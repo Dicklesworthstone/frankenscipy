@@ -11,12 +11,14 @@
 //!     is_orthogonal: boolean predicates verified on hand-built
 //!     matrices that exercise both true and false branches
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{
     DecompOptions, cond, is_diagonal, is_lower_triangular, is_orthogonal, is_upper_triangular,
     mat_norm_1, mat_norm_inf, trace,
@@ -71,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -256,35 +259,28 @@ fn diff_linalg_matrix_property_helpers() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let arms = ["norm_1", "norm_inf", "trace", "cond"];
+    let mut ledger = CompareLedger::new("diff_linalg_matrix_property_helpers", &arms);
+    // The numeric section is skipped (as before) when SciPy/numpy is unavailable and not
+    // required; the ledger's verdict applies whenever the oracle ran.
+    let oracle_ran = oracle_opt.is_some();
 
     // === Numeric helpers: compared against numpy ===
     if let Some(oracle) = oracle_opt {
         assert_eq!(oracle.points.len(), query.points.len());
         for (case, o) in query.points.iter().zip(oracle.points.iter()) {
             assert_eq!(case.case_id, o.case_id);
-            let Some(expected) = o.value else {
+            let fsci = fsci_compute(case).ok();
+            let Some((expected, actual)) =
+                ledger.pair(case.op.as_str(), &case.case_id, o.value, fsci)
+            else {
                 continue;
-            };
-            let actual = match fsci_compute(case) {
-                Ok(v) => v,
-                Err(e) => {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        actual: f64::NAN,
-                        expected,
-                        abs_diff: f64::INFINITY,
-                        rel_diff: f64::INFINITY,
-                        pass: false,
-                        note: e,
-                    });
-                    continue;
-                }
             };
             let abs_diff = (actual - expected).abs();
             let denom = expected.abs().max(1e-300);
             let rel_diff = abs_diff / denom;
             let pass = rel_diff <= REL_TOL || abs_diff <= ABS_TOL;
+            ledger.compared(case.op.as_str(), &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 op: case.op.clone(),
@@ -393,6 +389,7 @@ fn diff_linalg_matrix_property_helpers() {
             "fsci_linalg::{mat_norm_1, mat_norm_inf, trace, cond, is_diagonal, is_upper_triangular, is_lower_triangular, is_orthogonal} coverage"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -414,4 +411,12 @@ fn diff_linalg_matrix_property_helpers() {
         "matrix property helper coverage failed: {} cases",
         diffs.len()
     );
+    if oracle_ran {
+        ledger.finish(
+            arms.iter()
+                .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+                .min()
+                .unwrap_or(0),
+        );
+    }
 }

@@ -7,13 +7,14 @@
 //! eigenvalues by magnitude. Compare sorted |λ| values. Tolerance
 //! 1e-4 abs (power-iteration deflation accuracy).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, EigsOptions, FormatConvertible, Shape2D, eigsh};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -236,14 +238,10 @@ fn diff_sparse_eigsh_largest() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_eigsh_largest", &["eigsh"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.eigvals_sorted.as_ref() else {
-            continue;
-        };
+        let scipy_arm = pmap.get(&case.case_id);
         let mut data = Vec::new();
         let mut rs = Vec::new();
         let mut cs = Vec::new();
@@ -252,30 +250,32 @@ fn diff_sparse_eigsh_largest() {
             rs.push(r);
             cs.push(c);
         }
-        let Ok(coo) = CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rs, cs, true)
-        else {
+        // An unconverged eigsh result is an fsci failure, not a skip.
+        let fsci_eigs = CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rs, cs, true)
+            .ok()
+            .and_then(|coo| coo.to_csr().ok())
+            .and_then(|csr| eigsh(&csr, case.k, opts).ok())
+            .filter(|res| res.converged)
+            .map(|res| {
+                let mut eigs = res.eigenvalues;
+                eigs.sort_by(|a, b| b.abs().partial_cmp(&a.abs()).unwrap());
+                eigs
+            });
+        let Some((expected, eigs)) = ledger.slices(
+            "eigsh",
+            &case.case_id,
+            scipy_arm.and_then(|a| a.eigvals_sorted.as_deref()),
+            fsci_eigs.as_deref(),
+        ) else {
             continue;
         };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let Ok(res) = eigsh(&csr, case.k, opts) else {
-            continue;
-        };
-        if !res.converged {
-            continue;
-        }
-        let mut eigs = res.eigenvalues.clone();
-        eigs.sort_by(|a, b| b.abs().partial_cmp(&a.abs()).unwrap());
-        let abs_d = if eigs.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            eigs.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = eigs
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("eigsh", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -289,6 +289,7 @@ fn diff_sparse_eigsh_largest() {
         test_id: "diff_sparse_eigsh_largest".into(),
         category: "fsci_sparse::eigsh (LM) vs scipy.sparse.linalg.eigsh".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -309,4 +310,5 @@ fn diff_sparse_eigsh_largest() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -19,13 +19,14 @@
 //! max-abs across the vector for each case. Tol 1e-12 abs
 //! (ranks are integer or half-integer values).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::rankdata;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -222,30 +224,26 @@ fn diff_stats_rankdata() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let methods = ["average", "min", "max", "dense", "ordinal"];
+    let mut ledger = CompareLedger::new("diff_stats_rankdata", &methods);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_ranks) = &scipy_arm.ranks else {
+        let rust_ranks = rankdata(&case.data, Some(&case.method)).ok();
+        let Some((scipy_ranks, rust_ranks)) = ledger.slices(
+            &case.method,
+            &case.case_id,
+            scipy_arm.ranks.as_deref(),
+            rust_ranks.as_deref(),
+        ) else {
             continue;
         };
-        let rust_ranks = match rankdata(&case.data, Some(&case.method)) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if rust_ranks.len() != scipy_ranks.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.method.clone(),
-                max_abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut case_max = 0.0_f64;
         for (a, b) in rust_ranks.iter().zip(scipy_ranks.iter()) {
             case_max = case_max.max((a - b).abs());
         }
         max_overall = max_overall.max(case_max);
+        ledger.compared(&case.method, &case.case_id, case_max <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: case.method.clone(),
@@ -260,6 +258,7 @@ fn diff_stats_rankdata() {
         test_id: "diff_stats_rankdata".into(),
         category: "scipy.stats.rankdata".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -284,4 +283,10 @@ fn diff_stats_rankdata() {
         diffs.len(),
         max_overall
     );
+    let min_per_method = methods
+        .iter()
+        .map(|&m| query.points.iter().filter(|c| c.method == m).count())
+        .min()
+        .expect("rankdata declares its methods");
+    ledger.finish(min_per_method);
 }

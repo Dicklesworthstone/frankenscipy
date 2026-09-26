@@ -8,10 +8,12 @@
 //! Compare fsci's qr_multiply(Q, R, C) against fsci's matmul(Q, C)
 //! at 1e-12 abs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, matmul, qr, qr_multiply};
 use serde::Serialize;
 
@@ -30,6 +32,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -134,20 +137,46 @@ fn diff_linalg_qr_multiply_property() {
         ),
     ];
 
+    // The reference arm here is fsci's own matmul(Q, C), not SciPy; a failed qr leaves no
+    // reference and is recorded as a missing reference value.
+    let mut ledger = CompareLedger::new("diff_linalg_qr_multiply_property", &["qr_multiply"]);
+
     for (label, a, c) in probes {
-        let Ok(qr_res) = qr(a, opts) else { continue };
-        let Ok(via_mul) = matmul(&qr_res.q, c) else {
+        let case_id = format!("qr_multiply_{label}");
+        if a.len() > a[0].len() {
+            // fsci's qr returns the thin Q (m x n) where scipy.linalg.qr(a) returns m x m, so a C
+            // with A's row count cannot be multiplied by it.
+            ledger.allowlisted(
+                "qr_multiply",
+                &case_id,
+                "frankenscipy-kqeao",
+                "qr returns economic factors for a tall A",
+            );
             continue;
-        };
-        let Ok(via_qrm) = qr_multiply(&qr_res.q, &qr_res.r, c, opts) else {
+        }
+        let qr_res = qr(a, opts).ok();
+        let via_mul = qr_res.as_ref().and_then(|r| matmul(&r.q, c).ok());
+        let via_qrm = qr_res
+            .as_ref()
+            .and_then(|r| qr_multiply(&r.q, &r.r, c, opts).ok());
+        let Some((via_mul, via_qrm)) = ledger.both("qr_multiply", &case_id, via_mul, via_qrm)
+        else {
             continue;
         };
         let abs_d = frob_diff(&via_qrm, &via_mul);
         max_overall = max_overall.max(abs_d);
+        // frob_diff's running max reads a NaN as 0.0; a NaN entry on either side fails.
+        let no_nan = !via_qrm
+            .iter()
+            .chain(via_mul.iter())
+            .flatten()
+            .any(|v| v.is_nan());
+        let pass = no_nan && abs_d <= ABS_TOL;
+        ledger.compared("qr_multiply", &case_id, pass);
         diffs.push(CaseDiff {
-            case_id: format!("qr_multiply_{label}"),
+            case_id,
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -157,6 +186,7 @@ fn diff_linalg_qr_multiply_property() {
         test_id: "diff_linalg_qr_multiply_property".into(),
         category: "fsci_linalg::qr_multiply(Q, R, C) == matmul(Q, C)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -179,5 +209,12 @@ fn diff_linalg_qr_multiply_property() {
         "qr_multiply conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    // every square probe compares; the tall ones wait on frankenscipy-kqeao
+    ledger.finish(
+        probes
+            .iter()
+            .filter(|(_, a, _)| a.len() <= a[0].len())
+            .count(),
     );
 }

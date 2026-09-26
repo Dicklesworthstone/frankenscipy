@@ -22,13 +22,14 @@
 //!
 //! 4 fixtures = 4 cases × 3 sub-checks (disparity, mtx1, mtx2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::procrustes;
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -112,6 +114,17 @@ fn max_abs_diff_mat(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
         }
     }
     m
+}
+
+/// `max_abs_diff_mat` and `mtx2_min_axis_flip_diff` fold with `f64::max`, which drops a NaN, and
+/// zip rows, which drops a missing row or column: a compared fsci matrix must have SciPy's shape
+/// and no NaN.
+fn same_shape_no_nan(fsci: &[Vec<f64>], scipy: &[Vec<f64>]) -> bool {
+    fsci.len() == scipy.len()
+        && fsci
+            .iter()
+            .zip(scipy)
+            .all(|(f, s)| f.len() == s.len() && !f.iter().any(|v| v.is_nan()))
 }
 
 fn frob_norm_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
@@ -326,31 +339,63 @@ fn diff_spatial_procrustes() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_spatial_procrustes", &["disparity", "mtx1", "mtx2"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(scipy_m1), Some(scipy_m2), Some(scipy_d)) = (
-            scipy_arm.mtx1.as_ref(),
-            scipy_arm.mtx2.as_ref(),
-            scipy_arm.disparity,
-        ) else {
-            continue;
-        };
-        let res = match procrustes(&case.data1, &case.data2) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let res = procrustes(&case.data1, &case.data2).ok();
 
-        let disparity_diff = (res.disparity - scipy_d).abs();
-        let mtx1_diff = max_abs_diff_mat(&res.mtx1, scipy_m1);
-        let mtx2_diff = mtx2_min_axis_flip_diff(&res.mtx2, scipy_m2);
-        // Also try frobenius variant in case the per-axis flip
-        // mask isn't enough — log it but not used as gate here.
-        let _ = frob_norm_diff(&res.mtx1, scipy_m1);
+        let disparity_diff = ledger
+            .pair(
+                "disparity",
+                &case.case_id,
+                scipy_arm.disparity,
+                res.as_ref().map(|r| r.disparity),
+            )
+            .map(|(scipy_d, rust_d)| (rust_d - scipy_d).abs());
+        if let Some(d) = disparity_diff {
+            ledger.compared("disparity", &case.case_id, d <= ABS_TOL_DISPARITY);
+        }
 
-        let pass = disparity_diff <= ABS_TOL_DISPARITY
-            && mtx1_diff <= ABS_TOL_MTX1
-            && mtx2_diff <= ABS_TOL_MTX2;
+        let mtx1 = ledger.both(
+            "mtx1",
+            &case.case_id,
+            scipy_arm.mtx1.as_deref(),
+            res.as_ref().map(|r| r.mtx1.as_slice()),
+        );
+        let mtx1_diff = mtx1.map(|(scipy_m1, rust_m1)| {
+            let d = max_abs_diff_mat(rust_m1, scipy_m1);
+            // Also try frobenius variant in case the per-axis flip
+            // mask isn't enough — log it but not used as gate here.
+            let _ = frob_norm_diff(rust_m1, scipy_m1);
+            let ok = same_shape_no_nan(rust_m1, scipy_m1) && d <= ABS_TOL_MTX1;
+            (d, ok)
+        });
+        if let Some((_, ok)) = mtx1_diff {
+            ledger.compared("mtx1", &case.case_id, ok);
+        }
+
+        let mtx2 = ledger.both(
+            "mtx2",
+            &case.case_id,
+            scipy_arm.mtx2.as_deref(),
+            res.as_ref().map(|r| r.mtx2.as_slice()),
+        );
+        let mtx2_diff = mtx2.map(|(scipy_m2, rust_m2)| {
+            let d = mtx2_min_axis_flip_diff(rust_m2, scipy_m2);
+            let ok = same_shape_no_nan(rust_m2, scipy_m2) && d <= ABS_TOL_MTX2;
+            (d, ok)
+        });
+        if let Some((_, ok)) = mtx2_diff {
+            ledger.compared("mtx2", &case.case_id, ok);
+        }
+
+        let (Some(disparity_diff), Some((mtx1_diff, mtx1_ok)), Some((mtx2_diff, mtx2_ok))) =
+            (disparity_diff, mtx1_diff, mtx2_diff)
+        else {
+            continue; // the ledger recorded why an arm of this case was not compared
+        };
+        let pass = disparity_diff <= ABS_TOL_DISPARITY && mtx1_ok && mtx2_ok;
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -367,6 +412,7 @@ fn diff_spatial_procrustes() {
         test_id: "diff_spatial_procrustes".into(),
         category: "fsci_spatial::procrustes".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -389,4 +435,5 @@ fn diff_spatial_procrustes() {
         "procrustes conformance failed across {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

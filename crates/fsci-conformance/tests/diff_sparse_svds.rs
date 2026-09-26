@@ -7,13 +7,14 @@
 //! and right singular vectors have sign/phase ambiguity, so we
 //! only compare σ values. Tolerance 1e-4 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, EigsOptions, FormatConvertible, Shape2D, svds};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -211,6 +213,25 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse svds oracle JSON"))
 }
 
+/// fsci's top-k singular values sorted descending, or `None` when any step fails.
+fn fsci_sigma_sorted(case: &Case, opts: EigsOptions) -> Option<Vec<f64>> {
+    let mut data = Vec::new();
+    let mut rs = Vec::new();
+    let mut cs = Vec::new();
+    for &(r, c, v) in &case.triplets {
+        data.push(v);
+        rs.push(r);
+        cs.push(c);
+    }
+    let coo =
+        CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    let res = svds(&csr, case.k, opts).ok()?;
+    let mut sigs = res.singular_values.clone();
+    sigs.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    Some(sigs)
+}
+
 #[test]
 fn diff_sparse_svds() {
     let query = generate_query();
@@ -228,44 +249,25 @@ fn diff_sparse_svds() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_svds", &["svds"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.sigma_sorted.as_ref() else {
-            continue;
-        };
-        let mut data = Vec::new();
-        let mut rs = Vec::new();
-        let mut cs = Vec::new();
-        for &(r, c, v) in &case.triplets {
-            data.push(v);
-            rs.push(r);
-            cs.push(c);
-        }
-        let Ok(coo) =
-            CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true)
+        let scipy_sigma = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.sigma_sorted.as_deref());
+        let fsci_sigma = fsci_sigma_sorted(case, opts);
+        let Some((expected, sigs)) =
+            ledger.slices("svds", &case.case_id, scipy_sigma, fsci_sigma.as_deref())
         else {
             continue;
         };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let Ok(res) = svds(&csr, case.k, opts) else {
-            continue;
-        };
-        let mut sigs = res.singular_values.clone();
-        sigs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let abs_d = if sigs.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            sigs.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = sigs
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("svds", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -279,6 +281,7 @@ fn diff_sparse_svds() {
         test_id: "diff_sparse_svds".into(),
         category: "fsci_sparse::svds vs scipy.sparse.linalg.svds (top-k σ)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +302,5 @@ fn diff_sparse_svds() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

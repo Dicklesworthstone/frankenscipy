@@ -22,13 +22,14 @@
 //! using scipy's pearson-correlation-of-binary-indicators
 //! formulation. Deferred to a future tick.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::ttest_ind_from_stats;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -278,6 +280,7 @@ fn diff_stats_summary_misc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_summary_misc", &["statistic", "pvalue", "df"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -298,22 +301,24 @@ fn diff_stats_summary_misc() {
                     ("df", scipy_arm.df, result.df),
                 ];
                 for (arm_name, scipy_v, rust_v) in arms {
-                    if let Some(scipy_v) = scipy_v
-                        && rust_v.is_finite()
-                    {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: arm_name.into(),
-                            abs_diff,
-                            pass: abs_diff <= TTEST_TOL,
-                        });
-                    }
+                    let Some((scipy_v, rust_v)) =
+                        ledger.pair(arm_name, &case.case_id, scipy_v, Some(rust_v))
+                    else {
+                        continue;
+                    };
+                    let abs_diff = (rust_v - scipy_v).abs();
+                    max_overall = max_overall.max(abs_diff);
+                    ledger.compared(arm_name, &case.case_id, abs_diff <= TTEST_TOL);
+                    diffs.push(CaseDiff {
+                        case_id: case.case_id.clone(),
+                        func: case.func.clone(),
+                        arm: arm_name.into(),
+                        abs_diff,
+                        pass: abs_diff <= TTEST_TOL,
+                    });
                 }
             }
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -323,6 +328,7 @@ fn diff_stats_summary_misc() {
         test_id: "diff_stats_summary_misc".into(),
         category: "scipy.stats.ttest_ind_from_stats + contingency phi".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +353,5 @@ fn diff_stats_summary_misc() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

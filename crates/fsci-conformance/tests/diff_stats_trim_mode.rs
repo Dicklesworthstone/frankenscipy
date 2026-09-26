@@ -17,13 +17,14 @@
 //! 3 datasets × (3 trimboth props + 3 trim1 left + 3 trim1
 //! right + 1 mode) = 30 cases via subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{mode_full, trim1, trimboth};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -270,63 +272,59 @@ fn diff_stats_trim_mode() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_trim_mode",
+        &["trimboth", "trim1", "mode_value", "mode_count"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
-            "trimboth" => {
-                if let Some(scipy_vec) = &scipy_arm.vector_sorted {
-                    let mut rust_vec = trimboth(&case.data, case.prop).unwrap_or_else(|e| {
-                        panic!("scipy produced a trimboth for case {} (prop {}) but ours refused: {e:?}", case.case_id, case.prop)
-                    });
-                    rust_vec.sort_by(|a, b| a.total_cmp(b));
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: "vector_sorted_max".into(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
+            "trimboth" | "trim1" => {
+                let rust_vec = if case.func == "trimboth" {
+                    trimboth(&case.data, case.prop).ok()
+                } else {
+                    Some(trim1(&case.data, case.prop, &case.tail))
+                };
+                let rust_vec = rust_vec.map(|mut v| {
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    v
+                });
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    &case.func,
+                    &case.case_id,
+                    scipy_arm.vector_sorted.as_deref(),
+                    rust_vec.as_deref(),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    if a.is_finite() {
+                        max_local = max_local.max((a - b).abs());
                     }
                 }
-            }
-            "trim1" => {
-                if let Some(scipy_vec) = &scipy_arm.vector_sorted {
-                    let mut rust_vec = trim1(&case.data, case.prop, &case.tail);
-                    rust_vec.sort_by(|a, b| a.total_cmp(b));
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: "vector_sorted_max".into(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
-                    }
-                }
+                max_overall = max_overall.max(max_local);
+                ledger.compared(&case.func, &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    arm: "vector_sorted_max".into(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
             }
             "mode" => {
                 let r = mode_full(&case.data);
-                if let Some(scipy_v) = scipy_arm.mode_value
-                    && r.mode.is_finite()
-                {
-                    let abs_diff = (r.mode - scipy_v).abs();
+                if let Some((scipy_v, r_mode)) = ledger.pair(
+                    "mode_value",
+                    &case.case_id,
+                    scipy_arm.mode_value,
+                    Some(r.mode),
+                ) {
+                    let abs_diff = (r_mode - scipy_v).abs();
                     max_overall = max_overall.max(abs_diff);
+                    ledger.compared("mode_value", &case.case_id, abs_diff <= ABS_TOL);
                     diffs.push(CaseDiff {
                         case_id: case.case_id.clone(),
                         func: case.func.clone(),
@@ -335,9 +333,15 @@ fn diff_stats_trim_mode() {
                         pass: abs_diff <= ABS_TOL,
                     });
                 }
-                if let Some(scipy_c) = scipy_arm.mode_count {
-                    let abs_diff = (r.count as i64 - scipy_c).unsigned_abs() as f64;
+                if let Some((scipy_c, r_count)) = ledger.both(
+                    "mode_count",
+                    &case.case_id,
+                    scipy_arm.mode_count,
+                    Some(r.count),
+                ) {
+                    let abs_diff = (r_count as i64 - scipy_c).unsigned_abs() as f64;
                     max_overall = max_overall.max(abs_diff);
+                    ledger.compared("mode_count", &case.case_id, abs_diff <= ABS_TOL);
                     diffs.push(CaseDiff {
                         case_id: case.case_id.clone(),
                         func: case.func.clone(),
@@ -347,7 +351,7 @@ fn diff_stats_trim_mode() {
                     });
                 }
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -357,6 +361,7 @@ fn diff_stats_trim_mode() {
         test_id: "diff_stats_trim_mode".into(),
         category: "scipy.stats.trimboth + trim1 + mode".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -381,4 +386,6 @@ fn diff_stats_trim_mode() {
         diffs.len(),
         max_overall
     );
+    // mode_value/mode_count have one case per dataset, the fewest of any arm.
+    ledger.finish(query.points.iter().filter(|c| c.func == "mode").count());
 }

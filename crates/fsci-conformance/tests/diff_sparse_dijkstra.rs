@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-hxo6k]. Compares per-source shortest-path
 //! distance vectors at 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, dijkstra};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -252,21 +254,27 @@ fn diff_sparse_dijkstra() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_dijkstra", &["dijkstra"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_d) = scipy_arm.distances.as_ref() else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = dijkstra(&csr, false, case.source) else {
+        let fsci_d = dijkstra(&csr, false, case.source)
+            .ok()
+            .map(|res| res.distances);
+        let Some((scipy_d, fsci_d)) = ledger.both(
+            "dijkstra",
+            &case.case_id,
+            scipy_arm.distances.as_ref(),
+            fsci_d,
+        ) else {
             continue;
         };
         // Compare distances; treat fsci INF and scipy 1e308 sentinel as both infinite.
-        let abs_d = if res.distances.len() != scipy_d.len() {
+        let abs_d = if fsci_d.len() != scipy_d.len() {
             f64::INFINITY
         } else {
-            res.distances
+            fsci_d
                 .iter()
                 .zip(scipy_d.iter())
                 .map(|(a, b)| {
@@ -282,11 +290,14 @@ fn diff_sparse_dijkstra() {
                 })
                 .fold(0.0_f64, f64::max)
         };
+        // The max fold drops a NaN distance (0.0_f64.max(NaN) is 0.0), so reject one here.
+        let pass = abs_d <= ABS_TOL && !fsci_d.iter().any(|v| v.is_nan());
         max_overall = max_overall.max(abs_d);
+        ledger.compared("dijkstra", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -296,6 +307,7 @@ fn diff_sparse_dijkstra() {
         test_id: "diff_sparse_dijkstra".into(),
         category: "scipy.sparse.csgraph.dijkstra".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -316,4 +328,5 @@ fn diff_sparse_dijkstra() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-oasrr]. 1e-10 abs on w, |h|, angle(h).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::sosfreqz;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -208,16 +210,10 @@ fn diff_signal_sosfreqz() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_sosfreqz", &["w", "h_mag", "h_phase"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(w_exp), Some(mag_exp), Some(phase_exp)) = (
-            scipy_arm.w.as_ref(),
-            scipy_arm.h_mag.as_ref(),
-            scipy_arm.h_phase.as_ref(),
-        ) else {
-            continue;
-        };
         let sos: Vec<[f64; 6]> = case
             .sos_flat
             .as_chunks::<6>()
@@ -225,35 +221,42 @@ fn diff_signal_sosfreqz() {
             .iter()
             .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
             .collect();
-        let Ok(res) = sosfreqz(&sos, Some(case.n_freqs)) else {
-            continue;
-        };
-        let abs_d = if res.w.len() != w_exp.len()
-            || res.h_mag.len() != mag_exp.len()
-            || res.h_phase.len() != phase_exp.len()
-        {
-            f64::INFINITY
-        } else {
-            let dw = res
-                .w
+        let res = sosfreqz(&sos, Some(case.n_freqs)).ok();
+        let arms = [
+            (
+                "w",
+                scipy_arm.w.as_deref(),
+                res.as_ref().map(|r| r.w.as_slice()),
+            ),
+            (
+                "h_mag",
+                scipy_arm.h_mag.as_deref(),
+                res.as_ref().map(|r| r.h_mag.as_slice()),
+            ),
+            (
+                "h_phase",
+                scipy_arm.h_phase.as_deref(),
+                res.as_ref().map(|r| r.h_phase.as_slice()),
+            ),
+        ];
+        let mut arm_diffs = [f64::NAN; 3];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((expected, actual)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let d = actual
                 .iter()
-                .zip(w_exp.iter())
+                .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            let dm = res
-                .h_mag
-                .iter()
-                .zip(mag_exp.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            let dp = res
-                .h_phase
-                .iter()
-                .zip(phase_exp.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            dw.max(dm).max(dp)
-        };
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [dw, dm, dp] = arm_diffs;
+        let abs_d = dw.max(dm).max(dp);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -268,6 +271,7 @@ fn diff_signal_sosfreqz() {
         test_id: "diff_signal_sosfreqz".into(),
         category: "scipy.signal.sosfreqz".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -288,4 +292,5 @@ fn diff_signal_sosfreqz() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

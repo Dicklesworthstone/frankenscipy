@@ -15,13 +15,14 @@
 //! buttap(n). Roots are sorted by (re, im) before comparing.
 //! Tolerance 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{bilinear_zpk, buttap, lp2bp_zpk, lp2bs_zpk, lp2hp_zpk, lp2lp_zpk};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -307,45 +309,55 @@ fn diff_signal_lp2_zpk_transforms() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arm_names = ["lplp", "lphp", "lpbp", "lpbs", "bilinear"];
+    let mut ledger = CompareLedger::new("diff_signal_lp2_zpk_transforms", &arm_names);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
+        let op = case.op.as_str();
+        let scipy = match (&arm.z_re, &arm.z_im, &arm.p_re, &arm.p_im, arm.k) {
+            (Some(z_re), Some(z_im), Some(p_re), Some(p_im), Some(k_exp)) => {
+                let scipy_z: Vec<(f64, f64)> =
+                    z_re.iter().copied().zip(z_im.iter().copied()).collect();
+                let scipy_p: Vec<(f64, f64)> =
+                    p_re.iter().copied().zip(p_im.iter().copied()).collect();
+                Some((scipy_z, scipy_p, k_exp))
+            }
+            _ => None,
+        };
+        let fsci = buttap(case.n).ok().and_then(|(z, p, k)| {
+            let res = match op {
+                "lplp" => lp2lp_zpk(&z, &p, k, case.wo),
+                "lphp" => lp2hp_zpk(&z, &p, k, case.wo),
+                "lpbp" => lp2bp_zpk(&z, &p, k, case.wo, case.bw),
+                "lpbs" => lp2bs_zpk(&z, &p, k, case.wo, case.bw),
+                "bilinear" => bilinear_zpk(&z, &p, k, case.fs),
+                other => panic!("unknown op {other}"),
+            };
+            res.ok()
+        });
+        let Some(((scipy_z, scipy_p, k_exp), (zout, pout, kout))) =
+            ledger.both(op, &case.case_id, scipy, fsci)
+        else {
             continue;
         };
-        let (Some(z_re), Some(z_im), Some(p_re), Some(p_im), Some(k_exp)) = (
-            arm.z_re.as_ref(),
-            arm.z_im.as_ref(),
-            arm.p_re.as_ref(),
-            arm.p_im.as_ref(),
-            arm.k,
-        ) else {
-            continue;
-        };
-        let Ok((z, p, k)) = buttap(case.n) else {
-            continue;
-        };
-        let res = match case.op.as_str() {
-            "lplp" => lp2lp_zpk(&z, &p, k, case.wo),
-            "lphp" => lp2hp_zpk(&z, &p, k, case.wo),
-            "lpbp" => lp2bp_zpk(&z, &p, k, case.wo, case.bw),
-            "lpbs" => lp2bs_zpk(&z, &p, k, case.wo, case.bw),
-            "bilinear" => bilinear_zpk(&z, &p, k, case.fs),
-            _ => continue,
-        };
-        let Ok((zout, pout, kout)) = res else {
-            continue;
-        };
-        let scipy_z: Vec<(f64, f64)> = z_re.iter().copied().zip(z_im.iter().copied()).collect();
-        let scipy_p: Vec<(f64, f64)> = p_re.iter().copied().zip(p_im.iter().copied()).collect();
         let max_d = root_set_max_diff(&zout, &scipy_z)
             .max(root_set_max_diff(&pout, &scipy_p))
             .max((kout - k_exp).abs());
+        // f64::max drops a NaN operand, so a NaN root part or gain would read as a match.
+        let has_nan = kout.is_nan()
+            || zout
+                .iter()
+                .chain(&pout)
+                .any(|&(re, im)| re.is_nan() || im.is_nan());
+        let pass = max_d <= ABS_TOL && !has_nan;
         max_overall = max_overall.max(max_d);
+        ledger.compared(op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: max_d,
-            pass: max_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -357,6 +369,7 @@ fn diff_signal_lp2_zpk_transforms() {
             "fsci_signal::{lp2lp_zpk, lp2hp_zpk, lp2bp_zpk, lp2bs_zpk, bilinear_zpk} vs scipy.signal"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -377,4 +390,10 @@ fn diff_signal_lp2_zpk_transforms() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = arm_names
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

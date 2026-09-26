@@ -8,12 +8,14 @@
 //! solution residual ||A x − b||∞ stays tight when checked against
 //! the dense reconstruction.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::solveh_banded;
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -108,14 +111,18 @@ fn lower_band_from_dense(a: &[Vec<f64>], bw: usize) -> Vec<Vec<f64>> {
     ab
 }
 
-/// LAPACK upper-band storage of an SPD matrix A.
-/// ab[k][j] = A[j-k][j] for k=0..bw, j=k..n-1. Unused slots set to 0.
+/// LAPACK upper-band storage of an SPD matrix A: `ab[bw + i - j][j] = A[i][j]`, so the
+/// diagonal is the LAST row and the k-th superdiagonal is row `bw - k`. Unused slots are 0.
+///
+/// This used to put the diagonal in row 0 (the lower-storage order), which is not a positive
+/// definite matrix in upper storage: SciPy raised LinAlgError on both upper cases and they were
+/// skipped until the compared-case ledger (olv0j.1) reported them.
 fn upper_band_from_dense(a: &[Vec<f64>], bw: usize) -> Vec<Vec<f64>> {
     let n = a.len();
     let mut ab = vec![vec![0.0_f64; n]; bw + 1];
     for k in 0..=bw {
         for j in k..n {
-            ab[k][j] = a[j - k][j];
+            ab[bw - k][j] = a[j - k][j];
         }
     }
     ab
@@ -345,42 +352,21 @@ fn diff_linalg_solveh_banded() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_solveh_banded", &["solveh_banded"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.x.as_ref() else {
+        let sol = solveh_banded(&case.ab, &case.b, case.lower)
+            .ok()
+            .map(|r| r.x);
+        let Some((expected, sol)) = ledger.slices(
+            "solveh_banded",
+            &case.case_id,
+            o.x.as_deref(),
+            sol.as_deref(),
+        ) else {
             continue;
         };
-
-        let sol = match solveh_banded(&case.ab, &case.b, case.lower) {
-            Ok(r) => r.x,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    max_rel_diff: f64::INFINITY,
-                    residual_inf: f64::INFINITY,
-                    pass: false,
-                    note: format!("solveh_banded error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        if sol.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                max_abs_diff: f64::INFINITY,
-                max_rel_diff: f64::INFINITY,
-                residual_inf: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} scipy={}",
-                    sol.len(),
-                    expected.len()
-                ),
-            });
-            continue;
-        }
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
@@ -392,7 +378,7 @@ fn diff_linalg_solveh_banded() {
         }
 
         // Residual against the dense form of A
-        let ax = matvec(&case.a_dense, &sol);
+        let ax = matvec(&case.a_dense, sol);
         let mut residual_inf = 0.0_f64;
         for (axi, bi) in ax.iter().zip(case.b.iter()) {
             residual_inf = residual_inf.max((axi - bi).abs());
@@ -401,6 +387,7 @@ fn diff_linalg_solveh_banded() {
         let close_to_scipy = max_rel <= REL_TOL || max_abs <= ABS_TOL;
         let small_residual = residual_inf <= RESIDUAL_TOL;
         let pass = close_to_scipy && small_residual;
+        ledger.compared("solveh_banded", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             max_abs_diff: max_abs,
@@ -416,6 +403,7 @@ fn diff_linalg_solveh_banded() {
         test_id: "diff_linalg_solveh_banded".into(),
         category: "fsci_linalg::solveh_banded vs scipy.linalg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -437,4 +425,5 @@ fn diff_linalg_solveh_banded() {
         "solveh_banded parity failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

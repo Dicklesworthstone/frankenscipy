@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-n9r84]. Compares n_components exactly and
 //! labels up to permutation (via partition-equivalence on co-grouping).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{Connection, CsrMatrix, Shape2D, connected_components};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -255,20 +257,25 @@ fn diff_sparse_connected_components() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_connected_components",
+        &["connected_components"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(scipy_n), Some(scipy_labels)) =
-            (scipy_arm.n_components, scipy_arm.labels.as_ref())
-        else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = connected_components(&csr, false, Connection::Weak) else {
+        let Some(((scipy_n, scipy_labels), res)) = ledger.both(
+            "connected_components",
+            &case.case_id,
+            scipy_arm.n_components.zip(scipy_arm.labels.as_ref()),
+            connected_components(&csr, false, Connection::Weak).ok(),
+        ) else {
             continue;
         };
         let pass_n = res.n_components == scipy_n;
         let pass_part = co_grouping_match(&res.labels, scipy_labels);
+        ledger.compared("connected_components", &case.case_id, pass_n && pass_part);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci_n: res.n_components,
@@ -284,6 +291,7 @@ fn diff_sparse_connected_components() {
         test_id: "diff_sparse_connected_components".into(),
         category: "scipy.sparse.csgraph.connected_components".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -305,4 +313,5 @@ fn diff_sparse_connected_components() {
         "connected_components conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

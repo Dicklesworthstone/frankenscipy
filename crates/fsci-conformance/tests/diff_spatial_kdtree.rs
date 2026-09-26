@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy KDTree queries against SciPy subprocess oracle
 //! across deterministic point clouds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::KDTree;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +118,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     tolerance: f64,
     pass: bool,
@@ -519,24 +521,15 @@ fn diff_001_kdtree_query() {
 
     let mut diffs = Vec::new();
     let mut pass_count = 0;
+    let mut ledger = CompareLedger::new("diff_001_kdtree_query", &["query"]);
 
     for case in &cases {
-        let rust_result = rust_query(case);
-        assert!(
-            rust_result.is_some(),
-            "diff_001_kdtree_query missing Rust result for {}",
-            case.case_id
-        );
-        let Some(rust_result) = rust_result else {
-            continue;
-        };
-        let scipy_result = oracle_map.get(&case.case_id);
-        assert!(
-            scipy_result.is_some(),
-            "diff_001_kdtree_query missing SciPy result for {}",
-            case.case_id
-        );
-        let Some(scipy_result) = scipy_result else {
+        let Some((scipy_result, rust_result)) = ledger.both(
+            "query",
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_query(case),
+        ) else {
             continue;
         };
 
@@ -549,6 +542,7 @@ fn diff_001_kdtree_query() {
         // distance matches scipy's nearest distance to within DIST_TOL;
         // fall back to strict index match otherwise.
         let pass = dist_diff <= DIST_TOL;
+        ledger.compared("query", &case.case_id, pass);
 
         if pass {
             pass_count += 1;
@@ -575,6 +569,7 @@ fn diff_001_kdtree_query() {
         test_id: "diff_001_kdtree_query".into(),
         category: "scipy.spatial.KDTree.query".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         tolerance: DIST_TOL,
         pass: all_pass,
@@ -597,6 +592,7 @@ fn diff_001_kdtree_query() {
             diff.dist_diff
         );
     }
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -622,24 +618,15 @@ fn diff_002_kdtree_query_k() {
 
     let mut diffs = Vec::new();
     let mut pass_count = 0;
+    let mut ledger = CompareLedger::new("diff_002_kdtree_query_k", &["query_k"]);
 
     for case in &cases {
-        let rust_result = rust_query_k(case);
-        assert!(
-            rust_result.is_some(),
-            "diff_002_kdtree_query_k missing Rust result for {}",
-            case.case_id
-        );
-        let Some(rust_result) = rust_result else {
-            continue;
-        };
-        let scipy_result = oracle_map.get(&case.case_id);
-        assert!(
-            scipy_result.is_some(),
-            "diff_002_kdtree_query_k missing SciPy result for {}",
-            case.case_id
-        );
-        let Some(scipy_result) = scipy_result else {
+        let Some((scipy_result, rust_result)) = ledger.both(
+            "query_k",
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_query_k(case),
+        ) else {
             continue;
         };
 
@@ -654,6 +641,7 @@ fn diff_002_kdtree_query_k() {
         let max_dist_diff = max_distance_diff(&rust_distances, &scipy_result.distances);
 
         let pass = max_dist_diff <= DIST_TOL;
+        ledger.compared("query_k", &case.case_id, pass);
 
         if pass {
             pass_count += 1;
@@ -681,6 +669,7 @@ fn diff_002_kdtree_query_k() {
         test_id: "diff_002_kdtree_query_k".into(),
         category: "scipy.spatial.KDTree.query_k".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         tolerance: DIST_TOL,
         pass: all_pass,
@@ -701,6 +690,7 @@ fn diff_002_kdtree_query_k() {
             diff.max_dist_diff
         );
     }
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -726,30 +716,22 @@ fn diff_003_kdtree_query_ball_point() {
 
     let mut diffs = Vec::new();
     let mut pass_count = 0;
+    let mut ledger = CompareLedger::new("diff_003_kdtree_query_ball_point", &["query_ball_point"]);
 
     for case in &cases {
-        let rust_result = rust_query_ball_point(case);
-        assert!(
-            rust_result.is_some(),
-            "diff_003_kdtree_query_ball_point missing Rust result for {}",
-            case.case_id
-        );
-        let Some(mut rust_result) = rust_result else {
+        let Some((scipy_result, mut rust_result)) = ledger.both(
+            "query_ball_point",
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_query_ball_point(case),
+        ) else {
             continue;
         };
         rust_result.sort();
-        let scipy_result = oracle_map.get(&case.case_id);
-        assert!(
-            scipy_result.is_some(),
-            "diff_003_kdtree_query_ball_point missing SciPy result for {}",
-            case.case_id
-        );
-        let Some(scipy_result) = scipy_result else {
-            continue;
-        };
 
         let indices_match = rust_result == scipy_result.indices;
         let pass = indices_match;
+        ledger.compared("query_ball_point", &case.case_id, pass);
 
         if pass {
             pass_count += 1;
@@ -773,6 +755,7 @@ fn diff_003_kdtree_query_ball_point() {
         test_id: "diff_003_kdtree_query_ball_point".into(),
         category: "scipy.spatial.KDTree.query_ball_point".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         tolerance: 0.0,
         pass: all_pass,
@@ -793,6 +776,7 @@ fn diff_003_kdtree_query_ball_point() {
             diff.case_id, diff.rust_indices, diff.scipy_indices
         );
     }
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -861,24 +845,15 @@ fn diff_004_kdtree_edge_cases() {
 
     let mut diffs = Vec::new();
     let mut pass_count = 0;
+    let mut ledger = CompareLedger::new("diff_004_kdtree_edge_cases", &["query"]);
 
     for case in &cases {
-        let rust_result = rust_query(case);
-        assert!(
-            rust_result.is_some(),
-            "diff_004_kdtree_edge_cases missing Rust result for {}",
-            case.case_id
-        );
-        let Some(rust_result) = rust_result else {
-            continue;
-        };
-        let scipy_result = oracle_map.get(&case.case_id);
-        assert!(
-            scipy_result.is_some(),
-            "diff_004_kdtree_edge_cases missing SciPy result for {}",
-            case.case_id
-        );
-        let Some(scipy_result) = scipy_result else {
+        let Some((scipy_result, rust_result)) = ledger.both(
+            "query",
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_query(case),
+        ) else {
             continue;
         };
 
@@ -886,6 +861,7 @@ fn diff_004_kdtree_edge_cases() {
         let dist_match = dist_diff <= DIST_TOL;
 
         let pass = dist_match;
+        ledger.compared("query", &case.case_id, pass);
 
         if pass {
             pass_count += 1;
@@ -912,6 +888,7 @@ fn diff_004_kdtree_edge_cases() {
         test_id: "diff_004_kdtree_edge_cases".into(),
         category: "scipy.spatial.KDTree.edge".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         tolerance: DIST_TOL,
         pass: all_pass,
@@ -928,4 +905,5 @@ fn diff_004_kdtree_edge_cases() {
             diff.case_id, diff.rust_distance, diff.scipy_distance, diff.dist_diff
         );
     }
+    ledger.finish(cases.len());
 }

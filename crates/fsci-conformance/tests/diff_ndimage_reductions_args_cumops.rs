@@ -7,13 +7,14 @@
 //! Resolves [frankenscipy-yr65w]. Tolerance: 1e-12 abs (integer ops
 //! exact; float ops below double-precision noise).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     NdArray, argmax, argmin, count_nonzero, cumprod_array, cumsum_array, diff_array, equal_within,
 };
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -354,68 +356,63 @@ fn diff_ndimage_reductions_args_cumops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = [
+        "count_nonzero",
+        "argmax",
+        "argmin",
+        "cumsum",
+        "cumprod",
+        "diff",
+        "equal_within",
+    ];
+    let mut ledger = CompareLedger::new("diff_ndimage_reductions_args_cumops", &arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Ok(arr) = NdArray::new(case.data.clone(), case.shape.clone()) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
+        let scipy_scalar = arm.and_then(|a| a.scalar);
+        let scipy_values = arm.and_then(|a| a.values.as_deref());
+        let arr = NdArray::new(case.data.clone(), case.shape.clone()).ok();
+        let op = case.op.as_str();
 
-        let abs_d = match case.op.as_str() {
-            "count_nonzero" => {
-                let actual = count_nonzero(&arr) as f64;
-                let Some(e) = arm.scalar else { continue };
+        let abs_d = match op {
+            "count_nonzero" | "argmax" | "argmin" => {
+                let actual = arr.as_ref().map(|arr| {
+                    let index = match op {
+                        "count_nonzero" => count_nonzero(arr),
+                        "argmax" => argmax(arr),
+                        _ => argmin(arr),
+                    };
+                    index as f64
+                });
+                let Some((e, actual)) = ledger.pair(op, &case.case_id, scipy_scalar, actual) else {
+                    continue;
+                };
                 (actual - e).abs()
             }
-            "argmax" => {
-                let actual = argmax(&arr) as f64;
-                let Some(e) = arm.scalar else { continue };
-                (actual - e).abs()
-            }
-            "argmin" => {
-                let actual = argmin(&arr) as f64;
-                let Some(e) = arm.scalar else { continue };
-                (actual - e).abs()
-            }
-            "cumsum" => {
-                let actual = cumsum_array(&arr);
-                let Some(e) = arm.values.as_ref() else {
+            // cumsum / cumprod / diff / equal_within; an op that is not a declared arm
+            // panics in the ledger rather than being skipped.
+            _ => {
+                let actual = arr.as_ref().and_then(|arr| match op {
+                    "cumsum" => Some(cumsum_array(arr).data),
+                    "cumprod" => Some(cumprod_array(arr).data),
+                    "diff" => Some(diff_array(arr).data),
+                    "equal_within" => NdArray::new(case.data_b.clone(), case.shape.clone())
+                        .ok()
+                        .and_then(|arr_b| equal_within(arr, &arr_b, case.tol).ok())
+                        .map(|mask| mask.data),
+                    _ => None,
+                });
+                let Some((e, actual)) =
+                    ledger.slices(op, &case.case_id, scipy_values, actual.as_deref())
+                else {
                     continue;
                 };
-                vec_max_diff(&actual.data, e)
+                vec_max_diff(actual, e)
             }
-            "cumprod" => {
-                let actual = cumprod_array(&arr);
-                let Some(e) = arm.values.as_ref() else {
-                    continue;
-                };
-                vec_max_diff(&actual.data, e)
-            }
-            "diff" => {
-                let actual = diff_array(&arr);
-                let Some(e) = arm.values.as_ref() else {
-                    continue;
-                };
-                vec_max_diff(&actual.data, e)
-            }
-            "equal_within" => {
-                let Ok(arr_b) = NdArray::new(case.data_b.clone(), case.shape.clone()) else {
-                    continue;
-                };
-                let Ok(actual) = equal_within(&arr, &arr_b, case.tol) else {
-                    continue;
-                };
-                let Some(e) = arm.values.as_ref() else {
-                    continue;
-                };
-                vec_max_diff(&actual.data, e)
-            }
-            _ => continue,
         };
 
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -432,6 +429,7 @@ fn diff_ndimage_reductions_args_cumops() {
             "fsci_ndimage count_nonzero/argmax/argmin/cumsum/cumprod/diff/equal_within vs numpy"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -451,5 +449,11 @@ fn diff_ndimage_reductions_args_cumops() {
         "reductions/args/cumops conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

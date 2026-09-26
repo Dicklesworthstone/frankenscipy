@@ -9,6 +9,7 @@
 //! Goes through the CoreArrayBackend public path so the
 //! creation::linspace/arange wrappers are exercised end-to-end.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,11 +20,14 @@ use fsci_arrayapi::{
     ArangeRequest, CreationRequest, DType, ExecutionMode, LinspaceRequest, MemoryOrder,
     ScalarValue, Shape, arange, backend::CoreArrayBackend, linspace, ones, zeros,
 };
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Every op `build_query` emits cases for: one ledger arm each.
+const OPS: [&str; 4] = ["linspace", "arange", "zeros_shape", "ones_shape"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CasePoint {
@@ -74,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -346,60 +351,58 @@ fn diff_arrayapi_creation_helpers_numpy_parity() {
     let start = Instant::now();
     let backend = CoreArrayBackend::new(ExecutionMode::Strict);
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_arrayapi_creation_helpers_numpy_parity", &OPS);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(exp_len) = o.expected_len else {
-            continue;
+        let op = case.op.as_str();
+        let fsci = fsci_values(case, &backend);
+        if let Err(e) = &fsci {
+            eprintln!(
+                "arrayapi_creation: {} ({op}) fsci failed: {e}",
+                case.case_id
+            );
+        }
+        let fsci = fsci.ok();
+        // linspace/arange: numpy's values through slices (which also rejects a length mismatch
+        // and a NaN); zeros/ones: numpy's element count against fsci's fill.
+        let present = if matches!(op, "linspace" | "arange") {
+            ledger
+                .slices(op, &case.case_id, o.values.as_deref(), fsci.as_deref())
+                .map(|(exp_values, actual)| (exp_values.len(), Some(exp_values), actual))
+        } else {
+            ledger
+                .both(op, &case.case_id, o.expected_len, fsci.as_deref())
+                .map(|(exp_len, actual)| (exp_len, None, actual))
         };
-        let actual = match fsci_values(case, &backend) {
-            Ok(v) => v,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    op: case.op.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    fsci_len: 0,
-                    expected_len: exp_len,
-                    pass: false,
-                    note: e,
-                });
-                continue;
-            }
+        let Some((exp_len, exp_values, actual)) = present else {
+            continue;
         };
 
         // Length check applies to all ops
-        if actual.len() != exp_len {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                max_abs_diff: f64::INFINITY,
-                fsci_len: actual.len(),
-                expected_len: exp_len,
-                pass: false,
-                note: format!("length mismatch: fsci={} numpy={}", actual.len(), exp_len),
-            });
-            continue;
-        }
+        let len_ok = actual.len() == exp_len;
 
         // Value check for linspace/arange; zeros/ones value check via constant fill
-        let max_abs = match case.op.as_str() {
-            "linspace" | "arange" => {
-                let exp_values = o.values.as_ref().expect("values for linspace/arange");
-                actual
+        let max_abs = if len_ok {
+            match (op, exp_values) {
+                ("linspace" | "arange", Some(exp_values)) => actual
                     .iter()
                     .zip(exp_values.iter())
                     .map(|(a, e)| (a - e).abs())
-                    .fold(0.0_f64, f64::max)
+                    .fold(0.0_f64, f64::max),
+                ("zeros_shape", _) => actual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                ("ones_shape", _) => actual
+                    .iter()
+                    .map(|v| (v - 1.0).abs())
+                    .fold(0.0_f64, f64::max),
+                _ => f64::INFINITY,
             }
-            "zeros_shape" => actual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
-            "ones_shape" => actual
-                .iter()
-                .map(|v| (v - 1.0).abs())
-                .fold(0.0_f64, f64::max),
-            _ => f64::INFINITY,
+        } else {
+            f64::INFINITY
         };
-        let pass = max_abs <= ABS_TOL;
+        // The f64::max folds drop a NaN, so a NaN in fsci's fill must fail on its own.
+        let pass = len_ok && max_abs <= ABS_TOL && !actual.iter().any(|v| v.is_nan());
+        ledger.compared(op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -407,7 +410,11 @@ fn diff_arrayapi_creation_helpers_numpy_parity() {
             fsci_len: actual.len(),
             expected_len: exp_len,
             pass,
-            note: String::new(),
+            note: if len_ok {
+                String::new()
+            } else {
+                format!("length mismatch: fsci={} numpy={}", actual.len(), exp_len)
+            },
         });
     }
 
@@ -416,6 +423,7 @@ fn diff_arrayapi_creation_helpers_numpy_parity() {
         test_id: "diff_arrayapi_creation_helpers_numpy_parity".into(),
         category: "fsci_arrayapi::{linspace, arange, zeros, ones} vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -437,4 +445,11 @@ fn diff_arrayapi_creation_helpers_numpy_parity() {
         "arrayapi creation parity failed: {} cases",
         diffs.len()
     );
+    // Ops have different case counts (2 to 5); each arm must compare at least the smallest.
+    let min_per_arm = OPS
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("OPS is non-empty");
+    ledger.finish(min_per_arm);
 }

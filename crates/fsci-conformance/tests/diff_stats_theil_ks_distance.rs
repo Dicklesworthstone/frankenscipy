@@ -16,13 +16,14 @@
 //! × 1 ks_distance arm = 12 cases via subprocess. Tol 1e-12
 //! abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, Normal, ks_distance, theil_sen};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -287,56 +289,42 @@ fn diff_stats_theil_ks_distance() {
 
     let norm = Normal::standard();
     let cdf_norm = |x: f64| ContinuousDistribution::cdf(&norm, x);
+    let mut ledger = CompareLedger::new(
+        "diff_stats_theil_ks_distance",
+        &["slope", "intercept", "distance"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        match case.func.as_str() {
+        let arms: Vec<(&str, Option<f64>, f64)> = match case.func.as_str() {
             "theil_sen" => {
                 let (rs, ri) = theil_sen(&case.x, &case.y);
-                if let Some(scipy_s) = scipy_arm.slope
-                    && rs.is_finite()
-                {
-                    let abs_diff = (rs - scipy_s).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "slope".into(),
-                        abs_diff,
-                        pass: abs_diff <= ABS_TOL,
-                    });
-                }
-                if let Some(scipy_i) = scipy_arm.intercept
-                    && ri.is_finite()
-                {
-                    let abs_diff = (ri - scipy_i).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "intercept".into(),
-                        abs_diff,
-                        pass: abs_diff <= ABS_TOL,
-                    });
-                }
+                vec![
+                    ("slope", scipy_arm.slope, rs),
+                    ("intercept", scipy_arm.intercept, ri),
+                ]
             }
             "ks_distance" => {
                 let rd = ks_distance(&case.x, cdf_norm);
-                if let Some(scipy_d) = scipy_arm.distance
-                    && rd.is_finite()
-                {
-                    let abs_diff = (rd - scipy_d).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "distance".into(),
-                        abs_diff,
-                        pass: abs_diff <= ABS_TOL,
-                    });
-                }
+                vec![("distance", scipy_arm.distance, rd)]
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
+        };
+        for (arm, scipy_v, rust_v) in arms {
+            let Some((scipy_v, rust_v)) = ledger.pair(arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                func: case.func.clone(),
+                arm: arm.into(),
+                abs_diff,
+                pass: abs_diff <= ABS_TOL,
+            });
         }
     }
 
@@ -346,6 +334,7 @@ fn diff_stats_theil_ks_distance() {
         test_id: "diff_stats_theil_ks_distance".into(),
         category: "theil_sen + ks_distance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -370,4 +359,16 @@ fn diff_stats_theil_ks_distance() {
         diffs.len(),
         max_overall
     );
+    // slope/intercept compare the theil_sen cases, distance the ks_distance cases.
+    let theil_cases = query
+        .points
+        .iter()
+        .filter(|c| c.func == "theil_sen")
+        .count();
+    let ks_cases = query
+        .points
+        .iter()
+        .filter(|c| c.func == "ks_distance")
+        .count();
+    ledger.finish(theil_cases.min(ks_cases));
 }

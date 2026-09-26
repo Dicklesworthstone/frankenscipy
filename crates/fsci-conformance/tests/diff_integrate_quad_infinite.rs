@@ -11,19 +11,22 @@
 //! Tolerance: 1e-6 abs (substitution-based methods don't match adaptive QUADPACK
 //! to machine precision).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{QuadOptions, quad_full_inf, quad_inf, quad_neg_inf};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci entry point (the case `kind`).
+const ARMS: [&str; 3] = ["inf", "neg_inf", "full_inf"];
 
 #[derive(Debug, Clone, Serialize)]
 struct InfCase {
@@ -62,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -198,7 +202,13 @@ def f(name, x):
     if name == "x_exp_neg_x": return x * math.exp(-x)
     if name == "exp_neg_abs_x": return math.exp(-abs(x))
     if name == "sech2":
-        c = math.cosh(x)
+        # math.cosh raises OverflowError past |x| ~ 710 where IEEE (and the Rust integrand)
+        # gives cosh = inf and sech^2 = 0; quad samples such x on an infinite range, so the
+        # raise used to blank this case (found by the compared-case ledger, olv0j.1).
+        try:
+            c = math.cosh(x)
+        except OverflowError:
+            return 0.0
         return 1.0 / (c*c)
     return float("nan")
 
@@ -287,31 +297,25 @@ fn diff_integrate_quad_infinite() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_quad_infinite", &ARMS);
 
     for case in &query.points {
-        let Some(expected) = pmap.get(&case.case_id).and_then(|a| a.value) else {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.value);
+        let arm = case.kind.as_str();
+        let f = |x: f64| integrand(&case.func, x);
+        let fsci = match arm {
+            "inf" => case.bound.and_then(|a| quad_inf(f, a, opts).ok()),
+            "neg_inf" => case.bound.and_then(|b| quad_neg_inf(f, b, opts).ok()),
+            "full_inf" => quad_full_inf(f, opts).ok(),
+            _ => None,
+        }
+        .map(|qr| qr.integral);
+        let Some((expected, integral)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
             continue;
         };
-        let f = |x: f64| integrand(&case.func, x);
-        let res = match case.kind.as_str() {
-            "inf" => {
-                let Some(a) = case.bound else {
-                    continue;
-                };
-                quad_inf(f, a, opts)
-            }
-            "neg_inf" => {
-                let Some(b) = case.bound else {
-                    continue;
-                };
-                quad_neg_inf(f, b, opts)
-            }
-            "full_inf" => quad_full_inf(f, opts),
-            _ => continue,
-        };
-        let Ok(qr) = res else { continue };
-        let abs_d = (qr.integral - expected).abs();
+        let abs_d = (integral - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.kind.clone(),
@@ -327,6 +331,7 @@ fn diff_integrate_quad_infinite() {
         category: "fsci_integrate quad_inf / quad_neg_inf / quad_full_inf vs scipy.integrate.quad"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +352,11 @@ fn diff_integrate_quad_infinite() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (`neg_inf` has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.kind == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

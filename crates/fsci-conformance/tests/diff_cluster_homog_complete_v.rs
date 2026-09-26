@@ -12,7 +12,7 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{completeness_score, homogeneity_score, v_measure_score};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -257,6 +259,7 @@ fn diff_cluster_homog_complete_v() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -267,32 +270,28 @@ fn diff_cluster_homog_complete_v() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_homog_complete_v",
+        &["homogeneity_score", "completeness_score", "v_measure_score"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(eh), Some(ec), Some(ev)) = (arm.homog, arm.complete, arm.v) else {
-            continue;
-        };
-
-        let Ok(h) = homogeneity_score(&case.labels_true, &case.labels_pred) else {
-            continue;
-        };
-        let Ok(c) = completeness_score(&case.labels_true, &case.labels_pred) else {
-            continue;
-        };
-        let Ok(v) = v_measure_score(&case.labels_true, &case.labels_pred) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
+        let h = homogeneity_score(&case.labels_true, &case.labels_pred).ok();
+        let c = completeness_score(&case.labels_true, &case.labels_pred).ok();
+        let v = v_measure_score(&case.labels_true, &case.labels_pred).ok();
 
         for (op, actual, expected) in [
-            ("homogeneity_score", h, eh),
-            ("completeness_score", c, ec),
-            ("v_measure_score", v, ev),
+            ("homogeneity_score", h, arm.homog),
+            ("completeness_score", c, arm.complete),
+            ("v_measure_score", v, arm.v),
         ] {
+            let Some((expected, actual)) = ledger.pair(op, &case.case_id, expected, actual) else {
+                continue;
+            };
             let abs_d = (actual - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_{}", case.case_id, op),
                 op: op.into(),
@@ -308,6 +307,7 @@ fn diff_cluster_homog_complete_v() {
         test_id: "diff_cluster_homog_complete_v".into(),
         category: "fsci_cluster homogeneity/completeness/v_measure vs numpy formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -328,4 +328,5 @@ fn diff_cluster_homog_complete_v() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

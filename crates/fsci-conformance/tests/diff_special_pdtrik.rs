@@ -5,13 +5,14 @@
 //! the Poisson CDF: given a probability and an observed count m,
 //! returns the rate λ. Iterative — 1e-6 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::pdtrik;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -197,17 +199,18 @@ fn diff_special_pdtrik() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_pdtrik", &["pdtrik"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
+        let fsci_v = pdtrik(case.p, case.m);
+        let Some((scipy_v, fsci_v)) =
+            ledger.pair("pdtrik", &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
             continue;
         };
-        let fsci_v = pdtrik(case.p, case.m);
-        if !fsci_v.is_finite() {
-            continue;
-        }
         let abs_d = (fsci_v - scipy_v).abs();
+        ledger.compared("pdtrik", &case.case_id, abs_d <= ABS_TOL);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -222,6 +225,7 @@ fn diff_special_pdtrik() {
         test_id: "diff_special_pdtrik".into(),
         category: "scipy.special.pdtrik (Poisson rate inversion)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -242,4 +246,5 @@ fn diff_special_pdtrik() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

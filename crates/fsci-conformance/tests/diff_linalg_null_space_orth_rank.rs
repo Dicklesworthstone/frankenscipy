@@ -15,13 +15,14 @@
 //! - `numerical_rank`: returns an int that should match scipy.linalg
 //!   matrix_rank exactly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, null_space, numerical_rank, orth};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -303,109 +305,97 @@ fn diff_linalg_null_space_orth_rank() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["null", "orth", "rank"];
+    let mut ledger = CompareLedger::new("diff_linalg_null_space_orth_rank", &arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
         match case.op.as_str() {
             "null" => {
-                let Some(exp_cols) = arm.n_cols else { continue };
-                let Ok(n_basis) = null_space(&case.matrix, None, opts) else {
+                let fsci = null_space(&case.matrix, None, opts).ok();
+                let Some((exp_cols, n_basis)) =
+                    ledger.both("null", &case.case_id, arm.and_then(|a| a.n_cols), fsci)
+                else {
                     continue;
                 };
-                let m = case.matrix.len();
                 let n_cols = if n_basis.is_empty() {
                     0
                 } else {
                     n_basis[0].len()
                 };
-                if n_cols != exp_cols {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
+                let (abs_d, pass) = if n_cols != exp_cols {
                     max_overall = f64::INFINITY;
-                    continue;
-                }
-                if n_cols == 0 {
+                    (f64::INFINITY, false)
+                } else if n_cols == 0 {
                     // Both empty — pass
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: 0.0,
-                        pass: true,
-                    });
-                    continue;
-                }
-                // ||A · N||_F
-                // n_basis has shape (n_input_cols, n_cols)
-                let an = matmul(&case.matrix, &n_basis);
-                let d_an = frobenius_norm(&an);
-                // N^T N = I
-                let nt = transpose(&n_basis);
-                let nt_n = matmul(&nt, &n_basis);
-                let d_orth = frobenius_norm(&sub(&nt_n, &ident(n_cols)));
-                let abs_d = d_an.max(d_orth);
-                max_overall = max_overall.max(abs_d);
+                    (0.0, true)
+                } else {
+                    // ||A · N||_F
+                    // n_basis has shape (n_input_cols, n_cols)
+                    let an = matmul(&case.matrix, &n_basis);
+                    let d_an = frobenius_norm(&an);
+                    // N^T N = I
+                    let nt = transpose(&n_basis);
+                    let nt_n = matmul(&nt, &n_basis);
+                    let d_orth = frobenius_norm(&sub(&nt_n, &ident(n_cols)));
+                    let abs_d = d_an.max(d_orth);
+                    max_overall = max_overall.max(abs_d);
+                    // f64::max reads a NaN as the other operand; a NaN basis entry fails.
+                    let no_nan = !n_basis.iter().flatten().any(|v| v.is_nan());
+                    (abs_d, no_nan && abs_d <= ABS_TOL)
+                };
+                ledger.compared("null", &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     abs_diff: abs_d,
-                    pass: abs_d <= ABS_TOL,
+                    pass,
                 });
-                let _ = m;
             }
             "orth" => {
-                let Some(exp_cols) = arm.n_cols else { continue };
-                let Ok(q) = orth(&case.matrix, None, opts) else {
+                let fsci = orth(&case.matrix, None, opts).ok();
+                let Some((exp_cols, q)) =
+                    ledger.both("orth", &case.case_id, arm.and_then(|a| a.n_cols), fsci)
+                else {
                     continue;
                 };
                 let m = case.matrix.len();
                 let n_cols = if q.is_empty() { 0 } else { q[0].len() };
-                if n_cols != exp_cols {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
+                let (abs_d, pass) = if n_cols != exp_cols {
                     max_overall = f64::INFINITY;
-                    continue;
-                }
-                if n_cols == 0 {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: 0.0,
-                        pass: true,
-                    });
-                    continue;
-                }
-                // Q^T Q = I
-                let qt = transpose(&q);
-                let qt_q = matmul(&qt, &q);
-                let d_orth = frobenius_norm(&sub(&qt_q, &ident(n_cols)));
-                // range(Q) = range(A): (I - Q Q^T) A ≈ 0
-                let q_qt = matmul(&q, &qt);
-                let im = ident(m);
-                let i_qqt = sub(&im, &q_qt);
-                let i_qqt_a = matmul(&i_qqt, &case.matrix);
-                let d_range = frobenius_norm(&i_qqt_a);
-                let abs_d = d_orth.max(d_range);
-                max_overall = max_overall.max(abs_d);
+                    (f64::INFINITY, false)
+                } else if n_cols == 0 {
+                    (0.0, true)
+                } else {
+                    // Q^T Q = I
+                    let qt = transpose(&q);
+                    let qt_q = matmul(&qt, &q);
+                    let d_orth = frobenius_norm(&sub(&qt_q, &ident(n_cols)));
+                    // range(Q) = range(A): (I - Q Q^T) A ≈ 0
+                    let q_qt = matmul(&q, &qt);
+                    let im = ident(m);
+                    let i_qqt = sub(&im, &q_qt);
+                    let i_qqt_a = matmul(&i_qqt, &case.matrix);
+                    let d_range = frobenius_norm(&i_qqt_a);
+                    let abs_d = d_orth.max(d_range);
+                    max_overall = max_overall.max(abs_d);
+                    // f64::max reads a NaN as the other operand; a NaN basis entry fails.
+                    let no_nan = !q.iter().flatten().any(|v| v.is_nan());
+                    (abs_d, no_nan && abs_d <= ABS_TOL)
+                };
+                ledger.compared("orth", &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     abs_diff: abs_d,
-                    pass: abs_d <= ABS_TOL,
+                    pass,
                 });
             }
             "rank" => {
-                let Some(expected) = arm.rank else { continue };
-                let Ok(actual) = numerical_rank(&case.matrix, case.tol, opts) else {
+                let fsci = numerical_rank(&case.matrix, case.tol, opts).ok();
+                let Some((expected, actual)) =
+                    ledger.both("rank", &case.case_id, arm.and_then(|a| a.rank), fsci)
+                else {
                     continue;
                 };
                 let abs_d = if actual == expected {
@@ -414,6 +404,7 @@ fn diff_linalg_null_space_orth_rank() {
                     (actual as i64 - expected as i64).abs() as f64
                 };
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("rank", &case.case_id, actual == expected);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -421,7 +412,7 @@ fn diff_linalg_null_space_orth_rank() {
                     pass: actual == expected,
                 });
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         }
     }
 
@@ -431,6 +422,7 @@ fn diff_linalg_null_space_orth_rank() {
         test_id: "diff_linalg_null_space_orth_rank".into(),
         category: "fsci_linalg::{null_space, orth, numerical_rank} vs scipy.linalg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -450,5 +442,11 @@ fn diff_linalg_null_space_orth_rank() {
         "null/orth/rank conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

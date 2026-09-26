@@ -10,12 +10,14 @@
 //! normal-equation solve, so a coefficient-level bit match is not
 //! the right invariant; the evaluated curve is).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::make_lsq_spline;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -292,16 +295,23 @@ fn diff_interpolate_make_lsq_spline() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_interpolate_make_lsq_spline", &["make_lsq_spline"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.y_eval.as_ref() else {
-            continue;
-        };
 
-        let spline = match make_lsq_spline(&case.x, &case.y, &case.t, case.k) {
-            Ok(s) => s,
-            Err(e) => {
+        let spline = make_lsq_spline(&case.x, &case.y, &case.t, case.k);
+        let fsci_eval: Option<Vec<f64>> = spline
+            .as_ref()
+            .ok()
+            .map(|s| case.x_eval.iter().map(|xi| s.eval(*xi)).collect());
+        let Some((expected, fsci_eval)) = ledger.slices(
+            "make_lsq_spline",
+            &case.case_id,
+            o.y_eval.as_deref(),
+            fsci_eval.as_deref(),
+        ) else {
+            if let (Some(_), Err(e)) = (&o.y_eval, &spline) {
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     max_abs_diff: f64::INFINITY,
@@ -310,14 +320,13 @@ fn diff_interpolate_make_lsq_spline() {
                     pass: false,
                     note: format!("make_lsq_spline error: {e:?}"),
                 });
-                continue;
             }
+            continue;
         };
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
-        for (xi, exp) in case.x_eval.iter().zip(expected.iter()) {
-            let actual = spline.eval(*xi);
+        for (actual, exp) in fsci_eval.iter().zip(expected.iter()) {
             let abs_d = (actual - exp).abs();
             let denom = exp.abs().max(1.0e-300);
             let rel_d = abs_d / denom;
@@ -326,6 +335,7 @@ fn diff_interpolate_make_lsq_spline() {
         }
 
         let pass = max_rel <= REL_TOL || max_abs <= ABS_TOL;
+        ledger.compared("make_lsq_spline", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             max_abs_diff: max_abs,
@@ -341,6 +351,7 @@ fn diff_interpolate_make_lsq_spline() {
         test_id: "diff_interpolate_make_lsq_spline".into(),
         category: "fsci_interpolate::make_lsq_spline vs scipy.interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -362,4 +373,5 @@ fn diff_interpolate_make_lsq_spline() {
         "make_lsq_spline parity failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

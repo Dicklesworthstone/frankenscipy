@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy interpolation functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{
     NearestNDInterpolator, RbfInterpolator, RbfKernel, interp1d_linear, lagrange, polyfit, polyval,
     splev, splrep,
@@ -107,6 +108,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -608,12 +610,16 @@ fn diff_interp1d_linear() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_interp1d_linear", &["interp1d_linear"]);
 
     for case in &cases {
-        let Ok(rust_vals) = interp1d_linear(&case.x, &case.y, &case.x_new) else {
-            continue;
-        };
-        let Some(scipy_vals) = scipy_results.get(&case.case_id) else {
+        let rust_vals = interp1d_linear(&case.x, &case.y, &case.x_new).ok();
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            "interp1d_linear",
+            &case.case_id,
+            scipy_results.get(&case.case_id).map(Vec::as_slice),
+            rust_vals.as_deref(),
+        ) else {
             continue;
         };
 
@@ -623,13 +629,14 @@ fn diff_interp1d_linear() {
             .map(|(r, s)| (r - s).abs())
             .fold(0.0, f64::max);
         let pass = rust_vals.len() == scipy_vals.len() && case_max_diff <= INTERP_TOL;
+        ledger.compared("interp1d_linear", &case.case_id, pass);
         max_diff = max_diff.max(case_max_diff);
         all_pass = all_pass && pass;
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: "interp1d_linear".into(),
-            rust_values: rust_vals,
-            scipy_values: scipy_vals.clone(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
             max_diff: case_max_diff,
             tolerance: INTERP_TOL,
             pass,
@@ -641,6 +648,7 @@ fn diff_interp1d_linear() {
         test_id: "interp1d_linear".into(),
         category: "interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: INTERP_TOL,
         pass: all_pass,
@@ -652,6 +660,7 @@ fn diff_interp1d_linear() {
     emit_log(&log);
     assert_all_cases_compared("interp1d_linear", log.case_count, cases.len());
     assert!(all_pass, "interp1d_linear diff failed: max_diff={max_diff}");
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -676,26 +685,34 @@ fn diff_lagrange() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_lagrange", &["lagrange"]);
 
     for case in &cases {
-        if let Ok(coeffs) = lagrange(&case.xi, &case.yi) {
-            let rust_val = polyval(&coeffs, case.x_eval);
-            if let Some(&scipy_val) = scipy_results.get(&case.case_id) {
-                let abs_diff = (rust_val - scipy_val).abs();
-                let pass = abs_diff <= POLY_TOL;
-                max_diff = max_diff.max(abs_diff);
-                all_pass = all_pass && pass;
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    method: "lagrange".into(),
-                    rust_values: vec![rust_val],
-                    scipy_values: vec![scipy_val],
-                    max_diff: abs_diff,
-                    tolerance: POLY_TOL,
-                    pass,
-                });
-            }
-        }
+        let rust_val = lagrange(&case.xi, &case.yi)
+            .ok()
+            .map(|coeffs| polyval(&coeffs, case.x_eval));
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            "lagrange",
+            &case.case_id,
+            scipy_results.get(&case.case_id).copied(),
+            rust_val,
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_val - scipy_val).abs();
+        let pass = abs_diff <= POLY_TOL;
+        ledger.compared("lagrange", &case.case_id, pass);
+        max_diff = max_diff.max(abs_diff);
+        all_pass = all_pass && pass;
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: "lagrange".into(),
+            rust_values: vec![rust_val],
+            scipy_values: vec![scipy_val],
+            max_diff: abs_diff,
+            tolerance: POLY_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -703,6 +720,7 @@ fn diff_lagrange() {
         test_id: "lagrange".into(),
         category: "interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: POLY_TOL,
         pass: all_pass,
@@ -714,6 +732,7 @@ fn diff_lagrange() {
     emit_log(&log);
     assert_all_cases_compared("lagrange", log.case_count, cases.len());
     assert!(all_pass, "lagrange diff failed: max_diff={max_diff}");
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -738,26 +757,34 @@ fn diff_polyfit() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_polyfit", &["polyfit"]);
 
     for case in &cases {
-        if let Ok(coeffs) = polyfit(&case.x, &case.y, case.deg) {
-            let rust_val = polyval(&coeffs, case.x_eval);
-            if let Some(&scipy_val) = scipy_results.get(&case.case_id) {
-                let abs_diff = (rust_val - scipy_val).abs();
-                let pass = abs_diff <= POLY_TOL;
-                max_diff = max_diff.max(abs_diff);
-                all_pass = all_pass && pass;
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    method: "polyfit".into(),
-                    rust_values: vec![rust_val],
-                    scipy_values: vec![scipy_val],
-                    max_diff: abs_diff,
-                    tolerance: POLY_TOL,
-                    pass,
-                });
-            }
-        }
+        let rust_val = polyfit(&case.x, &case.y, case.deg)
+            .ok()
+            .map(|coeffs| polyval(&coeffs, case.x_eval));
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            "polyfit",
+            &case.case_id,
+            scipy_results.get(&case.case_id).copied(),
+            rust_val,
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_val - scipy_val).abs();
+        let pass = abs_diff <= POLY_TOL;
+        ledger.compared("polyfit", &case.case_id, pass);
+        max_diff = max_diff.max(abs_diff);
+        all_pass = all_pass && pass;
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: "polyfit".into(),
+            rust_values: vec![rust_val],
+            scipy_values: vec![scipy_val],
+            max_diff: abs_diff,
+            tolerance: POLY_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -765,6 +792,7 @@ fn diff_polyfit() {
         test_id: "polyfit".into(),
         category: "interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: POLY_TOL,
         pass: all_pass,
@@ -776,6 +804,7 @@ fn diff_polyfit() {
     emit_log(&log);
     assert_all_cases_compared("polyfit", log.case_count, cases.len());
     assert!(all_pass, "polyfit diff failed: max_diff={max_diff}");
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -800,15 +829,18 @@ fn diff_spline() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_spline", &["splrep+splev"]);
 
     for case in &cases {
-        let Ok(tck) = splrep(&case.x, &case.y, case.k, 0.0) else {
-            continue;
-        };
-        let Ok(rust_vals) = splev(&case.x_eval, &tck) else {
-            continue;
-        };
-        let Some(scipy_vals) = scipy_results.get(&case.case_id) else {
+        let rust_vals = splrep(&case.x, &case.y, case.k, 0.0)
+            .ok()
+            .and_then(|tck| splev(&case.x_eval, &tck).ok());
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            "splrep+splev",
+            &case.case_id,
+            scipy_results.get(&case.case_id).map(Vec::as_slice),
+            rust_vals.as_deref(),
+        ) else {
             continue;
         };
 
@@ -818,13 +850,14 @@ fn diff_spline() {
             .map(|(r, s)| (r - s).abs())
             .fold(0.0, f64::max);
         let pass = rust_vals.len() == scipy_vals.len() && case_max_diff <= POLY_TOL;
+        ledger.compared("splrep+splev", &case.case_id, pass);
         max_diff = max_diff.max(case_max_diff);
         all_pass = all_pass && pass;
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: "splrep+splev".into(),
-            rust_values: rust_vals,
-            scipy_values: scipy_vals.clone(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
             max_diff: case_max_diff,
             tolerance: POLY_TOL,
             pass,
@@ -836,6 +869,7 @@ fn diff_spline() {
         test_id: "spline".into(),
         category: "interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: POLY_TOL,
         pass: all_pass,
@@ -847,12 +881,14 @@ fn diff_spline() {
     emit_log(&log);
     assert_all_cases_compared("spline", log.case_count, cases.len());
     assert!(all_pass, "spline diff failed: max_diff={max_diff}");
+    ledger.finish(cases.len());
 }
 
 #[test]
 fn diff_rbf_interpolator() {
     let cases = rbf_cases();
     let mut compared = 0;
+    let mut ledger = CompareLedger::new("diff_rbf_interpolator", &["rbf_interpolator"]);
     for case in &cases {
         let kernel = rbf_kernel(&case.kernel);
         let rust = match case.degree {
@@ -882,11 +918,25 @@ fn diff_rbf_interpolator() {
             "{} output length",
             case.case_id
         );
+        // The max fold below swallows a NaN fsci value; the ledger records it instead.
+        let Some((scipy_values, rust_values)) = ledger.slices(
+            "rbf_interpolator",
+            &case.case_id,
+            Some(scipy.result.values.as_slice()),
+            Some(rust_values.as_slice()),
+        ) else {
+            continue;
+        };
         let max_abs_diff = rust_values
             .iter()
-            .zip(&scipy.result.values)
+            .zip(scipy_values)
             .map(|(rust, scipy)| (rust - scipy).abs())
             .fold(0.0_f64, f64::max);
+        ledger.compared(
+            "rbf_interpolator",
+            &case.case_id,
+            max_abs_diff <= case.tolerance,
+        );
         assert!(
             max_abs_diff <= case.tolerance,
             "{} differs from live SciPy by {max_abs_diff:.3e}, tolerance {:.3e}; rust={rust_values:?}, scipy={:?}",
@@ -897,6 +947,7 @@ fn diff_rbf_interpolator() {
         compared += 1;
     }
     assert_all_cases_compared("rbf_interpolator", compared, cases.len());
+    ledger.finish(cases.len());
 }
 
 /// Differential coverage for scipy.interpolate.NearestNDInterpolator.

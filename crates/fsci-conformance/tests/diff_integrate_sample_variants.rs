@@ -5,19 +5,27 @@
 //!
 //! Resolves [frankenscipy-v4u6c]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{simpson_irregular, simpson_uniform, trapezoid_irregular, trapezoid_uniform};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci entry point (the case `op`).
+const ARMS: [&str; 4] = [
+    "trapezoid_uniform",
+    "simpson_uniform",
+    "trapezoid_irregular",
+    "simpson_irregular",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -57,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -255,27 +264,25 @@ fn diff_integrate_sample_variants() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_sample_variants", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
+        let arm = case.op.as_str();
+        let fsci_v: Option<f64> = match arm {
+            "trapezoid_uniform" => trapezoid_uniform(&case.y, case.dx).ok().map(|r| r.integral),
+            "simpson_uniform" => simpson_uniform(&case.y, case.dx).ok().map(|r| r.integral),
+            "trapezoid_irregular" => Some(trapezoid_irregular(&case.y, &case.x)),
+            "simpson_irregular" => Some(simpson_irregular(&case.y, &case.x)),
+            _ => None,
         };
-        let fsci_v: f64 = match case.op.as_str() {
-            "trapezoid_uniform" => match trapezoid_uniform(&case.y, case.dx) {
-                Ok(r) => r.integral,
-                Err(_) => continue,
-            },
-            "simpson_uniform" => match simpson_uniform(&case.y, case.dx) {
-                Ok(r) => r.integral,
-                Err(_) => continue,
-            },
-            "trapezoid_irregular" => trapezoid_irregular(&case.y, &case.x),
-            "simpson_irregular" => simpson_irregular(&case.y, &case.x),
-            _ => continue,
+        let Some((expected, fsci_v)) = ledger.pair(arm, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -290,6 +297,7 @@ fn diff_integrate_sample_variants() {
         test_id: "diff_integrate_sample_variants".into(),
         category: "scipy.integrate uniform/irregular sample-grid variants".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -310,4 +318,12 @@ fn diff_integrate_sample_variants() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (the irregular arms have the fewest); each must compare all
+    // of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

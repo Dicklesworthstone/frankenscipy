@@ -15,13 +15,14 @@
 //! transformed vector element-wise with max-abs aggregation.
 //! Tol 1e-12 abs (closed-form per-element transform).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{boxcox, yeojohnson};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -258,31 +260,25 @@ fn diff_stats_power_forward() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_power_forward", &["boxcox", "yeojohnson"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.transformed else {
+        let rust_vec = fsci_eval(case);
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            scipy_arm.transformed.as_deref(),
+            rust_vec.as_deref(),
+        ) else {
             continue;
         };
-        let Some(rust_vec) = fsci_eval(case) else {
-            continue;
-        };
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-            if a.is_finite() {
-                max_local = max_local.max((a - b).abs());
-            }
+            max_local = max_local.max((a - b).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared(&case.func, &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -297,6 +293,7 @@ fn diff_stats_power_forward() {
         test_id: "diff_stats_power_forward".into(),
         category: "scipy.stats.boxcox/yeojohnson forward".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -321,4 +318,5 @@ fn diff_stats_power_forward() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "boxcox").count());
 }

@@ -3,13 +3,14 @@
 //!
 //! Resolves [frankenscipy-hl6fj]. 1e-12 abs on distance vectors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, bellman_ford};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,20 +240,26 @@ fn diff_sparse_bellman_ford() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_bellman_ford", &["bellman_ford"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_d) = scipy_arm.distances.as_ref() else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = bellman_ford(&csr, false, case.source) else {
+        let fsci_d = bellman_ford(&csr, false, case.source)
+            .ok()
+            .map(|res| res.distances);
+        let Some((scipy_d, fsci_d)) = ledger.both(
+            "bellman_ford",
+            &case.case_id,
+            scipy_arm.distances.as_ref(),
+            fsci_d,
+        ) else {
             continue;
         };
-        let abs_d = if res.distances.len() != scipy_d.len() {
+        let abs_d = if fsci_d.len() != scipy_d.len() {
             f64::INFINITY
         } else {
-            res.distances
+            fsci_d
                 .iter()
                 .zip(scipy_d.iter())
                 .map(|(a, b)| {
@@ -267,11 +275,14 @@ fn diff_sparse_bellman_ford() {
                 })
                 .fold(0.0_f64, f64::max)
         };
+        // The max fold drops a NaN distance (0.0_f64.max(NaN) is 0.0), so reject one here.
+        let pass = abs_d <= ABS_TOL && !fsci_d.iter().any(|v| v.is_nan());
         max_overall = max_overall.max(abs_d);
+        ledger.compared("bellman_ford", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -281,6 +292,7 @@ fn diff_sparse_bellman_ford() {
         test_id: "diff_sparse_bellman_ford".into(),
         category: "scipy.sparse.csgraph.bellman_ford".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -301,4 +313,5 @@ fn diff_sparse_bellman_ford() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

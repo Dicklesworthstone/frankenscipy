@@ -7,13 +7,14 @@
 //!   ihfft(x, n) = conj(rfft(pad_to_n(x))) / n
 //! Both checked against numpy formulas at 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{Complex64, FftOptions, hfft, ihfft};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -299,12 +301,11 @@ fn diff_fft_hfft_ihfft() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_fft_hfft_ihfft", &["hfft", "ihfft"]);
 
     // hfft
     for case in &query.hfft {
-        let Some(expected) = h_map.get(&case.case_id).and_then(|a| a.values.clone()) else {
-            continue;
-        };
+        let expected = h_map.get(&case.case_id).and_then(|a| a.values.as_deref());
         let x: Vec<Complex64> = case
             .x_packed
             .as_chunks::<2>()
@@ -312,18 +313,19 @@ fn diff_fft_hfft_ihfft() {
             .iter()
             .map(|c| (c[0], c[1]))
             .collect();
-        let Ok(out) = hfft(&x, Some(case.n), &opts) else {
+        let fsci_out = hfft(&x, Some(case.n), &opts).ok();
+        let Some((expected, out)) =
+            ledger.slices("hfft", &case.case_id, expected, fsci_out.as_deref())
+        else {
             continue;
         };
-        let abs_d = if out.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            out.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = out
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("hfft", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "hfft".into(),
@@ -334,27 +336,27 @@ fn diff_fft_hfft_ihfft() {
 
     // ihfft
     for case in &query.ihfft {
-        let Some(expected) = i_map.get(&case.case_id).and_then(|a| a.values.clone()) else {
-            continue;
-        };
-        let Ok(out) = ihfft(&case.x, Some(case.n), &opts) else {
-            continue;
-        };
-        let mut packed = Vec::with_capacity(out.len() * 2);
-        for &(re, im) in &out {
-            packed.push(re);
-            packed.push(im);
-        }
-        let abs_d = if packed.len() != expected.len() {
-            f64::INFINITY
-        } else {
+        let expected = i_map.get(&case.case_id).and_then(|a| a.values.as_deref());
+        let fsci_packed = ihfft(&case.x, Some(case.n), &opts).ok().map(|out| {
+            let mut packed = Vec::with_capacity(out.len() * 2);
+            for &(re, im) in &out {
+                packed.push(re);
+                packed.push(im);
+            }
             packed
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        });
+        let Some((expected, packed)) =
+            ledger.slices("ihfft", &case.case_id, expected, fsci_packed.as_deref())
+        else {
+            continue;
         };
+        let abs_d = packed
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("ihfft", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "ihfft".into(),
@@ -369,6 +371,7 @@ fn diff_fft_hfft_ihfft() {
         test_id: "diff_fft_hfft_ihfft".into(),
         category: "fsci_fft::hfft + ihfft vs scipy-convention numpy formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -389,4 +392,5 @@ fn diff_fft_hfft_ihfft() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.hfft.len().min(query.ihfft.len()));
 }

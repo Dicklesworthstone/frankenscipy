@@ -10,13 +10,14 @@
 //! functions × 2 alternatives × 2 arms = 24 cases via
 //! subprocess. Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kurtosistest, skewtest};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -236,41 +238,58 @@ fn diff_stats_skew_kurt_alt() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_skew_kurt_alt",
+        &[
+            "skewtest_statistic",
+            "skewtest_pvalue",
+            "kurtosistest_statistic",
+            "kurtosistest_pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let result = match case.func.as_str() {
-            "skewtest" => skewtest(&case.data, None, Some(&case.alternative)),
-            "kurtosistest" => kurtosistest(&case.data, None, Some(&case.alternative)),
-            _ => continue,
+        let (result, stat_arm, p_arm) = match case.func.as_str() {
+            "skewtest" => (
+                skewtest(&case.data, None, Some(&case.alternative)),
+                "skewtest_statistic",
+                "skewtest_pvalue",
+            ),
+            "kurtosistest" => (
+                kurtosistest(&case.data, None, Some(&case.alternative)),
+                "kurtosistest_statistic",
+                "kurtosistest_pvalue",
+            ),
+            other => panic!("unknown skew_kurt_alt func `{other}`"),
         };
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let result = result.ok();
 
-        if let Some(scipy_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - scipy_stat).abs();
+        let arms = [
+            (
+                stat_arm,
+                "statistic",
+                scipy_arm.statistic,
+                result.as_ref().map(|r| r.statistic),
+            ),
+            (
+                p_arm,
+                "pvalue",
+                scipy_arm.pvalue,
+                result.as_ref().map(|r| r.pvalue),
+            ),
+        ];
+        for (ledger_arm, arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(ledger_arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(ledger_arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 func: case.func.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -283,6 +302,7 @@ fn diff_stats_skew_kurt_alt() {
         test_id: "diff_stats_skew_kurt_alt".into(),
         category: "scipy.stats.skewtest/kurtosistest alternative=less|greater".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -307,4 +327,10 @@ fn diff_stats_skew_kurt_alt() {
         diffs.len(),
         max_overall
     );
+    let min_per_func = ["skewtest", "kurtosistest"]
+        .iter()
+        .map(|&func| query.points.iter().filter(|c| c.func == func).count())
+        .min()
+        .expect("skew_kurt_alt declares its functions");
+    ledger.finish(min_per_func);
 }

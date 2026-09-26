@@ -4,12 +4,14 @@
 //! Tests FrankenSciPy statistics functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use fsci_conformance::{ArmCounts, CompareLedger};
 
 // SCOPE NOTE (frankenscipy-1p21x, resolved by frankenscipy-9fjdi): ea0a03be8
 // dropped the resampling columns from this harness because `bootstrap`,
@@ -61,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -345,18 +348,18 @@ json.dump(results, sys.stdout)
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn scipy_oracle_or_skip(cases: &[StatsCase]) -> Vec<OracleResult> {
-    match run_scipy_oracle(cases) {
-        Some(results) => results,
-        None => {
-            assert!(
-                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
-                "SciPy oracle required but not available"
-            );
-            eprintln!("SciPy oracle not available, skipping diff test");
-            Vec::new()
-        }
+/// `None` only when SciPy could not be run. An oracle that ran and raised on every case returns
+/// `Some(vec![])`, which must reach the coverage asserts and the ledger, not skip the test.
+fn scipy_oracle_or_skip(cases: &[StatsCase]) -> Option<Vec<OracleResult>> {
+    let results = run_scipy_oracle(cases);
+    if results.is_none() {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "SciPy oracle required but not available"
+        );
+        eprintln!("SciPy oracle not available, skipping diff test");
     }
+    results
 }
 
 fn compute_rust_value(case: &StatsCase) -> Option<(f64, Option<f64>)> {
@@ -403,11 +406,9 @@ fn compute_rust_value(case: &StatsCase) -> Option<(f64, Option<f64>)> {
 #[test]
 fn diff_stats_basic() {
     let cases = stats_cases();
-    let oracle_results = scipy_oracle_or_skip(&cases);
-
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&cases) else {
         return;
-    }
+    };
     assert_eq!(
         oracle_results.len(),
         cases.len(),
@@ -447,21 +448,37 @@ fn diff_stats_basic() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let funcs = [
+        "gmean",
+        "hmean",
+        "pmean",
+        "circmean",
+        "circvar",
+        "circstd",
+        "quantile",
+        "ttest_1samp",
+        "ttest_ind",
+        "mannwhitneyu",
+        "wasserstein",
+        "energy",
+    ];
+    let mut ledger = CompareLedger::new("diff_stats_basic", &funcs);
 
     for case in &cases {
-        let Some((rust_val, _rust_val2)) = compute_rust_value(case) else {
-            continue;
-        };
-        let Some(scipy_result) = oracle_map.get(&case.case_id) else {
+        let rust_val = compute_rust_value(case).map(|(value, _rust_val2)| value);
+        let scipy_val = oracle_map.get(&case.case_id).map(|r| r.value);
+        let Some((scipy_val, rust_val)) =
+            ledger.pair(&case.func, &case.case_id, scipy_val, rust_val)
+        else {
             continue;
         };
 
-        let scipy_val = scipy_result.value;
         let abs_diff = (rust_val - scipy_val).abs();
         let rel_scale = rust_val.abs().max(scipy_val.abs()).max(1.0);
         let effective_tol = TOL * rel_scale;
 
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= effective_tol);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -480,6 +497,7 @@ fn diff_stats_basic() {
         test_id: "diff_stats_basic".into(),
         category: "scipy.stats".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -505,6 +523,12 @@ fn diff_stats_basic() {
         diffs.len(),
         max_diff
     );
+    let min_per_func = funcs
+        .iter()
+        .map(|&func| cases.iter().filter(|c| c.func == func).count())
+        .min()
+        .expect("diff_stats_basic declares its functions");
+    ledger.finish(min_per_func);
 }
 
 #[test]
@@ -585,14 +609,10 @@ json.dump(results, sys.stdout)
         return;
     }
 
-    let oracle_results: Vec<OracleResult> = match serde_json::from_slice(&output.stdout) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    if oracle_results.is_empty() {
-        return;
-    }
+    // SciPy ran: an unparseable or empty result is a failure to explain, not a skip (an oracle that
+    // raised on every case prints `[]`).
+    let oracle_results: Vec<OracleResult> =
+        serde_json::from_slice(&output.stdout).expect("parse SciPy wilcoxon oracle JSON");
     assert_eq!(
         oracle_results.len(),
         cases.len(),
@@ -622,22 +642,24 @@ json.dump(results, sys.stdout)
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_wilcoxon", &["wilcoxon"]);
 
     for case in &cases {
         let data2 = case.data2.as_ref().unwrap();
         let res = wilcoxon(&case.data, data2);
-        let rust_val = res.statistic;
-
-        let Some(scipy_result) = oracle_map.get(&case.case_id) else {
+        let scipy_val = oracle_map.get(&case.case_id).map(|r| r.value);
+        let Some((scipy_val, rust_val)) =
+            ledger.pair("wilcoxon", &case.case_id, scipy_val, Some(res.statistic))
+        else {
             continue;
         };
 
-        let scipy_val = scipy_result.value;
         let abs_diff = (rust_val - scipy_val).abs();
         let rel_scale = rust_val.abs().max(scipy_val.abs()).max(1.0);
         let effective_tol = TOL * rel_scale;
 
         max_diff = max_diff.max(abs_diff);
+        ledger.compared("wilcoxon", &case.case_id, abs_diff <= effective_tol);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -656,6 +678,7 @@ json.dump(results, sys.stdout)
         test_id: "diff_stats_wilcoxon".into(),
         category: "scipy.stats.wilcoxon".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -681,6 +704,7 @@ json.dump(results, sys.stdout)
         diffs.len(),
         max_diff
     );
+    ledger.finish(cases.len());
 }
 
 // ---------------------------------------------------------------------------

@@ -11,13 +11,14 @@
 //! subprocess. Tol 1e-12 abs (closed-form linear-interpolation
 //! quantile chain).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{idealfourths, iqr};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -221,44 +223,28 @@ fn diff_stats_idealfourths() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_idealfourths", &["qlo", "qup", "iqr"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_qlo, rust_qup) = idealfourths(&case.data);
         let rust_iqr = iqr(&case.data);
 
-        if let Some(s_qlo) = scipy_arm.qlo
-            && rust_qlo.is_finite()
-        {
-            let abs_diff = (rust_qlo - s_qlo).abs();
+        let arms = [
+            ("qlo", scipy_arm.qlo, rust_qlo),
+            ("qup", scipy_arm.qup, rust_qup),
+            ("iqr", scipy_arm.iqr, rust_iqr),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "qlo".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(s_qup) = scipy_arm.qup
-            && rust_qup.is_finite()
-        {
-            let abs_diff = (rust_qup - s_qup).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "qup".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(s_iqr) = scipy_arm.iqr
-            && rust_iqr.is_finite()
-        {
-            let abs_diff = (rust_iqr - s_iqr).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "iqr".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -271,6 +257,7 @@ fn diff_stats_idealfourths() {
         test_id: "diff_stats_idealfourths".into(),
         category: "scipy.stats.mstats.idealfourths + scipy.stats.iqr".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -295,4 +282,5 @@ fn diff_stats_idealfourths() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

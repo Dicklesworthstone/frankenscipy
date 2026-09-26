@@ -13,13 +13,14 @@
 //! Tolerance: 1e-8 abs on coherence values (autocoherence ≡ 1) and
 //! frequencies; 1e-8 abs on spectrogram sxx values.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{coherence, spectrogram};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -296,6 +298,23 @@ fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// A result packed as `[frequencies..., rest...]`, with the frequency count that marks the split.
+fn pack(frequencies: &[f64], rest: &[f64]) -> (usize, Vec<f64>) {
+    (frequencies.len(), [frequencies, rest].concat())
+}
+
+/// Max abs diff of the frequency block and of the rest of two packed results of equal length;
+/// both are infinite when the two sides split at different frequency counts.
+fn split_max_diff(got: &[f64], got_nf: usize, exp: &[f64], exp_nf: usize) -> (f64, f64) {
+    if got_nf != exp_nf {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+    (
+        vec_max_diff(&got[..got_nf], &exp[..exp_nf]),
+        vec_max_diff(&got[got_nf..], &exp[exp_nf..]),
+    )
+}
+
 #[test]
 fn diff_signal_coherence_spectrogram() {
     let query = generate_query();
@@ -312,31 +331,40 @@ fn diff_signal_coherence_spectrogram() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_coherence_spectrogram", &["coh", "spec"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
         match case.op.as_str() {
             "coh" => {
-                let (Some(exp_f), Some(exp_v)) = (arm.frequencies.as_ref(), arm.values.as_ref())
-                else {
-                    continue;
-                };
-                let Ok(r) = coherence(
+                let scipy_packed = arm.and_then(|a| {
+                    let (f, v) = (a.frequencies.as_ref()?, a.values.as_ref()?);
+                    Some(pack(f, v))
+                });
+                let fsci_packed = coherence(
                     &case.x,
                     &case.y,
                     case.fs,
                     Some(&case.window),
                     Some(case.nperseg),
                     Some(case.noverlap),
+                )
+                .ok()
+                .map(|r| pack(&r.frequencies, &r.coherence));
+                let Some((exp, got)) = ledger.slices(
+                    "coh",
+                    &case.case_id,
+                    scipy_packed.as_ref().map(|(_, v)| v.as_slice()),
+                    fsci_packed.as_ref().map(|(_, v)| v.as_slice()),
                 ) else {
                     continue;
                 };
-                let d_f = vec_max_diff(&r.frequencies, exp_f);
-                let d_v = vec_max_diff(&r.coherence, exp_v);
+                let exp_nf = scipy_packed.as_ref().map_or(0, |(nf, _)| *nf);
+                let got_nf = fsci_packed.as_ref().map_or(0, |(nf, _)| *nf);
+                let (d_f, d_v) = split_max_diff(got, got_nf, exp, exp_nf);
                 let abs_d = d_f.max(d_v);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("coh", &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -345,31 +373,45 @@ fn diff_signal_coherence_spectrogram() {
                 });
             }
             "spec" => {
-                let (Some(exp_f), Some(exp_t), Some(exp_sxx)) = (
-                    arm.frequencies.as_ref(),
-                    arm.times.as_ref(),
-                    arm.sxx_flat.as_ref(),
-                ) else {
-                    continue;
-                };
-                let Ok(r) = spectrogram(
+                // SciPy's times must be present but are not compared: half-sample alignment
+                // differs.
+                let scipy_packed = arm.and_then(|a| {
+                    let (f, _t, s) = (
+                        a.frequencies.as_ref()?,
+                        a.times.as_ref()?,
+                        a.sxx_flat.as_ref()?,
+                    );
+                    Some(pack(f, s))
+                });
+                let fsci_packed = spectrogram(
                     &case.x,
                     case.fs,
                     Some(&case.window),
                     Some(case.nperseg),
                     Some(case.noverlap),
+                )
+                .ok()
+                .map(|r| {
+                    let mut flat = Vec::new();
+                    for row in &r.sxx {
+                        flat.extend_from_slice(row);
+                    }
+                    pack(&r.frequencies, &flat)
+                });
+                let Some((exp, got)) = ledger.slices(
+                    "spec",
+                    &case.case_id,
+                    scipy_packed.as_ref().map(|(_, v)| v.as_slice()),
+                    fsci_packed.as_ref().map(|(_, v)| v.as_slice()),
                 ) else {
                     continue;
                 };
-                let mut flat = Vec::new();
-                for row in &r.sxx {
-                    flat.extend_from_slice(row);
-                }
-                let _unused_times = exp_t; // half-sample alignment differs; skip
-                let d_f = vec_max_diff(&r.frequencies, exp_f);
-                let d_s = vec_max_diff(&flat, exp_sxx);
+                let exp_nf = scipy_packed.as_ref().map_or(0, |(nf, _)| *nf);
+                let got_nf = fsci_packed.as_ref().map_or(0, |(nf, _)| *nf);
+                let (d_f, d_s) = split_max_diff(got, got_nf, exp, exp_nf);
                 let abs_d = d_f.max(d_s);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("spec", &case.case_id, d_f <= ABS_TOL && d_s <= SPEC_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -377,7 +419,7 @@ fn diff_signal_coherence_spectrogram() {
                     pass: d_f <= ABS_TOL && d_s <= SPEC_TOL,
                 });
             }
-            _ => continue,
+            other => panic!("generate_query emits only coh and spec cases, got `{other}`"),
         }
     }
 
@@ -387,6 +429,7 @@ fn diff_signal_coherence_spectrogram() {
         test_id: "diff_signal_coherence_spectrogram".into(),
         category: "fsci_signal::{coherence, spectrogram} vs scipy.signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -407,4 +450,6 @@ fn diff_signal_coherence_spectrogram() {
         diffs.len(),
         max_overall
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("coh").min(per_op("spec")));
 }

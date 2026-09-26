@@ -15,13 +15,14 @@
 //! 3 (f_obs, f_exp) fixtures × 4 lambdas × 2 arms (statistic
 //! + pvalue) = 24 cases via subprocess. Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{chisquare, power_divergence};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -242,6 +244,7 @@ fn diff_stats_chisquare_power() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_chisquare_power", &["statistic", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -269,26 +272,20 @@ fn diff_stats_chisquare_power() {
             power_divergence(&case.f_obs, exp_ref, case.lambda_)
         };
 
-        if let Some(scipy_stat) = scipy_arm.statistic
-            && stat.is_finite()
-        {
-            let abs_diff = (stat - scipy_stat).abs();
+        let arms = [
+            ("statistic", scipy_arm.statistic, stat),
+            ("pvalue", scipy_arm.pvalue, pval),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && pval.is_finite()
-        {
-            let abs_diff = (pval - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -301,6 +298,7 @@ fn diff_stats_chisquare_power() {
         test_id: "diff_stats_chisquare_power".into(),
         category: "scipy.stats.chisquare/power_divergence".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -325,4 +323,5 @@ fn diff_stats_chisquare_power() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

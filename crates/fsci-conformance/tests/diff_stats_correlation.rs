@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy correlation functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kendalltau, linregress, pearsonr, spearmanr};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_stat_diff: f64,
     max_pval_diff: f64,
     tolerance: f64,
@@ -389,6 +391,10 @@ fn diff_stats_correlation() {
     let mut diffs = Vec::new();
     let mut max_stat_diff = 0.0_f64;
     let mut max_pval_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_correlation",
+        &["pearsonr", "spearmanr", "kendalltau", "linregress"],
+    );
 
     for case in &cases {
         let rust_result = compute_rust_correlation(case);
@@ -397,12 +403,15 @@ fn diff_stats_correlation() {
             "unsupported correlation function {}",
             case.func
         );
-        let Some((rust_stat, rust_pval, rust_slope, rust_intercept)) = rust_result else {
-            continue;
-        };
         let scipy_result = oracle_map
             .get(&case.case_id)
             .expect("validated complete correlation oracle map");
+        // The oracle reports a raise as a NaN statistic/pvalue; NaN fails every `<=` below.
+        let Some((scipy_result, (rust_stat, rust_pval, rust_slope, rust_intercept))) =
+            ledger.both(&case.func, &case.case_id, Some(scipy_result), rust_result)
+        else {
+            continue;
+        };
 
         let scipy_stat = scipy_result.statistic;
         let scipy_pval = scipy_result.pvalue;
@@ -435,6 +444,7 @@ fn diff_stats_correlation() {
             let intercept_tol = TOL * ri.abs().max(si.abs()).max(1.0);
             pass = pass && slope_diff <= slope_tol && intercept_diff <= intercept_tol;
         }
+        ledger.compared(&case.func, &case.case_id, pass);
 
         max_stat_diff = max_stat_diff.max(stat_diff);
         max_pval_diff = max_pval_diff.max(pval_diff);
@@ -465,6 +475,7 @@ fn diff_stats_correlation() {
         test_id: "diff_stats_correlation".into(),
         category: "scipy.stats.correlation".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_stat_diff,
         max_pval_diff,
         tolerance: TOL,
@@ -498,4 +509,5 @@ fn diff_stats_correlation() {
         max_stat_diff,
         max_pval_diff
     );
+    ledger.finish(cases.iter().filter(|c| c.func == "pearsonr").count());
 }

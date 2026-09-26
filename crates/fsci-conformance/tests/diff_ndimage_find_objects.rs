@@ -6,13 +6,14 @@
 //! scipy returns list of `slice(start, stop)` tuples (stop-exclusive).
 //! Conversion: scipy.start == fsci.min, scipy.stop == fsci.max + 1.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, find_objects};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -240,25 +242,27 @@ fn diff_ndimage_find_objects() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_find_objects", &["find_objects"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_boxes) = scipy_arm.boxes.as_ref() else {
+        let fsci_boxes = NdArray::new(case.labels.clone(), case.input_shape.clone())
+            .ok()
+            .map(|labels| find_objects(&labels, case.num_labels));
+        let Some((scipy_boxes, fsci_boxes)) = ledger.both(
+            "find_objects",
+            &case.case_id,
+            scipy_arm.boxes.as_ref(),
+            fsci_boxes,
+        ) else {
             continue;
         };
-        let Ok(labels) = NdArray::new(case.labels.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let fsci_boxes = find_objects(&labels, case.num_labels);
-        if fsci_boxes.len() != scipy_boxes.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                pass: false,
-            });
-            continue;
-        }
-        let mut ok = true;
+        // a label-count mismatch fails the case
+        let mut ok = fsci_boxes.len() == scipy_boxes.len();
         for (fb, sb) in fsci_boxes.iter().zip(scipy_boxes.iter()) {
+            if !ok {
+                break;
+            }
             match fb {
                 None => {
                     if !sb.is_empty() {
@@ -281,6 +285,7 @@ fn diff_ndimage_find_objects() {
                 }
             }
         }
+        ledger.compared("find_objects", &case.case_id, ok);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             pass: ok,
@@ -293,6 +298,7 @@ fn diff_ndimage_find_objects() {
         test_id: "diff_ndimage_find_objects".into(),
         category: "scipy.ndimage.find_objects".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -311,4 +317,5 @@ fn diff_ndimage_find_objects() {
         "scipy.ndimage.find_objects conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

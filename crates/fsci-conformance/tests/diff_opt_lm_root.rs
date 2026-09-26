@@ -5,13 +5,14 @@
 //! multiple solutions; use the property ||F(x)||_∞ < 1e-5 on both
 //! fsci and scipy solutions instead of comparing x directly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::lm_root;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -210,36 +212,39 @@ fn diff_opt_lm_root() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_lm_root", &["lm_root"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(scipy_x) = arm.x.as_ref() else {
-            continue;
-        };
+        // A missing oracle row is recorded as SciPy giving no value, not skipped.
+        let scipy_x = pmap.get(&case.case_id).and_then(|arm| arm.x.as_deref());
         let fname = case.func.clone();
         let f = move |x: &[f64]| func(&fname, x);
-        let Ok(res) = lm_root(&f, &case.x0, 1.0e-10, 200) else {
+        // SciPy's row exists only when it converged, so a non-converged fsci solve is a failure.
+        let res = lm_root(&f, &case.x0, 1.0e-10, 200)
+            .ok()
+            .filter(|res| res.converged);
+        let Some((scipy_x, fsci_x)) = ledger.slices(
+            "lm_root",
+            &case.case_id,
+            scipy_x,
+            res.as_ref().map(|res| res.x.as_slice()),
+        ) else {
             continue;
         };
-        if !res.converged {
-            continue;
-        }
-        let fsci_residual = func(&case.func, &res.x)
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max);
-        let scipy_residual = func(&case.func, scipy_x)
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max);
+        let fsci_f = func(&case.func, fsci_x);
+        let scipy_f = func(&case.func, scipy_x);
+        let fsci_residual = fsci_f.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let scipy_residual = scipy_f.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
         let abs_d = fsci_residual.max(scipy_residual);
         max_overall = max_overall.max(abs_d);
+        // The residual max folds swallow a NaN component, so one fails the case explicitly.
+        let no_nan = !fsci_f.iter().chain(&scipy_f).any(|v| v.is_nan());
+        let pass = no_nan && abs_d <= RESIDUAL_TOL;
+        ledger.compared("lm_root", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= RESIDUAL_TOL,
+            pass,
         });
     }
 
@@ -249,6 +254,7 @@ fn diff_opt_lm_root() {
         test_id: "diff_opt_lm_root".into(),
         category: "fsci_opt::lm_root vs scipy.optimize.root(method='lm') via residual".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -269,4 +275,5 @@ fn diff_opt_lm_root() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -14,13 +14,14 @@
 //! so this is mostly a parity-by-composition harness. scipy is called
 //! with `size=(s,)*ndim` to get the same flat structuring element.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     BoundaryMode, NdArray, black_tophat, grey_closing, grey_dilation, grey_erosion, grey_opening,
     morphological_gradient, white_tophat,
@@ -71,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -294,30 +296,35 @@ fn diff_ndimage_grey_morphology() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = [
+        "erosion",
+        "dilation",
+        "opening",
+        "closing",
+        "morph_gradient",
+        "white_tophat",
+        "black_tophat",
+    ];
+    let mut ledger = CompareLedger::new("diff_ndimage_grey_morphology", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(fsci_v) = fsci_eval(case) else {
+        let fsci_v = fsci_eval(case);
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -332,6 +339,7 @@ fn diff_ndimage_grey_morphology() {
         test_id: "diff_ndimage_grey_morphology".into(),
         category: "scipy.ndimage grey morph + tophat/gradient".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -354,5 +362,11 @@ fn diff_ndimage_grey_morphology() {
         "scipy.ndimage grey morphology conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

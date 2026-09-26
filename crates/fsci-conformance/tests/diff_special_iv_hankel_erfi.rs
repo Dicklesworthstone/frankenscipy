@@ -11,13 +11,14 @@
 //!   1e-9 abs for small |x|, 1e-6 rel for |x| ≥ 1 (erfi grows
 //!   exponentially).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::Complex64 as FsciComplex;
 use fsci_special::types::SpecialTensor;
@@ -30,6 +31,8 @@ const IV_ABS_TOL: f64 = 1.0e-7;
 const HANKEL_ABS_TOL: f64 = 1.0e-6;
 const ERFI_ABS_TOL: f64 = 1.0e-9;
 const ERFI_REL_TOL: f64 = 1.0e-6;
+/// One ledger arm per op compared.
+const ARMS: [&str; 4] = ["iv", "hankel1", "hankel2", "erfi"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -70,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -310,61 +314,76 @@ fn diff_special_iv_hankel_erfi() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_iv_hankel_erfi", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let (abs_d, tol) = match case.op.as_str() {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.values.as_deref());
+        // `no_nan` is true for the scalar arms (`pair` hands back only finite values); the
+        // hankel metric is a `f64::max` of component differences, which drops a NaN operand.
+        let (abs_d, tol, no_nan) = match case.op.as_str() {
             "iv" => {
-                let Some(r) = fsci_iv(case.v, case.z) else {
+                let Some((expected, r)) = ledger.pair(
+                    "iv",
+                    &case.case_id,
+                    scipy.and_then(|v| v.first().copied()),
+                    fsci_iv(case.v, case.z),
+                ) else {
                     continue;
                 };
-                ((r - expected[0]).abs(), IV_ABS_TOL)
+                ((r - expected).abs(), IV_ABS_TOL, true)
             }
             "hankel1" | "hankel2" => {
-                let Some((re, im)) = fsci_hankel(&case.op, case.v, case.z) else {
+                let Some((expected, (re, im))) = ledger.both(
+                    &case.op,
+                    &case.case_id,
+                    scipy,
+                    fsci_hankel(&case.op, case.v, case.z),
+                ) else {
                     continue;
                 };
                 let d_re = (re - expected[0]).abs();
                 let d_im = (im - expected[1]).abs();
-                (d_re.max(d_im), HANKEL_ABS_TOL)
+                (d_re.max(d_im), HANKEL_ABS_TOL, !re.is_nan() && !im.is_nan())
             }
             "erfi" => {
-                let Some(r) = fsci_erfi(case.x) else {
+                let Some((expected, r)) = ledger.pair(
+                    "erfi",
+                    &case.case_id,
+                    scipy.and_then(|v| v.first().copied()),
+                    fsci_erfi(case.x),
+                ) else {
                     continue;
                 };
-                let abs = (r - expected[0]).abs();
-                let rel = if expected[0].abs() > 1.0 {
-                    abs / expected[0].abs()
+                let abs = (r - expected).abs();
+                let rel = if expected.abs() > 1.0 {
+                    abs / expected.abs()
                 } else {
                     0.0
                 };
                 // pass if either abs or rel tolerance holds
-                let tol = if expected[0].abs() > 1.0 {
+                let tol = if expected.abs() > 1.0 {
                     f64::INFINITY // rely on relative
                 } else {
                     ERFI_ABS_TOL
                 };
-                let abs_d = if expected[0].abs() > 1.0 {
+                let abs_d = if expected.abs() > 1.0 {
                     // For large |result|, transform diff to be ≤ rel_tol if it is
                     if rel <= ERFI_REL_TOL { 0.0 } else { abs }
                 } else {
                     abs
                 };
-                (abs_d, tol)
+                (abs_d, tol, true)
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
         max_overall = max_overall.max(abs_d);
+        let pass = no_nan && abs_d <= tol;
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= tol,
+            pass,
         });
     }
 
@@ -374,6 +393,7 @@ fn diff_special_iv_hankel_erfi() {
         test_id: "diff_special_iv_hankel_erfi".into(),
         category: "fsci_special::{iv, hankel1, hankel2, erfi} vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -394,4 +414,11 @@ fn diff_special_iv_hankel_erfi() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (iv and erfi have the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

@@ -15,13 +15,14 @@
 //! element to escape clipping when ceil(limits.1 * n) = 1.
 //! Tracked as [frankenscipy-q3sk7].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{idealfourths, moment};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -263,56 +265,46 @@ fn diff_stats_moment_etc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_moment_etc",
+        &["moment.scalar", "idealfourths.qlo", "idealfourths.qup"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        match case.func.as_str() {
-            "moment" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = moment(&case.data, case.order);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: "scalar".into(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
+        // (ledger arm, CaseDiff arm, SciPy value, fsci value)
+        let arms: Vec<(&str, &str, Option<f64>, f64)> = match case.func.as_str() {
+            "moment" => vec![(
+                "moment.scalar",
+                "scalar",
+                scipy_arm.scalar,
+                moment(&case.data, case.order),
+            )],
             "idealfourths" => {
                 let (rust_lo, rust_hi) = idealfourths(&case.data);
-                if let Some(scipy_lo) = scipy_arm.qlo
-                    && rust_lo.is_finite()
-                {
-                    let abs_diff = (rust_lo - scipy_lo).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "qlo".into(),
-                        abs_diff,
-                        pass: abs_diff <= ABS_TOL,
-                    });
-                }
-                if let Some(scipy_hi) = scipy_arm.qup
-                    && rust_hi.is_finite()
-                {
-                    let abs_diff = (rust_hi - scipy_hi).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "qup".into(),
-                        abs_diff,
-                        pass: abs_diff <= ABS_TOL,
-                    });
-                }
+                vec![
+                    ("idealfourths.qlo", "qlo", scipy_arm.qlo, rust_lo),
+                    ("idealfourths.qup", "qup", scipy_arm.qup, rust_hi),
+                ]
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
+        };
+        for (ledger_arm, arm, scipy_v, rust_v) in arms {
+            let Some((scipy_v, rust_v)) =
+                ledger.pair(ledger_arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(ledger_arm, &case.case_id, abs_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                func: case.func.clone(),
+                arm: arm.into(),
+                abs_diff,
+                pass: abs_diff <= ABS_TOL,
+            });
         }
     }
 
@@ -322,6 +314,7 @@ fn diff_stats_moment_etc() {
         test_id: "diff_stats_moment_etc".into(),
         category: "scipy.stats.moment + mstats.winsorize + mstats.idealfourths".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -346,4 +339,12 @@ fn diff_stats_moment_etc() {
         diffs.len(),
         max_overall
     );
+    // moment has 5 orders per dataset, idealfourths one case per dataset; each arm must compare
+    // all of its own cases, so the minimum is the smaller func's case count.
+    let min_per_arm = ["moment", "idealfourths"]
+        .iter()
+        .map(|func| query.points.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("two funcs");
+    ledger.finish(min_per_arm);
 }

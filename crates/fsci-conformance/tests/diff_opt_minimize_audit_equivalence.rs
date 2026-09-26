@@ -4,10 +4,12 @@
 //!
 //! Resolves [frankenscipy-lg5aa].
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
     MinimizeOptions, OptimizeMethod, minimize, minimize_with_audit, minimize_with_casp_portfolio,
     sync_audit_ledger,
@@ -31,6 +33,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -119,6 +122,20 @@ fn diff_opt_minimize_audit_equivalence() {
         ),
     ];
 
+    // One arm per method, named as the log's `op`; plain `minimize` is the reference side.
+    let method_arms = ["NelderMead", "Bfgs", "Powell"];
+    let min_per_arm = method_arms
+        .iter()
+        .map(|arm| {
+            probes
+                .iter()
+                .filter(|probe| format!("{:?}", probe.2) == *arm)
+                .count()
+        })
+        .min()
+        .expect("method_arms is non-empty");
+    let mut compare = CompareLedger::new("diff_opt_minimize_audit_equivalence", &method_arms);
+
     for (label, x0, method, f) in probes {
         let opts = MinimizeOptions {
             method: Some(method),
@@ -126,9 +143,17 @@ fn diff_opt_minimize_audit_equivalence() {
         };
         let plain = minimize(f, &x0, opts);
         let audited = minimize_with_audit(f, &x0, opts, &ledger);
+        let arm = format!("{method:?}");
         let pass = match (&plain, &audited) {
             (Ok(p), Ok(a)) => {
-                let d_x = vec_max_diff(&p.x, &a.x);
+                // A length mismatch, or a NaN that the max fold in `vec_max_diff` would drop,
+                // is recorded by the ledger.
+                let Some((px, ax)) =
+                    compare.slices(&arm, label, Some(p.x.as_slice()), Some(a.x.as_slice()))
+                else {
+                    continue;
+                };
+                let d_x = vec_max_diff(px, ax);
                 let pf = p.fun.unwrap_or(f64::NAN);
                 let af = a.fun.unwrap_or(f64::NAN);
                 let d_f = if pf.is_finite() && af.is_finite() {
@@ -142,9 +167,12 @@ fn diff_opt_minimize_audit_equivalence() {
                 };
                 d_x <= ABS_TOL && d_f <= ABS_TOL && p.status == a.status
             }
+            // Both refused: the audited wrapper must refuse the same way.
             (Err(pe), Err(ae)) => format!("{pe:?}") == format!("{ae:?}"),
+            // One refused and the other did not.
             _ => false,
         };
+        compare.compared(&arm, label, pass);
         let d = match (&plain, &audited) {
             (Ok(p), Ok(a)) => vec_max_diff(&p.x, &a.x),
             _ => 0.0,
@@ -163,6 +191,7 @@ fn diff_opt_minimize_audit_equivalence() {
         test_id: "diff_opt_minimize_audit_equivalence".into(),
         category: "fsci_opt::minimize_with_audit equivalent to minimize".into(),
         case_count: diffs.len(),
+        compared: compare.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -181,6 +210,7 @@ fn diff_opt_minimize_audit_equivalence() {
         "minimize_audit_equiv conformance failed: {} cases",
         diffs.len(),
     );
+    compare.finish(min_per_arm);
 }
 
 #[test]
@@ -257,11 +287,21 @@ fn diff_opt_minimize_with_casp_portfolio() {
         "portfolio must accumulate 3 evidence entries"
     );
 
+    // Each solve above either panicked (`expect`, routing `assert_eq!`) or produced its case.
+    let mut compare = CompareLedger::new(
+        "diff_opt_minimize_with_casp_portfolio",
+        &["BFGS", "NelderMead", "DIRECT"],
+    );
+    for d in &diffs {
+        compare.compared(&d.op, &d.case_id, d.pass);
+    }
+
     let all_pass = diffs.iter().all(|d| d.pass);
     let log = DiffLog {
         test_id: "diff_opt_minimize_with_casp_portfolio".into(),
         category: "fsci_opt::minimize_with_casp_portfolio CASP routing".into(),
         case_count: diffs.len(),
+        compared: compare.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -270,4 +310,6 @@ fn diff_opt_minimize_with_casp_portfolio() {
     emit_log(&log);
 
     assert!(all_pass, "all casp portfolio routing cases must pass");
+    // One routing case per solver arm.
+    compare.finish(1);
 }

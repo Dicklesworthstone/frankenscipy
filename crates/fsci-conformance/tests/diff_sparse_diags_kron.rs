@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-s6w8u]. 1e-12 abs (integer/rational arithmetic).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, diags, kron, kronsum};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -375,87 +377,94 @@ fn diff_sparse_diags_kron() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_diags_kron", &["diags", "kron", "kronsum"]);
 
     // diags
     for case in &query.diags_cases {
         let scipy_arm = diags_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.dense.as_ref() else {
-            continue;
-        };
-        let (Some(rows), Some(cols)) = (scipy_arm.rows, scipy_arm.cols) else {
-            continue;
-        };
         let shape = case.shape.map(|(r, c)| Shape2D::new(r, c));
         let offsets_is: Vec<isize> = case.offsets.iter().map(|&o| o as isize).collect();
-        let Ok(fsci_csr) = diags(&case.diagonals, &offsets_is, shape) else {
+        let Some((((rows, cols), expected), fsci_csr)) = ledger.both(
+            "diags",
+            &case.case_id,
+            scipy_arm
+                .rows
+                .zip(scipy_arm.cols)
+                .zip(scipy_arm.dense.as_ref()),
+            diags(&case.diagonals, &offsets_is, shape).ok(),
+        ) else {
             continue;
         };
         let fsci_shape = fsci_csr.shape();
-        if fsci_shape.rows != rows || fsci_shape.cols != cols {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: "diags".into(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        let fsci_dense = dense_from_csr(&fsci_csr);
-        let abs_d = fsci_dense
-            .iter()
-            .zip(expected.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        max_overall = max_overall.max(abs_d);
+        let (abs_d, pass) = if fsci_shape.rows != rows || fsci_shape.cols != cols {
+            (f64::INFINITY, false)
+        } else {
+            let fsci_dense = dense_from_csr(&fsci_csr);
+            let abs_d = fsci_dense
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(abs_d);
+            // The max fold drops a NaN (0.0_f64.max(NaN) is 0.0), so reject one here.
+            (
+                abs_d,
+                abs_d <= ABS_TOL && !fsci_dense.iter().any(|v| v.is_nan()),
+            )
+        };
+        ledger.compared("diags", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "diags".into(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
     // kron / kronsum
     for case in &query.kron_cases {
         let scipy_arm = kron_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.dense.as_ref() else {
-            continue;
-        };
-        let (Some(rows), Some(cols)) = (scipy_arm.rows, scipy_arm.cols) else {
-            continue;
-        };
         let a_csr = dense_to_csr(case.a.rows, case.a.cols, &case.a.dense);
         let b_csr = dense_to_csr(case.b.rows, case.b.cols, &case.b.dense);
         let fsci_csr = match case.op.as_str() {
             "kron" => kron(&a_csr, &b_csr),
             "kronsum" => kronsum(&a_csr, &b_csr),
-            _ => continue,
+            other => panic!("diff_sparse_diags_kron: unhandled op `{other}`"),
         };
-        let Ok(fsci_csr) = fsci_csr else {
+        let Some((((rows, cols), expected), fsci_csr)) = ledger.both(
+            &case.op,
+            &case.case_id,
+            scipy_arm
+                .rows
+                .zip(scipy_arm.cols)
+                .zip(scipy_arm.dense.as_ref()),
+            fsci_csr.ok(),
+        ) else {
             continue;
         };
         let fsci_shape = fsci_csr.shape();
-        if fsci_shape.rows != rows || fsci_shape.cols != cols {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        let fsci_dense = dense_from_csr(&fsci_csr);
-        let abs_d = fsci_dense
-            .iter()
-            .zip(expected.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        max_overall = max_overall.max(abs_d);
+        let (abs_d, pass) = if fsci_shape.rows != rows || fsci_shape.cols != cols {
+            (f64::INFINITY, false)
+        } else {
+            let fsci_dense = dense_from_csr(&fsci_csr);
+            let abs_d = fsci_dense
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(abs_d);
+            // The max fold drops a NaN (0.0_f64.max(NaN) is 0.0), so reject one here.
+            (
+                abs_d,
+                abs_d <= ABS_TOL && !fsci_dense.iter().any(|v| v.is_nan()),
+            )
+        };
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -465,6 +474,7 @@ fn diff_sparse_diags_kron() {
         test_id: "diff_sparse_diags_kron".into(),
         category: "scipy.sparse.diags + kron + kronsum".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -484,5 +494,12 @@ fn diff_sparse_diags_kron() {
         "scipy.sparse.diags/kron/kronsum conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let kron_ops =
+        ["kron", "kronsum"].map(|op| query.kron_cases.iter().filter(|c| c.op == op).count());
+    ledger.finish(
+        kron_ops
+            .into_iter()
+            .fold(query.diags_cases.len(), usize::min),
     );
 }

@@ -7,19 +7,22 @@
 //! Convention is normalized to q0 = 1 in both layers.
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::pade;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Cases where SciPy's `pade` raises LinAlgError (singular system); verified under 1.17.1.
+const SCIPY_SINGULAR: [&str; 2] = ["sin_m3_n2", "sin_m5_n2"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PadeCase {
@@ -58,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -272,6 +276,7 @@ fn diff_interpolate_pade() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -282,33 +287,49 @@ fn diff_interpolate_pade() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_pade", &["p", "q"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
+        let fsci = pade(&case.taylor, case.m, case.n).ok();
+        // sin's Taylor series has zero even coefficients, so these orders give a singular
+        // system: SciPy 1.17.1 raises `LinAlgError: A singular matrix detected`, and fsci must
+        // refuse too rather than invent a rational approximant.
+        if SCIPY_SINGULAR.contains(&case.case_id.as_str()) {
+            for name in ["p", "q"] {
+                ledger.expected_raise(name, &case.case_id, fsci.is_none());
+            }
             continue;
-        };
-        let (Some(ep), Some(eq)) = (arm.p.clone(), arm.q.clone()) else {
-            continue;
-        };
-        let Ok((p, q)) = pade(&case.taylor, case.m, case.n) else {
-            continue;
-        };
-        let abs_p = if p.len() != ep.len() {
-            f64::INFINITY
-        } else {
-            p.iter()
-                .zip(ep.iter())
+        }
+        let arms = [
+            (
+                "p",
+                arm.p.as_deref(),
+                fsci.as_ref().map(|(p, _)| p.as_slice()),
+            ),
+            (
+                "q",
+                arm.q.as_deref(),
+                fsci.as_ref().map(|(_, q)| q.as_slice()),
+            ),
+        ];
+        let mut arm_diffs = [f64::NAN; 2];
+        for (slot, (name, scipy, got)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((expected, actual)) = ledger.slices(name, &case.case_id, scipy, got) else {
+                continue;
+            };
+            let d = actual
+                .iter()
+                .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
-        let abs_q = if q.len() != eq.len() {
-            f64::INFINITY
-        } else {
-            q.iter()
-                .zip(eq.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+                .fold(0.0_f64, f64::max);
+            ledger.compared(name, &case.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [abs_p, abs_q] = arm_diffs;
         let abs_d = abs_p.max(abs_q);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
@@ -324,6 +345,7 @@ fn diff_interpolate_pade() {
         test_id: "diff_interpolate_pade".into(),
         category: "fsci_interpolate::pade vs scipy.interpolate.pade".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -344,4 +366,5 @@ fn diff_interpolate_pade() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

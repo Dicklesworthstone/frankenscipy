@@ -8,13 +8,14 @@
 //! Resolves [frankenscipy-9t4yf]. CZT round-trips through FFT via
 //! Bluestein's algorithm; 1e-9 abs is the appropriate floor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::czt;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -164,7 +166,9 @@ for case in q["points"]:
     w_polar = case.get("w")
     a_polar = case.get("a")
     w_arg = None
-    a_arg = None
+    # SciPy's default. `a=None` raises TypeError in 1.17.1, which the except below turned into a
+    # skipped case: 12 of 16 cases compared nothing until the compared-case ledger (olv0j.1).
+    a_arg = 1 + 0j
     if w_polar is not None:
         mag, ang = float(w_polar[0]), float(w_polar[1])
         w_arg = mag * (math.cos(ang) + 1j * math.sin(ang))
@@ -241,34 +245,35 @@ fn diff_signal_czt() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_czt", &["czt"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let Ok(complex_out) = czt(&case.x, case.m, case.w, case.a) else {
-            continue;
-        };
-        let mut fsci_v = Vec::with_capacity(complex_out.len() * 2);
-        for (re, im) in complex_out {
-            fsci_v.push(re);
-            fsci_v.push(im);
-        }
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
+        let fsci_v = czt(&case.x, case.m, case.w, case.a)
+            .ok()
+            .map(|complex_out| {
+                let mut v = Vec::with_capacity(complex_out.len() * 2);
+                for (re, im) in complex_out {
+                    v.push(re);
+                    v.push(im);
+                }
+                v
             });
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            "czt",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
-        }
+        };
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("czt", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -282,6 +287,7 @@ fn diff_signal_czt() {
         test_id: "diff_signal_czt".into(),
         category: "scipy.signal.czt (Bluestein chirp Z-transform)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -302,4 +308,5 @@ fn diff_signal_czt() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-5f9mj]. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::gammaln;
 use fsci_special::types::Complex64 as FsciComplex;
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -218,15 +220,18 @@ fn diff_special_loggamma_complex() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_loggamma_complex", &["loggamma"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(ere), Some(eim)) = (arm.re, arm.im) else {
-            continue;
-        };
-        let Some((re, im)) = fsci_eval(case.z_re, case.z_im) else {
+        // A case missing from the oracle output, or with either part missing, is recorded as
+        // SciPy giving no value.
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.re.zip(arm.im));
+        let Some(((ere, eim), (re, im))) = ledger.both(
+            "loggamma",
+            &case.case_id,
+            scipy,
+            fsci_eval(case.z_re, case.z_im),
+        ) else {
             continue;
         };
         // The imaginary part of loggamma is multivalued (mod 2π); compare
@@ -237,6 +242,8 @@ fn diff_special_loggamma_complex() {
         let im_adj = im - im_diff * two_pi;
         let abs_d = ((re - ere).powi(2) + (im_adj - eim).powi(2)).sqrt();
         max_overall = max_overall.max(abs_d);
+        // A NaN or infinite fsci part makes abs_d NaN or infinite, which fails this comparison.
+        ledger.compared("loggamma", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -250,6 +257,7 @@ fn diff_special_loggamma_complex() {
         test_id: "diff_special_loggamma_complex".into(),
         category: "fsci_special::gammaln(ComplexScalar) vs scipy.special.loggamma".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -273,4 +281,5 @@ fn diff_special_loggamma_complex() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -5,15 +5,18 @@
 //!
 //! Resolves [frankenscipy-s4h6q]. 1e-8 abs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{DifferentiateOptions, derivative};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-8;
+const ARMS: [&str; 7] = ["square", "cube", "sin", "cos", "exp", "log", "sqrt"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -28,6 +31,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -99,20 +103,40 @@ fn diff_opt_derivative() {
     ];
 
     let xs_default = [0.5_f64, 1.0, 1.5, 2.5, 5.0];
+    let mut ledger = CompareLedger::new("diff_opt_derivative", &ARMS);
     for (model, f, df_true) in &models {
         for x in xs_default {
             // log/sqrt need x > 0; use positive x set
             if (*model == "log" || *model == "sqrt") && x <= 0.0 {
                 continue;
             }
-            let Ok(res) = derivative(|t: f64| f(t), x, opts) else {
+            let case_id = format!("{model}_x{x}");
+            let fsci_df = derivative(|t: f64| f(t), x, opts).ok().map(|res| res.df);
+            // SciPy 1.17.1's own derivative(np.log, 0.5) fails (status -3: its default stencil
+            // evaluates log at 0), so fsci must refuse too.
+            if *model == "log" && x == 0.5 {
+                ledger.expected_raise(model, &case_id, fsci_df.is_none());
+                continue;
+            }
+            // SciPy recovers from a non-finite evaluation at these points and fsci does not.
+            if (*model == "log" && x == 1.0) || (*model == "sqrt" && x == 0.5) {
+                ledger.allowlisted(
+                    model,
+                    &case_id,
+                    "frankenscipy-3vcjx",
+                    "fsci refuses where scipy.differentiate.derivative succeeds",
+                );
+                continue;
+            }
+            let Some((expected, df)) = ledger.pair(model, &case_id, Some(df_true(x)), fsci_df)
+            else {
                 continue;
             };
-            let expected = df_true(x);
-            let abs_d = (res.df - expected).abs();
+            let abs_d = (df - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared(model, &case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("{model}_x{x}"),
+                case_id,
                 model: (*model).into(),
                 abs_diff: abs_d,
                 pass: abs_d <= ABS_TOL,
@@ -126,6 +150,7 @@ fn diff_opt_derivative() {
         test_id: "diff_opt_derivative".into(),
         category: "fsci_opt::derivative vs analytic".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -149,4 +174,6 @@ fn diff_opt_derivative() {
         diffs.len(),
         max_overall
     );
+    // log/sqrt admit only x > 0, and each has one case allowlisted under frankenscipy-3vcjx.
+    ledger.finish(xs_default.iter().filter(|&&x| x > 0.0).count() - 1);
 }

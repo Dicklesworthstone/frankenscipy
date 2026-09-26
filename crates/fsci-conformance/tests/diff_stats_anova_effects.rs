@@ -21,14 +21,15 @@
 //!   - f_oneway: 1e-9 abs (F-distribution chain)
 //!   - cohens_d / cramers_v: 1e-12 abs (closed-form)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_stats::{cohens_d, cramers_v, f_oneway};
+use fsci_conformance::{ArmCounts, CompareLedger};
+use fsci_stats::{alexandergovern, cohens_d, cramers_v, f_oneway};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -78,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -251,7 +253,9 @@ for case in q["points"]:
                 if n1 + n2 > 2 else float('nan')
             out["scalar"] = fnone((m1 - m2) / pooled) if pooled > 0 else None
         elif func == "cramers_v":
-            t = np.array(case["table"], dtype=float)
+            # association() requires an integer table; the float one raised ValueError on every
+            # case, so cramers_v compared nothing until the compared-case ledger (olv0j.1).
+            t = np.array(case["table"], dtype=int)
             out["scalar"] = fnone(float(contingency.association(t, method='cramer')))
     except Exception:
         pass
@@ -326,74 +330,84 @@ fn diff_stats_anova_effects() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_anova_effects",
+        &[
+            "f_oneway.statistic",
+            "f_oneway.pvalue",
+            "alexandergovern.statistic",
+            "alexandergovern.pvalue",
+            "cohens_d",
+            "cramers_v",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
-            "f_oneway" => {
+            // The query and the oracle have carried alexandergovern since frankenscipy-795bt was
+            // fixed, but no branch compared it; it takes the group-test tolerance of f_oneway.
+            "f_oneway" | "alexandergovern" => {
                 let groups: Vec<&[f64]> = case.groups.iter().map(|g| g.as_slice()).collect();
-                let r = f_oneway(&groups);
-                let (rust_stat, rust_p) = (r.statistic, r.pvalue);
-                if let Some(scipy_stat) = scipy_arm.statistic
-                    && rust_stat.is_finite()
-                {
-                    let abs_diff = (rust_stat - scipy_stat).abs();
+                let (rust_stat, rust_p) = if case.func == "f_oneway" {
+                    let r = f_oneway(&groups);
+                    (r.statistic, r.pvalue)
+                } else {
+                    let r = alexandergovern(&groups);
+                    (r.statistic, r.pvalue)
+                };
+                let stat_arm = format!("{}.statistic", case.func);
+                let pvalue_arm = format!("{}.pvalue", case.func);
+                let arms = [
+                    (
+                        stat_arm.as_str(),
+                        "statistic",
+                        scipy_arm.statistic,
+                        rust_stat,
+                    ),
+                    (pvalue_arm.as_str(), "pvalue", scipy_arm.pvalue, rust_p),
+                ];
+                for (ledger_arm, arm, scipy, rust) in arms {
+                    let Some((scipy_v, rust_v)) =
+                        ledger.pair(ledger_arm, &case.case_id, scipy, Some(rust))
+                    else {
+                        continue;
+                    };
+                    let abs_diff = (rust_v - scipy_v).abs();
                     max_overall = max_overall.max(abs_diff);
+                    ledger.compared(ledger_arm, &case.case_id, abs_diff <= STAT_TOL);
                     diffs.push(CaseDiff {
                         case_id: case.case_id.clone(),
                         func: case.func.clone(),
-                        arm: "statistic".into(),
+                        arm: arm.into(),
                         abs_diff,
                         pass: abs_diff <= STAT_TOL,
                     });
                 }
-                if let Some(scipy_p) = scipy_arm.pvalue
-                    && rust_p.is_finite()
-                {
-                    let abs_diff = (rust_p - scipy_p).abs();
-                    max_overall = max_overall.max(abs_diff);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        arm: "pvalue".into(),
-                        abs_diff,
-                        pass: abs_diff <= STAT_TOL,
-                    });
-                }
             }
-            "cohens_d" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = cohens_d(&case.pair_a, &case.pair_b);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: "cohens_d".into(),
-                            abs_diff,
-                            pass: abs_diff <= SCALAR_TOL,
-                        });
-                    }
-                }
+            "cohens_d" | "cramers_v" => {
+                let rust_v = if case.func == "cohens_d" {
+                    cohens_d(&case.pair_a, &case.pair_b)
+                } else {
+                    cramers_v(&case.table)
+                };
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair(&case.func, &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared(&case.func, &case.case_id, abs_diff <= SCALAR_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    arm: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= SCALAR_TOL,
+                });
             }
-            "cramers_v" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = cramers_v(&case.table);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            arm: "cramers_v".into(),
-                            abs_diff,
-                            pass: abs_diff <= SCALAR_TOL,
-                        });
-                    }
-                }
-            }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -403,6 +417,7 @@ fn diff_stats_anova_effects() {
         test_id: "diff_stats_anova_effects".into(),
         category: "f_oneway + alexandergovern + cohens_d + cramers_v".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -427,4 +442,5 @@ fn diff_stats_anova_effects() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "f_oneway").count());
 }

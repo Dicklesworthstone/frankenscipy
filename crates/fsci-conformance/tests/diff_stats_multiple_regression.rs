@@ -13,13 +13,14 @@
 //! residuals max-abs + std_errors vector) = 12 cases via
 //! subprocess. Tol 1e-9 abs (linear solve precision).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::multiple_regression;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -266,79 +268,68 @@ fn diff_stats_multiple_regression() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_multiple_regression",
+        &["coeffs_max", "r_squared", "residuals_max", "std_errors_max"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_coeffs, rust_resid, rust_r2, rust_se) = multiple_regression(&case.x, &case.y);
 
-        // coeffs vector
-        if let Some(scipy_coeffs) = &scipy_arm.coeffs
-            && rust_coeffs.len() == scipy_coeffs.len()
-        {
+        // Vector arms: `slices` rejects a length mismatch and a non-finite fsci element, which
+        // the max-fold below would otherwise swallow.
+        let vector_arms = [
+            (
+                "coeffs_max",
+                scipy_arm.coeffs.as_deref(),
+                rust_coeffs.as_slice(),
+            ),
+            (
+                "residuals_max",
+                scipy_arm.residuals.as_deref(),
+                rust_resid.as_slice(),
+            ),
+            (
+                "std_errors_max",
+                scipy_arm.std_errors.as_deref(),
+                rust_se.as_slice(),
+            ),
+        ];
+        for (arm, scipy_v, rust_v) in vector_arms {
+            let Some((scipy_v, rust_v)) = ledger.slices(arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
             let mut max_local = 0.0_f64;
-            for (a, b) in rust_coeffs.iter().zip(scipy_coeffs.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
+            for (a, b) in rust_v.iter().zip(scipy_v.iter()) {
+                max_local = max_local.max((a - b).abs());
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(arm, &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "coeffs_max".into(),
+                arm: arm.into(),
                 abs_diff: max_local,
                 pass: max_local <= ABS_TOL,
             });
         }
 
         // r_squared
-        if let Some(scipy_r2) = scipy_arm.r_squared
-            && rust_r2.is_finite()
-        {
+        if let Some((scipy_r2, rust_r2)) = ledger.pair(
+            "r_squared",
+            &case.case_id,
+            scipy_arm.r_squared,
+            Some(rust_r2),
+        ) {
             let abs_diff = (rust_r2 - scipy_r2).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared("r_squared", &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "r_squared".into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
-            });
-        }
-
-        // residuals (vector)
-        if let Some(scipy_resid) = &scipy_arm.residuals
-            && rust_resid.len() == scipy_resid.len()
-        {
-            let mut max_local = 0.0_f64;
-            for (a, b) in rust_resid.iter().zip(scipy_resid.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
-            }
-            max_overall = max_overall.max(max_local);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "residuals_max".into(),
-                abs_diff: max_local,
-                pass: max_local <= ABS_TOL,
-            });
-        }
-
-        // std_errors (vector)
-        if let Some(scipy_se) = &scipy_arm.std_errors
-            && rust_se.len() == scipy_se.len()
-        {
-            let mut max_local = 0.0_f64;
-            for (a, b) in rust_se.iter().zip(scipy_se.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
-            }
-            max_overall = max_overall.max(max_local);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "std_errors_max".into(),
-                abs_diff: max_local,
-                pass: max_local <= ABS_TOL,
             });
         }
     }
@@ -349,6 +340,7 @@ fn diff_stats_multiple_regression() {
         test_id: "diff_stats_multiple_regression".into(),
         category: "multiple_regression (numpy.linalg.lstsq reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -373,4 +365,5 @@ fn diff_stats_multiple_regression() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

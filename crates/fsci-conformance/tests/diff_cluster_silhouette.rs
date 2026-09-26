@@ -11,7 +11,7 @@
 //!
 //! Resolves [frankenscipy-2x5lj]. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{silhouette_samples, silhouette_score};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -279,6 +281,7 @@ fn diff_cluster_silhouette() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -289,38 +292,46 @@ fn diff_cluster_silhouette() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_silhouette",
+        &["silhouette_score", "silhouette_samples"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(escore), Some(esamples)) = (arm.score, arm.samples.as_ref()) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         let data = unflatten(&case.data_flat, case.n, case.d);
-        let Ok(score) = silhouette_score(&data, &case.labels) else {
-            continue;
-        };
-        let Ok(samples) = silhouette_samples(&data, &case.labels) else {
-            continue;
-        };
+        let score = silhouette_score(&data, &case.labels).ok();
+        let samples = silhouette_samples(&data, &case.labels).ok();
 
-        let abs_score = (score - escore).abs();
-        max_overall = max_overall.max(abs_score);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_score", case.case_id),
-            op: "silhouette_score".into(),
-            abs_diff: abs_score,
-            pass: abs_score <= ABS_TOL,
-        });
-        let abs_samples = vec_max_diff(&samples, esamples);
-        max_overall = max_overall.max(abs_samples);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_samples", case.case_id),
-            op: "silhouette_samples".into(),
-            abs_diff: abs_samples,
-            pass: abs_samples <= ABS_TOL,
-        });
+        if let Some((escore, score)) =
+            ledger.pair("silhouette_score", &case.case_id, arm.score, score)
+        {
+            let abs_score = (score - escore).abs();
+            max_overall = max_overall.max(abs_score);
+            ledger.compared("silhouette_score", &case.case_id, abs_score <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_score", case.case_id),
+                op: "silhouette_score".into(),
+                abs_diff: abs_score,
+                pass: abs_score <= ABS_TOL,
+            });
+        }
+        if let Some((esamples, samples)) = ledger.slices(
+            "silhouette_samples",
+            &case.case_id,
+            arm.samples.as_deref(),
+            samples.as_deref(),
+        ) {
+            let abs_samples = vec_max_diff(samples, esamples);
+            max_overall = max_overall.max(abs_samples);
+            ledger.compared("silhouette_samples", &case.case_id, abs_samples <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_samples", case.case_id),
+                op: "silhouette_samples".into(),
+                abs_diff: abs_samples,
+                pass: abs_samples <= ABS_TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -329,6 +340,7 @@ fn diff_cluster_silhouette() {
         test_id: "diff_cluster_silhouette".into(),
         category: "fsci_cluster silhouette_score + silhouette_samples vs sklearn formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -349,4 +361,5 @@ fn diff_cluster_silhouette() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

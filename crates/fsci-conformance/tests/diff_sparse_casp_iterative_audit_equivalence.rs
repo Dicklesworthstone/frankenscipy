@@ -5,10 +5,12 @@
 //! Resolves [frankenscipy-iwsa2]. Audit codepath only logs to the
 //! ledger; decision + iterative result must be bit-identical.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CaspIterativeSolveOptions, CooMatrix, FormatConvertible, Shape2D, casp_iterative_solve,
     casp_iterative_solve_with_audit, sync_audit_ledger,
@@ -31,6 +33,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -91,7 +94,7 @@ fn diff_sparse_casp_iterative_audit_equivalence() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
-    let ledger = sync_audit_ledger();
+    let audit_ledger = sync_audit_ledger();
 
     // SPD tridiagonal (CG-friendly)
     let tri3 = vec![
@@ -118,34 +121,44 @@ fn diff_sparse_casp_iterative_audit_equivalence() {
     };
     let b_tri5 = vec![1.0_f64, 0.5, 1.0, 0.5, 1.0];
 
-    for (label, rows, cols, trips, b) in [
+    let cases = [
         ("tri3", 3_usize, 3_usize, &tri3, &b_tri3),
         ("tri5", 5, 5, &tri5, &b_tri5),
-    ] {
-        let Some(csr) = build_csr(rows, cols, trips) else {
+    ];
+    // The reference arm is the plain solve; the audited solve is compared against it.
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_casp_iterative_audit_equivalence",
+        &["casp_iter"],
+    );
+    for (label, rows, cols, trips, b) in cases {
+        let case_id = format!("casp_iter_{label}");
+        let csr = build_csr(rows, cols, trips);
+        let opts = CaspIterativeSolveOptions::default();
+        let plain = csr
+            .as_ref()
+            .and_then(|m| casp_iterative_solve(m, b, None, opts).ok());
+        let audited = csr
+            .as_ref()
+            .and_then(|m| casp_iterative_solve_with_audit(m, b, None, opts, &audit_ledger).ok());
+        let Some((p, a)) = ledger.both("casp_iter", &case_id, plain, audited) else {
             continue;
         };
-        let opts = CaspIterativeSolveOptions::default();
-        let plain = casp_iterative_solve(&csr, b, None, opts);
-        let audited = casp_iterative_solve_with_audit(&csr, b, None, opts, &ledger);
-        let pass = match (&plain, &audited) {
-            (Ok(p), Ok(a)) => {
-                let d_x = vec_max_diff(&p.result.solution, &a.result.solution);
-                max_overall = max_overall.max(d_x);
-                d_x <= ABS_TOL
-                    && p.decision.selected_solver == a.decision.selected_solver
-                    && p.decision.rationale == a.decision.rationale
-                    && p.result.converged == a.result.converged
-            }
-            (Err(_), Err(_)) => true,
-            _ => false,
-        };
-        let d = match (&plain, &audited) {
-            (Ok(p), Ok(a)) => vec_max_diff(&p.result.solution, &a.result.solution),
-            _ => 0.0,
-        };
+        let d = vec_max_diff(&p.result.solution, &a.result.solution);
+        max_overall = max_overall.max(d);
+        // vec_max_diff's max fold drops a NaN (0.0_f64.max(NaN) is 0.0), so reject one here.
+        let pass = d <= ABS_TOL
+            && p.decision.selected_solver == a.decision.selected_solver
+            && p.decision.rationale == a.decision.rationale
+            && p.result.converged == a.result.converged
+            && !p
+                .result
+                .solution
+                .iter()
+                .chain(&a.result.solution)
+                .any(|v| v.is_nan());
+        ledger.compared("casp_iter", &case_id, pass);
         diffs.push(CaseDiff {
-            case_id: format!("casp_iter_{label}"),
+            case_id,
             op: "casp_iter".into(),
             abs_diff: d,
             pass,
@@ -158,6 +171,7 @@ fn diff_sparse_casp_iterative_audit_equivalence() {
         test_id: "diff_sparse_casp_iterative_audit_equivalence".into(),
         category: "fsci_sparse::casp_iterative_solve_with_audit equivalent to non-audit".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -178,4 +192,5 @@ fn diff_sparse_casp_iterative_audit_equivalence() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

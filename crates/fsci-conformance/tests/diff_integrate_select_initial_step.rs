@@ -12,12 +12,14 @@
 //!
 //! Rel tol 1e-9 (fsci should be bit-for-bit modulo the f1 evaluation).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{InitialStepRequest, ToleranceValue, select_initial_step};
 use fsci_runtime::RuntimeMode;
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     max_abs_diff: f64,
     pass: bool,
@@ -300,10 +303,13 @@ out = []
 for c in q["points"]:
     y0 = np.asarray(c["y0"], dtype=float)
     f0 = rhs(c, c["t0"], y0)
+    # serde_json writes the Rust side's f64::INFINITY max_step as null; min(.., None) raised
+    # TypeError and blanked 26 of 27 cases until the compared-case ledger (olv0j.1).
+    max_step = float("inf") if c["max_step"] is None else c["max_step"]
     try:
         h = select_initial_step(
             lambda t, y, case=c: rhs(case, t, y),
-            c["t0"], y0, c["t_bound"], c["max_step"], f0,
+            c["t0"], y0, c["t_bound"], max_step, f0,
             c["direction"], c["order"], c["rtol"], c["atol"])
         if not math.isfinite(h) and h != float('inf'):
             out.append({"case_id": c["case_id"], "h": None})
@@ -372,12 +378,13 @@ fn diff_integrate_select_initial_step() {
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_rel = 0.0_f64;
     let mut max_abs = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_select_initial_step",
+        &["select_initial_step"],
+    );
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.h else {
-            continue;
-        };
 
         // Compute f0 in Rust
         let f0 = eval_rhs(case, case.t0, &case.y0);
@@ -395,20 +402,14 @@ fn diff_integrate_select_initial_step() {
             atol: ToleranceValue::Scalar(case.atol),
             mode: RuntimeMode::Strict,
         };
-        let actual = match select_initial_step(&mut rhs_fn, &req) {
-            Ok(v) => v,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    actual: f64::NAN,
-                    expected,
-                    rel_diff: f64::INFINITY,
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                eprintln!("select_initial_step error in {}: {e:?}", case.case_id);
-                continue;
-            }
+        let result = select_initial_step(&mut rhs_fn, &req);
+        if let Err(e) = &result {
+            eprintln!("select_initial_step error in {}: {e:?}", case.case_id);
+        }
+        let Some((expected, actual)) =
+            ledger.pair("select_initial_step", &case.case_id, o.h, result.ok())
+        else {
+            continue;
         };
 
         let abs_diff = (actual - expected).abs();
@@ -417,6 +418,7 @@ fn diff_integrate_select_initial_step() {
         max_rel = max_rel.max(rel_diff);
         max_abs = max_abs.max(abs_diff);
         let pass = rel_diff <= REL_TOL || abs_diff <= ABS_TOL;
+        ledger.compared("select_initial_step", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             actual,
@@ -432,6 +434,7 @@ fn diff_integrate_select_initial_step() {
         test_id: "diff_integrate_select_initial_step".into(),
         category: "fsci_integrate::select_initial_step vs scipy Hairer heuristic".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         max_abs_diff: max_abs,
         pass: all_pass,
@@ -456,4 +459,5 @@ fn diff_integrate_select_initial_step() {
         diffs.len(),
         max_rel
     );
+    ledger.finish(query.points.len());
 }

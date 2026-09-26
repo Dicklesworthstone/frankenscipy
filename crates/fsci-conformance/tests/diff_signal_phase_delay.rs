@@ -12,13 +12,14 @@
 //! Tolerance: 1e-8 abs for filters with non-zero magnitude across the
 //! whole spectrum.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::phase_delay;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -205,9 +207,6 @@ print(json.dumps({"points": points}))
 }
 
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -230,35 +229,37 @@ fn diff_signal_phase_delay() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_phase_delay", &["freqs", "delay"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(efreqs), Some(edelay)) = (arm.freqs.as_ref(), arm.delay.as_ref()) else {
-            continue;
-        };
-        let Ok((freqs, delay)) = phase_delay(&case.b, &case.a, Some(case.n_freqs)) else {
-            continue;
-        };
-
-        let f_diff = vec_max_diff(&freqs, efreqs);
-        max_overall = max_overall.max(f_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_freqs", case.case_id),
-            op: "freqs".into(),
-            abs_diff: f_diff,
-            pass: f_diff <= ABS_TOL,
-        });
-
-        let d_diff = vec_max_diff(&delay, edelay);
-        max_overall = max_overall.max(d_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_delay", case.case_id),
-            op: "delay".into(),
-            abs_diff: d_diff,
-            pass: d_diff <= ABS_TOL,
-        });
+        let scipy_arm = pmap.get(&case.case_id);
+        let result = phase_delay(&case.b, &case.a, Some(case.n_freqs)).ok();
+        let arms = [
+            (
+                "freqs",
+                scipy_arm.and_then(|a| a.freqs.as_deref()),
+                result.as_ref().map(|(freqs, _)| freqs.as_slice()),
+            ),
+            (
+                "delay",
+                scipy_arm.and_then(|a| a.delay.as_deref()),
+                result.as_ref().map(|(_, delay)| delay.as_slice()),
+            ),
+        ];
+        for (op, scipy, fsci) in arms {
+            let Some((expected, actual)) = ledger.slices(op, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let diff = vec_max_diff(actual, expected);
+            max_overall = max_overall.max(diff);
+            ledger.compared(op, &case.case_id, diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_{op}", case.case_id),
+                op: op.into(),
+                abs_diff: diff,
+                pass: diff <= ABS_TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -267,6 +268,7 @@ fn diff_signal_phase_delay() {
         test_id: "diff_signal_phase_delay".into(),
         category: "fsci_signal::phase_delay vs scipy.signal.freqz formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -287,4 +289,5 @@ fn diff_signal_phase_delay() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

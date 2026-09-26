@@ -13,19 +13,22 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{lpmn, lqmn};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared (br-olv0j.2 is closed per function).
+const ARMS: [&str; 2] = ["lpmn", "lqmn"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -66,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -235,25 +239,25 @@ fn diff_special_lpmn_lqmn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_lpmn_lqmn", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy_table = pmap
+            .get(&case.case_id)
+            .and_then(|point| point.table.as_deref());
+        let fsci_flat = match case.op.as_str() {
+            "lpmn" => Some(flatten_table(&lpmn(case.m_max, case.n_max, case.x))),
+            "lqmn" => Some(flatten_table(&lqmn(case.m_max, case.n_max, case.x))),
+            _ => None,
+        };
+        let Some((expected, flat)) =
+            ledger.slices(&case.op, &case.case_id, scipy_table, fsci_flat.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.table.as_ref() else {
-            continue;
-        };
-        let table = match case.op.as_str() {
-            "lpmn" => lpmn(case.m_max, case.n_max, case.x),
-            "lqmn" => lqmn(case.m_max, case.n_max, case.x),
-            _ => continue,
-        };
-        let flat = flatten_table(&table);
-        if flat.iter().any(|v| !v.is_finite()) {
-            continue;
-        }
-        let abs_d = vec_max_diff(&flat, expected);
+        let abs_d = vec_max_diff(flat, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -275,6 +279,7 @@ fn diff_special_lpmn_lqmn() {
         test_id: "diff_special_lpmn_lqmn".into(),
         category: "fsci_special::{lpmn, lqmn} vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -295,4 +300,10 @@ fn diff_special_lpmn_lqmn() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

@@ -10,13 +10,14 @@
 //!
 //! Resolves [frankenscipy-uyp2g].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{stdtridf, tklmbda, voigt_profile};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -272,22 +274,26 @@ fn diff_special_misc_scalars() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_special_misc_scalars",
+        &["tklmbda", "voigt_profile", "stdtridf"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
         let (fsci_v, tol) = match case.func.as_str() {
             "tklmbda" => (tklmbda(case.arg1, case.arg2), TIGHT_TOL),
             "voigt_profile" => (voigt_profile(case.arg1, case.arg2, case.arg3), VOIGT_TOL),
             "stdtridf" => (stdtridf(case.arg1, case.arg2), STDTRIDF_TOL),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
-        if !fsci_v.is_finite() {
+        let Some((scipy_v, fsci_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
             continue;
-        }
+        };
         let abs_d = (fsci_v - scipy_v).abs();
+        ledger.compared(&case.func, &case.case_id, abs_d <= tol);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -303,6 +309,7 @@ fn diff_special_misc_scalars() {
         test_id: "diff_special_misc_scalars".into(),
         category: "scipy.special.tklmbda / voigt_profile / stdtridf".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,4 +333,5 @@ fn diff_special_misc_scalars() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "stdtridf").count());
 }

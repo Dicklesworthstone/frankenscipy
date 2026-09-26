@@ -11,13 +11,14 @@
 //! We compare on the total assignment cost (always unique) rather
 //! than the column indices.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::linear_sum_assignment;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -252,21 +254,27 @@ fn diff_opt_linear_sum_assignment() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger =
+        CompareLedger::new("diff_opt_linear_sum_assignment", &["linear_sum_assignment"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(fsci_total) = fsci_total_cost(&case.cost) else {
+        let Some((scipy_total, fsci_total)) = ledger.pair(
+            "linear_sum_assignment",
+            &case.case_id,
+            scipy_arm.total_cost,
+            fsci_total_cost(&case.cost),
+        ) else {
             continue;
         };
-        if let Some(scipy_total) = scipy_arm.total_cost {
-            let abs_d = (fsci_total - scipy_total).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        let abs_d = (fsci_total - scipy_total).abs();
+        max_overall = max_overall.max(abs_d);
+        ledger.compared("linear_sum_assignment", &case.case_id, abs_d <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff: abs_d,
+            pass: abs_d <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -275,6 +283,7 @@ fn diff_opt_linear_sum_assignment() {
         test_id: "diff_opt_linear_sum_assignment".into(),
         category: "scipy.optimize.linear_sum_assignment".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -298,4 +307,5 @@ fn diff_opt_linear_sum_assignment() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

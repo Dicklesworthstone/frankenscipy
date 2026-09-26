@@ -6,13 +6,14 @@
 //!
 //! Resolves [frankenscipy-3bv3e]. 1e-12 abs (integer / fractional data).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{eye_k, leslie, tri, tril, triu, vander};
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -366,56 +368,60 @@ fn diff_linalg_structural_construct() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["tri", "tril", "triu", "vander", "leslie", "eye_k"];
+    let mut ledger = CompareLedger::new("diff_linalg_structural_construct", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.dense.as_ref() else {
-            continue;
-        };
-        let (Some(rows), Some(cols)) = (scipy_arm.rows, scipy_arm.cols) else {
-            continue;
-        };
-        let fsci_mat: Vec<Vec<f64>> = match case.op.as_str() {
-            "tri" => tri(case.n, case.m, case.k),
+        let fsci_mat: Option<Vec<Vec<f64>>> = match case.op.as_str() {
+            "tri" => Some(tri(case.n, case.m, case.k)),
             "tril" => {
                 let src = rows_of(&case.a, case.a_rows, case.a_cols);
-                tril(&src, case.k)
+                Some(tril(&src, case.k))
             }
             "triu" => {
                 let src = rows_of(&case.a, case.a_rows, case.a_cols);
-                triu(&src, case.k)
+                Some(triu(&src, case.k))
             }
-            "vander" => vander(&case.x, Some(case.n), case.increasing),
-            "leslie" => match leslie(&case.f_vals, &case.s_vals) {
-                Ok(m) => m,
-                Err(_) => continue,
-            },
-            "eye_k" => eye_k(case.n, case.m, case.k),
-            _ => continue,
+            "vander" => Some(vander(&case.x, Some(case.n), case.increasing)),
+            "leslie" => leslie(&case.f_vals, &case.s_vals).ok(),
+            "eye_k" => Some(eye_k(case.n, case.m, case.k)),
+            other => panic!("unknown op {other}"),
         };
-        let fsci_rows = fsci_mat.len();
-        let fsci_cols = fsci_mat.first().map_or(0, |r| r.len());
-        if fsci_rows != rows || fsci_cols != cols {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        let fsci_flat = fsci_mat.as_deref().map(flatten);
+        let Some((expected, fsci_flat)) = ledger.slices(
+            case.op.as_str(),
+            &case.case_id,
+            scipy_arm.dense.as_deref(),
+            fsci_flat.as_deref(),
+        ) else {
             continue;
+        };
+        let fsci_rows = fsci_mat.as_ref().map_or(0, |m| m.len());
+        let fsci_cols = fsci_mat
+            .as_ref()
+            .and_then(|m| m.first())
+            .map_or(0, |r| r.len());
+        let shape_ok = scipy_arm.rows == Some(fsci_rows) && scipy_arm.cols == Some(fsci_cols);
+        let abs_d = if shape_ok {
+            fsci_flat
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
+        };
+        if shape_ok {
+            max_overall = max_overall.max(abs_d);
         }
-        let fsci_flat = flatten(&fsci_mat);
-        let abs_d = fsci_flat
-            .iter()
-            .zip(expected.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        max_overall = max_overall.max(abs_d);
+        let pass = shape_ok && abs_d <= ABS_TOL;
+        ledger.compared(case.op.as_str(), &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -425,6 +431,7 @@ fn diff_linalg_structural_construct() {
         test_id: "diff_linalg_structural_construct".into(),
         category: "numpy/scipy.linalg tri+tril+triu+vander+leslie+eye_k".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -444,5 +451,11 @@ fn diff_linalg_structural_construct() {
         "structural_construct conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

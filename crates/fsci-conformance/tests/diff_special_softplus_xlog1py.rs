@@ -10,13 +10,14 @@
 //! match scipy.special to machine precision in spot checks; this
 //! harness pins that agreement at 1e-14 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{softplus, xlog1py};
@@ -25,6 +26,8 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-14;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 2] = ["softplus", "xlog1py"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -64,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -255,24 +259,27 @@ fn diff_special_softplus_xlog1py() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_softplus_xlog1py", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(fsci_v) = fsci_eval(&case.func, case.x, case.y) else {
+        let Some((scipy_v, fsci_v)) = ledger.pair(
+            &case.func,
+            &case.case_id,
+            scipy_arm.value,
+            fsci_eval(&case.func, case.x, case.y),
+        ) else {
             continue;
         };
-        if let Some(scipy_v) = scipy_arm.value
-            && fsci_v.is_finite()
-        {
-            let abs_d = (fsci_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        let abs_d = (fsci_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.func, &case.case_id, abs_d <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff: abs_d,
+            pass: abs_d <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -281,6 +288,7 @@ fn diff_special_softplus_xlog1py() {
         test_id: "diff_special_softplus_xlog1py".into(),
         category: "scipy.special.softplus / xlog1py".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -304,4 +312,11 @@ fn diff_special_softplus_xlog1py() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (softplus has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

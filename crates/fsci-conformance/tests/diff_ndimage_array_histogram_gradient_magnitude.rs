@@ -14,19 +14,21 @@
 //!   central diffs in interior but forward/backward at edges, so
 //!   we compare INTERIOR samples only. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, array_histogram, gradient_magnitude};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["hist", "grad"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -73,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -312,26 +315,28 @@ fn diff_ndimage_array_histogram_gradient_magnitude() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_array_histogram_gradient_magnitude", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("oracle row for every case");
         match case.op.as_str() {
             "hist" => {
-                let (Some(exp_counts), Some(exp_edges)) = (arm.counts.as_ref(), arm.edges.as_ref())
-                else {
-                    continue;
-                };
                 let shape = if case.rows == 1 {
                     vec![case.cols]
                 } else {
                     vec![case.rows, case.cols]
                 };
-                let Ok(arr) = NdArray::new(case.data.clone(), shape) else {
+                let fsci_hist = NdArray::new(case.data.clone(), shape)
+                    .ok()
+                    .map(|arr| array_histogram(&arr, case.bins));
+                let Some(((exp_counts, exp_edges), (counts, edges))) = ledger.both(
+                    "hist",
+                    &case.case_id,
+                    arm.counts.as_ref().zip(arm.edges.as_ref()),
+                    fsci_hist,
+                ) else {
                     continue;
                 };
-                let (counts, edges) = array_histogram(&arr, case.bins);
                 // Compare counts exactly
                 let counts_diff = if counts.len() != exp_counts.len() {
                     f64::INFINITY
@@ -344,40 +349,42 @@ fn diff_ndimage_array_histogram_gradient_magnitude() {
                 };
                 let edges_diff = vec_max_diff(&edges, exp_edges);
                 let abs_d = counts_diff.max(edges_diff);
+                // vec_max_diff's max-fold swallows a NaN edge; a NaN edge must fail
+                let pass = abs_d <= ABS_TOL && !edges.iter().any(|e| e.is_nan());
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("hist", &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     abs_diff: abs_d,
-                    pass: abs_d <= ABS_TOL,
+                    pass,
                 });
             }
             "grad" => {
-                let (Some(expected), Some(ir), Some(ic)) =
-                    (arm.interior.as_ref(), arm.interior_rows, arm.interior_cols)
-                else {
+                // The oracle reports the interior block's shape beside its values.
+                let scipy_interior = match (
+                    arm.interior.as_deref(),
+                    arm.interior_rows,
+                    arm.interior_cols,
+                ) {
+                    (Some(v), Some(ir), Some(ic)) if v.len() == ir * ic => Some(v),
+                    _ => None,
+                };
+                let fsci_interior = NdArray::new(case.data.clone(), vec![case.rows, case.cols])
+                    .ok()
+                    .and_then(|arr| gradient_magnitude(&arr).ok())
+                    .map(|g| extract_interior(&g.data, case.rows, case.cols));
+                let Some((expected, interior)) = ledger.slices(
+                    "grad",
+                    &case.case_id,
+                    scipy_interior,
+                    fsci_interior.as_deref(),
+                ) else {
                     continue;
                 };
-                let Ok(arr) = NdArray::new(case.data.clone(), vec![case.rows, case.cols]) else {
-                    continue;
-                };
-                let Ok(g) = gradient_magnitude(&arr) else {
-                    continue;
-                };
-                let interior = extract_interior(&g.data, case.rows, case.cols);
-                let expected_len = ir * ic;
-                if interior.len() != expected_len {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    max_overall = f64::INFINITY;
-                    continue;
-                }
-                let abs_d = vec_max_diff(&interior, expected);
+                let abs_d = vec_max_diff(interior, expected);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("grad", &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -385,7 +392,7 @@ fn diff_ndimage_array_histogram_gradient_magnitude() {
                     pass: abs_d <= ABS_TOL,
                 });
             }
-            _ => continue,
+            other => panic!("unknown hist/grad op `{other}`"),
         }
     }
 
@@ -395,6 +402,7 @@ fn diff_ndimage_array_histogram_gradient_magnitude() {
         test_id: "diff_ndimage_array_histogram_gradient_magnitude".into(),
         category: "fsci_ndimage::{array_histogram, gradient_magnitude} vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -415,4 +423,11 @@ fn diff_ndimage_array_histogram_gradient_magnitude() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (grad has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

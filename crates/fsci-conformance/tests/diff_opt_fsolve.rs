@@ -5,10 +5,12 @@
 //! Resolves [frankenscipy-dwtdx]. 1e-6 abs. Verifies converged x ≈
 //! analytic root and residual ‖F(x)‖∞ ≤ tol.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::fsolve;
 use serde::Serialize;
 
@@ -28,6 +30,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -100,22 +103,34 @@ fn diff_opt_fsolve() {
         ),
     ];
 
+    let mut ledger = CompareLedger::new("diff_opt_fsolve", &["fsolve"]);
     for (label, f, x0, x_true) in &cases {
-        let Ok(r) = fsolve(|v| f(v), x0) else {
+        // A root exists at x_true, so a non-converged fsci solve is an fsci failure.
+        let r = fsolve(|v| f(v), x0).ok().filter(|r| r.converged);
+        let Some((x_true, x)) = ledger.slices(
+            "fsolve",
+            label,
+            Some(x_true.as_slice()),
+            r.as_ref().map(|r| r.x.as_slice()),
+        ) else {
             continue;
         };
         // Sort to handle multiple-root ambiguity? For these systems the roots
         // are unique near x0, so direct compare works.
-        let d = if r.x.len() != x_true.len() {
-            f64::INFINITY
-        } else {
-            r.x.iter()
-                .zip(x_true.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
-        let resid = r.fun.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let d = x
+            .iter()
+            .zip(x_true.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let resid = r
+            .as_ref()
+            .expect("slices returned fsci's x")
+            .fun
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(d);
+        ledger.compared("fsolve", label, d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: (*label).into(),
             abs_diff: d,
@@ -130,6 +145,7 @@ fn diff_opt_fsolve() {
         test_id: "diff_opt_fsolve".into(),
         category: "fsci_opt::fsolve vs analytic roots".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -153,4 +169,5 @@ fn diff_opt_fsolve() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

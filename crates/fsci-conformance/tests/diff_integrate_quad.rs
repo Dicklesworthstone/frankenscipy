@@ -14,13 +14,14 @@
 //! scipy's reported abs_err_estimate); 1e-12 for fixed_quad on
 //! polynomials it integrates exactly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{QuadOptions, fixed_quad, quad, romberg};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,9 @@ const QUAD_TOL: f64 = 1.0e-10;
 const FIXED_QUAD_TOL: f64 = 1.0e-12;
 const ROMBERG_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per routine compared (br-olv0j.2 is closed per function). The `romberg`
+/// arm's reference is `integrate.quad`'s value: SciPy no longer ships `romberg`.
+const ARMS: [&str; 3] = ["quad", "fixed_quad", "romberg"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -72,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -318,25 +323,26 @@ fn diff_integrate_quad() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_quad", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(fsci_v) = fsci_eval(case) else {
+        let arm = case.routine.as_str();
+        let Some((scipy_v, fsci_v)) =
+            ledger.pair(arm, &case.case_id, scipy_arm.value, fsci_eval(case))
+        else {
             continue;
         };
-        if let Some(scipy_v) = scipy_arm.value
-            && fsci_v.is_finite()
-        {
-            let abs_d = (fsci_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_d);
-            let tol = tol_for(&case.routine);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                routine: case.routine.clone(),
-                abs_diff: abs_d,
-                pass: abs_d <= tol,
-            });
-        }
+        let abs_d = (fsci_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_d);
+        let tol = tol_for(arm);
+        ledger.compared(arm, &case.case_id, abs_d <= tol);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            routine: case.routine.clone(),
+            abs_diff: abs_d,
+            pass: abs_d <= tol,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -345,6 +351,7 @@ fn diff_integrate_quad() {
         test_id: "diff_integrate_quad".into(),
         category: "scipy.integrate.quad / fixed_quad / romberg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -368,4 +375,11 @@ fn diff_integrate_quad() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (romberg has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.routine == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

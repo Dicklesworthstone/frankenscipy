@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-2i7no]. 1e-10 abs on (w, |h|, angle(h)).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::freqs;
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -213,17 +215,25 @@ fn diff_signal_freqs() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_freqs", &["freqs"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(w_exp), Some(mag_exp), Some(phase_exp)) = (
-            scipy_arm.w.as_ref(),
-            scipy_arm.h_mag.as_ref(),
-            scipy_arm.h_phase.as_ref(),
-        ) else {
-            continue;
+        let scipy_v = match (&scipy_arm.w, &scipy_arm.h_mag, &scipy_arm.h_phase) {
+            (Some(w), Some(mag), Some(phase)) => Some((w, mag, phase)),
+            _ => None,
         };
-        let Ok(res) = freqs(&case.b, &case.a, &case.w) else {
+        // SciPy's arrays are all finite by construction; a non-finite fsci element would vanish
+        // in the max folds below, so it counts as an fsci failure.
+        let fsci_res = freqs(&case.b, &case.a, &case.w).ok().filter(|r| {
+            r.w.iter()
+                .chain(&r.h_mag)
+                .chain(&r.h_phase)
+                .all(|v| v.is_finite())
+        });
+        let Some(((w_exp, mag_exp, phase_exp), res)) =
+            ledger.both("freqs", &case.case_id, scipy_v, fsci_res)
+        else {
             continue;
         };
         let abs_d = if res.w.len() != w_exp.len()
@@ -253,6 +263,7 @@ fn diff_signal_freqs() {
             dw.max(dm).max(dp)
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("freqs", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -266,6 +277,7 @@ fn diff_signal_freqs() {
         test_id: "diff_signal_freqs".into(),
         category: "scipy.signal.freqs (analog frequency response)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -286,4 +298,5 @@ fn diff_signal_freqs() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

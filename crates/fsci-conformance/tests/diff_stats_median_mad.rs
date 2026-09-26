@@ -15,13 +15,14 @@
 //! cases. Tol 1e-12 abs (closed-form sort + linear-interp
 //! midpoint).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{mad, median, median_abs_deviation};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -239,23 +241,25 @@ fn diff_stats_median_mad() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["median", "median_abs_deviation", "mad"];
+    let mut ledger = CompareLedger::new("diff_stats_median_mad", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
         let rust_v = match case.func.as_str() {
             "median" => median(&case.data),
             "median_abs_deviation" => median_abs_deviation(&case.data, case.scale),
             "mad" => mad(&case.data, case.scale),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
-        if !rust_v.is_finite() {
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, Some(rust_v))
+        else {
             continue;
-        }
+        };
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -270,6 +274,7 @@ fn diff_stats_median_mad() {
         test_id: "diff_stats_median_mad".into(),
         category: "numpy.median + scipy.stats.median_abs_deviation".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -294,4 +299,12 @@ fn diff_stats_median_mad() {
         diffs.len(),
         max_overall
     );
+    // median_abs_deviation runs at two scales per dataset; median and mad at one. Each arm must
+    // compare all of its own cases, so the minimum is the smallest arm's case count.
+    let min_per_arm = arms
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("arms is non-empty");
+    ledger.finish(min_per_arm);
 }

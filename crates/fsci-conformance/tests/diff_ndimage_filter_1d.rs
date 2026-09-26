@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-7adg0]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, maximum_filter1d, minimum_filter1d, uniform_filter1d};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -229,37 +231,38 @@ fn diff_ndimage_filter_1d() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    // Only uniform_filter1d cases are generated (max/min are excluded in generate_query).
+    let mut ledger = CompareLedger::new("diff_ndimage_filter_1d", &["uniform_filter1d"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_out = mode_of(&case.mode)
+            .zip(NdArray::new(case.input.clone(), case.shape.clone()).ok())
+            .and_then(|(mode, input)| {
+                let fsci_result = match case.op.as_str() {
+                    "uniform_filter1d" => uniform_filter1d(&input, case.size, case.axis, mode, 0.0),
+                    "maximum_filter1d" => maximum_filter1d(&input, case.size, case.axis, mode, 0.0),
+                    "minimum_filter1d" => minimum_filter1d(&input, case.size, case.axis, mode, 0.0),
+                    other => panic!("unknown filter_1d op `{other}`"),
+                };
+                fsci_result.ok()
+            })
+            .map(|out| out.data);
+        let Some((expected, out_data)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_out.as_deref(),
+        ) else {
             continue;
         };
-        let Some(mode) = mode_of(&case.mode) else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.input.clone(), case.shape.clone()) else {
-            continue;
-        };
-        let fsci_result = match case.op.as_str() {
-            "uniform_filter1d" => uniform_filter1d(&input, case.size, case.axis, mode, 0.0),
-            "maximum_filter1d" => maximum_filter1d(&input, case.size, case.axis, mode, 0.0),
-            "minimum_filter1d" => minimum_filter1d(&input, case.size, case.axis, mode, 0.0),
-            _ => continue,
-        };
-        let Ok(out) = fsci_result else {
-            continue;
-        };
-        let abs_d = if out.data.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            out.data
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = out_data
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -274,6 +277,7 @@ fn diff_ndimage_filter_1d() {
         test_id: "diff_ndimage_filter_1d".into(),
         category: "scipy.ndimage uniform/maximum/minimum_filter1d".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -294,4 +298,5 @@ fn diff_ndimage_filter_1d() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

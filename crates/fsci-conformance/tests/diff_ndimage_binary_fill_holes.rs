@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-dkl4l]. Bit-exact 0/1 comparison on 2-D
 //! binary masks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, binary_fill_holes};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     total_mismatched_pixels: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -234,25 +236,26 @@ fn diff_ndimage_binary_fill_holes() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut total_mismatched: usize = 0;
+    let mut ledger = CompareLedger::new("diff_ndimage_binary_fill_holes", &["binary_fill_holes"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
+        let fsci_v = fsci_eval(case);
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            "binary_fill_holes",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Some(fsci_v) = fsci_eval(case) else {
-            continue;
-        };
-        let mismatched = if fsci_v.len() != scipy_v.len() {
-            fsci_v.len()
-        } else {
-            fsci_v
-                .iter()
-                .zip(scipy_v.iter())
-                .filter(|(a, b)| (**a - **b).abs() > 0.5)
-                .count()
-        };
+        let mismatched = fsci_v
+            .iter()
+            .zip(scipy_v.iter())
+            .filter(|(a, b)| (**a - **b).abs() > 0.5)
+            .count();
         total_mismatched += mismatched;
+        ledger.compared("binary_fill_holes", &case.case_id, mismatched == 0);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             mismatched_pixels: mismatched,
@@ -266,6 +269,7 @@ fn diff_ndimage_binary_fill_holes() {
         test_id: "diff_ndimage_binary_fill_holes".into(),
         category: "scipy.ndimage.binary_fill_holes".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         total_mismatched_pixels: total_mismatched,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -289,4 +293,5 @@ fn diff_ndimage_binary_fill_holes() {
         diffs.len(),
         total_mismatched
     );
+    ledger.finish(query.points.len());
 }

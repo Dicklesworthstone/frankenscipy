@@ -11,13 +11,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, FormatConvertible, Shape2D, sparse_eliminate_zeros, sparse_has_explicit_zeros,
 };
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -265,16 +267,13 @@ fn diff_sparse_eliminate_zeros() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_eliminate_zeros",
+        &["has_zeros", "nnz_after", "dense"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(ehz), Some(ennz), Some(edense)) =
-            (arm.has_zeros, arm.nnz_after, arm.dense.as_ref())
-        else {
-            continue;
-        };
+        let scipy_arm = pmap.get(&case.case_id);
 
         let mut data = Vec::with_capacity(case.triplets.len());
         let mut rows = Vec::with_capacity(case.triplets.len());
@@ -285,57 +284,74 @@ fn diff_sparse_eliminate_zeros() {
             cols.push(c);
         }
         // sum_duplicates=false so explicit zeros aren't collapsed.
-        let Ok(coo) =
+        let csr =
             CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rows, cols, true)
-        else {
-            continue;
-        };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
+                .ok()
+                .and_then(|coo| coo.to_csr().ok());
 
         // has_explicit_zeros
-        let actual_hz = sparse_has_explicit_zeros(&csr);
-        let pass = actual_hz == ehz;
-        diffs.push(CaseDiff {
-            case_id: format!("{}_has_zeros", case.case_id),
-            op: "has_zeros".into(),
-            abs_diff: if pass { 0.0 } else { 1.0 },
-            pass,
-        });
+        if let Some((ehz, actual_hz)) = ledger.both(
+            "has_zeros",
+            &case.case_id,
+            scipy_arm.and_then(|a| a.has_zeros),
+            csr.as_ref().map(sparse_has_explicit_zeros),
+        ) {
+            let pass = actual_hz == ehz;
+            ledger.compared("has_zeros", &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_has_zeros", case.case_id),
+                op: "has_zeros".into(),
+                abs_diff: if pass { 0.0 } else { 1.0 },
+                pass,
+            });
+        }
 
         // eliminate_zeros
-        let cleaned = sparse_eliminate_zeros(&csr);
-        let actual_nnz = cleaned.data().len();
-        let nnz_pass = actual_nnz == ennz;
-        diffs.push(CaseDiff {
-            case_id: format!("{}_nnz_after", case.case_id),
-            op: "nnz_after".into(),
-            abs_diff: if nnz_pass {
-                0.0
-            } else {
-                (actual_nnz as f64 - ennz as f64).abs()
-            },
-            pass: nnz_pass,
-        });
+        let cleaned = csr.as_ref().map(sparse_eliminate_zeros);
+        if let Some((ennz, actual_nnz)) = ledger.both(
+            "nnz_after",
+            &case.case_id,
+            scipy_arm.and_then(|a| a.nnz_after),
+            cleaned.as_ref().map(|c| c.data().len()),
+        ) {
+            let nnz_pass = actual_nnz == ennz;
+            ledger.compared("nnz_after", &case.case_id, nnz_pass);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_nnz_after", case.case_id),
+                op: "nnz_after".into(),
+                abs_diff: if nnz_pass {
+                    0.0
+                } else {
+                    (actual_nnz as f64 - ennz as f64).abs()
+                },
+                pass: nnz_pass,
+            });
+        }
 
-        let actual_dense = csr_to_dense(
-            cleaned.shape().rows,
-            cleaned.shape().cols,
-            cleaned.indptr(),
-            cleaned.indices(),
-            cleaned.data(),
-        );
-        let abs_d = if actual_dense.len() != edense.len() {
-            f64::INFINITY
-        } else {
-            actual_dense
-                .iter()
-                .zip(edense.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let actual_dense = cleaned.as_ref().map(|cleaned| {
+            csr_to_dense(
+                cleaned.shape().rows,
+                cleaned.shape().cols,
+                cleaned.indptr(),
+                cleaned.indices(),
+                cleaned.data(),
+            )
+        });
+        let Some((edense, actual_dense)) = ledger.slices(
+            "dense",
+            &case.case_id,
+            scipy_arm.and_then(|a| a.dense.as_deref()),
+            actual_dense.as_deref(),
+        ) else {
+            continue;
         };
+        let abs_d = actual_dense
+            .iter()
+            .zip(edense.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("dense", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: format!("{}_dense", case.case_id),
             op: "dense".into(),
@@ -351,6 +367,7 @@ fn diff_sparse_eliminate_zeros() {
         category: "fsci_sparse::sparse_has_explicit_zeros + sparse_eliminate_zeros vs scipy.sparse"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -371,4 +388,5 @@ fn diff_sparse_eliminate_zeros() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

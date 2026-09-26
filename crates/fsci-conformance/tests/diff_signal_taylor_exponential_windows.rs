@@ -5,22 +5,30 @@
 //!   * `taylor(n, nbar, sll, norm, sym)` vs scipy.signal.windows.taylor
 //!   * `exponential(n, center, tau, sym)` vs scipy.signal.windows.exponential
 //!
-//! Sweeps n ∈ {8, 16, 32, 64}, nbar ∈ {3, 4, 5}, sll ∈ {-30, -40, -50},
+//! Sweeps n ∈ {8, 16, 32, 64}, nbar ∈ {3, 4, 5}, sll ∈ {30, 40, 50},
 //! with both sym=True and sym=False. For exponential: n ∈ {8, 16, 32},
 //! tau ∈ {2.0, 5.0, 8.0}, and several center configurations.
+//!
+//! SciPy's `sll` is the sidelobe suppression as a POSITIVE dB number. The sweep used to send
+//! -30/-40/-50, for which SciPy returns all-NaN windows (acosh of a value below 1); the oracle
+//! mapped those to None and every taylor case was skipped, so the test compared only the
+//! exponential arm until the compared-case ledger (olv0j.1) made the empty arm fail.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{exponential, taylor};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REL_TOL: f64 = 1.0e-10;
 const ABS_TOL: f64 = 1.0e-12;
+const FUNCS: [&str; 2] = ["taylor", "exponential"];
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,7 +39,7 @@ struct CasePoint {
     n: usize,
     /// Taylor: nbar
     nbar: usize,
-    /// Taylor: sll (negative dB)
+    /// Taylor: sll (sidelobe suppression, positive dB)
     sll: f64,
     norm: bool,
     sym: bool,
@@ -74,6 +82,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -107,7 +116,7 @@ fn build_query() -> OracleQuery {
     // taylor sweep
     for &n in &[8_usize, 16, 32, 64] {
         for &nbar in &[3_usize, 4, 5] {
-            for &sll in &[-30.0_f64, -40.0, -50.0] {
+            for &sll in &[30.0_f64, 40.0, 50.0] {
                 for &sym in &[true, false] {
                     pts.push(CasePoint {
                         case_id: format!("taylor_n{n}_nbar{nbar}_sll{sll}_sym{sym}"),
@@ -185,7 +194,11 @@ for c in q["points"]:
             w = windows.taylor(int(c["n"]), nbar=int(c["nbar"]), sll=float(c["sll"]),
                                norm=bool(c["norm"]), sym=bool(c["sym"]))
         elif c["func"] == "exponential":
-            center = None if (c["center"] != c["center"]) else float(c["center"])  # NaN check
+            # The Rust side encodes "no center" as NaN, which serde_json writes as null; the old
+            # `float(c["center"])` raised TypeError on it, so every default-center case (18 of 27)
+            # was skipped until the compared-case ledger (olv0j.1).
+            raw = c["center"]
+            center = None if (raw is None or raw != raw) else float(raw)
             w = windows.exponential(int(c["n"]), center=center, tau=float(c["tau"]),
                                     sym=bool(c["sym"]))
         else:
@@ -255,56 +268,30 @@ fn diff_signal_taylor_exponential_windows() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_taylor_exponential_windows", &FUNCS);
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let Some(expected) = o.w.as_ref() else {
-            continue;
-        };
 
-        let actual = match c.func.as_str() {
-            "taylor" => taylor(c.n, c.nbar, c.sll, c.norm, c.sym),
+        let actual: Option<Vec<f64>> = match c.func.as_str() {
+            "taylor" => Some(taylor(c.n, c.nbar, c.sll, c.norm, c.sym)),
             "exponential" => {
                 let center = if c.center.is_nan() {
                     None
                 } else {
                     Some(c.center)
                 };
-                match exponential(c.n, center, c.tau, c.sym) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        diffs.push(CaseDiff {
-                            case_id: c.case_id.clone(),
-                            func: c.func.clone(),
-                            max_abs_diff: f64::INFINITY,
-                            max_rel_diff: f64::INFINITY,
-                            n_eval: 0,
-                            pass: false,
-                            note: format!("exponential error: {e:?}"),
-                        });
-                        continue;
-                    }
-                }
+                exponential(c.n, center, c.tau, c.sym)
+                    .inspect_err(|e| eprintln!("{}: exponential error: {e:?}", c.case_id))
+                    .ok()
             }
             other => panic!("unknown func {other}"),
         };
-
-        if actual.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: c.case_id.clone(),
-                func: c.func.clone(),
-                max_abs_diff: f64::INFINITY,
-                max_rel_diff: f64::INFINITY,
-                n_eval: actual.len(),
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} scipy={}",
-                    actual.len(),
-                    expected.len()
-                ),
-            });
+        let Some((expected, actual)) =
+            ledger.slices(&c.func, &c.case_id, o.w.as_deref(), actual.as_deref())
+        else {
             continue;
-        }
+        };
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
@@ -315,6 +302,7 @@ fn diff_signal_taylor_exponential_windows() {
             max_rel = max_rel.max(abs_d / denom);
         }
         let pass = max_rel <= REL_TOL || max_abs <= ABS_TOL;
+        ledger.compared(&c.func, &c.case_id, pass);
         diffs.push(CaseDiff {
             case_id: c.case_id.clone(),
             func: c.func.clone(),
@@ -331,6 +319,7 @@ fn diff_signal_taylor_exponential_windows() {
         test_id: "diff_signal_taylor_exponential_windows".into(),
         category: "fsci_signal::{taylor, exponential} vs scipy.signal.windows".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -352,4 +341,10 @@ fn diff_signal_taylor_exponential_windows() {
         "taylor/exponential window parity failed: {} cases",
         diffs.len()
     );
+    let min_per_arm = FUNCS
+        .iter()
+        .map(|func| query.points.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("FUNCS is non-empty");
+    ledger.finish(min_per_arm);
 }

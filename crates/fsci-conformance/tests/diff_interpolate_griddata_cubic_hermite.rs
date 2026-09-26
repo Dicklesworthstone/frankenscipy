@@ -12,13 +12,14 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{GriddataMethod, cubic_hermite_interpolate, griddata};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -327,6 +329,7 @@ fn diff_interpolate_griddata_cubic_hermite() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -337,14 +340,13 @@ fn diff_interpolate_griddata_cubic_hermite() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_interpolate_griddata_cubic_hermite",
+        &["grid_linear", "grid_nearest", "chermite"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         let result: Option<Vec<f64>> = match case.op.as_str() {
             "grid_linear" => griddata(
                 &case.points,
@@ -363,13 +365,19 @@ fn diff_interpolate_griddata_cubic_hermite() {
             "chermite" => {
                 cubic_hermite_interpolate(&case.xs, &case.ys, &case.dys, &case.x_new).ok()
             }
-            _ => None,
+            other => panic!("unknown griddata_chermite op {other} in {}", case.case_id),
         };
-        let Some(y) = result else {
+        let Some((expected, y)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            arm.values.as_deref(),
+            result.as_deref(),
+        ) else {
             continue;
         };
-        let abs_d = vec_max_diff(&y, expected);
+        let abs_d = vec_max_diff(y, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -384,6 +392,7 @@ fn diff_interpolate_griddata_cubic_hermite() {
         test_id: "diff_interpolate_griddata_cubic_hermite".into(),
         category: "fsci_interpolate::griddata + cubic_hermite_interpolate vs scipy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -403,5 +412,11 @@ fn diff_interpolate_griddata_cubic_hermite() {
         "griddata/chermite conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        per_op("grid_linear")
+            .min(per_op("grid_nearest"))
+            .min(per_op("chermite")),
     );
 }

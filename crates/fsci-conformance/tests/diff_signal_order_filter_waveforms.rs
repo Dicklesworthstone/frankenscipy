@@ -13,18 +13,20 @@
 //!   parameter (width/duty). Deterministic; 1e-12 abs.
 //! - `unit_impulse`: delta function. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{order_filter, sawtooth, square, unit_impulse};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
+const OPS: [&str; 4] = ["order_filter", "sawtooth", "square", "unit_impulse"];
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -293,9 +296,6 @@ print(json.dumps({"points": points}))
 }
 
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -318,45 +318,31 @@ fn diff_signal_order_filter_waveforms() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_order_filter_waveforms", &OPS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let abs_d = match case.op.as_str() {
+        let scipy_v = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let fsci_v: Option<Vec<f64>> = match case.op.as_str() {
             "order_filter" => {
                 let y = order_filter(&case.x, case.window_size, case.rank);
                 let half = case.window_size / 2;
-                if y.len() < 2 * half {
-                    continue;
-                }
-                let interior = &y[half..y.len() - half];
-                vec_max_diff(interior, expected)
+                (y.len() >= 2 * half).then(|| y[half..y.len() - half].to_vec())
             }
-            "sawtooth" => {
-                let Ok(y) = sawtooth(&case.t, case.param) else {
-                    continue;
-                };
-                vec_max_diff(&y, expected)
-            }
-            "square" => {
-                let Ok(y) = square(&case.t, case.param) else {
-                    continue;
-                };
-                vec_max_diff(&y, expected)
-            }
-            "unit_impulse" => {
-                let Ok(y) = unit_impulse(case.shape, Some(case.idx)) else {
-                    continue;
-                };
-                vec_max_diff(&y, expected)
-            }
-            _ => continue,
+            "sawtooth" => sawtooth(&case.t, case.param).ok(),
+            "square" => square(&case.t, case.param).ok(),
+            "unit_impulse" => unit_impulse(case.shape, Some(case.idx)).ok(),
+            other => panic!("unknown op `{other}` in {}", case.case_id),
         };
+        let Some((expected, actual)) =
+            ledger.slices(&case.op, &case.case_id, scipy_v, fsci_v.as_deref())
+        else {
+            continue;
+        };
+        let abs_d = vec_max_diff(actual, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -372,6 +358,7 @@ fn diff_signal_order_filter_waveforms() {
         category: "fsci_signal::order_filter + sawtooth + square + unit_impulse vs scipy.signal"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -392,4 +379,10 @@ fn diff_signal_order_filter_waveforms() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = OPS
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("OPS is non-empty");
+    ledger.finish(min_per_arm);
 }

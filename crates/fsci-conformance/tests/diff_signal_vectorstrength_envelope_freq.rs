@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-z4pf4]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{analytic_envelope, dominant_frequency, vectorstrength};
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -314,42 +316,54 @@ fn diff_signal_vectorstrength_envelope_freq() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_vectorstrength_envelope_freq",
+        &["vectorstrength", "analytic_envelope", "dominant_frequency"],
+    );
 
     // vectorstrength
     for case in &query.vs {
         let scipy_arm = vs_map.get(&case.case_id).expect("validated oracle");
-        let (Some(s_exp), Some(p_exp)) = (scipy_arm.strength, scipy_arm.phase) else {
+        let Some(((s_exp, p_exp), (s, p))) = ledger.both(
+            "vectorstrength",
+            &case.case_id,
+            scipy_arm.strength.zip(scipy_arm.phase),
+            Some(vectorstrength(&case.events, case.period)),
+        ) else {
             continue;
         };
-        let (s, p) = vectorstrength(&case.events, case.period);
         let abs_d = (s - s_exp).abs().max((p - p_exp).abs());
         max_overall = max_overall.max(abs_d);
+        // f64::max drops a NaN operand, so a NaN strength or phase must fail explicitly.
+        let pass = abs_d <= ABS_TOL && !s.is_nan() && !p.is_nan();
+        ledger.compared("vectorstrength", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "vectorstrength".into(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
     // envelope
     for case in &query.env {
         let scipy_arm = env_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let env = analytic_envelope(&case.x).ok();
+        let Some((expected, env)) = ledger.slices(
+            "analytic_envelope",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            env.as_deref(),
+        ) else {
             continue;
         };
-        let Ok(env) = analytic_envelope(&case.x) else {
-            continue;
-        };
-        let abs_d = if env.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            env.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = env
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("analytic_envelope", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "analytic_envelope".into(),
@@ -361,12 +375,17 @@ fn diff_signal_vectorstrength_envelope_freq() {
     // dominant_frequency
     for case in &query.dom {
         let scipy_arm = dom_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
+        let Some((expected, fsci_v)) = ledger.pair(
+            "dominant_frequency",
+            &case.case_id,
+            scipy_arm.value,
+            Some(dominant_frequency(&case.magnitudes, &case.freqs)),
+        ) else {
             continue;
         };
-        let fsci_v = dominant_frequency(&case.magnitudes, &case.freqs);
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("dominant_frequency", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "dominant_frequency".into(),
@@ -381,6 +400,7 @@ fn diff_signal_vectorstrength_envelope_freq() {
         test_id: "diff_signal_vectorstrength_envelope_freq".into(),
         category: "scipy.signal vectorstrength + envelope + dominant_freq".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -401,4 +421,5 @@ fn diff_signal_vectorstrength_envelope_freq() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.vs.len().min(query.env.len()).min(query.dom.len()));
 }

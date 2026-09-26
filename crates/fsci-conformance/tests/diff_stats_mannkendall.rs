@@ -15,13 +15,14 @@
 //!   - pvalue       : 1e-9 abs  (normal cdf chain)
 //!   - trend_dir    : 1e-12 abs (integer compare)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::mannkendall;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -243,38 +245,36 @@ fn diff_stats_mannkendall() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_mannkendall", &["tau", "pvalue", "trend"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_tau, rust_p, rust_trend) = mannkendall(&case.data);
 
-        if let Some(scipy_tau) = scipy_arm.tau
-            && rust_tau.is_finite()
-        {
-            let abs_diff = (rust_tau - scipy_tau).abs();
+        let float_arms = [
+            ("tau", scipy_arm.tau, rust_tau, TAU_TOL),
+            ("pvalue", scipy_arm.pvalue, rust_p, PVALUE_TOL),
+        ];
+        for (arm, scipy, fsci, tol) in float_arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "tau".into(),
+                arm: arm.into(),
                 abs_diff,
-                pass: abs_diff <= TAU_TOL,
+                pass: abs_diff <= tol,
             });
         }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && rust_p.is_finite()
+        if let Some((scipy_trend, rust_trend)) =
+            ledger.both("trend", &case.case_id, scipy_arm.trend, Some(rust_trend))
         {
-            let abs_diff = (rust_p - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
-                abs_diff,
-                pass: abs_diff <= PVALUE_TOL,
-            });
-        }
-        if let Some(scipy_trend) = scipy_arm.trend {
             let abs_diff = (rust_trend as i64 - scipy_trend).unsigned_abs() as f64;
             max_overall = max_overall.max(abs_diff);
+            ledger.compared("trend", &case.case_id, abs_diff <= TAU_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "trend".into(),
@@ -290,6 +290,7 @@ fn diff_stats_mannkendall() {
         test_id: "diff_stats_mannkendall".into(),
         category: "mannkendall (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -314,4 +315,5 @@ fn diff_stats_mannkendall() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

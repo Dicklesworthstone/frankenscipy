@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-peq4g]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     NdArray, greater_than, log_array, power_array, scale_array, sqrt_array, threshold, where_cond,
 };
@@ -20,6 +21,15 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 7] = [
+    "log_array",
+    "sqrt_array",
+    "scale_array",
+    "power_array",
+    "threshold",
+    "greater_than",
+    "where_cond",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -61,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -286,6 +297,54 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse array_api oracle JSON"))
 }
 
+/// fsci's output for one case, `None` when an fsci call refused it.
+fn fsci_output(case: &PointCase) -> Option<Vec<f64>> {
+    let a_arr = NdArray::new(case.a.clone(), case.shape.clone()).ok()?;
+    let b_arr = if !case.b.is_empty() {
+        NdArray::new(case.b.clone(), case.shape.clone()).ok()
+    } else {
+        None
+    };
+    let out_data: Vec<f64> = match case.op.as_str() {
+        "log_array" => log_array(&a_arr).data,
+        "sqrt_array" => sqrt_array(&a_arr).data,
+        "scale_array" => scale_array(&a_arr, case.scalar).data,
+        "power_array" => power_array(&a_arr, case.scalar).data,
+        "threshold" => threshold(&a_arr, case.scalar).data,
+        "greater_than" => {
+            let b_arr = b_arr.as_ref().expect("greater_than needs b");
+            greater_than(&a_arr, b_arr).ok()?.data
+        }
+        "where_cond" => {
+            let b_arr = b_arr.as_ref().expect("where_cond needs b");
+            // Build cond from a > 5.0
+            let cond_data: Vec<f64> = case
+                .a
+                .iter()
+                .map(|&v| if v > 5.0 { 1.0 } else { 0.0 })
+                .collect();
+            let cond_arr = NdArray::new(cond_data, case.shape.clone()).ok()?;
+            where_cond(&cond_arr, &a_arr, b_arr).ok()?.data
+        }
+        other => panic!("unknown array_api op `{other}`"),
+    };
+    // Map -inf to -1e308 (matches oracle sentinel)
+    Some(
+        out_data
+            .iter()
+            .map(|&v| {
+                if v == f64::NEG_INFINITY {
+                    -1.0e308
+                } else if v == f64::INFINITY {
+                    1.0e308
+                } else {
+                    v
+                }
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn diff_ndimage_array_api_ops() {
     let query = generate_query();
@@ -303,74 +362,26 @@ fn diff_ndimage_array_api_ops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_array_api_ops", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v = fsci_output(case);
+        let Some((expected, mapped)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Ok(a_arr) = NdArray::new(case.a.clone(), case.shape.clone()) else {
-            continue;
-        };
-        let b_arr = if !case.b.is_empty() {
-            NdArray::new(case.b.clone(), case.shape.clone()).ok()
-        } else {
-            None
-        };
-        let out_data: Vec<f64> = match case.op.as_str() {
-            "log_array" => log_array(&a_arr).data,
-            "sqrt_array" => sqrt_array(&a_arr).data,
-            "scale_array" => scale_array(&a_arr, case.scalar).data,
-            "power_array" => power_array(&a_arr, case.scalar).data,
-            "threshold" => threshold(&a_arr, case.scalar).data,
-            "greater_than" => {
-                let b_arr = b_arr.as_ref().expect("greater_than needs b");
-                let Ok(out) = greater_than(&a_arr, b_arr) else {
-                    continue;
-                };
-                out.data
-            }
-            "where_cond" => {
-                let b_arr = b_arr.as_ref().expect("where_cond needs b");
-                // Build cond from a > 5.0
-                let cond_data: Vec<f64> = case
-                    .a
-                    .iter()
-                    .map(|&v| if v > 5.0 { 1.0 } else { 0.0 })
-                    .collect();
-                let Ok(cond_arr) = NdArray::new(cond_data, case.shape.clone()) else {
-                    continue;
-                };
-                let Ok(out) = where_cond(&cond_arr, &a_arr, b_arr) else {
-                    continue;
-                };
-                out.data
-            }
-            _ => continue,
-        };
-        // Map -inf to -1e308 (matches oracle sentinel)
-        let mapped: Vec<f64> = out_data
+        let abs_d = mapped
             .iter()
-            .map(|&v| {
-                if v == f64::NEG_INFINITY {
-                    -1.0e308
-                } else if v == f64::INFINITY {
-                    1.0e308
-                } else {
-                    v
-                }
-            })
-            .collect();
-        let abs_d = if mapped.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            mapped
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -385,6 +396,7 @@ fn diff_ndimage_array_api_ops() {
         test_id: "diff_ndimage_array_api_ops".into(),
         category: "fsci_ndimage array-API ops vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -405,4 +417,11 @@ fn diff_ndimage_array_api_ops() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (log/sqrt/where have one each); each must compare all its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

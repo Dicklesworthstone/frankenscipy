@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-5lxm0]. Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_constants as fc;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,23 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REL_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Every op `generate_query` emits cases for: one ledger arm each.
+const OPS: [&str; 14] = [
+    "celsius_to_kelvin",
+    "kelvin_to_celsius",
+    "fahrenheit_to_kelvin",
+    "kelvin_to_fahrenheit",
+    "fahrenheit_to_celsius",
+    "celsius_to_fahrenheit",
+    "rankine_to_kelvin",
+    "kelvin_to_rankine",
+    "ev_to_joules",
+    "joules_to_ev",
+    "wavelength_to_freq",
+    "freq_to_wavelength",
+    "deg2rad",
+    "rad2deg",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct ConvCase {
@@ -56,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -321,15 +340,16 @@ fn diff_constants_temp_ev_wavelength_deg() {
     let mut diffs = Vec::new();
     let mut max_abs = 0.0_f64;
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_constants_temp_ev_wavelength_deg", &OPS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Some(actual) = fsci_eval(&case.op, case.arg) else {
+        let op = case.op.as_str();
+        let Some((expected, actual)) = ledger.pair(
+            op,
+            &case.case_id,
+            pmap.get(&case.case_id).and_then(|arm| arm.value),
+            fsci_eval(op, case.arg),
+        ) else {
             continue;
         };
         let abs_d = (actual - expected).abs();
@@ -344,6 +364,7 @@ fn diff_constants_temp_ev_wavelength_deg() {
         // very small reference magnitudes (deg2rad of 0) don't fail solely
         // due to absolute eps noise.
         let pass = abs_d <= ABS_TOL || rel_d <= REL_TOL;
+        ledger.compared(op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -359,6 +380,7 @@ fn diff_constants_temp_ev_wavelength_deg() {
         test_id: "diff_constants_temp_ev_wavelength_deg".into(),
         category: "fsci_constants conversions vs scipy.constants".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs,
         max_rel_diff: max_rel,
         pass: all_pass,
@@ -384,4 +406,11 @@ fn diff_constants_temp_ev_wavelength_deg() {
         max_abs,
         max_rel
     );
+    // Ops have different case counts (3 to 8); each arm must compare at least the smallest.
+    let min_per_arm = OPS
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("OPS is non-empty");
+    ledger.finish(min_per_arm);
 }

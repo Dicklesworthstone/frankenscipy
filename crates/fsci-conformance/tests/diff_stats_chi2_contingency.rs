@@ -11,13 +11,14 @@
 //! + dof + expected_max_abs) = 16 cases via subprocess.
 //!   Tol 1e-9 abs (closed-form expected sum + chi-squared cdf).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::chi2_contingency;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -236,38 +238,39 @@ fn diff_stats_chi2_contingency() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_chi2_contingency",
+        &["statistic", "pvalue", "dof", "expected_max"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = chi2_contingency(&case.table, case.correction);
 
-        if let Some(scipy_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - scipy_stat).abs();
+        let scalar_arms = [
+            ("statistic", scipy_arm.statistic, result.statistic),
+            ("pvalue", scipy_arm.pvalue, result.pvalue),
+        ];
+        for (arm, scipy, fsci) in scalar_arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "statistic".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
         }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
+        if let Some((scipy_dof, fsci_dof)) =
+            ledger.both("dof", &case.case_id, scipy_arm.dof, Some(result.dof))
         {
-            let abs_diff = (result.pvalue - scipy_p).abs();
+            let abs_diff = (fsci_dof as i64 - scipy_dof).unsigned_abs() as f64;
             max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_dof) = scipy_arm.dof {
-            let abs_diff = (result.dof as i64 - scipy_dof).unsigned_abs() as f64;
-            max_overall = max_overall.max(abs_diff);
+            ledger.compared("dof", &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "dof".into(),
@@ -275,37 +278,36 @@ fn diff_stats_chi2_contingency() {
                 pass: abs_diff <= ABS_TOL,
             });
         }
-        if let Some(scipy_exp) = &scipy_arm.expected {
+        // Element values go through slices on the row-major flattening (a NaN must match
+        // SciPy's); the row structure is checked separately below.
+        let scipy_flat = scipy_arm.expected.as_ref().map(|rows| rows.concat());
+        let fsci_flat = result.expected.concat();
+        if let Some((s, f)) = ledger.slices(
+            "expected_max",
+            &case.case_id,
+            scipy_flat.as_deref(),
+            Some(fsci_flat.as_slice()),
+        ) {
             // Element-wise comparison; report max abs diff over the matrix.
-            let mut max_local = 0.0_f64;
-            let mut shape_ok = result.expected.len() == scipy_exp.len();
-            for (rrow, srow) in result.expected.iter().zip(scipy_exp.iter()) {
-                if rrow.len() != srow.len() {
-                    shape_ok = false;
-                    break;
-                }
-                for (a, b) in rrow.iter().zip(srow.iter()) {
-                    if a.is_finite() {
-                        max_local = max_local.max((a - b).abs());
-                    }
-                }
-            }
+            let row_lens = |rows: &[Vec<f64>]| rows.iter().map(Vec::len).collect::<Vec<usize>>();
+            let shape_ok = scipy_arm.expected.as_deref().map(row_lens)
+                == Some(row_lens(result.expected.as_slice()));
+            let max_local = f
+                .iter()
+                .zip(s.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            let pass = shape_ok && max_local <= ABS_TOL;
+            ledger.compared("expected_max", &case.case_id, pass);
             if shape_ok {
                 max_overall = max_overall.max(max_local);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: "expected_max".into(),
-                    abs_diff: max_local,
-                    pass: max_local <= ABS_TOL,
-                });
-            } else {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: "expected_max".into(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
             }
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: "expected_max".into(),
+                abs_diff: if shape_ok { max_local } else { f64::INFINITY },
+                pass,
+            });
         }
     }
 
@@ -315,6 +317,7 @@ fn diff_stats_chi2_contingency() {
         test_id: "diff_stats_chi2_contingency".into(),
         category: "scipy.stats.chi2_contingency".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -339,4 +342,5 @@ fn diff_stats_chi2_contingency() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

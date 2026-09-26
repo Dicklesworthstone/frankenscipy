@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-lzz1b]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{
     cumulative_trapezoid, cumulative_trapezoid_initial, cumulative_trapezoid_uniform,
 };
@@ -20,6 +21,12 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci entry point (the case `op`).
+const ARMS: [&str; 3] = [
+    "cumulative_trapezoid",
+    "cumulative_trapezoid_uniform",
+    "cumulative_trapezoid_initial",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -61,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -248,38 +256,44 @@ fn diff_integrate_cumulative_trapezoid() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_cumulative_trapezoid", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let arm = case.op.as_str();
+        if arm == "cumulative_trapezoid_initial" && case.initial != 0.0 {
+            // SciPy 1.17.1 raises `ValueError: initial must be None or 0`; fsci still prepends it.
+            ledger.allowlisted(
+                arm,
+                &case.case_id,
+                "frankenscipy-5tdmo",
+                "SciPy raises for a nonzero initial; fsci accepts it",
+            );
+            continue;
+        }
+        let fsci_v: Option<Vec<f64>> = match arm {
+            "cumulative_trapezoid" => cumulative_trapezoid(&case.y, &case.x).ok(),
+            "cumulative_trapezoid_uniform" => cumulative_trapezoid_uniform(&case.y, case.dx).ok(),
+            "cumulative_trapezoid_initial" => {
+                Some(cumulative_trapezoid_initial(&case.y, &case.x, case.initial))
+            }
+            _ => None,
+        };
+        let Some((expected, fsci_v)) = ledger.slices(
+            arm,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let fsci_v: Vec<f64> = match case.op.as_str() {
-            "cumulative_trapezoid" => match cumulative_trapezoid(&case.y, &case.x) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            "cumulative_trapezoid_uniform" => {
-                match cumulative_trapezoid_uniform(&case.y, case.dx) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            }
-            "cumulative_trapezoid_initial" => {
-                cumulative_trapezoid_initial(&case.y, &case.x, case.initial)
-            }
-            _ => continue,
-        };
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -294,6 +308,7 @@ fn diff_integrate_cumulative_trapezoid() {
         test_id: "diff_integrate_cumulative_trapezoid".into(),
         category: "scipy.integrate.cumulative_trapezoid".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -314,4 +329,12 @@ fn diff_integrate_cumulative_trapezoid() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (the `initial` arm has two per input); each must compare
+    // all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

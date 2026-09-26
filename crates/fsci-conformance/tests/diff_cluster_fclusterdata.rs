@@ -19,7 +19,7 @@
 //! All fixtures use carefully spread points so all pairwise
 //! distances are distinct → no tie-breaking divergence.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{LinkageMethod, fclusterdata};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-012";
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -267,18 +269,24 @@ fn diff_cluster_fclusterdata() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_fclusterdata",
+        &["single", "complete", "average"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_labels) = scipy_arm.labels.as_ref() else {
+        let method = method_for(&case.method).expect("generated linkage method");
+        let rust_labels = fclusterdata(&case.data, case.max_clusters, method)
+            .ok()
+            .map(|v| v.into_iter().map(|x| x as i64).collect::<Vec<_>>());
+        let Some((scipy_labels, rust_labels)) = ledger.both(
+            &case.method,
+            &case.case_id,
+            scipy_arm.labels.as_ref(),
+            rust_labels,
+        ) else {
             continue;
-        };
-        let Some(method) = method_for(&case.method) else {
-            continue;
-        };
-        let rust_labels = match fclusterdata(&case.data, case.max_clusters, method) {
-            Ok(v) => v.into_iter().map(|x| x as i64).collect::<Vec<_>>(),
-            Err(_) => continue,
         };
 
         let coassign = if rust_labels.len() == scipy_labels.len() {
@@ -286,6 +294,7 @@ fn diff_cluster_fclusterdata() {
         } else {
             false
         };
+        ledger.compared(&case.method, &case.case_id, coassign);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -301,6 +310,7 @@ fn diff_cluster_fclusterdata() {
         test_id: "diff_cluster_fclusterdata".into(),
         category: "fsci_cluster::fclusterdata".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -323,4 +333,5 @@ fn diff_cluster_fclusterdata() {
         "fclusterdata conformance failed across {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.iter().filter(|c| c.method == "single").count());
 }

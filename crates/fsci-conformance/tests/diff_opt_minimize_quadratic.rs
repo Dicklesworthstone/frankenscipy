@@ -5,15 +5,18 @@
 //! Resolves [frankenscipy-mu0xg]. Each method must converge to within
 //! 1e-4 of the analytic minimum.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{MinimizeOptions, bfgs, nelder_mead, powell};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-4;
+const METHODS: [&str; 3] = ["bfgs", "powell", "nelder_mead"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -28,6 +31,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -93,28 +97,32 @@ fn diff_opt_minimize_quadratic() {
         ),
     ];
 
+    let mut ledger = CompareLedger::new("diff_opt_minimize_quadratic", &METHODS);
     for (label, f, x0, x_min) in &cases {
-        for method in ["bfgs", "powell", "nelder_mead"] {
+        for method in METHODS {
             let res = match method {
                 "bfgs" => bfgs(&|v: &[f64]| f(v), x0, opts),
                 "powell" => powell(&|v: &[f64]| f(v), x0, opts),
                 "nelder_mead" => nelder_mead(&|v: &[f64]| f(v), x0, opts),
-                _ => continue,
+                other => panic!("unknown method {other}"),
             };
-            let Ok(r) = res else {
+            let case_id = format!("{label}_{method}");
+            // The analytic minimum exists, so an unsuccessful fsci run is an fsci failure.
+            let fsci_x = res.ok().filter(|r| r.success).map(|r| r.x);
+            let Some((x_min, x)) =
+                ledger.slices(method, &case_id, Some(x_min.as_slice()), fsci_x.as_deref())
+            else {
                 continue;
             };
-            let d = if r.x.len() != x_min.len() {
-                f64::INFINITY
-            } else {
-                r.x.iter()
-                    .zip(x_min.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
-            };
+            let d = x
+                .iter()
+                .zip(x_min.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
             max_overall = max_overall.max(d);
+            ledger.compared(method, &case_id, d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("{label}_{method}"),
+                case_id,
                 method: method.into(),
                 abs_diff: d,
                 pass: d <= ABS_TOL,
@@ -128,6 +136,7 @@ fn diff_opt_minimize_quadratic() {
         test_id: "diff_opt_minimize_quadratic".into(),
         category: "fsci_opt minimize methods on quadratic objectives".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -151,4 +160,5 @@ fn diff_opt_minimize_quadratic() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

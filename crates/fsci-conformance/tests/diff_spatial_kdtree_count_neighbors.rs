@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-n9540]. Integer-equality comparison vs
 //! scipy.spatial.cKDTree.count_neighbors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::KDTree;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -209,22 +211,24 @@ fn diff_spatial_kdtree_count_neighbors() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger =
+        CompareLedger::new("diff_spatial_kdtree_count_neighbors", &["count_neighbors"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_c) = scipy_arm.count else {
-            continue;
-        };
-        let Ok(t1) = KDTree::new(&case.pts1) else {
-            continue;
-        };
-        let Ok(t2) = KDTree::new(&case.pts2) else {
-            continue;
-        };
-        let Ok(fsci_c) = t1.count_neighbors(&t2, case.r) else {
+        let fsci_count = KDTree::new(&case.pts1)
+            .and_then(|t1| KDTree::new(&case.pts2).and_then(|t2| t1.count_neighbors(&t2, case.r)))
+            .ok();
+        let Some((scipy_c, fsci_c)) = ledger.both(
+            "count_neighbors",
+            &case.case_id,
+            scipy_arm.count,
+            fsci_count,
+        ) else {
             continue;
         };
         let pass = (fsci_c as i64) == scipy_c;
+        ledger.compared("count_neighbors", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci_count: fsci_c as i64,
@@ -239,6 +243,7 @@ fn diff_spatial_kdtree_count_neighbors() {
         test_id: "diff_spatial_kdtree_count_neighbors".into(),
         category: "scipy.spatial.cKDTree.count_neighbors".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -260,4 +265,5 @@ fn diff_spatial_kdtree_count_neighbors() {
         "count_neighbors conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

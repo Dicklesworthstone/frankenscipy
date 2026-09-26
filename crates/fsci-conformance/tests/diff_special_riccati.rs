@@ -12,13 +12,14 @@
 //! inherits the cylindrical Bessel precision floor
 //! (frankenscipy-0om9c).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{riccati_jn, riccati_yn};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-6;
 const REL_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function; each case checks its values and its derivatives.
+const ARMS: [&str; 2] = ["riccati_jn", "riccati_yn"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -67,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -96,16 +100,12 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write riccati diff log");
 }
 
+/// A non-finite element is returned as is: the ledger classifies it against SciPy's.
 fn fsci_eval(func: &str, n: u32, x: f64) -> Option<(Vec<f64>, Vec<f64>)> {
-    let (vs, ds) = match func {
-        "riccati_jn" => riccati_jn(n, x),
-        "riccati_yn" => riccati_yn(n, x),
-        _ => return None,
-    };
-    if vs.iter().chain(ds.iter()).all(|v| v.is_finite()) {
-        Some((vs, ds))
-    } else {
-        None
+    match func {
+        "riccati_jn" => Some(riccati_jn(n, x)),
+        "riccati_yn" => Some(riccati_yn(n, x)),
+        _ => None,
     }
 }
 
@@ -236,33 +236,37 @@ fn diff_special_riccati() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_riccati", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        let (sv, sd) = match (oracle.values.as_ref(), oracle.derivs.as_ref()) {
-            (Some(v), Some(d)) => (v, d),
-            _ => continue,
-        };
-        let Some((rv, rd)) = fsci_eval(&case.func, case.n, case.x) else {
+        let func = case.func.as_str();
+        let fsci = fsci_eval(func, case.n, case.x);
+        // One ledger outcome per case: `slices` records nothing when it hands both back, so a
+        // case is recorded by whichever check fails first, or by the verdict below.
+        let Some((sv, rv)) = ledger.slices(
+            func,
+            &case.case_id,
+            oracle.values.as_deref(),
+            fsci.as_ref().map(|(vs, _)| vs.as_slice()),
+        ) else {
             continue;
         };
-        if rv.len() != sv.len() || rd.len() != sd.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                arm: "values".into(),
-                abs_diff: f64::INFINITY,
-                rel_diff: f64::INFINITY,
-                pass: false,
-            });
+        let Some((sd, rd)) = ledger.slices(
+            func,
+            &case.case_id,
+            oracle.derivs.as_deref(),
+            fsci.as_ref().map(|(_, ds)| ds.as_slice()),
+        ) else {
             continue;
-        }
+        };
         let assess = |arms: &mut Vec<CaseDiff>,
                       arm: &str,
                       r_arr: &[f64],
                       s_arr: &[f64],
                       max_abs: &mut f64,
-                      max_rel: &mut f64| {
+                      max_rel: &mut f64|
+         -> bool {
             let mut worst_abs = 0.0_f64;
             let mut worst_rel = 0.0_f64;
             let mut pass = true;
@@ -286,23 +290,25 @@ fn diff_special_riccati() {
                 rel_diff: worst_rel,
                 pass,
             });
+            pass
         };
-        assess(
+        let values_pass = assess(
             &mut diffs,
             "values",
-            &rv,
+            rv,
             sv,
             &mut max_abs_overall,
             &mut max_rel_overall,
         );
-        assess(
+        let derivs_pass = assess(
             &mut diffs,
             "derivs",
-            &rd,
+            rd,
             sd,
             &mut max_abs_overall,
             &mut max_rel_overall,
         );
+        ledger.compared(func, &case.case_id, values_pass && derivs_pass);
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -311,6 +317,7 @@ fn diff_special_riccati() {
         test_id: "diff_special_riccati".into(),
         category: "scipy.special.riccati_jn/yn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -337,4 +344,10 @@ fn diff_special_riccati() {
         max_abs_overall,
         max_rel_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

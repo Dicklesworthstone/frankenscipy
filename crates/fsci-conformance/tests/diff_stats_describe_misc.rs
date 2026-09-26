@@ -13,13 +13,14 @@
 //! datasets × 1 gzscore (vector max-abs) = 21 + 3 + 3 + 3 =
 //! 30 cases via subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{describe, gstd, gzscore, variation};
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -292,6 +294,21 @@ fn diff_stats_describe_misc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_describe_misc",
+        &[
+            "nobs",
+            "min",
+            "max",
+            "mean",
+            "variance",
+            "skewness",
+            "kurtosis",
+            "gstd",
+            "variation",
+            "gzscore_max",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -312,69 +329,68 @@ fn diff_stats_describe_misc() {
                     ("kurtosis", scipy_arm.kurtosis, Some(r.kurtosis)),
                 ];
                 for (arm_name, scipy_v, rust_v) in arms {
-                    if let (Some(scipy_v), Some(rust_v)) = (scipy_v, rust_v)
-                        && rust_v.is_finite()
-                    {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            arm: arm_name.into(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
-            "gstd" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = gstd(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            arm: "gstd".into(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
-            "variation" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = variation(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            arm: "variation".into(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
-            "gzscore" => {
-                if let Some(scipy_vec) = &scipy_arm.vector {
-                    let rust_vec = gzscore(&case.data);
-                    let mut max_local = 0.0_f64;
-                    for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                        if a.is_finite() {
-                            max_local = max_local.max((a - b).abs());
-                        }
-                    }
-                    max_overall = max_overall.max(max_local);
+                    let Some((scipy_v, rust_v)) =
+                        ledger.pair(arm_name, &case.case_id, scipy_v, rust_v)
+                    else {
+                        continue;
+                    };
+                    let abs_diff = (rust_v - scipy_v).abs();
+                    max_overall = max_overall.max(abs_diff);
+                    ledger.compared(arm_name, &case.case_id, abs_diff <= ABS_TOL);
                     diffs.push(CaseDiff {
                         case_id: case.case_id.clone(),
-                        arm: "gzscore_max".into(),
-                        abs_diff: max_local,
-                        pass: max_local <= ABS_TOL,
+                        arm: arm_name.into(),
+                        abs_diff,
+                        pass: abs_diff <= ABS_TOL,
                     });
                 }
             }
-            _ => {}
+            "gstd" | "variation" => {
+                let arm = case.func.as_str();
+                let rust_v = if arm == "gstd" {
+                    gstd(&case.data)
+                } else {
+                    variation(&case.data)
+                };
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair(arm, &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    arm: arm.into(),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
+            }
+            "gzscore" => {
+                let rust_owned = gzscore(&case.data);
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    "gzscore_max",
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(rust_owned.as_slice()),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    max_local = max_local.max((a - b).abs());
+                }
+                max_overall = max_overall.max(max_local);
+                ledger.compared("gzscore_max", &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    arm: "gzscore_max".into(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
+            }
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -384,6 +400,7 @@ fn diff_stats_describe_misc() {
         test_id: "diff_stats_describe_misc".into(),
         category: "scipy.stats.describe + gstd + variation + gzscore".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -408,4 +425,13 @@ fn diff_stats_describe_misc() {
         diffs.len(),
         max_overall
     );
+    // describe's seven arms, gstd, variation and gzscore each compare one case per dataset of
+    // their func; the minimum is the smallest of those dataset counts.
+    let per_func = |func: &str| query.points.iter().filter(|c| c.func == func).count();
+    let min_cases = ["describe", "gstd", "variation", "gzscore"]
+        .into_iter()
+        .map(per_func)
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_cases);
 }

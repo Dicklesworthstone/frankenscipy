@@ -13,13 +13,14 @@
 //! None and skipped, and the test passed having compared nothing since
 //! 2026-05-06. It now asserts that every case is compared.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::gauspuls;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     rel_tol: f64,
@@ -268,21 +270,35 @@ fn diff_signal_gauspuls() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_gauspuls", &["i", "q", "envelope"]);
 
     for case in &cases {
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let (Some(scipy_i), Some(scipy_q), Some(scipy_env)) =
-            (&oracle.i, &oracle.q, &oracle.envelope)
-        else {
-            continue;
-        };
-
-        let r = gauspuls(&case.t, case.fc, case.bw, case.bwr).expect("gauspuls");
-        let di = max_abs_diff(&r.i, scipy_i);
-        let dq = max_abs_diff(&r.q, scipy_q);
-        let denv = max_abs_diff(&r.envelope, scipy_env);
+        let r = gauspuls(&case.t, case.fc, case.bw, case.bwr).ok();
+        let arms = [
+            ("i", oracle.i.as_deref(), r.as_ref().map(|r| r.i.as_slice())),
+            ("q", oracle.q.as_deref(), r.as_ref().map(|r| r.q.as_slice())),
+            (
+                "envelope",
+                oracle.envelope.as_deref(),
+                r.as_ref().map(|r| r.envelope.as_slice()),
+            ),
+        ];
+        let mut arm_diffs = [f64::NAN; 3];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let d = max_abs_diff(f, s);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [di, dq, denv] = arm_diffs;
         let case_max = di.max(dq).max(denv);
         let pass = case_max <= ABS_TOL;
         max_overall = max_overall.max(case_max);
@@ -302,6 +318,7 @@ fn diff_signal_gauspuls() {
         test_id: "diff_signal_gauspuls".into(),
         category: "scipy.signal.gauspuls".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         rel_tol: REL_TOL,
@@ -336,4 +353,5 @@ fn diff_signal_gauspuls() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

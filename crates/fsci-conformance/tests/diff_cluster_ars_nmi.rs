@@ -15,7 +15,7 @@
 //!
 //! Resolves [frankenscipy-pvh22]. Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{adjusted_rand_score, normalized_mutual_info};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -261,6 +263,7 @@ fn diff_cluster_ars_nmi() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -271,28 +274,26 @@ fn diff_cluster_ars_nmi() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_ars_nmi",
+        &["adjusted_rand_score", "normalized_mutual_info"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(eari), Some(enmi)) = (arm.ari, arm.nmi) else {
-            continue;
-        };
-
-        let Ok(actual_ari) = adjusted_rand_score(&case.labels_true, &case.labels_pred) else {
-            continue;
-        };
-        let Ok(actual_nmi) = normalized_mutual_info(&case.labels_true, &case.labels_pred) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
+        let actual_ari = adjusted_rand_score(&case.labels_true, &case.labels_pred).ok();
+        let actual_nmi = normalized_mutual_info(&case.labels_true, &case.labels_pred).ok();
 
         for (op, actual, expected) in [
-            ("adjusted_rand_score", actual_ari, eari),
-            ("normalized_mutual_info", actual_nmi, enmi),
+            ("adjusted_rand_score", actual_ari, arm.ari),
+            ("normalized_mutual_info", actual_nmi, arm.nmi),
         ] {
+            let Some((expected, actual)) = ledger.pair(op, &case.case_id, expected, actual) else {
+                continue;
+            };
             let abs_d = (actual - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_{}", case.case_id, op),
                 op: op.into(),
@@ -308,6 +309,7 @@ fn diff_cluster_ars_nmi() {
         test_id: "diff_cluster_ars_nmi".into(),
         category: "fsci_cluster ARS + NMI vs sklearn formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -328,4 +330,5 @@ fn diff_cluster_ars_nmi() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

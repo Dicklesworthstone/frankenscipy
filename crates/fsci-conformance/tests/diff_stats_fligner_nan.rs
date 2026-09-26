@@ -15,13 +15,14 @@
 //! same precision floor used by diff_stats_fligner.rs after
 //! the variance / tie-handling fix).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::fligner_with_nan_policy;
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +45,16 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // SciPy's nan_policy='propagate' answer is NaN; it arrives as "nan", distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     statistic: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     pvalue: Option<f64>,
 }
 
@@ -66,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -146,13 +157,14 @@ import numpy as np
 from scipy import stats
 
 def fnone(v):
+    # A NaN answer is sent as "nan", so the harness can tell it from a raised call (null).
     try:
         v = float(v)
     except Exception:
         return None
-    if v != v:
-        return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
 
 q = json.load(sys.stdin)
 points = []
@@ -234,49 +246,35 @@ fn diff_stats_fligner_nan() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_fligner_nan", &["statistic", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let group_refs: Vec<&[f64]> = case.groups.iter().map(|g| g.as_slice()).collect();
-        let result = match fligner_with_nan_policy(&group_refs, Some(&case.nan_policy)) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let result = fligner_with_nan_policy(&group_refs, Some(&case.nan_policy)).ok();
 
-        if !result.statistic.is_finite() && scipy_arm.statistic.is_none() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "statistic".into(),
-                abs_diff: 0.0,
-                pass: true,
-            });
-        } else if let Some(s_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - s_stat).abs();
+        let arms = [
+            (
+                "statistic",
+                scipy_arm.statistic,
+                result.as_ref().map(|r| r.statistic),
+            ),
+            (
+                "pvalue",
+                scipy_arm.pvalue,
+                result.as_ref().map(|r| r.pvalue),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if !result.pvalue.is_finite() && scipy_arm.pvalue.is_none() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
-                abs_diff: 0.0,
-                pass: true,
-            });
-        } else if let Some(s_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - s_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -289,6 +287,7 @@ fn diff_stats_fligner_nan() {
         test_id: "diff_stats_fligner_nan".into(),
         category: "scipy.stats.fligner(nan_policy)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -313,4 +312,5 @@ fn diff_stats_fligner_nan() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

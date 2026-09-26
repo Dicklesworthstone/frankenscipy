@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, Shape2D, spsolve_triangular};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -268,6 +270,29 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse spsolve_triangular oracle JSON"))
 }
 
+fn fsci_solve(case: &TriCase) -> Option<Vec<f64>> {
+    let mut data = Vec::with_capacity(case.triplets.len());
+    let mut rows = Vec::with_capacity(case.triplets.len());
+    let mut cols = Vec::with_capacity(case.triplets.len());
+    for &(r, c, v) in &case.triplets {
+        data.push(v);
+        rows.push(r);
+        cols.push(c);
+    }
+    let coo =
+        CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rows, cols, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    spsolve_triangular(&csr, &case.b, case.lower).ok()
+}
+
+fn arm_name(case: &TriCase) -> &'static str {
+    if case.lower {
+        "spsolve_triangular_lower"
+    } else {
+        "spsolve_triangular_upper"
+    }
+}
+
 #[test]
 fn diff_sparse_spsolve_triangular() {
     let query = generate_query();
@@ -284,50 +309,27 @@ fn diff_sparse_spsolve_triangular() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["spsolve_triangular_lower", "spsolve_triangular_upper"];
+    let mut ledger = CompareLedger::new("diff_sparse_spsolve_triangular", &arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.x.clone() else {
-            continue;
-        };
-        let mut data = Vec::with_capacity(case.triplets.len());
-        let mut rows = Vec::with_capacity(case.triplets.len());
-        let mut cols = Vec::with_capacity(case.triplets.len());
-        for &(r, c, v) in &case.triplets {
-            data.push(v);
-            rows.push(r);
-            cols.push(c);
-        }
-        let Ok(coo) =
-            CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rows, cols, true)
+        let op = arm_name(case);
+        let scipy_x = pmap.get(&case.case_id).and_then(|arm| arm.x.as_deref());
+        let fsci_x = fsci_solve(case);
+        let Some((expected, x)) = ledger.slices(op, &case.case_id, scipy_x, fsci_x.as_deref())
         else {
             continue;
         };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let Ok(x) = spsolve_triangular(&csr, &case.b, case.lower) else {
-            continue;
-        };
-        let abs_d = if x.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            x.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = x
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
-            op: if case.lower {
-                "spsolve_triangular_lower"
-            } else {
-                "spsolve_triangular_upper"
-            }
-            .into(),
+            op: op.into(),
             abs_diff: abs_d,
             pass: abs_d <= ABS_TOL,
         });
@@ -340,6 +342,7 @@ fn diff_sparse_spsolve_triangular() {
         category: "fsci_sparse::spsolve_triangular vs scipy.sparse.linalg.spsolve_triangular"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -360,4 +363,10 @@ fn diff_sparse_spsolve_triangular() {
         diffs.len(),
         max_overall
     );
+    let per_arm = arms
+        .iter()
+        .map(|a| query.points.iter().filter(|c| arm_name(c) == *a).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_arm);
 }

@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-uqzea]. Rel 1e-12 (exact float arithmetic
 //! expected for SI prefixes; converters use IEC/CODATA constants).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_constants as fc;
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -392,18 +394,25 @@ fn diff_constants_conversions() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_constants_conversions",
+        &["prefix", "temp", "speed_mass"],
+    );
 
     // prefixes
     for case in &query.prefixes {
         let scipy_arm = prefix_map.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
-        let Some(&fsci_v) = prefix_val_map.get(&case.case_id) else {
+        let Some((scipy_v, fsci_v)) = ledger.pair(
+            "prefix",
+            &case.case_id,
+            scipy_arm.value,
+            prefix_val_map.get(&case.case_id).copied(),
+        ) else {
             continue;
         };
         let r = rel(fsci_v, scipy_v);
         max_overall = max_overall.max(r);
+        ledger.compared("prefix", &case.case_id, r <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "prefix".into(),
@@ -415,14 +424,17 @@ fn diff_constants_conversions() {
     // temps
     for case in &query.temps {
         let scipy_arm = temp_map.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
-        let Ok(fsci_v) = fc::convert_temperature(case.val, &case.from, &case.to) else {
+        let Some((scipy_v, fsci_v)) = ledger.pair(
+            "temp",
+            &case.case_id,
+            scipy_arm.value,
+            fc::convert_temperature(case.val, &case.from, &case.to).ok(),
+        ) else {
             continue;
         };
         let r = rel(fsci_v, scipy_v);
         max_overall = max_overall.max(r);
+        ledger.compared("temp", &case.case_id, r <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: format!("temp_{}_{}", case.from, case.to),
@@ -434,14 +446,17 @@ fn diff_constants_conversions() {
     // speed/mass
     for case in &query.speed_mass {
         let scipy_arm = sm_map.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
-        let Some(fsci_v) = apply_speed_mass(&case.op, case.arg) else {
+        let Some((scipy_v, fsci_v)) = ledger.pair(
+            "speed_mass",
+            &case.case_id,
+            scipy_arm.value,
+            apply_speed_mass(&case.op, case.arg),
+        ) else {
             continue;
         };
         let r = rel(fsci_v, scipy_v);
         max_overall = max_overall.max(r);
+        ledger.compared("speed_mass", &case.case_id, r <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -456,6 +471,7 @@ fn diff_constants_conversions() {
         test_id: "diff_constants_conversions".into(),
         category: "scipy.constants prefixes + converters".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -475,5 +491,12 @@ fn diff_constants_conversions() {
         "constants_conversions conformance failed: {} cases, max_rel_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        query
+            .prefixes
+            .len()
+            .min(query.temps.len())
+            .min(query.speed_mass.len()),
     );
 }

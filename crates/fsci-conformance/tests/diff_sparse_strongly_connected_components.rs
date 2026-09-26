@@ -9,13 +9,14 @@
 //! for every (i, j), `labels_fsci[i] == labels_fsci[j]` iff
 //! `labels_scipy[i] == labels_scipy[j]`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, Shape2D, strongly_connected_components};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -206,6 +208,21 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse scc oracle JSON"))
 }
 
+fn fsci_scc_labels(case: &GraphCase) -> Option<Vec<usize>> {
+    let mut data = Vec::with_capacity(case.edges.len());
+    let mut rows = Vec::with_capacity(case.edges.len());
+    let mut cols = Vec::with_capacity(case.edges.len());
+    for &(u, v) in &case.edges {
+        data.push(1.0);
+        rows.push(u);
+        cols.push(v);
+    }
+    let coo =
+        CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rows, cols, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    Some(strongly_connected_components(&csr))
+}
+
 /// Two labelings induce the same partition iff for every pair (i, j),
 /// they agree on "same component".
 fn partitions_equal(a: &[usize], b: &[usize]) -> bool {
@@ -241,31 +258,24 @@ fn diff_sparse_strongly_connected_components() {
     let start = Instant::now();
     let mut diffs = Vec::new();
 
-    for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(enc), Some(elabels)) = (arm.n_components, arm.labels.as_ref()) else {
-            continue;
-        };
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_strongly_connected_components",
+        &["strongly_connected_components"],
+    );
 
-        let mut data = Vec::with_capacity(case.edges.len());
-        let mut rows = Vec::with_capacity(case.edges.len());
-        let mut cols = Vec::with_capacity(case.edges.len());
-        for &(u, v) in &case.edges {
-            data.push(1.0);
-            rows.push(u);
-            cols.push(v);
-        }
-        let Ok(coo) =
-            CooMatrix::from_triplets(Shape2D::new(case.n, case.n), data, rows, cols, true)
-        else {
+    for case in &query.points {
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| Some((arm.n_components?, arm.labels.as_deref()?)));
+        let fsci_labels = fsci_scc_labels(case);
+        let Some(((enc, elabels), labels)) = ledger.both(
+            "strongly_connected_components",
+            &case.case_id,
+            scipy,
+            fsci_labels,
+        ) else {
             continue;
         };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let labels = strongly_connected_components(&csr);
         // Number of components = count of unique labels.
         let actual_nc: usize = {
             let mut s = std::collections::BTreeSet::new();
@@ -277,6 +287,7 @@ fn diff_sparse_strongly_connected_components() {
         let n_components_match = actual_nc == enc;
         let partition_match = partitions_equal(&labels, elabels);
         let pass = n_components_match && partition_match;
+        ledger.compared("strongly_connected_components", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             n_components_match,
@@ -291,6 +302,7 @@ fn diff_sparse_strongly_connected_components() {
         test_id: "diff_sparse_strongly_connected_components".into(),
         category: "fsci_sparse::strongly_connected_components vs scipy.sparse.csgraph.connected_components(strong)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -308,4 +320,5 @@ fn diff_sparse_strongly_connected_components() {
     }
 
     assert!(all_pass, "scc conformance failed: {} cases", diffs.len());
+    ledger.finish(query.points.len());
 }

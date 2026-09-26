@@ -5,14 +5,20 @@
 //!
 //! Resolves [frankenscipy-vgob4]. Compare re+im at 1e-7 abs / 1e-6
 //! rel for moderate magnitudes.
+//!
+//! References: SciPy's `beta`, `betaln` and `polygamma` reject complex arguments, so beta is
+//! compared against `gamma(a) gamma(b) / gamma(a+b)` and betaln against
+//! `loggamma(a) + loggamma(b) - loggamma(a+b)`, both over SciPy's complex gamma/loggamma, and
+//! complex polygamma has no pinned reference (frankenscipy-a2l7s). Only digamma is a direct call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::beta::{complex_beta_scalar, complex_betaln_scalar};
 use fsci_special::gamma::{complex_digamma_scalar, complex_polygamma_scalar};
 use fsci_special::types::Complex64;
@@ -22,6 +28,10 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-7;
 const REL_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op.
+/// polygamma is not an arm: SciPy has no complex polygamma to compare against, and mpmath is
+/// not in the CI oracle environment (frankenscipy-a2l7s). Its cases stay generated, uncompared.
+const ARMS: [&str; 3] = ["beta", "betaln", "digamma"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -63,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -165,10 +176,13 @@ for case in q["points"]:
     b = complex(float(case["b_re"]), float(case["b_im"]))
     n = int(case["n"])
     try:
+        # sp.beta, sp.betaln and sp.polygamma reject complex arguments (TypeError in 1.17.1), which
+        # blanked those columns until the compared-case ledger (olv0j.1). beta and betaln are
+        # compared against their defining identities over SciPy's complex gamma / loggamma.
         if op == "beta":
-            c = complex(sp.beta(a, b))
+            c = complex(sp.gamma(a) * sp.gamma(b) / sp.gamma(a + b))
         elif op == "betaln":
-            c = complex(sp.betaln(a, b))
+            c = complex(sp.loggamma(a) + sp.loggamma(b) - sp.loggamma(a + b))
         elif op == "digamma":
             c = complex(sp.digamma(a))
         elif op == "polygamma":
@@ -246,14 +260,15 @@ fn diff_special_complex_beta_gamma_scalars() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_complex_beta_gamma_scalars", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        if case.op == "polygamma" {
+            continue; // no pinned reference (frankenscipy-a2l7s)
+        }
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
         let a = Complex64::new(case.a_re, case.a_im);
         let b = Complex64::new(case.b_re, case.b_im);
         let c = match case.op.as_str() {
@@ -261,18 +276,23 @@ fn diff_special_complex_beta_gamma_scalars() {
             "betaln" => complex_betaln_scalar(a, b),
             "digamma" => complex_digamma_scalar(a),
             "polygamma" => complex_polygamma_scalar(case.n, a),
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
         };
-        if !c.is_finite() {
+        // [re, im]: the ledger records a non-finite part against SciPy's finite one.
+        let fsci = [c.re, c.im];
+        let Some((expected, got)) =
+            ledger.slices(&case.op, &case.case_id, scipy, Some(fsci.as_slice()))
+        else {
             continue;
-        }
-        let d_re = (c.re - expected[0]).abs();
-        let d_im = (c.im - expected[1]).abs();
+        };
+        let d_re = (got[0] - expected[0]).abs();
+        let d_im = (got[1] - expected[1]).abs();
         let abs_d = d_re.max(d_im);
         // pass if abs or rel tolerance satisfied
         let mag = (expected[0].powi(2) + expected[1].powi(2)).sqrt();
         let pass = abs_d <= ABS_TOL || (mag > 1.0 && abs_d / mag <= REL_TOL);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -289,6 +309,7 @@ fn diff_special_complex_beta_gamma_scalars() {
             "fsci_special complex scalars (beta, betaln, digamma, polygamma) vs scipy.special"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -309,4 +330,11 @@ fn diff_special_complex_beta_gamma_scalars() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

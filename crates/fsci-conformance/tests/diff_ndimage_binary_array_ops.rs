@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-pxnf2]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     NdArray, add_arrays, masked_fill, masked_select, multiply_arrays, subtract_arrays,
 };
@@ -20,6 +21,13 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 5] = [
+    "add",
+    "subtract",
+    "multiply",
+    "masked_fill",
+    "masked_select",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -61,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -246,6 +255,34 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse binary_array oracle JSON"))
 }
 
+/// fsci's output for one case, `None` when an fsci call refused it.
+fn fsci_output(case: &PointCase) -> Option<Vec<f64>> {
+    let a_arr = NdArray::new(case.a.clone(), case.shape.clone()).ok()?;
+    let fsci_v: Vec<f64> = match case.op.as_str() {
+        "add" | "subtract" | "multiply" => {
+            let b_arr = NdArray::new(case.b.clone(), case.shape.clone()).ok()?;
+            let result = match case.op.as_str() {
+                "add" => add_arrays(&a_arr, &b_arr),
+                "subtract" => subtract_arrays(&a_arr, &b_arr),
+                "multiply" => multiply_arrays(&a_arr, &b_arr),
+                other => unreachable!("arithmetic op `{other}`"),
+            };
+            result.ok()?.data
+        }
+        "masked_fill" => {
+            let mask_arr = NdArray::new(case.mask.clone(), case.shape.clone()).ok()?;
+            let out = masked_fill(&a_arr, &mask_arr, case.fill_value);
+            out.data
+        }
+        "masked_select" => {
+            let mask_arr = NdArray::new(case.mask.clone(), case.shape.clone()).ok()?;
+            masked_select(&a_arr, &mask_arr)
+        }
+        other => panic!("unknown binary_array op `{other}`"),
+    };
+    Some(fsci_v)
+}
+
 #[test]
 fn diff_ndimage_binary_array_ops() {
     let query = generate_query();
@@ -263,56 +300,26 @@ fn diff_ndimage_binary_array_ops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_binary_array_ops", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v = fsci_output(case);
+        let Some((expected, fsci_v)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Ok(a_arr) = NdArray::new(case.a.clone(), case.shape.clone()) else {
-            continue;
-        };
-        let fsci_v: Vec<f64> = match case.op.as_str() {
-            "add" | "subtract" | "multiply" => {
-                let Ok(b_arr) = NdArray::new(case.b.clone(), case.shape.clone()) else {
-                    continue;
-                };
-                let result = match case.op.as_str() {
-                    "add" => add_arrays(&a_arr, &b_arr),
-                    "subtract" => subtract_arrays(&a_arr, &b_arr),
-                    "multiply" => multiply_arrays(&a_arr, &b_arr),
-                    _ => continue,
-                };
-                let Ok(out) = result else {
-                    continue;
-                };
-                out.data
-            }
-            "masked_fill" => {
-                let Ok(mask_arr) = NdArray::new(case.mask.clone(), case.shape.clone()) else {
-                    continue;
-                };
-                let out = masked_fill(&a_arr, &mask_arr, case.fill_value);
-                out.data
-            }
-            "masked_select" => {
-                let Ok(mask_arr) = NdArray::new(case.mask.clone(), case.shape.clone()) else {
-                    continue;
-                };
-                masked_select(&a_arr, &mask_arr)
-            }
-            _ => continue,
-        };
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -327,6 +334,7 @@ fn diff_ndimage_binary_array_ops() {
         test_id: "diff_ndimage_binary_array_ops".into(),
         category: "fsci_ndimage add/sub/mul + masked_fill/select vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +355,11 @@ fn diff_ndimage_binary_array_ops() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (masked_select has one); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

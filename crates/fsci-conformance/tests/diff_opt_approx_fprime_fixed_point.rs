@@ -13,13 +13,14 @@
 //!   tolerance so they converge to (near-)identical fixed points.
 //!   Compare at 1e-8 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{approx_fprime, fixed_point};
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,7 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const GRAD_ABS_TOL: f64 = 1.0e-7;
 const FP_ABS_TOL: f64 = 1.0e-8;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["grad", "fp"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -75,6 +77,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -311,23 +314,26 @@ fn diff_opt_approx_fprime_fixed_point() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_approx_fprime_fixed_point", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        // A missing oracle row is recorded as SciPy giving no value, not skipped.
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|scipy_arm| scipy_arm.values.as_deref());
         match case.op.as_str() {
             "grad" => {
                 let fname = case.func.clone();
                 let f = move |x: &[f64]| eval_multi(&fname, x);
-                let Ok(g) = approx_fprime(&case.xk, &f, case.eps) else {
+                let g = approx_fprime(&case.xk, &f, case.eps).ok();
+                let Some((expected, g)) =
+                    ledger.slices("grad", &case.case_id, expected, g.as_deref())
+                else {
                     continue;
                 };
-                let abs_d = vec_max_diff(&g, expected);
+                let abs_d = vec_max_diff(g, expected);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("grad", &case.case_id, abs_d <= GRAD_ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -338,11 +344,14 @@ fn diff_opt_approx_fprime_fixed_point() {
             "fp" => {
                 let fname = case.fp_func.clone();
                 let f = move |x: f64| eval_fp(&fname, x);
-                let Ok(x) = fixed_point(&f, case.x0, 1.0e-12, 200) else {
+                let x = fixed_point(&f, case.x0, 1.0e-12, 200).ok();
+                let scipy_x = expected.and_then(|v| v.first().copied());
+                let Some((scipy_x, x)) = ledger.pair("fp", &case.case_id, scipy_x, x) else {
                     continue;
                 };
-                let abs_d = (x - expected[0]).abs();
+                let abs_d = (x - scipy_x).abs();
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("fp", &case.case_id, abs_d <= FP_ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -350,7 +359,7 @@ fn diff_opt_approx_fprime_fixed_point() {
                     pass: abs_d <= FP_ABS_TOL,
                 });
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         }
     }
 
@@ -360,6 +369,7 @@ fn diff_opt_approx_fprime_fixed_point() {
         test_id: "diff_opt_approx_fprime_fixed_point".into(),
         category: "fsci_opt::{approx_fprime, fixed_point} vs scipy.optimize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -380,4 +390,11 @@ fn diff_opt_approx_fprime_fixed_point() {
         diffs.len(),
         max_overall
     );
+    // grad and fp have different case sets (fp has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

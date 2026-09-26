@@ -5,13 +5,14 @@
 //! several (a, d) with d ∈ {1, 2, 3, 4, 5} and a > (d-1)/2.
 //! Tolerance: 1e-10 rel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::multigammaln;
 use fsci_special::types::SpecialTensor;
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -199,15 +201,17 @@ fn diff_special_multigammaln() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_multigammaln", &["multigammaln"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Some(actual) = fsci_eval(case.a, case.d) else {
+        // A case missing from the oracle output is recorded as SciPy giving no value.
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
+        let Some((expected, actual)) = ledger.pair(
+            "multigammaln",
+            &case.case_id,
+            scipy,
+            fsci_eval(case.a, case.d),
+        ) else {
             continue;
         };
         let abs_d = (actual - expected).abs();
@@ -217,6 +221,7 @@ fn diff_special_multigammaln() {
             abs_d
         };
         max_rel = max_rel.max(rel_d);
+        ledger.compared("multigammaln", &case.case_id, rel_d <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -231,6 +236,7 @@ fn diff_special_multigammaln() {
         test_id: "diff_special_multigammaln".into(),
         category: "fsci_special::multigammaln vs scipy.special.multigammaln".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -254,4 +260,5 @@ fn diff_special_multigammaln() {
         diffs.len(),
         max_rel
     );
+    ledger.finish(query.points.len());
 }

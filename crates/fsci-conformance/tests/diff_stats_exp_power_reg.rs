@@ -16,13 +16,14 @@
 //! via subprocess. Tol 1e-9 abs (linregress precision +
 //! exp(intercept) accumulator drift).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{exponential_regression, power_regression};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -272,37 +274,39 @@ fn diff_stats_exp_power_reg() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_exp_power_reg",
+        &[
+            "exponential_regression.a",
+            "exponential_regression.b",
+            "power_regression.a",
+            "power_regression.b",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_a, rust_b) = match case.func.as_str() {
             "exponential_regression" => exponential_regression(&case.x, &case.y),
             "power_regression" => power_regression(&case.x, &case.y),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        if let Some(scipy_a) = scipy_arm.a
-            && rust_a.is_finite()
-        {
-            let abs_diff = (rust_a - scipy_a).abs();
+        let arms = [("a", scipy_arm.a, rust_a), ("b", scipy_arm.b, rust_b)];
+        for (arm, scipy_v, rust_v) in arms {
+            let ledger_arm = format!("{}.{arm}", case.func);
+            let Some((scipy_v, rust_v)) =
+                ledger.pair(&ledger_arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(&ledger_arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 func: case.func.clone(),
-                arm: "a".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_b) = scipy_arm.b
-            && rust_b.is_finite()
-        {
-            let abs_diff = (rust_b - scipy_b).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                arm: "b".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -315,6 +319,7 @@ fn diff_stats_exp_power_reg() {
         test_id: "diff_stats_exp_power_reg".into(),
         category: "exponential_regression + power_regression".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -339,4 +344,7 @@ fn diff_stats_exp_power_reg() {
         diffs.len(),
         max_overall
     );
+    // Each func's two arms compare one case per fixture of that func.
+    let per_func = |func: &str| query.points.iter().filter(|c| c.func == func).count();
+    ledger.finish(per_func("exponential_regression").min(per_func("power_regression")));
 }

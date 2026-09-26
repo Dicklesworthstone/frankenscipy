@@ -6,13 +6,14 @@
 //!   - smirnovi: 5e-3 abs (companion to smirnov's known ~3e-2
 //!     asymptotic floor; smirnov defect tracked separately).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{kolmogi, smirnovi};
@@ -22,6 +23,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const KOLMOGI_TOL: f64 = 1.0e-9;
 const SMIRNOVI_TOL: f64 = 5.0e-3;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op compared.
+const ARMS: [&str; 2] = ["kolmogi", "smirnovi"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -60,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -206,27 +210,28 @@ fn diff_special_kolmogi_smirnovi() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_kolmogi_smirnovi", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let (actual, tol) = match case.op.as_str() {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.value);
+        let (fsci, tol) = match case.op.as_str() {
             "kolmogi" => {
                 let pt = SpecialTensor::RealScalar(case.p);
-                let Ok(SpecialTensor::RealScalar(v)) = kolmogi(&pt, RuntimeMode::Strict) else {
-                    continue;
+                let v = match kolmogi(&pt, RuntimeMode::Strict) {
+                    Ok(SpecialTensor::RealScalar(v)) => Some(v),
+                    _ => None,
                 };
                 (v, KOLMOGI_TOL)
             }
-            "smirnovi" => (smirnovi(case.n, case.p), SMIRNOVI_TOL),
-            _ => continue,
+            "smirnovi" => (Some(smirnovi(case.n, case.p)), SMIRNOVI_TOL),
+            other => panic!("unknown op {other}"),
+        };
+        let Some((expected, actual)) = ledger.pair(&case.op, &case.case_id, scipy, fsci) else {
+            continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -241,6 +246,7 @@ fn diff_special_kolmogi_smirnovi() {
         test_id: "diff_special_kolmogi_smirnovi".into(),
         category: "fsci_special::kolmogi + smirnovi vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -261,4 +267,11 @@ fn diff_special_kolmogi_smirnovi() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (kolmogi has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

@@ -37,12 +37,64 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::Serialize;
+use serde::de::{self, Deserializer};
 
 /// Set to `1` in CI: a case SciPy produced no value for is then a failure, not a skip.
 pub const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 /// How many problem lines a failing [`CompareLedger::finish`] prints.
 const PROBLEMS_SHOWN: usize = 20;
+
+/// Deserializes an oracle scalar that is `null` (SciPy raised or gave nothing), a number, or a
+/// non-finite value sent as the string `"nan"`, `"inf"` or `"-inf"` (JSON has no NaN). With
+/// `#[serde(default, deserialize_with = "fsci_conformance::compare_ledger::oracle_f64")]` on an
+/// `Option<f64>` field, a documented NaN answer (e.g. `nan_policy='propagate'`) reaches
+/// [`CompareLedger::pair`] as NaN, a matching refusal, instead of looking like a missing oracle.
+/// The Python side:
+/// `def fval(v): v = float(v); return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))`
+///
+/// # Errors
+/// A value that is neither null, a number, nor one of the sentinels.
+pub fn oracle_f64<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
+    struct V;
+    impl<'de> de::Visitor<'de> for V {
+        type Value = Option<f64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, a number, or \"nan\" / \"inf\" / \"-inf\"")
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(self, de: D2) -> Result<Self::Value, D2::Error> {
+            de.deserialize_any(V)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        #[allow(clippy::cast_precision_loss)] // oracle integers are small counts and ranks
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+        #[allow(clippy::cast_precision_loss)] // oracle integers are small counts and ranks
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            match v {
+                "nan" => Ok(Some(f64::NAN)),
+                "inf" => Ok(Some(f64::INFINITY)),
+                "-inf" => Ok(Some(f64::NEG_INFINITY)),
+                other => Err(E::custom(format!(
+                    "expected an oracle number, got {other:?}"
+                ))),
+            }
+        }
+    }
+    de.deserialize_option(V)
+}
 
 /// Per-arm outcome counts, written into each diff log so the compared coverage is readable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -583,6 +635,35 @@ mod tests {
             ArmCounts {
                 oracle_missing: 1,
                 rust_failed: 1,
+                ..ArmCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn oracle_f64_tells_a_nan_answer_from_a_missing_one() {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default, deserialize_with = "super::oracle_f64")]
+            v: Option<f64>,
+        }
+        let parse = |s: &str| serde_json::from_str::<Row>(s).map(|r| r.v);
+        assert_eq!(parse(r#"{"v": null}"#).unwrap(), None);
+        assert_eq!(parse("{}").unwrap(), None);
+        assert_eq!(parse(r#"{"v": 1.5}"#).unwrap(), Some(1.5));
+        assert_eq!(parse(r#"{"v": 3}"#).unwrap(), Some(3.0));
+        assert!(parse(r#"{"v": "nan"}"#).unwrap().is_some_and(f64::is_nan));
+        assert_eq!(parse(r#"{"v": "-inf"}"#).unwrap(), Some(f64::NEG_INFINITY));
+        assert!(parse(r#"{"v": "NaN?"}"#).is_err());
+        // must-hit: a NaN answer is a matching refusal, not a missing oracle
+        let mut ledger = CompareLedger::new("t", &["x"]);
+        ledger.pair("x", "a", parse(r#"{"v": "nan"}"#).unwrap(), None);
+        ledger.pair("x", "b", parse(r#"{"v": null}"#).unwrap(), None);
+        assert_eq!(
+            counts(&ledger, "x"),
+            ArmCounts {
+                compared_cases: 1,
+                oracle_missing: 1,
                 ..ArmCounts::default()
             }
         );

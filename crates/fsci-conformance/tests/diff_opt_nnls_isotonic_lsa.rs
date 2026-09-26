@@ -14,13 +14,14 @@
 //!   be non-unique under ties, so compare the TOTAL COST (which
 //!   IS unique for any optimal assignment) at 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{isotonic_regression, linear_sum_assignment, nnls};
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,7 @@ const NNLS_RES_TOL: f64 = 1.0e-10;
 const ISO_TOL: f64 = 1.0e-12;
 const LSA_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 3] = ["nnls", "iso", "lsa"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -77,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -346,57 +349,65 @@ fn diff_opt_nnls_isotonic_lsa() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_nnls_isotonic_lsa", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        // A missing oracle row is recorded as SciPy giving no value, not skipped.
+        let arm = pmap.get(&case.case_id);
+        let scipy_values = arm.and_then(|arm| arm.values.as_deref());
         match case.op.as_str() {
             "nnls" => {
-                let Some(expected_x) = arm.values.as_ref() else {
+                // SciPy's nnls row counts only when it carries both x and the residual.
+                let scipy_x =
+                    scipy_values.filter(|_| arm.is_some_and(|arm| arm.residual.is_some()));
+                let fsci = nnls(&case.a, &case.b).ok();
+                let Some((expected_x, x)) = ledger.slices(
+                    "nnls",
+                    &case.case_id,
+                    scipy_x,
+                    fsci.as_ref().map(|(x, _)| x.as_slice()),
+                ) else {
                     continue;
                 };
-                let Some(_scipy_residual) = arm.residual else {
-                    continue;
-                };
-                let Ok((x, residual)) = nnls(&case.a, &case.b) else {
-                    continue;
-                };
-                let abs_d_x = vec_max_diff(&x, expected_x);
+                let abs_d_x = vec_max_diff(x, expected_x);
                 // fsci residual is the residual norm directly
                 let fsci_res = {
-                    let pred = matvec(&case.a, &x);
+                    let pred = matvec(&case.a, x);
                     pred.iter()
                         .zip(case.b.iter())
                         .map(|(p, b)| (p - b).powi(2))
                         .sum::<f64>()
                         .sqrt()
                 };
-                let _ = residual;
                 let pass = abs_d_x <= NNLS_X_TOL && fsci_res <= 1e6;
                 // additionally require x ≥ 0 and residual finite
                 let abs_d = abs_d_x;
                 max_overall = max_overall.max(abs_d);
                 let _ = NNLS_RES_TOL;
+                let pass = pass && x.iter().all(|v| *v >= -1e-10);
+                ledger.compared("nnls", &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     abs_diff: abs_d,
-                    pass: pass && x.iter().all(|v| *v >= -1e-10),
+                    pass,
                 });
             }
             "iso" => {
-                let Some(expected) = arm.values.as_ref() else {
-                    continue;
-                };
                 let w = if case.weights.is_empty() {
                     None
                 } else {
                     Some(case.weights.as_slice())
                 };
                 let r = isotonic_regression(&case.y, w);
-                let abs_d = vec_max_diff(&r, expected);
+                let Some((expected, r)) =
+                    ledger.slices("iso", &case.case_id, scipy_values, Some(r.as_slice()))
+                else {
+                    continue;
+                };
+                let abs_d = vec_max_diff(r, expected);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("iso", &case.case_id, abs_d <= ISO_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -405,19 +416,21 @@ fn diff_opt_nnls_isotonic_lsa() {
                 });
             }
             "lsa" => {
-                let Some(expected) = arm.values.as_ref() else {
+                let scipy_total = scipy_values.and_then(|v| v.first().copied());
+                let fsci_total = linear_sum_assignment(&case.cost).ok().map(|(rows, cols)| {
+                    rows.iter()
+                        .zip(cols.iter())
+                        .map(|(&r, &c)| case.cost[r][c])
+                        .sum::<f64>()
+                });
+                let Some((expected, total)) =
+                    ledger.pair("lsa", &case.case_id, scipy_total, fsci_total)
+                else {
                     continue;
                 };
-                let Ok((rows, cols)) = linear_sum_assignment(&case.cost) else {
-                    continue;
-                };
-                let total: f64 = rows
-                    .iter()
-                    .zip(cols.iter())
-                    .map(|(&r, &c)| case.cost[r][c])
-                    .sum();
-                let abs_d = (total - expected[0]).abs();
+                let abs_d = (total - expected).abs();
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("lsa", &case.case_id, abs_d <= LSA_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -425,7 +438,7 @@ fn diff_opt_nnls_isotonic_lsa() {
                     pass: abs_d <= LSA_TOL,
                 });
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         }
     }
 
@@ -436,6 +449,7 @@ fn diff_opt_nnls_isotonic_lsa() {
         category: "fsci_opt::{nnls, isotonic_regression, linear_sum_assignment} vs scipy.optimize"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -456,4 +470,11 @@ fn diff_opt_nnls_isotonic_lsa() {
         diffs.len(),
         max_overall
     );
+    // nnls, iso and lsa have different case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

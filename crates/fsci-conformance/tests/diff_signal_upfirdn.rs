@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-ziwx4]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::upfirdn;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -217,25 +219,26 @@ fn diff_signal_upfirdn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_upfirdn", &["upfirdn"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v = upfirdn(&case.h, &case.x, case.up, case.down).ok();
+        let Some((expected, fsci_v)) = ledger.slices(
+            "upfirdn",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Ok(fsci_v) = upfirdn(&case.h, &case.x, case.up, case.down) else {
-            continue;
-        };
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("upfirdn", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -249,6 +252,7 @@ fn diff_signal_upfirdn() {
         test_id: "diff_signal_upfirdn".into(),
         category: "scipy.signal.upfirdn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -269,4 +273,5 @@ fn diff_signal_upfirdn() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

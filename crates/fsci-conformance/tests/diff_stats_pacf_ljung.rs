@@ -15,13 +15,14 @@
 //! Levinson recursion accumulates ~1e-12 drift; chi² cdf
 //! chain another ~1e-12).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ljung_box, pacf};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -274,52 +276,50 @@ fn diff_stats_pacf_ljung() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger =
+        CompareLedger::new("diff_stats_pacf_ljung", &["pacf_max", "ljung_q", "ljung_p"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
         // pacf vector
-        if let Some(scipy_pacf) = &scipy_arm.pacf_vec {
-            let rust_pacf = pacf(&case.data, case.max_lag as usize);
-            if rust_pacf.len() == scipy_pacf.len() {
-                let mut max_local = 0.0_f64;
-                for (a, b) in rust_pacf.iter().zip(scipy_pacf.iter()) {
-                    if a.is_finite() {
-                        max_local = max_local.max((a - b).abs());
-                    }
-                }
-                max_overall = max_overall.max(max_local);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: "pacf_max".into(),
-                    abs_diff: max_local,
-                    pass: max_local <= ABS_TOL,
-                });
+        let rust_pacf = pacf(&case.data, case.max_lag as usize);
+        if let Some((scipy_pacf, rust_pacf)) = ledger.slices(
+            "pacf_max",
+            &case.case_id,
+            scipy_arm.pacf_vec.as_deref(),
+            Some(rust_pacf.as_slice()),
+        ) {
+            let mut max_local = 0.0_f64;
+            for (a, b) in rust_pacf.iter().zip(scipy_pacf.iter()) {
+                max_local = max_local.max((a - b).abs());
             }
+            max_overall = max_overall.max(max_local);
+            ledger.compared("pacf_max", &case.case_id, max_local <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: "pacf_max".into(),
+                abs_diff: max_local,
+                pass: max_local <= ABS_TOL,
+            });
         }
 
         // ljung_box
         let (rust_q, rust_p) = ljung_box(&case.data, case.max_lag as usize);
-        if let Some(scipy_q) = scipy_arm.ljung_q
-            && rust_q.is_finite()
-        {
-            let abs_diff = (rust_q - scipy_q).abs();
+        let arms = [
+            ("ljung_q", scipy_arm.ljung_q, rust_q),
+            ("ljung_p", scipy_arm.ljung_p, rust_p),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "ljung_q".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.ljung_p
-            && rust_p.is_finite()
-        {
-            let abs_diff = (rust_p - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "ljung_p".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -332,6 +332,7 @@ fn diff_stats_pacf_ljung() {
         test_id: "diff_stats_pacf_ljung".into(),
         category: "pacf + ljung_box (numpy/scipy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -356,4 +357,5 @@ fn diff_stats_pacf_ljung() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

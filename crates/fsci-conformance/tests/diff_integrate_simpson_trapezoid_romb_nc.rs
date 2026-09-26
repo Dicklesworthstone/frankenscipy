@@ -6,19 +6,22 @@
 //! weights normalized to interval [0,1] (sum=1); scipy returns weights
 //! for [0,n] (sum=n). The harness scales fsci's by n for comparison.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{newton_cotes, romb, simpson, trapezoid};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Ledger arms for the sampled-data cases (the case `op`); `newton_cotes` is the fourth arm.
+const SAMPLED_ARMS: [&str; 3] = ["trapezoid", "simpson", "romb"];
 
 #[derive(Debug, Clone, Serialize)]
 struct SampledCase {
@@ -73,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -276,29 +280,27 @@ fn diff_integrate_simpson_trapezoid_romb_nc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_simpson_trapezoid_romb_nc",
+        &["trapezoid", "simpson", "romb", "newton_cotes"],
+    );
 
     for case in &query.sampled {
         let scipy_arm = sampled_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
+        let arm = case.op.as_str();
+        let fsci_v: Option<f64> = match arm {
+            "trapezoid" => trapezoid(&case.y, &case.x).ok().map(|r| r.integral),
+            "simpson" => simpson(&case.y, &case.x).ok().map(|r| r.integral),
+            "romb" => romb(&case.y, case.dx).ok(),
+            _ => None,
         };
-        let fsci_v: f64 = match case.op.as_str() {
-            "trapezoid" => match trapezoid(&case.y, &case.x) {
-                Ok(r) => r.integral,
-                Err(_) => continue,
-            },
-            "simpson" => match simpson(&case.y, &case.x) {
-                Ok(r) => r.integral,
-                Err(_) => continue,
-            },
-            "romb" => match romb(&case.y, case.dx) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            _ => continue,
+        let Some((expected, fsci_v)) = ledger.pair(arm, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -311,24 +313,25 @@ fn diff_integrate_simpson_trapezoid_romb_nc() {
     // returns weights summing to n on [0, n]. Scale fsci by n.
     for case in &query.nc {
         let scipy_arm = nc_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.weights.as_ref() else {
-            continue;
-        };
-        let Ok(fsci_raw) = newton_cotes(case.n) else {
-            continue;
-        };
         let scale = case.n as f64;
-        let fsci_v: Vec<f64> = fsci_raw.iter().map(|w| w * scale).collect();
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let fsci_v: Option<Vec<f64>> = newton_cotes(case.n)
+            .ok()
+            .map(|fsci_raw| fsci_raw.iter().map(|w| w * scale).collect());
+        let Some((expected, fsci_v)) = ledger.slices(
+            "newton_cotes",
+            &case.case_id,
+            scipy_arm.weights.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
+            continue;
         };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("newton_cotes", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "newton_cotes".into(),
@@ -343,6 +346,7 @@ fn diff_integrate_simpson_trapezoid_romb_nc() {
         test_id: "diff_integrate_simpson_trapezoid_romb_nc".into(),
         category: "scipy.integrate sampled-data quadrature".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -363,4 +367,13 @@ fn diff_integrate_simpson_trapezoid_romb_nc() {
         diffs.len(),
         max_overall
     );
+    // Each sampled arm has its own case set and `newton_cotes` has `query.nc`; each arm must
+    // compare all of its own.
+    let min_per_arm = SAMPLED_ARMS
+        .iter()
+        .map(|arm| query.sampled.iter().filter(|c| c.op == *arm).count())
+        .chain([query.nc.len()])
+        .min()
+        .expect("arms are non-empty");
+    ledger.finish(min_per_arm);
 }

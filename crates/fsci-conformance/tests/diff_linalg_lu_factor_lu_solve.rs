@@ -8,12 +8,14 @@
 //! within a tight bound (LU is a direct solver, so residuals should
 //! be at the machine-precision level for well-conditioned matrices).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, lu_factor, lu_solve};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -269,58 +272,20 @@ fn diff_linalg_lu_factor_lu_solve() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_lu_factor_lu_solve", &["lu_solve"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.x.as_ref() else {
-            continue;
-        };
-
         let opts = DecompOptions::default();
-        let factored = match lu_factor(&case.a, opts) {
-            Ok(f) => f,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    max_rel_diff: f64::INFINITY,
-                    residual_inf: f64::INFINITY,
-                    pass: false,
-                    note: format!("lu_factor error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        let sol = match lu_solve(&factored, &case.b) {
-            Ok(s) => s.x,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    max_rel_diff: f64::INFINITY,
-                    residual_inf: f64::INFINITY,
-                    pass: false,
-                    note: format!("lu_solve error: {e:?}"),
-                });
-                continue;
-            }
-        };
-
-        if sol.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                max_abs_diff: f64::INFINITY,
-                max_rel_diff: f64::INFINITY,
-                residual_inf: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} scipy={}",
-                    sol.len(),
-                    expected.len()
-                ),
-            });
+        let sol = lu_factor(&case.a, opts)
+            .ok()
+            .and_then(|factored| lu_solve(&factored, &case.b).ok())
+            .map(|s| s.x);
+        let Some((expected, sol)) =
+            ledger.slices("lu_solve", &case.case_id, o.x.as_deref(), sol.as_deref())
+        else {
             continue;
-        }
+        };
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
@@ -331,7 +296,7 @@ fn diff_linalg_lu_factor_lu_solve() {
             max_rel = max_rel.max(abs_d / denom);
         }
         // Residual: A x - b
-        let ax = matvec(&case.a, &sol);
+        let ax = matvec(&case.a, sol);
         let mut residual_inf = 0.0_f64;
         for (ax_i, b_i) in ax.iter().zip(case.b.iter()) {
             residual_inf = residual_inf.max((ax_i - b_i).abs());
@@ -347,6 +312,7 @@ fn diff_linalg_lu_factor_lu_solve() {
         };
         let small_residual = residual_inf <= res_tol;
         let pass = close_to_scipy && small_residual;
+        ledger.compared("lu_solve", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             max_abs_diff: max_abs,
@@ -362,6 +328,7 @@ fn diff_linalg_lu_factor_lu_solve() {
         test_id: "diff_linalg_lu_factor_lu_solve".into(),
         category: "fsci_linalg::{lu_factor, lu_solve} vs scipy.linalg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -383,4 +350,5 @@ fn diff_linalg_lu_factor_lu_solve() {
         "lu_factor/lu_solve parity failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

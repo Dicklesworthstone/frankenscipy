@@ -8,13 +8,14 @@
 //!
 //! Tolerance: 1e-5 abs on solution x (residual floor ~1e-10 internal).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, FormatConvertible, IluOptions, IterativeSolveOptions, Shape2D, pcg, spilu,
 };
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -210,6 +212,30 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse pcg oracle JSON"))
 }
 
+/// fsci's converged ILU(0)-preconditioned CG solution, or `None` when any step fails or the
+/// solve does not converge.
+fn fsci_pcg(case: &Case) -> Option<Vec<f64>> {
+    let mut d = Vec::new();
+    let mut r = Vec::new();
+    let mut c = Vec::new();
+    for &(ri, ci, vi) in &case.triplets {
+        d.push(vi);
+        r.push(ri);
+        c.push(ci);
+    }
+    let coo = CooMatrix::from_triplets(Shape2D::new(case.n, case.n), d, r, c, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    let csc = csr.to_csc().ok()?;
+    let ilu = spilu(&csc, IluOptions::default()).ok()?;
+    let opts = IterativeSolveOptions {
+        tol: 1.0e-12,
+        max_iter: Some(2000),
+        ..Default::default()
+    };
+    let result = pcg(&csr, &case.b, &ilu, None, opts).ok()?;
+    result.converged.then_some(result.solution)
+}
+
 #[test]
 fn diff_sparse_pcg() {
     let query = generate_query();
@@ -226,56 +252,23 @@ fn diff_sparse_pcg() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_pcg", &["pcg"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy_x = pmap.get(&case.case_id).and_then(|arm| arm.x.as_deref());
+        let fsci_x = fsci_pcg(case);
+        let Some((expected, solution)) =
+            ledger.slices("pcg", &case.case_id, scipy_x, fsci_x.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.x.as_ref() else {
-            continue;
-        };
-        let mut d = Vec::new();
-        let mut r = Vec::new();
-        let mut c = Vec::new();
-        for &(ri, ci, vi) in &case.triplets {
-            d.push(vi);
-            r.push(ri);
-            c.push(ci);
-        }
-        let Ok(coo) = CooMatrix::from_triplets(Shape2D::new(case.n, case.n), d, r, c, true) else {
-            continue;
-        };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let Ok(csc) = csr.to_csc() else {
-            continue;
-        };
-        let Ok(ilu) = spilu(&csc, IluOptions::default()) else {
-            continue;
-        };
-        let opts = IterativeSolveOptions {
-            tol: 1.0e-12,
-            max_iter: Some(2000),
-            ..Default::default()
-        };
-        let Ok(result) = pcg(&csr, &case.b, &ilu, None, opts) else {
-            continue;
-        };
-        if !result.converged {
-            continue;
-        }
-        let abs_d = if result.solution.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            result
-                .solution
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = solution
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("pcg", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -289,6 +282,7 @@ fn diff_sparse_pcg() {
         test_id: "diff_sparse_pcg".into(),
         category: "fsci_sparse::pcg (ILU preconditioner) vs scipy.sparse.linalg.cg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -309,4 +303,5 @@ fn diff_sparse_pcg() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

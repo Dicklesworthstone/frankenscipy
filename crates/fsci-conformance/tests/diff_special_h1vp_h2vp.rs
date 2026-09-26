@@ -5,13 +5,14 @@
 //! derivatives of the Hankel functions. Real v, real positive z;
 //! derivative orders 1-3. Compare re+im at 1e-6 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{h1vp, h2vp};
@@ -20,6 +21,8 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op compared.
+const ARMS: [&str; 2] = ["h1vp", "h2vp"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -59,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -220,24 +224,28 @@ fn diff_special_h1vp_h2vp() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_h1vp_h2vp", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let Some((re, im)) = fsci_h_deriv(&case.op, case.v, case.z, case.n) else {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.values.as_deref());
+        let Some((expected, (re, im))) = ledger.both(
+            &case.op,
+            &case.case_id,
+            scipy,
+            fsci_h_deriv(&case.op, case.v, case.z, case.n),
+        ) else {
             continue;
         };
         let abs_d = (re - expected[0]).abs().max((im - expected[1]).abs());
         max_overall = max_overall.max(abs_d);
+        // f64::max drops a NaN operand, so a NaN component must fail on its own.
+        let pass = !re.is_nan() && !im.is_nan() && abs_d <= ABS_TOL;
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -247,6 +255,7 @@ fn diff_special_h1vp_h2vp() {
         test_id: "diff_special_h1vp_h2vp".into(),
         category: "fsci_special::{h1vp, h2vp} vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -267,4 +276,10 @@ fn diff_special_h1vp_h2vp() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

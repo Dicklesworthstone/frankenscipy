@@ -11,13 +11,14 @@
 //! ~1e-8 residual floor both sides converge to (relative drift may
 //! accumulate component-wise for ill-conditioned cases).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, FormatConvertible, IterativeSolveOptions, LgmresOptions, Shape2D, bicg, cgs, lgmres,
     qmr,
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -294,27 +296,24 @@ fn diff_sparse_iterative_bicg_cgs_qmr_lgmres() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let solvers = ["bicg", "cgs", "qmr", "lgmres"];
+    let mut ledger = CompareLedger::new("diff_sparse_iterative_bicg_cgs_qmr_lgmres", &solvers);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy_x = pmap.get(&case.case_id).and_then(|arm| arm.x.as_deref());
+        let fsci_x = fsci_solve(case);
+        let Some((expected, actual)) =
+            ledger.slices(&case.solver, &case.case_id, scipy_x, fsci_x.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.x.as_ref() else {
-            continue;
-        };
-        let Some(actual) = fsci_solve(case) else {
-            continue;
-        };
-        let abs_d = if actual.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.solver, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             solver: case.solver.clone(),
@@ -329,6 +328,7 @@ fn diff_sparse_iterative_bicg_cgs_qmr_lgmres() {
         test_id: "diff_sparse_iterative_bicg_cgs_qmr_lgmres".into(),
         category: "scipy.sparse.linalg bicg/cgs/qmr/lgmres".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -352,4 +352,10 @@ fn diff_sparse_iterative_bicg_cgs_qmr_lgmres() {
         diffs.len(),
         max_overall
     );
+    let per_solver = solvers
+        .iter()
+        .map(|s| query.points.iter().filter(|c| c.solver == *s).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_solver);
 }

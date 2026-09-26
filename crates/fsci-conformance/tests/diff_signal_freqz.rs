@@ -6,13 +6,14 @@
 //! h_phase). Compare w + h_mag at 1e-10 abs; phase compared via
 //! complex h reconstruction to sidestep ±π wrap.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::freqz;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_h_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -213,46 +215,51 @@ fn diff_signal_freqz() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_h: f64 = 0.0;
+    let mut ledger = CompareLedger::new("diff_signal_freqz", &["freqz"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let Ok(fsci_v) = freqz(&case.b, &case.a, Some(case.n)) else {
+        // SciPy's packed values are all finite by construction; a non-finite fsci element would
+        // vanish in the max folds below, so it counts as an fsci failure.
+        let fsci_res = freqz(&case.b, &case.a, Some(case.n)).ok().filter(|r| {
+            r.w.iter()
+                .chain(&r.h_mag)
+                .chain(&r.h_phase)
+                .all(|v| v.is_finite())
+        });
+        let Some((scipy_v, fsci_v)) =
+            ledger.both("freqz", &case.case_id, scipy_arm.values.as_ref(), fsci_res)
+        else {
             continue;
         };
         let n = case.n;
         // scipy_v: first n entries are w; remaining 2n are (re, im) pairs
-        if scipy_v.len() != n + 2 * n || fsci_v.w.len() != n {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                w_diff: f64::INFINITY,
-                h_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        let w_diff = fsci_v
-            .w
-            .iter()
-            .zip(scipy_v[..n].iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        // Reconstruct complex h from fsci_v: h = h_mag * (cos(phase) + i sin(phase))
-        let mut h_diff: f64 = 0.0;
-        for k in 0..n {
-            let re_f = fsci_v.h_mag[k] * fsci_v.h_phase[k].cos();
-            let im_f = fsci_v.h_mag[k] * fsci_v.h_phase[k].sin();
-            let re_s = scipy_v[n + 2 * k];
-            let im_s = scipy_v[n + 2 * k + 1];
-            let d = ((re_f - re_s).powi(2) + (im_f - im_s).powi(2)).sqrt();
-            if d > h_diff {
-                h_diff = d;
+        let (w_diff, h_diff) = if scipy_v.len() != n + 2 * n || fsci_v.w.len() != n {
+            (f64::INFINITY, f64::INFINITY)
+        } else {
+            let w_diff = fsci_v
+                .w
+                .iter()
+                .zip(scipy_v[..n].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            // Reconstruct complex h from fsci_v: h = h_mag * (cos(phase) + i sin(phase))
+            let mut h_diff: f64 = 0.0;
+            for k in 0..n {
+                let re_f = fsci_v.h_mag[k] * fsci_v.h_phase[k].cos();
+                let im_f = fsci_v.h_mag[k] * fsci_v.h_phase[k].sin();
+                let re_s = scipy_v[n + 2 * k];
+                let im_s = scipy_v[n + 2 * k + 1];
+                let d = ((re_f - re_s).powi(2) + (im_f - im_s).powi(2)).sqrt();
+                if d > h_diff {
+                    h_diff = d;
+                }
             }
-        }
+            (w_diff, h_diff)
+        };
         max_h = max_h.max(h_diff);
         let pass = w_diff <= ABS_TOL && h_diff <= ABS_TOL;
+        ledger.compared("freqz", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             w_diff,
@@ -267,6 +274,7 @@ fn diff_signal_freqz() {
         test_id: "diff_signal_freqz".into(),
         category: "scipy.signal.freqz".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_h_diff: max_h,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -290,4 +298,5 @@ fn diff_signal_freqz() {
         diffs.len(),
         max_h
     );
+    ledger.finish(query.points.len());
 }
