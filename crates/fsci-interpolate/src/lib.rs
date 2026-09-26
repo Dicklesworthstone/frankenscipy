@@ -549,11 +549,15 @@ fn detect_uniform_axis(axis: &[f64]) -> Option<(f64, f64)> {
 }
 
 /// Compute cubic spline coefficients with configurable boundary conditions.
+///
+/// Two and three points follow scipy `CubicSpline`'s special cases
+/// ([`cubic_spline_few_points`]) where it has them; natural and clamped ends take the general
+/// solve at any `n >= 2`, as in scipy.
 fn compute_cubic_spline(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Vec<[f64; 4]>, InterpError> {
     let n = x.len();
-    if n < 4 {
+    if n < 2 {
         return Err(InterpError::TooFewPoints {
-            minimum: 4,
+            minimum: 2,
             actual: n,
         });
     }
@@ -561,19 +565,23 @@ fn compute_cubic_spline(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Vec<[f64; 
     let m = n - 1; // number of intervals
     let h: Vec<f64> = (0..m).map(|i| x[i + 1] - x[i]).collect();
 
+    if let SplineBc::Periodic = bc {
+        let scale = y[0].abs().max(y[n - 1].abs()).max(1.0);
+        if (y[0] - y[n - 1]).abs() > 1e-12 * scale {
+            return Err(InterpError::InvalidArgument {
+                detail: "periodic spline requires y[0] == y[n-1]".to_string(),
+            });
+        }
+    }
+    if let Some(coeffs) = cubic_spline_few_points(y, &h, bc) {
+        return Ok(coeffs);
+    }
+
     let c = match bc {
         SplineBc::Natural => solve_spline_natural(n, &h, y),
         SplineBc::NotAKnot => solve_spline_not_a_knot(n, &h, y),
         SplineBc::Clamped(dl, dr) => solve_spline_clamped(n, &h, y, dl, dr),
-        SplineBc::Periodic => {
-            let scale = y[0].abs().max(y[n - 1].abs()).max(1.0);
-            if (y[0] - y[n - 1]).abs() > 1e-12 * scale {
-                return Err(InterpError::InvalidArgument {
-                    detail: "periodic spline requires y[0] == y[n-1]".to_string(),
-                });
-            }
-            solve_spline_periodic(n, &h, y)
-        }
+        SplineBc::Periodic => solve_spline_periodic(n, &h, y),
     };
 
     let mut coeffs = Vec::with_capacity(m);
@@ -586,6 +594,79 @@ fn compute_cubic_spline(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Vec<[f64; 
     }
 
     Ok(coeffs)
+}
+
+/// scipy `CubicSpline`'s special cases for two and three points (`_cubic.py`), as slopes `s` at
+/// the knots turned into pieces the way `CubicHermiteSpline` does. With two points, not-a-knot
+/// and periodic ends become first-derivative conditions equal to the one slope: a straight line
+/// (constant for periodic data). With three points, not-a-knot at both ends is the parabola
+/// through them (scipy's 3 × 3 system for the slopes), and a periodic spline has the one common
+/// slope `Σ(slope_i / h_i) / Σ(1 / h_i)`. `None` for every other case, which takes the general
+/// solve (natural and clamped ends at two or three points included, as in scipy).
+fn cubic_spline_few_points(y: &[f64], h: &[f64], bc: SplineBc) -> Option<Vec<[f64; 4]>> {
+    let n = y.len();
+    let slope: Vec<f64> = (0..n - 1).map(|i| (y[i + 1] - y[i]) / h[i]).collect();
+    let s: Vec<f64> = match (n, bc) {
+        (2, SplineBc::NotAKnot | SplineBc::Periodic) => vec![slope[0]; 2],
+        (3, SplineBc::NotAKnot) => {
+            let a = [
+                [1.0, 1.0, 0.0],
+                [h[1], 2.0 * (h[0] + h[1]), h[0]],
+                [0.0, 1.0, 1.0],
+            ];
+            let b = [
+                2.0 * slope[0],
+                3.0 * (h[0] * slope[1] + h[1] * slope[0]),
+                2.0 * slope[1],
+            ];
+            solve_3x3_partial_pivot(a, b).to_vec()
+        }
+        (3, SplineBc::Periodic) => {
+            let t = (slope[0] / h[0] + slope[1] / h[1]) / (1.0 / h[0] + 1.0 / h[1]);
+            vec![t; 3]
+        }
+        _ => return None,
+    };
+    Some(
+        (0..n - 1)
+            .map(|i| {
+                let t = (s[i] + s[i + 1] - 2.0 * slope[i]) / h[i];
+                [y[i], s[i], (slope[i] - s[i]) / h[i] - t, t / h[i]]
+            })
+            .collect(),
+    )
+}
+
+/// `a·x = b` for a 3 × 3 system by Gaussian elimination with partial pivoting (the first
+/// largest pivot in each column). The not-a-knot system of [`cubic_spline_few_points`] has
+/// determinant `h0 + h1 > 0`, so no pivot is zero there.
+fn solve_3x3_partial_pivot(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> [f64; 3] {
+    for col in 0..3 {
+        let mut p = col;
+        for r in col + 1..3 {
+            if a[r][col].abs() > a[p][col].abs() {
+                p = r;
+            }
+        }
+        a.swap(col, p);
+        b.swap(col, p);
+        for r in col + 1..3 {
+            let factor = a[r][col] / a[col][col];
+            for j in col..3 {
+                a[r][j] -= factor * a[col][j];
+            }
+            b[r] -= factor * b[col];
+        }
+    }
+    let mut x = [0.0; 3];
+    for i in (0..3).rev() {
+        let mut acc = b[i];
+        for j in i + 1..3 {
+            acc -= a[i][j] * x[j];
+        }
+        x[i] = acc / a[i][i];
+    }
+    x
 }
 
 fn solve_spline_natural(n: usize, h: &[f64], y: &[f64]) -> Vec<f64> {
@@ -980,9 +1061,11 @@ impl CubicSplineStandalone {
                 y_len: y.len(),
             });
         }
-        if x.len() < 4 {
+        // scipy `prepare_input`: "`x` must contain at least 2 elements."; two and three points
+        // take `CubicSpline`'s special cases (`compute_cubic_spline`).
+        if x.len() < 2 {
             return Err(InterpError::TooFewPoints {
-                minimum: 4,
+                minimum: 2,
                 actual: x.len(),
             });
         }
@@ -1020,7 +1103,9 @@ impl CubicSplineStandalone {
     }
 
     /// The `nu`-th derivative. scipy's `CubicSpline.derivative` keeps the spline's
-    /// `extrapolate`, so the derivative of a periodic spline wraps too.
+    /// `extrapolate`, so the derivative of a periodic spline wraps too. The third derivative is
+    /// piecewise constant, `6·d` on each piece (scipy `PPoly.derivative(3)`); from the fourth on
+    /// it is zero.
     pub fn derivative(&self, nu: usize) -> CubicSplineDerivative {
         let m = self.coeffs.len();
         let coeffs = match nu {
@@ -1034,6 +1119,11 @@ impl CubicSplineStandalone {
                 .coeffs
                 .iter()
                 .map(|&[_a, _b, c, d]| [2.0 * c, 6.0 * d, 0.0, 0.0])
+                .collect(),
+            3 => self
+                .coeffs
+                .iter()
+                .map(|&[_a, _b, _c, d]| [6.0 * d, 0.0, 0.0, 0.0])
                 .collect(),
             _ => vec![[0.0; 4]; m],
         };
@@ -1898,10 +1988,17 @@ impl FloaterHormannInterpolator {
 }
 
 /// The minimal-singular-value right vector(s) of `a`, summed over a degenerate
-/// minimum and normalized by `√count` (the AAA weight selection of scipy). Falls
-/// back to a column-normalized SVD when `a` is severely ill-conditioned, exactly
-/// as scipy does.
-fn aaa_min_singular_vector(a: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
+/// minimum and normalized by `√count` (the AAA weight selection of scipy). Uses a
+/// column-normalized SVD once `a` has been severely ill-conditioned, exactly as scipy
+/// does: its `ill_conditioned` switch (here `*ill_conditioned`, owned by the fit) is set
+/// by `s[0] / s[-1] > 1/(3·eps)`, which an exactly-zero `s[-1]` satisfies (the ratio is
+/// inf; 0/0 is NaN and does not), and stays set for the rest of the fit, skipping the
+/// plain SVD. A zero column then has a zero norm, and the NaN it makes fails the SVD, as
+/// scipy's "A has a NaN entry" does.
+fn aaa_min_singular_vector(
+    a: &[Vec<f64>],
+    ill_conditioned: &mut bool,
+) -> Result<Vec<f64>, InterpError> {
     /// Index-driven numeric kernel: the loop variables are the recurrence/band
     /// indices and several address more than one array per iteration, so iterator
     /// form would obscure the index algebra this is checked against rather than
@@ -1927,29 +2024,33 @@ fn aaa_min_singular_vector(a: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
         wj
     }
     let opt = fsci_linalg::DecompOptions::default();
-    let res = fsci_linalg::svd(a, opt).map_err(|e| InterpError::InvalidArgument {
-        detail: format!("AAA: SVD failed: {e}"),
-    })?;
-    let cond_tol = 1.0 / (3.0 * f64::EPSILON);
-    let last = res.s.len() - 1;
-    if res.s[last] > 0.0 && res.s[0] / res.s[last] > cond_tol {
-        // Severely ill-conditioned: re-solve on column-normalized columns.
-        let nrows = a.len();
-        let ncol = a[0].len();
-        let colnorm: Vec<f64> = (0..ncol)
-            .map(|c| (0..nrows).map(|r| a[r][c] * a[r][c]).sum::<f64>().sqrt())
-            .collect();
-        let an: Vec<Vec<f64>> = a
-            .iter()
-            .map(|row| (0..ncol).map(|c| row[c] / colnorm[c]).collect())
-            .collect();
-        let res2 = fsci_linalg::svd(&an, opt).map_err(|e| InterpError::InvalidArgument {
+    if !*ill_conditioned {
+        let res = fsci_linalg::svd(a, opt).map_err(|e| InterpError::InvalidArgument {
             detail: format!("AAA: SVD failed: {e}"),
         })?;
-        let wj = min_sv(&res2);
-        return Ok((0..ncol).map(|c| wj[c] / colnorm[c]).collect());
+        let cond_tol = 1.0 / (3.0 * f64::EPSILON);
+        let last = res.s.len() - 1;
+        if res.s[0] / res.s[last] > cond_tol {
+            *ill_conditioned = true;
+        } else {
+            return Ok(min_sv(&res));
+        }
     }
-    Ok(min_sv(&res))
+    // Severely ill-conditioned: re-solve on column-normalized columns.
+    let nrows = a.len();
+    let ncol = a[0].len();
+    let colnorm: Vec<f64> = (0..ncol)
+        .map(|c| (0..nrows).map(|r| a[r][c] * a[r][c]).sum::<f64>().sqrt())
+        .collect();
+    let an: Vec<Vec<f64>> = a
+        .iter()
+        .map(|row| (0..ncol).map(|c| row[c] / colnorm[c]).collect())
+        .collect();
+    let res2 = fsci_linalg::svd(&an, opt).map_err(|e| InterpError::InvalidArgument {
+        detail: format!("AAA: SVD failed: {e}"),
+    })?;
+    let wj = min_sv(&res2);
+    Ok((0..ncol).map(|c| wj[c] / colnorm[c]).collect())
 }
 
 /// AAA weights when the Loewner submatrix `a` (`r` rows, `n > r` columns) is wide: scipy then
@@ -2091,7 +2192,10 @@ fn lapack_dlarfg(alpha: f64, x: &[f64]) -> (f64, f64, Vec<f64>) {
 ///
 /// The Froissart-doublet `clean_up` post-process (scipy's `clean_up=True`) is not
 /// performed; the result equals scipy's for well-conditioned data, where no
-/// spurious poles arise.
+/// spurious poles arise. Where scipy's clean-up does fire, its decision rests on
+/// rounding-level residues (frankenscipy-llwlm item 8: in 550 random noisy fits it fired
+/// twice, 0.58 and 2e-5 decades from its threshold, and one-ulp weight perturbations flip
+/// the first in 36 of 40 draws), so it cannot be reproduced without scipy's exact SVD.
 pub struct Aaa {
     support_points: Vec<f64>,
     support_values: Vec<f64>,
@@ -2172,6 +2276,8 @@ impl Aaa {
         let mut zj: Vec<f64> = Vec::new();
         let mut fj: Vec<f64> = Vec::new();
         let mut weights: Vec<f64> = Vec::new();
+        // scipy's `ill_conditioned` latch: once set it stays set for the rest of the fit.
+        let mut ill_conditioned = false;
 
         for m in 0..max_terms {
             // Select the worst-approximated remaining point (first max on ties).
@@ -2209,7 +2315,7 @@ impl Aaa {
             } else if masked_rows.len() < ncol {
                 aaa_null_space_weights(&asub)?
             } else {
-                aaa_min_singular_vector(&asub)?
+                aaa_min_singular_vector(&asub, &mut ill_conditioned)?
             };
 
             // Rational approximant R at every point (= f at support points).
@@ -3762,6 +3868,17 @@ impl RegularGridInterpolator {
                 y_len: values.len(),
             });
         }
+        // scipy builds the cubic and quintic tensor splines in `__init__` (`make_ndbspl`), whose
+        // solve rejects non-finite data whatever the queries or `bounds_error` will be.
+        if matches!(
+            method,
+            RegularGridMethod::Cubic | RegularGridMethod::Quintic
+        ) && values.iter().any(|v| !v.is_finite())
+        {
+            return Err(InterpError::InvalidArgument {
+                detail: "RHS must contain only finite numbers".to_string(),
+            });
+        }
 
         // Detect evenly-spaced axes once at construction so the hot eval paths
         // can replace per-query binary search with O(1) direct addressing. An
@@ -3801,6 +3918,7 @@ impl RegularGridInterpolator {
             });
         }
         if xi.iter().any(|x| x.is_nan()) {
+            self.reject_non_finite_pchip_values()?;
             return Ok(f64::NAN);
         }
         let mut out_of_bounds = false;
@@ -3820,6 +3938,7 @@ impl RegularGridInterpolator {
             }
         }
         if out_of_bounds && let Some(fill) = self.fill_value {
+            self.reject_non_finite_pchip_values()?;
             return Ok(fill);
         }
         match self.method {
@@ -3831,7 +3950,22 @@ impl RegularGridInterpolator {
         }
     }
 
+    /// scipy's pchip path fits `PchipInterpolator` over the whole value grid on every call
+    /// (`_evaluate_spline`), before it applies NaN queries and the fill value, so non-finite
+    /// values raise "`y` must contain only finite values." for every query past the
+    /// `bounds_error` check, an empty batch included. The in-range path raises from
+    /// [`PchipInterpolator::new`] already; this covers the NaN and fill-value early returns.
+    fn reject_non_finite_pchip_values(&self) -> Result<(), InterpError> {
+        if self.method == RegularGridMethod::Pchip {
+            reject_non_finite_cubic_y(&self.values)?;
+        }
+        Ok(())
+    }
+
     pub fn eval_many(&self, xi: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
+        if xi.is_empty() {
+            self.reject_non_finite_pchip_values()?;
+        }
         if self.method == RegularGridMethod::Nearest && self.ndim() == 3 {
             return self.eval_many_nearest_3d(xi);
         }
@@ -8314,8 +8448,12 @@ pub fn make_smoothing_spline(
             detail: "regularization parameter should be non-negative".to_string(),
         });
     }
+    // scipy slices the weights (`w[:3]`, `w[:4]`, `w[j-2:j+3]`, then `w[-4:]`, `w[-3:]` for the
+    // last two columns) and only broadcasts the whole vector inside GCV, so with an explicit lam
+    // a longer vector is accepted, its head feeding the first n - 2 columns and its tail the last
+    // two; a shorter one fails to broadcast.
     let w: Vec<f64> = match w {
-        Some(s) if s.len() == n => s.to_vec(),
+        Some(s) if s.len() == n || (s.len() > n && lam.is_some()) => s.to_vec(),
         Some(_) => {
             return Err(InterpError::InvalidArgument {
                 detail: "weights must match the data length".to_string(),
@@ -8323,6 +8461,7 @@ pub fn make_smoothing_spline(
         }
         None => vec![1.0; n],
     };
+    let wl = w.len();
     // scipy solves `solve_banded((2, 2), X + lam*wE, y)` with its default `check_finite=True`
     // (inside GCV too when lam is None), which raises "array must not contain infs or NaNs"
     // for a non-finite y or lam after every check above; a NaN lam also slips past `< 0`.
@@ -8377,16 +8516,27 @@ pub fn make_smoothing_spline(
     }
     let c_r4 = coeff_of_divided_diff(&x[n - 4..n]);
     for r in 0..4 {
-        we[r][n - 2] = -c_r4[r] / w[n - 4 + r];
+        we[r][n - 2] = -c_r4[r] / w[wl - 4 + r];
     }
     let c_r3 = coeff_of_divided_diff(&x[n - 3..n]);
     for r in 0..3 {
-        we[r][n - 1] = c_r3[r] / w[n - 3 + r];
+        we[r][n - 1] = c_r3[r] / w[wl - 3 + r];
     }
     for row in &mut we {
         for v in row {
             *v *= 6.0;
         }
+    }
+    // scipy's `solve_banded(..., check_finite=True)` sees the weights too: through `X + lam*wE`
+    // for a given lam (a NaN weight makes wE NaN; `any(w <= 0)` let it through), and inside GCV,
+    // which multiplies by `w` itself, when lam is None (an infinite weight as well). Either
+    // raises "array must not contain infs or NaNs".
+    if we.iter().flatten().any(|v| !v.is_finite())
+        || (lam.is_none() && w.iter().any(|v| !v.is_finite()))
+    {
+        return Err(InterpError::InvalidArgument {
+            detail: "array must not contain infs or NaNs".to_string(),
+        });
     }
 
     // X (design) and E (penalty) stay in their O(n) LAPACK (2,2)-band storage (`xm`/`we`,
@@ -8485,6 +8635,36 @@ pub fn splprep(
     }
     for v in &mut u {
         *v /= total;
+    }
+    // A non-finite coordinate: after scipy's `1 <= k <= 5` and `m > k` checks, FITPACK `parcur`
+    // pins `u(1) = 0` and `u(m) = 1`, then requires `u` strictly increasing ("Invalid inputs.",
+    // ier = 10), which a NaN passes (it compares false). A NaN coordinate, or an infinite one on
+    // the first chord, leaves every interior `u` NaN, and `parcur` returns the s = 0 knot layout
+    // with NaN interior knots and NaN coefficients rather than raising; an infinite coordinate
+    // further on zeroes the `u` before it and fails the ordering.
+    if u.iter().any(|v| v.is_nan()) {
+        if !(1..=5).contains(&k) {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("1 <= k= {k} <=5 must hold"),
+            });
+        }
+        if m <= k {
+            return Err(InterpError::TooFewPoints {
+                minimum: k + 1,
+                actual: m,
+            });
+        }
+        u[0] = 0.0;
+        u[m - 1] = 1.0;
+        if u.windows(2).any(|p| p[0] >= p[1]) {
+            return Err(InterpError::InvalidArgument {
+                detail: "Invalid inputs.".to_string(),
+            });
+        }
+        let mut t = vec![0.0; k + 1];
+        t.extend(std::iter::repeat_n(f64::NAN, m - k - 1));
+        t.extend(std::iter::repeat_n(1.0, k + 1));
+        return Ok(((t, vec![vec![f64::NAN; m]; points.len()], k), u));
     }
     // Fit each coordinate against u; all share the same knot vector.
     let (t, _, _) = splrep(&u, &points[0], k, 0.0)?;
@@ -8832,6 +9012,19 @@ pub fn make_splprep(
     }
     for v in &mut u {
         *v /= total;
+    }
+    // A non-finite coordinate leaves NaN in `u` (NaN / NaN, or inf / inf), which scipy's
+    // `_validate_inputs` ordering check lets through (NaN compares false); its first knot
+    // placement then raises from `find_interval`, naming the NaN with its sign as C prints it.
+    if let Some(bad) = u.iter().find(|v| v.is_nan()) {
+        let shown = if bad.is_sign_negative() {
+            "-nan"
+        } else {
+            "nan"
+        };
+        return Err(InterpError::InvalidArgument {
+            detail: format!("find_interval: out of bounds with x = {shown}"),
+        });
     }
 
     let w = vec![1.0_f64; m];
@@ -12082,6 +12275,90 @@ mod tests {
         );
     }
 
+    /// frankenscipy-llwlm item 3. `make_smoothing_spline` fitted through a NaN weight (it passes
+    /// `any(w <= 0)`) and rejected every weight vector of the wrong length. scipy 1.17.1, live,
+    /// x = [0..6], y = [0.1, 0.9, 2.1, 2.9, 3.8, 5.2, 5.9], w = [1, 2, 0.5, 1, 3, 1, 0.25]:
+    /// - w with a NaN at index 0, 2 or 6, lam = 0.5, 0 or None: ValueError("array must not contain
+    ///   infs or NaNs"); an infinite weight raises the same with lam = None (GCV multiplies by w)
+    ///   and fits with lam = 0.5, c[0] = 0.09999999999999998 (that point is interpolated);
+    /// - w + [4] (length 8), lam = 0.5: accepted, `w[-4:]` and `w[-3:]` feeding the last two
+    ///   columns, c = [-0.09570829190628372, 0.2948307485830687, 1.0759088295617734,
+    ///   2.6389425348423976, 4.020229700292685, 4.137955757399056, 0.27310131953160666,
+    ///   -1.2764543364021819, -2.051232164369076]; with lam = None it fails to broadcast, and
+    ///   w[:-1] (length 6) fails with either lam.
+    ///
+    /// Must-not-change: w itself, lam = 0.5, still gives c[0] = 0.05471269191760253 and
+    /// c[8] = 6.099770573217224.
+    #[test]
+    fn make_smoothing_spline_weight_nan_and_length_like_scipy() {
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let y = [0.1, 0.9, 2.1, 2.9, 3.8, 5.2, 5.9];
+        let w = [1.0, 2.0, 0.5, 1.0, 3.0, 1.0, 0.25];
+        let nan_msg = "array must not contain infs or NaNs";
+        let is_nan_err = |r: Result<BSpline, InterpError>| match r {
+            Err(InterpError::InvalidArgument { detail }) => detail == nan_msg,
+            _ => false,
+        };
+        for pos in [0, 2, 6] {
+            let mut wn = w;
+            wn[pos] = f64::NAN;
+            for lam in [Some(0.5), Some(0.0), None] {
+                assert!(
+                    is_nan_err(make_smoothing_spline(&x, &y, Some(&wn[..]), lam)),
+                    "NaN w[{pos}], lam={lam:?}"
+                );
+            }
+        }
+        let mut wi = w;
+        wi[0] = f64::INFINITY;
+        assert!(
+            is_nan_err(make_smoothing_spline(&x, &y, Some(&wi[..]), None)),
+            "infinite weight under GCV"
+        );
+        let inf_fit =
+            make_smoothing_spline(&x, &y, Some(&wi[..]), Some(0.5)).expect("infinite w, lam=0.5");
+        let c0 = inf_fit.coeffs()[0];
+        assert!(
+            (c0 - 0.09999999999999998).abs() < 1e-10,
+            "infinite-weight c[0] = {c0}"
+        );
+
+        let mut w_long = w.to_vec();
+        w_long.push(4.0);
+        let long = make_smoothing_spline(&x, &y, Some(w_long.as_slice()), Some(0.5))
+            .expect("scipy accepts a longer w with lam");
+        let c_scipy = [
+            -0.09570829190628372,
+            0.2948307485830687,
+            1.0759088295617734,
+            2.6389425348423976,
+            4.020229700292685,
+            4.137955757399056,
+            0.27310131953160666,
+            -1.2764543364021819,
+            -2.051232164369076,
+        ];
+        assert_eq!(long.coeffs().len(), c_scipy.len());
+        for (&got, &want) in long.coeffs().iter().zip(&c_scipy) {
+            assert!(
+                (got - want).abs() < 1e-10,
+                "longer-w c {got} vs scipy {want}"
+            );
+        }
+        assert!(make_smoothing_spline(&x, &y, Some(w_long.as_slice()), None).is_err());
+        assert!(make_smoothing_spline(&x, &y, Some(&w[..6]), Some(0.5)).is_err());
+        assert!(make_smoothing_spline(&x, &y, Some(&w[..6]), None).is_err());
+
+        let fit = make_smoothing_spline(&x, &y, Some(&w[..]), Some(0.5)).expect("finite w");
+        let c = fit.coeffs();
+        assert!(
+            (c[0] - 0.05471269191760253).abs() < 1e-10,
+            "c[0] = {}",
+            c[0]
+        );
+        assert!((c[8] - 6.099770573217224).abs() < 1e-10, "c[8] = {}", c[8]);
+    }
+
     #[test]
     // The naive full-storage reference this test compares against is written with
     // explicit band indices, matching the compact-storage kernel it checks; iterator
@@ -12454,6 +12731,177 @@ mod tests {
             for (&g, &w) in got.iter().zip(want) {
                 assert!((g - w).abs() < 1e-12, "{g} vs scipy {w}");
             }
+        }
+    }
+
+    /// frankenscipy-llwlm item 4. `make_splprep` with s > 0 took a NaN chord parameter into its
+    /// knot placement. scipy 1.17.1, live, t = linspace(0, 1.5, 7), x = cos(t), y = sin(2t):
+    /// with x[0], x[3] or x[6] = nan, s = 0.1 (also s = 1e-6, k = 1 or 5), `make_splprep` raises
+    /// RuntimeError("find_interval: out of bounds with x = nan"); with y[2] = inf or y[0] = -inf
+    /// the parameter holds inf / inf and the message reads "x = -nan".
+    ///
+    /// Must-not-change: the finite curve with s = 0.1 gives u = [0, 0.22033051996010874,
+    /// 0.39156920205432655, 0.4895317961716718, 0.5861749637030901, 0.7621447360122305, 1],
+    /// t = [0, 0, 0, 0, 1, 1, 1, 1], c_x = [0.9928140726676935, 1.2442078867497974,
+    /// 0.264071350253483, 0.0688414980911756], c_y = [-0.030533760820112485, 1.1307777424728973,
+    /// 1.219226639562067, 0.11332863983205284].
+    #[test]
+    fn make_splprep_smoothing_rejects_nan_parameter_like_scipy() {
+        let is_find_interval_err = |r: Result<(ParametricSpline, Vec<f64>), InterpError>| match r {
+            Err(InterpError::InvalidArgument { detail }) => {
+                detail.starts_with("find_interval: out of bounds with x = ")
+                    && detail.ends_with("nan")
+            }
+            _ => false,
+        };
+        let t: Vec<f64> = (0..7).map(|i| 1.5 * i as f64 / 6.0).collect();
+        let px: Vec<f64> = t.iter().map(|v| v.cos()).collect();
+        let py: Vec<f64> = t.iter().map(|v| (2.0 * v).sin()).collect();
+        for pos in [0, 3, 6] {
+            let mut bad = px.clone();
+            bad[pos] = f64::NAN;
+            for (s, k) in [(0.1, 3), (1e-6, 3), (0.1, 1), (0.1, 5)] {
+                assert!(
+                    is_find_interval_err(make_splprep(&[bad.clone(), py.clone()], k, s)),
+                    "nan x[{pos}], s={s}, k={k}"
+                );
+            }
+        }
+        let mut y_inf = py.clone();
+        y_inf[2] = f64::INFINITY;
+        assert!(
+            is_find_interval_err(make_splprep(&[px.clone(), y_inf], 3, 0.1)),
+            "inf y[2]"
+        );
+
+        let ((knots, coeffs, k), u) = make_splprep(&[px, py], 3, 0.1).expect("finite curve");
+        assert_eq!(k, 3);
+        let u_scipy = [
+            0.0,
+            0.22033051996010874,
+            0.39156920205432655,
+            0.4895317961716718,
+            0.5861749637030901,
+            0.7621447360122305,
+            1.0,
+        ];
+        let t_scipy = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let cx_scipy = [
+            0.9928140726676935,
+            1.2442078867497974,
+            0.264071350253483,
+            0.0688414980911756,
+        ];
+        let cy_scipy = [
+            -0.030533760820112485,
+            1.1307777424728973,
+            1.219226639562067,
+            0.11332863983205284,
+        ];
+        assert_eq!(coeffs.len(), 2);
+        for (got, want, tol) in [
+            (&u, &u_scipy[..], 1e-12),
+            (&knots, &t_scipy[..], 1e-12),
+            (&coeffs[0], &cx_scipy[..], 1e-9),
+            (&coeffs[1], &cy_scipy[..], 1e-9),
+        ] {
+            assert_eq!(got.len(), want.len());
+            for (&g, &w) in got.iter().zip(want) {
+                assert!((g - w).abs() < tol, "{g} vs scipy {w}");
+            }
+        }
+    }
+
+    /// frankenscipy-llwlm item 5. Legacy `splprep` rejected a NaN coordinate (its NaN chord
+    /// parameter reached `splrep`). scipy 1.17.1, live (FITPACK `parcur` does not check), on
+    /// t = linspace(0, 1.5, 7), x = cos(t), y = sin(2t), s = 0:
+    /// - x[0], x[1], x[3], x[5] or x[6] = nan, or x[0] = inf: u = [0, nan ×5, 1], knots
+    ///   [0 ×4, nan ×3, 1 ×4], every coefficient nan (7 per coordinate), no raise; k = 1 gives
+    ///   knots [0, 0, nan ×5, 1, 1] and k = 5 [0 ×6, nan, 1 ×6];
+    /// - x[3] = inf zeroes u[1], u[2], so ier = 10: ValueError("Invalid inputs.");
+    /// - nan on 3 points with k = 3: TypeError("m > k must hold").
+    ///
+    /// Must-not-change: the finite curve gives u = [0, 0.22033051996010874, 0.39156920205432655,
+    /// 0.4895317961716718, 0.5861749637030901, 0.7621447360122305, 1] and interior knots
+    /// [0.39156920205432655, 0.4895317961716718, 0.5861749637030901].
+    #[test]
+    fn splprep_nan_coordinate_returns_nan_like_scipy() {
+        let t: Vec<f64> = (0..7).map(|i| 1.5 * i as f64 / 6.0).collect();
+        let px: Vec<f64> = t.iter().map(|v| v.cos()).collect();
+        let py: Vec<f64> = t.iter().map(|v| (2.0 * v).sin()).collect();
+        let nan_layout = |knots: &[f64], k: usize| {
+            knots.len() == 7 + k + 1
+                && knots[..=k].iter().all(|&v| v == 0.0)
+                && knots[k + 1..7].iter().all(|v| v.is_nan())
+                && knots[7..].iter().all(|&v| v == 1.0)
+        };
+        let mut cases: Vec<(String, Vec<f64>)> = Vec::new();
+        for pos in [0, 1, 3, 5, 6] {
+            let mut bad = px.clone();
+            bad[pos] = f64::NAN;
+            cases.push((format!("nan x[{pos}]"), bad));
+        }
+        let mut inf_first = px.clone();
+        inf_first[0] = f64::INFINITY;
+        cases.push(("inf x[0]".to_string(), inf_first));
+        for (label, bad) in &cases {
+            let ((knots, coeffs, k), u) =
+                splprep(&[bad.clone(), py.clone()], 3, 0.0).expect("scipy returns nan results");
+            assert_eq!(k, 3);
+            assert!(nan_layout(&knots, 3), "{label}: knots {knots:?}");
+            assert_eq!(coeffs.len(), 2, "{label}");
+            assert!(
+                coeffs
+                    .iter()
+                    .all(|c| c.len() == 7 && c.iter().all(|v| v.is_nan())),
+                "{label}: coefficients {coeffs:?}"
+            );
+            assert_eq!(u.len(), 7);
+            assert!(
+                u[0] == 0.0 && u[6] == 1.0 && u[1..6].iter().all(|v| v.is_nan()),
+                "{label}: u {u:?}"
+            );
+        }
+        let mut nan3 = px.clone();
+        nan3[3] = f64::NAN;
+        for k in [1, 5] {
+            let ((knots, _, _), _) =
+                splprep(&[nan3.clone(), py.clone()], k, 0.0).expect("nan result");
+            assert!(nan_layout(&knots, k), "k={k}: knots {knots:?}");
+        }
+        let mut inf3 = px.clone();
+        inf3[3] = f64::INFINITY;
+        assert!(matches!(
+            splprep(&[inf3, py.clone()], 3, 0.0),
+            Err(InterpError::InvalidArgument { detail }) if detail == "Invalid inputs."
+        ));
+        let mut short = px[..3].to_vec();
+        short[1] = f64::NAN;
+        assert!(matches!(
+            splprep(&[short, py[..3].to_vec()], 3, 0.0),
+            Err(InterpError::TooFewPoints {
+                minimum: 4,
+                actual: 3
+            })
+        ));
+
+        let ((knots, _, _), u) = splprep(&[px, py], 3, 0.0).expect("finite curve");
+        let u_scipy = [
+            0.0,
+            0.22033051996010874,
+            0.39156920205432655,
+            0.4895317961716718,
+            0.5861749637030901,
+            0.7621447360122305,
+            1.0,
+        ];
+        assert_eq!(u.len(), u_scipy.len());
+        for (&g, &w) in u.iter().zip(&u_scipy) {
+            assert!((g - w).abs() < 1e-12, "u {g} vs scipy {w}");
+        }
+        assert_eq!(knots.len(), 11);
+        for (&g, &w) in knots[4..7].iter().zip(&u_scipy[2..5]) {
+            assert!((g - w).abs() < 1e-12, "interior knot {g} vs scipy {w}");
         }
     }
 
@@ -13315,6 +13763,100 @@ mod tests {
         let svd_final = Aaa::new(&z, &f, None, 100).expect("exp fit");
         assert_eq!(svd_final.support_points().len(), 6);
         assert!((svd_final.eval(0.5) - 1.6487212707003112).abs() < 1e-12);
+    }
+
+    /// frankenscipy-llwlm item 7. scipy's AAA sets its `ill_conditioned` switch when
+    /// `s[0] / s[-1] > 1/(3·eps)` under `errstate(divide="ignore")`, so an exactly-zero smallest
+    /// singular value sets it (the ratio is inf), and it stays set for the rest of the fit; fsci
+    /// re-decided every step and required `s[-1] > 0`. On constant data with one outlier the
+    /// second Loewner column is exactly zero: scipy latches, column-normalizes by a zero norm and
+    /// raises. scipy 1.17.1, live, default and clean_up=False alike: z = [0..5],
+    /// f = [1, 1, 1, 5, 1, 1]; z = [0, 1, 2, 3], f = [2, 2, -1, 2]; z = [0, 0.5, .., 3],
+    /// f = [0, 0, 0, 0, 0, 3, 0]: ValueError("A has a NaN entry") at the second step. fsci went
+    /// on to take every point as a support point.
+    ///
+    /// Persistence: z = [-4, -3.5, -3.25, -3.2499999999999996, 4, 5] (a pair one ulp apart),
+    /// f = [5, 4.5, -100, 7.9, 8.8, 7.9]. The b/ulp Cauchy entry makes step 1's ratio 2.08e17, so
+    /// scipy latches; step 2's is 1.08e3, yet scipy stays column-normalized, and its step-3
+    /// residuals (0.3136 at -4 against 0.1976 at 5; a re-decided step 2 gives 0.2827 against
+    /// 0.3077) pick -4. scipy 1.17.1, live: support [-3.25, 4, -3.2499999999999996, -4], weights
+    /// [0.01856190908028774, 0.4957813974087375, 0.5960281658045845, 0.6313530605630713],
+    /// r(-3, 0, 4.5, -3.6, 10) = 4.618662973102652, 2.583631535934551, 8.265521644728386,
+    /// 3.426169141517883, 6.70782946596868. fsci ended on support point 5 instead.
+    ///
+    /// Must-not-change: exp on linspace(-1, 1, 30), never ill-conditioned, keeps scipy's support
+    /// points [1, -1, 0.7241379310344827, 0.034482758620689724, -0.4482758620689655,
+    /// -0.9310344827586207].
+    #[test]
+    fn aaa_ill_conditioned_latch_like_scipy() {
+        let cases: [(&[f64], &[f64]); 3] = [
+            (
+                &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                &[1.0, 1.0, 1.0, 5.0, 1.0, 1.0],
+            ),
+            (&[0.0, 1.0, 2.0, 3.0], &[2.0, 2.0, -1.0, 2.0]),
+            (
+                &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+            ),
+        ];
+        for (z, f) in cases {
+            let fit = Aaa::new(z, f, None, 100);
+            assert!(
+                matches!(fit, Err(InterpError::InvalidArgument { .. })),
+                "z={z:?} f={f:?}: scipy raises, got {:?}",
+                fit.map(|a| a.support_points().to_vec())
+            );
+        }
+
+        let z = [-4.0, -3.5, -3.25, -3.2499999999999996, 4.0, 5.0];
+        let f = [5.0, 4.5, -100.0, 7.9, 8.8, 7.9];
+        let latched = Aaa::new(&z, &f, None, 100).expect("latched fit");
+        assert_eq!(
+            latched.support_points(),
+            &[-3.25, 4.0, -3.2499999999999996, -4.0],
+            "support points"
+        );
+        let w_scipy = [
+            0.01856190908028774,
+            0.4957813974087375,
+            0.5960281658045845,
+            0.6313530605630713,
+        ];
+        for (&got, &want) in latched.weights().iter().zip(&w_scipy) {
+            assert!((got - want).abs() < 1e-12, "weight {got} vs scipy {want}");
+        }
+        let r_scipy = [
+            4.618662973102652,
+            2.583631535934551,
+            8.265521644728386,
+            3.426169141517883,
+            6.70782946596868,
+        ];
+        for (&q, &want) in [-3.0, 0.0, 4.5, -3.6, 10.0].iter().zip(&r_scipy) {
+            let got = latched.eval(q);
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs(),
+                "r({q}) = {got}, scipy {want}"
+            );
+        }
+
+        let mut z: Vec<f64> = (0..30).map(|i| -1.0 + i as f64 * (2.0 / 29.0)).collect();
+        z[29] = 1.0;
+        let f: Vec<f64> = z.iter().map(|v| v.exp()).collect();
+        let fit = Aaa::new(&z, &f, None, 100).expect("exp fit");
+        let support_scipy = [
+            1.0,
+            -1.0,
+            0.7241379310344827,
+            0.034482758620689724,
+            -0.4482758620689655,
+            -0.9310344827586207,
+        ];
+        assert_eq!(fit.support_points().len(), support_scipy.len());
+        for (&got, &want) in fit.support_points().iter().zip(&support_scipy) {
+            assert!((got - want).abs() < 1e-15, "support {got} vs scipy {want}");
+        }
     }
 
     #[test]
@@ -14862,6 +15404,158 @@ mod tests {
         assert!(matches!(err, InterpError::TooFewPoints { minimum: 4, .. }));
     }
 
+    /// frankenscipy-llwlm item 6. With non-finite grid values, fsci's pchip returned the fill
+    /// value (or NaN for a NaN query) without looking at the values, and cubic and quintic
+    /// accepted them. scipy 1.17.1, live, on the 6 × 6 grid [1..6]², v[i, j] = (i+1)²·√(j+1),
+    /// with v[1, 2] = nan or v[4, 0] = inf:
+    /// - pchip fits the whole grid per call, so it raises ValueError("`y` must contain only finite
+    ///   values.") in range, for out-of-range queries only (fill -1 or None), for a NaN query and
+    ///   for an empty batch, `interpn` too; with bounds_error an out-of-range query raises the
+    ///   bounds error first;
+    /// - cubic and quintic raise ValueError("RHS must contain only finite numbers") at
+    ///   construction, bounds_error either way.
+    ///
+    /// Must-not-change: finite pchip with fill -1 gives [-1.0, 9.869437470571906, nan] at
+    /// [(-5, 2.5), (2.5, 2.5), (nan, 2.5)]; linear on the NaN grid gives
+    /// [nan, 71.45475523431526, -1.0] at [(2.5, 2.5), (5.5, 5.5), (-5, 2.5)]; finite cubic and
+    /// quintic grids still build.
+    #[test]
+    fn regular_grid_non_finite_values_raise_like_scipy() {
+        let axis = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let points = vec![axis.clone(), axis];
+        let v: Vec<f64> = (0..36_u32)
+            .map(|k| {
+                let (i, j) = (k / 6 + 1, k % 6 + 1);
+                f64::from(i * i) * f64::from(j).sqrt()
+            })
+            .collect();
+        let mut vn = v.clone();
+        vn[6 + 2] = f64::NAN;
+        let mut vi = v.clone();
+        vi[4 * 6] = f64::INFINITY;
+        let y_msg = "`y` must contain only finite values.";
+        let rhs_msg = "RHS must contain only finite numbers";
+        let is_y_err = |r: Result<Vec<f64>, InterpError>| matches!(r, Err(InterpError::InvalidArgument { detail }) if detail == y_msg);
+        let empty: Vec<Vec<f64>> = Vec::new();
+        for (label, vals) in [("nan", &vn), ("inf", &vi)] {
+            let pchip = |bounds_error: bool, fill: Option<f64>| {
+                RegularGridInterpolator::new(
+                    points.clone(),
+                    vals.clone(),
+                    RegularGridMethod::Pchip,
+                    bounds_error,
+                    fill,
+                )
+                .expect("scipy builds a pchip grid without looking at the values")
+            };
+            let fill = pchip(false, Some(-1.0));
+            assert!(
+                is_y_err(fill.eval_many(&[vec![2.5, 2.5]])),
+                "{label} in range"
+            );
+            assert!(
+                is_y_err(fill.eval_many(&[vec![-5.0, 2.5], vec![2.5, 9.0]])),
+                "{label} out of range only, fill"
+            );
+            assert!(
+                is_y_err(fill.eval_many(&[vec![f64::NAN, 2.5]])),
+                "{label} NaN query"
+            );
+            assert!(is_y_err(fill.eval_many(&empty)), "{label} empty batch");
+            assert!(
+                matches!(fill.eval(&[-5.0, 2.5]), Err(InterpError::InvalidArgument { detail }) if detail == y_msg),
+                "{label} single out-of-range eval"
+            );
+            let extrapolate = pchip(false, None);
+            assert!(
+                is_y_err(extrapolate.eval_many(&[vec![-5.0, 2.5]])),
+                "{label} out of range, fill None"
+            );
+            let strict = pchip(true, None);
+            assert!(
+                matches!(
+                    strict.eval_many(&[vec![-5.0, 2.5]]),
+                    Err(InterpError::OutOfBounds { .. })
+                ),
+                "{label} bounds error first"
+            );
+            assert!(
+                is_y_err(strict.eval_many(&[vec![2.5, 2.5]])),
+                "{label} in range, bounds_error"
+            );
+            assert!(
+                is_y_err(interpn(
+                    points.clone(),
+                    vals.clone(),
+                    &[vec![-5.0, 2.5]],
+                    RegularGridMethod::Pchip,
+                    false,
+                    Some(-1.0),
+                )),
+                "{label} interpn out of range, fill"
+            );
+            for method in [RegularGridMethod::Cubic, RegularGridMethod::Quintic] {
+                for bounds_error in [false, true] {
+                    let built = RegularGridInterpolator::new(
+                        points.clone(),
+                        vals.clone(),
+                        method,
+                        bounds_error,
+                        Some(-1.0),
+                    );
+                    assert!(
+                        matches!(built, Err(InterpError::InvalidArgument { detail }) if detail == rhs_msg),
+                        "{label} {method:?} bounds_error={bounds_error}"
+                    );
+                }
+            }
+        }
+
+        let finite = RegularGridInterpolator::new(
+            points.clone(),
+            v.clone(),
+            RegularGridMethod::Pchip,
+            false,
+            Some(-1.0),
+        )
+        .expect("finite pchip");
+        let got = finite
+            .eval_many(&[vec![-5.0, 2.5], vec![2.5, 2.5], vec![f64::NAN, 2.5]])
+            .expect("finite pchip values");
+        assert_eq!(got[0], -1.0);
+        assert!(
+            (got[1] - 9.869437470571906).abs() < 1e-10,
+            "pchip {}",
+            got[1]
+        );
+        assert!(got[2].is_nan());
+        let linear = RegularGridInterpolator::new(
+            points.clone(),
+            vn,
+            RegularGridMethod::Linear,
+            false,
+            Some(-1.0),
+        )
+        .expect("linear on NaN values");
+        let got = linear
+            .eval_many(&[vec![2.5, 2.5], vec![5.5, 5.5], vec![-5.0, 2.5]])
+            .expect("linear propagates NaN values");
+        assert!(got[0].is_nan());
+        assert!(
+            (got[1] - 71.45475523431526).abs() < 1e-12,
+            "linear {}",
+            got[1]
+        );
+        assert_eq!(got[2], -1.0);
+        for method in [RegularGridMethod::Cubic, RegularGridMethod::Quintic] {
+            assert!(
+                RegularGridInterpolator::new(points.clone(), v.clone(), method, false, None)
+                    .is_ok(),
+                "finite {method:?} grid"
+            );
+        }
+    }
+
     #[test]
     fn regular_grid_pchip_matches_scipy_reference_values() {
         let points: Vec<Vec<f64>> = vec![vec![1.0, 2.0, 3.0, 4.0], vec![1.0, 2.0, 3.0, 4.0]];
@@ -15351,6 +16045,226 @@ mod tests {
                 "{name}(1.5) = {got}, scipy {want}"
             );
         }
+    }
+
+    /// frankenscipy-llwlm item 1. `CubicSpline::derivative(3)` returned zeros; scipy's is the
+    /// piecewise-constant `6·d` of each piece (`PPoly.derivative(3)`, `c2 = poch(1, 3)·c[0]`), and
+    /// `cs(x, nu=3)` agrees with it. scipy 1.17.1, live, x = [0, 1, 2.5, 3, 4.5],
+    /// y = [1, -0.5, 2, 0.25, 1], `cs.derivative(3)` at
+    /// [-0.5, 0, 0.5, 1, 1.75, 2.5, 2.75, 3, 4, 4.5, 5.25] (a knot takes the piece on its right,
+    /// the last knot the last piece; periodic wraps first):
+    /// - not-a-knot: -8.717757009345796 ×5, 15.70841121495328 ×2, 15.708411214953262 ×4;
+    /// - natural: 7.215053763440862 ×3, -12.39904420549582 ×2, 37.612903225806434 ×2,
+    ///   -4.948626045400239 ×4;
+    /// - clamped ((1, 0.5), (1, -1.25)): 20.735955056179776 ×3, -15.086142322097377 ×2,
+    ///   47.55056179775281 ×2, -13.303370786516858 ×4;
+    /// - periodic: -11.705996131528046, 16.25531914893617 ×2, -14.25145067698259 ×2,
+    ///   45.36170212765957 ×2, -11.705996131528046 ×2, 16.25531914893617 ×2.
+    ///
+    /// Must-not-change: `derivative(4)` is 0 everywhere (scipy's order-1 zero PPoly), and the
+    /// natural spline's `derivative(2)` at 1.75 is -2.0842293906810037.
+    #[test]
+    fn cubic_spline_third_derivative_matches_scipy() {
+        let x = [0.0, 1.0, 2.5, 3.0, 4.5];
+        let y = [1.0, -0.5, 2.0, 0.25, 1.0];
+        let pts = [-0.5, 0.0, 0.5, 1.0, 1.75, 2.5, 2.75, 3.0, 4.0, 4.5, 5.25];
+        let close = |got: f64, want: f64| (got - want).abs() <= 1e-12 * want.abs().max(1.0);
+        let nak = [
+            -8.717757009345796,
+            -8.717757009345796,
+            -8.717757009345796,
+            -8.717757009345796,
+            -8.717757009345796,
+            15.70841121495328,
+            15.70841121495328,
+            15.708411214953262,
+            15.708411214953262,
+            15.708411214953262,
+            15.708411214953262,
+        ];
+        let (n0, n1, n2, n3) = (
+            7.215053763440862,
+            -12.39904420549582,
+            37.612903225806434,
+            -4.948626045400239,
+        );
+        let natural = [n0, n0, n0, n1, n1, n2, n2, n3, n3, n3, n3];
+        let (c0, c1, c2, c3) = (
+            20.735955056179776,
+            -15.086142322097377,
+            47.55056179775281,
+            -13.303370786516858,
+        );
+        let clamped = [c0, c0, c0, c1, c1, c2, c2, c3, c3, c3, c3];
+        let (p0, p1, p2, p3) = (
+            16.25531914893617,
+            -14.25145067698259,
+            45.36170212765957,
+            -11.705996131528046,
+        );
+        let periodic = [p3, p0, p0, p1, p1, p2, p2, p3, p3, p0, p0];
+        for (bc, want) in [
+            (SplineBc::NotAKnot, nak),
+            (SplineBc::Natural, natural),
+            (SplineBc::Clamped(0.5, -1.25), clamped),
+            (SplineBc::Periodic, periodic),
+        ] {
+            let spline = CubicSplineStandalone::new(&x, &y, bc).expect("cubic spline");
+            let d3 = spline.derivative(3);
+            let d4 = spline.derivative(4);
+            for (&q, &w) in pts.iter().zip(&want) {
+                let got = d3.eval(q);
+                assert!(close(got, w), "{bc:?} cs'''({q}) = {got}, scipy {w}");
+                assert_eq!(d4.eval(q), 0.0, "{bc:?} fourth derivative at {q}");
+            }
+        }
+        let natural_spline =
+            CubicSplineStandalone::new(&x, &y, SplineBc::Natural).expect("natural");
+        let d2 = natural_spline.derivative(2).eval(1.75);
+        assert!(close(d2, -2.0842293906810037), "natural cs''(1.75) = {d2}");
+    }
+
+    /// frankenscipy-llwlm item 2. `CubicSpline` required four points; scipy's `prepare_input`
+    /// needs two, and `CubicSpline.__init__` special-cases two and three: with two points,
+    /// not-a-knot and periodic ends become first-derivative conditions equal to the one slope; with
+    /// three, not-a-knot at both ends is the parabola through them and periodic has one common
+    /// slope `Σ(slope/h) / Σ(1/h)`; natural and clamped ends take the general system. scipy 1.17.1,
+    /// live, evaluated at [x0 - 0.7, x0, (x0 + x1)/2, x1, x[-1], x[-1] + 0.4]:
+    /// - x = [0.5, 2], y = [1, -2]: not-a-knot and natural 2.4, 1.0, -0.5, -2.0, -2.0, -2.8;
+    ///   clamped ((1, 0.5), (1, -1.25)) -1.7237777777777774, 1.0, -0.171875, -2.0, -2.0,
+    ///   -1.980888888888888;
+    /// - x = [0.5, 2, 2.75], y = [1, -2, 0.5]: not-a-knot 6.05037037037037, 1.0,
+    ///   -1.8333333333333328, -2.0, 0.5, 2.9237037037037035; natural 3.3734320987654316, 1.0,
+    ///   -1.5, -2.0, 0.5, 2.087753086419753; clamped -3.600296296296296, 1.0, -0.90625, -2.0,
+    ///   0.49999999999999956, -2.6951111111111086;
+    /// - periodic, x = [0.5, 2], y = [1.5, 1.5]: 1.5 everywhere; x = [0.5, 2, 2.75],
+    ///   y = [1, -2, 1]: 1.0 at 0.5, -0.5 at 1.25, -2.0 at 2, first derivative 2.0 at 0.5;
+    /// - one point raises "`x` must contain at least 2 elements.".
+    ///
+    /// Must-not-change: four points not-a-knot, x = [0, 1, 2.5, 3], y = [1, -0.5, 2, 0.25],
+    /// gives 8.44426666666667 at -0.7 and -0.7083333333333336 at 0.5; `interp1d(kind='cubic')`
+    /// (`make_interp_spline(k=3)`) still needs four points.
+    #[test]
+    fn cubic_spline_two_and_three_points_match_scipy() {
+        let close = |got: f64, want: f64| (got - want).abs() <= 1e-12 * want.abs().max(1.0);
+        let check = |x: &[f64], y: &[f64], bc: SplineBc, want: [f64; 6]| {
+            let n = x.len();
+            let q = [
+                x[0] - 0.7,
+                x[0],
+                0.5 * (x[0] + x[1]),
+                x[1],
+                x[n - 1],
+                x[n - 1] + 0.4,
+            ];
+            let spline = CubicSplineStandalone::new(x, y, bc).expect("few-point cubic spline");
+            let batch = spline.eval_many(&q);
+            for ((&qi, &w), &b) in q.iter().zip(&want).zip(&batch) {
+                let got = spline.eval(qi);
+                assert!(close(got, w), "n={n} {bc:?} cs({qi}) = {got}, scipy {w}");
+                assert!(close(b, w), "n={n} {bc:?} batch cs({qi}) = {b}, scipy {w}");
+            }
+        };
+        let (x2, y2) = ([0.5, 2.0], [1.0, -2.0]);
+        let line = [2.4, 1.0, -0.5, -2.0, -2.0, -2.8];
+        check(&x2, &y2, SplineBc::NotAKnot, line);
+        check(&x2, &y2, SplineBc::Natural, line);
+        check(
+            &x2,
+            &y2,
+            SplineBc::Clamped(0.5, -1.25),
+            [
+                -1.7237777777777774,
+                1.0,
+                -0.171875,
+                -2.0,
+                -2.0,
+                -1.980888888888888,
+            ],
+        );
+        let (x3, y3) = ([0.5, 2.0, 2.75], [1.0, -2.0, 0.5]);
+        check(
+            &x3,
+            &y3,
+            SplineBc::NotAKnot,
+            [
+                6.05037037037037,
+                1.0,
+                -1.8333333333333328,
+                -2.0,
+                0.5,
+                2.9237037037037035,
+            ],
+        );
+        check(
+            &x3,
+            &y3,
+            SplineBc::Natural,
+            [3.3734320987654316, 1.0, -1.5, -2.0, 0.5, 2.087753086419753],
+        );
+        check(
+            &x3,
+            &y3,
+            SplineBc::Clamped(0.5, -1.25),
+            [
+                -3.600296296296296,
+                1.0,
+                -0.90625,
+                -2.0,
+                0.49999999999999956,
+                -2.6951111111111086,
+            ],
+        );
+        let flat = CubicSplineStandalone::new(&x2, &[1.5, 1.5], SplineBc::Periodic)
+            .expect("two-point periodic");
+        for q in [0.5, 1.25, 2.0, 3.1] {
+            assert!(close(flat.eval(q), 1.5), "two-point periodic cs({q})");
+        }
+        let per = CubicSplineStandalone::new(&x3, &[1.0, -2.0, 1.0], SplineBc::Periodic)
+            .expect("three-point periodic");
+        for (q, w) in [(0.5, 1.0), (1.25, -0.5), (2.0, -2.0)] {
+            let got = per.eval(q);
+            assert!(
+                close(got, w),
+                "three-point periodic cs({q}) = {got}, scipy {w}"
+            );
+        }
+        let slope = per.derivative(1).eval(0.5);
+        assert!(close(slope, 2.0), "three-point periodic cs'(0.5) = {slope}");
+        assert!(matches!(
+            CubicSplineStandalone::new(&[0.5], &[1.0], SplineBc::NotAKnot),
+            Err(InterpError::TooFewPoints {
+                minimum: 2,
+                actual: 1
+            })
+        ));
+
+        let x4 = [0.0, 1.0, 2.5, 3.0];
+        let four = CubicSplineStandalone::new(&x4, &[1.0, -0.5, 2.0, 0.25], SplineBc::NotAKnot)
+            .expect("four points");
+        assert!(
+            close(four.eval(-0.7), 8.44426666666667),
+            "four-point cs(-0.7)"
+        );
+        assert!(
+            close(four.eval(0.5), -0.7083333333333336),
+            "four-point cs(0.5)"
+        );
+        let interp1d_cubic = Interp1d::new(
+            &x3,
+            &y3,
+            Interp1dOptions {
+                kind: InterpKind::CubicSpline,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            interp1d_cubic,
+            Err(InterpError::TooFewPoints {
+                minimum: 4,
+                actual: 3
+            })
+        ));
     }
 
     #[test]
