@@ -7608,10 +7608,14 @@ pub fn lgmres(
         let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
         let r_norm = vec_norm(&r);
 
-        if r_norm / b_norm < options.tol {
+        // SciPy's test, `r_norm <= max(atol, rtol * b_norm)` with atol = 0. It must be the
+        // SAME comparison as lgmres_inner's `r_norm <= tol` (tol = options.tol * b_norm): with
+        // the old strict `r_norm / b_norm < tol` an exact x0 at tol = 0 passed the inner test
+        // (0 <= 0, zero iterations) and failed this one (0 < 0), so the loop never advanced.
+        if r_norm <= options.tol * b_norm {
             return Ok(IterativeSolveResult {
                 solution: x,
-                // status: true residual ‖b − Ax‖/‖b‖ < tol
+                // status: true residual ‖b − Ax‖ <= tol·‖b‖
                 converged: true,
                 iterations: total_iter,
                 residual_norm: r_norm / b_norm,
@@ -7638,6 +7642,11 @@ pub fn lgmres(
             (max_iter - total_iter).min(inner_m),
             &outer_v,
         )?;
+        if iters == 0 {
+            // No inner progress is possible (the inner cycle judged r already converged);
+            // the verdict after the loop reads the true residual.
+            break;
+        }
         total_iter += iters;
 
         // Update solution: x = x + z
@@ -7668,13 +7677,13 @@ pub fn lgmres(
     }
 
     let ax = csr_matvec(a, &x);
-    let r_norm = vec_norm_diff(&ax, b) / b_norm;
+    let r_norm = vec_norm_diff(&ax, b);
     Ok(IterativeSolveResult {
         solution: x,
         // The last cycle may have converged exactly as the budget ran out.
-        converged: r_norm < options.tol,
+        converged: r_norm <= options.tol * b_norm,
         iterations: total_iter,
-        residual_norm: r_norm,
+        residual_norm: r_norm / b_norm,
     })
 }
 
@@ -29523,6 +29532,44 @@ mod tests {
         let result = lgmres(&a, &b, None, LgmresOptions::default()).expect("lgmres works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &b, 1e-10);
+    }
+
+    // tol = 0 with an exact x0: the old strict outer test (0 < 0) disagreed with the inner
+    // cycle's `r <= tol` (0 <= 0, zero iterations) and the outer loop spun forever. Run on a
+    // thread with a deadline so that regression FAILS instead of hanging the suite. SciPy:
+    // lgmres(I, [1, 2], x0=[1, 2], rtol=0) returns x0 with info 0.
+    #[test]
+    fn lgmres_exact_x0_at_zero_tolerance_terminates_converged() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let a = identity_csr(2);
+            let options = LgmresOptions {
+                tol: 0.0,
+                ..LgmresOptions::default()
+            };
+            let _ = tx.send(lgmres(&a, &[1.0, 2.0], Some(&[1.0, 2.0]), options));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("lgmres at tol = 0 with an exact x0 did not return")
+            .expect("lgmres works");
+        assert!(result.converged);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.solution, vec![1.0, 2.0]);
+
+        // Must-miss arm: a wrong x0 at tol = 0 is not reported converged for free.
+        let result = lgmres(
+            &diagonally_dominant_csr_3x3(),
+            &[7.0, 7.0, 7.0],
+            Some(&[0.0, 0.0, 0.0]),
+            LgmresOptions {
+                tol: 0.0,
+                max_iter: Some(2),
+                ..LgmresOptions::default()
+            },
+        )
+        .expect("lgmres works");
+        assert!(!result.converged || result.residual_norm == 0.0);
     }
 
     #[test]
