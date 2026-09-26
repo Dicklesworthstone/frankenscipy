@@ -120,6 +120,12 @@
   "diff_integrate_cumulative_trapezoid.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_integrate_dop853.rs": {
+    "COUNT_REL_TOL": 0.15,
+    "EXACT_RTOL_FACTOR_TOL": 50.0,
+    "RETURN_GAP_VS_SCIPY_TOL": 2.0,
+    "Y_SCALE_FACTOR_TOL": 1.0
+  },
   "diff_integrate_fixed_quad_gauss_legendre.rs": {
     "ABS_TOL": 1e-10
   },
@@ -165,6 +171,11 @@
   },
   "diff_integrate_solve_ivp_audit_equivalence.rs": {
     "ABS_TOL": 1e-15
+  },
+  "diff_integrate_solve_ivp_stiff.rs": {
+    "COUNT_REL_TOL": 0.01,
+    "EXACT_SCALE_FACTOR_TOL": 50.0,
+    "Y_SCALE_FACTOR_TOL": 1.0
   },
   "diff_integrate_tplquad.rs": {
     "ABS_TOL": 1e-6

@@ -620,9 +620,10 @@ impl RkSolver {
         let f0 = fun(config.t0, config.y0);
         validate_rhs_shape(f0.len(), n)?;
         validate_hardened_initial_rhs(config.mode, &f0)?;
-        let nfev = 1;
+        let mut nfev = 1;
 
-        // Determine initial step size
+        // Determine initial step size. SciPy's nfev counts the probe evaluation
+        // select_initial_step makes; so do we (it makes none on its early returns).
         let h_abs = if let Some(first_step) = config.first_step {
             validate_first_step(first_step, config.t0, config.t_bound)?
         } else {
@@ -638,7 +639,11 @@ impl RkSolver {
                 atol: atol.clone(),
                 mode: config.mode,
             };
-            select_initial_step(fun, &step_request)?
+            let mut counted = |t: f64, y: &[f64]| {
+                nfev += 1;
+                fun(t, y)
+            };
+            select_initial_step(&mut counted, &step_request)?
         };
 
         let error_exponent = -1.0 / (config.tableau.error_estimator_order as f64 + 1.0);
@@ -730,9 +735,9 @@ impl RkSolver {
         let f0 = fun_box(config.t0, config.y0);
         validate_rhs_shape(f0.len(), n)?;
         validate_hardened_initial_rhs(config.mode, &f0)?;
-        let nfev = 1;
+        let mut nfev = 1;
 
-        // Determine initial step size
+        // Determine initial step size (the probe evaluation counts, as in SciPy).
         let h_abs = if let Some(first_step) = config.first_step {
             validate_first_step(first_step, config.t0, config.t_bound)?
         } else {
@@ -748,7 +753,11 @@ impl RkSolver {
                 atol: atol.clone(),
                 mode: config.mode,
             };
-            select_initial_step(&mut *fun_box, &step_request)?
+            let mut counted = |t: f64, y: &[f64]| {
+                nfev += 1;
+                fun_box(t, y)
+            };
+            select_initial_step(&mut counted, &step_request)?
         };
 
         let error_exponent = -1.0 / (config.tableau.error_estimator_order as f64 + 1.0);

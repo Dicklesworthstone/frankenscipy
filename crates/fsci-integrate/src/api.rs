@@ -274,11 +274,13 @@ fn interpolate_state(
 
 /// Sample the solution at `t_sample` inside the step `(t_old, t_new)`.
 ///
-/// Prefers the solver's own dense output — for RK45 that is SciPy's quartic
-/// Dormand-Prince interpolant over all seven stage derivatives — and falls back
-/// to the generic cubic Hermite for solvers that do not provide one. The
+/// Prefers the solver's own dense output — for RK45 SciPy's quartic Dormand-Prince
+/// interpolant over all seven stage derivatives, for BDF SciPy's difference polynomial —
+/// and falls back to the generic cubic Hermite for solvers that do not provide one. The
 /// fallback is one order lower and drifts from SciPy's samples mid-step even
-/// when the step endpoints agree, which is frankenscipy-3m5ip.
+/// when the step endpoints agree, which is frankenscipy-3m5ip. A solver that neither has
+/// dense output nor evaluates derivatives (BDF before its first accepted step, i.e.
+/// finishing at once on `t0 == t_bound`) is interpolated linearly.
 // frankenscipy-3qjah. Private helper; every argument is a distinct piece of the
 // step being interpolated (solver, both endpoints' states and times, the sample
 // point, the derivative closure). Bundling them into a struct would add an
@@ -290,8 +292,8 @@ fn sample_state<S, F>(
     solver: &S,
     y_old: &[f64],
     y_new: &[f64],
-    f_old: &[f64],
-    f_new: &[f64],
+    f_old: Option<&[f64]>,
+    f_new: Option<&[f64]>,
     t_old: f64,
     t_new: f64,
     t_sample: f64,
@@ -301,7 +303,24 @@ where
 {
     solver
         .dense_output_at(t_sample)
-        .unwrap_or_else(|| interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t_sample))
+        .unwrap_or_else(|| match (f_old, f_new) {
+            (Some(f_old), Some(f_new)) => {
+                interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t_sample)
+            }
+            _ => {
+                let h = t_new - t_old;
+                let x = if h == 0.0 {
+                    1.0
+                } else {
+                    (t_sample - t_old) / h
+                };
+                y_old
+                    .iter()
+                    .zip(y_new)
+                    .map(|(a, b)| a + x * (b - a))
+                    .collect()
+            }
+        })
 }
 
 fn is_new_time_point(points: &[f64], candidate: f64) -> bool {
@@ -319,24 +338,19 @@ fn eval_time_in_range(t_eval: f64, t_old: f64, t_new: f64, direction: f64) -> bo
     }
 }
 
-// frankenscipy-3qjah. Same reasoning as `sample_state`: a private root-solve
-// over one step, where the arguments are the event identity, its closure, the
-// bracketing times and the state needed to evaluate it. Scoped allow, not a
-// crate-level one.
-#[allow(clippy::too_many_arguments)]
+/// Root of one event inside the step `(t_old, t_new)`, evaluated on the step's
+/// interpolant `interp` (the solver's dense output where it has one, as SciPy's
+/// `solve_event_equation` uses `sol`).
 fn solve_event_equation(
     event_index: usize,
     event_fn: EventFn,
     t_old: f64,
     t_new: f64,
-    y_old: &[f64],
-    y_new: &[f64],
-    f_old: &[f64],
-    f_new: &[f64],
+    interp: &dyn Fn(f64) -> Vec<f64>,
 ) -> Result<f64, IntegrateValidationError> {
     let saw_non_finite = std::cell::Cell::new(false);
     let f = |t: f64| {
-        let y = interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t);
+        let y = interp(t);
         let value = event_fn(t, &y);
         if value.is_finite() {
             value
@@ -368,7 +382,9 @@ trait IvpSolver<F> {
     fn step_with(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure>;
     fn t(&self) -> f64;
     fn y(&self) -> &[f64];
-    fn f(&self) -> &[f64];
+    /// The derivative at the current point, for solvers that evaluate it. BDF does not
+    /// (neither does SciPy's) and returns `None`; it provides `dense_output_at` instead.
+    fn f(&self) -> Option<&[f64]>;
     fn t_old(&self) -> Option<f64>;
     fn y_old(&self) -> Option<&[f64]>;
     fn f_old(&self) -> Option<&[f64]>;
@@ -377,8 +393,7 @@ trait IvpSolver<F> {
     fn nlu(&self) -> usize;
     fn ivp_state(&self) -> OdeSolverState;
     /// Solver-specific dense output at `t`, or `None` to fall back to the
-    /// generic cubic Hermite. Only RK45 provides one today; see
-    /// `RkSolver::dense_output_at` and frankenscipy-3m5ip.
+    /// generic cubic Hermite. RK45 (frankenscipy-3m5ip) and BDF provide SciPy's.
     fn dense_output_at(&self, _t: f64) -> Option<Vec<f64>> {
         None
     }
@@ -397,8 +412,8 @@ where
     fn y(&self) -> &[f64] {
         self.y()
     }
-    fn f(&self) -> &[f64] {
-        self.f()
+    fn f(&self) -> Option<&[f64]> {
+        Some(self.f())
     }
     fn t_old(&self) -> Option<f64> {
         self.t_old()
@@ -439,8 +454,8 @@ where
     fn y(&self) -> &[f64] {
         self.y()
     }
-    fn f(&self) -> &[f64] {
-        self.f()
+    fn f(&self) -> Option<&[f64]> {
+        None
     }
     fn t_old(&self) -> Option<f64> {
         self.t_old()
@@ -449,7 +464,7 @@ where
         self.y_old()
     }
     fn f_old(&self) -> Option<&[f64]> {
-        self.f_old()
+        None
     }
     fn nfev(&self) -> usize {
         self.nfev()
@@ -462,6 +477,9 @@ where
     }
     fn ivp_state(&self) -> OdeSolverState {
         self.state()
+    }
+    fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        self.dense_output_at(t)
     }
 }
 
@@ -478,8 +496,8 @@ where
     fn y(&self) -> &[f64] {
         self.y()
     }
-    fn f(&self) -> &[f64] {
-        self.f()
+    fn f(&self) -> Option<&[f64]> {
+        Some(self.f())
     }
     fn t_old(&self) -> Option<f64> {
         self.t_old()
@@ -488,7 +506,7 @@ where
         self.y_old()
     }
     fn f_old(&self) -> Option<&[f64]> {
-        self.f_old()
+        None
     }
     fn nfev(&self) -> usize {
         self.nfev()
@@ -501,6 +519,9 @@ where
     }
     fn ivp_state(&self) -> OdeSolverState {
         self.state()
+    }
+    fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        self.dense_output_at(t)
     }
 }
 
@@ -674,10 +695,10 @@ where
         }
     }
 
-    fn f(&self) -> &[f64] {
+    fn f(&self) -> Option<&[f64]> {
         match &self.mode {
-            LsodaMode::Adams(rk) => rk.f(),
-            LsodaMode::Bdf(bdf) => bdf.f(),
+            LsodaMode::Adams(rk) => Some(rk.f()),
+            LsodaMode::Bdf(_) => None,
         }
     }
 
@@ -698,7 +719,7 @@ where
     fn f_old(&self) -> Option<&[f64]> {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.f_old(),
-            LsodaMode::Bdf(bdf) => bdf.f_old(),
+            LsodaMode::Bdf(_) => None,
         }
     }
 
@@ -728,6 +749,13 @@ where
         match &self.mode {
             LsodaMode::Adams(rk) => rk.state(),
             LsodaMode::Bdf(bdf) => bdf.state(),
+        }
+    }
+
+    fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        match &self.mode {
+            LsodaMode::Adams(rk) => rk.dense_output_at(t),
+            LsodaMode::Bdf(bdf) => bdf.dense_output_at(t),
         }
     }
 }
@@ -789,10 +817,23 @@ where
             Ok(outcome) => {
                 let t = solver.t();
                 let y = solver.y().to_vec();
-                let f = solver.f().to_vec();
+                let f = solver.f().map(<[f64]>::to_vec);
                 let t_old = solver.t_old().unwrap_or(t0);
                 let y_old = solver.y_old().unwrap_or(options.y0).to_vec();
-                let f_old = solver.f_old().unwrap_or(&f).to_vec();
+                let f_old = solver.f_old().map(<[f64]>::to_vec).or_else(|| f.clone());
+                // The step's interpolant, for t_eval samples AND event roots.
+                let interp = |te: f64| {
+                    sample_state(
+                        &solver,
+                        &y_old,
+                        &y,
+                        f_old.as_deref(),
+                        f.as_deref(),
+                        t_old,
+                        t,
+                        te,
+                    )
+                };
 
                 let mut terminal_event: Option<(f64, Vec<f64>)> = None;
 
@@ -804,18 +845,8 @@ where
                     for (i, ev_spec) in evs.iter().enumerate() {
                         let val = validate_event_value(i, (ev_spec.func)(t, &y))?;
                         if event_active(old_vals[i], val, ev_spec.direction) {
-                            let t_ev = solve_event_equation(
-                                i,
-                                ev_spec.func,
-                                t_old,
-                                t,
-                                &y_old,
-                                &y,
-                                &f_old,
-                                &f,
-                            )?;
-                            let y_ev =
-                                sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, t_ev);
+                            let t_ev = solve_event_equation(i, ev_spec.func, t_old, t, &interp)?;
+                            let y_ev = interp(t_ev);
 
                             if let Some(tes) = t_events.as_mut() {
                                 tes[i].push(t_ev);
@@ -856,7 +887,7 @@ where
                                 break;
                             }
                             ts.push(te);
-                            ys.push(sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, te));
+                            ys.push(interp(te));
                             next_t_eval_index += 1;
                         }
                     }
@@ -884,7 +915,7 @@ where
                         }
 
                         ts.push(te);
-                        ys.push(sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, te));
+                        ys.push(interp(te));
                         next_t_eval_index += 1;
                     }
                 } else if is_new_time_point(&ts, t) {

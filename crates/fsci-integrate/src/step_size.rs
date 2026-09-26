@@ -179,6 +179,110 @@ where
     Ok(final_h)
 }
 
+/// Finite-difference Jacobian of `fun` at `(t, y)`, SciPy's `_ivp.common.num_jac` (dense
+/// path), for the implicit solvers.
+///
+/// `f` is `fun(t, y)`; `threshold` is the solver's `atol` (per component). `factor` is the
+/// per-column relative step SciPy carries between calls as `jac_factor`: `None` starts at
+/// `sqrt(eps)`, and it is updated in place. Each column steps `h_j = (y_j + factor_j ·
+/// y_scale_j) - y_j` in the direction `f_j` points, with `y_scale_j = max(threshold_j, |y_j|)`.
+/// A column whose largest difference is below `eps^0.875` of the function's magnitude is
+/// retried with a 10x larger factor and the retry is kept if its relative difference is
+/// larger. The factor then grows 10x if the difference is below `eps^0.75`, shrinks 10x if
+/// above `eps^0.25`, and never falls below `1000·eps`. The evaluations are NOT counted in
+/// `nfev` (SciPy's `fun_vectorized` bypasses its counter).
+// Column-indexed arithmetic over several parallel per-column arrays, as in SciPy.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn num_jac<F>(
+    fun: &mut F,
+    t: f64,
+    y: &[f64],
+    f: &[f64],
+    threshold: &[f64],
+    factor: &mut Option<Vec<f64>>,
+) -> nalgebra::DMatrix<f64>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
+{
+    let n = y.len();
+    if n == 0 {
+        return nalgebra::DMatrix::zeros(0, 0);
+    }
+    let diff_reject = f64::EPSILON.powf(0.875);
+    let diff_small = f64::EPSILON.powf(0.75);
+    let diff_big = f64::EPSILON.powf(0.25);
+    let min_factor = 1e3 * f64::EPSILON;
+
+    let mut fac = factor
+        .take()
+        .unwrap_or_else(|| vec![f64::EPSILON.powf(0.5); n]);
+    let mut y_scale = vec![0.0; n];
+    let mut h = vec![0.0; n];
+    for j in 0..n {
+        let sign = if f[j] >= 0.0 { 1.0 } else { -1.0 };
+        y_scale[j] = sign * threshold[j].max(y[j].abs());
+        h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
+        while h[j] == 0.0 {
+            fac[j] *= 10.0;
+            h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
+        }
+    }
+
+    // One column: fun at y + h_j e_j, its difference from f, and the row of the largest
+    // |difference| (the first such row, as numpy's argmax).
+    let column = |fun: &mut F, j: usize, hj: f64| {
+        let mut yj = y.to_vec();
+        yj[j] += hj;
+        let f_new = fun(t, &yj);
+        let diff: Vec<f64> = f_new.iter().zip(f).map(|(a, b)| a - b).collect();
+        let mut max_ind = 0;
+        for i in 1..n {
+            if diff[i].abs() > diff[max_ind].abs() {
+                max_ind = i;
+            }
+        }
+        let max_diff = diff[max_ind].abs();
+        let scale = f[max_ind].abs().max(f_new[max_ind].abs());
+        (diff, max_diff, scale)
+    };
+
+    let mut diffs = Vec::with_capacity(n);
+    let mut max_diff = vec![0.0; n];
+    let mut scale = vec![0.0; n];
+    for j in 0..n {
+        let (d, md, s) = column(fun, j, h[j]);
+        diffs.push(d);
+        max_diff[j] = md;
+        scale[j] = s;
+    }
+    for j in 0..n {
+        if max_diff[j] < diff_reject * scale[j] {
+            let new_factor = 10.0 * fac[j];
+            let h_new = (y[j] + new_factor * y_scale[j]) - y[j];
+            let (d, md, s) = column(fun, j, h_new);
+            if max_diff[j] * s < md * scale[j] {
+                fac[j] = new_factor;
+                h[j] = h_new;
+                diffs[j] = d;
+                scale[j] = s;
+                max_diff[j] = md;
+            }
+        }
+    }
+
+    let jac = nalgebra::DMatrix::from_fn(n, n, |i, j| diffs[j][i] / h[j]);
+    for j in 0..n {
+        if max_diff[j] < diff_small * scale[j] {
+            fac[j] *= 10.0;
+        } else if max_diff[j] > diff_big * scale[j] {
+            fac[j] *= 0.1;
+        }
+        fac[j] = fac[j].max(min_factor);
+    }
+    *factor = Some(fac);
+    jac
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

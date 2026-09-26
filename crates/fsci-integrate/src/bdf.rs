@@ -12,6 +12,7 @@
 //! own genuine Radau IIA solver (see `radau.rs`).
 
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
+use crate::step_size::{InitialStepRequest, num_jac, select_initial_step};
 use crate::validation::{
     ToleranceValue, validate_first_step, validate_max_step, validate_rhs_shape, validate_tol,
 };
@@ -332,8 +333,16 @@ const MAX_FACTOR: f64 = 10.0;
 
 /// Empirical `kappa` constants (scipy `_bdf.py`), indices 0..=5.
 const KAPPA: [f64; 6] = [0.0, -0.1850, -1.0 / 9.0, -0.0823, -0.0415, 0.0];
-/// `gamma[i] = Σ_{k=1}^{i} 1/k`, `gamma[0] = 0`.
-const GAMMA_C: [f64; 6] = [0.0, 1.0, 1.5, 11.0 / 6.0, 25.0 / 12.0, 137.0 / 60.0];
+/// `gamma[i] = Σ_{k=1}^{i} 1/k`, `gamma[0] = 0`, accumulated left to right as SciPy's
+/// `np.cumsum(1 / np.arange(1, 6))` does. The rounded `25/12` is one ulp above that sum.
+const GAMMA_C: [f64; 6] = [
+    0.0,
+    1.0,
+    1.0 + 1.0 / 2.0,
+    1.0 + 1.0 / 2.0 + 1.0 / 3.0,
+    1.0 + 1.0 / 2.0 + 1.0 / 3.0 + 1.0 / 4.0,
+    1.0 + 1.0 / 2.0 + 1.0 / 3.0 + 1.0 / 4.0 + 1.0 / 5.0,
+];
 /// `alpha[i] = (1 - kappa[i]) * gamma[i]` — the BDF leading coefficient.
 const ALPHA_C: [f64; 6] = [
     (1.0 - KAPPA[0]) * GAMMA_C[0],
@@ -436,6 +445,14 @@ pub struct BdfSolverConfig<'a> {
     pub max_order: usize,
 }
 
+/// SciPy's `BdfDenseOutput(t_old, t, h, order, D[:order + 1])` for one accepted step.
+struct BdfDense {
+    t: f64,
+    h: f64,
+    order: usize,
+    d: Vec<Vec<f64>>,
+}
+
 /// BDF solver for stiff ODE systems.
 pub struct BdfSolver {
     n: usize,
@@ -457,14 +474,17 @@ pub struct BdfSolver {
     nlu: usize,
     mode: RuntimeMode,
 
-    f: Vec<f64>,
-    f_old: Option<Vec<f64>>,
-
     // Nordsieck-style array: d[k] for k = 0..order
     d: Vec<Vec<f64>>,
 
-    // Newton solver state
+    // Newton solver state. The Jacobian is SciPy's finite-difference `num_jac`, first taken
+    // at (t0, y0) in `new` and refreshed at most once per step, when Newton fails on it.
     current_jac: Option<DMatrix<f64>>,
+    /// SciPy's `jac_factor`: the per-column relative difference step `num_jac` carries
+    /// from one Jacobian to the next.
+    jac_factor: Option<Vec<f64>>,
+    /// SciPy's `BdfDenseOutput` for the last accepted step.
+    dense: Option<BdfDense>,
     /// `current_jac`'s diagonal entries when that Jacobian is EXACTLY diagonal, else
     /// `None`. Computed once per Jacobian (`njev`) and consumed once per factorization
     /// (`nlu`) — see [`newton_denominators`]. Mirrors `RadauSolver::jac_diagonal`.
@@ -473,10 +493,15 @@ pub struct BdfSolver {
     /// Same cadence as `jac_diagonal`: computed per Jacobian, consumed per factorization.
     jac_band: Option<(usize, usize)>,
     /// Factorization of `I − c·J`: dense LU, or the diagonal itself when `J` is
-    /// exactly diagonal (see [`NewtonFactor`]).
+    /// exactly diagonal (see [`NewtonFactor`]). As in SciPy it is dropped where the step
+    /// size changes for a reason other than an error rejection; after an error rejection
+    /// the next attempt keeps the factorization of the previous `c` (SciPy: "As we didn't
+    /// have problems with convergence, we don't reset LU here").
     lu: Option<NewtonFactor>,
-    /// The value of `c = h/alpha[order]` for which `lu` was factorized.
-    lu_c: Option<f64>,
+    /// The `c` that `lu` factorizes `I − c·J` for. It can differ from the current step's
+    /// `c` after an error rejection; the diagonal factor's non-finite fallback rebuilds the
+    /// dense system from it, so the two arms stay the same computation.
+    lu_c: f64,
     /// This solver's Newton factorizations that took the diagonal / banded path. The global
     /// [`BDF_DIAG_NEWTON_HITS`] / [`BDF_BAND_NEWTON_HITS`] sum over every solver in the
     /// process, so a test reading them races every other BDF solve running beside it
@@ -528,27 +553,41 @@ impl BdfSolver {
             ToleranceValue::Vector(v) => v.clone(),
         };
 
-        let h_mag = match config.first_step {
-            Some(h) => h,
-            None => select_initial_step_bdf(
-                fun,
-                config.t0,
-                config.y0,
-                direction,
-                config.rtol,
-                &atol_vec,
-                config.mode,
-            )?
-            .min(config.max_step),
-        };
-        let h = h_mag * direction;
-
+        // SciPy's order: f0 = fun(t0, y0), then select_initial_step(..., order = 1), whose
+        // probe evaluation counts toward nfev. The private BDF step selector this replaces
+        // evaluated f0 a second time, reported nfev = 1 for three calls, and skipped SciPy's
+        // interval-length caps.
         let y0 = config.y0.to_vec();
         let f0 = fun(config.t0, &y0);
         validate_rhs_shape(f0.len(), n)?;
         if config.mode == RuntimeMode::Hardened && !f0.iter().all(|value| value.is_finite()) {
             return Err(crate::IntegrateValidationError::NonFiniteF0);
         }
+        let mut nfev = 1;
+
+        let h_mag = match config.first_step {
+            Some(h) => h,
+            None => {
+                let request = InitialStepRequest {
+                    t0: config.t0,
+                    y0: config.y0,
+                    t_bound: config.t_bound,
+                    max_step: config.max_step,
+                    f0: &f0,
+                    direction,
+                    order: 1.0,
+                    rtol: config.rtol,
+                    atol: config.atol.clone(),
+                    mode: config.mode,
+                };
+                let mut counted = |t: f64, y: &[f64]| {
+                    nfev += 1;
+                    fun(t, y)
+                };
+                select_initial_step(&mut counted, &request)?
+            }
+        };
+        let h = h_mag * direction;
 
         // Backward-difference array D[0..=MAX_ORDER+2]: D[0] = y, D[1] = h*f, rest 0.
         let mut d = vec![vec![0.0; n]; MAX_ORDER + 3];
@@ -556,6 +595,17 @@ impl BdfSolver {
         for (j, d1j) in d[1].iter_mut().enumerate() {
             *d1j = h * f0[j];
         }
+
+        // SciPy's BDF.__init__ takes the first Jacobian here, at (t0, y0): njev = 1 before
+        // the first step, and its evaluations are not counted in nfev.
+        let mut jac_factor = None;
+        let jac = num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor);
+        let jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
+        let jac_band = if jac_diagonal.is_some() {
+            None
+        } else {
+            jacobian_bandwidth(&jac)
+        };
 
         Ok(Self {
             n,
@@ -571,18 +621,18 @@ impl BdfSolver {
             max_order: config.max_order.min(MAX_ORDER),
             n_equal_steps: 0,
             state: OdeSolverState::Running,
-            nfev: 1,
-            njev: 0,
+            nfev,
+            njev: 1,
             nlu: 0,
             mode: config.mode,
-            f: f0.clone(),
-            f_old: None,
             d,
-            current_jac: None,
-            jac_diagonal: None,
-            jac_band: None,
+            current_jac: Some(jac),
+            jac_factor,
+            dense: None,
+            jac_diagonal,
+            jac_band,
             lu: None,
-            lu_c: None,
+            lu_c: 0.0,
             diag_factorizations: 0,
             band_factorizations: 0,
             t_old: None,
@@ -618,20 +668,33 @@ impl BdfSolver {
         self.nlu
     }
 
-    pub fn f(&self) -> &[f64] {
-        &self.f
-    }
-
-    pub fn f_old(&self) -> Option<&[f64]> {
-        self.f_old.as_deref()
-    }
-
     pub fn state(&self) -> OdeSolverState {
         self.state
     }
 
     pub fn mode(&self) -> RuntimeMode {
         self.mode
+    }
+
+    /// SciPy's `BdfDenseOutput` for the last accepted step at `t`: the interpolating
+    /// polynomial held in the difference array, `D[0] + Σ_k D[k] · Π_{i<k} (t - t_i)/(h·(i+1))`
+    /// with `t_i = t_n - i·h`. `None` before the first accepted step.
+    pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        let dense = self.dense.as_ref()?;
+        // SciPy: y = np.dot(D[1:].T, cumprod(x)) + D[0], summed in that order.
+        let mut p = 1.0;
+        let mut y = vec![0.0; dense.d[0].len()];
+        for k in 1..=dense.order {
+            let i = (k - 1) as f64;
+            p *= (t - (dense.t - dense.h * i)) / (dense.h * (1.0 + i));
+            for (yj, dkj) in y.iter_mut().zip(&dense.d[k]) {
+                *yj += dkj * p;
+            }
+        }
+        for (yj, d0j) in y.iter_mut().zip(&dense.d[0]) {
+            *yj += d0j;
+        }
+        Some(y)
     }
 
     /// Perform one adaptive BDF step.
@@ -648,7 +711,7 @@ impl BdfSolver {
         if self.n == 0 || self.t == self.t_bound {
             self.t_old = Some(self.t);
             self.y_old = Some(self.y.clone());
-            self.f_old = Some(self.f.clone());
+            self.dense = None;
             self.t = self.t_bound;
             self.state = OdeSolverState::Finished;
             return Ok(StepOutcome {
@@ -671,7 +734,8 @@ impl BdfSolver {
         // predictor from the backward-difference array D, modified-Newton corrector
         // on (I − c·J) with a lazy Jacobian, error/step/order control via change_D.
         let n = self.n;
-        let newton_tol = (10.0 * f64::EPSILON / self.rtol).max(0.03_f64.min(self.rtol.sqrt()));
+        // SciPy: max(10 * EPS / rtol, min(0.03, rtol ** 0.5)), with `pow`, not `sqrt`.
+        let newton_tol = (10.0 * f64::EPSILON / self.rtol).max(0.03_f64.min(self.rtol.powf(0.5)));
 
         let spacing = if self.direction > 0.0 {
             self.t.next_up() - self.t
@@ -702,6 +766,9 @@ impl BdfSolver {
         let mut scale = vec![0.0; n];
         let mut n_iter = 1usize;
         let mut reached_bound;
+        // SciPy's `current_jac`: whether the Jacobian was refreshed during THIS step call.
+        // It survives step-size retries, so a step refreshes the Jacobian at most once.
+        let mut jac_fresh = false;
 
         loop {
             if h_abs < min_step {
@@ -731,37 +798,25 @@ impl BdfSolver {
             for j in 0..n {
                 scale[j] = self.atol[j] + self.rtol * y_predict[j].abs();
             }
-            let inv_alpha = 1.0 / ALPHA_C[order];
+            // SciPy: psi = np.dot(D[1:order + 1].T, gamma[1:order + 1]) / alpha[order] and
+            // c = h / alpha[order], rounded as SciPy rounds them.
             let mut psi = vec![0.0; n];
             for k in 1..=order {
-                let g = GAMMA_C[k] * inv_alpha;
                 for (p, &dkj) in psi.iter_mut().zip(self.d[k].iter()) {
-                    *p += g * dkj;
+                    *p += dkj * GAMMA_C[k];
                 }
             }
-            let c = h * inv_alpha;
+            for p in &mut psi {
+                *p /= ALPHA_C[order];
+            }
+            let c = h / ALPHA_C[order];
 
-            // Modified-Newton with lazy Jacobian refresh.
+            // Modified Newton on `I - c·J` (SciPy's inner `while not converged`). The LU is
+            // rebuilt only when it has been dropped; a failure on a Jacobian that is not
+            // fresh this step refreshes it at (t_new, y_predict) and retries once.
             let mut converged = false;
-            let mut jac_recomputed = false;
             loop {
-                if self.current_jac.is_none() {
-                    let f_pred = fun(t_new, &y_predict);
-                    self.nfev += 1;
-                    let jac = self.compute_jacobian(fun, t_new, &y_predict, &f_pred);
-                    // The O(n²) structural scan runs HERE, once per Jacobian, not once
-                    // per factorization — see `newton_denominators`.
-                    self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
-                    self.jac_band = if self.jac_diagonal.is_some() {
-                        None // the diagonal path is strictly better; do not double-scan.
-                    } else {
-                        jacobian_bandwidth(&jac)
-                    };
-                    self.current_jac = Some(jac);
-                    self.lu = None;
-                    jac_recomputed = true;
-                }
-                if self.lu.is_none() || self.lu_c != Some(c) {
+                if self.lu.is_none() {
                     let jac = self.current_jac.as_ref().expect("jacobian present");
                     // Structure-exploiting factorization: an exactly-diagonal Jacobian
                     // makes `I − c·J` diagonal, so the O(n³) LU collapses to `n`
@@ -841,7 +896,7 @@ impl BdfSolver {
                             }
                         }
                     });
-                    self.lu_c = Some(c);
+                    self.lu_c = c;
                     self.nlu += 1;
                 }
                 match self.newton_bdf(fun, t_new, &y_predict, c, &psi, &scale, newton_tol) {
@@ -854,12 +909,31 @@ impl BdfSolver {
                         break;
                     }
                     None => {
-                        if jac_recomputed {
-                            break; // Jacobian already fresh — give up, shrink step.
+                        if jac_fresh {
+                            break; // Jacobian already fresh this step: shrink the step.
                         }
-                        self.current_jac = None; // force recompute next pass.
-                        self.jac_diagonal = None; // stays in lockstep with `current_jac`.
-                        self.jac_band = None;
+                        // SciPy's jac_wrapped: f at the point (not counted in nfev), then
+                        // num_jac. The O(n²) structural scan runs once per Jacobian, not
+                        // once per factorization — see `newton_denominators`.
+                        let f_pred = fun(t_new, &y_predict);
+                        let jac = num_jac(
+                            fun,
+                            t_new,
+                            &y_predict,
+                            &f_pred,
+                            &self.atol,
+                            &mut self.jac_factor,
+                        );
+                        self.njev += 1;
+                        self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
+                        self.jac_band = if self.jac_diagonal.is_some() {
+                            None // the diagonal path is strictly better; do not double-scan.
+                        } else {
+                            jacobian_bandwidth(&jac)
+                        };
+                        self.current_jac = Some(jac);
+                        self.lu = None;
+                        jac_fresh = true;
                     }
                 }
             }
@@ -886,19 +960,18 @@ impl BdfSolver {
                 h_abs *= factor;
                 change_d(&mut self.d, order, factor, n);
                 self.n_equal_steps = 0;
-                self.lu = None;
+                // The LU is kept: SciPy's "As we didn't have problems with convergence, we
+                // don't reset LU here", so the retry runs Newton on the previous c's LU.
             } else {
-                // Step accepted.
+                // Step accepted. No derivative is evaluated at the new point: SciPy's BDF
+                // does not, and the dense output below needs none.
                 self.t_old = Some(self.t);
                 self.y_old = Some(self.y.clone());
-                self.f_old = Some(self.f.clone());
 
                 self.n_equal_steps += 1;
                 self.t = t_new;
                 self.y = y_new.clone();
                 self.h = h_abs * self.direction;
-                self.f = fun(t_new, &y_new);
-                self.nfev += 1;
 
                 // Update the difference array.
                 for j in 0..n {
@@ -956,6 +1029,14 @@ impl BdfSolver {
                     self.n_equal_steps = 0;
                     self.lu = None;
                 }
+                // SciPy builds the step's dense output after this: from the rescaled D, the
+                // new order and the new step size.
+                self.dense = Some(BdfDense {
+                    t: self.t,
+                    h: self.h,
+                    order: self.order,
+                    d: self.d[..=self.order].to_vec(),
+                });
 
                 let state = if reached_bound {
                     self.state = OdeSolverState::Finished;
@@ -1048,9 +1129,10 @@ impl BdfSolver {
                     }
                     if !finite {
                         let jac = self.current_jac.as_ref()?;
+                        let lu_c = self.lu_c;
                         let lu = DMatrix::<f64>::from_fn(n, n, |row, col| {
                             let unit = if row == col { 1.0 } else { 0.0 };
-                            unit - c * jac[(row, col)]
+                            unit - lu_c * jac[(row, col)]
                         })
                         .lu();
                         for j in 0..n {
@@ -1083,105 +1165,6 @@ impl BdfSolver {
             dy_norm_old = Some(dy_norm);
         }
         None
-    }
-
-    fn compute_jacobian<F>(&mut self, fun: &mut F, t: f64, y: &[f64], f0: &[f64]) -> DMatrix<f64>
-    where
-        F: FnMut(f64, &[f64]) -> Vec<f64>,
-    {
-        let eps = f64::EPSILON.sqrt();
-        let mut jac = DMatrix::<f64>::zeros(self.n, self.n);
-        let mut y_perturbed = y.to_vec();
-
-        for col in 0..self.n {
-            let perturb = eps * y[col].abs().max(1.0);
-            y_perturbed[col] += perturb;
-            let f_perturbed = fun(t, &y_perturbed);
-            self.nfev += 1;
-            for row in 0..self.n {
-                jac[(row, col)] = (f_perturbed[row] - f0[row]) / perturb;
-            }
-            y_perturbed[col] = y[col];
-        }
-
-        self.njev += 1;
-        jac
-    }
-}
-
-/// Select initial step size for BDF solver.
-pub(crate) fn select_initial_step_bdf<F>(
-    fun: &mut F,
-    t0: f64,
-    y0: &[f64],
-    direction: f64,
-    rtol: f64,
-    atol: &[f64],
-    mode: RuntimeMode,
-) -> Result<f64, crate::IntegrateValidationError>
-where
-    F: FnMut(f64, &[f64]) -> Vec<f64>,
-{
-    let f0 = fun(t0, y0);
-    let n = y0.len();
-    validate_rhs_shape(f0.len(), n)?;
-    if mode == RuntimeMode::Hardened && !f0.iter().all(|value| value.is_finite()) {
-        return Err(crate::IntegrateValidationError::NonFiniteF0);
-    }
-
-    let mut d0 = 0.0_f64;
-    let mut d1 = 0.0_f64;
-    for j in 0..n {
-        let scale = atol[j] + rtol * y0[j].abs();
-        d0 += (y0[j] / scale) * (y0[j] / scale);
-        d1 += (f0[j] / scale) * (f0[j] / scale);
-    }
-    d0 = (d0 / n as f64).sqrt();
-    d1 = (d1 / n as f64).sqrt();
-
-    let h0 = if d0 < 1e-5 || d1 < 1e-5 {
-        1e-6
-    } else {
-        0.01 * d0 / d1
-    };
-
-    let y1: Vec<f64> = y0
-        .iter()
-        .zip(f0.iter())
-        .map(|(yi, fi)| yi + direction * h0 * fi)
-        .collect();
-    let f1 = fun(t0 + direction * h0, &y1);
-    validate_rhs_shape(f1.len(), n)?;
-    if mode == RuntimeMode::Hardened && !f1.iter().all(|value| value.is_finite()) {
-        return Err(crate::IntegrateValidationError::NonFiniteF0);
-    }
-
-    let mut d2 = 0.0_f64;
-    for j in 0..n {
-        let scale = atol[j] + rtol * y0[j].abs();
-        d2 += ((f1[j] - f0[j]) / scale) * ((f1[j] - f0[j]) / scale);
-    }
-    d2 = (d2 / n as f64).sqrt() / h0;
-
-    let max_d = if d1.is_nan() || d2.is_nan() {
-        f64::NAN
-    } else {
-        d1.max(d2)
-    };
-    let h1 = if max_d <= 1e-15 || max_d.is_nan() {
-        if h0.is_nan() {
-            f64::NAN
-        } else {
-            (h0 * 1e-3).max(1e-6)
-        }
-    } else {
-        (0.01 / max_d).powf(0.5)
-    };
-
-    if h0.is_nan() || h1.is_nan() {
-        Ok(f64::NAN)
-    } else {
-        Ok((100.0 * h0).min(h1))
     }
 }
 
@@ -1684,9 +1667,21 @@ mod tests {
     }
 
     #[test]
-    fn select_initial_step_bdf_hardened_rejects_non_finite_probe_rhs() {
+    fn bdf_initial_step_probe_is_hardened_and_counted_like_scipy() {
+        let config = |mode| BdfSolverConfig {
+            t0: 0.0,
+            y0: &[1.0],
+            t_bound: 1.0,
+            rtol: 1e-6,
+            atol: ToleranceValue::Scalar(1e-8),
+            max_step: f64::INFINITY,
+            first_step: None,
+            mode,
+            max_order: 5,
+        };
+        // Must-fail arm: the probe evaluation (the second call) returns NaN.
         let mut calls = 0;
-        let mut fun = |_t: f64, _y: &[f64]| {
+        let mut nan_probe = |_t: f64, _y: &[f64]| {
             calls += 1;
             if calls == 1 {
                 vec![1.0]
@@ -1694,18 +1689,28 @@ mod tests {
                 vec![f64::NAN]
             }
         };
+        match BdfSolver::new(&mut nan_probe, config(RuntimeMode::Hardened)) {
+            Ok(_) => panic!("non-finite BDF probe RHS should fail"),
+            Err(err) => assert_eq!(err, crate::IntegrateValidationError::NonFiniteF0),
+        }
 
-        let err = select_initial_step_bdf(
-            &mut fun,
-            0.0,
-            &[1.0],
-            1.0,
-            1e-6,
-            &[1e-8],
-            RuntimeMode::Hardened,
-        )
-        .expect_err("non-finite BDF probe RHS should fail");
-        assert_eq!(err, crate::IntegrateValidationError::NonFiniteF0);
+        // SciPy's BDF.__init__ makes two counted calls, f(t0, y0) and the
+        // select_initial_step probe, and reports nfev = 2; its first Jacobian (njev = 1)
+        // costs uncounted calls, one per column here. The private selector this replaced
+        // made three calls, reported nfev = 1 and took no Jacobian until the first step.
+        let mut calls = 0;
+        let mut decay = |_t: f64, y: &[f64]| {
+            calls += 1;
+            vec![-y[0]]
+        };
+        let solver = BdfSolver::new(&mut decay, config(RuntimeMode::Strict)).expect("BDF init");
+        assert_eq!(solver.nfev(), 2);
+        assert_eq!(solver.njev(), 1);
+        assert_eq!(calls, 3);
+        // scipy.integrate.BDF(lambda t, y: -y, 0, [1.0], 1.0, rtol=1e-6, atol=1e-8).h_abs,
+        // pinned SciPy 1.17.1 (the selector's order-1 exponent: (0.01 / d2)^(1/2)).
+        let scipy_h_abs = 1.004_987_562_112_088_6e-4;
+        assert!((solver.h.abs() - scipy_h_abs).abs() <= 1e-14 * scipy_h_abs);
     }
 
     #[test]
