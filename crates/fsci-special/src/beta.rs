@@ -571,6 +571,38 @@ pub fn fdtridfd(dfn: f64, p: f64, x: f64) -> f64 {
 /// every family.
 pub(crate) const POISSON_INDEX_LIMIT: f64 = 9_007_199_254_740_992.0;
 
+/// Step cap for the upward half of the noncentral Poisson walks: `max(100_000, ⌈40·√λ⌉)`.
+///
+/// [`ncfdtr`], [`ncfdtrc`], [`nctdtr`], [`crate::gamma::chndtr`] and
+/// [`crate::gamma::chndtrc`] walk down from `j₀` until `j` reaches 0 or the relative weight
+/// test fires, so that half bounds itself. The upward half has no floor, so it also carries a
+/// step cap. That cap used to be a fixed 100,000. The upward walk needs about `7–9·√λ` steps
+/// before its relative test fires, so from about `λ = 1.2e8` the fixed cap cut the sum off
+/// with mass still unsummed (frankenscipy-g9yid). A float transliteration of each walk was
+/// measured at `x` = mean and mean ± 3 sd against SciPy 1.17.1. Where SciPy returns NaN
+/// (ncfdtr and nctdtr at λ = 1e10), it was measured against a per-term sum that has no
+/// recurrence and no cap:
+///
+/// ```text
+/// λ = nc/2 (χ², F) or nc²/2 (t)     capped?   worst relative error of the capped walk
+/// 1e6, 1e7, 1e8                    no        none (the cap was not reached)
+/// 2e8                              yes       ≤ 1e-9; the dropped terms were below rounding
+/// 1e9                              yes       6e-4 (chndtr), 0.13 (chndtrc), 8e-4 (F, t)
+/// 1e10                             yes       0.16 (chndtr), 0.97 (chndtrc), 0.16 (F, t)
+/// ```
+///
+/// For example, SciPy gives `chndtr(2.00008e10, 3, 2e10) = 0.99766`, and the capped walk gave
+/// 0.84124. With this cap the walk ends on its own stop tests at every measured point: the
+/// relative test fires after about `9·√λ` steps near the mean and up to `17·√λ` steps 10 sd
+/// into the left tail. The absolute test `w < 1e-300` fires by about `37·√λ` steps, since
+/// `w/w₀ ≈ exp(−k²/2λ)` and `w₀ ≈ 1/√(2πλ)`. So the cap is never the exit that ends a finite
+/// walk. It only bounds a walk whose stop tests cannot fire, such as one with NaN weights, and
+/// it stays finite because `j₀ < POISSON_INDEX_LIMIT` is checked before any walk starts.
+/// Below `λ = 6.25e6` the cap is the old 100,000, so small-`λ` results are unchanged.
+pub(crate) fn poisson_upward_step_cap(lam: f64) -> f64 {
+    (40.0 * lam.sqrt()).ceil().max(100_000.0)
+}
+
 /// Non-central F cumulative distribution function.
 ///
 /// Matches `scipy.special.ncfdtr(dfn, dfd, nc, f)`: the CDF at `f` of a
@@ -603,10 +635,26 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         // ncfdtr(3, 5, inf, inf) = 1.0; ncfdtr(3, 5, inf, f) = nan for f = -inf, -2, 0, 2, 1e300.
         return if f == f64::INFINITY { 1.0 } else { f64::NAN };
     }
-    if f <= 0.0 {
+    // A negative f is outside the support, and SciPy 1.17.1 answers nan there, not 0
+    // (frankenscipy-g9yid): ncfdtr(3, 5, 3, f) and ncfdtr(3, 5, 0, f) are nan for
+    // f = -1e-300, -2 and -inf, while f = ±0 gives 0.0. ncfdtri, ncfdtrinc and the dfd/dfn
+    // inverses already reject f < 0.
+    if f < 0.0 {
+        return f64::NAN;
+    }
+    if f == 0.0 {
         return 0.0;
     }
-    let y = dfn * f / (dfn * f + dfd);
+    // f = inf, or a finite f with dfn·f + dfd overflowing: the whole mass is below f, but
+    // y = dfn·f / (dfn·f + dfd) was inf/inf = NaN (frankenscipy-g9yid). SciPy 1.17.1 gives
+    // 1.0 for ncfdtr(3, 5, 3, inf), ncfdtr(3, 5, 3, 1e308), ncfdtr(3, 5, 0, 1e308) and
+    // ncfdtr(3, inf, 3, inf). With an infinite dfn or dfd and a finite f it gives nan
+    // (ncfdtr(inf, 5, 3, 2)), so the overflow case applies only to finite degrees of freedom.
+    let denom = dfn * f + dfd;
+    if f == f64::INFINITY || (denom == f64::INFINITY && dfn.is_finite() && dfd.is_finite()) {
+        return 1.0;
+    }
+    let y = dfn * f / denom;
     if nc == 0.0 {
         return btdtr(0.5 * dfn, 0.5 * dfd, y);
     }
@@ -647,14 +695,16 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     }
 
     let mut total = 0.0_f64;
-    // Upward from the mode.
+    // Upward from the mode. The cap scales with √λ (frankenscipy-g9yid; see
+    // `poisson_upward_step_cap`).
     let mut w = w0;
     let mut j = j0;
     let mut a = a0;
     let mut p = p0;
     let mut u = u0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * p.clamp(0.0, 1.0);
         p -= u;
         if p <= 0.0 {
@@ -667,7 +717,7 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         if w < 1e-300 || (w < 1e-14 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     w = w0;
@@ -817,8 +867,10 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     let mut a = a0;
     let mut q = q0;
     let mut u = u0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    // The cap scales with √λ (frankenscipy-g9yid; see `poisson_upward_step_cap`).
+    let cap = poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * q.clamp(0.0, 1.0);
         q += u;
         if q > 1.0 {
@@ -835,7 +887,7 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         if w < 1e-300 || (w < 1e-14 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode: Q(a−1) = Q(a) − u(a−1). Subtractive, hence the
     // cancellation-prone branch — but small in both factors, and stopped at zero.
@@ -1240,6 +1292,15 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     if t == 0.0 {
         return phi;
     }
+    if (t * t).is_infinite() {
+        // t = inf, or t ≥ 1.3407807929942596e154 where t² overflows: x = t²/(t² + df) was
+        // inf/inf = NaN (frankenscipy-g9yid). SciPy 1.17.1 answers 1.0, and so 0.0 at -t
+        // through the reflection above: nctdtr(5, nc, inf) = 1.0 for nc = -3, 0, 3 and 1e4;
+        // nctdtr(df, 3, 1e300) = 1.0 for df = 0.001, 0.5, 5, 1e300 and inf;
+        // nctdtr(5, 3, 2e154) = nctdtr(5, 3, 1.3407807929942596e154) = 1.0; and
+        // nctdtr(5, 3, -inf) = nctdtr(5, 3, -1e300) = 0.0.
+        return 1.0;
+    }
     let x = t * t / (t * t + df);
     let half_df = 0.5 * df;
     let lam = 0.5 * nc * nc;
@@ -1286,12 +1347,14 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     }
 
     let mut s = 0.0_f64;
-    // Upward from the mode.
+    // Upward from the mode. The cap scales with √λ (frankenscipy-g9yid; see
+    // `poisson_upward_step_cap`).
     let (mut p, mut q, mut j) = (p0, q0, j0);
     let (mut ip, mut iq, mut tp, mut tq) = (ip0, iq0, tp0, tq0);
     let (mut ap, mut aq) = (ap0, aq0);
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         s += p * ip + q * iq;
         ip -= tp;
         tp *= x * (ap + half_df) / (ap + 1.0);
@@ -1306,7 +1369,7 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
         if (p.abs() < 1e-300 && q.abs() < 1e-300) || (m < 1e-17 * s.abs().max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     p = p0;
@@ -4646,6 +4709,241 @@ mod tests {
             // The existing goldens' own bound (chndtr_matches_scipy_reference_values et al.).
             assert!(
                 (got - want).abs() <= 1e-10 * want.abs().max(1e-12),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
+    /// frankenscipy-g9yid. The upward half of each noncentral Poisson walk (chndtr, chndtrc,
+    /// ncfdtr, ncfdtrc, nctdtr) stopped after a fixed 100,000 steps. It needs about 7–9·√λ
+    /// steps, so from λ ≈ 1.2e8 the sum lost mass right of the mode and returned a wrong value
+    /// with no error. The cap is now `poisson_upward_step_cap(λ) = max(100_000, ⌈40·√λ⌉)`.
+    ///
+    /// Expected values are SciPy 1.17.1, read live. chndtrc and ncfdtrc mirror
+    /// scipy.stats.ncx2.sf and ncf.sf. The capped-walk column comes from a float
+    /// transliteration of the loops before this fix:
+    ///
+    /// ```text
+    ///                                   SciPy 1.17.1             capped walk
+    /// λ = 1e10 (nc = 2e10)
+    /// chndtr(2.00008e10, 3, 2e10)       0.9976608741697095       0.8412377222681212
+    /// chndtr(2e10, 3, 2e10)             0.49999717905138635      0.48741686728990513
+    /// ncx2.sf(2.00008e10, 3, 2e10)      0.0023391258360952       0.00011401720251455691
+    /// ncx2.sf(2e10, 3, 2e10)            0.5000028209494191       0.3539348721809433
+    /// λ = 1e9 (nc = 2e9; nc = 44721.36 for t)
+    /// ncfdtr(3, 50, 2e9, 1.13e9)        0.9907652168580527       0.9899900470882801
+    /// ncfdtr(3, 50, 2e9, 6.9e8)         0.5414581356040811       0.5410346645607019
+    /// ncf.sf(6.9e8, 3, 50, 2e9)         0.4585418643965284       0.4581829329895983
+    /// ncf.sf(1.13e9, 3, 50, 2e9)        0.009234783144074844     0.009227548888025352
+    /// nctdtr(5, 44721.36, 53193)        0.6182192759554592       0.6177344684591549
+    /// nctdtr(5, 44721.36, 120000)       0.9832721845904543       0.9825010151381184
+    /// ```
+    ///
+    /// The tolerance is 1e-3 relative at λ = 1e10 and 1e-4 at λ = 1e9. The capped walk misses
+    /// by 2.5e-2 to 0.95 and by 7.8e-4. The uncapped transliteration lands within 1e-5 and
+    /// 1.5e-6. That remainder comes from the mode anchors, not the walk: they are formed in
+    /// log space from terms of size λ·ln λ, so they carry an error of about that size times ε,
+    /// and the cap does not touch them.
+    ///
+    /// Must not change: below λ = 6.25e6 the cap is still 100,000, so these existing goldens
+    /// hold to 1e-10: chndtr(2000, 2, 2000) = 0.49553941086177933,
+    /// ncfdtr(10, 20, 40, 3) = 0.10716411882720595 and nctdtr(8, 5, 4) = 0.21027058165197615.
+    ///
+    /// The walks run on a worker thread and the test waits at most 60 s, so a regression that
+    /// stops a walk from ending fails here instead of hanging the suite.
+    #[test]
+    fn noncentral_upward_walk_is_not_cut_off_at_large_noncentrality() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rows: Vec<(&str, f64, f64, f64)> = vec![
+                (
+                    "chndtr(2.00008e10, 3, 2e10)",
+                    gamma::chndtr(2.00008e10, 3.0, 2e10),
+                    0.9976608741697095,
+                    1e-3,
+                ),
+                (
+                    "chndtr(2e10, 3, 2e10)",
+                    gamma::chndtr(2e10, 3.0, 2e10),
+                    0.49999717905138635,
+                    1e-3,
+                ),
+                (
+                    "chndtrc(2.00008e10, 3, 2e10)",
+                    gamma::chndtrc(2.00008e10, 3.0, 2e10),
+                    0.0023391258360952,
+                    1e-3,
+                ),
+                (
+                    "chndtrc(2e10, 3, 2e10)",
+                    gamma::chndtrc(2e10, 3.0, 2e10),
+                    0.5000028209494191,
+                    1e-3,
+                ),
+                (
+                    "ncfdtr(3, 50, 2e9, 1.13e9)",
+                    ncfdtr(3.0, 50.0, 2e9, 1.13e9),
+                    0.9907652168580527,
+                    1e-4,
+                ),
+                (
+                    "ncfdtr(3, 50, 2e9, 6.9e8)",
+                    ncfdtr(3.0, 50.0, 2e9, 6.9e8),
+                    0.5414581356040811,
+                    1e-4,
+                ),
+                (
+                    "ncfdtrc(3, 50, 2e9, 6.9e8)",
+                    ncfdtrc(3.0, 50.0, 2e9, 6.9e8),
+                    0.4585418643965284,
+                    1e-4,
+                ),
+                (
+                    "ncfdtrc(3, 50, 2e9, 1.13e9)",
+                    ncfdtrc(3.0, 50.0, 2e9, 1.13e9),
+                    0.009234783144074844,
+                    1e-4,
+                ),
+                (
+                    "nctdtr(5, 44721.36, 53193)",
+                    nctdtr(5.0, 44721.36, 53193.0),
+                    0.6182192759554592,
+                    1e-4,
+                ),
+                (
+                    "nctdtr(5, 44721.36, 120000)",
+                    nctdtr(5.0, 44721.36, 120000.0),
+                    0.9832721845904543,
+                    1e-4,
+                ),
+            ];
+            let _ = tx.send(rows);
+        });
+        let rows = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a noncentral CDF did not return within 60 s (frankenscipy-g9yid)");
+        // The worker has sent its rows and only returns now, so this join does not wait on a
+        // walk. A timeout above fails the test before reaching it.
+        worker
+            .join()
+            .expect("the frankenscipy-g9yid worker thread panicked");
+        for (label, got, want, tol) in rows {
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= tol,
+                "{label} = {got}, SciPy 1.17.1 gives {want} (relative error {rel:e} > {tol:e})"
+            );
+        }
+
+        for (label, got, want) in [
+            (
+                "chndtr(2000, 2, 2000)",
+                gamma::chndtr(2000.0, 2.0, 2000.0),
+                0.49553941086177933,
+            ),
+            (
+                "ncfdtr(10, 20, 40, 3)",
+                ncfdtr(10.0, 20.0, 40.0, 3.0),
+                0.10716411882720595,
+            ),
+            (
+                "nctdtr(8, 5, 4)",
+                nctdtr(8.0, 5.0, 4.0),
+                0.21027058165197615,
+            ),
+        ] {
+            assert!(
+                (got - want).abs() <= 1e-10 * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
+    /// frankenscipy-g9yid. ncfdtr and nctdtr at an infinite or overflowing argument, and
+    /// ncfdtr below its support, against SciPy 1.17.1 read live:
+    ///
+    /// ```text
+    /// ncfdtr(3, 5, 3, inf) = 1.0        was nan: y = dfn·f / (dfn·f + dfd) = inf/inf
+    /// ncfdtr(3, 5, 3, 1e308) = 1.0      was nan: dfn·f overflows
+    /// ncfdtr(3, 5, 0, 1e308) = 1.0      was nan
+    /// ncfdtr(3, inf, 3, inf) = 1.0      was nan
+    /// ncfdtr(3, 5, 3, -inf) = nan       was 0
+    /// ncfdtr(3, 5, 3, -2) = nan         was 0
+    /// ncfdtr(3, 5, 0, -2) = nan         was 0
+    /// ncfdtr(3, 5, 3, -1e-300) = nan    was 0
+    /// nctdtr(5, 3, inf) = 1.0           was nan: x = t²/(t² + df) = inf/inf
+    /// nctdtr(5, 3, 1e300) = 1.0         was nan: t² overflows
+    /// nctdtr(5, 3, 2e154) = 1.0         was nan
+    /// nctdtr(5, 0, inf) = 1.0           was nan
+    /// nctdtr(0.001, 3, 1e300) = 1.0     was nan
+    /// nctdtr(5, -3, inf) = 1.0          was nan
+    /// nctdtr(5, 3, -inf) = 0.0          was nan
+    /// nctdtr(5, 3, -1e300) = 0.0        was nan
+    /// ```
+    ///
+    /// Must not change, SciPy 1.17.1: ncfdtr(3, 5, 3, 0) = ncfdtr(3, 5, 3, -0.0) = 0.0; a
+    /// finite f with an infinite dfn stays nan, ncfdtr(inf, 5, 3, 2) = nan; the survival
+    /// function already answered these, ncf.sf(inf, 3, 5, 3) = ncf.sf(1e308, 3, 5, 3) = 0.0
+    /// and ncf.sf(-2, 3, 5, 3) = 1.0; and the finite goldens ncfdtr(10, 20, 40, 3) =
+    /// 0.10716411882720595 and nctdtr(8, 5, 4) = 0.21027058165197615.
+    #[test]
+    fn ncfdtr_nctdtr_follow_scipy_at_infinite_and_negative_arguments() {
+        let inf = f64::INFINITY;
+        let nan = f64::NAN;
+        for (label, got, want) in [
+            ("ncfdtr(3, 5, 3, inf)", ncfdtr(3.0, 5.0, 3.0, inf), 1.0),
+            ("ncfdtr(3, 5, 3, 1e308)", ncfdtr(3.0, 5.0, 3.0, 1e308), 1.0),
+            ("ncfdtr(3, 5, 0, 1e308)", ncfdtr(3.0, 5.0, 0.0, 1e308), 1.0),
+            ("ncfdtr(3, inf, 3, inf)", ncfdtr(3.0, inf, 3.0, inf), 1.0),
+            ("ncfdtr(3, 5, 3, -inf)", ncfdtr(3.0, 5.0, 3.0, -inf), nan),
+            ("ncfdtr(3, 5, 3, -2)", ncfdtr(3.0, 5.0, 3.0, -2.0), nan),
+            ("ncfdtr(3, 5, 0, -2)", ncfdtr(3.0, 5.0, 0.0, -2.0), nan),
+            (
+                "ncfdtr(3, 5, 3, -1e-300)",
+                ncfdtr(3.0, 5.0, 3.0, -1e-300),
+                nan,
+            ),
+            ("nctdtr(5, 3, inf)", nctdtr(5.0, 3.0, inf), 1.0),
+            ("nctdtr(5, 3, 1e300)", nctdtr(5.0, 3.0, 1e300), 1.0),
+            ("nctdtr(5, 3, 2e154)", nctdtr(5.0, 3.0, 2e154), 1.0),
+            ("nctdtr(5, 0, inf)", nctdtr(5.0, 0.0, inf), 1.0),
+            ("nctdtr(0.001, 3, 1e300)", nctdtr(0.001, 3.0, 1e300), 1.0),
+            ("nctdtr(5, -3, inf)", nctdtr(5.0, -3.0, inf), 1.0),
+            ("nctdtr(5, 3, -inf)", nctdtr(5.0, 3.0, -inf), 0.0),
+            ("nctdtr(5, 3, -1e300)", nctdtr(5.0, 3.0, -1e300), 0.0),
+            // Must not change.
+            ("ncfdtr(3, 5, 3, 0)", ncfdtr(3.0, 5.0, 3.0, 0.0), 0.0),
+            ("ncfdtr(3, 5, 3, -0.0)", ncfdtr(3.0, 5.0, 3.0, -0.0), 0.0),
+            ("ncfdtr(inf, 5, 3, 2)", ncfdtr(inf, 5.0, 3.0, 2.0), nan),
+            ("ncfdtrc(3, 5, 3, inf)", ncfdtrc(3.0, 5.0, 3.0, inf), 0.0),
+            (
+                "ncfdtrc(3, 5, 3, 1e308)",
+                ncfdtrc(3.0, 5.0, 3.0, 1e308),
+                0.0,
+            ),
+            ("ncfdtrc(3, 5, 3, -2)", ncfdtrc(3.0, 5.0, 3.0, -2.0), 1.0),
+        ] {
+            let matches = if want.is_nan() {
+                got.is_nan()
+            } else {
+                got == want
+            };
+            assert!(matches, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+        for (label, got, want) in [
+            (
+                "ncfdtr(10, 20, 40, 3)",
+                ncfdtr(10.0, 20.0, 40.0, 3.0),
+                0.10716411882720595,
+            ),
+            (
+                "nctdtr(8, 5, 4)",
+                nctdtr(8.0, 5.0, 4.0),
+                0.21027058165197615,
+            ),
+        ] {
+            assert!(
+                (got - want).abs() <= 1e-10 * want.abs(),
                 "{label} = {got}, SciPy 1.17.1 gives {want}"
             );
         }

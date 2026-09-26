@@ -3411,11 +3411,27 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
             f64::NAN
         };
     }
+    // Domain, as SciPy 1.17.1 has it (frankenscipy-g9yid). A negative x is outside the
+    // support and is nan, not 0: chndtr(-inf, 3, 3), chndtr(-2, 3, 3) and chndtr(-2, 3, 0)
+    // are all nan, while chndtr(±0, 3, 3) = 0. A negative nc is nan: chndtr(5, 3, -1) is nan,
+    // where this used to answer the central chdtr(3, 5). With nc > 0, df must be positive and
+    // finite: chndtr(x, df, 3) is nan for df = 0, -1 and inf, at x = 0 and x = inf as well.
+    // Before this check the walk took df + 2j0 as its degrees of freedom and returned a
+    // number.
+    if x < 0.0 || nc < 0.0 || (nc > 0.0 && (df <= 0.0 || df == f64::INFINITY)) {
+        return f64::NAN;
+    }
     if x <= 0.0 {
         return 0.0;
     }
     if nc <= 0.0 {
         return chdtr(df, x);
+    }
+    if x == f64::INFINITY {
+        // The whole mass is below x. The mode anchor would be exp(a·ln ∞ − ∞) = exp(NaN), so
+        // the walk returned NaN here (frankenscipy-g9yid). SciPy 1.17.1: chndtr(inf, 3, 3) =
+        // chndtr(inf, 3, 1e6) = chndtr(inf, 1e-300, 3) = 1.0.
+        return 1.0;
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
@@ -3451,14 +3467,16 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     }
 
     let mut total = 0.0_f64;
-    // Upward from the mode.
+    // Upward from the mode. The cap scales with √λ (frankenscipy-g9yid; see
+    // `crate::beta::poisson_upward_step_cap`).
     let mut w = w0;
     let mut j = j0;
     let mut a = a0;
     let mut p = p0;
     let mut t = t0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = crate::beta::poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * p.clamp(0.0, 1.0);
         // advance j → j+1, a → a+1
         p -= t;
@@ -3469,7 +3487,7 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
         if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     w = w0;
@@ -3537,6 +3555,14 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     if x.is_nan() || df.is_nan() || nc.is_nan() {
         return f64::NAN;
     }
+    // scipy.stats.ncx2 accepts only df > 0 finite and nc ≥ 0, and answers nan for any x
+    // outside that (frankenscipy-g9yid). In 1.17.1, ncx2.sf(x, df, nc) is nan at df = 0,
+    // -1 and inf and at nc = -1, for x = -2, 0, 5 and inf alike. Without this check the walk
+    // took df + 2j0 as its degrees of freedom and returned a number, and a negative nc fell
+    // through to the central chdtrc.
+    if df <= 0.0 || df == f64::INFINITY || nc < 0.0 {
+        return f64::NAN;
+    }
     if x <= 0.0 {
         return 1.0;
     }
@@ -3545,6 +3571,11 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
         // scipy.stats.ncx2.sf(x, 3, inf), which this mirrors, is nan at x = 5 and x = 1e300
         // and 0.0 at x = inf in 1.17.1. Its x = 0 → 1.0 is the return above.
         return if x == f64::INFINITY { 0.0 } else { f64::NAN };
+    }
+    if x == f64::INFINITY {
+        // No mass above x. The walk's anchor exp(a·ln ∞ − ∞) was NaN (frankenscipy-g9yid).
+        // SciPy 1.17.1: ncx2.sf(inf, 3, 3) = ncx2.sf(inf, 3, 0) = 0.0.
+        return 0.0;
     }
     if nc <= 0.0 {
         return chdtrc(df, x);
@@ -3570,14 +3601,16 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     }
 
     let mut total = 0.0_f64;
-    // Upward from the mode: Q grows by adding positive t — the stable direction here.
+    // Upward from the mode: Q grows by adding positive t — the stable direction here. The
+    // cap scales with √λ (frankenscipy-g9yid; see `crate::beta::poisson_upward_step_cap`).
     let mut w = w0;
     let mut j = j0;
     let mut a = a0;
     let mut q = q0;
     let mut t = t0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = crate::beta::poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * q.clamp(0.0, 1.0);
         q += t;
         j += 1.0;
@@ -3587,7 +3620,7 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
         if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     w = w0;
@@ -3701,6 +3734,12 @@ pub fn chndtridf(x: f64, p: f64, nc: f64) -> f64 {
     if x.is_nan() || p.is_nan() || nc.is_nan() || p <= 0.0 || p >= 1.0 || nc == f64::INFINITY {
         return f64::NAN;
     }
+    // x = inf: SciPy 1.17.1 chndtridf(inf, 0.5, 2) = chndtridf(inf, 0.5, 3) = nan. chndtr is
+    // 1.0 there (frankenscipy-g9yid), so both bracket ends read 1.0 and `invert_monotone`
+    // would clamp to its 1e-6 bound; before g9yid the NaN chndtr stopped it instead.
+    if x == f64::INFINITY {
+        return f64::NAN;
+    }
     invert_monotone(|df| chndtr(x, df, nc), p, 1e-6, 1e10)
 }
 
@@ -3712,7 +3751,10 @@ pub fn chndtridf(x: f64, p: f64, nc: f64) -> f64 {
 /// clamps toward 0 (as scipy does). `p ∉ (0, 1)` (or NaN) → NaN.
 #[must_use]
 pub fn chndtrinc(x: f64, df: f64, p: f64) -> f64 {
-    if x.is_nan() || df.is_nan() || p.is_nan() || p <= 0.0 || p >= 1.0 {
+    // x = inf: SciPy 1.17.1 chndtrinc(inf, 3, 0.5) = nan. chndtr is 1.0 there
+    // (frankenscipy-g9yid), so both bracket ends read 1.0 and `invert_monotone` would clamp
+    // to its nc = 0 bound; before g9yid the NaN chndtr stopped it instead.
+    if x.is_nan() || df.is_nan() || p.is_nan() || p <= 0.0 || p >= 1.0 || x == f64::INFINITY {
         return f64::NAN;
     }
     invert_monotone(|nc| chndtr(x, df, nc), p, 0.0, 1e8)
@@ -7095,9 +7137,12 @@ mod tests {
 
     /// A NaN endpoint value leaves the chndtr inversion undefined. SciPy 1.17.1:
     /// chndtrinc(inf, 3, 0.5) = nan, chndtridf(inf, 0.5, 2) = nan, chndtrinc(1, inf, 0.5) = nan.
-    /// fsci's chndtr is NaN at those bracket endpoints (x = inf with nc > 0, df = inf), and
+    /// fsci's chndtr was NaN at those bracket endpoints (x = inf with nc > 0, df = inf), and
     /// `invert_monotone` folded fa/fb with `f64::min`/`max`, which drop the NaN: chndtrinc
     /// returned the nc = 1e8 bound and chndtridf an Illinois iterate on NaN residuals.
+    /// Since frankenscipy-g9yid, chndtr(inf, df, nc) is SciPy's 1.0, and an explicit x = inf
+    /// guard in chndtrinc and chndtridf holds the x = inf rows. df = inf is still a NaN
+    /// endpoint.
     /// Must not change, SciPy 1.17.1: chndtrinc(5, 3, 0.5) = 2.8985299934839217,
     /// chndtridf(5, 0.5, 2) = 3.8373619908260497, and the below-range clamp
     /// chndtrinc(2, 3, 0.5) = 2.65249474e-315 (fsci returns the nc = 0 bound).
@@ -7118,6 +7163,82 @@ mod tests {
         );
         let clamped = chndtrinc(2.0, 3.0, 0.5);
         assert!(clamped.abs() < 1e-300, "chndtrinc clamp {clamped}");
+    }
+
+    /// frankenscipy-g9yid. chndtr and chndtrc at x = ±inf and at the edges of their domain,
+    /// against SciPy 1.17.1 read live (chndtrc mirrors scipy.stats.ncx2.sf):
+    ///
+    /// ```text
+    /// chndtr(inf, 3, 3) = 1.0        was nan: the mode anchor was exp(a·ln ∞ − ∞)
+    /// chndtr(inf, 1e-300, 3) = 1.0   was nan
+    /// ncx2.sf(inf, 3, 3) = 0.0       was nan
+    /// chndtr(-inf, 3, 3) = nan       was 0
+    /// chndtr(-2, 3, 3) = nan         was 0
+    /// chndtr(-2, 3, 0) = nan         was 0
+    /// chndtr(5, 0, 3) = nan          was a number: the walk took df + 2j0 as its dof
+    /// chndtr(5, -1, 3) = nan         was a number
+    /// chndtr(0, 0, 3) = nan          was 0
+    /// chndtr(5, 3, -1) = nan         was chdtr(3, 5)
+    /// ncx2.sf(5, 0, 3) = nan         was a number
+    /// ncx2.sf(0, -1, 3) = nan        was 1
+    /// ncx2.sf(5, 3, -1) = nan        was chdtrc(3, 5)
+    /// chndtridf(inf, 0.5, 3) = nan   chndtr's new 1.0 at x = inf would make both bracket
+    /// chndtrinc(inf, 3, 0.5) = nan   ends equal and return a bound, so x = inf is guarded
+    /// ```
+    ///
+    /// Must not change, SciPy 1.17.1: chndtr(0, 3, 3) = chndtr(-0.0, 3, 3) = 0.0,
+    /// chndtr(inf, 3, 0) = 1.0, ncx2.sf(-2, 3, 3) = ncx2.sf(0, 3, 3) = 1.0,
+    /// chndtr(5, inf, 3) = ncx2.sf(5, inf, 3) = nan, chndtr(5, 3, 3) = 0.4900713457395342 and
+    /// ncx2.sf(5, 3, 3) = 0.5099286542604659.
+    #[test]
+    fn chndtr_chndtrc_follow_scipy_at_infinite_x_and_domain_edges() {
+        let inf = f64::INFINITY;
+        let nan = f64::NAN;
+        for (label, got, want) in [
+            ("chndtr(inf, 3, 3)", chndtr(inf, 3.0, 3.0), 1.0),
+            ("chndtr(inf, 1e-300, 3)", chndtr(inf, 1e-300, 3.0), 1.0),
+            ("chndtrc(inf, 3, 3)", chndtrc(inf, 3.0, 3.0), 0.0),
+            ("chndtr(-inf, 3, 3)", chndtr(-inf, 3.0, 3.0), nan),
+            ("chndtr(-2, 3, 3)", chndtr(-2.0, 3.0, 3.0), nan),
+            ("chndtr(-2, 3, 0)", chndtr(-2.0, 3.0, 0.0), nan),
+            ("chndtr(5, 0, 3)", chndtr(5.0, 0.0, 3.0), nan),
+            ("chndtr(5, -1, 3)", chndtr(5.0, -1.0, 3.0), nan),
+            ("chndtr(0, 0, 3)", chndtr(0.0, 0.0, 3.0), nan),
+            ("chndtr(5, 3, -1)", chndtr(5.0, 3.0, -1.0), nan),
+            ("chndtrc(5, 0, 3)", chndtrc(5.0, 0.0, 3.0), nan),
+            ("chndtrc(0, -1, 3)", chndtrc(0.0, -1.0, 3.0), nan),
+            ("chndtrc(5, 3, -1)", chndtrc(5.0, 3.0, -1.0), nan),
+            ("chndtridf(inf, 0.5, 3)", chndtridf(inf, 0.5, 3.0), nan),
+            ("chndtrinc(inf, 3, 0.5)", chndtrinc(inf, 3.0, 0.5), nan),
+            // Must not change.
+            ("chndtr(0, 3, 3)", chndtr(0.0, 3.0, 3.0), 0.0),
+            ("chndtr(-0.0, 3, 3)", chndtr(-0.0, 3.0, 3.0), 0.0),
+            ("chndtr(inf, 3, 0)", chndtr(inf, 3.0, 0.0), 1.0),
+            ("chndtrc(-2, 3, 3)", chndtrc(-2.0, 3.0, 3.0), 1.0),
+            ("chndtrc(0, 3, 3)", chndtrc(0.0, 3.0, 3.0), 1.0),
+            ("chndtr(5, inf, 3)", chndtr(5.0, inf, 3.0), nan),
+            ("chndtrc(5, inf, 3)", chndtrc(5.0, inf, 3.0), nan),
+        ] {
+            let matches = if want.is_nan() {
+                got.is_nan()
+            } else {
+                got == want
+            };
+            assert!(matches, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+        for (label, got, want) in [
+            ("chndtr(5, 3, 3)", chndtr(5.0, 3.0, 3.0), 0.4900713457395342),
+            (
+                "chndtrc(5, 3, 3)",
+                chndtrc(5.0, 3.0, 3.0),
+                0.5099286542604659,
+            ),
+        ] {
+            assert!(
+                ((got - want) / want).abs() <= 1e-10,
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
     }
 
     #[test]

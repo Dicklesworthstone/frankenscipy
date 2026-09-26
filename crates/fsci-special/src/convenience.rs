@@ -5249,6 +5249,15 @@ pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
     if y == 1.0 {
         return f64::INFINITY;
     }
+    // a = ±0 and a = inf keep only the y = 0 / y = 1 edges above. For an interior y SciPy
+    // 1.17.1 is nan: gammaincinv(a, y) = nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95
+    // (frankenscipy-g9yid). The Newton loop below answered a number there instead. P(0, x)
+    // and P(inf, x) are NaN, so it bisected on NaN residuals: a float emulation of the loop
+    // ends at about 1.5e-323 for a = 0 and for a = inf with y < 0.5, and at inf for a = inf
+    // with y ≥ 0.5.
+    if a == 0.0 || a == f64::INFINITY {
+        return f64::NAN;
+    }
 
     let mode = fsci_runtime::RuntimeMode::Strict;
     let ln_gamma_a = crate::gammaln_scalar(a, mode).unwrap_or(f64::NAN);
@@ -5363,6 +5372,11 @@ pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
     }
     if y == 0.0 {
         return f64::INFINITY;
+    }
+    // Same as `gammaincinv_scalar` (frankenscipy-g9yid): SciPy 1.17.1 gammainccinv(a, y) =
+    // nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95; only the edges above answer.
+    if a == 0.0 || a == f64::INFINITY {
+        return f64::NAN;
     }
 
     // Q(a,x) = y. Routing through gammaincinv(a, 1-y) computes P = 1-Q near 1,
@@ -10122,6 +10136,55 @@ mod tests {
         assert_eq!(gammaincinv_scalar(-0.0, 1.0), f64::INFINITY);
         assert_eq!(gammainccinv_scalar(-0.0, 0.0), f64::INFINITY);
         assert_eq!(gammainccinv_scalar(-0.0, 1.0), 0.0);
+        let p = gammaincinv_scalar(2.0, 0.5);
+        assert!(
+            ((p - 1.678_346_990_016_661_2) / 1.678_346_990_016_661_2).abs() < 1e-11,
+            "gammaincinv(2, 0.5) = {p}, SciPy 1.17.1 gives 1.6783469900166612"
+        );
+        let q = gammainccinv_scalar(0.5, 0.5);
+        assert!(
+            ((q - 0.227_468_211_559_786_2) / 0.227_468_211_559_786_2).abs() < 1e-11,
+            "gammainccinv(0.5, 0.5) = {q}, SciPy 1.17.1 gives 0.2274682115597862"
+        );
+    }
+
+    /// frankenscipy-g9yid. At a = 0, -0.0 and inf, SciPy 1.17.1 answers only the y edges;
+    /// gammaincinv(a, y) and gammainccinv(a, y) are nan for y = 0.3, 0.5 and 0.95. fsci's
+    /// Newton loop ran with P(0, x) = P(inf, x) = NaN and bisected on NaN residuals. A float
+    /// emulation of that loop ends at about 1.5e-323, or at inf for a = inf with y ≥ 0.5.
+    ///
+    /// Must not change, SciPy 1.17.1: the edges gammaincinv(a, 0) = 0.0,
+    /// gammaincinv(a, 1) = inf, gammainccinv(a, 0) = inf and gammainccinv(a, 1) = 0.0 for
+    /// a = 0, -0.0 and inf; and the finite path, gammaincinv(2, 0.5) = 1.6783469900166612 and
+    /// gammainccinv(0.5, 0.5) = 0.2274682115597862.
+    #[test]
+    fn gammaincinv_zero_or_infinite_shape_is_nan_inside_the_unit_interval() {
+        for a in [0.0, -0.0, f64::INFINITY] {
+            for y in [0.3, 0.5, 0.95] {
+                let p = gammaincinv_scalar(a, y);
+                let q = gammainccinv_scalar(a, y);
+                assert!(
+                    p.is_nan(),
+                    "gammaincinv({a}, {y}) = {p}, SciPy 1.17.1 gives nan"
+                );
+                assert!(
+                    q.is_nan(),
+                    "gammainccinv({a}, {y}) = {q}, SciPy 1.17.1 gives nan"
+                );
+            }
+            assert_eq!(gammaincinv_scalar(a, 0.0), 0.0, "gammaincinv({a}, 0)");
+            assert_eq!(
+                gammaincinv_scalar(a, 1.0),
+                f64::INFINITY,
+                "gammaincinv({a}, 1)"
+            );
+            assert_eq!(
+                gammainccinv_scalar(a, 0.0),
+                f64::INFINITY,
+                "gammainccinv({a}, 0)"
+            );
+            assert_eq!(gammainccinv_scalar(a, 1.0), 0.0, "gammainccinv({a}, 1)");
+        }
         let p = gammaincinv_scalar(2.0, 0.5);
         assert!(
             ((p - 1.678_346_990_016_661_2) / 1.678_346_990_016_661_2).abs() < 1e-11,
