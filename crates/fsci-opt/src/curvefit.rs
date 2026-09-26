@@ -514,6 +514,15 @@ where
         .collect()
 }
 
+/// SciPy raises `ValueError` with this text when its `trf` SVD meets a non-finite matrix.
+impl From<trf::NonFiniteJacobian> for OptError {
+    fn from(_: trf::NonFiniteJacobian) -> Self {
+        Self::NonFiniteInput {
+            detail: String::from("array must not contain infs or NaNs"),
+        }
+    }
+}
+
 /// `method='trf'` with optional bounds, as SciPy's `least_squares` sets it up: tolerance and
 /// bound validation, `x0` made strictly feasible, the initial residuals required finite, then
 /// [`trf::trf`].
@@ -2108,6 +2117,38 @@ mod tests {
         )
         .expect_err("should reject zero diff_step");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
+    }
+
+    /// A forward-difference step that crosses a domain edge puts a NaN in the Jacobian while the
+    /// residuals stay finite. SciPy 1.17.1 on `[√(1 − x), x − 0.5]` from x0 = 1 − 1e-9 (default
+    /// step √ε·max(1, |x|) lands past 1) raises `ValueError: array must not contain infs or NaNs`
+    /// from trf's SVD, bounded or not; from x0 = 0.5 or 0.9 the step never crosses and SciPy runs
+    /// to max_nfev (status 0) without raising. fsci used to fold the NaN out of ‖g·v‖∞, read 0,
+    /// and report gtol convergence (status 1) at x0 (frankenscipy-qdb8s).
+    #[test]
+    fn least_squares_trf_refuses_a_nan_jacobian_like_scipy() {
+        let residuals = |x: &[f64]| vec![(1.0 - x[0]).sqrt(), x[0] - 0.5];
+        let edge = [1.0 - 1e-9];
+        let unbounded = least_squares(residuals, &edge, LeastSquaresOptions::default());
+        let bounded = least_squares_bounded(
+            residuals,
+            &edge,
+            &[-10.0],
+            &[10.0],
+            LeastSquaresOptions::default(),
+        );
+        for result in [unbounded, bounded] {
+            assert!(
+                matches!(&result, Err(OptError::NonFiniteInput { detail })
+                    if detail == "array must not contain infs or NaNs"),
+                "SciPy raises here; fsci returned {result:?}"
+            );
+        }
+        for x0 in [0.5, 0.9] {
+            let r = least_squares(residuals, &[x0], LeastSquaresOptions::default())
+                .expect("the step never crosses the edge, so SciPy does not raise");
+            assert_eq!((r.status, r.success), (0, false), "x0 = {x0}: {r:?}");
+        }
     }
 
     #[test]
