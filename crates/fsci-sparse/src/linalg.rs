@@ -12317,13 +12317,19 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 }
             }))
         }
+        // A NaN row sum makes the norm NaN, as numpy's max does (and as "1"/"-1" above);
+        // `f64::max` would drop it and report the largest finite row.
         "inf" => {
             let mut max_row = 0.0f64;
             for i in 0..n {
                 let start = a.indptr()[i];
                 let end = a.indptr()[i + 1];
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
-                max_row = max_row.max(row_sum);
+                max_row = if max_row.is_nan() || row_sum.is_nan() {
+                    f64::NAN
+                } else {
+                    max_row.max(row_sum)
+                };
             }
             Ok(max_row)
         }
@@ -12371,7 +12377,11 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 let start = a.indptr()[i];
                 let end = a.indptr()[i + 1];
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
-                min_row = min_row.min(row_sum);
+                min_row = if min_row.is_nan() || row_sum.is_nan() {
+                    f64::NAN
+                } else {
+                    min_row.min(row_sum)
+                };
             }
             Ok(min_row)
         }
@@ -27705,6 +27715,49 @@ mod tests {
             .to_csr()
             .expect("csr");
         assert_eq!(sparse_norm(&zero, "2").expect("ord 2"), 0.0);
+    }
+
+    /// Live scipy 1.17.1 `scipy.sparse.linalg.norm` on [[4,1,0],[1,3,1],[0,1,2]] with A[2,2] =
+    /// NaN, and again with A[0,1] = NaN, is nan for ord = inf, -inf, 1, -1 and 'fro'. On the
+    /// finite matrix it is inf → 5.0, -inf → 3.0, 1 → 5.0, -1 → 3.0. The row-sum orders folded
+    /// with `f64::max` / `f64::min`, which dropped the NaN row and returned the finite extreme.
+    #[test]
+    fn sparse_norm_row_orders_keep_a_nan_like_scipy() {
+        let matrix = |corrupt: Option<usize>| {
+            let mut data = vec![4.0, 1.0, 1.0, 3.0, 1.0, 1.0, 2.0];
+            if let Some(slot) = corrupt {
+                data[slot] = f64::NAN;
+            }
+            CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                data,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+        };
+        // Slot 6 is A[2,2], slot 1 is A[0,1].
+        for slot in [6, 1] {
+            let a = matrix(Some(slot));
+            for kind in ["inf", "-inf", "1", "-1", "fro"] {
+                let norm = sparse_norm(&a, kind).expect("scipy returns a value");
+                assert!(
+                    norm.is_nan(),
+                    "slot {slot}, ord {kind}: scipy nan, fsci {norm}"
+                );
+            }
+        }
+        let finite = matrix(None);
+        for (kind, want) in [("inf", 5.0), ("-inf", 3.0), ("1", 5.0), ("-1", 3.0)] {
+            assert_eq!(
+                sparse_norm(&finite, kind).expect("finite"),
+                want,
+                "ord {kind}"
+            );
+        }
     }
 
     /// A NaN anywhere in A makes every Krylov vector of AᵀA NaN. Live scipy 1.17.1 on
