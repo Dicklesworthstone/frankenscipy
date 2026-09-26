@@ -2115,6 +2115,9 @@ fn ks_critical(na: usize, nb: usize) -> f64 {
 
 /// The 10th, 50th and 90th percentiles, rounded, for the log.
 fn deciles(v: &[f64]) -> [f64; 3] {
+    if v.is_empty() {
+        return [f64::NAN; 3];
+    }
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
     let at = |q: f64| {
@@ -2225,6 +2228,16 @@ fn diff_random_generators_match_scipys_distributions() {
     let mut ks_checks = 0usize;
     let mut ks = |name: String, fsci: &[f64], scipy: &[f64], failures: &mut Vec<String>| {
         ks_checks += 1;
+        // A generator that failed its invariant stops early; a short sample must not pass
+        // (the KS statistic of an empty sample is 0).
+        if fsci.len() != draws || scipy.len() != draws {
+            failures.push(format!(
+                "{name}: compared {} fsci and {} SciPy draws, not {draws}",
+                fsci.len(),
+                scipy.len()
+            ));
+            return;
+        }
         let (d, crit) = (
             ks_statistic(fsci, scipy),
             ks_critical(fsci.len(), scipy.len()),
