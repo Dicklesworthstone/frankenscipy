@@ -2319,6 +2319,188 @@ fn validate_incomplete_gamma_domain(
     Ok(())
 }
 
+/// Shape from which the gamma- and beta-type power terms are formed in Loader's saddle-point
+/// form instead of in log space (frankenscipy-g9yid).
+///
+/// Four places formed a term like `λˣe^(−λ)/Γ(x+1)` or `xᵃ(1−x)ᵇ/B(a,b)` as the `exp` of a
+/// sum of logs: the Poisson weight and increment anchors of the noncentral walks
+/// ([`poisson_term`], [`crate::beta::beta_term`]), the prefactor of [`regularized_gamma_pair`]
+/// and the front factor of [`crate::beta::betainc_scalar`]. The logs are of size `a·ln a`
+/// while their sum is O(ln a), so the exponent carries an absolute error of about
+/// `ε·a·ln a`: at most about 1e-13 below 100, 2.5e-7 at 1e8 and 4e-3 at 1e12 (the table is in
+/// [`poisson_term`]). From 100 up, the saddle-point form holds about 1e-15. Below 100 each of
+/// the four keeps its log-space form, so small-shape results are unchanged.
+pub(crate) const SADDLE_POINT_MIN_SHAPE: f64 = 100.0;
+
+/// `ln √(2π)`.
+const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
+
+/// `stirlerr(k/2)` for `k = 0..=30`, from mpmath at 40 digits. Index 0 is a placeholder:
+/// `stirlerr(0)` is never formed.
+const STIRLERR_HALVES: [f64; 31] = [
+    0.0,
+    0.153_426_409_720_027_36,
+    0.081_061_466_795_327_26,
+    0.054_814_121_051_917_65,
+    0.041_340_695_955_409_3,
+    0.033_162_873_519_936_29,
+    0.027_677_925_684_998_34,
+    0.023_746_163_656_297_496,
+    0.020_790_672_103_765_093,
+    0.018_488_450_532_673_187,
+    0.016_644_691_189_821_193,
+    0.015_134_973_221_917_378,
+    0.013_876_128_823_070_748,
+    0.012_810_465_242_920_227,
+    0.011_896_709_945_891_77,
+    0.011_104_559_758_206_917,
+    0.010_411_265_261_972_096,
+    0.009_799_416_126_158_804,
+    0.009_255_462_182_712_733,
+    0.008_768_700_134_139_386,
+    0.008_330_563_433_362_87,
+    0.007_934_114_564_314_02,
+    0.007_573_675_487_951_841,
+    0.007_244_554_301_320_383,
+    0.006_942_840_107_209_53,
+    0.006_665_247_032_707_682,
+    0.006_408_994_188_004_207,
+    0.006_171_712_263_039_458,
+    0.005_951_370_112_758_847_5,
+    0.005_746_216_513_010_115_5,
+    0.005_554_733_551_962_801,
+];
+
+/// Loader's Stirling-series error `stirlerr(n) = lnΓ(n+1) − (n + ½)·ln n + n − ln √(2π)`,
+/// for `n > 0` (C. Loader, "Fast and Accurate Computation of Binomial Probabilities", 2000;
+/// R's `stirlerr`). Exact table at the half-integers up to 15, `lnΓ` below 15 otherwise, and
+/// the asymptotic series `1/(12n) − 1/(360n³) + …` above 15, truncated where the next term
+/// is below 3e-17.
+pub(crate) fn stirlerr(n: f64) -> f64 {
+    const S0: f64 = 1.0 / 12.0;
+    const S1: f64 = 1.0 / 360.0;
+    const S2: f64 = 1.0 / 1260.0;
+    const S3: f64 = 1.0 / 1680.0;
+    const S4: f64 = 1.0 / 1188.0;
+    if n <= 15.0 {
+        let nn = n + n;
+        if nn == nn.floor() {
+            return STIRLERR_HALVES[nn as usize];
+        }
+        return gammaln_scalar(n + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            - (n + 0.5) * n.ln()
+            + n
+            - LN_SQRT_2PI;
+    }
+    let nn = n * n;
+    if n > 500.0 {
+        return (S0 - S1 / nn) / n;
+    }
+    if n > 80.0 {
+        return (S0 - (S1 - S2 / nn) / nn) / n;
+    }
+    if n > 35.0 {
+        return (S0 - (S1 - (S2 - S3 / nn) / nn) / nn) / n;
+    }
+    (S0 - (S1 - (S2 - (S3 - S4 / nn) / nn) / nn) / nn) / n
+}
+
+/// Loader's deviance term `bd0(x, m) = x·ln(x/m) + m − x`, for `x, m > 0`. Near `x = m` it is
+/// summed as the series in `v = (x−m)/(x+m)`, `(x−m)·v + 2x·Σ v^(2j+1)/(2j+1)`, so the
+/// cancellation between `x·ln(x/m)` and `m − x` never happens.
+pub(crate) fn bd0(x: f64, m: f64) -> f64 {
+    if (x - m).abs() < 0.1 * (x + m) {
+        let v = (x - m) / (x + m);
+        let mut s = (x - m) * v;
+        if s.abs() < f64::MIN_POSITIVE {
+            return s;
+        }
+        let mut ej = 2.0 * x * v;
+        let v2 = v * v;
+        let mut odd = 3.0_f64;
+        while odd < 2000.0 {
+            ej *= v2;
+            let s1 = s + ej / odd;
+            if s1 == s {
+                return s1;
+            }
+            s = s1;
+            odd += 2.0;
+        }
+    }
+    x * (x / m).ln() + m - x
+}
+
+/// `λˣ·e^(−λ) / Γ(x+1)` for real `x ≥ 0`: the Poisson weight at `x`, and also the incomplete
+/// gamma increment `yᵃe^(−y)/Γ(a+1)` with `(x, λ) = (a, y)`. Loader's saddle-point form
+/// `exp(−stirlerr(x) − bd0(x, λ)) / √(2πx)` (R's `dpois_raw`), with R's guards at the edges.
+///
+/// The noncentral walks (chndtr, chndtrc, ncfdtr, ncfdtrc, nctdtr) used to form their mode
+/// anchors as `exp(−λ + x·ln λ − lnΓ(x+1))`. The three terms have size `λ·ln λ` and their sum
+/// is `−½·ln(2πλ)`, so the anchor lost about `λ·ln λ·ε` (frankenscipy-g9yid). Relative error
+/// of the Poisson weight at the mode `x = ⌊λ⌋` against mpmath (60 digits, the same f64
+/// inputs):
+///
+/// ```text
+/// λ        log-space   saddle point
+/// 1e-3     3.0e-17     3.0e-17
+/// 15       2.8e-15     3.2e-17
+/// 100      4.2e-14     3.2e-17
+/// 1e4      1.1e-13     8.3e-17
+/// 1e6      6.8e-10     3.0e-17
+/// 1e8      2.5e-7      2.3e-17
+/// 1e10     9.8e-6      9.0e-17
+/// 1e12     7.4e-5      9.7e-17   (4.0e-3 at x = ⌊λ⌋ ± 1)
+/// 1e14     3.8e-2      2.4e-17
+/// 2^52     1.7e8       8.1e-17
+/// ```
+///
+/// Over `x` within `±3√λ` of the mode the saddle-point error stays below 1.2e-15, and within
+/// `±10√λ` below 1.2e-13 (λ = 1000, a weight of 2e-22, where `bd0` takes its direct branch).
+///
+/// With `x` and `λ` both below [`SADDLE_POINT_MIN_SHAPE`] the log-space form is kept: it is
+/// the walks' old anchor expression operation for operation, so their small-λ results are
+/// bit-identical.
+pub(crate) fn poisson_term(x: f64, lam: f64) -> f64 {
+    if x.is_nan() || lam.is_nan() {
+        return f64::NAN;
+    }
+    if lam == 0.0 {
+        return if x == 0.0 { 1.0 } else { 0.0 };
+    }
+    if lam.is_infinite() || x < 0.0 {
+        return 0.0;
+    }
+    let log_space = || {
+        let lg = gammaln_scalar(x + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        (-lam + x * lam.ln() - lg).exp()
+    };
+    if x < SADDLE_POINT_MIN_SHAPE && lam < SADDLE_POINT_MIN_SHAPE {
+        return log_space();
+    }
+    if x <= lam * f64::MIN_POSITIVE {
+        return (-lam).exp();
+    }
+    if lam < x * f64::MIN_POSITIVE {
+        return if x.is_infinite() { 0.0 } else { log_space() };
+    }
+    (-stirlerr(x) - bd0(x, lam)).exp() / (std::f64::consts::TAU * x).sqrt()
+}
+
+/// Iteration cap of the incomplete gamma series and continued fraction: `12·√a + 200`.
+///
+/// Near `x ≈ a` the series needs about `8.3·√a` terms and the continued fraction about
+/// `9·a^(1/3)`. The cap used to be bounded by 2,000,000, which cut the series short from
+/// `a ≈ 2.8e10`: `P(1e12, 1e12)` came out 4.4e-2 low (frankenscipy-g9yid). The bound now
+/// applies only from `a = 2^53`, where `ap + 1.0` stops moving and no count of terms helps.
+fn incomplete_gamma_iteration_cap(a: f64) -> usize {
+    if a < crate::beta::POISSON_INDEX_LIMIT {
+        (12.0 * a.sqrt()) as usize + 200
+    } else {
+        2_000_000
+    }
+}
+
 fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64), SpecialError> {
     if a.is_nan() || x.is_nan() {
         return Ok((f64::NAN, f64::NAN));
@@ -2336,24 +2518,69 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
     const EPS: f64 = 1.0e-14;
     const FPMIN: f64 = 1.0e-300;
 
-    let lg = gammaln_scalar(a, RuntimeMode::Strict)?;
-    let prefactor = (-x + a * x.ln() - lg).exp();
+    // From a = SADDLE_POINT_MIN_SHAPE up, the large-shape path (frankenscipy-g9yid): the
+    // prefactor xᵃe⁻ˣ/Γ(a) = a·poisson_term(a, x) in saddle-point form, a compensated series
+    // sum, and a stop test that bounds the unsummed tail. Worst relative error of P and Q
+    // over x = a + {0, ±1, 0.9, 2, 10, ±√a, ±3√a}, against scipy.special (Temme's expansion
+    // there; it matched an mpmath series to 2e-15 at a = 1e8):
+    //
+    //     a        before     after
+    //     100      6.1e-14    1.1e-14
+    //     1e4      1.7e-11    5.1e-15
+    //     1e6      1.2e-9     6.0e-15
+    //     1e8      4.5e-7     7.3e-15
+    //     1e10     3.8e-5     2.4e-14
+    //     1e12     4.4e-2     1.2e-13   (continued fraction, x = a + 10; the series ~1e-14)
+    //
+    // Before, the prefactor lost ε·a·ln a, the plain stop `term ≤ 1e-14·sum` left a tail of
+    // about 1e-14·√a/6, the uncompensated sum of ~8√a terms drifted by up to 8e-12 at
+    // a = 1e12, and from a ≈ 2.8e10 the 2,000,000 cap cut the series off. Below the gate the
+    // old code runs unchanged.
+    let large = a >= SADDLE_POINT_MIN_SHAPE;
+    let prefactor = if large {
+        a * poisson_term(a, x)
+    } else {
+        let lg = gammaln_scalar(a, RuntimeMode::Strict)?;
+        (-x + a * x.ln() - lg).exp()
+    };
     let (p, q) = if x < a + 1.0 {
         // The lower series Σ xᵏ/(a)_{k+1} needs ~12√a terms to converge near
         // x≈a (the term ratio x/(a+k) ≈ 1 there); the old fixed 200-term cap
         // truncated it for large a — e.g. P(5000,5000) was 0.5% off (needs 558
         // terms). Scale the cap with √a so it stays exact at large a while the
         // ε-break keeps small/typical a cheap. frankenscipy.
-        let series_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+        let series_max = incomplete_gamma_iteration_cap(a);
         let mut ap = a;
         let mut term = 1.0 / a;
         let mut sum = term;
-        for _ in 0..series_max {
-            ap += 1.0;
-            term *= x / ap;
-            sum += term;
-            if term.abs() <= sum.abs() * EPS {
-                break;
+        if large {
+            // Neumaier-compensated. Every term is positive and below the first, so
+            // `sum ≥ term` and the fast two-sum is exact. With r = x/(ap + 1) < 1 the terms
+            // left after this one sum to at most term·r/(1 − r), so stopping at
+            // term ≤ ε·sum·(1 − r) bounds the truncation by ε·sum. r is also the next
+            // term's ratio, so each step divides once.
+            let mut carry = 0.0_f64;
+            let mut r = x / (ap + 1.0);
+            for _ in 0..series_max {
+                ap += 1.0;
+                term *= r;
+                let next = sum + term;
+                carry += (sum - next) + term;
+                sum = next;
+                r = x / (ap + 1.0);
+                if term <= sum * f64::EPSILON * (1.0 - r) {
+                    break;
+                }
+            }
+            sum += carry;
+        } else {
+            for _ in 0..series_max {
+                ap += 1.0;
+                term *= x / ap;
+                sum += term;
+                if term.abs() <= sum.abs() * EPS {
+                    break;
+                }
             }
         }
         let lower = prefactor * sum;
@@ -2365,11 +2592,12 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
         let mut c = 1.0 / FPMIN;
         let mut d = 1.0 / b;
         let mut h = d;
-        // The upper continued fraction needs ~√a steps near x≈a; the fixed
-        // 200-iter cap truncated it for very large a (Q(100000,100001) was ~1e-5
-        // off). Scale the cap with √a (the EPS-break keeps typical a cheap),
-        // mirroring the lower-series fix. frankenscipy.
-        let cf_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+        // The upper continued fraction needs ~9·a^(1/3) steps near x≈a (measured
+        // from a = 1e6 to 1e14, frankenscipy-g9yid); the fixed 200-iter cap
+        // truncated it for very large a (Q(100000,100001) was ~1e-5 off). Scale
+        // the cap with √a (the EPS-break keeps typical a cheap), mirroring the
+        // lower-series fix. frankenscipy.
+        let cf_max = incomplete_gamma_iteration_cap(a);
         for i in 1..=cf_max {
             let i_f = i as f64;
             let an = -i_f * (i_f - a);
@@ -3392,8 +3620,8 @@ pub fn chdtrc(v: f64, x: f64) -> f64 {
 /// ```
 ///
 /// The sum is accumulated outward from the Poisson mode `j₀ = ⌊λ⌋` (whose
-/// weight is formed in log space) so that large `nc` neither underflows the
-/// leading `e^{−λ}` factor nor loses precision.
+/// weight is formed by `poisson_term`, in saddle-point form from λ = 100) so that
+/// large `nc` neither underflows the leading `e^{−λ}` factor nor loses precision.
 #[must_use]
 pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     if x.is_nan() || df.is_nan() || nc.is_nan() {
@@ -3439,10 +3667,10 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     if j0 >= crate::beta::POISSON_INDEX_LIMIT {
         return f64::NAN;
     }
-    // Poisson weight at the mode j0, formed in log space to avoid underflow.
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // Poisson weight at the mode j0. It and t0 below were formed in log space, which lost
+    // about λ·ln λ·ε: 2.5e-7 at λ = 1e8 and 4e-3 at λ = 1e12, and chndtr carried that error
+    // whole. The saddle-point `poisson_term` holds 1e-16 (frankenscipy-g9yid).
+    let w0 = poisson_term(j0, lam);
 
     // Each Poisson term needs chdtr(df + 2j, x) = P(a, y), the regularized lower
     // incomplete gamma with a = df/2 + j, y = x/2. Computing it fresh per term
@@ -3459,8 +3687,7 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     let y = x / 2.0;
     let a0 = 0.5 * df + j0;
     let p0 = chdtr(df + 2.0 * j0, x); // = P(a0, y)
-    let t0 =
-        (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    let t0 = poisson_term(a0, y); // = y^a0 e^{−y} / Γ(a0 + 1)
     // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
     if p0 == 0.0 && t0 == 0.0 {
         return 0.0;
@@ -3586,15 +3813,13 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     if j0 >= crate::beta::POISSON_INDEX_LIMIT {
         return f64::NAN;
     }
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // Saddle-point anchors, as in `chndtr` (frankenscipy-g9yid).
+    let w0 = poisson_term(j0, lam);
 
     let y = x / 2.0;
     let a0 = 0.5 * df + j0;
     let q0 = chdtrc(df + 2.0 * j0, x); // = Q(a0, y), computed directly, never as 1 - P
-    let t0 =
-        (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    let t0 = poisson_term(a0, y); // = y^a0 e^{−y} / Γ(a0 + 1)
     // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
     if q0 == 0.0 && t0 == 0.0 {
         return 0.0;

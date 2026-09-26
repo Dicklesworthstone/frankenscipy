@@ -551,8 +551,9 @@ pub fn fdtridfd(dfn: f64, p: f64, x: f64) -> f64 {
 ///    f64 here. SciPy 1.17.1 (Boost) is nan at the centre too: `chndtr(2^60, 3, 2^60)`,
 ///    `ncfdtr(3, 5, 2^60, 2^60/3)` and `nctdtr(5, 1.35e8, 1.35e8)` are all nan. In the far
 ///    tails SciPy instead answers 0 or 1, and this exit does not follow it, on purpose. The
-///    mode anchors are formed in log space as differences of terms of size `j₀·ln j₀`, so their
-///    exponent carries an absolute error of that size times ε. The probe measured chndtr's
+///    mode anchors were then formed in log space as differences of terms of size `j₀·ln j₀`
+///    (saddle-point form since frankenscipy-g9yid), so their exponent carried an absolute
+///    error of that size times ε. The probe measured chndtr's
 ///    `t0` exponent in f64 (Python `math.lgamma` standing in for `gammaln`) against mpmath.
 ///    At `nc = 2^60` the error reached 4075. In 168 of 401 points within 10 sd of the mean
 ///    the f64 anchor underflowed to 0 while the exact one is about e^-21. A zero anchor
@@ -603,6 +604,54 @@ pub(crate) fn poisson_upward_step_cap(lam: f64) -> f64 {
     (40.0 * lam.sqrt()).ceil().max(100_000.0)
 }
 
+/// `xᵃ·yᵇ·Γ(a+b) / (Γ(a+1)·Γ(b))` for `a, b > 0` and `y = 1 − x` passed in exactly: the
+/// incomplete beta increment `I_x(a,b) − I_x(a+1,b)`, and `1/a` times the front factor of
+/// [`betainc_scalar`] (frankenscipy-g9yid).
+///
+/// From `a + b = SADDLE_POINT_MIN_SHAPE` it is `b/(a+b)` times the binomial term
+/// `C(a+b, a)·xᵃyᵇ` in Loader's saddle-point form (R's `dbinom_raw` with `n = a + b`):
+/// `exp(stirlerr(a+b) − stirlerr(a) − stirlerr(b) − bd0(a, (a+b)x) − bd0(b, (a+b)y))`
+/// `· √(b / (2π·a·(a+b)))`. The log-space form it replaces,
+/// `exp(a·ln x + b·ln y + lnΓ(a+b) − lnΓ(a+1) − lnΓ(b))`, loses `ε·a·ln a` to cancellation.
+/// Worst relative error against mpmath over the ncfdtr, ncfdtrc and nctdtr mode anchors at
+/// x = mean and mean ± 3 sd (dfn = 3, dfd = 50; df = 5):
+///
+/// ```text
+/// λ        log-space   saddle point
+/// 1e3      1.2e-12     4.4e-15
+/// 1e6      8.0e-10     3.6e-15
+/// 1e8      2.4e-7      3.6e-15
+/// 1e10     4.2e-5      6.0e-15
+/// 1e12     3.8e-3      4.3e-15
+/// ```
+///
+/// The saddle-point form also tolerates an `x` and `y` that miss `x + y = 1` by a rounding:
+/// a relative error `δ` in `x` moves it by `((a+b)·x − a)·δ`, which is O(δ) near the mode,
+/// where the log-space form's `xᵃ` moves by `a·δ`. That matters for ncfdtrc, whose `x` and
+/// `y` are rounded separately.
+pub(crate) fn beta_term(a: f64, b: f64, x: f64, y: f64) -> f64 {
+    if a.is_nan() || b.is_nan() || x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    let n = a + b;
+    if n < gamma::SADDLE_POINT_MIN_SHAPE {
+        let lg = |z: f64| gammaln_scalar(z, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        return (a * x.ln() + b * y.ln() + lg(n) - lg(a + 1.0) - lg(b)).exp();
+    }
+    if a.is_infinite() || b.is_infinite() || n.is_infinite() {
+        return f64::NAN;
+    }
+    if x == 0.0 || y == 0.0 {
+        return 0.0;
+    }
+    let lc = gamma::stirlerr(n)
+        - gamma::stirlerr(a)
+        - gamma::stirlerr(b)
+        - gamma::bd0(a, n * x)
+        - gamma::bd0(b, n * y);
+    lc.exp() * (b / n / (std::f64::consts::TAU * a)).sqrt()
+}
+
 /// Non-central F cumulative distribution function.
 ///
 /// Matches `scipy.special.ncfdtr(dfn, dfd, nc, f)`: the CDF at `f` of a
@@ -618,8 +667,8 @@ pub(crate) fn poisson_upward_step_cap(lam: f64) -> f64 {
 /// ```
 ///
 /// The sum is accumulated outward from the Poisson mode `j₀ = ⌊λ⌋` (mode weight
-/// formed in log space) so large `nc` neither underflows `e^{−λ}` nor loses
-/// precision.
+/// from `gamma::poisson_term`, saddle-point form from λ = 100) so large `nc`
+/// neither underflows `e^{−λ}` nor loses precision.
 #[must_use]
 pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     if dfn.is_nan() || dfd.is_nan() || nc.is_nan() || f.is_nan() {
@@ -658,15 +707,21 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     if nc == 0.0 {
         return btdtr(0.5 * dfn, 0.5 * dfd, y);
     }
+    // 1 − y in closed form, as in `ncfdtrc` (frankenscipy-g9yid). `1.0 - y` carries the
+    // rounding of y as a relative error of up to ε·dfn·f/(2·dfd) in 1 − y, 4.6e-6 near the
+    // mean at λ = 1e12, and ncfdtr there missed by 3.5e-6 with saddle-point anchors. With y1
+    // it misses by 1.3e-9.
+    let y1 = dfd / denom;
     let lam = nc / 2.0;
     let j0 = lam.floor();
     // frankenscipy-qu5po: the walk cannot step from here (see `POISSON_INDEX_LIMIT`).
     if j0 >= POISSON_INDEX_LIMIT {
         return f64::NAN;
     }
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // Saddle-point anchors (frankenscipy-g9yid): the Poisson weight here, the incomplete beta
+    // and its increment below. In log space each lost about λ·ln λ·ε (2.5e-7 at λ = 1e8,
+    // 4e-3 at 1e12); see `gamma::poisson_term` and `beta_term`.
+    let w0 = gamma::poisson_term(j0, lam);
 
     // Each Poisson term needs btdtr(0.5·dfn + j, 0.5·dfd, y) = I_y(a, b), the
     // regularized incomplete beta with a = 0.5·dfn + j, b = 0.5·dfd. Computing it
@@ -682,13 +737,8 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     // ≤4.3e-13 rel across nc up to 4000 and tails to 1e-144.
     let b = 0.5 * dfd;
     let a0 = 0.5 * dfn + j0;
-    let p0 = btdtr(a0, b, y); // = I_y(a0, b)
-    let u0 = (a0 * y.ln()
-        + b * (-y).ln_1p()
-        + gammaln_scalar(a0 + b, RuntimeMode::Strict).unwrap_or(f64::NAN)
-        - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
-        - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
-    .exp();
+    let p0 = betainc_with_complement(a0, b, y, y1).unwrap_or(f64::NAN); // = I_y(a0, b)
+    let u0 = beta_term(a0, b, y, y1); // = y^a0 (1−y)^b Γ(a0+b) / (Γ(a0+1) Γ(b))
     // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`).
     if p0 == 0.0 && u0 == 0.0 {
         return 0.0;
@@ -839,21 +889,15 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     if j0 >= POISSON_INDEX_LIMIT {
         return f64::NAN;
     }
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // Saddle-point anchors, as in `ncfdtr` (frankenscipy-g9yid).
+    let w0 = gamma::poisson_term(j0, lam);
 
     let a0 = 0.5 * dfn + j0;
     // Q_y(a0, b) = I_{1−y}(b, a0), computed DIRECTLY — never 1 − I_y(a0, b).
     let q0 = betainc_scalar(b, a0, y1, RuntimeMode::Strict).unwrap_or(f64::NAN);
     // u(a) = y^a (1−y)^b · Γ(a+b)/(Γ(a+1)Γ(b)), the recurrence increment shared
-    // with `ncfdtr`; (1−y)^b taken as b·ln(y1) so it stays exact for y → 1.
-    let u0 = (a0 * y.ln()
-        + b * y1.ln()
-        + gammaln_scalar(a0 + b, RuntimeMode::Strict).unwrap_or(f64::NAN)
-        - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
-        - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
-    .exp();
+    // with `ncfdtr`; (1−y)^b taken from y1 so it stays exact for y → 1.
+    let u0 = beta_term(a0, b, y, y1);
     // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`).
     if q0 == 0.0 && u0 == 0.0 {
         return 0.0;
@@ -1262,8 +1306,9 @@ pub fn nctdtridf(p: f64, nc: f64, t: f64) -> f64 {
 /// ```
 ///
 /// with `nctdtr(df, nc, t) = 1 − nctdtr(df, −nc, −t)` for `t < 0`. The series is
-/// summed outward from the Poisson mode `j₀=⌊λ⌋` (mode weights formed in log
-/// space, with `q`'s sign carried separately) so large `nc` stays stable.
+/// summed outward from the Poisson mode `j₀=⌊λ⌋` (mode weights from
+/// `gamma::poisson_term`, with `q`'s sign carried separately) so large `nc` stays
+/// stable.
 #[must_use]
 pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     if df.is_nan() || nc.is_nan() || t.is_nan() {
@@ -1314,11 +1359,16 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     if j0 >= POISSON_INDEX_LIMIT {
         return f64::NAN;
     }
-    let lg = |z: f64| gammaln_scalar(z, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let p0 = (-lam + j0 * lam.ln() - lg(j0 + 1.0)).exp();
+    // Saddle-point anchors (frankenscipy-g9yid). In log space p0, q0 and the increments tp0,
+    // tq0 each lost about λ·ln λ·ε: 2.5e-7 at λ = 1e8 and 4e-3 at λ = 1e12, and nctdtr at the
+    // mean missed mpmath by 5e-8 and 5e-3 there. See `gamma::poisson_term` and `beta_term`.
+    // p0 = e^{−λ} λ^{j0} / j0!, and q0 = (δ/√2)·e^{−λ} λ^{j0} / Γ(j0 + 3/2), which is
+    // (δ/√(2λ))·poisson_term(j0 + ½, λ) with δ/√(2λ) = ±1 up to the rounding of λ.
+    let p0 = gamma::poisson_term(j0, lam);
     let q_sign = if nc >= 0.0 { 1.0 } else { -1.0 };
     let q0 = q_sign
-        * ((nc.abs() / std::f64::consts::SQRT_2).ln() - lam + j0 * lam.ln() - lg(j0 + 1.5)).exp();
+        * (nc.abs() / std::f64::consts::SQRT_2 / lam.sqrt())
+        * gamma::poisson_term(j0 + 0.5, lam);
 
     // The p- and q-terms need I_x(a, df/2) along the integer-stepped chains
     // a = j+½ and a = j+1. Rather than a fresh `btdtr` continued fraction per
@@ -1329,17 +1379,20 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     // The recurrence is absolutely stable (~1e-15); its relative precision only
     // decays where I_x→0, which coincides with negligible Poisson weight (and
     // the loop's early-exit), so the summed CDF stays exact to ~1e-14.
-    let ln_x = x.ln();
-    let ln_1mx = (-x).ln_1p();
-    let t_seed = |a: f64| {
-        (a * ln_x + half_df * ln_1mx - a.ln() - (lg(a) + lg(half_df) - lg(a + half_df))).exp()
-    };
+    //
+    // 1 − x in closed form, df/(t² + df) (frankenscipy-g9yid). x rounds to within ε of 1 at
+    // large t, so `1.0 - x` carried a relative error of up to ε·t²/(2·df), 6e-11 at t = 1682,
+    // and with saddle-point anchors nctdtr at the mean still missed mpmath by 2e-11 at
+    // λ = 1e6, 2e-9 at 1e8 and 3e-7 at 1e10. The anchors now take x1 for 1 − x: 1e-14, 1e-13
+    // and 1e-12.
+    let x1 = df / (t * t + df);
     let ap0 = j0 + 0.5;
     let aq0 = j0 + 1.0;
-    let ip0 = btdtr(ap0, half_df, x);
-    let iq0 = btdtr(aq0, half_df, x);
-    let tp0 = t_seed(ap0);
-    let tq0 = t_seed(aq0);
+    let ip0 = betainc_with_complement(ap0, half_df, x, x1).unwrap_or(f64::NAN);
+    let iq0 = betainc_with_complement(aq0, half_df, x, x1).unwrap_or(f64::NAN);
+    // T(a, b) = xᵃ(1−x)ᵇ / (a·B(a, b)) = xᵃ(1−x)ᵇ·Γ(a+b) / (Γ(a+1)·Γ(b)).
+    let tp0 = beta_term(ap0, half_df, x, x1);
+    let tq0 = beta_term(aq0, half_df, x, x1);
     // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`). With every anchor
     // zero the series `s` is exactly 0 and the CDF is Φ(−δ).
     if ip0 == 0.0 && iq0 == 0.0 && tp0 == 0.0 && tq0 == 0.0 {
@@ -2621,12 +2674,32 @@ pub fn betainc_scalar(a: f64, b: f64, x: f64, mode: RuntimeMode) -> Result<f64, 
         };
     }
 
-    let ln_beta = betaln_scalar(a, b, RuntimeMode::Strict)?;
-    let front = (a * x.ln() + b * (1.0 - x).ln() - ln_beta).exp();
+    betainc_with_complement(a, b, x, 1.0 - x)
+}
+
+/// `I_x(a, b)` for `a, b > 0` and `x ∈ (0, 1)`, with the complement `y = 1 − x` passed in.
+///
+/// [`betainc_scalar`] passes `1.0 - x`. A caller that has `1 − x` in closed form passes that
+/// instead (frankenscipy-g9yid): nctdtr's `x = t²/(t²+df)` rounds to within `ε` of 1 at large
+/// `t`, so `1.0 - x` carries a relative error of `ε·t²/df`, 1e-10 at `t = 1682`. nctdtr at the
+/// mean then missed mpmath by 2e-11 at λ = 1e6, 2e-9 at 1e8 and 3e-7 at 1e10; with
+/// `y = df/(t²+df)` it misses by 1e-14, 1e-13 and 1e-12.
+///
+/// From `a + b = SADDLE_POINT_MIN_SHAPE` the front factor `xᵃyᵇ/B(a,b)` is `a·beta_term`
+/// (saddle-point form) instead of `exp(a·ln x + b·ln y − ln B(a,b))`, whose logs cancel to
+/// `ε·a·ln a`. Against scipy.special.betainc at the ncfdtr and nctdtr mode anchors near the
+/// mean it went from 1.3e-7 (λ = 1e8) and 2.4e-3 (λ = 1e12) to below 3e-15.
+pub(crate) fn betainc_with_complement(a: f64, b: f64, x: f64, y: f64) -> Result<f64, SpecialError> {
+    let front = if a + b >= gamma::SADDLE_POINT_MIN_SHAPE {
+        a * beta_term(a, b, x, y)
+    } else {
+        let ln_beta = betaln_scalar(a, b, RuntimeMode::Strict)?;
+        (a * x.ln() + b * y.ln() - ln_beta).exp()
+    };
     if x < (a + 1.0) / (a + b + 2.0) {
         Ok(front * betacf(a, b, x) / a)
     } else {
-        Ok(1.0 - front * betacf(b, a, 1.0 - x) / b)
+        Ok(1.0 - front * betacf(b, a, y) / b)
     }
 }
 
@@ -4741,9 +4814,10 @@ mod tests {
     ///
     /// The tolerance is 1e-3 relative at λ = 1e10 and 1e-4 at λ = 1e9. The capped walk misses
     /// by 2.5e-2 to 0.95 and by 7.8e-4. The uncapped transliteration lands within 1e-5 and
-    /// 1.5e-6. That remainder comes from the mode anchors, not the walk: they are formed in
-    /// log space from terms of size λ·ln λ, so they carry an error of about that size times ε,
-    /// and the cap does not touch them.
+    /// 1.5e-6. That remainder came from the mode anchors, not the walk: they were formed in
+    /// log space from terms of size λ·ln λ, so they carried an error of about that size times
+    /// ε, and the cap does not touch them. They are in saddle-point form now; see
+    /// `noncentral_mode_anchors_hold_at_large_noncentrality`.
     ///
     /// Must not change: below λ = 6.25e6 the cap is still 100,000, so these existing goldens
     /// hold to 1e-10: chndtr(2000, 2, 2000) = 0.49553941086177933,
@@ -4857,6 +4931,123 @@ mod tests {
                 "{label} = {got}, SciPy 1.17.1 gives {want}"
             );
         }
+    }
+
+    /// frankenscipy-g9yid, item 2. The noncentral walks start from terms at the Poisson mode:
+    /// the weight `e^(−λ)λ^j₀/j₀!`, the incomplete gamma or beta there, and its increment. All
+    /// were formed as the `exp` of a sum of logs of size `λ·ln λ`, so they carried an error of
+    /// about `λ·ln λ·ε`, and SciPy is NaN or inaccurate at these λ. They are now in Loader's
+    /// saddle-point form (`gamma::poisson_term`, `beta_term`, and the large-shape paths of the
+    /// incomplete gamma and beta), and nctdtr takes `1 − x` as `df/(t² + df)`.
+    ///
+    /// Expected values are mpmath at 40 digits, from integrals that are not Poisson sums:
+    /// chndtr for df = 3 is `∫₀ˣ ½e^(−w/2)·[Φ(√(x−w) − √nc) − Φ(−√(x−w) − √nc)] dw`, and
+    /// nctdtr is `∫₀^∞ f_χ²(df)(v)·Φ(t·√(v/df) − nc) dv`. At λ = 100 and 1e4, at the mean
+    /// and ±3 sd, both agree with SciPy 1.17.1 to 5e-15 wherever the CDF is above 1e-30, and
+    /// at λ = 1e6 the nctdtr integral agrees with an mpmath Lenth series to 20 digits.
+    /// Relative errors below are from a float transliteration of each arm.
+    /// "Before" is this code with `gamma::SADDLE_POINT_MIN_SHAPE = f64::INFINITY`, which puts
+    /// every anchor back in log space. The code before this change also cut the incomplete
+    /// gamma series off at 2,000,000 terms and missed chndtr(2e12 + 3, 3, 2e12) by 4.3e-2.
+    ///
+    /// ```text
+    ///                                λ       mpmath                 before    after
+    /// chndtr(2e8 + 3, 3, 2e8)        1e8     0.50001410473950935    2.5e-8    1.0e-13
+    /// chndtr(2e10 + 3, 3, 2e10)      1e10    0.50000141047395879    1.4e-5    1.3e-12
+    /// chndtr(2e12 + 3, 3, 2e12)      1e12    0.50000014104739589    1.9e-3    1.3e-11
+    /// nctdtr(5, 14142, 16821)        1.0e8   0.61822294435768955    1.1e-7    1.5e-13
+    /// nctdtr(5, 141421, 168209)      1.0e10  0.61820905927730827    2.7e-5    1.5e-12
+    /// nctdtr(5, 1414214, 1682089)    1.0e12  0.61820540746559938    1.3e-5    1.4e-11
+    /// ```
+    ///
+    /// The error left after the fix grows as about 1.3e-17·√λ and is the walk's own rounding:
+    /// at λ = 1e10 the walk started from mpmath-exact anchors still misses by 1.25e-12. The
+    /// tolerance is 1e-16·√λ, about 8 times that and more than 20,000 times below every
+    /// before-arm error.
+    ///
+    /// Must not change, bit-identical: with every shape below `SADDLE_POINT_MIN_SHAPE`, each
+    /// anchor keeps its old log-space expression operation for operation, so
+    /// chndtr(5, 3, 3) = 0.49007134573953426 as before. That literal is from the float
+    /// transliteration, not from a cargo run, so it is asserted to 1e-15 rather than bit for
+    /// bit.
+    ///
+    /// The walks run on a worker thread and the test waits at most 60 s.
+    #[test]
+    fn noncentral_mode_anchors_hold_at_large_noncentrality() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rows: Vec<(&str, f64, f64, f64)> = vec![
+                (
+                    "chndtr(2e8 + 3, 3, 2e8)",
+                    gamma::chndtr(2e8 + 3.0, 3.0, 2e8),
+                    0.500_014_104_739_509_4,
+                    1e8,
+                ),
+                (
+                    "chndtr(2e10 + 3, 3, 2e10)",
+                    gamma::chndtr(2e10 + 3.0, 3.0, 2e10),
+                    0.500_001_410_473_958_7,
+                    1e10,
+                ),
+                (
+                    "chndtr(2e12 + 3, 3, 2e12)",
+                    gamma::chndtr(2e12 + 3.0, 3.0, 2e12),
+                    0.500_000_141_047_395_9,
+                    1e12,
+                ),
+                (
+                    "nctdtr(5, 14142, 16821)",
+                    nctdtr(5.0, 14142.0, 16821.0),
+                    0.618_222_944_357_689_5,
+                    0.5 * 14142.0 * 14142.0,
+                ),
+                (
+                    "nctdtr(5, 141421, 168209)",
+                    nctdtr(5.0, 141_421.0, 168_209.0),
+                    0.618_209_059_277_308_3,
+                    0.5 * 141_421.0 * 141_421.0,
+                ),
+                (
+                    "nctdtr(5, 1414214, 1682089)",
+                    nctdtr(5.0, 1_414_214.0, 1_682_089.0),
+                    0.618_205_407_465_599_4,
+                    0.5 * 1_414_214.0 * 1_414_214.0,
+                ),
+            ];
+            let unchanged = gamma::chndtr(5.0, 3.0, 3.0);
+            let _ = tx.send((rows, unchanged));
+        });
+        let received = rx.recv_timeout(std::time::Duration::from_secs(60));
+        assert!(
+            received.is_ok(),
+            "a noncentral CDF did not return within 60 s (frankenscipy-g9yid)"
+        );
+        let (rows, unchanged) = received.unwrap_or_default();
+        // The worker has sent its rows and only returns now, so this join does not wait on a
+        // walk.
+        assert!(
+            worker.join().is_ok(),
+            "the frankenscipy-g9yid worker thread panicked"
+        );
+
+        let mut failures = Vec::new();
+        for (label, got, want, lam) in rows {
+            let rel = ((got - want) / want).abs();
+            let tol = 1e-16 * lam.sqrt();
+            // `!(rel <= tol)` so that a NaN also fails.
+            if !(rel <= tol) {
+                failures.push(format!(
+                    "{label} = {got}, mpmath gives {want} (relative error {rel:e} > {tol:e})"
+                ));
+            }
+        }
+        let want = 0.490_071_345_739_534_26;
+        if !((unchanged - want).abs() <= 1e-15 * want) {
+            failures.push(format!(
+                "chndtr(5, 3, 3) = {unchanged}, it was {want} before frankenscipy-g9yid"
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// frankenscipy-g9yid. ncfdtr and nctdtr at an infinite or overflowing argument, and
