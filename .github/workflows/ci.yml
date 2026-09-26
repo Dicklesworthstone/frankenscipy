@@ -286,9 +286,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
+          # networkx and mpmath are the oracles for the few routines SciPy lacks (see
+          # python_oracle/requirements.txt); without them those ledgered tests compare nothing.
+          python -m pip install "networkx==3.6.1" "mpmath==1.4.1"
           python - <<'EOF'
-          import numpy, scipy, os, sys
-          print("scipy", scipy.__version__, "numpy", numpy.__version__, sys.executable)
+          import numpy, scipy, networkx, mpmath, os, sys
+          print("scipy", scipy.__version__, "numpy", numpy.__version__, "networkx",
+                networkx.__version__, "mpmath", mpmath.__version__, sys.executable)
           assert scipy.__version__ == os.environ["PINNED_SCIPY"], scipy.__version__
           assert numpy.__version__ == os.environ["PINNED_NUMPY"], numpy.__version__
           EOF

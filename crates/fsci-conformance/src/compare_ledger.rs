@@ -21,6 +21,7 @@
 //!
 //! // (case id, SciPy's value or None when it raised, fsci's result)
 //! let cases = [("a", Some(1.0), Ok(1.0)), ("b", Some(2.0), Ok(2.0 + 1e-15))];
+//! let n = cases.len();
 //! let mut ledger = CompareLedger::new("diff_example", &["value"]);
 //! for (case_id, scipy, fsci) in cases {
 //!     let fsci: Result<f64, String> = fsci;
@@ -29,7 +30,7 @@
 //!     };
 //!     ledger.compared("value", case_id, (f - s).abs() <= 1e-12);
 //! }
-//! let counts = ledger.finish(cases.len()); // every case must have been compared
+//! let counts = ledger.finish(n); // every case must have been compared
 //! assert_eq!(counts["value"].compared_cases, 2);
 //! ```
 
