@@ -671,7 +671,9 @@ pub struct Output {
     /// `√(res_var · var_k)`, 0 for a fixed or dropped (rank-deficient) parameter, and NaN where
     /// SciPy's is: an overflowed variance times a zero `res_var`.
     pub sd_beta: Vec<f64>,
-    /// SciPy's `cov_beta` multiplied by `res_var` (SciPy leaves it unscaled).
+    /// ODRPACK's covariance of the estimated parameters as SciPy reports it: NOT scaled by
+    /// `res_var`, so `sd_beta_k = √(res_var · cov_beta_kk)`. 0 for a fixed or dropped parameter,
+    /// and all zeros after a numerical-error stop.
     pub cov_beta: Vec<Vec<f64>>,
     /// Input corrections: `xplus = x + delta`.
     pub delta: Vec<f64>,
@@ -2167,7 +2169,7 @@ const ODRPACK_RANK_TOLERANCE: f64 = f64::EPSILON;
 /// ODRPACK's covariance step (DODVCV), expanded to every parameter.
 struct OdrpackCovariance {
     res_var: f64,
-    /// SciPy's `cov_beta` times `res_var`.
+    /// SciPy's `cov_beta`: ODRPACK's VCV, not scaled by `res_var`.
     cov_beta: Vec<Vec<f64>>,
     sd_beta: Vec<f64>,
     /// DTRCO's estimate for the R that was kept (0 with no free parameter).
@@ -2262,14 +2264,15 @@ impl OdrpackCovariance {
             }
         }
         // SD = √(RVAR·var)/SSF with no clamp: an overflowed variance times a zero res_var is NaN,
-        // as SciPy reports it. VCV = var/(SSF_i·SSF_j), then scaled by res_var.
+        // as SciPy reports it. VCV = var/(SSF_i·SSF_j), unscaled by res_var, as SciPy reports
+        // `cov_beta` (frankenscipy-sawjl).
         let sd_beta = (0..np)
             .map(|k| (res_var * variance[k][k]).sqrt() / ssf[k])
             .collect();
         let cov_beta = (0..np)
             .map(|i| {
                 (0..np)
-                    .map(|j| variance[i][j] / (ssf[i] * ssf[j]) * res_var)
+                    .map(|j| variance[i][j] / (ssf[i] * ssf[j]))
                     .collect()
             })
             .collect();
@@ -2652,9 +2655,14 @@ mod tests {
             rhs.sum_square,
             tol * rhs.sum_square.abs().max(1.0),
         );
+        // cov_beta·res_var, the quantity this comparison held before cov_beta became SciPy's
+        // unscaled VCV (frankenscipy-sawjl). The raw VCV of an ill-conditioned fit amplifies
+        // the paths' last-iterate differences; the scaled product is the gate it always was.
         assert_eq!(lhs.cov_beta.len(), rhs.cov_beta.len());
         for (left, right) in lhs.cov_beta.iter().zip(&rhs.cov_beta) {
-            assert_vec_close(left, right, tol);
+            let left: Vec<f64> = left.iter().map(|v| v * lhs.res_var).collect();
+            let right: Vec<f64> = right.iter().map(|v| v * rhs.res_var).collect();
+            assert_vec_close(&left, &right, tol);
         }
     }
 
@@ -2899,8 +2907,11 @@ mod tests {
         );
 
         // The full normal matrix is [[2, 1], [1, 1]]. Its inverse has
-        // beta-block [[1]], while the old beta-only inverse was [[0.5]].
-        assert_close(covariance.cov_beta[0][0], 3.0, 1.0e-12);
+        // beta-block [[1]], while the old beta-only inverse was [[0.5]]. cov_beta is that
+        // block unscaled, and sd_beta = √(res_var·1).
+        assert_close(covariance.res_var, 3.0, 1.0e-12);
+        assert_close(covariance.cov_beta[0][0], 1.0, 1.0e-12);
+        assert_close(covariance.sd_beta[0], 3.0_f64.sqrt(), 1.0e-12);
     }
 
     #[test]
@@ -3237,12 +3248,12 @@ mod tests {
     /// optimum β0 = 110.3/55 (so fsci's solver takes no step at either scale):
     ///
     /// * s = 1e-100: sd_beta [0.01482682366364836], res_var 1.2090909090909083e-202,
-    ///   cov_beta·res_var [[0.00021983469995292298]], inv_condnum 1.0.
+    ///   cov_beta [[1.8181817289339506e198]], inv_condnum 1.0.
     /// * s = 1, must not change: sd_beta [0.014826824266328165], res_var 0.012090909090909053,
-    ///   cov_beta·res_var [[0.0002198347178245777]].
+    ///   cov_beta [[0.01818181876744633]].
     ///
     /// And the bead's exact fit, y = 2x, β0 = [2], s = 1e-100: cov_beta [[1.818182690913911e198]]
-    /// with res_var 0, so cov_beta·res_var [[0.0]] (fsci had NaN) and sd_beta [0.0].
+    /// with res_var 0, so sd_beta [0.0] (fsci had a NaN cov_beta).
     #[test]
     fn odr_covariance_rank_test_is_scale_relative_like_scipy() -> Result<(), OdrError> {
         let base = [1.0, 2.0, 3.0, 4.0, 5.0];
@@ -3252,13 +3263,13 @@ mod tests {
                 1.0e-100,
                 0.014_826_823_663_648_36,
                 1.209_090_909_090_908_3e-202,
-                0.000_219_834_699_952_922_98,
+                1.818_181_728_933_950_6e198,
             ),
             (
                 1.0,
                 0.014_826_824_266_328_165,
                 0.012_090_909_090_909_053,
-                0.000_219_834_717_824_577_7,
+                0.018_181_818_767_446_33,
             ),
         ] {
             let mut odr = ODR::new(
@@ -3290,9 +3301,15 @@ mod tests {
             ("structured", exact.run()?),
             ("dense", exact.run_dense_reference()?),
         ] {
-            assert_eq!(out.res_var, 0.0, "exact 1e-100, {path}");
-            assert_eq!(out.cov_beta, [[0.0]], "exact 1e-100, {path}");
-            assert_eq!(out.sd_beta, [0.0], "exact 1e-100, {path}");
+            let context = format!("exact 1e-100, {path}: {out:?}");
+            assert_eq!(out.res_var, 0.0, "{context}");
+            assert_rel(
+                out.cov_beta[0][0],
+                1.818_182_690_913_911e198,
+                1.0e-6,
+                &context,
+            );
+            assert_eq!(out.sd_beta, [0.0], "{context}");
         }
         Ok(())
     }
@@ -3304,18 +3321,21 @@ mod tests {
     /// `Model(β0·x)`, x = [0, 1, 2, 3], y = 2x + 0.1·[1, −1, 1, −1], β0 = [1, 1]:
     ///
     /// * ODR: sd_beta [0.02975082061988635, 0.0], res_var 0.0025036415077379776 = sum_square/3,
-    ///   cov_beta·res_var [[0.0008851113275566549, 0], [0, 0]], info 11, stopreason
+    ///   cov_beta [[0.35352957874402186, 0], [0, 0]], info 11, stopreason
     ///   ["Problem is not full rank at solution", "Sum of squares convergence"].
     /// * OLS: sd_beta [0.03642156969967579, 0.0], res_var 0.018571428571428513 (x = 0 has no
-    ///   derivative, so 3 − 1 degrees of freedom), info 11.
+    ///   derivative, so 3 − 1 degrees of freedom), cov_beta [[0.07142857827475708, 0], [0, 0]],
+    ///   info 11.
     ///
     /// A fixed parameter leaves the count the same way: unilinear with β0 fixed at 3, x = [0..3],
     /// y = [1.1, 3.9, 7.2, 9.9], β0 = [3, 0]: SciPy res_var 0.0022500000000339484 (sum_square/3;
-    /// fsci divided by n − 2) and sd_beta [0.0, 0.0749997788384343].
+    /// fsci divided by n − 2), sd_beta [0.0, 0.0749997788384343] and cov_beta
+    /// [[0, 0], [0, 2.499985255879638]].
     ///
     /// Must not change, a full-rank fit: unilinear, x = [1..5], y = [2.1, 3.9, 6.1, 7.9, 10.1],
     /// β0 = [1, 0], info 1 and SciPy's sd_beta with the analytic Jacobian fsci's unilinear uses,
-    /// [0.04003073470991557, 0.1327576599279166].
+    /// [0.04003073470991557, 0.1327576599279166], and sd_beta² = res_var·cov_beta on the
+    /// diagonal (frankenscipy-sawjl: cov_beta is not scaled by res_var).
     #[test]
     fn odr_rank_deficient_parameter_is_dropped_like_scipy() -> Result<(), OdrError> {
         let x = vec![0.0, 1.0, 2.0, 3.0];
@@ -3329,13 +3349,13 @@ mod tests {
                 FitType::Odr,
                 0.029_750_820_619_886_35,
                 0.002_503_641_507_737_977_6,
-                0.000_885_111_327_556_654_9,
+                0.353_529_578_744_021_86,
             ),
             (
                 FitType::Ols,
                 0.036_421_569_699_675_79,
                 0.018_571_428_571_428_513,
-                0.001_326_530_739_388_341_6,
+                0.071_428_578_274_757_08,
             ),
         ] {
             let mut odr = ODR::new(
@@ -3380,6 +3400,12 @@ mod tests {
             assert_rel(out.res_var, 0.002_250_000_000_033_948_4, 1.0e-9, &context);
             assert_eq!(out.sd_beta[0], 0.0, "{context}");
             assert_rel(out.sd_beta[1], 0.074_999_778_838_434_3, 1.0e-5, &context);
+            assert_eq!(
+                [out.cov_beta[0][0], out.cov_beta[0][1], out.cov_beta[1][0]],
+                [0.0; 3],
+                "{context}"
+            );
+            assert_rel(out.cov_beta[1][1], 2.499_985_255_879_638, 1.0e-5, &context);
             assert_eq!(out.info, 1, "{context}");
         }
 
@@ -3400,6 +3426,14 @@ mod tests {
             assert_eq!(out.stopreason.len(), 1, "{context}");
             assert_rel(out.sd_beta[0], 0.040_030_734_709_915_57, 1.0e-8, &context);
             assert_rel(out.sd_beta[1], 0.132_757_659_927_916_6, 1.0e-8, &context);
+            for k in 0..2 {
+                assert_rel(
+                    out.sd_beta[k].powi(2),
+                    out.res_var * out.cov_beta[k][k],
+                    1.0e-12,
+                    &context,
+                );
+            }
         }
         Ok(())
     }
@@ -3407,8 +3441,8 @@ mod tests {
     /// frankenscipy-i49i2: sd_beta was `max(var, 0).sqrt()`, which turned a NaN variance into 0.
     /// SciPy 1.17.1, `Model(β0·x)`, OLS, y = 2x exactly, β0 = [2], x = [1..5]·s:
     ///
-    /// * s = 1e-160: (RᵀR)⁻¹ overflows, cov_beta [[inf]] with res_var 0, so sd_beta [nan] and
-    ///   cov_beta·res_var [[nan]]; inv_condnum 1.0.
+    /// * s = 1e-160: (RᵀR)⁻¹ overflows, cov_beta [[inf]] with res_var 0, so sd_beta [nan];
+    ///   inv_condnum 1.0.
     /// * s = 1e-100: cov_beta [[1.818182690913911e198]], sd_beta [0.0].
     /// * s = 1, must not change: cov_beta [[0.018181818181818184]], sd_beta [0.0].
     ///
@@ -3431,11 +3465,16 @@ mod tests {
                 assert_eq!(out.res_var, 0.0, "{context}");
                 if scale == 1.0e-160 {
                     assert!(out.sd_beta[0].is_nan(), "{context}");
-                    assert!(out.cov_beta[0][0].is_nan(), "{context}");
+                    assert_eq!(out.cov_beta, [[f64::INFINITY]], "{context}");
                     assert_rel(out.inv_condnum, 1.0, 1.0e-12, &context);
                 } else {
+                    let cov = if scale == 1.0 {
+                        0.018_181_818_181_818_184
+                    } else {
+                        1.818_182_690_913_911e198
+                    };
                     assert_eq!(out.sd_beta, [0.0], "{context}");
-                    assert_eq!(out.cov_beta, [[0.0]], "{context}");
+                    assert_rel(out.cov_beta[0][0], cov, 1.0e-6, &context);
                 }
             }
         }

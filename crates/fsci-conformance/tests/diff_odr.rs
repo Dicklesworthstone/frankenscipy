@@ -40,7 +40,7 @@ struct OracleQuery {
 struct OracleCase {
     case_id: String,
     beta: Vec<f64>,
-    cov_beta_scaled: Vec<Vec<f64>>,
+    cov_beta: Vec<Vec<f64>>,
     sd_beta: Vec<f64>,
     res_var: f64,
 }
@@ -53,7 +53,7 @@ struct OracleResult {
 #[derive(Debug, Clone)]
 struct FsciCaseResult {
     beta: Vec<f64>,
-    cov_beta_scaled: Vec<Vec<f64>>,
+    cov_beta: Vec<Vec<f64>>,
     sd_beta: Vec<f64>,
     res_var: f64,
 }
@@ -190,11 +190,11 @@ for case in query["points"]:
     model = odr.Model(lambda beta, x: beta[0] * x + beta[1])
     data = odr.Data(x, y, we=we, wd=wd)
     out = odr.ODR(data, model, beta0=beta0).run()
-    scaled = np.asarray(out.cov_beta, dtype=float) * float(out.res_var)
+    cov = np.asarray(out.cov_beta, dtype=float)
     points.append({
         "case_id": case["case_id"],
         "beta": [float(v) for v in out.beta],
-        "cov_beta_scaled": [[float(v) for v in row] for row in scaled.tolist()],
+        "cov_beta": [[float(v) for v in row] for row in cov.tolist()],
         "sd_beta": [float(v) for v in out.sd_beta],
         "res_var": float(out.res_var),
     })
@@ -268,7 +268,7 @@ fn run_fsci_case(case: &OdrCase) -> TestResult<FsciCaseResult> {
         .map_err(|err| format!("run odr solver: {err}"))?;
     Ok(FsciCaseResult {
         beta: output.beta,
-        cov_beta_scaled: output.cov_beta,
+        cov_beta: output.cov_beta,
         sd_beta: output.sd_beta,
         res_var: output.res_var,
     })
@@ -352,8 +352,8 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
         let actual = run_fsci_case(case)
             .inspect_err(|err| eprintln!("odr fsci failure: {id} {err}"))
             .ok();
-        let scipy_diag = diagonal(&expected.cov_beta_scaled);
-        let fsci_diag = actual.as_ref().map(|a| diagonal(&a.cov_beta_scaled));
+        let scipy_diag = diagonal(&expected.cov_beta);
+        let fsci_diag = actual.as_ref().map(|a| diagonal(&a.cov_beta));
         let beta = ledger
             .slices(
                 "beta",
@@ -378,7 +378,7 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
                 fsci_diag.as_deref(),
             )
             .and(actual.as_ref())
-            .map(|a| max_rel_diff_diag(&a.cov_beta_scaled, &expected.cov_beta_scaled));
+            .map(|a| max_rel_diff_diag(&a.cov_beta, &expected.cov_beta));
         let res_var = ledger
             .pair(
                 "res_var",
