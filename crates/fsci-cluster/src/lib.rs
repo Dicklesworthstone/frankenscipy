@@ -4616,6 +4616,14 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
     let build_start = std::time::Instant::now();
     let dm = linkage_distance_matrix(&flat, n, d);
     let build_nanos = build_start.elapsed().as_nanos();
+    // Finite observations can still overflow to an infinite distance (|±1e200| apart squares
+    // to inf); SciPy checks the condensed matrix it builds and raises, where the centroid
+    // update would otherwise form inf - inf = NaN and clamp it to a 0.0 merge height.
+    if dm.iter().any(|v| !v.is_finite()) {
+        return Err(ClusterError::InvalidArgument(
+            "The condensed distance matrix must contain only finite values.".to_string(),
+        ));
+    }
     let agglomerate_start = std::time::Instant::now();
     let z = linkage_from_dm(n, dm, method);
     record_linkage_stage(0, build_nanos);
@@ -10228,6 +10236,27 @@ mod tests {
         assert_eq!(z[0][0], 0.0);
         assert_eq!(z[0][1], 1.0);
         assert!((z[0][2] - 1.0).abs() < 1e-10);
+    }
+
+    /// SciPy 1.17.1 `linkage([[1e200], [-1e200], [0]], method='centroid')` raises `ValueError:
+    /// The condensed distance matrix must contain only finite values.`: the points are finite
+    /// but two of them are 2e200 apart, whose square overflows to inf in the euclidean distance.
+    /// fsci checked only the observations, and the centroid update then formed inf - inf = NaN
+    /// and clamped it to a 0.0 merge height. `[[1], [3], [0]]` is SciPy's
+    /// [[0, 2, 1, 2], [1, 3, 2.5, 3]] and must not change.
+    #[test]
+    fn linkage_refuses_an_overflowing_distance_like_scipy() {
+        for method in [LinkageMethod::Centroid, LinkageMethod::Single] {
+            let err = linkage(&[vec![1e200], vec![-1e200], vec![0.0]], method)
+                .expect_err("scipy raises on a non-finite condensed distance");
+            assert!(
+                matches!(&err, ClusterError::InvalidArgument(msg) if msg.contains("only finite values")),
+                "{method:?}: {err:?}"
+            );
+        }
+        let z = linkage(&[vec![1.0], vec![3.0], vec![0.0]], LinkageMethod::Centroid)
+            .expect("finite data links");
+        assert_eq!(z, vec![[0.0, 2.0, 1.0, 2.0], [1.0, 3.0, 2.5, 3.0]]);
     }
 
     #[test]
