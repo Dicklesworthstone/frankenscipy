@@ -585,39 +585,55 @@ impl ODR {
             });
         }
         validate_finite_slice("model output", &yfit)?;
+        // SciPy's `eps` is ODRPACK's F = f(x + δ; β) − y, fitted minus observed
+        // (frankenscipy-i49i2); the solver's internal residual has the opposite sign.
         let eps = y
             .iter()
             .zip(yfit.iter())
-            .map(|(observed, fitted)| observed - fitted)
+            .map(|(observed, fitted)| fitted - observed)
             .collect::<Vec<_>>();
         let sum_square_eps = weighted_sum_square(&eps, &self.data.we);
         let sum_square_delta = weighted_sum_square(&delta, &self.data.wd);
         let sum_square = sum_square_eps + sum_square_delta;
-        let dof = y.len().saturating_sub(beta.len()).max(1);
+        let mut info = result.info;
+        let mut stopreason = vec![result.message];
         // ODRPACK never reaches its covariance step (DODVCV) after a numerical error, so SciPy
         // reports res_var, cov_beta and sd_beta as zeros there.
-        let covariance_skipped = result.info == ODRPACK_NUMERICAL_ERROR;
-        let res_var = if covariance_skipped {
-            0.0
+        let covariance = if result.info == ODRPACK_NUMERICAL_ERROR {
+            OdrpackCovariance::skipped(beta.len())
         } else {
-            sum_square / dof as f64
+            let (columns, observed_rows) = match &result.cov {
+                CovSource::Dense(jac) => (
+                    dense_profiled_beta_columns(jac, free_beta_indices.len()),
+                    dense_observed_rows(jac, y.len()),
+                ),
+                CovSource::Struct(jac) => (ctx.profiled_beta_columns(jac), ctx.observed_rows(jac)),
+            };
+            OdrpackCovariance::new(
+                columns,
+                observed_rows,
+                sum_square,
+                &self.beta0,
+                &free_beta_indices,
+            )
         };
-        let cov_beta = if covariance_skipped {
-            vec![vec![0.0; beta.len()]; beta.len()]
-        } else {
-            match &result.cov {
-                CovSource::Dense(jac) => {
-                    covariance_from_jacobian(jac, beta.len(), &free_beta_indices, res_var)
-                }
-                CovSource::Struct(jac) => ctx.covariance_beta(jac, beta.len(), res_var),
-            }
-        };
-        let sd_beta = cov_beta
-            .iter()
-            .enumerate()
-            .map(|(idx, row)| row.get(idx).copied().unwrap_or(f64::NAN).max(0.0).sqrt())
-            .collect::<Vec<_>>();
-        let inv_condnum = reciprocal_condition_proxy(&cov_beta);
+        // ODRPACK's tens digit of `info`: 1 when it dropped some of the free parameters from the
+        // covariance, 2 when it dropped all of them; SciPy reports both with this stopreason.
+        if covariance.rank_deficiency > 0 {
+            info += if covariance.rank_deficiency < free_beta_indices.len() {
+                10
+            } else {
+                20
+            };
+            stopreason.insert(0, String::from("Problem is not full rank at solution"));
+        }
+        let OdrpackCovariance {
+            res_var,
+            cov_beta,
+            sd_beta,
+            rcond: inv_condnum,
+            ..
+        } = covariance;
         Ok(Output {
             beta,
             sd_beta,
@@ -632,8 +648,8 @@ impl ODR {
             sum_square_eps,
             inv_condnum,
             rel_error: result.cost.abs() * f64::EPSILON,
-            info: result.info,
-            stopreason: vec![result.message],
+            info,
+            stopreason,
             nfev: result.nfev,
             njev: result.njev,
             nit: result.nit,
@@ -652,9 +668,14 @@ impl ODR {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Output {
     pub beta: Vec<f64>,
+    /// `√(res_var · var_k)`, 0 for a fixed or dropped (rank-deficient) parameter, and NaN where
+    /// SciPy's is: an overflowed variance times a zero `res_var`.
     pub sd_beta: Vec<f64>,
+    /// SciPy's `cov_beta` multiplied by `res_var` (SciPy leaves it unscaled).
     pub cov_beta: Vec<Vec<f64>>,
+    /// Input corrections: `xplus = x + delta`.
     pub delta: Vec<f64>,
+    /// Response errors as SciPy reports them: fitted minus observed (`Output::y − Data::y`).
     pub eps: Vec<f64>,
     pub xplus: Vec<f64>,
     pub y: Vec<f64>,
@@ -662,6 +683,7 @@ pub struct Output {
     pub sum_square: f64,
     pub sum_square_delta: f64,
     pub sum_square_eps: f64,
+    /// ODRPACK's reciprocal condition estimate of the scaled β Jacobian kept for the covariance.
     pub inv_condnum: f64,
     pub rel_error: f64,
     pub info: i32,
@@ -1575,54 +1597,42 @@ impl OdrStruct<'_> {
         Some(step)
     }
 
-    /// β covariance = res_var · (Schur complement of the δ–δ block of JᵀJ)⁻¹.
-    /// This equals the β-block of the inverse of the full (p+m)² normal matrix
-    /// the dense `covariance_from_jacobian` extracts, computed in O(n·p²).
-    fn covariance_beta(&self, sj: &StructJac, beta_len: usize, res_var: f64) -> Vec<Vec<f64>> {
+    /// The free-β columns of the weighted Jacobian with the δ corrections profiled out, in
+    /// ODRPACK's sign (`FJACB = √we·∂f/∂β`): DODSTP's `TFJACB = Ω⁻ᵀ·FJACB` for one input per
+    /// observation, row `i` divided by `Ω_i = √(1 + we_i·(∂f_i/∂x_i)²/wd_i)` when `δ_i` is free.
+    /// Their Gram matrix is the Schur complement of JᵀJ's δ–δ block, built in O(n·p) without
+    /// forming it. See [`dense_profiled_beta_columns`] for the dense path.
+    fn profiled_beta_columns(&self, sj: &StructJac) -> Vec<Vec<f64>> {
         let (n, p) = (self.n(), self.p());
-        let nan_cov = || vec![vec![f64::NAN; beta_len]; beta_len];
-        if beta_len == 0 {
-            return Vec::new();
-        }
-        if p == 0 {
-            return vec![vec![0.0; beta_len]; beta_len];
-        }
-
-        // c0_i = 1 for fixed-δ rows, b²/(a²+b²) for free-δ rows (μ = 0).
-        let mut c0 = vec![1.0; n];
+        let mut omega = vec![1.0; n];
         for (j, &dj) in self.free_delta.iter().enumerate() {
-            let a_j = sj.d_diag[j];
-            let b_j = sj.b[j];
-            let denom = a_j * a_j + b_j * b_j;
-            c0[dj] = if denom > 0.0 { b_j * b_j / denom } else { 0.0 };
+            // d/b = −√we·f′/√wd. A δ with no effect on its response profiles out nothing; a zero
+            // wd lets δ absorb the response error entirely (Ω = ∞, the row drops out).
+            let ratio = if sj.d_diag[j] == 0.0 {
+                0.0
+            } else {
+                sj.d_diag[j] / sj.b[j]
+            };
+            omega[dj] = (1.0 + ratio * ratio).sqrt();
         }
-        let mut schur = vec![vec![0.0; p]; p];
-        for (i, &ci) in c0.iter().enumerate().take(n) {
-            if ci == 0.0 {
-                continue;
-            }
-            let ai = &sj.a[i];
-            for lhs in 0..p {
-                let scaled = ai[lhs] * ci;
-                if scaled == 0.0 {
-                    continue;
-                }
-                let row = &mut schur[lhs];
-                for rhs in 0..p {
-                    row[rhs] += scaled * ai[rhs];
-                }
-            }
-        }
+        (0..p)
+            .map(|k| (0..n).map(|i| -sj.a[i][k] / omega[i]).collect())
+            .collect()
+    }
 
-        invert_matrix(schur).map_or_else(nan_cov, |inverse| {
-            let mut covariance = vec![vec![0.0; beta_len]; beta_len];
-            for (lhs_var, &lhs_beta) in self.free_beta.iter().enumerate() {
-                for (rhs_var, &rhs_beta) in self.free_beta.iter().enumerate() {
-                    covariance[lhs_beta][rhs_beta] = inverse[lhs_var][rhs_var] * res_var;
-                }
+    /// Observations with a nonzero weighted derivative with respect to a free β or, when its δ
+    /// is free, to its own input: ODRPACK's count behind the degrees of freedom (DODVCV's IDF).
+    fn observed_rows(&self, sj: &StructJac) -> usize {
+        let mut observed: Vec<bool> =
+            sj.a.iter()
+                .map(|row| row.iter().any(|&value| value != 0.0))
+                .collect();
+        for (j, &dj) in self.free_delta.iter().enumerate() {
+            if sj.d_diag[j] != 0.0 {
+                observed[dj] = true;
             }
-            covariance
-        })
+        }
+        observed.into_iter().filter(|&hit| hit).count()
     }
 }
 
@@ -2006,12 +2016,8 @@ fn solve_lm_step(
     })
 }
 
-/// Solve `matrix · x = rhs` via Gauss-Jordan elimination with partial pivoting.
-///
-/// Uses the same pivot selection and singularity guard as [`invert_matrix`], but
-/// transforms only the single RHS column rather than an n-column identity, so it
-/// costs ~half the arithmetic of inverting then multiplying. Result agrees with
-/// `invert_matrix(matrix)` applied to `rhs` to within floating-point roundoff.
+/// Solve `matrix · x = rhs` via Gauss-Jordan elimination with partial pivoting, transforming
+/// only the single RHS column. Used for the damped LM step, whose diagonal carries the damping.
 fn gaussian_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f64>> {
     let n = matrix.len();
     if n == 0 || rhs.len() != n || matrix.iter().any(|row| row.len() != n) {
@@ -2134,108 +2140,485 @@ fn max_abs(values: &[f64]) -> f64 {
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
 }
 
-fn covariance_from_jacobian(
-    jacobian: &[Vec<f64>],
-    beta_len: usize,
-    free_beta_indices: &[usize],
-    res_var: f64,
-) -> Vec<Vec<f64>> {
-    let variable_len = jacobian.first().map_or(0, Vec::len);
-    let nan_covariance = || vec![vec![f64::NAN; beta_len]; beta_len];
-    if beta_len == 0 {
-        return Vec::new();
-    }
-    if variable_len == 0
-        || free_beta_indices
-            .iter()
-            .any(|&beta_idx| beta_idx >= beta_len)
-    {
-        return nan_covariance();
-    }
+// ---------------------------------------------------------------------------
+// Covariance of the estimated β: ODRPACK's DODVCV (frankenscipy-i49i2).
+//
+// ODRPACK profiles the δ corrections out of the weighted β Jacobian (DODSTP's TFJACB), divides
+// column k by the scale of β_k (DSCLB, set from β0) and QR-factors the result with column
+// pivoting (DQRDC). While the reciprocal condition estimate of R (DTRCO) is at most EPSFCN it
+// drops the column that estimate's approximate null vector points at (DCHEX), so the rank test
+// is RELATIVE: a Jacobian passes or fails it the same way at any magnitude. (RᵀR)⁻¹ of the kept
+// columns (DPODI), unscaled, is the covariance before the residual variance; fixed and dropped
+// parameters get zero variance, and the degrees of freedom are the observations with a nonzero
+// weighted derivative minus the rank.
+//
+// This replaced an inverse of the full normal matrix JᵀJ behind an ABSOLUTE 1e-14 pivot test: a
+// β·x fit with x ~ 1e-100 failed it (sd_beta 0 where SciPy has 0.0148), and a parameter the
+// model ignores made every variance NaN where SciPy drops that one column.
+// ---------------------------------------------------------------------------
 
-    let mut normal = vec![vec![0.0; variable_len]; variable_len];
-    for row in jacobian {
-        if row.len() != variable_len {
-            return nan_covariance();
-        }
-        for lhs in 0..variable_len {
-            for rhs in 0..variable_len {
-                normal[lhs][rhs] += row[lhs] * row[rhs];
-            }
-        }
-    }
-    invert_matrix(normal).map_or_else(nan_covariance, |inverse| {
-        let mut covariance = vec![vec![0.0; beta_len]; beta_len];
-        for (lhs_var, &lhs_beta) in free_beta_indices.iter().enumerate() {
-            for (rhs_var, &rhs_beta) in free_beta_indices.iter().enumerate() {
-                covariance[lhs_beta][rhs_beta] = inverse[lhs_var][rhs_var] * res_var;
-            }
-        }
-        covariance
-    })
+/// ODRPACK's EPSFCN in the covariance rank test: η, the relative noise in the model's values.
+/// ODRPACK estimates it from five model evaluations at β0 (DETAF), floored at DMPREC = 2⁻⁵²; on
+/// every fit measured for frankenscipy-i49i2 it returned exactly 2⁻⁵². fsci does not spend those
+/// evaluations, so for a model noisier than machine precision it keeps a column whose reciprocal
+/// condition lies in (2⁻⁵², η] that ODRPACK would drop.
+const ODRPACK_RANK_TOLERANCE: f64 = f64::EPSILON;
+
+/// ODRPACK's covariance step (DODVCV), expanded to every parameter.
+struct OdrpackCovariance {
+    res_var: f64,
+    /// SciPy's `cov_beta` times `res_var`.
+    cov_beta: Vec<Vec<f64>>,
+    sd_beta: Vec<f64>,
+    /// DTRCO's estimate for the R that was kept (0 with no free parameter).
+    rcond: f64,
+    /// Free parameters dropped from R (ODRPACK's IRANK).
+    rank_deficiency: usize,
 }
 
-fn invert_matrix(mut matrix: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
-    let n = matrix.len();
-    if n == 0 || matrix.iter().any(|row| row.len() != n) {
+impl OdrpackCovariance {
+    /// The zeros SciPy reports when ODRPACK skipped its covariance step.
+    fn skipped(np: usize) -> Self {
+        Self {
+            res_var: 0.0,
+            cov_beta: vec![vec![0.0; np]; np],
+            sd_beta: vec![0.0; np],
+            rcond: 0.0,
+            rank_deficiency: 0,
+        }
+    }
+
+    /// DODVCV from the profiled Jacobian `columns` (one per entry of `free_beta`, in ODRPACK's
+    /// sign), the number of observations with a nonzero weighted derivative, the weighted sum of
+    /// squares, and β0, which sets the column scales.
+    fn new(
+        mut columns: Vec<Vec<f64>>,
+        observed_rows: usize,
+        sum_square: f64,
+        beta0: &[f64],
+        free_beta: &[usize],
+    ) -> Self {
+        let npp = free_beta.len();
+        let ssf = odrpack_beta_scale(beta0);
+        for (column, &k) in columns.iter_mut().zip(free_beta) {
+            for value in column.iter_mut() {
+                *value /= ssf[k];
+            }
+        }
+        let mut jpvt = qr_column_pivoted(&mut columns);
+        let rows = columns.first().map_or(0, Vec::len);
+        let mut r: Vec<Vec<f64>> = (0..npp)
+            .map(|i| {
+                (0..npp)
+                    .map(|j| {
+                        if i <= j && i < rows {
+                            columns[j][i]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // DODSTP's elimination loop: drop the column the null vector points at (IDAMAX: its
+        // first entry of largest magnitude) while RCOND <= EPSFCN. A NaN estimate drops nothing.
+        let mut kept = npp;
+        let mut rcond = 0.0;
+        while kept > 0 {
+            let (estimate, null_vector) = triangular_rcond(&r, kept);
+            rcond = estimate;
+            if !(estimate <= ODRPACK_RANK_TOLERANCE) {
+                break;
+            }
+            let drop = (0..kept).fold(0, |best, i| {
+                if null_vector[i].abs() > null_vector[best].abs() {
+                    i
+                } else {
+                    best
+                }
+            });
+            if drop + 1 != kept {
+                triangle_move_column_last(&mut r, drop, kept);
+                jpvt[drop..kept].rotate_left(1);
+            }
+            kept -= 1;
+        }
+        invert_gram_from_triangle(&mut r, kept);
+
+        let res_var = if observed_rows > kept {
+            sum_square / (observed_rows - kept) as f64
+        } else {
+            sum_square
+        };
+        // (RᵀR)⁻¹ back in parameter order; fixed and dropped parameters keep zero.
+        let np = beta0.len();
+        let mut variance = vec![vec![0.0; np]; np];
+        for i in 0..kept {
+            for j in i..kept {
+                let (a, b) = (free_beta[jpvt[i]], free_beta[jpvt[j]]);
+                variance[a][b] = r[i][j];
+                variance[b][a] = r[i][j];
+            }
+        }
+        // SD = √(RVAR·var)/SSF with no clamp: an overflowed variance times a zero res_var is NaN,
+        // as SciPy reports it. VCV = var/(SSF_i·SSF_j), then scaled by res_var.
+        let sd_beta = (0..np)
+            .map(|k| (res_var * variance[k][k]).sqrt() / ssf[k])
+            .collect();
+        let cov_beta = (0..np)
+            .map(|i| {
+                (0..np)
+                    .map(|j| variance[i][j] / (ssf[i] * ssf[j]) * res_var)
+                    .collect()
+            })
+            .collect();
+        Self {
+            res_var,
+            cov_beta,
+            sd_beta,
+            rcond,
+            rank_deficiency: npp - kept,
+        }
+    }
+}
+
+/// ODRPACK's DSCLB: the scale of each β from β0 (every parameter, fixed ones included).
+fn odrpack_beta_scale(beta0: &[f64]) -> Vec<f64> {
+    let bmax = beta0.iter().fold(0.0_f64, |acc, b| acc.max(b.abs()));
+    if bmax == 0.0 {
+        return vec![1.0; beta0.len()];
+    }
+    let bmin = beta0
+        .iter()
+        .filter(|b| **b != 0.0)
+        .fold(bmax, |acc, b| acc.min(b.abs()));
+    let spread = bmax.log10() - bmin.log10() >= 1.0;
+    beta0
+        .iter()
+        .map(|&b| {
+            if b == 0.0 {
+                10.0 / bmin
+            } else if spread {
+                1.0 / b.abs()
+            } else {
+                1.0 / bmax
+            }
+        })
+        .collect()
+}
+
+/// The dense Jacobian's free-β columns (`..p`) with its free-δ columns (`p..`) profiled out, in
+/// ODRPACK's sign: a Householder QR of the δ columns applied to the β columns, keeping the rows
+/// below the δ triangle. Their Gram matrix is the Schur complement of JᵀJ's δ–δ block, the matrix
+/// DODSTP builds row by row (TFJACB), here also for models whose responses share inputs.
+fn dense_profiled_beta_columns(jacobian: &[Vec<f64>], p: usize) -> Vec<Vec<f64>> {
+    let width = jacobian.first().map_or(0, Vec::len);
+    // Column-major and negated: the residual is y − f, ODRPACK's FJACB is ∂f/∂β.
+    let mut cols: Vec<Vec<f64>> = (0..width)
+        .map(|j| jacobian.iter().map(|row| -row[j]).collect())
+        .collect();
+    let mut top = 0;
+    for d in p..width {
+        let (before, from_d) = cols.split_at_mut(d);
+        let Some((delta_column, later)) = from_d.split_first_mut() else {
+            break;
+        };
+        let reflector = &mut delta_column[top..];
+        // A δ column that is zero below the triangle has nothing left to profile out.
+        if householder_reflector(reflector).is_none() {
+            continue;
+        }
+        for column in before[..p].iter_mut().chain(later.iter_mut()) {
+            apply_householder(reflector, &mut column[top..]);
+        }
+        top += 1;
+    }
+    cols.truncate(p);
+    for column in &mut cols {
+        column.drain(..top);
+    }
+    cols
+}
+
+/// Response rows (`..n_obs`) of the dense Jacobian with a nonzero weighted derivative for some
+/// free β or free δ: ODRPACK's count behind the degrees of freedom (DODVCV's IDF).
+fn dense_observed_rows(jacobian: &[Vec<f64>], n_obs: usize) -> usize {
+    jacobian
+        .iter()
+        .take(n_obs)
+        .filter(|row| row.iter().any(|&value| value != 0.0))
+        .count()
+}
+
+/// Euclidean norm with no overflow or underflow in the squares (LAPACK's scaled `dnrm2`):
+/// columns of order 1e-160 have subnormal squares.
+fn nrm2(values: &[f64]) -> f64 {
+    let (mut scale, mut ssq) = (0.0_f64, 1.0_f64);
+    for &value in values {
+        if value != 0.0 {
+            let magnitude = value.abs();
+            if scale < magnitude {
+                ssq = 1.0 + ssq * (scale / magnitude).powi(2);
+                scale = magnitude;
+            } else {
+                ssq += (magnitude / scale).powi(2);
+            }
+        }
+    }
+    scale * ssq.sqrt()
+}
+
+/// Turn `x` into a LINPACK (DQRDC) Householder reflector in place and return the signed norm it
+/// reflects `x` onto, `x ↦ (−norm, 0, …)`. `None`, with `x` untouched, for a zero vector.
+fn householder_reflector(x: &mut [f64]) -> Option<f64> {
+    let norm = nrm2(x);
+    if norm == 0.0 {
         return None;
     }
-    let mut inverse = vec![vec![0.0; n]; n];
-    for (idx, row) in inverse.iter_mut().enumerate() {
-        row[idx] = 1.0;
+    let norm = if x[0] == 0.0 {
+        norm
+    } else {
+        norm.copysign(x[0])
+    };
+    let inverse = 1.0 / norm;
+    for value in x.iter_mut() {
+        *value *= inverse;
     }
-    for pivot in 0..n {
-        let best = (pivot..n).max_by(|&lhs, &rhs| {
-            matrix[lhs][pivot]
-                .abs()
-                .total_cmp(&matrix[rhs][pivot].abs())
-        })?;
-        if matrix[best][pivot].abs() <= 1.0e-14 {
-            return None;
-        }
-        matrix.swap(pivot, best);
-        inverse.swap(pivot, best);
-        let scale = matrix[pivot][pivot];
-        for col in 0..n {
-            matrix[pivot][col] /= scale;
-            inverse[pivot][col] /= scale;
-        }
-        for row in 0..n {
-            if row == pivot {
-                continue;
-            }
-            let factor = matrix[row][pivot];
-            if factor == 0.0 {
-                continue;
-            }
-            for col in 0..n {
-                matrix[row][col] -= factor * matrix[pivot][col];
-                inverse[row][col] -= factor * inverse[pivot][col];
-            }
-        }
-    }
-    Some(inverse)
+    x[0] += 1.0;
+    Some(norm)
 }
 
-fn reciprocal_condition_proxy(matrix: &[Vec<f64>]) -> f64 {
-    let diag = matrix
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, row)| row.get(idx).copied())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect::<Vec<_>>();
-    if diag.is_empty() {
-        return 0.0;
+/// Apply a reflector from [`householder_reflector`] to `column`, both starting at the same row.
+fn apply_householder(reflector: &[f64], column: &mut [f64]) {
+    let t = -dot(reflector, column) / reflector[0];
+    for (value, &v) in column.iter_mut().zip(reflector) {
+        *value += t * v;
     }
-    let min = diag
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, |acc, value| acc.min(value));
-    let max = diag
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, value| acc.max(value));
-    if max == 0.0 { 0.0 } else { min / max }
+}
+
+/// LINPACK's DQRDC pivoting over every column (ODRPACK's call, all JPVT = 0): Householder QR of
+/// the matrix held column-major in `cols`, bringing forward the remaining column of largest
+/// (downdated) norm at each step. Leaves R's upper triangle in `cols[j][..=j]` and returns the
+/// original index of each column.
+fn qr_column_pivoted(cols: &mut [Vec<f64>]) -> Vec<usize> {
+    let p = cols.len();
+    let n = cols.first().map_or(0, Vec::len);
+    let mut jpvt: Vec<usize> = (0..p).collect();
+    let mut norms: Vec<f64> = cols.iter().map(|column| nrm2(column)).collect();
+    let mut reference = norms.clone();
+    for l in 0..n.min(p) {
+        if l + 1 < p {
+            let mut largest = 0.0;
+            let mut pick = l;
+            for j in l..p {
+                if norms[j] > largest {
+                    largest = norms[j];
+                    pick = j;
+                }
+            }
+            if pick != l {
+                cols.swap(l, pick);
+                norms[pick] = norms[l];
+                reference[pick] = reference[l];
+                jpvt.swap(l, pick);
+            }
+        }
+        if l + 1 == n {
+            break;
+        }
+        let (done, rest) = cols.split_at_mut(l + 1);
+        let reflector = &mut done[l][l..];
+        let Some(norm) = householder_reflector(reflector) else {
+            continue;
+        };
+        for (offset, column) in rest.iter_mut().enumerate() {
+            let j = l + 1 + offset;
+            apply_householder(reflector, &mut column[l..]);
+            if norms[j] == 0.0 {
+                continue;
+            }
+            // Downdate the column norm; recompute it once cancellation would make that inexact.
+            let tt = (1.0 - (column[l].abs() / norms[j]).powi(2)).max(0.0);
+            if 1.0 + 0.05 * tt * (norms[j] / reference[j]).powi(2) == 1.0 {
+                norms[j] = nrm2(&column[l + 1..]);
+                reference[j] = norms[j];
+            } else {
+                norms[j] *= tt.sqrt();
+            }
+        }
+        reflector[0] = -norm;
+    }
+    jpvt
+}
+
+/// LINPACK's DTRCO for the upper triangle of the `k × k` leading block of `r`: the reciprocal
+/// condition estimate `ynorm/‖R‖₁` and the approximate null vector it was built from.
+fn triangular_rcond(r: &[Vec<f64>], k: usize) -> (f64, Vec<f64>) {
+    let tnorm = (0..k)
+        .map(|j| (0..=j).map(|i| r[i][j].abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    // Solve Rᵀy = e, choosing e = ±1 to make y large.
+    let mut ek = 1.0_f64;
+    let mut z = vec![0.0; k];
+    for kk in 0..k {
+        let diagonal = r[kk][kk];
+        if z[kk] != 0.0 {
+            ek = ek.abs().copysign(-z[kk]);
+        }
+        if (ek - z[kk]).abs() > diagonal.abs() {
+            let s = diagonal.abs() / (ek - z[kk]).abs();
+            for value in &mut z {
+                *value *= s;
+            }
+            ek *= s;
+        }
+        let mut wk = ek - z[kk];
+        let mut wkm = -ek - z[kk];
+        let mut s = wk.abs();
+        let mut sm = wkm.abs();
+        if diagonal == 0.0 {
+            wk = 1.0;
+            wkm = 1.0;
+        } else {
+            wk /= diagonal;
+            wkm /= diagonal;
+        }
+        if kk + 1 < k {
+            for j in kk + 1..k {
+                sm += (z[j] + wkm * r[kk][j]).abs();
+                z[j] += wk * r[kk][j];
+                s += z[j].abs();
+            }
+            if s < sm {
+                let w = wkm - wk;
+                wk = wkm;
+                for j in kk + 1..k {
+                    z[j] += w * r[kk][j];
+                }
+            }
+        }
+        z[kk] = wk;
+    }
+    let s = 1.0 / z.iter().map(|value| value.abs()).sum::<f64>();
+    for value in &mut z {
+        *value *= s;
+    }
+    // Solve Rz = y.
+    let mut ynorm = 1.0;
+    for kk in (0..k).rev() {
+        let diagonal = r[kk][kk];
+        if z[kk].abs() > diagonal.abs() {
+            let s = diagonal.abs() / z[kk].abs();
+            for value in &mut z {
+                *value *= s;
+            }
+            ynorm *= s;
+        }
+        if diagonal == 0.0 {
+            z[kk] = 1.0;
+        } else {
+            z[kk] /= diagonal;
+        }
+        let w = -z[kk];
+        for i in 0..kk {
+            z[i] += w * r[i][kk];
+        }
+    }
+    let s = 1.0 / z.iter().map(|value| value.abs()).sum::<f64>();
+    for value in &mut z {
+        *value *= s;
+    }
+    ynorm *= s;
+    let rcond = if tnorm == 0.0 { 0.0 } else { ynorm / tnorm };
+    (rcond, z)
+}
+
+/// BLAS DROTG: the rotation with `[c s; −s c]·[a; b] = [r; 0]`, as `(r, c, s)`.
+fn givens_rotation(a: f64, b: f64) -> (f64, f64, f64) {
+    let scale = a.abs() + b.abs();
+    if scale == 0.0 {
+        return (0.0, 1.0, 0.0);
+    }
+    let larger = if a.abs() > b.abs() { a } else { b };
+    let radius = (scale * ((a / scale).powi(2) + (b / scale).powi(2)).sqrt()).copysign(larger);
+    (radius, a / radius, b / radius)
+}
+
+/// LINPACK's DCHEX, job 2, with `P = L = l`: move column `k` (0-based) of the `l × l` upper
+/// triangle in `r` to the last position, shift columns `k+1..l` left, and restore the triangle
+/// with Givens rotations. ODRPACK uses it to put the column it drops behind the kept ones.
+fn triangle_move_column_last(r: &mut [Vec<f64>], k: usize, l: usize) {
+    // 1-based from here on, as in LINPACK: column `kk` moves to position `l`.
+    let kk = k + 1;
+    let lmk = l - kk;
+    let mut c = vec![0.0; l + 1];
+    let mut s = vec![0.0; l + 1];
+    for i in 1..=kk {
+        s[lmk + i] = r[i - 1][kk - 1];
+    }
+    for j in kk..l {
+        for i in 1..=j {
+            r[i - 1][j - 1] = r[i - 1][j];
+        }
+        s[j - kk + 1] = r[j][j];
+    }
+    for i in 1..=kk {
+        r[i - 1][l - 1] = s[lmk + i];
+    }
+    for i in kk + 1..=l {
+        r[i - 1][l - 1] = 0.0;
+    }
+    for j in kk..=l {
+        if j != kk {
+            for i in kk..=(j - 1).min(l - 1) {
+                let ii = i - kk + 1;
+                let t = c[ii] * r[i - 1][j - 1] + s[ii] * r[i][j - 1];
+                r[i][j - 1] = c[ii] * r[i][j - 1] - s[ii] * r[i - 1][j - 1];
+                r[i - 1][j - 1] = t;
+            }
+        }
+        if j < l {
+            let jj = j - kk + 1;
+            let (radius, cosine, sine) = givens_rotation(r[j - 1][j - 1], s[jj]);
+            r[j - 1][j - 1] = radius;
+            c[jj] = cosine;
+            s[jj] = sine;
+        }
+    }
+}
+
+/// LINPACK's DPODI, job 1: overwrite the upper triangle of the `k × k` leading block of `r`, an
+/// upper-triangular R, with the upper triangle of (RᵀR)⁻¹.
+fn invert_gram_from_triangle(r: &mut [Vec<f64>], k: usize) {
+    // R⁻¹ in place.
+    for kk in 0..k {
+        r[kk][kk] = 1.0 / r[kk][kk];
+        let t = -r[kk][kk];
+        for i in 0..kk {
+            r[i][kk] *= t;
+        }
+        for j in kk + 1..k {
+            let t = r[kk][j];
+            r[kk][j] = 0.0;
+            for i in 0..=kk {
+                r[i][j] += t * r[i][kk];
+            }
+        }
+    }
+    // R⁻¹·R⁻ᵀ.
+    for j in 0..k {
+        for kk in 0..j {
+            let t = r[kk][j];
+            for i in 0..=kk {
+                r[i][kk] += t * r[i][j];
+            }
+        }
+        let t = r[j][j];
+        for i in 0..=j {
+            r[i][j] *= t;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2506,11 +2889,18 @@ mod tests {
     #[test]
     fn covariance_from_jacobian_uses_full_normal_beta_block() {
         let jacobian = vec![vec![1.0, 0.0], vec![1.0, 1.0]];
-        let covariance = covariance_from_jacobian(&jacobian, 1, &[0], 3.0);
+        // Column 0 is β, column 1 is δ; two observed rows and rank 1 make res_var = 3/1.
+        let covariance = OdrpackCovariance::new(
+            dense_profiled_beta_columns(&jacobian, 1),
+            2,
+            3.0,
+            &[1.0],
+            &[0],
+        );
 
         // The full normal matrix is [[2, 1], [1, 1]]. Its inverse has
         // beta-block [[1]], while the old beta-only inverse was [[0.5]].
-        assert_close(covariance[0][0], 3.0, 1.0e-12);
+        assert_close(covariance.cov_beta[0][0], 3.0, 1.0e-12);
     }
 
     #[test]
@@ -2808,11 +3198,299 @@ mod tests {
             assert_close(out.beta[0], 2.001_920_139_317_48, 1.0e-6);
             assert_close(out.beta[1], 0.014_239_795_736_218_601, 1.0e-5);
         }
+        // At 1e150 the intercept column, scaled by β0 as ODRPACK scales it, is 1e-151 of the slope
+        // column, so the covariance's relative rank test drops it: SciPy's info 11 and "Problem is
+        // not full rank at solution" (frankenscipy-i49i2; fsci reported info 1 before it ported
+        // that test).
         for (path, out) in [
             ("structured 1e150", large.run()?),
             ("dense 1e150", large.run_dense_reference()?),
         ] {
-            assert!(out.success && out.info == 1, "{path}: {out:?}");
+            assert!(out.success && out.info == 11, "{path}: {out:?}");
+            assert_eq!(
+                out.stopreason[0], "Problem is not full rank at solution",
+                "{path}"
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_rel(actual: f64, expected: f64, rel: f64, context: &str) {
+        assert!(
+            (actual - expected).abs() <= rel * expected.abs(),
+            "{context}: {actual:e} vs {expected:e} (relative tolerance {rel:e})"
+        );
+    }
+
+    /// `Model(β0·x)` with `parameters` parameters (β1.. unused), scalar-separable so that `run`
+    /// takes the structured path and `run_dense_reference` the dense one.
+    fn proportional_model(parameters: usize) -> Model {
+        Model::new(|b: &[f64], x: &[f64]| x.iter().map(|&v| b[0] * v).collect())
+            .with_parameter_count(parameters)
+            .with_scalar_separable(true)
+    }
+
+    /// frankenscipy-i49i2: the covariance inverted JᵀJ behind an ABSOLUTE 1e-14 pivot test, so a
+    /// Jacobian of order 1e-100 lost it (cov_beta NaN, sd_beta clamped to 0). ODRPACK rank-tests
+    /// the β-scaled R relative to its own norm, and SciPy reports the same sd_beta at any scale.
+    /// SciPy 1.17.1, `Model(β0·x)`, OLS, x = [1..5]·s, y = [2.1, 3.9, 6.1, 7.9, 10.1]·s, from the
+    /// optimum β0 = 110.3/55 (so fsci's solver takes no step at either scale):
+    ///
+    /// * s = 1e-100: sd_beta [0.01482682366364836], res_var 1.2090909090909083e-202,
+    ///   cov_beta·res_var [[0.00021983469995292298]], inv_condnum 1.0.
+    /// * s = 1, must not change: sd_beta [0.014826824266328165], res_var 0.012090909090909053,
+    ///   cov_beta·res_var [[0.0002198347178245777]].
+    ///
+    /// And the bead's exact fit, y = 2x, β0 = [2], s = 1e-100: cov_beta [[1.818182690913911e198]]
+    /// with res_var 0, so cov_beta·res_var [[0.0]] (fsci had NaN) and sd_beta [0.0].
+    #[test]
+    fn odr_covariance_rank_test_is_scale_relative_like_scipy() -> Result<(), OdrError> {
+        let base = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let noisy = [2.1, 3.9, 6.1, 7.9, 10.1];
+        for (scale, sd, res_var, cov) in [
+            (
+                1.0e-100,
+                0.014_826_823_663_648_36,
+                1.209_090_909_090_908_3e-202,
+                0.000_219_834_699_952_922_98,
+            ),
+            (
+                1.0,
+                0.014_826_824_266_328_165,
+                0.012_090_909_090_909_053,
+                0.000_219_834_717_824_577_7,
+            ),
+        ] {
+            let mut odr = ODR::new(
+                Data::new(
+                    base.iter().map(|v| v * scale).collect(),
+                    noisy.iter().map(|v| v * scale).collect(),
+                )?,
+                proportional_model(1),
+                vec![110.3 / 55.0],
+            )?;
+            odr.set_job(FitType::Ols);
+            for (path, out) in [
+                ("structured", odr.run()?),
+                ("dense", odr.run_dense_reference()?),
+            ] {
+                let context = format!("s = {scale:e}, {path}: {out:?}");
+                assert_rel(out.sd_beta[0], sd, 1.0e-7, &context);
+                assert_rel(out.res_var, res_var, 1.0e-12, &context);
+                assert_rel(out.cov_beta[0][0], cov, 1.0e-7, &context);
+                assert_rel(out.inv_condnum, 1.0, 1.0e-12, &context);
+            }
+        }
+
+        let x: Vec<f64> = base.iter().map(|v| v * 1.0e-100).collect();
+        let y = x.iter().map(|v| 2.0 * v).collect();
+        let mut exact = ODR::new(Data::new(x, y)?, proportional_model(1), vec![2.0])?;
+        exact.set_job(FitType::Ols);
+        for (path, out) in [
+            ("structured", exact.run()?),
+            ("dense", exact.run_dense_reference()?),
+        ] {
+            assert_eq!(out.res_var, 0.0, "exact 1e-100, {path}");
+            assert_eq!(out.cov_beta, [[0.0]], "exact 1e-100, {path}");
+            assert_eq!(out.sd_beta, [0.0], "exact 1e-100, {path}");
+        }
+        Ok(())
+    }
+
+    /// frankenscipy-i49i2: a model that ignores β1 has an exactly zero Jacobian column. fsci
+    /// inverted the singular JᵀJ (NaN everywhere, sd_beta clamped to [0, 0]); ODRPACK drops the
+    /// column from R (rank deficiency 1), reports the rest, and counts the degrees of freedom as
+    /// observations with a nonzero weighted derivative minus the rank. SciPy 1.17.1,
+    /// `Model(β0·x)`, x = [0, 1, 2, 3], y = 2x + 0.1·[1, −1, 1, −1], β0 = [1, 1]:
+    ///
+    /// * ODR: sd_beta [0.02975082061988635, 0.0], res_var 0.0025036415077379776 = sum_square/3,
+    ///   cov_beta·res_var [[0.0008851113275566549, 0], [0, 0]], info 11, stopreason
+    ///   ["Problem is not full rank at solution", "Sum of squares convergence"].
+    /// * OLS: sd_beta [0.03642156969967579, 0.0], res_var 0.018571428571428513 (x = 0 has no
+    ///   derivative, so 3 − 1 degrees of freedom), info 11.
+    ///
+    /// A fixed parameter leaves the count the same way: unilinear with β0 fixed at 3, x = [0..3],
+    /// y = [1.1, 3.9, 7.2, 9.9], β0 = [3, 0]: SciPy res_var 0.0022500000000339484 (sum_square/3;
+    /// fsci divided by n − 2) and sd_beta [0.0, 0.0749997788384343].
+    ///
+    /// Must not change, a full-rank fit: unilinear, x = [1..5], y = [2.1, 3.9, 6.1, 7.9, 10.1],
+    /// β0 = [1, 0], info 1 and SciPy's sd_beta with the analytic Jacobian fsci's unilinear uses,
+    /// [0.04003073470991557, 0.1327576599279166].
+    #[test]
+    fn odr_rank_deficient_parameter_is_dropped_like_scipy() -> Result<(), OdrError> {
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y: Vec<f64> = x
+            .iter()
+            .zip([1.0, -1.0, 1.0, -1.0])
+            .map(|(v, sign)| 2.0 * v + 0.1 * sign)
+            .collect();
+        for (fit_type, sd, res_var, cov) in [
+            (
+                FitType::Odr,
+                0.029_750_820_619_886_35,
+                0.002_503_641_507_737_977_6,
+                0.000_885_111_327_556_654_9,
+            ),
+            (
+                FitType::Ols,
+                0.036_421_569_699_675_79,
+                0.018_571_428_571_428_513,
+                0.001_326_530_739_388_341_6,
+            ),
+        ] {
+            let mut odr = ODR::new(
+                Data::new(x.clone(), y.clone())?,
+                proportional_model(2),
+                vec![1.0, 1.0],
+            )?;
+            odr.set_job(fit_type);
+            for (path, out) in [
+                ("structured", odr.run()?),
+                ("dense", odr.run_dense_reference()?),
+            ] {
+                let context = format!("{fit_type:?}, {path}: {out:?}");
+                assert_rel(out.sd_beta[0], sd, 1.0e-6, &context);
+                assert_eq!(out.sd_beta[1].to_bits(), 0.0_f64.to_bits(), "{context}");
+                assert_rel(out.res_var, res_var, 1.0e-12, &context);
+                assert_rel(out.cov_beta[0][0], cov, 1.0e-6, &context);
+                assert_eq!(
+                    [out.cov_beta[0][1], out.cov_beta[1][0], out.cov_beta[1][1]],
+                    [0.0; 3],
+                    "{context}"
+                );
+                assert_eq!(out.info, 11, "{context}");
+                assert_eq!(
+                    out.stopreason[0], "Problem is not full rank at solution",
+                    "{context}"
+                );
+            }
+        }
+
+        let fixed = ODR::new(
+            Data::new(x.clone(), vec![1.1, 3.9, 7.2, 9.9])?,
+            unilinear(),
+            vec![3.0, 0.0],
+        )?
+        .with_beta_free(vec![false, true])?;
+        for (path, out) in [
+            ("structured", fixed.run()?),
+            ("dense", fixed.run_dense_reference()?),
+        ] {
+            let context = format!("fixed β0, {path}: {out:?}");
+            assert_rel(out.res_var, 0.002_250_000_000_033_948_4, 1.0e-9, &context);
+            assert_eq!(out.sd_beta[0], 0.0, "{context}");
+            assert_rel(out.sd_beta[1], 0.074_999_778_838_434_3, 1.0e-5, &context);
+            assert_eq!(out.info, 1, "{context}");
+        }
+
+        let full_rank = ODR::new(
+            Data::new(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                vec![2.1, 3.9, 6.1, 7.9, 10.1],
+            )?,
+            unilinear(),
+            vec![1.0, 0.0],
+        )?;
+        for (path, out) in [
+            ("structured", full_rank.run()?),
+            ("dense", full_rank.run_dense_reference()?),
+        ] {
+            let context = format!("full rank, {path}: {out:?}");
+            assert_eq!(out.info, 1, "{context}");
+            assert_eq!(out.stopreason.len(), 1, "{context}");
+            assert_rel(out.sd_beta[0], 0.040_030_734_709_915_57, 1.0e-8, &context);
+            assert_rel(out.sd_beta[1], 0.132_757_659_927_916_6, 1.0e-8, &context);
+        }
+        Ok(())
+    }
+
+    /// frankenscipy-i49i2: sd_beta was `max(var, 0).sqrt()`, which turned a NaN variance into 0.
+    /// SciPy 1.17.1, `Model(β0·x)`, OLS, y = 2x exactly, β0 = [2], x = [1..5]·s:
+    ///
+    /// * s = 1e-160: (RᵀR)⁻¹ overflows, cov_beta [[inf]] with res_var 0, so sd_beta [nan] and
+    ///   cov_beta·res_var [[nan]]; inv_condnum 1.0.
+    /// * s = 1e-100: cov_beta [[1.818182690913911e198]], sd_beta [0.0].
+    /// * s = 1, must not change: cov_beta [[0.018181818181818184]], sd_beta [0.0].
+    ///
+    /// And the rank-deficient fit of the test above keeps sd_beta[1] = 0.0, where keeping the NaN
+    /// alone gave [NaN, NaN]. That change was tried and backed out in vfs3g because the absolute
+    /// pivot then also turned s = 1e-100 into NaN; with the relative rank test all four match.
+    #[test]
+    fn odr_sd_beta_keeps_a_nan_variance_like_scipy() -> Result<(), OdrError> {
+        let base = [1.0, 2.0, 3.0, 4.0, 5.0];
+        for scale in [1.0e-160, 1.0e-100, 1.0] {
+            let x: Vec<f64> = base.iter().map(|v| v * scale).collect();
+            let y = x.iter().map(|v| 2.0 * v).collect();
+            let mut odr = ODR::new(Data::new(x, y)?, proportional_model(1), vec![2.0])?;
+            odr.set_job(FitType::Ols);
+            for (path, out) in [
+                ("structured", odr.run()?),
+                ("dense", odr.run_dense_reference()?),
+            ] {
+                let context = format!("s = {scale:e}, {path}: {out:?}");
+                assert_eq!(out.res_var, 0.0, "{context}");
+                if scale == 1.0e-160 {
+                    assert!(out.sd_beta[0].is_nan(), "{context}");
+                    assert!(out.cov_beta[0][0].is_nan(), "{context}");
+                    assert_rel(out.inv_condnum, 1.0, 1.0e-12, &context);
+                } else {
+                    assert_eq!(out.sd_beta, [0.0], "{context}");
+                    assert_eq!(out.cov_beta, [[0.0]], "{context}");
+                }
+            }
+        }
+
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y = vec![0.1, 1.9, 4.1, 5.9];
+        let odr = ODR::new(Data::new(x, y)?, proportional_model(2), vec![1.0, 1.0])?;
+        for (path, out) in [
+            ("structured", odr.run()?),
+            ("dense", odr.run_dense_reference()?),
+        ] {
+            assert!(
+                out.sd_beta[0].is_finite() && out.sd_beta[0] > 0.0,
+                "{path}: {out:?}"
+            );
+            assert_eq!(out.sd_beta[1], 0.0, "{path}: {out:?}");
+        }
+        Ok(())
+    }
+
+    /// frankenscipy-i49i2: Output.eps was observed − fitted. SciPy's `eps` is ODRPACK's
+    /// F = f(x + δ; β) − y, fitted minus observed, and `delta` is `xplus − x`. SciPy 1.17.1,
+    /// unilinear, x = [1..5], y = [2.1, 3.9, 6.1, 7.9, 10.1], β0 = [1, 0], with the analytic
+    /// Jacobian fsci's unilinear uses: eps[0] = −0.016742455718879334 (fitted 2.08326 against
+    /// 2.1), delta[0] = 0.03351704770275878. With finite differences SciPy has eps[0] =
+    /// −0.016742296199194318. Must not change: beta and sum_square_eps
+    /// (SciPy 0.0019155833882863924).
+    #[test]
+    fn odr_eps_is_fitted_minus_observed_like_scipy() -> Result<(), OdrError> {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![2.1, 3.9, 6.1, 7.9, 10.1];
+        let odr = ODR::new(
+            Data::new(x.clone(), y.clone())?,
+            unilinear(),
+            vec![1.0, 0.0],
+        )?;
+        for (path, out) in [
+            ("structured", odr.run()?),
+            ("dense", odr.run_dense_reference()?),
+        ] {
+            let context = format!("{path}: {out:?}");
+            assert_rel(out.eps[0], -0.016_742_455_718_879_334, 1.0e-6, &context);
+            assert_rel(out.delta[0], 0.033_517_047_702_758_78, 1.0e-6, &context);
+            for i in 0..y.len() {
+                assert_eq!(out.eps[i], out.y[i] - y[i], "{context}");
+                assert_eq!(out.xplus[i], x[i] + out.delta[i], "{context}");
+            }
+            assert_rel(out.beta[0], 2.001_920_459_630_725_6, 1.0e-8, &context);
+            assert_rel(out.beta[1], 0.014_238_621_107_823_236, 1.0e-5, &context);
+            assert_rel(
+                out.sum_square_eps,
+                0.001_915_583_388_286_392_4,
+                1.0e-6,
+                &context,
+            );
         }
         Ok(())
     }
