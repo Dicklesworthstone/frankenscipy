@@ -3804,11 +3804,12 @@ where
     fmin_with_method(func, x0, OptimizeMethod::NewtonCg)
 }
 
-/// Minimize a function subject to inequality constraints using COBYLA.
+/// Minimize a function subject to inequality constraints `c(x) >= 0`.
 ///
-/// Matches `scipy.optimize.fmin_cobyla(func, x0, cons, rhobeg, maxfun)`: each
-/// constraint `c(x) >= 0` must hold at the solution. Returns the minimiser
-/// `xopt` (scipy's output). Use [`cobyla`] for the full result.
+/// Takes the arguments of `scipy.optimize.fmin_cobyla(func, x0, cons, rhobeg, maxfun)` and
+/// returns the minimiser `xopt`, but the search is [`cobyla`]'s coordinate compass search on
+/// a penalty, not Powell's COBYLA, so iterates and results differ from SciPy's. Use
+/// [`cobyla`] for the full result.
 pub fn fmin_cobyla<F, G>(
     func: F,
     x0: &[f64],
