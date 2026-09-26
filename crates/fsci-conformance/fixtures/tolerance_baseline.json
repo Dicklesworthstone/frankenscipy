@@ -2097,7 +2097,7 @@
     "SERIES_ENTROPY_REL_TOL": 1e-8,
     "SPECIAL_FN_ABS_TOL": 1e-10,
     "SPECIAL_FN_REL_TOL": 1e-9,
-    "TABLE_MARGIN_TOL": 1e-12,
+    "SPECTRUM_FROBENIUS_TOL": 1e-9,
     "UNIT_NORM_ERR_TOL": 1e-9
   },
   "diff_stats_mvn.rs": {
