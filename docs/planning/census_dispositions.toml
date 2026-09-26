@@ -1,0 +1,211 @@
+# SciPy names the census (scripts/symbol_census.py, frankenscipy-8dndw.2) must not count by name
+# match alone. Every entry is checked against the tree on each run, and a stale one fails it:
+#   na           not applicable to a Rust library; leaves the denominator, never counts as real
+#   missing      not implemented; must match no Rust item (implement it, then drop the entry)
+#   wrong_alias  a Rust item matches the name but computes something else; not real
+#   adapted      implemented under another Rust name; `rust` names it (fsci_crate::Item[::Member])
+# A name with no entry is real exactly when a public Rust item matches it.
+
+[[entry]]
+module = "scipy.constants"
+name = "ConstantWarning"
+disposition = "na"
+reason = "no obsolete CODATA keys to warn about"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.sparse"
+name = "SparseWarning"
+disposition = "na"
+reason = "no operation SciPy warns on (CSR/CSC element insertion, format-converting solver inputs)"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.sparse"
+name = "SparseEfficiencyWarning"
+disposition = "na"
+reason = "no CSR/CSC element insertion or format-converting solver inputs"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.integrate"
+name = "ODEintWarning"
+disposition = "na"
+reason = "odeint returns an error where SciPy warns and returns unfinished rows"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.linalg"
+name = "get_blas_funcs"
+disposition = "na"
+reason = "no BLAS/LAPACK underneath"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.linalg"
+name = "get_lapack_funcs"
+disposition = "na"
+reason = "no BLAS/LAPACK underneath"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.linalg"
+name = "find_best_blas_type"
+disposition = "na"
+reason = "no BLAS/LAPACK underneath"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.fft"
+name = "set_backend"
+disposition = "na"
+reason = "one native backend, no uarray protocol"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.fft"
+name = "set_global_backend"
+disposition = "na"
+reason = "one native backend, no uarray protocol"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.fft"
+name = "register_backend"
+disposition = "na"
+reason = "one native backend, no uarray protocol"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.fft"
+name = "skip_backend"
+disposition = "na"
+reason = "one native backend, no uarray protocol"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.optimize"
+name = "show_options"
+disposition = "na"
+reason = "interactive documentation printer"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.stats"
+name = "make_distribution"
+disposition = "missing"
+reason = "needs a generic user-defined distribution mechanism"
+bead = "frankenscipy-1ksfv"
+
+[[entry]]
+module = "scipy.stats"
+name = "kstwo"
+disposition = "missing"
+reason = "finite-n Kolmogorov-Smirnov law; the alias to the n -> inf KsTwoBign was removed"
+bead = "frankenscipy-szq1n.2"
+
+[[entry]]
+module = "scipy.stats"
+name = "landau"
+disposition = "missing"
+reason = "the alias to Moyal (a different density) was removed"
+bead = "frankenscipy-szq1n.2"
+
+[[entry]]
+module = "scipy.stats"
+name = "levy_stable"
+disposition = "missing"
+reason = "needs (alpha, beta) stable laws; the alias to Levy was removed"
+bead = "frankenscipy-szq1n.2"
+
+[[entry]]
+module = "scipy.stats"
+name = "vonmises_line"
+disposition = "missing"
+reason = "support [-pi, pi]; the alias to the periodic VonMises was removed"
+bead = "frankenscipy-szq1n.2"
+
+[[entry]]
+module = "scipy.integrate"
+name = "IntegrationWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::IntegrationWarning"
+reason = "a WarningCategory variant; quad and quad_points raise it where SciPy does"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.optimize"
+name = "NoConvergence"
+disposition = "adapted"
+rust = "fsci_opt::OptError::NoConvergence"
+reason = "an OptError variant returned by the nonlinear root solvers"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.optimize"
+name = "OptimizeWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::OptimizeWarning"
+reason = "a WarningCategory variant; curve_fit raises it when the covariance cannot be estimated"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.signal"
+name = "BadCoefficients"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::BadCoefficients"
+reason = "a WarningCategory variant; normalize and the transforms built on it raise it"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.signal"
+name = "freqresp"
+disposition = "adapted"
+rust = "fsci_signal::Lti::freqresp"
+reason = "a method of the continuous-time system rather than a free function"
+
+[[entry]]
+module = "scipy.signal"
+name = "impulse"
+disposition = "adapted"
+rust = "fsci_signal::Lti::impulse"
+reason = "a method of the continuous-time system rather than a free function"
+
+[[entry]]
+module = "scipy.signal"
+name = "step"
+disposition = "adapted"
+rust = "fsci_signal::Lti::step"
+reason = "a method of the continuous-time system rather than a free function"
+
+[[entry]]
+module = "scipy.special"
+name = "SpecialFunctionWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::SpecialFunctionWarning"
+reason = "a WarningCategory variant; errstate \"warn\" raises it"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.stats"
+name = "ConstantInputWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::ConstantInputWarning"
+reason = "a WarningCategory variant; pearsonr, spearmanr and pointbiserialr raise it"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.stats"
+name = "DegenerateDataWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::DegenerateDataWarning"
+reason = "a WarningCategory variant; bootstrap raises it"
+bead = "frankenscipy-8dndw.1"
+
+[[entry]]
+module = "scipy.stats"
+name = "NearConstantInputWarning"
+disposition = "adapted"
+rust = "fsci_runtime::WarningCategory::NearConstantInputWarning"
+reason = "a WarningCategory variant; pearsonr raises it"
+bead = "frankenscipy-8dndw.1"

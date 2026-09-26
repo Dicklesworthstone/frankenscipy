@@ -620,3 +620,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
           python scripts/oracle_attr_check.py
+      # The SciPy name census (frankenscipy-8dndw.2): declared / real / compared per module, the
+      # numbers the coverage docs quote. The 2026-09-15 census read 1,300/1,300 while 25 names
+      # were no-ops and 4 were aliases to other distributions. The committed
+      # docs/planning/symbol_census.json must equal a regeneration from this tree (regenerate
+      # with --write under the pinned SciPy). Refuses an unpinned interpreter or an unimportable
+      # module, and self-tests both arms of every count first.
+      - name: SciPy name census is current
+        run: python scripts/symbol_census.py --check
