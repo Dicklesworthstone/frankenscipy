@@ -31,6 +31,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_sparse::{
     CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SolveOptions,
     SparseBackend, cg, spsolve,
@@ -38,6 +39,19 @@ use fsci_sparse::{
 use serde::Deserialize;
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// The one case: the bead's permuted 100 x 100 grid Laplacian and its right-hand side.
+const CASE: &str = "laplacian_grid100_permuted";
+/// Single-case arms. Positive: `backend_direct_lu` (boolean), `backward_error` (fsci's
+/// normwise backward error against its analytic value 0, bound BACKWARD_ERR_TOL) and
+/// `forward_error` (fsci's x against live SciPy's `spsolve` x). Must-miss:
+/// `cg_shortcut_fails_forward` passes only when the old CG shortcut's x FAILS the forward
+/// contract against SciPy's x; it is the negative control, not a comparison of the shortcut.
+const ARMS: [&str; 4] = [
+    "backend_direct_lu",
+    "backward_error",
+    "forward_error",
+    "cg_shortcut_fails_forward",
+];
 /// Normwise backward error of fsci's x; SciPy's SuperLU reaches ~1e-17 here.
 const BACKWARD_ERR_TOL: f64 = 1e-13;
 /// ||x_fsci - x_scipy||_inf / ||x_scipy||_inf.
@@ -274,6 +288,9 @@ fn diff_sparse_spsolve_accuracy_contract() {
     );
 
     let Some(oracle) = scipy_solution(&system) else {
+        // SciPy unavailable outside FSCI_REQUIRE_SCIPY_ORACLE=1 (under it scipy_solution
+        // panics): the fsci-only asserts above have run and nothing is ledgered, as in the
+        // other live-oracle tests that skip before building their ledger.
         return;
     };
     let scipy_norm = inf_norm(&oracle.x);
@@ -288,6 +305,52 @@ fn diff_sparse_spsolve_accuracy_contract() {
         "SciPy spsolve: backward error {:.3e}, its own 1-ulp-in-b envelope {:.3e}; fsci forward error vs SciPy {forward:.3e} (CG shortcut: {shortcut_forward:.3e})",
         oracle.backward_error, oracle.one_ulp_envelope
     );
+
+    let mut ledger = CompareLedger::new("diff_sparse_spsolve_accuracy_contract", &ARMS);
+    ledger.compared(
+        "backend_direct_lu",
+        CASE,
+        matches!(result.backend_used, SparseBackend::NativeSparseLu),
+    );
+    // The backward error of an exact solve is 0; pair records a NaN or infinite one (inf_norm
+    // propagates a NaN in x) as an fsci failure.
+    if ledger
+        .pair("backward_error", CASE, Some(0.0), Some(fsci_bwd))
+        .is_some()
+    {
+        ledger.compared("backward_error", CASE, fsci_bwd <= BACKWARD_ERR_TOL);
+    }
+    // slices records a non-finite element of fsci's x, or an x of the wrong length that the zip
+    // in relative_gap would silently truncate.
+    if ledger
+        .slices(
+            "forward_error",
+            CASE,
+            Some(oracle.x.as_slice()),
+            Some(result.solution.as_slice()),
+        )
+        .is_some()
+    {
+        ledger.compared("forward_error", CASE, forward <= FORWARD_REL_TOL);
+    }
+    // Negative control: the verdict is that the shortcut MISSED the forward contract. A NaN or
+    // wrongly sized shortcut answer is a broken control (slices records it), never a miss.
+    if ledger
+        .slices(
+            "cg_shortcut_fails_forward",
+            CASE,
+            Some(oracle.x.as_slice()),
+            Some(shortcut.solution.as_slice()),
+        )
+        .is_some()
+    {
+        ledger.compared(
+            "cg_shortcut_fails_forward",
+            CASE,
+            shortcut_forward > FORWARD_REL_TOL,
+        );
+    }
+
     assert_eq!(
         oracle.x.len(),
         system.n,
@@ -301,4 +364,6 @@ fn diff_sparse_spsolve_accuracy_contract() {
         shortcut_forward > FORWARD_REL_TOL,
         "the contract cannot tell the old CG shortcut from a direct solve ({shortcut_forward:.3e})"
     );
+    // One system, so every arm (the must-miss included) compares exactly that one case.
+    ledger.finish(1);
 }

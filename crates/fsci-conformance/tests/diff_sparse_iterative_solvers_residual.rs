@@ -13,10 +13,12 @@
 //! (filed as defect [frankenscipy-rprhy]); other solvers all converge
 //! cleanly so it is a qmr-specific issue.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, LgmresOptions, Shape2D, bicg,
     bicgstab, cg, cgs, gmres, lgmres, minres, spmv_csr,
@@ -42,6 +44,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -125,13 +128,31 @@ fn diff_sparse_iterative_solvers_residual() {
         ("lgmres", Box::new(|| lgmres(&a, &b, None, lg_opts))),
     ];
 
+    // One ledger arm per solver, each checking the one SPD system. The reference side is the
+    // right-hand side b: A x must reproduce it. slices records an Err (no x, so no A x) as an
+    // fsci failure and rejects a non-finite A x element before the residual metric runs.
+    let arms: Vec<&str> = solvers.iter().map(|(name, _)| *name).collect();
+    let mut ledger = CompareLedger::new("diff_sparse_iterative_solvers_residual", &arms);
+
     for (name, call) in solvers {
-        match call() {
+        let case_id = format!("solver_{name}_spd_tridiag_n6");
+        let result = call();
+        let ax = result
+            .as_ref()
+            .ok()
+            .and_then(|r| spmv_csr(&a, &r.solution).ok());
+        let reference_ok = ledger
+            .slices(name, &case_id, Some(b.as_slice()), ax.as_deref())
+            .is_some();
+        match result {
             Ok(r) => {
                 let actual_res = residual_2norm(&a, &r.solution, &b);
                 let pass = r.converged && actual_res <= RESIDUAL_TOL;
+                if reference_ok {
+                    ledger.compared(name, &case_id, pass);
+                }
                 diffs.push(CaseDiff {
-                    case_id: format!("solver_{name}_spd_tridiag_n6"),
+                    case_id,
                     converged: r.converged,
                     iterations: r.iterations,
                     residual_norm_reported: r.residual_norm,
@@ -141,8 +162,9 @@ fn diff_sparse_iterative_solvers_residual() {
                 });
             }
             Err(e) => {
+                // Already recorded by slices above as an fsci failure against b.
                 diffs.push(CaseDiff {
-                    case_id: format!("solver_{name}_spd_tridiag_n6"),
+                    case_id,
                     converged: false,
                     iterations: 0,
                     residual_norm_reported: f64::INFINITY,
@@ -161,6 +183,7 @@ fn diff_sparse_iterative_solvers_residual() {
             "fsci_sparse iterative solvers (cg/gmres/bicg/cgs/bicgstab/minres/qmr/lgmres) residual"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -187,4 +210,6 @@ fn diff_sparse_iterative_solvers_residual() {
         "iterative solver coverage failed: {} cases",
         diffs.len()
     );
+    // Every solver arm checks the one SPD system, so each must have compared it.
+    ledger.finish(1);
 }

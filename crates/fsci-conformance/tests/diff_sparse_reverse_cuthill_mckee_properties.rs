@@ -8,15 +8,20 @@
 //! Exact permutation may differ from scipy (starting-node heuristics
 //! vary), but the bandwidth-reduction property is the contract.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, reverse_cuthill_mckee};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per invariant, each checking every fixture. `bandwidth_not_worse` compares
+/// bandwidth(P A Pᵀ) against the original bandwidth, which is only defined when the output is a
+/// permutation.
+const ARMS: [&str; 2] = ["is_permutation", "bandwidth_not_worse"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -32,6 +37,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -141,14 +147,18 @@ fn fixtures() -> Vec<(&'static str, Vec<f64>, usize)> {
 fn diff_sparse_reverse_cuthill_mckee_properties() {
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let cases = fixtures();
+    let case_count = cases.len();
+    let mut ledger = CompareLedger::new("diff_sparse_reverse_cuthill_mckee_properties", &ARMS);
 
-    for (label, adj, n) in fixtures() {
+    for (label, adj, n) in cases {
         let csr = dense_to_csr(n, n, &adj);
         let perm = reverse_cuthill_mckee(&csr);
         // Property 1: perm is a permutation
         let is_perm = perm.len() == n
             && perm.iter().copied().collect::<HashSet<_>>().len() == n
             && perm.iter().all(|&p| p < n);
+        ledger.compared("is_permutation", label, is_perm);
         // Property 2: bandwidth reduced (or equal)
         let original_bw = bandwidth(n, n, &adj);
         let permuted = if is_perm {
@@ -158,6 +168,16 @@ fn diff_sparse_reverse_cuthill_mckee_properties() {
         };
         let perm_bw = bandwidth(n, n, &permuted);
         let pass = is_perm && perm_bw <= original_bw;
+        // Without a permutation `permuted` is the input itself, so the bandwidth comparison
+        // would pass vacuously; record it as an fsci failure instead of a compared case.
+        if let Some((bw_before, bw_after)) = ledger.both(
+            "bandwidth_not_worse",
+            label,
+            Some(original_bw),
+            is_perm.then_some(perm_bw),
+        ) {
+            ledger.compared("bandwidth_not_worse", label, bw_after <= bw_before);
+        }
         diffs.push(CaseDiff {
             case_id: label.into(),
             original_bw,
@@ -173,6 +193,7 @@ fn diff_sparse_reverse_cuthill_mckee_properties() {
         test_id: "diff_sparse_reverse_cuthill_mckee_properties".into(),
         category: "fsci_sparse::reverse_cuthill_mckee invariants".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -190,4 +211,6 @@ fn diff_sparse_reverse_cuthill_mckee_properties() {
     }
 
     assert!(all_pass, "rcm conformance failed: {} cases", diffs.len());
+    // Both arms check every fixture.
+    ledger.finish(case_count);
 }

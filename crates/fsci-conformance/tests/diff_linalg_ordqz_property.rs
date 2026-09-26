@@ -17,15 +17,28 @@
 //! - BB upper triangular, AA quasi-upper-triangular (exact zeros)
 //! - no selected diagonal block follows an unselected one
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, OrdQzSort, matmul, ordqz};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
+/// One ledger arm per property, each checked on every (probe, sort) case. There is no SciPy
+/// side: the reference is Qᵀ A Z / Qᵀ B Z for the recon arms (self), the analytic identity for
+/// the ortho arms, and a boolean invariant for the Schur-form and ordering arms.
+const ARMS: [&str; 6] = [
+    "aa_recon",
+    "bb_recon",
+    "q_ortho",
+    "z_ortho",
+    "schur_form",
+    "selected_first",
+];
 
 /// A `(label, A, B)` ordqz probe.
 type OrdqzProbe = (&'static str, Vec<Vec<f64>>, Vec<Vec<f64>>);
@@ -45,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -307,14 +321,18 @@ fn diff_linalg_ordqz_property() -> Result<(), String> {
         ),
     ];
 
+    let sorts = [
+        (OrdQzSort::LeftHalfPlane, "lhp"),
+        (OrdQzSort::InsideUnitCircle, "iuc"),
+    ];
+    let mut ledger = CompareLedger::new("diff_linalg_ordqz_property", &ARMS);
+
     for (label, a, b) in probes {
-        for &(sort, sort_label) in &[
-            (OrdQzSort::LeftHalfPlane, "lhp"),
-            (OrdQzSort::InsideUnitCircle, "iuc"),
-        ] {
+        for &(sort, sort_label) in &sorts {
             // A failed call is a failed case, never a skipped one.
             let r = ordqz(a, b, sort, opts)
                 .map_err(|e| format!("ordqz {label} {sort_label} failed: {e:?}"))?;
+            let case_id = format!("ordqz_{label}_{sort_label}");
             let product = |x: &[Vec<f64>], y: &[Vec<f64>]| matmul(x, y).expect("square product");
             let qt = transpose(&r.q);
             let qtaz = product(&product(&qt, a), &r.z);
@@ -322,14 +340,42 @@ fn diff_linalg_ordqz_property() -> Result<(), String> {
             let d_aa = frob_diff(&qtaz, &r.aa);
             let d_bb = frob_diff(&qtbz, &r.bb);
             let n = r.q.len();
-            let d_q_orth = frob_diff(&product(&qt, &r.q), &ident(n));
-            let d_z_orth = frob_diff(&product(&transpose(&r.z), &r.z), &ident(n));
+            let eye = ident(n);
+            let qtq = product(&qt, &r.q);
+            let ztz = product(&transpose(&r.z), &r.z);
+            let d_q_orth = frob_diff(&qtq, &eye);
+            let d_z_orth = frob_diff(&ztz, &eye);
             let abs_d = [d_bb, d_q_orth, d_z_orth].into_iter().fold(d_aa, nan_max);
             max_overall = max_overall.max(abs_d);
             let schur_form = is_generalized_schur_form(&r.aa, &r.bb);
             let sorted = selected_first(&r.aa, &r.bb, sort);
+            // Residual arms: the reference (Qᵀ A Z, Qᵀ B Z, or the analytic identity) against
+            // fsci's matrix, flattened. slices records a non-finite element or a length
+            // mismatch itself; otherwise the arm's verdict is the file's tolerance on its
+            // nan_max residual. The conjunction of the six arms is the case's `pass` below.
+            for (arm, reference, observed, d) in [
+                ("aa_recon", &qtaz, &r.aa, d_aa),
+                ("bb_recon", &qtbz, &r.bb, d_bb),
+                ("q_ortho", &eye, &qtq, d_q_orth),
+                ("z_ortho", &eye, &ztz, d_z_orth),
+            ] {
+                let (reference, observed) = (reference.concat(), observed.concat());
+                if ledger
+                    .slices(
+                        arm,
+                        &case_id,
+                        Some(reference.as_slice()),
+                        Some(observed.as_slice()),
+                    )
+                    .is_some()
+                {
+                    ledger.compared(arm, &case_id, d <= ABS_TOL);
+                }
+            }
+            ledger.compared("schur_form", &case_id, schur_form);
+            ledger.compared("selected_first", &case_id, sorted);
             diffs.push(CaseDiff {
-                case_id: format!("ordqz_{label}_{sort_label}"),
+                case_id,
                 sort: sort_label.into(),
                 abs_diff: abs_d,
                 schur_form,
@@ -345,6 +391,7 @@ fn diff_linalg_ordqz_property() -> Result<(), String> {
         test_id: "diff_linalg_ordqz_property".into(),
         category: "fsci_linalg::ordqz property test (QT A Z=AA, QT B Z=BB, Q/Z orthogonal, Schur form, selection first)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -373,5 +420,7 @@ fn diff_linalg_ordqz_property() -> Result<(), String> {
         diffs.len(),
         max_overall
     );
+    // Every arm checks every (probe, sort) case.
+    ledger.finish(probes.len() * sorts.len());
     Ok(())
 }

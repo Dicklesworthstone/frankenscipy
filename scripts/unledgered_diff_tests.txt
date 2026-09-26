@@ -1,21 +1,29 @@
-# Diff tests not yet ending in a CompareLedger (frankenscipy-olv0j.1). This list only shrinks:
+# Diff tests that do not end in a CompareLedger (frankenscipy-olv0j.1). This list only shrinks:
 # scripts/unledgered_diff_tests.py fails on a new unlisted file and on a listed file that is
-# ledgered or gone. Remove a line when its file migrates; delete the file when it is empty.
+# ledgered or gone. Remove a line when its file migrates.
+#
+# Every entry left was read on 2026-09-26 and is a structural test of fsci's own machinery with no
+# reference side: there is no SciPy, numpy or analytic value to compare against, only an assertion
+# about fsci's internal state. A compared-case count over these would count assertions, so they are
+# listed rather than ledgered. A test here that gains a numeric reference must migrate.
+#
+# Audit-ledger hooks: record_* must grow the shared audit ledger by exactly one event.
 diff_arrayapi_audit_record_fail_closed.rs
 diff_arrayapi_creation_audit_record.rs
-diff_arrayapi_default_float_dtype.rs
-diff_cluster_dbscan_properties.rs
-diff_cluster_kmeans_properties.rs
-diff_fft.rs
-diff_fft_shared_plan_cache.rs
-diff_fft_take_transform_traces.rs
-diff_linalg_matrix_random_allclose.rs
-diff_linalg_ordqz_property.rs
-diff_linalg_qz_reconstruct.rs
 diff_opt_audit_record_helpers.rs
+diff_sparse_audit_record_helpers.rs
+diff_special_audit_record_helpers.rs
+diff_stats_audit_record_helpers.rs
+# Trace logs: take_*_traces must drain what one call emitted, then return empty.
+diff_fft_take_transform_traces.rs
+diff_special_take_special_traces.rs
+# CASP routing: a hand-specified branch, solver or constructed field for a hand-picked input.
 diff_opt_casp_problem_constructors.rs
-diff_opt_line_search_wolfe.rs
 diff_opt_select_minimize_method.rs
+diff_sparse_select_casp_iterative_solver.rs
+diff_special_select_hypergeometric_branch_casp.rs
+# fsci_runtime internals: tolerance predicates, loss matrices, evidence and audit ledgers, the
+# portfolio calibrator and the test-log builder.
 diff_runtime_assert_close_helpers.rs
 diff_runtime_audit_ledger_json_roundtrip.rs
 diff_runtime_close_within_tol.rs
@@ -24,16 +32,6 @@ diff_runtime_decision_signals_is_finite.rs
 diff_runtime_policy_evidence_ledger.rs
 diff_runtime_solver_portfolio_calibrator.rs
 diff_runtime_test_log_entry_builder.rs
-diff_signal_mel_mfcc_chroma.rs
-diff_sparse_audit_record_helpers.rs
-diff_sparse_boolean_indexing.rs
-diff_sparse_iterative_solvers_residual.rs
-diff_sparse_pagerank_properties.rs
-diff_sparse_reverse_cuthill_mckee_properties.rs
-diff_sparse_select_casp_iterative_solver.rs
-diff_sparse_shortest_path_properties.rs
-diff_sparse_spsolve_accuracy_contract.rs
-diff_special_audit_record_helpers.rs
-diff_special_select_hypergeometric_branch_casp.rs
-diff_special_take_special_traces.rs
-diff_stats_audit_record_helpers.rs
+# API surface with no numeric output: the FFT plan cache round-trip and the default float dtype.
+diff_fft_shared_plan_cache.rs
+diff_arrayapi_default_float_dtype.rs

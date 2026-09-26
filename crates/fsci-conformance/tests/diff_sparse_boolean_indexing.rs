@@ -10,14 +10,34 @@
 //!     dense value at the selected (row, col)
 //!   * Mask-length mismatches error
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, CscMatrix, FormatConvertible, Shape2D};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per check, each one fixed case recorded under its own name. The `*_values` and
+/// `all_true_*` arms compare against the source matrix's dense entries (flattened through
+/// `slices`, which rejects a length mismatch or a non-finite element); the `*_errors` arms are
+/// refusals; the shape arms are structural.
+const ARMS: [&str; 12] = [
+    "row_index_shape",
+    "row_index_values",
+    "col_index_shape",
+    "col_index_values",
+    "full_index_shape",
+    "full_index_values",
+    "mask_values_correct",
+    "row_mask_length_mismatch_errors",
+    "col_mask_length_mismatch_errors",
+    "mask_values_shape_mismatch_errors",
+    "all_true_row_returns_original",
+    "all_false_row_zero_rows",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -31,6 +51,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -76,6 +97,7 @@ fn csc_to_dense(m: &CscMatrix) -> Vec<Vec<f64>> {
 fn diff_sparse_boolean_indexing() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_sparse_boolean_indexing", &ARMS);
     let mut check = |id: &str, ok: bool, note: String| {
         diffs.push(CaseDiff {
             case_id: id.into(),
@@ -106,13 +128,31 @@ fn diff_sparse_boolean_indexing() {
         let mask = [true, false, true];
         let result = csc.boolean_row_index(&mask).expect("row_index");
         let result_dense = csc_to_dense(&result);
+        let shape_ok = result.shape().rows == 2 && result.shape().cols == 4;
+        ledger.compared("row_index_shape", "row_index_shape", shape_ok);
         check(
             "row_index_shape",
-            result.shape().rows == 2 && result.shape().cols == 4,
+            shape_ok,
             format!("shape={:?}", result.shape()),
         );
         // Rows in result should equal rows 0 and 2 of original
         let expected = vec![dense[0].clone(), dense[2].clone()];
+        let (expected_flat, got_flat) = (expected.concat(), result_dense.concat());
+        if ledger
+            .slices(
+                "row_index_values",
+                "row_index_values",
+                Some(expected_flat.as_slice()),
+                Some(got_flat.as_slice()),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "row_index_values",
+                "row_index_values",
+                result_dense == expected,
+            );
+        }
         check(
             "row_index_values",
             result_dense == expected,
@@ -125,12 +165,30 @@ fn diff_sparse_boolean_indexing() {
         let mask = [false, true, true, false];
         let result = csc.boolean_col_index(&mask).expect("col_index");
         let result_dense = csc_to_dense(&result);
+        let shape_ok = result.shape().rows == 3 && result.shape().cols == 2;
+        ledger.compared("col_index_shape", "col_index_shape", shape_ok);
         check(
             "col_index_shape",
-            result.shape().rows == 3 && result.shape().cols == 2,
+            shape_ok,
             format!("shape={:?}", result.shape()),
         );
         let expected: Vec<Vec<f64>> = dense.iter().map(|row| vec![row[1], row[2]]).collect();
+        let (expected_flat, got_flat) = (expected.concat(), result_dense.concat());
+        if ledger
+            .slices(
+                "col_index_values",
+                "col_index_values",
+                Some(expected_flat.as_slice()),
+                Some(got_flat.as_slice()),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "col_index_values",
+                "col_index_values",
+                result_dense == expected,
+            );
+        }
         check(
             "col_index_values",
             result_dense == expected,
@@ -144,9 +202,11 @@ fn diff_sparse_boolean_indexing() {
         let col_mask = [true, false, true, false];
         let result = csc.boolean_index(&row_mask, &col_mask).expect("full_index");
         let result_dense = csc_to_dense(&result);
+        let shape_ok = result.shape().rows == 2 && result.shape().cols == 2;
+        ledger.compared("full_index_shape", "full_index_shape", shape_ok);
         check(
             "full_index_shape",
-            result.shape().rows == 2 && result.shape().cols == 2,
+            shape_ok,
             format!("shape={:?}", result.shape()),
         );
         // Expected: take rows [0, 2] then cols [0, 2]
@@ -154,6 +214,22 @@ fn diff_sparse_boolean_indexing() {
             vec![dense[0][0], dense[0][2]],
             vec![dense[2][0], dense[2][2]],
         ];
+        let (expected_flat, got_flat) = (expected.concat(), result_dense.concat());
+        if ledger
+            .slices(
+                "full_index_values",
+                "full_index_values",
+                Some(expected_flat.as_slice()),
+                Some(got_flat.as_slice()),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "full_index_values",
+                "full_index_values",
+                result_dense == expected,
+            );
+        }
         check(
             "full_index_values",
             result_dense == expected,
@@ -171,6 +247,21 @@ fn diff_sparse_boolean_indexing() {
         ];
         let result = csc.boolean_mask_values(&mask).expect("mask_values");
         let expected = vec![1.0_f64, 4.0, 6.0];
+        if ledger
+            .slices(
+                "mask_values_correct",
+                "mask_values_correct",
+                Some(expected.as_slice()),
+                Some(result.as_slice()),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "mask_values_correct",
+                "mask_values_correct",
+                result == expected,
+            );
+        }
         check(
             "mask_values_correct",
             result == expected,
@@ -182,6 +273,12 @@ fn diff_sparse_boolean_indexing() {
     {
         let bad_mask = [true, false]; // shorter than 3 rows
         let r = csc.boolean_row_index(&bad_mask);
+        // The designed answer is a refusal (SciPy raises IndexError on a wrong-length mask).
+        ledger.expected_raise(
+            "row_mask_length_mismatch_errors",
+            "row_mask_length_mismatch_errors",
+            r.is_err(),
+        );
         check(
             "row_mask_length_mismatch_errors",
             r.is_err(),
@@ -193,6 +290,11 @@ fn diff_sparse_boolean_indexing() {
     {
         let bad_mask = [true, false, true]; // shorter than 4 cols
         let r = csc.boolean_col_index(&bad_mask);
+        ledger.expected_raise(
+            "col_mask_length_mismatch_errors",
+            "col_mask_length_mismatch_errors",
+            r.is_err(),
+        );
         check(
             "col_mask_length_mismatch_errors",
             r.is_err(),
@@ -204,6 +306,11 @@ fn diff_sparse_boolean_indexing() {
     {
         let bad_mask = vec![vec![true, false], vec![false, true]]; // 2×2 not 3×4
         let r = csc.boolean_mask_values(&bad_mask);
+        ledger.expected_raise(
+            "mask_values_shape_mismatch_errors",
+            "mask_values_shape_mismatch_errors",
+            r.is_err(),
+        );
         check(
             "mask_values_shape_mismatch_errors",
             r.is_err(),
@@ -216,20 +323,39 @@ fn diff_sparse_boolean_indexing() {
         let all_true = [true; 3];
         let r = csc.boolean_row_index(&all_true).expect("all-true row");
         let r_dense = csc_to_dense(&r);
-        check(
-            "all_true_row_returns_original",
-            r_dense == dense && r.shape() == csc.shape(),
-            String::new(),
-        );
+        let same = r_dense == dense && r.shape() == csc.shape();
+        let (dense_flat, r_flat) = (dense.concat(), r_dense.concat());
+        if ledger
+            .slices(
+                "all_true_row_returns_original",
+                "all_true_row_returns_original",
+                Some(dense_flat.as_slice()),
+                Some(r_flat.as_slice()),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "all_true_row_returns_original",
+                "all_true_row_returns_original",
+                same,
+            );
+        }
+        check("all_true_row_returns_original", same, String::new());
     }
 
     // === Edge: all-false mask returns 0-row matrix ===
     {
         let all_false = [false; 3];
         let r = csc.boolean_row_index(&all_false).expect("all-false row");
+        let shape_ok = r.shape().rows == 0 && r.shape().cols == 4;
+        ledger.compared(
+            "all_false_row_zero_rows",
+            "all_false_row_zero_rows",
+            shape_ok,
+        );
         check(
             "all_false_row_zero_rows",
-            r.shape().rows == 0 && r.shape().cols == 4,
+            shape_ok,
             format!("shape={:?}", r.shape()),
         );
     }
@@ -239,6 +365,7 @@ fn diff_sparse_boolean_indexing() {
         test_id: "diff_sparse_boolean_indexing".into(),
         category: "fsci_sparse::CsrMatrix::boolean_* coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -257,4 +384,6 @@ fn diff_sparse_boolean_indexing() {
         "boolean indexing coverage failed: {} cases",
         diffs.len()
     );
+    // Every arm is one fixed case, so each must have compared it.
+    ledger.finish(1);
 }

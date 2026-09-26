@@ -11,15 +11,32 @@
 //!     an edge in the CSR adjacency)
 //!   * Sum of edge weights along path == reported distance
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, CsrMatrix, FormatConvertible, Shape2D, shortest_path};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
+/// One ledger arm per check, each one fixed case recorded under its own name. A finite analytic
+/// distance (7, 0, 12, and the path's own edge-weight sum) goes through `pair`; the infinite
+/// answers and the path-shape checks are boolean properties.
+const ARMS: [&str; 10] = [
+    "g1_0_to_4_distance",
+    "g1_0_to_4_path_starts_at_source",
+    "g1_0_to_4_path_ends_at_target",
+    "g1_path_edges_valid",
+    "g1_path_sum_equals_distance",
+    "self_distance_zero",
+    "disconnected_returns_infinity",
+    "oob_source_returns_infinity",
+    "oob_target_returns_infinity",
+    "indirect_path_wins",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -33,6 +50,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -87,6 +105,7 @@ fn edge_weight(g: &CsrMatrix, u: usize, v: usize) -> Option<f64> {
 fn diff_sparse_shortest_path_properties() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_sparse_shortest_path_properties", &ARMS);
     let mut check = |id: &str, ok: bool, note: String| {
         diffs.push(CaseDiff {
             case_id: id.into(),
@@ -117,15 +136,40 @@ fn diff_sparse_shortest_path_properties() {
 
     {
         let (d, p) = shortest_path(&g1, true, 0, 4);
+        if ledger
+            .pair(
+                "g1_0_to_4_distance",
+                "g1_0_to_4_distance",
+                Some(7.0),
+                Some(d),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "g1_0_to_4_distance",
+                "g1_0_to_4_distance",
+                (d - 7.0).abs() < ABS_TOL,
+            );
+        }
         check(
             "g1_0_to_4_distance",
             (d - 7.0).abs() < ABS_TOL,
             format!("d={d} p={p:?}"),
         );
+        ledger.compared(
+            "g1_0_to_4_path_starts_at_source",
+            "g1_0_to_4_path_starts_at_source",
+            p.first() == Some(&0),
+        );
         check(
             "g1_0_to_4_path_starts_at_source",
             p.first() == Some(&0),
             format!("p={p:?}"),
+        );
+        ledger.compared(
+            "g1_0_to_4_path_ends_at_target",
+            "g1_0_to_4_path_ends_at_target",
+            p.last() == Some(&4),
         );
         check(
             "g1_0_to_4_path_ends_at_target",
@@ -144,7 +188,25 @@ fn diff_sparse_shortest_path_properties() {
                 }
             }
         }
+        ledger.compared("g1_path_edges_valid", "g1_path_edges_valid", edges_valid);
         check("g1_path_edges_valid", edges_valid, format!("p={p:?}"));
+        // The reference is the reported distance d; pair turns a non-finite d or path sum into
+        // a recorded failure rather than a comparison the `<` alone decides.
+        if ledger
+            .pair(
+                "g1_path_sum_equals_distance",
+                "g1_path_sum_equals_distance",
+                Some(d),
+                Some(path_sum),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "g1_path_sum_equals_distance",
+                "g1_path_sum_equals_distance",
+                (path_sum - d).abs() < ABS_TOL,
+            );
+        }
         check(
             "g1_path_sum_equals_distance",
             (path_sum - d).abs() < ABS_TOL,
@@ -155,6 +217,21 @@ fn diff_sparse_shortest_path_properties() {
     // === Source == target → distance 0 ===
     {
         let (d, p) = shortest_path(&g1, true, 2, 2);
+        if ledger
+            .pair(
+                "self_distance_zero",
+                "self_distance_zero",
+                Some(0.0),
+                Some(d),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "self_distance_zero",
+                "self_distance_zero",
+                d == 0.0 && p == vec![2],
+            );
+        }
         check(
             "self_distance_zero",
             d == 0.0 && p == vec![2],
@@ -165,6 +242,14 @@ fn diff_sparse_shortest_path_properties() {
     // === Disconnected: no edge from 4 back to 0 in directed graph ===
     {
         let (d, p) = shortest_path(&g1, true, 4, 0);
+        // The designed answer is the tuple (INFINITY, []): pair would record the distance on its
+        // own and drop the empty-path half, so the whole tuple goes through compared. The exact
+        // `d == f64::INFINITY` already rejects a NaN distance.
+        ledger.compared(
+            "disconnected_returns_infinity",
+            "disconnected_returns_infinity",
+            d == f64::INFINITY && p.is_empty(),
+        );
         check(
             "disconnected_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -175,6 +260,11 @@ fn diff_sparse_shortest_path_properties() {
     // === Out-of-bounds source ===
     {
         let (d, p) = shortest_path(&g1, true, 99, 0);
+        ledger.compared(
+            "oob_source_returns_infinity",
+            "oob_source_returns_infinity",
+            d == f64::INFINITY && p.is_empty(),
+        );
         check(
             "oob_source_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -185,6 +275,11 @@ fn diff_sparse_shortest_path_properties() {
     // === Out-of-bounds target ===
     {
         let (d, p) = shortest_path(&g1, true, 0, 99);
+        ledger.compared(
+            "oob_target_returns_infinity",
+            "oob_target_returns_infinity",
+            d == f64::INFINITY && p.is_empty(),
+        );
         check(
             "oob_target_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -197,6 +292,21 @@ fn diff_sparse_shortest_path_properties() {
         let g2 = build_csr(3, &[(0, 1, 5.0), (1, 2, 7.0), (0, 2, 100.0)]);
         // Direct edge 0→2 weight 100; via 1 it's 5+7=12. So path via 1 wins.
         let (d, p) = shortest_path(&g2, true, 0, 2);
+        if ledger
+            .pair(
+                "indirect_path_wins",
+                "indirect_path_wins",
+                Some(12.0),
+                Some(d),
+            )
+            .is_some()
+        {
+            ledger.compared(
+                "indirect_path_wins",
+                "indirect_path_wins",
+                (d - 12.0).abs() < ABS_TOL && p == vec![0, 1, 2],
+            );
+        }
         check(
             "indirect_path_wins",
             (d - 12.0).abs() < ABS_TOL && p == vec![0, 1, 2],
@@ -209,6 +319,7 @@ fn diff_sparse_shortest_path_properties() {
         test_id: "diff_sparse_shortest_path_properties".into(),
         category: "fsci_sparse::shortest_path property-based coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -227,4 +338,6 @@ fn diff_sparse_shortest_path_properties() {
         "shortest_path coverage failed: {} cases",
         diffs.len()
     );
+    // Every arm is one fixed case, so each must have compared it.
+    ledger.finish(1);
 }

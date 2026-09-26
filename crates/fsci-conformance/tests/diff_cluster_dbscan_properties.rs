@@ -13,15 +13,37 @@
 //!     partition modulo a remap of cluster IDs
 //!   * Error paths: empty data, non-finite eps, min_samples=0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::dbscan;
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per property check, each a single fixed case recorded under its own name.
+/// Every check is a boolean invariant of fsci's own output (integer labels and counts, so no
+/// value can be NaN) or a fail-closed contract (`*_errors`, the call must refuse); there is no
+/// SciPy side, the reference kind is analytic.
+const ARMS: [&str; 15] = [
+    "two_clusters_count",
+    "two_clusters_first_group_same_label",
+    "two_clusters_last_group_same_label",
+    "two_clusters_distinct_labels",
+    "two_clusters_no_noise",
+    "noise_isolated_point_labeled_minus_1",
+    "noise_cluster_count_one",
+    "core_sample_indices_all_five",
+    "core_sample_indices_sorted",
+    "permutation_invariance_modulo_label_remap",
+    "empty_data_errors",
+    "zero_eps_errors",
+    "nan_eps_errors",
+    "zero_min_samples_errors",
+    "non_finite_data_errors",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -35,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -88,7 +111,10 @@ fn canonicalize(labels: &[i64]) -> Vec<i64> {
 fn diff_cluster_dbscan_properties() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_cluster_dbscan_properties", &ARMS);
+    // Every check id is its own arm and its own case id; an undeclared id panics in the ledger.
     let mut check = |id: &str, ok: bool, note: String| {
+        ledger.compared(id, id, ok);
         diffs.push(CaseDiff {
             case_id: id.into(),
             pass: ok,
@@ -252,6 +278,7 @@ fn diff_cluster_dbscan_properties() {
         test_id: "diff_cluster_dbscan_properties".into(),
         category: "fsci_cluster::dbscan property-based coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -270,4 +297,6 @@ fn diff_cluster_dbscan_properties() {
         "dbscan property coverage failed: {} cases",
         diffs.len()
     );
+    // Every arm is one fixed case, so each must have compared it.
+    ledger.finish(1);
 }

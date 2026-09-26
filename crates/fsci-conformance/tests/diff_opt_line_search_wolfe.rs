@@ -7,14 +7,21 @@
 //!   Curvature (Wolfe1): g(x + α*d)'d >= c2 * g'd
 //!   Strong Wolfe (Wolfe2): |g(x + α*d)'d| <= c2 * |g'd|
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{WolfeParams, line_search_wolfe1, line_search_wolfe2};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per search (the ops `wolfe1`, `wolfe2`), each checked on every probe. There
+/// is no SciPy side and no reference value for α: the verdict is the Wolfe inequalities on the
+/// analytic quadratic, a boolean property that a NaN α fails (every comparison with NaN is
+/// false).
+const ARMS: [&str; 2] = ["wolfe1", "wolfe2"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -29,6 +36,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -76,6 +84,7 @@ fn diff_opt_line_search_wolfe() {
         ("from_3_neg2", vec![3.0, -2.0], vec![-6.0, 4.0]),
         ("from_0p5_2", vec![0.5, 2.0], vec![-1.0, -4.0]),
     ];
+    let mut ledger = CompareLedger::new("diff_opt_line_search_wolfe", &ARMS);
 
     for (label, x0, direction) in probes {
         let f0 = f(x0);
@@ -98,6 +107,7 @@ fn diff_opt_line_search_wolfe() {
             let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + 1e-10;
             let curvature_ok = dg_at >= params.c2 * dg0 - 1e-10;
             let pass = armijo_ok && curvature_ok && res.alpha > 0.0;
+            ledger.compared("wolfe1", label, pass);
             diffs.push(CaseDiff {
                 case_id: format!("wolfe1_{label}"),
                 op: "wolfe1".into(),
@@ -121,6 +131,7 @@ fn diff_opt_line_search_wolfe() {
             let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + 1e-10;
             let strong_ok = dg_at.abs() <= params.c2 * dg0.abs() + 1e-10;
             let pass = armijo_ok && strong_ok && res.alpha > 0.0;
+            ledger.compared("wolfe2", label, pass);
             diffs.push(CaseDiff {
                 case_id: format!("wolfe2_{label}"),
                 op: "wolfe2".into(),
@@ -136,6 +147,7 @@ fn diff_opt_line_search_wolfe() {
         test_id: "diff_opt_line_search_wolfe".into(),
         category: "fsci_opt::{line_search_wolfe1, line_search_wolfe2} property test".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -159,4 +171,6 @@ fn diff_opt_line_search_wolfe() {
         "line_search_wolfe conformance failed: {} cases",
         diffs.len(),
     );
+    // Both searches check every probe.
+    ledger.finish(probes.len());
 }

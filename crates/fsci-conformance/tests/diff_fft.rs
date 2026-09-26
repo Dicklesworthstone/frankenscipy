@@ -8,12 +8,19 @@
 //!
 //! All tests emit structured JSON logs to
 //! `fixtures/artifacts/FSCI-P2C-005/diff/`.
+//!
+//! Each test keeps a compared-case ledger: the reference side is the naive DFT, a closed-form
+//! formula or the input itself (roundtrips), or another fsci output for the metamorphic
+//! relations; the adversarial refusal tests record their expected-error verdict as a one-case
+//! arm. The case id is the test's log id.
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{
     Complex64, FftError, FftOptions, Normalization, fft, fft2, fftfreq, fftn, fftshift_1d, ifft,
     ifft2, ifftshift_1d, irfft, rfft, rfftfreq,
@@ -31,6 +38,7 @@ struct DiffTestLog {
     actual: String,
     diff: f64,
     tolerance: f64,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -94,6 +102,34 @@ fn nan_max(acc: f64, d: f64) -> f64 {
     }
 }
 
+/// Sends a real reference and fsci's real output through [`CompareLedger::slices`], so the
+/// ledger itself records a length mismatch or a non-finite element that does not match the
+/// reference's. True when the case can be compared; the caller then records its verdict with
+/// `ledger.compared`.
+fn real_slices(
+    ledger: &mut CompareLedger,
+    arm: &str,
+    case_id: &str,
+    reference: &[f64],
+    observed: &[f64],
+) -> bool {
+    ledger
+        .slices(arm, case_id, Some(reference), Some(observed))
+        .is_some()
+}
+
+/// [`real_slices`] for complex vectors, as interleaved re/im parts.
+fn complex_slices(
+    ledger: &mut CompareLedger,
+    arm: &str,
+    case_id: &str,
+    reference: &[Complex64],
+    observed: &[Complex64],
+) -> bool {
+    let re_im = |v: &[Complex64]| -> Vec<f64> { v.iter().flat_map(|&(re, im)| [re, im]).collect() };
+    real_slices(ledger, arm, case_id, &re_im(reference), &re_im(observed))
+}
+
 /// Naive DFT reference implementation for oracle comparison.
 fn naive_dft(input: &[Complex64], inverse: bool) -> Vec<Complex64> {
     let n = input.len();
@@ -150,7 +186,17 @@ fn test_signal_complex(n: usize) -> Vec<Complex64> {
         .collect()
 }
 
-fn run_diff_test(test_id: &str, category: &str, input_summary: &str, diff: f64, tolerance: f64) {
+/// Writes the test's log, with `ledger`'s compared counts, and asserts `diff <= tolerance`. The
+/// caller has already recorded the case in the ledger: its `pair`/`slices` guard, then
+/// `ledger.compared` with this same verdict when the guard accepted both sides.
+fn run_diff_test(
+    ledger: &CompareLedger,
+    test_id: &str,
+    category: &str,
+    input_summary: &str,
+    diff: f64,
+    tolerance: f64,
+) {
     let pass = diff <= tolerance;
     let start = Instant::now();
     let log = DiffTestLog {
@@ -161,6 +207,7 @@ fn run_diff_test(test_id: &str, category: &str, input_summary: &str, diff: f64, 
         actual: format!("diff = {diff:.2e}"),
         diff,
         tolerance,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -180,14 +227,22 @@ fn diff_001_fft_power_of_2() {
     let opts = FftOptions::default();
     let result = fft(&input, &opts).unwrap();
     let expected = naive_dft(&input, false);
+    let (arm, case) = ("fft_pow2", "diff_001_fft_pow2");
+    let mut ledger = CompareLedger::new("diff_001_fft_power_of_2", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_001_fft_pow2",
+        &ledger,
+        case,
         "differential",
         "complex signal n=8",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -196,14 +251,22 @@ fn diff_002_fft_non_power_of_2() {
     let opts = FftOptions::default();
     let result = fft(&input, &opts).unwrap();
     let expected = naive_dft(&input, false);
+    let (arm, case) = ("fft_npow2", "diff_002_fft_npow2");
+    let mut ledger = CompareLedger::new("diff_002_fft_non_power_of_2", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_002_fft_npow2",
+        &ledger,
+        case,
         "differential",
         "complex signal n=13",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -212,14 +275,22 @@ fn diff_003_fft_prime_size() {
     let opts = FftOptions::default();
     let result = fft(&input, &opts).unwrap();
     let expected = naive_dft(&input, false);
+    let (arm, case) = ("fft_prime", "diff_003_fft_prime");
+    let mut ledger = CompareLedger::new("diff_003_fft_prime_size", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_003_fft_prime",
+        &ledger,
+        case,
         "differential",
         "complex signal n=23 (prime)",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -228,14 +299,22 @@ fn diff_004_ifft_roundtrip() {
     let opts = FftOptions::default();
     let spectrum = fft(&input, &opts).unwrap();
     let recovered = ifft(&spectrum, &opts).unwrap();
+    let (arm, case) = ("ifft_roundtrip", "diff_004_ifft_roundtrip");
+    let mut ledger = CompareLedger::new("diff_004_ifft_roundtrip", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &input, &recovered);
     let diff = max_abs_diff_complex(&recovered, &input);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_004_ifft_roundtrip",
+        &ledger,
+        case,
         "differential",
         "ifft(fft(x)) n=16",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -244,14 +323,22 @@ fn diff_005_rfft_vs_oracle() {
     let opts = FftOptions::default();
     let result = rfft(&input, &opts).unwrap();
     let expected = naive_rfft(&input);
+    let (arm, case) = ("rfft_oracle", "diff_005_rfft_oracle");
+    let mut ledger = CompareLedger::new("diff_005_rfft_vs_oracle", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_005_rfft_oracle",
+        &ledger,
+        case,
         "differential",
         "real signal n=16 rfft",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -260,14 +347,22 @@ fn diff_006_rfft_odd_length() {
     let opts = FftOptions::default();
     let result = rfft(&input, &opts).unwrap();
     let expected = naive_rfft(&input);
+    let (arm, case) = ("rfft_odd", "diff_006_rfft_odd");
+    let mut ledger = CompareLedger::new("diff_006_rfft_odd_length", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_006_rfft_odd",
+        &ledger,
+        case,
         "differential",
         "real signal n=11 rfft",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -276,14 +371,22 @@ fn diff_007_irfft_roundtrip() {
     let opts = FftOptions::default();
     let spectrum = rfft(&input, &opts).unwrap();
     let recovered = irfft(&spectrum, Some(16), &opts).unwrap();
+    let (arm, case) = ("irfft_roundtrip", "diff_007_irfft_roundtrip");
+    let mut ledger = CompareLedger::new("diff_007_irfft_roundtrip", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &input, &recovered);
     let diff = max_abs_diff_real(&recovered, &input);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_007_irfft_roundtrip",
+        &ledger,
+        case,
         "differential",
         "irfft(rfft(x)) n=16",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -319,14 +422,15 @@ fn diff_008_fft2_vs_oracle() {
             expected[r * cols + c] = ft[r];
         }
     }
+    let (arm, case) = ("fft2_oracle", "diff_008_fft2_oracle");
+    let mut ledger = CompareLedger::new("diff_008_fft2_vs_oracle", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
-    run_diff_test(
-        "diff_008_fft2_oracle",
-        "differential",
-        "4x4 complex fft2",
-        diff,
-        TOL,
-    );
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
+    run_diff_test(&ledger, case, "differential", "4x4 complex fft2", diff, TOL);
+    ledger.finish(1);
 }
 
 #[test]
@@ -354,14 +458,15 @@ fn diff_009_fft2_non_square() {
             expected[r * cols + c] = ft[r];
         }
     }
+    let (arm, case) = ("fft2_nonsq", "diff_009_fft2_nonsq");
+    let mut ledger = CompareLedger::new("diff_009_fft2_non_square", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
-    run_diff_test(
-        "diff_009_fft2_nonsq",
-        "differential",
-        "3x5 complex fft2",
-        diff,
-        TOL,
-    );
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
+    run_diff_test(&ledger, case, "differential", "3x5 complex fft2", diff, TOL);
+    ledger.finish(1);
 }
 
 #[test]
@@ -372,14 +477,22 @@ fn diff_010_ifft2_roundtrip() {
     let opts = FftOptions::default();
     let spectrum = fft2(&input, (rows, cols), &opts).unwrap();
     let recovered = ifft2(&spectrum, (rows, cols), &opts).unwrap();
+    let (arm, case) = ("ifft2_roundtrip", "diff_010_ifft2_roundtrip");
+    let mut ledger = CompareLedger::new("diff_010_ifft2_roundtrip", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &input, &recovered);
     let diff = max_abs_diff_complex(&recovered, &input);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_010_ifft2_roundtrip",
+        &ledger,
+        case,
         "differential",
         "ifft2(fft2(x)) 4x6",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -422,14 +535,22 @@ fn diff_011_fftn_3d_oracle() {
             expected[outer * 2 + i] = val;
         }
     }
+    let (arm, case) = ("fftn_3d", "diff_011_fftn_3d");
+    let mut ledger = CompareLedger::new("diff_011_fftn_3d_oracle", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "diff_011_fftn_3d",
+        &ledger,
+        case,
         "differential",
         "2x3x2 complex fftn",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -443,14 +564,15 @@ fn diff_012_normalization_forward_vs_oracle() {
         .iter()
         .map(|&(re, im)| (re / n, im / n))
         .collect();
+    let (arm, case) = ("norm_forward", "diff_012_norm_forward");
+    let mut ledger = CompareLedger::new("diff_012_normalization_forward_vs_oracle", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
-    run_diff_test(
-        "diff_012_norm_forward",
-        "differential",
-        "forward norm n=8",
-        diff,
-        TOL,
-    );
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
+    run_diff_test(&ledger, case, "differential", "forward norm n=8", diff, TOL);
+    ledger.finish(1);
 }
 
 #[test]
@@ -464,14 +586,15 @@ fn diff_013_normalization_ortho_vs_oracle() {
         .iter()
         .map(|&(re, im)| (re * scale, im * scale))
         .collect();
+    let (arm, case) = ("norm_ortho", "diff_013_norm_ortho");
+    let mut ledger = CompareLedger::new("diff_013_normalization_ortho_vs_oracle", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
-    run_diff_test(
-        "diff_013_norm_ortho",
-        "differential",
-        "ortho norm n=8",
-        diff,
-        TOL,
-    );
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
+    run_diff_test(&ledger, case, "differential", "ortho norm n=8", diff, TOL);
+    ledger.finish(1);
 }
 
 #[test]
@@ -489,14 +612,22 @@ fn diff_014_fftfreq_even_vs_oracle() {
             }
         })
         .collect();
+    let (arm, case) = ("fftfreq_even", "diff_014_fftfreq_even");
+    let mut ledger = CompareLedger::new("diff_014_fftfreq_even_vs_oracle", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_real(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= 1e-15);
+    }
     run_diff_test(
-        "diff_014_fftfreq_even",
+        &ledger,
+        case,
         "differential",
         "fftfreq n=8 d=0.5",
         diff,
         1e-15,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -505,14 +636,22 @@ fn diff_015_rfftfreq_vs_oracle() {
     let d = 0.25;
     let result = rfftfreq(n, d).unwrap();
     let expected: Vec<f64> = (0..=n / 2).map(|k| k as f64 / (n as f64 * d)).collect();
+    let (arm, case) = ("rfftfreq", "diff_015_rfftfreq");
+    let mut ledger = CompareLedger::new("diff_015_rfftfreq_vs_oracle", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_real(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= 1e-15);
+    }
     run_diff_test(
-        "diff_015_rfftfreq",
+        &ledger,
+        case,
         "differential",
         "rfftfreq n=10 d=0.25",
         diff,
         1e-15,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -530,14 +669,22 @@ fn diff_016_fftfreq_odd_vs_oracle() {
             }
         })
         .collect();
+    let (arm, case) = ("fftfreq_odd", "diff_016_fftfreq_odd");
+    let mut ledger = CompareLedger::new("diff_016_fftfreq_odd_vs_oracle", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_real(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= 1e-15);
+    }
     run_diff_test(
-        "diff_016_fftfreq_odd",
+        &ledger,
+        case,
         "differential",
         "fftfreq n=7 d=1.0",
         diff,
         1e-15,
     );
+    ledger.finish(1);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -552,14 +699,25 @@ fn meta_001_parseval_energy_conservation() {
     let time_energy: f64 = input.iter().map(|c| complex_mag_sq(*c)).sum();
     let freq_energy: f64 = spectrum.iter().map(|c| complex_mag_sq(*c)).sum();
     let n = input.len() as f64;
+    // Reference: the input's energy; fsci side: the spectrum's energy over n.
+    let (arm, case) = ("parseval", "meta_001_parseval");
+    let mut ledger = CompareLedger::new("meta_001_parseval_energy_conservation", &[arm]);
+    let accepted = ledger
+        .pair(arm, case, Some(time_energy), Some(freq_energy / n))
+        .is_some();
     let diff = (time_energy - freq_energy / n).abs();
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "meta_001_parseval",
+        &ledger,
+        case,
         "metamorphic",
         "Parseval energy n=16",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -593,14 +751,23 @@ fn meta_002_linearity() {
         .map(|(&(ar, ai), &(br, bi))| (alpha * ar + beta * br, alpha * ai + beta * bi))
         .collect();
 
+    // Reference: alpha*F(a) + beta*F(b) from fsci's own transforms; fsci side: F(alpha*a+beta*b).
+    let (arm, case) = ("linearity", "meta_002_linearity");
+    let mut ledger = CompareLedger::new("meta_002_linearity", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &fc);
     let diff = max_abs_diff_complex(&fc, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "meta_002_linearity",
+        &ledger,
+        case,
         "metamorphic",
         "F(a*x+b*y) = a*F(x)+b*F(y)",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -622,14 +789,23 @@ fn meta_003_circular_shift_magnitude_preservation() {
         .map(|c| complex_mag_sq(*c).sqrt())
         .collect();
 
+    // Reference: |F(x)|; fsci side: |F(shift(x))|.
+    let (arm, case) = ("shift_mag", "meta_003_shift_mag");
+    let mut ledger = CompareLedger::new("meta_003_circular_shift_magnitude_preservation", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &magnitudes_orig, &magnitudes_shift);
     let diff = max_abs_diff_real(&magnitudes_orig, &magnitudes_shift);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "meta_003_shift_mag",
+        &ledger,
+        case,
         "metamorphic",
         "|F(shift(x))| = |F(x)|",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -639,6 +815,14 @@ fn meta_004_conjugate_symmetry_real_input() {
     let spectrum = fft(&input, &opts).unwrap();
     let n = spectrum.len();
 
+    // Reference: conj(X[n-k]); fsci side: X[k]; over the k the check below covers.
+    let mirrored_conj: Vec<Complex64> = (1..n / 2)
+        .map(|k| (spectrum[n - k].0, -spectrum[n - k].1))
+        .collect();
+    let (arm, case) = ("conj_sym", "meta_004_conj_sym");
+    let mut ledger = CompareLedger::new("meta_004_conjugate_symmetry_real_input", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &mirrored_conj, &spectrum[1..n / 2]);
+
     // For real input, X[k] = conj(X[n-k])
     let mut max_diff = 0.0_f64;
     for k in 1..n / 2 {
@@ -647,13 +831,18 @@ fn meta_004_conjugate_symmetry_real_input() {
         let d = nan_max((xk.0 - xnk.0).abs(), (xk.1 + xnk.1).abs());
         max_diff = nan_max(max_diff, d);
     }
+    if accepted {
+        ledger.compared(arm, case, max_diff <= TOL);
+    }
     run_diff_test(
-        "meta_004_conj_sym",
+        &ledger,
+        case,
         "metamorphic",
         "X[k]=conj(X[n-k]) for real input",
         max_diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -661,14 +850,22 @@ fn meta_005_fftshift_ifftshift_roundtrip() {
     let input = test_signal_real(15);
     let shifted = fftshift_1d(&input);
     let recovered = ifftshift_1d(&shifted);
+    let (arm, case) = ("shift_roundtrip", "meta_005_shift_roundtrip");
+    let mut ledger = CompareLedger::new("meta_005_fftshift_ifftshift_roundtrip", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &input, &recovered);
     let diff = max_abs_diff_real(&recovered, &input);
+    if accepted {
+        ledger.compared(arm, case, diff <= 0.0);
+    }
     run_diff_test(
-        "meta_005_shift_roundtrip",
+        &ledger,
+        case,
         "metamorphic",
         "ifftshift(fftshift(x)) = x",
         diff,
         0.0,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -679,29 +876,48 @@ fn meta_006_ortho_unitary_preservation() {
     let spectrum = fft(&input, &opts).unwrap();
     let recovered = ifft(&spectrum, &opts).unwrap();
 
-    let diff_roundtrip = max_abs_diff_complex(&recovered, &input);
-
     let input_energy: f64 = input.iter().map(|c| complex_mag_sq(*c)).sum();
     let spectrum_energy: f64 = spectrum.iter().map(|c| complex_mag_sq(*c)).sum();
+
+    // One case, two guards: the roundtrip against x, then the spectrum's energy against x's.
+    // `&&` consults the pair only once the slices accepted, so the case records one outcome.
+    let (arm, case) = ("ortho_unitary", "meta_006_ortho_unitary");
+    let mut ledger = CompareLedger::new("meta_006_ortho_unitary_preservation", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &input, &recovered)
+        && ledger
+            .pair(arm, case, Some(input_energy), Some(spectrum_energy))
+            .is_some();
+
+    let diff_roundtrip = max_abs_diff_complex(&recovered, &input);
     let energy_diff = (input_energy - spectrum_energy).abs();
 
     let diff = nan_max(diff_roundtrip, energy_diff);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "meta_006_ortho_unitary",
+        &ledger,
+        case,
         "metamorphic",
         "ortho preserves energy + roundtrip",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
 fn meta_007_rfft_output_length_invariant() {
     // rfft always returns n/2+1 bins
-    for n in [4, 5, 7, 8, 15, 16, 31, 32] {
+    // Structural: the reference is the bin count n/2+1, one case per n.
+    let arm = "rfft_len";
+    let mut ledger = CompareLedger::new("meta_007_rfft_output_length_invariant", &[arm]);
+    let sizes = [4, 5, 7, 8, 15, 16, 31, 32];
+    for n in sizes {
         let input: Vec<f64> = (0..n).map(|i| (i as f64) * 0.1).collect();
         let opts = FftOptions::default();
         let result = rfft(&input, &opts).unwrap();
+        ledger.compared(arm, &format!("n={n}"), result.len() == n / 2 + 1);
         assert_eq!(
             result.len(),
             n / 2 + 1,
@@ -711,12 +927,14 @@ fn meta_007_rfft_output_length_invariant() {
         );
     }
     run_diff_test(
+        &ledger,
         "meta_007_rfft_len",
         "metamorphic",
         "rfft len = n/2+1 for various n",
         0.0,
         0.0,
     );
+    ledger.finish(sizes.len());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -728,14 +946,22 @@ fn adv_001_size_1_fft() {
     let input = vec![(42.0, -7.0)];
     let opts = FftOptions::default();
     let result = fft(&input, &opts).unwrap();
+    let (arm, case) = ("size1_identity", "adv_001_size1");
+    let mut ledger = CompareLedger::new("adv_001_size_1_fft", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &input, &result);
     let diff = max_abs_diff_complex(&result, &input);
+    if accepted {
+        ledger.compared(arm, case, diff <= TOL);
+    }
     run_diff_test(
-        "adv_001_size1",
+        &ledger,
+        case,
         "adversarial",
         "fft of length-1 is identity",
         diff,
         TOL,
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -743,6 +969,9 @@ fn adv_002_empty_input_rejected() {
     let opts = FftOptions::default();
     let result = fft(&[], &opts);
     let pass = matches!(result, Err(FftError::InvalidShape { .. }));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger = CompareLedger::new("adv_002_empty_input_rejected", &["empty_rejected"]);
+    ledger.compared("empty_rejected", "adv_002_empty", pass);
     let log = DiffTestLog {
         test_id: "adv_002_empty".to_string(),
         category: "adversarial".to_string(),
@@ -751,12 +980,14 @@ fn adv_002_empty_input_rejected() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "empty input should return InvalidShape");
+    ledger.finish(1);
 }
 
 #[test]
@@ -765,6 +996,9 @@ fn adv_003_nan_rejected_by_check_finite() {
     let input = vec![(1.0, f64::NAN), (2.0, 0.0)];
     let result = fft(&input, &opts);
     let pass = matches!(result, Err(FftError::NonFiniteInput));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger = CompareLedger::new("adv_003_nan_rejected_by_check_finite", &["nan_rejected"]);
+    ledger.compared("nan_rejected", "adv_003_nan", pass);
     let log = DiffTestLog {
         test_id: "adv_003_nan".to_string(),
         category: "adversarial".to_string(),
@@ -773,12 +1007,14 @@ fn adv_003_nan_rejected_by_check_finite() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "NaN should be rejected when check_finite=true");
+    ledger.finish(1);
 }
 
 #[test]
@@ -787,6 +1023,9 @@ fn adv_004_inf_rejected_rfft() {
     let input = vec![1.0, f64::INFINITY, 3.0];
     let result = rfft(&input, &opts);
     let pass = matches!(result, Err(FftError::NonFiniteInput));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger = CompareLedger::new("adv_004_inf_rejected_rfft", &["inf_rfft_rejected"]);
+    ledger.compared("inf_rfft_rejected", "adv_004_inf_rfft", pass);
     let log = DiffTestLog {
         test_id: "adv_004_inf_rfft".to_string(),
         category: "adversarial".to_string(),
@@ -795,12 +1034,14 @@ fn adv_004_inf_rejected_rfft() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "Inf should be rejected when check_finite=true");
+    ledger.finish(1);
 }
 
 #[test]
@@ -810,6 +1051,10 @@ fn adv_005_zero_workers_rejected() {
     let input = vec![(1.0, 0.0)];
     let result = fft(&input, &opts);
     let pass = matches!(result, Err(FftError::InvalidWorkers { .. }));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger =
+        CompareLedger::new("adv_005_zero_workers_rejected", &["zero_workers_rejected"]);
+    ledger.compared("zero_workers_rejected", "adv_005_zero_workers", pass);
     let log = DiffTestLog {
         test_id: "adv_005_zero_workers".to_string(),
         category: "adversarial".to_string(),
@@ -818,12 +1063,14 @@ fn adv_005_zero_workers_rejected() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "zero workers should be rejected");
+    ledger.finish(1);
 }
 
 #[test]
@@ -833,6 +1080,12 @@ fn adv_006_irfft_length_mismatch() {
     let input = vec![(1.0, 0.0), (2.0, 0.0), (3.0, 0.0)];
     let result = irfft(&input, Some(8), &opts);
     let pass = matches!(result, Err(FftError::LengthMismatch { .. }));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger = CompareLedger::new(
+        "adv_006_irfft_length_mismatch",
+        &["irfft_mismatch_rejected"],
+    );
+    ledger.compared("irfft_mismatch_rejected", "adv_006_irfft_mismatch", pass);
     let log = DiffTestLog {
         test_id: "adv_006_irfft_mismatch".to_string(),
         category: "adversarial".to_string(),
@@ -841,12 +1094,14 @@ fn adv_006_irfft_length_mismatch() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "irfft length mismatch should be caught");
+    ledger.finish(1);
 }
 
 #[test]
@@ -855,6 +1110,9 @@ fn adv_007_fft2_shape_mismatch() {
     let input = vec![(1.0, 0.0); 10]; // 10 elements
     let result = fft2(&input, (3, 4), &opts); // expects 12
     let pass = matches!(result, Err(FftError::LengthMismatch { .. }));
+    // Structural: the expected outcome is an error variant, not a value.
+    let mut ledger = CompareLedger::new("adv_007_fft2_shape_mismatch", &["fft2_mismatch_rejected"]);
+    ledger.compared("fft2_mismatch_rejected", "adv_007_fft2_mismatch", pass);
     let log = DiffTestLog {
         test_id: "adv_007_fft2_mismatch".to_string(),
         category: "adversarial".to_string(),
@@ -863,18 +1121,26 @@ fn adv_007_fft2_shape_mismatch() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "fft2 shape mismatch should be caught");
+    ledger.finish(1);
 }
 
 #[test]
 fn adv_008_fftfreq_zero_n_rejected() {
     let result = fftfreq(0, 1.0);
     let pass = result.is_err();
+    // Structural: the expected outcome is an error, not a value.
+    let mut ledger = CompareLedger::new(
+        "adv_008_fftfreq_zero_n_rejected",
+        &["fftfreq_zero_rejected"],
+    );
+    ledger.compared("fftfreq_zero_rejected", "adv_008_fftfreq_zero", pass);
     let log = DiffTestLog {
         test_id: "adv_008_fftfreq_zero".to_string(),
         category: "adversarial".to_string(),
@@ -883,12 +1149,14 @@ fn adv_008_fftfreq_zero_n_rejected() {
         actual: format!("{result:?}"),
         diff: 0.0,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "fftfreq(0, _) should fail");
+    ledger.finish(1);
 }
 
 #[test]
@@ -897,8 +1165,14 @@ fn adv_009_fftfreq_negative_spacing_matches_scipy() {
     let d = -1.0;
     let result = fftfreq(n, d).unwrap();
     let expected = vec![-0.0, -0.125, -0.25, -0.375, 0.5, 0.375, 0.25, 0.125];
+    let (arm, case) = ("fftfreq_neg_d", "adv_009_fftfreq_neg_d");
+    let mut ledger = CompareLedger::new("adv_009_fftfreq_negative_spacing_matches_scipy", &[arm]);
+    let accepted = real_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_real(&result, &expected);
     let pass = diff <= 1e-15;
+    if accepted {
+        ledger.compared(arm, case, pass);
+    }
     let log = DiffTestLog {
         test_id: "adv_009_fftfreq_neg_d".to_string(),
         category: "differential".to_string(),
@@ -907,22 +1181,45 @@ fn adv_009_fftfreq_negative_spacing_matches_scipy() {
         actual: format!("{result:?}"),
         diff,
         tolerance: 1e-15,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
     };
     emit_log(&log);
     assert!(pass, "fftfreq negative spacing should match scipy");
+    ledger.finish(1);
 }
 
 #[test]
 fn adv_009b_fftfreq_non_finite_spacing_matches_scipy() {
+    // Two arms, one case each: fftfreq(4, inf) against its signed zeros, and rfftfreq(4, nan)
+    // against its n/2+1 NaN bins (slices matches a NaN reference element only with NaN, so an
+    // empty or short output no longer passes the `all(is_nan)` check vacuously).
+    let (inf_arm, nan_arm, case) = (
+        "fftfreq_inf_d",
+        "rfftfreq_nan_d",
+        "adv_009b_fftfreq_nonfinite_d",
+    );
+    let mut ledger = CompareLedger::new(
+        "adv_009b_fftfreq_non_finite_spacing_matches_scipy",
+        &[inf_arm, nan_arm],
+    );
     let inf_freqs = fftfreq(4, f64::INFINITY).unwrap();
     let inf_expected = vec![0.0, 0.0, -0.0, -0.0];
+    let inf_accepted = real_slices(&mut ledger, inf_arm, case, &inf_expected, &inf_freqs);
     let inf_diff = max_abs_diff_real(&inf_freqs, &inf_expected);
+    if inf_accepted {
+        ledger.compared(inf_arm, case, inf_diff <= 0.0);
+    }
 
     let nan_freqs = rfftfreq(4, f64::NAN).unwrap();
+    let nan_expected = vec![f64::NAN; 4 / 2 + 1];
+    let nan_accepted = real_slices(&mut ledger, nan_arm, case, &nan_expected, &nan_freqs);
     let nan_pass = nan_freqs.iter().all(|value| value.is_nan());
+    if nan_accepted {
+        ledger.compared(nan_arm, case, nan_pass);
+    }
     let pass = inf_diff <= 0.0 && nan_pass;
     let log = DiffTestLog {
         test_id: "adv_009b_fftfreq_nonfinite_d".to_string(),
@@ -932,6 +1229,7 @@ fn adv_009b_fftfreq_non_finite_spacing_matches_scipy() {
         actual: format!("inf={inf_freqs:?}; nan={nan_freqs:?}"),
         diff: inf_diff,
         tolerance: 0.0,
+        compared: ledger.counts().clone(),
         pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: 0,
@@ -941,6 +1239,7 @@ fn adv_009b_fftfreq_non_finite_spacing_matches_scipy() {
         pass,
         "non-finite spacing should match scipy/numpy propagation"
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -949,12 +1248,20 @@ fn adv_010_all_zeros_input() {
     let opts = FftOptions::default();
     let result = fft(&input, &opts).unwrap();
     let expected = vec![(0.0, 0.0); 8];
+    let (arm, case) = ("all_zeros", "adv_010_zeros");
+    let mut ledger = CompareLedger::new("adv_010_all_zeros_input", &[arm]);
+    let accepted = complex_slices(&mut ledger, arm, case, &expected, &result);
     let diff = max_abs_diff_complex(&result, &expected);
+    if accepted {
+        ledger.compared(arm, case, diff <= 0.0);
+    }
     run_diff_test(
-        "adv_010_zeros",
+        &ledger,
+        case,
         "adversarial",
         "fft of all-zeros = all-zeros",
         diff,
         0.0,
     );
+    ledger.finish(1);
 }

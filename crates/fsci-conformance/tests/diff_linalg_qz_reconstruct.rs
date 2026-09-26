@@ -5,15 +5,21 @@
 //! Resolves [frankenscipy-b2o05]. QZ has sign/ordering ambiguity, so we
 //! check invariants: Qᵀ A Z ≈ AA, Qᵀ B Z ≈ BB, Q Qᵀ ≈ I, Z Zᵀ ≈ I.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, qz};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
+/// One ledger arm per invariant (the ops `qz_aa`, `qz_bb`, `qz_q_ortho`, `qz_z_ortho`), each
+/// checked on every fixture. There is no SciPy side: the reference is Qᵀ A Z / Qᵀ B Z for the
+/// recon arms (self) and the analytic identity for the ortho arms.
+const ARMS: [&str; 4] = ["aa_recon", "bb_recon", "q_ortho", "z_ortho"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -28,6 +34,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -189,8 +196,11 @@ fn diff_linalg_qz_reconstruct() -> Result<(), String> {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let cases = fixtures();
+    let n_cases = cases.len();
+    let mut ledger = CompareLedger::new("diff_linalg_qz_reconstruct", &ARMS);
 
-    for (label, a, b) in fixtures() {
+    for (label, a, b) in cases {
         // A failed call is a failed case, never a skipped one.
         let res = qz(&a, &b, opts).map_err(|e| format!("qz {label} failed: {e:?}"))?;
 
@@ -241,6 +251,35 @@ fn diff_linalg_qz_reconstruct() -> Result<(), String> {
             abs_diff: z_d,
             pass: z_d <= ABS_TOL,
         });
+
+        // Each arm: the reference (Qᵀ A Z, Qᵀ B Z, or the n×n identity for n = A's order)
+        // against fsci's matrix, flattened. slices records a non-finite element or a length
+        // mismatch itself (identity_diff sizes its target from the product, so a wrongly sized
+        // Q or Z shows only here); otherwise the arm's verdict is the existing tolerance on the
+        // nan_max residual.
+        let n = a.len();
+        let eye: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        for (arm, reference, observed, d) in [
+            ("aa_recon", &qtaz, &res.aa, aa_diff),
+            ("bb_recon", &qtbz, &res.bb, bb_diff),
+            ("q_ortho", &eye, &qqt, q_d),
+            ("z_ortho", &eye, &zzt, z_d),
+        ] {
+            let (reference, observed) = (reference.concat(), observed.concat());
+            if ledger
+                .slices(
+                    arm,
+                    &label,
+                    Some(reference.as_slice()),
+                    Some(observed.as_slice()),
+                )
+                .is_some()
+            {
+                ledger.compared(arm, &label, d <= ABS_TOL);
+            }
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -249,6 +288,7 @@ fn diff_linalg_qz_reconstruct() -> Result<(), String> {
         test_id: "diff_linalg_qz_reconstruct".into(),
         category: "fsci_linalg.qz invariants".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -269,5 +309,7 @@ fn diff_linalg_qz_reconstruct() -> Result<(), String> {
         diffs.len(),
         max_overall
     );
+    // Every arm checks every fixture.
+    ledger.finish(n_cases);
     Ok(())
 }
