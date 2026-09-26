@@ -420,6 +420,16 @@ fn assert_artifacts_written(scenario_id: &str, steps: &[ForensicStep], all_pass:
     );
 }
 
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
+}
+
 // ======================================================================
 // HAPPY-PATH SCENARIOS (1-3)
 // ======================================================================
@@ -677,7 +687,7 @@ fn e2e_002b_gamma_beta_scipy_golden() {
         .iter()
         .zip(gamma_expected.iter())
         .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0_f64, f64::max);
+        .fold(0.0_f64, nan_max);
     let gamma_pass = gamma_diff <= TOL;
     all_pass &= gamma_pass;
     steps.push(make_step(
@@ -702,7 +712,7 @@ fn e2e_002b_gamma_beta_scipy_golden() {
         .iter()
         .zip(beta_expected.iter())
         .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0_f64, f64::max);
+        .fold(0.0_f64, nan_max);
     let beta_pass = beta_diff <= TOL;
     all_pass &= beta_pass;
     steps.push(make_step(
@@ -1190,7 +1200,7 @@ fn e2e_009_location_scale_invariance() {
         let z = (x - 5.0) / 3.0;
         let cdf_standard = standard.cdf(z);
         let err = (cdf_shifted - cdf_standard).abs();
-        max_err = max_err.max(err);
+        max_err = nan_max(max_err, err);
     }
     let pass = max_err < TOL;
     if !pass {
@@ -2475,7 +2485,7 @@ fn e2e_024_probplot_filliben_quantiles() {
         .iter()
         .zip(&expected)
         .map(|(&got, &want)| (got - want).abs())
-        .fold(0.0_f64, f64::max);
+        .fold(0.0_f64, nan_max);
     let pass = max_err < 2e-8;
     if !pass {
         all_pass = false;

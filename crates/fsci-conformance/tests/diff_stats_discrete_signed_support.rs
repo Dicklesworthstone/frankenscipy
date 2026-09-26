@@ -9,10 +9,12 @@
 //! exactly. Every row must be compared: a SciPy failure is a FAILED row, not a skipped one
 //! (frankenscipy-olv0j.1).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{DiscreteDistribution, DiscreteLaplace, RandInt, Skellam};
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +46,23 @@ struct Row {
     scipy: f64,
     pass: bool,
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct DiffLog {
+    compared: BTreeMap<String, ArmCounts>,
+    rows: Vec<Row>,
+}
+
+const ARMS: [&str; 8] = [
+    "pmf",
+    "cdf",
+    "sf",
+    "ppf",
+    "mean",
+    "var",
+    "support_lo",
+    "support_hi",
+];
 
 fn output_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/artifacts/{PACKET_ID}/diff"))
@@ -104,13 +123,38 @@ print(json.dumps(out, allow_nan=False))
     Some(serde_json::from_str(&stdout).expect("parse signed-support oracle JSON"))
 }
 
-fn check(rows: &mut Vec<Row>, family: &str, quantity: &str, at: f64, fsci: f64, scipy: f64) {
+fn check(
+    ledger: &mut CompareLedger,
+    rows: &mut Vec<Row>,
+    family: &str,
+    quantity: &str,
+    at: f64,
+    fsci: f64,
+    scipy: f64,
+) {
+    let case_id = if at.is_nan() {
+        family.to_string()
+    } else {
+        format!("{family}@{at}")
+    };
     let exact = matches!(quantity, "ppf" | "support_lo" | "support_hi");
+    // A support end is infinite on both sides for skellam and dlaplace: `both` keeps that row,
+    // and the exact equality below still fails a NaN on either side. Every other value SciPy
+    // sends is finite (`allow_nan=False`), so `pair` hands back both or records why not.
+    let values = if exact {
+        ledger.both(quantity, &case_id, Some(scipy), Some(fsci))
+    } else {
+        ledger.pair(quantity, &case_id, Some(scipy), Some(fsci))
+    };
+    let Some((scipy, fsci)) = values else {
+        return;
+    };
     let pass = if exact {
         fsci == scipy
     } else {
         (fsci - scipy).abs() <= REL_TOL * scipy.abs().max(1e-300)
     };
+    ledger.compared(quantity, &case_id, pass);
     rows.push(Row {
         family: family.to_string(),
         quantity: quantity.to_string(),
@@ -121,22 +165,28 @@ fn check(rows: &mut Vec<Row>, family: &str, quantity: &str, at: f64, fsci: f64, 
     });
 }
 
-fn compare<D: DiscreteDistribution>(rows: &mut Vec<Row>, d: &D, oracle: &OracleFamily) {
+fn compare<D: DiscreteDistribution>(
+    ledger: &mut CompareLedger,
+    rows: &mut Vec<Row>,
+    d: &D,
+    oracle: &OracleFamily,
+) {
     let name = oracle.name.as_str();
     for (i, &k) in KS.iter().enumerate() {
-        check(rows, name, "pmf", k as f64, d.pmf(k), oracle.pmf[i]);
-        check(rows, name, "cdf", k as f64, d.cdf(k), oracle.cdf[i]);
-        check(rows, name, "sf", k as f64, d.sf(k), oracle.sf[i]);
+        check(ledger, rows, name, "pmf", k as f64, d.pmf(k), oracle.pmf[i]);
+        check(ledger, rows, name, "cdf", k as f64, d.cdf(k), oracle.cdf[i]);
+        check(ledger, rows, name, "sf", k as f64, d.sf(k), oracle.sf[i]);
     }
     for (i, &q) in QS.iter().enumerate() {
-        check(rows, name, "ppf", q, d.ppf(q), oracle.ppf[i]);
+        check(ledger, rows, name, "ppf", q, d.ppf(q), oracle.ppf[i]);
     }
-    check(rows, name, "mean", f64::NAN, d.mean(), oracle.mean);
-    check(rows, name, "var", f64::NAN, d.var(), oracle.var);
+    check(ledger, rows, name, "mean", f64::NAN, d.mean(), oracle.mean);
+    check(ledger, rows, name, "var", f64::NAN, d.var(), oracle.var);
     let (lo, hi) = d.support();
     // An unparseable end becomes NaN, which fails the exact comparison.
     let end = |s: &str| s.parse::<f64>().unwrap_or(f64::NAN);
     check(
+        ledger,
         rows,
         name,
         "support_lo",
@@ -145,6 +195,7 @@ fn compare<D: DiscreteDistribution>(rows: &mut Vec<Row>, d: &D, oracle: &OracleF
         end(&oracle.support.0),
     );
     check(
+        ledger,
         rows,
         name,
         "support_hi",
@@ -161,11 +212,12 @@ fn diff_stats_discrete_signed_support() {
     };
     assert_eq!(oracle.len(), 3, "the oracle must return every family");
     let mut rows = Vec::new();
+    let mut ledger = CompareLedger::new("diff_stats_discrete_signed_support", &ARMS);
     for family in &oracle {
         match family.name.as_str() {
-            "skellam" => compare(&mut rows, &Skellam::new(2.0, 3.0), family),
-            "dlaplace" => compare(&mut rows, &DiscreteLaplace::new(0.8), family),
-            "randint" => compare(&mut rows, &RandInt::new(-3, 3), family),
+            "skellam" => compare(&mut ledger, &mut rows, &Skellam::new(2.0, 3.0), family),
+            "dlaplace" => compare(&mut ledger, &mut rows, &DiscreteLaplace::new(0.8), family),
+            "randint" => compare(&mut ledger, &mut rows, &RandInt::new(-3, 3), family),
             other => {
                 unreachable!("the oracle script emits only skellam, dlaplace, randint: {other}")
             }
@@ -174,9 +226,13 @@ fn diff_stats_discrete_signed_support() {
 
     let dir = output_dir();
     fs::create_dir_all(&dir).expect("create diff output dir");
+    let log = DiffLog {
+        compared: ledger.counts().clone(),
+        rows: rows.clone(),
+    };
     fs::write(
         dir.join("diff_stats_discrete_signed_support.json"),
-        serde_json::to_string_pretty(&rows).expect("serialize rows"),
+        serde_json::to_string_pretty(&log).expect("serialize rows"),
     )
     .expect("write diff log");
     for r in rows.iter().filter(|r| !r.pass) {
@@ -194,4 +250,6 @@ fn diff_stats_discrete_signed_support() {
         "{failed} of {} rows disagree with SciPy",
         rows.len()
     );
+    // mean, var and the support ends have one case per family, the fewest of any arm.
+    ledger.finish(oracle.len());
 }

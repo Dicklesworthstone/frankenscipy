@@ -10,13 +10,14 @@
 //! scipy/python3 is unavailable unless `FSCI_REQUIRE_SCIPY_ORACLE` is
 //! set.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, Logistic, Lomax, Pareto};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,18 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REL_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per `{dist}.{method}`, as the cases are generated.
+const ARMS: [&str; 9] = [
+    "logistic.pdf",
+    "logistic.cdf",
+    "logistic.sf",
+    "pareto.pdf",
+    "pareto.cdf",
+    "pareto.sf",
+    "lomax.pdf",
+    "lomax.cdf",
+    "lomax.sf",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct DistCase {
@@ -61,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     abs_tol: f64,
@@ -303,20 +317,16 @@ fn diff_stats_distributions() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_distributions", &ARMS);
 
     for case in &cases {
-        let scipy_value = match oracle_map.get(&case.case_id).and_then(|r| r.value) {
-            Some(v) if v.is_finite() => v,
-            _ => continue, // SciPy refused — skip.
+        let arm = format!("{}.{}", case.dist, case.method);
+        let scipy = oracle_map.get(&case.case_id).and_then(|r| r.value);
+        let Some((scipy_value, rust_value)) =
+            ledger.pair(&arm, &case.case_id, scipy, Some(rust_eval(case)))
+        else {
+            continue;
         };
-
-        let rust_value = rust_eval(case);
-        if !rust_value.is_finite() {
-            panic!(
-                "Rust returned non-finite ({rust_value}) for {case_id} where SciPy gave {scipy_value}",
-                case_id = case.case_id
-            );
-        }
 
         let abs_diff = (rust_value - scipy_value).abs();
         let rel_diff = abs_diff / scipy_value.abs().max(1.0);
@@ -324,6 +334,7 @@ fn diff_stats_distributions() {
 
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
+        ledger.compared(&arm, &case.case_id, pass);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -343,6 +354,7 @@ fn diff_stats_distributions() {
         test_id: "diff_stats_distributions".into(),
         category: "scipy.stats.{logistic, pareto, lomax}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         abs_tol: ABS_TOL,
@@ -371,4 +383,16 @@ fn diff_stats_distributions() {
         max_abs_overall,
         max_rel_overall
     );
+    // pareto drops x below scale, so its arms have the fewest cases; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| {
+            cases
+                .iter()
+                .filter(|c| format!("{}.{}", c.dist, c.method) == *arm)
+                .count()
+        })
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

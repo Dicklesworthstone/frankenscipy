@@ -17,13 +17,14 @@
 //! 3 datasets × 7 query points = 21 cases via subprocess.
 //! Tol 1e-12 abs (closed-form Gaussian sum).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::GaussianKde;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -95,10 +97,9 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write gaussian-kde diff log");
 }
 
-fn fsci_eval(bandwidth: f64, data: &[f64], x: f64) -> Option<f64> {
-    let kde = GaussianKde::with_bandwidth(data, bandwidth);
-    let v = kde.evaluate(x);
-    if v.is_finite() { Some(v) } else { None }
+fn fsci_eval(bandwidth: f64, data: &[f64], x: f64) -> f64 {
+    // A non-finite value reaches the ledger, which records it against SciPy's.
+    GaussianKde::with_bandwidth(data, bandwidth).evaluate(x)
 }
 
 fn generate_query() -> OracleQuery {
@@ -248,20 +249,26 @@ fn diff_stats_gaussian_kde() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_gaussian_kde", &["gaussian_kde"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.bandwidth, &case.data, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "gaussian_kde",
+            &case.case_id,
+            oracle.value,
+            Some(fsci_eval(case.bandwidth, &case.data, case.x)),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared("gaussian_kde", &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -270,6 +277,7 @@ fn diff_stats_gaussian_kde() {
         test_id: "diff_stats_gaussian_kde".into(),
         category: "scipy.stats.gaussian_kde".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -291,4 +299,5 @@ fn diff_stats_gaussian_kde() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -67,7 +67,7 @@ fn mean(values: &[f64]) -> f64 {
 }
 
 fn max_abs(values: &[f64]) -> f64 {
-    values.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+    values.iter().map(|v| v.abs()).fold(0.0_f64, nan_max)
 }
 
 fn zero_tolerance(values: &[f64]) -> f64 {
@@ -82,7 +82,17 @@ fn max_pair_abs_diff(left: &[f64], right: &[f64]) -> f64 {
     left.iter()
         .zip(right.iter())
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max)
+        .fold(0.0_f64, nan_max)
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 fn affine_sequence(len: usize, slope: f64, intercept: f64) -> Vec<f64> {

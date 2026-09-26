@@ -9,13 +9,14 @@
 //! Resolves [frankenscipy-713ui]. Both are deterministic scalar
 //! functions; 1e-10 abs tolerance covers iterative-solver floors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{wofz_real, wrightomega_scalar};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,8 @@ const PACKET_ID: &str = "FSCI-P2C-002";
 const WOFZ_TOL: f64 = 1.0e-7;
 const WRIGHTOMEGA_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function.
+const ARMS: [&str; 2] = ["wofz_real", "wrightomega"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -64,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -220,35 +224,35 @@ fn diff_special_wofz_wrightomega() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_wofz_wrightomega", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let (fsci_v, tol): (Vec<f64>, f64) = match case.func.as_str() {
+        let arm = case.func.as_str();
+        let (fsci_v, tol): (Vec<f64>, f64) = match arm {
             "wofz_real" => {
                 let (re, im) = wofz_real(case.x);
                 (vec![re, im], WOFZ_TOL)
             }
             "wrightomega" => (vec![wrightomega_scalar(case.x)], WRIGHTOMEGA_TOL),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
-        if fsci_v.len() != scipy_v.len() || fsci_v.iter().any(|v| !v.is_finite()) {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        // The ledger rejects a length mismatch and a non-finite fsci element.
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            arm,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(fsci_v.as_slice()),
+        ) else {
             continue;
-        }
+        };
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -263,6 +267,7 @@ fn diff_special_wofz_wrightomega() {
         test_id: "diff_special_wofz_wrightomega".into(),
         category: "scipy.special.wofz (real) + wrightomega".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -286,4 +291,11 @@ fn diff_special_wofz_wrightomega() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (wrightomega has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

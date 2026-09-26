@@ -10,13 +10,14 @@
 //! 4 fixtures × 3 arms (n_values + max-abs values + max-abs
 //! counts) = 12 cases via subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::find_repeats;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -215,39 +217,46 @@ fn diff_stats_find_repeats() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_find_repeats",
+        &["n_values", "values_max", "counts_max"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = find_repeats(&case.data);
 
-        let scipy_values = match &scipy_arm.values {
-            Some(v) => v,
-            None => continue,
-        };
-        let scipy_counts = match &scipy_arm.counts {
-            Some(v) => v,
-            None => continue,
-        };
-
         // n_values arm
-        let n_diff = (result.values.len() as i64 - scipy_values.len() as i64).unsigned_abs() as f64;
-        max_overall = max_overall.max(n_diff);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            arm: "n_values".into(),
-            abs_diff: n_diff,
-            pass: n_diff <= ABS_TOL,
-        });
+        if let Some((scipy_n, fsci_n)) = ledger.both(
+            "n_values",
+            &case.case_id,
+            scipy_arm.values.as_ref().map(Vec::len),
+            Some(result.values.len()),
+        ) {
+            let n_diff = (fsci_n as i64 - scipy_n as i64).unsigned_abs() as f64;
+            max_overall = max_overall.max(n_diff);
+            ledger.compared("n_values", &case.case_id, n_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: "n_values".into(),
+                abs_diff: n_diff,
+                pass: n_diff <= ABS_TOL,
+            });
+        }
 
-        // values element-wise
-        if result.values.len() == scipy_values.len() {
+        // values element-wise (the ledger rejects a length mismatch or a non-finite element)
+        if let Some((scipy_values, fsci_values)) = ledger.slices(
+            "values_max",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(result.values.as_slice()),
+        ) {
             let mut max_local = 0.0_f64;
-            for (a, b) in result.values.iter().zip(scipy_values.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
+            for (a, b) in fsci_values.iter().zip(scipy_values.iter()) {
+                max_local = max_local.max((a - b).abs());
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared("values_max", &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "values_max".into(),
@@ -256,14 +265,24 @@ fn diff_stats_find_repeats() {
             });
         }
 
-        // counts element-wise (integer)
-        if result.counts.len() == scipy_counts.len() {
+        // counts element-wise (integer); a length mismatch is a compared failure, not a skip
+        if let Some((scipy_counts, fsci_counts)) = ledger.both(
+            "counts_max",
+            &case.case_id,
+            scipy_arm.counts.as_deref(),
+            Some(result.counts.as_slice()),
+        ) {
             let mut max_local = 0.0_f64;
-            for (a, b) in result.counts.iter().zip(scipy_counts.iter()) {
-                let diff = (*a as i64 - *b).unsigned_abs() as f64;
-                max_local = max_local.max(diff);
+            if fsci_counts.len() == scipy_counts.len() {
+                for (a, b) in fsci_counts.iter().zip(scipy_counts.iter()) {
+                    let diff = (*a as i64 - *b).unsigned_abs() as f64;
+                    max_local = max_local.max(diff);
+                }
+            } else {
+                max_local = f64::INFINITY;
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared("counts_max", &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "counts_max".into(),
@@ -279,6 +298,7 @@ fn diff_stats_find_repeats() {
         test_id: "diff_stats_find_repeats".into(),
         category: "scipy.stats.find_repeats".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -303,4 +323,5 @@ fn diff_stats_find_repeats() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

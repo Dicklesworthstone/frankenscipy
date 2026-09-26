@@ -16,13 +16,14 @@
 //! Tol 1e-12 abs (closed-form) / 1e-9 abs (t-tail / normal-tail
 //! pvalue chains via betainc / ndtri).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kendalltau, linregress, spearmanr, weightedtau};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -267,122 +269,72 @@ fn diff_stats_correlation_basic() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
-
-    let record = |case_id: &str,
-                  arm: &str,
-                  rust_v: f64,
-                  scipy_v: f64,
-                  tol: f64,
-                  diffs: &mut Vec<CaseDiff>,
-                  max_overall: &mut f64| {
-        if !rust_v.is_finite() {
-            return;
-        }
-        let abs_diff = (rust_v - scipy_v).abs();
-        *max_overall = max_overall.max(abs_diff);
-        diffs.push(CaseDiff {
-            case_id: case_id.into(),
-            arm: arm.into(),
-            abs_diff,
-            pass: abs_diff <= tol,
-        });
-    };
+    let mut ledger = CompareLedger::new(
+        "diff_stats_correlation_basic",
+        &[
+            "slope",
+            "intercept",
+            "rvalue",
+            "pvalue",
+            "stderr",
+            "intercept_stderr",
+            "kendalltau.statistic",
+            "kendalltau.pvalue",
+            "spearmanr.statistic",
+            "spearmanr.pvalue",
+            "weightedtau.statistic",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.values else {
-            continue;
-        };
-        match case.func.as_str() {
+        // (arm, fsci value, tol); the arm's index is its position in SciPy's `values`.
+        let arms: Vec<(&str, f64, f64)> = match case.func.as_str() {
             "linregress" => {
                 let r = linregress(&case.x, &case.y);
-                let arms = [
+                vec![
                     ("slope", r.slope, STAT_TOL),
                     ("intercept", r.intercept, STAT_TOL),
                     ("rvalue", r.rvalue, STAT_TOL),
                     ("pvalue", r.pvalue, PVALUE_TOL),
                     ("stderr", r.stderr, STAT_TOL),
                     ("intercept_stderr", r.intercept_stderr, STAT_TOL),
-                ];
-                if scipy_vec.len() != arms.len() {
-                    continue;
-                }
-                for (i, (name, v, tol)) in arms.iter().enumerate() {
-                    record(
-                        &case.case_id,
-                        name,
-                        *v,
-                        scipy_vec[i],
-                        *tol,
-                        &mut diffs,
-                        &mut max_overall,
-                    );
-                }
+                ]
             }
             "kendalltau" => {
                 let r = kendalltau(&case.x, &case.y);
-                if scipy_vec.len() < 2 {
-                    continue;
-                }
-                record(
-                    &case.case_id,
-                    "kendalltau.statistic",
-                    r.statistic,
-                    scipy_vec[0],
-                    STAT_TOL,
-                    &mut diffs,
-                    &mut max_overall,
-                );
-                record(
-                    &case.case_id,
-                    "kendalltau.pvalue",
-                    r.pvalue,
-                    scipy_vec[1],
-                    PVALUE_TOL,
-                    &mut diffs,
-                    &mut max_overall,
-                );
+                vec![
+                    ("kendalltau.statistic", r.statistic, STAT_TOL),
+                    ("kendalltau.pvalue", r.pvalue, PVALUE_TOL),
+                ]
             }
             "spearmanr" => {
                 let r = spearmanr(&case.x, &case.y);
-                if scipy_vec.len() < 2 {
-                    continue;
-                }
-                record(
-                    &case.case_id,
-                    "spearmanr.statistic",
-                    r.statistic,
-                    scipy_vec[0],
-                    STAT_TOL,
-                    &mut diffs,
-                    &mut max_overall,
-                );
-                record(
-                    &case.case_id,
-                    "spearmanr.pvalue",
-                    r.pvalue,
-                    scipy_vec[1],
-                    PVALUE_TOL,
-                    &mut diffs,
-                    &mut max_overall,
-                );
+                vec![
+                    ("spearmanr.statistic", r.statistic, STAT_TOL),
+                    ("spearmanr.pvalue", r.pvalue, PVALUE_TOL),
+                ]
             }
             "weightedtau" => {
                 let r = weightedtau(&case.x, &case.y);
-                if scipy_vec.is_empty() {
-                    continue;
-                }
-                record(
-                    &case.case_id,
-                    "weightedtau.statistic",
-                    r,
-                    scipy_vec[0],
-                    STAT_TOL,
-                    &mut diffs,
-                    &mut max_overall,
-                );
+                vec![("weightedtau.statistic", r, STAT_TOL)]
             }
-            _ => continue,
+            other => panic!("correlation_basic: unknown func {other}"),
+        };
+        for (i, (arm, rust_v, tol)) in arms.into_iter().enumerate() {
+            let scipy_v = scipy_arm.values.as_ref().and_then(|v| v.get(i).copied());
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy_v, Some(rust_v)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= tol);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: arm.into(),
+                abs_diff,
+                pass: abs_diff <= tol,
+            });
         }
     }
 
@@ -392,6 +344,7 @@ fn diff_stats_correlation_basic() {
         test_id: "diff_stats_correlation_basic".into(),
         category: "scipy.stats.{linregress, kendalltau, spearmanr, weightedtau}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -415,5 +368,13 @@ fn diff_stats_correlation_basic() {
         "correlation_basic conformance failed: {} cases, max_abs={}",
         diffs.len(),
         max_overall
+    );
+    // every func has one case per fixture, so each arm is designed to compare that many
+    ledger.finish(
+        query
+            .points
+            .iter()
+            .filter(|c| c.func == "weightedtau")
+            .count(),
     );
 }

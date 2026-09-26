@@ -190,6 +190,16 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol || (a.is_nan() && b.is_nan())
 }
 
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // SCENARIOS 1-5: HAPPY-PATH
 // ═══════════════════════════════════════════════════════════════════════
@@ -1108,14 +1118,14 @@ fn scenario_10_precision() {
 
             let mut max_error = 0.0_f64;
             for (&orig, &back) in data.iter().zip(read.iter()) {
-                max_error = max_error.max((orig - back).abs());
+                max_error = nan_max(max_error, (orig - back).abs());
             }
 
-            if max_error > 1e-10 {
-                return Err(format!("precision loss: max_error={max_error}"));
+            if max_error <= 1e-10 {
+                Ok(format!("max roundtrip error: {max_error:.2e}"))
+            } else {
+                Err(format!("precision loss: max_error={max_error}"))
             }
-
-            Ok(format!("max roundtrip error: {max_error:.2e}"))
         },
     );
 
@@ -1137,14 +1147,14 @@ fn scenario_10_precision() {
                 } else {
                     back.abs()
                 };
-                max_rel_error = max_rel_error.max(rel_error);
+                max_rel_error = nan_max(max_rel_error, rel_error);
             }
 
-            if max_rel_error > 1e-10 {
-                return Err(format!("precision loss: rel_error={max_rel_error}"));
+            if max_rel_error <= 1e-10 {
+                Ok(format!("max relative error: {max_rel_error:.2e}"))
+            } else {
+                Err(format!("precision loss: rel_error={max_rel_error}"))
             }
-
-            Ok(format!("max relative error: {max_rel_error:.2e}"))
         },
     );
 
@@ -1176,13 +1186,13 @@ fn scenario_11_wav_bit_depth() {
                 .iter()
                 .zip(wav.data.iter())
                 .map(|(&o, &r)| (o - r).abs())
-                .fold(0.0_f64, f64::max);
+                .fold(0.0_f64, nan_max);
 
-            if max_error > 0.001 {
-                return Err(format!("quantization error too large: {max_error}"));
+            if max_error <= 0.001 {
+                Ok(format!("max quantization error: {max_error:.6}"))
+            } else {
+                Err(format!("quantization error too large: {max_error}"))
             }
-
-            Ok(format!("max quantization error: {max_error:.6}"))
         },
     );
 

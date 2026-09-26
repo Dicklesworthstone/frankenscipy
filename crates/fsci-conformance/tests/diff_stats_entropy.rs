@@ -11,13 +11,14 @@
 //! ~12 distributions via subprocess. Tolerances: 1e-10 abs OR
 //! 1e-9 rel — entropy formulas compose log + digamma helpers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     BetaDist, ChiSquared, ContinuousDistribution, Exponential, GammaDist, Gumbel, Laplace,
     Logistic, Lognormal, Normal, Rayleigh, Uniform, Weibull,
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -111,7 +113,8 @@ fn fsci_entropy(dist: &str, params: &[f64]) -> Option<f64> {
         "rayleigh" => Rayleigh::new(params[0]).entropy(),
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    // A non-finite value goes to the ledger as is: `pair` records it against SciPy's answer.
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -249,26 +252,32 @@ fn diff_stats_entropy() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_entropy", &["entropy"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_entropy(&case.dist, &case.params)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                dist: case.dist.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "entropy",
+            &case.case_id,
+            oracle.value,
+            fsci_entropy(&case.dist, &case.params),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared("entropy", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            dist: case.dist.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -277,6 +286,7 @@ fn diff_stats_entropy() {
         test_id: "diff_stats_entropy".into(),
         category: "scipy.stats.<dist>.entropy()".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -303,4 +313,5 @@ fn diff_stats_entropy() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

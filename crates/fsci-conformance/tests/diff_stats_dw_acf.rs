@@ -13,19 +13,21 @@
 //! 4 DW residual fixtures + 3 acf (data, max_lag) fixtures =
 //! 7 cases via subprocess. Tol 1e-12 abs (closed-form ratios).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{acf, durbin_watson};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["durbin_watson", "acf"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -65,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -274,46 +277,53 @@ fn diff_stats_dw_acf() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_dw_acf", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        match case.func.as_str() {
+        let arm = case.func.as_str();
+        match arm {
             "durbin_watson" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = durbin_watson(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
+                let rust_v = durbin_watson(&case.data);
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair(arm, &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
             }
             "acf" => {
-                if let Some(scipy_vec) = &scipy_arm.vector {
-                    let rust_vec = acf(&case.data, case.max_lag as usize);
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
-                    }
+                let rust_vec = acf(&case.data, case.max_lag as usize);
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(rust_vec.as_slice()),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    max_local = max_local.max((a - b).abs());
                 }
+                max_overall = max_overall.max(max_local);
+                ledger.compared(arm, &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -323,6 +333,7 @@ fn diff_stats_dw_acf() {
         test_id: "diff_stats_dw_acf".into(),
         category: "durbin_watson + acf (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +358,11 @@ fn diff_stats_dw_acf() {
         diffs.len(),
         max_overall
     );
+    // acf has 3 fixtures to durbin_watson's 4; each arm must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

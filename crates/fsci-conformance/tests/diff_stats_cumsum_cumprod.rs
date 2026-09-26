@@ -10,13 +10,14 @@
 //! (multiplicative noise grows with sequence length on noisy
 //! inputs — empirical precision floor on near-1 ratios).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{cumprod, cumsum};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -230,33 +232,31 @@ fn diff_stats_cumsum_cumprod() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_cumsum_cumprod", &["cumsum", "cumprod"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.values else {
-            continue;
-        };
-        let (rust_vec, tol) = match case.func.as_str() {
+        let func = case.func.as_str();
+        let (rust_vec, tol) = match func {
             "cumsum" => (cumsum(&case.data), CUMSUM_TOL),
             "cumprod" => (cumprod(&case.data), CUMPROD_TOL),
-            _ => continue,
+            other => panic!("cumsum_cumprod: unknown func {other}"),
         };
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            func,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(rust_vec.as_slice()),
+        ) else {
             continue;
-        }
-        let mut max_local = 0.0_f64;
-        for (r, s) in rust_vec.iter().zip(scipy_vec.iter()) {
-            if r.is_finite() {
-                max_local = max_local.max((r - s).abs());
-            }
-        }
+        };
+        let max_local = rust_vec
+            .iter()
+            .zip(scipy_vec.iter())
+            .map(|(r, s)| (r - s).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(max_local);
+        ledger.compared(func, &case.case_id, max_local <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -271,6 +271,7 @@ fn diff_stats_cumsum_cumprod() {
         test_id: "diff_stats_cumsum_cumprod".into(),
         category: "numpy.{cumsum, cumprod}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -295,4 +296,6 @@ fn diff_stats_cumsum_cumprod() {
         diffs.len(),
         max_overall
     );
+    // each dataset is one case of each func
+    ledger.finish(query.points.iter().filter(|c| c.func == "cumsum").count());
 }

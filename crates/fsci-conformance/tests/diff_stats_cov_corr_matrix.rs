@@ -14,13 +14,14 @@
 //! 3 datasets × 2 funcs = 6 cases via subprocess. Tol 1e-12
 //! abs (closed-form sums + ratios).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{corr_matrix, cov_matrix};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -246,55 +248,65 @@ fn diff_stats_cov_corr_matrix() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger =
+        CompareLedger::new("diff_stats_cov_corr_matrix", &["cov_matrix", "corr_matrix"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_mat) = &scipy_arm.matrix else {
-            continue;
-        };
-        let rust_mat = match case.func.as_str() {
+        let func = case.func.as_str();
+        let rust_mat = match func {
             "cov_matrix" => cov_matrix(&case.data),
             "corr_matrix" => corr_matrix(&case.data),
-            _ => continue,
+            other => panic!("cov_corr_matrix: unknown func {other}"),
         };
-        if rust_mat.len() != scipy_mat.len() {
+        let Some((scipy_mat, rust_mat)) = ledger.both(
+            func,
+            &case.case_id,
+            scipy_arm.matrix.as_ref(),
+            Some(rust_mat),
+        ) else {
+            continue;
+        };
+        let shape_ok = rust_mat.len() == scipy_mat.len()
+            && rust_mat
+                .iter()
+                .zip(scipy_mat.iter())
+                .all(|(rrow, srow)| rrow.len() == srow.len());
+        if shape_ok {
+            // Same shape: compare element-wise, where a NaN fsci element is a failure rather
+            // than a skipped element.
+            let scipy_flat: Vec<f64> = scipy_mat.iter().flatten().copied().collect();
+            let rust_flat: Vec<f64> = rust_mat.iter().flatten().copied().collect();
+            let Some((s, r)) = ledger.slices(
+                func,
+                &case.case_id,
+                Some(scipy_flat.as_slice()),
+                Some(rust_flat.as_slice()),
+            ) else {
+                continue;
+            };
+            let max_local = r
+                .iter()
+                .zip(s.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(max_local);
+            ledger.compared(func, &case.case_id, max_local <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                func: case.func.clone(),
+                abs_diff: max_local,
+                pass: max_local <= ABS_TOL,
+            });
+        } else {
+            ledger.compared(func, &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 func: case.func.clone(),
                 abs_diff: f64::INFINITY,
                 pass: false,
             });
-            continue;
         }
-        let mut max_local = 0.0_f64;
-        let mut shape_ok = true;
-        for (rrow, srow) in rust_mat.iter().zip(scipy_mat.iter()) {
-            if rrow.len() != srow.len() {
-                shape_ok = false;
-                break;
-            }
-            for (a, b) in rrow.iter().zip(srow.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
-            }
-        }
-        if !shape_ok {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        max_overall = max_overall.max(max_local);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            func: case.func.clone(),
-            abs_diff: max_local,
-            pass: max_local <= ABS_TOL,
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -303,6 +315,7 @@ fn diff_stats_cov_corr_matrix() {
         test_id: "diff_stats_cov_corr_matrix".into(),
         category: "cov_matrix + corr_matrix (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,5 +339,13 @@ fn diff_stats_cov_corr_matrix() {
         "cov_corr_matrix conformance failed: {} cases, max_abs={}",
         diffs.len(),
         max_overall
+    );
+    // each dataset is one case of each func
+    ledger.finish(
+        query
+            .points
+            .iter()
+            .filter(|c| c.func == "cov_matrix")
+            .count(),
     );
 }

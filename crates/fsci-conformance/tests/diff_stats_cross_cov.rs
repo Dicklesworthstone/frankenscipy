@@ -10,13 +10,14 @@
 //! case compares the cross-covariance matrix element-wise
 //! (max-abs aggregation). Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::cross_cov;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -233,48 +235,56 @@ fn diff_stats_cross_cov() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_cross_cov", &["cross_cov"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_mat) = &scipy_arm.matrix else {
+        let Some((scipy_mat, rust_mat)) = ledger.both(
+            "cross_cov",
+            &case.case_id,
+            scipy_arm.matrix.as_ref(),
+            Some(cross_cov(&case.x, &case.y)),
+        ) else {
             continue;
         };
-        let rust_mat = cross_cov(&case.x, &case.y);
-        if rust_mat.len() != scipy_mat.len() {
+        let shape_ok = rust_mat.len() == scipy_mat.len()
+            && rust_mat
+                .iter()
+                .zip(scipy_mat.iter())
+                .all(|(rrow, srow)| rrow.len() == srow.len());
+        if shape_ok {
+            // Same shape: compare element-wise, where a NaN fsci element is a failure rather
+            // than a skipped element.
+            let scipy_flat: Vec<f64> = scipy_mat.iter().flatten().copied().collect();
+            let rust_flat: Vec<f64> = rust_mat.iter().flatten().copied().collect();
+            let Some((s, r)) = ledger.slices(
+                "cross_cov",
+                &case.case_id,
+                Some(scipy_flat.as_slice()),
+                Some(rust_flat.as_slice()),
+            ) else {
+                continue;
+            };
+            let max_local = r
+                .iter()
+                .zip(s.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(max_local);
+            ledger.compared("cross_cov", &case.case_id, max_local <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                abs_diff: max_local,
+                pass: max_local <= ABS_TOL,
+            });
+        } else {
+            ledger.compared("cross_cov", &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 abs_diff: f64::INFINITY,
                 pass: false,
             });
-            continue;
         }
-        let mut max_local = 0.0_f64;
-        let mut shape_ok = true;
-        for (rrow, srow) in rust_mat.iter().zip(scipy_mat.iter()) {
-            if rrow.len() != srow.len() {
-                shape_ok = false;
-                break;
-            }
-            for (a, b) in rrow.iter().zip(srow.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
-            }
-        }
-        if !shape_ok {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        max_overall = max_overall.max(max_local);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            abs_diff: max_local,
-            pass: max_local <= ABS_TOL,
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -283,6 +293,7 @@ fn diff_stats_cross_cov() {
         test_id: "diff_stats_cross_cov".into(),
         category: "cross_cov (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -304,4 +315,5 @@ fn diff_stats_cross_cov() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

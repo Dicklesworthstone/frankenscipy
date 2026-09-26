@@ -113,17 +113,27 @@ fn max_abs_diff_vec(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
+        .fold(0.0_f64, nan_max)
 }
 
 fn max_abs_diff_mat(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     let mut m = 0.0_f64;
     for (ra, rb) in a.iter().zip(b.iter()) {
         for (va, vb) in ra.iter().zip(rb.iter()) {
-            m = m.max((va - vb).abs());
+            m = nan_max(m, (va - vb).abs());
         }
     }
     m
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 #[test]

@@ -10,13 +10,14 @@
 //! row_labels + col_labels) = 12 cases via subprocess. Tol
 //! 1e-12 abs (integer counts).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::contingency_table;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -224,6 +226,10 @@ fn diff_stats_contingency_table() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_contingency_table",
+        &["table", "row_labels", "col_labels"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -232,7 +238,12 @@ fn diff_stats_contingency_table() {
         let (rust_table, rust_rows, rust_cols) = contingency_table(&x_usize, &y_usize);
 
         // table
-        if let Some(scipy_table) = &scipy_arm.table {
+        if let Some((scipy_table, rust_table)) = ledger.both(
+            "table",
+            &case.case_id,
+            scipy_arm.table.as_ref(),
+            Some(&rust_table),
+        ) {
             let mut max_local = 0.0_f64;
             let mut shape_ok = rust_table.len() == scipy_table.len();
             if shape_ok {
@@ -248,6 +259,7 @@ fn diff_stats_contingency_table() {
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared("table", &case.case_id, shape_ok && max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "table".into(),
@@ -257,7 +269,12 @@ fn diff_stats_contingency_table() {
         }
 
         // row_labels
-        if let Some(scipy_rows) = &scipy_arm.row_labels {
+        if let Some((scipy_rows, rust_rows)) = ledger.both(
+            "row_labels",
+            &case.case_id,
+            scipy_arm.row_labels.as_ref(),
+            Some(&rust_rows),
+        ) {
             let mut max_local = 0.0_f64;
             let shape_ok = rust_rows.len() == scipy_rows.len();
             if shape_ok {
@@ -267,6 +284,11 @@ fn diff_stats_contingency_table() {
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(
+                "row_labels",
+                &case.case_id,
+                shape_ok && max_local <= ABS_TOL,
+            );
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "row_labels".into(),
@@ -276,7 +298,12 @@ fn diff_stats_contingency_table() {
         }
 
         // col_labels
-        if let Some(scipy_cols) = &scipy_arm.col_labels {
+        if let Some((scipy_cols, rust_cols)) = ledger.both(
+            "col_labels",
+            &case.case_id,
+            scipy_arm.col_labels.as_ref(),
+            Some(&rust_cols),
+        ) {
             let mut max_local = 0.0_f64;
             let shape_ok = rust_cols.len() == scipy_cols.len();
             if shape_ok {
@@ -286,6 +313,11 @@ fn diff_stats_contingency_table() {
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(
+                "col_labels",
+                &case.case_id,
+                shape_ok && max_local <= ABS_TOL,
+            );
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "col_labels".into(),
@@ -301,6 +333,7 @@ fn diff_stats_contingency_table() {
         test_id: "diff_stats_contingency_table".into(),
         category: "contingency_table (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -325,4 +358,5 @@ fn diff_stats_contingency_table() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

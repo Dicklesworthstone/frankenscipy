@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-uadm6]. Tolerance: 1e-13 absolute for finite
 //! outputs; NaN/infinity outputs compare by classification.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::powm1;
 use fsci_special::types::SpecialTensor;
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -317,12 +319,21 @@ fn diff_special_powm1() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_powm1", &["powm1"]);
 
     for case in &query.points {
         let expected = pmap.get(&case.case_id).expect("oracle case present");
         let actual = fsci_eval(case);
-        let diff = compare(case, &actual, expected);
+        // An "error" class is a raised SciPy call or a failed fsci call; every other class
+        // (finite, nan, pos_inf, neg_inf) is a value, compared class-exactly by `compare`.
+        let scipy = (expected.value_class != "error").then_some(expected);
+        let fsci = (actual.value_class != "error").then_some(&actual);
+        let Some((expected, actual)) = ledger.both("powm1", &case.case_id, scipy, fsci) else {
+            continue;
+        };
+        let diff = compare(case, actual, expected);
         max_overall = max_overall.max(diff.abs_diff);
+        ledger.compared("powm1", &case.case_id, diff.pass);
         diffs.push(diff);
     }
 
@@ -331,6 +342,7 @@ fn diff_special_powm1() {
         test_id: "diff_special_powm1".into(),
         category: "fsci_special::powm1 vs scipy.special.powm1".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -351,4 +363,5 @@ fn diff_special_powm1() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -12,19 +12,22 @@
 //!
 //! 7 input arrays × 3 functions = case sweep at 1e-12 abs tol.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{log_softmax, logsumexp, softmax};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function.
+const ARMS: [&str; 3] = ["softmax", "log_softmax", "logsumexp"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -65,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -232,30 +236,29 @@ fn diff_special_softmax() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_softmax", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        match case.func.as_str() {
+        let arm = case.func.as_str();
+        match arm {
             "softmax" => {
-                let Some(scipy_v) = scipy_arm.vector.as_ref() else {
+                let fsci_out = softmax(&case.x);
+                let Some((scipy_v, fsci_v)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(fsci_out.as_slice()),
+                ) else {
                     continue;
                 };
-                let fsci_v = softmax(&case.x);
-                if fsci_v.len() != scipy_v.len() {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    continue;
-                }
                 let abs_d = fsci_v
                     .iter()
                     .zip(scipy_v.iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     func: case.func.clone(),
@@ -264,25 +267,22 @@ fn diff_special_softmax() {
                 });
             }
             "log_softmax" => {
-                let Some(scipy_v) = scipy_arm.vector.as_ref() else {
+                let fsci_out = log_softmax(&case.x);
+                let Some((scipy_v, fsci_v)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(fsci_out.as_slice()),
+                ) else {
                     continue;
                 };
-                let fsci_v = log_softmax(&case.x);
-                if fsci_v.len() != scipy_v.len() {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    continue;
-                }
                 let abs_d = fsci_v
                     .iter()
                     .zip(scipy_v.iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max);
                 max_overall = max_overall.max(abs_d);
+                ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     func: case.func.clone(),
@@ -291,21 +291,17 @@ fn diff_special_softmax() {
                 });
             }
             "logsumexp" => {
-                let Some(scipy_v) = scipy_arm.scalar else {
+                let Some((scipy_v, fsci_v)) = ledger.pair(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.scalar,
+                    Some(logsumexp(&case.x)),
+                ) else {
                     continue;
                 };
-                let fsci_v = logsumexp(&case.x);
-                if !fsci_v.is_finite() {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        func: case.func.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    continue;
-                }
                 let abs_d = (fsci_v - scipy_v).abs();
                 max_overall = max_overall.max(abs_d);
+                ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     func: case.func.clone(),
@@ -313,7 +309,7 @@ fn diff_special_softmax() {
                     pass: abs_d <= ABS_TOL,
                 });
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -323,6 +319,7 @@ fn diff_special_softmax() {
         test_id: "diff_special_softmax".into(),
         category: "scipy.special.softmax/log_softmax/logsumexp".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -346,4 +343,11 @@ fn diff_special_softmax() {
         diffs.len(),
         max_overall
     );
+    // Each function must compare every input array.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

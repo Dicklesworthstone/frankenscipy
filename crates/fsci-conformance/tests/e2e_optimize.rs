@@ -295,6 +295,16 @@ fn l2_norm(v: &[f64]) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
+}
+
 fn assert_bundle_pass(bundle: &ForensicLogBundle) {
     assert_eq!(
         bundle.overall.status,
@@ -448,15 +458,16 @@ fn e2e_p2c003_02_multi_algorithm_comparison() {
             },
         );
         let spread = max_f - min_f;
-        if spread > 1.0e-4 {
-            return Err(format!(
+        if spread <= 1.0e-4 {
+            Ok(StepOutcome::new(
+                format!("terminal objective spread={spread:.3e}"),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "algorithm spread too wide: {spread:.3e} ({terminal_values:?})"
-            ));
+            ))
         }
-        Ok(StepOutcome::new(
-            format!("terminal objective spread={spread:.3e}"),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -1242,17 +1253,18 @@ fn e2e_p2c003_13_root_methods_comparison() {
         let max_diff = roots
             .iter()
             .flat_map(|(_, r1)| roots.iter().map(move |(_, r2)| (r1 - r2).abs()))
-            .fold(0.0f64, f64::max);
-        if max_diff > 1e-8 {
-            return Err(format!(
+            .fold(0.0f64, nan_max);
+        if max_diff <= 1e-8 {
+            Ok(StepOutcome::new(
+                format!("all methods agree within {:.3e}", max_diff),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "root methods disagree: max_diff={:.3e}, roots={:?}",
                 max_diff, roots
-            ));
+            ))
         }
-        Ok(StepOutcome::new(
-            format!("all methods agree within {:.3e}", max_diff),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -1322,22 +1334,22 @@ fn e2e_p2c003_14_fsolve_multivariate() {
         let eq1 = result.x[0] + result.x[1] + result.x[2] - 6.0;
         let eq2 = result.x[0] * result.x[1] - 8.0;
         let eq3 = result.x[1] + result.x[2] - 5.0;
-        let max_residual = eq1.abs().max(eq2.abs()).max(eq3.abs());
+        let max_residual = nan_max(nan_max(eq1.abs(), eq2.abs()), eq3.abs());
 
-        if max_residual > 0.01 {
-            return Err(format!(
+        if max_residual <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "found root: x=[{:.4}, {:.4}, {:.4}], max_residual={:.2e}",
+                    result.x[0], result.x[1], result.x[2], max_residual
+                ),
+                result.function_calls,
+            ))
+        } else {
+            Err(format!(
                 "equations not satisfied: residuals=[{:.3e}, {:.3e}, {:.3e}]",
                 eq1, eq2, eq3
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "found root: x=[{:.4}, {:.4}, {:.4}], max_residual={:.2e}",
-                result.x[0], result.x[1], result.x[2], max_residual
-            ),
-            result.function_calls,
-        ))
     });
 
     let bundle = runner.finish();

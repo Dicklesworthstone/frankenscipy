@@ -10,6 +10,7 @@ use std::error::Error;
 use std::io::{Error as IoError, Write};
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::{Complex64, SpecialTensor};
 use fsci_special::{hankel1e, hankel2e, jve, yve};
@@ -17,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const SCALED_BESSEL_TOL: f64 = 5.0e-8;
+/// One ledger arm per scaled callable.
+const ARMS: [&str; 4] = ["jve", "yve", "hankel1e", "hankel2e"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -176,18 +179,28 @@ fn diff_special_scaled_bessel() -> Result<(), Box<dyn Error>> {
         )));
     }
 
-    for (case, expected) in query.points.iter().zip(oracle.points.iter()) {
-        if case.case_id != expected.case_id {
+    let mut ledger = CompareLedger::new("diff_special_scaled_bessel", &ARMS);
+    for (case, oracle_point) in query.points.iter().zip(oracle.points.iter()) {
+        if case.case_id != oracle_point.case_id {
             return Err(test_error(format!(
                 "scaled Bessel oracle order mismatch: {} vs {}",
-                case.case_id, expected.case_id
+                case.case_id, oracle_point.case_id
             )));
         }
-        let actual = eval_case(case)?;
-        let expected = Complex64::new(expected.re, expected.im);
+        let arm = case.function.as_str();
+        let scipy = Some(Complex64::new(oracle_point.re, oracle_point.im));
+        let fsci = eval_case(case)
+            .inspect_err(|err| eprintln!("{}: fsci failed: {err}", case.case_id))
+            .ok();
+        let Some((expected, actual)) = ledger.both(arm, &case.case_id, scipy, fsci) else {
+            continue;
+        };
         let scale = expected.abs().max(1.0);
         let diff = (actual - expected).abs();
-        if diff > SCALED_BESSEL_TOL * scale {
+        // Written as `<=` so a NaN component (NaN diff) is a failure, not a silent pass.
+        let pass = diff <= SCALED_BESSEL_TOL * scale;
+        ledger.compared(arm, &case.case_id, pass);
+        if !pass {
             return Err(test_error(format!(
                 "{} mismatch: got ({}, {}), expected ({}, {}), abs_diff={diff}",
                 case.case_id, actual.re, actual.im, expected.re, expected.im
@@ -195,5 +208,12 @@ fn diff_special_scaled_bessel() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Each callable must compare all of its own cases.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.function == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
     Ok(())
 }

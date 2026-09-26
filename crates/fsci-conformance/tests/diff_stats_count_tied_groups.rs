@@ -10,13 +10,14 @@
 //! float-equality. Each case sums into per-tie-size arms (one
 //! arm per distinct tie size). Tol 1e-12 abs (integer counts).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::count_tied_groups;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -207,21 +209,33 @@ fn diff_stats_count_tied_groups() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    // One ledger arm: a case is the whole {tie size: group count} map, compared key by key.
+    let mut ledger = CompareLedger::new("diff_stats_count_tied_groups", &["count_tied_groups"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_counts) = &scipy_arm.counts else {
+        let Some((scipy_counts, rust_map)) = ledger.both(
+            "count_tied_groups",
+            &case.case_id,
+            scipy_arm.counts.as_ref(),
+            Some(count_tied_groups(&case.data)),
+        ) else {
             continue;
         };
-        let rust_map = count_tied_groups(&case.data);
 
         // Union the keys so we catch missing/extra entries on either side.
         let mut keys: HashSet<usize> = rust_map.keys().copied().collect();
+        // A SciPy key that is not a tie size cannot be matched, so it fails the case.
+        let mut unparsed_scipy_key = false;
         for k in scipy_counts.keys() {
-            if let Ok(parsed) = k.parse::<usize>() {
-                keys.insert(parsed);
+            match k.parse::<usize>() {
+                Ok(parsed) => {
+                    keys.insert(parsed);
+                }
+                Err(_) => unparsed_scipy_key = true,
             }
         }
+        let mut case_pass = !unparsed_scipy_key;
         if keys.is_empty() {
             // Both sides empty (no-ties case) — record a single noop arm.
             diffs.push(CaseDiff {
@@ -230,22 +244,24 @@ fn diff_stats_count_tied_groups() {
                 abs_diff: 0.0,
                 pass: true,
             });
-            continue;
+        } else {
+            let mut sorted_keys: Vec<usize> = keys.into_iter().collect();
+            sorted_keys.sort_unstable();
+            for k in sorted_keys {
+                let r = *rust_map.get(&k).unwrap_or(&0) as i64;
+                let s = *scipy_counts.get(&k.to_string()).unwrap_or(&0);
+                let abs_diff = (r - s).unsigned_abs() as f64;
+                max_overall = max_overall.max(abs_diff);
+                case_pass &= abs_diff <= ABS_TOL;
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    arm: format!("size{k}"),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
+            }
         }
-        let mut sorted_keys: Vec<usize> = keys.into_iter().collect();
-        sorted_keys.sort_unstable();
-        for k in sorted_keys {
-            let r = *rust_map.get(&k).unwrap_or(&0) as i64;
-            let s = *scipy_counts.get(&k.to_string()).unwrap_or(&0);
-            let abs_diff = (r - s).unsigned_abs() as f64;
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("size{k}"),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        ledger.compared("count_tied_groups", &case.case_id, case_pass);
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -254,6 +270,7 @@ fn diff_stats_count_tied_groups() {
         test_id: "diff_stats_count_tied_groups".into(),
         category: "scipy.stats.mstats.count_tied_groups".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -278,4 +295,5 @@ fn diff_stats_count_tied_groups() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

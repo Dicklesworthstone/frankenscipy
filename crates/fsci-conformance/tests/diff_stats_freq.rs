@@ -18,13 +18,14 @@
 //! lowerlimit + binsize) = 48 cases via subprocess. Tol 1e-12
 //! abs (closed-form histogram + cumulative sum).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{cumfreq, relfreq};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -247,26 +249,40 @@ fn diff_stats_freq() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_freq",
+        &[
+            "relfreq.frequency_max",
+            "relfreq.lowerlimit",
+            "relfreq.binsize",
+            "cumfreq.frequency_max",
+            "cumfreq.lowerlimit",
+            "cumfreq.binsize",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_freq, rust_edges) = match case.func.as_str() {
             "relfreq" => relfreq(&case.data, case.bins as usize),
             "cumfreq" => cumfreq(&case.data, case.bins as usize),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        // frequency vector
-        if let Some(scipy_freq) = &scipy_arm.frequency
-            && rust_freq.len() == scipy_freq.len()
-        {
+        // frequency vector (the ledger rejects a length mismatch or a non-finite element)
+        let freq_arm = format!("{}.frequency_max", case.func);
+        if let Some((scipy_freq, rust_v)) = ledger.slices(
+            &freq_arm,
+            &case.case_id,
+            scipy_arm.frequency.as_deref(),
+            Some(rust_freq.as_slice()),
+        ) {
             let mut max_local = 0.0_f64;
-            for (a, b) in rust_freq.iter().zip(scipy_freq.iter()) {
-                if a.is_finite() {
-                    max_local = max_local.max((a - b).abs());
-                }
+            for (a, b) in rust_v.iter().zip(scipy_freq.iter()) {
+                max_local = max_local.max((a - b).abs());
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(&freq_arm, &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 func: case.func.clone(),
@@ -276,32 +292,31 @@ fn diff_stats_freq() {
             });
         }
 
-        // lowerlimit = edges[0]
-        if let Some(scipy_lo) = scipy_arm.lowerlimit
-            && let Some(&rust_lo) = rust_edges.first()
-        {
-            let abs_diff = (rust_lo - scipy_lo).abs();
+        // lowerlimit = edges[0]; binsize = edges[1] - edges[0]
+        let scalar_arms = [
+            (
+                "lowerlimit",
+                scipy_arm.lowerlimit,
+                rust_edges.first().copied(),
+            ),
+            (
+                "binsize",
+                scipy_arm.binsize,
+                rust_edges.get(1).map(|e1| e1 - rust_edges[0]),
+            ),
+        ];
+        for (name, scipy, fsci) in scalar_arms {
+            let arm = format!("{}.{name}", case.func);
+            let Some((scipy_v, rust_v)) = ledger.pair(&arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(&arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 func: case.func.clone(),
-                arm: "lowerlimit".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-
-        // binsize = edges[1] - edges[0]
-        if let Some(scipy_bs) = scipy_arm.binsize
-            && rust_edges.len() >= 2
-        {
-            let rust_bs = rust_edges[1] - rust_edges[0];
-            let abs_diff = (rust_bs - scipy_bs).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                arm: "binsize".into(),
+                arm: name.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -314,6 +329,7 @@ fn diff_stats_freq() {
         test_id: "diff_stats_freq".into(),
         category: "scipy.stats.relfreq + cumfreq".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -338,4 +354,6 @@ fn diff_stats_freq() {
         diffs.len(),
         max_overall
     );
+    // Each func's three arms compare every (dataset, bins) case run through that func.
+    ledger.finish(query.points.iter().filter(|c| c.func == "relfreq").count());
 }
