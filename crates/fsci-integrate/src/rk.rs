@@ -1203,11 +1203,12 @@ impl RkSolver {
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
 
-            if !err_norm.is_finite() {
-                self.state = OdeSolverState::Failed;
-                return Err(StepFailure::NonFiniteState);
-            }
-
+            // A NaN or infinite error norm (the RHS went non-finite at a trial point) is a
+            // REJECTED step in SciPy's rk.py, not a failure: `error_norm < 1` is false, and
+            // Python's `max(MIN_FACTOR, SAFETY * nan**e)` is MIN_FACTOR (`inf**e` is 0), so the
+            // step shrinks by MIN_FACTOR and is retried. `f64::max` here drops the NaN the same
+            // way. SciPy 1.17.1 RK45 on y' = -sqrt(y), y(0) = 1, first_step = 0.9 recovers from
+            // 14 NaN trial evaluations and succeeds; this used to return NonFiniteState.
             if err_norm < 1.0 {
                 // Step accepted
                 let factor = if err_norm == 0.0 {
@@ -1413,11 +1414,12 @@ impl RkSolver {
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
 
-            if !err_norm.is_finite() {
-                self.state = OdeSolverState::Failed;
-                return Err(StepFailure::NonFiniteState);
-            }
-
+            // A NaN or infinite error norm (the RHS went non-finite at a trial point) is a
+            // REJECTED step in SciPy's rk.py, not a failure: `error_norm < 1` is false, and
+            // Python's `max(MIN_FACTOR, SAFETY * nan**e)` is MIN_FACTOR (`inf**e` is 0), so the
+            // step shrinks by MIN_FACTOR and is retried. `f64::max` here drops the NaN the same
+            // way. SciPy 1.17.1 RK45 on y' = -sqrt(y), y(0) = 1, first_step = 0.9 recovers from
+            // 14 NaN trial evaluations and succeeds; this used to return NonFiniteState.
             if err_norm < 1.0 {
                 // Step accepted
                 let factor = if err_norm == 0.0 {

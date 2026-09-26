@@ -1433,6 +1433,78 @@ mod tests {
     use super::*;
     use fsci_runtime::AuditAction;
 
+    /// A trial step whose right-hand side goes NaN is rejected and shrunk, not a failure.
+    /// SciPy 1.17.1 `solve_ivp(f, (0, 1.9), y0, method=..., first_step=0.9)`, default tolerances:
+    /// - y' = -sqrt(y), y0 = 1, RK45: 14 NaN evaluations, success, nfev = 97,
+    ///   y(1.9) = 0.0025021952904742124.
+    /// - y' = sqrt(1 - y), y0 = 0, RK45: 14 NaN evaluations, success, nfev = 85,
+    ///   y(1.9) = 0.997460458540015.
+    /// - must not change (no NaN evaluated): y' = -sqrt(y) with RK23 is nfev = 52,
+    ///   y = 0.002229771521795849; with DOP853 it is nfev = 25, y = 0.0024524366176797985.
+    #[test]
+    fn solve_ivp_rejects_a_nan_trial_step_like_scipy() {
+        let cases: [(&str, fn(f64) -> f64, f64, SolverKind, usize, f64); 4] = [
+            (
+                "sqrt_decay RK45",
+                |y| -y.sqrt(),
+                1.0,
+                SolverKind::Rk45,
+                97,
+                0.0025021952904742124,
+            ),
+            (
+                "sqrt_1my RK45",
+                |y| (1.0 - y).sqrt(),
+                0.0,
+                SolverKind::Rk45,
+                85,
+                0.997460458540015,
+            ),
+            (
+                "sqrt_decay RK23",
+                |y| -y.sqrt(),
+                1.0,
+                SolverKind::Rk23,
+                52,
+                0.002229771521795849,
+            ),
+            (
+                "sqrt_decay DOP853",
+                |y| -y.sqrt(),
+                1.0,
+                SolverKind::Dop853,
+                25,
+                0.0024524366176797985,
+            ),
+        ];
+        for (label, rhs, y0, method, nfev, y_end) in cases {
+            let y0 = [y0];
+            let result = solve_ivp(
+                &mut |_t, y| vec![rhs(y[0])],
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.9),
+                    y0: &y0,
+                    method,
+                    first_step: Some(0.9),
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .expect("scipy succeeds here");
+            let yf = result.y.last().expect("a final state")[0];
+            assert!(
+                result.success && result.status == 0,
+                "{label}: {} {}",
+                result.status,
+                result.message
+            );
+            assert_eq!(result.nfev, nfev, "{label}: nfev");
+            assert!(
+                (yf - y_end).abs() < 1e-12,
+                "{label}: y(1.9) = {yf}, scipy {y_end}"
+            );
+        }
+    }
+
     #[test]
     fn solve_ivp_harmonic_oscillator_system() {
         // 2-equation system y' = [y1, -y0], y(0)=[1,0] -> [cos t, -sin t].
