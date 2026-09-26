@@ -7,11 +7,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 #![allow(clippy::type_complexity)]
-// Numeric kernels: fixture vectors, deliberate min/max comparisons, and helper
-// aliases kept for the variants these modules can be switched to.
+// Numeric kernels: fixture vectors and deliberate min/max comparisons.
 #![allow(clippy::useless_vec)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
 #![allow(clippy::min_max)]
 #![allow(clippy::absurd_extreme_comparisons)]
 
@@ -54,15 +51,11 @@ pub mod interpolative;
 mod hessenberg_qr;
 
 // Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
-// not yet wired into any factorization. See panel_pool.rs.
-//
-// DECLARED DELIBERATELY, and the reason is frankenscipy-ozg54. This module shipped
-// undeclared because its fix was unverified: rch worker vmi1153651 served a
-// snapshot that was current as of the last COMMIT but dropped the UNCOMMITTED
-// working-tree edit, so three consecutive builds returned exit 0 while compiling
-// none of it. Committing the declaration is therefore the only way to get the file
-// in front of a compiler, AND it is a direct test of that diagnosis: if committed
-// edits do reach the worker, the test count moves 596 -> 602.
+// wired into no factorization. Its own doc records why it cannot serve the
+// cholesky k-loop without an index-addressed redesign, so no library path uses it
+// and it compiles with its tests only. Once `#![allow(dead_code)]` was lifted
+// (frankenscipy-szq1n.12) every item in it was reported unused.
+#[cfg(test)]
 mod panel_pool;
 
 // Tiled (PLASMA-style) Cholesky — foundation for the task-DAG dense-lane
@@ -29048,12 +29041,6 @@ mod tests {
             .lock()
             .expect("ledger poison should have been cleared");
         assert_eq!(ledger.len(), 4);
-    }
-
-    fn rotated_diagonal(lambda1: f64, lambda2: f64) -> Vec<Vec<f64>> {
-        let diag = 0.5 * (lambda1 + lambda2);
-        let off_diag = 0.5 * (lambda1 - lambda2);
-        vec![vec![diag, off_diag], vec![off_diag, diag]]
     }
 
     fn reconstruct_qr_result(result: &QrResult) -> Vec<Vec<f64>> {
