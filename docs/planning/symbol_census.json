@@ -1,22 +1,68 @@
 {
  "modules": {
-  "scipy.cluster": {
-   "applicable": 0,
-   "compared": 0,
+  "scipy.cluster.hierarchy": {
+   "applicable": 31,
+   "compared": 9,
    "crate": "fsci-cluster",
-   "declared": 0,
+   "declared": 30,
+   "matched_by": {
+    "case_fold": 1,
+    "exact": 29,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 1,
+   "not_real": {
+    "dendrogram": "missing: no dendrogram layout (ivl, leaves, icoord, dcoord) (frankenscipy-9fbpm)",
+    "set_link_color_palette": "na: sets matplotlib link colours; fsci does not plot"
+   },
+   "real": 30,
+   "real_not_compared": [
+    "ClusterNode",
+    "DisjointSet",
+    "average",
+    "centroid",
+    "complete",
+    "correspond",
+    "cut_tree",
+    "from_mlab_linkage",
+    "is_isomorphic",
+    "is_valid_im",
+    "leaders",
+    "maxRstat",
+    "maxdists",
+    "maxinconsts",
+    "median",
+    "optimal_leaf_ordering",
+    "single",
+    "to_mlab_linkage",
+    "to_tree",
+    "ward",
+    "weighted"
+   ],
+   "scipy": 32
+  },
+  "scipy.cluster.vq": {
+   "applicable": 4,
+   "compared": 2,
+   "crate": "fsci-cluster",
+   "declared": 4,
    "matched_by": {
     "case_fold": 0,
-    "exact": 0,
+    "exact": 4,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
    "not_real": {},
-   "real": 0,
-   "real_not_compared": [],
-   "scipy": 0
+   "real": 4,
+   "real_not_compared": [
+    "kmeans",
+    "kmeans2"
+   ],
+   "scipy": 4
   },
   "scipy.constants": {
    "applicable": 7,
@@ -65,6 +111,28 @@
    ],
    "scipy": 5
   },
+  "scipy.differentiate": {
+   "applicable": 3,
+   "compared": 0,
+   "crate": "fsci-opt",
+   "declared": 3,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 3,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 3,
+   "real_not_compared": [
+    "derivative",
+    "hessian",
+    "jacobian"
+   ],
+   "scipy": 3
+  },
   "scipy.fft": {
    "applicable": 37,
    "compared": 20,
@@ -105,6 +173,35 @@
     "set_workers"
    ],
    "scipy": 41
+  },
+  "scipy.fftpack": {
+   "applicable": 10,
+   "compared": 0,
+   "crate": "fsci-fft",
+   "declared": 1,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 1,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "cc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "cs_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "hilbert": "wrong_alias: fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence (frankenscipy-9fbpm)",
+    "ihilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "itilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "sc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "shift": "missing: legacy fftpack Fourier shift of a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "ss_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
+    "tilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)"
+   },
+   "real": 0,
+   "real_not_compared": [],
+   "scipy": 10
   },
   "scipy.integrate": {
    "applicable": 32,
@@ -242,6 +339,82 @@
    ],
    "scipy": 14
   },
+  "scipy.io.arff": {
+   "applicable": 4,
+   "compared": 0,
+   "crate": "fsci-io",
+   "declared": 0,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 0,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "ArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-9fbpm)",
+    "ParseArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-9fbpm)"
+   },
+   "real": 2,
+   "real_not_compared": [
+    "MetaData",
+    "loadarff"
+   ],
+   "scipy": 4
+  },
+  "scipy.io.matlab": {
+   "applicable": 10,
+   "compared": 0,
+   "crate": "fsci-io",
+   "declared": 0,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 0,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "MatReadError": "missing: MATLAB read failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
+    "MatReadWarning": "missing: no warning channel for recoverable MATLAB read issues (frankenscipy-1ksfv.12)",
+    "MatWriteError": "missing: MATLAB write failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
+    "MatWriteWarning": "missing: no warning channel for recoverable MATLAB write issues (frankenscipy-1ksfv.12)",
+    "MatlabFunction": "missing: MATLAB v5 function elements are not modelled (frankenscipy-1ksfv.12)",
+    "MatlabObject": "missing: MATLAB v5 class objects are not modelled (frankenscipy-1ksfv.12)",
+    "MatlabOpaque": "missing: MATLAB v5 opaque elements are not modelled (frankenscipy-1ksfv.12)",
+    "mat_struct": "missing: MATLAB v5 structs as attribute objects (struct_as_record=False) are not modelled (frankenscipy-1ksfv.12)",
+    "matfile_version": "missing: no MAT-file version probe (frankenscipy-1ksfv.12)",
+    "varmats_from_mat": "missing: no per-variable MAT-file splitter (frankenscipy-1ksfv.12)"
+   },
+   "real": 0,
+   "real_not_compared": [],
+   "scipy": 10
+  },
+  "scipy.io.wavfile": {
+   "applicable": 3,
+   "compared": 0,
+   "crate": "fsci-io",
+   "declared": 0,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 0,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "WavFileWarning": "missing: no warning channel for skipped or malformed WAV chunks (frankenscipy-9fbpm)"
+   },
+   "real": 2,
+   "real_not_compared": [
+    "read",
+    "write"
+   ],
+   "scipy": 3
+  },
   "scipy.linalg": {
    "applicable": 95,
    "compared": 62,
@@ -297,6 +470,28 @@
     "svdvals"
    ],
    "scipy": 98
+  },
+  "scipy.linalg.interpolative": {
+   "applicable": 8,
+   "compared": 6,
+   "crate": "fsci-linalg",
+   "declared": 7,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 7,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "estimate_rank": "missing: randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank (frankenscipy-9fbpm)"
+   },
+   "real": 7,
+   "real_not_compared": [
+    "interp_decomp"
+   ],
+   "scipy": 8
   },
   "scipy.ndimage": {
    "applicable": 75,
@@ -443,6 +638,24 @@
    ],
    "scipy": 71
   },
+  "scipy.optimize.elementwise": {
+   "applicable": 4,
+   "compared": 4,
+   "crate": "fsci-opt",
+   "declared": 4,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 4,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 4,
+   "real_not_compared": [],
+   "scipy": 4
+  },
   "scipy.signal": {
    "applicable": 157,
    "compared": 77,
@@ -542,6 +755,41 @@
    ],
    "scipy": 157
   },
+  "scipy.signal.windows": {
+   "applicable": 25,
+   "compared": 9,
+   "crate": "fsci-signal",
+   "declared": 22,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 22,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 25,
+   "real_not_compared": [
+    "bartlett",
+    "blackman",
+    "blackmanharris",
+    "bohman",
+    "boxcar",
+    "cosine",
+    "dpss",
+    "flattop",
+    "gaussian",
+    "hamming",
+    "hann",
+    "kaiser",
+    "nuttall",
+    "parzen",
+    "triang",
+    "tukey"
+   ],
+   "scipy": 25
+  },
   "scipy.sparse": {
    "applicable": 51,
    "compared": 23,
@@ -592,6 +840,81 @@
    ],
    "scipy": 53
   },
+  "scipy.sparse.csgraph": {
+   "applicable": 26,
+   "compared": 10,
+   "crate": "fsci-sparse",
+   "declared": 12,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 12,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "NegativeCycleError": "missing: SparseError has no negative-cycle variant (frankenscipy-fdepw)",
+    "breadth_first_tree": "missing: BFS order exists, the BFS tree matrix does not (frankenscipy-fdepw)",
+    "construct_dist_matrix": "missing: no distance matrix from a predecessor matrix (frankenscipy-fdepw)",
+    "csgraph_from_dense": "missing: no dense-to-csgraph conversion with a null value (frankenscipy-fdepw)",
+    "csgraph_from_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
+    "csgraph_masked_from_dense": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
+    "csgraph_to_dense": "missing: no csgraph-to-dense conversion with a null value (frankenscipy-fdepw)",
+    "csgraph_to_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
+    "depth_first_tree": "missing: DFS order exists, the DFS tree matrix does not (frankenscipy-fdepw)",
+    "maximum_bipartite_matching": "missing: no bipartite matching (frankenscipy-fdepw)",
+    "maximum_flow": "missing: no max-flow (frankenscipy-fdepw)",
+    "min_weight_full_bipartite_matching": "missing: no weighted bipartite matching (frankenscipy-fdepw)",
+    "reconstruct_path": "missing: no tree from a predecessor list (frankenscipy-fdepw)",
+    "yen": "missing: no k-shortest-paths (frankenscipy-fdepw)"
+   },
+   "real": 12,
+   "real_not_compared": [
+    "reverse_cuthill_mckee",
+    "shortest_path"
+   ],
+   "scipy": 26
+  },
+  "scipy.sparse.linalg": {
+   "applicable": 37,
+   "compared": 19,
+   "crate": "fsci-sparse",
+   "declared": 24,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 24,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 1,
+   "not_real": {
+    "ArpackError": "missing: SparseError has no eigensolver error class (frankenscipy-6j5tz)",
+    "ArpackNoConvergence": "missing: SparseError has no eigensolver non-convergence class (frankenscipy-6j5tz)",
+    "LaplacianNd": "missing: no grid Laplacian operator (frankenscipy-6j5tz)",
+    "LinearOperator": "missing: no matrix-free operator abstraction; iterative solvers take concrete matrices (frankenscipy-6j5tz)",
+    "MatrixRankWarning": "missing: spsolve on a singular matrix returns SingularMatrix instead of warning (frankenscipy-6j5tz)",
+    "aslinearoperator": "missing: no matrix-free operator abstraction (frankenscipy-6j5tz)",
+    "factorized": "missing: no solve callable over a cached LU (frankenscipy-6j5tz)",
+    "funm_multiply_krylov": "missing: no Krylov f(A)b (frankenscipy-6j5tz)",
+    "gcrotmk": "missing: no GCROT(m,k) solver (frankenscipy-6j5tz)",
+    "inv": "missing: no sparse inverse (frankenscipy-6j5tz)",
+    "lobpcg": "missing: no block eigensolver (frankenscipy-6j5tz)",
+    "use_solver": "na: selects UMFPACK for spsolve; there is no UMFPACK"
+   },
+   "real": 26,
+   "real_not_compared": [
+    "SuperLU",
+    "eigs",
+    "expm_multiply",
+    "is_sptriangular",
+    "onenormest",
+    "spbandwidth",
+    "tfqmr"
+   ],
+   "scipy": 38
+  },
   "scipy.spatial": {
    "applicable": 18,
    "compared": 4,
@@ -624,6 +947,53 @@
     "voronoi_plot_2d"
    ],
    "scipy": 18
+  },
+  "scipy.spatial.distance": {
+   "applicable": 27,
+   "compared": 22,
+   "crate": "fsci-spatial",
+   "declared": 26,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 26,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 27,
+   "real_not_compared": [
+    "is_valid_dm",
+    "is_valid_y",
+    "num_obs_dm",
+    "num_obs_y",
+    "squareform"
+   ],
+   "scipy": 27
+  },
+  "scipy.spatial.transform": {
+   "applicable": 4,
+   "compared": 0,
+   "crate": "fsci-spatial",
+   "declared": 4,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 4,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 4,
+   "real_not_compared": [
+    "RigidTransform",
+    "Rotation",
+    "RotationSpline",
+    "Slerp"
+   ],
+   "scipy": 4
   },
   "scipy.special": {
    "applicable": 358,
@@ -887,23 +1257,142 @@
     "yeojohnson_normplot"
    ],
    "scipy": 303
+  },
+  "scipy.stats.contingency": {
+   "applicable": 6,
+   "compared": 2,
+   "crate": "fsci-stats",
+   "declared": 6,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 6,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 6,
+   "real_not_compared": [
+    "association",
+    "crosstab",
+    "expected_freq",
+    "margins"
+   ],
+   "scipy": 6
+  },
+  "scipy.stats.mstats": {
+   "applicable": 29,
+   "compared": 10,
+   "crate": "fsci-stats",
+   "declared": 28,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 28,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 2,
+   "not_real": {
+    "argstoarray": "na: builds a masked array; fsci has no masked-array type",
+    "trim": "na: returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)",
+    "trimmed_mean": "missing: asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case (frankenscipy-9fbpm)"
+   },
+   "real": 28,
+   "real_not_compared": [
+    "compare_medians_ms",
+    "kendalltau_seasonal",
+    "kruskalwallis",
+    "ks_twosamp",
+    "meppf",
+    "mjci",
+    "mquantiles_cimj",
+    "msign",
+    "rsh",
+    "sen_seasonal_slopes",
+    "trima",
+    "trimmed_mean_ci",
+    "trimmed_std",
+    "trimmed_stde",
+    "trimmed_var",
+    "trimr",
+    "trimtail",
+    "ttest_onesamp"
+   ],
+   "scipy": 31
+  },
+  "scipy.stats.qmc": {
+   "applicable": 11,
+   "compared": 4,
+   "crate": "fsci-stats",
+   "declared": 7,
+   "matched_by": {
+    "case_fold": 2,
+    "exact": 4,
+    "reexport": 1,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {},
+   "real": 11,
+   "real_not_compared": [
+    "LatinHypercube",
+    "MultinomialQMC",
+    "MultivariateNormalQMC",
+    "PoissonDisk",
+    "QMCEngine",
+    "discrepancy",
+    "update_discrepancy"
+   ],
+   "scipy": 11
+  },
+  "scipy.stats.sampling": {
+   "applicable": 9,
+   "compared": 0,
+   "crate": "fsci-stats",
+   "declared": 5,
+   "matched_by": {
+    "case_fold": 0,
+    "exact": 5,
+    "reexport": 0,
+    "trait": 0,
+    "type_alias": 0
+   },
+   "na": 0,
+   "not_real": {
+    "FastGeneratorInversion": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
+    "NumericalInversePolynomial": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
+    "SimpleRatioUniforms": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
+    "UNURANError": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)"
+   },
+   "real": 5,
+   "real_not_compared": [
+    "DiscreteAliasUrn",
+    "DiscreteGuideTable",
+    "NumericalInverseHermite",
+    "RatioUniforms",
+    "TransformedDensityRejection"
+   ],
+   "scipy": 9
   }
  },
  "numpy": "2.4.3",
  "scipy": "1.17.1",
  "total": {
-  "applicable": 1288,
-  "compared": 722,
-  "declared": 1272,
+  "applicable": 1539,
+  "compared": 819,
+  "declared": 1455,
   "matched_by": {
-   "case_fold": 123,
-   "exact": 1078,
-   "reexport": 9,
+   "case_fold": 126,
+   "exact": 1257,
+   "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
-  "na": 12,
-  "real": 1283,
-  "scipy": 1300
+  "na": 16,
+  "real": 1479,
+  "scipy": 1555
  }
 }
