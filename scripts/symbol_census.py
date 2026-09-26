@@ -48,15 +48,37 @@ DIFF_TESTS = CRATES / "fsci-conformance" / "tests"
 DISPOSITIONS = ROOT / "docs" / "planning" / "census_dispositions.toml"
 ARTIFACT = ROOT / "docs" / "planning" / "symbol_census.json"
 
+# Every public SciPy module with an `__all__` (frankenscipy-9fbpm: the 16 top-level ones alone left
+# 245 names out). Left out: scipy.cluster itself (its `__all__` is just vq and hierarchy, so it
+# read 0/0), scipy.linalg.blas/lapack and scipy.stats.distributions (every name is already in the
+# parent), and scipy.optimize.cython_optimize (Cython-level API with no `__all__`).
 MODMAP = {
-    "scipy.cluster": "fsci-cluster", "scipy.constants": "fsci-constants",
-    "scipy.datasets": "fsci-datasets", "scipy.fft": "fsci-fft",
+    "scipy.cluster.hierarchy": "fsci-cluster",
+    "scipy.cluster.vq": "fsci-cluster", "scipy.constants": "fsci-constants",
+    "scipy.datasets": "fsci-datasets", "scipy.differentiate": "fsci-opt",
+    "scipy.fft": "fsci-fft", "scipy.fftpack": "fsci-fft",
     "scipy.integrate": "fsci-integrate", "scipy.interpolate": "fsci-interpolate",
-    "scipy.io": "fsci-io", "scipy.linalg": "fsci-linalg", "scipy.ndimage": "fsci-ndimage",
-    "scipy.odr": "fsci-odr", "scipy.optimize": "fsci-opt", "scipy.signal": "fsci-signal",
-    "scipy.sparse": "fsci-sparse", "scipy.spatial": "fsci-spatial",
+    "scipy.io": "fsci-io", "scipy.io.arff": "fsci-io", "scipy.io.matlab": "fsci-io",
+    "scipy.io.wavfile": "fsci-io", "scipy.linalg": "fsci-linalg",
+    "scipy.linalg.interpolative": "fsci-linalg", "scipy.ndimage": "fsci-ndimage",
+    "scipy.odr": "fsci-odr", "scipy.optimize": "fsci-opt", "scipy.optimize.elementwise": "fsci-opt",
+    "scipy.signal": "fsci-signal", "scipy.signal.windows": "fsci-signal",
+    "scipy.sparse": "fsci-sparse", "scipy.sparse.csgraph": "fsci-sparse",
+    "scipy.sparse.linalg": "fsci-sparse", "scipy.spatial": "fsci-spatial",
+    "scipy.spatial.distance": "fsci-spatial", "scipy.spatial.transform": "fsci-spatial",
     "scipy.special": "fsci-special", "scipy.stats": "fsci-stats",
+    "scipy.stats.contingency": "fsci-stats", "scipy.stats.mstats": "fsci-stats",
+    "scipy.stats.qmc": "fsci-stats", "scipy.stats.sampling": "fsci-stats",
 }
+# A name a module shares with its parent (or, for the legacy fftpack, with scipy.fft) is counted
+# once, in the owner's row: signal.windows.get_window is signal.get_window, and the mstats names
+# that stats also exports are the same functions over masked arrays.
+SHARED_WITH = {"scipy.fftpack": "scipy.fft"}
+
+
+def owner_of(module: str, modmap: dict[str, str]) -> str | None:
+    owner = SHARED_WITH.get(module) or module.rsplit(".", 1)[0]
+    return owner if owner != module and owner in modmap else None
 DISPOSITION_KINDS = ("adapted", "na", "missing", "wrong_alias")
 DISPOSITION_KEYS = {"module", "name", "disposition", "reason", "bead", "rust"}
 MATCH_KINDS = ("exact", "case_fold", "reexport", "type_alias", "trait")
@@ -247,11 +269,13 @@ def diff_uses(path: pathlib.Path, modmap: dict[str, str]) -> tuple[set[tuple[str
 def census(modmap, crates, dispositions, diff_paths, symbols=scipy_symbols) -> dict:
     uses = [diff_uses(p, modmap) for p in diff_paths]
     modules, total = {}, dict.fromkeys(COUNTS, 0) | {"matched_by": dict.fromkeys(MATCH_KINDS, 0)}
+    exported = {module: symbols(module) for module in modmap}
     for module, crate in sorted(modmap.items()):
-        names = symbols(module)
+        owner = owner_of(module, modmap)
+        names = exported[module] - (exported[owner] if owner else set())
         for m, n in dispositions:
             if m == module and n not in names:
-                raise CensusError(f"disposition {m}.{n}: not a callable in {module}.__all__")
+                raise CensusError(f"disposition {m}.{n}: not a callable counted in {module}'s row")
         surface = crate_surface(crates / crate / "src")
         row = dict.fromkeys(COUNTS, 0) | {"crate": crate, "matched_by": dict.fromkeys(MATCH_KINDS, 0)}
         row |= {"not_real": {}, "real_not_compared": []}
@@ -385,6 +409,8 @@ def self_test() -> bool:
     adapted = run(disps | entry("absent", "adapted", rust="fsci_fake::Moyal"))
     uncompared = census(modmap, crates, disps, [diff], lambda _m: names)["modules"]["scipy.fake"][
         "real_not_compared"]
+    nested = census({"scipy.fake": "fsci-fake", "scipy.fake.sub": "fsci-fake"}, crates, {}, [],
+                    lambda m: names if m == "scipy.fake" else {"solve", "subonly"})
     checks = {
         # inline_alias is public through the glob; hidden (private file module), hidden_inline
         # (private inline module), indented (method), binonly (src/bin) and absent never match
@@ -395,6 +421,9 @@ def self_test() -> bool:
         "na leaves the denominator": t["applicable"] == 11 and bare["applicable"] == 12,
         "a no-op name listed na leaves real unchanged": noop["declared"] == 7 and noop["real"] == t["real"],
         "adapted counts when its Rust item exists": adapted["real"] == 6,
+        # the submodule re-exports solve; only subonly is its own
+        "a submodule name shared with its parent is counted once": nested["modules"][
+            "scipy.fake.sub"]["scipy"] == 1 and nested["total"]["scipy"] == len(names) + 1,
         # solve is called and Onlytrait imported; Landau::new counts only once landau is real;
         # moyal is named by the oracle but never used; reexported is "called" only in a comment
         "a Rust call or import next to an oracle reference is compared": t["compared"] == 2
@@ -448,11 +477,11 @@ def print_report(report: dict) -> None:
     def pct(n, d):
         return f"{100 * n / d:5.1f}" if d else "  n/a"
 
-    print(f"{'module':18s} {'crate':17s} {'scipy':>5s} {'na':>3s} {'appl':>5s} {'decl':>5s} "
+    print(f"{'module':26s} {'crate':17s} {'scipy':>5s} {'na':>3s} {'appl':>5s} {'decl':>5s} "
           f"{'real':>5s} {'cmp':>5s} {'real%':>6s} {'cmp%':>6s}")
     rows = list(report["modules"].items()) + [("TOTAL", report["total"] | {"crate": ""})]
     for module, r in rows:
-        print(f"{module:18s} {r['crate']:17s} {r['scipy']:5d} {r['na']:3d} {r['applicable']:5d} "
+        print(f"{module:26s} {r['crate']:17s} {r['scipy']:5d} {r['na']:3d} {r['applicable']:5d} "
               f"{r['declared']:5d} {r['real']:5d} {r['compared']:5d} {pct(r['real'], r['applicable']):>6s} "
               f"{pct(r['compared'], r['applicable']):>6s}")
     print("declared, by match kind: " + ", ".join(f"{k} {v}" for k, v in report["total"]["matched_by"].items()))

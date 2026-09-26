@@ -209,3 +209,512 @@ disposition = "adapted"
 rust = "fsci_runtime::WarningCategory::NearConstantInputWarning"
 reason = "a WarningCategory variant; pearsonr raises it"
 bead = "frankenscipy-8dndw.1"
+
+# ---- public submodules (frankenscipy-9fbpm) ----
+
+[[entry]]
+module = "scipy.cluster.hierarchy"
+name = "dendrogram"
+disposition = "missing"
+reason = "no dendrogram layout (ivl, leaves, icoord, dcoord)"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.cluster.hierarchy"
+name = "set_link_color_palette"
+disposition = "na"
+reason = "sets matplotlib link colours; fsci does not plot"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "hilbert"
+disposition = "wrong_alias"
+reason = "fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "diff"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "tilbert"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "itilbert"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "ihilbert"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "cs_diff"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "sc_diff"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "ss_diff"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "cc_diff"
+disposition = "missing"
+reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.fftpack"
+name = "shift"
+disposition = "missing"
+reason = "legacy fftpack Fourier shift of a periodic sequence; not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.io.arff"
+name = "loadarff"
+disposition = "adapted"
+rust = "fsci_io::read_arff"
+reason = "parses ARFF text into ArffData"
+
+[[entry]]
+module = "scipy.io.arff"
+name = "MetaData"
+disposition = "adapted"
+rust = "fsci_io::ArffData"
+reason = "loadarff's (data, meta) pair is one ArffData, whose relation and attributes carry MetaData's content"
+
+[[entry]]
+module = "scipy.io.arff"
+name = "ArffError"
+disposition = "missing"
+reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.io.arff"
+name = "ParseArffError"
+disposition = "missing"
+reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatReadError"
+disposition = "missing"
+reason = "MATLAB read failures are IoError variants, not a distinct error class"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatWriteError"
+disposition = "missing"
+reason = "MATLAB write failures are IoError variants, not a distinct error class"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatReadWarning"
+disposition = "missing"
+reason = "no warning channel for recoverable MATLAB read issues"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatWriteWarning"
+disposition = "missing"
+reason = "no warning channel for recoverable MATLAB write issues"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatlabFunction"
+disposition = "missing"
+reason = "MATLAB v5 function elements are not modelled"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatlabObject"
+disposition = "missing"
+reason = "MATLAB v5 class objects are not modelled"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "MatlabOpaque"
+disposition = "missing"
+reason = "MATLAB v5 opaque elements are not modelled"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "mat_struct"
+disposition = "missing"
+reason = "MATLAB v5 structs as attribute objects (struct_as_record=False) are not modelled"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "matfile_version"
+disposition = "missing"
+reason = "no MAT-file version probe"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.matlab"
+name = "varmats_from_mat"
+disposition = "missing"
+reason = "no per-variable MAT-file splitter"
+bead = "frankenscipy-1ksfv.12"
+
+[[entry]]
+module = "scipy.io.wavfile"
+name = "read"
+disposition = "adapted"
+rust = "fsci_io::wav_read"
+reason = "reads a WAV byte buffer"
+
+[[entry]]
+module = "scipy.io.wavfile"
+name = "write"
+disposition = "adapted"
+rust = "fsci_io::wav_write"
+reason = "encodes a WAV byte buffer"
+
+[[entry]]
+module = "scipy.io.wavfile"
+name = "WavFileWarning"
+disposition = "missing"
+reason = "no warning channel for skipped or malformed WAV chunks"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.linalg.interpolative"
+name = "estimate_rank"
+disposition = "missing"
+reason = "randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.signal.windows"
+name = "bohman"
+disposition = "adapted"
+rust = "fsci_signal::bohman_window"
+reason = "window functions carry a _window suffix"
+
+[[entry]]
+module = "scipy.signal.windows"
+name = "nuttall"
+disposition = "adapted"
+rust = "fsci_signal::nuttall_window"
+reason = "window functions carry a _window suffix"
+
+[[entry]]
+module = "scipy.signal.windows"
+name = "tukey"
+disposition = "adapted"
+rust = "fsci_signal::tukey_window"
+reason = "window functions carry a _window suffix"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "NegativeCycleError"
+disposition = "missing"
+reason = "SparseError has no negative-cycle variant"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "breadth_first_tree"
+disposition = "missing"
+reason = "BFS order exists, the BFS tree matrix does not"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "depth_first_tree"
+disposition = "missing"
+reason = "DFS order exists, the DFS tree matrix does not"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "construct_dist_matrix"
+disposition = "missing"
+reason = "no distance matrix from a predecessor matrix"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "reconstruct_path"
+disposition = "missing"
+reason = "no tree from a predecessor list"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "yen"
+disposition = "missing"
+reason = "no k-shortest-paths"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "maximum_flow"
+disposition = "missing"
+reason = "no max-flow"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "maximum_bipartite_matching"
+disposition = "missing"
+reason = "no bipartite matching"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "min_weight_full_bipartite_matching"
+disposition = "missing"
+reason = "no weighted bipartite matching"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "csgraph_from_dense"
+disposition = "missing"
+reason = "no dense-to-csgraph conversion with a null value"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "csgraph_to_dense"
+disposition = "missing"
+reason = "no csgraph-to-dense conversion with a null value"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "csgraph_from_masked"
+disposition = "missing"
+reason = "no masked-array graph conversion"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "csgraph_masked_from_dense"
+disposition = "missing"
+reason = "no masked-array graph conversion"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.csgraph"
+name = "csgraph_to_masked"
+disposition = "missing"
+reason = "no masked-array graph conversion"
+bead = "frankenscipy-fdepw"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "norm"
+disposition = "adapted"
+rust = "fsci_sparse::sparse_norm"
+reason = "sparse matrix norms by kind"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "SuperLU"
+disposition = "adapted"
+rust = "fsci_sparse::SparseLuFactorization"
+reason = "splu's factorization object"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "use_solver"
+disposition = "na"
+reason = "selects UMFPACK for spsolve; there is no UMFPACK"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "LinearOperator"
+disposition = "missing"
+reason = "no matrix-free operator abstraction; iterative solvers take concrete matrices"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "aslinearoperator"
+disposition = "missing"
+reason = "no matrix-free operator abstraction"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "lobpcg"
+disposition = "missing"
+reason = "no block eigensolver"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "gcrotmk"
+disposition = "missing"
+reason = "no GCROT(m,k) solver"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "factorized"
+disposition = "missing"
+reason = "no solve callable over a cached LU"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "inv"
+disposition = "missing"
+reason = "no sparse inverse"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "funm_multiply_krylov"
+disposition = "missing"
+reason = "no Krylov f(A)b"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "LaplacianNd"
+disposition = "missing"
+reason = "no grid Laplacian operator"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "MatrixRankWarning"
+disposition = "missing"
+reason = "spsolve on a singular matrix returns SingularMatrix instead of warning"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "ArpackError"
+disposition = "missing"
+reason = "SparseError has no eigensolver error class"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.sparse.linalg"
+name = "ArpackNoConvergence"
+disposition = "missing"
+reason = "SparseError has no eigensolver non-convergence class"
+bead = "frankenscipy-6j5tz"
+
+[[entry]]
+module = "scipy.spatial.distance"
+name = "squareform"
+disposition = "adapted"
+rust = "fsci_spatial::squareform_to_matrix"
+reason = "split by direction: squareform_to_matrix and squareform_to_condensed"
+
+[[entry]]
+module = "scipy.stats.mstats"
+name = "argstoarray"
+disposition = "na"
+reason = "builds a masked array; fsci has no masked-array type"
+
+[[entry]]
+module = "scipy.stats.mstats"
+name = "trim"
+disposition = "na"
+reason = "returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)"
+
+[[entry]]
+module = "scipy.stats.mstats"
+name = "trimmed_mean"
+disposition = "missing"
+reason = "asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.stats.qmc"
+name = "Halton"
+disposition = "adapted"
+rust = "fsci_stats::HaltonSampler"
+reason = "QMC engines carry a Sampler suffix"
+
+[[entry]]
+module = "scipy.stats.qmc"
+name = "LatinHypercube"
+disposition = "adapted"
+rust = "fsci_stats::LatinHypercubeSampler"
+reason = "QMC engines carry a Sampler suffix"
+
+[[entry]]
+module = "scipy.stats.qmc"
+name = "PoissonDisk"
+disposition = "adapted"
+rust = "fsci_stats::PoissonDiskSampler"
+reason = "QMC engines carry a Sampler suffix"
+
+[[entry]]
+module = "scipy.stats.qmc"
+name = "Sobol"
+disposition = "adapted"
+rust = "fsci_stats::SobolSampler"
+reason = "QMC engines carry a Sampler suffix"
+
+[[entry]]
+module = "scipy.stats.sampling"
+name = "FastGeneratorInversion"
+disposition = "missing"
+reason = "UNU.RAN generators are not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.stats.sampling"
+name = "NumericalInversePolynomial"
+disposition = "missing"
+reason = "UNU.RAN generators are not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.stats.sampling"
+name = "SimpleRatioUniforms"
+disposition = "missing"
+reason = "UNU.RAN generators are not ported"
+bead = "frankenscipy-9fbpm"
+
+[[entry]]
+module = "scipy.stats.sampling"
+name = "UNURANError"
+disposition = "missing"
+reason = "UNU.RAN generators are not ported"
+bead = "frankenscipy-9fbpm"
