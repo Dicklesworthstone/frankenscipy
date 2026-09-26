@@ -10,7 +10,7 @@
 //! - Interpolation: shift, rotate, zoom, map_coordinates
 //! - Distance transforms: distance_transform_edt
 
-use fsci_interpolate::make_interp_spline;
+use fsci_interpolate::make_interp_spline_unchecked;
 use std::simd::Simd;
 use std::simd::num::SimdFloat;
 
@@ -929,7 +929,9 @@ fn spline_coefficients_for_line(line: &[f64], order: usize) -> Result<Vec<f64>, 
         return Ok(line.to_vec());
     }
     let x: Vec<f64> = (0..line.len()).map(|i| i as f64).collect();
-    let spline = make_interp_spline(&x, line, effective_order).map_err(|err| {
+    // Unchecked: scipy.ndimage never raises on a NaN image, where make_interp_spline's
+    // check_finite would.
+    let spline = make_interp_spline_unchecked(&x, line, effective_order).map_err(|err| {
         NdimageError::InvalidArgument(format!("failed to compute spline coefficients: {err}"))
     })?;
     Ok(spline.coeffs().to_vec())
@@ -1867,6 +1869,21 @@ fn compute_axis_support(
     support: &mut Vec<(usize, f64)>,
 ) -> bool {
     support.clear();
+    if coord.is_nan() {
+        // SciPy 1.17.1 `NI_GeometricTransform` (ni_interpolation.c): `map_coordinate` passes a
+        // NaN through untouched, since both of its range tests are false. Every mode but nearest
+        // and grid-constant then fails `cc > -1.0`, so the whole point takes `cval`. Nearest skips
+        // that test. Its edge fold sends the start index cast from `floor(NaN)` to sample 0, and
+        // the spline weights of NaN are NaN. So the point is NaN at order >= 1 and sample 0 of
+        // this axis at order 0. A tap of weight NaN reproduces that. The cardinal kernel alone
+        // clamped `(1 - |NaN|).max(0)` to 0 and dropped every order-1 tap, returning 0.0
+        // (frankenscipy-xae2n).
+        if mode != BoundaryMode::Nearest {
+            return false;
+        }
+        support.push((0, if order == 0 { 1.0 } else { f64::NAN }));
+        return true;
+    }
     let Some(mapped) = map_interpolation_coordinate(coord, input_shape_axis, mode) else {
         return false;
     };
@@ -2062,6 +2079,12 @@ fn sample_interpolated(
         // scipy rounds the (unmapped) coordinate via floor(coord + 0.5) — half
         // toward +∞, which differs from Rust's round() at negative half-integers.
         let round0 = |c: f64| (c + 0.5).floor() as i64;
+        // A NaN coordinate takes `cval` in every mode but nearest, where SciPy reads sample 0
+        // of that axis, and so does `round0`, whose `as i64` sends NaN to 0 (see
+        // `compute_axis_support`; frankenscipy-xae2n).
+        if mode != BoundaryMode::Nearest && coords.iter().any(|c| c.is_nan()) {
+            return cval;
+        }
         if mode == BoundaryMode::Constant {
             // scipy applies 'constant' on the FLOAT coordinate: a point outside
             // [0, len-1] is out of range (→ cval) even if it would round back to a
@@ -4031,10 +4054,15 @@ fn fill_rank_filter(
 /// A min/max over a rectangle equals the per-axis sequential min/max, so the
 /// O(N * size^ndim * log) full-footprint sort-and-select rank filter collapses
 /// to ndim O(N) sliding-window passes (a monotonic deque, O(1) amortized per
-/// output, independent of `size`). Comparisons use `total_cmp` — the same total
-/// order the rank filter sorts by — and every neighbourhood value comes from
-/// `get_boundary`, so the result is bit-for-bit identical to the rank filter,
-/// including NaN and signed-zero handling.
+/// output, independent of `size`). On NaN-free input the comparisons use
+/// `total_cmp` (the order the rank filter sorts by) or the equivalent `f64::max`/
+/// `f64::min`, and every neighbourhood value comes from `get_boundary`, so the
+/// result is bit-for-bit identical to the rank filter, signed zeros included.
+///
+/// A NaN (in the input, or as the `cval` of the constant boundary) instead runs
+/// SciPy's own decomposition: one `maximum_filter1d`/`minimum_filter1d` pass per
+/// axis, where SciPy keeps or drops a NaN by its position in the window (see
+/// [`scipy_minmax_ring_line`]; frankenscipy-xae2n).
 fn separable_minmax_filter(
     input: &NdArray,
     size: usize,
@@ -4054,7 +4082,7 @@ fn separable_minmax_filter(
     let kernel_shape: Vec<usize> = vec![size; ndim];
     let origins = normalize_filter_origins(ndim, &kernel_shape, origins)?;
     // The van Herk kernel's hot op is `tc_max`/`tc_min` (a full `total_cmp`, ~6
-    // integer ops) only to reproduce scipy's total-order tie-breaks. For the
+    // integer ops) only to reproduce the rank filter's total-order tie-breaks. For the
     // overwhelming common case `f64::max`/`f64::min` are byte-identical AND far
     // cheaper — they differ from the total order in EXACTLY two spots: NaN
     // (total_cmp propagates it, f64::max/min drops it) and the pair {+0.0, -0.0}
@@ -4062,13 +4090,25 @@ fn separable_minmax_filter(
     // or a negative zero; absent both, run the fast comparators. min/max of such
     // "clean" values can never MINT a NaN or a -0.0, so the input's cleanliness
     // holds through every separable axis pass.
-    let needs_total_cmp = input
+    let first_unclean = input
         .data
         .iter()
-        .any(|v| v.is_nan() || (*v == 0.0 && v.is_sign_negative()));
+        .position(|v| v.is_nan() || (*v == 0.0 && v.is_sign_negative()));
+    let needs_total_cmp = first_unclean.is_some();
+    // A NaN anywhere in a pass, including a NaN `cval` that the constant boundary pads
+    // every line with, hands every pass to the 1-D public kernel, which gives the lines
+    // holding a NaN SciPy's ring. The NaN search resumes where the probe stopped, so the
+    // two together read the input at most once, as the probe alone did; clean input pays
+    // two predicate checks more (frankenscipy-xae2n).
+    let has_nan = (mode == BoundaryMode::Constant && cval.is_nan())
+        || first_unclean.is_some_and(|i| input.data[i..].iter().any(|v| v.is_nan()));
     let mut cur = input.clone();
     for (d, &origin) in origins.iter().enumerate() {
-        cur = minmax_filter_along_axis(&cur, d, size, origin, mode, cval, is_max, needs_total_cmp);
+        cur = if has_nan {
+            minmax_filter1d_nanprop_queue(&cur, d, size, origin, mode, cval, is_max)
+        } else {
+            minmax_filter_along_axis(&cur, d, size, origin, mode, cval, is_max, needs_total_cmp)
+        };
     }
     Ok(cur)
 }
@@ -4298,9 +4338,15 @@ fn uniform_filter_along_axis(
 /// a parameter rather than a constant. `f64::max`/`f64::min` are not a total order in the
 /// presence of NaN (they absorb it) or -0.0 (they do not distinguish it from +0.0), so
 /// they are selected only when `needs_total_cmp` is false -- i.e. when the data provably
-/// contains neither -- and `tc_max`/`tc_min` carry scipy's total-order tie-breaks and NaN
-/// propagation otherwise. Both arms of the toggle take the SAME comparator, so the
+/// contains neither -- and `tc_max`/`tc_min` carry the rank filter's total-order
+/// tie-breaks otherwise. Both arms of the toggle take the SAME comparator, so the
 /// identity is between the two window algorithms and does not depend on that choice.
+///
+/// Neither arm is SciPy's NaN behaviour. SciPy 1.17.1 does not propagate a NaN through a
+/// min/max filter. It keeps or drops the NaN depending on where it falls in the window, so
+/// `maximum_filter1d([1, nan, 3, 4], 3)` is `[1, 3, 4, 4]`. `separable_minmax_filter`
+/// therefore sends NaN-bearing input to `scipy_minmax_ring_line` and never here
+/// (frankenscipy-xae2n); with a NaN, both arms are reference-only.
 pub static MINMAX_FILTER_HGW: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -4570,6 +4616,78 @@ fn filter1d_queue_evicts(back: f64, val: f64, is_max: bool) -> bool {
     if is_max { back <= val } else { back >= val }
 }
 
+/// SciPy's sliding minimum/maximum of one boundary-extended line, ported comparison for
+/// comparison from the ring-buffer loop of `NI_MinOrMaxFilter1D` (SciPy 1.17.1,
+/// `scipy/ndimage/src/ni_filters.c`; Richard Harter's ascending-minima deque). Every
+/// size-based `minimum_filter1d`/`maximum_filter1d` runs it, and so does every size-based
+/// `minimum_filter`/`maximum_filter`/`grey_erosion`/`grey_dilation`, one axis at a time
+/// (frankenscipy-xae2n).
+///
+/// `ext` is the line extended by `size - 1` boundary samples, so output `i` is the window
+/// `ext[i..i + size]`. Results go to `out[out_base + i * out_stride]` for each of the
+/// `ext.len() + 1 - size` outputs. `ring` is scratch and is grown to `size` slots.
+///
+/// On a NaN-free line this picks exactly what the monotonic queues pick, signed zeros
+/// included, since both keep the latest of tied values. On a line with a NaN the answer
+/// depends on where the NaN sits, which no associative comparator reproduces. A NaN never
+/// passes `val >= head` (or `<=` for the minimum) and never evicts, so it queues behind
+/// every value already present. A later value stops popping when it reaches the NaN, since
+/// `NaN <= val` is false, and the NaN stays unless a value that beats the current head
+/// clears the whole deque. If the entries ahead of a queued NaN expire first, the NaN
+/// becomes the head, and every window is NaN until it expires. A NaN that starts the line,
+/// such as a NaN `cval` under `mode='constant'`, is the head from the start. That gives
+/// `maximum_filter1d([1, 2, 3, 4], 3, mode='constant', cval=nan) == [nan, 3, 4, 4]` and
+/// `maximum_filter1d([1, nan, 3, 4], 3) == [1, 3, 4, 4]`.
+fn scipy_minmax_ring_line(
+    ext: &[f64],
+    size: usize,
+    is_max: bool,
+    ring: &mut Vec<(f64, usize)>,
+    out: &mut [f64],
+    out_base: usize,
+    out_stride: usize,
+) {
+    if size == 1 {
+        for (i, &v) in ext.iter().enumerate() {
+            out[out_base + i * out_stride] = v;
+        }
+        return;
+    }
+    if ring.len() < size {
+        ring.resize(size, (0.0, 0));
+    }
+    // (value, death) pairs. The live deque is `ring[head..=last]`, read circularly: `head` is
+    // SciPy's `minpair` and `last` its `last`. An entry pushed at step `ll` dies at
+    // `ll + size`. SciPy's step loop runs `ll` over `1..size + n - 1`, which is every index
+    // of `ext` after the first.
+    let mut head = 0usize;
+    let mut last = 0usize;
+    ring[0] = (ext[0], size);
+    for (ll, &val) in ext.iter().enumerate().skip(1) {
+        if ring[head].1 == ll {
+            head = if head + 1 == size { 0 } else { head + 1 };
+        }
+        let head_val = ring[head].0;
+        if (is_max && val >= head_val) || (!is_max && val <= head_val) {
+            ring[head] = (val, ll + size);
+            last = head;
+        } else {
+            // Reaching this branch means `val` did not beat the head, so
+            // `filter1d_queue_evicts(head_val, val)` (the same IEEE comparison, operands
+            // swapped) is false and SciPy's pop loop stops at `head` at the latest. The
+            // `last != head` test states that bound; it changes no comparison outcome.
+            while last != head && filter1d_queue_evicts(ring[last].0, val, is_max) {
+                last = if last == 0 { size - 1 } else { last - 1 };
+            }
+            last = if last + 1 == size { 0 } else { last + 1 };
+            ring[last] = (val, ll + size);
+        }
+        if ll + 1 >= size {
+            out[out_base + (ll + 1 - size) * out_stride] = ring[head].0;
+        }
+    }
+}
+
 #[inline(always)]
 fn reflect_origin0_ext_index(t: usize, mid: usize, lo: usize) -> usize {
     if t < lo {
@@ -4600,6 +4718,9 @@ fn minmax_filter1d_reflect_contiguous_queue(
     let mut out = NdArray::zeros(arr.shape.clone());
     let mut queue_idx = vec![0usize; cap];
     let mut queue_val = vec![0.0f64; cap];
+    // Scratch for SciPy's ring on a line that holds a NaN; empty (unallocated) until one does.
+    let mut nan_ext: Vec<f64> = Vec::new();
+    let mut ring: Vec<(f64, usize)> = Vec::new();
 
     for o in 0..outer {
         let base = o * slab;
@@ -4609,12 +4730,14 @@ fn minmax_filter1d_reflect_contiguous_queue(
         let mut tail = 0usize;
         let mut len = 0usize;
         let mut nan_count = 0usize;
+        let mut line_has_nan = false;
 
         for next in 0..ext_len {
             let src = reflect_origin0_ext_index(next, mid, lo);
             let val = input[src];
             if val.is_nan() {
                 nan_count += 1;
+                line_has_nan = true;
             } else {
                 while len > 0 {
                     let back = if tail == 0 { cap - 1 } else { tail - 1 };
@@ -4654,17 +4777,27 @@ fn minmax_filter1d_reflect_contiguous_queue(
                 }
             }
         }
+        // The NaN-counting queue above only placeholds a line that holds a NaN; SciPy's
+        // answer for it comes from its ring (frankenscipy-xae2n).
+        if line_has_nan {
+            nan_ext.clear();
+            nan_ext.extend((0..ext_len).map(|t| input[reflect_origin0_ext_index(t, mid, lo)]));
+            scipy_minmax_ring_line(&nan_ext, size, is_max, &mut ring, output, 0, 1);
+        }
     }
 
     out
 }
 
-/// Single-pass monotonic index queue for the public NaN-propagating 1-D min/max
-/// filters. It keeps the HGW boundary-resolved line materialization but fuses the
-/// prefix/suffix/combine passes into one scan. NaNs are counted out-of-band so the
-/// output remains the canonical NaN whenever any window element is NaN; equal
-/// non-NaN extrema evict older entries to match the left-to-right `f64::max/min`
-/// fold for signed zeros.
+/// Single-pass monotonic index queue for the public 1-D min/max filters. It keeps the
+/// HGW boundary-resolved line materialization but fuses the prefix/suffix/combine
+/// passes into one scan. Equal extrema evict older entries, so the latest of tied
+/// values wins, as in SciPy's ring (this matters for signed zeros). NaNs are counted
+/// out of band and a window holding one outputs NaN, but that is only a placeholder:
+/// every line whose boundary-extended input holds a NaN is recomputed by
+/// [`scipy_minmax_ring_line`], because SciPy keeps or drops a NaN by its position
+/// (frankenscipy-xae2n). A NaN-free line never reaches that path, so its output is
+/// the queue's.
 fn minmax_filter1d_nanprop_queue(
     arr: &NdArray,
     axis: usize,
@@ -4711,6 +4844,8 @@ fn minmax_filter1d_nanprop_queue_generic(
     let mut out = NdArray::zeros(arr.shape.clone());
     let mut ext = vec![0.0f64; ext_len];
     let mut queue = vec![0usize; ext_len];
+    // Scratch for SciPy's ring on a line that holds a NaN; unallocated until one does.
+    let mut ring: Vec<(f64, usize)> = Vec::new();
 
     for o in 0..outer {
         let outer_base = o * slab;
@@ -4744,12 +4879,14 @@ fn minmax_filter1d_nanprop_queue_generic(
             let mut tail = 0usize;
             let mut next = 0usize;
             let mut nan_count = 0usize;
+            let mut line_has_nan = false;
             for i in 0..mid {
                 let right = i + size - 1;
                 while next <= right {
                     let val = ext[next];
                     if val.is_nan() {
                         nan_count += 1;
+                        line_has_nan = true;
                     } else {
                         while tail > head
                             && filter1d_queue_evicts(ext[queue[tail - 1]], val, is_max)
@@ -4772,6 +4909,11 @@ fn minmax_filter1d_nanprop_queue_generic(
                 if ext[i].is_nan() {
                     nan_count -= 1;
                 }
+            }
+            // A line holding a NaN (a NaN `cval` included) takes SciPy's ring instead
+            // (frankenscipy-xae2n).
+            if line_has_nan {
+                scipy_minmax_ring_line(&ext, size, is_max, &mut ring, &mut out.data, base, stride);
             }
         }
     }
@@ -4799,7 +4941,8 @@ fn minmax_filter_along_axis(
     if MINMAX_FILTER_HGW.load(std::sync::atomic::Ordering::Relaxed) {
         // Clean data → fast `f64::max`/`f64::min` (byte-identical to the total-order
         // pick when neither NaN nor -0.0 is present); otherwise `tc_max`/`tc_min`
-        // to preserve scipy's total-order tie-breaks and NaN propagation.
+        // to keep the rank filter's total-order tie-breaks. NaN-bearing input never
+        // gets here from `separable_minmax_filter` (frankenscipy-xae2n).
         return match (is_max, needs_total_cmp) {
             (true, false) => minmax_along_axis_hgw(arr, axis, size, origin, mode, cval, f64::max),
             (false, false) => minmax_along_axis_hgw(arr, axis, size, origin, mode, cval, f64::min),
@@ -4885,7 +5028,51 @@ pub fn minimum_filter_axes(
     cval: f64,
 ) -> Result<NdArray, NdimageError> {
     let axes = normalize_signed_axes(axes, input.ndim())?;
+    let origins = vec![0; axes.len()];
+    if let Some(out) =
+        minmax_filter_axes_nan_passes(input, size, &axes, &origins, mode, cval, false)?
+    {
+        return Ok(out);
+    }
     rank_filter_index_usize_axes(input, size, &axes, mode, cval, 0)
+}
+
+/// SciPy's size-based min/max filter over an `axes` subset, for input that meets a NaN
+/// (in the data, or as the `cval` of the constant boundary): one `minimum_filter1d`/
+/// `maximum_filter1d` pass per listed axis, in the listed order, which is what
+/// `_min_or_max_filter` in `scipy/ndimage/_filters.py` runs. Each pass gives the lines
+/// holding a NaN SciPy's ring ([`scipy_minmax_ring_line`]). The `_axes` variants
+/// otherwise use the footprint rank filter, which agrees with those passes on NaN-free
+/// input apart from the sign of tied zeros. With a NaN, the answer depends on where the
+/// NaN sits, and even on the axis order.
+///
+/// `Ok(None)` leaves the call to the rank filter: no axes, empty input (whose error the
+/// rank filter reports), or no NaN to meet (frankenscipy-xae2n).
+fn minmax_filter_axes_nan_passes(
+    input: &NdArray,
+    size: usize,
+    axes: &[usize],
+    origins: &[i64],
+    mode: BoundaryMode,
+    cval: f64,
+    is_max: bool,
+) -> Result<Option<NdArray>, NdimageError> {
+    if axes.is_empty()
+        || input.size() == 0
+        || !((mode == BoundaryMode::Constant && cval.is_nan())
+            || input.data.iter().any(|v| v.is_nan()))
+    {
+        return Ok(None);
+    }
+    filter_footprint_size(axes.len(), size)?;
+    for &origin in origins {
+        validate_filter_origin(size, origin)?;
+    }
+    let mut cur = input.clone();
+    for (&axis, &origin) in axes.iter().zip(origins) {
+        cur = minmax_filter1d_nanprop_queue(&cur, axis, size, origin, mode, cval, is_max);
+    }
+    Ok(Some(cur))
 }
 
 /// Minimum filter with SciPy `origin` semantics.
@@ -4926,6 +5113,12 @@ pub fn maximum_filter_axes(
         return Ok(input.clone());
     }
     let kernel_total = filter_footprint_size(axes.len(), size)?;
+    let origins = vec![0; axes.len()];
+    if let Some(out) =
+        minmax_filter_axes_nan_passes(input, size, &axes, &origins, mode, cval, true)?
+    {
+        return Ok(out);
+    }
     rank_filter_index_usize_axes(input, size, &axes, mode, cval, kernel_total - 1)
 }
 
@@ -6105,19 +6298,26 @@ pub fn histogram_labels(
 /// Minimum and maximum values in each labeled region.
 ///
 /// Returns (min_values, max_values) vectors.
-/// Matches `scipy.ndimage.extrema`.
+/// Matches `scipy.ndimage.extrema(input, labels, index=range(1, num_labels + 1))`, whose
+/// index array takes `_select`'s sorted path: the minimum skips NaN (NaN only when every
+/// value in the label is NaN), one NaN makes the maximum NaN, and a label with no pixels
+/// reads 0 on both sides (frankenscipy-xae2n).
 pub fn extrema_labels(
     input: &NdArray,
     labels: &NdArray,
     num_labels: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    let mut mins = vec![f64::INFINITY; num_labels];
+    // NaN seed + `f64::min`: the seed survives only an all-NaN label; see
+    // `measurement_one_based_minmax`.
+    let mut mins = vec![f64::NAN; num_labels];
     let mut maxs = vec![f64::NEG_INFINITY; num_labels];
+    let mut seen = vec![false; num_labels];
 
     for i in 0..input.size() {
         let lbl = labels.data[i] as usize;
         if lbl > 0 && lbl <= num_labels {
             let value = input.data[i];
+            seen[lbl - 1] = true;
             mins[lbl - 1] = mins[lbl - 1].min(value);
             // `scipy.ndimage.maximum` with an index sorts NaN last and keeps the last value per
             // label, so one NaN makes the label's maximum NaN; `f64::max` would drop it.
@@ -6126,6 +6326,13 @@ pub fn extrema_labels(
             } else {
                 maxs[lbl - 1].max(value)
             };
+        }
+    }
+    // SciPy's sorted path scatters into `np.zeros`, so an empty label reads 0, not ±inf.
+    for (k, &was_seen) in seen.iter().enumerate() {
+        if !was_seen {
+            mins[k] = 0.0;
+            maxs[k] = 0.0;
         }
     }
 
@@ -8014,26 +8221,35 @@ fn measurement_one_based_variance(data: &[f64], labels: &[f64], label_count: usi
 /// Per-label minimum (`want_max=false`) or maximum over the one-based-contiguous fast path,
 /// as a parallel privatized-histogram reduction. min/max are associative, commutative, and
 /// exact, so the merged result is BYTE-IDENTICAL to the serial fold regardless of chunking.
-/// Matches the serial group path's conventions: a NaN in any element of a label propagates to
-/// NaN, and an empty label yields 0.0. Gated like the other label reductions.
+/// Matches the serial group path's conventions, which are SciPy's for an index array: a NaN
+/// anywhere in a label makes its maximum NaN, its minimum skips NaN (NaN only when every value
+/// is NaN), and an empty label yields 0.0. Gated like the other label reductions.
 fn measurement_one_based_minmax(
     data: &[f64],
     labels: &[f64],
     label_count: usize,
     want_max: bool,
 ) -> Vec<f64> {
+    // SciPy's `_select` answers an index array by argsorting the values (NaN sorts last) and
+    // keeping, per label, the last sorted value as the maximum and the first as the minimum.
+    // So one NaN poisons the maximum, which needs the explicit check because `f64::max`
+    // ignores NaN, while the minimum is the least non-NaN value. That is `f64::min` seeded
+    // with NaN: it returns the non-NaN operand, so the seed survives only in a label whose
+    // every value is NaN, which is SciPy's answer there. The NaN seed, like the old `+inf`,
+    // is replaced by the first non-NaN value unchanged, so NaN-free labels keep their bits
+    // (frankenscipy-xae2n).
     let init = if want_max {
         f64::NEG_INFINITY
     } else {
-        f64::INFINITY
+        f64::NAN
     };
-    // NaN-propagating combine, identical to the serial fold (Rust's min/max ignore NaN, so the
-    // explicit check is what makes a single NaN poison the whole label).
     let combine = |acc: f64, v: f64| -> f64 {
-        if acc.is_nan() || v.is_nan() {
-            f64::NAN
-        } else if want_max {
-            acc.max(v)
+        if want_max {
+            if acc.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                acc.max(v)
+            }
         } else {
             acc.min(v)
         }
@@ -8803,11 +9019,18 @@ pub fn minimum(
         }
         return Ok(vec![global_minmax_reduce(&input.data, false)]);
     }
+    // With labels AND an index array SciPy takes `_select`'s sorted path, whose minimum is the
+    // least non-NaN value (NaN only for an all-NaN label): `f64::min` seeded with NaN, as in
+    // `measurement_one_based_minmax`. Without an index SciPy calls `ndarray.min`, which
+    // propagates a NaN (frankenscipy-xae2n).
+    let sorted_path = labels.is_some() && index.is_some();
     Ok(measurement_label_groups(input, labels, index)?
         .iter()
         .map(|values| {
             if values.is_empty() {
                 0.0
+            } else if sorted_path {
+                values.iter().fold(f64::NAN, |acc, value| acc.min(*value))
             } else {
                 values.iter().fold(f64::INFINITY, |acc, value| {
                     if acc.is_nan() || value.is_nan() {
@@ -11087,6 +11310,11 @@ pub fn grey_dilation_axes(
             origin
         })
         .collect::<Vec<_>>();
+    if let Some(out) =
+        minmax_filter_axes_nan_passes(input, size, &axes, &origins, mode, cval, true)?
+    {
+        return Ok(out);
+    }
 
     rank_filter_index_usize_axes_with_origins(
         input,
@@ -11628,8 +11856,8 @@ pub fn maximum_filter1d_with_origin(
         return Err(NdimageError::EmptyInput);
     }
     validate_filter_origin(size, origin)?;
-    // O(n) monotonic index queue over a boundary-resolved line. It preserves the
-    // NaN-propagating fold contract while reducing the HGW path's extra full-line scans.
+    // O(n) monotonic index queue over a boundary-resolved line, avoiding the HGW path's
+    // extra full-line scans. Lines holding a NaN take SciPy's ring (frankenscipy-xae2n).
     Ok(minmax_filter1d_nanprop_queue(
         input, axis, size, origin, mode, cval, true,
     ))
@@ -14917,7 +15145,8 @@ mod tests {
                 .map(|i| (i as f64 * 0.41).sin() * 5.0 + (i % 7) as f64)
                 .collect();
             if total > 25 {
-                data[3] = f64::NAN;
+                // No NaN: one would send the whole filter to SciPy's ring and leave the
+                // kernel under test unrun (frankenscipy-xae2n). The -0.0 keeps `tc_max` live.
                 data[7] = -0.0;
                 data[8] = 0.0;
                 data[20] = f64::NEG_INFINITY;
@@ -14967,7 +15196,8 @@ mod tests {
         // The parallel-across-outer-slabs path in `minmax_along_axis_hgw` (reached via the N-D
         // maximum_filter/minimum_filter, which is the van Herk path since MINMAX_FILTER_HGW defaults
         // true) must be BYTE-IDENTICAL to the serial walk, across window sizes, modes, adversarial
-        // data (NaN, ±0.0, ±inf), and shapes above the parallel gate.
+        // data (±0.0, ±inf), and shapes above the parallel gate. No NaN: one would send the
+        // whole filter to SciPy's ring and leave this kernel unrun (frankenscipy-xae2n).
         MINMAX_FILTER_HGW.store(true, Ordering::Relaxed); // ensure the van Herk path is active
         let shapes: &[Vec<usize>] = &[
             vec![40],
@@ -14982,7 +15212,6 @@ mod tests {
                 .map(|i| (i as f64 * 0.37).sin() * 5.0 + (i % 7) as f64)
                 .collect();
             if total > 25 {
-                data[3] = f64::NAN;
                 data[7] = -0.0;
                 data[8] = 0.0;
                 data[20] = f64::NEG_INFINITY;
@@ -15025,8 +15254,10 @@ mod tests {
     }
 
     /// dimensions, window sizes, origins, boundary modes, and adversarial data
-    /// (NaN, ±0.0, duplicates). Serialized via a mutex because both paths share the
-    /// global `MINMAX_FILTER_HGW` toggle.
+    /// (±0.0, ±inf, duplicates). Serialized via a mutex because both paths share the
+    /// global `MINMAX_FILTER_HGW` toggle. No NaN: `separable_minmax_filter` sends a
+    /// NaN to SciPy's ring ahead of both paths, which would leave nothing compared
+    /// (frankenscipy-xae2n).
     #[test]
     fn minmax_hgw_byte_identical_to_deque() {
         use std::sync::Mutex;
@@ -15043,7 +15274,6 @@ mod tests {
             (
                 {
                     let mut v: Vec<f64> = (0..40).map(|i| ((i * 13) % 11) as f64 - 5.0).collect();
-                    v[3] = f64::NAN;
                     v[7] = -0.0;
                     v[8] = 0.0;
                     v[20] = f64::NEG_INFINITY;
@@ -15235,7 +15465,10 @@ mod tests {
     /// The fast `maximum/minimum_filter1d` path must be bit-for-bit identical to
     /// the legacy O(n·size) per-window fold (`filter1d_axis_with_origin`) across
     /// dims, axes, window sizes (incl. size > axis length), origins, boundary
-    /// modes, and NaN/±0/±inf data.
+    /// modes, and ±0/±inf data. NaN-free by necessity: SciPy keeps or drops a NaN by
+    /// its position in the window, which no per-window fold expresses, so NaN lines
+    /// are pinned against SciPy in
+    /// `min_max_filters_keep_or_drop_a_nan_by_position_like_scipy` (frankenscipy-xae2n).
     #[test]
     fn filter1d_hgw_byte_identical_to_fold() {
         let max_fold = |window: &[f64]| {
@@ -15266,7 +15499,6 @@ mod tests {
             (
                 {
                     let mut v: Vec<f64> = (0..40).map(|i| ((i * 7) % 13) as f64 - 6.0).collect();
-                    v[5] = f64::NAN;
                     v[6] = -0.0;
                     v[7] = 0.0;
                     v[30] = f64::INFINITY;
@@ -18101,6 +18333,196 @@ mod tests {
         assert_eq!(max_shifted.data, vec![2., 3., 4., 5., 5.]);
     }
 
+    /// SciPy 1.17.1 (numpy 2.4.3) neither propagates nor drops a NaN in a min/max filter: the
+    /// ring buffer of `NI_MinOrMaxFilter1D` keeps or drops it by where it sits in the window
+    /// (see `scipy_minmax_ring_line`), and size-based N-D, `axes`, and grey-morphology filters
+    /// are one such pass per axis, in axis order. Every expected value below was produced by
+    /// live SciPy 1.17.1. With `x = [2, nan, 5, -1, 4, nan, 3]`:
+    ///
+    /// ```text
+    /// maximum_filter1d(x, 3)                                  [2, 5, 5, 5, 4, 4, nan]
+    /// minimum_filter1d(x, 3)                                  [2, 2, nan, -1, -1, 3, 3]
+    /// maximum_filter1d(x, 4, origin=1)                        [5, nan, 5, 5, 5, 5, 4]
+    /// minimum_filter1d(x, 3, mode='constant', cval=nan)       [nan, 2, nan, -1, -1, 3, 3]
+    /// maximum_filter1d(x, 2, mode='constant', cval=9)         [9, 2, nan, 5, 4, 4, nan]
+    /// maximum_filter1d(x, 5, mode='nearest', origin=-2)       [5, 5, 5, 4, 4, nan, 3]
+    /// minimum_filter1d(x, 4, mode='nearest', origin=-1)       [2, -1, -1, -1, -1, 3, 3]
+    /// maximum_filter1d(x, 3, mode='wrap', origin=1)           [nan, 3, 5, 5, 5, 4, 4]
+    /// minimum_filter1d(x, 5, mode='wrap')                     [nan, -1, -1, -1, -1, -1, 4]
+    /// maximum_filter1d(x, 4, mode='mirror')                   [5, nan, 2, nan, 5, 4, 4]
+    /// minimum_filter1d(x, 2, mode='mirror')                   [nan, 2, nan, -1, -1, 4, nan]
+    /// maximum_filter1d([1, 2, 3, 4], 3, mode='constant', cval=nan)   [nan, 3, 4, 4]
+    /// ```
+    ///
+    /// The 2-D rows are commented inline. fsci propagated every NaN in the 1-D filters and
+    /// in the N-D maximum, dropped it in the N-D minimum (total order ranks NaN last), and
+    /// on NaN-free data with a NaN `cval` took the `f64::max` arm, which absorbed the NaN:
+    /// `[2, 3, 4, 4]` for the last row. The NaN-free rows at the end must not move
+    /// (frankenscipy-xae2n).
+    #[test]
+    fn min_max_filters_keep_or_drop_a_nan_by_position_like_scipy() {
+        let nan = f64::NAN;
+        let same = |got: &[f64], want: &[f64]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|(g, w)| (g.is_nan() && w.is_nan()) || g.to_bits() == w.to_bits())
+        };
+        let x = NdArray::new(vec![2.0, nan, 5.0, -1.0, 4.0, nan, 3.0], vec![7]).expect("shape");
+        let (rf, ct, nr, wr, mr) = (
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Nearest,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        );
+        // (is_max, mode, size, origin, cval, SciPy 1.17.1). Reflect with origin 0 runs the
+        // contiguous queue; every other row runs the generic one.
+        #[rustfmt::skip]
+        let rows: [(bool, BoundaryMode, usize, i64, f64, [f64; 7]); 11] = [
+            (true, rf, 3, 0, 0.0, [2.0, 5.0, 5.0, 5.0, 4.0, 4.0, nan]),
+            (false, rf, 3, 0, 0.0, [2.0, 2.0, nan, -1.0, -1.0, 3.0, 3.0]),
+            (true, rf, 4, 1, 0.0, [5.0, nan, 5.0, 5.0, 5.0, 5.0, 4.0]),
+            (false, ct, 3, 0, nan, [nan, 2.0, nan, -1.0, -1.0, 3.0, 3.0]),
+            (true, ct, 2, 0, 9.0, [9.0, 2.0, nan, 5.0, 4.0, 4.0, nan]),
+            (true, nr, 5, -2, 0.0, [5.0, 5.0, 5.0, 4.0, 4.0, nan, 3.0]),
+            (false, nr, 4, -1, 0.0, [2.0, -1.0, -1.0, -1.0, -1.0, 3.0, 3.0]),
+            (true, wr, 3, 1, 0.0, [nan, 3.0, 5.0, 5.0, 5.0, 4.0, 4.0]),
+            (false, wr, 5, 0, 0.0, [nan, -1.0, -1.0, -1.0, -1.0, -1.0, 4.0]),
+            (true, mr, 4, 0, 0.0, [5.0, nan, 2.0, nan, 5.0, 4.0, 4.0]),
+            (false, mr, 2, 0, 0.0, [nan, 2.0, nan, -1.0, -1.0, 4.0, nan]),
+        ];
+        for (is_max, mode, size, origin, cval, want) in rows {
+            let got = if is_max {
+                maximum_filter1d_with_origin(&x, size, 0, mode, cval, origin)
+            } else {
+                minimum_filter1d_with_origin(&x, size, 0, mode, cval, origin)
+            }
+            .expect("valid 1-D filter");
+            assert!(
+                same(&got.data, &want),
+                "is_max={is_max} {mode:?} size={size} origin={origin} cval={cval}: \
+                 fsci {:?}, SciPy {want:?}",
+                got.data
+            );
+        }
+
+        let clean4 = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]).expect("shape");
+        let got = maximum_filter1d(&clean4, 3, 0, BoundaryMode::Constant, nan).expect("filter");
+        assert!(
+            same(&got.data, &[nan, 3.0, 4.0, 4.0]),
+            "1-D cval=nan: {:?}",
+            got.data
+        );
+
+        let b = NdArray::new(
+            vec![0.0, 1.0, 2.0, 3.0, nan, 5.0, 6.0, 7.0, 8.0],
+            vec![3, 3],
+        )
+        .expect("shape");
+        let c = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).expect("shape");
+        // A NaN in both a size-2 row and column window, where the pass order decides.
+        let a = NdArray::new(
+            vec![0.0, nan, 9.0, 1.0, nan, nan, 0.0, 5.0, 6.0],
+            vec![3, 3],
+        )
+        .expect("shape");
+        // Axis 0 of a 4x2 array: a strided line through the generic queue.
+        let s =
+            NdArray::new(vec![1.0, nan, nan, 2.0, 3.0, 1.0, 0.0, nan], vec![4, 2]).expect("shape");
+        let reflect = BoundaryMode::Reflect;
+        // (SciPy call, fsci result, SciPy 1.17.1 flattened)
+        let checks: Vec<(&str, Result<NdArray, NdimageError>, Vec<f64>)> = vec![
+            (
+                "maximum_filter(b, 3)",
+                maximum_filter(&b, 3, reflect, 0.0),
+                vec![3.0, 5.0, 5.0, 7.0, 8.0, 8.0, 7.0, 8.0, 8.0],
+            ),
+            (
+                "minimum_filter(b, 3)",
+                minimum_filter(&b, 3, reflect, 0.0),
+                vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 3.0, 3.0, nan],
+            ),
+            (
+                "maximum_filter(c, 2, mode='constant', cval=nan)",
+                maximum_filter(&c, 2, BoundaryMode::Constant, nan),
+                vec![nan, nan, nan, nan, 5.0, 6.0],
+            ),
+            (
+                "minimum_filter(c, 2, mode='constant', cval=nan)",
+                minimum_filter(&c, 2, BoundaryMode::Constant, nan),
+                vec![nan, nan, nan, nan, 1.0, 2.0],
+            ),
+            (
+                "maximum_filter1d(s, 3, axis=0, mode='nearest')",
+                maximum_filter1d(&s, 3, 0, BoundaryMode::Nearest, 0.0),
+                vec![1.0, nan, 3.0, nan, 3.0, 2.0, 3.0, 1.0],
+            ),
+            (
+                "minimum_filter1d(s, 2, axis=0, mode='wrap', origin=-1)",
+                minimum_filter1d_with_origin(&s, 2, 0, BoundaryMode::Wrap, 0.0, -1),
+                vec![1.0, nan, nan, 1.0, 0.0, 1.0, 0.0, nan],
+            ),
+            (
+                "maximum_filter(a, 2, axes=[1, 0])",
+                maximum_filter_axes(&a, 2, &[1, 0], reflect, 0.0),
+                vec![0.0, 0.0, nan, 1.0, 1.0, nan, 1.0, 5.0, nan],
+            ),
+            (
+                "maximum_filter(a, 2, axes=[0, 1])",
+                maximum_filter_axes(&a, 2, &[0, 1], reflect, 0.0),
+                vec![0.0, 0.0, nan, 1.0, 1.0, nan, 1.0, 1.0, nan],
+            ),
+            (
+                "maximum_filter(a, 2)",
+                maximum_filter(&a, 2, reflect, 0.0),
+                vec![0.0, 0.0, nan, 1.0, 1.0, nan, 1.0, 1.0, nan],
+            ),
+            (
+                "minimum_filter(a, 3, axes=[1])",
+                minimum_filter_axes(&a, 3, &[1], reflect, 0.0),
+                vec![0.0, 0.0, nan, 1.0, 1.0, nan, 0.0, 0.0, 5.0],
+            ),
+            (
+                "grey_dilation(a, size=2)",
+                grey_dilation(&a, 2, reflect, 0.0),
+                vec![1.0, nan, 9.0, 1.0, nan, nan, 5.0, 6.0, 6.0],
+            ),
+            (
+                "grey_dilation(a, size=2, axes=[1, 0])",
+                grey_dilation_axes(&a, 2, &[1, 0], reflect, 0.0),
+                vec![1.0, nan, 9.0, 5.0, nan, nan, 5.0, 6.0, 6.0],
+            ),
+            (
+                "grey_erosion(a, size=3)",
+                grey_erosion(&a, 3, reflect, 0.0),
+                vec![0.0, 0.0, nan, 0.0, 0.0, nan, 0.0, 0.0, nan],
+            ),
+        ];
+        for (label, got, want) in checks {
+            let got = got.expect("valid filter");
+            assert!(
+                same(&got.data, &want),
+                "{label}: fsci {:?}, SciPy {want:?}",
+                got.data
+            );
+        }
+
+        // NaN-free input keeps its fast arms, and their values (SciPy 1.17.1 agrees).
+        let clean = NdArray::new(
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![3, 3],
+        )
+        .expect("shape");
+        let got = maximum_filter1d(&clean4, 3, 0, BoundaryMode::Constant, 0.0).expect("filter");
+        assert_eq!(got.data, vec![2.0, 3.0, 4.0, 4.0]);
+        let got = maximum_filter(&clean, 3, reflect, 0.0).expect("filter");
+        assert_eq!(got.data, vec![4.0, 5.0, 5.0, 7.0, 8.0, 8.0, 7.0, 8.0, 8.0]);
+        let got = minimum_filter_axes(&clean, 2, &[1], reflect, 0.0).expect("filter");
+        assert_eq!(got.data, vec![0.0, 0.0, 1.0, 3.0, 3.0, 4.0, 6.0, 6.0, 7.0]);
+    }
+
     #[test]
     fn min_max_filter_axes_match_scipy_subset_fixtures() {
         let input = NdArray::new(vec![4.0, 1.0, 7.0, 2.0, 9.0, 3.0], vec![2, 3]).unwrap();
@@ -18798,7 +19220,7 @@ mod tests {
             .map(|_| (rng() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0)
             .collect();
         let labels: Vec<f64> = (0..n).map(|_| (1 + (rng() % k as u64)) as f64).collect();
-        // Inject a NaN into label 7's region to exercise NaN propagation.
+        // Inject a NaN into label 7's region to exercise the NaN rules.
         for (i, &lv) in labels.iter().enumerate() {
             if lv as usize == 7 {
                 vals[i] = f64::NAN;
@@ -18812,18 +19234,17 @@ mod tests {
         let gmin = minimum(&input, Some(&lab), Some(&index)).unwrap();
         let gmax = maximum(&input, Some(&lab), Some(&index)).unwrap();
 
-        // Serial reference matching the production min/max fold semantics.
-        let mut rmin = vec![f64::INFINITY; k];
+        // Serial reference with SciPy's index-array semantics: the minimum skips NaN (NaN
+        // only for an all-NaN label), the maximum keeps one (frankenscipy-xae2n).
+        let mut rmin = vec![f64::NAN; k];
         let mut rmax = vec![f64::NEG_INFINITY; k];
         let mut cnt = vec![0usize; k];
         for (&v, &lv) in vals.iter().zip(&labels) {
             let p = (lv as usize) - 1;
             cnt[p] += 1;
-            rmin[p] = if rmin[p].is_nan() || v.is_nan() {
-                f64::NAN
-            } else {
-                rmin[p].min(v)
-            };
+            if !v.is_nan() {
+                rmin[p] = if rmin[p].is_nan() { v } else { rmin[p].min(v) };
+            }
             rmax[p] = if rmax[p].is_nan() || v.is_nan() {
                 f64::NAN
             } else {
@@ -18836,8 +19257,13 @@ mod tests {
             assert_eq!(gmin[i].to_bits(), want_min.to_bits(), "min label {i}");
             assert_eq!(gmax[i].to_bits(), want_max.to_bits(), "max label {i}");
         }
-        // Label 7 saw a NaN → NaN.
-        assert!(gmin[6].is_nan() && gmax[6].is_nan());
+        // Label 7 saw a NaN: its maximum is NaN, its minimum is the least other value.
+        assert!(
+            !gmin[6].is_nan() && gmax[6].is_nan(),
+            "label 7: min {} max {}",
+            gmin[6],
+            gmax[6]
+        );
     }
 
     #[test]
@@ -20878,6 +21304,131 @@ mod tests {
         }
     }
 
+    /// A NaN coordinate, SciPy 1.17.1 (`cval = -7`). `map_coordinate` in ni_interpolation.c
+    /// passes NaN through, so every mode but nearest fails `cc > -1.0` and returns `cval` at
+    /// every order. Nearest reads sample 0 of the NaN axis at order 0 and multiplies by NaN
+    /// spline weights above it:
+    ///
+    /// ```text
+    /// map_coordinates([5, 6, 7, 8, 9], [[nan, 1.5]], order=k, mode=m, cval=-7)
+    ///   constant, reflect, mirror, wrap (and grid-wrap, grid-mirror): [-7, v] at k = 0..5
+    ///   nearest: [5, 7] at k = 0, [nan, v] at k = 1..5
+    ///   (grid-constant, which fsci does not offer: -7 at k = 0, nan at k = 1..5)
+    /// x2 = arange(1, 13).reshape(3, 4) * 1.5,
+    /// map_coordinates(x2, [[nan, 1, nan], [2, nan, nan]], order=k, mode=m, cval=-7)
+    ///   nearest: [4.5, 7.5, 1.5] at k = 0, all nan at k = 1..5; every other mode all -7
+    /// affine_transform(x2, [[1, 0, nan], [0, 1, 0]] or [[1, 0.25, nan], [0, 1, 0]], ...)
+    /// geometric_transform(x2, lambda o: (nan, o[1]), ...)
+    ///   nearest: every row [1.5, 3, 4.5, 6] at k = 0, all nan at k = 1..5; otherwise all -7
+    /// ```
+    ///
+    /// `v` at 1.5 is 7 at order 0 and 6.5 at order 1 in every mode; it must not move. By the
+    /// old code, fsci read sample 0 at order 0 in every mode. At order 1 it returned 0.0 under
+    /// nearest, reflect, and mirror, because the cardinal kernel clamps `(1 - |NaN|).max(0)`
+    /// to 0 and drops zero taps. At higher orders it returned NaN wherever the cardinal or
+    /// cubic kernel ran (reflect, mirror, wrap order 3) (frankenscipy-xae2n).
+    #[test]
+    fn nan_coordinate_takes_cval_or_nan_like_scipy() {
+        let nan = f64::NAN;
+        let cval = -7.0;
+        let same = |g: f64, w: f64| (g.is_nan() && w.is_nan()) || g.to_bits() == w.to_bits();
+        let modes = [
+            BoundaryMode::Constant,
+            BoundaryMode::Reflect,
+            BoundaryMode::Mirror,
+            BoundaryMode::Wrap,
+            BoundaryMode::Nearest,
+        ];
+        let x = NdArray::new(vec![5.0, 6.0, 7.0, 8.0, 9.0], vec![5]).expect("shape");
+        let x2 = NdArray::new((1..=12).map(|v| f64::from(v) * 1.5).collect(), vec![3, 4])
+            .expect("shape");
+        for mode in modes {
+            let nearest = mode == BoundaryMode::Nearest;
+            for order in 0..=5usize {
+                let tag = format!("{mode:?} order {order}");
+                // What SciPy puts at a point with a NaN coordinate, given nearest's order-0 read.
+                let nan_point = |sample0: f64| match (nearest, order) {
+                    (true, 0) => sample0,
+                    (true, _) => nan,
+                    _ => cval,
+                };
+
+                let got = map_coordinates(&x, &[vec![nan, 1.5]], order, mode, cval)
+                    .expect("map_coordinates 1-D");
+                assert!(
+                    same(got[0], nan_point(5.0)),
+                    "{tag}: NaN point fsci {}",
+                    got[0]
+                );
+                // The finite neighbour is untouched: at every order it is bit-for-bit the value
+                // the same coordinate gets on its own, and SciPy's 7 / 6.5 at orders 0 / 1.
+                let alone = map_coordinates(&x, &[vec![1.5]], order, mode, cval)
+                    .expect("map_coordinates 1-D");
+                assert_eq!(
+                    got[1].to_bits(),
+                    alone[0].to_bits(),
+                    "{tag}: finite neighbour"
+                );
+                if order <= 1 {
+                    let want = [7.0, 6.5][order];
+                    assert!(
+                        (got[1] - want).abs() <= 1e-12,
+                        "{tag}: fsci {} at 1.5, SciPy {want}",
+                        got[1]
+                    );
+                }
+
+                let got = map_coordinates(
+                    &x2,
+                    &[vec![nan, 1.0, nan], vec![2.0, nan, nan]],
+                    order,
+                    mode,
+                    cval,
+                )
+                .expect("map_coordinates 2-D");
+                let want = [nan_point(4.5), nan_point(7.5), nan_point(1.5)];
+                assert!(
+                    got.iter().zip(&want).all(|(&g, &w)| same(g, w)),
+                    "{tag}: 2-D fsci {got:?}, SciPy {want:?}"
+                );
+
+                let row0 = [1.5, 3.0, 4.5, 6.0];
+                for matrix in [
+                    [[1.0, 0.0, nan], [0.0, 1.0, 0.0]],
+                    [[1.0, 0.25, nan], [0.0, 1.0, 0.0]],
+                ] {
+                    let got = affine_transform(&x2, &matrix, order, mode, cval)
+                        .expect("affine_transform");
+                    assert!(
+                        got.data
+                            .iter()
+                            .enumerate()
+                            .all(|(k, &g)| same(g, nan_point(row0[k % 4]))),
+                        "{tag}: affine_transform {matrix:?} fsci {:?}",
+                        got.data
+                    );
+                }
+                let got = geometric_transform(
+                    &x2,
+                    |o: &[usize]| vec![nan, o[1] as f64],
+                    None,
+                    order,
+                    mode,
+                    cval,
+                )
+                .expect("geometric_transform");
+                assert!(
+                    got.data
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &g)| same(g, nan_point(row0[k % 4]))),
+                    "{tag}: geometric_transform fsci {:?}",
+                    got.data
+                );
+            }
+        }
+    }
+
     #[test]
     fn binary_fill_holes_fills() {
         #[rustfmt::skip]
@@ -22176,6 +22727,99 @@ mod tests {
         assert_eq!(
             extrema_labels(&finite, &labels, 2),
             (vec![1.0, 3.0], vec![2.0, 5.0])
+        );
+    }
+
+    /// With an index array SciPy's `_select` argsorts the values (NaN last) and keeps the first
+    /// sorted value per label as the minimum and the last as the maximum, scattering into
+    /// `np.zeros`. So the labeled minimum skips a NaN, is NaN only for an all-NaN label, and an
+    /// empty label is 0. SciPy 1.17.1, `labels = [1, 1, 2, 2, 2]`:
+    ///
+    /// ```text
+    /// minimum([1, nan, 3, 4, 5], labels, [1, 2])        [1, 3]
+    /// minimum([1, nan, 3, 4, 5], labels, [2, 1])        [3, 1]
+    /// minimum([nan, nan, 3, 4, 5], labels, [2, 1, 3])   [3, nan, 0]
+    /// maximum([1, nan, 3, 4, 5], labels, [2, 1])        [5, nan]
+    /// minimum([1, nan, 3, 4, 5], labels)                nan   (no index: ndarray.min)
+    /// extrema([1, 2, 3, 4, 5], labels, [1, 2, 3])[:2]   ([1, 3, 0], [2, 5, 0])
+    /// extrema([nan, nan, 3, 4, 5], labels, [1, 2])[:2]  ([nan, 3], [nan, 5])
+    /// ```
+    ///
+    /// fsci's index-array minimum propagated the NaN (`[nan, 3]`, both the one-based fast path
+    /// and the general group path), `extrema_labels` gave `inf`/`-inf` for the empty label and
+    /// `inf` for the all-NaN label's minimum. The NaN-free minimum must not move
+    /// (frankenscipy-xae2n).
+    #[test]
+    fn labeled_minimum_and_extrema_follow_scipy_sorted_path_on_nan_and_empty_labels() {
+        let nan = f64::NAN;
+        let same = |got: &[f64], want: &[f64]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|(g, w)| (g.is_nan() && w.is_nan()) || g.to_bits() == w.to_bits())
+        };
+        let labels = NdArray::new(vec![1.0, 1.0, 2.0, 2.0, 2.0], vec![5]).expect("shape");
+        let x = NdArray::new(vec![1.0, nan, 3.0, 4.0, 5.0], vec![5]).expect("shape");
+        let all_nan = NdArray::new(vec![nan, nan, 3.0, 4.0, 5.0], vec![5]).expect("shape");
+        let finite = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]).expect("shape");
+        // [1, 2] takes the one-based fast path; the other indices take the group path.
+        let checks: Vec<(&str, Result<Vec<f64>, NdimageError>, Vec<f64>)> = vec![
+            (
+                "minimum(x, labels, [1, 2])",
+                minimum(&x, Some(&labels), Some(&[1, 2])),
+                vec![1.0, 3.0],
+            ),
+            (
+                "minimum(x, labels, [2, 1])",
+                minimum(&x, Some(&labels), Some(&[2, 1])),
+                vec![3.0, 1.0],
+            ),
+            (
+                "minimum(all_nan, labels, [1, 2])",
+                minimum(&all_nan, Some(&labels), Some(&[1, 2])),
+                vec![nan, 3.0],
+            ),
+            (
+                "minimum(all_nan, labels, [2, 1, 3])",
+                minimum(&all_nan, Some(&labels), Some(&[2, 1, 3])),
+                vec![3.0, nan, 0.0],
+            ),
+            (
+                "maximum(x, labels, [2, 1])",
+                maximum(&x, Some(&labels), Some(&[2, 1])),
+                vec![5.0, nan],
+            ),
+            (
+                "minimum(x, labels)",
+                minimum(&x, Some(&labels), None),
+                vec![nan],
+            ),
+            (
+                "minimum(finite, labels, [1, 2])",
+                minimum(&finite, Some(&labels), Some(&[1, 2])),
+                vec![1.0, 3.0],
+            ),
+            (
+                "minimum(finite, labels, [2, 1])",
+                minimum(&finite, Some(&labels), Some(&[2, 1])),
+                vec![3.0, 1.0],
+            ),
+        ];
+        for (label, got, want) in checks {
+            let got = got.expect("valid reduction");
+            assert!(same(&got, &want), "{label}: fsci {got:?}, SciPy {want:?}");
+        }
+
+        let (mins, maxs) = extrema_labels(&finite, &labels, 3);
+        assert!(
+            same(&mins, &[1.0, 3.0, 0.0]) && same(&maxs, &[2.0, 5.0, 0.0]),
+            "extrema_labels(finite, 3): fsci ({mins:?}, {maxs:?}), SciPy ([1, 3, 0], [2, 5, 0])"
+        );
+        let (mins, maxs) = extrema_labels(&all_nan, &labels, 2);
+        assert!(
+            same(&mins, &[nan, 3.0]) && same(&maxs, &[nan, 5.0]),
+            "extrema_labels(all_nan, 2): fsci ({mins:?}, {maxs:?}), SciPy ([nan, 3], [nan, 5])"
         );
     }
 
