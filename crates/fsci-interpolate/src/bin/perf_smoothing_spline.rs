@@ -1,10 +1,11 @@
 //! Same-process timing + bit-identity digest harness for the smoothing spline
-//! (`UnivariateSpline::new` with s > 0 -> make_smoothing_spline_impl).
+//! (`UnivariateSpline::new` with s > 0).
 //!
-//! The normal-equations build was O(n^2) (eval_basis_all per sample); it is now an
-//! O(n*k^2) sparse assembly (knot-span search + windowed de Boor + nonzero-window
-//! scatter). This dumps an FNV digest of the spline coefficients (compare across the
-//! stashed dense build to prove byte-identity) and times the construction.
+//! `UnivariateSpline::new` with s > 0 now runs the FITPACK `curfit` port (SciPy's knot-adding
+//! fit). The penalized-fit `make_smoothing_spline_impl` this harness was written for (its
+//! O(n^2) -> O(n*k^2) assembly lever, tests/artifacts/perf/2026-06-05-interpolate-smoothing-
+//! banded-solve) no longer exists, so digests from before that change are not comparable. It
+//! still dumps an FNV digest of the spline coefficients and times the construction.
 //! Run: `cargo run -p fsci-interpolate --bin perf_smoothing_spline`.
 
 use std::hint::black_box;

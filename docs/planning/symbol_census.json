@@ -246,7 +246,7 @@
   },
   "scipy.interpolate": {
    "applicable": 56,
-   "compared": 13,
+   "compared": 14,
    "crate": "fsci-interpolate",
    "declared": 56,
    "matched_by": {
@@ -286,7 +286,6 @@
     "RectSphereBivariateSpline",
     "SmoothBivariateSpline",
     "SmoothSphereBivariateSpline",
-    "UnivariateSpline",
     "approximate_taylor_polynomial",
     "barycentric_interpolate",
     "bisplev",
@@ -1380,7 +1379,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 821,
+  "compared": 822,
   "declared": 1455,
   "matched_by": {
    "case_fold": 126,

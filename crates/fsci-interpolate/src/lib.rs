@@ -2150,10 +2150,21 @@ pub fn barycentric_interpolate(
 pub struct UnivariateSpline {
     spline: BSpline,
     smoothing_factor: f64,
+    residual: f64,
 }
 
 impl UnivariateSpline {
+    /// Cubic smoothing spline, matching `scipy.interpolate.UnivariateSpline(x, y, s=s)` (k = 3,
+    /// unit weights, bbox = the data's interval).
+    ///
+    /// `s = 0` interpolates. `s > 0` runs FITPACK `curfit` as scipy does (`fpcurf0` with
+    /// `nest = max(m // 2, 2k + 2)`, then `_reset_nest` to `m + k + 1` when that fills up):
+    /// knots are added until the residual is at most `s`, then the spline with residual `s`
+    /// (to `0.001 s`) is found on them. scipy only warns when FITPACK cannot reach `s`; the
+    /// spline is returned then too. Like scipy, `x` must be increasing, strictly so unless
+    /// `s > 0`.
     pub fn new(x: &[f64], y: &[f64], s: f64) -> Result<Self, InterpError> {
+        const K: usize = 3;
         if x.len() != y.len() {
             return Err(InterpError::LengthMismatch {
                 x_len: x.len(),
@@ -2169,7 +2180,14 @@ impl UnivariateSpline {
         if x.iter().any(|&v| !v.is_finite()) {
             return Err(InterpError::NonFiniteX);
         }
-        if x.windows(2).any(|w| w[1] <= w[0]) {
+        // scipy `UnivariateSpline.validate_input`: "x must be increasing if s > 0" (ties
+        // allowed), otherwise "x must be strictly increasing if s = 0".
+        let unsorted = if s > 0.0 {
+            x.windows(2).any(|w| w[1] < w[0])
+        } else {
+            x.windows(2).any(|w| w[1] <= w[0])
+        };
+        if unsorted {
             return Err(InterpError::UnsortedX);
         }
         // scipy `UnivariateSpline.validate_input`: `not s >= 0.0` raises ValueError (after the
@@ -2180,16 +2198,48 @@ impl UnivariateSpline {
             });
         }
 
-        let spline = if s == 0.0 {
-            make_interp_spline(x, y, 3)?
+        let (spline, residual) = if s == 0.0 {
+            let spline = make_interp_spline(x, y, K)?;
+            let residual = x
+                .iter()
+                .zip(y)
+                .map(|(&xi, &yi)| {
+                    let r = yi - spline.eval(xi);
+                    r * r
+                })
+                .sum::<f64>();
+            (spline, residual)
         } else {
-            make_smoothing_spline_impl(x, y, s, 3)?
+            let nest = (x.len() / 2).max(2 * (K + 1));
+            let (t, c, fp) = curfit_smoothing(x, y, K, s, nest, true)?;
+            (BSpline::new(t, c, K)?, fp)
         };
 
         Ok(Self {
             spline,
             smoothing_factor: s,
+            residual,
         })
+    }
+
+    /// The knots without the repeated boundary ones, `t[k..n-k]`, as scipy's
+    /// `UnivariateSpline.get_knots()` returns them (the interval ends appear once).
+    pub fn get_knots(&self) -> &[f64] {
+        let t = self.spline.knots();
+        let k = self.spline.degree();
+        &t[k..t.len() - k]
+    }
+
+    /// The `n - k - 1` B-spline coefficients, scipy's `UnivariateSpline.get_coeffs()`.
+    pub fn get_coeffs(&self) -> &[f64] {
+        self.spline.coeffs()
+    }
+
+    /// The residual sum of squares `sum((y[i] - spl(x[i]))**2)`, scipy's `get_residual()`.
+    /// For `s > 0` this is FITPACK's `fp`; for `s = 0` it is computed from the interpolant,
+    /// where scipy reports FITPACK's rounding-level `fp` of the interpolating fit.
+    pub fn get_residual(&self) -> f64 {
+        self.residual
     }
 
     pub fn eval(&self, x: f64) -> f64 {
@@ -2401,8 +2451,7 @@ fn lsq_spline_fit(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpline, 
     // terms with a zero factor (+/-0.0, `v + (+/-0.0) == v`); the per-sample (a,b) order is
     // ascending and the sample order is unchanged, so every bit of A^T A matches. A^T y is
     // accumulated only over the window — for the finite inputs SciPy's make_lsq_spline
-    // accepts this equals the full loop bit-for-bit (skipped 0*y = +/-0.0); the sibling
-    // make_smoothing_spline_impl already assembles A^T y sparsely the same way. [perf]
+    // accepts this equals the full loop bit-for-bit (skipped 0*y = +/-0.0). [perf]
     let mut scratch = vec![0.0_f64; n];
     for i in 0..m {
         let Some(mu) = bspline_find_interval(t, x[i], n) else {
@@ -2794,117 +2843,6 @@ pub fn generate_knots(
         }
     }
     Ok(out)
-}
-
-fn make_smoothing_spline_impl(
-    x: &[f64],
-    y: &[f64],
-    s: f64,
-    k: usize,
-) -> Result<BSpline, InterpError> {
-    let t = interpolation_knots(x, k);
-    let n = x.len();
-    let mut ata = vec![vec![0.0; n]; n];
-    let mut aty = vec![0.0; n];
-    // O(n*k^2) sparse normal-equations assembly: locate the knot span containing each
-    // x[i] (bspline_find_interval, O(log n)), evaluate just the k+1 active basis values
-    // with the exact windowed Cox-de Boor recursion into a REUSED scratch buffer (no
-    // per-sample length-n alloc, no O(n) scan), then scatter over the nonzero window
-    // indices. BIT-IDENTICAL to the previous dense build: the windowed de Boor produces
-    // the same basis values, and `nz` is exactly the same nonzero set in the same
-    // ascending order, so every accumulator bit is preserved (skipped terms are 0). [perf]
-    let mut scratch = vec![0.0_f64; n];
-    let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
-    for i in 0..n {
-        let Some(mu) = bspline_find_interval(&t, x[i], n) else {
-            continue;
-        };
-        scratch[mu] = 1.0;
-        for p in 1..=k {
-            let start = mu.saturating_sub(p);
-            for idx in start..=mu {
-                let mut val = 0.0;
-                if idx + p < t.len() {
-                    let denom_left = t[idx + p] - t[idx];
-                    if denom_left > 0.0 {
-                        val += (x[i] - t[idx]) / denom_left * scratch[idx];
-                    }
-                }
-                if idx + p + 1 < t.len() && idx + 1 < n {
-                    let denom_right = t[idx + p + 1] - t[idx + 1];
-                    if denom_right > 0.0 {
-                        val += (t[idx + p + 1] - x[i]) / denom_right * scratch[idx + 1];
-                    }
-                }
-                scratch[idx] = val;
-            }
-        }
-        let lo = mu.saturating_sub(k);
-        nz.clear();
-        nz.extend((lo..=mu).filter(|&idx| scratch[idx] != 0.0));
-        let yi = y[i];
-        for &j in &nz {
-            let bj = scratch[j];
-            aty[j] += bj * yi;
-            let row = &mut ata[j];
-            for &l in &nz {
-                row[l] += bj * scratch[l];
-            }
-        }
-        for s in scratch[lo..=mu].iter_mut() {
-            *s = 0.0;
-        }
-    }
-
-    let scale = y
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        })
-        .max(1.0);
-    let lambda = s / ((n as f64) * scale * scale);
-    if lambda > 0.0 {
-        for i in 0..n {
-            ata[i][i] += penalty_diagonal(i, n, lambda);
-            if i + 1 < n {
-                let off = penalty_first_off_diagonal(i, n, lambda);
-                ata[i][i + 1] += off;
-                ata[i + 1][i] += off;
-            }
-            if i + 2 < n {
-                ata[i][i + 2] += lambda;
-                ata[i + 2][i] += lambda;
-            }
-        }
-    }
-
-    // A^T A has B-spline bandwidth k; the smoothing penalty adds the second off-diagonal,
-    // so the system is banded with half-width max(k, 2).
-    let c = solve_banded(&mut ata, &mut aty, k.max(2))?;
-    BSpline::new(t, c, k)
-}
-
-fn penalty_diagonal(i: usize, n: usize, lambda: f64) -> f64 {
-    if i == 0 || i + 1 == n {
-        lambda
-    } else if i == 1 || i + 2 == n {
-        5.0 * lambda
-    } else {
-        6.0 * lambda
-    }
-}
-
-fn penalty_first_off_diagonal(i: usize, n: usize, lambda: f64) -> f64 {
-    if i == 0 || i + 2 == n {
-        -2.0 * lambda
-    } else {
-        -4.0 * lambda
-    }
 }
 
 /// Index `mu` of the knot span containing `x`, i.e. the unique `i` in `[0, n)` that
@@ -6968,10 +6906,554 @@ impl NdPPoly {
     }
 }
 
-/// Smoothing spline representation (splrep equivalent).
+/// FITPACK `curfit` smoothing: `fpcurf.f` and `fpknot.f` from scipy v1.17.1
+/// (`scipy/interpolate/fitpack/`), transcribed line for line (frankenscipy-c4oxk).
 ///
-/// Returns (knots, coefficients, degree) that can be used with `splev`.
-/// Matches `scipy.interpolate.splrep`.
+/// The helpers `fpcurf` shares with `surfit` (`fpback`, `fpbspl`, `fpdisc`, `fpgivs`,
+/// `fprati`, `fprota`) are already faithful transcriptions in `surfit.rs` and are reused.
+/// Arrays are 1-based (index 0 unused) so the indices read beside the Fortran, and every
+/// floating-point operation keeps the Fortran order (`v**2` is `v * v`; scipy's `_dfitpack`
+/// build contains no FMA instruction). A Python transliteration of this code, and then this
+/// module compiled on its own, reproduced SciPy 1.17.1's `splrep` and `UnivariateSpline` bit
+/// for bit (knots, coefficients, `fp`, `ier`) on 2787 (data, k, s) rows, 2500 of them random.
+///
+/// This is not fsci's `fpknot`/`generate_knots`, which port scipy's `_fitpack_repro.py`:
+/// that recomputes the interval residuals before every new knot, where `fpknot.f` splits the
+/// stored estimate between the two halves and can add several knots per least-squares fit,
+/// so the two place different knots on some data (scipy's own `make_splrep` and `splrep`
+/// differ there too).
+///
+/// `fpint` and `nrdata` start as uninitialised memory in SciPy (`numpy.empty` for `splrep`,
+/// f2py `intent(cache)` for `UnivariateSpline`). `fpknot`'s no-split exit (`iserr`) can make
+/// a later call read entries nothing wrote, and then read `x` past its end; SciPy returns
+/// garbage knots or crashes there. The port holds unwritten entries as `None` and returns
+/// `Uninitialised` at that read instead of inventing a value.
+// FITPACK TRANSCRIPTION: the lint policy of `surfit.rs` (frankenscipy-9yyez). The explicit
+// 1-based index loops are the correspondence a reviewer checks against the Fortran.
+#[allow(clippy::manual_memcpy, clippy::explicit_counter_loop)]
+mod curfit {
+    use crate::surfit::{fpback, fpbspl, fpdisc, fpgivs, fprati, fprota};
+
+    /// `curfit.f` / `dfitpack.pyf`: the relative tolerance on `|fp - s|` and the iteration
+    /// cap of the `f(p) = s` root finder.
+    const TOL: f64 = 0.001;
+    const MAXIT: usize = 20;
+
+    /// `fpcurf` needed an `fpint`/`nrdata` entry that SciPy never initialised, or `x` past
+    /// its end: SciPy's result depends on stale memory there (or it crashes).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Uninitialised;
+
+    /// `fpcurf`'s in/out arguments, 1-based and sized for `nest` knots. `fpint` and `nrdata`
+    /// hold `None` where SciPy's array is still uninitialised memory.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Curfit {
+        pub(crate) n: usize,
+        pub(crate) t: Vec<f64>,
+        pub(crate) c: Vec<f64>,
+        pub(crate) fp: f64,
+        pub(crate) fpint: Vec<Option<f64>>,
+        pub(crate) nrdata: Vec<Option<usize>>,
+        pub(crate) ier: i32,
+    }
+
+    impl Curfit {
+        /// The state of a first (`iopt = 0`) call with room for `nest` knots. `c` is f2py's
+        /// zero-filled output (its entries past `n - k - 1` are returned as they are); `t`
+        /// is only ever read where `fpcurf` wrote it.
+        pub(crate) fn new(nest: usize) -> Self {
+            Self {
+                n: 0,
+                t: vec![0.0; nest + 1],
+                c: vec![0.0; nest + 1],
+                fp: 0.0,
+                fpint: vec![None; nest + 1],
+                nrdata: vec![None; nest + 1],
+                ier: 0,
+            }
+        }
+
+        /// `UnivariateSpline._reset_nest`: `numpy.resize` of `t`, `c`, `fpint`, `nrdata` to
+        /// `nest` entries, which repeats the old entries cyclically into the new tail.
+        pub(crate) fn resize(&mut self, nest: usize) {
+            numpy_resize(&mut self.t, nest);
+            numpy_resize(&mut self.c, nest);
+            numpy_resize(&mut self.fpint, nest);
+            numpy_resize(&mut self.nrdata, nest);
+        }
+    }
+
+    /// `numpy.resize(a, nest)` of a 1-based array (index 0 is not part of `a`).
+    fn numpy_resize<T: Clone>(v: &mut Vec<T>, nest: usize) {
+        let old = v.split_off(1);
+        v.extend(old.iter().cycle().take(nest).cloned());
+    }
+
+    /// gfortran's `integer = real*8` as scipy's `_dfitpack` build emits it on x86-64: every
+    /// such conversion there is a 32-bit `cvttsd2si`, which truncates toward zero and gives
+    /// `i32::MIN` for NaN or anything outside the `integer*4` range.
+    fn fortran_int4(v: f64) -> i64 {
+        if (-2_147_483_648.0..2_147_483_648.0).contains(&v) {
+            v.trunc() as i64
+        } else {
+            i64::from(i32::MIN)
+        }
+    }
+
+    /// `fpcurf.f` label 10: the interior knots `t(k+2..=m)` of the interpolating spline, the
+    /// data abscissae for odd `k` and the midpoints between them for even `k`.
+    fn interpolation_interior_knots(x: &[f64], m: usize, k: usize, t: &mut [f64]) {
+        let k2 = k + 2;
+        let k3 = k / 2;
+        for l in 0..m - (k + 1) {
+            let i = k2 + l;
+            let j = k3 + 2 + l;
+            t[i] = if k3 * 2 == k {
+                (x[j] + x[j - 1]) * 0.5
+            } else {
+                x[j]
+            };
+        }
+    }
+
+    /// `fpknot.f` (`istart = 1`): split the knot interval with the largest `fpint` among
+    /// those holding a data point, at its middle data point, sharing `fpint` and `nrdata`
+    /// between the halves. `n` and `nrint` grow by one even when no interval qualifies
+    /// (scipy's `iserr` exit places no knot).
+    fn fpknot(
+        x: &[f64],
+        m: usize,
+        t: &mut [f64],
+        n: &mut usize,
+        fpint: &mut [Option<f64>],
+        nrdata: &mut [Option<usize>],
+        nrint: &mut usize,
+    ) -> Result<(), Uninitialised> {
+        let k = (*n - *nrint - 1) / 2;
+        let mut fpmax = 0.0_f64;
+        let mut jbegin = 1_usize;
+        // (number, maxpt, maxbeg) of the interval to split.
+        let mut chosen = None;
+        for j in 1..=*nrint {
+            let jpoint = nrdata[j].ok_or(Uninitialised)?;
+            // `if(fpmax.ge.fpint(j) .or. jpoint.eq.0) go to 10`: fpint(j) decides nothing
+            // when jpoint is 0, so an unwritten one is only an error when it is read.
+            if jpoint != 0 {
+                let fpj = fpint[j].ok_or(Uninitialised)?;
+                if !(fpmax >= fpj) {
+                    fpmax = fpj;
+                    chosen = Some((j, jpoint, jbegin));
+                }
+            }
+            jbegin += jpoint + 1;
+        }
+        if let Some((number, maxpt, maxbeg)) = chosen {
+            let ihalf = maxpt / 2 + 1;
+            let nrx = maxbeg + ihalf;
+            if nrx > m {
+                // x(nrx) is past the data: SciPy reads whatever memory follows x.
+                return Err(Uninitialised);
+            }
+            let next = number + 1;
+            for j in next..=*nrint {
+                let jj = next + *nrint - j;
+                fpint[jj + 1] = fpint[jj];
+                nrdata[jj + 1] = nrdata[jj];
+                let jk = jj + k;
+                t[jk + 1] = t[jk];
+            }
+            nrdata[number] = Some(ihalf - 1);
+            nrdata[next] = Some(maxpt - ihalf);
+            let am = maxpt as f64;
+            let an = (ihalf - 1) as f64;
+            fpint[number] = Some(fpmax * an / am);
+            let an = (maxpt - ihalf) as f64;
+            fpint[next] = Some(fpmax * an / am);
+            let jk = next + k;
+            t[jk] = x[nrx];
+        }
+        *n += 1;
+        *nrint += 1;
+        Ok(())
+    }
+
+    /// `fpcurf.f` for `s > 0`, `iopt` 0 (start from the least-squares polynomial) or 1
+    /// (continue from the knots in `st`). `x`, `y`, `w` are 1-based with `m` points, `x`
+    /// non-decreasing within `[xb, xe]`, `1 <= k <= 5`. On return `st` holds `n`, the knots
+    /// `t[1..=n]`, the coefficients `c[1..=n-k-1]`, `fp` and FITPACK's `ier`: 0 (`|fp - s|`
+    /// within `0.001 s`), -1 (interpolating spline), -2 (least-squares polynomial, `fp0 <= s`),
+    /// 1 (`nest` knots used up), 2 (`f(p) = s` iteration broke down), 3 (20 iterations).
+    pub(crate) fn fpcurf(
+        iopt: i32,
+        x: &[f64],
+        y: &[f64],
+        w: &[f64],
+        m: usize,
+        xb: f64,
+        xe: f64,
+        k: usize,
+        s: f64,
+        nest: usize,
+        st: &mut Curfit,
+    ) -> Result<(), Uninitialised> {
+        let Curfit {
+            n,
+            t,
+            c,
+            fp,
+            fpint,
+            nrdata,
+            ier,
+        } = st;
+        let one = 1.0_f64;
+        let con1 = 0.1_f64;
+        let con9 = 0.9_f64;
+        let con4 = 0.04_f64;
+        let half = 0.5_f64;
+        let k1 = k + 1;
+        let k2 = k1 + 1;
+        let mut a = vec![vec![0.0_f64; k1 + 1]; nest + 1];
+        let mut b = vec![vec![0.0_f64; k2 + 1]; nest + 1];
+        let mut g = vec![vec![0.0_f64; k2 + 1]; nest + 1];
+        let mut q = vec![vec![0.0_f64; k1 + 1]; m + 1];
+        let mut z = vec![0.0_f64; nest + 1];
+        let mut h = [0.0_f64; 8];
+
+        // Part 1: the number of knots and their position.
+        let nmin = 2 * k1;
+        let acc = TOL * s;
+        let nmax = m + k1;
+        let mut fp0 = 0.0_f64;
+        // Label 45: iopt = 1 continues from the last call's knots unless fp0 <= s.
+        let resumed = if iopt != 0 && *n != nmin {
+            let fp0_last = fpint[*n].ok_or(Uninitialised)?;
+            let fpold_last = fpint[*n - 1].ok_or(Uninitialised)?;
+            let nplus_last = nrdata[*n].ok_or(Uninitialised)?;
+            (fp0_last > s).then_some((fp0_last, fpold_last, nplus_last))
+        } else {
+            None
+        };
+        let (mut fpold, mut nplus) = match resumed {
+            Some((fp0_last, fpold_last, nplus_last)) => {
+                fp0 = fp0_last;
+                (fpold_last, nplus_last)
+            }
+            None => {
+                // Label 50: start from the least-squares polynomial of degree k.
+                *n = nmin;
+                nrdata[1] = Some(m - 2);
+                (0.0_f64, 0_usize)
+            }
+        };
+        let mut fpms = 0.0_f64;
+        let mut nk1 = 0_usize;
+
+        // Label 60: least-squares splines on growing knot sets until fp <= s. When the knots
+        // reach nmax they are placed as for interpolation (label 10) and the loop restarts.
+        'knots: loop {
+            for _iter in 1..=m {
+                if *n == nmin {
+                    *ier = -2;
+                }
+                let mut nrint = *n - nmin + 1;
+                nk1 = *n - k1;
+                for j in 1..=k1 {
+                    t[j] = xb;
+                    t[*n + 1 - j] = xe;
+                }
+                // The observation matrix, reduced row by row to upper triangular form by
+                // Givens rotations; fp = f(p = inf) accumulates alongside.
+                *fp = 0.0;
+                for i in 1..=nk1 {
+                    z[i] = 0.0;
+                    for j in 1..=k1 {
+                        a[i][j] = 0.0;
+                    }
+                }
+                let mut l = k1;
+                for it in 1..=m {
+                    let xi = x[it];
+                    let wi = w[it];
+                    let mut yi = y[it] * wi;
+                    while !(xi < t[l + 1] || l == nk1) {
+                        l += 1;
+                    }
+                    fpbspl(t, k, xi, l, &mut h);
+                    for i in 1..=k1 {
+                        q[it][i] = h[i];
+                        h[i] *= wi;
+                    }
+                    let mut j = l - k1;
+                    for i in 1..=k1 {
+                        j += 1;
+                        let piv = h[i];
+                        if piv == 0.0 {
+                            continue;
+                        }
+                        let (cos, sin) = fpgivs(piv, &mut a[j][1]);
+                        fprota(cos, sin, &mut yi, &mut z[j]);
+                        if i == k1 {
+                            break;
+                        }
+                        let mut i2 = 1;
+                        for i1 in i + 1..=k1 {
+                            i2 += 1;
+                            fprota(cos, sin, &mut h[i1], &mut a[j][i2]);
+                        }
+                    }
+                    *fp += yi * yi;
+                }
+                if *ier == -2 {
+                    fp0 = *fp;
+                }
+                fpint[*n] = Some(fp0);
+                fpint[*n - 1] = Some(fpold);
+                nrdata[*n] = Some(nplus);
+                fpback(&a, &z, nk1, k1, c);
+                fpms = *fp - s;
+                if fpms.abs() < acc {
+                    return Ok(());
+                }
+                if fpms < 0.0 {
+                    // fp < s on these knots: find the smoothing spline (label 250).
+                    break 'knots;
+                }
+                if *n == nmax {
+                    *ier = -1;
+                    return Ok(());
+                }
+                if *n == nest {
+                    *ier = 1;
+                    return Ok(());
+                }
+                // How many knots to add.
+                if *ier == 0 {
+                    let nplus_i = nplus as i64;
+                    let mut npl1 = nplus_i * 2;
+                    let rn = nplus as f64;
+                    if fpold - *fp > acc {
+                        npl1 = fortran_int4(rn * fpms / (fpold - *fp));
+                    }
+                    nplus = (nplus_i * 2).min(npl1.max(nplus_i / 2).max(1)) as usize;
+                } else {
+                    nplus = 1;
+                    *ier = 0;
+                }
+                fpold = *fp;
+                // sum((w(i)*(y(i)-s(x(i))))**2) per knot interval t(j+k) <= x(i) <= t(j+k+1);
+                // a data point on a knot counts half to each side.
+                let mut fpart = 0.0_f64;
+                let mut i = 1;
+                let mut l = k2;
+                let mut new = false;
+                for it in 1..=m {
+                    if !(x[it] < t[l] || l > nk1) {
+                        new = true;
+                        l += 1;
+                    }
+                    let mut sum = 0.0_f64;
+                    let mut l0 = l - k2;
+                    for j in 1..=k1 {
+                        l0 += 1;
+                        sum += c[l0] * q[it][j];
+                    }
+                    let r = w[it] * (sum - y[it]);
+                    let term = r * r;
+                    fpart += term;
+                    if new {
+                        let store = term * half;
+                        fpint[i] = Some(fpart - store);
+                        i += 1;
+                        fpart = store;
+                        new = false;
+                    }
+                }
+                fpint[nrint] = Some(fpart);
+                for _ in 1..=nplus {
+                    fpknot(x, m, t, n, fpint, nrdata, &mut nrint)?;
+                    if *n == nmax {
+                        interpolation_interior_knots(x, m, k, t);
+                        continue 'knots;
+                    }
+                    if *n == nest {
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        // Label 250: the least-squares polynomial is itself the answer.
+        if *ier == -2 {
+            return Ok(());
+        }
+
+        // Part 2: the smoothing spline sp(x). The rows of b (the k-th derivative jumps at
+        // the interior knots, weight 1/p) are rotated into the triangularised observation
+        // matrix, and p is found by rational interpolation such that f(p) = fp = s.
+        fpdisc(t, *n, k2, &mut b);
+        let mut p1 = 0.0_f64;
+        let mut f1 = fp0 - s;
+        let mut p3 = -one;
+        let mut f3 = fpms;
+        let mut p = 0.0_f64;
+        for i in 1..=nk1 {
+            p += a[i][1];
+        }
+        let rn = nk1 as f64;
+        p = rn / p;
+        let mut ich1 = false;
+        let mut ich3 = false;
+        let n8 = *n - nmin;
+        for iter in 1..=MAXIT {
+            let pinv = one / p;
+            for i in 1..=nk1 {
+                c[i] = z[i];
+                g[i][k2] = 0.0;
+                for j in 1..=k1 {
+                    g[i][j] = a[i][j];
+                }
+            }
+            for it in 1..=n8 {
+                for i in 1..=k2 {
+                    h[i] = b[it][i] * pinv;
+                }
+                let mut yi = 0.0_f64;
+                for j in it..=nk1 {
+                    let piv = h[1];
+                    let (cos, sin) = fpgivs(piv, &mut g[j][1]);
+                    fprota(cos, sin, &mut yi, &mut c[j]);
+                    if j == nk1 {
+                        break;
+                    }
+                    let i2 = if j > n8 { nk1 - j } else { k1 };
+                    for i in 1..=i2 {
+                        let i1 = i + 1;
+                        fprota(cos, sin, &mut h[i1], &mut g[j][i1]);
+                        h[i] = h[i1];
+                    }
+                    h[i2 + 1] = 0.0;
+                }
+            }
+            // `call fpback(g,c,nk1,k2,c,nest)`: z and c are the same array in the Fortran.
+            let rhs = c[..=nk1].to_vec();
+            fpback(&g, &rhs, nk1, k2, c);
+            *fp = 0.0;
+            let mut l = k2;
+            for it in 1..=m {
+                if !(x[it] < t[l] || l > nk1) {
+                    l += 1;
+                }
+                let mut l0 = l - k2;
+                let mut sum = 0.0_f64;
+                for j in 1..=k1 {
+                    l0 += 1;
+                    sum += c[l0] * q[it][j];
+                }
+                let r = w[it] * (sum - y[it]);
+                *fp += r * r;
+            }
+            fpms = *fp - s;
+            if fpms.abs() < acc {
+                return Ok(());
+            }
+            if iter == MAXIT {
+                *ier = 3;
+                return Ok(());
+            }
+            let p2 = p;
+            let f2 = fpms;
+            if !ich3 {
+                if !(f2 - f3 > acc) {
+                    // The initial p is too large.
+                    p3 = p2;
+                    f3 = f2;
+                    p *= con4;
+                    if p <= p1 {
+                        p = p1 * con9 + p2 * con1;
+                    }
+                    continue;
+                }
+                if f2 < 0.0 {
+                    ich3 = true;
+                }
+            }
+            if !ich1 {
+                if !(f1 - f2 > acc) {
+                    // The initial p is too small.
+                    p1 = p2;
+                    f1 = f2;
+                    p /= con4;
+                    if p3 < 0.0 {
+                        continue;
+                    }
+                    if p >= p3 {
+                        p = p2 * con1 + p3 * con9;
+                    }
+                    continue;
+                }
+                if f2 > 0.0 {
+                    ich1 = true;
+                }
+            }
+            if f2 >= f1 || f2 <= f3 {
+                // f(p) is not behaving as theory says it must.
+                *ier = 2;
+                return Ok(());
+            }
+            p = fprati(&mut p1, &mut f1, p2, f2, &mut p3, &mut f3);
+        }
+        Ok(())
+    }
+}
+
+/// FITPACK `curfit` smoothing (`s > 0`) with unit weights over the data's own interval
+/// (`xb = x[0]`, `xe = x[m-1]`), starting with room for `nest` knots. With `grow_nest`, a
+/// run that uses up `nest` knots continues from them with `nest = m + k + 1`, as
+/// `UnivariateSpline` does (`_reset_nest`, then `fpcurf1`). Returns the knots `t[..n]`, the
+/// coefficients `c[..n]` (the last `k + 1` are FITPACK's untouched zeros) and `fp`.
+/// FITPACK's warning codes keep the fit, as scipy does.
+fn curfit_smoothing(
+    x: &[f64],
+    y: &[f64],
+    k: usize,
+    s: f64,
+    nest: usize,
+    grow_nest: bool,
+) -> Result<(Vec<f64>, Vec<f64>, f64), InterpError> {
+    let m = x.len();
+    let one_based =
+        |v: &[f64]| -> Vec<f64> { std::iter::once(0.0).chain(v.iter().copied()).collect() };
+    let xs = one_based(x);
+    let ys = one_based(y);
+    let ws = vec![1.0_f64; m + 1];
+    let (xb, xe) = (x[0], x[m - 1]);
+    let uninitialised = |_: curfit::Uninitialised| InterpError::InvalidArgument {
+        detail: "curfit found no knot interval to split and would continue from memory SciPy \
+                 never initialised (scipy 1.17.1 returns garbage knots or crashes here)"
+            .to_string(),
+    };
+    let mut st = curfit::Curfit::new(nest);
+    curfit::fpcurf(0, &xs, &ys, &ws, m, xb, xe, k, s, nest, &mut st).map_err(uninitialised)?;
+    if grow_nest && st.ier == 1 {
+        let nest = m + k + 1;
+        st.resize(nest);
+        curfit::fpcurf(1, &xs, &ys, &ws, m, xb, xe, k, s, nest, &mut st).map_err(uninitialised)?;
+    }
+    let n = st.n;
+    Ok((st.t[1..=n].to_vec(), st.c[1..=n].to_vec(), st.fp))
+}
+
+/// B-spline representation of 1-D data, matching `scipy.interpolate.splrep(x, y, k=k, s=s)`
+/// with unit weights. Returns `(t, c, k)` for [`splev`]; as in scipy's tck, `c` has `len(t)`
+/// entries, the last `k + 1` zero.
+///
+/// `s = 0` interpolates. `s > 0` runs FITPACK `curfit` as scipy does: knots are added where
+/// the least-squares spline misfits most until its residual `fp` is at most `s`, then the
+/// spline with `fp = s` (to `0.001 s`) is found on those knots. FITPACK's warnings (scipy's
+/// `RuntimeWarning` when the 20 iterations run out or the iteration breaks down) keep the fit,
+/// as scipy does. For `s > 0`, like scipy, `k` must be in `1..=5` and `x` non-decreasing (ties
+/// are allowed; a decreasing `x` is curfit's "Error on input data").
 pub fn splrep(
     x: &[f64],
     y: &[f64],
@@ -7002,33 +7484,25 @@ pub fn splrep(
         ));
     }
 
-    // For s > 0 (smoothing), use make_lsq_spline with automatic knots
-    let n = x.len();
-    let n_interior = (n as f64 / 4.0).ceil() as usize;
-    let n_interior = n_interior.max(1).min(n - k - 1);
-
-    let mut knots = Vec::with_capacity(n_interior + 2 * (k + 1));
-
-    // Repeated boundary knots
-    for _ in 0..=k {
-        knots.push(x[0]);
+    // s > 0: FITPACK curfit as scipy's splrep calls it (task = 0, unit weights, xb = x[0],
+    // xe = x[-1], nest = max(m + k + 1, 2k + 3)). scipy does not check y: a non-finite y
+    // propagates into the coefficients.
+    if !(1..=5).contains(&k) {
+        return Err(InterpError::InvalidArgument {
+            detail: format!("Given degree of the spline (k={k}) is not supported. (1<=k<=5)"),
+        });
     }
-    // Interior knots
-    for i in 1..=n_interior {
-        let idx = i * (n - 1) / (n_interior + 1);
-        knots.push(x[idx]);
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(InterpError::NonFiniteX);
     }
-    for _ in 0..=k {
-        knots.push(x[n - 1]);
+    if x.windows(2).any(|p| p[1] < p[0]) {
+        return Err(InterpError::InvalidArgument {
+            detail: "Error on input data".to_string(),
+        });
     }
-
-    // scipy `splrep` does not check finiteness: a non-finite y propagates, no raise.
-    let bspl = lsq_spline_fit(x, y, &knots, k)?;
-    Ok((
-        bspl.knots().to_vec(),
-        pad_tck_coeffs(bspl.knots(), bspl.coeffs()),
-        k,
-    ))
+    let m = x.len();
+    let (t, c, _fp) = curfit_smoothing(x, y, k, s, (m + k + 1).max(2 * k + 3), false)?;
+    Ok((t, c, k))
 }
 
 /// Fit a B-spline to 1-D data, matching `scipy.interpolate.make_splrep(x, y, k=k, s=0)`
@@ -11759,7 +12233,7 @@ mod tests {
             }
         }
 
-        // Sparse-support version (mirrors make_smoothing_spline_impl).
+        // Sparse-support version (only the nonzero basis indices).
         let mut ata = vec![vec![0.0f64; n]; n];
         let mut aty = vec![0.0f64; n];
         let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
@@ -12573,6 +13047,356 @@ mod tests {
                 assert!((got - e).abs() < 1e-10, "finite fit at {qi}: {got} vs {e}");
             }
         }
+    }
+
+    /// `x = 0, 0.5, ..., 11.5` and a noisy sine rounded to 3 decimals, so both sides hold
+    /// the same doubles: the data of the curfit pins below.
+    fn curfit_sine24() -> (Vec<f64>, Vec<f64>) {
+        let x = (0..24).map(|i| f64::from(i) * 0.5).collect();
+        let y = vec![
+            0.0, 0.524, 0.8, 0.864, 0.841, 0.45, 0.15, -0.15, -0.831, -1.071, -0.885, -0.652,
+            -0.264, 0.076, 0.653, 1.042, 0.788, 0.73, 0.127, -0.269, -0.82, -0.915, -1.19, -0.835,
+        ];
+        (x, y)
+    }
+
+    /// `x = 0, 1, ..., 15` and a noisy step.
+    fn curfit_step16() -> (Vec<f64>, Vec<f64>) {
+        let x = (0..16).map(f64::from).collect();
+        let y = vec![
+            0.0, 0.02, -0.01, 0.1, 0.0, 0.05, 0.0, 0.5, 1.0, 0.95, 1.0, 1.02, 1.0, 1.0, 0.98, 1.0,
+        ];
+        (x, y)
+    }
+
+    fn assert_close_rel(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                "{what}[{i}]: {g} vs scipy {w}"
+            );
+        }
+    }
+
+    /// frankenscipy-c4oxk item 1. `splrep(s > 0)` fitted fixed, evenly spaced knots and
+    /// ignored the value of `s`; scipy runs FITPACK curfit, which adds knots until the
+    /// residual is at most `s`. scipy 1.17.1, live, `splrep(x, y, k=k, s=s)`:
+    /// - `curfit_sine24`, k=3, s=0.1: t = [0]*4 + [3, 3.5, 4, 4.5, 6, 7, 7.5, 8, 8.5, 9, 10,
+    ///   10.5] + [11.5]*4 (fp = 0.10003489826224023, ier 0); c[:3] = -0.004006158834650042,
+    ///   1.3375420814153234, 0.8734820894691075, c[15] = -0.8444165320508285, then 4 zeros;
+    ///   splev at 0.25, 3.25, 6.5, 11.25 = 0.2959405241472342, -0.024104818889400713,
+    ///   0.17471482627926158, -1.0792936551346304.
+    /// - same data, s=0.5: t = [0]*4 + [3, 4.5, 6, 9] + [11.5]*4, splev = 0.30093325824814654,
+    ///   -0.17961847853019927, 0.16990152432928265, -1.098477636525463.
+    /// - k=1, s=0.5: t = [0, 0, 1.5, 3, 4.5, 6, 7.5, 9, 10.5, 11.5, 11.5], splev =
+    ///   0.3351791421315662, -0.05032564654014754, 0.11953554530490634, -1.0328267265622424.
+    /// - k=5, s=0.5: t = [0]*6 + [6, 9] + [11.5]*6, splev = 0.3090051408397284,
+    ///   -0.18667835520197001, 0.076243682161727, -1.0570183147073486.
+    /// - `curfit_step16`, k=3, s=0.2: t = [0]*4 + [2, 4, 8] + [15]*4, splev at 0.5, 4.5, 8.25,
+    ///   14.5 = 0.038986672299231334, 0.028731062043158426, 0.7851415067693319,
+    ///   0.9817472380892761; s=0.5 is the least-squares cubic (ier -2, fp0 =
+    ///   0.3325821462593133 <= s): t = [0]*4 + [15]*4, splev = 0.001574926782453386,
+    ///   0.11405410266333303, 0.7011227568266681, 0.9710012286797309.
+    /// - ties are accepted for s > 0: x = [0, 1, 1, 2, 3, 4, 4, 5, 6, 7], s=0.05 gives t =
+    ///   [0]*4 + [2, 4] + [7]*4, splev at 0.5, 2.5, 6.5 = 0.5932749589696957,
+    ///   0.5146773117158613, 0.05683757324105787. A decreasing x raises ValueError("Error on
+    ///   input data"); k=6 raises "Given degree of the spline (k=6) is not supported.
+    ///   (1<=k<=5)".
+    ///
+    /// Must-not-change: s = 0 still interpolates, splev at 0.25, 3.25, 6.5, 11.25 =
+    /// 0.2909279120106988, 0.04108775810897159, 0.07600000000000001, -1.173388487785626.
+    #[test]
+    fn splrep_smoothing_matches_scipy_curfit() {
+        let (x, y) = curfit_sine24();
+        let q = [0.25, 3.25, 6.5, 11.25];
+        let pins: [(usize, f64, Vec<f64>, [f64; 4]); 4] = [
+            (
+                3,
+                0.1,
+                vec![3.0, 3.5, 4.0, 4.5, 6.0, 7.0, 7.5, 8.0, 8.5, 9.0, 10.0, 10.5],
+                [
+                    0.2959405241472342,
+                    -0.024104818889400713,
+                    0.17471482627926158,
+                    -1.0792936551346304,
+                ],
+            ),
+            (
+                3,
+                0.5,
+                vec![3.0, 4.5, 6.0, 9.0],
+                [
+                    0.30093325824814654,
+                    -0.17961847853019927,
+                    0.16990152432928265,
+                    -1.098477636525463,
+                ],
+            ),
+            (
+                1,
+                0.5,
+                vec![1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5],
+                [
+                    0.3351791421315662,
+                    -0.05032564654014754,
+                    0.11953554530490634,
+                    -1.0328267265622424,
+                ],
+            ),
+            (
+                5,
+                0.5,
+                vec![6.0, 9.0],
+                [
+                    0.3090051408397284,
+                    -0.18667835520197001,
+                    0.076243682161727,
+                    -1.0570183147073486,
+                ],
+            ),
+        ];
+        for (k, s, interior, want) in pins {
+            let tck = splrep(&x, &y, k, s).expect("scipy fits");
+            let knots = [vec![0.0; k + 1], interior, vec![11.5; k + 1]].concat();
+            assert_eq!(tck.0, knots, "splrep knots k={k} s={s}");
+            assert_eq!(tck.1.len(), tck.0.len(), "tck c is padded to len(t)");
+            assert!(
+                tck.1[tck.0.len() - k - 1..].iter().all(|&v| v == 0.0),
+                "the last k+1 coefficients are FITPACK's zeros"
+            );
+            let got = splev(&q, &tck).expect("splev");
+            assert_close_rel(&got, &want, &format!("splrep k={k} s={s} splev"));
+        }
+        let tck = splrep(&x, &y, 3, 0.1).expect("scipy fits");
+        assert_close_rel(
+            &tck.1[..3],
+            &[
+                -0.004006158834650042,
+                1.3375420814153234,
+                0.8734820894691075,
+            ],
+            "splrep s=0.1 c[:3]",
+        );
+        assert_close_rel(&tck.1[15..16], &[-0.8444165320508285], "splrep s=0.1 c[15]");
+
+        let (x2, y2) = curfit_step16();
+        let q2 = [0.5, 4.5, 8.25, 14.5];
+        for (s, interior, want) in [
+            (
+                0.2,
+                vec![2.0, 4.0, 8.0],
+                [
+                    0.038986672299231334,
+                    0.028731062043158426,
+                    0.7851415067693319,
+                    0.9817472380892761,
+                ],
+            ),
+            (
+                0.5,
+                vec![],
+                [
+                    0.001574926782453386,
+                    0.11405410266333303,
+                    0.7011227568266681,
+                    0.9710012286797309,
+                ],
+            ),
+        ] {
+            let tck = splrep(&x2, &y2, 3, s).expect("scipy fits");
+            let knots = [vec![0.0; 4], interior, vec![15.0; 4]].concat();
+            assert_eq!(tck.0, knots, "step16 knots s={s}");
+            let got = splev(&q2, &tck).expect("splev");
+            assert_close_rel(&got, &want, &format!("step16 s={s} splev"));
+        }
+
+        let xt = [0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0, 5.0, 6.0, 7.0];
+        let yt = [0.0, 0.8, 1.0, 0.9, 0.1, -0.7, -0.8, -1.0, -0.3, 0.6];
+        let tck = splrep(&xt, &yt, 3, 0.05).expect("scipy accepts ties for s > 0");
+        assert_eq!(
+            tck.0,
+            [vec![0.0; 4], vec![2.0, 4.0], vec![7.0; 4]].concat(),
+            "ties knots"
+        );
+        let got = splev(&[0.5, 2.5, 6.5], &tck).expect("splev");
+        assert_close_rel(
+            &got,
+            &[0.5932749589696957, 0.5146773117158613, 0.05683757324105787],
+            "ties splev",
+        );
+        let reversed: Vec<f64> = xt.iter().rev().copied().collect();
+        let detail_of = |r: Result<(Vec<f64>, Vec<f64>, usize), InterpError>| match r {
+            Err(InterpError::InvalidArgument { detail }) => detail,
+            other => format!("{other:?}"),
+        };
+        assert_eq!(
+            detail_of(splrep(&reversed, &yt, 3, 0.5)),
+            "Error on input data"
+        );
+        assert_eq!(
+            detail_of(splrep(&x2, &y2, 6, 0.5)),
+            "Given degree of the spline (k=6) is not supported. (1<=k<=5)"
+        );
+
+        // Must-not-change: s = 0 is still the interpolating spline.
+        let tck = splrep(&x, &y, 3, 0.0).expect("interpolates");
+        let got = splev(&q, &tck).expect("splev");
+        let want = [
+            0.2909279120106988,
+            0.04108775810897159,
+            0.07600000000000001,
+            -1.173388487785626,
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-10, "splrep s=0: {g} vs scipy {w}");
+        }
+    }
+
+    /// frankenscipy-c4oxk item 1. `UnivariateSpline::new(s > 0)` fitted a penalized spline on
+    /// the interpolation knots; scipy runs FITPACK curfit (`fpcurf0` with nest = max(m//2, 8),
+    /// then `_reset_nest` when that fills up). scipy 1.17.1, live, `UnivariateSpline(x, y,
+    /// s=s)`:
+    /// - `curfit_sine24`, s=0.1 (nest 12 fills up, continued with nest 28): get_knots() =
+    ///   [0, 3, 3.5, 4, 4.5, 6, 7, 7.5, 8, 8.5, 9, 10, 10.5, 11.5], get_residual() =
+    ///   0.10003489826224023, get_coeffs()[:3] = -0.004006158834650042, 1.3375420814153234,
+    ///   0.8734820894691075, values at 0.25, 3.25, 6.5, 11.25 as splrep's above.
+    /// - s=3.0: get_knots() = [0, 3, 6, 9, 11.5], residual 2.999495266348722, values
+    ///   0.4421667033086317, -0.19954718649280828, -0.019487952202159195, -1.1983794652479245.
+    /// - `curfit_step16`, s=0.01 (nest 8 fills up): get_knots() = [0, 2, 4, 5, 6, 8, 9, 10,
+    ///   12, 15], residual 0.010000159969841145, values at 0.5, 4.5, 8.25, 14.5 =
+    ///   0.0019870874255634536, 0.04145359650636566, 1.0092335645545454, 0.9867487034150524.
+    /// - s=0.5: the least-squares cubic, get_knots() = [0, 15], residual 0.3325821462593133.
+    /// - ties with s > 0 are accepted: x = [0, 1, 1, 2, 3, 4, 4, 5, 6, 7], s=0.05 gives
+    ///   get_knots() = [0, 2, 4, 7], residual 0.04997761218331589; s = 0 raises "x must be
+    ///   strictly increasing if s = 0".
+    /// - x = 0..25 with y = 0 except y[10] = 1, s=0.1: get_knots() = [0, 3, 6, 8, 9, 10, 11,
+    ///   12, 24], residual 0.0999726418025223, values at 2.5, 10, 17.5 =
+    ///   -0.007510771062051604, 0.7884760377579613, 0.005040255565192963. (`splrep` with k=1
+    ///   on the same data reads memory FITPACK never initialised: scipy returns garbage knots
+    ///   that change from run to run, or crashes; fsci refuses.)
+    ///
+    /// Must-not-change: s = 0 interpolates, values at 0.25, 3.25, 6.5, 11.25 as splrep's.
+    #[test]
+    fn univariate_spline_smoothing_matches_scipy_curfit() {
+        let (x, y) = curfit_sine24();
+        let q = [0.25, 3.25, 6.5, 11.25];
+        let spl = UnivariateSpline::new(&x, &y, 0.1).expect("scipy fits");
+        assert_eq!(
+            spl.get_knots(),
+            [
+                0.0, 3.0, 3.5, 4.0, 4.5, 6.0, 7.0, 7.5, 8.0, 8.5, 9.0, 10.0, 10.5, 11.5
+            ]
+        );
+        assert_close_rel(&[spl.get_residual()], &[0.10003489826224023], "residual");
+        assert_close_rel(
+            &spl.get_coeffs()[..3],
+            &[
+                -0.004006158834650042,
+                1.3375420814153234,
+                0.8734820894691075,
+            ],
+            "coeffs",
+        );
+        assert_close_rel(
+            &spl.eval_many(&q),
+            &[
+                0.2959405241472342,
+                -0.024104818889400713,
+                0.17471482627926158,
+                -1.0792936551346304,
+            ],
+            "s=0.1 values",
+        );
+        let spl = UnivariateSpline::new(&x, &y, 3.0).expect("scipy fits");
+        assert_eq!(spl.get_knots(), [0.0, 3.0, 6.0, 9.0, 11.5]);
+        assert_close_rel(&[spl.get_residual()], &[2.999495266348722], "residual");
+        assert_close_rel(
+            &spl.eval_many(&q),
+            &[
+                0.4421667033086317,
+                -0.19954718649280828,
+                -0.019487952202159195,
+                -1.1983794652479245,
+            ],
+            "s=3 values",
+        );
+
+        let (x2, y2) = curfit_step16();
+        let spl = UnivariateSpline::new(&x2, &y2, 0.01).expect("scipy fits");
+        assert_eq!(
+            spl.get_knots(),
+            [0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0, 12.0, 15.0]
+        );
+        assert_close_rel(&[spl.get_residual()], &[0.010000159969841145], "residual");
+        assert_close_rel(
+            &spl.eval_many(&[0.5, 4.5, 8.25, 14.5]),
+            &[
+                0.0019870874255634536,
+                0.04145359650636566,
+                1.0092335645545454,
+                0.9867487034150524,
+            ],
+            "step16 values",
+        );
+        let spl = UnivariateSpline::new(&x2, &y2, 0.5).expect("scipy fits");
+        assert_eq!(spl.get_knots(), [0.0, 15.0]);
+        assert_close_rel(&[spl.get_residual()], &[0.3325821462593133], "residual");
+
+        let xt = [0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0, 5.0, 6.0, 7.0];
+        let yt = [0.0, 0.8, 1.0, 0.9, 0.1, -0.7, -0.8, -1.0, -0.3, 0.6];
+        let spl = UnivariateSpline::new(&xt, &yt, 0.05).expect("scipy accepts ties for s > 0");
+        assert_eq!(spl.get_knots(), [0.0, 2.0, 4.0, 7.0]);
+        assert_close_rel(&[spl.get_residual()], &[0.04997761218331589], "residual");
+        assert!(matches!(
+            UnivariateSpline::new(&xt, &yt, 0.0),
+            Err(InterpError::UnsortedX)
+        ));
+
+        let xs: Vec<f64> = (0..25).map(f64::from).collect();
+        let mut ys = vec![0.0; 25];
+        ys[10] = 1.0;
+        let spl = UnivariateSpline::new(&xs, &ys, 0.1).expect("scipy fits");
+        assert_eq!(
+            spl.get_knots(),
+            [0.0, 3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 24.0]
+        );
+        assert_close_rel(&[spl.get_residual()], &[0.0999726418025223], "residual");
+        assert_close_rel(
+            &spl.eval_many(&[2.5, 10.0, 17.5]),
+            &[
+                -0.007510771062051604,
+                0.7884760377579613,
+                0.005040255565192963,
+            ],
+            "spike values",
+        );
+        // scipy reads uninitialised memory here; fsci refuses.
+        let refused = splrep(&xs, &ys, 1, 0.1);
+        assert!(
+            matches!(
+                &refused,
+                Err(InterpError::InvalidArgument { detail })
+                    if detail.starts_with("curfit found no knot interval")
+            ),
+            "{refused:?}"
+        );
+
+        // Must-not-change: s = 0 still interpolates.
+        let spl = UnivariateSpline::new(&x, &y, 0.0).expect("interpolates");
+        let want = [
+            0.2909279120106988,
+            0.04108775810897159,
+            0.07600000000000001,
+            -1.173388487785626,
+        ];
+        for (g, w) in spl.eval_many(&q).iter().zip(want) {
+            assert!(
+                (g - w).abs() < 1e-10,
+                "UnivariateSpline s=0: {g} vs scipy {w}"
+            );
+        }
+        assert!(spl.get_residual() < 1e-20, "{}", spl.get_residual());
     }
 
     // ── RBF Interpolator tests ───────────────────────────────────────
