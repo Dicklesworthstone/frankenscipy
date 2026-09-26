@@ -242,7 +242,6 @@ where
 
     let mut f_best = f0;
     let mut x_best = denormalize(&c0);
-    let mut best_rect_idx = 0;
 
     let mut rectangles: Vec<HyperRectangle> = Vec::with_capacity(maxfun.min(100_000));
 
@@ -329,6 +328,11 @@ where
     };
     rect0.d = rect0.side_length_measure(options.locally_biased, &pow3_inv);
     rectangles.push(rect0);
+    // The centre holds `f0`, so it is the best rectangle until a sample beats it, as SciPy's
+    // `minpos` is. The scan below re-points this at the best rectangle whenever `f_best` is
+    // comparable; a NaN `f0` is never beaten (`f < NaN` is false), and the termination tests must
+    // then measure the NaN centre, not whichever rectangle was pushed first (frankenscipy-vfs3g).
+    let mut best_rect_idx = rectangles.len() - 1;
 
     // Update best rectangle index
     for (idx, r) in rectangles.iter().enumerate() {
@@ -479,8 +483,13 @@ where
             }
         }
 
-        // If locally biased, always ensure the overall best rectangle is included
-        if options.locally_biased && !poh.contains(&best_rect_idx) {
+        // If locally biased, always ensure the overall best rectangle is included -- unless its
+        // value is NaN: forcing a NaN centre into every division shrank it to `len_tol` and
+        // reported success, where SciPy runs to `maxfun` (status 1).
+        if options.locally_biased
+            && !rectangles[best_rect_idx].f.is_nan()
+            && !poh.contains(&best_rect_idx)
+        {
             poh.push(best_rect_idx);
         }
 
@@ -702,6 +711,71 @@ mod tests {
         };
         let err = direct(|x| x[0], &bounds, DirectOptions::default()).unwrap_err();
         assert!(matches!(err, OptError::InvalidBounds { .. }));
+    }
+
+    /// frankenscipy-vfs3g: a NaN at the centre is never beaten (`f < NaN` is false), so `f_best`
+    /// stays NaN. The termination tests then measured rectangle 0 instead of the centre, and
+    /// DIRECT-L forced that rectangle into every division, so it shrank to `len_tol` and the run
+    /// reported success (status 5). SciPy 1.17.1, default options:
+    ///
+    /// * NaN at x = 0.5, (x - 0.2)² elsewhere, bounds [(0, 1)]: x [0.5], fun nan, status 1,
+    ///   success False, nfev 1011, nit 34, "Number of function evaluations done is larger than
+    ///   maxfun=1000".
+    /// * NaN at (0, 0), (x0 - 0.3)² + (x1 + 0.4)² elsewhere, bounds [(-1, 1)]²: x [0, 0], fun nan,
+    ///   status 1, success False, nfev 2017, nit 56.
+    #[test]
+    fn test_direct_nan_centre_runs_to_maxfun_like_scipy() -> Result<(), OptError> {
+        let unit = Bounds::new(vec![0.0], vec![1.0])?;
+        let nan_centre = |x: &[f64]| {
+            if x[0] == 0.5 {
+                f64::NAN
+            } else {
+                (x[0] - 0.2).powi(2)
+            }
+        };
+        let res = direct(nan_centre, &unit, DirectOptions::default())?;
+        assert_eq!((res.status, res.success), (1, false), "{res:?}");
+        assert!(
+            res.fun.is_nan() && res.x == [0.5] && res.nfev >= 1000,
+            "{res:?}"
+        );
+        assert_eq!(
+            res.message,
+            "Number of function evaluations done is larger than maxfun=1000"
+        );
+
+        let square = Bounds::new(vec![-1.0, -1.0], vec![1.0, 1.0])?;
+        let nan_centre_2d = |x: &[f64]| {
+            if x == [0.0, 0.0] {
+                f64::NAN
+            } else {
+                (x[0] - 0.3).powi(2) + (x[1] + 0.4).powi(2)
+            }
+        };
+        let res = direct(nan_centre_2d, &square, DirectOptions::default())?;
+        assert_eq!((res.status, res.success), (1, false), "{res:?}");
+        assert!(res.fun.is_nan() && res.x == [0.0, 0.0], "{res:?}");
+
+        // Must not change: a comparable best value -- finite, or -inf at the centre -- still ends
+        // on len_tol (SciPy: status 5 at x ≈ 0.2, and at x = 0.5 with fun -inf).
+        let res = direct(|x| (x[0] - 0.2).powi(2), &unit, DirectOptions::default())?;
+        assert_eq!(
+            (res.status, res.success, res.nfev, res.nit),
+            (5, true, 87, 11),
+            "{res:?}"
+        );
+        assert!((res.x[0] - 0.2).abs() < 1e-5, "{res:?}");
+        let neg_inf_centre = |x: &[f64]| {
+            if x[0] == 0.5 {
+                f64::NEG_INFINITY
+            } else {
+                (x[0] - 0.2).powi(2)
+            }
+        };
+        let res = direct(neg_inf_centre, &unit, DirectOptions::default())?;
+        assert_eq!((res.status, res.success), (5, true), "{res:?}");
+        assert!(res.fun == f64::NEG_INFINITY && res.x == [0.5], "{res:?}");
+        Ok(())
     }
 
     #[test]

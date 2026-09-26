@@ -4943,6 +4943,27 @@ fn dense_spd_solve(m: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
     Some((0..n).map(|i| aug[i][n] / aug[i][i]).collect())
 }
 
+/// Power of two that `lsq_linear` scales `A` and `b` by before forming `AᵀA` and `Aᵀb`.
+///
+/// `AᵀA` squares A's magnitude, so entries past ~1e154 overflow it and entries below ~1e-154
+/// underflow it although the least-squares problem is well posed: A = [[1e160], [-1e160]],
+/// b = [1e160, 0] gave x = [NaN] unbounded and [0] on [0, 1], where SciPy 1.17.1 (lstsq on A,
+/// never AᵀA) returns 0.5 (frankenscipy-vfs3g). Scaling A and b by the same power of two is exact
+/// and leaves the minimiser and the bounds unchanged, so bring max|A| near 1 whenever it lies
+/// outside [2^-500, 2^500]; inside that range the factor is 1 and nothing changes.
+fn lsq_gram_scale(a: &[Vec<f64>]) -> f64 {
+    let safe = 2.0_f64.powi(500);
+    let a_max = a
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if a_max > safe || (a_max > 0.0 && a_max < safe.recip()) {
+        2.0_f64.powi(-(a_max.log2().round() as i32).clamp(-1000, 1000))
+    } else {
+        1.0
+    }
+}
+
 /// Solve the bound-constrained linear least-squares problem
 /// `min ‖A·x − b‖²` subject to `lb ≤ x ≤ ub`, matching
 /// `scipy.optimize.lsq_linear(A, b, bounds=(lb, ub), method='bvls')`.
@@ -4994,12 +5015,18 @@ pub fn lsq_linear(a: &[Vec<f64>], b: &[f64], lb: &[f64], ub: &[f64]) -> Result<V
     // (a cache miss per element, O(n²·m) of them — the dominant cost for this routine). ~1e-13
     // reassociation only; lsq_linear's bounded LS has a unique minimizer (full column rank), so
     // the optimum is unchanged (the Gram only feeds the subproblem solves and the KKT gradient).
-    let a_flat: Vec<f64> = a.iter().flat_map(|row| row.iter().copied()).collect();
+    // A and b enter scaled by `lsq_gram_scale(a)`, which is exactly 1 unless |A| would overflow
+    // or underflow AᵀA.
+    let scale = lsq_gram_scale(a);
+    let a_flat: Vec<f64> = a
+        .iter()
+        .flat_map(|row| row.iter().map(move |&value| value * scale))
+        .collect();
     let mut gram = vec![0.0_f64; n * n]; // contiguous row-major (full symmetric); feeds nnls_chol_*
     let mut atb = vec![0.0_f64; n];
     for i in 0..m {
         let ai = &a_flat[i * n..i * n + n];
-        let bi = b[i];
+        let bi = b[i] * scale;
         for j1 in 0..n {
             let v1 = ai[j1];
             let grow = &mut gram[j1 * n..j1 * n + n];
@@ -6688,6 +6715,51 @@ mod tests {
         let err =
             lsq_linear(&a, &b, &[f64::NAN, 0.0], &[1.0, 3.0]).expect_err("NaN bound should fail");
         assert!(matches!(err, crate::OptError::InvalidBounds { .. }));
+    }
+
+    /// frankenscipy-vfs3g: `lsq_linear` formed AᵀA from A as given, so A = [[1e160], [-1e160]]
+    /// overflowed it and x came back [NaN] unbounded and [0] on [0, 1]. SciPy 1.17.1 (bvls and
+    /// trf, both through lstsq on A), b = [1e160, 0]: x = 0.5 (status 3) unbounded and on [0, 1];
+    /// bvls x = 0.2 on (-inf, 0.2]. The mirror A = [[1e-170], [-1e-170]], b = [1e-170, 0]
+    /// underflowed AᵀA to 0 (x = [0]); SciPy: 0.49999999999999994. Two columns,
+    /// A = [[1e160, 0], [-1e160, 1e160], [0, 2e160]], b = [1e160, 0, 3e160]: SciPy
+    /// [1.2222222222222225, 1.4444444444444449] unbounded, bvls [0.3, 1.0] on [0, 0.3]×[0, 1].
+    #[test]
+    fn lsq_linear_scales_an_overflowing_gram_like_scipy() -> Result<(), crate::OptError> {
+        use crate::lsq_linear;
+        let inf = f64::INFINITY;
+        let close = |got: &[f64], want: &[f64]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 1e-15)
+        };
+        let huge = [vec![1.0e160], vec![-1.0e160]];
+        for (lb, ub, want) in [(-inf, inf, 0.5), (0.0, 1.0, 0.5), (-inf, 0.2, 0.2)] {
+            let x = lsq_linear(&huge, &[1.0e160, 0.0], &[lb], &[ub])?;
+            assert!(
+                close(&x, &[want]),
+                "bounds [{lb}, {ub}]: {x:?}, SciPy {want}"
+            );
+        }
+        let tiny = [vec![1.0e-170], vec![-1.0e-170]];
+        let x = lsq_linear(&tiny, &[1.0e-170, 0.0], &[0.0], &[1.0])?;
+        assert!(close(&x, &[0.49999999999999994]), "{x:?}");
+        let two = [
+            vec![1.0e160, 0.0],
+            vec![-1.0e160, 1.0e160],
+            vec![0.0, 2.0e160],
+        ];
+        let b2 = [1.0e160, 0.0, 3.0e160];
+        let x = lsq_linear(&two, &b2, &[-inf, -inf], &[inf, inf])?;
+        assert!(
+            close(&x, &[1.2222222222222225, 1.4444444444444449]),
+            "{x:?}"
+        );
+        let x = lsq_linear(&two, &b2, &[0.0, 0.0], &[0.3, 1.0])?;
+        assert!(close(&x, &[0.3, 1.0]), "{x:?}");
+
+        // Must not change: at unit scale A enters as given (SciPy 0.4999999999999998).
+        let x = lsq_linear(&[vec![1.0], vec![-1.0]], &[1.0, 0.0], &[-inf], &[inf])?;
+        assert!(close(&x, &[0.4999999999999998]), "{x:?}");
+        Ok(())
     }
 
     #[test]

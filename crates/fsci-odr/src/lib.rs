@@ -540,6 +540,7 @@ impl ODR {
                 cost: sr.cost,
                 success: sr.success,
                 message: sr.message,
+                info: sr.info,
                 nfev: sr.nfev,
                 njev: sr.njev,
                 nit: sr.nit,
@@ -557,6 +558,7 @@ impl ODR {
                 cost: lr.cost,
                 success: lr.success,
                 message: lr.message,
+                info: lr.info,
                 nfev: lr.nfev,
                 njev: lr.njev,
                 nit: lr.nit,
@@ -592,12 +594,23 @@ impl ODR {
         let sum_square_delta = weighted_sum_square(&delta, &self.data.wd);
         let sum_square = sum_square_eps + sum_square_delta;
         let dof = y.len().saturating_sub(beta.len()).max(1);
-        let res_var = sum_square / dof as f64;
-        let cov_beta = match &result.cov {
-            CovSource::Dense(jac) => {
-                covariance_from_jacobian(jac, beta.len(), &free_beta_indices, res_var)
+        // ODRPACK never reaches its covariance step (DODVCV) after a numerical error, so SciPy
+        // reports res_var, cov_beta and sd_beta as zeros there.
+        let covariance_skipped = result.info == ODRPACK_NUMERICAL_ERROR;
+        let res_var = if covariance_skipped {
+            0.0
+        } else {
+            sum_square / dof as f64
+        };
+        let cov_beta = if covariance_skipped {
+            vec![vec![0.0; beta.len()]; beta.len()]
+        } else {
+            match &result.cov {
+                CovSource::Dense(jac) => {
+                    covariance_from_jacobian(jac, beta.len(), &free_beta_indices, res_var)
+                }
+                CovSource::Struct(jac) => ctx.covariance_beta(jac, beta.len(), res_var),
             }
-            CovSource::Struct(jac) => ctx.covariance_beta(jac, beta.len(), res_var),
         };
         let sd_beta = cov_beta
             .iter()
@@ -619,7 +632,7 @@ impl ODR {
             sum_square_eps,
             inv_condnum,
             rel_error: result.cost.abs() * f64::EPSILON,
-            info: if result.success { 1 } else { 4 },
+            info: result.info,
             stopreason: vec![result.message],
             nfev: result.nfev,
             njev: result.njev,
@@ -1063,6 +1076,8 @@ struct LocalLeastSquaresResult {
     cost: f64,
     success: bool,
     message: String,
+    /// ODRPACK's `info`: 1 converged, 4 iteration limit, [`ODRPACK_NUMERICAL_ERROR`].
+    info: i32,
     nfev: usize,
     njev: usize,
     nit: usize,
@@ -1106,13 +1121,29 @@ where
     let mut njev = 1usize;
     for nit in 0..options.maxit {
         let gradient = jt_residual(&jac, &r);
-        if gradient_cosine(&gradient, &column_norms(&jac), &r) <= options.sstol {
+        let cosine = gradient_cosine(&gradient, &column_norms(&jac), &r);
+        if cosine.is_nan() {
+            return Ok(LocalLeastSquaresResult {
+                x,
+                cost,
+                // status: ‖r‖, a column norm or Jᵀr overflowed (ODRPACK's info 60000)
+                success: false,
+                message: String::from(NUMERICAL_ERROR_STOPREASON),
+                info: ODRPACK_NUMERICAL_ERROR,
+                nfev,
+                njev,
+                nit,
+                jac,
+            });
+        }
+        if cosine <= options.sstol {
             return Ok(LocalLeastSquaresResult {
                 x,
                 cost,
                 // status: max_j |cos(r, J_j)| <= sstol (MINPACK's scale-free gtol test)
                 success: true,
                 message: String::from("gradient tolerance reached"),
+                info: 1,
                 nfev,
                 njev,
                 nit,
@@ -1162,6 +1193,7 @@ where
                     // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
                     success: true,
                     message: String::from("parameter tolerance reached"),
+                    info: 1,
                     nfev,
                     njev,
                     nit,
@@ -1191,6 +1223,7 @@ where
                         // status: accepted step with (SS_old - SS_new)/SS_old <= sstol
                         success: true,
                         message: String::from("sum-of-squares tolerance reached"),
+                        info: 1,
                         nfev,
                         njev,
                         nit: nit + 1,
@@ -1210,6 +1243,7 @@ where
         cost,
         success: false,
         message: String::from("maximum iterations reached"),
+        info: 4,
         nfev,
         njev,
         nit: options.maxit,
@@ -1266,6 +1300,7 @@ struct StructResult {
     cost: f64,
     success: bool,
     message: String,
+    info: i32,
     nfev: usize,
     njev: usize,
     nit: usize,
@@ -1668,13 +1703,29 @@ where
     nfev += ctx.jac_evals();
     let mut njev = 1usize;
     for nit in 0..options.maxit {
-        if ctx.gradient_cosine(&jac, &r) <= options.sstol {
+        let cosine = ctx.gradient_cosine(&jac, &r);
+        if cosine.is_nan() {
+            return Ok(StructResult {
+                x,
+                cost,
+                // status: ‖r‖, a column norm or Jᵀr overflowed (ODRPACK's info 60000)
+                success: false,
+                message: String::from(NUMERICAL_ERROR_STOPREASON),
+                info: ODRPACK_NUMERICAL_ERROR,
+                nfev,
+                njev,
+                nit,
+                jac,
+            });
+        }
+        if cosine <= options.sstol {
             return Ok(StructResult {
                 x,
                 cost,
                 // status: max_j |cos(r, J_j)| <= sstol (structured MINPACK gtol test)
                 success: true,
                 message: String::from("gradient tolerance reached"),
+                info: 1,
                 nfev,
                 njev,
                 nit,
@@ -1716,6 +1767,7 @@ where
                     // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
                     success: true,
                     message: String::from("parameter tolerance reached"),
+                    info: 1,
                     nfev,
                     njev,
                     nit,
@@ -1744,6 +1796,7 @@ where
                         // status: accepted step with (SS_old - SS_new)/SS_old <= sstol
                         success: true,
                         message: String::from("sum-of-squares tolerance reached"),
+                        info: 1,
                         nfev,
                         njev,
                         nit: nit + 1,
@@ -1763,6 +1816,7 @@ where
         cost,
         success: false,
         message: String::from("maximum iterations reached"),
+        info: 4,
         nfev,
         njev,
         nit: options.maxit,
@@ -1777,6 +1831,7 @@ struct SolvedFit {
     cost: f64,
     success: bool,
     message: String,
+    info: i32,
     nfev: usize,
     njev: usize,
     nit: usize,
@@ -2002,13 +2057,26 @@ fn gaussian_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f6
 // the step so parameters near 1e-7 "converged" at once, and the SS change divided by
 // max(cost, 1) was absolute whenever cost < 1. Each is now invariant to rescaling the data.
 
+/// ODRPACK's `info` after a numerical error, which SciPy reports as "Numerical error detected".
+/// ODRPACK adds a rank digit (60010, 60020) that this solver does not compute.
+const ODRPACK_NUMERICAL_ERROR: i32 = 60_000;
+const NUMERICAL_ERROR_STOPREASON: &str = "Numerical error detected";
+
 /// MINPACK's scale-free `gtol` measure: the largest `|cos|` of the angle between the residual
 /// and a Jacobian column, `max_j |(Jᵀr)_j| / (‖r‖·‖J_j‖)`. Zero-norm columns are skipped; an
 /// exact fit (`r = 0`) is optimal.
+///
+/// NaN when the measure cannot be formed: once `‖r‖²`, a column's `‖J_j‖²` or `(Jᵀr)_j`
+/// overflows, every cosine is `g/∞ = 0` or `∞/∞ = NaN` (which `f64::max` drops), and the test
+/// read as converged at β0. SciPy's ODRPACK stops those fits with info 60000/60010
+/// (frankenscipy-vfs3g); the callers report the same status on a NaN.
 fn gradient_cosine(gradient: &[f64], column_norms: &[f64], residuals: &[f64]) -> f64 {
     let r_norm = dot(residuals, residuals).sqrt();
     if r_norm == 0.0 {
         return 0.0;
+    }
+    if !r_norm.is_finite() || gradient.iter().chain(column_norms).any(|v| !v.is_finite()) {
+        return f64::NAN;
     }
     gradient
         .iter()
@@ -2669,6 +2737,83 @@ mod tests {
         // Should fit: beta[0]=a≈2, beta[1]=b≈1
         assert_close(output.beta[0], 2.0, 0.1);
         assert_close(output.beta[1], 1.0, 0.1);
+        Ok(())
+    }
+
+    /// frankenscipy-vfs3g: once `‖r‖²` (or a column's `‖J_j‖²`) overflowed, every gradient cosine
+    /// was `g/∞ = 0` or `∞/∞ = NaN` (dropped by `f64::max`), so the fit reported "gradient
+    /// tolerance reached" (info 1) at β0. SciPy 1.17.1, unilinear, β0 = [1, 1]:
+    ///
+    /// * x = [1..5]·1e160, y = 2x + 1: info 60010, stopreason ["Numerical error detected"],
+    ///   beta [2.0000000224401786, 1.0], sum_square inf, res_var 0, sd_beta [0, 0], cov_beta 0.
+    /// * x = [1..5], y = [1..5]·1e155 (no NaN anywhere; only `‖r‖²` overflows): info 60000, the
+    ///   same stopreason, beta [9.999999999999998e154, 1.4557439427618822e140], sum_square inf,
+    ///   res_var 0, sd_beta [0, 0], cov_beta 0.
+    ///
+    /// ODRPACK skips its covariance step after the error, hence the zeros. fsci stops before its
+    /// first step, so beta stays β0 (ODRPACK's partial trust-region iterate is not reproduced),
+    /// and it computes no rank digit, so 60010 reads 60000.
+    #[test]
+    fn odr_overflowed_residual_norm_is_a_numerical_error_like_scipy() -> Result<(), OdrError> {
+        let base = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let huge_x: Vec<f64> = base.iter().map(|v| v * 1.0e160).collect();
+        let huge_x_y = huge_x.iter().map(|v| 2.0 * v + 1.0).collect();
+        let huge_y = base.iter().map(|v| v * 1.0e155).collect();
+        for (case, x, y) in [
+            ("x ~ 1e160", huge_x, huge_x_y),
+            ("y ~ 1e155", base.to_vec(), huge_y),
+        ] {
+            let odr = ODR::new(Data::new(x, y)?, unilinear(), vec![1.0, 1.0])?;
+            for (path, out) in [
+                ("structured", odr.run()?),
+                ("dense", odr.run_dense_reference()?),
+            ] {
+                assert_eq!(out.info, 60_000, "{case}, {path}: {:?}", out.stopreason);
+                assert_eq!(
+                    out.stopreason,
+                    ["Numerical error detected"],
+                    "{case}, {path}"
+                );
+                assert!(!out.success, "{case}, {path}");
+                assert_eq!(out.beta, [1.0, 1.0], "{case}, {path}");
+                assert_eq!(out.sum_square, f64::INFINITY, "{case}, {path}");
+                assert_eq!(out.res_var, 0.0, "{case}, {path}");
+                assert_eq!(out.sd_beta, [0.0, 0.0], "{case}, {path}");
+                assert_eq!(out.cov_beta, [[0.0, 0.0], [0.0, 0.0]], "{case}, {path}");
+            }
+        }
+
+        // Must not change: `‖r‖²` finite. SciPy 1.17.1 converges on this data (info 1, beta
+        // [2.00192013931748, 0.014239795736218601]) and on it scaled by 1e150 (info 11: a rank
+        // note plus sum-of-squares convergence), never with a numerical error.
+        let noisy = [2.1, 3.9, 6.1, 7.9, 10.1];
+        let unit = ODR::new(
+            Data::new(base.to_vec(), noisy.to_vec())?,
+            unilinear(),
+            vec![1.0, 0.0],
+        )?;
+        let large = ODR::new(
+            Data::new(
+                base.iter().map(|v| v * 1.0e150).collect(),
+                noisy.iter().map(|v| v * 1.0e150).collect(),
+            )?,
+            unilinear(),
+            vec![1.0, 0.0],
+        )?;
+        for (path, out) in [
+            ("structured", unit.run()?),
+            ("dense", unit.run_dense_reference()?),
+        ] {
+            assert!(out.success && out.info == 1, "{path}: {out:?}");
+            assert_close(out.beta[0], 2.001_920_139_317_48, 1.0e-6);
+            assert_close(out.beta[1], 0.014_239_795_736_218_601, 1.0e-5);
+        }
+        for (path, out) in [
+            ("structured 1e150", large.run()?),
+            ("dense 1e150", large.run_dense_reference()?),
+        ] {
+            assert!(out.success && out.info == 1, "{path}: {out:?}");
+        }
         Ok(())
     }
 }
