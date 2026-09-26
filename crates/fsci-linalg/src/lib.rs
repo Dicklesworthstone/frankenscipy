@@ -31231,6 +31231,380 @@ mod tests {
         );
     }
 
+    /// frankenscipy-7tb8d.14, acceptance item 2: on a corpus of rcond 1e-6..1e-10 matrices
+    /// (Hilbert, Vandermonde, random with prescribed condition number), the forward error of the
+    /// action Strict `solve` chooses is no worse than LU's, against the EXACT solution.
+    ///
+    /// Every system is exact in f64, so no reference solver's error enters the comparison: `A` is
+    /// an integer matrix, `x_true` the integer vector `(-1)^i (1 + 3i mod 7)` (‖x_true‖∞ = 7),
+    /// and `b = A·x_true` is formed in i128 with every entry of `A` and `b` below 2^53
+    /// (asserted), so `x_true` is the exact solution of the f64 system. Forward error is
+    /// ‖x − x_true‖∞ / ‖x_true‖∞; each `x_i − x_true_i` is exact (Sterbenz).
+    /// - Hilbert: `lcm(1..2n−1)·H_n`, n = 5..8 (n = 8 is rcond 2.95e-11, just past the band).
+    /// - Vandermonde: `V[i][j] = t_i^j` on consecutive integer nodes.
+    /// - randsvd: `A = Q1·diag(σ)·Q2ᵀ` scaled to integers, `σ_k = r^(n−1−k)`, so cond₂ = r^(n−1)
+    ///   exactly. `Q = P0·H1·P1·…·Hm·Pm` with random signed permutations `P` and Householder
+    ///   reflectors `H = I − v·vᵀ/2`, `v ∈ {0, ±1}ⁿ` with four nonzeros, so `2^m·Q` is an integer
+    ///   matrix (orthogonality asserted). Non-symmetric (`Q2 ≠ Q1`, the LU route) and SPD
+    ///   (`Q2 = Q1`, the Cholesky route) variants.
+    ///
+    /// Each matrix's weighted sum `Σ a_ij·(i·n + j + 1)` is pinned, so the matrices here are the
+    /// ones SciPy was measured on below.
+    ///
+    /// Arms: Strict `solve` (the CASP action, from its certificate; n ≤ 12 is below every
+    /// fast-path gate, so the portfolio decides) and `solve_with_action(DirectLU)` (nalgebra's
+    /// partial-pivoting LU, the factorization the portfolio's LU action runs at these sizes).
+    /// Non-symmetric input must be answered by that same LU, bit for bit; exactly symmetric input
+    /// by Cholesky, SciPy's `assume_a=None` route (2342adf05).
+    ///
+    /// The assertion is `chosen ≤ max(LU·(1 + SLACK), FLOOR)` per matrix, with `SLACK = 0`: both
+    /// arms are deterministic f64 computations in one process, so there is no noise for a slack
+    /// to absorb, and the ratio is exactly 1 wherever the chosen action is LU. `FLOOR = ε`, one
+    /// ulp of relative error in the largest component; it never binds here. The comparator's
+    /// two arms are checked on every row: LU against itself passes, and LU with its worst
+    /// component's error doubled fails.
+    ///
+    /// fsci's errors below were PREDICTED before this test first ran, by a bit-level Python
+    /// transliteration of `cholesky_lower_simd` + `cho_solve_lower_flat` and nalgebra 0.35's
+    /// `LU::new` + `LU::solve`. On unscaled Hilbert(6)·ones it reproduces the two components of
+    /// fsci's Cholesky answer recorded on frankenscipy-pvghr to every printed digit, and fsci's
+    /// recorded LU error there (6.6e-7). The test prints the measured table. rcond₁ is exact
+    /// (rational inverse):
+    ///
+    /// ```text
+    /// matrix              n  rcond1    chosen    chosen err  LU err    chosen/LU
+    /// hilbert5*2520       5  1.06e-06  Cholesky  2.02e-12    2.47e-12  0.82
+    /// hilbert6*27720      6  3.44e-08  Cholesky  1.01e-10    3.25e-11  3.12
+    /// hilbert7*360360     7  1.02e-09  Cholesky  4.57e-09    6.34e-10  7.21
+    /// hilbert8*360360     8  2.95e-11  Cholesky  5.48e-08    1.00e-08  5.48
+    /// vander[1..=6]       6  7.81e-07  LU        8.74e-12    8.74e-12  1.00
+    /// vander[1..=7]       7  2.42e-08  LU        2.71e-11    2.71e-11  1.00
+    /// vander[0..=7]       8  1.19e-08  LU        1.68e-10    1.68e-10  1.00
+    /// vander[-4..=5]     10  1.12e-07  LU        6.87e-11    6.87e-11  1.00
+    /// vander[1..=8]       8  6.02e-10  LU        8.70e-10    8.70e-10  1.00
+    /// vander[0..=8]       9  3.22e-10  LU        6.40e-12    6.40e-12  1.00
+    /// randsvd_gen_n8_r7   8  5.54e-07  LU        2.00e-11    2.00e-11  1.00
+    /// randsvd_gen_n8_r13  8  8.29e-09  LU        9.20e-10    9.20e-10  1.00
+    /// randsvd_gen_n8_r23  8  2.80e-10  LU        2.18e-10    2.18e-10  1.00
+    /// randsvd_spd_n8_r7   8  8.96e-07  Cholesky  1.07e-11    3.19e-13  33.52
+    /// randsvd_spd_n8_r13  8  8.38e-09  Cholesky  5.97e-10    1.90e-10  3.14
+    /// randsvd_spd_n8_r23  8  1.94e-10  Cholesky  1.01e-09    1.33e-10  7.60
+    /// randsvd_gen_n12_r4 12  1.27e-07  LU        1.16e-11    1.16e-11  1.00
+    /// randsvd_gen_n12_r7 12  1.93e-10  LU        6.06e-09    6.06e-09  1.00
+    /// randsvd_spd_n12_r4 12  1.21e-07  Cholesky  6.03e-11    6.09e-11  0.99
+    /// randsvd_spd_n12_r7 12  2.54e-10  Cholesky  1.58e-08    1.81e-08  0.87
+    /// ```
+    ///
+    /// Predicted verdict: the 11 non-symmetric rows pass (the chosen action IS LU), and 6 of the
+    /// 9 symmetric rows fail, by 3.1x to 33.5x, every one of them inside cond₂·u. Not hidden by
+    /// a slack: whether Cholesky must beat LU per matrix is the owner decision the bead records.
+    ///
+    /// SciPy 1.17.1 / numpy 2.4.3 (`~/.local/bin/python3.13`) on the same matrices: `solve`
+    /// default (on the symmetric rows bit-identical to `assume_a='pos'`, elsewhere to 'gen') and
+    /// `assume_a='gen'`, on the host kernel (threadpoolctl: libscipy_openblas `Haswell`,
+    /// `OPENBLAS_CORETYPE` unset), and the range over `OPENBLAS_CORETYPE` = Katmai, Nehalem,
+    /// Sandybridge, Haswell (Prescott runs Katmai's kernel and Zen Haswell's; SkylakeX cannot run
+    /// on this host, frankenscipy-pvghr). SciPy's own default is worse than its own LU on 5 of
+    /// the 9 symmetric rows on Haswell (Katmai 5, Nehalem 4, Sandybridge 3).
+    ///
+    /// ```text
+    /// matrix              default   gen       default, 4 kernels  gen, 4 kernels
+    /// hilbert5*2520      1.13e-12  4.37e-12  1.13e-12..4.64e-12  4.37e-12..4.37e-12
+    /// hilbert6*27720     1.58e-11  8.22e-11  1.58e-11..5.38e-11  5.99e-11..8.22e-11
+    /// hilbert7*360360    6.67e-09  1.30e-09  1.77e-09..6.67e-09  6.99e-10..1.92e-09
+    /// hilbert8*360360    1.99e-07  9.99e-10  4.43e-08..1.99e-07  9.99e-10..5.63e-08
+    /// vander[1..=6]      8.70e-12  8.70e-12  8.65e-12..8.70e-12  8.65e-12..8.70e-12
+    /// vander[1..=7]      7.99e-11  7.99e-11  7.99e-11..3.42e-10  7.99e-11..3.42e-10
+    /// vander[0..=7]      2.96e-10  2.96e-10  7.45e-11..2.97e-10  7.45e-11..2.97e-10
+    /// vander[-4..=5]     3.76e-11  3.76e-11  3.76e-11..2.30e-10  3.76e-11..2.30e-10
+    /// vander[1..=8]      2.49e-11  2.49e-11  2.49e-11..9.00e-10  2.49e-11..9.00e-10
+    /// vander[0..=8]      1.66e-08  1.66e-08  1.61e-08..1.66e-08  1.61e-08..1.66e-08
+    /// randsvd_gen_n8_r7  1.26e-11  1.26e-11  1.26e-11..1.69e-11  1.26e-11..1.69e-11
+    /// randsvd_gen_n8_r13 1.21e-09  1.21e-09  1.04e-09..1.43e-09  1.04e-09..1.43e-09
+    /// randsvd_gen_n8_r23 1.49e-08  1.49e-08  1.04e-09..1.49e-08  1.04e-09..1.49e-08
+    /// randsvd_spd_n8_r7  2.42e-12  3.26e-12  1.39e-12..4.32e-12  8.75e-13..3.26e-12
+    /// randsvd_spd_n8_r13 3.01e-10  2.48e-10  1.06e-10..3.10e-10  5.94e-11..5.10e-10
+    /// randsvd_spd_n8_r23 1.41e-10  1.16e-10  1.41e-10..2.01e-10  1.16e-10..2.04e-10
+    /// randsvd_gen_n12_r4 4.62e-12  4.62e-12  4.62e-12..5.24e-11  4.62e-12..5.24e-11
+    /// randsvd_gen_n12_r7 2.29e-09  2.29e-09  1.46e-09..1.99e-08  1.46e-09..1.99e-08
+    /// randsvd_spd_n12_r4 6.66e-11  4.00e-11  3.77e-11..8.08e-11  1.87e-11..4.48e-11
+    /// randsvd_spd_n12_r7 4.26e-09  1.79e-08  3.36e-09..1.87e-08  1.02e-08..2.48e-08
+    /// ```
+    #[test]
+    #[ignore = "frankenscipy-7tb8d.14: measured RED on vmi1227854 (2026-09-26): Strict solve's \
+                Cholesky route (SciPy's own dispatch for exactly-symmetric input) has a larger \
+                forward error than fsci's LU on 6/20 rows (3.1x-33.5x); SciPy's default is \
+                also worse than its own LU on 5/9 SPD rows. The acceptance criterion needs an \
+                owner decision; run with --ignored to reproduce the table."]
+    fn casp_forward_error_is_no_worse_than_lu_on_a_conditioning_corpus() {
+        /// Relative slack on LU's error; zero, see the doc comment.
+        const SLACK: f64 = 0.0;
+        /// One ulp of relative error in the largest component: "worse" below it is not resolvable.
+        const FLOOR: f64 = f64::EPSILON;
+        const EXACT_IN_F64: i128 = 1 << 53;
+
+        fn gcd(a: i128, b: i128) -> i128 {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        fn matmul_i(a: &[Vec<i128>], b: &[Vec<i128>]) -> Vec<Vec<i128>> {
+            a.iter()
+                .map(|row| {
+                    (0..b[0].len())
+                        .map(|j| row.iter().zip(b).map(|(&x, b_row)| x * b_row[j]).sum())
+                        .collect()
+                })
+                .collect()
+        }
+        fn signed_permutation(rng: &mut TestRng, n: usize) -> Vec<Vec<i128>> {
+            let mut perm: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let j = rng.int(0, i as i64) as usize;
+                perm.swap(i, j);
+            }
+            let mut p = vec![vec![0_i128; n]; n];
+            for (row, &column) in p.iter_mut().zip(&perm) {
+                row[column] = if rng.int(0, 1) == 0 { 1 } else { -1 };
+            }
+            p
+        }
+        /// `2·H` for `H = I − v·vᵀ/2`, `v ∈ {0, ±1}ⁿ` with four nonzeros (vᵀv = 4).
+        fn reflector_times_two(rng: &mut TestRng, n: usize) -> Vec<Vec<i128>> {
+            let mut support: Vec<usize> = Vec::with_capacity(4);
+            while support.len() < 4 {
+                let k = rng.int(0, n as i64 - 1) as usize;
+                if !support.contains(&k) {
+                    support.push(k);
+                }
+            }
+            let mut v = vec![0_i128; n];
+            for &k in &support {
+                v[k] = if rng.int(0, 1) == 0 { 1 } else { -1 };
+            }
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| 2 * i128::from(i == j) - v[i] * v[j])
+                        .collect()
+                })
+                .collect()
+        }
+        /// `2^reflectors·Q` for `Q = P0·H1·P1·…·Hm·Pm`; its Gram matrix must be `4^reflectors·I`.
+        fn orthogonal_times_scale(rng: &mut TestRng, n: usize, reflectors: u32) -> Vec<Vec<i128>> {
+            let mut q = signed_permutation(rng, n);
+            for _ in 0..reflectors {
+                q = matmul_i(&q, &reflector_times_two(rng, n));
+                q = matmul_i(&q, &signed_permutation(rng, n));
+            }
+            let transpose: Vec<Vec<i128>> = (0..n)
+                .map(|j| q.iter().map(|row| row[j]).collect())
+                .collect();
+            let scale_squared = 1_i128 << (2 * reflectors);
+            for (i, row) in matmul_i(&q, &transpose).iter().enumerate() {
+                for (j, &g) in row.iter().enumerate() {
+                    assert_eq!(g, scale_squared * i128::from(i == j), "Q is not orthogonal");
+                }
+            }
+            q
+        }
+
+        // (name, A, pinned Σ a_ij·(i·n + j + 1)).
+        let mut corpus: Vec<(String, Vec<Vec<i128>>, i128)> = Vec::new();
+        for (n, fingerprint) in [
+            (5, 156_460),
+            (6, 2_949_510),
+            (7, 60_660_978),
+            (8, 90_406_820),
+        ] {
+            let scale = (1..2 * n as i128).fold(1, |l, k| l / gcd(l, k) * k);
+            let a: Vec<Vec<i128>> = (0..n)
+                .map(|i| (0..n).map(|j| scale / (i + j + 1) as i128).collect())
+                .collect();
+            corpus.push((format!("hilbert{n}*{scale}"), a, fingerprint));
+        }
+        for (lo, hi, fingerprint) in [
+            (1_i128, 6_i128, 489_656),
+            (1, 7, 9_896_866),
+            (0, 7, 85_714_468),
+            (-4, 5, 274_840_972),
+            (1, 8, 227_405_620),
+            (0, 8, 2_190_560_805),
+        ] {
+            let n = (hi - lo + 1) as u32;
+            let a: Vec<Vec<i128>> = (lo..=hi)
+                .map(|t| (0..n).map(|j| t.pow(j)).collect())
+                .collect();
+            corpus.push((format!("vander[{lo}..={hi}]"), a, fingerprint));
+        }
+        let mut rng = TestRng(0x7B8D_1400_0000_0001);
+        for (n, ratio, symmetric, fingerprint) in [
+            (8, 7_i128, false, -70_352_311_616),
+            (8, 13, false, 4_390_428_176_640),
+            (8, 23, false, 895_392_297_468_800),
+            (8, 7, true, 19_472_150_528),
+            (8, 13, true, 2_149_590_116_864),
+            (8, 23, true, 783_529_406_021_632),
+            (12, 4, false, -21_782_237_250_560),
+            (12, 7, false, -29_799_663_371_660_288),
+            (12, 4, true, 11_400_619_755_264),
+            (12, 7, true, 6_048_275_088_344_064),
+        ] {
+            let reflectors = if n == 8 { 6 } else { 8 };
+            let q1 = orthogonal_times_scale(&mut rng, n, reflectors);
+            let q2 = if symmetric {
+                q1.clone()
+            } else {
+                orthogonal_times_scale(&mut rng, n, reflectors)
+            };
+            let sigma: Vec<i128> = (0..n).map(|k| ratio.pow((n - 1 - k) as u32)).collect();
+            let a: Vec<Vec<i128>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| (0..n).map(|k| q1[i][k] * sigma[k] * q2[j][k]).sum())
+                        .collect()
+                })
+                .collect();
+            let kind = if symmetric { "spd" } else { "gen" };
+            corpus.push((format!("randsvd_{kind}_n{n}_r{ratio}"), a, fingerprint));
+        }
+
+        let no_worse = |chosen: f64, lu: f64| chosen <= (lu * (1.0 + SLACK)).max(FLOOR);
+        let (mut lowest_rcond, mut highest_rcond) = (f64::INFINITY, 0.0_f64);
+        let mut table = String::new();
+        let mut losses = Vec::new();
+        for (name, ai, fingerprint) in &corpus {
+            let n = ai.len();
+            let weighted: i128 = ai
+                .iter()
+                .enumerate()
+                .flat_map(|(i, row)| {
+                    row.iter()
+                        .enumerate()
+                        .map(move |(j, &v)| v * (i * n + j + 1) as i128)
+                })
+                .sum();
+            assert_eq!(
+                weighted, *fingerprint,
+                "{name}: not the matrix SciPy was run on"
+            );
+            let x_true: Vec<i128> = (0..n)
+                .map(|i| (-1_i128).pow(i as u32) * (1 + (3 * i as i128) % 7))
+                .collect();
+            let bi: Vec<i128> = ai
+                .iter()
+                .map(|row| row.iter().zip(&x_true).map(|(&a, &x)| a * x).sum())
+                .collect();
+            assert!(
+                ai.iter()
+                    .flatten()
+                    .chain(&bi)
+                    .all(|v| v.abs() < EXACT_IN_F64),
+                "{name}: A or b is not exact in f64"
+            );
+            let a: Vec<Vec<f64>> = ai
+                .iter()
+                .map(|row| row.iter().map(|&v| v as f64).collect())
+                .collect();
+            let b: Vec<f64> = bi.iter().map(|&v| v as f64).collect();
+            let symmetric = (0..n).all(|i| (0..n).all(|j| ai[i][j] == ai[j][i]));
+            let x_scale = x_true.iter().map(|v| v.abs()).max().expect("n > 0") as f64;
+            let forward_error = |x: &[f64]| {
+                assert!(x.iter().all(|v| v.is_finite()), "{name}: x = {x:?}");
+                x.iter()
+                    .zip(&x_true)
+                    .map(|(xi, &ti)| (xi - ti as f64).abs())
+                    .fold(0.0_f64, f64::max)
+                    / x_scale
+            };
+
+            let chosen = solve(&a, &b, SolveOptions::default()).expect("Strict solve");
+            let certificate = chosen
+                .certificate
+                .as_ref()
+                .expect("the portfolio path certifies its action");
+            let lu = solve_with_action(&a, &b, SolverAction::DirectLU).expect("LU solve");
+            assert!(!certificate.fallback_active, "{name}: fallback");
+            if symmetric {
+                assert_eq!(
+                    certificate.structural_evidence,
+                    StructuralEvidence::Symmetric,
+                    "{name}"
+                );
+                assert_eq!(
+                    certificate.action,
+                    SolverAction::SymmetricFastPath,
+                    "{name}"
+                );
+            } else {
+                assert_eq!(
+                    certificate.structural_evidence,
+                    StructuralEvidence::General,
+                    "{name}"
+                );
+                assert_eq!(certificate.action, SolverAction::DirectLU, "{name}");
+                let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&chosen.x),
+                    bits(&lu.x),
+                    "{name}: Strict's LU is not the LU arm"
+                );
+            }
+            let rcond = certificate.rcond_estimate;
+            assert!(
+                rcond > 1e-13 && rcond < 1e-4,
+                "{name}: rcond estimate {rcond:e} is outside the corpus band"
+            );
+            lowest_rcond = lowest_rcond.min(rcond);
+            highest_rcond = highest_rcond.max(rcond);
+
+            let (chosen_error, lu_error) = (forward_error(&chosen.x), forward_error(&lu.x));
+            // The comparator's two arms: LU against itself is no worse, and LU with its worst
+            // component's error doubled is worse.
+            assert!(
+                lu_error > 2.0 * FLOOR,
+                "{name}: LU is exact, so the comparison cannot resolve anything"
+            );
+            assert!(no_worse(lu_error, lu_error), "{name}: LU against itself");
+            let worst = (0..n)
+                .max_by(|&i, &j| {
+                    let error = |k: usize| (lu.x[k] - x_true[k] as f64).abs();
+                    error(i).total_cmp(&error(j))
+                })
+                .expect("n > 0");
+            let mut doubled = lu.x.clone();
+            let worst_error = doubled[worst] - x_true[worst] as f64;
+            doubled[worst] += worst_error;
+            assert!(
+                !no_worse(forward_error(&doubled), lu_error),
+                "{name}: the comparator does not see a doubled error"
+            );
+
+            // Derived Debug ignores width, so pad the action's name as a String.
+            let action = format!("{:?}", certificate.action);
+            let line = format!(
+                "{name:<22} n={n:<2} rcond_est={rcond:9.3e} {action:<17} \
+                 chosen={chosen_error:9.3e} lu={lu_error:9.3e} chosen/lu={:.2}",
+                chosen_error / lu_error
+            );
+            eprintln!("{line}");
+            table.push_str(&line);
+            table.push('\n');
+            if !no_worse(chosen_error, lu_error) {
+                losses.push(format!("{name} ({:.2}x)", chosen_error / lu_error));
+            }
+        }
+        assert!(
+            lowest_rcond < 1e-9 && highest_rcond > 1e-7,
+            "the corpus does not span the band: rcond estimates {lowest_rcond:e}..{highest_rcond:e}"
+        );
+        assert!(
+            losses.is_empty(),
+            "the chosen action's forward error is worse than LU's on {} of {}: {}\n{table}",
+            losses.len(),
+            corpus.len(),
+            losses.join(", ")
+        );
+    }
+
     /// frankenscipy-7tb8d.6: a certificate is checkable from `(A, b, x)` alone, and the check
     /// rejects an answer the certificate does not describe.
     #[test]
