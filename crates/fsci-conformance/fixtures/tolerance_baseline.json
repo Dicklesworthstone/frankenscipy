@@ -912,6 +912,9 @@
   "diff_sparse_conv_with_mode.rs": {
     "ABS_TOL": 1e-15
   },
+  "diff_sparse_csgraph_directedness.rs": {
+    "DIST_ABS_TOL": 1e-12
+  },
   "diff_sparse_density_frob_inner.rs": {
     "ABS_TOL": 1e-12
   },

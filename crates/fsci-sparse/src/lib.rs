@@ -92,6 +92,7 @@ pub use linalg::{
     CaspMatvecCost,
     CaspPortfolioSolveResult,
     ConnectedComponentsResult,
+    Connection,
     EigsOptions,
     EigsResult,
     ExpmOptions,

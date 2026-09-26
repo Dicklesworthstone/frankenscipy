@@ -11200,8 +11200,9 @@ fn has_empty_structural_row(a: &CsrMatrix) -> bool {
 /// Returns an n×n matrix of shortest distances. Input is a CSR adjacency matrix
 /// where values are edge weights. Missing edges are treated as infinite distance.
 ///
-/// Matches `scipy.sparse.csgraph.floyd_warshall`.
-pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
+/// Matches `scipy.sparse.csgraph.floyd_warshall(graph, directed)`; with `directed = false`
+/// the pair `(i, j)` starts from the smaller of its two stored weights, as in SciPy.
+pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> Vec<Vec<f64>> {
     let shape = graph.shape();
     if shape.rows != shape.cols {
         return vec![];
@@ -11226,6 +11227,18 @@ pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
             // here — negative-cycle detection is `bellman_ford`'s job.
             if j != i {
                 d[i * n + j] = graph.data()[idx];
+            }
+        }
+    }
+    if !directed {
+        // SciPy's `directed=False`: each pair takes the shorter of its two directions.
+        for i in 0..n {
+            for j in i + 1..n {
+                if d[j * n + i] <= d[i * n + j] {
+                    d[i * n + j] = d[j * n + i];
+                } else {
+                    d[j * n + i] = d[i * n + j];
+                }
             }
         }
     }
@@ -11379,11 +11392,25 @@ impl Ord for SpDijkstraState {
     }
 }
 
-pub fn shortest_path(graph: &CsrMatrix, source: usize, target: usize) -> (f64, Vec<usize>) {
+/// Shortest path from `source` to `target` and its length, by Dijkstra. With
+/// `directed = false` an edge can be walked either way (each settled node relaxes its row and
+/// then its column), as `scipy.sparse.csgraph.shortest_path(directed=False)` walks it.
+/// Unreachable or out-of-range endpoints give `(inf, [])`.
+pub fn shortest_path(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+    target: usize,
+) -> (f64, Vec<usize>) {
     let n = graph.shape().rows;
     if source >= n || target >= n {
         return (f64::INFINITY, vec![]);
     }
+    let transpose = if directed || graph.shape().cols != n {
+        None
+    } else {
+        Some(transpose_adjacency(graph))
+    };
 
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
@@ -11416,11 +11443,13 @@ pub fn shortest_path(graph: &CsrMatrix, source: usize, target: usize) -> (f64, V
             break;
         }
 
-        let row_start = graph.indptr()[u];
-        let row_end = graph.indptr()[u + 1];
-        for idx in row_start..row_end {
-            let v = graph.indices()[idx];
-            let w = graph.data()[idx];
+        let row = graph.indptr()[u]..graph.indptr()[u + 1];
+        let own = graph.indices()[row.clone()].iter().zip(&graph.data()[row]);
+        let reverse = transpose.as_ref().map(|t| {
+            let row = t.indptr[u]..t.indptr[u + 1];
+            t.indices[row.clone()].iter().zip(&t.data[row])
+        });
+        for (&v, &w) in own.chain(reverse.into_iter().flatten()) {
             let alt = dist[u] + w;
             if alt < dist[v] {
                 dist[v] = alt;
@@ -13189,88 +13218,110 @@ pub fn degree_sequence(graph: &CsrMatrix) -> Vec<usize> {
         .collect()
 }
 
-/// Find the strongly connected components of a directed graph (Tarjan's algorithm).
+/// Find the strongly connected components of a directed graph, labelled exactly as
+/// `scipy.sparse.csgraph.connected_components(graph, directed=True, connection='strong')`
+/// labels them.
 ///
-/// Returns a vector of component assignments (component index for each node).
+/// Returns the component label of each node. This is SciPy's iterative Pearce algorithm (see
+/// [`pearce_scc`]). It replaced a recursive Tarjan, which numbered components in a different
+/// order and overflowed the stack (aborting the process) on a directed path of 200,000 nodes.
 pub fn strongly_connected_components(graph: &CsrMatrix) -> Vec<usize> {
     let n = graph.shape().rows;
-    let mut index_counter = 0usize;
-    let mut stack = Vec::new();
-    let mut on_stack = vec![false; n];
-    let mut index = vec![usize::MAX; n];
-    let mut lowlink = vec![0usize; n];
-    let mut component = vec![0usize; n];
-    let mut n_components = 0usize;
+    pearce_scc(graph.indptr(), graph.indices(), n).1
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn strongconnect(
-        v: usize,
-        graph: &CsrMatrix,
-        index_counter: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut [bool],
-        index: &mut [usize],
-        lowlink: &mut [usize],
-        component: &mut [usize],
-        n_components: &mut usize,
-    ) {
-        index[v] = *index_counter;
-        lowlink[v] = *index_counter;
-        *index_counter += 1;
-        stack.push(v);
-        on_stack[v] = true;
+/// SciPy's `_connected_components_directed` (`sparse/csgraph/_traversal.pyx`): Pearce's
+/// iterative, O(V + E)-memory variant of Tarjan's algorithm, ported statement by statement.
+/// SciPy saves memory by aliasing two pairs of arrays, and the port keeps that aliasing
+/// because the algorithm relies on it. The DFS stack's forward links share storage with the
+/// component stack `SS` (a node is never on both), and the low-links array becomes the label
+/// array: finished nodes hold labels counting DOWN from `N - 1`, and those never compare below
+/// a live index. Returns `(n_components, labels)` with the labels turned to count up from 0,
+/// as SciPy returns them.
+fn pearce_scc(indptr: &[usize], indices: &[usize], n: usize) -> (usize, Vec<usize>) {
+    const VOID: i64 = -1;
+    const END: i64 = -2;
+    let n_i = n as i64;
+    let mut lowlinks: Vec<i64> = vec![VOID; n];
+    // SciPy's `SS` and `stack_f` are the same array.
+    let mut ss: Vec<i64> = vec![VOID; n];
+    let mut stack_b: Vec<i64> = vec![VOID; n];
+    let mut ss_head = END;
+    let mut index: i64 = 0;
+    let mut label: i64 = n_i - 1;
 
-        let row_start = graph.indptr()[v];
-        let row_end = graph.indptr()[v + 1];
-        for idx in row_start..row_end {
-            let w = graph.indices()[idx];
-            if index[w] == usize::MAX {
-                strongconnect(
-                    w,
-                    graph,
-                    index_counter,
-                    stack,
-                    on_stack,
-                    index,
-                    lowlink,
-                    component,
-                    n_components,
-                );
-                lowlink[v] = lowlink[v].min(lowlink[w]);
-            } else if on_stack[w] {
-                lowlink[v] = lowlink[v].min(index[w]);
-            }
+    for start in 0..n {
+        if lowlinks[start] != VOID {
+            continue;
         }
-
-        if lowlink[v] == index[v] {
-            while let Some(w) = stack.pop() {
-                on_stack[w] = false;
-                component[w] = *n_components;
-                if w == v {
-                    break;
+        let mut stack_head = start as i64;
+        ss[start] = END;
+        stack_b[start] = END;
+        while stack_head != END {
+            let v = stack_head as usize;
+            if lowlinks[v] == VOID {
+                lowlinks[v] = index;
+                index += 1;
+                // Push every unvisited neighbour, moving one already on the DFS stack to
+                // the top; the last neighbour pushed is visited first.
+                for &w in &indices[indptr[v]..indptr[v + 1]] {
+                    if lowlinks[w] == VOID {
+                        if ss[w] != VOID {
+                            let (f, b) = (ss[w], stack_b[w]);
+                            if b != END {
+                                ss[b as usize] = f;
+                            }
+                            if f != END {
+                                stack_b[f as usize] = b;
+                            }
+                        }
+                        ss[w] = stack_head;
+                        stack_b[w] = END;
+                        stack_b[stack_head as usize] = w as i64;
+                        stack_head = w as i64;
+                    }
+                }
+            } else {
+                // Every descendant is finished: pop v and settle its low-link.
+                stack_head = ss[v];
+                if stack_head >= 0 {
+                    stack_b[stack_head as usize] = END;
+                }
+                ss[v] = VOID;
+                stack_b[v] = VOID;
+                let mut root = true;
+                let mut low_v = lowlinks[v];
+                for &w in &indices[indptr[v]..indptr[v + 1]] {
+                    let low_w = lowlinks[w];
+                    if low_w < low_v {
+                        low_v = low_w;
+                        root = false;
+                    }
+                }
+                lowlinks[v] = low_v;
+                if root {
+                    index -= 1;
+                    while ss_head != END && lowlinks[v] <= lowlinks[ss_head as usize] {
+                        let w = ss_head as usize;
+                        ss_head = ss[w];
+                        ss[w] = VOID;
+                        lowlinks[w] = label;
+                        index -= 1;
+                    }
+                    lowlinks[v] = label;
+                    label -= 1;
+                } else {
+                    ss[v] = ss_head;
+                    ss_head = v as i64;
                 }
             }
-            *n_components += 1;
         }
     }
-
-    for v in 0..n {
-        if index[v] == usize::MAX {
-            strongconnect(
-                v,
-                graph,
-                &mut index_counter,
-                &mut stack,
-                &mut on_stack,
-                &mut index,
-                &mut lowlink,
-                &mut component,
-                &mut n_components,
-            );
-        }
-    }
-
-    component
+    let labels = lowlinks
+        .iter()
+        .map(|&raw| (n_i - 1 - raw) as usize)
+        .collect();
+    ((n_i - 1 - label) as usize, labels)
 }
 
 /// Topological sort of a directed acyclic graph (DAG).
@@ -13381,7 +13432,7 @@ pub fn pagerank(graph: &CsrMatrix, damping: f64, max_iter: usize, tol: f64) -> V
 ///
 /// Uses Floyd-Warshall internally. Returns 0.0 for non-square matrices.
 pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
-    let dist = floyd_warshall(graph);
+    let dist = floyd_warshall(graph, true);
     if dist.is_empty() {
         return 0.0;
     }
@@ -13399,7 +13450,7 @@ pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
 /// Compute the eccentricity of each node (max shortest path distance).
 /// Returns empty vec for non-square matrices.
 pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
-    let dist = floyd_warshall(graph);
+    let dist = floyd_warshall(graph, true);
     if dist.is_empty() {
         return vec![];
     }
@@ -13545,7 +13596,7 @@ pub fn betweenness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 /// Compute closeness centrality for each node.
 pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
-    let dist = floyd_warshall(graph);
+    let dist = floyd_warshall(graph, true);
     if dist.is_empty() {
         return vec![0.0; n];
     }
@@ -14778,8 +14829,8 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
-        let ap = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        let fw = floyd_warshall(&g, true);
+        let ap = dijkstra_all_pairs(&g, true).expect("dijkstra_all_pairs");
         assert_eq!(ap.len(), n);
         for (i, (api, fwi)) in ap.iter().zip(fw.iter()).enumerate() {
             for (j, (&a, &b)) in api.distances.iter().zip(fwi.iter()).enumerate() {
@@ -14819,9 +14870,9 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
+        let fw = floyd_warshall(&g, true);
         let sources = [3usize, 17, 42, 0, 59];
-        let ms = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        let ms = dijkstra_multi_source(&g, true, &sources).expect("multi-source");
         assert_eq!(ms.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
             for (j, (&a, &b)) in ms[si].distances.iter().zip(fw[src].iter()).enumerate() {
@@ -14865,10 +14916,10 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let parallel = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        let parallel = dijkstra_all_pairs(&g, true).expect("dijkstra_all_pairs");
         assert_eq!(parallel.len(), n);
         for (source, row) in parallel.iter().enumerate() {
-            let serial = dijkstra(&g, source).expect("serial dijkstra");
+            let serial = dijkstra(&g, true, source).expect("serial dijkstra");
             for (node, (&left, &right)) in row
                 .distances
                 .iter()
@@ -14889,7 +14940,7 @@ mod tests {
 
         // Source order is the caller's, not sorted, and repeats are honoured.
         let sources = [n - 1, 0, 137, 0, 42];
-        let multi = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        let multi = dijkstra_multi_source(&g, true, &sources).expect("multi-source");
         assert_eq!(multi.len(), sources.len());
         for (slot, &source) in sources.iter().enumerate() {
             assert_eq!(
@@ -14899,7 +14950,7 @@ mod tests {
         }
 
         assert!(
-            dijkstra_multi_source(&g, &[n]).is_err(),
+            dijkstra_multi_source(&g, true, &[n]).is_err(),
             "out-of-bounds source must be rejected"
         );
     }
@@ -14932,9 +14983,9 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr");
-        let fw = floyd_warshall(&g);
+        let fw = floyd_warshall(&g, true);
         let sources = [1usize, 9, 30, 54, 0];
-        let bf = bellman_ford_multi_source(&g, &sources).expect("bf multi");
+        let bf = bellman_ford_multi_source(&g, true, &sources).expect("bf multi");
         assert_eq!(bf.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
             for (j, (&a, &b)) in bf[si].distances.iter().zip(fw[src].iter()).enumerate() {
@@ -14980,8 +15031,8 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
-        let jh = johnson(&g).expect("johnson");
+        let fw = floyd_warshall(&g, true);
+        let jh = johnson(&g, true).expect("johnson");
         assert_eq!(jh.len(), n);
         for (i, (jhi, fwi)) in jh.iter().zip(fw.iter()).enumerate() {
             for (j, (&a, &b)) in jhi.distances.iter().zip(fwi.iter()).enumerate() {
@@ -27346,7 +27397,7 @@ mod tests {
         .to_csr()
         .expect("csr");
 
-        let distances = floyd_warshall(&looped);
+        let distances = floyd_warshall(&looped, true);
         assert_eq!(
             distances[0][0], 0.0,
             "distance from a node to itself is the empty path, not its self-loop              (scipy gives 0 for a self-loop of weight 5, we gave {})",
@@ -27358,12 +27409,12 @@ mod tests {
         assert_eq!(distances[2][2], 0.0);
         assert!(distances[1][0].is_infinite(), "unreachable must be inf");
 
-        let from_zero = dijkstra(&looped, 0).expect("dijkstra");
+        let from_zero = dijkstra(&looped, true, 0).expect("dijkstra");
         assert_eq!(from_zero.distances[0], 0.0);
         assert_eq!(from_zero.distances[1], 1.0);
         assert_eq!(from_zero.distances[2], 3.0);
 
-        let bf = bellman_ford(&looped, 0).expect("bellman_ford");
+        let bf = bellman_ford(&looped, true, 0).expect("bellman_ford");
         assert_eq!(bf.distances[0], 0.0);
         assert_eq!(bf.distances[1], 1.0);
         assert_eq!(bf.distances[2], 3.0);
@@ -27380,13 +27431,13 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let reach = dijkstra(&disconnected, 0).expect("dijkstra");
+        let reach = dijkstra(&disconnected, true, 0).expect("dijkstra");
         assert!(
             reach.distances[3].is_infinite(),
             "unreachable node must be inf, got {}",
             reach.distances[3]
         );
-        let all_pairs = floyd_warshall(&disconnected);
+        let all_pairs = floyd_warshall(&disconnected, true);
         assert!(all_pairs[0][3].is_infinite());
         assert_eq!(all_pairs[3][3], 0.0);
     }
@@ -27555,7 +27606,8 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let components = connected_components(&graph).expect("connected_components");
+        let components =
+            connected_components(&graph, false, Connection::Weak).expect("connected_components");
         assert_eq!(components.n_components, 2, "scipy finds 2 weak components");
         let labels = &components.labels;
         assert_eq!(
@@ -28788,7 +28840,7 @@ mod tests {
     #[test]
     fn connected_components_single_component() {
         let g = triangle_graph_csr();
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 1);
         assert!(
             result.labels.iter().all(|&l| l == 0),
@@ -28799,7 +28851,7 @@ mod tests {
     #[test]
     fn connected_components_two_components() {
         let g = disconnected_graph_csr();
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2, "should have 2 components");
         // Nodes 0,1 in one component, nodes 2,3 in another
         assert_eq!(result.labels[0], result.labels[1]);
@@ -28820,14 +28872,14 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2);
     }
 
     #[test]
     fn dijkstra_triangle_graph() {
         let g = triangle_graph_csr();
-        let result = dijkstra(&g, 0).expect("dijkstra");
+        let result = dijkstra(&g, true, 0).expect("dijkstra");
         assert_eq!(result.distances[0], 0.0);
         // Node 1 takes the direct edge. Node 2 can use the direct edge or node 1 with equal cost.
         assert_eq!(result.distances[1], 1.0);
@@ -28841,7 +28893,7 @@ mod tests {
     #[test]
     fn dijkstra_unreachable_node() {
         let g = disconnected_graph_csr();
-        let result = dijkstra(&g, 0).expect("dijkstra");
+        let result = dijkstra(&g, true, 0).expect("dijkstra");
         assert_eq!(result.distances[0], 0.0);
         assert!(result.distances[1].is_finite());
         assert!(
@@ -28853,7 +28905,7 @@ mod tests {
     #[test]
     fn dijkstra_source_out_of_bounds() {
         let g = triangle_graph_csr();
-        let err = dijkstra(&g, 10).expect_err("oob");
+        let err = dijkstra(&g, true, 10).expect_err("oob");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
@@ -28869,12 +28921,12 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = dijkstra(&g, 0).expect("dijkstra negative edge");
+        let result = dijkstra(&g, true, 0).expect("dijkstra negative edge");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!((result.distances[2] - -1.0).abs() < 1e-10);
 
-        let unreachable = dijkstra(&g, 2).expect("dijkstra unreachable source");
+        let unreachable = dijkstra(&g, true, 2).expect("dijkstra unreachable source");
         assert!(unreachable.distances[0].is_infinite());
         assert!(unreachable.distances[1].is_infinite());
         assert_eq!(unreachable.distances[2], 0.0);
@@ -28892,7 +28944,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = dijkstra(&g, 0).expect("dijkstra with unreachable negative edge");
+        let result = dijkstra(&g, true, 0).expect("dijkstra with unreachable negative edge");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!(result.distances[2].is_infinite());
@@ -28998,11 +29050,11 @@ mod tests {
         .expect("csr");
 
         assert!(matches!(
-            connected_components(&g),
+            connected_components(&g, false, Connection::Weak),
             Err(SparseError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            dijkstra(&g, 0),
+            dijkstra(&g, true, 0),
             Err(SparseError::InvalidArgument { .. })
         ));
         assert!(matches!(
@@ -29017,7 +29069,7 @@ mod tests {
     fn bellman_ford_positive_weights() {
         // Same as Dijkstra test — should give identical results
         let g = triangle_graph_csr();
-        let result = bellman_ford(&g, 0).expect("bellman_ford");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!(
@@ -29041,7 +29093,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = bellman_ford(&g, 0).expect("bellman_ford neg");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford neg");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 4.0);
         assert!(
@@ -29065,15 +29117,99 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let err = bellman_ford(&g, 0).expect_err("negative cycle");
+        let err = bellman_ford(&g, true, 0).expect_err("negative cycle");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
     #[test]
     fn bellman_ford_unreachable() {
         let g = disconnected_graph_csr();
-        let result = bellman_ford(&g, 0).expect("bellman_ford");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford");
         assert!(result.distances[2].is_infinite());
+    }
+
+    fn edges_csr(n: usize, edges: &[(usize, usize, f64)]) -> CsrMatrix {
+        let coo = CooMatrix::from_triplets(
+            Shape2D::new(n, n),
+            edges.iter().map(|e| e.2).collect(),
+            edges.iter().map(|e| e.0).collect(),
+            edges.iter().map(|e| e.1).collect(),
+            false,
+        )
+        .expect("coo");
+        coo.to_csr().expect("csr")
+    }
+
+    // br-szq1n.3: strongly connected components are labelled as SciPy labels them. Pearce's
+    // DFS pushes every unvisited neighbour and visits the LAST one first, so on a fan
+    // 0 -> {1, 2} node 2 finishes first. SciPy 1.17.1: [2, 1, 0], and
+    // [3, 2, 2, 1, 0] for 0 -> {1, 3}, 1 <-> 2, 3 -> 4. A recursive Tarjan visits the first
+    // neighbour first and labels them [2, 0, 1] and [3, 0, 0, 2, 1].
+    #[test]
+    fn strong_components_carry_scipys_labels() {
+        let fan = edges_csr(3, &[(0, 1, 1.0), (0, 2, 1.0)]);
+        assert_eq!(strongly_connected_components(&fan), vec![2, 1, 0]);
+        let g = edges_csr(
+            5,
+            &[
+                (0, 1, 1.0),
+                (0, 3, 1.0),
+                (1, 2, 1.0),
+                (2, 1, 1.0),
+                (3, 4, 1.0),
+            ],
+        );
+        let r = connected_components(&g, true, Connection::Strong).expect("cc strong");
+        assert_eq!((r.n_components, r.labels), (4, vec![3, 2, 2, 1, 0]));
+        // Weak connection, or directed = false, is one component here.
+        let weak = connected_components(&g, true, Connection::Weak).expect("cc weak");
+        assert_eq!((weak.n_components, weak.labels), (1, vec![0; 5]));
+        let undirected = connected_components(&g, false, Connection::Strong).expect("cc");
+        assert_eq!(undirected.n_components, 1);
+    }
+
+    // The recursive Tarjan this replaced overflowed a 2 MB thread stack (process abort) on a
+    // directed path of 200,000 nodes. The iterative port finishes, one component per node,
+    // labelled from the sink back to the source as SciPy labels them.
+    #[test]
+    fn strong_components_of_a_long_chain_do_not_recurse() {
+        let n = 200_000;
+        let edges: Vec<(usize, usize, f64)> = (0..n - 1).map(|i| (i, i + 1, 1.0)).collect();
+        let g = edges_csr(n, &edges);
+        let labels = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || strongly_connected_components(&g))
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert_eq!(labels.len(), n);
+        assert_eq!(labels[n - 1], 0);
+        assert_eq!(labels[0], n - 1);
+    }
+
+    // br-szq1n.3: directed = false walks a stored edge either way. A graph stored as its
+    // lower triangle only is unreachable from node 0 directed, and reachable undirected;
+    // SciPy 1.17.1: dijkstra(L, directed=False, indices=0) = [0, 1, 3], predecessors
+    // [-9999, 0, 0].
+    #[test]
+    fn undirected_search_walks_lower_triangle_edges() {
+        let lower = edges_csr(3, &[(1, 0, 1.0), (2, 0, 3.0), (2, 1, 2.0)]);
+        let directed = dijkstra(&lower, true, 0).expect("directed");
+        assert!(directed.distances[1].is_infinite() && directed.distances[2].is_infinite());
+        let undirected = dijkstra(&lower, false, 0).expect("undirected");
+        assert_eq!(undirected.distances, vec![0.0, 1.0, 3.0]);
+        assert_eq!(undirected.predecessors, vec![-1, 0, 0]);
+        let bf = bellman_ford(&lower, false, 0).expect("undirected bellman-ford");
+        assert_eq!(bf.distances, vec![0.0, 1.0, 3.0]);
+        let (order, _) = breadth_first_order(&lower, 0, false).expect("bfs");
+        assert_eq!(order, vec![0, 1, 2]);
+        let fw = floyd_warshall(&lower, false);
+        assert_eq!(fw[0], vec![0.0, 1.0, 3.0]);
+        assert_eq!(fw[2][0], 3.0);
+        // A negative stored edge is a negative cycle once it can be walked both ways.
+        let negative = edges_csr(2, &[(1, 0, -1.0)]);
+        assert!(bellman_ford(&negative, true, 1).is_ok());
+        assert!(bellman_ford(&negative, false, 1).is_err());
     }
 
     // ── BFS/DFS traversal tests ─────────────────────────────────────
@@ -29081,7 +29217,7 @@ mod tests {
     #[test]
     fn bfs_order_triangle() {
         let g = triangle_graph_csr();
-        let (order, pred) = breadth_first_order(&g, 0).expect("bfs");
+        let (order, pred) = breadth_first_order(&g, 0, true).expect("bfs");
         assert_eq!(order[0], 0, "BFS starts at source");
         assert_eq!(order.len(), 3, "BFS visits all 3 nodes");
         assert_eq!(pred[0], -1, "source has no predecessor");
@@ -29090,7 +29226,7 @@ mod tests {
     #[test]
     fn bfs_order_disconnected() {
         let g = disconnected_graph_csr();
-        let (order, _) = breadth_first_order(&g, 0).expect("bfs");
+        let (order, _) = breadth_first_order(&g, 0, true).expect("bfs");
         // Only visits nodes reachable from 0: nodes 0 and 1
         assert_eq!(order.len(), 2, "BFS only visits connected component");
         assert!(order.contains(&0));
@@ -29100,7 +29236,7 @@ mod tests {
     #[test]
     fn dfs_order_triangle() {
         let g = triangle_graph_csr();
-        let (order, pred) = depth_first_order(&g, 0).expect("dfs");
+        let (order, pred) = depth_first_order(&g, 0, true).expect("dfs");
         assert_eq!(order[0], 0, "DFS starts at source");
         assert_eq!(order.len(), 3, "DFS visits all 3 nodes");
         assert_eq!(pred[0], -1, "source has no predecessor");
@@ -29109,7 +29245,7 @@ mod tests {
     #[test]
     fn dfs_order_disconnected() {
         let g = disconnected_graph_csr();
-        let (order, _) = depth_first_order(&g, 0).expect("dfs");
+        let (order, _) = depth_first_order(&g, 0, true).expect("dfs");
         assert_eq!(order.len(), 2, "DFS only visits connected component");
     }
 
@@ -29126,7 +29262,7 @@ mod tests {
             false,
         )
         .expect("graph a");
-        let (order, pred) = depth_first_order(&a, 0).expect("dfs a");
+        let (order, pred) = depth_first_order(&a, 0, true).expect("dfs a");
         assert_eq!(order, vec![0, 1, 2]);
         assert_eq!(pred, vec![-1, 0, 1], "push-time marking gave pred[2] = 0");
 
@@ -29139,7 +29275,7 @@ mod tests {
             false,
         )
         .expect("graph b");
-        let (order, pred) = depth_first_order(&b, 0).expect("dfs b");
+        let (order, pred) = depth_first_order(&b, 0, true).expect("dfs b");
         assert_eq!(order, vec![0, 1, 3, 2]);
         assert_eq!(pred, vec![-1, 0, 3, 1]);
     }
@@ -29147,7 +29283,7 @@ mod tests {
     #[test]
     fn bfs_source_out_of_bounds() {
         let g = triangle_graph_csr();
-        let err = breadth_first_order(&g, 10).expect_err("oob");
+        let err = breadth_first_order(&g, 10, true).expect_err("oob");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
@@ -30280,7 +30416,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let dist = super::floyd_warshall(&g);
+        let dist = super::floyd_warshall(&g, true);
         assert!((dist[0][0] - 0.0).abs() < 1e-10);
         assert!((dist[0][1] - 1.0).abs() < 1e-10);
         assert!((dist[0][2] - 3.0).abs() < 1e-10);
@@ -30304,7 +30440,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = super::connected_components(&g).expect("cc");
+        let result = super::connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2);
         assert_eq!(result.labels[0], result.labels[1]);
         assert_eq!(result.labels[2], result.labels[3]);
@@ -32110,14 +32246,75 @@ fn validate_csgraph(graph: &CsrMatrix) -> SparseResult<()> {
     Ok(())
 }
 
-/// Find connected components of a sparse graph.
+/// The adjacency of a graph's transpose, as SciPy's `csgraph.T.tocsr()`: node `i`'s
+/// neighbours are the `j` with a stored entry at `(j, i)`, in increasing `j`, with that
+/// entry's weight. SciPy's undirected traversals and shortest paths scan it right after the
+/// graph's own row, which fixes their visit order and tie-breaking.
+struct TransposeAdjacency {
+    indptr: Vec<usize>,
+    indices: Vec<usize>,
+    data: Vec<f64>,
+}
+
+fn transpose_adjacency(graph: &CsrMatrix) -> TransposeAdjacency {
+    let n = graph.shape().rows;
+    let (indptr, indices, data) = (graph.indptr(), graph.indices(), graph.data());
+    let mut starts = vec![0usize; n + 1];
+    for &col in indices {
+        starts[col + 1] += 1;
+    }
+    for i in 0..n {
+        starts[i + 1] += starts[i];
+    }
+    let mut next = starts.clone();
+    let mut t_indices = vec![0usize; indices.len()];
+    let mut t_data = vec![0.0; indices.len()];
+    for row in 0..n {
+        for idx in indptr[row]..indptr[row + 1] {
+            let col = indices[idx];
+            t_indices[next[col]] = row;
+            t_data[next[col]] = data[idx];
+            next[col] += 1;
+        }
+    }
+    TransposeAdjacency {
+        indptr: starts,
+        indices: t_indices,
+        data: t_data,
+    }
+}
+
+/// `connection=` for [`connected_components`] on a directed graph, as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    /// Components of the graph with every edge made undirected (SciPy's default).
+    Weak,
+    /// Strongly connected components: mutual reachability along directed edges.
+    Strong,
+}
+
+/// Find connected components of a sparse graph:
+/// `scipy.sparse.csgraph.connected_components(graph, directed, connection)`.
 ///
-/// Matches `scipy.sparse.csgraph.connected_components(graph, directed=False)`.
-///
-/// The input CSR matrix is treated as an adjacency matrix (nonzero = edge).
-/// For undirected graphs, the matrix should be symmetric.
-pub fn connected_components(graph: &CsrMatrix) -> SparseResult<ConnectedComponentsResult> {
+/// Nonzero stored entries are edges. With `directed = false`, or with
+/// [`Connection::Weak`], an edge joins its endpoints both ways; components are numbered in
+/// order of their smallest node, as SciPy numbers them. With `directed = true` and
+/// [`Connection::Strong`] the components are the strongly connected ones, labelled exactly as
+/// SciPy labels them (see [`strongly_connected_components`]).
+pub fn connected_components(
+    graph: &CsrMatrix,
+    directed: bool,
+    connection: Connection,
+) -> SparseResult<ConnectedComponentsResult> {
     validate_csgraph(graph)?;
+    if directed && connection == Connection::Strong {
+        let n = graph.shape().rows;
+        let (n_components, labels) = pearce_scc(graph.indptr(), graph.indices(), n);
+        return Ok(ConnectedComponentsResult {
+            n_components,
+            labels,
+        });
+    }
     let n = graph.shape().rows;
     let indptr = graph.indptr();
     let indices = graph.indices();
@@ -32189,19 +32386,30 @@ impl PartialOrd for DijkstraState {
 }
 
 impl Ord for DijkstraState {
+    /// SciPy's heap holds `(-distance, vertex)` pairs in a max-heap: the smallest distance
+    /// pops first and, between equal distances, the LARGEST vertex index. Ties decide
+    /// predecessors, so this order is part of the observable result.
     fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.total_cmp(&self.cost)
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| self.position.cmp(&other.position))
     }
 }
 
-/// Single-source shortest paths using Dijkstra's algorithm.
+/// Single-source shortest paths using Dijkstra's algorithm:
+/// `scipy.sparse.csgraph.dijkstra(graph, directed, indices=source)`.
 ///
-/// Matches `scipy.sparse.csgraph.dijkstra(graph, indices=source)`.
-///
-/// The CSR matrix values are edge weights. When negative edges are present,
-/// SciPy warns and still computes distances; we follow that observable result
+/// The CSR matrix values are edge weights. With `directed = false` an edge `(i, j)` can be
+/// walked either way; as in SciPy, each settled vertex relaxes its own row and then its column
+/// (the transpose's row), so the shorter of `(i, j)` and `(j, i)` wins. When negative edges are
+/// present, SciPy warns and still computes distances; we follow that observable result
 /// surface by delegating to Bellman-Ford instead of hard-failing.
-pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathResult> {
+pub fn dijkstra(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+) -> SparseResult<ShortestPathResult> {
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if source >= n {
@@ -32215,19 +32423,29 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
     let data = graph.data();
 
     if data.iter().any(|&weight| weight < 0.0) {
-        return bellman_ford(graph, source);
+        return bellman_ford(graph, directed, source);
     }
 
-    Ok(dijkstra_core(indptr, indices, data, n, source))
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
+    Ok(dijkstra_core(
+        indptr,
+        indices,
+        data,
+        transpose.as_ref(),
+        n,
+        source,
+    ))
 }
 
-/// Core Dijkstra heap loop over already-extracted CSR components. No validation
-/// or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
-/// once. Pure in its inputs, so it parallelizes byte-identically across sources.
+/// Core Dijkstra heap loop over already-extracted CSR components, SciPy's `_dijkstra`. No
+/// validation or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
+/// once. `transpose` is `Some` for an undirected search. Pure in its inputs, so it
+/// parallelizes byte-identically across sources.
 fn dijkstra_core(
     indptr: &[usize],
     indices: &[usize],
     data: &[f64],
+    transpose: Option<&TransposeAdjacency>,
     n: usize,
     source: usize,
 ) -> ShortestPathResult {
@@ -32245,19 +32463,24 @@ fn dijkstra_core(
         if cost > dist[position] {
             continue;
         }
-        // Relax edges from position
-        for idx in indptr[position]..indptr[position + 1] {
-            let v = indices[idx];
-            let weight = data[idx];
-            let alt = cost + weight;
-            if alt < dist[v] {
-                dist[v] = alt;
-                pred[v] = position as i64;
-                heap.push(DijkstraState {
-                    cost: alt,
-                    position: v,
-                });
+        let mut relax = |row_indices: &[usize], row_data: &[f64]| {
+            for (&v, &weight) in row_indices.iter().zip(row_data) {
+                let alt = cost + weight;
+                if alt < dist[v] {
+                    dist[v] = alt;
+                    pred[v] = position as i64;
+                    heap.push(DijkstraState {
+                        cost: alt,
+                        position: v,
+                    });
+                }
             }
+        };
+        let row = indptr[position]..indptr[position + 1];
+        relax(&indices[row.clone()], &data[row]);
+        if let Some(t) = transpose {
+            let row = t.indptr[position]..t.indptr[position + 1];
+            relax(&t.indices[row.clone()], &t.data[row]);
         }
     }
 
@@ -32275,6 +32498,7 @@ fn dijkstra_parallel_sources(
     indptr: &[usize],
     indices: &[usize],
     data: &[f64],
+    transpose: Option<&TransposeAdjacency>,
     n: usize,
     sources: &[usize],
 ) -> Vec<ShortestPathResult> {
@@ -32291,7 +32515,7 @@ fn dijkstra_parallel_sources(
                 scope.spawn(move || {
                     batch
                         .iter()
-                        .map(|&source| dijkstra_core(indptr, indices, data, n, source))
+                        .map(|&source| dijkstra_core(indptr, indices, data, transpose, n, source))
                         .collect::<Vec<_>>()
                 })
             })
@@ -32303,12 +32527,21 @@ fn dijkstra_parallel_sources(
     })
 }
 
-/// Single-source shortest paths using Bellman-Ford algorithm.
+/// Single-source shortest paths using Bellman-Ford algorithm:
+/// `scipy.sparse.csgraph.bellman_ford(graph, directed, indices=source)`.
 ///
-/// Matches `scipy.sparse.csgraph.bellman_ford(graph, indices=source)`.
-///
-/// Supports negative edge weights (unlike Dijkstra). Detects negative cycles.
-pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathResult> {
+/// Supports negative edge weights (unlike Dijkstra). Detects negative cycles with SciPy's
+/// `1e-15` slack. This follows SciPy's `_bellman_ford_directed` / `_bellman_ford_undirected`
+/// pass for pass, including reading each row's source distance once per pass. Undirected, a
+/// stored edge relaxes both of its endpoints, so a negative edge is itself a negative cycle.
+/// The passes stop early once one changes nothing; the remaining passes would not change
+/// anything either.
+pub fn bellman_ford(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+) -> SparseResult<ShortestPathResult> {
+    const EPS: f64 = 1e-15; // SciPy's DTYPE_EPS
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if source >= n {
@@ -32325,38 +32558,42 @@ pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPa
     let mut pred = vec![-1_i64; n];
     dist[source] = 0.0;
 
-    // Relax all edges n-1 times
     for _ in 0..n.saturating_sub(1) {
         let mut changed = false;
-        for u in 0..n {
-            if dist[u] == f64::INFINITY {
-                continue;
-            }
-            for idx in indptr[u]..indptr[u + 1] {
-                let v = indices[idx];
-                let weight = data[idx];
-                let alt = dist[u] + weight;
-                if alt < dist[v] {
-                    dist[v] = alt;
-                    pred[v] = u as i64;
+        for j in 0..n {
+            let mut d1 = dist[j];
+            for idx in indptr[j]..indptr[j + 1] {
+                let (k, w12) = (indices[idx], data[idx]);
+                let mut d2 = dist[k];
+                if d1 + w12 < d2 {
+                    d2 = d1 + w12;
+                    dist[k] = d2;
+                    pred[k] = j as i64;
+                    changed = true;
+                }
+                if !directed && d2 + w12 < d1 {
+                    d1 = d2 + w12;
+                    dist[j] = d1;
+                    pred[j] = k as i64;
                     changed = true;
                 }
             }
         }
         if !changed {
-            break; // Early termination: no updates in this pass
+            break;
         }
     }
 
-    // Check for negative cycles: one more pass
-    for u in 0..n {
-        if dist[u] == f64::INFINITY {
-            continue;
-        }
-        for idx in indptr[u]..indptr[u + 1] {
-            let v = indices[idx];
-            let weight = data[idx];
-            if dist[u] + weight < dist[v] {
+    for j in 0..n {
+        let d1 = dist[j];
+        for idx in indptr[j]..indptr[j + 1] {
+            let (d2, w12) = (dist[indices[idx]], data[idx]);
+            let violated = if directed {
+                d1 + w12 + EPS < d2
+            } else {
+                (d2 - d1).abs() > w12 + EPS
+            };
+            if violated {
                 return Err(SparseError::InvalidArgument {
                     message: "graph contains a negative-weight cycle".to_string(),
                 });
@@ -32370,14 +32607,32 @@ pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPa
     })
 }
 
+/// The transpose adjacency an undirected traversal needs, after checking the graph is
+/// square (a transpose of a non-square graph has no node for some of its columns).
+fn undirected_transpose(graph: &CsrMatrix) -> SparseResult<TransposeAdjacency> {
+    let shape = graph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "an undirected traversal needs a square graph, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    Ok(transpose_adjacency(graph))
+}
+
 /// Breadth-first search traversal order from a source node.
 ///
 /// Returns the node indices in BFS order and a predecessor array.
 ///
-/// Matches `scipy.sparse.csgraph.breadth_first_order(graph, i_start)`.
+/// Matches `scipy.sparse.csgraph.breadth_first_order(graph, i_start, directed)`. With
+/// `directed = false` each node's own row is scanned and then its column (the transpose's
+/// row), which is SciPy's visit order.
 pub fn breadth_first_order(
     graph: &CsrMatrix,
     source: usize,
+    directed: bool,
 ) -> SparseResult<(Vec<usize>, Vec<i64>)> {
     let n = graph.shape().rows;
     if source >= n {
@@ -32387,6 +32642,11 @@ pub fn breadth_first_order(
     }
     let indptr = graph.indptr();
     let indices = graph.indices();
+    let transpose = if directed {
+        None
+    } else {
+        Some(undirected_transpose(graph)?)
+    };
 
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
@@ -32399,7 +32659,11 @@ pub fn breadth_first_order(
 
     while let Some(node) = queue.pop_front() {
         order.push(node);
-        for &neighbor in indices.iter().take(indptr[node + 1]).skip(indptr[node]) {
+        let own = &indices[indptr[node]..indptr[node + 1]];
+        let reverse = transpose
+            .as_ref()
+            .map_or(&[][..], |t| &t.indices[t.indptr[node]..t.indptr[node + 1]]);
+        for &neighbor in own.iter().chain(reverse) {
             if !visited[neighbor] {
                 visited[neighbor] = true;
                 predecessors[neighbor] = node as i64;
@@ -32415,8 +32679,14 @@ pub fn breadth_first_order(
 ///
 /// Returns the node indices in DFS pre-order and a predecessor array.
 ///
-/// Matches `scipy.sparse.csgraph.depth_first_order(graph, i_start)`.
-pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<usize>, Vec<i64>)> {
+/// Matches `scipy.sparse.csgraph.depth_first_order(graph, i_start, directed)`. With
+/// `directed = false` a node's column (the transpose's row) is searched only when its own row
+/// has no unvisited neighbour left, as in SciPy's `_depth_first_undirected`.
+pub fn depth_first_order(
+    graph: &CsrMatrix,
+    source: usize,
+    directed: bool,
+) -> SparseResult<(Vec<usize>, Vec<i64>)> {
     let n = graph.shape().rows;
     if source >= n {
         return Err(SparseError::InvalidArgument {
@@ -32425,6 +32695,14 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
     }
     let indptr = graph.indptr();
     let indices = graph.indices();
+    let transpose = if directed {
+        None
+    } else {
+        Some(undirected_transpose(graph)?)
+    };
+    let mut t_cursor: Vec<usize> = transpose
+        .as_ref()
+        .map_or_else(Vec::new, |t| t.indptr[..n].to_vec());
 
     // br-szq1n.3: SciPy's `_depth_first_directed` descends into the FIRST unvisited
     // neighbour immediately, recording it in the order and its predecessor at that
@@ -32455,6 +32733,20 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
                 stack.push(child);
                 descended = true;
                 break;
+            }
+        }
+        if let (false, Some(t)) = (descended, transpose.as_ref()) {
+            while t_cursor[node] < t.indptr[node + 1] {
+                let child = t.indices[t_cursor[node]];
+                t_cursor[node] += 1;
+                if !visited[child] {
+                    visited[child] = true;
+                    predecessors[child] = node as i64;
+                    order.push(child);
+                    stack.push(child);
+                    descended = true;
+                    break;
+                }
             }
         }
         if order.len() == n {
@@ -33881,9 +34173,12 @@ where
 /// `result[i].distances[j]` is the shortest distance from `i` to `j`
 /// (`f64::INFINITY` if unreachable). Matches
 /// `scipy.sparse.csgraph.shortest_path(graph, method='D')` /
-/// `dijkstra(graph)` over all sources. Negative edges (where Dijkstra is invalid)
-/// fall back to per-source Bellman-Ford, propagating negative-cycle errors.
-pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+/// `dijkstra(graph, directed)` over all sources. Negative edges (where Dijkstra is
+/// invalid) fall back to per-source Bellman-Ford, propagating negative-cycle errors.
+pub fn dijkstra_all_pairs(
+    graph: &CsrMatrix,
+    directed: bool,
+) -> SparseResult<Vec<ShortestPathResult>> {
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if n == 0 {
@@ -33894,14 +34189,18 @@ pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathRes
     if data.iter().any(|&weight| weight < 0.0) {
         // Negative edges: Dijkstra is invalid. Per-source Bellman-Ford, serial,
         // propagating any negative-cycle error like SciPy. Not the hot path.
-        return (0..n).map(|source| bellman_ford(graph, source)).collect();
+        return (0..n)
+            .map(|source| bellman_ford(graph, directed, source))
+            .collect();
     }
 
     let sources: Vec<usize> = (0..n).collect();
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
     Ok(dijkstra_parallel_sources(
         graph.indptr(),
         graph.indices(),
         data,
+        transpose.as_ref(),
         n,
         &sources,
     ))
@@ -33910,9 +34209,10 @@ pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathRes
 /// Compute paths from the requested sources, retaining source order.
 ///
 /// Same parallel fan-out as [`dijkstra_all_pairs`] over an arbitrary source
-/// list. Matches `scipy.sparse.csgraph.dijkstra(graph, indices=sources)`.
+/// list. Matches `scipy.sparse.csgraph.dijkstra(graph, directed, indices=sources)`.
 pub fn dijkstra_multi_source(
     graph: &CsrMatrix,
+    directed: bool,
     sources: &[usize],
 ) -> SparseResult<Vec<ShortestPathResult>> {
     validate_csgraph(graph)?;
@@ -33930,34 +34230,39 @@ pub fn dijkstra_multi_source(
     if data.iter().any(|&weight| weight < 0.0) {
         return sources
             .iter()
-            .map(|&source| bellman_ford(graph, source))
+            .map(|&source| bellman_ford(graph, directed, source))
             .collect();
     }
 
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
     Ok(dijkstra_parallel_sources(
         graph.indptr(),
         graph.indices(),
         data,
+        transpose.as_ref(),
         n,
         sources,
     ))
 }
 
-/// Compute all-pairs paths for arbitrary edge signs, rejecting negative cycles.
-pub fn johnson(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+/// All-pairs shortest paths for arbitrary edge signs, rejecting negative cycles:
+/// `scipy.sparse.csgraph.johnson(graph, directed)` distances. Undirected, any negative edge
+/// is a negative cycle (walk it and back), which SciPy reports too.
+pub fn johnson(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<ShortestPathResult>> {
     (0..graph.shape().rows)
-        .map(|source| bellman_ford(graph, source))
+        .map(|source| bellman_ford(graph, directed, source))
         .collect()
 }
 
 /// Compute Bellman-Ford paths for a requested set of sources.
 pub fn bellman_ford_multi_source(
     graph: &CsrMatrix,
+    directed: bool,
     sources: &[usize],
 ) -> SparseResult<Vec<ShortestPathResult>> {
     sources
         .iter()
-        .map(|&source| bellman_ford(graph, source))
+        .map(|&source| bellman_ford(graph, directed, source))
         .collect()
 }
 
@@ -34000,11 +34305,14 @@ mod truncation_recovery_tests {
             vec![1, 2],
             vec![0, 1, 2, 2],
         );
-        let paths = dijkstra_multi_source(&graph, &[1, 0]).expect("multi-source paths");
+        let paths = dijkstra_multi_source(&graph, true, &[1, 0]).expect("multi-source paths");
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].distances, vec![f64::INFINITY, 0.0, 1.0]);
         assert_eq!(paths[1].distances, vec![0.0, 1.0, 2.0]);
-        assert_eq!(dijkstra_all_pairs(&graph).expect("all pairs").len(), 3);
+        assert_eq!(
+            dijkstra_all_pairs(&graph, true).expect("all pairs").len(),
+            3
+        );
     }
 }
 

@@ -113,7 +113,7 @@ fn main() {
             let s = gg.below(n);
             let t = gg.below(n);
             let (da, pa) = naive(&g, s, t);
-            let (db, pb) = shortest_path(&g, s, t);
+            let (db, pb) = shortest_path(&g, true, s, t);
             checks += 1;
             if da.to_bits() != db.to_bits() || pa != pb {
                 mismatches += 1;
@@ -137,7 +137,7 @@ fn main() {
             let mut p = Lcg(11);
             (0..reps).map(|_| (p.below(n), p.below(n))).collect()
         };
-        let _ = shortest_path(&g, 0, n - 1);
+        let _ = shortest_path(&g, true, 0, n - 1);
 
         let t0 = Instant::now();
         let mut acc = 0.0;
@@ -148,7 +148,7 @@ fn main() {
 
         let t1 = Instant::now();
         for &(s, t) in &pairs {
-            acc += shortest_path(&g, s, t).0.min(1e18);
+            acc += shortest_path(&g, true, s, t).0.min(1e18);
         }
         let new_t = t1.elapsed();
 

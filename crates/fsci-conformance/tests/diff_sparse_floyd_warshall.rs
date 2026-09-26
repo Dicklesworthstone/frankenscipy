@@ -266,7 +266,7 @@ fn fsci_eval(case: &PointCase) -> Option<Vec<f64>> {
 
     let coo = CooMatrix::from_triplets(Shape2D::new(case.n, case.n), w, r, c, false).ok()?;
     let csr = coo.to_csr().ok()?;
-    let dist_matrix = floyd_warshall(&csr);
+    let dist_matrix = floyd_warshall(&csr, case.directed);
     let mut flat = Vec::with_capacity(case.n * case.n);
     for row in &dist_matrix {
         for &v in row {

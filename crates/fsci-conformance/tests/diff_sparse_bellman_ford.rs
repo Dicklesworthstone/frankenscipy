@@ -245,7 +245,7 @@ fn diff_sparse_bellman_ford() {
             continue;
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = bellman_ford(&csr, case.source) else {
+        let Ok(res) = bellman_ford(&csr, false, case.source) else {
             continue;
         };
         let abs_d = if res.distances.len() != scipy_d.len() {

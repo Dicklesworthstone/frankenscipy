@@ -259,7 +259,7 @@ fn diff_sparse_dijkstra() {
             continue;
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = dijkstra(&csr, case.source) else {
+        let Ok(res) = dijkstra(&csr, false, case.source) else {
             continue;
         };
         // Compare distances; treat fsci INF and scipy 1e308 sentinel as both infinite.

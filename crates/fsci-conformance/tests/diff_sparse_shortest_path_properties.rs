@@ -116,7 +116,7 @@ fn diff_sparse_shortest_path_properties() {
     );
 
     {
-        let (d, p) = shortest_path(&g1, 0, 4);
+        let (d, p) = shortest_path(&g1, true, 0, 4);
         check(
             "g1_0_to_4_distance",
             (d - 7.0).abs() < ABS_TOL,
@@ -154,7 +154,7 @@ fn diff_sparse_shortest_path_properties() {
 
     // === Source == target → distance 0 ===
     {
-        let (d, p) = shortest_path(&g1, 2, 2);
+        let (d, p) = shortest_path(&g1, true, 2, 2);
         check(
             "self_distance_zero",
             d == 0.0 && p == vec![2],
@@ -164,7 +164,7 @@ fn diff_sparse_shortest_path_properties() {
 
     // === Disconnected: no edge from 4 back to 0 in directed graph ===
     {
-        let (d, p) = shortest_path(&g1, 4, 0);
+        let (d, p) = shortest_path(&g1, true, 4, 0);
         check(
             "disconnected_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -174,7 +174,7 @@ fn diff_sparse_shortest_path_properties() {
 
     // === Out-of-bounds source ===
     {
-        let (d, p) = shortest_path(&g1, 99, 0);
+        let (d, p) = shortest_path(&g1, true, 99, 0);
         check(
             "oob_source_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -184,7 +184,7 @@ fn diff_sparse_shortest_path_properties() {
 
     // === Out-of-bounds target ===
     {
-        let (d, p) = shortest_path(&g1, 0, 99);
+        let (d, p) = shortest_path(&g1, true, 0, 99);
         check(
             "oob_target_returns_infinity",
             d == f64::INFINITY && p.is_empty(),
@@ -196,7 +196,7 @@ fn diff_sparse_shortest_path_properties() {
     {
         let g2 = build_csr(3, &[(0, 1, 5.0), (1, 2, 7.0), (0, 2, 100.0)]);
         // Direct edge 0→2 weight 100; via 1 it's 5+7=12. So path via 1 wins.
-        let (d, p) = shortest_path(&g2, 0, 2);
+        let (d, p) = shortest_path(&g2, true, 0, 2);
         check(
             "indirect_path_wins",
             (d - 12.0).abs() < ABS_TOL && p == vec![0, 1, 2],

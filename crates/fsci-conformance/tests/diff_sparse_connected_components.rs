@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_sparse::{CsrMatrix, Shape2D, connected_components};
+use fsci_sparse::{Connection, CsrMatrix, Shape2D, connected_components};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -264,7 +264,7 @@ fn diff_sparse_connected_components() {
             continue;
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = connected_components(&csr) else {
+        let Ok(res) = connected_components(&csr, false, Connection::Weak) else {
             continue;
         };
         let pass_n = res.n_components == scipy_n;

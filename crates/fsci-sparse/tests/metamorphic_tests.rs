@@ -7,7 +7,7 @@
 
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::{
-    CooMatrix, CsrMatrix, EigsOptions, ExpmOptions, IluOptions, IterativeSolveOptions,
+    Connection, CooMatrix, CsrMatrix, EigsOptions, ExpmOptions, IluOptions, IterativeSolveOptions,
     LgmresOptions, LuOptions, Shape2D, SolveOptions, add_csr, bicg, bicgstab, block_diag,
     breadth_first_order, cg, cgs, connected_components, coo_to_csr_with_mode, csr_to_csc_with_mode,
     diags, dijkstra, eigsh, expm as sparse_expm, eye, floyd_warshall, gmres, kron, kronsum,
@@ -853,7 +853,7 @@ fn mr_floyd_warshall_zero_diagonal() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_floyd")
         .unwrap()
         .0;
-    let dist = floyd_warshall(&g);
+    let dist = floyd_warshall(&g, true);
     for (i, row) in dist.iter().enumerate().take(n) {
         assert!(
             row[i].abs() < 1e-12,
@@ -972,7 +972,7 @@ fn mr_dijkstra_source_distance_zero() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_dijkstra")
         .unwrap()
         .0;
-    let r = dijkstra(&g, 0).unwrap();
+    let r = dijkstra(&g, true, 0).unwrap();
     assert!(
         r.distances[0].abs() < 1e-12,
         "MR34 dijkstra distances[0] = {}",
@@ -1003,7 +1003,7 @@ fn mr_bfs_starts_at_source() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_bfs")
         .unwrap()
         .0;
-    let (order, _preds) = breadth_first_order(&g, 0).unwrap();
+    let (order, _preds) = breadth_first_order(&g, 0, true).unwrap();
     assert!(!order.is_empty(), "MR35 bfs order empty");
     assert_eq!(order[0], 0, "MR35 bfs first = {}, expected 0", order[0]);
 }
@@ -1442,7 +1442,7 @@ fn mr_connected_components_fully_connected() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_cc")
         .unwrap()
         .0;
-    let r = connected_components(&g).unwrap();
+    let r = connected_components(&g, false, Connection::Weak).unwrap();
     assert_eq!(
         r.n_components, 1,
         "MR36 connected_components = {} on fully connected, expected 1",

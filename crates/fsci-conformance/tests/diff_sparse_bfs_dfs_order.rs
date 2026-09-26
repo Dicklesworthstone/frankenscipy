@@ -296,8 +296,8 @@ fn diff_sparse_bfs_dfs_order() -> Result<(), String> {
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
         let fsci_result = match case.op.as_str() {
-            "bfs" => breadth_first_order(&csr, case.source),
-            "dfs" => depth_first_order(&csr, case.source),
+            "bfs" => breadth_first_order(&csr, case.source, true),
+            "dfs" => depth_first_order(&csr, case.source, true),
             other => return Err(format!("unknown op {other}")),
         };
         let (pass, note) = match fsci_result {

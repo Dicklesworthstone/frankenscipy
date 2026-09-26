@@ -57,7 +57,7 @@ fn summary(d: &[Vec<f64>]) -> (usize, f64, u64) {
 fn main() {
     println!("===PARITY_PAYLOAD_BEGIN===");
     for &n in &[64usize, 127, 300, 600] {
-        let (reach, sum, h) = summary(&floyd_warshall(&graph(n, 6, 7)));
+        let (reach, sum, h) = summary(&floyd_warshall(&graph(n, 6, 7), true));
         println!("n={n} reach={reach} checksum={sum:.10e} digest={h:016x}");
     }
     println!("===PARITY_PAYLOAD_END===");
@@ -65,11 +65,11 @@ fn main() {
     for &n in &[512usize, 1024, 1600] {
         let g = graph(n, 8, 7);
         let reps = 3;
-        let _ = floyd_warshall(&g);
+        let _ = floyd_warshall(&g, true);
         let t0 = Instant::now();
         let mut acc = 0.0;
         for _ in 0..reps {
-            let d = floyd_warshall(black_box(&g));
+            let d = floyd_warshall(black_box(&g), true);
             acc += d[n / 2][n / 3];
         }
         println!("n={n}  {:>10.3?}/call (acc={acc:.6})", t0.elapsed() / reps);
