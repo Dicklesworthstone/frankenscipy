@@ -342,20 +342,21 @@ fn e2e_p2c003_01_happy_path_minimize_bfgs() {
         }
         let distance = l2_norm(&[result.x[0] - 1.0, result.x[1] - 1.0]);
         let final_f = result.fun.unwrap_or(f64::INFINITY);
-        if distance > 5.0e-2 || final_f > 1.0e-6 {
-            return Err(format!(
+        if distance <= 5.0e-2 && final_f <= 1.0e-6 {
+            trace_cache = trace.clone();
+            Ok(StepOutcome::with_trace(
+                format!(
+                    "converged to x={:?}, f={final_f:.3e}, distance_to_opt={distance:.3e}",
+                    result.x
+                ),
+                result.nfev,
+                trace,
+            ))
+        } else {
+            Err(format!(
                 "solution quality too weak: distance={distance:.3e}, final_f={final_f:.3e}"
-            ));
+            ))
         }
-        trace_cache = trace.clone();
-        Ok(StepOutcome::with_trace(
-            format!(
-                "converged to x={:?}, f={final_f:.3e}, distance_to_opt={distance:.3e}",
-                result.x
-            ),
-            result.nfev,
-            trace,
-        ))
     });
 
     runner.record_step("verify_convergence_trace", "bfgs", || {
@@ -370,18 +371,19 @@ fn e2e_p2c003_01_happy_path_minimize_bfgs() {
             .last()
             .and_then(|entry| entry.f_val)
             .unwrap_or(f64::INFINITY);
-        if !last.is_finite() || last > first {
-            return Err(format!(
+        if last.is_finite() && last <= first {
+            Ok(StepOutcome::new(
+                format!(
+                    "trace length={} first_f={first:.3e} last_f={last:.3e}",
+                    trace_cache.len()
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "trace did not improve objective: first_f={first:.3e}, last_f={last:.3e}"
-            ));
+            ))
         }
-        Ok(StepOutcome::new(
-            format!(
-                "trace length={} first_f={first:.3e} last_f={last:.3e}",
-                trace_cache.len()
-            ),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -493,7 +495,7 @@ fn e2e_p2c003_03_root_finding_pipeline() {
             return Err(format!("brentq failed to converge: {}", result.message));
         }
         let residual = cubic_root_target(result.root).abs();
-        if residual > 1.0e-10 {
+        if residual.is_nan() || residual > 1.0e-10 {
             return Err(format!("brentq residual too large: {residual:.3e}"));
         }
         brentq_root = result.root;
@@ -546,17 +548,18 @@ fn e2e_p2c003_03_root_finding_pipeline() {
         let brentq_err = (brentq_root - expected_root).abs();
         let bisect_err = (bisect_root - expected_root).abs();
         let cross_diff = (brentq_root - bisect_root).abs();
-        if brentq_err > 1.0e-9 || bisect_err > 1.0e-8 || cross_diff > 1.0e-8 {
-            return Err(format!(
+        if brentq_err <= 1.0e-9 && bisect_err <= 1.0e-8 && cross_diff <= 1.0e-8 {
+            Ok(StepOutcome::new(
+                format!(
+                    "root agreement verified (brentq={brentq_root:.12}, bisect={bisect_root:.12})"
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "root mismatch: brentq_err={brentq_err:.3e}, bisect_err={bisect_err:.3e}, cross_diff={cross_diff:.3e}"
-            ));
+            ))
         }
-        Ok(StepOutcome::new(
-            format!(
-                "root agreement verified (brentq={brentq_root:.12}, bisect={bisect_root:.12})"
-            ),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -579,7 +582,7 @@ fn e2e_p2c003_04_convergence_verification_chain() {
         };
         let (result, trace) = capture_minimize_run("cg_pr_plus", shifted_quadratic, &x0, opts)?;
         let final_f = result.fun.unwrap_or(f64::INFINITY);
-        if final_f > 1.0e-5 {
+        if final_f.is_nan() || final_f > 1.0e-5 {
             return Err(format!(
                 "cg_pr_plus did not converge enough: final_f={final_f:.3e}, status={:?}",
                 result.status
@@ -617,18 +620,19 @@ fn e2e_p2c003_04_convergence_verification_chain() {
             .last()
             .and_then(|entry| entry.f_val)
             .unwrap_or(f64::INFINITY);
-        if last_f > first_f {
-            return Err(format!(
+        if last_f <= first_f {
+            Ok(StepOutcome::new(
+                format!(
+                    "trace semantics valid: points={}, first_f={first_f:.3e}, last_f={last_f:.3e}",
+                    trace_cache.len()
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "trace regression detected: first_f={first_f:.3e}, last_f={last_f:.3e}"
-            ));
+            ))
         }
-        Ok(StepOutcome::new(
-            format!(
-                "trace semantics valid: points={}, first_f={first_f:.3e}, last_f={last_f:.3e}",
-                trace_cache.len()
-            ),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -824,7 +828,7 @@ fn e2e_p2c003_08_large_dimension_stress() {
                 "large-dimension stress exceeded time budget: {elapsed_ms}ms"
             ));
         }
-        if final_f > 1.0e-4 {
+        if final_f.is_nan() || final_f > 1.0e-4 {
             return Err(format!(
                 "large-dimension objective too high: final_f={final_f:.3e}, status={:?}",
                 result.status
@@ -886,20 +890,20 @@ fn e2e_p2c003_09_curve_fit_exponential() {
         let b_err = (result.popt[1] - 1.3).abs();
         let c_err = (result.popt[2] - 0.5).abs();
 
-        if a_err > 0.01 || b_err > 0.01 || c_err > 0.01 {
-            return Err(format!(
+        if a_err <= 0.01 && b_err <= 0.01 && c_err <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "recovered params: a={:.4}, b={:.4}, c={:.4}, cost={:.2e}",
+                    result.popt[0], result.popt[1], result.popt[2], result.ls_result.cost
+                ),
+                result.ls_result.nfev,
+            ))
+        } else {
+            Err(format!(
                 "parameter recovery failed: popt={:?}, expected [2.5, 1.3, 0.5]",
                 result.popt
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "recovered params: a={:.4}, b={:.4}, c={:.4}, cost={:.2e}",
-                result.popt[0], result.popt[1], result.popt[2], result.ls_result.cost
-            ),
-            result.ls_result.nfev,
-        ))
     });
 
     runner.record_step("verify_covariance_matrix", "curve_fit", || {
@@ -923,7 +927,7 @@ fn e2e_p2c003_09_curve_fit_exponential() {
 
         // Diagonal elements should be positive (variances)
         for i in 0..3 {
-            if result.pcov[i][i] < 0.0 {
+            if result.pcov[i][i].is_nan() || result.pcov[i][i] < 0.0 {
                 return Err(format!(
                     "negative variance at pcov[{i}][{i}] = {}",
                     result.pcov[i][i]
@@ -984,20 +988,20 @@ fn e2e_p2c003_10_least_squares_levenberg_marquardt() {
         let cy_err = (result.x[1] - 2.0).abs();
         let r_err = (result.x[2] - 3.0).abs();
 
-        if cx_err > 0.1 || cy_err > 0.1 || r_err > 0.1 {
-            return Err(format!(
+        if cx_err <= 0.1 && cy_err <= 0.1 && r_err <= 0.1 {
+            Ok(StepOutcome::new(
+                format!(
+                    "fitted circle: cx={:.4}, cy={:.4}, r={:.4}, cost={:.2e}",
+                    result.x[0], result.x[1], result.x[2], result.cost
+                ),
+                result.nfev,
+            ))
+        } else {
+            Err(format!(
                 "circle fit inaccurate: cx={:.3}, cy={:.3}, r={:.3}",
                 result.x[0], result.x[1], result.x[2]
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "fitted circle: cx={:.4}, cy={:.4}, r={:.4}, cost={:.2e}",
-                result.x[0], result.x[1], result.x[2], result.cost
-            ),
-            result.nfev,
-        ))
     });
 
     let bundle = runner.finish();
@@ -1034,20 +1038,20 @@ fn e2e_p2c003_11_differential_evolution_rastrigin() {
         let dist_to_origin = (result.x[0].powi(2) + result.x[1].powi(2)).sqrt();
 
         // Global minimum is at (0, 0) with f=0
-        if final_f > 1.0 || dist_to_origin > 1.0 {
-            return Err(format!(
+        if final_f <= 1.0 && dist_to_origin <= 1.0 {
+            Ok(StepOutcome::new(
+                format!(
+                    "found minimum: f={:.4}, x=[{:.4}, {:.4}]",
+                    final_f, result.x[0], result.x[1]
+                ),
+                result.nfev,
+            ))
+        } else {
+            Err(format!(
                 "DE did not find global minimum: f={:.3e}, x={:?}",
                 final_f, result.x
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "found minimum: f={:.4}, x=[{:.4}, {:.4}]",
-                final_f, result.x[0], result.x[1]
-            ),
-            result.nfev,
-        ))
     });
 
     let bundle = runner.finish();
@@ -1082,20 +1086,20 @@ fn e2e_p2c003_12_linprog_basic() {
         let x1_err = (result.x[1] - 4.0).abs();
         let f_err = (result.fun - (-8.0)).abs();
 
-        if x0_err > 0.01 || x1_err > 0.01 || f_err > 0.01 {
-            return Err(format!(
+        if x0_err <= 0.01 && x1_err <= 0.01 && f_err <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "optimal: x=[{:.4}, {:.4}], f={:.4}",
+                    result.x[0], result.x[1], result.fun
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "LP solution incorrect: x={:?}, f={:.4}, expected x=[0,4], f=-8",
                 result.x, result.fun
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "optimal: x=[{:.4}, {:.4}], f={:.4}",
-                result.x[0], result.x[1], result.fun
-            ),
-            0,
-        ))
     });
 
     runner.record_step("solve_equality_constrained_lp", "linprog", || {
@@ -1121,20 +1125,20 @@ fn e2e_p2c003_12_linprog_basic() {
         let constraint_err = (result.x[0] + result.x[1] - 5.0).abs();
         let f_err = (result.fun - 5.0).abs();
 
-        if constraint_err > 0.01 || f_err > 0.01 {
-            return Err(format!(
+        if constraint_err <= 0.01 && f_err <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "optimal: x=[{:.4}, {:.4}], f={:.4}",
+                    result.x[0], result.x[1], result.fun
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "LP constraint violated or wrong f: x={:?}, f={:.4}",
                 result.x, result.fun
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "optimal: x=[{:.4}, {:.4}], f={:.4}",
-                result.x[0], result.x[1], result.fun
-            ),
-            0,
-        ))
     });
 
     let bundle = runner.finish();
@@ -1158,7 +1162,7 @@ fn e2e_p2c003_13_root_methods_comparison() {
             return Err(format!("ridder did not converge: {}", result.message));
         }
         let err = (result.root - expected_root).abs();
-        if err > 1e-9 {
+        if err.is_nan() || err > 1e-9 {
             return Err(format!("ridder root error too large: {err:.3e}"));
         }
         roots.push(("ridder", result.root));
@@ -1176,7 +1180,7 @@ fn e2e_p2c003_13_root_methods_comparison() {
             return Err(format!("toms748 did not converge: {}", result.message));
         }
         let err = (result.root - expected_root).abs();
-        if err > 1e-9 {
+        if err.is_nan() || err > 1e-9 {
             return Err(format!("toms748 root error too large: {err:.3e}"));
         }
         roots.push(("toms748", result.root));
@@ -1196,7 +1200,7 @@ fn e2e_p2c003_13_root_methods_comparison() {
             return Err(format!("newton did not converge: {}", result.message));
         }
         let err = (result.root - expected_root).abs();
-        if err > 1e-9 {
+        if err.is_nan() || err > 1e-9 {
             return Err(format!("newton root error too large: {err:.3e}"));
         }
         roots.push(("newton", result.root));
@@ -1214,7 +1218,7 @@ fn e2e_p2c003_13_root_methods_comparison() {
             return Err(format!("secant did not converge: {}", result.message));
         }
         let err = (result.root - expected_root).abs();
-        if err > 1e-9 {
+        if err.is_nan() || err > 1e-9 {
             return Err(format!("secant root error too large: {err:.3e}"));
         }
         roots.push(("secant", result.root));
@@ -1235,7 +1239,7 @@ fn e2e_p2c003_13_root_methods_comparison() {
             return Err(format!("halley did not converge: {}", result.message));
         }
         let err = (result.root - expected_root).abs();
-        if err > 1e-9 {
+        if err.is_nan() || err > 1e-9 {
             return Err(format!("halley root error too large: {err:.3e}"));
         }
         roots.push(("halley", result.root));
@@ -1292,22 +1296,22 @@ fn e2e_p2c003_14_fsolve_multivariate() {
         let r = (result.x[0].powi(2) + result.x[1].powi(2)).sqrt();
         let diff = (result.x[0] - result.x[1]).abs();
 
-        if (r - 1.0).abs() > 0.01 || diff > 0.01 {
-            return Err(format!(
+        if (r - 1.0).abs() <= 0.01 && diff <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "found root: x=[{:.6}, {:.6}], residual_norm={:.2e}",
+                    result.x[0],
+                    result.x[1],
+                    l2_norm(&result.fun)
+                ),
+                result.function_calls,
+            ))
+        } else {
+            Err(format!(
                 "solution incorrect: x={:?}, r={:.4}, diff={:.4}",
                 result.x, r, diff
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "found root: x=[{:.6}, {:.6}], residual_norm={:.2e}",
-                result.x[0],
-                result.x[1],
-                l2_norm(&result.fun)
-            ),
-            result.function_calls,
-        ))
     });
 
     runner.record_step("solve_3d_system", "fsolve", || {
@@ -1373,20 +1377,20 @@ fn e2e_p2c003_15_free_variable_linear_programs() {
         if !result.success {
             return Err(format!("linprog did not converge: {}", result.message));
         }
-        if (result.x[0] - 1.0).abs() > 0.01 || (result.fun - 1.0).abs() > 0.01 {
-            return Err(format!(
+        if (result.x[0] - 1.0).abs() <= 0.01 && (result.fun - 1.0).abs() <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "optimal free-variable LP: x=[{:.4}], f={:.4}",
+                    result.x[0], result.fun
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "free-variable LP solution incorrect: x={:?}, f={:.4}, expected x=[1], f=1",
                 result.x, result.fun
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "optimal free-variable LP: x=[{:.4}], f={:.4}",
-                result.x[0], result.fun
-            ),
-            0,
-        ))
     });
 
     runner.record_step("solve_free_integer_milp", "milp", || {
@@ -1411,20 +1415,20 @@ fn e2e_p2c003_15_free_variable_linear_programs() {
         if !result.success {
             return Err(format!("milp did not converge: {}", result.message));
         }
-        if result.x != vec![2.0] || (result.fun - (-2.0)).abs() > 0.01 {
-            return Err(format!(
+        if result.x == vec![2.0] && (result.fun - (-2.0)).abs() <= 0.01 {
+            Ok(StepOutcome::new(
+                format!(
+                    "optimal free-integer MILP: x=[{:.4}], f={:.4}",
+                    result.x[0], result.fun
+                ),
+                0,
+            ))
+        } else {
+            Err(format!(
                 "free-variable MILP solution incorrect: x={:?}, f={:.4}, expected x=[2], f=-2",
                 result.x, result.fun
-            ));
+            ))
         }
-
-        Ok(StepOutcome::new(
-            format!(
-                "optimal free-integer MILP: x=[{:.4}], f={:.4}",
-                result.x[0], result.fun
-            ),
-            0,
-        ))
     });
 
     let bundle = runner.finish();

@@ -116,7 +116,12 @@ fn write_bundle(scenario_id: &str, bundle: &ForensicLogBundle) {
     fs::write(&path, &json).expect("write interpolate e2e artifact bundle");
 }
 
+/// `zip` stops at the shorter side, so a short or empty result would fold to 0 and read as exact
+/// agreement. A length mismatch is infinitely wrong instead.
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -618,16 +623,16 @@ fn scenario_15_rect_bivariate_spline_scipy_shape() {
         || {
             let result = spline.eval_grid(&[0.5, 1.5], &[0.5, 1.5]);
             let expected = [vec![5.5, 6.5], vec![15.5, 16.5]];
-            let max_err = result
-                .iter()
-                .zip(expected.iter())
-                .flat_map(|(got_row, expected_row)| {
-                    got_row
-                        .iter()
-                        .zip(expected_row.iter())
-                        .map(|(&got, &want)| (got - want).abs())
-                })
-                .fold(0.0_f64, nan_max);
+            // A missing row or a short row reads as INFINITY, not as a small error.
+            let max_err = if result.len() == expected.len() {
+                result
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(got_row, expected_row)| max_abs_diff(got_row, expected_row))
+                    .fold(0.0_f64, nan_max)
+            } else {
+                f64::INFINITY
+            };
             if max_err < 1e-10 {
                 Ok(format!("max_grid_error={max_err:.2e}"))
             } else {

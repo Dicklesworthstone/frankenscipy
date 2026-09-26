@@ -109,21 +109,27 @@ fn sample_cov(samples: &[Vec<f64>], mean: &[f64], d: usize) -> Vec<Vec<f64>> {
     cov
 }
 
+/// `zip` stops at the shorter side, so a short or empty operand would fold to 0 and read as
+/// agreement. A length mismatch is infinitely wrong instead.
 fn max_abs_diff_vec(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f64, nan_max)
 }
 
+/// Row-count or per-row length mismatches read as INFINITY, as in [`max_abs_diff_vec`].
 fn max_abs_diff_mat(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
-    let mut m = 0.0_f64;
-    for (ra, rb) in a.iter().zip(b.iter()) {
-        for (va, vb) in ra.iter().zip(rb.iter()) {
-            m = nan_max(m, (va - vb).abs());
-        }
+    if a.len() != b.len() {
+        return f64::INFINITY;
     }
-    m
+    a.iter()
+        .zip(b.iter())
+        .map(|(ra, rb)| max_abs_diff_vec(ra, rb))
+        .fold(0.0_f64, nan_max)
 }
 
 /// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a

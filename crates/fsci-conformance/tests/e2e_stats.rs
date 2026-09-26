@@ -640,17 +640,22 @@ fn e2e_002_multi_distribution_roundtrip() {
 
     for (step_id, (name, ppf, cdf)) in distributions.iter().enumerate() {
         let t = Instant::now();
-        let mut dist_pass = true;
-        for &q in &quantiles {
-            let x = ppf(q);
-            if !x.is_finite() {
-                continue;
-            }
-            let roundtrip = cdf(x);
-            if (roundtrip - q).abs() > 1e-4 {
-                dist_pass = false;
-            }
-        }
+        // SciPy 1.17.1's ppf is finite at all 7 quantiles for every one of these 11
+        // distributions, so a non-finite fsci ppf is a failure of the step, not a skip, and a
+        // NaN roundtrip fails the `<=` gate.
+        let failures: Vec<(f64, f64, f64)> = quantiles
+            .iter()
+            .filter_map(|&q| {
+                let x = ppf(q);
+                let roundtrip = cdf(x);
+                if x.is_finite() && (roundtrip - q).abs() <= 1e-4 {
+                    None
+                } else {
+                    Some((q, x, roundtrip))
+                }
+            })
+            .collect();
+        let dist_pass = failures.is_empty();
         if !dist_pass {
             all_pass = false;
         }
@@ -659,7 +664,7 @@ fn e2e_002_multi_distribution_roundtrip() {
             name,
             "CDF(PPF(q)) roundtrip",
             &format!("quantiles={quantiles:?}"),
-            &format!("all_close={dist_pass}"),
+            &format!("all_close={dist_pass} failures(q, ppf, cdf)={failures:?}"),
             t.elapsed().as_nanos(),
             if dist_pass { "pass" } else { "FAIL" },
         ));
@@ -2486,7 +2491,8 @@ fn e2e_024_probplot_filliben_quantiles() {
         .zip(&expected)
         .map(|(&got, &want)| (got - want).abs())
         .fold(0.0_f64, nan_max);
-    let pass = max_err < 2e-8;
+    // zip stops at the shorter side, so a short result would read as a small max_err.
+    let pass = probabilities.len() == expected.len() && max_err < 2e-8;
     if !pass {
         all_pass = false;
     }
@@ -2572,6 +2578,7 @@ fn e2e_025_robust_helper_edge_semantics() {
     let pass = constant_compare[0].is_nan()
         && constant_compare[1].is_infinite()
         && constant_compare[1].is_sign_positive()
+        && same_object.len() == 2
         && same_object.iter().all(|&value| value.is_nan());
     if !pass {
         all_pass = false;
@@ -2589,8 +2596,11 @@ fn e2e_025_robust_helper_edge_semantics() {
     let t = Instant::now();
     let zero = gzscore(&[0.0, 1.0, 2.0]);
     let negative = gzscore(&[-1.0, 1.0, 2.0]);
-    let pass =
-        zero.iter().all(|&value| value.is_nan()) && negative.iter().all(|&value| value.is_nan());
+    // `all` over an empty result is vacuously true, so the lengths are part of the contract.
+    let pass = zero.len() == 3
+        && negative.len() == 3
+        && zero.iter().all(|&value| value.is_nan())
+        && negative.iter().all(|&value| value.is_nan());
     if !pass {
         all_pass = false;
     }
@@ -2798,10 +2808,11 @@ fn e2e_028_multiple_testing_helper_contracts() {
     let t = Instant::now();
     let bh = false_discovery_control(&pvalues, None).expect("default bh");
     let expected_bh = [0.02, 0.04, 0.04, 0.02];
-    let pass = bh
-        .iter()
-        .zip(expected_bh.iter())
-        .all(|(&actual, &expected)| (actual - expected).abs() < TOL);
+    let pass = bh.len() == expected_bh.len()
+        && bh
+            .iter()
+            .zip(expected_bh.iter())
+            .all(|(&actual, &expected)| (actual - expected).abs() < TOL);
     if !pass {
         all_pass = false;
     }
@@ -2823,11 +2834,13 @@ fn e2e_028_multiple_testing_helper_contracts() {
         0.083_333_333_333_333_31,
         0.041_666_666_666_666_664,
     ];
-    let pass = by.iter().zip(expected_by.iter()).zip(bh.iter()).all(
-        |((&actual, &expected), &bh_value)| {
-            (actual - expected).abs() < TOL && actual + TOL >= bh_value
-        },
-    );
+    let pass = by.len() == expected_by.len()
+        && bh.len() == expected_by.len()
+        && by.iter().zip(expected_by.iter()).zip(bh.iter()).all(
+            |((&actual, &expected), &bh_value)| {
+                (actual - expected).abs() < TOL && actual + TOL >= bh_value
+            },
+        );
     if !pass {
         all_pass = false;
     }
@@ -2845,11 +2858,12 @@ fn e2e_028_multiple_testing_helper_contracts() {
     let bonferroni = multipletests_bonferroni(&pvalues, 0.05);
     let expected_corrected = [0.04, 0.16, 0.12, 0.02];
     let expected_reject = [true, false, false, true];
-    let pass = bonferroni
-        .pvalues_corrected
-        .iter()
-        .zip(expected_corrected.iter())
-        .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
+    let pass = bonferroni.pvalues_corrected.len() == expected_corrected.len()
+        && bonferroni
+            .pvalues_corrected
+            .iter()
+            .zip(expected_corrected.iter())
+            .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
         && bonferroni.reject.as_slice() == expected_reject.as_slice();
     if !pass {
         all_pass = false;
@@ -2871,11 +2885,12 @@ fn e2e_028_multiple_testing_helper_contracts() {
     let holm = multipletests_holm(&pvalues, 0.05);
     let expected_corrected = [0.03, 0.06, 0.06, 0.02];
     let expected_reject = [true, false, false, true];
-    let pass = holm
-        .pvalues_corrected
-        .iter()
-        .zip(expected_corrected.iter())
-        .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
+    let pass = holm.pvalues_corrected.len() == expected_corrected.len()
+        && holm
+            .pvalues_corrected
+            .iter()
+            .zip(expected_corrected.iter())
+            .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
         && holm.reject.as_slice() == expected_reject.as_slice();
     if !pass {
         all_pass = false;
@@ -2898,11 +2913,12 @@ fn e2e_028_multiple_testing_helper_contracts() {
     let invalid = false_discovery_control(&[0.01, 0.02], Some("unknown"));
     let expected_corrected = [0.02, 0.04, 0.04, 0.02];
     let expected_reject = [true, true, true, true];
-    let pass = fdr_bh
-        .pvalues_corrected
-        .iter()
-        .zip(expected_corrected.iter())
-        .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
+    let pass = fdr_bh.pvalues_corrected.len() == expected_corrected.len()
+        && fdr_bh
+            .pvalues_corrected
+            .iter()
+            .zip(expected_corrected.iter())
+            .all(|(&actual, &expected)| (actual - expected).abs() < TOL)
         && fdr_bh.reject.as_slice() == expected_reject.as_slice()
         && invalid.is_err();
     if !pass {
@@ -3680,7 +3696,7 @@ fn e2e_035_rankdata_method_parity() {
 
     let t = Instant::now();
     let nan_ranks = rankdata(&[1.0, f64::NAN, 2.0], Some("ordinal")).expect("nan rankdata");
-    let pass = nan_ranks.iter().all(|rank| rank.is_nan());
+    let pass = nan_ranks.len() == 3 && nan_ranks.iter().all(|rank| rank.is_nan());
     if !pass {
         all_pass = false;
     }
@@ -4490,7 +4506,7 @@ fn e2e_043_trimmed_statistics_live_scipy_parity() {
                 oracle.tvar,
                 oracle.tstd,
                 oracle.tsem,
-                diffs.iter().copied().fold(0.0, f64::max)
+                diffs.iter().copied().fold(0.0, nan_max)
             ),
             t.elapsed().as_nanos(),
             if pass { "pass" } else { "FAIL" },
