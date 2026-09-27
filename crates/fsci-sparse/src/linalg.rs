@@ -221,6 +221,8 @@ struct PackedTriangularRows {
 struct TriangularLevelSchedule {
     offsets: Vec<usize>,
     rows: Vec<usize>,
+    /// Stored entries each level's rows reduce over: the level's work.
+    work: Vec<usize>,
 }
 
 impl TriangularLevelSchedule {
@@ -268,33 +270,72 @@ impl TriangularLevelSchedule {
 
         let mut offsets = Vec::with_capacity(levels.len() + 1);
         let mut scheduled_rows = Vec::with_capacity(row_count);
+        let mut work = Vec::with_capacity(levels.len());
         offsets.push(0);
         for level in levels {
+            work.push(
+                level
+                    .iter()
+                    .map(|&row| rows.offsets[row + 1] - rows.offsets[row])
+                    .sum(),
+            );
             scheduled_rows.extend(level);
             offsets.push(scheduled_rows.len());
         }
         Some(Self {
             offsets,
             rows: scheduled_rows,
+            work,
         })
     }
 
+    #[cfg(test)]
     fn has_parallel_rows(&self) -> bool {
         self.offsets
             .windows(2)
             .any(|window| window[1] - window[0] > 1)
     }
 
-    fn levels(&self) -> impl Iterator<Item = &[usize]> {
+    /// Work in levels of at least [`LEVEL_PAR_MIN_WORK`], the only ones the pool runs.
+    fn pooled_work(&self) -> usize {
+        self.work
+            .iter()
+            .filter(|&&work| work >= LEVEL_PAR_MIN_WORK)
+            .sum()
+    }
+
+    fn total_work(&self) -> usize {
+        self.work.iter().sum()
+    }
+
+    /// Each level's rows with its work.
+    fn levels(&self) -> impl Iterator<Item = (&[usize], usize)> {
         self.offsets
             .windows(2)
-            .map(|window| &self.rows[window[0]..window[1]])
+            .zip(&self.work)
+            .map(|(window, &work)| (&self.rows[window[0]..window[1]], work))
     }
 }
 
+/// Stored entries a level reduces over before it goes to the rayon pool. A pooled level costs a
+/// dispatch and a barrier, microseconds, and before this gate every level took the pool as soon
+/// as any level had two rows. The factors of shift-invert eigsh are the example: a tridiagonal
+/// A − σI has wide levels of two-entry rows, microseconds of work each, and the eigensolve ran at
+/// 62–81 ms on 64 threads against 28–41 ms on one core (frankenscipy-moti4). A row-count gate
+/// (1024 rows) did not change that. Work is what the pool has to amortize.
+///
+/// Tuned on perf_splu's solve stage (3-D Laplacian, side 24, against live SuperLU): at 2^17 the
+/// solve lost ~4% (0.853x against 0.889–0.908x before the gate), because pooled levels had been
+/// helping there. At 2^15 it reads 0.889x, within the before runs, and the shift-invert case
+/// stays fixed.
+const LEVEL_PAR_MIN_WORK: usize = 1 << 15;
+
+/// A schedule pays only when most of the solve's work sits in levels big enough for the pool.
+/// Otherwise the plain row-order loop, with its sequential memory access, is the faster path.
 #[inline]
 fn level_schedule_is_useful(schedule: &TriangularLevelSchedule) -> bool {
-    schedule.has_parallel_rows()
+    2 * schedule.pooled_work() >= schedule.total_work()
+        && schedule.pooled_work() > 0
         && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() > 1)
 }
 
@@ -320,7 +361,16 @@ fn triangular_forward_substitute<F>(
         )
     };
     if let Some(schedule) = schedule {
-        for rows in schedule.levels() {
+        for (rows, work) in schedule.levels() {
+            // Rows in one level never read each other, so a light level solved in place, in
+            // any order, gives the same bits as the pooled collect.
+            if work < LEVEL_PAR_MIN_WORK {
+                for &row in rows {
+                    let value = reduce(row, solved);
+                    solved[row] = value;
+                }
+                continue;
+            }
             let completed = rows
                 .par_iter()
                 .map(|&row| (row, reduce(row, solved)))
@@ -367,7 +417,14 @@ fn triangular_backward_substitute(
         ) / pivot)
     };
     if let Some(schedule) = schedule {
-        for rows in schedule.levels() {
+        for (rows, work) in schedule.levels() {
+            if work < LEVEL_PAR_MIN_WORK {
+                for &row in rows {
+                    let value = reduce(row, solved)?;
+                    solved[row] = value;
+                }
+                continue;
+            }
             let completed = rows
                 .par_iter()
                 .map(|&row| reduce(row, solved).map(|value| (row, value)))
@@ -17527,7 +17584,10 @@ mod tests {
         assert!(lu.lower_levels.has_parallel_rows());
         assert!(lu.upper_levels.has_parallel_rows());
         assert_eq!(
-            lu.lower_levels.levels().collect::<Vec<_>>(),
+            lu.lower_levels
+                .levels()
+                .map(|(rows, _)| rows)
+                .collect::<Vec<_>>(),
             vec![&[0, 1][..], &[2, 3][..]]
         );
 
@@ -17578,6 +17638,107 @@ mod tests {
                 "level-scheduled component {index} differs"
             );
         }
+    }
+
+    /// Levels with at least LEVEL_PAR_MIN_WORK stored entries go to the pool, lighter ones are
+    /// solved in place (frankenscipy-moti4). Here the second half of L and the first half of U
+    /// are one pooled level each (1024 rows × LEVEL_PAR_MIN_WORK/1024 entries = exactly the
+    /// gate), and the other
+    /// levels are light. Both paths must match the serial dependency order bit for bit. A
+    /// schedule the old rule accepted, one two-row level ahead of a chain, must not count as
+    /// useful.
+    #[test]
+    fn heavy_and_light_levels_both_match_the_serial_order_bits() {
+        let half = 1024;
+        let fan = LEVEL_PAR_MIN_WORK / half;
+        let n = 2 * half;
+        let lower_rows: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|row| {
+                if row < half {
+                    vec![]
+                } else {
+                    let i = row - half;
+                    let mut deps: Vec<usize> = (0..fan).map(|j| (i + 7 * j) % half).collect();
+                    deps.sort_unstable();
+                    deps.dedup();
+                    deps.into_iter()
+                        .map(|col| (col, 0.001 * ((row + col) % 13) as f64))
+                        .collect()
+                }
+            })
+            .collect();
+        let upper_rows: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|row| {
+                let diagonal = (row, 2.0 + (row % 5) as f64 * 0.125);
+                if row < half {
+                    let mut deps: Vec<usize> =
+                        (0..fan).map(|j| half + (row + 5 * j) % half).collect();
+                    deps.sort_unstable();
+                    deps.dedup();
+                    std::iter::once(diagonal)
+                        .chain(
+                            deps.into_iter()
+                                .map(|col| (col, 0.001 * ((row + col) % 11) as f64)),
+                        )
+                        .collect()
+                } else {
+                    vec![diagonal]
+                }
+            })
+            .collect();
+        let lu = NativeSparseLu::from_factor_rows(
+            n,
+            (0..n).collect(),
+            lower_rows,
+            upper_rows,
+            None,
+            PermutationOrdering::Natural,
+        );
+        assert!(lu.lower_levels.pooled_work() >= LEVEL_PAR_MIN_WORK);
+        assert!(lu.upper_levels.pooled_work() >= LEVEL_PAR_MIN_WORK);
+        let rhs: Vec<f64> = (0..n).map(|i| 1.0 + (i % 11) as f64 * 0.3).collect();
+        let solve = |schedule: bool| {
+            let mut x = vec![0.0; n];
+            triangular_forward_substitute(
+                &lu.lower.offsets,
+                &lu.lower.columns,
+                &lu.lower.values,
+                |row| rhs[row],
+                &mut x,
+                false,
+                schedule.then_some(&lu.lower_levels),
+            );
+            triangular_backward_substitute(
+                &lu.upper.offsets,
+                &lu.upper.columns,
+                &lu.upper.values,
+                &mut x,
+                false,
+                schedule.then_some(&lu.upper_levels),
+            )
+            .expect("valid diagonals");
+            x
+        };
+        let (scheduled, serial) = (solve(true), solve(false));
+        assert!(
+            scheduled
+                .iter()
+                .zip(&serial)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        // One two-row level ahead of a chain: the old rule (any level wider than one row) took
+        // the pool for every level of this; it is all thin and must not count as useful.
+        let chain = NativeSparseLu::from_factor_rows(
+            4,
+            vec![0, 1, 2, 3],
+            vec![vec![], vec![], vec![(1, 0.5)], vec![(2, 0.5)]],
+            (0..4).map(|row| vec![(row, 2.0)]).collect(),
+            None,
+            PermutationOrdering::Natural,
+        );
+        assert!(chain.lower_levels.has_parallel_rows());
+        assert_eq!(chain.lower_levels.pooled_work(), 0);
+        assert!(!level_schedule_is_useful(&chain.lower_levels));
     }
 
     #[test]
