@@ -963,6 +963,7 @@ fn end_to_end() {
             EigsOptions {
                 tol: 1e-8,
                 max_iter: 80,
+                ..EigsOptions::default()
             },
         );
         let dt = t0.elapsed();

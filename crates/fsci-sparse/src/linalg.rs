@@ -28,7 +28,7 @@ use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
 // still builds clean, so a `cargo build` or `cargo check` does not see the breakage.
 #[cfg(test)]
 use crate::formats::CooMatrix;
-use crate::ops::FormatConvertible;
+use crate::ops::{FormatConvertible, scale_csr, sub_csr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseBackend {
@@ -27809,14 +27809,14 @@ mod tests {
                 matches!(norm, Err(SparseError::NonFiniteInput { .. })),
                 "slot {slot}: SciPy raises; fsci returned {norm:?}"
             );
-            // svds keeps its flag convention (converged = false where SciPy raises), and
-            // the singular value it reports is NaN, not a fabricated 0.
-            let svd = svds(&a, 1, EigsOptions::default()).expect("svds");
-            assert!(!svd.converged, "slot {slot}: {svd:?}");
+            // svds refuses too: scipy 1.17.1 svds(a, k=1) raises ArpackError -9999 ("Could not
+            // build an Arnoldi factorization") at both slots, live. The restarted Lanczos
+            // (frankenscipy-1ksfv.10) reports the non-finite Krylov vector as an error; the
+            // one-pass solver it replaced returned converged = false with a NaN value.
+            let svd = svds(&a, 1, EigsOptions::default());
             assert!(
-                svd.singular_values.first().is_some_and(|s| s.is_nan()),
-                "slot {slot}: {:?}",
-                svd.singular_values
+                matches!(svd, Err(SparseError::NonFiniteInput { .. })),
+                "slot {slot}: SciPy raises; fsci returned {svd:?}"
             );
         }
         // MUST-NOT-CHANGE: the finite matrix still has its spectral norm.
@@ -28537,11 +28537,15 @@ mod tests {
     }
 
     // br-szq1n.7: `converged` must come from the Ritz residuals. MUST-MISS arm: the
-    // Grcar matrix is highly non-normal with its eigenvalues on a curve, so a single
-    // 13-vector Arnoldi pass (k = 6) cannot resolve the top six; the old code said
-    // `converged: true` regardless.
+    // Grcar matrix is highly non-normal with its eigenvalues on a curve, so one Krylov–Schur
+    // cycle (k = 6, max_iter = 1) cannot resolve the top six; the old single-pass code said
+    // `converged: true` regardless. eigs now restarts, so the budget is pinned to one cycle,
+    // and non-convergence is an `EigsNoConvergence` error as SciPy raises
+    // `ArpackNoConvergence` (SciPy 1.17.1: eigs(grcar(200), k=6, maxiter=1) -> "0/6
+    // eigenvectors converged"; with the default maxiter it also fails, 0/6 after 2001
+    // iterations).
     #[test]
-    fn eigs_reports_nonconvergence_on_grcar() {
+    fn eigs_reports_nonconvergence_on_grcar() -> Result<(), String> {
         let n = 200usize;
         let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
@@ -28560,12 +28564,20 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr");
-        let result = eigs(&a, 6, EigsOptions::default()).expect("eigs runs");
-        assert!(
-            !result.converged,
-            "one short Arnoldi pass on Grcar(200) cannot have converged: {:?}",
-            result.eigenvalues
-        );
+        let one_cycle = EigsOptions {
+            max_iter: 1,
+            ..EigsOptions::default()
+        };
+        let outcome = eigs(&a, 6, one_cycle);
+        let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+            return Err(format!(
+                "one Krylov–Schur cycle on Grcar(200) cannot converge: {outcome:?}"
+            ));
+        };
+        println!("grcar(200) k=6 max_iter=1: {message}");
+        assert!(!partial.converged);
+        assert!(partial.eigenvalues.len() < 6);
+        Ok(())
     }
 
     // MUST-HIT arm: when the Krylov space is the whole space (m = n) the Ritz pairs
@@ -30662,12 +30674,12 @@ mod tests {
         // get a benchmark-tuned 18.
         for k in 1..=12 {
             assert_eq!(
-                eigsh_krylov_window(10_000, k),
+                arpack_default_ncv(10_000, k),
                 (2 * k + 1).max(20),
                 "k = {k}"
             );
         }
-        assert_eq!(eigsh_krylov_window(10, 6), 10, "window is capped at n");
+        assert_eq!(arpack_default_ncv(10, 6), 10, "window is capped at n");
     }
 
     #[test]
@@ -31417,62 +31429,318 @@ mod tests {
 // ══════════════════════════════════════════════════════════════════════
 
 /// Result of sparse eigenvalue computation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EigsResult {
-    /// Eigenvalues (real parts). For [`eigsh`]/[`svds`] (symmetric/PSD operators)
-    /// these are the full eigenvalues; for general [`eigs`] they are the real
-    /// parts of the (possibly complex) eigenvalues — see [`Self::eigenvalues_im`].
+    /// Eigenvalues (real parts). [`eigsh`] returns them in ascending order, as
+    /// `scipy.sparse.linalg.eigsh` does when it returns eigenvectors. [`eigs`] returns the most
+    /// wanted first under its `which` (of the shifted-and-inverted values when `sigma` is set),
+    /// with a complex-conjugate pair adjacent, positive imaginary part first. [`svds`] runs the
+    /// symmetric kernel on AᵀA, largest first.
     pub eigenvalues: Vec<f64>,
     /// Imaginary parts of the eigenvalues, aligned with [`Self::eigenvalues`].
     /// All zero for symmetric operators ([`eigsh`]/[`svds`]); for general
     /// [`eigs`] a complex-conjugate pair appears as `±im`, matching
     /// `scipy.sparse.linalg.eigs`, which returns a complex array.
     pub eigenvalues_im: Vec<f64>,
-    /// Eigenvectors as columns (row-major: `eigenvectors[i]` is the i-th eigenvector).
-    /// For general [`eigs`] this is the real part of the (possibly complex)
-    /// eigenvector — see [`Self::eigenvectors_im`].
+    /// Eigenvectors (`eigenvectors[i]` belongs to `eigenvalues[i]`). With a mass matrix `M` they
+    /// are M-orthonormal (ARPACK's B-normalization), otherwise of unit 2-norm. For general
+    /// [`eigs`] this is the real part of the (possibly complex) eigenvector — see
+    /// [`Self::eigenvectors_im`].
     pub eigenvectors: Vec<Vec<f64>>,
     /// Imaginary parts of the eigenvectors, aligned with [`Self::eigenvectors`].
     /// All zero for symmetric operators and for real eigenpairs of [`eigs`].
     pub eigenvectors_im: Vec<Vec<f64>>,
-    /// Number of matrix-vector products performed.
+    /// Operator applications (`A·x`, `M⁻¹A·x`, or one factored solve in shift-invert mode)
+    /// plus the matrix-vector products of the explicit residual check.
     pub nmatvec: usize,
-    /// Whether all requested eigenvalues converged.
+    /// Krylov–Schur restart cycles run (ARPACK's `iter`).
+    pub iterations: usize,
+    /// Krylov basis size used (SciPy's `ncv`).
+    pub ncv: usize,
+    /// Whether every requested pair converged. [`eigs`] and [`eigsh`] return
+    /// [`SparseError::EigsNoConvergence`] rather than an unconverged result, so their `Ok` value
+    /// always says `true`; the partial result inside that error (the pairs that did converge)
+    /// and [`svds`]'s result can say `false`.
     pub converged: bool,
 }
 
-/// Options for sparse eigenvalue computation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EigsOptions {
-    /// Tolerance for convergence.
-    pub tol: f64,
-    /// Maximum iterations.
-    pub max_iter: usize,
+/// Which eigenvalues [`eigsh`] and [`eigs`] compute: SciPy's `which=`.
+///
+/// [`eigsh`] accepts `LM`, `SM`, `LA`, `SA` and `BE`; [`eigs`] accepts `LM`, `SM`, `LR`, `SR`,
+/// `LI` and `SI`, as SciPy does. With `sigma` set the selection applies to the
+/// shifted-and-inverted eigenvalues `1/(λ − σ)`, so `LM` finds the eigenvalues nearest `σ`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EigsWhich {
+    /// `'LM'`: largest magnitude (the default).
+    #[default]
+    LargestMagnitude,
+    /// `'SM'`: smallest magnitude.
+    SmallestMagnitude,
+    /// `'LA'`: largest algebraic value ([`eigsh`] only).
+    LargestAlgebraic,
+    /// `'SA'`: smallest algebraic value ([`eigsh`] only).
+    SmallestAlgebraic,
+    /// `'BE'`: `k/2` from each end of the spectrum, one more from the high end when `k` is odd
+    /// ([`eigsh`] only; needs `k > 1`).
+    BothEnds,
+    /// `'LR'`: largest real part ([`eigs`] only).
+    LargestReal,
+    /// `'SR'`: smallest real part ([`eigs`] only).
+    SmallestReal,
+    /// `'LI'`: largest imaginary part in magnitude ([`eigs`] only).
+    LargestImaginary,
+    /// `'SI'`: smallest imaginary part in magnitude ([`eigs`] only).
+    SmallestImaginary,
 }
 
-impl Default for EigsOptions {
-    fn default() -> Self {
-        Self {
-            tol: 1e-10,
-            max_iter: 1000,
+impl EigsWhich {
+    /// SciPy's two-letter spelling.
+    #[must_use]
+    pub const fn scipy_name(self) -> &'static str {
+        match self {
+            Self::LargestMagnitude => "LM",
+            Self::SmallestMagnitude => "SM",
+            Self::LargestAlgebraic => "LA",
+            Self::SmallestAlgebraic => "SA",
+            Self::BothEnds => "BE",
+            Self::LargestReal => "LR",
+            Self::SmallestReal => "SR",
+            Self::LargestImaginary => "LI",
+            Self::SmallestImaginary => "SI",
+        }
+    }
+
+    /// Accepted by `eigsh` (ARPACK `dsaupd`).
+    const fn symmetric_mode(self) -> bool {
+        matches!(
+            self,
+            Self::LargestMagnitude
+                | Self::SmallestMagnitude
+                | Self::LargestAlgebraic
+                | Self::SmallestAlgebraic
+                | Self::BothEnds
+        )
+    }
+
+    /// Accepted by `eigs` (ARPACK `dnaupd`).
+    const fn general_mode(self) -> bool {
+        matches!(
+            self,
+            Self::LargestMagnitude
+                | Self::SmallestMagnitude
+                | Self::LargestReal
+                | Self::SmallestReal
+                | Self::LargestImaginary
+                | Self::SmallestImaginary
+        )
+    }
+}
+
+impl std::str::FromStr for EigsWhich {
+    type Err = SparseError;
+
+    /// Parses SciPy's spelling (`"LM"`, `"SA"`, ...).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "LM" => Ok(Self::LargestMagnitude),
+            "SM" => Ok(Self::SmallestMagnitude),
+            "LA" => Ok(Self::LargestAlgebraic),
+            "SA" => Ok(Self::SmallestAlgebraic),
+            "BE" => Ok(Self::BothEnds),
+            "LR" => Ok(Self::LargestReal),
+            "SR" => Ok(Self::SmallestReal),
+            "LI" => Ok(Self::LargestImaginary),
+            "SI" => Ok(Self::SmallestImaginary),
+            other => Err(SparseError::InvalidArgument {
+                message: format!("which must be one of LM SM LA SA BE LR SR LI SI, got {other:?}"),
+            }),
         }
     }
 }
 
-fn normalize_eigs_options(options: EigsOptions) -> EigsOptions {
-    let defaults = EigsOptions::default();
-    EigsOptions {
-        tol: if options.tol > 0.0 && options.tol.is_finite() {
-            options.tol
-        } else {
-            defaults.tol
-        },
-        max_iter: if options.max_iter == 0 {
-            defaults.max_iter
-        } else {
-            options.max_iter
-        },
+/// Options for [`eigsh`], [`eigs`] and [`svds`], after SciPy's keyword arguments. The default
+/// is SciPy's: `which='LM'`, `tol=0` (machine precision), `maxiter=None` (`n * 10`),
+/// `ncv=None`, no shift, no mass matrix, and a start vector chosen by the solver.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EigsOptions<'a> {
+    /// Relative accuracy of the Ritz values: a pair is converged when its residual estimate is
+    /// at most `tol·max(|θ|, ε^(2/3))`, ARPACK's `dsconv`/`dnconv` test on the operator's
+    /// eigenvalue θ, floored at the projected problem's rounding level `ncv·ε·max|θ|`. `0`
+    /// (the default) or a negative value means machine precision, as in SciPy/ARPACK; NaN and
+    /// ±∞ are refused.
+    pub tol: f64,
+    /// Maximum number of restart cycles (ARPACK's `maxiter`). `0` (the default) means SciPy's
+    /// `n * 10`.
+    pub max_iter: usize,
+    /// Which eigenvalues to compute.
+    pub which: EigsWhich,
+    /// Krylov basis size (`ncv`). `None` means SciPy's `min(n, max(2k + 1, 20))`; an explicit
+    /// value is capped at `n` and must exceed `k` ([`eigsh`]) or `k + 1` ([`eigs`]) unless it
+    /// spans the whole space.
+    pub ncv: Option<usize>,
+    /// Shift for shift-invert mode (SciPy's `sigma`, `mode='normal'`). The operator becomes
+    /// `(A − σM)⁻¹M` (`M = I` without a mass matrix), factored once with [`splu`]; eigenvalues
+    /// map back as `λ = σ + 1/θ`. A shift exactly at an eigenvalue fails with
+    /// [`SparseError::SingularMatrix`], where SciPy raises "Factor is exactly singular".
+    pub sigma: Option<f64>,
+    /// Mass matrix `M` of the generalized problem `A x = λ M x` (SciPy's `M`). It must be
+    /// symmetric positive definite (semi-definite suffices in shift-invert mode). Without
+    /// `sigma` the operator is `M⁻¹A` with `M` factored by [`splu`] (ARPACK mode 2).
+    pub mass: Option<&'a CsrMatrix>,
+    /// Starting vector (SciPy's `v0`). `None` uses a fixed-seed pseudo-random vector, so results
+    /// are reproducible (SciPy draws a random one).
+    pub v0: Option<&'a [f64]>,
+}
+
+/// The numeric settings of one `eigs`/`eigsh`/`svds` call after SciPy's defaults are applied.
+#[derive(Debug, Clone, Copy)]
+struct KrylovSettings {
+    tol: f64,
+    max_iter: usize,
+    ncv: usize,
+    which: EigsWhich,
+}
+
+/// SciPy's `choose_ncv(k)`, capped at `n`: `min(n, max(2k + 1, 20))`. One rule for every `k` and
+/// every matrix: the basis size is a function of `(n, k)` only (AGENTS #12; a `k == 6`
+/// benchmark special case was removed by frankenscipy-szq1n.15).
+fn arpack_default_ncv(n: usize, k: usize) -> usize {
+    (2 * k + 1).max(20).min(n)
+}
+
+/// Applies SciPy's defaults and argument checks to `options` for a problem of size `n` with `k`
+/// wanted pairs (`symmetric` selects the `eigsh` rules, otherwise the `eigs` rules).
+fn resolve_krylov_settings(
+    n: usize,
+    k: usize,
+    options: &EigsOptions<'_>,
+    symmetric: bool,
+) -> SparseResult<KrylovSettings> {
+    if !options.tol.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("tol must be finite, got {}", options.tol),
+        });
     }
+    let tol = if options.tol <= 0.0 {
+        f64::EPSILON
+    } else {
+        options.tol
+    };
+    let max_iter = if options.max_iter == 0 {
+        n.saturating_mul(10).max(1)
+    } else {
+        options.max_iter
+    };
+    let which = options.which;
+    if symmetric && !which.symmetric_mode() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "which must be one of LM SM LA SA BE, got {}",
+                which.scipy_name()
+            ),
+        });
+    }
+    if !symmetric && !which.general_mode() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "which must be one of LM SM LR SR LI SI, got {}",
+                which.scipy_name()
+            ),
+        });
+    }
+    if which == EigsWhich::BothEnds && k == 1 {
+        // ARPACK dsaupd error -13.
+        return Err(SparseError::InvalidArgument {
+            message: "NEV and WHICH = 'BE' are incompatible: which='BE' needs k > 1".to_string(),
+        });
+    }
+    let ncv = match options.ncv {
+        None => arpack_default_ncv(n, k),
+        Some(requested) => {
+            let ncv = requested.min(n);
+            let minimum = if symmetric { k + 1 } else { k + 2 };
+            if ncv < n && ncv < minimum {
+                return Err(SparseError::InvalidArgument {
+                    message: if symmetric {
+                        format!("ncv must be k<ncv<=n, ncv={requested}")
+                    } else {
+                        format!("ncv must be k+1<ncv<=n, ncv={requested}")
+                    },
+                });
+            }
+            ncv
+        }
+    };
+    Ok(KrylovSettings {
+        tol,
+        max_iter,
+        ncv,
+        which,
+    })
+}
+
+/// Checks `A`, `k`, `M`, `sigma` and `v0` for [`eigsh`]/[`eigs`]; returns `n`.
+fn validate_eigen_problem(
+    a: &CsrMatrix,
+    k: usize,
+    options: &EigsOptions<'_>,
+    name: &str,
+) -> SparseResult<usize> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!("{name} requires a square matrix"),
+        });
+    }
+    let n = shape.rows;
+    if k == 0 || k > n {
+        return Err(SparseError::InvalidArgument {
+            message: format!("k={k} must be in [1, {n}]"),
+        });
+    }
+    // SciPy's ARPACK cannot build an Arnoldi factorization from a NaN/Inf operator and raises
+    // (ARPACK error -9999); refuse up front rather than iterate on NaN.
+    if a.data().iter().any(|v| !v.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("{name}: the matrix contains NaN or Inf"),
+        });
+    }
+    if let Some(mass) = options.mass {
+        if mass.shape() != shape {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "wrong M dimensions {}x{}, should be {n}x{n}",
+                    mass.shape().rows,
+                    mass.shape().cols
+                ),
+            });
+        }
+        if mass.data().iter().any(|v| !v.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: format!("{name}: M contains NaN or Inf"),
+            });
+        }
+    }
+    if let Some(sigma) = options.sigma
+        && !sigma.is_finite()
+    {
+        return Err(SparseError::InvalidArgument {
+            message: format!("sigma must be finite, got {sigma}"),
+        });
+    }
+    if let Some(v0) = options.v0 {
+        if v0.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("v0 has length {}, expected {n}", v0.len()),
+            });
+        }
+        if v0.iter().any(|v| !v.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "v0 contains NaN or Inf".to_string(),
+            });
+        }
+    }
+    Ok(n)
 }
 
 /// Solve a sparse triangular system Ax = b.
@@ -31541,775 +31809,2612 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
     Ok(x)
 }
 
-/// Compute the `k` largest-magnitude eigenvalues/eigenvectors of a sparse symmetric matrix,
-/// as `scipy.sparse.linalg.eigsh(A, k=k, which='LM')`.
+/// `k` eigenpairs of the sparse symmetric matrix `A` (or of the symmetric-definite pencil
+/// `A x = λ M x`), as `scipy.sparse.linalg.eigsh(A, k, M, sigma, which, v0, ncv, maxiter, tol)`
+/// with `mode='normal'`.
 ///
-/// Thick-restart Lanczos ([`thick_restart_lanczos`]) with SciPy's basis size
-/// `ncv = min(n, max(2k+1, 20))`, restarting until the k wanted Ritz pairs converge (as
-/// ARPACK's implicit restarts do) or `options.max_iter` restarts pass. `converged` also
-/// requires every returned pair's explicit residual ‖Ax − λx‖ ≤ tol·max(|λ|, 1). `which`,
-/// `sigma` (shift-invert) and `M` are not supported.
-pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "eigsh requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if k == 0 || k > n {
-        return Err(SparseError::InvalidArgument {
-            message: format!("k={k} must be in [1, {n}]"),
-        });
-    }
-    let options = normalize_eigs_options(options);
+/// Symmetric Krylov–Schur, i.e. thick-restart Lanczos (Stewart 2001; Wu & Simon 2000), with
+/// full DGKS reorthogonalization and locking of converged Ritz pairs: mathematically the
+/// implicitly restarted Lanczos method of ARPACK's `dsaupd`, which SciPy wraps. It restarts
+/// until every wanted Ritz pair passes ARPACK's test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))` or
+/// `max_iter` cycles pass. The operator follows SciPy's modes: `A` (mode 1), `M⁻¹A` in the
+/// M inner product (mode 2, `mass` without `sigma`), or `(A − σM)⁻¹M` (mode 3, `sigma`), with
+/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified as ARPACK's `dseupd`
+/// does.
+///
+/// Eigenvalues come back in ascending order with their eigenvectors (M-orthonormal with a mass
+/// matrix). Without a shift each eigenvalue is the Rayleigh quotient `xᵀAx / xᵀMx` of its
+/// returned vector; in shift-invert mode it is `σ + 1/θ`, as in ARPACK's `dseupd`. The
+/// convergence test is floored at the rounding level of the projected eigenproblem
+/// (`ncv·ε·max|θ|`), which ARPACK reaches through exact QL deflations instead. Every returned
+/// pair must also pass an explicit residual check,
+/// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`, a guard against an operator that
+/// no longer matches `A`.
+///
+/// # Errors
+/// - [`SparseError::EigsNoConvergence`] (SciPy's `ArpackNoConvergence`) when some wanted pair
+///   has not converged after `max_iter` cycles; it carries the pairs that did converge.
+/// - [`SparseError::SingularMatrix`] when `A − σM` is exactly singular (SciPy: "Factor is
+///   exactly singular").
+/// - [`SparseError::InvalidArgument`] for a `which` that `eigsh` does not take, `which='BE'`
+///   with `k = 1`, an `ncv` outside `k < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or
+///   an `M` that is not positive definite.
+/// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
+///
+/// Differences from SciPy: `k` may equal `n` (SciPy refuses `k ≥ n` for a sparse `A` and
+/// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one;
+/// `mode='buckling'`/`'cayley'`, `OPinv`/`Minv` operators and `return_eigenvectors=False` are
+/// not offered.
+pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+    let n = validate_eigen_problem(a, k, &options, "eigsh")?;
+    let settings = resolve_krylov_settings(n, k, &options, true)?;
+    let transform = SpectralTransform::build(a, &options, n)?;
+    // ARPACK's dgetv0 forces the start vector into the range of OP for a generalized problem.
+    let run = symmetric_krylov_schur(
+        |x: &[f64], bx: &[f64]| transform.apply(a, x, bx),
+        options.mass,
+        n,
+        k,
+        &settings,
+        options.v0,
+        options.mass.is_some(),
+    )?;
 
-    // A single Lanczos subspace of this size (what this used to run) resolves only the
-    // extreme pairs of a well-separated spectrum; on ordinary sparse matrices it left 5-50%
-    // residuals, so the basis is restarted until the wanted pairs converge
-    // (frankenscipy-1ksfv.10).
-    //
-    // br-szq1n.15: k == 6 used to get an 18-vector window and skip the explicit
-    // residual check, both tuned to "the live k=6 sparse benchmark" (AGENTS #12:
-    // the measured path must be the path a user gets). One rule now holds for
-    // every k: SciPy's window, explicit residuals.
-    let m = eigsh_krylov_window(n, k);
-    let mut result = thick_restart_lanczos(|v| csr_matvec(a, v), n, k, &options, m);
-    let (residuals_ok, resid_matvec) = eigsh_residual_check(a, &result, options.tol.max(1e-8));
-    result.nmatvec += resid_matvec;
-    // Both: every returned pair passes its residual test AND all k pairs came back (the Krylov
-    // kernel's flag). The residual check alone reported eigsh(I_30, k=3) -- one pair, the
-    // subspace collapses on the identity -- as converged (frankenscipy-szq1n.7).
-    result.converged = result.converged && residuals_ok;
-    Ok(result)
+    let sigma = transform.shift();
+    let a_norm = csr_norm_bound(a);
+    let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let guard = settings.tol.max(f64::EPSILON.sqrt());
+    let mut nmatvec = run.applications;
+    // (λ, eigenvector, converged)
+    let mut pairs: Vec<(f64, Vec<f64>, bool)> = Vec::with_capacity(run.theta.len());
+    for (i, &theta) in run.theta.iter().enumerate() {
+        let mut x = run.vectors[i].clone();
+        if transform.is_shift_invert() && theta != 0.0 {
+            // dseupd's purification: OP x/θ = x + (β·y_last/θ)·v_next lies in range(OP).
+            let c = run.coupling[i] / theta;
+            for (xi, &ni) in x.iter_mut().zip(&run.next) {
+                *xi += c * ni;
+            }
+            b_normalize(&mut x, options.mass);
+        }
+        let ax = csr_matvec(a, &x);
+        let mx = options.mass.map(|m| csr_matvec(m, &x));
+        nmatvec += 1 + usize::from(mx.is_some());
+        // Modes 1 and 2 return the Rayleigh quotient xᵀAx / xᵀMx of the returned vector. It
+        // agrees with the Ritz value to within ‖r‖²/gap and is free of the rounding the projected
+        // matrix accumulates over thousands of restarts (the Ritz value of the 2000-point
+        // Laplacian's smallest eigenvalue 2.46e-6 drifted by 1.6e-13 over 4185 cycles). In
+        // shift-invert mode σ + 1/θ is the sharper value near σ (3.3e-16 against 1.6e-15 for the
+        // quotient on the same Laplacian at σ = 1.0003), and a few cycles leave no drift.
+        let quotient = dot_product(&x, &ax) / dot_product(&x, mx.as_deref().unwrap_or(&x));
+        let lambda = if transform.is_shift_invert() || !quotient.is_finite() {
+            transform.eigenvalue(theta)
+        } else {
+            quotient
+        };
+        let resid = ax
+            .iter()
+            .zip(mx.as_deref().unwrap_or(&x))
+            .map(|(&axi, &mxi)| (axi - lambda * mxi).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let bound = guard * (a_norm + (lambda.abs() + sigma.abs()) * m_norm) * vec_norm(&x);
+        // A NaN residual fails: `resid <= bound` is false for NaN.
+        let ok = run.converged[i] && resid <= bound;
+        pairs.push((lambda, x, ok));
+    }
+    pairs.sort_by(|p, q| p.0.total_cmp(&q.0));
+
+    let converged = pairs.len() == k && pairs.iter().all(|p| p.2);
+    let assemble = |pairs: Vec<(f64, Vec<f64>, bool)>, converged: bool| {
+        let count = pairs.len();
+        let (eigenvalues, eigenvectors): (Vec<f64>, Vec<Vec<f64>>) =
+            pairs.into_iter().map(|(l, x, _)| (l, x)).unzip();
+        EigsResult {
+            eigenvalues,
+            eigenvalues_im: vec![0.0; count],
+            eigenvectors,
+            eigenvectors_im: vec![vec![0.0; n]; count],
+            nmatvec,
+            iterations: run.iterations,
+            ncv: settings.ncv,
+            converged,
+        }
+    };
+    if converged {
+        return Ok(assemble(pairs, true));
+    }
+    let good: Vec<(f64, Vec<f64>, bool)> = pairs.into_iter().filter(|p| p.2).collect();
+    let good_count = good.len();
+    Err(eigs_no_convergence(
+        run.iterations,
+        good_count,
+        k,
+        assemble(good, false),
+    ))
 }
 
-/// Thick-restart Lanczos (Wu & Simon 2000) for the `k` largest-magnitude eigenpairs of the
-/// symmetric operator `op` on `R^n`, with an `m`-vector basis (SciPy's `ncv`).
+/// SciPy's `ArpackNoConvergence` message, with the converged pairs as the partial result.
+fn eigs_no_convergence(
+    iterations: usize,
+    converged: usize,
+    k: usize,
+    partial: EigsResult,
+) -> SparseError {
+    SparseError::EigsNoConvergence {
+        message: format!(
+            "No convergence ({iterations} iterations, {converged}/{k} eigenvectors converged)"
+        ),
+        partial: Box::new(partial),
+    }
+}
+
+/// `max(‖A‖₁, ‖A‖∞)`, an upper bound on `‖A‖₂` for the explicit residual guard.
+fn csr_norm_bound(a: &CsrMatrix) -> f64 {
+    let (indptr, indices, data) = (a.indptr(), a.indices(), a.data());
+    let mut col_sums = vec![0.0_f64; a.shape().cols];
+    let mut row_max = 0.0_f64;
+    for row in 0..a.shape().rows {
+        let mut row_sum = 0.0;
+        for idx in indptr[row]..indptr[row + 1] {
+            let v = data[idx].abs();
+            row_sum += v;
+            col_sums[indices[idx]] += v;
+        }
+        row_max = row_max.max(row_sum);
+    }
+    col_sums.into_iter().fold(row_max, f64::max)
+}
+
+/// Scales `x` to unit B-norm (`B = M`, or the 2-norm without a mass matrix). A zero vector or a
+/// non-positive `xᵀMx` is left unchanged.
+fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
+    let norm_sq = match mass {
+        Some(m) => dot_product(x, &csr_matvec(m, x)),
+        None => dot_product(x, x),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        for xi in x.iter_mut() {
+            *xi *= inv;
+        }
+    }
+}
+
+/// SciPy's ARPACK modes 1-3 for one `eigs`/`eigsh` call: the operator the Krylov–Schur kernel
+/// iterates on, and how its eigenvalues θ map back to the problem's λ.
+enum SpectralTransform {
+    /// Mode 1: `OP = A`, `λ = θ`.
+    Standard,
+    /// Mode 2: `OP = M⁻¹A` in the M inner product, `λ = θ`. `M` is factored with [`splu`], as
+    /// SciPy's `get_inv_matvec(M)` does.
+    Generalized(SparseLuFactorization),
+    /// Mode 3: `OP = (A − σM)⁻¹M` (`M = I` without a mass matrix), `λ = σ + 1/θ`.
+    ShiftInvert {
+        sigma: f64,
+        factor: SparseLuFactorization,
+    },
+}
+
+impl SpectralTransform {
+    fn build(a: &CsrMatrix, options: &EigsOptions<'_>, n: usize) -> SparseResult<Self> {
+        match (options.sigma, options.mass) {
+            (None, None) => Ok(Self::Standard),
+            (None, Some(mass)) => Ok(Self::Generalized(splu(
+                &mass.to_csc()?,
+                LuOptions::default(),
+            )?)),
+            (Some(sigma), mass) => {
+                let shift = match mass {
+                    Some(m) => scale_csr(m, sigma)?,
+                    None => scale_csr(&eye(n)?, sigma)?,
+                };
+                let shifted = sub_csr(a, &shift)?;
+                let factor = splu(&shifted.to_csc()?, LuOptions::default())
+                    .map_err(|err| singular_shift_error(err, sigma))?;
+                Ok(Self::ShiftInvert { sigma, factor })
+            }
+        }
+    }
+
+    /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`), which is all mode 3 needs.
+    fn apply(&self, a: &CsrMatrix, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
+        match self {
+            Self::Standard => Ok(csr_matvec(a, x)),
+            Self::Generalized(mass_factor) => splu_solve(mass_factor, &csr_matvec(a, x)),
+            Self::ShiftInvert { sigma, factor } => {
+                splu_solve(factor, bx).map_err(|err| singular_shift_error(err, *sigma))
+            }
+        }
+    }
+
+    const fn is_shift_invert(&self) -> bool {
+        matches!(self, Self::ShiftInvert { .. })
+    }
+
+    /// `σ`, or 0 outside shift-invert mode.
+    const fn shift(&self) -> f64 {
+        match self {
+            Self::ShiftInvert { sigma, .. } => *sigma,
+            Self::Standard | Self::Generalized(_) => 0.0,
+        }
+    }
+
+    /// λ for a real Ritz value θ of `OP`.
+    fn eigenvalue(&self, theta: f64) -> f64 {
+        match self {
+            Self::ShiftInvert { sigma, .. } => sigma + 1.0 / theta,
+            Self::Standard | Self::Generalized(_) => theta,
+        }
+    }
+
+    /// λ for a complex Ritz value θ of `OP`.
+    fn eigenvalue_complex(&self, theta: (f64, f64)) -> (f64, f64) {
+        match self {
+            Self::ShiftInvert { sigma, .. } => {
+                let inv = complex_div((1.0, 0.0), theta);
+                (sigma + inv.0, inv.1)
+            }
+            Self::Standard | Self::Generalized(_) => theta,
+        }
+    }
+}
+
+/// A singular `A − σM` is SciPy's "Factor is exactly singular" (`splu` raises at σ exactly on
+/// an eigenvalue); other errors pass through.
+fn singular_shift_error(err: SparseError, sigma: f64) -> SparseError {
+    match err {
+        SparseError::SingularMatrix { message } => SparseError::SingularMatrix {
+            message: format!(
+                "Factor is exactly singular: A - sigma*M is singular at sigma={sigma} ({message})"
+            ),
+        },
+        other => other,
+    }
+}
+
+/// `a / b` in complex arithmetic (Smith's algorithm).
+fn complex_div(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.0.abs() >= b.1.abs() {
+        let r = b.1 / b.0;
+        let d = b.0 + b.1 * r;
+        ((a.0 + a.1 * r) / d, (a.1 - a.0 * r) / d)
+    } else {
+        let r = b.0 / b.1;
+        let d = b.0 * r + b.1;
+        ((a.0 * r + a.1) / d, (a.1 * r - a.0) / d)
+    }
+}
+
+/// `a · b` in complex arithmetic.
+fn complex_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// ARPACK's `eps23 = ε^(2/3)`: the floor of the relative convergence test and the relative
+/// size below which a Krylov residual counts as an invariant subspace.
+fn arpack_eps23() -> f64 {
+    f64::EPSILON.powf(2.0 / 3.0)
+}
+
+/// The rounding level of a Ritz residual estimate `|β·y_last|` computed from a dense `size`×`size`
+/// projected eigenproblem whose Ritz values have magnitudes `magnitudes`: `size·ε·max|θ|`.
 ///
-/// Each cycle extends the basis to `m` vectors with full (two-pass) reorthogonalization, takes
-/// the Ritz pairs of the projection, and stops when the `k` wanted residual estimates
-/// `|β·y_last|` are within `options.tol·max(|θ|, eps^(2/3))`. Otherwise it restarts from the best
-/// `k + (m−k)/2` Ritz vectors plus the normalized residual direction, which leaves the
-/// projection an arrowhead matrix that the next extension fills in. This plays the role of
-/// ARPACK `dsaupd`'s implicit restarts (SciPy's `eigsh`); at most `options.max_iter` cycles.
+/// ARPACK's test `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))` asks, at `tol = ε` and `|θ| ≪ max|θ|`, for
+/// an estimate far below this level. ARPACK meets it through its tridiagonal QL, whose exact
+/// deflations make the last eigenvector components exactly zero; a dense eigensolver computes
+/// those components only to about this level, and the test would never pass (observed: `eigsh`
+/// with `which='BE'` on the 300-point Laplacian stalled at 4/6 converged for 3000 cycles, where
+/// ARPACK needs 234). The test is therefore floored here, which still bounds the true residual
+/// by `(size + 1)·ε·‖H‖`, a backward-stable Ritz pair.
+fn krylov_estimate_floor(size: usize, magnitudes: impl Iterator<Item = f64>) -> f64 {
+    let largest = magnitudes.fold(0.0_f64, f64::max);
+    size as f64 * f64::EPSILON * largest
+}
+
+/// `y += a·x`.
+fn add_scaled(y: &mut [f64], a: f64, x: &[f64]) {
+    for (yi, &xi) in y.iter_mut().zip(x) {
+        *yi += a * xi;
+    }
+}
+
+/// Refuses a non-finite operator output: an overflowing `A·x`, or a solve through a singular
+/// factor, would otherwise be iterated on as if it were a direction.
+fn ensure_finite(w: &[f64]) -> SparseResult<()> {
+    if w.iter().all(|x| x.is_finite()) {
+        Ok(())
+    } else {
+        Err(SparseError::NonFiniteInput {
+            message: "the Krylov operator produced a non-finite vector".to_string(),
+        })
+    }
+}
+
+/// Scales `x` (and `bx = B·x`, when present) to unit B-norm; a zero vector is left alone.
+fn normalize_with(x: &mut [f64], bx: Option<&mut Vec<f64>>) {
+    let norm_sq = match bx.as_deref() {
+        Some(b) => dot_product(x, b),
+        None => dot_product(x, x),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        x.iter_mut().for_each(|xi| *xi *= inv);
+        if let Some(b) = bx {
+            b.iter_mut().for_each(|bi| *bi *= inv);
+        }
+    }
+}
+
+/// A B-orthonormal Krylov basis (`B = M`, or `I` without a mass matrix) with `B·v` stored beside
+/// each vector, so a B inner product costs one dot product.
+struct KrylovBasis<'b> {
+    mass: Option<&'b CsrMatrix>,
+    v: Vec<Vec<f64>>,
+    /// `B·v_i`; empty when `B = I`.
+    bv: Vec<Vec<f64>>,
+    n: usize,
+    rng: u64,
+}
+
+/// One orthogonalization of a new direction against the basis.
+struct Orthogonalized {
+    /// Gram–Schmidt coefficients `⟨v_i, w⟩_B` (both passes summed).
+    coeff: Vec<f64>,
+    /// B-norm of the direction before orthogonalization.
+    norm_before: f64,
+    /// B-norm after.
+    norm_after: f64,
+    /// `B·w` after (`None` when `B = I`).
+    bw: Option<Vec<f64>>,
+}
+
+impl<'b> KrylovBasis<'b> {
+    fn new(n: usize, mass: Option<&'b CsrMatrix>) -> Self {
+        Self {
+            mass,
+            v: Vec::new(),
+            bv: Vec::new(),
+            n,
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    /// Uniform(−1, 1) entries from a fixed-seed LCG: the default start vector, and the fresh
+    /// directions drawn after an invariant subspace. A constant start vector is orthogonal to
+    /// the antisymmetric eigenvectors of symmetric structured matrices (the 1-D Laplacian's
+    /// alternating mode) and never reaches them; a generic vector has a component along every
+    /// eigenvector and stays reproducible (SciPy draws a random one).
+    fn random_vector(&mut self) -> Vec<f64> {
+        let mut v = vec![0.0_f64; self.n];
+        for vi in &mut v {
+            self.rng = self
+                .rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *vi = ((self.rng >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+        }
+        v
+    }
+
+    fn b_times(&self, x: &[f64]) -> Option<Vec<f64>> {
+        self.mass.map(|m| csr_matvec(m, x))
+    }
+
+    /// `B·v_i` (`v_i` itself when `B = I`).
+    fn bvec(&self, i: usize) -> &[f64] {
+        if self.mass.is_some() {
+            &self.bv[i]
+        } else {
+            &self.v[i]
+        }
+    }
+
+    fn push(&mut self, v: Vec<f64>, bv: Option<Vec<f64>>) {
+        self.v.push(v);
+        if let Some(bv) = bv {
+            self.bv.push(bv);
+        }
+    }
+
+    fn replace(&mut self, v: Vec<Vec<f64>>, bv: Vec<Vec<f64>>) {
+        self.v = v;
+        self.bv = bv;
+    }
+
+    /// Two passes of classical Gram–Schmidt against every basis vector in the B inner product
+    /// ("twice is enough"; ARPACK applies the DGKS correction when the first pass cancels,
+    /// this always applies it). The norm before comes from Pythagoras.
+    fn orthogonalize(&self, w: &mut [f64]) -> SparseResult<Orthogonalized> {
+        let len = self.v.len();
+        let mut coeff = vec![0.0; len];
+        for _pass in 0..2 {
+            let c: Vec<f64> = (0..len).map(|i| dot_product(self.bvec(i), w)).collect();
+            for (i, &ci) in c.iter().enumerate() {
+                coeff[i] += ci;
+                add_scaled(w, -ci, &self.v[i]);
+            }
+        }
+        let bw = self.b_times(w);
+        let mut norm_sq = match &bw {
+            Some(b) => dot_product(w, b),
+            None => dot_product(w, w),
+        };
+        let coeff_sq: f64 = coeff.iter().map(|c| c * c).sum();
+        if norm_sq < 0.0 {
+            // Rounding can leave a tiny negative xᵀMx for a direction M (semi-definite in
+            // shift-invert mode) nearly annihilates; a sizeable one means M is indefinite.
+            if -norm_sq > arpack_eps23() * coeff_sq {
+                return Err(SparseError::InvalidArgument {
+                    message: "M must be positive definite: xᵀMx < 0 for a Krylov vector"
+                        .to_string(),
+                });
+            }
+            norm_sq = 0.0;
+        }
+        Ok(Orthogonalized {
+            coeff,
+            norm_before: (coeff_sq + norm_sq).sqrt(),
+            norm_after: norm_sq.sqrt(),
+            bw,
+        })
+    }
+
+    /// ARPACK `dgetv0` after an invariant subspace: a fresh random direction, B-orthogonal to
+    /// the basis and B-normalized. `None` when three draws all lie in the span (the basis
+    /// fills the space).
+    fn fresh_direction(&mut self) -> SparseResult<Option<(Vec<f64>, Option<Vec<f64>>)>> {
+        for _attempt in 0..3 {
+            let mut r = self.random_vector();
+            let orth = self.orthogonalize(&mut r)?;
+            if orth.norm_after > arpack_eps23() * orth.norm_before {
+                let mut br = orth.bw;
+                normalize_with(&mut r, br.as_mut());
+                return Ok(Some((r, br)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `Σ_j coef(j)·v_j` over the first `count` basis vectors, with the same combination of the
+    /// `B·v_j`.
+    fn combine(&self, count: usize, coef: impl Fn(usize) -> f64) -> (Vec<f64>, Option<Vec<f64>>) {
+        let mut x = vec![0.0; self.n];
+        let mut bx = self.mass.map(|_| vec![0.0; self.n]);
+        for j in 0..count {
+            let c = coef(j);
+            if c == 0.0 {
+                continue;
+            }
+            add_scaled(&mut x, c, &self.v[j]);
+            if let Some(bx) = bx.as_mut() {
+                add_scaled(bx, c, &self.bv[j]);
+            }
+        }
+        (x, bx)
+    }
+}
+
+/// Puts the B-normalized start vector into the empty basis: `v0`, or the fixed-seed random
+/// vector, first pushed through `OP` when `force_range` (ARPACK's `dgetv0` does this for a
+/// generalized problem so the start lies in the range of `OP`).
+fn krylov_start<F>(
+    basis: &mut KrylovBasis<'_>,
+    op: &mut F,
+    v0: Option<&[f64]>,
+    force_range: bool,
+    applications: &mut usize,
+) -> SparseResult<()>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = match v0 {
+        Some(v) => v.to_vec(),
+        None => basis.random_vector(),
+    };
+    if force_range {
+        let bx = basis.b_times(&x).unwrap_or_else(|| x.clone());
+        x = op(&x, &bx)?;
+        *applications += 1;
+        ensure_finite(&x)?;
+    }
+    let mut bx = basis.b_times(&x);
+    let norm_sq = match &bx {
+        Some(b) => dot_product(&x, b),
+        None => dot_product(&x, &x),
+    };
+    if !(norm_sq > 0.0) || !norm_sq.is_finite() {
+        // ARPACK error -9.
+        return Err(SparseError::InvalidArgument {
+            message: "starting vector is zero".to_string(),
+        });
+    }
+    normalize_with(&mut x, bx.as_mut());
+    basis.push(x, bx);
+    Ok(())
+}
+
+/// The B-normalized next Krylov direction and its `B·v`.
+type KrylovDirection = (Vec<f64>, Option<Vec<f64>>);
+
+/// Extends the basis to `m` vectors by Arnoldi/Lanczos steps with full reorthogonalization.
+/// Column `j`'s Gram–Schmidt coefficients and its coupling to vector `j + 1` go to
+/// `record(j, coeff, beta)`; the coupling is 0 where an invariant subspace was found and a
+/// fresh direction drawn, and is not a matrix entry for the last column. Returns the final
+/// coupling `β` and the next direction, or `(0, None)` when the basis is invariant.
+fn krylov_extend<F, R>(
+    basis: &mut KrylovBasis<'_>,
+    op: &mut F,
+    m: usize,
+    applications: &mut usize,
+    mut record: R,
+) -> SparseResult<(f64, Option<KrylovDirection>)>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+    R: FnMut(usize, &[f64], f64),
+{
+    while basis.len() <= m {
+        let j = basis.len() - 1;
+        let mut w = op(&basis.v[j], basis.bvec(j))?;
+        *applications += 1;
+        ensure_finite(&w)?;
+        let orth = basis.orthogonalize(&mut w)?;
+        let invariant = orth.norm_after <= arpack_eps23() * orth.norm_before;
+        let mut bw = orth.bw;
+        if j + 1 >= m {
+            record(j, &orth.coeff, 0.0);
+            if invariant {
+                return Ok((0.0, None));
+            }
+            normalize_with(&mut w, bw.as_mut());
+            return Ok((orth.norm_after, Some((w, bw))));
+        }
+        if invariant {
+            record(j, &orth.coeff, 0.0);
+            match basis.fresh_direction()? {
+                Some((r, br)) => basis.push(r, br),
+                None => return Ok((0.0, None)),
+            }
+        } else {
+            record(j, &orth.coeff, orth.norm_after);
+            normalize_with(&mut w, bw.as_mut());
+            basis.push(w, bw);
+        }
+    }
+    Ok((0.0, None))
+}
+
+/// Indices of the `count` Ritz values wanted under `which`, most wanted first (ARPACK's
+/// `dsgets`). `BE` takes `count/2` from the low end and the rest from the high end.
+fn select_symmetric(theta: &[f64], which: EigsWhich, count: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..theta.len()).collect();
+    let count = count.min(theta.len());
+    match which {
+        EigsWhich::BothEnds => {
+            idx.sort_by(|&a, &b| theta[a].total_cmp(&theta[b]));
+            let low = count / 2;
+            let high = count - low;
+            let mut out: Vec<usize> = idx[idx.len() - high..].iter().rev().copied().collect();
+            out.extend_from_slice(&idx[..low]);
+            return out;
+        }
+        EigsWhich::SmallestMagnitude => {
+            idx.sort_by(|&a, &b| theta[a].abs().total_cmp(&theta[b].abs()));
+        }
+        EigsWhich::LargestAlgebraic | EigsWhich::LargestReal => {
+            idx.sort_by(|&a, &b| theta[b].total_cmp(&theta[a]));
+        }
+        EigsWhich::SmallestAlgebraic | EigsWhich::SmallestReal => {
+            idx.sort_by(|&a, &b| theta[a].total_cmp(&theta[b]));
+        }
+        EigsWhich::LargestMagnitude
+        | EigsWhich::LargestImaginary
+        | EigsWhich::SmallestImaginary => {
+            idx.sort_by(|&a, &b| theta[b].abs().total_cmp(&theta[a].abs()));
+        }
+    }
+    idx.truncate(count);
+    idx
+}
+
+/// The wanted Ritz pairs of a symmetric Krylov–Schur run, most wanted first.
+struct SymmetricRitz {
+    theta: Vec<f64>,
+    /// B-orthonormal Ritz vectors.
+    vectors: Vec<Vec<f64>>,
+    /// `β·y_last`: the Ritz residual `OP x − θ x` is this multiple of `next`.
+    coupling: Vec<f64>,
+    /// ARPACK's convergence test, per pair.
+    converged: Vec<bool>,
+    /// The B-normalized residual direction (zero when the basis is invariant).
+    next: Vec<f64>,
+    iterations: usize,
+    applications: usize,
+}
+
+/// Symmetric Krylov–Schur (Stewart 2001), i.e. thick-restart Lanczos (Wu & Simon 2000), for the
+/// `k` Ritz pairs wanted under `settings.which` of an operator `op(x, B·x)` self-adjoint in the
+/// B inner product (`B = mass`, or `I`), with an `ncv`-vector basis.
 ///
-/// `eigsh` used to take a single pass of this basis. On ordinary sparse matrices with k = 6
-/// and n = 120..800 (random diagonally dominant SPD, random graph Laplacians, a clustered top
-/// spectrum) that left relative residuals of 4e-2 to 5e-1 on every one of 24 matrices
-/// (frankenscipy-1ksfv.10, found by the frankenscipy-szq1n.15 sweep).
-fn thick_restart_lanczos<F: FnMut(&[f64]) -> Vec<f64>>(
+/// Each cycle extends the basis to `ncv` vectors with full reorthogonalization (a fresh random
+/// direction replaces an invariant subspace, as in ARPACK), solves the projected symmetric
+/// eigenproblem, and tests every wanted pair with ARPACK's `dsconv`:
+/// `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))` — relative, since an absolute floor lets a matrix of
+/// norm 1e-11 pass on its first cycle whatever its Ritz values are — floored at the rounding
+/// level [`krylov_estimate_floor`], which scales with the operator. Otherwise it restarts from
+/// the `k + min(nconv, (ncv − k)/2)` most wanted Ritz vectors (ARPACK `dsaup2`'s adjustment of
+/// `nev`) plus the residual direction, which leaves the projection an arrowhead matrix; the
+/// arrow entry of a converged pair is zeroed (Stewart's deflation), which locks it. This is
+/// mathematically ARPACK's implicitly restarted Lanczos; at most `settings.max_iter` cycles.
+///
+/// A single unrestarted pass of such a basis, what `eigsh` used to run, left relative residuals
+/// of 4e-2 to 5e-1 on 24 ordinary sparse matrices with k = 6 and n = 120..800
+/// (frankenscipy-szq1n.15).
+fn symmetric_krylov_schur<F>(
     mut op: F,
+    mass: Option<&CsrMatrix>,
     n: usize,
     k: usize,
-    options: &EigsOptions,
-    m: usize,
-) -> EigsResult {
-    let m = m.min(n).max(k.min(n));
-    let keep = (k + (m.saturating_sub(k)) / 2)
-        .min(m.saturating_sub(1))
-        .max(k.min(m));
-    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
-    let tol = options.tol.max(f64::EPSILON);
-    let mut total_matvec = 0_usize;
+    settings: &KrylovSettings,
+    v0: Option<&[f64]>,
+    force_range: bool,
+) -> SparseResult<SymmetricRitz>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let m = settings.ncv.clamp(1, n);
+    let eps23 = arpack_eps23();
+    let tol = settings.tol;
+    let mut applications = 0_usize;
+    let mut basis = KrylovBasis::new(n, mass);
+    krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
 
-    // The same fixed-seed start vector as `krylov_arnoldi_eigs`.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut v0 = vec![0.0_f64; n];
-    for vi in v0.iter_mut() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        *vi = ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
-    }
-    let v0_norm = vec_norm(&v0);
-    for vi in &mut v0 {
-        *vi /= v0_norm;
-    }
-
-    let mut basis: Vec<Vec<f64>> = vec![v0];
-    let mut t = vec![vec![0.0; m]; m];
-    let mut theta: Vec<f64> = Vec::new();
-    let mut y = DMatrix::<f64>::zeros(0, 0);
-    let mut order: Vec<usize> = Vec::new();
-    let mut size = 0;
-    let mut converged = false;
-
-    for _cycle in 0..options.max_iter.max(1) {
-        // Extend the basis to m vectors; `residual` is the unnormalized next direction.
-        let mut residual = vec![0.0; n];
-        let mut beta = 0.0;
-        while basis.len() <= m {
-            let j = basis.len() - 1;
-            let mut w = op(&basis[j]);
-            total_matvec += 1;
-            let norm_before = vec_norm(&w);
-            let mut coeff = vec![0.0; basis.len()];
-            for _pass in 0..2 {
-                for (i, b) in basis.iter().enumerate() {
-                    let c = dot_product(&w, b);
-                    coeff[i] += c;
-                    for (wk, bk) in w.iter_mut().zip(b) {
-                        *wk -= c * bk;
+    // The projected matrix, row-major m×m.
+    let mut t = vec![0.0_f64; m * m];
+    // Leading kept Ritz vectors whose arrow entry was deflated.
+    let mut locked = vec![false; m];
+    let mut kept = 0_usize;
+    let mut iterations = 0_usize;
+    loop {
+        iterations += 1;
+        let (beta, next) = krylov_extend(
+            &mut basis,
+            &mut op,
+            m,
+            &mut applications,
+            |j, coeff, sub| {
+                for (i, &c) in coeff.iter().enumerate() {
+                    if i < kept && locked[i] {
+                        continue;
                     }
+                    t[i * m + j] = c;
+                    t[j * m + i] = c;
                 }
-            }
-            for (i, &c) in coeff.iter().enumerate() {
-                t[i][j] = c;
-                t[j][i] = c;
-            }
-            beta = vec_norm(&w);
-            if beta <= breakdown_rel_tol * norm_before || basis.len() == m {
-                residual = w;
-                if beta <= breakdown_rel_tol * norm_before {
-                    beta = 0.0; // invariant subspace: the Ritz pairs are exact
+                if j + 1 < m {
+                    t[(j + 1) * m + j] = sub;
+                    t[j * m + j + 1] = sub;
                 }
-                break;
-            }
-            for wk in &mut w {
-                *wk /= beta;
-            }
-            basis.push(w);
-        }
-        size = basis.len();
-
-        // Rayleigh–Ritz on the projection.
-        let projected = DMatrix::from_fn(size, size, |i, j| t[i][j]);
+            },
+        )?;
+        let size = basis.len();
+        let projected = DMatrix::from_fn(size, size, |i, j| t[i * m + j]);
         let Some(eigen) =
             nalgebra::SymmetricEigen::try_new(projected, f64::EPSILON, 30 * size.max(10))
         else {
-            break;
+            let partial = EigsResult {
+                iterations,
+                ncv: m,
+                ..EigsResult::default()
+            };
+            return Err(eigs_no_convergence(iterations, 0, k, partial));
         };
-        theta = eigen.eigenvalues.iter().copied().collect();
-        y = eigen.eigenvectors;
-        order = (0..size).collect();
-        order.sort_by(|&a, &b| theta[b].abs().total_cmp(&theta[a].abs()));
+        let theta: Vec<f64> = eigen.eigenvalues.iter().copied().collect();
+        let y = eigen.eigenvectors;
+        let coupling = |i: usize| beta * y[(size - 1, i)];
+        let floor = krylov_estimate_floor(size, theta.iter().map(|t| t.abs()));
+        let passes = |i: usize| coupling(i).abs() <= (tol * theta[i].abs().max(eps23)).max(floor);
+        let wanted = select_symmetric(&theta, settings.which, k);
+        let nconv = wanted.iter().filter(|&&i| passes(i)).count();
+        let finished = (wanted.len() == k && nconv == k) || size <= k;
 
-        // ARPACK `dsconv` scales the test by max(|θ|, eps^(2/3)), not max(|θ|, 1): with the
-        // absolute floor a matrix of norm 1e-11 passes a 1e-10 tolerance on its first cycle
-        // whatever its Ritz values are.
-        let wanted = k.min(size);
-        let estimates_ok = order.iter().take(wanted).all(|&i| {
-            (beta * y[(size - 1, i)]).abs() <= tol * theta[i].abs().max(breakdown_rel_tol)
-        });
-        if (estimates_ok && wanted == k) || beta == 0.0 || keep >= size {
-            converged = estimates_ok && wanted == k;
-            break;
-        }
-
-        // Thick restart: the `keep` best Ritz vectors, then the residual direction.
-        let mut new_basis: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-        for &i in order.iter().take(keep) {
-            let mut ritz = vec![0.0; n];
-            for (j, b) in basis.iter().enumerate().take(size) {
-                let coef = y[(j, i)];
-                for (rk, bk) in ritz.iter_mut().zip(b) {
-                    *rk += coef * bk;
+        let (next_v, next_bv) = match next {
+            Some(direction) if !finished && iterations < settings.max_iter => direction,
+            last => {
+                let mut out = SymmetricRitz {
+                    theta: Vec::with_capacity(k),
+                    vectors: Vec::with_capacity(k),
+                    coupling: Vec::with_capacity(k),
+                    converged: Vec::with_capacity(k),
+                    next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
+                    iterations,
+                    applications,
+                };
+                for &i in &wanted {
+                    let (mut x, mut bx) = basis.combine(size, |j| y[(j, i)]);
+                    normalize_with(&mut x, bx.as_mut());
+                    out.theta.push(theta[i]);
+                    out.vectors.push(x);
+                    out.coupling.push(coupling(i));
+                    out.converged.push(passes(i));
                 }
+                return Ok(out);
             }
-            new_basis.push(ritz);
-        }
-        for row in &mut t {
-            row.fill(0.0);
-        }
-        for (slot, &i) in order.iter().take(keep).enumerate() {
-            t[slot][slot] = theta[i];
-            let arrow = beta * y[(size - 1, i)];
-            t[slot][keep] = arrow;
-            t[keep][slot] = arrow;
-        }
-        for rk in &mut residual {
-            *rk /= beta;
-        }
-        new_basis.push(residual);
-        basis = new_basis;
-    }
+        };
 
-    // The k wanted Ritz pairs of the last projection, largest magnitude first.
-    let k_actual = k.min(order.len());
-    let mut eigenvalues = Vec::with_capacity(k_actual);
-    let mut eigenvectors = Vec::with_capacity(k_actual);
-    for &i in order.iter().take(k_actual) {
-        eigenvalues.push(theta[i]);
-        let mut x = vec![0.0; n];
-        for (j, b) in basis.iter().enumerate().take(size) {
-            let coef = y[(j, i)];
-            for (xk, bk) in x.iter_mut().zip(b) {
-                *xk += coef * bk;
+        // Restart from the `keep` most wanted Ritz vectors (ARPACK dsaup2's nev adjustment).
+        let mut keep = k + nconv.min((size - k) / 2);
+        if keep == 1 && size >= 6 {
+            keep = size / 2;
+        } else if keep == 1 && size > 2 {
+            keep = 2;
+        }
+        let keep = keep.min(size - 1);
+        let kept_idx = select_symmetric(&theta, settings.which, keep);
+        let mut new_v = Vec::with_capacity(m + 1);
+        let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
+        for &i in &kept_idx {
+            let (x, bx) = basis.combine(size, |j| y[(j, i)]);
+            new_v.push(x);
+            if let Some(bx) = bx {
+                new_bv.push(bx);
             }
         }
-        let norm = vec_norm(&x);
-        if norm > 0.0 {
-            for xk in &mut x {
-                *xk /= norm;
-            }
+        t.fill(0.0);
+        locked.fill(false);
+        for (s, &i) in kept_idx.iter().enumerate() {
+            t[s * m + s] = theta[i];
+            // Locking: a converged pair's coupling to the residual is below tolerance, and
+            // zeroing it (Stewart's deflation) decouples the pair so later cycles keep it exact.
+            locked[s] = passes(i);
+            let arrow = if locked[s] { 0.0 } else { coupling(i) };
+            t[s * m + keep] = arrow;
+            t[keep * m + s] = arrow;
         }
-        eigenvectors.push(x);
+        kept = keep;
+        basis.replace(new_v, new_bv);
+        basis.push(next_v, next_bv);
     }
-    EigsResult {
-        eigenvalues_im: vec![0.0; k_actual],
-        eigenvectors_im: vec![vec![0.0; n]; k_actual],
-        eigenvalues,
-        eigenvectors,
-        nmatvec: total_matvec,
-        converged: converged && k_actual == k,
-    }
-}
-
-/// SciPy's `ncv` default for `eigsh`: `min(n, max(2k + 1, 20))`.
-fn eigsh_krylov_window(n: usize, k: usize) -> usize {
-    (2 * k + 1).max(20).min(n)
-}
-
-/// Returns `(all_top_k_converged, matvecs_used)` for an eigsh result by checking
-/// every returned Ritz pair's residual `‖A x − λ x‖ ≤ tol·max(|λ|, 1)`.
-fn eigsh_residual_check(a: &CsrMatrix, result: &EigsResult, tol: f64) -> (bool, usize) {
-    if result.eigenvalues.is_empty() {
-        return (false, 0);
-    }
-    // status: cleared below by any pair whose residual fails the test or is NaN
-    let mut converged = true;
-    let mut matvecs = 0;
-    for (&lambda, x) in result.eigenvalues.iter().zip(result.eigenvectors.iter()) {
-        let ax = csr_matvec(a, x);
-        matvecs += 1;
-        let resid: f64 = ax
-            .iter()
-            .zip(x.iter())
-            .map(|(&axi, &xi)| (axi - lambda * xi).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        // A NaN residual (a non-finite matrix reaches here: CSR accepts NaN) must fail the
-        // test; `resid > thr` alone is false for NaN (frankenscipy-szq1n.7).
-        if resid.is_nan() || resid > tol * lambda.abs().max(1.0) {
-            converged = false;
-        }
-    }
-    (converged, matvecs)
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// eigs — Arnoldi-based eigenvalue solver for general sparse matrices
+// eigs — Krylov–Schur eigenvalue solver for general sparse matrices
 // ══════════════════════════════════════════════════════════════════════
 
-/// Compute the `k` eigenvalues of largest magnitude of a general sparse matrix, as
-/// `scipy.sparse.linalg.eigs(A, k=k, which='LM')`.
-///
-/// Arnoldi: ONE Krylov subspace of dimension `min(n, 2k+1)`, Ritz values from the projected
-/// upper-Hessenberg matrix. There are no implicit restarts (ARPACK restarts until
-/// convergence), so the result can be less accurate than SciPy's on a spectrum without a clear
-/// gap after the k-th eigenvalue. `converged` is true only when all `k` pairs came back.
-/// `which`, `sigma` and `M` are not supported.
-pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "eigs requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if k == 0 || k > n {
-        return Err(SparseError::InvalidArgument {
-            message: format!("k={k} must be in [1, {n}]"),
-        });
-    }
-    let options = normalize_eigs_options(options);
-
-    // Krylov subspace dimension (larger than k for better convergence).
-    let m = (2 * k + 1).min(n);
-    Ok(krylov_arnoldi_eigs(|v| csr_matvec(a, v), n, k, &options, m))
+/// One eigenpair of [`eigs`] before ordering: λ, the complex eigenvector, whether it passed
+/// both convergence tests, and its Schur block (shared by a conjugate pair).
+struct GeneralPair {
+    lambda: (f64, f64),
+    xr: Vec<f64>,
+    xi: Vec<f64>,
+    ok: bool,
+    block: usize,
 }
 
-/// The Arnoldi eigensolver behind [`eigs`] (a general operator; the symmetric
-/// [`eigsh`]/[`svds`] run [`thick_restart_lanczos`]). Builds ONE `m`-dimensional Krylov
-/// subspace with full modified-Gram-Schmidt re-orthogonalization, takes the Ritz values of
-/// the projected upper-Hessenberg matrix `H`, and back-transforms the top-`k`-by-magnitude
-/// Ritz vectors. O(m) matvecs, no restarts (frankenscipy-1ksfv.10 tracks restarting it).
-fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
-    mut op: F,
-    n: usize,
-    k: usize,
-    options: &EigsOptions,
-    m: usize,
-) -> EigsResult {
-    let mut total_matvec = 0;
+/// `k` eigenpairs of a general sparse matrix `A` (or of `A x = λ M x`), as
+/// `scipy.sparse.linalg.eigs(A, k, M, sigma, which, v0, ncv, maxiter, tol)` with a real
+/// `sigma`.
+///
+/// Nonsymmetric Krylov–Schur (Stewart 2001): Arnoldi with full DGKS reorthogonalization,
+/// restarted from a reordered real Schur form of the projected matrix, with converged leading
+/// Schur blocks deflated (locked). It is mathematically ARPACK's implicitly restarted Arnoldi
+/// (`dnaupd`), which SciPy wraps: the same `ncv`, `maxiter`, `tol` and `which` semantics and
+/// the same test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))`, floored at the projected problem's rounding
+/// level `ncv·ε·max|θ|` as in [`eigsh`]. The operator follows SciPy's modes: `A`,
+/// `M⁻¹A` in the M inner product (M symmetric positive definite), or `(A − σM)⁻¹M` with
+/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified.
+///
+/// The pairs come back most wanted first (under `which`, applied to `1/(λ − σ)` when `sigma` is
+/// set), a complex-conjugate pair adjacent with the positive imaginary part first. When `k`
+/// splits a pair, the member with positive imaginary part is returned, as SciPy does for its
+/// `k + 1`-th candidate. Every pair must also pass the explicit residual check
+/// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`.
+///
+/// # Errors
+/// - [`SparseError::EigsNoConvergence`] (SciPy's `ArpackNoConvergence`) when some wanted pair
+///   has not converged after `max_iter` cycles; it carries the pairs that did converge.
+/// - [`SparseError::SingularMatrix`] when `A − σM` is exactly singular.
+/// - [`SparseError::InvalidArgument`] for a `which` that `eigs` does not take, an `ncv`
+///   outside `k + 1 < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or an indefinite `M`.
+/// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
+///
+/// Differences from SciPy: `k` may reach `n` (SciPy refuses `k ≥ n − 1` for a sparse `A`); the
+/// default start vector is a fixed-seed pseudo-random one; complex `sigma` (`OPpart`),
+/// `OPinv`/`Minv` operators and `return_eigenvectors=False` are not offered.
+pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+    let n = validate_eigen_problem(a, k, &options, "eigs")?;
+    let settings = resolve_krylov_settings(n, k, &options, false)?;
+    let transform = SpectralTransform::build(a, &options, n)?;
+    let run = general_krylov_schur(
+        |x: &[f64], bx: &[f64]| transform.apply(a, x, bx),
+        options.mass,
+        n,
+        k,
+        &settings,
+        options.v0,
+        options.mass.is_some(),
+    )?;
 
-    // Arnoldi iteration: build orthonormal basis V and upper Hessenberg H
-    // such that A * V_m ≈ V_m * H_m
-    let mut v: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-    let mut h = vec![vec![0.0; m]; m + 1]; // (m+1) x m upper Hessenberg
-
-    // Initial vector. A CONSTANT vector is orthogonal to the antisymmetric
-    // eigenvectors of symmetric structured matrices (e.g. the 1-D Laplacian
-    // [2,-1;-1,2,…], whose top "alternating-sign" mode is orthogonal to any
-    // equal-valued vector), so the Krylov subspace never reaches those eigenpairs
-    // and Lanczos silently returns the wrong "top" eigenvalue. scipy/ARPACK use a
-    // random start; we use a fixed-seed deterministic pseudo-random vector, which
-    // has generic (non-zero) components along every eigenvector while staying
-    // fully reproducible.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64; // golden-ratio fixed seed
-    let mut v0 = vec![0.0_f64; n];
-    for vi in v0.iter_mut() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        // top 53 bits → uniform in [0, 1), mapped to (-1, 1)
-        *vi = ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
-    }
-    let v0_norm = vec_norm(&v0);
-    if v0_norm > 0.0 {
-        for vi in &mut v0 {
-            *vi /= v0_norm;
+    let sigma = transform.shift();
+    let a_norm = csr_norm_bound(a);
+    let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let guard = settings.tol.max(f64::EPSILON.sqrt());
+    let mut nmatvec = run.applications;
+    let mut pairs: Vec<GeneralPair> = Vec::with_capacity(run.theta.len());
+    for (i, &theta) in run.theta.iter().enumerate() {
+        let (mut xr, mut xi) = run.vectors[i].clone();
+        let lambda = transform.eigenvalue_complex(theta);
+        if transform.is_shift_invert() && (theta.0 != 0.0 || theta.1 != 0.0) {
+            // dneupd's purification: OP x/θ = x + (β·y_last/θ)·v_next.
+            let c = complex_div(run.coupling[i], theta);
+            add_scaled(&mut xr, c.0, &run.next);
+            add_scaled(&mut xi, c.1, &run.next);
+            complex_b_normalize(&mut xr, &mut xi, options.mass);
         }
-    }
-    v.push(v0);
-
-    // ARPACK's `eps23` = ε^(2/3) ≈ 3.67e-11, used as a RELATIVE tolerance for the
-    // lucky-breakdown test below. Hoisted out of the loop; see the gate for why it
-    // cannot be an absolute threshold (frankenscipy-6bfm3).
-    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
-
-    let mut actual_m = 0usize;
-    for j in 0..m {
-        // w = op(v_j)  (A·v for eigs/eigsh; AᵀA·v for svds). The result becomes the
-        // next basis vector (v.push(w) below), so its allocation is necessary — but
-        // op itself (FnMut) may reuse internal scratch. frankenscipy-fo9cj.
-        let mut w = op(&v[j]);
-        total_matvec += 1;
-
-        // Modified Gram-Schmidt orthogonalization
-        for i in 0..=j {
-            h[i][j] = dot_product(&w, &v[i]);
-            for (wk, vik) in w.iter_mut().zip(v[i].iter()) {
-                *wk -= h[i][j] * vik;
-            }
-        }
-
-        h[j + 1][j] = vec_norm(&w);
-        // br-iq1e: count this column as completed BEFORE the breakdown
-        // check. Without this, a lucky-breakdown at j=0 (e.g. when the
-        // initial vector is already an eigenvector — common for
-        // structured matrices like the 4-cycle shift) leaves actual_m
-        // = v.len() - 1 = 0 and the caller sees zero eigenvalues even
-        // though h[0][0] holds the correct dominant eigenvalue.
-        actual_m = j + 1;
-
-        // ‖w‖₂ BEFORE orthogonalization, which is the scale the breakdown test
-        // has to be measured against. Recovered from the projection
-        // coefficients rather than a second pass over `w`: modified
-        // Gram-Schmidt is an orthogonal decomposition, so
-        //   ‖w_before‖² = Σᵢ h[i][j]² + ‖w_after‖².
-        let w_norm_before = {
-            let mut acc = h[j + 1][j] * h[j + 1][j];
-            for row in h.iter().take(j + 1) {
-                acc += row[j] * row[j];
-            }
-            acc.sqrt()
+        let (axr, axi) = (csr_matvec(a, &xr), csr_matvec(a, &xi));
+        let (mxr, mxi) = match options.mass {
+            Some(m) => (csr_matvec(m, &xr), csr_matvec(m, &xi)),
+            None => (xr.clone(), xi.clone()),
         };
-
-        // frankenscipy-6bfm3: this gate was `h[j+1][j] < f64::EPSILON * 1e6`,
-        // an ABSOLUTE 2.22e-10 applied to a NORM. h[j+1][j] carries the scale of
-        // the operator, so on a uniformly small matrix it declared an invariant
-        // Krylov subspace immediately and truncated the basis to one vector —
-        // returning fewer eigenvalues than requested, from a 1-D subspace, on a
-        // perfectly well-conditioned problem. svds is hit hardest because its
-        // operator is AᵀA: a matrix of norm 5e-6 gives an operator norm of
-        // 2.5e-11, already under the old threshold.
-        //
-        // The test must be RELATIVE to ‖w_before‖. `eps^(2/3)` is ARPACK's
-        // `eps23`, the same constant it uses to decide a Lanczos/Arnoldi
-        // quantity is numerically zero — loose enough to still catch a genuine
-        // lucky breakdown through modified-Gram-Schmidt rounding (which lands
-        // near eps·‖w‖), tight enough not to discard a live basis direction.
-        if h[j + 1][j] <= breakdown_rel_tol * w_norm_before {
-            // Lucky breakdown: Krylov subspace is invariant.
-            break;
+        nmatvec += if options.mass.is_some() { 4 } else { 2 };
+        let mut resid_sq = 0.0;
+        for t in 0..n {
+            let rr = axr[t] - (lambda.0 * mxr[t] - lambda.1 * mxi[t]);
+            let ri = axi[t] - (lambda.0 * mxi[t] + lambda.1 * mxr[t]);
+            resid_sq += rr * rr + ri * ri;
         }
-
-        // Normalize
-        for wi in &mut w {
-            *wi /= h[j + 1][j];
-        }
-        v.push(w);
+        let x_norm = (dot_product(&xr, &xr) + dot_product(&xi, &xi)).sqrt();
+        let bound = guard * (a_norm + (lambda.0.hypot(lambda.1) + sigma.abs()) * m_norm) * x_norm;
+        // A NaN residual fails: `<=` is false for NaN.
+        let ok = run.converged[i] && resid_sq.sqrt() <= bound;
+        pairs.push(GeneralPair {
+            lambda,
+            xr,
+            xi,
+            ok,
+            block: run.block[i],
+        });
     }
-
-    // The projected Hessenberg matrix can have complex-conjugate eigenpairs, which a real
-    // single-shift QR silently collapses to their real parts. Use the double-shift Francis QR
-    // (`hqr`) to recover the full complex spectrum, then complex back-substitution for the
-    // eigenvectors. Matches `scipy.sparse.linalg.eigs`, which returns a complex array.
-    krylov_extract_general(&v, &h, actual_m, n, k, options, total_matvec)
-}
-
-/// Top-`k`-by-magnitude complex eigenpairs of a general operator from its
-/// Arnoldi basis `v` and upper-Hessenberg projection `h[0..m, 0..m]`.
-///
-/// The projected matrix is reduced by the double-shift Francis QR (`hqr`) into
-/// real and imaginary eigenvalue parts; the corresponding Ritz vectors are
-/// obtained by complex back-substitution against the *original* `h` (which `hqr`
-/// leaves untouched, working on a copy) and back-transformed into the original
-/// space as `x = V @ y`.
-fn krylov_extract_general(
-    v: &[Vec<f64>],
-    h: &[Vec<f64>],
-    m: usize,
-    n: usize,
-    k: usize,
-    options: &EigsOptions,
-    total_matvec: usize,
-) -> EigsResult {
-    let pairs = hessenberg_eigenvalues_complex(h, m, options.max_iter, options.tol);
-
-    // Sort by magnitude (largest first), take top k. `sort_by` is stable, so a
-    // complex-conjugate pair (equal magnitude) keeps deflation order.
-    let mut indexed: Vec<(usize, (f64, f64))> = pairs.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| {
-        let ma = a.1.0 * a.1.0 + a.1.1 * a.1.1;
-        let mb = b.1.0 * b.1.0 + b.1.1 * b.1.1;
-        mb.total_cmp(&ma)
-    });
-
-    let k_actual = k.min(indexed.len());
-    let mut eigenvalues = Vec::with_capacity(k_actual);
-    let mut eigenvalues_im = Vec::with_capacity(k_actual);
-    let mut eigenvectors = Vec::with_capacity(k_actual);
-    let mut eigenvectors_im = Vec::with_capacity(k_actual);
-    // br-szq1n.7: convergence is established per Ritz pair, as in the symmetric
-    // path. This used to be a literal `true` after one unrestarted Arnoldi pass.
-    // Fewer pairs than requested is not convergence either.
-    let mut converged = k_actual > 0 && k_actual == k;
-    let residual_tol = options.tol.max(1e-8);
-
-    for &(_, (re, im)) in indexed.iter().take(k_actual) {
-        eigenvalues.push(re);
-        eigenvalues_im.push(im);
-
-        // Eigenvector y of the projected Hessenberg matrix, in complex arithmetic,
-        // then x = V @ y back into the original space (V is real).
-        let y = hessenberg_eigenvector_complex(h, m, (re, im));
-
-        // Arnoldi residual of the Ritz pair: ||A V y - lambda V y|| = ||H_bar y -
-        // lambda [y; 0]|| with H_bar the (m+1) x m Hessenberg matrix (V orthonormal).
-        let y_norm = y.iter().map(|&(r, i)| r * r + i * i).sum::<f64>().sqrt();
-        let projected_resid = if y_norm > 0.0 && m > 0 {
-            let mut resid_sq = 0.0;
-            for row in 0..=m.min(h.len() - 1) {
-                let (mut rr, mut ri) = (0.0, 0.0);
-                for (col, &(yr, yi)) in y.iter().enumerate().take(m) {
-                    let hv = h[row][col];
-                    rr += hv * yr;
-                    ri += hv * yi;
-                }
-                if row < m {
-                    let (yr, yi) = y[row];
-                    rr -= re * yr - im * yi;
-                    ri -= re * yi + im * yr;
-                }
-                resid_sq += rr * rr + ri * ri;
+    // A conjugate pair is adjacent; put the member with positive Im(λ) first (in shift-invert
+    // mode Im(λ) has the opposite sign of Im(θ)).
+    let mut i = 0;
+    while i + 1 < pairs.len() {
+        if pairs[i].block == pairs[i + 1].block {
+            if pairs[i].lambda.1 < pairs[i + 1].lambda.1 {
+                pairs.swap(i, i + 1);
             }
-            resid_sq.sqrt() / y_norm
+            i += 2;
         } else {
-            f64::INFINITY
-        };
-        if projected_resid.is_nan() || projected_resid > residual_tol * re.hypot(im).max(1.0) {
-            converged = false;
+            i += 1;
         }
-        let mut evec_re = vec![0.0; n];
-        let mut evec_im = vec![0.0; n];
-        for (j, &(yr, yi)) in y.iter().enumerate() {
-            if yr == 0.0 && yi == 0.0 {
-                continue;
-            }
-            for ((xr, xi), &vji) in evec_re.iter_mut().zip(evec_im.iter_mut()).zip(v[j].iter()) {
-                *xr += yr * vji;
-                *xi += yi * vji;
-            }
-        }
-        // Normalize by the complex 2-norm sqrt(Σ |x_i|²).
-        let norm = evec_re
-            .iter()
-            .zip(evec_im.iter())
-            .map(|(&r, &i)| r * r + i * i)
-            .sum::<f64>()
-            .sqrt();
-        if norm > 0.0 {
-            for (xr, xi) in evec_re.iter_mut().zip(evec_im.iter_mut()) {
-                *xr /= norm;
-                *xi /= norm;
-            }
-        }
-        eigenvectors.push(evec_re);
-        eigenvectors_im.push(evec_im);
     }
+    pairs.truncate(k);
 
-    EigsResult {
-        eigenvalues,
-        eigenvalues_im,
-        eigenvectors,
-        eigenvectors_im,
-        nmatvec: total_matvec,
-        converged,
+    let converged = pairs.len() == k && pairs.iter().all(|p| p.ok);
+    let assemble = |pairs: Vec<GeneralPair>, converged: bool| {
+        let mut result = EigsResult {
+            nmatvec,
+            iterations: run.iterations,
+            ncv: settings.ncv,
+            converged,
+            ..EigsResult::default()
+        };
+        for p in pairs {
+            result.eigenvalues.push(p.lambda.0);
+            result.eigenvalues_im.push(p.lambda.1);
+            result.eigenvectors.push(p.xr);
+            result.eigenvectors_im.push(p.xi);
+        }
+        result
+    };
+    if converged {
+        return Ok(assemble(pairs, true));
+    }
+    let good: Vec<GeneralPair> = pairs.into_iter().filter(|p| p.ok).collect();
+    let good_count = good.len();
+    Err(eigs_no_convergence(
+        run.iterations,
+        good_count,
+        k,
+        assemble(good, false),
+    ))
+}
+
+/// Scales the complex vector `xr + i·xi` to unit B-norm (`B = M`, or the 2-norm).
+fn complex_b_normalize(xr: &mut [f64], xi: &mut [f64], mass: Option<&CsrMatrix>) {
+    let norm_sq = match mass {
+        Some(m) => dot_product(xr, &csr_matvec(m, xr)) + dot_product(xi, &csr_matvec(m, xi)),
+        None => dot_product(xr, xr) + dot_product(xi, xi),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        xr.iter_mut().for_each(|x| *x *= inv);
+        xi.iter_mut().for_each(|x| *x *= inv);
     }
 }
 
-/// Complex eigenvalues of an upper-Hessenberg matrix `H[0..m, 0..m]` via the
-/// double-shift Francis QR (the classic EISPACK/Numerical-Recipes `hqr`).
+/// The wanted Ritz pairs of a nonsymmetric Krylov–Schur run, most wanted first, a
+/// complex-conjugate pair adjacent (positive imaginary part of θ first).
+struct GeneralRitz {
+    theta: Vec<(f64, f64)>,
+    /// Complex Ritz vectors `(re, im)`, B-normalized.
+    vectors: Vec<(Vec<f64>, Vec<f64>)>,
+    /// `β·y_last` (complex): the Ritz residual `OP x − θ x` is this multiple of `next`.
+    coupling: Vec<(f64, f64)>,
+    /// ARPACK's convergence test, per pair.
+    converged: Vec<bool>,
+    /// Schur block of each pair; the members of a conjugate pair share one.
+    block: Vec<usize>,
+    /// The B-normalized residual direction (zero when the basis is invariant).
+    next: Vec<f64>,
+    iterations: usize,
+    applications: usize,
+}
+
+/// A Ritz value of the projected matrix and the (stable) id of its Schur block.
+#[derive(Debug, Clone, Copy)]
+struct SchurValue {
+    re: f64,
+    im: f64,
+    block: usize,
+}
+
+/// Order of `values` under `which`, most wanted first (ARPACK's `dngets`). The members of a
+/// conjugate pair share a key and stay adjacent, positive imaginary part first.
+fn general_order(values: &[SchurValue], which: EigsWhich) -> Vec<usize> {
+    let key = |v: &SchurValue| -> f64 {
+        match which {
+            EigsWhich::LargestMagnitude | EigsWhich::BothEnds => v.re.hypot(v.im),
+            EigsWhich::SmallestMagnitude => -v.re.hypot(v.im),
+            EigsWhich::LargestReal | EigsWhich::LargestAlgebraic => v.re,
+            EigsWhich::SmallestReal | EigsWhich::SmallestAlgebraic => -v.re,
+            EigsWhich::LargestImaginary => v.im.abs(),
+            EigsWhich::SmallestImaginary => -v.im.abs(),
+        }
+    };
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let (va, vb) = (&values[a], &values[b]);
+        key(vb)
+            .total_cmp(&key(va))
+            .then_with(|| va.block.cmp(&vb.block))
+            .then_with(|| vb.im.total_cmp(&va.im))
+    });
+    idx
+}
+
+/// Nonsymmetric Krylov–Schur (Stewart 2001) for the `k` Ritz pairs wanted under
+/// `settings.which` of the operator `op(x, B·x)` (B = `mass`, or `I`), with an `ncv`-vector
+/// basis.
 ///
-/// Unlike a real single-shift QR (which collapses a complex-conjugate pair onto its
-/// real part), this deflates 1×1 and 2×2 blocks
-/// and returns each eigenvalue as a `(re, im)` pair — a 2×2 block with negative
-/// discriminant yields the conjugate pair `re ± im·i`. Operates on a private copy
-/// of `H`, so the caller's matrix is left intact for eigenvector recovery.
-// The double-QR sweep indexes offset rows/columns (a[i][k+2], a[k+1][j], the
-// diagonal a[i][i], …); a range loop is the natural and clearest expression.
-#[allow(clippy::needless_range_loop)]
-fn hessenberg_eigenvalues_complex(
-    h: &[Vec<f64>],
-    m: usize,
-    max_iter: usize,
-    _tol: f64,
-) -> Vec<(f64, f64)> {
-    if m == 0 {
-        return Vec::new();
+/// Each cycle extends the Krylov decomposition `OP·V = V·H + β·v·e_mᵀ` to `ncv` vectors by
+/// Arnoldi with full reorthogonalization, computes the real Schur form `H = Q·T·Qᵀ`, and tests
+/// every wanted Ritz pair with ARPACK's `dnconv`: `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))`
+/// (floored at [`krylov_estimate_floor`]), with `y` the unit eigenvector of `H`. If `k` splits a conjugate pair the partner is wanted too
+/// (`dngets`). Otherwise the Schur form is reordered (LAPACK `dtrexc`-style block swaps) so
+/// the `k' + min(nconv, (ncv − k')/2)` most wanted eigenvalues — converged ones first — lead,
+/// the basis is truncated to their Schur vectors `V·Q₁` (an exact invariant subspace of `H`,
+/// so the decomposition stays a Krylov decomposition), and the leading converged blocks whose
+/// residual couplings are below tolerance are deflated. At most `settings.max_iter` cycles.
+fn general_krylov_schur<F>(
+    mut op: F,
+    mass: Option<&CsrMatrix>,
+    n: usize,
+    k: usize,
+    settings: &KrylovSettings,
+    v0: Option<&[f64]>,
+    force_range: bool,
+) -> SparseResult<GeneralRitz>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let m = settings.ncv.clamp(1, n);
+    let eps23 = arpack_eps23();
+    let tol = settings.tol;
+    let mut applications = 0_usize;
+    let mut basis = KrylovBasis::new(n, mass);
+    krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
+
+    // The projected matrix, row-major m×m (upper Hessenberg plus the restart's spike row).
+    let mut h = vec![0.0_f64; m * m];
+    let mut iterations = 0_usize;
+    loop {
+        iterations += 1;
+        let (beta, next) = krylov_extend(
+            &mut basis,
+            &mut op,
+            m,
+            &mut applications,
+            |j, coeff, sub| {
+                for (i, &c) in coeff.iter().enumerate() {
+                    h[i * m + j] = c;
+                }
+                if j + 1 < m {
+                    h[(j + 1) * m + j] = sub;
+                }
+            },
+        )?;
+        let size = basis.len();
+        let projected = DMatrix::from_fn(size, size, |i, j| h[i * m + j]);
+        let Some(mut schur) = RealSchur::new(projected) else {
+            let partial = EigsResult {
+                iterations,
+                ncv: m,
+                ..EigsResult::default()
+            };
+            return Err(eigs_no_convergence(iterations, 0, k, partial));
+        };
+        let values = schur.values();
+        let order = general_order(&values, settings.which);
+        let mut wanted = k.min(values.len());
+        if wanted > 0
+            && wanted < order.len()
+            && values[order[wanted - 1]].block == values[order[wanted]].block
+        {
+            wanted += 1;
+        }
+        // Unit eigenvectors of H for the wanted values, and their couplings to the residual.
+        let ritz: Vec<(Vec<(f64, f64)>, (f64, f64))> = order[..wanted]
+            .iter()
+            .map(|&r| {
+                let y = schur.projected_eigenvector(values[r]);
+                let last = y.last().copied().unwrap_or((0.0, 0.0));
+                (y, (beta * last.0, beta * last.1))
+            })
+            .collect();
+        let floor = krylov_estimate_floor(size, values.iter().map(|v| v.re.hypot(v.im)));
+        let passes = |idx: usize| {
+            let (_, c) = &ritz[idx];
+            let v = values[order[idx]];
+            c.0.hypot(c.1) <= (tol * v.re.hypot(v.im).max(eps23)).max(floor)
+        };
+        let nconv = (0..wanted).filter(|&i| passes(i)).count();
+        let finished = (wanted >= k && nconv == wanted) || size <= wanted;
+
+        let (next_v, next_bv) = match next {
+            Some(direction) if !finished && iterations < settings.max_iter => direction,
+            last => {
+                let mut out = GeneralRitz {
+                    theta: Vec::with_capacity(wanted),
+                    vectors: Vec::with_capacity(wanted),
+                    coupling: Vec::with_capacity(wanted),
+                    converged: Vec::with_capacity(wanted),
+                    block: Vec::with_capacity(wanted),
+                    next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
+                    iterations,
+                    applications,
+                };
+                for (idx, (y, c)) in ritz.iter().enumerate() {
+                    let value = values[order[idx]];
+                    let (mut xr, _) = basis.combine(size, |j| y[j].0);
+                    let (mut xi, _) = basis.combine(size, |j| y[j].1);
+                    complex_b_normalize(&mut xr, &mut xi, mass);
+                    out.theta.push((value.re, value.im));
+                    out.vectors.push((xr, xi));
+                    out.coupling.push(*c);
+                    out.converged.push(passes(idx));
+                    out.block.push(value.block);
+                }
+                return Ok(out);
+            }
+        };
+
+        // Restart: keep the most wanted blocks (ARPACK dnaup2's nev adjustment), converged
+        // ones first so that they can be deflated.
+        let mut keep_target = wanted + nconv.min((size - wanted) / 2);
+        if keep_target == 1 && size >= 6 {
+            keep_target = size / 2;
+        } else if keep_target == 1 && size > 2 {
+            keep_target = 2;
+        }
+        let converged_blocks: Vec<usize> = (0..wanted)
+            .filter(|&i| passes(i))
+            .map(|i| values[order[i]].block)
+            .collect();
+        let mut ranked: Vec<usize> = Vec::with_capacity(values.len());
+        for &block in converged_blocks
+            .iter()
+            .chain(order.iter().map(|&r| &values[r].block))
+        {
+            if !ranked.contains(&block) {
+                ranked.push(block);
+            }
+        }
+        let mut chosen: Vec<usize> = Vec::new();
+        let mut count = 0_usize;
+        for block in ranked {
+            if count >= keep_target {
+                break;
+            }
+            count += schur.block_size(block);
+            chosen.push(block);
+        }
+        while count > size - 1 {
+            match chosen.pop() {
+                Some(block) => count -= schur.block_size(block),
+                None => break,
+            }
+        }
+        let moved = schur.move_to_front(&chosen);
+        // A refused swap (nearly equal eigenvalues) leaves a shorter prefix; any leading set of
+        // Schur blocks is still an invariant subspace, so the restart stays exact.
+        let keep = if moved == 0 {
+            schur.blocks.first().map_or(1, |b| b.1)
+        } else {
+            moved
+        };
+
+        let mut new_v = Vec::with_capacity(m + 1);
+        let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
+        for s in 0..keep {
+            let (x, bx) = basis.combine(size, |j| schur.q[(j, s)]);
+            new_v.push(x);
+            if let Some(bx) = bx {
+                new_bv.push(bx);
+            }
+        }
+        h.fill(0.0);
+        for i in 0..keep {
+            for j in 0..keep {
+                h[i * m + j] = schur.t[(i, j)];
+            }
+        }
+        for s in 0..keep {
+            h[keep * m + s] = beta * schur.q[(size - 1, s)];
+        }
+        // Deflation (locking): a leading converged block whose couplings to the residual are
+        // below tolerance is decoupled, so it stays an exact invariant subspace of H.
+        for (pos, &(start, bsize)) in schur.blocks.iter().enumerate() {
+            if start + bsize > keep || !converged_blocks.contains(&schur.ids[pos]) {
+                break;
+            }
+            let magnitude = schur
+                .block_values((start, bsize))
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.0.hypot(v.1)));
+            let spike =
+                (start..start + bsize).fold(0.0_f64, |acc, s| acc.max(h[keep * m + s].abs()));
+            if spike > (tol * magnitude.max(eps23)).max(floor) {
+                break;
+            }
+            for s in start..start + bsize {
+                h[keep * m + s] = 0.0;
+            }
+        }
+        basis.replace(new_v, new_bv);
+        basis.push(next_v, next_bv);
     }
-    if m == 1 {
-        return vec![(h[0][0], 0.0)];
+}
+
+/// A real Schur decomposition `H = Q·T·Qᵀ` of a small dense matrix, `T` quasi-upper-triangular:
+/// 1×1 diagonal blocks for real eigenvalues and 2×2 blocks for complex-conjugate pairs.
+struct RealSchur {
+    t: DMatrix<f64>,
+    q: DMatrix<f64>,
+    /// `(start, size)` of each diagonal block, top to bottom.
+    blocks: Vec<(usize, usize)>,
+    /// A stable id per block that follows it through reordering.
+    ids: Vec<usize>,
+}
+
+impl RealSchur {
+    /// Householder reduction to Hessenberg form, then the Francis double-shift QR with
+    /// accumulated transformations (EISPACK `orthes` + the Schur part of `hqr2`, as in JAMA).
+    /// `None` when the QR iteration does not converge.
+    fn new(mut h: DMatrix<f64>) -> Option<Self> {
+        let mut q = hessenberg_reduce(&mut h);
+        let blocks = francis_real_schur(&mut h, &mut q)?;
+        let ids = (0..blocks.len()).collect();
+        Some(Self {
+            t: h,
+            q,
+            blocks,
+            ids,
+        })
     }
 
-    // Working copy of the m×m submatrix.
-    let mut a = vec![vec![0.0f64; m]; m];
-    for (ai, hi) in a.iter_mut().zip(h.iter()).take(m) {
-        ai[..m].copy_from_slice(&hi[..m]);
+    fn block_size(&self, id: usize) -> usize {
+        self.ids
+            .iter()
+            .position(|&b| b == id)
+            .map_or(0, |pos| self.blocks[pos].1)
     }
 
-    let mut wr = vec![0.0f64; m];
-    let mut wi = vec![0.0f64; m];
-
-    // |a|-style norm used by the subdiagonal-negligibility and exceptional-shift
-    // tests (NR `anorm`).
-    let mut anorm = 0.0f64;
-    for i in 0..m {
-        let start = i.saturating_sub(1);
-        for j in start..m {
-            anorm += a[i][j].abs();
+    /// The eigenvalues of the diagonal block `(start, size)`, positive imaginary part first.
+    fn block_values(&self, (start, size): (usize, usize)) -> Vec<(f64, f64)> {
+        if size == 1 {
+            return vec![(self.t[(start, start)], 0.0)];
+        }
+        let (a, b) = (self.t[(start, start)], self.t[(start, start + 1)]);
+        let (c, d) = (self.t[(start + 1, start)], self.t[(start + 1, start + 1)]);
+        let p = 0.5 * (a - d);
+        let disc = p * p + b * c;
+        let mid = 0.5 * (a + d);
+        if disc >= 0.0 {
+            // Rounding can leave a real pair in a 2×2 block after a swap.
+            let r = disc.sqrt();
+            vec![(mid + r, 0.0), (mid - r, 0.0)]
+        } else {
+            let im = (-disc).sqrt();
+            vec![(mid, im), (mid, -im)]
         }
     }
 
-    // sign(x, y) = |x| with the sign of y.
-    let sign = |x: f64, y: f64| if y >= 0.0 { x.abs() } else { -x.abs() };
-
-    let max_its = max_iter.max(30);
-    let mut nn: isize = m as isize - 1; // current active bottom-right index
-    let mut t = 0.0f64; // accumulated exceptional-shift origin
-
-    while nn >= 0 {
-        let mut its = 0usize;
-        loop {
-            // Find a small subdiagonal element to split off a sub-block.
-            let mut l = nn;
-            while l >= 1 {
-                let lu = l as usize;
-                let mut s = a[lu - 1][lu - 1].abs() + a[lu][lu].abs();
-                if s == 0.0 {
-                    s = anorm;
-                }
-                if a[lu][lu - 1].abs() + s == s {
-                    a[lu][lu - 1] = 0.0;
-                    break;
-                }
-                l -= 1;
+    fn values(&self) -> Vec<SchurValue> {
+        let mut out = Vec::with_capacity(self.t.nrows());
+        for (pos, &block) in self.blocks.iter().enumerate() {
+            for (re, im) in self.block_values(block) {
+                out.push(SchurValue {
+                    re,
+                    im,
+                    block: self.ids[pos],
+                });
             }
+        }
+        out
+    }
 
-            let x = a[nn as usize][nn as usize];
-            if l == nn {
-                // One real root.
-                wr[nn as usize] = x + t;
-                wi[nn as usize] = 0.0;
-                nn -= 1;
+    /// The unit eigenvector `Q·z` of `H` for `value`, with `z` from complex back substitution
+    /// on the quasi-triangular `T` (LAPACK `dtrevc`; a tiny pivot is replaced by `smin`).
+    fn projected_eigenvector(&self, value: SchurValue) -> Vec<(f64, f64)> {
+        let s = self.t.nrows();
+        let mut z = vec![(0.0_f64, 0.0_f64); s];
+        let Some(pos) = self.ids.iter().position(|&id| id == value.block) else {
+            return z;
+        };
+        let lambda = (value.re, value.im);
+        let t_max = self.t.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+        let smin = (f64::EPSILON * (lambda.0.abs() + lambda.1.abs()))
+            .max(f64::EPSILON * t_max)
+            .max(f64::MIN_POSITIVE);
+        let (start, size) = self.blocks[pos];
+        if size == 1 {
+            z[start] = (1.0, 0.0);
+        } else {
+            // (B − λI)·z = 0 for the 2×2 block B = [a b; c d]: z = [b, λ − a] or [λ − d, c].
+            let (a, b) = (self.t[(start, start)], self.t[(start, start + 1)]);
+            let (c, d) = (self.t[(start + 1, start)], self.t[(start + 1, start + 1)]);
+            let first = [(b, 0.0), (lambda.0 - a, lambda.1)];
+            let second = [(lambda.0 - d, lambda.1), (c, 0.0)];
+            let size_of = |v: &[(f64, f64); 2]| v[0].0.hypot(v[0].1).hypot(v[1].0.hypot(v[1].1));
+            let chosen = if size_of(&first) >= size_of(&second) {
+                first
+            } else {
+                second
+            };
+            z[start] = chosen[0];
+            z[start + 1] = chosen[1];
+        }
+        let end = start + size;
+        for bi in (0..pos).rev() {
+            let (bs, bsz) = self.blocks[bi];
+            let rhs = |row: usize, z: &[(f64, f64)]| {
+                let mut acc = (0.0, 0.0);
+                for (l, zl) in z.iter().enumerate().take(end).skip(bs + bsz) {
+                    acc.0 -= self.t[(row, l)] * zl.0;
+                    acc.1 -= self.t[(row, l)] * zl.1;
+                }
+                acc
+            };
+            if bsz == 1 {
+                let mut den = (self.t[(bs, bs)] - lambda.0, -lambda.1);
+                if den.0.hypot(den.1) < smin {
+                    den = (smin, 0.0);
+                }
+                z[bs] = complex_div(rhs(bs, &z), den);
+            } else {
+                let (r0, r1) = (rhs(bs, &z), rhs(bs + 1, &z));
+                let a00 = (self.t[(bs, bs)] - lambda.0, -lambda.1);
+                let a01 = (self.t[(bs, bs + 1)], 0.0);
+                let a10 = (self.t[(bs + 1, bs)], 0.0);
+                let a11 = (self.t[(bs + 1, bs + 1)] - lambda.0, -lambda.1);
+                let prod = complex_mul(a00, a11);
+                let cross = complex_mul(a01, a10);
+                let mut det = (prod.0 - cross.0, prod.1 - cross.1);
+                let scale = [a00, a01, a10, a11]
+                    .iter()
+                    .fold(0.0_f64, |acc, v| acc.max(v.0.hypot(v.1)));
+                if det.0.hypot(det.1) < smin * scale.max(smin) {
+                    det = (smin * scale.max(smin), 0.0);
+                }
+                let n0 = {
+                    let (p, q) = (complex_mul(r0, a11), complex_mul(a01, r1));
+                    (p.0 - q.0, p.1 - q.1)
+                };
+                let n1 = {
+                    let (p, q) = (complex_mul(a00, r1), complex_mul(a10, r0));
+                    (p.0 - q.0, p.1 - q.1)
+                };
+                z[bs] = complex_div(n0, det);
+                z[bs + 1] = complex_div(n1, det);
+            }
+            let z_max = z
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.0.abs().max(v.1.abs())));
+            if z_max > 1e100 {
+                for v in &mut z {
+                    v.0 /= z_max;
+                    v.1 /= z_max;
+                }
+            }
+        }
+        let mut y = vec![(0.0_f64, 0.0_f64); s];
+        for (i, yi) in y.iter_mut().enumerate() {
+            for (j, zj) in z.iter().enumerate() {
+                let qij = self.q[(i, j)];
+                yi.0 += qij * zj.0;
+                yi.1 += qij * zj.1;
+            }
+        }
+        let norm = y.iter().map(|v| v.0 * v.0 + v.1 * v.1).sum::<f64>().sqrt();
+        if norm > 0.0 && norm.is_finite() {
+            for v in &mut y {
+                v.0 /= norm;
+                v.1 /= norm;
+            }
+        }
+        y
+    }
+
+    /// Moves the blocks with ids `targets` to the top of `T`, in that order, by adjacent swaps
+    /// (LAPACK `dtrsen`/`dtrexc`). Returns the number of leading columns now holding target
+    /// blocks; stops at the first swap refused as unstable.
+    fn move_to_front(&mut self, targets: &[usize]) -> usize {
+        let mut placed = 0_usize;
+        let mut columns = 0_usize;
+        for &target in targets {
+            let Some(mut pos) = self.ids.iter().position(|&id| id == target) else {
+                continue;
+            };
+            while pos > placed {
+                let (start, p) = self.blocks[pos - 1];
+                let q = self.blocks[pos].1;
+                if !schur_swap_adjacent(&mut self.t, &mut self.q, start, p, q) {
+                    return columns;
+                }
+                self.blocks[pos - 1] = (start, q);
+                self.blocks[pos] = (start + q, p);
+                self.ids.swap(pos - 1, pos);
+                pos -= 1;
+            }
+            columns += self.blocks[placed].1;
+            placed += 1;
+        }
+        columns
+    }
+}
+
+/// Householder reduction of `h` to upper Hessenberg form in place, returning the orthogonal
+/// `V` with `H_in = V·H_out·Vᵀ` (EISPACK `orthes` + `ortran`, as in JAMA).
+fn hessenberg_reduce(h: &mut DMatrix<f64>) -> DMatrix<f64> {
+    let n = h.nrows();
+    let mut v = DMatrix::<f64>::identity(n, n);
+    if n < 3 {
+        return v;
+    }
+    let high = n - 1;
+    let mut ort = vec![0.0_f64; n];
+    for m in 1..high {
+        let scale: f64 = (m..=high).map(|i| h[(i, m - 1)].abs()).sum();
+        if scale == 0.0 {
+            continue;
+        }
+        let mut hh = 0.0;
+        for i in (m..=high).rev() {
+            ort[i] = h[(i, m - 1)] / scale;
+            hh += ort[i] * ort[i];
+        }
+        let mut g = hh.sqrt();
+        if ort[m] > 0.0 {
+            g = -g;
+        }
+        hh -= ort[m] * g;
+        ort[m] -= g;
+        for j in m..n {
+            let mut f = 0.0;
+            for i in (m..=high).rev() {
+                f += ort[i] * h[(i, j)];
+            }
+            f /= hh;
+            for i in m..=high {
+                h[(i, j)] -= f * ort[i];
+            }
+        }
+        for i in 0..=high {
+            let mut f = 0.0;
+            for j in (m..=high).rev() {
+                f += ort[j] * h[(i, j)];
+            }
+            f /= hh;
+            for j in m..=high {
+                h[(i, j)] -= f * ort[j];
+            }
+        }
+        ort[m] *= scale;
+        h[(m, m - 1)] = scale * g;
+    }
+    for m in (1..high).rev() {
+        if h[(m, m - 1)] == 0.0 {
+            continue;
+        }
+        for i in (m + 1)..=high {
+            ort[i] = h[(i, m - 1)];
+        }
+        for j in m..=high {
+            let mut g = 0.0;
+            for i in m..=high {
+                g += ort[i] * v[(i, j)];
+            }
+            // Double division avoids a possible underflow.
+            g = (g / ort[m]) / h[(m, m - 1)];
+            for i in m..=high {
+                v[(i, j)] += g * ort[i];
+            }
+        }
+    }
+    // The Householder vectors lived below the subdiagonal.
+    for j in 0..n {
+        for i in (j + 2)..n {
+            h[(i, j)] = 0.0;
+        }
+    }
+    v
+}
+
+/// The Francis double-shift QR on the upper Hessenberg `h`, accumulating into `z`, until `h` is
+/// quasi-upper-triangular (the Schur part of EISPACK `hqr2` as in JAMA, with Wilkinson's and
+/// MATLAB's exceptional shifts). A 2×2 block with real eigenvalues is split by a rotation, so
+/// every 2×2 block left holds a complex-conjugate pair. Returns the blocks top to bottom, or
+/// `None` after `30·max(10, n)` iterations on one eigenvalue.
+fn francis_real_schur(h: &mut DMatrix<f64>, z: &mut DMatrix<f64>) -> Option<Vec<(usize, usize)>> {
+    let nn = h.nrows();
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    if nn == 0 {
+        return Some(blocks);
+    }
+    let eps = f64::EPSILON;
+    let max_its = 30 * nn.max(10);
+    let mut exshift = 0.0_f64;
+    let mut norm = 0.0_f64;
+    for i in 0..nn {
+        for j in i.saturating_sub(1)..nn {
+            norm += h[(i, j)].abs();
+        }
+    }
+    let mut n = nn as isize - 1;
+    let mut iter = 0_usize;
+    while n >= 0 {
+        let nu = n as usize;
+        // Look for a single small subdiagonal element.
+        let mut l = nu;
+        while l > 0 {
+            let mut s = h[(l - 1, l - 1)].abs() + h[(l, l)].abs();
+            if s == 0.0 {
+                s = norm;
+            }
+            if h[(l, l - 1)].abs() < eps * s {
+                h[(l, l - 1)] = 0.0;
                 break;
             }
-
-            let y = a[(nn - 1) as usize][(nn - 1) as usize];
-            let w = a[nn as usize][(nn - 1) as usize] * a[(nn - 1) as usize][nn as usize];
-            if l == nn - 1 {
-                // A 2×2 block: solve its characteristic quadratic directly.
-                let p = 0.5 * (y - x);
-                let q = p * p + w;
-                let z = q.abs().sqrt();
-                let xb = x + t;
-                if q >= 0.0 {
-                    // Real eigenvalue pair.
-                    let zr = p + sign(z, p);
-                    wr[(nn - 1) as usize] = xb + zr;
-                    wr[nn as usize] = if zr != 0.0 { xb - w / zr } else { xb + zr };
-                    wi[(nn - 1) as usize] = 0.0;
-                    wi[nn as usize] = 0.0;
-                } else {
-                    // Complex-conjugate pair re ± im·i.
-                    wr[(nn - 1) as usize] = xb + p;
-                    wr[nn as usize] = xb + p;
-                    wi[(nn - 1) as usize] = -z;
-                    wi[nn as usize] = z;
+            l -= 1;
+        }
+        if l == nu {
+            // One real root.
+            h[(nu, nu)] += exshift;
+            blocks.push((nu, 1));
+            n -= 1;
+            iter = 0;
+        } else if l + 1 == nu {
+            // Two roots.
+            let w = h[(nu, nu - 1)] * h[(nu - 1, nu)];
+            let p = (h[(nu - 1, nu - 1)] - h[(nu, nu)]) / 2.0;
+            let q = p * p + w;
+            h[(nu, nu)] += exshift;
+            h[(nu - 1, nu - 1)] += exshift;
+            if q >= 0.0 {
+                // A real pair: split it with a rotation.
+                let zz = if p >= 0.0 { p + q.sqrt() } else { p - q.sqrt() };
+                let x = h[(nu, nu - 1)];
+                let s = x.abs() + zz.abs();
+                let (mut pr, mut qr) = (x / s, zz / s);
+                let r = (pr * pr + qr * qr).sqrt();
+                pr /= r;
+                qr /= r;
+                for j in (nu - 1)..nn {
+                    let t = h[(nu - 1, j)];
+                    h[(nu - 1, j)] = qr * t + pr * h[(nu, j)];
+                    h[(nu, j)] = qr * h[(nu, j)] - pr * t;
                 }
-                nn -= 2;
-                break;
-            }
-
-            if its >= max_its {
-                // Non-convergence backstop: deflate one real root and continue,
-                // rather than aborting as NR does.
-                wr[nn as usize] = x + t;
-                wi[nn as usize] = 0.0;
-                nn -= 1;
-                break;
-            }
-
-            // Form the (double) shift.
-            let mut xs = x;
-            let mut ys = y;
-            let mut ws = w;
-            if its == 10 || its == 20 {
-                // Exceptional shift to break a cycle.
-                t += xs;
-                for i in 0..=(nn as usize) {
-                    a[i][i] -= xs;
+                for i in 0..=nu {
+                    let t = h[(i, nu - 1)];
+                    h[(i, nu - 1)] = qr * t + pr * h[(i, nu)];
+                    h[(i, nu)] = qr * h[(i, nu)] - pr * t;
                 }
-                let s = a[nn as usize][(nn - 1) as usize].abs()
-                    + a[(nn - 1) as usize][(nn - 2) as usize].abs();
-                xs = 0.75 * s;
-                ys = xs;
-                ws = -0.4375 * s * s;
+                for i in 0..nn {
+                    let t = z[(i, nu - 1)];
+                    z[(i, nu - 1)] = qr * t + pr * z[(i, nu)];
+                    z[(i, nu)] = qr * z[(i, nu)] - pr * t;
+                }
+                h[(nu, nu - 1)] = 0.0;
+                blocks.push((nu, 1));
+                blocks.push((nu - 1, 1));
+            } else {
+                blocks.push((nu - 1, 2));
             }
-            its += 1;
-
-            // Locate two consecutive small subdiagonal elements (the bulge start).
-            let mut p = 0.0f64;
-            let mut q = 0.0f64;
-            let mut r = 0.0f64;
-            let mut mm = nn - 2;
-            while mm >= l {
-                let mu = mm as usize;
-                let z = a[mu][mu];
-                let rr = xs - z;
-                let ss = ys - z;
-                p = (rr * ss - ws) / a[mu + 1][mu] + a[mu][mu + 1];
-                q = a[mu + 1][mu + 1] - z - rr - ss;
-                r = a[mu + 2][mu + 1];
+            n -= 2;
+            iter = 0;
+        } else {
+            // No convergence yet: form the shift.
+            let mut x = h[(nu, nu)];
+            let mut y = h[(nu - 1, nu - 1)];
+            let mut w = h[(nu, nu - 1)] * h[(nu - 1, nu)];
+            if iter == 10 {
+                // Wilkinson's original ad hoc shift.
+                exshift += x;
+                for i in 0..=nu {
+                    h[(i, i)] -= x;
+                }
+                let s = h[(nu, nu - 1)].abs() + h[(nu - 1, nu - 2)].abs();
+                x = 0.75 * s;
+                y = x;
+                w = -0.4375 * s * s;
+            }
+            if iter == 30 {
+                // MATLAB's ad hoc shift.
+                let mut s = (y - x) / 2.0;
+                s = s * s + w;
+                if s > 0.0 {
+                    s = s.sqrt();
+                    if y < x {
+                        s = -s;
+                    }
+                    s = x - w / ((y - x) / 2.0 + s);
+                    for i in 0..=nu {
+                        h[(i, i)] -= s;
+                    }
+                    exshift += s;
+                    x = 0.964;
+                    y = x;
+                    w = x;
+                }
+            }
+            iter += 1;
+            if iter > max_its {
+                return None;
+            }
+            // Look for two consecutive small subdiagonal elements.
+            let mut m = nu - 2;
+            let (mut p, mut q, mut r);
+            loop {
+                let zm = h[(m, m)];
+                let rr = x - zm;
+                let ss = y - zm;
+                p = (rr * ss - w) / h[(m + 1, m)] + h[(m, m + 1)];
+                q = h[(m + 1, m + 1)] - zm - rr - ss;
+                r = h[(m + 2, m + 1)];
                 let s = p.abs() + q.abs() + r.abs();
                 p /= s;
                 q /= s;
                 r /= s;
-                if mm == l {
+                if m == l {
                     break;
                 }
-                let u = a[mu][mu - 1].abs() * (q.abs() + r.abs());
-                let vv = p.abs() * (a[mu - 1][mu - 1].abs() + z.abs() + a[mu + 1][mu + 1].abs());
-                if u + vv == vv {
+                if h[(m, m - 1)].abs() * (q.abs() + r.abs())
+                    < eps
+                        * (p.abs() * (h[(m - 1, m - 1)].abs() + zm.abs() + h[(m + 1, m + 1)].abs()))
+                {
                     break;
                 }
-                mm -= 1;
+                m -= 1;
             }
-
-            for i in (mm + 2)..=nn {
-                let iu = i as usize;
-                a[iu][iu - 2] = 0.0;
-                if i != mm + 2 {
-                    a[iu][iu - 3] = 0.0;
+            for i in (m + 2)..=nu {
+                h[(i, i - 2)] = 0.0;
+                if i > m + 2 {
+                    h[(i, i - 3)] = 0.0;
                 }
             }
-
-            // Double-QR sweep (chase the bulge) over rows/cols l..=nn.
-            let mut kk = mm;
-            while kk < nn {
-                let ku = kk as usize;
-                if kk != mm {
-                    p = a[ku][ku - 1];
-                    q = a[ku + 1][ku - 1];
-                    r = 0.0;
-                    if kk != nn - 1 {
-                        r = a[ku + 2][ku - 1];
+            // Double QR step on rows l..=n and columns m..=n.
+            for k in m..nu {
+                let notlast = k + 1 != nu;
+                let mut xk = 0.0;
+                if k != m {
+                    p = h[(k, k - 1)];
+                    q = h[(k + 1, k - 1)];
+                    r = if notlast { h[(k + 2, k - 1)] } else { 0.0 };
+                    xk = p.abs() + q.abs() + r.abs();
+                    if xk == 0.0 {
+                        continue;
                     }
-                    xs = p.abs() + q.abs() + r.abs();
-                    if xs != 0.0 {
-                        p /= xs;
-                        q /= xs;
-                        r /= xs;
-                    }
+                    p /= xk;
+                    q /= xk;
+                    r /= xk;
                 }
-                let s = sign((p * p + q * q + r * r).sqrt(), p);
-                if s != 0.0 {
-                    if kk == mm {
-                        if l != mm {
-                            a[ku][ku - 1] = -a[ku][ku - 1];
-                        }
-                    } else {
-                        a[ku][ku - 1] = -s * xs;
-                    }
-                    p += s;
-                    let xp = p / s;
-                    let yp = q / s;
-                    let zp = r / s;
-                    let qp = q / p;
-                    let rp = r / p;
-                    // Row modification.
-                    for j in ku..m {
-                        let mut pp = a[ku][j] + qp * a[ku + 1][j];
-                        if kk != nn - 1 {
-                            pp += rp * a[ku + 2][j];
-                            a[ku + 2][j] -= pp * zp;
-                        }
-                        a[ku + 1][j] -= pp * yp;
-                        a[ku][j] -= pp * xp;
-                    }
-                    let mmin = if nn < kk + 3 { nn } else { kk + 3 };
-                    // Column modification.
-                    for i in (l as usize)..=(mmin as usize) {
-                        let mut pp = xp * a[i][ku] + yp * a[i][ku + 1];
-                        if kk != nn - 1 {
-                            pp += zp * a[i][ku + 2];
-                            a[i][ku + 2] -= pp * rp;
-                        }
-                        a[i][ku + 1] -= pp * qp;
-                        a[i][ku] -= pp;
-                    }
+                let mut s = (p * p + q * q + r * r).sqrt();
+                if p < 0.0 {
+                    s = -s;
                 }
-                kk += 1;
+                if s == 0.0 {
+                    continue;
+                }
+                if k != m {
+                    h[(k, k - 1)] = -s * xk;
+                } else if l != m {
+                    h[(k, k - 1)] = -h[(k, k - 1)];
+                }
+                p += s;
+                let (xx, yy, zz) = (p / s, q / s, r / s);
+                let (qq, rr) = (q / p, r / p);
+                for j in k..nn {
+                    let mut pp = h[(k, j)] + qq * h[(k + 1, j)];
+                    if notlast {
+                        pp += rr * h[(k + 2, j)];
+                        h[(k + 2, j)] -= pp * zz;
+                    }
+                    h[(k, j)] -= pp * xx;
+                    h[(k + 1, j)] -= pp * yy;
+                }
+                for i in 0..=nu.min(k + 3) {
+                    let mut pp = xx * h[(i, k)] + yy * h[(i, k + 1)];
+                    if notlast {
+                        pp += zz * h[(i, k + 2)];
+                        h[(i, k + 2)] -= pp * rr;
+                    }
+                    h[(i, k)] -= pp;
+                    h[(i, k + 1)] -= pp * qq;
+                }
+                for i in 0..nn {
+                    let mut pp = xx * z[(i, k)] + yy * z[(i, k + 1)];
+                    if notlast {
+                        pp += zz * z[(i, k + 2)];
+                        z[(i, k + 2)] -= pp * rr;
+                    }
+                    z[(i, k)] -= pp;
+                    z[(i, k + 1)] -= pp * qq;
+                }
             }
         }
     }
-
-    (0..m).map(|i| (wr[i], wi[i])).collect()
+    blocks.reverse();
+    // Clean the strictly lower part outside the 2×2 blocks.
+    let mut pair_start = vec![false; nn];
+    for &(start, size) in &blocks {
+        pair_start[start] = size == 2;
+    }
+    for j in 0..nn {
+        for i in (j + 1)..nn {
+            if !(i == j + 1 && pair_start[j]) {
+                h[(i, j)] = 0.0;
+            }
+        }
+    }
+    Some(blocks)
 }
 
-/// Complex eigenvector of `H[0..m, 0..m]` for the (possibly complex) eigenvalue
-/// `lambda`: solve `(H - lambda·I) y = 0` by back-substitution against the
-/// subdiagonal with `y[m-1] = 1`. For a real `lambda` and real `H` every component
-/// stays real.
-fn hessenberg_eigenvector_complex(h: &[Vec<f64>], m: usize, lambda: (f64, f64)) -> Vec<(f64, f64)> {
-    if m == 0 {
-        return Vec::new();
-    }
-    if m == 1 {
-        return vec![(1.0, 0.0)];
-    }
-    let (lr, li) = lambda;
-    let mut y = vec![(0.0f64, 0.0f64); m];
-    y[m - 1] = (1.0, 0.0);
-    for rr in (1..m).rev() {
-        // acc = -lambda*y[r] + Σ_{c>=r} h[r][c]*y[c]   (h is real)
-        let yr = y[rr];
-        let mut acc = (-lr * yr.0 + li * yr.1, -lr * yr.1 - li * yr.0);
-        for c in rr..m {
-            acc.0 += h[rr][c] * y[c].0;
-            acc.1 += h[rr][c] * y[c].1;
+/// Swaps the adjacent diagonal blocks of the quasi-triangular `t` that start at column `j`
+/// (sizes `p` then `q`) by an orthogonal similarity accumulated into `z`: LAPACK `dlaexc`'s
+/// direct swap, which solves the Sylvester equation `T₁₁X − XT₂₂ = T₁₂` and takes the QR
+/// factorization of `[−X; I]`. Leaves everything untouched and returns `false` when the
+/// swapped form would not be backward stable (nearly equal eigenvalues), as `dlaexc` refuses.
+fn schur_swap_adjacent(
+    t: &mut DMatrix<f64>,
+    z: &mut DMatrix<f64>,
+    j: usize,
+    p: usize,
+    q: usize,
+) -> bool {
+    let s = p + q;
+    let nrow = t.nrows();
+    let d = t.view((j, j), (s, s)).clone_owned();
+    let d_max = d.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+    let eps = f64::EPSILON;
+    let thresh = (10.0 * eps * d_max).max(f64::MIN_POSITIVE);
+    // Kronecker form of T₁₁X − XT₂₂ = T₁₂ for the column-major vec(X), X p×q.
+    let dim = p * q;
+    let mut kron = DMatrix::<f64>::zeros(dim, dim);
+    let mut rhs = DVector::<f64>::zeros(dim);
+    for c in 0..q {
+        for r in 0..p {
+            let row = c * p + r;
+            rhs[row] = d[(r, p + c)];
+            for cc in 0..q {
+                for rr in 0..p {
+                    let mut val = 0.0;
+                    if c == cc {
+                        val += d[(r, rr)];
+                    }
+                    if r == rr {
+                        val -= d[(p + cc, p + c)];
+                    }
+                    kron[(row, cc * p + rr)] = val;
+                }
+            }
         }
-        let sub = h[rr][rr - 1];
-        if sub.abs() < f64::MIN_POSITIVE {
-            // Decoupled block: leave the remaining components at zero.
-            break;
-        }
-        y[rr - 1] = (-acc.0 / sub, -acc.1 / sub);
     }
-    y
+    let smin = (eps * d_max).max(f64::MIN_POSITIVE);
+    let x = solve_small_perturbed(kron, rhs, smin);
+    // [−X, I_p; I_q, 0]: its Q's first q columns span [−X; I_q], the T₂₂ invariant subspace.
+    let mut basis = DMatrix::<f64>::zeros(s, s);
+    for r in 0..p {
+        for c in 0..q {
+            basis[(r, c)] = -x[c * p + r];
+        }
+        basis[(r, q + r)] = 1.0;
+    }
+    for c in 0..q {
+        basis[(p + c, c)] = 1.0;
+    }
+    let rot = basis.qr().q();
+    let swapped = rot.transpose() * &d * &rot;
+    let mut lower = 0.0_f64;
+    for r in q..s {
+        for c in 0..q {
+            lower = lower.max(swapped[(r, c)].abs());
+        }
+    }
+    if !(lower <= thresh) {
+        return false;
+    }
+    let rows = t.view((j, j), (s, nrow - j)).clone_owned();
+    t.view_mut((j, j), (s, nrow - j))
+        .copy_from(&(rot.transpose() * rows));
+    let cols = t.view((0, j), (j + s, s)).clone_owned();
+    t.view_mut((0, j), (j + s, s)).copy_from(&(cols * &rot));
+    let z_cols = z.view((0, j), (nrow, s)).clone_owned();
+    z.view_mut((0, j), (nrow, s)).copy_from(&(z_cols * &rot));
+    // The block below the new leading block is zero to within `thresh`; make it exact.
+    for r in (j + q)..(j + s) {
+        for c in j..(j + q) {
+            t[(r, c)] = 0.0;
+        }
+    }
+    true
+}
+
+/// Solves the small system `a·x = b` by Gaussian elimination with partial pivoting, replacing a
+/// pivot below `smin` by `±smin` (LAPACK `dlasy2`'s perturbation for a nearly singular
+/// Sylvester operator).
+fn solve_small_perturbed(mut a: DMatrix<f64>, mut b: DVector<f64>, smin: f64) -> DVector<f64> {
+    let n = a.nrows();
+    for col in 0..n {
+        let pivot = (col..n)
+            .max_by(|&i, &j| a[(i, col)].abs().total_cmp(&a[(j, col)].abs()))
+            .unwrap_or(col);
+        if pivot != col {
+            a.swap_rows(pivot, col);
+            b.swap_rows(pivot, col);
+        }
+        if a[(col, col)].abs() < smin {
+            a[(col, col)] = if a[(col, col)] < 0.0 { -smin } else { smin };
+        }
+        for r in (col + 1)..n {
+            let f = a[(r, col)] / a[(col, col)];
+            if f != 0.0 {
+                for c in col..n {
+                    a[(r, c)] -= f * a[(col, c)];
+                }
+                b[r] -= f * b[col];
+            }
+        }
+    }
+    let mut x = DVector::<f64>::zeros(n);
+    for r in (0..n).rev() {
+        let mut acc = b[r];
+        for c in (r + 1)..n {
+            acc -= a[(r, c)] * x[c];
+        }
+        x[r] = acc / a[(r, r)];
+    }
+    x
+}
+
+#[cfg(test)]
+mod krylov_eigen_tests {
+    use super::*;
+
+    fn laplacian_1d(n: usize) -> CsrMatrix {
+        let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            vals.push(2.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                vals.extend([-1.0, -1.0]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// Exact eigenvalues of `tridiag(-1, 2, -1)`, ascending: `2 − 2cos(jπ/(n+1))`.
+    fn laplacian_eigenvalues(n: usize) -> Vec<f64> {
+        (1..=n)
+            .map(|j| 2.0 - 2.0 * (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos())
+            .collect()
+    }
+
+    fn csr(n: usize, vals: Vec<f64>, rows: Vec<usize>, cols: Vec<usize>) -> CsrMatrix {
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn diagonal(d: &[f64]) -> CsrMatrix {
+        let idx: Vec<usize> = (0..d.len()).collect();
+        csr(d.len(), d.to_vec(), idx.clone(), idx)
+    }
+
+    /// Ten eigenvalues in [1, 1 + 9e-9] above a spread in [0.01, 0.9].
+    fn clustered_diag(n: usize) -> CsrMatrix {
+        let mut d: Vec<f64> = (0..10).map(|i| 1.0 + 1e-9 * i as f64).collect();
+        let rest = n - 10;
+        for i in 0..rest {
+            d.push(0.01 + (0.9 - 0.01) * i as f64 / (rest - 1) as f64);
+        }
+        diagonal(&d)
+    }
+
+    /// Linear finite elements for `−u'' = λu` on (0, 1) with `n` interior nodes: stiffness
+    /// `K = tridiag(−1, 2, −1)/h`, mass `M = h·tridiag(1, 4, 1)/6`, and the exact generalized
+    /// eigenvalues `(6/h²)(1 − cos θ_j)/(2 + cos θ_j)`, `θ_j = jπ/(n+1)`, ascending.
+    fn fem_pair(n: usize) -> (CsrMatrix, CsrMatrix, Vec<f64>) {
+        let h = 1.0 / (n + 1) as f64;
+        let (mut kv, mut mv, mut rows, mut cols) = (vec![], vec![], vec![], vec![]);
+        for i in 0..n {
+            kv.push(2.0 / h);
+            mv.push(4.0 * h / 6.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                kv.extend([-1.0 / h, -1.0 / h]);
+                mv.extend([h / 6.0, h / 6.0]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        let exact = (1..=n)
+            .map(|j| {
+                let c = (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos();
+                6.0 / (h * h) * (1.0 - c) / (2.0 + c)
+            })
+            .collect();
+        (
+            csr(n, kv, rows.clone(), cols.clone()),
+            csr(n, mv, rows, cols),
+            exact,
+        )
+    }
+
+    /// A normal nonsymmetric matrix with known eigenvalues: 2×2 blocks `[[a, b], [−b, a]]`
+    /// (eigenvalues `a ± ib`) on a spread where the real part rises as the imaginary part falls,
+    /// scattered by a fixed permutation similarity.
+    /// With `reals` real eigenvalues `0.2 + 0.13·i` to the left of the pairs (the smallest
+    /// magnitudes and real parts).
+    fn normal_nonsymmetric(pairs: usize, reals: usize) -> (CsrMatrix, Vec<(f64, f64)>) {
+        let n = 2 * pairs + reals;
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut state = 0x5DEE_CE66_D1CE_u64;
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            perm.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        let (mut vals, mut rows, mut cols, mut exact) = (vec![], vec![], vec![], vec![]);
+        for j in 0..pairs {
+            let a = 1.0 + 0.9 * j as f64;
+            let b = 0.1 + 0.35 * (pairs - j) as f64;
+            let (p, q) = (perm[2 * j], perm[2 * j + 1]);
+            vals.extend([a, b, -b, a]);
+            rows.extend([p, p, q, q]);
+            cols.extend([p, q, p, q]);
+            exact.push((a, b));
+            exact.push((a, -b));
+        }
+        for i in 0..reals {
+            let r = 0.2 + 0.13 * i as f64;
+            let p = perm[2 * pairs + i];
+            vals.push(r);
+            rows.push(p);
+            cols.push(p);
+            exact.push((r, 0.0));
+        }
+        (csr(n, vals, rows, cols), exact)
+    }
+
+    /// `tridiag(−1 − c, 2, −1 + c)`: 1-D convection–diffusion, eigenvalues
+    /// `2 − 2·sqrt(1 − c²)·cos(jπ/(n+1))` (real for |c| < 1), ascending.
+    fn convection_diffusion(n: usize, c: f64) -> (CsrMatrix, Vec<f64>) {
+        let (mut vals, mut rows, mut cols) = (vec![], vec![], vec![]);
+        for i in 0..n {
+            vals.push(2.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                vals.extend([-1.0 + c, -1.0 - c]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        let s = (1.0 - c * c).sqrt();
+        let exact = (1..=n)
+            .map(|j| 2.0 - 2.0 * s * (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos())
+            .collect();
+        (csr(n, vals, rows, cols), exact)
+    }
+
+    /// The `k` values of the symmetric spectrum `exact` that SciPy's `which` selects (applied to
+    /// `1/(λ − σ)` with a shift), ascending: the definition, written independently of the
+    /// solver's selection code.
+    fn expected_symmetric(
+        exact: &[f64],
+        which: EigsWhich,
+        k: usize,
+        sigma: Option<f64>,
+    ) -> Vec<f64> {
+        let theta = |l: f64| sigma.map_or(l, |s| 1.0 / (l - s));
+        let mut v: Vec<f64> = exact.to_vec();
+        let picked: Vec<f64> = match which {
+            EigsWhich::BothEnds => {
+                v.sort_by(|x, y| theta(*x).total_cmp(&theta(*y)));
+                let low = k / 2;
+                let mut out = v[..low].to_vec();
+                out.extend_from_slice(&v[v.len() - (k - low)..]);
+                out
+            }
+            _ => {
+                let key = |l: f64| match which {
+                    EigsWhich::LargestMagnitude => theta(l).abs(),
+                    EigsWhich::SmallestMagnitude => -theta(l).abs(),
+                    EigsWhich::LargestAlgebraic => theta(l),
+                    _ => -theta(l),
+                };
+                v.sort_by(|x, y| key(*y).total_cmp(&key(*x)));
+                v[..k].to_vec()
+            }
+        };
+        let mut picked = picked;
+        picked.sort_by(f64::total_cmp);
+        picked
+    }
+
+    /// The `k` complex eigenvalues SciPy's `eigs` `which` selects, sorted by (re, im). A pair
+    /// split by `k` contributes its positive-imaginary member.
+    fn expected_general(
+        exact: &[(f64, f64)],
+        which: EigsWhich,
+        k: usize,
+        sigma: Option<f64>,
+    ) -> Vec<(f64, f64)> {
+        let theta = |l: (f64, f64)| match sigma {
+            Some(s) => complex_div((1.0, 0.0), (l.0 - s, l.1)),
+            None => l,
+        };
+        let key = |l: (f64, f64)| {
+            let t = theta(l);
+            match which {
+                EigsWhich::LargestMagnitude => t.0.hypot(t.1),
+                EigsWhich::SmallestMagnitude => -t.0.hypot(t.1),
+                EigsWhich::LargestReal => t.0,
+                EigsWhich::SmallestReal => -t.0,
+                EigsWhich::LargestImaginary => t.1.abs(),
+                _ => -t.1.abs(),
+            }
+        };
+        let mut v = exact.to_vec();
+        v.sort_by(|x, y| {
+            key(*y)
+                .total_cmp(&key(*x))
+                .then_with(|| y.1.total_cmp(&x.1))
+        });
+        let mut picked = v[..k].to_vec();
+        picked.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        picked
+    }
+
+    /// `max_i ‖A x_i − λ_i M x_i‖ / ‖A‖∞` over the returned (complex) pairs.
+    fn max_relative_residual(a: &CsrMatrix, mass: Option<&CsrMatrix>, r: &EigsResult) -> f64 {
+        let a_norm = csr_norm_bound(a);
+        let mut worst = 0.0_f64;
+        for i in 0..r.eigenvalues.len() {
+            let (lr, li) = (r.eigenvalues[i], r.eigenvalues_im[i]);
+            let (xr, xi) = (&r.eigenvectors[i], &r.eigenvectors_im[i]);
+            let (axr, axi) = (csr_matvec(a, xr), csr_matvec(a, xi));
+            let (mxr, mxi) = match mass {
+                Some(m) => (csr_matvec(m, xr), csr_matvec(m, xi)),
+                None => (xr.clone(), xi.clone()),
+            };
+            let mut sq = 0.0;
+            for t in 0..xr.len() {
+                let rr = axr[t] - (lr * mxr[t] - li * mxi[t]);
+                let ri = axi[t] - (lr * mxi[t] + li * mxr[t]);
+                sq += rr * rr + ri * ri;
+            }
+            worst = worst.max(sq.sqrt() / a_norm);
+        }
+        worst
+    }
+
+    /// `max |X^T B X − I|` over the returned real eigenvectors (`B = M` or `I`).
+    fn orthonormality_defect(r: &EigsResult, mass: Option<&CsrMatrix>) -> f64 {
+        let mut worst = 0.0_f64;
+        for (i, xi) in r.eigenvectors.iter().enumerate() {
+            let bxi = mass.map_or_else(|| xi.clone(), |m| csr_matvec(m, xi));
+            for (j, xj) in r.eigenvectors.iter().enumerate() {
+                let target = if i == j { 1.0 } else { 0.0 };
+                worst = worst.max((dot_product(xj, &bxi) - target).abs());
+            }
+        }
+        worst
+    }
+
+    fn max_abs_diff(got: &[f64], want: &[f64]) -> f64 {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        got.iter()
+            .zip(want)
+            .fold(0.0_f64, |acc, (g, w)| acc.max((g - w).abs()))
+    }
+
+    fn sorted_complex(r: &EigsResult) -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = r
+            .eigenvalues
+            .iter()
+            .copied()
+            .zip(r.eigenvalues_im.iter().copied())
+            .collect();
+        v.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        v
+    }
+
+    fn with_which(which: EigsWhich) -> EigsOptions<'static> {
+        EigsOptions {
+            which,
+            ..EigsOptions::default()
+        }
+    }
+
+    #[test]
+    fn eigsh_every_which_and_k_matches_the_laplacian_closed_form() {
+        let n = 300;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        for which in [
+            EigsWhich::LargestMagnitude,
+            EigsWhich::SmallestMagnitude,
+            EigsWhich::LargestAlgebraic,
+            EigsWhich::SmallestAlgebraic,
+            EigsWhich::BothEnds,
+        ] {
+            for k in [1_usize, 6, 20] {
+                if which == EigsWhich::BothEnds && k == 1 {
+                    continue;
+                }
+                let r = eigsh(&a, k, with_which(which)).expect("eigsh converges");
+                let want = expected_symmetric(&exact, which, k, None);
+                let err = max_abs_diff(&r.eigenvalues, &want);
+                let resid = max_relative_residual(&a, None, &r);
+                let ortho = orthonormality_defect(&r, None);
+                println!(
+                    "eigsh {} k={k}: iterations={} nmatvec={} ncv={} max|dλ|={err:e} resid={resid:e} ortho={ortho:e}",
+                    which.scipy_name(),
+                    r.iterations,
+                    r.nmatvec,
+                    r.ncv
+                );
+                assert!(r.converged);
+                assert_eq!(r.ncv, (2 * k + 1).max(20));
+                assert!(
+                    err <= 1e-12,
+                    "{} k={k}: max|dλ| = {err:e}",
+                    which.scipy_name()
+                );
+                assert!(
+                    resid <= 1e-8,
+                    "{} k={k}: residual {resid:e}",
+                    which.scipy_name()
+                );
+                assert!(
+                    ortho <= 1e-12,
+                    "{} k={k}: orthonormality {ortho:e}",
+                    which.scipy_name()
+                );
+                assert!(r.eigenvalues.windows(2).all(|w| w[0] <= w[1]), "ascending");
+            }
+        }
+    }
+
+    // Negative case 1 (frankenscipy-1ksfv.10). Before arm, original code at d46cb9476 (log
+    // scratchpad/eigs/before_arm.log, worker hz2): `EigsOptions` had no `sigma`, and
+    // `eigsh(L2000, k=6)` returned the six largest eigenvalues 3.99988..3.99999 with
+    // converged=false. SciPy 1.17.1: eigsh(k=6, sigma=1.0003, which='LM') returns the six
+    // eigenvalues nearest 1.0003 with max abs error 3.3e-16 against the closed form.
+    #[test]
+    fn eigsh_shift_invert_finds_the_eigenvalues_nearest_sigma() {
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let options = EigsOptions {
+            sigma: Some(1.0003),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&a, 6, options).expect("shift-invert converges");
+        let want = expected_symmetric(&exact, EigsWhich::LargestMagnitude, 6, Some(1.0003));
+        let err = max_abs_diff(&r.eigenvalues, &want);
+        let resid = max_relative_residual(&a, None, &r);
+        println!(
+            "sigma=1.0003: {:?} iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+            r.eigenvalues, r.iterations, r.nmatvec
+        );
+        assert!(err <= 1e-13, "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(orthonormality_defect(&r, None) <= 1e-12);
+        // Must-differ control: without the shift the same call finds the other end.
+        let plain = eigsh(&a, 6, EigsOptions::default()).expect("LM converges");
+        assert!(plain.eigenvalues.iter().all(|&l| l > 3.9));
+        assert!(r.eigenvalues.iter().all(|&l| (l - 1.0003).abs() < 0.01));
+    }
+
+    #[test]
+    fn eigsh_smallest_algebraic_laplacian_2000() {
+        // SciPy 1.17.1: eigsh(k=4, which='SA') max abs error 6.5e-17 against the closed form.
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let r = eigsh(&a, 4, with_which(EigsWhich::SmallestAlgebraic)).expect("SA converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[..4]);
+        let resid = max_relative_residual(&a, None, &r);
+        println!(
+            "SA k=4: {:?} iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+            r.eigenvalues, r.iterations, r.nmatvec
+        );
+        assert!(err <= 1e-13, "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+    }
+
+    #[test]
+    fn eigsh_shift_exactly_at_an_eigenvalue_is_a_singular_factor() {
+        // 2 − 2cos(667π/2001) = 1 exactly, so A − I is singular; SciPy 1.17.1 raises
+        // RuntimeError("Factor is exactly singular").
+        let a = laplacian_1d(2000);
+        let options = EigsOptions {
+            sigma: Some(1.0),
+            ..EigsOptions::default()
+        };
+        let err = eigsh(&a, 6, options).expect_err("sigma on an eigenvalue");
+        println!("sigma=1.0: {err}");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+        let err = eigs(&a, 6, options).expect_err("sigma on an eigenvalue");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn eigsh_generalized_fem_pair_is_m_orthonormal() {
+        let n = 400;
+        let (k_mat, m_mat, exact) = fem_pair(n);
+        // Shift-invert at 0: the lowest vibration modes, `eigsh(K, 6, M, sigma=0)`.
+        let low = EigsOptions {
+            sigma: Some(0.0),
+            mass: Some(&m_mat),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&k_mat, 6, low).expect("shift-invert with M converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[..6]);
+        let resid = max_relative_residual(&k_mat, Some(&m_mat), &r);
+        let ortho = orthonormality_defect(&r, Some(&m_mat));
+        println!(
+            "FEM sigma=0: {:?} err={err:e} resid={resid:e} M-ortho={ortho:e}",
+            r.eigenvalues
+        );
+        assert!(err <= 1e-9 * exact[5], "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(ortho <= 1e-12);
+        // Mode 2 (M⁻¹K in the M inner product), the largest end.
+        let high = EigsOptions {
+            mass: Some(&m_mat),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&k_mat, 6, high).expect("mode 2 converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[n - 6..]);
+        let resid = max_relative_residual(&k_mat, Some(&m_mat), &r);
+        let ortho = orthonormality_defect(&r, Some(&m_mat));
+        println!(
+            "FEM mode 2 LM: iterations={} err={err:e} resid={resid:e} M-ortho={ortho:e}",
+            r.iterations
+        );
+        assert!(err <= 1e-9 * exact[n - 1], "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(ortho <= 1e-12);
+    }
+
+    #[test]
+    fn eigs_every_which_and_k_matches_a_normal_matrix() {
+        // SciPy 1.17.1 converges on every (which, k) below; it does not on 'SI' with k = 20
+        // (ArpackNoConvergence after 1201 iterations) or on 'SM' with k = 1 for the pairs-only
+        // matrix, whose smallest-magnitude pair sits on a flat stretch of the spectrum, so those
+        // are not asked for.
+        let mixed = normal_nonsymmetric(55, 10);
+        let pairs = normal_nonsymmetric(60, 0);
+        let plan: [(&(CsrMatrix, Vec<(f64, f64)>), EigsWhich, &[usize]); 6] = [
+            (&mixed, EigsWhich::LargestMagnitude, &[1, 6, 20]),
+            (&mixed, EigsWhich::SmallestMagnitude, &[1, 6, 20]),
+            (&mixed, EigsWhich::LargestReal, &[1, 6, 20]),
+            (&mixed, EigsWhich::SmallestReal, &[1, 6, 20]),
+            (&mixed, EigsWhich::LargestImaginary, &[1, 6, 20]),
+            (&pairs, EigsWhich::SmallestImaginary, &[1, 6]),
+        ];
+        for ((a, exact), which, ks) in plan {
+            for &k in ks {
+                let r = eigs(a, k, with_which(which)).expect("eigs converges");
+                let got = sorted_complex(&r);
+                let want = expected_general(exact, which, k, None);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .fold(0.0_f64, |acc, (g, w)| acc.max((g.0 - w.0).hypot(g.1 - w.1)));
+                let resid = max_relative_residual(a, None, &r);
+                println!(
+                    "eigs {} k={k}: iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+                    which.scipy_name(),
+                    r.iterations,
+                    r.nmatvec
+                );
+                assert_eq!(got.len(), k);
+                assert!(
+                    err <= 1e-10,
+                    "{} k={k}: {got:?} vs {want:?}",
+                    which.scipy_name()
+                );
+                assert!(
+                    resid <= 1e-8,
+                    "{} k={k}: residual {resid:e}",
+                    which.scipy_name()
+                );
+                // A conjugate pair is adjacent, positive imaginary part first.
+                for i in 0..r.eigenvalues.len() {
+                    if r.eigenvalues_im[i] < 0.0 {
+                        assert!(
+                            i > 0 && r.eigenvalues_im[i - 1] == -r.eigenvalues_im[i],
+                            "unpaired negative member at {i}: {:?}",
+                            r.eigenvalues_im
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eigs_shift_invert_on_nonsymmetric_matrices() {
+        let (a, exact) = normal_nonsymmetric(60, 0);
+        let options = EigsOptions {
+            sigma: Some(20.3),
+            ..EigsOptions::default()
+        };
+        let r = eigs(&a, 6, options).expect("shift-invert converges");
+        let got = sorted_complex(&r);
+        let want = expected_general(&exact, EigsWhich::LargestMagnitude, 6, Some(20.3));
+        let err = got
+            .iter()
+            .zip(&want)
+            .fold(0.0_f64, |acc, (g, w)| acc.max((g.0 - w.0).hypot(g.1 - w.1)));
+        println!("normal sigma=20.3: {got:?} err={err:e}");
+        assert!(err <= 1e-10);
+        assert!(max_relative_residual(&a, None, &r) <= 1e-8);
+
+        // Convection–diffusion (mildly non-normal, real spectrum): nearest to 1.5.
+        let (cd, cd_exact) = convection_diffusion(100, 0.1);
+        let options = EigsOptions {
+            sigma: Some(1.5),
+            ..EigsOptions::default()
+        };
+        let r = eigs(&cd, 6, options).expect("shift-invert converges");
+        let mut got = r.eigenvalues.clone();
+        got.sort_by(f64::total_cmp);
+        let want = expected_symmetric(&cd_exact, EigsWhich::LargestMagnitude, 6, Some(1.5));
+        let err = max_abs_diff(&got, &want);
+        println!("convection-diffusion sigma=1.5: {got:?} err={err:e}");
+        assert!(r.eigenvalues_im.iter().all(|&im| im == 0.0));
+        assert!(err <= 1e-9, "max|dλ| = {err:e}");
+        assert!(max_relative_residual(&cd, None, &r) <= 1e-8);
+        // And the extreme real parts without a shift.
+        for which in [EigsWhich::LargestReal, EigsWhich::SmallestReal] {
+            let r = eigs(&cd, 6, with_which(which)).expect("eigs converges");
+            let mut got = r.eigenvalues.clone();
+            got.sort_by(f64::total_cmp);
+            let want = expected_symmetric(
+                &cd_exact,
+                if which == EigsWhich::LargestReal {
+                    EigsWhich::LargestAlgebraic
+                } else {
+                    EigsWhich::SmallestAlgebraic
+                },
+                6,
+                None,
+            );
+            let err = max_abs_diff(&got, &want);
+            println!(
+                "convection-diffusion {}: err={err:e} iterations={}",
+                which.scipy_name(),
+                r.iterations
+            );
+            assert!(err <= 1e-9, "max|dλ| = {err:e}");
+        }
+    }
+
+    // Negative case 2. Before arm, original code (scratchpad/eigs/before_arm.log): with
+    // max_iter 1 and 3 eigsh and eigs returned Ok with converged=false; with max_iter 1000 eigs
+    // still returned Ok(converged=false) holding [0.99999940, 0.894, 0.843, ...], values that are
+    // not the cluster. SciPy 1.17.1 raises ArpackNoConvergence (0/6 converged) for maxiter 1..10.
+    #[test]
+    fn clustered_spectrum_with_a_small_budget_reports_no_convergence() -> Result<(), String> {
+        let a = clustered_diag(200);
+        let small = EigsOptions {
+            max_iter: 1,
+            ..EigsOptions::default()
+        };
+        for (name, outcome) in [("eigsh", eigsh(&a, 6, small)), ("eigs", eigs(&a, 6, small))] {
+            let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+                return Err(format!(
+                    "{name}: expected EigsNoConvergence, got {outcome:?}"
+                ));
+            };
+            println!(
+                "{name} max_iter=1: {message}; partial {:?}",
+                partial.eigenvalues
+            );
+            assert!(!partial.converged);
+            assert!(partial.eigenvalues.len() < 6);
+            assert_eq!(partial.iterations, 1);
+        }
+        // With SciPy's default budget (maxiter = 10·n) the cluster is not resolved either: scipy
+        // 1.17.1 eigsh(a, k=6) with its default start vector raises ArpackNoConvergence ("2001
+        // iterations, 1/6 eigenvectors converged"), and over five random v0 it converged twice
+        // (scratchpad eigs/clustered.py). fsci must report the same honestly, and whatever it
+        // reports as converged must be a member of the cluster.
+        let outcome = eigsh(&a, 6, EigsOptions::default());
+        let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+            return Err(format!(
+                "eigsh default: SciPy raises ArpackNoConvergence here, got {outcome:?}"
+            ));
+        };
+        println!(
+            "eigsh clustered default: {message}; partial {:?}",
+            partial.eigenvalues
+        );
+        assert!(!partial.converged && partial.eigenvalues.len() < 6);
+        for value in &partial.eigenvalues {
+            assert!(
+                (value - 1.0).abs() <= 1e-8 + 1e-12,
+                "reported {value} is not in the cluster [1, 1 + 1e-8]"
+            );
+        }
+        Ok(())
+    }
+
+    // Negative case 3. The basis size is SciPy's rule min(n, max(2k+1, 20)) for every k: k = 6
+    // and k = 7 both run 20 vectors (before: eigsh_krylov_window gave 20 and 20 at d46cb9476,
+    // after frankenscipy-szq1n.15 removed a k == 6 special case), and k = 10 runs 21.
+    #[test]
+    fn neighbouring_k_use_the_same_window_rule() {
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let mut previous: Option<Vec<f64>> = None;
+        for (k, ncv) in [(6_usize, 20_usize), (7, 20), (10, 21)] {
+            let options = EigsOptions {
+                sigma: Some(1.0003),
+                ..EigsOptions::default()
+            };
+            let r = eigsh(&a, k, options).expect("converges");
+            assert_eq!(r.ncv, ncv, "k = {k}");
+            assert_eq!(r.ncv, arpack_default_ncv(n, k));
+            let want = expected_symmetric(&exact, EigsWhich::LargestMagnitude, k, Some(1.0003));
+            assert!(max_abs_diff(&r.eigenvalues, &want) <= 1e-13, "k = {k}");
+            if let Some(prev) = &previous {
+                // The k nearest contain the k−1 nearest.
+                for l in prev {
+                    assert!(r.eigenvalues.iter().any(|x| (x - l).abs() <= 1e-13));
+                }
+            }
+            previous = Some(r.eigenvalues);
+        }
+    }
+
+    #[test]
+    fn invariant_start_subspace_restarts_with_a_fresh_direction() {
+        // SciPy's docstring example: eigsh(eye(13), k=6) returns six ones.
+        let identity = diagonal(&[1.0; 30]);
+        let r = eigsh(&identity, 3, EigsOptions::default()).expect("identity converges");
+        assert_eq!(r.eigenvalues.len(), 3);
+        assert!(
+            r.eigenvalues.iter().all(|&l| (l - 1.0).abs() <= 1e-14),
+            "{:?}",
+            r.eigenvalues
+        );
+        let r = eigs(&identity, 3, EigsOptions::default()).expect("identity converges");
+        assert_eq!(r.eigenvalues.len(), 3);
+        assert!(
+            r.eigenvalues.iter().all(|&l| (l - 1.0).abs() <= 1e-14),
+            "{:?}",
+            r.eigenvalues
+        );
+        // A start vector inside the invariant subspace of diag(1, 2, 3): the first Krylov space
+        // is that subspace, and the wanted 10 and 9 live outside it.
+        let mut d = vec![1.0, 2.0, 3.0];
+        d.extend((0..40).map(|i| 10.0 - 0.2 * f64::from(i)));
+        let a = diagonal(&d);
+        let mut v0 = vec![0.0; d.len()];
+        v0[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        let options = EigsOptions {
+            v0: Some(&v0),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&a, 2, options).expect("converges");
+        assert!(
+            max_abs_diff(&r.eigenvalues, &[9.8, 10.0]) <= 1e-13,
+            "{:?}",
+            r.eigenvalues
+        );
+        let r = eigs(&a, 2, options).expect("converges");
+        let mut got = r.eigenvalues.clone();
+        got.sort_by(f64::total_cmp);
+        // eigs returns Ritz values (no Rayleigh quotient): relative 1e-13.
+        assert!(max_abs_diff(&got, &[9.8, 10.0]) <= 1e-12, "{got:?}");
+    }
+
+    #[test]
+    fn argument_errors_match_scipy() {
+        let a = laplacian_1d(50);
+        let invalid =
+            |r: SparseResult<EigsResult>| matches!(r, Err(SparseError::InvalidArgument { .. }));
+        // which: eigsh takes LM SM LA SA BE, eigs takes LM SM LR SR LI SI.
+        assert!(invalid(eigsh(&a, 3, with_which(EigsWhich::LargestReal))));
+        assert!(invalid(eigs(
+            &a,
+            3,
+            with_which(EigsWhich::LargestAlgebraic)
+        )));
+        assert!(invalid(eigsh(&a, 1, with_which(EigsWhich::BothEnds))));
+        // ncv must exceed k (eigsh) or k + 1 (eigs).
+        let ncv = |ncv| EigsOptions {
+            ncv: Some(ncv),
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 6, ncv(6))));
+        // Accepted (it may still run out of cycles with so small a basis; that is not an
+        // argument error).
+        assert!(!invalid(eigsh(&a, 6, ncv(7))));
+        assert!(invalid(eigs(&a, 6, ncv(7))));
+        assert!(!invalid(eigs(&a, 6, ncv(8))));
+        let zero = vec![0.0; 50];
+        let with_v0 = EigsOptions {
+            v0: Some(&zero),
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 2, with_v0)));
+        let nan_tol = EigsOptions {
+            tol: f64::NAN,
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 2, nan_tol)));
+        let mut vals = vec![1.0; 5];
+        vals[2] = f64::NAN;
+        assert!(matches!(
+            eigsh(&diagonal(&vals), 2, EigsOptions::default()),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+        assert_eq!(
+            "SA".parse::<EigsWhich>().ok(),
+            Some(EigsWhich::SmallestAlgebraic)
+        );
+        assert!("XX".parse::<EigsWhich>().is_err());
+    }
+
+    #[test]
+    fn real_schur_reorders_and_keeps_the_similarity() {
+        // H = Q0·B·Q0ᵀ with B block-diagonal (eigenvalues known) and Q0 a Householder-built
+        // orthogonal matrix; H is dense, not Hessenberg.
+        let blocks: [(f64, f64); 5] = [
+            (3.0, 0.0),
+            (-1.0, 2.0),
+            (0.5, 0.0),
+            (2.0, 0.25),
+            (-4.0, 0.0),
+        ];
+        let size = 7;
+        let mut b = DMatrix::<f64>::zeros(size, size);
+        let mut at = 0;
+        let mut exact = vec![];
+        // block_end[i]: the first column after the diagonal block holding row i.
+        let mut block_end = vec![0; size];
+        for &(re, im) in &blocks {
+            if im == 0.0 {
+                b[(at, at)] = re;
+                exact.push((re, 0.0));
+                block_end[at] = at + 1;
+                at += 1;
+            } else {
+                // [[re, 2·im], [−im/2, re]] has eigenvalues re ± i·im.
+                b[(at, at)] = re;
+                b[(at, at + 1)] = im * 2.0;
+                b[(at + 1, at)] = -im / 2.0;
+                b[(at + 1, at + 1)] = re;
+                exact.push((re, im));
+                exact.push((re, -im));
+                block_end[at] = at + 2;
+                block_end[at + 1] = at + 2;
+                at += 2;
+            }
+        }
+        // Couple the blocks above the block diagonal (the spectrum is unchanged).
+        for i in 0..size {
+            for j in block_end[i]..size {
+                b[(i, j)] += 0.1 * ((i * 7 + j * 3) % 5) as f64;
+            }
+        }
+        let u = DVector::from_fn(size, |i, _| 1.0 + (i as f64).sin());
+        let q0 = DMatrix::<f64>::identity(size, size) - &u * u.transpose() * (2.0 / u.dot(&u));
+        let h = &q0 * &b * q0.transpose();
+        let mut schur = RealSchur::new(h.clone()).expect("Schur converges");
+        let check = |s: &RealSchur| {
+            let back = &s.q * &s.t * s.q.transpose();
+            let err = (back - &h).abs().max();
+            let ortho = (s.q.transpose() * &s.q - DMatrix::<f64>::identity(size, size))
+                .abs()
+                .max();
+            assert!(err <= 1e-13, "‖QTQᵀ − H‖ = {err:e}");
+            assert!(ortho <= 1e-14, "‖QᵀQ − I‖ = {ortho:e}");
+            for (start, bsize) in &s.blocks {
+                for i in (start + bsize)..size {
+                    for j in *start..(start + bsize) {
+                        assert_eq!(s.t[(i, j)], 0.0, "T not quasi-triangular at ({i},{j})");
+                    }
+                }
+            }
+        };
+        check(&schur);
+        let mut got: Vec<(f64, f64)> = schur.values().iter().map(|v| (v.re, v.im)).collect();
+        got.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        exact.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        for (g, w) in got.iter().zip(&exact) {
+            assert!(
+                (g.0 - w.0).hypot(g.1 - w.1) <= 1e-12,
+                "{got:?} vs {exact:?}"
+            );
+        }
+        // Move the block holding −4 and then the pair 2 ± 0.25i to the front.
+        let values = schur.values();
+        let id_of = |re: f64| {
+            values
+                .iter()
+                .find(|v| (v.re - re).abs() < 1e-9)
+                .map(|v| v.block)
+                .expect("block present")
+        };
+        let targets = [id_of(-4.0), id_of(2.0)];
+        let moved = schur.move_to_front(&targets);
+        assert_eq!(moved, 3);
+        check(&schur);
+        let lead = schur.block_values(schur.blocks[0]);
+        assert!((lead[0].0 + 4.0).abs() <= 1e-12, "{lead:?}");
+        let second = schur.block_values(schur.blocks[1]);
+        assert!(
+            (second[0].0 - 2.0).abs() <= 1e-12 && (second[0].1 - 0.25).abs() <= 1e-12,
+            "{second:?}"
+        );
+        // The leading Schur vectors span an invariant subspace: H·Q₁ = Q₁·T₁₁.
+        let q1 = schur.q.columns(0, 3).clone_owned();
+        let t11 = schur.t.view((0, 0), (3, 3)).clone_owned();
+        let invariance = (&h * &q1 - &q1 * t11).abs().max();
+        assert!(invariance <= 1e-13, "‖H·Q₁ − Q₁·T₁₁‖ = {invariance:e}");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -32335,7 +34440,12 @@ pub struct SvdsResult {
 /// Uses the eigenvalue decomposition of A^T A to find singular values.
 /// σ_i = √(λ_i(A^T A)), u_i = A v_i / σ_i.
 /// Matches `scipy.sparse.linalg.svds(A, k=k)`.
-pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsResult> {
+///
+/// `options.tol`, `max_iter` and `ncv` apply to the symmetric Krylov–Schur run on AᵀA (SciPy's
+/// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass` and `v0` are refused
+/// ([`SparseError::Unsupported`]). A NaN/Inf in `A` (or an overflowing AᵀA) is refused with
+/// [`SparseError::NonFiniteInput`], where SciPy's ARPACK raises.
+pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<SvdsResult> {
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
@@ -32345,7 +34455,16 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
             message: format!("k={k} must be in [1, {}]", m.min(n)),
         });
     }
-    let options = normalize_eigs_options(options);
+    if options.which != EigsWhich::LargestMagnitude
+        || options.sigma.is_some()
+        || options.mass.is_some()
+        || options.v0.is_some()
+    {
+        return Err(SparseError::Unsupported {
+            feature: "svds supports which='LM' without sigma, M or v0".to_string(),
+        });
+    }
+    let settings = resolve_krylov_settings(n, k, &options, true)?;
 
     // Cache A in CSC once so the operator Aᵀ·w is a byte-identical parallel
     // column-gather (`csc_matvec`), reused across all Krylov steps.
@@ -32353,20 +34472,25 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
 
     // The top-k singular values of A are the square roots of the top-k eigenvalues
     // of the n×n SPSD matrix AᵀA, with right singular vectors = its eigenvectors.
-    // Build the k largest eigenpairs of AᵀA by thick-restart Lanczos on the operator
+    // Build the k largest eigenpairs of AᵀA by symmetric Krylov–Schur on the operator
     // v ↦ Aᵀ(A v), restarting until they converge (a single max(2k+1, 20) subspace,
     // what this used to run, resolves only a well-separated spectrum).
-    let ncv = (2 * k + 1).max(20).min(n);
     // AᵀA·v: reuse a hoisted `tmp` (rows-length) for the discarded intermediate
     // A·v instead of allocating it every Arnoldi step; the Aᵀ·tmp result is
     // returned fresh because it becomes the next basis vector. frankenscipy-fo9cj
     // (byte-identical: same kernels, tmp fully overwritten each call).
     let mut tmp = vec![0.0; a.shape().rows];
-    let ata_op = move |v: &[f64]| -> Vec<f64> {
+    let ata_op = move |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
         csr_matvec_into(a, v, &mut tmp);
-        csc_matvec(&a_csc, &tmp)
+        Ok(csc_matvec(&a_csc, &tmp))
     };
-    let eig = thick_restart_lanczos(ata_op, n, k, &options, ncv);
+    let run = symmetric_krylov_schur(ata_op, None, n, k, &settings, None, false)?;
+    let eig = EigsResult {
+        converged: run.theta.len() == k && run.converged.iter().all(|&c| c),
+        eigenvalues: run.theta,
+        eigenvectors: run.vectors,
+        ..EigsResult::default()
+    };
 
     let mut singular_values = Vec::with_capacity(k);
     let mut v_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);

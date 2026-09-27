@@ -31,6 +31,14 @@ pub enum SparseError {
     NonFiniteInput { message: String },
     #[error("singular matrix: {message}")]
     SingularMatrix { message: String },
+    /// `eigs`/`eigsh` stopped before every requested eigenpair converged: SciPy's
+    /// `ArpackNoConvergence`. `partial` holds the pairs that did converge (possibly none), with
+    /// `partial.converged == false`.
+    #[error("ARPACK-style eigensolver did not converge: {message}")]
+    EigsNoConvergence {
+        message: String,
+        partial: Box<crate::linalg::EigsResult>,
+    },
 }
 
 impl SparseError {
@@ -47,6 +55,7 @@ impl SparseError {
             Self::Unsupported { .. } => "unsupported",
             Self::NonFiniteInput { .. } => "non_finite_input",
             Self::SingularMatrix { .. } => "singular_matrix",
+            Self::EigsNoConvergence { .. } => "eigs_no_convergence",
         }
     }
 }

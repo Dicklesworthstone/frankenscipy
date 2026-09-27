@@ -150,6 +150,7 @@ fn end_to_end() {
             EigsOptions {
                 tol: 1e-7,
                 max_iter: 60,
+                ..EigsOptions::default()
             },
         );
         println!(

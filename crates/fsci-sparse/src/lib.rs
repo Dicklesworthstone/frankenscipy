@@ -93,6 +93,7 @@ pub use linalg::{
     Connection,
     EigsOptions,
     EigsResult,
+    EigsWhich,
     ExpmOptions,
     IluOptions,
     IterativeSolveOptions,
