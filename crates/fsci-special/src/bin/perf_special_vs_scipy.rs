@@ -1171,10 +1171,17 @@ fn main() {
     // says the host was quiet when the process began and nothing about whether it stayed
     // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
     // visible in the row rather than hidden inside a median.
-    gamma_gate_size_sweep();
+    // Both studies belong to their op: a run narrowed with FSCI_SPECIAL_OPS to another op used
+    // to execute them anyway, ~10 s of unrequested work inside its profile and its rows.
+    let op_selected = |op: &str| selected.split(',').any(|name| name.trim() == op);
+    if op_selected("gamma") {
+        gamma_gate_size_sweep();
+    }
     // y1 is the worst cell and its deficit survives every structural explanation tried so
     // far; x = 5 is where its kernel changes shape, so that is where to look next.
-    band_sweep("y1", (0.01, 30.0), 5.0, 9);
+    if op_selected("y1") {
+        band_sweep("y1", (0.01, 30.0), 5.0, 9);
+    }
 
     emit!("provenance_after {}", host_provenance());
 }
