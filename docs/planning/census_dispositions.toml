@@ -98,13 +98,6 @@ reason = "needs a generic user-defined distribution mechanism"
 bead = "frankenscipy-1ksfv"
 
 [[entry]]
-module = "scipy.stats"
-name = "levy_stable"
-disposition = "missing"
-reason = "needs (alpha, beta) stable laws; the alias to Levy was removed"
-bead = "frankenscipy-szq1n.2"
-
-[[entry]]
 module = "scipy.integrate"
 name = "IntegrationWarning"
 disposition = "adapted"

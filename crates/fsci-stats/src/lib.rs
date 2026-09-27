@@ -15,6 +15,7 @@ pub mod audit;
 pub mod censored;
 pub mod covariance;
 mod landau;
+mod levy_stable;
 pub mod qmc;
 
 pub use audit::{
@@ -22771,8 +22772,8 @@ pub type Exponweib = ExponWeibull;
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
 // `Kstwo` is now its own type, the finite-n law, and so are `VonmisesLine`, the law on
-// [loc - pi, loc + pi], and `Landau`, the Boost-backed law SciPy computes
-// (frankenscipy-1ksfv.16).
+// [loc - pi, loc + pi], `Landau`, the Boost-backed law SciPy computes, and `LevyStable`,
+// the (alpha, beta) stable law by Nolan's piecewise integration (frankenscipy-1ksfv.16).
 
 // SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
 // are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
@@ -25556,6 +25557,1321 @@ mod landau_matches_scipy {
             "Landau must not reproduce Moyal's density"
         );
         assert!((landau.cdf(0.0) - Moyal.cdf(0.0)).abs() > 0.01);
+    }
+}
+
+/// The parameterization of a [`LevyStable`] law: SciPy's class attribute
+/// `levy_stable.parameterization`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LevyStableParameterization {
+    /// Nolan's S1, SciPy's default: characteristic function
+    /// `exp(i·t·loc - |scale·t|^alpha·(1 - i·beta·sign(t)·tan(pi·alpha/2)))` for alpha != 1.
+    #[default]
+    S1,
+    /// Nolan's S0 (Zolotarev's M): continuous in alpha at 1; the same law as S1 with the location
+    /// moved by `beta·scale·tan(pi·alpha/2)` (by `2·beta·scale·ln(scale)/pi` at alpha = 1).
+    S0,
+}
+
+/// Lévy-stable distribution with stability `alpha` in (0, 2], skewness `beta` in [-1, 1],
+/// location `loc` and scale `scale`.
+///
+/// Matches `scipy.stats.levy_stable(alpha, beta, loc, scale)` with SciPy's default methods, in
+/// either parameterization (SciPy's `levy_stable.parameterization`). The private `levy_stable`
+/// module ports SciPy 1.17.1's code: Nolan's piecewise integration for `pdf` and `cdf` (on
+/// `fsci_integrate`'s QUADPACK), its closed forms at alpha = 2 (normal with scale √2), alpha = 1
+/// with beta = 0 (Cauchy), alpha = 1/2 with beta = 1 (Lévy) and alpha = 1/2 with beta = 0, and
+/// its rounding of alpha within 0.005 of 1 to 1. `ppf` is `rv_continuous`'s root finding on the
+/// cdf (a ×10 bracket search from ±10, then SciPy's `brentq` with `xtol = 1e-14`); `rvs` is
+/// Chambers–Mallows–Stuck; [`LevyStable::fitstart`] is McCulloch's quantile estimator.
+///
+/// As `rv_continuous` does, everything is evaluated at `z = (x - loc) / scale`, except that in
+/// S1 with `alpha == 1` loc is first moved by `2·beta·scale·ln(scale)/pi` (Nolan 2018, Definition
+/// 1.8). SciPy applies that move only in its `pdf`, `cdf` and `rvs` overrides; its inherited
+/// `sf`, `logpdf` and `ppf` skip it (SciPy 1.17.1: `levy_stable.sf(1.7, 1, 0.5, loc=1, scale=2)`
+/// is 0.4676 while `1 - cdf` is 0.5256). Here every method applies it, so `sf`, `logpdf`, `ppf`
+/// and `isf` depart from SciPy in that corner (S1, alpha exactly 1, beta != 0, scale != 1) and
+/// agree with its `pdf` and `cdf`.
+///
+/// `mean`, `var`, `skewness` and `kurtosis` are what SciPy's `_stats` reports, in both
+/// parameterizations: `loc` for alpha > 1 (else NaN), `2·scale²` at alpha = 2 (else +inf), and 0
+/// at alpha = 2 (else NaN). In S0 the law's actual mean for alpha > 1 is
+/// `loc - beta·scale·tan(pi·alpha/2)`; SciPy reports `loc` there too, and so does `mean`.
+/// `entropy` is not implemented (SciPy integrates it numerically). frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LevyStable {
+    pub alpha: f64,
+    pub beta: f64,
+    pub loc: f64,
+    pub scale: f64,
+    pub parameterization: LevyStableParameterization,
+}
+
+impl LevyStable {
+    /// `scipy.stats.levy_stable(alpha, beta, loc, scale)` in SciPy's default S1
+    /// parameterization.
+    ///
+    /// # Panics
+    ///
+    /// As [`LevyStable::with_parameterization`].
+    #[must_use]
+    pub fn new(alpha: f64, beta: f64, loc: f64, scale: f64) -> Self {
+        Self::with_parameterization(alpha, beta, loc, scale, LevyStableParameterization::S1)
+    }
+
+    /// `scipy.stats.levy_stable(alpha, beta, loc, scale)` with `levy_stable.parameterization`
+    /// set to `parameterization`.
+    ///
+    /// # Panics
+    ///
+    /// Outside SciPy's `_argcheck` (0 < alpha <= 2, -1 <= beta <= 1), if `scale` is not
+    /// positive, or if `loc` is not finite.
+    #[must_use]
+    pub fn with_parameterization(
+        alpha: f64,
+        beta: f64,
+        loc: f64,
+        scale: f64,
+        parameterization: LevyStableParameterization,
+    ) -> Self {
+        assert!(
+            alpha > 0.0 && alpha <= 2.0,
+            "alpha must be in (0, 2], got {alpha}"
+        );
+        assert!(
+            (-1.0..=1.0).contains(&beta),
+            "beta must be in [-1, 1], got {beta}"
+        );
+        assert!(scale > 0.0, "scale must be positive, got {scale}");
+        assert!(loc.is_finite(), "loc must be finite, got {loc}");
+        Self {
+            alpha,
+            beta,
+            loc,
+            scale,
+            parameterization,
+        }
+    }
+
+    /// SciPy's `levy_stable._fitstart(data)` in S1: McCulloch's (1986) quantile estimates
+    /// `(alpha, beta, loc, scale)` from the 5th, 25th, 50th, 75th and 95th percentiles
+    /// (numpy's linear method), interpolated bilinearly in his tables as SciPy's
+    /// `RectBivariateSpline(kx=1, ky=1)` does. It is the start of SciPy's MLE `fit`, which is
+    /// not ported. All NaN for empty data, where SciPy raises.
+    #[must_use]
+    pub fn fitstart(data: &[f64]) -> (f64, f64, f64, f64) {
+        levy_stable::fitstart_s1(data)
+    }
+
+    /// [`LevyStable::fitstart`] in either parameterization (`_fitstart_S0` moves only the
+    /// location).
+    #[must_use]
+    pub fn fitstart_with_parameterization(
+        data: &[f64],
+        parameterization: LevyStableParameterization,
+    ) -> (f64, f64, f64, f64) {
+        match parameterization {
+            LevyStableParameterization::S1 => levy_stable::fitstart_s1(data),
+            LevyStableParameterization::S0 => levy_stable::fitstart_s0(data),
+        }
+    }
+
+    /// The location `rv_continuous` standardizes with: SciPy's `pdf`/`cdf` overrides move it by
+    /// `2·beta·scale·ln(scale)/pi` in S1 at alpha = 1.
+    fn effective_loc(&self) -> f64 {
+        if self.parameterization == LevyStableParameterization::S1 && self.alpha == 1.0 {
+            self.loc + 2.0 * self.beta * self.scale * self.scale.ln() / PI
+        } else {
+            self.loc
+        }
+    }
+
+    /// The standard (loc 0, scale 1) density at a finite `z`: SciPy's `_pdf`.
+    fn standard_pdf(&self, z: f64) -> f64 {
+        match self.parameterization {
+            LevyStableParameterization::S1 => levy_stable::pdf_z1(z, self.alpha, self.beta),
+            LevyStableParameterization::S0 => levy_stable::pdf_z0(z, self.alpha, self.beta),
+        }
+    }
+
+    /// The standard cdf with `rv_continuous.cdf`'s edges: NaN at NaN, 0 at -inf, 1 at +inf.
+    fn standard_cdf(&self, z: f64) -> f64 {
+        if z.is_nan() {
+            f64::NAN
+        } else if z == f64::INFINITY {
+            1.0
+        } else if z == f64::NEG_INFINITY {
+            0.0
+        } else {
+            match self.parameterization {
+                LevyStableParameterization::S1 => levy_stable::cdf_z1(z, self.alpha, self.beta),
+                LevyStableParameterization::S0 => levy_stable::cdf_z0(z, self.alpha, self.beta),
+            }
+        }
+    }
+
+    /// `rv_continuous._ppf_single` on the standard law, 0 < q < 1: widen `[-10, 10]` by factors
+    /// of 10 until it brackets `cdf(z) = q`, then SciPy's `brentq` with `xtol = 1e-14`,
+    /// `rtol = 4·eps` and 100 iterations.
+    fn standard_ppf(&self, q: f64) -> f64 {
+        const FACTOR: f64 = 10.0;
+        let f = |z: f64| self.standard_cdf(z) - q;
+        let mut left = -FACTOR;
+        let mut right = f64::INFINITY;
+        while f(left) > 0.0 {
+            right = left;
+            left *= FACTOR;
+        }
+        if right.is_infinite() {
+            right = FACTOR.max(left);
+            while f(right) < 0.0 {
+                left = right;
+                right *= FACTOR;
+            }
+        }
+        ks_brentq(f, left, right, 1e-14, 4.0 * f64::EPSILON, 100)
+    }
+}
+
+impl ContinuousDistribution for LevyStable {
+    fn pdf(&self, x: f64) -> f64 {
+        let z = (x - self.effective_loc()) / self.scale;
+        if z.is_nan() {
+            f64::NAN
+        } else if z.is_infinite() {
+            0.0
+        } else {
+            self.standard_pdf(z) / self.scale
+        }
+    }
+
+    /// SciPy's `log(_pdf(z)) - log(scale)`.
+    fn logpdf(&self, x: f64) -> f64 {
+        let z = (x - self.effective_loc()) / self.scale;
+        if z.is_nan() {
+            f64::NAN
+        } else if z.is_infinite() {
+            f64::NEG_INFINITY
+        } else {
+            log_probability(self.standard_pdf(z)) - self.scale.ln()
+        }
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        self.standard_cdf((x - self.effective_loc()) / self.scale)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if q == 1.0 {
+            return f64::INFINITY;
+        }
+        self.standard_ppf(q) * self.scale + self.effective_loc()
+    }
+
+    fn mean(&self) -> f64 {
+        if self.alpha > 1.0 { self.loc } else { f64::NAN }
+    }
+
+    fn var(&self) -> f64 {
+        if self.alpha == 2.0 {
+            2.0 * self.scale * self.scale
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn skewness(&self) -> f64 {
+        if self.alpha == 2.0 { 0.0 } else { f64::NAN }
+    }
+
+    fn kurtosis(&self) -> f64 {
+        if self.alpha == 2.0 { 0.0 } else { f64::NAN }
+    }
+
+    /// SciPy's `rvs`: `_rvs_Z1` on `th = uniform(-pi/2, pi)` and `w = expon()` draws, scaled and
+    /// shifted, with the S1 alpha = 1 location move, then moved to S0 if asked.
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        let alpha_one_shift = 2.0 * self.beta * self.scale * self.scale.ln() / PI;
+        (0..n)
+            .map(|_| {
+                let th = rng.random::<f64>() * PI - PI / 2.0;
+                let w = -(1.0 - rng.random::<f64>()).ln();
+                let mut x =
+                    levy_stable::rvs_z1(self.alpha, self.beta, th, w) * self.scale + self.loc;
+                if self.alpha == 1.0 {
+                    x += alpha_one_shift;
+                }
+                match self.parameterization {
+                    LevyStableParameterization::S1 => x,
+                    LevyStableParameterization::S0 if self.alpha == 1.0 => {
+                        x - self.beta * 2.0 * self.scale * self.scale.ln() / PI
+                    }
+                    LevyStableParameterization::S0 => {
+                        x - self.scale * self.beta * (PI * self.alpha / 2.0).tan()
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod levy_stable_matches_scipy {
+    use super::{
+        ContinuousDistribution, Levy, LevyL, LevyStable, LevyStableParameterization, Normal,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::f64::consts::{FRAC_1_PI, FRAC_2_PI};
+
+    const S0: LevyStableParameterization = LevyStableParameterization::S0;
+
+    /// Relative agreement with SciPy 1.17.1: none needed. Every pinned pdf, cdf, ppf, isf and
+    /// fitstart value below is reproduced bit for bit (observed on worker vmi1227854 against
+    /// SciPy on this host): the port runs SciPy's arithmetic in SciPy's order on the same libm,
+    /// QUADPACK and bisection. The bead's stated piecewise accuracy is 1e-7; a last-bit libm
+    /// difference on another platform would show up here first, and the tail cdfs that SciPy
+    /// computes as 1 - (1 - tiny) would amplify it.
+    const TOL: f64 = 0.0;
+
+    /// The comparison can see what an all-exact slice must be able to see: one ulp, and a
+    /// nonzero value where SciPy has 0 (the sign of a zero is not compared).
+    #[test]
+    fn exact_check_detects_one_ulp_and_a_lost_zero() {
+        for v in [
+            0.22439915549671538,
+            6.294649246285644e-10,
+            -1559.7261037251076,
+        ] {
+            assert!(rel_err(v, v) <= TOL);
+            assert!(rel_err(f64::from_bits(v.to_bits() + 1), v) > TOL);
+        }
+        assert!(rel_err(1e-300, 0.0) > TOL);
+        assert!(rel_err(-0.0, 0.0) <= TOL);
+    }
+
+    /// Relative error; a zero or non-finite SciPy value must be matched exactly.
+    fn rel_err(got: f64, want: f64) -> f64 {
+        if want == 0.0 || !want.is_finite() {
+            if got == want || (got.is_nan() && want.is_nan()) {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            ((got - want) / want).abs()
+        }
+    }
+
+    fn check(got: f64, want: f64, tol: f64, what: &str) {
+        let rel = rel_err(got, want);
+        assert!(
+            rel <= tol,
+            "{what}: got {got:e}, scipy {want:e}, rel {rel:e}"
+        );
+    }
+
+    /// SciPy's `levy_stable.pdf(x, alpha, beta)` and `.cdf` in S1 over alpha in {0.5, 0.8, 1,
+    /// 1.3, 1.5, 1.9, 2} and beta in {-1, -0.3, 0, 0.3, 1}: both tails, x = 0 (the S0 point
+    /// x0 = zeta, Nolan's closed form) and x = 0.001 (rounded to it, except at alpha = 1).
+    /// Columns: alpha, beta, x, pdf, cdf.
+    #[test]
+    fn pdf_cdf_s1_grid() {
+        let rows: [(f64, f64, f64, f64, f64); 210] = [
+            (0.5, -1.0, -8.0, 0.016562720771501782, 0.2763263901682368),
+            (0.5, -1.0, -0.6, 0.3730535026483988, 0.8032943975410531),
+            (0.5, -1.0, 0.0, 1.949085916259688e-17, 1.0),
+            (0.5, -1.0, 0.001, 1.949085916259688e-17, 1.0),
+            (0.5, -1.0, 0.7, 0.0, 1.0),
+            (0.5, -1.0, 25.0, 0.0, 1.0),
+            (0.5, -0.3, -8.0, 0.009208314398718736, 0.1652548038252042),
+            (0.5, -0.3, -0.6, 0.21521527029304066, 0.4461760537407995),
+            (0.5, -0.3, 0.0, 0.48760541440493155, 0.6855471581554846),
+            (0.5, -0.3, 0.001, 0.48760541440493155, 0.6855471581554846),
+            (0.5, -0.3, 0.7, 0.07382584641394412, 0.805797221628825),
+            (0.5, -0.3, 25.0, 0.0009091205575524781, 0.9495373000646657),
+            (0.5, 0.0, -8.0, 0.006600448104972907, 0.12261012256487436),
+            (0.5, 0.0, -0.6, 0.14431983047158575, 0.31562067900091306),
+            (0.5, 0.0, 0.0, FRAC_2_PI, 0.5),
+            (0.5, 0.0, 0.001, FRAC_2_PI, 0.5),
+            (0.5, 0.0, 0.7, 0.12432225141116775, 0.6977677513262337),
+            (0.5, 0.0, 25.0, 0.0013570056406911766, 0.9263125233154991),
+            (0.5, 0.3, -8.0, 0.004297394478004458, 0.08277279588863995),
+            (0.5, 0.3, -0.6, 0.08528401119473829, 0.20213347441135632),
+            (0.5, 0.3, 0.0, 0.48760541440493155, 0.31445284184451533),
+            (0.5, 0.3, 0.001, 0.48760541440493155, 0.31445284184451533),
+            (0.5, 0.3, 0.7, 0.18542360813816966, 0.5737931986676515),
+            (0.5, 0.3, 25.0, 0.001842231510533302, 0.9020842116463124),
+            (0.5, 1.0, -8.0, 0.0, 0.0),
+            (0.5, 1.0, -0.6, 0.0, 0.0),
+            (0.5, 1.0, 0.0, 0.0, 0.0),
+            (0.5, 1.0, 0.001, 0.0, 0.0),
+            (0.5, 1.0, 0.7, 0.33346684575982144, 0.23199772362873405),
+            (0.5, 1.0, 25.0, 0.003128341551803647, 0.8414805811217939),
+            (0.8, -1.0, -8.0, 0.028659473674421877, 0.20110155202915803),
+            (0.8, -1.0, -0.6, 4.390880815162571e-39, 1.0),
+            (0.8, -1.0, 0.0, 5.087917201638111e-18, 1.0),
+            (0.8, -1.0, 0.001, 5.087917201638111e-18, 1.0),
+            (0.8, -1.0, 0.7, 0.0, 1.0),
+            (0.8, -1.0, 25.0, 0.0, 1.0),
+            (0.8, -0.3, -8.0, 0.009964804895649677, 0.09353535970685645),
+            (0.8, -0.3, -0.6, 0.34427466928219846, 0.6495982201609063),
+            (0.8, -0.3, 0.0, 0.14628132801326832, 0.7966419920006298),
+            (0.8, -0.3, 0.001, 0.14628132801326832, 0.7966419920006298),
+            (0.8, -0.3, 0.7, 0.059826687358587, 0.8620425306535849),
+            (0.8, -0.3, 25.0, 0.0005243806248791977, 0.9824469138187117),
+            (0.8, 0.0, -8.0, 0.006014072228519541, 0.06355153246297007),
+            (0.8, 0.0, -0.6, 0.20978750936432486, 0.32263875830265665),
+            (0.8, 0.0, 0.0, 0.3606460866352935, 0.5),
+            (0.8, 0.0, 0.001, 0.3606460866352935, 0.5),
+            (0.8, 0.0, 0.7, 0.18576351902279306, 0.697110501940675),
+            (0.8, 0.0, 25.0, 0.0008262734243697763, 0.9736631689381322),
+            (0.8, 0.3, -8.0, 0.0033535978288649613, 0.039687150487486056),
+            (0.8, 0.3, -0.6, 0.06640281480075298, 0.14426000650245863),
+            (0.8, 0.3, 0.0, 0.14628132801326832, 0.20335800799937015),
+            (0.8, 0.3, 0.001, 0.14628132801326832, 0.20335800799937015),
+            (0.8, 0.3, 0.7, 0.3525253840823327, 0.3853725422600267),
+            (0.8, 0.3, 25.0, 0.0011882961026735128, 0.9639746259276096),
+            (0.8, 1.0, -8.0, 0.0, 0.0),
+            (0.8, 1.0, -0.6, 0.0, 0.0),
+            (0.8, 1.0, 0.0, 5.087917201638111e-18, 0.0),
+            (0.8, 1.0, 0.001, 5.087917201638111e-18, 0.0),
+            (0.8, 1.0, 0.7, 5.576464363369111e-28, 1.0475219086964941e-54),
+            (0.8, 1.0, 25.0, 0.0023418744622336076, 0.9371065209029789),
+            (1.0, -1.0, -8.0, 0.011265632388028761, 0.08904691474117488),
+            (1.0, -1.0, -0.6, 0.2019789415129265, 0.4950473315171391),
+            (1.0, -1.0, 0.0, 0.2622401263753516, 0.6347612984876252),
+            (1.0, -1.0, 0.001, 0.26232590131782624, 0.6350235815102823),
+            (1.0, -1.0, 0.7, 0.27097489258491053, 0.8289699479379163),
+            (1.0, -1.0, 25.0, 0.0, 1.0),
+            (1.0, -0.3, -8.0, 0.006657731596500192, 0.05334752180736446),
+            (1.0, -0.3, -0.6, 0.21763380759466974, 0.3767538697715216),
+            (1.0, -0.3, 0.0, 0.3064321945515475, 0.5361683269173996),
+            (1.0, -0.3, 0.001, 0.30651643037060294, 0.5364748012644079),
+            (1.0, -0.3, 0.7, 0.23754491499847713, 0.7412747663940105),
+            (1.0, -0.3, 25.0, 0.00034398941525584143, 0.9912770178292325),
+            (1.0, 0.0, -8.0, 0.004897075172058319, 0.03958342416056554),
+            (1.0, 0.0, -0.6, 0.23405138689984611, 0.3279791303773693),
+            (1.0, 0.0, 0.0, FRAC_1_PI, 0.5),
+            (1.0, 0.0, 0.001, FRAC_1_PI, 0.5),
+            (1.0, 0.0, 0.7, 0.21363079609650382, 0.6944001122142147),
+            (1.0, 0.0, 25.0, 0.0005084822462999851, 0.9872743886520082),
+            (1.0, 0.3, -8.0, 0.0032698055218573683, 0.026710866191316036),
+            (1.0, 0.3, -0.6, 0.26110440209857916, 0.2836740208488117),
+            (1.0, 0.3, 0.0, 0.3064321945515475, 0.4638316730826004),
+            (1.0, 0.3, 0.001, 0.3063475447137699, 0.4641380629866888),
+            (1.0, 0.3, 0.7, 0.20161439263918113, 0.6442026456423113),
+            (1.0, 0.3, 25.0, 0.000683917036548624, 0.983104360905433),
+            (1.0, 1.0, -8.0, 0.0, 0.0),
+            (1.0, 1.0, -0.6, 0.2789054117819384, 0.19855781495200256),
+            (1.0, 1.0, 0.0, 0.2622401263753516, 0.3652387015123748),
+            (1.0, 1.0, 0.001, 0.2621542458904714, 0.3655008987072878),
+            (1.0, 1.0, 0.7, 0.1918622052163606, 0.5246424983134796),
+            (1.0, 1.0, 25.0, 0.0011386197364553871, 0.9726873569919952),
+            (1.3, -1.0, -8.0, 0.004190309728781619, 0.029745165983032562),
+            (1.3, -1.0, -0.6, 0.07413364098765113, 0.17728028014431485),
+            (1.3, -1.0, 0.0, 0.10619566580883097, 0.23076923076923073),
+            (1.3, -1.0, 0.001, 0.10619566580883097, 0.23076923076923073),
+            (1.3, -1.0, 0.7, 0.1606125766767349, 0.32303974211025976),
+            (1.3, -1.0, 25.0, 0.0, 1.0),
+            (1.3, -0.3, -8.0, 0.0034882950369826246, 0.02187433262698979),
+            (1.3, -0.3, -0.6, 0.16227588179437863, 0.24904222050605385),
+            (1.3, -0.3, 0.0, 0.24052511350974823, 0.369705727046296),
+            (1.3, -0.3, 0.001, 0.24052511350974823, 0.369705727046296),
+            (1.3, -0.3, 0.7, 0.2922293177017521, 0.561586433150799),
+            (1.3, -0.3, 25.0, 0.000148047540646656, 0.9972205258414658),
+            (1.3, 0.0, -8.0, 0.00302677940108581, 0.017854203302254734),
+            (1.3, 0.0, -0.6, 0.2482532977465233, 0.33320967508512944),
+            (1.3, 0.0, 0.0, 0.2939836011204819, 0.5),
+            (1.3, 0.0, 0.001, 0.2939836011204819, 0.5),
+            (1.3, 0.0, 0.7, 0.2342793541405378, 0.690924943255216),
+            (1.3, 0.0, 25.0, 0.00020598423999000127, 0.9960810787922774),
+            (1.3, 0.3, -8.0, 0.0024165855094997572, 0.013325079065414913),
+            (1.3, 0.3, -0.6, 0.29130625897978674, 0.46761298219347536),
+            (1.3, 0.3, 0.0, 0.24052511350974823, 0.630294272953704),
+            (1.3, 0.3, 0.001, 0.24052511350974823, 0.630294272953704),
+            (1.3, 0.3, 0.7, 0.15038062012414083, 0.7665854972491388),
+            (1.3, 0.3, 25.0, 0.0002609115772024291, 0.9949708198272604),
+            (1.3, 1.0, -8.0, 3.8236132577985704e-19, 0.0),
+            (1.3, 1.0, -0.6, 0.15169193099920864, 0.6925725883712198),
+            (1.3, 1.0, 0.0, 0.10619566580883097, 0.7692307692307693),
+            (1.3, 1.0, 0.001, 0.10619566580883097, 0.7692307692307693),
+            (1.3, 1.0, 0.7, 0.06989944266000792, 0.8299190340929501),
+            (1.3, 1.0, 25.0, 0.0003783919954251735, 0.9924871244799549),
+            (1.5, -1.0, -8.0, 0.0032251755152504207, 0.017484756444451244),
+            (1.5, -1.0, -0.6, 0.1385974500427236, 0.23294151904565508),
+            (1.5, -1.0, 0.0, 0.19751617184719183, 0.3333333333333333),
+            (1.5, -1.0, 0.001, 0.19751617184719183, 0.3333333333333333),
+            (1.5, -1.0, 0.7, 0.26210737427179515, 0.4956105647817015),
+            (1.5, -1.0, 25.0, 3.0305506512567044e-67, 1.0),
+            (1.5, -0.3, -8.0, 0.0023522398516789755, 0.01201308354884112),
+            (1.5, -0.3, -0.6, 0.2121333415970665, 0.29062743465443797),
+            (1.5, -0.3, 0.0, 0.2739614887777256, 0.4381509472815051),
+            (1.5, -0.3, 0.001, 0.2739614887777256, 0.4381509472815051),
+            (1.5, -0.3, 0.7, 0.27424897614974053, 0.6357905096367407),
+            (1.5, -0.3, 25.0, 6.931311581842246e-05, 0.9988640578792797),
+            (1.5, 0.0, -8.0, 0.0019064977468556735, 0.009474084702482344),
+            (1.5, 0.0, -0.6, 0.25214695100878964, 0.3348624199606438),
+            (1.5, 0.0, 0.0, 0.28735275145216443, 0.5),
+            (1.5, 0.0, 0.001, 0.28735275145216443, 0.5),
+            (1.5, 0.0, 0.7, 0.24078419849245475, 0.689793171445247),
+            (1.5, 0.0, 25.0, 9.823094437431082e-05, 0.9983836357577905),
+            (1.5, 0.3, -8.0, 0.0014087343664917218, 0.00680423463203117),
+            (1.5, 0.3, -0.6, 0.28031606301209966, 0.39195411557407334),
+            (1.5, 0.3, 0.0, 0.2739614887777256, 0.561849052718495),
+            (1.5, 0.3, 0.001, 0.2739614887777256, 0.561849052718495),
+            (1.5, 0.3, 0.7, 0.1996121436132396, 0.729961116695548),
+            (1.5, 0.3, 25.0, 0.0001266870897070833, 0.997907000996804),
+            (1.5, 1.0, -8.0, 2.7221809653183074e-17, 0.0),
+            (1.5, 1.0, -0.6, 0.25476754041558336, 0.5302415367068819),
+            (1.5, 1.0, 0.0, 0.19751617184719183, 0.6666666666666667),
+            (1.5, 1.0, 0.001, 0.19751617184719183, 0.6666666666666667),
+            (1.5, 1.0, 0.7, 0.12988232773465644, 0.7804791156739815),
+            (1.5, 1.0, 25.0, 0.0001913317163790853, 0.9968093544691081),
+            (1.9, -1.0, -8.0, 0.0005385072561569232, 0.002037391036924685),
+            (1.9, -1.0, -0.6, 0.24126395979151005, 0.31533318974397995),
+            (1.9, -1.0, 0.0, 0.2796624164821193, 0.47368421052631576),
+            (1.9, -1.0, 0.001, 0.2796624164821193, 0.47368421052631576),
+            (1.9, -1.0, 0.7, 0.2625550729802318, 0.6675837977300723),
+            (1.9, -1.0, 25.0, 2.8013218963501338e-77, 1.0),
+            (
+                1.9,
+                -0.3,
+                -8.0,
+                0.0003522619223978566,
+                0.0013277301865413094,
+            ),
+            (1.9, -0.3, -0.6, 0.2524309439323494, 0.32929471951450884),
+            (1.9, -0.3, 0.0, 0.28220080309975265, 0.4920456668200823),
+            (1.9, -0.3, 0.001, 0.28220080309975265, 0.4920456668200823),
+            (1.9, -0.3, 0.7, 0.2528716574204996, 0.683243470023103),
+            (1.9, -0.3, 25.0, 5.748182611248954e-06, 0.9999251872895237),
+            (
+                1.9,
+                0.0,
+                -8.0,
+                0.00027165910975856275,
+                0.0010224052551321972,
+            ),
+            (1.9, 0.0, -0.6, 0.25685957100498374, 0.3357465222250591),
+            (1.9, 0.0, 0.0, 0.282456516085198, 0.5),
+            (1.9, 0.0, 0.001, 0.282456516085198, 0.5),
+            (1.9, 0.0, 0.7, 0.24821801937009746, 0.6895158822271009),
+            (1.9, 0.0, 25.0, 8.210313802028654e-06, 0.999893133549616),
+            (
+                1.9,
+                0.3,
+                -8.0,
+                0.00019062132090107573,
+                0.0007164111442938825,
+            ),
+            (1.9, 0.3, -0.6, 0.26099632645460524, 0.3424591818881181),
+            (1.9, 0.3, 0.0, 0.28220080309975265, 0.5079543331799177),
+            (1.9, 0.3, 0.001, 0.28220080309975265, 0.5079543331799177),
+            (1.9, 0.3, 0.7, 0.24333967281684793, 0.6955015720822886),
+            (1.9, 0.3, 25.0, 1.0671611067081213e-05, 0.9998610851565186),
+            (1.9, 1.0, -8.0, 3.146023332289839e-09, 6.294649246285644e-10),
+            (1.9, 1.0, -0.6, 0.26923747914356494, 0.3590165416168569),
+            (1.9, 1.0, 0.0, 0.2796624164821193, 0.5263157894736842),
+            (1.9, 1.0, 0.001, 0.2796624164821193, 0.5263157894736842),
+            (1.9, 1.0, 0.7, 0.23139062318879178, 0.7083054736010856),
+            (1.9, 1.0, 25.0, 1.6411361938206534e-05, 0.9997863265076803),
+            (2.0, -1.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, -1.0, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, -1.0, 0.0, 0.28209479177387814, 0.49999999999999994),
+            (2.0, -1.0, 0.001, 0.28209479177387814, 0.49999999999999994),
+            (2.0, -1.0, 0.7, 0.24957092803615247, 0.6896910267811551),
+            (2.0, -1.0, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, -0.3, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, -0.3, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, -0.3, 0.0, 0.28209479177387814, 0.5),
+            (2.0, -0.3, 0.001, 0.28209479177387814, 0.5),
+            (2.0, -0.3, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, -0.3, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 0.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 0.0, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, 0.0, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 0.0, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 0.0, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 0.0, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 0.3, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 0.3, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, 0.3, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 0.3, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 0.3, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 0.3, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 1.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 1.0, -0.6, 0.2578152274047408, 0.33568662027043633),
+            (2.0, 1.0, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 1.0, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 1.0, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 1.0, 25.0, 3.9073496024030386e-69, 1.0),
+        ];
+        // Worst relative error per (alpha, beta) group, printed with --nocapture.
+        let mut worst: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (alpha, beta, x, pdf, cdf) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            let (ep, ec) = (rel_err(d.pdf(x), pdf), rel_err(d.cdf(x), cdf));
+            match worst.iter_mut().find(|w| w.0 == alpha && w.1 == beta) {
+                Some(w) => {
+                    w.2 = w.2.max(ep);
+                    w.3 = w.3.max(ec);
+                }
+                None => worst.push((alpha, beta, ep, ec)),
+            }
+        }
+        for (alpha, beta, ep, ec) in &worst {
+            eprintln!("levy_stable S1 alpha={alpha} beta={beta}: pdf {ep:e}, cdf {ec:e}");
+        }
+        for (alpha, beta, x, pdf, cdf) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            let what = format!("S1 alpha={alpha} beta={beta} x={x}");
+            check(d.pdf(x), pdf, TOL, &format!("pdf {what}"));
+            check(d.cdf(x), cdf, TOL, &format!("cdf {what}"));
+        }
+    }
+
+    /// The bead's spot value, S0 rows around zeta = -beta·tan(pi·alpha/2) (0.503 rounds to
+    /// zeta = 0.5 at alpha = 1.5, 0.52 does not), loc/scale rows in both parameterizations
+    /// including the S1 alpha = 1 location move, and alpha within 0.005 of 1, which SciPy
+    /// shifts by its own zeta and then treats as 1.
+    /// Columns: alpha, beta, loc, scale, x, pdf, cdf.
+    #[test]
+    fn pdf_cdf_s0_loc_scale_and_alpha_near_one() {
+        let d = LevyStable::new(1.5, 0.3, 0.0, 1.0);
+        check(d.pdf(0.5), 0.22439915549671538, TOL, "spot pdf");
+        check(d.cdf(0.5), 0.6875429387815427, TOL, "spot cdf");
+
+        let s0_rows: [(f64, f64, f64, f64, f64, f64, f64); 21] = [
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                -2.0,
+                0.0729514702833168,
+                0.06571542941283859,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.5,
+                0.2541126866022294,
+                0.5983890784336222,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.503,
+                0.2541126866022294,
+                0.5983890784336222,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.52,
+                0.2521997161081318,
+                0.6034522688733577,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                3.0,
+                0.04284619301847879,
+                0.9212012247259922,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                -1.5,
+                0.09202528714229978,
+                0.2618211709605025,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                0.9,
+                0.15188566709069184,
+                0.7931681554701584,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                0.93,
+                0.14472430504409473,
+                0.7976161115228116,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                4.0,
+                0.01321799423471113,
+                0.9279031888680158,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                -3.0,
+                0.023301629432233868,
+                0.011666863100042502,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                -0.4,
+                0.27163149990559843,
+                0.37027163372395777,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                2.0,
+                0.1050785882885927,
+                0.8994601818635383,
+            ),
+            (0.5, 1.0, 0.0, 1.0, -1.2, 0.0, 0.0),
+            (
+                0.5,
+                1.0,
+                0.0,
+                1.0,
+                -0.5,
+                0.4151074974205947,
+                0.15729920705028516,
+            ),
+            (
+                0.5,
+                1.0,
+                0.0,
+                1.0,
+                0.5,
+                0.1555995547570865,
+                0.4142161782425253,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                -2.0,
+                0.10382723397538259,
+                0.22684307112115798,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                1.0,
+                0.21521713882120536,
+                0.8632216427510822,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                1.5,
+                0.12154786593145031,
+                0.9479673043005242,
+            ),
+            (
+                1.5,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.13351911966380473,
+                0.5592694218395138,
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.12364376233084097,
+                0.5324311112999968,
+            ),
+            (
+                0.8,
+                -0.3,
+                -1.0,
+                0.5,
+                -0.2,
+                0.12253051796109418,
+                0.8606316070202891,
+            ),
+        ];
+        let s1_rows: [(f64, f64, f64, f64, f64, f64, f64); 13] = [
+            (
+                1.5,
+                0.3,
+                1.0,
+                2.0,
+                -3.0,
+                0.05440348128867137,
+                0.10919047132050375,
+            ),
+            (
+                1.5,
+                0.3,
+                1.0,
+                2.0,
+                1.7,
+                0.1209209848141138,
+                0.6525567570399271,
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.13887514101063092,
+                0.4744347570441515,
+            ),
+            (
+                1.0,
+                -0.4,
+                0.5,
+                0.3,
+                0.2,
+                0.42248384201263395,
+                0.27556411500662836,
+            ),
+            (
+                1.0,
+                1.0,
+                0.0,
+                5.0,
+                3.0,
+                0.056753963334066196,
+                0.24806041671319412,
+            ),
+            (
+                0.5,
+                1.0,
+                0.3,
+                1.7,
+                2.0,
+                0.14233572030537844,
+                0.31731050786291415,
+            ),
+            (
+                2.0,
+                0.6,
+                -1.0,
+                3.0,
+                0.5,
+                0.08833451078134286,
+                0.6381631950841185,
+            ),
+            (0.998, 0.5, 0.0, 1.0, -1.0, 6.103589830227616e-06, 0.0),
+            (0.998, 0.5, 0.0, 1.0, 0.3, 6.203263472125152e-06, 0.0),
+            (0.998, 0.5, 0.0, 1.0, 2.0, 6.337335339383234e-06, 0.0),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                -1.0,
+                4.4205229628133885e-05,
+                0.9953986396137107,
+            ),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                0.3,
+                4.312308121402212e-05,
+                0.9954553986621298,
+            ),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                2.0,
+                4.176684247378353e-05,
+                0.99552754589759,
+            ),
+        ];
+        for (rows, parameterization) in [
+            (&s0_rows[..], S0),
+            (&s1_rows[..], LevyStableParameterization::S1),
+        ] {
+            for &(alpha, beta, loc, scale, x, pdf, cdf) in rows {
+                let d =
+                    LevyStable::with_parameterization(alpha, beta, loc, scale, parameterization);
+                let what = format!("{parameterization:?} ({alpha}, {beta}, {loc}, {scale}) x={x}");
+                check(d.pdf(x), pdf, TOL, &format!("pdf {what}"));
+                check(d.cdf(x), cdf, TOL, &format!("cdf {what}"));
+            }
+        }
+    }
+
+    /// SciPy's `levy_stable.ppf` (generic root finding on the cdf) and `isf`.
+    #[test]
+    fn ppf_isf_rows() {
+        let ps = [0.01, 0.1, 0.5, 0.9, 0.99];
+        let rows: [(f64, f64, [f64; 5]); 7] = [
+            (
+                1.5,
+                0.3,
+                [
+                    -6.371307605716798,
+                    -2.0886224017914774,
+                    -0.22085552172957038,
+                    2.06680235533958,
+                    8.996966077267839,
+                ],
+            ),
+            (
+                0.8,
+                -0.3,
+                [
+                    -120.60758663157674,
+                    -7.3974104296497885,
+                    -1.0445416039861481,
+                    1.626854274821318,
+                    52.44040339388944,
+                ],
+            ),
+            (
+                1.0,
+                0.5,
+                [
+                    -15.16799305416683,
+                    -1.5477766789257335,
+                    0.22349210573932446,
+                    5.006386933270669,
+                    48.82826894159045,
+                ],
+            ),
+            (
+                2.0,
+                0.0,
+                [
+                    -3.2899527142663745,
+                    -1.8123876048736467,
+                    0.0,
+                    1.812387604873647,
+                    3.289952714266372,
+                ],
+            ),
+            (
+                0.5,
+                1.0,
+                [
+                    0.1507182493011396,
+                    0.36961150946819477,
+                    2.1981093383177317,
+                    63.32811767701677,
+                    6365.864385106271,
+                ],
+            ),
+            (
+                1.9,
+                -1.0,
+                [
+                    -4.205426893249391,
+                    -1.8467650006526712,
+                    0.09375287798650755,
+                    1.853531955701531,
+                    3.234759759840619,
+                ],
+            ),
+            (
+                0.5,
+                0.0,
+                [
+                    -1559.7261037251076,
+                    -12.741342661576967,
+                    0.0,
+                    12.741342661576983,
+                    1559.7261037250983,
+                ],
+            ),
+        ];
+        for (alpha, beta, want) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            for (p, w) in ps.into_iter().zip(want) {
+                check(d.ppf(p), w, TOL, &format!("ppf({p}) ({alpha}, {beta})"));
+            }
+        }
+        let d = LevyStable::new(1.5, 0.3, 1.0, 2.0);
+        check(d.ppf(0.3), -0.8865842731747346, TOL, "ppf(0.3) loc/scale");
+        check(d.isf(0.3), 2.1127466012802953, TOL, "isf(0.3) loc/scale");
+        let d = LevyStable::with_parameterization(1.5, 0.5, 0.0, 1.0, S0);
+        for (p, w) in [
+            (0.05, -2.2541858411797433),
+            (0.5, 0.13385304231281092),
+            (0.95, 3.933658790179654),
+        ] {
+            check(d.ppf(p), w, TOL, &format!("S0 ppf({p})"));
+        }
+    }
+
+    /// `levy_stable.stats(alpha, beta, loc, scale, moments='mvsk')`, the same in S0 and S1.
+    #[test]
+    fn stats_rows() {
+        let rows: [(f64, f64, f64, f64, [f64; 4]); 5] = [
+            (1.5, 0.5, 1.0, 2.0, [1.0, f64::INFINITY, f64::NAN, f64::NAN]),
+            (
+                0.8,
+                0.3,
+                1.0,
+                2.0,
+                [f64::NAN, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                [f64::NAN, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+            (2.0, 0.7, 1.0, 2.0, [1.0, 8.0, 0.0, 0.0]),
+            (
+                1.9,
+                -1.0,
+                -3.0,
+                0.5,
+                [-3.0, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+        ];
+        for (alpha, beta, loc, scale, want) in rows {
+            for parameterization in [LevyStableParameterization::S1, S0] {
+                let d =
+                    LevyStable::with_parameterization(alpha, beta, loc, scale, parameterization);
+                let got = [d.mean(), d.var(), d.skewness(), d.kurtosis()];
+                for (g, w) in got.into_iter().zip(want) {
+                    assert!(
+                        g == w || (g.is_nan() && w.is_nan()),
+                        "{parameterization:?} ({alpha}, {beta}, {loc}, {scale}) stats {got:?}, \
+                         scipy {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SciPy's `_argcheck` (0 < alpha <= 2, -1 <= beta <= 1) plus scale > 0 and a finite loc.
+    #[test]
+    fn argcheck_rejects_and_accepts_the_edges() {
+        let bad: [(f64, f64, f64, f64); 10] = [
+            (0.0, 0.0, 0.0, 1.0),
+            (-0.5, 0.0, 0.0, 1.0),
+            (2.0000001, 0.0, 0.0, 1.0),
+            (f64::NAN, 0.0, 0.0, 1.0),
+            (1.5, 1.0000001, 0.0, 1.0),
+            (1.5, -1.0000001, 0.0, 1.0),
+            (1.5, f64::NAN, 0.0, 1.0),
+            (1.5, 0.0, 0.0, 0.0),
+            (1.5, 0.0, 0.0, -1.0),
+            (1.5, 0.0, f64::INFINITY, 1.0),
+        ];
+        for (alpha, beta, loc, scale) in bad {
+            assert!(
+                std::panic::catch_unwind(|| LevyStable::new(alpha, beta, loc, scale)).is_err(),
+                "({alpha}, {beta}, {loc}, {scale}) must be rejected"
+            );
+        }
+        for (alpha, beta) in [(2.0, 1.0), (2.0, -1.0), (1e-3, 0.0), (1.0, 1.0)] {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            assert_eq!((d.alpha, d.beta), (alpha, beta));
+            assert_eq!(d.parameterization, LevyStableParameterization::S1);
+        }
+    }
+
+    /// Non-finite x, p in {0, 1} and out-of-range p, as `rv_continuous` answers them.
+    #[test]
+    fn edges() {
+        for parameterization in [LevyStableParameterization::S1, S0] {
+            let d = LevyStable::with_parameterization(1.5, 0.3, 0.5, 2.0, parameterization);
+            assert_eq!(d.pdf(f64::INFINITY), 0.0);
+            assert_eq!(d.pdf(f64::NEG_INFINITY), 0.0);
+            assert!(d.pdf(f64::NAN).is_nan());
+            assert_eq!(d.cdf(f64::INFINITY), 1.0);
+            assert_eq!(d.cdf(f64::NEG_INFINITY), 0.0);
+            assert!(d.cdf(f64::NAN).is_nan());
+            assert_eq!(d.sf(f64::INFINITY), 0.0);
+            assert_eq!(d.sf(f64::NEG_INFINITY), 1.0);
+            assert_eq!(d.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+            assert_eq!(d.ppf(0.0), f64::NEG_INFINITY);
+            assert_eq!(d.ppf(1.0), f64::INFINITY);
+            assert_eq!(d.isf(0.0), f64::INFINITY);
+            assert_eq!(d.isf(1.0), f64::NEG_INFINITY);
+            for bad in [-0.1, 1.1, f64::NAN] {
+                assert!(d.ppf(bad).is_nan(), "ppf({bad}) must be NaN");
+            }
+            // logpdf is log(f(z)) - log(scale); sf is 1 - cdf.
+            let x = 1.3;
+            check(d.logpdf(x), d.pdf(x).ln(), 1e-15, "logpdf");
+            assert_eq!(d.sf(x), 1.0 - d.cdf(x));
+            // ppf inverts the cdf to brentq's xtol.
+            for p in [0.02, 0.4, 0.97] {
+                check(d.cdf(d.ppf(p)), p, 1e-12, &format!("cdf(ppf({p}))"));
+            }
+        }
+        // The S1 alpha = 1 location move reaches sf, logpdf and ppf too (SciPy's own sf, logpdf
+        // and ppf skip it; its pdf and cdf, pinned above, do not).
+        let d = LevyStable::new(1.0, 0.5, 1.0, 2.0);
+        check(d.sf(1.7), 1.0 - 0.4744347570441515, TOL, "S1 alpha=1 sf");
+        check(
+            d.logpdf(1.7),
+            0.13887514101063092_f64.ln(),
+            1e-14,
+            "S1 alpha=1 logpdf",
+        );
+        check(d.cdf(d.ppf(0.3)), 0.3, 1e-12, "S1 alpha=1 cdf(ppf)");
+    }
+
+    /// `levy_stable._fitstart(data)` (S1 and S0) on deterministic samples: Cauchy quantiles,
+    /// heavy two-sided tails skewed right and (negated) left, light right-skewed data (the
+    /// nu_alpha < 2.439 branch, alpha = 2, beta = sign(nu_beta)), and a golden-ratio sequence.
+    #[test]
+    fn fitstart_rows() {
+        let n = 401;
+        let u: Vec<f64> = (0..n)
+            .map(|i| (f64::from(i) + 0.5) / f64::from(n))
+            .collect();
+        let cauchy: Vec<f64> = u
+            .iter()
+            .map(|&v| (std::f64::consts::PI * (v - 0.5)).tan())
+            .collect();
+        let right: Vec<f64> = u
+            .iter()
+            .map(|&v| v.powf(-1.0 / 1.3) - 0.5 * (1.0 - v).powf(-1.0 / 1.7))
+            .collect();
+        let left: Vec<f64> = right.iter().map(|&v| -v).collect();
+        let light: Vec<f64> = u.iter().map(|&v| v * v).collect();
+        let golden: Vec<f64> = (1..=250)
+            .map(|i| {
+                let v = (f64::from(i) * 0.6180339887498949) % 1.0;
+                (std::f64::consts::PI * (v - 0.5)).tan() * (1.0 + 0.5 * v)
+            })
+            .collect();
+        // (data, S1 (alpha, beta, delta, gamma), S0 delta)
+        let rows: [(&[f64], [f64; 4], f64); 5] = [
+            (
+                &cauchy,
+                [1.0158960249888753, -0.0, 0.0, 0.9976763632502582],
+                0.0,
+            ),
+            (
+                &right,
+                [
+                    1.0569100642826337,
+                    0.5332182241201249,
+                    6.419640594017776,
+                    0.9565996492264762,
+                ],
+                0.7289204860098151,
+            ),
+            (
+                &left,
+                [
+                    1.0569100642826337,
+                    -0.5332182241201249,
+                    -6.419640594017776,
+                    0.9565996492264762,
+                ],
+                -0.7289204860098151,
+            ),
+            (
+                &light,
+                [2.0, 1.0, 0.25000000000000006, 0.2614010048254625],
+                0.25,
+            ),
+            (
+                &golden,
+                [
+                    1.0132603158061595,
+                    0.12525788451248404,
+                    7.215217726938392,
+                    1.2092049810123457,
+                ],
+                -0.055351970138906914,
+            ),
+        ];
+        for (k, (data, s1, s0_delta)) in rows.into_iter().enumerate() {
+            let (a, b, d, g) = LevyStable::fitstart(data);
+            for (got, want, what) in [
+                (a, s1[0], "alpha"),
+                (b, s1[1], "beta"),
+                (d, s1[2], "loc"),
+                (g, s1[3], "scale"),
+            ] {
+                check(got, want, TOL, &format!("fitstart S1 dataset {k} {what}"));
+            }
+            let (a0, b0, d0, g0) = LevyStable::fitstart_with_parameterization(data, S0);
+            assert_eq!((a0, b0, g0), (a, b, g), "S0 changes only the location");
+            check(d0, s0_delta, TOL, &format!("fitstart S0 dataset {k} loc"));
+        }
+        let (a, b, d, g) = LevyStable::fitstart(&[]);
+        assert!(a.is_nan() && b.is_nan() && d.is_nan() && g.is_nan());
+        // np.percentile is NaN on NaN data: alpha falls to 2 and the rest is NaN, as in SciPy.
+        let (a, b, d, g) = LevyStable::fitstart(&[1.0, f64::NAN, 3.0]);
+        assert!(a == 2.0 && b.is_nan() && d.is_nan() && g.is_nan());
+    }
+
+    /// Fraction of `xs` at or below `x`.
+    fn ecdf(xs: &[f64], x: f64) -> f64 {
+        xs.iter().filter(|&&v| v <= x).count() as f64 / xs.len() as f64
+    }
+
+    /// `rvs` draws follow the law: the empirical cdf at SciPy's quantiles (S1) or at points
+    /// where the cdf is pinned (S0; S1 at alpha = 1 with scale 3, where the location move is
+    /// 1.049) is within 0.015 of it, six standard errors at n = 40000. The alpha = 1 draws are
+    /// also checked to MISS the unmoved law, so a dropped move fails.
+    #[test]
+    fn rvs_follow_the_cdf() {
+        const N: usize = 40_000;
+        const TOL_ECDF: f64 = 0.015;
+        let mut rng = StdRng::seed_from_u64(0x1e_5ab1e);
+
+        let d = LevyStable::new(1.5, 0.3, 0.0, 1.0);
+        let xs = d.rvs(N, &mut rng);
+        for (p, x) in [
+            (0.1, -2.0886224017914774),
+            (0.5, -0.22085552172957038),
+            (0.9, 2.06680235533958),
+        ] {
+            let e = ecdf(&xs, x);
+            assert!(
+                (e - p).abs() < TOL_ECDF,
+                "S1 (1.5, 0.3): ecdf {e} at ppf({p})"
+            );
+        }
+
+        let d = LevyStable::new(1.0, 0.5, 1.0, 3.0);
+        let unmoved = LevyStable::with_parameterization(1.0, 0.5, 1.0, 3.0, S0);
+        let xs = d.rvs(N, &mut rng);
+        let mut max_miss = 0.0_f64;
+        for x in [-2.0, 1.0, 2.0, 6.0] {
+            let e = ecdf(&xs, x);
+            let f = d.cdf(x);
+            assert!(
+                (e - f).abs() < TOL_ECDF,
+                "S1 alpha=1: ecdf {e} vs cdf {f} at {x}"
+            );
+            max_miss = max_miss.max((e - unmoved.cdf(x)).abs());
+        }
+        assert!(
+            max_miss > 5.0 * TOL_ECDF,
+            "the unmoved law must be distinguishable, max gap {max_miss}"
+        );
+
+        let d = LevyStable::with_parameterization(0.8, -0.3, -1.0, 2.0, S0);
+        let xs = d.rvs(N, &mut rng);
+        for x in [-8.0, -1.0, 0.5, 3.0] {
+            let (e, f) = (ecdf(&xs, x), d.cdf(x));
+            assert!(
+                (e - f).abs() < TOL_ECDF,
+                "S0 (0.8, -0.3): ecdf {e} vs cdf {f} at {x}"
+            );
+        }
+
+        // alpha = 2: normal with mean loc and variance 2·scale² = 18.
+        let d = LevyStable::new(2.0, 0.6, -1.0, 3.0);
+        let xs = d.rvs(N, &mut rng);
+        let mean = xs.iter().sum::<f64>() / N as f64;
+        let var = xs.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (N - 1) as f64;
+        assert!((mean + 1.0).abs() < 0.11, "alpha=2 sample mean {mean}");
+        assert!(
+            (var / 18.0 - 1.0).abs() < 0.05,
+            "alpha=2 sample variance {var}"
+        );
+    }
+
+    /// Negative control for the removed `LevyStable = Levy` alias (br-szq1n.2). In S1,
+    /// levy_stable(1/2, 1, loc, scale) IS levy(loc, scale) (SciPy agrees to 5e-15) and
+    /// levy_stable(1/2, -1) is levy_l; but S0 moves it by -scale, and any other (alpha, beta)
+    /// is a different law, where the old alias would have returned Lévy's numbers.
+    #[test]
+    fn levy_is_the_s1_half_one_case_and_nothing_else() {
+        let (loc, scale) = (0.3, 1.7);
+        let levy = Levy::new(loc, scale);
+        let s1 = LevyStable::new(0.5, 1.0, loc, scale);
+        let s0 = LevyStable::with_parameterization(0.5, 1.0, loc, scale, S0);
+        let s0_as_levy = Levy::new(loc - scale, scale);
+        let near = LevyStable::new(0.5, 0.9, loc, scale);
+        for x in [0.35, 0.8, 1.7, 4.0, 30.0] {
+            check(
+                s1.pdf(x),
+                levy.pdf(x),
+                1e-13,
+                &format!("S1 pdf({x}) = levy"),
+            );
+            check(
+                s1.cdf(x),
+                levy.cdf(x),
+                1e-13,
+                &format!("S1 cdf({x}) = levy"),
+            );
+            check(s0.pdf(x), s0_as_levy.pdf(x), 1e-13, &format!("S0 pdf({x})"));
+            assert!(
+                rel_err(s0.pdf(x), levy.pdf(x)) > 0.05,
+                "S0 (1/2, 1) must not be levy(loc, scale) at {x}"
+            );
+            assert!(
+                rel_err(near.pdf(x), levy.pdf(x)) > 0.01,
+                "(1/2, 0.9) must not be levy at {x}"
+            );
+        }
+        let levy_l = LevyL::new(0.0, 1.0);
+        let mirrored = LevyStable::new(0.5, -1.0, 0.0, 1.0);
+        for x in [-3.0, -0.5] {
+            check(
+                mirrored.pdf(x),
+                levy_l.pdf(x),
+                1e-13,
+                &format!("levy_l pdf({x})"),
+            );
+        }
+        // alpha = 2 is the normal law with scale sqrt(2)·scale, whatever beta.
+        let normal = Normal::new(1.0, std::f64::consts::SQRT_2 * 2.0);
+        for beta in [-1.0, 0.4] {
+            let d = LevyStable::new(2.0, beta, 1.0, 2.0);
+            for x in [-4.0, 1.0, 6.0] {
+                check(
+                    d.pdf(x),
+                    normal.pdf(x),
+                    1e-14,
+                    &format!("alpha=2 beta={beta} pdf({x})"),
+                );
+            }
+        }
     }
 }
 

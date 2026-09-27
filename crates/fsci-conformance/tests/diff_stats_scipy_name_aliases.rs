@@ -19,9 +19,9 @@ use fsci_stats::{
     Beta, Betabinom, Betanbinom, Binom, Burr, Chi2, ContinuousDistribution, Cosine,
     CosineDistribution, Dgamma, DiscreteDistribution, Dlaplace, Dweibull, Expon, Exponweib, F,
     Foldcauchy, Foldnorm, Gamma, Genexpon, Geom, GumbelL, GumbelR, HalfNormal, Halfnorm, Hypergeom,
-    Invgamma, Invgauss, Kstwo, Landau, LevyL, Lognorm, Logser, Nbinom, Ncf, NchypergeomFisher, Nct,
-    Ncx2, Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, VonmisesLine, Wald, WeibullMin,
-    rv_histogram,
+    Invgamma, Invgauss, Kstwo, Landau, LevyL, LevyStable, Lognorm, Logser, Nbinom, Ncf,
+    NchypergeomFisher, Nct, Ncx2, Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, VonmisesLine,
+    Wald, WeibullMin, rv_histogram,
 };
 use serde::{Deserialize, Serialize};
 
@@ -290,7 +290,7 @@ fn cases() -> Vec<AliasCase> {
             &[0.2, 1.0, 3.0],
             cont(Wald::new(1.0)),
         ),
-        // Three of the four szq1n.2 names that aliased a DIFFERENT law now name their own types
+        // The four szq1n.2 names that aliased a DIFFERENT law now name their own types
         // (frankenscipy-1ksfv.16), and each point is one where the old alias disagreed:
         // kstwobign.cdf(0.3) = 9.3e-6 against kstwo(10) 0.729; moyal.pdf(0) = 0.242 against
         // landau 0.262; vonmises at x = 4 has density and cdf 1.0035, vonmises_line 0 and 1.
@@ -311,6 +311,14 @@ fn cases() -> Vec<AliasCase> {
             "stats.vonmises_line(2)",
             &[-2.0, 1.0, 4.0],
             cont(VonmisesLine::new(2.0, 0.0)),
+        ),
+        // The fourth: levy_stable(1.5, 0.3), the bead's spot law (pdf(0.5) = 0.2244), where the
+        // old `LevyStable = Levy` alias is supported on (0, ∞) and cannot even take α, β.
+        c(
+            "LevyStable",
+            "stats.levy_stable(1.5, 0.3)",
+            &[-1.0, 0.5, 2.0],
+            cont(LevyStable::new(1.5, 0.3, 0.0, 1.0)),
         ),
         d(
             "NchypergeomFisher",
