@@ -22646,6 +22646,7 @@ pub type Exponweib = ExponWeibull;
 // finite-n KS law, kstwobign its n -> inf limit; vonmises_line is zero outside
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
+// `Kstwo` is now its own type, the finite-n law (frankenscipy-1ksfv.16).
 
 // SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
 // are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
@@ -25913,6 +25914,107 @@ impl ContinuousDistribution for KsTwoBign {
             1e-12,
             10,
         )
+    }
+}
+
+/// Exact finite-sample distribution of the two-sided one-sample Kolmogorov–Smirnov
+/// statistic D_n = sup_x |F_n(x) − F(x)| (the distribution of `ks_1samp`'s statistic under
+/// the null). Matches `scipy.stats.kstwo(n)`; [`KsTwoBign`] is its n → ∞ limit of √n·D_n.
+///
+/// Support is SciPy's `[1/(2n), 1]`. `cdf`, `sf`, `pdf`, `ppf` and `isf` follow SciPy's
+/// `kolmogn`, `kolmognp` and `kolmogni` branch for branch; the upper tail `sf` stays
+/// accurate where `1 − cdf` would cancel to 0. `mean` and `var` integrate `1 − cdf` (see
+/// [`Kstwo::mean`]). frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kstwo {
+    n: usize,
+}
+
+impl Kstwo {
+    /// The law of D_n for a sample of size `n`.
+    ///
+    /// # Errors
+    ///
+    /// `n == 0`: SciPy's `kstwo` requires an integer `n ≥ 1` (`kstwo(0)` fails to
+    /// freeze, and `kstwo.cdf(x, 0)` is NaN).
+    pub fn new(n: usize) -> Result<Self, StatsError> {
+        if n == 0 {
+            return Err(StatsError::InvalidArgument(
+                "kstwo requires a sample size n >= 1".to_string(),
+            ));
+        }
+        Ok(Self { n })
+    }
+
+    /// The sample size `n`.
+    #[must_use]
+    pub const fn n(&self) -> usize {
+        self.n
+    }
+
+    /// SciPy `kstwo.support(n)`: `(1/(2n), 1)`.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (0.5 / self.n as f64, 1.0)
+    }
+}
+
+impl ContinuousDistribution for Kstwo {
+    fn pdf(&self, x: f64) -> f64 {
+        kolmogn_p(self.n, x)
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        kolmogn(self.n, x, true)
+    }
+
+    /// Computed directly (2·smirnov in the upper tail), not as `1 − cdf`.
+    fn sf(&self, x: f64) -> f64 {
+        kolmogn(self.n, x, false)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.support().0;
+        }
+        if q == 1.0 {
+            return 1.0;
+        }
+        kolmogni(self.n, q, 1.0 - q, false)
+    }
+
+    /// Inverts `sf` itself for q < 1/2 (see [`kolmogni`]); SciPy inverts the CDF at 1 - q.
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return 1.0;
+        }
+        if q == 1.0 {
+            return self.support().0;
+        }
+        kolmogni(self.n, 1.0 - q, q, q < 0.5)
+    }
+
+    /// E[D_n] = ∫₀¹ (1 − cdf(x)) dx by adaptive Gauss–Kronrod.
+    ///
+    /// SciPy has no closed form either: `kstwo.mean(n)` is `quad(x·pdf)` with the pdf a
+    /// finite difference of the CDF, and lands 3e-10 to 2e-6 (relative) away from the exact
+    /// mean, and up to 3e-5 from the exact variance (n = 141) — e.g. n = 5 gives
+    /// 0.3583385977550 where the exact mean is 0.358338666…. The integral of 1 − cdf agrees
+    /// with exact (mpmath) moments to 1e-14.
+    fn mean(&self) -> f64 {
+        kstwo_raw_moments_12(self.n).0
+    }
+
+    /// E[D_n²] − E[D_n]², with E[D_n²] = ∫₀¹ 2x·(1 − cdf(x)) dx (see [`Kstwo::mean`]).
+    fn var(&self) -> f64 {
+        let (m1, m2) = kstwo_raw_moments_12(self.n);
+        m2 - m1 * m1
     }
 }
 
@@ -44334,17 +44436,54 @@ pub fn anderson_ksamp(
 const KS_EP128: f64 = 3.402823669209385e38; // 2^128
 const KS_EM128: f64 = 2.938735877055719e-39; // 2^-128
 
-/// x · 2^exp without intermediate overflow (matches numpy.ldexp).
-fn ks_ldexp(mut x: f64, mut exp: i32) -> f64 {
-    while exp > 1000 {
-        x *= 2f64.powi(1000);
-        exp -= 1000;
+/// x · 2^exp with ONE rounding, as C `ldexp` / `numpy.ldexp` (musl `scalbn`). The final
+/// scaling is kept above 2^-53 of the subnormal range so a subnormal result is not rounded
+/// twice.
+fn ks_ldexp(x: f64, exp: i32) -> f64 {
+    const P1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
+    const PM969: f64 = f64::from_bits(0x0360_0000_0000_0000); // 2^-1022 · 2^53
+    let mut y = x;
+    let mut n = exp;
+    if n > 1023 {
+        y *= P1023;
+        n -= 1023;
+        if n > 1023 {
+            y *= P1023;
+            n -= 1023;
+            n = n.min(1023);
+        }
+    } else if n < -1022 {
+        y *= PM969;
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= PM969;
+            n += 1022 - 53;
+            n = n.max(-1022);
+        }
     }
-    while exp < -1000 {
-        x *= 2f64.powi(-1000);
-        exp += 1000;
+    y * f64::from_bits(((0x3ff + n) as u64) << 52)
+}
+
+/// Mantissa in [0.5, 1) and binary exponent, as C `frexp` (musl); zero, inf and NaN come
+/// back unchanged with exponent 0.
+fn ks_frexp(x: f64) -> (f64, i32) {
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    if biased == 0 {
+        if x == 0.0 {
+            return (x, 0);
+        }
+        // Subnormal: scale by 2^64 into the normal range first.
+        let (m, e) = ks_frexp(x * f64::from_bits(0x43f0_0000_0000_0000));
+        return (m, e - 64);
     }
-    x * 2f64.powi(exp)
+    if biased == 0x7ff {
+        return (x, 0);
+    }
+    (
+        f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000),
+        biased - 0x3fe,
+    )
 }
 
 fn ks_matmul(a: &[Vec<f64>], b: &[Vec<f64>], m: usize) -> Vec<Vec<f64>> {
@@ -44577,63 +44716,231 @@ fn kolmogn_pomeranz(n: usize, x: f64) -> f64 {
     ans.clamp(0.0, 1.0)
 }
 
-/// Exact SF P(D_n ≥ x) for the two-sided one-sample KS statistic, matching
-/// scipy.stats `_kolmogn(n, x, cdf=False)` (kstwo.sf). Returns `None` only for
-/// the n>140 Pelz-Good body, where the caller uses the asymptotic series.
-/// frankenscipy-ksk1u
-fn kolmogn_sf(n: usize, x: f64) -> Option<f64> {
+/// log(n! / n^n) by Stirling's series with n·log(n) removed up front (scipy
+/// `_log_nfactorial_div_n_pow_n`).
+fn ks_log_nfactorial_div_n_pow_n(n: usize) -> f64 {
+    let nf = n as f64;
+    let rn = 1.0 / nf;
+    nf.ln() / 2.0 - nf + (2.0 * std::f64::consts::PI).ln() / 2.0 + rn * ks_stirling_poly(rn / nf)
+}
+
+/// scipy `_select_and_clip_prob`: the CDF or the SF, clipped to [0, 1] (NaN passes through).
+fn ks_select_and_clip(cdfprob: f64, sfprob: f64, cdf: bool) -> f64 {
+    (if cdf { cdfprob } else { sfprob }).clamp(0.0, 1.0)
+}
+
+/// P(D_n ≤ x) (`cdf = true`) or P(D_n ≥ x) for the two-sided one-sample KS statistic D_n:
+/// scipy.stats `_kolmogn`, dispatch for dispatch (Simard & L'Ecuyer 2011). Exact for
+/// n ≤ 140 (Ruben–Gambino edges, Durbin/MTW, Pomeranz, 2·smirnov); for n > 140 the SF
+/// above n·x² = 2.2 is 2·smirnov and the rest is Durbin/MTW or the Pelz–Good expansion.
+/// frankenscipy-ksk1u, frankenscipy-1ksfv.16
+fn kolmogn(n: usize, x: f64, cdf: bool) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
     if x >= 1.0 {
-        return Some(0.0);
+        return ks_select_and_clip(1.0, 0.0, cdf);
     }
     if x <= 0.0 {
-        return Some(1.0);
+        return ks_select_and_clip(0.0, 1.0, cdf);
     }
     let nf = n as f64;
     let t = nf * x;
     if t <= 1.0 {
-        // Ruben-Gambino, 1/2n ≤ x ≤ 1/n.
+        // Ruben–Gambino: P(D_n ≤ x) = n!/n^n (2t - 1)^n for 1/2n ≤ x ≤ 1/n.
         if t <= 0.5 {
-            return Some(1.0);
+            return ks_select_and_clip(0.0, 1.0, cdf);
         }
-        let cdf = if n <= 140 {
+        let prob = if n <= 140 {
             let mut p = 1.0;
             for i in 1..=n {
-                p *= (i as f64 / nf) * (2.0 * t - 1.0);
+                p *= (i as f64 * (1.0 / nf)) * (2.0 * t - 1.0);
             }
             p
         } else {
-            let rn = 1.0 / nf;
-            let log_nfac = nf.ln() / 2.0 - nf
-                + (2.0 * std::f64::consts::PI).ln() / 2.0
-                + rn * ks_stirling_poly(rn / nf);
-            (log_nfac + nf * (2.0 * t - 1.0).ln()).exp()
+            (ks_log_nfactorial_div_n_pow_n(n) + nf * (2.0 * t - 1.0).ln()).exp()
         };
-        return Some((1.0 - cdf).clamp(0.0, 1.0));
+        return ks_select_and_clip(prob, 1.0 - prob, cdf);
     }
     if t >= nf - 1.0 {
-        return Some((2.0 * (1.0 - x).powi(n as i32)).clamp(0.0, 1.0));
+        // Ruben–Gambino: P(D_n ≥ x) = 2 (1 - x)^n for x ≥ 1 - 1/n.
+        let prob = 2.0 * (1.0 - x).powf(nf);
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
     if x >= 0.5 {
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+        // Exact: the two one-sided events cannot both occur.
+        let prob = 2.0 * ks_smirnov3(n, x).0;
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
-    let nxsq = t * x;
+    let nxsquared = t * x;
     if n <= 140 {
-        if nxsq <= 0.754693 {
-            return Some((1.0 - kolmogn_dmtw(n, x)).clamp(0.0, 1.0));
+        if nxsquared <= 0.754_693 {
+            let prob = kolmogn_dmtw(n, x);
+            return ks_select_and_clip(prob, 1.0 - prob, cdf);
         }
-        if nxsq <= 4.0 {
-            return Some((1.0 - kolmogn_pomeranz(n, x)).clamp(0.0, 1.0));
+        if nxsquared <= 4.0 {
+            let prob = kolmogn_pomeranz(n, x);
+            return ks_select_and_clip(prob, 1.0 - prob, cdf);
         }
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+        // Miller's approximation 2·smirnov.
+        let prob = 2.0 * ks_smirnov3(n, x).0;
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
-    // n > 140.
-    if nxsq >= 2.2 {
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+    // n > 140: the CDF and the SF have different cutoffs on n·x².
+    if !cdf {
+        if nxsquared >= 370.0 {
+            return 0.0;
+        }
+        if nxsquared >= 2.2 {
+            return (2.0 * ks_smirnov3(n, x).0).clamp(0.0, 1.0);
+        }
     }
-    if n <= 100_000 && nf * x.powf(1.5) <= 1.4 {
-        return Some((1.0 - kolmogn_dmtw(n, x)).clamp(0.0, 1.0));
+    let cdfprob = if nxsquared >= 18.0 {
+        1.0
+    } else if n <= 100_000 && nf * x.powf(1.5) <= 1.4 {
+        kolmogn_dmtw(n, x)
+    } else {
+        kolmogn_pelzgood_cdf(n, x)
+    };
+    ks_select_and_clip(cdfprob, 1.0 - cdfprob, cdf)
+}
+
+/// Density of D_n: scipy.stats `_kolmogn_p`. Closed forms on the Ruben–Gambino edges,
+/// 2·ksone.pdf for x ≥ 1/2, and elsewhere SciPy's 5-point central difference of the CDF with
+/// its step x/2^16 (kept inside (1/n, 1/2), the CDF being a piecewise polynomial).
+/// frankenscipy-1ksfv.16
+fn kolmogn_p(n: usize, x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
     }
-    Some((1.0 - kolmogn_pelzgood_cdf(n, x)).clamp(0.0, 1.0))
+    if x >= 1.0 || x <= 0.0 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let t = nf * x;
+    if t <= 1.0 {
+        // d/dx n!/n^n (2t - 1)^n = 2 n² · n!/n^n (2t - 1)^(n-1)
+        if t <= 0.5 {
+            return 0.0;
+        }
+        let prd = if n <= 140 {
+            let mut p = 1.0;
+            for i in 1..n {
+                p *= (i as f64 * (1.0 / nf)) * (2.0 * t - 1.0);
+            }
+            p
+        } else {
+            (ks_log_nfactorial_div_n_pow_n(n) + (nf - 1.0) * (2.0 * t - 1.0).ln()).exp()
+        };
+        return prd * 2.0 * (nf * nf);
+    }
+    if t >= nf - 1.0 {
+        // d/dx (1 - 2(1 - x)^n) = 2n (1 - x)^(n-1)
+        return 2.0 * (1.0 - x).powf(nf - 1.0) * nf;
+    }
+    if x >= 0.5 {
+        return 2.0 * ks_smirnov3(n, x).2;
+    }
+    let delta = (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x);
+    let weights = [1.0 / 12.0, -8.0 / 12.0, 0.0 / 12.0, 8.0 / 12.0, -1.0 / 12.0];
+    let mut val = 0.0;
+    for (k, w) in weights.iter().enumerate() {
+        val += w * kolmogn(n, x + (k as f64 - 2.0) * delta, true);
+    }
+    val / delta
+}
+
+/// The x with P(D_n ≤ x) = p, given p and its complement q = 1 - p: scipy.stats
+/// `_kolmogni`. Closed forms on the Ruben–Gambino edges; otherwise SciPy's brentq
+/// (xtol = 1e-14, rtol = 4·eps, maxiter = 100) on [1/n, min(kolmogci(p)/√n, 1 - 1/n)] for
+/// `cdf(x) - p`.
+///
+/// `upper = true` runs that brentq on `q - sf(x)` from [1/n, min(kolmogi(q)/√n, 1 - 1/n)]
+/// instead, which is what `isf` needs for q < 1/2. SciPy's `kstwo.isf` takes the CDF route
+/// at p = 1 - q, which rounds away the digits of q below eps/q and, for n > 140, inverts the
+/// Pelz–Good CDF rather than the 2·smirnov SF: `kstwo.sf(kstwo.isf(q))` misses q by 1.4e-5
+/// (n = 141, q = 1e-3) up to 100 % (`kstwo.isf(1e-20, 100) = 0.99`, where `kstwo.sf` is
+/// 2e-200). frankenscipy-1ksfv.16
+fn kolmogni(n: usize, p: f64, q: f64, upper: bool) -> f64 {
+    let nf = n as f64;
+    if p <= 0.0 {
+        return 1.0 / nf;
+    }
+    if q <= 0.0 {
+        return 1.0;
+    }
+    let delta = ((p.ln() - ln_gamma(nf + 1.0)) / nf).exp();
+    if delta <= 1.0 / nf {
+        return (delta + 1.0 / nf) / 2.0;
+    }
+    let x = -((q / 2.0).ln() / nf).exp_m1();
+    if x >= 1.0 - 1.0 / nf {
+        return x;
+    }
+    let (lo, hi_cap) = (1.0 / nf, 1.0 - 1.0 / nf);
+    let (xtol, rtol) = (1e-14, 4.0 * f64::EPSILON);
+    if upper {
+        let x1 = (ks_kolmogi(q, p) / nf.sqrt()).min(hi_cap);
+        return ks_brentq(|x| q - kolmogn(n, x, false), lo, x1, xtol, rtol, 100);
+    }
+    let x1 = (ks_kolmogci(p) / nf.sqrt()).min(hi_cap);
+    ks_brentq(|x| kolmogn(n, x, true) - p, lo, x1, xtol, rtol, 100)
+}
+
+/// (E[D_n], E[D_n²]) of the law whose CDF `kolmogn` reports: E[X^k] = ∫₀¹ k x^(k-1)
+/// (1 - cdf(x)) dx, with cdf = 0 below the support edge 1/2n.
+///
+/// Adaptive Gauss–Kronrod between the places where `kolmogn` switches formula (the
+/// Ruben–Gambino edges, 1/2, n·x² = 0.754693, 4, 18 and n·x^1.5 = 1.4), truncated at
+/// √(40/n): past it Massart's P(D_n ≥ x) ≤ 2 e^(-2n x²) bounds the dropped mass by 4e-35.
+/// The CDF's knots at the multiples of 1/2n need no breakpoints: adding every one of them
+/// moved no mean or variance for n ≤ 140 by more than 5.9e-14 (relative) and cost 6×.
+///
+/// 1 - cdf rather than sf: for n > 140 the two are different approximations on
+/// 2.2 ≤ n x² < 18 (Pelz–Good vs 2·smirnov), and SciPy's `kstwo.mean` integrates x·pdf with
+/// the pdf taken from the CDF. The 2·smirnov SF is also ~10^4 times dearer to evaluate at
+/// n = 10^5.
+fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
+    let nf = n as f64;
+    let a = 0.5 / nf;
+    let hi = (40.0 / nf).sqrt().min(1.0);
+    let mut cuts = vec![
+        a,
+        hi,
+        1.0 / nf,
+        0.5,
+        1.0 - 1.0 / nf,
+        (0.754_693 / nf).sqrt(),
+        (4.0 / nf).sqrt(),
+        (18.0 / nf).sqrt(),
+        (1.4 / nf).powf(2.0 / 3.0),
+    ];
+    cuts.retain(|&c| c >= a && c <= hi);
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    let integrand = |x: f64| {
+        let upper = 1.0 - kolmogn(n, x, true);
+        vec![upper, 2.0 * x * upper]
+    };
+    let (mut m1, mut m2) = (a, a * a);
+    for w in cuts.windows(2) {
+        // GK15/G7 bisection to 1e-15 of the panel width (depth <= 12); valid finite bounds
+        // and tolerances, so quad_vec cannot fail here.
+        let options = fsci_integrate::QuadOptions {
+            epsabs: 1e-15 * (w[1] - w[0]),
+            epsrel: 0.0,
+            limit: 12,
+        };
+        let Ok(r) = fsci_integrate::quad_vec(integrand, w[0], w[1], options) else {
+            return (f64::NAN, f64::NAN);
+        };
+        let [i1, i2] = r.integral[..] else {
+            return (f64::NAN, f64::NAN);
+        };
+        m1 += i1;
+        m2 += i2;
+    }
+    (m1, m2)
 }
 
 /// Pelz-Good theta-function approximation to the CDF P(D_n ≤ x). Port of
@@ -44746,6 +45053,651 @@ fn ks_stirling_poly(z: f64) -> f64 {
     acc
 }
 
+// ── xsf `cephes/dd_real.h` + `cephes/kolmogorov.h` and SciPy `brentq.c`, the pieces that
+// `scipy.stats.kstwo` calls through `scipy.special` / `scipy.optimize`. frankenscipy-1ksfv.16
+
+/// Unevaluated sum `hi + lo`: the double-double subset of xsf `cephes/dd_real.h` (Bailey's
+/// QD, Briggs–Kahan addition) that `_smirnov` uses, operation for operation.
+#[derive(Clone, Copy, Debug)]
+struct KsDd {
+    hi: f64,
+    lo: f64,
+}
+
+fn ks_quick_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let c = s - a;
+    (s, b - c)
+}
+
+fn ks_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let c = s - a;
+    let d = b - c;
+    let e = s - c;
+    (s, (a - e) + d)
+}
+
+fn ks_two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, a.mul_add(b, -p))
+}
+
+impl KsDd {
+    const fn new(hi: f64) -> Self {
+        Self { hi, lo: 0.0 }
+    }
+
+    fn is_zero(self) -> bool {
+        self.hi == 0.0 && self.lo == 0.0
+    }
+
+    fn neg(self) -> Self {
+        Self {
+            hi: -self.hi,
+            lo: -self.lo,
+        }
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, rhs.hi);
+        let (t1, t2) = ks_two_sum(self.lo, rhs.lo);
+        let (s1, s2) = ks_quick_two_sum(s1, s2 + t1);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + t2);
+        Self { hi, lo }
+    }
+
+    fn add_f64(self, rhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, rhs);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
+        Self { hi, lo }
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        self.add(rhs.neg())
+    }
+
+    fn sub_f64(self, rhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, -rhs);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
+        Self { hi, lo }
+    }
+
+    /// `lhs - self` for a plain `lhs`.
+    fn sub_from_f64(self, lhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(lhs, -self.hi);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 - self.lo);
+        Self { hi, lo }
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let (p1, p2) = ks_two_prod(self.hi, rhs.hi);
+        let (hi, lo) = ks_quick_two_sum(p1, p2 + (self.hi * rhs.lo + self.lo * rhs.hi));
+        Self { hi, lo }
+    }
+
+    fn mul_f64(self, rhs: f64) -> Self {
+        let (p1, e1) = ks_two_prod(self.hi, rhs);
+        let (p2, e2) = ks_two_prod(self.lo, rhs);
+        let (hi, lo) = ks_quick_two_sum(p1, e2 + p2 + e1);
+        Self { hi, lo }
+    }
+
+    fn div(self, rhs: Self) -> Self {
+        let q1 = self.hi / rhs.hi;
+        let r = self.sub(rhs.mul_f64(q1));
+        let q2 = r.hi / rhs.hi;
+        let r = r.sub(rhs.mul_f64(q2));
+        let q3 = r.hi / rhs.hi;
+        let (hi, lo) = ks_quick_two_sum(q1, q2);
+        Self { hi, lo }.add_f64(q3)
+    }
+
+    fn div_f64(self, rhs: f64) -> Self {
+        self.div(Self::new(rhs))
+    }
+
+    /// `lhs / self` for a plain `lhs`.
+    fn div_into_f64(self, lhs: f64) -> Self {
+        Self::new(lhs).div(self)
+    }
+
+    fn floor(self) -> Self {
+        let hi = self.hi.floor();
+        if hi == self.hi {
+            // The high word is an integer already: round the low word.
+            let (hi, lo) = ks_quick_two_sum(hi, self.lo.floor());
+            return Self { hi, lo };
+        }
+        Self { hi, lo: 0.0 }
+    }
+
+    fn ldexp(self, exp: i32) -> Self {
+        Self {
+            hi: ks_ldexp(self.hi, exp),
+            lo: ks_ldexp(self.lo, exp),
+        }
+    }
+
+    fn frexp(self) -> (Self, i32) {
+        let (mut man, mut exponent) = ks_frexp(self.hi);
+        let mut b1 = ks_ldexp(self.lo, -exponent);
+        if man.abs() == 0.5 && man * b1 < 0.0 {
+            man *= 2.0;
+            b1 *= 2.0;
+            exponent -= 1;
+        }
+        (Self { hi: man, lo: b1 }, exponent)
+    }
+}
+
+/// a^m (xsf `pow_D`): `pow` of the high word, corrected to first order in lo/hi.
+fn ks_pow_dd(a: KsDd, m: i64) -> KsDd {
+    if m <= 0 {
+        if m == 0 {
+            return KsDd::new(1.0);
+        }
+        return ks_pow_dd(a, -m).div_into_f64(1.0);
+    }
+    if a.is_zero() {
+        return KsDd::new(0.0);
+    }
+    let mf = m as f64;
+    let ans = a.hi.powf(mf);
+    let r = a.lo / a.hi;
+    let mut adj = mf * r;
+    if adj.abs() > 1e-8 {
+        if adj.abs() < 1e-4 {
+            // First two Taylor terms of (1 + r)^m.
+            adj += (mf * r) * ((m - 1) as f64 / 2.0 * r);
+        } else {
+            adj = (mf * r.ln_1p()).exp_m1();
+        }
+    }
+    KsDd::new(ans).add_f64(ans * adj)
+}
+
+/// ((a + b) / (c + d))^m (xsf `pow4_D`).
+fn ks_pow4_dd(a: f64, b: f64, c: f64, d: f64, m: i64) -> KsDd {
+    if m <= 0 {
+        if m == 0 {
+            return KsDd::new(1.0);
+        }
+        return ks_pow4_dd(c, d, a, b, -m);
+    }
+    let num = KsDd::new(a).add_f64(b);
+    let den = KsDd::new(c).add_f64(d);
+    if num.is_zero() {
+        return if den.is_zero() {
+            KsDd::new(f64::NAN)
+        } else {
+            KsDd::new(0.0)
+        };
+    }
+    if den.is_zero() {
+        let negative = num.hi < 0.0 || (num.hi == 0.0 && num.lo < 0.0);
+        return KsDd::new(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    ks_pow_dd(num.div(den), m)
+}
+
+/// xsf `nextPowerOf2` (which, despite the name, rounds `x` up by one ulp-ish step).
+fn ks_next_power_of_2(x: f64) -> f64 {
+    let q = ks_ldexp(x, 1 - 53);
+    let l = (q + x).abs();
+    if l == 0.0 {
+        return x.abs();
+    }
+    let lint = l as i32;
+    if f64::from(lint) == l {
+        f64::from(lint)
+    } else {
+        l
+    }
+}
+
+/// a^m as (significand, binary exponent) so it cannot underflow (xsf `pow2Scaled_D`).
+fn ks_pow2_scaled_dd(a: KsDd, m: i64) -> (KsDd, i64) {
+    const SM_MAX_EXPONENT: i64 = 960;
+    if m <= 0 {
+        if m == 0 {
+            return (KsDd::new(1.0), 0);
+        }
+        let (ans, e1) = ks_pow2_scaled_dd(a, -m);
+        let (ans, e2) = ans.div_into_f64(1.0).frexp();
+        return (ans, -e1 + i64::from(e2));
+    }
+    let (y, ye) = a.frexp();
+    let ye = i64::from(ye);
+    if m == 1 {
+        return (y, ye);
+    }
+    let mf = m as f64;
+    let mut max_expt = SM_MAX_EXPONENT;
+    // y^max_expt must stay >= 2^-960; check cheaply before calling log().
+    if mf * (y.hi - 1.0) / y.hi < -(SM_MAX_EXPONENT as f64) * std::f64::consts::LN_2 {
+        let lg2y = y.hi.ln() / std::f64::consts::LN_2;
+        let lg_ans = mf * lg2y;
+        if lg_ans <= -(SM_MAX_EXPONENT as f64) {
+            max_expt = (ks_next_power_of_2(-(SM_MAX_EXPONENT as f64) / lg2y + 1.0) / 2.0) as i64;
+        }
+    }
+    if m <= max_expt {
+        let (ans, ans_e) = ks_pow_dd(y, m).frexp();
+        return (ans, i64::from(ans_e) + m * ye);
+    }
+    // y^m = (y^max_expt)^q · y^r
+    let q = m / max_expt;
+    let r = m % max_expt;
+    let (y2r, y2r_e) = ks_pow2_scaled_dd(y, r);
+    let (y2m, y2m_e) = ks_pow2_scaled_dd(y, max_expt);
+    let (y2mq, y2mq_e) = ks_pow2_scaled_dd(y2m, q);
+    let (ans, ans_e) = y2r.mul(y2mq).frexp();
+    (
+        ans,
+        i64::from(ans_e) + (y2mq_e + y2m_e * q) + y2r_e + m * ye,
+    )
+}
+
+/// C(n, j) stored as (significand, exponent), advanced to C(n, j + 1) (xsf `updateBinomial`).
+fn ks_update_binomial(cman: &mut KsDd, cexpt: &mut i64, n: i64, j: i64) {
+    let rat = KsDd::new((n - j) as f64).div_f64(j as f64 + 1.0);
+    let (man, expt) = cman.mul(rat).frexp();
+    *cexpt += i64::from(expt);
+    *cman = man;
+}
+
+/// A_v(n, x) = C(n, v) (1 - x - v/n)^(n-v) (x + v/n)^(v-1) (xsf `computeAv`).
+fn ks_smirnov_term(n: i64, x: f64, v: i64, cman: KsDd, cexpt: i64) -> KsDd {
+    let t2x = KsDd::new((n - v) as f64).div_f64(n as f64).sub_f64(x);
+    let (t2, t2e) = ks_pow2_scaled_dd(t2x, n - v);
+    let t1x = KsDd::new(v as f64).div_f64(n as f64).add_f64(x);
+    let (t1, t1e) = ks_pow2_scaled_dd(t1x, v - 1);
+    let expt = cexpt + t1e + t2e;
+    // Beyond ±2^31 the value is 0 or inf either way; clamp so the i32 ldexp cannot wrap.
+    t1.mul(t2)
+        .mul(cman)
+        .ldexp(expt.clamp(-(1 << 30), 1 << 30) as i32)
+}
+
+/// (sf, cdf, pdf) of the one-sided statistic D_n^+: `scipy.special.smirnov`, `smirnovc` and
+/// `-smirnovp`, ported from xsf `cephes::detail::_smirnov` (Birnbaum–Tingey sum in
+/// double-double; van Mulbregt 2018). `n` is 64-bit here where xsf has a C `int`; the two
+/// agree for every `n <= i32::MAX`.
+fn ks_smirnov3(n: usize, x: f64) -> (f64, f64, f64) {
+    const SMIRNOV_MAX_COMPUTE_N: i64 = 1_000_000;
+    const SM_UPPER_MAX_TERMS: i64 = 3;
+    const SM_UPPERSUM_MIN_N: i64 = 10;
+    // log(2^-1075): exp() of anything below returns 0 (xsf `MINLOG`).
+    #[allow(clippy::excessive_precision)]
+    const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
+    let n = n as i64;
+    if !(n > 0 && (0.0..=1.0).contains(&x)) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let nf = n as f64;
+    if n == 1 {
+        return (1.0 - x, x, 1.0);
+    }
+    if x == 0.0 {
+        return (1.0, 0.0, 1.0);
+    }
+    if x == 1.0 {
+        return (0.0, 1.0, 0.0);
+    }
+    // floor(n x) and its remainder, exactly (xsf `modNX`).
+    let nx_dd = KsDd::new(x).mul_f64(nf);
+    let nx_floor = nx_dd.floor();
+    let mut alpha = nx_dd.sub(nx_floor).hi;
+    let mut nxfl = nx_floor.hi as i64;
+    if alpha == 1.0 {
+        nxfl += 1;
+        alpha = 0.0;
+    }
+    let nx = nx_dd.hi;
+    let mut n1mxfl = n - nxfl - i64::from(alpha != 0.0);
+    let mut n1mxceil = n - nxfl;
+    // With alpha == 0 the last term belongs to neither sum.
+    if alpha == 0.0 {
+        n1mxfl -= 1;
+        n1mxceil += 1;
+    }
+    // x <= 1/n
+    if nxfl == 0 || (nxfl == 1 && alpha == 0.0) {
+        let t = ks_pow_dd(KsDd::new(1.0).add_f64(x), n - 1).hi;
+        let mut pdf = (nx + 1.0) * t / (1.0 + x);
+        let cdf = x * t;
+        if nxfl == 1 {
+            pdf -= 0.5;
+        }
+        return (1.0 - cdf, cdf, pdf);
+    }
+    // sf underflows.
+    if -2.0 * nf * x * x < MINLOG {
+        return (0.0, 1.0, 0.0);
+    }
+    // x >= 1 - 1/n
+    if nxfl >= n - 1 {
+        let sf = ks_pow_dd(KsDd::new(1.0).add_f64(-x), n).hi;
+        return (sf, 1.0 - sf, nf * sf / (1.0 - x));
+    }
+    // n too large to sum: p ~ exp(-(6nx + 1)^2 / 18n).
+    if n > SMIRNOV_MAX_COMPUTE_N {
+        let logp = -(6.0 * nf * x + 1.0).powi(2) / 18.0 / nf;
+        let (sf, cdf) = if logp < -std::f64::consts::LN_2 {
+            let sf = logp.exp();
+            (sf, 1.0 - sf)
+        } else {
+            let cdf = -logp.exp_m1();
+            (1.0 - cdf, cdf)
+        };
+        return (sf, cdf, (6.0 * nf * x + 1.0) * 2.0 * sf / 3.0);
+    }
+    // The upper sum alternates in sign; use it only when it has very few terms.
+    let n_upper_terms = n - n1mxceil + 1;
+    let use_upper = (n_upper_terms <= 1 && x < 0.5)
+        || (n >= SM_UPPERSUM_MIN_N && n_upper_terms <= SM_UPPER_MAX_TERMS && x <= 0.5 / nf.sqrt());
+    let vmid = n / 2;
+    let one_over_x = KsDd::new(1.0).div_f64(x);
+    let (start, step, n_terms, mut aj, first_coeff) = if use_upper {
+        let aj = ks_pow4_dd(1.0, x, 1.0, 0.0, n - 1);
+        let coeff = KsDd::new(1.0).add_f64(x).div_into_f64((n - 1) as f64);
+        (n, -1, n - n1mxceil + 1, aj, coeff.add(one_over_x))
+    } else {
+        let aj = ks_pow4_dd(1.0, -x, 1.0, 0.0, n).div_f64(x);
+        let coeff = KsDd::new((n - 1) as f64)
+            .mul_f64(x)
+            .sub_from_f64(-1.0)
+            .div(KsDd::new(1.0).sub_f64(x))
+            .div_f64(x);
+        (0, 1, n1mxfl + 1, aj, coeff.add(one_over_x))
+    };
+    let mut aj_sum = KsDd::new(0.0).add(aj);
+    let mut daj_sum = KsDd::new(0.0).add(aj.mul(first_coeff));
+    let mut cman = KsDd::new(1.0);
+    let mut cexpt = 0_i64;
+    ks_update_binomial(&mut cman, &mut cexpt, n, 0);
+    let mut j = 1_i64;
+    while j < n_terms {
+        let v = start + j * step;
+        aj = ks_smirnov_term(n, x, v, cman, cexpt);
+        if aj.hi.is_finite() && !aj.is_zero() {
+            // d/dx log A_v = 1/x + (v-1)/(x+v/n) - (n-v)/(1-x-v/n)
+            let coeff = KsDd::new((nxfl + v) as f64)
+                .add_f64(alpha)
+                .div_into_f64(nf * (v - 1) as f64)
+                .sub(
+                    KsDd::new((n - nxfl - v) as f64)
+                        .sub_f64(alpha)
+                        .div_into_f64((n - v) as f64 * nf),
+                )
+                .add(one_over_x);
+            aj_sum = aj_sum.add(aj);
+            daj_sum = daj_sum.add(aj.mul(coeff));
+        }
+        if !aj.is_zero() {
+            if (4 * (n_terms - j)) as f64 * aj.hi.abs() < f64::EPSILON * aj_sum.hi
+                && j != n_terms - 1
+            {
+                break;
+            }
+        } else if j > vmid {
+            break;
+        }
+        ks_update_binomial(&mut cman, &mut cexpt, n, j);
+        j += 1;
+    }
+    let deriv = daj_sum.mul_f64(x).hi;
+    let prob = aj_sum.mul_f64(x).hi;
+    let (sf, cdf, pdf) = if step < 0 {
+        (1.0 - prob, prob, deriv)
+    } else {
+        (prob, 1.0 - prob, -deriv)
+    };
+    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(pdf))
+}
+
+/// (sf, cdf, pdf) of the Kolmogorov limit law: `scipy.special.kolmogorov`, `kolmogc` and
+/// `-kolmogp`, ported from xsf `cephes::detail::_kolmogorov`.
+fn ks_kolmogorov3(x: f64) -> (f64, f64, f64) {
+    use std::f64::consts::PI;
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    // x <= pi / sqrt(8 · 746): exp(-pi^2/8x^2) underflows.
+    if x <= 0.0 || x <= PI / f64::from(746 * 8).sqrt() {
+        return (1.0, 0.0, 0.0);
+    }
+    let mut p = 1.0_f64;
+    let mut d = 0.0_f64;
+    let (sf, cdf);
+    if x <= 0.82 {
+        // P = w u (1 + u^8 + u^24 + u^48 + ...), u = e^(-pi^2/8x^2), w = sqrt(2pi)/x
+        let w = (2.0 * PI).sqrt() / x;
+        let logu8 = -PI * PI / (x * x);
+        let u = (logu8 / 8.0).exp();
+        if u == 0.0 {
+            p = (logu8 / 8.0 + w.ln()).exp();
+        } else {
+            let u8 = logu8.exp();
+            let u8cub = u8.powf(3.0);
+            p = 1.0 + u8cub * p;
+            d = 5.0 * 5.0 + u8cub * d;
+            p = 1.0 + u8 * u8 * p;
+            d = 3.0 * 3.0 + u8 * u8 * d;
+            p = 1.0 + u8 * p;
+            d = 1.0 * 1.0 + u8 * d;
+            d = PI * PI / 4.0 / (x * x) * d - p;
+            d *= w * u / x;
+            p *= w * u;
+        }
+        cdf = p;
+        sf = 1.0 - p;
+    } else {
+        // P = 2 (v - v^4 + v^9 - ...), v = e^(-2x^2)
+        let v = (-2.0 * x * x).exp();
+        let vsq = v * v;
+        let v3 = v.powf(3.0);
+        let mut vpwr = v3 * v3 * v;
+        p = 1.0 - vpwr * p;
+        d = 3.0 * 3.0 - vpwr * d;
+        vpwr = v3 * vsq;
+        p = 1.0 - vpwr * p;
+        d = 2.0 * 2.0 - vpwr * d;
+        vpwr = v3;
+        p = 1.0 - vpwr * p;
+        d = 1.0 * 1.0 - vpwr * d;
+        p *= 2.0 * v;
+        d *= 8.0 * v * x;
+        sf = p;
+        cdf = 1.0 - sf;
+    }
+    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(d))
+}
+
+/// x with kolmogc(x) = p: `scipy.special._ufuncs._kolmogci`.
+fn ks_kolmogci(p: f64) -> f64 {
+    ks_kolmogi(1.0 - p, p)
+}
+
+/// x with kolmogorov(x) = psf and kolmogc(x) = pcdf (psf + pcdf = 1): xsf
+/// `cephes::detail::_kolmogi`, a bracketed Newton iteration.
+fn ks_kolmogi(psf: f64, pcdf: f64) -> f64 {
+    use std::f64::consts::{PI, SQRT_2};
+    #[allow(clippy::excessive_precision)]
+    const LOGSQRT2PI: f64 = 9.189_385_332_046_727_417_803_297e-1;
+    const XTOL: f64 = f64::EPSILON;
+    const RTOL: f64 = 2.0 * f64::EPSILON;
+    let within_tol = |x: f64, y: f64| (x - y).abs() <= XTOL + RTOL * y.abs();
+    if !((0.0..=1.0).contains(&psf) && (0.0..=1.0).contains(&pcdf))
+        || (1.0 - pcdf - psf).abs() > 4.0 * f64::EPSILON
+    {
+        return f64::NAN;
+    }
+    if pcdf == 0.0 {
+        return 0.0;
+    }
+    if psf == 0.0 {
+        return f64::INFINITY;
+    }
+    let (mut a, mut b, mut x);
+    if pcdf <= 0.5 {
+        // p ~ (sqrt(2pi)/x) exp(-pi^2/8x^2): two fixed-point steps for each bound.
+        let logpcdf = pcdf.ln();
+        let bound = |logx: f64| PI / (2.0 * SQRT_2 * (-(logpcdf + logx - LOGSQRT2PI)).sqrt());
+        a = bound(logpcdf / 2.0);
+        b = bound(0.0);
+        a = bound(a.ln());
+        b = bound(b.ln());
+        x = (a + b) / 2.0;
+    } else {
+        // p ~ 2 exp(-2x^2), inverted as a power series in p/2.
+        let jiggerb = 256.0 * f64::EPSILON;
+        let pba = psf / (1.0 - (-4.0_f64).exp()) / 2.0;
+        let pbb = psf * (1.0 - jiggerb) / 2.0;
+        a = (-0.5 * pba.ln()).sqrt();
+        b = (-0.5 * pbb.ln()).sqrt();
+        let ph = psf / 2.0;
+        let p2 = ph * ph;
+        let p3 = ph * ph * ph;
+        let q0 = (1.0
+            + p3 * (1.0 + p3 * (4.0 + p2 * (-1.0 + ph * (22.0 + p2 * (-13.0 + 140.0 * ph))))))
+            * ph;
+        x = (-q0.ln() / 2.0).sqrt();
+        if x < a || x > b {
+            x = (a + b) / 2.0;
+        }
+    }
+    for _ in 0..=500 {
+        let x0 = x;
+        let (sf_x, cdf_x, pdf_x) = ks_kolmogorov3(x0);
+        let df = if pcdf < 0.5 { pcdf - cdf_x } else { sf_x - psf };
+        if df == 0.0 {
+            break;
+        }
+        if df > 0.0 && x > a {
+            a = x;
+        } else if df < 0.0 && x < b {
+            b = x;
+        }
+        let dfdx = -pdf_x;
+        x = if dfdx.abs() <= 0.0 {
+            (a + b) / 2.0
+        } else {
+            x0 - df / dfdx
+        };
+        if x >= a && x <= b {
+            if within_tol(x, x0) {
+                break;
+            }
+            if x == a || x == b {
+                x = (a + b) / 2.0;
+                if x == a || x == b {
+                    break;
+                }
+            }
+        } else {
+            x = (a + b) / 2.0;
+            if within_tol(x, x0) {
+                break;
+            }
+        }
+    }
+    x
+}
+
+/// SciPy's `brentq` (`scipy/optimize/Zeros/brentq.c`, C. Harris), step for step. Returns NaN
+/// where SciPy raises: no sign change on the bracket, a NaN function value, or no
+/// convergence within `maxiter`.
+fn ks_brentq(
+    f: impl Fn(f64) -> f64,
+    xa: f64,
+    xb: f64,
+    xtol: f64,
+    rtol: f64,
+    maxiter: usize,
+) -> f64 {
+    let (mut xpre, mut xcur) = (xa, xb);
+    let (mut xblk, mut fblk, mut spre, mut scur) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut fpre = f(xpre);
+    let mut fcur = f(xcur);
+    if fpre.is_nan() || fcur.is_nan() {
+        return f64::NAN;
+    }
+    if fpre == 0.0 {
+        return xpre;
+    }
+    if fcur == 0.0 {
+        return xcur;
+    }
+    if fpre.is_sign_negative() == fcur.is_sign_negative() {
+        return f64::NAN;
+    }
+    for _ in 0..maxiter {
+        if fpre != 0.0 && fcur != 0.0 && fpre.is_sign_negative() != fcur.is_sign_negative() {
+            xblk = xpre;
+            fblk = fpre;
+            spre = xcur - xpre;
+            scur = spre;
+        }
+        if fblk.abs() < fcur.abs() {
+            xpre = xcur;
+            xcur = xblk;
+            xblk = xpre;
+            fpre = fcur;
+            fcur = fblk;
+            fblk = fpre;
+        }
+        let delta = (xtol + rtol * xcur.abs()) / 2.0;
+        let sbis = (xblk - xcur) / 2.0;
+        if fcur == 0.0 || sbis.abs() < delta {
+            return xcur;
+        }
+        if spre.abs() > delta && fcur.abs() < fpre.abs() {
+            let stry = if xpre == xblk {
+                // interpolate
+                -fcur * (xcur - xpre) / (fcur - fpre)
+            } else {
+                // extrapolate
+                let dpre = (fpre - fcur) / (xpre - xcur);
+                let dblk = (fblk - fcur) / (xblk - xcur);
+                -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))
+            };
+            let limit = if spre.abs() < 3.0 * sbis.abs() - delta {
+                spre.abs()
+            } else {
+                3.0 * sbis.abs() - delta
+            };
+            if 2.0 * stry.abs() < limit {
+                spre = scur;
+                scur = stry;
+            } else {
+                spre = sbis;
+                scur = sbis;
+            }
+        } else {
+            spre = sbis;
+            scur = sbis;
+        }
+        xpre = xcur;
+        fpre = fcur;
+        if scur.abs() > delta {
+            xcur += scur;
+        } else {
+            xcur += if sbis > 0.0 { delta } else { -delta };
+        }
+        fcur = f(xcur);
+        if fcur.is_nan() {
+            return f64::NAN;
+        }
+    }
+    f64::NAN
+}
+
 /// When `true`, [`ks_1samp`] computes its KS statistic serially (the ORIG behaviour); default `false`
 /// fans the independent per-point CDF evaluations + max reduction across cores for large inputs.
 /// Byte-identical. A/B knob.
@@ -44825,14 +45777,9 @@ pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessO
         parts.into_iter().fold(0.0_f64, nan_max)
     };
 
-    // scipy's two-sided ks_1samp uses the EXACT KS distribution for n ≤ 10000
-    // (method='auto'); only the n>140 Pelz-Good body falls back to the
-    // asymptotic Kolmogorov series. frankenscipy-ksk1u
-    let pvalue = if !d_stat.is_nan() && n <= 10_000 {
-        kolmogn_sf(n, d_stat).unwrap_or_else(|| kolmogorov_pvalue(d_stat, nf))
-    } else {
-        kolmogorov_pvalue(d_stat, nf)
-    };
+    // SciPy's two-sided ks_1samp (method='auto') always uses the exact law,
+    // `pvalue = kstwo.sf(D, n)`, for every n. frankenscipy-ksk1u, frankenscipy-1ksfv.16
+    let pvalue = kolmogn(n, d_stat, false);
 
     GoodnessOfFitResult {
         statistic: d_stat,
@@ -75280,6 +76227,775 @@ mod tests {
                 (pdf_l - pdf_s).abs() < 1e-12,
                 "pdf series disagree at x={x}: large={pdf_l}, small={pdf_s}, diff={}",
                 (pdf_l - pdf_s).abs()
+            );
+        }
+    }
+
+    /// `|got - want| <= tol·|want|`, and exact where `want` is 0 or 1.
+    fn assert_kstwo_rel(got: f64, want: f64, tol: f64, what: &str) {
+        if want == 0.0 || want == 1.0 {
+            assert!(
+                got == want,
+                "{what}: got {got:e}, expected exactly {want:e}"
+            );
+        } else {
+            assert!(
+                (got - want).abs() <= tol * want.abs(),
+                "{what}: got {got:e}, expected {want:e} (rel {:.2e}, tol {tol:.0e})",
+                (got - want).abs() / want.abs()
+            );
+        }
+    }
+
+    /// scipy.stats.kstwo, SciPy 1.17.1 (frankenscipy-1ksfv.16). Measured bit-identical;
+    /// asserted to 2 ulp. `kstwo(0)` cannot be frozen in SciPy and `kstwo.cdf(x, 0)` is NaN.
+    #[test]
+    fn kstwo_headline_values_match_scipy() -> Result<(), StatsError> {
+        let ten = Kstwo::new(10)?;
+        let ulp2 = 2.0 * f64::EPSILON;
+        assert_kstwo_rel(ten.cdf(0.3), 0.7294644252000005, ulp2, "kstwo.cdf(0.3, 10)");
+        assert_kstwo_rel(
+            ten.ppf(0.5),
+            0.24686329073080385,
+            ulp2,
+            "kstwo.ppf(0.5, 10)",
+        );
+        assert_kstwo_rel(ten.pdf(0.3), 3.4637450399714, ulp2, "kstwo.pdf(0.3, 10)");
+        assert_kstwo_rel(ten.median(), 0.24686329073080385, ulp2, "kstwo.median(10)");
+        assert_kstwo_rel(
+            Kstwo::new(20)?.sf(0.3),
+            0.04306706665851623,
+            ulp2,
+            "kstwo.sf(0.3, 20)",
+        );
+        assert_eq!(ten.support(), (0.05, 1.0), "kstwo.support(10)");
+        assert_eq!(ten.n(), 10);
+        assert!(matches!(Kstwo::new(0), Err(StatsError::InvalidArgument(_))));
+        // SciPy's rv_continuous ends: ppf(0) and isf(1) are the lower support edge.
+        assert_eq!((ten.ppf(0.0), ten.ppf(1.0)), (0.05, 1.0));
+        assert_eq!((ten.isf(0.0), ten.isf(1.0)), (1.0, 0.05));
+        assert!(ten.ppf(-0.1).is_nan() && ten.isf(1.5).is_nan() && ten.ppf(f64::NAN).is_nan());
+        assert!(
+            ten.cdf(f64::NAN).is_nan() && ten.sf(f64::NAN).is_nan() && ten.pdf(f64::NAN).is_nan()
+        );
+        Ok(())
+    }
+
+    /// `(n, x, kstwo.cdf(x, n), kstwo.sf(x, n))`, SciPy 1.17.1. Every n of the bead; x at the
+    /// support edge 1/2n, at 3/4n, 1/n and 1.5/n (Ruben–Gambino and its neighbour), 1/2 and
+    /// 1 - 1/n, at n·x² = 0.5, 2, 3, 10 (every `kolmogn` method: DMTW, Pomeranz, Pelz–Good,
+    /// 2·smirnov), and where sf ≈ 1e-10, 1e-20, 1e-30.
+    ///
+    /// Measured on these points: 170 of 176 bit-identical, worst relative difference 2.0e-15
+    /// (cdf) and 1.3e-13 (sf, where it is 1 - cdf of the Pomeranz CDF and SciPy's matmul
+    /// order differs). Tolerance 1e-12; 0 and 1 exactly.
+    #[test]
+    fn kstwo_cdf_sf_grid_matches_scipy() -> Result<(), StatsError> {
+        const GRID: [(usize, f64, f64, f64); 88] = [
+            (1, 0.5, 0.0, 1.0),
+            (
+                1,
+                0.7071067811865476,
+                0.41421356237309515,
+                0.5857864376269049,
+            ),
+            (1, 0.75, 0.5, 0.5),
+            (2, 0.25, 0.0, 1.0),
+            (2, 0.375, 0.125, 0.875),
+            (2, 0.5, 0.5, 0.5),
+            (2, 0.75, 0.875, 0.125),
+            (5, 0.1, 0.0, 1.0),
+            (5, 0.15, 0.0012000000000000005, 0.9988),
+            (5, 0.2, 0.03840000000000002, 0.9616),
+            (5, 0.3, 0.33599999999999997, 0.664),
+            (
+                5,
+                0.31622776601683794,
+                0.4001252938165754,
+                0.5998747061834246,
+            ),
+            (5, 0.5, 0.888, 0.112),
+            (
+                5,
+                0.6324555320336759,
+                0.9816016643558628,
+                0.018398335644137166,
+            ),
+            (
+                5,
+                0.7745966692414834,
+                0.9988330993602692,
+                0.0011669006397307495,
+            ),
+            (5, 0.8, 0.99936, 0.0006399999999999993),
+            (10, 0.05, 0.0, 1.0),
+            (10, 0.075, 3.543750000000003e-07, 0.999999645625),
+            (10, 0.1, 0.0003628800000000003, 0.99963712),
+            (10, 0.15, 0.04603473, 0.95396527),
+            (
+                10,
+                0.22360679774997896,
+                0.3769483199726603,
+                0.6230516800273397,
+            ),
+            (
+                10,
+                0.4472135954999579,
+                0.9757866372363937,
+                0.024213362763606305,
+            ),
+            (10, 0.5, 0.99222259, 0.00777741),
+            (
+                10,
+                0.5477225575051661,
+                0.9975803441442025,
+                0.002419655855797518,
+            ),
+            (10, 0.9, 0.9999999998, 1.9999999999999957e-10),
+            (20, 0.025, 0.0, 1.0),
+            (20, 0.0375, 2.2127114863693748e-14, 0.9999999999999779),
+            (20, 0.05, 2.3201961595312535e-08, 0.9999999767980384),
+            (20, 0.075, 0.0006186630064295565, 0.9993813369935705),
+            (
+                20,
+                0.15811388300841897,
+                0.3571180884786759,
+                0.6428819115213241,
+            ),
+            (
+                20,
+                0.31622776601683794,
+                0.9718459601234036,
+                0.02815403987659637,
+            ),
+            (
+                20,
+                0.3872983346207417,
+                0.9967234359225274,
+                0.0032765640774725657,
+            ),
+            (20, 0.5, 0.9999621240475947, 3.787595240539032e-05),
+            (
+                20,
+                0.7071067811865476,
+                0.9999999998624253,
+                1.3757474852040778e-10,
+            ),
+            (
+                20,
+                0.7700486690869026,
+                0.9999999999994125,
+                5.875829734552639e-13,
+            ),
+            (20, 0.95, 1.0, 1.9073486328125338e-26),
+            (100, 0.005, 0.0, 1.0),
+            (100, 0.0075, 7.362140279596113e-73, 1.0),
+            (100, 0.01, 9.332621544394438e-43, 1.0),
+            (100, 0.015, 9.479558244426184e-20, 1.0),
+            (
+                100,
+                0.07071067811865475,
+                0.32730992553281946,
+                0.6726900744671805,
+            ),
+            (
+                100,
+                0.1414213562373095,
+                0.966978708397777,
+                0.033021291602222995,
+            ),
+            (
+                100,
+                0.17320508075688773,
+                0.9957052952741073,
+                0.004294704725892679,
+            ),
+            (
+                100,
+                0.31622776601683794,
+                0.9999999978264121,
+                2.1735878868482512e-09,
+            ),
+            (
+                100,
+                0.34437623401231104,
+                0.9999999999572428,
+                4.275723083950648e-11,
+            ),
+            (100, 0.48345035443383877, 1.0, 4.891687769154079e-22),
+            (100, 0.5, 1.0, 1.2131434371817858e-23),
+            (100, 0.590638214012526, 1.0, 9.085769644882067e-34),
+            (100, 0.99, 1.0, 2.0000000000001775e-200),
+            (141, 0.0035460992907801418, 0.0, 1.0),
+            (141, 0.005319148936170213, 6.211619266380889e-103, 1.0),
+            (141, 0.0070921985815602835, 1.731546731623012e-60, 1.0),
+            (141, 0.010638297872340425, 5.86012458712038e-28, 1.0),
+            (
+                141,
+                0.05954913341754137,
+                0.323253586596061,
+                0.6767464134039389,
+            ),
+            (
+                141,
+                0.11909826683508273,
+                0.9663882216025402,
+                0.03361177839745977,
+            ),
+            (
+                141,
+                0.14586499149789456,
+                0.9955894286502954,
+                0.0044103835122001585,
+            ),
+            (
+                141,
+                0.26631182064565373,
+                0.9999999975264966,
+                2.560354084896187e-09,
+            ),
+            (
+                141,
+                0.2900171070431208,
+                0.9999999999508435,
+                5.3605782432509715e-11,
+            ),
+            (141, 0.40713864472674677, 1.0, 1.2263241585803237e-21),
+            (141, 0.4974071065859466, 1.0, 9.26529754982104e-33),
+            (141, 0.5, 1.0, 4.034017661079683e-33),
+            (141, 0.9929078014184397, 1.0, 1.8244632139623947e-303),
+            (1000, 0.0005, 0.0, 1.0),
+            (1000, 0.00075, 0.0, 1.0),
+            (1000, 0.001, 0.0, 1.0),
+            (1000, 0.0015, 4.426367026531291e-201, 1.0),
+            (
+                1000,
+                0.022360679774997897,
+                0.3093205758896512,
+                0.6906794241103489,
+            ),
+            (
+                1000,
+                0.044721359549995794,
+                0.9644770888674792,
+                0.03552291113252082,
+            ),
+            (
+                1000,
+                0.05477225575051661,
+                0.9952331435452236,
+                0.004766852502767219,
+            ),
+            (1000, 0.1, 0.9999999962983148, 3.703687096817711e-09),
+            (
+                1000,
+                0.10890132715100492,
+                0.9999999999123387,
+                8.776845364022322e-11,
+            ),
+            (1000, 0.15288042556266132, 1.0, 7.13197291254064e-21),
+            (1000, 0.18677620294135613, 1.0, 5.1620431121308565e-31),
+            (1000, 0.5, 1.0, 1.064517291557782e-231),
+            (1000, 0.999, 1.0, 0.0),
+            (100000, 5e-06, 0.0, 1.0),
+            (100000, 7.5e-06, 0.0, 1.0),
+            (100000, 1e-05, 0.0, 1.0),
+            (100000, 1.5e-05, 0.0, 1.0),
+            (
+                100000,
+                0.00223606797749979,
+                0.30150625406351494,
+                0.698493745936485,
+            ),
+            (
+                100000,
+                0.00447213595499958,
+                0.963478320505348,
+                0.036521679494652015,
+            ),
+            (
+                100000,
+                0.005477225575051661,
+                0.9950606968279061,
+                0.0049393032460430366,
+            ),
+            (100000, 0.01, 0.9999999959067223, 4.093278023549254e-09),
+            (
+                100000,
+                0.010890132715100491,
+                0.9999999999007806,
+                9.921978096088987e-11,
+            ),
+            (100000, 0.015288042556266132, 1.0, 9.875609454851835e-21),
+            (100000, 0.018677620294135614, 1.0, 9.824479607961967e-31),
+            (100000, 0.5, 1.0, 0.0),
+            (100000, 0.99999, 1.0, 0.0),
+        ];
+        for (n, x, cdf, sf) in GRID {
+            let d = Kstwo::new(n)?;
+            assert_kstwo_rel(d.cdf(x), cdf, 1e-12, &format!("kstwo.cdf({x:e}, {n})"));
+            assert_kstwo_rel(d.sf(x), sf, 1e-12, &format!("kstwo.sf({x:e}, {n})"));
+        }
+        Ok(())
+    }
+
+    /// `(n, x, kstwo.pdf(x, n))`, SciPy 1.17.1, on the points of the cdf grid plus x = 0.3
+    /// (0.7 for n < 5). On the Ruben–Gambino edges and for x ≥ 1/2 SciPy's pdf is a closed
+    /// form (measured bit-identical; tolerance 4 ulp). Elsewhere it is a 5-point central
+    /// difference of the CDF with step δ = min(x/2^16, x - 1/n, 1/2 - x): the two CDFs differ
+    /// by an ulp or two and the quotient scales that by 1/δ. Measured worst there is exactly
+    /// 1.0·eps/δ; tolerance 4·eps/δ.
+    #[test]
+    fn kstwo_pdf_matches_scipy() -> Result<(), StatsError> {
+        const PDF: [(usize, f64, f64); 96] = [
+            (1, 0.5, 0.0),
+            (1, 0.7, 2.0),
+            (1, 0.7071067811865476, 2.0),
+            (1, 0.75, 2.0),
+            (2, 0.25, 0.0),
+            (2, 0.375, 2.0),
+            (2, 0.5, 4.0),
+            (2, 0.7, 1.2000000000000002),
+            (2, 0.75, 1.0),
+            (5, 0.1, 0.0),
+            (5, 0.15, 0.12000000000000005),
+            (5, 0.2, 1.9200000000000008),
+            (5, 0.3, 3.936000000009396),
+            (5, 0.31622776601683794, 3.951600846789102),
+            (5, 0.5, 1.326),
+            (5, 0.6324555320336759, 0.2935920383377193),
+            (5, 0.7745966692414834, 0.026316938422146333),
+            (5, 0.8, 0.015999999999999986),
+            (10, 0.05, 0.0),
+            (10, 0.075, 0.0001417500000000001),
+            (10, 0.1, 0.07257600000000006),
+            (10, 0.15, 2.42698680000179),
+            (10, 0.22360679774997896, 5.4029183366261355),
+            (10, 0.3, 3.4637450399714),
+            (10, 0.4472135954999579, 0.48597290560795886),
+            (10, 0.5, 0.17918018),
+            (10, 0.5477225575051661, 0.06274698408281501),
+            (10, 0.9, 1.999999999999996e-08),
+            (20, 0.025, 0.0),
+            (20, 0.0375, 3.5403383781909997e-11),
+            (20, 0.05, 1.8561569276250028e-05),
+            (20, 0.075, 0.13771367147841218),
+            (20, 0.15811388300841897, 7.617118475791654),
+            (20, 0.3, 1.0964841203895048),
+            (20, 0.31622776601683794, 0.7582389319312992),
+            (20, 0.3872983346207417, 0.11037196611624621),
+            (20, 0.5, 0.0017357691884712578),
+            (20, 0.7071067811865476, 1.0820302330420871e-08),
+            (20, 0.7700486690869026, 5.629843934118822e-11),
+            (20, 0.95, 7.629394531250128e-24),
+            (100, 0.005, 0.0),
+            (100, 0.0075, 2.944856111838445e-68),
+            (100, 0.01, 1.8665243088788874e-38),
+            (100, 0.015, 5.497466687728451e-16),
+            (100, 0.07071067811865475, 16.876153586409945),
+            (100, 0.1414213562373095, 1.9029795350318561),
+            (100, 0.17320508075688773, 0.3038678309517657),
+            (100, 0.3, 2.2256760227416334e-06),
+            (100, 0.31622776601683794, 2.891317973778561e-07),
+            (100, 0.34437623401231104, 6.2697137861486255e-09),
+            (100, 0.48345035443383877, 5.643773099544151e-12),
+            (100, 0.5, 2.7693233299033547e-21),
+            (100, 0.590638214012526, 2.6197946917281326e-31),
+            (100, 0.99, 2.000000000000176e-196),
+            (141, 0.0035460992907801418, 0.0),
+            (141, 0.005319148936170213, 4.9397281053967476e-98),
+            (141, 0.0070921985815602835, 6.88497611427942e-56),
+            (141, 0.010638297872340425, 6.776310692715603e-24),
+            (141, 0.05954913341754137, 20.014594779755498),
+            (141, 0.11909826683508273, 2.291152715873833),
+            (141, 0.14586499149789456, 0.36875196685662287),
+            (141, 0.26631182064565373, 3.88486925043919e-07),
+            (141, 0.2900171070431208, 8.511113864206367e-09),
+            (141, 0.3, 1.546140993013978e-09),
+            (141, 0.40713864472674677, 6.701609244560956e-12),
+            (141, 0.4974071065859466, 5.4854144003817764e-12),
+            (141, 0.5, 1.2980697810820992e-30),
+            (141, 0.9929078014184397, 3.627215315678632e-299),
+            (1000, 0.0005, 0.0),
+            (1000, 0.00075, 0.0),
+            (1000, 0.001, 0.0),
+            (1000, 0.0015, 2.5903128636230137e-195),
+            (1000, 0.022360679774997897, 53.0615385129308),
+            (1000, 0.044721359549995794, 6.382390553134707),
+            (1000, 0.05477225575051661, 1.0487155976089657),
+            (1000, 0.1, 1.4897523215040565e-06),
+            (1000, 0.10890132715100492, 3.8550747297711846e-08),
+            (1000, 0.15288042556266132, 1.784717759174772e-11),
+            (1000, 0.18677620294135613, 1.460830695961558e-11),
+            (1000, 0.3, 9.094947017729282e-12),
+            (1000, 0.5, 2.4279570877941085e-228),
+            (1000, 0.999, 0.0),
+            (100000, 5e-06, 0.0),
+            (100000, 7.5e-06, 0.0),
+            (100000, 1e-05, 0.0),
+            (100000, 1.5e-05, 0.0),
+            (100000, 0.00223606797749979, 529.1777040662653),
+            (100000, 0.00447213595499958, 65.35555643047705),
+            (100000, 0.005477225575051661, 10.824883779171103),
+            (100000, 0.01, 1.6377725842176005e-05),
+            (100000, 0.010890132715100491, 4.3336184516426947e-07),
+            (100000, 0.015288042556266132, 1.7847177591747723e-10),
+            (100000, 0.018677620294135614, 1.460830695961558e-10),
+            (100000, 0.3, 9.094947017729282e-12),
+            (100000, 0.5, 0.0),
+            (100000, 0.99999, 0.0),
+        ];
+        for (n, x, want) in PDF {
+            let got = Kstwo::new(n)?.pdf(x);
+            let nf = n as f64;
+            let t = nf * x;
+            let tol = if t > 1.0 && t < nf - 1.0 && x < 0.5 {
+                4.0 * f64::EPSILON / (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x)
+            } else {
+                4.0 * f64::EPSILON * want.abs()
+            };
+            assert!(
+                (got - want).abs() <= tol,
+                "kstwo.pdf({x:e}, {n}): got {got:e}, expected {want:e} (diff {:.2e}, tol {tol:.2e})",
+                (got - want).abs()
+            );
+        }
+        Ok(())
+    }
+
+    /// ppf: `(n, q, kstwo.ppf(q, n))`, SciPy 1.17.1; measured worst relative difference
+    /// 6.9e-15 (41 of 45 bit-identical), tolerance 1e-13.
+    ///
+    /// isf: for q ≥ 1/2 the reference is `kstwo.isf(q, n)`. For q < 1/2 it is the root of
+    /// SciPy's own `kstwo.sf(x, n) = q` found by SciPy's `brentq` (xtol 1e-300, rtol 4·eps),
+    /// because `kstwo.isf` itself inverts the CDF at 1 - q and its x misses the root of its
+    /// own sf by 9.3e-7 (relative; n = 141, q = 1e-3) and 1.5e-3 (n = 141, q = 1e-10), and it
+    /// answers 0.99 for (n = 100, q = 1e-20) where the root is 0.4694. Measured worst 1.3e-13;
+    /// tolerance 1e-12. Both directions also round-trip through cdf/sf to within what the x
+    /// rounding (brentq xtol 1e-14 plus an ulp) moves them: (2e-14 + 4·eps·x)·pdf(x)/q.
+    #[test]
+    fn kstwo_ppf_isf_match_scipy_and_round_trip() -> Result<(), StatsError> {
+        const PPF: [(usize, f64, f64); 45] = [
+            (1, 1e-10, 0.50000000005),
+            (1, 0.01, 0.505),
+            (1, 0.5, 0.75),
+            (1, 0.9, 0.95),
+            (1, 0.99, 0.995),
+            (2, 1e-10, 0.2500035355339059),
+            (2, 0.01, 0.28535533905932736),
+            (2, 0.5, 0.5),
+            (2, 0.9, 0.7763932022500211),
+            (2, 0.99, 0.9292893218813452),
+            (5, 1e-10, 0.1019192597481869),
+            (5, 0.01, 0.17640710679078997),
+            (5, 0.5, 0.3419118604444544),
+            (5, 0.9, 0.5094493282201105),
+            (5, 0.99, 0.6685311015147539),
+            (10, 1e-10, 0.06104062606603004),
+            (10, 0.01, 0.1272582296994841),
+            (10, 0.5, 0.24686329073080385),
+            (10, 0.9, 0.36866167417172396),
+            (10, 0.99, 0.48893165941109124),
+            (20, 1e-10, 0.044039860999449586),
+            (20, 0.01, 0.09183952886231248),
+            (20, 0.5, 0.17734150203326088),
+            (20, 0.9, 0.2647305721955971),
+            (20, 0.99, 0.35241089163889466),
+            (100, 1e-10, 0.020636199618185313),
+            (100, 0.01, 0.04258351033765298),
+            (100, 0.5, 0.08114721899006636),
+            (100, 0.9, 0.12066340877827493),
+            (100, 0.99, 0.16080868092855588),
+            (141, 1e-10, 0.017531798442713117),
+            (141, 0.01, 0.036047675409580496),
+            (141, 0.5, 0.06854593312811394),
+            (141, 0.9, 0.10185176534199158),
+            (141, 0.99, 0.13571749333517924),
+            (1000, 1e-10, 0.006804232675149381),
+            (1000, 0.01, 0.013784616615373639),
+            (1000, 0.5, 0.026005301564520387),
+            (1000, 0.9, 0.03853304260042531),
+            (1000, 0.99, 0.05129418752666127),
+            (100000, 1e-10, 0.000694472878843657),
+            (100000, 0.01, 0.0013929901816356212),
+            (100000, 0.5, 0.0026153524979369023),
+            (100000, 0.9, 0.003868478341244626),
+            (100000, 0.99, 0.005145321961471824),
+        ];
+        const ISF: [(usize, f64, f64); 58] = [
+            (1, 0.99, 0.505),
+            (1, 0.5, 0.75),
+            (1, 0.1, 0.95),
+            (1, 0.001, 0.9995),
+            (2, 0.99, 0.28535533905932736),
+            (2, 0.5, 0.5),
+            (2, 0.1, 0.7763932022500211),
+            (2, 0.001, 0.9776393202250021),
+            (2, 1e-10, 0.9999929289321882),
+            (5, 0.99, 0.17640710679078997),
+            (5, 0.5, 0.3419118604444544),
+            (5, 0.1, 0.5094493282201105),
+            (5, 0.001, 0.7813687768563802),
+            (5, 1e-10, 0.9912944943670388),
+            (5, 1e-20, 0.9999129449436706),
+            (5, 1e-30, 0.9999991294494367),
+            (10, 0.99, 0.12725822969948414),
+            (10, 0.5, 0.24686329073080385),
+            (10, 0.1, 0.3686616741717244),
+            (10, 0.001, 0.5804173076502123),
+            (10, 1e-10, 0.9066967008463193),
+            (10, 1e-20, 0.9906696700846319),
+            (10, 1e-30, 0.999066967008463),
+            (20, 0.99, 0.09183952886231249),
+            (20, 0.5, 0.17734150203326088),
+            (20, 0.1, 0.264730572195597),
+            (20, 0.001, 0.42085118898477314),
+            (20, 1e-10, 0.7111391015548139),
+            (20, 1e-20, 0.9034072379706929),
+            (20, 1e-30, 0.969454411258959),
+            (100, 0.99, 0.04258351033765298),
+            (100, 0.5, 0.08114721899006636),
+            (100, 0.1, 0.12066340877827346),
+            (100, 0.001, 0.1926841642763453),
+            (100, 1e-10, 0.3385080774348269),
+            (100, 1e-20, 0.46938222632910426),
+            (100, 1e-30, 0.5655584108139194),
+            (141, 0.99, 0.036047675409580496),
+            (141, 0.5, 0.06854593312811394),
+            (141, 0.1, 0.10185176534199156),
+            (141, 0.001, 0.16263697830922436),
+            (141, 1e-10, 0.28633637467734935),
+            (141, 1e-20, 0.39862411005501386),
+            (141, 1e-30, 0.4824689984213987),
+            (1000, 0.99, 0.01378461661537364),
+            (1000, 0.5, 0.026005301564520387),
+            (1000, 0.1, 0.03853304260042531),
+            (1000, 0.001, 0.061462226219893994),
+            (1000, 1e-10, 0.10860338279506067),
+            (1000, 1e-20, 0.15233297955361028),
+            (1000, 1e-30, 0.18590350211485884),
+            (100000, 0.99, 0.0013929901816356212),
+            (100000, 0.5, 0.0026153524979369023),
+            (100000, 0.1, 0.0038684783412446275),
+            (100000, 0.001, 0.006163094369922933),
+            (100000, 1e-10, 0.010888334794141518),
+            (100000, 1e-20, 0.015285995978376566),
+            (100000, 1e-30, 0.01867525051424361),
+        ];
+        let round_trip_tol = |d: &Kstwo, x: f64, q: f64| {
+            1e-12 + (2e-14 + 4.0 * f64::EPSILON * x) * d.pdf(x).abs() / q
+        };
+        for (n, q, want) in PPF {
+            let d = Kstwo::new(n)?;
+            let x = d.ppf(q);
+            assert_kstwo_rel(x, want, 1e-13, &format!("kstwo.ppf({q:e}, {n})"));
+            let back = d.cdf(x);
+            assert!(
+                (back - q).abs() <= round_trip_tol(&d, x, q) * q,
+                "cdf(ppf({q:e})) = {back:e} for n = {n}"
+            );
+        }
+        for (n, q, want) in ISF {
+            let d = Kstwo::new(n)?;
+            let x = d.isf(q);
+            assert_kstwo_rel(x, want, 1e-12, &format!("kstwo.isf({q:e}, {n})"));
+            let back = d.sf(x);
+            assert!(
+                (back - q).abs() <= round_trip_tol(&d, x, q) * q,
+                "sf(isf({q:e})) = {back:e} for n = {n}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mean and variance. SciPy's `kstwo.mean` integrates x·pdf with the pdf a finite
+    /// difference of the CDF and is off in the 7th to 10th digit; the references here are
+    /// exact: n = 1 is uniform on [1/2, 1]; n = 2..20 are mpmath (40 digits) Gauss–Legendre
+    /// integrals of 1 - cdf with the Pomeranz CDF in exact arithmetic, piecewise between the
+    /// knots k/2n (converged: degree 6 and 7 agree to all digits); n ≥ 100 are live
+    /// `scipy.integrate.quad(1 - _kolmogn(n, x), points = knots and method switches,
+    /// epsrel = 1e-14)` of SciPy's own CDF. Measured worst relative difference 2.5e-14;
+    /// tolerance 1e-12. SciPy's `kstwo.stats(n, 'mv')` is also checked, to its own measured
+    /// error (worst: var at n = 141, 2.9e-5 relative).
+    #[test]
+    fn kstwo_mean_var_match_exact_integrals() -> Result<(), StatsError> {
+        // (n, exact mean, exact var, scipy mean, scipy var, scipy's relative error bound)
+        const MOMENTS: [(usize, f64, f64, f64, f64, f64); 10] = [
+            (1, 0.75, 1.0 / 48.0, 0.75, 0.02083333333333337, 1e-14),
+            (
+                2,
+                13.0 / 24.0,
+                7.0 / 288.0,
+                0.5416666666666666,
+                0.024305555555555525,
+                1e-14,
+            ),
+            (
+                3,
+                0.4521604938271605,
+                0.018493274653254076,
+                0.4521602111730302,
+                0.018493529226721594,
+                2e-5,
+            ),
+            (
+                5,
+                0.3583386666666667,
+                0.011997285685841269,
+                0.3583385977550372,
+                0.01199732935614592,
+                1e-5,
+            ),
+            (
+                10,
+                0.259193114905,
+                0.006375655442845361,
+                0.25919311741328144,
+                0.006375656177625533,
+                1e-6,
+            ),
+            (
+                20,
+                0.186328979779269,
+                0.003286912406329235,
+                0.18632897966055004,
+                0.003286913160728565,
+                1e-6,
+            ),
+            (
+                100,
+                0.08524354134404581,
+                0.0006735696142652053,
+                0.0852435413708329,
+                0.0006735696121693939,
+                1e-8,
+            ),
+            (
+                141,
+                0.07200051989416156,
+                0.0004785612816561582,
+                0.07200066194571433,
+                0.0004785473893618025,
+                5e-5,
+            ),
+            (
+                1000,
+                0.02730620825518912,
+                6.7731022937035e-05,
+                0.027306207865352792,
+                6.77310395342664e-05,
+                1e-6,
+            ),
+            (
+                100000,
+                0.002745503663194748,
+                6.77727797599271e-07,
+                0.0027455036644474648,
+                6.77728131589263e-07,
+                1e-6,
+            ),
+        ];
+        for (n, mean, var, sp_mean, sp_var, sp_tol) in MOMENTS {
+            let d = Kstwo::new(n)?;
+            let (m, v) = (d.mean(), d.var());
+            assert_kstwo_rel(m, mean, 1e-12, &format!("kstwo.mean({n})"));
+            assert_kstwo_rel(v, var, 1e-12, &format!("kstwo.var({n})"));
+            if n <= 20 {
+                // std is sqrt(var); one integration per call, so checked where it is cheap.
+                assert_kstwo_rel(d.std(), var.sqrt(), 1e-12, &format!("kstwo.std({n})"));
+            }
+            assert_kstwo_rel(m, sp_mean, sp_tol, &format!("scipy kstwo.mean({n})"));
+            assert_kstwo_rel(v, sp_var, sp_tol, &format!("scipy kstwo.var({n})"));
+        }
+        Ok(())
+    }
+
+    /// What a naive Kstwo gets wrong. (a) The old `Kstwo = KsTwoBign` alias: kstwobign is the
+    /// law of √n·D_n as n → ∞, and kstwobign.cdf(0.3) = 9.306e-06 against
+    /// kstwo.cdf(0.3, 10) = 0.7295. (b) sf as 1 - cdf: at n = 20, x = 0.9 the CDF rounds to 1
+    /// while kstwo.sf = 2·smirnov(20, 0.9) = 2.0e-20; at n = 1000, x = 0.2 it is 1.6e-35.
+    /// (c) Below the support edge 1/2n (and at it) the CDF is exactly 0 and the pdf 0, where
+    /// the Ruben–Gambino product n!/n^n·(2nx - 1)^n is not: at n = 10, x = 0.02 it is 2.2e-6.
+    #[test]
+    fn kstwo_negative_cases_a_naive_law_gets_wrong() -> Result<(), StatsError> {
+        let ten = Kstwo::new(10)?;
+        let bign = KsTwoBign.cdf(0.3);
+        assert!(
+            (bign - 9.305801334566636e-06).abs() <= 1e-15,
+            "kstwobign.cdf(0.3) = {bign:e}"
+        );
+        assert_kstwo_rel(
+            ten.cdf(0.3),
+            0.7294644252000005,
+            1e-15,
+            "kstwo.cdf(0.3, 10)",
+        );
+        assert!(
+            ten.cdf(0.3) / bign > 7e4,
+            "Kstwo must not be the n -> inf limit"
+        );
+
+        let twenty = Kstwo::new(20)?;
+        assert_eq!(1.0 - twenty.cdf(0.9), 0.0, "1 - cdf cancels here");
+        assert_kstwo_rel(
+            twenty.sf(0.9),
+            2.0006866455078037e-20,
+            1e-14,
+            "kstwo.sf(0.9, 20)",
+        );
+        let thousand = Kstwo::new(1000)?;
+        assert_eq!(1.0 - thousand.cdf(0.2), 0.0, "1 - cdf cancels here");
+        assert_kstwo_rel(
+            thousand.sf(0.2),
+            1.5528629204250538e-35,
+            1e-12,
+            "kstwo.sf(0.2, 1000)",
+        );
+
+        for x in [0.0, 0.01, 0.02, 0.05] {
+            assert_eq!(ten.cdf(x), 0.0, "kstwo.cdf({x}, 10)");
+            assert_eq!(ten.sf(x), 1.0, "kstwo.sf({x}, 10)");
+            assert_eq!(ten.pdf(x), 0.0, "kstwo.pdf({x}, 10)");
+            assert_eq!(ten.logcdf(x), f64::NEG_INFINITY, "kstwo.logcdf({x}, 10)");
+        }
+        assert_eq!((ten.cdf(1.5), ten.sf(1.5), ten.pdf(1.5)), (1.0, 0.0, 0.0));
+        assert_eq!(
+            (ten.cdf(-0.5), ten.sf(-0.5), ten.pdf(-0.5)),
+            (0.0, 1.0, 0.0)
+        );
+        // isf through ppf(1 - q): 1 - 1e-20 rounds to 1, so that answer is the upper edge.
+        let hundred = Kstwo::new(100)?;
+        assert_eq!(hundred.ppf(1.0 - 1e-20), 1.0);
+        assert_kstwo_rel(
+            hundred.isf(1e-20),
+            0.46938222632910426,
+            1e-12,
+            "kstwo isf(1e-20, 100)",
+        );
+        Ok(())
+    }
+
+    /// SciPy 1.17.1 `ks_1samp` always takes the exact law: `pvalue = kstwo.sf(D, n)` for every
+    /// n (`if mode == 'auto': mode = 'exact'`). Before frankenscipy-1ksfv.16 fsci used the
+    /// asymptotic Kolmogorov series above n = 10000 and `fsci_special::smirnov`, which is
+    /// exp(-2 n d²) from n = 1000 on. Data x_i = (i + 1/2)/n + shift against the uniform CDF;
+    /// statistic and p-value from `scipy.stats.ks_1samp(x, uniform.cdf)`, measured
+    /// bit-identical. The old code gave 0.0013236624257262728 and 0.006152616450366392.
+    #[test]
+    fn ks_1samp_pvalue_is_scipy_kstwo_sf_for_every_n() {
+        for (n, shift, d_want, p_want) in [
+            (1000_usize, 0.06, 0.06050000000000011, 0.0012657830219129972),
+            (20000, 0.012, 0.012025000000000063, 0.0061027461978601935),
+        ] {
+            let nf = n as f64;
+            let data: Vec<f64> = (0..n).map(|i| (i as f64 + 0.5) / nf + shift).collect();
+            let r = ks_1samp(&data, |x| x.clamp(0.0, 1.0));
+            assert_eq!(r.statistic, d_want, "ks_1samp statistic, n = {n}");
+            assert_kstwo_rel(
+                r.pvalue,
+                p_want,
+                1e-14,
+                &format!("ks_1samp pvalue, n = {n}"),
             );
         }
     }

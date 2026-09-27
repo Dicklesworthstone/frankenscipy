@@ -99,13 +99,6 @@ bead = "frankenscipy-1ksfv"
 
 [[entry]]
 module = "scipy.stats"
-name = "kstwo"
-disposition = "missing"
-reason = "finite-n Kolmogorov-Smirnov law; the alias to the n -> inf KsTwoBign was removed"
-bead = "frankenscipy-szq1n.2"
-
-[[entry]]
-module = "scipy.stats"
 name = "landau"
 disposition = "missing"
 reason = "the alias to Moyal (a different density) was removed"

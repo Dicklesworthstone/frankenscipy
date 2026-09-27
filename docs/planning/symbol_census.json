@@ -1171,9 +1171,9 @@
    "applicable": 303,
    "compared": 235,
    "crate": "fsci-stats",
-   "declared": 295,
+   "declared": 296,
    "matched_by": {
-    "case_fold": 101,
+    "case_fold": 102,
     "exact": 152,
     "reexport": 0,
     "trait": 0,
@@ -1181,13 +1181,12 @@
    },
    "na": 0,
    "not_real": {
-    "kstwo": "missing: finite-n Kolmogorov-Smirnov law; the alias to the n -> inf KsTwoBign was removed (frankenscipy-szq1n.2)",
     "landau": "missing: the alias to Moyal (a different density) was removed (frankenscipy-szq1n.2)",
     "levy_stable": "missing: needs (alpha, beta) stable laws; the alias to Levy was removed (frankenscipy-szq1n.2)",
     "make_distribution": "missing: needs a generic user-defined distribution mechanism (frankenscipy-1ksfv)",
     "vonmises_line": "missing: support [-pi, pi]; the alias to the periodic VonMises was removed (frankenscipy-szq1n.2)"
    },
-   "real": 298,
+   "real": 299,
    "real_not_compared": [
     "Binomial",
     "CensoredData",
@@ -1222,6 +1221,7 @@
     "goodness_of_fit",
     "jf_skew_t",
     "ksone",
+    "kstwo",
     "log",
     "logrank",
     "mode",
@@ -1380,16 +1380,16 @@
  "total": {
   "applicable": 1539,
   "compared": 822,
-  "declared": 1455,
+  "declared": 1456,
   "matched_by": {
-   "case_fold": 126,
+   "case_fold": 127,
    "exact": 1257,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1479,
+  "real": 1480,
   "scipy": 1555
  }
 }
