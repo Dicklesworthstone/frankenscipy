@@ -72,6 +72,10 @@ pub const GAMMA_DISPATCH_PLAN: &[DispatchPlan] = &[
         function: "gammainc",
         steps: &[
             DispatchStep {
+                regime: KernelRegime::Asymptotic,
+                when: "SciPy's Temme zones (20 < a < 200, |x-a|/a < 0.3; a > 200, |x-a|/a < 4.5/sqrt(a))",
+            },
+            DispatchStep {
                 regime: KernelRegime::Series,
                 when: "x < a + 1 via stable lower-tail expansion",
             },
@@ -85,6 +89,10 @@ pub const GAMMA_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
         function: "gammaincc",
         steps: &[
+            DispatchStep {
+                regime: KernelRegime::Asymptotic,
+                when: "SciPy's Temme zones, summed directly for Q (not as 1 - P)",
+            },
             DispatchStep {
                 regime: KernelRegime::Series,
                 when: "complement from lower-tail expansion",
@@ -2515,6 +2523,14 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
         return Ok((1.0, 0.0));
     }
 
+    // SciPy's Temme zones, 20 < a < 200 with |x − a|/a < 0.3 and a > 200 with
+    // |x − a|/a < 4.5/√a, take Temme's uniform expansion exactly as SciPy's `igam` and `igamc`
+    // do (frankenscipy-6fpkm; see `crate::igam_temme`). Everything outside them runs the
+    // series and continued fraction below, unchanged.
+    if let Some(pair) = crate::igam_temme::igam_igamc_asymptotic(a, x) {
+        return Ok(pair);
+    }
+
     const EPS: f64 = 1.0e-14;
     const FPMIN: f64 = 1.0e-300;
 
@@ -2536,6 +2552,10 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
     // about 1e-14·√a/6, the uncompensated sum of ~8√a terms drifted by up to 8e-12 at
     // a = 1e12, and from a ≈ 2.8e10 the 2,000,000 cap cut the series off. Below the gate the
     // old code runs unchanged.
+    //
+    // Since frankenscipy-6fpkm the table's points from a = 1e4 up, and all but x = a ± 3√a
+    // at a = 100, are inside SciPy's Temme zones and are answered above; the table records
+    // this series and continued fraction, which still serve everything outside the zones.
     let large = a >= SADDLE_POINT_MIN_SHAPE;
     let prefactor = if large {
         a * poisson_term(a, x)
