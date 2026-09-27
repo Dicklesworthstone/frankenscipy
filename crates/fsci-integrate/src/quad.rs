@@ -4055,25 +4055,29 @@ pub fn trapezoid_richardson(y: &[f64], x: &[f64]) -> f64 {
     (4.0 * t1 - t2) / 3.0
 }
 
-/// Compute the cumulative integral using the trapezoidal rule
-/// with initial value specification.
+/// Compute the cumulative integral using the trapezoidal rule, with SciPy's `initial` argument:
+/// one entry per sample, `initial` first.
 ///
-/// Matches `scipy.integrate.cumulative_trapezoid` with initial=0.
-pub fn cumulative_trapezoid_initial(y: &[f64], x: &[f64], initial: f64) -> Vec<f64> {
-    let n = y.len();
-    if n < 2 || x.len() != n || !initial.is_finite() {
-        return vec![initial; n];
+/// Matches `scipy.integrate.cumulative_trapezoid(y, x, initial=initial)`. Since SciPy 1.12 the
+/// only accepted value is 0 (`initial=None` is [`cumulative_trapezoid`]); any other value, NaN
+/// included, raises `ValueError: initial must be None or 0`, and so does this function. A signed
+/// zero is kept as given, as SciPy's `np.full` keeps it. The inputs are validated exactly as
+/// [`cumulative_trapezoid`] validates them.
+pub fn cumulative_trapezoid_initial(
+    y: &[f64],
+    x: &[f64],
+    initial: f64,
+) -> Result<Vec<f64>, IntegrateValidationError> {
+    if initial != 0.0 {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: format!("`initial` must be None or 0, got {initial}"),
+        });
     }
-
-    let mut result = Vec::with_capacity(n);
+    let integral = cumulative_trapezoid(y, x)?;
+    let mut result = Vec::with_capacity(integral.len() + 1);
     result.push(initial);
-    let mut cumsum = initial;
-    for i in 1..n {
-        cumsum += 0.5 * (y[i] + y[i - 1]) * (x[i] - x[i - 1]);
-        result.push(cumsum);
-    }
-
-    result
+    result.extend(integral);
+    Ok(result)
 }
 
 /// Gauss-Legendre quadrature with specified number of points.
@@ -6873,10 +6877,39 @@ mod tests {
         }
     }
 
+    /// SciPy 1.17.1 `cumulative_trapezoid(y, x, initial=v)` raises `ValueError: initial must be
+    /// None or 0` for every v other than 0, and `At least one point is required` for an empty y.
+    /// With initial=0 it prepends that zero (sign kept) to `cumulative_trapezoid(y, x)`.
     #[test]
-    fn cumulative_trapezoid_initial_empty_input_stays_empty() {
-        let result = cumulative_trapezoid_initial(&[], &[], f64::NAN);
-        assert!(result.is_empty());
+    fn cumulative_trapezoid_initial_accepts_only_zero_like_scipy() {
+        let y = [1.0, 2.0, 4.0, 7.0];
+        let x = [0.0, 1.0, 1.5, 3.0];
+        for initial in [5.0, -3.0, 1e-300, f64::NAN, f64::INFINITY] {
+            let err = cumulative_trapezoid_initial(&y, &x, initial)
+                .expect_err("SciPy raises for a nonzero initial");
+            assert!(matches!(
+                err,
+                IntegrateValidationError::QuadInvalidBounds { .. }
+            ));
+        }
+        // SciPy: [0.0, 1.5, 3.0, 11.25].
+        let tail = cumulative_trapezoid(&y, &x).expect("valid samples");
+        for initial in [0.0, -0.0] {
+            let got = cumulative_trapezoid_initial(&y, &x, initial).expect("initial = 0");
+            assert_eq!(got.len(), y.len());
+            assert_eq!(got[0].to_bits(), initial.to_bits());
+            assert_eq!(&got[1..], tail.as_slice());
+        }
+        assert_eq!(
+            cumulative_trapezoid_initial(&y, &x, 0.0).expect("initial = 0"),
+            vec![0.0, 1.5, 3.0, 11.25]
+        );
+        assert_eq!(
+            cumulative_trapezoid_initial(&[2.0], &[0.0], 0.0).expect("one sample"),
+            vec![0.0]
+        );
+        assert!(cumulative_trapezoid_initial(&[], &[], 0.0).is_err());
+        assert!(cumulative_trapezoid_initial(&[1.0, 2.0], &[0.0], 0.0).is_err());
     }
 
     // ── tplquad tests ──────────────────────────────────────────────

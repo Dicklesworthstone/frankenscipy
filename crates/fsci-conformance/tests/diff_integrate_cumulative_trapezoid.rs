@@ -48,6 +48,8 @@ struct OracleQuery {
 struct PointArm {
     case_id: String,
     values: Option<Vec<f64>>,
+    /// The exception SciPy raised, by type name, when it raised.
+    raised: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,11 +183,11 @@ for case in q["points"]:
         else:
             v = None
         if v is None:
-            points.append({"case_id": cid, "values": None})
+            points.append({"case_id": cid, "values": None, "raised": None})
         else:
-            points.append({"case_id": cid, "values": finite_or_none(v)})
-    except Exception:
-        points.append({"case_id": cid, "values": None})
+            points.append({"case_id": cid, "values": finite_or_none(v), "raised": None})
+    except Exception as e:
+        points.append({"case_id": cid, "values": None, "raised": type(e).__name__})
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize cumulative_trap query");
@@ -261,24 +263,20 @@ fn diff_integrate_cumulative_trapezoid() {
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let arm = case.op.as_str();
-        if arm == "cumulative_trapezoid_initial" && case.initial != 0.0 {
-            // SciPy 1.17.1 raises `ValueError: initial must be None or 0`; fsci still prepends it.
-            ledger.allowlisted(
-                arm,
-                &case.case_id,
-                "frankenscipy-5tdmo",
-                "SciPy raises for a nonzero initial; fsci accepts it",
-            );
-            continue;
-        }
         let fsci_v: Option<Vec<f64>> = match arm {
             "cumulative_trapezoid" => cumulative_trapezoid(&case.y, &case.x).ok(),
             "cumulative_trapezoid_uniform" => cumulative_trapezoid_uniform(&case.y, case.dx).ok(),
             "cumulative_trapezoid_initial" => {
-                Some(cumulative_trapezoid_initial(&case.y, &case.x, case.initial))
+                cumulative_trapezoid_initial(&case.y, &case.x, case.initial).ok()
             }
             _ => None,
         };
+        // SciPy 1.17.1 raises `ValueError: initial must be None or 0` for the initial=5 cases;
+        // fsci must refuse them too.
+        if scipy_arm.raised.as_deref() == Some("ValueError") {
+            ledger.expected_raise(arm, &case.case_id, fsci_v.is_none());
+            continue;
+        }
         let Some((expected, fsci_v)) = ledger.slices(
             arm,
             &case.case_id,
@@ -336,5 +334,12 @@ fn diff_integrate_cumulative_trapezoid() {
         .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
         .min()
         .expect("ARMS is non-empty");
-    ledger.finish(min_per_arm);
+    let counts = ledger.finish(min_per_arm);
+    for arm in ARMS {
+        let cases = query.points.iter().filter(|c| c.op == arm).count();
+        assert_eq!(
+            counts[arm].compared_cases, cases,
+            "arm `{arm}` must compare all {cases} of its cases"
+        );
+    }
 }
