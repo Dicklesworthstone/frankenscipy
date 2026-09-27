@@ -12,7 +12,9 @@
 //! SciPy's `sll` is the sidelobe suppression as a POSITIVE dB number. The sweep used to send
 //! -30/-40/-50, for which SciPy returns all-NaN windows (acosh of a value below 1); the oracle
 //! mapped those to None and every taylor case was skipped, so the test compared only the
-//! exponential arm until the compared-case ledger (olv0j.1) made the empty arm fail.
+//! exponential arm until the compared-case ledger (olv0j.1) made the empty arm fail. Four
+//! negative-sll cases remain on purpose: the oracle reports SciPy's all-NaN window and fsci must
+//! return one too, rather than repairing sll with abs() (frankenscipy-pyyk3).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -59,6 +61,8 @@ struct OracleQuery {
 struct OraclePoint {
     case_id: String,
     w: Option<Vec<f64>>,
+    /// SciPy returned a window that is NaN in every sample (JSON cannot carry the NaNs).
+    all_nan: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +137,22 @@ fn build_query() -> OracleQuery {
             }
         }
     }
+    // Negative sll (frankenscipy-pyyk3): SciPy uses it as given and returns an all-NaN window.
+    for &n in &[8_usize, 16] {
+        for &sym in &[true, false] {
+            pts.push(CasePoint {
+                case_id: format!("taylor_n{n}_nbar4_sll-30_sym{sym}"),
+                func: "taylor".into(),
+                n,
+                nbar: 4,
+                sll: -30.0,
+                norm: true,
+                sym,
+                tau: 0.0,
+                center: f64::NAN,
+            });
+        }
+    }
 
     // exponential sweep — sym=true (no explicit center) and sym=false with various centers
     for &n in &[8_usize, 16, 32] {
@@ -204,11 +224,12 @@ for c in q["points"]:
         else:
             w = None
         if w is None or not np.all(np.isfinite(w)):
-            out.append({"case_id": cid, "w": None})
+            all_nan = w is not None and len(w) > 0 and bool(np.all(np.isnan(w)))
+            out.append({"case_id": cid, "w": None, "all_nan": all_nan})
         else:
-            out.append({"case_id": cid, "w": [float(v) for v in w]})
+            out.append({"case_id": cid, "w": [float(v) for v in w], "all_nan": False})
     except Exception:
-        out.append({"case_id": cid, "w": None})
+        out.append({"case_id": cid, "w": None, "all_nan": False})
 
 print(json.dumps({"points": out}))
 "#;
@@ -287,6 +308,22 @@ fn diff_signal_taylor_exponential_windows() {
             }
             other => panic!("unknown func {other}"),
         };
+        if o.all_nan {
+            let pass = actual
+                .as_deref()
+                .is_some_and(|w| w.len() == c.n && w.iter().all(|v| v.is_nan()));
+            ledger.compared(&c.func, &c.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: c.case_id.clone(),
+                func: c.func.clone(),
+                max_abs_diff: 0.0,
+                max_rel_diff: 0.0,
+                n_eval: c.n,
+                pass,
+                note: "SciPy window is all NaN".into(),
+            });
+            continue;
+        }
         let Some((expected, actual)) =
             ledger.slices(&c.func, &c.case_id, o.w.as_deref(), actual.as_deref())
         else {
