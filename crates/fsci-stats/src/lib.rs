@@ -1993,10 +1993,11 @@ impl ContinuousDistribution for NoncentralT {
         if self.nc.abs() < 1e-10 {
             return StudentT::new(self.df).sf(x);
         }
-        // sf(t; ν, δ) = 1 − F(t) = F(−t; ν, −δ) (noncentral-t reflection), so
-        // evaluate the tail DIRECTLY via `nctdtr` with reflected args — fast and
-        // cancellation-free (no 1 − cdf), matching the former local tail integrate.
-        fsci_special::nctdtr(self.df, -self.nc, -x).clamp(0.0, 1.0)
+        // The survival function computed directly (frankenscipy-g9yid). The reflection
+        // F(−t; ν, −δ) this used to evaluate is, for x > 0, nctdtr at a NEGATIVE t, which was
+        // itself 1 − nctdtr(ν, δ, t): the upper tail cancelled to 0 below ~1e-16, e.g.
+        // sf(4405362.28162058; 5, 3) was 0 where the law is 1e-30.
+        fsci_special::nctdtrc(self.df, self.nc, x).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -67357,6 +67358,30 @@ mod tests {
                 "vonmises cdf mono/bounds"
             );
             prev = c;
+        }
+    }
+
+    /// frankenscipy-g9yid: NoncentralT::sf was nctdtr at the reflected, negative t, i.e.
+    /// `1 − cdf`, and cancelled to 0 below ~1e-16. Expected values are mpmath quadrature (34
+    /// digits; scratchpad nct_tail/refs.json). Both the mean's side (df 5, nc 3: SciPy's nct.sf
+    /// agrees, 1.0e-30) and across zero (df 30, nc −10: SciPy's nct.sf gives 1.5e-30, its
+    /// complement series cancelling) were 0 in fsci.
+    #[test]
+    fn noncentral_t_sf_keeps_its_upper_tail() {
+        for (df, nc, x, want) in [
+            (5.0, 3.0, 4_405_362.281_620_58, 9.999_999_999_993_671e-31),
+            (
+                30.0,
+                -10.0,
+                1.728_399_704_847_42,
+                1.000_000_000_000_881_6e-30,
+            ),
+        ] {
+            let got = NoncentralT::new(df, nc).sf(x);
+            assert!(
+                (got - want).abs() <= 1e-13 * want,
+                "NoncentralT({df}, {nc}).sf({x:e}) = {got:e}, mpmath {want:e}"
+            );
         }
     }
 

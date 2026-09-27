@@ -1667,7 +1667,10 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
         };
     }
     if t < 0.0 {
-        return 1.0 - nctdtr(df, -nc, -t);
+        // The left tail is the survival of the reflected law, taken directly: `1 − nctdtr(df,
+        // −nc, −t)` cancelled to 0 (or to ~1e-16 of garbage) below about 1e-16, e.g.
+        // nctdtr(5, 10, −7.40744670100678) was 0 where the law is 1e-30.
+        return nctdtrc(df, -nc, -t);
     }
     let phi = crate::convenience::ndtr_scalar(-nc);
     if t == 0.0 {
@@ -1790,6 +1793,334 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
         }
     }
     (phi + 0.5 * s).clamp(0.0, 1.0)
+}
+
+/// Non-central t survival function `P(T > t) = 1 − nctdtr(df, nc, t)`, computed without
+/// forming `1 − nctdtr` where that would cancel (frankenscipy-g9yid).
+///
+/// Three regimes for `t > 0`:
+/// - the tail on the side of the mean (`nc ≥ 0`): past Boost's crossover, the complement series
+///   of [`nct_upper_series`], whose terms are all non-negative;
+/// - across zero from the mean (`nc < 0`): once `1 − nctdtr` would drop below 0.1, the
+///   positive-integrand quadrature of [`nct_far_tail`]. Every Poisson series there is a
+///   difference of O(1) sums, and SciPy's own `nct.sf` cancels in this regime;
+/// - otherwise `1 − nctdtr`, which is then at least 0.1 and loses nothing.
+///
+/// `t ≤ 0` is `nctdtr(df, −nc, −t)`, the positive-term `t ≥ 0` series.
+#[must_use]
+pub fn nctdtrc(df: f64, nc: f64, t: f64) -> f64 {
+    if df.is_nan() || nc.is_nan() || t.is_nan() {
+        return f64::NAN;
+    }
+    if df <= 0.0 {
+        return f64::NAN;
+    }
+    if nc.is_infinite() {
+        // The complement of nctdtr's limits: 1.0 at t = inf and 0.0 at t = −inf, NaN otherwise.
+        return if t == f64::INFINITY {
+            0.0
+        } else if t == f64::NEG_INFINITY {
+            1.0
+        } else {
+            f64::NAN
+        };
+    }
+    if t <= 0.0 {
+        return nctdtr(df, -nc, -t);
+    }
+    if (t * t).is_infinite() {
+        return 0.0;
+    }
+    nctdtrc_positive_t(df, nc, t)
+}
+
+/// The share of `1 − nctdtr` below which the `nc < 0` survival leaves the subtraction for the
+/// far-tail quadrature.
+const NCT_FAR_TAIL_SWITCH: f64 = 0.1;
+
+/// `P(T > t)` for `t > 0` with `t²` finite: the regime choice of [`nctdtrc`].
+fn nctdtrc_positive_t(df: f64, nc: f64, t: f64) -> f64 {
+    if nc >= 0.0 {
+        // Boost's crossover (non_central_t_cdf): below it the CDF side is the smaller one.
+        let tt = t * t;
+        let x = tt / (tt + df);
+        let d2 = nc * nc;
+        let b = 0.5 * df;
+        let c = 0.5 + b + 0.5 * d2;
+        let cross = 1.0 - (b / c) * (1.0 + d2 / (2.0 * c * c));
+        if x < cross {
+            return 1.0 - nctdtr(df, nc, t);
+        }
+        return nct_upper_series(df, nc, t);
+    }
+    if crate::convenience::ndtr_scalar(nc) >= NCT_FAR_TAIL_SWITCH {
+        let v = 1.0 - nctdtr(df, nc, t);
+        if v >= NCT_FAR_TAIL_SWITCH {
+            return v;
+        }
+    }
+    nct_far_tail(df, -nc, t)
+}
+
+/// `P(T > t)` for `nc ≥ 0`, `t > 0`: `Q = ½ Σ_j [p_j·I_y(df/2, j+½) + q_j·I_y(df/2, j+1)]` with
+/// `y = df/(t² + df)` in closed form. Every term is non-negative: the CDF's `Φ(−nc)` cancels
+/// exactly, since `Σ p_j = 1` and `Σ q_j = erf(nc/√2)` (Boost's `non_central_t2_q`). It is
+/// anchored at the Poisson mode like [`nctdtr`], each complement is taken directly with the
+/// roles swapped (never `1 − I_x`), the upward walk adds (the stable direction here), and the
+/// downward walk subtracts down to the cancellation floor, as [`ncfdtrc`] does.
+fn nct_upper_series(df: f64, nc: f64, t: f64) -> f64 {
+    let tt = t * t;
+    let x = tt / (tt + df);
+    let y = df / (tt + df);
+    let half_df = 0.5 * df;
+    let lam = 0.5 * nc * nc;
+    if lam == 0.0 {
+        // Student t: P(T > t) = ½·I_y(df/2, ½).
+        return 0.5 * betainc_with_complement(half_df, 0.5, y, x).unwrap_or(f64::NAN);
+    }
+    let j0 = lam.floor();
+    if j0 >= POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
+    let p0 = gamma::poisson_term(j0, lam);
+    let q0 = (nc / std::f64::consts::SQRT_2 / lam.sqrt()) * gamma::poisson_term(j0 + 0.5, lam);
+    let ap0 = j0 + 0.5;
+    let aq0 = j0 + 1.0;
+    let cp0 = betainc_with_complement(half_df, ap0, y, x).unwrap_or(f64::NAN);
+    let cq0 = betainc_with_complement(half_df, aq0, y, x).unwrap_or(f64::NAN);
+    let tp0 = beta_term(ap0, half_df, x, y);
+    let tq0 = beta_term(aq0, half_df, x, y);
+    // `f64::min`/`max` below would drop a NaN, so a NaN anchor ends here.
+    if [p0, q0, cp0, cq0, tp0, tq0].iter().any(|v| v.is_nan()) {
+        return f64::NAN;
+    }
+    if cp0 == 0.0 && cq0 == 0.0 && tp0 == 0.0 && tq0 == 0.0 {
+        return 0.0;
+    }
+    let mut total = 0.0_f64;
+    // Upward from the mode: Ī(a+1) = Ī(a) + T(a).
+    let (mut p, mut q, mut j) = (p0, q0, j0);
+    let (mut cp, mut cq, mut tp, mut tq) = (cp0, cq0, tp0, tq0);
+    let (mut ap, mut aq) = (ap0, aq0);
+    let cap = poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
+        total += p * cp.min(1.0) + q * cq.min(1.0);
+        cp += tp;
+        tp *= x * (ap + half_df) / (ap + 1.0);
+        ap += 1.0;
+        cq += tq;
+        tq *= x * (aq + half_df) / (aq + 1.0);
+        aq += 1.0;
+        j += 1.0;
+        p *= lam / j;
+        q *= lam / (j + 0.5);
+        if (p < 1e-300 && q < 1e-300) || (p.max(q) < 1e-17 * total.max(1e-300) && j > lam) {
+            break;
+        }
+        steps += 1.0;
+    }
+    // Downward: Ī(a−1) = Ī(a) − T(a−1). A complement driven to ≤ 0 by rounding is the floor.
+    let (mut p, mut q, mut j) = (p0, q0, j0);
+    let (mut cp, mut cq, mut tp, mut tq) = (cp0, cq0, tp0, tq0);
+    let (mut ap, mut aq) = (ap0, aq0);
+    while j > 0.0 {
+        p *= j / lam;
+        q *= (j + 0.5) / lam;
+        j -= 1.0;
+        tp *= ap / (x * (ap - 1.0 + half_df));
+        ap -= 1.0;
+        cp -= tp;
+        tq *= aq / (x * (aq - 1.0 + half_df));
+        aq -= 1.0;
+        cq -= tq;
+        if cp <= 0.0 && cq <= 0.0 {
+            break;
+        }
+        total += p * cp.max(0.0) + q * cq.max(0.0);
+        if p.max(q) < 1e-17 * total.max(1e-300) {
+            break;
+        }
+    }
+    (0.5 * total).clamp(0.0, 1.0)
+}
+
+/// `W(df, d, τ) = P(T ≤ −τ | nc = d)` for `d ≥ 0`, `τ > 0`: the tail across zero from the mean,
+/// as a trapezoid rule in `u` over a strictly log-concave positive integrand, so the peak is
+/// unique and the stop test is a bound, not a guess. `df ≥ 2` integrates the density form and
+/// `df < 2` the integration-by-parts form. The latter's incomplete-gamma factor becomes a sharp
+/// step at large `df`, while the density form needs thousands of nodes at small `df`.
+fn nct_far_tail(df: f64, d: f64, tau: f64) -> f64 {
+    if df >= 2.0 {
+        nct_far_tail_density(df, d, tau)
+    } else {
+        nct_far_tail_ibp(df, d, tau)
+    }
+}
+
+/// `√(2/π)`.
+const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
+/// `ln √(2π)`.
+const NCT_LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
+/// Trapezoid node cap per direction; a log-concave integrand stops long before it.
+const NCT_TRAPEZOID_MAX_NODES: usize = 100_000;
+
+/// Density form, `s = e^u`, `z = d + τs`:
+/// `W = e^{−d²/2}·∫ exp(ln df + ln pt(df/2, df·s²/2) + ln(½·erfcx(z/√2)) − dτs − (τs)²/2) du`,
+/// with `pt` the Poisson term (the density of `V = df·S²` in Loader's form), and `Φ(−z)` written
+/// as `½·erfcx(z/√2)·e^{−z²/2}` so that `e^{−d²/2}` comes out exactly.
+fn nct_far_tail_density(df: f64, d: f64, tau: f64) -> f64 {
+    use crate::convenience::erfcx_scalar;
+    use std::f64::consts::FRAC_1_SQRT_2;
+    let a = 0.5 * df;
+    let ln_df = df.ln();
+    let ln_norm = 0.5 * (std::f64::consts::TAU * a).ln();
+    let mills = |z: f64| SQRT_2_OVER_PI / erfcx_scalar(z * FRAC_1_SQRT_2);
+    let logf = |u: f64| {
+        let s = u.exp();
+        let ts = tau * s;
+        let lam = 0.5 * df * s * s;
+        if lam == 0.0 || ts.is_infinite() {
+            return f64::NEG_INFINITY;
+        }
+        let z = d + ts;
+        ln_df - gamma::stirlerr(a) - gamma::bd0(a, lam) - ln_norm
+            + (0.5 * erfcx_scalar(z * FRAC_1_SQRT_2)).ln()
+            - d * ts
+            - 0.5 * ts * ts
+    };
+    // l′(u) = df·(1 − s²) − τs·M(d + τs), M the inverse Mills ratio; decreasing in u.
+    let slope = |u: f64| {
+        let s = u.exp();
+        df * (1.0 - s * s) - tau * s * mills(d + tau * s)
+    };
+    // l′(0) < 0, and l′ > 0 at s_lo (M(z) < z + 1).
+    let s_lo = 0.5_f64.min(1.5 * df / (tau * ((d + 1.0) + ((d + 1.0).powi(2) + 3.0 * df).sqrt())));
+    let us = nct_peak_bisect(slope, s_lo.ln(), 0.0);
+    let s = us.exp();
+    let z = d + tau * s;
+    let m = mills(z);
+    let curvature = -2.0 * df * s * s - tau * s * m - (tau * s).powi(2) * m * (m - z);
+    let (lmax, sum) = nct_trapezoid(logf, us, trapezoid_step(curvature));
+    if sum == 0.0 {
+        return 0.0;
+    }
+    nct_scale_out(d, lmax, sum)
+}
+
+/// Integration-by-parts form, conditioning on `Z = −(d + w)`, `w = e^u`, `k = df/(2τ²)`:
+/// `W = e^{−d²/2}/√(2π)·∫ exp(u − dw − w²/2)·P(df/2, k·w²) du`.
+fn nct_far_tail_ibp(df: f64, d: f64, tau: f64) -> f64 {
+    let a = 0.5 * df;
+    let k = df / (2.0 * tau * tau);
+    if k == 0.0 {
+        return 0.0;
+    }
+    let lower = |x: f64| gamma::gammainc_scalar(a, x, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    let logf = |u: f64| {
+        let w = u.exp();
+        let pv = lower(k * w * w);
+        if pv <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        u - d * w - 0.5 * w * w + pv.ln()
+    };
+    // l′(u) = 1 − dw − w² + 2a·R with R = pt(a, x)/P(a, x) ∈ (0, 1].
+    let parts = |u: f64| {
+        let w = u.exp();
+        let x = k * w * w;
+        let pv = lower(x);
+        let r = if pv > 0.0 {
+            gamma::poisson_term(a, x) / pv
+        } else {
+            1.0
+        };
+        (1.0 - d * w - w * w + 2.0 * a * r, r, w, x)
+    };
+    // The roots of w² + dw = 1 and w² + dw = 1 + df bracket the peak.
+    let w_lo = 2.0 / (d + (d * d + 4.0).sqrt());
+    let w_hi = 2.0 * (1.0 + df) / (d + (d * d + 4.0 * (1.0 + df)).sqrt());
+    let us = nct_peak_bisect(|u| parts(u).0, w_lo.ln(), w_hi.ln());
+    let (_, r, w, x) = parts(us);
+    let curvature = -d * w - 2.0 * w * w + 4.0 * a * r * (a * (1.0 - r) - x);
+    let (lmax, sum) = nct_trapezoid(logf, us, trapezoid_step(curvature));
+    if sum == 0.0 {
+        return 0.0;
+    }
+    nct_scale_out(d, lmax - NCT_LN_SQRT_2PI, sum)
+}
+
+/// The peak of a log-concave integrand: bisection on its decreasing derivative over
+/// `[lo, hi]`, where it is positive at `lo` and negative at `hi`, to a width of 1e-10.
+fn nct_peak_bisect(slope: impl Fn(f64) -> f64, lo: f64, hi: f64) -> f64 {
+    let (mut lo, mut hi) = (lo, hi);
+    for _ in 0..200 {
+        if hi - lo <= 1e-10 {
+            break;
+        }
+        let mid = 0.5 * (lo + hi);
+        if slope(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Trapezoid step from the log-integrand's curvature at the peak: `σ/2.5`, at most 0.1.
+fn trapezoid_step(curvature: f64) -> f64 {
+    let sigma = 1.0 / (-curvature).max(1e-300).sqrt();
+    (sigma / 2.5).min(0.1)
+}
+
+/// `h·Σ_{i∈ℤ} exp(logf(peak + i·h) − lmax)` marched out from the peak. Each direction stops when
+/// the geometric bound `f·r/(1 − r)` on its remainder is below 1e-17 of the running sum, where
+/// `r` is the ratio of the last two nodes and log-concavity makes it non-increasing. Returns
+/// `(lmax, h·sum)`.
+fn nct_trapezoid(logf: impl Fn(f64) -> f64, peak: f64, h: f64) -> (f64, f64) {
+    let lmax = logf(peak);
+    if lmax == f64::NEG_INFINITY {
+        return (f64::NEG_INFINITY, 0.0);
+    }
+    if lmax.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut total = 1.0_f64;
+    for direction in [1.0, -1.0] {
+        let mut previous = lmax;
+        for i in 1..=NCT_TRAPEZOID_MAX_NODES {
+            let li = logf(peak + direction * i as f64 * h);
+            if li == f64::NEG_INFINITY {
+                break;
+            }
+            if li.is_nan() {
+                return (f64::NAN, f64::NAN);
+            }
+            let fi = (li - lmax).exp();
+            total += fi;
+            let ratio = (li - previous).exp();
+            if ratio < 1.0 && fi * ratio / (1.0 - ratio) < 1e-17 * total {
+                break;
+            }
+            previous = li;
+        }
+    }
+    (lmax, h * total)
+}
+
+/// `sum·exp(−d²/2 + log_rest)` with `d²` split exactly into `hi + lo`, and the exponent applied
+/// in two steps below −700 so a tiny result underflows gradually instead of all at once.
+fn nct_scale_out(d: f64, log_rest: f64, sum: f64) -> f64 {
+    let hi = d * d;
+    let lo = d.mul_add(d, -hi);
+    let sum = sum * (-0.5 * lo).exp();
+    let exponent = -0.5 * hi + log_rest;
+    if exponent < -700.0 {
+        sum * (exponent + 700.0).exp() * (-700.0_f64).exp()
+    } else {
+        sum * exponent.exp()
+    }
 }
 
 /// Student's t distribution CDF.
@@ -5681,6 +6012,77 @@ mod tests {
                 "{label} = {got}, SciPy 1.17.1 gives {want}"
             );
         }
+    }
+
+    /// frankenscipy-g9yid: the noncentral t tails away from the bulk were `1 − nctdtr` of a
+    /// reflected law and cancelled to 0 (or ~1e-16 of garbage) below about 1e-16: nctdtr's left
+    /// tail at t < 0 and nctdtrc's right tail at t > 0. Expected values are mpmath quadrature of
+    /// E[Φ(tS − δ)] and E[Φ(δ − tS)] as two separate positive integrals (34 digits, CDF + SF = 1
+    /// to 8.9e-33 on the grid; scratchpad nct_tail/refs.json). SciPy 1.17.1 is not the oracle
+    /// here: it is wrong across zero from the mean, e.g. nctdtr(5, 10, −7.40744670100678) =
+    /// 6.2e-17 where the law is 1e-30. Before this change fsci returned 0 at every row below.
+    #[test]
+    fn noncentral_t_tails_are_computed_directly() {
+        let left_tail = [
+            (
+                1.0,
+                0.5,
+                -1.578_188_193_300_98e29,
+                1.000_000_000_002_292_6e-30,
+            ),
+            (5.0, -2.0, -335_056.385_650_683, 1.000_000_000_001_415_1e-25),
+            (5.0, 3.0, -347.789_610_326_029, 9.999_999_999_983_786e-17),
+            (5.0, 10.0, -7.407_446_701_006_78, 9.999_999_999_990_794e-31),
+            (30.0, 3.0, -17.647_597_048_407_3, 9.999_999_999_989_708e-26),
+            (
+                30.0,
+                10.0,
+                -1.728_399_704_847_42,
+                1.000_000_000_000_881_6e-30,
+            ),
+            (200.0, 3.0, -6.760_435_488_904_36, 9.999_999_999_994_022e-21),
+        ];
+        for (df, nc, t, want) in left_tail {
+            let got = nctdtr(df, nc, t);
+            assert!(
+                (got - want).abs() <= 1e-13 * want,
+                "nctdtr({df}, {nc}, {t:e}) = {got:e}, mpmath {want:e}"
+            );
+        }
+        let right_tail = [
+            (5.0, 3.0, 4_405_362.281_620_58, 9.999_999_999_993_671e-31),
+            (
+                30.0,
+                -10.0,
+                1.728_399_704_847_42,
+                1.000_000_000_000_881_6e-30,
+            ),
+            (30.0, 40.0, 615.457_028_982_028, 1.000_000_000_001_425_2e-30),
+            (200.0, -2.0, 6.654_574_290_171_54, 9.999_999_999_997_589e-17),
+        ];
+        for (df, nc, t, want) in right_tail {
+            let got = nctdtrc(df, nc, t);
+            assert!(
+                (got - want).abs() <= 1e-13 * want,
+                "nctdtrc({df}, {nc}, {t:e}) = {got:e}, mpmath {want:e}"
+            );
+        }
+        // The two sides agree wherever neither is tiny, and the limits hold.
+        for (df, nc, t) in [
+            (5.0, 3.0, 3.0),
+            (5.0, -2.0, -1.0),
+            (30.0, 10.0, 9.0),
+            (1.0, 0.5, 0.2),
+        ] {
+            let closure = nctdtr(df, nc, t) + nctdtrc(df, nc, t) - 1.0;
+            assert!(
+                closure.abs() <= 4.0 * f64::EPSILON,
+                "({df}, {nc}, {t}): {closure:e}"
+            );
+        }
+        assert_eq!(nctdtrc(5.0, 3.0, f64::INFINITY), 0.0);
+        assert_eq!(nctdtrc(5.0, 3.0, f64::NEG_INFINITY), 1.0);
+        assert!(nctdtrc(5.0, f64::INFINITY, 1.0).is_nan() && nctdtrc(0.0, 1.0, 1.0).is_nan());
     }
 
     /// frankenscipy-g9yid, item 2. The noncentral walks start from terms at the Poisson mode:
