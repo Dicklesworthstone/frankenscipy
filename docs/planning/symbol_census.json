@@ -1168,7 +1168,7 @@
   },
   "scipy.stats": {
    "applicable": 303,
-   "compared": 238,
+   "compared": 239,
    "crate": "fsci-stats",
    "declared": 299,
    "matched_by": {
@@ -1217,7 +1217,6 @@
     "goodness_of_fit",
     "jf_skew_t",
     "ksone",
-    "kstwo",
     "log",
     "logrank",
     "mode",
@@ -1375,7 +1374,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 826,
+  "compared": 827,
   "declared": 1459,
   "matched_by": {
    "case_fold": 130,

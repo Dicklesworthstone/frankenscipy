@@ -46702,9 +46702,22 @@ fn kolmogn_p(n: usize, x: f64) -> f64 {
     }
     let delta = (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x);
     let weights = [1.0 / 12.0, -8.0 / 12.0, 0.0 / 12.0, 8.0 / 12.0, -1.0 / 12.0];
+    // SciPy's _kolmogn_p differentiates the CDF with this stencil everywhere. Where the CDF is
+    // near 1 the differences keep only a few of its digits: SciPy's kstwo.pdf(0.1107, 1000) is
+    // 3.5e-4 off a difference of its own sf, and this port's CDF noise put fsci 7.4e-3 off.
+    // In that deep tail (sf < 1e-3) the stencil runs on −sf, which keeps its relative
+    // precision. Elsewhere it stays on the CDF as SciPy's does: there the CDF stencil is
+    // accurate, and for n > 140 the sf is a different approximation (2·smirnov against
+    // Pelz–Good), whose derivative moved pdf(0.146, 141) by 4.7e-5.
+    let upper = kolmogn(n, x, false) < 1e-3;
     let mut val = 0.0;
     for (k, w) in weights.iter().enumerate() {
-        val += w * kolmogn(n, x + (k as f64 - 2.0) * delta, true);
+        let xk = x + (k as f64 - 2.0) * delta;
+        val += if upper {
+            -w * kolmogn(n, xk, false)
+        } else {
+            w * kolmogn(n, xk, true)
+        };
     }
     val / delta
 }
@@ -78493,7 +78506,11 @@ mod tests {
     /// form (measured bit-identical; tolerance 4 ulp). Elsewhere it is a 5-point central
     /// difference of the CDF with step δ = min(x/2^16, x - 1/n, 1/2 - x): the two CDFs differ
     /// by an ulp or two and the quotient scales that by 1/δ. Measured worst there is exactly
-    /// 1.0·eps/δ; tolerance 4·eps/δ.
+    /// 1.0·eps/δ; tolerance 4·eps/δ. Where sf < 1e-3, fsci runs that stencil on −sf instead
+    /// (see `kolmogn_p`), and three rows where SciPy's CDF stencil is off its own sf's
+    /// derivative by more than the tolerance now hold that derivative (GOLDEN-CHANGE notes in
+    /// the table). The far-tail rows whose SciPy value is pure stencil noise (for example 9.1e-12,
+    /// where the density is ~1e-77) pass on both sides within 4·eps/δ absolute.
     #[test]
     fn kstwo_pdf_matches_scipy() -> Result<(), StatsError> {
         const PDF: [(usize, f64, f64); 96] = [
@@ -78558,9 +78575,17 @@ mod tests {
             (141, 0.05954913341754137, 20.014594779755498),
             (141, 0.11909826683508273, 2.291152715873833),
             (141, 0.14586499149789456, 0.36875196685662287),
-            (141, 0.26631182064565373, 3.88486925043919e-07),
-            (141, 0.2900171070431208, 8.511113864206367e-09),
-            (141, 0.3, 1.546140993013978e-09),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16): SciPy's kstwo.pdf here is
+            // 3.88486925043919e-7. It differentiates the Pelz–Good CDF, 2.5% off the derivative
+            // of SciPy's own sf (central difference 3.98585e-7) and off 2·ksone.pdf
+            // (3.985847468353691e-7), which this row now holds. The sf is 2.56e-9, so fsci's
+            // stencil runs on −sf here.
+            (141, 0.26631182064565373, 3.985847468353691e-07),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16), the same Pelz–Good inconsistency: SciPy's
+            // kstwo.pdf gives 8.511113864206367e-9 and 1.546140993013978e-9, 7% and 8% off the
+            // derivative of its own sf (sf < 1e-10) and off 2·ksone.pdf, now held.
+            (141, 0.2900171070431208, 9.14329895336821e-09),
+            (141, 0.3, 1.6739653473796595e-09),
             (141, 0.40713864472674677, 6.701609244560956e-12),
             (141, 0.4974071065859466, 5.4854144003817764e-12),
             (141, 0.5, 1.2980697810820992e-30),
@@ -78572,7 +78597,10 @@ mod tests {
             (1000, 0.022360679774997897, 53.0615385129308),
             (1000, 0.044721359549995794, 6.382390553134707),
             (1000, 0.05477225575051661, 1.0487155976089657),
-            (1000, 0.1, 1.4897523215040565e-06),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16): SciPy's CDF stencil gives
+            // 1.4897523215040565e-6, 3.5e-4 below the derivative of its sf (sf = 3.7e-9),
+            // 1.490271690824096e-6, and 2·ksone.pdf, which this row now holds.
+            (1000, 0.1, 1.490271653628224e-06),
             (1000, 0.10890132715100492, 3.8550747297711846e-08),
             (1000, 0.15288042556266132, 1.784717759174772e-11),
             (1000, 0.18677620294135613, 1.460830695961558e-11),
@@ -78607,6 +78635,35 @@ mod tests {
                 (got - want).abs() <= tol,
                 "kstwo.pdf({x:e}, {n}): got {got:e}, expected {want:e} (diff {:.2e}, tol {tol:.2e})",
                 (got - want).abs()
+            );
+        }
+        Ok(())
+    }
+
+    /// In the deep upper tail (sf < 1e-3) the density comes from a stencil on −sf, whose values
+    /// keep their relative precision, where SciPy differentiates its CDF near 1. The references are
+    /// central differences of SciPy 1.17.1's own `kstwo.sf` with h = 1e-5·x (the h = 1e-4·x
+    /// estimates agree with them to 1e-6), not `kstwo.pdf`. SciPy's pdf is 3.5e-4 below at
+    /// (1000, 0.1107), and fsci's old CDF stencil was 7.4e-3 off (frankenscipy-1ksfv.16).
+    #[test]
+    fn kstwo_pdf_upper_tail_differentiates_the_sf() -> Result<(), StatsError> {
+        let rows: [(usize, f64, f64); 5] = [
+            (100, 0.19, 0.095_965_646_680_839_11),
+            (1000, 0.082_219_219_164_377_87, 0.000_826_230_920_629_256_4),
+            (1000, 0.094_868_329_805_051_39, 1.056_376_915_245_900_4e-5),
+            (1000, 0.110_679_718_105_893_28, 1.782_148_949_456_587e-8),
+            (
+                100_000,
+                0.009_486_832_980_505_138,
+                0.000_114_846_430_421_294_59,
+            ),
+        ];
+        for (n, x, want) in rows {
+            let got = Kstwo::new(n)?.pdf(x);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 1e-6,
+                "kstwo.pdf({x}, {n}) = {got:e}, sf-difference {want:e} ({rel:.1e})"
             );
         }
         Ok(())

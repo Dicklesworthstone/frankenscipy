@@ -3,7 +3,7 @@
 //!
 //! Resolves [frankenscipy-q291n]. VonMises (circular Gaussian
 //! analogue) has anchor tests in `fsci-stats/src/lib.rs` but no
-//! dedicated scipy diff harness. 6 (kappa, loc) pairs × 11
+//! dedicated scipy diff harness. 9 (kappa, loc) pairs × 11
 //! x-values × 2 families (pdf, cdf) via subprocess, and the same points for VonmisesLine's pdf,
 //! cdf and ppf (frankenscipy-1ksfv.16), two of them outside [loc−π, loc+π] where the two
 //! distributions differ.
@@ -11,8 +11,9 @@
 //! pdf is closed-form via the modified Bessel I0 helper.
 //! The cdf is the Bessel–Fourier series (frankenscipy-1qmf4), which replaced a trapezoid
 //! integration; CDF_TOL (1e-5) dates from the trapezoid and also bounds the ppf rows, which
-//! both sides get by root finding on the cdf. All kappa here are below SciPy's series cutoff
-//! (10.5), past which SciPy's cdf is a normal approximation.
+//! both sides get by root finding on the cdf. Every kappa but 50 is below SciPy's series cutoff
+//! (10.5). Past it SciPy's cdf is a normal approximation that drifts ~3e-6 from the exact
+//! series fsci keeps (frankenscipy-1qmf4), which CDF_TOL also covers.
 //!
 //! Outside one period the circular vonmises follows SciPy's "cycles + within-period cdf"
 //! convention (vonmises.cdf(2π) ≈ 1.5); vonmises_line is 0 or 1 there.
@@ -110,7 +111,11 @@ fn emit_log(log: &DiffLog) {
 fn generate_query() -> OracleQuery {
     // kappa = 0 ⇒ uniform on circle. kappa = ∞ ⇒ delta at loc.
     // Pick small/medium/large kappa and a few loc shifts.
-    let pairs: [(f64, f64); 6] = [
+    // The first three are frankenscipy-1ksfv.16's κ grid for vonmises_line.
+    let pairs: [(f64, f64); 9] = [
+        (0.1, 0.0),
+        (2.0, 0.0),
+        (50.0, 0.0),
         (0.5, 0.0),
         (1.0, 0.0),
         (3.0, 0.0),

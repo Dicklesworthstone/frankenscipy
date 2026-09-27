@@ -1967,6 +1967,12 @@
     "PVALUE_TOL": 1e-7,
     "STAT_TOL": 1e-12
   },
+  "diff_stats_kstwo.rs": {
+    "CDF_REL_TOL": 1e-12,
+    "PDF_FROM_SF_REL_TOL": 1e-6,
+    "PDF_REL_TOL": 1e-10,
+    "SF_REL_TOL": 1e-10
+  },
   "diff_stats_kstwobign.rs": {
     "CDF_TOL": 1e-10,
     "PDF_TOL": 1e-8,
