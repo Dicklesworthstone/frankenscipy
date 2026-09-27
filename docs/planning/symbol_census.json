@@ -877,7 +877,7 @@
   },
   "scipy.sparse.linalg": {
    "applicable": 37,
-   "compared": 19,
+   "compared": 20,
    "crate": "fsci-sparse",
    "declared": 24,
    "matched_by": {
@@ -905,7 +905,6 @@
    "real": 26,
    "real_not_compared": [
     "SuperLU",
-    "eigs",
     "expm_multiply",
     "is_sptriangular",
     "onenormest",
@@ -1169,11 +1168,11 @@
   },
   "scipy.stats": {
    "applicable": 303,
-   "compared": 235,
+   "compared": 236,
    "crate": "fsci-stats",
-   "declared": 296,
+   "declared": 297,
    "matched_by": {
-    "case_fold": 102,
+    "case_fold": 103,
     "exact": 152,
     "reexport": 0,
     "trait": 0,
@@ -1183,10 +1182,9 @@
    "not_real": {
     "landau": "missing: the alias to Moyal (a different density) was removed (frankenscipy-szq1n.2)",
     "levy_stable": "missing: needs (alpha, beta) stable laws; the alias to Levy was removed (frankenscipy-szq1n.2)",
-    "make_distribution": "missing: needs a generic user-defined distribution mechanism (frankenscipy-1ksfv)",
-    "vonmises_line": "missing: support [-pi, pi]; the alias to the periodic VonMises was removed (frankenscipy-szq1n.2)"
+    "make_distribution": "missing: needs a generic user-defined distribution mechanism (frankenscipy-1ksfv)"
    },
-   "real": 299,
+   "real": 300,
    "real_not_compared": [
     "Binomial",
     "CensoredData",
@@ -1379,17 +1377,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 822,
-  "declared": 1456,
+  "compared": 824,
+  "declared": 1457,
   "matched_by": {
-   "case_fold": 127,
+   "case_fold": 128,
    "exact": 1257,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1480,
+  "real": 1481,
   "scipy": 1555
  }
 }
