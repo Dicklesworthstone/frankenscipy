@@ -111,21 +111,16 @@ fn diff_opt_derivative() {
                 continue;
             }
             let case_id = format!("{model}_x{x}");
-            let fsci_df = derivative(|t: f64| f(t), x, opts).ok().map(|res| res.df);
+            // A non-finite value is SciPy's status -3 (df nan), which fsci reports the same way
+            // (frankenscipy-3vcjx); it counts as the refusal below.
+            let fsci_df = derivative(|t: f64| f(t), x, opts)
+                .ok()
+                .map(|res| res.df)
+                .filter(|df| df.is_finite());
             // SciPy 1.17.1's own derivative(np.log, 0.5) fails (status -3: its default stencil
             // evaluates log at 0), so fsci must refuse too.
             if *model == "log" && x == 0.5 {
                 ledger.expected_raise(model, &case_id, fsci_df.is_none());
-                continue;
-            }
-            // SciPy recovers from a non-finite evaluation at these points and fsci does not.
-            if (*model == "log" && x == 1.0) || (*model == "sqrt" && x == 0.5) {
-                ledger.allowlisted(
-                    model,
-                    &case_id,
-                    "frankenscipy-3vcjx",
-                    "fsci refuses where scipy.differentiate.derivative succeeds",
-                );
                 continue;
             }
             let Some((expected, df)) = ledger.pair(model, &case_id, Some(df_true(x)), fsci_df)
@@ -174,6 +169,6 @@ fn diff_opt_derivative() {
         diffs.len(),
         max_overall
     );
-    // log/sqrt admit only x > 0, and each has one case allowlisted under frankenscipy-3vcjx.
-    ledger.finish(xs_default.iter().filter(|&&x| x > 0.0).count() - 1);
+    // Every model is compared at every x; log at 0.5 is SciPy's own refusal (expected_raise).
+    ledger.finish(xs_default.iter().filter(|&&x| x > 0.0).count());
 }
