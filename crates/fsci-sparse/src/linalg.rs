@@ -32119,6 +32119,26 @@ fn add_scaled(y: &mut [f64], a: f64, x: &[f64]) {
     }
 }
 
+/// `⟨a, b⟩` over eight independent partial sums, combined pairwise at the end.
+///
+/// The Krylov–Schur orthogonalization spends almost all of eigsh/eigs in these dots (80% of a
+/// k = 20 run on a 10⁴-point Laplacian, frankenscipy-f5kx5). `dot_product`'s single serial sum
+/// retires one element per add latency, where ARPACK's BLAS dot keeps several in flight. The
+/// summation order differs from `dot_product` in the last bits; nothing here is held to bit
+/// identity.
+fn krylov_dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = [0.0_f64; 8];
+    let (a8, a_rest) = a.as_chunks::<8>();
+    let (b8, b_rest) = b.as_chunks::<8>();
+    for (x, y) in a8.iter().zip(b8) {
+        for ((sum, &xi), &yi) in acc.iter_mut().zip(x).zip(y) {
+            *sum += xi * yi;
+        }
+    }
+    let tail: f64 = a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum();
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
 /// Refuses a non-finite operator output: an overflowing `A·x`, or a solve through a singular
 /// factor, would otherwise be iterated on as if it were a direction.
 fn ensure_finite(w: &[f64]) -> SparseResult<()> {
@@ -32233,7 +32253,7 @@ impl<'b> KrylovBasis<'b> {
         let len = self.v.len();
         let mut coeff = vec![0.0; len];
         for _pass in 0..2 {
-            let c: Vec<f64> = (0..len).map(|i| dot_product(self.bvec(i), w)).collect();
+            let c: Vec<f64> = (0..len).map(|i| krylov_dot(self.bvec(i), w)).collect();
             for (i, &ci) in c.iter().enumerate() {
                 coeff[i] += ci;
                 add_scaled(w, -ci, &self.v[i]);
@@ -32241,8 +32261,8 @@ impl<'b> KrylovBasis<'b> {
         }
         let bw = self.b_times(w);
         let mut norm_sq = match &bw {
-            Some(b) => dot_product(w, b),
-            None => dot_product(w, w),
+            Some(b) => krylov_dot(w, b),
+            None => krylov_dot(w, w),
         };
         let coeff_sq: f64 = coeff.iter().map(|c| c * c).sum();
         if norm_sq < 0.0 {
