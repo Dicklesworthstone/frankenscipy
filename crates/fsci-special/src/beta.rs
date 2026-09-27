@@ -6796,6 +6796,102 @@ mod tests {
         }
     }
 
+    /// Integer shapes with b < 40 (after bratio's orientation) take Boost's binomial sum, as
+    /// SciPy's betainc does (frankenscipy-z3pk9). Both halves of the pair are held to 60-digit
+    /// mpmath, the complement computed as the lower integral I_{1−x}(b, a), not ∫_x^1 (mpmath's
+    /// upper integral lost 0.2% at (15, 20, 0.999)). The rows cover both orientations, a = b,
+    /// b = 2..39, a = 1000 with b = 5, and the `x^n`-underflow branch ((30, 12, 1e-9),
+    /// (39, 39, 1e-5)). SciPy 1.17.1 is within 2.5e-15 of the same references.
+    #[test]
+    fn integer_shapes_take_the_binomial_sum_like_boost() {
+        let rows: [(f64, f64, f64, f64, f64); 14] = [
+            (
+                10.0,
+                30.0,
+                0.2,
+                0.241_359_451_280_791_45,
+                0.758_640_548_719_208_5,
+            ),
+            (
+                10.0,
+                30.0,
+                0.25,
+                0.524_369_181_738_402_7,
+                0.475_630_818_261_597_2,
+            ),
+            (
+                30.0,
+                10.0,
+                0.75,
+                0.475_630_818_261_597_2,
+                0.524_369_181_738_402_7,
+            ),
+            (
+                30.0,
+                10.0,
+                0.9,
+                0.995_835_279_132_318_2,
+                0.004_164_720_867_681_855,
+            ),
+            (10.0, 10.0, 0.5, 0.5, 0.5),
+            (
+                10.0,
+                10.0,
+                0.3,
+                0.032_553_356_881_300_95,
+                0.967_446_643_118_699_1,
+            ),
+            (
+                30.0,
+                30.0,
+                0.45,
+                0.219_667_184_452_625_65,
+                0.780_332_815_547_374_3,
+            ),
+            (
+                2.0,
+                39.0,
+                0.05,
+                0.600_935_934_876_784_3,
+                0.399_064_065_123_215_7,
+            ),
+            (
+                1000.0,
+                5.0,
+                0.995,
+                0.436_544_110_448_118_3,
+                0.563_455_889_551_881_8,
+            ),
+            (
+                1000.0,
+                5.0,
+                0.999,
+                0.996_301_685_886_459_7,
+                0.003_698_314_113_540_221_4,
+            ),
+            (
+                25.0,
+                3.0,
+                0.6,
+                0.000_179_110_814_588_556_97,
+                0.999_820_889_185_411_5,
+            ),
+            (30.0, 12.0, 1e-9, 3.159_461_934_367_024e-261, 1.0),
+            (39.0, 39.0, 1e-5, 1.360_346_639_249_929_8e-173, 1.0),
+            (15.0, 20.0, 0.999, 1.0, 1.373_530_679_716_787_6e-51),
+        ];
+        for (a, b, x, want, want_c) in rows {
+            let (w, w1) = crate::bratio::bratio(a, b, x, 1.0 - x);
+            for (got, expected, what) in [(w, want, "I"), (w1, want_c, "1 - I")] {
+                let e = rel_err(got, expected);
+                assert!(
+                    e <= 1e-14,
+                    "{what}({a}, {b}, {x}): {got:e} vs {expected:e} ({e:.1e})"
+                );
+            }
+        }
+    }
+
     /// The before arm, kept as a permanent control: the old kernel fails the rows the tests above
     /// pin, so those tests can tell the two kernels apart.
     #[test]

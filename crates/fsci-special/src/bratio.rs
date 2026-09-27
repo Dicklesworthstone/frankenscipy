@@ -135,6 +135,19 @@ pub(crate) fn bratio(a: f64, b: f64, x: f64, y: f64) -> (f64, f64) {
         (a0, b0, x0, y0) = (b, a, y, x);
         lambda = lambda.abs();
     }
+    // Not TOMS 708: Boost's ibeta_imp, which SciPy's betainc runs, relates integer shapes with
+    // b < 40 to the binomial law at this point, I_x(a, b) = P(Bin(a + b − 1, x) ≥ a), a sum of
+    // at most b positive terms. It is exact, and it is 2.6x cheaper than the two log-Beta
+    // prefactors of bup + bpser below (frankenscipy-z3pk9).
+    if b0 < 40.0
+        && a0.fract() == 0.0
+        && b0.fract() == 0.0
+        && a0 < f64::from(i32::MAX - 100)
+        && y0 != 1.0
+    {
+        let k = a0 - 1.0;
+        return from_w(ind, binomial_ccdf(b0 + k, k, x0, y0));
+    }
     if b0 < 40.0 && b0 * x0 <= 0.7 {
         return from_w(ind, bpser(a0, b0, x0, eps));
     }
@@ -178,6 +191,81 @@ pub(crate) fn bratio(a: f64, b: f64, x: f64, y: f64) -> (f64, f64) {
 /// `1e15` by 1.5e-10 and `1e20` by 2e-7 (frankenscipy-5pnba). Here `a + b` is carried as an
 /// exact two-sum and the product as an exact `fma` two-product, so the only roundings are
 /// those of `λ`'s own size, and the same rows miss by 1e-14.
+/// Boost's `binomial_ccdf(n, k, x, y)` (`special_functions/beta.hpp`): P(X > k) for
+/// X ~ Binomial(n, x), with `y = 1 − x` passed exactly. The terms are summed from `x^n` down to
+/// `i = k + 1`, each from the last by `C(n, i) / C(n, i + 1) = (i + 1) / (n − i)`. When `x^n`
+/// underflows, the sum starts just above the mode and runs outwards, or, if that term
+/// underflows as well, adds the terms one by one. Boost takes the binomial coefficient from an
+/// exact factorial table; [`binomial_coefficient`] here is exact up to its final rounding.
+fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
+    let mut result = x.powf(n);
+    if result > f64::MIN_POSITIVE {
+        let mut term = result;
+        let mut i = n - 1.0;
+        while i > k {
+            term *= ((i + 1.0) * y) / ((n - i) * x);
+            result += term;
+            i -= 1.0;
+        }
+        return result;
+    }
+    let mut start = (n * x).trunc();
+    if start <= k + 1.0 {
+        start = (k + 2.0).trunc();
+    }
+    let choose = |i: f64| binomial_coefficient(n, i);
+    result = x.powf(start) * y.powf(n - start) * choose(start);
+    if result == 0.0 {
+        let mut i = start - 1.0;
+        while i > k {
+            result += x.powf(i) * y.powf(n - i) * choose(i);
+            i -= 1.0;
+        }
+        return result;
+    }
+    let start_term = result;
+    let mut term = result;
+    let mut i = start - 1.0;
+    while i > k {
+        term *= ((i + 1.0) * y) / ((n - i) * x);
+        result += term;
+        i -= 1.0;
+    }
+    term = start_term;
+    let mut i = start + 1.0;
+    while i <= n {
+        term *= (n - i + 1.0) * x / (i * y);
+        result += term;
+        i += 1.0;
+    }
+    result
+}
+
+/// C(n, k) for integers 0 ≤ k ≤ n (as f64). The recurrence C(n, i + 1) = C(n, i)·(n − i)/(i + 1)
+/// runs exactly in u128 while the product fits, so the result is rounded once; past that it
+/// continues in f64. In [`binomial_ccdf`] min(k, n − k) < 40, so the loop is short. A log-Γ
+/// form (`gamma::comb` beyond 20 terms) was 4.7e-14 off at C(77, 37), which the
+/// (39, 39, 1e-5) test row caught.
+fn binomial_coefficient(n: f64, k: f64) -> f64 {
+    let m = k.min(n - k) as u64;
+    let n = n as u64;
+    let mut exact: u128 = 1;
+    let mut i = 0_u64;
+    while i < m {
+        let Some(product) = exact.checked_mul(u128::from(n - i)) else {
+            break;
+        };
+        exact = product / u128::from(i + 1);
+        i += 1;
+    }
+    let mut c = exact as f64;
+    while i < m {
+        c = c * (n - i) as f64 / (i + 1) as f64;
+        i += 1;
+    }
+    c
+}
+
 fn beta_lambda(a: f64, b: f64, x: f64, y: f64) -> f64 {
     // a + b = s + es exactly (Knuth's two-sum).
     let s = a + b;
