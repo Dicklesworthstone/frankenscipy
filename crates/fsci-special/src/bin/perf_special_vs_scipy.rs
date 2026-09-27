@@ -79,9 +79,9 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialTensor, beta, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma,
-    gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0, k1, kn, kv,
-    kve, rgamma, spence, y0, y1, yn, yv, yve, zeta,
+    SpecialTensor, beta, betainc, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit,
+    exprel, gamma, gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0,
+    k1, kn, kv, kve, rgamma, spence, y0, y1, yn, yv, yve, zeta,
 };
 
 const PYTHON: &str = r#"
@@ -780,6 +780,135 @@ fn main() {
                 sci / fsci,
                 f1.max(f2) / f1.min(f2),
                 s1.max(s2) / s1.min(s2),
+            );
+        }
+    }
+
+    // ── betainc(a, b, x): the three-argument case (frankenscipy-d0u95) ──────────────
+    //
+    // The kernel became TOMS 708 `bratio` in 5pnba, a correctness fix whose everyday cost was
+    // never measured, and betainc sits under the t, F, beta and binomial CDFs. A uniform box
+    // would put almost every x deep in a tail where both sides return 0 or 1 cheaply, so the
+    // fixture is a GRID instead: every (a, b) in {0.5, 2, 10, 30, 200}², each at x = mean
+    // + {−3, −1, 0, 1, 3}·sd (clamped into (0, 1)) with a small jitter. That spans bratio's
+    // branches (power series, continued fraction, the asymptotic `basym` for large a and b)
+    // at the probabilities a p-value actually asks for.
+    if selected.split(',').any(|name| name.trim() == "betainc") {
+        // `FSCI_SPECIAL_BETAINC_A` / `_B` (comma lists) narrow the shape grid to ONE regime,
+        // which is how a loss is located; the full grid is the headline.
+        const OFFSETS: [f64; 5] = [-3.0, -1.0, 0.0, 1.0, 3.0];
+        let shapes = |key: &str| -> Vec<f64> {
+            std::env::var(key)
+                .ok()
+                .map(|list| {
+                    list.split(',')
+                        .map(|v| v.trim().parse().expect("shape list of numbers"))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![0.5, 2.0, 10.0, 30.0, 200.0])
+        };
+        let (a_shapes, b_shapes) = (
+            shapes("FSCI_SPECIAL_BETAINC_A"),
+            shapes("FSCI_SPECIAL_BETAINC_B"),
+        );
+        let pairs = a_shapes.len() * b_shapes.len();
+        let (mut a, mut b, mut x) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for i in 0..n {
+            let pair = i % pairs;
+            let (ai, bi) = (
+                a_shapes[pair / b_shapes.len()],
+                b_shapes[pair % b_shapes.len()],
+            );
+            let mean = ai / (ai + bi);
+            let sd = (ai * bi / ((ai + bi) * (ai + bi) * (ai + bi + 1.0))).sqrt();
+            let offset = OFFSETS[(i / pairs) % 5] + 0.2 * (unit(i) - 0.5);
+            a.push(ai);
+            b.push(bi);
+            x.push(offset.mul_add(sd, mean).clamp(1.0e-6, 1.0 - 1.0e-6));
+        }
+        println!(
+            "n={n} op=betainc grid a in {a_shapes:?} b in {b_shapes:?} x = mean + {OFFSETS:?}*sd"
+        );
+
+        let mut scipy = Scipy::start_n("betainc", &[&a, &b, &x]);
+        println!("{}", scipy.ready);
+
+        let (ta, tb, tx) = (
+            SpecialTensor::RealVec(a.clone()),
+            SpecialTensor::RealVec(b.clone()),
+            SpecialTensor::RealVec(x.clone()),
+        );
+        let ours = || -> Vec<f64> {
+            let out = betainc(&ta, &tb, &tx, RuntimeMode::Hardened);
+            real_vec(out.expect("fsci betainc over the grid"), "betainc")
+        };
+        black_box(ours());
+
+        if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
+            let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
+            let started = Instant::now();
+            for _ in 0..k {
+                black_box(ours());
+            }
+            let ms = started.elapsed().as_secs_f64() * 1.0e3;
+            println!(
+                "PROBE op=betainc calls={k} n={n} elements={} ms={ms:.3}",
+                k * n
+            );
+        } else {
+            let _ = scipy.time(1, 1);
+            const MIN_SAMPLE_MS3: f64 = 20.0;
+            let mut single = f64::INFINITY;
+            for _ in 0..3 {
+                let started = Instant::now();
+                black_box(ours());
+                single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+            }
+            let reps = fixed_reps
+                .unwrap_or_else(|| (MIN_SAMPLE_MS3 / single.max(1.0e-6)).ceil() as usize)
+                .clamp(1, 4096);
+            println!("op=betainc calibration single={single:.4}ms reps={reps}");
+            let time_ours = || -> f64 {
+                let started = Instant::now();
+                for _ in 0..reps {
+                    black_box(ours());
+                }
+                started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+            };
+            // Position-balanced A-B-B-A / B-A-A-B rounds, as the one-argument cases use.
+            let (mut fsci, mut sp, mut null_f, mut null_s) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for round in 0..rounds {
+                let (a1, s1, s2, a2) = if round % 2 == 0 {
+                    let a1 = time_ours();
+                    let s1 = scipy.time(reps, 1);
+                    let s2 = scipy.time(reps, 1);
+                    let a2 = time_ours();
+                    (a1, s1, s2, a2)
+                } else {
+                    let s1 = scipy.time(reps, 1);
+                    let a1 = time_ours();
+                    let a2 = time_ours();
+                    let s2 = scipy.time(reps, 1);
+                    (a1, s1, s2, a2)
+                };
+                fsci.push(a1.min(a2));
+                sp.push(s1.min(s2));
+                null_f.push(a1.max(a2) / a1.min(a2));
+                null_s.push(s1.max(s2) / s1.min(s2));
+            }
+            let (fsci_ms, scipy_ms) = (median(fsci), median(sp));
+            let check = scipy.check(&ours());
+            emit!(
+                "case=n{n} op=betainc fsci={fsci_ms:.3}ms scipy={scipy_ms:.3}ms \
+                 scipy/fsci={:.3}x null_fsci={:.3} null_scipy={:.3} {check}",
+                scipy_ms / fsci_ms,
+                median(null_f),
+                median(null_s),
             );
         }
     }
