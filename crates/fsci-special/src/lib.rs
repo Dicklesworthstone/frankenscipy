@@ -29,6 +29,7 @@ pub mod elliptic;
 pub mod error;
 pub mod gamma;
 pub mod hyper;
+mod igam_temme;
 pub mod orthopoly;
 pub mod types;
 
