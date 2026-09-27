@@ -99,13 +99,6 @@ bead = "frankenscipy-1ksfv"
 
 [[entry]]
 module = "scipy.stats"
-name = "landau"
-disposition = "missing"
-reason = "the alias to Moyal (a different density) was removed"
-bead = "frankenscipy-szq1n.2"
-
-[[entry]]
-module = "scipy.stats"
 name = "levy_stable"
 disposition = "missing"
 reason = "needs (alpha, beta) stable laws; the alias to Levy was removed"

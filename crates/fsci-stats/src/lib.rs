@@ -14,6 +14,7 @@
 pub mod audit;
 pub mod censored;
 pub mod covariance;
+mod landau;
 pub mod qmc;
 
 pub use audit::{
@@ -22769,8 +22770,9 @@ pub type Exponweib = ExponWeibull;
 // finite-n KS law, kstwobign its n -> inf limit; vonmises_line is zero outside
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
-// `Kstwo` is now its own type, the finite-n law, and so is `VonmisesLine`, the law on
-// [loc - pi, loc + pi] (frankenscipy-1ksfv.16).
+// `Kstwo` is now its own type, the finite-n law, and so are `VonmisesLine`, the law on
+// [loc - pi, loc + pi], and `Landau`, the Boost-backed law SciPy computes
+// (frankenscipy-1ksfv.16).
 
 // SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
 // are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
@@ -25137,6 +25139,423 @@ impl ContinuousDistribution for Moyal {
         // Moyal has unbounded support; only finite-value validation applies.
         validate_parameterless_fit_data(data)?;
         Ok(Self)
+    }
+}
+
+/// Landau distribution with location `loc` and scale `scale`.
+///
+/// Matches `scipy.stats.landau(loc, scale)`. SciPy computes the standard law with Boost.Math's
+/// `landau_distribution`; `pdf`, `cdf`, `sf`, `ppf` and `isf` here run a port of Boost's
+/// double-precision branches (the private `landau` module) on `z = (x - loc) / scale`, as
+/// `rv_continuous` does, and `sf`/`isf` are Boost's complemented forms rather than `1 - cdf`.
+///
+/// The textbook parameterization (location `mu`, scale `c`) also shifts the location with the
+/// scale: it corresponds to `loc = mu + 2c/π·ln(c)`, `scale = c` here, as in SciPy.
+///
+/// The law has no finite moments, so `mean`, `var`, `skewness` and `kurtosis` are NaN, as SciPy
+/// reports them. frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landau {
+    pub loc: f64,
+    pub scale: f64,
+}
+
+impl Landau {
+    /// `scipy.stats.landau(loc, scale)`.
+    ///
+    /// # Panics
+    ///
+    /// If `scale` is not positive or `loc` is not finite.
+    #[must_use]
+    pub fn new(loc: f64, scale: f64) -> Self {
+        assert!(scale > 0.0, "scale must be positive, got {scale}");
+        assert!(loc.is_finite(), "loc must be finite, got {loc}");
+        Self { loc, scale }
+    }
+}
+
+impl ContinuousDistribution for Landau {
+    // Rational approximations behind at most two `exp` and a `sqrt`, or one `log2`.
+    fn cdf_sf_is_cheap(&self) -> bool {
+        true
+    }
+
+    fn ppf_isf_is_cheap(&self) -> bool {
+        true
+    }
+
+    fn pdf(&self, x: f64) -> f64 {
+        landau::landau_pdf((x - self.loc) / self.scale) / self.scale
+    }
+
+    /// SciPy's `log(_pdf(z)) - log(scale)`.
+    fn logpdf(&self, x: f64) -> f64 {
+        log_probability(landau::landau_pdf((x - self.loc) / self.scale)) - self.scale.ln()
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        landau::landau_cdf((x - self.loc) / self.scale)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        landau::landau_sf((x - self.loc) / self.scale)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        self.loc + self.scale * landau::landau_ppf(q)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        self.loc + self.scale * landau::landau_isf(q)
+    }
+
+    fn mean(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn var(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn skewness(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn kurtosis(&self) -> f64 {
+        f64::NAN
+    }
+
+    /// SciPy's `_entropy` for the standard law, 2.37263644000448182 (mpmath, gh-19145), plus
+    /// `ln(scale)` as `rv_continuous.entropy` adds it.
+    fn entropy(&self) -> f64 {
+        2.372_636_440_004_481_7 + self.scale.ln()
+    }
+}
+
+#[cfg(test)]
+mod landau_matches_scipy {
+    use super::{ContinuousDistribution, Landau, Moyal};
+
+    /// Every pinned value below is bit-identical to SciPy 1.17.1 on the host that produced
+    /// it; 1e-14 leaves room only for a last-bit `exp`/`log2` difference between C libraries.
+    const TOL: f64 = 1e-14;
+
+    /// Relative agreement; a zero or infinite SciPy value must be matched exactly.
+    fn check(got: f64, want: f64, tol: f64, what: &str) {
+        if want == 0.0 || want.is_infinite() {
+            assert!(got == want, "{what}: got {got:e}, scipy {want:e}");
+        } else {
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= tol,
+                "{what}: got {got:e}, scipy {want:e}, rel {rel:e}"
+            );
+        }
+    }
+
+    /// One x in every interval of Boost's pdf and cdf branch chains. x < 0: [-1, 0), [-2, -1),
+    /// [-4, -2), [-5.1328125, -4) and the zero tail below. x >= 0: [0, 1), [1, 2), [2, 4),
+    /// [4, 8), [8, 16), [16, 32), [32, 64), then ilogb(x) < 8, 16, 32, 64 and the 2/(πx²)
+    /// tail, where π·x·x overflows at 1e200 and the pdf is 0 in SciPy too.
+    /// Columns: x, pdf, cdf, sf from `scipy.stats.landau`.
+    #[test]
+    fn pdf_cdf_sf_every_branch() {
+        let rows: [(f64, f64, f64, f64); 22] = [
+            (-5.2, 0.0, 0.0, 1.0),
+            (-5.0, 1.5190233064966156e-261, 1.6016174425058606e-264, 1.0),
+            (-4.5, 3.6174016008363494e-119, 8.357151723578122e-122, 1.0),
+            (-3.2, 1.1813573766726455e-15, 2.0786272497981016e-17, 1.0),
+            (
+                -2.5,
+                1.491956791108867e-05,
+                7.68815894016075e-07,
+                0.9999992311841059,
+            ),
+            (
+                -1.5,
+                0.08445596455553546,
+                0.018750043329448494,
+                0.9812499566705515,
+            ),
+            (
+                -0.7,
+                0.2709748925849106,
+                0.17103005206208358,
+                0.8289699479379165,
+            ),
+            (
+                -0.1,
+                0.27023174151919616,
+                0.3386047147644277,
+                0.6613952852355722,
+            ),
+            (
+                0.0,
+                0.26224012637535166,
+                0.3652387015123748,
+                0.6347612984876252,
+            ),
+            (
+                0.5,
+                0.2123184676750643,
+                0.48423925192325135,
+                0.5157607480767487,
+            ),
+            (
+                1.5,
+                0.1245839037914385,
+                0.6494530810783575,
+                0.35054691892164247,
+            ),
+            (
+                3.0,
+                0.058639488338036186,
+                0.7792966733588684,
+                0.22070332664113163,
+            ),
+            (
+                6.0,
+                0.01926154504862334,
+                0.8814405316227936,
+                0.11855946837720639,
+            ),
+            (
+                12.0,
+                0.005078037397657038,
+                0.9412844008396675,
+                0.058715599160332546,
+            ),
+            (
+                25.0,
+                0.0011386197364553709,
+                0.9726873569919952,
+                0.027312643008004858,
+            ),
+            (
+                50.0,
+                0.000274514183763706,
+                0.9866896366811772,
+                0.0133103633188229,
+            ),
+            (
+                100.0,
+                6.671040287844643e-05,
+                0.9934615333703324,
+                0.006538466629667619,
+            ),
+            (
+                300.0,
+                7.218696437831841e-06,
+                0.9978539611537297,
+                0.0021460388462702807,
+            ),
+            (
+                1e5,
+                6.367056207292683e-11,
+                0.9999936333527817,
+                6.3666472183572795e-06,
+            ),
+            (
+                1e10,
+                6.366197741591884e-21,
+                0.999999999936338,
+                6.366197732836492e-11,
+            ),
+            (1e30, 6.366197723675813e-61, 1.0, 6.3661977236758135e-31),
+            (1e200, 0.0, 1.0, 6.366197723675814e-201),
+        ];
+        let d = Landau::new(0.0, 1.0);
+        for (x, pdf, cdf, sf) in rows {
+            check(d.pdf(x), pdf, TOL, &format!("pdf({x:e})"));
+            check(d.cdf(x), cdf, TOL, &format!("cdf({x:e})"));
+            check(d.sf(x), sf, TOL, &format!("sf({x:e})"));
+        }
+    }
+
+    /// ppf walks Boost's lower-quantile chain for p <= 1/2 (p >= 0.375, 0.25, 0.125, then
+    /// ilogb(p) >= -4, -8, -16, -32, -64, -128, -256, -512, -1024 and -inf below) and the
+    /// upper chain on 1 - p above 1/2. isf walks the upper chain for q <= 1/2 (down to its
+    /// 2/(πq) tail, which overflows to inf at 1e-310) and the lower chain on 1 - q above.
+    #[test]
+    fn ppf_isf_every_branch() {
+        let ppf_rows: [(f64, f64); 22] = [
+            (1e-310, f64::NEG_INFINITY),
+            (1e-300, -5.082339425297071),
+            (1e-100, -4.376686695411364),
+            (1e-50, -3.9271296121139336),
+            (1e-30, -3.5918684814254718),
+            (1e-15, -3.127971832130881),
+            (1e-08, -2.6926105199042794),
+            (0.001, -1.9612653085775507),
+            (0.01, -1.6275061069535208),
+            (0.1, -0.9828373080642456),
+            (0.2, -0.5948319348759157),
+            (0.3, -0.24045468945638124),
+            (0.4, 0.13571822158688304),
+            (0.5, 0.5756301439450783),
+            (0.55, 0.836970410018457),
+            (0.7, 1.9574701757202584),
+            (0.8, 3.3842882761238124),
+            (0.9, 7.128678485028738),
+            (0.99, 66.02051286847637),
+            (0.999, 640.4590655726022),
+            (0.999999, 636628.0109354313),
+            (0.999999999999, 636633855820.5931),
+        ];
+        let isf_rows: [(f64, f64); 20] = [
+            (1e-310, f64::INFINITY),
+            (1e-300, 6.366197723675814e+299),
+            (1e-20, 6.366197723675814e+19),
+            (1e-12, 636619772384.6152),
+            (1e-06, 636628.0109537379),
+            (0.001, 640.4590655726026),
+            (0.01, 66.02051286847643),
+            (0.1, 7.128678485028738),
+            (0.2, 3.3842882761238107),
+            (0.3, 1.957470175720259),
+            (0.4, 1.1405756669701925),
+            (0.5, 0.5756301439450783),
+            (0.6, 0.13571822158688304),
+            (0.7, -0.24045468945638102),
+            (0.8, -0.5948319348759158),
+            (0.9, -0.9828373080642459),
+            (0.99, -1.6275061069535206),
+            (0.999, -1.9612653085775507),
+            (0.999999, -2.486311469659321),
+            (0.999999999999, -2.975430133850267),
+        ];
+        let d = Landau::new(0.0, 1.0);
+        for (p, want) in ppf_rows {
+            check(d.ppf(p), want, TOL, &format!("ppf({p:e})"));
+        }
+        for (q, want) in isf_rows {
+            check(d.isf(q), want, TOL, &format!("isf({q:e})"));
+        }
+    }
+
+    /// `scipy.stats.landau(loc=1.5, scale=2)`: x, pdf, logpdf, cdf, sf; then p, ppf, isf.
+    #[test]
+    fn loc_scale_rows() {
+        let d = Landau::new(1.5, 2.0);
+        for (x, pdf, logpdf, cdf, sf) in [
+            (
+                -5.0,
+                3.325073476292881e-17,
+                -37.94245480890192,
+                1.0828050366151318e-18,
+                1.0,
+            ),
+            (
+                0.0,
+                0.13272676982203357,
+                -2.0194626260973796,
+                0.15761490419728172,
+                0.8423850958027183,
+            ),
+            (
+                4.0,
+                0.07136413432449544,
+                -2.6399598562269664,
+                0.6160933636942969,
+                0.38390663630570304,
+            ),
+            (
+                30.0,
+                0.0017956471355326678,
+                -6.322389800825928,
+                0.9508961817992597,
+                0.049103818200740265,
+            ),
+        ] {
+            check(d.pdf(x), pdf, TOL, &format!("loc/scale pdf({x})"));
+            check(d.logpdf(x), logpdf, TOL, &format!("loc/scale logpdf({x})"));
+            check(d.cdf(x), cdf, TOL, &format!("loc/scale cdf({x})"));
+            check(d.sf(x), sf, TOL, &format!("loc/scale sf({x})"));
+        }
+        for (p, ppf, isf) in [
+            (1e-10, -4.19851353435383, 12732395477.055773),
+            (0.05, -0.982609392200156, 29.50960888222876),
+            (0.9, 15.757356970057476, -0.4656746161284917),
+            (0.999999999, 1273239607.5172403, -4.051245191844796),
+        ] {
+            check(d.ppf(p), ppf, TOL, &format!("loc/scale ppf({p:e})"));
+            check(d.isf(p), isf, TOL, &format!("loc/scale isf({p:e})"));
+        }
+        check(d.median(), 2.6512602878901568, TOL, "loc/scale median");
+        check(d.entropy(), 3.065783620564427, TOL, "loc/scale entropy");
+    }
+
+    /// Non-finite and out-of-range arguments, the moments SciPy leaves undefined, and logpdf.
+    #[test]
+    fn edges_moments_entropy_logpdf() {
+        let d = Landau::new(0.0, 1.0);
+        // SciPy 1.17.1 hands ±inf to Boost, which refuses non-finite x: pdf(±inf) is NaN.
+        assert!(d.pdf(f64::INFINITY).is_nan());
+        assert!(d.pdf(f64::NEG_INFINITY).is_nan());
+        assert!(d.pdf(f64::NAN).is_nan());
+        assert!(d.logpdf(f64::INFINITY).is_nan());
+        assert_eq!(d.cdf(f64::NEG_INFINITY), 0.0);
+        assert_eq!(d.cdf(f64::INFINITY), 1.0);
+        assert_eq!(d.sf(f64::NEG_INFINITY), 1.0);
+        assert_eq!(d.sf(f64::INFINITY), 0.0);
+        assert!(d.cdf(f64::NAN).is_nan());
+        assert!(d.sf(f64::NAN).is_nan());
+
+        assert_eq!(d.ppf(0.0), f64::NEG_INFINITY);
+        assert_eq!(d.ppf(1.0), f64::INFINITY);
+        assert_eq!(d.isf(0.0), f64::INFINITY);
+        assert_eq!(d.isf(1.0), f64::NEG_INFINITY);
+        for bad in [-0.1, 1.1, f64::NAN] {
+            assert!(d.ppf(bad).is_nan(), "ppf({bad}) must be NaN");
+            assert!(d.isf(bad).is_nan(), "isf({bad}) must be NaN");
+        }
+
+        assert!(d.mean().is_nan());
+        assert!(d.var().is_nan());
+        assert!(d.std().is_nan());
+        assert!(d.skewness().is_nan());
+        assert!(d.kurtosis().is_nan());
+        check(d.entropy(), 2.3726364400044817, TOL, "entropy");
+        check(d.median(), 0.5756301439450783, TOL, "median");
+
+        // logpdf: -inf where the pdf underflows to 0 (x = -5.2), else log(pdf).
+        assert_eq!(d.logpdf(-5.2), f64::NEG_INFINITY);
+        for (x, want) in [
+            (-4.5, -272.72187008801245),
+            (0.0, -1.338494682079505),
+            (1000.0, -14.259466824641148),
+        ] {
+            check(d.logpdf(x), want, TOL, &format!("logpdf({x})"));
+        }
+    }
+
+    /// cdf(ppf(p)) and sf(isf(q)) come back to p and q. The left tail is ill-conditioned
+    /// (d ln F / dx grows like σ = exp(-πx/2 - 1.4516)); SciPy itself is 1.6e-14 off at
+    /// p = 1e-12, hence 1e-13 here.
+    #[test]
+    fn round_trip() {
+        let d = Landau::new(0.0, 1.0);
+        for p in [1e-12, 1e-4, 0.01, 0.2, 0.365, 0.5, 0.8, 0.99, 0.999999] {
+            check(d.cdf(d.ppf(p)), p, 1e-13, &format!("cdf(ppf({p:e}))"));
+        }
+        for q in [1e-12, 1e-4, 0.01, 0.3, 0.635, 0.9] {
+            check(d.sf(d.isf(q)), q, 1e-13, &format!("sf(isf({q:e}))"));
+        }
+    }
+
+    /// Negative control: `Landau` used to be an alias of `Moyal` (br-szq1n.2). The two
+    /// densities differ at 0 (landau 0.26224, moyal 0.24197), so a regression to the alias
+    /// fails here.
+    #[test]
+    fn is_not_moyal() {
+        let landau = Landau::new(0.0, 1.0);
+        check(landau.pdf(0.0), 0.26224012637535166, TOL, "landau pdf(0)");
+        check(Moyal.pdf(0.0), 0.24197072451914337, 1e-13, "moyal pdf(0)");
+        assert!(
+            (landau.pdf(0.0) - Moyal.pdf(0.0)).abs() > 0.02,
+            "Landau must not reproduce Moyal's density"
+        );
+        assert!((landau.cdf(0.0) - Moyal.cdf(0.0)).abs() > 0.01);
     }
 }
 

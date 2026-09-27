@@ -1168,11 +1168,11 @@
   },
   "scipy.stats": {
    "applicable": 303,
-   "compared": 236,
+   "compared": 237,
    "crate": "fsci-stats",
-   "declared": 297,
+   "declared": 298,
    "matched_by": {
-    "case_fold": 103,
+    "case_fold": 104,
     "exact": 152,
     "reexport": 0,
     "trait": 0,
@@ -1180,11 +1180,10 @@
    },
    "na": 0,
    "not_real": {
-    "landau": "missing: the alias to Moyal (a different density) was removed (frankenscipy-szq1n.2)",
     "levy_stable": "missing: needs (alpha, beta) stable laws; the alias to Levy was removed (frankenscipy-szq1n.2)",
     "make_distribution": "missing: needs a generic user-defined distribution mechanism (frankenscipy-1ksfv)"
    },
-   "real": 300,
+   "real": 301,
    "real_not_compared": [
     "Binomial",
     "CensoredData",
@@ -1377,17 +1376,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 824,
-  "declared": 1457,
+  "compared": 825,
+  "declared": 1458,
   "matched_by": {
-   "case_fold": 128,
+   "case_fold": 129,
    "exact": 1257,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1481,
+  "real": 1482,
   "scipy": 1555
  }
 }
