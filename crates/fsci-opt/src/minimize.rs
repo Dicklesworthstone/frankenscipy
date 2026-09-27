@@ -7270,6 +7270,40 @@ mod tests {
         assert!(fd.x.iter().all(|v| v.abs() < 1e-6), "x={:?}", fd.x);
     }
 
+    /// Without `gradient`, fsci differences the objective as SciPy's
+    /// `approx_derivative(f, x, '2-point', abs_step=√ε)` does. SciPy's Newton-CG refuses to run
+    /// without `jac`, but given that same gradient explicitly (`jac=lambda x:
+    /// approx_derivative(...)`), SciPy 1.17.1 on sum(x²) at default options reports:
+    /// - from (2, −1): precision loss (status 2) after 1 iteration, njev 17, at x = (0, 0)
+    ///   exactly. The line search cannot decrease f = 0, so success = false is SciPy's verdict
+    ///   too (frankenscipy-fd4wz);
+    /// - from (2, −3): success after 4 iterations, njev 9, at
+    ///   x = (−7.450623592173823e-9, −7.450516104046771e-9).
+    ///
+    /// fsci's nfev also counts the differencing evaluations, which SciPy's jac hides, so it is not
+    /// compared.
+    #[test]
+    fn newton_cg_fd_gradient_follows_scipy_on_the_sphere() {
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::NewtonCg),
+            ..MinimizeOptions::default()
+        };
+        let stalled = minimize(sphere, &[2.0, -1.0], options).expect("minimize");
+        assert!(!stalled.success, "{}", stalled.message);
+        assert_eq!(stalled.status, ConvergenceStatus::PrecisionLoss);
+        assert_eq!((stalled.nit, stalled.njev, stalled.nhev), (1, 17, 0));
+        assert_eq!(stalled.x, vec![0.0, 0.0]);
+        assert_eq!(stalled.fun, Some(0.0));
+
+        let converged = minimize(sphere, &[2.0, -3.0], options).expect("minimize");
+        assert!(converged.success, "{}", converged.message);
+        assert_eq!((converged.nit, converged.njev, converged.nhev), (4, 9, 0));
+        assert_eq!(
+            converged.x,
+            vec![-7.450_623_592_173_823e-9, -7.450_516_104_046_771e-9]
+        );
+    }
+
     #[test]
     fn newton_cg_rosenbrock() {
         let options = MinimizeOptions {

@@ -69,18 +69,21 @@ fn rosen(x: &[f64]) -> f64 {
     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2)
 }
 
+fn quadratic_grad(x: &[f64]) -> Vec<f64> {
+    x.iter().map(|v| 2.0 * v).collect()
+}
+
+fn rosen_grad(x: &[f64]) -> Vec<f64> {
+    vec![
+        -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]),
+        200.0 * (x[1] - x[0] * x[0]),
+    ]
+}
+
 /// fsci's final function value, or `None` when the optimizer erred, reported no convergence, or
 /// returned no value. The analytic minimum is always reachable, so each of these is a failure.
 fn converged_fun(res: Result<OptimizeResult, OptError>) -> Option<f64> {
     res.ok().filter(|r| r.success).and_then(|r| r.fun)
-}
-
-/// fsci's final function value whatever its success flag; `None` only on an error or a missing
-/// value. newton_cg here runs on finite-difference gradients (SciPy's Newton-CG refuses to run
-/// without an analytic Jacobian), so there is no SciPy status to hold its flag to; its value is
-/// still held to the analytic minimum (frankenscipy-fd4wz tracks its success flag on this run).
-fn final_fun(res: Result<OptimizeResult, OptError>) -> Option<f64> {
-    res.ok().and_then(|r| r.fun)
 }
 
 #[test]
@@ -119,14 +122,32 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
         });
     }
 
-    // slsqp, newton_cg, trust_exact: both quadratic and Rosen.
-    for (label, f, x0) in [
-        ("quad", quadratic as fn(&[f64]) -> f64, vec![2.0_f64, -1.0]),
-        ("rosen", rosen as fn(&[f64]) -> f64, vec![0.0_f64, 0.0]),
+    // slsqp, newton_cg, trust_exact: both quadratic and Rosen. newton_cg gets the analytic
+    // gradient, as SciPy's Newton-CG requires `jac`. Without one fsci differences the objective,
+    // and on the quadratic from (2, -1) that stops on precision loss at x = 0, which is also
+    // SciPy's verdict given the same gradient (fsci-opt's
+    // newton_cg_fd_gradient_follows_scipy_on_the_sphere, frankenscipy-fd4wz).
+    for (label, f, grad, x0) in [
+        (
+            "quad",
+            quadratic as fn(&[f64]) -> f64,
+            quadratic_grad as fn(&[f64]) -> Vec<f64>,
+            vec![2.0_f64, -1.0],
+        ),
+        (
+            "rosen",
+            rosen as fn(&[f64]) -> f64,
+            rosen_grad as fn(&[f64]) -> Vec<f64>,
+            vec![0.0_f64, 0.0],
+        ),
     ] {
+        let with_grad = MinimizeOptions {
+            gradient: Some(grad),
+            ..opts
+        };
         let runs = [
             ("slsqp", converged_fun(slsqp(&f, &x0, opts))),
-            ("newton_cg", final_fun(newton_cg(&f, &x0, opts))),
+            ("newton_cg", converged_fun(newton_cg(&f, &x0, with_grad))),
             ("trust_exact", converged_fun(trust_exact(&f, &x0, opts))),
         ];
         for (op, fsci_fun) in runs {
