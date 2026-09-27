@@ -19,8 +19,9 @@ use fsci_stats::{
     Beta, Betabinom, Betanbinom, Binom, Burr, Chi2, ContinuousDistribution, Cosine,
     CosineDistribution, Dgamma, DiscreteDistribution, Dlaplace, Dweibull, Expon, Exponweib, F,
     Foldcauchy, Foldnorm, Gamma, Genexpon, Geom, GumbelL, GumbelR, HalfNormal, Halfnorm, Hypergeom,
-    Invgamma, Invgauss, LevyL, Lognorm, Logser, Nbinom, Ncf, NchypergeomFisher, Nct, Ncx2,
-    Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, Wald, WeibullMin, rv_histogram,
+    Invgamma, Invgauss, Kstwo, Landau, LevyL, Lognorm, Logser, Nbinom, Ncf, NchypergeomFisher, Nct,
+    Ncx2, Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, VonmisesLine, Wald, WeibullMin,
+    rv_histogram,
 };
 use serde::{Deserialize, Serialize};
 
@@ -288,6 +289,28 @@ fn cases() -> Vec<AliasCase> {
             "stats.wald()",
             &[0.2, 1.0, 3.0],
             cont(Wald::new(1.0)),
+        ),
+        // Three of the four szq1n.2 names that aliased a DIFFERENT law now name their own types
+        // (frankenscipy-1ksfv.16), and each point is one where the old alias disagreed:
+        // kstwobign.cdf(0.3) = 9.3e-6 against kstwo(10) 0.729; moyal.pdf(0) = 0.242 against
+        // landau 0.262; vonmises at x = 4 has density and cdf 1.0035, vonmises_line 0 and 1.
+        c(
+            "Kstwo",
+            "stats.kstwo(10)",
+            &[0.1, 0.3, 0.6],
+            cont(Kstwo::new(10).expect("kstwo n = 10")),
+        ),
+        c(
+            "Landau",
+            "stats.landau()",
+            &[-1.0, 0.0, 3.0],
+            cont(Landau::new(0.0, 1.0)),
+        ),
+        c(
+            "VonmisesLine",
+            "stats.vonmises_line(2)",
+            &[-2.0, 1.0, 4.0],
+            cont(VonmisesLine::new(2.0, 0.0)),
         ),
         d(
             "NchypergeomFisher",
