@@ -16026,7 +16026,8 @@ pub fn chebwin(n: usize, at: f64) -> Vec<f64> {
 /// # Arguments
 /// * `n` - Window length
 /// * `nbar` - Number of nearly constant-level sidelobes adjacent to the mainlobe
-/// * `sll` - Desired peak sidelobe level in dB (negative, e.g., -30.0)
+/// * `sll` - Desired sidelobe suppression in dB, a positive number (e.g. 30.0) as in SciPy. A
+///   negative value gives an all-NaN window (for `n > 1`), exactly as SciPy's `acosh` does.
 /// * `norm` - If true, normalize the window to have unit peak
 /// * `sym` - If true, generate symmetric window (default for filter design)
 pub fn taylor(n: usize, nbar: usize, sll: f64, norm: bool, sym: bool) -> Vec<f64> {
@@ -16043,8 +16044,10 @@ pub fn taylor(n: usize, nbar: usize, sll: f64, norm: bool, sym: bool) -> Vec<f64
     // br-y6wj: match scipy.signal.windows.taylor exactly. Two prior
     // bugs: (a) Fm denominator was missing the factor of 2, (b) sample
     // positions used i/(N-1) instead of scipy's centered (i - (N-1)/2)/N.
-    let b = 10.0_f64.powf(sll.abs() / 20.0);
-    let a = (b + (b * b - 1.0).max(0.0).sqrt()).ln() / std::f64::consts::PI;
+    // SciPy takes `sll` as given: B = 10**(sll/20), A = acosh(B)/pi. A negative sll puts B below
+    // 1, acosh is NaN and so is the whole window; that is not repaired here (frankenscipy-pyyk3).
+    let b = 10.0_f64.powf(sll / 20.0);
+    let a = b.acosh() / std::f64::consts::PI;
     let a_sq = a * a;
 
     let nbar_f = nbar as f64;
@@ -22884,7 +22887,7 @@ mod tests {
     #[test]
     fn taylor_window_symmetric() {
         // Taylor window should be symmetric
-        let w = taylor(11, 4, -30.0, true, true);
+        let w = taylor(11, 4, 30.0, true, true);
         assert_eq!(w.len(), 11);
         for i in 0..5 {
             assert!(
@@ -22899,7 +22902,7 @@ mod tests {
     #[test]
     fn taylor_window_normalized_peak() {
         // With norm=true, peak should be 1.0
-        let w = taylor(21, 4, -30.0, true, true);
+        let w = taylor(21, 4, 30.0, true, true);
         let max_val = w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         assert!(
             (max_val - 1.0).abs() < 1e-10,
@@ -22912,6 +22915,39 @@ mod tests {
     fn taylor_window_empty_and_single() {
         assert!(taylor(0, 4, -30.0, true, true).is_empty());
         assert_eq!(taylor(1, 4, -30.0, true, true), [1.0]);
+    }
+
+    /// SciPy 1.17.1 `windows.taylor(8, nbar=3, sll=s, norm, sym)`: sll is used as given, so a
+    /// negative or NaN sll makes acosh(10**(sll/20)) NaN and the whole window NaN. Positive sll
+    /// is the documented use.
+    #[test]
+    fn taylor_negative_sll_is_nan_like_scipy() {
+        let scipy_30 = [
+            0.290_297_267_110_167_4,
+            0.517_796_759_217_966_5,
+            0.802_302_893_269_473,
+            0.977_155_834_515_652_1,
+            0.977_155_834_515_652_1,
+            0.802_302_893_269_473,
+            0.517_796_759_217_966_5,
+            0.290_297_267_110_167_4,
+        ];
+        let w = taylor(8, 3, 30.0, true, true);
+        for (got, want) in w.iter().zip(scipy_30) {
+            assert!((got - want).abs() <= 1e-14, "sll=30: {got} vs {want}");
+        }
+        for (sll, norm, sym) in [
+            (-30.0, true, true),
+            (-30.0, false, false),
+            (f64::NAN, true, true),
+        ] {
+            let w = taylor(8, 3, sll, norm, sym);
+            assert_eq!(w.len(), 8);
+            assert!(
+                w.iter().all(|v| v.is_nan()),
+                "sll={sll} norm={norm} sym={sym}: {w:?}"
+            );
+        }
     }
 
     #[test]
