@@ -708,9 +708,28 @@ fn main() {
             if !selected.split(',').any(|name| name.trim() == op) {
                 continue;
             }
+            // `FSCI_SPECIAL_A_RANGE=lo,hi` replaces the first argument's domain (log-uniform
+            // when hi/lo > 100), and `FSCI_SPECIAL_B_NEAR_A=w` puts the second at a·(1 ± w)
+            // instead of its own box. Together they reach regimes a box cannot, such as the
+            // Temme zones of gammainc near x = a for large a (frankenscipy-6fpkm).
+            let a_range = std::env::var("FSCI_SPECIAL_A_RANGE").ok().map(|s| {
+                let v: Vec<f64> = s
+                    .split(',')
+                    .map(|t| t.trim().parse().expect("A_RANGE lo,hi"))
+                    .collect();
+                (v[0], v[1])
+            });
+            let near_a: Option<f64> = std::env::var("FSCI_SPECIAL_B_NEAR_A")
+                .ok()
+                .map(|s| s.trim().parse().expect("B_NEAR_A width"));
+            let (alo, ahi) = a_range.unwrap_or((alo, ahi));
             let a: Vec<f64> = (0..n)
                 .map(|i| {
-                    let v = alo + unit(i) * (ahi - alo);
+                    let v = if ahi / alo > 100.0 {
+                        (alo.ln() + unit(i) * (ahi / alo).ln()).exp()
+                    } else {
+                        alo + unit(i) * (ahi - alo)
+                    };
                     if integer_order { v.floor() } else { v }
                 })
                 .collect();
@@ -718,9 +737,14 @@ fn main() {
             // both would put every sample on the diagonal and exercise one line of a
             // two-dimensional domain.
             let b: Vec<f64> = (0..n)
-                .map(|i| blo + unit(i * 7 + 13) * (bhi - blo))
+                .map(|i| match near_a {
+                    Some(w) => a[i] * unit(i * 7 + 13).mul_add(2.0 * w, 1.0 - w),
+                    None => blo + unit(i * 7 + 13) * (bhi - blo),
+                })
                 .collect();
-            println!("n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}]");
+            println!(
+                "n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}] b_near_a={near_a:?}"
+            );
 
             let mut scipy = Scipy::start_n(op, &[&a, &b]);
             println!("{}", scipy.ready);
