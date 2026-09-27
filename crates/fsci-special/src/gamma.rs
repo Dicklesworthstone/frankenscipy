@@ -3870,9 +3870,25 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
 /// Inverse of [`chndtr`] in the argument `x`.
 ///
 /// Returns `x` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtrix(p, df, nc)`. The CDF is monotonically increasing in
-/// `x`, so the root is found by bracket-and-bisect. Boundaries follow scipy:
+/// `scipy.special.chndtrix(p, df, nc)`. Boundaries follow scipy:
 /// `p = 0 → 0`, `p = 1 → +∞`, and `p ∉ [0, 1]` (or NaN inputs) → NaN.
+///
+/// SciPy 1.17.1 answers with Boost's quantile, which brackets the root by a geometric walk and
+/// uses the complement `q − sf(x)` as the residual for `p ≥ 1/2`
+/// (boost/math/distributions/detail/generic_quantile.hpp 26-28, 83-94). This does the same with
+/// `bracket_and_solve_root` from `x = 1` and [`chndtrc`] (frankenscipy-g9yid),
+/// so a root far below 1 is bracketed in O(log) CDF calls and resolved to a relative
+/// tolerance: SciPy gives `chndtrix(1e-20, 3, 2) = 2.1860014721757718e-13`, where the old
+/// `[0, hi]` search stopped at its first false-position step, 2.28e-19. The answer is only as
+/// good as [`chndtr`] at the root: where both of its mode anchors underflow it returns 0, so a
+/// `p` near `1e-300` (SciPy: `chndtrix(1e-300, 3, 2) = 4.7095974041160384e-200`) is not
+/// resolved there. Boost starts from Pearson's approximation instead of 1, which moves only
+/// the escape value when the root is below `f64::MIN_POSITIVE`.
+///
+/// SciPy is NaN from `nc ≈ 4.18e10` at `p = 1/2` (the edge moves with `p`: 2.2e11 at 0.01,
+/// 4.3e10 at 0.99) because Boost's series hits its term limit. [`chndtr`] deliberately stays
+/// finite there, and this inverse stays consistent with it and answers. The owner may
+/// revisit that choice.
 #[must_use]
 pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     if p.is_nan() || df.is_nan() || nc.is_nan() || !(0.0..=1.0).contains(&p) {
@@ -3889,100 +3905,103 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     if p == 1.0 {
         return f64::INFINITY;
     }
-    let mut hi = 1.0_f64;
-    let mut fhi = chndtr(hi, df, nc);
-    while fhi < p {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
-        }
-        fhi = chndtr(hi, df, nc);
+    // A NaN CDF (the `crate::beta::POISSON_INDEX_LIMIT` exit) makes the walk return NaN
+    // rather than a bracket. SciPy 1.17.1: chndtrix(0.5, 3, 2^60) = nan.
+    let q = 1.0 - p;
+    if p < q {
+        crate::beta::bracket_and_solve_root(|x| chndtr(x, df, nc) - p, 1.0, true)
+    } else {
+        crate::beta::bracket_and_solve_root(|x| q - chndtrc(x, df, nc), 1.0, true)
     }
-    // A NaN CDF (the `crate::beta::POISSON_INDEX_LIMIT` exit) ends the doubling without
-    // bracketing anything. SciPy 1.17.1: chndtrix(0.5, 3, 2^60) = nan.
-    if fhi.is_nan() {
-        return f64::NAN;
-    }
-    // chndtr(·, df, nc) is increasing in x with chndtr(0, ·) = 0, so
-    // f(x) = chndtr(x, df, nc) − p is increasing with f(0) = −p < 0 < f(hi).
-    // Illinois false-position converges in ~12 chndtr evals vs the old fixed
-    // 100-step bisection — each eval is a full Poisson-weighted mixture, so this
-    // ~8× cuts chndtrix's dominant cost. (Its siblings chndtridf/chndtrinc
-    // already route through the Illinois `invert_monotone`.) The final doubling
-    // eval is reused as `fhi`; f(0) = −p needs no chndtr call.
-    let fhi_resid = fhi - p;
-    if fhi_resid == 0.0 {
-        return hi;
-    }
-    crate::beta::illinois_root(|m| chndtr(m, df, nc) - p, 0.0, hi, -p, fhi_resid)
 }
 
-/// Bisect for `v ∈ [a, b]` with `f(v) = target`, where `f` is monotone on
-/// `[a, b]` (direction auto-detected). If `target` is outside the range spanned
-/// by `f(a)..f(b)`, the nearer bound is returned (the unsolvable-tail clamp).
-fn invert_monotone(f: impl Fn(f64) -> f64, target: f64, a: f64, b: f64) -> f64 {
-    let (fa, fb) = (f(a), f(b));
-    // `f64::min`/`max` drop a NaN, so a NaN endpoint used to read as the other endpoint's
-    // value and return a bound (or hand Illinois NaN residuals). SciPy returns NaN there:
-    // chndtrinc(inf, 3, 0.5) and chndtridf(inf, 0.5, 2) are both nan in 1.17.1.
-    if fa.is_nan() || fb.is_nan() {
-        return f64::NAN;
-    }
-    if target <= fa.min(fb) {
-        return if fa <= fb { a } else { b };
-    }
-    if target >= fa.max(fb) {
-        return if fa >= fb { a } else { b };
-    }
-    // Superlinear Illinois (~12 evals) instead of 200 fixed bisection steps — each
-    // eval here is a full chndtr (Poisson-weighted mixture), so this is a large win
-    // for chndtridf/chndtrinc. The clamp guards above guarantee `target` is strictly
-    // inside (min(fa,fb), max(fa,fb)), so neither endpoint is the root. Illinois
-    // solves an INCREASING residual, so flip the sign when f is decreasing.
-    if fb >= fa {
-        crate::beta::illinois_root(|m| f(m) - target, a, b, fa - target, fb - target)
+/// The residual Boost's `degrees_of_freedom_finder` and `non_centrality_finder` solve for the
+/// noncentral χ² (boost/math/distributions/non_central_chi_squared.hpp 551-569 and 606-624):
+/// `cdf − p` when `p < q = 1 − p`, and the complement form `q − sf` otherwise.
+fn chndtr_inverse_residual(x: f64, df: f64, nc: f64, p: f64) -> f64 {
+    let q = 1.0 - p;
+    if p < q {
+        chndtr(x, df, nc) - p
     } else {
-        crate::beta::illinois_root(|m| target - f(m), a, b, target - fa, target - fb)
+        q - chndtrc(x, df, nc)
     }
 }
 
 /// Inverse of [`chndtr`] in the degrees of freedom `df`.
 ///
 /// Returns `df` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtridf(x, p, nc)`. The CDF is monotone (decreasing) in
-/// `df`, so the root is found by bisection. `p ∉ (0, 1)` (or NaN) → NaN.
+/// `scipy.special.chndtridf(x, p, nc)`.
+///
+/// SciPy 1.17.1 answers with Boost's `find_degrees_of_freedom`
+/// (boost/math/distributions/non_central_chi_squared.hpp 572-603): from the guess
+/// `max(x − nc, 1)` it walks by `bracket_and_solve_root` (the CDF falls as
+/// `df` grows). When no `df > 0` reaches `p`, the downward walk leaves the normal range and
+/// returns half the first subnormal it reaches: `chndtridf(5, 0.5, nc) = 2.65249474e-315` for
+/// `nc = 30`, `1e6`, `1e8` and `1e16`, and `chndtridf(5, 1 − 2⁻⁵³, 2) = 7.957484216e-315`. The
+/// old fixed
+/// `[1e-6, 1e10]` search returned its `1e-6` bound there, and `1e-6` for `x = 3e10` too, where
+/// SciPy gives 29999999998.66667 (frankenscipy-g9yid). `p ∈ {0, 1}`, `x = 0`, negative `x` or
+/// `nc`, and NaN are NaN, as in SciPy.
+///
+/// SciPy is NaN from `x ≈ 4.18e10` (Boost's series hits its term limit). [`chndtr`]
+/// deliberately stays finite there, and this inverse stays consistent with it and answers.
+/// The owner may revisit that choice.
 #[must_use]
 pub fn chndtridf(x: f64, p: f64, nc: f64) -> f64 {
-    // nc = inf: SciPy 1.17.1 chndtridf(5, 0.5, inf) = nan. Without this, chndtr's limit of 0
-    // at both bracket ends would make `invert_monotone` return its 1e-6 bound
-    // (frankenscipy-qu5po).
-    if x.is_nan() || p.is_nan() || nc.is_nan() || p <= 0.0 || p >= 1.0 || nc == f64::INFINITY {
+    if x.is_nan() || p.is_nan() || nc.is_nan() {
         return f64::NAN;
     }
-    // x = inf: SciPy 1.17.1 chndtridf(inf, 0.5, 2) = chndtridf(inf, 0.5, 3) = nan. chndtr is
-    // 1.0 there (frankenscipy-g9yid), so both bracket ends read 1.0 and `invert_monotone`
-    // would clamp to its 1e-6 bound; before g9yid the NaN chndtr stopped it instead.
-    if x == f64::INFINITY {
+    // SciPy's wrapper rejects nc < 0, x < 0 and p ∉ [0, 1]; Boost raises for p ∈ {0, 1}; and
+    // SciPy 1.17.1 is nan at x = 0: chndtridf(0, 0.5, 2) = nan.
+    if nc < 0.0 || x <= 0.0 || p <= 0.0 || p >= 1.0 {
         return f64::NAN;
     }
-    invert_monotone(|df| chndtr(x, df, nc), p, 1e-6, 1e10)
+    // nc = inf: SciPy 1.17.1 chndtridf(5, 0.5, inf) = nan (frankenscipy-qu5po). x = inf:
+    // chndtridf(inf, 0.5, 2) = chndtridf(inf, 0.5, 3) = nan, while chndtr is 1.0 there
+    // (frankenscipy-g9yid).
+    if nc == f64::INFINITY || x == f64::INFINITY {
+        return f64::NAN;
+    }
+    let guess = (x - nc).max(1.0);
+    crate::beta::bracket_and_solve_root(|df| chndtr_inverse_residual(x, df, nc, p), guess, false)
 }
 
 /// Inverse of [`chndtr`] in the non-centrality `nc`.
 ///
 /// Returns `nc` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtrinc(x, df, p)`. The CDF is monotone (decreasing) in
-/// `nc ≥ 0`; if `p` exceeds the central value `chndtr(x, df, 0)` the result
-/// clamps toward 0 (as scipy does). `p ∉ (0, 1)` (or NaN) → NaN.
+/// `scipy.special.chndtrinc(x, df, p)`.
+///
+/// SciPy 1.17.1 answers with Boost's `find_non_centrality`
+/// (boost/math/distributions/non_central_chi_squared.hpp 627-658): from the guess
+/// `max(x − df, 1)` it walks by `bracket_and_solve_root` (the CDF falls as
+/// `nc` grows). When `p` is above the central CDF no `nc ≥ 0` reaches it, and the downward
+/// walk returns half the first subnormal it reaches: `chndtrinc(5, 3, 0.9) =
+/// 5.304989477e-315`, where the old fixed `[0, 1e8]` search returned its bound 0. That search
+/// also returned 0 for `chndtrinc(1e9, 3, 0.5)`, whose root is 999999997.9999998 in SciPy
+/// (frankenscipy-g9yid). `p ∈ {0, 1}`, `x = 0`, negative `x` or `df`, and NaN are NaN, as in
+/// SciPy.
+///
+/// SciPy is NaN from `x ≈ 4.18e10` (7.8e9 at `p = 0.99`), because Boost's series hits its term
+/// limit. [`chndtr`] deliberately stays finite there, and this inverse stays consistent with
+/// it and answers; each CDF call there walks on the order of `√x` Poisson terms. The owner may
+/// revisit that choice.
 #[must_use]
 pub fn chndtrinc(x: f64, df: f64, p: f64) -> f64 {
-    // x = inf: SciPy 1.17.1 chndtrinc(inf, 3, 0.5) = nan. chndtr is 1.0 there
-    // (frankenscipy-g9yid), so both bracket ends read 1.0 and `invert_monotone` would clamp
-    // to its nc = 0 bound; before g9yid the NaN chndtr stopped it instead.
-    if x.is_nan() || df.is_nan() || p.is_nan() || p <= 0.0 || p >= 1.0 || x == f64::INFINITY {
+    if x.is_nan() || df.is_nan() || p.is_nan() {
         return f64::NAN;
     }
-    invert_monotone(|nc| chndtr(x, df, nc), p, 0.0, 1e8)
+    // SciPy's wrapper rejects df < 0, x < 0 and p ∉ [0, 1]; Boost raises for p ∈ {0, 1}; and
+    // SciPy 1.17.1 is nan at x = 0: chndtrinc(0, 3, 0.5) = nan.
+    if df < 0.0 || x <= 0.0 || p <= 0.0 || p >= 1.0 {
+        return f64::NAN;
+    }
+    // x = inf: SciPy 1.17.1 chndtrinc(inf, 3, 0.5) = nan, while chndtr is 1.0 there
+    // (frankenscipy-g9yid).
+    if x == f64::INFINITY {
+        return f64::NAN;
+    }
+    let guess = (x - df).max(1.0);
+    crate::beta::bracket_and_solve_root(|nc| chndtr_inverse_residual(x, df, nc, p), guess, false)
 }
 
 /// Inverse complemented chi-squared distribution.
@@ -7370,7 +7389,9 @@ mod tests {
     /// endpoint.
     /// Must not change, SciPy 1.17.1: chndtrinc(5, 3, 0.5) = 2.8985299934839217,
     /// chndtridf(5, 0.5, 2) = 3.8373619908260497, and the below-range clamp
-    /// chndtrinc(2, 3, 0.5) = 2.65249474e-315 (fsci returns the nc = 0 bound).
+    /// chndtrinc(2, 3, 0.5) = 2.65249474e-315 (fsci returned the nc = 0 bound until
+    /// frankenscipy-g9yid ported Boost's walk; the exact value is asserted in
+    /// `chndtridf_chndtrinc_follow_boosts_walk`).
     #[test]
     fn chndtr_inverses_return_nan_on_a_nan_endpoint_like_scipy() {
         assert!(chndtrinc(f64::INFINITY, 3.0, 0.5).is_nan());
@@ -7388,6 +7409,146 @@ mod tests {
         );
         let clamped = chndtrinc(2.0, 3.0, 0.5);
         assert!(clamped.abs() < 1e-300, "chndtrinc clamp {clamped}");
+    }
+
+    /// frankenscipy-g9yid. chndtridf and chndtrinc follow Boost's `find_degrees_of_freedom` /
+    /// `find_non_centrality` walk (guess `max(x − nc, 1)` / `max(x − df, 1)`, factor 2, the
+    /// complement residual for `p ≥ 1/2`), which is what SciPy 1.17.1 runs. Every expected value
+    /// is SciPy read live. The first row of each group is one the old fixed-range search got
+    /// wrong: it returned its bound `1e-6` (chndtridf) or `0` (chndtrinc).
+    #[test]
+    fn chndtridf_chndtrinc_follow_boosts_walk() {
+        let p1 = 1.0 - f64::EPSILON / 2.0;
+        // No df > 0 (nc ≥ 0) reaches p, so the downward walk escapes below f64::MIN_POSITIVE
+        // and answers half of that point: guess·2⁻¹⁰⁴⁵.
+        let exact = [
+            (
+                "chndtridf(5, 0.5, 30)",
+                chndtridf(5.0, 0.5, 30.0),
+                2.65249474e-315,
+            ),
+            (
+                "chndtridf(5, 0.5, 1e8)",
+                chndtridf(5.0, 0.5, 1e8),
+                2.65249474e-315,
+            ),
+            (
+                "chndtridf(5, 1 - 2^-53, 2)",
+                chndtridf(5.0, p1, 2.0),
+                7.957484216e-315,
+            ),
+            (
+                "chndtridf(1e-300, 0.5, 2)",
+                chndtridf(1e-300, 0.5, 2.0),
+                2.65249474e-315,
+            ),
+            (
+                "chndtrinc(5, 3, 0.9)",
+                chndtrinc(5.0, 3.0, 0.9),
+                5.304989477e-315,
+            ),
+            (
+                "chndtrinc(30, 3, 0.9999999)",
+                chndtrinc(30.0, 3.0, 0.9999999),
+                7.1617357945e-314,
+            ),
+            (
+                "chndtrinc(2, 3, 0.5)",
+                chndtrinc(2.0, 3.0, 0.5),
+                2.65249474e-315,
+            ),
+        ];
+        for (label, got, want) in exact {
+            assert!(
+                got == want,
+                "{label} = {got:e}, SciPy 1.17.1 gives {want:e}"
+            );
+        }
+        // Domain edges SciPy answers NaN (the old search returned its bound at x = 0).
+        let nan_rows = [
+            ("chndtridf(0, 0.5, 2)", chndtridf(0.0, 0.5, 2.0)),
+            ("chndtrinc(0, 3, 0.5)", chndtrinc(0.0, 3.0, 0.5)),
+            ("chndtridf(5, 0.5, -1)", chndtridf(5.0, 0.5, -1.0)),
+            ("chndtridf(-1, 0.5, 2)", chndtridf(-1.0, 0.5, 2.0)),
+            ("chndtrinc(5, -1, 0.5)", chndtrinc(5.0, -1.0, 0.5)),
+            ("chndtrinc(5, 0, 0.5)", chndtrinc(5.0, 0.0, 0.5)),
+            ("chndtrinc(-1, 3, 0.5)", chndtrinc(-1.0, 3.0, 0.5)),
+        ];
+        for (label, got) in nan_rows {
+            assert!(got.is_nan(), "{label} = {got}, SciPy 1.17.1 gives nan");
+        }
+        // Roots outside the old fixed ranges, or on an underflow plateau of the CDF.
+        let roots = [
+            (
+                "chndtridf(3e10, 0.5, 2)",
+                chndtridf(3e10, 0.5, 2.0),
+                29999999998.66667,
+                1e-12,
+            ),
+            (
+                "chndtridf(5, 1e-300, 2)",
+                chndtridf(5.0, 1e-300, 2.0),
+                403.3387893865996,
+                1e-11,
+            ),
+            (
+                "chndtrinc(1e9, 3, 0.5)",
+                chndtrinc(1e9, 3.0, 0.5),
+                999999997.9999998,
+                1e-11,
+            ),
+            (
+                "chndtrinc(1000, 3, 1 - 2^-53)",
+                chndtrinc(1000.0, 3.0, p1),
+                546.465079667596,
+                1e-10,
+            ),
+            // Must not change: interior roots.
+            (
+                "chndtridf(5, 0.5, 2)",
+                chndtridf(5.0, 0.5, 2.0),
+                3.8373619908260497,
+                1e-12,
+            ),
+            (
+                "chndtrinc(5, 3, 0.5)",
+                chndtrinc(5.0, 3.0, 0.5),
+                2.8985299934839217,
+                1e-12,
+            ),
+        ];
+        for (label, got, want, rel) in roots {
+            assert!(
+                (got - want).abs() <= rel * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want} (rel tol {rel})"
+            );
+        }
+    }
+
+    /// frankenscipy-g9yid. chndtrix brackets by Boost's geometric walk, so a root far below 1 is
+    /// resolved to a relative tolerance. SciPy 1.17.1 values read live; the old `[0, hi]`
+    /// search returned 2.28e-19 for the first row (its absolute tolerance stopped at the first
+    /// false-position step).
+    #[test]
+    fn chndtrix_resolves_small_roots_like_scipy() {
+        let rows = [
+            (
+                "chndtrix(1e-20, 3, 2)",
+                chndtrix(1e-20, 3.0, 2.0),
+                2.1860014721757718e-13,
+            ),
+            (
+                "chndtrix(0.5, 3, 2)",
+                chndtrix(0.5, 3.0, 2.0),
+                4.137515123399119,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
     }
 
     /// frankenscipy-g9yid. chndtr and chndtrc at x = ±inf and at the edges of their domain,
