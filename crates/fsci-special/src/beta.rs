@@ -2978,24 +2978,66 @@ where
         | (_, _, SpecialTensor::ComplexVec(_)) => {
             not_yet_implemented(function, mode, "complex-valued path pending")
         }
-        _ => {
-            record_special_trace(
-                function,
-                mode,
-                "domain_error",
-                "unsupported_broadcast_pattern",
-                "fail_closed",
-                "unsupported broadcast pattern for ternary inputs",
-                false,
-            );
-            Err(SpecialError {
-                function,
-                kind: SpecialErrorKind::DomainError,
-                mode,
-                detail: "unsupported broadcast pattern for ternary inputs",
-            })
-        }
+        _ => broadcast_real_ternary(function, a, b, c, mode, kernel),
     }
+}
+
+/// The remaining real patterns of a ternary ufunc — two or three vectors, with any scalar
+/// repeated — broadcast as SciPy's ufuncs do: `betainc(a, b, x)` over three arrays of one
+/// length is the ordinary call. Vectors of different lengths, or an `Empty` tensor, are refused.
+/// Shared by the ternary mappers of `beta` and `bessel` (frankenscipy-6ln18).
+pub(crate) fn broadcast_real_ternary<F>(
+    function: &'static str,
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    c: &SpecialTensor,
+    mode: RuntimeMode,
+    kernel: F,
+) -> SpecialResult
+where
+    F: Fn(f64, f64, f64) -> Result<f64, SpecialError> + Sync,
+{
+    let args = [a, b, c];
+    let all_real = args
+        .iter()
+        .all(|t| matches!(t, SpecialTensor::RealScalar(_) | SpecialTensor::RealVec(_)));
+    let mut lengths = args.iter().filter_map(|t| match t {
+        SpecialTensor::RealVec(values) => Some(values.len()),
+        _ => None,
+    });
+    let len = lengths.next();
+    if let Some(n) = len
+        && all_real
+        && lengths.all(|other| other == n)
+    {
+        let at = |t: &SpecialTensor, i: usize| match t {
+            SpecialTensor::RealVec(values) => values[i],
+            SpecialTensor::RealScalar(value) => *value,
+            _ => f64::NAN,
+        };
+        return par_map_indices(n, |i| kernel(at(a, i), at(b, i), at(c, i)))
+            .map(SpecialTensor::RealVec);
+    }
+    let detail = if all_real && len.is_some() {
+        "vector inputs must have matching lengths"
+    } else {
+        "unsupported broadcast pattern for ternary inputs"
+    };
+    record_special_trace(
+        function,
+        mode,
+        "domain_error",
+        "unsupported_broadcast_pattern",
+        "fail_closed",
+        detail,
+        false,
+    );
+    Err(SpecialError {
+        function,
+        kind: SpecialErrorKind::DomainError,
+        mode,
+        detail,
+    })
 }
 
 /// Sign of Γ(x) on the real line. Γ > 0 for x > 0; for x < 0 it alternates on
@@ -4821,6 +4863,51 @@ mod tests {
             c1.re
         );
         assert!(c1.im.abs() < 1e-10);
+    }
+
+    /// SciPy's ufuncs broadcast `betainc(a, b, x)` over arrays of one length, with scalars
+    /// repeated. The ternary mapper used to accept one vector only and refused
+    /// `betainc(a_vec, b_vec, x_vec)` as an "unsupported broadcast pattern".
+    #[test]
+    fn ternary_ufuncs_broadcast_several_vectors() {
+        let a = vec![0.5, 2.0, 10.0, 30.0];
+        let b = vec![200.0, 2.0, 0.5, 30.0];
+        let x = vec![0.001, 0.5, 0.97, 0.45];
+        let (ta, tb, tx) = (
+            SpecialTensor::RealVec(a.clone()),
+            SpecialTensor::RealVec(b.clone()),
+            SpecialTensor::RealVec(x.clone()),
+        );
+        let expect = |i: usize, bi: f64| {
+            betainc_scalar(a[i], bi, x[i], RuntimeMode::Strict).expect("scalar betainc")
+        };
+        let vector = |t: SpecialTensor| match t {
+            SpecialTensor::RealVec(values) => values,
+            _ => Vec::new(),
+        };
+        let all = vector(betainc(&ta, &tb, &tx, RuntimeMode::Strict).expect("three vectors"));
+        assert_eq!(all.len(), 4);
+        for (i, got) in all.iter().enumerate() {
+            assert_eq!(got.to_bits(), expect(i, b[i]).to_bits(), "element {i}");
+        }
+        let b_scalar = SpecialTensor::RealScalar(3.0);
+        let mixed =
+            vector(betainc(&ta, &b_scalar, &tx, RuntimeMode::Strict).expect("vec, scalar, vec"));
+        assert_eq!(mixed.len(), 4);
+        for (i, got) in mixed.iter().enumerate() {
+            assert_eq!(got.to_bits(), expect(i, 3.0).to_bits(), "element {i}");
+        }
+        let short = SpecialTensor::RealVec(vec![0.5, 0.5]);
+        let err = betainc(&ta, &tb, &short, RuntimeMode::Strict).expect_err("mismatched lengths");
+        assert_eq!(err.kind, SpecialErrorKind::DomainError);
+        assert_eq!(err.detail, "vector inputs must have matching lengths");
+        assert!(betainc(&ta, &tb, &SpecialTensor::Empty, RuntimeMode::Strict).is_err());
+        // The same mapper serves betaincc, and bessel's wright_bessel shares the helper.
+        let comp = vector(betaincc(&ta, &tb, &tx, RuntimeMode::Strict).expect("betaincc vectors"));
+        assert_eq!(comp.len(), 4);
+        let wb = crate::bessel::wright_bessel(&ta, &tb, &tx, RuntimeMode::Strict)
+            .expect("wright_bessel vectors");
+        assert!(matches!(wb, SpecialTensor::RealVec(ref v) if v.len() == 4));
     }
 
     #[test]

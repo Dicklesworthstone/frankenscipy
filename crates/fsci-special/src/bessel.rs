@@ -3781,23 +3781,7 @@ where
         | (_, _, SpecialTensor::ComplexVec(_)) => {
             not_yet_implemented(function, mode, "complex-valued path pending")
         }
-        _ => {
-            record_special_trace(
-                function,
-                mode,
-                "domain_error",
-                "unsupported_broadcast_pattern",
-                "fail_closed",
-                "unsupported broadcast pattern for ternary inputs",
-                false,
-            );
-            Err(SpecialError {
-                function,
-                kind: SpecialErrorKind::DomainError,
-                mode,
-                detail: "unsupported broadcast pattern for ternary inputs",
-            })
-        }
+        _ => crate::beta::broadcast_real_ternary(function, a, b, c, mode, kernel),
     }
 }
 
