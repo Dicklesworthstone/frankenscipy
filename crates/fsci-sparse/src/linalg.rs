@@ -32119,6 +32119,10 @@ fn add_scaled(y: &mut [f64], a: f64, x: &[f64]) {
     }
 }
 
+/// Entries per block in the Krylov basis kernels: 512 f64 (4 KiB) of the vector being built
+/// stays in L1 while each basis vector's block passes over it.
+const KRYLOV_BLOCK: usize = 512;
+
 /// `⟨a, b⟩` over eight independent partial sums, combined pairwise at the end.
 ///
 /// The Krylov–Schur orthogonalization spends almost all of eigsh/eigs in these dots (80% of a
@@ -32254,9 +32258,17 @@ impl<'b> KrylovBasis<'b> {
         let mut coeff = vec![0.0; len];
         for _pass in 0..2 {
             let c: Vec<f64> = (0..len).map(|i| krylov_dot(self.bvec(i), w)).collect();
-            for (i, &ci) in c.iter().enumerate() {
-                coeff[i] += ci;
-                add_scaled(w, -ci, &self.v[i]);
+            for (total, &ci) in coeff.iter_mut().zip(&c) {
+                *total += ci;
+            }
+            // w −= Σ c_i v_i, blocked so a block of w stays in L1 while every basis vector
+            // passes over it; each entry subtracts in i order, as the unblocked loop did.
+            for start in (0..self.n).step_by(KRYLOV_BLOCK) {
+                let end = (start + KRYLOV_BLOCK).min(self.n);
+                let w_block = &mut w[start..end];
+                for (vi, &ci) in self.v.iter().zip(&c) {
+                    add_scaled(w_block, -ci, &vi[start..end]);
+                }
             }
         }
         let bw = self.b_times(w);
@@ -32300,8 +32312,40 @@ impl<'b> KrylovBasis<'b> {
         Ok(None)
     }
 
+    /// [`Self::combine`] for several coefficient columns at once, `coefs[t][j]` weighting `v_j`
+    /// in output `t`. The loops run over blocks of [`KRYLOV_BLOCK`] entries, so each basis
+    /// block is read once for every output, as a dgemm reads it, where one `combine` per output
+    /// streamed the whole basis each time (the restarts were a quarter of a k = 20 eigsh,
+    /// frankenscipy-f5kx5). Every entry still adds its terms in `j` order, skipping zero
+    /// coefficients, so each output is bit-identical to `combine`'s.
+    fn combine_many(&self, count: usize, coefs: &[Vec<f64>]) -> Vec<(Vec<f64>, Option<Vec<f64>>)> {
+        let mut out: Vec<(Vec<f64>, Option<Vec<f64>>)> = coefs
+            .iter()
+            .map(|_| (vec![0.0; self.n], self.mass.map(|_| vec![0.0; self.n])))
+            .collect();
+        for start in (0..self.n).step_by(KRYLOV_BLOCK) {
+            let end = (start + KRYLOV_BLOCK).min(self.n);
+            for j in 0..count {
+                let vj = &self.v[j][start..end];
+                let bvj = self.mass.map(|_| &self.bv[j][start..end]);
+                for ((x, bx), c) in out.iter_mut().zip(coefs) {
+                    let cj = c[j];
+                    if cj == 0.0 {
+                        continue;
+                    }
+                    add_scaled(&mut x[start..end], cj, vj);
+                    if let (Some(bx), Some(bvj)) = (bx.as_mut(), bvj) {
+                        add_scaled(&mut bx[start..end], cj, bvj);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `Σ_j coef(j)·v_j` over the first `count` basis vectors, with the same combination of the
-    /// `B·v_j`.
+    /// `B·v_j`. The unblocked reference [`Self::combine_many`] is held to, bit for bit.
+    #[cfg(test)]
     fn combine(&self, count: usize, coef: impl Fn(usize) -> f64) -> (Vec<f64>, Option<Vec<f64>>) {
         let mut x = vec![0.0; self.n];
         let mut bx = self.mass.map(|_| vec![0.0; self.n]);
@@ -32553,8 +32597,11 @@ where
                     iterations,
                     applications,
                 };
-                for &i in &wanted {
-                    let (mut x, mut bx) = basis.combine(size, |j| y[(j, i)]);
+                let columns: Vec<Vec<f64>> = wanted
+                    .iter()
+                    .map(|&i| (0..size).map(|j| y[(j, i)]).collect())
+                    .collect();
+                for (&i, (mut x, mut bx)) in wanted.iter().zip(basis.combine_many(size, &columns)) {
                     normalize_with(&mut x, bx.as_mut());
                     out.theta.push(theta[i]);
                     out.vectors.push(x);
@@ -32576,8 +32623,11 @@ where
         let kept_idx = select_symmetric(&theta, settings.which, keep);
         let mut new_v = Vec::with_capacity(m + 1);
         let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
-        for &i in &kept_idx {
-            let (x, bx) = basis.combine(size, |j| y[(j, i)]);
+        let columns: Vec<Vec<f64>> = kept_idx
+            .iter()
+            .map(|&i| (0..size).map(|j| y[(j, i)]).collect())
+            .collect();
+        for (x, bx) in basis.combine_many(size, &columns) {
             new_v.push(x);
             if let Some(bx) = bx {
                 new_bv.push(bx);
@@ -32907,10 +32957,20 @@ where
                     iterations,
                     applications,
                 };
-                for (idx, (y, c)) in ritz.iter().enumerate() {
+                let columns: Vec<Vec<f64>> = ritz
+                    .iter()
+                    .flat_map(|(y, _)| {
+                        [
+                            (0..size).map(|j| y[j].0).collect(),
+                            (0..size).map(|j| y[j].1).collect(),
+                        ]
+                    })
+                    .collect();
+                let mut parts = basis.combine_many(size, &columns).into_iter();
+                for (idx, (_, c)) in ritz.iter().enumerate() {
                     let value = values[order[idx]];
-                    let (mut xr, _) = basis.combine(size, |j| y[j].0);
-                    let (mut xi, _) = basis.combine(size, |j| y[j].1);
+                    let (mut xr, _) = parts.next().unwrap_or_default();
+                    let (mut xi, _) = parts.next().unwrap_or_default();
                     complex_b_normalize(&mut xr, &mut xi, mass);
                     out.theta.push((value.re, value.im));
                     out.vectors.push((xr, xi));
@@ -32969,8 +33029,10 @@ where
 
         let mut new_v = Vec::with_capacity(m + 1);
         let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
-        for s in 0..keep {
-            let (x, bx) = basis.combine(size, |j| schur.q[(j, s)]);
+        let columns: Vec<Vec<f64>> = (0..keep)
+            .map(|s| (0..size).map(|j| schur.q[(j, s)]).collect())
+            .collect();
+        for (x, bx) in basis.combine_many(size, &columns) {
             new_v.push(x);
             if let Some(bx) = bx {
                 new_bv.push(bx);
@@ -34335,6 +34397,52 @@ mod krylov_eigen_tests {
             Some(EigsWhich::SmallestAlgebraic)
         );
         assert!("XX".parse::<EigsWhich>().is_err());
+    }
+
+    /// combine_many (blocked over KRYLOV_BLOCK entries) against one unblocked combine per
+    /// output, to the bit, with a mass matrix, a length that is not a multiple of the block,
+    /// zero coefficients and signed zeros (frankenscipy-f5kx5).
+    #[test]
+    fn blocked_basis_combinations_are_bit_identical() {
+        let n = 2 * KRYLOV_BLOCK + 37;
+        let mass = csr(n, vec![2.0; n], (0..n).collect(), (0..n).collect());
+        let mut basis = KrylovBasis::new(n, Some(&mass));
+        for j in 0..7 {
+            let v: Vec<f64> = (0..n)
+                .map(|i| ((i * 31 + j * 17) % 97) as f64 / 97.0 - 0.5)
+                .collect();
+            let bv: Vec<f64> = v.iter().map(|x| 2.0 * x).collect();
+            basis.push(v, Some(bv));
+        }
+        let columns: Vec<Vec<f64>> = (0..4)
+            .map(|t| {
+                (0..7)
+                    .map(|j| match (t + j) % 5 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        r => (r as f64).mul_add(0.37, -(t as f64) * 0.11),
+                    })
+                    .collect()
+            })
+            .collect();
+        let blocked = basis.combine_many(7, &columns);
+        assert_eq!(blocked.len(), columns.len());
+        for (column, (x, bx)) in columns.iter().zip(&blocked) {
+            let (rx, rbx) = basis.combine(7, |j| column[j]);
+            assert!(x.iter().zip(&rx).all(|(a, b)| a.to_bits() == b.to_bits()));
+            let (bx, rbx) = (bx.as_ref().expect("mass"), rbx.expect("mass"));
+            assert!(bx.iter().zip(&rbx).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        // Must-differ control: the comparison sees a one-ulp change.
+        let (rx, _) = basis.combine(7, |j| columns[0][j]);
+        let mut nudged = blocked[0].0.clone();
+        nudged[n - 1] = f64::from_bits(nudged[n - 1].to_bits() ^ 1);
+        assert!(
+            !nudged
+                .iter()
+                .zip(&rx)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
     }
 
     #[test]
