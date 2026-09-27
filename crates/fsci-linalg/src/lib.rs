@@ -5196,11 +5196,24 @@ pub fn lu_solve(lu_factor: &LuFactorResult, b: &[f64]) -> Result<SolveResult, Li
     })
 }
 
-/// QR decomposition: A = QR.
+/// QR decomposition `A = Q·R` in SciPy's default `mode='full'`: `Q` is m×m orthogonal and `R`
+/// is m×n upper trapezoidal, with zero rows below `min(m, n)`.
 ///
-/// Returns orthogonal Q and upper triangular R.
-/// Matches `scipy.linalg.qr(a)`.
+/// Matches `scipy.linalg.qr(a)` up to the signs of Q's columns and R's rows (the Householder
+/// sign convention). For a tall `A` this used to return the economic factors (Q m×n) under the
+/// default name (frankenscipy-kqeao); those are now [`qr_economic`]. For `m ≤ n` the two modes
+/// coincide and the result is unchanged.
 pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgError> {
+    qr_factors(a, options, true)
+}
+
+/// Economic QR, `scipy.linalg.qr(a, mode='economic')`: `Q` is m×k and `R` is k×n with
+/// `k = min(m, n)`.
+pub fn qr_economic(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgError> {
+    qr_factors(a, options, false)
+}
+
+fn qr_factors(a: &[Vec<f64>], options: DecompOptions, full: bool) -> Result<QrResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
@@ -5214,11 +5227,22 @@ pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgErro
 
     let matrix = dmatrix_from_rows(a)?;
     let qr_decomp = matrix.qr();
-    let q_mat = qr_decomp.q();
-    let r_mat = qr_decomp.r();
+    let (q, r) = if full && rows > cols {
+        // The complete Q: the Householder reflectors applied to the m×m identity give Qᵀ.
+        let mut q_transpose = DMatrix::<f64>::identity(rows, rows);
+        qr_decomp.q_tr_mul(&mut q_transpose);
+        let mut r = rows_from_dmatrix(&qr_decomp.r());
+        r.resize(rows, vec![0.0; cols]);
+        (rows_from_dmatrix(&q_transpose.transpose()), r)
+    } else {
+        (
+            rows_from_dmatrix(&qr_decomp.q()),
+            rows_from_dmatrix(&qr_decomp.r()),
+        )
+    };
 
     emit_trace(LinalgTrace {
-        operation: "qr",
+        operation: if full { "qr" } else { "qr_economic" },
         matrix_size: (rows, cols),
         mode: options.mode,
         rcond: None,
@@ -5226,10 +5250,7 @@ pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgErro
         error: None,
     });
 
-    Ok(QrResult {
-        q: rows_from_dmatrix(&q_mat),
-        r: rows_from_dmatrix(&r_mat),
-    })
+    Ok(QrResult { q, r })
 }
 
 /// QR decomposition returning only the upper-trapezoidal factor `R`, skipping the
@@ -5262,7 +5283,10 @@ pub fn qr_r(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Lin
         error: None,
     });
 
-    Ok(rows_from_dmatrix(&r_mat))
+    // SciPy's mode='r' R is m×n, like mode='full' (frankenscipy-kqeao).
+    let mut r = rows_from_dmatrix(&r_mat);
+    r.resize(rows, vec![0.0; cols]);
+    Ok(r)
 }
 
 /// RQ decomposition: factor `A = R·Q` with `R` upper-trapezoidal (m×n) and `Q`
@@ -33527,6 +33551,114 @@ mod tests {
     }
 
     // ── QR decomposition tests ──────────────────────────────────────
+
+    /// frankenscipy-kqeao: `qr` is scipy.linalg.qr's default mode='full' (Q m×m, R m×n); for a
+    /// tall A it returned the economic factors (Q 4×3), which are now `qr_economic`. scipy
+    /// 1.17.1, live, on a = [[2, −1, 0], [1, 3, 1], [0, 1, 4], [1, 0, 1]]: Q 4×4 and R 4×3
+    /// below, mode='economic' Q 4×3 / R 3×3, and mode='r' R 4×3. Q's columns and R's rows are
+    /// compared up to the Householder sign of each column (for m − k = 1 the fourth column is
+    /// unique up to sign too).
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn qr_default_mode_is_scipys_full_mode() {
+        let a = vec![
+            vec![2.0, -1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 4.0],
+            vec![1.0, 0.0, 1.0],
+        ];
+        let scipy_q: [[f64; 4]; 4] = [
+            [
+                -0.816_496_580_927_726,
+                0.405_095_746_833_466_7,
+                -0.042_295_493_443_781_36,
+                -0.409_196_603_682_284_1,
+            ],
+            [
+                -0.408_248_290_463_863,
+                -0.860_828_462_021_116_8,
+                0.296_068_454_106_469_5,
+                -0.068_199_433_947_047_36,
+            ],
+            [
+                0.0,
+                -0.303_821_810_125_1,
+                -0.930_500_855_763_189_7,
+                -0.204_598_301_841_142_03,
+            ],
+            [
+                -0.408_248_290_463_863,
+                0.050_636_968_354_183_34,
+                -0.211_477_467_218_906_76,
+                0.886_592_641_311_615_5,
+            ],
+        ];
+        let scipy_r: [[f64; 3]; 4] = [
+            [
+                -2.449_489_742_783_178,
+                -0.408_248_290_463_863,
+                -0.816_496_580_927_726,
+            ],
+            [0.0, -3.291_402_943_021_916_3, -2.025_478_734_167_333_7],
+            [0.0, 0.0, -3.637_412_436_165_197],
+            [0.0, 0.0, 0.0],
+        ];
+        let full = qr(&a, DecompOptions::default()).expect("qr");
+        assert_eq!((full.q.len(), full.q[0].len()), (4, 4), "Q is m x m");
+        assert_eq!((full.r.len(), full.r[0].len()), (4, 3), "R is m x n");
+        assert_eq!(full.r[3], vec![0.0; 3], "R's row below min(m, n) is zero");
+        for j in 0..4 {
+            // The column's sign from its largest SciPy entry.
+            let pivot = (0..4)
+                .max_by(|&x, &y| scipy_q[x][j].abs().total_cmp(&scipy_q[y][j].abs()))
+                .unwrap_or(0);
+            let sign = (full.q[pivot][j] * scipy_q[pivot][j]).signum();
+            for i in 0..4 {
+                assert!(
+                    (sign * full.q[i][j] - scipy_q[i][j]).abs() <= 1e-14,
+                    "Q[{i}][{j}] = {} vs scipy {}",
+                    full.q[i][j],
+                    scipy_q[i][j]
+                );
+            }
+            if j < 3 {
+                for k in 0..3 {
+                    assert!(
+                        (sign * full.r[j][k] - scipy_r[j][k]).abs() <= 1e-13,
+                        "R[{j}][{k}] = {} vs scipy {}",
+                        full.r[j][k],
+                        scipy_r[j][k]
+                    );
+                }
+            }
+        }
+        // Q is orthogonal and Q·R reproduces A.
+        for i in 0..4 {
+            for j in 0..4 {
+                let dot: f64 = (0..4).map(|k| full.q[k][i] * full.q[k][j]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - want).abs() <= 1e-14, "QᵀQ[{i}][{j}] = {dot}");
+            }
+            for j in 0..3 {
+                let qr_val: f64 = (0..4).map(|k| full.q[i][k] * full.r[k][j]).sum();
+                assert!(
+                    (qr_val - a[i][j]).abs() <= 1e-14,
+                    "(QR)[{i}][{j}] = {qr_val}"
+                );
+            }
+        }
+        let economic = qr_economic(&a, DecompOptions::default()).expect("economic qr");
+        assert_eq!((economic.q.len(), economic.q[0].len()), (4, 3));
+        assert_eq!((economic.r.len(), economic.r[0].len()), (3, 3));
+        let r_only = qr_r(&a, DecompOptions::default()).expect("qr_r");
+        assert_eq!(r_only, full.r, "mode='r' is the full R");
+        // Square and wide inputs: both modes coincide.
+        let wide = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 7.0]];
+        assert_eq!(
+            qr(&wide, DecompOptions::default()).expect("wide"),
+            qr_economic(&wide, DecompOptions::default()).expect("wide economic")
+        );
+    }
 
     #[test]
     #[allow(clippy::needless_range_loop)]

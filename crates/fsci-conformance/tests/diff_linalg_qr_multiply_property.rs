@@ -143,17 +143,8 @@ fn diff_linalg_qr_multiply_property() {
 
     for (label, a, c) in probes {
         let case_id = format!("qr_multiply_{label}");
-        if a.len() > a[0].len() {
-            // fsci's qr returns the thin Q (m x n) where scipy.linalg.qr(a) returns m x m, so a C
-            // with A's row count cannot be multiplied by it.
-            ledger.allowlisted(
-                "qr_multiply",
-                &case_id,
-                "frankenscipy-kqeao",
-                "qr returns economic factors for a tall A",
-            );
-            continue;
-        }
+        // qr returns SciPy's full Q (m x m), so a C with A's row count multiplies it for tall A
+        // too (frankenscipy-kqeao).
         let qr_res = qr(a, opts).ok();
         let via_mul = qr_res.as_ref().and_then(|r| matmul(&r.q, c).ok());
         let via_qrm = qr_res
@@ -210,11 +201,6 @@ fn diff_linalg_qr_multiply_property() {
         diffs.len(),
         max_overall
     );
-    // every square probe compares; the tall ones wait on frankenscipy-kqeao
-    ledger.finish(
-        probes
-            .iter()
-            .filter(|(_, a, _)| a.len() <= a[0].len())
-            .count(),
-    );
+    // every probe compares, the tall ones included
+    ledger.finish(probes.len());
 }
