@@ -21,6 +21,9 @@ pub mod airy;
 pub mod audit;
 pub mod bessel;
 pub mod beta;
+// TOMS 708 `bratio`, the incomplete beta kernel behind `beta` (frankenscipy-5pnba). Private and
+// std-only: a self-contained port with its own cdflib helpers, checked bit-for-bit against the C.
+mod bratio;
 pub mod convenience;
 pub mod elliptic;
 pub mod error;

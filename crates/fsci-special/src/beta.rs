@@ -306,8 +306,8 @@ pub fn btdtrc(a: f64, b: f64, x: f64) -> f64 {
     if x >= 1.0 {
         return 0.0;
     }
-    // btdtrc(a, b, x) = 1 - betainc(a, b, x) = betainc(b, a, 1-x)
-    betainc_scalar(b, a, 1.0 - x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    // bratio's complement 1 − I_x(a, b), computed directly (frankenscipy-5pnba).
+    betaincc_with_complement(a, b, x, 1.0 - x)
 }
 
 /// Inverse beta distribution CDF.
@@ -410,8 +410,15 @@ pub fn fdtr(dfn: f64, dfd: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
-    let z = dfn * x / (dfn * x + dfd);
-    btdtr(0.5 * dfn, 0.5 * dfd, z)
+    // 1 − z in closed form, dfd/(dfn·x + dfd), so a large x keeps the digits of the upper
+    // tail (frankenscipy-5pnba). NaN arguments (x = inf gives inf/inf) propagate.
+    let denom = dfn * x + dfd;
+    let z = dfn * x / denom;
+    let z1 = dfd / denom;
+    if z.is_nan() || z1.is_nan() {
+        return f64::NAN;
+    }
+    betainc_with_complement(0.5 * dfn, 0.5 * dfd, z, z1).unwrap_or(f64::NAN)
 }
 
 /// F-distribution survival function.
@@ -430,10 +437,15 @@ pub fn fdtrc(dfn: f64, dfd: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 1.0;
     }
-    // fdtrc(dfn, dfd, x) = 1 - fdtr(dfn, dfd, x)
-    // = 1 - btdtr(dfn/2, dfd/2, z) = btdtr(dfd/2, dfn/2, 1-z)
-    let z = dfn * x / (dfn * x + dfd);
-    btdtr(0.5 * dfd, 0.5 * dfn, 1.0 - z)
+    // fdtrc(dfn, dfd, x) = 1 − I_z(dfn/2, dfd/2): bratio's complement, with 1 − z in closed
+    // form (frankenscipy-5pnba).
+    let denom = dfn * x + dfd;
+    let z = dfn * x / denom;
+    let z1 = dfd / denom;
+    if z.is_nan() || z1.is_nan() {
+        return f64::NAN;
+    }
+    betaincc_with_complement(0.5 * dfn, 0.5 * dfd, z, z1)
 }
 
 /// Inverse F-distribution CDF.
@@ -704,14 +716,18 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         return 1.0;
     }
     let y = dfn * f / denom;
-    if nc == 0.0 {
-        return btdtr(0.5 * dfn, 0.5 * dfd, y);
-    }
     // 1 − y in closed form, as in `ncfdtrc` (frankenscipy-g9yid). `1.0 - y` carries the
     // rounding of y as a relative error of up to ε·dfn·f/(2·dfd) in 1 − y, 4.6e-6 near the
     // mean at λ = 1e12, and ncfdtr there missed by 3.5e-6 with saddle-point anchors. With y1
     // it misses by 1.3e-9.
     let y1 = dfd / denom;
+    if nc == 0.0 {
+        // The central law takes the same closed-form complement (frankenscipy-5pnba): at
+        // dfd = 1e-100, y rounds to 1 and `btdtr(…, y)` said 1.0, where the law is ~1e-98,
+        // continuous with nc > 0 (SciPy's ncfdtr(3, 1e-100, 1, 1.5) = 1.15e-98). SciPy's own
+        // cdflib `cumf` passes both, which is how its ncfdtridfd(3, ·, 0, 1.5) finds dfd = 20.
+        return betainc_with_complement(0.5 * dfn, 0.5 * dfd, y, y1).unwrap_or(f64::NAN);
+    }
     let lam = nc / 2.0;
     let j0 = lam.floor();
     // frankenscipy-qu5po: the walk cannot step from here (see `POISSON_INDEX_LIMIT`).
@@ -844,9 +860,9 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
 ///    the anchor and the `(1−y)^b` factor of `u` (as `b·ln(y1)`, where [`ncfdtr`] can
 ///    afford `ln_1p(−y)`).
 ///
-/// The anchor `Q_y(a₀, b)` is `I_{1−y}(b, a₀)` evaluated directly by
-/// [`betainc_scalar`] — a series/continued-fraction evaluation that underflows
-/// gracefully — so no probability is ever obtained by subtracting from one.
+/// The anchor `Q_y(a₀, b)` is the incomplete beta kernel's own complement `1 − I_y(a₀, b)`,
+/// which it computes directly and which underflows gracefully, so no probability is ever
+/// obtained by subtracting from one.
 ///
 /// Boundaries: `f ≤ 0 → 1`, `nc = 0` degenerates to the central `I_{1−y}(dfd/2, dfn/2)`,
 /// non-positive `dfn`/`dfd` or negative `nc` → NaN.
@@ -878,10 +894,8 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     let y1 = dfd / denom;
     let b = 0.5 * dfd;
     if nc == 0.0 {
-        // Central F survival: Q_y(dfn/2, dfd/2) = I_{1−y}(dfd/2, dfn/2).
-        return betainc_scalar(b, 0.5 * dfn, y1, RuntimeMode::Strict)
-            .unwrap_or(f64::NAN)
-            .clamp(0.0, 1.0);
+        // Central F survival: Q_y(dfn/2, dfd/2), bratio's complement at the exact y and y1.
+        return betaincc_with_complement(0.5 * dfn, b, y, y1).clamp(0.0, 1.0);
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
@@ -893,8 +907,9 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     let w0 = gamma::poisson_term(j0, lam);
 
     let a0 = 0.5 * dfn + j0;
-    // Q_y(a0, b) = I_{1−y}(b, a0), computed DIRECTLY — never 1 − I_y(a0, b).
-    let q0 = betainc_scalar(b, a0, y1, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    // Q_y(a0, b) = 1 − I_y(a0, b), computed DIRECTLY as bratio's complement (at the exact y and
+    // y1, frankenscipy-5pnba) — never by subtracting from 1.
+    let q0 = betaincc_with_complement(a0, b, y, y1);
     // u(a) = y^a (1−y)^b · Γ(a+b)/(Γ(a+1)Γ(b)), the recurrence increment shared
     // with `ncfdtr`; (1−y)^b taken from y1 so it stays exact for y → 1.
     let u0 = beta_term(a0, b, y, y1);
@@ -963,8 +978,22 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
 /// Inverse of [`ncfdtr`] in the argument `f`.
 ///
 /// Returns `f` such that `ncfdtr(dfn, dfd, nc, f) = p`, matching
-/// `scipy.special.ncfdtri(dfn, dfd, nc, p)`. Monotone increasing in `f`, solved
-/// by bracket-and-bisect. `p = 0 → 0`, `p = 1 → +∞`, `p ∉ [0, 1]` → NaN.
+/// `scipy.special.ncfdtri(dfn, dfd, nc, p)`. `p = 0 → 0`, `p = 1 → +∞`, `p ∉ [0, 1]` → NaN.
+///
+/// SciPy 1.17.1 answers with Boost's quantile, which brackets the root by a geometric walk
+/// from a guess and never searches a linear range. This does the same with
+/// `bracket_and_solve_root` from `f = 1` (frankenscipy-g9yid), so a root many decades
+/// below 1 is bracketed in O(log) CDF calls and then resolved to a relative tolerance:
+/// SciPy gives `ncfdtri(3, 5, 2, 1e-20) = 6.67000004655459e-14`, where the old `[0, hi]`
+/// search stopped at its first false-position step, 5.92e-20. For `p ≥ 1/2` the residual is
+/// `q − ncfdtrc` with `q = 1 − p`, Boost's complement form. The answer is only as good as
+/// [`ncfdtr`] at the root: where both of its mode anchors underflow it returns 0, so a `p` far
+/// below `1e-300` (SciPy: `ncfdtri(3, 5, 2, 1e-300) = 1.4370079482811187e-200`) is not
+/// resolved there.
+///
+/// SciPy is NaN from `nc ≈ 1.0293e10` for every `p`, `dfn` and `dfd` measured (Boost's series
+/// hits its term limit), while [`ncfdtr`] deliberately stays finite there, and this inverse
+/// stays consistent with it and answers. The owner may revisit that choice.
 #[must_use]
 pub fn ncfdtri(dfn: f64, dfd: f64, nc: f64, p: f64) -> f64 {
     if dfn.is_nan() || dfd.is_nan() || nc.is_nan() || p.is_nan() || !(0.0..=1.0).contains(&p) {
@@ -981,68 +1010,294 @@ pub fn ncfdtri(dfn: f64, dfd: f64, nc: f64, p: f64) -> f64 {
     if p == 1.0 {
         return f64::INFINITY;
     }
-    let mut hi = 1.0_f64;
-    let mut fhi = ncfdtr(dfn, dfd, nc, hi) - p;
-    while fhi < 0.0 {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
-        }
-        fhi = ncfdtr(dfn, dfd, nc, hi) - p;
+    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) makes the walk return NaN rather than a
+    // bracket. SciPy 1.17.1: ncfdtri(3, 5, 2^60, 0.5) = nan.
+    let q = 1.0 - p;
+    if p < q {
+        bracket_and_solve_root(|x| ncfdtr(dfn, dfd, nc, x) - p, 1.0, true)
+    } else {
+        bracket_and_solve_root(|x| q - ncfdtrc(dfn, dfd, nc, x), 1.0, true)
     }
-    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) ends the doubling without bracketing
-    // anything, and `illinois_root` would turn it into an arbitrary midpoint.
-    // SciPy 1.17.1: ncfdtri(3, 5, 2^60, 0.5) = nan.
-    if fhi.is_nan() {
-        return f64::NAN;
-    }
-    let lo = 0.0_f64;
-    let flo = ncfdtr(dfn, dfd, nc, lo) - p; // ncfdtr(f=0) = 0 < p
-    illinois_root(|x| ncfdtr(dfn, dfd, nc, x) - p, lo, hi, flo, fhi)
 }
 
 /// Inverse of [`ncfdtr`] in the non-centrality `nc`.
 ///
 /// Returns `nc ≥ 0` such that `ncfdtr(dfn, dfd, nc, f) = p`, matching
-/// `scipy.special.ncfdtrinc(dfn, dfd, p, f)`. The non-central F CDF is decreasing
-/// in `nc`, so bracket-and-bisect on `[0, hi]`. If `p` exceeds the central
-/// (`nc = 0`) CDF, no non-negative `nc` solves it and the result is `0` (scipy's
-/// convention); `p = 0` needs `nc → ∞`. Agreement with scipy is limited by
-/// scipy's own DINVR tolerance (~1e-6); this root makes `ncfdtr(result) = p`
-/// tighter than that. frankenscipy.
+/// `scipy.special.ncfdtrinc(dfn, dfd, p, f)`.
+///
+/// SciPy 1.17.1 answers with cdflib's `cdffnc_which5` (scipy/special/cdflib.c 1855-1906),
+/// which searches `nc ∈ [0, 1e4]` from `nc = 5` and returns a bound when the root is outside:
+/// `0` when `p` is above the central (`nc = 0`) CDF, and `1e4` when the CDF at `nc = 1e4` is
+/// still above `p`. `cdflib_invert` reproduces that search on fsci's own [`ncfdtr`]
+/// (frankenscipy-g9yid). SciPy gives `ncfdtrinc(3, 5, 0.5, f) = 1e4` for `f = 1e4`, `1e6`,
+/// `1e300` and `inf`, where the old unbounded doubling returned 2.6e6, NaN after about 2.4e9
+/// Poisson-walk steps, and `+inf`. `p` must lie in `[0, 1 − 1e-16]`, so `p = 1` is NaN.
+///
+/// Inside `(0, 1e4)` the root is fsci's: cdflib sums its CDF only to a relative 1e-4
+/// (`cumfnc`, cdflib.c 2952), so SciPy's interior values differ from the exact root by up
+/// to about 1e-5 relative (1e-3 at `f ≈ 1e3`). Where cdflib's own CDF underflows to 0 SciPy
+/// returns that artifact, e.g. `ncfdtrinc(3, 5, 1e-300, 2) = 9769.9999995115`; this does not
+/// copy it.
 #[must_use]
 pub fn ncfdtrinc(dfn: f64, dfd: f64, p: f64, f: f64) -> f64 {
-    if dfn.is_nan() || dfd.is_nan() || p.is_nan() || f.is_nan() || !(0.0..=1.0).contains(&p) {
+    if dfn.is_nan() || dfd.is_nan() || p.is_nan() || f.is_nan() {
         return f64::NAN;
     }
-    if dfn <= 0.0 || dfd <= 0.0 || f < 0.0 {
+    if !cdflib_p_in_range(p) || f < 0.0 || dfn <= 0.0 || dfd <= 0.0 {
         return f64::NAN;
     }
-    // The CDF is largest at nc = 0; a target above it has no nc ≥ 0 solution.
-    if p >= ncfdtr(dfn, dfd, 0.0, f) {
-        return 0.0;
+    // cdffnc_which5: DS.small = 0, DS.big = 1e4; bounds 0 / 1e4 (cdflib.c 1862-1863, 1900).
+    match cdflib_invert(|nc| ncfdtr(dfn, dfd, nc, f), p, 0.0, 1e4) {
+        CdflibSearch::Root(nc) => nc,
+        CdflibSearch::BelowLow => 0.0,
+        CdflibSearch::AboveHigh => 1e4,
+        CdflibSearch::Undefined => f64::NAN,
     }
-    if p == 0.0 {
-        return f64::INFINITY;
+}
+
+/// cdflib's probability domain for its inverses: `0 ≤ p ≤ 1 − 1e-16` (for example
+/// scipy/special/cdflib.c 1873), so `p = 1` and anything above it are NaN in SciPy 1.17.1.
+/// `1 − 1e-16` rounds to `1 − 2⁻⁵³`, the largest double below 1, which is allowed.
+fn cdflib_p_in_range(p: f64) -> bool {
+    (0.0..=1.0 - 1e-16).contains(&p)
+}
+
+/// What cdflib's `dinvr` concluded about a root (frankenscipy-g9yid).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CdflibSearch {
+    /// A root inside `[small, big]`.
+    Root(f64),
+    /// No root: the answer lies below `small` (cdflib status 1).
+    BelowLow,
+    /// No root: the answer lies above `big` (cdflib status 2).
+    AboveHigh,
+    /// A CDF value was NaN. cdflib's own CDFs never are, so this is fsci's fail-closed exit.
+    Undefined,
+}
+
+/// The root search of cdflib's `dinvr` (scipy/special/cdflib.c 3571-3789, SciPy 1.17.1) for
+/// `cdf(x) = p` on `[small, big]`, with fsci's [`illinois_root`] where cdflib runs `dzror`.
+///
+/// 1. The residual `cdf(x) − p` is evaluated at both ends. `qincr = fbig > fsmall` is strict,
+///    so a flat CDF counts as decreasing. If both ends have the sign that puts the root below
+///    `small` the answer is [`CdflibSearch::BelowLow`]; above `big`, [`CdflibSearch::AboveHigh`]
+///    (the table at cdflib.c 3645-3668).
+/// 2. Otherwise the residual at the start `x = 5` is evaluated; an exact zero is the answer
+///    (3682). Then cdflib steps away from 5 towards the root with step `max(0.5, 0.5·5) = 2.5`,
+///    multiplied by 5 after each step that does not bracket (3677, 3690-3744).
+/// 3. The bracket is solved by [`illinois_root`].
+///
+/// Every caller in SciPy uses the start 5, `absstp = relstp = 0.5` and `stpmul = 5`. Only the
+/// range and the bound values differ, and those are the callers' own.
+fn cdflib_invert(cdf: impl Fn(f64) -> f64, p: f64, small: f64, big: f64) -> CdflibSearch {
+    const START: f64 = 5.0;
+    const STEP_MULTIPLIER: f64 = 5.0;
+    let residual = |x: f64| cdf(x) - p;
+    let fsmall = residual(small);
+    let fbig = residual(big);
+    if fsmall.is_nan() || fbig.is_nan() {
+        return CdflibSearch::Undefined;
     }
-    let mut hi = 1.0_f64;
-    while ncfdtr(dfn, dfd, hi, f) > p {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
+    let qincr = fbig > fsmall;
+    if qincr {
+        if fsmall > 0.0 {
+            return CdflibSearch::BelowLow;
+        }
+        if fbig < 0.0 {
+            return CdflibSearch::AboveHigh;
+        }
+    } else {
+        if fsmall < 0.0 {
+            return CdflibSearch::BelowLow;
+        }
+        if fbig > 0.0 {
+            return CdflibSearch::AboveHigh;
         }
     }
-    let lo = 0.0_f64;
-    // CDF is decreasing in nc, so g(x) = p − ncfdtr(…,x,…) is increasing with
-    // g(lo) < 0 (guaranteed by the p ≥ ncfdtr(…,0,…) guard above) < g(hi).
-    let flo = p - ncfdtr(dfn, dfd, lo, f);
-    let fhi = p - ncfdtr(dfn, dfd, hi, f);
-    // The doubling can stop on a NaN CDF (hi reached the `POISSON_INDEX_LIMIT` exit,
-    // frankenscipy-qu5po). That is no bracket.
-    if fhi.is_nan() {
+    let y0 = residual(START);
+    if y0.is_nan() {
+        return CdflibSearch::Undefined;
+    }
+    if y0 == 0.0 {
+        return CdflibSearch::Root(START);
+    }
+    // step = max(absstp, relstp·|x0|) = max(0.5, 0.5·5) (cdflib.c 3677).
+    let mut step = 2.5_f64;
+    let step_up = (qincr && y0 < 0.0) || (!qincr && y0 > 0.0);
+    let (xlo, ylo, xhi, yhi) = if step_up {
+        let (mut xlb, mut ylb) = (START, y0);
+        let mut xub = (xlb + step).min(big);
+        loop {
+            let yub = residual(xub);
+            if yub.is_nan() {
+                return CdflibSearch::Undefined;
+            }
+            if (qincr && yub >= 0.0) || (!qincr && yub <= 0.0) {
+                break (xlb, ylb, xub, yub);
+            }
+            if xub >= big {
+                return CdflibSearch::AboveHigh;
+            }
+            step *= STEP_MULTIPLIER;
+            xlb = xub;
+            ylb = yub;
+            xub = (xlb + step).min(big);
+        }
+    } else {
+        let (mut xub, mut yub) = (START, y0);
+        let mut xlb = (xub - step).max(small);
+        loop {
+            let ylb = residual(xlb);
+            if ylb.is_nan() {
+                return CdflibSearch::Undefined;
+            }
+            if (qincr && ylb <= 0.0) || (!qincr && ylb >= 0.0) {
+                break (xlb, ylb, xub, yub);
+            }
+            if xlb <= small {
+                return CdflibSearch::BelowLow;
+            }
+            step *= STEP_MULTIPLIER;
+            xub = xlb;
+            yub = ylb;
+            xlb = (xub - step).max(small);
+        }
+    };
+    if ylo == 0.0 {
+        return CdflibSearch::Root(xlo);
+    }
+    if yhi == 0.0 {
+        return CdflibSearch::Root(xhi);
+    }
+    // illinois_root solves an increasing residual with f(lo) < 0 < f(hi).
+    let root = if ylo < 0.0 {
+        illinois_root(residual, xlo, xhi, ylo, yhi)
+    } else {
+        illinois_root(|x| -residual(x), xlo, xhi, -ylo, -yhi)
+    };
+    if root.is_nan() {
+        CdflibSearch::Undefined
+    } else {
+        CdflibSearch::Root(root)
+    }
+}
+
+/// `boost::math::sign` for a residual: `1`, `-1`, or `0` for zero and NaN.
+fn residual_sign(z: f64) -> i32 {
+    if z > 0.0 {
+        1
+    } else if z < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Boost's `tools::bracket_and_solve_root` (boost/math/tools/toms748_solve.hpp 516-622 at the
+/// boost/math commit 5e088ffe that SciPy 1.17.1 pins), with [`illinois_root`] in place of TOMS
+/// 748 for the final bracket (frankenscipy-g9yid).
+///
+/// `f` is monotone, increasing when `rising`. From `guess` the walk multiplies (or divides) by a
+/// factor that starts at 2 and doubles after 32, 16, 8, 4, 2 and then every step, for at most
+/// 400 steps; running out is NaN, where Boost raises an evaluation error that SciPy turns into
+/// NaN. A downward walk whose residual never changes sign stops once `|a| < f64::MIN_POSITIVE`
+/// and answers the midpoint of `[0, a]` (line 575), which is how SciPy's `chndtridf` and
+/// `chndtrinc` produce values such as `2.65249474e-315` (`= 2⁻¹⁰⁴⁵`, the escape from a
+/// guess of 1) when no root exists on the small side. A NaN residual, or a walk that
+/// overflows to infinity (Boost's domain error), is NaN.
+pub(crate) fn bracket_and_solve_root(f: impl Fn(f64) -> f64, guess: f64, rising: bool) -> f64 {
+    const MAX_ITER: u32 = 400;
+    let mut factor = 2.0_f64;
+    let mut a = guess;
+    let mut fa = f(a);
+    if fa.is_nan() {
         return f64::NAN;
     }
-    illinois_root(|x| p - ncfdtr(dfn, dfd, x, f), lo, hi, flo, fhi)
+    if fa == 0.0 {
+        return a;
+    }
+    let mut b = a;
+    let mut fb = fa;
+    let mut count = MAX_ITER - 1;
+    let mut step = 32_u32;
+    let zero_is_right = (fa < 0.0) == if guess < 0.0 { !rising } else { rising };
+    if zero_is_right {
+        while residual_sign(fb) == residual_sign(fa) {
+            if count == 0 {
+                return f64::NAN;
+            }
+            if (MAX_ITER - count).is_multiple_of(step) {
+                factor *= 2.0;
+                if step > 1 {
+                    step /= 2;
+                }
+            }
+            a = b;
+            fa = fb;
+            b *= factor;
+            if !b.is_finite() {
+                return f64::NAN;
+            }
+            fb = f(b);
+            if fb.is_nan() {
+                return f64::NAN;
+            }
+            count -= 1;
+        }
+    } else {
+        while residual_sign(fb) == residual_sign(fa) {
+            if a.abs() < f64::MIN_POSITIVE {
+                let (lo, hi) = if a > 0.0 { (0.0, a) } else { (a, 0.0) };
+                return lo + (hi - lo) / 2.0;
+            }
+            if count == 0 {
+                return f64::NAN;
+            }
+            if (MAX_ITER - count).is_multiple_of(step) {
+                factor *= 2.0;
+                if step > 1 {
+                    step /= 2;
+                }
+            }
+            b = a;
+            fb = fa;
+            a /= factor;
+            fa = f(a);
+            if fa.is_nan() {
+                return f64::NAN;
+            }
+            count -= 1;
+        }
+    }
+    if fa == 0.0 {
+        return a;
+    }
+    if fb == 0.0 {
+        return b;
+    }
+    let (lo, hi, flo, fhi) = if a < b {
+        (a, b, fa, fb)
+    } else {
+        (b, a, fb, fa)
+    };
+    if flo < 0.0 {
+        illinois_root(&f, lo, hi, flo, fhi)
+    } else {
+        illinois_root(|x| -f(x), lo, hi, -flo, -fhi)
+    }
+}
+
+/// Midpoint for [`illinois_root`] when false position gives no usable step: the geometric
+/// mean when the bracket excludes 0, so a bracket spanning many decades is halved in log
+/// space, and the arithmetic mean otherwise (frankenscipy-g9yid).
+fn bracket_midpoint(lo: f64, hi: f64) -> f64 {
+    if lo > 0.0 {
+        lo.sqrt() * hi.sqrt()
+    } else if hi < 0.0 {
+        -((-lo).sqrt() * (-hi).sqrt())
+    } else {
+        0.5 * (lo + hi)
+    }
 }
 
 /// Root of a monotone-increasing `f` in the bracket `[lo, hi]` with
@@ -1052,6 +1307,28 @@ pub fn ncfdtrinc(dfn: f64, dfd: f64, p: f64, f: f64) -> f64 {
 /// of expensive `f` evaluations from ~100 (plain bisection) to ~10-15 — the
 /// dominant cost of the noncentral-t/F inverse CDFs, whose `f` is itself a
 /// several-µs series. Returns the root to full `f64` precision.
+///
+/// Three things changed in frankenscipy-g9yid, each because the old version returned a wrong
+/// root while reporting success:
+///
+/// 1. **A stagnating iterate is verified before it is returned.** The search stops when the
+///    false-position iterate moves by less than the tolerance, or when it rounds onto an
+///    endpoint. That also happens far from the root, when the residual at the stale endpoint
+///    is tiny, for example on an underflowed plateau such as `1e-300 − chndtr(5, df, 2)` for
+///    `df ≳ 420`. The old search returned 4.88e6 there for a root of 403.34. Now the point
+///    `2·tol` further into the bracket is evaluated: a sign change there proves the root is
+///    within `2·tol` and the iterate is returned; otherwise that endpoint moves to the probe
+///    and a bisection step follows. On a smooth residual this costs one extra evaluation.
+/// 2. **The tolerance is relative once the bracket excludes 0**, `4ε·|x|`. The old
+///    `4ε·max(|x|, 1)` was absolute below 1, so a root near 1e-200 was accepted from any
+///    bracket narrower than 1e-15, that is at once. Brackets that touch or straddle 0 keep
+///    the old tolerance, because a root at exactly 0 has no relative scale.
+/// 3. **The false-position step is `lo + (hi − lo)·flo/(flo − fhi)`**, which has no product of
+///    an abscissa and a residual. The old `(lo·fhi − hi·flo)/(fhi − flo)` underflowed to 0/0
+///    when both were tiny, and every step fell back to a midpoint. The midpoint is now
+///    geometric when the bracket excludes 0.
+///
+/// A NaN residual ends the search with NaN.
 pub(crate) fn illinois_root<F: Fn(f64) -> f64>(
     f: F,
     mut lo: f64,
@@ -1059,69 +1336,128 @@ pub(crate) fn illinois_root<F: Fn(f64) -> f64>(
     mut flo: f64,
     mut fhi: f64,
 ) -> f64 {
+    const REL_TOL: f64 = 4.0 * f64::EPSILON;
     let mut side = 0i32;
-    // `mid` holds the PREVIOUS iterate for the stop test; there is none yet, so
+    // `prev` holds the PREVIOUS iterate for the stagnation test; there is none yet, so
     // seed it as NaN rather than the midpoint. Otherwise, when the root sits at
     // (or within rounding of) an endpoint, the false-position candidate is
-    // rejected on iteration 1, `next` falls back to 0.5*(lo+hi) which equals the
-    // seed, and `(next - mid) == 0` fires a SPURIOUS immediate return of the
+    // rejected on iteration 1, `next` falls back to the midpoint which equals the
+    // seed, and `(next - prev) == 0` fires a SPURIOUS immediate return of the
     // midpoint (observed on gammainc_shape_inv/pdtrik where roots land on the
-    // power-of-2 bracket endpoint). NaN makes the first delta non-converged; the
-    // `(hi - lo) <= tol` clause still catches a genuinely tiny initial bracket.
-    let mut mid = f64::NAN;
-    for _ in 0..100 {
-        // False-position estimate; fall back to the midpoint if the secant is
-        // degenerate (equal / non-finite endpoint values) or lands outside the
-        // bracket.
-        let denom = fhi - flo;
-        let candidate = if denom.is_finite() && denom != 0.0 {
-            (lo * fhi - hi * flo) / denom
+    // power-of-2 bracket endpoint).
+    let mut prev = f64::NAN;
+    for _ in 0..200 {
+        let width = hi - lo;
+        let candidate = lo + width * (flo / (flo - fhi));
+        // `hug` is the endpoint the estimate claims the root sits at: 1 = hi, -1 = lo.
+        let (next, mut hug) = if candidate.is_nan() {
+            (bracket_midpoint(lo, hi), 0)
+        } else if candidate >= hi {
+            (hi, 1)
+        } else if candidate <= lo {
+            (lo, -1)
         } else {
-            0.5 * (lo + hi)
+            (candidate, 0)
         };
-        let next = if candidate > lo && candidate < hi {
-            candidate
+        let tol = if lo > 0.0 || hi < 0.0 {
+            REL_TOL * next.abs()
         } else {
-            0.5 * (lo + hi)
+            REL_TOL * next.abs().max(1.0)
         };
-        let tol = 4.0 * f64::EPSILON * next.abs().max(1.0);
-        // Converged once the iterate stops moving or the bracket is negligible.
-        // NOTE: with false-position one endpoint can stay stale so `hi - lo`
-        // need not shrink to zero — the *iterate* is the answer, so we return
-        // `mid` (the last interpolant), never `0.5*(lo+hi)`.
-        if (next - mid).abs() <= tol || (hi - lo).abs() <= tol {
+        if width <= tol {
             return next;
         }
-        mid = next;
-        let fmid = f(mid);
-        if fmid == 0.0 {
-            return mid;
+        if hug == 0 && (next - prev).abs() <= tol {
+            // The iterate stopped moving next to the endpoint just replaced by `prev`.
+            hug = side;
         }
-        if fmid > 0.0 {
-            hi = mid;
-            fhi = fmid;
+        if hug != 0 {
+            let probe = if hug == 1 {
+                next - 2.0 * tol
+            } else {
+                next + 2.0 * tol
+            };
+            if !(probe > lo && probe < hi) {
+                return next;
+            }
+            let fprobe = f(probe);
+            if fprobe.is_nan() {
+                return f64::NAN;
+            }
+            if fprobe == 0.0 {
+                return probe;
+            }
+            if (hug == 1) == (fprobe < 0.0) {
+                return next;
+            }
+            if fprobe > 0.0 {
+                hi = probe;
+                fhi = fprobe;
+            } else {
+                lo = probe;
+                flo = fprobe;
+            }
+            let mid = bracket_midpoint(lo, hi);
+            if mid > lo && mid < hi {
+                let fmid = f(mid);
+                if fmid.is_nan() {
+                    return f64::NAN;
+                }
+                if fmid == 0.0 {
+                    return mid;
+                }
+                if fmid > 0.0 {
+                    hi = mid;
+                    fhi = fmid;
+                } else {
+                    lo = mid;
+                    flo = fmid;
+                }
+            }
+            side = 0;
+            prev = f64::NAN;
+            continue;
+        }
+        prev = next;
+        let fnext = f(next);
+        if fnext.is_nan() {
+            return f64::NAN;
+        }
+        if fnext == 0.0 {
+            return next;
+        }
+        if fnext > 0.0 {
+            hi = next;
+            fhi = fnext;
             if side == 1 {
                 flo *= 0.5; // Illinois down-weight of the stale endpoint
             }
             side = 1;
         } else {
-            lo = mid;
-            flo = fmid;
+            lo = next;
+            flo = fnext;
             if side == -1 {
                 fhi *= 0.5;
             }
             side = -1;
         }
     }
-    mid
+    lo + 0.5 * (hi - lo)
 }
 
 /// Inverse of [`nctdtr`] in the argument `t`.
 ///
 /// Returns `t` such that `nctdtr(df, nc, t) = p`, matching
-/// `scipy.special.nctdtrit(df, nc, p)`. Monotone increasing in `t`, solved by
-/// bracket-and-[`illinois_root`] over the whole real line. Following scipy's
-/// cdflib, the exact boundaries `p ≤ 0` and `p ≥ 1` return `+∞`.
+/// `scipy.special.nctdtrit(df, nc, p)`. Following SciPy, the exact boundaries `p ≤ 0`
+/// and `p ≥ 1` return `+∞`.
+///
+/// SciPy 1.17.1 answers with Boost's quantile, which first puts its guess on the side of 0
+/// where `nctdtr(df, nc, 0)` says the root lies and then brackets by a geometric walk
+/// (boost/math/distributions/non_central_t.hpp 342-389). This does the same from `±1` with
+/// `bracket_and_solve_root` (frankenscipy-g9yid), so the number of CDF calls grows with
+/// `log|t|` only. SciPy is NaN from `|nc| ≈ 1.0145e5` for every `p` and `df` measured (Boost's
+/// series hits its term limit), while [`nctdtr`] deliberately stays finite there, and this
+/// inverse stays consistent with it and answers. The owner may revisit that choice.
 #[must_use]
 pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
     if df.is_nan() || nc.is_nan() || p.is_nan() {
@@ -1135,161 +1471,161 @@ pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
     if p <= 0.0 || p >= 1.0 {
         return f64::INFINITY;
     }
-    // Bracket the root (nctdtr is increasing in t).
-    let mut lo = -1.0_f64;
-    let mut flo = nctdtr(df, nc, lo) - p;
-    while flo > 0.0 {
-        lo *= 2.0;
-        if lo < -1e300 {
-            return f64::NEG_INFINITY;
-        }
-        flo = nctdtr(df, nc, lo) - p;
-    }
-    let mut hi = 1.0_f64;
-    let mut fhi = nctdtr(df, nc, hi) - p;
-    while fhi < 0.0 {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
-        }
-        fhi = nctdtr(df, nc, hi) - p;
-    }
-    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) ends a doubling loop without bracketing
-    // anything. SciPy 1.17.1: nctdtrit(5, 1.35e8, 0.5) = nan.
-    if flo.is_nan() || fhi.is_nan() {
+    let at_zero = nctdtr(df, nc, 0.0);
+    if at_zero.is_nan() {
         return f64::NAN;
     }
-    illinois_root(|t| nctdtr(df, nc, t) - p, lo, hi, flo, fhi)
+    if at_zero == p {
+        return 0.0;
+    }
+    let guess = if at_zero < p { 1.0 } else { -1.0 };
+    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) makes the walk return NaN rather than a
+    // bracket. SciPy 1.17.1: nctdtrit(5, 1.35e8, 0.5) = nan.
+    bracket_and_solve_root(|t| nctdtr(df, nc, t) - p, guess, true)
 }
 
 /// Inverse of [`nctdtr`] in the non-centrality `nc`.
 ///
 /// Returns `nc` such that `nctdtr(df, nc, t) = p`, matching
-/// `scipy.special.nctdtrinc(df, p, t)`. The non-central t CDF is decreasing in
-/// `nc` (more non-centrality shifts mass right), solved by bracket-and-bisect
-/// over the whole real line; `p = 0 → +∞`, `p = 1 → −∞`. Matches scipy to ~1e-9.
-/// frankenscipy.
+/// `scipy.special.nctdtrinc(df, p, t)`.
+///
+/// SciPy 1.17.1 answers with cdflib's `cdftnc_which4` (scipy/special/cdflib.c 2504-2561): it
+/// clamps `t` to `±f64::MAX` and `df` to at most `1e10`, searches `nc ∈ [−1e6, 1e6]` from
+/// `nc = 5`, and returns `1e6` when the root is above the range and `0` (not `−1e6`, line
+/// 2554) when it is below. `cdflib_invert` reproduces that search on fsci's own [`nctdtr`]
+/// (frankenscipy-g9yid). SciPy gives `nctdtrinc(5, 0.5, t) = 1e6` for `t = inf`, `1e300` and
+/// `3e8`, and `0.0` for `t = −inf` and `−1e9`. The old unbounded doubling returned `±inf`, or
+/// NaN after about 1.2e9 Poisson-walk steps. `p` must lie in `[0, 1 − 1e-16]`, so `p = 1`
+/// is NaN.
+///
+/// Inside the range the root is fsci's; cdflib truncates its series at a relative 1e-7
+/// (`cumtnc`, cdflib.c 3362), so SciPy's interior values differ by about 1e-8 near `t = 2`
+/// and by 1e-3 at `t = 1e5`. Three SciPy defects are not copied: for `3e5 ≲ |t| ≲ 1e8`
+/// SciPy does not return, because `cumtnc`'s forward loop cannot meet its stop test at
+/// `nc = −1e6`; at `t = 0` its C `cumnor` swaps the tail for `0 < x ≤ 0.66291`, so
+/// `nctdtrinc(5, 0.5, 0) = −0.6629099965481363`; and where `cumtnc` underflows it returns
+/// the artifact `nctdtrinc(5, 1e-300, 2) = 82.4999995875`.
 #[must_use]
 pub fn nctdtrinc(df: f64, p: f64, t: f64) -> f64 {
     if df.is_nan() || p.is_nan() || t.is_nan() {
         return f64::NAN;
     }
-    if df <= 0.0 || !(0.0..=1.0).contains(&p) {
+    if !cdflib_p_in_range(p) || df <= 0.0 {
         return f64::NAN;
     }
-    if p <= 0.0 {
-        return f64::INFINITY;
+    // cdflib.c 2542-2543: t = fmax(fmin(t, DBL_MAX), -DBL_MAX); df = fmin(df, 1e10).
+    let t = t.clamp(-f64::MAX, f64::MAX);
+    let df = df.min(1e10);
+    // cdftnc_which4: DS.small = -1e6, DS.big = 1e6; bounds 0 / 1e6 (2514-2515, 2554).
+    match cdflib_invert(|nc| nctdtr(df, nc, t), p, -1e6, 1e6) {
+        CdflibSearch::Root(nc) => nc,
+        CdflibSearch::BelowLow => 0.0,
+        CdflibSearch::AboveHigh => 1e6,
+        CdflibSearch::Undefined => f64::NAN,
     }
-    if p >= 1.0 {
-        return f64::NEG_INFINITY;
-    }
-    // Decreasing in nc: large nc ⇒ CDF → 0, very negative nc ⇒ CDF → 1.
-    let mut hi = 1.0_f64;
-    while nctdtr(df, hi, t) > p {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
-        }
-    }
-    let mut lo = -1.0_f64;
-    while nctdtr(df, lo, t) < p {
-        lo *= 2.0;
-        if lo < -1e300 {
-            return f64::NEG_INFINITY;
-        }
-    }
-    // Decreasing in nc, so g(x) = p − nctdtr(df, x, t) is increasing with
-    // g(lo) ≤ 0 ≤ g(hi) from the brackets above.
-    let flo = p - nctdtr(df, lo, t);
-    let fhi = p - nctdtr(df, hi, t);
-    // A doubling loop can stop on a NaN CDF (|nc| reached the `POISSON_INDEX_LIMIT` exit,
-    // frankenscipy-qu5po). That is no bracket.
-    if flo.is_nan() || fhi.is_nan() {
-        return f64::NAN;
-    }
-    illinois_root(|x| p - nctdtr(df, x, t), lo, hi, flo, fhi)
 }
 
-// Solve g(x) = target for a positive parameter x ∈ [1e-8, 1e12], with g (numerically) monotone,
-// via bisection — the safeguarded parameter inversion cdflib's DINVR performs for the
-// degrees-of-freedom inverses. The direction is read from the bracket endpoints; a target outside
-// the achievable range clamps to the corresponding bound (matching scipy's behaviour).
-fn invert_positive_param(target: f64, g: impl Fn(f64) -> f64) -> f64 {
-    const LO: f64 = 1e-8;
-    const HI: f64 = 1e12; // "no finite solution" sentinel (the CDF is numerically flat beyond this)
-    let (lo, hi) = (LO, HI);
-    let glo = g(lo);
-    let ghi = g(hi);
-    if !glo.is_finite() || !ghi.is_finite() {
-        return f64::NAN;
-    }
-    let increasing = ghi >= glo;
-    let (gmin, gmax) = if increasing { (glo, ghi) } else { (ghi, glo) };
-    if target <= gmin {
-        return if increasing { LO } else { HI };
-    }
-    if target >= gmax {
-        return if increasing { HI } else { LO };
-    }
-    // Superlinear root-find (Illinois) instead of a fixed 200-step bisection over
-    // the 20-decade [1e-8, 1e12] bracket — ~10x fewer of the expensive CDF `g`
-    // evaluations. Fold the increasing/decreasing cases into an increasing
-    // residual `f` with f(lo) < 0 < f(hi).
-    let (flo, fhi) = if increasing {
-        (glo - target, ghi - target)
-    } else {
-        (target - glo, target - ghi)
-    };
-    let f = |x: f64| {
-        if increasing {
-            g(x) - target
-        } else {
-            target - g(x)
-        }
-    };
-    illinois_root(f, lo, hi, flo, fhi)
+/// cdflib's `cumfnc` reports an error (status 1, which SciPy turns into NaN) when
+/// `(int)(nc/2)` overflows, that is from `nc/2 = 2³¹` on (scipy/special/cdflib.c 2966-2969).
+/// It checks this only for `f > 0`: `f ≤ 0` has already returned 0 (2957-2959).
+/// SciPy 1.17.1: `ncfdtridfd(3, 0.5, nc, 2)` is `1e-100` at `nc = 4294967294` and NaN at
+/// `4294967296`, `1e10` and `inf`, while `ncfdtridfd(3, 0.5, 1e10, 0) = 1e-100`.
+fn cumfnc_rejects_nc(nc: f64, f: f64) -> bool {
+    f > 0.0 && nc / 2.0 >= 2_147_483_648.0
 }
 
 /// Inverse of [`ncfdtr`] in the denominator degrees of freedom `dfd`.
 ///
 /// Returns `dfd` such that `ncfdtr(dfn, dfd, nc, f) = p`, matching
 /// `scipy.special.ncfdtridfd(dfn, p, nc, f)`.
+///
+/// SciPy 1.17.1 answers with cdflib's `cdffnc_which4` (scipy/special/cdflib.c 1800-1853),
+/// which searches `dfd ∈ [1e-100, 1e100]` from `dfd = 5` and returns `1e-100` below the range
+/// and `1e100` above it. `cdflib_invert` reproduces the search on fsci's own [`ncfdtr`]
+/// (frankenscipy-g9yid). SciPy gives `ncfdtridfd(3, 0.5, 2, inf) = 1e100` and
+/// `ncfdtridfd(3, 0.5, 2, 0) = 1e-100`, where the old `[1e-8, 1e12]` search returned `1e-8`
+/// and `1e12`. `p` must lie in `[0, 1 − 1e-16]`; see `cumfnc_rejects_nc` for the NaN at
+/// large `nc`.
+///
+/// Not copied: where the target is above the `dfd → ∞` limit of the CDF, cdflib's `cumfnc`
+/// rounds `1 − dfn·f/(dfn·f + dfd)` to 1 from `dfd ≈ dfn·f·2⁵⁴` on and its CDF jumps there, so
+/// SciPy returns that point, `ncfdtridfd(3, 0.7, 2, 2) = 1.0808639105448624e17`. fsci's
+/// [`ncfdtr`] forms `1 − y` in closed form and has no such jump; a CDF that stays at its limit
+/// gives the `1e100` bound instead.
 #[must_use]
 pub fn ncfdtridfd(dfn: f64, p: f64, nc: f64, f: f64) -> f64 {
-    if dfn.is_nan() || p.is_nan() || nc.is_nan() || f.is_nan() || !(0.0..=1.0).contains(&p) {
+    if dfn.is_nan() || p.is_nan() || nc.is_nan() || f.is_nan() {
         return f64::NAN;
     }
-    if dfn <= 0.0 || nc < 0.0 || f < 0.0 {
+    if !cdflib_p_in_range(p) || f < 0.0 || dfn <= 0.0 || nc < 0.0 || cumfnc_rejects_nc(nc, f) {
         return f64::NAN;
     }
-    invert_positive_param(p, |dfd| ncfdtr(dfn, dfd, nc, f))
+    // cdffnc_which4: DS.small = 1e-100, DS.big = 1e100; bounds 1e-100 / 1e100 (1807-1808, 1846).
+    match cdflib_invert(|dfd| ncfdtr(dfn, dfd, nc, f), p, 1e-100, 1e100) {
+        CdflibSearch::Root(dfd) => dfd,
+        CdflibSearch::BelowLow => 1e-100,
+        CdflibSearch::AboveHigh => 1e100,
+        CdflibSearch::Undefined => f64::NAN,
+    }
 }
 
 /// Inverse of [`ncfdtr`] in the numerator degrees of freedom `dfn`.
 ///
 /// Returns `dfn` such that `ncfdtr(dfn, dfd, nc, f) = p`, matching
 /// `scipy.special.ncfdtridfn(p, dfd, nc, f)`.
+///
+/// SciPy 1.17.1 answers with cdflib's `cdffnc_which3` (scipy/special/cdflib.c 1745-1798): the
+/// same search as [`ncfdtridfd`], over `dfn ∈ [1e-100, 1e100]` from `dfn = 5`, with the bounds
+/// `1e-100` and `1e100` (frankenscipy-g9yid). SciPy gives `ncfdtridfn(p, 5, 2, 2) = 1e-100` for
+/// `p = 0.2` and `1e100` for `p = 0.99`, where the old `[1e-8, 1e12]` search returned `1e-8`
+/// and `1e12`, and NaN at `nc = 1e10` (see `cumfnc_rejects_nc`), where it returned 1.35e10.
+/// The CDF need not be monotone in `dfn`; like cdflib, the search takes the root its steps
+/// from 5 bracket first.
 #[must_use]
 pub fn ncfdtridfn(p: f64, dfd: f64, nc: f64, f: f64) -> f64 {
-    if dfd.is_nan() || p.is_nan() || nc.is_nan() || f.is_nan() || !(0.0..=1.0).contains(&p) {
+    if dfd.is_nan() || p.is_nan() || nc.is_nan() || f.is_nan() {
         return f64::NAN;
     }
-    if dfd <= 0.0 || nc < 0.0 || f < 0.0 {
+    if !cdflib_p_in_range(p) || f < 0.0 || dfd <= 0.0 || nc < 0.0 || cumfnc_rejects_nc(nc, f) {
         return f64::NAN;
     }
-    invert_positive_param(p, |dfn| ncfdtr(dfn, dfd, nc, f))
+    // cdffnc_which3: DS.small = 1e-100, DS.big = 1e100; bounds 1e-100 / 1e100 (1752-1753, 1791).
+    match cdflib_invert(|dfn| ncfdtr(dfn, dfd, nc, f), p, 1e-100, 1e100) {
+        CdflibSearch::Root(dfn) => dfn,
+        CdflibSearch::BelowLow => 1e-100,
+        CdflibSearch::AboveHigh => 1e100,
+        CdflibSearch::Undefined => f64::NAN,
+    }
 }
 
 /// Inverse of [`nctdtr`] in the degrees of freedom `df`.
 ///
 /// Returns `df` such that `nctdtr(df, nc, t) = p`, matching
 /// `scipy.special.nctdtridf(p, nc, t)`.
+///
+/// SciPy 1.17.1 answers with cdflib's `cdftnc_which3` (scipy/special/cdflib.c 2445-2502): it
+/// clamps `t` to `±f64::MAX`, rejects `nc ∉ [−1e6, 1e6]` (NaN), searches `df ∈ [1e-100, 1e10]`
+/// from `df = 5`, and returns `1e100` above the range and **`−1e100`** below it (line 2495).
+/// `cdflib_invert` reproduces the search on fsci's own [`nctdtr`] (frankenscipy-g9yid).
+/// SciPy gives `nctdtridf(0.5, 1, inf) = 1e100`, `nctdtridf(0.5, 1, −inf) = −1e100` and
+/// `nctdtridf(0, 1, 1.5) = −1e100`, where the old `[1e-8, 1e12]` search returned `1e-8`,
+/// `1e12` and `1e-8`. `p` must lie in `[0, 1 − 1e-16]`.
 #[must_use]
 pub fn nctdtridf(p: f64, nc: f64, t: f64) -> f64 {
-    if p.is_nan() || nc.is_nan() || t.is_nan() || !(0.0..=1.0).contains(&p) {
+    if p.is_nan() || nc.is_nan() || t.is_nan() {
         return f64::NAN;
     }
-    invert_positive_param(p, |df| nctdtr(df, nc, t))
+    if !cdflib_p_in_range(p) || !(-1e6..=1e6).contains(&nc) {
+        return f64::NAN;
+    }
+    let t = t.clamp(-f64::MAX, f64::MAX);
+    // cdftnc_which3: DS.small = 1e-100, DS.big = 1e10; bounds -1e100 / 1e100 (2455-2456, 2495).
+    match cdflib_invert(|df| nctdtr(df, nc, t), p, 1e-100, 1e10) {
+        CdflibSearch::Root(df) => df,
+        CdflibSearch::BelowLow => -1e100,
+        CdflibSearch::AboveHigh => 1e100,
+        CdflibSearch::Undefined => f64::NAN,
+    }
 }
 
 /// Non-central Student's t cumulative distribution function.
@@ -1350,7 +1686,11 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     let half_df = 0.5 * df;
     let lam = 0.5 * nc * nc;
     if lam == 0.0 {
-        return phi + 0.5 * btdtr(0.5, half_df, x);
+        // With the closed-form 1 − x, as the λ > 0 anchors below take it (frankenscipy-5pnba):
+        // at df = 1e-100, x rounds to 1 and `btdtr(0.5, df/2, x)` said 1, so nctdtr(1e-100, 0,
+        // 1.2) was 1.0 where SciPy and stdtr give 0.5.
+        let x1 = df / (t * t + df);
+        return phi + 0.5 * betainc_with_complement(0.5, half_df, x, x1).unwrap_or(f64::NAN);
     }
 
     let j0 = lam.floor();
@@ -1470,10 +1810,41 @@ pub fn stdtr(v: f64, t: f64) -> f64 {
     // Use the relation with incomplete beta:
     // For t >= 0: stdtr(v, t) = 1 - 0.5 * I(v/(v+t²); v/2, 1/2)
     // For t < 0:  stdtr(v, t) = 0.5 * I(v/(v+t²); v/2, 1/2)
-    let x = v / (v + t * t);
-    let half_beta = 0.5 * btdtr(0.5 * v, 0.5, x);
+    let half_beta = 0.5 * student_t_beta(v, t);
 
     if t >= 0.0 { 1.0 - half_beta } else { half_beta }
+}
+
+/// `I_x(v/2, 1/2)` at `x = v/(v + t²)`, the two-sided Student t tail `P(|T| > |t|)`, with
+/// `1 − x = t²/(v + t²)` passed to the kernel in closed form (frankenscipy-5pnba). For `v ≫ t²`
+/// the old `1.0 − x` was all rounding: `x` rounds to 1 from `v = 1e17` at `t = 2`, and
+/// `stdtr(1e20, 2)` came out as 0.5. `t = ±∞` is `x = 0`, and `v + t²` overflowing to ∞ with a
+/// finite `t` is `x = 0` as well (`I = 0`).
+fn student_t_beta(v: f64, t: f64) -> f64 {
+    let t2 = t * t;
+    let denom = v + t2;
+    let x = v / denom;
+    let y = t2 / denom;
+    if x.is_nan() || y.is_nan() {
+        // v + t² = ∞ with t² = ∞ (t = ±∞): x = v/∞ = 0, y = ∞/∞.
+        return if t2.is_infinite() && v.is_finite() {
+            0.0
+        } else {
+            f64::NAN
+        };
+    }
+    btdtr_pair(0.5 * v, 0.5, x, y)
+}
+
+/// `I_x(a, b)` with `y = 1 − x` passed in, and btdtr's endpoint values `I_0 = 0`, `I_1 = 1`.
+fn btdtr_pair(a: f64, b: f64, x: f64, y: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if y <= 0.0 {
+        return 1.0;
+    }
+    betainc_with_complement(a, b, x, y).unwrap_or(f64::NAN)
 }
 
 /// Student's t distribution survival function.
@@ -1492,8 +1863,7 @@ pub fn stdtrc(v: f64, t: f64) -> f64 {
     }
 
     // Use symmetry: stdtrc(v, t) = 1 - stdtr(v, t) = stdtr(v, -t)
-    let x = v / (v + t * t);
-    let half_beta = 0.5 * btdtr(0.5 * v, 0.5, x);
+    let half_beta = 0.5 * student_t_beta(v, t);
 
     if t >= 0.0 { half_beta } else { 1.0 - half_beta }
 }
@@ -1622,8 +1992,8 @@ pub fn nctdtrinc_many(df: f64, p: &[f64], t: f64) -> Vec<f64> {
 
 /// Vectorized inverse noncentral-F CDF w.r.t. denominator dof,
 /// `ncfdtridfd(dfn, p, nc, f)`, over many `p` for fixed `(dfn, nc, f)`. Each
-/// solve is an [`invert_positive_param`] (Illinois) over the single-threaded
-/// SciPy ufunc; the parallel fan wins. See [`stdtrit_many`].
+/// solve is cdflib's bounded search (`cdflib_invert`, then Illinois) over the
+/// single-threaded SciPy ufunc; the parallel fan wins. See [`stdtrit_many`].
 #[must_use]
 pub fn ncfdtridfd_many(dfn: f64, p: &[f64], nc: f64, f: f64) -> Vec<f64> {
     par_map_indices(p.len(), |i| {
@@ -1761,9 +2131,10 @@ pub fn bdtr(k: f64, n: f64, p: f64) -> f64 {
         return 1.0;
     }
 
-    // bdtr(k, n, p) = I(1-p; n-k, k+1) = betainc(n-k, k+1, 1-p)
-    // Or equivalently: 1 - betainc(k+1, n-k, p)
-    btdtr(n - k, k + 1.0, 1.0 - p)
+    // bdtr(k, n, p) = I(1-p; n-k, k+1) = 1 - betainc(k+1, n-k, p): bratio's complement at the
+    // exact p, rather than I at a rounded 1 − p, which loses p's digits when p is small
+    // (frankenscipy-5pnba).
+    betaincc_with_complement(k + 1.0, n - k, p, 1.0 - p)
 }
 
 /// Binomial distribution survival function.
@@ -1931,8 +2302,9 @@ pub fn nbdtrc(k: f64, n: f64, p: f64) -> f64 {
         return 1.0;
     }
 
-    // nbdtrc(k, n, p) = 1 - betainc(n, k+1, p) = betainc(k+1, n, 1-p)
-    btdtr(k + 1.0, n, 1.0 - p)
+    // nbdtrc(k, n, p) = 1 - betainc(n, k+1, p): bratio's complement at the exact p
+    // (frankenscipy-5pnba).
+    betaincc_with_complement(n, k + 1.0, p, 1.0 - p)
 }
 
 /// Inverse negative binomial distribution CDF.
@@ -2683,37 +3055,41 @@ pub fn betainc_scalar(a: f64, b: f64, x: f64, mode: RuntimeMode) -> Result<f64, 
 /// instead (frankenscipy-g9yid): nctdtr's `x = t²/(t²+df)` rounds to within `ε` of 1 at large
 /// `t`, so `1.0 - x` carries a relative error of `ε·t²/df`, 1e-10 at `t = 1682`. nctdtr at the
 /// mean then missed mpmath by 2e-11 at λ = 1e6, 2e-9 at 1e8 and 3e-7 at 1e10; with
-/// `y = df/(t²+df)` it misses by 1e-14, 1e-13 and 1e-12.
+/// `y = df/(t²+df)` it misses by 1e-14, 1e-13 and 1e-12. `x + y` must be 1 to within a few
+/// roundings (`3·10⁻¹⁵`), or the result is NaN.
 ///
-/// From `a + b = SADDLE_POINT_MIN_SHAPE` the front factor `xᵃyᵇ/B(a,b)` is `a·beta_term`
-/// (saddle-point form) instead of `exp(a·ln x + b·ln y − ln B(a,b))`, whose logs cancel to
-/// `ε·a·ln a`. Against scipy.special.betainc at the ncfdtr and nctdtr mode anchors near the
-/// mean it went from 1.3e-7 (λ = 1e8) and 2.4e-3 (λ = 1e12) to below 3e-15.
+/// The kernel is TOMS 708's `bratio` (frankenscipy-5pnba; see `crate::bratio`). It replaced a
+/// Numerical Recipes continued fraction with a 200-term cap, which truncated silently near the
+/// mean once a shape parameter was large: `stdtr(1e15, 2)` was off by 8e-4, and
+/// `betainc(2.5, 1e20, 5e-20)` = −4.9e281.
 pub(crate) fn betainc_with_complement(a: f64, b: f64, x: f64, y: f64) -> Result<f64, SpecialError> {
-    let front = if a + b >= gamma::SADDLE_POINT_MIN_SHAPE {
-        a * beta_term(a, b, x, y)
-    } else {
-        let ln_beta = betaln_scalar(a, b, RuntimeMode::Strict)?;
-        (a * x.ln() + b * y.ln() - ln_beta).exp()
-    };
-    if x < (a + 1.0) / (a + b + 2.0) {
-        Ok(front * betacf(a, b, x) / a)
-    } else {
-        Ok(1.0 - front * betacf(b, a, y) / b)
-    }
+    Ok(crate::bratio::bratio(a, b, x, y).0)
 }
+
+/// `1 − I_x(a, b)` for `a, b > 0` and `x ∈ (0, 1)`, with `y = 1 − x` passed in: `bratio`'s own
+/// complement, computed directly rather than by subtracting from 1, so an upper tail keeps its
+/// digits all the way down (frankenscipy-5pnba).
+pub(crate) fn betaincc_with_complement(a: f64, b: f64, x: f64, y: f64) -> f64 {
+    crate::bratio::bratio(a, b, x, y).1
+}
+
+/// Below this, `log_betainc_scalar` stops taking the log of `bratio`'s `I` and sums the tail in
+/// log space: `I` is near the bottom of the normal range, where `bratio`'s own intermediate
+/// factors start to underflow.
+const LOG_BETAINC_LOG_SPACE_BELOW: f64 = 1e-290;
 
 /// Natural log of the regularized incomplete beta function `I_x(a, b)`.
 ///
 /// `ln I_x(a, b)` stays finite deep in the tail where `I` itself underflows to
-/// 0 (so `betainc_scalar(a, b, x).ln()` would be `-inf`). The shared front
-/// factor `front = exp(a*ln x + b*ln(1-x) - lnB(a,b))` underflows but the
-/// Lentz continued fraction `betacf` is `O(1)`. In the small-`I` region
-/// (`x < (a+1)/(a+b+2)`) `I = front * betacf(a,b,x)/a`, so
-/// `ln I = (a*ln x + b*ln(1-x) - lnB(a,b)) + ln(betacf(a,b,x)/a)` keeps full
-/// precision; in the large-`I` region `I = 1 - complement` and
-/// `ln I = ln1p(-complement)`. Matches `betainc_scalar(a, b, x).ln()` wherever
-/// the latter is representable.
+/// 0 (so `betainc_scalar(a, b, x).ln()` would be `-inf`). Where `I` is representable it is
+/// `ln` of the `bratio` kernel's `I`, or `ln1p(−(1 − I))` from its directly computed complement
+/// when `I > ½`. Below [`LOG_BETAINC_LOG_SPACE_BELOW`] (the small-`I` region, `x` below
+/// `(a+1)/(a+b+2)`) the tail is summed in log space (frankenscipy-5pnba): by TOMS 708's own
+/// far-tail expansions in log form (`BGRAT` for `a ≥ 15, b ≤ 1`, `BRCOMP·BFRAC` for `a, b > 1`;
+/// `crate::bratio::ln_bratio_lower_tail`), and otherwise as
+/// `ln(xᵃ(1−x)ᵇ/B(a,b)) + ln(betacf(a,b,x)/a)` with TOMS's front factor in log form
+/// (`crate::bratio::ln_brcomp`). Both replace `a·ln x + b·ln(1−x) − ln B(a,b)`, which cancels
+/// to `ε·a·ln a` once the parameters are large.
 ///
 /// For the complementary log use the reflection `ln(1 - I_x(a,b)) =
 /// log_betainc_scalar(b, a, 1 - x)`.
@@ -2735,19 +3111,20 @@ pub fn log_betainc_scalar(a: f64, b: f64, x: f64) -> f64 {
         return 0.0;
     }
 
-    let ln_beta = match betaln_scalar(a, b, RuntimeMode::Strict) {
-        Ok(v) => v,
-        Err(_) => return f64::NAN,
-    };
-    let log_front = a * x.ln() + b * (1.0 - x).ln() - ln_beta;
-
-    if x < (a + 1.0) / (a + b + 2.0) {
-        // Small-I region: log form is finite even when front underflows.
-        log_front + (betacf(a, b, x) / a).ln()
-    } else {
-        // Large-I region: I = 1 - complement; complement is small & representable.
-        let complement = log_front.exp() * betacf(b, a, 1.0 - x) / b;
-        (-complement).ln_1p()
+    let y = 1.0 - x;
+    let (w, w1) = crate::bratio::bratio(a, b, x, y);
+    if w1 < 0.5 {
+        return (-w1).ln_1p();
+    }
+    if w >= LOG_BETAINC_LOG_SPACE_BELOW || !(x < (a + 1.0) / (a + b + 2.0)) {
+        return w.ln();
+    }
+    if let Some(ln_i) = crate::bratio::ln_bratio_lower_tail(a, b, x, y) {
+        return ln_i;
+    }
+    match betacf(a, b, x) {
+        Some(cf) => crate::bratio::ln_brcomp(a, b, x, y) + (cf / a).ln(),
+        None => f64::NAN,
     }
 }
 
@@ -2828,7 +3205,8 @@ pub fn betaincc_scalar(a: f64, b: f64, x: f64, mode: RuntimeMode) -> Result<f64,
         };
     }
 
-    betainc_scalar(b, a, 1.0 - x, mode)
+    // bratio's own complement (frankenscipy-5pnba), not I_{1−x}(b, a) through a rounded 1 − x.
+    Ok(betaincc_with_complement(a, b, x, 1.0 - x))
 }
 
 #[must_use]
@@ -2849,7 +3227,13 @@ pub fn betainccinv_scalar(a: f64, b: f64, y: f64) -> f64 {
     1.0 - crate::convenience::betaincinv_scalar(b, a, y)
 }
 
-fn betacf(a: f64, b: f64, x: f64) -> f64 {
+/// Lentz's continued fraction for `I_x(a, b)·a·B(a, b)/(xᵃ(1−x)ᵇ)` (Numerical Recipes'
+/// `betacf`), for `x` below `(a+1)/(a+b+2)`. Only [`log_betainc_scalar`]'s deep tail uses it,
+/// and only where neither TOMS far-tail expansion applies (`a ≤ 1`, or `b ≤ 1` with `a < 15`),
+/// where the tail is at tiny `x` and the fraction converges in a few terms (frankenscipy-5pnba).
+/// Near the mean it needs O(√a) terms, and it was once the whole betainc kernel there and
+/// truncated silently at the cap; now a fraction that has not converged by the cap is `None`.
+fn betacf(a: f64, b: f64, x: f64) -> Option<f64> {
     const MAX_ITERS: usize = 200;
     const EPS: f64 = 3.0e-14;
     const MIN_NUM: f64 = 1.0e-300;
@@ -2893,11 +3277,11 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
         let delta = d * c;
         h *= delta;
         if (delta - 1.0).abs() <= EPS {
-            break;
+            return Some(h);
         }
     }
 
-    h
+    None
 }
 
 fn invert_monotone_positive(cdf: impl Fn(f64) -> f64, target: f64, increasing: bool) -> f64 {
@@ -2955,7 +3339,7 @@ fn invert_monotone_positive(cdf: impl Fn(f64) -> f64, target: f64, increasing: b
     // ~40 plain-bisection steps. `cdf` here is btdtr's continued fraction, whose
     // cost does not vary with the probe point, so fewer evaluations is a clean
     // speed win — and the root is returned to ~4·eps (tighter than the former
-    // 1e-12 bracket). Mirrors invert_monotone -> illinois_root (chndtridf).
+    // 1e-12 bracket).
     let (glo, ghi) = if increasing {
         (lo_value - target, hi_value - target)
     } else {
@@ -4484,6 +4868,372 @@ mod tests {
         assert!(nctdtridf(1.5, 0.0, 1.0).is_nan()); // p out of [0,1]
     }
 
+    /// frankenscipy-g9yid. The five cdflib-backed inverses return SciPy's search bounds when
+    /// the root lies outside cdflib's range, instead of searching without limit. Every expected
+    /// value is SciPy 1.17.1 read live. Ranges and bounds (scipy/special/cdflib.c):
+    ///
+    /// ```text
+    /// ncfdtrinc   cdffnc_which5  nc  ∈ [0, 1e4]        below → 0       above → 1e4
+    /// nctdtrinc   cdftnc_which4  nc  ∈ [−1e6, 1e6]     below → 0       above → 1e6
+    /// nctdtridf   cdftnc_which3  df  ∈ [1e-100, 1e10]  below → −1e100  above → 1e100
+    /// ncfdtridfd  cdffnc_which4  dfd ∈ [1e-100, 1e100] below → 1e-100  above → 1e100
+    /// ncfdtridfn  cdffnc_which3  dfn ∈ [1e-100, 1e100] below → 1e-100  above → 1e100
+    /// ```
+    ///
+    /// The first row of each group is one the old unbounded search got wrong: 2610874.47,
+    /// −inf, 1e-8, 1e-8 and 1.35e10 respectively.
+    #[test]
+    fn cdflib_inverses_return_scipys_search_bounds() {
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let p1 = 1.0 - f64::EPSILON / 2.0;
+        let rows: Vec<(&str, f64, f64)> = vec![
+            (
+                "ncfdtrinc(3, 5, 0.5, 1e6)",
+                ncfdtrinc(3.0, 5.0, 0.5, 1e6),
+                1e4,
+            ),
+            (
+                "ncfdtrinc(3, 5, 0.5, inf)",
+                ncfdtrinc(3.0, 5.0, 0.5, inf),
+                1e4,
+            ),
+            (
+                "ncfdtrinc(3, 5, 0, 100)",
+                ncfdtrinc(3.0, 5.0, 0.0, 100.0),
+                1e4,
+            ),
+            (
+                "ncfdtrinc(3, 5, 0.9, 1)",
+                ncfdtrinc(3.0, 5.0, 0.9, 1.0),
+                0.0,
+            ),
+            (
+                "ncfdtrinc(3, 5, 0.5, 0)",
+                ncfdtrinc(3.0, 5.0, 0.5, 0.0),
+                0.0,
+            ),
+            (
+                "ncfdtrinc(3, 5, 1 - 2^-53, 2)",
+                ncfdtrinc(3.0, 5.0, p1, 2.0),
+                0.0,
+            ),
+            ("ncfdtrinc(3, 5, 1, 2)", ncfdtrinc(3.0, 5.0, 1.0, 2.0), nan),
+            ("ncfdtrinc(3, 5, 0, 0)", ncfdtrinc(3.0, 5.0, 0.0, 0.0), 5.0),
+            ("nctdtrinc(5, 0.5, -inf)", nctdtrinc(5.0, 0.5, -inf), 0.0),
+            ("nctdtrinc(5, 0.5, inf)", nctdtrinc(5.0, 0.5, inf), 1e6),
+            ("nctdtrinc(5, 0.5, 1e300)", nctdtrinc(5.0, 0.5, 1e300), 1e6),
+            ("nctdtrinc(5, 1, 2)", nctdtrinc(5.0, 1.0, 2.0), nan),
+            ("nctdtridf(0, 1, 1.5)", nctdtridf(0.0, 1.0, 1.5), -1e100),
+            ("nctdtridf(0.5, 1, -inf)", nctdtridf(0.5, 1.0, -inf), -1e100),
+            ("nctdtridf(0.5, 1e6, 1.5)", nctdtridf(0.5, 1e6, 1.5), -1e100),
+            ("nctdtridf(0.5, -5, 1.5)", nctdtridf(0.5, -5.0, 1.5), -1e100),
+            ("nctdtridf(0.5, 1, inf)", nctdtridf(0.5, 1.0, inf), 1e100),
+            ("nctdtridf(0.9, 1, 1.5)", nctdtridf(0.9, 1.0, 1.5), 1e100),
+            (
+                "nctdtridf(1 - 2^-53, 1, 1.5)",
+                nctdtridf(p1, 1.0, 1.5),
+                1e100,
+            ),
+            (
+                "nctdtridf(0.5, 1, 1e300)",
+                nctdtridf(0.5, 1.0, 1e300),
+                1e100,
+            ),
+            (
+                "nctdtridf(0.5, 1000000.1, 1.5)",
+                nctdtridf(0.5, 1_000_000.1, 1.5),
+                nan,
+            ),
+            ("nctdtridf(1, 1, 1.5)", nctdtridf(1.0, 1.0, 1.5), nan),
+            (
+                "ncfdtridfd(3, 0.5, 2, inf)",
+                ncfdtridfd(3.0, 0.5, 2.0, inf),
+                1e100,
+            ),
+            (
+                "ncfdtridfd(5, 0.9, 1, 0.5)",
+                ncfdtridfd(5.0, 0.9, 1.0, 0.5),
+                1e100,
+            ),
+            (
+                "ncfdtridfd(3, 0.5, 2, 0)",
+                ncfdtridfd(3.0, 0.5, 2.0, 0.0),
+                1e-100,
+            ),
+            (
+                "ncfdtridfd(3, 0, 2, 2)",
+                ncfdtridfd(3.0, 0.0, 2.0, 2.0),
+                1e-100,
+            ),
+            (
+                "ncfdtridfd(3, 0.5, 4294967296, 2)",
+                ncfdtridfd(3.0, 0.5, 4_294_967_296.0, 2.0),
+                nan,
+            ),
+            (
+                "ncfdtridfd(3, 0.5, 1e10, 0)",
+                ncfdtridfd(3.0, 0.5, 1e10, 0.0),
+                1e-100,
+            ),
+            (
+                "ncfdtridfd(3, 1, 2, 2)",
+                ncfdtridfd(3.0, 1.0, 2.0, 2.0),
+                nan,
+            ),
+            (
+                "ncfdtridfn(0.5, 5, 1e10, 2)",
+                ncfdtridfn(0.5, 5.0, 1e10, 2.0),
+                nan,
+            ),
+            (
+                "ncfdtridfn(0.5, 5, 2, inf)",
+                ncfdtridfn(0.5, 5.0, 2.0, inf),
+                1e100,
+            ),
+            (
+                "ncfdtridfn(0.99, 5, 2, 2)",
+                ncfdtridfn(0.99, 5.0, 2.0, 2.0),
+                1e100,
+            ),
+            (
+                "ncfdtridfn(0.2, 5, 2, 2)",
+                ncfdtridfn(0.2, 5.0, 2.0, 2.0),
+                1e-100,
+            ),
+            (
+                "ncfdtridfn(0.5, 5, 2, 0)",
+                ncfdtridfn(0.5, 5.0, 2.0, 0.0),
+                1e-100,
+            ),
+            (
+                "ncfdtridfn(0.5, 5, 4294967296, 2)",
+                ncfdtridfn(0.5, 5.0, 4_294_967_296.0, 2.0),
+                nan,
+            ),
+        ];
+        for (label, got, want) in rows {
+            let matches = if want.is_nan() {
+                got.is_nan()
+            } else {
+                got == want
+            };
+            assert!(matches, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+    }
+
+    /// frankenscipy-g9yid. Must not change: interior roots of the cdflib-backed inverses.
+    /// SciPy 1.17.1 inverts cdflib's own CDFs, which cdflib truncates at a relative 1e-4
+    /// (`cumfnc`) and 1e-7 (`cumtnc`), so these agree with SciPy only to those tolerances;
+    /// against fsci's own CDF the roots are exact to rounding.
+    #[test]
+    fn cdflib_inverses_interior_values_do_not_move() {
+        let rows = [
+            (
+                "ncfdtrinc(3, 5, 0.5, 2)",
+                ncfdtrinc(3.0, 5.0, 0.5, 2.0),
+                3.1855517561084823,
+                1e-5,
+            ),
+            (
+                "nctdtrinc(5, 0.5, 2)",
+                nctdtrinc(5.0, 0.5, 2.0),
+                1.8929610084247588,
+                1e-7,
+            ),
+            (
+                "nctdtrinc(5, 0.9, -2)",
+                nctdtrinc(5.0, 0.9, -2.0),
+                -3.4141763497275717,
+                1e-7,
+            ),
+            (
+                "nctdtridf(0.5, 1, 1.5)",
+                nctdtridf(0.5, 1.0, 1.5),
+                0.7061449175041883,
+                1e-8,
+            ),
+            (
+                "ncfdtridfd(3, 0.5, 2, 2)",
+                ncfdtridfd(3.0, 0.5, 2.0, 2.0),
+                1.8986465231034602,
+                1e-5,
+            ),
+            (
+                "ncfdtridfn(0.5, 5, 2, 2)",
+                ncfdtridfn(0.5, 5.0, 2.0, 2.0),
+                1.3625100439758695,
+                1e-5,
+            ),
+        ];
+        for (label, got, want, rel) in rows {
+            assert!(
+                (got - want).abs() <= rel * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want} (rel tol {rel})"
+            );
+        }
+        // Against fsci's own CDF the roots are tight.
+        let nc = ncfdtrinc(3.0, 5.0, 0.5, 2.0);
+        assert!(
+            (ncfdtr(3.0, 5.0, nc, 2.0) - 0.5).abs() < 1e-12,
+            "ncfdtrinc round trip"
+        );
+        let nc = nctdtrinc(5.0, 0.5, 2.0);
+        assert!(
+            (nctdtr(5.0, nc, 2.0) - 0.5).abs() < 1e-12,
+            "nctdtrinc round trip"
+        );
+        let df = nctdtridf(0.5, 1.0, 1.5);
+        assert!(
+            (nctdtr(df, 1.0, 1.5) - 0.5).abs() < 1e-12,
+            "nctdtridf round trip"
+        );
+    }
+
+    /// frankenscipy-g9yid. The cdflib-backed searches are bounded. In a float transliteration of
+    /// the old unbounded doubling, each of these walked an estimated 1.2e9 to 2.4e9 Poisson
+    /// terms and then answered NaN or the unbounded root 2.6e14; SciPy 1.17.1 answers all three
+    /// with its cap. Run on a worker thread so a regression fails instead of hanging the suite.
+    #[test]
+    fn cdflib_inverse_searches_are_bounded() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rows: Vec<(&str, f64, f64)> = vec![
+                (
+                    "ncfdtrinc(3, 5, 0.5, 1e300)",
+                    ncfdtrinc(3.0, 5.0, 0.5, 1e300),
+                    1e4,
+                ),
+                (
+                    "ncfdtrinc(3, 5, 0.5, 1e14)",
+                    ncfdtrinc(3.0, 5.0, 0.5, 1e14),
+                    1e4,
+                ),
+                ("nctdtrinc(5, 0.5, 3e8)", nctdtrinc(5.0, 0.5, 3e8), 1e6),
+            ];
+            let _ = tx.send(rows);
+        });
+        let rows = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a cdflib-backed inverse did not return within 60 s (frankenscipy-g9yid)");
+        for (label, got, want) in rows {
+            assert!(got == want, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+    }
+
+    /// frankenscipy-g9yid. `illinois_root` returned a wrong root in three situations; each row
+    /// is one of them, with the old answer.
+    #[test]
+    fn illinois_root_verifies_before_returning() {
+        // 1. A residual stuck at a tiny positive value beyond its sign change (the underflow
+        //    plateau of 1e-300 - chndtr(5, df, 2) past df ≈ 403.34, with its value at 1e-6):
+        //    false position hugged the far end and the old stop returned 4882812.500000998.
+        let step_at = 403.3387893865996;
+        let at_lo = -0.8686981363318387;
+        let step = |x: f64| if x < step_at { at_lo } else { 1e-300 };
+        let root = illinois_root(step, 1e-6, 1e10, at_lo, 1e-300);
+        assert!(
+            (root - step_at).abs() <= 1e-14 * step_at,
+            "plateau root {root}, want {step_at}"
+        );
+        // 2. A root near 1e-200: the old absolute tolerance accepted the whole bracket at once
+        //    and returned its midpoint, 5.5e-200. The old false-position step also underflowed
+        //    to 0/0 here; the new one lands on the root of this linear residual at once.
+        let evaluations = std::cell::Cell::new(0_u32);
+        let root = illinois_root(
+            |x| {
+                evaluations.set(evaluations.get() + 1);
+                x - 4.7e-200
+            },
+            1e-200,
+            1e-199,
+            1e-200 - 4.7e-200,
+            1e-199 - 4.7e-200,
+        );
+        assert!(
+            (root - 4.7e-200).abs() <= 1e-15 * 4.7e-200,
+            "tiny root {root}"
+        );
+        assert!(
+            evaluations.get() <= 3,
+            "tiny root took {} evaluations",
+            evaluations.get()
+        );
+        //    A curved residual with its root at 1e-20: the old tolerance returned the first
+        //    false-position estimate, 2.4785054261852173e-20.
+        let curved = |x: f64| x.sqrt() - 1e-10;
+        let root = illinois_root(curved, 1e-21, 1e-19, curved(1e-21), curved(1e-19));
+        assert!((root - 1e-20).abs() <= 1e-14 * 1e-20, "curved root {root}");
+        // 3. A flat residual near a root at 1e-10: the old stop took one stagnating step and
+        //    returned 1e-30.
+        let root = illinois_root(|x| x * x * x - 1e-30, -1.0, 1.0, -1.0 - 1e-30, 1.0 - 1e-30);
+        assert!((root - 1e-10).abs() <= 1e-12 * 1e-10, "cube root {root}");
+        // Must not change: an ordinary smooth root to full precision.
+        let root = illinois_root(|x| x * x - 2.0, 1.0, 2.0, -1.0, 2.0);
+        assert!(
+            (root - std::f64::consts::SQRT_2).abs() <= 4.0 * f64::EPSILON,
+            "sqrt 2 {root}"
+        );
+    }
+
+    /// frankenscipy-g9yid. `bracket_and_solve_root` is Boost's walk: when the residual never
+    /// changes sign on the way down it answers the midpoint of `[0, a]` for the first
+    /// `|a| < f64::MIN_POSITIVE`, which from a guess of 1 is `2⁻¹⁰⁴⁵ = 2.65249474e-315`
+    /// (SciPy 1.17.1's `chndtridf(5, 0.5, 30)`), and from 3 is `7.957484216e-315`
+    /// (`chndtridf(5, 1 − 2⁻⁵³, 2)`).
+    #[test]
+    fn bracket_and_solve_root_escapes_like_boost() {
+        assert_eq!(
+            bracket_and_solve_root(|_| -1.0, 1.0, false),
+            2.65249474e-315
+        );
+        assert_eq!(
+            bracket_and_solve_root(|_| -1.0, 1.0, false),
+            f64::MIN_POSITIVE * 2f64.powi(-23)
+        );
+        assert_eq!(
+            bracket_and_solve_root(|_| -1.0, 3.0, false),
+            7.957484216e-315
+        );
+        // An upward walk that never brackets overflows, which Boost reports as an error.
+        assert!(bracket_and_solve_root(|_| 1.0, 1.0, false).is_nan());
+        // A root on a bracket end is returned exactly; an interior one to full precision.
+        assert_eq!(bracket_and_solve_root(|x| 2.0 - x, 1.0, false), 2.0);
+        let root = bracket_and_solve_root(|x| x.ln() - 10.0, 1.0, true);
+        assert!((root - 10f64.exp()).abs() <= 1e-14 * 10f64.exp(), "{root}");
+    }
+
+    /// frankenscipy-g9yid. ncfdtri and nctdtrit bracket by Boost's geometric walk, so a root far
+    /// below 1 is resolved to a relative tolerance. SciPy 1.17.1 values read live; the old
+    /// `[0, hi]` search returned 5.92e-20 for the first row (its absolute tolerance stopped at
+    /// the first false-position step).
+    #[test]
+    fn noncentral_quantiles_resolve_small_roots_like_scipy() {
+        let rows = [
+            (
+                "ncfdtri(3, 5, 2, 1e-20)",
+                ncfdtri(3.0, 5.0, 2.0, 1e-20),
+                6.67000004655459e-14,
+            ),
+            (
+                "ncfdtri(3, 5, 2, 0.5)",
+                ncfdtri(3.0, 5.0, 2.0, 0.5),
+                1.5736032013715704,
+            ),
+            (
+                "nctdtrit(5, 1, 0.5)",
+                nctdtrit(5.0, 1.0, 0.5),
+                1.0528510409473961,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
     #[test]
     fn fdtri_matches_scipy_reference_values() {
         // scipy.special.fdtri(5, 10, 0.5) ≈ 0.931933160851048
@@ -5136,6 +5886,465 @@ mod tests {
             assert!(
                 (got - want).abs() <= 1e-10 * want.abs(),
                 "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
+    // frankenscipy-5pnba: the incomplete beta kernel is TOMS 708's `bratio`.
+    //
+    // Expected values are mpmath 1.4.1 at 60+ digits at the EXACT double arguments (the
+    // hypergeometric series where it converges geometrically, the Lentz continued fraction on
+    // the small side, tanh-sinh quadrature of the log-space density near the mean; wherever
+    // two apply they agree to 1e-50 or better), rounded to double, with SciPy 1.17.1 computed
+    // alongside. SciPy agrees to about 1e-15 except where a row says otherwise.
+
+    /// Relative error, 0 for an exact match (so both-zero passes).
+    fn rel_err(got: f64, want: f64) -> f64 {
+        if got == want {
+            0.0
+        } else {
+            ((got - want) / want).abs()
+        }
+    }
+
+    const BRATIO_TOL: f64 = 1e-13;
+
+    /// The pre-frankenscipy-5pnba kernel, verbatim: Numerical Recipes' Lentz continued
+    /// fraction with its 200-term cap, fronted by `a·beta_term` from `a + b = 100` and by
+    /// `exp(a·ln x + b·ln y − ln B(a, b))` below. The before arm: see
+    /// `legacy_nr_kernel_misses_the_large_parameter_rows`.
+    pub(super) fn legacy_nr_betainc(a: f64, b: f64, x: f64, y: f64) -> f64 {
+        fn cf(a: f64, b: f64, x: f64) -> f64 {
+            const MAX_ITERS: usize = 200;
+            const EPS: f64 = 3.0e-14;
+            const MIN_NUM: f64 = 1.0e-300;
+            let (qab, qap, qam) = (a + b, a + 1.0, a - 1.0);
+            let mut c = 1.0;
+            let mut d = 1.0 - qab * x / qap;
+            if d.abs() < MIN_NUM {
+                d = MIN_NUM;
+            }
+            d = 1.0 / d;
+            let mut h = d;
+            for m in 1..=MAX_ITERS {
+                let m_f = m as f64;
+                let m2 = 2.0 * m_f;
+                let aa = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+                d = 1.0 + aa * d;
+                if d.abs() < MIN_NUM {
+                    d = MIN_NUM;
+                }
+                c = 1.0 + aa / c;
+                if c.abs() < MIN_NUM {
+                    c = MIN_NUM;
+                }
+                d = 1.0 / d;
+                h *= d * c;
+                let aa2 = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+                d = 1.0 + aa2 * d;
+                if d.abs() < MIN_NUM {
+                    d = MIN_NUM;
+                }
+                c = 1.0 + aa2 / c;
+                if c.abs() < MIN_NUM {
+                    c = MIN_NUM;
+                }
+                d = 1.0 / d;
+                let delta = d * c;
+                h *= delta;
+                if (delta - 1.0).abs() <= EPS {
+                    break;
+                }
+            }
+            h
+        }
+        let front = if a + b >= gamma::SADDLE_POINT_MIN_SHAPE {
+            a * beta_term(a, b, x, y)
+        } else {
+            match betaln_scalar(a, b, RuntimeMode::Strict) {
+                Ok(ln_beta) => (a * x.ln() + b * y.ln() - ln_beta).exp(),
+                Err(_) => f64::NAN,
+            }
+        };
+        if x < (a + 1.0) / (a + b + 2.0) {
+            front * cf(a, b, x) / a
+        } else {
+            1.0 - front * cf(b, a, y) / b
+        }
+    }
+
+    #[test]
+    fn betainc_kernel_holds_with_one_huge_shape_parameter() {
+        // stdtr(v, ±2) and stdtrc(v, 2). SciPy agrees to <= 5.3e-16.
+        for (v, upper, lower) in [
+            (1e10, 0.977249868038323, 0.02275013196167695),
+            (1e12, 0.9772498680516858, 0.022750131948314184),
+            (1e15, 0.9772498680518207, 0.022750131948179344),
+            (1e20, 0.9772498680518208, 0.02275013194817921),
+        ] {
+            for (label, got, want) in [
+                ("stdtr(v, 2)", stdtr(v, 2.0), upper),
+                ("stdtr(v, -2)", stdtr(v, -2.0), lower),
+                ("stdtrc(v, 2)", stdtrc(v, 2.0), lower),
+            ] {
+                let e = rel_err(got, want);
+                assert!(
+                    e <= BRATIO_TOL,
+                    "{label} at v = {v:e}: {got:e} vs {want:e} ({e:.1e})"
+                );
+            }
+        }
+        // fdtr(5, dfd, 2) and fdtrc. SciPy agrees to <= 9.4e-16.
+        for (dfd, cdf, sf) in [
+            (1e12, 0.9247647538524961, 0.07523524614750389),
+            (1e15, 0.9247647538534868, 0.07523524614651317),
+            (1e20, 0.9247647538534878, 0.07523524614651218),
+        ] {
+            for (label, got, want) in [
+                ("fdtr", fdtr(5.0, dfd, 2.0), cdf),
+                ("fdtrc", fdtrc(5.0, dfd, 2.0), sf),
+            ] {
+                let e = rel_err(got, want);
+                assert!(
+                    e <= BRATIO_TOL,
+                    "{label}(5, {dfd:e}, 2): {got:e} vs {want:e} ({e:.1e})"
+                );
+            }
+        }
+        // betainc(2.5, 1e20, 5e-20) and its complement through each complement entry point.
+        let x = 5e-20;
+        for (label, got, want) in [
+            (
+                "betainc",
+                betainc_scalar(2.5, 1e20, x, RuntimeMode::Strict).unwrap_or(f64::NAN),
+                0.9247647538534878,
+            ),
+            ("btdtr", btdtr(2.5, 1e20, x), 0.9247647538534878),
+            (
+                "betaincc",
+                betaincc_scalar(2.5, 1e20, x, RuntimeMode::Strict).unwrap_or(f64::NAN),
+                0.07523524614651218,
+            ),
+            ("btdtrc", btdtrc(2.5, 1e20, x), 0.07523524614651218),
+        ] {
+            let e = rel_err(got, want);
+            assert!(
+                e <= BRATIO_TOL,
+                "{label}(2.5, 1e20, 5e-20): {got:e} vs {want:e} ({e:.1e})"
+            );
+        }
+        // ncfdtr(5, dfd, 1, 2) → chndtr(10, 5, 1) = 0.8626668135599574 as dfd → ∞ (mpmath; SciPy
+        // gives ...576). dfd = 1e15 is the Poisson sum of mpmath incomplete betas.
+        for (dfd, want) in [
+            (1e15, 0.8626668135599563),
+            (1e20, 0.8626668135599574),
+            (1e100, 0.8626668135599574),
+        ] {
+            let got = ncfdtr(5.0, dfd, 1.0, 2.0);
+            let e = rel_err(got, want);
+            assert!(
+                e <= BRATIO_TOL,
+                "ncfdtr(5, {dfd:e}, 1, 2): {got:e} vs {want:e} ({e:.1e})"
+            );
+        }
+    }
+
+    #[test]
+    fn betainc_kernel_holds_with_both_shape_parameters_huge_near_the_mean() {
+        // x = mean ± 1 sd rounded to a multiple of 2⁻⁵³, so 1 − x is exact: TOMS 708's BASYM.
+        // SciPy misses the lower tails by up to 8.7e-12 (a = b = 1e10).
+        for (a, b, x, lower, upper) in [
+            (
+                1e6,
+                1e6,
+                0.499646446697795,
+                0.1586553144241098,
+                0.8413446855758903,
+            ),
+            (
+                1e6,
+                1e6,
+                0.500353553302205,
+                0.8413446855758903,
+                0.1586553144241098,
+            ),
+            (
+                1e10,
+                1e10,
+                0.49999646446609414,
+                0.15865525393623536,
+                0.8413447460637646,
+            ),
+            (
+                1e10,
+                1e10,
+                0.5000035355339059,
+                0.8413447460637646,
+                0.15865525393623536,
+            ),
+            (
+                1e6,
+                1e10,
+                9.989001599808311e-05,
+                0.1586552137265905,
+                0.8413447862734095,
+            ),
+            (
+                1e6,
+                1e10,
+                0.00010008998600175012,
+                0.8413447862965844,
+                0.15865521370341568,
+            ),
+            (
+                1e10,
+                1e6,
+                0.9998999100139982,
+                0.15865521370341568,
+                0.8413447862965844,
+            ),
+            (
+                1e10,
+                1e6,
+                0.9999001099840019,
+                0.8413447862734095,
+                0.1586552137265905,
+            ),
+        ] {
+            let got = btdtr(a, b, x);
+            let e = rel_err(got, lower);
+            assert!(
+                e <= BRATIO_TOL,
+                "btdtr({a:e}, {b:e}, {x}): {got:e} vs {lower:e} ({e:.1e})"
+            );
+            let got = btdtrc(a, b, x);
+            let e = rel_err(got, upper);
+            assert!(
+                e <= BRATIO_TOL,
+                "btdtrc({a:e}, {b:e}, {x}): {got:e} vs {upper:e} ({e:.1e})"
+            );
+        }
+    }
+
+    #[test]
+    fn betainc_kernel_holds_with_a_tiny_shape_parameter_and_in_the_tails() {
+        for (a, b, x, lower, upper) in [
+            // One parameter ≤ 1e-3 (FPSER, APSER, BPSER regimes).
+            (0.001, 5.0, 0.2, 0.9997834456464276, 0.00021655435357234194),
+            (5.0, 0.001, 0.9, 0.000590780689705737, 0.9994092193102943),
+            (0.001, 0.001, 0.3, 0.49957696213967645, 0.5004230378603235),
+            (1e-20, 0.5, 0.3, 1.0, 2.4198702426718918e-20),
+            (2.5, 1e-20, 0.3, 2.525438280078752e-22, 1.0),
+            (
+                1e-05,
+                10000.0,
+                1e-05,
+                0.9999817704465501,
+                1.8229553449877786e-05,
+            ),
+            (
+                300.0,
+                0.0001,
+                0.999,
+                9.065575366839369e-05,
+                0.9999093442463316,
+            ),
+            // x near 0 and 1: both tails, down to 3e-299.
+            (2.0, 30.0, 0.9999999999, 1.0, 3.100007694563734e-299),
+            (30.0, 2.0, 1e-10, 3.0999999997000033e-299, 1.0),
+            (5.0, 3.0, 0.999, 0.9999999651048741, 3.489512593001509e-08),
+            (0.5, 2.5, 0.9999999990686774, 1.0, 8.987298704137216e-24),
+            // SciPy's betaincc here is 1.0, off by 6.4e-11.
+            (0.5, 0.5, 1e-20, 6.366197723675813e-11, 0.999999999936338),
+            (
+                200.0,
+                30.0,
+                0.95,
+                0.9999983407221587,
+                1.6592778413140257e-06,
+            ),
+            (3.0, 40.0, 0.9, 1.0, 7.011999999999938e-38),
+        ] {
+            for (label, got, want) in [
+                ("btdtr", btdtr(a, b, x), lower),
+                (
+                    "betaincc",
+                    betaincc_scalar(a, b, x, RuntimeMode::Strict).unwrap_or(f64::NAN),
+                    upper,
+                ),
+                ("btdtrc", btdtrc(a, b, x), upper),
+            ] {
+                let e = rel_err(got, want);
+                assert!(
+                    e <= BRATIO_TOL,
+                    "{label}({a:e}, {b:e}, {x}): {got:e} vs {want:e} ({e:.1e})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn betainc_kernel_holds_on_everyday_shape_parameters() {
+        // a, b ∈ {0.5, 2, 30, 200}, x ∈ {0.1, 0.5, 0.9}: (a, b, x, I_x(a, b), 1 − I_x(a, b)).
+        for (a, b, x, lower, upper) in [
+            (0.5, 0.5, 0.1, 0.20483276469913345, 0.7951672353008665),
+            (0.5, 0.5, 0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.9, 0.7951672353008665, 0.20483276469913342),
+            (0.5, 2.0, 0.1, 0.458530260724415, 0.541469739275585),
+            (0.5, 2.0, 0.5, 0.8838834764831844, 0.11611652351681559),
+            (0.5, 2.0, 0.9, 0.9961174629530395, 0.0038825370469605085),
+            (0.5, 30.0, 0.1, 0.9877175515001473, 0.012282448499852747),
+            (0.5, 30.0, 0.5, 0.9999999998669794, 1.3302059355529229e-10),
+            (0.5, 30.0, 0.9, 1.0, 1.0793411337245473e-31),
+            (0.5, 200.0, 0.1, 0.9999999999129222, 8.707774398967445e-11),
+            (0.5, 200.0, 0.5, 1.0, 3.500102489320581e-62),
+            (0.5, 200.0, 0.9, 1.0, 4.201432808808219e-202),
+            (2.0, 0.5, 0.1, 0.0038825370469605107, 0.9961174629530395),
+            (2.0, 0.5, 0.5, 0.11611652351681559, 0.8838834764831844),
+            (2.0, 0.5, 0.9, 0.5414697392755851, 0.45853026072441494),
+            (2.0, 2.0, 0.1, 0.028000000000000004, 0.972),
+            (2.0, 2.0, 0.5, 0.5, 0.5),
+            (2.0, 2.0, 0.9, 0.972, 0.027999999999999987),
+            (2.0, 30.0, 0.1, 0.8304353668991352, 0.16956463310086478),
+            (2.0, 30.0, 0.5, 0.9999999850988388, 1.4901161193847656e-08),
+            (2.0, 30.0, 0.9, 1.0, 2.799999999999981e-29),
+            (2.0, 200.0, 0.1, 0.9999999851843339, 1.4815666128176182e-08),
+            (2.0, 200.0, 0.5, 1.0, 6.285245430639753e-59),
+            (2.0, 200.0, 0.9, 1.0, 1.8099999999999195e-198),
+            (30.0, 0.5, 0.1, 1.0793411337245563e-31, 1.0),
+            (30.0, 0.5, 0.5, 1.3302059355529229e-10, 0.9999999998669794),
+            (30.0, 0.5, 0.9, 0.01228244849985276, 0.9877175515001473),
+            (30.0, 2.0, 0.1, 2.8000000000000047e-29, 1.0),
+            (30.0, 2.0, 0.5, 1.4901161193847656e-08, 0.9999999850988388),
+            (30.0, 2.0, 0.9, 0.16956463310086492, 0.8304353668991351),
+            (30.0, 30.0, 0.1, 3.1056495720556e-15, 0.9999999999999969),
+            (30.0, 30.0, 0.5, 0.5, 0.5),
+            (30.0, 30.0, 0.9, 0.9999999999999969, 3.105649572055577e-15),
+            (30.0, 200.0, 0.1, 0.07688909815907019, 0.9231109018409298),
+            (30.0, 200.0, 0.5, 1.0, 6.545600958483148e-33),
+            (30.0, 200.0, 0.9, 1.0, 2.3156566951687756e-165),
+            (200.0, 0.5, 0.1, 4.201432808808452e-202, 1.0),
+            (200.0, 0.5, 0.5, 3.500102489320581e-62, 1.0),
+            (200.0, 0.5, 0.9, 8.707774398967499e-11, 0.9999999999129222),
+            (200.0, 2.0, 0.1, 1.81000000000002e-198, 1.0),
+            (200.0, 2.0, 0.5, 6.285245430639753e-59, 1.0),
+            (200.0, 2.0, 0.9, 1.4815666128176268e-08, 0.9999999851843339),
+            (200.0, 30.0, 0.1, 2.3156566951689024e-165, 1.0),
+            (200.0, 30.0, 0.5, 6.545600958483148e-33, 1.0),
+            (200.0, 30.0, 0.9, 0.92311090184093, 0.07688909815906998),
+            (200.0, 200.0, 0.1, 4.5332869859638815e-91, 1.0),
+            (200.0, 200.0, 0.5, 0.5, 0.5),
+            (200.0, 200.0, 0.9, 1.0, 4.5332869859636575e-91),
+        ] {
+            for (label, got, want) in [
+                (
+                    "betainc",
+                    betainc_scalar(a, b, x, RuntimeMode::Strict).unwrap_or(f64::NAN),
+                    lower,
+                ),
+                (
+                    "betaincc",
+                    betaincc_scalar(a, b, x, RuntimeMode::Strict).unwrap_or(f64::NAN),
+                    upper,
+                ),
+            ] {
+                let e = rel_err(got, want);
+                assert!(
+                    e <= BRATIO_TOL,
+                    "{label}({a}, {b}, {x}): {got:e} vs {want:e} ({e:.1e})"
+                );
+            }
+        }
+    }
+
+    /// The frankenscipy-g9yid item 6 row: cdflib's dfd search evaluates ncfdtr at dfd = 1e100,
+    /// which the old kernel returned as 0, so the search stopped at the 1e-100 bound.
+    #[test]
+    fn ncfdtridfd_recovers_dfd_through_the_huge_dfd_bound() {
+        let p = ncfdtr(5.0, 10.0, 1.0, 2.0);
+        let got = ncfdtridfd(5.0, p, 1.0, 2.0);
+        assert!(
+            rel_err(got, 10.0) <= 1e-6,
+            "ncfdtridfd(5, ncfdtr(5, 10, 1, 2) = {p}, 1, 2) = {got:e}, want 10"
+        );
+        let far = ncfdtr(5.0, 1e100, 1.0, 2.0);
+        assert!(
+            rel_err(far, 0.8626668135599574) <= BRATIO_TOL,
+            "ncfdtr(5, 1e100, 1, 2) = {far:e}, the search's upper bound"
+        );
+    }
+
+    #[test]
+    fn log_betainc_holds_in_huge_parameter_and_underflowed_tails() {
+        // (a, b, x, ln I_x(a, b)) from mpmath; every row but the two marked "representable" has
+        // I below the smallest double.
+        for (a, b, x, want) in [
+            // Student t, df = 1e10: t = −40 (underflows) and t = −3 (representable).
+            (5e9, 0.5, 0.9999998400000256, -803.9152306564122),
+            (5e9, 0.5, 0.9999999991, -5.914578842892178),
+            // a = b huge, 40 and 45 sd below the mean; and 3 sd (representable).
+            (1e10, 1e10, 0.49985857864376615, -804.6084739745613),
+            (1e10, 1e10, 0.4999893933982824, -6.607726222300781),
+            (1e6, 1e6, 0.4840901014007768, -1017.7385112332812),
+            // One huge parameter.
+            (300.0, 1e15, 1e-14, -734.0965389576945),
+            (1e8, 0.9, 0.999992, -800.738162266186),
+            (1e12, 50.0, 0.9999999999, -18.256484964870996),
+            (1e15, 3.5, 0.9999999999985, -1482.9385470738391),
+            (2.5, 5e19, 1e-20, -3.285169839243992),
+            // Moderate parameters, far tails.
+            (30.0, 200.0, 1e-12, -742.5640374030463),
+            (40.0, 0.3, 1e-8, -740.5078726811059),
+            (10.0, 0.5, 1e-80, -1843.804226691833),
+            (0.5, 0.5, 0.3, -0.9969312110207781),
+        ] {
+            let got = log_betainc_scalar(a, b, x);
+            let e = rel_err(got, want);
+            assert!(
+                e <= BRATIO_TOL,
+                "log_betainc({a:e}, {b:e}, {x}): {got} vs {want} ({e:.1e})"
+            );
+        }
+    }
+
+    /// The before arm, kept as a permanent control: the old kernel fails the rows the tests above
+    /// pin, so those tests can tell the two kernels apart.
+    #[test]
+    fn legacy_nr_kernel_misses_the_large_parameter_rows() {
+        // (label, legacy value, expected) — the expected values are the ones pinned above.
+        let d15 = 10.0 + 1e15;
+        let t20 = 1e20 + 4.0;
+        for (label, legacy, want, miss) in [
+            (
+                "betainc(2.5, 1e20, 5e-20)",
+                legacy_nr_betainc(2.5, 1e20, 5e-20, 1.0 - 5e-20),
+                0.9247647538534878,
+                1e-3,
+            ),
+            (
+                "fdtr(5, 1e15, 2)",
+                legacy_nr_betainc(2.5, 0.5e15, 10.0 / d15, 1e15 / d15),
+                0.9247647538534868,
+                1e-5,
+            ),
+            (
+                // The old stdtr took 1 − x by subtraction; x rounds to 1 at v = 1e20.
+                "stdtr(1e20, 2)",
+                1.0 - 0.5 * legacy_nr_betainc(5e19, 0.5, 1e20 / t20, 1.0 - 1e20 / t20),
+                0.9772498680518208,
+                1e-2,
+            ),
+            (
+                "btdtr(1e10, 1e10, mean - 1 sd)",
+                legacy_nr_betainc(1e10, 1e10, 0.49999646446609414, 0.5000035355339059),
+                0.15865525393623536,
+                1e-12,
+            ),
+        ] {
+            let e = rel_err(legacy, want);
+            assert!(
+                !(e <= miss),
+                "the old kernel was expected to miss {label} by more than {miss:e}: {legacy:e} vs {want:e} ({e:.1e})"
             );
         }
     }
