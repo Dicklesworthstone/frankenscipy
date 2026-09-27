@@ -112,13 +112,6 @@ reason = "needs (alpha, beta) stable laws; the alias to Levy was removed"
 bead = "frankenscipy-szq1n.2"
 
 [[entry]]
-module = "scipy.stats"
-name = "vonmises_line"
-disposition = "missing"
-reason = "support [-pi, pi]; the alias to the periodic VonMises was removed"
-bead = "frankenscipy-szq1n.2"
-
-[[entry]]
 module = "scipy.integrate"
 name = "IntegrationWarning"
 disposition = "adapted"

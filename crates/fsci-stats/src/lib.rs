@@ -11072,6 +11072,128 @@ impl ContinuousDistribution for VonMises {
     }
 }
 
+/// `scipy.stats.vonmises_line(kappa, loc)`: the von Mises law on the line, supported on the
+/// single period `[loc − π, loc + π]`.
+///
+/// SciPy builds it as `vonmises_gen(a=-π, b=π)`, so inside that window its density, cdf and
+/// moments are [`VonMises`]'s. Outside it the density is 0 and the cdf stays at 0 below and 1
+/// above, where the circular `vonmises` repeats its density and adds one to the cdf per period.
+/// `ppf(0)`/`ppf(1)` are the window's ends, not ±∞. The fit is [`VonMises`]'s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VonmisesLine {
+    pub kappa: f64,
+    pub loc: f64,
+}
+
+impl VonmisesLine {
+    #[must_use]
+    pub fn new(kappa: f64, loc: f64) -> Self {
+        assert!(kappa >= 0.0, "kappa must be non-negative, got {kappa}");
+        Self { kappa, loc }
+    }
+
+    /// The support `[loc − π, loc + π]`, as SciPy's `support()`.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (self.loc - PI, self.loc + PI)
+    }
+
+    fn circular(&self) -> VonMises {
+        VonMises {
+            kappa: self.kappa,
+            loc: self.loc,
+        }
+    }
+}
+
+impl ContinuousDistribution for VonmisesLine {
+    fn pdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x < a || x > b {
+            return 0.0;
+        }
+        self.circular().pdf(x)
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x < a || x > b {
+            return f64::NEG_INFINITY;
+        }
+        self.circular().logpdf(x)
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x <= a {
+            return 0.0;
+        }
+        if x >= b {
+            return 1.0;
+        }
+        self.circular().base_cdf(x)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (a, b) = self.support();
+        if q == 0.0 {
+            return a;
+        }
+        if q == 1.0 {
+            return b;
+        }
+        self.circular().ppf(q)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (a, b) = self.support();
+        if q == 0.0 {
+            return b;
+        }
+        if q == 1.0 {
+            return a;
+        }
+        self.circular().isf(q)
+    }
+
+    fn mean(&self) -> f64 {
+        self.circular().mean()
+    }
+
+    fn var(&self) -> f64 {
+        self.circular().var()
+    }
+
+    fn entropy(&self) -> f64 {
+        self.circular().entropy()
+    }
+
+    fn skewness(&self) -> f64 {
+        self.circular().skewness()
+    }
+
+    fn kurtosis(&self) -> f64 {
+        self.circular().kurtosis()
+    }
+
+    fn mode(&self) -> f64 {
+        self.loc
+    }
+
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        VonMises::try_fit(data).map(|fitted| Self {
+            kappa: fitted.kappa,
+            loc: fitted.loc,
+        })
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Poisson Distribution (discrete, but commonly needed)
 // ══════════════════════════════════════════════════════════════════════
@@ -22647,7 +22769,8 @@ pub type Exponweib = ExponWeibull;
 // finite-n KS law, kstwobign its n -> inf limit; vonmises_line is zero outside
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
-// `Kstwo` is now its own type, the finite-n law (frankenscipy-1ksfv.16).
+// `Kstwo` is now its own type, the finite-n law, and so is `VonmisesLine`, the law on
+// [loc - pi, loc + pi] (frankenscipy-1ksfv.16).
 
 // SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
 // are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
@@ -76132,6 +76255,72 @@ mod tests {
                 "VonMises({kappa}) kurt: got {} want {kurt}",
                 v.kurtosis()
             );
+        }
+    }
+
+    /// SciPy 1.17.1 `vonmises_line(κ, loc=0.5)` against `vonmises(κ, loc=0.5)`: they agree on
+    /// [loc − π, loc + π] and part outside it, where vonmises_line has density 0, cdf 1 above and
+    /// ppf/isf ending at the window's edges (frankenscipy-1ksfv.16).
+    #[test]
+    fn vonmises_line_is_vonmises_on_one_period() {
+        let loc = 0.5;
+        // (κ, cdf(1.0), cdf(-2.0), ppf(0.3), var, entropy), SciPy 1.17.1, except var: SciPy
+        // integrates x²·pdf with quad and at κ = 10 returns 0.10565504392755344, 1.1e-8 below
+        // the 40-digit mpmath value of ∫x²·pdf used here (which the Bessel series reproduces).
+        let cases = [
+            (
+                0.0,
+                0.579_577_471_545_947_6,
+                0.102_112_642_270_261_62,
+                -0.756_637_061_435_917_2,
+                3.289_868_133_696_452_9,
+                1.837_877_066_409_345_3,
+            ),
+            (
+                2.0,
+                0.738_192_214_418_519_1,
+                0.006_985_005_694_537_374_5,
+                0.090_740_763_537_030_64,
+                0.764_461_879_811_126_9,
+                1.266_321_291_964_285_2,
+            ),
+            // κ = 10 is below SciPy's series cutoff (10.5); above it SciPy's cdf is a normal
+            // approximation that fsci's exact series does not follow (frankenscipy-1qmf4).
+            (
+                10.0,
+                0.938_644_931_910_898_9,
+                3.909_338_117_114_025e-9,
+                0.331_759_218_938_926_7,
+                0.105_655_054_874_171_9,
+                0.294_850_889_979_581_86,
+            ),
+        ];
+        for (kappa, cdf_1, cdf_m2, ppf_03, var, entropy) in cases {
+            let line = VonmisesLine::new(kappa, loc);
+            let circular = VonMises::new(kappa, loc);
+            assert_eq!(line.support(), (loc - PI, loc + PI));
+            assert!((line.cdf(1.0) - cdf_1).abs() < 1e-13, "κ={kappa}");
+            assert!((line.cdf(-2.0) - cdf_m2).abs() < 1e-13, "κ={kappa}");
+            assert!((line.sf(1.0) - (1.0 - cdf_1)).abs() < 1e-13, "κ={kappa}");
+            assert!((line.ppf(0.3) - ppf_03).abs() < 1e-9, "κ={kappa}");
+            assert!((line.var() - var).abs() < 1e-12, "κ={kappa}");
+            assert!((line.entropy() - entropy).abs() < 1e-12, "κ={kappa}");
+            assert_eq!(line.pdf(1.0).to_bits(), circular.pdf(1.0).to_bits());
+            // Outside the window: SciPy's vonmises_line is 0 / -inf / 1 / 0 where vonmises
+            // repeats its density and counts a further cycle.
+            for x in [4.0, -2.9, 12.0] {
+                assert_eq!(line.pdf(x), 0.0, "κ={kappa} x={x}");
+                assert_eq!(line.logpdf(x), f64::NEG_INFINITY, "κ={kappa} x={x}");
+                assert!(circular.pdf(x) > 0.0, "κ={kappa} x={x}");
+            }
+            assert_eq!(line.cdf(4.0), 1.0);
+            assert_eq!(line.cdf(-2.9), 0.0);
+            assert!(circular.cdf(4.0) >= 1.0 && circular.cdf(12.0) > 2.0);
+            assert_eq!(line.ppf(0.0), loc - PI);
+            assert_eq!(line.ppf(1.0), loc + PI);
+            assert_eq!(line.isf(0.0), loc + PI);
+            assert_eq!(line.isf(1.0), loc - PI);
+            assert!(line.ppf(1.5).is_nan() && line.cdf(f64::NAN).is_nan());
         }
     }
 
