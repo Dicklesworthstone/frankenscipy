@@ -87,8 +87,15 @@ else:
     values = take(g * g * g).reshape(g, g, g)
     queries = take(m * 3).reshape(m, 3)
     fixture = b''.join(a.tobytes() for a in axes) + values.tobytes() + queries.tobytes()
-    rgi = RegularGridInterpolator(tuple(axes), values, method='linear', bounds_error=False)
-    def run(): return rgi(queries)
+    if op == 'rgi':
+        rgi = RegularGridInterpolator(tuple(axes), values, method='linear', bounds_error=False)
+        def run(): return rgi(queries)
+    else:
+        # rgi_cubic is the whole job: SciPy builds its spline (make_ndbspl + gcrotmk) in
+        # the constructor, and that build is most of the cost.
+        def run():
+            return RegularGridInterpolator(tuple(axes), values, method='cubic',
+                                           bounds_error=False)(queries)
 
 ref = np.ascontiguousarray(run(), dtype='<f8')
 print(f'READY scipy={scipy.__version__} numpy={np.__version__} op={op} n={n} m={m} g={g} '
@@ -345,11 +352,13 @@ fn main() {
         .map(|c| c.to_vec())
         .collect();
 
-    for op in ["splev", "cubic", "rgi"] {
+    // `rgi_cubic` (build + evaluate, RegularGridInterpolator method='cubic') runs only when
+    // named in FSCI_INTERP_OPS.
+    for op in ["splev", "cubic", "rgi", "rgi_cubic"] {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
-        let blobs: Vec<&[f64]> = if op == "rgi" {
+        let blobs: Vec<&[f64]> = if op.starts_with("rgi") {
             vec![&axes[0], &axes[1], &axes[2], &values, &queries_flat]
         } else {
             vec![&x, &y, &q]
@@ -384,6 +393,18 @@ fn main() {
                 // Measured wrong first: the scalar loop read 0.788x at n=20000 where the
                 // batch call is well over parity.
                 "cubic" => spline.as_ref().expect("spline").eval_many(&q),
+                // The whole job, as on SciPy's side: build the interpolating spline, then
+                // evaluate. CHECK compares with SciPy's default `cubic`, whose gcrotmk build
+                // is only solved to rtol 1e-5, so its max_rel is SciPy's solver error.
+                "rgi_cubic" => RegularGridInterpolator::new(
+                    axes.to_vec(),
+                    values.clone(),
+                    RegularGridMethod::Cubic,
+                    false,
+                    None,
+                )
+                .and_then(|grid| grid.eval_many(&queries))
+                .expect("fsci rgi cubic"),
                 _ => grid
                     .as_ref()
                     .expect("grid")

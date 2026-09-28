@@ -224,6 +224,9 @@
   "diff_interpolate_rect_bivariate_bilinear_spline.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_interpolate_regular_grid_splines.rs": {
+    "REL_TOL": 1e-12
+  },
   "diff_interpolate_spl_ops.rs": {
     "TCK_TOL": 1e-9,
     "VAL_TOL": 1e-9

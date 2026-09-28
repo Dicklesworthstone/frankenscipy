@@ -1048,6 +1048,7 @@ pub enum InterpolateRegularGridMethod {
     Linear,
     Nearest,
     Pchip,
+    Slinear,
     Cubic,
     Quintic,
 }
@@ -12137,6 +12138,7 @@ fn fixture_regular_grid_method_to_runtime(
         InterpolateRegularGridMethod::Linear => FsciRegularGridMethod::Linear,
         InterpolateRegularGridMethod::Nearest => FsciRegularGridMethod::Nearest,
         InterpolateRegularGridMethod::Pchip => FsciRegularGridMethod::Pchip,
+        InterpolateRegularGridMethod::Slinear => FsciRegularGridMethod::Slinear,
         InterpolateRegularGridMethod::Cubic => FsciRegularGridMethod::Cubic,
         InterpolateRegularGridMethod::Quintic => FsciRegularGridMethod::Quintic,
     }

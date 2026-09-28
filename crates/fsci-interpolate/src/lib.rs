@@ -3774,11 +3774,16 @@ pub enum RegularGridMethod {
     /// Tensor-product PCHIP interpolation. Requires at least 4 points per axis.
     /// Matches scipy's `method='pchip'`.
     Pchip,
-    /// Tensor product cubic spline (k=3). Requires at least 4 points per axis.
-    /// Matches scipy's `method='cubic'`.
+    /// Tensor-product interpolating spline of degree 1, which is multilinear interpolation
+    /// between the grid points and extends the end pieces outside them. Requires at least 2
+    /// points per axis. Matches scipy's `method='slinear'`.
+    Slinear,
+    /// Tensor-product interpolating cubic spline (k=3, not-a-knot). Requires at least 4 points
+    /// per axis. Matches scipy's `method='cubic'` up to the tolerance of the iterative solver
+    /// SciPy uses to build it, and `method='cubic_legacy'` to rounding.
     Cubic,
-    /// Tensor product quintic spline (k=5). Requires at least 6 points per axis.
-    /// Matches scipy's `method='quintic'`.
+    /// Tensor-product interpolating quintic spline (k=5, not-a-knot). Requires at least 6 points
+    /// per axis. Matches scipy's `method='quintic'` as [`Cubic`](Self::Cubic) matches `cubic`.
     Quintic,
 }
 
@@ -3795,10 +3800,8 @@ pub struct RegularGridInterpolator {
     /// direct-address interval lookup instead of binary search. `None` for
     /// irregular axes (which keep the binary-search path).
     uniform_axes: Vec<Option<(f64, f64)>>,
-    /// Per-axis spline coefficients for Cubic/Quintic methods.
-    /// Each inner Vec contains spline coefficients for that axis.
-    /// Reserved for future precomputation optimization.
-    _spline_coeffs_per_axis: Option<Vec<Vec<[f64; 4]>>>,
+    /// The interpolating spline for the Slinear, Cubic and Quintic methods.
+    spline: Option<GridSpline>,
 }
 
 /// Same-binary A/B toggle for batch PCHIP evaluation. When `true`, `eval_many` routes every PCHIP
@@ -3832,7 +3835,9 @@ impl RegularGridInterpolator {
 
         // Determine minimum points required per axis based on method
         let min_points = match method {
-            RegularGridMethod::Linear | RegularGridMethod::Nearest => 2,
+            RegularGridMethod::Linear | RegularGridMethod::Nearest | RegularGridMethod::Slinear => {
+                2
+            }
             RegularGridMethod::Pchip | RegularGridMethod::Cubic => 4,
             RegularGridMethod::Quintic => 6,
         };
@@ -3872,17 +3877,23 @@ impl RegularGridInterpolator {
                 y_len: values.len(),
             });
         }
-        // scipy builds the cubic and quintic tensor splines in `__init__` (`make_ndbspl`), whose
-        // solve rejects non-finite data whatever the queries or `bounds_error` will be.
-        if matches!(
-            method,
-            RegularGridMethod::Cubic | RegularGridMethod::Quintic
-        ) && values.iter().any(|v| !v.is_finite())
-        {
+        // scipy builds the slinear, cubic and quintic tensor splines in `__init__`
+        // (`make_ndbspl`), whose solve rejects non-finite data whatever the queries or
+        // `bounds_error` will be.
+        let spline_degree = match method {
+            RegularGridMethod::Slinear => Some(1),
+            RegularGridMethod::Cubic => Some(3),
+            RegularGridMethod::Quintic => Some(5),
+            _ => None,
+        };
+        if spline_degree.is_some() && values.iter().any(|v| !v.is_finite()) {
             return Err(InterpError::InvalidArgument {
                 detail: "RHS must contain only finite numbers".to_string(),
             });
         }
+        let spline = spline_degree
+            .map(|k| GridSpline::new(&points, &values, &strides, k))
+            .transpose()?;
 
         // Detect evenly-spaced axes once at construction so the hot eval paths
         // can replace per-query binary search with O(1) direct addressing. An
@@ -3895,9 +3906,6 @@ impl RegularGridInterpolator {
             .map(|axis| detect_uniform_axis(axis))
             .collect();
 
-        // For spline methods, we don't precompute coefficients since that would be
-        // expensive and may not be needed. Coefficients are computed on-the-fly
-        // during interpolation using 1D cubic spline along each axis.
         Ok(Self {
             points,
             values,
@@ -3906,7 +3914,7 @@ impl RegularGridInterpolator {
             bounds_error,
             fill_value,
             uniform_axes,
-            _spline_coeffs_per_axis: None,
+            spline,
         })
     }
 
@@ -3951,8 +3959,9 @@ impl RegularGridInterpolator {
             RegularGridMethod::Linear => self.eval_linear(xi),
             RegularGridMethod::Nearest => Ok(self.eval_nearest(xi)),
             RegularGridMethod::Pchip => self.eval_pchip(xi),
-            RegularGridMethod::Cubic => self.eval_spline(xi, 3),
-            RegularGridMethod::Quintic => self.eval_spline(xi, 5),
+            RegularGridMethod::Slinear | RegularGridMethod::Cubic | RegularGridMethod::Quintic => {
+                Ok(self.eval_spline(xi))
+            }
         }
     }
 
@@ -4028,8 +4037,9 @@ impl RegularGridInterpolator {
             RegularGridMethod::Nearest => ndim,
             RegularGridMethod::Linear => 1usize << ndim.min(16),
             RegularGridMethod::Pchip => ndim * 16,
-            RegularGridMethod::Cubic => ndim * 64,
-            RegularGridMethod::Quintic => ndim * 128,
+            RegularGridMethod::Slinear => 1usize << ndim.min(16),
+            RegularGridMethod::Cubic => 4usize.saturating_pow(ndim as u32),
+            RegularGridMethod::Quintic => 6usize.saturating_pow(ndim as u32),
         };
         par_query_try_map(xi, work_per_query, |x| self.eval(x))
     }
@@ -4429,108 +4439,104 @@ impl RegularGridInterpolator {
         Ok(reduced[0])
     }
 
-    /// Tensor product spline interpolation (cubic or quintic).
-    ///
-    /// Uses successive 1D cubic spline interpolations along each axis.
-    /// For degree k, we need k+1 points per axis.
-    fn eval_spline(&self, xi: &[f64], _degree: usize) -> Result<f64, InterpError> {
-        // For tensor-product interpolation, we apply 1D spline interpolation
-        // successively along each dimension. Start with a hypercube of values
-        // and reduce dimension by interpolating along one axis at a time.
+    /// The tensor-product spline methods (`slinear`, `cubic`, `quintic`) evaluated from the
+    /// coefficients `new` solved for. See [`GridSpline`].
+    fn eval_spline(&self, xi: &[f64]) -> f64 {
+        self.spline
+            .as_ref()
+            .expect("spline methods build their GridSpline in new")
+            .eval(xi, &self.strides)
+    }
+}
 
-        // We'll work with a recursive reduction approach:
-        // 1. Extract a hyperslab of the grid around the query point
-        // 2. Interpolate along dimension 0
-        // 3. Repeat for remaining dimensions
+/// The interpolating tensor-product spline behind `RegularGridInterpolator`'s `slinear`,
+/// `cubic` and `quintic` methods: degree `k` per axis with `make_interp_spline`'s not-a-knot
+/// knots, and coefficients chosen so the spline passes through every grid value.
+///
+/// SciPy 1.17.1 builds the same spline with `make_ndbspl`, which hands the whole tensor
+/// collocation system to the iterative `gcrotmk` at its default `rtol = 1e-5`, so its values
+/// carry that solver's error. Its `*_legacy` methods compute the exact interpolant by fitting a
+/// `make_interp_spline` along each axis per query. The system matrix is the Kronecker product
+/// of the per-axis collocation matrices, so here it is solved exactly, one banded solve per
+/// axis fiber, once at construction. A query is then the `(k+1)^ndim`-term sum `NdBSpline`
+/// evaluates, in the same order.
+#[derive(Debug, Clone)]
+struct GridSpline {
+    k: usize,
+    /// Per-axis knots, `interpolation_knots(axis, k)` as `make_interp_spline` builds them.
+    knots: Vec<Vec<f64>>,
+    /// Coefficients in the value grid's row-major layout.
+    coef: Vec<f64>,
+}
 
-        // For simplicity, we use a direct tensor product approach:
-        // Compute the spline basis values for each dimension, then sum over
-        // all combinations.
-
-        // For cubic spline, we use 4 points per dimension: a LOCAL cubic
-        // (Catmull-Rom, C1) tensor product. NOTE: this is NOT identical to
-        // scipy.interpolate.RegularGridInterpolator(method="cubic"), which fits
-        // a GLOBAL C2 tensor spline over the whole grid (hence ~264x slower at
-        // 300^2/50k queries; fsci 5.98 ms vs scipy 1582 ms). Values agree to
-        // ~0.06% but are not bit-parity — a deliberate speed/locality choice.
-        // (interpn `linear` IS bit-parity with scipy and 1.73x faster.)
-
-        self.eval_spline_tensor_product(xi)
+impl GridSpline {
+    fn new(
+        points: &[Vec<f64>],
+        values: &[f64],
+        strides: &[usize],
+        k: usize,
+    ) -> Result<Self, InterpError> {
+        let mut coef = values.to_vec();
+        let mut fiber = Vec::new();
+        for (dim, axis) in points.iter().enumerate() {
+            let (len, stride) = (axis.len(), strides[dim]);
+            let block = len * stride;
+            fiber.resize(len, 0.0);
+            for block_start in (0..coef.len()).step_by(block) {
+                for start in block_start..block_start + stride {
+                    for (i, slot) in fiber.iter_mut().enumerate() {
+                        *slot = coef[start + i * stride];
+                    }
+                    let spline = make_interp_spline_unchecked(axis, &fiber, k)?;
+                    for (i, &c) in spline.coeffs().iter().enumerate() {
+                        coef[start + i * stride] = c;
+                    }
+                }
+            }
+        }
+        let knots = points
+            .iter()
+            .map(|axis| interpolation_knots(axis, k))
+            .collect();
+        Ok(Self { k, knots, coef })
     }
 
-    /// Compute tensor product cubic spline interpolation.
-    ///
-    /// Uses local cubic (Catmull-Rom style) interpolation which is C1 continuous.
-    fn eval_spline_tensor_product(&self, xi: &[f64]) -> Result<f64, InterpError> {
-        let ndim = self.ndim();
-
-        // For each dimension, compute interpolation indices and weights
-        let mut interp_data: Vec<(usize, [f64; 4])> = Vec::with_capacity(ndim);
-
-        for (axis, &x) in self.points.iter().zip(xi) {
-            let n = axis.len();
-
-            // Find the interval: we want 4 points centered around x
-            // For Catmull-Rom, we need points at i-1, i, i+1, i+2 where
-            // axis[i] <= x < axis[i+1]
-            let i = Self::find_interval(axis, x);
-
-            // Clamp to ensure we have 4 valid points
-            let i0 = if i == 0 { 0 } else { i - 1 };
-            let i0 = i0.min(n.saturating_sub(4));
-
-            // Compute normalized parameter t for the interval [i, i+1]
-            // where i corresponds to i0+1
-            let center = i0 + 1;
-            let t = if center + 1 < n && axis[center + 1] != axis[center] {
-                (x - axis[center]) / (axis[center + 1] - axis[center])
-            } else {
-                0.0
-            };
-
-            // Catmull-Rom basis functions
-            let t2 = t * t;
-            let t3 = t2 * t;
-
-            // Weights for points p0, p1, p2, p3 where we interpolate between p1 and p2
-            let w0 = -0.5 * t3 + t2 - 0.5 * t;
-            let w1 = 1.5 * t3 - 2.5 * t2 + 1.0;
-            let w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
-            let w3 = 0.5 * t3 - 0.5 * t2;
-
-            interp_data.push((i0, [w0, w1, w2, w3]));
+    /// `NdBSpline.__call__` at one point: per axis the knot span (the end spans extend the
+    /// polynomial outside the data, as `extrapolate=True` does) and its `k+1` non-zero basis
+    /// values, then the sum over every combination with the last axis varying fastest.
+    fn eval(&self, xi: &[f64], strides: &[usize]) -> f64 {
+        let k = self.k;
+        let ndim = self.knots.len();
+        let mut spans = Vec::with_capacity(ndim);
+        let mut basis = Vec::with_capacity(ndim);
+        for (t, &x) in self.knots.iter().zip(xi) {
+            let span = BSpline::find_span_n(t, t.len() - k - 1, k, x);
+            spans.push(span);
+            basis.push(bspline_basis_funs(t, k, x, span));
         }
-
-        // Now compute weighted sum over all 4^ndim combinations
-        let mut result = 0.0;
-        let num_corners = 4_usize.pow(ndim as u32);
-
-        for corner_idx in 0..num_corners {
-            let mut weight = 1.0;
-            let mut flat_idx = 0;
-
-            for (dim, (base_idx, weights)) in interp_data.iter().enumerate().take(ndim) {
-                // Extract which of the 4 points we're using for this corner
-                let offset = (corner_idx / 4_usize.pow(dim as u32)) % 4;
-                let point_idx = *base_idx + offset;
-
-                // Ensure point_idx is in bounds
-                if point_idx >= self.points[dim].len() {
-                    // Skip this corner (weight will be zeroed)
-                    weight = 0.0;
+        let mut offsets = vec![0_usize; ndim];
+        let mut total = 0.0;
+        loop {
+            let mut factor = 1.0;
+            let mut flat = 0;
+            for dim in 0..ndim {
+                factor *= basis[dim][offsets[dim]];
+                flat += (spans[dim] - k + offsets[dim]) * strides[dim];
+            }
+            total += self.coef[flat] * factor;
+            let mut dim = ndim;
+            loop {
+                if dim == 0 {
+                    return total;
+                }
+                dim -= 1;
+                offsets[dim] += 1;
+                if offsets[dim] <= k {
                     break;
                 }
-
-                flat_idx += point_idx * self.strides[dim];
-                weight *= weights[offset];
-            }
-
-            if weight != 0.0 {
-                result += weight * self.values[flat_idx];
+                offsets[dim] = 0;
             }
         }
-
-        Ok(result)
     }
 }
 
@@ -15418,40 +15424,160 @@ mod tests {
     }
 
     #[test]
-    fn regular_grid_cubic_1d_smooth() {
-        // Cubic spline should interpolate smoothly
+    fn regular_grid_cubic_reproduces_cubics_exactly() {
+        // A not-a-knot cubic spline reproduces every cubic, inside the data and, through the
+        // end pieces, outside it: SciPy's cubic_legacy gives 0.25, 6.25 and 25 for x^2 at
+        // 0.5, 2.5 and 5 to within 2 ulps. The Catmull-Rom tensor this replaced was 0.25 off.
         let points = vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]];
-        let values = vec![0.0, 1.0, 4.0, 9.0, 16.0]; // y = x^2
-        let interp =
-            RegularGridInterpolator::new(points, values, RegularGridMethod::Cubic, false, None)
-                .expect("regular grid cubic");
-        // Test at midpoints
-        let v_half = interp.eval(&[0.5]).expect("eval");
-        let v_1_5 = interp.eval(&[1.5]).expect("eval");
-        let v_2_5 = interp.eval(&[2.5]).expect("eval");
-        // For cubic interpolation of x^2, should be close to correct values
-        assert!((v_half - 0.25).abs() < 0.5, "got {v_half}, expected ~0.25");
-        assert!((v_1_5 - 2.25).abs() < 0.5, "got {v_1_5}, expected ~2.25");
-        assert!((v_2_5 - 6.25).abs() < 0.5, "got {v_2_5}, expected ~6.25");
+        let cubics: [fn(f64) -> f64; 2] = [|t| t * t, |t| t * t * t - 2.0 * t];
+        for f in cubics {
+            let values = points[0].iter().map(|&t| f(t)).collect();
+            let interp = RegularGridInterpolator::new(
+                points.clone(),
+                values,
+                RegularGridMethod::Cubic,
+                false,
+                None,
+            )
+            .expect("regular grid cubic");
+            for x in [0.5, 1.5, 2.5, 5.0, -0.75] {
+                let got = interp.eval(&[x]).expect("eval");
+                assert!(
+                    (got - f(x)).abs() <= 1e-13 * f(x).abs().max(1.0),
+                    "x={x}: {got}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn regular_grid_cubic_2d_smooth() {
-        // 2D cubic interpolation on a 4x4 grid
-        let points = vec![vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 2.0, 3.0]];
-        // values = x + y
-        let mut values = Vec::new();
-        for &x in &points[0] {
-            for &y in &points[1] {
-                values.push(x + y);
+    fn regular_grid_splines_match_scipy_legacy_values() {
+        // SciPy 1.17.1, RegularGridInterpolator((x, y), V, method=m + '_legacy',
+        // bounds_error=False, fill_value=None), V = sin(x)·exp(0.3y) + 0.1·x·y². The legacy
+        // methods fit the exact interpolating spline; SciPy's default methods solve for the
+        // same spline with gcrotmk at rtol 1e-5 and sit 1.5e-4 (cubic) and 1.4e-2 (quintic)
+        // from these values on this grid. Queries 5 to 7 are outside the grid (extrapolated).
+        let x: [f64; 7] = [0.0, 0.7, 1.5, 2.1, 3.0, 4.2, 5.0];
+        let y: [f64; 6] = [-1.0, -0.2, 0.5, 1.4, 2.0, 3.3];
+        let values: Vec<f64> = x
+            .iter()
+            .flat_map(|&a| {
+                y.iter()
+                    .map(move |&b| a.sin() * (0.3 * b).exp() + 0.1 * a * b * b)
+            })
+            .collect();
+        let queries = [
+            [0.35, -0.6],
+            [1.5, 0.5],
+            [2.9, 1.9],
+            [4.9, 3.2],
+            [-0.4, 0.0],
+            [5.6, 3.9],
+            [2.5, -1.7],
+        ];
+        let expected = [
+            (
+                RegularGridMethod::Slinear,
+                [
+                    0.2891873926348113,
+                    1.1964238323863805,
+                    1.4536565214178045,
+                    2.5884733190687714,
+                    -0.3738330764366184,
+                    4.711271269843196,
+                    0.7663833149629362,
+                ],
+            ),
+            (
+                RegularGridMethod::Cubic,
+                [
+                    0.30373159884539636,
+                    1.1964238323863805,
+                    1.4668790455621878,
+                    2.4287940271268296,
+                    -0.43327052653131237,
+                    7.134504884786417,
+                    1.0786834877862228,
+                ],
+            ),
+            (
+                RegularGridMethod::Quintic,
+                [
+                    0.2978950636065965,
+                    1.1964238323863805,
+                    1.4699443609869423,
+                    2.453641402371683,
+                    -0.3692784133430398,
+                    6.374889708011861,
+                    1.0817902254845095,
+                ],
+            ),
+        ];
+        for (method, want) in expected {
+            let interp = RegularGridInterpolator::new(
+                vec![x.to_vec(), y.to_vec()],
+                values.clone(),
+                method,
+                false,
+                None,
+            )
+            .expect("spline grid");
+            let batch: Vec<Vec<f64>> = queries.iter().map(|q| q.to_vec()).collect();
+            let got = interp.eval_many(&batch).expect("eval_many");
+            for ((q, &g), &w) in queries.iter().zip(&got).zip(&want) {
+                assert!(
+                    (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                    "{method:?} at {q:?}: {g} vs SciPy {w}"
+                );
+            }
+        }
+
+        // 3-D: cos(a + 2b)·(1 + c²) on a 5 × 5 × 6 grid, SciPy cubic_legacy.
+        let a: Vec<f64> = (0..5).map(|i| f64::from(i) * 0.25).collect();
+        let b = vec![0.0, 0.3, 0.5, 0.9, 1.0];
+        let c = vec![0.0, 0.25, 0.6, 0.8, 1.0, 1.3];
+        let mut w = Vec::new();
+        for &ai in &a {
+            for &bi in &b {
+                for &ci in &c {
+                    w.push((ai + 2.0 * bi).cos() * (1.0 + ci * ci));
+                }
             }
         }
         let interp =
-            RegularGridInterpolator::new(points, values, RegularGridMethod::Cubic, false, None)
-                .expect("regular grid cubic 2d");
-        // Test at midpoint - should be exactly correct for linear function
-        let v = interp.eval(&[1.5, 1.5]).expect("eval");
-        assert!((v - 3.0).abs() < 0.1, "got {v}, expected 3.0");
+            RegularGridInterpolator::new(vec![a, b, c], w, RegularGridMethod::Cubic, true, None)
+                .expect("3-D cubic");
+        for (q, want) in [
+            ([0.1, 0.2, 0.3], 0.9578164084843325),
+            ([0.77, 0.95, 1.2], -2.174330355099462),
+        ] {
+            let got = interp.eval(&q).expect("3-D eval");
+            assert!((got - want).abs() <= 1e-12, "3-D {q:?}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn regular_grid_slinear_needs_two_points_and_finite_values() {
+        let err = RegularGridInterpolator::new(
+            vec![vec![0.0], vec![0.0, 1.0]],
+            vec![1.0, 2.0],
+            RegularGridMethod::Slinear,
+            false,
+            None,
+        )
+        .expect_err("one point");
+        assert!(matches!(err, InterpError::TooFewPoints { minimum: 2, .. }));
+        let err = RegularGridInterpolator::new(
+            vec![vec![0.0, 1.0]],
+            vec![1.0, f64::NAN],
+            RegularGridMethod::Slinear,
+            false,
+            None,
+        )
+        .expect_err("NaN value");
+        assert!(
+            matches!(err, InterpError::InvalidArgument { detail } if detail == "RHS must contain only finite numbers")
+        );
     }
 
     #[test]
