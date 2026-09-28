@@ -171,6 +171,15 @@ fn generate_query() -> OracleQuery {
         finite_case("pos_0p5", 0.5),
         finite_case("pos_1", 1.0),
         finite_case("pos_2", 2.0),
+        // floor(x) parity at the ulp either side of -1, the smallest subnormal, and at
+        // floor(x) = -2^31, the last parity SciPy's 32-bit int cast still reads correctly.
+        // Below that SciPy reads every x as +1 and fsci keeps the true sign, so no case is
+        // compared there; the unit test pins fsci's sign.
+        finite_case("neg_1_minus_ulp", -0.999_999_999_999_999_9),
+        finite_case("neg_1_plus_ulp", -1.000_000_000_000_000_2),
+        finite_case("neg_min_subnormal", -5e-324),
+        finite_case("neg_2p31_minus_0p5", -2_147_483_647.5),
+        finite_case("neg_1e20", -1.0e20),
         special_case("pos_inf", "pos_inf"),
         special_case("nan", "nan"),
     ];
