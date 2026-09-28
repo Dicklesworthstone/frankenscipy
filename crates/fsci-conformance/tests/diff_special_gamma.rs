@@ -8,9 +8,9 @@
 //! Erlang, Pearson3, etc. — but had no dedicated diff harness.
 //! ~12 x-values × 4 functions = ~48 cases via subprocess.
 //!
-//! Tolerances: 1e-12 abs / rel for gamma/gammaln, 1e-15 relative
-//! for digamma (bit-identical xsf port), 5e-10 scaled for
-//! rgamma. The reflection branch around negative
+//! Tolerances: 1e-12 abs / rel for gamma, exact for gammaln
+//! (Cephes lgam port), 1e-15 relative for digamma (bit-identical
+//! xsf port), 5e-10 scaled for rgamma. The reflection branch around negative
 //! integers is intentionally skipped — gamma has poles at
 //! 0, -1, -2, … and even just-near-pole values are
 //! ill-conditioned and amplify any small kernel difference.
@@ -174,6 +174,31 @@ fn generate_query() -> OracleQuery {
             x,
         });
     }
+    // gammaln over every Cephes lgam band: tiny |x| of both signs, (0, 0.5), the negative
+    // recurrence down to -34 and the reflection past it, and both Stirling forms.
+    let xs_gammaln = [
+        1.0e-300_f64,
+        -1.0e-300,
+        0.3,
+        0.49,
+        -0.3,
+        -1.2,
+        -33.7,
+        -34.5,
+        -40.3,
+        -100.25,
+        12.9,
+        999.5,
+        1500.0,
+        1.0e9,
+    ];
+    for &x in &xs_gammaln {
+        points.push(PointCase {
+            case_id: format!("gammaln_x{x}"),
+            func: "gammaln".into(),
+            x,
+        });
+    }
     OracleQuery { points }
 }
 
@@ -301,7 +326,12 @@ fn diff_special_gamma() {
 
         let scale = scipy_v.abs().max(1.0);
         let pass = match arm {
-            "gamma" | "gammaln" => abs_diff <= GAMMA_TOL_ABS || rel_diff <= GAMMA_TOL_REL * scale,
+            "gamma" => abs_diff <= GAMMA_TOL_ABS || rel_diff <= GAMMA_TOL_REL * scale,
+            // gammaln is SciPy's Cephes lgam bit for bit on the whole real line, so the gate is
+            // EXACT. The 1e-10 absolute / 1e-12 relative gate it shared with gamma could not
+            // see the Lanczos recurrence and reflection that answered below x = 0.5, a few ulp
+            // off, and neither could 1e-15 relative (frankenscipy-bmyh2).
+            "gammaln" => abs_diff == 0.0,
             "digamma" => abs_diff <= DIGAMMA_TOL_REL * scipy_v.abs(),
             "rgamma" => abs_diff <= RGAMMA_TOL_REL * scale,
             _ => false,
