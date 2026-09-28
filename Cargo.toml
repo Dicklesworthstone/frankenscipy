@@ -47,7 +47,7 @@ fsci-ndimage = { version = "0.2.0", path = "crates/fsci-ndimage" }
 fsci-odr = { version = "0.2.0", path = "crates/fsci-odr" }
 fsci-opt = { version = "0.2.0", path = "crates/fsci-opt" }
 fsci-runtime = { version = "0.2.0", path = "crates/fsci-runtime" }
-fsci-sparse = { version = "0.2.0", path = "crates/fsci-sparse" }
+fsci-sparse = { version = "0.2.0", path = "crates/fsci-sparse", default-features = false }
 fsci-signal = { version = "0.2.0", path = "crates/fsci-signal" }
 fsci-spatial = { version = "0.2.0", path = "crates/fsci-spatial" }
 fsci-special = { version = "0.2.0", path = "crates/fsci-special" }

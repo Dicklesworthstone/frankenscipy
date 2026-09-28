@@ -19,6 +19,7 @@
 pub mod audit;
 pub mod construct;
 pub mod formats;
+#[cfg(feature = "npz")]
 pub mod io;
 pub mod linalg;
 pub mod ops;
@@ -40,6 +41,7 @@ pub use formats::{
     SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec,
     get_index_dtype, safely_cast_index_arrays,
 };
+#[cfg(feature = "npz")]
 pub use io::{
     NpzWritable, SparseMatrixOutput, SparseNpz, load_npz, load_npz_from_reader, save_npz,
     save_npz_to_writer,
