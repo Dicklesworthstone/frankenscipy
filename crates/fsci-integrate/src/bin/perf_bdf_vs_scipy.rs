@@ -2638,13 +2638,13 @@ mod bench {
                 (Method::Bdf, Fixture::Coupled) => band_hits == 0 || diag_hits != 0,
                 (Method::Bdf, Fixture::Dense) => diag_hits != 0 || band_hits != 0,
                 (Method::Bdf, Fixture::RadauStiff) => true,
-                // LSODA is a BDF-FAMILY method: it switches to BDF in stiff regions,
-                // so the BDF counters legitimately fire and the per-fixture rule
-                // applies to it exactly as it does to BDF. (Discovered by this proof
-                // aborting on `diag_hits=30` — the assert was wrong, not the run.)
-                (Method::Lsoda, Fixture::Diagonal) => diag_hits == 0 || band_hits != 0,
-                (Method::Lsoda, Fixture::Coupled) => band_hits == 0 || diag_hits != 0,
-                (Method::Lsoda, Fixture::Dense) => diag_hits != 0 || band_hits != 0,
+                // LSODA is ODEPACK's own Adams/BDF (`fsci_integrate::lsoda`, frankenscipy-
+                // 1ksfv.9): its BDF steps factor a dense `I - h el0 J` and never enter
+                // `BdfSolver`, so no BDF or Radau structural counter may fire on any fixture.
+                // (The RK45-then-BDF stand-in it replaced did run `BdfSolver`'s paths.)
+                (Method::Lsoda, Fixture::Diagonal | Fixture::Coupled | Fixture::Dense) => {
+                    diag_hits != 0 || band_hits != 0 || radau_diag_hits != 0
+                }
                 (Method::Lsoda, Fixture::RadauStiff) => true,
                 // Radau's own counter proves the structural stage/error path fired.
                 (Method::Radau, Fixture::Diagonal | Fixture::RadauStiff) => {

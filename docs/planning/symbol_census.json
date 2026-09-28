@@ -205,7 +205,7 @@
   },
   "scipy.integrate": {
    "applicable": 32,
-   "compared": 12,
+   "compared": 14,
    "crate": "fsci-integrate",
    "declared": 31,
    "matched_by": {
@@ -225,7 +225,6 @@
     "DOP853",
     "DenseOutput",
     "IntegrationWarning",
-    "LSODA",
     "OdeSolution",
     "OdeSolver",
     "RK23",
@@ -238,7 +237,6 @@
     "nquad",
     "nsum",
     "ode",
-    "odeint",
     "qmc_quad",
     "tanhsinh"
    ],
@@ -1352,7 +1350,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 849,
+  "compared": 851,
   "declared": 1475,
   "matched_by": {
    "case_fold": 131,
