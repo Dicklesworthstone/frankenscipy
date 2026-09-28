@@ -720,14 +720,20 @@ fn loggamma_dispatch(
         SpecialTensor::RealScalar(x) => loggamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
             // loggamma(real) == gammaln (cheap ~30ns); gate with the family min so the
-            // n/256-class over-subscription that pessimizes small arrays is avoided.
+            // n/256-class over-subscription that pessimizes small arrays is avoided. The
+            // crossover and the Cephes switch are read once per batch, as gammaln's are: a
+            // relaxed load per element is an optimisation barrier in the hot loop.
+            let min_x = gammaln_asymptotic_min_x();
+            let cephes = GAMMALN_CEPHES_LGAM.load(std::sync::atomic::Ordering::Relaxed);
             if gamma_family_is_parallel(values.len()) {
-                par_map_light(values.len(), |i| loggamma_scalar(values[i], mode))
-                    .map(SpecialTensor::RealVec)
+                par_map_light(values.len(), |i| {
+                    loggamma_scalar_with_threshold(values[i], mode, min_x, cephes)
+                })
+                .map(SpecialTensor::RealVec)
             } else {
                 values
                     .iter()
-                    .map(|&x| loggamma_scalar(x, mode))
+                    .map(|&x| loggamma_scalar_with_threshold(x, mode, min_x, cephes))
                     .collect::<Result<Vec<_>, _>>()
                     .map(SpecialTensor::RealVec)
             }
@@ -1478,10 +1484,10 @@ fn gammaln_scalar_with_threshold(
         return Ok(0.0);
     }
 
-    let output = if x >= 0.5 {
-        if cephes_lgam {
-            lgam_cephes_positive(x)
-        } else if x < asymptotic_min_x {
+    let output = if cephes_lgam {
+        lgam_cephes(x)
+    } else if x >= 0.5 {
+        if x < asymptotic_min_x {
             lngamma_lanczos(x)
         } else {
             lngamma_positive(x)
@@ -1522,6 +1528,22 @@ fn gammaln_scalar_with_threshold(
 }
 
 pub fn loggamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    loggamma_scalar_with_threshold(
+        x,
+        mode,
+        gammaln_asymptotic_min_x(),
+        GAMMALN_CEPHES_LGAM.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `loggamma_scalar` with `gammaln`'s crossover and Cephes switch passed in, so a batch reads
+/// them once rather than per element. See `gammaln_scalar_with_threshold`.
+fn loggamma_scalar_with_threshold(
+    x: f64,
+    mode: RuntimeMode,
+    asymptotic_min_x: f64,
+    cephes_lgam: bool,
+) -> Result<f64, SpecialError> {
     if x.is_nan() {
         return Ok(f64::NAN);
     }
@@ -1562,7 +1584,7 @@ pub fn loggamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
             detail: "loggamma pole at zero",
         });
     }
-    gammaln_scalar(x, mode)
+    gammaln_scalar_with_threshold(x, mode, asymptotic_min_x, cephes_lgam)
 }
 
 pub fn gammasgn_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
@@ -1704,35 +1726,89 @@ const LGAM_RAT_C: [f64; 6] = [
     -2.01889141433532773231E6,
 ];
 
-/// `ln|Gamma(x)|` for `x > 0` by SciPy's own method: one logarithm, not two.
+/// `ln|Gamma(x)|` by SciPy's own method, `xsf::cephes::detail::lgam_sgn`: one logarithm,
+/// not two.
 ///
-/// Mirrors `xsf::cephes::detail::lgam_sgn` for positive arguments — the recurrence into
-/// [2,3] with a rational below 13, the Stirling series with `LGAM_CHEB_A` from 13 to 1000,
-/// and the reduced Stirling form above that. Callers handle poles, zero and negative x.
-fn lgam_cephes_positive(x: f64) -> f64 {
-    if x < 13.0 {
-        let mut z = 1.0_f64;
-        let mut p = 0.0_f64;
-        let mut u = x;
-        while u >= 3.0 {
-            p -= 1.0;
-            u = x + p;
-            z *= u;
+/// The reflection below -34; the recurrence into [2,3] with a rational below 13, negative x
+/// included; the Stirling series with `LGAM_CHEB_A` from 13 to 1000; and the reduced
+/// Stirling form above that. A non-positive integer is a pole (+inf), past `MAXLGM` is
+/// +inf, and an infinity or NaN returns itself, so gammaln(-inf) is -inf as in SciPy.
+///
+/// Cephes' reflection calls lgam_sgn(-x) recursively. Here it calls the Stirling bands
+/// directly, which is where -x > 34 always lands: a recursive function is never inlined, and
+/// the recursive form measured ~10% slower on gammaln's batch. The Stirling bands are tested
+/// first because they are most of the line and +inf belongs to them; -inf goes to the
+/// reflection, and NaN fails every comparison and comes out of the recurrence as NaN. So the
+/// hot path carries no separate finiteness test.
+fn lgam_cephes(x: f64) -> f64 {
+    if x >= 13.0 {
+        return lgam_cephes_stirling(x);
+    }
+    if x < -34.0 {
+        return lgam_cephes_reflection(x);
+    }
+    let mut z = 1.0_f64;
+    let mut p = 0.0_f64;
+    let mut u = x;
+    while u >= 3.0 {
+        p -= 1.0;
+        u = x + p;
+        z *= u;
+    }
+    while u < 2.0 {
+        if u == 0.0 {
+            return f64::INFINITY;
         }
-        while u < 2.0 {
-            // `u == 0` is a pole and is excluded before this function is reached.
-            z /= u;
-            p += 1.0;
-            u = x + p;
-        }
-        let z = z.abs();
-        if u == 2.0 {
-            return z.ln();
-        }
-        p -= 2.0;
-        let u = x + p;
-        let rational = u * polevl(u, &LGAM_RAT_B) / p1evl(u, &LGAM_RAT_C);
-        return z.ln() + rational;
+        z /= u;
+        p += 1.0;
+        u = x + p;
+    }
+    if z.is_infinite() {
+        // 1/x overflowed: |x| is below ~5.6e-309, where ln|Gamma(x)| is -ln|x| to the last
+        // bit. SciPy's Cephes carries the overflow through and returns +inf.
+        return -x.abs().ln();
+    }
+    let z = z.abs();
+    if u == 2.0 {
+        return z.ln();
+    }
+    p -= 2.0;
+    let u = x + p;
+    let rational = u * polevl(u, &LGAM_RAT_B) / p1evl(u, &LGAM_RAT_C);
+    z.ln() + rational
+}
+
+/// Cephes' reflection for x < -34: ln(pi) - ln|q sin(pi z)| - lgam(q), q = -x. -inf returns
+/// itself, as Cephes' finiteness test makes it.
+#[cold]
+#[inline(never)]
+fn lgam_cephes_reflection(x: f64) -> f64 {
+    if x == f64::NEG_INFINITY {
+        return x;
+    }
+    let q = -x;
+    let w = lgam_cephes_stirling(q);
+    let mut p = q.floor();
+    if p == q {
+        return f64::INFINITY;
+    }
+    let mut z = q - p;
+    if z > 0.5 {
+        p += 1.0;
+        z = p - q;
+    }
+    let z = q * cephes_sinpi(z);
+    if z == 0.0 {
+        return f64::INFINITY;
+    }
+    LOGPI_CEPHES - z.ln() - w
+}
+
+/// Cephes' lgam for finite x >= 13: +inf past `MAXLGM`, then Stirling with `LGAM_CHEB_A` below
+/// 1000, the reduced series to 1e8, and the bare leading terms beyond.
+fn lgam_cephes_stirling(x: f64) -> f64 {
+    if x > LGAM_MAXLGM {
+        return f64::INFINITY;
     }
 
     let q = (x - 0.5) * x.ln() - x + HALF_LN_TWO_PI_CEPHES;
@@ -1751,6 +1827,26 @@ fn lgam_cephes_positive(x: f64) -> f64 {
 
 /// `log(sqrt(2*pi))`, Cephes' `LS2PI`.
 const HALF_LN_TWO_PI_CEPHES: f64 = 0.918_938_533_204_672_741_78;
+
+/// `log(pi)`, Cephes' `LOGPI`.
+#[allow(clippy::excessive_precision)]
+const LOGPI_CEPHES: f64 = 1.144_729_885_849_400_174_14;
+
+/// Cephes' `MAXLGM`: above it `ln Gamma` overflows.
+const LGAM_MAXLGM: f64 = 2.556_348e305;
+
+/// Cephes' `sinpi`, reduced with `fmod(x, 2)` as SciPy's is.
+fn cephes_sinpi(x: f64) -> f64 {
+    let (x, s) = if x < 0.0 { (-x, -1.0) } else { (x, 1.0) };
+    let r = x % 2.0;
+    if r < 0.5 {
+        s * (PI * r).sin()
+    } else if r > 1.5 {
+        s * (PI * (r - 2.0)).sin()
+    } else {
+        -s * (PI * (r - 1.0)).sin()
+    }
+}
 
 fn lngamma_lanczos(x: f64) -> f64 {
     let mut coeff_sum = LANCZOS_COEFFS[0];
@@ -3212,11 +3308,12 @@ fn lngamma_positive(x: f64) -> f64 {
 /// much of a caller's input lies in [20, 100). For inputs below 20 it is worth nothing.
 pub const GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT: f64 = 20.0;
 
-/// Use SciPy's own `lgam` for `ln|Gamma(x)|`, `x > 0` (`true`, shipping), instead of the
-/// Lanczos band and our Stirling.
+/// Use SciPy's own `lgam` for `ln|Gamma(x)|` over the whole real line (`true`, shipping),
+/// instead of the Lanczos band, our Stirling and the Lanczos reflection.
 ///
-/// NOT bit-identical to either and not intended to be: it is the incumbent's algorithm.
-/// Accuracy against the live SciPy arm is the contract.
+/// NOT bit-identical to the `false` arm and not intended to be: it is the incumbent's
+/// algorithm, and bit-identical to SciPy (frankenscipy-bmyh2) except below |x| ~ 5.6e-309,
+/// where SciPy overflows to +inf and this keeps -ln|x|.
 pub static GAMMALN_CEPHES_LGAM: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// BATCHES that took the Cephes arm — "enabled" is not "took effect".
@@ -6672,6 +6769,67 @@ mod tests {
             }
             other => Err(format!("expected real vector, got {other:?}")),
         }
+    }
+
+    #[test]
+    fn gammaln_and_loggamma_are_scipy_cephes_lgam_bit_for_bit() -> Result<(), String> {
+        // SciPy 1.17.1 gammaln: every lgam band, (0, 0.5) and the negative axis included,
+        // which a Lanczos recurrence and reflection used to answer.
+        let cases = [
+            (1e-300, 690.775_527_898_213_7),
+            (-1e-300, 690.775_527_898_213_7),
+            (0.3, 1.095_797_994_818_075_6),
+            (0.49, 0.592_249_629_335_267),
+            (-0.3, 1.464_840_050_857_602_7),
+            (-1.2, 1.579_176_034_039_983_6),
+            (-33.7, -86.163_172_056_157_82),
+            (-34.5, -89.210_200_379_969),
+            (-40.3, -110.075_481_007_337_76),
+            (-100.25, -363.400_923_227_821_5),
+            (12.9, 19.735_015_850_713_005),
+            (999.5, 5_901.766_920_694_738),
+            (1500.0, 9_467.092_964_530_666),
+            (1.0e9, 19_723_265_827.503_716),
+            (3.0e305, f64::INFINITY),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ];
+        let xs: Vec<f64> = cases.iter().map(|c| c.0).collect();
+        let batch = match gammaln(&SpecialTensor::RealVec(xs), RuntimeMode::Strict) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            other => return Err(format!("expected real vector, got {other:?}")),
+        };
+        for (i, &(x, want)) in cases.iter().enumerate() {
+            let one = get_scalar(gammaln(&scalar(x), RuntimeMode::Strict))?;
+            assert_eq!(one.to_bits(), f64::to_bits(want), "gammaln({x:e})");
+            assert_eq!(batch[i].to_bits(), one.to_bits(), "gammaln batch ({x:e})");
+            if x >= 0.0 {
+                let lg = get_scalar(loggamma(&scalar(x), RuntimeMode::Strict))?;
+                assert_eq!(lg.to_bits(), one.to_bits(), "loggamma({x:e})");
+            }
+        }
+        // Below |x| ~ 5.6e-309 SciPy's 1/x overflows and it returns +inf; ln Gamma(x) is
+        // -ln|x| to the last bit there, and that is kept.
+        for x in [1e-310, -1e-310, 5e-324] {
+            let got = get_scalar(gammaln(&scalar(x), RuntimeMode::Strict))?;
+            assert_eq!(
+                got.to_bits(),
+                (-f64::abs(x).ln()).to_bits(),
+                "gammaln({x:e})"
+            );
+        }
+        let lg = match loggamma(
+            &SpecialTensor::RealVec(vec![0.3, 12.9, -0.5, 0.0]),
+            RuntimeMode::Strict,
+        ) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            other => return Err(format!("expected real vector, got {other:?}")),
+        };
+        assert_eq!(lg[0].to_bits(), f64::to_bits(1.095_797_994_818_075_6));
+        assert_eq!(lg[1].to_bits(), f64::to_bits(19.735_015_850_713_005));
+        assert!(lg[2].is_nan());
+        assert_eq!(lg[3], f64::INFINITY);
+        Ok(())
     }
 
     #[test]

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! Live scipy.special.loggamma parity for the explicit fsci_special::loggamma API.
 //!
-//! Resolves [frankenscipy-qq65q]. Tolerance: 1e-10 abs for finite values;
-//! non-finite branch-cut and pole outputs compare by classification.
+//! Resolves [frankenscipy-qq65q]. Tolerance: exact for finite real values, 1e-10 abs for
+//! complex ones; non-finite branch-cut and pole outputs compare by classification.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -159,6 +159,19 @@ fn generate_query() -> OracleQuery {
         (-0.5, Some(-1.0e-12)),
         (1.0, Some(-2.0)),
         (3.0, Some(4.0)),
+        // Real x across every Cephes lgam band: tiny, (0, 0.5) where a Lanczos recurrence
+        // used to answer, the [2,3] rational, both Stirling forms, and past MAXLGM.
+        (1.0e-300, None),
+        (0.001, None),
+        (0.3, None),
+        (0.49, None),
+        (3.7, None),
+        (12.9, None),
+        (13.5, None),
+        (999.5, None),
+        (1500.0, None),
+        (1.0e9, None),
+        (3.0e305, None),
     ];
     let points = probes
         .iter()
@@ -284,10 +297,18 @@ fn compare(case: &PointCase, actual: &PointArm, expected: &PointArm) -> CaseDiff
         abs_diff = abs_diff.max((actual_im - turns * two_pi - expected_im).abs());
     }
 
+    // Real loggamma is SciPy's Cephes lgam bit for bit, so its finite values must be EQUAL;
+    // complex values keep the absolute gate. The 1e-10 absolute gate could not see the Lanczos
+    // recurrence below x = 0.5 that SciPy does not use, and neither can 1e-15 relative: it was
+    // 3 ulp, 6e-16 relative, off at x = 0.3 (frankenscipy-bmyh2).
+    let pass = match (case.im, expected.re) {
+        (None, Some(_)) => abs_diff == 0.0,
+        _ => abs_diff <= ABS_TOL,
+    };
     CaseDiff {
         case_id: case.case_id.clone(),
         abs_diff,
-        pass: abs_diff <= ABS_TOL,
+        pass,
     }
 }
 
