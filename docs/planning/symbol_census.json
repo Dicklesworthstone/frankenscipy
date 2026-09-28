@@ -785,7 +785,7 @@
   },
   "scipy.sparse": {
    "applicable": 51,
-   "compared": 23,
+   "compared": 24,
    "crate": "fsci-sparse",
    "declared": 51,
    "matched_by": {
@@ -805,7 +805,6 @@
     "block_array",
     "bsr_array",
     "csc_array",
-    "csc_matrix",
     "csr_array",
     "dia_array",
     "diags_array",
@@ -1353,7 +1352,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 848,
+  "compared": 849,
   "declared": 1475,
   "matched_by": {
    "case_fold": 131,

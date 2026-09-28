@@ -1008,6 +1008,11 @@
   "diff_sparse_shortest_path_properties.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_sparse_spilu_ilutp.rs": {
+    "KRYLOV_RATIO_TOL": 1.5,
+    "NNZ_REL_TOL": 0.25,
+    "SKEW_GMRES_TOL": 1e-10
+  },
   "diff_sparse_spilu_solve.rs": {},
   "diff_sparse_splu_solve.rs": {
     "ABS_TOL": 1e-8

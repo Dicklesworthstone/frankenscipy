@@ -97,7 +97,9 @@ pub use linalg::{
     EigsResult,
     EigsWhich,
     ExpmOptions,
+    IluDropRule,
     IluOptions,
+    IluStatistics,
     IterativeSolveOptions,
     IterativeSolveResult,
     LgmresOptions,
@@ -161,6 +163,7 @@ pub use linalg::{
     betweenness_centrality,
     bicg,
     bicgstab,
+    bicgstab_preconditioned,
     breadth_first_order,
     breadth_first_tree,
     casp_iterative_solve,
@@ -193,6 +196,7 @@ pub use linalg::{
     floyd_warshall,
     gmres,
     gmres_batch,
+    gmres_preconditioned,
     graph_diameter,
     is_connected,
     is_sptriangular,
@@ -2426,11 +2430,11 @@ mod tests {
         serde_json::from_str(&encoded).expect("log json parse")
     }
 
-    // ── ILU(0) preconditioner tests ─────────────────────────────────
+    // ── spilu (ILUTP) preconditioner tests ──────────────────────────
 
     #[test]
     fn spilu_diagonal_matrix() {
-        // ILU(0) of a diagonal matrix should give L=I, U=diag
+        // The incomplete LU of a diagonal matrix is L=I, U=diag
         let coo = CooMatrix::from_triplets(
             Shape2D::new(3, 3),
             vec![2.0, 5.0, 3.0],
@@ -2477,7 +2481,7 @@ mod tests {
         let csc = coo.to_csc().expect("coo->csc");
         let ilu = spilu(&csc, IluOptions::default()).expect("spilu tridiagonal");
 
-        // For a tridiagonal matrix, ILU(0) = exact LU (no fill-in discarded)
+        // A tridiagonal matrix has no fill to drop, so the incomplete LU is exact
         let b = vec![1.0; n];
         let x = ilu.solve(&b).expect("ilu solve");
 
@@ -2497,7 +2501,7 @@ mod tests {
     #[test]
     fn spilu_as_preconditioner_for_cg() {
         // Use ILU as preconditioner: solve M^-1 * A * x = M^-1 * b
-        // where M = LU from ILU(0)
+        // where M = LU from spilu
         let n = 4;
         // SPD matrix: diag(10, 10, 10, 10) + off-diag(-1)
         let mut rows = Vec::new();
@@ -2586,7 +2590,7 @@ mod tests {
         let csr = coo.to_csr().expect("csr");
         let csc = coo.to_csc().expect("csc");
 
-        // Build ILU(0) preconditioner
+        // Build the spilu preconditioner
         let ilu = spilu(&csc, IluOptions::default()).expect("ilu");
 
         let b: Vec<f64> = (0..n).map(|i| (i + 1) as f64).collect();

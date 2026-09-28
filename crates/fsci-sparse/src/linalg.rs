@@ -50,6 +50,9 @@ pub enum SparseBackend {
     /// Reported, not requested: the CASP portfolio's iterative method produced the answer.
     /// Never `SparseSolverAction::SuperLU`; a direct solve reports the arm that ran.
     Iterative(SparseSolverAction),
+    /// Reported, not requested: `spilu`'s native threshold ILU with partial pivoting, which
+    /// follows SuperLU's `dgsitrf` drop and pivot rules column by column.
+    NativeIlutp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,12 +107,148 @@ impl Default for LuOptions {
     }
 }
 
+/// SuperLU's `ILU_DropRule` bit set, which SciPy's `spilu(drop_rule=...)` passes straight
+/// through (frankenscipy-1ksfv.11).
+///
+/// The bits keep SuperLU's values, including its one surprise: `SECONDARY` is not a bit of its
+/// own but `PROWS | COLUMN | AREA` (0x000E). `dgsitrf` tests `rule & DROP_SECONDARY`, so ANY of
+/// those three switches secondary (quota) dropping on — the default `BASIC | AREA` included —
+/// and naming `secondary` sets all three, which selects the PROWS quota because `dgsitrf` tests
+/// PROWS first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IluDropRule(u32);
+
+impl IluDropRule {
+    /// SuperLU `NODROP` (SciPy `drop_rule=0`): nothing is dropped.
+    pub const NONE: Self = Self(0x0000);
+    /// `DROP_BASIC`: drop L rows whose largest multiplier is below `drop_tol`.
+    pub const BASIC: Self = Self(0x0001);
+    /// `DROP_PROWS`: quota `fill_factor·nnz(A)/n` per row (ILUTP(p, tau)).
+    pub const PROWS: Self = Self(0x0002);
+    /// `DROP_COLUMN`: quota `fill_factor·nnz(A(:,j))` per column.
+    pub const COLUMN: Self = Self(0x0004);
+    /// `DROP_AREA`: quota from `fill_factor·nnz(A(:,1:j))`, the running area.
+    pub const AREA: Self = Self(0x0008);
+    /// `DROP_SECONDARY` = `PROWS | COLUMN | AREA`.
+    pub const SECONDARY: Self = Self(0x000E);
+    /// `DROP_DYNAMIC`: double or halve the tolerance as fill runs over or under the area quota.
+    pub const DYNAMIC: Self = Self(0x0010);
+    /// `DROP_INTERP`: secondary threshold by interpolation instead of selection.
+    pub const INTERP: Self = Self(0x0100);
+    const KNOWN_BITS: u32 = 0x011F;
+
+    /// The SuperLU bit pattern.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// From SuperLU bits, as SciPy accepts an integer `drop_rule`.
+    ///
+    /// # Errors
+    /// `InvalidArgument` for a bit SuperLU does not define.
+    pub fn from_bits(bits: u32) -> SparseResult<Self> {
+        if bits & !Self::KNOWN_BITS != 0 {
+            return Err(SparseError::InvalidArgument {
+                message: format!("invalid ILU drop rule bits {bits:#x}"),
+            });
+        }
+        Ok(Self(bits))
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Does this rule share any bit with `other`? (`rule & DROP_X` in SuperLU.)
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Parse SciPy's string form: comma-separated names from `basic`, `prows`, `column`, `area`,
+    /// `secondary`, `dynamic`, `interp`, compared as SciPy's `my_strxcmp` does (case, underscores
+    /// and whitespace ignored). Like SciPy, an empty name is an error.
+    ///
+    /// # Errors
+    /// `InvalidArgument` for an unknown or empty name.
+    pub fn from_scipy_spec(spec: &str) -> SparseResult<Self> {
+        let mut rule = Self::NONE;
+        for item in spec.split(',') {
+            let name: String = item
+                .chars()
+                .filter(|c| *c != '_' && !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect();
+            let one = match name.as_str() {
+                "basic" => Self::BASIC,
+                "prows" => Self::PROWS,
+                "column" => Self::COLUMN,
+                "area" => Self::AREA,
+                "secondary" => Self::SECONDARY,
+                "dynamic" => Self::DYNAMIC,
+                "interp" => Self::INTERP,
+                _ => {
+                    return Err(SparseError::InvalidArgument {
+                        message: format!("invalid value for 'ILU_DropRule' parameter: {item:?}"),
+                    });
+                }
+            };
+            rule = rule.union(one);
+        }
+        Ok(rule)
+    }
+}
+
+impl Default for IluDropRule {
+    /// SuperLU `ilu_set_default_options`: `DROP_BASIC | DROP_AREA`.
+    fn default() -> Self {
+        Self::BASIC.union(Self::AREA)
+    }
+}
+
+impl std::ops::BitOr for IluDropRule {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        self.union(other)
+    }
+}
+
+/// Options of [`spilu`], each meaning what the same-named `scipy.sparse.linalg.spilu` argument
+/// means. Defaults are SuperLU's `ilu_set_default_options` and `sp_ienv`, which SciPy uses when
+/// an argument is `None`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IluOptions {
+    /// Strict: a zero pivot fails the factorization, as SciPy's "Factor is exactly singular"
+    /// does. Hardened: non-finite input is refused, and a zero pivot is replaced the way
+    /// SuperLU itself replaces it (by `‖A(:,j)‖∞ · 0.01^(1 − j/n)`) and counted in
+    /// [`IluStatistics::zero_pivots`].
     pub mode: RuntimeMode,
+    /// SciPy `permc_spec`, reported back as `ordering_used`. `Colamd` is SuperLU's vendored
+    /// COLAMD 2.9.1; `MmdAta` / `MmdAtPlusA` run this crate's exact minimum degree on AᵀA /
+    /// A+Aᵀ (the same objective as SuperLU's `genmmd`, not its multiple-elimination variant);
+    /// `Amd` and `ReverseCuthillMcKee` are fsci extensions on A+Aᵀ.
     pub ordering: PermutationOrdering,
+    /// SciPy `drop_tol` (SuperLU `ILU_DropTol`, default 1e-4). U entries below
+    /// `drop_tol·‖A(:,j)‖∞` and L rows whose multipliers are all below `drop_tol` are dropped.
     pub drop_tol: f64,
+    /// SciPy `fill_factor` (SuperLU `ILU_FillFactor`, default 10): the quota scale of the
+    /// secondary dropping selected by `drop_rule`.
     pub fill_factor: f64,
+    /// SciPy `drop_rule` (SuperLU `ILU_DropRule`, default `BASIC | AREA`).
+    pub drop_rule: IluDropRule,
+    /// SciPy `diag_pivot_thresh` (SuperLU `DiagPivotThresh`, 0.1 for ILU): the diagonal entry is
+    /// the pivot when its magnitude is at least this fraction of the column's largest candidate.
+    pub diag_pivot_thresh: f64,
+    /// SciPy `relax` (SuperLU `sp_ienv(2)` = 10): elimination-tree leaf subtrees with fewer
+    /// descendants than this are factored as one relaxed supernode, whose U part is never
+    /// dropped.
+    pub relax: usize,
+    /// SciPy `panel_size` (SuperLU `sp_ienv(1)` = 20): columns factored as one panel, which see
+    /// the supernode that ended before the panel undropped.
+    pub panel_size: usize,
 }
 
 impl Default for IluOptions {
@@ -119,6 +258,10 @@ impl Default for IluOptions {
             ordering: PermutationOrdering::Colamd,
             drop_tol: 1e-4,
             fill_factor: 10.0,
+            drop_rule: IluDropRule::default(),
+            diag_pivot_thresh: 0.1,
+            relax: 10,
+            panel_size: 20,
         }
     }
 }
@@ -613,76 +756,115 @@ fn pivot_is_zero(pivot: f64) -> bool {
     pivot == 0.0
 }
 
-/// ILU(0) factorization result.
-///
-/// Stores L (unit lower triangular) and U (upper triangular) in CSR format,
-/// maintaining the same sparsity pattern as the original matrix.
-#[derive(Debug, Clone, PartialEq)]
+/// What one [`spilu`] factorization did (the bead's diagnosability list: pivots taken, entries
+/// dropped, supernodes formed). `nnz(L)`, `nnz(U)` and the ordering are on the factorization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IluStatistics {
+    /// Columns whose pivot was not the diagonal entry of A (threshold partial pivoting).
+    pub off_diagonal_pivots: usize,
+    /// Zero pivots replaced by SuperLU's fill tolerance. Nonzero only in Hardened mode; in Strict
+    /// mode a zero pivot fails the factorization, as it does in SciPy.
+    pub zero_pivots: usize,
+    /// Off-supernode U entries dropped by the drop tolerance or the fill quota.
+    pub dropped_u_entries: usize,
+    /// Stored L entries removed with their rows when a supernode ended.
+    pub dropped_l_entries: usize,
+    /// Supernodes formed, relaxed ones included.
+    pub supernodes: usize,
+    /// Relaxed supernodes: elimination-tree leaf subtrees factored as one dense block.
+    pub relaxed_supernodes: usize,
+}
+
+/// An incomplete factorization `Pr·A·Pc ≈ L·U` from [`spilu`], shaped like SciPy's `SuperLU`
+/// object: `L` unit lower triangular with its unit diagonal stored, `U` upper triangular, both in
+/// the permuted (step) numbering, with `perm_r[i]` the step at which row `i` of A was pivoted and
+/// `perm_c[j]` the position of column `j` of A in `A·Pc`.
+#[derive(Debug, Clone)]
 pub struct SparseIluFactorization {
     pub shape: (usize, usize),
     pub backend_used: SparseBackend,
     pub ordering_used: PermutationOrdering,
-    /// L factor data (unit lower triangular, stored in CSR row-by-row).
-    /// L diagonal entries are implicitly 1.0.
-    l_data: Vec<f64>,
-    l_indices: Vec<usize>,
-    l_indptr: Vec<usize>,
-    /// U factor data (upper triangular, stored in CSR row-by-row).
-    u_data: Vec<f64>,
-    u_indices: Vec<usize>,
-    u_indptr: Vec<usize>,
-    n: usize,
+    pub statistics: IluStatistics,
+    l: CscMatrix,
+    u: CscMatrix,
+    perm_r: Vec<usize>,
+    perm_c: Vec<usize>,
+    /// The row of A pivoted at each step, so the forward sweep reads `(Pr·b)[step]` as
+    /// `b[step_rows[step]]` without materialising `Pr·b`.
+    step_rows: Vec<usize>,
+    /// Strict lower rows of L and rows of U (diagonal first) for the shared triangular kernels.
+    lower: PackedTriangularRows,
+    upper: PackedTriangularRows,
+    lower_levels: TriangularLevelSchedule,
+    upper_levels: TriangularLevelSchedule,
 }
 
 impl SparseIluFactorization {
-    /// Solve L*U*x = b using forward/backward substitution.
-    pub fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        if b.len() != self.n {
-            return Err(SparseError::IncompatibleShape {
-                message: format!("rhs length {} != matrix size {}", b.len(), self.n),
-            });
-        }
-
-        // Forward substitution: L*y = b (L is unit lower triangular)
-        let mut y = b.to_vec();
-        for i in 0..self.n {
-            for idx in self.l_indptr[i]..self.l_indptr[i + 1] {
-                let j = self.l_indices[idx];
-                if j < i {
-                    y[i] -= self.l_data[idx] * y[j];
-                }
-            }
-        }
-
-        // Backward substitution: U*x = y
-        let mut x = y;
-        for i in (0..self.n).rev() {
-            for idx in self.u_indptr[i]..self.u_indptr[i + 1] {
-                let j = self.u_indices[idx];
-                if j > i {
-                    x[i] -= self.u_data[idx] * x[j];
-                }
-            }
-            // Divide by diagonal of U
-            let diag = self.get_u_diagonal(i);
-            if pivot_is_zero(diag) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero diagonal in U at row {i}"),
-                });
-            }
-            x[i] /= diag;
-        }
-
-        Ok(x)
+    /// L (SciPy `SuperLU.L`): unit lower triangular, unit diagonal stored, zeros not stored.
+    #[must_use]
+    pub const fn l(&self) -> &CscMatrix {
+        &self.l
     }
 
-    fn get_u_diagonal(&self, i: usize) -> f64 {
-        for idx in self.u_indptr[i]..self.u_indptr[i + 1] {
-            if self.u_indices[idx] == i {
-                return self.u_data[idx];
-            }
+    /// U (SciPy `SuperLU.U`): upper triangular with its diagonal, zeros not stored.
+    #[must_use]
+    pub const fn u(&self) -> &CscMatrix {
+        &self.u
+    }
+
+    /// SciPy `SuperLU.perm_r`: row `i` of A is row `perm_r[i]` of `Pr·A`.
+    #[must_use]
+    pub fn perm_r(&self) -> &[usize] {
+        &self.perm_r
+    }
+
+    /// SciPy `SuperLU.perm_c`: column `j` of A is column `perm_c[j]` of `A·Pc`.
+    #[must_use]
+    pub fn perm_c(&self) -> &[usize] {
+        &self.perm_c
+    }
+
+    /// `nnz(L) + nnz(U)`, SciPy's `ilu.L.nnz + ilu.U.nnz` (unit diagonal of L included). Not
+    /// SciPy's `SuperLU.nnz`, which counts supernodal storage including padding.
+    #[must_use]
+    pub fn lu_nnz(&self) -> usize {
+        self.l.nnz() + self.u.nnz()
+    }
+
+    /// Solve `L·U·z = Pr·b` and return `x = Pc·z`, SciPy's `SuperLU.solve(b)` (`trans='N'`).
+    ///
+    /// # Errors
+    /// `IncompatibleShape` when `b` does not have `n` entries.
+    pub fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let n = self.shape.0;
+        if b.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("rhs length {} != matrix size {n}", b.len()),
+            });
         }
-        0.0
+        let lower_schedule =
+            level_schedule_is_useful(&self.lower_levels).then_some(&self.lower_levels);
+        let upper_schedule =
+            level_schedule_is_useful(&self.upper_levels).then_some(&self.upper_levels);
+        let mut y = vec![0.0; n];
+        triangular_forward_substitute(
+            &self.lower.offsets,
+            &self.lower.columns,
+            &self.lower.values,
+            |row| b[self.step_rows[row]],
+            &mut y,
+            self.lower.contiguous,
+            lower_schedule,
+        );
+        triangular_backward_substitute(
+            &self.upper.offsets,
+            &self.upper.columns,
+            &self.upper.values,
+            &mut y,
+            self.upper.contiguous,
+            upper_schedule,
+        )?;
+        Ok(self.perm_c.iter().map(|&step| y[step]).collect())
     }
 }
 
@@ -6011,12 +6193,61 @@ pub fn splu_solve_many(
     }
 }
 
-/// ILU(0) incomplete LU factorization.
+/// SuperLU's `sp_ienv(7)`: the widest fundamental supernode `dgsitrf` forms, and half the tail
+/// (`2 · 10` columns) that `last_drop` exempts from L dropping.
+const ILU_MAX_SUPERNODE: usize = 10;
+/// SuperLU `ILU_FillTol` (`ilu_set_default_options`): a zero pivot at step `j` is replaced by
+/// `‖A(:,j)‖∞ · ILU_FILL_TOL^(1 − j/n)` (Hardened mode only; SciPy raises instead).
+const ILU_FILL_TOL: f64 = 1e-2;
+/// "No index": an unpivoted row, a column outside every relaxed supernode.
+const ILU_NONE: usize = usize::MAX;
+
+/// Threshold incomplete LU with partial pivoting: `scipy.sparse.linalg.spilu`
+/// (frankenscipy-1ksfv.11).
 ///
-/// Computes L and U factors maintaining the sparsity pattern of A.
-/// Matches `scipy.sparse.linalg.spilu(A, drop_tol=0)` behavior.
+/// SciPy's `spilu` is SuperLU's `dgsitrf` (ILUTP; X. S. Li and M. Shao, "A supernodal approach
+/// to incomplete LU factorization with partial pivoting", ACM TOMS 37(4), 2011) run with
+/// `ilu_set_default_options`. This is a column-by-column (left-looking, Gilbert–Peierls)
+/// factorization that follows `dgsitrf`'s rules for WHAT is dropped and WHEN, including the
+/// supernode bookkeeping those rules are phrased in:
 ///
-/// Input is CSC but internally converts to CSR for row-based ILU(0).
+/// * the column ordering `A·Pc` of `options.ordering` is followed (except for NATURAL) by the
+///   postorder of the column elimination tree, as SuperLU's `sp_preorder` does; NATURAL runs
+///   SuperLU's symmetric mode (etree of A+Aᵀ, no postorder), which SciPy's `spilu` requests;
+/// * relaxed supernodes: elimination-tree leaf subtrees with fewer than `relax` descendants are
+///   factored as one dense block whose U part is never dropped;
+/// * fundamental supernodes: column j joins column j−1's supernode when its L pattern is
+///   j−1's minus j−1's pivot row, up to 10 columns; U entries in the current supernode's rows
+///   are kept;
+/// * U column j: an off-supernode entry is dropped when `|u| < drop_tol·‖A(:,j)‖∞` or when the
+///   fill quota of `drop_rule` is used up, and beyond the quota only the largest survive
+///   (secondary dropping, selected on SIGNED values exactly as SuperLU's `dqselect` does);
+/// * threshold partial pivoting: the diagonal of A is the pivot when it is at least
+///   `diag_pivot_thresh` times the largest candidate, otherwise the largest candidate is;
+/// * L: when a supernode ends — after the next column is factored, or for the supernode that
+///   ended before a panel, after the whole panel — rows whose largest multiplier is below
+///   `drop_tol` are dropped, then rows beyond the quota; the last `max(20, 5%)` columns are
+///   exempt.
+///
+/// Not reproduced, and why: the supernodal ARITHMETIC (the same updates are applied column by
+/// column, so rounding differs); SuperLU's order of candidate rows (a tie between equal pivot
+/// candidates goes to the smallest row here); the misaligned norms in `ilu_ddrop_row`'s secondary
+/// loop (`m1--` before `temp[i] = temp[m1]`), which judge a row by its neighbour's norm — rows
+/// here are judged by their own; MILU and `ILU_Norm` other than the infinity norm, which SciPy
+/// reaches only through its raw `options` dictionary; SuperLU's `genmmd` for the two MMD orderings
+/// (fsci's exact minimum degree runs instead, see [`IluOptions::ordering`]). COLAMD itself IS
+/// SuperLU's (a port of its vendored COLAMD 2.9.1), so under the default ordering both sides
+/// factor the same `A·Pc`. Parity is therefore on the drop, fill and pivot RULES and on the
+/// preconditioner they
+/// produce: `diff_sparse_spilu_ilutp` checks nnz(L+U) within ±25% and preconditioned Krylov
+/// iteration counts within 1.5× of live SciPy's on the same matrices. Nothing tighter is claimed.
+///
+/// # Errors
+/// `InvalidShape` for a non-square matrix. `InvalidArgument` for a non-finite `drop_tol` or
+/// `diag_pivot_thresh`, a `fill_factor` that is not finite and positive (SciPy hangs at 0 and
+/// fails below), `panel_size == 0` (SciPy hangs), or `n >= 2^32`. `NonFiniteInput` for
+/// non-finite entries in Hardened mode. `SingularMatrix` in Strict mode at a zero pivot, where
+/// SciPy raises "Factor is exactly singular".
 pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactorization> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -6024,141 +6255,1618 @@ pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactor
             message: "spilu requires a square matrix".to_string(),
         });
     }
-    if options.drop_tol < 0.0 || options.fill_factor < 1.0 {
+    if !options.drop_tol.is_finite() {
         return Err(SparseError::InvalidArgument {
-            message: "drop_tol must be >= 0 and fill_factor must be >= 1".to_string(),
+            message: format!("spilu drop_tol must be finite, got {}", options.drop_tol),
         });
     }
-
+    if !(options.fill_factor.is_finite() && options.fill_factor > 0.0) {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "spilu fill_factor must be finite and positive, got {}",
+                options.fill_factor
+            ),
+        });
+    }
+    if !options.diag_pivot_thresh.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "spilu diag_pivot_thresh must be finite, got {}",
+                options.diag_pivot_thresh
+            ),
+        });
+    }
+    if options.panel_size == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "spilu panel_size must be at least 1".to_string(),
+        });
+    }
     let n = shape.rows;
-    if n == 0 {
-        return Ok(SparseIluFactorization {
-            shape: (0, 0),
-            backend_used: SparseBackend::Auto,
-            ordering_used: options.ordering,
-            l_data: Vec::new(),
-            l_indices: Vec::new(),
-            l_indptr: vec![0],
-            u_data: Vec::new(),
-            u_indices: Vec::new(),
-            u_indptr: vec![0],
-            n: 0,
+    if u32::try_from(n).is_err() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("spilu supports n < 2^32, got {n}"),
+        });
+    }
+    if options.mode == RuntimeMode::Hardened && a.data().iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "spilu matrix contains NaN or Inf".to_string(),
         });
     }
 
-    // Convert to CSR for row-based factorization
-    let csr = a.to_csr()?;
-    let indptr = csr.indptr();
-    let indices = csr.indices();
-    let data = csr.data();
+    let (colptr, rowind, values) = canonical_csc_columns(a);
+    let (row_ptr, row_cols) = transpose_pattern(n, &colptr, &rowind);
+    let (iperm_c, ordering_used, symmetric_mode) =
+        ilu_column_ordering(n, &colptr, &rowind, &row_ptr, &row_cols, options.ordering);
+    let relaxed = if symmetric_mode {
+        let parent = elimination_tree_of_permuted(&pattern_csr(n, &row_ptr, &row_cols), &iperm_c);
+        ilu_heap_relax_supernodes(&parent, options.relax)
+    } else {
+        ilu_relax_supernodes(&column_etree(n, &colptr, &rowind, &iperm_c), options.relax)
+    };
 
-    // Work on a dense-ish representation for the factorization:
-    // For each row, track L entries (j < i) and U entries (j >= i)
-    // using the original sparsity pattern.
-    let mut lu_data = data.to_vec(); // mutable copy of values
-    let lu_indices = indices;
-    let lu_indptr = indptr;
+    let mut factor = Ilutp::new(n, &colptr, &rowind, &values, &iperm_c, &relaxed, &options);
+    factor.run(&relaxed.end, options.panel_size)?;
+    factor.into_factorization(ordering_used)
+}
 
-    // IKJ variant of ILU(0): for each row i, for each nonzero a[i,k] with k < i,
-    // compute multiplier a[i,k] /= a[k,k], then for each nonzero a[k,j] with j > k,
-    // if (i,j) is in the sparsity pattern, subtract multiplier * a[k,j].
-    let mut row_lookup = vec![usize::MAX; n];
-    let mut row_lookup_touched = Vec::new();
+/// Relaxed supernodes: `end[first] = last` for each, `ILU_NONE` elsewhere, and their first
+/// columns in the order SuperLU found them (`relax_fsupc`), which `mark_relax` follows.
+struct RelaxedSupernodes {
+    end: Vec<usize>,
+    found: Vec<usize>,
+}
+
+/// The columns of `a` sorted by row with duplicates summed, as SciPy's `A.sum_duplicates()`
+/// leaves them. Explicit zeros stay: SuperLU treats every stored entry as structural.
+fn canonical_csc_columns(a: &CscMatrix) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let meta = a.canonical_meta();
+    if meta.sorted_indices && meta.deduplicated {
+        return (a.indptr().to_vec(), a.indices().to_vec(), a.data().to_vec());
+    }
+    let n = a.shape().cols;
+    let mut colptr = Vec::with_capacity(n + 1);
+    let mut rowind = Vec::with_capacity(a.nnz());
+    let mut values = Vec::with_capacity(a.nnz());
+    let mut entries: Vec<(usize, f64)> = Vec::new();
+    colptr.push(0);
+    for col in 0..n {
+        let range = a.indptr()[col]..a.indptr()[col + 1];
+        entries.clear();
+        entries.extend(
+            a.indices()[range.clone()]
+                .iter()
+                .copied()
+                .zip(a.data()[range].iter().copied()),
+        );
+        entries.sort_by_key(|&(row, _)| row);
+        for &(row, value) in &entries {
+            if rowind.len() > colptr[col] && rowind.last() == Some(&row) {
+                if let Some(last) = values.last_mut() {
+                    *last += value;
+                }
+            } else {
+                rowind.push(row);
+                values.push(value);
+            }
+        }
+        colptr.push(rowind.len());
+    }
+    (colptr, rowind, values)
+}
+
+/// Row lists of the pattern whose column lists are `colptr`/`rowind` (square, order `n`).
+fn transpose_pattern(n: usize, colptr: &[usize], rowind: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut row_ptr = vec![0usize; n + 1];
+    for &row in rowind {
+        row_ptr[row + 1] += 1;
+    }
+    for row in 0..n {
+        row_ptr[row + 1] += row_ptr[row];
+    }
+    let mut cursor = row_ptr[..n].to_vec();
+    let mut row_cols = vec![0usize; rowind.len()];
+    for col in 0..n {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            row_cols[cursor[row]] = col;
+            cursor[row] += 1;
+        }
+    }
+    (row_ptr, row_cols)
+}
+
+/// The pattern of the rows `row_ptr`/`row_cols` as a CSR matrix of ones.
+fn pattern_csr(n: usize, row_ptr: &[usize], row_cols: &[usize]) -> CsrMatrix {
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; row_cols.len()],
+        row_cols.to_vec(),
+        row_ptr.to_vec(),
+    )
+}
+
+/// The pattern of A + Aᵀ (ones, self loops kept) from both orientations of A.
+fn a_plus_at_pattern_csr(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+) -> CsrMatrix {
+    let mut indptr = Vec::with_capacity(n + 1);
+    let mut indices = Vec::with_capacity(2 * rowind.len());
+    indptr.push(0);
     for i in 0..n {
-        let row_start = lu_indptr[i];
-        let row_end = lu_indptr[i + 1];
-        row_lookup_touched.clear();
-        for (offset, &col) in lu_indices[row_start..row_end].iter().enumerate() {
-            let idx = row_start + offset;
-            row_lookup[col] = idx;
-            row_lookup_touched.push(col);
+        let start = indices.len();
+        indices.extend_from_slice(&row_cols[row_ptr[i]..row_ptr[i + 1]]);
+        indices.extend_from_slice(&rowind[colptr[i]..colptr[i + 1]]);
+        indices[start..].sort_unstable();
+        let mut write = start;
+        for read in start..indices.len() {
+            if write == start || indices[read] != indices[write - 1] {
+                indices[write] = indices[read];
+                write += 1;
+            }
+        }
+        indices.truncate(write);
+        indptr.push(indices.len());
+    }
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; indices.len()],
+        indices,
+        indptr,
+    )
+}
+
+/// The pattern of AᵀA (ones, diagonal kept), SuperLU `getata`'s input to MMD_ATA: column `col`
+/// of AᵀA is the union of the rows of A that column `col` of A touches.
+fn ata_pattern_csr(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+) -> CsrMatrix {
+    let mut mark = vec![ILU_NONE; n];
+    let mut indptr = Vec::with_capacity(n + 1);
+    let mut indices = Vec::new();
+    indptr.push(0);
+    for col in 0..n {
+        let start = indices.len();
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            for &other in &row_cols[row_ptr[row]..row_ptr[row + 1]] {
+                if mark[other] != col {
+                    mark[other] = col;
+                    indices.push(other);
+                }
+            }
+        }
+        indices[start..].sort_unstable();
+        indptr.push(indices.len());
+    }
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; indices.len()],
+        indices,
+        indptr,
+    )
+}
+
+/// `spilu`'s column ordering: the step → column map (`iperm_c`), the ordering that ran, and
+/// whether SuperLU's symmetric mode applies. Every ordering but NATURAL is followed by the
+/// postorder of the column elimination tree, as SuperLU's `sp_preorder` does.
+fn ilu_column_ordering(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+    requested: PermutationOrdering,
+) -> (Vec<usize>, PermutationOrdering, bool) {
+    let natural = || {
+        (
+            (0..n).collect::<Vec<_>>(),
+            PermutationOrdering::Natural,
+            true,
+        )
+    };
+    let (base, used) = match requested {
+        PermutationOrdering::Natural => return natural(),
+        PermutationOrdering::Colamd => (
+            colamd_ordering(n, n, colptr, rowind),
+            PermutationOrdering::Colamd,
+        ),
+        PermutationOrdering::MmdAta => (
+            minimum_degree_ordering(&ata_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::MmdAta,
+        ),
+        PermutationOrdering::MmdAtPlusA => (
+            minimum_degree_ordering(&a_plus_at_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::MmdAtPlusA,
+        ),
+        PermutationOrdering::Amd => (
+            approximate_minimum_degree_ordering(&a_plus_at_pattern_csr(
+                n, colptr, rowind, row_ptr, row_cols,
+            )),
+            PermutationOrdering::Amd,
+        ),
+        PermutationOrdering::ReverseCuthillMcKee => (
+            reverse_cuthill_mckee(&a_plus_at_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::ReverseCuthillMcKee,
+        ),
+    };
+    let mut seen = vec![false; n];
+    let is_permutation = base.len() == n
+        && base
+            .iter()
+            .all(|&col| col < n && !std::mem::replace(&mut seen[col], true));
+    if !is_permutation {
+        return natural();
+    }
+    let parent = column_etree(n, colptr, rowind, &base);
+    let postordered = postorder_forest(&parent)
+        .into_iter()
+        .map(|position| base[position])
+        .collect();
+    (postordered, used, false)
+}
+
+/// COLAMD's "empty" link and the dead markers of its column and row records.
+const COLAMD_EMPTY: i64 = -1;
+const COLAMD_DEAD_PRINCIPAL: i64 = -1;
+const COLAMD_DEAD_NON_PRINCIPAL: i64 = -2;
+const COLAMD_DEAD_ROW: i64 = -1;
+
+/// COLAMD's `Colamd_Col`. The four `shared` words are C unions and are kept as ONE word each,
+/// because the algorithm reads one member through another (a degree-list head's `prev`, which is
+/// EMPTY, is later read as its `headhash`):
+/// `shared1` thickness | parent, `shared2` score | order, `shared3` headhash | hash | prev,
+/// `shared4` degree_next | hash_next.
+#[derive(Debug, Clone, Copy)]
+struct ColamdCol {
+    start: i64,
+    length: i64,
+    shared1: i64,
+    shared2: i64,
+    shared3: i64,
+    shared4: i64,
+}
+
+/// COLAMD's `Colamd_Row`: `shared1` degree | p, `shared2` mark | first_column.
+#[derive(Debug, Clone, Copy)]
+struct ColamdRow {
+    start: i64,
+    length: i64,
+    shared1: i64,
+    shared2: i64,
+}
+
+/// COLAMD 2.9.1 exactly as SuperLU vendors it (`SRC/colamd.c`, default knobs: dense rows and
+/// columns at `max(16, 10·√n)`, aggressive absorption), which is what SciPy's
+/// `spilu(permc_spec='COLAMD')` and `splu(permc_spec='COLAMD')` run through `get_colamd`.
+/// Returns the column at each position (`p` after `order_children`); SuperLU's
+/// `perm_c[p[i]] = i` is its inverse.
+///
+/// A line-by-line port, not a re-derivation, because the ordering is only useful here if it
+/// is SciPy's ordering: ILUTP's fill quota is cumulative over columns, so a different minimum
+/// degree ordering of the same fill can land on the other side of the quota (measured on the
+/// bead's matrix at fill_factor = 10: AMD on AᵀA gave bicgstab 7 preconditioner applications
+/// where SciPy needs 3, and SciPy given that same AMD ordering needed 8). The workspace length
+/// is `colamd_recommended`'s, so garbage collections happen where SuperLU's do; the hash is
+/// 32-bit unsigned, as SciPy builds SuperLU with `int` indices. Input columns must be sorted
+/// with no duplicates (the "jumbled" repair path is therefore not ported).
+fn colamd_ordering(n_row: usize, n_col: usize, colptr: &[usize], rowind: &[usize]) -> Vec<usize> {
+    if n_col == 0 {
+        return Vec::new();
+    }
+    let nnz = colptr[n_col];
+    // colamd_recommended = 2·nnz + Col_size + Row_size + n_col + nnz/5, less the Col and Row
+    // records COLAMD_MAIN carves off its end.
+    let alen = (2 * nnz + n_col + nnz / 5) as i64;
+    // Slack past `alen` only turns an out-of-contract write into no-op room instead of a panic;
+    // every decision (garbage collection) reads `alen`, never the vector's length.
+    let mut a = vec![0i64; alen as usize + n_col + 1];
+    for (slot, &row) in a.iter_mut().zip(rowind) {
+        *slot = row as i64;
+    }
+    let mut cols = vec![
+        ColamdCol {
+            start: 0,
+            length: 0,
+            shared1: 0,
+            shared2: 0,
+            shared3: 0,
+            shared4: 0,
+        };
+        n_col + 1
+    ];
+    let mut rows = vec![
+        ColamdRow {
+            start: 0,
+            length: 0,
+            shared1: 0,
+            shared2: 0,
+        };
+        n_row + 1
+    ];
+
+    // --- init_rows_cols (sorted, duplicate-free input) ---
+    for col in 0..n_col {
+        cols[col] = ColamdCol {
+            start: colptr[col] as i64,
+            length: (colptr[col + 1] - colptr[col]) as i64,
+            shared1: 1,
+            shared2: 0,
+            shared3: COLAMD_EMPTY,
+            shared4: COLAMD_EMPTY,
+        };
+    }
+    for &row in &rowind[..nnz] {
+        rows[row].length += 1;
+    }
+    let mut next_start = nnz as i64;
+    for row in rows.iter_mut().take(n_row) {
+        row.start = next_start;
+        row.shared1 = next_start;
+        next_start += row.length;
+    }
+    for col in 0..n_col {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            let slot = rows[row].shared1 as usize;
+            a[slot] = col as i64;
+            rows[row].shared1 += 1;
+        }
+    }
+    for row in rows.iter_mut().take(n_row) {
+        row.shared2 = 0;
+        row.shared1 = row.length;
+    }
+
+    // --- init_scoring ---
+    let dense_degree = |count: usize| (10.0 * (count as f64).sqrt()).max(16.0) as i64;
+    let dense_row_count = dense_degree(n_col);
+    let dense_col_count = dense_degree(n_row.min(n_col));
+    let n_col_i = n_col as i64;
+    let mut max_deg = 0i64;
+    let mut n_col2 = n_col_i;
+    for c in (0..n_col).rev() {
+        if cols[c].length == 0 {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        }
+    }
+    for c in (0..n_col).rev() {
+        if cols[c].start < 0 {
+            continue;
+        }
+        if cols[c].length > dense_col_count {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            let start = cols[c].start as usize;
+            for i in start..start + cols[c].length as usize {
+                rows[a[i] as usize].shared1 -= 1;
+            }
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        }
+    }
+    for row in rows.iter_mut().take(n_row) {
+        let degree = row.shared1;
+        if degree > dense_row_count || degree == 0 {
+            row.shared2 = COLAMD_DEAD_ROW;
+        } else {
+            max_deg = max_deg.max(degree);
+        }
+    }
+    for c in (0..n_col).rev() {
+        if cols[c].start < 0 {
+            continue;
+        }
+        let start = cols[c].start as usize;
+        let mut write = start;
+        let mut score = 0i64;
+        for read in start..start + cols[c].length as usize {
+            let row = a[read] as usize;
+            if rows[row].shared2 < 0 {
+                continue;
+            }
+            a[write] = row as i64;
+            write += 1;
+            score += rows[row].shared1 - 1;
+            score = score.min(n_col_i);
+        }
+        let length = (write - start) as i64;
+        if length == 0 {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        } else {
+            cols[c].length = length;
+            cols[c].shared2 = score;
+        }
+    }
+    // `head` is COLAMD's reuse of `p`: degree-list heads and, between them, hash buckets.
+    let mut head = vec![COLAMD_EMPTY; n_col + 1];
+    for c in (0..n_col).rev() {
+        if cols[c].start >= 0 {
+            let score = cols[c].shared2 as usize;
+            let next = head[score];
+            cols[c].shared3 = COLAMD_EMPTY;
+            cols[c].shared4 = next;
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = c as i64;
+            }
+            head[score] = c as i64;
+        }
+    }
+
+    // --- find_ordering ---
+    let max_mark = i64::from(i32::MAX) - n_col_i;
+    let mut tag_mark = colamd_clear_mark(0, max_mark, &mut rows[..n_row]);
+    let mut min_score = 0usize;
+    let mut pfree = 2 * nnz as i64;
+    let mut k = 0i64;
+    while k < n_col2 {
+        while min_score < n_col && head[min_score] == COLAMD_EMPTY {
+            min_score += 1;
+        }
+        let pivot_col = head[min_score] as usize;
+        let next = cols[pivot_col].shared4;
+        head[min_score] = next;
+        if next != COLAMD_EMPTY {
+            cols[next as usize].shared3 = COLAMD_EMPTY;
+        }
+        let pivot_col_score = cols[pivot_col].shared2;
+        cols[pivot_col].shared2 = k;
+        let pivot_col_thickness = cols[pivot_col].shared1;
+        k += pivot_col_thickness;
+        let needed_memory = pivot_col_score.min(n_col_i - k);
+        if pfree + needed_memory >= alen {
+            pfree =
+                colamd_garbage_collection(&mut rows[..n_row], &mut cols[..n_col], &mut a, pfree);
+            tag_mark = colamd_clear_mark(0, max_mark, &mut rows[..n_row]);
         }
 
-        for idx_ik in row_start..row_end {
-            let k = lu_indices[idx_ik];
-            if k >= i {
-                break; // only process lower triangle (k < i)
+        // The pivot row: the union of the live rows of the pivot column.
+        let pivot_row_start = pfree;
+        let mut pivot_row_degree = 0i64;
+        cols[pivot_col].shared1 = -pivot_col_thickness;
+        let pc_start = cols[pivot_col].start as usize;
+        let pc_end = pc_start + cols[pivot_col].length as usize;
+        for ci in pc_start..pc_end {
+            let row = a[ci] as usize;
+            if rows[row].shared2 >= 0 {
+                let r_start = rows[row].start as usize;
+                for ri in r_start..r_start + rows[row].length as usize {
+                    let col = a[ri] as usize;
+                    let thickness = cols[col].shared1;
+                    if thickness > 0 && cols[col].start >= 0 {
+                        cols[col].shared1 = -thickness;
+                        a[pfree as usize] = col as i64;
+                        pfree += 1;
+                        pivot_row_degree += thickness;
+                    }
+                }
             }
+        }
+        cols[pivot_col].shared1 = pivot_col_thickness;
+        max_deg = max_deg.max(pivot_row_degree);
+        for ci in pc_start..pc_end {
+            rows[a[ci] as usize].shared2 = COLAMD_DEAD_ROW;
+        }
+        let pivot_row_length = pfree - pivot_row_start;
+        let pivot_row = if pivot_row_length > 0 {
+            a[cols[pivot_col].start as usize]
+        } else {
+            COLAMD_EMPTY
+        };
+        let pr_start = pivot_row_start as usize;
+        let pr_end = pr_start + pivot_row_length as usize;
 
-            // Find diagonal a[k,k]
-            let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-            if pivot_is_zero(diag_k) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero pivot at row {k} during ILU(0)"),
-                });
+        // Approximate degrees: |Le \ Lp| for every row element touched.
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            let thickness = -cols[col].shared1;
+            cols[col].shared1 = thickness;
+            let cur_score = cols[col].shared2;
+            let prev = cols[col].shared3;
+            let next = cols[col].shared4;
+            if prev == COLAMD_EMPTY {
+                head[cur_score as usize] = next;
+            } else {
+                cols[prev as usize].shared4 = next;
             }
-
-            // Compute multiplier: a[i,k] /= a[k,k]
-            lu_data[idx_ik] /= diag_k;
-            let multiplier = lu_data[idx_ik];
-
-            // For each nonzero in row k with column j > k
-            for idx_kj in lu_indptr[k]..lu_indptr[k + 1] {
-                let j = lu_indices[idx_kj];
-                if j <= k {
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = prev;
+            }
+            let c_start = cols[col].start as usize;
+            for ci in c_start..c_start + cols[col].length as usize {
+                let row = a[ci] as usize;
+                let row_mark = rows[row].shared2;
+                if row_mark < 0 {
                     continue;
                 }
-                let a_kj = lu_data[idx_kj];
-
-                // If (i, j) exists in the sparsity pattern, subtract
-                let idx_ij = row_lookup[j];
-                if idx_ij != usize::MAX {
-                    lu_data[idx_ij] -= multiplier * a_kj;
+                let mut set_difference = row_mark - tag_mark;
+                if set_difference < 0 {
+                    set_difference = rows[row].shared1;
                 }
-                // ILU(0): if (i,j) is NOT in pattern, we drop the fill-in
+                set_difference -= thickness;
+                if set_difference == 0 {
+                    // aggressive absorption (the default knob)
+                    rows[row].shared2 = COLAMD_DEAD_ROW;
+                } else {
+                    rows[row].shared2 = set_difference + tag_mark;
+                }
             }
         }
 
-        for &col in &row_lookup_touched {
-            row_lookup[col] = usize::MAX;
+        // Prune dead rows from each pivot-row column, score it and hash its row pattern.
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            let mut hash: u32 = 0;
+            let mut cur_score = 0i64;
+            let c_start = cols[col].start as usize;
+            let mut write = c_start;
+            for read in c_start..c_start + cols[col].length as usize {
+                let row = a[read] as usize;
+                let row_mark = rows[row].shared2;
+                if row_mark < 0 {
+                    continue;
+                }
+                a[write] = row as i64;
+                write += 1;
+                hash = hash.wrapping_add(row as u32);
+                cur_score += row_mark - tag_mark;
+                cur_score = cur_score.min(n_col_i);
+            }
+            cols[col].length = (write - c_start) as i64;
+            if cols[col].length == 0 {
+                cols[col].start = COLAMD_DEAD_PRINCIPAL;
+                pivot_row_degree -= cols[col].shared1;
+                cols[col].shared2 = k;
+                k += cols[col].shared1;
+            } else {
+                cols[col].shared2 = cur_score;
+                let bucket = (hash % (n_col as u32 + 1)) as usize;
+                let head_column = head[bucket];
+                let first_col = if head_column > COLAMD_EMPTY {
+                    let first = cols[head_column as usize].shared3;
+                    cols[head_column as usize].shared3 = col as i64;
+                    first
+                } else {
+                    let first = -(head_column + 2);
+                    head[bucket] = -(col as i64 + 2);
+                    first
+                };
+                cols[col].shared4 = first_col;
+                cols[col].shared3 = bucket as i64;
+            }
+        }
+
+        colamd_detect_super_cols(&mut cols, &a, &mut head, pr_start, pr_end);
+        cols[pivot_col].start = COLAMD_DEAD_PRINCIPAL;
+        tag_mark = colamd_clear_mark(tag_mark + max_deg + 1, max_mark, &mut rows[..n_row]);
+
+        // Finalize the pivot row and put its columns back on the degree lists.
+        let mut write = pr_start;
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            if cols[col].start < 0 {
+                continue;
+            }
+            a[write] = col as i64;
+            write += 1;
+            let slot = (cols[col].start + cols[col].length) as usize;
+            a[slot] = pivot_row;
+            cols[col].length += 1;
+            let mut cur_score = cols[col].shared2 + pivot_row_degree;
+            let max_score = n_col_i - k - cols[col].shared1;
+            cur_score -= cols[col].shared1;
+            cur_score = cur_score.min(max_score);
+            cols[col].shared2 = cur_score;
+            let next = head[cur_score as usize];
+            cols[col].shared4 = next;
+            cols[col].shared3 = COLAMD_EMPTY;
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = col as i64;
+            }
+            head[cur_score as usize] = col as i64;
+            min_score = min_score.min(cur_score as usize);
+        }
+        if pivot_row_degree > 0 {
+            let row = pivot_row as usize;
+            rows[row].start = pivot_row_start;
+            rows[row].length = write as i64 - pivot_row_start;
+            rows[row].shared1 = pivot_row_degree;
+            rows[row].shared2 = 0;
         }
     }
 
-    // Extract L and U from the modified data
-    let mut l_data = Vec::new();
-    let mut l_indices = Vec::new();
-    let mut l_indptr = vec![0usize];
-    let mut u_data = Vec::new();
-    let mut u_indices = Vec::new();
-    let mut u_indptr = vec![0usize];
+    // --- order_children ---
+    for i in 0..n_col {
+        if cols[i].start != COLAMD_DEAD_PRINCIPAL && cols[i].shared2 == COLAMD_EMPTY {
+            let mut parent = i;
+            loop {
+                parent = cols[parent].shared1 as usize;
+                if cols[parent].start == COLAMD_DEAD_PRINCIPAL {
+                    break;
+                }
+            }
+            let mut c = i;
+            let mut order = cols[parent].shared2;
+            loop {
+                cols[c].shared2 = order;
+                order += 1;
+                cols[c].shared1 = parent as i64;
+                c = cols[c].shared1 as usize;
+                if cols[c].shared2 != COLAMD_EMPTY {
+                    break;
+                }
+            }
+            cols[parent].shared2 = order;
+        }
+    }
+    let mut position_to_col = vec![0usize; n_col];
+    for (c, col) in cols.iter().enumerate().take(n_col) {
+        position_to_col[col.shared2 as usize] = c;
+    }
+    position_to_col
+}
 
-    for i in 0..n {
-        // L entries: j < i (with implicit 1 on diagonal)
-        for idx in lu_indptr[i]..lu_indptr[i + 1] {
-            let j = lu_indices[idx];
-            if j < i {
-                l_data.push(lu_data[idx]);
-                l_indices.push(j);
+/// COLAMD `clear_mark`: restart the row tags when they would overflow.
+fn colamd_clear_mark(tag_mark: i64, max_mark: i64, rows: &mut [ColamdRow]) -> i64 {
+    if tag_mark <= 0 || tag_mark >= max_mark {
+        for row in rows.iter_mut() {
+            if row.shared2 >= 0 {
+                row.shared2 = 0;
             }
         }
-        // Add implicit diagonal
-        l_data.push(1.0);
-        l_indices.push(i);
-        l_indptr.push(l_data.len());
+        1
+    } else {
+        tag_mark
+    }
+}
 
-        // U entries: j >= i
-        for idx in lu_indptr[i]..lu_indptr[i + 1] {
-            let j = lu_indices[idx];
-            if j >= i {
-                u_data.push(lu_data[idx]);
-                u_indices.push(j);
+/// COLAMD `garbage_collection`: compact live column lists to the front of `a`, then the live
+/// rows after them (each row found by a one's-complement marker on its first slot). Returns the
+/// new free pointer.
+fn colamd_garbage_collection(
+    rows: &mut [ColamdRow],
+    cols: &mut [ColamdCol],
+    a: &mut [i64],
+    pfree: i64,
+) -> i64 {
+    let mut dest = 0usize;
+    for col in cols.iter_mut() {
+        if col.start >= 0 {
+            let src = col.start as usize;
+            col.start = dest as i64;
+            for j in 0..col.length as usize {
+                let row = a[src + j];
+                if rows[row as usize].shared2 >= 0 {
+                    a[dest] = row;
+                    dest += 1;
+                }
+            }
+            col.length = dest as i64 - col.start;
+        }
+    }
+    for (r, row) in rows.iter_mut().enumerate() {
+        if row.shared2 < 0 || row.length == 0 {
+            row.shared2 = COLAMD_DEAD_ROW;
+        } else {
+            let first = row.start as usize;
+            row.shared2 = a[first];
+            a[first] = -(r as i64) - 1;
+        }
+    }
+    let mut src = dest;
+    while (src as i64) < pfree {
+        if a[src] < 0 {
+            let r = (-a[src] - 1) as usize;
+            a[src] = rows[r].shared2;
+            rows[r].start = dest as i64;
+            for _ in 0..rows[r].length {
+                let col = a[src];
+                src += 1;
+                if cols[col as usize].start >= 0 {
+                    a[dest] = col;
+                    dest += 1;
+                }
+            }
+            rows[r].length = dest as i64 - rows[r].start;
+        } else {
+            src += 1;
+        }
+    }
+    dest as i64
+}
+
+/// COLAMD `detect_super_cols`: merge pivot-row columns with identical row patterns and scores
+/// (same hash bucket) into supercolumns, then empty the buckets used.
+fn colamd_detect_super_cols(
+    cols: &mut [ColamdCol],
+    a: &[i64],
+    head: &mut [i64],
+    row_start: usize,
+    row_end: usize,
+) {
+    for &entry in &a[row_start..row_end] {
+        let col = entry as usize;
+        if cols[col].start < 0 {
+            continue;
+        }
+        let hash = cols[col].shared3 as usize;
+        let head_column = head[hash];
+        let first_col = if head_column > COLAMD_EMPTY {
+            cols[head_column as usize].shared3
+        } else {
+            -(head_column + 2)
+        };
+        let mut super_c = first_col;
+        while super_c != COLAMD_EMPTY {
+            let sc = super_c as usize;
+            let length = cols[sc].length;
+            let mut prev_c = sc;
+            let mut c = cols[sc].shared4;
+            while c != COLAMD_EMPTY {
+                let cu = c as usize;
+                let same = cols[cu].length == length && cols[cu].shared2 == cols[sc].shared2 && {
+                    let (s1, s2) = (cols[sc].start as usize, cols[cu].start as usize);
+                    a[s1..s1 + length as usize] == a[s2..s2 + length as usize]
+                };
+                if !same {
+                    prev_c = cu;
+                    c = cols[cu].shared4;
+                    continue;
+                }
+                cols[sc].shared1 += cols[cu].shared1;
+                cols[cu].shared1 = sc as i64;
+                cols[cu].start = COLAMD_DEAD_NON_PRINCIPAL;
+                cols[cu].shared2 = COLAMD_EMPTY;
+                cols[prev_c].shared4 = cols[cu].shared4;
+                c = cols[cu].shared4;
+            }
+            super_c = cols[sc].shared4;
+        }
+        if head_column > COLAMD_EMPTY {
+            cols[head_column as usize].shared3 = COLAMD_EMPTY;
+        } else {
+            head[hash] = COLAMD_EMPTY;
+        }
+    }
+}
+
+/// Column elimination tree of `A·Pc` — the elimination tree of `(A·Pc)ᵀ(A·Pc)` — without
+/// forming the product (CSparse `cs_etree(A, 1)`; SuperLU's `sp_coletree` computes the same
+/// tree). `order[k]` is the column of A at position `k`; roots have parent `n`.
+fn column_etree(n: usize, colptr: &[usize], rowind: &[usize], order: &[usize]) -> Vec<usize> {
+    let mut parent = vec![n; n];
+    let mut ancestor = vec![ILU_NONE; n];
+    let mut prev = vec![ILU_NONE; n];
+    for (k, &col) in order.iter().enumerate() {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            let mut i = prev[row];
+            while i != ILU_NONE && i < k {
+                let next = ancestor[i];
+                ancestor[i] = k;
+                if next == ILU_NONE {
+                    parent[i] = k;
+                }
+                i = next;
+            }
+            prev[row] = k;
+        }
+    }
+    parent
+}
+
+/// SuperLU `ilu_relax_snode`: on an elimination tree whose parents follow their children (every
+/// etree does), each leaf starts a relaxed supernode that climbs while the parent has fewer than
+/// `relax` descendants.
+fn ilu_relax_supernodes(parent: &[usize], relax: usize) -> RelaxedSupernodes {
+    let n = parent.len();
+    let mut descendants = vec![0usize; n];
+    for node in 0..n {
+        if parent[node] != n {
+            descendants[parent[node]] += descendants[node] + 1;
+        }
+    }
+    let mut relaxed = RelaxedSupernodes {
+        end: vec![ILU_NONE; n],
+        found: Vec::new(),
+    };
+    let mut j = 0;
+    while j < n {
+        let start = j;
+        let mut up = parent[j];
+        while up != n && descendants[up] < relax {
+            j = up;
+            up = parent[j];
+        }
+        relaxed.end[start] = j;
+        relaxed.found.push(start);
+        j += 1;
+        while j < n && descendants[j] != 0 {
+            j += 1;
+        }
+    }
+    relaxed
+}
+
+/// SuperLU `ilu_heap_relax_snode`, for the symmetric-mode etree, which is heap ordered but not
+/// postordered: relaxed supernodes are found on the postordered tree and kept only where they
+/// are contiguous in the original order; otherwise each of their leaves stands alone.
+fn ilu_heap_relax_supernodes(parent: &[usize], relax: usize) -> RelaxedSupernodes {
+    let n = parent.len();
+    let order = postorder_forest(parent);
+    let mut post = vec![0usize; n];
+    for (position, &node) in order.iter().enumerate() {
+        post[node] = position;
+    }
+    let mut post_parent = vec![n; n];
+    for node in 0..n {
+        if parent[node] != n {
+            post_parent[post[node]] = post[parent[node]];
+        }
+    }
+    let mut descendants = vec![0usize; n];
+    for node in 0..n {
+        if post_parent[node] != n {
+            descendants[post_parent[node]] += descendants[node] + 1;
+        }
+    }
+    let mut relaxed = RelaxedSupernodes {
+        end: vec![ILU_NONE; n],
+        found: Vec::new(),
+    };
+    let mut j = 0;
+    while j < n {
+        let start = j;
+        let mut up = post_parent[j];
+        while up != n && descendants[up] < relax {
+            j = up;
+            up = post_parent[j];
+        }
+        let first = (start..=j).map(|i| order[i]).min().unwrap_or(order[j]);
+        let last = order[j];
+        if last - first == j - start {
+            relaxed.end[first] = last;
+            relaxed.found.push(first);
+        } else {
+            for i in start..=j {
+                if descendants[i] == 0 {
+                    relaxed.end[order[i]] = order[i];
+                    relaxed.found.push(order[i]);
+                }
             }
         }
-        u_indptr.push(u_data.len());
+        j += 1;
+        while j < n && descendants[j] != 0 {
+            j += 1;
+        }
+    }
+    relaxed
+}
+
+/// Rows of a supernode whose removal from its pre-panel columns waits for the panel to end.
+struct DeferredRowDrop {
+    first: usize,
+    end: usize,
+    rows: Vec<usize>,
+}
+
+/// State of one `dgsitrf`-rules factorization. Rows are A's own row numbers until export;
+/// columns are steps (positions in `A·Pc`).
+struct Ilutp<'a> {
+    n: usize,
+    colptr: &'a [usize],
+    rowind: &'a [usize],
+    values: &'a [f64],
+    iperm_c: &'a [usize],
+    nnz_a: usize,
+    drop_tol: f64,
+    gamma: f64,
+    rule: IluDropRule,
+    pivot_thresh: f64,
+    hardened: bool,
+    last_drop: usize,
+    /// SuperLU `marker_relax`: the first column of the relaxed supernode whose A columns hold a
+    /// row; such a row is never an earlier column's pivot.
+    marker_relax: Vec<usize>,
+    pinv: Vec<usize>,
+    step_rows: Vec<usize>,
+    swap: Vec<usize>,
+    iswap: Vec<usize>,
+    l_rows: Vec<Vec<usize>>,
+    l_vals: Vec<Vec<f64>>,
+    u_steps: Vec<Vec<usize>>,
+    u_vals: Vec<Vec<f64>>,
+    u_diag: Vec<f64>,
+    sn_first: Vec<usize>,
+    sn_relaxed: Vec<bool>,
+    nnz_aj: usize,
+    nnz_lj: usize,
+    nnz_uj: usize,
+    tol_l: f64,
+    tol_u: f64,
+    x: Vec<f64>,
+    visit: Vec<usize>,
+    touched: Vec<usize>,
+    stack: Vec<usize>,
+    unodes: Vec<usize>,
+    lcand: Vec<usize>,
+    /// `prev_mark[row] == j + 1` when `row` is in column j's L pattern.
+    prev_mark: Vec<usize>,
+    /// Size of the previous panel column's L pattern; `None` after a relaxed supernode.
+    prev_len: Option<usize>,
+    row_mark: Vec<usize>,
+    mark_generation: usize,
+    norms: Vec<f64>,
+    deferred: Option<DeferredRowDrop>,
+    stats: IluStatistics,
+}
+
+impl<'a> Ilutp<'a> {
+    fn new(
+        n: usize,
+        colptr: &'a [usize],
+        rowind: &'a [usize],
+        values: &'a [f64],
+        iperm_c: &'a [usize],
+        relaxed: &RelaxedSupernodes,
+        options: &IluOptions,
+    ) -> Self {
+        // SuperLU `mark_relax`, in the order the supernodes were found: a later one overwrites.
+        let mut marker_relax = vec![ILU_NONE; n];
+        for &first in &relaxed.found {
+            let last = relaxed.end[first];
+            for step in first..=last {
+                let col = iperm_c[step];
+                for &row in &rowind[colptr[col]..colptr[col + 1]] {
+                    marker_relax[row] = first;
+                }
+            }
+        }
+        let mut perm_c = vec![0usize; n];
+        for (step, &col) in iperm_c.iter().enumerate() {
+            perm_c[col] = step;
+        }
+        // SuperLU: last_drop = max(min_mn - 2·sp_ienv(7), (int)(min_mn·0.95)).
+        let last_drop = n
+            .saturating_sub(2 * ILU_MAX_SUPERNODE)
+            .max((n as f64 * 0.95) as usize);
+        Self {
+            n,
+            colptr,
+            rowind,
+            values,
+            iperm_c,
+            nnz_a: rowind.len(),
+            drop_tol: options.drop_tol,
+            gamma: options.fill_factor,
+            rule: options.drop_rule,
+            pivot_thresh: options.diag_pivot_thresh,
+            hardened: options.mode == RuntimeMode::Hardened,
+            last_drop,
+            marker_relax,
+            pinv: vec![ILU_NONE; n],
+            step_rows: vec![ILU_NONE; n],
+            swap: iperm_c.to_vec(),
+            iswap: perm_c,
+            l_rows: vec![Vec::new(); n],
+            l_vals: vec![Vec::new(); n],
+            u_steps: vec![Vec::new(); n],
+            u_vals: vec![Vec::new(); n],
+            u_diag: vec![0.0; n],
+            sn_first: vec![0; n],
+            sn_relaxed: vec![false; n],
+            nnz_aj: 0,
+            nnz_lj: 0,
+            nnz_uj: 0,
+            tol_l: options.drop_tol,
+            tol_u: options.drop_tol,
+            x: vec![0.0; n],
+            visit: vec![0; n],
+            touched: Vec::new(),
+            stack: Vec::new(),
+            unodes: Vec::new(),
+            lcand: Vec::new(),
+            prev_mark: vec![0; n],
+            prev_len: None,
+            row_mark: vec![0; n],
+            mark_generation: 0,
+            norms: vec![0.0; n],
+            deferred: None,
+            stats: IluStatistics::default(),
+        }
     }
 
-    Ok(SparseIluFactorization {
-        shape: (n, n),
-        backend_used: SparseBackend::Auto,
-        ordering_used: options.ordering,
-        l_data,
-        l_indices,
-        l_indptr,
-        u_data,
-        u_indices,
-        u_indptr,
-        n,
-    })
+    fn a_range(&self, step: usize) -> std::ops::Range<usize> {
+        let col = self.iperm_c[step];
+        self.colptr[col]..self.colptr[col + 1]
+    }
+
+    /// `‖A(:,col(step))‖∞` (SuperLU `amax`).
+    fn column_amax(&self, step: usize) -> f64 {
+        self.values[self.a_range(step)]
+            .iter()
+            .fold(0.0, |largest, value| largest.max(value.abs()))
+    }
+
+    fn relax_allows(&self, row: usize, step: usize) -> bool {
+        let marker = self.marker_relax[row];
+        marker == ILU_NONE || marker <= step
+    }
+
+    /// Sparse triangular solve of column `step` against the L columns of steps `>= floor`:
+    /// `x` over the reach, `unodes` the U steps reached (ascending, a topological order since
+    /// L(:,k) only reaches steps after k), `lcand` the unpivoted rows — the L pattern. `seeds`
+    /// is the column's own pattern, or the union pattern of a relaxed supernode.
+    fn eliminate(&mut self, step: usize, floor: usize, seeds: &[usize]) {
+        let stamp = step + 1;
+        self.touched.clear();
+        self.stack.clear();
+        self.unodes.clear();
+        self.lcand.clear();
+        for &row in seeds {
+            if self.visit[row] != stamp {
+                self.visit[row] = stamp;
+                self.touched.push(row);
+                self.stack.push(row);
+            }
+        }
+        while let Some(row) = self.stack.pop() {
+            let k = self.pinv[row];
+            if k == ILU_NONE {
+                self.lcand.push(row);
+                continue;
+            }
+            if k < floor {
+                continue;
+            }
+            self.unodes.push(k);
+            for &next in &self.l_rows[k] {
+                if self.visit[next] != stamp {
+                    self.visit[next] = stamp;
+                    self.touched.push(next);
+                    self.stack.push(next);
+                }
+            }
+        }
+        for &row in &self.touched {
+            self.x[row] = 0.0;
+        }
+        for p in self.a_range(step) {
+            self.x[self.rowind[p]] += self.values[p];
+        }
+        self.unodes.sort_unstable();
+        for &k in &self.unodes {
+            let xk = self.x[self.step_rows[k]];
+            if xk != 0.0 {
+                for (&row, &multiplier) in self.l_rows[k].iter().zip(&self.l_vals[k]) {
+                    self.x[row] -= multiplier * xk;
+                }
+            }
+        }
+    }
+
+    /// SuperLU `ilu_dpivotL`: threshold partial pivoting among the L pattern. A zero pivot fails
+    /// in Strict mode (SciPy raises); in Hardened mode it is replaced by SuperLU's fill value.
+    fn choose_pivot(&mut self, step: usize, amax: f64) -> SparseResult<(usize, f64)> {
+        let diag_row = self.iperm_c[step];
+        let mut pivmax = -1.0_f64;
+        let mut pivot = ILU_NONE;
+        let mut diag_present = false;
+        let mut first = ILU_NONE;
+        for &row in &self.lcand {
+            if !self.relax_allows(row, step) {
+                continue;
+            }
+            let magnitude = self.x[row].abs();
+            if magnitude > pivmax || (magnitude == pivmax && row < pivot) {
+                pivmax = magnitude;
+                pivot = row;
+            }
+            diag_present |= row == diag_row;
+            first = first.min(row);
+        }
+        if !(pivmax > 0.0) {
+            if !self.hardened {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("Factor is exactly singular: zero pivot at step {step}"),
+                });
+            }
+            self.stats.zero_pivots += 1;
+            let row = if diag_present {
+                diag_row
+            } else if first != ILU_NONE {
+                first
+            } else {
+                (step..self.n)
+                    .map(|position| self.swap[position])
+                    .find(|&row| self.pinv[row] == ILU_NONE && self.relax_allows(row, step))
+                    .or_else(|| (0..self.n).find(|&row| self.pinv[row] == ILU_NONE))
+                    .unwrap_or(diag_row)
+            };
+            let amax = if amax > 0.0 { amax } else { ILU_FILL_TOL };
+            let value = amax * ILU_FILL_TOL.powf(1.0 - step as f64 / self.n as f64);
+            return Ok((row, value));
+        }
+        if diag_present {
+            let diagonal = self.x[diag_row].abs();
+            if diagonal != 0.0 && diagonal >= self.pivot_thresh * pivmax {
+                pivot = diag_row;
+            }
+        }
+        Ok((pivot, self.x[pivot]))
+    }
+
+    /// Record the pivot of `step`, with SuperLU's `swap`/`iswap` bookkeeping (read only by the
+    /// zero-pivot fallback), and store U's diagonal and L(:, step) = candidates / pivot.
+    fn finish_column(&mut self, step: usize, pivot: usize, value: f64) {
+        self.pinv[pivot] = step;
+        self.step_rows[step] = pivot;
+        if pivot != self.iperm_c[step] {
+            self.stats.off_diagonal_pivots += 1;
+        }
+        let (position, target) = (self.iswap[pivot], step);
+        if position != target {
+            let (a, b) = (self.swap[position], self.swap[target]);
+            self.swap[position] = b;
+            self.swap[target] = a;
+            self.iswap[a] = target;
+            self.iswap[b] = position;
+        }
+        self.u_diag[step] = value;
+        // SuperLU scales by the reciprocal (`cdiv`), not by division.
+        let reciprocal = 1.0 / value;
+        let mut rows = Vec::with_capacity(self.lcand.len().saturating_sub(1));
+        let mut vals = Vec::with_capacity(rows.capacity());
+        for &row in &self.lcand {
+            if row != pivot {
+                rows.push(row);
+                vals.push(self.x[row] * reciprocal);
+            }
+        }
+        self.l_rows[step] = rows;
+        self.l_vals[step] = vals;
+    }
+
+    /// The U quota of `ilu_dcopy_to_ucol`'s caller for column `step`.
+    fn u_quota(&self, step: usize, column_nnz: usize) -> i64 {
+        let (n, gamma) = (self.n as f64, self.gamma);
+        if self.rule.intersects(IluDropRule::PROWS) {
+            (gamma * self.nnz_a as f64 / n * step as f64 / n) as i64
+        } else if self.rule.intersects(IluDropRule::COLUMN) {
+            (gamma * column_nnz as f64 * (step + 1) as f64 / n) as i64
+        } else if self.rule.intersects(IluDropRule::AREA) {
+            (gamma * 0.9 * self.nnz_aj as f64 * 0.5 - self.nnz_uj as f64) as i64
+        } else {
+            self.n as i64
+        }
+    }
+
+    /// SuperLU `ilu_dcopy_to_ucol` for a panel column: U entries of the current supernode
+    /// (`>= fsupc`) are kept; the rest pass the drop tolerance and the quota, then secondary
+    /// dropping keeps the largest by SIGNED selection, as `dqselect` does on `ucol`.
+    fn store_u_column(&mut self, step: usize, fsupc: usize, amax: f64, column_nnz: usize) {
+        let (threshold, quota) = if self.rule == IluDropRule::NONE {
+            (-1.0, self.n as i64)
+        } else {
+            (amax * self.tol_u, self.u_quota(step, column_nnz))
+        };
+        let mut steps = Vec::with_capacity(self.unodes.len());
+        let mut vals = Vec::with_capacity(self.unodes.len());
+        let mut kept_steps = Vec::new();
+        let mut kept_vals = Vec::new();
+        let (mut d_max, mut d_min) = (0.0_f64, 1.0 / f64::MIN_POSITIVE);
+        for &k in &self.unodes {
+            let value = self.x[self.step_rows[k]];
+            if k >= fsupc {
+                steps.push(k);
+                vals.push(value);
+                continue;
+            }
+            let magnitude = value.abs();
+            if quota > 0 && magnitude >= threshold {
+                kept_steps.push(k);
+                kept_vals.push(value);
+                d_max = d_max.max(magnitude);
+                d_min = d_min.min(magnitude);
+            } else {
+                self.stats.dropped_u_entries += 1;
+            }
+        }
+        let kept = kept_vals.len() as i64;
+        if self.rule.intersects(IluDropRule::SECONDARY) && kept > quota {
+            let tol = if quota > 0 {
+                if self.rule.intersects(IluDropRule::INTERP) {
+                    let (inv_max, inv_min) = (1.0 / d_max, 1.0 / d_min);
+                    1.0 / (inv_max + (inv_min - inv_max) * quota as f64 / kept as f64)
+                } else {
+                    kth_largest(&kept_vals, quota as usize)
+                }
+            } else {
+                d_max
+            };
+            for (k, value) in kept_steps.into_iter().zip(kept_vals) {
+                if value.abs() <= tol {
+                    self.stats.dropped_u_entries += 1;
+                } else {
+                    steps.push(k);
+                    vals.push(value);
+                    self.nnz_uj += 1;
+                }
+            }
+        } else {
+            self.nnz_uj += kept_steps.len();
+            steps.extend(kept_steps);
+            vals.extend(kept_vals);
+        }
+        if self.rule.intersects(IluDropRule::DYNAMIC) {
+            // SuperLU compares against nnzLj here, not nnzUj; kept as written.
+            if self.gamma * 0.9 * self.nnz_aj as f64 * 0.5 < self.nnz_lj as f64 {
+                self.tol_u = (self.tol_u * 2.0).min(1.0);
+            } else {
+                self.tol_u = self.drop_tol.max(self.tol_u * 0.5);
+            }
+        }
+        self.u_steps[step] = steps;
+        self.u_vals[step] = vals;
+    }
+
+    /// The L quota of `ilu_ddrop_row`'s caller for the supernode `first..=last`.
+    fn l_quota(&self, first: usize, last: usize) -> i64 {
+        let (n, gamma) = (self.n as f64, self.gamma);
+        let width = (last - first + 1) as f64;
+        if self.rule.intersects(IluDropRule::PROWS) {
+            (gamma * self.nnz_a as f64 / n * (n - first as f64) / n * width) as i64
+        } else if self.rule.intersects(IluDropRule::COLUMN) {
+            let column_nnz: usize = (first..=last).map(|step| self.a_range(step).len()).sum();
+            (gamma * column_nnz as f64 * (n - first as f64) / n) as i64
+        } else if self.rule.intersects(IluDropRule::AREA) {
+            (gamma * self.nnz_aj as f64 * (1.0 - 0.5 * (last as f64 + 1.0) / n)
+                - self.nnz_lj as f64) as i64
+        } else {
+            (self.n * self.n) as i64
+        }
+    }
+
+    /// SuperLU `ilu_ddrop_row` for the supernode `first..=last`: rows below its diagonal block
+    /// whose largest multiplier is below the tolerance go, then rows beyond the quota. Columns
+    /// before `defer_before` keep the rows until the panel ends (`apply_deferred_drop`).
+    fn drop_supernode_rows(&mut self, first: usize, last: usize, defer_before: usize) {
+        let width = last - first + 1;
+        let below = self.l_rows[last].clone();
+        let m = width + below.len();
+        let quota = self.l_quota(first, last);
+        if m == width || self.rule == IluDropRule::NONE {
+            self.nnz_lj += m * width;
+            self.adapt_tol_l(last);
+            return;
+        }
+        self.mark_generation += 1;
+        let generation = self.mark_generation;
+        for &row in &below {
+            self.row_mark[row] = generation;
+            self.norms[row] = 0.0;
+        }
+        for step in first..=last {
+            for (&row, &value) in self.l_rows[step].iter().zip(&self.l_vals[step]) {
+                if self.row_mark[row] == generation {
+                    self.norms[row] = self.norms[row].max(value.abs());
+                }
+            }
+        }
+        let mut dropped = Vec::new();
+        let mut kept = Vec::with_capacity(below.len());
+        let (mut d_max, mut d_min) = (0.0_f64, 1.0_f64);
+        for &row in &below {
+            let norm = self.norms[row];
+            if self.rule.intersects(IluDropRule::BASIC) && norm < self.tol_l {
+                dropped.push(row);
+            } else {
+                kept.push(row);
+                d_max = d_max.max(norm);
+                d_min = d_min.min(norm);
+            }
+        }
+        let quota = (quota as f64 / width as f64).ceil() as i64;
+        let basic_dropped = dropped.len();
+        if self.rule.intersects(IluDropRule::SECONDARY) && ((m - basic_dropped) as i64) > quota {
+            let tol = if quota > width as i64 {
+                if self.rule.intersects(IluDropRule::INTERP) {
+                    let (inv_max, inv_min) = (1.0 / d_max, 1.0 / d_min);
+                    1.0 / (inv_max
+                        + (inv_min - inv_max) * quota as f64 / (m - width - basic_dropped) as f64)
+                } else {
+                    let norms: Vec<f64> = kept.iter().map(|&row| self.norms[row]).collect();
+                    kth_largest(&norms, (quota - width as i64) as usize)
+                }
+            } else {
+                d_max
+            };
+            let mut still_kept = Vec::with_capacity(kept.len());
+            for row in kept {
+                if self.norms[row] <= tol {
+                    dropped.push(row);
+                } else {
+                    still_kept.push(row);
+                }
+            }
+        }
+        self.nnz_lj += (m - dropped.len()) * width;
+        if !dropped.is_empty() {
+            self.mark_generation += 1;
+            let generation = self.mark_generation;
+            for &row in &dropped {
+                self.row_mark[row] = generation;
+            }
+            for step in first.max(defer_before)..=last {
+                self.remove_marked_rows(step, generation);
+            }
+            if first < defer_before {
+                debug_assert!(self.deferred.is_none(), "one pre-panel supernode per panel");
+                self.deferred = Some(DeferredRowDrop {
+                    first,
+                    end: defer_before.min(last + 1),
+                    rows: dropped,
+                });
+            }
+        }
+        self.adapt_tol_l(last);
+    }
+
+    /// `DROP_DYNAMIC` for L, which `dgsitrf` applies after every supernode drop — including the
+    /// ones `ilu_ddrop_row` returns from early because there was nothing below the block.
+    fn adapt_tol_l(&mut self, last: usize) {
+        if self.rule.intersects(IluDropRule::DYNAMIC) {
+            let n = self.n as f64;
+            if self.gamma * self.nnz_aj as f64 * (1.0 - 0.5 * (last as f64 + 1.0) / n)
+                < self.nnz_lj as f64
+            {
+                self.tol_l = (self.tol_l * 2.0).min(1.0);
+            } else {
+                self.tol_l = self.drop_tol.max(self.tol_l * 0.5);
+            }
+        }
+    }
+
+    fn remove_marked_rows(&mut self, step: usize, generation: usize) {
+        let rows = &mut self.l_rows[step];
+        let vals = &mut self.l_vals[step];
+        let mut write = 0;
+        for read in 0..rows.len() {
+            if self.row_mark[rows[read]] == generation {
+                self.stats.dropped_l_entries += 1;
+            } else {
+                rows[write] = rows[read];
+                vals[write] = vals[read];
+                write += 1;
+            }
+        }
+        rows.truncate(write);
+        vals.truncate(write);
+    }
+
+    fn apply_deferred_drop(&mut self) {
+        if let Some(drop) = self.deferred.take() {
+            self.mark_generation += 1;
+            let generation = self.mark_generation;
+            for &row in &drop.rows {
+                self.row_mark[row] = generation;
+            }
+            for step in drop.first..drop.end {
+                self.remove_marked_rows(step, generation);
+            }
+        }
+    }
+
+    /// Does column `step` (a panel column, pattern in `lcand`) join column `step − 1`'s
+    /// supernode? SuperLU `ilu_dcolumn_dfs`: same pattern less the previous pivot, not after a
+    /// relaxed supernode, not singular, at most `ILU_MAX_SUPERNODE` columns.
+    fn joins_previous_supernode(&self, step: usize) -> bool {
+        step > 0
+            && !self.sn_relaxed[step - 1]
+            && !self.lcand.is_empty()
+            && step - self.sn_first[step - 1] < ILU_MAX_SUPERNODE
+            && self.prev_len == Some(self.lcand.len() + 1)
+            && self.lcand.iter().all(|&row| self.prev_mark[row] == step)
+    }
+
+    /// `dgsitrf`'s main loop: relaxed supernodes and panels of `panel_size` columns.
+    fn run(&mut self, relax_end: &[usize], panel_size: usize) -> SparseResult<()> {
+        let n = self.n;
+        let rowind = self.rowind;
+        let mut union = Vec::new();
+        let mut jcol = 0;
+        while jcol < n {
+            if relax_end[jcol] != ILU_NONE {
+                let kcol = relax_end[jcol];
+                if jcol > 0 && jcol < self.last_drop {
+                    self.drop_supernode_rows(self.sn_first[jcol - 1], jcol - 1, 0);
+                }
+                self.stats.supernodes += 1;
+                self.stats.relaxed_supernodes += 1;
+                union.clear();
+                for step in jcol..=kcol {
+                    union.extend_from_slice(&rowind[self.a_range(step)]);
+                }
+                for icol in jcol..=kcol {
+                    self.nnz_aj += self.a_range(icol).len();
+                    let mut amax = self.column_amax(icol);
+                    if amax == 0.0 {
+                        amax = ILU_FILL_TOL;
+                    }
+                    self.eliminate(icol, jcol, &union);
+                    self.sn_first[icol] = jcol;
+                    self.sn_relaxed[icol] = true;
+                    // Every U step reached lies in this supernode: kept, never counted.
+                    self.u_steps[icol] = self.unodes.clone();
+                    self.u_vals[icol] = self
+                        .unodes
+                        .iter()
+                        .map(|&k| self.x[self.step_rows[k]])
+                        .collect();
+                    let (pivot, value) = self.choose_pivot(icol, amax)?;
+                    self.finish_column(icol, pivot, value);
+                }
+                self.prev_len = None;
+                jcol = kcol + 1;
+                continue;
+            }
+
+            let end = (jcol + panel_size).min(n);
+            let mut width = panel_size;
+            let mut k = jcol + 1;
+            while k < end {
+                if relax_end[k] != ILU_NONE {
+                    width = k - jcol;
+                    break;
+                }
+                k += 1;
+            }
+            if k == n {
+                width = n - jcol;
+            }
+            let panel_start = jcol;
+            for jj in jcol..jcol + width {
+                let range = self.a_range(jj);
+                let column_nnz = range.len();
+                self.nnz_aj += column_nnz;
+                let amax = self.column_amax(jj);
+                self.eliminate(jj, 0, &rowind[range]);
+                let joins = self.joins_previous_supernode(jj);
+                let fsupc = if joins {
+                    self.sn_first[jj - 1]
+                } else {
+                    self.stats.supernodes += 1;
+                    jj
+                };
+                self.sn_first[jj] = fsupc;
+                self.sn_relaxed[jj] = false;
+                if self.lcand.is_empty() {
+                    // SuperLU gives an empty column a (zero) fill-in position to pivot on.
+                    let fill_row = (jj..n)
+                        .map(|position| self.swap[position])
+                        .find(|&row| self.pinv[row] == ILU_NONE && self.relax_allows(row, jj));
+                    if let Some(row) = fill_row {
+                        self.x[row] = 0.0;
+                        self.lcand.push(row);
+                    }
+                }
+                for &row in &self.lcand {
+                    self.prev_mark[row] = jj + 1;
+                }
+                self.prev_len = Some(self.lcand.len());
+                self.store_u_column(jj, fsupc, amax, column_nnz);
+                let (pivot, value) = self.choose_pivot(jj, amax)?;
+                self.finish_column(jj, pivot, value);
+                if jj > 0 && !joins && jj < self.last_drop {
+                    self.drop_supernode_rows(self.sn_first[jj - 1], jj - 1, panel_start);
+                }
+            }
+            self.apply_deferred_drop();
+            jcol += width;
+        }
+        Ok(())
+    }
+
+    /// Export `Pr·A·Pc ≈ L·U` in the step numbering, exact zeros left out as SciPy's `L`/`U`
+    /// leave them out.
+    fn into_factorization(
+        self,
+        ordering_used: PermutationOrdering,
+    ) -> SparseResult<SparseIluFactorization> {
+        let n = self.n;
+        let mut l_indptr = Vec::with_capacity(n + 1);
+        let mut l_indices = Vec::new();
+        let mut l_data = Vec::new();
+        let mut u_indptr = Vec::with_capacity(n + 1);
+        let mut u_indices = Vec::new();
+        let mut u_data = Vec::new();
+        let mut lower_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut upper_rows: Vec<Vec<(usize, f64)>> =
+            (0..n).map(|step| vec![(step, self.u_diag[step])]).collect();
+        let mut entries: Vec<(usize, f64)> = Vec::new();
+        l_indptr.push(0);
+        u_indptr.push(0);
+        for step in 0..n {
+            entries.clear();
+            entries.push((step, 1.0));
+            for (&row, &value) in self.l_rows[step].iter().zip(&self.l_vals[step]) {
+                if value != 0.0 {
+                    entries.push((self.pinv[row], value));
+                }
+            }
+            entries.sort_unstable_by_key(|&(row, _)| row);
+            for &(row, value) in &entries {
+                l_indices.push(row);
+                l_data.push(value);
+                if row != step {
+                    lower_rows[row].push((step, value));
+                }
+            }
+            l_indptr.push(l_indices.len());
+
+            entries.clear();
+            for (&k, &value) in self.u_steps[step].iter().zip(&self.u_vals[step]) {
+                if value != 0.0 {
+                    entries.push((k, value));
+                }
+            }
+            entries.push((step, self.u_diag[step]));
+            entries.sort_unstable_by_key(|&(row, _)| row);
+            for &(row, value) in &entries {
+                u_indices.push(row);
+                u_data.push(value);
+                if row != step {
+                    upper_rows[row].push((step, value));
+                }
+            }
+            u_indptr.push(u_indices.len());
+        }
+        let lower = PackedTriangularRows::from_rows(&lower_rows);
+        let upper = PackedTriangularRows::from_rows(&upper_rows);
+        let invariant = |which: &str| SparseError::InvalidArgument {
+            message: format!("spilu {which} factor is not triangular in step order"),
+        };
+        let lower_levels = TriangularLevelSchedule::lower(&lower).ok_or_else(|| invariant("L"))?;
+        let upper_levels = TriangularLevelSchedule::upper(&upper).ok_or_else(|| invariant("U"))?;
+        let mut perm_c = vec![0usize; n];
+        for (step, &col) in self.iperm_c.iter().enumerate() {
+            perm_c[col] = step;
+        }
+        let shape = Shape2D::new(n, n);
+        Ok(SparseIluFactorization {
+            shape: (n, n),
+            backend_used: SparseBackend::NativeIlutp,
+            ordering_used,
+            statistics: self.stats,
+            l: CscMatrix::from_components(shape, l_data, l_indices, l_indptr, false)?,
+            u: CscMatrix::from_components(shape, u_data, u_indices, u_indptr, false)?,
+            perm_r: self.pinv,
+            perm_c,
+            step_rows: self.step_rows,
+            lower,
+            upper,
+            lower_levels,
+            upper_levels,
+        })
+    }
+}
+
+/// SuperLU `dqselect(n, A, k)`: the k-th largest value (0-based, `k` clamped to the length),
+/// compared as SIGNED numbers — which is what `ilu_dcopy_to_ucol` feeds it.
+fn kth_largest(values: &[f64], k: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut work = values.to_vec();
+    let k = k.min(work.len() - 1);
+    let (_, kth, _) = work.select_nth_unstable_by(k, |a, b| b.total_cmp(a));
+    *kth
 }
 
 /// Sparse matrix exponential via dense fallback.
@@ -7081,7 +8789,7 @@ fn csr_matvec_into_impl(
 
 /// Preconditioned Conjugate Gradient solver.
 ///
-/// Solves Ax = b using CG with an ILU(0) preconditioner M ≈ A.
+/// Solves Ax = b using CG with an incomplete-LU preconditioner M = L·U ≈ A from [`spilu`].
 /// The preconditioner solves M*z = r at each iteration instead of using r directly.
 /// Matches `scipy.sparse.linalg.cg(A, b, M=spilu(A).solve)`.
 pub fn pcg(
@@ -7213,6 +8921,362 @@ pub fn pcg(
 /// side 64, while `perf_sparse_vs_scipy` kept printing 20. It is a named constant now, and the
 /// harness prints it.
 pub const GMRES_DEFAULT_RESTART: usize = 20;
+
+/// Shape checks and the initial iterate shared by the preconditioned Krylov ports.
+fn preconditioned_krylov_start(
+    name: &str,
+    a: &CsrMatrix,
+    b: &[f64],
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<f64>> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!("{name} requires a square matrix"),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, x0, options)?;
+    match x0 {
+        Some(initial) if initial.len() != n => Err(SparseError::IncompatibleShape {
+            message: "initial guess length must match matrix rows".to_string(),
+        }),
+        Some(initial) => Ok(initial.to_vec()),
+        None => Ok(vec![0.0; n]),
+    }
+}
+
+/// A preconditioner application with the length checked, so a wrong-sized `M` fails loudly
+/// instead of truncating a zip.
+fn apply_preconditioner<M>(preconditioner: &M, v: &[f64]) -> SparseResult<Vec<f64>>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let z = preconditioner(v)?;
+    if z.len() != v.len() {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "preconditioner returned {} entries for a vector of {}",
+                z.len(),
+                v.len()
+            ),
+        });
+    }
+    Ok(z)
+}
+
+/// LAPACK `dlartg` (the 3.10+ algorithm SciPy's bundled LAPACK runs): `c`, `s`, `r` with
+/// `[c s; −s c]·[f; g] = [r; 0]`, `r` carrying the sign of `f`.
+fn lapack_lartg(f: f64, g: f64) -> (f64, f64, f64) {
+    let safmin = f64::MIN_POSITIVE;
+    let safmax = 1.0 / safmin;
+    let rtmin = safmin.sqrt();
+    let rtmax = (safmax / 2.0).sqrt();
+    let (f1, g1) = (f.abs(), g.abs());
+    if g == 0.0 {
+        (1.0, 0.0, f)
+    } else if f == 0.0 {
+        (0.0, 1.0_f64.copysign(g), g1)
+    } else if f1 > rtmin && f1 < rtmax && g1 > rtmin && g1 < rtmax {
+        let d = (f * f + g * g).sqrt();
+        let r = d.copysign(f);
+        (f1 / d, g / r, r)
+    } else {
+        let u = safmin.max(f1).max(g1).min(safmax);
+        let (fs, gs) = (f / u, g / u);
+        let d = (fs * fs + gs * gs).sqrt();
+        let r = d.copysign(f);
+        (fs.abs() / d, gs / r, r * u)
+    }
+}
+
+/// Restarted GMRES with a LEFT preconditioner: SciPy 1.17.1's
+/// `scipy.sparse.linalg.gmres(A, b, M=M, restart=restart, rtol=tol, atol=0)`, ported step for
+/// step (modified Gram–Schmidt on `M⁻¹A`, LAPACK `lartg` Givens rotations, and SciPy's gh-8400
+/// inner tolerance `ptol` that tightens or relaxes between restarts). `preconditioner` is
+/// SciPy's `M.matvec`, e.g. `|r| ilu.solve(r)` for `M = spilu(A)`.
+///
+/// `restart` defaults to 20 (SciPy's default, capped at n); `options.max_iter` counts restart
+/// CYCLES as SciPy's `maxiter` does (default 10n). `iterations` is the number of inner Arnoldi
+/// steps, SciPy's `callback_type='pr_norm'` count. Convergence is SciPy's: the TRUE residual
+/// `‖b − A·x‖ ≤ tol·‖b‖` after a cycle.
+///
+/// The existing unpreconditioned [`gmres`] keeps its own restart length and is not this port.
+///
+/// # Errors
+/// Shape and input errors as [`gmres`], `InvalidArgument` for `restart == Some(0)`, and any
+/// error the preconditioner returns.
+pub fn gmres_preconditioned<M>(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: M,
+    x0: Option<&[f64]>,
+    restart: Option<usize>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = preconditioned_krylov_start("GMRES", a, b, x0, options)?;
+    if restart == Some(0) {
+        return Err(SparseError::InvalidArgument {
+            message: "GMRES restart must be at least 1".to_string(),
+        });
+    }
+    let n = b.len();
+    let b_norm = vec_norm(b);
+    if rhs_is_zero(b_norm) {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            // status: ‖b‖ = 0, so x = 0 solves exactly (SciPy returns b)
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let atol = options.tol * b_norm;
+    let eps = f64::EPSILON;
+    let max_cycles = options.max_iter.unwrap_or(n * 10);
+    let restart = restart.unwrap_or(20).min(n);
+
+    let mb_norm = vec_norm(&apply_preconditioner(&preconditioner, b)?);
+    let mut ptol_max_factor = 1.0_f64;
+    let mut ptol = mb_norm * ptol_max_factor.min(atol / b_norm);
+    let mut presid = 0.0_f64;
+    let mut v = vec![vec![0.0; n]; restart + 1];
+    let mut h = vec![vec![0.0; restart + 1]; restart];
+    let mut givens = vec![(0.0_f64, 0.0_f64); restart];
+    let mut inner = 0usize;
+    let mut r = if x.iter().any(|&value| value != 0.0) {
+        let ax = csr_matvec(a, &x);
+        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
+    } else {
+        b.to_vec()
+    };
+    if vec_norm(&r) < atol {
+        let residual_norm = vec_norm(&r) / b_norm;
+        return Ok(IterativeSolveResult {
+            solution: x,
+            // status: ‖b − A·x0‖ < tol·‖b‖ before any step
+            converged: true,
+            iterations: 0,
+            residual_norm,
+        });
+    }
+    let mut r_norm = f64::INFINITY;
+    let mut av = vec![0.0; n];
+    for _cycle in 0..max_cycles {
+        v[0] = apply_preconditioner(&preconditioner, &r)?;
+        let beta = vec_norm(&v[0]);
+        let inverse = 1.0 / beta;
+        v[0].iter_mut().for_each(|value| *value *= inverse);
+        let mut s = vec![0.0; restart + 1];
+        s[0] = beta;
+        let mut breakdown = false;
+        let mut col = 0;
+        for column in 0..restart {
+            col = column;
+            csr_matvec_into(a, &v[col], &mut av);
+            let mut w = apply_preconditioner(&preconditioner, &av)?;
+            let h0 = vec_norm(&w);
+            for k in 0..=col {
+                let projection = dot_product(&v[k], &w);
+                h[col][k] = projection;
+                subtract_scaled_basis_vector(&mut w, projection, &v[k]);
+            }
+            let h1 = vec_norm(&w);
+            h[col][col + 1] = h1;
+            if h1 <= eps * h0 {
+                h[col][col + 1] = 0.0;
+                breakdown = true;
+                v[col + 1] = w;
+            } else {
+                let inverse = 1.0 / h1;
+                w.iter_mut().for_each(|value| *value *= inverse);
+                v[col + 1] = w;
+            }
+            for k in 0..col {
+                let (c, sn) = givens[k];
+                let (n0, n1) = (h[col][k], h[col][k + 1]);
+                h[col][k] = c * n0 + sn * n1;
+                h[col][k + 1] = -sn * n0 + c * n1;
+            }
+            let (c, sn, magnitude) = lapack_lartg(h[col][col], h[col][col + 1]);
+            givens[col] = (c, sn);
+            h[col][col] = magnitude;
+            h[col][col + 1] = 0.0;
+            let rotated = -sn * s[col];
+            s[col] *= c;
+            s[col + 1] = rotated;
+            presid = rotated.abs();
+            inner += 1;
+            if presid <= ptol || breakdown {
+                break;
+            }
+        }
+        if h[col][col] == 0.0 {
+            s[col] = 0.0;
+        }
+        let mut y = s[..=col].to_vec();
+        for k in (1..=col).rev() {
+            if y[k] != 0.0 {
+                y[k] /= h[k][k];
+                let coefficient = y[k];
+                for i in 0..k {
+                    y[i] -= coefficient * h[k][i];
+                }
+            }
+        }
+        if y[0] != 0.0 {
+            y[0] /= h[0][0];
+        }
+        for (coefficient, basis) in y.iter().zip(&v) {
+            for (xi, bi) in x.iter_mut().zip(basis) {
+                *xi += coefficient * bi;
+            }
+        }
+        let ax = csr_matvec(a, &x);
+        r = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
+        r_norm = vec_norm(&r);
+        if r_norm <= atol || breakdown {
+            break;
+        }
+        if presid <= ptol {
+            ptol_max_factor = eps.max(0.25 * ptol_max_factor);
+        } else {
+            ptol_max_factor = (1.5 * ptol_max_factor).min(1.0);
+        }
+        ptol = presid * ptol_max_factor.min(atol / r_norm);
+    }
+    Ok(IterativeSolveResult {
+        solution: x,
+        // status: SciPy's `info = 0 if rnorm <= atol`
+        converged: r_norm <= atol,
+        iterations: inner,
+        residual_norm: r_norm / b_norm,
+    })
+}
+
+/// BiCGSTAB with a preconditioner: SciPy 1.17.1's
+/// `scipy.sparse.linalg.bicgstab(A, b, M=M, rtol=tol, atol=0)` ported step for step, including
+/// its breakdown tests (`|ρ| < ε²`, `|ω| < ε²`, `r̃ᵀv = 0`) and its half-step exit when
+/// `‖s‖ < tol·‖b‖`. `preconditioner` is SciPy's `M.matvec`.
+///
+/// `options.max_iter` defaults to 10n as SciPy's does. `iterations` counts the iterations
+/// entered, a half-step exit included (SciPy's callback count plus that last partial one).
+///
+/// # Errors
+/// Shape and input errors as [`bicgstab`], and any error the preconditioner returns.
+pub fn bicgstab_preconditioned<M>(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: M,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = preconditioned_krylov_start("BiCGSTAB", a, b, x0, options)?;
+    let n = b.len();
+    let b_norm = vec_norm(b);
+    if rhs_is_zero(b_norm) {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            // status: ‖b‖ = 0, so x = 0 solves exactly (SciPy returns b)
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let atol = options.tol * b_norm;
+    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let breakdown_tol = f64::EPSILON * f64::EPSILON;
+    let mut r: Vec<f64> = if x.iter().any(|&value| value != 0.0) {
+        let ax = csr_matvec(a, &x);
+        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
+    } else {
+        b.to_vec()
+    };
+    let r_tilde = r.clone();
+    let mut p = vec![0.0; n];
+    let mut v = vec![0.0; n];
+    let mut t = vec![0.0; n];
+    let (mut rho_prev, mut omega, mut alpha) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let finish = |x: Vec<f64>, r: &[f64], converged: bool, iterations: usize| {
+        let residual_norm = vec_norm(r) / b_norm;
+        IterativeSolveResult {
+            solution: x,
+            converged,
+            iterations,
+            residual_norm,
+        }
+    };
+    for iteration in 0..max_iter {
+        if vec_norm(&r) < atol {
+            // status: ‖r‖ < tol·‖b‖
+            return Ok(finish(x, &r, true, iteration));
+        }
+        let rho = dot_product(&r_tilde, &r);
+        if rho.abs() < breakdown_tol {
+            // status: ρ breakdown (SciPy info −10)
+            return Ok(finish(x, &r, false, iteration));
+        }
+        if iteration > 0 {
+            if omega.abs() < breakdown_tol {
+                // status: ω breakdown (SciPy info −11)
+                return Ok(finish(x, &r, false, iteration));
+            }
+            let beta = (rho / rho_prev) * (alpha / omega);
+            for i in 0..n {
+                p[i] -= omega * v[i];
+                p[i] *= beta;
+                p[i] += r[i];
+            }
+        } else {
+            p.copy_from_slice(&r);
+        }
+        let p_hat = apply_preconditioner(&preconditioner, &p)?;
+        csr_matvec_into(a, &p_hat, &mut v);
+        let rv = dot_product(&r_tilde, &v);
+        if rv == 0.0 {
+            // status: r̃ᵀv = 0 breakdown (SciPy info −11)
+            return Ok(finish(x, &r, false, iteration));
+        }
+        alpha = rho / rv;
+        for (ri, vi) in r.iter_mut().zip(&v) {
+            *ri -= alpha * vi;
+        }
+        if vec_norm(&r) < atol {
+            for (xi, pi) in x.iter_mut().zip(&p_hat) {
+                *xi += alpha * pi;
+            }
+            // status: ‖s‖ < tol·‖b‖ at the half step
+            return Ok(finish(x, &r, true, iteration + 1));
+        }
+        let s_hat = apply_preconditioner(&preconditioner, &r)?;
+        csr_matvec_into(a, &s_hat, &mut t);
+        omega = dot_product(&t, &r) / dot_product(&t, &t);
+        for i in 0..n {
+            x[i] += alpha * p_hat[i];
+        }
+        for i in 0..n {
+            x[i] += omega * s_hat[i];
+        }
+        for (ri, ti) in r.iter_mut().zip(&t) {
+            *ri -= omega * ti;
+        }
+        rho_prev = rho;
+    }
+    // status: SciPy returns `info = maxiter` here without re-testing the last residual.
+    Ok(finish(x, &r, false, max_iter))
+}
 
 /// GMRES (Generalized Minimal Residual) solver for general (non-symmetric) sparse systems.
 ///
@@ -11821,8 +13885,9 @@ fn elimination_tree_of_permuted(a: &CsrMatrix, perm: &[usize]) -> Vec<usize> {
 /// Postorder of the forest described by `parent`, children visited in increasing order.
 ///
 /// Iterative so a deep tree cannot blow the stack -- an n=4096 banded matrix produces a chain
-/// thousands deep, which a recursive DFS would not survive.
-#[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
+/// thousands deep, which a recursive DFS would not survive. Children ascending and roots
+/// ascending is SuperLU's `TreePostorder` order, which `spilu` relies on to postorder its column
+/// elimination tree as `sp_preorder` does.
 fn postorder_forest(parent: &[usize]) -> Vec<usize> {
     let n = parent.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -15234,6 +17299,11 @@ mod tests {
         assert_eq!(options.ordering, PermutationOrdering::Colamd);
         assert!((options.drop_tol - 1e-4).abs() <= f64::EPSILON);
         assert!((options.fill_factor - 10.0).abs() <= f64::EPSILON);
+        // SuperLU ilu_set_default_options / sp_ienv, which SciPy uses for `None`.
+        assert_eq!(options.drop_rule.bits(), 0x0009);
+        assert!((options.diag_pivot_thresh - 0.1).abs() <= f64::EPSILON);
+        assert_eq!(options.relax, 10);
+        assert_eq!(options.panel_size, 20);
     }
 
     #[test]
@@ -15679,180 +17749,491 @@ mod tests {
         assert!(matches!(err, SparseError::InvalidShape { .. }));
     }
 
+    /// SciPy 1.17.1's `spilu` accepts what SuperLU accepts (measured live): a negative
+    /// `drop_tol` (nothing then falls under it) and a `fill_factor` below 1. It fails with
+    /// "gstrf was called with invalid arguments" at `fill_factor=-1` and HANGS at 0 and at
+    /// `panel_size=0`, so those, and non-finite values, are refused here instead.
     #[test]
-    fn spilu_rejects_negative_drop_tol() {
-        let a = square_csc();
-        let options = IluOptions {
-            drop_tol: -1e-6,
-            ..IluOptions::default()
-        };
-        let err = spilu(&a, options).expect_err("negative drop_tol");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    fn spilu_option_domain_follows_scipy_and_refuses_what_hangs_it() {
+        let a = spilu_convection_diffusion_csc(8, 1.5, 1.5);
+        for options in [
+            IluOptions {
+                drop_tol: -1e-6,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: 0.5,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                drop_rule: IluDropRule::NONE,
+                ..IluOptions::default()
+            },
+        ] {
+            spilu(&a, options).expect("SciPy accepts this option value");
+        }
+        for options in [
+            IluOptions {
+                drop_tol: f64::NAN,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: 0.0,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: -1.0,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: f64::INFINITY,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                diag_pivot_thresh: f64::NAN,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                panel_size: 0,
+                ..IluOptions::default()
+            },
+        ] {
+            let err = spilu(&a, options).expect_err("refused option value");
+            assert!(
+                matches!(err, SparseError::InvalidArgument { .. }),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
-    fn spilu_rejects_fill_factor_below_one() {
-        let a = square_csc();
-        let options = IluOptions {
-            fill_factor: 0.9,
-            ..IluOptions::default()
-        };
-        let err = spilu(&a, options).expect_err("fill factor");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    fn spilu_drop_rule_parses_scipy_names_and_superlu_bits() {
+        assert_eq!(
+            IluDropRule::from_scipy_spec("basic,area").expect("default spelling"),
+            IluDropRule::default()
+        );
+        assert_eq!(
+            IluDropRule::from_scipy_spec(" Dynamic , INTERP,prows")
+                .expect("case, spaces")
+                .bits(),
+            0x0112
+        );
+        // SuperLU's SECONDARY is PROWS | COLUMN | AREA, not a bit of its own.
+        assert_eq!(
+            IluDropRule::from_scipy_spec("secondary")
+                .expect("secondary")
+                .bits(),
+            0x000E
+        );
+        assert!(IluDropRule::default().intersects(IluDropRule::SECONDARY));
+        assert!(IluDropRule::from_scipy_spec("").is_err());
+        assert!(IluDropRule::from_scipy_spec("basic,bogus").is_err());
+        assert_eq!(
+            IluDropRule::from_bits(0x0119).expect("valid bits").bits(),
+            0x0119
+        );
+        assert!(IluDropRule::from_bits(0x0200).is_err());
     }
 
-    #[test]
-    fn spilu_valid_input_succeeds() {
-        // ILU(0) now implemented — verify it produces a factorization
-        let a = square_csc();
-        let ilu = spilu(&a, IluOptions::default()).expect("spilu should succeed");
-        assert_eq!(ilu.shape, (a.shape().rows, a.shape().cols));
-    }
-
-    fn spilu_reference_find_index(
-        indices: &[usize],
-        indptr: &[usize],
-        row: usize,
-        col: usize,
-    ) -> Option<usize> {
-        (indptr[row]..indptr[row + 1]).find(|&idx| indices[idx] == col)
-    }
-
-    fn spilu_reference_linear_scan(a: &CscMatrix) -> SparseResult<SparseIluFactorization> {
-        let csr = a.to_csr()?;
-        let n = csr.shape().rows;
-        let lu_indptr = csr.indptr();
-        let lu_indices = csr.indices();
-        let mut lu_data = csr.data().to_vec();
-
-        for i in 0..n {
-            for idx_ik in lu_indptr[i]..lu_indptr[i + 1] {
-                let k = lu_indices[idx_ik];
-                if k >= i {
-                    break;
+    /// 2-D convection–diffusion on an m×m grid, central differences scaled by h²: `4` on the
+    /// diagonal, `−1 ∓ cx` on the x neighbours and `−1 ∓ cy` on the y neighbours (`c = pe·h/2`).
+    /// `(40, 0.4, 0.0)` is exactly the bead's reference matrix
+    /// `kron(I, diags([−1.4, 4, −0.6])) + kron(diags([−1, −1], [−1, 1]), I)`.
+    fn spilu_convection_diffusion_csc(m: usize, cx: f64, cy: f64) -> CscMatrix {
+        let n = m * m;
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..m {
+            for i in 0..m {
+                let k = j * m + i;
+                let mut push = |col: usize, value: f64| {
+                    rows.push(k);
+                    cols.push(col);
+                    data.push(value);
+                };
+                push(k, 4.0);
+                if i > 0 {
+                    push(k - 1, -1.0 - cx);
                 }
-
-                let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-                if pivot_is_zero(diag_k) {
-                    return Err(SparseError::SingularMatrix {
-                        message: format!("zero pivot at row {k} during ILU(0)"),
-                    });
+                if i + 1 < m {
+                    push(k + 1, -1.0 + cx);
                 }
-
-                lu_data[idx_ik] /= diag_k;
-                let multiplier = lu_data[idx_ik];
-
-                for idx_kj in lu_indptr[k]..lu_indptr[k + 1] {
-                    let j = lu_indices[idx_kj];
-                    if j <= k {
-                        continue;
-                    }
-                    let a_kj = lu_data[idx_kj];
-
-                    if let Some(idx_ij) = spilu_reference_find_index(lu_indices, lu_indptr, i, j) {
-                        lu_data[idx_ij] -= multiplier * a_kj;
-                    }
+                if j > 0 {
+                    push(k - m, -1.0 - cy);
+                }
+                if j + 1 < m {
+                    push(k + m, -1.0 + cy);
                 }
             }
         }
-
-        let mut l_data = Vec::new();
-        let mut l_indices = Vec::new();
-        let mut l_indptr = vec![0usize];
-        let mut u_data = Vec::new();
-        let mut u_indices = Vec::new();
-        let mut u_indptr = vec![0usize];
-
-        for i in 0..n {
-            for idx in lu_indptr[i]..lu_indptr[i + 1] {
-                let j = lu_indices[idx];
-                if j < i {
-                    l_data.push(lu_data[idx]);
-                    l_indices.push(j);
-                }
-            }
-            l_data.push(1.0);
-            l_indices.push(i);
-            l_indptr.push(l_data.len());
-
-            for idx in lu_indptr[i]..lu_indptr[i + 1] {
-                let j = lu_indices[idx];
-                if j >= i {
-                    u_data.push(lu_data[idx]);
-                    u_indices.push(j);
-                }
-            }
-            u_indptr.push(u_data.len());
-        }
-
-        Ok(SparseIluFactorization {
-            shape: (n, n),
-            backend_used: SparseBackend::Auto,
-            ordering_used: IluOptions::default().ordering,
-            l_data,
-            l_indices,
-            l_indptr,
-            u_data,
-            u_indices,
-            u_indptr,
-            n,
-        })
-    }
-
-    fn spilu_banded_csc(n: usize, half_bandwidth: usize) -> CscMatrix {
-        let entries_per_row = half_bandwidth.saturating_mul(2).saturating_add(1);
-        let mut data = Vec::with_capacity(n.saturating_mul(entries_per_row));
-        let mut rows = Vec::with_capacity(data.capacity());
-        let mut cols = Vec::with_capacity(data.capacity());
-
-        for row in 0..n {
-            let start = row.saturating_sub(half_bandwidth);
-            let end = row.saturating_add(half_bandwidth).min(n.saturating_sub(1));
-            for col in start..=end {
-                rows.push(row);
-                cols.push(col);
-                if row == col {
-                    data.push(entries_per_row as f64 + 2.0 + (row % 17) as f64 * 0.001);
-                } else {
-                    data.push(-1.0 / (row.abs_diff(col) + 1) as f64);
-                }
-            }
-        }
-
         CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
-            .expect("spilu banded coo")
+            .expect("convection-diffusion coo")
             .to_csc()
-            .expect("spilu banded csc")
+            .expect("convection-diffusion csc")
     }
 
-    fn float_bits(values: &[f64]) -> Vec<u64> {
-        values.iter().map(|value| value.to_bits()).collect()
-    }
-
-    fn assert_spilu_factors_same_bits(
-        actual: &SparseIluFactorization,
-        expected: &SparseIluFactorization,
-    ) {
-        assert_eq!(actual.shape, expected.shape);
-        assert_eq!(actual.backend_used, expected.backend_used);
-        assert_eq!(actual.ordering_used, expected.ordering_used);
-        assert_eq!(actual.n, expected.n);
-        assert_eq!(actual.l_indptr, expected.l_indptr);
-        assert_eq!(actual.l_indices, expected.l_indices);
-        assert_eq!(float_bits(&actual.l_data), float_bits(&expected.l_data));
-        assert_eq!(actual.u_indptr, expected.u_indptr);
-        assert_eq!(actual.u_indices, expected.u_indices);
-        assert_eq!(float_bits(&actual.u_data), float_bits(&expected.u_data));
-    }
-
-    #[test]
-    fn spilu_row_workspace_matches_linear_scan_factor_bits() {
-        for &(n, half_bandwidth) in &[(16usize, 3usize), (64, 5), (160, 7)] {
-            let matrix = spilu_banded_csc(n, half_bandwidth);
-            let actual = spilu(&matrix, IluOptions::default()).expect("workspace spilu");
-            let expected = spilu_reference_linear_scan(&matrix).expect("reference spilu");
-            assert_spilu_factors_same_bits(&actual, &expected);
+    /// The bead's negative case 1: diagonal 0, sub-diagonal −1, super-diagonal +1.
+    fn spilu_zero_diagonal_skew_tridiagonal_csc(n: usize) -> CscMatrix {
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0);
+            }
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                data.push(1.0);
+            }
         }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("skew coo")
+            .to_csc()
+            .expect("skew csc")
+    }
+
+    /// `max |(Pr·A·Pc − L·U)_ij| / max |A_ij|`, densely.
+    fn spilu_factor_relative_error(a: &CscMatrix, ilu: &SparseIluFactorization) -> f64 {
+        let n = a.shape().rows;
+        let dense_a = csc_to_dense(a);
+        let (l, u) = (csc_to_dense(ilu.l()), csc_to_dense(ilu.u()));
+        let mut worst = 0.0_f64;
+        let a_max = dense_a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        for row in 0..n {
+            for col in 0..n {
+                // (Pr·A·Pc)[perm_r[i], perm_c[j]] = A[i, j].
+                let mut lu = 0.0;
+                let (step_row, step_col) = (ilu.perm_r()[row], ilu.perm_c()[col]);
+                for k in 0..n {
+                    lu += l[step_row * n + k] * u[k * n + step_col];
+                }
+                worst = worst.max((dense_a[row * n + col] - lu).abs());
+            }
+        }
+        worst / a_max
+    }
+
+    fn spilu_is_permutation(p: &[usize]) -> bool {
+        let mut seen = vec![false; p.len()];
+        p.iter()
+            .all(|&i| i < p.len() && !std::mem::replace(&mut seen[i], true))
+    }
+
+    /// The bead's unit test: with nothing dropped (drop_tol = 0, a fill factor no quota can
+    /// bind), ILUTP IS LU with threshold partial pivoting, so Pr·A·Pc = L·U to rounding, under
+    /// every ordering. The must-miss arm: the default drop_tol on the same matrix drops entries
+    /// and leaves a visible error, so the check can tell exact from incomplete.
+    #[test]
+    fn spilu_is_exact_lu_when_nothing_is_dropped() {
+        let a = spilu_convection_diffusion_csc(10, 2.7, 1.3);
+        for ordering in [
+            PermutationOrdering::Colamd,
+            PermutationOrdering::Natural,
+            PermutationOrdering::MmdAta,
+            PermutationOrdering::MmdAtPlusA,
+            PermutationOrdering::Amd,
+            PermutationOrdering::ReverseCuthillMcKee,
+        ] {
+            let exact = spilu(
+                &a,
+                IluOptions {
+                    ordering,
+                    drop_tol: 0.0,
+                    fill_factor: 1e6,
+                    ..IluOptions::default()
+                },
+            )
+            .expect("exact factorization");
+            assert!(spilu_is_permutation(exact.perm_r()) && spilu_is_permutation(exact.perm_c()));
+            let error = spilu_factor_relative_error(&a, &exact);
+            assert!(
+                error <= 1e-12,
+                "{ordering:?}: drop_tol=0 must be exact, ‖PrAPc − LU‖/‖A‖ = {error:e}"
+            );
+            assert_eq!(exact.statistics.dropped_u_entries, 0);
+            assert_eq!(exact.statistics.dropped_l_entries, 0);
+        }
+        let incomplete = spilu(
+            &a,
+            IluOptions {
+                drop_tol: 1e-1,
+                ..IluOptions::default()
+            },
+        )
+        .expect("incomplete factorization");
+        assert!(
+            incomplete.statistics.dropped_u_entries + incomplete.statistics.dropped_l_entries > 0
+        );
+        assert!(
+            spilu_factor_relative_error(&a, &incomplete) > 1e-6,
+            "drop_tol=0.1 must leave a visible factorization error"
+        );
+        assert_eq!(incomplete.ordering_used, PermutationOrdering::Colamd);
+        assert_eq!(incomplete.backend_used, SparseBackend::NativeIlutp);
+    }
+
+    /// `Colamd` is SuperLU's COLAMD followed by `sp_preorder`'s etree postorder, so `perm_c` is
+    /// SciPy's to the index. The pin is SciPy 1.17.1's own `spilu(A).perm_c` on the 6×6 member of
+    /// the bead's matrix family (measured live, not taken from this code), where it also returns
+    /// nnz(L+U) = 372. The must-differ arm: fsci's exact minimum degree on AᵀA (`MmdAta`) is a
+    /// different ordering, so the pin can tell COLAMD from another reasonable ordering.
+    #[test]
+    fn spilu_colamd_perm_c_is_scipys() {
+        let a = spilu_convection_diffusion_csc(6, 0.4, 0.0);
+        let scipy_perm_c: [usize; 36] = [
+            12, 14, 33, 35, 2, 0, 13, 15, 34, 32, 3, 1, 16, 19, 30, 31, 25, 28, 17, 18, 20, 26, 27,
+            29, 10, 11, 21, 22, 7, 6, 8, 9, 23, 24, 5, 4,
+        ];
+        let ilu = spilu(&a, IluOptions::default()).expect("spilu");
+        assert_eq!(ilu.ordering_used, PermutationOrdering::Colamd);
+        assert_eq!(ilu.perm_c(), &scipy_perm_c);
+        let mmd = spilu(
+            &a,
+            IluOptions {
+                ordering: PermutationOrdering::MmdAta,
+                ..IluOptions::default()
+            },
+        )
+        .expect("spilu mmd");
+        assert_ne!(mmd.perm_c(), &scipy_perm_c);
+    }
+
+    /// The bead's negative case 1 at unit scale: every diagonal entry of A is zero, so ILU(0)
+    /// — and any ILU that takes the diagonal — meets a zero pivot at the first column. ILUTP must
+    /// pivot away from it, stay exact (the factor of a tridiagonal has no dropped fill here), and
+    /// precondition GMRES to 1e-10.
+    #[test]
+    fn spilu_pivots_away_from_a_zero_diagonal() {
+        let n = 100;
+        let a = spilu_zero_diagonal_skew_tridiagonal_csc(n);
+        let ilu = spilu(&a, IluOptions::default()).expect("ILUTP pivots off the zero diagonal");
+        assert!(
+            ilu.statistics.off_diagonal_pivots >= n / 2,
+            "the zero diagonal can never be the pivot: {:?}",
+            ilu.statistics
+        );
+        assert_eq!(ilu.statistics.zero_pivots, 0);
+        assert!(spilu_factor_relative_error(&a, &ilu) <= 1e-12);
+        let csr = a.to_csr().expect("csr");
+        let b = vec![1.0; n];
+        let result = gmres_preconditioned(
+            &csr,
+            &b,
+            |r: &[f64]| ilu.solve(r),
+            None,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-10,
+                max_iter: Some(20),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("preconditioned gmres");
+        assert!(result.converged, "{result:?}");
+        assert!(relative_residual(&csr, &b, &result.solution) <= 1e-10);
+        // The same matrix with a pivot threshold of 0 on a nonzero diagonal would keep the
+        // diagonal; here there is none to keep, so a threshold of 0 must still pivot.
+        let forced = spilu(
+            &a,
+            IluOptions {
+                diag_pivot_thresh: 0.0,
+                ..IluOptions::default()
+            },
+        )
+        .expect("threshold 0 still cannot pivot on an exact zero");
+        assert!(forced.statistics.off_diagonal_pivots >= n / 2);
+    }
+
+    /// `diag_pivot_thresh` means what SciPy's does: 1e-300 on the diagonal is kept at
+    /// threshold 0 and replaced by the larger off-diagonal entry at the default 0.1 (SciPy
+    /// 1.17.1 on [[1e-300, 1], [1, 1]] returns perm_r = [1, 0]).
+    #[test]
+    fn spilu_threshold_pivoting_prefers_the_diagonal_only_above_the_threshold() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1e-300, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csc()
+        .expect("csc");
+        let natural = IluOptions {
+            ordering: PermutationOrdering::Natural,
+            ..IluOptions::default()
+        };
+        let pivoted = spilu(&a, natural).expect("default threshold");
+        assert_eq!(pivoted.perm_r(), &[1, 0]);
+        let kept = spilu(
+            &a,
+            IluOptions {
+                diag_pivot_thresh: 0.0,
+                ..natural
+            },
+        )
+        .expect("threshold 0");
+        assert_eq!(kept.perm_r(), &[0, 1]);
+    }
+
+    /// A structurally singular pivot: SciPy raises "Factor is exactly singular" for
+    /// [[1, 1], [1, 1]]; Strict mode refuses the same way, Hardened replaces the pivot the way
+    /// SuperLU does internally and reports it.
+    #[test]
+    fn spilu_zero_pivot_fails_strict_and_is_replaced_hardened() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csc()
+        .expect("csc");
+        let err = spilu(&a, IluOptions::default()).expect_err("SciPy raises here");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+        let hardened = spilu(
+            &a,
+            IluOptions {
+                mode: RuntimeMode::Hardened,
+                ..IluOptions::default()
+            },
+        )
+        .expect("hardened fills the pivot");
+        assert_eq!(hardened.statistics.zero_pivots, 1);
+        let x = hardened.solve(&[1.0, 2.0]).expect("finite solve");
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    /// The bead's negative case 2 (unit form, on the bead's own matrix family): nnz(L+U) grows
+    /// strictly as drop_tol falls, and fill_factor bounds it. SciPy 1.17.1 on the bead's matrix
+    /// gives 17326 / 31508 / 52188 / 59159; the live comparison is in
+    /// `diff_sparse_spilu_ilutp`. The cap `fill_factor·nnz(A) + n` is not a SuperLU guarantee —
+    /// SciPy itself exceeds it at fill_factor = 1 (9451 > 9440 on the bead's matrix) — so it is
+    /// asserted from fill_factor = 2 up.
+    #[test]
+    fn spilu_fill_grows_as_drop_tol_falls_and_fill_factor_caps_it() {
+        let a = spilu_convection_diffusion_csc(40, 0.4, 0.0);
+        let n = a.shape().rows;
+        let mut previous = 0;
+        for drop_tol in [1e-1, 1e-2, 1e-4, 1e-6] {
+            let ilu = spilu(
+                &a,
+                IluOptions {
+                    drop_tol,
+                    fill_factor: 20.0,
+                    ..IluOptions::default()
+                },
+            )
+            .expect("spilu");
+            let nnz = ilu.lu_nnz();
+            assert!(
+                nnz > previous,
+                "drop_tol={drop_tol}: {nnz} after {previous}"
+            );
+            previous = nnz;
+        }
+        for fill_factor in [2.0, 5.0, 10.0, 20.0] {
+            for drop_tol in [0.0, 1e-4] {
+                let ilu = spilu(
+                    &a,
+                    IluOptions {
+                        drop_tol,
+                        fill_factor,
+                        ..IluOptions::default()
+                    },
+                )
+                .expect("spilu");
+                let cap = fill_factor * a.nnz() as f64 + n as f64;
+                assert!(
+                    ilu.lu_nnz() as f64 <= cap,
+                    "fill_factor={fill_factor} drop_tol={drop_tol}: {} > {cap}",
+                    ilu.lu_nnz()
+                );
+            }
+        }
+    }
+
+    /// The factor is scale-covariant like SciPy's: scaling A by 2^-60 leaves L's bits alone and
+    /// scales U's exactly, and `solve` scales back, because every drop and pivot test is relative.
+    #[test]
+    fn spilu_is_scale_covariant() {
+        let a = spilu_convection_diffusion_csc(12, 3.0, 2.0);
+        let scale = 2.0_f64.powi(-60);
+        let scaled = CscMatrix::from_components(
+            a.shape(),
+            a.data().iter().map(|v| v * scale).collect(),
+            a.indices().to_vec(),
+            a.indptr().to_vec(),
+            false,
+        )
+        .expect("scaled");
+        let unit = spilu(&a, IluOptions::default()).expect("unit");
+        let small = spilu(&scaled, IluOptions::default()).expect("scaled");
+        assert_eq!(unit.l().indices(), small.l().indices());
+        assert_eq!(
+            unit.l()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            small
+                .l()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unit.u()
+                .data()
+                .iter()
+                .map(|v| (v * scale).to_bits())
+                .collect::<Vec<_>>(),
+            small
+                .u()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The preconditioned Krylov ports against a direct solve, and a must-differ arm: the
+    /// ILUTP preconditioner has to cut GMRES's inner iterations on convection–diffusion, or the
+    /// preconditioner argument is not being applied.
+    #[test]
+    fn preconditioned_gmres_and_bicgstab_converge_with_spilu() {
+        let a = spilu_convection_diffusion_csc(20, 2.4, 2.4);
+        let n = a.shape().rows;
+        let csr = a.to_csr().expect("csr");
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 5) as f64).collect();
+        let ilu = spilu(&a, IluOptions::default()).expect("spilu");
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        };
+        let with_m = gmres_preconditioned(&csr, &b, |r: &[f64]| ilu.solve(r), None, None, options)
+            .expect("gmres M");
+        let identity = |r: &[f64]| -> SparseResult<Vec<f64>> { Ok(r.to_vec()) };
+        let without_m =
+            gmres_preconditioned(&csr, &b, identity, None, None, options).expect("gmres I");
+        assert!(with_m.converged && without_m.converged);
+        assert!(relative_residual(&csr, &b, &with_m.solution) <= 1e-10);
+        assert!(
+            with_m.iterations * 4 < without_m.iterations,
+            "ILUTP must cut GMRES iterations: {} with M, {} without",
+            with_m.iterations,
+            without_m.iterations
+        );
+        let bicg = bicgstab_preconditioned(&csr, &b, |r: &[f64]| ilu.solve(r), None, options)
+            .expect("bicgstab M");
+        assert!(bicg.converged, "{bicg:?}");
+        assert!(relative_residual(&csr, &b, &bicg.solution) <= 1e-10);
+        let wrong_length = |r: &[f64]| -> SparseResult<Vec<f64>> { Ok(r[1..].to_vec()) };
+        assert!(gmres_preconditioned(&csr, &b, wrong_length, None, None, options).is_err());
     }
 
     #[test]
@@ -24984,7 +27365,7 @@ mod tests {
     /// A scale that is an exact power of two, chosen to land every pivot of the
     /// fixtures below well under the absolute floor `f64::EPSILON * 100.0`
     /// (2.22e-14) that the pivot guards used to apply. Scaling by a power of two
-    /// commutes with round-to-nearest, so a triangular solve and an ILU(0)
+    /// commutes with round-to-nearest, so a triangular solve and an incomplete-LU
     /// elimination on the scaled system owe a BIT-IDENTICAL answer — there is no
     /// tolerance here to argue about.
     const PIVOT_GUARD_SCALE: f64 = 8.673_617_379_884_035e-19; // 2^-60
@@ -25105,28 +27486,30 @@ mod tests {
         let unit = spd_uneven_row_csr(n);
         let scaled = scale_csr(&unit, PIVOT_GUARD_SCALE);
         let unit_ilu = spilu(&unit.to_csc().expect("csc"), IluOptions::default())
-            .expect("the unscaled ILU(0) is ordinary");
+            .expect("the unscaled ILU is ordinary");
         let scaled_ilu = spilu(&scaled.to_csc().expect("csc"), IluOptions::default()).expect(
             "SciPy's spilu factors this matrix at 2^-60; an absolute pivot floor is the \
              only reason we would not",
         );
 
         // The L multipliers are ratios of scaled quantities, so they are
-        // unchanged; the U entries carry the scale factor exactly.
+        // unchanged; the U entries carry the scale factor exactly. (Every ILUTP drop and
+        // pivot test is relative, so the same entries survive at both scales.)
         assert_eq!(
-            float_bits_fingerprint(&unit_ilu.l_data),
-            float_bits_fingerprint(&scaled_ilu.l_data),
-            "ILU(0) multipliers are ratios and must not move with the matrix scale"
+            float_bits_fingerprint(unit_ilu.l().data()),
+            float_bits_fingerprint(scaled_ilu.l().data()),
+            "ILU multipliers are ratios and must not move with the matrix scale"
         );
         let rescaled_u: Vec<f64> = unit_ilu
-            .u_data
+            .u()
+            .data()
             .iter()
             .map(|value| value * PIVOT_GUARD_SCALE)
             .collect();
         assert_eq!(
             float_bits_fingerprint(&rescaled_u),
-            float_bits_fingerprint(&scaled_ilu.u_data),
-            "ILU(0) U entries must scale exactly with the matrix, as SciPy's do"
+            float_bits_fingerprint(scaled_ilu.u().data()),
+            "ILU U entries must scale exactly with the matrix, as SciPy's do"
         );
 
         // The factorization's own triangular solve carries the third copy of the
@@ -25195,6 +27578,13 @@ mod tests {
     /// golden. The guard being relaxed only ever fired below 2.22e-14, and every
     /// pivot of this fixture is order 1, so the path taken here is unchanged and
     /// the bits must be too.
+    ///
+    /// GOLDEN-CHANGE (frankenscipy-1ksfv.11): this test also pinned `spilu`'s L and U bits
+    /// (0x4be3_da52_fddc_3876 / 0x176f_3410_334b_e541). Those were ILU(0)'s factors, and
+    /// `spilu` is no longer ILU(0) — it is ILUTP with fill, pivoting and a column ordering —
+    /// so the pins were removed, not regenerated. The pivot-guard property they protected for
+    /// the ILU is `pivot_guards_are_scale_invariant_like_the_incumbent`, which still runs
+    /// against the new factorization.
     #[test]
     fn a_well_scaled_factorization_is_untouched_by_the_pivot_guard_change() {
         let n = 64;
@@ -25204,11 +27594,6 @@ mod tests {
             .expect("well-scaled lower solve");
         let upper_solution = spsolve_triangular(&bidiagonal_triangular_csr(n, false), &rhs, false)
             .expect("well-scaled upper solve");
-        let ilu = spilu(
-            &spd_uneven_row_csr(n).to_csc().expect("csc"),
-            IluOptions::default(),
-        )
-        .expect("well-scaled ILU(0)");
 
         let mut drifted = Vec::new();
         for (label, fingerprint, expected) in [
@@ -25221,16 +27606,6 @@ mod tests {
                 "spsolve_triangular(upper)",
                 float_bits_fingerprint(&upper_solution),
                 0x1471_c933_7974_b97a_u64,
-            ),
-            (
-                "spilu L",
-                float_bits_fingerprint(&ilu.l_data),
-                0x4be3_da52_fddc_3876_u64,
-            ),
-            (
-                "spilu U",
-                float_bits_fingerprint(&ilu.u_data),
-                0x176f_3410_334b_e541_u64,
             ),
         ] {
             if fingerprint != expected {
