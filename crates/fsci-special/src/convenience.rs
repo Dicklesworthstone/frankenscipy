@@ -433,7 +433,14 @@ pub fn ndtr_scalar(x: f64) -> f64 {
 /// Matches `scipy.special.ndtri(y)`. Under `errstate`, `y` outside `[0, 1]` is SciPy's
 /// "domain error".
 pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    let value = map_real_wg("ndtri", y_tensor, mode, |y| Ok(ndtri_scalar(y)))?;
+    // The evaluator choice is read ONCE per call, never per element.
+    let unrolled = NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
+    if unrolled {
+        NDTRI_UNROLL_POLEVL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let value = map_real_wg("ndtri", y_tensor, mode, |y| {
+        Ok(ndtri_scalar_with(y, unrolled))
+    })?;
     crate::sf_error_unary("ndtri", y_tensor, mode, |y| {
         (!(0.0..=1.0).contains(&y) && !y.is_nan()).then_some(crate::SpecialErrorCode::Domain)
     })?;

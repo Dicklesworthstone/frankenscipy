@@ -1233,7 +1233,8 @@
     "ABS_TOL": 1e-9
   },
   "diff_special_error.rs": {
-    "ERFINV_TOL_REL": 5e-9,
+    "ERFCINV_TOL_REL": 5e-9,
+    "ERFINV_TOL_REL": 1e-15,
     "ERF_TOL": 1e-13
   },
   "diff_special_exp1_expi.rs": {

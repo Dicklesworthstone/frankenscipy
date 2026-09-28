@@ -43,18 +43,14 @@ pub const ERROR_DISPATCH_PLAN: &[DispatchPlan] = &[
         steps: &[
             DispatchStep {
                 regime: KernelRegime::Series,
-                when: "|y| < 0.9",
+                when: "|y| <= 0.5: Boost rational in |y|",
             },
             DispatchStep {
                 regime: KernelRegime::Asymptotic,
-                when: "0.9 <= |y| < 1",
-            },
-            DispatchStep {
-                regime: KernelRegime::Recurrence,
-                when: "polish via Newton/Halley refinement",
+                when: "0.5 < |y| < 1: Boost rationals in sqrt(-log(1-|y|)), five bands",
             },
         ],
-        notes: "Endpoints y=+/-1 map to +/-inf with strict SciPy parity.",
+        notes: "Boost.Math erf_inv, as SciPy calls it; y=+/-1 map to +/-inf, erfinv(-0)=+0.",
     },
     DispatchPlan {
         function: "erfcinv",
@@ -231,16 +227,8 @@ fn erfinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
         && !values.iter().any(|&v| v.abs() > 1.0)
     {
         ERFINV_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The evaluator choice is read ONCE for the whole array, never per element.
-        let unrolled =
-            crate::convenience::NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
-        crate::convenience::NDTRI_UNROLL_POLEVL_HITS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(SpecialTensor::RealVec(
-            values
-                .iter()
-                .map(|&v| erfinv_value_with(v, unrolled))
-                .collect(),
+            values.iter().map(|&v| erfinv_value(v)).collect(),
         ));
     }
     map_unary_input_rp(
@@ -249,7 +237,7 @@ fn erfinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
         mode,
         |v| erfinv_scalar(v, mode),
         |value| erfinv_complex_scalar(value, mode),
-        1 << 20, // cheap ndtri-Newton (~23ns); default-256 gate lost 18.8x@4096 (BlackThrush A/B)
+        1 << 20, // cheap (one rational, ~20ns); default-256 gate lost 18.8x@4096 (BlackThrush A/B)
     )
 }
 
@@ -817,7 +805,13 @@ pub fn erfinv_scalar(y: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
 ///
 /// Splitting it out this way is what lets the batch avoid building a
 /// `Result<f64, SpecialError>` for every element of an array that cannot produce an error.
-/// The algorithm is unchanged and lives in exactly one place.
+/// The algorithm lives in exactly one place.
+///
+/// The algorithm is Boost.Math's `erf_inv`, which is what SciPy's `erfinv` calls, and the
+/// result is bit-identical to SciPy 1.17.1's (400,010 points, subnormals and 1 - ulp
+/// included). It works from p = |y| and q = 1 - |y|. It used to compute
+/// `ndtri((y + 1) / 2) / sqrt(2)`, where forming `(y + 1) / 2` rounds a small `y` away:
+/// 8.3e-8 relative error at y = 1e-10 (frankenscipy-pi4e0).
 fn erfinv_value(y: f64) -> f64 {
     if y.is_nan() {
         return f64::NAN;
@@ -828,38 +822,214 @@ fn erfinv_value(y: f64) -> f64 {
     if y == -1.0 {
         return f64::NEG_INFINITY;
     }
+    // Boost returns an unsigned 0 here, so SciPy's erfinv(-0.0) is +0.0.
     if y == 0.0 {
-        return y;
+        return 0.0;
     }
-
-    let p = 0.5 * (y + 1.0);
-    if p == 0.0 || p == 1.0 {
-        return y.signum() * crate::convenience::erfcinv_conv(1.0 - y.abs());
-    }
-
-    crate::convenience::ndtri_scalar(p) * std::f64::consts::FRAC_1_SQRT_2
+    let p = y.abs();
+    boost_erf_inv_imp(p, 1.0 - p).copysign(y)
 }
 
-/// `erfinv_value` with the `ndtri` evaluator choice supplied by the batch entry point.
-fn erfinv_value_with(y: f64, unrolled: bool) -> f64 {
-    if y.is_nan() {
-        return f64::NAN;
+/// Boost.Math's `erf_inv_imp` for 64-bit and narrower types, for `0 < p < 1` and `q = 1 - p`.
+fn boost_erf_inv_imp(p: f64, q: f64) -> f64 {
+    if p <= 0.5 {
+        let g = p * (p + 10.0);
+        return g * ERFINV_SMALL.y + g * ERFINV_SMALL.r(p);
     }
-    if y == 1.0 {
-        return f64::INFINITY;
+    if q >= 0.25 {
+        let g = (-2.0 * q.ln()).sqrt();
+        return g / (ERFINV_MID.y + ERFINV_MID.r(q - 0.25));
     }
-    if y == -1.0 {
-        return f64::NEG_INFINITY;
+    // q = 1 - p is at least 2^-53, so x <= 6.07. Boost's x >= 18 bands serve erfc_inv's tiny
+    // q, cannot be reached from erfinv, and are not carried.
+    let x = (-q.ln()).sqrt();
+    if x < 3.0 {
+        ERFINV_TAIL3.tail(x, 1.125)
+    } else if x < 6.0 {
+        ERFINV_TAIL6.tail(x, 3.0)
+    } else {
+        ERFINV_TAIL18.tail(x, 6.0)
     }
-    if y == 0.0 {
-        return y;
-    }
-    let p = 0.5 * (y + 1.0);
-    if p == 0.0 || p == 1.0 {
-        return y.signum() * crate::convenience::erfcinv_conv(1.0 - y.abs());
-    }
-    crate::convenience::ndtri_scalar_with(p, unrolled) * std::f64::consts::FRAC_1_SQRT_2
 }
+
+/// One band of `erf_inv_imp`: a constant `y` (a `float` in Boost, exact in `f64`) plus a
+/// correction `R = P/Q` fitted for low absolute error against it.
+struct BoostErfInvBand<const NP: usize, const NQ: usize> {
+    y: f64,
+    p: [f64; NP],
+    q: [f64; NQ],
+}
+
+impl<const NP: usize, const NQ: usize> BoostErfInvBand<NP, NQ> {
+    #[inline(always)]
+    fn r(&self, x: f64) -> f64 {
+        boost_horner2(&self.p, x) / boost_horner2(&self.q, x)
+    }
+
+    /// The `q < 0.25` bands: x·(Y + R(x - base)), rounded as Boost writes it.
+    #[inline(always)]
+    fn tail(&self, x: f64, base: f64) -> f64 {
+        self.y * x + self.r(x - base) * x
+    }
+}
+
+/// Boost.Math's second-order Horner: `BOOST_MATH_POLY_METHOD 3`, GCC's default and so what
+/// SciPy's build uses. The even and odd coefficients run as two Horner chains in x², then
+/// combine as E + x·O. Rounding follows the operation order, so a plain Horner here would
+/// be close to SciPy but not bit-identical.
+#[inline(always)]
+fn boost_horner2<const N: usize>(a: &[f64; N], x: f64) -> f64 {
+    let x2 = x * x;
+    let (top_even, top_odd) = if N.is_multiple_of(2) {
+        (N - 2, N - 1)
+    } else {
+        (N - 1, N - 2)
+    };
+    let mut even = a[top_even];
+    let mut k = top_even;
+    while k >= 2 {
+        k -= 2;
+        even = even * x2 + a[k];
+    }
+    let mut odd = a[top_odd];
+    let mut k = top_odd;
+    while k >= 3 {
+        k -= 2;
+        odd = odd * x2 + a[k];
+    }
+    even + odd * x
+}
+
+// Coefficients verbatim from boost/math/special_functions/erf_inv.hpp. Boost reads them as
+// long double and narrows to double; all of them (117 across the seven bands) round to the
+// same double either way.
+#[allow(clippy::excessive_precision)]
+const ERFINV_SMALL: BoostErfInvBand<8, 10> = BoostErfInvBand {
+    y: 0.0891314744949340820313,
+    p: [
+        -0.000508781949658280665617,
+        -0.00836874819741736770379,
+        0.0334806625409744615033,
+        -0.0126926147662974029034,
+        -0.0365637971411762664006,
+        0.0219878681111168899165,
+        0.00822687874676915743155,
+        -0.00538772965071242932965,
+    ],
+    q: [
+        1.0,
+        -0.970005043303290640362,
+        -1.56574558234175846809,
+        1.56221558398423026363,
+        0.662328840472002992063,
+        -0.71228902341542847553,
+        -0.0527396382340099713954,
+        0.0795283687341571680018,
+        -0.00233393759374190016776,
+        0.000886216390456424707504,
+    ],
+};
+#[allow(clippy::excessive_precision)]
+const ERFINV_MID: BoostErfInvBand<9, 9> = BoostErfInvBand {
+    y: 2.249481201171875,
+    p: [
+        -0.202433508355938759655,
+        0.105264680699391713268,
+        8.37050328343119927838,
+        17.6447298408374015486,
+        -18.8510648058714251895,
+        -44.6382324441786960818,
+        17.445385985570866523,
+        21.1294655448340526258,
+        -3.67192254707729348546,
+    ],
+    q: [
+        1.0,
+        6.24264124854247537712,
+        3.9713437953343869095,
+        -28.6608180499800029974,
+        -20.1432634680485188801,
+        48.5609213108739935468,
+        10.8268667355460159008,
+        -22.6436933413139721736,
+        1.72114765761200282724,
+    ],
+};
+#[allow(clippy::excessive_precision)]
+const ERFINV_TAIL3: BoostErfInvBand<11, 8> = BoostErfInvBand {
+    y: 0.807220458984375,
+    p: [
+        -0.131102781679951906451,
+        -0.163794047193317060787,
+        0.117030156341995252019,
+        0.387079738972604337464,
+        0.337785538912035898924,
+        0.142869534408157156766,
+        0.0290157910005329060432,
+        0.00214558995388805277169,
+        -0.679465575181126350155e-6,
+        0.285225331782217055858e-7,
+        -0.681149956853776992068e-9,
+    ],
+    q: [
+        1.0,
+        3.46625407242567245975,
+        5.38168345707006855425,
+        4.77846592945843778382,
+        2.59301921623620271374,
+        0.848854343457902036425,
+        0.152264338295331783612,
+        0.01105924229346489121,
+    ],
+};
+#[allow(clippy::excessive_precision)]
+const ERFINV_TAIL6: BoostErfInvBand<9, 7> = BoostErfInvBand {
+    y: 0.93995571136474609375,
+    p: [
+        -0.0350353787183177984712,
+        -0.00222426529213447927281,
+        0.0185573306514231072324,
+        0.00950804701325919603619,
+        0.00187123492819559223345,
+        0.000157544617424960554631,
+        0.460469890584317994083e-5,
+        -0.230404776911882601748e-9,
+        0.266339227425782031962e-11,
+    ],
+    q: [
+        1.0,
+        1.3653349817554063097,
+        0.762059164553623404043,
+        0.220091105764131249824,
+        0.0341589143670947727934,
+        0.00263861676657015992959,
+        0.764675292302794483503e-4,
+    ],
+};
+#[allow(clippy::excessive_precision)]
+const ERFINV_TAIL18: BoostErfInvBand<9, 7> = BoostErfInvBand {
+    y: 0.98362827301025390625,
+    p: [
+        -0.0167431005076633737133,
+        -0.00112951438745580278863,
+        0.00105628862152492910091,
+        0.000209386317487588078668,
+        0.149624783758342370182e-4,
+        0.449696789927706453732e-6,
+        0.462596163522878599135e-8,
+        -0.281128735628831791805e-13,
+        0.99055709973310326855e-16,
+    ],
+    q: [
+        1.0,
+        0.591429344886417493481,
+        0.138151865749083321638,
+        0.0160746087093676504695,
+        0.000964011807005165528527,
+        0.275335474764726041141e-4,
+        0.282243172016108031869e-6,
+    ],
+};
 
 fn erfinv_complex_scalar(y: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
     if !y.re.is_finite() || !y.im.is_finite() {
@@ -1026,8 +1196,8 @@ fn erfcinv_scalar_with_arm(
 
     // erfcinv(y) = -Phi^-1(y/2)/sqrt(2). Both arms compute that identity; they differ only in
     // which inverse-normal kernel evaluates it. `ndtri_scalar` is the crate's Cephes-derived
-    // one, already trusted by `erfinv_scalar` three functions up and by `erfcinv_conv`, and it
-    // handles the deep tail by delegating there rather than by losing digits.
+    // one, as SciPy's cephes `erfcinv` uses, also trusted by `erfcinv_conv`, and it handles
+    // the deep tail by delegating there rather than by losing digits.
     if ndtri_arm {
         Ok(-crate::convenience::ndtri_scalar(0.5 * y) * std::f64::consts::FRAC_1_SQRT_2)
     } else {
@@ -1460,6 +1630,42 @@ mod tests {
                 "erfinv({input}) = {result}, expected {want}"
             );
         }
+    }
+
+    #[test]
+    fn erfinv_is_scipy_boost_erf_inv_bit_for_bit() {
+        // scipy.special.erfinv 1.17.1 (Boost erf_inv), one or more points per reachable band:
+        // |y| <= 0.5, then 1 - |y| >= 0.25, then sqrt(-log(1 - |y|)) < 3, < 6 and >= 6. The
+        // small-|y| points are the regression: the old ndtri((y + 1) / 2) route returned
+        // 8.862269987795026e-11 at 1e-10, 8.3e-8 relative off.
+        let cases = [
+            (1e-10, 8.862269254527581e-11),
+            (1e-6, 8.862269254529899e-7),
+            (3e-4, 0.0002658680839001967),
+            (-0.3, -0.2724627147267544),
+            (0.5, 0.4769362762044699),
+            (5e-324, 5e-324),
+            (0.6, 0.5951160814499948),
+            (0.75, 0.8134198475976184),
+            (0.8, 0.9061938024368232),
+            (-0.95, -1.3859038243496775),
+            (0.999, 2.326753765513524),
+            (0.999999, 3.458910737275499),
+            (0.999999999999, 5.042031898572696),
+            (1.0 - f64::EPSILON / 2.0, 5.8635847487551676),
+            (1.0 - f64::EPSILON, 5.805018683193453),
+        ];
+        for (y, expected) in cases {
+            let result = super::erfinv_scalar(y, RuntimeMode::Strict).unwrap();
+            assert_eq!(
+                result.to_bits(),
+                f64::to_bits(expected),
+                "erfinv({y:e}) = {result:e}, SciPy {expected:e}"
+            );
+        }
+        // Boost's zero is unsigned: SciPy returns +0.0 for -0.0.
+        let zero = super::erfinv_scalar(-0.0, RuntimeMode::Strict).unwrap();
+        assert_eq!(zero.to_bits(), 0.0_f64.to_bits(), "erfinv(-0.0) = {zero:e}");
     }
 
     #[test]
