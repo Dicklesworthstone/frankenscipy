@@ -324,6 +324,16 @@ pub fn expit(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// Matches `scipy.special.logit(p)`.
 /// Domain: p in (0, 1).
 pub fn logit(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    // Only a Hardened refusal can fail, so an array without one maps the kernel directly rather
+    // than building a Result per element.
+    if let SpecialTensor::RealVec(values) = p_tensor
+        && (matches!(mode, RuntimeMode::Strict)
+            || !values.iter().any(|&p| logit_hardened_refuses(p)))
+    {
+        return Ok(SpecialTensor::RealVec(
+            values.iter().map(|&p| logit_value(p)).collect(),
+        ));
+    }
     map_real("logit", p_tensor, mode, |p| logit_scalar(p, mode))
 }
 
@@ -844,77 +854,42 @@ fn expit_scalar(x: f64) -> f64 {
     }
 }
 
+/// Hardened refuses p outside (0, 1); NaN passes through as in Strict.
+fn logit_hardened_refuses(p: f64) -> bool {
+    !(p.is_nan() || (p > 0.0 && p < 1.0))
+}
+
 fn logit_scalar(p: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if p.is_nan() {
-        return Ok(f64::NAN);
+    if matches!(mode, RuntimeMode::Hardened) && logit_hardened_refuses(p) {
+        record_special_trace(
+            "logit",
+            mode,
+            "domain_error",
+            format!("p={p}"),
+            "fail_closed",
+            "p must be in (0, 1)",
+            false,
+        );
+        return Err(SpecialError {
+            function: "logit",
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail: "p must be in (0, 1)",
+        });
     }
-    if p < 0.0 || p > 1.0 {
-        return match mode {
-            RuntimeMode::Strict => Ok(f64::NAN),
-            RuntimeMode::Hardened => {
-                record_special_trace(
-                    "logit",
-                    mode,
-                    "domain_error",
-                    format!("p={p}"),
-                    "fail_closed",
-                    "p must be in (0, 1)",
-                    false,
-                );
-                Err(SpecialError {
-                    function: "logit",
-                    kind: SpecialErrorKind::DomainError,
-                    mode,
-                    detail: "p must be in (0, 1)",
-                })
-            }
-        };
+    Ok(logit_value(p))
+}
+
+/// xsf's `logit`, SciPy's kernel. log(p/(1-p)) loses relative precision as p nears 1/2, where
+/// the result nears 0, so on [0.3, 0.65] it is log1p(2(p-1/2)) - log1p(-2(p-1/2)). The one
+/// expression also gives Strict's edges: -inf at 0, inf at 1, NaN outside [0, 1] and at NaN.
+fn logit_value(p: f64) -> f64 {
+    if p < 0.3 || p > 0.65 {
+        (p / (1.0 - p)).ln()
+    } else {
+        let s = 2.0 * (p - 0.5);
+        s.ln_1p() - (-s).ln_1p()
     }
-    if p == 0.0 {
-        return match mode {
-            RuntimeMode::Strict => Ok(f64::NEG_INFINITY),
-            RuntimeMode::Hardened => {
-                record_special_trace(
-                    "logit",
-                    mode,
-                    "domain_error",
-                    format!("p={p}"),
-                    "fail_closed",
-                    "p must be in (0, 1)",
-                    false,
-                );
-                Err(SpecialError {
-                    function: "logit",
-                    kind: SpecialErrorKind::DomainError,
-                    mode,
-                    detail: "p must be in (0, 1)",
-                })
-            }
-        };
-    }
-    if p == 1.0 {
-        return match mode {
-            RuntimeMode::Strict => Ok(f64::INFINITY),
-            RuntimeMode::Hardened => {
-                record_special_trace(
-                    "logit",
-                    mode,
-                    "domain_error",
-                    format!("p={p}"),
-                    "fail_closed",
-                    "p must be in (0, 1)",
-                    false,
-                );
-                Err(SpecialError {
-                    function: "logit",
-                    kind: SpecialErrorKind::DomainError,
-                    mode,
-                    detail: "p must be in (0, 1)",
-                })
-            }
-        };
-    }
-    Ok((p / (1.0 - p)).ln())
 }
 
 fn entr_scalar(x: f64) -> f64 {
@@ -9449,6 +9424,60 @@ mod tests {
         assert!(logit_scalar(0.0, mh).is_err());
         assert!(logit_scalar(1.0, mh).is_err());
         assert!(logit_scalar(1.1, mh).is_err());
+    }
+
+    #[test]
+    fn logit_is_scipy_xsf_bit_for_bit_and_the_batch_is_the_scalar() {
+        // SciPy 1.17.1 values: either side of both branch points and near 1/2, where
+        // log(p/(1-p)) alone was up to 3e-8 relative off (0.5 - 1e-9).
+        let cases = [
+            (0.299_999_999_999_999_93, -0.847_297_860_387_203_9),
+            (0.3, -0.847_297_860_387_203_7),
+            (0.4, -0.405_465_108_108_164_3),
+            (0.500_000_000_001, 3.999_911_513_119_514e-12),
+            (0.499_999_999, -4.000_000_108_916_879e-9),
+            (0.500_000_1, 3.999_999_997_894_629_5e-7),
+            (0.6, 0.405_465_108_108_164_3),
+            (0.65, 0.619_039_208_406_223_5),
+            (0.650_000_000_000_000_1, 0.619_039_208_406_224_1),
+            (1e-300, -690.775_527_898_213_7),
+            (0.999_999_999_999_999_9, 36.736_800_569_677_1),
+        ];
+        let xs: Vec<f64> = cases
+            .iter()
+            .map(|c| c.0)
+            .chain([0.0, -0.0, 1.0, -0.1, 1.1, f64::INFINITY, f64::NAN])
+            .collect();
+        let batch = match logit(&SpecialTensor::RealVec(xs.clone()), RuntimeMode::Strict) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            other => panic!("expected real vector, got {other:?}"),
+        };
+        for (i, &p) in xs.iter().enumerate() {
+            let scalar = logit_scalar(p, RuntimeMode::Strict).unwrap();
+            assert_eq!(batch[i].to_bits(), scalar.to_bits(), "logit({p:e})");
+        }
+        for (i, &(p, want)) in cases.iter().enumerate() {
+            assert_eq!(batch[i].to_bits(), f64::to_bits(want), "logit({p:e})");
+        }
+        let n = cases.len();
+        assert_eq!(batch[n], f64::NEG_INFINITY);
+        assert_eq!(batch[n + 1], f64::NEG_INFINITY);
+        assert_eq!(batch[n + 2], f64::INFINITY);
+        assert!(batch[n + 3..].iter().all(|v| v.is_nan()));
+
+        let refused = SpecialTensor::RealVec(vec![0.4, 1.0]);
+        let err = logit(&refused, RuntimeMode::Hardened).unwrap_err();
+        assert_eq!(err.kind, SpecialErrorKind::DomainError);
+        match logit(
+            &SpecialTensor::RealVec(vec![0.4, f64::NAN]),
+            RuntimeMode::Hardened,
+        ) {
+            Ok(SpecialTensor::RealVec(v)) => {
+                assert_eq!(v[0].to_bits(), f64::to_bits(-0.405_465_108_108_164_3));
+                assert!(v[1].is_nan());
+            }
+            other => panic!("expected real vector, got {other:?}"),
+        }
     }
 
     #[test]

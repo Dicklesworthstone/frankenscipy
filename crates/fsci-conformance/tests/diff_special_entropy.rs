@@ -10,7 +10,7 @@
 //!   • rel_entr(x, y) = x·log(x/y) — KL kernel
 //!   • xlogy(x, y) = x·log(y)   — entropy/likelihood gradient
 //!
-//! Tolerances: 1e-13 abs (closed-form fundamental kernels).
+//! Tolerances: 1e-13 abs (closed-form fundamental kernels); logit 1e-15 relative.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-13;
+// logit is xsf's two-branch kernel, bit-identical to SciPy. A TRUE relative tolerance: the
+// 1e-13 absolute gate could not see logit(0.5 - 1e-9) 3e-8 relative off (frankenscipy-0pzs0).
+const LOGIT_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per SciPy function compared.
 const ARMS: [&str; 5] = ["expit", "logit", "entr", "rel_entr", "xlogy"];
@@ -117,8 +120,24 @@ fn fsci_eval(func: &str, x: f64, y: f64) -> Option<f64> {
 fn generate_query() -> OracleQuery {
     // expit: domain ℝ
     let xs_expit = [-15.0_f64, -5.0, -1.0, -0.1, 0.0, 0.1, 1.0, 5.0, 15.0];
-    // logit: domain (0, 1)
-    let ps_logit = [0.001_f64, 0.05, 0.25, 0.5, 0.75, 0.95, 0.999];
+    // logit: domain (0, 1). Near 1/2 the result nears 0, so only a relative gate sees the
+    // precision log(p/(1-p)) loses there; 0.3 and 0.65 are SciPy's branch points.
+    let ps_logit = [
+        0.001_f64,
+        0.05,
+        0.25,
+        0.3,
+        0.4,
+        0.499_999_999,
+        0.5,
+        0.500_000_000_001,
+        0.500_000_1,
+        0.6,
+        0.65,
+        0.75,
+        0.95,
+        0.999,
+    ];
     // entr: domain x ≥ 0
     let xs_entr = [0.0_f64, 1.0e-6, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0];
     // rel_entr / xlogy: (x, y) with x ≥ 0, y > 0
@@ -282,12 +301,17 @@ fn diff_special_entropy() {
         };
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
-        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        let pass = if arm == "logit" {
+            abs_diff <= LOGIT_TOL_REL * scipy_v.abs()
+        } else {
+            abs_diff <= ABS_TOL
+        };
+        ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
             abs_diff,
-            pass: abs_diff <= ABS_TOL,
+            pass,
         });
     }
 

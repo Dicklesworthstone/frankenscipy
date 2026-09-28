@@ -1235,7 +1235,8 @@
     "ABS_TOL": 1e-12
   },
   "diff_special_entropy.rs": {
-    "ABS_TOL": 1e-13
+    "ABS_TOL": 1e-13,
+    "LOGIT_TOL_REL": 1e-15
   },
   "diff_special_erf_complex.rs": {
     "ABS_TOL": 1e-9
