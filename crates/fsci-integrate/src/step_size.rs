@@ -256,6 +256,19 @@ where
     Ok(final_h)
 }
 
+/// `num_jac`'s thresholds `(eps^0.875, eps^0.75, eps^0.25, eps^0.5)` without the platform
+/// `powf`. `f64::EPSILON` is `2^-52`, so the last three are the powers of two `2^-39`,
+/// `2^-13` and `2^-26`, which IEEE `sqrt` and a product produce exactly. `eps^0.875` is
+/// `sqrt(eps * eps^0.75) = sqrt(2^-91)`, correctly rounded by `sqrt`. The results are the
+/// same on every platform and equal to the exact values a correctly rounded `pow` returns.
+fn eps_powers() -> (f64, f64, f64, f64) {
+    let sqrt_eps = f64::EPSILON.sqrt();
+    let quarter = sqrt_eps.sqrt();
+    let three_quarters = sqrt_eps * quarter;
+    let seven_eighths = (f64::EPSILON * three_quarters).sqrt();
+    (seven_eighths, three_quarters, quarter, sqrt_eps)
+}
+
 /// Finite-difference Jacobian of `fun` at `(t, y)`, SciPy's `_ivp.common.num_jac` (dense
 /// path), for the implicit solvers.
 ///
@@ -285,14 +298,10 @@ where
     if n == 0 {
         return nalgebra::DMatrix::zeros(0, 0);
     }
-    let diff_reject = f64::EPSILON.powf(0.875);
-    let diff_small = f64::EPSILON.powf(0.75);
-    let diff_big = f64::EPSILON.powf(0.25);
+    let (diff_reject, diff_small, diff_big, sqrt_eps) = eps_powers();
     let min_factor = 1e3 * f64::EPSILON;
 
-    let mut fac = factor
-        .take()
-        .unwrap_or_else(|| vec![f64::EPSILON.powf(0.5); n]);
+    let mut fac = factor.take().unwrap_or_else(|| vec![sqrt_eps; n]);
     let mut y_scale = vec![0.0; n];
     let mut h = vec![0.0; n];
     for j in 0..n {
@@ -363,6 +372,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eps_powers_are_the_exact_values() {
+        let (seven_eighths, three_quarters, quarter, sqrt_eps) = eps_powers();
+        assert_eq!(sqrt_eps.to_bits(), 2.0_f64.powi(-26).to_bits());
+        assert_eq!(quarter.to_bits(), 2.0_f64.powi(-13).to_bits());
+        assert_eq!(three_quarters.to_bits(), 2.0_f64.powi(-39).to_bits());
+        // 2^-45.5 = sqrt(2) * 2^-46; the power-of-two scaling is exact, so the correctly
+        // rounded value is the correctly rounded SQRT_2 scaled.
+        assert_eq!(
+            seven_eighths.to_bits(),
+            (std::f64::consts::SQRT_2 * 2.0_f64.powi(-46)).to_bits()
+        );
+    }
+
+    #[test]
+    fn eps_powers_match_this_hosts_powf() {
+        // Not an oracle (powf is the thing being replaced), a same-host check that the
+        // replacement did not move num_jac's thresholds where the platform powf is exact.
+        let (seven_eighths, three_quarters, quarter, sqrt_eps) = eps_powers();
+        assert_eq!(seven_eighths, f64::EPSILON.powf(0.875));
+        assert_eq!(three_quarters, f64::EPSILON.powf(0.75));
+        assert_eq!(quarter, f64::EPSILON.powf(0.25));
+        assert_eq!(sqrt_eps, f64::EPSILON.powf(0.5));
+    }
 
     #[test]
     fn select_initial_step_empty_system() {
