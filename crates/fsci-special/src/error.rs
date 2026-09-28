@@ -272,6 +272,28 @@ fn erfcinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if ndtri_arm {
         ERFCINV_NDTRI_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // Infallible serial batch, as erfinv's. An array with no element outside [0, 2] cannot
+    // produce an error, so this maps SciPy's -ndtri(y/2)/sqrt(2) directly, with ndtri's
+    // evaluator flag read once. The per-element route built a `Result` per element and re-read
+    // that flag inside `ndtri_scalar`: 169 instructions per element against SciPy's 103. NaN,
+    // 0, 1 and 2 come out as on the scalar path.
+    if ndtri_arm
+        && let SpecialTensor::RealVec(values) = y
+        && values.len() < 1 << 20
+        && !values.iter().any(|&v| v < 0.0 || v > 2.0)
+    {
+        let unrolled =
+            crate::convenience::NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
+        return Ok(SpecialTensor::RealVec(
+            values
+                .iter()
+                .map(|&v| {
+                    -crate::convenience::ndtri_scalar_with(0.5 * v, unrolled)
+                        * std::f64::consts::FRAC_1_SQRT_2
+                })
+                .collect(),
+        ));
+    }
     map_unary_input_rp(
         "erfcinv",
         y,
@@ -1190,8 +1212,9 @@ fn erfcinv_scalar_with_arm(
         };
     }
 
+    // SciPy computes -ndtri(0.5)/sqrt(2) here and returns -0.0, as the batch path does.
     if y == 1.0 {
-        return Ok(0.0);
+        return Ok(-0.0);
     }
 
     // erfcinv(y) = -Phi^-1(y/2)/sqrt(2). Both arms compute that identity; they differ only in
@@ -1666,6 +1689,58 @@ mod tests {
         // Boost's zero is unsigned: SciPy returns +0.0 for -0.0.
         let zero = super::erfinv_scalar(-0.0, RuntimeMode::Strict).unwrap();
         assert_eq!(zero.to_bits(), 0.0_f64.to_bits(), "erfinv(-0.0) = {zero:e}");
+    }
+
+    #[test]
+    fn erfcinv_and_ndtri_batches_equal_the_scalar_path_bit_for_bit() {
+        // The infallible batches must reproduce the per-element route exactly, special values
+        // included. SciPy's erfcinv(1.0) is -0.0 (-ndtri(0.5)/sqrt(2)).
+        let ys = vec![
+            0.0,
+            -0.0,
+            1e-300,
+            0.001,
+            0.5,
+            1.0,
+            1.5,
+            1.999,
+            2.0,
+            f64::NAN,
+        ];
+        let batch = match super::erfcinv(&SpecialTensor::RealVec(ys.clone()), RuntimeMode::Strict) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            _ => Vec::new(),
+        };
+        assert_eq!(batch.len(), ys.len());
+        for (&y, &got) in ys.iter().zip(&batch) {
+            let want = super::erfcinv_scalar(y, RuntimeMode::Strict).unwrap_or(f64::INFINITY);
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "erfcinv({y:e}) batch {got:e} scalar {want:e}"
+            );
+        }
+        assert_eq!(
+            batch[5].to_bits(),
+            (-0.0_f64).to_bits(),
+            "erfcinv(1) must be -0.0"
+        );
+
+        let ps = vec![0.0, 1e-300, 0.02, 0.5, 0.9, 1.0 - 1e-16, 1.0, f64::NAN];
+        let batch = match crate::convenience::ndtri(
+            &SpecialTensor::RealVec(ps.clone()),
+            RuntimeMode::Strict,
+        ) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            _ => Vec::new(),
+        };
+        assert_eq!(batch.len(), ps.len());
+        for (&p, &got) in ps.iter().zip(&batch) {
+            let want = crate::convenience::ndtri_scalar(p);
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "ndtri({p:e}) batch {got:e} scalar {want:e}"
+            );
+        }
     }
 
     #[test]

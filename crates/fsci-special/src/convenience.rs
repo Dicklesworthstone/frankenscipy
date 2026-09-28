@@ -401,9 +401,20 @@ pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if unrolled {
         NDTRI_UNROLL_POLEVL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let value = map_real_wg("ndtri", y_tensor, mode, |y| {
-        Ok(ndtri_scalar_with(y, unrolled))
-    })?;
+    // ndtri cannot fail per element (out of domain is NaN), so a serial batch maps the kernel
+    // directly instead of collecting a `Result` per element. The parallel path (>= 2^20
+    // elements) is unchanged.
+    let value = match y_tensor {
+        SpecialTensor::RealVec(values) if values.len() < 1 << 20 => SpecialTensor::RealVec(
+            values
+                .iter()
+                .map(|&y| ndtri_scalar_with(y, unrolled))
+                .collect(),
+        ),
+        _ => map_real_wg("ndtri", y_tensor, mode, |y| {
+            Ok(ndtri_scalar_with(y, unrolled))
+        })?,
+    };
     crate::sf_error_unary("ndtri", y_tensor, mode, |y| {
         (!(0.0..=1.0).contains(&y) && !y.is_nan()).then_some(crate::SpecialErrorCode::Domain)
     })?;
