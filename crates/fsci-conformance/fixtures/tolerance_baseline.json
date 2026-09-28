@@ -1380,8 +1380,8 @@
   },
   "diff_special_ndtr.rs": {
     "LOG_NDTR_TOL": 1e-6,
-    "NDTRI_EXP_TOL_REL": 2e-6,
-    "NDTRI_TOL_REL": 1e-7,
+    "NDTRI_EXP_TOL_REL": 1e-15,
+    "NDTRI_TOL_REL": 1e-15,
     "NDTR_TOL": 5e-13
   },
   "diff_special_negentropy_bce.rs": {
@@ -1450,7 +1450,7 @@
     "ABS_TOL": 1e-14
   },
   "diff_special_spence.rs": {
-    "ABS_TOL": 5e-8
+    "REL_TOL": 1e-15
   },
   "diff_special_sph_harm_y.rs": {
     "ABS_TOL": 1e-10

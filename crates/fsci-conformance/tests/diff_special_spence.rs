@@ -23,9 +23,10 @@ use fsci_special::types::SpecialTensor;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-// fsci's spence series lands ~1e-8 abs at z=0.01 and ~1e-9 at
-// z=50 (small-z and large-z series boundary). 5e-8 absorbs.
-const ABS_TOL: f64 = 5.0e-8;
+// spence is Cephes' with Cephes' own coefficient doubles, bit-identical to SciPy. This is a TRUE
+// relative tolerance, a few ulp. It used to be an absolute 5e-8, which could not see SPENCE_B
+// transcribed 1 ulp off (frankenscipy-qbwth).
+const REL_TOL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,7 +107,24 @@ fn generate_query() -> OracleQuery {
     // broader special-function precision sweep in
     // frankenscipy-0om9c.
     let zs = [
-        0.01_f64, 0.05, 0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0,
+        0.01_f64,
+        0.05,
+        0.1,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        5.0,
+        10.0,
+        25.0,
+        50.0,
+        // One point in each of Cephes' four argument ranges where the 16-digit SPENCE_B
+        // missed SciPy by 1-6 ulp.
+        0.651_541_973_701_075_2,
+        0.265_877_344_675_972_1,
+        1.950_863_934_790_465_5,
+        2.868_172_090_875_553_7,
     ];
     let mut points = Vec::new();
     for &z in &zs {
@@ -219,11 +237,12 @@ fn diff_special_spence() {
         };
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
-        ledger.compared("spence", &case.case_id, abs_diff <= ABS_TOL);
+        let pass = abs_diff <= REL_TOL * scipy_v.abs();
+        ledger.compared("spence", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff,
-            pass: abs_diff <= ABS_TOL,
+            pass,
         });
     }
 

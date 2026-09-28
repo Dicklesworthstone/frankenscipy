@@ -32,8 +32,14 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const NDTR_TOL: f64 = 5.0e-13;
 const LOG_NDTR_TOL: f64 = 1.0e-6;
-const NDTRI_TOL_REL: f64 = 1.0e-7;
-const NDTRI_EXP_TOL_REL: f64 = 2.0e-6;
+// ndtri is Cephes' with Cephes' own coefficient doubles, bit-identical to SciPy. This is a TRUE
+// relative tolerance, a few ulp. It used to be 1e-7 scaled by max(|value|, 1), which could
+// not see tables transcribed 1-2 ulp off (frankenscipy-qbwth).
+const NDTRI_TOL_REL: f64 = 1.0e-15;
+// ndtri_exp is xsf's, bit-identical to SciPy. This is a TRUE relative tolerance, a few ulp. It
+// was 2e-6 scaled by max(|value|, 1), wide enough to pass the Acklam rational it replaced at
+// 1.1e-9 relative (frankenscipy-qbwth).
+const NDTRI_EXP_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per SciPy function compared.
 const ARMS: [&str; 4] = ["ndtr", "log_ndtr", "ndtri", "ndtri_exp"];
@@ -137,6 +143,12 @@ fn generate_query() -> OracleQuery {
         0.999,
         1.0 - 1.0e-6,
         1.0 - 1.0e-9,
+        // Points where the 16-digit tables missed SciPy by an ulp: the central rational, the
+        // z < 8 tail, its reflection, and 1e-20 for the z >= 8 table.
+        0.798_523_345_806_105_5,
+        0.048_965_581_752_949_63,
+        0.870_088_502_327_503_3,
+        1.0e-20,
     ];
     // ndtri_exp takes log-probabilities directly and must stay finite
     // in both tails where ndtri(exp(y)) loses information.
@@ -152,6 +164,13 @@ fn generate_query() -> OracleQuery {
         -0.1,
         -1.0e-9,
         -1.0e-20,
+        // Either side of xsf's switches at -2 and log1p(-exp(-2)), and one inside the central
+        // range, where the Acklam rational this replaced was ~1e-9 off.
+        -2.0001,
+        -1.9999,
+        -0.5,
+        -0.145,
+        -1.0e10,
     ];
 
     let mut points = Vec::new();
@@ -303,14 +322,8 @@ fn diff_special_ndtr() {
         let pass = match case.func.as_str() {
             "ndtr" => abs_diff <= NDTR_TOL,
             "log_ndtr" => abs_diff <= LOG_NDTR_TOL,
-            "ndtri" => {
-                let scale = scipy_v.abs().max(1.0);
-                abs_diff <= NDTRI_TOL_REL * scale
-            }
-            "ndtri_exp" => {
-                let scale = scipy_v.abs().max(1.0);
-                abs_diff <= NDTRI_EXP_TOL_REL * scale
-            }
+            "ndtri" => abs_diff <= NDTRI_TOL_REL * scipy_v.abs(),
+            "ndtri_exp" => abs_diff <= NDTRI_EXP_TOL_REL * scipy_v.abs(),
             _ => false,
         };
         ledger.compared(arm, &case.case_id, pass);

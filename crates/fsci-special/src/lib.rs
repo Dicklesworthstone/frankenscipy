@@ -3674,6 +3674,79 @@ mod tests {
     }
 
     #[test]
+    fn ndtri_ndtri_exp_and_erfcinv_are_scipy_bit_for_bit() {
+        // scipy.special.ndtri / erfcinv 1.17.1, one point per branch: central rational, lower
+        // tail with z < 8 and z >= 8, and the reflected upper tail. With the old 16-digit
+        // tables each of these came out 1 ulp off SciPy (frankenscipy-qbwth).
+        let cases = [
+            (0.7985233458061055, 0.8363583994945307),
+            (0.04896558175294963, -1.654967140649188),
+            (4.934218154990496e-287, -36.18666428536214),
+            (0.8700885023275033, 1.126809589148029),
+        ];
+        for (p, want) in cases {
+            for unrolled in [true, false] {
+                let got = crate::convenience::ndtri_scalar_with(p, unrolled);
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "ndtri({p:e}) unrolled={unrolled} = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        // ndtri_exp: xsf's three routes (tail rational in sqrt(-2y), ndtri(exp(y)),
+        // -ndtri(-expm1(y))). The Acklam rational it replaced was ~1e-9 relative off.
+        for (y, want) in [
+            (-0.001, 3.090380786917045),
+            (-0.5, 0.27028802073873587),
+            (-1.9999, -1.1014574009882083),
+            (-2.0001, -1.101581854051879),
+            (-10.0, -3.913946240531893),
+            (-700.0, -37.295079632647415),
+            (-1e10, -141421.35614695237),
+        ] {
+            let got = crate::convenience::ndtri_exp_scalar(y);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "ndtri_exp({y:e}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        for (y, want) in [(0.5, 0.4769362762044699), (1.5, -0.4769362762044699)] {
+            // Anything but a real scalar becomes NaN, which the bit comparison rejects.
+            let got = match erfcinv(&SpecialTensor::RealScalar(y), RuntimeMode::Strict) {
+                Ok(SpecialTensor::RealScalar(v)) => v,
+                _ => f64::NAN,
+            };
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "erfcinv({y}) = {got:e}, SciPy {want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn spence_is_scipy_cephes_bit_for_bit() {
+        // scipy.special.spence 1.17.1 in each of Cephes' four argument ranges. With the old
+        // 16-digit SPENCE_B each came out 1-6 ulp off SciPy (frankenscipy-qbwth).
+        let cases = [
+            (0.6515419737010752, 0.38470911102299943),
+            (0.2658773446759721, 0.9494745952599211),
+            (1.9508639347904655, -0.7881726116023027),
+            (2.8681720908755537, -1.3633736011234079),
+        ];
+        for (x, want) in cases {
+            let got = crate::convenience::spence_scalar(x);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "spence({x}) = {got:e}, SciPy {want:e}"
+            );
+        }
+    }
+
+    #[test]
     fn zeta_matches_scipy_reference_values() {
         // scipy.special.zeta([2, 3, 4])
         let inputs = [2.0, 3.0, 4.0];

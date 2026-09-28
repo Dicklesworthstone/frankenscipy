@@ -74,45 +74,8 @@ pub const CONVENIENCE_DISPATCH_PLAN: &[DispatchPlan] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 const DILOG_SERIES_MAX_TERMS: usize = 128;
 const PI_SQUARED_OVER_SIX: f64 = PI * PI / 6.0;
-const NDTRI_EXP_LOG_P_LOW: f64 = -3.719_338_661_598_645;
-const NDTRI_EXP_LOG_P_HIGH: f64 = -0.024_548_872_921_412_7;
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_A: [f64; 6] = [
-    -3.969_683_028_665_376e1,
-    2.209_460_984_245_205e2,
-    -2.759_285_104_469_687e2,
-    1.383_577_518_672_690e2,
-    -3.066_479_806_614_716e1,
-    2.506_628_277_459_239,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_B: [f64; 5] = [
-    -5.447_609_879_822_406e1,
-    1.615_858_368_580_409e2,
-    -1.556_989_798_598_866e2,
-    6.680_131_188_771_972e1,
-    -1.328_068_155_288_572e1,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_C: [f64; 6] = [
-    -7.784_894_002_430_293e-3,
-    -3.223_964_580_411_365e-1,
-    -2.400_758_277_161_838,
-    -2.549_732_539_343_734,
-    4.374_664_141_464_968,
-    2.938_163_982_698_783,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_D: [f64; 4] = [
-    7.784_695_709_041_462e-3,
-    3.224_671_290_700_398e-1,
-    2.445_134_137_142_996,
-    3.754_408_661_907_416,
-];
+/// `log1p(-exp(-2))`, where xsf's `ndtri_exp` switches to `-ndtri(-expm1(y))`.
+const NDTRI_EXP_UPPER: f64 = -0.14541345786885906;
 
 /// Normalized sinc function: sin(πx) / (πx).
 ///
@@ -597,69 +560,80 @@ fn cephes_ndtri_p1evl_simd(x: Simd<f64, 8>, coefficients: &[f64]) -> Simd<f64, 8
 const CEPHES_NDTRI_EXP_NEG2: f64 = 0.135_335_283_236_612_7;
 const CEPHES_NDTRI_SQRT_2PI: f64 = 2.506_628_274_631_000_7;
 
+// The Cephes tables verbatim from xsf/cephes/ndtri.h, which SciPy's ndtri uses. They were
+// once each rounded to 16 significant digits, and seven entries of Q0, P1 and P2 then parsed
+// to a double 1-2 ulp away from Cephes's. That made ndtri, erfcinv and every quantile built
+// on them differ from SciPy in the last bit (frankenscipy-qbwth). The full decimals below
+// parse to Cephes's doubles.
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P0: [f64; 5] = [
-    -5.996_335_010_141_079e1,
-    9.800_107_541_859_997e1,
-    -5.667_628_574_690_703e1,
-    1.393_126_093_872_796_8e1,
-    -1.239_165_838_673_812_5,
+    -5.99633501014107895267E1,
+    9.80010754185999661536E1,
+    -5.66762857469070293439E1,
+    1.39312609387279679503E1,
+    -1.23916583867381258016E0,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q0: [f64; 8] = [
-    1.954_488_583_381_417_6,
-    4.676_279_128_988_815,
-    8.636_024_213_908_906e1,
-    -2.254_626_878_541_193_8e2,
-    2.002_602_123_800_606_6e2,
-    -8.203_722_561_683_333e1,
-    1.590_562_251_262_117e1,
-    -1.183_316_211_213_300_1,
+    1.95448858338141759834E0,
+    4.67627912898881538453E0,
+    8.63602421390890590575E1,
+    -2.25462687854119370527E2,
+    2.00260212380060660359E2,
+    -8.20372256168333339912E1,
+    1.59056225126211695515E1,
+    -1.18331621121330003142E0,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P1: [f64; 9] = [
-    4.055_448_923_059_624,
-    3.152_510_945_998_938_5e1,
-    5.716_281_922_464_213e1,
-    4.408_050_738_932_008e1,
-    1.468_495_619_288_580_2e1,
-    2.186_633_068_507_902_5,
-    -1.402_560_791_713_545e-1,
-    -3.504_246_268_278_482e-2,
-    -8.574_567_851_546_854e-4,
+    4.05544892305962419923E0,
+    3.15251094599893866154E1,
+    5.71628192246421288162E1,
+    4.40805073893200834700E1,
+    1.46849561928858024014E1,
+    2.18663306850790267539E0,
+    -1.40256079171354495875E-1,
+    -3.50424626827848203418E-2,
+    -8.57456785154685413611E-4,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q1: [f64; 8] = [
-    1.577_998_832_564_667_5e1,
-    4.539_076_351_288_792e1,
-    4.131_720_382_546_72e1,
-    1.504_253_856_929_075e1,
-    2.504_649_462_083_094,
-    -1.421_829_228_547_877_8e-1,
-    -3.808_064_076_915_783e-2,
-    -9.332_594_808_954_574e-4,
+    1.57799883256466749731E1,
+    4.53907635128879210584E1,
+    4.13172038254672030440E1,
+    1.50425385692907503408E1,
+    2.50464946208309415979E0,
+    -1.42182922854787788574E-1,
+    -3.80806407691578277194E-2,
+    -9.33259480895457427372E-4,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P2: [f64; 9] = [
-    3.237_748_917_769_460_3,
-    6.915_228_890_689_842,
-    3.938_810_252_924_744_4,
-    1.333_034_608_158_075_5,
-    2.014_853_895_491_790_8e-1,
-    1.237_166_348_178_200_2e-2,
-    3.015_815_535_082_354e-4,
-    2.658_069_746_867_375_5e-6,
-    6.239_745_391_849_833e-9,
+    3.23774891776946035970E0,
+    6.91522889068984211695E0,
+    3.93881025292474443415E0,
+    1.33303460815807542389E0,
+    2.01485389549179081538E-1,
+    1.23716634817820021358E-2,
+    3.01581553508235416007E-4,
+    2.65806974686737550832E-6,
+    6.23974539184983293730E-9,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q2: [f64; 8] = [
-    6.024_270_393_647_42,
-    3.679_835_638_561_608_7,
-    1.377_020_994_890_813_2,
-    2.162_369_935_944_966_3e-1,
-    1.342_040_060_885_431_8e-2,
-    3.280_144_646_821_277_4e-4,
-    2.892_478_647_453_806_8e-6,
-    6.790_194_080_099_813e-9,
+    6.02427039364742014255E0,
+    3.67983563856160859403E0,
+    1.37702099489081330271E0,
+    2.16236993594496635890E-1,
+    1.34204006088543189037E-2,
+    3.28014464682127739104E-4,
+    2.89247864745380683936E-6,
+    6.79019408009981274425E-9,
 ];
 
 /// Horner with the degree known at COMPILE time, taking the table as an array rather than a
@@ -723,64 +697,45 @@ pub fn ndtri_exp(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real("ndtri_exp", y_tensor, mode, |y| Ok(ndtri_exp_scalar(y)))
 }
 
-/// Scalar helper for `ndtri_exp`.
+/// Scalar helper for `ndtri_exp`: xsf's `ndtri_exp`, bit-identical to SciPy 1.17.1 on 150,006
+/// points (log-magnitudes 1e-300 to 1e300).
+/// - y < -2: Cephes ndtri's tail rational applied directly to sqrt(-2y).
+/// - y above log1p(-exp(-2)): -ndtri(-expm1(y)).
+/// - Otherwise: ndtri(exp(y)).
+///
+/// It replaces Acklam's rational with no refinement, which was 1.1e-9 relative off SciPy
+/// (frankenscipy-qbwth). NaN and y > 0 give NaN, y = 0 gives +inf and -inf gives -inf, as in
+/// SciPy.
 #[must_use]
 pub fn ndtri_exp_scalar(log_p: f64) -> f64 {
-    if log_p.is_nan() {
-        return f64::NAN;
-    }
-    if log_p > 0.0 {
-        return f64::NAN;
-    }
-    if log_p == 0.0 {
-        return f64::INFINITY;
-    }
-    if log_p == f64::NEG_INFINITY {
+    if log_p < -f64::MAX {
         return f64::NEG_INFINITY;
     }
-
-    if log_p <= NDTRI_EXP_LOG_P_LOW {
-        return ndtri_exp_lower_tail_from_log_p(log_p);
+    if log_p < -2.0 {
+        return ndtri_exp_small_y(log_p);
     }
-    if log_p >= NDTRI_EXP_LOG_P_HIGH {
-        let upper_tail = -log_p.exp_m1();
-        if upper_tail == 0.0 {
-            return f64::INFINITY;
-        }
-        return -ndtri_exp_lower_tail_from_log_p(upper_tail.ln());
+    if log_p > NDTRI_EXP_UPPER {
+        return -ndtri_scalar(-log_p.exp_m1());
     }
-
-    ndtri_exp_central(log_p.exp())
+    ndtri_scalar(log_p.exp())
 }
 
-fn ndtri_exp_lower_tail_from_log_p(log_p: f64) -> f64 {
-    let q = (-2.0 * log_p).sqrt();
-    let numerator =
-        (((((NDTRI_EXP_C[0] * q + NDTRI_EXP_C[1]) * q + NDTRI_EXP_C[2]) * q + NDTRI_EXP_C[3]) * q
-            + NDTRI_EXP_C[4])
-            * q)
-            + NDTRI_EXP_C[5];
-    let denominator =
-        ((((NDTRI_EXP_D[0] * q + NDTRI_EXP_D[1]) * q + NDTRI_EXP_D[2]) * q + NDTRI_EXP_D[3]) * q)
-            + 1.0;
-    numerator / denominator
-}
-
-fn ndtri_exp_central(p: f64) -> f64 {
-    let q = p - 0.5;
-    let r = q * q;
-    let numerator =
-        (((((NDTRI_EXP_A[0] * r + NDTRI_EXP_A[1]) * r + NDTRI_EXP_A[2]) * r + NDTRI_EXP_A[3]) * r
-            + NDTRI_EXP_A[4])
-            * r
-            + NDTRI_EXP_A[5])
-            * q;
-    let denominator =
-        (((((NDTRI_EXP_B[0] * r + NDTRI_EXP_B[1]) * r + NDTRI_EXP_B[2]) * r + NDTRI_EXP_B[3]) * r
-            + NDTRI_EXP_B[4])
-            * r)
-            + 1.0;
-    numerator / denominator
+/// xsf's `ndtri_exp_small_y`: `sqrt(-2y)` rather than `sqrt(-2 log p)`, since p itself would
+/// underflow.
+fn ndtri_exp_small_y(y: f64) -> f64 {
+    let x = if y >= -f64::MAX * 0.5 {
+        (-2.0 * y).sqrt()
+    } else {
+        std::f64::consts::SQRT_2 * (-y).sqrt()
+    };
+    let x0 = x - x.ln() / x;
+    let z = 1.0 / x;
+    let x1 = if x < 8.0 {
+        z * ndtri_pe::<_, true>(z, &CEPHES_NDTRI_P1) / ndtri_p1e::<_, true>(z, &CEPHES_NDTRI_Q1)
+    } else {
+        z * ndtri_pe::<_, true>(z, &CEPHES_NDTRI_P2) / ndtri_p1e::<_, true>(z, &CEPHES_NDTRI_Q2)
+    };
+    x1 - x0
 }
 
 /// Recover the mean of a normal distribution from a CDF value, standard deviation, and quantile.
@@ -4544,15 +4499,19 @@ const SPENCE_A: [f64; 8] = [
     3.297_713_409_852_251e0,
     1.000_000_000_000_000_1e0,
 ];
+// Verbatim from xsf/cephes/spence.h. Rounded to 16 digits, two entries parsed 1 ulp away from
+// Cephes's doubles; the last, 9.99999999999999998740E-1, is exactly 1.0 as a double
+// (frankenscipy-qbwth).
+#[allow(clippy::excessive_precision)]
 const SPENCE_B: [f64; 8] = [
-    6.909_904_889_125_533e-4,
-    2.540_437_639_325_444e-2,
-    2.829_748_606_025_681e-1,
-    1.411_725_977_518_310_7e0,
-    3.638_005_333_451_371e0,
-    5.032_788_801_433_170e0,
-    3.547_713_409_852_251e0,
-    9.999_999_999_999_999e-1,
+    6.90990488912553276999E-4,
+    2.54043763932544379113E-2,
+    2.82974860602568089943E-1,
+    1.41172597751831069617E0,
+    3.63800533345137075418E0,
+    5.03278880143316990390E0,
+    3.54771340985225096217E0,
+    9.99999999999999998740E-1,
 ];
 
 #[inline]
