@@ -7205,6 +7205,15 @@ pub fn pcg(
     })
 }
 
+/// The Krylov dimension [`gmres`] restarts at, capped at `n`: SciPy's default `restart=20`
+/// (`scipy/sparse/linalg/_isolve/iterative.py`, `restart = min(restart, n)`).
+///
+/// frankenscipy-felow set it to 20 in f10be8e16, and a rustfmt pass (1e12c2d6e) applied
+/// afterwards put back 30. That left fsci at 244 inner iterations where SciPy takes 163 at
+/// side 64, while `perf_sparse_vs_scipy` kept printing 20. It is a named constant now, and the
+/// harness prints it.
+pub const GMRES_DEFAULT_RESTART: usize = 20;
+
 /// GMRES (Generalized Minimal Residual) solver for general (non-symmetric) sparse systems.
 ///
 /// Solves Ax = b for general square A using restarted GMRES with Arnoldi iteration.
@@ -7229,7 +7238,7 @@ pub fn gmres(
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
     let max_iter = options.max_iter.unwrap_or(n * 10);
-    let restart = n.min(30); // Krylov subspace dimension before restart
+    let restart = n.min(GMRES_DEFAULT_RESTART);
 
     let mut x = match x0 {
         Some(initial) => {
@@ -26546,6 +26555,55 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
+    }
+
+    #[test]
+    fn gmres_restart_and_inner_iterations_match_scipy() {
+        // 2-D convection-diffusion on an m×m grid (h = 1/(m+1)), rhs of ones, rtol 1e-8.
+        // SciPy 1.17.1 gmres, counting inner iterations with callback_type='pr_norm':
+        // 56, 98 and 108. Restart 30, which a rustfmt pass had put back, takes a different
+        // Krylov path (frankenscipy-felow).
+        fn convdiff(m: usize, pe: f64) -> CsrMatrix {
+            let h = 1.0 / (m as f64 + 1.0);
+            let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..m {
+                for j in 0..m {
+                    let k = i * m + j;
+                    vals.push(4.0);
+                    rows.push(k);
+                    cols.push(k);
+                    for (di, dj, c) in [
+                        (0_isize, 1_isize, -1.0 + pe * h / 2.0),
+                        (0, -1, -1.0 - pe * h / 2.0),
+                        (1, 0, -1.0),
+                        (-1, 0, -1.0),
+                    ] {
+                        let (ii, jj) = (i as isize + di, j as isize + dj);
+                        if (0..m as isize).contains(&ii) && (0..m as isize).contains(&jj) {
+                            vals.push(c);
+                            rows.push(k);
+                            cols.push(ii as usize * m + jj as usize);
+                        }
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(m * m, m * m), vals, rows, cols, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        }
+        assert_eq!(GMRES_DEFAULT_RESTART, 20);
+        for (m, pe, scipy_inner) in [(12, 10.0, 56), (16, 50.0, 98), (20, 5.0, 108)] {
+            let a = convdiff(m, pe);
+            let b = vec![1.0; m * m];
+            let options = IterativeSolveOptions {
+                tol: 1e-8,
+                ..IterativeSolveOptions::default()
+            };
+            let result = gmres(&a, &b, None, options).expect("gmres");
+            assert!(result.converged, "m={m} pe={pe}");
+            assert_eq!(result.iterations, scipy_inner, "m={m} pe={pe}");
+        }
     }
 
     #[test]
