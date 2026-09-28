@@ -107,8 +107,9 @@ struct DiffLog {
 
 fn point_case(case_id: String, points: Vec<Vec<f64>>, seed: u64) -> PointCase {
     let d = points[0].len();
-    // 80 queries: a 2-D batch that large takes fsci's grid locator; 3-D and up take the walk.
-    let queries = lcg_points(80, d, seed ^ 0x5bd1_e995)
+    // 100 queries: a 2-D batch that large takes fsci's grid locator; 3-D and up take the walk.
+    // Over the 12 Delaunay cases that is 1200, the bead's 1000 with room for boundary drops.
+    let queries = lcg_points(100, d, seed ^ 0x5bd1_e995)
         .into_iter()
         .map(|q| q.into_iter().map(|x| 1.2 * x - 0.1).collect())
         .collect();
@@ -1226,5 +1227,115 @@ fn diff_spatial_qhull_degenerate() {
         }
     }
     emit_log("diff_spatial_qhull_degenerate", cases.len(), &ledger, notes);
+    ledger.finish(cases.len());
+}
+
+/// Cospherical and lattice input: cube and hypercube corners, a cube with its centre, a 3-D
+/// lattice and a 2-D grid. The Delaunay triangulation is not unique here, so simplex sets are
+/// not compared.
+fn cospherical_cases() -> Vec<PointCase> {
+    let corners = |d: usize| -> Vec<Vec<f64>> {
+        (0..1usize << d)
+            .map(|mask| (0..d).map(|k| ((mask >> k) & 1) as f64).collect())
+            .collect()
+    };
+    let lattice = |d: usize, n: usize| -> Vec<Vec<f64>> {
+        (0..n.pow(d as u32))
+            .map(|index| {
+                let mut rest = index;
+                (0..d)
+                    .map(|_| {
+                        let c = (rest % n) as f64 / (n - 1) as f64;
+                        rest /= n;
+                        c
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let mut cube_and_centre = corners(3);
+    cube_and_centre.push(vec![0.5, 0.5, 0.5]);
+    vec![
+        point_case("cube_corners_3d".into(), corners(3), 11),
+        point_case("cube_corners_centre_3d".into(), cube_and_centre, 12),
+        point_case("lattice_3d_3x3x3".into(), lattice(3, 3), 13),
+        point_case("grid_2d_5x5".into(), lattice(2, 5), 14),
+        point_case("hypercube_corners_4d".into(), corners(4), 15),
+    ]
+}
+
+/// What must hold on cospherical input is SciPy's behaviour class.
+/// - The hull has SciPy's vertex set, area and volume.
+/// - The triangulation is valid: every fsci simplex is non-degenerate, and both sides' simplex
+///   volumes sum to the hull volume.
+#[test]
+fn diff_spatial_qhull_cospherical() {
+    let cases = cospherical_cases();
+    let query = Query {
+        hull: cases.clone(),
+        delaunay: cases.clone(),
+        ..Query::default()
+    };
+    let Some(oracle) = scipy_oracle_or_skip(&query) else {
+        return;
+    };
+    let hull = by_case(&oracle, "hull");
+    let tri = by_case(&oracle, "delaunay");
+    let mut ledger =
+        CompareLedger::new("diff_spatial_qhull_cospherical", &["hull", "triangulation"]);
+    let mut notes = Vec::new();
+    let mut worst = Worst::default();
+    for case in &cases {
+        let id = case.case_id.as_str();
+        let s_hull = hull[id].get("error").is_none().then_some(&hull[id]);
+        let fsci_hull = ConvexHull::new(&case.points).ok();
+        if let Some((s, h)) = ledger.both("hull", id, s_hull, fsci_hull.as_ref()) {
+            let mut want: Vec<usize> = ints(&s["vertices"]).iter().map(|&v| v as usize).collect();
+            want.sort_unstable();
+            let mut got = h.vertices.clone();
+            got.sort_unstable();
+            worst.rel("hull measures (rel)", h.volume, num(&s["volume"]));
+            worst.rel("hull measures (rel)", h.area, num(&s["area"]));
+            let pass = got == want
+                && rel_close(h.volume, num(&s["volume"]), MEASURE_REL_TOL)
+                && rel_close(h.area, num(&s["area"]), MEASURE_REL_TOL);
+            ledger.compared("hull", id, pass);
+        }
+        let s_tri = tri[id].get("error").is_none().then_some(&tri[id]);
+        let fsci_tri = Delaunay::new(&case.points).ok();
+        if let Some((s, t)) = ledger.both("triangulation", id, s_tri, fsci_tri.as_ref()) {
+            let volume = num(&hull[id]["volume"]);
+            let theirs = usize_rows(&s["simplices"]);
+            let ours: Vec<f64> = t
+                .simplices
+                .iter()
+                .map(|simplex| simplex_volume(&case.points, simplex))
+                .collect();
+            let total: f64 = ours.iter().sum();
+            let scipy_total: f64 = theirs
+                .iter()
+                .map(|simplex| simplex_volume(&case.points, simplex))
+                .sum();
+            let thinnest = ours.iter().copied().fold(f64::INFINITY, f64::min);
+            worst.rel("triangulation volume sum (rel)", total, volume);
+            notes.push(format!(
+                "{id}: fsci {} simplices, SciPy {}; volume sums {total} and {scipy_total} of hull \
+                 {volume}; thinnest fsci simplex {thinnest:e}",
+                t.simplices.len(),
+                theirs.len()
+            ));
+            let pass = rel_close(total, volume, MEASURE_REL_TOL)
+                && rel_close(scipy_total, volume, MEASURE_REL_TOL)
+                && thinnest > 1e-12 * volume;
+            ledger.compared("triangulation", id, pass);
+        }
+    }
+    notes.extend(worst.notes());
+    emit_log(
+        "diff_spatial_qhull_cospherical",
+        cases.len(),
+        &ledger,
+        notes,
+    );
     ledger.finish(cases.len());
 }
