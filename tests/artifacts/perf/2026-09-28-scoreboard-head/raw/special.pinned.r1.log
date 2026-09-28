@@ -1,0 +1,354 @@
+gammaln_hoist_threshold=true
+gamma_family_prealloc_fill=true
+gammaln_cephes_lgam=true
+iv_series_term_ratio=true
+beta_cephes_direct=true
+gamma_cephes_reflection_free=true
+gamma_infallible_batch=true
+rgamma_cephes_cheb=true
+gamma_cephes_rational=true
+bessel_k01_cephes=true
+bessel_y01_cephes_large=true
+bessel_i01_cephes=true
+zeta_cephes_rational=true
+elf_sha256=b8c631d609344742215602079301bac5215e3d93227fe2176a1595c8a618f406
+elf_sha256=b8c631d609344742215602079301bac5215e3d93227fe2176a1595c8a618f406
+provenance_before host=thinkstation1 cpu_model=AMD_Ryzen_Threadripper_PRO_5975WX_32-Cores physical_cores=32 logical_threads=1 ram_kb=226257632 numa_nodes=1 governor=powersave loadavg=[12.29 24.93 22.56 2/2449 1113872]
+provenance_before host=thinkstation1 cpu_model=AMD_Ryzen_Threadripper_PRO_5975WX_32-Cores physical_cores=32 logical_threads=1 ram_kb=226257632 numa_nodes=1 governor=powersave loadavg=[12.29 24.93 22.56 2/2449 1113872]
+n=200000 gammaln_crossover=20
+n=200000 op=gammaln domain=[0.01, 60]
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=gammaln n=200000 fixture_sha256=7ef98ceb920a4458ce91ad670236c4c9c84d6fa09d7db336d07586df76adc00c tasks=1 genuine=True out_len=200000
+op=gammaln calibration single=2.4968ms reps=9
+case=n200000 op=gammaln fsci=2.595ms scipy=1.823ms scipy/fsci=0.702x null_fsci=1.003 null_scipy=1.001 CHECK max_abs=1.88737914186276612e-15 max_rel=2.73644469638430760e-15 compared=200000 nonfinite_mismatch=0
+case=n200000 op=gammaln fsci=2.595ms scipy=1.823ms scipy/fsci=0.702x null_fsci=1.003 null_scipy=1.001 CHECK max_abs=1.88737914186276612e-15 max_rel=2.73644469638430760e-15 compared=200000 nonfinite_mismatch=0
+armab op=gammaln lever=cephes_lgam control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=gammaln lever=cephes_lgam control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=gammaln lever=cephes_lgam on=2.597ms off=2.681ms rounds=25
+armab op=gammaln lever=cephes_lgam on=2.597ms off=2.681ms rounds=25
+armab op=gammaln lever=cephes_lgam off/on=1.032x paired_median=1.031x paired_min=0.991x paired_max=1.202x null_on=1.009 null_off=1.023
+armab op=gammaln lever=cephes_lgam off/on=1.032x paired_median=1.031x paired_min=0.991x paired_max=1.202x null_on=1.009 null_off=1.023
+armab op=gammaln lever=cephes_lgam crosswindow scipy/on=0.702x scipy/off=0.680x (case line reports scipy/off)
+armab op=gammaln lever=cephes_lgam crosswindow scipy/on=0.702x scipy/off=0.680x (case line reports scipy/off)
+armab op=gammaln lever=cephes_lgam arm=on  CHECK max_abs=1.88737914186276612e-15 max_rel=2.73644469638430760e-15 compared=200000 nonfinite_mismatch=0
+armab op=gammaln lever=cephes_lgam arm=on  CHECK max_abs=1.88737914186276612e-15 max_rel=2.73644469638430760e-15 compared=200000 nonfinite_mismatch=0
+armab op=gammaln lever=cephes_lgam arm=off CHECK max_abs=2.84217094304040074e-14 max_rel=4.45340227594766505e-11 compared=200000 nonfinite_mismatch=0
+armab op=gammaln lever=cephes_lgam arm=off CHECK max_abs=2.84217094304040074e-14 max_rel=4.45340227594766505e-11 compared=200000 nonfinite_mismatch=0
+n=200000 op=digamma domain=[0.01, 60]
+READY scipy=1.17.1 numpy=2.4.3 op=digamma n=200000 fixture_sha256=7ef98ceb920a4458ce91ad670236c4c9c84d6fa09d7db336d07586df76adc00c tasks=1 genuine=True out_len=200000
+op=digamma calibration single=2.2217ms reps=10
+case=n200000 op=digamma fsci=2.229ms scipy=1.990ms scipy/fsci=0.893x null_fsci=1.086 null_scipy=1.041 CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+case=n200000 op=digamma fsci=2.229ms scipy=1.990ms scipy/fsci=0.893x null_fsci=1.086 null_scipy=1.041 CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+armab op=digamma lever=force_serial control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=digamma lever=force_serial control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=digamma lever=force_serial on=2.169ms off=2.235ms rounds=25
+armab op=digamma lever=force_serial on=2.169ms off=2.235ms rounds=25
+armab op=digamma lever=force_serial off/on=1.030x paired_median=1.028x paired_min=0.990x paired_max=1.068x null_on=1.002 null_off=1.008
+armab op=digamma lever=force_serial off/on=1.030x paired_median=1.028x paired_min=0.990x paired_max=1.068x null_on=1.002 null_off=1.008
+armab op=digamma lever=force_serial crosswindow scipy/on=0.918x scipy/off=0.891x (case line reports scipy/off)
+armab op=digamma lever=force_serial crosswindow scipy/on=0.918x scipy/off=0.891x (case line reports scipy/off)
+armab op=digamma lever=force_serial arm=on  CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+armab op=digamma lever=force_serial arm=on  CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+armab op=digamma lever=force_serial arm=off CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+armab op=digamma lever=force_serial arm=off CHECK max_abs=2.84217094304040074e-14 max_rel=2.36603309863220025e-11 compared=200000 nonfinite_mismatch=0
+n=200000 op=gamma domain=[0.01, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=gamma n=200000 fixture_sha256=86cc7a1c44a8d6f2f68a69192810aeaa1f1cead0310f6b694856547c01da489b tasks=1 genuine=True out_len=200000
+op=gamma calibration single=3.5411ms reps=6
+case=n200000 op=gamma fsci=3.507ms scipy=2.683ms scipy/fsci=0.765x null_fsci=1.012 null_scipy=1.040 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+case=n200000 op=gamma fsci=3.507ms scipy=2.683ms scipy/fsci=0.765x null_fsci=1.012 null_scipy=1.040 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=gamma lever=force_serial control on_hits=1 off_hits=1 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=gamma lever=force_serial control on_hits=1 off_hits=1 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=gamma lever=force_serial on=3.416ms off=3.440ms rounds=25
+armab op=gamma lever=force_serial on=3.416ms off=3.440ms rounds=25
+armab op=gamma lever=force_serial off/on=1.007x paired_median=1.004x paired_min=0.969x paired_max=1.028x null_on=1.010 null_off=1.012
+armab op=gamma lever=force_serial off/on=1.007x paired_median=1.004x paired_min=0.969x paired_max=1.028x null_on=1.010 null_off=1.012
+armab op=gamma lever=force_serial crosswindow scipy/on=0.785x scipy/off=0.780x (case line reports scipy/off)
+armab op=gamma lever=force_serial crosswindow scipy/on=0.785x scipy/off=0.780x (case line reports scipy/off)
+armab op=gamma lever=force_serial arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=gamma lever=force_serial arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=gamma lever=force_serial arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=gamma lever=force_serial arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+n=200000 op=rgamma domain=[-10, 10]
+READY scipy=1.17.1 numpy=2.4.3 op=rgamma n=200000 fixture_sha256=81fc51653a92c4868254e45593405c9f0d983ef1db4e75ef61648b35fde003ee tasks=1 genuine=True out_len=200000
+op=rgamma calibration single=4.3648ms reps=5
+case=n200000 op=rgamma fsci=4.346ms scipy=3.438ms scipy/fsci=0.791x null_fsci=1.024 null_scipy=1.018 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+case=n200000 op=rgamma fsci=4.346ms scipy=3.438ms scipy/fsci=0.791x null_fsci=1.024 null_scipy=1.018 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=rgamma lever=hoist_flag_out_of_kernel control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=rgamma lever=hoist_flag_out_of_kernel control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=rgamma lever=hoist_flag_out_of_kernel on=4.336ms off=4.714ms rounds=25
+armab op=rgamma lever=hoist_flag_out_of_kernel on=4.336ms off=4.714ms rounds=25
+armab op=rgamma lever=hoist_flag_out_of_kernel off/on=1.087x paired_median=1.079x paired_min=1.047x paired_max=1.127x null_on=1.016 null_off=1.013
+armab op=rgamma lever=hoist_flag_out_of_kernel off/on=1.087x paired_median=1.079x paired_min=1.047x paired_max=1.127x null_on=1.016 null_off=1.013
+armab op=rgamma lever=hoist_flag_out_of_kernel crosswindow scipy/on=0.793x scipy/off=0.729x (case line reports scipy/off)
+armab op=rgamma lever=hoist_flag_out_of_kernel crosswindow scipy/on=0.793x scipy/off=0.729x (case line reports scipy/off)
+armab op=rgamma lever=hoist_flag_out_of_kernel arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=rgamma lever=hoist_flag_out_of_kernel arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=rgamma lever=hoist_flag_out_of_kernel arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=rgamma lever=hoist_flag_out_of_kernel arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+n=200000 op=zeta domain=[1.5, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=zeta n=200000 fixture_sha256=abbcc8a4be60bfcf069c335d5b0b9fcc48feaf953b6875d4f54bfa8c0eaaaecc tasks=1 genuine=True out_len=200000
+op=zeta calibration single=3.2585ms reps=7
+case=n200000 op=zeta fsci=3.327ms scipy=4.901ms scipy/fsci=1.473x null_fsci=1.012 null_scipy=1.024 CHECK max_abs=4.44089209850062616e-16 max_rel=2.74499242045015610e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=zeta fsci=3.327ms scipy=4.901ms scipy/fsci=1.473x null_fsci=1.012 null_scipy=1.024 CHECK max_abs=4.44089209850062616e-16 max_rel=2.74499242045015610e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=erf domain=[-6, 6]
+READY scipy=1.17.1 numpy=2.4.3 op=erf n=200000 fixture_sha256=ec2e61fc20e27fad28d6db2704f02cbbc87b19df41fcf7538a9fd0c2ec7c515c tasks=1 genuine=True out_len=200000
+op=erf calibration single=1.1096ms reps=19
+case=n200000 op=erf fsci=1.112ms scipy=2.203ms scipy/fsci=1.981x null_fsci=1.002 null_scipy=1.003 CHECK max_abs=1.11022302462515654e-16 max_rel=1.31739650323524071e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=erf fsci=1.112ms scipy=2.203ms scipy/fsci=1.981x null_fsci=1.002 null_scipy=1.003 CHECK max_abs=1.11022302462515654e-16 max_rel=1.31739650323524071e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=erfc domain=[-6, 6]
+READY scipy=1.17.1 numpy=2.4.3 op=erfc n=200000 fixture_sha256=ec2e61fc20e27fad28d6db2704f02cbbc87b19df41fcf7538a9fd0c2ec7c515c tasks=1 genuine=True out_len=200000
+op=erfc calibration single=1.2052ms reps=17
+case=n200000 op=erfc fsci=1.209ms scipy=2.072ms scipy/fsci=1.714x null_fsci=1.004 null_scipy=1.029 CHECK max_abs=2.22044604925031308e-16 max_rel=4.61977822367815274e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=erfc fsci=1.209ms scipy=2.072ms scipy/fsci=1.714x null_fsci=1.004 null_scipy=1.029 CHECK max_abs=2.22044604925031308e-16 max_rel=4.61977822367815274e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=erfinv domain=[-0.999, 0.999]
+READY scipy=1.17.1 numpy=2.4.3 op=erfinv n=200000 fixture_sha256=97c6c46d3fbd01c45ee90d53ad46c174c818bdf78fc1f8c78fc58991b5adda28 tasks=1 genuine=True out_len=200000
+op=erfinv calibration single=3.2186ms reps=7
+case=n200000 op=erfinv fsci=3.214ms scipy=2.266ms scipy/fsci=0.705x null_fsci=1.003 null_scipy=1.020 CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+case=n200000 op=erfinv fsci=3.214ms scipy=2.266ms scipy/fsci=0.705x null_fsci=1.003 null_scipy=1.020 CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+armab op=erfinv lever=ndtri_unroll_polevl control on_hits=1 off_hits=1 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=erfinv lever=ndtri_unroll_polevl control on_hits=1 off_hits=1 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=erfinv lever=ndtri_unroll_polevl on=3.186ms off=3.246ms rounds=25
+armab op=erfinv lever=ndtri_unroll_polevl on=3.186ms off=3.246ms rounds=25
+armab op=erfinv lever=ndtri_unroll_polevl off/on=1.019x paired_median=1.021x paired_min=0.992x paired_max=1.075x null_on=1.005 null_off=1.011
+armab op=erfinv lever=ndtri_unroll_polevl off/on=1.019x paired_median=1.021x paired_min=0.992x paired_max=1.075x null_on=1.005 null_off=1.011
+armab op=erfinv lever=ndtri_unroll_polevl crosswindow scipy/on=0.711x scipy/off=0.698x (case line reports scipy/off)
+armab op=erfinv lever=ndtri_unroll_polevl crosswindow scipy/on=0.711x scipy/off=0.698x (case line reports scipy/off)
+armab op=erfinv lever=ndtri_unroll_polevl arm=on  CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+armab op=erfinv lever=ndtri_unroll_polevl arm=on  CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+armab op=erfinv lever=ndtri_unroll_polevl arm=off CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+armab op=erfinv lever=ndtri_unroll_polevl arm=off CHECK max_abs=2.26485497023531934e-14 max_rel=7.40907513953783678e-12 compared=200000 nonfinite_mismatch=0
+n=200000 op=erfcinv domain=[0.001, 1.999]
+READY scipy=1.17.1 numpy=2.4.3 op=erfcinv n=200000 fixture_sha256=a39fe4b4edd65c7d1a17448c52efd5ecda50395fc86b5fca28314cba4f79d81c tasks=1 genuine=True out_len=200000
+op=erfcinv calibration single=3.5272ms reps=6
+case=n200000 op=erfcinv fsci=3.606ms scipy=2.067ms scipy/fsci=0.573x null_fsci=1.008 null_scipy=1.013 CHECK max_abs=8.88178419700125232e-16 max_rel=1.15973903135397223e-15 compared=200000 nonfinite_mismatch=0
+case=n200000 op=erfcinv fsci=3.606ms scipy=2.067ms scipy/fsci=0.573x null_fsci=1.008 null_scipy=1.013 CHECK max_abs=8.88178419700125232e-16 max_rel=1.15973903135397223e-15 compared=200000 nonfinite_mismatch=0
+armab op=erfcinv lever=ndtri_not_acklam control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=erfcinv lever=ndtri_not_acklam control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=erfcinv lever=ndtri_not_acklam on=3.666ms off=1.768ms rounds=25
+armab op=erfcinv lever=ndtri_not_acklam on=3.666ms off=1.768ms rounds=25
+armab op=erfcinv lever=ndtri_not_acklam off/on=0.482x paired_median=0.485x paired_min=0.469x paired_max=0.498x null_on=1.005 null_off=1.008
+armab op=erfcinv lever=ndtri_not_acklam off/on=0.482x paired_median=0.485x paired_min=0.469x paired_max=0.498x null_on=1.005 null_off=1.008
+armab op=erfcinv lever=ndtri_not_acklam crosswindow scipy/on=0.564x scipy/off=1.169x (case line reports scipy/off)
+armab op=erfcinv lever=ndtri_not_acklam crosswindow scipy/on=0.564x scipy/off=1.169x (case line reports scipy/off)
+armab op=erfcinv lever=ndtri_not_acklam arm=on  CHECK max_abs=8.88178419700125232e-16 max_rel=1.15973903135397223e-15 compared=200000 nonfinite_mismatch=0
+armab op=erfcinv lever=ndtri_not_acklam arm=on  CHECK max_abs=8.88178419700125232e-16 max_rel=1.15973903135397223e-15 compared=200000 nonfinite_mismatch=0
+armab op=erfcinv lever=ndtri_not_acklam arm=off CHECK max_abs=2.28107133182220423e-09 max_rel=1.12892054034163799e-09 compared=200000 nonfinite_mismatch=0
+armab op=erfcinv lever=ndtri_not_acklam arm=off CHECK max_abs=2.28107133182220423e-09 max_rel=1.12892054034163799e-09 compared=200000 nonfinite_mismatch=0
+n=200000 op=dawsn domain=[-10, 10]
+READY scipy=1.17.1 numpy=2.4.3 op=dawsn n=200000 fixture_sha256=81fc51653a92c4868254e45593405c9f0d983ef1db4e75ef61648b35fde003ee tasks=1 genuine=True out_len=200000
+op=dawsn calibration single=1.8156ms reps=12
+case=n200000 op=dawsn fsci=1.874ms scipy=2.409ms scipy/fsci=1.285x null_fsci=1.021 null_scipy=1.016 CHECK max_abs=2.77555756156289135e-16 max_rel=7.51380257581934907e-15 compared=200000 nonfinite_mismatch=0
+case=n200000 op=dawsn fsci=1.874ms scipy=2.409ms scipy/fsci=1.285x null_fsci=1.021 null_scipy=1.016 CHECK max_abs=2.77555756156289135e-16 max_rel=7.51380257581934907e-15 compared=200000 nonfinite_mismatch=0
+n=200000 op=j0 domain=[-30, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=j0 n=200000 fixture_sha256=d4cdc4ff3e1b2291019b6e51103cc16f04d759359c6de51dccce754263db83ba tasks=1 genuine=True out_len=200000
+op=j0 calibration single=4.2299ms reps=5
+case=n200000 op=j0 fsci=4.442ms scipy=3.689ms scipy/fsci=0.831x null_fsci=1.002 null_scipy=1.002 CHECK max_abs=2.49800180540660222e-16 max_rel=9.41093002906640893e-11 compared=200000 nonfinite_mismatch=0
+case=n200000 op=j0 fsci=4.442ms scipy=3.689ms scipy/fsci=0.831x null_fsci=1.002 null_scipy=1.002 CHECK max_abs=2.49800180540660222e-16 max_rel=9.41093002906640893e-11 compared=200000 nonfinite_mismatch=0
+n=200000 op=j1 domain=[-30, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=j1 n=200000 fixture_sha256=d4cdc4ff3e1b2291019b6e51103cc16f04d759359c6de51dccce754263db83ba tasks=1 genuine=True out_len=200000
+op=j1 calibration single=3.3606ms reps=6
+case=n200000 op=j1 fsci=3.562ms scipy=3.705ms scipy/fsci=1.040x null_fsci=1.004 null_scipy=1.006 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+case=n200000 op=j1 fsci=3.562ms scipy=3.705ms scipy/fsci=1.040x null_fsci=1.004 null_scipy=1.006 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+n=200000 op=y0 domain=[0.01, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=y0 n=200000 fixture_sha256=86cc7a1c44a8d6f2f68a69192810aeaa1f1cead0310f6b694856547c01da489b tasks=1 genuine=True out_len=200000
+op=y0 calibration single=4.0132ms reps=5
+case=n200000 op=y0 fsci=4.039ms scipy=3.799ms scipy/fsci=0.941x null_fsci=1.005 null_scipy=1.015 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+case=n200000 op=y0 fsci=4.039ms scipy=3.799ms scipy/fsci=0.941x null_fsci=1.005 null_scipy=1.015 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y0 lever=force_serial control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=y0 lever=force_serial control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=y0 lever=force_serial on=4.013ms off=4.037ms rounds=25
+armab op=y0 lever=force_serial on=4.013ms off=4.037ms rounds=25
+armab op=y0 lever=force_serial off/on=1.006x paired_median=1.013x paired_min=0.972x paired_max=1.042x null_on=1.014 null_off=1.009
+armab op=y0 lever=force_serial off/on=1.006x paired_median=1.013x paired_min=0.972x paired_max=1.042x null_on=1.014 null_off=1.009
+armab op=y0 lever=force_serial crosswindow scipy/on=0.947x scipy/off=0.941x (case line reports scipy/off)
+armab op=y0 lever=force_serial crosswindow scipy/on=0.947x scipy/off=0.941x (case line reports scipy/off)
+armab op=y0 lever=force_serial arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y0 lever=force_serial arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y0 lever=force_serial arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y0 lever=force_serial arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+n=200000 op=y1 domain=[0.01, 30]
+READY scipy=1.17.1 numpy=2.4.3 op=y1 n=200000 fixture_sha256=86cc7a1c44a8d6f2f68a69192810aeaa1f1cead0310f6b694856547c01da489b tasks=1 genuine=True out_len=200000
+op=y1 calibration single=3.9707ms reps=6
+case=n200000 op=y1 fsci=4.101ms scipy=3.811ms scipy/fsci=0.929x null_fsci=1.008 null_scipy=1.027 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+case=n200000 op=y1 fsci=4.101ms scipy=3.811ms scipy/fsci=0.929x null_fsci=1.008 null_scipy=1.027 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y1 lever=hoist_flag_out_of_kernel control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=y1 lever=hoist_flag_out_of_kernel control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=y1 lever=hoist_flag_out_of_kernel on=4.070ms off=4.660ms rounds=25
+armab op=y1 lever=hoist_flag_out_of_kernel on=4.070ms off=4.660ms rounds=25
+armab op=y1 lever=hoist_flag_out_of_kernel off/on=1.145x paired_median=1.142x paired_min=1.114x paired_max=1.170x null_on=1.014 null_off=1.009
+armab op=y1 lever=hoist_flag_out_of_kernel off/on=1.145x paired_median=1.142x paired_min=1.114x paired_max=1.170x null_on=1.014 null_off=1.009
+armab op=y1 lever=hoist_flag_out_of_kernel crosswindow scipy/on=0.936x scipy/off=0.818x (case line reports scipy/off)
+armab op=y1 lever=hoist_flag_out_of_kernel crosswindow scipy/on=0.936x scipy/off=0.818x (case line reports scipy/off)
+armab op=y1 lever=hoist_flag_out_of_kernel arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y1 lever=hoist_flag_out_of_kernel arm=on  CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y1 lever=hoist_flag_out_of_kernel arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+armab op=y1 lever=hoist_flag_out_of_kernel arm=off CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+n=200000 op=i0 domain=[-15, 15]
+READY scipy=1.17.1 numpy=2.4.3 op=i0 n=200000 fixture_sha256=0ced16208cf52eee22abb29d8914b0cf7ab8093f2d49d76f53ec17c38062fe5c tasks=1 genuine=True out_len=200000
+op=i0 calibration single=6.7797ms reps=3
+case=n200000 op=i0 fsci=6.727ms scipy=7.663ms scipy/fsci=1.139x null_fsci=1.008 null_scipy=1.027 CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=i0 fsci=6.727ms scipy=7.663ms scipy/fsci=1.139x null_fsci=1.008 null_scipy=1.027 CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+armab op=i0 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=i0 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=i0 lever=hoist_element_flags on=6.665ms off=6.572ms rounds=25
+armab op=i0 lever=hoist_element_flags on=6.665ms off=6.572ms rounds=25
+armab op=i0 lever=hoist_element_flags off/on=0.986x paired_median=1.002x paired_min=0.961x paired_max=1.053x null_on=1.016 null_off=1.020
+armab op=i0 lever=hoist_element_flags off/on=0.986x paired_median=1.002x paired_min=0.961x paired_max=1.053x null_on=1.016 null_off=1.020
+armab op=i0 lever=hoist_element_flags crosswindow scipy/on=1.150x scipy/off=1.166x (case line reports scipy/off)
+armab op=i0 lever=hoist_element_flags crosswindow scipy/on=1.150x scipy/off=1.166x (case line reports scipy/off)
+armab op=i0 lever=hoist_element_flags arm=on  CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+armab op=i0 lever=hoist_element_flags arm=on  CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+armab op=i0 lever=hoist_element_flags arm=off CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+armab op=i0 lever=hoist_element_flags arm=off CHECK max_abs=5.82076609134674072e-11 max_rel=3.36600954083781655e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=i1 domain=[-15, 15]
+READY scipy=1.17.1 numpy=2.4.3 op=i1 n=200000 fixture_sha256=0ced16208cf52eee22abb29d8914b0cf7ab8093f2d49d76f53ec17c38062fe5c tasks=1 genuine=True out_len=200000
+op=i1 calibration single=6.9307ms reps=3
+case=n200000 op=i1 fsci=6.859ms scipy=7.801ms scipy/fsci=1.137x null_fsci=1.005 null_scipy=1.005 CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=i1 fsci=6.859ms scipy=7.801ms scipy/fsci=1.137x null_fsci=1.005 null_scipy=1.005 CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+armab op=i1 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=i1 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=i1 lever=hoist_element_flags on=6.829ms off=6.785ms rounds=25
+armab op=i1 lever=hoist_element_flags on=6.829ms off=6.785ms rounds=25
+armab op=i1 lever=hoist_element_flags off/on=0.994x paired_median=1.005x paired_min=0.965x paired_max=1.046x null_on=1.002 null_off=1.011
+armab op=i1 lever=hoist_element_flags off/on=0.994x paired_median=1.005x paired_min=0.965x paired_max=1.046x null_on=1.002 null_off=1.011
+armab op=i1 lever=hoist_element_flags crosswindow scipy/on=1.142x scipy/off=1.150x (case line reports scipy/off)
+armab op=i1 lever=hoist_element_flags crosswindow scipy/on=1.142x scipy/off=1.150x (case line reports scipy/off)
+armab op=i1 lever=hoist_element_flags arm=on  CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+armab op=i1 lever=hoist_element_flags arm=on  CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+armab op=i1 lever=hoist_element_flags arm=off CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+armab op=i1 lever=hoist_element_flags arm=off CHECK max_abs=5.82076609134674072e-11 max_rel=3.33497386263818696e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=k0 domain=[0.01, 20]
+READY scipy=1.17.1 numpy=2.4.3 op=k0 n=200000 fixture_sha256=eb63e00a143f952cb68e63ffd90f721625375c80d9c9fd6704892d8807d40b65 tasks=1 genuine=True out_len=200000
+op=k0 calibration single=6.6991ms reps=3
+case=n200000 op=k0 fsci=7.133ms scipy=7.485ms scipy/fsci=1.049x null_fsci=1.002 null_scipy=1.003 CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+case=n200000 op=k0 fsci=7.133ms scipy=7.485ms scipy/fsci=1.049x null_fsci=1.002 null_scipy=1.003 CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+armab op=k0 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=k0 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=k0 lever=hoist_element_flags on=7.027ms off=7.409ms rounds=25
+armab op=k0 lever=hoist_element_flags on=7.027ms off=7.409ms rounds=25
+armab op=k0 lever=hoist_element_flags off/on=1.054x paired_median=1.054x paired_min=1.011x paired_max=1.096x null_on=1.008 null_off=1.011
+armab op=k0 lever=hoist_element_flags off/on=1.054x paired_median=1.054x paired_min=1.011x paired_max=1.096x null_on=1.008 null_off=1.011
+armab op=k0 lever=hoist_element_flags crosswindow scipy/on=1.065x scipy/off=1.010x (case line reports scipy/off)
+armab op=k0 lever=hoist_element_flags crosswindow scipy/on=1.065x scipy/off=1.010x (case line reports scipy/off)
+armab op=k0 lever=hoist_element_flags arm=on  CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+armab op=k0 lever=hoist_element_flags arm=on  CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+armab op=k0 lever=hoist_element_flags arm=off CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+armab op=k0 lever=hoist_element_flags arm=off CHECK max_abs=8.88178419700125232e-16 max_rel=1.55813329946179248e-15 compared=200000 nonfinite_mismatch=0
+n=200000 op=k1 domain=[0.01, 20]
+READY scipy=1.17.1 numpy=2.4.3 op=k1 n=200000 fixture_sha256=eb63e00a143f952cb68e63ffd90f721625375c80d9c9fd6704892d8807d40b65 tasks=1 genuine=True out_len=200000
+op=k1 calibration single=6.8740ms reps=3
+case=n200000 op=k1 fsci=7.050ms scipy=7.530ms scipy/fsci=1.068x null_fsci=1.011 null_scipy=1.008 CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=k1 fsci=7.050ms scipy=7.530ms scipy/fsci=1.068x null_fsci=1.011 null_scipy=1.008 CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+armab op=k1 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=k1 lever=hoist_element_flags control on_hits=1 off_hits=0 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals the on arm at this size, in which case the sweep is an A/A null)
+armab op=k1 lever=hoist_element_flags on=6.989ms off=7.191ms rounds=25
+armab op=k1 lever=hoist_element_flags on=6.989ms off=7.191ms rounds=25
+armab op=k1 lever=hoist_element_flags off/on=1.029x paired_median=1.027x paired_min=0.997x paired_max=1.059x null_on=1.012 null_off=1.013
+armab op=k1 lever=hoist_element_flags off/on=1.029x paired_median=1.027x paired_min=0.997x paired_max=1.059x null_on=1.012 null_off=1.013
+armab op=k1 lever=hoist_element_flags crosswindow scipy/on=1.077x scipy/off=1.047x (case line reports scipy/off)
+armab op=k1 lever=hoist_element_flags crosswindow scipy/on=1.077x scipy/off=1.047x (case line reports scipy/off)
+armab op=k1 lever=hoist_element_flags arm=on  CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+armab op=k1 lever=hoist_element_flags arm=on  CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+armab op=k1 lever=hoist_element_flags arm=off CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+armab op=k1 lever=hoist_element_flags arm=off CHECK max_abs=1.77635683940025046e-15 max_rel=9.90343832327313946e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=spence domain=[0, 10]
+READY scipy=1.17.1 numpy=2.4.3 op=spence n=200000 fixture_sha256=706d322ff2c099926979e9a7417d7dfa96d97ddd5a8d42cc05dbbbe267d02ee3 tasks=1 genuine=True out_len=200000
+op=spence calibration single=3.9253ms reps=6
+case=n200000 op=spence fsci=3.923ms scipy=3.152ms scipy/fsci=0.803x null_fsci=1.005 null_scipy=1.024 CHECK max_abs=1.77635683940025046e-15 max_rel=3.05074248474110561e-15 compared=200000 nonfinite_mismatch=0
+case=n200000 op=spence fsci=3.923ms scipy=3.152ms scipy/fsci=0.803x null_fsci=1.005 null_scipy=1.024 CHECK max_abs=1.77635683940025046e-15 max_rel=3.05074248474110561e-15 compared=200000 nonfinite_mismatch=0
+n=200000 op=expit domain=[-20, 20]
+READY scipy=1.17.1 numpy=2.4.3 op=expit n=200000 fixture_sha256=5447f058527c19f957de84d1cdcda3c23d2dc2796afe11e68bbb187e2dfc240c tasks=1 genuine=True out_len=200000
+op=expit calibration single=1.0022ms reps=20
+case=n200000 op=expit fsci=1.006ms scipy=0.966ms scipy/fsci=0.961x null_fsci=1.002 null_scipy=1.006 CHECK max_abs=1.11022302462515654e-16 max_rel=4.41952318404382869e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=expit fsci=1.006ms scipy=0.966ms scipy/fsci=0.961x null_fsci=1.002 null_scipy=1.006 CHECK max_abs=1.11022302462515654e-16 max_rel=4.41952318404382869e-16 compared=200000 nonfinite_mismatch=0
+n=200000 op=exprel domain=[-10, 10]
+READY scipy=1.17.1 numpy=2.4.3 op=exprel n=200000 fixture_sha256=81fc51653a92c4868254e45593405c9f0d983ef1db4e75ef61648b35fde003ee tasks=1 genuine=True out_len=200000
+op=exprel calibration single=1.7347ms reps=12
+case=n200000 op=exprel fsci=1.737ms scipy=2.019ms scipy/fsci=1.163x null_fsci=1.001 null_scipy=1.001 CHECK max_abs=2.22044604925031308e-16 max_rel=2.22043494707187692e-16 compared=200000 nonfinite_mismatch=0
+case=n200000 op=exprel fsci=1.737ms scipy=2.019ms scipy/fsci=1.163x null_fsci=1.001 null_scipy=1.001 CHECK max_abs=2.22044604925031308e-16 max_rel=2.22043494707187692e-16 compared=200000 nonfinite_mismatch=0
+gatesweep op=gamma note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=gamma note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=gamma n=65536 serial=1.149ms threaded=1.206ms par/ser=1.054x min=1.011x max=1.082x null_serial=1.038 null_threaded=1.007 prefers=SERIAL
+gatesweep op=gamma n=65536 serial=1.149ms threaded=1.206ms par/ser=1.054x min=1.011x max=1.082x null_serial=1.038 null_threaded=1.007 prefers=SERIAL
+gatesweep op=gamma n=131072 serial=2.317ms threaded=2.382ms par/ser=1.029x min=1.006x max=1.035x null_serial=1.007 null_threaded=1.003 prefers=SERIAL
+gatesweep op=gamma n=131072 serial=2.317ms threaded=2.382ms par/ser=1.029x min=1.006x max=1.035x null_serial=1.007 null_threaded=1.003 prefers=SERIAL
+gatesweep op=gamma n=262144 serial=4.647ms threaded=4.717ms par/ser=1.015x min=0.986x max=1.020x null_serial=1.009 null_threaded=1.007 prefers=SERIAL
+gatesweep op=gamma n=262144 serial=4.647ms threaded=4.717ms par/ser=1.015x min=0.986x max=1.020x null_serial=1.009 null_threaded=1.007 prefers=SERIAL
+gatesweep op=gamma n=524288 serial=9.269ms threaded=9.342ms par/ser=1.006x min=0.975x max=1.037x null_serial=1.008 null_threaded=1.008 prefers=UNRESOLVED
+gatesweep op=gamma n=524288 serial=9.269ms threaded=9.342ms par/ser=1.006x min=0.975x max=1.037x null_serial=1.008 null_threaded=1.008 prefers=UNRESOLVED
+gatesweep op=gamma n=1048576 serial=18.542ms threaded=18.690ms par/ser=1.007x min=0.975x max=1.037x null_serial=1.005 null_threaded=1.004 prefers=SERIAL
+gatesweep op=gamma n=1048576 serial=18.542ms threaded=18.690ms par/ser=1.007x min=0.975x max=1.037x null_serial=1.005 null_threaded=1.004 prefers=SERIAL
+gatesweep op=gamma n=2097152 serial=37.570ms threaded=37.602ms par/ser=0.999x min=0.974x max=1.020x null_serial=1.004 null_threaded=1.009 prefers=UNRESOLVED
+gatesweep op=gamma n=2097152 serial=37.570ms threaded=37.602ms par/ser=0.999x min=0.974x max=1.020x null_serial=1.004 null_threaded=1.009 prefers=UNRESOLVED
+gatesweep op=gamma n=65536 serial_cost_rel=0.99 row=ok
+gatesweep op=gamma n=65536 serial_cost_rel=0.99 row=ok
+gatesweep op=gamma n=131072 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=131072 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=524288 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=524288 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=1048576 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=1048576 serial_cost_rel=1.00 row=ok
+gatesweep op=gamma n=2097152 serial_cost_rel=1.01 row=ok
+gatesweep op=gamma n=2097152 serial_cost_rel=1.01 row=ok
+gatesweep op=digamma note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=digamma note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=digamma n=65536 serial=0.711ms threaded=0.773ms par/ser=1.088x min=1.080x max=1.101x null_serial=1.009 null_threaded=1.007 prefers=SERIAL
+gatesweep op=digamma n=65536 serial=0.711ms threaded=0.773ms par/ser=1.088x min=1.080x max=1.101x null_serial=1.009 null_threaded=1.007 prefers=SERIAL
+gatesweep op=digamma n=131072 serial=1.411ms threaded=1.476ms par/ser=1.045x min=1.042x max=1.052x null_serial=1.005 null_threaded=1.004 prefers=SERIAL
+gatesweep op=digamma n=131072 serial=1.411ms threaded=1.476ms par/ser=1.045x min=1.042x max=1.052x null_serial=1.005 null_threaded=1.004 prefers=SERIAL
+gatesweep op=digamma n=262144 serial=2.839ms threaded=2.899ms par/ser=1.020x min=0.998x max=1.025x null_serial=1.004 null_threaded=1.003 prefers=SERIAL
+gatesweep op=digamma n=262144 serial=2.839ms threaded=2.899ms par/ser=1.020x min=0.998x max=1.025x null_serial=1.004 null_threaded=1.003 prefers=SERIAL
+gatesweep op=digamma n=524288 serial=5.517ms threaded=5.569ms par/ser=1.004x min=0.966x max=1.043x null_serial=1.014 null_threaded=1.014 prefers=UNRESOLVED
+gatesweep op=digamma n=524288 serial=5.517ms threaded=5.569ms par/ser=1.004x min=0.966x max=1.043x null_serial=1.014 null_threaded=1.014 prefers=UNRESOLVED
+gatesweep op=digamma n=1048576 serial=11.350ms threaded=11.221ms par/ser=1.007x min=0.976x max=1.041x null_serial=1.014 null_threaded=1.013 prefers=UNRESOLVED
+gatesweep op=digamma n=1048576 serial=11.350ms threaded=11.221ms par/ser=1.007x min=0.976x max=1.041x null_serial=1.014 null_threaded=1.013 prefers=UNRESOLVED
+gatesweep op=digamma n=2097152 serial=22.954ms threaded=23.019ms par/ser=1.003x min=0.990x max=1.036x null_serial=1.013 null_threaded=1.012 prefers=UNRESOLVED
+gatesweep op=digamma n=2097152 serial=22.954ms threaded=23.019ms par/ser=1.003x min=0.990x max=1.036x null_serial=1.013 null_threaded=1.012 prefers=UNRESOLVED
+gatesweep op=digamma n=65536 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=65536 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=131072 serial_cost_rel=0.99 row=ok
+gatesweep op=digamma n=131072 serial_cost_rel=0.99 row=ok
+gatesweep op=digamma n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=524288 serial_cost_rel=0.97 row=ok
+gatesweep op=digamma n=524288 serial_cost_rel=0.97 row=ok
+gatesweep op=digamma n=1048576 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=1048576 serial_cost_rel=1.00 row=ok
+gatesweep op=digamma n=2097152 serial_cost_rel=1.01 row=ok
+gatesweep op=digamma n=2097152 serial_cost_rel=1.01 row=ok
+gatesweep op=y1 note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=y1 note=internal-A/B-not-an-incumbent-comparison
+gatesweep op=y1 n=65536 serial=1.342ms threaded=1.406ms par/ser=1.048x min=1.013x max=1.052x null_serial=1.006 null_threaded=1.006 prefers=SERIAL
+gatesweep op=y1 n=65536 serial=1.342ms threaded=1.406ms par/ser=1.048x min=1.013x max=1.052x null_serial=1.006 null_threaded=1.006 prefers=SERIAL
+gatesweep op=y1 n=131072 serial=2.696ms threaded=2.755ms par/ser=1.023x min=0.991x max=1.062x null_serial=1.005 null_threaded=1.006 prefers=SERIAL
+gatesweep op=y1 n=131072 serial=2.696ms threaded=2.755ms par/ser=1.023x min=0.991x max=1.062x null_serial=1.005 null_threaded=1.006 prefers=SERIAL
+gatesweep op=y1 n=262144 serial=5.326ms threaded=5.348ms par/ser=1.012x min=0.988x max=1.025x null_serial=1.007 null_threaded=1.010 prefers=SERIAL
+gatesweep op=y1 n=262144 serial=5.326ms threaded=5.348ms par/ser=1.012x min=0.988x max=1.025x null_serial=1.007 null_threaded=1.010 prefers=SERIAL
+gatesweep op=y1 n=524288 serial=10.650ms threaded=10.837ms par/ser=1.007x min=0.991x max=1.036x null_serial=1.002 null_threaded=1.003 prefers=SERIAL
+gatesweep op=y1 n=524288 serial=10.650ms threaded=10.837ms par/ser=1.007x min=0.991x max=1.036x null_serial=1.002 null_threaded=1.003 prefers=SERIAL
+gatesweep op=y1 n=1048576 serial=21.131ms threaded=21.143ms par/ser=1.011x min=0.990x max=1.016x null_serial=1.016 null_threaded=1.004 prefers=UNRESOLVED
+gatesweep op=y1 n=1048576 serial=21.131ms threaded=21.143ms par/ser=1.011x min=0.990x max=1.016x null_serial=1.016 null_threaded=1.004 prefers=UNRESOLVED
+gatesweep op=y1 n=2097152 serial=42.072ms threaded=42.380ms par/ser=1.004x min=0.992x max=1.035x null_serial=1.012 null_threaded=1.016 prefers=UNRESOLVED
+gatesweep op=y1 n=2097152 serial=42.072ms threaded=42.380ms par/ser=1.004x min=0.992x max=1.035x null_serial=1.012 null_threaded=1.016 prefers=UNRESOLVED
+gatesweep op=y1 n=65536 serial_cost_rel=1.01 row=ok
+gatesweep op=y1 n=65536 serial_cost_rel=1.01 row=ok
+gatesweep op=y1 n=131072 serial_cost_rel=1.01 row=ok
+gatesweep op=y1 n=131072 serial_cost_rel=1.01 row=ok
+gatesweep op=y1 n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=y1 n=262144 serial_cost_rel=1.00 row=ok
+gatesweep op=y1 n=524288 serial_cost_rel=1.00 row=ok
+gatesweep op=y1 n=524288 serial_cost_rel=1.00 row=ok
+gatesweep op=y1 n=1048576 serial_cost_rel=0.99 row=ok
+gatesweep op=y1 n=1048576 serial_cost_rel=0.99 row=ok
+gatesweep op=y1 n=2097152 serial_cost_rel=0.99 row=ok
+gatesweep op=y1 n=2097152 serial_cost_rel=0.99 row=ok
+bandsweep op=y1 split_at=5 lower_share_of_full_fixture=0.166 note=diagnostic-per-branch-not-a-headline-ratio
+bandsweep op=y1 split_at=5 lower_share_of_full_fixture=0.166 note=diagnostic-per-branch-not-a-headline-ratio
+bandsweep op=y1 band=lower domain=[0.01, 5] scipy/fsci=0.870x min=0.834x max=0.899x null_fsci=1.008 null_scipy=1.010 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+bandsweep op=y1 band=lower domain=[0.01, 5] scipy/fsci=0.870x min=0.834x max=0.899x null_fsci=1.008 null_scipy=1.010 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+bandsweep op=y1 band=upper domain=[5, 30] scipy/fsci=0.969x min=0.957x max=0.987x null_fsci=1.007 null_scipy=1.009 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+bandsweep op=y1 band=upper domain=[5, 30] scipy/fsci=0.969x min=0.957x max=0.987x null_fsci=1.007 null_scipy=1.009 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000 nonfinite_mismatch=0
+provenance_after host=thinkstation1 cpu_model=AMD_Ryzen_Threadripper_PRO_5975WX_32-Cores physical_cores=32 logical_threads=1 ram_kb=226257632 numa_nodes=1 governor=powersave loadavg=[6.29 21.36 21.47 2/2345 1115700]
+provenance_after host=thinkstation1 cpu_model=AMD_Ryzen_Threadripper_PRO_5975WX_32-Cores physical_cores=32 logical_threads=1 ram_kb=226257632 numa_nodes=1 governor=powersave loadavg=[6.29 21.36 21.47 2/2345 1115700]

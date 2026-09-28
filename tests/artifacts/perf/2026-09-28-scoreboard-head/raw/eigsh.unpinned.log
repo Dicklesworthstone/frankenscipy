@@ -1,0 +1,28 @@
+elf_sha256=8fa7f6d3d1e449caa803d8ee245fa92f5006db1dacffa58538b75f773a46d585
+elf_sha256=8fa7f6d3d1e449caa803d8ee245fa92f5006db1dacffa58538b75f773a46d585
+provenance_before host=thinkstation1 logical_threads=64 governor=powersave loadavg=[12.57 17.00 20.15 9/2755 1004206]
+provenance_before host=thinkstation1 logical_threads=64 governor=powersave loadavg=[12.57 17.00 20.15 9/2755 1004206]
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 n=20000 nnz=179850 k=6 which=LM sigma=None tasks=1 genuine=True
+case=planted_20000_LM_k6 n=20000 nnz=179850 k=6 which=LM sigma=None fsci=8.443ms scipy=7.123ms scipy/fsci=0.844x null_fsci=1.028 null_scipy=1.029 iterations=1 nmatvec=26 CHECK max_rel=2.842e-16
+case=planted_20000_LM_k6 n=20000 nnz=179850 k=6 which=LM sigma=None fsci=8.443ms scipy=7.123ms scipy/fsci=0.844x null_fsci=1.028 null_scipy=1.029 iterations=1 nmatvec=26 CHECK max_rel=2.842e-16
+READY scipy=1.17.1 numpy=2.4.3 n=20000 nnz=59998 k=6 which=LM sigma=0.5 tasks=1 genuine=True
+case=lap1d_20000_sigma0.5_k6 n=20000 nnz=59998 k=6 which=LM sigma=Some(0.5) fsci=28.688ms scipy=31.457ms scipy/fsci=1.097x null_fsci=1.029 null_scipy=1.010 iterations=3 nmatvec=47 CHECK max_rel=0.000e+00
+case=lap1d_20000_sigma0.5_k6 n=20000 nnz=59998 k=6 which=LM sigma=Some(0.5) fsci=28.688ms scipy=31.457ms scipy/fsci=1.097x null_fsci=1.029 null_scipy=1.010 iterations=3 nmatvec=47 CHECK max_rel=0.000e+00
+READY scipy=1.17.1 numpy=2.4.3 n=10000 nnz=49600 k=1 which=LM sigma=None tasks=1 genuine=True
+case=lap2d_100_LM_k1 n=10000 nnz=49600 k=1 which=LM sigma=None fsci=118.494ms scipy=112.789ms scipy/fsci=0.952x null_fsci=1.013 null_scipy=1.004 iterations=71 nmatvec=721 CHECK max_rel=3.887e-15
+case=lap2d_100_LM_k1 n=10000 nnz=49600 k=1 which=LM sigma=None fsci=118.494ms scipy=112.789ms scipy/fsci=0.952x null_fsci=1.013 null_scipy=1.004 iterations=71 nmatvec=721 CHECK max_rel=3.887e-15
+READY scipy=1.17.1 numpy=2.4.3 n=10000 nnz=49600 k=20 which=LM sigma=None tasks=1 genuine=True
+case=lap2d_100_LM_k20 n=10000 nnz=49600 k=20 which=LM sigma=None fsci=562.100ms scipy=445.959ms scipy/fsci=0.793x null_fsci=1.033 null_scipy=1.030 iterations=125 nmatvec=1711 CHECK max_rel=1.399e-14
+case=lap2d_100_LM_k20 n=10000 nnz=49600 k=20 which=LM sigma=None fsci=562.100ms scipy=445.959ms scipy/fsci=0.793x null_fsci=1.033 null_scipy=1.030 iterations=125 nmatvec=1711 CHECK max_rel=1.399e-14
+READY scipy=1.17.1 numpy=2.4.3 n=3600 nnz=17760 k=6 which=SA sigma=None tasks=1 genuine=True
+case=lap2d_60_SA_k6 n=3600 nnz=17760 k=6 which=SA sigma=None fsci=36.118ms scipy=53.406ms scipy/fsci=1.479x null_fsci=1.026 null_scipy=1.018 iterations=56 nmatvec=693 CHECK max_rel=4.239e-14
+case=lap2d_60_SA_k6 n=3600 nnz=17760 k=6 which=SA sigma=None fsci=36.118ms scipy=53.406ms scipy/fsci=1.479x null_fsci=1.026 null_scipy=1.018 iterations=56 nmatvec=693 CHECK max_rel=4.239e-14
+READY scipy=1.17.1 numpy=2.4.3 n=3600 nnz=17760 k=6 which=LR sigma=None tasks=1 genuine=True
+case=convdiff2d_60_LR_k6 n=3600 nnz=17760 k=6 which=LR sigma=None fsci=39.216ms scipy=42.775ms scipy/fsci=1.091x null_fsci=1.026 null_scipy=1.008 iterations=52 nmatvec=672 CHECK max_rel=1.114e-13
+case=convdiff2d_60_LR_k6 n=3600 nnz=17760 k=6 which=LR sigma=None fsci=39.216ms scipy=42.775ms scipy/fsci=1.091x null_fsci=1.026 null_scipy=1.008 iterations=52 nmatvec=672 CHECK max_rel=1.114e-13
+READY scipy=1.17.1 numpy=2.4.3 n=10000 nnz=49600 k=6 which=LM sigma=0.0 tasks=1 genuine=True
+case=convdiff2d_100_sigma0_k6 n=10000 nnz=49600 k=6 which=LM sigma=Some(0.0) fsci=330.647ms scipy=227.600ms scipy/fsci=0.688x null_fsci=1.072 null_scipy=1.047 iterations=18 nmatvec=249 CHECK max_rel=1.397e-13
+case=convdiff2d_100_sigma0_k6 n=10000 nnz=49600 k=6 which=LM sigma=Some(0.0) fsci=330.647ms scipy=227.600ms scipy/fsci=0.688x null_fsci=1.072 null_scipy=1.047 iterations=18 nmatvec=249 CHECK max_rel=1.397e-13
+provenance_after host=thinkstation1 logical_threads=64 governor=powersave loadavg=[9.22 15.49 19.49 4/2766 1007447]
+provenance_after host=thinkstation1 logical_threads=64 governor=powersave loadavg=[9.22 15.49 19.49 4/2766 1007447]

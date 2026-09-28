@@ -1,0 +1,16 @@
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+METADATA harness=fft-whole-job-aa-bbaa rounds=3 rust_threads=64 configured_workers=Exact(1) elf_sha256=f619b6142bc73ca7a9b48c534c0e67c8421bde051b723895a80670eac60edf71 READY scipy=1.17.1 numpy=2.4.3
+RESULT mode=rfft n=65536 repeats=6 fsci_ms=0.792319 scipy_ms=0.529335 fsci_over_scipy=1.496820 fsci_aa=1.077836 scipy_aa=0.486831 fsci_checksum=5264e74906b75adc scipy_checksum=486d4fe0fcec455d
+RESULT mode=fft n=65536 repeats=6 fsci_ms=1.361026 scipy_ms=0.893715 fsci_over_scipy=1.522886 fsci_aa=0.847516 scipy_aa=0.734562 fsci_checksum=f319869363d59ddb scipy_checksum=85c113044c113174
+RESULT mode=rfft n=131072 repeats=6 fsci_ms=1.488666 scipy_ms=1.520743 fsci_over_scipy=0.978907 fsci_aa=0.993803 scipy_aa=0.993490 fsci_checksum=b05e7bc3940b0c3a scipy_checksum=27393b7a85cc98ac
+RESULT mode=fft n=131072 repeats=6 fsci_ms=3.269914 scipy_ms=2.268273 fsci_over_scipy=1.441588 fsci_aa=1.038640 scipy_aa=0.800176 fsci_checksum=94fc1673cda1b655 scipy_checksum=7a32e30b8c2e3188
+RESULT mode=rfft n=262144 repeats=6 fsci_ms=3.613582 scipy_ms=3.606845 fsci_over_scipy=1.001868 fsci_aa=0.785943 scipy_aa=1.076965 fsci_checksum=f31c308c703eb3ba scipy_checksum=9542c202b2b83566
+RESULT mode=fft n=262144 repeats=6 fsci_ms=6.697315 scipy_ms=4.903593 fsci_over_scipy=1.365798 fsci_aa=1.024553 scipy_aa=0.948981 fsci_checksum=b4c3ab88c5ae2ce9 scipy_checksum=07dcecf3b3cecff4
+RESULT mode=rfft n=524288 repeats=4 fsci_ms=7.061178 scipy_ms=7.881275 fsci_over_scipy=0.895944 fsci_aa=0.961410 scipy_aa=0.957650 fsci_checksum=791547442dc6ebd4 scipy_checksum=6b96acc263816ff0
+RESULT mode=fft n=524288 repeats=4 fsci_ms=14.593610 scipy_ms=10.926536 fsci_over_scipy=1.335612 fsci_aa=1.060594 scipy_aa=0.783795 fsci_checksum=faf71725acd39d22 scipy_checksum=3becccf34001cf33
+RESULT mode=rfft n=1048576 repeats=4 fsci_ms=15.028809 scipy_ms=18.381269 fsci_over_scipy=0.817615 fsci_aa=1.015594 scipy_aa=0.924621 fsci_checksum=b28c511f144d171c scipy_checksum=0e0a3b220f0aed1b
+RESULT mode=fft n=1048576 repeats=4 fsci_ms=39.204540 scipy_ms=27.256331 fsci_over_scipy=1.438365 fsci_aa=1.002120 scipy_aa=0.964977 fsci_checksum=52f921af4aae2c30 scipy_checksum=23bcfcf20007cf3f
+RESULT mode=rfft n=2097152 repeats=2 fsci_ms=54.729998 scipy_ms=46.959642 fsci_over_scipy=1.165469 fsci_aa=1.025338 scipy_aa=1.004659 fsci_checksum=5df4bbbc29260d59 scipy_checksum=209fc11bc7909165
+RESULT mode=fft n=2097152 repeats=2 fsci_ms=93.613801 scipy_ms=65.659675 fsci_over_scipy=1.425743 fsci_aa=1.031336 scipy_aa=1.132489 fsci_checksum=6fae43114862d9a6 scipy_checksum=c3b0030ec0000000
+RESULT mode=rfft n=4194304 repeats=2 fsci_ms=139.947141 scipy_ms=105.484578 fsci_over_scipy=1.326707 fsci_aa=0.967908 scipy_aa=0.956993 fsci_checksum=6e6fab0e39555871 scipy_checksum=011f96fe17877e45
+RESULT mode=fft n=4194304 repeats=2 fsci_ms=201.849462 scipy_ms=133.057887 fsci_over_scipy=1.517005 fsci_aa=1.010452 scipy_aa=0.981125 fsci_checksum=d112dce3c74cf3db scipy_checksum=3c203cf08000000f

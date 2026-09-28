@@ -1,0 +1,15 @@
+elf_sha256=dedffde5209f23327da55fa550a96620e5dfddaaab8d5f72f0cd4f1ef9720f79
+n=200000 tie_factor=8 ks_banded=true ks_series=true
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=rankdata n=200000 fixture_sha256=d032ad5d78b68ec95c9374f0d1bd64bdbefd8d99a008f6d3e11e6cabc0156c6c tasks=1 genuine=True out_len=200000
+op=rankdata calibration single=4.5569ms reps=5
+case=n200000t8 op=rankdata fsci=4.063ms scipy=6.563ms scipy/fsci=1.615x null_fsci=1.100 null_scipy=1.039 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+READY scipy=1.17.1 numpy=2.4.3 op=spearmanr n=200000 fixture_sha256=d032ad5d78b68ec95c9374f0d1bd64bdbefd8d99a008f6d3e11e6cabc0156c6c tasks=1 genuine=True out_len=2
+op=spearmanr calibration single=6.0127ms reps=4
+case=n200000t8 op=spearmanr fsci=6.504ms scipy=26.913ms scipy/fsci=4.138x null_fsci=1.087 null_scipy=1.036 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+READY scipy=1.17.1 numpy=2.4.3 op=kendalltau n=200000 fixture_sha256=d032ad5d78b68ec95c9374f0d1bd64bdbefd8d99a008f6d3e11e6cabc0156c6c tasks=1 genuine=True out_len=2
+op=kendalltau calibration single=13.3105ms reps=2
+case=n200000t8 op=kendalltau fsci=13.956ms scipy=16.616ms scipy/fsci=1.191x null_fsci=1.144 null_scipy=1.094 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+READY scipy=1.17.1 numpy=2.4.3 op=ks_2samp n=200000 fixture_sha256=d032ad5d78b68ec95c9374f0d1bd64bdbefd8d99a008f6d3e11e6cabc0156c6c tasks=1 genuine=True out_len=2
+op=ks_2samp calibration single=7.0127ms reps=3
+case=n200000t8 op=ks_2samp fsci=6.996ms scipy=25.658ms scipy/fsci=3.667x null_fsci=1.071 null_scipy=1.043 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00

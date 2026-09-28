@@ -1,0 +1,16 @@
+elf_sha256=31bf88d2c340f9d65332fd7aeec83877bf730a3fda358f8ba77f274587aa8693
+median_direct=true
+n=512 sigma=3 size=5 available_parallelism=1
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=gaussian n=512 sigma=3.0 size=5 fixture_sha256=9077bf65501c79e8452decf1cf224c7e57be45ea67bdbac601963e5e37eb1dfe tasks=1 genuine=True out_len=262144
+op=gaussian calibration single=1.4367ms reps=14
+case=n512 op=gaussian fsci=1.424ms scipy=4.565ms scipy/fsci=3.206x null_fsci=1.052 null_scipy=1.002 CHECK max_abs=1.11022302462515654e-15 max_rel=1.03424683543670844e-15 max_abs_interior=1.11022302462515654e-15 border_worse=False
+READY scipy=1.17.1 numpy=2.4.3 op=uniform n=512 sigma=3.0 size=5 fixture_sha256=9077bf65501c79e8452decf1cf224c7e57be45ea67bdbac601963e5e37eb1dfe tasks=1 genuine=True out_len=262144
+op=uniform calibration single=2.9364ms reps=7
+case=n512 op=uniform fsci=2.942ms scipy=2.619ms scipy/fsci=0.890x null_fsci=1.015 null_scipy=1.012 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 max_abs_interior=0.00000000000000000e+00 border_worse=False
+READY scipy=1.17.1 numpy=2.4.3 op=median n=512 sigma=3.0 size=5 fixture_sha256=9077bf65501c79e8452decf1cf224c7e57be45ea67bdbac601963e5e37eb1dfe tasks=1 genuine=True out_len=262144
+op=median calibration single=22.1362ms reps=1
+case=n512 op=median fsci=21.866ms scipy=16.985ms scipy/fsci=0.777x null_fsci=1.002 null_scipy=1.004 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 max_abs_interior=0.00000000000000000e+00 border_worse=False
+READY scipy=1.17.1 numpy=2.4.3 op=edt n=512 sigma=3.0 size=5 fixture_sha256=a35723983e51c010982d0811cd04a006f14692601be674b6bed25382ae858d45 tasks=1 genuine=True out_len=262144
+op=edt calibration single=6.8389ms reps=3
+case=n512 op=edt fsci=6.864ms scipy=10.823ms scipy/fsci=1.577x null_fsci=1.032 null_scipy=1.024 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 max_abs_interior=0.00000000000000000e+00 border_worse=False
