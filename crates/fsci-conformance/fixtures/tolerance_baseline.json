@@ -1323,11 +1323,11 @@
     "REL_TOL_KER_KEI": 0.001
   },
   "diff_special_kolmogi_smirnovi.rs": {
-    "KOLMOGI_TOL": 1e-9,
+    "KOLMOGI_TOL_REL": 1e-15,
     "SMIRNOVI_TOL": 0.005
   },
   "diff_special_ks.rs": {
-    "KOLMOGOROV_TOL": 1e-9,
+    "KOLMOGOROV_TOL_REL": 1e-15,
     "SMIRNOV_TOL": 0.05
   },
   "diff_special_lambertw.rs": {

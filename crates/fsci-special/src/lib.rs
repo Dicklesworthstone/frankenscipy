@@ -213,6 +213,7 @@ pub use convenience::{
     kerp_zeros,
     kl_div,
     kolmogi,
+    kolmogi_pair,
     kolmogorov,
     lambertw_scalar,
     ldexp,

@@ -20,7 +20,10 @@ use fsci_special::{kolmogi, smirnovi};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const KOLMOGI_TOL: f64 = 1.0e-9;
+// kolmogi is xsf's `_kolmogi`: SciPy's bits on 99.8% of points, 1 ulp off on the rest. This is a
+// TRUE relative tolerance, ~4 ulp. It was an absolute 1e-9, which let the old Newton's 6.3e-14
+// pass unseen (frankenscipy-11wqg).
+const KOLMOGI_TOL_REL: f64 = 1.0e-15;
 const SMIRNOVI_TOL: f64 = 5.0e-3;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per op compared.
@@ -221,13 +224,18 @@ fn diff_special_kolmogi_smirnovi() {
                     Ok(SpecialTensor::RealScalar(v)) => Some(v),
                     _ => None,
                 };
-                (v, KOLMOGI_TOL)
+                (v, KOLMOGI_TOL_REL)
             }
             "smirnovi" => (Some(smirnovi(case.n, case.p)), SMIRNOVI_TOL),
             other => panic!("unknown op {other}"),
         };
         let Some((expected, actual)) = ledger.pair(&case.op, &case.case_id, scipy, fsci) else {
             continue;
+        };
+        let tol = if case.op == "kolmogi" {
+            tol * expected.abs()
+        } else {
+            tol
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);

@@ -46891,10 +46891,11 @@ fn kolmogni(n: usize, p: f64, q: f64, upper: bool) -> f64 {
     let (lo, hi_cap) = (1.0 / nf, 1.0 - 1.0 / nf);
     let (xtol, rtol) = (1e-14, 4.0 * f64::EPSILON);
     if upper {
-        let x1 = (ks_kolmogi(q, p) / nf.sqrt()).min(hi_cap);
+        let x1 = (fsci_special::kolmogi_pair(q, p) / nf.sqrt()).min(hi_cap);
         return ks_brentq(|x| q - kolmogn(n, x, false), lo, x1, xtol, rtol, 100);
     }
-    let x1 = (ks_kolmogci(p) / nf.sqrt()).min(hi_cap);
+    // SciPy's private `_kolmogci(p)`: the cdf-side inverse.
+    let x1 = (fsci_special::kolmogi_pair(1.0 - p, p) / nf.sqrt()).min(hi_cap);
     ks_brentq(|x| kolmogn(n, x, true) - p, lo, x1, xtol, rtol, 100)
 }
 
@@ -47470,155 +47471,6 @@ fn ks_smirnov3(n: usize, x: f64) -> (f64, f64, f64) {
         (prob, 1.0 - prob, -deriv)
     };
     (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(pdf))
-}
-
-/// (sf, cdf, pdf) of the Kolmogorov limit law: `scipy.special.kolmogorov`, `kolmogc` and
-/// `-kolmogp`, ported from xsf `cephes::detail::_kolmogorov`.
-fn ks_kolmogorov3(x: f64) -> (f64, f64, f64) {
-    use std::f64::consts::PI;
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN);
-    }
-    // x <= pi / sqrt(8 · 746): exp(-pi^2/8x^2) underflows.
-    if x <= 0.0 || x <= PI / f64::from(746 * 8).sqrt() {
-        return (1.0, 0.0, 0.0);
-    }
-    let mut p = 1.0_f64;
-    let mut d = 0.0_f64;
-    let (sf, cdf);
-    if x <= 0.82 {
-        // P = w u (1 + u^8 + u^24 + u^48 + ...), u = e^(-pi^2/8x^2), w = sqrt(2pi)/x
-        let w = (2.0 * PI).sqrt() / x;
-        let logu8 = -PI * PI / (x * x);
-        let u = (logu8 / 8.0).exp();
-        if u == 0.0 {
-            p = (logu8 / 8.0 + w.ln()).exp();
-        } else {
-            let u8 = logu8.exp();
-            let u8cub = u8.powf(3.0);
-            p = 1.0 + u8cub * p;
-            d = 5.0 * 5.0 + u8cub * d;
-            p = 1.0 + u8 * u8 * p;
-            d = 3.0 * 3.0 + u8 * u8 * d;
-            p = 1.0 + u8 * p;
-            d = 1.0 * 1.0 + u8 * d;
-            d = PI * PI / 4.0 / (x * x) * d - p;
-            d *= w * u / x;
-            p *= w * u;
-        }
-        cdf = p;
-        sf = 1.0 - p;
-    } else {
-        // P = 2 (v - v^4 + v^9 - ...), v = e^(-2x^2)
-        let v = (-2.0 * x * x).exp();
-        let vsq = v * v;
-        let v3 = v.powf(3.0);
-        let mut vpwr = v3 * v3 * v;
-        p = 1.0 - vpwr * p;
-        d = 3.0 * 3.0 - vpwr * d;
-        vpwr = v3 * vsq;
-        p = 1.0 - vpwr * p;
-        d = 2.0 * 2.0 - vpwr * d;
-        vpwr = v3;
-        p = 1.0 - vpwr * p;
-        d = 1.0 * 1.0 - vpwr * d;
-        p *= 2.0 * v;
-        d *= 8.0 * v * x;
-        sf = p;
-        cdf = 1.0 - sf;
-    }
-    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(d))
-}
-
-/// x with kolmogc(x) = p: `scipy.special._ufuncs._kolmogci`.
-fn ks_kolmogci(p: f64) -> f64 {
-    ks_kolmogi(1.0 - p, p)
-}
-
-/// x with kolmogorov(x) = psf and kolmogc(x) = pcdf (psf + pcdf = 1): xsf
-/// `cephes::detail::_kolmogi`, a bracketed Newton iteration.
-fn ks_kolmogi(psf: f64, pcdf: f64) -> f64 {
-    use std::f64::consts::{PI, SQRT_2};
-    #[allow(clippy::excessive_precision)]
-    const LOGSQRT2PI: f64 = 9.189_385_332_046_727_417_803_297e-1;
-    const XTOL: f64 = f64::EPSILON;
-    const RTOL: f64 = 2.0 * f64::EPSILON;
-    let within_tol = |x: f64, y: f64| (x - y).abs() <= XTOL + RTOL * y.abs();
-    if !((0.0..=1.0).contains(&psf) && (0.0..=1.0).contains(&pcdf))
-        || (1.0 - pcdf - psf).abs() > 4.0 * f64::EPSILON
-    {
-        return f64::NAN;
-    }
-    if pcdf == 0.0 {
-        return 0.0;
-    }
-    if psf == 0.0 {
-        return f64::INFINITY;
-    }
-    let (mut a, mut b, mut x);
-    if pcdf <= 0.5 {
-        // p ~ (sqrt(2pi)/x) exp(-pi^2/8x^2): two fixed-point steps for each bound.
-        let logpcdf = pcdf.ln();
-        let bound = |logx: f64| PI / (2.0 * SQRT_2 * (-(logpcdf + logx - LOGSQRT2PI)).sqrt());
-        a = bound(logpcdf / 2.0);
-        b = bound(0.0);
-        a = bound(a.ln());
-        b = bound(b.ln());
-        x = (a + b) / 2.0;
-    } else {
-        // p ~ 2 exp(-2x^2), inverted as a power series in p/2.
-        let jiggerb = 256.0 * f64::EPSILON;
-        let pba = psf / (1.0 - (-4.0_f64).exp()) / 2.0;
-        let pbb = psf * (1.0 - jiggerb) / 2.0;
-        a = (-0.5 * pba.ln()).sqrt();
-        b = (-0.5 * pbb.ln()).sqrt();
-        let ph = psf / 2.0;
-        let p2 = ph * ph;
-        let p3 = ph * ph * ph;
-        let q0 = (1.0
-            + p3 * (1.0 + p3 * (4.0 + p2 * (-1.0 + ph * (22.0 + p2 * (-13.0 + 140.0 * ph))))))
-            * ph;
-        x = (-q0.ln() / 2.0).sqrt();
-        if x < a || x > b {
-            x = (a + b) / 2.0;
-        }
-    }
-    for _ in 0..=500 {
-        let x0 = x;
-        let (sf_x, cdf_x, pdf_x) = ks_kolmogorov3(x0);
-        let df = if pcdf < 0.5 { pcdf - cdf_x } else { sf_x - psf };
-        if df == 0.0 {
-            break;
-        }
-        if df > 0.0 && x > a {
-            a = x;
-        } else if df < 0.0 && x < b {
-            b = x;
-        }
-        let dfdx = -pdf_x;
-        x = if dfdx.abs() <= 0.0 {
-            (a + b) / 2.0
-        } else {
-            x0 - df / dfdx
-        };
-        if x >= a && x <= b {
-            if within_tol(x, x0) {
-                break;
-            }
-            if x == a || x == b {
-                x = (a + b) / 2.0;
-                if x == a || x == b {
-                    break;
-                }
-            }
-        } else {
-            x = (a + b) / 2.0;
-            if within_tol(x, x0) {
-                break;
-            }
-        }
-    }
-    x
 }
 
 /// SciPy's `brentq` (`scipy/optimize/Zeros/brentq.c`, C. Harris), step for step. Returns NaN

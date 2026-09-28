@@ -8,7 +8,7 @@
 //!   • smirnov(n, d) is the one-sided KS sf for sample size n
 //!     at deviation d.
 //!
-//! 12 y for kolmogorov + 5 n × 7 d for smirnov = 47 cases via
+//! 17 y for kolmogorov + 5 n × 7 d for smirnov = 52 cases via
 //! subprocess. Tolerances: 1e-9 abs for kolmogorov (canonical
 //! series); 5e-3 abs for smirnov (fsci uses an O(1/n)-corrected
 //! asymptotic, scipy uses the exact Birnbaum-Tingey series).
@@ -27,7 +27,10 @@ use fsci_special::{kolmogorov, smirnov};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const KOLMOGOROV_TOL: f64 = 1.0e-9;
+// kolmogorov is xsf's `_kolmogorov`, bit-identical to SciPy. This is a TRUE relative tolerance,
+// a few ulp. It was an absolute 1e-9 over y >= 0.1, which never reached the small-y region where
+// the old truncated series was 0.1376 off (frankenscipy-11wqg).
+const KOLMOGOROV_TOL_REL: f64 = 1.0e-15;
 // fsci's smirnov asymptotic lands ~3e-2 abs even for n=50;
 // 5e-2 absorbs cleanly across n ∈ [50, 500].
 const SMIRNOV_TOL: f64 = 5.0e-2;
@@ -117,8 +120,11 @@ fn fsci_eval(func: &str, n: i32, arg: f64) -> Option<f64> {
 }
 
 fn generate_query() -> OracleQuery {
+    // Small y first: below ~0.035 a truncated alternating series has not converged, and
+    // SciPy's theta-series branch runs up to 0.82.
     let ys = [
-        0.1_f64, 0.3, 0.5, 0.75, 1.0, 1.36, 1.5, 1.95, 2.0, 2.5, 3.0, 5.0,
+        0.01_f64, 0.02, 0.035, 0.05, 0.1, 0.3, 0.5, 0.75, 0.82, 1.0, 1.36, 1.5, 1.95, 2.0, 2.5,
+        3.0, 5.0,
     ];
     // n restricted to ≥50: fsci's smirnov uses an O(1/n)-corrected
     // asymptotic exp(-2nd²), scipy uses the exact Birnbaum-Tingey
@@ -261,7 +267,7 @@ fn diff_special_ks() {
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
         let tol = match case.func.as_str() {
-            "kolmogorov" => KOLMOGOROV_TOL,
+            "kolmogorov" => KOLMOGOROV_TOL_REL * scipy_v.abs(),
             "smirnov" => SMIRNOV_TOL,
             _ => 0.0,
         };
