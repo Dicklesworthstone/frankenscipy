@@ -1,17 +1,15 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for the modified cylindrical
-//! Bessel family I_0, I_1, K_0, K_1
-//! (`scipy.special.i0/i1/k0/k1`).
+//! Bessel family I_0, I_1, K_0, K_1 and their exponentially scaled
+//! forms (`scipy.special.i0/i1/k0/k1/i0e/i1e/k0e/k1e`).
 //!
-//! Resolves [frankenscipy-k4hhh]. Companion to
-//! `diff_special_bessel` (J_n / Y_n). 11 x-values × 2 (i0, i1)
-//! plus 11 x-values × 2 (k0, k1, x>0 only) = 44 cases via
-//! subprocess.
+//! Resolves [frankenscipy-k4hhh]; the scaled arms are frankenscipy-wyn06.
+//! Companion to `diff_special_bessel` (J_n / Y_n). 11 x-values × 2
+//! (i0, i1), 11 x-values × 2 (k0, k1, x>0 only), and 9 x-values × 4
+//! scaled plus x = -3.5 for i0e/i1e = 82 cases via subprocess.
 //!
-//! Tolerances: 1e-7 abs (matches the Bessel-kernel floor
-//! documented in frankenscipy-0om9c). I_n grows exponentially
-//! so far-x tightening is dominated by absolute scale; we
-//! report relative tolerance separately for x ≥ 5.
+//! Tolerance: 1e-15 relative for every arm; all eight are
+//! bit-identical Cephes ports.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -23,15 +21,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
-use fsci_special::{i0, i1, kv};
+use fsci_special::{i0, i0e, i1, i1e, k0, k0e, k1, k1e};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const ABS_TOL: f64 = 1.0e-7;
-const REL_TOL: f64 = 1.0e-9;
+// All eight are Cephes' Chebyshev kernels, bit-identical to SciPy. This is a TRUE relative
+// tolerance, a few ulp. It was 1e-7 absolute (1e-9 relative above 1), which could not see the
+// last-bit differences of the old ln(x) - ln 2 and exp·(cheb/sqrt) forms (frankenscipy-wyn06).
+const REL_TOL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per SciPy function compared.
-const ARMS: [&str; 4] = ["i0", "i1", "k0", "k1"];
+const ARMS: [&str; 8] = ["i0", "i1", "k0", "k1", "i0e", "i1e", "k0e", "k1e"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -105,8 +105,12 @@ fn fsci_eval(func: &str, x: f64) -> Option<f64> {
     let result = match func {
         "i0" => i0(&arg, RuntimeMode::Strict),
         "i1" => i1(&arg, RuntimeMode::Strict),
-        "k0" => kv(&SpecialTensor::RealScalar(0.0), &arg, RuntimeMode::Strict),
-        "k1" => kv(&SpecialTensor::RealScalar(1.0), &arg, RuntimeMode::Strict),
+        "k0" => k0(&arg, RuntimeMode::Strict),
+        "k1" => k1(&arg, RuntimeMode::Strict),
+        "i0e" => i0e(&arg, RuntimeMode::Strict),
+        "i1e" => i1e(&arg, RuntimeMode::Strict),
+        "k0e" => k0e(&arg, RuntimeMode::Strict),
+        "k1e" => k1e(&arg, RuntimeMode::Strict),
         _ => return None,
     };
     match result {
@@ -154,6 +158,25 @@ fn generate_query() -> OracleQuery {
             });
         }
     }
+    // The scaled forms across both kernel switches (2 and 8) and out to 1000, where
+    // I·exp(-x) and K·exp(x) built from the unscaled values overflow or underflow.
+    let xs_scaled = [0.01_f64, 0.5, 1.9, 2.1, 7.9, 8.5, 50.0, 700.0, 1000.0];
+    for &x in &xs_scaled {
+        for func in ["i0e", "i1e", "k0e", "k1e"] {
+            points.push(PointCase {
+                case_id: format!("{func}_x{x}"),
+                func: func.to_string(),
+                x,
+            });
+        }
+    }
+    for func in ["i0e", "i1e"] {
+        points.push(PointCase {
+            case_id: format!("{func}_x-3.5"),
+            func: func.to_string(),
+            x: -3.5,
+        });
+    }
     OracleQuery { points }
 }
 
@@ -181,6 +204,10 @@ for case in q["points"]:
         elif func == "i1": value = special.i1(x)
         elif func == "k0": value = special.k0(x)
         elif func == "k1": value = special.k1(x)
+        elif func == "i0e": value = special.i0e(x)
+        elif func == "i1e": value = special.i1e(x)
+        elif func == "k0e": value = special.k0e(x)
+        elif func == "k1e": value = special.k1e(x)
         else: value = None
         points.append({"case_id": cid, "value": finite_or_none(value)})
     except Exception:
@@ -278,13 +305,7 @@ fn diff_special_bessel_modified() {
         };
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
-        // For values with |scipy| > 1, fall back to relative
-        // tolerance (I_n grows exponentially); else use absolute.
-        let pass = if scipy_v.abs() > 1.0 {
-            rel_diff <= REL_TOL
-        } else {
-            abs_diff <= ABS_TOL
-        };
+        let pass = abs_diff <= REL_TOL * scipy_v.abs();
         ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),

@@ -967,7 +967,7 @@
   },
   "scipy.special": {
    "applicable": 358,
-   "compared": 204,
+   "compared": 208,
    "crate": "fsci-special",
    "declared": 357,
    "matched_by": {
@@ -1021,8 +1021,6 @@
     "he_roots",
     "hermite",
     "hermitenorm",
-    "i0e",
-    "i1e",
     "inv_boxcox1p",
     "it2i0k0",
     "it2j0y0",
@@ -1037,8 +1035,6 @@
     "jnyn_zeros",
     "js_roots",
     "jve",
-    "k0e",
-    "k1e",
     "kei_zeros",
     "keip_zeros",
     "kelvin_zeros",
@@ -1346,7 +1342,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 855,
+  "compared": 859,
   "declared": 1475,
   "matched_by": {
    "case_fold": 131,

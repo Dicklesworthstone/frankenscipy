@@ -1150,8 +1150,7 @@
     "REL_TOL": 1e-6
   },
   "diff_special_bessel_modified.rs": {
-    "ABS_TOL": 1e-7,
-    "REL_TOL": 1e-9
+    "REL_TOL": 1e-15
   },
   "diff_special_bessel_zeros.rs": {
     "ABS_TOL": 1e-7

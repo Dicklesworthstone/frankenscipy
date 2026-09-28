@@ -546,39 +546,65 @@ const I1_CHEB_B: [f64; 25] = [
     7.78576235018280120474E-1,
 ];
 
-/// Largest `x` for which `exp(x)` is finite; beyond it Cephes splits the exponential in two
-/// halves because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows.
+/// Largest `x` for which `exp(x)` is finite. Beyond it, current xsf splits the exponential in two
+/// halves, because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows. The xsf
+/// that SciPy 1.17.1 pins (0d0a593f) returns inf there instead; fsci follows the later, finite
+/// form.
 const CEPHES_MAXLOG: f64 = 7.09782712893383996732E2;
 
-/// `I0(x)` by SciPy's own Chebyshev kernels.
+/// `I0(x)` by SciPy's own Chebyshev kernels, associated as Cephes writes them:
+/// `(exp(x) · chbevl) / sqrt(x)`, not `exp(x) · (chbevl / sqrt(x))`, which differs in the last
+/// bit (frankenscipy-wyn06).
 fn i0_cephes(x: f64) -> f64 {
     let x = x.abs();
     if x <= 8.0 {
         let y = (x / 2.0) - 2.0;
         return x.exp() * cephes_chbevl(y, &I0_CHEB_A);
     }
-    let cheb = cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt();
+    let cheb = cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B);
     if x > CEPHES_MAXLOG {
         let e = (x / 2.0).exp();
-        return e * cheb * e;
+        return e * cheb / x.sqrt() * e;
     }
-    x.exp() * cheb
+    x.exp() * cheb / x.sqrt()
 }
 
-/// `I1(x)` by SciPy's own Chebyshev kernels. Odd in `x`, so the sign is restored at the end.
+/// `I1(x)` by SciPy's own Chebyshev kernels, associated as Cephes writes them. Odd in `x`, so
+/// the sign is restored at the end.
 fn i1_cephes(x: f64) -> f64 {
     let z = x.abs();
     let out = if z <= 8.0 {
         let y = (z / 2.0) - 2.0;
         cephes_chbevl(y, &I1_CHEB_A) * z * z.exp()
     } else {
-        let cheb = cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt();
+        let cheb = cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B);
         if z > CEPHES_MAXLOG {
             let e = (z / 2.0).exp();
-            e * cheb * e
+            e * cheb / z.sqrt() * e
         } else {
-            z.exp() * cheb
+            z.exp() * cheb / z.sqrt()
         }
+    };
+    if x < 0.0 { -out } else { out }
+}
+
+/// `I0(x)·exp(-|x|)`: Cephes `i0e`, the same Chebyshev tables without the exponential, so it is
+/// finite for every finite `x` (frankenscipy-wyn06).
+fn i0e_cephes(x: f64) -> f64 {
+    let x = x.abs();
+    if x <= 8.0 {
+        return cephes_chbevl((x / 2.0) - 2.0, &I0_CHEB_A);
+    }
+    cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt()
+}
+
+/// `I1(x)·exp(-|x|)`: Cephes `i1e`.
+fn i1e_cephes(x: f64) -> f64 {
+    let z = x.abs();
+    let out = if z <= 8.0 {
+        cephes_chbevl((z / 2.0) - 2.0, &I1_CHEB_A) * z
+    } else {
+        cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt()
     };
     if x < 0.0 { -out } else { out }
 }
@@ -718,9 +744,10 @@ pub static BESSEL_K01_CEPHES_HITS: std::sync::atomic::AtomicUsize =
 /// `exp(x)`. That branch therefore paid TWO exponentials and a rounding round-trip to
 /// arrive back where it started. Cephes computes `K0` below 2 with no exponential at all.
 fn k0_cephes(x: f64) -> f64 {
+    // Cephes writes log(0.5 x) and calls its own i0. `ln(x) - ln 2` rounds differently, and
+    // `i0_scalar` read a toggle and bumped a shared counter per element (frankenscipy-wyn06).
     if x <= 2.0 {
-        return cephes_chbevl(x * x - 2.0, &K0_A)
-            - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
+        return cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_cephes(x);
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
 }
@@ -728,8 +755,7 @@ fn k0_cephes(x: f64) -> f64 {
 /// `K1(x)` for `x > 0`, UNSCALED. Same story as [`k0_cephes`].
 fn k1_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        return (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
-            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        return (0.5 * x).ln() * i1_cephes(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
 }
@@ -938,13 +964,15 @@ pub fn kve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRe
 /// Scalar: i0e(x) = I_0(x) * exp(-|x|).
 #[must_use]
 pub fn i0e_scalar(x: f64) -> f64 {
-    iv_scalar(0.0, x) * (-x.abs()).exp()
+    // Cephes' own scaled kernel, as SciPy. It was iv(0, x)·exp(-|x|): 4x slower than SciPy,
+    // and inf·0 past |x| ~ 709 (frankenscipy-wyn06).
+    i0e_cephes(x)
 }
 
 /// Scalar: i1e(x) = I_1(x) * exp(-|x|).
 #[must_use]
 pub fn i1e_scalar(x: f64) -> f64 {
-    iv_scalar(1.0, x) * (-x.abs()).exp()
+    i1e_cephes(x)
 }
 
 /// Scalar: ive(v, x) = I_v(x) * exp(-|x|).
@@ -1025,13 +1053,27 @@ pub fn log_ive_scalar(v: f64, x: f64) -> f64 {
 /// Scalar: k0e(x) = K_0(x) * exp(x).
 #[must_use]
 pub fn k0e_scalar(x: f64) -> f64 {
-    k0_scalar(x) * x.exp()
+    // Cephes `k0e`, as SciPy. It was k0(x)·exp(x): 0·inf = NaN past x ~ 745, and slower
+    // (frankenscipy-wyn06).
+    if x == 0.0 {
+        return f64::INFINITY;
+    }
+    if x < 0.0 {
+        return f64::NAN;
+    }
+    k0e_cephes(x)
 }
 
 /// Scalar: k1e(x) = K_1(x) * exp(x).
 #[must_use]
 pub fn k1e_scalar(x: f64) -> f64 {
-    k1_scalar(x) * x.exp()
+    if x == 0.0 {
+        return f64::INFINITY;
+    }
+    if x < 0.0 {
+        return f64::NAN;
+    }
+    k1e_cephes(x)
 }
 
 /// Scalar: kve(v, x) = K_v(x) * exp(x).
@@ -2287,20 +2329,20 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
     k_curr
 }
 
+/// Cephes `k0e` for `x > 0`: `K0(x)·exp(x)`, finite for every finite `x`.
 fn k0e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y =
-            cephes_chbevl(x * x - 2.0, &K0_A) - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
+        let y = cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_cephes(x);
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
     }
 }
 
+/// Cephes `k1e` for `x > 0`: `K1(x)·exp(x)`.
 fn k1e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y = (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
-            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        let y = (0.5 * x).ln() * i1_cephes(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
@@ -10240,6 +10282,124 @@ mod tests {
         assert!(super::k0_scalar(-1.0).is_nan());
         assert!(super::k1_scalar(-1.0).is_nan());
         assert!(super::kn_scalar(0, -1.0).is_nan());
+    }
+
+    #[test]
+    fn scaled_and_unscaled_i01_k01_are_scipy_cephes_bit_for_bit() {
+        // scipy.special 1.17.1, bit for bit, either side of the x = 2 and x = 8 kernel switches.
+        // At x = 1000 the old i0e/i1e (iv·exp(-x)) and k0e/k1e (k·exp(x)) were not finite.
+        let scaled = [
+            (
+                0.5,
+                0.64503527044915,
+                0.15642080318487173,
+                1.5241093857739092,
+                2.7310097082117855,
+            ),
+            (
+                1.9,
+                0.31824316288914156,
+                0.21661191117477055,
+                0.861450616751756,
+                1.0674709298145695,
+            ),
+            (
+                7.9,
+                0.14436986414104191,
+                0.13489649943989365,
+                0.43930008190021524,
+                0.4663177847368799,
+            ),
+            (
+                8.5,
+                0.13900184305484758,
+                0.13054935509459586,
+                0.423935999333698,
+                0.4482133915630794,
+            ),
+            (
+                50.0,
+                0.056561626647454184,
+                0.055993123892895395,
+                0.17680715585742932,
+                0.17856655855881556,
+            ),
+            (
+                1000.0,
+                0.012617240455891257,
+                0.01261093025692863,
+                0.03962832160075422,
+                0.03964813081296021,
+            ),
+        ];
+        for (x, i0e, i1e, k0e, k1e) in scaled {
+            for (name, got, want) in [
+                ("i0e", super::i0e_scalar(x), i0e),
+                ("i1e", super::i1e_scalar(x), i1e),
+                ("i1e(-x)", super::i1e_scalar(-x), -i1e),
+                ("k0e", super::k0e_scalar(x), k0e),
+                ("k1e", super::k1e_scalar(x), k1e),
+            ] {
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "{name}({x}) = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        let unscaled = [
+            (
+                0.5,
+                1.0634833707413234,
+                0.25789430539089636,
+                0.9244190712276656,
+                1.6564411200033007,
+            ),
+            (
+                1.9,
+                2.1277401940538874,
+                1.448244373054889,
+                0.12884597927604755,
+                0.15966015303266756,
+            ),
+            (
+                7.9,
+                389.406283282158,
+                363.8539440845081,
+                0.00016286766768765324,
+                0.0001728843064923898,
+            ),
+            (
+                8.5,
+                683.1619269901155,
+                641.6199025400667,
+                8.625756634932507e-05,
+                9.119724775006897e-05,
+            ),
+            (
+                50.0,
+                2.9325537838493355e20,
+                2.9030785901035566e20,
+                3.410167749789495e-23,
+                3.4441022267175555e-23,
+            ),
+        ];
+        for (x, i0, i1, k0, k1) in unscaled {
+            for (name, got, want) in [
+                ("i0", super::i0_cephes(x), i0),
+                ("i1", super::i1_cephes(x), i1),
+                ("k0", super::k0_cephes(x), k0),
+                ("k1", super::k1_cephes(x), k1),
+            ] {
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "{name}({x}) = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        assert_eq!(super::k0e_scalar(0.0), f64::INFINITY);
+        assert!(super::k1e_scalar(-1.0).is_nan());
     }
 
     #[test]
