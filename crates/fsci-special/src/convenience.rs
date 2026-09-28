@@ -2607,92 +2607,90 @@ pub fn euler(n: u32) -> f64 {
 ///
 /// Generalizes the Riemann zeta function: ζ(s) = ζ(s, 1).
 ///
-/// Matches `scipy.special.zeta(s, a)` (the two-argument form).
+/// Matches `scipy.special.zeta(s, a)` (the two-argument form) bit for bit: this is the
+/// Cephes `zeta(x, q)` SciPy calls, checked on 30,000 points including negative `a`.
 ///
-/// Uses Euler-Maclaurin summation:
+/// - s = 1 is a pole (+inf), and s < 1 is outside the domain (NaN). This implementation used
+///   to return +inf for every s <= 1.
+/// - A nonpositive-integer `a` is a pole (+inf). A negative non-integer `a` needs an integer
+///   `s`, so that `(a + k)^-s` stays real; otherwise the result is NaN.
+/// - For a > 1e8 it uses the asymptotic (1/(s-1) + 1/(2a))·a^(1-s) (DLMF 25.11.43).
+/// - Otherwise it sums directly until a + k > 9 (at least nine terms), then applies up to
+///   twelve Euler-Maclaurin Bernoulli corrections, stopping once a term is below 2^-53 of
+///   the sum.
 ///
-/// ```text
-///   ζ(s, a) ≈ Σ_{n=0}^{N-1} (n+a)^{-s}
-///           + (N+a)^{1-s} / (s-1)               [integral tail]
-///           - (1/2) (N+a)^{-s}                  [half-term]
-///           + (s/12) (N+a)^{-s-1}               [B_2 correction]
-///           - s(s+1)(s+2)/720 · (N+a)^{-s-3}    [B_4 correction]
-///           + s..(s+4)/30240 · (N+a)^{-s-5}     [B_6 correction]
-///           - s..(s+6)/1209600 · (N+a)^{-s-7}   [B_8 correction]
-/// ```
-///
-/// Direct sum to N=20 with four Bernoulli terms gives ~1e-13 absolute
-/// accuracy down to s≈1.1 (the previous implementation, which used a
-/// 10 000-term direct sum and only the integral tail, missed the
-/// half-term and Bernoulli corrections and so floored at ~1e-5 abs at
-/// s=1.1) — frankenscipy-3u8ze.
+/// It replaces an N = 20 Euler-Maclaurin sum with four Bernoulli terms (~1e-13) and a separate
+/// shift recurrence for negative `a` (frankenscipy-re34v).
 pub fn hurwitz_zeta(s: f64, a: f64) -> f64 {
+    const MACHEP: f64 = 1.110_223_024_625_156_5e-16; // 2^-53, Cephes' MACHEP
+    // (2k)! / B_2k
+    #[allow(clippy::excessive_precision)]
+    const EULER_MACLAURIN: [f64; 12] = [
+        12.0,
+        -720.0,
+        30240.0,
+        -1209600.0,
+        47900160.0,
+        -1.8924375803183791606e9,
+        7.47242496e10,
+        -2.950130727918164224e12,
+        1.1646782814350067249e14,
+        -4.5979787224074726105e15,
+        1.8152105401943546773e17,
+        -7.1661652561756670113e18,
+    ];
     if s.is_nan() || a.is_nan() {
         return f64::NAN;
     }
+    if s == 1.0 {
+        return f64::INFINITY;
+    }
+    if s < 1.0 {
+        return f64::NAN;
+    }
     if a <= 0.0 {
-        // A nonpositive-integer a hits a pole (some a+k = 0) => +inf (scipy).
         if a == a.floor() {
             return f64::INFINITY;
         }
-        // For negative non-integer a, scipy.special.zeta(s, a) is real only when s
-        // is an integer (so the negative-base terms (a+j)^{-s} stay real), via the
-        // shift recurrence ζ(s,a) = Σ_{j<m} (a+j)^{-s} + ζ(s, a+m), a+m ∈ (0,1].
-        // Non-integer s with a<0 is NaN in scipy; reproduce that.
-        if s != s.round() || s <= 1.0 {
+        if s != s.floor() {
             return f64::NAN;
         }
-        let exp = -(s as i64);
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&exp) {
-            return f64::NAN;
+    }
+    if a > 1e8 {
+        return (1.0 / (s - 1.0) + 1.0 / (2.0 * a)) * a.powf(1.0 - s);
+    }
+
+    let mut sum = a.powf(-s);
+    let mut base = a;
+    let mut terms = 0;
+    let mut b = 0.0;
+    while terms < 9 || base <= 9.0 {
+        terms += 1;
+        base += 1.0;
+        b = base.powf(-s);
+        sum += b;
+        if (b / sum).abs() < MACHEP {
+            return sum;
         }
-        let exp = exp as i32;
-        let m = (-a).ceil() as i64;
-        let mut acc = 0.0;
-        for j in 0..m {
-            acc += (a + j as f64).powi(exp);
+    }
+    let w = base;
+    sum += b * w / (s - 1.0);
+    sum -= 0.5 * b;
+    let mut poch = 1.0;
+    let mut k = 0.0;
+    for divisor in EULER_MACLAURIN {
+        poch *= s + k;
+        b /= w;
+        let t = poch * b / divisor;
+        sum += t;
+        if (t / sum).abs() < MACHEP {
+            return sum;
         }
-        return acc + hurwitz_zeta(s, a + m as f64);
+        k += 1.0;
+        poch *= s + k;
+        b /= w;
+        k += 1.0;
     }
-    if s <= 1.0 {
-        return f64::INFINITY; // Pole at s=1
-    }
-
-    let n_direct: usize = 20;
-    let mut sum = 0.0;
-    for k in 0..n_direct {
-        sum += (k as f64 + a).powf(-s);
-    }
-
-    let na = n_direct as f64 + a;
-    let na_inv_sq = 1.0 / (na * na);
-
-    // (N+a)^{-s} computed via powf for accuracy across the supported
-    // s range; subsequent factors are obtained by multiplying by 1/na².
-    let na_neg_s = na.powf(-s);
-
-    // Integral tail: (N+a)^{1-s} / (s-1) = (N+a) · (N+a)^{-s} / (s-1).
-    sum += na * na_neg_s / (s - 1.0);
-    // Half-term: +(1/2) · (N+a)^{-s}. Direct sum covers k = 0..N-1,
-    // the Euler-Maclaurin tail Σ_{k=N}^∞ f(k+a) starts at k = N,
-    // so the half-term sits on the included left boundary y = N+a.
-    sum += 0.5 * na_neg_s;
-
-    // Bernoulli corrections. `term` tracks (N+a)^{-s-(2j-1)} for j=1,2,…
-    // and `poch` tracks the Pochhammer symbol [s]_{2j-1}.
-    let mut term = na_neg_s / na;
-    let mut poch = s;
-    sum += (1.0 / 12.0) * poch * term; // j=1
-    term *= na_inv_sq;
-    poch *= (s + 1.0) * (s + 2.0);
-    sum -= (1.0 / 720.0) * poch * term; // j=2
-    term *= na_inv_sq;
-    poch *= (s + 3.0) * (s + 4.0);
-    sum += (1.0 / 30240.0) * poch * term; // j=3
-    term *= na_inv_sq;
-    poch *= (s + 5.0) * (s + 6.0);
-    sum -= (1.0 / 1209600.0) * poch * term; // j=4
-
     sum
 }
 
@@ -4389,64 +4387,14 @@ pub fn tetragamma(x: f64) -> f64 {
 }
 
 /// Digamma function ψ(x) = d(ln Γ(x))/dx (scalar).
+///
+/// The crate's one digamma kernel, SciPy's xsf `digamma`. It keeps SciPy's signed pole at
+/// zero, ψ(+0) = -inf and ψ(-0) = +inf (frankenscipy-eaqem), and NaN at the negative
+/// integers. This was a second, separately maintained shift-to-12 asymptotic
+/// (frankenscipy-re34v).
+#[must_use]
 pub fn digamma_scalar(x: f64) -> f64 {
-    // ZERO IS A POLE WITH A SIGN, not a NaN. scipy 1.17.1:
-    //   psi( 0.0) = -inf
-    //   psi(-0.0) = +inf
-    // In IEEE arithmetic `x == 0.0` is TRUE for -0.0, so the old guard
-    // `x <= 0.0 && x == x.floor()` collapsed both zeros into one NaN
-    // (frankenscipy-eaqem). The sign is INVERTED relative to intuition -- +0.0
-    // gives NEGATIVE infinity -- so these are copied from the measurement, not
-    // reasoned out.
-    //
-    // `gammasgn_scalar` in gamma.rs already handles the same input correctly
-    // with `if x == 0.0 { if x.is_sign_negative() {..} }`, which is the positive
-    // control proving this pattern is known here; digamma simply omitted it.
-    if x == 0.0 {
-        return if x.is_sign_negative() {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        };
-    }
-    // The negative integers remain genuine NaN poles: psi(-1.0) = psi(-2.0) = nan.
-    if x < 0.0 && x == x.floor() {
-        return f64::NAN;
-    }
-
-    let mut val = x;
-    let mut result = 0.0;
-
-    if val < 0.0 {
-        result -= std::f64::consts::PI / (std::f64::consts::PI * val).tan();
-        val = 1.0 - val;
-    }
-
-    // Recur up to val ≥ 12 then apply the Stirling-type asymptotic through the
-    // 1/x^10 term. The previous (shift-to-8, through 1/x^6) form left a ~2e-10
-    // absolute error (worst ~4e-9 relative) that capped the accuracy of every
-    // digamma-based series (e.g. the hyp2f1/hyperu logarithmic connection forms);
-    // this reaches ~4e-14 worst relative — verified vs mpmath over x∈[0.01,1000]
-    // and the reflected negative axis — for ~4 extra recur steps and 2 terms.
-    while val < 12.0 {
-        result -= 1.0 / val;
-        val += 1.0;
-    }
-
-    let inv_x = 1.0 / val;
-    let inv_x2 = inv_x * inv_x;
-    let mut term = inv_x2;
-    result += val.ln() - inv_x / 2.0 - term / 12.0; // 1/x^2
-    term *= inv_x2;
-    result += term / 120.0; // +1/(120 x^4)
-    term *= inv_x2;
-    result -= term / 252.0; // -1/(252 x^6)
-    term *= inv_x2;
-    result += term / 240.0; // +1/(240 x^8)
-    term *= inv_x2;
-    result -= term / 132.0; // -1/(132 x^10)
-
-    result
+    crate::gamma::digamma_core(x)
 }
 
 // ══════════════════════════════════════════════════════════════════════

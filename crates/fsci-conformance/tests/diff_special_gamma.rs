@@ -8,8 +8,9 @@
 //! Erlang, Pearson3, etc. — but had no dedicated diff harness.
 //! ~12 x-values × 4 functions = ~48 cases via subprocess.
 //!
-//! Tolerances: 1e-12 abs / rel for gamma/gammaln, 1e-10 rel for
-//! digamma/rgamma. The reflection branch around negative
+//! Tolerances: 1e-12 abs / rel for gamma/gammaln, 1e-15 relative
+//! for digamma (bit-identical xsf port), 5e-10 scaled for
+//! rgamma. The reflection branch around negative
 //! integers is intentionally skipped — gamma has poles at
 //! 0, -1, -2, … and even just-near-pole values are
 //! ill-conditioned and amplify any small kernel difference.
@@ -30,9 +31,12 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const GAMMA_TOL_ABS: f64 = 1.0e-10;
 const GAMMA_TOL_REL: f64 = 1.0e-12;
-// digamma has a uniform ~2.4e-10 abs floor across the small/
-// moderate x range; bump to 5e-10 abs to absorb with margin.
-const DIGAMMA_TOL_REL: f64 = 5.0e-10;
+// digamma is SciPy's xsf digamma and matches it bit for bit. This is a TRUE relative
+// tolerance, a few ulp. It used to be an absolute 5e-10, which could not see 1e-12 relative
+// error next to digamma's roots (frankenscipy-re34v).
+const DIGAMMA_TOL_REL: f64 = 1.0e-15;
+// rgamma: 5e-10 scaled by max(|value|, 1).
+const RGAMMA_TOL_REL: f64 = 5.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per function.
 const ARMS: [&str; 4] = ["gamma", "gammaln", "digamma", "rgamma"];
@@ -150,6 +154,25 @@ fn generate_query() -> OracleQuery {
                 x,
             });
         }
+    }
+    // digamma next to its positive root (1.4616...) and its negative root (-0.5041...),
+    // where a value built by cancellation loses its relative accuracy.
+    let xs_digamma_roots = [
+        1.461_632_144_968_362_2_f64,
+        1.461_632_144_969_362_3,
+        1.46,
+        1.47,
+        -0.504_083_008_264_455_4,
+        -0.504_083_008_164_455_4,
+        -0.3,
+        -0.7,
+    ];
+    for &x in &xs_digamma_roots {
+        points.push(PointCase {
+            case_id: format!("digamma_x{x}"),
+            func: "digamma".into(),
+            x,
+        });
     }
     OracleQuery { points }
 }
@@ -279,7 +302,8 @@ fn diff_special_gamma() {
         let scale = scipy_v.abs().max(1.0);
         let pass = match arm {
             "gamma" | "gammaln" => abs_diff <= GAMMA_TOL_ABS || rel_diff <= GAMMA_TOL_REL * scale,
-            "digamma" | "rgamma" => abs_diff <= DIGAMMA_TOL_REL * scale,
+            "digamma" => abs_diff <= DIGAMMA_TOL_REL * scipy_v.abs(),
+            "rgamma" => abs_diff <= RGAMMA_TOL_REL * scale,
             _ => false,
         };
         ledger.compared(arm, &case.case_id, pass);
