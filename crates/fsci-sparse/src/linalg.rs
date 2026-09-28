@@ -11260,8 +11260,8 @@ fn has_empty_structural_row(a: &CsrMatrix) -> bool {
 /// Matches `scipy.sparse.csgraph.floyd_warshall(graph, directed)`; with `directed = false`
 /// the pair `(i, j)` starts from the smaller of its two stored weights, as in SciPy.
 ///
-/// A negative cycle is an error, as SciPy's `NegativeCycleError`: after the relaxation any
-/// `dist[i][i] < 0` refuses the whole matrix, whose distances through the cycle are unbounded
+/// A negative cycle is [`SparseError::NegativeCycle`], SciPy's `NegativeCycleError`: after the
+/// relaxation any `dist[i][i] < 0` refuses the whole matrix, whose distances through the cycle are unbounded
 /// below (frankenscipy-lna36). With `directed = false` one negative edge is such a cycle. A
 /// non-square graph is an error too, as SciPy's `ValueError`.
 pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<Vec<f64>>> {
@@ -11335,10 +11335,8 @@ pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<Vec
     // ...")` over the whole diagonal once the relaxation is done.
     let cycle: Vec<usize> = (0..n).filter(|&i| d[i * n + i] < 0.0).collect();
     if !cycle.is_empty() {
-        return Err(SparseError::InvalidArgument {
-            message: format!(
-                "graph contains a negative-weight cycle: Negative cycle in nodes {cycle:?}"
-            ),
+        return Err(SparseError::NegativeCycle {
+            message: format!("Negative cycle in nodes {cycle:?}"),
         });
     }
     Ok(d.chunks_exact(n).map(<[f64]>::to_vec).collect())
@@ -29417,8 +29415,14 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
+        // SciPy 1.17.1: NegativeCycleError("Negative cycle detected on node 0"), the source.
         let err = bellman_ford(&g, true, 0).expect_err("negative cycle");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+        assert_eq!(
+            err,
+            SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            }
+        );
     }
 
     /// frankenscipy-lna36. floyd_warshall returned a distance matrix through a negative cycle.
@@ -29460,7 +29464,7 @@ mod tests {
             let result = floyd_warshall(g, directed);
             // The reported node list, e.g. "... Negative cycle in nodes [0, 1]".
             let reported: Option<Vec<usize>> = match &result {
-                Err(SparseError::InvalidArgument { message }) => message
+                Err(SparseError::NegativeCycle { message }) => message
                     .split_once("Negative cycle in nodes [")
                     .and_then(|(_, rest)| rest.split_once(']'))
                     .map(|(list, _)| {
@@ -29499,7 +29503,7 @@ mod tests {
         ));
         assert!(matches!(
             graph_diameter(&cycle),
-            Err(SparseError::InvalidArgument { .. })
+            Err(SparseError::NegativeCycle { .. })
         ));
     }
 
@@ -35079,8 +35083,36 @@ fn dijkstra_core(
 ) -> ShortestPathResult {
     let mut dist = vec![f64::INFINITY; n];
     let mut pred = vec![-1_i64; n];
-    dist[source] = 0.0;
+    let transpose = transpose.map(|t| (&t.indptr[..], &t.indices[..], &t.data[..]));
+    dijkstra_scan(
+        (indptr, indices, data),
+        transpose,
+        &mut dist,
+        &mut pred,
+        source,
+    );
+    ShortestPathResult {
+        distances: dist,
+        predecessors: pred,
+    }
+}
 
+/// A CSR adjacency as `(indptr, indices, weights)`: [`dijkstra_scan`] takes the weights apart
+/// from the structure because [`yen`] masks edges by overwriting weights with infinity.
+type CsrAdjacency<'a> = (&'a [usize], &'a [usize], &'a [f64]);
+
+/// SciPy's `_dijkstra` heap loop for one source over caller-initialised `dist` and `pred`
+/// (whatever `dist` already holds bounds the relaxations, as in SciPy; [`yen`] relies on that).
+/// `transpose` is `Some` for an undirected search: each settled vertex relaxes its own row and
+/// then its transpose row.
+fn dijkstra_scan(
+    graph: CsrAdjacency<'_>,
+    transpose: Option<CsrAdjacency<'_>>,
+    dist: &mut [f64],
+    pred: &mut [i64],
+    source: usize,
+) {
+    dist[source] = 0.0;
     let mut heap = BinaryHeap::new();
     heap.push(DijkstraState {
         cost: 0.0,
@@ -35104,17 +35136,10 @@ fn dijkstra_core(
                 }
             }
         };
-        let row = indptr[position]..indptr[position + 1];
-        relax(&indices[row.clone()], &data[row]);
-        if let Some(t) = transpose {
-            let row = t.indptr[position]..t.indptr[position + 1];
-            relax(&t.indices[row.clone()], &t.data[row]);
+        for (indptr, indices, weights) in std::iter::once(graph).chain(transpose) {
+            let row = indptr[position]..indptr[position + 1];
+            relax(&indices[row.clone()], &weights[row]);
         }
-    }
-
-    ShortestPathResult {
-        distances: dist,
-        predecessors: pred,
     }
 }
 
@@ -35159,7 +35184,9 @@ fn dijkstra_parallel_sources(
 /// `scipy.sparse.csgraph.bellman_ford(graph, directed, indices=source)`.
 ///
 /// Supports negative edge weights (unlike Dijkstra). Detects negative cycles with SciPy's
-/// `1e-15` slack. This follows SciPy's `_bellman_ford_directed` / `_bellman_ford_undirected`
+/// `1e-15` slack and reports them as [`SparseError::NegativeCycle`], SciPy's
+/// `NegativeCycleError` (so do [`johnson`], [`dijkstra`] on a negative weight, and their
+/// multi-source forms, which run this per source). This follows SciPy's `_bellman_ford_directed` / `_bellman_ford_undirected`
 /// pass for pass, including reading each row's source distance once per pass. Undirected, a
 /// stored edge relaxes both of its endpoints, so a negative edge is itself a negative cycle.
 /// The passes stop early once one changes nothing; the remaining passes would not change
@@ -35222,8 +35249,9 @@ pub fn bellman_ford(
                 (d2 - d1).abs() > w12 + EPS
             };
             if violated {
-                return Err(SparseError::InvalidArgument {
-                    message: "graph contains a negative-weight cycle".to_string(),
+                // SciPy's `_bellman_ford_*` return the SOURCE index, which its message names.
+                return Err(SparseError::NegativeCycle {
+                    message: format!("Negative cycle detected on node {source}"),
                 });
             }
         }
@@ -35386,6 +35414,2253 @@ pub fn depth_first_order(
     }
 
     Ok((order, predecessors))
+}
+
+// ── csgraph trees, predecessor tools, dense and masked conversions, maximum flow, bipartite
+// matchings and Yen's k shortest paths (frankenscipy-fdepw). Each is a port of SciPy 1.17.1's
+// `scipy/sparse/csgraph/_tools.pyx`, `_traversal.pyx`, `_flow.pyx`, `_matching.pyx` or
+// `_shortest_path.pyx`, pass for pass: which flow, matching, tree edge or path comes out when
+// several are optimal depends on the exact scan order, and these return SciPy's.
+
+/// The node count of a square graph, or SciPy's `validate_graph` error for a non-square one.
+fn square_csgraph_order(graph: &CsrMatrix) -> SparseResult<usize> {
+    let shape = graph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "compressed-sparse graph must be shape (N, N), got ({}, {})",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    Ok(shape.rows)
+}
+
+/// The transpose of a CSR pattern with `n_cols` columns, as SciPy's `csr_tocsc` builds it: a
+/// stable counting sort, so row `c` of the transpose lists the rows holding column `c` in
+/// increasing order, and a duplicated entry keeps its storage order. Returns the transpose's
+/// `indptr` and `indices`, and for each of its positions the position of the same entry in the
+/// input (`order`), which carries values across and is SciPy's `_make_edge_pointers`.
+fn csr_transpose_order(
+    indptr: &[usize],
+    indices: &[usize],
+    n_cols: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut t_indptr = vec![0usize; n_cols + 1];
+    for &col in indices {
+        t_indptr[col + 1] += 1;
+    }
+    for col in 0..n_cols {
+        t_indptr[col + 1] += t_indptr[col];
+    }
+    let mut next = t_indptr[..n_cols].to_vec();
+    let mut t_indices = vec![0usize; indices.len()];
+    let mut order = vec![0usize; indices.len()];
+    for row in 0..indptr.len().saturating_sub(1) {
+        for entry in indptr[row]..indptr[row + 1] {
+            let slot = &mut next[indices[entry]];
+            t_indices[*slot] = row;
+            order[*slot] = entry;
+            *slot += 1;
+        }
+    }
+    (t_indptr, t_indices, order)
+}
+
+/// `scipy.sparse.csgraph.breadth_first_tree(csgraph, i_start, directed)`: the tree of edges
+/// from each node's [`breadth_first_order`] predecessor to it, built by [`reconstruct_path`].
+pub fn breadth_first_tree(
+    csgraph: &CsrMatrix,
+    i_start: usize,
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let (_, predecessors) = breadth_first_order(csgraph, i_start, directed)?;
+    reconstruct_path(csgraph, &predecessors, directed)
+}
+
+/// `scipy.sparse.csgraph.depth_first_tree(csgraph, i_start, directed)`: the tree of edges from
+/// each node's [`depth_first_order`] predecessor to it, built by [`reconstruct_path`]. Which of
+/// several depth-first trees comes out is SciPy's, since the traversal is SciPy's.
+pub fn depth_first_tree(
+    csgraph: &CsrMatrix,
+    i_start: usize,
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let (_, predecessors) = depth_first_order(csgraph, i_start, directed)?;
+    reconstruct_path(csgraph, &predecessors, directed)
+}
+
+/// A predecessor entry as a node: `None` for any negative value, an error past the last node.
+fn predecessor_node(predecessor: i64, n: usize) -> SparseResult<Option<usize>> {
+    if predecessor < 0 {
+        return Ok(None);
+    }
+    match usize::try_from(predecessor) {
+        Ok(node) if node < n => Ok(Some(node)),
+        _ => Err(SparseError::IndexOutOfBounds {
+            axis: "predecessor",
+            index: usize::try_from(predecessor).unwrap_or(usize::MAX),
+            bound: n,
+        }),
+    }
+}
+
+/// For each entry `(row, column)` of the CSR pattern `(want_indptr, want_indices)`, the value
+/// `graph[row, column]` as SciPy's `csr_sample_values` reads it: the sum of the entries stored
+/// there, in storage order, and 0 when there are none.
+fn csgraph_pattern_values(
+    graph: CsrAdjacency<'_>,
+    want_indptr: &[usize],
+    want_indices: &[usize],
+    n: usize,
+) -> Vec<f64> {
+    let (indptr, indices, data) = graph;
+    let mut sums: Vec<Option<f64>> = vec![None; n];
+    let mut out = vec![0.0; want_indices.len()];
+    for row in 0..want_indptr.len().saturating_sub(1) {
+        let wanted = want_indptr[row]..want_indptr[row + 1];
+        if wanted.is_empty() {
+            continue;
+        }
+        let stored = indptr[row]..indptr[row + 1];
+        for (&col, &w) in indices[stored.clone()].iter().zip(&data[stored.clone()]) {
+            sums[col] = Some(sums[col].map_or(w, |s| s + w));
+        }
+        for (slot, &col) in out[wanted.clone()].iter_mut().zip(&want_indices[wanted]) {
+            *slot = sums[col].unwrap_or(0.0);
+        }
+        for &col in &indices[stored] {
+            sums[col] = None;
+        }
+    }
+    out
+}
+
+/// `np.minimum`: NaN if either side is NaN.
+fn nan_propagating_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
+    }
+}
+
+/// `scipy.sparse.csgraph.reconstruct_path(csgraph, predecessors, directed)`: the N x N tree
+/// with an edge from `predecessors[i]` to `i` for every node that has a predecessor.
+///
+/// The edge `(p, i)` carries `csgraph[p, i]`: the sum of the entries stored there, 0 when there
+/// are none, and a stored zero is kept as an explicit zero of the tree. With `directed = false`
+/// it carries the smaller of `csgraph[p, i]` and `csgraph[i, p]`, where a 0 on either side
+/// first counts as infinity, as in SciPy: a pair whose only weight is an explicit zero carries
+/// infinity.
+///
+/// Each row lists its children in increasing index. SciPy orders them with `np.argsort` of the
+/// predecessors, which is not stable, so past 16 nodes a SciPy row can hold the same children
+/// in another storage order; the matrix is the same.
+///
+/// Every negative predecessor means "none": fsci's traversals write -1, SciPy's -9999 (SciPy
+/// itself treats only its "none" as such). `predecessors` needs one entry per node, and an
+/// entry past the last node is an error.
+pub fn reconstruct_path(
+    csgraph: &CsrMatrix,
+    predecessors: &[i64],
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let n = square_csgraph_order(csgraph)?;
+    if predecessors.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "predecessors has {} entries for a graph of {n} nodes",
+                predecessors.len()
+            ),
+        });
+    }
+    let parents = predecessors
+        .iter()
+        .map(|&p| predecessor_node(p, n))
+        .collect::<SparseResult<Vec<_>>>()?;
+    let mut indptr = vec![0usize; n + 1];
+    for &p in parents.iter().flatten() {
+        indptr[p + 1] += 1;
+    }
+    for row in 0..n {
+        indptr[row + 1] += indptr[row];
+    }
+    let mut next = indptr[..n].to_vec();
+    let mut indices = vec![0usize; indptr[n]];
+    for (child, parent) in parents.iter().enumerate() {
+        if let Some(p) = *parent {
+            indices[next[p]] = child;
+            next[p] += 1;
+        }
+    }
+    let forward = csgraph_pattern_values(
+        (csgraph.indptr(), csgraph.indices(), csgraph.data()),
+        &indptr,
+        &indices,
+        n,
+    );
+    let data = if directed {
+        forward
+    } else {
+        // csgraph[i, p] for the tree entry (p, i) is row p of the transpose.
+        let t = transpose_adjacency(csgraph);
+        let backward =
+            csgraph_pattern_values((&t.indptr, &t.indices, &t.data), &indptr, &indices, n);
+        let unset_zero = |w: f64| if w == 0.0 { f64::INFINITY } else { w };
+        forward
+            .iter()
+            .zip(&backward)
+            .map(|(&a, &b)| nan_propagating_min(unset_zero(a), unset_zero(b)))
+            .collect()
+    };
+    CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+}
+
+/// `scipy.sparse.csgraph.construct_dist_matrix(graph, predecessors, directed, null_value)`:
+/// `dist[i][j]` is the length of the path from `i` to `j` that row `i` of `predecessors`
+/// encodes, walked back from `j`.
+///
+/// As in SciPy, edge weights are read from [`csgraph_to_dense`] with infinity for non-edges
+/// (the lightest of duplicated entries); with `directed = false` a 0 first becomes infinity
+/// and each pair takes the lighter of its two directions. A walk that stops at a node with no
+/// predecessor keeps the length summed so far; `null_value` is written only where `j != i` has
+/// no predecessor at all. A step along a pair that is not an edge adds infinity.
+///
+/// Every negative predecessor means "none" (fsci -1, SciPy -9999). SciPy loops forever on a
+/// predecessor row that cycles without reaching `i`, and indexes out of bounds on a node past
+/// the last; both are errors here.
+pub fn construct_dist_matrix(
+    graph: &CsrMatrix,
+    predecessors: &[Vec<i64>],
+    directed: bool,
+    null_value: f64,
+) -> SparseResult<Vec<Vec<f64>>> {
+    let mut weights = csgraph_to_dense(graph, f64::INFINITY)?;
+    let n = weights.len();
+    if predecessors.len() != n || predecessors.iter().any(|row| row.len() != n) {
+        return Err(SparseError::IncompatibleShape {
+            message: "graph and predecessors must have the same shape".to_string(),
+        });
+    }
+    if !directed {
+        for w in weights.iter_mut().flatten() {
+            if *w == 0.0 {
+                *w = f64::INFINITY;
+            }
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                if weights[j][i] <= weights[i][j] {
+                    weights[i][j] = weights[j][i];
+                } else {
+                    weights[j][i] = weights[i][j];
+                }
+            }
+        }
+    }
+    let mut dist = vec![vec![0.0; n]; n];
+    for (i, (row_pred, row_dist)) in predecessors.iter().zip(&mut dist).enumerate() {
+        for (j, d) in row_dist.iter_mut().enumerate() {
+            let mut null_path = true;
+            let mut k2 = j;
+            let mut steps = 0usize;
+            while k2 != i {
+                let Some(k1) = predecessor_node(row_pred[k2], n)? else {
+                    break;
+                };
+                if steps == n {
+                    return Err(SparseError::InvalidArgument {
+                        message: format!(
+                            "predecessors[{i}] cycles: the walk back from node {j} never reaches {i}"
+                        ),
+                    });
+                }
+                steps += 1;
+                *d += weights[k1][k2];
+                null_path = false;
+                k2 = k1;
+            }
+            if null_path && i != j {
+                *d = null_value;
+            }
+        }
+    }
+    Ok(dist)
+}
+
+/// `scipy.sparse.csgraph.csgraph_to_dense(csgraph, null_value)`: the dense N x N graph, with
+/// `null_value` where nothing is stored.
+///
+/// Unlike `toarray`, duplicated entries do not add up: the smallest one is kept, and a stored
+/// zero is a zero-weight edge, not a non-edge. A stored NaN is never "smaller" than the
+/// infinity the cell starts at, so it reads as infinity (not `null_value`), as in SciPy.
+pub fn csgraph_to_dense(csgraph: &CsrMatrix, null_value: f64) -> SparseResult<Vec<Vec<f64>>> {
+    let shape = csgraph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "csgraph should be a square matrix, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let n = shape.rows;
+    let mut graph = vec![vec![f64::INFINITY; n]; n];
+    let mut stored = vec![vec![false; n]; n];
+    let (indptr, indices, data) = (csgraph.indptr(), csgraph.indices(), csgraph.data());
+    for row in 0..n {
+        for entry in indptr[row]..indptr[row + 1] {
+            let col = indices[entry];
+            stored[row][col] = true;
+            if data[entry] < graph[row][col] {
+                graph[row][col] = data[entry];
+            }
+        }
+    }
+    for (row, stored_row) in graph.iter_mut().zip(&stored) {
+        for (w, &is_stored) in row.iter_mut().zip(stored_row) {
+            if !is_stored {
+                *w = null_value;
+            }
+        }
+    }
+    Ok(graph)
+}
+
+/// A dense graph and its mask: the Rust form of the NumPy masked arrays that SciPy's
+/// `csgraph_masked_from_dense`, `csgraph_from_masked` and `csgraph_to_masked` pass around.
+/// `mask[i][j]` true means `(i, j)` is not an edge; `data[i][j]` keeps the underlying value
+/// either way, as a masked array does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaskedGraph {
+    /// The values, row-major.
+    pub data: Vec<Vec<f64>>,
+    /// `true` where the value is masked (not an edge).
+    pub mask: Vec<Vec<bool>>,
+}
+
+/// The side of a square dense graph, or SciPy's error for a ragged or non-square one.
+fn square_dense_order<T>(graph: &[Vec<T>]) -> SparseResult<usize> {
+    let n = graph.len();
+    if graph.iter().any(|row| row.len() != n) {
+        return Err(SparseError::InvalidShape {
+            message: "graph should be a square array".to_string(),
+        });
+    }
+    Ok(n)
+}
+
+/// `scipy.sparse.csgraph.csgraph_masked_from_dense(graph, null_value, nan_null,
+/// infinity_null)`: the graph with its non-edges masked.
+///
+/// `null_value = None` masks no value. A NaN `null_value` turns on `nan_null` instead, and an
+/// infinite one `infinity_null` (both signs), as in SciPy. Any other `null_value` masks the
+/// entries NumPy's `masked_values` finds equal to it, and for float data that is
+/// `np.isclose(x, null_value)` with `rtol = 1e-5`, `atol = 1e-8`: with the default
+/// `null_value = 0`, an entry of magnitude at most 1e-8 is a non-edge too.
+pub fn csgraph_masked_from_dense(
+    graph: &[Vec<f64>],
+    null_value: Option<f64>,
+    nan_null: bool,
+    infinity_null: bool,
+) -> SparseResult<MaskedGraph> {
+    square_dense_order(graph)?;
+    let (mut nan_null, mut infinity_null) = (nan_null, infinity_null);
+    let null_value = match null_value {
+        Some(v) if v.is_nan() => {
+            nan_null = true;
+            None
+        }
+        Some(v) if v.is_infinite() => {
+            infinity_null = true;
+            None
+        }
+        other => other,
+    };
+    let is_null = |x: f64| {
+        null_value.is_some_and(|v| (x - v).abs() <= 1e-8 + 1e-5 * v.abs() || x == v)
+            || (infinity_null && x.is_infinite())
+            || (nan_null && x.is_nan())
+    };
+    Ok(MaskedGraph {
+        data: graph.to_vec(),
+        mask: graph
+            .iter()
+            .map(|row| row.iter().map(|&x| is_null(x)).collect())
+            .collect(),
+    })
+}
+
+/// `scipy.sparse.csgraph.csgraph_from_masked(graph)`: the CSR graph of the unmasked entries,
+/// row by row in column order.
+pub fn csgraph_from_masked(graph: &MaskedGraph) -> SparseResult<CsrMatrix> {
+    let n = square_dense_order(&graph.data)?;
+    if square_dense_order(&graph.mask)? != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "mask and data shapes differ".to_string(),
+        });
+    }
+    let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+    for (values, masked) in graph.data.iter().zip(&graph.mask) {
+        for (col, (&value, &is_masked)) in values.iter().zip(masked).enumerate() {
+            if !is_masked {
+                data.push(value);
+                indices.push(col);
+            }
+        }
+        indptr.push(data.len());
+    }
+    CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+}
+
+/// `scipy.sparse.csgraph.csgraph_from_dense(graph, null_value, nan_null, infinity_null)`:
+/// [`csgraph_from_masked`] of [`csgraph_masked_from_dense`]. With SciPy's defaults
+/// (`Some(0.0)`, `true`, `true`) zeros, NaNs and infinities are non-edges, and so is any entry
+/// of magnitude at most 1e-8 (see [`csgraph_masked_from_dense`]).
+pub fn csgraph_from_dense(
+    graph: &[Vec<f64>],
+    null_value: Option<f64>,
+    nan_null: bool,
+    infinity_null: bool,
+) -> SparseResult<CsrMatrix> {
+    csgraph_from_masked(&csgraph_masked_from_dense(
+        graph,
+        null_value,
+        nan_null,
+        infinity_null,
+    )?)
+}
+
+/// `scipy.sparse.csgraph.csgraph_to_masked(csgraph)`: `np.ma.masked_invalid` of
+/// [`csgraph_to_dense`] with NaN for non-edges, so a stored infinity or NaN is masked too.
+pub fn csgraph_to_masked(csgraph: &CsrMatrix) -> SparseResult<MaskedGraph> {
+    let data = csgraph_to_dense(csgraph, f64::NAN)?;
+    let mask = data
+        .iter()
+        .map(|row| row.iter().map(|x| !x.is_finite()).collect())
+        .collect();
+    Ok(MaskedGraph { data, mask })
+}
+
+/// `method=` of [`maximum_flow`], as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaximumFlowMethod {
+    /// Dinic's algorithm, blocking flows in breadth-first level graphs; SciPy's default.
+    #[default]
+    Dinic,
+    /// Edmonds–Karp: one shortest augmenting path per breadth-first search.
+    EdmondsKarp,
+}
+
+/// What [`maximum_flow`] returns: SciPy's `MaximumFlowResult`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaximumFlowResult {
+    /// The value of the flow: the sum of the flow on the source's row.
+    pub flow_value: i64,
+    /// SciPy's `.flow`: the flow on every edge of the graph after the missing reverse edges are
+    /// added as explicit zeros, rows sorted by column. An edge's reverse carries its negated
+    /// flow, so the matrix is antisymmetric; its entries are integers.
+    pub flow: CsrMatrix,
+}
+
+/// A capacity as SciPy's int32 (`ITYPE`). SciPy refuses a non-integer dtype; with f64 storage
+/// that is a non-integral value. SciPy casts wider integers to int32 silently (2**31 + 5 wraps
+/// to a negative capacity); fsci refuses a value outside int32 instead.
+fn flow_capacity(w: f64) -> SparseResult<i32> {
+    if !(w.is_finite() && w.fract() == 0.0) {
+        return Err(SparseError::InvalidArgument {
+            message: "graph capacities must be integers".to_string(),
+        });
+    }
+    if w < f64::from(i32::MIN) || w > f64::from(i32::MAX) {
+        return Err(SparseError::InvalidArgument {
+            message: format!("graph capacity {w} does not fit SciPy's int32 capacities"),
+        });
+    }
+    Ok(w as i32)
+}
+
+/// `scipy.sparse.csgraph.maximum_flow(csgraph, source, sink, method)`: a maximum flow from
+/// `source` to `sink` of the directed graph whose stored entries are integer capacities.
+///
+/// Validation follows SciPy's order: non-integral capacities, `source == sink`, a non-square
+/// graph, then out-of-range `source` and `sink`. A row stored out of column order is sorted
+/// first (stably; SciPy's `sorted_indices` is not stable, which matters only for a row that is
+/// both unsorted and holds duplicated entries). The reverse of every edge is then added with
+/// capacity 0 unless it is stored, and SciPy's `_edmonds_karp` or `_dinic` runs on that graph
+/// in its int32 arithmetic (wrapping as SciPy's C does, which only capacities near 2^31 reach).
+/// Which of several maximum flows comes out is SciPy's.
+pub fn maximum_flow(
+    csgraph: &CsrMatrix,
+    source: usize,
+    sink: usize,
+    method: MaximumFlowMethod,
+) -> SparseResult<MaximumFlowResult> {
+    let mut capacities = csgraph
+        .data()
+        .iter()
+        .map(|&w| flow_capacity(w))
+        .collect::<SparseResult<Vec<i32>>>()?;
+    if source == sink {
+        return Err(SparseError::InvalidArgument {
+            message: "source and sink vertices must differ".to_string(),
+        });
+    }
+    let shape = csgraph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: "graph must be specified as a square matrix.".to_string(),
+        });
+    }
+    let n = shape.rows;
+    for (name, vertex) in [("source", source), ("sink", sink)] {
+        if vertex >= n {
+            return Err(SparseError::InvalidArgument {
+                message: format!(
+                    "{name} value ({vertex}) must be between 0 and {}",
+                    n.cast_signed() - 1
+                ),
+            });
+        }
+    }
+
+    let indptr = csgraph.indptr();
+    let mut indices = csgraph.indices().to_vec();
+    for row in 0..n {
+        let range = indptr[row]..indptr[row + 1];
+        if indices[range.clone()].is_sorted() {
+            continue;
+        }
+        let mut entries: Vec<(usize, i32)> = indices[range.clone()]
+            .iter()
+            .copied()
+            .zip(capacities[range.clone()].iter().copied())
+            .collect();
+        entries.sort_by_key(|&(col, _)| col);
+        for (slot, (col, cap)) in range.zip(entries) {
+            indices[slot] = col;
+            capacities[slot] = cap;
+        }
+    }
+
+    // SciPy's `_add_reverse_edges`: merge each row of the graph with the same row of its
+    // transpose, keeping the graph's capacity where both have the entry and 0 otherwise.
+    let (at_indptr, at_indices, _) = csr_transpose_order(indptr, &indices, n);
+    let mut edge_ptr = vec![0usize; n + 1];
+    let mut heads = Vec::with_capacity(2 * indices.len());
+    let mut edge_caps = Vec::with_capacity(2 * indices.len());
+    for i in 0..n {
+        let (mut a, a_end) = (indptr[i], indptr[i + 1]);
+        let (mut b, b_end) = (at_indptr[i], at_indptr[i + 1]);
+        while a != a_end || b != b_end {
+            let move_a = a != a_end && (b == b_end || indices[a] <= at_indices[b]);
+            let move_b = b != b_end && (a == a_end || at_indices[b] <= indices[a]);
+            if move_a {
+                heads.push(indices[a]);
+                edge_caps.push(capacities[a]);
+                a += 1;
+            }
+            if move_b {
+                if !move_a {
+                    heads.push(at_indices[b]);
+                    edge_caps.push(0);
+                }
+                b += 1;
+            }
+        }
+        edge_ptr[i + 1] = heads.len();
+    }
+    // SciPy's `_make_edge_pointers`: position q of the transpose holds the edge reversed.
+    let (_, _, rev_edge) = csr_transpose_order(&edge_ptr, &heads, n);
+
+    let flows = match method {
+        MaximumFlowMethod::EdmondsKarp => {
+            let mut tails = vec![0usize; heads.len()];
+            for v in 0..n {
+                tails[edge_ptr[v]..edge_ptr[v + 1]].fill(v);
+            }
+            edmonds_karp_flows(
+                &edge_ptr, &tails, &heads, &edge_caps, &rev_edge, source, sink,
+            )
+        }
+        MaximumFlowMethod::Dinic => {
+            dinic_flows(&edge_ptr, &heads, &mut edge_caps, &rev_edge, source, sink)
+        }
+    };
+    let flow_value = flows[edge_ptr[source]..edge_ptr[source + 1]]
+        .iter()
+        .map(|&f| i64::from(f))
+        .sum();
+    let flow = CsrMatrix::from_components(
+        Shape2D::new(n, n),
+        flows.iter().map(|&f| f64::from(f)).collect(),
+        heads,
+        edge_ptr,
+        false,
+    )?;
+    Ok(MaximumFlowResult { flow_value, flow })
+}
+
+/// SciPy's `_edmonds_karp`: breadth-first augmenting paths over a graph whose every edge has
+/// its reverse (`rev_edge`). Returns the flow on each edge.
+fn edmonds_karp_flows(
+    edge_ptr: &[usize],
+    tails: &[usize],
+    heads: &[usize],
+    capacities: &[i32],
+    rev_edge: &[usize],
+    source: usize,
+    sink: usize,
+) -> Vec<i32> {
+    const NO_EDGE: usize = usize::MAX;
+    let n = edge_ptr.len() - 1;
+    let mut flow = vec![0i32; heads.len()];
+    let mut queue = vec![0usize; n];
+    let mut pred_edge = vec![NO_EDGE; n];
+    loop {
+        pred_edge.fill(NO_EDGE);
+        queue[0] = source;
+        let (mut start, mut end) = (0usize, 1usize);
+        let mut path_found = false;
+        while start != end && !path_found {
+            let cur = queue[start];
+            start += 1;
+            for e in edge_ptr[cur]..edge_ptr[cur + 1] {
+                let t = heads[e];
+                if pred_edge[t] == NO_EDGE && t != source && capacities[e] > flow[e] {
+                    pred_edge[t] = e;
+                    if t == sink {
+                        path_found = true;
+                        break;
+                    }
+                    queue[end] = t;
+                    end += 1;
+                }
+            }
+        }
+        if !path_found {
+            return flow;
+        }
+        let mut df = i32::MAX;
+        let mut t = sink;
+        while t != source {
+            let e = pred_edge[t];
+            df = df.min(capacities[e].wrapping_sub(flow[e]));
+            t = tails[e];
+        }
+        let mut t = sink;
+        while t != source {
+            let e = pred_edge[t];
+            flow[e] = flow[e].wrapping_add(df);
+            flow[rev_edge[e]] = flow[rev_edge[e]].wrapping_sub(df);
+            t = tails[e];
+        }
+    }
+}
+
+/// SciPy's `_dinic`: blocking flows in level graphs. `capacities` are the residual capacities
+/// and are consumed. Returns the flow on each edge.
+fn dinic_flows(
+    edge_ptr: &[usize],
+    heads: &[usize],
+    capacities: &mut [i32],
+    rev_edge: &[usize],
+    source: usize,
+    sink: usize,
+) -> Vec<i32> {
+    let n = edge_ptr.len() - 1;
+    let mut levels = vec![-1i64; n];
+    let mut progress = vec![0usize; n];
+    let mut queue = vec![0usize; n];
+    let mut stack = vec![(0usize, 0i32); n];
+    let mut flows = vec![0i32; heads.len()];
+    loop {
+        levels.fill(-1);
+        // SciPy's `_build_level_graph`: breadth-first levels over edges with residual capacity,
+        // stopping when the sink is dequeued.
+        queue[0] = source;
+        let (mut start, mut end) = (0usize, 1usize);
+        levels[source] = 0;
+        let mut reached_sink = false;
+        while start != end {
+            let cur = queue[start];
+            start += 1;
+            if cur == sink {
+                reached_sink = true;
+                break;
+            }
+            for e in edge_ptr[cur]..edge_ptr[cur + 1] {
+                let dst = heads[e];
+                if capacities[e] > 0 && levels[dst] == -1 {
+                    levels[dst] = levels[cur] + 1;
+                    queue[end] = dst;
+                    end += 1;
+                }
+            }
+        }
+        if !reached_sink {
+            return flows;
+        }
+        progress.copy_from_slice(&edge_ptr[..n]);
+        while dinic_augment(
+            edge_ptr,
+            source,
+            sink,
+            &levels,
+            heads,
+            rev_edge,
+            capacities,
+            &mut progress,
+            &mut flows,
+            &mut stack,
+        ) {}
+    }
+}
+
+/// SciPy's `_augment_paths`: one depth-first augmenting path in the level graph, resuming each
+/// vertex's edge scan at `progress`. Every vertex it stands on has an edge (it was reached along
+/// one, and that edge's reverse starts at it; the source reached the sink), so `progress` of a
+/// stacked vertex always names one of its own edges.
+fn dinic_augment(
+    edge_ptr: &[usize],
+    source: usize,
+    sink: usize,
+    levels: &[i64],
+    heads: &[usize],
+    rev_edge: &[usize],
+    capacities: &mut [i32],
+    progress: &mut [usize],
+    flows: &mut [i32],
+    stack: &mut [(usize, i32)],
+) -> bool {
+    let mut top = 0usize;
+    stack[0] = (source, i32::MAX);
+    loop {
+        let (mut current, flow) = stack[top];
+        let e = progress[current];
+        let dst = heads[e];
+        if capacities[e] > 0 && levels[dst] == levels[current] + 1 {
+            let current_flow = flow.min(capacities[e]);
+            if dst == sink {
+                for &(vertex, _) in stack[..=top].iter().rev() {
+                    let e = progress[vertex];
+                    let r = rev_edge[e];
+                    capacities[e] = capacities[e].wrapping_sub(current_flow);
+                    capacities[r] = capacities[r].wrapping_add(current_flow);
+                    flows[e] = flows[e].wrapping_add(current_flow);
+                    flows[r] = flows[r].wrapping_sub(current_flow);
+                }
+                return true;
+            }
+            top += 1;
+            stack[top] = (dst, current_flow);
+        } else {
+            while progress[current] + 1 == edge_ptr[current + 1] {
+                if top == 0 {
+                    return false;
+                }
+                top -= 1;
+                current = stack[top].0;
+            }
+            progress[current] += 1;
+        }
+    }
+}
+
+/// `perm_type=` of [`maximum_bipartite_matching`], as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchingPermType {
+    /// One entry per column: the row matched to it. SciPy's default.
+    #[default]
+    Row,
+    /// One entry per row: the column matched to it.
+    Column,
+}
+
+/// SciPy's `_hopcroft_karp` on a CSR pattern with `n_rows` rows and `n_cols` columns. Returns
+/// `(x, y)`: `x[row]` is the column matched to `row` and `y[col]` the row matched to `col`, -1
+/// when unmatched.
+fn hopcroft_karp(
+    indptr: &[usize],
+    indices: &[usize],
+    n_rows: usize,
+    n_cols: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    const INF: i64 = i32::MAX as i64;
+    // Every unmatched column is matched to the auxiliary row `aux`.
+    let aux = n_rows;
+    let mut x = vec![-1i64; n_rows];
+    let mut y = vec![aux; n_cols];
+    let mut dist = vec![0i64; n_rows + 1];
+    let mut queue = vec![0usize; n_rows + 1];
+    let mut stack: Vec<usize> = Vec::with_capacity(n_rows + 1);
+    let mut parents = vec![0usize; n_rows];
+    loop {
+        let (mut head, mut tail) = (0usize, 0usize);
+        for v in 0..n_rows {
+            if x[v] < 0 {
+                dist[v] = 0;
+                queue[tail] = v;
+                tail += 1;
+            } else {
+                dist[v] = INF;
+            }
+        }
+        dist[aux] = INF;
+        while head < tail {
+            let v = queue[head];
+            head += 1;
+            if dist[v] < dist[aux] {
+                for &u in &indices[indptr[v]..indptr[v + 1]] {
+                    let yu = y[u];
+                    if dist[yu] == INF {
+                        dist[yu] = dist[v] + 1;
+                        queue[tail] = yu;
+                        tail += 1;
+                    }
+                }
+            }
+        }
+        if dist[aux] == INF {
+            break;
+        }
+        // Depth-first search from every unmatched row, along the BFS layers.
+        for w in 0..n_rows {
+            if x[w] >= 0 {
+                continue;
+            }
+            stack.clear();
+            stack.push(w);
+            let mut done = false;
+            while let Some(popped) = stack.pop() {
+                let mut v = popped;
+                for up in indptr[v]..indptr[v + 1] {
+                    let mut u = indices[up];
+                    let yu = y[u];
+                    if dist[yu] == dist[v] + 1 {
+                        if yu == aux {
+                            done = true;
+                            // Flip the matching along the path back to the root.
+                            loop {
+                                dist[v] = INF;
+                                let u_old = x[v];
+                                y[u] = v;
+                                x[v] = u as i64;
+                                if v == w {
+                                    break;
+                                }
+                                u = u_old as usize;
+                                v = parents[v];
+                            }
+                            break;
+                        }
+                        stack.push(yu);
+                        parents[yu] = v;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    let y = y
+        .into_iter()
+        .map(|row| if row == aux { -1 } else { row as i64 })
+        .collect();
+    (x, y)
+}
+
+/// `scipy.sparse.csgraph.maximum_bipartite_matching(graph, perm_type)`: a maximum matching of
+/// the bipartite graph whose rows are one side and columns the other (every stored entry is an
+/// edge, explicit zeros included), by SciPy's Hopcroft–Karp. `Row` returns, per column, the row
+/// matched to it; `Column`, per row, the column; -1 marks an unmatched vertex. Which of several
+/// maximum matchings comes out is SciPy's: rows are scanned in storage order.
+#[must_use]
+pub fn maximum_bipartite_matching(graph: &CsrMatrix, perm_type: MatchingPermType) -> Vec<i64> {
+    let shape = graph.shape();
+    let (x, y) = hopcroft_karp(graph.indptr(), graph.indices(), shape.rows, shape.cols);
+    match perm_type {
+        MatchingPermType::Row => y,
+        MatchingPermType::Column => x,
+    }
+}
+
+fn no_full_matching() -> SparseError {
+    SparseError::InvalidArgument {
+        message: "no full matching exists".to_string(),
+    }
+}
+
+/// `scipy.sparse.csgraph.min_weight_full_bipartite_matching(biadjacency, maximize)`: a
+/// matching of `min(rows, cols)` edges with the least total weight (the most, with `maximize`),
+/// as `(row_ind, col_ind)` with `row_ind` increasing.
+///
+/// As in SciPy: with `maximize` the weights are negated first; then +infinity entries and zeros
+/// (explicit zeros included; SciPy warns about those) are not edges. An error "no full matching
+/// exists" when Hopcroft–Karp finds no matching of that size, or LAPJVsp runs out of columns (a
+/// row of NaN weights, a -infinity weight). A wide or square graph runs SciPy's LAPJVsp port
+/// directly; a tall one runs it on the transpose. Which of several optimal matchings comes out
+/// is SciPy's.
+pub fn min_weight_full_bipartite_matching(
+    biadjacency: &CsrMatrix,
+    maximize: bool,
+) -> SparseResult<(Vec<usize>, Vec<usize>)> {
+    let shape = biadjacency.shape();
+    let (n_rows, n_cols) = (shape.rows, shape.cols);
+    let (in_indptr, in_indices, in_data) = (
+        biadjacency.indptr(),
+        biadjacency.indices(),
+        biadjacency.data(),
+    );
+    let mut indptr = vec![0usize; n_rows + 1];
+    let mut indices = Vec::with_capacity(in_indices.len());
+    let mut data = Vec::with_capacity(in_data.len());
+    for row in 0..n_rows {
+        for entry in in_indptr[row]..in_indptr[row + 1] {
+            let w = if maximize {
+                -in_data[entry]
+            } else {
+                in_data[entry]
+            };
+            if w != 0.0 && w != f64::INFINITY {
+                indices.push(in_indices[entry]);
+                data.push(w);
+            }
+        }
+        indptr[row + 1] = indices.len();
+    }
+    let full = n_rows.min(n_cols);
+    if n_cols < n_rows {
+        let (t_indptr, t_indices, order) = csr_transpose_order(&indptr, &indices, n_cols);
+        let t_data: Vec<f64> = order.iter().map(|&entry| data[entry]).collect();
+        let (matching, _) = hopcroft_karp(&t_indptr, &t_indices, n_cols, n_rows);
+        if matching.iter().filter(|&&m| m != -1).count() != full {
+            return Err(no_full_matching());
+        }
+        let b = lapjvsp((&t_indptr, &t_indices, &t_data), n_cols, n_rows)?;
+        // np.argsort(b): b is a matching, so its values are distinct and the order unambiguous.
+        let mut pairs: Vec<(usize, usize)> = b
+            .into_iter()
+            .enumerate()
+            .map(|(col, row)| (row, col))
+            .collect();
+        pairs.sort_unstable();
+        Ok(pairs.into_iter().unzip())
+    } else {
+        let (matching, _) = hopcroft_karp(&indptr, &indices, n_rows, n_cols);
+        if matching.iter().filter(|&&m| m != -1).count() != full {
+            return Err(no_full_matching());
+        }
+        let b = lapjvsp((&indptr, &indices, &data), n_rows, n_cols)?;
+        Ok(((0..full).collect(), b))
+    }
+}
+
+/// The working arrays of SciPy's `_lapjvsp` (Volgenant's LAPJVS.P), with -1 for "none".
+struct Lapjvsp {
+    v: Vec<f64>,
+    x: Vec<isize>,
+    y: Vec<isize>,
+    d: Vec<f64>,
+    ok: Vec<bool>,
+    free: Vec<isize>,
+    todo: Vec<isize>,
+    lab: Vec<usize>,
+}
+
+/// An index SciPy's port would read out of bounds (a -1 "none" used as an index) can only come
+/// from an infeasible problem there; here it is the same "no full matching exists" error.
+fn lapjvsp_index(i: isize) -> SparseResult<usize> {
+    usize::try_from(i).map_err(|_| no_full_matching())
+}
+
+/// SciPy's `_lapjvsp` on the CSR graph `(first, kk, cc)` with `nr <= nc`: for each row, the
+/// column matched to it in a minimum-weight matching that covers every row.
+fn lapjvsp(graph: CsrAdjacency<'_>, nr: usize, nc: usize) -> SparseResult<Vec<usize>> {
+    const INF: f64 = f64::INFINITY;
+    let (first, kk, cc) = graph;
+    let at = lapjvsp_index;
+    let mut s = Lapjvsp {
+        v: vec![0.0; nc],
+        x: vec![-1; nr],
+        y: vec![-1; nc],
+        d: vec![0.0; nc],
+        ok: vec![false; nc],
+        free: vec![-1; nr],
+        todo: vec![-1; nc],
+        lab: vec![0; nc],
+    };
+    let l0 = if nr == nc {
+        // Column reduction (from line 55 of LAPJVS.P).
+        s.v.fill(INF);
+        for i in 0..nr {
+            for t in first[i]..first[i + 1] {
+                let jp = kk[t];
+                if cc[t] < s.v[jp] {
+                    s.v[jp] = cc[t];
+                    s.y[jp] = i.cast_signed();
+                }
+            }
+        }
+        let mut xinv = vec![false; nr];
+        for jp in (0..nc).rev() {
+            let i = at(s.y[jp])?;
+            if s.x[i] == -1 {
+                s.x[i] = jp.cast_signed();
+            } else {
+                s.y[jp] = -1;
+                xinv[i] = true;
+            }
+        }
+        // Reduction transfer.
+        let mut lp = 0usize;
+        for i in 0..nr {
+            if xinv[i] {
+                continue;
+            }
+            if s.x[i] != -1 {
+                let j1 = at(s.x[i])?;
+                let mut min_diff = INF;
+                for t in first[i]..first[i + 1] {
+                    let jp = kk[t];
+                    if jp != j1 && cc[t] - s.v[jp] < min_diff {
+                        min_diff = cc[t] - s.v[jp];
+                    }
+                }
+                let mut tp = first[i];
+                while kk[tp] != j1 {
+                    tp += 1;
+                }
+                s.v[j1] = cc[tp] - min_diff;
+            } else {
+                s.free[lp] = i.cast_signed();
+                lp += 1;
+            }
+        }
+        // Two rounds of augmenting row reduction.
+        for _ in 0..2 {
+            let mut h = 0usize;
+            let l0p = lp;
+            lp = 0;
+            while h < l0p {
+                let i = at(s.free[h])?;
+                h += 1;
+                let (mut j0p, mut j1p) = (-1isize, -1isize);
+                let (mut v0, mut vj) = (INF, INF);
+                for t in first[i]..first[i + 1] {
+                    let jp = kk[t];
+                    let dj = cc[t] - s.v[jp];
+                    if dj < vj {
+                        if dj >= v0 {
+                            vj = dj;
+                            j1p = jp.cast_signed();
+                        } else {
+                            vj = v0;
+                            v0 = dj;
+                            j1p = j0p;
+                            j0p = jp.cast_signed();
+                        }
+                    }
+                }
+                let mut i0 = s.y[at(j0p)?];
+                if v0 < vj {
+                    s.v[at(j0p)?] += v0 - vj;
+                } else if i0 != -1 {
+                    j0p = j1p;
+                    i0 = s.y[at(j0p)?];
+                }
+                s.x[i] = j0p;
+                s.y[at(j0p)?] = i.cast_signed();
+                if i0 != -1 {
+                    if v0 < vj {
+                        h -= 1;
+                        s.free[h] = i0;
+                    } else {
+                        s.free[lp] = i0;
+                        lp += 1;
+                    }
+                }
+            }
+        }
+        lp
+    } else {
+        for (i, slot) in s.free.iter_mut().enumerate() {
+            *slot = i.cast_signed();
+        }
+        nr
+    };
+    // Augmentation, one free row at a time. `td1` carries over between rows, as in SciPy.
+    let mut td1 = -1isize;
+    for l in 0..l0 {
+        td1 = s.single_l(graph, l, nc, td1)?;
+    }
+    s.x.into_iter().map(at).collect()
+}
+
+impl Lapjvsp {
+    /// SciPy's `_lapjvsp_single_l`: a shortest augmenting path from free row `free[l]`.
+    fn single_l(
+        &mut self,
+        graph: CsrAdjacency<'_>,
+        l: usize,
+        nc: usize,
+        mut td1: isize,
+    ) -> SparseResult<isize> {
+        const INF: f64 = f64::INFINITY;
+        let (first, kk, cc) = graph;
+        let at = lapjvsp_index;
+        self.d.fill(INF);
+        self.ok.fill(false);
+        let mut min_diff = INF;
+        let i0 = at(self.free[l])?;
+        for t in first[i0]..first[i0 + 1] {
+            let j = kk[t];
+            let dj = cc[t] - self.v[j];
+            self.d[j] = dj;
+            self.lab[j] = i0;
+            if dj <= min_diff {
+                if dj < min_diff {
+                    td1 = -1;
+                    min_diff = dj;
+                }
+                td1 += 1;
+                self.todo[at(td1)?] = j.cast_signed();
+            }
+        }
+        for hp in 0..=td1 {
+            let j = at(self.todo[at(hp)?])?;
+            if self.y[j] == -1 {
+                self.update_assignments(j, i0)?;
+                return Ok(td1);
+            }
+            self.ok[j] = true;
+        }
+        let mut td2 = nc.cast_signed() - 1;
+        let mut last = nc;
+        loop {
+            if td1 < 0 {
+                return Err(no_full_matching());
+            }
+            let j0 = at(self.todo[at(td1)?])?;
+            td1 -= 1;
+            let i = at(self.y[j0])?;
+            self.todo[at(td2)?] = j0.cast_signed();
+            td2 -= 1;
+            let mut tp = first[i];
+            while kk[tp] != j0 {
+                tp += 1;
+            }
+            let h = cc[tp] - self.v[j0] - min_diff;
+            for t in first[i]..first[i + 1] {
+                let j = kk[t];
+                if self.ok[j] {
+                    continue;
+                }
+                let vj = cc[t] - self.v[j] - h;
+                if vj < self.d[j] {
+                    self.d[j] = vj;
+                    self.lab[j] = i;
+                    if vj == min_diff {
+                        if self.y[j] == -1 {
+                            self.update_dual(nc, last, min_diff)?;
+                            self.update_assignments(j, i0)?;
+                            return Ok(td1);
+                        }
+                        td1 += 1;
+                        self.todo[at(td1)?] = j.cast_signed();
+                        self.ok[j] = true;
+                    }
+                }
+            }
+            if td1 == -1 {
+                // LAPJVS.P uses large finite numbers where this uses infinity.
+                min_diff = INF;
+                last = at(td2 + 1)?;
+                for jp in 0..nc {
+                    let dj = self.d[jp];
+                    if dj != INF && dj <= min_diff && !self.ok[jp] {
+                        if dj < min_diff {
+                            td1 = -1;
+                            min_diff = dj;
+                        }
+                        td1 += 1;
+                        self.todo[at(td1)?] = jp.cast_signed();
+                    }
+                }
+                for hp in 0..=td1 {
+                    let j = at(self.todo[at(hp)?])?;
+                    if self.y[j] == -1 {
+                        self.update_dual(nc, last, min_diff)?;
+                        self.update_assignments(j, i0)?;
+                        return Ok(td1);
+                    }
+                    self.ok[j] = true;
+                }
+            }
+        }
+    }
+
+    /// SciPy's `_lapjvsp_update_dual`.
+    fn update_dual(&mut self, nc: usize, last: usize, min_diff: f64) -> SparseResult<()> {
+        for k in last..nc {
+            let j0 = lapjvsp_index(self.todo[k])?;
+            self.v[j0] += self.d[j0] - min_diff;
+        }
+        Ok(())
+    }
+
+    /// SciPy's `_lapjvsp_update_assignments`: flip the alternating path ending at column `j`.
+    fn update_assignments(&mut self, mut j: usize, i0: usize) -> SparseResult<()> {
+        loop {
+            let i = self.lab[j];
+            self.y[j] = i.cast_signed();
+            let next = self.x[i];
+            self.x[i] = j.cast_signed();
+            if i == i0 {
+                return Ok(());
+            }
+            j = lapjvsp_index(next)?;
+        }
+    }
+}
+
+/// What [`yen`] returns: SciPy's `yen(..., return_predecessors=True)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YenResult {
+    /// The lengths of the loopless paths found, shortest first; at most `k` of them.
+    pub distances: Vec<f64>,
+    /// `predecessors[m][j]`: the node before `j` on the `m`-th path, -1 for a node off the path
+    /// and for the source (SciPy's -9999).
+    pub predecessors: Vec<Vec<i64>>,
+}
+
+/// SciPy's `_johnson_directed` / `_johnson_undirected`: Bellman–Ford potentials from a virtual
+/// node joined to every node by a zero-weight edge, `n` passes, then the `1e-15` check. `Err`
+/// names the node whose check failed, as SciPy's `NegativeCycleError` does.
+fn johnson_potentials(
+    graph: CsrAdjacency<'_>,
+    n: usize,
+    directed: bool,
+) -> Result<Vec<f64>, usize> {
+    const EPS: f64 = 1e-15; // SciPy's DTYPE_EPS
+    let (indptr, indices, weights) = graph;
+    let mut h = vec![0.0; n];
+    for _ in 0..n {
+        for j in 0..n {
+            let mut d1 = h[j];
+            for e in indptr[j]..indptr[j + 1] {
+                let (k, w) = (indices[e], weights[e]);
+                let d2 = h[k];
+                if d1 + w < d2 {
+                    h[k] = d1 + w;
+                }
+                // SciPy's undirected pass tests the reverse direction against the d2 it read
+                // BEFORE the update above.
+                if !directed && d2 + w < d1 {
+                    d1 = d2 + w;
+                    h[j] = d1;
+                }
+            }
+        }
+    }
+    for j in 0..n {
+        let d1 = h[j];
+        for e in indptr[j]..indptr[j + 1] {
+            let (d2, w) = (h[indices[e]], weights[e]);
+            let violated = if directed {
+                d1 + w + EPS < d2
+            } else {
+                (d2 - d1).abs() > w + EPS
+            };
+            if violated {
+                return Err(j);
+            }
+        }
+    }
+    Ok(h)
+}
+
+/// SciPy's `_johnson_add_weights`: `w(u, v) += h(u)`, then `-= h(v)`.
+fn johnson_reweight(indptr: &[usize], indices: &[usize], weights: &mut [f64], h: &[f64]) {
+    for j in 0..indptr.len().saturating_sub(1) {
+        for e in indptr[j]..indptr[j + 1] {
+            weights[e] += h[j];
+            weights[e] -= h[indices[e]];
+        }
+    }
+}
+
+/// SciPy's `_YenCandidatePaths`: the best candidate paths so far, shortest first. A path is
+/// stored from the sink back to the source.
+struct YenCandidates {
+    items: Vec<(f64, Vec<usize>, usize)>,
+    required: usize,
+}
+
+impl YenCandidates {
+    /// Insert before any candidate of equal length (`std::lower_bound`), then keep the
+    /// `required` shortest.
+    fn insert(
+        &mut self,
+        distance: f64,
+        source_to_spur: &[i64],
+        spur_to_sink: &[i64],
+        spur: usize,
+        sink: usize,
+    ) {
+        if self.items.len() >= self.required
+            && self
+                .items
+                .last()
+                .is_some_and(|&(longest, _, _)| distance >= longest)
+        {
+            return;
+        }
+        let mut path = Vec::new();
+        let mut node = sink;
+        while node != spur {
+            path.push(node);
+            match usize::try_from(spur_to_sink[node]) {
+                Ok(prev) => node = prev,
+                Err(_) => return,
+            }
+        }
+        let mut node = i64::try_from(spur).unwrap_or(-1);
+        while let Ok(at) = usize::try_from(node) {
+            path.push(at);
+            node = source_to_spur[at];
+        }
+        let at = self.items.partition_point(|&(d, _, _)| d < distance);
+        self.items.insert(at, (distance, path, spur));
+        self.items.truncate(self.required);
+    }
+
+    /// Remove the shortest candidate into `target` (one predecessor row) and return its spur.
+    fn pop_into(&mut self, target: &mut [i64]) -> usize {
+        let (_, path, spur) = self.items.remove(0);
+        for pair in path.windows(2) {
+            target[pair[0]] = pair[1] as i64;
+        }
+        self.required -= 1;
+        spur
+    }
+}
+
+/// `scipy.sparse.csgraph.yen(csgraph, source, sink, K, directed, return_predecessors=True,
+/// unweighted)`: up to `k` loopless paths from `source` to `sink`, shortest first.
+///
+/// A port of SciPy's `_yen`, spur node by spur node, over SciPy's Dijkstra ([`dijkstra`]'s heap
+/// order), so which of several equally long paths comes first is SciPy's: a new candidate goes
+/// before any queued one of the same length. Negative weights are first made non-negative with
+/// Johnson's potentials, and a negative cycle is [`SparseError::NegativeCycle`] (undirected, any
+/// negative edge is one). `unweighted` counts edges. Like [`dijkstra`], and unlike SciPy, NaN
+/// or infinite weights are refused. `k = 0` finds nothing; `source == sink` finds the empty
+/// path, of length 0.
+pub fn yen(
+    csgraph: &CsrMatrix,
+    source: usize,
+    sink: usize,
+    k: usize,
+    directed: bool,
+    unweighted: bool,
+) -> SparseResult<YenResult> {
+    validate_csgraph(csgraph)?;
+    let n = csgraph.shape().rows;
+    if source >= n || sink >= n {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "For csgraph with shape (N, N), must have 0 <= source < N and 0 <= sink < N. \
+                 Got N={n}, source={source}, sink={sink}."
+            ),
+        });
+    }
+    let (indptr, indices) = (csgraph.indptr(), csgraph.indices());
+    let nnz = indices.len();
+    let mut weights = if unweighted {
+        vec![1.0; nnz]
+    } else {
+        csgraph.data().to_vec()
+    };
+    let potentials = if !unweighted && weights.iter().any(|&w| w < 0.0) {
+        let h = johnson_potentials((indptr, indices, &weights), n, directed).map_err(|node| {
+            SparseError::NegativeCycle {
+                message: format!("Negative cycle detected on node {node}"),
+            }
+        })?;
+        johnson_reweight(indptr, indices, &mut weights, &h);
+        Some(h)
+    } else {
+        None
+    };
+    let transpose = (!directed).then(|| {
+        let (t_indptr, t_indices, order) = csr_transpose_order(indptr, indices, n);
+        let mut t_weights: Vec<f64> = if unweighted {
+            vec![1.0; nnz]
+        } else {
+            order.iter().map(|&e| csgraph.data()[e]).collect()
+        };
+        if let Some(h) = &potentials {
+            johnson_reweight(&t_indptr, &t_indices, &mut t_weights, h);
+        }
+        (t_indptr, t_indices, t_weights)
+    });
+    let (mut distances, mut predecessors) = yen_paths(
+        (indptr, indices, &weights),
+        transpose.as_ref().map(|(p, i, w)| (&p[..], &i[..], &w[..])),
+        n,
+        source,
+        sink,
+        k,
+    )?;
+    if let Some(h) = &potentials {
+        let shift = h[sink] - h[source];
+        for d in &mut distances {
+            *d += shift;
+        }
+    }
+    let found = distances.iter().filter(|&&d| d < f64::INFINITY).count();
+    distances.truncate(found);
+    predecessors.truncate(found);
+    Ok(YenResult {
+        distances,
+        predecessors,
+    })
+}
+
+/// SciPy's `_yen` over non-negative `graph` weights (and the transpose's, undirected). Returns
+/// `k` distances (infinity past the last path found) and `k` predecessor rows.
+fn yen_paths(
+    graph: CsrAdjacency<'_>,
+    transpose: Option<CsrAdjacency<'_>>,
+    n: usize,
+    source: usize,
+    sink: usize,
+    k: usize,
+) -> SparseResult<(Vec<f64>, Vec<Vec<i64>>)> {
+    const INF: f64 = f64::INFINITY;
+    let mut distances = vec![INF; k];
+    let mut paths = vec![vec![-1_i64; n]; k];
+    if k == 0 {
+        return Ok((distances, paths));
+    }
+    let (indptr, indices, original) = graph;
+    let mut dist = vec![INF; n];
+    let mut pred = vec![-1_i64; n];
+    dijkstra_scan(graph, transpose, &mut dist, &mut pred, source);
+    distances[0] = dist[sink];
+    if distances[0] == INF {
+        return Ok((distances, paths));
+    }
+    let mut weights = original.to_vec();
+    let mut t_weights: Vec<f64> = transpose.map_or_else(Vec::new, |(_, _, w)| w.to_vec());
+    let mut node = i64::try_from(sink).unwrap_or(-1);
+    while let Ok(at) = usize::try_from(node) {
+        paths[0][at] = pred[at];
+        node = pred[at];
+    }
+    // The node before `node` on a path row, which the walks below only ask of nodes on it.
+    let before = |row: &[i64], node: usize| -> SparseResult<usize> {
+        usize::try_from(row[node]).map_err(|_| SparseError::InvalidArgument {
+            message: format!("node {node} has no predecessor on the previous path"),
+        })
+    };
+
+    let mut candidates = YenCandidates {
+        items: Vec::new(),
+        required: k,
+    };
+    let mut previous_spur = source;
+    for kth in 1..k {
+        let mut spur = sink;
+        let mut root_distance = distances[kth - 1];
+        while spur != previous_spur {
+            // Step the spur node back along the previous path, shortening the root path by
+            // the (lightest current) weight of the edge crossed.
+            let tmp_i = before(&paths[kth - 1], spur)?;
+            let mut tmp_d = INF;
+            for e in indptr[tmp_i]..indptr[tmp_i + 1] {
+                if indices[e] == spur {
+                    tmp_d = weights[e];
+                    break;
+                }
+            }
+            if let Some((t_indptr, t_indices, _)) = transpose {
+                for e in t_indptr[tmp_i]..t_indptr[tmp_i + 1] {
+                    if t_indices[e] == spur && t_weights[e] < tmp_d {
+                        tmp_d = t_weights[e];
+                        break;
+                    }
+                }
+            }
+            if tmp_d == INF {
+                return Err(SparseError::InvalidArgument {
+                    message: format!("No edge between nodes {tmp_i} and {spur}"),
+                });
+            }
+            root_distance -= tmp_d;
+            spur = tmp_i;
+            let spur_id = spur as i64;
+
+            // Remove the next edge of every path found so far that shares this root path.
+            for found in &paths[..kth] {
+                let mut node = spur;
+                while found[node] == paths[kth - 1][node] {
+                    if node == source {
+                        for e in indptr[spur]..indptr[spur + 1] {
+                            if found[indices[e]] == spur_id {
+                                weights[e] = INF;
+                            }
+                        }
+                        if let Some((t_indptr, t_indices, _)) = transpose {
+                            for e in t_indptr[spur]..t_indptr[spur + 1] {
+                                if found[t_indices[e]] == spur_id {
+                                    t_weights[e] = INF;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    node = before(found, node)?;
+                }
+            }
+            // Remove the root path's nodes other than the spur node.
+            let mut node = paths[kth - 1][spur];
+            while let Ok(at) = usize::try_from(node) {
+                weights[indptr[at]..indptr[at + 1]].fill(INF);
+                if let Some((t_indptr, _, _)) = transpose {
+                    t_weights[t_indptr[at]..t_indptr[at + 1]].fill(INF);
+                }
+                node = paths[kth - 1][at];
+            }
+
+            pred.fill(-1);
+            dist.fill(INF);
+            dist[source] = 0.0;
+            dijkstra_scan(
+                (indptr, indices, &weights),
+                transpose.map(|(t_indptr, t_indices, _)| (t_indptr, t_indices, &t_weights[..])),
+                &mut dist,
+                &mut pred,
+                spur,
+            );
+            let total = dist[sink] + root_distance;
+            if total != INF {
+                candidates.insert(total, &paths[kth - 1], &pred, spur, sink);
+            }
+
+            // Restore the weights of the root path's nodes, the spur node included.
+            let mut node = spur_id;
+            while let Ok(at) = usize::try_from(node) {
+                let row = indptr[at]..indptr[at + 1];
+                weights[row.clone()].copy_from_slice(&original[row]);
+                if let Some((t_indptr, _, t_original)) = transpose {
+                    let row = t_indptr[at]..t_indptr[at + 1];
+                    t_weights[row.clone()].copy_from_slice(&t_original[row]);
+                }
+                node = paths[kth - 1][at];
+            }
+        }
+        let Some(&(shortest, _, _)) = candidates.items.first() else {
+            break;
+        };
+        distances[kth] = shortest;
+        previous_spur = candidates.pop_into(&mut paths[kth]);
+    }
+    Ok((distances, paths))
+}
+
+/// frankenscipy-fdepw. Every expected value below was printed by live SciPy 1.17.1 (numpy
+/// 2.4.3) from the scratchpad scripts `csgraph/probe1.py` .. `probe4.py`, `gen_unit.py`,
+/// `gen_unit2.py` and `search_flow4.py`; SciPy's -9999 "no predecessor" is written -1.
+#[cfg(test)]
+mod csgraph_fdepw_tests {
+    use super::*;
+
+    const INF: f64 = f64::INFINITY;
+
+    /// A CSR matrix from entries listed in storage order (grouped by row, in the order given):
+    /// explicit zeros, duplicates and unsorted rows are kept as listed.
+    fn csr(n_rows: usize, n_cols: usize, entries: &[(usize, usize, f64)]) -> CsrMatrix {
+        assert!(
+            entries.windows(2).all(|w| w[0].0 <= w[1].0),
+            "grouped by row"
+        );
+        let mut indptr = vec![0usize; n_rows + 1];
+        for &(row, _, _) in entries {
+            indptr[row + 1] += 1;
+        }
+        for row in 0..n_rows {
+            indptr[row + 1] += indptr[row];
+        }
+        CsrMatrix::from_components(
+            Shape2D::new(n_rows, n_cols),
+            entries.iter().map(|e| e.2).collect(),
+            entries.iter().map(|e| e.1).collect(),
+            indptr,
+            false,
+        )
+        .expect("csr")
+    }
+
+    fn dense_csr(rows: &[&[f64]]) -> CsrMatrix {
+        let entries: Vec<(usize, usize, f64)> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| {
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &w)| w != 0.0)
+                    .map(move |(c, &w)| (r, c, w))
+            })
+            .collect();
+        csr(rows.len(), rows.first().map_or(0, |r| r.len()), &entries)
+    }
+
+    fn parts(m: &CsrMatrix) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+        (m.indptr().to_vec(), m.indices().to_vec(), m.data().to_vec())
+    }
+
+    fn to_dense(m: &CsrMatrix) -> Vec<Vec<f64>> {
+        let shape = m.shape();
+        let mut out = vec![vec![0.0; shape.cols]; shape.rows];
+        for row in 0..shape.rows {
+            for e in m.indptr()[row]..m.indptr()[row + 1] {
+                out[row][m.indices()[e]] += m.data()[e];
+            }
+        }
+        out
+    }
+
+    /// The message of an InvalidArgument error. Anything else maps to a sentinel that the
+    /// callers' expected messages never equal.
+    fn invalid_argument(result: SparseResult<impl std::fmt::Debug>) -> String {
+        match result {
+            Err(SparseError::InvalidArgument { message }) => message,
+            _ => "<not an InvalidArgument error>".to_string(),
+        }
+    }
+
+    /// SciPy 1.17.1 (`search_flow4.py`): the smallest random graph whose SciPy flow differs from
+    /// a depth-first Ford–Fulkerson's. Dinic and Edmonds–Karp agree with each other (both augment
+    /// the first shortest path in edge order; 40,000 random graphs never separated them), and
+    /// SciPy sends 1 -> 2 -> 4 where the DFS sends 1 -> 3 -> 4. Every pair with edges both ways
+    /// keeps its own capacity, and the missing reverses are explicit zeros.
+    #[test]
+    fn maximum_flow_returns_scipys_flow_among_the_maximum_flows() {
+        let g = csr(
+            5,
+            5,
+            &[
+                (0, 1, 3.0),
+                (0, 2, 1.0),
+                (1, 2, 2.0),
+                (1, 3, 1.0),
+                (1, 4, 2.0),
+                (2, 0, 2.0),
+                (2, 1, 1.0),
+                (2, 4, 2.0),
+                (3, 2, 2.0),
+                (3, 4, 3.0),
+                (4, 1, 3.0),
+                (4, 3, 3.0),
+            ],
+        );
+        let want = (
+            vec![0, 2, 6, 10, 13, 16],
+            vec![1, 2, 0, 2, 3, 4, 0, 1, 3, 4, 1, 2, 4, 1, 2, 3],
+            vec![
+                3.0, 1.0, -3.0, 1.0, 0.0, 2.0, -1.0, -1.0, 0.0, 2.0, 0.0, 0.0, 0.0, -2.0, -2.0, 0.0,
+            ],
+        );
+        // The depth-first Ford–Fulkerson's flow, same value 4.
+        let dfs: [[f64; 5]; 5] = [
+            [0.0, 3.0, 1.0, 0.0, 0.0],
+            [-3.0, 0.0, 0.0, 1.0, 2.0],
+            [-1.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0, 0.0, 1.0],
+            [0.0, -2.0, -1.0, -1.0, 0.0],
+        ];
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&g, 0, 4, method).expect("maximum_flow");
+            assert_eq!(r.flow_value, 4, "{method:?}");
+            assert_eq!(parts(&r.flow), want, "{method:?}");
+            // Must-miss arm: the pinned answer is not the other maximum flow.
+            let ours = to_dense(&r.flow);
+            assert!(ours.iter().zip(&dfs).any(|(a, b)| a[..] != b[..]));
+            assert_eq!(dfs[0].iter().sum::<f64>(), 4.0);
+        }
+    }
+
+    /// SciPy's docstring example (CLRS 26.1), value 23, and its flow CSR from `probe1.py`.
+    #[test]
+    fn maximum_flow_clrs_example() {
+        let g = dense_csr(&[
+            &[0.0, 16.0, 13.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 10.0, 12.0, 0.0, 0.0],
+            &[0.0, 4.0, 0.0, 0.0, 14.0, 0.0],
+            &[0.0, 0.0, 9.0, 0.0, 0.0, 20.0],
+            &[0.0, 0.0, 0.0, 7.0, 0.0, 4.0],
+            &[0.0; 6],
+        ]);
+        let want = (
+            vec![0, 2, 5, 9, 13, 16, 18],
+            vec![1, 2, 0, 2, 3, 0, 1, 3, 4, 1, 2, 4, 5, 2, 3, 5, 3, 4],
+            vec![
+                12.0, 11.0, -12.0, 0.0, 12.0, -11.0, 0.0, 0.0, 11.0, -12.0, 0.0, -7.0, 19.0, -11.0,
+                7.0, 4.0, -19.0, -4.0,
+            ],
+        );
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&g, 0, 5, method).expect("maximum_flow");
+            assert_eq!(r.flow_value, 23);
+            assert_eq!(parts(&r.flow), want);
+        }
+    }
+
+    /// `probe1.py`: an unsorted row is sorted first; duplicated edges stay separate edges;
+    /// negative capacities are never used; an isolated source gives the reversed pattern with
+    /// zero flow.
+    #[test]
+    fn maximum_flow_storage_edge_cases() {
+        let unsorted = csr(3, 3, &[(0, 2, 5.0), (0, 1, 3.0)]);
+        let r = maximum_flow(&unsorted, 0, 2, MaximumFlowMethod::Dinic).expect("unsorted");
+        assert_eq!(
+            parts(&r.flow),
+            (
+                vec![0, 2, 3, 4],
+                vec![1, 2, 0, 0],
+                vec![0.0, 5.0, 0.0, -5.0]
+            )
+        );
+        assert_eq!(r.flow_value, 5);
+
+        let duplicated = csr(3, 3, &[(0, 1, 2.0), (0, 1, 3.0), (1, 2, 4.0)]);
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&duplicated, 0, 2, method).expect("duplicated");
+            assert_eq!(r.flow_value, 4);
+            assert_eq!(
+                parts(&r.flow),
+                (
+                    vec![0, 2, 5, 6],
+                    vec![1, 1, 0, 0, 2, 1],
+                    vec![2.0, 2.0, -2.0, -2.0, 4.0, -4.0]
+                )
+            );
+        }
+
+        let negative = dense_csr(&[&[0.0, 3.0, -2.0], &[0.0, 0.0, 5.0], &[4.0, 0.0, 0.0]]);
+        let r = maximum_flow(&negative, 0, 2, MaximumFlowMethod::EdmondsKarp).expect("negative");
+        assert_eq!(r.flow_value, 3);
+        assert_eq!(
+            parts(&r.flow),
+            (
+                vec![0, 2, 4, 6],
+                vec![1, 2, 0, 2, 0, 1],
+                vec![3.0, 0.0, -3.0, 3.0, 0.0, -3.0]
+            )
+        );
+
+        let isolated = dense_csr(&[&[0.0; 3], &[0.0, 0.0, 1.0], &[0.0; 3]]);
+        let r = maximum_flow(&isolated, 0, 2, MaximumFlowMethod::Dinic).expect("isolated");
+        assert_eq!(r.flow_value, 0);
+        assert_eq!(
+            parts(&r.flow),
+            (vec![0, 0, 1, 2], vec![2, 1], vec![0.0, 0.0])
+        );
+    }
+
+    /// SciPy's ValueErrors, in SciPy's order: capacities first, then source == sink, shape,
+    /// then the bounds. fsci also refuses a capacity outside int32, which SciPy wraps.
+    #[test]
+    fn maximum_flow_refusals() {
+        let g = dense_csr(&[&[0.0, 5.0], &[0.0, 0.0]]);
+        let fractional = dense_csr(&[&[0.0, 1.5], &[0.0, 0.0]]);
+        assert_eq!(
+            invalid_argument(maximum_flow(&fractional, 0, 0, MaximumFlowMethod::Dinic)),
+            "graph capacities must be integers"
+        );
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 1, 1, MaximumFlowMethod::Dinic)),
+            "source and sink vertices must differ"
+        );
+        let wide = csr(2, 3, &[(0, 1, 1.0)]);
+        assert!(matches!(
+            maximum_flow(&wide, 0, 1, MaximumFlowMethod::Dinic),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 0, 7, MaximumFlowMethod::Dinic)),
+            "sink value (7) must be between 0 and 1"
+        );
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 9, 1, MaximumFlowMethod::Dinic)),
+            "source value (9) must be between 0 and 1"
+        );
+        let huge = dense_csr(&[&[0.0, 2_147_483_653.0], &[0.0, 0.0]]);
+        assert!(maximum_flow(&huge, 0, 1, MaximumFlowMethod::Dinic).is_err());
+        let r = maximum_flow(&g, 0, 1, MaximumFlowMethod::default()).expect("2-node flow");
+        assert_eq!(r.flow_value, 5);
+    }
+
+    /// `gen_unit.py`: Hopcroft–Karp finds 3 matched rows where a greedy first-free-column
+    /// matcher stops at 2 ([1, -1, -1, 0]); SciPy's choice is pinned per row and per column.
+    #[test]
+    fn maximum_bipartite_matching_is_hopcroft_karp_not_greedy() {
+        let g = csr(
+            4,
+            5,
+            &[
+                (0, 1, 1.0),
+                (0, 2, 1.0),
+                (0, 3, 1.0),
+                (1, 1, 1.0),
+                (2, 1, 1.0),
+                (3, 0, 1.0),
+                (3, 3, 1.0),
+                (3, 4, 1.0),
+            ],
+        );
+        let column = maximum_bipartite_matching(&g, MatchingPermType::Column);
+        assert_eq!(column, vec![2, 1, -1, 0]);
+        assert_ne!(column, vec![1, -1, -1, 0], "the greedy matching");
+        assert_eq!(
+            maximum_bipartite_matching(&g, MatchingPermType::Row),
+            vec![3, 1, 0, -1, -1]
+        );
+        // SciPy's docstring: explicit zeros are edges too.
+        let doc = csr(2, 3, &[(0, 2, 0.0), (1, 0, 0.0), (1, 1, 0.0)]);
+        assert_eq!(
+            maximum_bipartite_matching(&doc, MatchingPermType::Column),
+            vec![2, 0]
+        );
+        assert_eq!(
+            maximum_bipartite_matching(&doc, MatchingPermType::default()),
+            vec![1, -1, 0]
+        );
+        let empty = csr(2, 0, &[]);
+        assert_eq!(
+            maximum_bipartite_matching(&empty, MatchingPermType::Column),
+            vec![-1, -1]
+        );
+        assert!(maximum_bipartite_matching(&empty, MatchingPermType::Row).is_empty());
+    }
+
+    /// `gen_unit.py` / `probe3.py`. Among equally light matchings SciPy's LAPJVsp picks a
+    /// particular one: all-ones 4x4 gives [3, 0, 1, 2], not the identity a naive solver returns.
+    #[test]
+    fn min_weight_full_bipartite_matching_picks_scipys_optimum() {
+        let run = |rows: &[&[f64]], maximize: bool| {
+            min_weight_full_bipartite_matching(&dense_csr(rows), maximize)
+        };
+        let ones: &[&[f64]] = &[&[1.0; 4], &[1.0; 4], &[1.0; 4], &[1.0; 4]];
+        let got = run(ones, false).expect("ones");
+        assert_eq!(got, (vec![0, 1, 2, 3], vec![3, 0, 1, 2]));
+        assert_ne!(got.1, vec![0, 1, 2, 3]);
+        let doc: &[&[f64]] = &[&[3.0, 3.0, 6.0], &[4.0, 3.0, 5.0], &[10.0, 1.0, 8.0]];
+        assert_eq!(
+            run(doc, false).expect("doc"),
+            (vec![0, 1, 2], vec![0, 2, 1])
+        );
+        assert_eq!(run(doc, true).expect("max"), (vec![0, 1, 2], vec![2, 1, 0]));
+        let ties: &[&[f64]] = &[
+            &[2.0, 1.0, 1.0, 3.0],
+            &[1.0, 1.0, 2.0, 2.0],
+            &[3.0, 2.0, 1.0, 1.0],
+        ];
+        assert_eq!(
+            run(ties, false).expect("wide"),
+            (vec![0, 1, 2], vec![1, 0, 2])
+        );
+        assert_eq!(
+            run(ties, true).expect("wide max"),
+            (vec![0, 1, 2], vec![3, 2, 0])
+        );
+        let tall: Vec<Vec<f64>> = (0..4)
+            .map(|c| ties.iter().map(|r| r[c]).collect())
+            .collect();
+        let tall: Vec<&[f64]> = tall.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            run(&tall, false).expect("tall"),
+            (vec![0, 1, 2], vec![1, 0, 2])
+        );
+        let doc3: &[&[f64]] = &[&[0.0, 1.0, 1.0], &[0.0, 2.0, 3.0]];
+        assert_eq!(run(doc3, false).expect("doc3"), (vec![0, 1], vec![2, 1]));
+        let doc4: &[&[f64]] = &[&[0.0, 1.0], &[3.0, 1.0], &[1.0, 4.0]];
+        assert_eq!(run(doc4, false).expect("doc4"), (vec![0, 2], vec![1, 0]));
+        // +inf is not an edge; NaN is; -inf is with maximize (it becomes +inf and is dropped).
+        assert_eq!(
+            run(&[&[INF, 1.0], &[2.0, 3.0]], false).expect("inf"),
+            (vec![0, 1], vec![1, 0])
+        );
+        assert_eq!(
+            run(&[&[f64::NAN, 1.0], &[2.0, 3.0]], false).expect("nan"),
+            (vec![0, 1], vec![1, 0])
+        );
+        assert_eq!(
+            run(&[&[-INF, 1.0], &[2.0, 3.0]], true).expect("max -inf"),
+            (vec![0, 1], vec![1, 0])
+        );
+        // Explicit zeros are removed before matching.
+        let explicit = csr(2, 2, &[(0, 0, 0.0), (0, 1, 1.0), (1, 0, 2.0), (1, 1, 3.0)]);
+        assert_eq!(
+            min_weight_full_bipartite_matching(&explicit, false).expect("explicit zero"),
+            (vec![0, 1], vec![1, 0])
+        );
+        let empty = csr(2, 0, &[]);
+        let (rows, cols) = min_weight_full_bipartite_matching(&empty, false).expect("empty");
+        assert!(rows.is_empty() && cols.is_empty());
+    }
+
+    /// SciPy raises ValueError("no full matching exists") for each of these.
+    #[test]
+    fn min_weight_full_bipartite_matching_refusals() {
+        let cases: [&[&[f64]]; 5] = [
+            &[&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.0, 1.0, 1.0]],
+            &[&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0]],
+            &[&[f64::NAN, f64::NAN], &[2.0, 3.0]],
+            &[&[-INF, 1.0], &[2.0, 3.0]],
+            &[&[INF, 0.0], &[2.0, 3.0]],
+        ];
+        for rows in cases {
+            assert_eq!(
+                invalid_argument(min_weight_full_bipartite_matching(&dense_csr(rows), false)),
+                "no full matching exists",
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// SciPy's docstring graph (`gen_unit.py`) and a stored zero (`probe2.py`): undirected, an
+    /// edge whose only weight is an explicit zero carries infinity; directed, it stays 0.
+    #[test]
+    fn traversal_trees() {
+        let x = dense_csr(&[
+            &[0.0, 8.0, 0.0, 3.0],
+            &[0.0, 0.0, 2.0, 5.0],
+            &[0.0, 0.0, 0.0, 6.0],
+            &[0.0; 4],
+        ]);
+        for directed in [true, false] {
+            assert_eq!(
+                parts(&breadth_first_tree(&x, 0, directed).expect("bft")),
+                (vec![0, 2, 3, 3, 3], vec![1, 3, 2], vec![8.0, 3.0, 2.0])
+            );
+            assert_eq!(
+                parts(&depth_first_tree(&x, 0, directed).expect("dft")),
+                (vec![0, 1, 2, 3, 3], vec![1, 2, 3], vec![8.0, 2.0, 6.0])
+            );
+        }
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0), (2, 0, 5.0)]);
+        assert_eq!(
+            parts(&breadth_first_tree(&zero, 0, false).expect("bft zero")),
+            (vec![0, 2, 2, 2], vec![1, 2], vec![INF, 3.0])
+        );
+        assert_eq!(
+            parts(&depth_first_tree(&zero, 0, true).expect("dft zero")),
+            (vec![0, 2, 2, 2], vec![1, 2], vec![0.0, 3.0])
+        );
+    }
+
+    /// `probe2.py`: duplicates add up; a predecessor that is not an edge gives a stored 0; any
+    /// negative predecessor is "none".
+    #[test]
+    fn reconstruct_path_values() {
+        let dup = csr(3, 3, &[(0, 1, 2.0), (0, 1, 3.0), (1, 2, 4.0)]);
+        for directed in [true, false] {
+            assert_eq!(
+                parts(&reconstruct_path(&dup, &[-1, 0, 1], directed).expect("dup")),
+                (vec![0, 1, 2, 2], vec![1, 2], vec![5.0, 4.0])
+            );
+        }
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0), (2, 0, 5.0)]);
+        assert_eq!(
+            parts(&reconstruct_path(&zero, &[-9999, 2, 0], true).expect("nonedge")),
+            (vec![0, 1, 1, 2], vec![2, 1], vec![3.0, 0.0])
+        );
+        assert_eq!(
+            reconstruct_path(&zero, &[-1, 0, 0], false),
+            reconstruct_path(&zero, &[-9999, 0, 0], false)
+        );
+        assert!(matches!(
+            reconstruct_path(&zero, &[-1, 0], true),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            reconstruct_path(&zero, &[-1, 0, 3], true),
+            Err(SparseError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    /// `probe2.py` / `gen_unit2.py`.
+    #[test]
+    fn construct_dist_matrix_values() {
+        let g = dense_csr(&[
+            &[0.0, 1.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[0.0, 0.0, 0.0, 3.0],
+            &[0.0; 4],
+        ]);
+        let pred = vec![
+            vec![-1, 0, 0, 2],
+            vec![1, -1, 0, 1],
+            vec![2, 0, -1, 2],
+            vec![1, 3, 3, -1],
+        ];
+        assert_eq!(
+            construct_dist_matrix(&g, &pred, false, INF).expect("undirected"),
+            vec![
+                vec![0.0, 1.0, 2.0, 5.0],
+                vec![1.0, 0.0, 3.0, 1.0],
+                vec![2.0, 3.0, 0.0, 3.0],
+                vec![2.0, 1.0, 3.0, 0.0]
+            ]
+        );
+        assert_eq!(
+            construct_dist_matrix(&g, &pred, true, INF).expect("directed"),
+            vec![
+                vec![0.0, 1.0, 2.0, 5.0],
+                vec![INF, 0.0, INF, 1.0],
+                vec![INF, INF, 0.0, 3.0],
+                vec![INF, INF, INF, 0.0]
+            ]
+        );
+        // A chain that stops short keeps its partial sum; null_value only for no step at all.
+        let mut broken = vec![vec![-9999; 4]; 4];
+        broken[0][3] = 2;
+        broken[0][1] = 0;
+        assert_eq!(
+            construct_dist_matrix(&g, &broken, true, -1.0).expect("broken"),
+            vec![
+                vec![0.0, 1.0, -1.0, 3.0],
+                vec![-1.0, 0.0, -1.0, -1.0],
+                vec![-1.0, -1.0, 0.0, -1.0],
+                vec![-1.0, -1.0, -1.0, 0.0]
+            ]
+        );
+        // A stored zero: 0 directed, infinity undirected (where 0 means "no edge").
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0)]);
+        let pz = vec![vec![-1, 0, 0], vec![-1; 3], vec![-1; 3]];
+        assert_eq!(
+            construct_dist_matrix(&zero, &pz, true, -7.5).expect("zero directed"),
+            vec![
+                vec![0.0, 0.0, 3.0],
+                vec![-7.5, 0.0, -7.5],
+                vec![-7.5, -7.5, 0.0]
+            ]
+        );
+        assert_eq!(
+            construct_dist_matrix(&zero, &pz, false, INF).expect("zero undirected")[0],
+            vec![0.0, INF, 3.0]
+        );
+        // SciPy loops forever here; fsci refuses.
+        let cyclic = vec![vec![-1, 2, 1, -1], vec![-1; 4], vec![-1; 4], vec![-1; 4]];
+        assert!(construct_dist_matrix(&g, &cyclic, true, INF).is_err());
+        assert!(matches!(
+            construct_dist_matrix(&g, &pred[..3], true, INF),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    /// `probe1.py`.
+    #[test]
+    fn dense_and_masked_conversions() {
+        let nan = f64::NAN;
+        let a = vec![
+            vec![0.0, 1e-9, 2.0],
+            vec![1e-7, 0.0, 3.0],
+            vec![INF, nan, 0.0],
+        ];
+        // The default null is np.isclose(x, 0): 1e-9 is a non-edge, 1e-7 an edge.
+        assert_eq!(
+            parts(&csgraph_from_dense(&a, Some(0.0), true, true).expect("default")),
+            (vec![0, 1, 3, 3], vec![2, 0, 2], vec![2.0, 1e-7, 3.0])
+        );
+        let b = vec![
+            vec![5.00001, 5.0, 2.0],
+            vec![4.99996, 0.0, 3.0],
+            vec![-INF, nan, 0.0],
+        ];
+        assert_eq!(
+            parts(&csgraph_from_dense(&b, Some(5.0), true, true).expect("null 5")),
+            (vec![0, 1, 3, 4], vec![2, 1, 2, 2], vec![2.0, 0.0, 3.0, 0.0])
+        );
+        let all = csgraph_from_dense(&b, None, false, false).expect("no null");
+        assert_eq!(all.indptr(), &[0, 3, 6, 9]);
+        assert!(all.data()[7].is_nan() && all.data()[6] == -INF);
+        let nan_null = csgraph_from_dense(&b, Some(nan), false, false).expect("null nan");
+        assert_eq!(
+            parts(&nan_null),
+            (
+                vec![0, 3, 6, 8],
+                vec![0, 1, 2, 0, 1, 2, 0, 2],
+                vec![5.00001, 5.0, 2.0, 4.99996, 0.0, 3.0, -INF, 0.0]
+            )
+        );
+        let inf_null = csgraph_from_dense(&b, Some(-INF), false, false).expect("null -inf");
+        assert_eq!(inf_null.indices(), &[0, 1, 2, 0, 1, 2, 1, 2]);
+        assert!(inf_null.data()[6].is_nan());
+
+        let masked = csgraph_masked_from_dense(
+            &[
+                vec![0.0, 1.0, 2.0],
+                vec![3.0, 0.0, nan],
+                vec![0.0, INF, 0.0],
+            ],
+            Some(0.0),
+            true,
+            true,
+        )
+        .expect("masked");
+        assert_eq!(
+            masked.mask,
+            vec![
+                vec![true, false, false],
+                vec![false, true, true],
+                vec![true, true, true]
+            ]
+        );
+        assert!(masked.data[1][2].is_nan() && masked.data[2][1] == INF);
+
+        // A stored NaN reads as infinity, not null; duplicates keep the smallest.
+        let t = csr(3, 3, &[(0, 0, nan), (1, 1, 3.0), (1, 1, 2.0), (2, 2, 0.0)]);
+        assert_eq!(
+            csgraph_to_dense(&t, -1.0).expect("to_dense"),
+            vec![
+                vec![INF, -1.0, -1.0],
+                vec![-1.0, 2.0, -1.0],
+                vec![-1.0, -1.0, 0.0]
+            ]
+        );
+        let tm = csgraph_to_masked(&t).expect("to_masked");
+        assert_eq!(
+            tm.mask,
+            vec![
+                vec![true, true, true],
+                vec![true, false, true],
+                vec![true, true, false]
+            ]
+        );
+        assert!(tm.data[0][0] == INF && tm.data[0][1].is_nan() && tm.data[1][1] == 2.0);
+        let fm = csgraph_from_masked(&MaskedGraph {
+            data: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            mask: vec![vec![false, true], vec![true, false]],
+        })
+        .expect("from_masked");
+        assert_eq!(parts(&fm), (vec![0, 1, 2], vec![0, 1], vec![1.0, 4.0]));
+        assert!(csgraph_to_dense(&csr(2, 3, &[]), 0.0).is_err());
+        assert!(csgraph_from_dense(&[vec![1.0, 2.0]], Some(0.0), true, true).is_err());
+    }
+
+    /// `gen_unit.py` / `probe4.py`: on the 3x3 unit grid, eight corner-to-corner paths, six of
+    /// length 4 then two of length 6, in SciPy's order.
+    #[test]
+    fn yen_grid_ties_follow_scipys_candidate_order() {
+        let mut edges = Vec::new();
+        for i in 0..9usize {
+            let (r, c) = (i / 3, i % 3);
+            let mut row: Vec<usize> = Vec::new();
+            if r > 0 {
+                row.push(i - 3);
+            }
+            if c > 0 {
+                row.push(i - 1);
+            }
+            if c < 2 {
+                row.push(i + 1);
+            }
+            if r < 2 {
+                row.push(i + 3);
+            }
+            edges.extend(row.into_iter().map(|j| (i, j, 1.0)));
+        }
+        let grid = csr(9, 9, &edges);
+        let r = yen(&grid, 0, 8, 8, true, false).expect("yen grid");
+        assert_eq!(r.distances, vec![4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 6.0, 6.0]);
+        assert_eq!(
+            r.predecessors,
+            vec![
+                vec![-1, -1, -1, 0, -1, -1, 3, 6, 7],
+                vec![-1, 0, -1, -1, 1, -1, -1, 4, 7],
+                vec![-1, 0, 1, -1, -1, 2, -1, -1, 5],
+                vec![-1, 0, -1, -1, 1, 4, -1, -1, 5],
+                vec![-1, -1, -1, 0, 3, -1, -1, 4, 7],
+                vec![-1, -1, -1, 0, 3, 4, -1, -1, 5],
+                vec![-1, 0, -1, 4, 1, -1, 3, 6, 7],
+                vec![-1, 0, 1, -1, 5, 2, -1, 4, 7],
+            ]
+        );
+    }
+
+    /// `gen_unit.py` / `probe4.py`.
+    #[test]
+    fn yen_weights_signs_and_edge_cases() {
+        let doc = dense_csr(&[
+            &[0.0, 1.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[2.0, 0.0, 0.0, 3.0],
+            &[0.0; 4],
+        ]);
+        let r = yen(&doc, 0, 3, 5, false, false).expect("doc");
+        assert_eq!(r.distances, vec![2.0, 5.0]);
+        assert_eq!(r.predecessors, vec![vec![-1, 0, -1, 1], vec![-1, -1, 0, 2]]);
+        let r = yen(&doc, 0, 3, 5, false, true).expect("unweighted");
+        assert_eq!(r.distances, vec![2.0, 2.0]);
+        assert_eq!(r.predecessors, vec![vec![-1, -1, 0, 2], vec![-1, 0, -1, 1]]);
+        let none = yen(&doc, 0, 3, 0, true, false).expect("k = 0");
+        assert!(none.distances.is_empty() && none.predecessors.is_empty());
+        let same = yen(&doc, 1, 1, 3, true, false).expect("source = sink");
+        assert_eq!(
+            (same.distances, same.predecessors),
+            (vec![0.0], vec![vec![-1; 4]])
+        );
+        assert!(
+            yen(&doc, 3, 0, 3, true, false)
+                .expect("no path")
+                .distances
+                .is_empty()
+        );
+        assert_eq!(
+            invalid_argument(yen(&doc, 0, 9, 2, true, false)),
+            "For csgraph with shape (N, N), must have 0 <= source < N and 0 <= sink < N. \
+             Got N=4, source=0, sink=9."
+        );
+
+        // A negative edge is reweighted by Johnson's potentials, directed.
+        let neg = dense_csr(&[
+            &[0.0, 4.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[0.0, -1.0, 0.0, 5.0],
+            &[0.0; 4],
+        ]);
+        let r = yen(&neg, 0, 3, 4, true, false).expect("negative edge");
+        assert_eq!(r.distances, vec![2.0, 5.0, 7.0]);
+        assert_eq!(
+            r.predecessors,
+            vec![vec![-1, 2, 0, 1], vec![-1, 0, -1, 1], vec![-1, -1, 0, 2]]
+        );
+        // Undirected, the negative edge is a negative cycle.
+        assert_eq!(
+            yen(&neg, 0, 3, 4, false, false),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            })
+        );
+        let cycle = dense_csr(&[&[0.0, 1.0, 0.0], &[0.0, 0.0, -3.0], &[1.0, 0.0, 0.0]]);
+        assert_eq!(
+            yen(&cycle, 0, 2, 2, true, false),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            })
+        );
+        assert_eq!(
+            bellman_ford(&cycle, true, 1),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 1".to_string()
+            })
+        );
+    }
 }
 
 /// Compute the graph Laplacian matrix L = D - A.

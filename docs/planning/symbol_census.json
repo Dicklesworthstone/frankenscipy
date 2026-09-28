@@ -841,34 +841,19 @@
   },
   "scipy.sparse.csgraph": {
    "applicable": 26,
-   "compared": 10,
+   "compared": 24,
    "crate": "fsci-sparse",
-   "declared": 12,
+   "declared": 25,
    "matched_by": {
     "case_fold": 0,
-    "exact": 12,
+    "exact": 25,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "NegativeCycleError": "missing: SparseError has no negative-cycle variant (frankenscipy-fdepw)",
-    "breadth_first_tree": "missing: BFS order exists, the BFS tree matrix does not (frankenscipy-fdepw)",
-    "construct_dist_matrix": "missing: no distance matrix from a predecessor matrix (frankenscipy-fdepw)",
-    "csgraph_from_dense": "missing: no dense-to-csgraph conversion with a null value (frankenscipy-fdepw)",
-    "csgraph_from_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "csgraph_masked_from_dense": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "csgraph_to_dense": "missing: no csgraph-to-dense conversion with a null value (frankenscipy-fdepw)",
-    "csgraph_to_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "depth_first_tree": "missing: DFS order exists, the DFS tree matrix does not (frankenscipy-fdepw)",
-    "maximum_bipartite_matching": "missing: no bipartite matching (frankenscipy-fdepw)",
-    "maximum_flow": "missing: no max-flow (frankenscipy-fdepw)",
-    "min_weight_full_bipartite_matching": "missing: no weighted bipartite matching (frankenscipy-fdepw)",
-    "reconstruct_path": "missing: no tree from a predecessor list (frankenscipy-fdepw)",
-    "yen": "missing: no k-shortest-paths (frankenscipy-fdepw)"
-   },
-   "real": 12,
+   "not_real": {},
+   "real": 26,
    "real_not_compared": [
     "reverse_cuthill_mckee",
     "shortest_path"
@@ -1374,17 +1359,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 827,
-  "declared": 1459,
+  "compared": 841,
+  "declared": 1472,
   "matched_by": {
    "case_fold": 130,
-   "exact": 1257,
+   "exact": 1270,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1483,
+  "real": 1497,
   "scipy": 1555
  }
 }

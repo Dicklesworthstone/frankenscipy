@@ -31,6 +31,11 @@ pub enum SparseError {
     NonFiniteInput { message: String },
     #[error("singular matrix: {message}")]
     SingularMatrix { message: String },
+    /// A shortest-path routine met a cycle of negative total weight, so the distances through it
+    /// are unbounded below: SciPy's `scipy.sparse.csgraph.NegativeCycleError`. `message` is
+    /// SciPy's own text, e.g. "Negative cycle detected on node 0".
+    #[error("negative cycle: {message}")]
+    NegativeCycle { message: String },
     /// `eigs`/`eigsh` stopped before every requested eigenpair converged: SciPy's
     /// `ArpackNoConvergence`. `partial` holds the pairs that did converge (possibly none), with
     /// `partial.converged == false`.
@@ -55,6 +60,7 @@ impl SparseError {
             Self::Unsupported { .. } => "unsupported",
             Self::NonFiniteInput { .. } => "non_finite_input",
             Self::SingularMatrix { .. } => "singular_matrix",
+            Self::NegativeCycle { .. } => "negative_cycle",
             Self::EigsNoConvergence { .. } => "eigs_no_convergence",
         }
     }
