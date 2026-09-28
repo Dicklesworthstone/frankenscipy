@@ -31,10 +31,11 @@ mod bench {
     use fsci_linalg::{
         DecompOptions, EIGH_DSYMV_FORCE_SCALAR, PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE, eigh,
     };
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
@@ -520,6 +521,7 @@ for raw_line in sys.stdin.buffer:
 
     /// What the arm will actually spawn if asked for `requested` threads.
     /// Used by the tests to state the invariant the cap exists to preserve.
+    #[cfg(test)]
     pub fn expected_threads(requested: usize) -> usize {
         requested * OBSERVED_THREADS_PER_REQUESTED
     }
@@ -642,7 +644,9 @@ for raw_line in sys.stdin.buffer:
     /// frankenscipy voided rows over it. Two arms on SMT siblings share
     /// execution units, so each depresses the other while every A/A null stays
     /// perfectly happy -- the same blind spot as resident-process contention,
-    /// one level down in the hardware. Inputs are `(cpu, core_id)` pairs.
+    /// one level down in the hardware. Inputs are `(cpu, core_id)` pairs. The run records the
+    /// placement facts rather than gating on them (54f01ea9b); this states the rule in tests.
+    #[cfg(test)]
     pub fn arms_share_physical_core(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
         a.iter().any(|(_, core_a)| {
             *core_a != usize::MAX && b.iter().any(|(_, core_b)| core_b == core_a)
@@ -1000,8 +1004,7 @@ for raw_line in sys.stdin.buffer:
                 let _ = time_fsci(&a, 1, min_of);
                 stop.store(true, O::Relaxed);
                 let _ = sampler.join();
-                let out = seen.lock().map(|g| g.clone()).unwrap_or_default();
-                out
+                seen.lock().map(|g| g.clone()).unwrap_or_default()
             };
 
             let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
@@ -1424,7 +1427,6 @@ for raw_line in sys.stdin.buffer:
 #[cfg(all(test, feature = "eigh-incumbent-bench"))]
 mod tests {
     use super::bench::{MIN_NULL_MARGIN, Paired, null_margin};
-    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 
     fn paired(ratio_p50: f64, lo: f64, hi: f64) -> Paired {
         Paired {
