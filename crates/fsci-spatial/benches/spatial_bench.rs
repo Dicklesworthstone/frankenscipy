@@ -226,9 +226,6 @@ fn bench_kdtree(c: &mut Criterion) {
     group.finish();
 }
 
-/// Delaunay triangulation (Bowyer-Watson, frankenscipy-8d2z2 buffer hoist) vs scipy's
-/// Qhull (docs/perf_oracle_delaunay.py). Tests fsci's most complex spatial algorithm
-/// against scipy's elite geometric C.
 fn bench_sparse_dm(c: &mut Criterion) {
     use fsci_spatial::KDTree;
     let mut group = c.benchmark_group("sparse_distance_matrix");
@@ -257,41 +254,40 @@ fn bench_find_simplex(c: &mut Criterion) {
     use fsci_spatial::Delaunay;
     let mut group = c.benchmark_group("find_simplex");
     for &npts in &[2000usize, 5000] {
-        let pts: Vec<(f64, f64)> = (0..npts)
+        let pts: Vec<Vec<f64>> = (0..npts)
             .map(|i| {
                 let t = i as f64;
-                ((t * 0.137).sin() * 0.5 + 0.5, (t * 0.071).cos() * 0.5 + 0.5)
+                vec![(t * 0.137).sin() * 0.5 + 0.5, (t * 0.071).cos() * 0.5 + 0.5]
             })
             .collect();
         let tri = Delaunay::new(&pts).expect("delaunay");
-        let q: Vec<(f64, f64)> = (0..50000)
+        let q: Vec<Vec<f64>> = (0..50000)
             .map(|i| {
                 let t = i as f64;
-                ((t * 0.0191).fract(), (t * 0.0233).fract())
+                vec![(t * 0.0191).fract(), (t * 0.0233).fract()]
             })
             .collect();
-        group.bench_function(BenchmarkId::new("seq", npts), |b| {
-            b.iter(|| q.iter().map(|&p| tri.find_simplex(p)).collect::<Vec<_>>())
-        });
-        group.bench_function(BenchmarkId::new("many", npts), |b| {
-            b.iter(|| tri.find_simplex_many(&q))
+        group.bench_function(BenchmarkId::new("walk", npts), |b| {
+            b.iter(|| tri.find_simplex(&q, false, None).expect("walk"))
         });
     }
     group.finish();
 }
 
+/// Delaunay triangulation (the lifted exact-predicate Quickhull) vs SciPy's Qhull
+/// (docs/perf_oracle_delaunay.py).
 fn bench_delaunay(c: &mut Criterion) {
     use fsci_spatial::Delaunay;
     let mut group = c.benchmark_group("delaunay");
     for &n in &[1000usize, 2000, 4000, 8000] {
         // Deterministic scattered 2-D points (low-discrepancy-ish, no exact duplicates).
-        let pts: Vec<(f64, f64)> = (0..n)
+        let pts: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 let t = i as f64;
-                (
+                vec![
                     (t * 0.6180339887).fract() * 100.0,
                     (t * 0.4142135624).fract() * 100.0,
-                )
+                ]
             })
             .collect();
         group.bench_function(BenchmarkId::from_parameter(n), |b| {

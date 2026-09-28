@@ -891,7 +891,7 @@
   },
   "scipy.spatial": {
    "applicable": 18,
-   "compared": 4,
+   "compared": 8,
    "crate": "fsci-spatial",
    "declared": 18,
    "matched_by": {
@@ -905,13 +905,9 @@
    "not_real": {},
    "real": 18,
    "real_not_compared": [
-    "ConvexHull",
-    "Delaunay",
-    "HalfspaceIntersection",
     "QhullError",
     "Rectangle",
     "SphericalVoronoi",
-    "Voronoi",
     "convex_hull_plot_2d",
     "delaunay_plot_2d",
     "distance_matrix",
@@ -1350,7 +1346,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 851,
+  "compared": 855,
   "declared": 1475,
   "matched_by": {
    "case_fold": 131,

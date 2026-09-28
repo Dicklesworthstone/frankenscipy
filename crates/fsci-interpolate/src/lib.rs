@@ -4822,10 +4822,11 @@ impl Delaunay2D {
         // returned regardless, so a pathological input degrades to the old behaviour rather than
         // failing outright.
         //
-        // `fsci_spatial::Delaunay` had the SAME defect from the same constant and is fixed the
-        // same way; the two implementations are independent and neither can be dropped for the
-        // other, so the reasoning is written out in both.
-        let hull_vertices = fsci_spatial::ConvexHull::new(points)
+        // `fsci_spatial::Delaunay` had the SAME defect from the same constant; it has since been
+        // rebuilt as the lower hull of lifted points (an N-D exact-predicate Quickhull), which
+        // has no super-triangle. This 2-D Bowyer-Watson stays independent of it.
+        let hull_rows: Vec<Vec<f64>> = points.iter().map(|&(x, y)| vec![x, y]).collect();
+        let hull_vertices = fsci_spatial::ConvexHull::new(&hull_rows)
             .ok()
             .map(|h| h.vertices.len());
         let mut triangles = Vec::new();

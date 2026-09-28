@@ -1076,6 +1076,15 @@
     "ABS_TOL_MTX1": 1e-12,
     "ABS_TOL_MTX2": 1e-9
   },
+  "diff_spatial_qhull.rs": {
+    "BARYCENTRIC_REL_TOL": 1e-9,
+    "EQUATION_ABS_TOL": 1e-11,
+    "INTERSECTION_ABS_TOL": 1e-10,
+    "LIFT_ABS_TOL": 1e-12,
+    "MEASURE_REL_TOL": 1e-11,
+    "PARABOLOID_REL_TOL": 1e-14,
+    "VORONOI_VERTEX_REL_TOL": 1e-9
+  },
   "diff_spatial_slerp_rotation.rs": {
     "ABS_TOL": 1e-12
   },

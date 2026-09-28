@@ -5263,7 +5263,11 @@ pub struct SpatialExpected {
     pub index: Option<usize>,
     pub distance: Option<f64>,
     pub vertices: Option<Vec<usize>>,
+    /// `ConvexHull.area`: the surface area, i.e. the perimeter of a 2-D hull.
     pub area: Option<f64>,
+    /// `ConvexHull.volume`: the volume, i.e. the enclosed area of a 2-D hull.
+    #[serde(default)]
+    pub volume: Option<f64>,
     pub disparity: Option<f64>,
     pub atol: Option<f64>,
     pub rtol: Option<f64>,
@@ -5311,9 +5315,11 @@ enum SpatialObserved {
     KdTreeBallPoint {
         indices: Vec<usize>,
     },
+    /// Sorted hull vertices with SciPy's `area` and `volume`.
     ConvexHull {
         vertices: Vec<usize>,
         area: f64,
+        volume: f64,
     },
     /// br-uufs: KDTree.query_ball_tree result — list of neighbor
     /// index lists (one per point in tree A; each list contains the
@@ -5741,14 +5747,14 @@ fn execute_convex_hull(case: &SpatialCase) -> SpatialObserved {
         Ok(v) => v,
         Err(e) => return SpatialObserved::Error(format!("parse points: {e}")),
     };
-    let points_2d: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
-    match fsci_spatial::ConvexHull::new(&points_2d) {
+    match fsci_spatial::ConvexHull::new(&points) {
         Ok(hull) => {
             let mut vertices = hull.vertices.clone();
-            vertices.sort();
+            vertices.sort_unstable();
             SpatialObserved::ConvexHull {
                 vertices,
                 area: hull.area,
+                volume: hull.volume,
             }
         }
         Err(e) => SpatialObserved::Error(format!("{e:?}")),
@@ -5765,11 +5771,13 @@ fn execute_voronoi(case: &SpatialCase) -> SpatialObserved {
         Ok(v) => v,
         Err(e) => return SpatialObserved::Error(format!("parse points: {e}")),
     };
-    let points_2d: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
-    match fsci_spatial::Voronoi::new(&points_2d) {
+    if points.iter().any(|p| p.len() != 2) {
+        return SpatialObserved::Error("voronoi_result fixtures are 2-D".to_string());
+    }
+    match fsci_spatial::Voronoi::new(&points) {
         Ok(v) => {
             let mut sorted_vertices: Vec<[f64; 2]> =
-                v.vertices.iter().map(|(x, y)| [*x, *y]).collect();
+                v.vertices.iter().map(|p| [p[0], p[1]]).collect();
             sorted_vertices.sort_by(|a, b| {
                 a[0].partial_cmp(&b[0])
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -5795,7 +5803,7 @@ fn execute_halfspace_intersection(case: &SpatialCase) -> SpatialObserved {
         Err(e) => return SpatialObserved::Error(format!("parse interior_point: {e}")),
     };
 
-    match fsci_spatial::HalfspaceIntersection::from_nd(&halfspaces, &interior_point) {
+    match fsci_spatial::HalfspaceIntersection::new(&halfspaces, &interior_point) {
         Ok(result) => SpatialObserved::HalfspaceIntersection {
             intersections: result.intersections,
             dual_points: result.dual_points,
@@ -6003,24 +6011,43 @@ fn compare_spatial_outcome(case: &SpatialCase, observed: &SpatialObserved) -> (b
                 format!("kdtree ball_point match: {} hits", indices.len()),
             )
         }
-        ("convex_hull", SpatialObserved::ConvexHull { vertices, area }) => {
+        (
+            "convex_hull",
+            SpatialObserved::ConvexHull {
+                vertices,
+                area,
+                volume,
+            },
+        ) => {
             let exp_vertices = case.expected.vertices.as_ref().cloned().unwrap_or_default();
-            let exp_area = case.expected.area.unwrap_or(0.0);
             if *vertices != exp_vertices {
                 return (
                     false,
                     format!("vertices mismatch: got {vertices:?}, expected {exp_vertices:?}"),
                 );
             }
-            if !allclose_scalar(*area, exp_area, atol, rtol) {
+            if case.expected.area.is_none() && case.expected.volume.is_none() {
                 return (
                     false,
-                    format!("area mismatch: got {area}, expected {exp_area}"),
+                    "convex_hull expectation names neither area nor volume".to_string(),
                 );
+            }
+            for (field, got, expected) in [
+                ("area", *area, case.expected.area),
+                ("volume", *volume, case.expected.volume),
+            ] {
+                if let Some(expected) = expected
+                    && !allclose_scalar(got, expected, atol, rtol)
+                {
+                    return (
+                        false,
+                        format!("{field} mismatch: got {got}, expected {expected}"),
+                    );
+                }
             }
             (
                 true,
-                format!("convex hull match: vertices={vertices:?}, area={area}"),
+                format!("convex hull match: vertices={vertices:?}, area={area}, volume={volume}"),
             )
         }
         ("kdtree_ball_tree_result", SpatialObserved::KdTreeBallTree { neighbors }) => {
@@ -9470,15 +9497,30 @@ fn compare_spatial_case_differential(
             };
             (passed, message, Some(diff), Some(tolerance()))
         }
-        ("convex_hull", SpatialObserved::ConvexHull { vertices, area }) => {
+        (
+            "convex_hull",
+            SpatialObserved::ConvexHull {
+                vertices,
+                area,
+                volume,
+            },
+        ) => {
             let expected_vertices = case.expected.vertices.as_deref().unwrap_or(&[]);
-            let expected_area = case.expected.area.unwrap_or(0.0);
             let vertex_diff = if vertices.as_slice() == expected_vertices {
                 0.0
             } else {
                 f64::INFINITY
             };
-            let diff = vertex_diff.max((area - expected_area).abs());
+            let measure_diff = [(*area, case.expected.area), (*volume, case.expected.volume)]
+                .into_iter()
+                .filter_map(|(got, expected)| expected.map(|e| (got - e).abs()))
+                // A NaN difference must surface, not vanish into `f64::max`.
+                .fold(0.0_f64, |m, d| if d.is_nan() || d > m { d } else { m });
+            let diff = if measure_diff.is_nan() {
+                measure_diff
+            } else {
+                vertex_diff.max(measure_diff)
+            };
             (passed, message, Some(diff), Some(tolerance()))
         }
         ("procrustes_result", SpatialObserved::Procrustes { disparity }) => {

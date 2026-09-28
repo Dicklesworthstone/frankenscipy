@@ -17,14 +17,6 @@
       }
     },
     {
-      "function_name": "fsci_spatial::HalfspaceIntersection::from_nd",
-      "tolerance_policy": {
-        "comparison_mode": "allclose",
-        "default_atol": 1e-10,
-        "default_rtol": 1e-08
-      }
-    },
-    {
       "function_name": "fsci_spatial::KDTree::query",
       "tolerance_policy": {
         "comparison_mode": "allclose",
