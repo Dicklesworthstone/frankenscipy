@@ -7,12 +7,12 @@
 //! Run with: `cargo test -p fsci-cluster --test metamorphic_tests`
 
 use fsci_cluster::{
-    LinkageMethod, adjusted_rand_score, calinski_harabasz_score, completeness_score, cophenet,
-    davies_bouldin_score, dbscan, elbow_inertias, fcluster, fclusterdata, fowlkes_mallows_score,
-    gap_statistic, homogeneity_score, inconsistent, is_monotonic, is_valid_linkage, kmeans,
-    kmedoids, leaves_list, linkage, linkage_from_distances, mean_shift, mini_batch_kmeans,
-    normalized_mutual_info, num_obs_linkage, proximity_cliques, silhouette_samples,
-    silhouette_score, v_measure_score, vq, whiten,
+    FclusterCriterion, LinkageMethod, adjusted_rand_score, calinski_harabasz_score,
+    completeness_score, cophenet, davies_bouldin_score, dbscan, elbow_inertias, fcluster,
+    fclusterdata, fowlkes_mallows_score, gap_statistic, homogeneity_score, inconsistent,
+    is_monotonic, is_valid_linkage, kmeans, kmedoids, leaves_list, linkage, linkage_from_distances,
+    mean_shift, mini_batch_kmeans, normalized_mutual_info, num_obs_linkage, proximity_cliques,
+    silhouette_samples, silhouette_score, v_measure_score, vq, whiten,
 };
 
 fn small_dataset() -> Vec<Vec<f64>> {
@@ -129,7 +129,7 @@ fn mr_fcluster_respects_max_clusters() {
     let data = small_dataset();
     let z = linkage(&data, LinkageMethod::Ward).unwrap();
     for &max_k in &[1usize, 2, 3, 5, 10] {
-        let labels = fcluster(&z, max_k).unwrap();
+        let labels = fcluster(&z, FclusterCriterion::MaxClust(max_k)).unwrap();
         assert_eq!(labels.len(), data.len());
         let mut sorted_unique: Vec<usize> = labels.to_vec();
         sorted_unique.sort_unstable();
@@ -441,10 +441,10 @@ fn mr_mini_batch_kmeans_returns_k_centroids() {
 #[test]
 fn mr_fclusterdata_matches_fcluster_pipeline() {
     let data = small_dataset();
-    let max_k = 3;
-    let from_func = fclusterdata(&data, max_k, LinkageMethod::Ward).unwrap();
+    let criterion = FclusterCriterion::MaxClust(3);
+    let from_func = fclusterdata(&data, criterion, LinkageMethod::Ward).unwrap();
     let z = linkage(&data, LinkageMethod::Ward).unwrap();
-    let from_pipeline = fcluster(&z, max_k).unwrap();
+    let from_pipeline = fcluster(&z, criterion).unwrap();
     assert_eq!(
         from_func, from_pipeline,
         "MR20 fclusterdata should equal fcluster(linkage(X))"
@@ -951,7 +951,8 @@ fn mr_kmeans_inertia_nonneg() {
 fn mr_fclusterdata_label_range() {
     let data = small_dataset();
     for k in [1usize, 2, 3] {
-        let labels = fclusterdata(&data, k, LinkageMethod::Ward).unwrap();
+        let labels =
+            fclusterdata(&data, FclusterCriterion::MaxClust(k), LinkageMethod::Ward).unwrap();
         assert_eq!(labels.len(), data.len(), "MR45 fclusterdata length");
         for (i, &lbl) in labels.iter().enumerate() {
             assert!(

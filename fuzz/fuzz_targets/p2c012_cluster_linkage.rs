@@ -2,7 +2,8 @@
 
 use arbitrary::Arbitrary;
 use fsci_cluster::{
-    fcluster, is_monotonic, is_valid_linkage, leaves_list, linkage, num_obs_linkage, LinkageMethod,
+    fcluster, is_monotonic, is_valid_linkage, leaves_list, linkage, num_obs_linkage,
+    FclusterCriterion, LinkageMethod,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -144,7 +145,7 @@ fuzz_target!(|input: LinkageInput| {
     if n <= 16 {
         for max_clusters in [2, 3, n / 2 + 1, n] {
             if (1..=n).contains(&max_clusters)
-                && let Ok(labels) = fcluster(&z, max_clusters)
+                && let Ok(labels) = fcluster(&z, FclusterCriterion::MaxClust(max_clusters))
             {
                 if labels.len() != n {
                     panic!(
