@@ -199,6 +199,16 @@ pub fn gammaln(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    // Only a Hardened pole can fail, so an array without one maps the kernel directly rather
+    // than building a Result per element.
+    if let SpecialTensor::RealVec(values) = x
+        && (matches!(mode, RuntimeMode::Strict)
+            || !values.iter().any(|&v| is_negative_integer_pole(v)))
+    {
+        return Ok(SpecialTensor::RealVec(
+            values.iter().map(|&v| gammasgn_value(v)).collect(),
+        ));
+    }
     map_real_input_rp(
         "gammasgn",
         x,
@@ -1588,47 +1598,48 @@ fn loggamma_scalar_with_threshold(
 }
 
 pub fn gammasgn_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if x.is_nan() || x == f64::NEG_INFINITY {
-        return Ok(f64::NAN);
+    if matches!(mode, RuntimeMode::Hardened) && is_negative_integer_pole(x) {
+        record_special_trace(
+            "gammasgn",
+            mode,
+            "pole_input",
+            format!("input={x}"),
+            "fail_closed",
+            "gammasgn pole at negative integer",
+            false,
+        );
+        return Err(SpecialError {
+            function: "gammasgn",
+            kind: SpecialErrorKind::PoleInput,
+            mode,
+            detail: "gammasgn pole at negative integer",
+        });
     }
-    if x == f64::INFINITY {
-        return Ok(1.0);
-    }
-    if is_negative_integer_pole(x) {
-        if matches!(mode, RuntimeMode::Hardened) {
-            record_special_trace(
-                "gammasgn",
-                mode,
-                "pole_input",
-                format!("input={x}"),
-                "fail_closed",
-                "gammasgn pole at negative integer",
-                false,
-            );
-            return Err(SpecialError {
-                function: "gammasgn",
-                kind: SpecialErrorKind::PoleInput,
-                mode,
-                detail: "gammasgn pole at negative integer",
-            });
-        }
-        return Ok(f64::NAN);
-    }
-    if x == 0.0 {
-        return Ok(if x.is_sign_negative() { -1.0 } else { 1.0 });
+    Ok(gammasgn_value(x))
+}
+
+/// xsf's `gammasgn`, SciPy's kernel: on the negative axis Γ is negative exactly when `floor(x)`
+/// is odd. Every x at or below -2^52 is an integer, so the parity cast is exact wherever it is
+/// reached. SciPy casts to a 32-bit `int`, which overflows below -2^31 and reads every such x
+/// as even (+1); this keeps the true sign there.
+fn gammasgn_value(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
     }
     if x > 0.0 {
-        return Ok(1.0);
+        return 1.0;
     }
-
-    let sine = crate::convenience::sinpi(x);
-    if sine.is_nan() {
-        Ok(f64::NAN)
-    } else if sine.is_sign_negative() {
-        Ok(-1.0)
-    } else {
-        Ok(1.0)
+    if x == 0.0 {
+        return 1.0_f64.copysign(x);
     }
+    if x.is_infinite() {
+        return f64::NAN;
+    }
+    let fx = x.floor();
+    if x - fx == 0.0 {
+        return f64::NAN;
+    }
+    if (fx as i64) % 2 != 0 { -1.0 } else { 1.0 }
 }
 
 fn multigammaln_scalar(a: f64, d: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
@@ -6825,6 +6836,57 @@ mod tests {
         assert_eq!(lg[1].to_bits(), f64::to_bits(19.735_015_850_713_005));
         assert!(lg[2].is_nan());
         assert_eq!(lg[3], f64::INFINITY);
+        Ok(())
+    }
+
+    #[test]
+    fn gammasgn_batch_is_the_scalar_kernel_and_keeps_the_hardened_pole() -> Result<(), String> {
+        // floor(x) odd -> -1, even -> +1, at the ulp either side of -1 and out to 2^52. Past
+        // -2^31 the sign still alternates; SciPy's int cast reads all of those as +1.
+        let cases = [
+            (-5e-324, -1.0),
+            (-0.999_999_999_999_999_9, -1.0),
+            (-1.000_000_000_000_000_2, 1.0),
+            (-1.0e15 - 0.5, -1.0),
+            (-2_147_483_648.5, -1.0),
+            (-3.0e9 - 0.5, -1.0),
+            (-4_294_967_297.5, 1.0),
+            (-4_503_599_627_370_495.5, 1.0),
+            (-4_503_599_627_370_494.5, -1.0),
+        ];
+        let xs: Vec<f64> = cases
+            .iter()
+            .map(|c| c.0)
+            .chain([
+                -0.0,
+                0.0,
+                -7.0,
+                -4.503_599_627_370_496e15,
+                f64::NEG_INFINITY,
+                f64::NAN,
+            ])
+            .collect();
+        let batch = match gammasgn(&SpecialTensor::RealVec(xs.clone()), RuntimeMode::Strict) {
+            Ok(SpecialTensor::RealVec(v)) => v,
+            other => return Err(format!("expected real vector, got {other:?}")),
+        };
+        for (i, &x) in xs.iter().enumerate() {
+            let scalar = gammasgn_scalar(x, RuntimeMode::Strict).map_err(|e| e.to_string())?;
+            assert_eq!(batch[i].to_bits(), scalar.to_bits(), "gammasgn({x:e})");
+        }
+        for (i, &(x, want)) in cases.iter().enumerate() {
+            assert_eq!(batch[i], want, "gammasgn({x:e})");
+        }
+        assert!(batch[cases.len() + 2..].iter().all(|v| v.is_nan()));
+
+        let with_pole = SpecialTensor::RealVec(vec![-0.5, -3.0]);
+        let err = gammasgn(&with_pole, RuntimeMode::Hardened).unwrap_err();
+        assert_eq!(err.kind, SpecialErrorKind::PoleInput);
+        let no_pole = SpecialTensor::RealVec(vec![-0.5, -1.5]);
+        match gammasgn(&no_pole, RuntimeMode::Hardened) {
+            Ok(SpecialTensor::RealVec(v)) => assert_eq!(v, vec![-1.0, 1.0]),
+            other => return Err(format!("expected real vector, got {other:?}")),
+        }
         Ok(())
     }
 
