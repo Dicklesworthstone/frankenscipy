@@ -79,9 +79,11 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialTensor, beta, betainc, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit,
-    exprel, gamma, gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0,
-    k1, kn, kv, kve, ndtri, rgamma, spence, y0, y1, yn, yv, yve, zeta,
+    SpecialTensor, beta, betainc, betaln, cosm1, dawsn, digamma, ellipe, ellipk, ellipkm1, entr,
+    erf, erfc, erfcinv, erfcx, erfi, erfinv, exp1, expi, expit, exprel, gamma, gammainc, gammaincc,
+    gammaln, gammasgn, hyp0f1, i0, i0e, i1, i1e, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e,
+    kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit, ndtr, ndtri, ndtri_exp,
+    rgamma, spence, wrightomega, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -265,6 +267,42 @@ const CASES: &[(&str, f64, f64)] = &[
     ("spence", 0.0, 10.0),
     ("expit", -20.0, 20.0),
     ("exprel", -10.0, 10.0),
+    // Widened after the CHECK column of these rows found erfinv (7.4e-12) and digamma
+    // (2.4e-11) off SciPy: every remaining real unary ufunc with a SciPy twin, so the
+    // accuracy column covers them too.
+    // The normal distribution and its logarithms.
+    ("ndtr", -10.0, 10.0),
+    ("log_ndtr", -40.0, 10.0),
+    ("ndtri_exp", -40.0, -0.001),
+    // Error-function relatives.
+    ("erfcx", -5.0, 50.0),
+    ("erfi", -5.0, 5.0),
+    // Exponential integrals across their series/continued-fraction switch.
+    ("exp1", 0.01, 50.0),
+    ("expi", -30.0, 30.0),
+    // Complete elliptic integrals in the parameter m. SciPy also takes m < 0, but this harness
+    // runs Hardened, where fsci's ellipk refuses m < 0 by policy, so the domain starts at 0.
+    ("ellipk", 0.0, 0.999),
+    ("ellipkm1", 0.001, 1.0),
+    ("ellipe", 0.0, 1.0),
+    // Exponentially scaled Bessel functions.
+    ("i0e", -50.0, 50.0),
+    ("i1e", -50.0, 50.0),
+    ("k0e", 0.01, 50.0),
+    ("k1e", 0.01, 50.0),
+    // Kolmogorov's distribution and its inverse.
+    ("kolmogorov", 0.01, 3.0),
+    ("kolmogi", 0.001, 0.999),
+    // Logistic, entropy and cosine helpers.
+    ("logit", 0.001, 0.999),
+    ("log_expit", -30.0, 30.0),
+    ("entr", 0.0, 10.0),
+    ("cosm1", -10.0, 10.0),
+    // Gamma and zeta relatives; zetac's range crosses its reflection.
+    ("loggamma", 0.01, 60.0),
+    ("gammasgn", -10.5, 10.0),
+    ("zetac", -20.0, 30.0),
+    ("wrightomega", -20.0, 20.0),
 ];
 
 /// Two-argument cases: the `scipy.special` name and a domain for each argument.
@@ -351,6 +389,30 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "spence" => spence(tensor, mode),
         "expit" => expit(tensor, mode),
         "exprel" => exprel(tensor, mode),
+        "ndtr" => ndtr(tensor, mode),
+        "log_ndtr" => log_ndtr(tensor, mode),
+        "ndtri_exp" => ndtri_exp(tensor, mode),
+        "erfcx" => erfcx(tensor, mode),
+        "erfi" => erfi(tensor, mode),
+        "exp1" => exp1(tensor, mode),
+        "expi" => expi(tensor, mode),
+        "ellipk" => ellipk(tensor, mode),
+        "ellipkm1" => ellipkm1(tensor, mode),
+        "ellipe" => ellipe(tensor, mode),
+        "i0e" => i0e(tensor, mode),
+        "i1e" => i1e(tensor, mode),
+        "k0e" => k0e(tensor, mode),
+        "k1e" => k1e(tensor, mode),
+        "kolmogorov" => kolmogorov(tensor, mode),
+        "kolmogi" => kolmogi(tensor, mode),
+        "logit" => logit(tensor, mode),
+        "log_expit" => log_expit(tensor, mode),
+        "entr" => entr(tensor, mode),
+        "cosm1" => cosm1(tensor, mode),
+        "loggamma" => loggamma(tensor, mode),
+        "gammasgn" => gammasgn(tensor, mode),
+        "zetac" => zetac(tensor, mode),
+        "wrightomega" => wrightomega(tensor, mode),
         other => panic!("no fsci entry point wired for {other}"),
     }
 }
