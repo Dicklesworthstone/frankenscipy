@@ -1736,6 +1736,16 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     // T(a, b) = xᵃ(1−x)ᵇ / (a·B(a, b)) = xᵃ(1−x)ᵇ·Γ(a+b) / (Γ(a+1)·Γ(b)).
     let tp0 = beta_term(ap0, half_df, x, x1);
     let tq0 = beta_term(aq0, half_df, x, x1);
+    // frankenscipy-k5qew. With a large positive δ and a small t, I_x at the Poisson mode is far
+    // below the terms that carry the CDF, which sit well under the mode. The anchors underflow,
+    // or go subnormal and lose their digits, while the answer is ~1e-250: nctdtr(30, 40, 3) was 0
+    // where mpmath gives 1.2e-248. There the CDF is E[Φ(tS − δ)], a positive integrand, and the
+    // quadrature of the far tail computes it with τ = −t. Only I_x decides: it is small only in
+    // the lower tail of x. The T increments can also be tiny near x = 1, where the CDF is near 1
+    // and the series is sound.
+    if nc > 0.0 && ip0.is_finite() && iq0.is_finite() && ip0.min(iq0) < NCT_ANCHOR_FLOOR {
+        return nct_far_tail_density(df, nc, -t);
+    }
     // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`). With every anchor
     // zero the series `s` is exactly 0 and the CDF is Φ(−δ).
     if ip0 == 0.0 && iq0 == 0.0 && tp0 == 0.0 && tq0 == 0.0 {
@@ -1837,6 +1847,11 @@ pub fn nctdtrc(df: f64, nc: f64, t: f64) -> f64 {
 /// The share of `1 − nctdtr` below which the `nc < 0` survival leaves the subtraction for the
 /// far-tail quadrature.
 const NCT_FAR_TAIL_SWITCH: f64 = 0.1;
+
+/// An `I_x` mode anchor of [`nctdtr`]'s series below this is within ~1e-28 of the subnormal
+/// range. Past it the anchors no longer carry the series, and `nc > 0` takes the near-tail
+/// quadrature.
+const NCT_ANCHOR_FLOOR: f64 = 1e-280;
 
 /// `P(T > t)` for `t > 0` with `t²` finite: the regime choice of [`nctdtrc`].
 fn nctdtrc_positive_t(df: f64, nc: f64, t: f64) -> f64 {
@@ -1969,6 +1984,9 @@ const NCT_TRAPEZOID_MAX_NODES: usize = 100_000;
 /// `W = e^{−d²/2}·∫ exp(ln df + ln pt(df/2, df·s²/2) + ln(½·erfcx(z/√2)) − dτs − (τs)²/2) du`,
 /// with `pt` the Poisson term (the density of `V = df·S²` in Loader's form), and `Φ(−z)` written
 /// as `½·erfcx(z/√2)·e^{−z²/2}` so that `e^{−d²/2}` comes out exactly.
+///
+/// `W = P(T ≤ −τ)` holds for `τ` of either sign. [`nctdtr`] also calls it with `τ = −t < 0` for
+/// the near tail `P(T ≤ t)` at large `d`.
 fn nct_far_tail_density(df: f64, d: f64, tau: f64) -> f64 {
     use crate::convenience::erfcx_scalar;
     use std::f64::consts::FRAC_1_SQRT_2;
@@ -1989,14 +2007,29 @@ fn nct_far_tail_density(df: f64, d: f64, tau: f64) -> f64 {
             - d * ts
             - 0.5 * ts * ts
     };
-    // l′(u) = df·(1 − s²) − τs·M(d + τs), M the inverse Mills ratio; decreasing in u.
+    // l′(u) = df·(1 − s²) − τs·M(d + τs), M the inverse Mills ratio. It is decreasing in u for
+    // τ > 0. For either sign it changes sign once: the integrand is log-concave in s, since
+    // ln f_S(s) and ln Φ(−d − τs) both are, so it has a single peak.
     let slope = |u: f64| {
         let s = u.exp();
         df * (1.0 - s * s) - tau * s * mills(d + tau * s)
     };
-    // l′(0) < 0, and l′ > 0 at s_lo (M(z) < z + 1).
-    let s_lo = 0.5_f64.min(1.5 * df / (tau * ((d + 1.0) + ((d + 1.0).powi(2) + 3.0 * df).sqrt())));
-    let us = nct_peak_bisect(slope, s_lo.ln(), 0.0);
+    let (u_lo, u_hi) = if tau > 0.0 {
+        // l′(0) < 0, and l′ > 0 at s_lo (M(z) < z + 1).
+        let s_lo =
+            0.5_f64.min(1.5 * df / (tau * ((d + 1.0) + ((d + 1.0).powi(2) + 3.0 * df).sqrt())));
+        (s_lo.ln(), 0.0)
+    } else {
+        // τ ≤ 0, the near tail P(T ≤ |τ|) (frankenscipy-k5qew): l′(0) = −τ·M(d + τ) ≥ 0, and
+        // since z = d + τs ≤ d and M(z) < max(z, 0) + 1 ≤ d + 1, l′ < 0 past the positive root
+        // s_hi of df·s² − |τ|(d + 1)·s − df. The integrand is not log-concave for s below
+        // |τ|d/(2(df + τ²)), but that stretch lies left of the single peak and, for the large d
+        // this path serves, some 1e-16 below it.
+        let pull = -tau * (d + 1.0);
+        let s_hi = (pull + (pull * pull + 4.0 * df * df).sqrt()) / (2.0 * df);
+        (0.0, s_hi.ln())
+    };
+    let us = nct_peak_bisect(slope, u_lo, u_hi);
     let s = us.exp();
     let z = d + tau * s;
     let m = mills(z);
@@ -6170,6 +6203,44 @@ mod tests {
         assert_eq!(nctdtrc(5.0, 3.0, f64::INFINITY), 0.0);
         assert_eq!(nctdtrc(5.0, 3.0, f64::NEG_INFINITY), 1.0);
         assert!(nctdtrc(5.0, f64::INFINITY, 1.0).is_nan() && nctdtrc(0.0, 1.0, 1.0).is_nan());
+    }
+
+    /// frankenscipy-k5qew. At t ≥ 0 with a large δ the CDF sits in the near tail, carried by
+    /// Poisson terms far below the mode. The mode anchors I_x(j₀ + ½, df/2) underflowed and the
+    /// series returned 0 on the first three rows. Expected values are mpmath quadrature of
+    /// E[Φ(tS − δ)] over ±12σ of its peak. The first three are at 50 digits in s and agree with a
+    /// 30-digit integral in u = ln s to 2e-14 (scratchpad nct_tail/k5qew_check.py and
+    /// k5qew_refs.py). SciPy 1.17.1 is right on rows 2, 4, 5 and 6, to within 5e-14. It is wrong
+    /// on the first (1.08e-169) and NaN on the third. Reaching 1e-12 on the third also needed
+    /// `erfcx` past 25: its three-term asymptotic series was 7e-9 off there.
+    #[test]
+    fn nctdtr_near_tail_at_large_nc_is_the_positive_integral() {
+        let rows = [
+            (5.0, 40.0, 1.0, 1.088_713_133_218_302_8e-287),
+            (30.0, 40.0, 3.0, 1.176_600_867_542_950_8e-248),
+            (200.0, 40.0, 3.0, 6.432_996_433_288_180_2e-293),
+            (12.0, 30.0, 2.0, 6.089_730_487_572_389e-140),
+            (3.0, 38.0, 4.0, 3.154_636_090_766_829e-49),
+            (50.0, 35.0, 1.5, 2.804_113_539_323_231e-240),
+        ];
+        for (df, nc, t, want) in rows {
+            let got = nctdtr(df, nc, t);
+            assert!(
+                (got - want).abs() <= 1e-12 * want,
+                "nctdtr({df}, {nc}, {t}) = {got:e}, mpmath {want:e}"
+            );
+        }
+        // The series still carries the bulk: SciPy 1.17.1 values, unchanged.
+        for (df, nc, t, want) in [
+            (5.0, 3.0, 3.0, 0.450_144_569_699_377_55),
+            (10.0, 20.0, 12.0, 0.003_042_353_990_182_597_6),
+        ] {
+            let got = nctdtr(df, nc, t);
+            assert!(
+                (got - want).abs() <= 1e-13 * want,
+                "nctdtr({df}, {nc}, {t}) = {got}, SciPy {want}"
+            );
+        }
     }
 
     /// frankenscipy-g9yid, item 2. The noncentral walks start from terms at the Poisson mode:

@@ -5558,10 +5558,19 @@ pub fn erfcx_scalar(x: f64) -> f64 {
         // directly — no exp(x²)·exp(−x²) round-trip (~2× faster, more accurate).
         crate::error::erfcx_cephes_real(x)
     } else {
-        // Asymptotic: erfcx(x) ≈ 1/(x√π) * (1 - 1/(2x²) + 3/(4x⁴) - ...)
+        // Asymptotic series erfcx(x) = 1/(x√π)·Σ_k (−1)^k·(2k−1)!!/(2x²)^k. From x = 25 each
+        // term is at most (2k+1)/1250 of the one before, so eight terms reach ε: the ninth is
+        // 5e-21 of the sum. Three terms stopped at 15/(8x⁶), 7.7e-9 at x = 25
+        // (frankenscipy-k5qew).
         let inv_x = 1.0 / x;
-        let inv_x2 = inv_x * inv_x;
-        inv_x / std::f64::consts::PI.sqrt() * (1.0 - 0.5 * inv_x2 + 0.75 * inv_x2 * inv_x2)
+        let t = 0.5 * inv_x * inv_x;
+        let mut term = 1.0_f64;
+        let mut sum = 1.0_f64;
+        for k in 1..=8_u32 {
+            term *= -f64::from(2 * k - 1) * t;
+            sum += term;
+        }
+        inv_x / std::f64::consts::PI.sqrt() * sum
     }
 }
 
@@ -12747,13 +12756,32 @@ mod tests {
     }
 
     #[test]
-    fn erfcx_large_x_uses_stable_asymptotic_path() -> Result<(), String> {
-        let result = erfcx(&SpecialTensor::RealScalar(30.0), RuntimeMode::Strict)
-            .map_err(|err| err.to_string())?;
-        let value = expect_real_scalar(result)?;
-        let expected = erfcx_scalar(30.0);
-        assert!(value.is_finite());
-        assert!((value - expected).abs() < 1e-16);
+    fn erfcx_large_x_asymptotic_series_matches_scipy() -> Result<(), String> {
+        // scipy.special.erfcx 1.17.1, each within 2e-16 of mpmath at 40 digits. The x ≥ 25
+        // branch was a three-term series and missed these by 7.7e-9 at x = 25 and 6.8e-9 at
+        // 25.5 (frankenscipy-k5qew). This test used to compare erfcx with erfcx_scalar, which
+        // could not see that.
+        for (x, want) in [
+            (24.999, 0.022_550_473_014_042_085),
+            (25.0, 0.022_549_572_432_641_357),
+            (25.5, 0.022_108_108_052_519_827),
+            (26.0, 0.021_683_584_850_562_91),
+            (30.0, 0.018_795_888_861_416_754),
+            (40.0, 0.014_100_335_983_377_815),
+            (50.0, 0.011_281_536_265_323_772),
+            (100.0, 0.005_641_613_782_989_433),
+            (1e3, 0.000_564_189_301_453_387_6),
+            (1e8, 5.641_895_835_477_563e-9),
+            (1e150, 5.641_895_835_477_563e-151),
+        ] {
+            let result = erfcx(&SpecialTensor::RealScalar(x), RuntimeMode::Strict)
+                .map_err(|err| err.to_string())?;
+            let value = expect_real_scalar(result)?;
+            assert!(
+                (value - want).abs() <= 1e-15 * want,
+                "erfcx({x}) = {value}, SciPy {want}"
+            );
+        }
         Ok(())
     }
 
