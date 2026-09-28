@@ -64,6 +64,8 @@ rand = "0.10.2"
 toml = "1.1.6"
 npyz = "0.9.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# Pure safe-Rust zlib for MAT-file miCOMPRESSED elements (fsci-io); already in the tree via zip.
+miniz_oxide = "0.8.9"
 # ══════════════════════════════════════════════════════════════════════════════
 # Release profile (the AGENTS.md / README documented spec — frankenscipy-jky37)
 # ══════════════════════════════════════════════════════════════════════════════

@@ -102,7 +102,10 @@ use fsci_interpolate::{
     BSpline, CubicSplineStandalone, Interp1d, Interp1dOptions, InterpKind as FsciInterpKind,
     RegularGridInterpolator, RegularGridMethod as FsciRegularGridMethod, SplineBc as FsciSplineBc,
 };
-use fsci_io::{MatArray, loadmat, loadtxt, mmread, mmwrite, savemat, savetxt, wav_read, wav_write};
+use fsci_io::{
+    LoadmatOptions, MatFile, MatFormat, MatNumeric, MatValue, SavematOptions, loadmat, loadtxt,
+    mmread, mmwrite, savemat, savetxt, wav_read, wav_write,
+};
 use fsci_linalg::{
     DecompOptions, InvOptions, LinalgError, LstsqDriver, LstsqOptions, MatrixAssumption,
     PinvOptions, SolveOptions, TriangularSolveOptions, TriangularTranspose, cholesky, det,
@@ -12685,12 +12688,21 @@ fn decode_io_hex_bytes(content_hex: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn first_mat_array_as_matrix(arrays: Vec<MatArray>) -> Result<(usize, usize, Vec<f64>), String> {
-    let first = arrays
+/// The first variable of a MAT file as a row-major real matrix, the shape the io fixtures and
+/// the SciPy oracle's `_matrix_payload` compare.
+fn first_mat_array_as_matrix(file: MatFile) -> Result<(usize, usize, Vec<f64>), String> {
+    let (_, first) = file
+        .variables
         .into_iter()
         .next()
         .ok_or_else(|| "MAT file did not contain any arrays".to_owned())?;
-    Ok((first.rows, first.cols, first.data))
+    match first {
+        MatValue::Numeric(numeric) => numeric.to_row_major_f64().map_err(|e| e.to_string()),
+        other => Err(format!(
+            "first MAT variable is a {} array, not a numeric matrix",
+            other.class_name()
+        )),
+    }
 }
 
 fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
@@ -12716,7 +12728,9 @@ fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
         IoCase::Loadmat { content_hex, .. } => {
             match decode_io_hex_bytes(content_hex)
                 .map_err(|error| error.to_string())
-                .and_then(|bytes| loadmat(&bytes).map_err(|error| error.to_string()))
+                .and_then(|bytes| {
+                    loadmat(&bytes, &LoadmatOptions::default()).map_err(|error| error.to_string())
+                })
                 .and_then(first_mat_array_as_matrix)
             {
                 Ok((rows, cols, values)) => IoObservedOutcome::Matrix { rows, cols, values },
@@ -12730,14 +12744,14 @@ fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
             data,
             ..
         } => {
-            let array = MatArray {
-                name: name.clone(),
-                rows: *rows,
-                cols: *cols,
-                data: data.clone(),
+            // The oracle writes these with `format="4"`.
+            let options = SavematOptions {
+                format: MatFormat::V4,
+                ..SavematOptions::default()
             };
-            match savemat(&[array])
-                .and_then(|bytes| loadmat(&bytes))
+            match MatNumeric::from_row_major(*rows, *cols, data)
+                .and_then(|array| savemat(&[(name.clone(), MatValue::Numeric(array))], &options))
+                .and_then(|bytes| loadmat(&bytes, &LoadmatOptions::default()))
                 .map_err(|error| error.to_string())
                 .and_then(first_mat_array_as_matrix)
             {

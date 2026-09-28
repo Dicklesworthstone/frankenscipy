@@ -231,6 +231,7 @@
     "TCK_TOL": 1e-9,
     "VAL_TOL": 1e-9
   },
+  "diff_io_loadmat_corpus.rs": {},
   "diff_linalg.rs": {},
   "diff_linalg_adjugate_cofactor.rs": {
     "ABS_TOL": 1e-9

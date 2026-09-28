@@ -307,7 +307,7 @@
   },
   "scipy.io": {
    "applicable": 14,
-   "compared": 0,
+   "compared": 3,
    "crate": "fsci-io",
    "declared": 14,
    "matched_by": {
@@ -326,15 +326,12 @@
     "FortranFormattingError",
     "hb_read",
     "hb_write",
-    "loadmat",
     "mminfo",
     "mmread",
     "mmwrite",
     "netcdf_file",
     "netcdf_variable",
-    "readsav",
-    "savemat",
-    "whosmat"
+    "readsav"
    ],
    "scipy": 14
   },
@@ -364,12 +361,12 @@
   },
   "scipy.io.matlab": {
    "applicable": 10,
-   "compared": 0,
+   "compared": 4,
    "crate": "fsci-io",
-   "declared": 0,
+   "declared": 3,
    "matched_by": {
-    "case_fold": 0,
-    "exact": 0,
+    "case_fold": 1,
+    "exact": 2,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
@@ -379,16 +376,13 @@
     "MatReadError": "missing: MATLAB read failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
     "MatReadWarning": "missing: no warning channel for recoverable MATLAB read issues (frankenscipy-1ksfv.12)",
     "MatWriteError": "missing: MATLAB write failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
-    "MatWriteWarning": "missing: no warning channel for recoverable MATLAB write issues (frankenscipy-1ksfv.12)",
-    "MatlabFunction": "missing: MATLAB v5 function elements are not modelled (frankenscipy-1ksfv.12)",
-    "MatlabObject": "missing: MATLAB v5 class objects are not modelled (frankenscipy-1ksfv.12)",
-    "MatlabOpaque": "missing: MATLAB v5 opaque elements are not modelled (frankenscipy-1ksfv.12)",
-    "mat_struct": "missing: MATLAB v5 structs as attribute objects (struct_as_record=False) are not modelled (frankenscipy-1ksfv.12)",
-    "matfile_version": "missing: no MAT-file version probe (frankenscipy-1ksfv.12)",
-    "varmats_from_mat": "missing: no per-variable MAT-file splitter (frankenscipy-1ksfv.12)"
+    "MatWriteWarning": "missing: no warning channel for recoverable MATLAB write issues (frankenscipy-1ksfv.12)"
    },
-   "real": 0,
-   "real_not_compared": [],
+   "real": 6,
+   "real_not_compared": [
+    "matfile_version",
+    "varmats_from_mat"
+   ],
    "scipy": 10
   },
   "scipy.io.wavfile": {
@@ -1359,17 +1353,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 841,
-  "declared": 1472,
+  "compared": 848,
+  "declared": 1475,
   "matched_by": {
-   "case_fold": 130,
-   "exact": 1270,
+   "case_fold": 131,
+   "exact": 1272,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1497,
+  "real": 1503,
   "scipy": 1555
  }
 }

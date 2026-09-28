@@ -326,44 +326,23 @@ bead = "frankenscipy-1ksfv.12"
 [[entry]]
 module = "scipy.io.matlab"
 name = "MatlabFunction"
-disposition = "missing"
-reason = "MATLAB v5 function elements are not modelled"
-bead = "frankenscipy-1ksfv.12"
+disposition = "adapted"
+rust = "fsci_io::MatValue::Function"
+reason = "loadmat returns a function handle as MatValue::Function wrapping the struct MATLAB stores for it"
 
 [[entry]]
 module = "scipy.io.matlab"
 name = "MatlabObject"
-disposition = "missing"
-reason = "MATLAB v5 class objects are not modelled"
-bead = "frankenscipy-1ksfv.12"
+disposition = "adapted"
+rust = "fsci_io::MatObject"
+reason = "a MATLAB object is MatObject: its class name and its struct array"
 
 [[entry]]
 module = "scipy.io.matlab"
 name = "MatlabOpaque"
-disposition = "missing"
-reason = "MATLAB v5 opaque elements are not modelled"
-bead = "frankenscipy-1ksfv.12"
-
-[[entry]]
-module = "scipy.io.matlab"
-name = "mat_struct"
-disposition = "missing"
-reason = "MATLAB v5 structs as attribute objects (struct_as_record=False) are not modelled"
-bead = "frankenscipy-1ksfv.12"
-
-[[entry]]
-module = "scipy.io.matlab"
-name = "matfile_version"
-disposition = "missing"
-reason = "no MAT-file version probe"
-bead = "frankenscipy-1ksfv.12"
-
-[[entry]]
-module = "scipy.io.matlab"
-name = "varmats_from_mat"
-disposition = "missing"
-reason = "no per-variable MAT-file splitter"
-bead = "frankenscipy-1ksfv.12"
+disposition = "adapted"
+rust = "fsci_io::MatOpaque"
+reason = "an anonymous function's workspace is MatOpaque: SciPy's three int8 strings and the array"
 
 [[entry]]
 module = "scipy.io.wavfile"

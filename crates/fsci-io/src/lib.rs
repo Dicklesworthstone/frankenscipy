@@ -14,8 +14,9 @@
 //! Input/Output routines for FrankenSciPy.
 //!
 //! Matches `scipy.io` core functions:
-//! - `savemat` / `loadmat` — MATLAB .mat file v4 real double matrix read/write
-//! - `whosmat` — MATLAB variable name, shape, and class inventory
+//! - `loadmat` / `savemat` — MATLAB MAT-files, Level 5 (v6/v7, compressed or not) and Level 4:
+//!   numeric (real, complex, logical, N-D), char, cell, struct, object, sparse, function handles
+//! - `whosmat` / `matfile_version` / `varmats_from_mat` — MAT-file inventory and splitting
 //! - `mmread` / `mmwrite` — Matrix Market format read/write
 //! - `wavfile.read` / `wavfile.write` — WAV audio file read/write
 //! - `netcdf_file` — NetCDF (simplified) read/write
@@ -1326,192 +1327,1029 @@ pub fn wav_write(sample_rate: u32, channels: u16, data: &[f64]) -> Result<Vec<u8
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// MAT-file v4 (simple numeric arrays)
+// MATLAB MAT-files (Level 4 and Level 5): loadmat / savemat / whosmat
 // ══════════════════════════════════════════════════════════════════════
+//
+// A port of SciPy 1.17.1's `scipy.io.matlab` (`_mio.py`, `_mio4.py`, `_mio5.py` and the
+// compiled `_mio5_utils`, `_mio_utils` and `_streams` modules, whose behaviour was pinned
+// against the live interpreter). The reader keeps SciPy's stream semantics: sub-elements are
+// read one after another without trusting the enclosing element's byte count, element padding
+// may be missing at the end of a stream, a zlib stream without its end marker is decoded as far
+// as it goes, and a trailing partial tag or a zero-length top-level element is an error. Where
+// SciPy would build an inconsistent object from a malformed file (a sparse row index outside the
+// matrix, a decreasing column pointer, a negative dimension) or crash on it (an unknown data type
+// code in a numeric element segfaults `read_numeric`), fsci fails closed.
+//
+// Errors: a file SciPy rejects with ValueError, TypeError, OSError, zlib.error,
+// UnicodeDecodeError or MatReadError is `IoError::InvalidFormat` here; the v7.3 (HDF5) format,
+// NotImplementedError in SciPy, is `IoError::UnsupportedFeature`.
 
-/// A named array loaded from a MAT file.
-#[derive(Debug, Clone)]
-pub struct MatArray {
-    pub name: String,
-    pub rows: usize,
-    pub cols: usize,
-    pub data: Vec<f64>,
+/// A MATLAB array class (`mx*_CLASS`), as the array flags of a Level 5 variable store it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MatClass {
+    /// `mxCELL_CLASS` (1).
+    Cell,
+    /// `mxSTRUCT_CLASS` (2).
+    Struct,
+    /// `mxOBJECT_CLASS` (3): a struct with a class name.
+    Object,
+    /// `mxCHAR_CLASS` (4).
+    Char,
+    /// `mxSPARSE_CLASS` (5).
+    Sparse,
+    /// `mxDOUBLE_CLASS` (6).
+    Double,
+    /// `mxSINGLE_CLASS` (7).
+    Single,
+    /// `mxINT8_CLASS` (8).
+    Int8,
+    /// `mxUINT8_CLASS` (9).
+    Uint8,
+    /// `mxINT16_CLASS` (10).
+    Int16,
+    /// `mxUINT16_CLASS` (11).
+    Uint16,
+    /// `mxINT32_CLASS` (12).
+    Int32,
+    /// `mxUINT32_CLASS` (13).
+    Uint32,
+    /// `mxINT64_CLASS` (14).
+    Int64,
+    /// `mxUINT64_CLASS` (15).
+    Uint64,
+    /// `mxFUNCTION_CLASS` (16): a function handle.
+    Function,
+    /// `mxOPAQUE_CLASS` (17): the workspace of an anonymous function.
+    Opaque,
 }
 
-/// One entry returned by [`whosmat`].
+const MAT_CLASSES: [MatClass; 17] = [
+    MatClass::Cell,
+    MatClass::Struct,
+    MatClass::Object,
+    MatClass::Char,
+    MatClass::Sparse,
+    MatClass::Double,
+    MatClass::Single,
+    MatClass::Int8,
+    MatClass::Uint8,
+    MatClass::Int16,
+    MatClass::Uint16,
+    MatClass::Int32,
+    MatClass::Uint32,
+    MatClass::Int64,
+    MatClass::Uint64,
+    MatClass::Function,
+    MatClass::Opaque,
+];
+
+impl MatClass {
+    /// The class code stored in the array flags (`mxCELL_CLASS` = 1 … `mxOPAQUE_CLASS` = 17).
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Cell => 1,
+            Self::Struct => 2,
+            Self::Object => 3,
+            Self::Char => 4,
+            Self::Sparse => 5,
+            Self::Double => 6,
+            Self::Single => 7,
+            Self::Int8 => 8,
+            Self::Uint8 => 9,
+            Self::Int16 => 10,
+            Self::Uint16 => 11,
+            Self::Int32 => 12,
+            Self::Uint32 => 13,
+            Self::Int64 => 14,
+            Self::Uint64 => 15,
+            Self::Function => 16,
+            Self::Opaque => 17,
+        }
+    }
+
+    /// The class of a stored code; `None` for the codes SciPy has no reader for (0 and 18 up).
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<Self> {
+        usize::from(code)
+            .checked_sub(1)
+            .and_then(|index| MAT_CLASSES.get(index).copied())
+    }
+
+    /// SciPy's `mclass_info` name, as [`whosmat`] reports it (`"double"`, `"cell"`, …).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cell => "cell",
+            Self::Struct => "struct",
+            Self::Object => "object",
+            Self::Char => "char",
+            Self::Sparse => "sparse",
+            Self::Double => "double",
+            Self::Single => "single",
+            Self::Int8 => "int8",
+            Self::Uint8 => "uint8",
+            Self::Int16 => "int16",
+            Self::Uint16 => "uint16",
+            Self::Int32 => "int32",
+            Self::Uint32 => "uint32",
+            Self::Int64 => "int64",
+            Self::Uint64 => "uint64",
+            Self::Function => "function",
+            Self::Opaque => "opaque",
+        }
+    }
+
+    /// The dtype of a numeric class, which [`LoadmatOptions::mat_dtype`] casts to.
+    #[must_use]
+    pub const fn numeric_dtype(self) -> Option<MatDtype> {
+        match self {
+            Self::Double => Some(MatDtype::F64),
+            Self::Single => Some(MatDtype::F32),
+            Self::Int8 => Some(MatDtype::I8),
+            Self::Uint8 => Some(MatDtype::U8),
+            Self::Int16 => Some(MatDtype::I16),
+            Self::Uint16 => Some(MatDtype::U16),
+            Self::Int32 => Some(MatDtype::I32),
+            Self::Uint32 => Some(MatDtype::U32),
+            Self::Int64 => Some(MatDtype::I64),
+            Self::Uint64 => Some(MatDtype::U64),
+            _ => None,
+        }
+    }
+}
+
+/// Element type of a [`MatData`] vector; [`MatDtype::name`] is the NumPy dtype SciPy returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MatDtype {
+    F64,
+    F32,
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    Bool,
+}
+
+impl MatDtype {
+    /// NumPy's name for the dtype (`"float64"`, …, `"bool"`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F64 => "float64",
+            Self::F32 => "float32",
+            Self::I8 => "int8",
+            Self::U8 => "uint8",
+            Self::I16 => "int16",
+            Self::U16 => "uint16",
+            Self::I32 => "int32",
+            Self::U32 => "uint32",
+            Self::I64 => "int64",
+            Self::U64 => "uint64",
+            Self::Bool => "bool",
+        }
+    }
+
+    /// Bytes per element.
+    #[must_use]
+    pub const fn item_size(self) -> usize {
+        match self {
+            Self::F64 | Self::I64 | Self::U64 => 8,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::I16 | Self::U16 => 2,
+            Self::I8 | Self::U8 | Self::Bool => 1,
+        }
+    }
+
+    /// The class SciPy writes for data of this dtype: `bool` is a `uint8` array with the
+    /// logical flag set.
+    #[must_use]
+    pub const fn class(self) -> MatClass {
+        match self {
+            Self::F64 => MatClass::Double,
+            Self::F32 => MatClass::Single,
+            Self::I8 => MatClass::Int8,
+            Self::U8 | Self::Bool => MatClass::Uint8,
+            Self::I16 => MatClass::Int16,
+            Self::U16 => MatClass::Uint16,
+            Self::I32 => MatClass::Int32,
+            Self::U32 => MatClass::Uint32,
+            Self::I64 => MatClass::Int64,
+            Self::U64 => MatClass::Uint64,
+        }
+    }
+
+    /// The `mi*` data type a Level 5 writer stores this dtype as (`bool` is stored as bytes).
+    const fn mi_type(self) -> u32 {
+        match self {
+            Self::F64 => MI_DOUBLE,
+            Self::F32 => MI_SINGLE,
+            Self::I8 => MI_INT8,
+            Self::U8 | Self::Bool => MI_UINT8,
+            Self::I16 => MI_INT16,
+            Self::U16 => MI_UINT16,
+            Self::I32 => MI_INT32,
+            Self::U32 => MI_UINT32,
+            Self::I64 => MI_INT64,
+            Self::U64 => MI_UINT64,
+        }
+    }
+
+    /// SciPy's `mdtypes_template`: the dtype a numeric data element of type `mdtype` reads as.
+    /// The three Unicode storage types read as unsigned integers of their code-unit width.
+    const fn from_mi_type(mdtype: u32) -> Option<Self> {
+        match mdtype {
+            MI_INT8 => Some(Self::I8),
+            MI_UINT8 | MI_UTF8 => Some(Self::U8),
+            MI_INT16 => Some(Self::I16),
+            MI_UINT16 | MI_UTF16 => Some(Self::U16),
+            MI_INT32 => Some(Self::I32),
+            MI_UINT32 | MI_UTF32 => Some(Self::U32),
+            MI_SINGLE => Some(Self::F32),
+            MI_DOUBLE => Some(Self::F64),
+            MI_INT64 => Some(Self::I64),
+            MI_UINT64 => Some(Self::U64),
+            _ => None,
+        }
+    }
+}
+
+/// The elements of a MATLAB array, in MATLAB's column-major (Fortran) order.
 ///
-/// The current MAT v4/v5 contract supports full, real `double` matrices, so
-/// `class_name` is always `"double"`. Keeping the class in the result mirrors
-/// SciPy's `(name, shape, data class)` inventory and leaves room for future MAT
-/// classes without changing the function's return shape.
+/// The variant is the dtype SciPy returns. By default that is the type the file STORED the data
+/// in, not the array's class: MATLAB narrows a `double` array of small integers to `uint8` on
+/// disk and SciPy hands back `uint8` (the class stays in [`MatNumeric::class`]). With
+/// [`LoadmatOptions::mat_dtype`] it is the class's dtype. `Bool` appears for logical arrays read
+/// with `mat_dtype` and for logical sparse data that MATLAB stored as one byte per value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatData {
+    F64(Vec<f64>),
+    F32(Vec<f32>),
+    I8(Vec<i8>),
+    U8(Vec<u8>),
+    I16(Vec<i16>),
+    U16(Vec<u16>),
+    I32(Vec<i32>),
+    U32(Vec<u32>),
+    I64(Vec<i64>),
+    U64(Vec<u64>),
+    Bool(Vec<bool>),
+}
+
+/// Evaluate `$body` with `$v` bound to the vector inside any [`MatData`] variant.
+macro_rules! mat_data_each {
+    ($data:expr, $v:ident => $body:expr) => {
+        match $data {
+            MatData::F64($v) => $body,
+            MatData::F32($v) => $body,
+            MatData::I8($v) => $body,
+            MatData::U8($v) => $body,
+            MatData::I16($v) => $body,
+            MatData::U16($v) => $body,
+            MatData::I32($v) => $body,
+            MatData::U32($v) => $body,
+            MatData::I64($v) => $body,
+            MatData::U64($v) => $body,
+            MatData::Bool($v) => $body,
+        }
+    };
+}
+
+/// Build a [`MatData`] of the same variant from `$body`, a vector computed from `$v`.
+macro_rules! mat_data_map {
+    ($data:expr, $v:ident => $body:expr) => {
+        match $data {
+            MatData::F64($v) => MatData::F64($body),
+            MatData::F32($v) => MatData::F32($body),
+            MatData::I8($v) => MatData::I8($body),
+            MatData::U8($v) => MatData::U8($body),
+            MatData::I16($v) => MatData::I16($body),
+            MatData::U16($v) => MatData::U16($body),
+            MatData::I32($v) => MatData::I32($body),
+            MatData::U32($v) => MatData::U32($body),
+            MatData::I64($v) => MatData::I64($body),
+            MatData::U64($v) => MatData::U64($body),
+            MatData::Bool($v) => MatData::Bool($body),
+        }
+    };
+}
+
+/// Every element of `$data` converted to `$t`: integers and bools with `as` (NumPy's wrapping
+/// integer casts), floats through `$from_float`.
+macro_rules! mat_data_cast_vec {
+    ($data:expr, $t:ty, $from_float:path) => {
+        match $data {
+            MatData::F64(v) => v.iter().map(|&x| $from_float(x)).collect::<Vec<$t>>(),
+            MatData::F32(v) => v.iter().map(|&x| $from_float(f64::from(x))).collect(),
+            MatData::I8(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::U8(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::I16(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::U16(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::I32(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::U32(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::I64(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::U64(v) => v.iter().map(|&x| x as $t).collect(),
+            MatData::Bool(v) => v.iter().map(|&x| u8::from(x) as $t).collect(),
+        }
+    };
+}
+
+// Float → integer conversions as NumPy 2.4 performs them on x86-64 for in-range values
+// (truncation toward zero). Out of range and NaN, NumPy's result depends on which of its SIMD
+// or scalar loops ran (the same value gave different integers depending on the array's length),
+// so no single answer is SciPy's; these give the scalar `cvttsd2si` "integer indefinite" value.
+// MATLAB only narrows a class's storage when every value fits, so real files never reach it.
+fn numpy_f64_to_i32(x: f64) -> i32 {
+    if x > -2_147_483_649.0 && x < 2_147_483_648.0 {
+        x as i32
+    } else {
+        i32::MIN
+    }
+}
+
+fn numpy_f64_to_i64(x: f64) -> i64 {
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&x) {
+        x as i64
+    } else {
+        i64::MIN
+    }
+}
+
+fn numpy_f64_to_u64(x: f64) -> u64 {
+    if x >= 9_223_372_036_854_775_808.0 {
+        if x < 18_446_744_073_709_551_616.0 {
+            x as u64
+        } else {
+            0
+        }
+    } else {
+        numpy_f64_to_i64(x) as u64
+    }
+}
+
+fn f64_to_i8(x: f64) -> i8 {
+    numpy_f64_to_i32(x) as i8
+}
+
+fn f64_to_u8(x: f64) -> u8 {
+    numpy_f64_to_i32(x) as u8
+}
+
+fn f64_to_i16(x: f64) -> i16 {
+    numpy_f64_to_i32(x) as i16
+}
+
+fn f64_to_u16(x: f64) -> u16 {
+    numpy_f64_to_i32(x) as u16
+}
+
+fn f64_to_u32(x: f64) -> u32 {
+    numpy_f64_to_i64(x) as u32
+}
+
+fn f64_to_f32(x: f64) -> f32 {
+    x as f32
+}
+
+const fn f64_to_f64(x: f64) -> f64 {
+    x
+}
+
+impl MatData {
+    /// Number of elements.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        mat_data_each!(self, v => v.len())
+    }
+
+    /// Whether there are no elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The element type.
+    #[must_use]
+    pub const fn dtype(&self) -> MatDtype {
+        match self {
+            Self::F64(_) => MatDtype::F64,
+            Self::F32(_) => MatDtype::F32,
+            Self::I8(_) => MatDtype::I8,
+            Self::U8(_) => MatDtype::U8,
+            Self::I16(_) => MatDtype::I16,
+            Self::U16(_) => MatDtype::U16,
+            Self::I32(_) => MatDtype::I32,
+            Self::U32(_) => MatDtype::U32,
+            Self::I64(_) => MatDtype::I64,
+            Self::U64(_) => MatDtype::U64,
+            Self::Bool(_) => MatDtype::Bool,
+        }
+    }
+
+    /// Element `index` as `f64` (64-bit integers round to nearest, `bool` is 0 or 1).
+    #[must_use]
+    pub fn get_f64(&self, index: usize) -> Option<f64> {
+        match self {
+            Self::F64(v) => v.get(index).copied(),
+            Self::F32(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::I8(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::U8(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::I16(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::U16(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::I32(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::U32(v) => v.get(index).map(|&x| f64::from(x)),
+            Self::I64(v) => v.get(index).map(|&x| x as f64),
+            Self::U64(v) => v.get(index).map(|&x| x as f64),
+            Self::Bool(v) => v.get(index).map(|&x| f64::from(u8::from(x))),
+        }
+    }
+
+    /// A copy converted to `dtype` as NumPy's `astype` converts: integers wrap, floats truncate
+    /// toward zero, integer → float rounds to nearest, and anything → `bool` is "nonzero".
+    /// A float outside the target's range or NaN has no single NumPy answer (see
+    /// `numpy_f64_to_i32`); MATLAB never stores one where a cast would meet it.
+    #[must_use]
+    #[allow(clippy::unnecessary_cast)] // the macro casts every variant, including the target's own
+    pub fn cast(&self, dtype: MatDtype) -> Self {
+        match dtype {
+            MatDtype::F64 => Self::F64(mat_data_cast_vec!(self, f64, f64_to_f64)),
+            MatDtype::F32 => Self::F32(mat_data_cast_vec!(self, f32, f64_to_f32)),
+            MatDtype::I8 => Self::I8(mat_data_cast_vec!(self, i8, f64_to_i8)),
+            MatDtype::U8 => Self::U8(mat_data_cast_vec!(self, u8, f64_to_u8)),
+            MatDtype::I16 => Self::I16(mat_data_cast_vec!(self, i16, f64_to_i16)),
+            MatDtype::U16 => Self::U16(mat_data_cast_vec!(self, u16, f64_to_u16)),
+            MatDtype::I32 => Self::I32(mat_data_cast_vec!(self, i32, numpy_f64_to_i32)),
+            MatDtype::U32 => Self::U32(mat_data_cast_vec!(self, u32, f64_to_u32)),
+            MatDtype::I64 => Self::I64(mat_data_cast_vec!(self, i64, numpy_f64_to_i64)),
+            MatDtype::U64 => Self::U64(mat_data_cast_vec!(self, u64, numpy_f64_to_u64)),
+            MatDtype::Bool => Self::Bool(match self {
+                Self::F64(v) => v.iter().map(|&x| x != 0.0).collect(),
+                Self::F32(v) => v.iter().map(|&x| x != 0.0).collect(),
+                Self::I8(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::U8(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::I16(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::U16(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::I32(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::U32(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::I64(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::U64(v) => v.iter().map(|&x| x != 0).collect(),
+                Self::Bool(v) => v.clone(),
+            }),
+        }
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn to_f64_vec(&self) -> Vec<f64> {
+        mat_data_cast_vec!(self, f64, f64_to_f64)
+    }
+
+    /// The first `n` elements (all of them when there are fewer).
+    fn truncated(&self, n: usize) -> Self {
+        mat_data_map!(self, v => v[..n.min(v.len())].to_vec())
+    }
+
+    /// NumPy broadcasting of a one-element vector to `n` elements; any other length is kept.
+    fn broadcast(&self, n: usize) -> Self {
+        mat_data_map!(self, v => if v.len() == 1 { vec![v[0]; n] } else { v.clone() })
+    }
+
+    /// The elements at `order`, in that order.
+    fn gather(&self, order: &[usize]) -> Self {
+        mat_data_map!(self, v => order.iter().map(|&k| v[k]).collect())
+    }
+
+    /// Little-endian bytes as a writer stores them (`bool` as one byte, 0 or 1).
+    fn le_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::F64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::I8(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::U8(v) => v.clone(),
+            Self::I16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::U16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::U32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::I64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::U64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::Bool(v) => v.iter().map(|&x| u8::from(x)).collect(),
+        }
+    }
+}
+
+/// Decode a stored data element: `bytes.len() / item_size` values (a partial trailing element is
+/// dropped, as SciPy's `byte_count // itemsize` drops it).
+fn decode_mat_data(dtype: MatDtype, bytes: &[u8], big_endian: bool) -> MatData {
+    macro_rules! decode {
+        ($variant:ident, $t:ty, $n:literal) => {
+            MatData::$variant(
+                bytes
+                    .as_chunks::<$n>()
+                    .0
+                    .iter()
+                    .map(|&chunk| {
+                        if big_endian {
+                            <$t>::from_be_bytes(chunk)
+                        } else {
+                            <$t>::from_le_bytes(chunk)
+                        }
+                    })
+                    .collect(),
+            )
+        };
+    }
+    match dtype {
+        MatDtype::F64 => decode!(F64, f64, 8),
+        MatDtype::F32 => decode!(F32, f32, 4),
+        MatDtype::I8 => decode!(I8, i8, 1),
+        MatDtype::U8 => MatData::U8(bytes.to_vec()),
+        MatDtype::I16 => decode!(I16, i16, 2),
+        MatDtype::U16 => decode!(U16, u16, 2),
+        MatDtype::I32 => decode!(I32, i32, 4),
+        MatDtype::U32 => decode!(U32, u32, 4),
+        MatDtype::I64 => decode!(I64, i64, 8),
+        MatDtype::U64 => decode!(U64, u64, 8),
+        MatDtype::Bool => MatData::Bool(bytes.iter().map(|&b| b != 0).collect()),
+    }
+}
+
+/// A dense numeric (or logical) MATLAB array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatNumeric {
+    /// MATLAB dimensions (at least two in a file; fewer after [`LoadmatOptions::squeeze_me`]).
+    pub dims: Vec<usize>,
+    /// The array's class; the data may be stored in a narrower type (see [`MatData`]).
+    pub class: MatClass,
+    /// MATLAB's logical flag: SciPy's `bool` dtype under `mat_dtype`, `whosmat`'s `"logical"`.
+    pub logical: bool,
+    /// Real part, column-major, `product(dims)` elements.
+    pub real: MatData,
+    /// Imaginary part for complex arrays. SciPy returns `complex64` when the stored real part
+    /// was 4 bytes wide and `complex128` otherwise, so both parts are `F32` or both are `F64`.
+    pub imag: Option<MatData>,
+}
+
+impl MatNumeric {
+    /// A real array of `real`'s dtype, with the class SciPy writes for that dtype (`bool` data
+    /// is a logical `uint8` array).
+    #[must_use]
+    pub fn new(dims: Vec<usize>, real: MatData) -> Self {
+        let dtype = real.dtype();
+        Self {
+            dims,
+            class: dtype.class(),
+            logical: dtype == MatDtype::Bool,
+            real,
+            imag: None,
+        }
+    }
+
+    /// A complex array with the class of `real`'s dtype.
+    #[must_use]
+    pub fn complex(dims: Vec<usize>, real: MatData, imag: MatData) -> Self {
+        Self {
+            imag: Some(imag),
+            ..Self::new(dims, real)
+        }
+    }
+
+    /// A 2-D `double` array from row-major values, the layout the rest of fsci-io uses.
+    ///
+    /// # Errors
+    /// `IoError::InvalidFormat` when `values.len() != rows * cols`.
+    pub fn from_row_major(rows: usize, cols: usize, values: &[f64]) -> Result<Self, IoError> {
+        let count = checked_matrix_len(rows, cols, "MAT array")?;
+        if values.len() != count {
+            return Err(IoError::InvalidFormat(format!(
+                "a {rows}x{cols} MAT array needs {count} values, got {}",
+                values.len()
+            )));
+        }
+        let mut column_major = vec![0.0; count];
+        for r in 0..rows {
+            for c in 0..cols {
+                column_major[c * rows + r] = values[r * cols + c];
+            }
+        }
+        Ok(Self::new(vec![rows, cols], MatData::F64(column_major)))
+    }
+
+    /// A real 2-D array's `(rows, cols, values)` widened to `f64`, in row-major order.
+    ///
+    /// # Errors
+    /// `IoError::UnsupportedFeature` for a complex array or one that is not 2-D.
+    pub fn to_row_major_f64(&self) -> Result<(usize, usize, Vec<f64>), IoError> {
+        if self.imag.is_some() {
+            return Err(IoError::UnsupportedFeature(
+                "a complex MAT array has no real row-major form".to_string(),
+            ));
+        }
+        let [rows, cols] = self.dims[..] else {
+            return Err(IoError::UnsupportedFeature(format!(
+                "a MAT array with dimensions {:?} is not a 2-D matrix",
+                self.dims
+            )));
+        };
+        let column_major = self.real.to_f64_vec();
+        if column_major.len() != rows * cols {
+            return Err(IoError::InvalidFormat(format!(
+                "a {rows}x{cols} MAT array holds {} values",
+                column_major.len()
+            )));
+        }
+        let mut row_major = vec![0.0; rows * cols];
+        for c in 0..cols {
+            for r in 0..rows {
+                row_major[r * cols + c] = column_major[c * rows + r];
+            }
+        }
+        Ok((rows, cols, row_major))
+    }
+
+    /// SciPy's `mat_dtype` cast: to the class's dtype, or `bool` for a logical array. A complex
+    /// array keeps only its real part (NumPy's `astype` to a real dtype drops the imaginary part,
+    /// and SciPy does exactly that), except that `bool` tests both parts for nonzero.
+    fn into_class_dtype(self) -> Self {
+        let target = if self.logical {
+            Some(MatDtype::Bool)
+        } else {
+            self.class.numeric_dtype()
+        };
+        let Some(target) = target else {
+            return self;
+        };
+        let real = match (&self.imag, target) {
+            (Some(imag), MatDtype::Bool) => MatData::Bool(
+                (0..self.real.len())
+                    .map(|i| {
+                        self.real.get_f64(i).is_some_and(|x| x != 0.0)
+                            || imag.get_f64(i).is_some_and(|x| x != 0.0)
+                    })
+                    .collect(),
+            ),
+            _ => self.real.cast(target),
+        };
+        Self {
+            dims: self.dims,
+            class: self.class,
+            logical: self.logical,
+            real,
+            imag: None,
+        }
+    }
+}
+
+/// A MATLAB char array, one Unicode character per element (SciPy's `U1` array, as returned
+/// with `chars_as_strings = false`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatChar {
+    /// MATLAB dimensions.
+    pub dims: Vec<usize>,
+    /// Characters in column-major order.
+    pub chars: Vec<char>,
+}
+
+impl MatChar {
+    /// A 1×n char row holding `text`.
+    #[must_use]
+    pub fn row(text: &str) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        Self {
+            dims: vec![1, chars.len()],
+            chars,
+        }
+    }
+
+    /// SciPy's `chars_to_strings`: the last dimension becomes the characters of each string.
+    fn into_strings(self) -> MatStrings {
+        let Some((&width, prefix)) = self.dims.split_last() else {
+            // A char array with no dimensions at all holds one character.
+            return MatStrings {
+                dims: Vec::new(),
+                width: 1,
+                strings: self
+                    .chars
+                    .iter()
+                    .map(|c| c.to_string().trim_end_matches('\0').to_string())
+                    .collect(),
+            };
+        };
+        if width == 0 {
+            let mut dims = prefix[..prefix.len().saturating_sub(1)].to_vec();
+            dims.push(0);
+            return MatStrings {
+                dims,
+                width: 1,
+                strings: Vec::new(),
+            };
+        }
+        let count = self.chars.len() / width;
+        let strings = (0..count)
+            .map(|i| {
+                let text: String = (0..width).map(|j| self.chars[i + count * j]).collect();
+                text.trim_end_matches('\0').to_string()
+            })
+            .collect();
+        MatStrings {
+            dims: prefix.to_vec(),
+            width,
+            strings,
+        }
+    }
+}
+
+/// A char array read with `chars_as_strings` (SciPy's default): an array of strings over all
+/// but the last MATLAB dimension, each holding the characters along the last one. Trailing NUL
+/// characters are not part of a string, as in NumPy's `U` dtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatStrings {
+    /// Dimensions of the string array (the char array's without its last).
+    pub dims: Vec<usize>,
+    /// Characters per string: the char array's last dimension (`U<width>` in NumPy; 1 when that
+    /// dimension is 0).
+    pub width: usize,
+    /// Strings in column-major order.
+    pub strings: Vec<String>,
+}
+
+/// A MATLAB cell array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatCell {
+    /// MATLAB dimensions.
+    pub dims: Vec<usize>,
+    /// Elements in column-major order.
+    pub items: Vec<MatValue>,
+}
+
+/// A MATLAB struct array (SciPy's `mat_struct`, or a record array under the default
+/// `struct_as_record`: both hold these dimensions, field names and values).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatStruct {
+    /// MATLAB dimensions.
+    pub dims: Vec<usize>,
+    /// Field names in file order. Repeated names are renamed as SciPy renames them: the second
+    /// `x` is `_1_x`, the third `_2_x`.
+    pub field_names: Vec<String>,
+    /// Field values element by element (column-major), fields in `field_names` order within an
+    /// element: element `e`'s field `f` is `values[e * field_names.len() + f]`.
+    pub values: Vec<MatValue>,
+}
+
+impl MatStruct {
+    /// Field `name` of element `element` (column-major index).
+    #[must_use]
+    pub fn field(&self, element: usize, name: &str) -> Option<&MatValue> {
+        let index = self.field_names.iter().position(|f| f == name)?;
+        self.values.get(
+            element
+                .checked_mul(self.field_names.len())?
+                .checked_add(index)?,
+        )
+    }
+}
+
+/// A MATLAB object (SciPy's `MatlabObject`): a struct array with a class name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatObject {
+    pub class_name: String,
+    pub fields: MatStruct,
+}
+
+/// A MATLAB sparse matrix in compressed-sparse-column form (SciPy's `csc_matrix`; a Level 4
+/// sparse matrix, which SciPy returns as COO, is given in canonical CSC: row indices sorted
+/// within each column and duplicate entries summed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatSparse {
+    pub rows: usize,
+    pub cols: usize,
+    /// MATLAB's logical flag.
+    pub logical: bool,
+    /// Column pointers, `cols + 1` of them.
+    pub indptr: Vec<usize>,
+    /// Row index of each stored entry.
+    pub indices: Vec<usize>,
+    /// Stored values (real part), in the dtype SciPy returns.
+    pub data: MatData,
+    /// Imaginary parts of a complex matrix.
+    pub imag: Option<MatData>,
+}
+
+/// An anonymous function's workspace (SciPy's `MatlabOpaque`): three `int8` strings and an array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatOpaque {
+    pub s0: Vec<u8>,
+    pub s1: Vec<u8>,
+    pub s2: Vec<u8>,
+    pub arr: Box<MatValue>,
+}
+
+/// One MATLAB value, as [`loadmat`] returns it and [`savemat`] writes it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatValue {
+    Numeric(MatNumeric),
+    /// A char array read with `chars_as_strings = false`, or one to write as MATLAB chars.
+    Char(MatChar),
+    /// A char array read with `chars_as_strings = true` (the default), or a NumPy-style string
+    /// array to write as SciPy writes one.
+    Strings(MatStrings),
+    Cell(MatCell),
+    Struct(MatStruct),
+    Object(MatObject),
+    Sparse(MatSparse),
+    /// A function handle (SciPy's `MatlabFunction`) wrapping the struct MATLAB stores for it.
+    Function(Box<MatValue>),
+    Opaque(MatOpaque),
+}
+
+impl MatValue {
+    /// SciPy's class name for the value (`whosmat`'s names, `"logical"` for logical arrays).
+    #[must_use]
+    pub const fn class_name(&self) -> &'static str {
+        match self {
+            Self::Numeric(v) if v.logical => "logical",
+            Self::Numeric(v) => v.class.name(),
+            Self::Char(_) | Self::Strings(_) => "char",
+            Self::Cell(_) => "cell",
+            Self::Struct(_) => "struct",
+            Self::Object(_) => "object",
+            Self::Sparse(v) if v.logical => "logical",
+            Self::Sparse(_) => "sparse",
+            Self::Function(_) => "function",
+            Self::Opaque(_) => "opaque",
+        }
+    }
+
+    /// SciPy's `squeeze_element`: an empty array becomes 1-D of length 0, other arrays lose
+    /// their unit dimensions, and a one-element cell becomes its element (NumPy's `.item()` of
+    /// a 0-d object array).
+    fn squeezed(self) -> Self {
+        fn squeeze(dims: &mut Vec<usize>) {
+            if dims.contains(&0) {
+                *dims = vec![0];
+            } else {
+                dims.retain(|&d| d != 1);
+            }
+        }
+        match self {
+            Self::Numeric(mut v) => {
+                squeeze(&mut v.dims);
+                Self::Numeric(v)
+            }
+            Self::Char(mut v) => {
+                squeeze(&mut v.dims);
+                Self::Char(v)
+            }
+            Self::Strings(mut v) => {
+                squeeze(&mut v.dims);
+                Self::Strings(v)
+            }
+            Self::Struct(mut v) => {
+                squeeze(&mut v.dims);
+                Self::Struct(v)
+            }
+            Self::Object(mut v) => {
+                squeeze(&mut v.fields.dims);
+                Self::Object(v)
+            }
+            Self::Cell(mut v) => {
+                squeeze(&mut v.dims);
+                if v.dims.is_empty()
+                    && v.items.len() == 1
+                    && let Some(item) = v.items.pop()
+                {
+                    item
+                } else {
+                    Self::Cell(v)
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// SciPy's `__header__`, `__version__` and `__globals__` entries of a Level 5 file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatHeader {
+    /// The 116-byte description with leading and trailing spaces, tabs, newlines and NULs removed.
+    pub text: Vec<u8>,
+    /// The version word as `"major.minor"` (`"1.0"`).
+    pub version: String,
+    /// Names of the variables stored with the global flag, in read order.
+    pub globals: Vec<String>,
+}
+
+/// What [`loadmat`] returns: SciPy's result dict, in file order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatFile {
+    /// [`matfile_version`] of the file: `(0, 0)` for Level 4, `(1, 0)` for Level 5.
+    pub version: (u8, u8),
+    /// The file is big-endian. SciPy then returns `>`-ordered dtypes; the values are the same.
+    pub big_endian: bool,
+    /// Level 5 files only.
+    pub header: Option<MatHeader>,
+    /// Variables in file order. A name stored twice keeps its first position and its last value,
+    /// as SciPy's dict does. An unnamed Level 5 variable is `"__function_workspace__"`.
+    pub variables: Vec<(String, MatValue)>,
+}
+
+impl MatFile {
+    /// The variable called `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&MatValue> {
+        self.variables
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value)
+    }
+}
+
+/// One entry of [`whosmat`]: SciPy's `(name, shape, class)` tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatInfo {
     pub name: String,
-    pub shape: (usize, usize),
+    pub shape: Vec<usize>,
+    /// `"double"`, `"logical"`, `"cell"`, … (SciPy's `mclass_info`), or `"unknown"`.
     pub class_name: String,
 }
 
-const MAT4_MI_DOUBLE: i32 = 0;
-const MAT4_MX_FULL_CLASS: i32 = 0;
-const MAT4_MAX_ELEMENTS: usize = 128 * 1024 * 1024;
-
-fn checked_mat_dense_len(rows: usize, cols: usize) -> Result<usize, IoError> {
-    let len = checked_matrix_len(rows, cols, "MAT v4 matrix")?;
-    if len > MAT4_MAX_ELEMENTS {
-        return Err(IoError::InvalidFormat(format!(
-            "MAT v4 matrix dimensions {rows}x{cols} exceed dense read safety bound of {MAT4_MAX_ELEMENTS} elements"
-        )));
-    }
-    Ok(len)
-}
-
-fn validate_mat_array(arr: &MatArray) -> Result<usize, IoError> {
-    if arr.name.is_empty() {
-        return Err(IoError::InvalidFormat(
-            "MAT v4 variable name cannot be empty".to_string(),
-        ));
-    }
-    if arr.name.contains('\0') {
-        return Err(IoError::InvalidFormat(format!(
-            "array name '{}' contains a NUL byte and cannot be encoded safely",
-            arr.name.escape_debug()
-        )));
-    }
-    if arr.name.chars().any(|ch| u32::from(ch) > 0xff) {
-        return Err(IoError::UnsupportedFeature(format!(
-            "array name '{}' is not Latin-1 encodable for MAT v4",
-            arr.name.escape_debug()
-        )));
-    }
-    i32::try_from(arr.rows).map_err(|_| {
-        IoError::InvalidFormat(format!(
-            "array '{}' row count {} exceeds MAT v4 i32 header range",
-            arr.name, arr.rows
-        ))
-    })?;
-    i32::try_from(arr.cols).map_err(|_| {
-        IoError::InvalidFormat(format!(
-            "array '{}' column count {} exceeds MAT v4 i32 header range",
-            arr.name, arr.cols
-        ))
-    })?;
-    let expected_len = checked_mat_dense_len(arr.rows, arr.cols)?;
-    if arr.data.len() != expected_len {
-        return Err(IoError::InvalidFormat(format!(
-            "array '{}' expected {} values but found {}",
-            arr.name,
-            expected_len,
-            arr.data.len()
-        )));
-    }
-    Ok(expected_len)
-}
-
-fn mat4_name_bytes(name: &str) -> Result<Vec<u8>, IoError> {
-    let mut bytes = Vec::with_capacity(name.len() + 1);
-    for ch in name.chars() {
-        if u32::from(ch) > 0xff {
-            return Err(IoError::UnsupportedFeature(format!(
-                "array name '{}' is not Latin-1 encodable for MAT v4",
-                name.escape_debug()
-            )));
-        }
-        bytes.push(ch as u8);
-    }
-    bytes.push(0);
-    Ok(bytes)
-}
-
-fn read_mat4_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32, IoError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| IoError::InvalidFormat(format!("MAT v4 {field} offset overflowed usize")))?;
-    let slice = bytes.get(*offset..end).ok_or_else(|| {
-        IoError::InvalidFormat(format!("truncated MAT v4 header while reading {field}"))
-    })?;
-    *offset = end;
-    Ok(i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-fn read_mat4_f64(bytes: &[u8], offset: &mut usize, name: &str) -> Result<f64, IoError> {
-    let end = offset.checked_add(8).ok_or_else(|| {
-        IoError::InvalidFormat(format!("MAT v4 data offset overflowed for '{name}'"))
-    })?;
-    let slice = bytes.get(*offset..end).ok_or_else(|| {
-        IoError::InvalidFormat(format!("truncated MAT v4 data payload for '{name}'"))
-    })?;
-    *offset = end;
-    Ok(f64::from_le_bytes([
-        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-    ]))
-}
-
-fn mat4_nonnegative_usize(value: i32, field: &str) -> Result<usize, IoError> {
-    if value < 0 {
-        return Err(IoError::InvalidFormat(format!(
-            "MAT v4 {field} cannot be negative: {value}"
-        )));
-    }
-    usize::try_from(value).map_err(|_| {
-        IoError::InvalidFormat(format!(
-            "MAT v4 {field} {value} cannot be represented as usize"
-        ))
-    })
-}
-
-/// Save arrays to MATLAB MAT-file Level 4 bytes.
+/// Options of [`loadmat`] and [`whosmat`], with SciPy's defaults.
 ///
-/// This intentionally supports the SciPy-compatible `format="4"` subset for
-/// full real double matrices. Structs, cells, sparse matrices, complex values,
-/// character arrays, compression, and MAT v5/v7.3 are outside this narrow
-/// contract and fail closed elsewhere.
-pub fn savemat(arrays: &[MatArray]) -> Result<Vec<u8>, IoError> {
-    let mut out = Vec::new();
-    for arr in arrays {
-        validate_mat_array(arr)?;
-        let name = mat4_name_bytes(&arr.name)?;
-        let name_len = i32::try_from(name.len()).map_err(|_| {
-            IoError::InvalidFormat(format!(
-                "array '{}' name length {} exceeds MAT v4 i32 header range",
-                arr.name,
-                name.len()
-            ))
-        })?;
-        let rows = i32::try_from(arr.rows).map_err(|_| {
-            IoError::InvalidFormat(format!(
-                "array '{}' row count {} exceeds MAT v4 i32 header range",
-                arr.name, arr.rows
-            ))
-        })?;
-        let cols = i32::try_from(arr.cols).map_err(|_| {
-            IoError::InvalidFormat(format!(
-                "array '{}' column count {} exceeds MAT v4 i32 header range",
-                arr.name, arr.cols
-            ))
-        })?;
-
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&rows.to_le_bytes());
-        out.extend_from_slice(&cols.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&name_len.to_le_bytes());
-        out.extend_from_slice(&name);
-        for col in 0..arr.cols {
-            for row in 0..arr.rows {
-                out.extend_from_slice(&arr.data[row * arr.cols + col].to_le_bytes());
-            }
-        }
-    }
-    Ok(out)
+/// Not carried over from SciPy: `struct_as_record` (fsci has one struct representation,
+/// [`MatStruct`], holding what either SciPy layout holds: the dimensions, the field names in file
+/// order and every element's values; `simplify_cells` still applies SciPy's non-record
+/// conversions), `matlab_compatible` (it is `squeeze_me = false, chars_as_strings = false,
+/// mat_dtype = true`), `byte_order` (the file's own byte order is used, as SciPy does by
+/// default), `uint16_codec` (SciPy's default, UTF-8, is the codec), and `appendmat` /
+/// `spmatrix` (file-name and Python-type concerns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadmatOptions {
+    /// Return numeric arrays in the dtype of their MATLAB class (`bool` for logical arrays)
+    /// instead of the type the file stored them in. Default `false`.
+    pub mat_dtype: bool,
+    /// Remove unit dimensions: a 1×1 array becomes 0-d and a 1×1 cell becomes its element.
+    /// Default `false`.
+    pub squeeze_me: bool,
+    /// Return char arrays as string arrays ([`MatValue::Strings`]). Default `true`.
+    pub chars_as_strings: bool,
+    /// SciPy's `simplify_cells`: implies `squeeze_me`, turns a 1×1 object into a plain struct,
+    /// and turns 1-D struct arrays and 1-D cells whose first element is a struct into 1-D cells
+    /// of 0-d structs (SciPy's lists of dicts). Level 5 files only, as in SciPy. Default `false`.
+    pub simplify_cells: bool,
+    /// Reject a compressed variable whose decompressed stream holds more than the variable, or
+    /// whose compressed bytes the file does not fully contain. Default `true`.
+    pub verify_compressed_data_integrity: bool,
+    /// Read only these variables (all when `None`).
+    pub variable_names: Option<Vec<String>>,
 }
 
-// --- MATLAB Level-5 (.mat v5) reader ---------------------------------------
-//
-// Supports the SciPy `format="5"` (uncompressed) subset: real, full, 2-D
-// numeric arrays. Complex, sparse, char, cell, struct, object, N-D, and
-// zlib-compressed (miCOMPRESSED) elements fail closed with a clear message.
+impl Default for LoadmatOptions {
+    fn default() -> Self {
+        Self {
+            mat_dtype: false,
+            squeeze_me: false,
+            chars_as_strings: true,
+            simplify_cells: false,
+            verify_compressed_data_integrity: true,
+            variable_names: None,
+        }
+    }
+}
 
-// MAT v5 data element types.
+/// The file format [`savemat`] writes (SciPy's `format`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatFormat {
+    /// MATLAB 4 (`format='4'`): 2-D numeric, char and sparse arrays only.
+    V4,
+    /// MATLAB 5 and up to 7.2 (`format='5'`, SciPy's default).
+    #[default]
+    V5,
+}
+
+/// How [`savemat`] writes an array with fewer than two dimensions (SciPy's `oned_as`): a 0-d
+/// value is 1×1, an empty 1-D array 0×0 and a 1-D array of n elements 1×n (`Row`, SciPy's
+/// default) or n×1 (`Column`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnedAs {
+    #[default]
+    Row,
+    Column,
+}
+
+/// Options of [`savemat`], with SciPy's defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SavematOptions {
+    pub format: MatFormat,
+    /// Allow struct field names of up to 63 characters instead of 31 (MATLAB 7.6+).
+    pub long_field_names: bool,
+    /// Compress each Level 5 variable into an `miCOMPRESSED` element.
+    pub do_compression: bool,
+    pub oned_as: OnedAs,
+}
+
+// Level 5 data-element types (`mi*`).
 const MI_INT8: u32 = 1;
 const MI_UINT8: u32 = 2;
 const MI_INT16: u32 = 3;
@@ -1524,362 +2362,2242 @@ const MI_INT64: u32 = 12;
 const MI_UINT64: u32 = 13;
 const MI_MATRIX: u32 = 14;
 const MI_COMPRESSED: u32 = 15;
+const MI_UTF8: u32 = 16;
+const MI_UTF16: u32 = 17;
+const MI_UTF32: u32 = 18;
 
-/// Read one MAT v5 data element at `off`, returning `(type, payload, next_off)`.
-/// Handles both the standard tag (8-byte header + padded payload) and the
-/// "small element" form (size packed into the upper 16 bits of the tag).
-fn read_v5_element(bytes: &[u8], off: usize) -> Result<(u32, &[u8], usize), IoError> {
-    let head = bytes
-        .get(off..off + 4)
-        .ok_or_else(|| IoError::InvalidFormat("truncated MAT v5 element tag".to_string()))?;
-    let raw = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-    if (raw >> 16) != 0 {
-        // Small-element form: bytes 2..4 hold the size, bytes 0..2 the type.
-        let size = (raw >> 16) as usize;
-        let typ = raw & 0xFFFF;
-        if size > 4 {
+/// Largest dimensions element SciPy reads: `_MAT_MAXDIMS` = 32 `int32` values.
+const MAT5_MAX_DIMS_BYTES: usize = 128;
+/// Bound on arrays whose size comes from a header alone, so a forged header cannot demand an
+/// allocation the file does not pay for (a char array stored with zero bytes is that many spaces,
+/// and a Level 4 sparse matrix's column pointers are sized by its stated column count).
+const MAT_MAX_HEADER_ELEMENTS: usize = 1 << 28;
+/// Bound on one decompressed variable: its `miMATRIX` tag counts bytes in a `u32`.
+const MAT5_MAX_INFLATED_BYTES: usize = (u32::MAX as usize).saturating_add(16);
+/// Deepest nesting of cells, structs and function handles read or written. Every level is a
+/// recursive call, so this keeps a forged file from exhausting the stack; MATLAB data does not
+/// nest anywhere near this deep.
+const MAT_MAX_NESTING: usize = 100;
+
+fn mat_nesting_error() -> IoError {
+    IoError::InvalidFormat(format!(
+        "MAT arrays nest deeper than {MAT_MAX_NESTING} levels"
+    ))
+}
+
+const fn padding8(len: usize) -> usize {
+    (8 - len % 8) % 8
+}
+
+fn element_count(dims: &[usize]) -> Result<usize, IoError> {
+    dims.iter().try_fold(1usize, |count, &d| {
+        count.checked_mul(d).ok_or_else(|| {
+            IoError::InvalidFormat(format!(
+                "MAT dimensions {dims:?} overflow the element count"
+            ))
+        })
+    })
+}
+
+fn latin1_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+fn latin1_bytes(text: &str) -> Result<Vec<u8>, IoError> {
+    text.chars()
+        .map(|ch| {
+            u8::try_from(u32::from(ch)).map_err(|_| {
+                IoError::InvalidFormat(format!(
+                    "'latin-1' codec can't encode character {ch:?} in MAT name {text:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn utf8_name(bytes: &[u8], what: &str) -> Result<String, IoError> {
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| IoError::InvalidFormat(format!("MAT {what} is not valid UTF-8: {e}")))
+}
+
+fn mat73_unsupported() -> IoError {
+    IoError::UnsupportedFeature(
+        "Please use HDF reader for matlab v7.3 files, e.g. h5py".to_string(),
+    )
+}
+
+/// A read position in a MAT byte stream (the file, or one decompressed variable) in the file's
+/// byte order. Reading past the end fails like SciPy's `could not read bytes`; forward skips
+/// (element padding) stop at the end silently, as SciPy's seeks do.
+struct MatStream<'a> {
+    data: &'a [u8],
+    pos: usize,
+    big_endian: bool,
+}
+
+/// The header of a Level 5 matrix (SciPy's `VarHeader5`).
+struct Mat5Header<'a> {
+    class_code: u8,
+    logical: bool,
+    global: bool,
+    complex: bool,
+    /// `None` for an opaque object, which stores neither dimensions nor a name.
+    dims: Option<Vec<i32>>,
+    name: Option<&'a [u8]>,
+}
+
+impl<'a> MatStream<'a> {
+    const fn new(data: &'a [u8], big_endian: bool) -> Self {
+        Self {
+            data,
+            pos: 0,
+            big_endian,
+        }
+    }
+
+    const fn at_end(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    fn read(&mut self, n: usize) -> Result<&'a [u8], IoError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| {
+                IoError::InvalidFormat(format!(
+                    "could not read bytes: {n} needed at offset {} of a {}-byte MAT stream",
+                    self.pos,
+                    self.data.len()
+                ))
+            })?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.data.len());
+    }
+
+    const fn word(&self, bytes: [u8; 4]) -> u32 {
+        if self.big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        }
+    }
+
+    const fn half(&self, bytes: [u8; 2]) -> u16 {
+        if self.big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    }
+
+    fn read_u32(&mut self) -> Result<u32, IoError> {
+        let b = self.read(4)?;
+        Ok(self.word([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Two words, as SciPy's `read_full_tag` reads them (no small-element decoding).
+    fn read_full_tag(&mut self) -> Result<(u32, u32), IoError> {
+        Ok((self.read_u32()?, self.read_u32()?))
+    }
+
+    /// SciPy's `read_element`: a data element's type and payload. A small data element (size in
+    /// the upper half of the first word, at most 4) carries its payload in the tag; a full
+    /// element's payload is followed by padding to 8 bytes, which may be cut off by the end of
+    /// the stream.
+    fn read_element(&mut self) -> Result<(u32, &'a [u8]), IoError> {
+        let tag = self.read(8)?;
+        let word = self.word([tag[0], tag[1], tag[2], tag[3]]);
+        let small = (word >> 16) as usize;
+        if small != 0 {
+            if small > 4 {
+                return Err(IoError::InvalidFormat(format!(
+                    "Error in SDE format data: a small data element claims {small} bytes"
+                )));
+            }
+            return Ok((word & 0xffff, &tag[4..4 + small]));
+        }
+        let count = self.word([tag[4], tag[5], tag[6], tag[7]]) as usize;
+        let payload = self.read(count)?;
+        self.skip(padding8(count));
+        Ok((word, payload))
+    }
+
+    /// SciPy's `read_element_into`: a full element may hold at most `max` bytes.
+    fn read_element_bounded(&mut self, max: usize) -> Result<(u32, &'a [u8]), IoError> {
+        let start = self.pos;
+        let tag = self.read(8)?;
+        let word = self.word([tag[0], tag[1], tag[2], tag[3]]);
+        if word >> 16 == 0 && self.word([tag[4], tag[5], tag[6], tag[7]]) as usize > max {
             return Err(IoError::InvalidFormat(
-                "MAT v5 small element claims size > 4 bytes".to_string(),
+                "Unexpected amount of data to read (malformed input file?)".to_string(),
             ));
         }
-        let payload = bytes
-            .get(off + 4..off + 4 + size)
-            .ok_or_else(|| IoError::InvalidFormat("truncated MAT v5 small element".to_string()))?;
-        Ok((typ, payload, off + 8))
-    } else {
-        let szb = bytes
-            .get(off + 4..off + 8)
-            .ok_or_else(|| IoError::InvalidFormat("truncated MAT v5 element size".to_string()))?;
-        let size = u32::from_le_bytes([szb[0], szb[1], szb[2], szb[3]]) as usize;
-        let data_start = off + 8;
-        let data_end = data_start
-            .checked_add(size)
-            .ok_or_else(|| IoError::InvalidFormat("MAT v5 element size overflow".to_string()))?;
-        let payload = bytes.get(data_start..data_end).ok_or_else(|| {
-            IoError::InvalidFormat("truncated MAT v5 element payload".to_string())
+        self.pos = start;
+        self.read_element()
+    }
+
+    /// SciPy's `read_into_int32s`: `miINT32` values, or `miUINT32` values that are all below 2³¹.
+    fn read_int32s(&mut self, max: usize) -> Result<Vec<i32>, IoError> {
+        let (mdtype, bytes) = self.read_element_bounded(max)?;
+        let unsigned = match mdtype {
+            MI_INT32 => false,
+            MI_UINT32 => true,
+            other => {
+                return Err(IoError::InvalidFormat(format!(
+                    "Expecting miINT32 as data type, got {other}"
+                )));
+            }
+        };
+        let values: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| self.word(chunk) as i32)
+            .collect();
+        if unsigned && values.iter().any(|&v| v < 0) {
+            return Err(IoError::InvalidFormat(
+                "Expecting miINT32, got miUINT32 with negative values".to_string(),
+            ));
+        }
+        Ok(values)
+    }
+
+    /// SciPy's `read_int8_string`: names are `miINT8`, or ASCII-only `miUTF8`.
+    fn read_int8_string(&mut self) -> Result<&'a [u8], IoError> {
+        let (mdtype, bytes) = self.read_element()?;
+        match mdtype {
+            MI_INT8 => Ok(bytes),
+            MI_UTF8 if bytes.is_ascii() => Ok(bytes),
+            MI_UTF8 => Err(IoError::InvalidFormat("Non ascii int8 string".to_string())),
+            other => Err(IoError::InvalidFormat(format!(
+                "Expecting miINT8 as data type, got {other}"
+            ))),
+        }
+    }
+
+    /// SciPy's `read_numeric`: an element in the dtype of its stored type. With `nnz`, a
+    /// multi-byte element whose byte count equals `nnz` is `nnz` bytes of logical values: that is
+    /// how MATLAB stores logical sparse data under an `miDOUBLE` tag. The flag reports that case.
+    fn read_numeric(&mut self, nnz: Option<usize>) -> Result<(MatData, bool), IoError> {
+        let (mdtype, bytes) = self.read_element()?;
+        let dtype = MatDtype::from_mi_type(mdtype).ok_or_else(|| {
+            IoError::InvalidFormat(format!(
+                "MAT data element type {mdtype} is not a numeric type"
+            ))
         })?;
-        // Elements are padded to an 8-byte boundary.
-        let next = (data_end + 7) & !7usize;
-        Ok((raw, payload, next))
+        if dtype.item_size() != 1 && nnz == Some(bytes.len()) {
+            return Ok((MatData::Bool(bytes.iter().map(|&b| b != 0).collect()), true));
+        }
+        Ok((decode_mat_data(dtype, bytes, self.big_endian), false))
+    }
+
+    /// SciPy's `read_header`: the array-flags element (whose tag SciPy does not inspect), then
+    /// dimensions and name for every class except opaque.
+    fn read_matrix_header(&mut self) -> Result<Mat5Header<'a>, IoError> {
+        self.read(8)?;
+        let flags = self.read_u32()?;
+        self.read_u32()?; // nzmax: sparse readers size from the column pointers instead
+        let class_code = (flags & 0xff) as u8;
+        let mut header = Mat5Header {
+            class_code,
+            logical: flags >> 9 & 1 == 1,
+            global: flags >> 10 & 1 == 1,
+            complex: flags >> 11 & 1 == 1,
+            dims: None,
+            name: None,
+        };
+        if class_code != MatClass::Opaque.code() {
+            header.dims = Some(self.read_int32s(MAT5_MAX_DIMS_BYTES)?);
+            header.name = Some(self.read_int8_string()?);
+        }
+        Ok(header)
     }
 }
 
-/// Decode a MAT v5 numeric data element (column-major on disk) DIRECTLY into
-/// fsci's row-major storage, fusing the byte decode and the column→row transpose
-/// into a single pass.
-///
-/// The prior route decoded into a column-major `Vec` and then transposed into a
-/// second `Vec` — for an R×C array that is one full extra allocation plus two
-/// extra passes over R·C·8 bytes. Fusing keeps the disk read sequential (`c`
-/// outer) while writing the transposed position, and drops the intermediate
-/// buffer: measured ~4× faster on a 300000×8 double array (25.8 → 6.4 ms),
-/// byte-identical output. Errors match the previous decode/validate sequence.
-fn decode_v5_numeric_rowmajor(
-    typ: u32,
-    p: &[u8],
-    rows: usize,
-    cols: usize,
-    name: &str,
-) -> Result<Vec<f64>, IoError> {
-    let unit: usize = match typ {
-        MI_DOUBLE | MI_INT64 | MI_UINT64 => 8,
-        MI_SINGLE | MI_INT32 | MI_UINT32 => 4,
-        MI_INT16 | MI_UINT16 => 2,
-        MI_INT8 | MI_UINT8 => 1,
+fn header_dims(header: &Mat5Header<'_>) -> Result<Vec<usize>, IoError> {
+    header
+        .dims
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|&d| {
+            usize::try_from(d).map_err(|_| {
+                IoError::InvalidFormat(format!("MAT array has a negative dimension {d}"))
+            })
+        })
+        .collect()
+}
+
+fn decode_utf16_lossy(bytes: &[u8], big_endian: bool) -> Vec<char> {
+    let (units, rest) = bytes.as_chunks::<2>();
+    let mut chars: Vec<char> = char::decode_utf16(units.iter().map(|&unit| {
+        if big_endian {
+            u16::from_be_bytes(unit)
+        } else {
+            u16::from_le_bytes(unit)
+        }
+    }))
+    .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect();
+    if !rest.is_empty() {
+        chars.push(char::REPLACEMENT_CHARACTER);
+    }
+    chars
+}
+
+fn decode_utf32_lossy(bytes: &[u8], big_endian: bool) -> Vec<char> {
+    let (units, rest) = bytes.as_chunks::<4>();
+    let mut chars: Vec<char> = units
+        .iter()
+        .map(|&unit| {
+            let code = if big_endian {
+                u32::from_be_bytes(unit)
+            } else {
+                u32::from_le_bytes(unit)
+            };
+            char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+        })
+        .collect();
+    if !rest.is_empty() {
+        chars.push(char::REPLACEMENT_CHARACTER);
+    }
+    chars
+}
+
+/// SciPy's `read_char`. The stored type picks the decoding, always with replacement of invalid
+/// sequences: `miUINT16` code units are narrowed to bytes and decoded as UTF-8 (SciPy's
+/// `uint16_codec`, the system default), `miINT8`/`miUINT8` as ASCII, `miUTF8/16/32` as that
+/// encoding. An element with no bytes is `product(dims)` spaces; otherwise the decoded text must
+/// hold at least that many characters, and the rest is ignored.
+fn read_mat5_char(s: &mut MatStream<'_>, header: &Mat5Header<'_>) -> Result<MatChar, IoError> {
+    let dims = header_dims(header)?;
+    let length = element_count(&dims)?;
+    let (mdtype, bytes) = s.read_element()?;
+    if bytes.is_empty() {
+        if length > MAT_MAX_HEADER_ELEMENTS {
+            return Err(IoError::InvalidFormat(format!(
+                "empty char data stands for {length} characters, above the {MAT_MAX_HEADER_ELEMENTS}-element bound"
+            )));
+        }
+        return Ok(MatChar {
+            dims,
+            chars: vec![' '; length],
+        });
+    }
+    let mut chars: Vec<char> = match mdtype {
+        MI_UINT16 => {
+            let need = length
+                .checked_mul(2)
+                .filter(|&need| need <= bytes.len())
+                .ok_or_else(|| {
+                    IoError::InvalidFormat(format!(
+                        "buffer is too small: {} bytes of uint16 char data for {length} characters",
+                        bytes.len()
+                    ))
+                })?;
+            let narrowed: Vec<u8> = bytes[..need]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&unit| s.half(unit) as u8)
+                .collect();
+            String::from_utf8_lossy(&narrowed).chars().collect()
+        }
+        MI_INT8 | MI_UINT8 => bytes
+            .iter()
+            .map(|&b| {
+                if b.is_ascii() {
+                    char::from(b)
+                } else {
+                    char::REPLACEMENT_CHARACTER
+                }
+            })
+            .collect(),
+        MI_UTF8 => String::from_utf8_lossy(bytes).chars().collect(),
+        MI_UTF16 => decode_utf16_lossy(bytes, s.big_endian),
+        MI_UTF32 => decode_utf32_lossy(bytes, s.big_endian),
         other => {
-            return Err(IoError::UnsupportedFeature(format!(
-                "MAT v5 real data element type {other} is not a supported numeric type"
+            return Err(IoError::InvalidFormat(format!(
+                "Type {other} does not appear to be char type"
             )));
         }
     };
-    if !p.len().is_multiple_of(unit) {
+    if chars.len() < length {
         return Err(IoError::InvalidFormat(format!(
-            "MAT v5 numeric payload {} not a multiple of {unit}",
-            p.len()
+            "buffer is too small: char data decodes to {} characters, fewer than the {length} its dimensions hold",
+            chars.len()
         )));
     }
-    let expected = checked_mat_dense_len(rows, cols)?;
-    let count = p.len() / unit;
-    if count != expected {
-        return Err(IoError::InvalidFormat(format!(
-            "MAT v5 array '{name}' has {count} values but dimensions imply {expected}"
-        )));
-    }
+    chars.truncate(length);
+    Ok(MatChar { dims, chars })
+}
 
-    let mut data = vec![0.0f64; expected];
-    // Column-major disk → row-major store: data[r*cols+c] reads the disk element
-    // at linear index (c*rows+r). `c` outer keeps the byte read sequential.
-    macro_rules! fill {
-        ($conv:expr) => {
-            for c in 0..cols {
-                let base = c * rows;
-                for r in 0..rows {
-                    let o = (base + r) * unit;
-                    data[r * cols + c] = $conv(&p[o..o + unit]);
-                }
-            }
+/// SciPy's `read_real_complex`. A complex array's parts are both `float32` when the stored real
+/// part is 4 bytes wide and both `float64` otherwise; a one-element imaginary part broadcasts.
+fn read_mat5_numeric(
+    s: &mut MatStream<'_>,
+    header: &Mat5Header<'_>,
+    class: MatClass,
+) -> Result<MatNumeric, IoError> {
+    let dims = header_dims(header)?;
+    let count = element_count(&dims)?;
+    let (real, imag) = if header.complex {
+        let (real, _) = s.read_numeric(None)?;
+        let (imag, _) = s.read_numeric(None)?;
+        let parts = if real.dtype().item_size() == 4 {
+            MatDtype::F32
+        } else {
+            MatDtype::F64
         };
-    }
-    match typ {
-        MI_DOUBLE => fill!(|b: &[u8]| f64::from_le_bytes(b.try_into().unwrap())),
-        MI_SINGLE => fill!(|b: &[u8]| f32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT8 => fill!(|b: &[u8]| b[0] as i8 as f64),
-        MI_UINT8 => fill!(|b: &[u8]| b[0] as f64),
-        MI_INT16 => fill!(|b: &[u8]| i16::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT16 => fill!(|b: &[u8]| u16::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT32 => fill!(|b: &[u8]| i32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT32 => fill!(|b: &[u8]| u32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT64 => fill!(|b: &[u8]| i64::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT64 => fill!(|b: &[u8]| u64::from_le_bytes(b.try_into().unwrap()) as f64),
-        _ => unreachable!("unit already validated the type set"),
-    }
-    Ok(data)
-}
-
-/// Parse a single `miMATRIX` payload into a [`MatArray`].
-fn parse_v5_matrix(payload: &[u8]) -> Result<MatArray, IoError> {
-    // Sub-element 1: array flags (miUINT32, class + flag bits).
-    let (flag_type, flags, off) = read_v5_element(payload, 0)?;
-    if flag_type != MI_UINT32 || flags.len() < 8 {
-        return Err(IoError::InvalidFormat(
-            "MAT v5 array flags sub-element malformed".to_string(),
-        ));
-    }
-    let class_flags = u32::from_le_bytes([flags[0], flags[1], flags[2], flags[3]]);
-    let class = class_flags & 0xFF;
-    let is_complex = (class_flags & 0x0000_0800) != 0;
-
-    // Sub-element 2: dimensions (miINT32).
-    let (dim_type, dim_bytes, off) = read_v5_element(payload, off)?;
-    if dim_type != MI_INT32 {
-        return Err(IoError::InvalidFormat(
-            "MAT v5 dimensions sub-element must be miINT32".to_string(),
-        ));
-    }
-    let ndim = dim_bytes.len() / 4;
-    let dims: Vec<i64> = dim_bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&b| i32::from_le_bytes(b) as i64)
-        .collect();
-
-    // Sub-element 3: array name (miINT8), trimmed at the first NUL.
-    let (_name_type, name_bytes, off) = read_v5_element(payload, off)?;
-    let name: String = name_bytes
-        .iter()
-        .take_while(|&&b| b != 0)
-        .map(|&b| char::from(b))
-        .collect();
-
-    // Fail closed on everything outside the real-full-2D-numeric contract.
-    if is_complex {
-        return Err(IoError::UnsupportedFeature(format!(
-            "MAT v5 complex array '{name}' is not supported"
-        )));
-    }
-    // Numeric classes are mxDOUBLE(6)..=mxUINT64(15); 1..=5 are
-    // cell/struct/object/char/sparse.
-    if !(6..=15).contains(&class) {
-        return Err(IoError::UnsupportedFeature(format!(
-            "MAT v5 array '{name}' has unsupported class {class} (cell/struct/char/sparse/object)"
-        )));
-    }
-    if ndim != 2 {
-        return Err(IoError::UnsupportedFeature(format!(
-            "MAT v5 array '{name}' is {ndim}-D; only 2-D arrays are supported"
-        )));
-    }
-    let rows = mat5_dim_usize(dims[0], &name)?;
-    let cols = mat5_dim_usize(dims[1], &name)?;
-
-    // Sub-element 4: real part (column-major on disk). Decode + transpose into
-    // fsci's row-major storage in a single fused pass (no intermediate buffer).
-    let (real_type, real_bytes, _) = read_v5_element(payload, off)?;
-    let data = decode_v5_numeric_rowmajor(real_type, real_bytes, rows, cols, &name)?;
-    Ok(MatArray {
-        name,
-        rows,
-        cols,
-        data,
-    })
-}
-
-fn mat5_dim_usize(value: i64, name: &str) -> Result<usize, IoError> {
-    usize::try_from(value).map_err(|_| {
-        IoError::InvalidFormat(format!(
-            "MAT v5 array '{name}' has invalid dimension {value}"
-        ))
-    })
-}
-
-/// Load arrays from MATLAB Level-5 (.mat v5) bytes (uncompressed, real, full,
-/// 2-D numeric arrays — the SciPy `format="5"` default subset).
-fn loadmat_v5(bytes: &[u8]) -> Result<Vec<MatArray>, IoError> {
-    if bytes.len() < 128 {
-        return Err(IoError::InvalidFormat(
-            "MAT v5 file shorter than its 128-byte header".to_string(),
-        ));
-    }
-    // Endian indicator: "IM" on disk == little-endian (no swap); "MI" == big.
-    match &bytes[126..128] {
-        b"IM" => {}
-        b"MI" => {
-            return Err(IoError::UnsupportedFeature(
-                "big-endian MAT v5 files are not supported".to_string(),
-            ));
-        }
-        other => {
+        if imag.len() != real.len() && imag.len() != 1 {
             return Err(IoError::InvalidFormat(format!(
-                "MAT v5 endian indicator {other:?} is not 'IM' or 'MI'"
+                "could not broadcast an imaginary part of {} values into {} real values",
+                imag.len(),
+                real.len()
             )));
         }
+        let n = real.len();
+        (real.cast(parts), Some(imag.cast(parts).broadcast(n)))
+    } else {
+        (s.read_numeric(None)?.0, None)
+    };
+    if real.len() != count {
+        return Err(IoError::InvalidFormat(format!(
+            "cannot reshape array of size {} into shape {dims:?}",
+            real.len()
+        )));
+    }
+    Ok(MatNumeric {
+        dims,
+        class,
+        logical: header.logical,
+        real,
+        imag,
+    })
+}
+
+/// Stored sparse indices as `usize`; SciPy's constructor casts float indices by truncation.
+fn sparse_index_values(data: &MatData, what: &str) -> Result<Vec<usize>, IoError> {
+    (0..data.len())
+        .map(|i| {
+            let value = data.get_f64(i).unwrap_or(f64::NAN).trunc();
+            if (0.0..9_007_199_254_740_992.0).contains(&value) {
+                Ok(value as usize)
+            } else {
+                Err(IoError::InvalidFormat(format!(
+                    "MAT sparse {what} {value} is not a valid index"
+                )))
+            }
+        })
+        .collect()
+}
+
+/// SciPy's `read_sparse` and the `csc_array` checks it relies on. A complex matrix's parts are
+/// promoted as NumPy promotes `real + imag * 1j`. fsci also rejects what SciPy would turn into
+/// an inconsistent matrix: decreasing column pointers and row indices outside the matrix.
+fn read_mat5_sparse(s: &mut MatStream<'_>, header: &Mat5Header<'_>) -> Result<MatSparse, IoError> {
+    let dims = header_dims(header)?;
+    let (row_data, _) = s.read_numeric(None)?;
+    let (ptr_data, _) = s.read_numeric(None)?;
+    let [rows, cols, ..] = dims[..] else {
+        return Err(IoError::InvalidFormat(format!(
+            "a sparse array needs 2 dimensions, this one has {}",
+            dims.len()
+        )));
+    };
+    let ptr_len = cols
+        .checked_add(1)
+        .ok_or_else(|| IoError::InvalidFormat("sparse column count overflows".to_string()))?;
+    let indptr = sparse_index_values(&ptr_data.truncated(ptr_len), "column pointer")?;
+    if indptr.len() != ptr_len {
+        return Err(IoError::InvalidFormat(format!(
+            "index pointer size {} should be {ptr_len}",
+            indptr.len()
+        )));
+    }
+    let nnz = indptr[cols];
+    let (data, imag) = if header.complex {
+        let (real, real_bytes) = s.read_numeric(Some(nnz))?;
+        let (imag, imag_bytes) = s.read_numeric(Some(nnz))?;
+        if (real_bytes || imag_bytes) && nnz > 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "complex sparse data stored as {nnz} bytes of logical values cannot be combined"
+            )));
+        }
+        let parts = if imag.dtype() == MatDtype::F32
+            && matches!(
+                real.dtype(),
+                MatDtype::F32
+                    | MatDtype::I8
+                    | MatDtype::U8
+                    | MatDtype::I16
+                    | MatDtype::U16
+                    | MatDtype::Bool
+            ) {
+            MatDtype::F32
+        } else {
+            MatDtype::F64
+        };
+        let len = match (real.len(), imag.len()) {
+            (a, b) if a == b => a,
+            (1, b) => b,
+            (a, 1) => a,
+            (a, b) => {
+                return Err(IoError::InvalidFormat(format!(
+                    "operands could not be broadcast together with shapes ({a},) ({b},)"
+                )));
+            }
+        };
+        (
+            real.cast(parts).broadcast(len),
+            Some(imag.cast(parts).broadcast(len)),
+        )
+    } else if header.logical {
+        (s.read_numeric(Some(nnz))?.0, None)
+    } else {
+        (s.read_numeric(None)?.0, None)
+    };
+    let stored = row_data.len().min(nnz);
+    if data.len().min(nnz) != stored {
+        return Err(IoError::InvalidFormat(
+            "indices and data should have the same size".to_string(),
+        ));
+    }
+    if stored < nnz {
+        return Err(IoError::InvalidFormat(
+            "Last value of index pointer should be less than the size of index and data arrays"
+                .to_string(),
+        ));
+    }
+    if indptr[0] != 0 {
+        return Err(IoError::InvalidFormat(
+            "index pointer should start with 0".to_string(),
+        ));
+    }
+    if indptr.windows(2).any(|w| w[0] > w[1]) {
+        return Err(IoError::InvalidFormat(
+            "sparse column pointers decrease".to_string(),
+        ));
+    }
+    let indices = sparse_index_values(&row_data.truncated(nnz), "row index")?;
+    if let Some(&row) = indices.iter().find(|&&row| row >= rows) {
+        return Err(IoError::InvalidFormat(format!(
+            "sparse row index {row} is outside the {rows}-row matrix"
+        )));
+    }
+    Ok(MatSparse {
+        rows,
+        cols,
+        logical: header.logical,
+        indptr,
+        indices,
+        data: data.truncated(nnz),
+        imag: imag.map(|m| m.truncated(nnz)),
+    })
+}
+
+/// SciPy's `cread_fieldnames`: one name length, then names in fixed-width slots. A name runs to
+/// its first NUL even past its slot, as `PyBytes_FromString` reads it; repeated names are
+/// renamed `_1_name`, `_2_name`, … after the first occurrence.
+fn read_mat5_field_names(s: &mut MatStream<'_>) -> Result<Vec<String>, IoError> {
+    let lengths = s.read_int32s(4)?;
+    let [name_length] = lengths[..] else {
+        return Err(IoError::InvalidFormat(
+            "Only one value for namelength".to_string(),
+        ));
+    };
+    let names = s.read_int8_string()?;
+    let width = usize::try_from(name_length)
+        .ok()
+        .filter(|&w| w > 0)
+        .ok_or_else(|| {
+            IoError::InvalidFormat(format!(
+                "struct field name length {name_length} is not positive"
+            ))
+        })?;
+    let count = names.len() / width;
+    let mut fields: Vec<String> = Vec::with_capacity(count);
+    let mut repeats = vec![0usize; count];
+    for i in 0..count {
+        let rest = &names[i * width..];
+        let raw = &rest[..rest.iter().position(|&b| b == 0).unwrap_or(rest.len())];
+        let mut name = utf8_name(raw, "struct field name")?;
+        if let Some(first) = fields.iter().position(|f| *f == name) {
+            repeats[first] += 1;
+            name = format!("_{}_{name}", repeats[first]);
+        }
+        fields.push(name);
+    }
+    Ok(fields)
+}
+
+/// SciPy's per-file read options, as `VarReader5` holds them.
+struct Mat5Reader {
+    mat_dtype: bool,
+    squeeze: bool,
+    chars_as_strings: bool,
+}
+
+impl Mat5Reader {
+    /// SciPy's `array_from_header`. `process` applies `mat_dtype`, `chars_as_strings` and
+    /// `squeeze_me`; sparse matrices, function handles and opaque objects are never processed,
+    /// and the unnamed function workspace is read unprocessed.
+    fn read_array(
+        &self,
+        s: &mut MatStream<'_>,
+        header: &Mat5Header<'_>,
+        process: bool,
+        depth: usize,
+    ) -> Result<MatValue, IoError> {
+        let class = MatClass::from_code(header.class_code).ok_or_else(|| {
+            IoError::InvalidFormat(format!(
+                "MAT array class code {} has no reader",
+                header.class_code
+            ))
+        })?;
+        let mut process = process;
+        let value = match class {
+            MatClass::Double
+            | MatClass::Single
+            | MatClass::Int8
+            | MatClass::Uint8
+            | MatClass::Int16
+            | MatClass::Uint16
+            | MatClass::Int32
+            | MatClass::Uint32
+            | MatClass::Int64
+            | MatClass::Uint64 => {
+                let numeric = read_mat5_numeric(s, header, class)?;
+                MatValue::Numeric(if process && self.mat_dtype {
+                    numeric.into_class_dtype()
+                } else {
+                    numeric
+                })
+            }
+            MatClass::Sparse => {
+                process = false;
+                MatValue::Sparse(read_mat5_sparse(s, header)?)
+            }
+            MatClass::Char => {
+                let chars = read_mat5_char(s, header)?;
+                if process && self.chars_as_strings {
+                    MatValue::Strings(chars.into_strings())
+                } else {
+                    MatValue::Char(chars)
+                }
+            }
+            MatClass::Cell => {
+                let dims = header_dims(header)?;
+                let count = element_count(&dims)?;
+                let mut items = Vec::new();
+                for _ in 0..count {
+                    items.push(self.read_mi_matrix(s, true, depth + 1)?);
+                }
+                MatValue::Cell(MatCell { dims, items })
+            }
+            MatClass::Struct => MatValue::Struct(self.read_struct(s, header, depth)?),
+            MatClass::Object => {
+                let class_name = utf8_name(s.read_int8_string()?, "object class name")?;
+                MatValue::Object(MatObject {
+                    class_name,
+                    fields: self.read_struct(s, header, depth)?,
+                })
+            }
+            MatClass::Function => {
+                process = false;
+                MatValue::Function(Box::new(self.read_mi_matrix(s, true, depth + 1)?))
+            }
+            MatClass::Opaque => {
+                process = false;
+                let s0 = s.read_int8_string()?.to_vec();
+                let s1 = s.read_int8_string()?.to_vec();
+                let s2 = s.read_int8_string()?.to_vec();
+                let arr = Box::new(self.read_mi_matrix(s, true, depth + 1)?);
+                MatValue::Opaque(MatOpaque { s0, s1, s2, arr })
+            }
+        };
+        Ok(if process && self.squeeze {
+            value.squeezed()
+        } else {
+            value
+        })
     }
 
-    let mut arrays = Vec::new();
-    let mut off = 128;
-    while off + 8 <= bytes.len() {
-        let (typ, payload, next) = read_v5_element(bytes, off)?;
-        off = next;
-        match typ {
-            MI_MATRIX => arrays.push(parse_v5_matrix(payload)?),
-            MI_COMPRESSED => {
-                return Err(IoError::UnsupportedFeature(
-                    "MAT v5 compressed elements require zlib inflation; re-save with \
-                     do_compression=False"
-                        .to_string(),
+    /// SciPy's `read_mi_matrix`: a nested matrix. A zero-length one is an empty `double` array.
+    fn read_mi_matrix(
+        &self,
+        s: &mut MatStream<'_>,
+        process: bool,
+        depth: usize,
+    ) -> Result<MatValue, IoError> {
+        if depth > MAT_MAX_NESTING {
+            return Err(mat_nesting_error());
+        }
+        let (mdtype, count) = s.read_full_tag()?;
+        if mdtype != MI_MATRIX {
+            return Err(IoError::InvalidFormat(format!(
+                "Expecting matrix here, got data element type {mdtype}"
+            )));
+        }
+        if count == 0 {
+            let dims = if process && self.squeeze {
+                vec![0]
+            } else {
+                vec![1, 0]
+            };
+            return Ok(MatValue::Numeric(MatNumeric::new(
+                dims,
+                MatData::F64(Vec::new()),
+            )));
+        }
+        let header = s.read_matrix_header()?;
+        self.read_array(s, &header, process, depth)
+    }
+
+    fn read_struct(
+        &self,
+        s: &mut MatStream<'_>,
+        header: &Mat5Header<'_>,
+        depth: usize,
+    ) -> Result<MatStruct, IoError> {
+        let field_names = read_mat5_field_names(s)?;
+        let dims = header_dims(header)?;
+        let count = element_count(&dims)?;
+        let mut values = Vec::new();
+        if !field_names.is_empty() {
+            for _ in 0..count {
+                for _ in 0..field_names.len() {
+                    values.push(self.read_mi_matrix(s, true, depth + 1)?);
+                }
+            }
+        }
+        Ok(MatStruct {
+            dims,
+            field_names,
+            values,
+        })
+    }
+}
+
+/// How a zlib stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflateEnd {
+    /// The stream's end marker and checksum were read.
+    Complete,
+    /// The input ran out first; SciPy's `decompressobj` keeps what it decoded.
+    Truncated,
+    /// Decoding stopped at the output bound.
+    Limited,
+}
+
+/// SciPy's `ZlibInputStream`: inflate a zlib stream, keeping what a truncated stream yields
+/// (some MATLAB files lack a valid end-of-stream marker) and failing on a checksum mismatch or
+/// a corrupt stream as `zlib.error` does.
+fn inflate_zlib(input: &[u8], limit: usize) -> Result<(Vec<u8>, InflateEnd), IoError> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+        | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    let mut out = vec![0u8; input.len().saturating_mul(4).clamp(64, limit.max(64))];
+    let mut decompressor = Box::<DecompressorOxide>::default();
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    loop {
+        let (status, consumed, written) = decompress(
+            &mut decompressor,
+            &input[in_pos..],
+            &mut out,
+            out_pos,
+            flags,
+        );
+        in_pos += consumed;
+        out_pos += written;
+        match status {
+            TINFLStatus::Done => {
+                out.truncate(out_pos);
+                return Ok((out, InflateEnd::Complete));
+            }
+            TINFLStatus::HasMoreOutput => {
+                if out.len() >= limit {
+                    out.truncate(out_pos.min(limit));
+                    return Ok((out, InflateEnd::Limited));
+                }
+                let grown = out.len().saturating_mul(2).min(limit);
+                out.resize(grown, 0);
+            }
+            TINFLStatus::FailedCannotMakeProgress | TINFLStatus::NeedsMoreInput => {
+                out.truncate(out_pos);
+                return Ok((out, InflateEnd::Truncated));
+            }
+            TINFLStatus::Adler32Mismatch => {
+                return Err(IoError::InvalidFormat(
+                    "Error -3 while decompressing data: incorrect data check".to_string(),
                 ));
             }
-            0 => break, // trailing zero padding
-            other => {
-                return Err(IoError::UnsupportedFeature(format!(
-                    "unexpected MAT v5 top-level element type {other}"
+            TINFLStatus::Failed | TINFLStatus::BadParam => {
+                return Err(IoError::InvalidFormat(format!(
+                    "Error while decompressing MAT data: invalid zlib stream ({status:?})"
                 )));
             }
         }
     }
-    Ok(arrays)
 }
 
-/// Load arrays from MATLAB MAT-file Level 4 bytes.
-///
-/// The returned `MatArray::data` uses the same row-major layout as the rest of
-/// `fsci-io`; MAT v4 stores full matrices in column-major order on disk.
-pub fn loadmat(bytes: &[u8]) -> Result<Vec<MatArray>, IoError> {
-    // MATLAB Level-5 files open with the 128-byte text header "MATLAB 5.0 ...".
-    // MAT v4 files instead begin with the small integer `mopt` field, so the
-    // ASCII prefix unambiguously distinguishes the two formats.
-    if bytes.len() >= 128 && bytes.starts_with(b"MATLAB 5.0") {
-        return loadmat_v5(bytes);
+/// Where a top-level Level 5 variable came from.
+struct Mat5Top {
+    /// Byte offset of the variable's top-level tag.
+    start: usize,
+    /// Byte offset where SciPy seeks next: the tag's end plus its byte count, unpadded.
+    next: usize,
+    /// `Some` for an `miCOMPRESSED` element: how its zlib stream ended, and whether the file held
+    /// all the compressed bytes the tag counts.
+    compressed: Option<(InflateEnd, bool)>,
+}
+
+impl Mat5Top {
+    /// SciPy's `verify_compressed_data_integrity` check (`ZlibInputStream.all_data_read`): the
+    /// variable consumed its whole decompressed stream, and every compressed byte was there.
+    fn check_consumed(&self, s: &MatStream<'_>) -> Result<(), IoError> {
+        match self.compressed {
+            Some((end, whole_input))
+                if !whole_input || end == InflateEnd::Limited || !s.at_end() =>
+            {
+                Err(IoError::InvalidFormat(
+                    "Did not fully consume compressed contents of an miCOMPRESSED element. This \
+                     can indicate that the .mat file is corrupted."
+                        .to_string(),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
-    let mut arrays = Vec::new();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let mopt = read_mat4_i32(bytes, &mut offset, "mopt")?;
-        let rows_raw = read_mat4_i32(bytes, &mut offset, "mrows")?;
-        let cols_raw = read_mat4_i32(bytes, &mut offset, "ncols")?;
-        let imagf = read_mat4_i32(bytes, &mut offset, "imagf")?;
-        let name_len_raw = read_mat4_i32(bytes, &mut offset, "namlen")?;
+}
 
-        if !(0..=5000).contains(&mopt) {
-            return Err(IoError::InvalidFormat(format!(
-                "MAT v4 mopt {mopt} is outside the supported header range"
-            )));
-        }
-        let order = mopt / 1000;
-        let after_order = mopt % 1000;
-        let unused = after_order / 100;
-        let after_unused = after_order % 100;
-        let data_type = after_unused / 10;
-        let matrix_class = after_unused % 10;
-        if order != 0 {
-            return Err(IoError::UnsupportedFeature(
-                "MAT v4 big-endian variables are not supported".to_string(),
-            ));
-        }
-        if unused != 0 {
-            return Err(IoError::InvalidFormat(format!(
-                "MAT v4 mopt reserved O field must be 0, got {unused}"
-            )));
-        }
-        if data_type != MAT4_MI_DOUBLE || matrix_class != MAT4_MX_FULL_CLASS {
-            return Err(IoError::UnsupportedFeature(format!(
-                "only MAT v4 full real double matrices are supported (P={data_type}, T={matrix_class})"
-            )));
-        }
-        if imagf != 0 {
-            return Err(IoError::UnsupportedFeature(
-                "MAT v4 complex matrices are not supported".to_string(),
-            ));
-        }
+/// The 128-byte Level 5 file header: byte order, `__header__` text and `__version__`.
+fn read_mat5_file_header(bytes: &[u8]) -> Result<(bool, Vec<u8>, String), IoError> {
+    let head = bytes.get(..128).ok_or_else(|| {
+        IoError::InvalidFormat(format!(
+            "MAT 5 file header is truncated: {} of 128 bytes",
+            bytes.len()
+        ))
+    })?;
+    // SciPy's `guess_byte_order`: anything but "IM" is big-endian.
+    let big_endian = &head[126..128] != b"IM";
+    let is_space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | 0);
+    let description = &head[..116];
+    let first = description.iter().position(|b| !is_space(b)).unwrap_or(116);
+    let last = description
+        .iter()
+        .rposition(|b| !is_space(b))
+        .map_or(first, |i| i + 1);
+    let word = if big_endian {
+        u16::from_be_bytes([head[124], head[125]])
+    } else {
+        u16::from_le_bytes([head[124], head[125]])
+    };
+    Ok((
+        big_endian,
+        description[first..last].to_vec(),
+        format!("{}.{}", word >> 8, word & 0xff),
+    ))
+}
 
-        let rows = mat4_nonnegative_usize(rows_raw, "mrows")?;
-        let cols = mat4_nonnegative_usize(cols_raw, "ncols")?;
-        let name_len = mat4_nonnegative_usize(name_len_raw, "namlen")?;
-        if name_len == 0 {
-            return Err(IoError::InvalidFormat(
-                "MAT v4 variable name length cannot be zero".to_string(),
-            ));
+/// SciPy's `read_var_header` loop over a Level 5 file: for each top-level element, open its
+/// stream (inflating an `miCOMPRESSED` one), read the matrix header, and hand both to `visit`,
+/// which returns whether to go on. An uncompressed variable is read straight from the file
+/// stream, past its own byte count if its elements say so, as SciPy reads it.
+fn for_each_mat5_variable<F>(bytes: &[u8], big_endian: bool, mut visit: F) -> Result<(), IoError>
+where
+    F: for<'s> FnMut(&mut MatStream<'s>, Mat5Header<'s>, &Mat5Top) -> Result<bool, IoError>,
+{
+    let mut pos = 128;
+    while pos < bytes.len() {
+        let mut file = MatStream::new(bytes, big_endian);
+        file.pos = pos;
+        let (mdtype, count) = file.read_full_tag()?;
+        if count == 0 {
+            return Err(IoError::InvalidFormat("Did not read any bytes".to_string()));
         }
-        let name_end = offset.checked_add(name_len).ok_or_else(|| {
-            IoError::InvalidFormat("MAT v4 name offset overflowed usize".to_string())
-        })?;
-        let name_bytes = bytes
-            .get(offset..name_end)
-            .ok_or_else(|| IoError::InvalidFormat("truncated MAT v4 variable name".to_string()))?;
-        offset = name_end;
-        let trimmed_name_len = name_bytes
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(name_bytes.len());
-        if trimmed_name_len == 0 {
-            return Err(IoError::InvalidFormat(
-                "MAT v4 variable name cannot be empty".to_string(),
-            ));
+        let body = file.pos;
+        let next = body.saturating_add(count as usize);
+        let keep_going = if mdtype == MI_COMPRESSED {
+            let end = next.min(bytes.len());
+            let (inflated, how) = inflate_zlib(&bytes[body..end], MAT5_MAX_INFLATED_BYTES)?;
+            let top = Mat5Top {
+                start: pos,
+                next,
+                compressed: Some((how, next <= bytes.len())),
+            };
+            let mut stream = MatStream::new(&inflated, big_endian);
+            let (inner, _) = stream.read_full_tag()?;
+            if inner != MI_MATRIX {
+                return Err(IoError::InvalidFormat(format!(
+                    "Expecting miMATRIX type here, got {inner}"
+                )));
+            }
+            let header = stream.read_matrix_header()?;
+            visit(&mut stream, header, &top)?
+        } else {
+            if mdtype != MI_MATRIX {
+                return Err(IoError::InvalidFormat(format!(
+                    "Expecting miMATRIX type here, got {mdtype}"
+                )));
+            }
+            let top = Mat5Top {
+                start: pos,
+                next,
+                compressed: None,
+            };
+            let header = file.read_matrix_header()?;
+            visit(&mut file, header, &top)?
+        };
+        if !keep_going {
+            break;
         }
-        let name: String = name_bytes[..trimmed_name_len]
-            .iter()
-            .map(|&byte| char::from(byte))
-            .collect();
+        pos = next;
+    }
+    Ok(())
+}
 
-        let expected_len = checked_mat_dense_len(rows, cols)?;
-        let mut data = vec![0.0; expected_len];
-        for col in 0..cols {
-            for row in 0..rows {
-                data[row * cols + col] = read_mat4_f64(bytes, &mut offset, &name)?;
+/// A top-level variable's name as SciPy keys it: Latin-1, `"None"` without a name.
+fn mat5_variable_name(header: &Mat5Header<'_>) -> String {
+    header
+        .name
+        .map_or_else(|| "None".to_string(), latin1_string)
+}
+
+fn loadmat_v5(
+    bytes: &[u8],
+    version: (u8, u8),
+    options: &LoadmatOptions,
+) -> Result<MatFile, IoError> {
+    let (big_endian, text, version_text) = read_mat5_file_header(bytes)?;
+    let reader = Mat5Reader {
+        mat_dtype: options.mat_dtype,
+        squeeze: options.squeeze_me || options.simplify_cells,
+        chars_as_strings: options.chars_as_strings,
+    };
+    let mut wanted = options.variable_names.clone();
+    let mut variables: Vec<(String, MatValue)> = Vec::new();
+    let mut globals = Vec::new();
+    for_each_mat5_variable(bytes, big_endian, |stream, header, top| {
+        let mut name = mat5_variable_name(&header);
+        // An unnamed matrix can only be MATLAB 7's function workspace; SciPy keeps it raw.
+        let process = if name.is_empty() {
+            name = "__function_workspace__".to_string();
+            false
+        } else {
+            true
+        };
+        if let Some(list) = &wanted
+            && !list.contains(&name)
+        {
+            return Ok(true);
+        }
+        let value = reader.read_array(stream, &header, process, 0)?;
+        if options.verify_compressed_data_integrity {
+            top.check_consumed(stream)?;
+        }
+        match variables.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = value,
+            None => variables.push((name.clone(), value)),
+        }
+        if header.global {
+            globals.push(name.clone());
+        }
+        if let Some(list) = &mut wanted
+            && let Some(i) = list.iter().position(|n| *n == name)
+        {
+            list.remove(i);
+            if list.is_empty() {
+                return Ok(false);
             }
         }
-        arrays.push(MatArray {
-            name,
-            rows,
-            cols,
-            data,
-        });
+        Ok(true)
+    })?;
+    if options.simplify_cells {
+        variables = variables
+            .into_iter()
+            .map(|(name, value)| (name, simplify_mat_value(demote_scalar_objects(value))))
+            .collect();
     }
-    Ok(arrays)
+    Ok(MatFile {
+        version,
+        big_endian,
+        header: Some(MatHeader {
+            text,
+            version: version_text,
+            globals,
+        }),
+        variables,
+    })
 }
 
-/// List the variables stored in a MATLAB MAT-file.
+fn whosmat_v5(bytes: &[u8], options: &LoadmatOptions) -> Result<Vec<MatInfo>, IoError> {
+    let (big_endian, _, _) = read_mat5_file_header(bytes)?;
+    let squeeze = options.squeeze_me || options.simplify_cells;
+    let mut out = Vec::new();
+    for_each_mat5_variable(bytes, big_endian, |_, header, _| {
+        let mut name = mat5_variable_name(&header);
+        if name.is_empty() {
+            name = "__function_workspace__".to_string();
+        }
+        if header.dims.is_none() {
+            return Err(IoError::InvalidFormat(format!(
+                "variable '{name}' is an opaque object, which has no dimensions"
+            )));
+        }
+        let mut shape = header_dims(&header)?;
+        if header.class_code == MatClass::Char.code() && options.chars_as_strings {
+            shape.pop();
+        }
+        if squeeze {
+            shape.retain(|&d| d != 1);
+        }
+        let class_name = if header.logical {
+            "logical"
+        } else {
+            MatClass::from_code(header.class_code).map_or("unknown", MatClass::name)
+        };
+        out.push(MatInfo {
+            name,
+            shape,
+            class_name: class_name.to_string(),
+        });
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+// `simplify_cells`. SciPy reads structs as `mat_struct` objects when it is set (it implies
+// `struct_as_record=False` and `squeeze_me=True`), then converts the result dict.
+
+/// Squeezing a 1×1 object array read with `struct_as_record=False` yields the bare `mat_struct`
+/// (NumPy's `.item()` of a 0-d object array): its class name is gone. That happens at every
+/// level, so it is applied to the whole tree.
+fn demote_scalar_objects(value: MatValue) -> MatValue {
+    fn demote_values(mut fields: MatStruct) -> MatStruct {
+        fields.values = fields
+            .values
+            .into_iter()
+            .map(demote_scalar_objects)
+            .collect();
+        fields
+    }
+    match value {
+        MatValue::Object(object) => {
+            let fields = demote_values(object.fields);
+            if fields.dims.is_empty() {
+                MatValue::Struct(fields)
+            } else {
+                MatValue::Object(MatObject {
+                    class_name: object.class_name,
+                    fields,
+                })
+            }
+        }
+        MatValue::Struct(fields) => MatValue::Struct(demote_values(fields)),
+        MatValue::Cell(mut cell) => {
+            cell.items = cell.items.into_iter().map(demote_scalar_objects).collect();
+            MatValue::Cell(cell)
+        }
+        MatValue::Function(inner) => MatValue::Function(Box::new(demote_scalar_objects(*inner))),
+        MatValue::Opaque(mut opaque) => {
+            opaque.arr = Box::new(demote_scalar_objects(*opaque.arr));
+            MatValue::Opaque(opaque)
+        }
+        other => other,
+    }
+}
+
+/// SciPy's `mat_struct`: a single struct (0-d after squeezing). `_matstruct_to_dict` makes it a
+/// dict, which here stays a 0-d [`MatStruct`].
+fn is_mat_struct(value: &MatValue) -> bool {
+    matches!(value, MatValue::Struct(s) if s.dims.is_empty())
+}
+
+/// SciPy's `_has_struct`: a non-empty 1-D array whose first element is a `mat_struct`.
+fn has_mat_struct(value: &MatValue) -> bool {
+    match value {
+        MatValue::Struct(s) => s.dims.len() == 1 && s.dims[0] > 0,
+        MatValue::Object(o) => o.fields.dims.len() == 1 && o.fields.dims[0] > 0,
+        MatValue::Cell(c) => c.dims.len() == 1 && c.items.first().is_some_and(is_mat_struct),
+        _ => false,
+    }
+}
+
+/// The per-value rule shared by `_simplify_cells`, `_matstruct_to_dict` and
+/// `_inspect_cell_array`: a struct becomes a dict (its fields simplified), an array holding
+/// structs becomes a list, anything else is kept as it is.
+fn simplify_mat_value(value: MatValue) -> MatValue {
+    if is_mat_struct(&value) {
+        match value {
+            MatValue::Struct(mut s) => {
+                s.values = s.values.into_iter().map(simplify_mat_value).collect();
+                MatValue::Struct(s)
+            }
+            other => other,
+        }
+    } else if has_mat_struct(&value) {
+        let items: Vec<MatValue> = match value {
+            MatValue::Struct(s) => split_struct_elements(s),
+            MatValue::Object(o) => split_struct_elements(o.fields),
+            MatValue::Cell(c) => c.items,
+            other => return other,
+        };
+        let items: Vec<MatValue> = items.into_iter().map(simplify_mat_value).collect();
+        MatValue::Cell(MatCell {
+            dims: vec![items.len()],
+            items,
+        })
+    } else {
+        value
+    }
+}
+
+/// Each element of a struct array as its own 0-d struct.
+fn split_struct_elements(s: MatStruct) -> Vec<MatValue> {
+    let count = s.dims.iter().product::<usize>();
+    let width = s.field_names.len();
+    let mut values = s.values.into_iter();
+    (0..count)
+        .map(|_| {
+            MatValue::Struct(MatStruct {
+                dims: Vec::new(),
+                field_names: s.field_names.clone(),
+                values: values.by_ref().take(width).collect(),
+            })
+        })
+        .collect()
+}
+
+// Level 4.
+
+/// A Level 4 variable header (SciPy's `VarHeader4`) and where its data lie.
+struct Mat4Header<'a> {
+    name: &'a [u8],
+    dtype: MatDtype,
+    class: i32,
+    rows: usize,
+    cols: usize,
+    complex: bool,
+    data: usize,
+    next: usize,
+}
+
+fn read_mat4_header(bytes: &[u8], pos: usize, big_endian: bool) -> Result<Mat4Header<'_>, IoError> {
+    let head = bytes.get(pos..pos.saturating_add(20)).ok_or_else(|| {
+        IoError::InvalidFormat(format!(
+            "MAT 4 variable header at offset {pos} is truncated"
+        ))
+    })?;
+    let int = |i: usize| {
+        let b = [
+            head[4 * i],
+            head[4 * i + 1],
+            head[4 * i + 2],
+            head[4 * i + 3],
+        ];
+        if big_endian {
+            i32::from_be_bytes(b)
+        } else {
+            i32::from_le_bytes(b)
+        }
+    };
+    let (mopt, mrows, ncols, imagf, namlen) = (int(0), int(1), int(2), int(3), int(4));
+    let namlen = usize::try_from(namlen)
+        .map_err(|_| IoError::InvalidFormat(format!("MAT 4 name length {namlen} is negative")))?;
+    let name_start = pos + 20;
+    let name_end = name_start.saturating_add(namlen).min(bytes.len());
+    let raw = &bytes[name_start..name_end];
+    let first = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
+    let last = raw.iter().rposition(|&b| b != 0).map_or(first, |i| i + 1);
+    if !(0..=5000).contains(&mopt) {
+        return Err(IoError::InvalidFormat(
+            "Mat 4 mopt wrong format, byteswapping problem?".to_string(),
+        ));
+    }
+    // The thousands digit is the variable's byte order; SciPy warns about the VAX and Cray
+    // codes and reads every variable in the order it detected for the file.
+    let rest = mopt % 1000;
+    if rest / 100 != 0 {
+        return Err(IoError::InvalidFormat(
+            "O in MOPT integer should be 0, wrong format?".to_string(),
+        ));
+    }
+    let dtype = match rest % 100 / 10 {
+        0 => MatDtype::F64,
+        1 => MatDtype::F32,
+        2 => MatDtype::I32,
+        3 => MatDtype::I16,
+        4 => MatDtype::U16,
+        5 => MatDtype::U8,
+        p => {
+            return Err(IoError::InvalidFormat(format!(
+                "MAT 4 data type code {p} is not one SciPy reads"
+            )));
+        }
+    };
+    let class = rest % 10;
+    let dim = |value: i32, what: &str| {
+        usize::try_from(value)
+            .map_err(|_| IoError::InvalidFormat(format!("MAT 4 {what} {value} is negative")))
+    };
+    let rows = dim(mrows, "row count")?;
+    let cols = dim(ncols, "column count")?;
+    let complex = imagf == 1;
+    let size = rows
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(dtype.item_size()))
+        .and_then(|n| n.checked_mul(if complex && class != 2 { 2 } else { 1 }))
+        .ok_or_else(|| IoError::InvalidFormat("MAT 4 matrix size overflows".to_string()))?;
+    Ok(Mat4Header {
+        name: &raw[first..last],
+        dtype,
+        class,
+        rows,
+        cols,
+        complex,
+        data: name_end,
+        next: name_end.saturating_add(size),
+    })
+}
+
+/// SciPy's `read_sub_array`: `rows × cols` values of the stored type, starting at `offset`.
+fn mat4_sub_array(
+    bytes: &[u8],
+    header: &Mat4Header<'_>,
+    offset: usize,
+    big_endian: bool,
+) -> Result<MatData, IoError> {
+    let len = header.rows * header.cols * header.dtype.item_size();
+    let raw = offset
+        .checked_add(len)
+        .and_then(|end| bytes.get(offset..end))
+        .ok_or_else(|| {
+            IoError::InvalidFormat(format!(
+                "Not enough bytes to read matrix '{}'; is this a badly-formed file? Consider \
+                 listing matrices with `whosmat` and loading named matrices with \
+                 `variable_names` kwarg to `loadmat`",
+                latin1_string(header.name)
+            ))
+        })?;
+    Ok(decode_mat_data(header.dtype, raw, big_endian))
+}
+
+/// SciPy's Level 4 `read_sparse_array`: an (nnz + 1) × 3 (or × 4, complex) table of 1-based
+/// row and column indices and values, the last row holding the matrix shape. SciPy builds a COO
+/// matrix; this returns its canonical CSC form (what SciPy's `.tocsc()` gives).
+fn read_mat4_sparse(
+    bytes: &[u8],
+    header: &Mat4Header<'_>,
+    big_endian: bool,
+) -> Result<MatSparse, IoError> {
+    let table = mat4_sub_array(bytes, header, header.data, big_endian)?.to_f64_vec();
+    let (height, width) = (header.rows, header.cols);
+    if height == 0 || width < 3 {
+        return Err(IoError::InvalidFormat(format!(
+            "MAT 4 sparse data must be (nnz + 1) x 3 or x 4, found {height} x {width}"
+        )));
+    }
+    let at = |row: usize, col: usize| table[row + height * col];
+    let nnz = height - 1;
+    // The column count sizes the column pointers, so it is bounded like a header-sized array.
+    let dimension = |value: f64, bound: f64| {
+        let t = value.trunc();
+        if (0.0..=bound).contains(&t) {
+            Ok(t as usize)
+        } else {
+            Err(IoError::InvalidFormat(format!(
+                "MAT 4 sparse dimension {value} is not a supported size"
+            )))
+        }
+    };
+    let rows = dimension(at(nnz, 0), 9_007_199_254_740_992.0)?;
+    let cols = dimension(at(nnz, 1), MAT_MAX_HEADER_ELEMENTS as f64)?;
+    let mut entries = Vec::with_capacity(nnz);
+    for k in 0..nnz {
+        let i = i64::from(numpy_f64_to_i32(at(k, 0))) - 1;
+        let j = i64::from(numpy_f64_to_i32(at(k, 1))) - 1;
+        if i < 0 || j < 0 {
+            return Err(IoError::InvalidFormat(
+                "negative row index found".to_string(),
+            ));
+        }
+        let (i, j) = (i as usize, j as usize);
+        if i >= rows || j >= cols {
+            return Err(IoError::InvalidFormat(
+                "row index exceeds matrix dimensions".to_string(),
+            ));
+        }
+        entries.push((j, i, at(k, 2), if width > 3 { at(k, 3) } else { 0.0 }));
+    }
+    entries.sort_by_key(|&(col, row, _, _)| (col, row));
+    let mut indptr = vec![0usize; cols + 1];
+    let (mut indices, mut real, mut imag) = (Vec::new(), Vec::new(), Vec::new());
+    let mut previous = None;
+    for (col, row, re, im) in entries {
+        if previous == Some((col, row))
+            && let (Some(r), Some(m)) = (real.last_mut(), imag.last_mut())
+        {
+            *r += re;
+            *m += im;
+            continue;
+        }
+        previous = Some((col, row));
+        indices.push(row);
+        real.push(re);
+        imag.push(im);
+        indptr[col + 1] += 1;
+    }
+    for c in 0..cols {
+        indptr[c + 1] += indptr[c];
+    }
+    Ok(MatSparse {
+        rows,
+        cols,
+        logical: false,
+        indptr,
+        indices,
+        data: MatData::F64(real),
+        imag: (width > 3).then_some(MatData::F64(imag)),
+    })
+}
+
+fn read_mat4_array(
+    bytes: &[u8],
+    header: &Mat4Header<'_>,
+    big_endian: bool,
+    options: &LoadmatOptions,
+) -> Result<MatValue, IoError> {
+    let dims = vec![header.rows, header.cols];
+    let value = match header.class {
+        0 => {
+            let real = mat4_sub_array(bytes, header, header.data, big_endian)?;
+            let numeric = if header.complex {
+                let offset = header.data + real.len() * header.dtype.item_size();
+                let imag = mat4_sub_array(bytes, header, offset, big_endian)?;
+                // NumPy's `real + imag * 1j`: complex64 for float32 parts, complex128 otherwise.
+                let parts = if header.dtype == MatDtype::F32 {
+                    MatDtype::F32
+                } else {
+                    MatDtype::F64
+                };
+                MatNumeric {
+                    dims,
+                    class: MatClass::Double,
+                    logical: false,
+                    real: real.cast(parts),
+                    imag: Some(imag.cast(parts)),
+                }
+            } else {
+                MatNumeric {
+                    dims,
+                    class: MatClass::Double,
+                    logical: false,
+                    real,
+                    imag: None,
+                }
+            };
+            MatValue::Numeric(numeric)
+        }
+        1 => {
+            let codes = mat4_sub_array(bytes, header, header.data, big_endian)?.cast(MatDtype::U8);
+            let MatData::U8(codes) = codes else {
+                return Err(IoError::InvalidFormat(
+                    "MAT 4 char codes did not convert to bytes".to_string(),
+                ));
+            };
+            let chars = MatChar {
+                dims,
+                chars: codes.iter().map(|&b| char::from(b)).collect(),
+            };
+            if options.chars_as_strings {
+                MatValue::Strings(chars.into_strings())
+            } else {
+                MatValue::Char(chars)
+            }
+        }
+        2 => {
+            return Ok(MatValue::Sparse(read_mat4_sparse(
+                bytes, header, big_endian,
+            )?));
+        }
+        other => {
+            return Err(IoError::InvalidFormat(format!(
+                "No reader for class code {other}"
+            )));
+        }
+    };
+    Ok(if options.squeeze_me || options.simplify_cells {
+        value.squeezed()
+    } else {
+        value
+    })
+}
+
+/// SciPy's `MatFile4Reader.guess_byte_order`: a first `mopt` outside 0..=5000 read
+/// little-endian means the file is big-endian.
+fn mat4_big_endian(bytes: &[u8]) -> bool {
+    let mopt = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    !(0..=5000).contains(&mopt)
+}
+
+fn loadmat_v4(bytes: &[u8], options: &LoadmatOptions) -> Result<MatFile, IoError> {
+    let big_endian = mat4_big_endian(bytes);
+    let mut wanted = options.variable_names.clone();
+    let mut variables: Vec<(String, MatValue)> = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let header = read_mat4_header(bytes, pos, big_endian)?;
+        pos = header.next;
+        let name = latin1_string(header.name);
+        if let Some(list) = &wanted
+            && !list.contains(&name)
+        {
+            continue;
+        }
+        let value = read_mat4_array(bytes, &header, big_endian, options)?;
+        match variables.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = value,
+            None => variables.push((name.clone(), value)),
+        }
+        if let Some(list) = &mut wanted
+            && let Some(i) = list.iter().position(|n| *n == name)
+        {
+            list.remove(i);
+            if list.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(MatFile {
+        version: (0, 0),
+        big_endian,
+        header: None,
+        variables,
+    })
+}
+
+fn whosmat_v4(bytes: &[u8], options: &LoadmatOptions) -> Result<Vec<MatInfo>, IoError> {
+    let big_endian = mat4_big_endian(bytes);
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let header = read_mat4_header(bytes, pos, big_endian)?;
+        pos = header.next;
+        let mut shape = match header.class {
+            0 => vec![header.rows, header.cols],
+            1 => {
+                if options.chars_as_strings {
+                    vec![header.rows]
+                } else {
+                    vec![header.rows, header.cols]
+                }
+            }
+            2 if header.rows >= 1 && header.cols >= 1 => {
+                // SciPy reads just the shape from the table's last row.
+                let size = header.dtype.item_size();
+                let value_at = |index: usize| {
+                    let offset = header.data + index * size;
+                    let raw = bytes.get(offset..offset + size).ok_or_else(|| {
+                        IoError::InvalidFormat(format!(
+                            "buffer is too small for the shape of sparse matrix '{}'",
+                            latin1_string(header.name)
+                        ))
+                    })?;
+                    let value = decode_mat_data(header.dtype, raw, big_endian)
+                        .get_f64(0)
+                        .unwrap_or(f64::NAN)
+                        .trunc();
+                    if value >= 0.0 && value.is_finite() {
+                        Ok(value as usize)
+                    } else {
+                        Err(IoError::InvalidFormat(format!(
+                            "sparse matrix '{}' has shape entry {value}",
+                            latin1_string(header.name)
+                        )))
+                    }
+                };
+                vec![value_at(header.rows - 1)?, value_at(2 * header.rows - 1)?]
+            }
+            2 => Vec::new(),
+            other => {
+                return Err(IoError::InvalidFormat(format!(
+                    "No reader for class code {other}"
+                )));
+            }
+        };
+        if options.squeeze_me || options.simplify_cells {
+            shape.retain(|&d| d != 1);
+        }
+        let class_name = match header.class {
+            0 => "double",
+            1 => "char",
+            _ => "sparse",
+        };
+        out.push(MatInfo {
+            name: latin1_string(header.name),
+            shape,
+            class_name: class_name.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+// Writing.
+
+/// SciPy's `matdims`: the MATLAB dimensions of an array with `dims`.
+fn matlab_dims(dims: &[usize], oned_as: OnedAs) -> Vec<usize> {
+    match *dims {
+        [] => vec![1, 1],
+        [0] => vec![0, 0],
+        [n] => match oned_as {
+            OnedAs::Row => vec![1, n],
+            OnedAs::Column => vec![n, 1],
+        },
+        _ => dims.to_vec(),
+    }
+}
+
+fn check_element_count(len: usize, dims: &[usize], what: &str) -> Result<(), IoError> {
+    let expected = element_count(dims)?;
+    if len == expected {
+        Ok(())
+    } else {
+        Err(IoError::InvalidFormat(format!(
+            "a {what} array with dimensions {dims:?} needs {expected} elements, got {len}"
+        )))
+    }
+}
+
+/// A sparse matrix's structure: `cols + 1` column pointers from 0 to the stored count, never
+/// decreasing, row indices inside the matrix, and data (and imaginary parts) for every entry.
+fn validate_mat_sparse(v: &MatSparse) -> Result<(), IoError> {
+    let nnz = v.indices.len();
+    let pointers_ok = v.cols.checked_add(1) == Some(v.indptr.len())
+        && v.indptr.first() == Some(&0)
+        && v.indptr.last() == Some(&nnz)
+        && v.indptr.windows(2).all(|w| w[0] <= w[1]);
+    if !pointers_ok {
+        return Err(IoError::InvalidFormat(format!(
+            "sparse column pointers must be {} values rising from 0 to the {nnz} stored entries",
+            v.cols.saturating_add(1)
+        )));
+    }
+    if v.data.len() != nnz || v.imag.as_ref().is_some_and(|m| m.len() != nnz) {
+        return Err(IoError::InvalidFormat(format!(
+            "a sparse matrix with {nnz} stored entries has {} values",
+            v.data.len()
+        )));
+    }
+    if let Some(&row) = v.indices.iter().find(|&&row| row >= v.rows) {
+        return Err(IoError::InvalidFormat(format!(
+            "sparse row index {row} is outside the {}-row matrix",
+            v.rows
+        )));
+    }
+    Ok(())
+}
+
+fn index_bytes(values: &[usize]) -> Result<Vec<u8>, IoError> {
+    let mut out = Vec::with_capacity(4 * values.len());
+    for &value in values {
+        let value = i32::try_from(value).map_err(|_| {
+            IoError::InvalidFormat(format!("sparse index {value} does not fit a MAT int32"))
+        })?;
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// SciPy's `write_element`: a payload of at most 4 bytes goes in a small data element, a larger
+/// one in a full element padded to 8 bytes.
+fn write_mat5_element(out: &mut Vec<u8>, mdtype: u32, payload: &[u8]) -> Result<(), IoError> {
+    let count = u32::try_from(payload.len()).map_err(|_| {
+        IoError::InvalidFormat(format!(
+            "a MAT data element of {} bytes exceeds the format's 4 GiB limit",
+            payload.len()
+        ))
+    })?;
+    if count <= 4 {
+        out.extend_from_slice(&((count << 16) | mdtype).to_le_bytes());
+        out.extend_from_slice(payload);
+        out.resize(out.len() + 4 - payload.len(), 0);
+    } else {
+        out.extend_from_slice(&mdtype.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(payload);
+        out.resize(out.len() + padding8(payload.len()), 0);
+    }
+    Ok(())
+}
+
+fn write_mat5_data(out: &mut Vec<u8>, data: &MatData) -> Result<(), IoError> {
+    write_mat5_element(out, data.dtype().mi_type(), &data.le_bytes())
+}
+
+/// SciPy's `write_header`: array flags, dimensions and name.
+fn write_mat5_array_header(
+    out: &mut Vec<u8>,
+    dims: &[usize],
+    class: MatClass,
+    complex: bool,
+    logical: bool,
+    nzmax: u32,
+    name: &[u8],
+) -> Result<(), IoError> {
+    out.extend_from_slice(&MI_UINT32.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+    let flags = u32::from(class.code()) | (u32::from(complex) << 11) | (u32::from(logical) << 9);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&nzmax.to_le_bytes());
+    let mut dim_bytes = Vec::with_capacity(4 * dims.len());
+    for &d in dims {
+        let d = i32::try_from(d).map_err(|_| {
+            IoError::InvalidFormat(format!("MAT dimension {d} does not fit an int32"))
+        })?;
+        dim_bytes.extend_from_slice(&d.to_le_bytes());
+    }
+    write_mat5_element(out, MI_INT32, &dim_bytes)?;
+    write_mat5_element(out, MI_INT8, name)
+}
+
+/// SciPy's `arr_to_chars` for a string array: the char dimensions (the array's, or `[1]` for a
+/// 0-d one, plus the width) and the characters in column-major order, padded with spaces. NUL
+/// characters are written as spaces, as NumPy's empty `U1` elements are. An array of only empty
+/// strings (or none) is SciPy's special case: all-zero dimensions and no characters.
+fn strings_char_matrix(v: &MatStrings) -> Result<(Vec<usize>, Vec<char>), IoError> {
+    check_element_count(v.strings.len(), &v.dims, "string")?;
+    if let Some(long) = v.strings.iter().find(|s| s.chars().count() > v.width) {
+        return Err(IoError::InvalidFormat(format!(
+            "string {long:?} is longer than the string array's width {}",
+            v.width
+        )));
+    }
+    if v.strings.iter().all(String::is_empty) {
+        return Ok((vec![0; v.dims.len().max(2)], Vec::new()));
+    }
+    let mut dims = if v.dims.is_empty() {
+        vec![1]
+    } else {
+        v.dims.clone()
+    };
+    dims.push(v.width);
+    let rows: Vec<Vec<char>> = v.strings.iter().map(|s| s.chars().collect()).collect();
+    let mut chars = Vec::with_capacity(rows.len() * v.width);
+    for k in 0..v.width {
+        for row in &rows {
+            let ch = row.get(k).copied().unwrap_or(' ');
+            chars.push(if ch == '\0' { ' ' } else { ch });
+        }
+    }
+    Ok((dims, chars))
+}
+
+/// SciPy's `VarWriter5`, writing little-endian as SciPy does on this platform.
+struct Mat5Writer {
+    oned_as: OnedAs,
+    long_field_names: bool,
+}
+
+impl Mat5Writer {
+    /// One `miMATRIX` element: tag (byte count patched in at the end), header, contents.
+    fn write_matrix(
+        &self,
+        out: &mut Vec<u8>,
+        value: &MatValue,
+        name: &[u8],
+        depth: usize,
+    ) -> Result<(), IoError> {
+        if depth > MAT_MAX_NESTING {
+            return Err(mat_nesting_error());
+        }
+        let start = out.len();
+        out.extend_from_slice(&[0u8; 8]);
+        match value {
+            MatValue::Numeric(v) => {
+                check_element_count(v.real.len(), &v.dims, "numeric")?;
+                if v.class.numeric_dtype().is_none() {
+                    return Err(IoError::InvalidFormat(format!(
+                        "a numeric array cannot have class {}",
+                        v.class.name()
+                    )));
+                }
+                if let Some(imag) = &v.imag
+                    && imag.len() != v.real.len()
+                {
+                    return Err(IoError::InvalidFormat(format!(
+                        "a complex array has {} real and {} imaginary values",
+                        v.real.len(),
+                        imag.len()
+                    )));
+                }
+                let dims = matlab_dims(&v.dims, self.oned_as);
+                write_mat5_array_header(out, &dims, v.class, v.imag.is_some(), v.logical, 0, name)?;
+                write_mat5_data(out, &v.real)?;
+                if let Some(imag) = &v.imag {
+                    write_mat5_data(out, imag)?;
+                }
+            }
+            MatValue::Char(v) => {
+                check_element_count(v.chars.len(), &v.dims, "char")?;
+                let dims = matlab_dims(&v.dims, self.oned_as);
+                write_mat5_array_header(out, &dims, MatClass::Char, false, false, 0, name)?;
+                let text: String = v.chars.iter().collect();
+                write_mat5_element(out, MI_UTF8, text.as_bytes())?;
+            }
+            MatValue::Strings(v) => {
+                let (dims, chars) = strings_char_matrix(v)?;
+                write_mat5_array_header(out, &dims, MatClass::Char, false, false, 0, name)?;
+                let text: String = chars.into_iter().collect();
+                write_mat5_element(out, MI_UTF8, text.as_bytes())?;
+            }
+            MatValue::Cell(v) => {
+                check_element_count(v.items.len(), &v.dims, "cell")?;
+                let dims = matlab_dims(&v.dims, self.oned_as);
+                write_mat5_array_header(out, &dims, MatClass::Cell, false, false, 0, name)?;
+                for item in &v.items {
+                    self.write_matrix(out, item, &[], depth + 1)?;
+                }
+            }
+            MatValue::Struct(v) => {
+                let dims = matlab_dims(&v.dims, self.oned_as);
+                write_mat5_array_header(out, &dims, MatClass::Struct, false, false, 0, name)?;
+                self.write_fields(out, v, depth)?;
+            }
+            MatValue::Object(v) => {
+                let dims = matlab_dims(&v.fields.dims, self.oned_as);
+                write_mat5_array_header(out, &dims, MatClass::Object, false, false, 0, name)?;
+                if !v.class_name.is_ascii() {
+                    return Err(IoError::InvalidFormat(format!(
+                        "object class name {:?} is not ASCII",
+                        v.class_name
+                    )));
+                }
+                write_mat5_element(out, MI_INT8, v.class_name.as_bytes())?;
+                self.write_fields(out, &v.fields, depth)?;
+            }
+            MatValue::Sparse(v) => {
+                validate_mat_sparse(v)?;
+                // MATLAB expects row indices sorted within each column (SciPy's `sort_indices`).
+                let mut order: Vec<usize> = (0..v.indices.len()).collect();
+                for c in 0..v.cols {
+                    order[v.indptr[c]..v.indptr[c + 1]].sort_by_key(|&k| v.indices[k]);
+                }
+                let indices: Vec<usize> = order.iter().map(|&k| v.indices[k]).collect();
+                let nzmax = u32::try_from(indices.len().max(1)).map_err(|_| {
+                    IoError::InvalidFormat("sparse matrix has too many entries".to_string())
+                })?;
+                write_mat5_array_header(
+                    out,
+                    &[v.rows, v.cols],
+                    MatClass::Sparse,
+                    v.imag.is_some(),
+                    v.logical,
+                    nzmax,
+                    name,
+                )?;
+                write_mat5_element(out, MI_INT32, &index_bytes(&indices)?)?;
+                write_mat5_element(out, MI_INT32, &index_bytes(&v.indptr)?)?;
+                write_mat5_data(out, &v.data.gather(&order))?;
+                if let Some(imag) = &v.imag {
+                    write_mat5_data(out, &imag.gather(&order))?;
+                }
+            }
+            MatValue::Function(_) => {
+                return Err(IoError::UnsupportedFeature(
+                    "Cannot write matlab functions".to_string(),
+                ));
+            }
+            MatValue::Opaque(_) => {
+                return Err(IoError::UnsupportedFeature(
+                    "Cannot write MATLAB opaque objects".to_string(),
+                ));
+            }
+        }
+        let count = u32::try_from(out.len() - start - 8).map_err(|_| {
+            IoError::InvalidFormat("Matrix too large to save with Matlab 5 format".to_string())
+        })?;
+        out[start..start + 4].copy_from_slice(&MI_MATRIX.to_le_bytes());
+        out[start + 4..start + 8].copy_from_slice(&count.to_le_bytes());
+        Ok(())
+    }
+
+    /// SciPy's `_write_items`: name length, fixed-width names, then every element's fields. A
+    /// struct with no fields is written as SciPy writes an empty one: name length 1, no names.
+    fn write_fields(&self, out: &mut Vec<u8>, v: &MatStruct, depth: usize) -> Result<(), IoError> {
+        let count = element_count(&v.dims)?;
+        let expected = count.checked_mul(v.field_names.len());
+        if expected != Some(v.values.len()) {
+            return Err(IoError::InvalidFormat(format!(
+                "a struct array with dimensions {:?} and {} fields has {} values",
+                v.dims,
+                v.field_names.len(),
+                v.values.len()
+            )));
+        }
+        if v.field_names.is_empty() {
+            write_mat5_element(out, MI_INT32, &1i32.to_le_bytes())?;
+            return write_mat5_element(out, MI_INT8, &[]);
+        }
+        if let Some(bad) = v
+            .field_names
+            .iter()
+            .find(|f| f.is_empty() || !f.is_ascii() || f.contains('\0'))
+        {
+            return Err(IoError::InvalidFormat(format!(
+                "struct field name {bad:?} is not a non-empty ASCII name"
+            )));
+        }
+        let length = v.field_names.iter().map(String::len).max().unwrap_or(0) + 1;
+        let max_length = if self.long_field_names { 64 } else { 32 };
+        if length > max_length {
+            return Err(IoError::InvalidFormat(format!(
+                "Field names are restricted to {} characters",
+                max_length - 1
+            )));
+        }
+        write_mat5_element(out, MI_INT32, &(length as i32).to_le_bytes())?;
+        let mut names = vec![0u8; length * v.field_names.len()];
+        for (i, field) in v.field_names.iter().enumerate() {
+            names[i * length..i * length + field.len()].copy_from_slice(field.as_bytes());
+        }
+        write_mat5_element(out, MI_INT8, &names)?;
+        for value in &v.values {
+            self.write_matrix(out, value, &[], depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+/// Days since 1970-01-01 as a proleptic Gregorian (year, month, day).
+fn civil_from_days(days: i64) -> (i64, usize, u64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month as usize, day as u64)
+}
+
+/// `time.asctime()` for a UTC instant (SciPy stamps local time; fsci has no time-zone data).
+fn asctime_utc(seconds: u64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = seconds / 86_400;
+    let clock = seconds % 86_400;
+    let (year, month, day) = civil_from_days(i64::try_from(days).unwrap_or(i64::MAX / 2));
+    format!(
+        "{} {} {day:2} {:02}:{:02}:{:02} {year}",
+        WEEKDAYS[(days % 7) as usize],
+        MONTHS[month - 1],
+        clock / 3_600,
+        clock % 3_600 / 60,
+        clock % 60
+    )
+}
+
+/// SciPy's `write_file_header`: description, zero subsystem offset, version 0x0100, "IM".
+fn mat5_file_header_bytes() -> [u8; 128] {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let platform = if cfg!(windows) { "nt" } else { "posix" };
+    let text = format!(
+        "MATLAB 5.0 MAT-file Platform: {platform}, Created on: {}",
+        asctime_utc(seconds)
+    );
+    let mut header = [0u8; 128];
+    let n = text.len().min(116);
+    header[..n].copy_from_slice(&text.as_bytes()[..n]);
+    header[124..126].copy_from_slice(&0x0100u16.to_le_bytes());
+    header[126..128].copy_from_slice(b"IM");
+    header
+}
+
+fn savemat_v5(
+    variables: &[(String, MatValue)],
+    options: &SavematOptions,
+) -> Result<Vec<u8>, IoError> {
+    let writer = Mat5Writer {
+        oned_as: options.oned_as,
+        long_field_names: options.long_field_names,
+    };
+    let mut out = mat5_file_header_bytes().to_vec();
+    for (name, value) in variables {
+        if name.is_empty() {
+            return Err(IoError::InvalidFormat(
+                "MAT variable name cannot be empty".to_string(),
+            ));
+        }
+        // SciPy skips these with a MatWriteWarning: MATLAB cannot load them.
+        if name.starts_with('_') {
+            continue;
+        }
+        let name = latin1_bytes(name)?;
+        if options.do_compression {
+            let mut raw = Vec::new();
+            writer.write_matrix(&mut raw, value, &name, 0)?;
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+            let count = u32::try_from(packed.len()).map_err(|_| {
+                IoError::InvalidFormat("compressed MAT variable exceeds 4 GiB".to_string())
+            })?;
+            out.extend_from_slice(&MI_COMPRESSED.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&packed);
+        } else {
+            writer.write_matrix(&mut out, value, &name, 0)?;
+        }
+    }
+    Ok(out)
+}
+
+/// One Level 4 variable: SciPy's `VarWriter4.write`.
+fn write_mat4_variable(
+    out: &mut Vec<u8>,
+    name: &str,
+    value: &MatValue,
+    oned_as: OnedAs,
+) -> Result<(), IoError> {
+    let mut name_bytes = latin1_bytes(name)?;
+    name_bytes.push(0);
+    // (dims, P data type, T class, imagf, payload)
+    let (dims, data_type, class, imagf, payload): (Vec<usize>, i32, i32, i32, Vec<u8>) = match value
+    {
+        MatValue::Numeric(v) => {
+            check_element_count(v.real.len(), &v.dims, "numeric")?;
+            if let Some(imag) = &v.imag
+                && imag.len() != v.real.len()
+            {
+                return Err(IoError::InvalidFormat(format!(
+                    "a complex array has {} real and {} imaginary values",
+                    v.real.len(),
+                    imag.len()
+                )));
+            }
+            // SciPy's `np_to_mtypes`; any other dtype (and mixed complex parts) is written as
+            // double, as SciPy casts it to float64 / complex128.
+            let native = match (v.real.dtype(), v.imag.as_ref().map(MatData::dtype)) {
+                (MatDtype::F64, None | Some(MatDtype::F64)) => Some(0),
+                (MatDtype::F32, None | Some(MatDtype::F32)) => Some(1),
+                (MatDtype::I32, None) => Some(2),
+                (MatDtype::I16, None) => Some(3),
+                (MatDtype::U16, None) => Some(4),
+                (MatDtype::U8, None) => Some(5),
+                _ => None,
+            };
+            let mut payload = Vec::new();
+            let data_type = if let Some(p) = native {
+                payload.extend(v.real.le_bytes());
+                if let Some(imag) = &v.imag {
+                    payload.extend(imag.le_bytes());
+                }
+                p
+            } else {
+                payload.extend(v.real.cast(MatDtype::F64).le_bytes());
+                if let Some(imag) = &v.imag {
+                    payload.extend(imag.cast(MatDtype::F64).le_bytes());
+                }
+                0
+            };
+            (
+                matlab_dims(&v.dims, oned_as),
+                data_type,
+                0,
+                i32::from(v.imag.is_some()),
+                payload,
+            )
+        }
+        MatValue::Char(v) => {
+            check_element_count(v.chars.len(), &v.dims, "char")?;
+            let text: String = v.chars.iter().collect();
+            (matlab_dims(&v.dims, oned_as), 5, 1, 0, latin1_bytes(&text)?)
+        }
+        MatValue::Strings(v) => {
+            // SciPy converts a string array to chars unless it is already one character wide.
+            let (dims, chars) = if v.width == 1 {
+                check_element_count(v.strings.len(), &v.dims, "string")?;
+                let chars = v
+                    .strings
+                    .iter()
+                    .map(|s| s.chars().next().unwrap_or('\0'))
+                    .collect();
+                (matlab_dims(&v.dims, oned_as), chars)
+            } else {
+                let (mut dims, chars) = strings_char_matrix(v)?;
+                if chars.is_empty() {
+                    // SciPy's Level 4 writer has no empty-string special case.
+                    dims = if v.dims.is_empty() {
+                        vec![1]
+                    } else {
+                        v.dims.clone()
+                    };
+                    dims.push(v.width);
+                    let blank = vec![' '; element_count(&dims)?];
+                    let text: String = blank.into_iter().collect();
+                    return write_mat4_record(
+                        out,
+                        &name_bytes,
+                        &dims,
+                        5,
+                        1,
+                        0,
+                        &latin1_bytes(&text)?,
+                    );
+                }
+                (dims, chars)
+            };
+            let text: String = chars.into_iter().collect();
+            (dims, 5, 1, 0, latin1_bytes(&text)?)
+        }
+        MatValue::Sparse(v) => {
+            validate_mat_sparse(v)?;
+            let nnz = v.indices.len();
+            let width = if v.imag.is_some() { 4 } else { 3 };
+            let height = nnz + 1;
+            let real = v.data.to_f64_vec();
+            let imag = v.imag.as_ref().map(MatData::to_f64_vec);
+            let mut table = vec![0.0f64; height * width];
+            for c in 0..v.cols {
+                for k in v.indptr[c]..v.indptr[c + 1] {
+                    table[k] = (v.indices[k] + 1) as f64;
+                    table[height + k] = (c + 1) as f64;
+                    table[2 * height + k] = real[k];
+                    if let Some(imag) = &imag {
+                        table[3 * height + k] = imag[k];
+                    }
+                }
+            }
+            table[nnz] = v.rows as f64;
+            table[height + nnz] = v.cols as f64;
+            let payload = table.iter().flat_map(|x| x.to_le_bytes()).collect();
+            (vec![height, width], 0, 2, 0, payload)
+        }
+        MatValue::Cell(_)
+        | MatValue::Struct(_)
+        | MatValue::Object(_)
+        | MatValue::Function(_)
+        | MatValue::Opaque(_) => {
+            return Err(IoError::UnsupportedFeature(format!(
+                "Cannot save object arrays in Mat4 ('{name}' is a {})",
+                value.class_name()
+            )));
+        }
+    };
+    write_mat4_record(out, &name_bytes, &dims, data_type, class, imagf, &payload)
+}
+
+fn write_mat4_record(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    dims: &[usize],
+    data_type: i32,
+    class: i32,
+    imagf: i32,
+    payload: &[u8],
+) -> Result<(), IoError> {
+    let [rows, cols] = *dims else {
+        return Err(IoError::InvalidFormat(
+            "Matlab 4 files cannot save arrays with more than 2 dimensions".to_string(),
+        ));
+    };
+    let field = |value: usize, what: &str| {
+        i32::try_from(value).map_err(|_| {
+            IoError::InvalidFormat(format!("MAT 4 {what} {value} does not fit an int32"))
+        })
+    };
+    // mopt = M*1000 + O*100 + P*10 + T with M = 0 (little-endian) and O = 0.
+    for word in [
+        data_type * 10 + class,
+        field(rows, "row count")?,
+        field(cols, "column count")?,
+        imagf,
+        field(name.len(), "name length")?,
+    ] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out.extend_from_slice(name);
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+fn savemat_v4(
+    variables: &[(String, MatValue)],
+    options: &SavematOptions,
+) -> Result<Vec<u8>, IoError> {
+    if options.long_field_names {
+        return Err(IoError::InvalidFormat(
+            "Long field names are not available for version 4 files".to_string(),
+        ));
+    }
+    let mut out = Vec::new();
+    for (name, value) in variables {
+        write_mat4_variable(&mut out, name, value, options.oned_as)?;
+    }
+    Ok(out)
+}
+
+/// SciPy's `matfile_version`: `(0, 0)` for a Level 4 file, `(1, minor)` for Level 5 and
+/// `(2, minor)` for a v7.3 (HDF5) file.
 ///
-/// This is the `scipy.io.whosmat` surface for the MAT classes FrankenSciPy can
-/// currently decode. Each result contains the variable name, its two-dimensional
-/// shape, and the MATLAB data class.
-pub fn whosmat(bytes: &[u8]) -> Result<Vec<MatInfo>, IoError> {
-    Ok(loadmat(bytes)?
+/// # Errors
+/// `IoError::InvalidFormat` for fewer than SciPy's 20 probe bytes ("Mat file appears to be
+/// truncated"), 20 zero bytes ("corrupt"), and a Level 5-style header whose version byte is not
+/// 1 or 2 ("Unknown mat file type").
+pub fn matfile_version(bytes: &[u8]) -> Result<(u8, u8), IoError> {
+    if bytes.len() < 20 {
+        return Err(IoError::InvalidFormat(
+            "Mat file appears to be truncated".to_string(),
+        ));
+    }
+    if bytes[..20].iter().all(|&b| b == 0) {
+        return Err(IoError::InvalidFormat(
+            "Mat file appears to be corrupt (first 20 bytes == 0)".to_string(),
+        ));
+    }
+    // A Level 4 file starts with its first variable's `mopt`, which has a zero byte.
+    if bytes[..4].contains(&0) {
+        return Ok((0, 0));
+    }
+    // Bytes 124..128 hold the version word and the endian indicator; SciPy tests the third.
+    if bytes.len() < 127 {
+        return Err(IoError::InvalidFormat(format!(
+            "MAT file header is truncated: {} bytes, the version word needs 127",
+            bytes.len()
+        )));
+    }
+    let major_at = usize::from(bytes[126] == b'I');
+    let major = bytes[124 + major_at];
+    let minor = bytes[125 - major_at];
+    if matches!(major, 1 | 2) {
+        Ok((major, minor))
+    } else {
+        Err(IoError::InvalidFormat(format!(
+            "Unknown mat file type, version {major}, {minor}"
+        )))
+    }
+}
+
+/// Read a MATLAB MAT-file: `scipy.io.loadmat` for Level 5 (MATLAB v5 through v7.2, compressed or
+/// not, either byte order) and Level 4 files.
+///
+/// Values come back as SciPy returns them under `options` (see [`MatValue`], [`MatData`] and
+/// [`LoadmatOptions`]), with the file's `__header__`, `__version__` and `__globals__` in
+/// [`MatFile::header`].
+///
+/// A compressed variable is inflated whole before its header is read, so a damaged zlib
+/// checksum fails the read even for a variable `variable_names` skips; SciPy inflates such a
+/// variable in 128 KiB blocks and only notices when it reaches the damaged block.
+///
+/// # Errors
+/// `IoError::UnsupportedFeature` for a v7.3 (HDF5) file; `IoError::InvalidFormat` for every
+/// file SciPy rejects, and for the malformed files SciPy would turn into inconsistent arrays.
+pub fn loadmat(bytes: &[u8], options: &LoadmatOptions) -> Result<MatFile, IoError> {
+    match matfile_version(bytes)? {
+        (0, _) => loadmat_v4(bytes, options),
+        version @ (1, _) => loadmat_v5(bytes, version, options),
+        _ => Err(mat73_unsupported()),
+    }
+}
+
+/// List a MAT-file's variables without reading their data: `scipy.io.whosmat`'s
+/// `(name, shape, class)`. Only `squeeze_me`, `simplify_cells` (which implies it) and
+/// `chars_as_strings` (which drops a char array's last dimension) affect the result.
+///
+/// # Errors
+/// As [`loadmat`], for the headers.
+pub fn whosmat(bytes: &[u8], options: &LoadmatOptions) -> Result<Vec<MatInfo>, IoError> {
+    match matfile_version(bytes)? {
+        (0, _) => whosmat_v4(bytes, options),
+        (1, _) => whosmat_v5(bytes, options),
+        _ => Err(mat73_unsupported()),
+    }
+}
+
+/// Split a Level 5 MAT-file into one file per variable (`scipy.io.matlab.varmats_from_mat`):
+/// each is the original 128-byte header followed by the variable's element, unread. Duplicate
+/// names are all kept.
+///
+/// # Errors
+/// `IoError::UnsupportedFeature` for a Level 4 or v7.3 file; otherwise as [`loadmat`], for the
+/// headers.
+pub fn varmats_from_mat(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, IoError> {
+    match matfile_version(bytes)? {
+        (1, _) => {}
+        (0, _) => {
+            return Err(IoError::UnsupportedFeature(
+                "varmats_from_mat splits Level 5 files; this is a Level 4 file".to_string(),
+            ));
+        }
+        _ => return Err(mat73_unsupported()),
+    }
+    let (big_endian, _, _) = read_mat5_file_header(bytes)?;
+    let mut spans = Vec::new();
+    for_each_mat5_variable(bytes, big_endian, |_, header, top| {
+        spans.push((mat5_variable_name(&header), top.start, top.next));
+        Ok(true)
+    })?;
+    Ok(spans
         .into_iter()
-        .map(|array| MatInfo {
-            name: array.name,
-            shape: (array.rows, array.cols),
-            class_name: "double".to_string(),
+        .map(|(name, start, next)| {
+            let mut file = bytes[..128].to_vec();
+            file.extend_from_slice(&bytes[start..next.min(bytes.len())]);
+            (name, file)
         })
         .collect())
 }
 
-/// Save arrays to a simple text-based format (similar to MATLAB ASCII).
+/// Write a MATLAB MAT-file: `scipy.io.savemat`.
 ///
-/// This provides a basic `savemat`-like interface. Full .mat v5 binary
-/// format requires extensive implementation; this provides a portable
-/// text alternative.
+/// Level 5 (the default) writes every [`MatValue`] but function handles and opaque objects,
+/// which SciPy cannot write either; Level 4 writes 2-D numeric, char and sparse arrays. As in
+/// SciPy, a Level 5 variable whose name starts with `_` is skipped (SciPy warns), a 0-d or 1-D
+/// array is written by [`SavematOptions::oned_as`], numeric data is written in its own dtype
+/// with the value's class and logical flag, and a [`MatStrings`] array is written as SciPy
+/// writes a NumPy string array (padded with spaces; all-empty becomes an empty char array). A
+/// [`MatChar`] is written with its own dimensions. The header's creation time is UTC.
+///
+/// # Errors
+/// `IoError::UnsupportedFeature` for values the format cannot hold; `IoError::InvalidFormat` for
+/// inconsistent values (element counts that do not match the dimensions, a malformed sparse
+/// structure, over-long field names, names that are not Latin-1).
+pub fn savemat(
+    variables: &[(String, MatValue)],
+    options: &SavematOptions,
+) -> Result<Vec<u8>, IoError> {
+    match options.format {
+        MatFormat::V4 => savemat_v4(variables, options),
+        MatFormat::V5 => savemat_v5(variables, options),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Plain-text matrices (fsci's own `savemat_text` / `loadmat_text` format)
+// ══════════════════════════════════════════════════════════════════════
+
+/// A named 2-D `f64` matrix, row-major, in the plain-text format of [`savemat_text`] and
+/// [`loadmat_text`] (not a MATLAB MAT-file; see [`loadmat`] for those).
+#[derive(Debug, Clone)]
+pub struct MatArray {
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<f64>,
+}
+
 /// Runtime switch to force the serial `savemat_text` formatter for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 /// CONTRACT: BYTE-IDENTICAL output either way. Each worker formats a
@@ -1896,6 +4614,7 @@ pub fn whosmat(bytes: &[u8]) -> Result<Vec<MatInfo>, IoError> {
 pub static SAVEMAT_TEXT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Save arrays to a simple text-based format (similar to MATLAB ASCII).
 pub fn savemat_text(arrays: &[MatArray]) -> Result<String, IoError> {
     let mut out = String::new();
     for arr in arrays {
@@ -5641,35 +8360,511 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mat_v5_numeric_decodes_typed_little_endian_chunks() {
-        // frankenscipy-99ru7: c40f0641d (frankenscipy-3xbva) wrote this against
-        // `decode_v5_numeric`, the NON-fused decoder that 4b42292a4 had put in
-        // place of the fused decode+transpose lever. The lever is restored, so
-        // the assertions are re-pointed at `decode_v5_numeric_rowmajor`. Shapes
-        // are 1×n, for which the column-major→row-major map is the identity
-        // (data[0*n+c] reads disk index c*1+0 = c), so the expected values are
-        // unchanged and this still tests exactly what 3xbva pinned: the typed
-        // chunk decode and the alignment guard.
-        let integers =
-            decode_v5_numeric_rowmajor(MI_INT16, &[0xfe, 0xff, 0x34, 0x12], 1, 2, "ints")
-                .expect("aligned i16 payload");
-        assert_eq!(integers, vec![-2.0, 4660.0]);
-
-        let doubles = decode_v5_numeric_rowmajor(
-            MI_DOUBLE,
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f],
-            1,
-            1,
-            "doubles",
-        )
-        .expect("aligned f64 payload");
-        assert_eq!(doubles, vec![1.0]);
-
-        let err = decode_v5_numeric_rowmajor(MI_INT32, &[0, 0, 0], 1, 1, "misaligned")
-            .expect_err("misaligned payload");
-        assert!(
-            matches!(err, IoError::InvalidFormat(message) if message.contains("multiple of 4"))
+    fn mat_data_elements_decode_typed_chunks_in_either_byte_order() {
+        // frankenscipy-3xbva pinned the typed chunk decode; frankenscipy-1ksfv.12 moved it to
+        // SciPy's rule for a payload that is not a whole number of elements: `byte_count //
+        // itemsize` values, the partial one dropped (live SciPy 1.17.1 reads a 1x2 double from
+        // 19 payload bytes), with the array's reshape rejecting a count its dims do not match.
+        assert_eq!(
+            decode_mat_data(MatDtype::I16, &[0xfe, 0xff, 0x34, 0x12], false),
+            MatData::I16(vec![-2, 4660])
         );
+        assert_eq!(
+            decode_mat_data(MatDtype::I16, &[0xff, 0xfe, 0x12, 0x34], true),
+            MatData::I16(vec![-2, 4660])
+        );
+        assert_eq!(
+            decode_mat_data(MatDtype::F64, &1.0f64.to_le_bytes(), false),
+            MatData::F64(vec![1.0])
+        );
+        assert_eq!(
+            decode_mat_data(MatDtype::I32, &[0, 0, 0], false),
+            MatData::I32(Vec::new())
+        );
+        let mut nineteen = [1.0f64, 2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<_>>();
+        nineteen.extend_from_slice(&[1, 2, 3]);
+        let file = mat5_file(&[mat5_matrix(
+            MatClass::Double.code(),
+            0,
+            &[1, 2],
+            b"x",
+            &[mat5_element(MI_DOUBLE, &nineteen)],
+        )]);
+        let loaded = loadmat(&file, &LoadmatOptions::default()).expect("partial element");
+        assert_eq!(
+            loaded.get("x"),
+            Some(&MatValue::Numeric(MatNumeric::new(
+                vec![1, 2],
+                MatData::F64(vec![1.0, 2.0])
+            )))
+        );
+        let short = mat5_file(&[mat5_matrix(
+            MatClass::Double.code(),
+            0,
+            &[1, 3],
+            b"x",
+            &[mat5_element(MI_DOUBLE, &nineteen)],
+        )]);
+        let err = loadmat(&short, &LoadmatOptions::default()).expect_err("2 values for 1x3");
+        assert!(matches!(err, IoError::InvalidFormat(m) if m.contains("cannot reshape")));
+    }
+
+    // ── MAT-file test builders: the byte layout SciPy's probes used, little-endian unless a
+    //    helper says otherwise. ──
+
+    fn mat5_header_bytes(big_endian: bool) -> Vec<u8> {
+        let mut head = b"MATLAB 5.0 MAT-file, fsci-io unit test".to_vec();
+        head.resize(116, b' ');
+        head.extend_from_slice(&[0; 8]);
+        if big_endian {
+            head.extend_from_slice(&0x0100u16.to_be_bytes());
+            head.extend_from_slice(b"MI");
+        } else {
+            head.extend_from_slice(&0x0100u16.to_le_bytes());
+            head.extend_from_slice(b"IM");
+        }
+        head
+    }
+
+    fn mat5_file(elements: &[Vec<u8>]) -> Vec<u8> {
+        let mut file = mat5_header_bytes(false);
+        for element in elements {
+            file.extend_from_slice(element);
+        }
+        file
+    }
+
+    /// A full (never small) data element, padded to 8 bytes.
+    fn mat5_element(mdtype: u32, payload: &[u8]) -> Vec<u8> {
+        mat5_element_in(mdtype, payload, false)
+    }
+
+    fn mat5_element_in(mdtype: u32, payload: &[u8], big_endian: bool) -> Vec<u8> {
+        let word = |w: u32| {
+            if big_endian {
+                w.to_be_bytes()
+            } else {
+                w.to_le_bytes()
+            }
+        };
+        let mut out = word(mdtype).to_vec();
+        out.extend_from_slice(&word(u32::try_from(payload.len()).expect("small payload")));
+        out.extend_from_slice(payload);
+        out.resize(out.len() + padding8(payload.len()), 0);
+        out
+    }
+
+    fn mat5_matrix(class: u8, flags: u32, dims: &[i32], name: &[u8], subs: &[Vec<u8>]) -> Vec<u8> {
+        mat5_matrix_in(class, flags, dims, name, subs, false)
+    }
+
+    fn mat5_matrix_in(
+        class: u8,
+        flags: u32,
+        dims: &[i32],
+        name: &[u8],
+        subs: &[Vec<u8>],
+        big_endian: bool,
+    ) -> Vec<u8> {
+        let word = |w: u32| {
+            if big_endian {
+                w.to_be_bytes()
+            } else {
+                w.to_le_bytes()
+            }
+        };
+        let mut flag_bytes = word(u32::from(class) | (flags << 8)).to_vec();
+        flag_bytes.extend_from_slice(&[0; 4]);
+        let dim_bytes: Vec<u8> = dims
+            .iter()
+            .flat_map(|&d| {
+                if big_endian {
+                    d.to_be_bytes()
+                } else {
+                    d.to_le_bytes()
+                }
+            })
+            .collect();
+        let mut body = mat5_element_in(MI_UINT32, &flag_bytes, big_endian);
+        body.extend(mat5_element_in(MI_INT32, &dim_bytes, big_endian));
+        body.extend(mat5_element_in(MI_INT8, name, big_endian));
+        for sub in subs {
+            body.extend_from_slice(sub);
+        }
+        let mut out = word(MI_MATRIX).to_vec();
+        out.extend_from_slice(&word(u32::try_from(body.len()).expect("small matrix")));
+        out.extend(body);
+        out
+    }
+
+    fn f64_bytes(values: &[f64]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn i32_bytes(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn scalar_double(name: &[u8], value: f64) -> Vec<u8> {
+        mat5_matrix(
+            MatClass::Double.code(),
+            0,
+            &[1, 1],
+            name,
+            &[mat5_element(MI_DOUBLE, &value.to_le_bytes())],
+        )
+    }
+
+    fn zlib_element(raw: &[u8]) -> Vec<u8> {
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(raw, 6);
+        let mut out = MI_COMPRESSED.to_le_bytes().to_vec();
+        out.extend_from_slice(&u32::try_from(packed.len()).expect("small").to_le_bytes());
+        out.extend(packed);
+        out
+    }
+
+    fn numeric(dims: &[usize], data: MatData) -> MatValue {
+        MatValue::Numeric(MatNumeric::new(dims.to_vec(), data))
+    }
+
+    fn strings(dims: &[usize], width: usize, values: &[&str]) -> MatValue {
+        MatValue::Strings(MatStrings {
+            dims: dims.to_vec(),
+            width,
+            strings: values.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    fn load_default(bytes: &[u8]) -> MatFile {
+        loadmat(bytes, &LoadmatOptions::default()).expect("MAT file loads")
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit pair"))
+            .collect()
+    }
+
+    /// The content of the SciPy reference files below, as fsci values.
+    fn scipy_reference_content() -> Vec<(String, MatValue)> {
+        vec![
+            (
+                "s".to_string(),
+                MatValue::Struct(MatStruct {
+                    dims: vec![1, 1],
+                    field_names: vec!["ab".to_string(), "c".to_string()],
+                    values: vec![
+                        numeric(&[2, 2], MatData::F64(vec![1.0, 3.0, 2.0, 4.0])),
+                        MatValue::Char(MatChar::row("hi")),
+                    ],
+                }),
+            ),
+            (
+                "c".to_string(),
+                MatValue::Cell(MatCell {
+                    dims: vec![1, 2],
+                    items: vec![
+                        numeric(&[1, 1], MatData::F64(vec![1.0])),
+                        MatValue::Char(MatChar::row("x")),
+                    ],
+                }),
+            ),
+            (
+                "sp".to_string(),
+                MatValue::Sparse(MatSparse {
+                    rows: 2,
+                    cols: 2,
+                    logical: false,
+                    indptr: vec![0, 1, 2],
+                    indices: vec![1, 0],
+                    data: MatData::F64(vec![2.0, 1.5]),
+                    imag: None,
+                }),
+            ),
+            (
+                "b".to_string(),
+                numeric(&[1, 2], MatData::Bool(vec![true, false])),
+            ),
+            (
+                "z".to_string(),
+                MatValue::Numeric(MatNumeric::complex(
+                    vec![1, 2],
+                    MatData::F32(vec![1.0, 3.0]),
+                    MatData::F32(vec![2.0, -4.0]),
+                )),
+            ),
+            ("e".to_string(), numeric(&[0, 0], MatData::F64(Vec::new()))),
+            ("st".to_string(), strings(&[2], 3, &["a", "bcd"])),
+            (
+                "i".to_string(),
+                numeric(&[2, 3, 4], MatData::I8((0..24).collect())),
+            ),
+            (
+                "v".to_string(),
+                numeric(&[3], MatData::F64(vec![0.0, 1.0, 2.0])),
+            ),
+        ]
+    }
+
+    /// `scipy.io.savemat(f, content)` (SciPy 1.17.1, uncompressed, oned_as='row') from byte 116
+    /// on; the description before it holds a timestamp. Content: see `scipy_reference_content`
+    /// (the generator used NumPy equivalents: a dict for `s`, an object array for `c`, a
+    /// `csc_array`, a bool array, complex64, `np.zeros((0, 0))`, `np.array(['a', 'bcd'])`, an
+    /// int8 2x3x4 array and `np.arange(3.0)`).
+    const SCIPY_V5_REFERENCE_FROM_116: &str = concat!(
+        "00000000000000000001494d0e000000d000000006000000080000000200000000000000050000000800000001000000",
+        "0100000001000100730000000500040003000000010000000600000061620063000000000e0000005000000006000000",
+        "080000000600000000000000050000000800000002000000020000000100000000000000090000002000000000000000",
+        "0000f03f0000000000000840000000000000004000000000000010400e00000030000000060000000800000004000000",
+        "0000000005000000080000000100000002000000010000000000000010000200686900000e000000a000000006000000",
+        "0800000001000000000000000500000008000000010000000200000001000100630000000e0000003800000006000000",
+        "080000000600000000000000050000000800000001000000010000000100000000000000090000000800000000000000",
+        "0000f03f0e00000030000000060000000800000004000000000000000500000008000000010000000100000001000000",
+        "0000000010000100780000000e0000006800000006000000080000000500000002000000050000000800000002000000",
+        "02000000010002007370000005000000080000000100000000000000050000000c000000000000000100000002000000",
+        "0000000009000000100000000000000000000040000000000000f83f0e00000030000000060000000800000009020000",
+        "0000000005000000080000000100000002000000010001006200000002000200010000000e0000004800000006000000",
+        "08000000070800000000000005000000080000000100000002000000010001007a00000007000000080000000000803f",
+        "00004040070000000800000000000040000080c00e000000300000000600000008000000060000000000000005000000",
+        "080000000000000000000000010001006500000009000000000000000e00000038000000060000000800000004000000",
+        "00000000050000000800000002000000030000000100020073740000100000000600000061622063206400000e000000",
+        "5000000006000000080000000800000000000000050000000c0000000200000003000000040000000000000001000100",
+        "690000000100000018000000000102030405060708090a0b0c0d0e0f10111213141516170e0000004800000006000000",
+        "080000000600000000000000050000000800000001000000030000000100010076000000090000001800000000000000",
+        "00000000000000000000f03f0000000000000040",
+    );
+
+    /// `scipy.io.savemat(f, {'x': [[1., 2., 3.], [4., 5., 6.]], 's': 'hi', 'z': [[1+2j]],
+    /// 'sp': csc_array([[0, 1.5], [2., 0]]), 'i': np.array([[7, 8]], dtype=np.int16)},
+    /// format='4')`, SciPy 1.17.1.
+    const SCIPY_V4_REFERENCE: &str = concat!(
+        "00000000020000000300000000000000020000007800000000000000f03f000000000000104000000000000000400000",
+        "000000001440000000000000084000000000000018403300000001000000020000000000000002000000730068690000",
+        "0000010000000100000001000000020000007a00000000000000f03f0000000000000040020000000300000003000000",
+        "00000000030000007370000000000000000040000000000000f03f0000000000000040000000000000f03f0000000000",
+        "00004000000000000000400000000000000040000000000000f83f00000000000000001e000000010000000200000000",
+        "00000002000000690007000800",
+    );
+
+    #[test]
+    fn savemat_v5_writes_scipys_bytes() {
+        let written = savemat(&scipy_reference_content(), &SavematOptions::default())
+            .expect("reference content writes");
+        assert_eq!(&written[..10], b"MATLAB 5.0");
+        assert_eq!(written[116..], hex_bytes(SCIPY_V5_REFERENCE_FROM_116));
+        // Must-miss: a column-oriented 1-D write differs exactly in `v`'s dimensions.
+        let column = savemat(
+            &scipy_reference_content(),
+            &SavematOptions {
+                oned_as: OnedAs::Column,
+                ..SavematOptions::default()
+            },
+        )
+        .expect("column write");
+        assert_ne!(column[116..], hex_bytes(SCIPY_V5_REFERENCE_FROM_116));
+        assert_eq!(
+            whosmat(&column, &LoadmatOptions::default())
+                .expect("inventory")
+                .iter()
+                .find(|info| info.name == "v")
+                .map(|info| info.shape.clone()),
+            Some(vec![3, 1])
+        );
+    }
+
+    #[test]
+    fn savemat_v4_writes_scipys_bytes() {
+        let content = vec![
+            (
+                "x".to_string(),
+                MatValue::Numeric(
+                    MatNumeric::from_row_major(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("2x3"),
+                ),
+            ),
+            ("s".to_string(), MatValue::Char(MatChar::row("hi"))),
+            (
+                "z".to_string(),
+                MatValue::Numeric(MatNumeric::complex(
+                    vec![1, 1],
+                    MatData::F64(vec![1.0]),
+                    MatData::F64(vec![2.0]),
+                )),
+            ),
+            (
+                "sp".to_string(),
+                MatValue::Sparse(MatSparse {
+                    rows: 2,
+                    cols: 2,
+                    logical: false,
+                    indptr: vec![0, 1, 2],
+                    indices: vec![1, 0],
+                    data: MatData::F64(vec![2.0, 1.5]),
+                    imag: None,
+                }),
+            ),
+            ("i".to_string(), numeric(&[1, 2], MatData::I16(vec![7, 8]))),
+        ];
+        let options = SavematOptions {
+            format: MatFormat::V4,
+            ..SavematOptions::default()
+        };
+        let written = savemat(&content, &options).expect("v4 write");
+        assert_eq!(written, hex_bytes(SCIPY_V4_REFERENCE));
+        let loaded = load_default(&written);
+        assert_eq!(loaded.version, (0, 0));
+        assert_eq!(
+            loaded.get("x"),
+            Some(&numeric(
+                &[2, 3],
+                MatData::F64(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+            ))
+        );
+        assert_eq!(loaded.get("s"), Some(&strings(&[1], 2, &["hi"])));
+        assert_eq!(
+            loaded.get("sp"),
+            content.iter().find(|(n, _)| n == "sp").map(|(_, v)| v)
+        );
+        // A cell cannot be written to Level 4 (SciPy: "Cannot save object arrays in Mat4").
+        let cell = vec![(
+            "c".to_string(),
+            MatValue::Cell(MatCell {
+                dims: vec![1, 1],
+                items: vec![numeric(&[1, 1], MatData::F64(vec![1.0]))],
+            }),
+        )];
+        assert!(matches!(
+            savemat(&cell, &options),
+            Err(IoError::UnsupportedFeature(_))
+        ));
+        let cube = vec![(
+            "c".to_string(),
+            numeric(&[1, 1, 2], MatData::F64(vec![1.0, 2.0])),
+        )];
+        assert!(
+            matches!(savemat(&cube, &options), Err(IoError::InvalidFormat(m)) if m.contains("more than 2"))
+        );
+    }
+
+    #[test]
+    fn savemat_v5_round_trips_every_value_kind_compressed_and_not() {
+        let mut content = scipy_reference_content();
+        content.push((
+            "o".to_string(),
+            MatValue::Object(MatObject {
+                class_name: "inline".to_string(),
+                fields: MatStruct {
+                    dims: vec![1, 1],
+                    field_names: vec!["expr".to_string()],
+                    values: vec![MatValue::Char(MatChar::row("x^2"))],
+                },
+            }),
+        ));
+        content.push((
+            "spc".to_string(),
+            MatValue::Sparse(MatSparse {
+                rows: 3,
+                cols: 2,
+                logical: false,
+                indptr: vec![0, 2, 3],
+                indices: vec![2, 0, 1],
+                data: MatData::F64(vec![1.0, 2.0, 3.0]),
+                imag: Some(MatData::F64(vec![-1.0, 0.5, 0.0])),
+            }),
+        ));
+        content.push(("u".to_string(), MatValue::Char(MatChar::row("Grüße, 世界"))));
+        content.push((
+            "_hidden".to_string(),
+            numeric(&[1, 1], MatData::F64(vec![9.0])),
+        ));
+        for do_compression in [false, true] {
+            let options = SavematOptions {
+                do_compression,
+                ..SavematOptions::default()
+            };
+            let written = savemat(&content, &options).expect("write");
+            let file = loadmat(
+                &written,
+                &LoadmatOptions {
+                    chars_as_strings: false,
+                    ..LoadmatOptions::default()
+                },
+            )
+            .expect("read back");
+            assert_eq!(
+                file.variables.len(),
+                content.len() - 1,
+                "_hidden is skipped"
+            );
+            assert!(file.get("_hidden").is_none());
+            // The row-sorted sparse matrix and the object come back as written.
+            for name in ["s", "sp", "o", "u", "i", "z", "c", "e"] {
+                assert_eq!(
+                    file.get(name),
+                    content.iter().find(|(n, _)| n == name).map(|(_, v)| v),
+                    "{name} (compressed: {do_compression})"
+                );
+            }
+            // Row indices are sorted within columns on write, as MATLAB requires.
+            assert_eq!(
+                file.get("spc"),
+                Some(&MatValue::Sparse(MatSparse {
+                    rows: 3,
+                    cols: 2,
+                    logical: false,
+                    indptr: vec![0, 2, 3],
+                    indices: vec![0, 2, 1],
+                    data: MatData::F64(vec![2.0, 1.0, 3.0]),
+                    imag: Some(MatData::F64(vec![0.5, -1.0, 0.0])),
+                }))
+            );
+            // Logical data is stored as bytes: it reads back as uint8 unless mat_dtype asks for
+            // the class dtype.
+            assert_eq!(
+                file.get("b"),
+                Some(&MatValue::Numeric(MatNumeric {
+                    dims: vec![1, 2],
+                    class: MatClass::Uint8,
+                    logical: true,
+                    real: MatData::U8(vec![1, 0]),
+                    imag: None,
+                }))
+            );
+        }
+        // Function handles cannot be written (SciPy raises MatWriteError).
+        let function = vec![(
+            "f".to_string(),
+            MatValue::Function(Box::new(numeric(&[1, 1], MatData::F64(vec![1.0])))),
+        )];
+        assert!(matches!(
+            savemat(&function, &SavematOptions::default()),
+            Err(IoError::UnsupportedFeature(_))
+        ));
+        // Field names: 31 characters by default, 63 with long_field_names.
+        let long = vec![(
+            "s".to_string(),
+            MatValue::Struct(MatStruct {
+                dims: vec![1, 1],
+                field_names: vec!["f".repeat(40)],
+                values: vec![numeric(&[1, 1], MatData::F64(vec![1.0]))],
+            }),
+        )];
+        assert!(matches!(
+            savemat(&long, &SavematOptions::default()),
+            Err(IoError::InvalidFormat(m)) if m == "Field names are restricted to 31 characters"
+        ));
+        let long_ok = savemat(
+            &long,
+            &SavematOptions {
+                long_field_names: true,
+                ..SavematOptions::default()
+            },
+        )
+        .expect("63-character field names");
+        assert_eq!(load_default(&long_ok).get("s"), Some(&long[0].1));
     }
 
     #[test]
@@ -6430,35 +9625,55 @@ mod tests {
 
     #[test]
     fn whosmat_reports_name_shape_and_class() {
-        let arrays = vec![
-            MatArray {
-                name: "matrix".to_string(),
-                rows: 2,
-                cols: 3,
-                data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            },
-            MatArray {
-                name: "scalar".to_string(),
-                rows: 1,
-                cols: 1,
-                data: vec![42.0],
-            },
-        ];
-        let bytes = savemat(&arrays).expect("MAT encode");
+        let bytes =
+            savemat(&scipy_reference_content(), &SavematOptions::default()).expect("MAT encode");
+        let info = |name: &str, shape: &[usize], class_name: &str| MatInfo {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            class_name: class_name.to_string(),
+        };
+        // SciPy 1.17.1's whosmat of the same content (see SCIPY_V5_REFERENCE_FROM_116).
         assert_eq!(
-            whosmat(&bytes).expect("MAT inventory"),
+            whosmat(&bytes, &LoadmatOptions::default()).expect("MAT inventory"),
             vec![
-                MatInfo {
-                    name: "matrix".to_string(),
-                    shape: (2, 3),
-                    class_name: "double".to_string(),
-                },
-                MatInfo {
-                    name: "scalar".to_string(),
-                    shape: (1, 1),
-                    class_name: "double".to_string(),
-                },
+                info("s", &[1, 1], "struct"),
+                info("c", &[1, 2], "cell"),
+                info("sp", &[2, 2], "sparse"),
+                info("b", &[1, 2], "logical"),
+                info("z", &[1, 2], "single"),
+                info("e", &[0, 0], "double"),
+                info("st", &[2], "char"),
+                info("i", &[2, 3, 4], "int8"),
+                info("v", &[1, 3], "double"),
             ]
+        );
+        let squeezed = whosmat(
+            &bytes,
+            &LoadmatOptions {
+                squeeze_me: true,
+                chars_as_strings: false,
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("squeezed inventory");
+        assert_eq!(squeezed[0], info("s", &[], "struct"));
+        assert_eq!(squeezed[6], info("st", &[2, 3], "char"));
+        assert_eq!(squeezed[8], info("v", &[3], "double"));
+        let v4 = savemat(
+            &[(
+                "m".to_string(),
+                numeric(&[2, 3], MatData::F32(vec![0.0; 6])),
+            )],
+            &SavematOptions {
+                format: MatFormat::V4,
+                ..SavematOptions::default()
+            },
+        )
+        .expect("v4");
+        // A Level 4 full matrix is "double" whatever it was stored as, as in SciPy.
+        assert_eq!(
+            whosmat(&v4, &LoadmatOptions::default()).expect("v4 inventory"),
+            vec![info("m", &[2, 3], "double")]
         );
     }
 
@@ -6488,39 +9703,722 @@ mod tests {
 
     #[test]
     fn savemat_loadmat_binary_matches_scipy_semantics() {
-        // Test that our MAT format roundtrip preserves values like scipy.io.savemat/loadmat
-        // scipy.io.loadmat returns arrays: {'x': [[1.0, 2.0, 3.0]], 'y': [[1, 2], [3, 4]]}
-        let arrays = vec![
-            MatArray {
-                name: "x".to_string(),
-                rows: 1,
-                cols: 3,
-                data: vec![1.0, 2.0, 3.0],
-            },
-            MatArray {
-                name: "y".to_string(),
-                rows: 2,
-                cols: 2,
-                data: vec![1.0, 2.0, 3.0, 4.0],
-            },
+        // scipy.io.loadmat(savemat({'x': [[1., 2., 3.]], 'y': [[1., 2.], [3., 4.]]})) gives back
+        // the same 1x3 and 2x2 float64 arrays, in either format.
+        let content = vec![
+            (
+                "x".to_string(),
+                MatValue::Numeric(MatNumeric::from_row_major(1, 3, &[1.0, 2.0, 3.0]).expect("1x3")),
+            ),
+            (
+                "y".to_string(),
+                MatValue::Numeric(
+                    MatNumeric::from_row_major(2, 2, &[1.0, 2.0, 3.0, 4.0]).expect("2x2"),
+                ),
+            ),
         ];
-        let bytes = savemat(&arrays).expect("savemat should succeed");
-        let loaded = loadmat(&bytes).expect("loadmat should succeed");
-        assert_eq!(loaded.len(), 2);
-        let x = loaded
+        for format in [MatFormat::V5, MatFormat::V4] {
+            let bytes = savemat(
+                &content,
+                &SavematOptions {
+                    format,
+                    ..SavematOptions::default()
+                },
+            )
+            .expect("savemat");
+            let loaded = load_default(&bytes);
+            assert_eq!(loaded.variables, content, "{format:?}");
+            let y = loaded.get("y").and_then(|value| match value {
+                MatValue::Numeric(n) => n.to_row_major_f64().ok(),
+                _ => None,
+            });
+            assert_eq!(y, Some((2, 2, vec![1.0, 2.0, 3.0, 4.0])), "{format:?}");
+        }
+        assert!(MatNumeric::from_row_major(2, 2, &[1.0]).is_err());
+    }
+
+    #[test]
+    fn matfile_version_matches_scipys_probe() {
+        assert_eq!(
+            matfile_version(&[1; 19]),
+            Err(IoError::InvalidFormat(
+                "Mat file appears to be truncated".to_string()
+            ))
+        );
+        assert_eq!(
+            matfile_version(&[0; 20]),
+            Err(IoError::InvalidFormat(
+                "Mat file appears to be corrupt (first 20 bytes == 0)".to_string()
+            ))
+        );
+        // A zero byte among the first four is Level 4.
+        let mut v4 = vec![b'x'; 40];
+        v4[3] = 0;
+        assert_eq!(matfile_version(&v4), Ok((0, 0)));
+        assert_eq!(matfile_version(&mat5_header_bytes(false)), Ok((1, 0)));
+        assert_eq!(matfile_version(&mat5_header_bytes(true)), Ok((1, 0)));
+        // SciPy: "Unknown mat file type, version 231, 173" for its japanese_utf8.txt.
+        let mut text = mat5_header_bytes(false);
+        text[124..128].copy_from_slice(&[0xe7, 0xad, 0x89, 0xe3]);
+        assert_eq!(
+            matfile_version(&text),
+            Err(IoError::InvalidFormat(
+                "Unknown mat file type, version 231, 173".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn loadmat_fails_closed_on_truncated_corrupt_and_hdf5_files() {
+        let opts = LoadmatOptions::default();
+        assert_eq!(
+            loadmat(&[0, 0, 0], &opts),
+            Err(IoError::InvalidFormat(
+                "Mat file appears to be truncated".to_string()
+            ))
+        );
+        // v7.3 (HDF5): SciPy raises NotImplementedError.
+        let mut hdf5 = mat5_header_bytes(false);
+        hdf5[124..126].copy_from_slice(&0x0200u16.to_le_bytes());
+        hdf5.extend_from_slice(&[0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(matfile_version(&hdf5), Ok((2, 0)));
+        assert!(
+            matches!(loadmat(&hdf5, &opts), Err(IoError::UnsupportedFeature(m)) if m.contains("v7.3"))
+        );
+        assert!(matches!(
+            whosmat(&hdf5, &opts),
+            Err(IoError::UnsupportedFeature(_))
+        ));
+
+        // A file cut inside a variable fails as SciPy's stream read does; the whole file loads.
+        let whole = mat5_file(&[scalar_double(b"x", 1.5), scalar_double(b"y", 2.5)]);
+        assert_eq!(load_default(&whole).variables.len(), 2);
+        for cut in [whole.len() - 1, whole.len() - 12, 128 + 20] {
+            assert!(
+                matches!(
+                    loadmat(&whole[..cut], &opts),
+                    Err(IoError::InvalidFormat(_))
+                ),
+                "cut at {cut}"
+            );
+        }
+        // Trailing zero padding is a zero-length element to SciPy, and a partial tag a short read.
+        let mut padded = whole.clone();
+        padded.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            loadmat(&padded, &opts),
+            Err(IoError::InvalidFormat("Did not read any bytes".to_string()))
+        );
+        let mut trailing = whole.clone();
+        trailing.extend_from_slice(&[1, 2, 3]);
+        assert!(matches!(
+            loadmat(&trailing, &opts),
+            Err(IoError::InvalidFormat(m)) if m.starts_with("could not read bytes")
+        ));
+        // A top-level element that is not a matrix.
+        let loose = mat5_file(&[mat5_element(MI_DOUBLE, &f64_bytes(&[1.0]))]);
+        assert_eq!(
+            loadmat(&loose, &opts),
+            Err(IoError::InvalidFormat(
+                "Expecting miMATRIX type here, got 9".to_string()
+            ))
+        );
+        // An unknown numeric element type (SciPy 1.17.1 segfaults on it).
+        let unknown = mat5_file(&[mat5_matrix(
+            6,
+            0,
+            &[1, 1],
+            b"x",
+            &[mat5_element(11, &[0; 8])],
+        )]);
+        assert!(matches!(
+            loadmat(&unknown, &opts),
+            Err(IoError::InvalidFormat(m)) if m.contains("not a numeric type")
+        ));
+        // A negative dimension (SciPy reshapes it into nonsense).
+        let negative = mat5_file(&[mat5_matrix(
+            6,
+            0,
+            &[-1, 1],
+            b"x",
+            &[mat5_element(MI_DOUBLE, &[])],
+        )]);
+        assert!(matches!(
+            loadmat(&negative, &opts),
+            Err(IoError::InvalidFormat(m)) if m.contains("negative dimension")
+        ));
+        // Dimensions longer than SciPy's 32-value buffer.
+        let many_dims = mat5_file(&[mat5_matrix(6, 0, &[1; 33], b"x", &[])]);
+        assert_eq!(
+            loadmat(&many_dims, &opts),
+            Err(IoError::InvalidFormat(
+                "Unexpected amount of data to read (malformed input file?)".to_string()
+            ))
+        );
+        // A sparse row index outside the matrix (SciPy builds an invalid csc_matrix), with the
+        // in-range control loading.
+        let sparse = |row: i32| {
+            mat5_file(&[mat5_matrix(
+                5,
+                0,
+                &[2, 2],
+                b"s",
+                &[
+                    mat5_element(MI_INT32, &i32_bytes(&[0, row])),
+                    mat5_element(MI_INT32, &i32_bytes(&[0, 1, 2])),
+                    mat5_element(MI_DOUBLE, &f64_bytes(&[5.0, 6.0])),
+                ],
+            )])
+        };
+        assert!(loadmat(&sparse(1), &opts).is_ok());
+        assert!(matches!(
+            loadmat(&sparse(7), &opts),
+            Err(IoError::InvalidFormat(m)) if m.contains("outside the 2-row matrix")
+        ));
+        // Nesting deeper than the stack guard, with a shallow control.
+        let nested = |depth: usize| {
+            let mut inner = scalar_double(b"", 1.0);
+            for _ in 0..depth {
+                inner = mat5_matrix(MatClass::Cell.code(), 0, &[1, 1], b"", &[inner]);
+            }
+            mat5_file(&[mat5_matrix(
+                MatClass::Cell.code(),
+                0,
+                &[1, 1],
+                b"deep",
+                &[inner],
+            )])
+        };
+        assert!(loadmat(&nested(20), &opts).is_ok());
+        assert!(matches!(
+            loadmat(&nested(150), &opts),
+            Err(IoError::InvalidFormat(m)) if m.contains("nest deeper")
+        ));
+    }
+
+    #[test]
+    fn loadmat_handles_compressed_streams_like_scipys_zlib_input_stream() {
+        let opts = LoadmatOptions::default();
+        let raw = scalar_double(b"x", 1.5);
+        let good = mat5_file(&[zlib_element(&raw)]);
+        assert_eq!(
+            load_default(&good).get("x"),
+            Some(&numeric(&[1, 1], MatData::F64(vec![1.5])))
+        );
+        // Not a zlib stream: SciPy raises zlib.error.
+        let mut bad_stream = mat5_header_bytes(false);
+        bad_stream.extend_from_slice(&MI_COMPRESSED.to_le_bytes());
+        bad_stream.extend_from_slice(&8u32.to_le_bytes());
+        bad_stream.extend_from_slice(&[0; 8]);
+        assert!(matches!(
+            loadmat(&bad_stream, &opts),
+            Err(IoError::InvalidFormat(m)) if m.contains("decompressing")
+        ));
+        // A damaged Adler-32 checksum.
+        let mut bad_sum = good.clone();
+        let last = bad_sum.len() - 1;
+        bad_sum[last] ^= 0xff;
+        assert_eq!(
+            loadmat(&bad_sum, &opts),
+            Err(IoError::InvalidFormat(
+                "Error -3 while decompressing data: incorrect data check".to_string()
+            ))
+        );
+        // A stream without its checksum decodes as far as it goes, as `decompressobj` does, and
+        // passes the integrity check because the variable consumed all of it.
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+        let mut no_checksum = mat5_header_bytes(false);
+        no_checksum.extend_from_slice(&MI_COMPRESSED.to_le_bytes());
+        no_checksum.extend_from_slice(
+            &u32::try_from(packed.len() - 4)
+                .expect("small")
+                .to_le_bytes(),
+        );
+        no_checksum.extend_from_slice(&packed[..packed.len() - 4]);
+        assert_eq!(
+            load_default(&no_checksum).get("x"),
+            Some(&numeric(&[1, 1], MatData::F64(vec![1.5])))
+        );
+        // Decompressed bytes left over after the variable: "Did not fully consume", unless the
+        // check is turned off.
+        let mut raw_plus = raw.clone();
+        raw_plus.extend_from_slice(&[0; 8]);
+        let overlong = mat5_file(&[zlib_element(&raw_plus)]);
+        assert!(matches!(
+            loadmat(&overlong, &opts),
+            Err(IoError::InvalidFormat(m)) if m.starts_with("Did not fully consume")
+        ));
+        let lenient = LoadmatOptions {
+            verify_compressed_data_integrity: false,
+            ..LoadmatOptions::default()
+        };
+        assert_eq!(
+            loadmat(&overlong, &lenient).map(|f| f.variables.len()),
+            Ok(1)
+        );
+        // A compressed element the file does not fully hold fails the check too.
+        let mut cut = good.clone();
+        let count = u32::try_from(good.len() - 128 - 8 + 5).expect("small");
+        cut[132..136].copy_from_slice(&count.to_le_bytes());
+        assert!(matches!(
+            loadmat(&cut, &opts),
+            Err(IoError::InvalidFormat(m)) if m.starts_with("Did not fully consume")
+        ));
+    }
+
+    #[test]
+    fn loadmat_reads_elements_as_scipy_1_17_1_does() {
+        // Each expectation is what live SciPy 1.17.1 returned for the same bytes.
+        let char_file = |dims: &[i32], mdtype: u32, payload: &[u8]| {
+            mat5_file(&[mat5_matrix(
+                4,
+                0,
+                dims,
+                b"c",
+                &[mat5_element(mdtype, payload)],
+            )])
+        };
+        let u16s = |units: &[u16]| {
+            units
+                .iter()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let text = |file: Vec<u8>| load_default(&file).get("c").cloned();
+        // miUINT16 units are narrowed to bytes and decoded as UTF-8 with replacement.
+        assert_eq!(
+            text(char_file(&[1, 3], MI_UINT16, &u16s(&[0x141, 0x42, 0x43]))),
+            Some(strings(&[1], 3, &["ABC"]))
+        );
+        assert_eq!(
+            text(char_file(&[1, 3], MI_UINT16, &u16s(&[0x80, 0x41, 0x42]))),
+            Some(strings(&[1], 3, &["\u{fffd}AB"]))
+        );
+        assert!(
+            loadmat(
+                &char_file(&[1, 2], MI_UINT16, &u16s(&[0xc3, 0xa9, 0x41, 0x42])),
+                &LoadmatOptions::default()
+            )
+            .is_err()
+        );
+        // miUTF16 with a lone surrogate, miUTF8 with a broken sequence, miINT8 above 127.
+        assert_eq!(
+            text(char_file(&[1, 3], MI_UTF16, &u16s(&[0x41, 0xd800, 0x42]))),
+            Some(strings(&[1], 3, &["A\u{fffd}B"]))
+        );
+        assert_eq!(
+            text(char_file(&[1, 4], MI_UTF8, b"\xe2\x82A\xffB")),
+            Some(strings(&[1], 4, &["\u{fffd}A\u{fffd}B"]))
+        );
+        assert_eq!(
+            text(char_file(&[1, 2], MI_INT8, &[0x41, 0x80])),
+            Some(strings(&[1], 2, &["A\u{fffd}"]))
+        );
+        // Extra characters are ignored, too few are an error, no bytes at all are spaces.
+        assert_eq!(
+            text(char_file(&[1, 2], MI_UTF8, b"abcd")),
+            Some(strings(&[1], 2, &["ab"]))
+        );
+        assert!(
+            loadmat(
+                &char_file(&[1, 4], MI_UTF8, b"ab"),
+                &LoadmatOptions::default()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            text(char_file(&[1, 3], MI_UTF8, b"")),
+            Some(strings(&[1], 3, &["   "]))
+        );
+        // chars_to_strings: trailing NULs end a string, the last axis is the string axis.
+        assert_eq!(
+            text(char_file(&[1, 4], MI_UTF8, b"ab\0\0")),
+            Some(strings(&[1], 4, &["ab"]))
+        );
+        assert_eq!(
+            text(char_file(&[2, 2], MI_UTF8, b"a\0b\0")),
+            Some(strings(&[2], 2, &["ab", ""]))
+        );
+        assert_eq!(
+            text(char_file(&[2, 1, 2], MI_UTF8, b"abcd")),
+            Some(strings(&[2, 1], 2, &["ac", "bd"]))
+        );
+        assert_eq!(
+            text(char_file(&[0, 5], MI_UTF8, b"")),
+            Some(strings(&[0], 5, &[]))
+        );
+        assert_eq!(
+            text(char_file(&[1, 0], MI_UTF8, b"")),
+            Some(strings(&[0], 1, &[]))
+        );
+        assert_eq!(
+            text(char_file(&[2, 3, 0], MI_UTF8, b"")),
+            Some(strings(&[2, 0], 1, &[]))
+        );
+        // A numeric type is not char data.
+        assert_eq!(
+            loadmat(
+                &char_file(&[1, 2], MI_DOUBLE, &f64_bytes(&[65.0, 66.0])),
+                &LoadmatOptions::default()
+            ),
+            Err(IoError::InvalidFormat(
+                "Type 9 does not appear to be char type".to_string()
+            ))
+        );
+
+        // Complex parts: complex64 for a 4-byte real part (16777217 rounds in float32), and a
+        // one-value imaginary part broadcasts.
+        let complex = mat5_file(&[mat5_matrix(
+            6,
+            8,
+            &[1, 2],
+            b"z",
+            &[
+                mat5_element(MI_INT32, &i32_bytes(&[16_777_217, 2])),
+                mat5_element(MI_UINT8, &[5, 6]),
+            ],
+        )]);
+        assert_eq!(
+            load_default(&complex).get("z"),
+            Some(&MatValue::Numeric(MatNumeric {
+                dims: vec![1, 2],
+                class: MatClass::Double,
+                logical: false,
+                real: MatData::F32(vec![16_777_216.0, 2.0]),
+                imag: Some(MatData::F32(vec![5.0, 6.0])),
+            }))
+        );
+        let broadcast = mat5_file(&[mat5_matrix(
+            6,
+            8,
+            &[1, 3],
+            b"z",
+            &[
+                mat5_element(MI_DOUBLE, &f64_bytes(&[1.0, 2.0, 3.0])),
+                mat5_element(MI_DOUBLE, &f64_bytes(&[5.0])),
+            ],
+        )]);
+        let imag = match load_default(&broadcast).get("z") {
+            Some(MatValue::Numeric(z)) => z.imag.clone(),
+            _ => None,
+        };
+        assert_eq!(imag, Some(MatData::F64(vec![5.0; 3])));
+
+        // Big-endian numeric data (SciPy returns '>f8' with the same values).
+        let mut big = mat5_header_bytes(true);
+        let payload: Vec<u8> = [1.5f64, -2.0]
             .iter()
-            .find(|a| a.name == "x")
-            .expect("x should exist");
-        let y = loaded
-            .iter()
-            .find(|a| a.name == "y")
-            .expect("y should exist");
-        assert_eq!(x.data, vec![1.0, 2.0, 3.0]);
-        assert_eq!(y.data, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(x.rows, 1);
-        assert_eq!(x.cols, 3);
-        assert_eq!(y.rows, 2);
-        assert_eq!(y.cols, 2);
+            .flat_map(|x| x.to_be_bytes())
+            .collect();
+        big.extend(mat5_matrix_in(
+            6,
+            0,
+            &[1, 2],
+            b"x",
+            &[mat5_element_in(MI_DOUBLE, &payload, true)],
+            true,
+        ));
+        let file = load_default(&big);
+        assert!(file.big_endian);
+        assert_eq!(
+            file.get("x"),
+            Some(&numeric(&[1, 2], MatData::F64(vec![1.5, -2.0])))
+        );
+
+        // Struct field names: repeated names renamed as SciPy renames them, a name running past
+        // its slot to the next NUL, and miUINT32 accepted for the name length.
+        let field = |names: &[u8], width: i32| {
+            mat5_file(&[mat5_matrix(
+                2,
+                0,
+                &[1, 1],
+                b"s",
+                &[
+                    mat5_element(MI_UINT32, &width.to_le_bytes()),
+                    mat5_element(MI_INT8, names),
+                    scalar_double(b"", 1.0),
+                    scalar_double(b"", 2.0),
+                    scalar_double(b"", 3.0),
+                ],
+            )])
+        };
+        let names = |file: Vec<u8>| match load_default(&file).get("s") {
+            Some(MatValue::Struct(s)) => s.field_names.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            names(field(b"a\0\0a\0\0a\0\0", 3)),
+            vec!["a", "_1_a", "_2_a"]
+        );
+        assert_eq!(names(field(b"abcd", 2)), vec!["abcd", "cd"]);
+        assert!(loadmat(&field(b"ab", 0), &LoadmatOptions::default()).is_err());
+    }
+
+    #[test]
+    fn loadmat_options_follow_scipy() {
+        let logical = mat5_matrix(9, 2, &[2, 1], b"b", &[mat5_element(MI_UINT8, &[1, 0])]);
+        let narrowed = mat5_matrix(
+            8,
+            0,
+            &[1, 2],
+            b"i8",
+            &[mat5_element(MI_DOUBLE, &f64_bytes(&[1.0, -1.5]))],
+        );
+        let complex = mat5_matrix(
+            6,
+            8,
+            &[1, 1],
+            b"z",
+            &[
+                mat5_element(MI_DOUBLE, &f64_bytes(&[1.0])),
+                mat5_element(MI_DOUBLE, &f64_bytes(&[2.0])),
+            ],
+        );
+        let cell = mat5_matrix(1, 0, &[1, 1], b"c", &[scalar_double(b"", 3.5)]);
+        let structs = mat5_matrix(
+            2,
+            0,
+            &[1, 2],
+            b"sa",
+            &[
+                mat5_element(MI_INT32, &2i32.to_le_bytes()),
+                mat5_element(MI_INT8, b"f\0"),
+                scalar_double(b"", 1.0),
+                scalar_double(b"", 2.0),
+            ],
+        );
+        let object = mat5_matrix(
+            3,
+            0,
+            &[1, 1],
+            b"o",
+            &[
+                mat5_element(MI_INT8, b"cls"),
+                mat5_element(MI_INT32, &2i32.to_le_bytes()),
+                mat5_element(MI_INT8, b"f\0"),
+                scalar_double(b"", 4.0),
+            ],
+        );
+        let workspace = mat5_matrix(9, 0, &[1, 3], b"", &[mat5_element(MI_UINT8, &[1, 2, 3])]);
+        let empty = mat5_matrix(6, 0, &[0, 3], b"e", &[mat5_element(MI_DOUBLE, &[])]);
+        let file = mat5_file(&[
+            logical, narrowed, complex, cell, structs, object, workspace, empty,
+        ]);
+
+        // Defaults: stored types, 2-D shapes.
+        let plain = load_default(&file);
+        assert_eq!(
+            plain.get("b"),
+            Some(&MatValue::Numeric(MatNumeric {
+                dims: vec![2, 1],
+                class: MatClass::Uint8,
+                logical: true,
+                real: MatData::U8(vec![1, 0]),
+                imag: None,
+            }))
+        );
+        // mat_dtype: logical -> bool, the int8 class's dtype (truncation), complex -> real part.
+        let typed = loadmat(
+            &file,
+            &LoadmatOptions {
+                mat_dtype: true,
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("mat_dtype");
+        let data = |file: &MatFile, name: &str| match file.get(name) {
+            Some(MatValue::Numeric(n)) => Some((n.real.clone(), n.imag.clone())),
+            _ => None,
+        };
+        assert_eq!(
+            data(&typed, "b"),
+            Some((MatData::Bool(vec![true, false]), None))
+        );
+        assert_eq!(data(&typed, "i8"), Some((MatData::I8(vec![1, -1]), None)));
+        assert_eq!(data(&typed, "z"), Some((MatData::F64(vec![1.0]), None)));
+        // The unnamed function workspace is read raw: no mat_dtype, no squeeze.
+        assert_eq!(
+            data(&typed, "__function_workspace__"),
+            Some((MatData::U8(vec![1, 2, 3]), None))
+        );
+
+        // squeeze_me: unit dimensions go, a 1x1 cell is its element, empty is 1-D length 0.
+        let squeezed = loadmat(
+            &file,
+            &LoadmatOptions {
+                squeeze_me: true,
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("squeeze");
+        assert_eq!(
+            squeezed.get("c"),
+            Some(&numeric(&[], MatData::F64(vec![3.5])))
+        );
+        assert_eq!(
+            squeezed.get("e"),
+            Some(&numeric(&[0], MatData::F64(Vec::new())))
+        );
+        let dims = |file: &MatFile, name: &str| match file.get(name) {
+            Some(MatValue::Numeric(n)) => Some(n.dims.clone()),
+            _ => None,
+        };
+        assert_eq!(dims(&squeezed, "b"), Some(vec![2]));
+        assert_eq!(dims(&squeezed, "__function_workspace__"), Some(vec![1, 3]));
+
+        // simplify_cells: a 1x2 struct array is a list of dicts, a 1x1 object a plain dict.
+        let simple = loadmat(
+            &file,
+            &LoadmatOptions {
+                simplify_cells: true,
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("simplify_cells");
+        let dict = |value: f64| {
+            MatValue::Struct(MatStruct {
+                dims: Vec::new(),
+                field_names: vec!["f".to_string()],
+                values: vec![numeric(&[], MatData::F64(vec![value]))],
+            })
+        };
+        assert_eq!(
+            simple.get("sa"),
+            Some(&MatValue::Cell(MatCell {
+                dims: vec![2],
+                items: vec![dict(1.0), dict(2.0)],
+            }))
+        );
+        assert_eq!(simple.get("o"), Some(&dict(4.0)));
+        // Without simplify_cells the object keeps its class.
+        assert!(matches!(plain.get("o"), Some(MatValue::Object(o)) if o.class_name == "cls"));
+
+        // variable_names: only those, in file order.
+        let picked = loadmat(
+            &file,
+            &LoadmatOptions {
+                variable_names: Some(vec!["z".to_string(), "b".to_string()]),
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("variable_names");
+        let names: Vec<&str> = picked.variables.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["b", "z"]);
+        let none = loadmat(
+            &file,
+            &LoadmatOptions {
+                variable_names: Some(Vec::new()),
+                ..LoadmatOptions::default()
+            },
+        )
+        .expect("no variables");
+        assert!(none.variables.is_empty());
+
+        // A repeated name keeps its first position and its last value; the global flag is kept.
+        let repeated = mat5_file(&[
+            scalar_double(b"x", 1.0),
+            scalar_double(b"y", 2.0),
+            mat5_matrix(
+                6,
+                4,
+                &[1, 1],
+                b"x",
+                &[mat5_element(MI_DOUBLE, &f64_bytes(&[3.0]))],
+            ),
+        ]);
+        let file = load_default(&repeated);
+        assert_eq!(
+            file.variables[0],
+            ("x".to_string(), numeric(&[1, 1], MatData::F64(vec![3.0])))
+        );
+        assert_eq!(file.header.map(|h| h.globals), Some(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn mat_data_cast_follows_numpy_astype() {
+        // NumPy 2.4.3 on x86-64, identical for 4- and 9-element arrays (`mat_dtype` casts).
+        let cast = |values: &[f64], dtype| MatData::F64(values.to_vec()).cast(dtype);
+        assert_eq!(
+            cast(&[300.7, -1.5, 70000.0, 40000.0], MatDtype::I8),
+            MatData::I8(vec![44, -1, 112, 64])
+        );
+        assert_eq!(
+            cast(&[300.7, -1.5, 1e10], MatDtype::U8),
+            MatData::U8(vec![44, 255, 0])
+        );
+        assert_eq!(
+            cast(&[70000.0, 40000.0, -70000.0], MatDtype::I16),
+            MatData::I16(vec![4464, -25536, -4464])
+        );
+        assert_eq!(
+            cast(&[f64::NAN, f64::INFINITY, -3e9, 2.5], MatDtype::I32),
+            MatData::I32(vec![i32::MIN, i32::MIN, i32::MIN, 2])
+        );
+        assert_eq!(
+            cast(&[1e19, -2.5], MatDtype::I64),
+            MatData::I64(vec![i64::MIN, -2])
+        );
+        assert_eq!(
+            cast(
+                &[
+                    -1.0,
+                    9_223_372_036_854_775_808.0,
+                    f64::NAN,
+                    18_446_744_073_709_551_616.0
+                ],
+                MatDtype::U64
+            ),
+            MatData::U64(vec![u64::MAX, 1 << 63, 1 << 63, 0])
+        );
+        assert_eq!(
+            MatData::U64(vec![u64::MAX, 70000]).cast(MatDtype::I16),
+            MatData::I16(vec![-1, 4464])
+        );
+        assert_eq!(
+            MatData::I64(vec![(1 << 53) + 1]).cast(MatDtype::F32),
+            MatData::F32(vec![9_007_199_254_740_992.0])
+        );
+        assert_eq!(
+            cast(&[0.0, -0.0, f64::NAN, 2.0], MatDtype::Bool),
+            MatData::Bool(vec![false, false, true, true])
+        );
+    }
+
+    #[test]
+    fn mat5_header_stamps_asctime_in_utc() {
+        // Python's time.asctime(time.gmtime(s)).
+        assert_eq!(asctime_utc(0), "Thu Jan  1 00:00:00 1970");
+        assert_eq!(asctime_utc(951_782_400), "Tue Feb 29 00:00:00 2000");
+        assert_eq!(asctime_utc(1_700_000_000), "Tue Nov 14 22:13:20 2023");
+        assert_eq!(asctime_utc(4_102_444_800), "Fri Jan  1 00:00:00 2100");
+        let header = mat5_file_header_bytes();
+        assert!(header.starts_with(b"MATLAB 5.0 MAT-file Platform: "));
+        assert_eq!(&header[124..128], &[0x00, 0x01, b'I', b'M']);
+        assert_eq!(matfile_version(&header), Ok((1, 0)));
+    }
+
+    #[test]
+    fn varmats_from_mat_splits_a_file_into_single_variable_files() {
+        let written = savemat(
+            &scipy_reference_content(),
+            &SavematOptions {
+                do_compression: true,
+                ..SavematOptions::default()
+            },
+        )
+        .expect("write");
+        let parts = varmats_from_mat(&written).expect("split");
+        assert_eq!(parts.len(), scipy_reference_content().len());
+        let whole = load_default(&written);
+        for ((name, part), (whole_name, value)) in parts.iter().zip(&whole.variables) {
+            assert_eq!(name, whole_name);
+            let single = load_default(part);
+            assert_eq!(single.variables, vec![(name.clone(), value.clone())]);
+        }
+        assert!(matches!(
+            varmats_from_mat(&hex_bytes(SCIPY_V4_REFERENCE)),
+            Err(IoError::UnsupportedFeature(_))
+        ));
     }
 
     #[test]
@@ -6537,14 +10435,25 @@ mod tests {
             0, 0, 0, 0, 2, 0, 0, 0, 118, 0, 0, 0, 0, 0, 0, 0, 36, 64, 0, 0, 0, 0, 0, 0, 52, 64, 0,
             0, 0, 0, 0, 0, 62, 64, 0, 0, 0, 0, 0, 0, 68, 64,
         ];
-        let loaded = loadmat(scipy_mat4).expect("fsci loadmat must read scipy MAT v4 output");
-        assert_eq!(loaded.len(), 2);
-        let a = loaded.iter().find(|m| m.name == "A").expect("A present");
-        assert_eq!((a.rows, a.cols), (2, 3));
-        assert_eq!(a.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let v = loaded.iter().find(|m| m.name == "v").expect("v present");
-        assert_eq!((v.rows, v.cols), (1, 4));
-        assert_eq!(v.data, vec![10.0, 20.0, 30.0, 40.0]);
+        let loaded = load_default(scipy_mat4);
+        assert_eq!(loaded.version, (0, 0));
+        assert!(loaded.header.is_none());
+        assert_eq!(loaded.variables.len(), 2);
+        // Column-major, as MATLAB and SciPy (`order='F'`) hold it.
+        assert_eq!(
+            loaded.get("A"),
+            Some(&numeric(
+                &[2, 3],
+                MatData::F64(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+            ))
+        );
+        assert_eq!(
+            loaded.get("v"),
+            Some(&numeric(
+                &[1, 4],
+                MatData::F64(vec![10.0, 20.0, 30.0, 40.0])
+            ))
+        );
     }
 
     #[test]
@@ -6568,77 +10477,46 @@ mod tests {
             0, 0, 0, 9, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 64, 0, 0, 0, 0, 0, 0, 52, 64,
             0, 0, 0, 0, 0, 0, 62, 64, 0, 0, 0, 0, 0, 0, 68, 64,
         ];
-        let loaded = loadmat(scipy_mat5).expect("fsci loadmat must read scipy MAT v5 output");
-        assert_eq!(loaded.len(), 2);
-        let a = loaded.iter().find(|m| m.name == "A").expect("A present");
-        assert_eq!((a.rows, a.cols), (2, 3));
-        assert_eq!(a.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let v = loaded.iter().find(|m| m.name == "v").expect("v present");
-        assert_eq!((v.rows, v.cols), (1, 4));
-        assert_eq!(v.data, vec![10.0, 20.0, 30.0, 40.0]);
-    }
-
-    #[test]
-    fn loadmat_v5_rejects_compressed_and_complex_clearly() {
-        // miCOMPRESSED top-level element (type 15) -> clear, actionable error.
-        let mut compressed = vec![0u8; 128];
-        compressed[0..10].copy_from_slice(b"MATLAB 5.0");
-        compressed[126] = b'I';
-        compressed[127] = b'M';
-        compressed.extend_from_slice(&15u32.to_le_bytes()); // miCOMPRESSED
-        compressed.extend_from_slice(&8u32.to_le_bytes());
-        compressed.extend_from_slice(&[0u8; 8]);
-        let err = loadmat(&compressed).expect_err("compressed must be rejected");
-        assert!(matches!(err, IoError::UnsupportedFeature(_)));
-
-        // Big-endian indicator "MI" -> clear unsupported error.
-        let mut big = vec![0u8; 128];
-        big[0..10].copy_from_slice(b"MATLAB 5.0");
-        big[126] = b'M';
-        big[127] = b'I';
-        let err = loadmat(&big).expect_err("big-endian must be rejected");
-        assert!(matches!(err, IoError::UnsupportedFeature(_)));
-    }
-
-    #[test]
-    fn savemat_binary_roundtrip_mat4_real_double() {
-        let arrays = vec![
-            MatArray {
-                name: "A".to_string(),
-                rows: 2,
-                cols: 2,
-                data: vec![1.0, 2.0, 3.0, 4.0],
-            },
-            MatArray {
-                name: "b".to_string(),
-                rows: 1,
-                cols: 3,
-                data: vec![5.0, 6.0, 7.0],
-            },
-        ];
-
-        let bytes = savemat(&arrays).expect("MAT v4 real doubles should serialize");
-        let loaded = loadmat(&bytes).expect("MAT v4 real doubles should parse");
-
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].name, "A");
-        assert_eq!(loaded[0].rows, 2);
-        assert_eq!(loaded[0].cols, 2);
-        assert_eq!(loaded[0].data, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(loaded[1].name, "b");
-        assert_eq!(loaded[1].rows, 1);
-        assert_eq!(loaded[1].cols, 3);
-        assert_eq!(loaded[1].data, vec![5.0, 6.0, 7.0]);
+        let loaded = load_default(scipy_mat5);
+        assert_eq!(loaded.version, (1, 0));
+        let header = loaded.header.clone().expect("Level 5 header");
+        assert!(
+            header
+                .text
+                .starts_with(b"MATLAB 5.0 MAT-file Platform: posix")
+        );
+        assert_eq!(header.version, "1.0");
+        assert!(header.globals.is_empty());
+        assert_eq!(
+            loaded.get("A"),
+            Some(&numeric(
+                &[2, 3],
+                MatData::F64(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+            ))
+        );
+        assert_eq!(
+            loaded.get("v"),
+            Some(&numeric(
+                &[1, 4],
+                MatData::F64(vec![10.0, 20.0, 30.0, 40.0])
+            ))
+        );
     }
 
     #[test]
     fn savemat_binary_uses_mat4_column_major_double_layout() {
-        let bytes = savemat(&[MatArray {
-            name: "A".to_string(),
-            rows: 2,
-            cols: 2,
-            data: vec![1.0, 2.0, 3.0, 4.0],
-        }])
+        let bytes = savemat(
+            &[(
+                "A".to_string(),
+                MatValue::Numeric(
+                    MatNumeric::from_row_major(2, 2, &[1.0, 2.0, 3.0, 4.0]).expect("2x2"),
+                ),
+            )],
+            &SavematOptions {
+                format: MatFormat::V4,
+                ..SavematOptions::default()
+            },
+        )
         .expect("MAT v4 real doubles should serialize");
 
         let expected = [
@@ -6657,31 +10535,74 @@ mod tests {
     }
 
     #[test]
-    fn loadmat_binary_rejects_complex_mat4_payload() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&0i32.to_le_bytes());
-        bytes.extend_from_slice(&1i32.to_le_bytes());
-        bytes.extend_from_slice(&1i32.to_le_bytes());
-        bytes.extend_from_slice(&1i32.to_le_bytes());
-        bytes.extend_from_slice(&2i32.to_le_bytes());
-        bytes.extend_from_slice(b"z\0");
-        bytes.extend_from_slice(&1.0f64.to_le_bytes());
-        bytes.extend_from_slice(&2.0f64.to_le_bytes());
-
-        let err = loadmat(&bytes).expect_err("complex MAT v4 payload should fail closed");
+    fn loadmat_reads_complex_char_and_sparse_mat4_payloads() {
+        let header = |mopt: i32, rows: i32, cols: i32, imagf: i32, name: &[u8]| {
+            let mut out: Vec<u8> = [
+                mopt,
+                rows,
+                cols,
+                imagf,
+                i32::try_from(name.len()).expect("short"),
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+            out.extend_from_slice(name);
+            out
+        };
+        let mut bytes = header(0, 1, 1, 1, b"z\0");
+        bytes.extend(f64_bytes(&[1.0, 2.0]));
         assert_eq!(
-            err,
-            IoError::UnsupportedFeature("MAT v4 complex matrices are not supported".to_string())
+            load_default(&bytes).get("z"),
+            Some(&MatValue::Numeric(MatNumeric::complex(
+                vec![1, 1],
+                MatData::F64(vec![1.0]),
+                MatData::F64(vec![2.0]),
+            )))
         );
-    }
-
-    #[test]
-    fn loadmat_binary_rejects_truncated_header() {
-        let err = loadmat(&[0, 0, 0]).expect_err("short MAT v4 header should fail");
+        // Char codes stored as doubles (teststring_4.2c_SOL2.mat does this), read as Latin-1.
+        let mut chars = header(1, 1, 3, 0, b"c\0");
+        chars.extend(f64_bytes(&[104.0, 233.0, 121.0]));
         assert_eq!(
-            err,
-            IoError::InvalidFormat("truncated MAT v4 header while reading mopt".to_string())
+            load_default(&chars).get("c"),
+            Some(&strings(&[1], 3, &["héy"]))
         );
+        // Sparse: 1-based (row, col, value) rows and a closing (rows, cols, 0) row, out of order
+        // and with a duplicate, become canonical CSC.
+        let mut sparse = header(2, 4, 3, 0, b"s\0");
+        sparse.extend(f64_bytes(&[
+            3.0, 1.0, 3.0, 3.0, 2.0, 1.0, 2.0, 2.0, 5.0, 7.0, 1.0, 0.0,
+        ]));
+        assert_eq!(
+            load_default(&sparse).get("s"),
+            Some(&MatValue::Sparse(MatSparse {
+                rows: 3,
+                cols: 2,
+                logical: false,
+                indptr: vec![0, 1, 2],
+                indices: vec![0, 2],
+                data: MatData::F64(vec![7.0, 6.0]),
+                imag: None,
+            }))
+        );
+        // Big-endian (mopt 1000): the file's first mopt decides the byte order.
+        let mut big: Vec<u8> = [1000i32, 1, 1, 0, 2]
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .collect();
+        big.extend_from_slice(b"b\0");
+        big.extend_from_slice(&(-0.5f64).to_be_bytes());
+        let file = load_default(&big);
+        assert!(file.big_endian);
+        assert_eq!(
+            file.get("b"),
+            Some(&numeric(&[1, 1], MatData::F64(vec![-0.5])))
+        );
+        // A truncated matrix: SciPy's "Not enough bytes to read matrix" (debigged_m4.mat).
+        assert!(matches!(
+            loadmat(&bytes[..bytes.len() - 1], &LoadmatOptions::default()),
+            Err(IoError::InvalidFormat(m)) if m.starts_with("Not enough bytes to read matrix 'z'")
+        ));
     }
 
     #[test]
