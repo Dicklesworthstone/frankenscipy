@@ -25,7 +25,10 @@ const PACKET_ID: &str = "FSCI-P2C-002";
 /// precision floor is ~1e-7 on |x| ≥ 1.5. wrightomega is essentially
 /// Newton-on-machine-precision so 1e-12 is fine there.
 const WOFZ_TOL: f64 = 1.0e-7;
-const WRIGHTOMEGA_TOL: f64 = 1.0e-12;
+// wrightomega is xsf's, bit-identical to SciPy. This is a TRUE relative tolerance, a few ulp. It
+// was an absolute 1e-12, blind to relative error on the tiny values below z = -18 where e^z
+// was returned early (frankenscipy-i20cg).
+const WRIGHTOMEGA_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per function.
 const ARMS: [&str; 2] = ["wofz_real", "wrightomega"];
@@ -110,7 +113,11 @@ fn generate_query() -> OracleQuery {
         });
     }
     // wrightomega real-argument samples
-    let wo_xs: &[f64] = &[-3.0, -1.0, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
+    // -40 and -18.96 sit in the range where e^z used to be returned; 50 and 1e21 cover the
+    // large-z seed and the z > 1e20 shortcut.
+    let wo_xs: &[f64] = &[
+        -3.0, -1.0, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, -40.0, -18.96, -5.0, 50.0, 1e21,
+    ];
     for (i, x) in wo_xs.iter().enumerate() {
         points.push(PointCase {
             case_id: format!("wrightomega_{i:02}_z{x}"),
@@ -234,7 +241,7 @@ fn diff_special_wofz_wrightomega() {
                 let (re, im) = wofz_real(case.x);
                 (vec![re, im], WOFZ_TOL)
             }
-            "wrightomega" => (vec![wrightomega_scalar(case.x)], WRIGHTOMEGA_TOL),
+            "wrightomega" => (vec![wrightomega_scalar(case.x)], WRIGHTOMEGA_TOL_REL),
             other => panic!("unknown func {other} in {}", case.case_id),
         };
         // The ledger rejects a length mismatch and a non-finite fsci element.
@@ -252,6 +259,12 @@ fn diff_special_wofz_wrightomega() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        // wrightomega's tolerance is relative to SciPy's value.
+        let tol = if case.func == "wrightomega" {
+            tol * scipy_v[0].abs()
+        } else {
+            tol
+        };
         ledger.compared(arm, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),

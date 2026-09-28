@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-10;
 const REL_TOL: f64 = 1.0e-10;
+// zetac is xsf's Cephes zetac, bit-identical to SciPy. This is a TRUE relative tolerance, a few
+// ulp. It shared binom's absolute-or-relative 1e-10, which could not see zetac 1e-9 off at
+// s = 30 or 5e-13 off on the negative axis (frankenscipy-i20cg).
+const ZETAC_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per op.
 const ARMS: [&str; 2] = ["binom", "zetac"];
@@ -112,8 +116,11 @@ fn generate_query() -> OracleQuery {
 
     // Covers s > 1, the critical strip 0 < s < 1 (Borwein eta evaluation,
     // frankenscipy-kk4vu), s = 0, and the reflected region s < 0.
+    // The last seven reach Cephes' other branches: exp-rational (12.5, 30.5), the power sum
+    // (60), the reflection (-3.5, -18.05) and the small-negative Taylor polynomial (-0.005).
     let zetac_xs = [
         2.0_f64, 3.0, 4.0, 5.0, 6.0, 1.5, 0.9, 0.7, 0.5, 0.3, 0.1, 0.0, -1.0, -2.0, -3.0, 10.0,
+        12.5, 30.0, 30.5, 60.0, -3.5, -18.05, -0.005,
     ];
     for s in zetac_xs {
         points.push(PointCase {
@@ -239,7 +246,11 @@ fn diff_special_binom_zetac() {
         } else {
             abs_d
         };
-        let pass = abs_d <= ABS_TOL || rel <= REL_TOL;
+        let pass = if case.op == "zetac" {
+            abs_d <= ZETAC_TOL_REL * expected.abs()
+        } else {
+            abs_d <= ABS_TOL || rel <= REL_TOL
+        };
         ledger.compared(&case.op, &case.case_id, pass);
         max_overall = max_overall.max(rel);
         diffs.push(CaseDiff {

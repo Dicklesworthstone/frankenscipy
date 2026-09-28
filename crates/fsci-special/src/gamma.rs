@@ -4628,13 +4628,13 @@ fn zetac_positive_rational(x: f64) -> f64 {
     }
 
     if x <= 10.0 {
-        let b = 2.0_f64.powf(x) * (x - 1.0);
+        let b = pow2_cephes(x) * (x - 1.0);
         let w = 1.0 / x;
         return (x * polevl(w, &ZETAC_P)) / (b * p1evl(w, &ZETAC_Q));
     }
 
     if x <= 50.0 {
-        let b = 2.0_f64.powf(-x);
+        let b = pow2_cephes(-x);
         let w = polevl(x, &ZETAC_A) / p1evl(x, &ZETAC_B);
         return w.exp() + b;
     }
@@ -4653,8 +4653,15 @@ fn zetac_positive_rational(x: f64) -> f64 {
             break;
         }
     }
-    let b = 2.0_f64.powf(-x);
+    let b = pow2_cephes(-x);
     (s + b) / (1.0 - b)
+}
+
+/// `pow(2, x)` as Cephes calls it. LLVM rewrites `2.0_f64.powf(x)` into `exp2(x)`, and glibc's
+/// `exp2` rounds differently from its `pow` on ~0.1% of arguments (108 of 100,000 on (1, 50)),
+/// which moved zetac an ulp or two off SciPy there. Hiding the base keeps the `pow` call.
+fn pow2_cephes(x: f64) -> f64 {
+    std::hint::black_box(2.0_f64).powf(x)
 }
 
 fn zeta_positive(s: f64) -> f64 {
@@ -4818,42 +4825,153 @@ pub fn zetac(s_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input_rp("zetac", s_tensor, mode, |s| Ok(zetac_scalar(s)), 1 << 15) // be ~30k
 }
 
-/// Compute the Riemann zeta function complement: zetac(s) = zeta(s) - 1 for scalar `s`.
+/// Riemann zeta function minus one, zetac(s) = ζ(s) - 1, for scalar `s`.
 ///
-/// Matches `scipy.special.zetac(s)`.
+/// Matches `scipy.special.zetac(s)`: xsf's Cephes `zetac`, bit-identical to SciPy 1.17.1 on
+/// 75,042 points.
+/// - s >= 0: `zetac_positive`, which is tabulated at integers 0..=30; the (1-x) rational R/S
+///   for s < 1; `zetac_positive_rational` beyond 1.
+/// - -0.01 < s < 0: a Taylor polynomial.
+/// - s <= -0.01: the reflection formula with Cephes' Lanczos sum.
 ///
-/// This is useful when zeta(s) is close to 1 (i.e., for large s > 1),
-/// where direct computation of zeta(s) - 1 would suffer from catastrophic
-/// cancellation. For large s, zetac(s) ≈ 2^(-s).
-///
-/// # Arguments
-/// * `s` - Real argument
-///
-/// # Returns
-/// ζ(s) - 1 for any real s ≠ 1
+/// It replaces a direct sum for s > 10, which stopped at an absolute 1e-18 term and so was
+/// 1e-9 relative off at s = 30, and `zeta(s) - 1` elsewhere, which was up to 5e-13 off on the
+/// negative axis (frankenscipy-i20cg).
 pub fn zetac_scalar(s: f64) -> f64 {
     if s.is_nan() {
+        return s;
+    }
+    if s == f64::NEG_INFINITY {
         return f64::NAN;
     }
+    if s < 0.0 && s > -0.01 {
+        return polevl(s, &ZETAC_TAYLOR0);
+    }
+    if s < 0.0 {
+        return zeta_reflection(-s) - 1.0;
+    }
     if s == 1.0 {
-        return f64::INFINITY; // pole of zeta
+        return f64::INFINITY;
     }
-    if s > 10.0 {
-        // For large s > 10, zetac(s) = sum_{n=2}^∞ n^(-s) ≈ 2^(-s) + 3^(-s) + ...
-        // Direct computation avoids subtraction from 1
-        let mut sum = 0.0_f64;
-        for n in 2..=100 {
-            let term = (n as f64).powf(-s);
-            if term < 1e-18 {
-                break;
-            }
-            sum += term;
+    if s < 1.0 {
+        // Integer 0 is tabulated (-1.5), as Cephes looks up integers before this branch.
+        if s == 0.0 {
+            return ZETAC_INTEGER[0];
         }
-        sum
-    } else {
-        // For smaller s, just compute zeta(s) - 1
-        zeta_scalar(s) - 1.0
+        return polevl(s, &ZETAC_R) / ((1.0 - s) * p1evl(s, &ZETAC_S));
     }
+    zetac_positive_rational(s)
+}
+
+/// `(1 - x)(ζ(x) - 1) = R(x)/S(x)` for `0 <= x <= 1`.
+#[allow(clippy::excessive_precision)]
+const ZETAC_R: [f64; 6] = [
+    -3.28717474506562731748E-1,
+    1.55162528742623950834E1,
+    -2.48762831680821954401E2,
+    1.01050368053237678329E3,
+    1.26726061410235149405E4,
+    -1.11578094770515181334E5,
+];
+
+/// Denominator for [`ZETAC_R`]; monic, so the leading `1.0` is implicit.
+#[allow(clippy::excessive_precision)]
+const ZETAC_S: [f64; 5] = [
+    1.95107674914060531512E1,
+    3.17710311750646984099E2,
+    3.03835500874445748734E3,
+    2.03665876435770579345E4,
+    7.43853965136767874343E4,
+];
+
+/// Taylor polynomial of `ζ(x) - 1` about 0, for `-0.01 < x < 0`, where the reflection's
+/// `1 - x` rounds to 1.
+#[allow(clippy::excessive_precision)]
+const ZETAC_TAYLOR0: [f64; 10] = [
+    -1.0000000009110164892,
+    -1.0000000057646759799,
+    -9.9999983138417361078e-1,
+    -1.0000013011460139596,
+    -1.000001940896320456,
+    -9.9987929950057116496e-1,
+    -1.000785194477042408,
+    -1.0031782279542924256,
+    -9.1893853320467274178e-1,
+    -1.5,
+];
+
+/// ζ(-x) for `x > 0` by the reflection formula (DLMF 25.4.2), as Cephes computes it: Cephes'
+/// Lanczos sum for Γ, with the large factors grouped so that they do not overflow first.
+fn zeta_reflection(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const SQRT2OPI: f64 = 7.978845608028653558798921198687637369517E-1;
+    let hx = x / 2.0;
+    if hx == hx.floor() {
+        // A zero of the sine factor: ζ at a negative even integer.
+        return 0.0;
+    }
+    let x_shift = x % 4.0;
+    let mut small_term = -SQRT2OPI * (0.5 * PI * x_shift).sin();
+    small_term *=
+        cephes_lanczos_sum_expg_scaled(x + 1.0) * crate::convenience::hurwitz_zeta(x + 1.0, 1.0);
+    let base = (x + CEPHES_LANCZOS_G + 0.5) / (2.0 * PI * std::f64::consts::E);
+    let large_term = base.powf(x + 0.5);
+    if large_term.is_finite() {
+        return large_term * small_term;
+    }
+    let large_term = base.powf(0.5 * x + 0.25);
+    (large_term * small_term) * large_term
+}
+
+/// Cephes' Lanczos `g` (Boost's lanczos13m53), which is exact in binary.
+#[allow(clippy::excessive_precision)]
+const CEPHES_LANCZOS_G: f64 = 6.024680040776729583740234375;
+
+/// Cephes `lanczos_sum_expg_scaled`: `ratevl` over the tables below, evaluated in `1/x` for
+/// `|x| > 1`. Numerator and denominator have equal degree, so Cephes' `pow(x, M - N)` factor is
+/// exactly 1.
+fn cephes_lanczos_sum_expg_scaled(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const NUM: [f64; 13] = [
+        0.006061842346248906525783753964555936883222,
+        0.5098416655656676188125178644804694509993,
+        19.51992788247617482847860966235652136208,
+        449.9445569063168119446858607650988409623,
+        6955.999602515376140356310115515198987526,
+        75999.29304014542649875303443598909137092,
+        601859.6171681098786670226533699352302507,
+        3481712.15498064590882071018964774556468,
+        14605578.08768506808414169982791359218571,
+        43338889.32467613834773723740590533316085,
+        86363131.28813859145546927288977868422342,
+        103794043.1163445451906271053616070238554,
+        56906521.91347156388090791033559122686859,
+    ];
+    const DENOM: [f64; 13] = [
+        1.0,
+        66.0,
+        1925.0,
+        32670.0,
+        357423.0,
+        2637558.0,
+        13339535.0,
+        45995730.0,
+        105258076.0,
+        150917976.0,
+        120543840.0,
+        39916800.0,
+        0.0,
+    ];
+    let reversed = x.abs() > 1.0;
+    let y = if reversed { 1.0 / x } else { x };
+    let at = |table: &[f64; 13], i: usize| if reversed { table[12 - i] } else { table[i] };
+    let mut num = at(&NUM, 0);
+    let mut denom = at(&DENOM, 0);
+    for i in 1..13 {
+        num = num * y + at(&NUM, i);
+        denom = denom * y + at(&DENOM, i);
+    }
+    num / denom
 }
 
 // ============================================================================
@@ -8638,6 +8756,41 @@ mod tests {
             assert!(
                 (lhs - rhs).abs() < 1e-9,
                 "ψ({x}+1) = {lhs}, expected ψ({x}) + 1/{x} = {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn zetac_is_scipy_cephes_bit_for_bit() {
+        // scipy.special.zetac 1.17.1 in each Cephes branch: reflection, the small-negative
+        // Taylor polynomial, (1-x)R/S, the rational in 1/x, exp-rational, and the power sum.
+        // 30.5 was the regression: the old direct sum stopped at an absolute 1e-18 term. The
+        // four with 17 significant digits are where exp2(x) and pow(2, x) round apart: an
+        // optimised build turns `2.0.powf(x)` into exp2, which missed SciPy there by an ulp.
+        // Only `cargo test --release` can see that; the dev profile never rewrites the call.
+        let cases = [
+            (-18.05, -0.27543197971002975),
+            (-3.5, -0.9955589886645205),
+            (-0.005, -1.4954302623133413),
+            (0.5, -2.4603545088095866),
+            (1.5, 1.6123753486854882),
+            (1.372_713_090_679_940_5, 2.286_695_030_344_013),
+            (8.893_732_445_416_685, 0.002_164_711_184_352_902),
+            (10.244_420_980_078_344, 0.000_838_079_028_326_297_6),
+            (31.645_327_310_579_106, 2.977_202_803_942_258e-10),
+            (12.5, 0.0001737517336431782),
+            (30.0, 9.313274324196682e-10),
+            (30.5, 6.585473125700447e-10),
+            (60.0, 8.673617380119933e-19),
+        ];
+        for (s, want) in cases {
+            // Opaque, so an optimised build cannot constant-fold `pow(2, s)` with the host's
+            // `pow` and hide what the compiled call does at run time.
+            let got = zetac_scalar(std::hint::black_box(s));
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "zetac({s}) = {got:e}, SciPy {want:e}"
             );
         }
     }

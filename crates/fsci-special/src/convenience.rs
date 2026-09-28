@@ -4728,36 +4728,47 @@ pub fn wrightomega(z_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult
 
 /// Scalar Wright Omega helper.
 pub fn wrightomega_scalar(z: f64) -> f64 {
-    let exp_z = z.exp();
-
-    // Initial guess via Lambert W approximation
-    let mut w = if z > 1.0 {
-        z - z.ln()
-    } else if z > -2.0 {
-        z.exp() / (1.0 + z.exp())
-    } else {
-        if exp_z <= 1.0e-8 {
-            return exp_z;
-        }
-        exp_z
-    };
-
-    // Newton iteration: f(w) = w + ln(w) - z, f'(w) = 1 + 1/w
-    for _ in 0..50 {
-        if z < 0.0 && (!w.is_finite() || w <= 0.0) {
-            return exp_z;
-        }
-        let residual = w + w.ln() - z;
-        if residual.abs() < 1e-15 {
-            break;
-        }
-        let next = w - residual / (1.0 + 1.0 / w);
-        if z < 0.0 && (!next.is_finite() || next <= 0.0) {
-            return exp_z;
-        }
-        w = next;
+    // xsf `wrightomega(double)`, bit-identical to SciPy 1.17.1 on 140,006 points. The seed is:
+    // - e^z below -2;
+    // - e^(2(z-1)/3) on [-2, 1);
+    // - z - ln z + ln z / z beyond.
+    // Then one Fritsch-Shafer-Crowley step, and a second when the condition estimate asks.
+    // e^z alone is returned only below -50, where W(e^z) = e^z - e^2z + ... already rounds to
+    // e^z. The previous Newton returned e^z from -18.4, 1e-8 relative off (frankenscipy-i20cg).
+    if z.is_nan() {
+        return z;
     }
-
+    if z.is_infinite() {
+        return if z > 0.0 { z } else { 0.0 };
+    }
+    if z < -50.0 {
+        return z.exp();
+    }
+    if z > 1e20 {
+        return z;
+    }
+    let mut w = if z < -2.0 {
+        z.exp()
+    } else if z < 1.0 {
+        (2.0 * (z - 1.0) / 3.0).exp()
+    } else {
+        let l = z.ln();
+        z - l + l / z
+    };
+    let fsc_step = |w: f64| -> (f64, f64, f64) {
+        let r = z - w - w.ln();
+        let wp1 = w + 1.0;
+        let e = r / wp1 * (2.0 * wp1 * (wp1 + 2.0 / 3.0 * r) - r)
+            / (2.0 * wp1 * (wp1 + 2.0 / 3.0 * r) - 2.0 * r);
+        (w * (1.0 + e), r, wp1)
+    };
+    let (next, r, wp1) = fsc_step(w);
+    w = next;
+    if ((2.0 * w * w - 8.0 * w - 1.0) * r.abs().powf(4.0)).abs()
+        >= f64::EPSILON * 72.0 * wp1.abs().powf(6.0)
+    {
+        w = fsc_step(w).0;
+    }
     w
 }
 
@@ -10852,6 +10863,29 @@ mod tests {
         assert!(ke_neg.im.is_nan());
         assert!(kep_neg.re.is_nan());
         assert!(kep_neg.im.is_nan());
+    }
+
+    #[test]
+    fn wrightomega_real_is_scipy_xsf_bit_for_bit() {
+        // scipy.special.wrightomega 1.17.1 on real input. -18.96 was the regression: e^z was
+        // returned from -18.4 down, 1e-8 relative off.
+        for (z, want) in [
+            (-40.0, 4.248354255291589e-18),
+            (-18.96, 5.831450863789683e-09),
+            (-5.0, 0.0066930004977309955),
+            (-1.0, 0.27846454276107374),
+            (0.5, 0.7662486081617502),
+            (3.0, 2.207940031569323),
+            (50.0, 46.167719165492095),
+            (1e21, 1e21),
+        ] {
+            let got = wrightomega_scalar(z);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "wrightomega({z}) = {got:e}, SciPy {want:e}"
+            );
+        }
     }
 
     #[test]
