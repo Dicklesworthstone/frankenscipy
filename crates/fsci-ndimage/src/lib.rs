@@ -11026,33 +11026,18 @@ pub fn rotate(
     };
 
     let (out_rows, out_cols) = if reshape {
-        // Compute new size to contain rotated image
-        let corners = [
-            (0.0, 0.0),
-            (rows as f64, 0.0),
-            (0.0, cols as f64),
-            (rows as f64, cols as f64),
-        ];
-        let cy = rows as f64 / 2.0;
-        let cx = cols as f64 / 2.0;
-        let mut min_y = f64::MAX;
-        let mut max_y = f64::MIN;
-        let mut min_x = f64::MAX;
-        let mut max_x = f64::MIN;
-        for (y, x) in corners {
-            let dy = y - cy;
-            let dx = x - cx;
-            let ny = cy + cos_a * dy - sin_a * dx;
-            let nx = cx + sin_a * dy + cos_a * dx;
-            min_y = min_y.min(ny);
-            max_y = max_y.max(ny);
-            min_x = min_x.min(nx);
-            max_x = max_x.max(nx);
-        }
-        (
-            (max_y - min_y).ceil() as usize,
-            (max_x - min_x).ceil() as usize,
-        )
+        // SciPy 1.17.1 `rotate`: out_bounds = rot_matrix @ [[0, 0, iy, iy], [0, ix, 0, ix]]
+        // with rot_matrix = [[c, s], [-s, c]], and each output extent is
+        // int(ptp(out_bounds) + 0.5). This took the ceiling instead, so a 5x5 image at 45
+        // degrees (extent 7.07) came out 8x8 where SciPy gives 7x7 (frankenscipy-q74y3).
+        let (iy, ix) = (rows as f64, cols as f64);
+        let extent = |a: f64, b: f64| {
+            let bounds = [0.0, b * ix, a * iy, a * iy + b * ix];
+            let hi = bounds.iter().copied().fold(f64::MIN, f64::max);
+            let lo = bounds.iter().copied().fold(f64::MAX, f64::min);
+            (hi - lo + 0.5) as usize
+        };
+        (extent(cos_a, sin_a), extent(-sin_a, cos_a))
     } else {
         (rows, cols)
     };
@@ -20170,9 +20155,28 @@ mod tests {
         let input = NdArray::new(data, vec![2, 2]).unwrap();
         let result = rotate(&input, 90.0, false, 0, BoundaryMode::Constant, 0.0).unwrap();
         assert_eq!(result.shape, vec![2, 2]);
-        // After 90° rotation: top-right becomes top-left, etc.
-        // Due to rounding, just check it doesn't crash and produces valid output
-        assert_eq!(result.data.len(), 4);
+        // scipy.ndimage.rotate([[1, 2], [3, 4]], 90, reshape=False, order=0) 1.17.1.
+        assert_eq!(result.data, vec![2.0, 4.0, 1.0, 3.0]);
+    }
+
+    #[test]
+    fn rotate_reshape_output_shape_matches_scipy() {
+        // SciPy 1.17.1 sizes the reshaped output as int(ptp(rot_matrix @ corners) + 0.5) per
+        // axis. A ceiling made 5x5 at 45 degrees 8x8 where SciPy gives 7x7 (frankenscipy-q74y3).
+        for (shape, angle, want) in [
+            ([5, 5], 45.0, [7, 7]),
+            ([5, 5], 30.0, [7, 7]),
+            ([10, 6], 30.0, [12, 10]),
+            ([10, 6], 45.0, [11, 11]),
+            ([7, 3], 60.0, [6, 8]),
+            ([4, 9], 135.0, [9, 9]),
+            ([6, 6], 90.0, [6, 6]),
+        ] {
+            let data: Vec<f64> = (0..shape[0] * shape[1]).map(|i| i as f64).collect();
+            let input = NdArray::new(data, shape.to_vec()).unwrap();
+            let result = rotate(&input, angle, true, 1, BoundaryMode::Constant, 0.0).unwrap();
+            assert_eq!(result.shape, want.to_vec(), "{shape:?} at {angle}");
+        }
     }
 
     #[test]

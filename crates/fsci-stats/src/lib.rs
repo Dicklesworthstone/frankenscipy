@@ -37235,6 +37235,10 @@ fn wilcoxon_tie_sum_by_resort(abs_diffs: &[f64]) -> f64 {
     tie_sum
 }
 
+/// SciPy's `wilcoxon(method='auto')` takes the normal approximation outright for more than
+/// this many differences (`_wilcoxon.py`: `if method == "auto" and d.shape[-1] > 50`).
+const WILCOXON_AUTO_EXACT_MAX_N: usize = 50;
+
 pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() != y.len() || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -37292,9 +37296,12 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
         .map(|(r, _)| *r)
         .sum();
 
-    // scipy `method='auto'` uses the EXACT signed-rank null distribution when no
-    // zeros were dropped and the absolute differences have no ties (ranks 1..n);
-    // it falls back to the normal approximation otherwise. frankenscipy-78v5y
+    // scipy `method='auto'` (1.17.1 `_wilcoxon.py`): more than 50 differences take the
+    // normal approximation outright. At most 50 take the EXACT signed-rank null distribution
+    // when no zeros were dropped and the absolute differences have no ties (ranks 1..n),
+    // frankenscipy-78v5y. Otherwise it is the permutation test (n ≤ 13) or the normal
+    // approximation. The cut was nr ≤ 1000, which gave the exact p-value where SciPy's
+    // default gives the approximation, for every 50 < n ≤ 1000 (frankenscipy-hlu5b).
     let no_zeros = x.len() == nr;
     // HISTORICAL (frankenscipy-78v5y): computing `no_ties` used to sort a clone of
     // abs_diffs, so it was gated behind the cheap `no_zeros && nr <= 1000` checks to spare
@@ -37310,9 +37317,9 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     let no_ties = || tie_sum == 0.0;
     let take_exact = if WILCOXON_FORCE_EAGER_NOTIES.load(std::sync::atomic::Ordering::Relaxed) {
         let nt = no_ties();
-        no_zeros && nt && nr <= 1000
+        no_zeros && nt && x.len() <= WILCOXON_AUTO_EXACT_MAX_N
     } else {
-        no_zeros && nr <= 1000 && no_ties()
+        no_zeros && x.len() <= WILCOXON_AUTO_EXACT_MAX_N && no_ties()
     };
     if take_exact {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, "two-sided");
@@ -37436,7 +37443,7 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // from the ranking pass answers that for free — it is zero exactly when no tie group
     // has size >= 2. BYTE-IDENTICAL as a predicate: both test exact equality.
     let no_ties = tie_sum == 0.0;
-    if no_zeros && no_ties && nr <= 1000 {
+    if no_zeros && no_ties && x.len() <= WILCOXON_AUTO_EXACT_MAX_N {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, alternative);
         return TtestResult {
             statistic: stat,

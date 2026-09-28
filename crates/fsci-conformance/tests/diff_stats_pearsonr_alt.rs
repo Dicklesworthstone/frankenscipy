@@ -116,13 +116,23 @@ fn generate_query() -> OracleQuery {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
             vec![3.5, 1.2, 4.5, 2.0, 5.0, 1.5, 4.0, 2.5, 3.0, 4.2],
         ),
-        // Strong (but not exact) anti-correlation. Exact r=±1 omitted
-        // because fsci's pvalue for the boundary disagrees with scipy
-        // — tracked separately as a P3 fsci defect.
+        // Strong (but not exact) anti-correlation.
         (
             "strong_anti",
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
             vec![10.05, 8.95, 8.05, 7.0, 6.05, 5.0, 4.0, 3.05, 2.0, 0.95],
+        ),
+        // Exact r = ±1: the p-value boundary. These were left out because fsci's boundary
+        // p-value disagreed with SciPy.
+        (
+            "exact_pos",
+            (1..=10).map(|i| i as f64).collect(),
+            (1..=10).map(|i| 2.0 * i as f64 + 1.0).collect(),
+        ),
+        (
+            "exact_neg",
+            (1..=10).map(|i| i as f64).collect(),
+            (1..=10).map(|i| 5.0 - 0.5 * i as f64).collect(),
         ),
     ];
     let alternatives = ["less", "greater"];

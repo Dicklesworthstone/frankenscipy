@@ -10,7 +10,7 @@
 //! z<0 and 0<z<1 series regimes; near-z=1 and |z|>1 are tested
 //! separately.
 //!
-//! 24 finite-valued (a, b, c, z) cases plus 4 real branch-cut
+//! 33 finite-valued (a, b, c, z) cases plus 4 real branch-cut
 //! cases via subprocess. Tolerances: 5e-7 rel — same as hyp1f1;
 //! Gauss hypergeometric is wide-tolerance coverage, not a
 //! precision claim.
@@ -143,7 +143,7 @@ fn generate_query() -> OracleQuery {
     //   ₂F₁(1, 1, 2, z) = -ln(1-z)/z
     //   ₂F₁(0.5, 0.5, 1, z) = (2/π)·K(z) (related to ellipk)
     //   ₂F₁(1, 1, 3/2, z²) = arcsin(z)/(z√(1-z²))
-    let cases: [(f64, f64, f64, f64); 24] = [
+    let cases: &[(f64, f64, f64, f64)] = &[
         // Identity: -ln(1-z)/z
         (1.0, 1.0, 2.0, 0.5),
         (1.0, 1.0, 2.0, -0.5),
@@ -167,10 +167,7 @@ fn generate_query() -> OracleQuery {
         // Small z
         (1.5, 2.5, 3.5, 0.001),
         (2.0, 4.0, 6.0, 1.0e-6),
-        // Negative-only z (faster series convergence). Stop
-        // short of -1 because fsci's hyp2f1 series returns NaN
-        // for |z| ≥ 0.99 in some (a, b, c) regimes — likely a
-        // truncation-vs-Pfaff-transformation seam.
+        // Negative z.
         (1.0, 2.0, 3.0, -0.9),
         (0.5, 1.5, 2.5, -0.5),
         // ₂F₁(a, b, b, z) = (1-z)^(-a)
@@ -179,6 +176,17 @@ fn generate_query() -> OracleQuery {
         // Misc
         (1.0, 0.5, 1.5, -0.3),
         (2.5, 1.5, 4.0, 0.2),
+        // |z| near and at 1, and z < −1. These were left out because fsci's series returned
+        // NaN for |z| ≥ 0.99 in some regimes.
+        (1.0, 2.0, 3.0, -0.99),
+        (1.0, 2.0, 3.0, -0.999),
+        (1.0, 2.0, 3.0, -1.0),
+        (0.5, 1.5, 2.5, -0.995),
+        (1.5, 2.5, 3.0, -0.99),
+        (0.5, 0.5, 1.0, 0.99),
+        (1.0, 1.0, 2.0, 0.999),
+        (2.0, 3.0, 4.0, -5.0),
+        (0.3, 0.7, 1.5, -3.0),
     ];
     let mut points = Vec::new();
     for (i, &(a, b, c, z)) in cases.iter().enumerate() {

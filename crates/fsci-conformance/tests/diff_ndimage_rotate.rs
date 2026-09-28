@@ -117,14 +117,10 @@ fn build_query() -> OracleQuery {
     //   * angle=0 (identity) for all order/mode/reshape combinations
     //   * angle=90 and 180 with order=0 (nearest-neighbor — boundary
     //     handling is independent of mode for these cell-aligned rotations)
-    //   * angle=90 and 180 with order=1 restricted to reflect/nearest
-    //     modes — constant/wrap diverge slightly at boundary cells
-    //     because fsci and scipy handle the cval-fill region differently
-    //     under the linear-interp branch. Documented limitation; not
-    //     enough to be a defect since both produce mathematically valid
-    //     rotated images, but exact element parity isnt achievable.
+    //   * angle=90 and 180 with order=1 in every mode. constant and wrap used to be left out
+    //     as "exact element parity isn't achievable"; they are back so the diff can show
+    //     whether that holds.
     let modes_all = ["reflect", "constant", "nearest", "wrap"];
-    let modes_safe = ["reflect", "nearest"];
     for mode in &modes_all {
         for &reshape in &[true, false] {
             for &order in &[0_usize, 1] {
@@ -165,7 +161,11 @@ fn build_query() -> OracleQuery {
                 });
             }
         }
-        for mode in &modes_safe {
+        for mode in &modes_all {
+            // As for order 0: 180° under constant has no stable SciPy reference.
+            if angle == 180.0 && *mode == "constant" {
+                continue;
+            }
             for &reshape in &[true, false] {
                 pts.push(CasePoint {
                     case_id: format!("rot{angle}_order1_{mode}_reshape{reshape}"),
@@ -177,6 +177,26 @@ fn build_query() -> OracleQuery {
                     order: 1,
                     mode: (*mode).into(),
                 });
+            }
+        }
+    }
+    // Non-cardinal angles, where every output pixel interpolates: orders 1 and 3 over all
+    // four modes. The module doc listed these, but no case generated them.
+    for &angle in &[30.0_f64, 45.0] {
+        for mode in &modes_all {
+            for &reshape in &[true, false] {
+                for &order in &[1_usize, 3] {
+                    pts.push(CasePoint {
+                        case_id: format!("rot{angle}_order{order}_{mode}_reshape{reshape}"),
+                        rows,
+                        cols,
+                        data: data.clone(),
+                        angle,
+                        reshape,
+                        order,
+                        mode: (*mode).into(),
+                    });
+                }
             }
         }
     }
@@ -326,6 +346,27 @@ fn diff_ndimage_rotate() {
                 max_abs = max_abs.max((a - e).abs());
             }
             let pass = max_abs <= ABS_TOL;
+            // frankenscipy-q74y3: order >= 2 under reflect is ~1e-5 off SciPy at 30/45 degrees.
+            // Only that signature is allowlisted, and only while it fails and stays below 1e-4:
+            // anything larger or different is a compared failure. Once fixed, these cases
+            // count as compared again with no edit here.
+            if !pass && case.order >= 2 && case.mode == "reflect" && max_abs < 1e-4 {
+                ledger.allowlisted(
+                    "rotate",
+                    &case.case_id,
+                    "frankenscipy-q74y3",
+                    "order >= 2 reflect differs from SciPy by ~1e-5 at non-cardinal angles",
+                );
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    rows,
+                    cols,
+                    max_abs_diff: max_abs,
+                    pass: true,
+                    note: "allowlisted under frankenscipy-q74y3".into(),
+                });
+                continue;
+            }
             ledger.compared("rotate", &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
@@ -361,5 +402,6 @@ fn diff_ndimage_rotate() {
     }
 
     assert!(all_pass, "rotate parity failed: {} cases", diffs.len());
-    ledger.finish(query.points.len());
+    let allowlisted = ledger.counts().get("rotate").map_or(0, |c| c.allowlisted);
+    ledger.finish(query.points.len() - allowlisted);
 }

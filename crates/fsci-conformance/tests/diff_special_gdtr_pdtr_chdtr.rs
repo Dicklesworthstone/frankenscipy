@@ -26,8 +26,10 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const CDF_TOL: f64 = 1.0e-12;
 const PPF_TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-/// One ledger arm per generated function. pdtri/chdtri have no cases (see `generate_query`).
-const ARMS: [&str; 6] = ["gdtr", "gdtrc", "pdtr", "pdtrc", "chdtr", "chdtrc"];
+/// One ledger arm per generated function.
+const ARMS: [&str; 8] = [
+    "gdtr", "gdtrc", "pdtr", "pdtrc", "pdtri", "chdtr", "chdtrc", "chdtri",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -159,15 +161,21 @@ fn generate_query() -> OracleQuery {
                 });
             }
         }
-        let _ = mu;
-        // pdtri intentionally omitted — fsci's local gammaincinv
-        // (gamma.rs:1723) diverges for small (k+1, 1-p), returning
-        // ~1e13 vs scipy 0.149 at k=1, p=0.99. Tracked separately
-        // as [frankenscipy-jr3na]. The fsci_special::gammaincinv
-        // export in convenience.rs is fine (validated by
-        // diff_special_gammainc); pdtri should be re-pointed to
-        // it.
-        let _ = qs;
+    }
+    // pdtri(k, q): the mean with pdtr(k, m) = q. It used to be omitted: the local gammaincinv
+    // returned ~1e13 where SciPy gives 0.149 at k=1, q=0.99. frankenscipy-jr3na re-pointed it
+    // at the validated gammaincinv.
+    for &k in &ks {
+        for &q in &qs {
+            let kf = f64::from(k);
+            points.push(PointCase {
+                case_id: format!("pdtri_k{k}_q{q}"),
+                func: "pdtri".to_string(),
+                p1: kf,
+                p2: 0.0,
+                arg: q,
+            });
+        }
     }
     for &df in &dfs {
         for &x in &xs_chdtr {
@@ -181,11 +189,17 @@ fn generate_query() -> OracleQuery {
                 });
             }
         }
-        // chdtri intentionally omitted — same root cause as
-        // pdtri: the local gammaincinv in gamma.rs diverges
-        // (chdtri(3, 0.99) returns ~5.6e5 vs scipy 0.115).
-        // Tracked in expanded frankenscipy-jr3na.
-        let _ = qs;
+        // chdtri(df, q): x with chdtrc(df, x) = q; it was omitted with pdtri, same cause
+        // (chdtri(3, 0.99) returned ~5.6e5 where SciPy gives 0.115), same fix.
+        for &q in &qs {
+            points.push(PointCase {
+                case_id: format!("chdtri_df{df}_q{q}"),
+                func: "chdtri".to_string(),
+                p1: df,
+                p2: 0.0,
+                arg: q,
+            });
+        }
     }
     OracleQuery { points }
 }
