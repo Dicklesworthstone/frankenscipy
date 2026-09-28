@@ -55,7 +55,7 @@ fsci-odr = { workspace = true }
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
 fsci-signal = { workspace = true }
-fsci-sparse = { workspace = true }
+fsci-sparse = { workspace = true, features = ["npz"] }
 fsci-special = { workspace = true }
 fsci-stats = { workspace = true }
 ftui = { workspace = true, features = ["runtime", "crossterm"], optional = true }

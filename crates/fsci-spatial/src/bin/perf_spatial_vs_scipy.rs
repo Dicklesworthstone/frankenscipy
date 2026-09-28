@@ -9,6 +9,9 @@
 //! C loop, and `cKDTree.query` is C++ with its own node layout. Comparing against SciPy's
 //! numpy-level code would mostly measure Python overhead.
 //!
+//! `delaunay` and `tsearch` (opt-in through `FSCI_SPATIAL_OPS`, 2-D) put Qhull itself on the
+//! other side: the triangulation build, and batched point location in a prebuilt one.
+//!
 //! Gates on nothing a running measurement cannot supply for itself — twelve harnesses in this
 //! tree abort on a booking claim that is unsatisfiable (bead fr78g), and copying that would
 //! make this one unrunnable too. Agreement is CHECKED by shipping our result back to the
@@ -20,7 +23,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use fsci_runtime::scipy_incumbent::ScipyIncumbent;
-use fsci_spatial::{DistanceMetric, KDTree, pdist};
+use fsci_spatial::{Delaunay, DistanceMetric, KDTree, pdist, tsearch};
 
 /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
 /// installation whose compiled submodules do not load, and that difference would otherwise
@@ -48,7 +51,7 @@ const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
 import scipy
-from scipy.spatial import cKDTree
+from scipy.spatial import Delaunay, cKDTree
 from scipy.spatial.distance import pdist
 
 op = os.environ['FSCI_SPATIAL_OP']
@@ -64,14 +67,33 @@ if len(qraw) != nq * dim * 8: raise RuntimeError('short queries')
 qry = np.frombuffer(qraw, dtype='<f8').reshape(nq, dim).copy()
 
 tree = cKDTree(pts) if op == 'kdtree' else None
+tri = Delaunay(pts) if op == 'tsearch' else None
+
+def simplex_keys(s):
+    # A triangle's identity independent of Qhull's order: its sorted vertices packed into one
+    # float, exact while n**3 < 2**53.
+    s = np.sort(s, axis=1).astype(np.float64)
+    return (s[:, 0] * n + s[:, 1]) * n + s[:, 2]
 
 def run():
     if op == 'pdist':
         return pdist(pts, metric='euclidean')
+    if op == 'delaunay':
+        return Delaunay(pts).simplices
+    if op == 'tsearch':
+        return tri.find_simplex(qry)
     d, _i = tree.query(qry, k=1)
     return d
 
-ref = np.ascontiguousarray(run(), dtype='<f8')
+def key(out):
+    # Applied to the checked result only, never inside the timed loop.
+    if op == 'delaunay':
+        return np.sort(simplex_keys(out))
+    if op == 'tsearch':
+        return np.where(out >= 0, simplex_keys(tri.simplices)[out], -1.0)
+    return out
+
+ref = np.ascontiguousarray(key(run()), dtype='<f8')
 print(f'READY scipy={scipy.__version__} numpy={np.__version__} op={op} n={n} dim={dim} nq={nq} '
       f'fixture_sha256={hashlib.sha256(raw).hexdigest()} '
       f'tasks={len(os.listdir("/proc/self/task"))} '
@@ -205,6 +227,26 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
+/// The Python side's `simplex_keys` for one triangle.
+fn simplex_key(vertices: &[usize], n: usize) -> f64 {
+    let mut v = [vertices[0], vertices[1], vertices[2]];
+    v.sort_unstable();
+    ((v[0] * n + v[1]) * n + v[2]) as f64
+}
+
+/// Uniform points in the unit square for the triangulation ops. The lattice fixture the
+/// other ops use puts every 2-D point on the line y = x + c (mod 1), which is degenerate for
+/// a triangulation.
+fn uniform_square(count: usize, state: &mut u64) -> Vec<Vec<f64>> {
+    let mut next = || {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..count).map(|_| vec![next(), next()]).collect()
+}
+
 fn main() {
     let n: usize = std::env::var("FSCI_SPATIAL_N")
         .ok()
@@ -263,28 +305,79 @@ fn main() {
         .map(|i| (0..dim).map(|d| coord(i + n, d)).collect())
         .collect();
 
-    for op in ["pdist", "kdtree"] {
+    // `delaunay` times the 2-D triangulation build and `tsearch` the batched point location on
+    // a prebuilt one (both select with FSCI_SPATIAL_OPS and need FSCI_SPATIAL_DIM=2). Each is
+    // checked on order-free simplex keys, because simplex numbering is Qhull's artifact.
+    let mut lcg_state = 11_u64;
+    let triangulation_points = uniform_square(n, &mut lcg_state);
+    let triangulation_queries = uniform_square(nq, &mut lcg_state);
+
+    for op in ["pdist", "kdtree", "delaunay", "tsearch"] {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
-        let mut scipy = Scipy::start(op, &points, &queries);
+        let triangulates = matches!(op, "delaunay" | "tsearch");
+        assert!(
+            !triangulates || dim == 2,
+            "op={op} needs FSCI_SPATIAL_DIM=2"
+        );
+        let (points, queries) = if triangulates {
+            (&triangulation_points, &triangulation_queries)
+        } else {
+            (&points, &queries)
+        };
+        let mut scipy = Scipy::start(op, points, queries);
         println!("{}", scipy.ready);
 
-        let tree = (op == "kdtree").then(|| KDTree::new(&points).expect("build fsci KDTree"));
+        let tree = (op == "kdtree").then(|| KDTree::new(points).expect("build fsci KDTree"));
+        let tri = (op == "tsearch").then(|| Delaunay::new(points).expect("build fsci Delaunay"));
 
+        // The timed call, which returns what it computed so nothing can be optimised away.
+        let run = || -> Vec<f64> {
+            match op {
+                "pdist" => pdist(points, DistanceMetric::Euclidean).expect("fsci pdist"),
+                "kdtree" => {
+                    let tree = tree.as_ref().expect("tree");
+                    queries
+                        .iter()
+                        .map(|q| tree.query(q).expect("fsci query").1)
+                        .collect()
+                }
+                "delaunay" => {
+                    let built = Delaunay::new(points).expect("fsci Delaunay");
+                    vec![built.simplices.len() as f64]
+                }
+                _ => {
+                    let found = tsearch(tri.as_ref().expect("tri"), queries).expect("tsearch");
+                    vec![found.len() as f64]
+                }
+            }
+        };
+        // The checked result, keyed like the Python side's `key`, outside any timed region.
         let ours = || -> Vec<f64> {
-            if op == "pdist" {
-                pdist(&points, DistanceMetric::Euclidean).expect("fsci pdist")
-            } else {
-                let tree = tree.as_ref().expect("tree");
-                queries
-                    .iter()
-                    .map(|q| tree.query(q).expect("fsci query").1)
-                    .collect()
+            match op {
+                "delaunay" => {
+                    let built = Delaunay::new(points).expect("fsci Delaunay");
+                    let mut keys: Vec<f64> =
+                        built.simplices.iter().map(|s| simplex_key(s, n)).collect();
+                    keys.sort_by(f64::total_cmp);
+                    keys
+                }
+                "tsearch" => {
+                    let tri = tri.as_ref().expect("tri");
+                    tsearch(tri, queries)
+                        .expect("tsearch")
+                        .iter()
+                        .map(|&s| {
+                            usize::try_from(s).map_or(-1.0, |s| simplex_key(&tri.simplices[s], n))
+                        })
+                        .collect()
+                }
+                _ => run(),
             }
         };
 
-        black_box(ours());
+        black_box(run());
         let _ = scipy.time(1, 1);
 
         // `FSCI_SPATIAL_FIXED_REPS` repeats the call inside one sample. Default stays 1 so
@@ -294,7 +387,7 @@ fn main() {
         let time_ours = || -> f64 {
             let started = Instant::now();
             for _ in 0..reps {
-                black_box(ours());
+                black_box(run());
             }
             started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
         };
@@ -331,7 +424,23 @@ fn main() {
         }
 
         let (fsci_ms, scipy_ms) = (median(fsci), median(sp));
-        let check = scipy.check(&ours());
+        // A triangulation with a different simplex count would desynchronise the CHECK
+        // exchange, which reads exactly SciPy's length; report it instead.
+        let checked = ours();
+        let scipy_len = scipy
+            .ready
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("out_len="))
+            .and_then(|v| v.parse::<usize>().ok())
+            .expect("READY line carries out_len");
+        let check = if checked.len() == scipy_len {
+            scipy.check(&checked)
+        } else {
+            format!(
+                "CHECK length_mismatch fsci={} scipy={scipy_len}",
+                checked.len()
+            )
+        };
         println!(
             "case=n{n}d{dim} op={op} fsci={fsci_ms:.3}ms scipy={scipy_ms:.3}ms \
              scipy/fsci={:.3}x null_fsci={:.3} null_scipy={:.3} {check}",

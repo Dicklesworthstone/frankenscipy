@@ -14,6 +14,7 @@ fn main() {
         first_step: None,
         max_step: f64::INFINITY,
         mode: RuntimeMode::Strict,
+        jac: None,
     };
     let res = solve_ivp(&mut |_t: f64, _y: &[f64]| vec![0.0], &opts);
     println!("{:?}", res.map(|r| r.y.last().unwrap().clone()));

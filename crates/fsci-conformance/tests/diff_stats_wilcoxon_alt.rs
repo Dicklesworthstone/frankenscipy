@@ -4,16 +4,14 @@
 //! — `'less'` and `'greater'`. The default two-sided is
 //! covered by diff_stats.rs.
 //!
-//! Resolves [frankenscipy-4my70]. fsci's wilcoxon_alternative
-//! returns the T+ statistic and a normal-approximation
-//! pvalue. scipy's mode='auto' default flips to an exact
-//! permutation table at small n and applies continuity
-//! correction by default; the oracle pins
-//! `mode='approx', correction=False` to match fsci's
-//! asymptotic-no-correction path.
+//! Resolves [frankenscipy-4my70]. The oracle calls SciPy's own default
+//! (`method='auto'`: exact without ties or zeros up to n = 50, a
+//! permutation test with them up to n = 13, else the normal
+//! approximation; `correction=False`). The n = 60 and 120 fixtures pin the
+//! n > 50 switch that fsci missed (frankenscipy-hlu5b).
 //!
-//! 4 paired fixtures × 2 alternatives × 2 active arms
-//! (statistic + pvalue) = 16 cases via subprocess. Tol 1e-9
+//! 6 paired fixtures × 3 alternatives × 2 active arms
+//! (statistic + pvalue) = 36 cases via subprocess. Tol 1e-9
 //! abs.
 
 use std::collections::{BTreeMap, HashMap};
@@ -98,6 +96,14 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write wilcoxon_alt diff log");
 }
 
+/// `y = x + d` for `x = 0..n` with differences `d_i = shift + (i·37 mod 101)/97 − 0.5`,
+/// scaled so no two `|d_i|` tie and none is zero.
+fn untied_shift(n: u32, shift: f64) -> Vec<f64> {
+    (0..n)
+        .map(|i| f64::from(i) + shift + f64::from(i * 37 % 101) / 97.0 - 0.5 + f64::from(i) * 1e-4)
+        .collect()
+}
+
 fn generate_query() -> OracleQuery {
     let fixtures: Vec<(&str, Vec<f64>, Vec<f64>)> = vec![
         // Treatment effect: y consistently larger
@@ -128,8 +134,23 @@ fn generate_query() -> OracleQuery {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
             vec![2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
         ),
+        // More than 50 differences with no ties or zeros: SciPy's auto takes the normal
+        // approximation here, not the exact distribution. The shifts are small so the p-values
+        // are moderate: at a strong shift both are ~1e-11 and a 1e-9 tolerance cannot tell the
+        // exact tail from the normal one.
+        (
+            "no_ties_n60",
+            (0..60).map(f64::from).collect(),
+            untied_shift(60, 0.06),
+        ),
+        (
+            "no_ties_n120",
+            (0..120).map(f64::from).collect(),
+            untied_shift(120, -0.03),
+        ),
     ];
-    let alternatives = ["less", "greater"];
+    // two-sided too, for the n > 50 fixtures' sake: the plain `wilcoxon` had the same cut.
+    let alternatives = ["less", "greater", "two-sided"];
 
     let mut points = Vec::new();
     for (name, x, y) in &fixtures {
@@ -167,18 +188,11 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     y = np.array(case["y"], dtype=float)
     try:
-        # Mirror fsci's dispatch: exact permutation for len(x) <= 13,
-        # asymptotic normal beyond (frankenscipy-qghyr). The earlier blanket
-        # mode='approx' pin compared scipy's normal approximation against
-        # fsci's exact permutation on small tied cases and diverged by up
-        # to 0.0033 (2026-09-04, ia47s).
-        method = "exact" if len(x) <= 13 else "approx"
-        # fsci's asymptotic path has no continuity correction.
-        correction = False
-        res = stats.wilcoxon(
-            x, y, alternative=alt, mode=method, correction=correction,
-            zero_method='wilcox',
-        )
+        # SciPy's own default: method='auto', correction=False, zero_method='wilcox'. This
+        # oracle used to mirror fsci's dispatch instead ('exact' up to n = 13, else 'approx'),
+        # which hid fsci taking the exact path up to n = 1000 where SciPy's auto switches to
+        # the normal approximation above n = 50 (frankenscipy-hlu5b).
+        res = stats.wilcoxon(x, y, alternative=alt)
         points.append({
             "case_id": cid,
             "statistic": fnone(res.statistic),

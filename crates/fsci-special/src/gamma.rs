@@ -2930,7 +2930,7 @@ fn gamma_lanczos(x: f64) -> f64 {
     log_abs_value.exp().copysign(coeff_sum)
 }
 
-fn digamma_core(x: f64) -> f64 {
+pub(crate) fn digamma_core(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
@@ -2951,27 +2951,130 @@ fn digamma_core(x: f64) -> f64 {
     if is_negative_integer_pole(x) {
         return f64::NAN;
     }
+    // SciPy's xsf `digamma`, bit-identical on 150,022 points. Near the negative root it
+    // sums a Taylor series, whose coefficients are Hurwitz zeta values at the root; anywhere
+    // else it is Cephes `psi`.
+    //
+    // This used to shift x up to 12 and apply the Bernoulli asymptotic series. Near either
+    // root that cancels about 2.5 - 2.5, so an absolute error of about 3e-15 became relative
+    // error of 1e-12 or worse (frankenscipy-re34v).
+    if (x - DIGAMMA_NEGROOT).abs() < 0.3 {
+        let z = x - DIGAMMA_NEGROOT;
+        let mut res = DIGAMMA_NEGROOT_VALUE;
+        let mut coeff = -1.0;
+        for n in 1..100 {
+            coeff *= -z;
+            let term = coeff * crate::convenience::hurwitz_zeta(f64::from(n + 1), DIGAMMA_NEGROOT);
+            res += term;
+            if term.abs() < f64::EPSILON * res.abs() {
+                break;
+            }
+        }
+        return res;
+    }
+    cephes_psi(x)
+}
 
+/// The negative root of digamma nearest the origin, and digamma's value there as a double.
+const DIGAMMA_NEGROOT: f64 = -0.504_083_008_264_455_4;
+const DIGAMMA_NEGROOT_VALUE: f64 = 7.289_763_902_976_895e-17;
+
+/// Cephes `psi` for finite, nonzero x that is not a negative integer.
+fn cephes_psi(mut x: f64) -> f64 {
+    let mut y = 0.0;
     if x < 0.0 {
-        return digamma_core(1.0 - x) - PI / crate::convenience::tanpi(x);
+        // Reduce before tan(pi * x); fract() is Cephes' modf remainder, exact.
+        y = -PI / (PI * x.fract()).tan();
+        x = 1.0 - x;
     }
-
-    let mut shifted = x;
-    let mut acc = 0.0;
-    while shifted < 12.0 {
-        acc -= 1.0 / shifted;
-        shifted += 1.0;
+    if x <= 10.0 && x == x.floor() {
+        let n = x as u32;
+        for i in 1..n {
+            y += 1.0 / f64::from(i);
+        }
+        return y - CEPHES_EULER;
     }
+    if x < 1.0 {
+        y -= 1.0 / x;
+        x += 1.0;
+    } else if x < 10.0 {
+        while x > 2.0 {
+            x -= 1.0;
+            y += 1.0 / x;
+        }
+    }
+    if (1.0..=2.0).contains(&x) {
+        return y + digamma_imp_1_2(x);
+    }
+    y + psi_asy(x)
+}
 
-    let inv = 1.0 / shifted;
-    let inv2 = inv * inv;
-    // Bernoulli asymptotic extended through the B₁₀ term (was truncated at B₆,
-    // leaving ~2.5e-10 at the shift point). frankenscipy-luxsz.
-    acc + shifted.ln()
-        - 0.5 * inv
-        - inv2
-            * (1.0 / 12.0
-                - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))))
+/// Euler's constant as Cephes spells it (the same double as `std`'s `EGAMMA`).
+#[allow(clippy::excessive_precision)]
+const CEPHES_EULER: f64 = 0.577215664901532860606512090082402431;
+
+/// Boost's rational on [1, 2], anchored at the positive root:
+/// (x - root) · (Y + P(x-1)/Q(x-1)). The root is split into three doubles so that
+/// x - root is exact to well below an ulp of the result.
+fn digamma_imp_1_2(x: f64) -> f64 {
+    const Y: f64 = 0.995_581_626_892_089_84; // a float in Boost; exact in f64
+    const ROOT1: f64 = 1_569_415_565.0 / 1_073_741_824.0;
+    const ROOT2: f64 = (381_566_830.0 / 1_073_741_824.0) / 1_073_741_824.0;
+    #[allow(clippy::excessive_precision)]
+    const ROOT3: f64 = 0.9016312093258695918615325266959189453125e-19;
+    const P: [f64; 6] = [
+        -0.002_071_332_116_774_595_2,
+        -0.045_251_321_448_739_056,
+        -0.289_191_264_447_747_84,
+        -0.650_318_537_708_965_07,
+        -0.325_550_311_868_044_91,
+        0.254_798_510_611_315_51,
+    ];
+    const Q: [f64; 7] = [
+        -0.557_898_413_216_755_13e-6,
+        0.002_128_498_701_782_114_4,
+        0.054_151_797_245_674_225,
+        0.435_935_296_926_659_69,
+        1.460_624_290_976_351_5,
+        2.076_711_702_373_046_9,
+        1.0,
+    ];
+    let mut g = x - ROOT1;
+    g -= ROOT2;
+    g -= ROOT3;
+    let r = cephes_polevl_exact(x - 1.0, &P) / cephes_polevl_exact(x - 1.0, &Q);
+    g * Y + g * r
+}
+
+/// Cephes' asymptotic series for x >= 10.
+fn psi_asy(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const A: [f64; 7] = [
+        8.33333333333333333333E-2,
+        -2.10927960927960927961E-2,
+        7.57575757575757575758E-3,
+        -4.16666666666666666667E-3,
+        3.96825396825396825397E-3,
+        -8.33333333333333333333E-3,
+        8.33333333333333333333E-2,
+    ];
+    let y = if x < 1.0e17 {
+        let z = 1.0 / (x * x);
+        z * cephes_polevl_exact(z, &A)
+    } else {
+        0.0
+    };
+    x.ln() - 0.5 / x - y
+}
+
+/// Cephes `polevl`: Horner from the leading coefficient.
+#[inline(always)]
+fn cephes_polevl_exact<const N: usize>(x: f64, coef: &[f64; N]) -> f64 {
+    let mut ans = coef[0];
+    for &c in &coef[1..] {
+        ans = ans * x + c;
+    }
+    ans
 }
 
 fn trigamma_core(x: f64) -> f64 {
@@ -8529,14 +8632,48 @@ mod tests {
         // a non-positive integer. Independent of any specific value;
         // catches drift in either the recurrence-shift branch or the
         // asymptotic series. Pin across multiple x.
-        // 1e-9 envelope reflects the asymptotic-series truncation
-        // residual (~5e-11 for moderate x, growing with x).
         for &x in &[0.25_f64, 0.5, 1.5, 2.7, 5.3, 9.1, 17.4] {
             let lhs = digamma_core(x + 1.0);
             let rhs = digamma_core(x) + 1.0 / x;
             assert!(
                 (lhs - rhs).abs() < 1e-9,
                 "ψ({x}+1) = {lhs}, expected ψ({x}) + 1/{x} = {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn digamma_is_scipy_xsf_bit_for_bit() {
+        // scipy.special.digamma 1.17.1. Both roots and their neighbours are the regression:
+        // the old shift-to-12 asymptotic cancelled ~2.5 - 2.5 there and was off by 1e-12
+        // relative or worse. -0.504..., -0.3 and -0.5040830081644554 take the zeta series;
+        // -10.5 the reflection; 7.0 the harmonic sum; 12.5 and 1e18 the asymptotic.
+        let cases = [
+            (1.4616321449683622, -9.241265521729427e-17),
+            (1.4616321449693623, 9.676658594180966e-13),
+            (1.46, -0.0015805619870834522),
+            (-0.5040830082644554, 7.289763902976895e-17),
+            (-0.5040830081644554, 8.939800027369837e-10),
+            (-0.3, 2.1133097796353972),
+            (0.3, -3.502524222200133),
+            (2.5, 0.7031566406452432),
+            (7.0, 1.872784335098467),
+            (12.5, 2.4851956512749123),
+            (-10.5, 2.3982391295357814),
+            (1e-300, -9.999999999999999e299),
+            (1e18, 41.44653167389282),
+        ];
+        for (x, expected) in cases {
+            let got = digamma_core(x);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(expected),
+                "digamma({x:e}) = {got:e}, SciPy {expected:e}"
+            );
+            assert_eq!(
+                crate::convenience::digamma_scalar(x).to_bits(),
+                got.to_bits(),
+                "convenience::digamma_scalar({x:e}) left the one kernel"
             );
         }
     }
@@ -8558,10 +8695,7 @@ mod tests {
             (3.0, 1.5 - gamma_em),
             (4.0, 1.0 + 0.5 + 1.0 / 3.0 - gamma_em),
         ];
-        // Tolerance reflects the ~2e-10 residual of the asymptotic-
-        // with-shift digamma_core (Euler-Maclaurin truncated at
-        // order 1/x⁷). Tighter than 1e-9 would require extending the
-        // series; pin the current envelope.
+        // Closed forms, not SciPy's doubles: `digamma_is_scipy_xsf_bit_for_bit` pins those.
         for &(x, expected) in cases {
             let got = digamma_core(x);
             assert!(

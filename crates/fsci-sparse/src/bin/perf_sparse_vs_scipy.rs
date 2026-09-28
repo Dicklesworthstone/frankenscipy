@@ -2354,9 +2354,12 @@ mod bench {
             );
         }
         if matches!(method, Method::Gmres) {
+            // The constant gmres() actually uses; a hard-coded 20 kept printing while the
+            // solver ran 30 (frankenscipy-felow regression).
             println!(
-                "solver_schedule: frankenscipy_restart=20 scipy_restart=default_20 \
-                 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
+                "solver_schedule: frankenscipy_restart={} scipy_restart=default_20 \
+                 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing",
+                fsci_sparse::linalg::GMRES_DEFAULT_RESTART
             );
         }
         if matches!(method, Method::Cg) {

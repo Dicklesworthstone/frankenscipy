@@ -4,7 +4,8 @@
 //! `scipy.stats.cramervonmises_2samp(x, y)`.
 //!
 //! Resolves [frankenscipy-xu25f]. Cross-checks both the
-//! T-statistic and the asymptotic p-value across 4 (x, y)
+//! T-statistic and SciPy's default (`method='auto'`: exact for samples of at most 20,
+//! asymptotic beyond) p-value across 4 (x, y)
 //! fixtures.
 //!
 //! 4 fixtures × 2 arms = 8 cases via subprocess. Tol 1e-12
@@ -156,8 +157,10 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     y = np.array(case["y"], dtype=float)
     try:
-        # method='asymptotic' to match fsci's default Bessel-K series.
-        res = stats.cramervonmises_2samp(x, y, method='asymptotic')
+        # SciPy's own default, method='auto': exact when neither sample exceeds 20. This used to
+        # pin 'asymptotic' "to match fsci's default Bessel-K series", which left fsci's default
+        # auto path uncompared.
+        res = stats.cramervonmises_2samp(x, y)
         points.append({
             "case_id": cid,
             "statistic": fnone(res.statistic),

@@ -36,8 +36,9 @@ fn main() {
         off += 16;
     }
 
-    let tri = Delaunay::new(&pts).expect("delaunay");
-    let hull = ConvexHull::new(&pts).expect("hull");
+    let rows: Vec<Vec<f64>> = pts.iter().map(|&(x, y)| vec![x, y]).collect();
+    let tri = Delaunay::new(&rows).expect("delaunay");
+    let hull = ConvexHull::new(&rows).expect("hull");
     let h = hull.vertices.len();
     let expected = 2 * np - 2 - h;
     println!(
@@ -53,7 +54,7 @@ fn main() {
     let tri_area: f64 = tri
         .simplices
         .iter()
-        .map(|&(i, j, k)| area(pts[i], pts[j], pts[k]))
+        .map(|s| area(pts[s[0]], pts[s[1]], pts[s[2]]))
         .sum();
     let hv: Vec<(f64, f64)> = hull.vertices.iter().map(|&i| pts[i]).collect();
     let mut hull_area = 0.0;
@@ -66,9 +67,12 @@ fn main() {
         100.0 * (hull_area - tri_area) / hull_area
     );
 
-    let missed = xi
+    let queries: Vec<Vec<f64>> = xi.iter().map(|&(x, y)| vec![x, y]).collect();
+    let missed = tri
+        .find_simplex(&queries, false, None)
+        .expect("find_simplex")
         .iter()
-        .filter(|&&q| tri.find_simplex(q).is_none())
+        .filter(|&&s| s < 0)
         .count();
     println!("queries={nq} queries_with_no_containing_triangle={missed}");
 }

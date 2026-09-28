@@ -9,6 +9,7 @@ use fsci_runtime::{
 
 use crate::IntegrateValidationError;
 use crate::bdf::{BdfSolver, BdfSolverConfig};
+use crate::lsoda::{JacFn, Lsoda, LsodaMethod, LsodaSetup, Task};
 use crate::rk::{RK23_TABLEAU, RK45_TABLEAU, RkSolver, RkSolverConfig};
 use crate::solver::{OdeSolver, OdeSolverState, StepFailure, StepOutcome};
 use crate::validation::{
@@ -79,7 +80,7 @@ pub struct OdeSolution {
     pub alt_segment: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SolveIvpOptions<'a> {
     pub t_span: (f64, f64),
     pub y0: &'a [f64],
@@ -92,6 +93,36 @@ pub struct SolveIvpOptions<'a> {
     pub first_step: Option<f64>,
     pub max_step: f64,
     pub mode: RuntimeMode,
+    /// SciPy's `jac`: `jac(t, y)[i][j] = d f_i / d y_j`. LSODA uses it in place of its
+    /// finite-difference Jacobian (ODEPACK `jt = 1` instead of 2). The explicit Runge-Kutta
+    /// methods ignore it, as SciPy's do (with a warning there); BDF and Radau here form their
+    /// Jacobians by differences only, so a `jac` with either is refused as not implemented
+    /// rather than silently not used.
+    pub jac: Option<JacFn>,
+}
+
+/// Field by field, with `jac` compared by address (`fn_addr_eq`), as [`EventSpec`] compares
+/// its event functions.
+impl PartialEq for SolveIvpOptions<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let jac_eq = match (self.jac, other.jac) {
+            (Some(a), Some(b)) => std::ptr::fn_addr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.t_span == other.t_span
+            && self.y0 == other.y0
+            && self.method == other.method
+            && self.t_eval == other.t_eval
+            && self.dense_output == other.dense_output
+            && self.events == other.events
+            && self.rtol == other.rtol
+            && self.atol == other.atol
+            && self.first_step == other.first_step
+            && self.max_step == other.max_step
+            && self.mode == other.mode
+            && jac_eq
+    }
 }
 
 impl Default for SolveIvpOptions<'_> {
@@ -108,6 +139,7 @@ impl Default for SolveIvpOptions<'_> {
             first_step: None,
             max_step: f64::INFINITY,
             mode: RuntimeMode::Strict,
+            jac: None,
         }
     }
 }
@@ -195,9 +227,9 @@ fn validate_events_with_audit(
 /// declaration order — `t_span` (two `f64`), `y0` (`f64s`), `method` (`Debug`), `t_eval`
 /// (presence flag, then `f64s`), `dense_output`, `events` (presence flag, then the count and,
 /// per event, `direction` then `max_events` as presence flag and value), `rtol`, `atol`
-/// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`
-/// and `mode` (`Debug`). The right-hand side and the event functions are code, not data, and
-/// are not part of it.
+/// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`,
+/// `mode` (`Debug`) and `jac` (presence flag only). The right-hand side, the event functions and
+/// the Jacobian are code, not data, and are not part of it.
 fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
     let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp");
     fingerprinter
@@ -228,7 +260,8 @@ fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
     fingerprint_optional_f64(&mut fingerprinter, options.first_step);
     fingerprinter
         .f64(options.max_step)
-        .str(&format!("{:?}", options.mode));
+        .str(&format!("{:?}", options.mode))
+        .bool(options.jac.is_some());
     fingerprinter.finish()
 }
 
@@ -533,307 +566,318 @@ where
     }
 }
 
-enum LsodaMode {
-    Adams(RkSolver),
-    Bdf(BdfSolver),
-}
-
-/// Configuration for constructing an [`LsodaSolver`].
+/// Configuration for constructing an [`LsodaSolver`]: the arguments of
+/// `scipy.integrate.LSODA(fun, t0, y0, t_bound, first_step, max_step, rtol, atol, jac)`.
 pub struct LsodaSolverConfig<'a> {
     pub t0: f64,
     pub y0: &'a [f64],
     pub t_bound: f64,
     pub rtol: f64,
     pub atol: ToleranceValue,
+    /// The largest |h| (ODEPACK's `hmax`); `f64::INFINITY` for no bound.
     pub max_step: f64,
+    /// The first step to try (ODEPACK's `h0`, given the integration direction's sign); `None`
+    /// lets ODEPACK choose it from the tolerances and `f(t0, y0)`.
     pub first_step: Option<f64>,
+    /// `jac(t, y)[i][j] = d f_i / d y_j` (`jt = 1`); `None` forms the Jacobian by forward
+    /// differences of `fun` (`jt = 2`), one evaluation per column.
+    pub jac: Option<JacFn>,
     pub mode: RuntimeMode,
 }
 
-/// The stepper behind `solve_ivp(method="LSODA")` and `odeint`, as a step-by-step solver
-/// object like [`RkSolver`] and [`BdfSolver`] (`scipy.integrate.LSODA`).
+/// `scipy.integrate.LSODA`, the stepper behind `solve_ivp(method="LSODA")`: ODEPACK's LSODA as
+/// SciPy 1.17.1 runs it (a port of SciPy's `lsoda.c`, see [`crate::lsoda`]), stepped the way
+/// SciPy's wrapper steps it: one ODEPACK call per step with `itask = 5` and `tcrit = t_bound`,
+/// so no step passes `t_bound` and the last one lands on it.
 ///
-/// It is NOT ODEPACK's LSODA: it starts with RK45 and switches once, for good, to BDF when a
-/// stiffness estimate from consecutive steps crosses a threshold or RK45 cannot take a step.
-/// ODEPACK switches both ways between Adams and BDF families of varying order, so step
-/// counts and step sequences differ from SciPy's (frankenscipy-1ksfv.9).
+/// Variable-order implicit Adams (orders 1-12, functional iteration) and BDF (orders 1-5, chord
+/// iteration on `I - h el0 J`), switching automatically in both directions;
+/// [`LsodaSolver::method_used`] and [`LsodaSolver::order_used`] report what took each step.
+///
+/// Construction evaluates nothing, as SciPy's `LSODA.__init__` does not: the first
+/// [`LsodaSolver::step_with`] evaluates `f(t0, y0)` and chooses the first step. `nfev` counts
+/// every right-hand-side evaluation, those of finite-difference Jacobian columns included;
+/// `njev` and `nlu` both count Jacobians, each followed by one LU factorization (SciPy reports
+/// ODEPACK's NJE for both).
+///
+/// SciPy's `min_step` has no counterpart: SciPy 1.17.1's `lsoda.c` never passes it to the
+/// stepper, so it changes nothing there either (see [`crate::lsoda`]).
 pub struct LsodaSolver {
-    mode: LsodaMode,
+    core: Lsoda,
+    t: f64,
+    y: Vec<f64>,
+    t_old: Option<f64>,
+    y_old: Option<Vec<f64>>,
     t_bound: f64,
-    rtol: f64,
-    atol: ToleranceValue,
-    max_step: f64,
-    first_step: Option<f64>,
-    runtime_mode: RuntimeMode,
-    pending_bdf_switch: bool,
-    nfev_offset: usize,
+    direction: f64,
+    state: OdeSolverState,
+    mode: RuntimeMode,
 }
 
 impl LsodaSolver {
-    /// Create the solver at `(t0, y0)`, starting in its RK45 phase.
+    /// The solver at `(t0, y0)`, before its first step. Nothing is evaluated here.
     ///
     /// # Errors
-    /// The same tolerance, step and state validation as [`RkSolver::new`].
-    pub fn new<F>(
-        fun: &mut F,
-        config: LsodaSolverConfig<'_>,
-    ) -> Result<Self, IntegrateValidationError>
-    where
-        F: FnMut(f64, &[f64]) -> Vec<f64>,
-    {
-        let rk_config = RkSolverConfig {
-            t0: config.t0,
-            y0: config.y0,
-            t_bound: config.t_bound,
-            rtol: config.rtol,
-            atol: config.atol.clone(),
-            max_step: config.max_step,
-            first_step: config.first_step,
-            mode: config.mode,
-            tableau: &RK45_TABLEAU,
+    /// An empty or non-finite `y0`, a non-finite `t0` or `t_bound`, and what
+    /// [`crate::validate_tol`], [`crate::validate_first_step`] and [`crate::validate_max_step`]
+    /// reject (SciPy's `LSODA.__init__` checks).
+    pub fn new(config: LsodaSolverConfig<'_>) -> Result<Self, IntegrateValidationError> {
+        let n = config.y0.len();
+        if n == 0 {
+            return Err(IntegrateValidationError::EmptyY0);
+        }
+        if !config.t0.is_finite() || !config.t_bound.is_finite() {
+            return Err(IntegrateValidationError::NonFiniteSpan);
+        }
+        if config.y0.iter().any(|v| !v.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteY0);
+        }
+        let max_step = crate::validate_max_step(config.max_step)?;
+        let first_step = config
+            .first_step
+            .map(|value| crate::validate_first_step(value, config.t0, config.t_bound))
+            .transpose()?;
+        let tol = crate::validate_tol(
+            ToleranceValue::Scalar(config.rtol),
+            config.atol,
+            n,
+            config.mode,
+        )?;
+        let as_vec = |value: ToleranceValue| match value {
+            ToleranceValue::Scalar(v) => vec![v],
+            ToleranceValue::Vector(values) => values,
         };
-        let solver = RkSolver::new(fun, rk_config)?;
+        // SciPy: direction = sign(t_bound - t0), or 1 when they are equal.
+        let direction = if config.t_bound == config.t0 {
+            1.0
+        } else {
+            (config.t_bound - config.t0).signum()
+        };
+        let setup = LsodaSetup {
+            rtol: as_vec(tol.rtol),
+            atol: as_vec(tol.atol),
+            // SciPy: first_step * direction into rwork[4]; max_step = inf is ODEPACK's 0.
+            h0: first_step.map_or(0.0, |step| step * direction),
+            hmax: if max_step.is_infinite() {
+                0.0
+            } else {
+                max_step
+            },
+            mxstep: 500,
+            jac: config.jac,
+        };
         Ok(Self {
-            mode: LsodaMode::Adams(solver),
+            core: Lsoda::new(n, setup),
+            t: config.t0,
+            y: config.y0.to_vec(),
+            t_old: None,
+            y_old: None,
             t_bound: config.t_bound,
-            rtol: config.rtol,
-            atol: config.atol,
-            max_step: config.max_step,
-            first_step: config.first_step,
-            runtime_mode: config.mode,
-            pending_bdf_switch: false,
-            nfev_offset: 0,
+            direction,
+            state: OdeSolverState::Running,
+            mode: config.mode,
         })
     }
 
-    fn from_options<F>(
-        fun: &mut F,
-        options: &SolveIvpOptions<'_>,
-    ) -> Result<Self, IntegrateValidationError>
-    where
-        F: FnMut(f64, &[f64]) -> Vec<f64>,
-    {
-        Self::new(
-            fun,
-            LsodaSolverConfig {
-                t0: options.t_span.0,
-                y0: options.y0,
-                t_bound: options.t_span.1,
-                rtol: options.rtol,
-                atol: options.atol.clone(),
-                max_step: options.max_step,
-                first_step: options.first_step,
-                mode: options.mode,
-            },
-        )
+    fn from_options(options: &SolveIvpOptions<'_>) -> Result<Self, IntegrateValidationError> {
+        Self::new(LsodaSolverConfig {
+            t0: options.t_span.0,
+            y0: options.y0,
+            t_bound: options.t_span.1,
+            rtol: options.rtol,
+            atol: options.atol.clone(),
+            max_step: options.max_step,
+            first_step: options.first_step,
+            jac: options.jac,
+            mode: options.mode,
+        })
     }
 
-    /// Whether the solver has switched to its BDF phase.
+    /// The method of the last accepted step (ODEPACK's MUSED, `iwork[18]`); `None` before the
+    /// first step.
     #[must_use]
-    pub fn is_stiff_phase(&self) -> bool {
-        matches!(self.mode, LsodaMode::Bdf(_))
+    pub fn method_used(&self) -> Option<LsodaMethod> {
+        self.core.method_used()
     }
 
-    fn should_switch_to_bdf(rk: &RkSolver, t_bound: f64) -> bool {
-        let Some(t_old) = rk.t_old() else {
-            return false;
-        };
-        let Some(y_old) = rk.y_old() else {
-            return false;
-        };
-        let Some(f_old) = rk.f_old() else {
-            return false;
-        };
-
-        let step_size = (rk.t() - t_old).abs();
-        if step_size == 0.0 {
-            return false;
-        }
-
-        let remaining = (t_bound - rk.t()).abs();
-        let mut stiffness_indicator = 0.0_f64;
-        for (((&y_prev, &y_curr), &f_prev), &f_curr) in y_old
-            .iter()
-            .zip(rk.y().iter())
-            .zip(f_old.iter())
-            .zip(rk.f().iter())
-        {
-            let state_delta = (y_curr - y_prev).abs();
-            let slope_delta = (f_curr - f_prev).abs();
-            if state_delta > 1e-14 {
-                stiffness_indicator =
-                    stiffness_indicator.max(step_size * slope_delta / state_delta);
-            }
-        }
-
-        stiffness_indicator > 1.5 || (step_size < remaining * 1e-4 && stiffness_indicator > 0.25)
+    /// The method the next step will use (MCUR, `iwork[19]`). It differs from
+    /// [`LsodaSolver::method_used`] right after the step that decided to switch.
+    #[must_use]
+    pub fn method_current(&self) -> Option<LsodaMethod> {
+        self.core.method_current()
     }
 
-    fn switch_to_bdf<F>(
-        &mut self,
-        fun: &mut F,
-        preferred_first_step: Option<f64>,
-    ) -> Result<(), StepFailure>
-    where
-        F: FnMut(f64, &[f64]) -> Vec<f64>,
-    {
-        let (t0, y0, consumed_nfev) = match &self.mode {
-            LsodaMode::Adams(rk) => (rk.t(), rk.y().to_vec(), rk.nfev()),
-            LsodaMode::Bdf(_) => return Ok(()),
-        };
+    /// The order of the last accepted step (NQU, `iwork[13]`); 0 before the first step.
+    #[must_use]
+    pub fn order_used(&self) -> usize {
+        self.core.nqu()
+    }
 
-        let config = BdfSolverConfig {
-            t0,
-            y0: &y0,
-            t_bound: self.t_bound,
-            rtol: self.rtol,
-            atol: self.atol.clone(),
-            max_step: self.max_step,
-            first_step: preferred_first_step.or(self.first_step),
-            mode: self.runtime_mode,
-            max_order: 5,
-        };
-        let solver = BdfSolver::new(fun, config).map_err(|_| StepFailure::SolverError)?;
-        self.nfev_offset += consumed_nfev;
-        self.mode = LsodaMode::Bdf(solver);
-        self.pending_bdf_switch = false;
-        Ok(())
+    /// The order the next step will attempt (NQCUR, `iwork[14]`).
+    #[must_use]
+    pub fn order_current(&self) -> usize {
+        self.core.nq()
+    }
+
+    /// The size of the last accepted step (HU, `rwork[10]`).
+    #[must_use]
+    pub fn step_size_used(&self) -> f64 {
+        self.core.hu()
+    }
+
+    /// The step size the next step will attempt (HCUR, `rwork[11]`).
+    #[must_use]
+    pub fn step_size_current(&self) -> f64 {
+        self.core.h()
+    }
+
+    /// Accepted steps (NST, `iwork[10]`).
+    #[must_use]
+    pub fn n_steps(&self) -> usize {
+        self.core.nst()
+    }
+
+    /// The time of the last method switch, `t0` if there has been none (TSW, `rwork[14]`).
+    #[must_use]
+    pub fn t_switch(&self) -> f64 {
+        self.core.tsw()
     }
 }
 
 impl LsodaSolver {
-    /// Advance one step (switching to BDF first if the previous step flagged stiffness).
+    /// Advance one step: one ODEPACK call with `itask = 5`, `tcrit = t_bound` (SciPy's
+    /// `LSODA._step_impl` inside `OdeSolver.step`).
     ///
     /// # Errors
-    /// The step failures of the active RK45 or BDF phase.
-    pub fn step_with<F>(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure>
+    /// Stepping a finished or failed solver, and ODEPACK's failures (`istate < 0`: repeated
+    /// error-test or convergence failures, tolerances too small, a zero error weight) or a
+    /// right-hand side / Jacobian of the wrong shape. The solver is then failed and keeps its
+    /// last accepted state, as SciPy's does.
+    pub fn step_with<F>(&mut self, fun: &mut F) -> Result<StepOutcome, StepFailure>
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
-        if self.pending_bdf_switch {
-            let preferred_first_step = match &self.mode {
-                LsodaMode::Adams(rk) => rk.t_old().map(|t_old| (rk.t() - t_old).abs()),
-                LsodaMode::Bdf(_) => None,
-            };
-            self.switch_to_bdf(fun, preferred_first_step)?;
+        if self.state != OdeSolverState::Running {
+            return Err(StepFailure::RuntimeError(
+                "Attempt to step on a finished or failed solver.",
+            ));
         }
-
-        match &mut self.mode {
-            LsodaMode::Adams(rk) => match rk.step_with(fun) {
-                Ok(outcome) => {
-                    if outcome.state == OdeSolverState::Running
-                        && Self::should_switch_to_bdf(rk, self.t_bound)
-                    {
-                        self.pending_bdf_switch = true;
-                    }
-                    Ok(outcome)
+        if self.t == self.t_bound {
+            // SciPy's corner case: no integration, no evaluation.
+            self.t_old = Some(self.t);
+            self.y_old = Some(self.y.clone());
+            self.state = OdeSolverState::Finished;
+            return Ok(StepOutcome {
+                message: None,
+                state: OdeSolverState::Finished,
+            });
+        }
+        let t_start = self.t;
+        let mut t = self.t;
+        let mut y = self.y.clone();
+        match self.core.call(
+            fun,
+            &mut y,
+            &mut t,
+            self.t_bound,
+            Task::OneStepToTcrit,
+            self.t_bound,
+        ) {
+            Ok(()) => {
+                self.t_old = Some(t_start);
+                self.y_old = Some(std::mem::replace(&mut self.y, y));
+                self.t = t;
+                if self.direction * (self.t - self.t_bound) >= 0.0 {
+                    self.state = OdeSolverState::Finished;
                 }
-                Err(crate::solver::StepFailure::StepSizeTooSmall)
-                | Err(crate::solver::StepFailure::ConvergenceFailure) => {
-                    let preferred_first_step = rk
-                        .t_old()
-                        .map(|t_old| (rk.t() - t_old).abs())
-                        .or(self.first_step);
-                    self.switch_to_bdf(fun, preferred_first_step)?;
-                    if let LsodaMode::Bdf(bdf) = &mut self.mode {
-                        bdf.step_with(fun)
-                    } else {
-                        Err(crate::solver::StepFailure::ConvergenceFailure)
-                    }
-                }
-                Err(err) => Err(err),
-            },
-            LsodaMode::Bdf(bdf) => bdf.step_with(fun),
+                Ok(StepOutcome {
+                    message: None,
+                    state: self.state,
+                })
+            }
+            Err(failure) => {
+                self.state = OdeSolverState::Failed;
+                Err(failure.into_step_failure())
+            }
         }
     }
 
     #[must_use]
     pub fn t(&self) -> f64 {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.t(),
-            LsodaMode::Bdf(bdf) => bdf.t(),
-        }
+        self.t
     }
 
     #[must_use]
     pub fn y(&self) -> &[f64] {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.y(),
-            LsodaMode::Bdf(bdf) => bdf.y(),
-        }
-    }
-
-    fn f(&self) -> Option<&[f64]> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => Some(rk.f()),
-            LsodaMode::Bdf(_) => None,
-        }
+        &self.y
     }
 
     #[must_use]
     pub fn t_old(&self) -> Option<f64> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.t_old(),
-            LsodaMode::Bdf(bdf) => bdf.t_old(),
-        }
+        self.t_old
     }
 
-    fn y_old(&self) -> Option<&[f64]> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.y_old(),
-            LsodaMode::Bdf(bdf) => bdf.y_old(),
-        }
+    #[must_use]
+    pub fn y_old(&self) -> Option<&[f64]> {
+        self.y_old.as_deref()
     }
 
-    fn f_old(&self) -> Option<&[f64]> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.f_old(),
-            LsodaMode::Bdf(_) => None,
-        }
-    }
-
-    /// Right-hand-side evaluations over both phases.
+    /// Right-hand-side evaluations (ODEPACK's NFE), finite-difference Jacobian columns
+    /// included.
     #[must_use]
     pub fn nfev(&self) -> usize {
-        self.nfev_offset
-            + match &self.mode {
-                LsodaMode::Adams(rk) => rk.nfev(),
-                LsodaMode::Bdf(bdf) => bdf.nfev(),
-            }
+        self.core.nfe()
     }
 
+    /// Jacobian evaluations (NJE), user-supplied or by differences.
     #[must_use]
     pub fn njev(&self) -> usize {
-        match &self.mode {
-            LsodaMode::Adams(_) => 0,
-            LsodaMode::Bdf(bdf) => bdf.njev(),
-        }
+        self.core.nje()
     }
 
+    /// LU factorizations: one per Jacobian, so NJE again, as SciPy reports it.
     #[must_use]
     pub fn nlu(&self) -> usize {
-        match &self.mode {
-            LsodaMode::Adams(_) => 0,
-            LsodaMode::Bdf(bdf) => bdf.nlu(),
-        }
+        self.core.nje()
     }
 
     #[must_use]
     pub fn state(&self) -> OdeSolverState {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.state(),
-            LsodaMode::Bdf(bdf) => bdf.state(),
-        }
+        self.state
     }
 
-    /// The last step's interpolant at `t` (SciPy's `solver.dense_output()(t)`): RK45's in the
-    /// first phase, BDF's after the switch.
+    #[must_use]
+    pub fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    /// SciPy's `LsodaDenseOutput` for the last step at `t`: the Nordsieck history up to the
+    /// step's order `q` (NQU), `sum_k yh[:, k] ((t - t_n)/h)^k`, where `h` is the step size the
+    /// history is scaled to (the NEXT step's, HCUR) and, when ODEPACK has already lowered the
+    /// order for the next step, column `q` (left at the old scale) is first multiplied by
+    /// `(h/hu)^q`, all as SciPy computes it. A step that did not integrate (`t0 == t_bound`)
+    /// gives the constant `y`. `None` before the first step.
     #[must_use]
     pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.dense_output_at(t),
-            LsodaMode::Bdf(bdf) => bdf.dense_output_at(t),
+        let t_old = self.t_old?;
+        if self.t == t_old {
+            return Some(self.y.clone());
         }
+        let order = self.core.nqu();
+        let h = self.core.h();
+        let top_scale = (self.core.nq() < order).then(|| (h / self.core.hu()).powf(order as f64));
+        let x = (t - self.t) / h;
+        let mut out = vec![0.0; self.y.len()];
+        for k in 0..=order {
+            // numpy: ((t - t_n)/h) ** arange(order + 1), elementwise pow.
+            let p = x.powf(k as f64);
+            let scale = if k == order { top_scale } else { None };
+            for (o, &c) in out.iter_mut().zip(self.core.yh_column(k)) {
+                let c = scale.map_or(c, |s| c * s);
+                *o += c * p;
+            }
+        }
+        Some(out)
     }
 }
 
@@ -841,7 +885,7 @@ impl<F> IvpSolver<F> for LsodaSolver
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
-    fn step_with(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure> {
+    fn step_with(&mut self, fun: &mut F) -> Result<StepOutcome, StepFailure> {
         self.step_with(fun)
     }
     fn t(&self) -> f64 {
@@ -851,7 +895,7 @@ where
         self.y()
     }
     fn f(&self) -> Option<&[f64]> {
-        self.f()
+        None
     }
     fn t_old(&self) -> Option<f64> {
         self.t_old()
@@ -860,7 +904,7 @@ where
         self.y_old()
     }
     fn f_old(&self) -> Option<&[f64]> {
-        self.f_old()
+        None
     }
     fn nfev(&self) -> usize {
         self.nfev()
@@ -873,12 +917,6 @@ where
     }
     fn ivp_state(&self) -> OdeSolverState {
         self.state()
-    }
-    fn prepare_dense_output(&mut self, fun: &mut F) -> Result<(), crate::solver::StepFailure> {
-        match &mut self.mode {
-            LsodaMode::Adams(rk) => rk.prepare_dense_output(fun),
-            LsodaMode::Bdf(_) => Ok(()),
-        }
     }
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
@@ -1370,6 +1408,16 @@ where
         validate_t_eval_with_audit(t_eval, t0, tf, audit)?;
     }
 
+    // SciPy's BDF and Radau would use `jac`; these form their Jacobians by differences only.
+    if resolved_options.jac.is_some()
+        && matches!(resolved_options.method, SolverKind::Bdf | SolverKind::Radau)
+    {
+        fail_closed(audit, "not_yet_implemented", "rejected");
+        return Err(IntegrateValidationError::NotYetImplemented {
+            function: "solve_ivp(jac=...) with BDF or Radau",
+        });
+    }
+
     match resolved_options.method {
         SolverKind::Rk45 | SolverKind::Rk23 | SolverKind::Dop853 => {
             let tableau = match resolved_options.method {
@@ -1422,7 +1470,7 @@ where
             solve_ivp_core(fun, solver, &resolved_options)
         }
         SolverKind::Lsoda => {
-            let solver = LsodaSolver::from_options(fun, &resolved_options)?;
+            let solver = LsodaSolver::from_options(&resolved_options)?;
             solve_ivp_core(fun, solver, &resolved_options)
         }
     }
@@ -1701,7 +1749,8 @@ mod tests {
             .f64(1e-6)
             .bool(false) // first_step: None
             .f64(f64::INFINITY) // max_step
-            .str(mode);
+            .str(mode)
+            .bool(false); // jac: None
         fingerprinter.finish()
     }
 
@@ -2446,94 +2495,252 @@ mod tests {
         assert_eq!(sol.values, vec![vec![2.0]]);
     }
 
-    #[test]
-    fn lsoda_switches_to_bdf_for_stiff_problem() {
-        let options = SolveIvpOptions {
-            t_span: (0.0, 0.1),
-            y0: &[1.0],
-            method: SolverKind::Lsoda,
-            rtol: 1e-4,
+    fn lsoda_config(t_span: (f64, f64), y0: &[f64], jac: Option<JacFn>) -> LsodaSolverConfig<'_> {
+        LsodaSolverConfig {
+            t0: t_span.0,
+            y0,
+            t_bound: t_span.1,
+            rtol: 1e-3,
             atol: ToleranceValue::Scalar(1e-6),
-            first_step: Some(1e-6),
-            ..SolveIvpOptions::default()
-        };
-        let mut fun = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
-        let mut solver = LsodaSolver::from_options(&mut fun, &options).expect("LSODA init");
-
-        let mut switched = false;
-        for _ in 0..2000 {
-            let outcome = solver.step_with(&mut fun).expect("LSODA step");
-            if matches!(solver.mode, LsodaMode::Bdf(_)) {
-                switched = true;
-            }
-            if outcome.state != OdeSolverState::Running {
-                break;
-            }
+            max_step: f64::INFINITY,
+            first_step: None,
+            jac,
+            mode: RuntimeMode::Strict,
         }
-
-        assert!(
-            switched,
-            "LSODA wrapper never switched to BDF on a stiff system"
-        );
-        let expected = 0.1_f64.cos();
-        let final_y = match &solver.mode {
-            LsodaMode::Adams(rk) => rk.y()[0],
-            LsodaMode::Bdf(bdf) => bdf.y()[0],
-        };
-        assert!(
-            (final_y - expected).abs() < 0.05,
-            "LSODA stiff solve ended at {}, expected about {}",
-            final_y,
-            expected
-        );
     }
 
-    /// `scipy.integrate.LSODA` used to be an empty unit struct (frankenscipy-8dndw.1). The
-    /// public handle must drive exactly the stepper `solve_ivp(method="LSODA")` runs.
+    /// A stepped LSODA run: the steps at which the method of the accepted step (ODEPACK's
+    /// MUSED) changed, with the new method, and the highest order (NQU) each method reached.
+    struct LsodaHistory {
+        switches: Vec<(usize, LsodaMethod)>,
+        max_adams_order: usize,
+        max_bdf_order: usize,
+        solver: LsodaSolver,
+    }
+
+    fn lsoda_history<F>(fun: &mut F, config: LsodaSolverConfig<'_>) -> LsodaHistory
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        let mut solver = crate::LSODA::new(config).expect("LSODA config");
+        let mut switches: Vec<(usize, LsodaMethod)> = Vec::new();
+        let (mut max_adams_order, mut max_bdf_order) = (0, 0);
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(fun).expect("LSODA step");
+            let used = solver.method_used().expect("a step was accepted");
+            if switches.last().map(|&(_, method)| method) != Some(used) {
+                switches.push((solver.n_steps(), used));
+            }
+            match used {
+                LsodaMethod::Adams => max_adams_order = max_adams_order.max(solver.order_used()),
+                LsodaMethod::Bdf => max_bdf_order = max_bdf_order.max(solver.order_used()),
+            }
+        }
+        LsodaHistory {
+            switches,
+            max_adams_order,
+            max_bdf_order,
+            solver,
+        }
+    }
+
+    fn vdp1000(_t: f64, y: &[f64]) -> Vec<f64> {
+        vec![y[1], 1000.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]]
+    }
+
+    fn vdp1000_jac(_t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+        vec![
+            vec![0.0, 1.0],
+            vec![-2000.0 * y[0] * y[1] - 1.0, 1000.0 * (1.0 - y[0] * y[0])],
+        ]
+    }
+
+    fn stiff_cos_jac(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+        vec![vec![-1000.0]]
+    }
+
+    /// The switch history SciPy 1.17.1 reports: step by step, `(nst, iwork[18])` from
+    /// `LSODA(...)._lsoda_solver._integrator.iwork` after each `step()`, reduced to the steps
+    /// where MUSED changed (1 = Adams, 2 = BDF), and max(iwork[13]) per method. The ODEPACK
+    /// documentation places MUSED at iwork(19) and NQU at iwork(14), 1-based.
+    /// - y' = -1000 (y - cos t), [0, 10]: [(1, 1), (31, 2)], orders Adams <= 4, BDF <= 5.
+    /// - van der Pol mu = 1000, [0, 3000]: [(1, 1), (23, 2), (166, 1), (250, 2), (393, 1),
+    ///   (477, 2), (620, 1), (704, 2)] over 727 steps, orders Adams <= 4, BDF <= 3.
+    /// - y' = -y cos t at rtol 1e-9: [(1, 1)], Adams order up to 9.
+    ///
+    /// A one-way RK45 -> BDF switch cannot produce the van der Pol row.
     #[test]
-    fn public_lsoda_handle_steps_like_solve_ivp() {
-        let mut fun = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
-        let mut solver = crate::LSODA::new(
-            &mut fun,
+    fn lsoda_switch_history_is_scipys() {
+        use LsodaMethod::{Adams, Bdf};
+        let h = lsoda_history(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            lsoda_config((0.0, 10.0), &[0.0], None),
+        );
+        assert_eq!(h.switches, vec![(1, Adams), (31, Bdf)]);
+        assert_eq!((h.max_adams_order, h.max_bdf_order), (4, 5));
+        assert_eq!(
+            (h.solver.n_steps(), h.solver.nfev(), h.solver.njev()),
+            (110, 208, 25)
+        );
+
+        let h = lsoda_history(&mut vdp1000, lsoda_config((0.0, 3000.0), &[2.0, 0.0], None));
+        assert_eq!(
+            h.switches,
+            vec![
+                (1, Adams),
+                (23, Bdf),
+                (166, Adams),
+                (250, Bdf),
+                (393, Adams),
+                (477, Bdf),
+                (620, Adams),
+                (704, Bdf)
+            ]
+        );
+        assert_eq!((h.max_adams_order, h.max_bdf_order), (4, 3));
+        assert_eq!(h.solver.n_steps(), 727);
+
+        let h = lsoda_history(
+            &mut |t: f64, y: &[f64]| vec![-y[0] * t.cos()],
             LsodaSolverConfig {
-                t0: 0.0,
-                y0: &[1.0],
-                t_bound: 0.1,
-                rtol: 1e-4,
-                atol: ToleranceValue::Scalar(1e-6),
-                max_step: f64::INFINITY,
-                first_step: Some(1e-6),
-                mode: RuntimeMode::Strict,
+                rtol: 1e-9,
+                atol: ToleranceValue::Scalar(1e-12),
+                ..lsoda_config((0.0, 10.0), &[1.0], None)
+            },
+        );
+        assert_eq!(h.switches, vec![(1, Adams)]);
+        assert_eq!((h.max_adams_order, h.max_bdf_order), (9, 0));
+    }
+
+    /// `jac` given is ODEPACK's jt = 1: the Jacobian comes from the user, so each one costs no
+    /// evaluations (SciPy: stiff scalar nfev 230 with 24 Jacobians; van der Pol nfev 1543 =
+    /// 1803 - 2 x 130, the same 727 steps and switch history as with differences).
+    #[test]
+    fn lsoda_user_jacobian_is_scipys_jt1() {
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            &SolveIvpOptions {
+                jac: Some(stiff_cos_jac),
+                ..lsoda_options((0.0, 10.0), &[0.0], 1e-3, 1e-6)
             },
         )
+        .expect("LSODA with jac");
+        assert_eq!(
+            (r.status, r.t.len(), r.nfev, r.njev, r.nlu),
+            (0, 121, 230, 24, 24)
+        );
+        assert_lsoda_bits("y(10)", &r.y[120], &[-0.8396138595348207]);
+
+        let h = lsoda_history(
+            &mut vdp1000,
+            lsoda_config((0.0, 3000.0), &[2.0, 0.0], Some(vdp1000_jac)),
+        );
+        assert_eq!(h.switches.len(), 8);
+        assert_eq!(
+            (h.solver.n_steps(), h.solver.nfev(), h.solver.njev()),
+            (727, 1543, 130)
+        );
+        let scipy = [-1.4974126251531406, 0.0012054067934727682];
+        for (got, want) in h.solver.y().iter().zip(scipy) {
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs(),
+                "y(3000): fsci {got:?}, SciPy {want:?}"
+            );
+        }
+    }
+
+    /// Negative arms: a Jacobian of the wrong shape fails the step (SciPy raises), a `jac` for
+    /// BDF or Radau is refused rather than silently replaced by differences, and a finished
+    /// solver cannot be stepped.
+    #[test]
+    fn lsoda_rejects_bad_jacobians_and_finished_steps() {
+        fn wrong_shape(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![1.0, 2.0]]
+        }
+        let mut fun = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
+        let mut solver =
+            crate::LSODA::new(lsoda_config((0.0, 10.0), &[0.0], Some(wrong_shape))).expect("init");
+        let failure = loop {
+            match solver.step_with(&mut fun) {
+                Ok(_) => assert_eq!(solver.method_used(), Some(LsodaMethod::Adams)),
+                Err(failure) => break failure,
+            }
+        };
+        assert!(
+            matches!(failure, StepFailure::RuntimeError(m) if m.contains("Jacobian")),
+            "{failure:?}"
+        );
+        assert_eq!(solver.state(), OdeSolverState::Failed);
+
+        for method in [SolverKind::Bdf, SolverKind::Radau] {
+            let err = solve_ivp(
+                &mut fun,
+                &SolveIvpOptions {
+                    method,
+                    jac: Some(stiff_cos_jac),
+                    ..lsoda_options((0.0, 1.0), &[0.0], 1e-3, 1e-6)
+                },
+            )
+            .expect_err("jac with BDF/Radau is not implemented");
+            assert!(
+                matches!(err, IntegrateValidationError::NotYetImplemented { .. }),
+                "{err:?}"
+            );
+        }
+
+        let mut solver = crate::LSODA::new(lsoda_config((0.0, 0.1), &[0.0], None)).expect("init");
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut fun).expect("step");
+        }
+        assert_eq!(
+            solver.t().to_bits(),
+            0.1_f64.to_bits(),
+            "the last step lands on t_bound"
+        );
+        assert!(solver.step_with(&mut fun).is_err());
+    }
+
+    /// `scipy.integrate.LSODA` used to be an empty unit struct (frankenscipy-8dndw.1), then an
+    /// RK45-then-BDF stand-in. The public handle must drive exactly the stepper
+    /// `solve_ivp(method="LSODA")` runs, and evaluates nothing until its first step.
+    #[test]
+    fn public_lsoda_handle_steps_like_solve_ivp() {
+        let mut calls = 0_usize;
+        let mut fun = |t: f64, y: &[f64]| {
+            calls += 1;
+            vec![-1000.0 * (y[0] - t.cos())]
+        };
+        let mut solver = crate::LSODA::new(LsodaSolverConfig {
+            rtol: 1e-4,
+            first_step: Some(1e-6),
+            ..lsoda_config((0.0, 0.1), &[1.0], None)
+        })
         .expect("LSODA init");
+        assert!(solver.dense_output_at(0.0).is_none());
         let mut ts = vec![solver.t()];
         while solver.state() == OdeSolverState::Running {
             solver.step_with(&mut fun).expect("LSODA step");
             ts.push(solver.t());
             let t_old = solver.t_old().expect("a step was taken");
+            let at_end = solver.dense_output_at(solver.t()).expect("dense output");
+            assert_eq!(at_end[0].to_bits(), solver.y()[0].to_bits());
             let midpoint = solver
                 .dense_output_at(0.5 * (t_old + solver.t()))
                 .expect("dense output inside the last step");
             assert!(midpoint[0].is_finite());
         }
-        assert!(
-            solver.is_stiff_phase(),
-            "stiff problem must reach the BDF phase"
-        );
+        assert_eq!(solver.method_used(), Some(LsodaMethod::Bdf));
         assert_eq!(solver.state(), OdeSolverState::Finished);
+        assert_eq!(solver.nfev(), calls);
 
-        let options = SolveIvpOptions {
-            t_span: (0.0, 0.1),
-            y0: &[1.0],
-            method: SolverKind::Lsoda,
-            rtol: 1e-4,
-            atol: ToleranceValue::Scalar(1e-6),
-            first_step: Some(1e-6),
-            ..SolveIvpOptions::default()
-        };
-        let mut fun2 = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
-        let reference = solve_ivp(&mut fun2, &options).expect("solve_ivp LSODA");
+        let reference = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            &SolveIvpOptions {
+                first_step: Some(1e-6),
+                ..lsoda_options((0.0, 0.1), &[1.0], 1e-4, 1e-6)
+            },
+        )
+        .expect("solve_ivp LSODA");
         assert_eq!(
             ts, reference.t,
             "the handle and solve_ivp took different steps"
@@ -2578,6 +2785,222 @@ mod tests {
                 "step {i} y[1]: got {}, expected {}",
                 y_step[1],
                 expected_y1[i]
+            );
+        }
+    }
+
+    // ── solve_ivp(method="LSODA") against SciPy 1.17.1, step for step (frankenscipy-1ksfv.9) ──
+    //
+    // Every number below was printed by SciPy 1.17.1 / numpy 2.4.3 (`solve_ivp(fun, t_span, y0,
+    // method="LSODA", ...)`, repr of each float). The right-hand sides are written with the same
+    // operations in the same order as the Python lambdas. Where no LAPACK call is involved
+    // (Adams-only runs, and any n = 1 problem, whose 1x1 LU is one division) the port does
+    // SciPy's arithmetic operation for operation, so the step times and states are asserted
+    // bit for bit. The RK45-then-BDF stand-in this port replaced fails every count here.
+
+    fn assert_lsoda_bits(label: &str, got: &[f64], want: &[f64]) {
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "{label}[{i}]: fsci {g:?}, SciPy {w:?}"
+            );
+        }
+    }
+
+    fn lsoda_options(t_span: (f64, f64), y0: &[f64], rtol: f64, atol: f64) -> SolveIvpOptions<'_> {
+        SolveIvpOptions {
+            t_span,
+            y0,
+            method: SolverKind::Lsoda,
+            rtol,
+            atol: ToleranceValue::Scalar(atol),
+            ..SolveIvpOptions::default()
+        }
+    }
+
+    /// y' = -y cos t on [0, 10] at rtol 1e-9: nonstiff, so SciPy stays on Adams the whole way
+    /// (MUSED = 1 on all 194 steps) and climbs to order 9. nfev = 416 is 1 initial evaluation
+    /// plus the functional-iteration evaluations; no Jacobian is ever formed.
+    #[test]
+    fn lsoda_adams_cos_decay_is_scipys_step_for_step() {
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-y[0] * t.cos()],
+            &lsoda_options((0.0, 10.0), &[1.0], 1e-9, 1e-12),
+        )
+        .expect("LSODA cos decay");
+        assert_eq!((r.status, r.success), (0, true), "{}", r.message);
+        assert_eq!((r.t.len(), r.nfev, r.njev, r.nlu), (195, 416, 0, 0));
+        assert_lsoda_bits(
+            "t[..5]",
+            &r.t[..5],
+            &[
+                0.0,
+                3.149699260936168e-05,
+                6.299398521872336e-05,
+                0.006933604330925288,
+                0.013804214676631853,
+            ],
+        );
+        assert_lsoda_bits("y(10)", &r.y[194], &[1.7229209951620803]);
+    }
+
+    /// Lotka-Volterra on [0, 15] at rtol 1e-8: n = 2 and still Adams-only (order up to 8), so
+    /// no LU factorization, and SciPy's 682 steps are reproduced exactly.
+    #[test]
+    fn lsoda_adams_lotka_volterra_is_scipys_step_for_step() {
+        let r = solve_ivp(
+            &mut |_t: f64, y: &[f64]| vec![1.5 * y[0] - y[0] * y[1], -3.0 * y[1] + y[0] * y[1]],
+            &lsoda_options((0.0, 15.0), &[10.0, 5.0], 1e-8, 1e-10),
+        )
+        .expect("LSODA Lotka-Volterra");
+        assert_eq!((r.status, r.t.len(), r.nfev, r.njev), (0, 683, 1451, 0));
+        assert_lsoda_bits(
+            "y(15)",
+            &r.y[682],
+            &[0.7137520493090799, 0.0754077628257764],
+        );
+    }
+
+    /// The same Adams run integrated backward from t = 10 to 0 (h < 0 throughout).
+    #[test]
+    fn lsoda_adams_backward_is_scipys_step_for_step() {
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-y[0] * t.cos()],
+            &lsoda_options((10.0, 0.0), &[1.0], 1e-9, 1e-12),
+        )
+        .expect("LSODA backward");
+        assert_eq!((r.status, r.t.len(), r.nfev, r.njev), (0, 179, 383, 0));
+        assert_lsoda_bits(
+            "t[..3]",
+            &r.t[..3],
+            &[10.0, 9.999962540117728, 9.999925080235457],
+        );
+        assert_lsoda_bits("y(0)", &r.y[178], &[0.5804096642119552]);
+    }
+
+    /// y' = -1000 (y - cos t) at the default tolerances: SciPy starts on Adams, switches to BDF
+    /// on step 31 and stays there, forming 25 finite-difference Jacobians (one evaluation each,
+    /// n = 1). nfev 208, njev = nlu = 25.
+    #[test]
+    fn lsoda_stiff_scalar_switches_to_bdf_like_scipy() {
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            &lsoda_options((0.0, 10.0), &[0.0], 1e-3, 1e-6),
+        )
+        .expect("LSODA stiff scalar");
+        assert_eq!(
+            (r.status, r.t.len(), r.nfev, r.njev, r.nlu),
+            (0, 111, 208, 25, 25)
+        );
+        assert_lsoda_bits(
+            "t[..5]",
+            &r.t[..5],
+            &[
+                0.0,
+                3.162277660168363e-08,
+                6.324555320336727e-08,
+                1.657533971189277e-05,
+                3.308743387058218e-05,
+            ],
+        );
+        assert_lsoda_bits("y(10)", &r.y[110], &[-0.8393610876664377]);
+    }
+
+    /// first_step and max_step reach ODEPACK as h0 (rwork[4]) and hmax (rwork[5]).
+    #[test]
+    fn lsoda_first_step_and_max_step_reach_odepack() {
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            &SolveIvpOptions {
+                first_step: Some(1e-4),
+                max_step: 0.5,
+                ..lsoda_options((0.0, 10.0), &[0.0], 1e-3, 1e-6)
+            },
+        )
+        .expect("LSODA first_step/max_step");
+        assert_eq!((r.status, r.t.len(), r.nfev, r.njev), (0, 131, 250, 28));
+        assert_lsoda_bits("t[1]", &r.t[1..2], &[1.193142358094778e-06]);
+        assert_lsoda_bits("y(10)", &r.y[130], &[-0.8396154663283392]);
+    }
+
+    /// t_eval samples come from SciPy's LsodaDenseOutput over the Nordsieck history
+    /// (sum_k yh[:, k] ((t - t_n)/h)^k); nfev is unchanged by sampling.
+    #[test]
+    fn lsoda_t_eval_samples_come_from_the_nordsieck_history() {
+        let t_eval = [0.0, 0.001, 0.5, 2.5, 7.25, 10.0];
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())],
+            &SolveIvpOptions {
+                t_eval: Some(&t_eval),
+                ..lsoda_options((0.0, 10.0), &[0.0], 1e-3, 1e-6)
+            },
+        )
+        .expect("LSODA t_eval");
+        let scipy = [
+            0.0,
+            0.6321647151385436,
+            0.878127537595317,
+            -0.8006126583631122,
+            0.5693233954013428,
+            -0.8393610876664377,
+        ];
+        assert_eq!((r.t.len(), r.nfev), (6, 208));
+        for (i, (got, want)) in r.y.iter().map(|y| y[0]).zip(scipy).enumerate() {
+            // The sum over the history is numpy's dot (BLAS), whose summation order is not
+            // pinned; allow a few ulps.
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON * want.abs(),
+                "sample {i} at t = {}: fsci {got:?}, SciPy {want:?}",
+                t_eval[i]
+            );
+        }
+
+        let t_eval = [0.3, 1.7, 4.4, 9.9];
+        let r = solve_ivp(
+            &mut |t: f64, y: &[f64]| vec![-y[0] * t.cos()],
+            &SolveIvpOptions {
+                t_eval: Some(&t_eval),
+                ..lsoda_options((0.0, 10.0), &[1.0], 1e-9, 1e-12)
+            },
+        )
+        .expect("LSODA t_eval Adams");
+        let scipy = [
+            0.7441443748121572,
+            0.370958598381063,
+            2.5898554457115757,
+            1.580175452023483,
+        ];
+        assert_eq!((r.t.len(), r.nfev), (4, 416));
+        for (i, (got, want)) in r.y.iter().map(|y| y[0]).zip(scipy).enumerate() {
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON * want.abs(),
+                "sample {i} at t = {}: fsci {got:?}, SciPy {want:?}",
+                t_eval[i]
+            );
+        }
+    }
+
+    /// Van der Pol, mu = 1000, on [0, 3000] at the default tolerances: SciPy switches Adams ->
+    /// BDF -> Adams ... seven times (see `lsoda_van_der_pol_switch_history_is_scipys`), taking
+    /// 727 steps with 130 finite-difference Jacobians (two evaluations each).
+    #[test]
+    fn lsoda_van_der_pol_1000_counts_are_scipys() {
+        let r = solve_ivp(
+            &mut |_t: f64, y: &[f64]| vec![y[1], 1000.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]],
+            &lsoda_options((0.0, 3000.0), &[2.0, 0.0], 1e-3, 1e-6),
+        )
+        .expect("LSODA van der Pol");
+        assert_eq!(
+            (r.status, r.t.len(), r.nfev, r.njev, r.nlu),
+            (0, 728, 1803, 130, 130)
+        );
+        let scipy = [-1.49741262484335, 0.001205406794123583];
+        for (got, want) in r.y[727].iter().zip(scipy) {
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs(),
+                "y(3000): fsci {got:?}, SciPy {want:?}"
             );
         }
     }

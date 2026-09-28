@@ -1,16 +1,16 @@
 {
   "packet_id": "FSCI-P2C-017",
   "family": "io_core",
-  "generated_unix_ms": 1790392936313,
+  "generated_unix_ms": 1790579496519,
   "runtime": {
     "python_version": "3.13.12",
     "numpy_version": "2.4.3",
     "scipy_version": "1.17.1"
   },
   "provenance": {
-    "fixture_input_blake3": "14e91fe3d5a431c31e74796dff54623959b318ee7e5c70f02f1faf7329e785a8",
-    "oracle_output_blake3": "3e6041986ae4a722a9d6fc00cd0541f218acf0242d289a9ab671ce6db58802af",
-    "capture_blake3": "df0c451184b7f2672fcfc6cafaf82beba1ef90dc11f5e6d584001d6d3d7e8942"
+    "fixture_input_blake3": "7c615ffa2f3ae17b215f612af12af9efbdd951dde3955b1f2d17d8997626d738",
+    "oracle_output_blake3": "4b0c7c810764f8b468cc0947bf6830016d2d4caf218671fd73faa5933e79a94d",
+    "capture_blake3": "ca0c015f583798848f010c7dea633492a7edcb7f96d779e2affcd8399b2fd870"
   },
   "case_outputs": [
     {
@@ -207,7 +207,7 @@
       "status": "ok",
       "result_kind": "error",
       "result": {
-        "error": "truncated MAT v4 header"
+        "error": "Mat file appears to be truncated"
       },
       "error": null
     },

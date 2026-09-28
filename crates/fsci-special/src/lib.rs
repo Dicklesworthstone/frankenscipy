@@ -3338,6 +3338,31 @@ mod tests {
         assert!(hurwitz_zeta(1.0, 1.0).is_infinite());
     }
 
+    #[test]
+    fn hurwitz_zeta_is_scipy_cephes_zeta_bit_for_bit() {
+        // scipy.special.zeta(s, a) 1.17.1: the direct sum plus Euler-Maclaurin, a negative
+        // a (integer s), and the a > 1e8 asymptotic.
+        let cases = [
+            (1.1, 1.0, 10.584448464950801),
+            (1.5, 2.0, 1.6123753486854886),
+            (30.0, 2.5, 1.152969168563024e-12),
+            (2.0, -0.5, 8.934802200544679),
+            (4.0, -2.5, 32.457979369864596),
+            (3.0, 1e9, 5.0000000050000005e-19),
+        ];
+        for (s, a, expected) in cases {
+            let got = hurwitz_zeta(s, a);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(expected),
+                "zeta({s}, {a}) = {got:e}, SciPy {expected:e}"
+            );
+        }
+        // s < 1 is outside the domain: NaN, not the +inf this used to return.
+        assert!(hurwitz_zeta(0.5, 1.0).is_nan());
+        assert!(hurwitz_zeta(0.5, 2.5).is_nan());
+    }
+
     // ── sici tests ───────────────────────────────────────────────────
 
     #[test]

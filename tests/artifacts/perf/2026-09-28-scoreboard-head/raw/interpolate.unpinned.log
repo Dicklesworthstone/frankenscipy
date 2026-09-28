@@ -1,0 +1,12 @@
+elf_sha256=1d4679491d94caa0b5eb534fa67a9bc911c29e3c89e90a58d0644a83fe53bcc9
+sorted_queries=false
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=splev n=2000 m=100000 g=48 fixture_sha256=5a64daa68c16049945dc49a0e9c3b9dc5350b4edaa17b2cad429ffe3c9ae358e tasks=1 genuine=True out_len=100000 nt=2004 nc=2004
+op=splev calibration single=1.8733ms reps=11
+case=n2000m100000g48 op=splev fsci=1.729ms scipy=50.893ms scipy/fsci=29.437x null_fsci=1.024 null_scipy=1.014 CHECK max_abs=8.88178419700125232e-16 max_rel=1.45304884621824116e-13
+READY scipy=1.17.1 numpy=2.4.3 op=cubic n=2000 m=100000 g=48 fixture_sha256=5a64daa68c16049945dc49a0e9c3b9dc5350b4edaa17b2cad429ffe3c9ae358e tasks=1 genuine=True out_len=100000 nt=0 nc=0
+op=cubic calibration single=2.8309ms reps=8
+case=n2000m100000g48 op=cubic fsci=2.777ms scipy=3.860ms scipy/fsci=1.390x null_fsci=1.070 null_scipy=1.033 CHECK max_abs=2.22044604925031308e-16 max_rel=1.17976740605909571e-13
+READY scipy=1.17.1 numpy=2.4.3 op=rgi n=2000 m=100000 g=48 fixture_sha256=b7fced334273c7f8481ded034446764250c65e57d852d7431ffc2fbda0effc29 tasks=1 genuine=True out_len=100000 nt=0 nc=0
+op=rgi calibration single=5.0589ms reps=4
+case=n2000m100000g48 op=rgi fsci=5.171ms scipy=9.803ms scipy/fsci=1.896x null_fsci=1.117 null_scipy=1.125 CHECK max_abs=6.66133814775093924e-16 max_rel=1.46798016110842600e-13

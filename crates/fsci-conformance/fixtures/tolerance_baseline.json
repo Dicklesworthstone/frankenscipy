@@ -6,7 +6,9 @@
     "ABS_TOL": 1e-12
   },
   "diff_arrayapi_default_float_dtype.rs": {},
-  "diff_cluster.rs": {},
+  "diff_cluster.rs": {
+    "REL_TOL": 1e-12
+  },
   "diff_cluster_ars_nmi.rs": {
     "ABS_TOL": 1e-12
   },
@@ -132,6 +134,11 @@
   "diff_integrate_gauss_kronrod_newton_cotes.rs": {
     "ABS_TOL": 1e-7
   },
+  "diff_integrate_lsoda.rs": {
+    "DENSE_SCALE_TOL": 0.0001,
+    "T_GRID_REL_TOL": 1e-12,
+    "Y_SCALE_TOL": 1e-6
+  },
   "diff_integrate_monte_carlo_qmc_quad.rs": {},
   "diff_integrate_odeint_closed_form.rs": {
     "ABS_TOL": 0.0001
@@ -222,10 +229,14 @@
   "diff_interpolate_rect_bivariate_bilinear_spline.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_interpolate_regular_grid_splines.rs": {
+    "REL_TOL": 1e-12
+  },
   "diff_interpolate_spl_ops.rs": {
     "TCK_TOL": 1e-9,
     "VAL_TOL": 1e-9
   },
+  "diff_io_loadmat_corpus.rs": {},
   "diff_linalg.rs": {},
   "diff_linalg_adjugate_cofactor.rs": {
     "ABS_TOL": 1e-9
@@ -919,6 +930,7 @@
   "diff_sparse_csgraph_directedness.rs": {
     "DIST_ABS_TOL": 1e-12
   },
+  "diff_sparse_csgraph_flow_matching_paths.rs": {},
   "diff_sparse_density_frob_inner.rs": {
     "ABS_TOL": 1e-12
   },
@@ -1001,6 +1013,11 @@
   "diff_sparse_shortest_path_properties.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_sparse_spilu_ilutp.rs": {
+    "KRYLOV_RATIO_TOL": 1.5,
+    "NNZ_REL_TOL": 0.25,
+    "SKEW_GMRES_TOL": 1e-10
+  },
   "diff_sparse_spilu_solve.rs": {},
   "diff_sparse_splu_solve.rs": {
     "ABS_TOL": 1e-8
@@ -1058,6 +1075,15 @@
     "ABS_TOL_DISPARITY": 1e-10,
     "ABS_TOL_MTX1": 1e-12,
     "ABS_TOL_MTX2": 1e-9
+  },
+  "diff_spatial_qhull.rs": {
+    "BARYCENTRIC_REL_TOL": 1e-9,
+    "EQUATION_ABS_TOL": 1e-11,
+    "INTERSECTION_ABS_TOL": 1e-10,
+    "LIFT_ABS_TOL": 1e-12,
+    "MEASURE_REL_TOL": 1e-11,
+    "PARABOLOID_REL_TOL": 1e-14,
+    "VORONOI_VERTEX_REL_TOL": 1e-9
   },
   "diff_spatial_slerp_rotation.rs": {
     "ABS_TOL": 1e-12
@@ -1216,7 +1242,8 @@
     "ABS_TOL": 1e-9
   },
   "diff_special_error.rs": {
-    "ERFINV_TOL_REL": 5e-9,
+    "ERFCINV_TOL_REL": 5e-9,
+    "ERFINV_TOL_REL": 1e-15,
     "ERF_TOL": 1e-13
   },
   "diff_special_exp1_expi.rs": {
@@ -1244,9 +1271,10 @@
     "ABS_TOL_FRESNEL_SHI": 0.00001
   },
   "diff_special_gamma.rs": {
-    "DIGAMMA_TOL_REL": 5e-10,
+    "DIGAMMA_TOL_REL": 1e-15,
     "GAMMA_TOL_ABS": 1e-10,
-    "GAMMA_TOL_REL": 1e-12
+    "GAMMA_TOL_REL": 1e-12,
+    "RGAMMA_TOL_REL": 5e-10
   },
   "diff_special_gamma_mod_squared.rs": {
     "REL_TOL": 0.03
@@ -2167,7 +2195,8 @@
     "ABS_TOL": 1e-9
   },
   "diff_stats_page_trend.rs": {
-    "ABS_TOL": 1e-9
+    "ABS_TOL": 1e-9,
+    "P_REL_TOL": 1e-12
   },
   "diff_stats_pareto.rs": {
     "CDF_TOL": 1e-12,

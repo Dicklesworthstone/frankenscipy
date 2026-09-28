@@ -1,0 +1,47 @@
+{
+  "schema": "fsci-scoreboard-run/1",
+  "tag": "special.unpinned.r1",
+  "harness": "perf_special_vs_scipy",
+  "binary": "/data/projects/.worktrees/frankenscipy-scoreboard/rch-probe-bin/scoreboard/perf_special_vs_scipy",
+  "executed_elf_sha256": "b8c631d609344742215602079301bac5215e3d93227fe2176a1595c8a618f406",
+  "build_manifest": "rch-probe-bin/scoreboard/manifest_b1.txt",
+  "argv": [
+    "/data/projects/.worktrees/frankenscipy-scoreboard/rch-probe-bin/scoreboard/perf_special_vs_scipy"
+  ],
+  "cwd": "/data/projects/.worktrees/frankenscipy-scoreboard",
+  "env_overlay": {},
+  "pin_cpu": null,
+  "sibling_cpus": [],
+  "mode": "unpinned",
+  "git_head": "54ee859e6c90c3ee8a0f909bfa6e61422a3c30da",
+  "incumbent_interpreter": "/home/ubuntu/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/bin/python3.13",
+  "incumbent_interpreter_sha256": "263dd6cc0c5b61880e54abfb2b1b4ea9aef7ae64e5f0e0b9f3eb15b8e8b9ae4e",
+  "started_utc": "2026-09-28T06:21:23+00:00",
+  "loadavg_pre": [
+    6.29,
+    21.36,
+    21.47
+  ],
+  "procs_running_pre": 1,
+  "ambient_wait_s": 0.0,
+  "ambient_wait_bound_s": 1200.0,
+  "host": "thinkstation1",
+  "governor": "powersavex64",
+  "scaling_driver": "amd-pstate-epp",
+  "epp": "balance_performance",
+  "isa": "sse4_2+avx+avx2+fma",
+  "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
+  "logical_cpus": 64,
+  "kernel": "7.0.0-30-generic",
+  "finished_utc": "2026-09-28T06:22:20+00:00",
+  "elapsed_s": 56.31,
+  "exit_code": 0,
+  "timed_out": false,
+  "loadavg_post": [
+    11.3,
+    20.07,
+    21.01
+  ],
+  "host_busy_whole_run": 0.15497336321193061,
+  "log_sha256": "2bf2189ed959de60f280f0712d0116afb83e07dc8f3851eb02f855da8429aae4"
+}

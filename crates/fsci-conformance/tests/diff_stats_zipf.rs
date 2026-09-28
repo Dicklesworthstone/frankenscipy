@@ -100,13 +100,10 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    // a > 1 required (zeta diverges otherwise). Skip a ≤ 3
-    // because fsci's riemann_zeta truncates the series at
-    // k=10000 with too-aggressive 1e-15 relative tolerance —
-    // tail error is significant for slow-convergent a (37% at
-    // a=1.1, 3e-3 at a=1.5, 4e-5 at a=2, 3.5e-9 at a=3).
-    // Tracked separately as [frankenscipy-3u8ze].
-    let as_ = [4.0_f64, 5.0, 6.0, 8.0, 10.0, 15.0];
+    // a > 1 required (zeta diverges otherwise). a ≤ 3 used to be skipped: riemann_zeta
+    // truncated its series at k=10000 (37% off at a=1.1). frankenscipy-3u8ze replaced it
+    // with Euler-Maclaurin, so the slowly convergent exponents are back in.
+    let as_ = [1.1_f64, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0];
     let ks = [1_u64, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 10000];
     let mut points = Vec::new();
     for &a in &as_ {

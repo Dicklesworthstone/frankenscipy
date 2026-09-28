@@ -37235,6 +37235,10 @@ fn wilcoxon_tie_sum_by_resort(abs_diffs: &[f64]) -> f64 {
     tie_sum
 }
 
+/// SciPy's `wilcoxon(method='auto')` takes the normal approximation outright for more than
+/// this many differences (`_wilcoxon.py`: `if method == "auto" and d.shape[-1] > 50`).
+const WILCOXON_AUTO_EXACT_MAX_N: usize = 50;
+
 pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() != y.len() || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -37292,9 +37296,12 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
         .map(|(r, _)| *r)
         .sum();
 
-    // scipy `method='auto'` uses the EXACT signed-rank null distribution when no
-    // zeros were dropped and the absolute differences have no ties (ranks 1..n);
-    // it falls back to the normal approximation otherwise. frankenscipy-78v5y
+    // scipy `method='auto'` (1.17.1 `_wilcoxon.py`): more than 50 differences take the
+    // normal approximation outright. At most 50 take the EXACT signed-rank null distribution
+    // when no zeros were dropped and the absolute differences have no ties (ranks 1..n),
+    // frankenscipy-78v5y. Otherwise it is the permutation test (n ≤ 13) or the normal
+    // approximation. The cut was nr ≤ 1000, which gave the exact p-value where SciPy's
+    // default gives the approximation, for every 50 < n ≤ 1000 (frankenscipy-hlu5b).
     let no_zeros = x.len() == nr;
     // HISTORICAL (frankenscipy-78v5y): computing `no_ties` used to sort a clone of
     // abs_diffs, so it was gated behind the cheap `no_zeros && nr <= 1000` checks to spare
@@ -37310,9 +37317,9 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     let no_ties = || tie_sum == 0.0;
     let take_exact = if WILCOXON_FORCE_EAGER_NOTIES.load(std::sync::atomic::Ordering::Relaxed) {
         let nt = no_ties();
-        no_zeros && nt && nr <= 1000
+        no_zeros && nt && x.len() <= WILCOXON_AUTO_EXACT_MAX_N
     } else {
-        no_zeros && nr <= 1000 && no_ties()
+        no_zeros && x.len() <= WILCOXON_AUTO_EXACT_MAX_N && no_ties()
     };
     if take_exact {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, "two-sided");
@@ -37436,7 +37443,7 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // from the ranking pass answers that for free — it is zero exactly when no tie group
     // has size >= 2. BYTE-IDENTICAL as a predicate: both test exact equality.
     let no_ties = tie_sum == 0.0;
-    if no_zeros && no_ties && nr <= 1000 {
+    if no_zeros && no_ties && x.len() <= WILCOXON_AUTO_EXACT_MAX_N {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, alternative);
         return TtestResult {
             statistic: stat,
@@ -44465,99 +44472,231 @@ pub fn obrientransform(groups: &[&[f64]]) -> Vec<Vec<f64>> {
     })
 }
 
+/// How [`page_trend_test`] computes its p-value: `scipy.stats.page_trend_test(method=...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageTrendMethod {
+    /// `'auto'`: exact unless the table has more than 8 columns, more than 12 rows with more
+    /// than 3 columns, or more than 20 rows.
+    #[default]
+    Auto,
+    /// `'exact'`: the null distribution of L, convolved over rows (Odiase and Ogbonmwan).
+    Exact,
+    /// `'asymptotic'`: the normal approximation to L.
+    Asymptotic,
+}
+
 /// Result of Page's trend test.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageTrendResult {
     /// Page's L statistic.
     pub statistic: f64,
-    /// Approximate p-value (one-sided, for increasing trend).
+    /// One-sided p-value for an increasing trend in the predicted order.
     pub pvalue: f64,
+    /// The method that computed `pvalue`: `Exact` or `Asymptotic`, never `Auto`.
+    pub method: PageTrendMethod,
 }
 
-/// Perform Page's L test for a monotonic trend in ranked data.
+/// The largest column count the exact method handles. The single-row distribution comes from a
+/// subset DP over 2^k states; SciPy enumerates all k! permutations instead, which exhausts
+/// memory near k = 12, so this covers every table SciPy can complete.
+const PAGE_EXACT_MAX_COLUMNS: usize = 12;
+
+/// Page's L test for a monotonic trend across ordered conditions: rows are subjects or blocks,
+/// columns are conditions.
 ///
-/// Tests whether there is a monotonic trend across ordered conditions.
-/// Data should be organized as rows (subjects/blocks) by columns (conditions).
+/// Matches `scipy.stats.page_trend_test(data, ranked, predicted_ranks, method)` (SciPy
+/// 1.17.1):
+/// - rows are ranked with average ranks for ties, unless `ranked` says they already are;
+/// - `L = Σ_j predicted_ranks[j] · (column j's rank sum)`, with `1..=n` as the default
+///   prediction;
+/// - the exact p-value is `P(L' ≥ trunc(L))`. SciPy convolves the single-row distribution
+///   across rows, and so does this;
+/// - the asymptotic p-value is `norm.sf((L − E0)/√V0)`.
 ///
-/// Matches `scipy.stats.page_trend_test(data)`.
+/// # Errors
 ///
-/// # Arguments
-/// * `data` — 2D data where each inner slice is a row (subject), columns are conditions
+/// As SciPy raises:
+/// - fewer than 2 rows or 3 columns, or ragged rows;
+/// - a NaN in `data`;
+/// - `ranked` data outside `[1, n]`;
+/// - `predicted_ranks` that is not a permutation of `1..=n`.
 ///
-/// # Returns
-/// `PageTrendResult` with L statistic and approximate p-value.
-pub fn page_trend_test(data: &[&[f64]]) -> PageTrendResult {
-    let n = data.len(); // number of subjects/blocks
-    if n == 0 {
-        return PageTrendResult {
-            statistic: f64::NAN,
-            pvalue: f64::NAN,
-        };
+/// Also an error: the exact method on more than 12 columns (see `PAGE_EXACT_MAX_COLUMNS`).
+pub fn page_trend_test(
+    data: &[&[f64]],
+    ranked: bool,
+    predicted_ranks: Option<&[usize]>,
+    method: PageTrendMethod,
+) -> Result<PageTrendResult, StatsError> {
+    let m = data.len();
+    let n = data.first().map_or(0, |row| row.len());
+    if data.iter().any(|row| row.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "`data` must be a 2d array.".to_string(),
+        ));
     }
-
-    let k = data[0].len(); // number of conditions
-    if k < 2 || data.iter().any(|row| row.len() != k) {
-        return PageTrendResult {
-            statistic: f64::NAN,
-            pvalue: f64::NAN,
-        };
+    if m < 2 || n < 3 {
+        return Err(StatsError::InvalidArgument(
+            "Page's L is only appropriate for data with two or more rows and three or more \
+             columns."
+                .to_string(),
+        ));
     }
+    if data.iter().any(|row| row.iter().any(|v| v.is_nan())) {
+        return Err(StatsError::InvalidArgument(
+            "`data` contains NaNs, which cannot be ranked meaningfully".to_string(),
+        ));
+    }
+    let n_f = n as f64;
+    if ranked
+        && data
+            .iter()
+            .any(|row| row.iter().any(|&v| !(1.0..=n_f).contains(&v)))
+    {
+        return Err(StatsError::InvalidArgument(
+            "`data` is not properly ranked. Rank the data or pass `ranked=False`.".to_string(),
+        ));
+    }
+    let default_prediction: Vec<usize>;
+    let predicted = match predicted_ranks {
+        Some(p) => {
+            let mut seen = vec![false; n];
+            let is_permutation = p.len() == n
+                && p.iter()
+                    .all(|&r| (1..=n).contains(&r) && !std::mem::replace(&mut seen[r - 1], true));
+            if !is_permutation {
+                return Err(StatsError::InvalidArgument(format!(
+                    "`predicted_ranks` must include each integer from 1 to {n} (the number of \
+                     columns in `data`) exactly once."
+                )));
+            }
+            p
+        }
+        None => {
+            default_prediction = (1..=n).collect();
+            &default_prediction
+        }
+    };
 
-    // Rank within each row
-    let mut rank_sums = vec![0.0; k];
-    // Per-row scratch hoisted out of the loop: indexed is cleared+rebuilt each row,
-    // ranks is fully overwritten (the while loop assigns every column) -> byte-
-    // identical, saving 2×n_rows allocations. frankenscipy-26zjo.
-    let mut indexed: Vec<(usize, f64)> = Vec::with_capacity(k);
-    let mut ranks = vec![0.0; k];
-
+    // Column rank sums, adding the rows in order as numpy's sum over axis 0 does.
+    let mut rank_sums = vec![0.0; n];
+    let mut indexed: Vec<(usize, f64)> = Vec::with_capacity(n);
+    let mut ranks = vec![0.0; n];
     for row in data {
-        // Get ranks for this row
-        indexed.clear();
-        indexed.extend(row.iter().copied().enumerate());
-        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        let mut i = 0;
-        while i < k {
-            let mut j = i + 1;
-            while j < k && indexed[j].1 == indexed[i].1 {
-                j += 1;
+        if ranked {
+            ranks.copy_from_slice(row);
+        } else {
+            indexed.clear();
+            indexed.extend(row.iter().copied().enumerate());
+            indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut i = 0;
+            while i < n {
+                let mut j = i + 1;
+                while j < n && indexed[j].1 == indexed[i].1 {
+                    j += 1;
+                }
+                let avg_rank = (i + 1 + j) as f64 / 2.0;
+                for entry in &indexed[i..j] {
+                    ranks[entry.0] = avg_rank;
+                }
+                i = j;
             }
-            let avg_rank = (i + 1 + j) as f64 / 2.0;
-            for idx in i..j {
-                ranks[indexed[idx].0] = avg_rank;
-            }
-            i = j;
         }
-
-        for (col, &rank) in ranks.iter().enumerate() {
-            rank_sums[col] += rank;
+        for (sum, &rank) in rank_sums.iter_mut().zip(&ranks) {
+            *sum += rank;
         }
     }
-
-    // Compute L statistic: sum of (condition_index + 1) * rank_sum
-    let l: f64 = rank_sums
+    let l: f64 = predicted
         .iter()
-        .enumerate()
-        .map(|(i, &r)| (i + 1) as f64 * r)
+        .zip(&rank_sums)
+        .map(|(&p, &s)| p as f64 * s)
         .sum();
 
-    // Expected value and variance under null hypothesis
-    let n_f = n as f64;
-    let k_f = k as f64;
-    let expected_l = n_f * k_f * (k_f + 1.0).powi(2) / 4.0;
-    let var_l = n_f * k_f.powi(2) * (k_f + 1.0).powi(2) * (k_f - 1.0) / 144.0;
-
-    // Z-score approximation
-    let z = (l - expected_l) / var_l.sqrt();
-
-    // One-sided p-value (testing for increasing trend)
-    let pvalue = 1.0 - standard_normal_cdf(z);
-
-    PageTrendResult {
+    let method = match method {
+        PageTrendMethod::Auto if n > 8 || (m > 12 && n > 3) || m > 20 => {
+            PageTrendMethod::Asymptotic
+        }
+        PageTrendMethod::Auto => PageTrendMethod::Exact,
+        chosen => chosen,
+    };
+    let pvalue = if method == PageTrendMethod::Exact {
+        page_l_exact_sf(l, m, n)?
+    } else {
+        // SciPy evaluates E0 and V0 in Python integers before the true division.
+        let (mi, ni) = (m as u128, n as u128);
+        let e0 = (mi * ni * (ni + 1) * (ni + 1)) as f64 / 4.0;
+        let v0 = (mi * ni * ni * (ni + 1) * (ni * ni - 1)) as f64 / 144.0;
+        Normal::standard().sf((l - e0) / v0.sqrt())
+    };
+    Ok(PageTrendResult {
         statistic: l,
         pvalue,
+        method,
+    })
+}
+
+/// SciPy's `_l_p_exact`: `P(L' ≥ trunc(l))` for `rows` independent rows of `k` columns. The
+/// single-row distribution counts `Σ i·π(i)` over all permutations π of `1..=k` (a subset DP,
+/// where SciPy enumerates the permutations; the counts are integers either way). The row
+/// distributions are convolved in the order and summation order of SciPy's recursive
+/// `_PageL.pmf`.
+fn page_l_exact_sf(l: f64, rows: usize, k: usize) -> Result<f64, StatsError> {
+    if k > PAGE_EXACT_MAX_COLUMNS {
+        return Err(StatsError::InvalidArgument(format!(
+            "the exact Page's L distribution is limited to {PAGE_EXACT_MAX_COLUMNS} columns; \
+             use the asymptotic method"
+        )));
     }
+    // One row's L runs from a = Σ i(k+1-i) to b = Σ i².
+    let a = k * (k + 1) * (k + 2) / 6;
+    let b = k * (k + 1) * (2 * k + 1) / 6;
+    // counts[mask][s]: ways to give columns 1..=popcount(mask) the ranks in `mask` with
+    // Σ column·rank = s.
+    let mut counts = vec![vec![0_u64; b + 1]; 1 << k];
+    counts[0][0] = 1;
+    for mask in 0..(1_usize << k) {
+        let column = mask.count_ones() as usize + 1;
+        if column > k {
+            continue;
+        }
+        for rank in 0..k {
+            if mask & (1 << rank) != 0 {
+                continue;
+            }
+            let (from, to) = (mask, mask | (1 << rank));
+            let step = column * (rank + 1);
+            for s in 0..=b - step {
+                let c = counts[from][s];
+                if c != 0 {
+                    counts[to][s + step] += c;
+                }
+            }
+        }
+    }
+    let factorial: u64 = (1..=k as u64).product();
+    let single: Vec<f64> = counts[(1 << k) - 1][a..=b]
+        .iter()
+        .map(|&c| c as f64 / factorial as f64)
+        .collect();
+    // pmf over L for `r` rows lives on [r·a, r·b]; `pmf[i]` is P(L = r·a + i).
+    let mut pmf = single.clone();
+    for r in 2..=rows {
+        let mut next = vec![0.0; r * (b - a) + 1];
+        for (i, slot) in next.iter_mut().enumerate() {
+            let target = r * a + i;
+            let low = target.saturating_sub((r - 1) * b).max(a);
+            let high = (target - (r - 1) * a).min(b);
+            let mut p = 0.0;
+            for t in low..=high {
+                p += pmf[target - t - (r - 1) * a] * single[t - a];
+            }
+            *slot = p;
+        }
+        pmf = next;
+    }
+    // SciPy truncates L with int() before summing the pmf from there to the maximum.
+    let start = (l.trunc() as usize).max(rows * a) - rows * a;
+    Ok(pmf.get(start..).map_or(0.0, |tail| tail.iter().sum()))
 }
 
 /// Compute a weighted Kendall's tau correlation.
@@ -68721,7 +68860,13 @@ mod tests {
         let r0 = [1.0, 1.0 + d10, 3.0, 4.0];
         let r1 = [2.0, 2.0 + d10, 5.0, 6.0];
         let r2 = [3.0, 3.0 + d10, 7.0, 8.0];
-        let pt = page_trend_test(&[&r0[..], &r1[..], &r2[..]]);
+        let pt = page_trend_test(
+            &[&r0[..], &r1[..], &r2[..]],
+            false,
+            None,
+            PageTrendMethod::Auto,
+        )
+        .expect("page_trend_test");
         assert!(
             (pt.statistic - 90.0).abs() < 1e-9,
             "page_trend L {} != scipy 90.0 (tolerance grouping gives 88.5)",
@@ -88891,42 +89036,219 @@ mod tests {
         assert_eq!(result[0].len(), 4);
     }
 
-    #[test]
-    fn page_trend_test_increasing() {
-        // Clear increasing trend across conditions
-        let row1 = [1.0, 2.0, 3.0, 4.0];
-        let row2 = [1.0, 3.0, 2.0, 4.0];
-        let row3 = [2.0, 1.0, 3.0, 4.0];
-        let result = page_trend_test(&[&row1, &row2, &row3]);
-        assert!(result.statistic.is_finite());
-        assert!(result.pvalue.is_finite());
-        // Strong trend should have small p-value
-        assert!(result.pvalue < 0.1);
+    fn page_close(got: &PageTrendResult, l: f64, p: f64, method: PageTrendMethod, label: &str) {
+        assert_eq!(got.statistic, l, "{label}: L");
+        assert!(
+            (got.pvalue - p).abs() <= 1e-13 * p,
+            "{label}: p {} vs SciPy {p}",
+            got.pvalue
+        );
+        assert_eq!(got.method, method, "{label}: method");
     }
 
     #[test]
-    fn page_trend_test_no_trend() {
-        // No clear trend
-        let row1 = [4.0, 1.0, 3.0, 2.0];
-        let row2 = [2.0, 4.0, 1.0, 3.0];
-        let row3 = [3.0, 2.0, 4.0, 1.0];
-        let result = page_trend_test(&[&row1, &row2, &row3]);
-        assert!(result.statistic.is_finite());
-        assert!(result.pvalue.is_finite());
+    fn page_trend_test_exact_and_asymptotic_match_scipy() {
+        use PageTrendMethod::{Asymptotic, Auto, Exact};
+        let page = |rows: &[&[f64]], method| {
+            page_trend_test(rows, false, None, method).expect("page_trend_test")
+        };
+        // SciPy 1.17.1 page_trend_test. With at most 8 columns and few rows, 'auto' is the
+        // exact distribution; the pre-port code always took the normal approximation.
+        let inc: [&[f64]; 3] = [
+            &[1.0, 2.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+        ];
+        page_close(
+            &page(&inc, Auto),
+            88.0,
+            0.0028935185185185184,
+            Exact,
+            "increasing",
+        );
+        let none: [&[f64]; 3] = [
+            &[4.0, 1.0, 3.0, 2.0],
+            &[2.0, 4.0, 1.0, 3.0],
+            &[3.0, 2.0, 4.0, 1.0],
+        ];
+        page_close(
+            &page(&none, Auto),
+            71.0,
+            0.8088107638888886,
+            Exact,
+            "no trend",
+        );
+        // Ties: average ranks make L = 88.5, and the exact sf starts from int(L) = 88.
+        let ties: [&[f64]; 3] = [
+            &[1.0, 1.0, 3.0, 4.0],
+            &[2.0, 2.0, 5.0, 6.0],
+            &[3.0, 3.0, 7.0, 8.0],
+        ];
+        page_close(
+            &page(&ties, Auto),
+            88.5,
+            0.0028935185185185184,
+            Exact,
+            "ties",
+        );
+
+        // 7 columns: exact over 7! orderings per row.
+        let big: [&[f64]; 6] = [
+            &[2.041, -2.256, 1.018, 0.332, 0.747, 1.284, -0.22],
+            &[-0.232, -0.565, 3.923, 1.126, 0.847, 1.219, 1.132],
+            &[-1.055, -0.091, 1.082, 0.661, 2.158, 1.3, 1.824],
+            &[1.546, 0.845, 0.095, 0.717, 1.741, 3.435, 1.53],
+            &[-0.244, 1.302, -0.286, 0.608, 2.083, 2.08, 1.892],
+            &[0.67, -2.528, 1.621, -0.06, -0.469, 1.776, 2.501],
+        ];
+        page_close(
+            &page(&big, Auto),
+            750.0,
+            0.0022749974281885857,
+            Exact,
+            "7 columns",
+        );
+        page_close(
+            &page(&big, Asymptotic),
+            750.0,
+            0.002670496262533603,
+            Asymptotic,
+            "7 asym",
+        );
+
+        // 22 rows: 'auto' switches to the normal approximation; 'exact' still convolves.
+        let tall_rows = [
+            [-0.445, -0.876, 0.426, 0.547],
+            [1.406, 0.947, 0.594, 1.712],
+            [-0.206, -0.726, 0.984, 1.183],
+            [-0.215, -0.583, 0.629, -1.894],
+            [0.69, 0.691, -1.239, 0.661],
+            [-0.964, 0.957, -1.634, -0.314],
+            [0.71, 1.356, -1.758, 0.102],
+            [0.328, -0.409, 1.991, -0.591],
+            [0.355, -0.848, 1.806, 0.578],
+            [-0.372, -1.518, 2.082, 1.353],
+            [0.754, 1.338, 0.749, -0.039],
+            [-0.8, -0.6, 1.77, -0.86],
+            [-0.596, -0.121, 0.625, 1.175],
+            [-1.249, -1.53, 0.396, 1.814],
+            [0.757, 0.416, 0.083, 0.893],
+            [-0.243, 1.017, -0.394, 0.734],
+            [-0.111, 0.743, 0.625, 3.15],
+            [1.499, 1.697, -1.64, 0.26],
+            [-0.609, 0.733, -1.879, 1.774],
+            [1.067, -1.102, -0.579, -0.201],
+            [0.043, 0.841, 2.448, 0.403],
+            [0.768, 0.355, 2.16, 1.342],
+        ];
+        let tall: Vec<&[f64]> = tall_rows.iter().map(|r| &r[..]).collect();
+        page_close(
+            &page(&tall, Auto),
+            567.0,
+            0.10464263040960536,
+            Asymptotic,
+            "22 rows",
+        );
+        page_close(
+            &page(&tall, Exact),
+            567.0,
+            0.11222420175699505,
+            Exact,
+            "22 rows exact",
+        );
+
+        // Deep upper tail: SciPy's norm.sf gives 1.97e-54, where 1 - cdf is exactly 0.
+        let strong_row: Vec<f64> = (1..=9).map(f64::from).collect();
+        let strong: Vec<&[f64]> = (0..30).map(|_| &strong_row[..]).collect();
+        page_close(
+            &page(&strong, Auto),
+            8550.0,
+            1.9664165896741723e-54,
+            Asymptotic,
+            "tail",
+        );
     }
 
     #[test]
-    fn page_trend_test_empty() {
-        let result = page_trend_test(&[]);
-        assert!(result.statistic.is_nan());
-        assert!(result.pvalue.is_nan());
+    fn page_trend_test_ranked_and_predicted_ranks_match_scipy() {
+        use PageTrendMethod::{Auto, Exact};
+        let rows: [&[f64]; 3] = [
+            &[1.0, 2.0, 3.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+        ];
+        let got = page_trend_test(&rows, true, None, Auto).expect("ranked");
+        page_close(&got, 88.0, 0.0028935185185185184, Exact, "ranked");
+        let tied: [&[f64]; 3] = [
+            &[1.5, 1.5, 3.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+        ];
+        let got = page_trend_test(&tied, true, None, Auto).expect("ranked ties");
+        page_close(&got, 87.5, 0.007016782407407407, Exact, "ranked ties");
+        let data: [&[f64]; 3] = [
+            &[21.0, 22.0, 24.0, 26.0],
+            &[23.0, 25.0, 27.0, 30.0],
+            &[20.0, 26.0, 28.0, 30.0],
+        ];
+        let got = page_trend_test(&data, false, Some(&[2, 3, 1, 4]), Auto).expect("predicted");
+        page_close(&got, 81.0, 0.142578125, Exact, "predicted ranks");
     }
 
     #[test]
-    fn page_trend_test_single_condition() {
-        let row1 = [1.0];
-        let result = page_trend_test(&[&row1]);
-        assert!(result.statistic.is_nan());
+    fn page_trend_test_rejects_what_scipy_rejects() {
+        use PageTrendMethod::Auto;
+        // Anything but an InvalidArgument maps to a sentinel that every assertion below rejects.
+        let msg = |r: Result<PageTrendResult, StatsError>| match r {
+            Err(StatsError::InvalidArgument(m)) => m,
+            _ => "<not an InvalidArgument error>".to_string(),
+        };
+        let shape = "Page's L is only appropriate for data with two or more rows and three or more \
+                     columns.";
+        assert_eq!(msg(page_trend_test(&[], false, None, Auto)), shape);
+        assert_eq!(
+            msg(page_trend_test(&[&[1.0, 2.0, 3.0]], false, None, Auto)),
+            shape
+        );
+        assert_eq!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0], &[2.0, 1.0]],
+                false,
+                None,
+                Auto
+            )),
+            shape
+        );
+        assert!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0, f64::NAN], &[2.0, 1.0, 3.0]],
+                false,
+                None,
+                Auto
+            ))
+            .contains("NaN")
+        );
+        assert!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0, 3.0, 5.0], &[2.0, 1.0, 3.0, 4.0]],
+                true,
+                None,
+                Auto
+            ))
+            .contains("not properly ranked")
+        );
+        let rows: [&[f64]; 2] = [&[1.0, 2.0, 3.0], &[2.0, 1.0, 3.0]];
+        assert!(
+            msg(page_trend_test(&rows, false, Some(&[1, 1, 3]), Auto)).contains("exactly once")
+        );
+        assert!(msg(page_trend_test(&rows, false, Some(&[1, 2]), Auto)).contains("exactly once"));
+        let wide: Vec<f64> = (0..13).map(f64::from).collect();
+        let wide_rows: [&[f64]; 2] = [&wide, &wide];
+        assert!(
+            page_trend_test(&wide_rows, false, None, PageTrendMethod::Exact).is_err(),
+            "exact beyond PAGE_EXACT_MAX_COLUMNS"
+        );
+        assert!(page_trend_test(&wide_rows, false, None, Auto).is_ok());
     }
 
     #[test]
@@ -106001,16 +106323,15 @@ mod tests {
         let row4: Vec<f64> = vec![2.0, 1.0, 3.0];
         let row5: Vec<f64> = vec![2.0, 1.0, 3.0];
         let data: Vec<&[f64]> = vec![&row1, &row2, &row3, &row4, &row5];
-        let result = page_trend_test(&data);
-        assert!(
-            (result.statistic - 68.0).abs() < 1e-10,
-            "page_trend statistic got {}, expected 68.0",
-            result.statistic
-        );
-        assert!(
-            result.pvalue > 0.0 && result.pvalue < 0.01,
-            "page_trend pvalue got {}, expected <0.01 (significant)",
-            result.pvalue
+        let result =
+            page_trend_test(&data, false, None, PageTrendMethod::Auto).expect("page_trend_test");
+        // SciPy 1.17.1: statistic 68.0, exact p-value 0.006558641975308641.
+        page_close(
+            &result,
+            68.0,
+            0.006558641975308641,
+            PageTrendMethod::Exact,
+            "five rows",
         );
     }
 
@@ -107434,17 +107755,25 @@ mod tests {
         let row2: Vec<f64> = vec![23.0, 25.0, 27.0, 30.0];
         let row3: Vec<f64> = vec![20.0, 26.0, 28.0, 30.0];
         let data: Vec<&[f64]> = vec![&row1, &row2, &row3];
-        let result = page_trend_test(&data);
-        assert!(
-            (result.statistic - 90.0).abs() < 1e-6,
-            "page_trend_test statistic got {}, expected 90.0",
-            result.statistic
+        // SciPy 1.17.1: 'auto' is exact here (7.2e-5); the normal approximation this function
+        // used to return for every table gives 1.35e-3, 18x larger.
+        let exact =
+            page_trend_test(&data, false, None, PageTrendMethod::Auto).expect("page_trend_test");
+        page_close(
+            &exact,
+            90.0,
+            7.233796296296296e-05,
+            PageTrendMethod::Exact,
+            "auto",
         );
-        // p-value calculation differs from scipy; verify it's small and significant
-        assert!(
-            result.pvalue < 0.01 && result.pvalue > 0.0,
-            "page_trend_test pvalue got {}, expected small positive",
-            result.pvalue
+        let asymptotic = page_trend_test(&data, false, None, PageTrendMethod::Asymptotic)
+            .expect("page_trend_test");
+        page_close(
+            &asymptotic,
+            90.0,
+            0.0013498980316300933,
+            PageTrendMethod::Asymptotic,
+            "asymptotic",
         );
     }
 

@@ -81,7 +81,7 @@ fn incumbent() -> &'static ScipyIncumbent {
 use fsci_special::{
     SpecialTensor, beta, betainc, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit,
     exprel, gamma, gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0,
-    k1, kn, kv, kve, rgamma, spence, y0, y1, yn, yv, yve, zeta,
+    k1, kn, kv, kve, ndtri, rgamma, spence, y0, y1, yn, yv, yve, zeta,
 };
 
 const PYTHON: &str = r#"
@@ -250,6 +250,7 @@ const CASES: &[(&str, f64, f64)] = &[
     ("erfc", -6.0, 6.0),
     ("erfinv", -0.999, 0.999),
     ("erfcinv", 0.001, 1.999),
+    ("ndtri", 0.001, 0.999),
     ("dawsn", -10.0, 10.0),
     // Bessel: oscillatory small-argument series through to the asymptotic expansion.
     ("j0", -30.0, 30.0),
@@ -337,6 +338,7 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "erfc" => erfc(tensor, mode),
         "erfinv" => erfinv(tensor, mode),
         "erfcinv" => erfcinv(tensor, mode),
+        "ndtri" => ndtri(tensor, mode),
         "dawsn" => dawsn(tensor, mode),
         "j0" => j0(tensor, mode),
         "j1" => j1(tensor, mode),
@@ -1509,17 +1511,18 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
             },
             true,
         )),
-        // erfinv's live question is now its polynomial evaluator's shape: the Cephes tables
-        // are fixed-size arrays but `cephes_ndtri_polevl` takes a slice, so the degree is a
-        // runtime length. SciPy's equivalent is a compile-time-degree template.
-        "erfinv" => Some((
+        // ndtri's live question is its polynomial evaluator's shape: the Cephes tables are
+        // fixed-size arrays but `cephes_ndtri_polevl` takes a slice, so the degree is a
+        // runtime length. SciPy's equivalent is a compile-time-degree template. It was asked
+        // through erfinv until erfinv became Boost's erf_inv and stopped calling ndtri.
+        "ndtri" => Some((
             "ndtri_unroll_polevl",
             |on| {
                 fsci_special::NDTRI_UNROLL_POLEVL.store(on, std::sync::atomic::Ordering::Relaxed);
             },
             true,
         )),
-        "erfinv_old" => Some((
+        "erfinv" => Some((
             "infallible_batch",
             |on| {
                 fsci_special::ERFINV_INFALLIBLE_BATCH
@@ -1611,8 +1614,11 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfcinv" => {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
-        "erfinv" => Some(|| {
+        "ndtri" => Some(|| {
             fsci_special::NDTRI_UNROLL_POLEVL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
+        "erfinv" => Some(|| {
+            fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         "y1" => Some(|| {
             fsci_special::BESSEL_Y01_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed)

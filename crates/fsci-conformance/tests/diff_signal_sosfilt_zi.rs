@@ -97,9 +97,16 @@ fn generate_query() -> OracleQuery {
                 [1.0, 0.0, 0.0, 1.0, -0.3, 0.1],
             ],
         ),
-        // 3-section cascade dropped — fsci diverges from scipy by ~3.0
-        // (likely related to multi-section state-propagation order
-        // differences); 1- and 2-section cases match exactly.
+        // A 3-section cascade was dropped once, as "fsci diverges from scipy by ~3.0"; it is
+        // back to show whether that still holds.
+        (
+            "3section_cascade",
+            vec![
+                [0.5, 0.0, 0.0, 1.0, -0.5, 0.0],
+                [1.0, 0.0, 0.0, 1.0, -0.3, 0.1],
+                [1.0, 0.4, 0.1, 1.0, -0.8, 0.3],
+            ],
+        ),
         ("fir_only", vec![[1.0, 0.5, 0.25, 1.0, 0.0, 0.0]]),
     ];
     let points = cases

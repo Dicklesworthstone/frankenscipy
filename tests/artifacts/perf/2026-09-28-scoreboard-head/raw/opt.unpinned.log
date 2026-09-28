@@ -1,0 +1,13 @@
+elf_sha256=3628d8c5a9e4922c5357333e66d172e920839535537e824446f9047920cf4252
+n=256 m=256 nnls_gram_blocked=false nnls_direct_qr=true
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=assignment n=256 m=256 fixture_sha256=18368229d60a380d3f00a0bffe40cd36dad945c9cf47fccf745fc55eec7ba808 tasks=1 genuine=True out_len=1
+op=assignment calibration single=1.2987ms reps=16
+case=n256m256 op=assignment fsci=1.038ms scipy=1.207ms scipy/fsci=1.163x null_fsci=1.013 null_scipy=1.019 CHECK max_abs=3.55271367880050093e-15 max_rel=1.87271154837564860e-16 compared=1
+READY scipy=1.17.1 numpy=2.4.3 op=nnls n=256 m=256 fixture_sha256=18368229d60a380d3f00a0bffe40cd36dad945c9cf47fccf745fc55eec7ba808 tasks=1 genuine=True out_len=257
+op=nnls calibration single=1.5334ms reps=14
+case=n256m256 op=nnls fsci=1.313ms scipy=1.520ms scipy/fsci=1.158x null_fsci=1.103 null_scipy=1.072 CHECK max_abs=1.77635683940025046e-15 max_rel=9.40351669663482683e-14 compared=257
+armab=nnls_direct_qr qr=1.246ms gram=3.824ms gram/qr=3.069x null_qr=1.123 null_gram=1.071 hits_on=1 hits_off=0
+READY scipy=1.17.1 numpy=2.4.3 op=linprog n=256 m=256 fixture_sha256=18368229d60a380d3f00a0bffe40cd36dad945c9cf47fccf745fc55eec7ba808 tasks=32 genuine=True out_len=1
+op=linprog calibration single=4.1529ms reps=5
+case=n256m256 op=linprog fsci=2.193ms scipy=27.366ms scipy/fsci=12.480x null_fsci=1.124 null_scipy=1.038 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=1

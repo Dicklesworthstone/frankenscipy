@@ -24,6 +24,11 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= ATOL + RTOL * a.abs().max(b.abs()).max(1.0)
 }
 
+/// 2-D points as the `(npoints, ndim)` rows the Qhull-equivalent types take.
+fn as_rows(points: &[(f64, f64)]) -> Vec<Vec<f64>> {
+    points.iter().map(|&(x, y)| vec![x, y]).collect()
+}
+
 const ALL_METRICS: &[DistanceMetric] = &[
     DistanceMetric::Euclidean,
     DistanceMetric::SqEuclidean,
@@ -308,7 +313,7 @@ fn mr_convex_hull_encloses_all_inputs() {
         (2.0, 2.0),
         (3.0, 1.5),
     ];
-    let hull = ConvexHull::new(&pts).unwrap();
+    let hull = ConvexHull::new(&as_rows(&pts)).unwrap();
 
     // Get hull vertices in CCW order.
     let hull_pts: Vec<(f64, f64)> = hull.vertices.iter().map(|&i| pts[i]).collect();
@@ -331,12 +336,12 @@ fn mr_convex_hull_encloses_all_inputs() {
         }
     }
 
-    // Hull area for the 4x3 rectangle must be 12.
+    // Hull area (SciPy's `volume` in 2-D) for the 4x3 rectangle must be 12.
     let expected_area = 12.0_f64;
     assert!(
-        (hull.area - expected_area).abs() < 1e-10,
+        (hull.volume - expected_area).abs() < 1e-10,
         "MR9 hull area: {} vs {expected_area}",
-        hull.area
+        hull.volume
     );
 }
 
@@ -348,7 +353,7 @@ fn mr_convex_hull_encloses_all_inputs() {
 #[test]
 fn mr_convex_hull_triangle() {
     let pts = vec![(0.0_f64, 0.0), (4.0, 0.0), (0.0, 3.0)];
-    let hull = ConvexHull::new(&pts).unwrap();
+    let hull = ConvexHull::new(&as_rows(&pts)).unwrap();
     assert_eq!(
         hull.vertices.len(),
         3,
@@ -356,9 +361,9 @@ fn mr_convex_hull_triangle() {
     );
     let expected_area = 6.0_f64; // 1/2 · base · height = 1/2 · 4 · 3
     assert!(
-        (hull.area - expected_area).abs() < 1e-10,
+        (hull.volume - expected_area).abs() < 1e-10,
         "MR10 triangle area: {} vs {expected_area}",
-        hull.area
+        hull.volume
     );
 }
 
@@ -377,16 +382,16 @@ fn mr_convex_hull_translation_invariance() {
         (2.0, 2.0),
         (3.5, 1.0),
     ];
-    let hull_a = ConvexHull::new(&base).unwrap();
+    let hull_a = ConvexHull::new(&as_rows(&base)).unwrap();
     let dx = 7.5_f64;
     let dy = -3.2_f64;
     let shifted: Vec<(f64, f64)> = base.iter().map(|&(x, y)| (x + dx, y + dy)).collect();
-    let hull_b = ConvexHull::new(&shifted).unwrap();
+    let hull_b = ConvexHull::new(&as_rows(&shifted)).unwrap();
     assert!(
-        (hull_a.area - hull_b.area).abs() < 1e-10,
+        (hull_a.volume - hull_b.volume).abs() < 1e-10,
         "MR11 area changed under translation: {} vs {}",
-        hull_a.area,
-        hull_b.area
+        hull_a.volume,
+        hull_b.volume
     );
     assert_eq!(
         hull_a.vertices.len(),
@@ -1200,13 +1205,17 @@ fn mr_sokalsneath_self_zero() {
 #[test]
 fn mr_convex_hull_area_positive() {
     let points = vec![(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (1.0, 1.0)];
-    let hull = ConvexHull::new(&points).unwrap();
-    assert!(hull.area > 0.0, "MR47 ConvexHull area = {} ≤ 0", hull.area);
-    // Triangle area is 6 (base 4, height 3, area = 6).
+    let hull = ConvexHull::new(&as_rows(&points)).unwrap();
     assert!(
-        (hull.area - 6.0).abs() < 1e-9,
+        hull.volume > 0.0,
+        "MR47 ConvexHull area = {} ≤ 0",
+        hull.volume
+    );
+    // Triangle area is 6 (base 4, height 3, area = 6); SciPy names it `volume` in 2-D.
+    assert!(
+        (hull.volume - 6.0).abs() < 1e-9,
         "MR47 ConvexHull area = {} expected 6",
-        hull.area
+        hull.volume
     );
 }
 
@@ -1217,7 +1226,7 @@ fn mr_convex_hull_area_positive() {
 #[test]
 fn mr_convex_hull_unique_vertices() {
     let points = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (2.0, 1.5)];
-    let hull = ConvexHull::new(&points).unwrap();
+    let hull = ConvexHull::new(&as_rows(&points)).unwrap();
     let mut seen = vec![false; points.len()];
     for &v in &hull.vertices {
         assert!(v < points.len(), "MR48 vertex idx {v} out of range");
@@ -1233,17 +1242,14 @@ fn mr_convex_hull_unique_vertices() {
 #[test]
 fn mr_convex_hull_perimeter_positive() {
     let points = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)];
-    let hull = ConvexHull::new(&points).unwrap();
-    assert!(
-        hull.perimeter > 0.0,
-        "MR49 ConvexHull perimeter = {}",
-        hull.perimeter
-    );
+    let hull = ConvexHull::new(&as_rows(&points)).unwrap();
+    // SciPy's `area` of a 2-D hull is its perimeter.
+    assert!(hull.area > 0.0, "MR49 ConvexHull perimeter = {}", hull.area);
     // 4-3-4-3 rectangle perimeter = 14.
     assert!(
-        (hull.perimeter - 14.0).abs() < 1e-9,
+        (hull.area - 14.0).abs() < 1e-9,
         "MR49 perimeter = {} expected 14",
-        hull.perimeter
+        hull.area
     );
 }
 
@@ -1260,12 +1266,13 @@ fn mr_delaunay_simplices_in_range() {
         (0.0, 3.0),
         (2.0, 1.5),
     ];
-    let d = Delaunay::new(&points).unwrap();
+    let d = Delaunay::new(&as_rows(&points)).unwrap();
     let n = points.len();
-    for &(a, b, c) in &d.simplices {
-        assert!(a < n, "MR50 simplex idx {a} ≥ {n}");
-        assert!(b < n, "MR50 simplex idx {b} ≥ {n}");
-        assert!(c < n, "MR50 simplex idx {c} ≥ {n}");
+    for simplex in &d.simplices {
+        assert_eq!(simplex.len(), 3, "MR50 a 2-D simplex has 3 vertices");
+        for &idx in simplex {
+            assert!(idx < n, "MR50 simplex idx {idx} ≥ {n}");
+        }
     }
 }
 
@@ -1277,7 +1284,7 @@ fn mr_delaunay_simplices_in_range() {
 #[test]
 fn mr_voronoi_regions_exist() {
     let points = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (2.0, 1.5)];
-    let v = Voronoi::new(&points).unwrap();
+    let v = Voronoi::new(&as_rows(&points)).unwrap();
     assert_eq!(
         v.point_region.len(),
         points.len(),
@@ -1300,13 +1307,13 @@ fn mr_convex_hull_subset_area_dominated() {
         (5.0, 5.0),
     ];
     let subset = vec![(0.0, 0.0), (5.0, 0.0), (0.0, 5.0)];
-    let hull_outer = ConvexHull::new(&outer).unwrap();
-    let hull_subset = ConvexHull::new(&subset).unwrap();
+    let hull_outer = ConvexHull::new(&as_rows(&outer)).unwrap();
+    let hull_subset = ConvexHull::new(&as_rows(&subset)).unwrap();
     assert!(
-        hull_subset.area <= hull_outer.area + 1e-9,
+        hull_subset.volume <= hull_outer.volume + 1e-9,
         "MR52 subset area = {} > outer area = {}",
-        hull_subset.area,
-        hull_outer.area
+        hull_subset.volume,
+        hull_outer.volume
     );
 }
 

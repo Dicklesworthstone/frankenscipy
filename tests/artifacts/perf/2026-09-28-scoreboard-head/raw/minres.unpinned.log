@@ -1,0 +1,20 @@
+elf_sha256=e481404dc2dd7708dbaa558001ac087f6f351091d72b7827ba18506ce514113a
+cpu_affinity=0-63
+host_busy_fraction=0.061
+fixture side=64 n=4096 nnz=20224 shift=0 diagonal=4.001 rtol=0.00000001 max_iter=20000 rounds=11 reps=3
+ours-minres  iterations=141 converged=true reported_residual=8.035951e-9 true_residual=8.035951e-9
+ours-gmres20 iterations=529 converged=true reported_residual=9.905525e-9 true_residual=9.905525e-9
+a_applications_ratio_gmres20_over_minres=3.7518
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+scipy_identity=READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py minres_mod=scipy.sparse.linalg._isolve.minres python=/home/ubuntu/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/bin/python3.13 fsci_loaded=False genuine=True
+scipy_case=CASE n=4096 nnz=20224 sorted=True
+scipy-minres info=0 iterations=83 true_residual=9.341063e-5
+agreement_minres_vs_scipy_max_abs=1.417143e-3
+agreement_gmres20_vs_scipy_max_abs=1.417740e-3
+ours-minres  median_ms_per_solve=4.1629 ci95=[4.1551,4.1767] cv=0.0198
+ours-gmres20 median_ms_per_solve=42.8155 ci95=[42.7120,43.0475] cv=0.0067
+scipy-minres median_ms_per_solve=4.1163 ci95=[4.0896,4.1238] cv=0.0057
+null_pair_median=1.0011 null_bias=0.0011
+SPEEDUP minres_vs_gmres20_delegate=10.2850x
+SPEEDUP minres_vs_scipy_minres=0.9888x
+SPEEDUP gmres20_delegate_vs_scipy_minres=0.0961x

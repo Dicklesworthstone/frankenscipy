@@ -3,10 +3,9 @@
 //!
 //! Resolves [frankenscipy-7a90a].
 //!
-//! - `coherence`: Welch-based Pxx, Pyy, Pxy estimate. Restricted to
-//!   x==y (autocoherence) — fsci diverges from scipy by up to 0.63
-//!   abs on cross-coherence (defect 99796 — likely Pxy averaging
-//!   convention).
+//! - `coherence`: Welch-based Pxx, Pyy, Pxy estimate, on autocoherence
+//!   (x == y) and two cross-coherence cases. Cross-coherence was once
+//!   0.63 off: csd skipped the per-segment mean removal (defect 99796).
 //! - `spectrogram`: time axis differs by 0.5/fs (half-sample
 //!   alignment); only frequencies and sxx values are compared.
 //!

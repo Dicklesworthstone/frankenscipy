@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fsci_cluster::{LinkageMethod, fcluster, linkage};
+use fsci_cluster::{FclusterCriterion, LinkageMethod, fcluster, linkage};
 use libfuzzer_sys::fuzz_target;
 
 // Cluster fcluster bounds oracle:
@@ -72,7 +72,7 @@ fuzz_target!(|input: ClusterInput| {
     let max_clusters = (input.max_clusters as usize).clamp(1, n);
     // fcluster signature returns Result<Vec<usize>, ClusterError>; ignore
     // input shapes that fail validation (typically n < 2 or degenerate z).
-    let labels = match fcluster(&z, max_clusters) {
+    let labels = match fcluster(&z, FclusterCriterion::MaxClust(max_clusters)) {
         Ok(v) => v,
         Err(_) => return,
     };

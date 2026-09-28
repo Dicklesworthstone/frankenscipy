@@ -1,0 +1,7 @@
+elf_sha256=a80c0d8619679d923a276776f47b13587a0776724350e1d051832fdae9ea931f
+lfilter_low_order_max_nfilt=5
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 n=1048576 op=lfilter fixture_sha256=0641cab001797eb0527e19d293e71de4cfb94c55274eb81c6491f29d5397904b tasks=1 genuine=True out_len=1048576
+case=n1048576 op=lfilter fsci=5.264ms scipy=5.210ms scipy/fsci=0.990x null_fsci=1.001 null_scipy=1.009 CHECK max_abs=4.88498130835068878e-15 max_rel=3.91654223569415837e-13
+READY scipy=1.17.1 numpy=2.4.3 n=1048576 op=convolve fixture_sha256=0641cab001797eb0527e19d293e71de4cfb94c55274eb81c6491f29d5397904b tasks=1 genuine=True out_len=1048640
+case=n1048576 op=convolve fsci=9.736ms scipy=11.761ms scipy/fsci=1.208x null_fsci=1.019 null_scipy=1.003 CHECK max_abs=1.55431223447521916e-15 max_rel=3.05704213211643295e-14

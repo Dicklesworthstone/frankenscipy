@@ -205,7 +205,7 @@
   },
   "scipy.integrate": {
    "applicable": 32,
-   "compared": 12,
+   "compared": 14,
    "crate": "fsci-integrate",
    "declared": 31,
    "matched_by": {
@@ -225,7 +225,6 @@
     "DOP853",
     "DenseOutput",
     "IntegrationWarning",
-    "LSODA",
     "OdeSolution",
     "OdeSolver",
     "RK23",
@@ -238,7 +237,6 @@
     "nquad",
     "nsum",
     "ode",
-    "odeint",
     "qmc_quad",
     "tanhsinh"
    ],
@@ -307,7 +305,7 @@
   },
   "scipy.io": {
    "applicable": 14,
-   "compared": 0,
+   "compared": 3,
    "crate": "fsci-io",
    "declared": 14,
    "matched_by": {
@@ -326,15 +324,12 @@
     "FortranFormattingError",
     "hb_read",
     "hb_write",
-    "loadmat",
     "mminfo",
     "mmread",
     "mmwrite",
     "netcdf_file",
     "netcdf_variable",
-    "readsav",
-    "savemat",
-    "whosmat"
+    "readsav"
    ],
    "scipy": 14
   },
@@ -364,12 +359,12 @@
   },
   "scipy.io.matlab": {
    "applicable": 10,
-   "compared": 0,
+   "compared": 4,
    "crate": "fsci-io",
-   "declared": 0,
+   "declared": 3,
    "matched_by": {
-    "case_fold": 0,
-    "exact": 0,
+    "case_fold": 1,
+    "exact": 2,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
@@ -379,16 +374,13 @@
     "MatReadError": "missing: MATLAB read failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
     "MatReadWarning": "missing: no warning channel for recoverable MATLAB read issues (frankenscipy-1ksfv.12)",
     "MatWriteError": "missing: MATLAB write failures are IoError variants, not a distinct error class (frankenscipy-1ksfv.12)",
-    "MatWriteWarning": "missing: no warning channel for recoverable MATLAB write issues (frankenscipy-1ksfv.12)",
-    "MatlabFunction": "missing: MATLAB v5 function elements are not modelled (frankenscipy-1ksfv.12)",
-    "MatlabObject": "missing: MATLAB v5 class objects are not modelled (frankenscipy-1ksfv.12)",
-    "MatlabOpaque": "missing: MATLAB v5 opaque elements are not modelled (frankenscipy-1ksfv.12)",
-    "mat_struct": "missing: MATLAB v5 structs as attribute objects (struct_as_record=False) are not modelled (frankenscipy-1ksfv.12)",
-    "matfile_version": "missing: no MAT-file version probe (frankenscipy-1ksfv.12)",
-    "varmats_from_mat": "missing: no per-variable MAT-file splitter (frankenscipy-1ksfv.12)"
+    "MatWriteWarning": "missing: no warning channel for recoverable MATLAB write issues (frankenscipy-1ksfv.12)"
    },
-   "real": 0,
-   "real_not_compared": [],
+   "real": 6,
+   "real_not_compared": [
+    "matfile_version",
+    "varmats_from_mat"
+   ],
    "scipy": 10
   },
   "scipy.io.wavfile": {
@@ -791,7 +783,7 @@
   },
   "scipy.sparse": {
    "applicable": 51,
-   "compared": 23,
+   "compared": 24,
    "crate": "fsci-sparse",
    "declared": 51,
    "matched_by": {
@@ -811,7 +803,6 @@
     "block_array",
     "bsr_array",
     "csc_array",
-    "csc_matrix",
     "csr_array",
     "dia_array",
     "diags_array",
@@ -841,34 +832,19 @@
   },
   "scipy.sparse.csgraph": {
    "applicable": 26,
-   "compared": 10,
+   "compared": 24,
    "crate": "fsci-sparse",
-   "declared": 12,
+   "declared": 25,
    "matched_by": {
     "case_fold": 0,
-    "exact": 12,
+    "exact": 25,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "NegativeCycleError": "missing: SparseError has no negative-cycle variant (frankenscipy-fdepw)",
-    "breadth_first_tree": "missing: BFS order exists, the BFS tree matrix does not (frankenscipy-fdepw)",
-    "construct_dist_matrix": "missing: no distance matrix from a predecessor matrix (frankenscipy-fdepw)",
-    "csgraph_from_dense": "missing: no dense-to-csgraph conversion with a null value (frankenscipy-fdepw)",
-    "csgraph_from_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "csgraph_masked_from_dense": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "csgraph_to_dense": "missing: no csgraph-to-dense conversion with a null value (frankenscipy-fdepw)",
-    "csgraph_to_masked": "missing: no masked-array graph conversion (frankenscipy-fdepw)",
-    "depth_first_tree": "missing: DFS order exists, the DFS tree matrix does not (frankenscipy-fdepw)",
-    "maximum_bipartite_matching": "missing: no bipartite matching (frankenscipy-fdepw)",
-    "maximum_flow": "missing: no max-flow (frankenscipy-fdepw)",
-    "min_weight_full_bipartite_matching": "missing: no weighted bipartite matching (frankenscipy-fdepw)",
-    "reconstruct_path": "missing: no tree from a predecessor list (frankenscipy-fdepw)",
-    "yen": "missing: no k-shortest-paths (frankenscipy-fdepw)"
-   },
-   "real": 12,
+   "not_real": {},
+   "real": 26,
    "real_not_compared": [
     "reverse_cuthill_mckee",
     "shortest_path"
@@ -915,7 +891,7 @@
   },
   "scipy.spatial": {
    "applicable": 18,
-   "compared": 4,
+   "compared": 8,
    "crate": "fsci-spatial",
    "declared": 18,
    "matched_by": {
@@ -929,13 +905,9 @@
    "not_real": {},
    "real": 18,
    "real_not_compared": [
-    "ConvexHull",
-    "Delaunay",
-    "HalfspaceIntersection",
     "QhullError",
     "Rectangle",
     "SphericalVoronoi",
-    "Voronoi",
     "convex_hull_plot_2d",
     "delaunay_plot_2d",
     "distance_matrix",
@@ -1374,17 +1346,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 827,
-  "declared": 1459,
+  "compared": 855,
+  "declared": 1475,
   "matched_by": {
-   "case_fold": 130,
-   "exact": 1257,
+   "case_fold": 131,
+   "exact": 1272,
    "reexport": 10,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1483,
+  "real": 1503,
   "scipy": 1555
  }
 }

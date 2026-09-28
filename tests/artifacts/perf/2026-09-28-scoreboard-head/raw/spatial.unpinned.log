@@ -1,0 +1,7 @@
+elf_sha256=e966375cd0d274bcfd7130f0083360f6b67ba469f92bd45c00c9188dda09f438
+pdist_soa_euclidean=true available_parallelism=64
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=pdist n=2000 dim=8 nq=2000 fixture_sha256=0224fcc6df8c47e1d9e57f12038bac617d225aa20a1fceb19767759fa34dcd18 tasks=1 genuine=True out_len=1999000
+case=n2000d8 op=pdist fsci=2.696ms scipy=6.398ms scipy/fsci=2.373x null_fsci=1.023 null_scipy=1.141 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+READY scipy=1.17.1 numpy=2.4.3 op=kdtree n=2000 dim=8 nq=2000 fixture_sha256=0224fcc6df8c47e1d9e57f12038bac617d225aa20a1fceb19767759fa34dcd18 tasks=1 genuine=True out_len=2000
+case=n2000d8 op=kdtree fsci=0.469ms scipy=0.872ms scipy/fsci=1.860x null_fsci=1.025 null_scipy=1.028 CHECK max_abs=4.33680868994201774e-19 max_rel=2.04445255398120439e-16

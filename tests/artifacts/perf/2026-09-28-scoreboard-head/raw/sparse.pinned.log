@@ -1,0 +1,7 @@
+elf_sha256=6f25167539bdb99ba76b60322903913372b4def8130ba2ee6b1bb9ac25ea4107
+frankenscipy_engine_sha256=6f25167539bdb99ba76b60322903913372b4def8130ba2ee6b1bb9ac25ea4107
+cpu_affinity=5
+hardware_provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231687815168 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=5 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=5 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1429008 scaling_max_freq_khz=4561833
+evidence_protocol=DEFAULT_SINGLE_CPU bicgstab_multi_profile=false
+ABORT: host-wide benchmark exclusivity failed during pre; CPUs above 20.0% busy: cpu19=100.0%,cpu22=73.3%,cpu23=83.9%,cpu40=26.7%,cpu48=100.0%,cpu50=100.0%,cpu54=27.6%

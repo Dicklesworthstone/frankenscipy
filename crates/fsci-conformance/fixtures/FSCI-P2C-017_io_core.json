@@ -194,7 +194,7 @@
       "content_hex": "000000",
       "expected": {
         "kind": "error",
-        "error": "truncated MAT v4 header"
+        "error": "Mat file appears to be truncated"
       }
     },
     {

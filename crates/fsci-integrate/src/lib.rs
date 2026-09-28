@@ -6,6 +6,7 @@ pub mod bvp;
 mod collocation;
 pub mod complex;
 pub mod lebedev;
+pub mod lsoda;
 pub mod quad;
 mod quadpack;
 pub mod radau;
@@ -24,6 +25,7 @@ pub use bvp::{BvpBcJac, BvpError, BvpFunJac, BvpOptions, BvpResult, solve_bvp, s
 pub use complex::{ComplexOdeResult, complex_ode};
 pub use fsci_runtime::{StiffnessConditionState, StiffnessDetector};
 pub use lebedev::{LebedevRule, lebedev_rule};
+pub use lsoda::{JacFn, LsodaMethod};
 pub use quad::{
     CompositeQuadResult, CubatureOptions, CubatureRegion, CubatureResult, CubatureRule,
     CubatureScalarResult, CubatureStatus, DblquadOptions, DblquadResult, NsumResult, QmcQuadResult,
@@ -69,8 +71,8 @@ pub type BDF = BdfSolver;
 /// SciPy-compatible alias for continuous solution output, matching `scipy.integrate.DenseOutput`.
 pub type DenseOutput = OdeSolution;
 
-/// SciPy-compatible alias for the LSODA stepper, matching `scipy.integrate.LSODA` (see
-/// [`LsodaSolver`] for how it differs from ODEPACK's).
+/// SciPy-compatible alias for the LSODA stepper, matching `scipy.integrate.LSODA`: ODEPACK's
+/// LSODA as SciPy 1.17.1 runs it (see [`LsodaSolver`] and [`lsoda`]).
 pub type LSODA = LsodaSolver;
 
 /// Object-oriented ODE integrator interface, matching `scipy.integrate.ode`.
@@ -143,13 +145,27 @@ pub type ode<F> = Ode<F>;
 // `IntegrateValidationError::IntegrationFailed`.
 pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
+/// `odeint`'s default `rtol` and `atol` (`_odepackmodule.c`: `tol = 1.49012e-8`).
+const ODEINT_TOL: f64 = 1.49012e-8;
+/// `odeint`'s default `mxstep`: steps allowed per output time.
+const ODEINT_MXSTEP: usize = 500;
+
 /// Legacy `odeint`-style interface.
 ///
-/// Matches `scipy.integrate.odeint(func, y0, t)`: integrates y' = func(y, t) with
-/// LSODA (automatic nonstiff/stiff switching) at `rtol = atol = 1.49e-8` and
-/// returns one state per requested time, `y_matrix[i]` at `t[i]`. If the
-/// integrator cannot reach every requested time, this returns
-/// [`IntegrateValidationError::IntegrationFailed`] instead of a truncated matrix.
+/// `scipy.integrate.odeint(func, y0, t)` at its defaults: ODEPACK's LSODA (the port in
+/// [`lsoda`], automatic Adams/BDF switching, finite-difference Jacobian) at
+/// `rtol = atol = 1.49012e-8`, `mxstep = 500`, called once per output time with `itask = 1`,
+/// so the solver steps past each `t[i]` and interpolates `y(t[i])` from its Nordsieck history,
+/// exactly as SciPy's `_odepackmodule.c` drives it. The first row is `y0` (repeated for every
+/// leading time equal to `t[0]`); `t` may increase or decrease, with repeats.
+///
+/// Where SciPy warns (`ODEintWarning`) and returns rows it could not compute, this returns
+/// [`IntegrateValidationError::IntegrationFailed`] naming ODEPACK's reason.
+///
+/// # Errors
+/// An empty or non-finite `y0`, a non-finite or non-monotonic `t`
+/// ([`IntegrateValidationError::TEvalNotSorted`], SciPy's `ValueError`), a right-hand side of
+/// the wrong length, and ODEPACK failures.
 pub fn odeint<F>(
     func: &mut F,
     y0: &[f64],
@@ -170,45 +186,51 @@ where
     if t.iter().any(|value| !value.is_finite()) {
         return Err(IntegrateValidationError::NonFiniteSpan);
     }
-    if t.len() == 1 {
-        return Ok(vec![y0.to_vec()]);
+    let increasing = t.windows(2).all(|w| w[1] >= w[0]);
+    let decreasing = t.windows(2).all(|w| w[1] <= w[0]);
+    if !increasing && !decreasing {
+        return Err(IntegrateValidationError::TEvalNotSorted);
     }
 
-    // odeint convention: func(y, t), but solve_ivp uses func(t, y)
-    let mut ivp_func = |ti: f64, yi: &[f64]| -> Vec<f64> { func(yi, ti) };
-
-    let t0 = t[0];
-    let tf = t[t.len() - 1];
-
-    let result = solve_ivp(
-        &mut ivp_func,
-        &SolveIvpOptions {
-            t_span: (t0, tf),
-            y0,
-            // SciPy's odeint is ODEPACK LSODA; a nonstiff-only method here made
-            // stiff odeint problems crawl or fail where SciPy switches to BDF.
-            method: SolverKind::Lsoda,
-            t_eval: Some(t),
-            rtol: 1.49e-8,
-            atol: ToleranceValue::Scalar(1.49e-8),
-            ..SolveIvpOptions::default()
+    // SciPy copies y0 into every row whose time equals t[0], then calls LSODA for the rest.
+    let t0count = t.iter().take_while(|&&ti| ti == t[0]).count();
+    let mut rows = vec![y0.to_vec(); t0count];
+    let mut core = lsoda::Lsoda::new(
+        y0.len(),
+        lsoda::LsodaSetup {
+            rtol: vec![ODEINT_TOL],
+            atol: vec![ODEINT_TOL],
+            h0: 0.0,
+            hmax: 0.0,
+            mxstep: ODEINT_MXSTEP,
+            jac: None,
         },
-    )?;
-
-    // br-szq1n.7: `result.y[i]` is the state at `t[i]` (t_eval), but only for the
-    // times the solver reached. This used to return the result unchecked, so a
-    // failed integration silently produced fewer rows than requested times.
-    if !result.success || result.y.len() != t.len() {
-        return Err(IntegrateValidationError::IntegrationFailed {
-            message: format!(
-                "{} (reached {} of {} requested times)",
-                result.message,
-                result.y.len(),
-                t.len()
-            ),
-        });
+    );
+    // odeint's func(y, t) as ODEPACK's f(t, y).
+    let mut rhs = |ti: f64, yi: &[f64]| func(yi, ti);
+    let mut y = y0.to_vec();
+    let mut t_reached = t[0];
+    for &tout in &t[t0count..] {
+        if let Err(failure) = core.call(
+            &mut rhs,
+            &mut y,
+            &mut t_reached,
+            tout,
+            lsoda::Task::Interpolate,
+            tout,
+        ) {
+            return Err(IntegrateValidationError::IntegrationFailed {
+                message: format!(
+                    "{} (reached {} of {} requested times; stopped at t = {t_reached})",
+                    failure.message(),
+                    rows.len(),
+                    t.len()
+                ),
+            });
+        }
+        rows.push(y.clone());
     }
-    Ok(result.y)
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -273,6 +295,93 @@ mod tests {
         let err = odeint(&mut |_y, _t| vec![0.0], &[f64::NAN], &[0.0])
             .expect_err("single-point odeint should validate y0");
         assert_eq!(err, IntegrateValidationError::NonFiniteY0);
+    }
+
+    fn assert_rows_bits(label: &str, rows: &[Vec<f64>], want: &[f64]) {
+        assert_eq!(rows.len(), want.len(), "{label}: rows");
+        for (i, (row, w)) in rows.iter().zip(want).enumerate() {
+            assert_eq!(
+                row[0].to_bits(),
+                w.to_bits(),
+                "{label} row {i}: fsci {:?}, SciPy {w:?}",
+                row[0]
+            );
+        }
+    }
+
+    /// `scipy.integrate.odeint` 1.17.1 at its defaults (rtol = atol = 1.49012e-8, LSODA with
+    /// itask = 1 per output time, finite-difference Jacobian): every row is ODEPACK's
+    /// interpolation (DINTDY) at that time, printed by SciPy and asserted bit for bit (n = 1,
+    /// so no LAPACK arithmetic is involved).
+    #[test]
+    fn odeint_rows_are_scipys_lsoda_interpolants() {
+        let t = [0.0, 0.5, 1.0, 2.0, 5.0, 10.0];
+        let rows = odeint(&mut |y: &[f64], t: f64| vec![-y[0] * t.cos()], &[1.0], &t)
+            .expect("nonstiff odeint");
+        assert_rows_bits(
+            "cos decay",
+            &rows,
+            &[
+                1.0,
+                0.6191388879730072,
+                0.43107590913850996,
+                0.4028070605001435,
+                2.608887530046163,
+                1.7229206092686842,
+            ],
+        );
+        let rows = odeint(
+            &mut |y: &[f64], t: f64| vec![-1000.0 * (y[0] - t.cos())],
+            &[0.0],
+            &t,
+        )
+        .expect("stiff odeint");
+        assert_rows_bits(
+            "stiff cos",
+            &rows,
+            &[
+                0.0,
+                0.8780611083804218,
+                0.541143235584491,
+                -0.41523712836919385,
+                0.2827029769136198,
+                -0.8396147102545395,
+            ],
+        );
+    }
+
+    /// Repeated output times are allowed (SciPy copies y0 for every leading t0 and
+    /// interpolates again for a repeated later time), and so is a decreasing grid.
+    #[test]
+    fn odeint_repeated_and_decreasing_times_match_scipy() {
+        let rows = odeint(
+            &mut |y: &[f64], t: f64| vec![-1000.0 * (y[0] - t.cos())],
+            &[0.0],
+            &[0.0, 0.0, 1.0, 1.0, 3.0],
+        )
+        .expect("repeated times");
+        assert_rows_bits(
+            "repeated",
+            &rows,
+            &[
+                0.0,
+                0.0,
+                0.5411432355845051,
+                0.5411432355845051,
+                -0.9898503878100214,
+            ],
+        );
+        let rows = odeint(
+            &mut |y: &[f64], t: f64| vec![-y[0] * t.cos()],
+            &[1.0],
+            &[3.0, 2.0, 0.0],
+        )
+        .expect("decreasing times");
+        assert_rows_bits(
+            "decreasing",
+            &rows,
+            &[1.0, 0.4638577416108029, 1.1515629173033617],
+        );
     }
 
     #[test]
