@@ -13,7 +13,7 @@
 use fsci_runtime::RuntimeMode;
 
 use crate::solver::{OdeSolver, OdeSolverState, StepFailure, StepOutcome};
-use crate::step_size::InitialStepRequest;
+use crate::step_size::{InitialStepRequest, kth_root};
 use crate::validation::{ToleranceValue, validate_rhs_shape, validate_tol};
 use crate::{
     IntegrateValidationError, select_initial_step, validate_first_step, validate_max_step,
@@ -727,7 +727,9 @@ pub struct RkSolver {
     f: Vec<f64>,
     f_old: Option<Vec<f64>>,
     h_abs: f64,
-    error_exponent: f64,
+    /// Step control scales by `err^(-1/error_root)`, `error_root = order + 1`,
+    /// through the deterministic `kth_root` rather than the platform `powf`.
+    error_root: u32,
     k: Vec<Vec<f64>>,
     y_new: Vec<f64>,
     f_new: Vec<f64>,
@@ -815,7 +817,7 @@ impl RkSolver {
             select_initial_step(&mut counted, &step_request)?
         };
 
-        let error_exponent = -1.0 / (config.tableau.error_estimator_order as f64 + 1.0);
+        let error_root = (config.tableau.error_estimator_order + 1).min(64) as u32;
 
         // Allocate K storage: n_stages + 1 vectors of length n
         let k = vec![vec![0.0; n]; config.tableau.n_stages + 1];
@@ -841,7 +843,7 @@ impl RkSolver {
             f: f0,
             f_old: None,
             h_abs,
-            error_exponent,
+            error_root,
             k,
             y_new,
             f_new,
@@ -930,7 +932,7 @@ impl RkSolver {
             select_initial_step(&mut counted, &step_request)?
         };
 
-        let error_exponent = -1.0 / (config.tableau.error_estimator_order as f64 + 1.0);
+        let error_root = (config.tableau.error_estimator_order + 1).min(64) as u32;
 
         // Allocate K storage: n_stages + 1 vectors of length n
         let k = vec![vec![0.0; n]; config.tableau.n_stages + 1];
@@ -956,7 +958,7 @@ impl RkSolver {
             f: f0,
             f_old: None,
             h_abs,
-            error_exponent,
+            error_root,
             k,
             y_new,
             f_new,
@@ -1214,7 +1216,7 @@ impl RkSolver {
                 let factor = if err_norm == 0.0 {
                     MAX_FACTOR
                 } else {
-                    MAX_FACTOR.min(SAFETY * err_norm.powf(self.error_exponent))
+                    MAX_FACTOR.min(SAFETY / kth_root(err_norm, self.error_root))
                 };
 
                 let factor = if step_rejected {
@@ -1235,7 +1237,7 @@ impl RkSolver {
                 std::mem::swap(&mut self.f, &mut self.f_new);
             } else {
                 // Step rejected: decrease step size
-                h_abs *= MIN_FACTOR.max(SAFETY * err_norm.powf(self.error_exponent));
+                h_abs *= MIN_FACTOR.max(SAFETY / kth_root(err_norm, self.error_root));
                 step_rejected = true;
             }
         }
@@ -1425,7 +1427,7 @@ impl RkSolver {
                 let factor = if err_norm == 0.0 {
                     MAX_FACTOR
                 } else {
-                    MAX_FACTOR.min(SAFETY * err_norm.powf(self.error_exponent))
+                    MAX_FACTOR.min(SAFETY / kth_root(err_norm, self.error_root))
                 };
 
                 let factor = if step_rejected {
@@ -1446,7 +1448,7 @@ impl RkSolver {
                 std::mem::swap(&mut self.f, &mut self.f_new);
             } else {
                 // Step rejected: decrease step size
-                h_abs *= MIN_FACTOR.max(SAFETY * err_norm.powf(self.error_exponent));
+                h_abs *= MIN_FACTOR.max(SAFETY / kth_root(err_norm, self.error_root));
                 step_rejected = true;
             }
         }
