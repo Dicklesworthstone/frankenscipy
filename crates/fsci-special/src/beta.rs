@@ -2754,15 +2754,22 @@ pub fn nbdtrin(k: f64, y: f64, p: f64) -> f64 {
         return DISTRIBUTION_INVERSE_UPPER_SENTINEL;
     }
 
+    // The bracket's lower end is the last doubling still above y, or 1e-100 when the root is
+    // below 1, never 0: nbdtr(k, 0, p) is NaN (n must be positive), and a NaN endpoint sent
+    // every call to `bisect_decreasing`'s 160-step bisection instead of its Illinois solve.
+    // That was 0.10x SciPy's speed (frankenscipy-f8hzz). If 1e-100 does not bracket, the
+    // bisection fallback still answers.
+    let mut lo = 1e-100;
     let mut hi = 1.0;
     while nbdtr(k, hi, p) > y {
+        lo = hi;
         hi *= 2.0;
         if hi >= DISTRIBUTION_INVERSE_UPPER_SENTINEL {
             return DISTRIBUTION_INVERSE_UPPER_SENTINEL;
         }
     }
 
-    bisect_decreasing(0.0, hi, y, |n| nbdtr(k, n, p))
+    bisect_decreasing(lo, hi, y, |n| nbdtr(k, n, p))
 }
 
 fn bisect_increasing<F>(mut lo: f64, mut hi: f64, target: f64, f: F) -> f64
@@ -4608,6 +4615,21 @@ mod tests {
             (result - 1.0).abs() < 1e-10,
             "nbdtr(100, 1, 0.5) = {result}, expected ~1.0"
         );
+    }
+
+    #[test]
+    fn nbdtrin_brackets_from_a_positive_n() {
+        // frankenscipy-f8hzz: with k = 0, nbdtr(0, n, p) = p^n, so n = ln(y)/ln(p) exactly.
+        // The roots sit below 1, where the bracket's lower end is 1e-100 (the old 0 was a NaN
+        // endpoint), at 1 itself, and above 1, where it is the last doubling.
+        for (y, p) in [(0.9, 0.5), (0.99, 0.3), (0.5, 0.5), (0.3, 0.9), (1e-6, 0.7)] {
+            let want = f64::ln(y) / f64::ln(p);
+            let got = nbdtrin(0.0, std::hint::black_box(y), p);
+            assert!(
+                ((got - want) / want).abs() < 1e-14,
+                "nbdtrin(0, {y}, {p}) = {got}, ln(y)/ln(p) = {want}"
+            );
+        }
     }
 
     #[test]
