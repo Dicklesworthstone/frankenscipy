@@ -2442,29 +2442,153 @@ pub fn itairy(x: f64) -> (f64, f64, f64, f64) {
 
 /// Integral of H_0(t) / t from x to infinity.
 ///
-/// Matches `scipy.special.it2struve0`. The identity
-/// ∫₀∞ H_0(t)/t dt = π/2 lets us compute the finite correction from 0 to |x|
-/// while preserving SciPy's negative-argument symmetry.
+/// Matches `scipy.special.it2struve0`, including its convention for negative `x`:
+/// `π/2 + ∫₀^{|x|} H_0(t)/t dt` (`∫₀^∞ H_0(t)/t dt = π/2`), which is `π − it2struve0(|x|)`.
+/// A non-finite `x` gives NaN, as SciPy's does.
 pub fn it2struve0(x: f64) -> f64 {
-    if !x.is_finite() {
-        return f64::NAN;
+    // Below |x| = 1.5 it is π/2 ∓ the term-by-term series of ∫₀^{|x|} H_0/t, within 6.5e-16 of
+    // the exact integral. For positive x that difference cancels as the value falls towards
+    // 2/(πx): 1.2e-15 off by 2, 1.3e-14 by 4.8 and 1e-10 by 16, where a Simpson quadrature at
+    // 64|x| Struve evaluations per call took over (5e-9 off by 300, 3e-2 at 1e5, where its step
+    // cap bit). Now [1.5, 6) is a Chebyshev fit of x·it2struve0(x) and [6, ∞) the
+    // amplitude-phase form of [`it2struve0_tail`]: over 25000 points in [1.5, 1e5] both hold
+    // 6.2e-16 of the exact integral, and 1.5e-16 over [−300, −1.5]. SciPy's own ITTH0 is 8e-11
+    // off below 16 and 2e-7 between 16 and 40 (frankenscipy-ch0z1).
+    let ax = x.abs();
+    if ax < IT2STRUVE0_SERIES_MAX {
+        let correction = struve0_over_t_integral_series(ax);
+        return if x.is_sign_negative() {
+            std::f64::consts::FRAC_PI_2 + correction
+        } else {
+            std::f64::consts::FRAC_PI_2 - correction
+        };
     }
-
-    let correction = if x.abs() <= STRUVE_INT_SERIES_MAX {
-        struve0_over_t_integral_series(x.abs())
+    let tail = if ax < IT2STRUVE0_TAIL_MIN {
+        chebyshev_sum(&IT2STRUVE0_MID, (ax - 3.75) / 2.25) / ax
+    } else if ax.is_finite() {
+        it2struve0_tail(ax)
     } else {
-        struve_integral_abs(x, struve0_over_t)
+        return f64::NAN;
     };
     if x.is_sign_negative() {
-        std::f64::consts::FRAC_PI_2 + correction
+        PI - tail
     } else {
-        std::f64::consts::FRAC_PI_2 - correction
+        tail
     }
 }
 
-/// Above this |x| the alternating Struve-integral series loses too many digits
-/// to cancellation, so the scalar integrals fall back to Simpson quadrature.
-const STRUVE_INT_SERIES_MAX: f64 = 16.0;
+/// Below this |x| [`it2struve0`] is `π/2 ∓` the series of `∫₀^{|x|} H_0/t`.
+const IT2STRUVE0_SERIES_MAX: f64 = 1.5;
+
+/// From this |x| on, [`it2struve0`] takes [`it2struve0_tail`]; below it (down to
+/// [`IT2STRUVE0_SERIES_MAX`]) the Chebyshev fit [`IT2STRUVE0_MID`].
+const IT2STRUVE0_TAIL_MIN: f64 = 6.0;
+
+/// `x · it2struve0(x)` on `[1.5, 6]` as a Chebyshev series in `t = (x − 3.75) / 2.25`. Fitted at
+/// 48 first-kind nodes to the exact integral (`π/2 −` the term-by-term series summed in mpmath at
+/// 55 + 0.9x digits) and rounded once; the first dropped coefficient is 1.3e-18. `π/2 − ∫₀ˣ H_0/t`
+/// is entire in `x`, so the coefficients fall faster than any geometric rate. The factor `x`
+/// flattens the `2/(πx)` decay, so the sum does not cancel.
+const IT2STRUVE0_MID: [f64; 20] = [
+    0.6410305650603118,
+    -0.21765286412528376,
+    0.28001649276879725,
+    0.052872010050828984,
+    -0.04926783699426264,
+    0.0014014551185209064,
+    0.0017272693900763187,
+    -7.583023703235011e-05,
+    -3.329874912711984e-05,
+    1.4972247475077957e-06,
+    4.12169117122096e-07,
+    -1.7593978429384766e-08,
+    -3.5595867595764084e-09,
+    1.4123629051813008e-10,
+    2.2670581082508636e-11,
+    -8.318456092471617e-13,
+    -1.1085555484908106e-13,
+    3.763722411325794e-15,
+    4.2919021285321774e-16,
+    -1.3519785850415636e-17,
+];
+
+/// `(A, P, Q)` of [`it2struve0_tail`] as Chebyshev series in `t = 2w − 1`, `w = 6/x ∈ (0, 1]`,
+/// one row per order. Fitted at 64 first-kind nodes, where both Laplace integrals were evaluated
+/// in mpmath at 36 digits, and rounded once. The dropped coefficients sum to below 3e-17.
+#[rustfmt::skip]
+const IT2STRUVE0_TAIL: [(f64, f64, f64); 27] = [
+    (0.6345927470106502, 0.6127241376161029, 0.4767374481747674),
+    (-0.0026588523281227314, 0.03933602309893508, -0.08910295572370847),
+    (-0.0006016950537949631, -0.008928688130746343, -0.000557559214605177),
+    (3.2105781285491515e-05, 0.0003902015758155304, 0.0009846060223677705),
+    (1.428419138372598e-06, 9.477156954012659e-05, -0.00011614456041810242),
+    (-5.016063575216223e-07, -2.4075304813807393e-05, -2.8690704323628355e-06),
+    (4.8172278843853694e-08, 2.0655072923176477e-06, 3.83151917745201e-06),
+    (2.255376798745148e-09, 3.493019810143679e-07, -7.752759228164026e-07),
+    (-1.7372324533173867e-09, -1.720203123019696e-07, 4.653356094509801e-08),
+    (3.3192488274382127e-10, 3.296046935208787e-08, 2.2024652309229824e-08),
+    (-2.14953166709023e-11, -1.4329612308970617e-09, -9.17373119418164e-09),
+    (-7.939238050821085e-12, -1.3737124225250654e-09, 1.8137011098703231e-09),
+    (3.4617436050223598e-12, 5.745714344992165e-10, -8.13180113737295e-11),
+    (-7.264216524963928e-13, -1.2465811580615054e-10, -8.940787131943638e-11),
+    (5.698714745857356e-14, 8.457135849341004e-12, 4.102472623283286e-11),
+    (2.3779762804221853e-14, 5.913655351959128e-12, -1.0186562480125185e-11),
+    (-1.3026088275504654e-14, -3.2185866518862703e-12, 1.1034719927297996e-12),
+    (3.612542560886082e-15, 9.391144737200432e-13, 3.6488321492202567e-13),
+    (-5.515270094798337e-16, -1.4954935977341705e-13, -2.6609485254883205e-13),
+    (-4.3917427836851755e-17, -1.5453947173176308e-14, 9.319071687082911e-14),
+    (6.586961957784252e-17, 2.1996605616329332e-14, -2.013223474611025e-14),
+    (-2.7049366162974344e-17, -9.553116770712703e-15, 8.262462789856021e-16),
+    (7.057867499811132e-18, 2.660226057476041e-15, 1.6635483520693059e-15),
+    (-9.358773538941577e-19, -3.832625757501277e-16, -9.706518484025748e-16),
+    (-2.18871382347544e-19, -8.758905595111514e-17, 3.414513473980099e-16),
+    (2.0951615652262967e-19, 9.234929192027303e-17, -7.791087930958881e-17),
+    (-8.852697709642913e-20, -4.182190512192065e-17, 3.764211588296043e-18),
+];
+
+/// `it2struve0(x)` for `x ≥ 6` as `(A + (P sin x + Q cos x) / √x) / x`, with `A`, `P`, `Q` the
+/// Chebyshev series [`IT2STRUVE0_TAIL`] in `w = 6/x`.
+///
+/// `H_0 = Y_0 + K_0` with `K_0(t) = H_0(t) − Y_0(t) = (2/π) ∫₀^∞ e^{−ts} (1+s²)^{−1/2} ds`
+/// (DLMF 11.5.2), and each part of `∫ₓ^∞ H_0(t)/t dt` is one Laplace transform:
+/// - `∫ₓ^∞ K_0(t)/t dt = (2/π) ∫₀^∞ e^{−xs} asinh(s)/s ds`, non-oscillatory and near `2/(πx)`.
+///   This is `A/x`.
+/// - `∫ₓ^∞ H_0⁽¹⁾(t)/t dt = (2/π) e^{ix} ∫₀^∞ e^{−xs} (−i) acosh(1+is)/(s−i) ds`, from the
+///   representation of `H_0⁽¹⁾` that [`itstruve0_laplace`] uses: differentiating both sides in
+///   `x` gives back `−H_0⁽¹⁾(x)/x`. It is `e^{ix} x^{−3/2} (P + iQ)`, and `∫ₓ^∞ Y_0(t)/t dt` is
+///   its imaginary part, `x^{−3/2} (P sin x + Q cos x)`.
+///
+/// Both integrals agree with the exact series to 1e-41 on [0.5, 300]. `A`, `P` and `Q` are smooth
+/// on `w ∈ (0, 1]` (at `w → 0` they tend to `2/π` and `√(2/π) e^{iπ/4}`). The phase is `x`
+/// itself rather than `x − π/4`, so it carries no rounding: the π/4 is folded into `P` and `Q`.
+fn it2struve0_tail(x: f64) -> f64 {
+    let inv_x = 1.0 / x;
+    let t = 2.0 * (IT2STRUVE0_TAIL_MIN * inv_x) - 1.0;
+    let t2 = 2.0 * t;
+    // Three Clenshaw recurrences side by side.
+    let (mut a1, mut a2, mut p1, mut p2, mut q1, mut q2) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(a, p, q) in IT2STRUVE0_TAIL[1..].iter().rev() {
+        (a1, a2) = (a + t2 * a1 - a2, a1);
+        (p1, p2) = (p + t2 * p1 - p2, p1);
+        (q1, q2) = (q + t2 * q1 - q2, q1);
+    }
+    let (a0, p0, q0) = IT2STRUVE0_TAIL[0];
+    let a = a0 + t * a1 - a2;
+    let p = p0 + t * p1 - p2;
+    let q = q0 + t * q1 - q2;
+    let (sin_x, cos_x) = x.sin_cos();
+    inv_x * (a + inv_x.sqrt() * (p * sin_x + q * cos_x))
+}
+
+/// Clenshaw sum `Σₖ cₖ Tₖ(t)` of a Chebyshev series, `c₀` taken at full weight.
+fn chebyshev_sum(c: &[f64], t: f64) -> f64 {
+    let t2 = 2.0 * t;
+    let (mut b1, mut b2) = (0.0, 0.0);
+    for &ck in c[1..].iter().rev() {
+        (b1, b2) = (ck + t2 * b1 - b2, b1);
+    }
+    c[0] + t * b1 - b2
+}
 
 /// Above this |x| [`itstruve0`] takes [`itstruve0_laplace`] rather than the series.
 const ITSTRUVE0_SERIES_MAX: f64 = 6.0;
@@ -2583,7 +2707,8 @@ fn struve0_integral_series(x: f64, sgn: f64) -> f64 {
 
 /// `∫₀ˣ H_0(t)/t dt` via term-by-term integration of the `H_0/t` series:
 /// `Σ (-1)ᵏ · x^{2k+1} / (2^{2k+1} · Γ(k+3/2)² · (2k+1))`. `x` is `|x|`; the
-/// caller applies scipy's `π/2 ∓ correction` sign convention. ~1e-10 for `x ≤ 16`.
+/// caller applies scipy's `π/2 ∓ correction` sign convention, below
+/// [`IT2STRUVE0_SERIES_MAX`] only.
 fn struve0_over_t_integral_series(ax: f64) -> f64 {
     let x2 = ax * ax;
     let mut term = 2.0 * ax / PI; // k = 0 term
@@ -2600,45 +2725,6 @@ fn struve0_over_t_integral_series(ax: f64) -> f64 {
         }
     }
     sum
-}
-
-fn struve_integral_abs<F>(x: f64, integrand: F) -> f64
-where
-    F: Fn(f64) -> f64,
-{
-    if !x.is_finite() {
-        return f64::NAN;
-    }
-    let upper = x.abs();
-    if upper == 0.0 {
-        return 0.0;
-    }
-
-    // Only it2struve0 still integrates here; itstruve0 and itmodstruve0 left it for their
-    // Laplace form and their series (frankenscipy-ch0z1). The integrand oscillates with period
-    // ~2π, so the old 256·|x| Simpson density was ~1600 points per oscillation, wildly
-    // over-resolved. 64·|x| is ~400 per oscillation. When itstruve0 and itmodstruve0 used it,
-    // the worst error vs mpmath over x ∈ [16, 127] was 7.4e-11 and 3.3e-10 respectively.
-    let raw_steps = (64.0 * upper.max(1.0)).ceil() as usize;
-    let steps = raw_steps.clamp(64, 32_768);
-    let steps = steps + (steps % 2);
-    let h = upper / steps as f64;
-
-    let mut sum = integrand(0.0) + integrand(upper);
-    for i in 1..steps {
-        let t = i as f64 * h;
-        let weight = if i % 2 == 0 { 2.0 } else { 4.0 };
-        sum += weight * integrand(t);
-    }
-    sum * h / 3.0
-}
-
-fn struve0_over_t(t: f64) -> f64 {
-    if t.abs() < 1.0e-12 {
-        2.0 / PI
-    } else {
-        struve(0.0, t) / t
-    }
 }
 
 /// Simple Lanczos gamma function.
@@ -16748,8 +16834,9 @@ mod tests {
 
     #[test]
     fn struve_integral_large_x_matches_high_precision_truth() {
-        // |x| > 16 uses the Simpson quadrature for it2struve0 and itmodstruve0 (itstruve0 is
-        // the Laplace form past 6, pinned tighter in itstruve0_past_six_is_the_exact_integral).
+        // Past 6 itstruve0 and it2struve0 are their Laplace-derived forms, and itmodstruve0 is
+        // its series and from 45 its asymptotic form; each is pinned at 2e-15 in its own
+        // `*_exact_integral*` test below (frankenscipy-ch0z1).
         // References are high-precision (mpmath 20-digit) ground truth — NOTE
         // SciPy's own itstruve0 is inaccurate here (itstruve0(50): truth 3.2445,
         // SciPy 6.30), so these lock in fsci's correctness, not SciPy parity.
@@ -16848,6 +16935,78 @@ mod tests {
         }
         // Past the overflow it is inf, as SciPy's is.
         assert_eq!(itmodstruve0(std::hint::black_box(715.0)), f64::INFINITY);
+    }
+
+    /// frankenscipy-ch0z1. `it2struve0` is `π/2 ∓` its series below |x| = 1.5, a Chebyshev fit
+    /// of `x·it2struve0(x)` on [1.5, 6) and the amplitude-phase tail from 6; negative x is
+    /// `π − it2struve0(|x|)`. Each pin is the exact integral: `π/2 −` the term-by-term series
+    /// summed in mpmath at 50 + 0.9x digits, which is more than its cancellation costs (π minus
+    /// that for negative x), rounded once. The old routes miss 20 of these at 2e-15: `π/2 −` the
+    /// f64 series was 4.9e-15 off at 3.9 and 6.5e-11 at 16, and the Simpson quadrature past 16
+    /// was 8e-11 off at 17.2 and 5e-9 at 300. SciPy's own ITTH0 is 2e-11 off at 16 and 6e-8 at
+    /// 23.7, so SciPy is not the reference here.
+    #[test]
+    fn it2struve0_is_the_exact_integral() {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64); 24] = [
+            (1.75, 0.5741925901547921),
+            (-2.5, 2.844448633790081),
+            (3.9, 0.07431575919885444),
+            (4.8, 0.07278263269433576),
+            (5.5, 0.09985040949792102),
+            (5.999999999999999, 0.11833664178101615),
+            (6.0, 0.11833664178101617),
+            (6.25, 0.12496225938490622),
+            (7.5, 0.12070378801861187),
+            (-7.5, 3.020888865571181),
+            (9.0, 0.06504320442147894),
+            (11.3, 0.044244133188391564),
+            (13.7, 0.061486120344981444),
+            (15.9, 0.0304106017357131),
+            (16.0, 0.029505695657558808),
+            (17.2, 0.02791105859214424),
+            (23.7, 0.022332752575750597),
+            (29.0, 0.016885308982410245),
+            (40.0, 0.016213313631284396),
+            (-40.0, 3.125379339958509),
+            (55.5, 0.01091346468259087),
+            (100.0, 0.0065541908590652665),
+            (250.0, 0.00244122142442305),
+            (300.0, 0.0020105371670472018),
+        ];
+        let misses: Vec<String> = PINS
+            .iter()
+            .filter_map(|&(x, want)| {
+                let got = it2struve0(std::hint::black_box(x));
+                let rel = ((got - want) / want).abs();
+                (rel.is_nan() || rel > 2e-15)
+                    .then(|| format!("it2struve0({x}) = {got:e}, exact {want:e}, rel {rel:e}"))
+            })
+            .collect();
+        assert!(
+            misses.is_empty(),
+            "{} of {} pins miss 2e-15:\n{}",
+            misses.len(),
+            PINS.len(),
+            misses.join("\n")
+        );
+        // The three routes meet without a step.
+        for edge in [IT2STRUVE0_SERIES_MAX, IT2STRUVE0_TAIL_MIN] {
+            let below = it2struve0(edge.next_down());
+            let above = it2struve0(edge);
+            assert!(
+                ((above - below) / below).abs() <= 4e-15,
+                "at {edge}: {below:e} | {above:e}"
+            );
+        }
+        // Far out it is 2/(πx) (its expansion is 2/(πx)·(1 − 1/(3x²) + ...)), and π for −x, as
+        // SciPy's is.
+        let huge = it2struve0(std::hint::black_box(1e300));
+        assert!(
+            ((huge - 6.366_197_723_675_814e-301) / huge).abs() <= 2e-15,
+            "{huge:e}"
+        );
+        assert_eq!(it2struve0(std::hint::black_box(-1e300)), PI);
     }
 
     #[test]
