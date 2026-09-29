@@ -5548,77 +5548,296 @@ pub fn owens_t(
     })
 }
 
+/// Owen's T, SciPy's bits: xsf's `cephes/owens_t.h` (the revision SciPy 1.17.1 pins,
+/// 0d0a593f), which is Patefield and Tandy's algorithm ("Fast and accurate calculation of
+/// Owen's T-function", J. Stat. Softw. 5(5), 2000). The former 10-point Gauss-Legendre rule
+/// on [0, a] was up to 2.5e-9 relative off at (h, a) = (-4.872, -0.922), where SciPy is
+/// 1.1e-13 (frankenscipy-nb55y).
+///
+/// T is even in h and odd in a, so the kernel sees h ≥ 0, a ≥ 0; a > 1 maps to 1/a through
+/// Owen's reflection, taken with Φ or with the complementary Φ(−x) by whether ah ≤ 0.67.
+/// Every operation keeps the C source's order and association; erf, erfc and ndtr are the
+/// Cephes kernels xsf calls, and `expm1` is Cephes' rational, not libm's.
 #[must_use]
 pub fn owens_t_scalar(h: f64, a: f64) -> f64 {
-    if a == 0.0 {
-        return 0.0;
+    if h.is_nan() || a.is_nan() {
+        return f64::NAN;
     }
-    // T(h,a) is even in h and odd in a; reduce to h ≥ 0, a ≥ 0 and restore
-    // the sign of a afterwards.
-    let sign = if a < 0.0 { -1.0 } else { 1.0 };
-    sign * owens_t_core(h.abs(), a.abs())
+    let h = h.abs();
+    let fabs_a = a.abs();
+    let fabs_ah = fabs_a * h;
+    let result = if fabs_a == f64::INFINITY {
+        // Patefield-Tandy p. 13.
+        0.5 * owens_t_norm2(h)
+    } else if h == f64::INFINITY {
+        0.0
+    } else if fabs_a <= 1.0 {
+        owens_t_dispatch(h, fabs_a, fabs_ah)
+    } else if fabs_ah <= 0.67 {
+        let normh = owens_t_norm1(h);
+        let normah = owens_t_norm1(fabs_ah);
+        0.25 - normh * normah - owens_t_dispatch(fabs_ah, 1.0 / fabs_a, h)
+    } else {
+        let normh = owens_t_norm2(h);
+        let normah = owens_t_norm2(fabs_ah);
+        (normh + normah) / 2.0 - normh * normah - owens_t_dispatch(fabs_ah, 1.0 / fabs_a, h)
+    };
+    if a < 0.0 { -result } else { result }
 }
 
-/// Owen's T for h ≥ 0, a ≥ 0.
-fn owens_t_core(h: f64, a: f64) -> f64 {
+/// Method index by (h, a) cell: 15 h intervals (`OWENS_T_HRANGE` upper bounds, then above
+/// 4.8) times 8 a intervals (`OWENS_T_ARANGE`, then above 0.99999), row-major in a.
+const OWENS_T_SELECT_METHOD: [usize; 120] = [
+    0, 0, 1, 12, 12, 12, 12, 12, 12, 12, 12, 15, 15, 15, 8, 0, 1, 1, 2, 2, 4, 4, 13, 13, 14, 14,
+    15, 15, 15, 8, 1, 1, 2, 2, 2, 4, 4, 14, 14, 14, 14, 15, 15, 15, 9, 1, 1, 2, 4, 4, 4, 4, 6, 6,
+    15, 15, 15, 15, 15, 9, 1, 2, 2, 4, 4, 5, 5, 7, 7, 16, 16, 16, 11, 11, 10, 1, 2, 4, 4, 4, 5, 5,
+    7, 7, 16, 16, 16, 11, 11, 11, 1, 2, 3, 3, 5, 5, 7, 7, 16, 16, 16, 16, 16, 11, 11, 1, 2, 3, 3,
+    5, 5, 17, 17, 17, 17, 16, 16, 16, 11, 11,
+];
+
+const OWENS_T_HRANGE: [f64; 14] = [
+    0.02, 0.06, 0.09, 0.125, 0.26, 0.4, 0.6, 1.6, 1.7, 2.33, 2.4, 3.36, 3.4, 4.8,
+];
+
+const OWENS_T_ARANGE: [f64; 7] = [0.025, 0.09, 0.15, 0.36, 0.5, 0.9, 0.99999];
+
+/// Series order per method index (a double in the C source, compared against int counters).
+const OWENS_T_ORD: [f64; 18] = [
+    2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 12.0, 18.0, 10.0, 20.0, 30.0, 0.0, 4.0, 7.0, 8.0, 20.0, 0.0, 0.0,
+];
+
+/// Which of T1..T6 each method index runs.
+const OWENS_T_METHODS: [u8; 18] = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 4, 4, 4, 4, 5, 6];
+
+/// T3's Chebyshev-derived coefficients, verbatim from xsf.
+const OWENS_T_C: [f64; 31] = [
+    1.0,
+    -1.0,
+    1.0,
+    -0.9999999999999998,
+    0.9999999999999839,
+    -0.9999999999993063,
+    0.9999999999797337,
+    -0.9999999995749584,
+    0.9999999933226235,
+    -0.9999999188923242,
+    0.9999992195143483,
+    -0.9999939351372067,
+    0.9999613559769055,
+    -0.9997955636651394,
+    0.9990927896296171,
+    -0.9965938374119182,
+    0.9891001713838613,
+    -0.9700785580406933,
+    0.9291143868326319,
+    -0.8542058695956156,
+    0.737965260330301,
+    -0.585234698828374,
+    0.4159977761456763,
+    -0.25882108752419436,
+    0.13755358251638927,
+    -0.060795276632595575,
+    0.021633768329987153,
+    -0.005934056934551867,
+    0.0011743414818332946,
+    -0.0001489155613350369,
+    9.072354320794358e-06,
+];
+
+/// T5's 13-point Gauss rule on [0, 1] in t², nodes and weights verbatim from xsf.
+const OWENS_T_PTS: [f64; 13] = [
+    0.35082039676451715489E-02,
+    0.31279042338030753740E-01,
+    0.85266826283219451090E-01,
+    0.16245071730812277011E+00,
+    0.25851196049125434828E+00,
+    0.36807553840697533536E+00,
+    0.48501092905604697475E+00,
+    0.60277514152618576821E+00,
+    0.71477884217753226516E+00,
+    0.81475510988760098605E+00,
+    0.89711029755948965867E+00,
+    0.95723808085944261843E+00,
+    0.99178832974629703586E+00,
+];
+
+const OWENS_T_WTS: [f64; 13] = [
+    0.18831438115323502887E-01,
+    0.18567086243977649478E-01,
+    0.18042093461223385584E-01,
+    0.17263829606398753364E-01,
+    0.16243219975989856730E-01,
+    0.14994592034116704829E-01,
+    0.13535474469662088392E-01,
+    0.11886351605820165233E-01,
+    0.10070377242777431897E-01,
+    0.81130545742299586629E-02,
+    0.60419009528470238773E-02,
+    0.38862217010742057883E-02,
+    0.16793031084546090448E-02,
+];
+
+/// xsf `get_method`: the first h and a interval whose upper bound is not exceeded.
+fn owens_t_method(h: f64, a: f64) -> usize {
+    let ihint = OWENS_T_HRANGE
+        .iter()
+        .position(|&bound| h <= bound)
+        .unwrap_or(14);
+    let iaint = OWENS_T_ARANGE
+        .iter()
+        .position(|&bound| a <= bound)
+        .unwrap_or(7);
+    OWENS_T_SELECT_METHOD[iaint * 15 + ihint]
+}
+
+/// xsf `owens_t_norm1`: erf(x/√2)/2 = Φ(x) − ½. A division by √2, as in the source; the
+/// product with 1/√2 differs in the last bit.
+fn owens_t_norm1(x: f64) -> f64 {
+    crate::error::erf_scalar(x / SQRT_2) / 2.0
+}
+
+/// xsf `owens_t_norm2`: erfc(x/√2)/2 = Φ(−x).
+fn owens_t_norm2(x: f64) -> f64 {
+    crate::error::erfc_scalar(x / SQRT_2) / 2.0
+}
+
+fn owens_t_sqrt_2pi() -> f64 {
+    (2.0 * PI).sqrt()
+}
+
+/// T1: the series in (a^(2j+1))/(2j+1) with the incomplete exponential sums, m + 1 terms.
+fn owens_t1(h: f64, a: f64, m: f64) -> f64 {
+    let hs = -0.5 * h * h;
+    let dhs = hs.exp();
+    let as_ = a * a;
+    let mut aj = a / (2.0 * PI);
+    let mut dj = xsf_smirnov::cephes_expm1(hs);
+    let mut gj = hs * dhs;
+    let mut val = a.atan() / (2.0 * PI);
+    let mut j = 1.0;
+    let mut jj = 1.0;
+    loop {
+        val += dj * aj / jj;
+        if m <= j {
+            break;
+        }
+        j += 1.0;
+        jj += 2.0;
+        aj *= as_;
+        dj = gj - dj;
+        gj *= hs / j;
+    }
+    val
+}
+
+/// T2: the series in powers of 1/h², 2m + 1 terms.
+fn owens_t2(h: f64, a: f64, ah: f64, m: f64) -> f64 {
+    let maxi = 2.0 * m + 1.0;
+    let hs = h * h;
+    let as_ = -a * a;
+    let y = 1.0 / hs;
+    let mut val = 0.0;
+    let mut vi = a * (-0.5 * ah * ah).exp() / owens_t_sqrt_2pi();
+    let mut z = (ndtr_scalar(ah) - 0.5) / h;
+    let mut i = 1.0;
+    loop {
+        val += z;
+        if maxi <= i {
+            break;
+        }
+        z = y * (vi - i * z);
+        vi *= as_;
+        i += 2.0;
+    }
+    val * ((-0.5 * hs).exp() / owens_t_sqrt_2pi())
+}
+
+/// T3: T2's series with the 31 Chebyshev-economised coefficients.
+fn owens_t3(h: f64, a: f64, ah: f64) -> f64 {
+    let aa = a * a;
+    let hh = h * h;
+    let y = 1.0 / hh;
+    let mut vi = a * (-ah * ah / 2.0).exp() / owens_t_sqrt_2pi();
+    let mut zi = owens_t_norm1(ah) / h;
+    let mut result = 0.0;
+    let mut odd = 1.0;
+    for &c in &OWENS_T_C {
+        result += zi * c;
+        zi = y * (odd * zi - vi);
+        vi *= aa;
+        odd += 2.0;
+    }
+    result * ((-hh / 2.0).exp() / owens_t_sqrt_2pi())
+}
+
+/// T4: the series in powers of −a², 2m + 1 terms.
+fn owens_t4(h: f64, a: f64, m: f64) -> f64 {
+    let maxi = 2.0 * m + 1.0;
+    let hh = h * h;
+    let naa = -a * a;
+    let mut i = 1.0;
+    let mut ai = a * (-hh * (1.0 - naa) / 2.0).exp() / (2.0 * PI);
+    let mut yi = 1.0;
+    let mut result = 0.0;
+    loop {
+        result += ai * yi;
+        if maxi <= i {
+            break;
+        }
+        i += 2.0;
+        yi = (1.0 - hh * yi) / i;
+        ai *= naa;
+    }
+    result
+}
+
+/// T5: 13-point Gauss quadrature of the defining integral.
+fn owens_t5(h: f64, a: f64) -> f64 {
+    let aa = a * a;
+    let nhh = -0.5 * h * h;
+    let mut result = 0.0;
+    for (&pt, &wt) in OWENS_T_PTS.iter().zip(&OWENS_T_WTS) {
+        let r = 1.0 + aa * pt;
+        result += wt * (nhh * r).exp() / r;
+    }
+    result * a
+}
+
+/// T6: the a → 1 expansion about T(h, 1) = Φ(h)Φ(−h)/2.
+fn owens_t6(h: f64, a: f64) -> f64 {
+    let normh = owens_t_norm2(h);
+    let y = 1.0 - a;
+    let r = y.atan2(1.0 + a);
+    let mut result = normh * (1.0 - normh) / 2.0;
+    if r != 0.0 {
+        result -= r * (-y * h * h / (2.0 * r)).exp() / (2.0 * PI);
+    }
+    result
+}
+
+/// xsf `owens_t_dispatch` for h ≥ 0 and 0 ≤ a ≤ 1; `ah` is a·h, or the original h under the
+/// reflection.
+fn owens_t_dispatch(h: f64, a: f64, ah: f64) -> f64 {
+    if h == 0.0 {
+        return a.atan() / (2.0 * PI);
+    }
     if a == 0.0 {
         return 0.0;
     }
-    if h == 0.0 {
-        return a.atan() / (2.0 * std::f64::consts::PI);
+    if a == 1.0 {
+        return owens_t_norm2(-h) * owens_t_norm2(h) / 2.0;
     }
-    if a > 1.0 {
-        // The 10-point Gauss-Legendre rule below is only accurate over a short
-        // interval; for a > 1 the integrand on [0, a] is sharply peaked near
-        // t = 0 and 10 nodes miss it (owens_t(1,100) was 36% off). Owen's
-        // reflection maps a > 1 to 1/a < 1:
-        //   T(h,a) = ½Φ(−h) + ½Φ(−ah) − Φ(−h)Φ(−ah) − T(ah, 1/a).
-        // The constant is written via the complementary CDF Φ(−x) so it stays
-        // accurate when Φ(h), Φ(ah) ≈ 1 (the ½[Φ(h)+Φ(ah)]−Φ(h)Φ(ah) form lost
-        // ~0.7% to cancellation at owens_t(8,3)).
-        let qh = ndtr_scalar(-h);
-        let qah = ndtr_scalar(-a * h);
-        return 0.5 * qh + 0.5 * qah - qh * qah - owens_t_core(a * h, 1.0 / a);
+    let index = owens_t_method(h, a);
+    let m = OWENS_T_ORD[index];
+    match OWENS_T_METHODS[index] {
+        1 => owens_t1(h, a, m),
+        2 => owens_t2(h, a, ah, m),
+        3 => owens_t3(h, a, ah),
+        4 => owens_t4(h, a, m),
+        5 => owens_t5(h, a),
+        6 => owens_t6(h, a),
+        _ => f64::NAN,
     }
-
-    // Numerical integration via Gauss-Legendre (10-point)
-    let gl_nodes = [
-        -0.973_906_528_517_171_7,
-        -0.865_063_366_688_984_5,
-        -0.679_409_568_299_024_4,
-        -0.433_395_394_129_247_2,
-        -0.148_874_338_981_631_2,
-        0.148_874_338_981_631_2,
-        0.433_395_394_129_247_2,
-        0.679_409_568_299_024_4,
-        0.865_063_366_688_984_5,
-        0.973_906_528_517_171_7,
-    ];
-    let gl_weights = [
-        0.066_671_344_308_688_1,
-        0.149_451_349_150_580_6,
-        0.219_086_362_515_982,
-        0.269_266_719_309_996_4,
-        0.295_524_224_714_752_9,
-        0.295_524_224_714_752_9,
-        0.269_266_719_309_996_4,
-        0.219_086_362_515_982,
-        0.149_451_349_150_580_6,
-        0.066_671_344_308_688_1,
-    ];
-
-    let mid = a / 2.0;
-    let half = a / 2.0;
-    let h2 = h * h;
-
-    let mut sum = 0.0;
-    for (&node, &weight) in gl_nodes.iter().zip(gl_weights.iter()) {
-        let t = mid + half * node;
-        let integrand = (-0.5 * h2 * (1.0 + t * t)).exp() / (1.0 + t * t);
-        sum += weight * integrand;
-    }
-
-    sum * half / (2.0 * std::f64::consts::PI)
 }
 
 /// Relative error exponential: (exp(x) - 1) / x, accurate near x=0.
@@ -6990,8 +7209,8 @@ mod xsf_smirnov {
     const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
 
     /// cephes `expm1` (`unity.h`): a rational approximation on [−0.5, 0.5], not libm's
-    /// `expm1`, from which it differs in the last bit.
-    fn cephes_expm1(x: f64) -> f64 {
+    /// `expm1`, from which it differs in the last bit. Also Owen's T's T1 (`owens_t1`).
+    pub(super) fn cephes_expm1(x: f64) -> f64 {
         const EP: [f64; 3] = [
             1.261_771_930_748_105_908_779_8e-4,
             3.029_944_077_074_419_612_995_6e-2,
@@ -11005,6 +11224,67 @@ mod tests {
                 (got - want).abs() <= tol,
                 "owens_t({h},{a}) = {got}, scipy {want}"
             );
+        }
+    }
+
+    #[test]
+    fn owens_t_is_scipy_patefield_tandy_bit_for_bit() {
+        // frankenscipy-nb55y: owens_t is xsf's Patefield-Tandy owens_t.h, so SciPy 1.17.1's
+        // values are pinned to the bit. One (h, a) per path: T1..T6 directly, every method the
+        // a > 1 reflection reaches under both of its branches (ah <= 0.67 and above), the
+        // closed forms (h = 0, a = 0, a = 1, a = inf, h = inf), table-cell boundaries, and the
+        // bead's worst point, which the Gauss-Legendre rule had 2.5e-9 relative off. Where
+        // one exists the point was chosen so that libm's expm1 in T1, or x * (1/sqrt 2) in
+        // place of x / sqrt 2 in norm1/norm2, gives different bits. (h, a, scipy).
+        let cases: [(f64, f64, f64); 35] = [
+            (0.715, 0.206, 0.024951259674922427),             // T1
+            (6.431, 0.3657, 3.117647270473573e-11),           // T2
+            (3.978, 0.6239, 1.721385520235399e-05),           // T3
+            (0.838, 0.0907, 0.01012356113847244),             // T4
+            (1.81, 0.6509, 0.014746297532343123),             // T5
+            (1.279, 0.999995, 0.045179233085271504),          // T6
+            (0.366, 1.443, 0.13900437617885206),              // reflection, ah <= 0.67, T1
+            (0.0565, 11.591, 0.23346166537400592),            // reflection, ah <= 0.67, T4
+            (0.4751, 1.818, 0.14083649699332967),             // reflection, ah > 0.67, T1
+            (6.5729, 38.253, 1.2336150135792441e-11),         // reflection, ah > 0.67, T2
+            (6.5933, 1.583, 1.0753902765021123e-11),          // reflection, ah > 0.67, T3
+            (0.178, 13.859, 0.21461812741317024),             // reflection, ah > 0.67, T4
+            (1.3436, 1.842, 0.04461648383326246),             // reflection, ah > 0.67, T5
+            (1.279, 1.000008, 0.04517943459455167),           // reflection, ah > 0.67, T6
+            (3.2, 1.000004, 0.00034333290105256097),          // reflection, 1/a just below 1
+            (0.1, 1.0000001, 0.12420687956748308),            // reflection, ah <= 0.67, a ~ 1
+            (-4.872, -0.922, -2.7618437205809556e-07),        // the bead's worst point
+            (0.02, 0.025, 0.00397724926088619),               // on both cell bounds
+            (4.8, 0.99999, 3.9666376122455044e-07),           // on both cell bounds
+            (2.33, 0.5, 0.004025149112463264),                // on both cell bounds
+            (2.75, 0.999995, 0.0014854419163221643),          // a above the last a bound
+            (5.5, 0.999993, 9.494781052601517e-09),           // a above the last a bound
+            (6.5, 0.9995, 2.0080002918471168e-11),            // h above the last h bound
+            (10.0, 0.5, 3.8099247740170695e-24),              // h above the last h bound
+            (1e-300, 0.3, 0.046386789538871175),              // tiny h
+            (0.3, 1e-300, 1.5215172481714229e-301),           // tiny a
+            (1.5, 1.0, 0.031171999563740185),                 // a = 1 closed form
+            (37.0, 1.0, 2.8627856112626135e-300),             // a = 1 deep in the tail
+            (0.0, 0.5, 0.07379180882521663),                  // h = 0: atan(a)/(2 pi)
+            (0.0, 3.0, 0.19879180882521663),                  // h = 0 through the reflection
+            (1.25, f64::INFINITY, 0.05282488683342765),       // a = inf: Phi(-h)/2
+            (-1.25, f64::NEG_INFINITY, -0.05282488683342765), // odd in a, even in h
+            (f64::INFINITY, -0.5, -0.0),                      // h = inf keeps the sign of a
+            (0.5, -0.0, 0.0),                                 // a = -0 is +0
+            (-0.715, -0.206, -0.024951259674922427),          // odd in a, even in h
+        ];
+        for (h, a, want) in cases {
+            let got = owens_t_scalar(std::hint::black_box(h), std::hint::black_box(a));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "owens_t({h:?}, {a:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        // NaN in either argument is NaN, including a = 0 (the former kernel returned 0).
+        for (h, a) in [(f64::NAN, 0.0), (0.5, f64::NAN), (f64::NAN, f64::INFINITY)] {
+            let got = owens_t_scalar(std::hint::black_box(h), std::hint::black_box(a));
+            assert!(got.is_nan(), "owens_t({h:?}, {a:?}) = {got:?}, SciPy NaN");
         }
     }
 
