@@ -6983,6 +6983,7 @@ pub fn smirnovi(n: i32, p: f64) -> f64 {
 /// C `int` arithmetic is done in `i64`, which agrees with it wherever it does not overflow;
 /// where it does (undefined behaviour), fsci keeps the exact value. frankenscipy-k4c2c
 mod xsf_smirnov {
+    use super::ldexp;
     use std::f64::consts::LN_2;
 
     /// `n` above this uses `exp(−(6nx + 1)² / 18n)` instead of summing.
@@ -7028,31 +7029,6 @@ mod xsf_smirnov {
         let r = x * polevl(xx, &EP[..]);
         let r = r / (polevl(xx, &EQ[..]) - r);
         r + r
-    }
-
-    /// C `ldexp`: `x · 2^exp` with one rounding (musl `scalbn`; the scaling is split so that a
-    /// subnormal result is rounded once).
-    fn ldexp(x: f64, exp: i32) -> f64 {
-        const P1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
-        const PM969: f64 = f64::from_bits(0x0360_0000_0000_0000); // 2^-1022 · 2^53
-        let mut y = x;
-        let mut n = exp;
-        if n > 1023 {
-            y *= P1023;
-            n -= 1023;
-            if n > 1023 {
-                y *= P1023;
-                n = (n - 1023).min(1023);
-            }
-        } else if n < -1022 {
-            y *= PM969;
-            n += 1022 - 53;
-            if n < -1022 {
-                y *= PM969;
-                n = (n + 1022 - 53).max(-1022);
-            }
-        }
-        y * f64::from_bits(((0x3ff + n) as u64) << 52)
     }
 
     /// C `frexp`: significand in [0.5, 1) and binary exponent; zero, ±inf and NaN come back
@@ -8267,15 +8243,35 @@ pub fn copysign(x: f64, y: f64) -> f64 {
     x.copysign(y)
 }
 
-/// Multiply x by 2 raised to the power exp.
+/// Multiply x by 2 raised to the power exp, with one rounding: C's `ldexp`, so numpy's.
 ///
-/// ldexp(x, exp) = x * 2^exp
-/// Matches numpy `ldexp(x, exp)`.
+/// musl's `scalbn`. `x * 2.0.powi(exp)` is wrong wherever 2^exp itself is not representable
+/// but the product is: ldexp(0.5, 1024) came out inf, not 2^1023, and ldexp(2^52, -1100) came
+/// out 0, not 2^-1048 (frankenscipy-9y1o1). Here the scaling is split into steps of 2^1023,
+/// or of 2^-969 so a subnormal result is rounded once, before the final power-of-two
+/// multiply, whose exponent is then always representable.
 #[must_use]
 pub fn ldexp(x: f64, exp: i32) -> f64 {
-    // Use the formula: x * 2^exp
-    // For safety, use libm's implementation via powi
-    x * 2.0_f64.powi(exp)
+    const P1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
+    const PM969: f64 = f64::from_bits(0x0360_0000_0000_0000); // 2^-1022 · 2^53
+    let mut y = x;
+    let mut n = exp;
+    if n > 1023 {
+        y *= P1023;
+        n -= 1023;
+        if n > 1023 {
+            y *= P1023;
+            n = (n - 1023).min(1023);
+        }
+    } else if n < -1022 {
+        y *= PM969;
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= PM969;
+            n = (n + 1022 - 53).max(-1022);
+        }
+    }
+    y * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
 
 /// Extract mantissa and exponent from x.
@@ -12439,6 +12435,39 @@ mod tests {
         assert!((ldexp(1.0, 2) - 4.0).abs() < 1e-14);
         assert!((ldexp(1.0, -1) - 0.5).abs() < 1e-14);
         assert!((ldexp(3.0, 2) - 12.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn ldexp_is_numpys_single_rounding_scaling_at_the_extremes() {
+        // numpy.ldexp (C ldexp) values. The first two are where x * 2.0.powi(e) was wrong:
+        // 2^e itself overflows or underflows though the product is representable.
+        let cases = [
+            (0.5, 1024, 8.988_465_674_311_58e307),
+            (4_503_599_627_370_496.0, -1100, 3.315_618_4e-316),
+            (1.0, -1074, 5e-324),
+            (1.0, -1075, 0.0),
+            (1.5, -1074, 1e-323),
+            (3.0, -1076, 5e-324),
+            (1.0, 1023, 8.988_465_674_311_58e307),
+            (1.0, 1024, f64::INFINITY),
+            (0.75, 1025, f64::INFINITY),
+            (5e-324, 2098, f64::INFINITY),
+            (1.797_693_134_862_315_7e308, -2098, 5e-324),
+            (1.797_693_134_862_315_7e308, -2200, 0.0),
+            (-2.5, 10, -2560.0),
+            (-0.0, 50, -0.0),
+            (f64::INFINITY, -5000, f64::INFINITY),
+            (f64::NEG_INFINITY, 5000, f64::NEG_INFINITY),
+            (1.0, i32::MAX, f64::INFINITY),
+            (1.0, i32::MIN, 0.0),
+            (2.225_073_858_507_201_4e-308, 1, 4.450_147_717_014_403e-308),
+            (8.095e-320, 60, 9.332_636_185_032_189e-302),
+        ];
+        for (x, e, want) in cases {
+            let got = ldexp(std::hint::black_box(x), std::hint::black_box(e));
+            assert_eq!(got.to_bits(), f64::to_bits(want), "ldexp({x:e}, {e})");
+        }
+        assert!(ldexp(f64::NAN, 3).is_nan());
     }
 
     #[test]
