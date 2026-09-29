@@ -4824,7 +4824,6 @@ const Y0_YQ: [f64; 7] = [
     2.50596256172653059228E17,
 ];
 const SQRT2OPI: f64 = 0.79788456080286535588; // √(2/π)
-const SQRT1OPI: f64 = 0.56418958354775628695; // √(1/π)
 const THREE_PI_OVER_FOUR: f64 = 2.35619449019234492885;
 
 const J1_RP: [f64; 4] = [
@@ -4977,11 +4976,14 @@ fn j0_core(x: f64) -> f64 {
     if x.is_infinite() {
         return 0.0;
     }
+    // Cephes j0, as xsf ships it for scipy.special.j0, operation for operation. Two shortcuts that
+    // differed from it are gone:
+    // - |x| < 3e-8 returned 1.0, where 1 - x²/4 rounds to 1 - 2^-53 from x ≈ 1.5e-8.
+    // - Past x = 10, cos(x - π/4) and sin(x - π/4) were expanded into cos x and sin x. The two
+    //   products cancel next to a zero of J0: 9.4e-11 relative off SciPy there
+    //   (frankenscipy-1efrg).
     let ax = x.abs(); // J0 is even
     if ax <= 5.0 {
-        if ax < 3.0e-8 {
-            return 1.0; // x²/4 below machine epsilon (covers x = 0: J0(0) = 1)
-        }
         let z = ax * ax;
         if ax < 1.0e-5 {
             return 1.0 - z / 4.0;
@@ -4993,12 +4995,8 @@ fn j0_core(x: f64) -> f64 {
     let qz = 25.0 / (ax * ax);
     let p = cephes_polevl(qz, &J0_PP) / cephes_polevl(qz, &J0_PQ);
     let q = cephes_polevl(qz, &J0_QP) / cephes_p1evl(qz, &J0_QQ);
-    if ax < 10.0 {
-        let xn = ax - std::f64::consts::FRAC_PI_4;
-        (p * xn.cos() - w * q * xn.sin()) * SQRT2OPI / ax.sqrt()
-    } else {
-        ((p + w * q) * ax.cos() + (p - w * q) * ax.sin()) * SQRT1OPI / ax.sqrt()
-    }
+    let xn = ax - std::f64::consts::FRAC_PI_4;
+    (p * xn.cos() - w * q * xn.sin()) * SQRT2OPI / ax.sqrt()
 }
 
 fn j0_series_small(x: f64) -> f64 {
@@ -9115,6 +9113,44 @@ mod tests {
             actual.im,
             expected.im
         );
+    }
+
+    /// frankenscipy-1efrg. `j0` is Cephes j0 operation for operation, so it returns
+    /// `scipy.special.j0`'s bits: next to the zeros at 11.79, 14.93, 18.07 and 30.63, where the
+    /// old x ≥ 10 expansion was up to 9.4e-11 relative off, at large x, and below 3e-8, where the
+    /// old shortcut returned 1.0 instead of 1 − x²/4.
+    #[test]
+    fn j0_is_scipys_cephes_j0_bit_for_bit() {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64); 19] = [
+            (2.5e-8, 0.9999999999999999),
+            (1.2e-8, 1.0),
+            (2.9e-8, 0.9999999999999998),
+            (4.9, -0.20973832758532618),
+            (5.5, -0.006843869417819189),
+            (9.99, -0.24548852594224305),
+            (10.0, -0.24593576445134832),
+            (11.791534439014281, -2.6481984375475295e-16),
+            (11.7915344390142, -1.9258892137902803e-14),
+            (14.930917708487787, 3.1163506548748245e-17),
+            (-14.930917708487787, 3.1163506548748245e-17),
+            (18.071063967910924, 2.018692387036633e-17),
+            (20.5, 0.11509696025367488),
+            (30.634606468431976, -4.60131523227105e-17),
+            (57.3, 0.10533413321246045),
+            (100.0, 0.01998585030422333),
+            (1234.5678, -0.014753414749700435),
+            (1e5, -0.001719201116238339),
+            (1e10, 2.1755892946936445e-06),
+        ];
+        for (x, want) in PINS {
+            let got = j0_core(std::hint::black_box(x));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "j0({x}) = {got:e}, SciPy {want:e}"
+            );
+        }
     }
 
     #[test]
