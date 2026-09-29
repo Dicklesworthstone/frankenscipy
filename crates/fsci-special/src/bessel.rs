@@ -975,10 +975,53 @@ pub fn i1e_scalar(x: f64) -> f64 {
     i1e_cephes(x)
 }
 
+/// Below this |x| the unscaled route `iv(v, x)·e^{-|x|}` is safe for order v ≥ 0:
+/// I_v(x) ≤ e^x < 1.02e304 and e^{-x} > 9.8e-305 are both normal doubles.
+const IVE_SCALED_MIN_X: f64 = 700.0;
+
 /// Scalar: ive(v, x) = I_v(x) * exp(-|x|).
+///
+/// Formed as `iv(v, x)·e^{-|x|}` only where both factors are representable. Past that the
+/// scaled value comes straight from a scaled expansion: I_v(x) overflows at x ≈ 710 and
+/// the product was inf·0 = NaN, at every point of x in [1e3, 1e8] where SciPy returns
+/// e.g. ive(0.2, 1.02e6) = 3.95e-4 (frankenscipy-jd905).
+///
+/// - `|x| > 50` and `|x| > v²`, where `iv` itself takes the Hankel asymptotic: the same
+///   series without its e^{|x|}, so no exp round trip at all. For a negative non-integer
+///   order the reflection's K term is below e^{-2|x|} < 1e-43 of the result and is dropped.
+/// - `|x| ≥ 700` with `|x| ≤ v²` (so |v| > 26): Debye's uniform expansion with the scale
+///   folded into its exponent, plus the reflection term for a negative non-integer order.
 #[must_use]
 pub fn ive_scalar(v: f64, x: f64) -> f64 {
-    iv_scalar(v, x) * (-x.abs()).exp()
+    let ax = x.abs();
+    let hankel = ax > 50.0 && ax > v * v;
+    if !(ax.is_finite() && (hankel || ax >= IVE_SCALED_MIN_X)) || v.is_nan() {
+        return iv_scalar(v, x) * (-ax).exp();
+    }
+    // Domain and parity exactly as `iv_scalar`: I_{-n} = I_n, and for x < 0 an integer
+    // order takes (-1)^n while any other order is complex (NaN).
+    let order = if v < 0.0 && v.fract() == 0.0 { -v } else { v };
+    let sign = if x < 0.0 {
+        if order.fract() != 0.0 {
+            return f64::NAN;
+        }
+        if (order as i64) % 2 != 0 { -1.0 } else { 1.0 }
+    } else {
+        1.0
+    };
+    let value = if hankel {
+        iv_asymptotic_scaled(order, ax)
+    } else {
+        let p = order.abs();
+        let (i_scaled, k_scaled) = ik_uniform_asymptotic_scaled(p, ax);
+        if order < 0.0 {
+            // I_{-p} = I_p + (2/π) sin(pπ) K_p, every term scaled by e^{-x}.
+            i_scaled + (2.0 / PI) * crate::convenience::sinpi(p) * k_scaled
+        } else {
+            i_scaled
+        }
+    };
+    sign * value
 }
 
 /// Scalar: ln of the exponentially-scaled modified Bessel function of the
@@ -2331,18 +2374,33 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     if v < 0.0 && v.fract() == 0.0 {
         return iv_scalar(v.abs(), z);
     }
+    // I_v(-z) = (-1)^v I_v(z) for integer v; for non-integer v it is complex, NaN here as
+    // in SciPy. Decided BEFORE the asymptotic branch below, which evaluates at |z| and
+    // used to return +I_v(|z|) for any negative z: iv(1, -100) came back +1.07e42 where
+    // SciPy gives -1.07e42, and iv(0.5, -100) a finite value where SciPy gives NaN
+    // (frankenscipy-jd905).
+    if z < 0.0 && v.fract() != 0.0 {
+        return f64::NAN;
+    }
     // Negative non-integer order: the power-series term Γ(v+k+1) passes through
     // ln(v+k+1) for v+k+1 <= 0 (any v <= -1), producing NaN. SciPy instead uses
     // the reflection identity I_{-p}(z) = I_p(z) + (2/π) sin(pπ) K_p(z) with p=|v|.
-    // K_v is symmetric (K_p = K_{|v|}); for z < 0 the result is complex, matching
-    // the NaN returned by the power-series branch below.
+    // K_v is symmetric (K_p = K_{|v|}).
+    //
+    // K_p comes from `kv_scalar`, which rebuilds K unscaled when only the e^z-scaled value
+    // overflows, and which is +inf when K_p itself does: at tiny z the reflection term then
+    // overflows to ±inf with the sign of sin(pπ), as SciPy's does. It used to take
+    // K_p·e^z from `kv_scaled_value` directly, whose recurrence handed back a lower order's
+    // value on overflow, so iv(-3.3, 1e-100) was finite where SciPy is -inf (jd905).
+    // sin(pπ) is `sinpi`, exact at the reduction, as Cephes' `sinpi`; sin(p·π) lost the
+    // rounding of p·π, 1e-13 absolute at p = 200.
     if v < 0.0 && v.fract() != 0.0 && z > 0.0 {
         let p = -v;
         if p > 20_000.0 {
             return f64::INFINITY;
         }
-        let kp = kv_scaled_value(p, z) * (-z).exp();
-        return iv_scalar(p, z) + (2.0 / PI) * (p * PI).sin() * kp;
+        let kp = kv_scalar(p, z, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        return iv_scalar(p, z) + (2.0 / PI) * crate::convenience::sinpi(p) * kp;
     }
 
     // The large-ARGUMENT asymptotic I_v(z) ~ e^z/√(2πz)·Σ(4v²-…)/(8z)^k is only
@@ -2352,7 +2410,12 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     // 4.8e36). Require z > v² so the asymptotic is firmly in its valid regime;
     // otherwise fall through to the (everywhere-valid) ascending power series.
     if az > 50.0 && az > v * v {
-        return iv_asymptotic(v, az);
+        let value = iv_asymptotic(v, az);
+        return if z < 0.0 && (v.abs() as i64) % 2 != 0 {
+            -value
+        } else {
+            value
+        };
     }
 
     // Power series: I_v(z) = (z/2)^v Σ (z²/4)^k / (k! Γ(v+k+1))
@@ -2392,6 +2455,11 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
             let kf = k as f64;
             term *= quarter_z2 / ((kf + 1.0) * (v + kf + 1.0));
             if !term.is_finite() {
+                // Every term is positive, so a term past f64::MAX puts the sum there too.
+                // Breaking before adding it returned the finite partial sum: iv(38.25, 916)
+                // was 1.06e308 where I_v overflows (frankenscipy-jd905). The log-form arm
+                // below adds the term before its check and was already inf.
+                sum += term;
                 break;
             }
         }
@@ -2413,22 +2481,37 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
         }
     }
 
-    // Parity for negative z: I_v(-z) = (-1)^v I_v(z) for integer v
-    if z < 0.0 {
-        if v.fract() == 0.0 {
-            let n = v.abs() as i64;
-            if n % 2 != 0 {
-                return -sum;
-            }
-        } else {
-            return f64::NAN; // Complex for non-integer v and negative z
-        }
+    // Parity for negative z: I_v(-z) = (-1)^v I_v(z). v is an integer here: negative z
+    // with a non-integer order returned NaN above.
+    if z < 0.0 && (v.abs() as i64) % 2 != 0 {
+        return -sum;
     }
 
     sum
 }
 
 fn iv_asymptotic(v: f64, z: f64) -> f64 {
+    // e^z alone overflows past z = 709.78 while I_v(z) ≈ e^z/√(2πz) stays finite to
+    // z ≈ 714: iv(1.5, 711) was inf where SciPy and mpmath give 9.07e306
+    // (frankenscipy-jd905). There e^{z/2} is applied twice, so only a result that is
+    // itself past f64::MAX overflows. At z <= 709 the product is unchanged, bit for bit.
+    if z <= 709.0 {
+        (z * 2.0 * PI).sqrt().recip() * z.exp() * iv_asymptotic_sum(v, z)
+    } else {
+        let half = (0.5 * z).exp();
+        (z * 2.0 * PI).sqrt().recip() * half * iv_asymptotic_sum(v, z) * half
+    }
+}
+
+/// `iv_asymptotic` without its e^z: I_v(z)·e^{-z} for z > 0, finite for every finite z,
+/// where the unscaled form overflows past z ≈ 709.8.
+fn iv_asymptotic_scaled(v: f64, z: f64) -> f64 {
+    (z * 2.0 * PI).sqrt().recip() * iv_asymptotic_sum(v, z)
+}
+
+/// The Hankel series Σ_k (-1)^k a_k(v)/z^k of the large-argument asymptotic
+/// I_v(z) ~ e^z/√(2πz)·Σ_k (-1)^k a_k(v)/z^k (DLMF 10.40.1).
+fn iv_asymptotic_sum(v: f64, z: f64) -> f64 {
     // I_v(z) ~ e^z / sqrt(2*pi*z) * [ 1 - (4v^2-1)/8z + (4v^2-1)(4v^2-9)/(2! (8z)^2) - ... ]
     let mu = 4.0 * v * v;
     let mut sum = 1.0;
@@ -2444,7 +2527,138 @@ fn iv_asymptotic(v: f64, z: f64) -> f64 {
         }
     }
 
-    (z * 2.0 * PI).sqrt().recip() * z.exp() * sum
+    sum
+}
+
+/// Debye's uniform-asymptotic polynomials u_k(t) = t^k·P_k(t²), k = 1..=10 (AMS 9.3.9,
+/// 9.3.10), as P_k's coefficients, highest degree first. Transcribed verbatim from xsf's
+/// `iv_asymptotic_ufactors` (the table SciPy's `iv` runs for |v| > 50); every literal is
+/// within 2 ulp of the exact rational of the defining recursion.
+const IV_UNIFORM_U: [&[f64]; 10] = [
+    &[-0.20833333333333334, 0.125],
+    &[0.3342013888888889, -0.40104166666666669, 0.0703125],
+    &[
+        -1.0258125964506173,
+        1.8464626736111112,
+        -0.89121093750000002,
+        0.0732421875,
+    ],
+    &[
+        4.6695844234262474,
+        -11.207002616222995,
+        8.78912353515625,
+        -2.3640869140624998,
+        0.112152099609375,
+    ],
+    &[
+        -28.212072558200244,
+        84.636217674600744,
+        -91.818241543240035,
+        42.534998745388457,
+        -7.3687943594796312,
+        0.22710800170898438,
+    ],
+    &[
+        212.5701300392171,
+        -765.25246814118157,
+        1059.9904525279999,
+        -699.57962737613275,
+        218.19051174421159,
+        -26.491430486951554,
+        0.57250142097473145,
+    ],
+    &[
+        -1919.4576623184068,
+        8061.7221817373083,
+        -13586.550006434136,
+        11655.393336864536,
+        -5305.6469786134048,
+        1200.9029132163525,
+        -108.09091978839464,
+        1.7277275025844574,
+    ],
+    &[
+        20204.291330966149,
+        -96980.598388637503,
+        192547.0012325315,
+        -203400.17728041555,
+        122200.46498301747,
+        -41192.654968897557,
+        7109.5143024893641,
+        -493.915304773088,
+        6.074042001273483,
+    ],
+    &[
+        -242919.18790055133,
+        1311763.6146629769,
+        -2998015.9185381061,
+        3763271.2976564039,
+        -2813563.2265865342,
+        1268365.2733216248,
+        -331645.17248456361,
+        45218.768981362737,
+        -2499.8304818112092,
+        24.380529699556064,
+    ],
+    &[
+        3284469.8530720375,
+        -19706819.11843222,
+        50952602.492664628,
+        -74105148.211532637,
+        66344512.274729028,
+        -37567176.660763353,
+        13288767.166421819,
+        -2785618.1280864552,
+        308186.40461266245,
+        -13886.089753717039,
+        110.01714026924674,
+    ],
+];
+
+/// Debye's uniform asymptotic expansion (AMS 9.7.7, 9.7.8) for order `v > 0` and `x > 0`,
+/// both results scaled by e^{-x}: `(I_v(x)·e^{-x}, K_v(x)·e^{-x})`.
+///
+/// This is Cephes' `ikv_asymptotic_uniform`, the routine SciPy's `iv` runs for |v| > 50,
+/// with the scale folded into the exponents instead of applied to a finished value:
+///
+///   v·η − x = v²/(√(v²+x²) + x) − v·asinh(v/x),     −v·η − x = v·asinh(v/x) − √(v²+x²) − x,
+///
+/// η = √(1+z²) + ln(z/(1+√(1+z²))), z = x/v. Written this way each exponent's rounding
+/// error stays O(eps·(v + x)), the conditioning of e^{±v·η} itself (the direct form lost
+/// √(v²+x²) − x to cancellation for x ≫ v), and I_v·e^{-x} stays finite where e^{v·η}
+/// alone would overflow. Accurate wherever v is large or t = 1/√(1+z²) is small: the k-th
+/// term is u_k(t)/v^k with u_k(t) = O(t^k).
+fn ik_uniform_asymptotic_scaled(v: f64, x: f64) -> (f64, f64) {
+    const MACHEP: f64 = f64::EPSILON / 2.0;
+    let r = v.hypot(x);
+    let t = v / r;
+    let t2 = t * t;
+    let a = v * (v / x).asinh();
+    let i_exponent = v * v / (r + x) - a;
+    let k_exponent = a - r - x;
+
+    let mut i_sum = 1.0;
+    let mut k_sum = 1.0;
+    let mut t_pow = 1.0;
+    let mut divisor = v;
+    for (n, coefficients) in IV_UNIFORM_U.iter().enumerate() {
+        t_pow *= t;
+        let mut p = 0.0;
+        for &c in *coefficients {
+            p = p * t2 + c;
+        }
+        let term = p * t_pow / divisor;
+        i_sum += term;
+        // u_k enters K with sign (-1)^k; n = k - 1.
+        k_sum += if n % 2 == 1 { term } else { -term };
+        if term.abs() < MACHEP {
+            break;
+        }
+        divisor *= v;
+    }
+    let i_scaled = (t / (2.0 * PI * v)).sqrt() * i_exponent.exp() * i_sum;
+    let k_scaled = (PI * t / (2.0 * v)).sqrt() * k_exponent.exp() * k_sum;
+    (i_scaled, k_scaled)
 }
 
 /// K_v(z) for real order v.
@@ -2462,9 +2676,28 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     // K_v = e^{-z} · (K_v·e^z). The scaled value is computed without ever forming
     // the tiny K_v directly; for z ≳ 745 the e^{-z} underflows to 0, matching
     // SciPy (kve stays finite via kve_scalar). K_v is symmetric: K_{-v} = K_v.
-    let result = kv_scaled_value(v.abs(), z) * (-z).exp();
+    //
+    // Past z = 708, e^{-z} is subnormal and carries only as many bits as it sits above
+    // 4.9e-324, so the product lost them even where K_v is a normal double:
+    // kv(190.2, 723.6) = 1.7e-305 was 4e-10 off (frankenscipy-jd905). There e^{-z/2} is
+    // applied twice: each factor stays normal and the result rounds to the subnormal grid
+    // once, at the end. At z <= 708 the product is unchanged, bit for bit.
+    let scaled = kv_scaled_value(v.abs(), z);
+    let result = if z <= 708.0 {
+        scaled * (-z).exp()
+    } else {
+        let half = (-0.5 * z).exp();
+        scaled * half * half
+    };
     if result.is_finite() {
         return Ok(result);
+    }
+    // Below z = eps, e^{-z} is 1 to within an ulp, so K_v = K_v·e^z and the unscaled
+    // rebuild below overflows exactly where the scaled value did (up to rounding at
+    // f64::MAX itself). Skipping it matters at tiny z, where K_v overflows at most orders
+    // and the rebuild's two extra Temme evaluations tripled the cost of every such point.
+    if scaled == f64::INFINITY && z < f64::EPSILON {
+        return Ok(f64::INFINITY);
     }
     // The SCALED value K_v·e^z overflowed at large order (e.g. K_500(100)·e^100
     // ≈ 7e322) even though K_v itself is representable (2.7e279). Rebuild K_v
@@ -2537,13 +2770,16 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
     // same algorithm SciPy/Cephes use. Self-validating and ~machine-accurate
     // (worst 4e-15 vs mpmath over the reachable domain), and far cheaper than the
     // 96-point Gauss quadrature it replaces. Fall back to the quadrature if a
-    // pathological input ever yields a non-finite value, so accuracy never regresses.
+    // pathological input ever yields NaN, so accuracy never regresses. An inf is NOT
+    // pathological: Temme's intermediates cannot overflow on their own (e^z ≤ 7.4 in the
+    // series, |xmu·ln(2/z)| ≤ 372), so inf means K_v·e^z itself exceeds f64::MAX, and the
+    // quadrature turned that into NaN (kve(500.3, 100); frankenscipy-jd905).
     if v_abs.fract() != 0.0 {
         let k = kv_temme_scaled(v_abs, z);
-        return if k.is_finite() {
-            k
-        } else {
+        return if k.is_nan() {
             kv_integral_scaled(v_abs, z)
+        } else {
+            k
         };
     }
     // Integer order: the recurrence K_{n+1} = K_{n-1} + (2n/z)K_n is identical for
@@ -2832,11 +3068,21 @@ fn kv_temme_scaled(v: f64, z: f64) -> f64 {
         rk1 = rkmu * (xmu + z + 0.5 - h) * xi;
     }
     // Stable upward recurrence in order: K_{ν+1} = (2ν/z)K_ν + K_{ν-1}.
+    //
+    // After step i, rkmu = K_{xmu+i} and rk1 = K_{xmu+i+1}; the answer is rkmu after step
+    // nl. An overflow of rk1 at the LAST step leaves rkmu = K_v intact. An overflow any
+    // earlier means an order at or below v already exceeds f64::MAX, and K_ν grows with ν,
+    // so K_v overflows too. Breaking there and returning rkmu handed back the value of a
+    // LOWER order: kv(4.48, 3.5e-125) was K_1.48 = 2.3e184 where the true value is 1e559
+    // (frankenscipy-jd905).
     for i in 1..=nl {
         let rktemp = (xmu + i as f64) * xi2 * rk1 + rkmu;
         rkmu = rk1;
         rk1 = rktemp;
         if !rk1.is_finite() {
+            if i < nl {
+                return f64::INFINITY;
+            }
             break;
         }
     }
@@ -10987,6 +11233,244 @@ mod tests {
                 "iv({v}, {z}) = {val}, expected {expected}"
             );
         }
+    }
+
+    /// Relative-error bound for a value formed as exp(E): a correctly computed E carries
+    /// eps·|E| absolute error, so the relative error of y = e^E scales with 1 + |ln y|.
+    /// SciPy's own error sits inside it at every finite point below.
+    fn jd905_close(got: f64, want: f64) -> bool {
+        let tol = 4.0 * f64::EPSILON * (1.0 + want.abs().ln().abs());
+        got.is_finite() && ((got - want) / want).abs() <= tol
+    }
+
+    /// frankenscipy-jd905: `ive` past |x| ≈ 710 was I_v(x)·e^{-|x|} = inf·0 = NaN — at
+    /// every point of x in [1e3, 1e8] — where the scaled value is O(1/√x). References are
+    /// mpmath at 60 digits.
+    #[test]
+    fn ive_huge_x_is_the_scaled_expansion_not_inf_times_zero() {
+        use std::hint::black_box;
+        let _guard = bessel_toggle_lock();
+        let cases: [(f64, f64, f64); 13] = [
+            // Hankel branch, x > v².
+            (0.2, 1.02e6, 3.950_117_593_919_830_7e-4),
+            (3.0, 1.0e8, 3.989_422_629_477_082e-5),
+            (4.9, 5.0e4, 1.783_700_254_381_221_4e-3),
+            (0.0, 1.0e3, 1.261_724_045_589_125_7e-2),
+            // SciPy is NaN here: AMOS refuses |x| > 1.07e9 outright.
+            (2.5, 3.0e9, 7.283_656_196_663_538e-6),
+            (-3.0, 1.0e5, 1.261_511_068_417_547_3e-3),
+            // Debye branch, 700 <= x <= v².
+            (46.0, 1.0e3, 4.378_567_419_409_335e-3),
+            (
+                159.317_722_046_833_86,
+                14_314.841_135_745_512,
+                1.373_978_335_763_434e-3,
+            ),
+            (300.5, 800.0, 7.965_797_354_833_637e-27),
+            (1000.25, 900.0, 2.417_946_092_188_464_8e-225),
+            // Negative non-integer order: I_p + (2/π) sin(pπ) K_p, all scaled.
+            (-30.7, 750.0, 7.770_144_822_488_232_6e-3),
+            (-1100.3, 800.0, 3.149_809_416_015_628_4e-296),
+            // The K term dominates; SciPy is NaN (its scaled K overflows).
+            (-2000.3, 800.0, 1.549_317_163_995_651e146),
+        ];
+        for (v, x, want) in cases {
+            let got = ive_scalar(black_box(v), black_box(x));
+            assert!(
+                jd905_close(got, want),
+                "ive({v}, {x}) = {got:e}, mpmath {want:e}"
+            );
+        }
+        // Parity for negative x, as `iv`: (-1)^n for integer order, NaN (complex) otherwise.
+        let odd = ive_scalar(black_box(3.0), black_box(-1.0e5));
+        assert!(
+            jd905_close(odd, -1.261_511_068_417_547_3e-3),
+            "ive(3, -1e5) = {odd:e}"
+        );
+        let even = ive_scalar(black_box(2.0), black_box(-1.0e5));
+        assert!(
+            jd905_close(even, 1.261_542_606_746_174_4e-3),
+            "ive(2, -1e5) = {even:e}"
+        );
+        assert!(ive_scalar(black_box(2.5), black_box(-1.0e5)).is_nan());
+        // Below the scaled branches the product is unchanged, bit for bit.
+        for (v, x) in [(1.5, 2.0), (7.25, 12.0), (30.0, 600.0)] {
+            let product = iv_scalar(v, x) * (-x).exp();
+            assert_eq!(
+                ive_scalar(black_box(v), black_box(x)).to_bits(),
+                product.to_bits()
+            );
+        }
+    }
+
+    /// frankenscipy-jd905: Temme's upward K recurrence broke on overflow and returned the
+    /// value of a LOWER order, so kv(4.48, 3.5e-125) was K_1.48 = 2.3e184 where the true
+    /// value is 1e559 — finite garbage at 8082 of 20000 points of x in [1e-300, 1e-3].
+    #[test]
+    fn kv_kve_overflow_is_inf_not_a_lower_order() {
+        use std::hint::black_box;
+        let m = RuntimeMode::Strict;
+        // (v, x, mpmath log10 K_v(x)): all past f64::MAX; SciPy is inf at each.
+        for (v, x, log10_true) in [
+            (4.48, 3.5e-125, 559.66),
+            (2.2, 1.0e-150, 330.40),
+            (114.958_655_124_034_62, 0.112_573_416_231_455_66, 329.67),
+        ] {
+            let k = kv_scalar(black_box(v), black_box(x), m).unwrap();
+            let ke = kve_scalar(black_box(v), black_box(x));
+            assert_eq!(
+                k,
+                f64::INFINITY,
+                "kv({v}, {x}) = {k:e}, true 1e{log10_true}"
+            );
+            assert_eq!(
+                ke,
+                f64::INFINITY,
+                "kve({v}, {x}) = {ke:e}, true 1e{log10_true}"
+            );
+        }
+        // Finite just below the top of the range. SciPy is inf at the first: AMOS reports
+        // overflow once ln K exceeds its ELIM ≈ 700.9, i.e. K > 1e304.
+        for (v, x, want) in [
+            (1.02, 1.0e-300, 1.002_647_953_934_875_7e306),
+            (0.6, 1.0e-300, 1.128_596_681_122_213_4e180),
+        ] {
+            let k = kv_scalar(black_box(v), black_box(x), m).unwrap();
+            let ke = kve_scalar(black_box(v), black_box(x));
+            assert!(
+                jd905_close(k, want),
+                "kv({v}, {x}) = {k:e}, mpmath {want:e}"
+            );
+            assert!(
+                jd905_close(ke, want),
+                "kve({v}, {x}) = {ke:e}, mpmath {want:e}"
+            );
+        }
+        // K_v·e^x overflows but K_v does not: kve is inf and kv rebuilds K unscaled.
+        let k = kv_scalar(black_box(500.3), black_box(100.0), m).unwrap();
+        assert!(
+            jd905_close(k, 5.464_865_041_698_317e279),
+            "kv(500.3, 100) = {k:e}"
+        );
+        assert_eq!(
+            kve_scalar(black_box(500.3), black_box(100.0)),
+            f64::INFINITY
+        );
+        // Past x = 708, e^{-x} is subnormal: K_v = (K_v·e^x)·e^{-x} must not inherit its
+        // few bits. SciPy is 0 at the first and fourth (AMOS underflow), mpmath is not.
+        for (v, x, want) in [
+            (
+                190.235_029_294_912_12,
+                723.559_785_889_169_3,
+                1.668_981_957_175_857_6e-305,
+            ),
+            (190.0, 720.0, 6.246_156_964_826_772e-304),
+            (150.5, 712.0, 2.147_195_984_526_581_5e-304),
+            (60.0, 709.5, 4.374_705_218_697_514e-309),
+        ] {
+            let k = kv_scalar(black_box(v), black_box(x), m).unwrap();
+            assert!(
+                jd905_close(k, want),
+                "kv({v}, {x}) = {k:e}, mpmath {want:e}"
+            );
+        }
+        // A subnormal result is exact to its own grid spacing.
+        let (v, x, want) = (
+            190.287_029_138_912_57,
+            741.983_741_129_859_9,
+            9.043_972_292_7e-314,
+        );
+        let k = kv_scalar(black_box(v), black_box(x), m).unwrap();
+        assert!(
+            (k - want).abs() <= 2.0 * f64::from_bits(1),
+            "kv({v}, {x}) = {k:e}, mpmath {want:e}"
+        );
+    }
+
+    /// frankenscipy-jd905: iv at a negative non-integer order is I_p + (2/π) sin(pπ) K_p,
+    /// so at tiny x it must overflow with the sign of sin(pπ) wherever K_p does — finite at
+    /// 17900 of 20000 points of v in [-200, -0.5], x in [1e-300, 1e-50] through the stale-order
+    /// K. The ascending series stopped one term short of its own overflow, and the Hankel
+    /// branch ignored the sign of a negative x.
+    #[test]
+    fn iv_overflow_is_inf_with_the_sign_of_sin_and_negative_x_keeps_parity() {
+        use std::hint::black_box;
+        let _guard = bessel_toggle_lock();
+        // (v, x, sign of the overflow); SciPy's iv agrees at each, its ive is NaN.
+        for (v, x, want) in [
+            (-3.3, 1.0e-100, f64::NEG_INFINITY),
+            (-60.3, 1.0e-100, f64::INFINITY),
+            (-1.3, 1.0e-300, f64::NEG_INFINITY),
+            (
+                -141.865_674_902_975_3,
+                0.140_904_074_991_901_9,
+                f64::NEG_INFINITY,
+            ),
+        ] {
+            let i = iv_scalar(black_box(v), black_box(x));
+            let ie = ive_scalar(black_box(v), black_box(x));
+            assert_eq!(i, want, "iv({v}, {x}) = {i:e}");
+            assert_eq!(ie, want, "ive({v}, {x}) = {ie:e}");
+        }
+        for (v, x, want) in [
+            (-0.7, 1.0e-300, 5.430_276_886_137_009e209),
+            (-2.5, 1.0e-60, 2.393_653_682_408_596e150),
+        ] {
+            let i = iv_scalar(black_box(v), black_box(x));
+            assert!(
+                jd905_close(i, want),
+                "iv({v}, {x}) = {i:e}, mpmath {want:e}"
+            );
+        }
+        // The ascending series past f64::MAX (x <= v², so no Hankel branch) is inf: the
+        // term-ratio loop returned the partial sum before the overflowing term, 1.06e308 at
+        // the first point. (v, x, mpmath log10 I_v(x)); SciPy is inf at each.
+        for (v, x, log10_true) in [
+            (38.254_064_737_805_78, 915.997_132_906_634, 395.59),
+            (30.0, 800.0, 345.34),
+            (27.5, 720.0, 310.64),
+            (-38.254_064_737_805_78, 915.997_132_906_634, 395.59),
+        ] {
+            let i = iv_scalar(black_box(v), black_box(x));
+            assert_eq!(
+                i,
+                f64::INFINITY,
+                "iv({v}, {x}) = {i:e}, true 1e{log10_true}"
+            );
+        }
+        for (v, x, want) in [
+            (30.0, 705.0, 1.194_367_957_420_588_8e304),
+            (35.5, 700.0, 6.214_952_409_341_372e301),
+            // Hankel branch past e^709.78: I_v stays finite to x ≈ 714 (inf before).
+            (1.5, 711.0, 9.072_785_569_077_674e306),
+            (0.25, 712.0, 2.468_302_644_276_742_5e307),
+            (3.0, 713.5, 1.098_148_485_991_812_3e308),
+            (
+                -10.279_460_661_618_032,
+                710.042_666_280_813_8,
+                3.240_548_578_029_48e306,
+            ),
+        ] {
+            let i = iv_scalar(black_box(v), black_box(x));
+            assert!(
+                jd905_close(i, want),
+                "iv({v}, {x}) = {i:e}, mpmath {want:e}"
+            );
+        }
+        assert_eq!(iv_scalar(black_box(3.0), black_box(714.5)), f64::INFINITY);
+        // I_v(-x) = (-1)^v I_v(x) in the Hankel branch too; non-integer order is NaN.
+        for (v, x, want) in [
+            (1.0, -100.0, -1.068_369_390_338_162_5e42),
+            (2.0, -100.0, 1.052_384_319_324_310_6e42),
+            (3.0, -60.0, -5.464_801_454_879_571e24),
+        ] {
+            let i = iv_scalar(black_box(v), black_box(x));
+            assert!(
+                jd905_close(i, want),
+                "iv({v}, {x}) = {i:e}, mpmath {want:e}"
+            );
+        }
+        assert!(iv_scalar(black_box(0.5), black_box(-100.0)).is_nan());
     }
 
     #[test]
