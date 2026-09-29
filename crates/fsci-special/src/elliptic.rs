@@ -426,35 +426,10 @@ fn ellipkm1_scalar(p: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if p < 0.0 {
         return domain_error("ellipkm1", mode, "p must be >= 0 (m = 1-p must be <= 1)");
     }
-    if p == 0.0 {
-        return Ok(f64::INFINITY);
-    }
-    if p == 1.0 {
-        return Ok(PI / 2.0);
-    }
-
-    // For small p, use series expansion for numerical stability
-    // K(1-p) ≈ ln(4/sqrt(p)) + (ln(4/sqrt(p)) - 1) * p/4 + O(p^2)
-    if p < 1e-10 {
-        let ln4_sqrt_p = (4.0 / p.sqrt()).ln();
-        // Leading term only for very small p
-        return Ok(ln4_sqrt_p);
-    }
-
-    // For larger p, use AGM directly with m = 1 - p
-    // sqrt(1 - m) = sqrt(p)
-    let mut a = 1.0;
-    let mut b = p.sqrt();
-    for _ in 0..50 {
-        let a_new = 0.5 * (a + b);
-        let b_new = (a * b).sqrt();
-        if (a_new - b_new).abs() < 1.0e-15 * a_new {
-            return Ok(PI / (2.0 * a_new));
-        }
-        a = a_new;
-        b = b_new;
-    }
-    Ok(PI / (2.0 * a))
+    // scipy.special.ellipkm1 IS Cephes `ellpk(p)`, the kernel `ellipk` already calls. The
+    // AGM this replaced kept only the leading term ln(4/√p) below p = 1e-10, dropping
+    // (ln(4/√p) − 1)·p/4: 1.0e-11 relative off at p = 4.5e-11 (frankenscipy-36gsc).
+    Ok(cephes_ellpk_x(p))
 }
 
 fn ellipe_scalar(m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
@@ -3430,6 +3405,38 @@ mod tests {
         }
         // p < 0 (m > 1) is outside the real domain -> NaN, matching scipy.
         assert!(ellipkm1_scalar(-1.0, RuntimeMode::Strict).unwrap().is_nan());
+    }
+
+    #[test]
+    fn ellipkm1_is_scipys_ellpk_bit_for_bit() -> Result<(), SpecialError> {
+        // frankenscipy-36gsc: ellipkm1 is Cephes ellpk(p), SciPy's kernel. The old AGM kept
+        // only ln(4/sqrt p) below p = 1e-10 (1e-11 off at 4.46e-11) and ran its own AGM above.
+        // (p, scipy.special.ellipkm1(p)).
+        let cases: [(f64, f64); 14] = [
+            (1e-300, 346.77405831022674),
+            (1e-100, 116.51554901082218),
+            (1e-17, 20.95826765156928),
+            (4.462405696195516e-11, 13.302668365535762),
+            (1e-10, 12.8992198263876),
+            (3e-10, 12.349913682607308),
+            (1e-05, 7.142772450581779),
+            (0.1, 2.5780921133481733),
+            (0.5, 1.8540746773013719),
+            (1.0, 1.5707963267948966),
+            (2.0, 1.3110287771460598),
+            (10000000000.0, 0.000128992198263876),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::INFINITY),
+        ];
+        for (p, want) in cases {
+            let got = ellipkm1_scalar(std::hint::black_box(p), RuntimeMode::Strict)?;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "ellipkm1({p:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
