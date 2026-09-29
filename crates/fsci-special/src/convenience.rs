@@ -2974,7 +2974,13 @@ where
     if n >= real_par_min {
         par_map_moderate(n, f)
     } else {
-        (0..n).map(f).collect()
+        // Preallocated and filled in place, not `(0..n).map(f).collect()`: collecting
+        // `Result`s goes through a shunt whose size hint is 0, so the Vec regrew as it went.
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(f(i)?);
+        }
+        Ok(out)
     }
 }
 
