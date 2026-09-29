@@ -349,7 +349,7 @@ const ELLPE_Q: [f64; 10] = [
 ];
 
 /// Cephes `ellpk(x) = K(1−x)`: complete elliptic K via the exact xsf polynomial.
-fn cephes_ellpk_x(x: f64) -> f64 {
+pub(crate) fn cephes_ellpk_x(x: f64) -> f64 {
     if x < 0.0 {
         return f64::NAN;
     }

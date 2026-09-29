@@ -6650,23 +6650,55 @@ pub fn cosm1(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real("cosm1", x_tensor, mode, |x| Ok(cosm1_scalar(x)))
 }
 
-/// Arithmetic-geometric mean of two positive numbers.
+/// Arithmetic-geometric mean.
+///
+/// SciPy 1.17.1's own `agm` (`scipy/special/_agm.pxd`), SciPy's bits. In the normal range it is
+/// `(π/4)(a + b)/K(1 − e)` with `e = 4ab/(a + b)²` and K Cephes' `ellpk`, the kernel `ellipkm1`
+/// is. Beyond `1/√(max/2)` .. `√(max/2)` the 20-step iteration runs instead, so nothing
+/// overflows. SciPy's domain comes with it:
+/// - NaN in or opposite signs: NaN;
+/// - 0 against an infinity: NaN;
+/// - any zero: 0;
+/// - `a = b`: `a`;
+/// - both negative: `−agm(−a, −b)`.
+///
+/// The iteration this replaced answered NaN for every zero or negative argument
+/// (frankenscipy-89pgv).
 pub fn agm(a: f64, b: f64) -> f64 {
-    if a <= 0.0 || b <= 0.0 {
+    const SQRT_HALF_MAX: f64 = 9.480_751_908_109_176e153;
+    const INV_SQRT_HALF_MAX: f64 = 1.054_768_661_486_3e-154;
+    if a.is_nan() || b.is_nan() {
         return f64::NAN;
     }
-    let mut an = a;
-    let mut bn = b;
-    for _ in 0..50 {
-        let next_a = (an + bn) / 2.0;
-        let next_b = (an * bn).sqrt();
-        if (next_a - next_b).abs() < 1e-15 * next_a {
-            return next_a;
-        }
-        an = next_a;
-        bn = next_b;
+    if (a < 0.0 && b > 0.0) || (a > 0.0 && b < 0.0) {
+        return f64::NAN;
     }
-    (an + bn) / 2.0
+    if (a.is_infinite() || b.is_infinite()) && (a == 0.0 || b == 0.0) {
+        return f64::NAN;
+    }
+    if a == 0.0 || b == 0.0 {
+        return 0.0;
+    }
+    if a == b {
+        return a;
+    }
+    let (sgn, a, b) = if a < 0.0 { (-1.0, -a, -b) } else { (1.0, a, b) };
+    if INV_SQRT_HALF_MAX < a && a < SQRT_HALF_MAX && INV_SQRT_HALF_MAX < b && b < SQRT_HALF_MAX {
+        let e = 4.0 * a * b / (a + b).powi(2);
+        return sgn * (PI / 4.0) * (a + b) / crate::elliptic::cephes_ellpk_x(e);
+    }
+    // SciPy's `_agm_iter`: at most 20 steps, stopping once the mean repeats an argument.
+    let (mut a, mut b) = (a, b);
+    let mut amean = 0.5 * a + 0.5 * b;
+    let mut count = 20;
+    while count > 0 && amean != a && amean != b {
+        let gmean = a.sqrt() * b.sqrt();
+        a = amean;
+        b = gmean;
+        amean = 0.5 * a + 0.5 * b;
+        count -= 1;
+    }
+    sgn * amean
 }
 
 /// Clausen function Cl₂(θ) = Σ_{k=1}^∞ sin(kθ)/k².
@@ -9887,6 +9919,40 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn agm_is_scipys_agm_bit_for_bit() {
+        // frankenscipy-89pgv: agm is SciPy's _agm.pxd. SciPy 1.17.1's bits through the
+        // (pi/4)(a+b)/ellpk form, the extreme-magnitude iteration (1e-320, 1e300, 1e-200, inf),
+        // zeros, a == b and both-negative arguments. The old iteration was NaN for every zero
+        // or negative argument. (a, b, scipy.special.agm(a, b)).
+        let cases: [(f64, f64, f64); 13] = [
+            (24.0, 6.0, 13.458171481725614),
+            (1.0, 2.0, 1.4567910310469068),
+            (3.0, 3.0, 3.0),
+            (0.0, 5.0, 0.0),
+            (5.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (1e-320, 5.0, 0.01061602831874734),
+            (-2.0, -8.0, -4.486057160575205),
+            (1e300, 1.0, 2.269406194157821e297),
+            (1e-200, 1e-100, 6.781055745575451e-103),
+            (f64::INFINITY, 5.0, f64::INFINITY),
+            (0.5, 99.5, 23.398618868442995),
+            (12.25, 88.0, 41.02213273165341),
+        ];
+        for (a, b, want) in cases {
+            let got = agm(std::hint::black_box(a), std::hint::black_box(b));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "agm({a:?}, {b:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        for (a, b) in [(-1.0, 5.0), (0.0, f64::INFINITY), (f64::NAN, 1.0)] {
+            assert!(agm(a, b).is_nan(), "agm({a}, {b}) is NaN in SciPy");
+        }
     }
 
     #[test]
