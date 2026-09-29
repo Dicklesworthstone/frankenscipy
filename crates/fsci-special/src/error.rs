@@ -855,6 +855,20 @@ fn erfinv_value(y: f64) -> f64 {
     boost_erf_inv_imp(p, 1.0 - p).copysign(y)
 }
 
+/// Boost.Math's `erfc_inv(z)` for `0 < z < 2`, as `boost::math::erfc_inv` runs it for a
+/// `double` under SciPy's policy: `z > 1` reflects to `-erf_inv_imp(1 - (2 - z), 2 - z)`, and
+/// `z <= 1` is `erf_inv_imp(1 - z, z)`. SciPy's `stdtrit` takes its normal quantile from here
+/// (`-erfc_inv(2u)·√2`, Boost's `t_distribution_inv.hpp`), for `df ≥ 1e20` as the whole answer
+/// and in Hill's estimate (frankenscipy-eiqnk). The endpoints are the caller's.
+pub(crate) fn boost_erfc_inv(z: f64) -> f64 {
+    if z > 1.0 {
+        let q = 2.0 - z;
+        -boost_erf_inv_imp(1.0 - q, q)
+    } else {
+        boost_erf_inv_imp(1.0 - z, z)
+    }
+}
+
 /// Boost.Math's `erf_inv_imp` for 64-bit and narrower types, for `0 < p < 1` and `q = 1 - p`.
 fn boost_erf_inv_imp(p: f64, q: f64) -> f64 {
     if p <= 0.5 {
@@ -865,15 +879,18 @@ fn boost_erf_inv_imp(p: f64, q: f64) -> f64 {
         let g = (-2.0 * q.ln()).sqrt();
         return g / (ERFINV_MID.y + ERFINV_MID.r(q - 0.25));
     }
-    // q = 1 - p is at least 2^-53, so x <= 6.07. Boost's x >= 18 bands serve erfc_inv's tiny
-    // q, cannot be reached from erfinv, and are not carried.
+    // From erfinv, q = 1 - p is at least 2^-53 and x <= 6.07. erfc_inv passes its argument as q,
+    // down to the smallest subnormal: x = sqrt(-ln q) <= 27.3, inside Boost's x < 44 band, so
+    // its last band (x >= 44) cannot be reached by a double and is not carried.
     let x = (-q.ln()).sqrt();
     if x < 3.0 {
         ERFINV_TAIL3.tail(x, 1.125)
     } else if x < 6.0 {
         ERFINV_TAIL6.tail(x, 3.0)
-    } else {
+    } else if x < 18.0 {
         ERFINV_TAIL18.tail(x, 6.0)
+    } else {
+        ERFINV_TAIL44.tail(x, 18.0)
     }
 }
 
@@ -1053,6 +1070,29 @@ const ERFINV_TAIL18: BoostErfInvBand<9, 7> = BoostErfInvBand {
         0.000964011807005165528527,
         0.275335474764726041141e-4,
         0.282243172016108031869e-6,
+    ],
+};
+#[allow(clippy::excessive_precision)]
+const ERFINV_TAIL44: BoostErfInvBand<8, 7> = BoostErfInvBand {
+    y: 0.99714565277099609375,
+    p: [
+        -0.0024978212791898131227,
+        -0.779190719229053954292e-5,
+        0.254723037413027451751e-4,
+        0.162397777342510920873e-5,
+        0.396341011304801168516e-7,
+        0.411632831190944208473e-9,
+        0.145596286718675035587e-11,
+        -0.116765012397184275695e-17,
+    ],
+    q: [
+        1.0,
+        0.207123112214422517181,
+        0.0169410838120975906478,
+        0.000690538265622684595676,
+        0.145007359818232637924e-4,
+        0.144437756628144157666e-6,
+        0.509761276599778486139e-9,
     ],
 };
 

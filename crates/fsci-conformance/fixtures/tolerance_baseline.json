@@ -1454,6 +1454,7 @@
   },
   "diff_special_stdtr_btdtr.rs": {
     "CDF_TOL": 1e-12,
+    "PPF_HARD_TOL_REL": 4e-15,
     "PPF_TOL_REL": 1e-9
   },
   "diff_special_stirling2.rs": {

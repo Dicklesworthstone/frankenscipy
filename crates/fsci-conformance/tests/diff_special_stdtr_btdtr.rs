@@ -9,7 +9,8 @@
 //! diff_stats_beta which exercise the same kernel indirectly.
 //!
 //! Tolerances: 1e-12 abs cdf/sf (regularized incomplete beta);
-//! 1e-9 rel ppf (betaincinv composition).
+//! 1e-9 rel ppf (betaincinv composition); 4e-15 truly relative for the
+//! `stdtrit_hard_*` cases (frankenscipy-eiqnk).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -25,6 +26,12 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const CDF_TOL: f64 = 1.0e-12;
 const PPF_TOL_REL: f64 = 1.0e-9;
+/// `stdtrit` where it is hard: within 1e-15..1e-3 of p = 1/2, in the tails down to 1e-300 and
+/// just below 1, and at Boost's closed-form `v` (frankenscipy-eiqnk). Every point is one where
+/// SciPy 1.17.1 is itself within 3e-16 of the exact (mpmath) quantile, so the bound is truly
+/// relative: near p = 1/2 `t` is 1e-15, and `PPF_TOL_REL` against a scale of 1 passes 0 there,
+/// which is what the old fsci returned.
+const PPF_HARD_TOL_REL: f64 = 4.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per SciPy function compared (br-olv0j.2 is closed per function).
 const ARMS: [&str; 6] = ["stdtr", "stdtrc", "stdtrit", "btdtr", "btdtrc", "btdtri"];
@@ -152,6 +159,62 @@ fn generate_query() -> OracleQuery {
                 arg: q,
             });
         }
+    }
+    // stdtrit where it is hard (frankenscipy-eiqnk), compared under PPF_HARD_TOL_REL. Near
+    // p = 1/2 at v = 1.5 (SciPy's inverse incomplete beta), 2.5 (its body series) and 1000
+    // (Hill), where SciPy stays within 3e-16; its v = 3..30 and v = 1e9 centre is off by up to
+    // 6e-7, and its v = 1, 4, 6 centre by up to 1, so those rows are the lib tests' (against
+    // mpmath), not this file's.
+    let mut hard = Vec::new();
+    for df in [1.5_f64, 2.5, 1000.0] {
+        for k in [3, 5, 7, 9, 11, 13, 15] {
+            let offset = 10.0_f64.powi(-k);
+            hard.push((df, 0.5 + offset));
+            hard.push((df, 0.5 - offset));
+        }
+    }
+    // Tails down to 1e-300 and up to 1 - 1e-15. SciPy is +inf at 1e-300 for v = 2.5, 3 and 5
+    // and saturates near 1e154 there for v = 1.5, so those points are left out.
+    for (df, ps) in [
+        (1.5_f64, &[1e-100, 1e-20, 1e-5][..]),
+        (2.5, &[1e-100, 1e-20, 1e-5][..]),
+        (3.0, &[1e-100, 1e-20, 1e-5][..]),
+        (5.0, &[1e-100, 1e-20, 1e-5][..]),
+        (30.0, &[1e-300, 1e-100, 1e-20, 1e-5][..]),
+        (1000.0, &[1e-300, 1e-100, 1e-20, 1e-5][..]),
+        (1e8, &[1e-300, 1e-100, 1e-20, 1e-5][..]),
+    ] {
+        for &p in ps {
+            hard.push((df, p));
+        }
+        hard.push((df, 1.0 - 1e-10));
+        hard.push((df, 1.0 - 1e-15));
+    }
+    // Boost's exact closed forms, which SciPy returns bit for bit.
+    for (df, p) in [
+        (1.0, 1e-12),
+        (1.0, 0.05),
+        (1.0, 0.7),
+        (2.0, 1e-300),
+        (2.0, 0.5 + 1e-12),
+        (2.0, 0.9),
+        (4.0, 1e-300),
+        (4.0, 0.01),
+        (4.0, 0.95),
+        (1e20, 1e-300),
+        (1e20, 0.5 - 1e-15),
+        (1e20, 0.975),
+    ] {
+        hard.push((df, p));
+    }
+    for (df, p) in hard {
+        points.push(PointCase {
+            case_id: format!("stdtrit_hard_df{df:e}_p{p:e}"),
+            func: "stdtrit".into(),
+            a: df,
+            b: 0.0,
+            arg: p,
+        });
     }
     for &(a, b) in &beta_pairs {
         for &x in &xs {
@@ -302,6 +365,9 @@ fn diff_special_stdtr_btdtr() {
 
         let pass = match arm {
             "stdtr" | "stdtrc" | "btdtr" | "btdtrc" => abs_diff <= CDF_TOL,
+            "stdtrit" if case.case_id.starts_with("stdtrit_hard_") => {
+                abs_diff <= PPF_HARD_TOL_REL * scipy_v.abs()
+            }
             "stdtrit" | "btdtri" => abs_diff <= PPF_TOL_REL * scale,
             _ => false,
         };

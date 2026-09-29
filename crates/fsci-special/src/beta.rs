@@ -2237,7 +2237,31 @@ pub fn stdtrc(v: f64, t: f64) -> f64 {
 /// Returns t such that P(T <= t) = p where T follows a Student's t
 /// distribution with v degrees of freedom.
 ///
-/// Matches `scipy.special.stdtrit(v, p)`.
+/// Matches `scipy.special.stdtrit(v, p)` (frankenscipy-eiqnk). SciPy 1.17.1 is Boost.Math's
+/// `quantile(students_t_distribution)`: `fast_students_t_quantile` estimates `t` (closed forms
+/// for `v` = 1, 2 and 4, the normal quantile past `v = 2^28`, Shaw's body and tail series below
+/// `v = 3`, Hill's approximation otherwise, and the inverse incomplete beta for non-integer
+/// `v < 2`) and takes one Halley step on the incomplete beta. With `u = min(p, 1 − p)`:
+///
+/// - `v ≥ 1e20`, `v = 2`, `v = 1` below `u = 0.35` and `v = 4` below `u = 0.15` are Boost's own
+///   closed forms, SciPy's bits.
+/// - `v = 1` and `v = 4` nearer the centre are those closed forms rewritten without
+///   cancellation. Boost's `cos(πu)` and `acos(√(4u(1 − u)))` lose every digit as `u → 1/2`:
+///   SciPy's `stdtrit(1, 0.5 + 1e-15)` is 1e-2 off and `stdtrit(4, 0.5 + 1e-9)` is 0.
+/// - Everything else starts from Boost's estimate and runs Halley's method to convergence on
+///   the incomplete beta, each side of it computed where it keeps its digits (see
+///   `student_t_halley`), with the residual in the form that does not cancel:
+///   `(1/2 − u) − I_y(1/2, v/2)/2` near the centre, where SciPy's `F − p` is rounding once
+///   `t` is small (its `stdtrit(5, 0.5 + 1e-9)` is 9e-9 off, `stdtrit(6, 0.5 + 1e-9)` is 0 and
+///   `stdtrit(30, 0.5 + 1e-9)` 1e-13), and `ln(F/u)` in the tails, where SciPy's density
+///   underflows (`stdtrit(5, 1e-300)` is +inf; the quantile is -1.57e60).
+/// - Where `x = v/(v + t²)` is below `2⁻⁶⁰`, `t` is the tail's leading term
+///   `√v·(v·B(v/2, 1/2)·u)^(−1/v)`, exact there. It stays finite (or overflows to ∓inf when the
+///   quantile is past `f64::MAX`) where SciPy's inverse incomplete beta saturates near 1e154.
+///
+/// The edges are SciPy's: NaN for a NaN, `v ≤ 0` or `p` outside `[0, 1]`; `+inf` at both
+/// `p = 0` and `p = 1` (Boost raises an overflow error for either and SciPy maps it to `+inf`
+/// whatever its sign); `0` at `p = 1/2`. `v = +inf` is the normal quantile.
 #[must_use]
 pub fn stdtrit(v: f64, p: f64) -> f64 {
     if v.is_nan() || p.is_nan() {
@@ -2246,43 +2270,600 @@ pub fn stdtrit(v: f64, p: f64) -> f64 {
     if v <= 0.0 || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if p == 0.0 {
+    if p == 0.0 || p == 1.0 {
         return f64::INFINITY;
     }
-    if p == 1.0 {
-        return f64::INFINITY;
-    }
-    if (p - 0.5).abs() < 1e-15 {
+    if p == 0.5 {
         return 0.0;
     }
+    // 1 − p is exact for p ≥ 1/2, so u carries all of p's digits on either side.
+    let upper = p > 0.5;
+    let u = if upper { 1.0 - p } else { p };
+    let t = student_t_quantile_magnitude(v, u);
+    if upper { t } else { -t }
+}
 
-    // v == 1 is the standard Cauchy distribution, whose quantile is
-    // tan(π(p − 1/2)) = −cos(πp)/sin(πp). Evaluating it directly keeps full
-    // precision in the tails, where the general inverse-beta path below loses
-    // ~1e-6 (e.g. stdtrit(1, 1e-6) was off by 2.8e-6 vs scipy).
+/// `u` from which `stdtrit(1, ·)` is `tan(π(1/2 − u))` rather than Boost's `cos(πu)/sin(πu)`.
+/// Boost's `cos` near `π/2` loses about `ε/(π(1/2 − u))` relative: 5e-15 by `u = 0.49` and
+/// 1.2e-10 within 1e-4 of the centre. Below 0.35 it is within 4.4e-16 of the exact quantile.
+const STDTRIT_DF1_TAN_FROM: f64 = 0.35;
+
+/// `u` from which `stdtrit(4, ·)` is the cancellation-free rewrite of Boost's closed form.
+/// Boost's `acos(√α)` at `α → 1` and its `r − 4` lose about `1.3e-16/(1/2 − u)²` relative
+/// (3.3e-13 by `u = 0.49`, 1.6e-3 within 1e-4 of the centre); below 0.15 it is within 4.4e-16.
+const STDTRIT_DF4_STABLE_FROM: f64 = 0.15;
+
+/// The Halley iteration stops after a step below this fraction of `t`: Halley is cubic, and a
+/// step of 1e-6 leaves an error at the rounding floor (in a Python model of this iteration over
+/// 11,000 points a step of 1e-5 could still leave 3e-14).
+const STDTRIT_HALLEY_STOP: f64 = 1e-6;
+
+/// Cap on Halley steps. The estimates start within 1e-4 almost everywhere, and one or two steps
+/// finish; the cap only ends an iteration that cannot converge.
+const STDTRIT_HALLEY_MAX: usize = 32;
+
+/// `|t|` for the lower-tail probability `u ∈ (0, 1/2)` with `v > 0` degrees of freedom.
+fn student_t_quantile_magnitude(v: f64, u: f64) -> f64 {
+    use std::f64::consts::{PI, SQRT_2};
+    if v >= 1e20 {
+        // Boost's exact normal quantile: t differs from it by less than ε from here on.
+        return crate::error::boost_erfc_inv(2.0 * u) * SQRT_2;
+    }
+    let w = 1.0 - u;
     if v == 1.0 {
-        let pi_p = std::f64::consts::PI * p;
-        return -pi_p.cos() / pi_p.sin();
+        if u < STDTRIT_DF1_TAN_FROM {
+            let pi_u = PI * u;
+            return pi_u.cos() / pi_u.sin();
+        }
+        return (PI * (0.5 - u)).tan();
     }
-
-    // Use the inverse beta to find z = v/(v+t²)
-    // For p > 0.5: z = btdtri(v/2, 1/2, 2*(1-p))
-    // For p < 0.5: z = btdtri(v/2, 1/2, 2*p)
-    let (z, sign) = if p > 0.5 {
-        (btdtri(0.5 * v, 0.5, 2.0 * (1.0 - p)), 1.0)
+    if v == 2.0 {
+        return (1.0 - 2.0 * u) / (2.0 * u * w).sqrt();
+    }
+    if v == 4.0 {
+        if u < STDTRIT_DF4_STABLE_FROM {
+            let root_alpha = (4.0 * u * w).sqrt();
+            let r = 4.0 * (root_alpha.acos() / 3.0).cos() / root_alpha;
+            return (r - 4.0).sqrt();
+        }
+        // φ = acos(√(4uw)) = asin(1 − 2u), 1 − 2u exact here, and r − 4 = 4(cos(φ/3) − cos φ)/
+        // cos φ = 4·sin(2φ/3)·sin(φ/3)/√(uw) with nothing subtracted.
+        let phi = (1.0 - 2.0 * u).asin();
+        return (4.0 * (2.0 * phi / 3.0).sin() * (phi / 3.0).sin() / (u * w).sqrt()).sqrt();
+    }
+    let beta = student_t_beta_half(0.5 * v);
+    // The leading tail term needs x = (v·B·u)^(2/v) below 2^-60; from v = 3 on that takes
+    // u < 2^-90/(3·B(3/2, 1/2)) ≈ 1.7e-28, so the two logarithms of the test are skipped above.
+    if (v < 3.0 || u < 1e-27)
+        && let Some(t) = student_t_tail_leading(v, u, beta)
+    {
+        return t;
+    }
+    let estimate = if v > 268_435_456.0 {
+        crate::error::boost_erfc_inv(2.0 * u) * SQRT_2
+    } else if v < 3.0 {
+        // B(v/2, 1/2)·√v is Boost's tgamma_delta_ratio(v/2, 1/2)·√(vπ).
+        let b_root_v = beta * v.sqrt();
+        // Boost switches to the body series above u = 0.2742 − 0.0242·v, tuned for 2 ≤ v < 3.
+        // Below v = 1 its tail series stays within 1e-9 up to u ≈ 0.45 while the body series
+        // is off by orders of magnitude, so the switch moves toward the centre as v → 0.
+        if u > 0.5 - 0.17 * v.sqrt() {
+            student_t_body_series(v, u, b_root_v)
+        } else {
+            student_t_tail_series(v, u, b_root_v)
+        }
     } else {
-        (btdtri(0.5 * v, 0.5, 2.0 * p), -1.0)
+        student_t_hill(v, u)
     };
+    let start = if estimate > 0.0 && estimate.is_finite() {
+        estimate
+    } else {
+        // A series that overflowed; the leading tail term is a usable start at any u.
+        student_t_tail_leading_unchecked(v, u, beta)
+    };
+    student_t_halley(v, u, beta, start)
+}
 
-    // z = v/(v+t²) => t² = v*(1-z)/z => t = sign * sqrt(v*(1-z)/z)
-    if z <= 0.0 {
-        return sign * f64::INFINITY;
-    }
-    if z >= 1.0 {
-        return 0.0;
-    }
+/// `√π`, correctly rounded.
+const SQRT_PI: f64 = 1.772_453_850_905_516_027_298_167;
 
-    sign * (v * (1.0 - z) / z).sqrt()
+/// `B(a, 1/2) = √π·Γ(a)/Γ(a + 1/2)`, the normaliser of the t density with `v = 2a`.
+///
+/// Every digit of it counts: in the power-law tail `t ∝ B^(−1/v)`, so its relative error comes
+/// out of `stdtrit` multiplied by `1/v`. Above `a = 0.1` it is `√π` times Boost's Lanczos ratio,
+/// within 9.4e-16 of the exact value (mpmath, 2,800 points over 1e-3..1e8). At and below
+/// `a = 0.1` that 7.8e-16 would become 8e-15 at `v = 0.1`, so there it is
+/// `exp(ln R)/a` with `R(a) = Γ(1 + a)·√π/Γ(1/2 + a)` from its Maclaurin series
+/// `ln R = 2 ln 2·a + Σ_{k≥2} (−1)ᵏ ζ(k)(2 − 2ᵏ)/k·aᵏ` (radius 1/2; at `a ≤ 0.1` the terms
+/// past k = 26 are below 3e-20): within 2.1e-16.
+fn student_t_beta_half(a: f64) -> f64 {
+    if a <= 0.1 {
+        const C: [f64; 25] = [
+            -1.6449340668482264,
+            2.4041138063191885,
+            -3.7881313179889835,
+            6.22156653086022,
+            -10.512544973839308,
+            18.150286992874612,
+            -31.87945605928473,
+            56.780475593477995,
+            -102.301645578063,
+            186.0919190803662,
+            -341.2506231957703,
+            630.0773094089744,
+            -1170.2145262106094,
+            2184.466816943389,
+            -4095.9375942242555,
+            7710.058882793788,
+            -14563.500037382837,
+            27594.0526552217,
+            -52428.75001498929,
+            99864.33334285778,
+            -190650.13636970092,
+            364722.0434821298,
+            -699050.6250024727,
+            1342177.240001583,
+            -2581110.11538563,
+        ];
+        let tail = C.iter().rev().fold(0.0, |acc, &c| acc * a + c);
+        return (a * (2.0 * std::f64::consts::LN_2 + a * tail)).exp() / a;
+    }
+    SQRT_PI * boost_tgamma_half_ratio(a)
+}
+
+/// Boost.Math's `tgamma_delta_ratio(z, 1/2) = Γ(z)/Γ(z + 1/2)`, as
+/// `tgamma_delta_ratio_imp_lanczos_final` runs it for a double on x86-64: lanczos13m53 and its
+/// SSE2 sum, `exp((1/2 − z)·log1p(1/(2·zgh)))·L(z)/L(z + 1/2)·(e/(zgh + 1/2))^(1/2)`, for
+/// `z ≥ ε` (Boost's own branch for smaller `z` is not carried; the caller has `z > 0.1`).
+fn boost_tgamma_half_ratio(z: f64) -> f64 {
+    const LANCZOS_G: f64 = 6.024680040776729583740234375;
+    let zgh = z + LANCZOS_G - 0.5;
+    let mut result = if z + 0.5 == z {
+        (-0.5_f64).exp()
+    } else {
+        ((0.5 - z) * (0.5 / zgh).ln_1p()).exp() * (lanczos13m53_sum(z) / lanczos13m53_sum(z + 0.5))
+    };
+    result *= (std::f64::consts::E / (zgh + 0.5)).powf(0.5);
+    result
+}
+
+/// Boost's `lanczos13m53::lanczos_sum<double>` from `detail/lanczos_sse2.hpp`: the even and odd
+/// coefficients as two Horner chains in `x²` (the two SSE2 lanes) up to `x = 4.31965e25`, a
+/// plain Horner in `1/x` beyond.
+fn lanczos13m53_sum(x: f64) -> f64 {
+    const NUM: [f64; 13] = [
+        23531376880.41075968857200767445163675473,
+        42919803642.64909876895789904700198885093,
+        35711959237.35566804944018545154716670596,
+        17921034426.03720969991975575445893111267,
+        6039542586.35202800506429164430729792107,
+        1439720407.311721673663223072794912393972,
+        248874557.8620541565114603864132294232163,
+        31426415.58540019438061423162831820536287,
+        2876370.628935372441225409051620849613599,
+        186056.2653952234950402949897160456992822,
+        8071.672002365816210638002902272250613822,
+        210.8242777515793458725097339207133627117,
+        2.506628274631000270164908177133837338626,
+    ];
+    const DEN: [f64; 13] = [
+        0.0,
+        39916800.0,
+        120543840.0,
+        150917976.0,
+        105258076.0,
+        45995730.0,
+        13339535.0,
+        2637558.0,
+        357423.0,
+        32670.0,
+        1925.0,
+        66.0,
+        1.0,
+    ];
+    if x > 4.31965e25 {
+        let z = 1.0 / x;
+        let (mut n, mut d) = (NUM[0], DEN[0]);
+        for k in 1..13 {
+            n = n * z + NUM[k];
+            d = d * z + DEN[k];
+        }
+        return n / d;
+    }
+    let x2 = x * x;
+    let (mut even_n, mut even_d) = (NUM[12], DEN[12]);
+    let (mut odd_n, mut odd_d) = (NUM[11], DEN[11]);
+    for k in [10, 8, 6, 4, 2, 0] {
+        even_n = even_n * x2 + NUM[k];
+        even_d = even_d * x2 + DEN[k];
+    }
+    for k in [9, 7, 5, 3, 1] {
+        odd_n = odd_n * x2 + NUM[k];
+        odd_d = odd_d * x2 + DEN[k];
+    }
+    (even_n + odd_n * x) / (even_d + odd_d * x)
+}
+
+/// `|t|` from the tail's leading term, when that term is exact to double precision.
+///
+/// `I_x(a, 1/2) = xᵃ/(a·B(a, 1/2))·(1 + O(x))` with `a = v/2` and `x = v/(v + t²)`, so
+/// `F(−t) = u` puts `x` at `x₀ = (v·B·u)^(2/v)` and `t = √(v(1 − x)/x)` at `√v·(v·B·u)^(−1/v)`.
+/// The neglected terms move `ln x` by `x/v` and `(1 − x)` moves `t` by `x/2`, so with
+/// `x₀ < 2⁻⁶⁰·min(v, 1)` the term is `t` to within `2⁻⁶¹`. `None` otherwise.
+fn student_t_tail_leading(v: f64, u: f64, beta: f64) -> Option<f64> {
+    let ln_x0 = (2.0 / v) * ((v * beta).ln() + u.ln());
+    if !(ln_x0 < -60.0 * std::f64::consts::LN_2 + v.ln().min(0.0)) {
+        return None;
+    }
+    Some(student_t_tail_leading_unchecked(v, u, beta))
+}
+
+/// `√v·(v·B(v/2, 1/2))^(−1/v)·u^(−1/v)`, `+inf` when it is past `f64::MAX`.
+///
+/// `1/v` is carried as `e_hi + e_lo`: the rounding of `1/v` alone, multiplied by `|ln u|`
+/// (690 at `u = 1e-300`), would be an error of 8e-14/v in `u^(−1/v)`.
+fn student_t_tail_leading_unchecked(v: f64, u: f64, beta: f64) -> f64 {
+    let ln_vb = (v * beta).ln();
+    let e_hi = 1.0 / v;
+    let e_lo = (-e_hi).mul_add(v, 1.0) / v;
+    let ln_u = u.ln();
+    // scale holds about 2^(−1/v): below v ≈ 1e-3 it leaves the normal range, and a subnormal
+    // scale keeps too few digits (at v = 9.5e-4 it made t 7e-6 off), so it goes to the log.
+    let scale = v.sqrt() * (-ln_vb * e_hi - ln_vb * e_lo).exp();
+    if scale >= f64::MIN_POSITIVE {
+        let t = scale * (u.powf(-e_hi) * (-e_lo * ln_u).exp());
+        if t.is_finite() {
+            return t;
+        }
+        // u^(−1/v) alone overflowed while scale < 1 may bring the product back: take it as
+        // the square of u^(−1/(2v)) (e_hi/2 is exact) and multiply one factor at a time.
+        let half = u.powf(-0.5 * e_hi) * (-0.5 * e_lo * ln_u).exp();
+        let t = scale * half * half;
+        if t.is_finite() {
+            return t;
+        }
+    }
+    // The logarithm: its error, 2ε/v from ln(v·B) + ln u and ε·|ln t| from the exponential,
+    // is about what the 1/v conditioning already allows once v is below 1e-3.
+    let ln_t = 0.5 * v.ln() - (ln_vb + ln_u) * (e_hi + e_lo);
+    if ln_t < f64::MAX.ln() {
+        ln_t.exp()
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Boost's `inverse_students_t_hill` (G. W. Hill, CACM Algorithm 396), as a magnitude, with its
+/// `float` constants widened as C++ widens them.
+fn student_t_hill(ndf: f64, u: f64) -> f64 {
+    let a = 1.0 / (ndf - 0.5);
+    let b = 48.0 / (a * a);
+    let mut c = ((20700.0 * a / b - 98.0) * a - 16.0) * a + f64::from(96.36_f32);
+    let d = ((94.5 / (b + c) - 3.0) / b + 1.0) * (a * std::f64::consts::PI / 2.0).sqrt() * ndf;
+    let mut y = (d * 2.0 * u).powf(2.0 / ndf);
+    if y > f64::from(0.05_f32) + a {
+        // Asymptotic inverse expansion about the normal quantile x (negative, as in Boost).
+        let x = -crate::error::boost_erfc_inv(2.0 * u) * std::f64::consts::SQRT_2;
+        y = x * x;
+        if ndf < 5.0 {
+            c += f64::from(0.3_f32) * (ndf - 4.5) * (x + f64::from(0.6_f32));
+        }
+        c += (((f64::from(0.05_f32) * d * x - 5.0) * x - 7.0) * x - 2.0) * x + b;
+        y = (((((f64::from(0.4_f32) * y + f64::from(6.3_f32)) * y + 36.0) * y + 94.5) / c
+            - y
+            - 3.0)
+            / b
+            + 1.0)
+            * x;
+        y = (a * y * y).exp_m1();
+    } else {
+        y = ((1.0
+            / (((ndf + 6.0) / (ndf * y) - f64::from(0.089_f32) * d - f64::from(0.822_f32))
+                * (ndf + 2.0)
+                * 3.0)
+            + 0.5 / (ndf + 4.0))
+            * y
+            - 1.0)
+            * (ndf + 1.0)
+            / (ndf + 2.0)
+            + 1.0 / y;
+    }
+    (ndf * y).sqrt()
+}
+
+/// Shaw's body series (Boost's `inverse_students_t_body_series`), as a magnitude: an odd
+/// polynomial in `z = B(v/2, 1/2)·√v·(1/2 − u)`.
+fn student_t_body_series(v: f64, u: f64, b_root_v: f64) -> f64 {
+    let z = b_root_v * (0.5 - u);
+    let i = 1.0 / v;
+    let c = [
+        1.0,
+        0.16666666666666666667 + 0.16666666666666666667 * i,
+        (0.0083333333333333333333 * i + 0.066666666666666666667) * i + 0.058333333333333333333,
+        ((0.00019841269841269841270 * i + 0.0017857142857142857143) * i + 0.026785714285714285714)
+            * i
+            + 0.025198412698412698413,
+        (((2.7557319223985890653e-6 * i + 0.00037477954144620811287) * i
+            - 0.0011078042328042328042)
+            * i
+            + 0.010559964726631393298)
+            * i
+            + 0.012039792768959435626,
+        ((((2.5052108385441718775e-8 * i - 0.000062705427288760622094) * i
+            + 0.00059458674042007375341)
+            * i
+            - 0.0016095979637646304313)
+            * i
+            + 0.0061039211560044893378)
+            * i
+            + 0.0038370059724226390893,
+        (((((1.6059043836821614599e-10 * i + 0.000015401265401265401265) * i
+            - 0.00016376804137220803887)
+            * i
+            + 0.00069084207973096861986)
+            * i
+            - 0.0012579159844784844785)
+            * i
+            + 0.0010898206731540064873)
+            * i
+            + 0.0032177478835464946576,
+        ((((((7.6471637318198164759e-13 * i - 3.9851014346715404916e-6) * i
+            + 0.000049255746366361445727)
+            * i
+            - 0.00024947258047043099953)
+            * i
+            + 0.00064513046951456342991)
+            * i
+            - 0.00076245135440323932387)
+            * i
+            + 0.000033530976880017885309)
+            * i
+            + 0.0017438262298340009980,
+        (((((((2.8114572543455207632e-15 * i + 1.0914179173496789432e-6) * i
+            - 0.000015303004486655377567)
+            * i
+            + 0.000090867107935219902229)
+            * i
+            - 0.00029133414466938067350)
+            * i
+            + 0.00051406605788341121363)
+            * i
+            - 0.00036307660358786885787)
+            * i
+            - 0.00031101086326318780412)
+            * i
+            + 0.00096472747321388644237,
+        ((((((((8.2206352466243297170e-18 * i - 3.1239569599829868045e-7) * i
+            + 4.8903045291975346210e-6)
+            * i
+            - 0.000033202652391372058698)
+            * i
+            + 0.00012645437628698076975)
+            * i
+            - 0.00028690924218514613987)
+            * i
+            + 0.00035764655430568632777)
+            * i
+            - 0.00010230378073700412687)
+            * i
+            - 0.00036942667800009661203)
+            * i
+            + 0.00054229262813129686486,
+    ];
+    let z2 = z * z;
+    z * c.iter().rev().fold(0.0, |acc, &ck| acc * z2 + ck)
+}
+
+/// Shaw's tail series (Boost's `inverse_students_t_tail_series`), as a magnitude.
+fn student_t_tail_series(v: f64, u: f64, b_root_v: f64) -> f64 {
+    let w = b_root_v * u;
+    let mut np2 = v + 2.0;
+    let mut np4 = v + 4.0;
+    let mut np6 = v + 6.0;
+    let mut d = [1.0; 7];
+    d[1] = -(v + 1.0) / (2.0 * np2);
+    np2 *= v + 2.0;
+    d[2] = -v * (v + 1.0) * (v + 3.0) / (8.0 * np2 * np4);
+    np2 *= v + 2.0;
+    d[3] = -v * (v + 1.0) * (v + 5.0) * (((3.0 * v) + 7.0) * v - 2.0) / (48.0 * np2 * np4 * np6);
+    np2 *= v + 2.0;
+    np4 *= v + 4.0;
+    d[4] = -v
+        * (v + 1.0)
+        * (v + 7.0)
+        * (((((15.0 * v + 154.0) * v + 465.0) * v + 286.0) * v - 336.0) * v + 64.0)
+        / (384.0 * np2 * np4 * np6 * (v + 8.0));
+    np2 *= v + 2.0;
+    d[5] = -v
+        * (v + 1.0)
+        * (v + 3.0)
+        * (v + 9.0)
+        * ((((((35.0 * v + 452.0) * v + 1573.0) * v + 600.0) * v - 2020.0) * v + 928.0) * v
+            - 128.0)
+        / (1280.0 * np2 * np4 * np6 * (v + 8.0) * (v + 10.0));
+    np2 *= v + 2.0;
+    np4 *= v + 4.0;
+    np6 *= v + 6.0;
+    d[6] = -v
+        * (v + 1.0)
+        * (v + 11.0)
+        * (((((((((((945.0 * v + 31506.0) * v + 425858.0) * v + 2980236.0) * v + 11266745.0)
+            * v
+            + 20675018.0)
+            * v
+            + 7747124.0)
+            * v
+            - 22574632.0)
+            * v
+            - 8565600.0)
+            * v
+            + 18108416.0)
+            * v
+            - 7099392.0)
+            * v
+            + 884736.0)
+        / (46080.0 * np2 * np4 * np6 * (v + 8.0) * (v + 10.0) * (v + 12.0));
+    let rn = v.sqrt();
+    let div = (rn * w).powf(1.0 / v);
+    let power = div * div;
+    let series = d.iter().rev().fold(0.0, |acc, &dk| acc * power + dk);
+    series * rn / div
+}
+
+/// Halley's method for `|t|` from `start` on `F(−s) = u`, where `F(−s) = I_x(a, 1/2)/2` with
+/// `a = v/2`, `x = v/(v + s²)`, `y = s²/(v + s²)`, and `beta = B(a, 1/2)`.
+///
+/// For `u ≥ 1/4` the residual is `F − u`, taken as `(1/2 − u) − J/2` with `J = I_y(1/2, a) =
+/// 1 − 2F` wherever `J` is the side computed directly: `1/2 − u` is exact, so the residual
+/// keeps its digits as `s → 0` (SciPy's `F − p` is rounding there). Below `u = 1/4` it is
+/// `G = ln(F/u)`, solved with `G' = −h` and `G'' = −h(h − q)`, where `h = f/F` is the hazard,
+/// `f` the density and `q = −f'/f = s(v + 1)/(v + s²)`: in logs the power-law tail is nearly
+/// linear, and nothing underflows at `u = 1e-300` (SciPy's density does).
+///
+/// `F`, or `J`, comes from the form that keeps its digits at `s`:
+/// - `x ≤ 1/2`: `I_x(a, 1/2) = xᵃ/(aB)·(1 + a·Σ cₙ/(a + n))`, `cₙ = cₙ₋₁·(1 − 1/(2n))·x`, with
+///   `xᵃ` from `powf`, one rounding, and `h = v/(√(v + s²)·(1 + a·Σ))` in closed form. TOMS 708
+///   forms `xᵃ` as `exp(a·ln x)`, which carries `ε·|a·ln x|`: 7e-14 at `F = 1e-300`.
+/// - `u ≥ 1/4`, `y ≤ 1/2` and `a·y ≤ 1`: `J = 2·√y/B·(1 + Σ dₙ/(2n + 1))`,
+///   `dₙ = dₙ₋₁·(1 − a/n)·y`, which keeps its digits as `s → 0` where TOMS 708's
+///   `exp(½·ln y − …)` carries `ε·|½·ln y|`, 4e-15 at `s = 1e-15`. `a·y ≤ 1` bounds every term
+///   of the alternating sum by 1. Below `u = 1/4`, `F = (1 − J)/2` would lose `J/(1 − J)` of
+///   its digits to the subtraction, so the tail form computes `F` itself:
+/// - `u < 1/4`, `x > 1/2` and `a ≥ 15`: Temme's expansion (TOMS 708's BGRAT) with an accurate
+///   front factor, [`student_t_lower_bgrat`].
+/// - Otherwise TOMS 708's `bratio`, which returns `I` and `1 − I` (neither small there), and
+///   the density from `ln_brcomp`.
+fn student_t_halley(v: f64, u: f64, beta: f64, start: f64) -> f64 {
+    let a = 0.5 * v;
+    let centre = u >= 0.25;
+    let ln_u = if centre { 0.0 } else { u.ln() };
+    let halley_abs = |p0: f64, density: f64, q: f64| p0 / (density - 0.5 * p0 * q);
+    let halley_log = |g: f64, hazard: f64, q: f64| g / (hazard + 0.5 * g * (hazard - q));
+    let mut s = start;
+    for _ in 0..STDTRIT_HALLEY_MAX {
+        let s2 = s * s;
+        let (x, y, q, root) = if s2.is_finite() {
+            let d = v + s2;
+            (v / d, s2 / d, s * (v + 1.0) / d, d.sqrt())
+        } else {
+            let r = (v / s) / s;
+            (r / (1.0 + r), 1.0 / (1.0 + r), (v + 1.0) / s, s)
+        };
+        let step = if x <= 0.5 {
+            let series = 1.0 + a * student_t_x_series(a, x);
+            let hazard = v / (root * series);
+            let lower = x.powf(a) * series / (v * beta);
+            if centre {
+                halley_abs(lower - u, hazard * lower, q)
+            } else {
+                let g = if lower > 1e-300 {
+                    ((lower - u) / u).ln_1p()
+                } else {
+                    // xᵃ underflowed: only a subnormal u is down here.
+                    a * x.ln() + series.ln() - (v * beta).ln() - ln_u
+                };
+                halley_log(g, hazard, q)
+            }
+        } else if centre && y <= 0.5 && a * y <= 1.0 {
+            let j = 2.0 * (s / root) / beta * (1.0 + student_t_y_series(a, y));
+            let density = (a * (-y).ln_1p()).exp() / (beta * root);
+            halley_abs((0.5 - u) - 0.5 * j, density, q)
+        } else if !centre && a >= 15.0 {
+            let (lower, ln_lower) = student_t_lower_bgrat(a, y, beta);
+            let g = if lower > 1e-300 {
+                ((lower - u) / u).ln_1p()
+            } else {
+                ln_lower - ln_u
+            };
+            let ln_density = crate::bratio::ln_brcomp(a, 0.5, x, y) - s.ln();
+            halley_log(g, (ln_density - ln_lower).exp(), q)
+        } else {
+            // x > 1/2 with a·y > 1 near the centre, or with a < 15 in the tail. Neither side of I
+            // is small here (near the centre 2F ≥ 2u ≥ 1/2; in the tail xᵃ > 2^-15), so neither
+            // loses digits to bratio's exp(a·ln x) or underflows.
+            let (w, w1) = crate::bratio::bratio(a, 0.5, x, y);
+            let density = (crate::bratio::ln_brcomp(a, 0.5, x, y) - s.ln()).exp();
+            if centre {
+                halley_abs((0.5 - u) - 0.5 * w1, density, q)
+            } else {
+                let lower = 0.5 * w;
+                halley_log(((lower - u) / u).ln_1p(), density / lower, q)
+            }
+        };
+        if !step.is_finite() {
+            break;
+        }
+        let next = s + step;
+        let done = step.abs() <= STDTRIT_HALLEY_STOP * s;
+        s = if next > 0.0 { next } else { 0.5 * s };
+        if done || !s.is_finite() {
+            break;
+        }
+    }
+    s
+}
+
+/// `Σ_{n≥1} cₙ/(a + n)` with `cₙ = cₙ₋₁·(1 − 1/(2n))·x`, `c₀ = 1`: TOMS 708's BPSER sum for
+/// `I_x(a, 1/2)`. Its terms are positive and fall at least as fast as `xⁿ`.
+fn student_t_x_series(a: f64, x: f64) -> f64 {
+    let mut sum = 0.0;
+    let mut c = 1.0;
+    let mut n = 0.0;
+    loop {
+        n += 1.0;
+        c *= (1.0 - 0.5 / n) * x;
+        let term = c / (a + n);
+        sum += term;
+        if a * term <= 1e-17 * (1.0 + a * sum) || n >= 200.0 {
+            return sum;
+        }
+    }
+}
+
+/// `F(−s) = I_x(a, 1/2)/2` for `x = 1 − y > 1/2` and `a ≥ 15`, with its logarithm, by Temme's
+/// uniform expansion as TOMS 708's BGRAT sums it: `I_x(a, b) = Γ(a + b)/(Γ(a)·νᵇ)·Q(b, z)·Σ/J₀`
+/// with `ν = a + (b − 1)/2`, `z = −ν·ln x`, and at `b = 1/2`, `Q(1/2, z) = erfc(√z)`.
+///
+/// `bratio` sums the same expansion (and BPSER nearer the centre) but forms its front factor as
+/// `exp(−(algdiv(1/2, a) + ½·ln ν))`, two terms of size `½·ln a` that cancel, and BPSER's as
+/// `exp(½·ln y − …)` the same way: at `v = 7e7` that left `stdtrit` 3.2e-15 off for `u` in
+/// 0.1..0.25. Here `Γ(a + 1/2)/Γ(a) = √π/B(a, 1/2)` comes from the Lanczos ratio and `erfc(√z)`
+/// from the Cephes kernel, each a few ulp, and the error is 1.5e-15 at most.
+fn student_t_lower_bgrat(a: f64, y: f64, beta: f64) -> (f64, f64) {
+    let lnx = (-y).ln_1p();
+    let nu = a - 0.25;
+    let z = -nu * lnx;
+    let root_z = z.sqrt();
+    // J₀ = Q(1/2, z)/r with r = √(z/π)·e^(−z), so J₀ = e^z·erfc(√z)·√(π/z).
+    let scaled = crate::bratio::erfc1(true, root_z);
+    let j0 = scaled * (std::f64::consts::PI / z).sqrt();
+    let ratio =
+        crate::bratio::bgrat_sum(0.5, z, lnx, nu, j0, 0.0, 1e-17).map_or(f64::NAN, |sum| sum / j0);
+    let front = 0.5 * ratio * SQRT_PI / (beta * nu.sqrt());
+    // erfc itself from the Cephes kernel: TOMS's erfc1 has 15-digit coefficients and is up to
+    // 1.3e-15 off on [0.5, 1] and 2.3e-15 on [2, 4] (mpmath, 2,000 points each). Its scaled
+    // form only enters J₀ (and through it Σ/J₀ − 1, below 1e-12 here) and the log below
+    // 1e-300, where the hazard is about s and the error in t is that of F divided by s².
+    let lower = crate::error::erfc_scalar(root_z) * front;
+    (lower, (scaled * front).ln() - z)
+}
+
+/// `Σ_{n≥1} dₙ/(2n + 1)` with `dₙ = dₙ₋₁·(1 − a/n)·y`, `d₀ = 1`: BPSER's sum for
+/// `I_y(1/2, a)`. It alternates once `a > 1`; `a·y ≤ 1` keeps every term below 1. Once a
+/// factor `1 − a/n` is small, every later term carries it, so a small term ends the sum.
+fn student_t_y_series(a: f64, y: f64) -> f64 {
+    let mut sum = 0.0;
+    let mut d = 1.0;
+    let mut n = 0.0;
+    loop {
+        n += 1.0;
+        d *= (1.0 - a / n) * y;
+        let term = d / (2.0 * n + 1.0);
+        sum += term;
+        if term.abs() <= 1e-17 * (1.0 + sum).abs() || n >= 200.0 {
+            return sum;
+        }
+    }
 }
 
 /// Vectorized inverse Student's-t CDF `stdtrit(v, p)` over many probabilities
@@ -4476,6 +5057,241 @@ mod tests {
         assert!(stdtrit(5.0, 0.0).is_infinite() && stdtrit(5.0, 0.0).is_sign_positive());
         assert!(stdtrit(5.0, 1.0).is_infinite() && stdtrit(5.0, 1.0).is_sign_positive());
         assert!((stdtrit(5.0, 0.5) - 0.0).abs() < 1e-10);
+    }
+
+    /// `stdtrit(v, p)` with both arguments behind `black_box`, so no case folds at compile time.
+    fn stdtrit_opaque(v: f64, p: f64) -> f64 {
+        stdtrit(std::hint::black_box(v), std::hint::black_box(p))
+    }
+
+    #[test]
+    fn stdtrit_edges_are_scipys() {
+        // SciPy 1.17.1: Boost's overflow error at p = 0 and p = 1 becomes +inf on both sides;
+        // p = 1/2 is +0; NaN, v <= 0 (including -0) and p outside [0, 1] are NaN.
+        for (v, p) in [(5.0, 0.0), (5.0, -0.0), (5.0, 1.0), (0.3, 0.0), (1e30, 1.0)] {
+            assert_eq!(stdtrit_opaque(v, p), f64::INFINITY, "stdtrit({v}, {p})");
+        }
+        for v in [0.05, 1.0, 4.0, 7.0, 1e25, f64::INFINITY] {
+            assert_eq!(
+                stdtrit_opaque(v, 0.5).to_bits(),
+                0.0_f64.to_bits(),
+                "v = {v}"
+            );
+        }
+        for (v, p) in [
+            (f64::NAN, 0.3),
+            (5.0, f64::NAN),
+            (0.0, 0.3),
+            (-0.0, 0.3),
+            (-1.0, 0.3),
+            (5.0, -0.1),
+            (5.0, 1.1),
+        ] {
+            assert!(stdtrit_opaque(v, p).is_nan(), "stdtrit({v}, {p})");
+        }
+    }
+
+    #[test]
+    fn stdtrit_closed_forms_are_scipys_bits() {
+        // SciPy 1.17.1's own values where Boost's estimate is exact and accurate: v = 1 below
+        // u = min(p, 1 - p) = 0.35, v = 2, v = 4 below u = 0.15, and the normal quantile from
+        // v = 1e20 (frankenscipy-eiqnk). Each is within 2.1e-16 of the exact quantile.
+        let cases: [(f64, f64, f64); 38] = [
+            (1.0, 1e-300, -3.183098861837907e+299),
+            (1.0, 1e-12, -318309886183.7907),
+            (1.0, 0.001, -318.30883898555044),
+            (1.0, 0.05, -6.313751514675044),
+            (1.0, 0.2, -1.3763819204711736),
+            (1.0, 0.3, -0.7265425280053609),
+            (1.0, 0.34, -0.5497546521927699),
+            (1.0, 0.7, 0.7265425280053608),
+            (1.0, 0.8, 1.3763819204711738),
+            (1.0, 0.999999, 318309.88617359026),
+            (2.0, 1e-300, -7.071067811865475e+149),
+            (2.0, 1e-09, -22360.679741456875),
+            (2.0, 0.01, -6.964556734283274),
+            (2.0, 0.3, -0.6172133998483678),
+            (2.0, 0.4999999, -2.8284271248275796e-07),
+            (2.0, 0.500000000001, 2.828364555072952e-12),
+            (2.0, 0.9, 1.8856180831641272),
+            (2.0, 0.999999999999, 707114.602524408),
+            (4.0, 1e-300, -1.3160740129524924e+75),
+            (4.0, 1e-09, -234.02761040611892),
+            (4.0, 0.01, -3.746947387979197),
+            (4.0, 0.1, -1.5332062740589436),
+            (4.0, 0.14, -1.2482977903919314),
+            (4.0, 0.87, 1.3111779582625098),
+            (4.0, 0.95, 2.1318467863266495),
+            (4.0, 0.9999999999999, 2340.164712534563),
+            (1e20, 1e-300, -37.04709629936121),
+            (1e20, 1e-07, -5.199337582192817),
+            (1e20, 0.3, -0.5244005127080409),
+            (1e20, 0.499999999999999, -2.5046247822045905e-15),
+            (1e20, 0.500000001, 2.506628203738712e-09),
+            (1e20, 0.975, 1.9599639845400538),
+            (1e300, 0.01, -2.3263478740408408),
+            (1e300, 0.6, 0.2533471031357998),
+            (f64::INFINITY, 1e-100, -21.273453560965326),
+            (f64::INFINITY, 0.25, -0.6744897501960818),
+            (f64::INFINITY, 0.75, 0.6744897501960818),
+            (2.0, 0.7, 0.6172133998483674),
+        ];
+        let misses: Vec<String> = cases
+            .iter()
+            .filter_map(|&(v, p, want)| {
+                let got = stdtrit_opaque(v, p);
+                (got.to_bits() != want.to_bits())
+                    .then(|| format!("stdtrit({v:e}, {p:e}) = {got:e}, SciPy {want:e}"))
+            })
+            .collect();
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    /// Relative error of `got` against the exact quantile; an infinite `want` must match exactly.
+    fn stdtrit_rel_err(got: f64, want: f64) -> f64 {
+        if want.is_infinite() {
+            return if got == want { 0.0 } else { f64::INFINITY };
+        }
+        if got.is_finite() {
+            ((got - want) / want).abs()
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    #[test]
+    fn stdtrit_near_one_half_is_the_exact_quantile() {
+        // mpmath quantiles at 60 digits, rounded once. SciPy 1.17.1 misses these by up to
+        // 1e-2 (v = 1), 1 (v = 4 and v = 6, where it returns 0), 9e-9 (v = 5), 1.1e-13 (v = 30)
+        // and 2.5e-10 (v = 1e9): its one Halley step forms F - p, which is rounding once t is
+        // small, and its v = 1 and v = 4 closed forms cancel. The old fsci returned 0 within
+        // 1e-15 of 1/2 and was 4.8e-3 off at v = 30, p = 1/2 + 1e-7.
+        let cases: [(f64, f64, f64); 45] = [
+            (1.0, 0.501, 0.003141602989056159),
+            (1.0, 0.4999999, -3.141592653680235e-07),
+            (1.0, 0.50000000001, 3.141592913526335e-11),
+            (1.0, 0.4999999999999, -3.140825582456773e-13),
+            (1.0, 0.500000000000001, 3.1390816482077686e-15),
+            (1.5, 0.501, 0.002934839237205688),
+            (1.5, 0.4999999, -2.934832215485126e-07),
+            (1.5, 0.50000000001, 2.9348324582297685e-11),
+            (1.5, 0.4999999999999, -2.9341156282039996e-13),
+            (1.5, 0.500000000000001, 2.9324864690545253e-15),
+            (3.0, 0.501, 0.002720703521734023),
+            (3.0, 0.4999999, -2.720699046429607e-07),
+            (3.0, 0.50000000001, 2.7206992714629754e-11),
+            (3.0, 0.4999999999999, -2.7200347432636215e-13),
+            (3.0, 0.500000000000001, 2.718524451901454e-15),
+            (4.0, 0.501, 0.0026666706172941367),
+            (4.0, 0.4999999, -2.666666666743388e-07),
+            (4.0, 0.50000000001, 2.666666887307656e-11),
+            (4.0, 0.4999999999999, -2.6660155564665427e-13),
+            (4.0, 0.500000000000001, 2.6645352591003757e-15),
+            (5.0, 0.501, 0.002634309180336605),
+            (5.0, 0.4999999, -2.63430552421606e-07),
+            (5.0, 0.50000000001, 2.6343057421036887e-11),
+            (5.0, 0.4999999999999, -2.633662315441393e-13),
+            (5.0, 0.500000000000001, 2.6321999821179946e-15),
+            (6.0, 0.501, 0.0026127925272127605),
+            (6.0, 0.4999999, -2.6127890590438906e-07),
+            (6.0, 0.50000000001, 2.6127892751518595e-11),
+            (6.0, 0.4999999999999, -2.6121511038660733e-13),
+            (6.0, 0.500000000000001, 2.6107007145801953e-15),
+            (30.0, 0.501, 0.002527603007215139),
+            (30.0, 0.4999999, -2.5276002261960695e-07),
+            (30.0, 0.50000000001, 2.5276004352579393e-11),
+            (30.0, 0.4999999999999, -2.5269830712649596e-13),
+            (30.0, 0.500000000000001, 2.5255799712809144e-15),
+            (1000.0, 0.501, 0.0025072576394709746),
+            (1000.0, 0.4999999, -2.5072550100059754e-07),
+            (1000.0, 0.50000000001, 2.5072552173850608e-11),
+            (1000.0, 0.4999999999999, -2.506642822692121e-13),
+            (1000.0, 0.500000000000001, 2.5052510165718034e-15),
+            (1e9, 0.501, 0.002506630900198428),
+            (1e9, 0.4999999, -2.5066282753297635e-07),
+            (1e9, 0.50000000001, 2.506628482657011e-11),
+            (1e9, 0.4999999999999, -2.50601624104343e-13),
+            (1e9, 0.500000000000001, 2.5046247828307465e-15),
+        ];
+        let misses: Vec<String> = cases
+            .iter()
+            .filter_map(|&(v, p, want)| {
+                let got = stdtrit_opaque(v, p);
+                let err = stdtrit_rel_err(got, want);
+                (err > 1.5e-15).then(|| {
+                    format!("stdtrit({v:e}, {p}) = {got:e}, exact {want:e}, rel err {err:.1e}")
+                })
+            })
+            .collect();
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    #[test]
+    fn stdtrit_tails_are_the_exact_quantile() {
+        // mpmath quantiles at 60 digits, rounded once. SciPy 1.17.1 returns +inf (the sign
+        // lost too) for v = 2.5, 3 and 5 at p = 1e-300, where its Halley step's density
+        // underflows, and saturates near 1e154 for v < 2 (v = 1.5 at 1e-300: 8.2e153 for
+        // 5.2e199). v = 0.3 below 1e-100 is past f64::MAX: -inf. In the power-law tail t goes as
+        // F^(-1/v), so a rounding in F is multiplied by 1/v: the bound scales with max(1, 1/v).
+        // The last row is the leading tail term at v < 1e-3, where (v·B)^(-1/v) is subnormal.
+        let cases: [(f64, f64, f64); 41] = [
+            (0.3, 1e-300, f64::NEG_INFINITY),
+            (0.3, 1e-100, f64::NEG_INFINITY),
+            (0.3, 1e-20, -1.3958120070683056e+65),
+            (0.3, 1e-05, -1395812007068299.0),
+            (0.3, 0.9999999999, 6.478783638974156e+31),
+            (1.5, 1e-300, -5.219469427344636e+199),
+            (1.5, 1e-100, -2.422663101134615e+66),
+            (1.5, 1e-20, -11245005997832.137),
+            (1.5, 1e-05, -1124.5001233812075),
+            (1.5, 0.9999999999, 2422662.9674997074),
+            (2.5, 1e-300, -8.765437882279991e+119),
+            (2.5, 1e-100, -8.765437882279991e+39),
+            (2.5, 1e-20, -87654378.8227999),
+            (2.5, 1e-05, -87.64328685666187),
+            (2.5, 0.9999999999, 8765.437481262352),
+            (3.0, 1e-300, -1.033110836044653e+100),
+            (3.0, 1e-100, -2.225769823822442e+33),
+            (3.0, 1e-20, -4795275.720468973),
+            (3.0, 1e-05, -47.927728375933924),
+            (3.0, 0.9999999999, 2225.769223296075),
+            (5.0, 1e-300, -1.5683925590993378e+60),
+            (5.0, 1e-100, -1.5683925590993378e+20),
+            (5.0, 1e-20, -15683.925454365775),
+            (5.0, 1e-05, -15.546854534954756),
+            (5.0, 0.9999999999, 156.8255901132807),
+            (30.0, 1e-300, -50178575360.50508),
+            (30.0, 1e-100, -10810.645001143976),
+            (30.0, 1e-20, -22.658878371940183),
+            (30.0, 1e-05, -5.054032421446494),
+            (30.0, 0.9999999999, 9.377489746079775),
+            (1000.0, 1e-300, -54.291388553051746),
+            (1000.0, 1e-100, -23.930617087826445),
+            (1000.0, 1e-20, -9.467044815255925),
+            (1000.0, 1e-05, -4.285437682652958),
+            (1000.0, 0.9999999999, 6.427876270033028),
+            (1e8, 1e-300, -37.047223509020284),
+            (1e8, 1e-100, -21.273477682947938),
+            (1e8, 1e-20, -9.262342099516875),
+            (1e8, 1e-05, -4.264890998523436),
+            (1e8, 0.9999999999, 6.3613415491563465),
+            (
+                0.000950173833991285,
+                0.5294493946518161,
+                8.593961085524128e25,
+            ),
+        ];
+        let misses: Vec<String> = cases
+            .iter()
+            .filter_map(|&(v, p, want)| {
+                let got = stdtrit_opaque(v, p);
+                let err = stdtrit_rel_err(got, want);
+                (err > 1.5e-15 * v.recip().max(1.0)).then(|| {
+                    format!("stdtrit({v:e}, {p:e}) = {got:e}, exact {want:e}, rel err {err:.1e}")
+                })
+            })
+            .collect();
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
     }
 
     #[test]

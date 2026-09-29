@@ -655,7 +655,16 @@ fn bgrat(a: f64, b: f64, x: f64, y: f64, w: f64, eps: f64) -> f64 {
 
 /// [`bgrat`]'s expansion `Σ dₙ·Jₙ`, from `J₀ = Q(b, z)/r` and with `l = w/u` in the stopping
 /// test; `None` where the sum turns non-positive and cdflib gives up on the expansion.
-fn bgrat_sum(b: f64, z: f64, lnx: f64, nu: f64, j0: f64, l: f64, eps: f64) -> Option<f64> {
+/// `stdtrit` sums it too, with its own prefactor (frankenscipy-eiqnk).
+pub(crate) fn bgrat_sum(
+    b: f64,
+    z: f64,
+    lnx: f64,
+    nu: f64,
+    j0: f64,
+    l: f64,
+    eps: f64,
+) -> Option<f64> {
     let mut c = [0.0_f64; 30];
     let mut d = [0.0_f64; 30];
     let bm1 = (b - 0.5) - 0.5;
@@ -1219,7 +1228,7 @@ fn erf(x: f64) -> f64 {
 }
 
 /// `erfc(x)`, or `e^(x²)·erfc(x)` when `scaled`.
-fn erfc1(scaled: bool, x: f64) -> f64 {
+pub(crate) fn erfc1(scaled: bool, x: f64) -> f64 {
     let c = 0.564189583547756;
     const A: [f64; 5] = [
         0.771058495001320e-04,
