@@ -6006,19 +6006,36 @@ pub fn log_ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_wg("log_ndtr", x_tensor, mode, |x| Ok(log_ndtr_scalar(x)))
 }
 
+/// The SIMD path takes [`log_ndtr_scalar`]'s two branches lane by lane. For `x ≥ −1` that is
+/// `log1p(−erfc(x/√2)/2)`, SciPy's form. The path once took `ln(erfc(−x/√2)/2)` for every
+/// `x ≥ −8`, which is `ln Φ(x)` with Φ(x) rounded toward 1. It returned 0 from about x = 8.5
+/// where the answer is −Φ(−x) (log_ndtr(10) = −7.6e-24), and lost digits from x ≈ 1. The
+/// scalar kernel's fix (frankenscipy-08o4z) never reached this duplicate, so tensors of 64 to
+/// 2^20 elements kept it (frankenscipy-iulu0).
 fn log_ndtr_real_vec_simd(values: &[f64]) -> Vec<f64> {
     use std::simd::Simd;
     const LANES: usize = 8;
-    let scale = Simd::<f64, LANES>::splat(-FRAC_1_SQRT_2);
     let mut out = vec![0.0f64; values.len()];
     let mut i = 0;
     while i + LANES <= values.len() {
         let x = Simd::<f64, LANES>::from_slice(&values[i..i + LANES]);
         let lanes = x.to_array();
         if lanes.iter().all(|x| x.is_finite() && *x >= -8.0) {
-            let erfc = crate::error::erfc_full_simd_chunk(x * scale);
+            // erfc(x/√2) = 2Φ(−x) where x ≥ −1, erfc(−x/√2) = 2Φ(x) below.
+            let u = lanes.map(|v| {
+                if v >= -1.0 {
+                    v * FRAC_1_SQRT_2
+                } else {
+                    -v * FRAC_1_SQRT_2
+                }
+            });
+            let erfc = crate::error::erfc_full_simd_chunk(Simd::from_array(u));
             for j in 0..LANES {
-                out[i + j] = (0.5 * erfc[j]).ln();
+                out[i + j] = if lanes[j] >= -1.0 {
+                    (-(0.5 * erfc[j])).ln_1p()
+                } else {
+                    (0.5 * erfc[j]).ln()
+                };
             }
         } else {
             for j in 0..LANES {
@@ -9822,13 +9839,48 @@ mod tests {
             if expected.is_nan() {
                 assert!(simd[k].is_nan(), "log_ndtr simd preserved NaN at {x}");
             } else {
-                max_abs = max_abs.max((simd[k] - expected).abs());
+                // RELATIVE: an absolute 1e-12 passed the SIMD path's 0 against the scalar
+                // -1.8e-33 at x = 12 (frankenscipy-iulu0).
+                let rel = (simd[k] - expected).abs() / expected.abs().max(f64::MIN_POSITIVE);
+                max_abs = max_abs.max(rel);
             }
         }
         assert!(
-            max_abs < 1e-12,
-            "log_ndtr simd max abs diff vs scalar = {max_abs:e}"
+            max_abs < 1e-13,
+            "log_ndtr simd max rel diff vs scalar = {max_abs:e}"
         );
+    }
+
+    #[test]
+    fn log_ndtr_tensor_path_keeps_the_upper_tail() -> Result<(), String> {
+        // frankenscipy-iulu0: 64 elements take the SIMD path. For x >= -1 it must be
+        // log1p(-Phi(-x)), SciPy's form, not ln(Phi(x)) with Phi(x) rounded toward 1, which
+        // was 0 at x = 10, 15 and 30. (x, scipy.special.log_ndtr(x)).
+        let cases = [
+            (-0.5, -1.1759117615936188),
+            (0.0, -0.6931471805599453),
+            (1.0, -0.1727537790234499),
+            (3.0, -0.0013508099647481925),
+            (5.0, -2.8665161296376294e-07),
+            (10.0, -7.61985302416047e-24),
+            (15.0, -3.6709661993126986e-51),
+            (30.0, -4.906713927147908e-198),
+            (-3.0, -6.60772622151035),
+            (-7.9, -34.20622817098172),
+        ];
+        let xs: Vec<f64> = (0..64).map(|i| cases[i % cases.len()].0).collect();
+        let out = log_ndtr(&SpecialTensor::RealVec(xs), RuntimeMode::Strict)
+            .map_err(|err| err.to_string())?;
+        let values = expect_real_vec(out)?;
+        for (i, got) in values.iter().enumerate() {
+            let (x, want) = cases[i % cases.len()];
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-13,
+                "tensor log_ndtr({x}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
