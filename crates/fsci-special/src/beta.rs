@@ -3191,7 +3191,27 @@ pub(crate) fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, Spec
         }
     }
 
-    let log_value = betaln_scalar(a, b, mode)?;
+    // Positive arguments take Cephes' own log route, `lgam(a) + (lgam(b) − lgam(a+b))` with
+    // `a >= b`, and in that grouping. `betaln_scalar` sums `(lgam(a) + lgam(b)) − lgam(a+b)`,
+    // which is the same number in exact arithmetic but not in floating point: past MAXGAM
+    // each lgam is in the hundreds to tens of thousands, and the two groupings round those
+    // sums differently. That moved `binom` (1/((n+1)·B)) by up to 2.3e-13 relative from
+    // `scipy.special.binom` on 130 of 1019 integer arguments up to n = 20000 that take this
+    // route — enough to put the one-sided exact `ks_2samp` p-value, a sum of products of such
+    // binomials, 1.1e-12 from SciPy's (frankenscipy-qwa3t). In Cephes' grouping all 130 agree
+    // to the bit.
+    //
+    // NOT covered here: below MAXGAM (the direct route above) 129 of those arguments still
+    // differ, by up to 2.6e-13, because `gamma_core` evaluates Γ(x > 33) by a log-form Lanczos
+    // sum where Cephes uses Stirling's formula; that is an accuracy gap in `gamma_core`
+    // (2.6e-13 from the exact binomial, against SciPy's 6.7e-16), not a grouping one.
+    let log_value = if a > 0.0 && b > 0.0 {
+        let lg_ab = gammaln_scalar(a + b, RuntimeMode::Strict)?;
+        let lg_b = gammaln_scalar(b, RuntimeMode::Strict)?;
+        gammaln_scalar(a, RuntimeMode::Strict)? + (lg_b - lg_ab)
+    } else {
+        betaln_scalar(a, b, mode)?
+    };
     // B(a,b) = Γ(a)Γ(b)/Γ(a+b) is signed: betaln gives ln|B|, so restore the sign
     // from the gamma factors (scipy.special.beta(-2.5,3)=-1.0667). For positive
     // a,b every gamma is positive => sign = +1 (unchanged).
