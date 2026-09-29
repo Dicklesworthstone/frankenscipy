@@ -1297,7 +1297,9 @@
   "diff_special_hyp0f1.rs": {
     "REL_TOL": 1e-8
   },
-  "diff_special_hyp1f1.rs": {},
+  "diff_special_hyp1f1.rs": {
+    "CANCELLATION_REL_TOL": 1e-13
+  },
   "diff_special_hyp2f1.rs": {},
   "diff_special_hyperu.rs": {},
   "diff_special_inv_boxcox1p.rs": {

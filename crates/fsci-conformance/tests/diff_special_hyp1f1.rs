@@ -11,6 +11,15 @@
 //! the series-asymptotic seam (|z| around ~30-50 for moderate
 //! a, b); the harness uses a wide tolerance documented as
 //! coverage rather than a precision claim.
+//!
+//! The cancellation group (frankenscipy-yqaob) is a precision claim:
+//! `CANCELLATION_REL_TOL` relative to |scipy|, no floor, at points
+//! where the Kummer series alternates (a < 0 < z; a > b, z < 0;
+//! b < 0), where a + k or b + k passes near zero mid-series, and
+//! where the |z| > 200 expansions truncated early or overflowed. fsci
+//! was 1.3e-13 to 1.6e2 relative off mpmath at each of them (+inf at
+//! z = 710); SciPy 1.17.1 is within 8e-15 of mpmath at each, and fsci
+//! now within 1e-15.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -27,6 +36,8 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const TOL_REL: f64 = 5.0e-7;
+/// Relative to |scipy| for the cancellation group: 12x SciPy's own worst error there.
+const CANCELLATION_REL_TOL: f64 = 1.0e-13;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +46,8 @@ struct PointCase {
     a: f64,
     b: f64,
     z: f64,
+    /// Judged by `CANCELLATION_REL_TOL` instead of `TOL_REL`.
+    cancellation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +163,43 @@ fn generate_query() -> OracleQuery {
             a,
             b,
             z,
+            cancellation: false,
+        });
+    }
+    // frankenscipy-yqaob: fsci's old relative error, then SciPy 1.17.1's, both vs mpmath.
+    let cancelling: [(f64, f64, f64); 17] = [
+        // a < 0 < z: the first terms alternate and dwarf the sum.
+        (-8.5, 4.25, 18.0),    // 3.6e-13 / 3.9e-16
+        (-9.75, 1.25, 19.5),   // 1.3e-13 / 4.8e-16
+        (-9.5, 9.75, 12.0),    // 1.9e-12 / 1.0e-16
+        (-12.75, 3.5, 30.0),   // 4.0e-11 / 6.7e-16
+        (-29.5, 28.25, 46.5),  // 6.3e1 / 1.0e-15
+        (-29.0, 6.625, 12.25), // 7.5e-5 / 1.2e-15 (the polynomial)
+        (-28.0, 19.875, 39.5), // 5.5 / 2.5e-15 (the polynomial)
+        // a > b, z < 0: Kummer's inner series alternates.
+        (9.5, 0.75, -19.0),   // 1.0e-12 / 8.3e-16
+        (24.5, 0.125, -16.0), // 1.3e-6 / 7.9e-16
+        // b < 0.
+        (28.5, -6.25, -30.0), // 1.9e-3 / 1.2e-15
+        (-29.75, -3.5, 33.0), // 3.3e-4 / 4.7e-16
+        // The series stopped at a term made tiny by a + 26 ≈ -1e-10, and by b + 10 ≈ -1 just
+        // before b + 11 ≈ 1e-9 inflates the tail.
+        (-26.0000000001, -50.1, 36.2),   // 1.9e-8 / 3.6e-16
+        (-2.703, -10.999999999, 0.2818), // 1.2e-9 / 1.7e-16
+        // |z| > 200: the other exponential scale, and the expansions' truncation.
+        (-30.5, 1.5, 201.0),    // 1.0 / 7.9e-15
+        (-29.5, 29.25, -201.5), // 1.0 / 5.7e-16
+        (30.5, 1.5, -201.0),    // 1.6e2 / 3.9e-16
+        // Past ln(f64::MAX): the old clamp returned +inf. SciPy 7.5e-17.
+        (2.0, 3.0, 710.0),
+    ];
+    for (i, &(a, b, z)) in cancelling.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("cancel_a{a}_b{b}_z{z}_i{i}"),
+            a,
+            b,
+            z,
+            cancellation: true,
         });
     }
     OracleQuery { points }
@@ -259,16 +309,21 @@ fn diff_special_hyp1f1() {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let scale = scipy_v.abs().max(1.0);
-        let rel_diff = abs_diff / scale;
+        let (rel_diff, pass) = if case.cancellation {
+            let rel_diff = abs_diff / scipy_v.abs();
+            (rel_diff, rel_diff <= CANCELLATION_REL_TOL)
+        } else {
+            let scale = scipy_v.abs().max(1.0);
+            (abs_diff / scale, abs_diff <= TOL_REL * scale)
+        };
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
-        ledger.compared("hyp1f1", &case.case_id, abs_diff <= TOL_REL * scale);
+        ledger.compared("hyp1f1", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff,
             rel_diff,
-            pass: abs_diff <= TOL_REL * scale,
+            pass,
         });
     }
 

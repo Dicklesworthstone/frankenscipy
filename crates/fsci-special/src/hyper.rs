@@ -1606,7 +1606,7 @@ pub(crate) fn hyp1f1_scalar(
         if b <= 0.0 && b == b.floor() && (b > a || a == 0.0) {
             return Ok(f64::INFINITY);
         }
-        return hyp1f1_series(a, b, z, mode);
+        return hyp1f1_kernel(Dd::from_f64(a), b, z, mode);
     }
 
     // b a nonpositive integer is a pole of 1/Γ(b): the series hits a zero
@@ -1636,21 +1636,35 @@ pub(crate) fn hyp1f1_scalar(
     if a == b {
         return Ok(z.exp());
     }
+    // SciPy (Boost) evaluates M(1, 2, z) as expm1(z)/z, and Boost's expm1 raises overflow from
+    // z = 709 on, so scipy.special.hyp1f1(1, 2, z) is +inf there although the value is finite
+    // up to z ≈ 716. Every other (a, b) past ln(f64::MAX) is finite in SciPy 1.17.1, and here.
+    if a == 1.0 && b == 2.0 && z >= HYP1F1_SCIPY_EXPM1_OVERFLOW {
+        return Ok(f64::INFINITY);
+    }
 
     let decision = select_hypergeometric_branch(HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14), mode)?;
     match decision.branch {
         HypergeometricBranch::KummerTransform => {
-            // M(a,b,z) = e^z M(b-a, b, -z)
-            let inner = hyp1f1_series(b - a, b, -z, mode)?;
-            Ok(z.exp() * inner)
+            hyp1f1_converged_or(hyp1f1_kummer_value(a, b, z), mode)
         }
-        HypergeometricBranch::DirectSeries => hyp1f1_series(a, b, z, mode),
+        HypergeometricBranch::DirectSeries => hyp1f1_kernel(Dd::from_f64(a), b, z, mode),
         HypergeometricBranch::AsymptoticExpansion => {
-            if z > 0.0 {
-                hyp1f1_asymptotic(a, b, z)
+            // The one-term expansion is taken only where the dropped term is negligible and the
+            // expansion resolves to double precision. Otherwise (a < 0 with |a| large beside
+            // |z|, where the algebraic term carries the value, or the mirror case for z < 0)
+            // the cancellation-controlled kernel takes over; if that overflows as well, the
+            // one-term expansion is still the best estimate available.
+            let value = if z > 0.0 {
+                hyp1f1_asymptotic(a, b, z, true)
+                    .or_else(|| hyp1f1_kernel_value(Dd::from_f64(a), b, z))
+                    .or_else(|| hyp1f1_asymptotic(a, b, z, false))
             } else {
-                hyp1f1_asymptotic_negative(a, b, z)
-            }
+                hyp1f1_asymptotic_negative(a, b, z, true)
+                    .or_else(|| hyp1f1_kummer_value(a, b, z))
+                    .or_else(|| hyp1f1_asymptotic_negative(a, b, z, false))
+            };
+            hyp1f1_converged_or(value, mode)
         }
         HypergeometricBranch::ParameterGuard => {
             guarded_hypergeometric_parameter("hyp1f1", mode, decision.reason)
@@ -1666,98 +1680,498 @@ pub(crate) fn hyp1f1_scalar(
     }
 }
 
-/// Direct series summation for 1F1.
-fn hyp1f1_series(a: f64, b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    let max_terms = 500;
-    let eps = f64::EPSILON;
+// ── 1F1 on the real line: series, double-double series, recurrences ──────────────────────
+//
+// frankenscipy-yqaob. The Kummer series Σ t_k, t_k = (a)_k z^k / ((b)_k k!), was summed in
+// double everywhere. That is exact enough only while the terms keep one sign. For a < 0 and
+// z > 0 (and, after Kummer's transformation, for a > b and z < 0; and wherever b < 0) the
+// first terms alternate and can be many orders larger than the sum, and the result lost
+// log10(Σ|t_k| / |M|) digits: up to 1e3 relative error over a in [-30, 30], b in [-10, 30],
+// z in [-50, 50], where SciPy 1.17.1 is at worst 6e-11 off mpmath (outside the corner of
+// nonpositive-integer a with b < 0, where SciPy itself is up to 3e-2 off). The reported
+// point hyp1f1(-8.4159…, 8.7912…, 14.8929…) ≈ 2.7e-9 sits next to a zero of M: 5.6e-7. The same
+// sum also stopped at the first tiny term, which a near-integer a or a b just past a pole
+// produces in the middle of the series, and the large-|z| expansions broke off at the first
+// growing term and dropped the other exponential scale outright.
+//
+// Now the cancellation C = Σ|t_k| / |Σ t_k| is measured as the series is summed. C <= 16 (every
+// sign-definite series, bit-identical to the old sum) keeps the double sum; beyond it the
+// series is re-summed in double-double with the parameters carried exactly, whose rounding is
+// ~2^-104 C; and where even that is not enough (C beyond ~1e12, a < 0 with |a| and z large)
+// the value comes from the recurrences in a and b started where every term is positive.
 
-    let mut sum = 1.0;
-    let mut term = 1.0;
+/// Cancellation Σ|t_k| / |Σ t_k| up to which the plain double sum is kept; past it the sum goes
+/// double-double. Its error is a few ulps times this: at most 5.5e-15 measured over the 200k
+/// points of perf_special_vs_scipy's hyp1f1 fixture. In a std-only copy of this kernel timed on
+/// that fixture's domain, 4 cost 1.10x more time for a 1.5e-15 worst case over the error map,
+/// and 64 saved 1.15x for 4.9e-15.
+const HYP1F1_PLAIN_MAX_CANCELLATION: f64 = 16.0;
+/// 2^-104, the double-double unit roundoff.
+const HYP1F1_DD_EPS: f64 = 4.930_380_657_631_324e-32;
+/// The kernel's double-double series stops once a term is below 2^-60 of the sum: the result
+/// is rounded to double, so its tail only has to vanish at that scale.
+const HYP1F1_DD_STOP_KERNEL: f64 = 8.673_617_379_884_035e-19;
+/// The recurrence route's start values are carried to full double-double accuracy.
+const HYP1F1_DD_STOP_START: f64 = 1.0e-33;
+/// Term cap of the double-double series (it serves |z| up to ~1000 through the fallbacks).
+const HYP1F1_DD_MAX_TERMS: usize = 4000;
+/// Step cap of each recurrence of the negative-a route.
+const HYP1F1_RECURRENCE_MAX_STEPS: f64 = 4000.0;
+/// Log-magnitude gap below which an asymptotic term is dropped: e^-41.4 = 1e-18.
+const HYP1F1_ASYM_NEGLIGIBLE_LN: f64 = -41.4;
+/// Boost's expm1 overflow threshold (its `log_max_value<double>`), where SciPy's M(1, 2, z)
+/// becomes +inf.
+const HYP1F1_SCIPY_EXPM1_OVERFLOW: f64 = 709.0;
 
-    for n in 0..max_terms {
-        let nf = n as f64;
-        // A nonpositive-integer a terminates the series at k = n: the (a + nf)
-        // numerator factor is exactly zero, so this and every later term vanish.
-        // Return before the multiply to avoid a 0/0 when b is also a negative
-        // integer of the same magnitude (e.g. hyp1f1(-2,-2,z): (a+2)=(b+2)=0).
-        if a + nf == 0.0 {
-            return Ok(sum);
-        }
-        term *= (a + nf) * z / ((b + nf) * (nf + 1.0));
-
-        if !term.is_finite() {
-            return hyp1f1_unconverged(
-                mode,
-                "series term overflowed before convergence was established",
-            );
-        }
-
-        sum += term;
-
-        if !sum.is_finite() {
-            return hyp1f1_unconverged(
-                mode,
-                "series sum overflowed before convergence was established",
-            );
-        }
-
-        if term == 0.0 {
-            return Ok(sum);
-        }
-
-        if term.abs() < eps * sum.abs() {
-            return Ok(sum);
-        }
-    }
-
-    hyp1f1_unconverged(mode, "series did not converge within 500 terms")
+/// An unevaluated sum hi + lo of two doubles (|lo| <= ulp(hi)/2): 106 significant bits.
+#[derive(Clone, Copy, Debug)]
+struct Dd {
+    hi: f64,
+    lo: f64,
 }
 
-/// Large positive-z asymptotic for 1F1 (DLMF 13.7.2, dominant term as z → +∞):
-///
-///   M(a,b,z) ~ Γ(b)/Γ(a) · e^z · z^{a-b} · Σ_{s≥0} (b-a)_s (1-a)_s / (s! z^s).
-///
-/// The exponentially small e^{-z}-weighted companion term is negligible for the
-/// z > 200 regime this serves. The series is asymptotic (divergent); we sum to
-/// its smallest term (optimal truncation). The prefactor is built in log space
-/// to avoid overflowing the intermediate e^z, which lets us return correct
-/// finite values well past where the direct series fails.
-///
-/// Parity: SciPy evaluates e^z directly and therefore overflows to ±inf once
-/// z exceeds ln(f64::MAX) ≈ 709.7827, even when the true value is representable.
-/// We reproduce that boundary so conformance matches `scipy.special.hyp1f1`.
-fn hyp1f1_asymptotic(a: f64, b: f64, z: f64) -> Result<f64, SpecialError> {
-    const LN_F64_MAX: f64 = 709.782_712_893_384;
+/// fl(a + b) and its rounding error.
+fn dd_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let bb = s - a;
+    (s, (a - (s - bb)) + (b - bb))
+}
 
-    // Prefactor sign and log-magnitude: Γ(b)/Γ(a) · e^z · z^{a-b}, z > 0.
-    let (ln_gb, sign_b) = ln_gamma_with_sign(b);
-    let (ln_ga, sign_a) = ln_gamma_with_sign(a);
-    let sign = sign_a * sign_b;
-    let ln_pref = ln_gb - ln_ga + z + (a - b) * z.ln();
+/// fl(a + b) and its rounding error, for |a| >= |b|.
+fn dd_quick_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    (s, b - (s - a))
+}
 
-    // Optimal-truncation asymptotic series Σ (b-a)_s (1-a)_s / (s! z^s).
+/// fl(a · b) and its rounding error.
+fn dd_two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, a.mul_add(b, -p))
+}
+
+impl Dd {
+    const ONE: Self = Self { hi: 1.0, lo: 0.0 };
+
+    const fn from_f64(x: f64) -> Self {
+        Self { hi: x, lo: 0.0 }
+    }
+
+    /// x + y exactly (for x = b and y = -a this is b - a, which double rounds).
+    fn sum_of(x: f64, y: f64) -> Self {
+        let (hi, lo) = dd_two_sum(x, y);
+        Self { hi, lo }
+    }
+
+    fn add(self, o: Self) -> Self {
+        let (s1, s2) = dd_two_sum(self.hi, o.hi);
+        let (t1, t2) = dd_two_sum(self.lo, o.lo);
+        let (s1, s2) = dd_quick_two_sum(s1, s2 + t1);
+        let (hi, lo) = dd_quick_two_sum(s1, s2 + t2);
+        Self { hi, lo }
+    }
+
+    fn add_f64(self, o: f64) -> Self {
+        let (s1, s2) = dd_two_sum(self.hi, o);
+        let (hi, lo) = dd_quick_two_sum(s1, s2 + self.lo);
+        Self { hi, lo }
+    }
+
+    fn sub(self, o: Self) -> Self {
+        self.add(Self {
+            hi: -o.hi,
+            lo: -o.lo,
+        })
+    }
+
+    fn mul(self, o: Self) -> Self {
+        let (p, e) = dd_two_prod(self.hi, o.hi);
+        let (hi, lo) = dd_quick_two_sum(p, e + (self.hi * o.lo + self.lo * o.hi));
+        Self { hi, lo }
+    }
+
+    fn mul_f64(self, o: f64) -> Self {
+        let (p, e) = dd_two_prod(self.hi, o);
+        let (hi, lo) = dd_quick_two_sum(p, e + self.lo * o);
+        Self { hi, lo }
+    }
+
+    fn div(self, o: Self) -> Self {
+        let q1 = self.hi / o.hi;
+        let r = self.sub(o.mul_f64(q1));
+        let q2 = r.hi / o.hi;
+        let r = r.sub(o.mul_f64(q2));
+        let q3 = r.hi / o.hi;
+        let (hi, lo) = dd_quick_two_sum(q1, q2);
+        Self { hi, lo }.add_f64(q3)
+    }
+
+    fn is_zero(self) -> bool {
+        self.hi == 0.0 && self.lo == 0.0
+    }
+
+    fn to_f64(self) -> f64 {
+        self.hi + self.lo
+    }
+}
+
+/// `value`, or the mode's unconverged outcome (NaN in Strict, an error in Hardened) when no
+/// 1F1 method produced one.
+fn hyp1f1_converged_or(value: Option<f64>, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    match value {
+        Some(v) => Ok(v),
+        None => hyp1f1_unconverged(
+            mode,
+            "1F1 series overflowed or did not converge, and no recurrence applies",
+        ),
+    }
+}
+
+/// M(a, b, x) by the kernel (see `hyp1f1_kernel_value`), with the mode's unconverged outcome.
+fn hyp1f1_kernel(a: Dd, b: f64, x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    hyp1f1_converged_or(hyp1f1_kernel_value(a, b, x), mode)
+}
+
+/// M(a, b, z) = e^z M(b - a, b, -z) for z < 0. b - a goes in exactly (double rounds it, and
+/// near a nonpositive integer M(b - a, ·, ·) is as sensitive to that rounding as 1/Γ(b - a) is
+/// in `hyp1f1_rgamma_dd`), unless it rounds to a nonpositive integer: then the inner series is
+/// the terminating polynomial, as the branch choice (and SciPy) take it.
+fn hyp1f1_kummer_value(a: f64, b: f64, z: f64) -> Option<f64> {
+    let b_minus_a = b - a;
+    let alpha = if is_nonpositive_integer(b_minus_a) {
+        Dd::from_f64(b_minus_a)
+    } else {
+        Dd::sum_of(b, -a)
+    };
+    let v = hyp1f1_mul_exp(hyp1f1_kernel_value(alpha, b, -z)?, z);
+    v.is_finite().then_some(v)
+}
+
+/// M(a, b, x) for real x with `a` carried exactly as a double-double. The plain double series
+/// when its cancellation is at most `HYP1F1_PLAIN_MAX_CANCELLATION`; the double-double series
+/// when its rounding bound is below a tenth of an ulp; the recurrence route for a < 0 < x
+/// beyond that. None when all of them overflow or fail to converge.
+fn hyp1f1_kernel_value(a: Dd, b: f64, x: f64) -> Option<f64> {
+    // The plain series reads a.hi only: harmless when a is exact, and when every term is
+    // positive (a relative error of a then moves the k-th term by at most k ulps).
+    if (a.lo == 0.0 || (a.hi > 0.0 && b > 0.0 && x > 0.0))
+        && let Some((sum, abs_sum)) = hyp1f1_series_plain(a.hi, b, x)
+        && abs_sum <= HYP1F1_PLAIN_MAX_CANCELLATION * sum.abs()
+    {
+        return Some(sum);
+    }
+    let dd = hyp1f1_series_dd(a, Dd::from_f64(b), x, HYP1F1_DD_STOP_KERNEL);
+    // Each term carries ~(n + 8)·2^-104 relative rounding, so the sum's error is below
+    // Σ|t_k|·(n + 8)·8·2^-104; accept when that is a tenth of an ulp of the sum.
+    if let Some((sum, abs_sum, n)) = dd
+        && abs_sum * (n as f64 + 8.0) * 8.0 * HYP1F1_DD_EPS <= 0.1 * f64::EPSILON * sum.hi.abs()
+    {
+        return Some(sum.to_f64());
+    }
+    if x > 0.0
+        && a.hi < 0.0
+        && b != b.floor()
+        && let Some(v) = hyp1f1_negative_a_recurrence(a, b, x)
+    {
+        return Some(v);
+    }
+    dd.map(|(sum, _, _)| sum.to_f64()).filter(|v| v.is_finite())
+}
+
+/// Whether a small term t_n may end the series: every later ratio
+/// r_k = |(a+k) z / ((b+k)(k+1))|, k > n, must be at most 1/2, so that the tail is below |t_n|.
+/// With a, b > 0 the terms only fall from the peak on (the original rule, kept as it was).
+/// Otherwise a factor a + k or b + k still near zero leaves a tiny term followed by a tail that
+/// is not small at all (a near-integer negative a; b just past a pole, where (a+k)/(b+k) is
+/// large), so every later factor must be at least 1; then r_k decreases when a >= b
+/// (d ln r/dk = 1/(a+k) - 1/(b+k) - 1/(k+1) < 0) and r_{n+1} <= 1/2 suffices, and when a < b
+/// r_k < |z|/(k+1), so n + 2 >= 2|z| does.
+fn hyp1f1_series_tail_is_settled(a: f64, b: f64, z: f64, nf: f64) -> bool {
+    if a > 0.0 && b > 0.0 {
+        return true;
+    }
+    let k = nf + 1.0;
+    if a + k < 1.0 || b + k < 1.0 {
+        return false;
+    }
+    if a >= b {
+        (a + k) * z.abs() <= 0.5 * (b + k) * (k + 1.0)
+    } else {
+        k + 1.0 >= 2.0 * z.abs()
+    }
+}
+
+/// The Kummer series in double with Σ|t_k| beside it; None when a term or the sum overflows
+/// or 500 terms do not converge.
+fn hyp1f1_series_plain(a: f64, b: f64, z: f64) -> Option<(f64, f64)> {
+    let eps = f64::EPSILON;
+    let mut sum = 1.0_f64;
+    let mut term = 1.0_f64;
+    let mut abs_sum = 1.0_f64;
+    for n in 0..500 {
+        let nf = n as f64;
+        // A nonpositive-integer a terminates the series at k = n: the (a + nf) numerator
+        // factor is exactly zero, so this and every later term vanish. Return before the
+        // multiply to avoid a 0/0 when b is also a negative integer of the same magnitude
+        // (e.g. hyp1f1(-2,-2,z): (a+2)=(b+2)=0).
+        if a + nf == 0.0 {
+            return Some((sum, abs_sum));
+        }
+        term *= (a + nf) * z / ((b + nf) * (nf + 1.0));
+        if !term.is_finite() {
+            return None;
+        }
+        sum += term;
+        abs_sum += term.abs();
+        if !sum.is_finite() {
+            return None;
+        }
+        if term == 0.0 {
+            return Some((sum, abs_sum));
+        }
+        if term.abs() < eps * sum.abs() && hyp1f1_series_tail_is_settled(a, b, z, nf) {
+            return Some((sum, abs_sum));
+        }
+    }
+    None
+}
+
+/// The Kummer series in double-double with `a` and `b` exact, stopped once a term is below
+/// `stop` of the sum. Returns the sum, Σ|t_k| and the term count; None on overflow or when
+/// `HYP1F1_DD_MAX_TERMS` do not converge.
+fn hyp1f1_series_dd(a: Dd, b: Dd, x: f64, stop: f64) -> Option<(Dd, f64, usize)> {
+    let mut sum = Dd::ONE;
+    let mut term = Dd::ONE;
+    let mut abs_sum = 1.0_f64;
+    for n in 0..HYP1F1_DD_MAX_TERMS {
+        let nf = n as f64;
+        let an = a.add_f64(nf);
+        if an.is_zero() {
+            return Some((sum, abs_sum, n));
+        }
+        let bn = b.add_f64(nf);
+        // term·(a+n)·x / ((b+n)(n+1)): one double-double product, a two-step division (the
+        // quotient's second word), and the sloppy sum, whose error is bounded by
+        // 2^-104 (|sum| + |term|) — the scale the Σ|t_k| error model already charges.
+        let num = term.mul(an).mul_f64(x);
+        let den = bn.mul_f64(nf + 1.0);
+        let q1 = num.hi / den.hi;
+        let (p, pe) = dd_two_prod(den.hi, q1);
+        let q2 = ((num.hi - p) - pe + num.lo - den.lo * q1) / den.hi;
+        let (th, tl) = dd_quick_two_sum(q1, q2);
+        term = Dd { hi: th, lo: tl };
+        if !term.hi.is_finite() {
+            return None;
+        }
+        let (s, e) = dd_two_sum(sum.hi, term.hi);
+        let (sh, sl) = dd_quick_two_sum(s, e + sum.lo + term.lo);
+        sum = Dd { hi: sh, lo: sl };
+        if !sum.hi.is_finite() {
+            return None;
+        }
+        abs_sum += term.hi.abs();
+        if term.hi == 0.0 {
+            return Some((sum, abs_sum, n + 1));
+        }
+        if term.hi.abs() <= stop * sum.hi.abs() && hyp1f1_series_tail_is_settled(a.hi, b.hi, x, nf)
+        {
+            return Some((sum, abs_sum, n + 1));
+        }
+    }
+    None
+}
+
+/// M(a, b, x) for a < 0 < x, b not an integer, when the series cancels beyond what
+/// double-double absorbs. b is raised to b' = b + nb > max(x, 2) + 1 and a to a0 = a + m in
+/// (1, 2], where the series has only positive terms; from M(a0, b'), M(a0 - 1, b') (and the
+/// same at b' + 1) the recurrence in a (DLMF 13.3.1) runs backward at fixed b' — stable for
+/// b' > x — down to a, then the recurrence in b (DLMF 13.3.2) runs backward to b, stable
+/// because M is its minimal solution as b grows. Everything is double-double with exact
+/// parameters.
+fn hyp1f1_negative_a_recurrence(a: Dd, b: f64, x: f64) -> Option<f64> {
+    let m = (-a.hi).floor() + 2.0;
+    let nb = (x.max(2.0) + 1.0 - b).ceil().max(0.0);
+    if !x.is_finite() || m > HYP1F1_RECURRENCE_MAX_STEPS || nb > HYP1F1_RECURRENCE_MAX_STEPS {
+        return None;
+    }
+    let a0 = a.add_f64(m);
+    let steps_a = m as usize - 1;
+    let steps_b = nb as usize;
+    let mut at_b = [Dd::ONE; 2];
+    for (slot, shift) in [(0_usize, nb), (1, nb + 1.0)] {
+        if slot == 1 && steps_b == 0 {
+            break;
+        }
+        let bp = Dd::sum_of(b, shift);
+        let (upper, _, _) = hyp1f1_series_dd(a0, bp, x, HYP1F1_DD_STOP_START)?;
+        let (lower, _, _) = hyp1f1_series_dd(a0.add_f64(-1.0), bp, x, HYP1F1_DD_STOP_START)?;
+        // (b - c) M(c - 1) = c M(c + 1) - (2c - b + x) M(c), c from a0 - 1 down to a + 1.
+        let (mut m_up, mut m_c) = (upper, lower);
+        let mut c = a0.add_f64(-1.0);
+        for _ in 0..steps_a {
+            let coef = c.mul_f64(2.0).sub(bp).add_f64(x);
+            let next = c.mul(m_up).sub(coef.mul(m_c)).div(bp.sub(c));
+            m_up = m_c;
+            m_c = next;
+            c = c.add_f64(-1.0);
+        }
+        at_b[slot] = m_c;
+    }
+    if steps_b == 0 {
+        let v = at_b[0].to_f64();
+        return v.is_finite().then_some(v);
+    }
+    // M(a, c - 1) = [(c - 1 + x) M(a, c) - x (c - a)/c M(a, c + 1)] / (c - 1), c from b' to b + 1.
+    let (mut m_c, mut m_up) = (at_b[0], at_b[1]);
+    let mut c = Dd::sum_of(b, nb);
+    for _ in 0..steps_b {
+        let cm1 = c.add_f64(-1.0);
+        let lead = cm1.add_f64(x).mul(m_c);
+        let trail = c.sub(a).mul_f64(x).div(c).mul(m_up);
+        let next = lead.sub(trail).div(cm1);
+        m_up = m_c;
+        m_c = next;
+        c = cm1;
+    }
+    let v = m_c.to_f64();
+    v.is_finite().then_some(v)
+}
+
+/// v · e^w, with e^w applied in steps of at most e^700 when |w| > 700, so a representable
+/// product is not lost to an overflow or underflow of e^w alone.
+fn hyp1f1_mul_exp(v: f64, w: f64) -> f64 {
+    if w.abs() <= 700.0 {
+        return v * w.exp();
+    }
+    let mut v = v;
+    let mut rest = w;
+    while rest > 700.0 && v.is_finite() && v != 0.0 {
+        v *= 700.0_f64.exp();
+        rest -= 700.0;
+    }
+    while rest < -700.0 && v.is_finite() && v != 0.0 {
+        v *= (-700.0_f64).exp();
+        rest += 700.0;
+    }
+    v * rest.exp()
+}
+
+/// Σ_s (p)_s (q)_s / (s! w^s), the 2F0 of the large-|z| expansions, summed to its smallest term
+/// PAST the initial hump. While s is below max(-p, -q), or while (p+s)(q+s) > (s+1)|w|, the
+/// terms may grow before they fall (at a = -29.5, b = 29.25, z = -201.5 the first six do);
+/// breaking off at the first growth, as this did, kept only the leading 1 and was ~100% off.
+/// Only a growth after the terms have been falling marks the optimal truncation point.
+///
+/// With `require_accurate`, None unless that smallest term is below 1e-17 of the sum (the
+/// expansion has resolved to double precision); without it the truncated sum is returned
+/// regardless, as the last-resort estimate.
+fn hyp1f1_asym_2f0(p: f64, q: f64, w: f64, require_accurate: bool) -> Option<f64> {
     let mut series = 1.0_f64;
     let mut term = 1.0_f64;
     let mut prev_abs = 1.0_f64;
-    for s in 0..1024 {
+    let mut falling = false;
+    for s in 0..4096 {
         let sf = s as f64;
-        term *= (b - a + sf) * (1.0 - a + sf) / ((sf + 1.0) * z);
+        term *= (p + sf) * (q + sf) / ((sf + 1.0) * w);
         let abs_term = term.abs();
-        if abs_term > prev_abs {
-            break; // asymptotic series past its smallest term — truncate
+        if abs_term == 0.0 {
+            return Some(series);
+        }
+        // Every later factor p + s + 1, q + s + 1 is at least 1 from here on.
+        let past_hump = sf >= -p && sf >= -q;
+        if past_hump && falling && abs_term > prev_abs {
+            let resolved = prev_abs <= 1.0e-17 * series.abs();
+            return (resolved || !require_accurate).then_some(series);
         }
         series += term;
+        if past_hump && abs_term < prev_abs {
+            falling = true;
+        }
         prev_abs = abs_term;
-        if abs_term <= f64::EPSILON * series.abs() {
-            break;
+        if past_hump
+            && abs_term <= 0.25 * f64::EPSILON * series.abs()
+            && ((p + sf + 1.0) * (q + sf + 1.0)).abs() <= 0.5 * (sf + 2.0) * w.abs()
+        {
+            return Some(series);
         }
     }
+    (!require_accurate).then_some(series)
+}
 
-    // Match SciPy's e^z overflow boundary.
-    if z > LN_F64_MAX {
-        return Ok(sign * series.signum() * f64::INFINITY);
+/// Γ(x) for the expansions' prefactors: the crate's Cephes Γ (SciPy's bits); ±inf past the
+/// overflow, where `hyp1f1_scaled_power` takes the log form instead.
+fn hyp1f1_gamma(x: f64) -> f64 {
+    crate::gamma::gamma_core(x)
+}
+
+/// 1/Γ(x), exactly 0 at the poles.
+fn hyp1f1_rgamma(x: f64) -> f64 {
+    if is_nonpositive_integer(x) {
+        return 0.0;
     }
-    Ok(sign * ln_pref.exp() * series)
+    1.0 / crate::gamma::gamma_core(x)
+}
+
+/// 1/Γ(s) at a double-double argument, to first order in s.lo: d ln(1/Γ)/ds = -ψ(s), and ψ is
+/// ~1/distance near a pole, so a rounded b - a 0.0033 from -39 moved 1/Γ(b - a) by 5e-13
+/// (SciPy is off by the same there, from the same rounding).
+fn hyp1f1_rgamma_dd(s: Dd) -> f64 {
+    let r = hyp1f1_rgamma(s.hi);
+    if s.lo == 0.0 || r == 0.0 {
+        return r;
+    }
+    r * (1.0 - crate::gamma::digamma_core(s.hi) * s.lo)
+}
+
+/// scale · Γ(p) · r · e^w · y^e for y > 0, where r = 1/Γ(q) is supplied, as a product of
+/// separately rounded factors. The exp of the summed logarithms, as this was, carries an
+/// absolute error of ulp(|L|) in L ≈ 700, a 1.1e-13 relative error of the value. e^w goes in
+/// last and in steps of at most e^700, so a value near the overflow threshold does not
+/// overflow on the way; the exponent e is double-double (a - b rounds in double) and its low
+/// word enters as the factor 1 + e.lo ln y. The log form remains for factors outside the
+/// normal range.
+fn hyp1f1_scaled_power(scale: f64, p: f64, q: f64, rq: f64, w: f64, y: f64, e: Dd) -> f64 {
+    let g = hyp1f1_gamma(p) * rq * scale;
+    let pw = y.powf(e.hi) * (1.0 + e.lo * y.ln());
+    let v = g * pw;
+    if g.is_normal() && pw.is_normal() && v.is_normal() {
+        let v = hyp1f1_mul_exp(v, w);
+        if v.is_normal() || v.is_infinite() {
+            return v;
+        }
+    }
+    let (lp, sp) = ln_gamma_with_sign(p);
+    let (lq, sq) = ln_gamma_with_sign(q);
+    scale.signum() * sp * sq * (lp - lq + w + e.hi * y.ln() + scale.abs().ln()).exp()
+}
+
+/// Large positive-z asymptotic for 1F1 (DLMF 13.7.2, the e^z term as z → +∞):
+///
+///   M(a,b,z) ~ Γ(b)/Γ(a) · e^z · z^{a-b} · Σ_{s≥0} (b-a)_s (1-a)_s / (s! z^s).
+///
+/// The companion algebraic term Γ(b)/Γ(b-a) z^{-a} was dropped unconditionally. For a < 0 it
+/// need not be small — at a = -30.5, b = 29.5, z = 201 it is 2e8 times the e^z term — so with
+/// `require_accurate` this returns None unless that term is below 1e-18 of the kept one and
+/// the expansion resolves (on the positive axis the e^z series cannot be summed past the size
+/// of the algebraic term, so both cannot be combined here). a is not a nonpositive integer
+/// here (the polynomial is routed away upstream).
+///
+/// SciPy 1.17.1 is finite past z = ln(f64::MAX) whenever the value is, and so is this; the
+/// former +inf clamp there is gone (M(1, 2, z) keeps SciPy's own overflow, upstream).
+fn hyp1f1_asymptotic(a: f64, b: f64, z: f64, require_accurate: bool) -> Option<f64> {
+    if require_accurate && !is_nonpositive_integer(b - a) {
+        let (ln_gb, _) = ln_gamma_with_sign(b);
+        let (ln_ga, _) = ln_gamma_with_sign(a);
+        let (ln_gba, _) = ln_gamma_with_sign(b - a);
+        let ln_z = z.ln();
+        let ln_exp_term = ln_gb - ln_ga + z + (a - b) * ln_z;
+        let ln_alg_term = ln_gb - ln_gba - a * ln_z;
+        if ln_alg_term - ln_exp_term > HYP1F1_ASYM_NEGLIGIBLE_LN {
+            return None;
+        }
+    }
+    let series = hyp1f1_asym_2f0(b - a, 1.0 - a, z, require_accurate)?;
+    let v = hyp1f1_scaled_power(series, b, a, hyp1f1_rgamma(a), z, z, Dd::sum_of(a, -b));
+    (!v.is_nan()).then_some(v)
 }
 
 /// Large negative-z asymptotic for 1F1 (DLMF 13.7.2 as z → -∞).
@@ -1773,65 +2187,51 @@ fn hyp1f1_asymptotic(a: f64, b: f64, z: f64) -> Result<f64, SpecialError> {
 ///
 ///   M(a,b,z) ~ Γ(b)/Γ(a) · e^z · z^{a-b} · Σ_{s≥0} (b-a)_s (1-a)_s / (s! z^s).
 ///
-/// Both branches build the prefactor in log space. (a is guaranteed non-(nonpos
-/// integer) here — the polynomial case is routed to the direct series upstream.)
-fn hyp1f1_asymptotic_negative(a: f64, b: f64, z: f64) -> Result<f64, SpecialError> {
+/// The prefactors are products of separately rounded factors (`hyp1f1_scaled_power`), and
+/// 1/Γ(b - a) is taken at the exact b - a. With `require_accurate` this returns None where the
+/// dropped e^z term is not below 1e-18 of the kept one (a large beside b, e.g. a = 30.5,
+/// b = -9.25, z = -200, where it is 1.7e-4 of it), where the expansion does not resolve, and when
+/// b - a is a nonpositive integer: M = e^z M(b - a, b, -z) is then e^z times a polynomial,
+/// which the Kummer route sums with its cancellation control (the terminating expansion
+/// alternates and cancelled to 4e-14 at a = 30.5, b = 1.5, z = -201). (a is not a nonpositive
+/// integer here — the polynomial case is routed to the kernel upstream.)
+fn hyp1f1_asymptotic_negative(a: f64, b: f64, z: f64, require_accurate: bool) -> Option<f64> {
     let neg_z = -z; // > 0
     let b_minus_a = b - a;
 
     if is_nonpositive_integer(b_minus_a) {
-        // Exponential term; a - b = k is a nonnegative integer.
+        if require_accurate {
+            return None;
+        }
+        // Exponential term; a - b = k is a nonnegative integer, so z^k is real.
         let k = (a - b).round();
-        let (ln_gb, sign_b) = ln_gamma_with_sign(b);
-        let (ln_ga, sign_a) = ln_gamma_with_sign(a);
         let z_pow_sign = if (k as i64).rem_euclid(2) == 0 {
             1.0
         } else {
             -1.0
         };
-        let sign = sign_a * sign_b * z_pow_sign;
-        let ln_pref = ln_gb - ln_ga + z + k * neg_z.ln();
-        let mut series = 1.0_f64;
-        let mut term = 1.0_f64;
-        let mut prev_abs = 1.0_f64;
-        for s in 0..1024 {
-            let sf = s as f64;
-            term *= (b_minus_a + sf) * (1.0 - a + sf) / ((sf + 1.0) * z);
-            let abs_term = term.abs();
-            if abs_term > prev_abs {
-                break;
-            }
-            series += term;
-            prev_abs = abs_term;
-            if abs_term <= f64::EPSILON * series.abs() {
-                break;
-            }
-        }
-        return Ok(sign * ln_pref.exp() * series);
+        let series = hyp1f1_asym_2f0(b_minus_a, 1.0 - a, z, false)?;
+        let rq = hyp1f1_rgamma(a);
+        let v = hyp1f1_scaled_power(z_pow_sign * series, b, a, rq, z, neg_z, Dd::from_f64(k));
+        return (!v.is_nan()).then_some(v);
     }
 
-    // Algebraic term Γ(b)/Γ(b-a) (-z)^{-a} Σ (a)_s (a-b+1)_s / (s! (-z)^s).
-    let (ln_gb, sign_b) = ln_gamma_with_sign(b);
-    let (ln_gba, sign_ba) = ln_gamma_with_sign(b_minus_a);
-    let sign = sign_b * sign_ba;
-    let ln_pref = ln_gb - ln_gba - a * neg_z.ln();
-    let mut series = 1.0_f64;
-    let mut term = 1.0_f64;
-    let mut prev_abs = 1.0_f64;
-    for s in 0..1024 {
-        let sf = s as f64;
-        term *= (a + sf) * (a - b + 1.0 + sf) / ((sf + 1.0) * neg_z);
-        let abs_term = term.abs();
-        if abs_term > prev_abs {
-            break;
-        }
-        series += term;
-        prev_abs = abs_term;
-        if abs_term <= f64::EPSILON * series.abs() {
-            break;
+    if require_accurate {
+        let (ln_gb, _) = ln_gamma_with_sign(b);
+        let (ln_gba, _) = ln_gamma_with_sign(b_minus_a);
+        let (ln_ga, _) = ln_gamma_with_sign(a);
+        let ln_z = neg_z.ln();
+        let ln_alg = ln_gb - ln_gba - a * ln_z;
+        let ln_exp = ln_gb - ln_ga + z + (a - b) * ln_z;
+        if ln_exp - ln_alg > HYP1F1_ASYM_NEGLIGIBLE_LN {
+            return None;
         }
     }
-    Ok(sign * ln_pref.exp() * series)
+    // Algebraic term Γ(b)/Γ(b-a) (-z)^{-a} Σ (a)_s (a-b+1)_s / (s! (-z)^s).
+    let series = hyp1f1_asym_2f0(a, a - b + 1.0, neg_z, require_accurate)?;
+    let rq = hyp1f1_rgamma_dd(Dd::sum_of(b, -a));
+    let v = hyp1f1_scaled_power(series, b, b_minus_a, rq, 0.0, neg_z, Dd::from_f64(-a));
+    (!v.is_nan()).then_some(v)
 }
 
 fn hyp1f1_unconverged(mode: RuntimeMode, detail: &'static str) -> Result<f64, SpecialError> {
@@ -5825,7 +6225,8 @@ mod tests {
             );
         }
 
-        // SciPy overflows e^z to +inf for z past ln(f64::MAX) ≈ 709.78; match it.
+        // SciPy's M(1, 2, z) is expm1(z)/z, whose expm1 overflows to +inf from z = 709 on;
+        // match it. (Other (a, b) stay finite past ln(f64::MAX) in SciPy, and here.)
         let inf = hyp1f1(
             &scalar(1.0),
             &scalar(2.0),
@@ -5884,6 +6285,73 @@ mod tests {
                 "hyp1f1({a},{b},{z}) = {v:e}, scipy {expected:e}, rel={rel:e}"
             );
         }
+    }
+
+    #[test]
+    fn hyp1f1_cancelling_series_and_both_exponential_scales_match_mpmath() {
+        // frankenscipy-yqaob. Each point sits where the old evaluation lost digits; references
+        // are mpmath.hyp1f1 at 60 digits (unchanged at 120). Old error / SciPy 1.17.1 error:
+        let cases = [
+            // a < 0 < z, next to a zero of M: the reported worst point. 5.6e-7 / 1.3e-10.
+            (
+                -8.415964752105744,
+                8.791271126186622,
+                14.892975321074033,
+                2.726_550_180_444_172_9e-9,
+            ),
+            // a < 0 < z, Σ|t_k| / |M| = 4.6e18: 6.3e1 / 1.0e-15 (the recurrence route).
+            (-29.5, 28.25, 46.5, -1.086_402_576_103_869_6e-8),
+            (-12.75, 3.5, 30.0, -103.164_894_832_837_9), // 4.0e-11 / 6.7e-16
+            // a > b, z < 0: Kummer's inner series cancels. 1.3e-6 / 7.9e-16.
+            (24.5, 0.125, -16.0, 0.001_055_199_183_244_682_1),
+            (28.5, -6.25, -30.0, -4.695_802_531_381_758_8), // b < 0: 1.9e-3 / 1.2e-15
+            (-29.75, -3.5, 33.0, 650_450_212_077.205_87),   // 3.3e-4 / 4.7e-16
+            // Nonpositive-integer a (the polynomial) at z > 0: 7.5e-5 / 1.2e-15, 5.5 / 2.5e-15.
+            (-29.0, 6.625, 12.25, 6.778_811_251_203_031_3e-5),
+            (-28.0, 19.875, 39.5, 2.636_807_447_916_924_3e-7),
+            // The series stopped at the tiny term that a + 26 ≈ -1e-10 leaves: 1.9e-8 / 3.6e-16.
+            (-26.0000000001, -50.1, 36.2, 5_970_474.596_822_539_1),
+            // ... and at the one before b + 11 ≈ 1e-9 inflates the tail: 1.2e-9 / 1.7e-16.
+            (-2.703, -10.999999999, 0.2818, 1.070_919_681_745_780_7),
+            // z > 200: the expansion broke off at its first term, which grows (its sum is 475,
+            // not 1). 1.0 / 7.9e-15.
+            (-30.5, 1.5, 201.0, -7.677_729_523_110_572_9e48),
+            // z < -200: the same, on the algebraic term. 1.0 / 5.7e-16.
+            (-29.5, 29.25, -201.5, 9.411_443_411_878_808_1e22),
+            // z < -200, b - a = -29 and -39: the terminating expansion alternates.
+            // 1.6e2 / 3.9e-16 and 1.0e1 / 1.2e-16.
+            (30.5, 1.5, -201.0, -3.628_179_929_918_628_8e-55),
+            (29.875, -9.125, -501.75, -6.804_338_466_305_195_8e-150),
+            // Past ln(f64::MAX) the value is finite, and SciPy's with it: inf / 7.5e-17.
+            (2.0, 3.0, 710.0, 6.284_079_703_267_816_4e305),
+            (-0.5, 1.5, 710.0, -1.112_618_710_098_256_5e302),
+        ];
+        for (a, b, z, expected) in cases {
+            let r = hyp1f1(
+                &scalar(std::hint::black_box(a)),
+                &scalar(std::hint::black_box(b)),
+                &scalar(std::hint::black_box(z)),
+                RuntimeMode::Strict,
+            );
+            let v = get_scalar(&r).expect("finite hyp1f1");
+            let rel = ((v - expected) / expected).abs();
+            assert!(
+                rel <= 2.0e-15,
+                "hyp1f1({a}, {b}, {z}) = {v:e}, mpmath {expected:e}, rel = {rel:e}"
+            );
+        }
+        // SciPy's M(1, 2, z) is expm1(z)/z and overflows with Boost's expm1 from z = 709 on.
+        let at = |z: f64| {
+            let r = hyp1f1(&scalar(1.0), &scalar(2.0), &scalar(z), RuntimeMode::Strict);
+            get_scalar(&r).expect("real hyp1f1")
+        };
+        assert_eq!(at(709.0), f64::INFINITY);
+        let below = at(708.9);
+        let expected = 1.048_994_581_447_411e305;
+        assert!(
+            ((below - expected) / expected).abs() <= 1.0e-14,
+            "M(1,2,708.9) = {below:e}"
+        );
     }
 
     #[test]
