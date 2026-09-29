@@ -862,6 +862,9 @@ fn gammainc_dispatch(
     mode: RuntimeMode,
     lower: bool,
 ) -> SpecialResult {
+    if let Some(values) = incomplete_gamma_real_batch(a, x, mode, lower) {
+        return Ok(SpecialTensor::RealVec(values));
+    }
     match (a, x) {
         // Real-real cases
         (SpecialTensor::RealScalar(a_val), SpecialTensor::RealScalar(x_val)) => {
@@ -1037,6 +1040,112 @@ fn gammainc_dispatch(
             detail: "empty tensor is not a valid special-function input",
         }),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Batches [`incomplete_gamma_real_batch`] answered on this thread: its must-hit control.
+    static INCOMPLETE_GAMMA_BATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `P` (`lower`) or `Q` over a real batch with no `Result` per element, or `None` for the
+/// per-element path (frankenscipy-449uv).
+///
+/// `gammainc_scalar` fails only under Hardened, and records a domain trace only under Strict,
+/// both for an input the scan below finds without any arithmetic. A batch with no such input
+/// cannot fail, so it runs `igam`/`igamc` straight into the output. Timed against live SciPy
+/// on the harness fixture (n = 200000, one core), carrying the 56-byte `Result` per element
+/// kept `gammainc` at 0.93x of SciPy although its kernel is SciPy's operation for operation
+/// (`chdtr`, the same kernel without the `Result`, was 1.00x). A batch that does hold such an
+/// input goes back to the per-element path, which fails or traces in index order as before.
+/// Bit-identical: the same kernel on the same inputs.
+fn incomplete_gamma_real_batch(
+    a: &SpecialTensor,
+    x: &SpecialTensor,
+    mode: RuntimeMode,
+    lower: bool,
+) -> Option<Vec<f64>> {
+    // A scalar side is a one-element slice read at index 0 for every output.
+    let (a, x, n): (&[f64], &[f64], usize) = match (a, x) {
+        (SpecialTensor::RealVec(a), SpecialTensor::RealVec(x)) if a.len() == x.len() => {
+            (a, x, a.len())
+        }
+        (SpecialTensor::RealVec(a), SpecialTensor::RealScalar(x)) => {
+            (a, std::slice::from_ref(x), a.len())
+        }
+        (SpecialTensor::RealScalar(a), SpecialTensor::RealVec(x)) => {
+            (std::slice::from_ref(a), x, x.len())
+        }
+        _ => return None,
+    };
+    // `validate_incomplete_gamma_domain`'s conditions, scanned per argument so the scans
+    // vectorise: Hardened refuses a non-positive or infinite `a` and a negative `x`, Strict
+    // traces a negative `a` or `x`. The scalar test also passes any pair holding a NaN, which
+    // these scans do not know about; they only ever send such a batch to the per-element path,
+    // which answers it exactly as before.
+    let refused_a = |v: f64| match mode {
+        RuntimeMode::Strict => v < 0.0,
+        RuntimeMode::Hardened => v <= 0.0 || v == f64::INFINITY,
+    };
+    if a.iter().any(|&v| refused_a(v)) || x.iter().any(|&v| v < 0.0) {
+        return None;
+    }
+    #[cfg(test)]
+    INCOMPLETE_GAMMA_BATCH_HITS.with(|hits| hits.set(hits.get() + 1));
+    let function = if lower { "gammainc" } else { "gammaincc" };
+    let kernel = move |a: f64, x: f64| {
+        let value = if lower {
+            crate::igam_temme::igam(a, x)
+        } else {
+            crate::igam_temme::igamc(a, x)
+        };
+        trace_non_finite_incomplete_gamma(function, a, x, value, mode);
+        value
+    };
+    let mut out = vec![0.0_f64; n];
+    // The per-element path's worker policy (`par_map_indices`): this kernel is heavy.
+    let nthreads = if n < 256 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 128)
+            .max(1)
+    };
+    let chunk = n.div_ceil(nthreads);
+    let kernel = &kernel;
+    // One loop per shape, so the scalar side is a loop invariant and not a test per element.
+    let fill = move |start: usize, slots: &mut [f64]| {
+        let range = start..start + slots.len();
+        match (a.len() == n, x.len() == n) {
+            (true, true) => {
+                for ((slot, &ai), &xi) in slots.iter_mut().zip(&a[range.clone()]).zip(&x[range]) {
+                    *slot = kernel(ai, xi);
+                }
+            }
+            (true, false) => {
+                for (slot, &ai) in slots.iter_mut().zip(&a[range]) {
+                    *slot = kernel(ai, x[0]);
+                }
+            }
+            _ => {
+                for (slot, &xi) in slots.iter_mut().zip(&x[range]) {
+                    *slot = kernel(a[0], xi);
+                }
+            }
+        }
+    };
+    if nthreads <= 1 {
+        fill(0, &mut out);
+        return Some(out);
+    }
+    std::thread::scope(|scope| {
+        for (c, slots) in out.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || fill(c * chunk, slots));
+        }
+    });
+    Some(out)
 }
 
 fn gammainc_complex_parameter_scalar(
@@ -1217,53 +1326,44 @@ pub fn multigammaln(a: &SpecialTensor, d: f64, mode: RuntimeMode) -> SpecialResu
 
 /// Gamma distribution CDF with rate `a` and shape `b`.
 ///
-/// Matches `scipy.special.gdtr(a, b, x)`.
+/// SciPy's `gdtr(a, b, x)`, xsf's `cephes/gdtr.h` bit for bit: NaN for a negative `x`, else
+/// `igam(b, a·x)` with all of `igam`'s edges (so `gdtr(0, b, x) = 0`, `gdtr(a, 0, x) = 1` for
+/// `a·x > 0`, and a negative `a` or `b` is NaN) (frankenscipy-449uv).
 #[must_use]
 pub fn gdtr(a: f64, b: f64, x: f64) -> f64 {
-    if a.is_nan() || b.is_nan() || x.is_nan() {
+    if x < 0.0 {
         return f64::NAN;
     }
-    if a <= 0.0 || b <= 0.0 {
-        return f64::NAN;
-    }
-    if x <= 0.0 {
-        return 0.0;
-    }
-    gammainc_scalar(b, a * x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igam(b, a * x)
 }
 
 /// Gamma distribution survival function with rate `a` and shape `b`.
 ///
 /// Returns P(X > x) = 1 - gdtr(a, b, x).
 ///
-/// Matches `scipy.special.gdtrc(a, b, x)`.
+/// SciPy's `gdtrc(a, b, x)`: NaN for a negative `x`, else `igamc(b, a·x)`, as [`gdtr`].
 #[must_use]
 pub fn gdtrc(a: f64, b: f64, x: f64) -> f64 {
-    if a.is_nan() || b.is_nan() || x.is_nan() {
+    if x < 0.0 {
         return f64::NAN;
     }
-    if a <= 0.0 || b <= 0.0 {
-        return f64::NAN;
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    gammaincc_scalar(b, a * x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igamc(b, a * x)
 }
 
 /// Inverse gamma distribution CDF with rate `a` and shape `b`, solving for `x`.
 ///
-/// Matches `scipy.special.gdtrix(a, b, p)`.
+/// SciPy 1.17.1's `gdtrix(a, b, p)` (`special_gdtrix` in `xsf_wrappers.cpp`, not cdflib):
+/// NaN when `a` and `b` are both 0 or when either is +inf (with neither negative), else
+/// `gammaincinv(b, p) / a`, bit for bit.
 #[must_use]
 pub fn gdtrix(a: f64, b: f64, p: f64) -> f64 {
-    if a.is_nan() || b.is_nan() || p.is_nan() {
+    if a == 0.0 && b == 0.0 {
         return f64::NAN;
     }
-    if b <= 0.0 || !(0.0..=1.0).contains(&p) {
+    if (a.is_infinite() || b.is_infinite()) && a >= 0.0 && b >= 0.0 {
         return f64::NAN;
     }
-
-    gammaincinv(b, p) / a
+    crate::igam_temme::igami(b, p) / a
 }
 
 /// Vectorized inverse gamma CDF w.r.t. `x`, `gdtrix(a, b, p)`, over many
@@ -1288,17 +1388,18 @@ pub fn chdtriv_many(p: &[f64], x: f64) -> Vec<f64> {
 
 /// Inverse gamma distribution CDF with respect to rate `a`.
 ///
-/// Matches `scipy.special.gdtria(p, b, x)`.
+/// SciPy 1.17.1's `gdtria(p, b, x)` (`special_gdtria` in `xsf_wrappers.cpp`, not cdflib): NaN
+/// at `x = 0`; 0 for `b = p = 0` (NaN there if `x = +inf`); else `gammaincinv(b, p) / x`,
+/// bit for bit.
 #[must_use]
 pub fn gdtria(p: f64, b: f64, x: f64) -> f64 {
-    if p.is_nan() || b.is_nan() || x.is_nan() {
+    if x == 0.0 {
         return f64::NAN;
     }
-    if b <= 0.0 || !(0.0..=1.0).contains(&p) || x == 0.0 {
-        return f64::NAN;
+    if b == 0.0 && p == 0.0 {
+        return if x == f64::INFINITY { f64::NAN } else { 0.0 };
     }
-
-    gammaincinv(b, p) / x
+    crate::igam_temme::igami(b, p) / x
 }
 
 /// Inverse gamma distribution CDF with respect to shape `b`.
@@ -1327,7 +1428,7 @@ pub fn gdtrib(a: f64, p: f64, x: f64) -> f64 {
         return 0.0;
     }
 
-    gammainc_shape_inv(scaled_x, p)
+    gamma_shape_inv(scaled_x, p, 1.0 - p)
 }
 
 // Default-threshold wrapper over `map_real_input_rp` (parallel cutoff 256).
@@ -1789,6 +1890,20 @@ fn lgam_cephes(x: f64) -> f64 {
     z.ln() + rational
 }
 
+/// Cephes' `lgam` exactly as xsf 0d0a593f computes it, for ports pinned to SciPy's bits
+/// (`crate::igam_temme`). It is [`lgam_cephes`] except where `1/x` overflows (`0 < |x|` below
+/// about 5.6e-309): xsf carries that overflow through its recurrence to +inf, where
+/// `lgam_cephes` answers the exact `−ln|x|` instead. SciPy's `gammainc(1e-310, 0.5)` is 0
+/// because of it.
+pub(crate) fn xsf_lgam(x: f64) -> f64 {
+    // `1/x` is infinite exactly when `|x| <= 2^-1024` (zero included); a compare, not a divide.
+    const RECIP_OVERFLOW: f64 = f64::from_bits(0x0004_0000_0000_0000);
+    if x.abs() <= RECIP_OVERFLOW {
+        return f64::INFINITY;
+    }
+    lgam_cephes(x)
+}
+
 /// Cephes' reflection for x < -34: ln(pi) - ln|q sin(pi z)| - lgam(q), q = -x. -inf returns
 /// itself, as Cephes' finiteness test makes it.
 #[cold]
@@ -2198,16 +2313,59 @@ fn complex_rgamma_scalar(z: Complex64) -> Complex64 {
     (-complex_gammaln(z)).exp()
 }
 
+/// `P(a, x)`, SciPy's `gammainc`: xsf's `igam`, bit for bit (`crate::igam_temme`,
+/// frankenscipy-449uv). Strict mode answers every input as SciPy does, `a = 0` and infinite
+/// `a` included; Hardened refuses a non-finite or non-positive `a` and a negative `x`.
 pub fn gammainc_scalar(a: f64, x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     validate_incomplete_gamma_domain("gammainc", a, x, mode)?;
-    let (p, _) = regularized_gamma_pair(a, x, mode)?;
+    let p = crate::igam_temme::igam(a, x);
+    trace_non_finite_incomplete_gamma("gammainc", a, x, p, mode);
     Ok(p)
 }
 
+/// `Q(a, x)`, SciPy's `gammaincc`: xsf's `igamc`, bit for bit. Modes as [`gammainc_scalar`].
 pub fn gammaincc_scalar(a: f64, x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     validate_incomplete_gamma_domain("gammaincc", a, x, mode)?;
-    let (_, q) = regularized_gamma_pair(a, x, mode)?;
+    let q = crate::igam_temme::igamc(a, x);
+    trace_non_finite_incomplete_gamma("gammaincc", a, x, q, mode);
     Ok(q)
+}
+
+/// Record a non-finite `P` or `Q` at a finite `a > 0` and finite `x > 0`, the only inputs where
+/// one would be a numerical failure rather than one of SciPy's edge answers. The test is
+/// inline in every kernel loop; the record is out of line.
+#[inline]
+fn trace_non_finite_incomplete_gamma(
+    function: &'static str,
+    a: f64,
+    x: f64,
+    value: f64,
+    mode: RuntimeMode,
+) {
+    if value.is_finite() || !(a.is_finite() && a > 0.0 && x.is_finite() && x > 0.0) {
+        return;
+    }
+    record_non_finite_incomplete_gamma(function, a, x, value, mode);
+}
+
+#[cold]
+#[inline(never)]
+fn record_non_finite_incomplete_gamma(
+    function: &'static str,
+    a: f64,
+    x: f64,
+    value: f64,
+    mode: RuntimeMode,
+) {
+    record_special_trace(
+        function,
+        mode,
+        "non_finite_output",
+        format!("a={a},x={x}"),
+        "returned_non_finite",
+        format!("output={value}"),
+        false,
+    );
 }
 
 /// Natural log of the regularized lower incomplete gamma function `P(a, x)`.
@@ -2400,6 +2558,11 @@ fn validate_incomplete_gamma_domain(
     }
     if !a.is_finite() || a <= 0.0 || x < 0.0 {
         return match mode {
+            // SciPy's own domain error is a negative `a` or `x`, where it returns NaN. `a = 0`
+            // and an infinite `a` are edges it answers (`gammainc(0, 1) = 1`,
+            // `gammainc(inf, 1) = 0`), so Strict records nothing for them and returns SciPy's
+            // value (frankenscipy-449uv).
+            RuntimeMode::Strict if a >= 0.0 && x >= 0.0 => Ok(()),
             RuntimeMode::Strict => {
                 record_special_trace(
                     function,
@@ -2439,8 +2602,9 @@ fn validate_incomplete_gamma_domain(
 ///
 /// Four places formed a term like `λˣe^(−λ)/Γ(x+1)` or `xᵃ(1−x)ᵇ/B(a,b)` as the `exp` of a
 /// sum of logs: the Poisson weight and increment anchors of the noncentral walks
-/// ([`poisson_term`], [`crate::beta::beta_term`]), the prefactor of [`regularized_gamma_pair`]
-/// and the front factor of [`crate::beta::betainc_scalar`]. The logs are of size `a·ln a`
+/// ([`poisson_term`], [`crate::beta::beta_term`]), the prefactor of the incomplete gamma pair
+/// (since replaced by xsf's `igam_fac`, frankenscipy-449uv) and the front factor of
+/// [`crate::beta::betainc_scalar`]. The logs are of size `a·ln a`
 /// while their sum is O(ln a), so the exponent carries an absolute error of about
 /// `ε·a·ln a`: at most about 1e-13 below 100, 2.5e-7 at 1e8 and 4e-3 at 1e12 (the table is in
 /// [`poisson_term`]). From 100 up, the saddle-point form holds about 1e-15. Below 100 each of
@@ -2600,187 +2764,6 @@ pub(crate) fn poisson_term(x: f64, lam: f64) -> f64 {
         return if x.is_infinite() { 0.0 } else { log_space() };
     }
     (-stirlerr(x) - bd0(x, lam)).exp() / (std::f64::consts::TAU * x).sqrt()
-}
-
-/// Iteration cap of the incomplete gamma series and continued fraction: `12·√a + 200`.
-///
-/// Near `x ≈ a` the series needs about `8.3·√a` terms and the continued fraction about
-/// `9·a^(1/3)`. The cap used to be bounded by 2,000,000, which cut the series short from
-/// `a ≈ 2.8e10`: `P(1e12, 1e12)` came out 4.4e-2 low (frankenscipy-g9yid). The bound now
-/// applies only from `a = 2^53`, where `ap + 1.0` stops moving and no count of terms helps.
-fn incomplete_gamma_iteration_cap(a: f64) -> usize {
-    if a < crate::beta::POISSON_INDEX_LIMIT {
-        (12.0 * a.sqrt()) as usize + 200
-    } else {
-        2_000_000
-    }
-}
-
-fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64), SpecialError> {
-    if a.is_nan() || x.is_nan() {
-        return Ok((f64::NAN, f64::NAN));
-    }
-    if !a.is_finite() || a <= 0.0 || x < 0.0 {
-        return Ok((f64::NAN, f64::NAN));
-    }
-    if x == 0.0 {
-        return Ok((0.0, 1.0));
-    }
-    if x.is_infinite() {
-        return Ok((1.0, 0.0));
-    }
-
-    // SciPy's Temme zones, 20 < a < 200 with |x − a|/a < 0.3 and a > 200 with
-    // |x − a|/a < 4.5/√a, take Temme's uniform expansion exactly as SciPy's `igam` and `igamc`
-    // do (frankenscipy-6fpkm; see `crate::igam_temme`). Everything outside them runs the
-    // series and continued fraction below, unchanged.
-    if let Some(pair) = crate::igam_temme::igam_igamc_asymptotic(a, x) {
-        return Ok(pair);
-    }
-
-    const EPS: f64 = 1.0e-14;
-    const FPMIN: f64 = 1.0e-300;
-
-    // From a = SADDLE_POINT_MIN_SHAPE up, the large-shape path (frankenscipy-g9yid): the
-    // prefactor xᵃe⁻ˣ/Γ(a) = a·poisson_term(a, x) in saddle-point form, a compensated series
-    // sum, and a stop test that bounds the unsummed tail. Worst relative error of P and Q
-    // over x = a + {0, ±1, 0.9, 2, 10, ±√a, ±3√a}, against scipy.special (Temme's expansion
-    // there; it matched an mpmath series to 2e-15 at a = 1e8):
-    //
-    //     a        before     after
-    //     100      6.1e-14    1.1e-14
-    //     1e4      1.7e-11    5.1e-15
-    //     1e6      1.2e-9     6.0e-15
-    //     1e8      4.5e-7     7.3e-15
-    //     1e10     3.8e-5     2.4e-14
-    //     1e12     4.4e-2     1.2e-13   (continued fraction, x = a + 10; the series ~1e-14)
-    //
-    // Before, the prefactor lost ε·a·ln a, the plain stop `term ≤ 1e-14·sum` left a tail of
-    // about 1e-14·√a/6, the uncompensated sum of ~8√a terms drifted by up to 8e-12 at
-    // a = 1e12, and from a ≈ 2.8e10 the 2,000,000 cap cut the series off. Below the gate the
-    // old code runs unchanged.
-    //
-    // Since frankenscipy-6fpkm the table's points from a = 1e4 up, and all but x = a ± 3√a
-    // at a = 100, are inside SciPy's Temme zones and are answered above; the table records
-    // this series and continued fraction, which still serve everything outside the zones.
-    let large = a >= SADDLE_POINT_MIN_SHAPE;
-    let prefactor = if large {
-        a * poisson_term(a, x)
-    } else {
-        let lg = gammaln_scalar(a, RuntimeMode::Strict)?;
-        (-x + a * x.ln() - lg).exp()
-    };
-    let (p, q) = if x < a + 1.0 {
-        // The lower series Σ xᵏ/(a)_{k+1} needs ~12√a terms to converge near
-        // x≈a (the term ratio x/(a+k) ≈ 1 there); the old fixed 200-term cap
-        // truncated it for large a — e.g. P(5000,5000) was 0.5% off (needs 558
-        // terms). Scale the cap with √a so it stays exact at large a while the
-        // ε-break keeps small/typical a cheap. frankenscipy.
-        let series_max = incomplete_gamma_iteration_cap(a);
-        let mut ap = a;
-        let mut term = 1.0 / a;
-        let mut sum = term;
-        if large {
-            // Neumaier-compensated. Every term is positive and below the first, so
-            // `sum ≥ term` and the fast two-sum is exact. With r = x/(ap + 1) < 1 the terms
-            // left after this one sum to at most term·r/(1 − r), so stopping at
-            // term ≤ ε·sum·(1 − r) bounds the truncation by ε·sum. r is also the next
-            // term's ratio, so each step divides once.
-            let mut carry = 0.0_f64;
-            let mut r = x / (ap + 1.0);
-            for _ in 0..series_max {
-                ap += 1.0;
-                term *= r;
-                let next = sum + term;
-                carry += (sum - next) + term;
-                sum = next;
-                r = x / (ap + 1.0);
-                if term <= sum * f64::EPSILON * (1.0 - r) {
-                    break;
-                }
-            }
-            sum += carry;
-        } else {
-            for _ in 0..series_max {
-                ap += 1.0;
-                term *= x / ap;
-                sum += term;
-                if term.abs() <= sum.abs() * EPS {
-                    break;
-                }
-            }
-        }
-        let lower = prefactor * sum;
-        let p_value = clamp_unit_interval(lower);
-        let q_value = clamp_unit_interval(1.0 - p_value);
-        (p_value, q_value)
-    } else {
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / FPMIN;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        // The upper continued fraction needs ~9·a^(1/3) steps near x≈a (measured
-        // from a = 1e6 to 1e14, frankenscipy-g9yid); the fixed 200-iter cap
-        // truncated it for very large a (Q(100000,100001) was ~1e-5 off). Scale
-        // the cap with √a (the EPS-break keeps typical a cheap), mirroring the
-        // lower-series fix. frankenscipy.
-        let cf_max = incomplete_gamma_iteration_cap(a);
-        for i in 1..=cf_max {
-            let i_f = i as f64;
-            let an = -i_f * (i_f - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < FPMIN {
-                d = FPMIN;
-            }
-            c = b + an / c;
-            if c.abs() < FPMIN {
-                c = FPMIN;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() <= EPS {
-                break;
-            }
-        }
-        let upper = prefactor * h;
-        let q_value = clamp_unit_interval(upper);
-        let p_value = clamp_unit_interval(1.0 - q_value);
-        (p_value, q_value)
-    };
-
-    if !p.is_finite() {
-        record_special_trace(
-            "gammainc",
-            mode,
-            "non_finite_output",
-            format!("a={a},x={x}"),
-            "returned_non_finite",
-            format!("output={p}"),
-            false,
-        );
-    }
-    if !q.is_finite() {
-        record_special_trace(
-            "gammaincc",
-            mode,
-            "non_finite_output",
-            format!("a={a},x={x}"),
-            "returned_non_finite",
-            format!("output={q}"),
-            false,
-        );
-    }
-
-    Ok((p, q))
-}
-
-fn clamp_unit_interval(value: f64) -> f64 {
-    if value.is_nan() {
-        return f64::NAN;
-    }
-    value.clamp(0.0, 1.0)
 }
 
 // REJECTED LEVER, recorded so it is not retried: threading the pole predicate in.
@@ -2970,6 +2953,26 @@ const GAMMA_CEPHES_Q: [f64; 8] = [
     7.14304917030273074085E-2,
     1.00000000000000000320E0,
 ];
+
+/// Cephes' `Gamma` exactly as xsf 0d0a593f computes it, with none of [`gamma_core`]'s
+/// switches, for ports pinned to SciPy's bits (`crate::igam_temme`): +inf and NaN return
+/// themselves and -inf is NaN, `±0` is `±inf`, a negative integer is NaN, Stirling past
+/// `|x| = 33` and the rational reduction within it.
+pub(crate) fn xsf_gamma(x: f64) -> f64 {
+    if !x.is_finite() {
+        return if x > 0.0 { x } else { f64::NAN };
+    }
+    if x == 0.0 {
+        return f64::INFINITY.copysign(x);
+    }
+    if x.abs() > GAMMA_CEPHES_MAX_X {
+        if x < 0.0 && x.floor() == x {
+            return f64::NAN;
+        }
+        return gamma_cephes_stirling(x);
+    }
+    gamma_cephes_reduced(x)
+}
 
 /// `Γ(x)` for `0.5 <= x <= 33` by SciPy's own method: reduce into `[2, 3]`, then one
 /// rational. No transcendental is evaluated anywhere on this path.
@@ -3756,80 +3759,69 @@ pub fn factorialk(n: i64, k: i64) -> f64 {
 
 /// Poisson distribution CDF: P(X <= k) for Poisson with mean m.
 ///
-/// Matches `scipy.special.pdtr(k, m)`.
-///
-/// Uses the relation: pdtr(k, m) = gammaincc(k + 1, m)
+/// SciPy's `pdtr(k, m)`, xsf's `cephes/pdtr.h` bit for bit: NaN for a negative `k` or `m`, 1
+/// at `m = 0` (a NaN `k` included), else `igamc(floor(k) + 1, m)`. SciPy floors a non-integer
+/// count, so pdtr(2.7, 3) is pdtr(2, 3); using k + 1 raw was up to 0.136 off
+/// (frankenscipy-uyhhv).
 ///
 /// # Arguments
 /// * `k` - Number of events (non-negative integer, but accepts float)
 /// * `m` - Expected number of events (mean, must be >= 0)
 pub fn pdtr(k: f64, m: f64) -> f64 {
-    if k.is_nan() || m.is_nan() {
-        return f64::NAN;
-    }
-    if m < 0.0 || k < 0.0 {
+    if k < 0.0 || m < 0.0 {
         return f64::NAN;
     }
     if m == 0.0 {
-        return 1.0; // P(X <= k) = 1 when m = 0
+        return 1.0;
     }
-
-    // pdtr(k, m) = gammaincc(floor(k) + 1, m): SciPy's Cephes floors a non-integer count, so
-    // pdtr(2.7, 3) is pdtr(2, 3). Using k + 1 raw was up to 0.136 off (frankenscipy-uyhhv).
-    gammaincc_scalar(k.floor() + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igamc(k.floor() + 1.0, m)
 }
 
 /// Poisson distribution survival function: P(X > k) for Poisson with mean m.
 ///
-/// Matches `scipy.special.pdtrc(k, m)`.
-///
-/// Uses the relation: pdtrc(k, m) = gammainc(k + 1, m)
+/// SciPy's `pdtrc(k, m)`: NaN for a negative `k` or `m`, 0 at `m = 0`, else
+/// `igam(floor(k) + 1, m)`, with the floor of [`pdtr`].
 ///
 /// # Arguments
 /// * `k` - Number of events (non-negative integer, but accepts float)
 /// * `m` - Expected number of events (mean, must be >= 0)
 pub fn pdtrc(k: f64, m: f64) -> f64 {
-    if k.is_nan() || m.is_nan() {
-        return f64::NAN;
-    }
-    if m < 0.0 || k < 0.0 {
+    if k < 0.0 || m < 0.0 {
         return f64::NAN;
     }
     if m == 0.0 {
-        return 0.0; // P(X > k) = 0 when m = 0
+        return 0.0;
     }
-
-    // pdtrc(k, m) = gammainc(floor(k) + 1, m), with SciPy's floor of the count as in `pdtr`.
-    gammainc_scalar(k.floor() + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igam(k.floor() + 1.0, m)
 }
 
 /// Inverse of Poisson CDF: find m such that pdtr(k, m) = p.
 ///
-/// Matches `scipy.special.pdtri(k, p)`.
-///
-/// Uses Newton's method to find the root.
+/// SciPy's `pdtri(k, p)`: its ufunc casts `k` to a C `int` (NaN stays NaN) and calls xsf's
+/// `cephes/pdtr.h` `pdtri`, which is NaN for a negative count or a `p` outside `[0, 1)` and
+/// otherwise `igamci(k + 1, p)`, bit for bit.
 ///
 /// # Arguments
-/// * `k` - Number of events. SciPy's pdtri takes a C `int`, so a float count is truncated
-///   toward zero: pdtri(2.7, p) is pdtri(2, p) and pdtri(-0.5, p) is pdtri(0, p).
-/// * `p` - Probability in [0, 1): SciPy's Cephes returns NaN at p >= 1 and inf at p = 0.
+/// * `k` - Number of events, truncated toward zero as the C cast does: pdtri(2.7, p) is
+///   pdtri(2, p) and pdtri(-0.5, p) is pdtri(0, p). Out of the `int` range the x86-64 cast
+///   gives `INT_MIN`, and `k = INT_MAX` wraps `k + 1` there, so both are NaN as in SciPy.
+/// * `p` - Probability in [0, 1): NaN at p >= 1, inf at p = 0.
 pub fn pdtri(k: f64, p: f64) -> f64 {
-    if k.is_nan() || p.is_nan() {
+    if k.is_nan() {
+        return k;
+    }
+    // `(int)k` as x86-64's `cvttsd2si` computes it: truncation within the range, INT_MIN
+    // outside it.
+    let k = if k > -2_147_483_649.0 && k < 2_147_483_648.0 {
+        k.trunc() as i32
+    } else {
+        i32::MIN
+    };
+    if k < 0 || !(0.0..1.0).contains(&p) {
         return f64::NAN;
     }
-    let k = k.trunc();
-    if k < 0.0 || !(0.0..1.0).contains(&p) {
-        return f64::NAN;
-    }
-    if p == 0.0 {
-        return f64::INFINITY;
-    }
-
-    // pdtri(k, p): m such that gammaincc(k+1, m) = p, i.e. m = gammainccinv(k+1, p).
-    // Invert the *complemented* incomplete gamma directly rather than via
-    // gammaincinv(k+1, 1 − p): forming `1 − p` loses tail precision for small p,
-    // while the complemented inverse keeps it exact (matches scipy to ~1e-15).
-    crate::convenience::gammainccinv_scalar(k + 1.0, p)
+    // The C's `v = k + 1` is `int` arithmetic, which wraps at INT_MAX.
+    crate::igam_temme::igamci(f64::from(k.wrapping_add(1)), p)
 }
 
 /// Inverse of Poisson CDF with respect to event count k.
@@ -3856,7 +3848,9 @@ pub fn pdtrik(p: f64, m: f64) -> f64 {
         return f64::NAN;
     }
 
-    let shape = gammainc_shape_inv(m, 1.0 - p);
+    // pdtr(k, m) = Q(k + 1, m) = p: the target is `p` on the upper side and `1 − p` on the
+    // lower, and a small `p` is solved as itself (frankenscipy-52i4q).
+    let shape = gamma_shape_inv(m, 1.0 - p, p);
     if !shape.is_finite() {
         return shape;
     }
@@ -3869,20 +3863,15 @@ pub fn pdtrik(p: f64, m: f64) -> f64 {
 /// Returns the probability P(X <= x) where X follows a chi-squared
 /// distribution with v degrees of freedom.
 ///
-/// Matches `scipy.special.chdtr(v, x)`.
+/// SciPy's `chdtr(v, x)`, xsf's `cephes/chdtr.h` bit for bit: NaN for a negative `x`, else
+/// `igam(v/2, x/2)` with all of `igam`'s edges (`chdtr(0, x) = 1` for `x > 0`, a negative `v`
+/// is NaN) (frankenscipy-449uv).
 #[must_use]
 pub fn chdtr(v: f64, x: f64) -> f64 {
-    if v.is_nan() || x.is_nan() {
+    if x < 0.0 {
         return f64::NAN;
     }
-    if v <= 0.0 {
-        return f64::NAN;
-    }
-    if x <= 0.0 {
-        return 0.0;
-    }
-    // chdtr(v, x) = gammainc(v/2, x/2) = P(v/2, x/2)
-    gammainc_scalar(v / 2.0, x / 2.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igam(v / 2.0, x / 2.0)
 }
 
 /// Chi-squared distribution survival function.
@@ -3890,20 +3879,13 @@ pub fn chdtr(v: f64, x: f64) -> f64 {
 /// Returns the probability P(X > x) where X follows a chi-squared
 /// distribution with v degrees of freedom.
 ///
-/// Matches `scipy.special.chdtrc(v, x)`.
+/// SciPy's `chdtrc(v, x)`: NaN for a negative `x`, else `igamc(v/2, x/2)`, as [`chdtr`].
 #[must_use]
 pub fn chdtrc(v: f64, x: f64) -> f64 {
-    if v.is_nan() || x.is_nan() {
+    if x < 0.0 {
         return f64::NAN;
     }
-    if v <= 0.0 {
-        return f64::NAN;
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    // chdtrc(v, x) = gammaincc(v/2, x/2) = Q(v/2, x/2)
-    gammaincc_scalar(v / 2.0, x / 2.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    crate::igam_temme::igamc(v / 2.0, x / 2.0)
 }
 
 /// Non-central chi-squared cumulative distribution function.
@@ -4307,27 +4289,17 @@ pub fn chndtrinc(x: f64, df: f64, p: f64) -> f64 {
 /// Returns x such that P(X > x) = p where X follows a chi-squared
 /// distribution with v degrees of freedom.
 ///
-/// Matches `scipy.special.chdtri(v, p)`.
+/// SciPy's `chdtri(v, p)`, xsf's `cephes/chdtr.h` bit for bit: NaN for a `p` outside
+/// `[0, 1]`, else `2·igamci(v/2, p)` with all of `igamci`'s edges (`p = 0` is inf and `p = 1`
+/// is 0 for every `v ≥ 0`, `v = 0` included) (frankenscipy-449uv).
 #[must_use]
 pub fn chdtri(v: f64, p: f64) -> f64 {
-    if v.is_nan() || p.is_nan() {
+    // The C tests `p < 0 || p > 1`; a NaN `p` passes it and comes back NaN from `igamci`,
+    // which this range test answers directly.
+    if !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if v <= 0.0 || !(0.0..=1.0).contains(&p) {
-        return f64::NAN;
-    }
-    if p == 0.0 {
-        return f64::INFINITY;
-    }
-    if p == 1.0 {
-        return 0.0;
-    }
-    // chdtri(v, p) finds x such that gammaincc(v/2, x/2) = p, i.e.
-    // x = 2 * gammainccinv(v/2, p). Invert the *complemented* incomplete gamma
-    // directly rather than via gammaincinv(v/2, 1 − p): forming `1 − p` loses
-    // all tail precision for small p (e.g. p = 1e-8 was ~6e-9 off), whereas the
-    // complemented inverse keeps the small p exact (matches scipy to ~1e-15).
-    2.0 * crate::convenience::gammainccinv_scalar(v / 2.0, p)
+    2.0 * crate::igam_temme::igamci(0.5 * v, p)
 }
 
 /// Inverse chi-squared distribution CDF with respect to degrees of freedom.
@@ -4351,7 +4323,7 @@ pub fn chdtriv(p: f64, x: f64) -> f64 {
         return 0.0;
     }
 
-    let shape = gammainc_shape_inv(x / 2.0, p);
+    let shape = gamma_shape_inv(x / 2.0, p, 1.0 - p);
     if !shape.is_finite() {
         return shape;
     }
@@ -4359,57 +4331,74 @@ pub fn chdtriv(p: f64, x: f64) -> f64 {
     2.0 * shape
 }
 
-/// Inverse of the regularized lower incomplete gamma function.
-/// Finds x such that gammainc(a, x) = p.
+/// The shape `t` with `P(t, x) = p`, equivalently `Q(t, x) = q`, for `x > 0`, where the
+/// caller passes the target both ways as it holds them (`q = 1 − p` formed once, exactly when
+/// `p ≥ ½`, or the other way round).
 ///
-/// Delegates to `crate::convenience::gammaincinv_scalar`. The local
-/// Newton-Raphson here was diverging when p was close to 0 or 1: the
-/// initial guess for small p reached x ≈ 8 even when the true root
-/// was ~0.15, and Newton walked to the iteration cap returning a
-/// value many orders of magnitude wrong (frankenscipy-jr3na). The
-/// convenience helper is the validated one that the diff_special
-/// gammainc harness already covers at 1e-9 rel.
-fn gammaincinv(a: f64, p: f64) -> f64 {
-    if a <= 0.0 || !(0.0..=1.0).contains(&p) {
-        return f64::NAN;
-    }
-    if p == 0.0 {
-        return 0.0;
-    }
-    if p == 1.0 {
-        return f64::INFINITY;
-    }
-    crate::convenience::gammaincinv_scalar(a, p)
-}
-
-fn gammainc_shape_inv(x: f64, p: f64) -> f64 {
-    let mut lo = 0.0;
-    let mut hi = x.max(1.0);
-    while gammainc_scalar(hi, x, RuntimeMode::Strict).unwrap_or(f64::NAN) > p {
-        lo = hi;
-        hi *= 2.0;
-        if !hi.is_finite() {
-            return f64::INFINITY;
+/// The residual is formed on whichever target is smaller, as cdflib's `cdfgam` (SciPy's
+/// `gdtrib`, `chdtriv` and `pdtrik`) does, and as a log ratio: `ln(p / P(t, x))` for `p ≤ q`,
+/// `ln(Q(t, x) / q)` otherwise. It used to be `p − P(t, x)` always, and near `p = 1` that
+/// residual has no digits left, as `1 − p` has none near `p = 0` for `pdtrik`, which passed
+/// `1 − p`: mpmath put chdtriv 2.66, gdtrib 1.44 and pdtrik 1.0 off there, where SciPy is
+/// within 6e-15 (frankenscipy-52i4q). The log keeps a target like 1e-100 solvable: a plain
+/// `Q − q` runs from −1e-100 to about 0.5 across the first bracket, and Illinois' halving of
+/// the stale end needs ~330 steps to bridge that (pdtrik(1e-100, 300) stopped at 149 for a root
+/// of 19.2). The ratio is formed before the log, so near the root the residual is the relative
+/// difference itself, not a difference of two logs each rounded at `ε·|ln q|`.
+fn gamma_shape_inv(x: f64, p: f64, q: f64) -> f64 {
+    let lower = p <= q;
+    // P(t, x) is monotone DECREASING in t and Q(t, x) INCREASING, so either residual is
+    // increasing, with f(lo) < 0 < f(hi) once the bracket is found. Illinois false-position
+    // converges in ~3-4× fewer evaluations than the old 180-cap bisection.
+    let f = |t: f64| {
+        if lower {
+            (p / crate::igam_temme::igam(t, x)).ln()
+        } else {
+            (crate::igam_temme::igamc(t, x) / q).ln()
         }
-    }
-
-    // P(shape, x) is monotone DECREASING in shape, so f(t) = p − P(t, x) is
-    // increasing with f(lo) < 0 < f(hi). Illinois false-position converges in
-    // ~3-4× fewer gammainc evaluations than the old 180-cap bisection. At lo = 0
-    // the shape-0 limit P(0, x) = 1 (x > 0) gives f(lo) = p − 1 without an extra
-    // (and potentially NaN) gammainc call.
-    let f = |t: f64| p - gammainc_scalar(t, x, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let flo = if lo == 0.0 { p - 1.0 } else { f(lo) };
-    let fhi = f(hi);
+    };
+    // Bracket from max(x, 1): up by doubling, or down by factors of 16. The lower end is never
+    // 0, because `illinois_root`'s tolerance is absolute (4ε) on a bracket that touches 0, and
+    // near p = 1 the roots of chdtriv and gdtrib are 1e-13 to 1e-16 (chdtriv(1 − 2^-53, 1)
+    // stopped at 2^-49 for a root of 3.97e-16 that way).
+    let mut hi = x.max(1.0);
+    let mut fhi = f(hi);
+    let (lo, flo) = if fhi < 0.0 {
+        loop {
+            let (lo, flo) = (hi, fhi);
+            hi *= 2.0;
+            if !hi.is_finite() {
+                return f64::INFINITY;
+            }
+            fhi = f(hi);
+            if !(fhi < 0.0) {
+                break (lo, flo);
+            }
+        }
+    } else {
+        loop {
+            let lo = hi / 16.0;
+            if lo == 0.0 {
+                return 0.0;
+            }
+            let flo = f(lo);
+            if !(flo > 0.0) {
+                break (lo, flo);
+            }
+            (hi, fhi) = (lo, flo);
+        }
+    };
     if fhi == 0.0 {
         return hi;
     }
     if flo == 0.0 {
         return lo;
     }
-    if !flo.is_finite() || !fhi.is_finite() {
+    if flo.is_nan() || fhi.is_nan() {
         return f64::NAN;
     }
+    // An infinite end (P or Q underflowed to 0) is sound: the false-position step is then NaN
+    // and `illinois_root` takes a geometric midpoint until both ends are finite.
     crate::beta::illinois_root(f, lo, hi, flo, fhi)
 }
 
@@ -5032,14 +5021,15 @@ fn zeta_reflection(x: f64) -> f64 {
     (large_term * small_term) * large_term
 }
 
-/// Cephes' Lanczos `g` (Boost's lanczos13m53), which is exact in binary.
+/// Cephes' Lanczos `g` (Boost's lanczos13m53), which is exact in binary. Also `igam_fac`'s
+/// (`crate::igam_temme`).
 #[allow(clippy::excessive_precision)]
-const CEPHES_LANCZOS_G: f64 = 6.024680040776729583740234375;
+pub(crate) const CEPHES_LANCZOS_G: f64 = 6.024680040776729583740234375;
 
 /// Cephes `lanczos_sum_expg_scaled`: `ratevl` over the tables below, evaluated in `1/x` for
 /// `|x| > 1`. Numerator and denominator have equal degree, so Cephes' `pow(x, M - N)` factor is
-/// exactly 1.
-fn cephes_lanczos_sum_expg_scaled(x: f64) -> f64 {
+/// exactly 1. Also `igam_fac`'s (`crate::igam_temme`).
+pub(crate) fn cephes_lanczos_sum_expg_scaled(x: f64) -> f64 {
     #[allow(clippy::excessive_precision)]
     const NUM: [f64; 13] = [
         0.006061842346248906525783753964555936883222,
@@ -7662,7 +7652,7 @@ mod tests {
     #[test]
     fn gdtrib_roundtrip_recovers_shape() {
         // gdtrib(a, gdtr(a, b, x), x) ≈ b
-        // gdtrib uses gammainc_shape_inv, a Newton root finder over b.
+        // gdtrib uses gamma_shape_inv, an Illinois root finder over b.
         for &a in &[0.5, 1.0, 2.5] {
             for &b in &[1.0, 2.0, 3.5] {
                 for &x in &[0.5, 2.0, 5.0] {
@@ -9326,5 +9316,133 @@ mod tests {
             "gammainc(2,1) = {}, expected 0.2642411177",
             val2
         );
+    }
+
+    /// frankenscipy-449uv. The `Result`-free batch of `gammainc`/`gammaincc` is the scalar
+    /// kernel element for element (bits compared, NaN and the edges included) in all three
+    /// shapes, serial and threaded, in both modes. Must-hit: the batch counter moves for every
+    /// clean batch. Must-miss: a batch holding an input `gammainc_scalar` refuses (Hardened,
+    /// a = 0) or traces (Strict, a < 0) does not take it, and still fails or answers NaN there.
+    #[test]
+    fn incomplete_gamma_batch_is_the_scalar_kernel_bit_for_bit() -> Result<(), String> {
+        let hits = || INCOMPLETE_GAMMA_BATCH_HITS.with(std::cell::Cell::get);
+        let mut a: Vec<f64> = (0..700).map(|i| 0.05 + 0.37 * f64::from(i % 97)).collect();
+        let mut x: Vec<f64> = (0..700).map(|i| 1e-3 * 1.9_f64.powi(i % 29)).collect();
+        a[3] = f64::NAN;
+        x[5] = f64::INFINITY;
+        x[7] = 0.0;
+        a[9] = 250.0;
+        x[9] = 251.0;
+        let (va, vx) = (
+            SpecialTensor::RealVec(a.clone()),
+            SpecialTensor::RealVec(x.clone()),
+        );
+        let shapes = [
+            (va.clone(), vx.clone(), 700),
+            (va.clone(), SpecialTensor::RealScalar(2.5), 700),
+            (SpecialTensor::RealScalar(7.25), vx.clone(), 700),
+            (
+                SpecialTensor::RealVec(a[..40].to_vec()),
+                SpecialTensor::RealVec(x[..40].to_vec()),
+                40,
+            ),
+        ];
+        let arg = |t: &SpecialTensor, i: usize| match t {
+            SpecialTensor::RealScalar(v) => Ok(*v),
+            SpecialTensor::RealVec(v) => Ok(v[i]),
+            other => Err(format!("fixture is not real: {other:?}")),
+        };
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for (ta, tx, n) in &shapes {
+                for lower in [true, false] {
+                    let before = hits();
+                    let out = if lower {
+                        gammainc(ta, tx, mode)
+                    } else {
+                        gammaincc(ta, tx, mode)
+                    };
+                    assert_eq!(hits(), before + 1, "a clean batch missed the batch path");
+                    let Ok(SpecialTensor::RealVec(out)) = out else {
+                        return Err(format!("batch returned {out:?}"));
+                    };
+                    assert_eq!(out.len(), *n);
+                    for (i, &got) in out.iter().enumerate() {
+                        let (ai, xi) = (arg(ta, i)?, arg(tx, i)?);
+                        let want = if lower {
+                            gammainc_scalar(ai, xi, mode)
+                        } else {
+                            gammaincc_scalar(ai, xi, mode)
+                        }
+                        .expect("scalar answers a clean input");
+                        assert!(
+                            got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                            "lower={lower} {mode:?} ({ai}, {xi}): batch {got:e}, scalar {want:e}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut refused = a.clone();
+        refused[11] = 0.0;
+        let before = hits();
+        let err = gammainc(&SpecialTensor::RealVec(refused), &vx, RuntimeMode::Hardened);
+        assert!(err.is_err(), "Hardened a = 0 must still fail: {err:?}");
+        let mut negative = a;
+        negative[11] = -1.0;
+        let strict = gammainc(&SpecialTensor::RealVec(negative), &vx, RuntimeMode::Strict);
+        assert_eq!(
+            hits(),
+            before,
+            "a batch with a refused input took the batch path"
+        );
+        let Ok(SpecialTensor::RealVec(strict)) = strict else {
+            return Err(format!("Strict returned {strict:?}"));
+        };
+        assert!(strict[11].is_nan());
+        Ok(())
+    }
+
+    /// frankenscipy-52i4q. `chdtriv`, `gdtrib` and `pdtrik` solve for a shape, and near a
+    /// target of 1 the residual `p − P(t, x)` has no digits left (nor has `1 − p` near 0, which
+    /// `pdtrik` used to pass): mpmath put them 2.66, 1.44 and 1.0 off there. Solving on the
+    /// smaller of `p` and `q` holds each of these to 1e-13 of the root; the must-change rows
+    /// are the four targets within 1e-10 of 1 and the three below 1e-16.
+    ///
+    /// Each root is mpmath's at 50 digits (`Q(t, x) = q` or `P(t, x) = p` solved in log space
+    /// by Anderson-Bjorck in a bracket); SciPy's cdflib agrees with every one to 1.1e-15.
+    #[test]
+    fn shape_inverses_hold_their_tails_to_mpmath() -> Result<(), String> {
+        #[rustfmt::skip]
+        const ROWS: &[(&str, &[f64], f64)] = &[
+            ("chdtriv", &[0.999999999999998, 5.0], 1.6041806396718153e-13),
+            ("chdtriv", &[0.9999999999, 20.0], 4.810855167901038e-05),
+            ("chdtriv", &[0.9999999999999999, 1.0], 3.96668594226602e-16),
+            ("chdtriv", &[1e-10, 3.0], 29.834461441294067),
+            ("chdtriv", &[0.3, 10.0], 13.083141130024424),
+            ("gdtrib", &[1.0, 0.9999999999999996, 2.0], 9.081484087176402e-15),
+            ("gdtrib", &[0.5, 0.999999999999, 10.0], 8.708366415777958e-10),
+            ("gdtrib", &[2.0, 1e-200, 3.0], 185.50393074750812),
+            ("gdtrib", &[1.0, 0.4, 2.0], 2.688963383011637),
+            ("pdtrik", &[2e-17, 60.0], 7.62838061972189),
+            ("pdtrik", &[1e-100, 300.0], 19.235946813073614),
+            ("pdtrik", &[1e-300, 1000.0], 92.33610613862406),
+            ("pdtrik", &[0.5, 5.0], 4.329370268245591),
+            ("pdtrik", &[0.999999999999, 5.0], 26.99622240038523),
+        ];
+        for &(name, args, root) in ROWS {
+            let v: Vec<f64> = args.iter().map(|&t| std::hint::black_box(t)).collect();
+            let got = match name {
+                "chdtriv" => chdtriv(v[0], v[1]),
+                "gdtrib" => gdtrib(v[0], v[1], v[2]),
+                "pdtrik" => pdtrik(v[0], v[1]),
+                other => return Err(format!("no shape inverse {other}")),
+            };
+            let rel = ((got - root) / root).abs();
+            assert!(
+                rel <= 1e-13,
+                "{name}{args:?} = {got:e}, mpmath {root:e}, relative error {rel:e}"
+            );
+        }
+        Ok(())
     }
 }

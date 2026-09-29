@@ -1038,7 +1038,9 @@ mod tests {
     fn gammainc_domain_policy_diverges_by_runtime_mode() {
         let _guard = trace_test_guard();
         let _ = take_special_traces();
-        let invalid_a = SpecialTensor::RealScalar(0.0);
+        // A negative `a` is SciPy's own domain error (NaN). `a = 0` is not: SciPy answers
+        // gammainc(0, 1) = 1, which Strict returns (frankenscipy-449uv).
+        let invalid_a = SpecialTensor::RealScalar(-1.0);
         let one = SpecialTensor::RealScalar(1.0);
 
         let strict = gammainc(&invalid_a, &one, RuntimeMode::Strict).expect("strict returns NaN");

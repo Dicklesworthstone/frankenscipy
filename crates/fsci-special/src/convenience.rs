@@ -5163,117 +5163,13 @@ pub fn gammaincinv(
     })
 }
 
-/// Scalar helper for the inverse regularized incomplete gamma function.
+/// Scalar helper for the inverse regularized incomplete gamma function: SciPy's
+/// `gammaincinv`, xsf's `igami` bit for bit (DiDonato & Morris' estimate and at most three
+/// Halley steps; `crate::igam_temme`, frankenscipy-449uv). It replaced a bracketed Newton
+/// solve that took four to ten full `gammainc` evaluations.
+#[must_use]
 pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
-    // A NaN or negative `a` makes the bracket `hi = a + 4·√a + 10` NaN, and
-    // `x0.clamp(lo + 1e-300, hi)` below PANICS on a NaN bound (frankenscipy-qu5po). SciPy
-    // 1.17.1 rejects both before its p = 0 / p = 1 shortcuts: gammaincinv(nan, y) and
-    // gammaincinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1. A signed zero is not negative
-    // there, so gammaincinv(-0.0, 0) = 0.0 and gammaincinv(-0.0, 1) = inf still.
-    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
-        return f64::NAN;
-    }
-    if y == 0.0 {
-        return 0.0;
-    }
-    if y == 1.0 {
-        return f64::INFINITY;
-    }
-    // a = ±0 and a = inf keep only the y = 0 / y = 1 edges above. For an interior y SciPy
-    // 1.17.1 is nan: gammaincinv(a, y) = nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95
-    // (frankenscipy-g9yid). The Newton loop below answered a number there instead. P(0, x)
-    // and P(inf, x) are NaN, so it bisected on NaN residuals: a float emulation of the loop
-    // ends at about 1.5e-323 for a = 0 and for a = inf with y < 0.5, and at inf for a = inf
-    // with y ≥ 0.5.
-    if a == 0.0 || a == f64::INFINITY {
-        return f64::NAN;
-    }
-
-    let mode = fsci_runtime::RuntimeMode::Strict;
-    let ln_gamma_a = crate::gammaln_scalar(a, mode).unwrap_or(f64::NAN);
-
-    // Initial guess using leading-term power inversion for a < 1, Wilson-Hilferty for a >= 1 and y >= 0.5
-    let x0 = if a < 1.0 {
-        // For a < 1, P(a, x) ~ x^a / Gamma(a+1) across x in (0, 1).
-        // Wilson-Hilferty is invalid for a < 1 (h = 1/(9a) > 1/9 yields negative w and cubes to negative numbers).
-        // Invert in log-space: ln(x) ~ (ln(y) + ln_gamma(a+1)) / a.
-        let ln_gamma_a1 = crate::gammaln_scalar(a + 1.0, mode).unwrap_or(0.0);
-        let ln_x0 = (y.ln() + ln_gamma_a1) / a;
-        if ln_x0 <= 0.0 {
-            ln_x0.exp().max(1e-300)
-        } else {
-            let q = 1.0 - y;
-            if q > 0.0 {
-                (-q.ln() + ln_gamma_a).max(1.0)
-            } else {
-                1.0
-            }
-        }
-    } else if y < 0.5 {
-        // For small y and a >= 1: P(a, x) ~ x^a / (a * Gamma(a))
-        let ln_gamma_a1 = crate::gammaln_scalar(a + 1.0, mode).unwrap_or(0.0);
-        let ln_x0 = (y.ln() + ln_gamma_a1) / a;
-        ln_x0.exp().max(1e-300)
-    } else {
-        // Wilson-Hilferty: the Gamma(a,1) quantile ≈ a·(1 − 1/(9a) + z/√(9a))³ with z = Φ⁻¹(y).
-        // For a >= 1 and y >= 0.5, h = 1/(9a) <= 1/9 and z >= 0, guaranteeing w > 0.
-        let z = ndtri_scalar(y);
-        let h = 1.0 / (9.0 * a);
-        let w = 1.0 - h + z * h.sqrt();
-        (a * w * w * w).max(1e-300)
-    };
-
-    // Bracketed Newton: maintain [lo, hi] where P(a, lo) < y < P(a, hi)
-    let mut lo = 0.0_f64;
-    let mut hi = a + 4.0 * a.sqrt() + 10.0; // generous upper bound
-    // Expand hi if needed
-    while gammainc_conv(a, hi) < y {
-        hi *= 2.0;
-    }
-
-    let mut x = x0.clamp(lo + 1e-300, hi);
-
-    for _ in 0..100 {
-        let p = gammainc_conv(a, x);
-        let err = p - y;
-        // Relative tolerance: an absolute 1e-14 stops far too early when y (and
-        // hence P) is tiny (~1e-4 relative at y=1e-10). frankenscipy-lj6b2.
-        if err.abs() <= 1e-15 * y.max(1e-300) {
-            break;
-        }
-
-        // Update brackets
-        if p < y {
-            lo = x;
-        } else {
-            hi = x;
-        }
-
-        // Newton step: dP/dx = x^(a-1) * e^(-x) / Gamma(a)
-        let dpx = x.powf(a - 1.0) * (-x).exp() / ln_gamma_a.exp();
-        let x_new = if dpx.abs() > 1e-30 {
-            let step = x - err / dpx;
-            // Accept Newton step only if it stays in bracket
-            if step > lo && step < hi {
-                step
-            } else {
-                0.5 * (lo + hi)
-            }
-        } else {
-            0.5 * (lo + hi)
-        };
-
-        // Iterate-convergence break (see betaincinv_scalar): the `1e-15·y` residual
-        // tolerance above is often unreachable (gammainc carries ~1e-15 relative
-        // noise), so without this Newton oscillated at the ULP floor toward the
-        // 100-iter cap — each iter a full gammainc. Return as soon as the estimate
-        // stops moving; x is then the root to machine precision (~3-4 iters).
-        if (x_new - x).abs() <= 4.0 * f64::EPSILON * x.abs().max(f64::MIN_POSITIVE) {
-            return x_new;
-        }
-        x = x_new;
-    }
-    x
+    crate::igam_temme::igami(a, y)
 }
 
 /// Inverse of the complemented regularized incomplete gamma function.
@@ -5289,69 +5185,13 @@ pub fn gammainccinv(
     })
 }
 
-/// Scalar helper for the inverse complemented regularized incomplete gamma function.
+/// Scalar helper for the inverse complemented regularized incomplete gamma function:
+/// SciPy's `gammainccinv`, xsf's `igamci` bit for bit (`crate::igam_temme`,
+/// frankenscipy-449uv). It replaced a full `gammaincinv(a, 1 − y)` solve followed by a Newton
+/// refinement on `Q`.
+#[must_use]
 pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
-    // Same domain as `gammaincinv_scalar`, whose clamp panicked when this delegated a NaN or
-    // negative `a` to it (frankenscipy-qu5po). SciPy 1.17.1: gammainccinv(nan, y) and
-    // gammainccinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1.
-    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
-        return f64::NAN;
-    }
-    if y == 1.0 {
-        return 0.0;
-    }
-    if y == 0.0 {
-        return f64::INFINITY;
-    }
-    // Same as `gammaincinv_scalar` (frankenscipy-g9yid): SciPy 1.17.1 gammainccinv(a, y) =
-    // nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95; only the edges above answer.
-    if a == 0.0 || a == f64::INFINITY {
-        return f64::NAN;
-    }
-
-    // Q(a,x) = y. Routing through gammaincinv(a, 1-y) computes P = 1-Q near 1,
-    // so the small Q resolves to only ~1e-6 (and 1-y rounds to 1 for tiny y).
-    // Instead refine on Q directly with Newton. frankenscipy-lj6b2.
-    let ln_gamma_a =
-        crate::gammaln_scalar(a, fsci_runtime::RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let mut x = if 1.0 - y < 1.0 {
-        gammaincinv_scalar(a, 1.0 - y)
-    } else {
-        // Deep tail: Q(a,x) ~ x^{a-1} e^{-x}/Γ(a) ⟹ x ≈ -ln(y·Γ(a)) + (a-1)ln(x).
-        let t = -y.ln() - ln_gamma_a;
-        let mut s = t.max(1.0);
-        for _ in 0..60 {
-            s = t + (a - 1.0) * s.ln();
-            if !s.is_finite() || s <= 0.0 {
-                s = t;
-                break;
-            }
-        }
-        s
-    };
-    let gamma_a = ln_gamma_a.exp();
-    for _ in 0..30 {
-        let q = gammaincc_conv(a, x);
-        let err = q - y;
-        if err.abs() <= 1e-16 * y.max(1e-300) {
-            break;
-        }
-        let dqx = -x.powf(a - 1.0) * (-x).exp() / gamma_a;
-        if dqx == 0.0 || !dqx.is_finite() {
-            break;
-        }
-        let step = x - err / dqx;
-        let x_new = if step > 0.0 { step } else { 0.5 * x };
-        // Iterate-convergence break (see betaincinv_scalar): the `1e-16·y` residual
-        // tolerance is unreachable (gammaincc carries ~1e-15 noise), so Newton else
-        // oscillates at the ULP floor to the 30-iter cap — the chdtri / chi²-quantile
-        // loss. Return once the estimate stops moving (root to machine precision).
-        if (x_new - x).abs() <= 4.0 * f64::EPSILON * x.abs().max(f64::MIN_POSITIVE) {
-            return x_new;
-        }
-        x = x_new;
-    }
-    x
+    crate::igam_temme::igamci(a, y)
 }
 
 /// Evaluate the complementary error function erfc(x) = 1 - erf(x).
@@ -7123,6 +6963,9 @@ pub fn smirnovi(n: i32, p: f64) -> f64 {
     xsf_smirnov::smirnovi(i64::from(n), p, 1.0 - p)
 }
 
+/// Cephes' `expm1` for the crate's other xsf ports (`crate::igam_temme`'s `igamc_series`).
+pub(crate) use xsf_smirnov::cephes_expm1;
+
 /// xsf `cephes/kolmogorov.h` (the one-sided half, xsf 0d0a593f as compiled by SciPy 1.17.1)
 /// with the parts of `cephes/dd_real.h` and `cephes/unity.h` it calls, ported operation for
 /// operation: every `double_double` operator and libm call is reproduced in the order xsf
@@ -7149,8 +6992,9 @@ mod xsf_smirnov {
     const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
 
     /// cephes `expm1` (`unity.h`): a rational approximation on [−0.5, 0.5], not libm's
-    /// `expm1`, from which it differs in the last bit. Also Owen's T's T1 (`owens_t1`).
-    pub(super) fn cephes_expm1(x: f64) -> f64 {
+    /// `expm1`, from which it differs in the last bit. Also Owen's T's T1 (`owens_t1`), and
+    /// `igamc_series` (`crate::igam_temme`) through [`super::cephes_expm1`].
+    pub(crate) fn cephes_expm1(x: f64) -> f64 {
         const EP: [f64; 3] = [
             1.261_771_930_748_105_908_779_8e-4,
             3.029_944_077_074_419_612_995_6e-2,

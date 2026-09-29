@@ -8,8 +8,10 @@
 //! diff_stats_poisson, and diff_stats_chi2 which exercise the
 //! same kernel indirectly.
 //!
-//! Tolerances: 1e-12 abs cdf/sf (regularized incomplete gamma);
-//! 1e-9 rel ppf (gammaincinv composition).
+//! Gates are exact: each wrapper is xsf's `cephes/gdtr.h`, `pdtr.h` or `chdtr.h` over the
+//! ported `igam`/`igamc`/`igamci` (frankenscipy-449uv), so every value must be SciPy's to the
+//! bit. The inverses are also compared in their tails, p from 1e-300 to 1 − 2^-53, where a
+//! hard-region sweep found the old kernels 6e-2 (chdtri) and 1.9e84 (pdtri) off.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -23,8 +25,6 @@ use fsci_special::{chdtr, chdtrc, chdtri, gdtr, gdtrc, pdtr, pdtrc, pdtri};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const CDF_TOL: f64 = 1.0e-12;
-const PPF_TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per generated function.
 const ARMS: [&str; 8] = [
@@ -228,6 +228,136 @@ fn generate_query() -> OracleQuery {
             });
         }
     }
+
+    // frankenscipy-449uv: the inverses in their tails, p from 1e-300 to 1 − 2^-53, where a
+    // hard-region sweep found the old kernels 6e-2 (chdtri) and 1.9e84 (pdtri) off, and the
+    // forward CDFs across the Temme zones and the Lanczos igam_fac above a = 200.
+    let tails = [
+        1e-300_f64,
+        1e-200,
+        1e-100,
+        1e-50,
+        1e-20,
+        1e-10,
+        1.0 - 1e-10,
+        1.0 - f64::EPSILON / 2.0,
+    ];
+    for &df in &[0.5_f64, 3.0, 20.0, 100.0] {
+        for &q in &tails {
+            points.push(PointCase {
+                case_id: format!("tail_chdtri_df{df}_q{q:e}"),
+                func: "chdtri".to_string(),
+                p1: df,
+                p2: 0.0,
+                arg: q,
+            });
+        }
+    }
+    for &k in &[0.0_f64, 5.0, 30.0, 2.7] {
+        for &q in &tails {
+            points.push(PointCase {
+                case_id: format!("tail_pdtri_k{k}_q{q:e}"),
+                func: "pdtri".to_string(),
+                p1: k,
+                p2: 0.0,
+                arg: q,
+            });
+        }
+    }
+    for &(a, x) in &[
+        (50.0_f64, 45.0),
+        (150.0, 160.0),
+        (300.0, 400.0),
+        (1e4, 1.01e4),
+        (250.0, 20.0),
+    ] {
+        for func in ["chdtr", "chdtrc"] {
+            points.push(PointCase {
+                case_id: format!("wide_{func}_df{}_x{}", 2.0 * a, 2.0 * x),
+                func: func.to_string(),
+                p1: 2.0 * a,
+                p2: 0.0,
+                arg: 2.0 * x,
+            });
+        }
+        for func in ["pdtr", "pdtrc"] {
+            points.push(PointCase {
+                case_id: format!("wide_{func}_k{a}_mu{x}"),
+                func: func.to_string(),
+                p1: a,
+                p2: 0.0,
+                arg: x,
+            });
+        }
+        for func in ["gdtr", "gdtrc"] {
+            points.push(PointCase {
+                case_id: format!("wide_{func}_a0.5_b{a}_x{}", 2.0 * x),
+                func: func.to_string(),
+                p1: 0.5,
+                p2: a,
+                arg: 2.0 * x,
+            });
+        }
+    }
+    // The complements for x ≫ a, x from 1e-10 to 1e4: a forward-CDF sweep over that range found
+    // the old pdtrc 6.05e-3, gdtrc 2.6e-4, pdtr 1.5e-4 and chdtrc 6.4e-5 off.
+    let wide_xs = [1e-10_f64, 1e-3, 50.0, 1e3, 1e4];
+    for &k in &[0.0_f64, 3.0, 12.0, 29.0] {
+        for &mu in &wide_xs {
+            for func in ["pdtr", "pdtrc"] {
+                points.push(PointCase {
+                    case_id: format!("widex_{func}_k{k}_mu{mu:e}"),
+                    func: func.to_string(),
+                    p1: k,
+                    p2: 0.0,
+                    arg: mu,
+                });
+            }
+        }
+    }
+    for &shape in &[0.5_f64, 7.0, 19.0] {
+        for &x in &wide_xs {
+            for func in ["gdtr", "gdtrc"] {
+                points.push(PointCase {
+                    case_id: format!("widex_{func}_a0.7_b{shape}_x{x:e}"),
+                    func: func.to_string(),
+                    p1: 0.7,
+                    p2: shape,
+                    arg: x,
+                });
+            }
+            for func in ["chdtr", "chdtrc"] {
+                points.push(PointCase {
+                    case_id: format!("widex_{func}_df{}_x{x:e}", 2.0 * shape),
+                    func: func.to_string(),
+                    p1: 2.0 * shape,
+                    p2: 0.0,
+                    arg: x,
+                });
+            }
+        }
+    }
+    // SciPy's edges that a plain domain check gets wrong: a zero degree of freedom, shape or
+    // rate is not NaN (chdtr(0, 1) = 1, gdtr(1, 0, 3) = 1, gdtr(0, 2, 3) = 0), and
+    // chdtri(0, 1) is 0.
+    let edges: [(&str, f64, f64, f64); 7] = [
+        ("chdtr", 0.0, 0.0, 1.0),
+        ("chdtrc", 0.0, 0.0, 1.0),
+        ("gdtr", 1.0, 0.0, 3.0),
+        ("gdtrc", 1.0, 0.0, 3.0),
+        ("gdtr", 0.0, 2.0, 3.0),
+        ("gdtrc", 0.0, 2.0, 3.0),
+        ("chdtri", 0.0, 0.0, 1.0),
+    ];
+    for (func, p1, p2, arg) in edges {
+        points.push(PointCase {
+            case_id: format!("edge_{func}_{p1}_{p2}_{arg}"),
+            func: func.to_string(),
+            p1,
+            p2,
+            arg,
+        });
+    }
     OracleQuery { points }
 }
 
@@ -354,11 +484,8 @@ fn diff_special_gdtr_pdtr_chdtr() {
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
 
-        let pass = match arm {
-            "gdtr" | "gdtrc" | "pdtr" | "pdtrc" | "chdtr" | "chdtrc" => abs_diff <= CDF_TOL,
-            "pdtri" | "chdtri" => abs_diff <= PPF_TOL_REL * scale,
-            _ => false,
-        };
+        // Bit for bit, the sign of a zero included (frankenscipy-449uv).
+        let pass = rust_v.to_bits() == scipy_v.to_bits();
         ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),

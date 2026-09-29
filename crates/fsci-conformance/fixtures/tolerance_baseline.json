@@ -1278,15 +1278,9 @@
   "diff_special_gamma_mod_squared.rs": {
     "REL_TOL": 0.03
   },
-  "diff_special_gammainc.rs": {
-    "GAMMAINCINV_TOL_REL": 1e-9,
-    "GAMMAINC_TOL": 1e-12
-  },
+  "diff_special_gammainc.rs": {},
   "diff_special_gammasgn.rs": {},
-  "diff_special_gdtr_pdtr_chdtr.rs": {
-    "CDF_TOL": 1e-12,
-    "PPF_TOL_REL": 1e-9
-  },
+  "diff_special_gdtr_pdtr_chdtr.rs": {},
   "diff_special_gdtrix_fdtridfd.rs": {
     "ABS_TOL": 1e-6,
     "REL_TOL": 1e-6

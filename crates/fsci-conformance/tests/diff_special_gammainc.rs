@@ -8,8 +8,12 @@
 //! Nakagami, Rice, Poisson, NegBinomial, etc. cdf/ppf paths in
 //! fsci-stats.
 //!
-//! Tolerances: 1e-12 abs for the regularized series (mature in
-//! fsci); 1e-9 rel for the inverse.
+//! Gates are exact: fsci's four are xsf's `igam`, `igamc`, `igami` and `igamci`, the code
+//! SciPy 1.17.1 runs, ported operation for operation (frankenscipy-449uv), so every compared
+//! value must be SciPy's to the bit. The grid spans `a` from 1e-3 to 1e5 (both Temme zones,
+//! the Lanczos `igam_fac` above 200), `x` from 1e-3·a to 10·a, and inverse targets from
+//! 1e-300 to 1 − 1e-12, where the old kernels were up to 1.3e-14 (forward) and far more
+//! (inverse tails) off.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -25,8 +29,6 @@ use fsci_special::{gammainc, gammaincc, gammainccinv, gammaincinv};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const GAMMAINC_TOL: f64 = 1.0e-12;
-const GAMMAINCINV_TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per function.
 const ARMS: [&str; 4] = ["gammainc", "gammaincc", "gammaincinv", "gammainccinv"];
@@ -146,6 +148,85 @@ fn generate_query() -> OracleQuery {
                 });
             }
         }
+    }
+
+    // frankenscipy-449uv: every branch of xsf's igam.h and igami.h. Shapes from 1e-3 to 1e5
+    // cross igamc_series (small x), the power series, the continued fraction, both Temme zones
+    // (20 < a < 200 near x = a, and a > 200 within 4.5·√a), and the Lanczos igam_fac above
+    // 200; x runs from 1e-3·a to 10·a, into tails near 1e-300.
+    let wide_as = [
+        1e-3_f64, 0.05, 0.3, 0.9, 1.0, 1.5, 7.5, 21.0, 60.0, 150.0, 250.0, 1e3, 1e4, 1e5,
+    ];
+    let multiples = [1e-3_f64, 0.1, 0.5, 0.9, 0.99, 1.0, 1.01, 1.1, 2.0, 10.0];
+    // Absolute x from 1e-10 to 1e4 as well: a forward-CDF sweep over that range found the old
+    // complement up to 3.9e-5 (gammaincc) off for x ≫ a.
+    let small_xs = [1e-10_f64, 1e-5, 1e-3, 0.3, 0.5, 1.05, 1.2, 50.0, 1e3, 1e4];
+    // Inverse targets down to 1e-300 and up to 1 − 1e-12, both sides of the 0.9 switch.
+    let targets = [
+        1e-300_f64,
+        1e-100,
+        1e-20,
+        1e-5,
+        0.05,
+        0.3,
+        0.5,
+        0.7,
+        0.95,
+        1.0 - 1e-6,
+        1.0 - 1e-12,
+    ];
+    for &a in &wide_as {
+        let xs = multiples.iter().map(|&m| a * m).chain(small_xs);
+        for x in xs {
+            for func in ["gammainc", "gammaincc"] {
+                let case_id = format!("wide_{func}_a{a:e}_x{x:e}");
+                // a·m and a small x can coincide (a = 0.3, m = 1); keep each point once.
+                if points.iter().any(|c: &PointCase| c.case_id == case_id) {
+                    continue;
+                }
+                points.push(PointCase {
+                    case_id,
+                    func: func.to_string(),
+                    a,
+                    x,
+                });
+            }
+        }
+        for &q in &targets {
+            for func in ["gammaincinv", "gammainccinv"] {
+                points.push(PointCase {
+                    case_id: format!("wide_{func}_a{a:e}_q{q:e}"),
+                    func: func.to_string(),
+                    a,
+                    x: q,
+                });
+            }
+        }
+    }
+    // SciPy's edges that are finite: a = 0 (P = 1 for x > 0), a subnormal (xsf's lgam is
+    // +inf there, so P = 0), P above 1 at a = 1e-300, and the Halley loop's early return and
+    // Newton fallback of the inverse. The old kernel answered NaN at a = 0.
+    let edges: [(&str, f64, f64); 12] = [
+        ("gammainc", 0.0, 1.0),
+        ("gammaincc", 0.0, 1.0),
+        ("gammainc", 1e-310, 0.5),
+        ("gammaincc", 1e-310, 0.5),
+        ("gammainc", 1e-300, 0.5),
+        ("gammaincc", 1e-300, 0.5),
+        ("gammaincinv", 0.001, 1e-300),
+        ("gammaincinv", 0.9, 1e-279),
+        ("gammaincinv", 1e6, 0.5),
+        ("gammainccinv", 1e-6, 1e-5),
+        ("gammainccinv", 0.1, 0.012),
+        ("gammainccinv", 0.001, 0.6),
+    ];
+    for (func, a, x) in edges {
+        points.push(PointCase {
+            case_id: format!("edge_{func}_a{a:e}_x{x:e}"),
+            func: func.to_string(),
+            a,
+            x,
+        });
     }
     OracleQuery { points }
 }
@@ -272,14 +353,8 @@ fn diff_special_gammainc() {
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
 
-        let pass = match arm {
-            "gammainc" | "gammaincc" => abs_diff <= GAMMAINC_TOL,
-            "gammaincinv" | "gammainccinv" => {
-                let scale = scipy_v.abs().max(1.0);
-                abs_diff <= GAMMAINCINV_TOL_REL * scale
-            }
-            _ => false,
-        };
+        // Bit for bit, the sign of a zero included (frankenscipy-449uv).
+        let pass = rust_v.to_bits() == scipy_v.to_bits();
         ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),

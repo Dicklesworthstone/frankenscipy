@@ -4,7 +4,8 @@
 //! Resolves [frankenscipy-8436m].
 //!
 //! - `gdtrix(a, b, p)`: inverse gamma CDF, returns x such that
-//!   gdtr(a, b, x) = p. fsci uses gammaincinv(b, p)/a.
+//!   gdtr(a, b, x) = p. SciPy 1.17.1 computes gammaincinv(b, p)/a over xsf's `igami` (not
+//!   cdflib), and so does fsci, bit for bit (frankenscipy-449uv): held exactly, tails included.
 //! - `fdtridfd(dfn, p, x)`: F-distribution CDF inversion solving
 //!   for dfd given (dfn, p, x). Uses CDFlib boundary sentinels at
 //!   ±1e±100; we test only interior regular cases.
@@ -116,6 +117,27 @@ fn generate_query() -> OracleQuery {
             p2: b,
             p3: p,
         });
+    }
+    // frankenscipy-449uv: the tails, p from 1e-300 to 1 − 2^-53, where a hard-region sweep
+    // found the old gammaincinv up to 1e163 (low tail) and 0.237 (just below 1) off.
+    for &(a, b) in &[(0.1_f64, 0.5), (2.5, 20.0), (1.0, 3.0)] {
+        for &p in &[
+            1e-300_f64,
+            1e-150,
+            1e-20,
+            1e-5,
+            0.999,
+            1.0 - 1e-10,
+            1.0 - f64::EPSILON / 2.0,
+        ] {
+            points.push(Case {
+                case_id: format!("gdtrix_tail_a{a}_b{b}_p{p:e}"),
+                op: "gdtrix".into(),
+                p1: a,
+                p2: b,
+                p3: p,
+            });
+        }
     }
 
     // fdtridfd: interior cases — fixed dfn and x, vary p in (0.1, 0.9)
@@ -252,7 +274,14 @@ fn diff_special_gdtrix_fdtridfd() {
         } else {
             abs_d
         };
-        let pass = abs_d <= ABS_TOL || rel_d <= REL_TOL;
+        // gdtrix is SciPy 1.17.1's `gammaincinv(b, p) / a` over xsf's `igami`, which fsci ports
+        // operation for operation, so it is held to SciPy's bits (frankenscipy-449uv).
+        // fdtridfd is a cdflib solve on both sides and keeps the tolerance.
+        let pass = if case.op == "gdtrix" {
+            actual.to_bits() == expected.to_bits()
+        } else {
+            abs_d <= ABS_TOL || rel_d <= REL_TOL
+        };
         max_overall = max_overall.max(abs_d);
         ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {

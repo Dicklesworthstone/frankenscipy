@@ -167,6 +167,28 @@ fn generate_query() -> OracleQuery {
             p3: x,
         });
     }
+    // frankenscipy-449uv: gdtria in its tails, p from 1e-300 to 1 − 2^-53, where a
+    // hard-region sweep found the old gammaincinv up to 3.4e150 (low tail) and 4.9e-2 (just
+    // below 1) off.
+    for &(b, x) in &[(0.5_f64, 0.1), (20.0, 2.5), (3.0, 1.0)] {
+        for &p in &[
+            1e-300_f64,
+            1e-150,
+            1e-20,
+            1e-5,
+            0.999,
+            1.0 - 1e-10,
+            1.0 - f64::EPSILON / 2.0,
+        ] {
+            points.push(PointCase {
+                case_id: format!("gdtria_tail_p{p:e}_b{b}_x{x}"),
+                func: "gdtria".into(),
+                p1: p,
+                p2: b,
+                p3: x,
+            });
+        }
+    }
     // Student-t cases
     let t_seed = [
         (0.05_f64, -1.65),
@@ -303,13 +325,21 @@ fn diff_special_param_solvers() {
         let rel_diff = abs_diff / scale;
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
-        ledger.compared(arm, &case.case_id, abs_diff <= REL_TOL * scale);
+        // gdtria is SciPy 1.17.1's `gammaincinv(b, p) / x` over xsf's `igami` (not cdflib),
+        // which fsci ports operation for operation, so it is held to SciPy's bits
+        // (frankenscipy-449uv). The other four are solves on both sides and keep the tolerance.
+        let pass = if arm == "gdtria" {
+            rust_v.to_bits() == scipy_v.to_bits()
+        } else {
+            abs_diff <= REL_TOL * scale
+        };
+        ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
             abs_diff,
             rel_diff,
-            pass: abs_diff <= REL_TOL * scale,
+            pass,
         });
     }
 
