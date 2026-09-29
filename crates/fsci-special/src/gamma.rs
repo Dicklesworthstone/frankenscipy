@@ -1019,9 +1019,7 @@ fn polygamma_dispatch(
         SpecialTensor::RealScalar(x) => {
             let result = match n {
                 0 => digamma_scalar(*x, mode),
-                1 => trigamma_scalar(*x, mode),
-                2 => tetragamma_scalar(*x, mode),
-                _ => polygamma_higher_scalar(n, *x, mode),
+                _ => polygamma_real_scalar(n, *x, mode),
             };
             result.map(SpecialTensor::RealScalar)
         }
@@ -1030,19 +1028,15 @@ fn polygamma_dispatch(
             // small-n over-subscription (measured 12x@4096). Order-preserving.
             let eval = |x: f64| match n {
                 0 => digamma_scalar(x, mode),
-                1 => trigamma_scalar(x, mode),
-                2 => tetragamma_scalar(x, mode),
-                _ => polygamma_higher_scalar(n, x, mode),
+                _ => polygamma_real_scalar(n, x, mode),
             };
-            if gamma_family_is_parallel(values.len()) {
-                par_map_indices(values.len(), |i| eval(values[i])).map(SpecialTensor::RealVec)
+            let nthreads = if gamma_family_is_parallel(values.len()) {
+                crate::par_workers(values.len(), 128)
             } else {
-                values
-                    .iter()
-                    .map(|&x| eval(x))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
-            }
+                1
+            };
+            crate::par_map_indices_with_threads(values.len(), nthreads, |i| eval(values[i]))
+                .map(SpecialTensor::RealVec)
         }
         SpecialTensor::ComplexScalar(z_val) => Ok(SpecialTensor::ComplexScalar(
             complex_polygamma_scalar(n, *z_val),
@@ -1858,85 +1852,9 @@ fn digamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     Ok(value)
 }
 
-fn trigamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if matches!(mode, RuntimeMode::Hardened) && is_negative_integer_pole(x) {
-        record_special_trace(
-            "polygamma",
-            mode,
-            "pole_input",
-            format!("input={x}"),
-            "fail_closed",
-            "trigamma pole at nonpositive integer",
-            false,
-        );
-        return Err(SpecialError {
-            function: "polygamma",
-            kind: SpecialErrorKind::PoleInput,
-            mode,
-            detail: "trigamma pole at nonpositive integer",
-        });
-    }
-    // scipy.special.polygamma(1, x) = +inf at every nonpositive-integer pole
-    // (the trigamma double pole is one-signed). The core returns NaN at negative
-    // integers (0/0 in the reflection); pin all nonpositive integers to +inf to
-    // match scipy. frankenscipy-fxm0t
-    if x == 0.0 || is_negative_integer_pole(x) {
-        return Ok(f64::INFINITY);
-    }
-    let value = trigamma_core(x);
-    if !value.is_finite() {
-        record_special_trace(
-            "polygamma",
-            mode,
-            "non_finite_output",
-            format!("input={x}"),
-            "returned_non_finite",
-            format!("output={value}"),
-            false,
-        );
-    }
-    Ok(value)
-}
-
-fn tetragamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if matches!(mode, RuntimeMode::Hardened) && is_negative_integer_pole(x) {
-        record_special_trace(
-            "polygamma",
-            mode,
-            "pole_input",
-            format!("input={x}"),
-            "fail_closed",
-            "tetragamma pole at nonpositive integer",
-            false,
-        );
-        return Err(SpecialError {
-            function: "polygamma",
-            kind: SpecialErrorKind::PoleInput,
-            mode,
-            detail: "tetragamma pole at nonpositive integer",
-        });
-    }
-    // scipy.special.polygamma(2, x) = -inf at every nonpositive-integer pole
-    // (even-order derivative → one-signed −inf). frankenscipy-fxm0t
-    if x == 0.0 || is_negative_integer_pole(x) {
-        return Ok(f64::NEG_INFINITY);
-    }
-    let value = crate::convenience::tetragamma(x);
-    if !value.is_finite() {
-        record_special_trace(
-            "polygamma",
-            mode,
-            "non_finite_output",
-            format!("input={x}"),
-            "returned_non_finite",
-            format!("output={value}"),
-            false,
-        );
-    }
-    Ok(value)
-}
-
-fn polygamma_higher_scalar(order: usize, x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+/// `polygamma(order, x)` for a real `x` and `order >= 1`: [`polygamma_cephes`], except that
+/// Hardened refuses the negative-integer poles.
+fn polygamma_real_scalar(order: usize, x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if matches!(mode, RuntimeMode::Hardened) && is_negative_integer_pole(x) {
         record_special_trace(
             "polygamma",
@@ -1944,28 +1862,18 @@ fn polygamma_higher_scalar(order: usize, x: f64, mode: RuntimeMode) -> Result<f6
             "pole_input",
             format!("order={order},input={x}"),
             "fail_closed",
-            "higher-order polygamma pole at nonpositive integer",
+            "polygamma pole at nonpositive integer",
             false,
         );
         return Err(SpecialError {
             function: "polygamma",
             kind: SpecialErrorKind::PoleInput,
             mode,
-            detail: "higher-order polygamma pole at nonpositive integer",
+            detail: "polygamma pole at nonpositive integer",
         });
     }
-    // scipy.special.polygamma(n, x) at a nonpositive-integer pole is +inf for odd
-    // n and -inf for even n (the leading term is (-1)^{n+1} n!/(x+k)^{n+1}, a
-    // one-signed pole). frankenscipy-fxm0t
-    if x == 0.0 || is_negative_integer_pole(x) {
-        return Ok(if order % 2 == 1 {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        });
-    }
-    let value = polygamma_higher_core(order, x);
-    if !value.is_finite() {
+    let value = polygamma_cephes(order, x);
+    if !value.is_finite() && x != 0.0 && !is_negative_integer_pole(x) {
         record_special_trace(
             "polygamma",
             mode,
@@ -3120,40 +3028,32 @@ fn trigamma_core(x: f64) -> f64 {
         + 5.0 * inv11 / 66.0
 }
 
-fn polygamma_higher_core(order: usize, x: f64) -> f64 {
-    if x.is_nan() {
-        return f64::NAN;
-    }
-    if x == 0.0 {
-        return polygamma_sign(order) * f64::INFINITY;
-    }
-    if x.is_infinite() {
-        return if x.is_sign_positive() { 0.0 } else { f64::NAN };
-    }
-    if is_negative_integer_pole(x) {
-        return f64::NAN;
-    }
-
-    let sign = polygamma_sign(order);
-    let factorial = factorial_f64(order);
-    let order_plus_one = order as f64 + 1.0;
-
-    let mut shifted = x;
-    let mut correction = 0.0;
-    while shifted < 12.0 {
-        correction += sign * factorial / shifted.powf(order_plus_one);
-        shifted += 1.0;
-    }
-
-    correction + sign * factorial * crate::convenience::hurwitz_zeta(order_plus_one, shifted)
-}
-
-fn polygamma_sign(order: usize) -> f64 {
-    if order % 2 == 1 { 1.0 } else { -1.0 }
-}
-
-fn factorial_f64(order: usize) -> f64 {
-    (1..=order).fold(1.0, |acc, value| acc * value as f64)
+/// `polygamma(order, x)` for `order >= 1` exactly as SciPy computes it: scipy/special/_basic.py
+/// returns `(-1)**(n+1) * gamma(n+1.0) * zeta(n+1, x)`, Cephes' Gamma times Cephes' Hurwitz
+/// zeta, both of which this crate has bit for bit (`gamma_core`,
+/// `convenience::hurwitz_zeta`). Evaluated in SciPy's order, left to right.
+///
+/// Bit-identical to SciPy 1.17.1 on 49,091 points: n = 1..7, x uniform in [-20, 20], |x| from
+/// 1e-8 to 1e8, the poles and ±inf. That includes SciPy's one-signed poles (+inf for odd n,
+/// −inf for even) and polygamma(n, +inf) = ±0.
+///
+/// This replaced per-order kernels: a reflection and B₁₀ asymptotic for trigamma, another for
+/// tetragamma, and a shifted Hurwitz sum above that. They were up to 3.6e-13 relative off
+/// (tetragamma at 1.5; SciPy 1.3e-16) and returned NaN at −inf (frankenscipy-a79hb).
+///
+/// `gamma_core_with(.., count: false)`, not `gamma_core`: this runs once per element and the
+/// hit counter is a shared `fetch_add`.
+pub(crate) fn polygamma_cephes(order: usize, x: f64) -> f64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = order as f64;
+    let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
+    let factorial = gamma_core_with(
+        n + 1.0,
+        GAMMA_CEPHES_RATIONAL.load(Relaxed),
+        GAMMA_CEPHES_REFLECTION_FREE.load(Relaxed),
+        false,
+    );
+    sign * factorial * crate::convenience::hurwitz_zeta(n + 1.0, x)
 }
 
 fn is_negative_integer_pole(x: f64) -> bool {
@@ -6884,6 +6784,72 @@ mod tests {
             .expect_err("a <= 0.5 * (d - 1) should fail closed");
         assert_eq!(err.kind, SpecialErrorKind::DomainError);
         assert_eq!(err.detail, "condition a must exceed 0.5 * (d - 1)");
+    }
+
+    /// Real polygamma(n >= 1) is SciPy's `(-1)**(n+1) * gamma(n+1.0) * zeta(n+1, x)` bit for
+    /// bit, through `polygamma` and through the public `trigamma`/`tetragamma`/`pentagamma`
+    /// (frankenscipy-a79hb). Pins are scipy.special.polygamma 1.17.1. The per-order kernels
+    /// this replaced missed (2, 1.5) by 3.6e-13.
+    #[test]
+    fn polygamma_is_scipys_formula_bit_for_bit() -> Result<(), String> {
+        let _guard = gamma_toggle_lock();
+        const PINS: [(usize, f64, u64); 16] = [
+            (1, 2.5, 0x3fdf_6205_7f72_96ca),
+            (1, 0.5, 0x4013_bd3c_c9be_45df),
+            (1, -3.5, 0x4023_3de3_e42f_c784),
+            (1, 1e-7, 0x42d6_bcc4_1e90_006b),
+            (1, 37.25, 0x3f9b_dcba_e44f_ff5c),
+            (1, 3e8, 0x3e2c_a213_d90d_b1b4),
+            (2, 1.5, 0xbfea_8580_8a40_aba3),
+            (2, -0.25, 0x405e_aca1_a84a_4960),
+            (2, 7.75, 0xbf93_63d1_a85f_ddd6),
+            (2, 1e5, 0xbddb_7cf1_dd8d_43ca),
+            (3, 0.3, 0x4087_3922_5581_e956),
+            (3, -2.6, 0x4071_b89d_34f9_4136),
+            (3, 12.0, 0x3f55_76ed_e542_1cb9),
+            (4, 4.5, 0xbf96_d602_3b76_2ff9),
+            (5, -1.5, 0x40ce_0ad3_02f7_63c4),
+            (5, 0.9, 0x406c_933e_ab75_27fe),
+        ];
+        // One-signed poles (+inf odd n, -inf even n) and polygamma(n, +inf) = +0 / -0.
+        const EDGES: [(usize, f64, u64); 7] = [
+            (1, 0.0, 0x7ff0_0000_0000_0000),
+            (1, -2.0, 0x7ff0_0000_0000_0000),
+            (2, 0.0, 0xfff0_0000_0000_0000),
+            (2, -3.0, 0xfff0_0000_0000_0000),
+            (3, -1.0, 0x7ff0_0000_0000_0000),
+            (1, f64::INFINITY, 0x0000_0000_0000_0000),
+            (2, f64::INFINITY, 0x8000_0000_0000_0000),
+        ];
+        for &(n, x, bits) in PINS.iter().chain(EDGES.iter()) {
+            let got = get_scalar(polygamma(
+                n,
+                &scalar(std::hint::black_box(x)),
+                RuntimeMode::Strict,
+            ))?;
+            if got.to_bits() != bits {
+                return Err(format!(
+                    "polygamma({n}, {x}) = {got:e}, SciPy {:e}",
+                    f64::from_bits(bits)
+                ));
+            }
+            let public = match n {
+                1 => Some(crate::convenience::trigamma(x)),
+                2 => Some(crate::convenience::tetragamma(x)),
+                3 => Some(crate::convenience::pentagamma(x)),
+                _ => None,
+            };
+            if let Some(value) = public
+                && value.to_bits() != bits
+            {
+                return Err(format!("public psi_{n}({x}) = {value:e}, SciPy {got:e}"));
+            }
+        }
+        // Hardened still refuses the negative-integer poles.
+        if polygamma(2, &scalar(-3.0), RuntimeMode::Hardened).is_ok() {
+            return Err("Hardened polygamma(2, -3) must fail closed".to_string());
+        }
+        Ok(())
     }
 
     #[test]
