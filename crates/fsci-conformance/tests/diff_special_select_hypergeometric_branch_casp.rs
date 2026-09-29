@@ -95,12 +95,21 @@ fn diff_special_select_hypergeometric_branch_casp() {
         RuntimeMode::Strict,
         HypergeometricBranch::DirectSeries,
     );
-    // Large z_abs → AsymptoticExpansion
+    // Large negative z → AsymptoticExpansion (the oscillatory J side)
     probe(
-        "hyp0f1_asymptotic_large_z",
-        HyperCaspProblem::hyp0f1(2.0, 100.0, 1.0e-10),
+        "hyp0f1_asymptotic_large_negative_z",
+        HyperCaspProblem::hyp0f1(2.0, -100.0, 1.0e-10),
         RuntimeMode::Strict,
         HypergeometricBranch::AsymptoticExpansion,
+    );
+    // Large positive z → DirectSeries: past n = -b its terms have one sign, so it cannot
+    // cancel; the ten-term I_nu asymptotic that used to serve it was 5.2e-6 off at
+    // (9.59, 55.4) (frankenscipy-n5ub1).
+    probe(
+        "hyp0f1_direct_series_large_positive_z",
+        HyperCaspProblem::hyp0f1(2.0, 100.0, 1.0e-10),
+        RuntimeMode::Strict,
+        HypergeometricBranch::DirectSeries,
     );
 
     // === Hyp1f1 ===
