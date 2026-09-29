@@ -2869,6 +2869,11 @@ pub(crate) fn gamma_core_with(x: f64, rational: bool, reflection_free: bool, cou
         }
         return gamma_cephes_reduced(x);
     }
+    // Past 33 in magnitude Cephes' Gamma is Stirling's formula, and the reflection through it
+    // below -33: SciPy's gamma, and its rgamma (1/Gamma past |x| = 4), are exactly this.
+    if x.abs() > GAMMA_CEPHES_MAX_X && rational {
+        return gamma_cephes_stirling(x);
+    }
     if x < 0.5 {
         // Reflection formula: Γ(x) = π / (sin(πx) * Γ(1-x))
         let sin_pi_x = crate::convenience::sinpi(x);
@@ -3014,10 +3019,72 @@ fn gamma_cephes_near_zero(z: f64, x: f64) -> f64 {
 /// Euler-Mascheroni as Cephes spells it in `gamma.h`'s small-argument exit.
 const EULER_MASCHERONI_CEPHES: f64 = 0.577_215_664_901_532_9;
 
-/// Upper limit of the rational form. Above it Cephes switches to Stirling; we keep the
-/// Lanczos kernel there instead, which is unchanged behaviour and outside every domain this
-/// harness measures — named rather than silently assumed equivalent.
+/// Upper limit of the rational form. Above it Cephes switches to Stirling's formula
+/// (`gamma_cephes_stirling`); the Lanczos kernel serves only the `false` arm of the Cephes
+/// toggle. It was 2.6e-13 off there where Cephes is 6.7e-16 (frankenscipy-p0y96).
 const GAMMA_CEPHES_MAX_X: f64 = 33.0;
+
+/// Cephes' `Gamma` for |x| > 33: `stirf` above 33, and below -33 the reflection
+/// pi / (|q sin(pi z)| stirf(q)), q = -x, with Cephes' reduction of z to [-1/2, 1/2] and its
+/// sign from the parity of floor(q). Negative integers are poles and never reach here.
+fn gamma_cephes_stirling(x: f64) -> f64 {
+    if x > 0.0 {
+        return cephes_stirf(x);
+    }
+    let q = -x;
+    let mut p = q.floor();
+    let sign = if (p as i64) % 2 == 0 { -1.0 } else { 1.0 };
+    let mut z = q - p;
+    if z > 0.5 {
+        p += 1.0;
+        z = q - p;
+    }
+    let z = q * cephes_sinpi(z);
+    if z == 0.0 {
+        return sign * f64::INFINITY;
+    }
+    sign * (PI / (z.abs() * cephes_stirf(q)))
+}
+
+/// Cephes' `stirf`: Stirling's formula with its `STIR` correction, for 33 <= x < MAXGAM.
+/// Above `MAXSTIR` the power is taken in two halves so x^(x-1/2) cannot overflow before the
+/// division by e^x.
+fn cephes_stirf(x: f64) -> f64 {
+    if x >= GAMMA_MAXGAM_CEPHES {
+        return f64::INFINITY;
+    }
+    let w = 1.0 / x;
+    let w = 1.0 + w * polevl(w, &GAMMA_STIR_CEPHES);
+    let y = x.exp();
+    let y = if x > GAMMA_MAXSTIR_CEPHES {
+        let v = x.powf(0.5 * x - 0.25);
+        v * (v / y)
+    } else {
+        x.powf(x - 0.5) / y
+    };
+    SQRT_2PI_CEPHES * y * w
+}
+
+/// Cephes' `STIR`, the Stirling correction polynomial in 1/x.
+#[allow(clippy::excessive_precision)]
+const GAMMA_STIR_CEPHES: [f64; 5] = [
+    7.87311395793093628397E-4,
+    -2.29549961613378126380E-4,
+    -2.68132617805781232825E-3,
+    3.47222221605458667310E-3,
+    8.33333333333482257126E-2,
+];
+
+/// Cephes' `MAXSTIR`.
+const GAMMA_MAXSTIR_CEPHES: f64 = 143.01608;
+
+/// Cephes' `MAXGAM`: the largest x whose Gamma is finite.
+#[allow(clippy::excessive_precision)]
+const GAMMA_MAXGAM_CEPHES: f64 = 171.624_376_956_302_725;
+
+/// Cephes' `SQRT2PI`.
+#[allow(clippy::excessive_precision)]
+const SQRT_2PI_CEPHES: f64 = 2.506_628_274_631_000_502_415_765_284_811_045_253_007;
 
 fn gamma_lanczos(x: f64) -> f64 {
     let x_minus_1 = x - 1.0;
@@ -6890,6 +6957,61 @@ mod tests {
         match gammasgn(&no_pole, RuntimeMode::Hardened) {
             Ok(SpecialTensor::RealVec(v)) => assert_eq!(v, vec![-1.0, 1.0]),
             other => return Err(format!("expected real vector, got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gamma_and_rgamma_past_33_are_scipy_cephes_stirling_bit_for_bit() -> Result<(), String> {
+        // SciPy 1.17.1: either side of MAXSTIR (143.01608, where stirf splits its power),
+        // up to and past MAXGAM, and the reflection below -33 down to underflow. The Lanczos
+        // sum that served |x| > 33 was up to 2.6e-13 off here.
+        let cases = [
+            (33.25, 6.288_735_965_374_881e35, 1.590_144_673_756_212_3e-36),
+            (
+                50.125,
+                9.908_317_739_893_532e62,
+                1.009_253_060_157_460_4e-63,
+            ),
+            (100.1, 1.478_454_494_651_475e156, 6.763_819_945_880_282e-157),
+            (143.0, 2.695_364_137_888_163e245, 3.710_073_848_439_295e-246),
+            (143.5, 3.220_370_481_730_809e246, 3.105_232_785_087_955e-247),
+            (
+                170.9,
+                4.341_324_334_535_224_6e306,
+                2.303_444_578_063_432e-307,
+            ),
+            (
+                171.6,
+                1.585_896_909_667_256_7e308,
+                6.305_580_103_626_116e-309,
+            ),
+            (171.7, f64::INFINITY, 0.0),
+            (-33.5, 6.227_609_042_535_816e-38, 1.605_752_694_444_689_6e37),
+            (
+                -34.5,
+                -1.805_104_070_300_236_6e-39,
+                -5.539_846_795_834_179e38,
+            ),
+            (-40.3, -1.566_123_497_762_419e-48, -6.385_192_492_346_476e47),
+            (
+                -100.25,
+                -1.503_087_709_322_750_6e-158,
+                -6.652_971_704_828_67e157,
+            ),
+            (
+                -170.5,
+                -3.312_739_521_538_607_4e-308,
+                -3.018_649_650_835_054e307,
+            ),
+            (-180.5, -0.0, f64::NEG_INFINITY),
+        ];
+        for (x, want_gamma, want_rgamma) in cases {
+            let x = std::hint::black_box(x);
+            let g = get_scalar(gamma(&scalar(x), RuntimeMode::Strict))?;
+            assert_eq!(g.to_bits(), f64::to_bits(want_gamma), "gamma({x})");
+            let r = get_scalar(rgamma(&scalar(x), RuntimeMode::Strict))?;
+            assert_eq!(r.to_bits(), f64::to_bits(want_rgamma), "rgamma({x})");
         }
         Ok(())
     }
