@@ -1682,14 +1682,16 @@ fn modstruve_asymptotic(v: f64, x: f64) -> f64 {
 /// even in x: integrating from 0 to a negative endpoint returns the same value
 /// as integrating to the positive endpoint.
 pub fn itstruve0(x: f64) -> f64 {
-    // For |x| ≤ 16 integrate the Struve H_0 series term-by-term (closed form,
-    // ~1e-11 vs scipy) instead of running a Simpson quadrature that re-evaluates
-    // struve() at every node. Beyond 16 the alternating series loses digits to
-    // cancellation, so fall back to the (accuracy-preserving) quadrature.
-    if x.abs() <= STRUVE_INT_SERIES_MAX {
+    // |x| ≤ 6: the term-by-term integral of the H_0 series (7.7e-16 at 6). Past that the
+    // alternating series cancels (7e-15 by 8, 1e-12 by 14), so the rest takes the Laplace
+    // form, which holds 1.4e-15 of the exact integral from 6 up (frankenscipy-ch0z1).
+    let ax = x.abs();
+    if ax <= ITSTRUVE0_SERIES_MAX {
         struve0_integral_series(x, -1.0)
+    } else if ax.is_finite() {
+        itstruve0_laplace(ax)
     } else {
-        struve_integral_abs(x, |t| struve(0.0, t))
+        f64::NAN
     }
 }
 
@@ -1698,13 +1700,15 @@ pub fn itstruve0(x: f64) -> f64 {
 /// Matches `scipy.special.itmodstruve0`; L_0 has the same odd symmetry as H_0
 /// for real inputs, so the integral is even in x.
 pub fn itmodstruve0(x: f64) -> f64 {
-    // Modified-Struve L_0 series has all-positive terms (no cancellation); the
-    // same term-by-term integral closed form is used for |x| ≤ 16, quadrature
-    // beyond. See [`itstruve0`].
-    if x.abs() <= STRUVE_INT_SERIES_MAX {
+    // L_0's series has all-positive terms, so its term-by-term integral cannot cancel: summed
+    // in f64 it is within 1.3e-15 of the exact integral at every x up to the overflow near 713,
+    // where it goes to inf as SciPy does, in about x terms. The Simpson quadrature this replaced
+    // past 16 was 3e-10 off and ~100x slower, and SciPy's own asymptotic past 20 is 7e-9 off at
+    // 25 (frankenscipy-ch0z1).
+    if x.is_finite() {
         struve0_integral_series(x, 1.0)
     } else {
-        struve_integral_abs(x, |t| modstruve(0.0, t))
+        f64::NAN
     }
 }
 
@@ -2192,6 +2196,98 @@ pub fn it2struve0(x: f64) -> f64 {
 /// to cancellation, so the scalar integrals fall back to Simpson quadrature.
 const STRUVE_INT_SERIES_MAX: f64 = 16.0;
 
+/// Above this |x| [`itstruve0`] takes [`itstruve0_laplace`] rather than the series.
+const ITSTRUVE0_SERIES_MAX: f64 = 6.0;
+
+/// The 24-point Gauss-Laguerre rule for the weight `e^{−u}`, as `(node, weight)`, cut after the
+/// 18th node: the six dropped weights are below 6e-18 and their integrand in
+/// [`itstruve0_laplace`] is bounded, so dropping them moves nothing. Computed at 60 digits (the
+/// roots of `L₂₄` polished by Newton; `wᵢ = xᵢ / (25² L₂₅(xᵢ)²)`) and rounded once.
+const GAUSS_LAGUERRE_24: [(f64, f64); 18] = [
+    (0.05901985218150798, 0.14281197333478185),
+    (0.31123914619848375, 0.2587741075174239),
+    (0.7660969055459367, 0.2588067072728698),
+    (1.4255975908036131, 0.18332268897777804),
+    (2.2925620586321904, 0.0981662726299189),
+    (3.3707742642089977, 0.040732478151408645),
+    (4.665083703467171, 0.013226019405120156),
+    (6.1815351187367655, 0.0033693490584783036),
+    (7.927539247172152, 0.0006721625640935479),
+    (9.912098015077706, 0.00010446121465927518),
+    (12.146102711729766, 1.2544721977993332e-05),
+    (14.642732289596674, 1.15131581273728e-06),
+    (17.417992646508978, 7.96081295913363e-08),
+    (20.491460082616424, 4.0728589875499996e-09),
+    (23.887329848169735, 1.507008226292585e-10),
+    (27.635937174332717, 3.917736515058451e-12),
+    (31.776041352374722, 6.894181052958085e-14),
+    (36.35840580165162, 7.819800382459448e-16),
+];
+
+/// The 24-point generalised Gauss-Laguerre rule for the weight `u^{−1/2} e^{−u}`, cut after the
+/// 18th node as [`GAUSS_LAGUERRE_24`] is; weights `Γ(24.5) xᵢ / (24! · 25² · L₂₅^{(−1/2)}(xᵢ)²)`.
+const GAUSS_LAGUERRE_24_HALF: [(f64, f64); 18] = [
+    (0.02543799658568936, 0.6220020607559261),
+    (0.22910231649262433, 0.5079230853295182),
+    (0.6372902787326687, 0.33840894389128223),
+    (1.2517406323627465, 0.18364459415857035),
+    (2.075112909852381, 0.0809593539692077),
+    (3.1110524551477132, 0.0288899231499622),
+    (4.3642830769353065, 0.008306009823955105),
+    (5.840733271323608, 0.0019127846396388305),
+    (7.547704680023454, 0.00035030086360234567),
+    (9.494095330026488, 5.0571980554969775e-05),
+    (11.690695926056073, 5.694517383469696e-06),
+    (14.150586187285759, 4.937317987339501e-07),
+    (16.889671928527108, 3.2450282717915394e-08),
+    (19.927425875242463, 1.5860934990330765e-09),
+    (23.287932824879917, 5.630593075676338e-11),
+    (27.001406056472355, 1.4093865163091777e-12),
+    (31.106464709046566, 2.3951797309583587e-14),
+    (35.653703516328214, 2.630319245316817e-16),
+];
+
+/// `∫₀ˣ H₀(t) dt` for `x > 6` as two Laplace transforms.
+///
+/// `H₀ = Y₀ + K₀` with `K₀(t) = H₀(t) − Y₀(t) = (2/π) ∫₀^∞ e^{−ts} (1+s²)^{−1/2} ds`
+/// (DLMF 11.5.2). Integrating in `t`, with `∫₀^∞ Y₀ = 0`:
+/// - `∫₀ˣ K₀ = (2/π)(ln 2x + γ + I(x))`, where `I(x) = ∫₀^∞ e^{−xs} (1 − (1+s²)^{−1/2}) / s ds`
+///   is non-oscillatory.
+/// - `∫₀ˣ Y₀ = −∫ₓ^∞ Y₀ = −Im[(2i/π) e^{ix} ∫₀^∞ e^{−xs} ds / ((1+is) √(2is − s²))]`. This
+///   comes from rotating `H₀⁽¹⁾(t) = (2/(πi)) ∫₁^∞ e^{its} (s²−1)^{−1/2} ds` onto `s = 1 + iσ`.
+///
+/// With `u = xs` both are Gauss-Laguerre integrals. `I` uses the `e^{−u}` rule on
+/// `(s/x) / (r(1+r))`, where `r = √(1+s²)`; this is `1 − 1/r` written so that it does not
+/// cancel. The oscillatory part uses the `u^{−1/2} e^{−u}` rule and absorbs the `√s`
+/// singularity. For `x ≥ 6` the integrands' singularities, at `u = ±ix` and `u = 2ix`, are far
+/// enough from the positive axis for 18 nodes. Against the exact series at 40 + 0.9x digits,
+/// the worst of 84 points in `[6, 300]` is 1.4e-15.
+fn itstruve0_laplace(x: f64) -> f64 {
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let inv_x = 1.0 / x;
+    let mut i_sum = 0.0;
+    for &(u, w) in &GAUSS_LAGUERRE_24 {
+        let s = u * inv_x;
+        let r = (1.0 + s * s).sqrt();
+        i_sum += w * (s * inv_x) / (r * (1.0 + r));
+    }
+    // J = Σ w / ((1 + is) √(2i − s)); √(2i − s) is the principal root a + ib.
+    let (mut j_re, mut j_im) = (0.0, 0.0);
+    for &(u, w) in &GAUSS_LAGUERRE_24_HALF {
+        let s = u * inv_x;
+        let m = (s * s + 4.0).sqrt();
+        let (a, b) = ((0.5 * (m - s)).sqrt(), (0.5 * (m + s)).sqrt());
+        let (c, d) = (a - s * b, b + s * a);
+        let inv_den = 1.0 / (c * c + d * d);
+        j_re += w * c * inv_den;
+        j_im -= w * d * inv_den;
+    }
+    // ∫ₓ^∞ Y₀ = Im[(2i/π) e^{ix} J / √x] = (2/π)(cos x · J_re − sin x · J_im) / √x.
+    let (sin_x, cos_x) = x.sin_cos();
+    let y0_tail = (2.0 / PI) * inv_x.sqrt() * (cos_x * j_re - sin_x * j_im);
+    (2.0 / PI) * ((2.0 * x).ln() + EULER_GAMMA + i_sum) - y0_tail
+}
+
 /// `∫₀ˣ C_0(t) dt` where `C_0 = H_0` (`sgn = -1`, alternating) or `C_0 = L_0`
 /// (`sgn = +1`, modified). Integrates the Struve/modified-Struve series
 /// term-by-term: `Σ sgnᵏ · x^{2k+2} / (Γ(k+3/2)² · 2^{2k+1} · (2k+2))`, which is
@@ -2248,13 +2344,11 @@ where
         return 0.0;
     }
 
-    // The Struve integrands oscillate with period ~2π (or, for L₀, rise smoothly),
-    // so the old 256·|x| Simpson density was ~1600 points per oscillation — wildly
-    // over-resolved. 64·|x| is ~400/oscillation: worst quadrature error vs
-    // high-precision (mpmath) ground truth is 7.4e-11 for itstruve0 and 3.3e-10 for
-    // itmodstruve0 over x∈[16,127], while cutting the per-node struve()/modstruve()
-    // evaluations ~4×. (This path is already correct where SciPy's own itstruve0
-    // is inaccurate at large x — e.g. itstruve0(50)=3.2445, SciPy returns 6.30.)
+    // Only it2struve0 still integrates here; itstruve0 and itmodstruve0 left it for their
+    // Laplace form and their series (frankenscipy-ch0z1). The integrand oscillates with period
+    // ~2π, so the old 256·|x| Simpson density was ~1600 points per oscillation, wildly
+    // over-resolved. 64·|x| is ~400 per oscillation. When itstruve0 and itmodstruve0 used it,
+    // the worst error vs mpmath over x ∈ [16, 127] was 7.4e-11 and 3.3e-10 respectively.
     let raw_steps = (64.0 * upper.max(1.0)).ceil() as usize;
     let steps = raw_steps.clamp(64, 32_768);
     let steps = steps + (steps % 2);
@@ -16352,7 +16446,8 @@ mod tests {
 
     #[test]
     fn struve_integral_large_x_matches_high_precision_truth() {
-        // |x| > 16 uses the Simpson quadrature (now 64·|x| steps, ~4× cheaper).
+        // |x| > 16 uses the Simpson quadrature for it2struve0 and itmodstruve0 (itstruve0 is
+        // the Laplace form past 6, pinned tighter in itstruve0_past_six_is_the_exact_integral).
         // References are high-precision (mpmath 20-digit) ground truth — NOTE
         // SciPy's own itstruve0 is inaccurate here (itstruve0(50): truth 3.2445,
         // SciPy 6.30), so these lock in fsci's correctness, not SciPy parity.
@@ -16373,6 +16468,79 @@ mod tests {
                 "{label} = {actual}, expected {expected}"
             );
         }
+    }
+
+    /// frankenscipy-ch0z1. Past |x| = 6 `itstruve0` is the Laplace form. Each pin is the exact
+    /// integral: the term-by-term series summed in mpmath at 40 + 0.9x digits, which is more than
+    /// its cancellation costs, then rounded once. The old routes miss these at 2e-15: the double
+    /// series was 1e-12 off by x = 14, and the Simpson quadrature past 16 was 7e-11 off. SciPy's
+    /// own ITSH0 is 1e-12 off at 16, 9e-7 at 29, and O(1) wrong from 40, so SciPy is not the
+    /// reference here.
+    #[test]
+    fn itstruve0_past_six_is_the_exact_integral() {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64); 15] = [
+            (6.25, 1.7909473149001491),
+            (7.5, 1.8267382620256432),
+            (-7.5, 1.8267382620256432),
+            (9.0, 2.287536730163513),
+            (11.3, 2.4751252870662794),
+            (13.7, 2.271809228671129),
+            (15.9, 2.731994117122735),
+            (16.0, 2.74642640255143),
+            (17.2, 2.7712380313606744),
+            (23.7, 2.926592804551052),
+            (29.0, 3.100335851303605),
+            (40.0, 3.148417627447186),
+            (55.5, 3.3947758689205614),
+            (100.0, 3.720914252854685),
+            (250.0, 4.349953826618994),
+        ];
+        for (x, want) in PINS {
+            let got = itstruve0(std::hint::black_box(x));
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-15,
+                "itstruve0({x}) = {got:e}, exact {want:e}, rel {rel:e}"
+            );
+        }
+        // The two routes meet at 6 without a step.
+        let below = itstruve0(ITSTRUVE0_SERIES_MAX);
+        let above = itstruve0(ITSTRUVE0_SERIES_MAX.next_up());
+        assert!(
+            ((above - below) / below).abs() <= 4e-15,
+            "{below:e} | {above:e}"
+        );
+    }
+
+    /// frankenscipy-ch0z1. `itmodstruve0` is its all-positive series at every finite x. Each pin
+    /// is the series summed in mpmath at 50 digits; the Simpson quadrature it replaced past 16 was
+    /// 3e-10 off, and SciPy's asymptotic past 20 is 7e-9 off at 25.
+    #[test]
+    fn itmodstruve0_is_the_exact_integral_up_to_overflow() {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64); 10] = [
+            (16.5, 1499803.0549157115),
+            (18.25, 8170935.521923119),
+            (20.0, 44758596.19878038),
+            (25.0, 5899173181.422938),
+            (-25.0, 5899173181.422938),
+            (30.0, 795538858181.7499),
+            (50.0, 2.9629659299472146e20),
+            (100.0, 1.079217066847346e42),
+            (400.0, 1.0431665100985694e172),
+            (700.0, 1.530688656412344e302),
+        ];
+        for (x, want) in PINS {
+            let got = itmodstruve0(std::hint::black_box(x));
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-15,
+                "itmodstruve0({x}) = {got:e}, exact {want:e}, rel {rel:e}"
+            );
+        }
+        // Past the overflow it is inf, as SciPy's is.
+        assert_eq!(itmodstruve0(std::hint::black_box(715.0)), f64::INFINITY);
     }
 
     #[test]
