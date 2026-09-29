@@ -1736,21 +1736,31 @@ pub(crate) fn jv_scalar(v: f64, z: f64) -> f64 {
     let az = z.abs();
     let av = v.abs();
 
-    // Power series: J_v(z) = (z/2)^v Σ (-z²/4)^k / (k! Γ(v+k+1)). Its largest
-    // term is ~e^z while |J_v| ~ z^{-1/2}, so it loses ~0.43·z digits to
-    // cancellation once z grows — catastrophic for large z (the old z < 20+|v|
-    // cutoff gave jv(30.5,50)=1.48 vs scipy -0.0084, and jv(200.5,198.5) ~1e29
-    // off). The z < 20 cutoff still left ~6-9 digits lost in z ∈ [14, 20)
-    // (jv(1.5,17.2) was 6.5e-9 vs scipy ~1e-15). Crossover the series ↔
-    // asymptotic/Miller at z = 14: below it the series keeps ≳10 digits, above
-    // it the asymptotic/Miller path below is more accurate. Verified vs scipy
-    // 1.17.1: |error| < 1e-10 for v ∈ [0.5, 50], z ∈ [0.25, 60]
-    // (frankenscipy-…); was up to 6.5e-9.
-    if az < 14.0 {
+    // Power series: J_v(z) = (z/2)^v Σ (-z²/4)^k / (k! Γ(v+k+1)). Its terms sum
+    // in magnitude to ~I_v(z) while |J_v| ~ z^{-1/2}, so it cancels away ~0.43·z
+    // digits (the old z < 20+|v| cutoff gave jv(30.5,50)=1.48 vs scipy -0.0084).
+    // Measured against mpmath it holds 1.7e-14 relative below z = 5 and then
+    // loses 5e-13 by z = 8, 1e-11 by z = 11 and 3e-9 by z = 14 (jv(1.567, 11.0),
+    // near a zero), where SciPy is ~1e-14. So the series now stops at z = 5.
+    if az < 5.0 {
         return jv_series(v, z);
     }
 
-    // z ≥ 20. The DLMF 10.17.3 asymptotic only converges for z > v² (term ratio
+    // 5 ≤ z < 17: Temme's method (see bessel_jy_temme), ~1e-14 away from zeros.
+    // It also takes the z ∈ [14, 17) points that went to the Hankel expansion
+    // below, whose smallest term there is still up to 1.4e-13 (v ≈ 3, z = 14);
+    // at z ≥ 17 it is under 4e-16. The Miller branch below normalizes at orders
+    // below 2, where the expansion has already converged at z = 14, so it keeps
+    // [14, 17). frankenscipy-5v5lj.
+    if z > 0.0 && av <= 20_000.0 && (az < 14.0 || (az < 17.0 && (av < 1.0 || az > av * av))) {
+        return bessel_jy_real_order(v, z).0;
+    }
+    if az < 14.0 {
+        // z < 0 (NaN for a non-integer order) and orders past 20000.
+        return jv_series(v, z);
+    }
+
+    // z ≥ 14. The DLMF 10.17.3 asymptotic only converges for z > v² (term ratio
     // ~v²/(2z)); in the band z ≤ v² it diverges (jv(10.5,50) was 0.0296 vs
     // -0.0848). There J_v is reached by a stable Miller backward recurrence from
     // a small base order — valid for both the oscillatory z > |v| and the
@@ -2025,6 +2035,228 @@ fn yv_upward(av: f64, z: f64) -> f64 {
     ym
 }
 
+/// Smallest argument [`bessel_jy_temme`] serves. One step of its downward J recurrence
+/// multiplies by up to ~2ν/x, and the running value is rescaled only once it passes 1e250, so
+/// a step must stay below ~1e58: x ≥ 1e-50 keeps that true for every order up to 20000.
+const JY_TEMME_MIN_X: f64 = 1e-50;
+
+/// (J_v(x), Y_v(x)) for real order v ≥ 0 and x > 0 by Temme's method, as in Numerical
+/// Recipes' `bessjy` (the J/Y sibling of [`kv_temme_scaled`]):
+///
+/// 1. CF1 (modified Lentz) gives f = J'_v/J_v at the target order.
+/// 2. J and J' are recurred DOWN, unnormalised, to μ = v − nl. For x < 2, |μ| ≤ 1/2; for
+///    x ≥ 2 the recurrence stops just below the turning point (μ ≲ x + 1/2). Downward is J's
+///    stable direction on both stretches.
+/// 3. At order μ, Temme's series (x < 2) or Steed's CF2 for p + iq = (J' + iY')/(J + iY)
+///    (x ≥ 2) with the Wronskian J Y' − J' Y = 2/(πx) fixes J_μ, Y_μ and Y_{μ+1}.
+/// 4. J_v is the recurred value rescaled by J_μ, and Y is recurred UP from μ to v, which is
+///    Y's stable direction.
+///
+/// No step sums terms much larger than its result, so the relative error stays near 1e-14
+/// away from zeros for any order, integer-adjacent ones included. The power series it
+/// replaces for 5 ≤ x < 17 cancelled like I_v(x)/|J_v(x)| (3e-9 relative at jv(1.567, 11.0)),
+/// and `(J_v cos vπ − J_{−v})/sin vπ` for Y_v lost a further 1/|sin vπ| next to integer
+/// orders (1.2e-8 at yv(2.99955, 12.83)); SciPy (AMOS) is ~1e-14 on both (frankenscipy-5v5lj).
+///
+/// Two departures from the book, both accuracy: the CF1 coefficients and the recurrence
+/// factors are formed from the order at each step rather than by repeatedly adding 1/x, whose
+/// accumulated rounding cost 1e-12 relative at jv(89.3, 0.97) in a float64 emulation; and the
+/// recurrence is seeded at ±1 and rescaled rather than at 1e-300, so large orders do not
+/// overflow it.
+fn bessel_jy_temme(v: f64, x: f64) -> (f64, f64) {
+    const EPS: f64 = f64::EPSILON;
+    const FPMIN: f64 = 1e-300;
+    const MAXIT: usize = 10_000;
+    const XMIN: f64 = 2.0;
+    let nl = if x < XMIN {
+        (v + 0.5) as usize
+    } else {
+        (v - x + 1.5).max(0.0) as usize
+    };
+    // v − nl and the running order below are exact: subtracting 1 from a double ≥ 1/2 never
+    // rounds.
+    let xmu = v - nl as f64;
+    let xmu2 = xmu * xmu;
+    let xi = 1.0 / x;
+    let xi2 = 2.0 * xi;
+    let w = xi2 / PI;
+
+    // CF1: f = J'_v/J_v, with isign tracking the sign of J_v relative to J_{v+m}.
+    let mut isign = 1.0_f64;
+    let mut h = (v * xi).max(FPMIN);
+    let mut d = 0.0_f64;
+    let mut c = h;
+    for i in 1..=MAXIT {
+        let b = xi2 * (v + i as f64);
+        d = b - d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = b - 1.0 / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = c * d;
+        h *= del;
+        if d < 0.0 {
+            isign = -isign;
+        }
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+
+    // Downward: J_{ν−1} = (ν/x)J_ν + J'_ν, J'_{ν−1} = ((ν−1)/x)J_{ν−1} − J_ν.
+    let mut rjl = isign;
+    let mut rjpl = h * rjl;
+    let mut nu = v;
+    let mut rescale = 1.0_f64;
+    for _ in 0..nl {
+        let rjtemp = nu * xi * rjl + rjpl;
+        nu -= 1.0;
+        rjpl = nu * xi * rjtemp - rjl;
+        rjl = rjtemp;
+        if rjl.abs() > 1e250 {
+            rjl *= 1e-250;
+            rjpl *= 1e-250;
+            rescale *= 1e-250;
+        }
+    }
+    if rjl == 0.0 {
+        rjl = EPS;
+    }
+    let f = rjpl / rjl;
+
+    let (rjmu, rymu, ry1) = if x < XMIN {
+        // Temme's series for Y_μ and Y_{μ+1}, |μ| ≤ 1/2.
+        let x2 = 0.5 * x;
+        let pimu = PI * xmu;
+        let fact = if pimu.abs() < EPS {
+            1.0
+        } else {
+            pimu / pimu.sin()
+        };
+        let d = -x2.ln();
+        let e = xmu * d;
+        let fact2 = if e.abs() < EPS { 1.0 } else { e.sinh() / e };
+        let (gam1, gam2, gampl, gammi) = beschb(xmu);
+        let mut ff = FRAC_2_PI * fact * (gam1 * e.cosh() + gam2 * fact2 * d);
+        let ee = e.exp();
+        let mut p = ee / (gampl * PI);
+        let mut q = 1.0 / (ee * PI * gammi);
+        let pimu2 = 0.5 * pimu;
+        let fact3 = if pimu2.abs() < EPS {
+            1.0
+        } else {
+            pimu2.sin() / pimu2
+        };
+        let r = PI * pimu2 * fact3 * fact3;
+        let mut c = 1.0;
+        let d = -x2 * x2;
+        let mut sum = ff + r * q;
+        let mut sum1 = p;
+        for i in 1..=MAXIT {
+            let fi = i as f64;
+            ff = (fi * ff + p + q) / (fi * fi - xmu2);
+            c *= d / fi;
+            p /= fi - xmu;
+            q /= fi + xmu;
+            let del = c * (ff + r * q);
+            sum += del;
+            sum1 += c * p - fi * del;
+            if del.abs() < (1.0 + sum.abs()) * EPS {
+                break;
+            }
+        }
+        let rymu = -sum;
+        let ry1 = -sum1 * xi2;
+        let rymup = xmu * xi * rymu - ry1;
+        (w / (rymup - f * rymu), rymu, ry1)
+    } else {
+        // Steed's CF2 for p + iq, then the Wronskian.
+        let a0 = 0.25 - xmu2;
+        let mut p = -0.5 * xi;
+        let mut q = 1.0;
+        let br = 2.0 * x;
+        let mut bi = 2.0;
+        let fact = a0 * xi / (p * p + q * q);
+        let mut cr = br + q * fact;
+        let mut ci = bi + p * fact;
+        let den = br * br + bi * bi;
+        let mut dr = br / den;
+        let mut di = -bi / den;
+        let mut dlr = cr * dr - ci * di;
+        let mut dli = cr * di + ci * dr;
+        let temp = p * dlr - q * dli;
+        q = p * dli + q * dlr;
+        p = temp;
+        for i in 2..=MAXIT {
+            let a = a0 + (i * (i - 1)) as f64;
+            bi += 2.0;
+            dr = a * dr + br;
+            di = a * di + bi;
+            if dr.abs() + di.abs() < FPMIN {
+                dr = FPMIN;
+            }
+            let fact = a / (cr * cr + ci * ci);
+            cr = br + cr * fact;
+            ci = bi - ci * fact;
+            if cr.abs() + ci.abs() < FPMIN {
+                cr = FPMIN;
+            }
+            let den = dr * dr + di * di;
+            dr /= den;
+            di /= -den;
+            dlr = cr * dr - ci * di;
+            dli = cr * di + ci * dr;
+            let temp = p * dlr - q * dli;
+            q = p * dli + q * dlr;
+            p = temp;
+            if (dlr - 1.0).abs() + dli.abs() < EPS {
+                break;
+            }
+        }
+        let gam = (p - f) / q;
+        let rjmu = (w / ((p - f) * gam + q)).sqrt().copysign(rjl);
+        let rymu = rjmu * gam;
+        let rymup = rymu * (p + q / gam);
+        (rjmu, rymu, xmu * xi * rymu - rymup)
+    };
+
+    let j = isign * (rjmu / rjl) * rescale;
+    // Upward: Y_{ν+1} = (2ν/x)Y_ν − Y_{ν−1}. Past overflow the order-v value is infinite too.
+    let (mut y_lo, mut y_hi) = (rymu, ry1);
+    for i in 1..=nl {
+        let next = (xmu + i as f64) * xi2 * y_hi - y_lo;
+        y_lo = y_hi;
+        y_hi = next;
+        if !y_hi.is_finite() && i < nl {
+            return (j, y_hi);
+        }
+    }
+    (j, y_lo)
+}
+
+/// (J_v(x), Y_v(x)) for any real non-integer order and x ≥ [`JY_TEMME_MIN_X`], from
+/// [`bessel_jy_temme`] at |v|. A negative order takes the reflection
+/// J_{−p} = cos(pπ)J_p − sin(pπ)Y_p, Y_{−p} = sin(pπ)J_p + cos(pπ)Y_p, with cos(pπ) an
+/// exact zero at half-integer p (whose Y_p can be infinite, and 0·∞ is NaN).
+fn bessel_jy_real_order(v: f64, x: f64) -> (f64, f64) {
+    if v >= 0.0 {
+        return bessel_jy_temme(v, x);
+    }
+    let p = -v;
+    let (jp, yp) = bessel_jy_temme(p, x);
+    let (cos_p, sin_p) = bessel_reflection_trig(p);
+    let (mut j, mut y) = (-sin_p * yp, sin_p * jp);
+    if cos_p != 0.0 {
+        j += cos_p * jp;
+        y += cos_p * yp;
+    }
+    (j, y)
+}
+
 /// Y_v(z) for real order v.
 pub(crate) fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if v.is_nan() || z.is_nan() {
@@ -2042,25 +2274,34 @@ pub(crate) fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, Specia
         );
     }
 
-    // Integer or near-integer order: delegate to avoid catastrophic cancellation in (J_v cos(vπ) - J_{-v}) / sin(vπ)
-    if (v - v.round()).abs() < 1e-12 && v.abs() <= i32::MAX as f64 {
-        let n = v.round() as i32;
-        return yn_scalar(n as f64, z, mode);
+    // Integer order: the integer-order kernels.
+    if v.fract() == 0.0 && v.abs() <= i32::MAX as f64 {
+        return yn_scalar(v, z, mode);
     }
 
     // For z ≥ 20 compute Y_v via the Hankel/K relation (DLMF 10.27.8), matching complex_yv_scalar
     if z >= 20.0 {
         return Ok(complex_yv_hankel(v, Complex64::from_real(z), mode).re);
     }
-
-    // Non-integer order: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ)
-    let sin_vpi = (v * PI).sin();
-    if sin_vpi.abs() < 1e-15 {
-        let n = v.round() as i32;
-        return yn_scalar(n as f64, z, mode);
-    }
     if v.abs() > 20_000.0 {
         return Ok(f64::NEG_INFINITY);
+    }
+
+    // 0 < z < 20, non-integer order: Temme's method. The reflection formula below
+    // cancels like the J_{±v} power series it sums (3e-9 relative at z ≈ 12.7), and
+    // next to an integer order it divides that by sin(vπ) → 0 (1.2e-8 at
+    // yv(2.99955, 12.83)); it used to snap |v − n| < 1e-12 to Y_n for the same
+    // reason. frankenscipy-5v5lj.
+    if z >= JY_TEMME_MIN_X {
+        return Ok(bessel_jy_real_order(v, z).1);
+    }
+
+    // z < 1e-50: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ), with J_{-v} the leading
+    // series term; integer-adjacent orders take Y_n.
+    let sin_vpi = (v * PI).sin();
+    if (v - v.round()).abs() < 1e-12 || sin_vpi.abs() < 1e-15 {
+        let n = v.round() as i32;
+        return yn_scalar(n as f64, z, mode);
     }
 
     let jv_pos = jv_scalar(v, z);
@@ -8218,6 +8459,119 @@ mod tests {
                 (y - yref).abs() <= 1e-9 * yref.abs().max(1e-3),
                 "yv({v},{z}) = {y}, scipy {yref}"
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // mpmath values, correctly rounded
+    fn jv_yv_real_order_mid_argument_match_mpmath() {
+        // frankenscipy-5v5lj: for 5 ≤ x < 20 real-order jv summed a power series that
+        // cancels like I_v(x)/|J_v(x)| (2e-10 relative at x ≈ 13.8), took the Hankel
+        // expansion at x ∈ [14, 17) before it had converged (1.3e-13), and yv divided
+        // (J_v cos vπ − J_{−v}) by sin vπ, which lost a further 1/|sin vπ| next to integer
+        // orders (1.0e-8 at v = 7.00007) or snapped |v − n| < 1e-12 to Y_n (7e-13 at
+        // v = 7 − 3e-13). Every pin sits away from a zero (|f| ≥ 0.3·√(J² + Y²)).
+        // (v, x, mpmath 60-digit value rounded once to f64); the inputs come from the
+        // perf_special_vs_scipy fixture, plus three hand-picked integer-adjacent orders.
+        const REL: f64 = 3e-14;
+        let jv_pins: [(f64, f64, f64); 12] = [
+            (1.3821550535348395, 7.135356093931718, -0.12222526608005967),
+            (1.4253387239838282, 8.036106391680825, 0.11287273856813448),
+            (2.933727898816304, 9.99897150308549, 0.07900784687086908),
+            (1.5460193619419142, 10.55333383999848, 0.09914565955526455),
+            (0.186555440333679, 11.696838909483272, -0.08787141955764792),
+            (3.0677140968577095, 12.793734118797643, 0.0681293301450242),
+            (1.7010132969601093, 13.786288141135577, -0.11652825474683381),
+            (1.7115171654485037, 14.005383983848049, -0.0770648979813219),
+            (-3.000344798965603, 5.718281845154464, -0.1969325768000194),
+            (-1.350267249198252, 8.969351091946724, -0.15189372980311808),
+            (-2.621730334808995, 10.938572184283448, -0.10355752932200774),
+            (-2.4191175426473723, 13.732172803481589, -0.0699065170355083),
+        ];
+        let yv_pins: [(f64, f64, f64); 20] = [
+            (4.000162599512201, 2.7432912701261896, -1.1298916842765592),
+            (3.999796300611098, 2.735650793047621, -1.1373437326377458),
+            (6.9992002023993924, 6.298974603076191, -0.5661859603916003),
+            (7.0000713997858, 6.317146548560355, -0.5615074049935778),
+            (2.8106316681049957, 7.431358205925383, 0.11675905006947336),
+            (2.8493801518595445, 8.239596781209656, -0.08878159231140798),
+            (9.999406001781995, 9.87902486292541, -0.37928406809836746),
+            (2.980564658306025, 10.975920072239782, -0.09111423549587169),
+            (3.027015318954043, 11.944815165554504, 0.11144326408418773),
+            (2.999551001346996, 12.83214300357099, 0.2222126475923163),
+            (3.1207581377255873, 13.900157799526601, 0.16566571021895898),
+            (3.128321715034855, 14.057923326230021, 0.14310806834468123),
+            (1.998547004358987, 19.99242052273843, -0.07833834270830177),
+            (-6.001332696001912, 3.3410244769265693, -3.247367286168547),
+            (-2.9994934015197954, 5.730020809937571, -0.3010605642387799),
+            (-1.0006794979615066, 13.789424631726105, 0.19215287251889768),
+            (-8.000146599560201, 14.781620655138035, -0.10732792095941654),
+            (6.9999999999997, 1.3172, -4586.267632609442),
+            (2.0000000000004, 17.63, 0.1804478490459013),
+            (3.3e-10, 0.0371, -2.1699518880873785),
+        ];
+        let mut failures = Vec::new();
+        for (v, x, want) in jv_pins {
+            let got = jv_scalar(v, x);
+            let rel = (got - want).abs() / want.abs();
+            if !(rel <= REL) {
+                failures.push(format!(
+                    "jv({v}, {x}) = {got:e}, mpmath {want:e}, rel {rel:.2e}"
+                ));
+            }
+        }
+        for (v, x, want) in yv_pins {
+            let got = yv_scalar(v, x, RuntimeMode::Strict).unwrap();
+            let rel = (got - want).abs() / want.abs();
+            if !(rel <= REL) {
+                failures.push(format!(
+                    "yv({v}, {x}) = {got:e}, mpmath {want:e}, rel {rel:.2e}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} pins off by more than {REL:e} relative:\n{}",
+            failures.len(),
+            jv_pins.len() + yv_pins.len(),
+            failures.join("\n")
+        );
+
+        // The public entry points, batched (fanned out) and scaled, take the same kernel.
+        let orders: Vec<f64> = jv_pins.iter().map(|p| p.0).collect();
+        let args: Vec<f64> = jv_pins.iter().map(|p| p.1).collect();
+        let (tv, tx) = (
+            SpecialTensor::RealVec(orders.clone()),
+            SpecialTensor::RealVec(args.clone()),
+        );
+        for batch in [
+            jv(&tv, &tx, RuntimeMode::Strict).unwrap(),
+            jve(&tv, &tx, RuntimeMode::Strict).unwrap(),
+        ] {
+            let SpecialTensor::RealVec(values) = batch else {
+                panic!("real orders and arguments give a real vector");
+            };
+            for ((&v, &x), got) in orders.iter().zip(&args).zip(values) {
+                assert_eq!(got.to_bits(), jv_scalar(v, x).to_bits(), "jv/jve({v}, {x})");
+            }
+        }
+        let orders: Vec<f64> = yv_pins.iter().map(|p| p.0).collect();
+        let args: Vec<f64> = yv_pins.iter().map(|p| p.1).collect();
+        let (tv, tx) = (
+            SpecialTensor::RealVec(orders.clone()),
+            SpecialTensor::RealVec(args.clone()),
+        );
+        for batch in [
+            yv(&tv, &tx, RuntimeMode::Strict).unwrap(),
+            yve(&tv, &tx, RuntimeMode::Strict).unwrap(),
+        ] {
+            let SpecialTensor::RealVec(values) = batch else {
+                panic!("real orders and arguments give a real vector");
+            };
+            for ((&v, &x), got) in orders.iter().zip(&args).zip(values) {
+                let want = yv_scalar(v, x, RuntimeMode::Strict).unwrap();
+                assert_eq!(got.to_bits(), want.to_bits(), "yv/yve({v}, {x})");
+            }
         }
     }
 
