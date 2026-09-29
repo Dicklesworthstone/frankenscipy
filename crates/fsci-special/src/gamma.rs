@@ -4509,64 +4509,31 @@ pub fn zeta(s_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 
 /// Compute the Riemann zeta function ζ(s) for real scalar `s`.
 ///
-/// Matches `scipy.special.zeta(s)`.
+/// SciPy's own dispatch, xsf's `riemann_zeta` (`cephes/zetac.h`): the reflection formula
+/// [`zeta_reflection`] for `s ≤ −0.01`, `1 + zetac(s)` on (−0.01, 1], and the already
+/// bit-identical [`zeta_positive`] above 1. The pieces are [`zetac_scalar`]'s, which were
+/// SciPy's bits before this; `zeta` did not use them.
 ///
-/// Uses direct summation with Euler-Maclaurin acceleration for s > 1,
-/// and the reflection formula for s < 0.
+/// It had its own forms. On (0, 1) it was η(s)/(1 − 2^{1−s}), whose denominator cancels as
+/// s → 1: 0.39 relative off at s = 1 − 4e-16, with NaN where it reached 0, where SciPy's rational
+/// `R(s)/((1 − s)·S(s))` is exact. Its own Taylor series near 0 was 9.3e-14 off, and its
+/// `2^s π^{s−1} sin(πs/2) Γ(1−s) ζ(1−s)` reflection 6.2e-13 (frankenscipy-s57eg).
 pub(crate) fn zeta_scalar(s: f64) -> f64 {
     if s.is_nan() {
         return f64::NAN;
     }
-    if s == 1.0 {
-        return f64::INFINITY; // pole
-    }
-    if s == 0.0 {
-        return -0.5; // ζ(0) = -1/2
-    }
-    if s.abs() < 1.0e-3 {
-        // Near s=0 the reflection formula multiplies a tiny sin(πs/2) by ζ(1−s),
-        // which blows up near its pole at 1 — catastrophic cancellation whose
-        // relative error grows like 1/|s| (≈3e-8 at s=−1e-9). Use the Taylor
-        // series ζ(s) = Σ ζ^(n)(0)/n! · sⁿ instead; 8 terms give full f64
-        // precision for |s| < 1e-3. frankenscipy.
-        #[allow(clippy::excessive_precision)]
-        const ZETA_TAYLOR_0: [f64; 8] = [
-            -0.5,
-            -0.918_938_533_204_672_741_780_329_7,
-            -1.003_178_227_954_292_425_605_05,
-            -1.000_785_194_477_042_407_960_177,
-            -0.999_879_299_500_571_164_957_800_8,
-            -1.000_001_940_896_320_456_037_8,
-            -1.000_001_301_146_013_959_624_312,
-            -0.999_999_831_384_173_610_779_930_2,
-        ];
-        let mut acc = ZETA_TAYLOR_0[7];
-        for &c in ZETA_TAYLOR_0[..7].iter().rev() {
-            acc = acc * s + c;
-        }
-        return acc;
-    }
-    if s > 1.0 {
-        zeta_positive(s)
-    } else if s < 0.0 {
-        // Reflection formula: ζ(s) = 2^s * π^(s-1) * sin(πs/2) * Γ(1-s) * ζ(1-s)
-        let s1 = 1.0 - s;
-        let z1 = zeta_positive(s1);
-        let sin_half_pi_s = crate::convenience::sinpi(s / 2.0);
-        let gamma_1_minus_s = gamma_core(s1);
-        // Compute parts carefully to avoid overflow/underflow
-        let factor = 2.0_f64.powf(s) * PI.powf(s - 1.0) * sin_half_pi_s * gamma_1_minus_s;
-        factor * z1
-    } else {
-        // 0 < s < 1: use Dirichlet eta function relation
-        // ζ(s) = η(s) / (1 - 2^(1-s)) where η(s) = sum (-1)^(n+1) / n^s
-        let eta = dirichlet_eta(s);
-        let denom = 1.0 - 2.0_f64.powf(1.0 - s);
-        if denom == 0.0 {
+    if s <= -0.01 {
+        if s == f64::NEG_INFINITY {
             return f64::NAN;
         }
-        eta / denom
+        return zeta_reflection(-s);
     }
+    if s > 1.0 {
+        return zeta_positive(s);
+    }
+    // (−0.01, 1]: zetac's Taylor series below 0, its table at 0 (ζ(0) = 1 − 1.5), its
+    // rational on (0, 1) and its pole at 1.
+    1.0 + zetac_scalar(s)
 }
 
 /// Zeta for s > 1 via Euler-Maclaurin summation.
@@ -4957,39 +4924,6 @@ fn zeta_positive_affine_vec(values: &[f64]) -> Option<Vec<f64>> {
         });
     }
     Some(out)
-}
-
-/// Dirichlet eta function η(s) = Σ_{n≥1} (-1)^{n+1} / n^s, for s > 0.
-///
-/// Evaluated with Borwein's algorithm (P. Borwein, "An Efficient Algorithm
-/// for the Riemann Zeta Function", 2000). A naive partial sum of the
-/// alternating series converges far too slowly in the critical strip — its
-/// truncation error after `m` terms is ~½·m^{-s}, giving only ~1 digit at
-/// s = 0.5 for m = 100. Borwein's weighted partial sum instead converges
-/// geometrically, with error ~(3+√8)^{-n} ≈ 5.83^{-n}.
-fn dirichlet_eta(s: f64) -> f64 {
-    // d_k = n · Σ_{j=0}^{k} t_j,  with t_0 = 1/n and
-    // t_{j+1} = t_j · 4(n+j)(n-j) / ((2j+1)(2j+2)).
-    const N: usize = 32;
-    let nf = N as f64;
-    let mut d = [0.0_f64; N + 1];
-    let mut t = 1.0 / nf;
-    let mut cumulative = t;
-    d[0] = nf * cumulative;
-    for j in 0..N {
-        let jf = j as f64;
-        t *= 4.0 * (nf + jf) * (nf - jf) / ((2.0 * jf + 1.0) * (2.0 * jf + 2.0));
-        cumulative += t;
-        d[j + 1] = nf * cumulative;
-    }
-    let dn = d[N];
-    // η(s) = -1/d_n · Σ_{k=0}^{n-1} (-1)^k (d_k - d_n) / (k+1)^s.
-    let mut sum = 0.0;
-    for (k, &dk) in d.iter().take(N).enumerate() {
-        let sign = if k.is_multiple_of(2) { 1.0 } else { -1.0 };
-        sum += sign * (dk - dn) / ((k + 1) as f64).powf(s);
-    }
-    -sum / dn
 }
 
 /// Compute the Riemann zeta function complement: zetac(s) = zeta(s) - 1 for real tensors.
@@ -9064,6 +8998,48 @@ mod tests {
                 .unwrap()
                 .is_infinite()
         );
+    }
+
+    #[test]
+    fn zeta_is_scipys_riemann_zeta_bit_for_bit() {
+        // frankenscipy-s57eg: zeta is xsf's riemann_zeta dispatch over zetac's pieces. SciPy
+        // 1.17.1's bits through every branch: the pole's lower edge (the old eta form was 0.39
+        // off at 1 - 4e-16), the rational on (0, 1), the table at 0, the Taylor series on
+        // (-0.01, 0), the reflection side, and the unchanged s > 1. (s, scipy.special.zeta(s)).
+        let cases: [(f64, f64); 22] = [
+            (0.0, -0.5),
+            (-0.0, -0.5),
+            (1e-300, -0.5),
+            (1e-05, -0.5000091894856509),
+            (0.0005, -0.5004597201863201),
+            (0.25, -0.8132784052618918),
+            (0.5, -1.4603545088095866),
+            (0.9, -9.430114019402255),
+            (0.999, -999.422857155788),
+            (0.9999999999, -9999999172.019142),
+            (0.9999999999999996, -2251799813685247.5),
+            (-0.0005, -0.4995407814029189),
+            (-0.005, -0.4954302623133413),
+            (-0.00999, -0.4909189334152535),
+            (-0.01, -0.4909099416053367),
+            (-0.5, -0.2078862249773546),
+            (-2.5, 0.00851692877785033),
+            (-7.3, 0.003936040865716969),
+            (-30.5, 149774871.2779351),
+            (-4.0, 0.0),
+            (1.5, 2.612375348685488),
+            (3.0, 1.2020569031595942),
+        ];
+        for (s, want) in cases {
+            let got = zeta_scalar(std::hint::black_box(s));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "zeta({s:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        assert_eq!(zeta_scalar(1.0), f64::INFINITY);
+        assert!(zeta_scalar(f64::NEG_INFINITY).is_nan());
     }
 
     #[test]
