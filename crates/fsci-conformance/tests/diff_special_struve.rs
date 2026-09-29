@@ -275,6 +275,16 @@ fn generate_integral_query() -> IntegralQuery {
             x,
         });
     }
+    // it2struve0 past |x| = 6 is its amplitude-phase tail (frankenscipy-ch0z1). These points
+    // stop at 20 because SciPy's ITTH0 is within 5e-10 of the exact integral only up to there;
+    // it is 2e-8 off at 23 and 6e-8 at 23.7.
+    for x in [6.25_f64, -7.5, 9.0, 11.3, 13.7, 16.0, 17.2, 20.0] {
+        points.push(IntegralCase {
+            case_id: format!("it2struve0_x{x}"),
+            func: "it2struve0".into(),
+            x,
+        });
+    }
     IntegralQuery { points }
 }
 
