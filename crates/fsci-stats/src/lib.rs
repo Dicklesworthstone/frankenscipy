@@ -58063,19 +58063,13 @@ pub fn xlog1py(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln_1p() }
 }
 
-/// Relative entropy (elementwise): x*log(x/y).
-/// Matches `scipy.special.rel_entr(x, y)`.
+/// Relative entropy (elementwise): x*log(x/y), `scipy.special.rel_entr(x, y)` bit for bit.
+///
+/// fsci-special's kernel, not a second copy: this one was the bare `x*log(x/y)`, 1.9e-12 off where
+/// x is close to y.
+#[must_use]
 pub fn rel_entr(x: f64, y: f64) -> f64 {
-    if x.is_nan() || y.is_nan() {
-        return f64::NAN;
-    }
-    if x == 0.0 && y >= 0.0 {
-        0.0
-    } else if x > 0.0 && y > 0.0 {
-        x * (x / y).ln()
-    } else {
-        f64::INFINITY
-    }
+    fsci_special::rel_entr_scalar(x, y)
 }
 
 /// Logit function: log(p / (1 - p)).
