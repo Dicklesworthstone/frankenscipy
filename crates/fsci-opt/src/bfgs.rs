@@ -879,8 +879,8 @@ pub(crate) fn line_search_wolfe12<O: LineObjective>(
 
 pub(crate) struct BfgsParams {
     pub gtol: f64,
-    /// `norm=np.inf` (SciPy's default) when true, else the 2-norm.
-    pub norm_inf: bool,
+    /// SciPy's `norm`: the order of the gradient norm (default `np.inf`).
+    pub norm: f64,
     pub maxiter: usize,
     pub xrtol: f64,
     pub c1: f64,
@@ -910,16 +910,41 @@ pub(crate) const fn status_message(status: u8) -> &'static str {
     }
 }
 
-fn vecnorm(v: &[f64], inf: bool) -> f64 {
-    if inf {
-        // `np.amax(np.abs(v))` propagates NaN.
+/// SciPy's `vecnorm(x, ord)` (`_optimize.py`): `amax(abs(x))` for ord = ∞, `amin(abs(x))` for
+/// ord = −∞ (both propagate NaN), else `sum(abs(x)**ord)**(1/ord)` summed as numpy sums
+/// (frankenscipy-6ycp2: SciPy's `norm` option).
+fn vecnorm(v: &[f64], ord: f64) -> f64 {
+    if ord.is_infinite() {
         if v.iter().any(|x| x.is_nan()) {
-            f64::NAN
-        } else {
-            v.iter().fold(0.0_f64, |m, x| m.max(x.abs()))
+            return f64::NAN;
         }
+        let abs = v.iter().map(|x| x.abs());
+        return if ord == f64::INFINITY {
+            abs.fold(0.0_f64, f64::max)
+        } else {
+            abs.fold(f64::INFINITY, f64::min)
+        };
+    }
+    let powered: Vec<f64> = v.iter().map(|&x| np_abs_power(x, ord)).collect();
+    np_add_reduce(&powered).powf(1.0 / ord)
+}
+
+/// numpy's `abs(x) ** ord` for a scalar exponent, with numpy's fast paths (`square`, `sqrt`,
+/// `reciprocal`, identity) so the bits match.
+fn np_abs_power(x: f64, ord: f64) -> f64 {
+    let a = x.abs();
+    if ord == 2.0 {
+        a * a
+    } else if ord == 1.0 {
+        a
+    } else if ord == 0.5 {
+        a.sqrt()
+    } else if ord == -1.0 {
+        1.0 / a
+    } else if ord == 0.0 {
+        1.0
     } else {
-        dot(v, v).sqrt()
+        a.powf(ord)
     }
 }
 
@@ -941,7 +966,7 @@ pub(crate) fn minimize_bfgs<O: LineObjective>(
     let mut xk = x0.to_vec();
     let mut warnflag = 0_u8;
     let mut stopped_by_callback = false;
-    let mut gnorm = vecnorm(&gfk, params.norm_inf);
+    let mut gnorm = vecnorm(&gfk, params.norm);
     while gnorm > params.gtol && k < params.maxiter {
         let pk: Vec<f64> = (0..n)
             .map(|i| -dot(&hk[i * n..(i + 1) * n], &gfk))
@@ -979,11 +1004,11 @@ pub(crate) fn minimize_bfgs<O: LineObjective>(
             stopped_by_callback = true;
             break;
         }
-        gnorm = vecnorm(&gfk, params.norm_inf);
+        gnorm = vecnorm(&gfk, params.norm);
         if gnorm <= params.gtol {
             break;
         }
-        if alpha_k * vecnorm(&pk, false) <= params.xrtol * (params.xrtol + vecnorm(&xk, false)) {
+        if alpha_k * vecnorm(&pk, 2.0) <= params.xrtol * (params.xrtol + vecnorm(&xk, 2.0)) {
             break;
         }
         if !old_fval.is_finite() {
@@ -1039,8 +1064,8 @@ pub(crate) fn minimize_bfgs<O: LineObjective>(
 
 pub(crate) struct CgParams {
     pub gtol: f64,
-    /// `norm=np.inf` (SciPy's default) when true, else the 2-norm.
-    pub norm_inf: bool,
+    /// SciPy's `norm`: the order of the gradient norm (default `np.inf`).
+    pub norm: f64,
     pub maxiter: usize,
     pub c1: f64,
     pub c2: f64,
@@ -1072,14 +1097,14 @@ fn polak_ribiere_powell_step(
     pk: &[f64],
     gfk: &[f64],
     deltak: f64,
-    norm_inf: bool,
+    norm: f64,
 ) -> PrStep {
     let x = point(xk, alpha, pk);
     let yk: Vec<f64> = gfkp1.iter().zip(gfk).map(|(a, b)| a - b).collect();
     // Python's `max(0, v)`: 0 unless v > 0, so a NaN ratio restarts along -g.
     let beta_k = py_max(0.0, dot(&yk, &gfkp1) / deltak);
     let p = gfkp1.iter().zip(pk).map(|(g, p)| -g + beta_k * p).collect();
-    let gnorm = vecnorm(&gfkp1, norm_inf);
+    let gnorm = vecnorm(&gfkp1, norm);
     PrStep {
         alpha,
         x,
@@ -1106,7 +1131,7 @@ pub(crate) fn minimize_cg<O: LineObjective>(
     let mut warnflag = 0_u8;
     let mut stopped_by_callback = false;
     let mut pk: Vec<f64> = gfk.iter().map(|g| -g).collect();
-    let mut gnorm = vecnorm(&gfk, params.norm_inf);
+    let mut gnorm = vecnorm(&gfk, params.norm);
     while gnorm > params.gtol && k < params.maxiter {
         let deltak = dot(&gfk, &gfk);
         let mut cached: Option<PrStep> = None;
@@ -1119,7 +1144,7 @@ pub(crate) fn minimize_cg<O: LineObjective>(
                     &pk,
                     &gfk,
                     deltak,
-                    params.norm_inf,
+                    params.norm,
                 );
                 // Accept a step that converges, or one whose next direction descends enough.
                 let accept = step.gnorm <= params.gtol
@@ -1154,7 +1179,7 @@ pub(crate) fn minimize_cg<O: LineObjective>(
                     Some(g) => g,
                     None => obj.grad(&point(&xk, ls.alpha, &pk))?,
                 };
-                polak_ribiere_powell_step(ls.alpha, gfkp1, &xk, &pk, &gfk, deltak, params.norm_inf)
+                polak_ribiere_powell_step(ls.alpha, gfkp1, &xk, &pk, &gfk, deltak, params.norm)
             }
         };
         xk = step.x;

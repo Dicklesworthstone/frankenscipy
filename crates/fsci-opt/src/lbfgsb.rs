@@ -80,6 +80,9 @@ pub(crate) struct LbfgsbOutcome {
     pub stop: LbfgsbStop,
     /// `_minimize_lbfgsb`'s warnflag: 0 converged, 1 maxfun / maxiter, 2 otherwise.
     pub warnflag: u8,
+    /// The stored correction pairs as SciPy reads them for `hess_inv`: the first
+    /// `min(iupdat, m)` columns of `ws` and `wy`, in storage order (frankenscipy-6ycp2).
+    pub corrections: (Vec<Vec<f64>>, Vec<Vec<f64>>),
 }
 
 /// `ddot` with unit strides, in order.
@@ -1344,6 +1347,14 @@ pub(crate) fn minimize_lbfgsb<O: LbfgsbObjective>(
         _ if obj.nfev() > params.maxfun || n_iterations >= params.maxiter => 1,
         _ => 2,
     };
+    // `_minimize_lbfgsb`: `s = wa[0: m*n].reshape(m, n)`, `n_corrs = min(isave[30], maxcor)`
+    // (isave[30] is iupdat), `LbfgsInvHessProduct(s[:n_corrs], y[:n_corrs])`.
+    let n_corrs = mem.iupdat.min(m);
+    let columns = |w: &[f64]| -> Vec<Vec<f64>> {
+        (0..n_corrs)
+            .map(|k| w[k * n..(k + 1) * n].to_vec())
+            .collect()
+    };
     Ok(LbfgsbOutcome {
         x,
         fun: f,
@@ -1351,6 +1362,7 @@ pub(crate) fn minimize_lbfgsb<O: LbfgsbObjective>(
         nit: n_iterations,
         stop,
         warnflag,
+        corrections: (columns(&mem.ws), columns(&mem.wy)),
     })
 }
 
