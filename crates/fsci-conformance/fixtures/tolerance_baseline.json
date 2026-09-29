@@ -1147,6 +1147,7 @@
   },
   "diff_special_bessel_jv_yv.rs": {
     "ABS_TOL": 1e-6,
+    "REGIME_REL_TOL": 1e-12,
     "REL_TOL": 1e-6
   },
   "diff_special_bessel_modified.rs": {
