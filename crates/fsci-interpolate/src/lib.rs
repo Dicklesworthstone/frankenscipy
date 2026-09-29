@@ -17,7 +17,7 @@
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
+use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
 use std::collections::HashMap;
 
 /// Create a new shared audit ledger for synchronous contexts.
@@ -135,6 +135,20 @@ impl std::fmt::Display for InterpError {
 
 impl std::error::Error for InterpError {}
 
+impl InterpError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::TooFewPoints { .. } => "too_few_points",
+            Self::UnsortedX => "unsorted_x",
+            Self::NonFiniteX => "non_finite_x",
+            Self::LengthMismatch { .. } => "length_mismatch",
+            Self::OutOfBounds { .. } => "out_of_bounds",
+            Self::InvalidArgument { .. } => "invalid_argument",
+        }
+    }
+}
+
 /// Options for 1D interpolation.
 #[derive(Debug, Clone, Copy)]
 pub struct Interp1dOptions {
@@ -207,22 +221,35 @@ impl Interp1d {
     }
 
     /// Create a new 1D interpolator with optional audit ledger.
+    ///
+    /// With a ledger, every error it returns, in either mode, is recorded as one `FailClosed`
+    /// event (frankenscipy-3cu8u.2).
     pub fn new_with_audit(
         x: &[f64],
         y: &[f64],
         options: Interp1dOptions,
         audit_ledger: Option<&SyncSharedAuditLedger>,
     ) -> Result<Self, InterpError> {
+        let fingerprint = || interp1d_audit_fingerprint(x, y, &options);
+        let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint));
+        let result = Self::build_audited(x, y, options, audit.as_ref());
+        audit_finish(audit.as_ref(), result, InterpError::reason_code)
+    }
+
+    /// [`Self::new_with_audit`]'s construction, recording its rejections under `audit`.
+    fn build_audited(
+        x: &[f64],
+        y: &[f64],
+        options: Interp1dOptions,
+        audit: Option<&AuditScope<'_>>,
+    ) -> Result<Self, InterpError> {
         if matches!(options.mode, RuntimeMode::Hardened) {
             if x.len() > HARDENED_MAX_DIM {
-                if let Some(ledger) = audit_ledger {
-                    record_fail_closed(
-                        ledger,
-                        &interp1d_audit_fingerprint(x, y, &options),
-                        "dimension exceeds hardened limit",
-                        "rejected",
-                    );
-                }
+                audit_reject(
+                    audit,
+                    "resource_exhausted",
+                    "rejected: dimension exceeds hardened limit",
+                );
                 return Err(InterpError::InvalidArgument {
                     detail: format!(
                         "x length ({}) exceeds hardened limit ({HARDENED_MAX_DIM})",
@@ -231,14 +258,11 @@ impl Interp1d {
                 });
             }
             if y.iter().any(|&v| !v.is_finite()) {
-                if let Some(ledger) = audit_ledger {
-                    record_fail_closed(
-                        ledger,
-                        &interp1d_audit_fingerprint(x, y, &options),
-                        "non-finite y values in hardened mode",
-                        "rejected",
-                    );
-                }
+                audit_reject(
+                    audit,
+                    "non_finite_input",
+                    "rejected: y values must be finite in hardened mode",
+                );
                 return Err(InterpError::InvalidArgument {
                     detail: "y values must be finite in hardened mode".to_string(),
                 });

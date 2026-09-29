@@ -3,7 +3,8 @@
 use fsci_opt::root::brentq;
 use fsci_opt::types::RootOptions;
 use fsci_runtime::{
-    Fingerprinter, OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode,
+    AuditScope, Fingerprinter, OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio,
+    RuntimeMode,
 };
 
 use crate::IntegrateValidationError;
@@ -11,7 +12,7 @@ use crate::bdf::{BdfSolver, BdfSolverConfig};
 use crate::rk::{RK23_TABLEAU, RK45_TABLEAU, RkSolver, RkSolverConfig};
 use crate::solver::{OdeSolver, OdeSolverState, StepFailure, StepOutcome};
 use crate::validation::{
-    AuditScope, SyncSharedAuditLedger, ToleranceValue, fail_closed, fingerprint_optional_f64,
+    SyncSharedAuditLedger, ToleranceValue, fail_closed, fingerprint_optional_f64,
     fingerprint_tolerance, validate_first_step_scoped, validate_max_step_scoped,
     validate_tol_scoped,
 };
@@ -949,7 +950,12 @@ where
 {
     let fingerprint_of = || solve_ivp_fingerprint(options);
     let audit = AuditScope::new(audit_ledger, &fingerprint_of);
-    solve_ivp_impl(fun, options, Some(&audit))
+    // frankenscipy-3cu8u.2: every error is one fail-closed event, a failed integration
+    // included, not only the validators' rejections.
+    audit.finish(
+        solve_ivp_impl(fun, options, Some(&audit)),
+        IntegrateValidationError::reason_code,
+    )
 }
 
 impl From<OdeSolverAction> for SolverKind {
