@@ -79,15 +79,20 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialError, SpecialErrorKind, SpecialTensor, bei, beip, ber, berp, beta, betainc, betaln,
-    binom, boxcox, boxcox1p, cbrt, chdtr, chdtrc, chdtri, cosdg, cosm1, cotdg, dawsn, digamma,
-    ellipe, ellipeinc, ellipk, ellipkinc, ellipkm1, entr, erf, erfc, erfcinv, erfcx, erfi, erfinv,
-    exp1, expi, expit, expn, exprel, gamma, gammainc, gammaincc, gammaln, gammasgn, huber, hyp0f1,
-    i0, i0e, i1, i1e, inv_boxcox, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e, kei, keip, ker,
-    kerp, kl_div, kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit,
-    modstruve, ndtr, ndtri, ndtri_exp, owens_t, pdtr, pdtrc, pdtri, poch, pseudo_huber, rel_entr,
-    rgamma, sindg, smirnov, smirnovi, spence, stdtr, stdtrit, struve, tandg, tklmbda, wrightomega,
-    xlog1py, xlogy, y0, y1, yn, yv, yve, zeta, zetac,
+    SpecialError, SpecialErrorKind, SpecialTensor, bdtr, bdtrc, bdtri, bdtrik, bdtrin, bei, beip,
+    ber, berp, beta, betainc, betaincc, betainccinv, betaincinv, betaln, binom, boxcox, boxcox1p,
+    cbrt, chdtr, chdtrc, chdtri, chdtriv, chndtr, chndtridf, chndtrinc, chndtrix, cosdg, cosm1,
+    cotdg, dawsn, digamma, ellipe, ellipeinc, ellipk, ellipkinc, ellipkm1, elliprc, elliprd,
+    elliprf, elliprg, elliprj, entr, erf, erfc, erfcinv, erfcx, erfi, erfinv, eval_gegenbauer,
+    eval_genlaguerre, eval_jacobi, exp1, expi, expit, expn, exprel, fdtr, fdtrc, fdtri, fdtridfd,
+    gamma, gammainc, gammaincc, gammaln, gammasgn, gdtr, gdtrc, gdtria, gdtrib, gdtrix, huber,
+    hyp0f1, hyp1f1, hyp2f1, hyperu, i0, i0e, i1, i1e, inv_boxcox, iv, ive, j0, j1, jn, jv, jve, k0,
+    k0e, k1, k1e, kei, keip, ker, kerp, kl_div, kn, kolmogi, kolmogorov, kv, kve, log_expit,
+    log_ndtr, log_wright_bessel, loggamma, logit, lpmv, modstruve, nbdtr, nbdtrc, nbdtri, nbdtrik,
+    nbdtrin, ncfdtr, ncfdtri, nctdtr, nctdtridf, nctdtrinc, nctdtrit, ndtr, ndtri, ndtri_exp,
+    owens_t, pdtr, pdtrc, pdtri, pdtrik, poch, pseudo_huber, rel_entr, rgamma, sindg, smirnov,
+    smirnovi, spence, stdtr, stdtridf, stdtrit, struve, tandg, tklmbda, voigt_profile,
+    wright_bessel, wrightomega, xlog1py, xlogy, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -104,6 +109,10 @@ raw = sys.stdin.buffer.read(n * 8 * nargs)
 if len(raw) != n * 8 * nargs: raise RuntimeError('short fixture')
 flat = np.frombuffer(raw, dtype='<f8').copy()
 args = [flat[i * n:(i + 1) * n] for i in range(nargs)]
+# Integer counts and degrees go over as int64, so SciPy runs the integer-specialised loop a
+# caller with integer n gets (`eval_gegenbauer`'s `ldd->d`, not its hypergeometric `ddd->d`).
+int_args = {int(i) for i in os.environ.get('FSCI_SPECIAL_INT_ARGS', '').split(',') if i}
+args = [a.astype(np.int64) if i in int_args else a for i, a in enumerate(args)]
 
 fn = getattr(sp, op)   # resolved by name: adding a case needs no change here
 def run(): return np.ascontiguousarray(fn(*args), dtype='<f8')
@@ -156,24 +165,27 @@ struct Scipy {
 
 impl Scipy {
     fn start(op: &str, x: &[f64]) -> Self {
-        Self::start_n(op, &[x])
+        Self::start_n(op, &[x], &[])
     }
 
     /// Start the child for an op of any arity. Arguments are sent as one flat little-endian
     /// stream, argument-major, and the child slices them back apart — so adding a
-    /// two-argument case needs no protocol change beyond `FSCI_SPECIAL_NARGS`.
-    fn start_n(op: &str, args: &[&[f64]]) -> Self {
+    /// two-argument case needs no protocol change beyond `FSCI_SPECIAL_NARGS`. The positions
+    /// in `int_args` hold integer values and reach SciPy as int64.
+    fn start_n(op: &str, args: &[&[f64]], int_args: &[usize]) -> Self {
         let n = args[0].len();
         assert!(
             args.iter().all(|a| a.len() == n),
             "all argument arrays must have the same length"
         );
+        let int_list: Vec<String> = int_args.iter().map(usize::to_string).collect();
         let mut child = incumbent()
             .command()
             .args(["-u", "-c", PYTHON])
             .env("FSCI_SPECIAL_OP", op)
             .env("FSCI_SPECIAL_N", n.to_string())
             .env("FSCI_SPECIAL_NARGS", args.len().to_string())
+            .env("FSCI_SPECIAL_INT_ARGS", int_list.join(","))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -382,6 +394,10 @@ const CASES2: &[(&str, f64, f64, f64, f64)] = &[
     ("rel_entr", 0.0, 10.0, 0.001, 10.0),
     ("huber", 0.1, 5.0, -10.0, 10.0),
     ("pseudo_huber", 0.1, 5.0, -10.0, 10.0),
+    ("elliprc", 0.0, 10.0, 0.01, 10.0),
+    ("stdtridf", 0.51, 0.999, 0.1, 10.0),
+    ("chdtriv", 0.001, 0.999, 0.1, 40.0),
+    ("pdtrik", 0.001, 0.999, 0.1, 40.0),
 ];
 
 /// Integer-order siblings, kept apart because their first argument is quantised.
@@ -393,6 +409,275 @@ const CASES2_INTEGER_ORDER: &[(&str, f64, f64, f64, f64)] = &[
     ("smirnov", 1.0, 200.0, 0.0, 1.0),
     ("smirnovi", 1.0, 200.0, 0.001, 0.999),
 ];
+
+/// Three- and four-argument cases: the name, one domain per argument, and the positions that
+/// hold integer counts or degrees. Those are floored in the fixture and reach SciPy as int64,
+/// so the loop timed is the one a caller with integer `n` gets.
+///
+/// The two-argument sweep, once its fixtures were real, found five accuracy bugs in its first
+/// pass. This is the same unmeasured surface one arity up: the distribution family with its
+/// inverses, the Carlson integrals, the confluent and Gauss hypergeometric functions and the
+/// orthogonal polynomials. `betainc` has its own grid below and is not repeated here.
+/// Count arguments sit below the total they count (`k < n` for `bdtr`) so the fixture asks
+/// the question the function is for, not its edge.
+const CASES_N: &[(&str, &[(f64, f64)], &[usize])] = &[
+    ("hyp1f1", &[(-10.0, 10.0), (0.5, 10.0), (-20.0, 20.0)], &[]),
+    ("hyperu", &[(0.1, 5.0), (0.1, 5.0), (0.1, 20.0)], &[]),
+    ("betaincc", &[(0.5, 30.0), (0.5, 30.0), (0.0, 1.0)], &[]),
+    (
+        "betaincinv",
+        &[(0.5, 30.0), (0.5, 30.0), (0.001, 0.999)],
+        &[],
+    ),
+    (
+        "betainccinv",
+        &[(0.5, 30.0), (0.5, 30.0), (0.001, 0.999)],
+        &[],
+    ),
+    (
+        "wright_bessel",
+        &[(0.0, 5.0), (0.0, 10.0), (0.0, 20.0)],
+        &[],
+    ),
+    (
+        "log_wright_bessel",
+        &[(0.0, 5.0), (0.0, 10.0), (0.0, 100.0)],
+        &[],
+    ),
+    ("gdtr", &[(0.1, 5.0), (0.5, 20.0), (0.0, 40.0)], &[]),
+    ("gdtrc", &[(0.1, 5.0), (0.5, 20.0), (0.0, 40.0)], &[]),
+    ("gdtrix", &[(0.1, 5.0), (0.5, 20.0), (0.001, 0.999)], &[]),
+    ("gdtria", &[(0.001, 0.999), (0.5, 20.0), (0.1, 40.0)], &[]),
+    ("gdtrib", &[(0.1, 5.0), (0.001, 0.999), (0.1, 40.0)], &[]),
+    ("bdtr", &[(0.0, 50.0), (50.0, 101.0), (0.0, 1.0)], &[0, 1]),
+    ("bdtrc", &[(0.0, 50.0), (50.0, 101.0), (0.0, 1.0)], &[0, 1]),
+    (
+        "bdtri",
+        &[(0.0, 50.0), (50.0, 101.0), (0.001, 0.999)],
+        &[0, 1],
+    ),
+    (
+        "bdtrik",
+        &[(0.001, 0.999), (1.0, 101.0), (0.01, 0.99)],
+        &[1],
+    ),
+    ("bdtrin", &[(0.0, 50.0), (0.001, 0.999), (0.01, 0.99)], &[0]),
+    ("nbdtr", &[(0.0, 50.0), (1.0, 51.0), (0.0, 1.0)], &[0, 1]),
+    ("nbdtrc", &[(0.0, 50.0), (1.0, 51.0), (0.0, 1.0)], &[0, 1]),
+    (
+        "nbdtri",
+        &[(0.0, 50.0), (1.0, 51.0), (0.001, 0.999)],
+        &[0, 1],
+    ),
+    (
+        "nbdtrik",
+        &[(0.001, 0.999), (1.0, 51.0), (0.01, 0.99)],
+        &[1],
+    ),
+    (
+        "nbdtrin",
+        &[(0.0, 50.0), (0.001, 0.999), (0.01, 0.99)],
+        &[0],
+    ),
+    ("fdtr", &[(0.5, 50.0), (0.5, 50.0), (0.0, 10.0)], &[]),
+    ("fdtrc", &[(0.5, 50.0), (0.5, 50.0), (0.0, 10.0)], &[]),
+    ("fdtri", &[(0.5, 50.0), (0.5, 50.0), (0.001, 0.999)], &[]),
+    ("fdtridfd", &[(0.5, 50.0), (0.001, 0.999), (0.1, 10.0)], &[]),
+    ("nctdtr", &[(0.5, 50.0), (-5.0, 5.0), (-10.0, 10.0)], &[]),
+    ("nctdtrit", &[(0.5, 50.0), (-5.0, 5.0), (0.001, 0.999)], &[]),
+    (
+        "nctdtridf",
+        &[(0.001, 0.999), (-5.0, 5.0), (-10.0, 10.0)],
+        &[],
+    ),
+    (
+        "nctdtrinc",
+        &[(0.5, 50.0), (0.001, 0.999), (-10.0, 10.0)],
+        &[],
+    ),
+    ("chndtr", &[(0.0, 60.0), (0.5, 20.0), (0.0, 20.0)], &[]),
+    ("chndtrix", &[(0.001, 0.999), (0.5, 20.0), (0.0, 20.0)], &[]),
+    (
+        "chndtridf",
+        &[(0.1, 60.0), (0.001, 0.999), (0.0, 20.0)],
+        &[],
+    ),
+    (
+        "chndtrinc",
+        &[(0.1, 60.0), (0.5, 20.0), (0.001, 0.999)],
+        &[],
+    ),
+    ("elliprf", &[(0.0, 10.0), (0.0, 10.0), (0.0, 10.0)], &[]),
+    ("elliprd", &[(0.0, 10.0), (0.0, 10.0), (0.01, 10.0)], &[]),
+    ("elliprg", &[(0.0, 10.0), (0.0, 10.0), (0.0, 10.0)], &[]),
+    (
+        "voigt_profile",
+        &[(-10.0, 10.0), (0.01, 5.0), (0.01, 5.0)],
+        &[],
+    ),
+    ("lpmv", &[(-5.0, 6.0), (0.0, 21.0), (-1.0, 1.0)], &[0, 1]),
+    (
+        "eval_gegenbauer",
+        &[(0.0, 31.0), (-0.4, 5.0), (-1.0, 1.0)],
+        &[0],
+    ),
+    (
+        "eval_genlaguerre",
+        &[(0.0, 31.0), (-0.9, 5.0), (0.0, 30.0)],
+        &[0],
+    ),
+    // Four arguments.
+    (
+        "eval_jacobi",
+        &[(0.0, 31.0), (-0.9, 5.0), (-0.9, 5.0), (-1.0, 1.0)],
+        &[0],
+    ),
+    (
+        "hyp2f1",
+        &[(-5.0, 5.0), (-5.0, 5.0), (0.5, 10.0), (-1.0, 0.95)],
+        &[],
+    ),
+    (
+        "ncfdtr",
+        &[(0.5, 50.0), (0.5, 50.0), (0.0, 20.0), (0.0, 10.0)],
+        &[],
+    ),
+    (
+        "ncfdtri",
+        &[(0.5, 50.0), (0.5, 50.0), (0.0, 20.0), (0.001, 0.999)],
+        &[],
+    ),
+    (
+        "elliprj",
+        &[(0.0, 10.0), (0.0, 10.0), (0.0, 10.0), (0.01, 10.0)],
+        &[],
+    ),
+];
+
+/// Dispatch to our entry point for `op` at any arity; two arguments go to [`call_ours2`].
+fn call_ours_n(op: &str, args: &[SpecialTensor]) -> fsci_special::SpecialResult {
+    let mode = RuntimeMode::Hardened;
+    match (op, args) {
+        (_, [a, b]) => call_ours2(op, a, b),
+        ("hyp1f1", [a, b, x]) => hyp1f1(a, b, x, mode),
+        ("hyperu", [a, b, x]) => hyperu(a, b, x, mode),
+        ("betaincc", [a, b, x]) => betaincc(a, b, x, mode),
+        ("betaincinv", [a, b, y]) => betaincinv(a, b, y, mode),
+        ("betainccinv", [a, b, y]) => betainccinv(a, b, y, mode),
+        ("wright_bessel", [a, b, x]) => wright_bessel(a, b, x, mode),
+        ("log_wright_bessel", [a, b, x]) => log_wright_bessel(a, b, x, mode),
+        ("hyp2f1", [a, b, c, z]) => hyp2f1(a, b, c, z, mode),
+        ("gdtr", [a, b, c]) => scalar_map3(a, b, c, gdtr),
+        ("gdtrc", [a, b, c]) => scalar_map3(a, b, c, gdtrc),
+        ("gdtrix", [a, b, c]) => scalar_map3(a, b, c, gdtrix),
+        ("gdtria", [a, b, c]) => scalar_map3(a, b, c, gdtria),
+        ("gdtrib", [a, b, c]) => scalar_map3(a, b, c, gdtrib),
+        ("bdtr", [a, b, c]) => scalar_map3(a, b, c, bdtr),
+        ("bdtrc", [a, b, c]) => scalar_map3(a, b, c, bdtrc),
+        ("bdtri", [a, b, c]) => scalar_map3(a, b, c, bdtri),
+        ("bdtrik", [a, b, c]) => scalar_map3(a, b, c, bdtrik),
+        ("bdtrin", [a, b, c]) => scalar_map3(a, b, c, bdtrin),
+        ("nbdtr", [a, b, c]) => scalar_map3(a, b, c, nbdtr),
+        ("nbdtrc", [a, b, c]) => scalar_map3(a, b, c, nbdtrc),
+        ("nbdtri", [a, b, c]) => scalar_map3(a, b, c, nbdtri),
+        ("nbdtrik", [a, b, c]) => scalar_map3(a, b, c, nbdtrik),
+        ("nbdtrin", [a, b, c]) => scalar_map3(a, b, c, nbdtrin),
+        ("fdtr", [a, b, c]) => scalar_map3(a, b, c, fdtr),
+        ("fdtrc", [a, b, c]) => scalar_map3(a, b, c, fdtrc),
+        ("fdtri", [a, b, c]) => scalar_map3(a, b, c, fdtri),
+        ("fdtridfd", [a, b, c]) => scalar_map3(a, b, c, fdtridfd),
+        ("nctdtr", [a, b, c]) => scalar_map3(a, b, c, nctdtr),
+        ("nctdtrit", [a, b, c]) => scalar_map3(a, b, c, nctdtrit),
+        ("nctdtridf", [a, b, c]) => scalar_map3(a, b, c, nctdtridf),
+        ("nctdtrinc", [a, b, c]) => scalar_map3(a, b, c, nctdtrinc),
+        ("chndtr", [a, b, c]) => scalar_map3(a, b, c, chndtr),
+        ("chndtrix", [a, b, c]) => scalar_map3(a, b, c, chndtrix),
+        ("chndtridf", [a, b, c]) => scalar_map3(a, b, c, chndtridf),
+        ("chndtrinc", [a, b, c]) => scalar_map3(a, b, c, chndtrinc),
+        ("elliprf", [a, b, c]) => scalar_map3(a, b, c, elliprf),
+        ("elliprd", [a, b, c]) => scalar_map3(a, b, c, elliprd),
+        ("elliprg", [a, b, c]) => scalar_map3(a, b, c, elliprg),
+        ("voigt_profile", [a, b, c]) => scalar_map3(a, b, c, voigt_profile),
+        // Integer positions: the fixture floors them, so the casts are exact.
+        ("lpmv", [a, b, c]) => scalar_map3(a, b, c, |m, l, x| lpmv(m as i32, l as u32, x)),
+        ("eval_gegenbauer", [a, b, c]) => {
+            scalar_map3(a, b, c, |n, alpha, x| eval_gegenbauer(n as u32, alpha, x))
+        }
+        ("eval_genlaguerre", [a, b, c]) => {
+            scalar_map3(a, b, c, |n, alpha, x| eval_genlaguerre(n as u32, alpha, x))
+        }
+        ("eval_jacobi", [a, b, c, d]) => scalar_map4(a, b, c, d, |n, alpha, beta, x| {
+            eval_jacobi(n as u32, alpha, beta, x)
+        }),
+        ("ncfdtr", [a, b, c, d]) => scalar_map4(a, b, c, d, ncfdtr),
+        ("ncfdtri", [a, b, c, d]) => scalar_map4(a, b, c, d, ncfdtri),
+        ("elliprj", [a, b, c, d]) => scalar_map4(a, b, c, d, elliprj),
+        // The caller reports this with the op name.
+        _ => Err(SpecialError {
+            function: "call_ours_n",
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail: "no fsci entry point wired for this op at this arity",
+        }),
+    }
+}
+
+/// [`scalar_map2`] for three arguments.
+fn scalar_map3(
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    c: &SpecialTensor,
+    kernel: fn(f64, f64, f64) -> f64,
+) -> fsci_special::SpecialResult {
+    match (a, b, c) {
+        (SpecialTensor::RealVec(av), SpecialTensor::RealVec(bv), SpecialTensor::RealVec(cv)) => {
+            Ok(SpecialTensor::RealVec(
+                av.iter()
+                    .zip(bv)
+                    .zip(cv)
+                    .map(|((&x, &y), &z)| kernel(x, y, z))
+                    .collect(),
+            ))
+        }
+        _ => Err(SpecialError {
+            function: "scalar_map3",
+            kind: SpecialErrorKind::DomainError,
+            mode: RuntimeMode::Hardened,
+            detail: "scalar kernels take three real vectors",
+        }),
+    }
+}
+
+/// [`scalar_map2`] for four arguments.
+fn scalar_map4(
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    c: &SpecialTensor,
+    d: &SpecialTensor,
+    kernel: fn(f64, f64, f64, f64) -> f64,
+) -> fsci_special::SpecialResult {
+    match (a, b, c, d) {
+        (
+            SpecialTensor::RealVec(av),
+            SpecialTensor::RealVec(bv),
+            SpecialTensor::RealVec(cv),
+            SpecialTensor::RealVec(dv),
+        ) => Ok(SpecialTensor::RealVec(
+            av.iter()
+                .zip(bv)
+                .zip(cv)
+                .zip(dv)
+                .map(|(((&w, &x), &y), &z)| kernel(w, x, y, z))
+                .collect(),
+        )),
+        _ => Err(SpecialError {
+            function: "scalar_map4",
+            kind: SpecialErrorKind::DomainError,
+            mode: RuntimeMode::Hardened,
+            detail: "scalar kernels take four real vectors",
+        }),
+    }
+}
 
 /// Dispatch to our two-argument entry point for `op`.
 fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::SpecialResult {
@@ -439,6 +724,10 @@ fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::S
         "binom" => scalar_map2(a, b, binom),
         "tklmbda" => scalar_map2(a, b, tklmbda),
         "kl_div" => scalar_map2(a, b, kl_div),
+        "elliprc" => scalar_map2(a, b, elliprc),
+        "stdtridf" => scalar_map2(a, b, stdtridf),
+        "chdtriv" => scalar_map2(a, b, chdtriv),
+        "pdtrik" => scalar_map2(a, b, pdtrik),
         // Integer-order cases: the fixture floors the first argument, so the casts are exact.
         "expn" => scalar_map2(a, b, |n, x| expn(n as usize, x)),
         "smirnov" => scalar_map2(a, b, |n, d| smirnov(n as i32, d)),
@@ -897,131 +1186,149 @@ fn main() {
         k as f64 / 1_000_003.0
     };
 
-    // ── two-argument sweep ───────────────────────────────────────────────────────────
+    // ── multi-argument sweep ─────────────────────────────────────────────────────────
     //
     // Same protocol, same agreement check, same probe mode; only the arity differs. Run
     // with `FSCI_SPECIAL_OPS=<name>` like the one-argument cases.
-    for (cases, integer_order) in [(CASES2, false), (CASES2_INTEGER_ORDER, true)] {
-        for &(op, alo, ahi, blo, bhi) in cases {
-            if !selected.split(',').any(|name| name.trim() == op) {
-                continue;
-            }
-            // `FSCI_SPECIAL_A_RANGE=lo,hi` replaces the first argument's domain (log-uniform
-            // when hi/lo > 100), and `FSCI_SPECIAL_B_NEAR_A=w` puts the second at a·(1 ± w)
-            // instead of its own box. Together they reach regimes a box cannot, such as the
-            // Temme zones of gammainc near x = a for large a (frankenscipy-6fpkm).
-            let a_range = std::env::var("FSCI_SPECIAL_A_RANGE").ok().map(|s| {
-                let v: Vec<f64> = s
-                    .split(',')
-                    .map(|t| t.trim().parse().expect("A_RANGE lo,hi"))
-                    .collect();
-                (v[0], v[1])
-            });
-            let near_a: Option<f64> = std::env::var("FSCI_SPECIAL_B_NEAR_A")
-                .ok()
-                .map(|s| s.trim().parse().expect("B_NEAR_A width"));
-            let (alo, ahi) = a_range.unwrap_or((alo, ahi));
-            let a: Vec<f64> = (0..n)
-                .map(|i| {
-                    // Log-uniform only for a POSITIVE lower bound. With alo = 0 the ratio is
-                    // inf, and ln(0) + u·inf is NaN for every u: each case with a zero lower
-                    // bound (jv, yv, iv, kv, their scaled forms, jn, yn, kn) timed and
-                    // "checked" an all-NaN fixture on both sides until this was caught.
-                    let v = if alo > 0.0 && ahi / alo > 100.0 {
-                        (alo.ln() + unit(i) * (ahi / alo).ln()).exp()
-                    } else {
-                        alo + unit(i) * (ahi - alo)
-                    };
-                    if integer_order { v.floor() } else { v }
-                })
-                .collect();
-            // A second, decorrelated stream for the other argument — reusing `unit(i)` for
-            // both would put every sample on the diagonal and exercise one line of a
-            // two-dimensional domain.
-            let b: Vec<f64> = (0..n)
-                .map(|i| match near_a {
-                    Some(w) => a[i] * unit(i * 7 + 13).mul_add(2.0 * w, 1.0 - w),
-                    None => blo + unit(i * 7 + 13) * (bhi - blo),
-                })
-                .collect();
-            println!(
-                "n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}] b_near_a={near_a:?}"
-            );
-
-            let mut scipy = Scipy::start_n(op, &[&a, &b]);
-            println!("{}", scipy.ready);
-
-            let ta = SpecialTensor::RealVec(a.clone());
-            let tb = SpecialTensor::RealVec(b.clone());
-            let ours = || -> Vec<f64> {
-                let out = call_ours2(op, &ta, &tb);
-                real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
-            };
-            black_box(ours());
-
-            // `FSCI_SPECIAL_DUMP=<file>`: `op a b fsci(a, b)` per fixture point, as the
-            // one-argument loop writes `op x fsci(x)`.
-            if let Ok(path) = std::env::var("FSCI_SPECIAL_DUMP") {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .expect("open FSCI_SPECIAL_DUMP");
-                let mut file = std::io::BufWriter::new(file);
-                for ((ai, bi), yi) in a.iter().zip(&b).zip(ours()) {
-                    writeln!(file, "{op} {ai:?} {bi:?} {yi:?}").expect("write FSCI_SPECIAL_DUMP");
-                }
-            }
-
-            if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
-                let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
-                let started = Instant::now();
-                for _ in 0..k {
-                    black_box(ours());
-                }
-                let ms = started.elapsed().as_secs_f64() * 1.0e3;
-                println!(
-                    "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3}",
-                    k * n
-                );
-                continue;
-            }
-
-            let _ = scipy.time(1, 1);
-            const MIN_SAMPLE_MS2: f64 = 20.0;
-            let mut single = f64::INFINITY;
-            for _ in 0..3 {
-                let started = Instant::now();
-                black_box(ours());
-                single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
-            }
-            let reps = fixed_reps
-                .unwrap_or_else(|| (MIN_SAMPLE_MS2 / single.max(1.0e-6)).ceil() as usize)
-                .clamp(1, 4096);
-            println!("op={op} calibration single={single:.4}ms reps={reps}");
-
-            let time_ours = || -> f64 {
-                let started = Instant::now();
-                for _ in 0..reps {
-                    black_box(ours());
-                }
-                started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
-            };
-            let f1 = time_ours();
-            let s1 = scipy.time(reps, 1);
-            let s2 = scipy.time(reps, 1);
-            let f2 = time_ours();
-            let fsci = f1.min(f2);
-            let sci = s1.min(s2);
-            let check = scipy.check(&ours());
-            emit!(
-                "case=n{n} op={op} fsci={fsci:.3}ms scipy={sci:.3}ms scipy/fsci={:.3}x \
-                 null_fsci={:.3} null_scipy={:.3} {check}",
-                sci / fsci,
-                f1.max(f2) / f1.min(f2),
-                s1.max(s2) / s1.min(s2),
-            );
+    let cases_n = CASES2
+        .iter()
+        .map(|&(op, alo, ahi, blo, bhi)| (op, vec![(alo, ahi), (blo, bhi)], &[][..]))
+        .chain(
+            CASES2_INTEGER_ORDER
+                .iter()
+                .map(|&(op, alo, ahi, blo, bhi)| (op, vec![(alo, ahi), (blo, bhi)], &[0][..])),
+        )
+        .chain(
+            CASES_N
+                .iter()
+                .map(|&(op, domains, integer)| (op, domains.to_vec(), integer)),
+        );
+    // One decorrelated stream per argument: reusing `unit(i)` for all of them would put every
+    // sample on the diagonal and exercise one line of a multi-dimensional domain.
+    const STREAMS: [(usize, usize); 4] = [(1, 0), (7, 13), (11, 29), (13, 41)];
+    for (op, mut domains, integer) in cases_n {
+        if !selected.split(',').any(|name| name.trim() == op) {
+            continue;
         }
+        // `FSCI_SPECIAL_A_RANGE=lo,hi` replaces the first argument's domain (log-uniform when
+        // hi/lo > 100), and `FSCI_SPECIAL_B_NEAR_A=w` puts the second at a·(1 ± w) instead of
+        // its own box. Together they reach regimes a box cannot, such as the Temme zones of
+        // gammainc near x = a for large a (frankenscipy-6fpkm).
+        if let Ok(s) = std::env::var("FSCI_SPECIAL_A_RANGE") {
+            let v: Vec<f64> = s
+                .split(',')
+                .map(|t| t.trim().parse().expect("A_RANGE lo,hi"))
+                .collect();
+            domains[0] = (v[0], v[1]);
+        }
+        let near_a: Option<f64> = std::env::var("FSCI_SPECIAL_B_NEAR_A")
+            .ok()
+            .map(|s| s.trim().parse().expect("B_NEAR_A width"));
+        let mut args: Vec<Vec<f64>> = Vec::with_capacity(domains.len());
+        for (k, &(lo, hi)) in domains.iter().enumerate() {
+            let (mult, offset) = STREAMS[k];
+            let arg: Vec<f64> = (0..n)
+                .map(|i| {
+                    let u = unit(i * mult + offset);
+                    let v = match near_a {
+                        Some(w) if k == 1 => args[0][i] * u.mul_add(2.0 * w, 1.0 - w),
+                        // Log-uniform only for the first argument, and only for a POSITIVE
+                        // lower bound. With lo = 0 the ratio is inf, and ln(0) + u·inf is NaN
+                        // for every u: each case with a zero lower bound (jv, yv, iv, kv, their
+                        // scaled forms, jn, yn, kn) timed and "checked" an all-NaN fixture on
+                        // both sides until this was caught.
+                        _ if k == 0 && lo > 0.0 && hi / lo > 100.0 => {
+                            (lo.ln() + u * (hi / lo).ln()).exp()
+                        }
+                        _ => lo + u * (hi - lo),
+                    };
+                    if integer.contains(&k) { v.floor() } else { v }
+                })
+                .collect();
+            args.push(arg);
+        }
+        let named: Vec<String> = domains
+            .iter()
+            .zip(b'a'..)
+            .map(|(&(lo, hi), letter)| format!("domain_{}=[{lo}, {hi}]", letter as char))
+            .collect();
+        println!("n={n} op={op} {} b_near_a={near_a:?}", named.join(" "));
+
+        let arg_refs: Vec<&[f64]> = args.iter().map(Vec::as_slice).collect();
+        let mut scipy = Scipy::start_n(op, &arg_refs, integer);
+        println!("{}", scipy.ready);
+
+        let tensors: Vec<SpecialTensor> =
+            args.iter().cloned().map(SpecialTensor::RealVec).collect();
+        let ours = || -> Vec<f64> {
+            let out = call_ours_n(op, &tensors);
+            real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
+        };
+        black_box(ours());
+
+        // `FSCI_SPECIAL_DUMP=<file>`: `op args… fsci(args…)` per fixture point, as the
+        // one-argument loop writes `op x fsci(x)`.
+        if let Ok(path) = std::env::var("FSCI_SPECIAL_DUMP") {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open FSCI_SPECIAL_DUMP");
+            let mut file = std::io::BufWriter::new(file);
+            for (i, yi) in ours().into_iter().enumerate() {
+                let point: Vec<String> = args.iter().map(|arg| format!("{:?}", arg[i])).collect();
+                writeln!(file, "{op} {} {yi:?}", point.join(" ")).expect("write FSCI_SPECIAL_DUMP");
+            }
+        }
+
+        if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
+            let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
+            let started = Instant::now();
+            for _ in 0..k {
+                black_box(ours());
+            }
+            let ms = started.elapsed().as_secs_f64() * 1.0e3;
+            println!(
+                "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3}",
+                k * n
+            );
+            continue;
+        }
+
+        let _ = scipy.time(1, 1);
+        const MIN_SAMPLE_MS2: f64 = 20.0;
+        let mut single = f64::INFINITY;
+        for _ in 0..3 {
+            let started = Instant::now();
+            black_box(ours());
+            single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+        }
+        let reps = fixed_reps
+            .unwrap_or_else(|| (MIN_SAMPLE_MS2 / single.max(1.0e-6)).ceil() as usize)
+            .clamp(1, 4096);
+        println!("op={op} calibration single={single:.4}ms reps={reps}");
+
+        let time_ours = || -> f64 {
+            let started = Instant::now();
+            for _ in 0..reps {
+                black_box(ours());
+            }
+            started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+        };
+        let f1 = time_ours();
+        let s1 = scipy.time(reps, 1);
+        let s2 = scipy.time(reps, 1);
+        let f2 = time_ours();
+        let fsci = f1.min(f2);
+        let sci = s1.min(s2);
+        let check = scipy.check(&ours());
+        emit!(
+            "case=n{n} op={op} fsci={fsci:.3}ms scipy={sci:.3}ms scipy/fsci={:.3}x \
+                 null_fsci={:.3} null_scipy={:.3} {check}",
+            sci / fsci,
+            f1.max(f2) / f1.min(f2),
+            s1.max(s2) / s1.min(s2),
+        );
     }
 
     // ── betainc(a, b, x): the three-argument case (frankenscipy-d0u95) ──────────────
@@ -1074,7 +1381,7 @@ fn main() {
             "n={n} op=betainc grid a in {a_shapes:?} b in {b_shapes:?} x = mean + {OFFSETS:?}*sd"
         );
 
-        let mut scipy = Scipy::start_n("betainc", &[&a, &b, &x]);
+        let mut scipy = Scipy::start_n("betainc", &[&a, &b, &x], &[]);
         println!("{}", scipy.ready);
 
         let (ta, tb, tx) = (
