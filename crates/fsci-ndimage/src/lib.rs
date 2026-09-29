@@ -17,7 +17,7 @@ use std::simd::num::SimdFloat;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
+use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -92,6 +92,17 @@ impl std::fmt::Display for NdimageError {
 }
 
 impl std::error::Error for NdimageError {}
+
+impl NdimageError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidArgument(_) => "invalid_argument",
+            Self::DimensionMismatch(_) => "dimension_mismatch",
+            Self::EmptyInput => "empty_input",
+        }
+    }
+}
 
 /// Boundary mode for filtering operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3233,30 +3244,38 @@ pub fn gaussian_filter_with_mode(
             .str(&format!("{runtime_mode:?}"))
             .finish()
     };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint));
+    let result = gaussian_filter_audited(input, sigma, mode, cval, runtime_mode, audit.as_ref());
+    audit_finish(audit.as_ref(), result, NdimageError::reason_code)
+}
+
+/// [`gaussian_filter_with_mode`]'s filter, recording its rejections under `audit`.
+fn gaussian_filter_audited(
+    input: &NdArray,
+    sigma: f64,
+    mode: BoundaryMode,
+    cval: f64,
+    runtime_mode: RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<NdArray, NdimageError> {
     if matches!(runtime_mode, RuntimeMode::Hardened) {
         if input.shape.iter().any(|&d| d > HARDENED_MAX_DIM) {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &fingerprint(),
-                    "dimension exceeds hardened limit",
-                    "rejected",
-                );
-            }
+            audit_reject(
+                audit,
+                "resource_exhausted",
+                "rejected: dimension exceeds hardened limit",
+            );
             return Err(NdimageError::InvalidArgument(format!(
                 "input shape {:?} exceeds hardened limit ({HARDENED_MAX_DIM})",
                 input.shape
             )));
         }
         if !sigma.is_finite() || !cval.is_finite() {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &fingerprint(),
-                    "non-finite parameter in hardened mode",
-                    "rejected",
-                );
-            }
+            audit_reject(
+                audit,
+                "non_finite_input",
+                "rejected: sigma and cval must be finite in hardened mode",
+            );
             return Err(NdimageError::InvalidArgument(
                 "sigma and cval must be finite in hardened mode".to_string(),
             ));

@@ -11,8 +11,9 @@ use fsci_linalg::{
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
 use fsci_runtime::{
-    Fingerprinter, RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry,
-    SparseSolverPortfolio, SparseStructuralEvidence,
+    AuditAction, AuditScope, Fingerprinter, PortfolioEvidence, RuntimeMode, SparseSolverAction,
+    SparseSolverEvidenceEntry, SparseSolverPortfolio, SparseStructuralEvidence, audit_recover,
+    audit_reject,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -9805,23 +9806,29 @@ pub fn casp_iterative_solve_with_audit(
     options: CaspIterativeSolveOptions,
     ledger: &crate::audit::SyncSharedAuditLedger,
 ) -> SparseResult<CaspIterativeSolveResult> {
-    let solved = casp_iterative_solve_inner(a, b, x0, options)?;
     // frankenscipy-3cu8u.1: `a`, `b`, `x0` and every option, in that order; it used to be the
     // rationale string, which every problem routed the same way shared.
-    let mut fingerprinter = Fingerprinter::new("fsci_sparse::casp_iterative_solve");
-    crate::audit::fingerprint_csr(&mut fingerprinter, a);
-    fingerprinter.f64s(b).bool(x0.is_some());
-    if let Some(x0) = x0 {
-        fingerprinter.f64s(x0);
-    }
-    fingerprint_iterative_options(&mut fingerprinter, &options.iterative);
-    fingerprinter
-        .bool(options.preconditioner_available)
-        .str(&format!("{:?}", options.matrix_vector_cost))
-        .bool(options.prefer_low_memory);
-    crate::audit::record_bounded_recovery(
-        ledger,
-        &fingerprinter.finish(),
+    let fingerprint = || {
+        let mut fingerprinter = Fingerprinter::new("fsci_sparse::casp_iterative_solve");
+        crate::audit::fingerprint_csr(&mut fingerprinter, a);
+        fingerprinter.f64s(b).bool(x0.is_some());
+        if let Some(x0) = x0 {
+            fingerprinter.f64s(x0);
+        }
+        fingerprint_iterative_options(&mut fingerprinter, &options.iterative);
+        fingerprinter
+            .bool(options.preconditioner_available)
+            .str(&format!("{:?}", options.matrix_vector_cost))
+            .bool(options.prefer_low_memory);
+        fingerprinter.finish()
+    };
+    let audit = AuditScope::new(ledger, &fingerprint);
+    // frankenscipy-3cu8u.2: an error is one fail-closed event, as
+    // `casp_iterative_solve::<error kind>`.
+    let solved = audit.finish(casp_iterative_solve_inner(a, b, x0, options), |error| {
+        format!("casp_iterative_solve::{}", error.reason_code())
+    })?;
+    audit.recover(
         &format!(
             "casp_sparse_iterative_solver={}",
             solved.decision.selected_solver.as_str()
@@ -9849,6 +9856,9 @@ pub struct CaspPortfolioSolveResult {
     pub chosen_action: SparseSolverAction,
     pub posterior: [f64; 4],
     pub expected_losses: [f64; 6],
+    /// The condition estimate and structure the posterior was computed from.
+    pub cond_estimate: f64,
+    pub structure: SparseStructuralEvidence,
     pub x: Vec<f64>,
     pub converged: bool,
     pub iterations: usize,
@@ -10034,6 +10044,8 @@ pub fn solve_with_casp_portfolio(
         chosen_action: action,
         posterior,
         expected_losses,
+        cond_estimate,
+        structure: structural,
         x: final_x,
         converged: final_converged,
         iterations: final_iters,
@@ -10061,25 +10073,17 @@ pub fn spsolve_with_casp(
 ///
 /// Matches the ergonomics of `fsci_linalg::solve_with_audit`.
 /// Records to the provided `SyncSharedAuditLedger`:
-/// - `FailClosed` events when input validation rejects malformed or non-finite inputs
 /// - `BoundedRecovery` events when the iterative solver fails to converge and falls back to
 ///   direct LU (in either mode)
+/// - one `FailClosed` event for every error it returns, in either mode: validation rejections
+///   of malformed or non-finite inputs under their own reasons, and every other error (a
+///   singular matrix, say) as `spsolve_with_casp::<error kind>` (frankenscipy-3cu8u.2)
 pub fn spsolve_with_audit(
     a: &CsrMatrix,
     b: &[f64],
     options: SolveOptions,
     portfolio: &mut SparseSolverPortfolio,
     audit_ledger: &crate::audit::SyncSharedAuditLedger,
-) -> SparseResult<SolveResult> {
-    spsolve_with_casp_internal(a, b, options, portfolio, Some(audit_ledger))
-}
-
-fn spsolve_with_casp_internal(
-    a: &CsrMatrix,
-    b: &[f64],
-    options: SolveOptions,
-    portfolio: &mut SparseSolverPortfolio,
-    audit_ledger: Option<&crate::audit::SyncSharedAuditLedger>,
 ) -> SparseResult<SolveResult> {
     // frankenscipy-3cu8u.1: every event this call records carries one fingerprint over `a`,
     // `b` and `options` (`mode`, `backend`, `ordering`, `check_finite`). It is computed only
@@ -10096,29 +10100,37 @@ fn spsolve_with_casp_internal(
             .bool(options.check_finite);
         fingerprinter.finish()
     };
+    let audit = AuditScope::new(audit_ledger, &fingerprint);
+    let result = spsolve_with_casp_internal(a, b, options, portfolio, Some(&audit));
+    audit.finish(result, |error| {
+        format!("spsolve_with_casp::{}", error.reason_code())
+    })
+}
+
+fn spsolve_with_casp_internal(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SparseSolverPortfolio,
+    audit: Option<&AuditScope<'_>>,
+) -> SparseResult<SolveResult> {
     let shape = a.shape();
     if !shape.is_square() {
-        if let Some(ledger) = audit_ledger {
-            crate::audit::record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "spsolve_with_casp::non_square",
-                "rejected: matrix must be square",
-            );
-        }
+        audit_reject(
+            audit,
+            "spsolve_with_casp::non_square",
+            "rejected: matrix must be square",
+        );
         return Err(SparseError::InvalidShape {
             message: "spsolve requires a square matrix".to_string(),
         });
     }
     if b.len() != shape.rows {
-        if let Some(ledger) = audit_ledger {
-            crate::audit::record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "spsolve_with_casp::rhs_mismatch",
-                "rejected: rhs length must match matrix rows",
-            );
-        }
+        audit_reject(
+            audit,
+            "spsolve_with_casp::rhs_mismatch",
+            "rejected: rhs length must match matrix rows",
+        );
         return Err(SparseError::IncompatibleShape {
             message: "rhs length must match matrix rows".to_string(),
         });
@@ -10126,28 +10138,22 @@ fn spsolve_with_casp_internal(
     if (options.check_finite || options.mode == RuntimeMode::Hardened)
         && (a.data().iter().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite()))
     {
-        if let Some(ledger) = audit_ledger {
-            crate::audit::record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "spsolve_with_casp::non_finite",
-                "rejected: matrix/rhs contains NaN or Inf",
-            );
-        }
+        audit_reject(
+            audit,
+            "spsolve_with_casp::non_finite",
+            "rejected: matrix/rhs contains NaN or Inf",
+        );
         return Err(SparseError::NonFiniteInput {
             message: "matrix/rhs contains NaN or Inf".to_string(),
         });
     }
 
     if options.mode == RuntimeMode::Hardened && has_empty_structural_row(a) {
-        if let Some(ledger) = audit_ledger {
-            crate::audit::record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "spsolve_with_casp::empty_structural_row",
-                "rejected: detected empty structural row in hardened mode",
-            );
-        }
+        audit_reject(
+            audit,
+            "spsolve_with_casp::empty_structural_row",
+            "rejected: detected empty structural row in hardened mode",
+        );
         return Err(SparseError::SingularMatrix {
             message: "detected empty structural row in hardened mode".to_string(),
         });
@@ -10162,12 +10168,42 @@ fn spsolve_with_casp_internal(
 
     let casp_res = solve_with_casp_portfolio(a, b, None, portfolio, iterative_opts)?;
 
-    if casp_res.fallback_active
-        && let Some(ledger) = audit_ledger
-    {
-        crate::audit::record_bounded_recovery(
-            ledger,
-            &fingerprint(),
+    // frankenscipy-7tb8d.11: the CASP choice, in the mode the call ran in. After an iterative
+    // arm fell back, the answer is the direct LU's, and that is the action recorded.
+    if let Some(audit) = audit {
+        let taken = if casp_res.fallback_active {
+            SparseSolverAction::SuperLU
+        } else {
+            casp_res.chosen_action
+        };
+        audit.record(
+            AuditAction::CaspDecision {
+                portfolio: <SparseSolverPortfolio as PortfolioEvidence>::NAME.to_string(),
+                mode: options.mode,
+                action: format!("{taken:?}"),
+                posterior: casp_res.posterior.to_vec(),
+                expected_losses: casp_res.expected_losses.to_vec(),
+                chosen_expected_loss: casp_res.expected_losses[taken.index()],
+                fallback: casp_res.fallback_active,
+                evidence: std::collections::BTreeMap::from([
+                    ("cond_estimate".to_string(), casp_res.cond_estimate.into()),
+                    (
+                        "is_symmetric".to_string(),
+                        casp_res.structure.is_symmetric.to_string().into(),
+                    ),
+                    (
+                        "is_positive_definite_hint".to_string(),
+                        format!("{:?}", casp_res.structure.is_positive_definite_hint).into(),
+                    ),
+                ]),
+            },
+            &format!("CASP selected {:?}", casp_res.chosen_action),
+        );
+    }
+
+    if casp_res.fallback_active {
+        audit_recover(
+            audit,
             "casp_iterative_to_superlu_fallback",
             "recovered: direct solve succeeded after iterative non-convergence",
         );
@@ -27031,6 +27067,61 @@ mod tests {
             decision.rationale,
             "large_very_sparse_nonsymmetric_transpose_stabilization"
         );
+    }
+
+    /// frankenscipy-7tb8d.11: `spsolve_with_audit` records its CASP choice as a `CaspDecision`
+    /// in the mode the call ran in, with the posterior and losses its portfolio recorded.
+    #[test]
+    fn spsolve_with_audit_records_casp_decision_in_its_mode() {
+        let a = spd_csr_3x3();
+        let b = vec![5.0, 5.0, 3.0];
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let ledger = crate::audit::sync_audit_ledger();
+            let mut portfolio = SparseSolverPortfolio::new(mode, 4);
+            let options = SolveOptions {
+                mode,
+                ..SolveOptions::default()
+            };
+            spsolve_with_audit(&a, &b, options, &mut portfolio, &ledger).expect("solve");
+            let recorded = portfolio.evidence().back().expect("evidence").clone();
+            let guard = ledger.lock().expect("ledger");
+            let decisions: Vec<_> = guard
+                .entries()
+                .iter()
+                .filter_map(|event| match &event.action {
+                    fsci_runtime::AuditAction::CaspDecision {
+                        portfolio,
+                        mode,
+                        action,
+                        posterior,
+                        expected_losses,
+                        fallback,
+                        ..
+                    } => Some((
+                        portfolio.clone(),
+                        *mode,
+                        action.clone(),
+                        posterior.clone(),
+                        expected_losses.clone(),
+                        *fallback,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(decisions.len(), 1, "{mode:?}: {:?}", guard.entries());
+            let (name, event_mode, action, posterior, losses, fallback) = &decisions[0];
+            assert_eq!(name, "sparse");
+            assert_eq!(*event_mode, mode);
+            assert_eq!(*fallback, recorded.fallback_active);
+            let taken = if recorded.fallback_active {
+                SparseSolverAction::SuperLU
+            } else {
+                recorded.chosen_action
+            };
+            assert_eq!(action, &format!("{taken:?}"));
+            assert_eq!(posterior, &recorded.posterior);
+            assert_eq!(losses, &recorded.expected_losses);
+        }
     }
 
     #[test]

@@ -33,6 +33,24 @@ pub enum SparseError {
     SingularMatrix { message: String },
 }
 
+impl SparseError {
+    /// The audit reason code of this error; audited APIs prefix it with their operation, as
+    /// in `spsolve_with_casp::singular_matrix` (frankenscipy-3cu8u.2).
+    pub(crate) const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidShape { .. } => "invalid_shape",
+            Self::InvalidSparseStructure { .. } => "invalid_sparse_structure",
+            Self::IndexOutOfBounds { .. } => "index_out_of_bounds",
+            Self::IncompatibleShape { .. } => "incompatible_shape",
+            Self::InvalidArgument { .. } => "invalid_argument",
+            Self::IndexOverflow { .. } => "index_overflow",
+            Self::Unsupported { .. } => "unsupported",
+            Self::NonFiniteInput { .. } => "non_finite_input",
+            Self::SingularMatrix { .. } => "singular_matrix",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseFormat {
     Csr,

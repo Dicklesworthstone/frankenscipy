@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
+use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -123,6 +123,18 @@ impl std::fmt::Display for SpatialError {
 }
 
 impl std::error::Error for SpatialError {}
+
+impl SpatialError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::EmptyData => "empty_data",
+            Self::DimensionMismatch { .. } => "dimension_mismatch",
+            Self::InvalidArgument(_) => "invalid_argument",
+            Self::Qhull(_) => "qhull",
+        }
+    }
+}
 
 impl From<QhullError> for SpatialError {
     fn from(value: QhullError) -> Self {
@@ -3118,6 +3130,9 @@ impl KDTree {
     }
 
     /// Build a k-d tree under an explicit runtime policy with optional audit ledger.
+    ///
+    /// With a ledger, every error it returns, in either mode, is recorded as one `FailClosed`
+    /// event (frankenscipy-3cu8u.2).
     pub fn new_with_mode(
         data: &[Vec<f64>],
         mode: RuntimeMode,
@@ -3131,18 +3146,26 @@ impl KDTree {
                 .str(&format!("{mode:?}"))
                 .finish()
         };
+        let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint));
+        let result = Self::build_audited(data, mode, audit.as_ref());
+        audit_finish(audit.as_ref(), result, SpatialError::reason_code)
+    }
+
+    /// [`Self::new_with_mode`]'s build, recording its rejections under `audit`.
+    fn build_audited(
+        data: &[Vec<f64>],
+        mode: RuntimeMode,
+        audit: Option<&AuditScope<'_>>,
+    ) -> Result<Self, SpatialError> {
         if matches!(mode, RuntimeMode::Hardened)
             && (data.len() > HARDENED_MAX_DIM
                 || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM))
         {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &fingerprint(),
-                    "dimension exceeds hardened limit",
-                    "rejected",
-                );
-            }
+            audit_reject(
+                audit,
+                "resource_exhausted",
+                "rejected: dimension exceeds hardened limit",
+            );
             return Err(SpatialError::InvalidArgument(format!(
                 "data count or dimension exceeds hardened limit ({HARDENED_MAX_DIM})"
             )));
@@ -3163,14 +3186,7 @@ impl KDTree {
             });
         }
         if data.iter().flatten().any(|value| !value.is_finite()) {
-            if let (RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
-                record_fail_closed(
-                    ledger,
-                    &fingerprint(),
-                    "points must be finite in hardened mode",
-                    "rejected",
-                );
-            }
+            audit_reject(audit, "non_finite_input", "rejected: points must be finite");
             return Err(SpatialError::InvalidArgument(
                 "points must be finite".to_string(),
             ));
