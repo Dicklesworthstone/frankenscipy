@@ -24,7 +24,7 @@ pub const HYPER_DISPATCH_PLAN: &[DispatchPlan] = &[
                 when: "|z| >= 50 and b is stable away from nonpositive-integer poles",
             },
         ],
-        notes: "CASP records the same magnitude split used by the scalar evaluator and guards near-pole lower parameters.",
+        notes: "CASP records the same magnitude split used by the scalar evaluator and guards near-pole lower parameters. For z < 0 both steps take the cancellation-controlled J-Bessel route: Hankel's expansion when it resolves, else the series in double or double-double, else Gamma(b) (-z)^((1-b)/2) J_{b-1}(2 sqrt(-z)).",
     },
     DispatchPlan {
         function: "hyp1f1",
@@ -249,6 +249,34 @@ const HYPER_UNSUPPORTED_CHAIN: &[HypergeometricBranch] =
     &[HypergeometricBranch::UnsupportedAnalyticContinuation];
 const HYP2F1_DIVERGENT_CHAIN: &[HypergeometricBranch] =
     &[HypergeometricBranch::DivergentAtUnitArgument];
+/// Pfaff's series serves real z in [-3, 0): there z/(z - 1) <= 3/4 and ~130 terms suffice.
+/// Below it DLMF 15.8.3 takes over; over z in [-3, -1] Pfaff's series was the more accurate of
+/// the two against mpmath (its worst 9e-13 against 15.8.3's 6e-9 where the two terms cancel).
+const HYP2F1_PFAFF_SERIES_LIMIT: f64 = -3.0;
+/// Distance of b - a from an integer below which DLMF 15.8.3's two terms are paired: at 0.1 and
+/// beyond, 15.8.3 as it stands was as accurate as the paired form (both at most 7e-13 against
+/// mpmath, over a, b in [-5, 5], c in [0.5, 10], z in [-1e4, -3]), and cheaper.
+const HYP2F1_NEAR_INTEGER_BAND: f64 = 0.1;
+/// Cancellation of DLMF 15.8.3's two terms past which the paired form is taken instead (1.5% of
+/// the points of a, b in [-5, 5], c in [0.5, 10], z in [-1e4, -3] with b - a at least 0.1 from
+/// an integer).
+const HYP2F1_CONNECTION_MAX_CANCELLATION: f64 = 32.0;
+/// The paired form sums m regular terms first; past this m, 15.8.3 as it stands.
+const HYP2F1_NEAR_INTEGER_MAX_M: f64 = 1000.0;
+/// Term cap of the paired series (its ratio is at most 1/4 past z = -3).
+const HYP2F1_PAIRED_MAX_TERMS: usize = 2000;
+/// Term cap of Hankel's expansion of J_ν (it resolves within ~2x terms, and x >= ~20 is needed).
+const BESSEL_J_HANKEL_MAX_TERMS: usize = 200;
+/// Below this x Hankel's expansion cannot resolve (its smallest term is ~e^-2x > 2^-56), so
+/// 0F1 does not try it.
+const BESSEL_J_HANKEL_MIN_X: f64 = 19.0;
+/// π - fl(π), for phases formed in double-double.
+const PI_LO: f64 = 1.224_646_799_147_353_2e-16;
+/// Past √-z = 1.75 the 0F1 series' cancellation exceeds `HYP1F1_PLAIN_MAX_CANCELLATION` whenever
+/// 2√-z exceeds b - 1, so the double pass is skipped there.
+const HYP0F1_PLAIN_MAX_R: f64 = 1.75;
+/// 2^-56: Hankel's expansion has resolved once a term is this small beside |P| + |Q|.
+const BESSEL_J_HANKEL_RESOLVED: f64 = 1.387_778_780_781_445_7e-17;
 // The log-space integrand's accuracy plateaus at ~3.2e-8 vs SciPy for STEPS>=512 (256 degrades to
 // 8.5e-4) — the 4096 steps were ~8x over-resolved with no accuracy gain. 768 keeps the identical
 // 3.2e-8 floor with a comfortable margin over the 512 plateau-start, cutting ~5.3x of the per-point
@@ -273,6 +301,14 @@ const HYPERU_CONN_MAX_COND: f64 = 1.0e6;
 // route never regresses. Verified vs mpmath: worst accepted 3.9e-9 over a>0,
 // b∈{1..5}, x∈[0.05,15]; larger x (worse) falls through to the integral.
 const HYPERU_INTB_MAX_ERR: f64 = 1.0e-9;
+/// Distance of b from a positive integer below which U(a > 0, b, x) takes the paired form
+/// (`hyperu_near_integer_b`) before the connection formula, whose rounding loss grows like
+/// x/|b - n| (and 1/(|b - 1| ln(1/x)) next to b = 1).
+const HYPERU_NEAR_INTEGER_BAND: f64 = 0.1;
+/// Largest n = b - 1 the paired form serves (as the integer-b route it replaces did).
+const HYPERU_NEAR_INTEGER_MAX_N: f64 = 199.0;
+/// Term cap of the paired series.
+const HYPERU_PAIRED_MAX_TERMS: usize = 6000;
 
 /// Select the hypergeometric branch for a scalar special-function problem.
 pub fn select_hypergeometric_branch(
@@ -915,6 +951,13 @@ pub fn hyp0f1_scalar(b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
 
     let decision = select_hypergeometric_branch(HyperCaspProblem::hyp0f1(b, z, 1.0e-14), mode)?;
     match decision.branch {
+        // z < 0 is the oscillatory J-Bessel side at every magnitude: its series alternates, so
+        // both branches hand it to the cancellation-controlled route.
+        HypergeometricBranch::DirectSeries | HypergeometricBranch::AsymptoticExpansion
+            if z < 0.0 =>
+        {
+            Ok(hyp0f1_negative(b, z))
+        }
         HypergeometricBranch::DirectSeries => Ok(hyp0f1_series(b, z)),
         HypergeometricBranch::AsymptoticExpansion => Ok(hyp0f1_asymptotic(b, z)),
         HypergeometricBranch::ParameterGuard => {
@@ -952,6 +995,192 @@ fn hyp0f1_series(b: f64, z: f64) -> f64 {
     }
 
     sum
+}
+
+/// 0F1(; b; z) for z < 0 (frankenscipy-14k5d). There 0F1(; b; -x²/4) = Γ(b) (x/2)^(1-b)
+/// J_{b-1}(x) oscillates with an envelope ~x^(-1/2) while the alternating power series sums
+/// terms as large as 0F1(; b; |z|) ~ e^x. The series was summed in double below |z| = 50, and
+/// above it Hankel's expansion of J was cut at its first growing term, which for (b - 1)² beyond
+/// x keeps only the leading 1: hyp0f1(8.93, -130.6) was 846 relative off, and the double series
+/// lost up to e^14 ulps below |z| = 50. Now, in order:
+///   * Hankel's expansion, summed past its hump, when it resolves (x large beside (b - 1)²);
+///   * the power series in double while its cancellation Σ|t_k| / |Σ t_k| is at most 16, and in
+///     double-double with b exact beyond, as the 1F1 kernel does;
+///   * past double-double's reach, SciPy's own form Γ(b) (√-z)^(1-b) J_{b-1}(2√-z).
+fn hyp0f1_negative(b: f64, z: f64) -> f64 {
+    let r = (-z).sqrt();
+    // √-z = r + r_lo in double-double: the phase 2√-z runs to hundreds of radians, where the
+    // rounding of r alone would move a J of order one by 2r·2^-53.
+    let r_lo = (-r).mul_add(r, -z) / (2.0 * r);
+    // Hankel's smallest term is ~e^-2x, so it cannot resolve below x = 2r ≈ 19.4.
+    if r >= 0.5 * BESSEL_J_HANKEL_MIN_X
+        && let Some(j) = bessel_j_hankel(b - 1.0, 2.0 * r, 2.0 * r_lo)
+    {
+        return hyp0f1_from_bessel_j(b, r, r_lo, j);
+    }
+    // Σ|t_k| / |Σ t_k| is at least e^2r / 2 once 2r exceeds b - 1, past 16 from 2r = 3.5 on:
+    // the double pass is only worth trying below that.
+    if (r <= HYP0F1_PLAIN_MAX_R || r < 0.5 * (b - 1.0))
+        && let Some((sum, abs_sum)) = hyp0f1_series_plain(b, z)
+        && abs_sum <= HYP1F1_PLAIN_MAX_CANCELLATION * sum.abs()
+    {
+        return sum;
+    }
+    let dd = hyp0f1_series_dd(b, z);
+    if let Some((sum, abs_sum, n)) = dd {
+        // The 1F1 kernel's rounding bound, held against the larger of the sum and the envelope
+        // of the oscillation (Σ|t_k| is about e^x / 2 times it): next to a zero of J no method
+        // keeps its relative accuracy, while this sum still holds its absolute one.
+        let scale = sum.hi.abs().max(2.0 * abs_sum * (-2.0 * r).exp());
+        if abs_sum * (n as f64 + 8.0) * 8.0 * HYP1F1_DD_EPS <= 0.1 * f64::EPSILON * scale {
+            return sum.to_f64();
+        }
+    }
+    let v = hyp0f1_from_bessel_j(b, r, r_lo, crate::bessel::jv_scalar(b - 1.0, 2.0 * r));
+    if v.is_finite() {
+        return v;
+    }
+    dd.map_or(f64::NAN, |(sum, _, _)| sum.to_f64())
+}
+
+/// Γ(b) r^(1-b) J for √-z = r + r_lo: the prefactor of 0F1(; b; z) = Γ(b) (√-z)^(1-b)
+/// J_{b-1}(2√-z), with 1 - b exact and r_lo to first order; `hyp1f1_scaled_power` takes the log
+/// form where a factor over- or underflows.
+fn hyp0f1_from_bessel_j(b: f64, r: f64, r_lo: f64, j: f64) -> f64 {
+    let e = Dd::sum_of(1.0, -b);
+    let scale = j * (1.0 + e.hi * r_lo / r);
+    let mut power = r.powf(e.hi);
+    if e.lo != 0.0 {
+        power *= 1.0 + e.lo * r.ln();
+    }
+    let g = hyp1f1_gamma(b);
+    let v = g * power * scale;
+    if g.is_normal() && power.is_normal() && (v.is_normal() || scale == 0.0) {
+        return v;
+    }
+    hyp1f1_scaled_power(scale, b, 1.0, 1.0, 0.0, r, e)
+}
+
+/// J_ν(x + x_lo) by Hankel's expansion (DLMF 10.17.3),
+///
+///   J_ν(x) = √(2/(πx)) [cos ω P(ν, x) - sin ω Q(ν, x)],   ω = x - (2ν + 1)π/4,
+///   P = Σ_j (-1)^j a_{2j} / x^{2j},   Q = Σ_j (-1)^j a_{2j+1} / x^{2j+1},
+///   a_k = a_{k-1} (4ν² - (2k - 1)²) / (8k),
+///
+/// when it resolves. The terms may grow while (2k - 1)² < 4ν², so only a growth past that hump
+/// marks the divergence (cutting at the first growth kept a_0 alone). None unless a term falls
+/// below 2^-56 of |P| + |Q| first and the hump stays within 64 times it, i.e. unless x is large
+/// beside ν². ω is formed in double-double (x + x_lo less π(2ν + 1)/4 with π to 107 bits), so
+/// the phase keeps x's absolute accuracy at any x.
+fn bessel_j_hankel(nu: f64, x: f64, x_lo: f64) -> Option<f64> {
+    let mu = 4.0 * nu * nu;
+    let mut term = 1.0_f64;
+    let mut p = 1.0_f64;
+    let mut q = 0.0_f64;
+    let mut abs_sum = 1.0_f64;
+    let mut prev_abs = 1.0_f64;
+    let mut resolved = false;
+    for k in 1..BESSEL_J_HANKEL_MAX_TERMS {
+        let kf = k as f64;
+        let odd = 2.0 * kf - 1.0;
+        term *= (mu - odd * odd) / (8.0 * kf * x);
+        let abs_term = term.abs();
+        if abs_term == 0.0 {
+            // Half-integer ν: the expansion terminates and is exact.
+            resolved = true;
+            break;
+        }
+        if odd * odd > mu && abs_term > prev_abs {
+            break;
+        }
+        // a_k enters P (k = 2j) or Q (k = 2j + 1) with the sign (-1)^j.
+        let signed = if (k / 2).is_multiple_of(2) {
+            term
+        } else {
+            -term
+        };
+        if k.is_multiple_of(2) {
+            p += signed;
+        } else {
+            q += signed;
+        }
+        abs_sum += abs_term;
+        prev_abs = abs_term;
+        if abs_term <= BESSEL_J_HANKEL_RESOLVED * (p.abs() + q.abs()) {
+            resolved = true;
+            break;
+        }
+    }
+    if !resolved || abs_sum > 64.0 * (p.abs() + q.abs()) {
+        return None;
+    }
+    // ω = x - πt, t = (2ν + 1)/4.
+    let t = (2.0 * nu + 1.0) * 0.25;
+    let (pi_t, pi_t_err) = dd_two_prod(std::f64::consts::PI, t);
+    let (w, w_err) = dd_two_sum(x, -pi_t);
+    let w_lo = w_err + x_lo - (pi_t_err + PI_LO * t);
+    let (s, c) = w.sin_cos();
+    let (cos_w, sin_w) = (c - w_lo * s, s + w_lo * c);
+    Some((2.0 / (std::f64::consts::PI * x)).sqrt() * (cos_w * p - sin_w * q))
+}
+
+/// Whether the 0F1 series may end after term n: every later ratio |z| / ((b + k)(k + 1)), k > n,
+/// is at most 1/2 (they fall with k once b + k >= 1), so the tail is below the last term.
+fn hyp0f1_series_tail_is_settled(b: f64, z: f64, nf: f64) -> bool {
+    let k = nf + 1.0;
+    b + k >= 1.0 && z.abs() <= 0.5 * (b + k) * (k + 1.0)
+}
+
+/// The 0F1 series in double with Σ|t_k| beside it; None on overflow or when 500 terms do not
+/// converge.
+fn hyp0f1_series_plain(b: f64, z: f64) -> Option<(f64, f64)> {
+    let mut sum = 1.0_f64;
+    let mut term = 1.0_f64;
+    let mut abs_sum = 1.0_f64;
+    for n in 0..500 {
+        let nf = n as f64;
+        term *= z / ((b + nf) * (nf + 1.0));
+        if !term.is_finite() {
+            return None;
+        }
+        sum += term;
+        abs_sum += term.abs();
+        if term == 0.0
+            || (term.abs() < f64::EPSILON * sum.abs() && hyp0f1_series_tail_is_settled(b, z, nf))
+        {
+            return Some((sum, abs_sum));
+        }
+    }
+    None
+}
+
+/// The 0F1 series in double-double with b exact, as `hyp1f1_series_dd` sums the 1F1 series:
+/// the sum, Σ|t_k| and the term count; None on overflow or when `HYP1F1_DD_MAX_TERMS` do not
+/// converge.
+fn hyp0f1_series_dd(b: f64, z: f64) -> Option<(Dd, f64, usize)> {
+    let bd = Dd::from_f64(b);
+    let mut sum = Dd::ONE;
+    let mut term = Dd::ONE;
+    let mut abs_sum = 1.0_f64;
+    for n in 0..HYP1F1_DD_MAX_TERMS {
+        let nf = n as f64;
+        term = term.mul_f64(z).div_sloppy(bd.add_f64(nf).mul_f64(nf + 1.0));
+        if !term.hi.is_finite() {
+            return None;
+        }
+        sum = sum.add_sloppy(term);
+        if !sum.hi.is_finite() {
+            return None;
+        }
+        abs_sum += term.hi.abs();
+        if term.hi == 0.0
+            || (term.hi.abs() <= HYP1F1_DD_STOP_KERNEL * sum.hi.abs()
+                && hyp0f1_series_tail_is_settled(b, z, nf))
+        {
+            return Some((sum, abs_sum, n + 1));
+        }
+    }
+    None
 }
 
 fn broadcast_shape_error(function: &'static str, mode: RuntimeMode) -> SpecialError {
@@ -1152,7 +1381,8 @@ fn select_hyp2f1_branch(
             problem,
             500,
             HYP2F1_PFAFF_CHAIN,
-            "negative real argument outside the unit disk uses the Pfaff transform",
+            "negative real argument outside the unit disk uses the Pfaff transform (its series \
+             to z = -3, then DLMF 15.8.4 at 1 - z' = 1/(1 - z))",
         ));
     }
 
@@ -1346,38 +1576,21 @@ fn hyp0f1_series_complex(
     Ok(sum)
 }
 
-/// Asymptotic expansion for 0F1(; b; z) for large |z|.
-/// Uses relation to Bessel functions.
+/// Asymptotic expansion for 0F1(; b; z) for large positive z (z < 0 goes to
+/// `hyp0f1_negative`): 0F1(; b; x²/4) = Γ(b) (x/2)^(1-b) I_{b-1}(x).
 fn hyp0f1_asymptotic(b: f64, z: f64) -> f64 {
-    // 0F1(; b; z) is related to Bessel functions:
-    // 0F1(; b; -x²/4) = Γ(b) * (x/2)^(1-b) * J_{b-1}(x)  for x > 0
-    // 0F1(; b; x²/4) = Γ(b) * (x/2)^(1-b) * I_{b-1}(x)   for x > 0
-    //
-    // For large positive z: use modified Bessel I
-    // For large negative z: use Bessel J
-
     // Compute gamma(b) via exp(gammaln(b))
     // Use gammaln_scalar with Strict mode (won't fail for b > 0)
     let ln_gamma_b = crate::gamma::gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN);
     let gamma_b = ln_gamma_b.exp();
 
-    if z > 0.0 {
-        // z = x²/4, so x = 2*sqrt(z)
-        let x = 2.0 * z.sqrt();
-        let nu = b - 1.0;
+    // z = x²/4, so x = 2*sqrt(z)
+    let x = 2.0 * z.sqrt();
+    let nu = b - 1.0;
 
-        // 0F1(; b; z) = Γ(b) * z^((1-b)/2) * I_{b-1}(x)
-        let i_val = bessel_i_asymptotic(nu, x);
-        gamma_b * z.powf((1.0 - b) / 2.0) * i_val
-    } else {
-        // z = -x²/4, so x = 2*sqrt(-z)
-        let x = 2.0 * (-z).sqrt();
-        let nu = b - 1.0;
-
-        // 0F1(; b; z) = Γ(b) * (-z)^((1-b)/2) * J_{b-1}(x)
-        let j_val = bessel_j_asymptotic(nu, x);
-        gamma_b * (-z).powf((1.0 - b) / 2.0) * j_val
-    }
+    // 0F1(; b; z) = Γ(b) * z^((1-b)/2) * I_{b-1}(x)
+    let i_val = bessel_i_asymptotic(nu, x);
+    gamma_b * z.powf((1.0 - b) / 2.0) * i_val
 }
 
 /// Asymptotic approximation for I_nu(x) for large x.
@@ -1400,46 +1613,6 @@ fn bessel_i_asymptotic(nu: f64, x: f64) -> f64 {
     }
 
     x.exp() * coeff * sum
-}
-
-/// Asymptotic expansion of J_nu(x) for large x (DLMF 10.17.3):
-///
-///   J_ν(x) ~ sqrt(2/(πx)) [cos(ω) P(ν,x) - sin(ω) Q(ν,x)],   ω = x - νπ/2 - π/4,
-///   P = Σ_j (-1)^j a_{2j}/x^{2j},   Q = Σ_j (-1)^j a_{2j+1}/x^{2j+1},
-///   a_0 = 1,   a_k = a_{k-1} (4ν² - (2k-1)²) / (8k).
-///
-/// The previous implementation kept only the leading term (P = 1, Q = 0), which
-/// is accurate to O(1/x) and left 0F1's oscillatory (z < 0) branch ~1-3% off
-/// SciPy. The full series — summed to its smallest term, since it is asymptotic
-/// (divergent) — restores ~1e-14 agreement. frankenscipy-o9ws0.
-fn bessel_j_asymptotic(nu: f64, x: f64) -> f64 {
-    let mu = 4.0 * nu * nu;
-    let mut term = 1.0_f64; // a_k / x^k, a_0 = 1
-    let mut prev_abs = 1.0_f64;
-    let mut p = 1.0_f64; // k = 0 term of P
-    let mut q = 0.0_f64;
-    for k in 1..64 {
-        let kf = k as f64;
-        term *= (mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf * x);
-        let abs_term = term.abs();
-        if abs_term > prev_abs {
-            break; // asymptotic series past its smallest term — truncate
-        }
-        if k % 2 == 0 {
-            let sign = if (k / 2) % 2 == 0 { 1.0 } else { -1.0 };
-            p += sign * term;
-        } else {
-            let sign = if ((k - 1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
-            q += sign * term;
-        }
-        prev_abs = abs_term;
-        if abs_term <= f64::EPSILON {
-            break;
-        }
-    }
-    let omega = x - nu * std::f64::consts::FRAC_PI_2 - std::f64::consts::FRAC_PI_4;
-    let amplitude = (2.0 / (std::f64::consts::PI * x)).sqrt();
-    amplitude * (omega.cos() * p - omega.sin() * q)
 }
 
 /// Gauss hypergeometric function 2F1(a, b; c; z).
@@ -1805,6 +1978,23 @@ impl Dd {
         Self { hi, lo }.add_f64(q3)
     }
 
+    /// self / den as a two-step quotient (the second word from the exact remainder of the
+    /// first), for the series kernels.
+    fn div_sloppy(self, den: Self) -> Self {
+        let q1 = self.hi / den.hi;
+        let (p, pe) = dd_two_prod(den.hi, q1);
+        let q2 = ((self.hi - p) - pe + self.lo - den.lo * q1) / den.hi;
+        let (hi, lo) = dd_quick_two_sum(q1, q2);
+        Self { hi, lo }
+    }
+
+    /// self + o with the error bounded by 2^-104 (|self| + |o|), for the series kernels.
+    fn add_sloppy(self, o: Self) -> Self {
+        let (s, e) = dd_two_sum(self.hi, o.hi);
+        let (hi, lo) = dd_quick_two_sum(s, e + self.lo + o.lo);
+        Self { hi, lo }
+    }
+
     fn is_zero(self) -> bool {
         self.hi == 0.0 && self.lo == 0.0
     }
@@ -1952,19 +2142,11 @@ fn hyp1f1_series_dd(a: Dd, b: Dd, x: f64, stop: f64) -> Option<(Dd, f64, usize)>
         // term·(a+n)·x / ((b+n)(n+1)): one double-double product, a two-step division (the
         // quotient's second word), and the sloppy sum, whose error is bounded by
         // 2^-104 (|sum| + |term|) — the scale the Σ|t_k| error model already charges.
-        let num = term.mul(an).mul_f64(x);
-        let den = bn.mul_f64(nf + 1.0);
-        let q1 = num.hi / den.hi;
-        let (p, pe) = dd_two_prod(den.hi, q1);
-        let q2 = ((num.hi - p) - pe + num.lo - den.lo * q1) / den.hi;
-        let (th, tl) = dd_quick_two_sum(q1, q2);
-        term = Dd { hi: th, lo: tl };
+        term = term.mul(an).mul_f64(x).div_sloppy(bn.mul_f64(nf + 1.0));
         if !term.hi.is_finite() {
             return None;
         }
-        let (s, e) = dd_two_sum(sum.hi, term.hi);
-        let (sh, sl) = dd_quick_two_sum(s, e + sum.lo + term.lo);
-        sum = Dd { hi: sh, lo: sl };
+        sum = sum.add_sloppy(term);
         if !sum.hi.is_finite() {
             return None;
         }
@@ -2353,26 +2535,25 @@ pub fn hyperu_scalar(a: f64, b: f64, x: f64, mode: RuntimeMode) -> Result<f64, S
         if let Some(v) = hyperu_large_x_asymptotic(a, b, x, 1e-13) {
             return Ok(v);
         }
+        // b at or near a positive integer: the connection formula's Γ(1-b) and Γ(b-1) poles
+        // cancel (exactly singular at the integer). The paired form (DLMF 13.2.9 at the
+        // integer) is exact at any distance and self-gated; larger x, where its sums cancel,
+        // falls through.
+        let nb = (b - 1.0).round();
+        if (b - 1.0 - nb).abs() < HYPERU_NEAR_INTEGER_BAND
+            && (0.0..=HYPERU_NEAR_INTEGER_MAX_N).contains(&nb)
+            && let Some(v) = hyperu_near_integer_b(a, b, x, HYPERU_INTB_MAX_ERR)
+        {
+            return Ok(v);
+        }
         // Small/moderate x (asymptotic didn't resolve): the two-term 1F1
         // connection formula (non-integer b) is ~10× cheaper than the 768-step
         // confluent integral AND more accurate here. It is only taken when its
         // cancellation condition is small enough that the rounding loss stays
         // well under the integral's ~3.2e-8 floor (self-validating gate);
-        // otherwise (integer b, or large-x cancellation) it falls through to the
-        // integral with no accuracy regression.
+        // otherwise (large-x cancellation) it falls through to the integral with
+        // no accuracy regression.
         if let Some(v) = hyperu_connection_formula_checked(a, b, x, HYPERU_CONN_MAX_COND, mode) {
-            return Ok(v);
-        }
-        // Integer b: the connection formula is singular. The DLMF 13.2.9
-        // logarithmic form (self-gated) resolves small-x cases ~10× cheaper than
-        // the 768-step integral; larger x (log series loses precision) or huge b
-        // fall through to the integral with no accuracy regression.
-        let nb = b.round();
-        if is_near_integer(b)
-            && (1.0..=200.0).contains(&nb)
-            && let Some(v) =
-                hyperu_positive_integer_b_log(a, (nb as u32) - 1, x, HYPERU_INTB_MAX_ERR)
-        {
             return Ok(v);
         }
         return hyperu_positive_a_integral(a, b, x, mode);
@@ -2695,42 +2876,29 @@ fn hyperu_connection_formula(
     x: f64,
     mode: RuntimeMode,
 ) -> Result<f64, SpecialError> {
-    let sin_pi_b = (std::f64::consts::PI * b).sin();
-    if sin_pi_b.abs() < 1.0e-12 {
-        return unsupported_hypergeometric_branch(
+    match hyperu_connection_terms(a, b, x, mode)? {
+        None => unsupported_hypergeometric_branch(
             "hyperu",
             mode,
             "connection formula is singular for integer b",
-        );
+        ),
+        Some((value, _)) if value.is_finite() => Ok(value),
+        Some(_) => unsupported_hypergeometric_branch(
+            "hyperu",
+            mode,
+            "connection formula produced a non-finite value",
+        ),
     }
-
-    let m_ab = hyp1f1_scalar(a, b, x, mode)?;
-    let shifted_a = a - b + 1.0;
-    let shifted_b = 2.0 - b;
-    let m_shifted = hyp1f1_scalar(shifted_a, shifted_b, x, mode)?;
-    let term1 = m_ab * reciprocal_gamma_real(shifted_a) * reciprocal_gamma_real(b);
-    let term2 =
-        x.powf(1.0 - b) * m_shifted * reciprocal_gamma_real(a) * reciprocal_gamma_real(shifted_b);
-    let value = std::f64::consts::PI * (term1 - term2) / sin_pi_b;
-
-    if value.is_finite() {
-        return Ok(value);
-    }
-
-    unsupported_hypergeometric_branch(
-        "hyperu",
-        mode,
-        "connection formula produced a non-finite value",
-    )
 }
 
 /// Self-validating variant of the two-term 1F1 connection formula. Computes the
 /// same value as `hyperu_connection_formula` but first estimates the cancellation
-/// loss `cond = (|T1| + |T2|) / |T1 − T2|` and returns `None` when b is (near)
+/// loss `cond = (|T1| + |T2|) / |T1 + T2|` and returns `None` when b is (near)
 /// integer (formula singular) or `cond > max_cond` (rounding loss too large — the
 /// caller falls back to the cancellation-free confluent integral). Used on the
 /// a>0 branch to skip the 768-step quadrature at small/moderate x, where the two
 /// 1F1 series (all-positive terms for a,b,x>0) are cheap and well-conditioned.
+/// A value past the overflow threshold comes back as +-inf, not as a refusal.
 fn hyperu_connection_formula_checked(
     a: f64,
     b: f64,
@@ -2738,103 +2906,177 @@ fn hyperu_connection_formula_checked(
     max_cond: f64,
     mode: RuntimeMode,
 ) -> Option<f64> {
-    let sin_pi_b = (std::f64::consts::PI * b).sin();
-    if sin_pi_b.abs() < 1.0e-12 {
-        return None;
-    }
-    let m_ab = hyp1f1_scalar(a, b, x, mode).ok()?;
-    let shifted_a = a - b + 1.0;
-    let shifted_b = 2.0 - b;
-    let m_shifted = hyp1f1_scalar(shifted_a, shifted_b, x, mode).ok()?;
-    let t1 = m_ab * reciprocal_gamma_real(shifted_a) * reciprocal_gamma_real(b);
-    let t2 =
-        x.powf(1.0 - b) * m_shifted * reciprocal_gamma_real(a) * reciprocal_gamma_real(shifted_b);
-    let diff = t1 - t2;
-    if diff == 0.0 {
-        return None;
-    }
-    let cond = (t1.abs() + t2.abs()) / diff.abs();
-    if !cond.is_finite() || cond > max_cond {
-        return None;
-    }
-    let value = std::f64::consts::PI * diff / sin_pi_b;
-    if value.is_finite() { Some(value) } else { None }
+    let (value, cond) = hyperu_connection_terms(a, b, x, mode).ok()??;
+    (cond <= max_cond).then_some(value)
 }
 
-/// U(a, n+1, x) for a>0 and n = b−1 a nonnegative integer, via the DLMF 13.2.9
-/// logarithmic form: a finite x^{-n}-polynomial (empty for n=0) plus a log series
-/// Σ_k (a)_k/((n+1)_k k!) x^k [ln x + ψ(a+k) − ψ(k+1) − ψ(n+k+1)]. The connection
-/// formula is singular for integer b, so this is the fast small-x route there.
-/// Self-validates by estimating the summation rounding error
-/// ≈ eps·(|pref_log|·Σ|log-terms| + |finite-terms|)/|value| and returns None if
-/// it exceeds `max_err` (larger x, where the sign-changing log series loses
-/// precision — caller uses the confluent integral) or the value is non-finite.
-/// Terminating cases (a a positive integer ≤ n) fall out naturally: Γ(a−n) is a
-/// pole, so the log term vanishes and only the finite (Laguerre-type) polynomial
-/// remains.
-fn hyperu_positive_integer_b_log(a: f64, n: u32, x: f64, max_err: f64) -> Option<f64> {
-    let nf = n as f64;
+/// DLMF 13.2.42,
+///
+///   U(a, b, x) = Γ(1-b)/Γ(a-b+1) M(a, b, x) + Γ(b-1)/Γ(a) x^(1-b) M(a-b+1, 2-b, x),
+///
+/// as (value, cancellation (|T1| + |T2|)/|T1 + T2|); None when b is within ~3e-13 of an integer,
+/// where both terms have poles. The π/sin(πb) form this replaces rounded πb, which cost
+/// ulp(πb)/|tan πb| (3e-13 at b = 2.001), and formed x^(1-b) outright, which overflows for tiny
+/// x and b > 1 long before U does: every hyperu(a, b, x) with (b - 1) ln(1/x) > 709 fell through
+/// to the confluent integral, and that refused in Hardened mode ("quadrature overflowed") or,
+/// where it did not overflow, lost the integrand beyond its t <= e^180 window
+/// (frankenscipy-14k5d). Now b - 1, 1 - b and a - b + 1 are exact (first order in their low
+/// words), x^(1-b) goes in as two half powers where it alone over- or underflows, and a value
+/// that really overflows is +-inf with cancellation 1.
+fn hyperu_connection_terms(
+    a: f64,
+    b: f64,
+    x: f64,
+    mode: RuntimeMode,
+) -> Result<Option<(f64, f64)>, SpecialError> {
+    if (std::f64::consts::PI * b).sin().abs() < 1.0e-12 {
+        return Ok(None);
+    }
+    let m_ab = hyp1f1_scalar(a, b, x, mode)?;
+    let m_shifted = hyp1f1_scalar(a - b + 1.0, 2.0 - b, x, mode)?;
+    let one_minus_b = Dd::sum_of(1.0, -b);
+    let b_minus_one = Dd::sum_of(b, -1.0);
+    let t1 = hyp1f1_gamma_dd(one_minus_b) * hyp1f1_rgamma_dd(Dd::sum_of(a, -b).add_f64(1.0)) * m_ab;
+    let g2 = hyp1f1_gamma_dd(b_minus_one) * hyp1f1_rgamma(a) * m_shifted;
+    let log_lo = 1.0 + one_minus_b.lo * x.ln();
+    let power = x.powf(one_minus_b.hi);
+    let t2 = if power.is_normal() {
+        g2 * power * log_lo
+    } else {
+        let half = x.powf(0.5 * one_minus_b.hi);
+        g2 * half * half * log_lo
+    };
+    if t2.is_infinite() && t1.is_finite() {
+        return Ok(Some((t2, 1.0)));
+    }
+    let value = t1 + t2;
+    let cond = if value.is_finite() {
+        (t1.abs() + t2.abs()) / value.abs()
+    } else {
+        f64::NAN
+    };
+    Ok(Some((value, cond)))
+}
+
+/// Γ(s) at a double-double argument, to first order in s.lo (d ln Γ/ds = ψ(s)).
+fn hyp1f1_gamma_dd(s: Dd) -> f64 {
+    let g = hyp1f1_gamma(s.hi);
+    if s.lo == 0.0 || !g.is_finite() {
+        return g;
+    }
+    g * (1.0 + crate::gamma::digamma_core(s.hi) * s.lo)
+}
+
+/// U(a, b, x) for a > 0 and b = n + 1 + eps next to a positive integer (n >= 0, |eps| below
+/// `HYPERU_NEAR_INTEGER_BAND`), where DLMF 13.2.42's Γ(1-b) and Γ(b-1) poles cancel. Its first
+/// n terms of the second series are regular; pairing each later one with its partner in the
+/// first series (the scheme of `hyp2f1_inv_one_minus_z_near_integer`) gives, exactly for every
+/// eps,
+///
+///   U = Γ(n+eps)/Γ(a) x^(-n-eps) Σ_{k<n} (a-n-eps)_k x^k / ((1-n-eps)_k k!)
+///     + (-1)^n Γ(1-eps)/Γ(a-n-eps) Σ_j (a)_j x^j E_j / ((1+eps)_{n+j} j!),
+///
+///   E_j = (R_j - 1)/eps,   R_j = x^-eps Γ(a+j-eps)Γ(1+j)Γ(1+n+j+eps) / (Γ(a+j)Γ(1+j-eps)Γ(1+n+j)),
+///
+/// which at eps = 0 is DLMF 13.2.9 (E_j = -ln x - ψ(a+j) + ψ(1+j) + ψ(1+n+j)); the former
+/// integer-b route rounded b to the integer (a 2e-7 error at |eps| = 1e-12, x = 1e-300), and
+/// the connection formula lost eps_mach/(|eps| ln(1/x)) next to b = 1. Self-validating: None
+/// when the estimated rounding error eps_mach (|finite part| + |Γ-prefactor| Σ_j |coef_j|
+/// (|E_j| + |the parts of E_j|))/|U| exceeds `max_err` (larger x, where U is recessive and the
+/// sums cancel) or on NaN; a value past the overflow threshold is +-inf. A positive integer a <= n makes 1/Γ(a-n-eps) vanish
+/// at eps = 0, leaving the finite (Laguerre-type) polynomial.
+fn hyperu_near_integer_b(a: f64, b: f64, x: f64, max_err: f64) -> Option<f64> {
+    let d = Dd::sum_of(b, -1.0);
+    let n = d.hi.round();
+    let eps = (d.hi - n) + d.lo;
+    let ni = n as usize;
     let ln_x = x.ln();
 
-    // Log series (converges in the small x).
-    let mut s_log = 0.0_f64;
-    let mut sum_abs = 0.0_f64;
-    let mut coeff = 1.0_f64; // (a)_k/((n+1)_k k!) x^k
-    for k in 0..6000 {
-        let kf = k as f64;
-        let l = ln_x + crate::convenience::digamma_scalar(a + kf)
-            - crate::convenience::digamma_scalar(kf + 1.0)
-            - crate::convenience::digamma_scalar(nf + kf + 1.0);
-        let term = coeff * l;
-        s_log += term;
-        sum_abs += term.abs();
-        if k > 2 && term.abs() <= 1e-18 * s_log.abs().max(1e-300) {
-            break;
-        }
-        coeff *= (a + kf) / ((nf + 1.0 + kf) * (kf + 1.0)) * x;
-    }
-    let log_sign = if (n + 1).is_multiple_of(2) { 1.0 } else { -1.0 }; // (−1)^{n+1}
-    let mut fact_n = 1.0_f64; // n!
-    for i in 1..=n {
-        fact_n *= i as f64;
-    }
-    let pref_log = log_sign / fact_n * reciprocal_gamma_real(a - nf);
-    let t_log = pref_log * s_log;
-
-    // Finite part (n ≥ 1): (n−1)!/Γ(a) · x^{−n} Σ_{k=0}^{n−1} (a−n)_k/((1−n)_k k!) x^k.
-    let mut t_fin = 0.0_f64;
-    let mut fin_abs = 0.0_f64;
-    if n >= 1 {
-        let mut s_fin = 0.0_f64;
-        let mut acc_abs = 0.0_f64;
-        let mut c = 1.0_f64;
-        for k in 0..n {
-            s_fin += c;
-            acc_abs += c.abs();
-            if k < n - 1 {
+    // The regular terms, Γ(n+eps)/Γ(a) x^(-n-eps) Σ_{k<n} ...; x^-n by steps where it alone
+    // overflows.
+    let (mut finite, mut finite_abs) = (0.0_f64, 0.0_f64);
+    if ni > 0 {
+        let (mut s, mut s_abs, mut c) = (0.0_f64, 0.0_f64, 1.0_f64);
+        for k in 0..ni {
+            s += c;
+            s_abs += c.abs();
+            if k + 1 < ni {
                 let kf = k as f64;
-                c *= (a - nf + kf) / ((1.0 - nf + kf) * (kf + 1.0)) * x;
+                c *= (a - n - eps + kf) / ((1.0 - n - eps + kf) * (kf + 1.0)) * x;
             }
         }
-        let mut fact_nm1 = 1.0_f64; // (n−1)!
-        for i in 1..n {
-            fact_nm1 *= i as f64;
-        }
-        let pf = fact_nm1 * reciprocal_gamma_real(a) * x.powi(-(n as i32));
-        t_fin = pf * s_fin;
-        fin_abs = pf.abs() * acc_abs;
+        let g = hyp1f1_gamma(n + eps) * hyp1f1_rgamma(a) * (-eps * ln_x).exp();
+        let power = x.powf(-n);
+        let (v, v_abs) = if power.is_normal() {
+            (g * s * power, (g * s_abs * power).abs())
+        } else {
+            let (mut v, mut v_abs) = (g * s, (g * s_abs).abs());
+            for _ in 0..ni {
+                v /= x;
+                v_abs /= x;
+            }
+            (v, v_abs)
+        };
+        finite = v;
+        finite_abs = v_abs;
     }
 
-    let value = t_log + t_fin;
-    if !value.is_finite() {
+    // The paired terms.
+    let (l1, g1) = ln_gamma_ratio_over(a, -eps);
+    let (l2, g2) = ln_gamma_ratio_over(1.0, -eps);
+    let (l3, g3) = ln_gamma_ratio_over(1.0 + n, eps);
+    let lambda = -ln_x - l1 + l2 + l3;
+    let mut e_j = if g1 * g2 * g3 > 0.0 {
+        lambda * expm1_over(eps * lambda)
+    } else {
+        // Γ(a - eps) and Γ(a) on either side of the pole at 0 (a < |eps|): R_0 < 0.
+        (-(eps * lambda).exp() - 1.0) / eps
+    };
+    let mut r_j = 1.0 + eps * e_j;
+    // E_j is a sum of terms of this size (ln x and the ψ-like parts), and its rounding error is
+    // absolute, eps_mach times it: where E_j crosses zero next to the largest coefficients, as
+    // it does once x is a few units, |coef_j E_j| alone would understate the error of the sum
+    // (by 30x at hyperu(4.2, 1.087, 5.0), and the value there was 3e-8 off).
+    let mut e_scale = ln_x.abs() + l1.abs() + l2.abs() + l3.abs();
+    let mut coef = 1.0_f64; // (a)_j x^j / ((1+eps)_{n+j} j!)
+    for i in 0..ni {
+        coef /= 1.0 + eps + i as f64;
+    }
+    let (mut tail, mut tail_abs) = (0.0_f64, 0.0_f64);
+    let mut converged = false;
+    for j in 0..HYPERU_PAIRED_MAX_TERMS {
+        let jf = j as f64;
+        let term = coef * e_j;
+        tail += term;
+        tail_abs += coef.abs() * (e_j.abs() + e_scale);
+        let ratio = (a + jf) * x / ((1.0 + eps + n + jf) * (jf + 1.0));
+        if j > 2 && ratio <= 0.5 && term.abs() <= 1.0e-18 * tail.abs() {
+            converged = true;
+            break;
+        }
+        let alpha = a + jf;
+        let gamma = 1.0 + n + jf;
+        let delta = 1.0 + jf;
+        // R_{j+1}/R_j = (1 - eps/α)(1 + eps/γ)/(1 - eps/δ) = 1 + eps r.
+        let (ia, ig, id) = (1.0 / alpha, 1.0 / gamma, 1.0 / delta);
+        let r = (-ia + ig + id - eps * ia * ig) / (1.0 - eps * id);
+        e_j += r_j * r;
+        r_j = 1.0 + eps * e_j;
+        e_scale += ia.abs() + ig + id;
+        coef *= ratio;
+    }
+    if !converged {
         return None;
     }
-    let err_est = f64::EPSILON * (pref_log.abs() * sum_abs + fin_abs) / value.abs().max(1e-300);
-    if err_est <= max_err {
-        Some(value)
-    } else {
-        None
+    let sign = if ni.is_multiple_of(2) { 1.0 } else { -1.0 };
+    let pref = sign * hyp1f1_gamma(1.0 - eps) * hyp1f1_rgamma_dd(Dd::sum_of(a, -n).add_f64(-eps));
+    let paired = pref * tail;
+    if finite.is_infinite() && paired.is_finite() {
+        return Some(finite);
     }
+    let value = finite + paired;
+    let err_est = f64::EPSILON * (finite_abs + pref.abs() * tail_abs) / value.abs();
+    (err_est <= max_err).then_some(value)
 }
 
 fn is_near_integer(x: f64) -> bool {
@@ -3155,12 +3397,7 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
             let cab = c - a - b;
             Ok(gamma_ratio_for_hyp2f1(c, cab, c - a, c - b))
         }
-        HypergeometricBranch::PfaffTransform => {
-            let z_new = z / (z - 1.0);
-            let factor = (1.0 - z).powf(-a);
-            let inner = hyp2f1_series(a, c - b, c, z_new)?;
-            Ok(factor * inner)
-        }
+        HypergeometricBranch::PfaffTransform => hyp2f1_negative_argument(a, b, c, z),
         HypergeometricBranch::LinearFractionalIdentity => {
             // Euler transformation: 2F1(a,b;c;z) = (1-z)^{c-a-b} 2F1(c-a,c-b;c;z).
             // Selection guarantees c-a or c-b is a nonpositive integer, so the
@@ -3209,11 +3446,18 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
 /// (non-finite prefactors, integer c−a−b with a or b ≤ 0) reach this series
 /// that close to z = 1.
 fn hyp2f1_series(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
+    Ok(hyp2f1_series_measured(a, b, c, z).0)
+}
+
+/// `hyp2f1_series` with its cancellation Σ|t_n| / |Σ t_n| beside the sum (NaN and +inf when it
+/// overflows or does not converge).
+fn hyp2f1_series_measured(a: f64, b: f64, c: f64, z: f64) -> (f64, f64) {
     let max_terms = 5000;
     let eps = f64::EPSILON;
 
     let mut sum = 1.0;
     let mut term = 1.0;
+    let mut abs_sum = 1.0_f64;
 
     for n in 0..max_terms {
         let nf = n as f64;
@@ -3224,17 +3468,311 @@ fn hyp2f1_series(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
         }
 
         sum += term;
+        abs_sum += term.abs();
 
-        if term == 0.0 {
-            return Ok(sum);
-        }
-
-        if term.abs() < eps * sum.abs() {
-            return Ok(sum);
+        if term == 0.0 || term.abs() < eps * sum.abs() {
+            return (sum, abs_sum / sum.abs());
         }
     }
 
-    Ok(f64::NAN)
+    (f64::NAN, f64::INFINITY)
+}
+
+/// Pfaff's series 2F1(a, b; c; z) = (1 - z)^-a 2F1(a, c - b; c; z/(z - 1)) for z < 0.
+fn hyp2f1_pfaff_series(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
+    let z_new = z / (z - 1.0);
+    let factor = (1.0 - z).powf(-a);
+    let inner = hyp2f1_series(a, c - b, c, z_new)?;
+    Ok(factor * inner)
+}
+
+/// 2F1(a, b; c; z) for real z < 0, the CASP Pfaff branch (frankenscipy-14k5d).
+///
+/// Pfaff's transform takes z to z' = z/(z - 1) in (0, 1), where the series converges like z'^n:
+/// quickly to z = -3 (z' = 3/4), but it needs ~36|z| terms beyond, and past z ≈ -140 the
+/// 5000-term cap returned NaN (6165 of 20000 points of z in [-1e4, -1], at 0.08x SciPy's speed).
+/// Past z = -3 the value is now DLMF 15.8.4 at 1 - z' = 1/(1 - z) (with Pfaff's transform,
+/// DLMF 15.8.3): two series in 1/(1 - z) < 1/4 with gamma prefactors. Those prefactors have
+/// poles where b - a is an integer, and near one SciPy (cephes' 1/z transform, DLMF 15.8.2)
+/// loses every digit; within `HYP2F1_NEAR_INTEGER_BAND` of an integer, and wherever the two
+/// terms cancel, the pole terms are paired (`hyp2f1_inv_one_minus_z_near_integer`), exactly for
+/// any distance. When c - a or c - b is a nonpositive integer the function is elementary times
+/// a polynomial (Euler or Pfaff), summed as such. A non-finite result falls back to Pfaff's
+/// series.
+fn hyp2f1_negative_argument(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
+    if z >= HYP2F1_PFAFF_SERIES_LIMIT {
+        return hyp2f1_pfaff_series(a, b, c, z);
+    }
+    let value = if is_nonpositive_integer(c - a) || is_nonpositive_integer(c - b) {
+        hyp2f1_negative_terminating(a, b, c, z)
+    } else {
+        // b - a = d exactly, = m + eps with m the nearest integer (d.hi - m is exact).
+        let d = Dd::sum_of(b, -a);
+        let m = d.hi.round();
+        let eps = (d.hi - m) + d.lo;
+        let pairable = m.abs() <= HYP2F1_NEAR_INTEGER_MAX_M;
+        if eps.abs() < HYP2F1_NEAR_INTEGER_BAND && pairable {
+            hyp2f1_inv_one_minus_z_near_integer(a, b, c, z, m, eps)
+        } else {
+            // Where 15.8.3's two terms cancel (the value near a zero of 2F1), the paired form
+            // cancels less: over a, b in [-5, 5], c in [0.5, 10], z in [-1e4, -3] it was the
+            // closer to mpmath at two thirds of such points, and its worst error half as large.
+            let (value, cancellation) = hyp2f1_inv_one_minus_z(a, b, c, z, d);
+            let paired = if cancellation > HYP2F1_CONNECTION_MAX_CANCELLATION && pairable {
+                hyp2f1_inv_one_minus_z_near_integer(a, b, c, z, m, eps)
+            } else {
+                f64::NAN
+            };
+            if paired.is_finite() { paired } else { value }
+        }
+    };
+    if value.is_finite() {
+        return Ok(value);
+    }
+    hyp2f1_pfaff_series(a, b, c, z)
+}
+
+/// 2F1(a, b; c; z) for z < -3 when c - a or c - b is a nonpositive integer: Euler's
+/// (1 - z)^(c-a-b) 2F1(c - a, c - b; c; z) is then (1 - z)^(c-a-b) times a polynomial in z, and
+/// Pfaff's (1 - z)^-b 2F1(b, c - a; c; z') (or with a and c - b) one in z' = z/(z - 1). The one
+/// that cancels less is taken: the polynomial in z' alternates when z' is near 1, and lost 1e-9
+/// where the one in z was exact to 1e-14.
+fn hyp2f1_negative_terminating(a: f64, b: f64, c: f64, z: f64) -> f64 {
+    let (euler, euler_cancellation) = hyp2f1_series_measured(c - a, c - b, c, z);
+    let (p, q) = if is_nonpositive_integer(c - a) {
+        (b, c - a)
+    } else {
+        (a, c - b)
+    };
+    let (pfaff, pfaff_cancellation) = hyp2f1_series_measured(p, q, c, z / (z - 1.0));
+    if euler_cancellation <= pfaff_cancellation {
+        (1.0 - z).powf(c - a - b) * euler
+    } else {
+        (1.0 - z).powf(-p) * pfaff
+    }
+}
+
+/// DLMF 15.8.3 for z < -1, with b - a = d (double-double) at least `HYP2F1_NEAR_INTEGER_BAND`
+/// from an integer:
+///
+///   2F1(a, b; c; z) = Γ(c)Γ(b-a)/(Γ(b)Γ(c-a)) (1-z)^-a 2F1(a, c-b; a-b+1; w)
+///                   + Γ(c)Γ(a-b)/(Γ(a)Γ(c-b)) (1-z)^-b 2F1(b, c-a; b-a+1; w),   w = 1/(1-z).
+///
+/// 1 - z is carried in double-double: w and the powers keep their accuracy at any |z|. Returns
+/// the value and the cancellation (|T1| + |T2|)/|T1 + T2| of its two terms.
+fn hyp2f1_inv_one_minus_z(a: f64, b: f64, c: f64, z: f64, d: Dd) -> (f64, f64) {
+    let (s_hi, s_lo) = dd_two_sum(1.0, -z);
+    let w = (1.0 - s_lo / s_hi) / s_hi;
+    let (f1, _) = hyp2f1_series_measured(a, c - b, (1.0 - d.hi) - d.lo, w);
+    let (f2, _) = hyp2f1_series_measured(b, c - a, (1.0 + d.hi) + d.lo, w);
+    let neg_d = Dd {
+        hi: -d.hi,
+        lo: -d.lo,
+    };
+    let t1 = hyp2f1_connection_term(c, d, c - a, b, s_hi, s_lo, -a, f1);
+    let t2 = hyp2f1_connection_term(c, neg_d, c - b, a, s_hi, s_lo, -b, f2);
+    let value = t1 + t2;
+    (value, (t1.abs() + t2.abs()) / value.abs())
+}
+
+/// 2F1(a, b; c; z) for z < -1 with b - a = m + eps, m the nearest integer (|eps| <= 1/2): taken
+/// when |eps| is below `HYP2F1_NEAR_INTEGER_BAND`, where DLMF 15.8.3's two terms carry Γ(±eps)
+/// poles that cancel, and where 15.8.3's terms cancel for any other reason.
+///
+/// With (p, q) = (a, c - b) when m >= 0, else (b, c - a) with m and eps negated, Pfaff's
+/// transform gives (1 - z)^-p 2F1(p, q; c; z'), z' = z/(z - 1), where c - p - q = m + eps, and
+/// DLMF 15.8.4 at s = 1 - z' = 1/(1 - z). Its first m terms are regular; pairing each later
+/// term of the first series with its partner in the second (whose Γ(-m-eps) supplies the pole)
+/// gives, exactly for every eps,
+///
+///   2F1(p, q; c; z') = Γ(c)Γ(m+eps)/(Γ(c-p)Γ(c-q)) Σ_{k<m} (p)_k (q)_k s^k / ((1-m-eps)_k k!)
+///     - (-1)^m Γ(c)Γ(1+eps)/(Γ(c-p)Γ(c-q)) Σ_j (p)_{m+j} (q)_{m+j} s^{m+j} E_j / ((m+j)! (1-eps)_j),
+///
+///   E_j = (P_j - 1)/eps,   P_j = s^eps Γ(p+m+j+eps)Γ(q+m+j+eps)Γ(1+m+j)Γ(1+j-eps)
+///                                 / (Γ(p+m+j)Γ(q+m+j)Γ(1+m+j+eps)Γ(1+j)),
+///
+/// which at eps = 0 is DLMF 15.8.10 (E_j = ln s + ψ(p+m+j) + ψ(q+m+j) - ψ(1+m+j) - ψ(1+j)).
+/// E_0 comes from `ln_gamma_ratio_over`, and E_{j+1} = E_j + P_j r_j with P_{j+1}/P_j = 1 + eps
+/// r_j a rational function of j: no difference of nearly equal quantities is ever formed.
+/// SciPy's value is off by up to 1e7 relative in this band; this holds 1e-13 against mpmath.
+fn hyp2f1_inv_one_minus_z_near_integer(a: f64, b: f64, c: f64, z: f64, m: f64, eps: f64) -> f64 {
+    let (p, q, cp, cq, m, eps) = if m >= 0.0 {
+        (a, c - b, c - a, b, m, eps)
+    } else {
+        (b, c - a, c - b, a, -m, -eps)
+    };
+    let (s_hi, s_lo) = dd_two_sum(1.0, -z);
+    let s = (1.0 - s_lo / s_hi) / s_hi;
+    let ln_s = -(s_hi.ln() + s_lo / s_hi);
+    let mi = m as usize;
+
+    // The m regular terms.
+    let mut finite = 0.0_f64;
+    let mut t = 1.0_f64;
+    for k in 0..mi {
+        finite += t;
+        if k + 1 < mi {
+            let kf = k as f64;
+            t *= (p + kf) * (q + kf) / ((1.0 - m - eps + kf) * (kf + 1.0)) * s;
+        }
+    }
+
+    // The paired terms: coef_j = (p)_{m+j} (q)_{m+j} / ((m+j)! (1-eps)_j), E_j as above.
+    let mut coef = 1.0_f64;
+    for i in 0..mi {
+        let f = i as f64;
+        coef *= (p + f) * (q + f) / (f + 1.0);
+    }
+    let (l1, g1) = ln_gamma_ratio_over(p + m, eps);
+    let (l2, g2) = ln_gamma_ratio_over(q + m, eps);
+    let (l3, g3) = ln_gamma_ratio_over(1.0 + m, eps);
+    let (l4, g4) = ln_gamma_ratio_over(1.0, -eps);
+    let lambda = ln_s + l1 + l2 - l3 - l4;
+    let mut e_j = if g1 * g2 * g3 * g4 > 0.0 {
+        lambda * expm1_over(eps * lambda)
+    } else {
+        // A gamma ratio changed sign (p + m or q + m within eps of a pole): P_0 < 0 is far
+        // from 1 and needs no care.
+        (-(eps * lambda).exp() - 1.0) / eps
+    };
+    let mut p_j = 1.0 + eps * e_j;
+    let mut s_pow = s.powi(mi as i32);
+    let mut tail = 0.0_f64;
+    let mut converged = false;
+    for j in 0..HYP2F1_PAIRED_MAX_TERMS {
+        let jf = j as f64;
+        let term = s_pow * coef * e_j;
+        tail += term;
+        if j > 2 && term.abs() <= 1.0e-17 * tail.abs() {
+            converged = true;
+            break;
+        }
+        let alpha = p + m + jf;
+        let beta = q + m + jf;
+        let gamma = 1.0 + m + jf;
+        let delta = 1.0 + jf;
+        // P_{j+1}/P_j = (1 + eps/α)(1 + eps/β)(1 - eps/δ)/(1 + eps/γ) = 1 + eps r_j.
+        let (ia, ib, ig, id) = (1.0 / alpha, 1.0 / beta, 1.0 / gamma, 1.0 / delta);
+        let r = (ia + ib - id - ig + eps * (ia * ib - ia * id - ib * id)
+            - eps * eps * ia * ib * id)
+            / (1.0 + eps * ig);
+        e_j += p_j * r;
+        p_j = 1.0 + eps * e_j;
+        coef *= alpha * beta / (gamma * (delta - eps));
+        s_pow *= s;
+    }
+    if !converged {
+        return f64::NAN;
+    }
+
+    let regular = if mi > 0 {
+        hyp2f1_connection_term(c, Dd::sum_of(m, eps), cp, cq, s_hi, s_lo, -p, finite)
+    } else {
+        0.0
+    };
+    let paired = hyp2f1_connection_term(c, Dd::sum_of(1.0, eps), cp, cq, s_hi, s_lo, -p, tail);
+    if mi.is_multiple_of(2) {
+        regular - paired
+    } else {
+        regular + paired
+    }
+}
+
+/// Γ(p1)Γ(p2)/(Γ(q1)Γ(q2)) · y^e · f for y = y_hi + y_lo > 0: a product of separately rounded
+/// factors (Cephes Γ), with p2 double-double (to first order in its low word, which matters
+/// next to a pole) and y_lo to first order; zero at a pole of Γ(q1) or Γ(q2), and the log form
+/// where a factor over- or underflows.
+fn hyp2f1_connection_term(
+    p1: f64,
+    p2: Dd,
+    q1: f64,
+    q2: f64,
+    y_hi: f64,
+    y_lo: f64,
+    e: f64,
+    f: f64,
+) -> f64 {
+    if f == 0.0 || is_nonpositive_integer(q1) || is_nonpositive_integer(q2) {
+        return 0.0;
+    }
+    let g = hyp1f1_gamma(p1) * hyp1f1_gamma_dd(p2) * hyp1f1_rgamma(q1) * hyp1f1_rgamma(q2);
+    let pw = y_hi.powf(e) * (1.0 + e * y_lo / y_hi);
+    let v = g * pw * f;
+    if g.is_normal() && pw.is_normal() && v.is_normal() {
+        return v;
+    }
+    let (l1, s1) = ln_gamma_with_sign(p1);
+    let (l2, s2) = ln_gamma_with_sign(p2.hi);
+    let (l3, s3) = ln_gamma_with_sign(q1);
+    let (l4, s4) = ln_gamma_with_sign(q2);
+    f.signum() * s1 * s2 * s3 * s4 * (l1 + l2 - l3 - l4 + e * y_hi.ln() + f.abs().ln()).exp()
+}
+
+/// ln(1 + u)/u, 1 at u = 0.
+fn ln_1p_over(u: f64) -> f64 {
+    if u == 0.0 { 1.0 } else { u.ln_1p() / u }
+}
+
+/// (e^t - 1)/t, 1 at t = 0.
+fn expm1_over(t: f64) -> f64 {
+    if t == 0.0 { 1.0 } else { t.exp_m1() / t }
+}
+
+/// B_{2k} / (2k (2k - 1)), k = 1..8: the coefficients of Stirling's series for ln Γ.
+const STIRLING_LN_GAMMA: [f64; 8] = [
+    1.0 / 12.0,
+    -1.0 / 360.0,
+    1.0 / 1260.0,
+    -1.0 / 1680.0,
+    1.0 / 1188.0,
+    -691.0 / 360_360.0,
+    1.0 / 156.0,
+    -3617.0 / 122_400.0,
+];
+
+/// (ln|Γ(x + e)/Γ(x)| / e, sign of Γ(x + e)/Γ(x)), accurate for small |e| and ψ(x) at e = 0:
+/// Γ(x + 1) = x Γ(x) lifts x to 10 or more (the steps' factors 1 + e/(x + i) multiplied as
+/// 1 + e q and taken to the log once), and there Stirling's series is differenced term by
+/// term in closed form (no difference of nearly equal powers is formed).
+/// x must not be a nonpositive integer; NaN below -1000 (a lift that long is not worth it).
+fn ln_gamma_ratio_over(x: f64, e: f64) -> (f64, f64) {
+    if x.is_nan() || x <= -1000.0 || is_nonpositive_integer(x) {
+        return (f64::NAN, 1.0);
+    }
+    // The lift multiplies Γ(x + e)/Γ(x) by Π_i (1 + e/(x + i)) = 1 + e q, kept as q (exact in the
+    // limit e → 0, where q = Σ 1/(x + i)) and taken to the log once.
+    let mut x = x;
+    let mut q = 0.0_f64;
+    while x < 10.0 {
+        q += (1.0 + e * q) / x;
+        x += 1.0;
+    }
+    let lift = 1.0 + e * q;
+    let (acc, sign) = if lift > 0.0 {
+        (-q * ln_1p_over(e * q), 1.0)
+    } else if lift < 0.0 {
+        // x and x + e straddle a pole: the ratio changes sign.
+        (-(-lift).ln() / e, -1.0)
+    } else {
+        return (f64::NAN, 1.0);
+    };
+    // ln(1 + e/x)/e.
+    let l = ln_1p_over(e / x) / x;
+    let v = (x - 0.5) * l + (x + e).ln() - 1.0;
+    // Σ_k c_k ((x + e)^(1-2k) - x^(1-2k))/e, where with r0 = 1/x, r1 = 1/(x + e),
+    // (r1^n - r0^n)/e = -r0 r1 H_{n-1} and H_m = Σ_{j<=m} r1^j r0^(m-j) = r0 H_{m-1} + r1^m:
+    // positive terms only, so no cancellation at any e (and n r0^(n+1) at e = 0).
+    let r0 = 1.0 / x;
+    let r1 = 1.0 / (x + e);
+    let (mut h, mut r1_pow, mut stirling) = (1.0_f64, 1.0_f64, 0.0_f64);
+    for &ck in &STIRLING_LN_GAMMA {
+        stirling += ck * h;
+        r1_pow *= r1;
+        h = r0 * h + r1_pow;
+        r1_pow *= r1;
+        h = r0 * h + r1_pow;
+    }
+    (v - r0 * r1 * stirling + acc, sign)
 }
 
 /// 2F1(a, b; c; x) at a nonpositive-integer c, tested in the order SciPy's real routine (xsf's
@@ -6605,6 +7143,165 @@ mod tests {
                 err <= 1e-11 * scale,
                 "hyp2f1({a},{b};{c};{zr}+{zi}i) = {got:?}, mpmath = {expected:?}, err={err:e}"
             );
+        }
+    }
+
+    /// Worst relative error of `f` over `cases` against their references, with a report line per
+    /// case.
+    fn worst_relative_error<const N: usize>(
+        cases: &[([f64; N], f64)],
+        f: impl Fn([f64; N]) -> f64,
+    ) -> (f64, String) {
+        let mut worst = 0.0_f64;
+        let mut report = String::new();
+        for &(args, expected) in cases {
+            let got = f(std::hint::black_box(args));
+            let rel = if got == expected {
+                0.0
+            } else {
+                ((got - expected) / expected).abs()
+            };
+            worst = if rel.is_nan() {
+                f64::INFINITY
+            } else {
+                worst.max(rel)
+            };
+            report.push_str(&format!(
+                "\n  {args:?}: {got:e} vs {expected:e}, rel {rel:.2e}"
+            ));
+        }
+        (worst, report)
+    }
+
+    /// frankenscipy-14k5d: past z ≈ -140 Pfaff's series at z/(z - 1) → 1 ran out of terms and
+    /// 2F1 was NaN (6165 of 20000 points of z in [-1e4, -1]); now DLMF 15.8.3, with the pole
+    /// pairs of b - a near an integer combined. References: mpmath at 40 digits.
+    #[test]
+    #[allow(clippy::excessive_precision)] // mpmath references verbatim
+    fn hyp2f1_large_negative_z_matches_mpmath() {
+        let cases = [
+            // The reported point: b - a = -3.05, the paired (near-integer) form.
+            (
+                [
+                    3.960983117050649,
+                    0.910412268763193,
+                    8.652771041686874,
+                    -648.335145138167,
+                ],
+                0.006_451_452_280_106_981_1,
+            ),
+            // DLMF 15.8.3 as it stands (b - a 0.29 and 0.38 from an integer).
+            (
+                [
+                    2.516937449187653,
+                    0.802092593722219,
+                    3.0624938125185626,
+                    -2007.9925247805832,
+                ],
+                0.002_825_442_276_016_323_8,
+            ),
+            (
+                [
+                    1.0728917813246568,
+                    0.693772918681244,
+                    6.97221658335025,
+                    -6219.058167385678,
+                ],
+                0.018_327_617_930_654_91,
+            ),
+            // b - a an integer (2, and -6 with a and b exchanged): DLMF 15.8.10.
+            ([1.5, 3.5, 2.25, -1000.0], 8.801_051_055_444_661_5e-6),
+            ([4.25, -1.75, 0.75, -50.0], 12_684.399_832_982_336),
+            // b - a = 2 + 1e-9, where 15.8.3's two terms are 1e9 times the value.
+            ([0.25, 2.250000001, 3.5, -500.0], 0.243_055_186_332_822_46),
+            // c - a = -2: (1 - z)^(c-a-b) times a polynomial in z.
+            ([3.5, 1.25, 1.5, -2000.0], 6.232_965_585_874_230_8e-6),
+            ([0.5, 1.75, 2.5, -1.0e8], 0.000_131_102_875_116_548_44),
+            ([-2.5, 1.5, 4.0, -300.0], 223_338.169_047_313_5),
+        ];
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let (worst, report) = worst_relative_error(&cases, |[a, b, c, z]| {
+                hyp2f1_scalar(a, b, c, z, mode).unwrap_or(f64::NAN)
+            });
+            // Measured worst 2.9e-16.
+            assert!(
+                worst <= 1.0e-15,
+                "hyp2f1 at large negative z ({mode:?}):{report}"
+            );
+        }
+    }
+
+    /// frankenscipy-14k5d: 0F1 for z < 0 summed its alternating series in double below |z| = 50
+    /// (up to 5e-12 off) and cut Hankel's expansion of J at its first growing term above it (846
+    /// relative off at the first point, 1.9 at (9.9, -300)). References: mpmath at 40 digits.
+    #[test]
+    #[allow(clippy::excessive_precision)] // mpmath references verbatim
+    fn hyp0f1_negative_z_matches_mpmath() {
+        // 1e-3 of the oscillation's envelope from a zero of J, where every method's relative
+        // error inflates a thousandfold (SciPy's is 1.7e-12 here): 1.9e-14 measured.
+        let near_zero = [(
+            [8.92868821393536, -130.57548644060603],
+            2.749_347_121_791_716_2e-8,
+        )];
+        let (worst, report) = worst_relative_error(&near_zero, |[b, z]| {
+            hyp0f1_scalar(b, z, RuntimeMode::Hardened).unwrap_or(f64::NAN)
+        });
+        assert!(worst <= 1.0e-13, "hyp0f1 next to a zero of J:{report}");
+        let cases = [
+            ([9.9, -300.0], -2.141_739_971_126_678_8e-7),
+            ([7.3, -2500.0], 3.929_002_614_067_003_5e-11),
+            ([0.75, -5000.0], -0.224_474_689_542_297_64),
+            ([6.1, -75.0], -0.000_456_568_444_133_236_76),
+            ([2.0, -40.0], -0.022_138_937_095_344_396),
+            ([5.5, -45.0], 0.002_237_262_294_409_160_1),
+            ([3.25, -49.0], -0.006_245_646_252_561_340_1),
+            ([1.3, -20.0], 0.026_620_605_987_373_51),
+        ];
+        let (worst, report) = worst_relative_error(&cases, |[b, z]| {
+            hyp0f1_scalar(b, z, RuntimeMode::Hardened).unwrap_or(f64::NAN)
+        });
+        // Measured worst 4.0e-15 (the double-double series is exact to the ulp: 0 at four points).
+        assert!(worst <= 5.0e-15, "hyp0f1 at negative z:{report}");
+    }
+
+    /// frankenscipy-14k5d: for b > 1 and tiny x, x^(1-b) overflowed long before U(a, b, x) does, so
+    /// the connection formula was dropped and the confluent integral refused in Hardened mode
+    /// ("quadrature overflowed"); next to b = 1 the connection formula's cancellation sent it to
+    /// the same integral, which misses the integrand beyond t = e^180. References: mpmath at 40
+    /// digits.
+    #[test]
+    #[allow(clippy::excessive_precision)] // mpmath references verbatim
+    fn hyperu_tiny_x_matches_mpmath() {
+        let cases = [
+            // x^(1-b) = 5e308 overflows; U = 2e307 does not.
+            ([5.0, 2.05, 1.0e-294], 2.032_949_624_090_409_7e307),
+            ([6.0, 3.0, 1.0e-155], 8.333_333_333_333_333_1e307),
+            // b 1e-9 from 1: the paired form (SciPy is 9e-8 off).
+            ([2.0, 1.000000001, 1.0e-250], 574.069_222_935_688_23),
+            // a < |b - n|: Γ(a - eps) and Γ(a) straddle the pole at 0.
+            ([0.05, 1.07, 1.0e-100], 7_074_237.715_102_728_4),
+            ([0.3, 4.02, 1.0e-40], 4.297_148_782_607_512_4e120),
+            ([2.5, 1.95, 1.0e-3], 543.267_125_239_029_89),
+            ([3.0, 1.0, 1.0e-300], 344.349_156_116_656_09),
+            ([1.5, 0.4, 1.0e-200], 1.423_040_983_583_609_4),
+        ];
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let (worst, report) = worst_relative_error(&cases, |[a, b, x]| {
+                hyperu_scalar(a, b, x, mode).unwrap_or(f64::NAN)
+            });
+            // Measured worst 9.8e-16.
+            assert!(worst <= 2.0e-15, "hyperu at tiny x ({mode:?}):{report}");
+        }
+        // Past the overflow threshold the value is +inf in both modes (U = 3.2e335 here; SciPy
+        // returns NaN), not a refusal.
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let v = hyperu_scalar(
+                std::hint::black_box(0.8063821023262053),
+                2.2739731369176304,
+                3.660247118587688e-264,
+                mode,
+            );
+            assert_eq!(v.ok(), Some(f64::INFINITY), "{mode:?}");
         }
     }
 }
