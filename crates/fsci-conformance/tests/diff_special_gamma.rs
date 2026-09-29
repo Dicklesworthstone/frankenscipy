@@ -8,7 +8,7 @@
 //! Erlang, Pearson3, etc. — but had no dedicated diff harness.
 //! ~12 x-values × 4 functions = ~48 cases via subprocess.
 //!
-//! Tolerances: 1e-12 abs / rel for gamma, exact for gammaln
+//! Tolerances: 1e-15 relative for gamma (Cephes Gamma port), exact for gammaln
 //! (Cephes lgam port), 1e-15 relative for digamma (bit-identical
 //! xsf port), 5e-10 scaled for rgamma. The reflection branch around negative
 //! integers is intentionally skipped — gamma has poles at
@@ -29,8 +29,10 @@ use fsci_special::{digamma, gamma, gammaln, rgamma};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const GAMMA_TOL_ABS: f64 = 1.0e-10;
-const GAMMA_TOL_REL: f64 = 1.0e-12;
+// gamma is Cephes' Gamma on the whole line: the rational to 33 and Stirling's formula past
+// it. A TRUE relative tolerance, a few ulp. It was 1e-10 absolute or 1e-12 relative, which
+// passed the Lanczos sum that served |x| > 33 at 2.6e-13 off (frankenscipy-p0y96).
+const GAMMA_TOL_REL: f64 = 1.0e-15;
 // digamma is SciPy's xsf digamma and matches it bit for bit. This is a TRUE relative
 // tolerance, a few ulp. It used to be an absolute 5e-10, which could not see 1e-12 relative
 // error next to digamma's roots (frankenscipy-re34v).
@@ -199,6 +201,20 @@ fn generate_query() -> OracleQuery {
             x,
         });
     }
+    // gamma and rgamma past |x| = 33, Cephes' Stirling range: either side of MAXSTIR and the
+    // reflection below -33.
+    let xs_stirling = [
+        33.25_f64, 50.125, 100.1, 143.0, 143.5, 170.9, -34.5, -40.3, -100.25,
+    ];
+    for &x in &xs_stirling {
+        for func in ["gamma", "rgamma"] {
+            points.push(PointCase {
+                case_id: format!("{func}_stirling_x{x}"),
+                func: func.into(),
+                x,
+            });
+        }
+    }
     OracleQuery { points }
 }
 
@@ -326,7 +342,7 @@ fn diff_special_gamma() {
 
         let scale = scipy_v.abs().max(1.0);
         let pass = match arm {
-            "gamma" => abs_diff <= GAMMA_TOL_ABS || rel_diff <= GAMMA_TOL_REL * scale,
+            "gamma" => abs_diff <= GAMMA_TOL_REL * scipy_v.abs(),
             // gammaln is SciPy's Cephes lgam bit for bit on the whole real line, so the gate is
             // EXACT. The 1e-10 absolute / 1e-12 relative gate it shared with gamma could not
             // see the Lanczos recurrence and reflection that answered below x = 0.5, a few ulp
