@@ -145,6 +145,16 @@ fn generate_integral_query() -> IntegralQuery {
             });
         }
     }
+    // itstruve0 past |x| = 6 is the Laplace form (frankenscipy-ch0z1). These points stop at
+    // 23.7 because SciPy's ITSH0 is within 3e-9 of the exact integral only up to there; it is
+    // 9e-7 off by 29 and O(1) wrong from 40.
+    for x in [6.25_f64, -7.5, 9.0, 11.3, 13.7, 16.0, 20.0, 23.7] {
+        points.push(IntegralCase {
+            case_id: format!("itstruve0_x{x}"),
+            func: "itstruve0".into(),
+            x,
+        });
+    }
     IntegralQuery { points }
 }
 
