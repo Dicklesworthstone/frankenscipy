@@ -10,6 +10,11 @@
 //! 8 (a, b) pairs × 7 q-values = 56 cases via subprocess.
 //! Tolerances: 1e-9 rel against scipy_v with scale =
 //! max(|scipy|, 1).
+//!
+//! Plus tail cases in the 1e-300 tail (frankenscipy-xzrpr), held to the same 1e-9 relative to
+//! |SciPy| itself, since the roots are far below 1. Each was mpmath-checked (60 digits) with
+//! SciPy within 2e-16 of it; points where SciPy is NaN or wrong are pinned to mpmath in
+//! fsci-special's unit tests instead.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -34,6 +39,8 @@ struct PointCase {
     a: f64,
     b: f64,
     q: f64,
+    /// Compared relative to |SciPy| (see the module docs).
+    tail: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,8 +132,38 @@ fn generate_query() -> OracleQuery {
                 a,
                 b,
                 q,
+                tail: false,
             });
         }
+    }
+    // frankenscipy-xzrpr: roots in the 1e-300 tail. Old fsci: 1.38e-99 for 1.06e-195,
+    // 2.01e-33 for 3.59e-52, 2.10e-18 for 4.28e-26, 2.22e-14 for 2.2185e-14 (1.6e-3 off).
+    let tail_cases: [(f64, f64, f64); 4] = [
+        (
+            1.165665503003491,
+            14.55107334677996,
+            1.1163949326526923e-226,
+        ),
+        (
+            2.2050358848923453,
+            21.82666602000194,
+            1.4245691623898521e-111,
+        ),
+        (
+            9.192797921606235,
+            11.741000276999168,
+            1.0440467452774665e-228,
+        ),
+        (17.227600317199048, 8.984617046148863, 6.90302558253208e-230),
+    ];
+    for (i, &(a, b, q)) in tail_cases.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("tail{i}_a{a}_b{b}_q{q:e}"),
+            a,
+            b,
+            q,
+            tail: true,
+        });
     }
     OracleQuery { points }
 }
@@ -237,7 +274,11 @@ fn diff_special_betaincinv() {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let scale = scipy_v.abs().max(1.0);
+        let scale = if case.tail {
+            scipy_v.abs()
+        } else {
+            scipy_v.abs().max(1.0)
+        };
         let rel_diff = abs_diff / scale;
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);

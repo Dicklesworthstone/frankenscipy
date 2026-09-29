@@ -318,7 +318,8 @@ pub fn btdtri(a: f64, b: f64, y: f64) -> f64 {
     if a.is_nan() || b.is_nan() || y.is_nan() {
         return f64::NAN;
     }
-    if a <= 0.0 || b <= 0.0 || !(0.0..=1.0).contains(&y) {
+    // A shape of inf is outside betaincinv's domain at every y, as in SciPy 1.17.1.
+    if !(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite()) || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 0.0 {
@@ -328,12 +329,9 @@ pub fn btdtri(a: f64, b: f64, y: f64) -> f64 {
         return 1.0;
     }
 
-    // btdtr(a, b, x) == betainc(a, b, x), so the inverse is exactly betaincinv.
-    // The dedicated inverse carries a small-x asymptotic seed
-    // (x ~ (y·a·B(a,b))^{1/a}) + relative-tolerance Newton, which resolves the
-    // deep a<1 tail (e.g. y=1e-8) instead of stalling at the ~1e-16 floor that
-    // the generic bisection bottomed out on. frankenscipy-8urrz.
-    crate::convenience::betaincinv_scalar(a, b, y)
+    // btdtr(a, b, x) == betainc(a, b, x), so the inverse is exactly betaincinv
+    // (frankenscipy-8urrz), solved against the smaller of y and 1 − y (frankenscipy-xzrpr).
+    ibeta_inv_pair(a, b, y, 1.0 - y).0
 }
 
 /// Inverse beta distribution CDF with respect to shape parameter `a`.
@@ -466,8 +464,14 @@ pub fn fdtri(dfn: f64, dfd: f64, y: f64) -> f64 {
         return f64::INFINITY;
     }
 
-    let z = btdtri(0.5 * dfn, 0.5 * dfd, y);
-    dfd * z / (dfn * (1.0 - z))
+    // Boost's F quantile, which SciPy runs: x = I⁻¹(dfn/2, dfd/2, y) together with its
+    // complement 1 − x from the same solve, and F = dfd·x/(dfn·(1 − x)). Forming 1 − x by
+    // subtraction made every y within about 1e-11 of 1 whose root is past ~1e20 an inf
+    // (fdtri(33.69, 1.07, 1 − 7.7e-12) is 3.7295e20), and the old inverse's 1e-300 tail
+    // missed by up to 1e265 relative (frankenscipy-xzrpr). An infinite dfn or dfd is NaN, as
+    // in SciPy 1.17.1.
+    let (z, z1) = ibeta_inv_pair(0.5 * dfn, 0.5 * dfd, y, 1.0 - y);
+    dfd * z / (dfn * z1)
 }
 
 /// Inverse F-distribution CDF with respect to denominator degrees of freedom.
@@ -507,44 +511,127 @@ pub fn fdtridfd(dfn: f64, p: f64, x: f64) -> f64 {
         return LOWER_SENTINEL;
     }
 
-    let upper_limit = gamma::chdtr(dfn, dfn * x);
-    if !upper_limit.is_finite() {
-        return f64::NAN;
-    }
-    if p >= upper_limit {
+    // cdflib's `cdff` (which = 4) solves `fdtr − p` when p ≤ q and `q − fdtrc` otherwise, so a
+    // p near 1 is solved on its exact complement q = 1 − p (frankenscipy-xzrpr). `fdtr − p`
+    // has no digits there: fdtridfd(33.94, 1 − 4e-16, 4.386) was 8192, a bracket end, for
+    // 5611.3, and the limit test below sent roots near 3.3e4 to the 1e100 sentinel.
+    let q = 1.0 - p;
+    let lower = p <= q;
+    // dfd → ∞ takes fdtr to chdtr(dfn, dfn·x), so a p at or past that limit has no root.
+    let no_root = if lower {
+        let limit = gamma::chdtr(dfn, dfn * x);
+        if !limit.is_finite() {
+            return f64::NAN;
+        }
+        p >= limit
+    } else {
+        let limit = gamma::chdtrc(dfn, dfn * x);
+        if !limit.is_finite() {
+            return f64::NAN;
+        }
+        q <= limit
+    };
+    if no_root {
         return UPPER_SENTINEL;
     }
+    // Both forms rise with dfd.
+    let residual = |m: f64| {
+        if lower {
+            fdtr(dfn, m, x) - p
+        } else {
+            q - fdtrc(dfn, m, x)
+        }
+    };
 
-    // fdtr is increasing in dfd. Bracket the root two-sidedly from dfd = 1, then
-    // solve with the superlinear Illinois method (~10 evals) instead of the former
-    // 240-iteration bisection (a ~21× SciPy loss — each eval is a full fdtr).
-    let f1 = fdtr(dfn, 1.0, x) - p;
+    // Bracket the root from dfd = 1 and solve it with the superlinear Illinois method instead
+    // of the former 240-iteration bisection (a ~21× SciPy loss — each eval is a full fdtr).
+    match bracket_rising(residual, LOWER_SENTINEL, UPPER_SENTINEL) {
+        RisingBracket::Root(dfd) => dfd,
+        RisingBracket::Below => LOWER_SENTINEL,
+        RisingBracket::Above => UPPER_SENTINEL,
+        RisingBracket::Undefined => f64::NAN,
+        RisingBracket::Bracket { lo, hi, flo, fhi } => {
+            let dfd = illinois_root(residual, lo, hi, flo, fhi);
+            if dfd <= 0.0 { LOWER_SENTINEL } else { dfd }
+        }
+    }
+}
+
+/// What [`bracket_rising`] found for a residual that rises with a positive parameter.
+enum RisingBracket {
+    /// `residual(lo) < 0 < residual(hi)`, for [`illinois_root`].
+    Bracket {
+        lo: f64,
+        hi: f64,
+        flo: f64,
+        fhi: f64,
+    },
+    /// The residual is exactly zero here.
+    Root(f64),
+    /// The residual is still positive at the floor: the root lies below it.
+    Below,
+    /// The residual is still negative at the ceiling: the root lies above it.
+    Above,
+    /// The residual is NaN at the start.
+    Undefined,
+}
+
+/// Bracket the root of `residual`, rising in a positive parameter, from 1 (frankenscipy-xzrpr).
+///
+/// Below 1 the bracket is `[floor, 1]` at once. These residuals are CDFs in a shape or degrees
+/// of freedom, close to linear as it goes to 0, so the Illinois solve's false-position steps
+/// cross the decades in a few evaluations. The former walk halved from 1 instead, 332
+/// evaluations down to 1e-100: fdtridfd with p near 1e-300, whose roots sit near 1e-51, took
+/// 13 µs a call (0.04x SciPy), and stdtridf near p = ½ (roots near 1e-17) 3.4 µs.
+///
+/// Above 1 the residual saturates, which a false-position step would not cross, so the root is
+/// walked up to: by doubling to 65536, which keeps the bracket two-fold for the common roots,
+/// and from there by a factor that doubles after every step, 4, 8, 16, …, so a root near 1e30
+/// is bracketed in 28 steps rather than 100. The last step is clamped to the ceiling, which is
+/// evaluated. Only a residual whose sign is unchanged at the floor or the ceiling is `Below` or
+/// `Above`.
+fn bracket_rising(residual: impl Fn(f64) -> f64, floor: f64, ceiling: f64) -> RisingBracket {
+    let f1 = residual(1.0);
+    if f1.is_nan() {
+        return RisingBracket::Undefined;
+    }
+    if f1 == 0.0 {
+        return RisingBracket::Root(1.0);
+    }
+    if f1 > 0.0 {
+        let flo = residual(floor);
+        if flo == 0.0 {
+            return RisingBracket::Root(floor);
+        }
+        if flo > 0.0 {
+            return RisingBracket::Below;
+        }
+        return RisingBracket::Bracket {
+            lo: floor,
+            hi: 1.0,
+            flo,
+            fhi: f1,
+        };
+    }
+    let mut step = 2.0_f64;
     let (mut lo, mut flo) = (1.0_f64, f1);
-    let (mut hi, mut fhi) = (1.0_f64, f1);
-    while fhi < 0.0 {
-        hi *= 2.0;
-        if hi >= UPPER_SENTINEL {
-            return UPPER_SENTINEL;
+    loop {
+        let hi = (lo * step).min(ceiling);
+        let fhi = residual(hi);
+        if fhi == 0.0 {
+            return RisingBracket::Root(hi);
         }
-        fhi = fdtr(dfn, hi, x) - p;
-    }
-    while flo > 0.0 {
-        lo *= 0.5;
-        if lo <= LOWER_SENTINEL {
-            return LOWER_SENTINEL;
+        if !(fhi < 0.0) {
+            return RisingBracket::Bracket { lo, hi, flo, fhi };
         }
-        flo = fdtr(dfn, lo, x) - p;
+        if hi >= ceiling {
+            return RisingBracket::Above;
+        }
+        (lo, flo) = (hi, fhi);
+        if lo >= 65536.0 {
+            step *= 2.0;
+        }
     }
-    // A bracket endpoint can land exactly on the root (illinois excludes endpoints).
-    if flo == 0.0 {
-        return lo;
-    }
-    if fhi == 0.0 {
-        return hi;
-    }
-
-    let dfd = illinois_root(|m| fdtr(dfn, m, x) - p, lo, hi, flo, fhi);
-    if dfd <= 0.0 { LOWER_SENTINEL } else { dfd }
 }
 
 /// 2^53: the first Poisson mode `j₀ = ⌊λ⌋` from which the noncentral walks cannot step.
@@ -3008,51 +3095,74 @@ pub fn stdtridf(p: f64, t: f64) -> f64 {
     if p == 0.5 {
         return MIN_DF_SENTINEL;
     }
-    if t < 0.0 {
-        return stdtridf(1.0 - p, -t);
-    }
-    if p < 0.5 {
+    // P(T ≤ −t) = 1 − P(T ≤ t): a negative t is the mirror problem with p and q = 1 − p
+    // exchanged, each kept as the exact one it is. The old recursion on 1 − p rounded a small p
+    // away, so stdtridf(1e-20, −10) answered the 1e10 sentinel for the root df = 290.45.
+    let (p, q, t) = if t < 0.0 {
+        (1.0 - p, p, -t)
+    } else {
+        (p, 1.0 - p, t)
+    };
+    // For t > 0, stdtr(df, t) = ½ + ½·I_{t²/(df+t²)}(½, df/2) ≥ ½, rising with df.
+    let d = p - 0.5;
+    if d < 0.0 {
         return LOWER_SENTINEL;
     }
+    // cdflib solves `stdtr − p` or `stdtrc − q`, whichever target is smaller; the first has no
+    // digits once p is near 1 (stdtridf(1 − 8e-16, 7.98) was the 1e10 sentinel for 15781) or
+    // near ½, where the root df is tiny. Here the residual is formed against the smaller of
+    // q = ½·I_{df/(df+t²)}(df/2, ½) and d = p − ½ (exact for p ≥ ¼) = ½·(1 − that I), both
+    // from one `bratio` pair (frankenscipy-xzrpr).
+    let central = d <= q;
+    let residual = |df: f64| {
+        let (w, w1) = student_t_tail_pair(df, t);
+        if central { 0.5 * w1 - d } else { q - 0.5 * w }
+    };
 
-    let upper_value = stdtr(UPPER_SENTINEL, t);
-    if !upper_value.is_finite() {
+    let upper_value = residual(UPPER_SENTINEL);
+    if upper_value.is_nan() {
         return f64::NAN;
     }
-    if p >= upper_value {
+    if upper_value <= 0.0 {
         return UPPER_SENTINEL;
     }
 
-    // stdtr is increasing in df. Bracket two-sidedly from df = 1, then solve with
-    // the superlinear Illinois method (~10 evals) instead of the former 240-iteration
-    // bisection (each eval is a full stdtr).
-    let f1 = stdtr(1.0, t) - p;
-    let (mut lo, mut flo) = (1.0_f64, f1);
-    let (mut hi, mut fhi) = (1.0_f64, f1);
-    while fhi < 0.0 {
-        hi *= 2.0;
-        if hi >= UPPER_SENTINEL {
-            return UPPER_SENTINEL;
+    // The residual rises with df. Bracket from df = 1, then solve with the superlinear Illinois
+    // method instead of the former 240-iteration bisection (each eval is a full stdtr).
+    match bracket_rising(residual, MIN_DF_SENTINEL, UPPER_SENTINEL) {
+        RisingBracket::Root(df) => df,
+        RisingBracket::Below => MIN_DF_SENTINEL,
+        RisingBracket::Above => UPPER_SENTINEL,
+        RisingBracket::Undefined => f64::NAN,
+        RisingBracket::Bracket { lo, hi, flo, fhi } => {
+            let df = illinois_root(residual, lo, hi, flo, fhi);
+            if df <= 0.0 { MIN_DF_SENTINEL } else { df }
         }
-        fhi = stdtr(hi, t) - p;
     }
-    while flo > 0.0 {
-        lo *= 0.5;
-        if lo <= MIN_DF_SENTINEL {
-            return MIN_DF_SENTINEL;
-        }
-        flo = stdtr(lo, t) - p;
-    }
-    // A bracket endpoint can land exactly on the root (illinois excludes endpoints).
-    if flo == 0.0 {
-        return lo;
-    }
-    if fhi == 0.0 {
-        return hi;
-    }
+}
 
-    let df = illinois_root(|m| stdtr(m, t) - p, lo, hi, flo, fhi);
-    if df <= 0.0 { MIN_DF_SENTINEL } else { df }
+/// `(I_x(df/2, ½), 1 − I_x(df/2, ½))` at `x = df/(df + t²)`, `1 − x = t²/(df + t²)` in closed
+/// form: twice the Student t tail `P(T > |t|)` and twice `P(0 < T ≤ |t|)`, each to full
+/// relative precision from `bratio`'s pair. `t = ±∞` (and `df + t²` overflowing) is `x = 0`.
+fn student_t_tail_pair(df: f64, t: f64) -> (f64, f64) {
+    let t2 = t * t;
+    let denom = df + t2;
+    let x = df / denom;
+    let y = t2 / denom;
+    if x.is_nan() || y.is_nan() {
+        return if t2.is_infinite() && df.is_finite() {
+            (0.0, 1.0)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+    }
+    if x <= 0.0 {
+        return (0.0, 1.0);
+    }
+    if y <= 0.0 {
+        return (1.0, 0.0);
+    }
+    crate::bratio::bratio(0.5 * df, 0.5, x, y)
 }
 
 /// Binomial distribution CDF.
@@ -3078,8 +3188,27 @@ pub fn bdtr(k: f64, n: f64, p: f64) -> f64 {
 
     // bdtr(k, n, p) = I(1-p; n-k, k+1) = 1 - betainc(k+1, n-k, p): bratio's complement at the
     // exact p, rather than I at a rounded 1 − p, which loses p's digits when p is small
-    // (frankenscipy-5pnba).
+    // (frankenscipy-5pnba). It is exactly 1 once that betainc is below half an ulp of 1.
+    if beta_lower_tail_negligible(k + 1.0, n - k, p) {
+        return 1.0;
+    }
     betaincc_with_complement(k + 1.0, n - k, p, 1.0 - p)
+}
+
+/// Whether `I_x(a, b) < 2⁻⁵⁵` for certain, so that `1 − I_x(a, b)` is exactly 1 once rounded
+/// (frankenscipy-xzrpr). For `b ≥ 1` the integrand's `(1 − t)^(b−1)` is at most 1, so
+/// `I_x(a, b) ≤ x^a/(a·B(a, b)) = x^a·[Γ(b + a)/Γ(b)]/Γ(a + 1)`; the log-convexity of Γ gives
+/// `Γ(b + a)/Γ(b) ≤ (a + b)^a`, and `Γ(a + 1) ≥ 0.8856` for `a ≥ 0`. So
+/// `I_x(a, b) ≤ 1.1292·(x·(a + b))^a`, below `2⁻⁵⁵` once `a·ln(x·(a + b)) < −38.25`.
+///
+/// It lets `bdtr`, `bdtrc`, `nbdtr` and `nbdtrc` answer 1 without a `bratio` call in the tail
+/// where they round to 1, which is most of a log-uniform p in [1e-300, 1e-3]: `bdtr` there took
+/// 84 ns a call against SciPy's 10 ns (`incbet` returns 1 at once when its `1 − p` rounds to 1).
+fn beta_lower_tail_negligible(a: f64, b: f64, x: f64) -> bool {
+    // ln(x·(a + b)) ≥ −745 for any x > 0, so a < 0.05 can never reach −38.25; the guard keeps
+    // the `ln` off the hot path of the solvers that call these CDFs at small shapes.
+    let scaled = x * (a + b);
+    b >= 1.0 && a >= 0.05 && scaled < 1.0 && a * scaled.ln() < -38.25
 }
 
 /// Binomial distribution survival function.
@@ -3103,7 +3232,11 @@ pub fn bdtrc(k: f64, n: f64, p: f64) -> f64 {
         return 0.0;
     }
 
-    // bdtrc(k, n, p) = betainc(k+1, n-k, p)
+    // bdtrc(k, n, p) = betainc(k+1, n-k, p) = 1 − I_{1−p}(n−k, k+1), exactly 1 once that
+    // complement is below half an ulp of 1 (1 − p is exact wherever it can be).
+    if beta_lower_tail_negligible(n - k, k + 1.0, 1.0 - p) {
+        return 1.0;
+    }
     btdtr(k + 1.0, n - k, p)
 }
 
@@ -3131,10 +3264,11 @@ pub fn bdtri(k: f64, n: f64, y: f64) -> f64 {
         return 0.0;
     }
 
-    // bdtr(k, n, p) = betainc(n-k, k+1, 1-p) = y
-    // So 1-p = btdtri(n-k, k+1, y)
-    // Thus p = 1 - btdtri(n-k, k+1, y)
-    1.0 - btdtri(n - k, k + 1.0, y)
+    // bdtr(k, n, p) = I_{1−p}(n−k, k+1) = y, so 1 − p is the inverse incomplete beta and p is
+    // its complement, which the solve returns to full relative precision. The old
+    // 1 − btdtri(…) was all rounding for y near 1: bdtri(0, 69, 1 − 1.4e-15) was 0 for
+    // 2.0917e-17 (frankenscipy-xzrpr). An infinite n is NaN there, as in SciPy.
+    ibeta_inv_pair(n - k, k + 1.0, y, 1.0 - y).1
 }
 
 /// Inverse binomial CDF with respect to `k`.
@@ -3220,7 +3354,11 @@ pub fn nbdtr(k: f64, n: f64, p: f64) -> f64 {
         return 0.0;
     }
 
-    // nbdtr(k, n, p) = I_p(n, k+1) = betainc(n, k+1, p)
+    // nbdtr(k, n, p) = I_p(n, k+1) = betainc(n, k+1, p) = 1 − I_{1−p}(k+1, n), exactly 1 once
+    // that complement is below half an ulp of 1.
+    if beta_lower_tail_negligible(k + 1.0, n, 1.0 - p) {
+        return 1.0;
+    }
     btdtr(n, k + 1.0, p)
 }
 
@@ -3248,7 +3386,10 @@ pub fn nbdtrc(k: f64, n: f64, p: f64) -> f64 {
     }
 
     // nbdtrc(k, n, p) = 1 - betainc(n, k+1, p): bratio's complement at the exact p
-    // (frankenscipy-5pnba).
+    // (frankenscipy-5pnba), exactly 1 once that betainc is below half an ulp of 1.
+    if beta_lower_tail_negligible(n, k + 1.0, p) {
+        return 1.0;
+    }
     betaincc_with_complement(n, k + 1.0, p, 1.0 - p)
 }
 
@@ -3272,9 +3413,9 @@ pub fn nbdtri(k: f64, n: f64, y: f64) -> f64 {
         return 1.0;
     }
 
-    // nbdtr(k, n, p) = betainc(n, k+1, p) = y
-    // So p = btdtri(n, k+1, y)
-    btdtri(n, k + 1.0, y)
+    // nbdtr(k, n, p) = I_p(n, k+1) = y (frankenscipy-xzrpr: the solve keeps p's relative
+    // precision in the 1e-300 tail, where the old one missed by up to 1e98).
+    ibeta_inv_pair(n, k + 1.0, y, 1.0 - y).0
 }
 
 /// Inverse negative-binomial CDF with respect to `k`.
@@ -3335,22 +3476,29 @@ pub fn nbdtrin(k: f64, y: f64, p: f64) -> f64 {
         return DISTRIBUTION_INVERSE_UPPER_SENTINEL;
     }
 
-    // The bracket's lower end is the last doubling still above y, or 1e-100 when the root is
-    // below 1, never 0: nbdtr(k, 0, p) is NaN (n must be positive), and a NaN endpoint sent
-    // every call to `bisect_decreasing`'s 160-step bisection instead of its Illinois solve.
-    // That was 0.10x SciPy's speed (frankenscipy-f8hzz). If 1e-100 does not bracket, the
-    // bisection fallback still answers.
-    let mut lo = 1e-100;
-    let mut hi = 1.0;
-    while nbdtr(k, hi, p) > y {
-        lo = hi;
-        hi *= 2.0;
-        if hi >= DISTRIBUTION_INVERSE_UPPER_SENTINEL {
-            return DISTRIBUTION_INVERSE_UPPER_SENTINEL;
+    // cdflib's `cdfnbn` (which = 3) solves `nbdtr − y` when y ≤ 1 − y and `nbdtrc − (1 − y)`
+    // otherwise; the first has no digits for y near 1, where nbdtrin(12, 1 − 2e-16, 0.693) was
+    // 6.19e-9 for 9.58e-9. Both residuals below rise with n, the second on the exact 1 − y
+    // (frankenscipy-xzrpr).
+    let q = 1.0 - y;
+    let residual = |n: f64| {
+        if y <= q {
+            y - nbdtr(k, n, p)
+        } else {
+            nbdtrc(k, n, p) - q
         }
+    };
+    // The bracket's floor is 1e-100, never 0: nbdtr(k, 0, p) is NaN (n must be positive), and
+    // a NaN endpoint once sent every call to a 160-step bisection instead of the Illinois
+    // solve, 0.10x SciPy's speed (frankenscipy-f8hzz). No y < 1 puts the root below it (the
+    // root is 1.6e-15 at y = 1 − 2⁻⁵³); SciPy's own search floor there is 0.
+    match bracket_rising(residual, 1e-100, DISTRIBUTION_INVERSE_UPPER_SENTINEL) {
+        RisingBracket::Root(n) => n,
+        RisingBracket::Below => 0.0,
+        RisingBracket::Above => DISTRIBUTION_INVERSE_UPPER_SENTINEL,
+        RisingBracket::Undefined => f64::NAN,
+        RisingBracket::Bracket { lo, hi, flo, fhi } => illinois_root(residual, lo, hi, flo, fhi),
     }
-
-    bisect_decreasing(lo, hi, y, |n| nbdtr(k, n, p))
 }
 
 fn bisect_increasing<F>(mut lo: f64, mut hi: f64, target: f64, f: F) -> f64
@@ -4255,7 +4403,7 @@ pub fn betainccinv_scalar(a: f64, b: f64, y: f64) -> f64 {
     if a.is_nan() || b.is_nan() || y.is_nan() {
         return f64::NAN;
     }
-    if a <= 0.0 || b <= 0.0 || !(0.0..=1.0).contains(&y) {
+    if !(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite()) || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 0.0 {
@@ -4265,7 +4413,270 @@ pub fn betainccinv_scalar(a: f64, b: f64, y: f64) -> f64 {
         return 0.0;
     }
 
-    1.0 - crate::convenience::betaincinv_scalar(b, a, y)
+    // 1 − I_x(a, b) = y is I_x(a, b) = 1 − y with y the exact one of the two targets. The old
+    // `1 − betaincinv(b, a, y)` formed x as 1 − (1 − x) and lost every digit of a small x:
+    // betainccinv(0.896, 12.66, 1 − 8.5e-15) was 0 for 1.5074e-17 (frankenscipy-xzrpr).
+    ibeta_inv_pair(a, b, 1.0 - y, y).0
+}
+
+/// `ln(2⁻¹⁰⁷⁵)`, just below: a positive number under this rounds to 0 in f64.
+const SUBNORMAL_ROUNDS_TO_ZERO_LN: f64 = -745.14;
+
+/// Evaluation budget of [`ibeta_inv_pair`]. From its starting guess the Halley iteration
+/// settles in 2–5 evaluations; the budget only bounds a search that bisects, which it does
+/// when the residual is flat to within its rounding (a shape parameter near 1e-8, whose root
+/// is conditioned by 1/a) and from a guess with no digits.
+const IBETA_INV_MAX_EVALS: u32 = 128;
+
+/// The pair `(x, 1 − x)` with `I_x(a, b) = p` and `1 − I_x(a, b) = q`, each to full relative
+/// precision: SciPy's `ibeta_inv(a, b, p, &y)` contract (Boost), which `betaincinv`,
+/// `betainccinv`, `btdtri`, `fdtri`, `bdtri` and `nbdtri` all read from (frankenscipy-xzrpr).
+///
+/// `p` and `q` are both passed. The smaller of them must be the caller's exact argument; the
+/// other may carry the rounding of `1 − smaller`, and is 1 when the smaller is below `ε/2`.
+/// Shapes must be finite and positive, and `0 < p, q ≤ 1`; anything else is `(NaN, NaN)`.
+///
+/// The solve replaces a linear-space Newton on `I_x − y` from a lower-tail seed whose
+/// derivative floor (`1e-30`) sent every step in the 1e-300 tail to an arithmetic bisection
+/// of `[0, 1]`: `betaincinv(0.836, 12.25, 3.76e-263)` was 7.5e-37 for 1.263e-315, and
+/// `betaincinv(4.04, 5.15, 1.24e-205)` was 1.1e-22 for 6.01e-52. Four things are different:
+///
+/// 1. **The residual is taken against whichever of `p`, `q` is smaller**, as
+///    `ln(I/p)` or `ln((1 − I)/q)` from `bratio`'s own pair, so a target near 1 keeps the
+///    digits of its complement and a target near 1e-300 keeps its relative precision.
+/// 2. **The unknown is whichever of `x`, `y` is smaller, in logs** (`z = ln v`). Both are
+///    kept, and the other is formed as `1 − v` only while `v ≤ ½`, where that is exact enough;
+///    `x` near 1 is carried as its small complement. In `z` the tails are close to straight
+///    lines (`ln I ≈ a·ln x + const`), so a step from the power-law guess lands on the root.
+/// 3. **Steps are Halley's** on `G(z) = ±ln(I_s/t)` with `G' = v·(dI/dx)/I_s` from TOMS 708's
+///    `ln_brcomp` and `G''/G' = c − G'`, `c = a − (b − 1)·x/y` (or its mirror), so the
+///    curvature costs nothing extra. A step that leaves the sign bracket (kept as `(x, y)`
+///    pairs) is replaced by a bisection, geometric in whichever variable the bracket lies
+///    below ½ in.
+/// 4. **The stop is on the size of the last step** against the error it leaves:
+///    `|Δz| ≤ (ε/(4(κ² + 1)))^{1/3}` after a Halley step and `(ε/(4(|κ| + 1)))^{1/2}` after
+///    Newton, with `κ = G''/G'`, or once the step is inside the residual's own rounding,
+///    `8ε/G'`.
+///
+/// `a = 1` and `b = 1` are closed forms: `I_x(a, 1) = x^a` and `I_x(1, b) = 1 − (1 − x)^b`.
+pub(crate) fn ibeta_inv_pair(a: f64, b: f64, p: f64, q: f64) -> (f64, f64) {
+    const NAN2: (f64, f64) = (f64::NAN, f64::NAN);
+    if !(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite()) {
+        return NAN2;
+    }
+    if !(p > 0.0 && p <= 1.0 && q > 0.0 && q <= 1.0) {
+        return NAN2;
+    }
+    if b == 1.0 {
+        // x^a = p: from ln p when p is the exact target, from ln(1 − q) otherwise.
+        if p <= q {
+            let ln_x = p.ln() / a;
+            return (p.powf(1.0 / a), -ln_x.exp_m1());
+        }
+        let ln_x = (-q).ln_1p() / a;
+        return (ln_x.exp(), -ln_x.exp_m1());
+    }
+    if a == 1.0 {
+        // (1 − x)^b = q, the mirror image.
+        if q <= p {
+            let ln_y = q.ln() / b;
+            return (-ln_y.exp_m1(), q.powf(1.0 / b));
+        }
+        let ln_y = (-p).ln_1p() / b;
+        return (-ln_y.exp_m1(), ln_y.exp());
+    }
+
+    let lower = p <= q;
+    let target = if lower { p } else { q };
+    let ln_target = target.ln();
+    let (mut x, mut y) = ibeta_inv_guess(a, b, p, q);
+    if x == 0.0 || y == 0.0 {
+        return (x, y);
+    }
+    // The sign bracket as pairs, in x order: H = I_x − p = q − (1 − I_x) rises with x, and
+    // H(xl) < 0 < H(xh). x = 0 and x = 1 are never evaluated; I is 0 and 1 there.
+    let (mut xl, mut yl, mut xh, mut yh) = (0.0_f64, 1.0_f64, 1.0_f64, 0.0_f64);
+    for _ in 0..IBETA_INV_MAX_EVALS {
+        let (w, w1) = crate::bratio::bratio(a, b, x, y);
+        let ws = if lower { w } else { w1 };
+        if ws.is_nan() {
+            return NAN2;
+        }
+        let ln_ws = ws.ln();
+        // ln(I_s/t) from the ratio, which keeps the digits near the root that the difference
+        // of two logs of size up to 745 would not; the difference only where the ratio leaves
+        // the range (a zero I_s, or a subnormal target).
+        let ratio = ws / target;
+        let f = if ratio > 0.0 && ratio.is_finite() {
+            ratio.ln()
+        } else {
+            ln_ws - ln_target
+        };
+        if f == 0.0 {
+            return (x, y);
+        }
+        if (f > 0.0) == lower {
+            (xh, yh) = (x, y);
+        } else {
+            (xl, yl) = (x, y);
+        }
+
+        let var_x = x <= y;
+        let (v, other) = if var_x { (x, y) } else { (y, x) };
+        // G = s·f rises with z = ln v.
+        let s = if lower == var_x { 1.0 } else { -1.0 };
+        let g = s * f;
+        let g1 = (crate::bratio::ln_brcomp(a, b, x, y) - other.ln() - ln_ws).exp();
+        if f.is_finite() && g1 > 0.0 && g1.is_finite() {
+            let newton = g / g1;
+            let kappa = if var_x {
+                a - (b - 1.0) * (x / y)
+            } else {
+                b - (a - 1.0) * (y / x)
+            } - s * g1;
+            let den = 1.0 - 0.5 * newton * kappa;
+            let (dz, tol) = if (0.5..=2.0).contains(&den) {
+                (
+                    -newton / den,
+                    (f64::EPSILON / (4.0 * (kappa * kappa + 1.0))).cbrt(),
+                )
+            } else {
+                (-newton, (f64::EPSILON / (4.0 * (kappa.abs() + 1.0))).sqrt())
+            };
+            let v_new = v * dz.exp();
+            let (x_new, y_new) = if var_x {
+                (v_new, 1.0 - v_new)
+            } else {
+                (1.0 - v_new, v_new)
+            };
+            let inside = if var_x {
+                xl < x_new && x_new < xh
+            } else {
+                yh < y_new && y_new < yl
+            };
+            if inside {
+                if dz.abs() <= tol.max(8.0 * f64::EPSILON / g1) {
+                    return (x_new, y_new);
+                }
+                (x, y) = (x_new, y_new);
+                continue;
+            }
+        }
+        match ibeta_inv_bisect(xl, yl, xh, yh) {
+            Some(mid) => (x, y) = mid,
+            // A root below the smallest subnormal rounds to 0 (and its mirror to 1).
+            None if xl == 0.0 && xh < f64::MIN_POSITIVE => return (0.0, 1.0),
+            None if yh == 0.0 && yl < f64::MIN_POSITIVE => return (1.0, 0.0),
+            None => return (x, y),
+        }
+    }
+    (x, y)
+}
+
+/// Midpoint of [`ibeta_inv_pair`]'s bracket `[xl, xh]` (with complements `yl`, `yh`), or
+/// `None` once the bracket is down to rounding. Geometric in `x` when the bracket lies below
+/// ½ and in `y` when it lies above, so a bracket that spans decades is halved in its exponent;
+/// with no finite lower end yet it steps to the geometric mean with `f64::MIN_POSITIVE`.
+fn ibeta_inv_bisect(xl: f64, yl: f64, xh: f64, yh: f64) -> Option<(f64, f64)> {
+    let geometric = |lo: f64, hi: f64| {
+        if lo > 0.0 {
+            lo.sqrt() * hi.sqrt()
+        } else if hi > 4.0 * f64::MIN_POSITIVE {
+            hi.sqrt() * f64::MIN_POSITIVE.sqrt()
+        } else {
+            0.5 * hi
+        }
+    };
+    let (x, y) = if xh <= 0.5 {
+        let x = geometric(xl, xh);
+        (x, 1.0 - x)
+    } else if yl <= 0.5 {
+        let y = geometric(yh, yl);
+        (1.0 - y, y)
+    } else {
+        let x = 0.5 * (xl + xh);
+        if x <= 0.5 {
+            (x, 1.0 - x)
+        } else {
+            let y = 0.5 * (yl + yh);
+            (1.0 - y, y)
+        }
+    };
+    let inside = if x <= y {
+        xl < x && x < xh
+    } else {
+        yh < y && y < yl
+    };
+    inside.then_some((x, y))
+}
+
+/// Starting pair for [`ibeta_inv_pair`] (`a, b ≠ 1`), or its answer, `(0, 1)` or `(1, 0)`, when
+/// the tail's power law puts the root below half the smallest subnormal.
+///
+/// In a tail the leading power law is inverted with its first correction,
+/// `I_x(a, b) = x^a/(a·B(a, b))·(1 + a(1 − b)/(a + 1)·x + …)`, so
+/// `x ≈ x₀(1 + x₀(b − 1)/(a + 1))` with `x₀ = (p·a·B(a, b))^{1/a}`, and the mirror image for
+/// `y`; it is used while the correction is below 0.2. Otherwise the guess is Numerical
+/// Recipes' `invbetai` start: Abramowitz & Stegun 26.5.22 for `a, b ≥ 1`, returned as the
+/// pair `(a, b·e^{2w})/(a + b·e^{2w})`, and the two-sided power law for a shape below 1.
+fn ibeta_inv_guess(a: f64, b: f64, p: f64, q: f64) -> (f64, f64) {
+    let ln_beta = crate::bratio::betaln(a, b);
+    let ln_x0 = (p.ln() + a.ln() + ln_beta) / a;
+    let ln_y0 = (q.ln() + b.ln() + ln_beta) / b;
+    // A tail root below half the smallest subnormal rounds to 0 (the power law is exact to
+    // O(x) there): betaincinv(0.0016, 9.4, 0.28) is e^−791. Searching for it would bisect
+    // the whole subnormal range.
+    if ln_x0 < SUBNORMAL_ROUNDS_TO_ZERO_LN && p <= q {
+        return (0.0, 1.0);
+    }
+    if ln_y0 < SUBNORMAL_ROUNDS_TO_ZERO_LN && q < p {
+        return (1.0, 0.0);
+    }
+    let x0 = ln_x0.exp();
+    let y0 = ln_y0.exp();
+    let x_slope = (b - 1.0) / (a + 1.0);
+    let y_slope = (a - 1.0) / (b + 1.0);
+    let x_tail = x0 < 0.5 && (x0 * x_slope).abs() < 0.2;
+    let y_tail = y0 < 0.5 && (y0 * y_slope).abs() < 0.2;
+    if x_tail && (p <= q || !y_tail) {
+        let x = x0 * (1.0 + x0 * x_slope);
+        return (x, 1.0 - x);
+    }
+    if y_tail {
+        let y = y0 * (1.0 + y0 * y_slope);
+        return (1.0 - y, y);
+    }
+    let (x, y) = if a >= 1.0 && b >= 1.0 {
+        let t = (-2.0 * p.min(q).ln()).sqrt();
+        let mut z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
+        if p < 0.5 {
+            z = -z;
+        }
+        let al = (z * z - 3.0) / 6.0;
+        let h = 2.0 / (1.0 / (2.0 * a - 1.0) + 1.0 / (2.0 * b - 1.0));
+        let w = (z * (al + h).sqrt() / h)
+            - (1.0 / (2.0 * b - 1.0) - 1.0 / (2.0 * a - 1.0)) * (al + 5.0 / 6.0 - 2.0 / (3.0 * h));
+        (
+            a / (a + b * (2.0 * w).exp()),
+            b / (a * (-2.0 * w).exp() + b),
+        )
+    } else {
+        let t = (a * (a / (a + b)).ln()).exp() / a;
+        let u = (b * (b / (a + b)).ln()).exp() / b;
+        let w = t + u;
+        if p < t / w {
+            let x = (a * w * p).powf(1.0 / a);
+            (x, 1.0 - x)
+        } else {
+            let y = (b * w * q).powf(1.0 / b);
+            (1.0 - y, y)
+        }
+    };
+    if x > 0.0 && x < 1.0 && y > 0.0 && y < 1.0 {
+        (x, y)
+    } else {
+        (a / (a + b), b / (a + b))
+    }
 }
 
 /// Lentz's continued fraction for `I_x(a, b)·a·B(a, b)/(xᵃ(1−x)ᵇ)` (Numerical Recipes'
@@ -7926,5 +8337,320 @@ mod tests {
                 "the old kernel was expected to miss {label} by more than {miss:e}: {legacy:e} vs {want:e} ({e:.1e})"
             );
         }
+    }
+
+    // frankenscipy-xzrpr: the beta-family inverses at a probability near 1 or in the 1e-300
+    // tail, and the binomial CDFs at results near the bottom of the double range.
+    //
+    // Expected values are mpmath 1.4.1 at 60 digits at the EXACT double arguments: forward
+    // values directly, inverses by a bracketed solve of ln F = ln target in the logit (or log)
+    // of the unknown, where F is the CDF when the target is at most ½ and its directly computed
+    // complement otherwise, solved twice from different starts that agree to 1e-25. Each row
+    // names the old fsci value and SciPy 1.17.1's.
+
+    /// Assert `got` is within `tol` (relative) of the mpmath value.
+    fn assert_rel(label: &str, got: f64, want: f64, tol: f64) {
+        let e = rel_err(got, want);
+        assert!(
+            e <= tol,
+            "{label}: {got:e} vs mpmath {want:e} ({e:.1e} > {tol:e})"
+        );
+    }
+
+    const XZRPR_TOL: f64 = 1e-13;
+
+    /// p → 1 on the complementary target. Old fsci: fdtri inf, fdtridfd 8192, stdtridf 372.81
+    /// for 369.29 and the 1e10 sentinel at t = −10 (the old recursion on 1 − p rounded
+    /// p = 1e-20 away), betainccinv and bdtri(0, …) 0, bdtri(2, …) 9.2e-13 off, nbdtrin
+    /// 6.19e-9. SciPy 1.17.1 is within 2e-14 of every row but bdtri(2, 80, …), where its Cephes
+    /// `incbi` is 9.2e-13 off as well.
+    #[test]
+    fn inverses_near_one_solve_on_the_complement() {
+        use std::hint::black_box as bb;
+        let rows: [(&str, f64, f64); 9] = [
+            (
+                "fdtri(33.69, 1.071, 1 − 7.7e-12)",
+                fdtri(
+                    bb(33.687472437582684),
+                    bb(1.0707827876516371),
+                    bb(0.9999999999922503),
+                ),
+                3.729539123404429963e20,
+            ),
+            (
+                "fdtri(5.363, 0.8027, 1 − 1.1e-15)",
+                fdtri(
+                    bb(5.363459409621771),
+                    bb(0.8026915919252242),
+                    bb(0.9999999999999989),
+                ),
+                8.817662248216571320e36,
+            ),
+            (
+                "fdtridfd(33.94, 1 − 4e-16, 4.386)",
+                fdtridfd(
+                    bb(33.943040170879485),
+                    bb(0.9999999999999996),
+                    bb(4.38562784311647),
+                ),
+                5611.310751891762794,
+            ),
+            (
+                // The row the sweep found (1 − 8e-16, 7.981) → 15780.8 is as bad in old fsci
+                // (the 1e10 sentinel) but sits where stdtrc(df, t) is within 10% of its df → ∞
+                // limit, so its root is conditioned to about 1e-13 and is left to the live diff.
+                "stdtridf(1 − 9e-16, 8.316)",
+                stdtridf(bb(0.9999999999999991), bb(8.31550025349924)),
+                369.2856360993613544,
+            ),
+            (
+                "stdtridf(1e-20, −10)",
+                stdtridf(bb(1e-20), bb(-10.0)),
+                290.4526719576584523,
+            ),
+            (
+                "betainccinv(0.896, 12.66, 1 − 8.5e-15)",
+                betainccinv_scalar(
+                    bb(0.8959773120680639),
+                    bb(12.663256010231969),
+                    bb(0.9999999999999915),
+                ),
+                1.507407032238358273e-17,
+            ),
+            (
+                "bdtri(0, 69, 1 − 1.4e-15)",
+                bdtri(bb(0.0), bb(69.0), bb(0.9999999999999986)),
+                2.091724539148847143e-17,
+            ),
+            (
+                "bdtri(2, 80, 1 − 6.4e-11)",
+                bdtri(bb(2.0), bb(80.0), bb(0.9999999999359858)),
+                9.203414703998083511e-6,
+            ),
+            (
+                "nbdtrin(12, 1 − 2.2e-16, 0.693)",
+                nbdtrin(bb(12.0), bb(0.9999999999999998), bb(0.6929942510172469)),
+                9.580739296434116279e-9,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert_rel(label, got, want, XZRPR_TOL);
+        }
+    }
+
+    /// The target in the 1e-300 tail. Old fsci: betaincinv 1.12e-22 for 6.01e-52 and 1.6e-3 off,
+    /// nbdtri 1.49e-37 for 6.48e-136 and 6.7e-4 off, fdtri 8.2e5 off. SciPy 1.17.1 (Boost's
+    /// ibeta_inv) is NaN at the first betaincinv row and 0.985 off at the third; the others it
+    /// holds to 1e-16. What is left here is the forward kernel's: TOMS 708 forms these tails as
+    /// exp(a·ln x − ln B), whose rounding |ln I|·ε reaches the root divided by a.
+    #[test]
+    fn inverses_hold_relative_precision_in_the_1e300_tail() {
+        use crate::convenience::betaincinv_scalar;
+        use std::hint::black_box as bb;
+        let rows: [(&str, f64, f64); 6] = [
+            (
+                "betaincinv(4.038, 5.154, 1.24e-205)",
+                betaincinv_scalar(
+                    bb(4.0375113874658375),
+                    bb(5.153994538016386),
+                    bb(1.23760120132999e-205),
+                ),
+                6.012922683372208613e-52,
+            ),
+            (
+                "betaincinv(17.23, 8.985, 6.90e-230)",
+                betaincinv_scalar(
+                    bb(17.227600317199048),
+                    bb(8.984617046148863),
+                    bb(6.90302558253208e-230),
+                ),
+                2.218502151000938408e-14,
+            ),
+            (
+                "betaincinv(24.82, 3.128, 4.09e-280)",
+                betaincinv_scalar(
+                    bb(24.819520541438376),
+                    bb(3.1280586158241523),
+                    bb(4.0929379803107383e-280),
+                ),
+                4.321254168768946910e-12,
+            ),
+            (
+                "nbdtri(5, 2, 8.82e-270)",
+                nbdtri(bb(5.0), bb(2.0), bb(8.815118692845373e-270)),
+                6.478947112009486168e-136,
+            ),
+            (
+                "nbdtri(28, 17, 2.41e-211)",
+                nbdtri(bb(28.0), bb(17.0), bb(2.412547387592462e-211)),
+                7.986297605572566266e-14,
+            ),
+            (
+                "fdtri(15.68, 23.50, 1.04e-189)",
+                fdtri(
+                    bb(15.677099968700094),
+                    bb(23.498175505473483),
+                    bb(1.0393981743088624e-189),
+                ),
+                2.875419174435945926e-25,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert_rel(label, got, want, XZRPR_TOL);
+        }
+    }
+
+    /// Points where SciPy 1.17.1 is NaN or wrong and fsci is right, pinned to mpmath here and
+    /// kept out of the live SciPy diffs. SciPy: fdtri NaN (Boost's ibeta_inv), fdtridfd the
+    /// 1e-100 search bound for a root at 2.4e-51 (checked at 150 digits), nbdtrin 48655 for
+    /// 9857.8 and bdtri 1.0 for 0.9008 (cdflib and Cephes `incbi` in the tail), nbdtri
+    /// 0.999999998 for 0.3532 (`incbi` near 1), and bdtri(1, 74, 1 − 1.4e-13) 7.35e-9 off, where
+    /// Cephes forms p as 1 − incbi(…) just as old fsci did (it gave the same 7.2930641526e-9).
+    /// That last row is the only one old fsci failed; the others document the divergence.
+    #[test]
+    fn scipy_divergences_in_the_beta_tails_pinned_to_mpmath() {
+        use std::hint::black_box as bb;
+        let rows: [(&str, f64, f64); 6] = [
+            (
+                "bdtri(1, 74, 1 − 1.4e-13)",
+                bdtri(bb(1.0), bb(74.0), bb(0.9999999999998563)),
+                7.293064206202159690e-9,
+            ),
+            (
+                "fdtri(6.972, 12.06, 3.02e-170)",
+                fdtri(
+                    bb(6.972006583980248),
+                    bb(12.062521812434563),
+                    bb(3.0242560501440936e-170),
+                ),
+                1.134632424835414686e-49,
+            ),
+            (
+                "fdtridfd(39.59, 1.43e-49, 6.900)",
+                fdtridfd(
+                    bb(39.58582524252427),
+                    bb(1.4305878539549028e-49),
+                    bb(6.899755000734998),
+                ),
+                2.411964456490167086e-51,
+            ),
+            (
+                "nbdtrin(13, 3.42e-243, 0.9391)",
+                nbdtrin(bb(13.0), bb(3.42037243508297e-243), bb(0.9391440325679024)),
+                9857.768637849617313,
+            ),
+            (
+                "bdtri(45, 83, 4.86e-17)",
+                bdtri(bb(45.0), bb(83.0), bb(4.857590949723313e-17)),
+                0.9007839752622687216,
+            ),
+            (
+                "nbdtri(47, 1, 1 − 8.3e-10)",
+                nbdtri(bb(47.0), bb(1.0), bb(0.9999999991712257)),
+                0.3531542106885167669,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert_rel(label, got, want, XZRPR_TOL);
+        }
+    }
+
+    /// stdtridf just above p = ½: the root df is near 1e-17 and `stdtr − p` has no digits there;
+    /// the residual is formed against d = p − ½ = ½·I_{t²/(df+t²)}(½, df/2) instead. SciPy 1.17.1
+    /// answers 1.1143e-17 (7.6% off), old fsci 1.3878e-17 (34% off).
+    #[test]
+    fn stdtridf_just_above_one_half_solves_on_p_minus_one_half() {
+        use std::hint::black_box as bb;
+        let got = stdtridf(bb(0.5000000000000001), bb(3.287107338677984));
+        assert_rel(
+            "stdtridf(½ + 1.1e-16, 3.287)",
+            got,
+            1.035773976313151193e-17,
+            XZRPR_TOL,
+        );
+    }
+
+    /// Binomial and negative-binomial CDFs whose value is near the bottom of the double range,
+    /// where the binomial sum's first term was a product of subnormal factors. Old fsci: bdtr
+    /// 4.59e-300 for 2.4754e-300 and 0 for 9.12e-310, bdtrc 6.2e-4 off, nbdtr 3.39e-298 for
+    /// 2.2499e-298, nbdtrc 6.36e-300 for 3.808e-300. SciPy 1.17.1 (`incbet`) holds 1e-13.
+    #[test]
+    fn binomial_cdfs_keep_their_digits_at_the_bottom_of_the_range() {
+        use std::hint::black_box as bb;
+        let rows: [(&str, f64, f64, f64); 5] = [
+            (
+                "bdtr(21, 64, 1 − 4.43e-8)",
+                bdtr(bb(21.0), bb(64.0), bb(0.9999999557370799)),
+                2.475418176575061910e-300,
+                1e-14,
+            ),
+            (
+                "bdtrc(27, 56, 8.87e-12)",
+                bdtrc(bb(27.0), bb(56.0), bb(8.866662069093556e-12)),
+                2.635551345807991603e-294,
+                1e-14,
+            ),
+            (
+                "nbdtr(22, 24, 1.15e-13)",
+                nbdtr(bb(22.0), bb(24.0), bb(1.1498145979637354e-13)),
+                2.249909580430058191e-298,
+                1e-14,
+            ),
+            (
+                "nbdtrc(29, 21, 1 − 3.66e-11)",
+                nbdtrc(bb(29.0), bb(21.0), bb(0.9999999999633916)),
+                3.808084443323983804e-300,
+                1e-14,
+            ),
+            (
+                // Subnormal: 47 significant bits, so the bound is the value's own spacing.
+                "bdtr(30, 80, 1 − 2.4e-7)",
+                bdtr(bb(30.0), bb(80.0), bb(0.9999997599847374)),
+                9.118694722714884996e-310,
+                1e-13,
+            ),
+        ];
+        for (label, got, want, tol) in rows {
+            assert_rel(label, got, want, tol);
+        }
+    }
+
+    /// The "rounds to exactly 1" fast path of bdtr, bdtrc, nbdtr and nbdtrc must answer 1 where
+    /// the tail is below half an ulp and must NOT fire just outside that: bdtr(0, 100, 1e-17) is
+    /// (1 − 1e-17)^100 = 1 − 1e-15 + 4.95e-30, which SciPy's `pow(1 − p, n)` rounds to 1.
+    #[test]
+    fn binomial_cdfs_round_to_one_only_below_half_an_ulp() {
+        use std::hint::black_box as bb;
+        assert_eq!(bdtr(bb(0.0), bb(100.0), bb(1e-18 / 101.0 / 64.0)), 1.0);
+        assert_eq!(bdtr(bb(5.0), bb(60.0), bb(1e-40)), 1.0);
+        assert_eq!(nbdtrc(bb(5.0), bb(60.0), bb(1e-300)), 1.0);
+        assert_eq!(bdtrc(bb(5.0), bb(60.0), bb(1.0 - 1e-15)), 1.0);
+        assert_eq!(nbdtr(bb(5.0), bb(60.0), bb(1.0 - 1e-15)), 1.0);
+        // (1 − 1e-17)^100 = 1 − 1e-15 + 4.95e-30; within 2 ulps of it and below 1, both as
+        // bdtr(0, 100, p) and as nbdtrc(99, 1, p), the same binomial tail.
+        for (label, near) in [
+            ("bdtr(0, 100, 1e-17)", bdtr(bb(0.0), bb(100.0), bb(1e-17))),
+            ("nbdtrc(99, 1, 1e-17)", nbdtrc(bb(99.0), bb(1.0), bb(1e-17))),
+        ] {
+            assert!(near < 1.0, "{label} = {near:e} must stay below 1");
+            assert_rel(label, near, 1.0 - 9.999999999999995e-16, 3e-16);
+        }
+    }
+
+    /// A shape that is not finite and positive is NaN at every y, the endpoints included, as in
+    /// SciPy 1.17.1; old fsci answered the endpoint (or a number from a NaN-residual bisection).
+    #[test]
+    fn beta_inverses_reject_nonfinite_shapes_at_every_target() {
+        assert!(crate::convenience::betaincinv_scalar(0.0, 3.0, 0.0).is_nan());
+        assert!(crate::convenience::betaincinv_scalar(0.0, 3.0, 0.5).is_nan());
+        assert!(crate::convenience::betaincinv_scalar(f64::INFINITY, 3.0, 0.5).is_nan());
+        assert!(betainccinv_scalar(f64::INFINITY, 3.0, 0.5).is_nan());
+        assert!(btdtri(2.0, f64::INFINITY, 0.0).is_nan());
+        assert!(fdtri(f64::INFINITY, 3.0, 0.5).is_nan());
+        // The endpoints themselves are unchanged for a valid shape.
+        assert_eq!(crate::convenience::betaincinv_scalar(2.0, 3.0, 0.0), 0.0);
+        assert_eq!(crate::convenience::betaincinv_scalar(2.0, 3.0, 1.0), 1.0);
+        assert_eq!(betainccinv_scalar(2.0, 3.0, 0.0), 1.0);
+        assert_eq!(betainccinv_scalar(2.0, 3.0, 1.0), 0.0);
     }
 }

@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `scipy.special.betaincc` and
 //! `scipy.special.betainccinv`.
+//!
+//! Tail cases (frankenscipy-xzrpr): betainccinv at y within 1e-14 of 1, whose roots are below
+//! 1e-16, compared on `TOL_REL` relative to |SciPy| alone (the absolute `TOL_ABS` would accept
+//! any tiny number, old fsci's 0 included). Each was mpmath-checked (60 digits) with SciPy
+//! within 3e-16 of it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -29,6 +34,8 @@ struct PointCase {
     a: f64,
     b: f64,
     q: f64,
+    /// Compared relative to |SciPy| alone (see the module docs).
+    tail: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +128,7 @@ fn generate_query() -> OracleQuery {
                 a,
                 b,
                 q: x,
+                tail: false,
             });
         }
         for &q in &qs {
@@ -130,8 +138,26 @@ fn generate_query() -> OracleQuery {
                 a,
                 b,
                 q,
+                tail: false,
             });
         }
+    }
+    // frankenscipy-xzrpr: old fsci formed x as 1 − (1 − x) and answered 0 at all four.
+    let tail_cases: [(f64, f64, f64); 4] = [
+        (0.8959773120680639, 12.663256010231969, 0.9999999999999915),
+        (0.8981013056960829, 12.678123965628103, 0.9999999999999912),
+        (0.54000187999436, 10.171427985716043, 0.9999999999999999),
+        (0.8075660773017681, 12.044377366867899, 0.9999999999999968),
+    ];
+    for (i, &(a, b, q)) in tail_cases.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("betainccinv_tail{i}_a{a}_b{b}_q{q}"),
+            op: "betainccinv".into(),
+            a,
+            b,
+            q,
+            tail: true,
+        });
     }
     OracleQuery { points }
 }
@@ -227,11 +253,15 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse betaincc oracle JSON"))
 }
 
-fn close_enough(actual: f64, expected: f64) -> (f64, f64, bool) {
+fn close_enough(actual: f64, expected: f64, tail: bool) -> (f64, f64, bool) {
     if actual.is_nan() || expected.is_nan() {
         return (0.0, 0.0, actual.is_nan() && expected.is_nan());
     }
     let abs_diff = (actual - expected).abs();
+    if tail {
+        let rel_diff = abs_diff / expected.abs();
+        return (abs_diff, rel_diff, rel_diff <= TOL_REL);
+    }
     let scale = expected.abs().max(1.0);
     let rel_diff = abs_diff / scale;
     (
@@ -263,7 +293,7 @@ fn diff_special_betaincc() {
         else {
             continue;
         };
-        let (abs_diff, rel_diff, pass) = close_enough(actual, expected);
+        let (abs_diff, rel_diff, pass) = close_enough(actual, expected, case.tail);
         max_abs_diff = max_abs_diff.max(abs_diff);
         max_rel_diff = max_rel_diff.max(rel_diff);
         ledger.compared(arm, &case.case_id, pass);

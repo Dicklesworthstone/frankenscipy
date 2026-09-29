@@ -159,6 +159,25 @@ fn generate_query() -> OracleQuery {
             p3: x,
         });
     }
+    // frankenscipy-xzrpr: p within 1e-15 of 1, solved on the exact q = 1 − p as cdflib does.
+    // mpmath (60 digits): 89.48279644597726, 81.75866665231107, 115.7107510577996,
+    // 5611.310751891763, with SciPy within 8e-14 of each. Old fsci solved `fdtr − p`, which has
+    // no digits there: 89.65, 81.79, 115.68 and 8192 (a bracket end).
+    let fd_near_one: &[(f64, f64, f64)] = &[
+        (27.050235349293953, 0.9999999999999991, 9.021457235628294),
+        (27.195368913893258, 0.9999999999999983, 9.340751077746766),
+        (48.238745783762646, 0.9999999999999992, 6.136180191459426),
+        (33.943040170879485, 0.9999999999999996, 4.38562784311647),
+    ];
+    for (i, &(dfn, p, x)) in fd_near_one.iter().enumerate() {
+        points.push(Case {
+            case_id: format!("fdtridfd_near_one{i}_dfn{dfn}_p{p}_x{x}"),
+            op: "fdtridfd".into(),
+            p1: dfn,
+            p2: p,
+            p3: x,
+        });
+    }
 
     OracleQuery { points }
 }
