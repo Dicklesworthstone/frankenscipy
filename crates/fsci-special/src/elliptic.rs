@@ -197,7 +197,7 @@ pub fn lambertw(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
         x_tensor,
         mode,
         |x| lambertw_scalar(x, mode),
-        |z| lambertw_complex_scalar(z, mode),
+        |z| Ok(lambertw_complex_scalar(z)),
         1 << 16, // lambertw break-even ~58k (BlackThrush A/B: 32768 loses 1.70x, 65536 wins 0.87x)
     )
 }
@@ -964,135 +964,184 @@ fn ellipeinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, S
 }
 
 fn lambertw_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if x.is_nan() {
-        return Ok(f64::NAN);
-    }
-    if x == f64::INFINITY {
-        return Ok(f64::INFINITY);
-    }
-    let min_x = -1.0 / std::f64::consts::E;
-    if x < min_x - 1.0e-12 {
+    if x < -LAMBERTW_EXPN1 {
         return domain_error("lambertw", mode, "x must be >= -1/e for principal branch");
     }
-    if (x - min_x).abs() < 1.0e-12 {
-        return Ok(-1.0); // W₀(-1/e) = -1
-    }
-    if x == 0.0 {
-        return Ok(0.0);
-    }
-    if (x - std::f64::consts::E).abs() < f64::EPSILON {
-        return Ok(1.0);
-    }
-
-    // Initial guess
-    let mut w = if x < 0.0 {
-        // For x in (-1/e, 0): W is in (-1, 0). Use a quadratic approximation near -1/e.
-        let p = (2.0 * (std::f64::consts::E * x + 1.0)).sqrt();
-        -1.0 + p - p * p / 3.0
-    } else if x < 0.5 {
-        // Near 0: W(x) ≈ x - x²
-        x * (1.0 - x)
-    } else if x <= std::f64::consts::E {
-        // Moderate x: use log-based estimate
-        let lx = (1.0 + x).ln();
-        lx * (1.0 - lx / (2.0 + lx))
-    } else {
-        // Large x: W(x) ≈ ln(x) - ln(ln(x))
-        let lx = x.ln();
-        lx - lx.ln()
-    };
-
-    // Halley's iteration: w_{n+1} = w_n - (w*e^w - x) / (e^w*(w+1) - (w+2)*(w*e^w - x)/(2w+2))
-    for _ in 0..50 {
-        let ew = w.exp();
-        let wew = w * ew;
-        let f = wew - x;
-        if f.abs() < 1.0e-15 * (1.0 + x.abs()) {
-            return Ok(w);
-        }
-        let denom = ew * (w + 1.0) - (w + 2.0) * f / (2.0 * w + 2.0);
-        if denom.abs() < 1.0e-30 {
-            break;
-        }
-        w -= f / denom;
-    }
-    Ok(w)
+    Ok(lambertw_real(x))
 }
 
-fn lambertw_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
-    if z.re.is_nan() || z.im.is_nan() {
-        return Ok(complex_nan());
+/// xsf's e^-1 and W(1), as lambertw.h spells them.
+const LAMBERTW_EXPN1: f64 = 0.367_879_441_171_442_33;
+const LAMBERTW_OMEGA: f64 = 0.567_143_290_409_783_8;
+
+/// W₀(x) for real x, SciPy's `lambertw(x).real` bit for bit on 70,011 of 70,011 points for
+/// x >= -1/e (frankenscipy-e8vhq).
+///
+/// SciPy runs xsf's lambertw (k = 0, tol = 1e-8) in complex arithmetic. On a zero imaginary part,
+/// GCC's complex multiply and divide and glibc's cexp and csqrt reduce exactly to the real
+/// operations used here. glibc's clog does not, and is emulated by [`lambertw_clog_real`].
+/// - Initial guess: the branch-point series for |x + 1/e| < 0.3, the (3, 2) Padé approximant on
+///   (-0.2, 1.5), and log(x) - log(log(x)) above.
+/// - Halley's method, in the overflow-safe form while w >= 0.
+/// - It stops when a step moves w by at most 1e-8 relative. The iteration is cubic, so that
+///   step already lands at full precision.
+///
+/// This replaced two separate implementations, one here and one in `convenience`, both stopped
+/// on a residual rather than a step:
+/// - this one snapped every x within 1e-12 of -1/e to -1, where W is -1 + 2.3e-6;
+/// - the public `lambertw_scalar` stopped at 684.2377 for 1e300, where W is 684.2472.
+///
+/// Deliberate difference: at the double nearest -1/e SciPy's step divides by 2w + 2 = 0 and
+/// returns NaN; this returns W = -1. Below it the real branch does not exist and this returns
+/// NaN.
+pub(crate) fn lambertw_real(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY || x == 0.0 {
+        return x;
     }
-    if !z.is_finite() {
-        if z.im == 0.0 && z.re == f64::INFINITY {
-            return Ok(Complex64::from_real(f64::INFINITY));
+    if x < -LAMBERTW_EXPN1 {
+        return f64::NAN;
+    }
+    if x == -LAMBERTW_EXPN1 {
+        return -1.0;
+    }
+    if x == 1.0 {
+        return LAMBERTW_OMEGA;
+    }
+    let mut w = if (x + LAMBERTW_EXPN1).abs() < 0.3 {
+        let p = (2.0 * (std::f64::consts::E * x + 1.0)).sqrt();
+        lambertw_evalpoly2(&LAMBERTW_BRANCHPT, p)
+    } else if -0.2 < x && x < 1.5 {
+        x * lambertw_evalpoly2(&LAMBERTW_PADE_NUM, x) / lambertw_evalpoly2(&LAMBERTW_PADE_DEN, x)
+    } else {
+        let lx = lambertw_clog_real(x);
+        lx - lambertw_clog_real(lx)
+    };
+    if w >= 0.0 {
+        for _ in 0..100 {
+            let ew = (-w).exp();
+            let wewz = w - x * ew;
+            let wn = w - wewz / (w + 1.0 - (w + 2.0) * wewz / (2.0 * w + 2.0));
+            if (wn - w).abs() <= LAMBERTW_TOL * wn.abs() {
+                return wn;
+            }
+            w = wn;
         }
-        return Ok(complex_nan());
+    } else {
+        for _ in 0..100 {
+            let ew = w.exp();
+            let wew = w * ew;
+            let wewz = wew - x;
+            let wn = w - wewz / (wew + ew - (w + 2.0) * wewz / (2.0 * w + 2.0));
+            if (wn - w).abs() <= LAMBERTW_TOL * wn.abs() {
+                return wn;
+            }
+            w = wn;
+        }
     }
-    if z.re == 0.0 && z.im == 0.0 {
-        return Ok(Complex64::from_real(0.0));
-    }
+    f64::NAN
+}
 
-    let min_x = -1.0 / std::f64::consts::E;
-    if z.im == 0.0 && z.re >= min_x {
-        return lambertw_scalar(z.re, mode).map(Complex64::from_real);
-    }
+/// scipy.special.lambertw's default `tol`.
+const LAMBERTW_TOL: f64 = 1e-8;
+/// xsf's branch-point series, the (3, 2) Padé numerator and denominator (lambertw.h).
+const LAMBERTW_BRANCHPT: [f64; 3] = [-1.0 / 3.0, 1.0, -1.0];
+const LAMBERTW_PADE_NUM: [f64; 3] = [12.851_063_829_787_234, 12.340_425_531_914_894, 1.0];
+const LAMBERTW_PADE_DEN: [f64; 3] = [32.531_914_893_617_02, 14.340_425_531_914_894, 1.0];
 
-    let mut w = lambertw_complex_initial_guess(z);
+/// xsf's `cevalpoly` of degree 2 at a real point: its fused recurrence, where the imaginary part
+/// is zero and `std::norm(z)` is `x·x`.
+fn lambertw_evalpoly2(coeffs: &[f64; 3], x: f64) -> f64 {
+    let (r, s) = (2.0 * x, x * x);
+    let b = (-s).mul_add(coeffs[0], coeffs[2]);
+    let a = r.mul_add(coeffs[0], coeffs[1]);
+    x * a + b
+}
+
+/// The real part of glibc's `clog(x + 0i)` for finite x > 0. Bitwise, that is not `x.ln()`:
+/// - `log1p((x - 1)(x + 1)) / 2` on [0.5, 2), and 0 at 1;
+/// - `log(x / 2) + ln 2` above `f64::MAX / 2`, where glibc rescales;
+/// - `log(x)` elsewhere.
+fn lambertw_clog_real(x: f64) -> f64 {
+    if x == 1.0 {
+        0.0
+    } else if (0.5..2.0).contains(&x) {
+        ((x - 1.0) * (x + 1.0)).ln_1p() / 2.0
+    } else if x > f64::MAX / 2.0 {
+        (x / 2.0).ln() + std::f64::consts::LN_2
+    } else {
+        x.ln()
+    }
+}
+
+/// W₀(z) for complex z: xsf's lambertw (k = 0, tol = 1e-8), step for step (frankenscipy-e8vhq).
+///
+/// - Real z >= -1/e goes to [`lambertw_real`], so it carries SciPy's bits.
+/// - Elsewhere this is xsf's algorithm on this crate's `Complex64`:
+///   - the same special cases;
+///   - the branch-point series within 0.3 of -1/e, the (3, 2) Padé approximant in xsf's region
+///     around 0, and log(z) - log(log(z)) outside both;
+///   - Halley's method in its two forms, stopping on a 1e-8 relative step.
+///
+/// Its complex division is not GCC's `__divdc3`, so the last bit can differ from SciPy's. Both
+/// are within a few ulp of mpmath.
+///
+/// The residual stop it replaced, 1e-14·(1 + |z|), left lambertw(-1+0j) 5.9e-15 from mpmath in
+/// modulus (2.3e-14 in its real part), where SciPy is 1.1e-16.
+fn lambertw_complex_scalar(z: Complex64) -> Complex64 {
+    if z.re.is_nan() || z.im.is_nan() {
+        return z;
+    }
+    if z.re == f64::INFINITY {
+        return z;
+    }
+    if z.re == f64::NEG_INFINITY {
+        return -z + Complex64::new(0.0, std::f64::consts::PI);
+    }
+    if z.im == 0.0 && z.re >= -LAMBERTW_EXPN1 {
+        return Complex64::from_real(lambertw_real(z.re));
+    }
     let one = Complex64::from_real(1.0);
     let two = Complex64::from_real(2.0);
-
-    for _ in 0..80 {
-        let ew = w.exp();
-        let wew = w * ew;
-        let f = wew - z;
-        if f.abs() < 1.0e-14 * (1.0 + z.abs()) {
-            return Ok(w);
+    let mut w = if (z + Complex64::from_real(LAMBERTW_EXPN1)).abs() < 0.3 {
+        let p = complex_sqrt((z * std::f64::consts::E + one) * 2.0);
+        lambertw_cevalpoly2(&LAMBERTW_BRANCHPT, p)
+    } else if -1.0 < z.re && z.re < 1.5 && z.im.abs() < 1.0 && -2.5 * z.im.abs() - 0.2 < z.re {
+        z * lambertw_cevalpoly2(&LAMBERTW_PADE_NUM, z) / lambertw_cevalpoly2(&LAMBERTW_PADE_DEN, z)
+    } else {
+        let lz = z.ln();
+        lz - lz.ln()
+    };
+    if w.re >= 0.0 {
+        for _ in 0..100 {
+            let ew = (-w).exp();
+            let wewz = w - z * ew;
+            let wn = w - wewz / (w + one - (w + two) * wewz / (w * 2.0 + two));
+            if (wn - w).abs() <= LAMBERTW_TOL * wn.abs() {
+                return wn;
+            }
+            w = wn;
         }
-
-        let w_plus_one = w + one;
-        let denom = ew * w_plus_one - (w + two) * f / (w_plus_one * 2.0);
-        if denom.abs() < 1.0e-30 {
-            break;
-        }
-
-        let step = f / denom;
-        w = w - step;
-        if step.abs() < 1.0e-14 * (1.0 + w.abs()) {
-            return Ok(w);
+    } else {
+        for _ in 0..100 {
+            let ew = w.exp();
+            let wew = w * ew;
+            let wewz = wew - z;
+            let wn = w - wewz / (wew + ew - (w + two) * wewz / (w * 2.0 + two));
+            if (wn - w).abs() <= LAMBERTW_TOL * wn.abs() {
+                return wn;
+            }
+            w = wn;
         }
     }
-
-    Ok(w)
+    complex_nan()
 }
 
-fn lambertw_complex_initial_guess(z: Complex64) -> Complex64 {
-    // Principal-branch (k = 0) initial guess matching scipy's `_lambertw.pxd`
-    // (Veberič 2012 / Corless 1996). The previous guess used the LARGE-|z|
-    // asymptotic `log(z) - log(log(z))` for moderate |z|, which lands in the
-    // basin of a non-principal branch (W·e^W = z has infinitely many roots) —
-    // Halley then converged to the wrong sheet (lambertw(0.5+0.3i) gave
-    // -1.97-3.68i instead of scipy's 0.372+0.152i). Three regions:
-    let expn1 = Complex64::from_real(1.0 / std::f64::consts::E);
-    let branch_delta = z + expn1;
-    if branch_delta.abs() < 0.3 {
-        // Near the branch point z = -1/e: series in p = √(2(e·z + 1)).
-        let ez1 = Complex64::from_real(std::f64::consts::E) * z + Complex64::from_real(1.0);
-        let p = complex_sqrt(ez1 * 2.0);
-        let p2 = p * p;
-        let p3 = p2 * p;
-        return Complex64::from_real(-1.0) + p - p2 / 3.0 + p3 * (11.0 / 72.0);
-    }
-
-    if -1.0 < z.re && z.re < 1.5 && z.im.abs() < 1.0 && z.re > -2.5 * z.im.abs() - 0.2 {
-        // Empirically good region near 0: [2/2] Padé approximant of W₀.
-        let z2 = z * z;
-        let num = z * (Complex64::from_real(60.0) + z * 114.0 + z2 * 17.0);
-        let den = Complex64::from_real(60.0) + z * 174.0 + z2 * 101.0;
-        return num / den;
-    }
-
-    z.ln()
+/// xsf's `cevalpoly` of degree 2: its fused recurrence on `2 Re z` and `|z|²`.
+fn lambertw_cevalpoly2(coeffs: &[f64; 3], z: Complex64) -> Complex64 {
+    let (r, s) = (2.0 * z.re, z.norm_sqr());
+    let b = (-s).mul_add(coeffs[0], coeffs[2]);
+    let a = r.mul_add(coeffs[0], coeffs[1]);
+    z * a + Complex64::from_real(b)
 }
 
 fn exp1_scalar(z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
@@ -3073,6 +3122,84 @@ mod tests {
                 w.im
             );
         }
+    }
+
+    /// xsf's lambertw (frankenscipy-e8vhq): real x carries SciPy 1.17.1's bits, and complex z is
+    /// within a few ulp of mpmath (40 digits). The residual-stopped Halley this replaced missed
+    /// lambertw(-1+0j) by 5.9e-15 and snapped x within 1e-12 of -1/e to -1.
+    #[test]
+    fn lambertw_is_xsf_lambertw() -> Result<(), String> {
+        const REAL: [(f64, u64); 18] = [
+            (-0.367_879_441_170_442_36, 0xbfef_fffb_1c3f_210b),
+            (-0.3, 0xbfdf_525d_b815_078b),
+            (-0.2, 0xbfd0_9642_6398_65b5),
+            (-0.0679, 0xbfb2_b31a_cf23_85c5),
+            (-0.05, 0xbfaa_fc47_5750_9774),
+            (0.3, 0x3fce_4dff_7e7e_deee),
+            (0.9, 0x3fe0_f464_4377_a018),
+            (1.2, 0x3fe4_568a_5919_a617),
+            (1.49, 0x3fe7_233c_69f1_9c9b),
+            (1.5, 0x3fe7_3a41_9921_27b6),
+            (1.9, 0x3fea_889c_cca3_7d91),
+            (2.0, 0x3feb_488b_5571_3c51),
+            (std::f64::consts::E, 0x3ff0_0000_0000_0000),
+            (10.0, 0x3ffb_edae_c560_6044),
+            (1e5, 0x4022_91b3_58a6_9dac),
+            (1e20, 0x4045_2743_c037_72ee),
+            (1e300, 0x4085_61fa_4884_a0e5),
+            (5e-324, 0x0000_0000_0000_0001),
+        ];
+        for &(x, bits) in &REAL {
+            let x = std::hint::black_box(x);
+            let tensor = eval_scalar(lambertw(&SpecialTensor::RealScalar(x), RuntimeMode::Strict));
+            let public = crate::convenience::lambertw_scalar(x);
+            for (label, got) in [("lambertw", tensor), ("lambertw_scalar", public)] {
+                if got.to_bits() != bits {
+                    return Err(format!(
+                        "{label}({x:e}) = {got:e}, SciPy {:e}",
+                        f64::from_bits(bits)
+                    ));
+                }
+            }
+        }
+        const COMPLEX: [(f64, f64, f64, f64); 7] = [
+            (
+                -1.0,
+                0.0,
+                -0.318_131_505_204_764_13,
+                1.337_235_701_430_689_5,
+            ),
+            (-0.5, 0.0, -0.794_023_632_344_689_4, 0.770_111_750_510_379_1),
+            (0.5, 0.3, 0.372_030_602_393_5, 0.152_166_010_103_015_42),
+            (-3.0, 2.0, 0.775_283_572_184_502_1, 1.468_534_850_781_243_2),
+            (10.0, -5.0, 1.808_259_747_830_680_6, -0.299_505_759_379_962),
+            (
+                -0.2,
+                0.1,
+                -0.226_933_772_515_757_94,
+                0.164_986_470_020_154_6,
+            ),
+            (1e6, 1e6, 11.700_540_314_897_427, 0.723_630_896_383_287_8),
+        ];
+        for &(re, im, want_re, want_im) in &COMPLEX {
+            let z = Complex64::new(std::hint::black_box(re), im);
+            let w = eval_complex_scalar(lambertw(
+                &SpecialTensor::ComplexScalar(z),
+                RuntimeMode::Strict,
+            ));
+            let want = Complex64::new(want_re, want_im);
+            let err = (w - want).abs() / want.abs();
+            if err > 1.0e-15 {
+                return Err(format!(
+                    "lambertw({re}+{im}i) = {w:?}, mpmath {want:?}, rel {err:e}"
+                ));
+            }
+        }
+        // Real input never takes a complex-arithmetic path that could leave it complex.
+        if !crate::convenience::lambertw_scalar(-0.5).is_nan() {
+            return Err("lambertw_scalar below -1/e must be NaN".to_string());
+        }
+        Ok(())
     }
 
     #[test]

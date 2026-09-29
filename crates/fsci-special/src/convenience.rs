@@ -6131,49 +6131,13 @@ pub fn debye(n: usize, x: f64) -> f64 {
     n as f64 / x.powi(n as i32) * integral
 }
 
-/// Lambert W function principal branch W_0(x).
+/// Lambert W function principal branch W_0(x): w with w·exp(w) = x.
 ///
-/// Finds w such that w * exp(w) = x.
-/// Scalar convenience wrapper matching `scipy.special.lambertw`.
+/// `scipy.special.lambertw(x).real` bit for bit for x >= -1/e, and NaN below. This is the crate's
+/// one real Lambert W, `elliptic::lambertw_real` (frankenscipy-e8vhq).
+#[must_use]
 pub fn lambertw_scalar(x: f64) -> f64 {
-    if x == f64::INFINITY {
-        return f64::INFINITY;
-    }
-    if x == 0.0 {
-        return 0.0;
-    }
-    if (x - (-1.0 / std::f64::consts::E)).abs() < f64::EPSILON {
-        return -1.0;
-    }
-    if x < -1.0 / std::f64::consts::E {
-        return f64::NAN;
-    }
-
-    // Initial guess. The asymptotic form x.ln() - ln(ln(x)) is only valid
-    // when ln(x) > 1 (i.e. x > e). Below that, ln(ln(x)) is undefined or
-    // -∞, so use a Padé-style approximation that is well-behaved for
-    // small positive x.
-    let mut w = if x < std::f64::consts::E {
-        // Bürmann's series gives a good seed: W(x) ≈ x / (1 + x).
-        x / (1.0 + x)
-    } else {
-        x.ln() - x.ln().ln()
-    };
-
-    // Halley's method
-    for _ in 0..50 {
-        let ew = w.exp();
-        let wew = w * ew;
-        let f = wew - x;
-        if f.abs() < 1e-15 * x.abs().max(1.0) {
-            break;
-        }
-        let fp = ew * (w + 1.0);
-        let fpp = ew * (w + 2.0);
-        w -= f / (fp - f * fpp / (2.0 * fp));
-    }
-
-    w
+    crate::elliptic::lambertw_real(x)
 }
 
 /// Riemann zeta function ζ(s) for any real `s`, matching `scipy.special.zeta`.
