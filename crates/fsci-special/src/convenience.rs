@@ -4363,61 +4363,67 @@ pub fn digamma_scalar(x: f64) -> f64 {
 
 /// Rising factorial (Pochhammer symbol): (x)_n = x(x+1)...(x+n-1).
 ///
-/// Matches `scipy.special.poch`.
+/// Matches `scipy.special.poch`, to the bit: this is xsf's Cephes `poch` (the revision SciPy
+/// 1.17.1 pins, 0d0a593f).
+/// 1. Recurrences bring |m| below 1: multiply down while m ≥ 1, divide up while m ≤ −1.
+///    Each loop stops early at a pole, an overflow or an underflow.
+/// 2. m = 0 then returns the product.
+/// 3. a > 10⁴ with |m| ≤ 1 takes an a^m series.
+/// 4. The Γ poles are resolved: +∞ where only Γ(a + m) has one, 0 where only Γ(a) has one.
+/// 5. Otherwise the result is the product times exp(lgam(a + m) − lgam(a)) and both gamma signs.
+///
+/// The form this replaced took an exact rising product for integer m and the log-gamma ratio
+/// for everything else. Near a pole it was 7.4e-11 relative off at (−3.0000000013, −3.000006),
+/// where SciPy is 3.5e-15 (frankenscipy-zw56i). A Python emulation of this code matched
+/// scipy.special.poch on 45,007 of 45,007 points: pole-adjacent a, integer m, the large-a
+/// series and the edges.
 pub fn poch(x: f64, n: f64) -> f64 {
-    // poch(x, n) = (x)_n = Γ(x+n)/Γ(x). Matching scipy.special.poch requires
-    // handling the Γ poles at non-positive integers, which the plain
-    // gammaln/gammasgn ratio collapses to NaN:
-    //   * numerator-only pole (x+n a non-positive integer, x not)  → +inf;
-    //   * denominator-only pole (x a non-positive integer, x+n not) → 0;
-    //   * both poles (⟺ n integer): the exact finite limit, computed as the
-    //     signed (reciprocal) rising product — e.g. poch(-2,-2)=1/12,
-    //     poch(-5,3)=-60 — which the gammaln ratio (∞/∞) cannot give.
-    // scipy returns +∞ (never −∞) at every single-pole divergence; the
-    // pole-cases are resolved before the integer product so the sign of the
-    // product's zero factor can't flip +inf to −inf. frankenscipy-7o3a2
-    if n == 0.0 {
-        return 1.0;
-    }
-    let xn = x + n;
-    let x_pole = x <= 0.0 && x == x.floor();
-    let xn_pole = xn <= 0.0 && xn == xn.floor();
-    if xn_pole && !x_pole {
-        return f64::INFINITY; // numerator Γ pole, finite denominator
-    }
-    if x_pole && !xn_pole {
-        return 0.0; // denominator Γ pole, finite numerator
-    }
-    if n == n.floor() {
-        // Integer n: exact signed (reciprocal) product. Correct through the
-        // both-pole finite limit and the ordinary case alike. The loop is
-        // bounded — single-pole cases returned above, and the both-pole case
-        // forces |n| ≤ |x|; the cap guards pathological large n (necessarily
-        // neither-pole there, where the smooth Γ path below stays accurate).
-        let ni = n as i64;
-        if ni.abs() <= 4096 {
-            let mut r = 1.0_f64;
-            if ni > 0 {
-                for i in 0..ni {
-                    r *= x + i as f64;
-                }
-                return r;
-            }
-            for i in ni..0 {
-                r *= x + i as f64;
-            }
-            return 1.0 / r;
+    let is_nonpos_int = |v: f64| v <= 0.0 && v == v.ceil() && v.abs() < 1e13;
+    let (a, mut m) = (x, n);
+    let mut r = 1.0_f64;
+    // 1. Reduce |m| below 1 by the recurrences.
+    while m >= 1.0 {
+        if a + m == 1.0 {
+            break;
+        }
+        m -= 1.0;
+        r *= a + m;
+        if !r.is_finite() || r == 0.0 {
+            break;
         }
     }
-    // Smooth signed Γ-ratio (neither argument hits a pole here). gammaln gives
-    // ln|·|, so restore the sign from the gamma factors — scipy.special
-    // .poch(-4.3, 0.5) = -2.938, not +2.938. For x>0 both signs are +1.
+    while m <= -1.0 {
+        if a + m == 0.0 {
+            break;
+        }
+        r /= a + m;
+        m += 1.0;
+        if !r.is_finite() || r == 0.0 {
+            break;
+        }
+    }
+    // 2. Evaluate with the reduced m.
+    if m == 0.0 {
+        return r;
+    }
+    if a > 1e4 && m.abs() <= 1.0 {
+        return r
+            * a.powf(m)
+            * (1.0
+                + m * (m - 1.0) / (2.0 * a)
+                + m * (m - 1.0) * (m - 2.0) * (3.0 * m - 1.0) / (24.0 * a * a)
+                + m * m * (m - 1.0) * (m - 1.0) * (m - 2.0) * (m - 3.0) / (48.0 * a * a * a));
+    }
+    if is_nonpos_int(a + m) && !is_nonpos_int(a) && a + m != m {
+        return f64::INFINITY;
+    }
+    if !is_nonpos_int(a + m) && is_nonpos_int(a) {
+        return 0.0;
+    }
     let mode = fsci_runtime::RuntimeMode::Strict;
-    let log_result = crate::gammaln_scalar(xn, mode).unwrap_or(f64::NAN)
-        - crate::gammaln_scalar(x, mode).unwrap_or(f64::NAN);
-    let sign = crate::gammasgn_scalar(xn, mode).unwrap_or(f64::NAN)
-        * crate::gammasgn_scalar(x, mode).unwrap_or(f64::NAN);
-    sign * log_result.exp()
+    let lgam = |v: f64| crate::gammaln_scalar(v, mode).unwrap_or(f64::NAN);
+    let sgn = |v: f64| crate::gammasgn_scalar(v, mode).unwrap_or(f64::NAN);
+    r * (lgam(a + m) - lgam(a)).exp() * sgn(a + m) * sgn(a)
 }
 
 /// Softmax function: exp(x_i) / Σ exp(x_j), numerically stable.
@@ -10264,6 +10270,42 @@ mod tests {
             (betaln_scalar(100.0, 100.0, m).unwrap() - -139.665_259_086_706_67).abs() < 1e-10,
             "betaln(100,100)"
         );
+    }
+
+    #[test]
+    fn poch_is_scipys_cephes_poch_bit_for_bit() {
+        // frankenscipy-zw56i: poch is xsf's Cephes poch. SciPy 1.17.1's bits through the
+        // reduction loops, m = 0, the large-a series, both pole outcomes (+inf, 0), the
+        // both-pole finite limits and the gamma-ratio path. The first point is the sweep's
+        // worst, 7.4e-11 off before. (a, m, scipy.special.poch(a, m)).
+        let cases: [(f64, f64, f64); 14] = [
+            (-3.00000000130809, -3.000005999982, -1.8163808136222019e-06),
+            (2.0, 3.0, 24.0),
+            (0.5, 2.0, 0.75),
+            (-2.0, -2.0, 0.08333333333333333),
+            (-5.0, 3.0, -60.0),
+            (-4.3, 0.5, -2.938123324828691),
+            (1.0, 0.0, 1.0),
+            (-3.0, 0.5, 0.0),
+            (0.5, -3.5, f64::INFINITY),
+            (-2.5, 2.5, f64::INFINITY),
+            (12345.6, 0.7, 731.2314255611542),
+            (7.25, -2.75, 0.010067439447618393),
+            (3.5, 4.25, 920.1022396922906),
+            (
+                -2.9999999999648965,
+                -3.999003002990991,
+                4.2000107014479106e-11,
+            ),
+        ];
+        for (a, m, want) in cases {
+            let got = poch(std::hint::black_box(a), std::hint::black_box(m));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "poch({a:?}, {m:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
     }
 
     #[test]
