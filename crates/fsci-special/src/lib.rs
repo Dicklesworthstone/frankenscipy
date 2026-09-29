@@ -691,6 +691,209 @@ pub(crate) fn sf_negative_domain_zero_pole(x: f64) -> Option<SpecialErrorCode> {
     }
 }
 
+/// Worker count for an array map over `n` elements: one worker per `per_worker` elements, at
+/// most one per core, serial below two workers' worth.
+///
+/// `per_worker` is the cost knob. The loose 128 of [`par_map_indices`] suits kernels of a few
+/// hundred ns and up; on a ~8 ns kernel it spawns 64 OS threads for microseconds of work each
+/// and leaves a flat ~3-4 ms spawn floor, which is why the cheap and moderate kernels use
+/// [`par_map_light`] and [`par_map_moderate`].
+pub(crate) fn par_workers(n: usize, per_worker: usize) -> usize {
+    if n / per_worker < 2 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / per_worker)
+}
+
+/// Write `f(base + k)` into `out[k]`, stopping at the first error in index order.
+///
+/// Iterating `out` by `iter_mut` rather than by index is deliberate: there is no bound to
+/// check, so the write is a plain store.
+fn fill_indices<T, H>(out: &mut [T], base: usize, f: &H) -> Result<(), SpecialError>
+where
+    H: Fn(usize) -> Result<T, SpecialError>,
+{
+    for (offset, slot) in out.iter_mut().enumerate() {
+        *slot = f(base + offset)?;
+    }
+    Ok(())
+}
+
+/// Evaluate `f(0..n)` into a `Vec<T>` on `nthreads` threads. This is the one array mapper
+/// behind every module's array arms.
+///
+/// Each index writes its own slot and the chunks are scanned in index order, so every arm is
+/// bit-identical to `(0..n).map(f).collect()`, including returning the first failing index's
+/// error. Asserted by `gamma_family_prealloc_fill_arms_agree_bit_for_bit` on the serial and
+/// the threaded arm, with a one-ULP detector proving the comparison can see a difference.
+///
+/// COLLECTING A `Result` PER ELEMENT COSTS MORE THAN THE LOG IT WRAPS. `collect::<Result<Vec<T>,
+/// _>>()` routes every element through `GenericShunt`, which cannot preallocate from the size
+/// hint (the iterator may stop early), so the `Vec` regrows and each element pays a capacity
+/// check and a discriminant test. Profiled on `gammaln` at n = 200000, x in [20.1, 60], by
+/// symbol: the kernel 50.5%, `GenericShunt::from_iter` 26.1%, `log` 22.0%. Only 13.6
+/// instructions per element of that block went away (226.8 against 240.4): a profile says where
+/// instructions are, not how many can be removed. boxcox and huber ran ~10% faster
+/// preallocated (ly59d).
+///
+/// So [`GAMMA_FAMILY_PREALLOC_FILL`] (shipping) allocates `vec![T::default(); n]` once and
+/// fills it through `iter_mut`. It is not `with_capacity` + `push`, because a growing `len`
+/// turns every later write into a bounds check LLVM cannot hoist; that swap cost 46% elsewhere
+/// in this workspace. The zeroing pass is dead work and this is still faster. The threaded arm
+/// also drops a whole copy of the output: each thread fills its own `chunks_mut` slice of the
+/// final buffer instead of building a `Vec` to concatenate. With the toggle off, the old
+/// collect-and-concatenate arm runs, so the harness can A/B the two in one binary
+/// (`FSCI_SPECIAL_PREALLOC=0`).
+///
+/// MUST-MISS CONTROL: `erf` at 64 <= n < 2^20 takes its SIMD path, not this mapper, and at
+/// n = 200000 reads 69.3 instructions per element with the arm on and off, `prealloc_hits=0`
+/// both times.
+///
+/// THE SERIAL FILL STAYS IN THIS SMALL BODY so it inlines into the caller, where `n` is the
+/// input's length and the kernel's `values[i]` bound check folds away. With every arm in one
+/// body the mapper did not inline, and huber ran 0.32-0.34 ms at n = 200000 against 0.29-0.30
+/// ms for the small push loop it replaced (ly59d).
+pub(crate) fn par_map_indices_with_threads<T, H>(
+    n: usize,
+    nthreads: usize,
+    f: H,
+) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+
+    if nthreads <= 1 && GAMMA_FAMILY_PREALLOC_FILL.load(Relaxed) {
+        GAMMA_FAMILY_PREALLOC_FILL_HITS.fetch_add(1, Relaxed);
+        let mut out = vec![T::default(); n];
+        for (i, slot) in (0..n).zip(out.iter_mut()) {
+            *slot = f(i)?;
+        }
+        return Ok(out);
+    }
+    par_map_indices_fan_out(n, nthreads, f)
+}
+
+/// Every arm of [`par_map_indices_with_threads`] but the preallocated serial fill: the threaded
+/// fill, and the collect arms [`GAMMA_FAMILY_PREALLOC_FILL`] restores when off.
+fn par_map_indices_fan_out<T, H>(n: usize, nthreads: usize, f: H) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+
+    if !GAMMA_FAMILY_PREALLOC_FILL.load(Relaxed) {
+        if nthreads <= 1 {
+            return (0..n).map(&f).collect();
+        }
+        let chunk = n.div_ceil(nthreads);
+        let f = &f;
+        let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
+            (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = t * chunk;
+                    if i0 >= n {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(n);
+                    Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        });
+        let mut out = Vec::with_capacity(n);
+        for cr in chunk_results {
+            out.extend(cr?);
+        }
+        return Ok(out);
+    }
+
+    GAMMA_FAMILY_PREALLOC_FILL_HITS.fetch_add(1, Relaxed);
+    let mut out = vec![T::default(); n];
+    if n == 0 {
+        return Ok(out);
+    }
+    let chunk = n.div_ceil(nthreads);
+    let f = &f;
+    let results: Vec<Result<(), SpecialError>> = std::thread::scope(|scope| {
+        out.chunks_mut(chunk)
+            .enumerate()
+            .map(|(t, slice)| scope.spawn(move || fill_indices(slice, t * chunk, f)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    for result in results {
+        result?;
+    }
+    Ok(out)
+}
+
+/// [`par_map_indices_with_threads`] on one worker per 128 elements: the default for kernels
+/// of a few hundred ns and up (incomplete gamma and beta, Bessel, elliptic, Airy, erfinv).
+pub(crate) fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    par_map_indices_with_threads(n, par_workers(n, 128), f)
+}
+
+/// [`par_map_indices`], serial below `real_par_min` elements: the break-even for kernels whose
+/// cost a 128-element worker cannot amortise at moderate `n`.
+pub(crate) fn par_map_indices_gated<T, H>(
+    n: usize,
+    real_par_min: usize,
+    f: H,
+) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    let nthreads = if n >= real_par_min {
+        par_workers(n, 128)
+    } else {
+        1
+    };
+    par_map_indices_with_threads(n, nthreads, f)
+}
+
+/// One worker per 8192 elements, for moderate kernels of ~50-300 ns (erfcx, dawsn, erfi,
+/// spence, wrightomega). Measured on `dawsn`, the 128 cap left a flat ~2.8-3.3 ms from
+/// n = 50k to 500k.
+pub(crate) fn par_map_moderate<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    par_map_indices_with_threads(n, par_workers(n, 1 << 13), f)
+}
+
+/// One worker per 32768 elements, for cheap compute-bound kernels (~8-30 ns: expit, logit,
+/// the Lanczos gamma family). This cap flipped gamma/gammaln/digamma at n of about 128k-1M
+/// from a 1.4-2x loss to SciPy into a 1.2-2.75x win.
+pub(crate) fn par_map_light<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
+where
+    T: Send + Default + Clone,
+    H: Fn(usize) -> Result<T, SpecialError> + Sync,
+{
+    par_map_indices_with_threads(n, par_workers(n, 1 << 15), f)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};

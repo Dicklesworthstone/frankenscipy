@@ -10,6 +10,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, record_special_trace,
 };
+use crate::{par_map_indices, par_map_indices_gated};
 
 pub const ERROR_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
@@ -321,53 +322,6 @@ pub static ERFCINV_NDTRI: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 pub static ERFCINV_NDTRI_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
-/// Error-function kernels (erf series / erfc continued fraction / erfinv–erfcinv Newton
-/// refinement) are non-trivial per element and each index writes its own slot, so chunking
-/// across cores and concatenating in index order is bit-identical to `(0..n).map(f).collect()`
-/// — including returning the first failing index's error in index order. Generic over the
-/// output type (f64 or Complex64).
-fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("error-fn array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
 // Unreferenced: every entry point in this module calls map_unary_input_rp with
 // an explicit parallel threshold instead. RETAINED with a note rather than
 // deleted (frankenscipy-e2ve2), matching map_real_input in gamma.rs and
@@ -409,16 +363,8 @@ where
     match input {
         SpecialTensor::RealScalar(x) => real_kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
-            if values.len() < real_par_min {
-                values
-                    .iter()
-                    .map(|&x| real_kernel(x))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
-            } else {
-                par_map_indices(values.len(), |i| real_kernel(values[i]))
-                    .map(SpecialTensor::RealVec)
-            }
+            par_map_indices_gated(values.len(), real_par_min, |i| real_kernel(values[i]))
+                .map(SpecialTensor::RealVec)
         }
         SpecialTensor::ComplexScalar(value) => {
             complex_kernel(*value).map(SpecialTensor::ComplexScalar)

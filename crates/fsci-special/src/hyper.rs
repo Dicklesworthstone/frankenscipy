@@ -1625,50 +1625,15 @@ pub fn hyp2f1(
     hyp2f1_dispatch("hyp2f1", a, b, c, z, mode)
 }
 
-/// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
-/// Hypergeometric kernels (2F1/1F1 series, up to thousands of terms) are very expensive per
-/// element and each index writes its own slot, so chunking across cores and concatenating in
-/// index order is bit-identical to `(0..n).map(f).collect()` — including returning the first
-/// failing index's error in index order. Generic over the output type (f64 or Complex64).
+/// [`crate::par_map_indices_with_threads`] on one worker per 32 elements: hypergeometric
+/// kernels (2F1/1F1 series, up to thousands of terms) are expensive enough to fan out four
+/// times finer than the crate default.
 fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
 where
-    T: Send,
+    T: Send + Default + Clone,
     H: Fn(usize) -> Result<T, SpecialError> + Sync,
 {
-    let nthreads = if n < 64 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 32)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("hypergeometric array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
+    crate::par_map_indices_with_threads(n, crate::par_workers(n, 32), f)
 }
 
 fn hyp2f1_dispatch(

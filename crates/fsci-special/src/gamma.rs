@@ -8,6 +8,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
 };
+use crate::{par_map_indices, par_map_light};
 
 pub const GAMMA_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
@@ -228,167 +229,6 @@ pub fn loggamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     Ok(value)
 }
 
-/// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
-/// Gamma-family kernels (Lanczos gamma / log-gamma / digamma series) are non-trivial per
-/// element and each index writes its own slot, so chunking across cores and concatenating
-/// in index order is bit-identical to `(0..n).map(f).collect()` — including returning the
-/// first failing index's error in index order. Generic over the output type (f64 or
-/// Complex64); infallible complex kernels wrap their result in `Ok`.
-fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send + Default + Copy,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    par_map_indices_with_threads(n, nthreads, f)
-}
-
-/// Light-kernel parallel map: the gamma-family scalar kernels (gamma/gammaln/
-/// digamma/loggamma, ~30 ns Lanczos each) are so cheap that the loose `n/128`
-/// worker cap of [`par_map_indices`] over-subscribes at moderate `n` — 64 OS
-/// threads spawned to do microseconds of work each, leaving a flat ~4 ms spawn
-/// floor that loses to SciPy's serial cephes. Cap by WORK instead (≥~32k elements
-/// per worker) so each thread amortizes its spawn; this flips the moderate-`n`
-/// (≈128k–1M) gamma family from a 1.4–2x loss to a 1.2–2.75x win. Heavy kernels
-/// (complex arms, incomplete gamma) keep the looser cap. Order-preserving, so the
-/// output stays byte-identical to the serial map.
-fn par_map_light<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send + Default + Copy,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 32768)
-            .max(1)
-    };
-    par_map_indices_with_threads(n, nthreads, f)
-}
-
-/// Write `f(base + k)` into `out[k]`, stopping at the first error in index order.
-///
-/// Iterating `out` by `iter_mut` rather than by index is deliberate: there is no bound to
-/// check, so the write is a plain store.
-fn fill_indices<T, H>(out: &mut [T], base: usize, f: &H) -> Result<(), SpecialError>
-where
-    H: Fn(usize) -> Result<T, SpecialError>,
-{
-    for (offset, slot) in out.iter_mut().enumerate() {
-        *slot = f(base + offset)?;
-    }
-    Ok(())
-}
-
-fn par_map_indices_with_threads<T, H>(
-    n: usize,
-    nthreads: usize,
-    f: H,
-) -> Result<Vec<T>, SpecialError>
-where
-    T: Send + Default + Copy,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    // COLLECTING A `Result` PER ELEMENT COSTS MORE THAN THE LOG IT WRAPS.
-    //
-    // `(0..n).map(f).collect::<Result<Vec<T>, _>>()` routes every element through
-    // `GenericShunt`, the adapter that lets a fallible iterator collect into a `Vec`. It
-    // cannot use the size hint to preallocate — the iterator may stop early — so each
-    // element pays a capacity check and a discriminant test, and the compiler cannot turn
-    // the body into a straight store. Profiled on `gammaln` at n=200000, x in [20.1, 60],
-    // instructions attributed by symbol:
-    //
-    //     gammaln_scalar_with_threshold   50.5%   (the kernel itself)
-    //     ...GenericShunt...::from_iter   26.1%   <- this
-    //     __ieee754_log_fma + log@plt     22.0%
-    //
-    // 26% of the op, in the collect. Allocating the output up front and writing each slot
-    // through `iter_mut` removes the adapter entirely; the buffer is `vec![T::default();
-    // n]`, NOT `with_capacity` + `push`, because a push-built buffer keeps a growing `len`
-    // that turns every later write into a bounds check LLVM cannot hoist — that swap cost
-    // 46% elsewhere in this workspace. The zeroing pass really is dead work and keeping it
-    // is still faster.
-    //
-    // 26% ATTRIBUTED IS NOT 26% REMOVABLE. Only 13.6 instructions per element of that
-    // block actually went away (226.8 against 240.4, 159.7 against 173.3, 183.1 against
-    // 196.9 in the three bands); the rest is the store and the loop any version must
-    // perform. A profile says where instructions ARE, not how many can be removed —
-    // quoting the attribution as the prize would have overstated this by threefold.
-    //
-    // MUST-MISS CONTROL: `erf` does not route through this mapper and reads 69.3
-    // instructions per element with the arm on AND off, `prealloc_hits=0` both times. An
-    // op that must not move, and does not.
-    //
-    // BIT-IDENTICAL: same `f`, same indices, same order, and the first error in index
-    // order is still the one returned. Only the destination changes. Asserted by
-    // `gamma_family_prealloc_fill_arms_agree_bit_for_bit` on both the serial and the
-    // threaded arm, with a one-ULP detector proving the comparison can see a difference.
-    //
-    // The parallel arm additionally drops a whole copy of the output: it used to build one
-    // `Vec` per thread and concatenate them, and now each thread fills its own disjoint
-    // `chunks_mut` slice of the final buffer.
-    if !GAMMA_FAMILY_PREALLOC_FILL.load(std::sync::atomic::Ordering::Relaxed) {
-        if nthreads <= 1 {
-            return (0..n).map(&f).collect();
-        }
-        let chunk = n.div_ceil(nthreads);
-        let f = &f;
-        let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let i0 = t * chunk;
-                    if i0 >= n {
-                        return None;
-                    }
-                    let i1 = (i0 + chunk).min(n);
-                    Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("gamma array worker panicked"))
-                .collect()
-        });
-        let mut out = Vec::with_capacity(n);
-        for cr in chunk_results {
-            out.extend(cr?);
-        }
-        return Ok(out);
-    }
-
-    GAMMA_FAMILY_PREALLOC_FILL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut out = vec![T::default(); n];
-    if nthreads <= 1 || n == 0 {
-        fill_indices(&mut out, 0, &f)?;
-        return Ok(out);
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let results: Vec<Result<(), SpecialError>> = std::thread::scope(|scope| {
-        out.chunks_mut(chunk)
-            .enumerate()
-            .map(|(t, slice)| scope.spawn(move || fill_indices(slice, t * chunk, f)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("gamma array worker panicked"))
-            .collect()
-    });
-    for result in results {
-        result?;
-    }
-    Ok(out)
-}
-
 /// Real arrays at or above this length route the cheap gamma-family kernels
 /// (gamma/gammaln/digamma, ~29ns Lanczos each) through `par_map_indices`. The
 /// per-element compute finally dominates the OS-thread spawn + chunk-concat
@@ -523,11 +363,7 @@ where
     let nthreads = if n < par_min {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 32768)
-            .max(1)
+        crate::par_workers(n, 1 << 15)
     };
     if nthreads <= 1 {
         for (slot, &x) in out.iter_mut().zip(values) {
@@ -1104,15 +940,7 @@ fn incomplete_gamma_real_batch(
     };
     let mut out = vec![0.0_f64; n];
     // The per-element path's worker policy (`par_map_indices`): this kernel is heavy.
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
+    let nthreads = crate::par_workers(n, 128);
     let chunk = n.div_ceil(nthreads);
     let kernel = &kernel;
     // One loop per shape, so the scalar side is a loop invariant and not a test per element.
@@ -3429,10 +3257,10 @@ pub static GAMMALN_HOIST_THRESHOLD: std::sync::atomic::AtomicBool =
 /// Fill a preallocated output buffer by index instead of collecting a `Result` per element
 /// (`true`, shipping). Bit-identical: same `f`, same indices, same order, same first error.
 ///
-/// This is the shared mapper for the whole crate's array paths — 245 call sites across
-/// gamma, bessel, beta, elliptic, airy, error and hyper — so it is an articulation point
-/// rather than one kernel's tuning. Profiled on `gammaln`, the `collect::<Result<Vec<_>,
-/// _>>()` adapter was 26.1% of the op, more than the `log` it wraps.
+/// It selects the arm of `crate::par_map_indices_with_threads`, the one mapper behind every
+/// module's array arms, so it is an articulation point rather than one kernel's tuning.
+/// Profiled on `gammaln`, the `collect::<Result<Vec<_>, _>>()` adapter was 26.1% of the op,
+/// more than the `log` it wraps.
 pub static GAMMA_FAMILY_PREALLOC_FILL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// Array evaluations that took the preallocated-fill arm — "enabled" is not "took effect".
@@ -5669,6 +5497,7 @@ fn complex_parameter_gammaincc_cf(a: Complex64, z: Complex64) -> Result<Complex6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::par_map_indices_with_threads;
 
     /// The ONE lock for every test that writes a gamma-family perf toggle.
     ///
