@@ -347,7 +347,15 @@ pub fn select_hypergeometric_branch(
         ));
     }
 
-    if problem.parameter_stability_margin <= problem.precision_target {
+    // A 1F1 lower parameter within the precision target of a nonpositive-integer pole, but not
+    // on it, is a large finite value. Strict evaluates it as SciPy 1.17.1 (Boost) does: SciPy is
+    // within 5.4e-15 of mpmath there (60 points with b down to 1e-300 and within 1e-14 of -n).
+    // Hardened keeps failing closed. The exact poles never reach this selector; hyp1f1_scalar
+    // answers them first (frankenscipy-tbhnl).
+    let strict_1f1_off_pole = mode == RuntimeMode::Strict
+        && problem.function == HypergeometricFunction::Hyp1f1
+        && problem.parameter_stability_margin > 0.0;
+    if problem.parameter_stability_margin <= problem.precision_target && !strict_1f1_off_pole {
         return Ok(hyper_casp_decision(
             HypergeometricBranch::ParameterGuard,
             problem,
@@ -1801,6 +1809,13 @@ pub(crate) fn hyp1f1_scalar(
     // up to z ≈ 716. Every other (a, b) past ln(f64::MAX) is finite in SciPy 1.17.1, and here.
     if a == 1.0 && b == 2.0 && z >= HYP1F1_SCIPY_EXPM1_OVERFLOW {
         return Ok(f64::INFINITY);
+    }
+    // The same expm1(z)/z is -1/-inf = 0 at z = -inf, where the selector would call a
+    // non-finite argument unsupported (frankenscipy-tbhnl). SciPy's other infinite-z answers
+    // are NaN, or never return (hyp1f1(0.5, 1.5, inf) runs past 20 s), so only this one is
+    // copied.
+    if a == 1.0 && b == 2.0 && z == f64::NEG_INFINITY {
+        return Ok(0.0);
     }
 
     let decision = select_hypergeometric_branch(HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14), mode)?;
@@ -5073,13 +5088,68 @@ mod tests {
         assert_eq!(decision.fallback_chain, HYP1F1_KUMMER_CHAIN);
     }
 
+    /// frankenscipy-tbhnl: a 1F1 lower parameter near a pole is guarded in Hardened only; Strict
+    /// evaluates it, as SciPy does.
     #[test]
-    fn hyper_casp_guards_lower_parameter_near_pole() {
+    fn hyper_casp_guards_lower_parameter_near_pole() -> Result<(), SpecialError> {
         let problem = HyperCaspProblem::hyp1f1(1.0, 1.0e-16, 0.5, 1.0e-14);
-        let decision = select_casp_for_test(problem);
+        let hardened = select_hypergeometric_branch(problem, RuntimeMode::Hardened)?;
+        assert_eq!(hardened.branch, HypergeometricBranch::ParameterGuard);
+        assert!(hardened.parameter_stability_margin <= hardened.precision_target);
 
-        assert_eq!(decision.branch, HypergeometricBranch::ParameterGuard);
-        assert!(decision.parameter_stability_margin <= decision.precision_target);
+        let strict = select_casp_for_test(problem);
+        assert_eq!(strict.branch, HypergeometricBranch::DirectSeries);
+        Ok(())
+    }
+
+    /// frankenscipy-tbhnl. Next to a pole of the lower parameter (b tiny, or within 1e-14 of
+    /// -n), Strict hyp1f1 is the large finite value SciPy returns rather than NaN. Each pin is
+    /// mpmath's hyp1f1 at 60 digits; SciPy is within 2.9e-15 of every one.
+    #[test]
+    fn hyp1f1_next_to_a_lower_parameter_pole_matches_mpmath() -> Result<(), SpecialError> {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64, f64, f64); 12] = [
+            (4.517, 6.128246929561813e-107, -13.86, -6.613095609661075e102),
+            (1.0, 1e-16, 0.5, 8243606353500642.0),
+            (-2.838, 2.860425367386195e-15, -15.972, 7.04924580975314e17),
+            (2.5, -3e-300, 7.25, -7.713996960968076e304),
+            (-0.317, -5.000000000000003, -5.798, -38026757756146.16),
+            (-3.184, -2.9999999999999907, 11.96, -2.550171551070379e18),
+            (1.001, -5.000000000000001, 9.142, 5.13242365804892e22),
+            (0.75, -2.000000000000001, -30.0, 48514694283778.56),
+            (3.5, -1.9999999999999998, 40.0, 1.4183657908301814e41),
+            (-4.872, -2.0000000000000067, -8.135, -2.695684731799896e18),
+            (0.5, 1e-15, 60.0, 4.969865772295803e41),
+            (1.5, -1e-15, -2.0, 157971638455484.47),
+        ];
+        for (a, b, z, want) in PINS {
+            let (a, b, z) = (
+                std::hint::black_box(a),
+                std::hint::black_box(b),
+                std::hint::black_box(z),
+            );
+            let got = hyp1f1_scalar(a, b, z, RuntimeMode::Strict)?;
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 1e-13,
+                "hyp1f1({a}, {b}, {z}) = {got:e}, mpmath {want:e}, rel {rel:e}"
+            );
+            assert!(
+                hyp1f1_scalar(a, b, z, RuntimeMode::Hardened).is_err(),
+                "Hardened must still refuse b = {b}"
+            );
+        }
+        // SciPy's expm1(z)/z form for M(1, 2, z) is 0 at z = -inf.
+        assert_eq!(
+            hyp1f1_scalar(
+                1.0,
+                2.0,
+                std::hint::black_box(f64::NEG_INFINITY),
+                RuntimeMode::Strict
+            )?,
+            0.0
+        );
+        Ok(())
     }
 
     #[test]

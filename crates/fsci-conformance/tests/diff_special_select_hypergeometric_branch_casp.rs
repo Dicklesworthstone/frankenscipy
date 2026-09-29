@@ -184,8 +184,16 @@ fn diff_special_select_hypergeometric_branch_casp() {
         probe(
             "parameter_guard_low_margin",
             p,
-            RuntimeMode::Strict,
+            RuntimeMode::Hardened,
             HypergeometricBranch::ParameterGuard,
+        );
+        // Strict evaluates a 1F1 lower parameter next to (not on) a pole, as SciPy does
+        // (frankenscipy-tbhnl): the guard fires in Hardened only.
+        probe(
+            "parameter_near_pole_strict_evaluates",
+            p,
+            RuntimeMode::Strict,
+            HypergeometricBranch::DirectSeries,
         );
     }
 
