@@ -3967,6 +3967,18 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     let y = x / 2.0;
     let a0 = 0.5 * df + j0;
     let p0 = chdtr(df + 2.0 * j0, x); // = P(a0, y)
+    // frankenscipy-pf9eg: deep in the lower tail the mode anchor loses its digits and then
+    // underflows while the law does not (chndtr(1.08e-46, 12.24, 8.93) = 1.07e-288 came back 0),
+    // so the mixture is summed by parts from below its dominant term. The terms
+    // w_j·P(a + j, y) peak where (j + 1)(a + j + 1) = λy, at j + 1 = m below.
+    if p0 < crate::beta::POISSON_ANCHOR_FLOOR {
+        let a = 0.5 * df;
+        let m = 0.5 * ((a * a + 4.0 * lam * y).sqrt() - a);
+        let k_start = crate::beta::poisson_by_parts_start(m, j0);
+        let d_start = poisson_term(a + k_start, y);
+        return crate::beta::poisson_mixture_by_parts(lam, k_start, d_start, |k| y / (a + k + 1.0))
+            .clamp(0.0, 1.0);
+    }
     let t0 = poisson_term(a0, y); // = y^a0 e^{−y} / Γ(a0 + 1)
     // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
     if p0 == 0.0 && t0 == 0.0 {
@@ -4160,10 +4172,11 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
 /// so a root far below 1 is bracketed in O(log) CDF calls and resolved to a relative
 /// tolerance: SciPy gives `chndtrix(1e-20, 3, 2) = 2.1860014721757718e-13`, where the old
 /// `[0, hi]` search stopped at its first false-position step, 2.28e-19. The answer is only as
-/// good as [`chndtr`] at the root: where both of its mode anchors underflow it returns 0, so a
-/// `p` near `1e-300` (SciPy: `chndtrix(1e-300, 3, 2) = 4.7095974041160384e-200`) is not
-/// resolved there. Boost starts from Pearson's approximation instead of 1, which moves only
-/// the escape value when the root is below `f64::MIN_POSITIVE`.
+/// good as [`chndtr`] at the root, which holds its relative precision down to the bottom of the
+/// double range (frankenscipy-pf9eg): its mode walk returned 0 once its anchors underflowed,
+/// and chndtrix(1.07e-288, 12.24, 8.93) was 8.8e14 relatively off (SciPy 1.5e-14). A root below
+/// `f64::MIN_POSITIVE` comes from a bisection over the subnormals (`subnormal_root`), not from
+/// the walk's escape value (Boost's, which SciPy moves with Boost's Pearson start).
 ///
 /// SciPy is NaN from `nc ≈ 4.18e10` at `p = 1/2` (the edge moves with `p`: 2.2e11 at 0.01,
 /// 4.3e10 at 0.99) because Boost's series hits its term limit. [`chndtr`] deliberately stays
@@ -4189,7 +4202,12 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     // rather than a bracket. SciPy 1.17.1: chndtrix(0.5, 3, 2^60) = nan.
     let q = 1.0 - p;
     if p < q {
-        crate::beta::bracket_and_solve_root(|x| chndtr(x, df, nc) - p, 1.0, true)
+        let residual = |x: f64| chndtr(x, df, nc) - p;
+        let root = crate::beta::bracket_and_solve_root(residual, 1.0, true);
+        if root < f64::MIN_POSITIVE {
+            return crate::beta::subnormal_root(residual);
+        }
+        root
     } else {
         crate::beta::bracket_and_solve_root(|x| q - chndtrc(x, df, nc), 1.0, true)
     }

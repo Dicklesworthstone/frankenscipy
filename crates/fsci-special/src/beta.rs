@@ -703,6 +703,85 @@ pub(crate) fn poisson_upward_step_cap(lam: f64) -> f64 {
     (40.0 * lam.sqrt()).ceil().max(100_000.0)
 }
 
+/// A lower-tail mode anchor of [`ncfdtr`] or [`crate::gamma::chndtr`] (`I_y` or `P` at the
+/// Poisson mode) below this is within ~1e-28 of the subnormal range. Past it the anchor loses
+/// its digits and then underflows, and the mode walk returned 0 where the law is still well
+/// inside the double range; the mixture is then summed by parts instead
+/// ([`poisson_mixture_by_parts`], frankenscipy-pf9eg).
+pub(crate) const POISSON_ANCHOR_FLOOR: f64 = 1e-280;
+
+/// The lower tail `Σ_j w_j·F_j` of a noncentral Poisson mixture, `w_j = e^{−λ}λʲ/j!`, whose
+/// mixed CDF is the tail sum of its own increments, `F_j = Σ_{k≥j} d_k`, summed by parts as
+/// `Σ_k d_k·V_k` with `V_k = Σ_{j≤k} w_j` the Poisson CDF (frankenscipy-pf9eg).
+///
+/// [`crate::gamma::chndtr`] has `F_j = P(a + j, y)` and `d_k = y^{a+k}·e^{−y}/Γ(a+k+1)`;
+/// [`ncfdtr`] has `F_j = I_y(a + j, b)` and `d_k = `[`beta_term`]`(a + k, b, y, 1 − y)`. Every
+/// term is positive, so nothing cancels, and nothing is formed at the Poisson mode. The mode
+/// walks anchor `F` there, and deep in the lower tail that anchor underflows while the law does
+/// not: chndtr(1.08e-46, 12.24, 8.93) is 1.07e-288, but its anchor P(10.12, 5.4e-47) is
+/// 1.5e-475. The walk returned 0 there, and chndtrix(1.07e-288, 12.24, 8.93) came back 8.8e14
+/// relatively off.
+///
+/// This is Ding's algorithm (AS 275), which Boost's noncentral χ² CDF uses below `nc = 200`
+/// (`non_central_chi_square_p_ding` in boost/math/distributions/non_central_chi_squared.hpp),
+/// started at `k_start` rather than 0 so that a large `λ` does not underflow `V_0 = e^{−λ}`.
+/// The caller puts `k_start` about ten standard deviations below the dominant term; `d_start`
+/// is `d_{k_start}` and `ratio(k)` is `d_{k+1}/d_k`. The sum stops, as Ding's does, at the
+/// first term below 1e-17 of the sum that is no larger than its predecessor. A zero `d_start`
+/// is a zero sum: `d` is a product of ratios from it, so every later term is zero too.
+pub(crate) fn poisson_mixture_by_parts(
+    lam: f64,
+    k_start: f64,
+    d_start: f64,
+    ratio: impl Fn(f64) -> f64,
+) -> f64 {
+    if d_start.is_nan() {
+        return f64::NAN;
+    }
+    if d_start == 0.0 {
+        return 0.0;
+    }
+    // V_k = P(K ≤ k) = Q(k + 1, λ), and the Poisson weight w_k that the next V adds.
+    let mut v = crate::igam_temme::igamc(k_start + 1.0, lam);
+    let mut w = gamma::poisson_term(k_start, lam);
+    let mut d = d_start;
+    let mut k = k_start;
+    let mut sum = d * v;
+    let mut last = sum;
+    let cap = poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
+        d *= ratio(k);
+        k += 1.0;
+        w *= lam / k;
+        v = (v + w).min(1.0);
+        let term = d * v;
+        if term.is_nan() {
+            return f64::NAN;
+        }
+        sum += term;
+        if term <= 1e-17 * sum && term <= last {
+            break;
+        }
+        last = term;
+        steps += 1.0;
+    }
+    sum
+}
+
+/// Where [`poisson_mixture_by_parts`] starts: ten standard deviations of the terms below the
+/// dominant index `k* = max(m − 1, 0)`, with `m > 0` the root of the caller's term-ratio
+/// equation, and never above the Poisson mode `j0`. Near `k*` the terms fall off like a Gaussian
+/// of variance at most `k*`, and faster further out, so what lies below the start is below
+/// 1e-20 of the peak.
+pub(crate) fn poisson_by_parts_start(m: f64, j0: f64) -> f64 {
+    let k_star = (m - 1.0).max(0.0);
+    (k_star - 10.0 * k_star.sqrt() - 10.0)
+        .max(0.0)
+        .floor()
+        .min(j0)
+}
+
 /// `xᵃ·yᵇ·Γ(a+b) / (Γ(a+1)·Γ(b))` for `a, b > 0` and `y = 1 − x` passed in exactly: the
 /// incomplete beta increment `I_x(a,b) − I_x(a+1,b)`, and `1/a` times the front factor of
 /// [`betainc_scalar`] (frankenscipy-g9yid).
@@ -841,6 +920,22 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     let b = 0.5 * dfd;
     let a0 = 0.5 * dfn + j0;
     let p0 = betainc_with_complement(a0, b, y, y1).unwrap_or(f64::NAN); // = I_y(a0, b)
+    // frankenscipy-pf9eg: deep in the lower tail the mode anchor loses its digits and then
+    // underflows while the law does not (ncfdtr(16.7, 30.6, 12.0, 7.96e-26) = 2.27e-209 came
+    // back 0), so the mixture is summed by parts from below its dominant term. The terms
+    // w_j·I_y(a + j, b) peak where (j + 1)(a + j + 1) = λy(a + j + b), at j + 1 = m below.
+    if p0 < POISSON_ANCHOR_FLOOR {
+        let a = 0.5 * dfn;
+        let ly = lam * y;
+        let lin = a - ly;
+        let m = 0.5 * ((lin * lin + 4.0 * ly * (a + b - 1.0)).max(0.0).sqrt() - lin);
+        let k_start = poisson_by_parts_start(m, j0);
+        let d_start = beta_term(a + k_start, b, y, y1);
+        return poisson_mixture_by_parts(lam, k_start, d_start, |k| {
+            y * (a + k + b) / (a + k + 1.0)
+        })
+        .clamp(0.0, 1.0);
+    }
     let u0 = beta_term(a0, b, y, y1); // = y^a0 (1−y)^b Γ(a0+b) / (Γ(a0+1) Γ(b))
     // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`).
     if p0 == 0.0 && u0 == 0.0 {
@@ -1074,9 +1169,11 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
 /// SciPy gives `ncfdtri(3, 5, 2, 1e-20) = 6.67000004655459e-14`, where the old `[0, hi]`
 /// search stopped at its first false-position step, 5.92e-20. For `p ≥ 1/2` the residual is
 /// `q − ncfdtrc` with `q = 1 − p`, Boost's complement form. The answer is only as good as
-/// [`ncfdtr`] at the root: where both of its mode anchors underflow it returns 0, so a `p` far
-/// below `1e-300` (SciPy: `ncfdtri(3, 5, 2, 1e-300) = 1.4370079482811187e-200`) is not
-/// resolved there.
+/// [`ncfdtr`] at the root, which holds its relative precision down to the bottom of the double
+/// range (frankenscipy-pf9eg): its mode walk returned 0 once its anchors underflowed, and
+/// ncfdtri(16.7, 30.6, 12.0, 2.27e-209) was 184 relatively off (SciPy 1.9e-17). A root below
+/// `f64::MIN_POSITIVE` comes from a bisection over the subnormals (`subnormal_root`), not from
+/// the walk's escape value.
 ///
 /// SciPy is NaN from `nc ≈ 1.0293e10` for every `p`, `dfn` and `dfd` measured (Boost's series
 /// hits its term limit), while [`ncfdtr`] deliberately stays finite there, and this inverse
@@ -1101,7 +1198,12 @@ pub fn ncfdtri(dfn: f64, dfd: f64, nc: f64, p: f64) -> f64 {
     // bracket. SciPy 1.17.1: ncfdtri(3, 5, 2^60, 0.5) = nan.
     let q = 1.0 - p;
     if p < q {
-        bracket_and_solve_root(|x| ncfdtr(dfn, dfd, nc, x) - p, 1.0, true)
+        let residual = |x: f64| ncfdtr(dfn, dfd, nc, x) - p;
+        let root = bracket_and_solve_root(residual, 1.0, true);
+        if root < f64::MIN_POSITIVE {
+            return subnormal_root(residual);
+        }
+        root
     } else {
         bracket_and_solve_root(|x| q - ncfdtrc(dfn, dfd, nc, x), 1.0, true)
     }
@@ -1374,6 +1476,55 @@ pub(crate) fn bracket_and_solve_root(f: impl Fn(f64) -> f64, guess: f64, rising:
     }
 }
 
+/// The root below `f64::MIN_POSITIVE` of a residual that rises in `x ≥ 0`, is at most 0 at
+/// `x = 0` and positive at `f64::MIN_POSITIVE` (frankenscipy-pf9eg).
+///
+/// [`bracket_and_solve_root`]'s downward walk escapes at the first subnormal it reaches with
+/// half of it, Boost's value, which is not the root. chndtrix and ncfdtri reach it whenever the
+/// quantile of a tiny `p` is below the normal range: chndtrix(3.47e-121, 0.754, 16.14) has its
+/// root at 1e-310, and chndtrix(5.75e-144, 0.754, 16.14) at 3.8e-371, which rounds to 0. The
+/// subnormals are evenly spaced, so bisecting their bit patterns reaches two adjacent doubles in
+/// at most 52 halvings, and whichever of the two has the smaller residual is returned. That is
+/// as exact as the residual's own subnormal arithmetic: chndtr halves `x`, which rounds the
+/// smallest subnormal to 0, so the second root comes back as 5e-324. A NaN residual is NaN.
+pub(crate) fn subnormal_root(f: impl Fn(f64) -> f64) -> f64 {
+    let mut lo = 0_u64;
+    let mut hi = f64::MIN_POSITIVE.to_bits();
+    let mut flo = f(0.0);
+    let mut fhi = f(f64::MIN_POSITIVE);
+    if flo.is_nan() || fhi.is_nan() {
+        return f64::NAN;
+    }
+    if flo >= 0.0 {
+        return 0.0;
+    }
+    if fhi <= 0.0 {
+        return f64::MIN_POSITIVE;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let fmid = f(f64::from_bits(mid));
+        if fmid.is_nan() {
+            return f64::NAN;
+        }
+        if fmid == 0.0 {
+            return f64::from_bits(mid);
+        }
+        if fmid > 0.0 {
+            hi = mid;
+            fhi = fmid;
+        } else {
+            lo = mid;
+            flo = fmid;
+        }
+    }
+    if -flo <= fhi {
+        f64::from_bits(lo)
+    } else {
+        f64::from_bits(hi)
+    }
+}
+
 /// Midpoint for [`illinois_root`] when false position gives no usable step: the geometric
 /// mean when the bracket excludes 0, so a bracket spanning many decades is halved in log
 /// space, and the arithmetic mean otherwise (frankenscipy-g9yid).
@@ -1545,6 +1696,11 @@ pub(crate) fn illinois_root<F: Fn(f64) -> f64>(
 /// `log|t|` only. SciPy is NaN from `|nc| ≈ 1.0145e5` for every `p` and `df` measured (Boost's
 /// series hits its term limit), while [`nctdtr`] deliberately stays finite there, and this
 /// inverse stays consistent with it and answers. The owner may revisit that choice.
+///
+/// For `p ≥ ½` the residual is the complement `q − nctdtrc` (frankenscipy-pf9eg). A root past
+/// `±f64::MAX`, which a tiny `p` has at a small `df` (the tail falls like `|t|^(−df)`), rounds
+/// to `∓∞`, and one that the walk's last step jumped past on its way to infinity is solved
+/// between that step's start and `±f64::MAX`; the walk itself returned NaN for both.
 #[must_use]
 pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
     if df.is_nan() || nc.is_nan() || p.is_nan() {
@@ -1558,17 +1714,71 @@ pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
     if p <= 0.0 || p >= 1.0 {
         return f64::INFINITY;
     }
-    let at_zero = nctdtr(df, nc, 0.0);
-    if at_zero.is_nan() {
-        return f64::NAN;
-    }
-    if at_zero == p {
-        return 0.0;
-    }
-    let guess = if at_zero < p { 1.0 } else { -1.0 };
     // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) makes the walk return NaN rather than a
     // bracket. SciPy 1.17.1: nctdtrit(5, 1.35e8, 0.5) = nan.
-    bracket_and_solve_root(|t| nctdtr(df, nc, t) - p, guess, true)
+    let q = 1.0 - p;
+    if p < q {
+        let at_zero = nctdtr(df, nc, 0.0);
+        if at_zero.is_nan() {
+            return f64::NAN;
+        }
+        if at_zero == p {
+            return 0.0;
+        }
+        let guess = if at_zero < p { 1.0 } else { -1.0 };
+        // frankenscipy-pf9eg: the residual is a log ratio, ln P(T ≤ t) − ln p. The tail falls
+        // over decades within a bracket, where `P − p` made the Illinois steps crawl, and a
+        // tiny p keeps its full relative scale.
+        let ln_p = p.ln();
+        return walk_with_overflow(|t| nctdtr(df, nc, t).ln() - ln_p, guess);
+    }
+    // frankenscipy-pf9eg: from p = ½ up the residual is Boost's complement form q − P(T > t),
+    // q = 1 − p exact. `nctdtr − p` has no digits within a few ulps of 1, and for nc < 0 the
+    // series is a difference of O(1) sums: nctdtr(41.0, −4.54, t) sits at 1 − 1.3e-15 from
+    // t = 8 to 1.3e154, so at nctdtrit(41.0, −4.54, 1 − 1.1e-16) the walk never saw a sign
+    // change and stopped where t² overflows, 1.34e154, for a root of 4.544 (SciPy 1.17.1
+    // answers 4.319, 0.049 off). P(T > t) falls with t, so the root is above 0 when
+    // P(T > 0) = Φ(nc) exceeds q. The residual is the log ratio ln q − ln P(T > t), as above.
+    let above_zero = nctdtrc(df, nc, 0.0);
+    if above_zero.is_nan() {
+        return f64::NAN;
+    }
+    if above_zero == q {
+        return 0.0;
+    }
+    let guess = if above_zero > q { 1.0 } else { -1.0 };
+    let ln_q = q.ln();
+    walk_with_overflow(|t| ln_q - nctdtrc(df, nc, t).ln(), guess)
+}
+
+/// [`bracket_and_solve_root`] for a residual rising in `t ∈ ℝ`, walked outward from `guess`,
+/// with the NaN it returns when the walk steps to infinity resolved (frankenscipy-pf9eg). The
+/// root is then `−∞` when the residual is still positive at `−f64::MAX` (it is below the double
+/// range) and `+∞` when it is still negative at `f64::MAX`. Otherwise it lies between
+/// `±f64::MAX` and `guess`, and the walk's last, overflowing step jumped past it:
+/// nctdtrit(0.896, −1.256, 3.07e-274) has its root at −1.35e305. That bracket is solved
+/// directly. A NaN residual stays NaN.
+fn walk_with_overflow(residual: impl Fn(f64) -> f64, guess: f64) -> f64 {
+    let root = bracket_and_solve_root(&residual, guess, true);
+    if !root.is_nan() {
+        return root;
+    }
+    let at_min = residual(-f64::MAX);
+    if at_min > 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let at_max = residual(f64::MAX);
+    if at_max < 0.0 {
+        return f64::INFINITY;
+    }
+    let at_guess = residual(guess);
+    if guess < 0.0 && at_min < 0.0 && at_guess > 0.0 {
+        illinois_root(&residual, -f64::MAX, guess, at_min, at_guess)
+    } else if guess > 0.0 && at_guess < 0.0 && at_max > 0.0 {
+        illinois_root(&residual, guess, f64::MAX, at_guess, at_max)
+    } else {
+        f64::NAN
+    }
 }
 
 /// Inverse of [`nctdtr`] in the non-centrality `nc`.
@@ -1926,10 +2136,21 @@ pub fn nctdtrc(df: f64, nc: f64, t: f64) -> f64 {
         return nctdtr(df, -nc, -t);
     }
     if (t * t).is_infinite() {
-        return 0.0;
+        // frankenscipy-pf9eg: t² overflows from t = 1.34e154, and this answered 0 there, though
+        // the tail is a power law, P(T > t) = E[P(df/2, df(Z + nc)²/(2t²)); Z + nc > 0]
+        // = C·t^(−df)·(1 + O((nc² + df)·df/t²)), which is far from 0 at a small df:
+        // nctdtr(1.5, 4, −1e160) is 3.9e-246 and nctdtr(0.6, 4, −1e200) 9.0e-126 (mpmath). So
+        // nctdtrit at a tiny p and a small df stopped near −1.34e154 for roots below it (SciPy
+        // 1.17.1 too). The law is scaled from t = 1e100, where the correction is
+        // (nc² + df)·df·1e-200; t = inf is 0, as before.
+        return nctdtrc_positive_t(df, nc, NCT_POWER_TAIL_ANCHOR)
+            * (NCT_POWER_TAIL_ANCHOR / t).powf(df);
     }
     nctdtrc_positive_t(df, nc, t)
 }
+
+/// The `t` from which [`nctdtrc`] scales its power-law tail once `t²` overflows.
+const NCT_POWER_TAIL_ANCHOR: f64 = 1e100;
 
 /// The share of `1 − nctdtr` below which the `nc < 0` survival leaves the subtraction for the
 /// far-tail quadrature.
@@ -8652,5 +8873,195 @@ mod tests {
         assert_eq!(crate::convenience::betaincinv_scalar(2.0, 3.0, 1.0), 1.0);
         assert_eq!(betainccinv_scalar(2.0, 3.0, 0.0), 1.0);
         assert_eq!(betainccinv_scalar(2.0, 3.0, 1.0), 0.0);
+    }
+
+    // frankenscipy-pf9eg: the noncentral quantiles in their far tails. Expected values are
+    // mpmath at 50 digits at the EXACT double arguments. Forward: chndtr and ncfdtr as the
+    // Poisson mixtures of mpmath's regularized P and I_y; nctdtr as the half-line integrals
+    // ∫₀^∞ φ(w ∓ nc)·P(df/2, df·w²/(2t²)) dw of positive integrands (quadrature on an O(1)
+    // scaled integrand, checked against Lenth's series at 60 digits plus the cancellation
+    // and 2·log₁₀|t| more: agreement to 1e-50). Inverses: a bracketed solve of ln F = ln target
+    // in ln x or asinh t, F the lower CDF when p ≤ ½ and the directly computed upper tail
+    // against q = 1 − p otherwise. Each row names the old fsci value and SciPy 1.17.1's.
+
+    /// Collect `(label, got, want, tol)` rows, relative error, and assert once so a failing run
+    /// names every row it gets wrong.
+    fn assert_rows_rel(rows: &[(&str, f64, f64, f64)]) {
+        let failures: Vec<String> = rows
+            .iter()
+            .filter(|&&(_, got, want, tol)| !(rel_err(got, want) <= tol))
+            .map(|&(label, got, want, tol)| {
+                format!(
+                    "{label}: {got:e} vs mpmath {want:e} ({:.1e} > {tol:e})",
+                    rel_err(got, want)
+                )
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The bead's rows and their neighbours. Old fsci: nctdtrit 1.34e154 (where t² overflows)
+    /// for 4.544 and 1.2e-7 off at 44.545 as p → 1; chndtrix 8.8e14 and ncfdtri 184 relatively
+    /// off at p = 1.07e-288 and 2.27e-209; nctdtrit −9.48e153 for −1e200. SciPy 1.17.1: 4.319
+    /// (0.049 off), 1.2e-16, 1.5e-14, 1.9e-17 and −1.34e154.
+    #[test]
+    fn noncentral_quantiles_hold_the_far_tails_to_mpmath() {
+        use crate::gamma::chndtrix;
+        use std::hint::black_box as bb;
+        assert_rows_rel(&[
+            (
+                "nctdtrit(41.00, −4.539, 1 − 1.1e-16)",
+                nctdtrit(
+                    bb(41.00350098949703),
+                    bb(-4.538791383625849),
+                    bb(0.9999999999999999),
+                ),
+                4.5439587189359157787,
+                1e-13,
+            ),
+            (
+                "nctdtrit(10, 2, 1 − 1e-10)",
+                nctdtrit(bb(10.0), bb(2.0), bb(0.9999999999)),
+                44.545259153093121791,
+                1e-13,
+            ),
+            (
+                "chndtrix(1.07e-288, 12.24, 8.933)",
+                chndtrix(
+                    bb(1.0699288839087942e-288),
+                    bb(12.23652729041813),
+                    bb(8.932733201800394),
+                ),
+                1.0801914838668329684e-46,
+                1e-13,
+            ),
+            (
+                "ncfdtri(16.70, 30.64, 12.01, 2.27e-209)",
+                ncfdtri(
+                    bb(16.69763840708478),
+                    bb(30.641944574166274),
+                    bb(12.011603965188105),
+                    bb(2.271600371331527e-209),
+                ),
+                7.9610195724434932075e-26,
+                1e-13,
+            ),
+            (
+                "nctdtrit(1.5, 4, 3.89e-306)",
+                nctdtrit(bb(1.5), bb(4.0), bb(3.892703197308629e-306)),
+                -9.9999999999999995369e199,
+                1e-13,
+            ),
+            // The walk's last step overflowed to −∞ past this root, and it returned NaN until
+            // `walk_with_overflow` solved the remaining bracket (old fsci and SciPy −1.34e154).
+            (
+                "nctdtrit(0.896, −1.256, 3.07e-274)",
+                nctdtrit(
+                    bb(0.8963453109640671),
+                    bb(-1.2559812320563042),
+                    bb(3.0688420693564726e-274),
+                ),
+                -1.346503779438500671642e305,
+                1e-13,
+            ),
+        ]);
+    }
+
+    /// The forward kernels at those roots. Old fsci: chndtr and ncfdtr 0 (their mode anchors
+    /// underflowed: P(10.12, 5.4e-47) = 1.5e-475), nctdtr 0 once t² overflows. SciPy 1.17.1:
+    /// 1.2e-13 and 1.1e-15 off, and 0 for both nctdtr rows.
+    #[test]
+    fn noncentral_cdfs_hold_the_bottom_of_the_range_to_mpmath() {
+        use crate::gamma::chndtr;
+        use std::hint::black_box as bb;
+        assert_rows_rel(&[
+            (
+                "chndtr(1.08e-46, 12.24, 8.933)",
+                chndtr(
+                    bb(1.080191483866833e-46),
+                    bb(12.23652729041813),
+                    bb(8.932733201800394),
+                ),
+                1.06992888390879452e-288,
+                1e-12,
+            ),
+            (
+                "ncfdtr(16.70, 30.64, 12.01, 7.96e-26)",
+                ncfdtr(
+                    bb(16.69763840708478),
+                    bb(30.641944574166274),
+                    bb(12.011603965188105),
+                    bb(7.961019572443493e-26),
+                ),
+                2.2716003713315273495e-209,
+                1e-12,
+            ),
+            (
+                "nctdtr(0.6, 4, −1e200)",
+                nctdtr(bb(0.6), bb(4.0), bb(-1e200)),
+                9.0411313021702910675e-126,
+                1e-12,
+            ),
+            (
+                "nctdtr(1.5, 4, −1e160)",
+                nctdtr(bb(1.5), bb(4.0), bb(-1e160)),
+                3.8927031973086288468e-246,
+                1e-12,
+            ),
+        ]);
+    }
+
+    /// Roots outside the normal range. chndtrix(5.75e-144, 0.754, 16.14) has its root at
+    /// 3.8e-371, which rounds to 0; chndtrix(3.47e-121, …) at 1e-310 and ncfdtri(0.9, 20, 3,
+    /// 6.92e-142) at 1e-312, subnormals; nctdtrit(0.6, 4, 1e-250) below −f64::MAX, since
+    /// nctdtr(0.6, 4, −f64::MAX) = 1.0e-190. Old fsci: 1.8e-38 for both chndtrix rows, 1.7e-223
+    /// and −9.48e153. SciPy 1.17.1: 5.6e-309, NaN, 3.2e-310 and −1.34e154.
+    #[test]
+    fn noncentral_quantiles_round_roots_outside_the_normal_range() {
+        use crate::gamma::chndtrix;
+        use std::hint::black_box as bb;
+        // A subnormal root is only as good as the kernel's own subnormal intermediates: x/2,
+        // dfn·f and y = dfn·f/(dfn·f + dfd) keep about 33 bits at 1e-313, and x/2 of the smallest
+        // subnormal rounds to 0. So 1e-9 relative, or two subnormal spacings from 0.
+        let near = |got: f64, want: f64| {
+            (got - want).abs() <= (1e-9 * want.abs()).max(2.0 * f64::from_bits(1))
+        };
+        let rows = [
+            (
+                "chndtrix(5.75e-144, 0.754, 16.14)",
+                chndtrix(
+                    bb(5.754276415107772e-144),
+                    bb(0.7541427375717873),
+                    bb(16.140611578165263),
+                ),
+                0.0,
+            ),
+            (
+                "chndtrix(3.47e-121, 0.754, 16.14)",
+                chndtrix(
+                    bb(3.4729190563154213e-121),
+                    bb(0.7541427375717873),
+                    bb(16.140611578165263),
+                ),
+                9.9999999999999687895e-311,
+            ),
+            (
+                "ncfdtri(0.9, 20, 3, 6.92e-142)",
+                ncfdtri(bb(0.9), bb(20.0), bb(3.0), bb(6.916001443379828e-142)),
+                9.9999999999846557158e-313,
+            ),
+        ];
+        let mut failures: Vec<String> = rows
+            .iter()
+            .filter(|&&(_, got, want)| !near(got, want))
+            .map(|&(label, got, want)| format!("{label}: {got:e}, mpmath {want:e}"))
+            .collect();
+        let beyond = nctdtrit(bb(0.6), bb(4.0), bb(1e-250));
+        if beyond != f64::NEG_INFINITY {
+            failures.push(format!(
+                "nctdtrit(0.6, 4, 1e-250): {beyond:e}, the root is below −f64::MAX"
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
