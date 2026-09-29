@@ -179,9 +179,14 @@ struct CaspChoice {
     mode: RuntimeMode,
     /// The action that produced the answer (the fallback, when there was one).
     action: SolverAction,
+    /// The portfolio's own choice ([`PortfolioDecision::action`]).
+    portfolio_action: SolverAction,
+    /// The action attempted first ([`PortfolioDecision::first_attempt`]): in Strict mode
+    /// SciPy's own factorization for the structure, whatever the portfolio chose.
+    first_attempt: SolverAction,
     posterior: [f64; 4],
     expected_losses: [f64; 6],
-    /// Whether `action` is a fallback from the action first selected.
+    /// Whether `action` is a fallback from `first_attempt`.
     fallback: bool,
     rcond: f64,
     structure: StructuralEvidence,
@@ -190,11 +195,19 @@ struct CaspChoice {
 /// Record a CASP solver choice: the portfolio, the real mode, the action, the posterior, every
 /// action's expected loss and the chosen one's, and the rcond and structure that drove it. It
 /// used to be a `ModeDecision` that always said Strict and carried the action and rcond only.
+/// The evidence also names the portfolio's own choice and the first attempt, so a Strict answer
+/// that SciPy's order put ahead of the portfolio's choice does not read as the portfolio's
+/// selection (frankenscipy-7tb8d.14).
 fn record_casp_decision(ledger: &SyncSharedAuditLedger, fingerprint: &str, choice: CaspChoice) {
     let outcome = if choice.fallback {
         format!(
-            "CASP fallback to {:?} (rcond={:.2e})",
-            choice.action, choice.rcond
+            "CASP fallback to {:?} after {:?} (rcond={:.2e})",
+            choice.action, choice.first_attempt, choice.rcond
+        )
+    } else if choice.first_attempt != choice.portfolio_action {
+        format!(
+            "SciPy's {:?} ahead of the CASP choice {:?} (rcond={:.2e})",
+            choice.action, choice.portfolio_action, choice.rcond
         )
     } else {
         format!(
@@ -218,6 +231,14 @@ fn record_casp_decision(ledger: &SyncSharedAuditLedger, fingerprint: &str, choic
                 (
                     "structural_evidence".to_string(),
                     format!("{:?}", choice.structure).into(),
+                ),
+                (
+                    "portfolio_action".to_string(),
+                    format!("{:?}", choice.portfolio_action).into(),
+                ),
+                (
+                    "first_attempt".to_string(),
+                    format!("{:?}", choice.first_attempt).into(),
                 ),
             ]),
         },
@@ -541,15 +562,45 @@ pub struct PortfolioDecision {
     /// Strict mode, the SVD `lstsq` and `pinv` always use, or a fallback. The result is the
     /// certificate's `action`.
     pub action: SolverAction,
+    /// The action `solve` / `inv` attempted first (frankenscipy-7tb8d.14): SciPy's own
+    /// factorization for the structure when [`Self::scipy_route_first`], else the portfolio's
+    /// `action`. The certificate's `action` is this one unless its `fallback_active` says a later
+    /// attempt answered. `None` for `lstsq` and `pinv`, which run their own action without
+    /// attempting the portfolio's.
+    pub first_attempt: Option<SolverAction>,
+    /// Strict mode `solve` / `inv`: the first attempt was SciPy's own factorization for the
+    /// structure (LU on a general matrix), whatever the portfolio chose, and the portfolio's
+    /// order only resumed if it failed its certificate. `false` in Hardened mode, where the
+    /// portfolio's choice goes first, and for `lstsq` and `pinv`.
+    pub scipy_route_first: bool,
     /// [`SolverPortfolio::state_digest`] of the portfolio when it decided.
     pub state_digest: String,
 }
 
 impl PortfolioDecision {
-    /// `portfolio`'s choice of `action`, read before anything records into it.
+    /// `portfolio`'s choice of `action`, read before anything records into it, for a routine
+    /// that runs its own action rather than attempting the portfolio's (`lstsq`, `pinv`).
     fn of(portfolio: &SolverPortfolio, action: SolverAction) -> Self {
         Self {
             action,
+            first_attempt: None,
+            scipy_route_first: false,
+            state_digest: portfolio.state_digest(),
+        }
+    }
+
+    /// `portfolio`'s choice of `action` for `solve` / `inv`, which attempt actions in turn and
+    /// attempted `first_attempt` ([`strict_order_action`] of that choice in `mode`) first.
+    fn ordered(
+        portfolio: &SolverPortfolio,
+        action: SolverAction,
+        first_attempt: SolverAction,
+        mode: RuntimeMode,
+    ) -> Self {
+        Self {
+            action,
+            first_attempt: Some(first_attempt),
+            scipy_route_first: mode == RuntimeMode::Strict,
             state_digest: portfolio.state_digest(),
         }
     }
@@ -568,7 +619,11 @@ pub struct ReplayReport {
 /// Replay a certificate's CASP decision against a snapshot of the portfolio that made it
 /// (frankenscipy-7tb8d.12). The snapshot's `select_action` is fed the certificate's rcond
 /// estimate and structural evidence, and must give back the recorded portfolio choice, the
-/// posterior, every action's expected loss and the chosen action's, bit for bit.
+/// posterior, every action's expected loss and the chosen action's, bit for bit. Where the
+/// certificate records a first attempt (`solve`, `inv`), it must be the one its order implies
+/// from that choice, SciPy's route for the structure when `scipy_route_first` and the replayed
+/// choice otherwise, and `fallback_active` must say whether the answering action differs from it
+/// (frankenscipy-7tb8d.14).
 ///
 /// A snapshot whose [`SolverPortfolio::state_digest`] differs from the certificate's is
 /// refused: its outcome counts, calibration or mode differ, so a replay would compute another
@@ -621,6 +676,26 @@ pub fn replay_decision(certificate: &SolveCertificate, snapshot: &SolverPortfoli
             certificate.chosen_expected_loss,
             certificate.chosen_expected_loss.to_bits()
         ));
+    }
+    if let Some(first) = certificate.decision.first_attempt {
+        let ordered = if certificate.decision.scipy_route_first {
+            scipy_route(certificate.structural_evidence)
+        } else {
+            action
+        };
+        if first != ordered {
+            mismatches.push(format!(
+                "first attempt {first:?}, but the order (scipy_route_first = {}) puts {ordered:?} \
+                 first after the portfolio's {action:?}",
+                certificate.decision.scipy_route_first
+            ));
+        }
+        if certificate.fallback_active != (certificate.action != first) {
+            mismatches.push(format!(
+                "fallback_active {} with action {:?} after first attempt {first:?}",
+                certificate.fallback_active, certificate.action
+            ));
+        }
     }
     ReplayReport {
         replayed: mismatches.is_empty(),
@@ -2855,14 +2930,32 @@ pub fn verify_solve_certificate(
     }
 }
 
+/// The factorization SciPy's own `solve` / `inv` run for a structure, as SciPy's `assume_a`
+/// gives it or its `assume_a=None` detection finds it: LU (getrf) for a general matrix, the
+/// symmetric factorization (Cholesky, then Bunch–Kaufman LDLᵀ, per the assumption) for a
+/// symmetric one, and the diagonal / triangular solves for those structures.
+fn scipy_route(structural_evidence: StructuralEvidence) -> SolverAction {
+    match structural_evidence {
+        StructuralEvidence::General => SolverAction::DirectLU,
+        StructuralEvidence::Diagonal => SolverAction::DiagonalFastPath,
+        StructuralEvidence::Triangular => SolverAction::TriangularFastPath,
+        StructuralEvidence::Symmetric => SolverAction::SymmetricFastPath,
+    }
+}
+
 /// The action `solve` / `inv` try next, given the posterior's `candidate` and the actions
 /// already `tried`. Strict mode maximizes observable compatibility, so it follows SciPy's order
-/// rather than the posterior's: the symmetric factorization first on symmetric evidence
-/// (exact symmetry under `assume_a=None`, or 'sym' / 'her' / 'pos'), then LU (getrf) at every
-/// conditioning, and QR / SVD only once LU has failed its backward-error certificate. On a
-/// non-symmetric matrix at rcond 2.5e-5 the posterior's QR is not SciPy's answer; on
-/// Hilbert(6) SciPy's Cholesky is 1.8e-8 from the exact solution, where the posterior's QR was
-/// 7.6e-7 away from it (frankenscipy-7tb8d.14). Hardened mode keeps the posterior's choice.
+/// rather than the posterior's: SciPy's own factorization for the structure first
+/// ([`scipy_route`]: the symmetric factorization on symmetric evidence, exact symmetry under
+/// `assume_a=None` or 'sym' / 'her' / 'pos'; LU on a general matrix; the diagonal / triangular
+/// solve), then LU (getrf), and QR / SVD only once those have failed their backward-error
+/// certificate. That holds whatever the portfolio chose: its calibrator's drift override sends
+/// every decision to the SVD, and recorded failures can rank QR first. On a non-symmetric
+/// matrix at rcond 2.5e-5 the posterior's QR is not SciPy's answer; on Hilbert(6) SciPy's
+/// Cholesky is 1.8e-8 from the exact solution, where the posterior's QR was 7.6e-7 away from it
+/// (frankenscipy-7tb8d.14). Hardened mode keeps the posterior's choice. With nothing tried yet
+/// this is the solve's first attempt, which its certificate records
+/// ([`PortfolioDecision::first_attempt`]).
 ///
 /// Where Strict still departs from SciPy's structure dispatch (frankenscipy-7tb8d.15):
 /// - n ≥ [`solve_flat_min`] / [`inv_flat_min`]: a symmetric matrix that is not positive
@@ -2882,10 +2975,9 @@ fn strict_order_action(
     if mode != RuntimeMode::Strict {
         return candidate;
     }
-    if structural_evidence == StructuralEvidence::Symmetric
-        && !tried.contains(&SolverAction::SymmetricFastPath)
-    {
-        return SolverAction::SymmetricFastPath;
+    let route = scipy_route(structural_evidence);
+    if !tried.contains(&route) {
+        return route;
     }
     if matches!(
         candidate,
@@ -3324,7 +3416,8 @@ fn solve_with_portfolio_internal(
         &[],
     );
 
-    let decision = PortfolioDecision::of(portfolio, posterior_action);
+    let decision =
+        PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3543,7 +3636,8 @@ fn solve_audited(
         &[],
     );
 
-    let decision = PortfolioDecision::of(portfolio, posterior_action);
+    let decision =
+        PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3572,6 +3666,8 @@ fn solve_audited(
         CaspChoice {
             mode: options.mode,
             action: actual_action,
+            portfolio_action: posterior_action,
+            first_attempt: selected_action,
             posterior,
             expected_losses,
             fallback: fallback_active,
@@ -3673,13 +3769,14 @@ pub fn inv_with_casp(
 
     let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
-    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let selected_action = strict_order_action(
         options.mode,
         report.structural_evidence,
         posterior_action,
         &[],
     );
+    let decision =
+        PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
 
     // For inv, we try actions in order of expected loss
     let mut actions = vec![
@@ -29159,6 +29256,8 @@ mod tests {
             CaspChoice {
                 mode: RuntimeMode::Strict,
                 action: SolverAction::DirectLU,
+                portfolio_action: SolverAction::DirectLU,
+                first_attempt: SolverAction::DirectLU,
                 posterior: [1.0, 0.0, 0.0, 0.0],
                 expected_losses: [1.0; 6],
                 fallback: false,
@@ -30713,6 +30812,220 @@ mod tests {
             .certificate
             .expect("certificate");
         assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
+    }
+
+    /// A Strict or Hardened portfolio whose calibrator has drifted (its accepted answers
+    /// missed), so that its own choice is the SVD at every conditioning and structure.
+    fn drifted_portfolio(mode: RuntimeMode) -> SolverPortfolio {
+        let mut portfolio = SolverPortfolio::new(mode, 64);
+        for _ in 0..20 {
+            portfolio.observe_backward_error(1.0);
+        }
+        assert!(portfolio.calibrator().should_fallback());
+        portfolio
+    }
+
+    /// frankenscipy-7tb8d.14: Strict `solve_with_casp` / `solve_with_audit` / `inv_with_casp`
+    /// attempt SciPy's own factorization for the structure FIRST, whatever the portfolio chose,
+    /// and their certificate, replay and audit say so; Hardened keeps the portfolio's choice.
+    /// On a fresh portfolio the calibrated losses (7tb8d.2) already choose SciPy's route, so the
+    /// fresh-portfolio tests above cannot see the ordering. Here the portfolio has drifted and
+    /// its own choice is the SVD, as the bead's hand-set losses once made it QR on Hilbert(6).
+    #[test]
+    fn strict_casp_attempts_scipys_route_before_the_portfolio_choice() {
+        let h = hilbert(6);
+        let ones = [1.0; 6];
+        // H6⁻¹·1, exactly.
+        let exact = [-6.0, 210.0, -1_680.0, 5_040.0, -6_300.0, 2_772.0];
+        let error = |x: &[f64]| {
+            x.iter()
+                .zip(exact)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0_f64, f64::max)
+        };
+        let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let action_errors: Vec<(SolverAction, f64)> = [
+            SolverAction::DirectLU,
+            SolverAction::PivotedQR,
+            SolverAction::SVDFallback,
+            SolverAction::SymmetricFastPath,
+        ]
+        .into_iter()
+        .map(|action| {
+            let x = solve_with_action(&h, &ones, action)
+                .expect("action solves")
+                .x;
+            (action, error(&x))
+        })
+        .collect();
+        println!("hilbert(6)·x = 1, max |x - exact| per action: {action_errors:?}");
+        // Must-miss arm of the 1e-7 bound below: every action but SciPy's Cholesky misses it
+        // (measured on hz4: LU 6.6e-7, QR 7.0e-7, SVD 5.5e-7, Cholesky 1.9e-8), so the bound
+        // tells SciPy's route from each of the portfolio's alternatives, LU included.
+        for (action, action_error) in &action_errors {
+            if *action != SolverAction::SymmetricFastPath {
+                assert!(*action_error > 1e-7, "{action:?} error {action_error:e}");
+            }
+        }
+
+        // Strict: SciPy's Cholesky, although the portfolio chose the SVD.
+        let mut strict = drifted_portfolio(RuntimeMode::Strict);
+        let snapshot = strict.clone();
+        let result =
+            solve_with_casp(&h, &ones, SolveOptions::default(), &mut strict).expect("solve");
+        let certificate = result.certificate.clone().expect("certificate");
+        assert_eq!(certificate.decision.action, SolverAction::SVDFallback);
+        assert_eq!(
+            certificate.decision.first_attempt,
+            Some(SolverAction::SymmetricFastPath)
+        );
+        assert!(certificate.decision.scipy_route_first);
+        assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
+        assert!(!certificate.fallback_active);
+        assert!(error(&result.x) <= 1e-7, "x = {:?}", result.x);
+
+        // The replay checks the order too: the certificate replays, one claiming the
+        // portfolio's SVD went first does not, nor one calling the answer a fallback.
+        let replay = replay_decision(&certificate, &snapshot);
+        assert!(replay.replayed, "{}", replay.reason);
+        let mut claimed = certificate.clone();
+        claimed.decision.first_attempt = Some(SolverAction::SVDFallback);
+        let refused = replay_decision(&claimed, &snapshot);
+        assert!(
+            !refused.replayed && refused.reason.contains("first attempt"),
+            "{}",
+            refused.reason
+        );
+        let mut flipped = certificate.clone();
+        flipped.fallback_active = true;
+        let refused = replay_decision(&flipped, &snapshot);
+        assert!(
+            !refused.replayed && refused.reason.contains("fallback_active"),
+            "{}",
+            refused.reason
+        );
+
+        // `solve_with_audit`: the same answer, and an audit event that names the portfolio's
+        // choice next to the action that ran.
+        let audit_ledger = sync_audit_ledger();
+        let mut audited_portfolio = drifted_portfolio(RuntimeMode::Strict);
+        let audited = solve_with_audit(
+            &h,
+            &ones,
+            SolveOptions::default(),
+            &mut audited_portfolio,
+            &audit_ledger,
+        )
+        .expect("audited solve");
+        assert_eq!(bits(&audited.x), bits(&result.x));
+        {
+            let ledger = lock_audit_ledger(&audit_ledger);
+            let event = ledger
+                .entries()
+                .iter()
+                .find(|event| matches!(event.action, AuditAction::CaspDecision { .. }))
+                .expect("a CASP decision event");
+            let AuditAction::CaspDecision {
+                action,
+                fallback,
+                evidence,
+                ..
+            } = &event.action
+            else {
+                unreachable!("found as CaspDecision");
+            };
+            assert_eq!(action, "SymmetricFastPath");
+            assert!(!fallback);
+            assert_eq!(
+                evidence["portfolio_action"],
+                fsci_runtime::EvidenceValue::Label("SVDFallback".to_string())
+            );
+            assert_eq!(
+                evidence["first_attempt"],
+                fsci_runtime::EvidenceValue::Label("SymmetricFastPath".to_string())
+            );
+            assert!(event.outcome.contains("ahead of"), "{}", event.outcome);
+        }
+
+        // `inv`: SciPy's Cholesky inverse first as well.
+        let inverse = inv_with_casp(
+            &h,
+            InvOptions::default(),
+            &mut drifted_portfolio(RuntimeMode::Strict),
+        )
+        .expect("inv");
+        let inverse_certificate = inverse.certificate.expect("certificate");
+        assert_eq!(inverse_certificate.action, SolverAction::SymmetricFastPath);
+        assert_eq!(
+            inverse_certificate.decision.first_attempt,
+            Some(SolverAction::SymmetricFastPath)
+        );
+
+        // One ulp of asymmetry: a general matrix, so LU (getrf) first, bit for bit the LU action.
+        let mut skew = h.clone();
+        skew[0][5] = f64::from_bits(skew[0][5].to_bits() + 1);
+        let result = solve_with_casp(
+            &skew,
+            &ones,
+            SolveOptions::default(),
+            &mut drifted_portfolio(RuntimeMode::Strict),
+        )
+        .expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(certificate.decision.action, SolverAction::SVDFallback);
+        assert_eq!(
+            certificate.decision.first_attempt,
+            Some(SolverAction::DirectLU)
+        );
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+        let lu = solve_with_action(&skew, &ones, SolverAction::DirectLU).expect("LU");
+        assert_eq!(bits(&result.x), bits(&lu.x));
+
+        // Diagonal: SciPy's `b·(1/d)`, not LU's `b/d`. Must-differ arm: the two disagree in the
+        // last bit on 5/3, so the bit comparison can tell them apart.
+        let d = [3.0, 7.0, 0.1, 49.0];
+        let rhs = [5.0; 4];
+        let diagonal: Vec<Vec<f64>> = (0..4)
+            .map(|i| (0..4).map(|j| if i == j { d[i] } else { 0.0 }).collect())
+            .collect();
+        assert_ne!((5.0_f64 / 3.0).to_bits(), (5.0 * (1.0 / 3.0_f64)).to_bits());
+        let result = solve_with_casp(
+            &diagonal,
+            &rhs,
+            SolveOptions::default(),
+            &mut drifted_portfolio(RuntimeMode::Strict),
+        )
+        .expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(certificate.action, SolverAction::DiagonalFastPath);
+        assert_eq!(
+            certificate.decision.first_attempt,
+            Some(SolverAction::DiagonalFastPath)
+        );
+        let scipy: Vec<f64> = rhs.iter().zip(d).map(|(b, d)| b * (1.0 / d)).collect();
+        assert_eq!(bits(&result.x), bits(&scipy));
+
+        // Hardened keeps the portfolio's choice: the SVD, attempted first, not a fallback.
+        let hardened_options = SolveOptions {
+            mode: RuntimeMode::Hardened,
+            ..SolveOptions::default()
+        };
+        let mut hardened = drifted_portfolio(RuntimeMode::Hardened);
+        let hardened_snapshot = hardened.clone();
+        let result =
+            solve_with_casp(&h, &ones, hardened_options, &mut hardened).expect("hardened solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(certificate.action, SolverAction::SVDFallback);
+        assert_eq!(
+            certificate.decision.first_attempt,
+            Some(SolverAction::SVDFallback)
+        );
+        assert!(!certificate.decision.scipy_route_first);
+        assert!(!certificate.fallback_active);
+        let svd = solve_with_action(&h, &ones, SolverAction::SVDFallback).expect("svd");
+        assert_eq!(bits(&result.x), bits(&svd.x));
+        let replay = replay_decision(&certificate, &hardened_snapshot);
+        assert!(replay.replayed, "{}", replay.reason);
     }
 
     /// `Pᵀ·diag(-1, 1, 1, -1)·P` with `P` unit upper triangular and integer: symmetric
@@ -42105,6 +42418,24 @@ mod tests {
                     certificate.structural_evidence
                 ))
             );
+            // frankenscipy-7tb8d.14: the portfolio's own choice and the first attempt, as the
+            // certificate's decision records them.
+            assert_eq!(
+                evidence["portfolio_action"],
+                fsci_runtime::EvidenceValue::Label(format!("{:?}", certificate.decision.action))
+            );
+            let first = certificate
+                .decision
+                .first_attempt
+                .expect("solve records its first attempt");
+            assert_eq!(
+                evidence["first_attempt"],
+                fsci_runtime::EvidenceValue::Label(format!("{first:?}"))
+            );
+            assert_eq!(
+                certificate.decision.scipy_route_first,
+                mode == RuntimeMode::Strict
+            );
         }
     }
 
@@ -44241,6 +44572,7 @@ mod proptest_tests {
             .collect();
         let b: Vec<f64> = (0..n).map(|i| (i as f64).cos()).collect();
         let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let snapshot = portfolio.clone();
         let result =
             solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solves");
         let certificate = result.certificate.as_ref().expect("certificate");
@@ -44264,6 +44596,50 @@ mod proptest_tests {
             (counts.iter().sum::<f64>() - 2.0).abs() < 1e-12,
             "{counts:?}"
         );
+        // frankenscipy-7tb8d.14: the evidence says LU (SciPy's route) went first and the answer
+        // is the fallback, and the replay agrees.
+        assert_eq!(
+            certificate.decision.first_attempt,
+            Some(SolverAction::DirectLU)
+        );
+        assert!(certificate.decision.scipy_route_first);
+        let replay = replay_decision(certificate, &snapshot);
+        assert!(replay.replayed, "{}", replay.reason);
+        let mut flipped = certificate.clone();
+        flipped.fallback_active = false;
+        assert!(!replay_decision(&flipped, &snapshot).replayed);
+        let audit_ledger = sync_audit_ledger();
+        let mut audited_portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        solve_with_audit(
+            &a,
+            &b,
+            SolveOptions::default(),
+            &mut audited_portfolio,
+            &audit_ledger,
+        )
+        .expect("audited solve");
+        let ledger = audit_ledger.lock().expect("audit ledger");
+        let event = ledger
+            .entries()
+            .iter()
+            .find(|event| matches!(event.action, AuditAction::CaspDecision { .. }))
+            .expect("a CASP decision event");
+        let AuditAction::CaspDecision {
+            action,
+            fallback,
+            evidence,
+            ..
+        } = &event.action
+        else {
+            unreachable!("found as CaspDecision");
+        };
+        assert_eq!(action, &format!("{:?}", certificate.action));
+        assert!(*fallback);
+        assert_eq!(
+            evidence["first_attempt"],
+            fsci_runtime::EvidenceValue::Label("DirectLU".to_string())
+        );
+        assert!(event.outcome.contains("fallback"), "{}", event.outcome);
     }
 
     // br-szq1n.12: `driver` was never read. SciPy 1.17.1, lstsq([[1,0],[0,1],[1,1]], [1,2,4]):
