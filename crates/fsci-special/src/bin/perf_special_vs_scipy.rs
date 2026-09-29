@@ -80,11 +80,14 @@ fn incumbent() -> &'static ScipyIncumbent {
 }
 use fsci_special::{
     SpecialError, SpecialErrorKind, SpecialTensor, bei, beip, ber, berp, beta, betainc, betaln,
-    cbrt, cosdg, cosm1, cotdg, dawsn, digamma, ellipe, ellipk, ellipkm1, entr, erf, erfc, erfcinv,
-    erfcx, erfi, erfinv, exp1, expi, expit, exprel, gamma, gammainc, gammaincc, gammaln, gammasgn,
-    hyp0f1, i0, i0e, i1, i1e, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e, kei, keip, ker, kerp,
-    kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit, ndtr, ndtri, ndtri_exp,
-    rgamma, sindg, spence, tandg, wrightomega, y0, y1, yn, yv, yve, zeta, zetac,
+    binom, boxcox, boxcox1p, cbrt, chdtr, chdtrc, chdtri, cosdg, cosm1, cotdg, dawsn, digamma,
+    ellipe, ellipeinc, ellipk, ellipkinc, ellipkm1, entr, erf, erfc, erfcinv, erfcx, erfi, erfinv,
+    exp1, expi, expit, expn, exprel, gamma, gammainc, gammaincc, gammaln, gammasgn, huber, hyp0f1,
+    i0, i0e, i1, i1e, inv_boxcox, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e, kei, keip, ker,
+    kerp, kl_div, kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit,
+    modstruve, ndtr, ndtri, ndtri_exp, owens_t, pdtr, pdtrc, pdtri, poch, pseudo_huber, rel_entr,
+    rgamma, sindg, smirnov, smirnovi, spence, stdtr, stdtrit, struve, tandg, tklmbda, wrightomega,
+    xlog1py, xlogy, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -130,8 +133,14 @@ for line in sys.stdin.buffer:
         diff = np.abs(ours[finite] - ref[finite])
         rel = diff / np.maximum(np.abs(ref[finite]), np.finfo(np.float64).tiny)
         mismatched = int(np.sum(np.isfinite(ref) != np.isfinite(ours)))
-        print(f'CHECK max_abs={np.max(diff):.17e} max_rel={np.max(rel):.17e} '
-              f'compared={int(finite.sum())} nonfinite_mismatch={mismatched}', flush=True)
+        # initial=0.0: an op with NO point finite on both sides used to crash np.max here and
+        # print no CHECK line at all. It now reports compared=0 with the non-finite counts of
+        # each side, so the row says which side is wrong instead of silently going blank.
+        print(f'CHECK max_abs={np.max(diff, initial=0.0):.17e} '
+              f'max_rel={np.max(rel, initial=0.0):.17e} '
+              f'compared={int(finite.sum())} nonfinite_mismatch={mismatched} '
+              f'ref_nonfinite={int((~np.isfinite(ref)).sum())} '
+              f'ours_nonfinite={int((~np.isfinite(ours)).sum())}', flush=True)
     elif cmd[0] == 'quit':
         break
     else:
@@ -345,6 +354,34 @@ const CASES2: &[(&str, f64, f64, f64, f64)] = &[
     ("yve", 0.0, 10.0, 0.5, 30.0),
     ("ive", 0.0, 5.0, 0.1, 12.0),
     ("kve", 0.0, 5.0, 0.1, 12.0),
+    // Widened: Struve, the chi-square / Student t / Poisson distribution family and their
+    // inverses, Owen's T, the incomplete elliptic integrals (m >= 0: Hardened refuses m < 0),
+    // Pochhammer and binom, and the log/entropy/Box-Cox/Huber helpers.
+    ("struve", -2.0, 10.0, 0.0, 30.0),
+    ("modstruve", -2.0, 10.0, 0.0, 20.0),
+    ("chdtr", 0.5, 20.0, 0.0, 40.0),
+    ("chdtrc", 0.5, 20.0, 0.0, 40.0),
+    ("chdtri", 0.5, 20.0, 0.001, 0.999),
+    ("stdtr", 0.5, 30.0, -10.0, 10.0),
+    ("stdtrit", 0.5, 30.0, 0.001, 0.999),
+    ("pdtr", 0.0, 30.0, 0.0, 40.0),
+    ("pdtrc", 0.0, 30.0, 0.0, 40.0),
+    ("pdtri", 0.0, 30.0, 0.001, 0.999),
+    ("owens_t", -5.0, 5.0, -5.0, 5.0),
+    ("ellipkinc", -3.0, 3.0, 0.0, 0.99),
+    ("ellipeinc", -3.0, 3.0, 0.0, 0.99),
+    ("poch", 0.1, 20.0, -5.0, 5.0),
+    ("binom", 0.0, 50.0, 0.0, 50.0),
+    ("tklmbda", -10.0, 10.0, -1.0, 2.0),
+    ("xlogy", 0.0, 10.0, 0.001, 10.0),
+    ("xlog1py", 0.0, 10.0, -0.999, 10.0),
+    ("boxcox", 0.001, 50.0, -3.0, 3.0),
+    ("boxcox1p", -0.999, 50.0, -3.0, 3.0),
+    ("inv_boxcox", -2.0, 5.0, -3.0, 3.0),
+    ("kl_div", 0.0, 10.0, 0.001, 10.0),
+    ("rel_entr", 0.0, 10.0, 0.001, 10.0),
+    ("huber", 0.1, 5.0, -10.0, 10.0),
+    ("pseudo_huber", 0.1, 5.0, -10.0, 10.0),
 ];
 
 /// Integer-order siblings, kept apart because their first argument is quantised.
@@ -352,6 +389,9 @@ const CASES2_INTEGER_ORDER: &[(&str, f64, f64, f64, f64)] = &[
     ("jn", 0.0, 10.0, 0.5, 20.0),
     ("yn", 0.0, 10.0, 0.5, 20.0),
     ("kn", 0.0, 10.0, 0.1, 12.0),
+    ("expn", 0.0, 20.0, 0.01, 30.0),
+    ("smirnov", 1.0, 200.0, 0.0, 1.0),
+    ("smirnovi", 1.0, 200.0, 0.001, 0.999),
 ];
 
 /// Dispatch to our two-argument entry point for `op`.
@@ -374,7 +414,56 @@ fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::S
         "jn" => jn(a, b, mode),
         "yn" => yn(a, b, mode),
         "kn" => kn(a, b, mode),
+        "owens_t" => owens_t(a, b, mode),
+        "ellipkinc" => ellipkinc(a, b, mode),
+        "ellipeinc" => ellipeinc(a, b, mode),
+        "xlogy" => xlogy(a, b, mode),
+        "xlog1py" => xlog1py(a, b, mode),
+        "boxcox" => boxcox(a, b, mode),
+        "boxcox1p" => boxcox1p(a, b, mode),
+        "inv_boxcox" => inv_boxcox(a, b, mode),
+        "rel_entr" => rel_entr(a, b, mode),
+        "huber" => huber(a, b, mode),
+        "pseudo_huber" => pseudo_huber(a, b, mode),
+        "struve" => scalar_map2(a, b, struve),
+        "modstruve" => scalar_map2(a, b, modstruve),
+        "chdtr" => scalar_map2(a, b, chdtr),
+        "chdtrc" => scalar_map2(a, b, chdtrc),
+        "chdtri" => scalar_map2(a, b, chdtri),
+        "stdtr" => scalar_map2(a, b, stdtr),
+        "stdtrit" => scalar_map2(a, b, stdtrit),
+        "pdtr" => scalar_map2(a, b, pdtr),
+        "pdtrc" => scalar_map2(a, b, pdtrc),
+        "pdtri" => scalar_map2(a, b, pdtri),
+        "poch" => scalar_map2(a, b, poch),
+        "binom" => scalar_map2(a, b, binom),
+        "tklmbda" => scalar_map2(a, b, tklmbda),
+        "kl_div" => scalar_map2(a, b, kl_div),
+        // Integer-order cases: the fixture floors the first argument, so the casts are exact.
+        "expn" => scalar_map2(a, b, |n, x| expn(n as usize, x)),
+        "smirnov" => scalar_map2(a, b, |n, d| smirnov(n as i32, d)),
+        "smirnovi" => scalar_map2(a, b, |n, p| smirnovi(n as i32, p)),
         other => panic!("no fsci two-argument entry point wired for {other}"),
+    }
+}
+
+/// fsci's scalar-only two-argument kernels mapped pairwise over the fixture, as SciPy's ufunc
+/// maps its C kernel; the map is inside the timed region, as SciPy's loop is inside its.
+fn scalar_map2(
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    kernel: fn(f64, f64) -> f64,
+) -> fsci_special::SpecialResult {
+    match (a, b) {
+        (SpecialTensor::RealVec(av), SpecialTensor::RealVec(bv)) => Ok(SpecialTensor::RealVec(
+            av.iter().zip(bv).map(|(&x, &y)| kernel(x, y)).collect(),
+        )),
+        _ => Err(SpecialError {
+            function: "scalar_map2",
+            kind: SpecialErrorKind::DomainError,
+            mode: RuntimeMode::Hardened,
+            detail: "scalar kernels take two real vectors",
+        }),
     }
 }
 
@@ -834,7 +923,11 @@ fn main() {
             let (alo, ahi) = a_range.unwrap_or((alo, ahi));
             let a: Vec<f64> = (0..n)
                 .map(|i| {
-                    let v = if ahi / alo > 100.0 {
+                    // Log-uniform only for a POSITIVE lower bound. With alo = 0 the ratio is
+                    // inf, and ln(0) + u·inf is NaN for every u: each case with a zero lower
+                    // bound (jv, yv, iv, kv, their scaled forms, jn, yn, kn) timed and
+                    // "checked" an all-NaN fixture on both sides until this was caught.
+                    let v = if alo > 0.0 && ahi / alo > 100.0 {
                         (alo.ln() + unit(i) * (ahi / alo).ln()).exp()
                     } else {
                         alo + unit(i) * (ahi - alo)
@@ -865,6 +958,20 @@ fn main() {
                 real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
             };
             black_box(ours());
+
+            // `FSCI_SPECIAL_DUMP=<file>`: `op a b fsci(a, b)` per fixture point, as the
+            // one-argument loop writes `op x fsci(x)`.
+            if let Ok(path) = std::env::var("FSCI_SPECIAL_DUMP") {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .expect("open FSCI_SPECIAL_DUMP");
+                let mut file = std::io::BufWriter::new(file);
+                for ((ai, bi), yi) in a.iter().zip(&b).zip(ours()) {
+                    writeln!(file, "{op} {ai:?} {bi:?} {yi:?}").expect("write FSCI_SPECIAL_DUMP");
+                }
+            }
 
             if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
                 let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
