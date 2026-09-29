@@ -70,21 +70,21 @@
       "subsystem": "solver_portfolio",
       "pass": true,
       "description": "WellConditioned → DirectLU (min expected loss)",
-      "detail": "action=DirectLU, losses=[1.0, 3.0, 15.0, 0.0, 0.0], chosen=1.00"
+      "detail": "action=DirectLU, losses=[1.0319926099000587, 2.0, 31.5, 0.0, 0.0, 0.5], chosen=1.03"
     },
     {
       "fixture_id": "portfolio_moderate_condition",
       "subsystem": "solver_portfolio",
       "pass": true,
-      "description": "ModerateCondition → PivotedQR",
-      "detail": "action=PivotedQR, losses=[5.0, 1.0, 10.0, 0.0, 0.0]"
+      "description": "ModerateCondition → DirectLU, PivotedQR next (calibrated)",
+      "detail": "action=DirectLU, losses=[1.0006762508974, 2.0, 31.502146632181486, 0.0, 0.0, 0.5]"
     },
     {
       "fixture_id": "portfolio_ill_and_near_singular",
       "subsystem": "solver_portfolio",
       "pass": true,
-      "description": "IllConditioned/NearSingular → SVDFallback",
-      "detail": "ill=SVDFallback, near_singular=SVDFallback"
+      "description": "IllConditioned/NearSingular → DirectLU (calibrated)",
+      "detail": "ill=DirectLU, near_singular=DirectLU"
     },
     {
       "fixture_id": "portfolio_all_states_valid",
@@ -98,7 +98,7 @@
       "subsystem": "solver_portfolio",
       "pass": true,
       "description": "Loss matrix structural properties hold",
-      "detail": "Loss matrix satisfies: non-negative, SVD dominates ill-conditioned, LU dominates well-conditioned"
+      "detail": "Loss matrix satisfies: non-negative, and in every state LU <= QR < SVD (calibrated)"
     },
     {
       "fixture_id": "calibrator_no_fallback",

@@ -4,6 +4,10 @@
 Covers FSCI-P2C-008 runtime CASP (Condition-Aware Solver Portfolio) conformance.
 Validates policy decisions, condition-based solver selection, and conformal
 calibration against numerical linear algebra conditioning references in SciPy/NumPy.
+
+SciPy has no solver portfolio, so the solver_selection reference is not SciPy's: it is
+the argmin, over the general solvers, of the state's column of the measured calibration
+committed at artifacts/casp-calibration-solver.json (frankenscipy-7tb8d.2).
 """
 
 from __future__ import annotations
@@ -36,6 +40,34 @@ def _err(case_id: str, error: str, result_kind: str = "exception") -> Dict[str, 
     }
 
 
+_CALIBRATION = (
+    Path(__file__).resolve().parents[3] / "artifacts" / "casp-calibration-solver.json"
+)
+_STATE_NAMES = {
+    "well_conditioned": "WellConditioned",
+    "moderate_condition": "Moderate",
+    "ill_conditioned": "IllConditioned",
+    "near_singular": "NearSingular",
+}
+# The structured fast paths need structural evidence, which solver_selection cases never carry.
+_GENERAL_SOLVERS = {
+    "DirectLU": "direct_lu",
+    "PivotedQR": "pivoted_qr",
+    "SVDFallback": "svd_fallback",
+}
+
+
+def _calibrated_action(cond_state: str) -> str:
+    calibration = json.loads(_CALIBRATION.read_text(encoding="utf-8"))
+    column = calibration["states"].index(_STATE_NAMES[cond_state])
+    losses = {
+        action: row[column]
+        for action, row in zip(calibration["actions"], calibration["loss_matrix"])
+        if action in _GENERAL_SOLVERS
+    }
+    return _GENERAL_SOLVERS[min(losses, key=losses.__getitem__)]
+
+
 def _run_case(case: Dict[str, Any], np: Any, scipy: Any) -> Dict[str, Any]:
     case_id = case["case_id"]
     test_kind = case.get("test_kind", "")
@@ -56,14 +88,9 @@ def _run_case(case: Dict[str, Any], np: Any, scipy: Any) -> Dict[str, Any]:
 
         if test_kind == "solver_selection":
             cond_state = case.get("condition_state")
-            if cond_state == "well_conditioned":
-                action = "direct_lu"
-            elif cond_state == "moderate_condition":
-                action = "pivoted_qr"
-            elif cond_state in ("ill_conditioned", "near_singular"):
-                action = "svd_fallback"
-            else:
+            if cond_state not in _STATE_NAMES:
                 return _err(case_id, f"unknown condition state: {cond_state}")
+            action = _calibrated_action(cond_state)
             return _ok(case_id, "solver_action", {"kind": "solver_action", "action": action})
 
         if test_kind == "calibrator_drift":

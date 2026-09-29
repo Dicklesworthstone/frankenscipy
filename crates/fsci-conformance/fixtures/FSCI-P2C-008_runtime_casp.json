@@ -119,7 +119,7 @@
       "observations": null,
       "expected": {
         "kind": "solver_action",
-        "action": "pivoted_qr"
+        "action": "direct_lu"
       }
     },
     {
@@ -134,7 +134,7 @@
       "observations": null,
       "expected": {
         "kind": "solver_action",
-        "action": "svd_fallback"
+        "action": "direct_lu"
       }
     },
     {
@@ -149,7 +149,7 @@
       "observations": null,
       "expected": {
         "kind": "solver_action",
-        "action": "svd_fallback"
+        "action": "direct_lu"
       }
     },
     {

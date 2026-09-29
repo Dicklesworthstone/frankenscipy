@@ -15,6 +15,7 @@
 //! | `booking_claim` | [`BookingClaim`]: verifies the fleet measurement booking a timed row cites |
 
 pub mod booking_claim;
+mod calibrated_losses;
 pub mod eprocess;
 pub mod evidence;
 pub mod mode;
@@ -27,8 +28,9 @@ pub mod supervision;
 pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
 pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
-    AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
-    Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
+    AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionEvidenceEntry,
+    EvidenceValue, Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
+    audit_finish, audit_recover, audit_reject,
 };
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
@@ -43,6 +45,76 @@ use serde::{Deserialize, Serialize};
 // ═══════════════════════════════════════════════════════════════════
 // CASP — Condition-Aware Solver Portfolio (§0.4)
 // ═══════════════════════════════════════════════════════════════════
+
+/// Read access to a CASP portfolio's recorded decisions, the same for all five portfolios
+/// (frankenscipy-7tb8d.11). Each keeps its newest `evidence_capacity` entries, oldest first.
+pub trait PortfolioEvidence {
+    /// One recorded decision.
+    type Entry: Serialize;
+    /// The portfolio's name in its JSONL lines: `solver`, `sparse`, `opt`, `ode` or `hyper`.
+    const NAME: &'static str;
+
+    /// The runtime mode the portfolio decides in.
+    fn mode(&self) -> RuntimeMode;
+
+    /// The recorded decisions, oldest first.
+    fn evidence(&self) -> &VecDeque<Self::Entry>;
+
+    /// The recorded decisions as JSONL, one object per line, oldest first: `portfolio` and
+    /// `mode`, then the entry's own fields. A line that fails to serialize is left out.
+    fn serialize_jsonl(&self) -> String {
+        #[derive(Serialize)]
+        struct Line<'a, E> {
+            portfolio: &'static str,
+            mode: RuntimeMode,
+            #[serde(flatten)]
+            entry: &'a E,
+        }
+        let mode = self.mode();
+        let mut output = Vec::with_capacity(self.evidence().len().saturating_mul(256));
+        for entry in self.evidence() {
+            let entry_start = output.len();
+            if entry_start != 0 {
+                output.push(b'\n');
+            }
+            let line = Line {
+                portfolio: Self::NAME,
+                mode,
+                entry,
+            };
+            if serde_json::to_writer(&mut output, &line).is_err() {
+                output.truncate(entry_start);
+            }
+        }
+        String::from_utf8(output).expect("serde_json always emits UTF-8")
+    }
+}
+
+/// [`PortfolioEvidence`] for the five portfolios, whose fields share names.
+macro_rules! portfolio_evidence {
+    ($($portfolio:ty => $entry:ty, $name:literal;)+) => {$(
+        impl PortfolioEvidence for $portfolio {
+            type Entry = $entry;
+            const NAME: &'static str = $name;
+
+            fn mode(&self) -> RuntimeMode {
+                self.mode
+            }
+
+            fn evidence(&self) -> &VecDeque<$entry> {
+                &self.evidence
+            }
+        }
+    )+};
+}
+
+portfolio_evidence! {
+    SolverPortfolio => SolverEvidenceEntry, "solver";
+    SparseSolverPortfolio => SparseSolverEvidenceEntry, "sparse";
+    OptSolverPortfolio => OptSolverEvidenceEntry, "opt";
+    OdeSolverPortfolio => OdeSolverEvidenceEntry, "ode";
+    HyperSolverPortfolio => HyperSolverEvidenceEntry, "hyper";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatrixConditionState {
@@ -134,18 +206,20 @@ pub struct SolverEvidenceEntry {
 
 /// Expected-loss solver selection engine (§0.4 alien-artifact).
 ///
-/// Loss matrix (6 actions × 4 states):
+/// The loss matrix (6 actions × 4 states) is measured, not typed: [`Self::default_loss_matrix`]
+/// is the generated `calibrated_losses::SOLVER_LOSS_MATRIX`, from
+/// `cargo run --release -p fsci-linalg --bin casp_calibrate`, and its report
+/// `artifacts/casp-calibration-solver.json` holds the corpus, every matrix's outcome per action,
+/// the failure rates and the rule (frankenscipy-7tb8d.2). Measured, LU's backward error passes
+/// the portfolio's acceptance test at every conditioning except where pivot growth defeats it,
+/// so LU has the least expected loss in every state. QR (twice LU's flops) is the fallback
+/// when LU's backward error fails. The SVD refuses a square system whose numerical rank is short
+/// (its rank cutoff), about a quarter of the ill-conditioned matrices, so it comes last. The
+/// hand-set matrix this replaced sent moderate conditioning to QR and ill conditioning to the SVD.
 ///
-/// | Action \ State     | WellCond | Moderate | IllCond | NearSingular |
-/// |--------------------|----------|----------|---------|--------------|
-/// | DirectLU           |        1 |        5 |      40 |          120 |
-/// | PivotedQR          |        3 |        1 |       8 |           45 |
-/// | SVDFallback        |       15 |       10 |       1 |            1 |
-/// | DiagonalFastPath   |        0 |        0 |       0 |          100 |
-/// | TriangularFastPath |        0 |        0 |       0 |          100 |
-/// | SymmetricFastPath  |        0 |        0 |       0 |          100 |
-///
-/// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence)
+/// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence), where an action with attempts recorded
+/// at this rcond decade has the failure term of its loss replaced by what they showed
+/// (frankenscipy-3iekl, [`learned_loss`]).
 #[derive(Debug, Clone)]
 pub struct SolverPortfolio {
     mode: RuntimeMode,
@@ -156,6 +230,11 @@ pub struct SolverPortfolio {
     /// Dirichlet outcome counts over the four condition states, one row per decade of rcond
     /// (see [`rcond_decade`]). Filled by [`SolverPortfolio::record_outcome`].
     outcome_counts: [[f64; 4]; RCOND_DECADES],
+    /// `[failures, trials]` per rcond decade and action, from the same recorded outcomes
+    /// (frankenscipy-3iekl). They replace the calibrated failure term of an action's expected
+    /// loss (see [`learned_loss`]). Unlike the state counts they can move the decision: the
+    /// calibrated losses rank LU first in every state, so no state posterior can.
+    failure_counts: [[[f64; 2]; 6]; RCOND_DECADES],
 }
 
 /// How an attempted dense solve turned out, as fed back to the portfolio.
@@ -196,6 +275,42 @@ const OK_PROBABILITY: [[f64; 4]; 6] = [
 /// Share of the non-`Ok` probability that is `Inaccurate` (the rest is `Failed`).
 const INACCURATE_SHARE: f64 = 0.7;
 
+/// Pseudo-trials the calibrated failure rate carries in the Beta posterior of an action's
+/// failure rate at an rcond decade (frankenscipy-3iekl).
+const FAILURE_PRIOR_TRIALS: f64 = 4.0;
+
+/// An action's expected loss once attempts with it at this rcond decade have been recorded
+/// (frankenscipy-3iekl). The calibrated loss is `cost + p0 × r`: `p0` the measured failure rate
+/// under the state posterior and `r` the expected recovery cost it implies. The recorded
+/// attempts replace `p0` by the Beta posterior mean `(m·p0 + failures) / (m + trials)`, with `m`
+/// = [`FAILURE_PRIOR_TRIALS`], and keep `r`. An action the corpus never saw fail implies no
+/// `r`; its failure is priced at the cheapest other general solver, the one that would recover.
+fn learned_loss(
+    calibrated: f64,
+    action: usize,
+    posterior: [f64; 4],
+    failures: f64,
+    trials: f64,
+) -> f64 {
+    let cost = calibrated_losses::SOLVER_ACTION_COST[action];
+    let p0: f64 = calibrated_losses::SOLVER_FAILURE_RATE[action]
+        .iter()
+        .zip(posterior)
+        .map(|(rate, p)| rate * p)
+        .sum();
+    let failure_term = calibrated - cost;
+    let recovery = if p0 > 0.0 && failure_term > 0.0 {
+        failure_term / p0
+    } else {
+        (0..3)
+            .filter(|&other| other != action)
+            .map(|other| calibrated_losses::SOLVER_ACTION_COST[other])
+            .fold(f64::INFINITY, f64::min)
+    };
+    let failure_rate = (FAILURE_PRIOR_TRIALS * p0 + failures) / (FAILURE_PRIOR_TRIALS + trials);
+    cost + failure_rate * recovery
+}
+
 /// The decade row an rcond value's outcomes are counted in.
 fn rcond_decade(rcond: f64) -> usize {
     if !rcond.is_finite() || rcond <= 0.0 {
@@ -220,6 +335,7 @@ impl SolverPortfolio {
             evidence_capacity,
             calibrator: ConformalCalibrator::new(0.05, 200),
             outcome_counts: [[0.0; 4]; RCOND_DECADES],
+            failure_counts: [[[0.0; 2]; 6]; RCOND_DECADES],
         }
     }
 
@@ -273,6 +389,11 @@ impl SolverPortfolio {
     /// LU results at an rcond the map calls well conditioned therefore move that decade's
     /// posterior toward the ill-conditioned states, and the next decision there changes.
     pub fn record_outcome(&mut self, rcond: f64, action: SolverAction, outcome: AttemptOutcome) {
+        let tally = &mut self.failure_counts[rcond_decade(rcond)][action.index()];
+        tally[1] += 1.0;
+        if outcome != AttemptOutcome::Ok {
+            tally[0] += 1.0;
+        }
         let prior = self.smoothed_posterior(rcond);
         let ok = OK_PROBABILITY[action.index()];
         let mut responsibility = [0.0; 4];
@@ -302,14 +423,7 @@ impl SolverPortfolio {
 
     #[must_use]
     pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
-        [
-            [1.0, 5.0, 40.0, 120.0], // DirectLU
-            [3.0, 1.0, 8.0, 45.0],   // PivotedQR
-            [15.0, 10.0, 1.0, 1.0],  // SVDFallback
-            [0.0, 0.0, 0.0, 100.0],  // DiagonalFastPath
-            [0.0, 0.0, 0.0, 100.0],  // TriangularFastPath
-            [0.0, 0.0, 0.0, 100.0],  // SymmetricFastPath
-        ]
+        calibrated_losses::SOLVER_LOSS_MATRIX
     }
 
     /// Select optimal action via expected-loss minimization.
@@ -335,7 +449,7 @@ impl SolverPortfolio {
         excluded: &[SolverAction],
     ) -> Option<(SolverAction, [f64; 4], [f64; 6], f64)> {
         let posterior = self.posterior(rcond);
-        let losses = self.compute_expected_losses(posterior);
+        let losses = self.compute_expected_losses(posterior, rcond);
 
         // If conformal calibrator detects drift, override to SVDFallback
         if self.calibrator.should_fallback() && !excluded.contains(&SolverAction::SVDFallback) {
@@ -409,25 +523,28 @@ impl SolverPortfolio {
         self.calibrator.observe(backward_error);
     }
 
-    /// Serialize evidence ledger to JSONL format for audit trail (§0.19).
-    #[must_use]
-    pub fn serialize_jsonl(&self) -> String {
-        let mut output = Vec::with_capacity(self.evidence.len().saturating_mul(256));
-        for entry in &self.evidence {
-            let entry_start = output.len();
-            if entry_start != 0 {
-                output.push(b'\n');
-            }
-            if serde_json::to_writer(&mut output, entry).is_err() {
-                output.truncate(entry_start);
-            }
-        }
-        String::from_utf8(output).expect("serde_json always emits UTF-8")
-    }
-
     #[must_use]
     pub fn evidence_len(&self) -> usize {
         self.evidence.len()
+    }
+
+    /// A digest of everything [`Self::select_action`] reads: the mode, the loss matrix, the
+    /// outcome and failure counts and the calibrator's state, as a [`Fingerprinter`] `"blake3:…"`
+    /// (frankenscipy-7tb8d.12). Two portfolios with one digest decide identically. A solve
+    /// certificate records the digest of the portfolio that made its decision, so the decision
+    /// replays against a snapshot of that portfolio, and a snapshot in any other state is
+    /// refused rather than giving a different answer. The loss matrix stands in for a
+    /// calibration version: it is the calibration.
+    #[must_use]
+    pub fn state_digest(&self) -> String {
+        let mut fingerprinter = Fingerprinter::new("fsci_runtime::SolverPortfolio::state");
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .f64s(self.loss_matrix.as_flattened())
+            .f64s(self.outcome_counts.as_flattened())
+            .f64s(self.failure_counts.as_flattened().as_flattened());
+        self.calibrator.fingerprint_into(&mut fingerprinter);
+        fingerprinter.finish()
     }
 
     #[must_use]
@@ -440,12 +557,29 @@ impl SolverPortfolio {
         &self.calibrator
     }
 
-    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+    /// Σ_s L(a,s) · P(s), with the failure term of every action that has recorded attempts at
+    /// `rcond`'s decade replaced by what they showed ([`learned_loss`]). An action with none
+    /// keeps the calibrated value exactly, so a fresh portfolio decides as before, bit for bit.
+    fn compute_expected_losses(&self, posterior: [f64; 4], rcond: f64) -> [f64; 6] {
         let mut losses = [0.0; 6];
         for (action_idx, row) in self.loss_matrix.iter().enumerate() {
             losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
         }
+        let tallies = &self.failure_counts[rcond_decade(rcond)];
+        for (action_idx, loss) in losses.iter_mut().enumerate() {
+            let [failures, trials] = tallies[action_idx];
+            if trials > 0.0 {
+                *loss = learned_loss(*loss, action_idx, posterior, failures, trials);
+            }
+        }
         losses
+    }
+
+    /// `[failures, trials]` recorded per action at `rcond`'s decade, in `SolverAction::ALL`
+    /// order (for diagnostics and audit).
+    #[must_use]
+    pub fn failure_counts(&self, rcond: f64) -> [[f64; 2]; 6] {
+        self.failure_counts[rcond_decade(rcond)]
     }
 
     /// The PRIOR map from rcond to condition states: piecewise-linear in `log10(rcond)` between
@@ -500,6 +634,19 @@ pub struct ConformalCalibrator {
 }
 
 impl ConformalCalibrator {
+    /// Feed the calibrator's whole state to a fingerprint: its parameters, its counters and
+    /// its score window, oldest first.
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        let scores: Vec<f64> = self.scores.iter().copied().collect();
+        fingerprinter
+            .f64(self.alpha)
+            .usize(self.capacity)
+            .f64(self.violation_threshold)
+            .usize(self.coverage_violations)
+            .usize(self.total_predictions)
+            .f64s(&scores);
+    }
+
     #[must_use]
     pub fn new(alpha: f64, capacity: usize) -> Self {
         let capacity = capacity.max(10);
@@ -673,16 +820,10 @@ pub struct SparseSolverEvidenceEntry {
 
 /// Sparse solver selection portfolio engine.
 ///
-/// Loss matrix (6 actions × 4 states):
-///
-/// | Action \ State       | SPD | GenWell | Indef | IllCond |
-/// |----------------------|-----|---------|-------|---------|
-/// | ConjugateGradient    |   1 |     150 |   200 |     250 |
-/// | MinRes               |   3 |     100 |     2 |     200 |
-/// | BiCGSTAB             |   6 |       1 |    45 |     180 |
-/// | GMRES                |  10 |       4 |     6 |      60 |
-/// | QMR                  |  12 |       5 |     8 |      70 |
-/// | SuperLU              |  40 |      30 |    25 |       2 |
+/// Loss matrix: [`Self::default_loss_matrix`], 6 actions × 4 states (SPD, general well
+/// conditioned, indefinite, ill conditioned). It is hand-set, not yet measured: the dense
+/// [`SolverPortfolio`]'s is calibrated (frankenscipy-7tb8d.2), and this one is to reuse that
+/// harness once its features are real. The table that stood here disagreed with the constant.
 #[derive(Debug, Clone)]
 pub struct SparseSolverPortfolio {
     mode: RuntimeMode,
@@ -913,15 +1054,10 @@ pub struct OptSolverEvidenceEntry {
 
 /// Optimization solver selection portfolio engine.
 ///
-/// Loss matrix (5 actions × 4 states):
-///
-/// | Action \ State          | SmoothConvex | Valley | MultiModal | NoisyNonSmooth |
-/// |-------------------------|--------------|--------|------------|----------------|
-/// | BFGS                    |            1 |     15 |        120 |            150 |
-/// | LBFGSB                  |            2 |     20 |        120 |            150 |
-/// | NelderMead              |           50 |     60 |         80 |              2 |
-/// | DIRECT                  |           80 |     40 |          2 |             10 |
-/// | TrustRegionNewtonCG     |            8 |      2 |         70 |            180 |
+/// Loss matrix: [`Self::default_loss_matrix`], 5 actions × 4 states (smooth convex, valley,
+/// multimodal, noisy non-smooth). It is hand-set, not yet measured: the dense
+/// [`SolverPortfolio`]'s is calibrated (frankenscipy-7tb8d.2), and this one is to reuse that
+/// harness once its features are real. The table that stood here disagreed with the constant.
 #[derive(Debug, Clone)]
 pub struct OptSolverPortfolio {
     mode: RuntimeMode,
@@ -1230,15 +1366,10 @@ impl Default for StiffnessDetector {
 
 /// ODE solver selection portfolio engine.
 ///
-/// Loss matrix (5 actions × 4 states):
-///
-/// | Action \ State  | NonStiff | MildlyStiff | Stiff | Algebraic |
-/// |-----------------|----------|-------------|-------|-----------|
-/// | RK45            |        1 |          25 |   200 |       300 |
-/// | RK23            |        5 |          40 |   250 |       300 |
-/// | DOP853          |        2 |          35 |   250 |       150 |
-/// | Radau           |       35 |           3 |     2 |         1 |
-/// | BDF             |       25 |           2 |     1 |        15 |
+/// Loss matrix: [`Self::default_loss_matrix`], 5 actions × 4 states (non-stiff, mildly stiff,
+/// stiff, algebraic). It is hand-set, not yet measured: the dense [`SolverPortfolio`]'s is
+/// calibrated (frankenscipy-7tb8d.2), and this one is to reuse that harness once its features
+/// are real.
 #[derive(Debug, Clone)]
 pub struct OdeSolverPortfolio {
     mode: RuntimeMode,
@@ -1460,16 +1591,10 @@ pub struct HyperSolverEvidenceEntry {
 
 /// Hypergeometric branch selection portfolio engine.
 ///
-/// Loss matrix (6 actions × 4 states):
-///
-/// | Action \ State       | NearZero | Transform | Asymptotic | BoundaryNearPole |
-/// |----------------------|----------|-----------|------------|------------------|
-/// | DirectSeries         |        1 |        40 |        150 |              200 |
-/// | KummerTransform      |       20 |         2 |        100 |              200 |
-/// | PfaffTransform       |       25 |         3 |         90 |              200 |
-/// | Asymptotic           |       80 |        50 |          2 |              100 |
-/// | ContinuedFraction    |       30 |        10 |         20 |                5 |
-/// | GuardedFallback      |      100 |        80 |         70 |                1 |
+/// Loss matrix: [`Self::default_loss_matrix`], 6 actions × 4 states (near zero, transform,
+/// asymptotic, boundary near a pole). It is hand-set, not yet measured: the dense
+/// [`SolverPortfolio`]'s is calibrated (frankenscipy-7tb8d.2), and this one is to reuse that
+/// harness once its features are real. The table that stood here disagreed with the constant.
 #[derive(Debug, Clone)]
 pub struct HyperSolverPortfolio {
     mode: RuntimeMode,
@@ -1906,11 +2031,26 @@ mod tests {
 
     // frankenscipy-7tb8d.1: the posterior LEARNS. At rcond = 1e-3 the map says mostly
     // well-conditioned and LU wins; 50 recorded "LU was inaccurate" outcomes there must move
-    // mass to the ill-conditioned states and change the decision. Before this bead the
-    // posterior was a pure function of rcond, so this failed.
+    // mass to the ill-conditioned states. Before that bead the posterior was a pure function of
+    // rcond, so this failed.
+    //
+    // Whether the moved posterior moves the DECISION depends on the loss matrix. Under a
+    // state-dependent one, the hand-set matrix fixed here, it does. Under the calibrated one
+    // (frankenscipy-7tb8d.2), LU has the least loss in every state, so the posterior alone
+    // cannot: LU fails by pivot growth, which a conditioning state does not describe. What moves
+    // it there is the recorded failure rate of LU itself (frankenscipy-3iekl).
     #[test]
     fn recorded_outcomes_move_the_posterior_and_the_decision() {
+        const HAND_SET: [[f64; 4]; 6] = [
+            [1.0, 5.0, 40.0, 120.0],
+            [3.0, 1.0, 8.0, 45.0],
+            [15.0, 10.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 100.0],
+            [0.0, 0.0, 0.0, 100.0],
+            [0.0, 0.0, 0.0, 100.0],
+        ];
         let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        portfolio.loss_matrix = HAND_SET;
         let rcond = 1e-3;
         let (before, p0, _, _) = portfolio.select_action(rcond, None);
         assert_eq!(before, SolverAction::DirectLU);
@@ -1932,6 +2072,7 @@ mod tests {
         // Negative arm: successes at the same rcond keep LU -- including the FIRST one, which
         // a smoothed decision posterior would have flipped to QR.
         let mut ok = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        ok.loss_matrix = HAND_SET;
         ok.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Ok);
         assert_eq!(ok.select_action(rcond, None).0, SolverAction::DirectLU);
         for _ in 1..50 {
@@ -1939,6 +2080,70 @@ mod tests {
         }
         assert_eq!(ok.select_action(rcond, None).0, SolverAction::DirectLU);
         assert!(ok.posterior(rcond)[0] >= p0[0] - 0.05);
+
+        // Under the calibrated losses the same outcomes move the posterior, and LU's own
+        // failure rate moves the choice (frankenscipy-3iekl).
+        let mut calibrated = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        for _ in 0..50 {
+            calibrated.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Inaccurate);
+        }
+        let (choice, p2, ..) = calibrated.select_action(rcond, None);
+        assert!(p2[2] + p2[3] > p0[2] + p0[3] + 0.5, "{p0:?} -> {p2:?}");
+        assert_eq!(choice, SolverAction::PivotedQR);
+    }
+
+    /// frankenscipy-3iekl: under the calibrated losses, recorded failures of an action raise ITS
+    /// expected loss at that rcond decade until the next solver wins, and recorded successes
+    /// lower it again. A fresh portfolio decides exactly as the calibrated matrix does.
+    #[test]
+    fn recorded_failures_move_the_calibrated_decision() {
+        let rcond = 1e-3;
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let (cold, posterior, cold_losses, _) = portfolio.select_action(rcond, None);
+        assert_eq!(cold, SolverAction::DirectLU);
+        for (a, row) in SolverPortfolio::default_loss_matrix().iter().enumerate() {
+            let calibrated: f64 = row.iter().zip(posterior).map(|(l, p)| l * p).sum();
+            assert_eq!(cold_losses[a].to_bits(), calibrated.to_bits(), "action {a}");
+        }
+
+        // LU keeps failing at this decade: it holds for a few failures, then QR takes over.
+        let mut failures = 0;
+        while portfolio.select_action(rcond, None).0 == SolverAction::DirectLU {
+            portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Inaccurate);
+            failures += 1;
+            assert!(failures <= 10, "LU still chosen after {failures} failures");
+        }
+        let (switched, _, losses, _) = portfolio.select_action(rcond, None);
+        println!("rcond 1e-3: QR after {failures} LU failures, losses {losses:?}");
+        assert_eq!(switched, SolverAction::PivotedQR);
+        assert!(failures >= 2, "one failure must not be enough ({failures})");
+        assert_eq!(
+            portfolio.failure_counts(rcond)[SolverAction::DirectLU.index()],
+            [f64::from(failures), f64::from(failures)]
+        );
+
+        // Must-miss: the failures stay at their decade.
+        for other in [0.5, 1e-2, 1e-4, 1e-9] {
+            assert_eq!(
+                portfolio.select_action(other, None).0,
+                SolverAction::DirectLU,
+                "rcond {other:e}"
+            );
+        }
+
+        // Successes bring LU back.
+        let mut successes = 0;
+        while portfolio.select_action(rcond, None).0 != SolverAction::DirectLU {
+            portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Ok);
+            successes += 1;
+            assert!(successes <= 10, "LU not back after {successes} successes");
+        }
+        println!("rcond 1e-3: LU back after {successes} successes");
+
+        // The tallies are part of the state a certificate replays against.
+        let mut untallied = portfolio.clone();
+        untallied.failure_counts = [[[0.0; 2]; 6]; RCOND_DECADES];
+        assert_ne!(portfolio.state_digest(), untallied.state_digest());
     }
 
     // frankenscipy-7tb8d.1: the fallback re-ranks the REMAINING actions under the updated
@@ -2006,25 +2211,20 @@ mod tests {
         assert_eq!(action, SolverAction::DirectLU);
     }
 
+    // frankenscipy-7tb8d.2: under the calibrated losses LU is chosen at every conditioning
+    // (the hand-set matrix chose QR at 1e-6 and the SVD at 1e-12 and 1e-18), and the SVD has the
+    // largest expected loss of the three general solvers.
     #[test]
-    fn casp_selects_qr_for_moderate() {
+    fn casp_selects_lu_at_every_conditioning() {
         let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
-        let (action, _, _, _) = portfolio.select_action(1e-6, None);
-        assert_eq!(action, SolverAction::PivotedQR);
-    }
-
-    #[test]
-    fn casp_selects_svd_for_ill_conditioned() {
-        let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
-        let (action, _, _, _) = portfolio.select_action(1e-12, None);
-        assert_eq!(action, SolverAction::SVDFallback);
-    }
-
-    #[test]
-    fn casp_selects_svd_for_near_singular() {
-        let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
-        let (action, _, _, _) = portfolio.select_action(1e-18, None);
-        assert_eq!(action, SolverAction::SVDFallback);
+        for rcond in [1e-6, 1e-12, 1e-18] {
+            let (action, _, losses, _) = portfolio.select_action(rcond, None);
+            assert_eq!(action, SolverAction::DirectLU, "rcond {rcond:e}");
+            assert!(
+                losses[SolverAction::SVDFallback.index()] > losses[SolverAction::PivotedQR.index()],
+                "rcond {rcond:e}: {losses:?}"
+            );
+        }
     }
 
     #[test]
@@ -2044,12 +2244,14 @@ mod tests {
     }
 
     // frankenscipy-7tb8d.14: the symmetric factorization is a candidate only for symmetric
-    // evidence, and loses to SVD where the posterior is all near-singular.
+    // evidence. Under the calibrated losses (frankenscipy-7tb8d.2) it is chosen for symmetric
+    // evidence at every conditioning, near singular included: it failed no solvable corpus
+    // matrix, where the SVD failed most near-singular ones.
     #[test]
     fn casp_offers_the_symmetric_path_only_for_symmetric_evidence() {
         let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
         let symmetric = Some(StructuralEvidence::Symmetric);
-        for rcond in [1e-2, 1e-6, 1e-11] {
+        for rcond in [1e-2, 1e-6, 1e-11, 1e-16] {
             assert_eq!(
                 portfolio.select_action(rcond, symmetric).0,
                 SolverAction::SymmetricFastPath
@@ -2061,10 +2263,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            portfolio.select_action(1e-16, symmetric).0,
-            SolverAction::SVDFallback
-        );
         let excluded = portfolio
             .select_action_excluding(1e-2, symmetric, &[SolverAction::SymmetricFastPath])
             .expect("the general solvers remain");
@@ -2123,10 +2321,17 @@ mod tests {
             fallback_active: true,
             backward_error: Some(1e-14),
         });
+        // Each line is the entry's own JSON with `portfolio` and `mode` spliced in front.
         let former = portfolio
             .evidence
             .iter()
             .filter_map(|entry| serde_json::to_string(entry).ok())
+            .map(|json| {
+                format!(
+                    "{{\"portfolio\":\"solver\",\"mode\":\"Strict\",{}",
+                    &json[1..]
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let jsonl = portfolio.serialize_jsonl();
@@ -2136,6 +2341,255 @@ mod tests {
         )
         .expect("invalid JSONL evidence entry");
         assert_eq!(parsed["component"], "test\"entry");
+    }
+
+    /// frankenscipy-7tb8d.2: the dense portfolio's loss matrix is the committed calibration, bit
+    /// for bit, and the calibration is its own rule applied to its own measurements. A hand
+    /// edit of the generated module, of the report, or of both alike fails here; regenerate
+    /// both with `casp_calibrate` instead.
+    #[test]
+    fn solver_loss_matrix_is_the_committed_calibration() {
+        let report: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../artifacts/casp-calibration-solver.json"
+        ))
+        .expect("the calibration report parses");
+        let table = |key: &str| -> Vec<Vec<f64>> {
+            report[key]
+                .as_array()
+                .expect("a table of the report")
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .expect("a row")
+                        .iter()
+                        .map(|v| v.as_f64().expect("a number"))
+                        .collect()
+                })
+                .collect()
+        };
+        let actions: Vec<&str> = report["actions"]
+            .as_array()
+            .expect("actions")
+            .iter()
+            .map(|a| a.as_str().expect("an action name"))
+            .collect();
+        let names: Vec<String> = SolverAction::ALL.iter().map(|a| format!("{a:?}")).collect();
+        assert_eq!(actions, names, "the report's rows are SolverAction::ALL");
+
+        let recorded = table("loss_matrix");
+        let matrix = SolverPortfolio::default_loss_matrix();
+        let cost: Vec<f64> = report["cost"]
+            .as_array()
+            .expect("cost")
+            .iter()
+            .map(|v| v.as_f64().expect("a cost"))
+            .collect();
+        let (recovery, total) = (table("recovery_weight"), table("total_weight"));
+        for (a, row) in matrix.iter().enumerate() {
+            for (s, &loss) in row.iter().enumerate() {
+                assert_eq!(
+                    loss.to_bits(),
+                    recorded[a][s].to_bits(),
+                    "{} in state {s}: the constant {loss:e}, the report {:e}",
+                    names[a],
+                    recorded[a][s]
+                );
+                // The report's rule, recomputed from its measurements in the generator's order.
+                assert!(total[a][s] > 0.0, "{} unmeasured in state {s}", names[a]);
+                let rule = cost[a] + recovery[a][s] / total[a][s];
+                assert_eq!(
+                    rule.to_bits(),
+                    loss.to_bits(),
+                    "{} in state {s}: the rule gives {rule:e}, the loss is {loss:e}",
+                    names[a]
+                );
+            }
+        }
+
+        // frankenscipy-3iekl: the loss's two terms, as generated, are the report's too.
+        let rates = table("failure_rate");
+        for a in 0..6 {
+            assert_eq!(
+                calibrated_losses::SOLVER_ACTION_COST[a].to_bits(),
+                cost[a].to_bits(),
+                "{} cost",
+                names[a]
+            );
+            for s in 0..4 {
+                assert_eq!(
+                    calibrated_losses::SOLVER_FAILURE_RATE[a][s].to_bits(),
+                    rates[a][s].to_bits(),
+                    "{} failure rate in state {s}",
+                    names[a]
+                );
+            }
+        }
+    }
+
+    /// frankenscipy-7tb8d.2: every action does work on the calibration corpus, as the first
+    /// choice on some matrix or as the fallback that succeeds when the first choice fails,
+    /// except the ones named here, which are retained only as later fallbacks. A recalibration
+    /// that changes the set fails here until someone decides again.
+    ///
+    /// `SVDFallback`: refuses a square system whose numerical rank is short (the rank cutoff
+    /// `max(m, n)·eps·σ_max`), and on the full-rank ones it accepts, Householder QR is backward
+    /// stable too, at `4n³/3` flops against its `21n³`. On the corpus it is never chosen, never
+    /// the fallback that succeeds and never the only action that succeeds; whether to remove it
+    /// from the dense portfolio or give it a job is frankenscipy-qmgrm.
+    #[test]
+    fn every_solver_action_is_reached_or_named_as_retained() {
+        const RETAINED_UNREACHED: [SolverAction; 1] = [SolverAction::SVDFallback];
+        let report: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../artifacts/casp-calibration-solver.json"
+        ))
+        .expect("the calibration report parses");
+        let unreached = |report: &serde_json::Value| -> Vec<SolverAction> {
+            let count = |key: &str, action: SolverAction| {
+                report[key][format!("{action:?}")]
+                    .as_u64()
+                    .expect("the report's counts cover every action")
+            };
+            SolverAction::ALL
+                .into_iter()
+                .filter(|&a| count("chosen_on_corpus", a) == 0 && count("fallback_success", a) == 0)
+                .collect()
+        };
+        assert_eq!(unreached(&report), RETAINED_UNREACHED);
+        let listed: Vec<&str> = report["unreached"]
+            .as_array()
+            .expect("the report's unreached list")
+            .iter()
+            .map(|a| a.as_str().expect("an action name"))
+            .collect();
+        assert_eq!(listed, ["SVDFallback"], "the report's own list agrees");
+
+        // Must-miss: the one matrix QR rescues is all that keeps it reached. Without it, QR
+        // would join the unreached set and the assertion above would fail.
+        assert!(report["fallback_success"]["PivotedQR"].as_u64() > Some(0));
+        let mut without_rescue = report.clone();
+        without_rescue["fallback_success"]["PivotedQR"] = 0.into();
+        assert_eq!(
+            unreached(&without_rescue),
+            [SolverAction::PivotedQR, SolverAction::SVDFallback]
+        );
+    }
+
+    /// frankenscipy-7tb8d.11: every portfolio's recorded decision reads back through its JSONL
+    /// with the portfolio, the mode, the action and, bit for bit, the posterior and the losses.
+    #[test]
+    fn every_portfolio_round_trips_a_decision_through_jsonl() {
+        fn check<P: PortfolioEvidence>(
+            portfolio: &P,
+            action: impl Serialize,
+            posterior: &[f64],
+            losses: &[f64],
+        ) {
+            let jsonl = portfolio.serialize_jsonl();
+            assert_eq!(jsonl.lines().count(), 1, "{jsonl}");
+            let line: serde_json::Value = serde_json::from_str(&jsonl).expect("one JSON line");
+            assert_eq!(line["portfolio"], P::NAME, "{jsonl}");
+            assert_eq!(line["mode"], "Hardened", "{jsonl}");
+            assert_eq!(
+                line["chosen_action"],
+                serde_json::to_value(action).expect("action"),
+                "{jsonl}"
+            );
+            let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            for (key, expected) in [("posterior", posterior), ("expected_losses", losses)] {
+                let read: Vec<f64> = line[key]
+                    .as_array()
+                    .expect(key)
+                    .iter()
+                    .map(|v| v.as_f64().expect("number"))
+                    .collect();
+                assert_eq!(bits(&read), bits(expected), "{key} in {jsonl}");
+            }
+        }
+        let mode = RuntimeMode::Hardened;
+
+        let mut solver = SolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) =
+            solver.select_action(3.7e-7, Some(StructuralEvidence::General));
+        solver.record_evidence(SolverEvidenceEntry {
+            component: "test",
+            matrix_shape: (3, 3),
+            rcond_estimate: 3.7e-7,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            backward_error: Some(1.25e-16),
+        });
+        check(&solver, action, &posterior, &losses);
+
+        let mut sparse = SparseSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = sparse.select_action(
+            1.3e5,
+            Some(SparseStructuralEvidence {
+                is_symmetric: true,
+                is_positive_definite_hint: Some(true),
+            }),
+        );
+        sparse.record_evidence(SparseSolverEvidenceEntry {
+            component: "test",
+            matrix_shape: (5, 5),
+            nnz: 13,
+            cond_estimate: 1.3e5,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            relative_residual: None,
+        });
+        check(&sparse, action, &posterior, &losses);
+
+        let mut opt = OptSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = opt.select_action(2.2e4, false, true);
+        opt.record_evidence(OptSolverEvidenceEntry {
+            component: "test",
+            dimension: 7,
+            condition_number_estimate: 2.2e4,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: true,
+            gradient_norm: Some(3.1e-9),
+        });
+        check(&opt, action, &posterior, &losses);
+
+        let mut ode = OdeSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = ode.select_action(250.0, false);
+        ode.record_evidence(OdeSolverEvidenceEntry {
+            component: "test",
+            system_dim: 2,
+            stiffness_ratio_estimate: 250.0,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            step_rejections: Some(1),
+        });
+        check(&ode, action, &posterior, &losses);
+
+        let mut hyper = HyperSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = hyper.select_action(0.7, 0.3, false);
+        hyper.record_evidence(HyperSolverEvidenceEntry {
+            component: "test",
+            function_kind: "hyp2f1",
+            z_abs: 0.7,
+            parameter_stability_margin: 0.3,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            term_count: Some(31),
+        });
+        check(&hyper, action, &posterior, &losses);
     }
 
     #[test]

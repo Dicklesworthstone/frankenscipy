@@ -7,7 +7,7 @@
       "action": "init",
       "input_summary": "mode=Strict, capacity=64",
       "output_summary": "mode=Strict",
-      "duration_ns": 3908,
+      "duration_ns": 4417,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -17,7 +17,7 @@
       "action": "decide",
       "input_summary": "cond=2.0, meta=0.0, anom=0.0",
       "output_summary": "action=Allow, top_state=Compatible, reason=mode=Strict; top_state=Compatible; p=0.940946; cond_log10=2.000; metadata=0.000; anomaly=0.000",
-      "duration_ns": 34887,
+      "duration_ns": 15754,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -27,7 +27,7 @@
       "action": "check",
       "input_summary": "posterior=[0.9409462429483226, 0.05049559023426266, 0.008558166817414595]",
       "output_summary": "sum=1.000000000000",
-      "duration_ns": 2475,
+      "duration_ns": 3304,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -37,21 +37,21 @@
       "action": "check",
       "input_summary": "ledger.len()",
       "output_summary": "len=1",
-      "duration_ns": 811,
+      "duration_ns": 751,
       "mode": "strict",
       "outcome": "ok"
     }
   ],
   "artifacts": [],
   "environment": {
-    "rust_version": "0.1.0",
+    "rust_version": "0.2.0",
     "os": "linux",
-    "cpu_count": 64,
+    "cpu_count": 8,
     "total_memory_mb": "unknown"
   },
   "overall": {
     "status": "pass",
-    "total_duration_ns": 161706,
+    "total_duration_ns": 103284,
     "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_001_policy_well_cond --nocapture"
   }
 }

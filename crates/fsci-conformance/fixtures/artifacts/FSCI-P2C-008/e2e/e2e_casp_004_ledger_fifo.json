@@ -7,7 +7,7 @@
       "action": "init",
       "input_summary": "capacity=5",
       "output_summary": "ledger.capacity=5",
-      "duration_ns": 5851,
+      "duration_ns": 2424,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -17,7 +17,7 @@
       "action": "decide",
       "input_summary": "20 decisions with varying cond",
       "output_summary": "ledger.len=5, capacity=5",
-      "duration_ns": 48952,
+      "duration_ns": 44838,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -27,21 +27,21 @@
       "action": "check",
       "input_summary": "latest entry should exist",
       "output_summary": "has_latest=true, mode=Strict",
-      "duration_ns": 681,
+      "duration_ns": 872,
       "mode": "strict",
       "outcome": "ok"
     }
   ],
   "artifacts": [],
   "environment": {
-    "rust_version": "0.1.0",
+    "rust_version": "0.2.0",
     "os": "linux",
-    "cpu_count": 64,
+    "cpu_count": 8,
     "total_memory_mb": "unknown"
   },
   "overall": {
     "status": "pass",
-    "total_duration_ns": 180842,
+    "total_duration_ns": 114862,
     "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_004_ledger_fifo --nocapture"
   }
 }

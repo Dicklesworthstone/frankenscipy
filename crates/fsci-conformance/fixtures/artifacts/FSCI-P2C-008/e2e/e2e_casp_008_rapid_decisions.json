@@ -6,8 +6,8 @@
       "step_name": "rapid_1000_decisions",
       "action": "batch_decide",
       "input_summary": "1000 decisions with varying signals",
-      "output_summary": "allow=390, validate=590, fail=20, total=1000",
-      "duration_ns": 1418087,
+      "output_summary": "allow=15, validate=15, fail=970, total=1000",
+      "duration_ns": 1612774,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -17,7 +17,7 @@
       "action": "check",
       "input_summary": "ledger.len() <= capacity",
       "output_summary": "len=100, capacity=100",
-      "duration_ns": 501,
+      "duration_ns": 671,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -27,21 +27,21 @@
       "action": "check",
       "input_summary": "same signal → same action",
       "output_summary": "action1=FullValidate, action2=FullValidate, match=true",
-      "duration_ns": 4589,
+      "duration_ns": 5318,
       "mode": "strict",
       "outcome": "ok"
     }
   ],
   "artifacts": [],
   "environment": {
-    "rust_version": "0.1.0",
+    "rust_version": "0.2.0",
     "os": "linux",
-    "cpu_count": 64,
+    "cpu_count": 8,
     "total_memory_mb": "unknown"
   },
   "overall": {
     "status": "pass",
-    "total_duration_ns": 1508648,
+    "total_duration_ns": 1700826,
     "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_008_rapid_decisions --nocapture"
   }
 }

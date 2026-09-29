@@ -1,6 +1,6 @@
 {
   "packet_id": "FSCI-P2C-008",
-  "generated_at": "unix:1789628397",
+  "generated_at": "unix:1790338395",
   "fixtures": [
     {
       "fixture_id": "policy_low_risk_Strict",
@@ -117,7 +117,7 @@
     {
       "fixture_id": "portfolio_moderate_condition",
       "subsystem": "solver_portfolio",
-      "description": "ModerateCondition state → PivotedQR selection",
+      "description": "ModerateCondition state → DirectLU selection (calibrated)",
       "signal_triple": null,
       "matrix_condition": "ModerateCondition",
       "mode": "Strict"
@@ -125,7 +125,7 @@
     {
       "fixture_id": "portfolio_ill_and_near_singular",
       "subsystem": "solver_portfolio",
-      "description": "IllConditioned/NearSingular → SVDFallback",
+      "description": "IllConditioned/NearSingular → DirectLU (calibrated)",
       "signal_triple": null,
       "matrix_condition": "IllConditioned+NearSingular",
       "mode": "Strict"

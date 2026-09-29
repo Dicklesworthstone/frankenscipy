@@ -81,9 +81,9 @@ use bunch_kaufman::{BunchKaufman, Triangle};
 
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
-    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, Fingerprinter,
-    PolicyAction, PolicyController, PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry,
-    SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
+    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionSignals,
+    Fingerprinter, PolicyAction, PolicyController, PolicyDecision, PortfolioEvidence, RuntimeMode,
+    SolverAction, SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
 
@@ -179,25 +179,56 @@ fn record_bounded_recovery(
 }
 
 /// Record a CASP solver selection decision for audit trail.
-fn record_casp_decision(
-    ledger: &SyncSharedAuditLedger,
-    fingerprint: &str,
+/// A CASP solver choice, as the audit ledger records it (frankenscipy-7tb8d.11).
+#[derive(Clone, Copy)]
+struct CaspChoice {
+    /// The mode the call ran in.
+    mode: RuntimeMode,
+    /// The action that produced the answer (the fallback, when there was one).
     action: SolverAction,
-    rcond: f64,
+    posterior: [f64; 4],
+    expected_losses: [f64; 6],
+    /// Whether `action` is a fallback from the action first selected.
     fallback: bool,
-) {
-    let decision_desc = if fallback {
-        format!("CASP fallback to {:?} (rcond={rcond:.2e})", action)
+    rcond: f64,
+    structure: StructuralEvidence,
+}
+
+/// Record a CASP solver choice: the portfolio, the real mode, the action, the posterior, every
+/// action's expected loss and the chosen one's, and the rcond and structure that drove it. It
+/// used to be a `ModeDecision` that always said Strict and carried the action and rcond only.
+fn record_casp_decision(ledger: &SyncSharedAuditLedger, fingerprint: &str, choice: CaspChoice) {
+    let outcome = if choice.fallback {
+        format!(
+            "CASP fallback to {:?} (rcond={:.2e})",
+            choice.action, choice.rcond
+        )
     } else {
-        format!("CASP selected {:?} (rcond={rcond:.2e})", action)
+        format!(
+            "CASP selected {:?} (rcond={:.2e})",
+            choice.action, choice.rcond
+        )
     };
     let event = AuditEvent::new(
         casp_now_unix_ms(),
         fingerprint,
-        AuditAction::ModeDecision {
-            mode: RuntimeMode::Strict, // CASP operates in both modes
+        AuditAction::CaspDecision {
+            portfolio: <SolverPortfolio as PortfolioEvidence>::NAME.to_string(),
+            mode: choice.mode,
+            action: format!("{:?}", choice.action),
+            posterior: choice.posterior.to_vec(),
+            expected_losses: choice.expected_losses.to_vec(),
+            chosen_expected_loss: choice.expected_losses[choice.action.index()],
+            fallback: choice.fallback,
+            evidence: std::collections::BTreeMap::from([
+                ("rcond_estimate".to_string(), choice.rcond.into()),
+                (
+                    "structural_evidence".to_string(),
+                    format!("{:?}", choice.structure).into(),
+                ),
+            ]),
         },
-        decision_desc,
+        outcome,
     );
     lock_or_recover(ledger).record(event);
 }
@@ -217,26 +248,29 @@ fn record_mode_decision(
     lock_or_recover(ledger).record(event);
 }
 
-fn fail_closed_reason(error: &LinalgError) -> Option<&'static str> {
+/// The audit reason code of an error an audited call returns (frankenscipy-3cu8u.2). Every
+/// error is a fail-closed event, a numerical refusal such as a singular matrix included.
+fn fail_closed_reason(error: &LinalgError) -> &'static str {
     match error {
-        LinalgError::RaggedMatrix => Some("ragged_matrix"),
-        LinalgError::ExpectedSquareMatrix => Some("non_square_matrix"),
-        LinalgError::IncompatibleShapes { .. } => Some("incompatible_shapes"),
-        LinalgError::NonFiniteInput => Some("non_finite_input"),
-        LinalgError::InvalidBandShape { .. } => Some("invalid_band_shape"),
-        LinalgError::InvalidPinvThreshold => Some("invalid_pinv_threshold"),
-        LinalgError::UnsupportedAssumption => Some("unsupported_assumption"),
-        LinalgError::PolicyRejected { .. } => Some("policy_rejected"),
-        LinalgError::ConditionTooHigh { .. } => Some("condition_too_high"),
-        LinalgError::ResourceExhausted { .. } => Some("resource_exhausted"),
-        LinalgError::InvalidArgument { .. } => Some("invalid_argument"),
-        LinalgError::NotSupported { .. } | LinalgError::ConvergenceFailure { .. } => {
-            Some("not_supported")
-        }
-        LinalgError::SingularMatrix => None,
+        LinalgError::RaggedMatrix => "ragged_matrix",
+        LinalgError::ExpectedSquareMatrix => "non_square_matrix",
+        LinalgError::IncompatibleShapes { .. } => "incompatible_shapes",
+        LinalgError::NonFiniteInput => "non_finite_input",
+        LinalgError::InvalidBandShape { .. } => "invalid_band_shape",
+        LinalgError::InvalidPinvThreshold => "invalid_pinv_threshold",
+        LinalgError::UnsupportedAssumption => "unsupported_assumption",
+        LinalgError::PolicyRejected { .. } => "policy_rejected",
+        LinalgError::ConditionTooHigh { .. } => "condition_too_high",
+        LinalgError::ResourceExhausted { .. } => "resource_exhausted",
+        LinalgError::InvalidArgument { .. } => "invalid_argument",
+        LinalgError::NotSupported { .. } => "not_supported",
+        LinalgError::ConvergenceFailure { .. } => "convergence_failure",
+        LinalgError::SingularMatrix => "singular_matrix",
     }
 }
 
+/// One event per audited call: its mode decision when it succeeds, and a fail-closed event
+/// when it returns an error.
 fn record_operation_audit<T>(
     ledger: &SyncSharedAuditLedger,
     fingerprint: &str,
@@ -246,23 +280,12 @@ fn record_operation_audit<T>(
 ) {
     match result {
         Ok(_) => record_mode_decision(ledger, fingerprint, mode, &format!("{operation} executed")),
-        Err(error) => {
-            if let Some(reason) = fail_closed_reason(error) {
-                record_fail_closed(
-                    ledger,
-                    fingerprint,
-                    reason,
-                    &format!("{operation} rejected: {error}"),
-                );
-            } else {
-                record_mode_decision(
-                    ledger,
-                    fingerprint,
-                    mode,
-                    &format!("{operation} errored: {error}"),
-                );
-            }
-        }
+        Err(error) => record_fail_closed(
+            ledger,
+            fingerprint,
+            fail_closed_reason(error),
+            &format!("{operation} rejected: {error}"),
+        ),
     }
 }
 
@@ -513,6 +536,107 @@ pub struct SolveCertificate {
     /// [`verify_solve_certificate`] recomputes from `(A, b, x)` alone, and a forward error bound.
     /// `None` for `inv`, `lstsq` and `pinv` certificates (frankenscipy-7tb8d.6).
     pub accuracy: Option<AccuracyCertificate>,
+    /// The CASP portfolio's decision, replayable with [`replay_decision`].
+    pub decision: PortfolioDecision,
+}
+
+/// What a certificate records of the CASP portfolio's decision beyond its inputs, the
+/// certificate's rcond estimate and structural evidence (frankenscipy-7tb8d.12).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PortfolioDecision {
+    /// The portfolio's own choice. The routine may then change it: SciPy's structure order in
+    /// Strict mode, the SVD `lstsq` and `pinv` always use, or a fallback. The result is the
+    /// certificate's `action`.
+    pub action: SolverAction,
+    /// [`SolverPortfolio::state_digest`] of the portfolio when it decided.
+    pub state_digest: String,
+}
+
+impl PortfolioDecision {
+    /// `portfolio`'s choice of `action`, read before anything records into it.
+    fn of(portfolio: &SolverPortfolio, action: SolverAction) -> Self {
+        Self {
+            action,
+            state_digest: portfolio.state_digest(),
+        }
+    }
+}
+
+/// What [`replay_decision`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayReport {
+    /// The snapshot's state digest is the certificate's, and it decides the same way, bit for
+    /// bit.
+    pub replayed: bool,
+    /// Why not, or `"replayed"`.
+    pub reason: String,
+}
+
+/// Replay a certificate's CASP decision against a snapshot of the portfolio that made it
+/// (frankenscipy-7tb8d.12). The snapshot's `select_action` is fed the certificate's rcond
+/// estimate and structural evidence, and must give back the recorded portfolio choice, the
+/// posterior, every action's expected loss and the chosen action's, bit for bit.
+///
+/// A snapshot whose [`SolverPortfolio::state_digest`] differs from the certificate's is
+/// refused: its outcome counts, calibration or mode differ, so a replay would compute another
+/// decision, not check this one.
+#[must_use]
+pub fn replay_decision(certificate: &SolveCertificate, snapshot: &SolverPortfolio) -> ReplayReport {
+    let digest = snapshot.state_digest();
+    if digest != certificate.decision.state_digest {
+        return ReplayReport {
+            replayed: false,
+            reason: format!(
+                "portfolio state digest {digest} is not the certificate's {}",
+                certificate.decision.state_digest
+            ),
+        };
+    }
+    let (action, posterior, expected_losses, _) = snapshot.select_action(
+        certificate.rcond_estimate,
+        Some(certificate.structural_evidence),
+    );
+    let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let mut mismatches = Vec::new();
+    if action != certificate.decision.action {
+        mismatches.push(format!(
+            "portfolio choice {action:?}, recorded {:?}",
+            certificate.decision.action
+        ));
+    }
+    for (name, replayed, recorded) in [
+        ("posterior", &posterior[..], &certificate.posterior[..]),
+        (
+            "expected losses",
+            &expected_losses[..],
+            &certificate.expected_losses[..],
+        ),
+    ] {
+        if bits(replayed) != bits(recorded) {
+            mismatches.push(format!(
+                "{name} {replayed:?} (bits {:x?}), recorded {recorded:?} (bits {:x?})",
+                bits(replayed),
+                bits(recorded)
+            ));
+        }
+    }
+    let chosen = expected_losses[certificate.action.index()];
+    if chosen.to_bits() != certificate.chosen_expected_loss.to_bits() {
+        mismatches.push(format!(
+            "chosen expected loss {chosen:e} (bits {:x}), recorded {:e} (bits {:x})",
+            chosen.to_bits(),
+            certificate.chosen_expected_loss,
+            certificate.chosen_expected_loss.to_bits()
+        ));
+    }
+    ReplayReport {
+        replayed: mismatches.is_empty(),
+        reason: if mismatches.is_empty() {
+            "replayed".to_string()
+        } else {
+            mismatches.join("; ")
+        },
+    }
 }
 
 /// The checkable part of a solve certificate (frankenscipy-7tb8d.6). `r = b − A·x` is computed
@@ -641,8 +765,36 @@ pub struct ConditionReport {
 
 struct ConditionDiagnosticsWork {
     report: ConditionReport,
+    /// The matrix as a `DMatrix`, when the diagnostics built one (the nalgebra LU route).
     matrix_cache: Option<DMatrix<f64>>,
-    lu_cache: Option<LU<f64, Dyn, Dyn>>,
+    /// The LU factorization the rcond estimate came from; the portfolio's LU actions and the
+    /// accuracy certificate reuse it rather than factor again.
+    lu_cache: Option<LuFactorStorage>,
+    /// The Cholesky factorization of an exactly symmetric matrix, when the diagnostics tried it.
+    cholesky_cache: CholeskyProbe,
+}
+
+/// What the diagnostics learned by factoring an exactly symmetric `A` as `L·Lᵀ`
+/// (frankenscipy-w8bjb). The rcond estimate, the symmetric actions, the accuracy certificate and
+/// the `inv` detection's positive-definiteness verdict share one factorization; the symmetric
+/// action used to pay the LU the estimate took, and then a Cholesky on top.
+enum CholeskyProbe {
+    NotTried,
+    /// [`cholesky_lower_factor`]'s flat lower factor, as the symmetric actions would compute it.
+    Factor(Vec<f64>),
+    /// Not positive definite: the factorization broke down.
+    BrokeDown,
+}
+
+impl CholeskyProbe {
+    /// `A`'s lower Cholesky factor: the probe's, or factored now when the probe was not tried.
+    fn factor<'p>(&'p self, a: &[Vec<f64>], n: usize) -> Option<Cow<'p, [f64]>> {
+        match self {
+            Self::Factor(l_flat) => Some(Cow::Borrowed(l_flat)),
+            Self::BrokeDown => None,
+            Self::NotTried => cholesky_lower_factor(a, n).map(Cow::Owned),
+        }
+    }
 }
 
 /// Result of LU decomposition with partial pivoting.
@@ -1763,6 +1915,7 @@ fn condition_diagnostics_with_assumption_mode(
         diagonal || assumption == Some(MatrixAssumption::UpperTriangular) || bandwidth.0 == 0;
     let lower_triangular =
         diagonal || assumption == Some(MatrixAssumption::LowerTriangular) || bandwidth.1 == 0;
+    let exactly_symmetric = rows == cols && issymmetric(a, 0.0, 0.0)?;
     let symmetric = matches!(
         assumption,
         Some(
@@ -1770,9 +1923,7 @@ fn condition_diagnostics_with_assumption_mode(
                 | MatrixAssumption::Hermitian
                 | MatrixAssumption::PositiveDefinite
         )
-    ) || (rows == cols && issymmetric(a, 0.0, 0.0)?);
-    let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
-        || (evaluate_positive_definite && symmetric && is_positive_definite(a));
+    ) || exactly_symmetric;
     let banded = rows > 0
         && cols > 0
         && (diagonal
@@ -1812,6 +1963,37 @@ fn condition_diagnostics_with_assumption_mode(
         },
     };
 
+    // frankenscipy-w8bjb: an exactly symmetric matrix that the symmetric action will factor by
+    // Cholesky (or whose positive definiteness `inv`'s detection asks for) is factored here,
+    // once, and the rcond estimate is taken from that factor, as LAPACK's `pocon` takes it.
+    // Only an exactly symmetric matrix: under an explicit 'pos' the factor of one triangle is
+    // not the factor of `A`. An explicit 'sym' / 'her' goes to LDLᵀ and needs no Cholesky.
+    let cholesky_route = !matches!(
+        assumption,
+        Some(MatrixAssumption::Symmetric | MatrixAssumption::Hermitian)
+    );
+    let cholesky_cache = if rows > 4
+        && exactly_symmetric
+        && !diagonal
+        && ((cholesky_route && structural_evidence == StructuralEvidence::Symmetric)
+            || evaluate_positive_definite)
+    {
+        match cholesky_lower_factor(a, rows) {
+            Some(l_flat) => CholeskyProbe::Factor(l_flat),
+            None => CholeskyProbe::BrokeDown,
+        }
+    } else {
+        CholeskyProbe::NotTried
+    };
+    let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
+        || (evaluate_positive_definite
+            && symmetric
+            && match &cholesky_cache {
+                CholeskyProbe::Factor(_) => true,
+                CholeskyProbe::BrokeDown => false,
+                CholeskyProbe::NotTried => is_positive_definite(a),
+            });
+
     let mut matrix_cache = None;
     let mut lu_cache = None;
     let rcond_estimate = if rows == 0 || cols == 0 {
@@ -1824,6 +2006,20 @@ fn condition_diagnostics_with_assumption_mode(
         fast_rcond_triangular(a, true)
     } else if upper_triangular && !lower_triangular {
         fast_rcond_triangular(a, false)
+    } else if let CholeskyProbe::Factor(l_flat) = &cholesky_cache {
+        fast_rcond_from_cholesky(l_flat, rows, matrix_norm1_rows(a, cols))
+    } else if rows > 4
+        && rows >= lu_factor_flat_min()
+        && !flat_lu_factor_disabled()
+        && let Some(factors) = lu_factor_blocked(a)
+    {
+        // frankenscipy-u87cd: from `lu_factor`'s measured crossover up, the parallel blocked
+        // LU `solve()` and `lu_factor` use, not nalgebra's serial one; the rcond estimate is
+        // the same Higham iteration over it. A singular pivot falls through to nalgebra below,
+        // so singular matrices are diagnosed exactly as before.
+        let rcond = fast_rcond_from_flat_lu(&factors, matrix_norm1_rows(a, cols));
+        lu_cache = Some(LuFactorStorage::Flat(factors));
+        rcond
     } else {
         let (matrix, matrix_norm_1) = dmatrix_from_rows_with_norm1(a)?;
         let lu = matrix.clone().lu();
@@ -1836,7 +2032,7 @@ fn condition_diagnostics_with_assumption_mode(
             fast_rcond_from_lu(&lu, matrix_norm_1, rows)
         };
         matrix_cache = Some(matrix);
-        lu_cache = Some(lu);
+        lu_cache = Some(LuFactorStorage::Nalgebra(lu));
         rcond
     };
 
@@ -1857,6 +2053,7 @@ fn condition_diagnostics_with_assumption_mode(
         },
         matrix_cache,
         lu_cache,
+        cholesky_cache,
     })
 }
 
@@ -2165,6 +2362,7 @@ fn build_solve_certificate(
     expected_losses: [f64; 6],
     fallback_active: bool,
     accuracy: AccuracyCertificate,
+    decision: PortfolioDecision,
 ) -> SolveCertificate {
     SolveCertificate {
         action,
@@ -2176,6 +2374,7 @@ fn build_solve_certificate(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active,
         accuracy: Some(accuracy),
+        decision,
     }
 }
 
@@ -2326,6 +2525,10 @@ enum InverseAccess<'a> {
     Triangular { lower: bool },
     /// An LU factorization of `A`.
     Lu(&'a LU<f64, Dyn, Dyn>),
+    /// A blocked LU factorization of `A` (frankenscipy-u87cd).
+    Flat(&'a LuFactorsFlat),
+    /// The flat lower Cholesky factor of a symmetric `A` (frankenscipy-w8bjb); `A⁻ᵀ = A⁻¹`.
+    Cholesky(&'a [f64]),
 }
 
 /// LAPACK xGERFS's forward error bound (see [`AccuracyCertificate::forward_error_bound`]).
@@ -2378,6 +2581,39 @@ fn forward_error_bound(
                 None => return (None, ForwardBoundMethod::Unavailable),
             }
         }
+        InverseAccess::Flat(factors) if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            // Column j of A⁻¹ solves A·c = e_j.
+            let columns: Option<Vec<Vec<f64>>> = (0..n)
+                .map(|j| {
+                    let mut e = vec![0.0; n];
+                    e[j] = 1.0;
+                    lu_solve_flat_factored(factors, &e)
+                })
+                .collect();
+            match columns {
+                Some(columns) => (
+                    explicit(&|i, j| columns[j][i]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                None => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
+        InverseAccess::Cholesky(l_flat) if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            let columns: Option<Vec<Vec<f64>>> = (0..n)
+                .map(|j| {
+                    let mut e = vec![0.0; n];
+                    e[j] = 1.0;
+                    cho_solve_lower_flat(l_flat, n, &e)
+                })
+                .collect();
+            match columns {
+                Some(columns) => (
+                    explicit(&|i, j| columns[j][i]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                None => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
         // ‖ |A⁻¹| g ‖∞ = ‖ A⁻¹·diag(g) ‖∞ = ‖ M ‖₁ with M = diag(g)·A⁻ᵀ, as xGERFS estimates it.
         InverseAccess::Triangular { lower } => {
             let solve_with = |v: &mut Vec<f64>, trans: TriangularTranspose| {
@@ -2416,6 +2652,40 @@ fn forward_error_bound(
                     let rhs = DVector::from_iterator(n, v.iter().zip(&g).map(|(e, gi)| e * gi));
                     match lu.solve(&rhs) {
                         Some(w) => *v = w.iter().copied().collect(),
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
+        InverseAccess::Flat(factors) => {
+            let estimate = one_norm_estimate(
+                n,
+                |v| match lu_subst_factored_transpose(factors, v) {
+                    Some(w) => *v = w.iter().zip(&g).map(|(e, gi)| e * gi).collect(),
+                    None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                },
+                |v| {
+                    let rhs: Vec<f64> = v.iter().zip(&g).map(|(e, gi)| e * gi).collect();
+                    match lu_solve_flat_factored(factors, &rhs) {
+                        Some(w) => *v = w,
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
+        InverseAccess::Cholesky(l_flat) => {
+            let estimate = one_norm_estimate(
+                n,
+                |v| match cho_solve_lower_flat(l_flat, n, v) {
+                    Some(w) => *v = w.iter().zip(&g).map(|(e, gi)| e * gi).collect(),
+                    None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                },
+                |v| {
+                    let rhs: Vec<f64> = v.iter().zip(&g).map(|(e, gi)| e * gi).collect();
+                    match cho_solve_lower_flat(l_flat, n, &rhs) {
+                        Some(w) => *v = w,
                         None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
                     }
                 },
@@ -2465,14 +2735,15 @@ fn solved_matrix(a: &[Vec<f64>], part: SolvedPart) -> Cow<'_, [Vec<f64>]> {
     )
 }
 
-/// The accuracy part of a solve certificate for `x` from a solve of `A·x = b`. `lu` is the
-/// diagnostics' factorization of `A`, when there is one.
+/// The accuracy part of a solve certificate for `x` from a solve of `A·x = b`. `lu` and
+/// `cholesky` are the diagnostics' factorizations of `A`, when there are any.
 fn certify_accuracy(
     a: &[Vec<f64>],
     b: &[f64],
     x: &[f64],
     report: &ConditionReport,
-    lu: Option<&LU<f64, Dyn, Dyn>>,
+    lu: Option<&LuFactorStorage>,
+    cholesky: &CholeskyProbe,
 ) -> AccuracyCertificate {
     let part = solved_part(report);
     let solved = solved_matrix(a, part);
@@ -2482,9 +2753,11 @@ fn certify_accuracy(
         SolvedPart::Diagonal => Some(InverseAccess::Diagonal),
         SolvedPart::LowerTriangle => Some(InverseAccess::Triangular { lower: true }),
         SolvedPart::UpperTriangle => Some(InverseAccess::Triangular { lower: false }),
-        SolvedPart::Full => match lu {
-            Some(lu) => Some(InverseAccess::Lu(lu)),
-            None => match dmatrix_from_rows(&solved) {
+        SolvedPart::Full => match (lu, cholesky) {
+            (Some(LuFactorStorage::Nalgebra(lu)), _) => Some(InverseAccess::Lu(lu)),
+            (Some(LuFactorStorage::Flat(factors)), _) => Some(InverseAccess::Flat(factors)),
+            (None, CholeskyProbe::Factor(l_flat)) => Some(InverseAccess::Cholesky(l_flat)),
+            (None, _) => match dmatrix_from_rows(&solved) {
                 Ok(matrix) => {
                     fresh_lu = matrix.lu();
                     Some(InverseAccess::Lu(&fresh_lu))
@@ -2660,6 +2933,7 @@ fn symmetric_solve(
     a: &[Vec<f64>],
     b: &[f64],
     factorization: SymmetricFactorization,
+    cholesky: &CholeskyProbe,
 ) -> Result<Vec<f64>, LinalgError> {
     let n = a.len();
     let ldl = || {
@@ -2672,7 +2946,7 @@ fn symmetric_solve(
     if factorization.route == SymmetricRoute::Ldl {
         return ldl();
     }
-    match cholesky_lower_factor(a, n) {
+    match cholesky.factor(a, n) {
         Some(l_flat) => cho_solve_lower_flat(&l_flat, n, b).ok_or(LinalgError::SingularMatrix),
         None if factorization.route == SymmetricRoute::CholeskyThenLdl => ldl(),
         None => Err(LinalgError::SingularMatrix),
@@ -2685,6 +2959,7 @@ fn symmetric_solve(
 fn symmetric_inverse(
     a: &[Vec<f64>],
     factorization: SymmetricFactorization,
+    cholesky: &CholeskyProbe,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
     let n = a.len();
     let ldl = || {
@@ -2697,7 +2972,7 @@ fn symmetric_inverse(
     if factorization.route == SymmetricRoute::Ldl {
         return ldl();
     }
-    let Some(l_flat) = cholesky_lower_factor(a, n) else {
+    let Some(l_flat) = cholesky.factor(a, n) else {
         return if factorization.route == SymmetricRoute::CholeskyThenLdl {
             ldl()
         } else {
@@ -2724,16 +2999,40 @@ fn dispatch_solve_action(
     report: &ConditionReport,
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
-    lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &mut Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
 ) -> Result<SolveResult, LinalgError> {
     match action {
         SolverAction::DirectLU => {
+            // A matrix the diagnostics factored by Cholesky has no LU yet (frankenscipy-w8bjb):
+            // take the one they would have taken, so LU on it is the same factorization.
+            let n = effective_a.len();
+            if lu_cache.is_none()
+                && matches!(cholesky_cache, CholeskyProbe::Factor(_))
+                && n >= lu_factor_flat_min()
+                && !flat_lu_factor_disabled()
+                && let Some(factors) = lu_factor_blocked(effective_a)
+            {
+                *lu_cache = Some(LuFactorStorage::Flat(factors));
+            }
+            // The diagnostics' blocked factorization (frankenscipy-u87cd); the backward error
+            // is the same quantity the nalgebra route computes, summed in another order.
+            if let Some(LuFactorStorage::Flat(factors)) = lu_cache.as_ref() {
+                let x = lu_solve_flat_factored(factors, b).ok_or(LinalgError::SingularMatrix)?;
+                let backward_error = compute_backward_error_dense(effective_a, &x, b);
+                return Ok(SolveResult {
+                    x,
+                    warning: rcond_warning(report.rcond_estimate),
+                    backward_error: Some(backward_error),
+                    certificate: None,
+                });
+            }
             let matrix = if let Some(matrix) = matrix_cache.take() {
                 matrix
             } else {
                 dmatrix_from_rows(effective_a)?
             };
-            let lu = if let Some(lu) = lu_cache.take() {
+            let lu = if let Some(LuFactorStorage::Nalgebra(lu)) = lu_cache.take() {
                 lu
             } else {
                 matrix.clone().lu()
@@ -2745,7 +3044,7 @@ fn dispatch_solve_action(
                 .map(|x| compute_backward_error(&matrix, x, &rhs));
             // Handed back: the accuracy certificate's forward bound reuses the factorization.
             *matrix_cache = Some(matrix);
-            *lu_cache = Some(lu);
+            *lu_cache = Some(LuFactorStorage::Nalgebra(lu));
             let x = solved.ok_or(LinalgError::SingularMatrix)?;
             let backward_err = backward_err.unwrap_or(f64::INFINITY);
             Ok(SolveResult {
@@ -2766,7 +3065,7 @@ fn dispatch_solve_action(
             false,
         ),
         SolverAction::SymmetricFastPath => {
-            let x = symmetric_solve(effective_a, b, symmetric)?;
+            let x = symmetric_solve(effective_a, b, symmetric, cholesky_cache)?;
             let backward_error = compute_backward_error_dense(effective_a, &x, b);
             Ok(SolveResult {
                 x,
@@ -2780,8 +3079,57 @@ fn dispatch_solve_action(
 
 /// Backward error above which an attempt that returned `Ok` still counts as a FAILED attempt:
 /// the portfolio records it as `Inaccurate` and the next action is tried. Same bar as the
-/// drift counter and the full-validation policy.
-const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_THRESHOLD;
+/// drift counter and the full-validation policy, and the bar the CASP loss calibration counts
+/// failures against (frankenscipy-7tb8d.2).
+pub const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_THRESHOLD;
+
+/// Solve `A·x = b` with exactly one CASP action, bypassing the portfolio's choice
+/// (frankenscipy-7tb8d.2): the loss calibration measures every action on every matrix through
+/// it, and a caller who knows which factorization they want can ask for it. The structure is
+/// detected as `solve` detects it for `assume_a=None`; an action that structure does not admit
+/// (a triangular solve of a full matrix) is `NotSupported`. The result carries the action's
+/// backward error and no certificate.
+pub fn solve_with_action(
+    a: &[Vec<f64>],
+    b: &[f64],
+    action: SolverAction,
+) -> Result<SolveResult, LinalgError> {
+    let (rows, cols) = matrix_shape(a)?;
+    if rows != cols {
+        return Err(LinalgError::ExpectedSquareMatrix);
+    }
+    if b.len() != rows {
+        return Err(LinalgError::IncompatibleShapes {
+            a_shape: (rows, cols),
+            b_len: b.len(),
+        });
+    }
+    validate_finite_matrix_and_vector(a, b, RuntimeMode::Strict, true)?;
+    let ConditionDiagnosticsWork {
+        report,
+        mut matrix_cache,
+        mut lu_cache,
+        cholesky_cache,
+    } = condition_diagnostics_for_solve(a, None)?;
+    if !candidate_actions(report.structural_evidence).contains(&action) {
+        return Err(LinalgError::NotSupported {
+            detail: format!(
+                "{action:?} does not apply to a matrix with {:?} structure",
+                report.structural_evidence
+            ),
+        });
+    }
+    dispatch_solve_action(
+        action,
+        a,
+        b,
+        &report,
+        SymmetricFactorization::new(None, false),
+        &mut matrix_cache,
+        &mut lu_cache,
+        &cholesky_cache,
+    )
+}
 
 /// Try portfolio actions until one returns an accurate solution; returns the action that
 /// produced the result (or `selected_action` when every attempt errored).
@@ -2802,10 +3150,12 @@ fn run_portfolio_attempts(
     report: &ConditionReport,
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
-    lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &mut Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
     selected_action: SolverAction,
     posterior: [f64; 4],
     expected_losses: [f64; 6],
+    decision: PortfolioDecision,
 ) -> (SolverAction, Result<SolveResult, LinalgError>) {
     let applicable = candidate_actions(report.structural_evidence);
     let rcond = report.rcond_estimate;
@@ -2824,6 +3174,7 @@ fn run_portfolio_attempts(
             symmetric,
             matrix_cache,
             lu_cache,
+            cholesky_cache,
         ) {
             Ok(solve_result) => {
                 let omega = solve_result.backward_error.unwrap_or(0.0);
@@ -2864,8 +3215,14 @@ fn run_portfolio_attempts(
     }
     match accepted.or(least_inaccurate) {
         Some((action, mut solve_result)) => {
-            let accuracy =
-                certify_accuracy(effective_a, b, &solve_result.x, report, lu_cache.as_ref());
+            let accuracy = certify_accuracy(
+                effective_a,
+                b,
+                &solve_result.x,
+                report,
+                lu_cache.as_ref(),
+                cholesky_cache,
+            );
             solve_result.certificate = Some(build_solve_certificate(
                 report,
                 action,
@@ -2873,6 +3230,7 @@ fn run_portfolio_attempts(
                 expected_losses,
                 action != selected_action,
                 accuracy,
+                decision,
             ));
             (action, Ok(solve_result))
         }
@@ -2940,6 +3298,7 @@ fn solve_with_portfolio_internal(
         report,
         mut matrix_cache,
         mut lu_cache,
+        cholesky_cache,
     } = diagnostics;
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
@@ -2972,6 +3331,7 @@ fn solve_with_portfolio_internal(
         &[],
     );
 
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -2981,9 +3341,11 @@ fn solve_with_portfolio_internal(
         SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
+        &cholesky_cache,
         selected_action,
         posterior,
         expected_losses,
+        decision,
     );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
@@ -3040,9 +3402,11 @@ pub fn solve_with_casp(
 /// Solve linear system with full audit logging.
 ///
 /// Records to the provided `AuditLedger`:
-/// - `FailClosed` events when validation rejects input (non-finite, ill-conditioned)
 /// - CASP solver selection decisions
 /// - Bounded recovery events in hardened mode
+/// - one `FailClosed` event for every error it returns, in either mode, after the call's other
+///   events: validation rejections (non-finite, ill-conditioned) under their own reasons and
+///   every other error, a singular matrix included, under [`fail_closed_reason`]
 pub fn solve_with_audit(
     a: &[Vec<f64>],
     b: &[f64],
@@ -3050,27 +3414,38 @@ pub fn solve_with_audit(
     portfolio: &mut SolverPortfolio,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
-    let fingerprint = audit_fingerprint("fsci_linalg::solve", &options, |f| {
-        f.rows(a).f64s(b);
-    });
+    let fingerprint_of = || {
+        audit_fingerprint("fsci_linalg::solve", &options, |f| {
+            f.rows(a).f64s(b);
+        })
+    };
+    let audit = AuditScope::new(audit_ledger, &fingerprint_of);
+    let result = solve_audited(a, b, options, portfolio, &audit);
+    audit.finish(result, fail_closed_reason)
+}
+
+/// [`solve_with_audit`]'s solve, recording its events under `audit`.
+fn solve_audited(
+    a: &[Vec<f64>],
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SolverPortfolio,
+    audit: &AuditScope<'_>,
+) -> Result<SolveResult, LinalgError> {
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
 
     // Validation with audit logging
     if rows != cols {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "non_square_matrix",
             &format!("rejected: {rows}x{cols} is not square"),
         );
         return Err(LinalgError::ExpectedSquareMatrix);
     }
     if b.len() != rows {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "incompatible_shapes",
             &format!("rejected: b.len()={} != rows={rows}", b.len()),
         );
@@ -3083,9 +3458,7 @@ pub fn solve_with_audit(
     // Hardened dimension check with audit
     if options.mode == RuntimeMode::Hardened && (rows > HARDENED_MAX_DIM || cols > HARDENED_MAX_DIM)
     {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "resource_exhausted",
             &format!("rejected: {rows}x{cols} exceeds hardened limit {HARDENED_MAX_DIM}"),
         );
@@ -3100,21 +3473,11 @@ pub fn solve_with_audit(
     let must_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     if must_check {
         if a.iter().flatten().any(|v| !v.is_finite()) {
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "non_finite_matrix",
-                "rejected: matrix contains NaN or Inf",
-            );
+            audit.reject("non_finite_matrix", "rejected: matrix contains NaN or Inf");
             return Err(LinalgError::NonFiniteInput);
         }
         if b.iter().any(|v| !v.is_finite()) {
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "non_finite_vector",
-                "rejected: vector contains NaN or Inf",
-            );
+            audit.reject("non_finite_vector", "rejected: vector contains NaN or Inf");
             return Err(LinalgError::NonFiniteInput);
         }
     }
@@ -3142,6 +3505,7 @@ pub fn solve_with_audit(
         report,
         mut matrix_cache,
         mut lu_cache,
+        cholesky_cache,
     } = diagnostics;
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
@@ -3149,12 +3513,7 @@ pub fn solve_with_audit(
                 match solve_policy_decision(options.mode, &report, metadata_incompatibility_score) {
                     Ok(decision) => decision,
                     Err(err) => {
-                        record_fail_closed(
-                            audit_ledger,
-                            &fingerprint,
-                            "policy_rejected",
-                            &format!("rejected: {err}"),
-                        );
+                        audit.reject("policy_rejected", &format!("rejected: {err}"));
                         return Err(err);
                     }
                 },
@@ -3168,9 +3527,7 @@ pub fn solve_with_audit(
         && report.rcond_estimate < HARDENED_RCOND_THRESHOLD
         && report.rcond_estimate > 0.0
     {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "condition_too_high",
             &format!(
                 "rejected: rcond={:.2e} < threshold={:.2e}",
@@ -3193,6 +3550,7 @@ pub fn solve_with_audit(
         &[],
     );
 
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3202,40 +3560,48 @@ pub fn solve_with_audit(
         SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
+        &cholesky_cache,
         selected_action,
         posterior,
         expected_losses,
+        decision,
     );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
         Ok(solve_result)
     });
-    if matches!(&result, Err(LinalgError::ConvergenceFailure { .. })) {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "policy_full_validation",
-            "rejected: policy full validation failed",
-        );
-    }
 
     // Record CASP decision to audit ledger
     let fallback_active = actual_action != selected_action;
     record_casp_decision(
-        audit_ledger,
-        &fingerprint,
-        actual_action,
-        report.rcond_estimate,
-        fallback_active,
+        audit.ledger(),
+        audit.fingerprint(),
+        CaspChoice {
+            mode: options.mode,
+            action: actual_action,
+            posterior,
+            expected_losses,
+            fallback: fallback_active,
+            rcond: report.rcond_estimate,
+            structure: report.structural_evidence,
+        },
     );
 
     // Record bounded recovery if fallback occurred in hardened mode
     if fallback_active && options.mode == RuntimeMode::Hardened {
         record_bounded_recovery(
-            audit_ledger,
-            &fingerprint,
+            audit.ledger(),
+            audit.fingerprint(),
             &format!("fallback from {:?} to {:?}", selected_action, actual_action),
             "recovered via safer solver",
+        );
+    }
+
+    // After the decision it failed under, so the fail-closed event is the call's last.
+    if matches!(&result, Err(LinalgError::ConvergenceFailure { .. })) {
+        audit.reject(
+            "policy_full_validation",
+            "rejected: policy full validation failed",
         );
     }
 
@@ -3304,6 +3670,7 @@ pub fn inv_with_casp(
         report,
         matrix_cache,
         lu_cache,
+        cholesky_cache,
     } = diagnostics;
 
     // For truly singular matrices, error immediately - inv() should not fall back to pinv
@@ -3313,6 +3680,7 @@ pub fn inv_with_casp(
 
     let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let selected_action = strict_order_action(
         options.mode,
         report.structural_evidence,
@@ -3368,6 +3736,7 @@ pub fn inv_with_casp(
             lower_triangular,
             &matrix_cache,
             &lu_cache,
+            &cholesky_cache,
         ) {
             Ok(mut inv_result) => {
                 let fallback_active = action != selected_action;
@@ -3381,6 +3750,7 @@ pub fn inv_with_casp(
                     chosen_expected_loss: expected_losses[action.index()],
                     fallback_active,
                     accuracy: None,
+                    decision: decision.clone(),
                 });
                 actual_action = action;
                 result = Some(inv_result);
@@ -3523,7 +3893,8 @@ fn dispatch_inv_action(
     symmetric: SymmetricFactorization,
     lower_triangular: bool,
     matrix_cache: &Option<DMatrix<f64>>,
-    lu_cache: &Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
 ) -> Result<InvResult, LinalgError> {
     match action {
         SolverAction::DiagonalFastPath | SolverAction::TriangularFastPath => {
@@ -3546,7 +3917,7 @@ fn dispatch_inv_action(
             })
         }
         SolverAction::SymmetricFastPath => {
-            let inverse = symmetric_inverse(a, symmetric)?;
+            let inverse = symmetric_inverse(a, symmetric, cholesky_cache)?;
             let rcond = rcond_from_inverse(a, &inverse, n);
             if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
                 return Err(LinalgError::ConditionTooHigh {
@@ -3564,9 +3935,44 @@ fn dispatch_inv_action(
             })
         }
         SolverAction::DirectLU => {
+            // A matrix the diagnostics factored by Cholesky has no LU yet (frankenscipy-w8bjb):
+            // take the one they would have taken.
+            let fresh = if lu_cache.is_none()
+                && matches!(cholesky_cache, CholeskyProbe::Factor(_))
+                && n >= lu_factor_flat_min()
+                && !flat_lu_factor_disabled()
+            {
+                lu_factor_blocked(a).map(LuFactorStorage::Flat)
+            } else {
+                None
+            };
+            let lu_cache = fresh.as_ref().or(lu_cache.as_ref());
+            // The diagnostics' blocked factorization (frankenscipy-u87cd): the same rcond,
+            // pivot and Hardened checks as the nalgebra route below, over its factors.
+            if let Some(LuFactorStorage::Flat(factors)) = lu_cache {
+                let a_norm_1 = matrix_norm1_rows(a, n);
+                let rcond = fast_rcond_from_flat_lu(factors, a_norm_1);
+                let pivot_tiny = (0..n)
+                    .any(|i| factors.data[i * n + i].abs() <= f64::EPSILON * a_norm_1.max(1.0));
+                if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0
+                {
+                    return Err(LinalgError::ConditionTooHigh {
+                        rcond,
+                        threshold: HARDENED_RCOND_THRESHOLD,
+                    });
+                }
+                if rcond == 0.0 || rcond < f64::EPSILON || pivot_tiny {
+                    return Err(LinalgError::SingularMatrix);
+                }
+                return Ok(InvResult {
+                    inverse: inverse_from_flat_lu(factors).ok_or(LinalgError::SingularMatrix)?,
+                    warning: rcond_warning(rcond),
+                    certificate: None,
+                });
+            }
             // Use cached LU if available
             let (matrix, lu) = match (matrix_cache, lu_cache) {
-                (Some(m), Some(lu)) => (m.clone(), lu.clone()),
+                (Some(m), Some(LuFactorStorage::Nalgebra(lu))) => (m.clone(), lu.clone()),
                 _ => {
                     let m = dmatrix_from_rows(a)?;
                     let lu = m.clone().lu();
@@ -3715,6 +4121,7 @@ fn lstsq_with_casp_kernel(
     if let Some(fast) = lstsq_low_rank_tall(a, b, rows, cols, cond, LOW_RANK_PINV_MIN_COLS) {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3727,6 +4134,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3767,6 +4175,7 @@ fn lstsq_with_casp_kernel(
     {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3779,6 +4188,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3816,6 +4226,7 @@ fn lstsq_with_casp_kernel(
     {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3828,6 +4239,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3875,6 +4287,7 @@ fn lstsq_with_casp_kernel(
 
             let (selected_action, posterior, expected_losses, _) =
                 portfolio.select_action(rcond_estimate, None);
+            let decision = PortfolioDecision::of(portfolio, selected_action);
             let action = SolverAction::SVDFallback;
             let x = thin_svd.least_squares_solution(threshold, &rhs)?;
             let residual = &rhs - &matrix * x.clone();
@@ -3889,6 +4302,7 @@ fn lstsq_with_casp_kernel(
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: action != selected_action,
                 accuracy: None,
+                decision,
             };
 
             emit_trace(LinalgTrace {
@@ -3957,6 +4371,7 @@ fn lstsq_with_casp_kernel(
 
     let (selected_action, posterior, expected_losses, _) =
         portfolio.select_action(rcond_estimate, None);
+    let decision = PortfolioDecision::of(portfolio, selected_action);
 
     // For lstsq, QR can only solve square systems in nalgebra; use SVD for non-square
     // Also prefer SVD for ill-conditioned or rank-deficient cases
@@ -4024,6 +4439,7 @@ fn lstsq_with_casp_kernel(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: action != selected_action,
         accuracy: None,
+        decision,
     };
 
     emit_trace(LinalgTrace {
@@ -4086,7 +4502,9 @@ pub fn pinv_with_casp(
     }
 
     if let Some(fast) = pinv_low_rank_tall(a, rows, cols, atol, rtol) {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4099,6 +4517,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4133,7 +4552,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_tall_cholesky(&matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4146,6 +4567,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4179,7 +4601,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_wide_cholesky(a, &matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4192,6 +4616,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4225,7 +4650,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_square_lu(a, &matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4238,6 +4665,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4281,7 +4709,9 @@ pub fn pinv_with_casp(
                 .count();
             let pinv_matrix = thin_svd.pseudo_inverse(threshold);
 
-            let (_, posterior, expected_losses, _) = portfolio.select_action(rcond_estimate, None);
+            let (portfolio_action, posterior, expected_losses, _) =
+                portfolio.select_action(rcond_estimate, None);
+            let decision = PortfolioDecision::of(portfolio, portfolio_action);
             let action = SolverAction::SVDFallback;
 
             let certificate = SolveCertificate {
@@ -4294,6 +4724,7 @@ pub fn pinv_with_casp(
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: false,
                 accuracy: None,
+                decision,
             };
 
             emit_trace(LinalgTrace {
@@ -4350,7 +4781,9 @@ pub fn pinv_with_casp(
     let pinv_matrix = pseudo_inverse_from_svd(&svd, threshold)?;
 
     // For pinv, always SVD but record the portfolio decision for audit
-    let (_, posterior, expected_losses, _) = portfolio.select_action(rcond_estimate, None);
+    let (portfolio_action, posterior, expected_losses, _) =
+        portfolio.select_action(rcond_estimate, None);
+    let decision = PortfolioDecision::of(portfolio, portfolio_action);
     let action = SolverAction::SVDFallback;
 
     let certificate = SolveCertificate {
@@ -4363,6 +4796,7 @@ pub fn pinv_with_casp(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: false,
         accuracy: None,
+        decision,
     };
 
     emit_trace(LinalgTrace {
@@ -23742,7 +24176,34 @@ fn lu_solve_flat_factored(factors: &LuFactorsFlat, b: &[f64]) -> Option<Vec<f64>
 }
 
 fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
-    let n = factors.n;
+    rcond_from_solves(
+        factors.n,
+        a_norm,
+        |v| lu_subst_factored_transpose(factors, v),
+        |v| lu_solve_flat_factored(factors, v),
+    )
+}
+
+/// [`fast_rcond_from_flat_lu`]'s estimate over a Cholesky factor `A = L·Lᵀ` (frankenscipy-w8bjb):
+/// `A` is symmetric, so `A⁻ᵀ = A⁻¹` and both solves go through the factor, as LAPACK's `pocon`
+/// estimates from it.
+fn fast_rcond_from_cholesky(l_flat: &[f64], n: usize, a_norm: f64) -> f64 {
+    rcond_from_solves(
+        n,
+        a_norm,
+        |v| cho_solve_lower_flat(l_flat, n, v),
+        |v| cho_solve_lower_flat(l_flat, n, v),
+    )
+}
+
+/// The Higham-style 1-norm estimate of `‖A⁻¹‖₁` from a solve with `Aᵀ` and a solve with `A`,
+/// as `1 / (‖A‖₁ · ‖A⁻¹‖₁)`; a failed solve reads as singular.
+fn rcond_from_solves(
+    n: usize,
+    a_norm: f64,
+    solve_transpose: impl Fn(&[f64]) -> Option<Vec<f64>>,
+    solve: impl Fn(&[f64]) -> Option<Vec<f64>>,
+) -> f64 {
     if n == 0 {
         return 1.0;
     }
@@ -23757,7 +24218,7 @@ fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
             .iter()
             .map(|&value| if value >= 0.0 { 1.0 } else { -1.0 })
             .collect();
-        let w = match lu_subst_factored_transpose(factors, &sign_x) {
+        let w = match solve_transpose(&sign_x) {
             Some(w) => w,
             None => return 0.0,
         };
@@ -23765,7 +24226,7 @@ fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
             .iter()
             .map(|&value| if value >= 0.0 { 1.0 } else { -1.0 })
             .collect();
-        let x_new = match lu_solve_flat_factored(factors, &sign_w) {
+        let x_new = match solve(&sign_w) {
             Some(x_new) => x_new,
             None => return 0.0,
         };
@@ -24055,7 +24516,9 @@ fn lu_subst_factored_f32(factors: &LuFactorsFlatF32, rhs: &[f64]) -> Option<Vec<
 pub static DISABLE_MIXED_LU: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Runtime switch to force `lu_factor` onto the original nalgebra storage path.
+/// Runtime switch to force `lu_factor`, and the CASP portfolio's condition diagnostics and
+/// LU actions (`solve_with_casp`, `solve_with_audit`, `inv_with_casp` and the portfolio
+/// fallback of `solve`/`inv`; frankenscipy-u87cd), onto the original nalgebra storage path.
 /// This exists for same-worker A/B Criterion evidence; production default is the
 /// flat blocked factor path for large matrices.
 #[doc(hidden)]
@@ -25852,15 +26315,23 @@ fn inv_blocked(a_in: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     if n == 0 || !rows_are_rectangular(a_in, n) {
         return None;
     }
-    let factors = lu_factor_blocked(a_in)?;
+    inverse_from_flat_lu(&lu_factor_blocked(a_in)?)
+}
 
+/// `A⁻¹` from a blocked LU factorization of `A`: `A·X = I` as a multi-RHS TRSM, in
+/// column-blocks across threads.
+fn inverse_from_flat_lu(factors: &LuFactorsFlat) -> Option<Vec<Vec<f64>>> {
+    let n = factors.n;
+    if n == 0 {
+        return None;
+    }
     // Solve A·X = I as a multi-RHS TRSM, in column-blocks across threads.
     let nthreads = matmul_thread_count(n, n, n);
     let blocks: Vec<Option<Vec<f64>>> = if nthreads <= 1 {
-        vec![trsm_inv_columns(&factors, 0, n)]
+        vec![trsm_inv_columns(factors, 0, n)]
     } else {
         let chunk = n.div_ceil(nthreads);
-        let factors_ref = &factors;
+        let factors_ref = factors;
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..nthreads)
                 .filter_map(|t| {
@@ -28486,7 +28957,19 @@ mod tests {
             "svd_fallback",
             "recovered",
         );
-        record_casp_decision(&audit_ledger, "casp", SolverAction::DirectLU, 1.0, false);
+        record_casp_decision(
+            &audit_ledger,
+            "casp",
+            CaspChoice {
+                mode: RuntimeMode::Strict,
+                action: SolverAction::DirectLU,
+                posterior: [1.0, 0.0, 0.0, 0.0],
+                expected_losses: [1.0; 6],
+                fallback: false,
+                rcond: 1.0,
+                structure: StructuralEvidence::General,
+            },
+        );
         record_mode_decision(&audit_ledger, "mode", RuntimeMode::Strict, "executed");
 
         let ledger = audit_ledger
@@ -29330,6 +29813,278 @@ mod tests {
         );
     }
 
+    /// frankenscipy-u87cd: from `lu_factor`'s blocked-LU gate up, the CASP portfolio's
+    /// diagnostics factor with the blocked LU and its LU actions reuse that factorization;
+    /// below the gate they keep nalgebra's and the results are bit-identical to it. Above the
+    /// gate the answers agree with nalgebra's to the reassociation of the blocked update, and
+    /// the rcond estimate, the action and the posterior are the same. A matrix the blocked LU
+    /// finds singular is diagnosed on nalgebra's factorization, as before.
+    #[test]
+    fn portfolio_lu_actions_reuse_the_blocked_factorization_from_its_gate() {
+        let dominant = |n: usize, seed: u64| {
+            let mut state = seed;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 101) as f64 - 50.0
+            };
+            let a: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| next() + if i == j { 60.0 * n as f64 } else { 0.0 })
+                        .collect()
+                })
+                .collect();
+            let b: Vec<f64> = (0..n).map(|_| next()).collect();
+            (a, b)
+        };
+        let relative = |x: &[f64], reference: &[f64]| {
+            let scale = reference.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            x.iter()
+                .zip(reference)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0_f64, f64::max)
+                / scale
+        };
+        for (n, flat) in [
+            (LU_FACTOR_FLAT_MIN_DIM - 1, false),
+            (LU_FACTOR_FLAT_MIN_DIM + 2, true),
+        ] {
+            let (a, b) = dominant(n, 0x0087_CD00 + n as u64);
+            let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+            assert_eq!(
+                matches!(work.lu_cache, Some(LuFactorStorage::Flat(_))),
+                flat,
+                "n = {n}"
+            );
+
+            // The nalgebra route, computed directly.
+            let matrix = dmatrix_from_rows(&a).expect("matrix");
+            let lu = matrix.clone().lu();
+            let reference_rcond = fast_rcond_from_lu(&lu, matrix_norm1(&matrix), n);
+            let reference_x: Vec<f64> = lu
+                .solve(&DVector::from_column_slice(&b))
+                .expect("nalgebra solve")
+                .iter()
+                .copied()
+                .collect();
+            let reference_inverse =
+                rows_from_dmatrix(&lu.solve(&DMatrix::identity(n, n)).expect("inverse"));
+            let rcond = work.report.rcond_estimate;
+            assert!(
+                (rcond - reference_rcond).abs() <= 1e-10 * reference_rcond,
+                "n = {n}: rcond {rcond:e} vs nalgebra {reference_rcond:e}"
+            );
+
+            let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
+            let solved =
+                solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solve");
+            let certificate = solved.certificate.clone().expect("certificate");
+            assert_eq!(certificate.action, SolverAction::DirectLU, "n = {n}");
+            let (_, posterior, ..) = SolverPortfolio::new(RuntimeMode::Strict, 4)
+                .select_action(reference_rcond, Some(StructuralEvidence::General));
+            for (p, q) in certificate.posterior.iter().zip(posterior) {
+                assert!((p - q).abs() <= 1e-9, "n = {n}: posterior {p} vs {q}");
+            }
+            assert!(verify_solve_certificate(&a, &b, &solved.x, &certificate).verified);
+            let inverse = inv_with_casp(
+                &a,
+                InvOptions::default(),
+                &mut SolverPortfolio::new(RuntimeMode::Strict, 4),
+            )
+            .expect("inverse")
+            .inverse;
+            if flat {
+                assert!(relative(&solved.x, &reference_x) <= 1e-12, "n = {n}");
+                for (row, reference_row) in inverse.iter().zip(&reference_inverse) {
+                    assert!(relative(row, reference_row) <= 1e-12, "n = {n}");
+                }
+            } else {
+                for (p, q) in solved.x.iter().zip(&reference_x) {
+                    assert_eq!(p.to_bits(), q.to_bits(), "n = {n}: x differs from nalgebra");
+                }
+                for (row, reference_row) in inverse.iter().zip(&reference_inverse) {
+                    for (p, q) in row.iter().zip(reference_row) {
+                        assert_eq!(p.to_bits(), q.to_bits(), "n = {n}: inverse differs");
+                    }
+                }
+            }
+        }
+
+        // Two equal rows: an exact zero pivot, so the blocked LU declines and the diagnostics
+        // keep nalgebra's factorization and its rcond of a singular matrix.
+        let n = LU_FACTOR_FLAT_MIN_DIM + 2;
+        let (mut a, _) = dominant(n, 7);
+        a[n - 1] = a[0].clone();
+        let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+        assert!(matches!(work.lu_cache, Some(LuFactorStorage::Nalgebra(_))));
+    }
+
+    /// frankenscipy-w8bjb: an exactly symmetric matrix is factored by Cholesky once, in the
+    /// diagnostics, and the rcond estimate, the symmetric actions and the certificate share the
+    /// factor; no LU is taken for it. The answers are the ones factoring afresh gives, bit for
+    /// bit; only the rcond estimate's route changes, and it estimates the same quantity.
+    #[test]
+    fn symmetric_diagnostics_share_one_cholesky_factorization() {
+        let spd = |n: usize, shift: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            let v = (0.01 * (i + j) as f64 + 0.3).sin();
+                            if i == j { v + shift } else { v * 0.1 }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // Either side of the blocked LU's and the blocked Cholesky's crossovers.
+        for n in [20, LU_FACTOR_FLAT_MIN_DIM + 2, CHOL_FACTOR_FLAT_MIN_DIM + 4] {
+            let a = spd(n, n as f64);
+            let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).cos()).collect();
+            let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+            assert_eq!(
+                work.report.structural_evidence,
+                StructuralEvidence::Symmetric
+            );
+            assert!(
+                matches!(work.cholesky_cache, CholeskyProbe::Factor(_)),
+                "n = {n}: an SPD matrix is factored by Cholesky in the diagnostics"
+            );
+            let CholeskyProbe::Factor(l_flat) = &work.cholesky_cache else {
+                unreachable!("asserted above");
+            };
+            assert!(
+                work.lu_cache.is_none() && work.matrix_cache.is_none(),
+                "n = {n}"
+            );
+            let fresh = cholesky_lower_factor(&a, n).expect("SPD");
+            assert!(
+                l_flat
+                    .iter()
+                    .zip(&fresh)
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: the cached factor is the one the action would compute"
+            );
+
+            // The rcond estimate: the same quantity as the LU route's, to rounding.
+            let matrix = dmatrix_from_rows(&a).expect("matrix");
+            let lu_rcond = fast_rcond_from_lu(&matrix.clone().lu(), matrix_norm1(&matrix), n);
+            let rcond = work.report.rcond_estimate;
+            assert!(
+                (rcond - lu_rcond).abs() <= 1e-10 * lu_rcond,
+                "n = {n}: rcond {rcond:e} vs the LU route's {lu_rcond:e}"
+            );
+
+            // The symmetric action and inverse: bit for bit what factoring afresh gives.
+            let factorization = SymmetricFactorization::new(None, false);
+            let solved = solve_with_action(&a, &b, SolverAction::SymmetricFastPath).expect("solve");
+            let afresh =
+                symmetric_solve(&a, &b, factorization, &CholeskyProbe::NotTried).expect("solve");
+            assert!(
+                solved
+                    .x
+                    .iter()
+                    .zip(&afresh)
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: symmetric solve differs"
+            );
+            let inverse = symmetric_inverse(&a, factorization, &work.cholesky_cache).expect("inv");
+            let inverse_afresh =
+                symmetric_inverse(&a, factorization, &CholeskyProbe::NotTried).expect("inv");
+            assert!(
+                inverse
+                    .iter()
+                    .flatten()
+                    .zip(inverse_afresh.iter().flatten())
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: symmetric inverse differs"
+            );
+
+            // LU on an SPD matrix is still the factorization the diagnostics used to take.
+            let lu = solve_with_action(&a, &b, SolverAction::DirectLU).expect("LU");
+            if n >= LU_FACTOR_FLAT_MIN_DIM {
+                let factors = lu_factor_blocked(&a).expect("blocked LU");
+                let expected = lu_solve_flat_factored(&factors, &b).expect("solve");
+                assert!(
+                    lu.x.iter()
+                        .zip(&expected)
+                        .all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "n = {n}: LU on an SPD matrix left the blocked factorization"
+                );
+            }
+
+            // The portfolio path certifies from the factor, and the certificate checks out.
+            let mut portfolio = SolverPortfolio::new(RuntimeMode::Hardened, 4);
+            let casp = solve_with_casp(
+                &a,
+                &b,
+                SolveOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..SolveOptions::default()
+                },
+                &mut portfolio,
+            )
+            .expect("casp");
+            let certificate = casp.certificate.expect("certificate");
+            assert_eq!(
+                certificate.action,
+                SolverAction::SymmetricFastPath,
+                "n = {n}"
+            );
+            assert!(
+                certificate
+                    .accuracy
+                    .as_ref()
+                    .is_some_and(|accuracy| accuracy.forward_error_bound.is_some())
+            );
+            assert!(verify_solve_certificate(&a, &b, &casp.x, &certificate).verified);
+
+            // `inv`'s detection reads positive definiteness off the same factorization.
+            let inv_work = condition_diagnostics_with_assumption(&a, None).expect("diagnostics");
+            assert!(inv_work.report.positive_definite, "n = {n}");
+            assert!(matches!(inv_work.cholesky_cache, CholeskyProbe::Factor(_)));
+        }
+
+        // Must-miss arms. Symmetric indefinite: the probe breaks down, the diagnostics keep the
+        // LU route, and the symmetric action goes straight to LDLᵀ.
+        let n = LU_FACTOR_FLAT_MIN_DIM + 2;
+        let mut indefinite = spd(n, n as f64);
+        indefinite[3][3] = -(n as f64);
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).cos()).collect();
+        let work = condition_diagnostics_for_solve(&indefinite, None).expect("diagnostics");
+        assert!(matches!(work.cholesky_cache, CholeskyProbe::BrokeDown));
+        assert!(matches!(work.lu_cache, Some(LuFactorStorage::Flat(_))));
+        let solved =
+            solve_with_action(&indefinite, &b, SolverAction::SymmetricFastPath).expect("LDL");
+        let ldl = BunchKaufman::factor(&indefinite, Triangle::Upper).solve(&b);
+        assert!(
+            solved
+                .x
+                .iter()
+                .zip(&ldl)
+                .all(|(p, q)| p.to_bits() == q.to_bits())
+        );
+        let inv_work =
+            condition_diagnostics_with_assumption(&indefinite, None).expect("diagnostics");
+        assert!(!inv_work.report.positive_definite);
+
+        // An explicit 'sym' is LDLᵀ, a non-symmetric matrix is LU, and n <= 4 keeps the exact
+        // SVD estimate: none of them tries Cholesky.
+        let a = spd(n, n as f64);
+        let sym = condition_diagnostics_for_solve(&a, Some(MatrixAssumption::Symmetric))
+            .expect("diagnostics");
+        assert!(matches!(sym.cholesky_cache, CholeskyProbe::NotTried));
+        let mut general = a.clone();
+        general[0][1] += 1e-3;
+        let work = condition_diagnostics_for_solve(&general, None).expect("diagnostics");
+        assert!(matches!(work.cholesky_cache, CholeskyProbe::NotTried));
+        assert!(work.lu_cache.is_some());
+        let small = condition_diagnostics_for_solve(&spd(4, 4.0), None).expect("diagnostics");
+        assert!(matches!(small.cholesky_cache, CholeskyProbe::NotTried));
+    }
+
     #[test]
     fn condition_diagnostics_identity_reports_diagonal_spd() {
         let a = vec![
@@ -29527,56 +30282,48 @@ mod tests {
 
     // The posterior's own choice is observable in Hardened mode; Strict tries SciPy's LU first
     // (frankenscipy-7tb8d.14, `strict_solve_and_inv_try_scipys_lu_first`). Non-symmetric, so
-    // the evidence is General rather than the Cholesky-first Symmetric.
+    // the evidence is General rather than the Cholesky-first Symmetric. Under the calibrated
+    // losses (frankenscipy-7tb8d.2) that choice is LU at moderate and at ill conditioning,
+    // where the hand-set matrix took QR and the SVD, and LU's backward error passes on both.
     #[test]
-    fn casp_selects_qr_for_moderate_condition() {
-        let a = vec![vec![1.0, 1.0], vec![1.0001, 1.0]];
-        let b = vec![1.0, -1.0];
-        let report = condition_diagnostics(&a).expect("condition diagnostics");
-        assert!(
-            report.rcond_estimate < 1e-2 && report.rcond_estimate > 1e-6,
-            "expected moderate rcond, got {}",
-            report.rcond_estimate
-        );
-        assert_eq!(report.structural_evidence, StructuralEvidence::General);
+    fn hardened_casp_takes_lu_at_moderate_and_ill_conditioning() {
         let hardened = SolveOptions {
             mode: RuntimeMode::Hardened,
             ..SolveOptions::default()
         };
-        let result = solve(&a, &b, hardened).expect("solve works");
-        let certificate = result.certificate.expect("certificate populated");
-        assert_eq!(certificate.action, SolverAction::PivotedQR);
-        assert!(!certificate.fallback_active);
-        assert_certificate_populated(&certificate);
-    }
-
-    #[test]
-    fn casp_selects_svd_for_ill_conditioned() {
-        let a = vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]];
         let b = vec![1.0, -1.0];
-        let report = condition_diagnostics(&a).expect("condition diagnostics");
-        assert!(
-            report.rcond_estimate < 1e-9,
-            "expected ill-conditioned rcond, got {}",
-            report.rcond_estimate
-        );
-        assert_eq!(report.structural_evidence, StructuralEvidence::General);
-        let hardened = SolveOptions {
-            mode: RuntimeMode::Hardened,
-            ..SolveOptions::default()
-        };
-        let result = solve(&a, &b, hardened).expect("solve works");
-        let certificate = result.certificate.expect("certificate populated");
-        assert_eq!(certificate.action, SolverAction::SVDFallback);
-        assert!(!certificate.fallback_active);
-        assert_certificate_populated(&certificate);
+        for (a, low, high) in [
+            (vec![vec![1.0, 1.0], vec![1.0001, 1.0]], 1e-6, 1e-2),
+            (vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]], 0.0, 1e-9),
+        ] {
+            let report = condition_diagnostics(&a).expect("condition diagnostics");
+            assert!(
+                report.rcond_estimate > low && report.rcond_estimate < high,
+                "rcond {} outside ({low:e}, {high:e})",
+                report.rcond_estimate
+            );
+            assert_eq!(report.structural_evidence, StructuralEvidence::General);
+            let result = solve(&a, &b, hardened).expect("solve works");
+            assert!(
+                result
+                    .backward_error
+                    .is_some_and(|omega| omega <= ATTEMPT_BACKWARD_ERROR_TOL),
+                "{:?}",
+                result.backward_error
+            );
+            let certificate = result.certificate.expect("certificate populated");
+            assert_eq!(certificate.action, SolverAction::DirectLU);
+            assert!(!certificate.fallback_active);
+            assert_certificate_populated(&certificate);
+        }
     }
 
     /// frankenscipy-7tb8d.14. On a NON-symmetric matrix `scipy.linalg.solve` / `inv` (default
     /// `assume_a=None`) factor with LU at every conditioning — SciPy 1.17.1's default answer is
-    /// bit-identical to `assume_a='gen'` on both matrices below. Where the posterior prefers QR
-    /// (rcond 2.5e-5) or SVD (rcond 2.5e-13), Strict mode must still answer with LU when LU's
-    /// certificate passes. (A symmetric matrix is SciPy's Cholesky path instead —
+    /// bit-identical to `assume_a='gen'` on both matrices below. Where the portfolio prefers
+    /// something else (here the SVD, once its calibrator has drifted), Strict mode must still
+    /// answer with LU when LU's certificate passes. (A symmetric matrix is SciPy's Cholesky path
+    /// instead —
     /// `strict_symmetric_solve_and_inv_take_scipys_cholesky`.)
     #[test]
     fn strict_solve_and_inv_try_scipys_lu_first() {
@@ -29592,8 +30339,15 @@ mod tests {
                 .select_action(rcond, Some(StructuralEvidence::General))
                 .0
         };
-        // Negative arm: the posterior alone would not pick LU on either matrix.
-        assert_eq!(posterior(&moderate, &portfolio), SolverAction::PivotedQR);
+        // Negative arm: the portfolio alone would not pick LU. Under the calibrated losses
+        // (frankenscipy-7tb8d.2) its own choice is LU at every conditioning, so the case where
+        // it disagrees with SciPy is the drift override: once the calibrator sees its accepted
+        // answers miss, it sends every decision to the SVD.
+        for _ in 0..20 {
+            portfolio.observe_backward_error(1.0);
+        }
+        assert!(portfolio.calibrator().should_fallback());
+        assert_eq!(posterior(&moderate, &portfolio), SolverAction::SVDFallback);
         assert_eq!(posterior(&severe, &portfolio), SolverAction::SVDFallback);
 
         let strict = solve_with_casp(&moderate, &b, SolveOptions::default(), &mut portfolio)
@@ -30272,9 +31026,10 @@ mod tests {
             assert!(
                 true_error <= bound,
                 "bound {bound:e} < true error {true_error:e}: A = {ai:?}, b = {bi:?}, \
-                 x = {:?}, exact = {nums:?}/{den}, omega = {:e}",
+                 x = {:?}, exact = {nums:?}/{den}, omega = {:e}, rcond = {:e}",
                 result.x,
-                accuracy.componentwise_backward_error
+                accuracy.componentwise_backward_error,
+                certificate.rcond_estimate
             );
             worst_ratio = worst_ratio.max(true_error / bound);
             // The naive arm: signed A⁻¹ times r, no rounding term.
@@ -30467,6 +31222,94 @@ mod tests {
                 verify_solve_certificate(matrix, &[3.0, 5.0, 7.0], &result.x, &certificate);
             assert!(report.verified, "{}", report.reason);
         }
+    }
+
+    /// frankenscipy-7tb8d.6: TwoSum and TwoProd are exact, checked in i128 on inputs scaled
+    /// to integers, and the certificate's residual is the correctly rounded exact residual
+    /// where plain f64 arithmetic is not. Each must-hit arm has to fire, or the check could
+    /// not tell an exact kernel from a rounding one.
+    #[test]
+    fn compensated_residual_is_exact_where_plain_arithmetic_is_not() {
+        let mut rng = TestRng(0x7B8D_6000_0000_2202);
+        let pow2 = |k: i32| 2.0_f64.powi(k);
+        let mantissa = |rng: &mut TestRng| rng.int(-(1 << 52) + 1, (1 << 52) - 1);
+        let (mut sum_rounded, mut prod_rounded) = (0, 0);
+        for _ in 0..20_000 {
+            // a + b = s + e, everything a multiple of 2^-60.
+            let (ia, ib, k) = (
+                mantissa(&mut rng),
+                mantissa(&mut rng),
+                rng.int(0, 60) as i32,
+            );
+            let (a, b) = (ia as f64, ib as f64 * pow2(-k));
+            let (s, e) = two_sum(a, b);
+            let scaled = |v: f64| (v * pow2(60)) as i128;
+            assert_eq!(
+                scaled(s) + scaled(e),
+                (i128::from(ia) << 60) + (i128::from(ib) << (60 - k)),
+                "two_sum({a:e}, {b:e}) = ({s:e}, {e:e})"
+            );
+            sum_rounded += usize::from(e != 0.0);
+
+            // a · b = p + e, everything a multiple of 2^-(ka + kb).
+            let (ka, kb) = (rng.int(0, 30) as i32, rng.int(0, 30) as i32);
+            let (a, b) = (ia as f64 * pow2(-ka), ib as f64 * pow2(-kb));
+            let (p, e) = two_prod(a, b);
+            let scaled = |v: f64| (v * pow2(ka + kb)) as i128;
+            assert_eq!(
+                scaled(p) + scaled(e),
+                i128::from(ia) * i128::from(ib),
+                "two_prod({a:e}, {b:e}) = ({p:e}, {e:e})"
+            );
+            prod_rounded += usize::from(e != 0.0);
+        }
+        assert!(sum_rounded > 0 && prod_rounded > 0);
+
+        // Rows whose exact residual is the tiny rounding error of b = fl(A·x): the compensated
+        // residual must equal it rounded once, bit for bit; plain arithmetic must miss.
+        let (mut plain_wrong, mut rows) = (0, 0);
+        for _ in 0..500 {
+            let n = rng.int(2, 8) as usize;
+            let entry = |rng: &mut TestRng| rng.int(-(1 << 30), 1 << 30);
+            let ai: Vec<Vec<i64>> = (0..n)
+                .map(|_| (0..n).map(|_| entry(&mut rng)).collect())
+                .collect();
+            let xi: Vec<i64> = (0..n).map(|_| entry(&mut rng)).collect();
+            let products: Vec<i128> = ai
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .zip(&xi)
+                        .map(|(&v, &x)| i128::from(v) * i128::from(x))
+                        .sum()
+                })
+                .collect();
+            let a: Vec<Vec<f64>> = ai
+                .iter()
+                .map(|row| row.iter().map(|&v| v as f64).collect())
+                .collect();
+            let x: Vec<f64> = xi.iter().map(|&v| v as f64).collect();
+            let b: Vec<f64> = products.iter().map(|&p| p as f64).collect();
+            let (r, _) = residual_and_magnitude(&a, &x, &b);
+            for (i, row) in a.iter().enumerate() {
+                let exact = b[i] as i128 - products[i];
+                assert_eq!(
+                    r[i].to_bits(),
+                    (exact as f64).to_bits(),
+                    "row {row:?}, x = {x:?}, b = {}: residual {} vs exact {exact}",
+                    b[i],
+                    r[i]
+                );
+                let plain = row.iter().zip(&x).fold(b[i], |acc, (v, xj)| acc - v * xj);
+                plain_wrong += usize::from(plain.to_bits() != (exact as f64).to_bits());
+                rows += 1;
+            }
+        }
+        eprintln!("compensated residual: {rows} rows exact; plain f64 wrong on {plain_wrong}");
+        assert!(
+            plain_wrong > rows / 2,
+            "plain arithmetic was wrong on only {plain_wrong} of {rows}"
+        );
     }
 
     #[test]
@@ -40446,36 +41289,71 @@ mod tests {
 
     // ═══ AuditLedger Integration Tests (§0.19) ═══
 
+    /// frankenscipy-7tb8d.11: `solve_with_audit` records its CASP choice as a `CaspDecision` in
+    /// the mode the call ran in (it used to say Strict whatever the mode), with the action,
+    /// posterior, losses and evidence the certificate carries, under the call's fingerprint.
     #[test]
     fn solve_with_audit_records_casp_decision() {
         let a = vec![vec![3.0, 2.0], vec![1.0, 2.0]];
         let b = vec![5.0, 5.0];
-        let audit_ledger = sync_audit_ledger();
-        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 16);
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let audit_ledger = sync_audit_ledger();
+            let mut portfolio = SolverPortfolio::new(mode, 16);
+            let options = SolveOptions {
+                mode,
+                ..SolveOptions::default()
+            };
+            let certificate = solve_with_audit(&a, &b, options, &mut portfolio, &audit_ledger)
+                .expect("solve")
+                .certificate
+                .expect("certificate");
 
-        let result = solve_with_audit(
-            &a,
-            &b,
-            SolveOptions::default(),
-            &mut portfolio,
-            &audit_ledger,
-        );
-        assert!(result.is_ok());
-
-        let ledger = lock_audit_ledger(&audit_ledger);
-        assert_eq!(ledger.len(), 1, "should have exactly one audit entry");
-
-        let entry = &ledger.entries()[0];
-        match &entry.action {
-            AuditAction::ModeDecision { .. } => {}
-            other => {
-                unreachable!("expected ModeDecision, got {other:?}");
-            }
+            let ledger = lock_audit_ledger(&audit_ledger);
+            let decisions: Vec<&AuditEvent> = ledger
+                .entries()
+                .iter()
+                .filter(|event| matches!(event.action, AuditAction::CaspDecision { .. }))
+                .collect();
+            assert_eq!(decisions.len(), 1, "{mode:?}: {:?}", ledger.entries());
+            let fingerprint = audit_fingerprint("fsci_linalg::solve", &options, |f| {
+                f.rows(&a).f64s(&b);
+            });
+            assert_eq!(decisions[0].input_fingerprint, fingerprint);
+            let AuditAction::CaspDecision {
+                portfolio,
+                mode: recorded_mode,
+                action,
+                posterior,
+                expected_losses,
+                chosen_expected_loss,
+                fallback,
+                evidence,
+            } = &decisions[0].action
+            else {
+                unreachable!("filtered to CaspDecision");
+            };
+            assert_eq!(portfolio, "solver");
+            assert_eq!(*recorded_mode, mode, "{:?}", decisions[0]);
+            assert_eq!(action, &format!("{:?}", certificate.action));
+            assert_eq!(posterior, &certificate.posterior);
+            assert_eq!(expected_losses, &certificate.expected_losses);
+            assert_eq!(
+                chosen_expected_loss.to_bits(),
+                certificate.chosen_expected_loss.to_bits()
+            );
+            assert_eq!(*fallback, certificate.fallback_active);
+            assert_eq!(
+                evidence["rcond_estimate"],
+                fsci_runtime::EvidenceValue::Number(certificate.rcond_estimate)
+            );
+            assert_eq!(
+                evidence["structural_evidence"],
+                fsci_runtime::EvidenceValue::Label(format!(
+                    "{:?}",
+                    certificate.structural_evidence
+                ))
+            );
         }
-        assert!(
-            entry.outcome.contains("CASP"),
-            "outcome should mention CASP"
-        );
     }
 
     #[test]

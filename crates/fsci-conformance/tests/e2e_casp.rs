@@ -346,12 +346,15 @@ fn e2e_003_solver_portfolio_selection() {
         ));
     }
 
-    // Verify expected selections
+    // Verify expected selections: the calibrated losses (frankenscipy-7tb8d.2) rank LU first at
+    // every conditioning, so ill conditioning also answers LU, with the SVD last of the fallbacks.
     let t = Instant::now();
     let (well_action, _, _, _) = portfolio.select_action(1e-2, None);
-    let (ill_action, _, _, _) = portfolio.select_action(1e-12, None);
+    let (ill_action, _, ill_losses, _) = portfolio.select_action(1e-12, None);
     let pass = matches!(well_action, SolverAction::DirectLU)
-        && matches!(ill_action, SolverAction::SVDFallback);
+        && matches!(ill_action, SolverAction::DirectLU)
+        && ill_losses[SolverAction::SVDFallback.index()]
+            > ill_losses[SolverAction::PivotedQR.index()];
     if !pass {
         all_pass = false;
     }
@@ -359,8 +362,8 @@ fn e2e_003_solver_portfolio_selection() {
         5,
         "verify_expected_selections",
         "check",
-        "well→DirectLU, ill→SVDFallback",
-        &format!("well={well_action:?}, ill={ill_action:?}"),
+        "well→DirectLU, ill→DirectLU (calibrated)",
+        &format!("well={well_action:?}, ill={ill_action:?}, ill_losses={ill_losses:?}"),
         t.elapsed().as_nanos(),
         if pass { "ok" } else { "fail" },
     ));
