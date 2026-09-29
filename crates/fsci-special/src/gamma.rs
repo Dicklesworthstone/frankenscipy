@@ -3774,8 +3774,9 @@ pub fn pdtr(k: f64, m: f64) -> f64 {
         return 1.0; // P(X <= k) = 1 when m = 0
     }
 
-    // pdtr(k, m) = gammaincc(k + 1, m) = Q(k + 1, m)
-    gammaincc_scalar(k + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    // pdtr(k, m) = gammaincc(floor(k) + 1, m): SciPy's Cephes floors a non-integer count, so
+    // pdtr(2.7, 3) is pdtr(2, 3). Using k + 1 raw was up to 0.136 off (frankenscipy-uyhhv).
+    gammaincc_scalar(k.floor() + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
 }
 
 /// Poisson distribution survival function: P(X > k) for Poisson with mean m.
@@ -3798,8 +3799,8 @@ pub fn pdtrc(k: f64, m: f64) -> f64 {
         return 0.0; // P(X > k) = 0 when m = 0
     }
 
-    // pdtrc(k, m) = gammainc(k + 1, m) = P(k + 1, m)
-    gammainc_scalar(k + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    // pdtrc(k, m) = gammainc(floor(k) + 1, m), with SciPy's floor of the count as in `pdtr`.
+    gammainc_scalar(k.floor() + 1.0, m, RuntimeMode::Strict).unwrap_or(f64::NAN)
 }
 
 /// Inverse of Poisson CDF: find m such that pdtr(k, m) = p.
@@ -3809,20 +3810,19 @@ pub fn pdtrc(k: f64, m: f64) -> f64 {
 /// Uses Newton's method to find the root.
 ///
 /// # Arguments
-/// * `k` - Number of events (non-negative integer, but accepts float)
-/// * `p` - Probability (must be in [0, 1])
+/// * `k` - Number of events. SciPy's pdtri takes a C `int`, so a float count is truncated
+///   toward zero: pdtri(2.7, p) is pdtri(2, p) and pdtri(-0.5, p) is pdtri(0, p).
+/// * `p` - Probability in [0, 1): SciPy's Cephes returns NaN at p >= 1 and inf at p = 0.
 pub fn pdtri(k: f64, p: f64) -> f64 {
     if k.is_nan() || p.is_nan() {
         return f64::NAN;
     }
-    if k < 0.0 || !(0.0..=1.0).contains(&p) {
+    let k = k.trunc();
+    if k < 0.0 || !(0.0..1.0).contains(&p) {
         return f64::NAN;
     }
     if p == 0.0 {
         return f64::INFINITY;
-    }
-    if p == 1.0 {
-        return 0.0;
     }
 
     // pdtri(k, p): m such that gammaincc(k+1, m) = p, i.e. m = gammainccinv(k+1, p).
@@ -7504,6 +7504,33 @@ mod tests {
     }
 
     #[test]
+    fn poisson_family_takes_scipys_integer_count() {
+        // SciPy floors a non-integer count in pdtr/pdtrc (Cephes: igamc/igam(floor(k) + 1, m))
+        // and truncates it in pdtri (a C int argument). So each call below must equal its
+        // integer-count twin to the bit; with the raw k + 1 they were up to 0.136 apart.
+        let k = std::hint::black_box(2.7);
+        assert_eq!(pdtr(k, 3.0).to_bits(), pdtr(2.0, 3.0).to_bits());
+        assert_eq!(pdtrc(k, 3.0).to_bits(), pdtrc(2.0, 3.0).to_bits());
+        assert_eq!(pdtri(k, 0.5).to_bits(), pdtri(2.0, 0.5).to_bits());
+        assert_eq!(pdtri(-0.5, 0.3).to_bits(), pdtri(0.0, 0.3).to_bits());
+        // SciPy 1.17.1's values, to the incomplete-gamma residual.
+        let rel = |got: f64, want: f64| ((got - want) / want).abs();
+        assert!(rel(pdtr(k, 3.0), 0.423_190_081_126_843_64) < 1e-13);
+        assert!(rel(pdtrc(k, 3.0), 0.576_809_918_873_156_6) < 1e-13);
+        assert!(rel(pdtri(k, 0.5), 2.674_060_313_723_559) < 1e-12);
+        assert!(rel(pdtri(-0.5, 0.3), 1.203_972_804_325_935_7) < 1e-12);
+        // Edges: SciPy's pdtri is NaN at p = 1 and inf at p = 0; a negative count is NaN in
+        // pdtr/pdtrc and below -1 in pdtri; m = 0 gives 1 and 0.
+        assert!(pdtri(2.0, 1.0).is_nan());
+        assert_eq!(pdtri(2.0, 0.0), f64::INFINITY);
+        assert!(pdtri(-1.0, 0.5).is_nan());
+        assert!(pdtr(-0.5, 1.0).is_nan());
+        assert!(pdtrc(-0.5, 1.0).is_nan());
+        assert_eq!(pdtr(k, 0.0), 1.0);
+        assert_eq!(pdtrc(k, 0.0), 0.0);
+    }
+
+    #[test]
     fn pdtr_pdtrc_complement() {
         // pdtr(k, m) + pdtrc(k, m) = 1
         for &k in &[0.0, 1.0, 5.0, 10.0] {
@@ -7628,12 +7655,15 @@ mod tests {
 
     #[test]
     fn pdtrik_inverse() {
+        // pdtr floors its count (SciPy's Cephes), while pdtrik inverts the continuous
+        // extension, so the round trip returns floor(k): SciPy 1.17.1 gives
+        // pdtrik(pdtr(2.5, m), m) = 2 and pdtrik(pdtr(0.25, m), m) = 0 for every m here.
         for &m in &[0.5, 1.0, 2.5, 5.0, 10.0] {
-            for &k in &[0.25, 1.0, 2.5, 5.0] {
+            for &k in &[0.25_f64, 1.0, 2.5, 5.0] {
                 let p = pdtr(k, m);
                 let recovered = pdtrik(p, m);
                 assert!(
-                    (recovered - k).abs() < 5e-10,
+                    (recovered - k.floor()).abs() < 5e-10,
                     "pdtrik failed: m={m}, k={k}, p={p}, recovered={recovered}"
                 );
             }

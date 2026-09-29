@@ -177,6 +177,33 @@ fn generate_query() -> OracleQuery {
             });
         }
     }
+    // Non-integer counts: SciPy floors k in pdtr/pdtrc and truncates it in pdtri (a C int),
+    // so -0.5 is pdtri's count 0. With the raw k + 1 these were up to 0.136 (pdtr) and 1.69
+    // (pdtri) off (frankenscipy-uyhhv).
+    for &kf in &[0.5_f64, 2.7, 7.3] {
+        for &mu in &mus {
+            for func in ["pdtr", "pdtrc"] {
+                points.push(PointCase {
+                    case_id: format!("{func}_mu{mu}_kfrac{kf}"),
+                    func: func.to_string(),
+                    p1: kf,
+                    p2: 0.0,
+                    arg: mu,
+                });
+            }
+        }
+    }
+    for &kf in &[-0.5_f64, 0.5, 2.7, 7.3] {
+        for &q in &qs {
+            points.push(PointCase {
+                case_id: format!("pdtri_kfrac{kf}_q{q}"),
+                func: "pdtri".to_string(),
+                p1: kf,
+                p2: 0.0,
+                arg: q,
+            });
+        }
+    }
     for &df in &dfs {
         for &x in &xs_chdtr {
             for func in ["chdtr", "chdtrc"] {
