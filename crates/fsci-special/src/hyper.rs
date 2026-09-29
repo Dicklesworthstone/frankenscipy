@@ -1600,8 +1600,10 @@ pub(crate) fn hyp1f1_scalar(
     // The a-series runs k = 0..|a|; for b = -|b| the denominator (b)_k first
     // hits 0 at k = |b|+1. Hence |a| <= |b| → finite polynomial, while
     // |a| > |b| → a genuine pole, where scipy returns +inf (even at z = 0).
+    // a = 0 is not a polynomial there: scipy returns +inf for every
+    // nonpositive-integer b, b = 0 included (frankenscipy-cx02y).
     if is_nonpositive_integer(a) {
-        if b <= 0.0 && b == b.floor() && b > a {
+        if b <= 0.0 && b == b.floor() && (b > a || a == 0.0) {
             return Ok(f64::INFINITY);
         }
         return hyp1f1_series(a, b, z, mode);
@@ -2471,10 +2473,10 @@ fn hyp1f1_complex_parameters(
     z: Complex64,
     mode: RuntimeMode,
 ) -> Result<Complex64, SpecialError> {
-    if z.im == 0.0 && a.im == 0.0 && b.im == 0.0 {
-        return Ok(Complex64::from_real(hyp1f1_scalar(a.re, b.re, z.re, mode)?));
-    }
-
+    // A nonpositive-integer b is a pole for the complex routine whatever a is: scipy's
+    // complex hyp1f1 returns inf+0j there, even for a terminating a and a z whose imaginary
+    // part is 0, where its real routine gives the polynomial (frankenscipy-cx02y). So the
+    // pole is decided before the all-real case is handed to the real path.
     if complex_is_zero(b) || complex_is_nonpositive_integer(b) {
         if mode == RuntimeMode::Hardened {
             return Err(SpecialError {
@@ -2484,7 +2486,11 @@ fn hyp1f1_complex_parameters(
                 detail: "b must not be zero or a negative integer",
             });
         }
-        return Ok(complex_nan());
+        return Ok(Complex64::new(f64::INFINITY, 0.0));
+    }
+
+    if z.im == 0.0 && a.im == 0.0 && b.im == 0.0 {
+        return Ok(Complex64::from_real(hyp1f1_scalar(a.re, b.re, z.re, mode)?));
     }
 
     if complex_is_zero(z) || complex_is_zero(a) {
@@ -4261,6 +4267,88 @@ mod tests {
             val == f64::INFINITY,
             "b=0 should return +inf in strict mode, got {val}"
         );
+    }
+
+    /// frankenscipy-cx02y (nightly fuzz crash, p2c006_special_hyper_complex): SciPy 1.17.1's
+    /// hyp1f1 where b is a nonpositive integer, over a, b in {0, -1, -2, -3} and z in
+    /// {-1/12, 0, 0.7}. The real routine keeps the terminating polynomial only for a <= -1 with
+    /// b <= a (a = 0 is +inf); the complex routine is inf+0j for every a, even for a z whose
+    /// imaginary part is 0.
+    #[test]
+    fn hyp1f1_nonpositive_integer_b_matches_scipy_real_and_complex() {
+        let grid = [0.0, -1.0, -2.0, -3.0];
+        for z in [-1.0 / 12.0, 0.0, 0.7] {
+            for b in grid {
+                // a = 0: the old route returned the degree-0 "polynomial" 1.
+                let real = get_scalar(&hyp1f1(
+                    &scalar(0.0),
+                    &scalar(b),
+                    &scalar(z),
+                    RuntimeMode::Strict,
+                ));
+                assert_eq!(real, Some(f64::INFINITY), "hyp1f1(0, {b}, {z})");
+                for a in grid {
+                    for zc in [Complex64::new(z, 0.0), Complex64::new(z, 0.3)] {
+                        let value = get_complex_scalar(&hyp1f1(
+                            &complex(a, 0.0),
+                            &complex(b, 0.0),
+                            &complex(zc.re, zc.im),
+                            RuntimeMode::Strict,
+                        ));
+                        assert!(
+                            value.is_some_and(|v| v.re == f64::INFINITY && v.im.to_bits() == 0),
+                            "hyp1f1({a}, {b}, {zc:?}) = {value:?}, scipy inf+0j"
+                        );
+                    }
+                }
+            }
+        }
+        // The fuzz input itself: hyp1f1(a, a, z) with a = 0 is a pole, not exp(z).
+        let fuzz = get_complex_scalar(&hyp1f1(
+            &complex(0.0, 0.0),
+            &complex(0.0, 0.0),
+            &complex(-1.0 / 12.0, 0.0),
+            RuntimeMode::Strict,
+        ));
+        assert_eq!(fuzz, Some(Complex64::new(f64::INFINITY, 0.0)));
+
+        // Must-hit rows that keep their values: the real terminating polynomials, a = 0 with a
+        // positive b, and the complex path away from the poles.
+        let polynomials = [
+            (-1.0, -1.0, -1.0 / 12.0, 0.9166666666666666),
+            (-2.0, -3.0, 0.7, 1.5483333333333331),
+            (-3.0, -3.0, -1.0 / 12.0, 0.9200424382716049),
+            (0.0, 2.0, 0.7, 1.0),
+        ];
+        for (a, b, z, want) in polynomials {
+            let got = get_scalar(&hyp1f1(
+                &scalar(a),
+                &scalar(b),
+                &scalar(z),
+                RuntimeMode::Strict,
+            ))
+            .expect("finite");
+            assert!(
+                (got - want).abs() <= 1e-15 * want.abs(),
+                "hyp1f1({a}, {b}, {z}) = {got}, scipy {want}"
+            );
+        }
+        let away = get_complex_scalar(&hyp1f1(
+            &complex(0.0, 0.0),
+            &complex(2.0, 0.0),
+            &complex(0.3, 0.2),
+            RuntimeMode::Strict,
+        ));
+        assert_eq!(away, Some(Complex64::new(1.0, 0.0)));
+
+        // Hardened fails closed at the pole on the complex route too, all-real parts included.
+        let hardened = hyp1f1(
+            &complex(-1.0, 0.0),
+            &complex(-1.0, 0.0),
+            &complex(-1.0 / 12.0, 0.0),
+            RuntimeMode::Hardened,
+        );
+        assert_eq!(error_kind(&hardened), Some(SpecialErrorKind::DomainError));
     }
 
     #[test]
