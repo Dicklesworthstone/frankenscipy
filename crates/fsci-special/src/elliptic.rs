@@ -560,19 +560,23 @@ fn cephes_ellik_landen(phi: f64, m: f64, a: f64, npio2: f64, big_k: &mut f64, ma
     }
     let (mut aa, mut bb) = (1.0, b);
     let mut c = m.sqrt();
-    let mut d: i64 = 1;
-    let mut modulus: i64 = 0;
+    // Cephes keeps `mod` and `d` as C ints. Held here as integer-valued doubles: `trunc`,
+    // `floor` and doubling give the same values while |mod| < 2^31, and phi, reduced to
+    // |phi| <= pi/2 on entry, only doubles per step. It keeps a saturating `as i64` and two
+    // int <-> double conversions off the loop-carried chain phi -> mod -> phi.
+    let mut d = 1.0_f64;
+    let mut modulus = 0.0_f64;
     let mut phi = phi;
     while (c / aa).abs() > machep {
         let ratio = bb / aa;
-        phi = phi + (t * ratio).atan() + modulus as f64 * PI;
+        phi = phi + (t * ratio).atan() + modulus * PI;
         let denom = 1.0 - ratio * t * t;
         if denom.abs() > 10.0 * machep {
             t = t * (1.0 + ratio) / denom;
-            modulus = ((phi + PI / 2.0) / PI) as i64;
+            modulus = ((phi + PI / 2.0) / PI).trunc();
         } else {
             t = phi.tan();
-            modulus = ((phi - t.atan()) / PI).floor() as i64;
+            modulus = ((phi - t.atan()) / PI).floor();
         }
         c = (aa - bb) / 2.0;
         let g = (aa * bb).sqrt();
@@ -580,7 +584,7 @@ fn cephes_ellik_landen(phi: f64, m: f64, a: f64, npio2: f64, big_k: &mut f64, ma
         bb = g;
         d += d;
     }
-    (t.atan() + modulus as f64 * PI) / (d as f64 * aa)
+    (t.atan() + modulus * PI) / (d * aa)
 }
 
 /// Cephes `ellik_neg_m`: `F(φ | m)` for m < 0 and 0 < φ < π/2. A power series for small m·φ²,
