@@ -573,7 +573,7 @@ fn cephes_ellik_landen(phi: f64, m: f64, a: f64, npio2: f64, big_k: &mut f64, ma
         let denom = 1.0 - ratio * t * t;
         if denom.abs() > 10.0 * machep {
             t = t * (1.0 + ratio) / denom;
-            modulus = ((phi + PI / 2.0) / PI).trunc();
+            modulus = ellik_quadrant(phi);
         } else {
             t = phi.tan();
             modulus = ((phi - t.atan()) / PI).floor();
@@ -585,6 +585,17 @@ fn cephes_ellik_landen(phi: f64, m: f64, a: f64, npio2: f64, big_k: &mut f64, ma
         d += d;
     }
     (t.atan() + modulus * PI) / (d * aa)
+}
+
+/// Cephes' `mod = (phi + M_PI_2) / M_PI` for [`cephes_ellik_landen`], truncated as the C int is.
+///
+/// Out of line on purpose. Inline, LLVM packs this division with the loop's
+/// `t * (1 + ratio) / denom` into one `vdivpd`. This one needs the iteration's `atan` result
+/// and t's does not, so packing made the next `atan`'s argument wait for the current `atan`, and
+/// the calls could no longer overlap.
+#[inline(never)]
+fn ellik_quadrant(phi: f64) -> f64 {
+    ((phi + PI / 2.0) / PI).trunc()
 }
 
 /// Cephes `ellik_neg_m`: `F(φ | m)` for m < 0 and 0 < φ < π/2. A power series for small m·φ²,
