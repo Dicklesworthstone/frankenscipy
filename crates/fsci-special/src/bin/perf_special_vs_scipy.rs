@@ -554,6 +554,67 @@ const CASES_N: &[(&str, &[(f64, f64)], &[usize])] = &[
     ),
 ];
 
+/// One argument's fixture distribution, from `FSCI_SPECIAL_ARG<k>`:
+///
+/// - `lo,hi`: uniform on [lo, hi];
+/// - `log:lo,hi`: log-uniform on [lo, hi], for tails such as p in [1e-300, 1e-3];
+/// - `near:c,dmin,dmax`: c ± d, with d log-uniform on [dmin, dmax] and the side alternating
+///   point by point, for a centre such as p = 0.5;
+/// - `below:c,dmin,dmax`: c − d, for an edge that must not be crossed, such as p → 1.
+enum ArgSampler {
+    Uniform(f64, f64),
+    Log(f64, f64),
+    Offset {
+        centre: f64,
+        dmin: f64,
+        dmax: f64,
+        both_sides: bool,
+    },
+}
+
+impl ArgSampler {
+    fn parse(spec: &str) -> Option<Self> {
+        let (kind, body) = spec.split_once(':').unwrap_or(("uniform", spec));
+        let v: Vec<f64> = body
+            .split(',')
+            .map(|t| t.trim().parse().ok())
+            .collect::<Option<_>>()?;
+        match (kind, v.as_slice()) {
+            ("uniform", &[lo, hi]) => Some(Self::Uniform(lo, hi)),
+            ("log", &[lo, hi]) if lo > 0.0 && hi > lo => Some(Self::Log(lo, hi)),
+            ("near" | "below", &[centre, dmin, dmax]) if dmin > 0.0 && dmax >= dmin => {
+                Some(Self::Offset {
+                    centre,
+                    dmin,
+                    dmax,
+                    both_sides: kind == "near",
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn sample(&self, u: f64, i: usize) -> f64 {
+        match *self {
+            Self::Uniform(lo, hi) => lo + u * (hi - lo),
+            Self::Log(lo, hi) => (lo.ln() + u * (hi / lo).ln()).exp(),
+            Self::Offset {
+                centre,
+                dmin,
+                dmax,
+                both_sides,
+            } => {
+                let d = (dmin.ln() + u * (dmax / dmin).ln()).exp();
+                if both_sides && i % 2 == 1 {
+                    centre + d
+                } else {
+                    centre - d
+                }
+            }
+        }
+    }
+}
+
 /// Dispatch to our entry point for `op` at any arity; two arguments go to [`call_ours2`].
 fn call_ours_n(op: &str, args: &[SpecialTensor]) -> fsci_special::SpecialResult {
     let mode = RuntimeMode::Hardened;
@@ -1224,20 +1285,38 @@ fn main() {
         let near_a: Option<f64> = std::env::var("FSCI_SPECIAL_B_NEAR_A")
             .ok()
             .map(|s| s.trim().parse().expect("B_NEAR_A width"));
+        // `FSCI_SPECIAL_ARG<k>=<sampler>` replaces argument k's box with one of the samplers
+        // `ArgSampler::parse` reads. The uniform boxes almost never land where an inverse is
+        // hard: stdtrit lost every digit within 1e-9 of p = 0.5 while its row read clean
+        // (frankenscipy-eiqnk).
+        let overrides: Vec<Option<(String, ArgSampler)>> = (0..domains.len())
+            .map(|k| {
+                std::env::var(format!("FSCI_SPECIAL_ARG{k}"))
+                    .ok()
+                    .map(|spec| {
+                        let sampler = ArgSampler::parse(&spec).expect(
+                            "FSCI_SPECIAL_ARG<k> is lo,hi | log:lo,hi | near:c,dmin,dmax | \
+                         below:c,dmin,dmax",
+                        );
+                        (spec, sampler)
+                    })
+            })
+            .collect();
         let mut args: Vec<Vec<f64>> = Vec::with_capacity(domains.len());
         for (k, &(lo, hi)) in domains.iter().enumerate() {
             let (mult, offset) = STREAMS[k];
             let arg: Vec<f64> = (0..n)
                 .map(|i| {
                     let u = unit(i * mult + offset);
-                    let v = match near_a {
-                        Some(w) if k == 1 => args[0][i] * u.mul_add(2.0 * w, 1.0 - w),
+                    let v = match (&overrides[k], near_a) {
+                        (Some((_, sampler)), _) => sampler.sample(u, i),
+                        (None, Some(w)) if k == 1 => args[0][i] * u.mul_add(2.0 * w, 1.0 - w),
                         // Log-uniform only for the first argument, and only for a POSITIVE
                         // lower bound. With lo = 0 the ratio is inf, and ln(0) + u·inf is NaN
                         // for every u: each case with a zero lower bound (jv, yv, iv, kv, their
                         // scaled forms, jn, yn, kn) timed and "checked" an all-NaN fixture on
                         // both sides until this was caught.
-                        _ if k == 0 && lo > 0.0 && hi / lo > 100.0 => {
+                        (None, _) if k == 0 && lo > 0.0 && hi / lo > 100.0 => {
                             (lo.ln() + u * (hi / lo).ln()).exp()
                         }
                         _ => lo + u * (hi - lo),
@@ -1249,8 +1328,12 @@ fn main() {
         }
         let named: Vec<String> = domains
             .iter()
+            .zip(&overrides)
             .zip(b'a'..)
-            .map(|(&(lo, hi), letter)| format!("domain_{}=[{lo}, {hi}]", letter as char))
+            .map(|((&(lo, hi), over), letter)| match over {
+                Some((spec, _)) => format!("domain_{}={spec}", letter as char),
+                None => format!("domain_{}=[{lo}, {hi}]", letter as char),
+            })
             .collect();
         println!("n={n} op={op} {} b_near_a={near_a:?}", named.join(" "));
 
