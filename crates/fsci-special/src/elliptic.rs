@@ -20,8 +20,6 @@ use crate::types::{
     SpecialResult, SpecialTensor, record_special_trace,
 };
 
-const GAUSS_LEGENDRE_15_WEIGHT_SUM: f64 = 1.999_999_999_999_999_8;
-
 pub const ELLIPTIC_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
         function: "ellipk",
@@ -476,24 +474,173 @@ fn ellipkinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
     if m >= 1.0 && mode == RuntimeMode::Hardened {
         return domain_error("ellipkinc", mode, "m must be in [0, 1)");
     }
-    if phi == 0.0 {
-        return Ok(0.0);
+    Ok(cephes_ellik(phi, m))
+}
+
+/// `F(φ | m)` by SciPy's own method: xsf's Cephes `ellik` (the revision SciPy 1.17.1 pins,
+/// 0d0a593f), SciPy's bits.
+/// - Reduce φ by multiples of π/2, carrying the K(m) terms.
+/// - Past tan φ = 10, transform the amplitude.
+/// - Otherwise run the descending Landen / AGM transformation to MACHEP.
+/// - m < 0 goes through `cephes_ellik_neg_m`: series, asymptotic, or Carlson's R_F with its own
+///   stopping rule.
+/// - m = 1 is `asinh(tan φ)`.
+///
+/// `mod` is a C `int` in the source, so `(φ + π/2)/π` truncates toward zero.
+///
+/// This replaced `sinφ·R_F(cos²φ, 1 − m·sin²φ, 1)`, whose second argument cancels as m → 1.
+/// It was 1.0e-10 relative off at (1.5709, 1 − 2.9e-8), where SciPy is 6e-14 (frankenscipy-zw56i).
+/// A Python emulation of this code matched scipy.special.ellipkinc on 80,008 of 80,008 points:
+/// m within 1e-16 of 1, negative m to −1e12, |φ| to 1e6, tiny φ, and the edges.
+fn cephes_ellik(phi: f64, m: f64) -> f64 {
+    const MACHEP: f64 = 1.110_223_024_625_156_540_42e-16;
+    if phi.is_nan() || m.is_nan() || m > 1.0 {
+        return f64::NAN;
     }
-    if (phi - PI / 2.0).abs() < 1e-15 {
-        return ellipk_scalar(m, mode);
+    if phi.is_infinite() || m.is_infinite() {
+        return if m.is_infinite() && phi.is_finite() {
+            0.0
+        } else if phi.is_infinite() && m.is_finite() {
+            phi
+        } else {
+            f64::NAN
+        };
     }
     if m == 0.0 {
-        return Ok(0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM);
+        return phi;
     }
+    let a = 1.0 - m;
+    if a == 0.0 {
+        // DLMF 19.6.8 and 4.23.42.
+        return if phi.abs() >= PI / 2.0 {
+            f64::INFINITY
+        } else {
+            phi.tan().asinh()
+        };
+    }
+    let mut npio2 = (phi / (PI / 2.0)).floor();
+    if npio2.abs() % 2.0 == 1.0 {
+        npio2 += 1.0;
+    }
+    let mut big_k = 0.0;
+    let mut phi = phi;
+    if npio2 != 0.0 {
+        big_k = cephes_ellpk_x(a);
+        phi -= npio2 * (PI / 2.0);
+    }
+    let negative = phi < 0.0;
+    if negative {
+        phi = -phi;
+    }
+    let mut temp = if a > 1.0 {
+        cephes_ellik_neg_m(phi, m)
+    } else {
+        cephes_ellik_landen(phi, m, a, npio2, &mut big_k, MACHEP)
+    };
+    if negative {
+        temp = -temp;
+    }
+    temp + npio2 * big_k
+}
 
-    // Carlson symmetric form (machine-accurate, incl. the m→1 corner that fixed
-    // Gauss-Legendre quadrature could not resolve). frankenscipy-o65r0.
-    Ok(ellipkinc_carlson(phi, m, mode))
+/// The 0 < m < 1 core of [`cephes_ellik`] after the π/2 reduction: the amplitude
+/// transformation past tan φ = 10 (recursing once), else the descending Landen/AGM iteration.
+fn cephes_ellik_landen(phi: f64, m: f64, a: f64, npio2: f64, big_k: &mut f64, machep: f64) -> f64 {
+    let b = a.sqrt();
+    let mut t = phi.tan();
+    if t.abs() > 10.0 {
+        let e = 1.0 / (b * t);
+        if e.abs() < 10.0 {
+            if npio2 == 0.0 {
+                *big_k = cephes_ellpk_x(a);
+            }
+            return *big_k - cephes_ellik(e.atan(), m);
+        }
+    }
+    let (mut aa, mut bb) = (1.0, b);
+    let mut c = m.sqrt();
+    let mut d: i64 = 1;
+    let mut modulus: i64 = 0;
+    let mut phi = phi;
+    while (c / aa).abs() > machep {
+        let ratio = bb / aa;
+        phi = phi + (t * ratio).atan() + modulus as f64 * PI;
+        let denom = 1.0 - ratio * t * t;
+        if denom.abs() > 10.0 * machep {
+            t = t * (1.0 + ratio) / denom;
+            modulus = ((phi + PI / 2.0) / PI) as i64;
+        } else {
+            t = phi.tan();
+            modulus = ((phi - t.atan()) / PI).floor() as i64;
+        }
+        c = (aa - bb) / 2.0;
+        let g = (aa * bb).sqrt();
+        aa = (aa + bb) / 2.0;
+        bb = g;
+        d += d;
+    }
+    (t.atan() + modulus as f64 * PI) / (d as f64 * aa)
+}
+
+/// Cephes `ellik_neg_m`: `F(φ | m)` for m < 0 and 0 < φ < π/2. A power series for small m·φ²,
+/// an asymptotic form for large, and otherwise Carlson's `R_F(c − 1, c − m, c)` with
+/// c = csc²φ (or the small-φ scaled form) and Cephes' own stopping rule.
+fn cephes_ellik_neg_m(phi: f64, m: f64) -> f64 {
+    let mpp = (m * phi) * phi;
+    if -mpp < 1e-6 && phi < -m {
+        return phi + (-mpp * phi * phi / 30.0 + 3.0 * mpp * mpp / 40.0 + mpp / 6.0) * phi;
+    }
+    if -mpp > 4e7 {
+        let sm = (-m).sqrt();
+        let sp = phi.sin();
+        let cp = phi.cos();
+        let a = (4.0 * sp * sm / (1.0 + cp)).ln();
+        let b = -(1.0 + cp / sp / sp - a) / 4.0 / m;
+        return (a + b) / sm;
+    }
+    let (scale, x, y, z) = if phi > 1e-153 && m > -1e305 {
+        let s = phi.sin();
+        let csc2 = 1.0 / (s * s);
+        (1.0, 1.0 / (phi.tan() * phi.tan()), csc2 - m, csc2)
+    } else {
+        (phi, 1.0, 1.0 - m * phi * phi, 1.0)
+    };
+    if x == y && x == z {
+        return scale / x.sqrt();
+    }
+    let a0 = (x + y + z) / 3.0;
+    let mut a = a0;
+    let (mut x1, mut y1, mut z1) = (x, y, z);
+    // Carlson gives 1/pow(3*r, 1/6) for this constant; ~338.38 at r = eps.
+    let mut q = 400.0 * (a0 - x).abs().max((a0 - y).abs().max((a0 - z).abs()));
+    let mut n: u32 = 0;
+    while q > a.abs() && n <= 100 {
+        let (sx, sy, sz) = (x1.sqrt(), y1.sqrt(), z1.sqrt());
+        let lam = sx * sy + sx * sz + sy * sz;
+        x1 = (x1 + lam) / 4.0;
+        y1 = (y1 + lam) / 4.0;
+        z1 = (z1 + lam) / 4.0;
+        a = (x1 + y1 + z1) / 3.0;
+        n += 1;
+        q /= 4.0;
+    }
+    // Cephes writes `(1 << 2 * n)`, an int shift that is undefined past n = 15; 4ⁿ as a double
+    // is the same value wherever the C is defined.
+    let pow4 = 4.0_f64.powi(n as i32);
+    let xx = (a0 - x) / a / pow4;
+    let yy = (a0 - y) / a / pow4;
+    let zz = -(xx + yy);
+    let e2 = xx * yy - zz * zz;
+    let e3 = xx * yy * zz;
+    scale * (1.0 - e2 / 10.0 + e3 / 14.0 + e2 * e2 / 24.0 - 3.0 * e2 * e3 / 44.0) / a.sqrt()
 }
 
 /// Carlson symmetric elliptic integral R_F(x,y,z) (Numerical Recipes §6.11):
-/// R_F = ½∫₀^∞ dt/√((t+x)(t+y)(t+z)). Handles the m→1 logarithmic corner that
-/// fixed quadrature cannot.
+/// R_F = ½∫₀^∞ dt/√((t+x)(t+y)(t+z)).
+// No longer called: ellipkinc is Cephes `ellik` (frankenscipy-zw56i) and the public `elliprf`
+// is SciPy's rf. RETAINED, as `carlson_rd` is, because `carlson_rf_rd` below claims to be
+// byte-identical to this pair and cites both by name.
+#[allow(dead_code)]
 fn carlson_rf(mut x: f64, mut y: f64, mut z: f64) -> f64 {
     const ERRTOL: f64 = 1.3e-3; // error ~ERRTOL^6 ≈ 5e-18 ≪ machine eps; was 1e-5 (~9 iters → ~5)
     for _ in 0..1000 {
@@ -561,21 +708,6 @@ fn carlson_rd(mut x: f64, mut y: f64, mut z: f64) -> f64 {
         }
     }
     f64::NAN
-}
-
-/// F(φ, m) for any φ via Carlson R_F, with the periodic reduction
-/// F(φ + nπ, m) = F(φ, m) + 2n·K(m) so φ stays in [-π/2, π/2].
-fn ellipkinc_carlson(phi: f64, m: f64, mode: RuntimeMode) -> f64 {
-    let n = (phi / PI).round();
-    let phi_r = phi - n * PI;
-    let s = phi_r.sin();
-    let c = phi_r.cos();
-    let f_r = s * carlson_rf(c * c, 1.0 - m * s * s, 1.0);
-    if n == 0.0 {
-        f_r
-    } else {
-        2.0 * n * ellipk_scalar(m, mode).unwrap_or(f64::NAN) + f_r
-    }
 }
 
 /// E(φ, m) for any φ via Carlson R_F/R_D, with E(φ + nπ, m) = E(φ, m) + 2n·E(m).
@@ -663,7 +795,6 @@ fn ellipeinc_carlson(phi: f64, m: f64, mode: RuntimeMode) -> f64 {
 
 fn ellipkinc_scalar_phi_over_m_vec(phi: f64, m_values: &[f64], mode: RuntimeMode) -> SpecialResult {
     if phi.is_nan()
-        || (phi - PI / 2.0).abs() < 1e-15
         || m_values.iter().any(|m| {
             m.is_nan() || !(0.0..=1.0).contains(m) || (*m >= 1.0 && mode == RuntimeMode::Hardened)
         })
@@ -676,23 +807,10 @@ fn ellipkinc_scalar_phi_over_m_vec(phi: f64, m_values: &[f64], mode: RuntimeMode
             .map(SpecialTensor::RealVec);
     }
 
-    if phi == 0.0 {
-        return Ok(SpecialTensor::RealVec(vec![0.0; m_values.len()]));
-    }
-
-    // Carlson form per m (machine-accurate near m→1). frankenscipy-o65r0.
-    // Each m is an independent, expensive iterative R_F evaluation written to its own
-    // output slot; chunking across cores and concatenating in index order is bit-identical
-    // to the serial `m_values.iter().map(..).collect()` (par_map_indices gates n<256 to the
-    // sequential path). The kernel reads no shared mutable state, so the result is unchanged.
-    let values = par_map_indices(m_values.len(), |i| {
-        let m = m_values[i];
-        Ok(if m == 0.0 {
-            0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM
-        } else {
-            ellipkinc_carlson(phi, m, mode)
-        })
-    })?;
+    // Cephes `ellik` per m, each written to its own slot: chunking across cores and
+    // concatenating in index order is bit-identical to the serial map (par_map_indices gates
+    // n < 256 to the sequential path).
+    let values = par_map_indices(m_values.len(), |i| Ok(cephes_ellik(phi, m_values[i])))?;
     Ok(SpecialTensor::RealVec(values))
 }
 
@@ -716,7 +834,9 @@ fn ellipeinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
         return ellipe_scalar(m, mode);
     }
     if m == 0.0 {
-        return Ok(0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM);
+        // E(φ | 0) = φ, which Cephes' ellie returns as is. The Gauss-Legendre weight sum here,
+        // 1.9999999999999998, made it φ·(1 − 2⁻⁵³), 1 ulp below SciPy.
+        return Ok(phi);
     }
 
     // Carlson symmetric form (machine-accurate near m→1). frankenscipy-o65r0.
@@ -2518,6 +2638,43 @@ mod tests {
     // ── Incomplete elliptic integrals ─────────────────────────────
 
     #[test]
+    fn ellipkinc_is_scipys_cephes_ellik_bit_for_bit() -> Result<(), SpecialError> {
+        // frankenscipy-zw56i: ellipkinc is xsf's Cephes ellik. SciPy 1.17.1's bits through the
+        // Landen iteration, m -> 1 (the old R_F form was 1.0e-10 off at the first point), m = 1,
+        // the amplitude transformation, |phi| past pi/2, m < 0 (series, Carlson and asymptotic
+        // branches) and m = 0, which is phi exactly. (phi, m, scipy.special.ellipkinc).
+        let cases: [(f64, f64, f64); 14] = [
+            (1.5708642874071383, 0.9999999709353826, 10.451933845280488),
+            (1.0, 0.5, 1.0832167728451687),
+            (1.5707963267948966, 0.5, 1.8540746773013719),
+            (2.0, 0.3, 2.220590552128474),
+            (-2.5, 0.7, -3.4768751906448916),
+            (1.4, 0.999999999, 2.45799558245953),
+            (1.4, 1.0, 2.4579955903729784),
+            (1.0, 0.0, 1.0),
+            (20.0, 0.9, 32.39944907100371),
+            (0.5, -3.0, 0.45396297924155427),
+            (1.2, -1e9, 0.0003594981570130712),
+            (1e-200, -5.0, 1e-200),
+            (1.5, -1e5, 0.02236326885456018),
+            (0.3, 0.99999999999, 0.3046039744016562),
+        ];
+        for (phi, m, want) in cases {
+            let got = ellipkinc_scalar(
+                std::hint::black_box(phi),
+                std::hint::black_box(m),
+                RuntimeMode::Strict,
+            )?;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "ellipkinc({phi:?}, {m:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ellipkinc_at_pi_half_equals_complete() {
         let phi = SpecialTensor::RealScalar(PI / 2.0);
         let m = SpecialTensor::RealScalar(0.5);
@@ -2544,9 +2701,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_elliptic_m_zero_preserves_quadrature_bits() {
+    fn incomplete_elliptic_m_zero_is_phi() {
+        // F(phi | 0) = E(phi | 0) = phi, which Cephes' ellik and ellie return as is. This test
+        // used to pin 0.5*phi*1.9999999999999998, the Gauss-Legendre weight sum, which was
+        // 1 ulp below SciPy (frankenscipy-zw56i).
         for phi in [PI / 6.0, PI / 4.0, PI / 3.0, PI / 2.0 - 0.1] {
-            let expected = 0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM;
+            let expected = phi;
             let phi_tensor = SpecialTensor::RealScalar(phi);
             let m = SpecialTensor::RealScalar(0.0);
             let kinc = eval_scalar(ellipkinc(&phi_tensor, &m, RuntimeMode::Strict));

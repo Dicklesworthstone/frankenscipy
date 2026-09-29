@@ -535,33 +535,33 @@ pub fn eval_laguerre(n: u32, x: f64) -> f64 {
 
 /// Evaluate the generalized Laguerre polynomial L_n^α(x).
 ///
-/// Uses the three-term recurrence:
-///   L_0^α(x) = 1, L_1^α(x) = 1 + α - x,
-///   (n+1) L_{n+1}^α(x) = (2n+1+α-x) L_n^α(x) - (n+α) L_{n-1}^α(x)
+/// SciPy's integer-degree `eval_genlaguerre` (`eval_genlaguerre_l` in 1.17.1's
+/// `orthogonal_eval.pxd`), its bits. It runs the recurrence on L_k^α / binom(k + α, k):
+///   d_1 = −x/(α+1),  p_1 = 1 + d_1,
+///   d_{k+1} = −x/(k+α+1) · p_k + k/(k+α+1) · d_k,  p_{k+1} = p_k + d_{k+1},
+/// and scales by `binom(n + α, n)` once at the end. The unnormalised three-term recurrence this
+/// replaced drifted to 2.1e-10 relative by n ≈ 900, where SciPy holds 1e-11. α ≤ −1 is outside
+/// the weight's domain and is NaN at every degree, as is a NaN α or x.
 ///
 /// Weight function: x^α exp(-x) on [0, ∞).
 pub fn eval_genlaguerre(n: u32, alpha: f64, x: f64) -> f64 {
-    if n == 0 {
-        if alpha.is_nan() || alpha == f64::NEG_INFINITY || x.is_nan() {
-            return f64::NAN;
-        }
-        return 1.0;
-    }
-    if !alpha.is_finite() || !x.is_finite() {
+    if alpha <= -1.0 || alpha.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    if n == 1 {
-        return 1.0 + alpha - x;
+    match n {
+        0 => 1.0,
+        1 => -x + alpha + 1.0,
+        _ => {
+            let mut d = -x / (alpha + 1.0);
+            let mut p = d + 1.0;
+            for kk in 0..n - 1 {
+                let k = f64::from(kk) + 1.0;
+                d = -x / (k + alpha + 1.0) * p + (k / (k + alpha + 1.0)) * d;
+                p += d;
+            }
+            crate::gamma::binom(f64::from(n) + alpha, f64::from(n)) * p
+        }
     }
-    let mut l_prev = 1.0;
-    let mut l_curr = 1.0 + alpha - x;
-    for k in 1..n {
-        let kf = k as f64;
-        let l_next = ((2.0 * kf + 1.0 + alpha - x) * l_curr - (kf + alpha) * l_prev) / (kf + 1.0);
-        l_prev = l_curr;
-        l_curr = l_next;
-    }
-    l_curr
 }
 
 /// Generalized Laguerre with the legacy scipy argument order
@@ -6299,6 +6299,46 @@ mod tests {
         assert!(eval_laguerre(0, f64::NAN).is_nan());
         assert_eq!(eval_genlaguerre(0, f64::INFINITY, f64::INFINITY), 1.0);
         assert!(eval_genlaguerre(0, f64::NEG_INFINITY, 0.0).is_nan());
+    }
+
+    /// frankenscipy-zw56i. `scipy.special.eval_genlaguerre` with an int64 degree, SciPy 1.17.1.
+    /// The three-term recurrence this replaced missed 13 of these 19: every n ≥ 5 row by a few
+    /// ulp (1000 ulp at n = 896), and α ≤ −1, where SciPy is NaN at every degree, and α = ∞.
+    #[test]
+    fn genlaguerre_is_scipys_integer_degree_recurrence_bit_for_bit() {
+        #[rustfmt::skip]
+        const PINS: &[(u32, f64, f64, f64)] = &[
+            (896, 2.3, 17.5, 15079.920715482976),
+            (1000, 0.5, 29.0, 176406.36731070126),
+            (300, -0.5, 3.0, -0.1390660708311058),
+            (60, 4.75, 55.0, -21826528562.197136),
+            (25, 1.5, 12.25, 90.34229678655952),
+            (5, 0.0, 1.5, 0.11640625000000004),
+            (2, 3.25, 0.125, 10.5078125),
+            (1, 2.5, 3.0, 0.5),
+            (0, 0.5, 7.0, 1.0),
+            (0, f64::INFINITY, f64::INFINITY, 1.0),
+            (4, f64::INFINITY, 1.0, f64::INFINITY),
+            (1, 0.5, f64::INFINITY, f64::NEG_INFINITY),
+            (4, 0.5, f64::INFINITY, f64::NAN),
+            (7, -0.999, 2.0, -0.15824242939019514),
+            (5, -1.0, 1.0, f64::NAN),
+            (5, -1.5, 1.0, f64::NAN),
+            (0, -1.0, 1.0, f64::NAN),
+            (3, 0.5, -4.0, 58.35416666666667),
+            (40, 0.25, 90.0, 2.322586478676585e18),
+        ];
+        for &(n, alpha, x, want) in PINS {
+            let got = eval_genlaguerre(
+                std::hint::black_box(n),
+                std::hint::black_box(alpha),
+                std::hint::black_box(x),
+            );
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "eval_genlaguerre({n}, {alpha}, {x}) = {got:e}, SciPy {want:e}"
+            );
+        }
     }
 
     // ── Jacobi ────────────────────────────────────────────────────
