@@ -6890,6 +6890,11 @@ mod tests {
         // SciPy 1.17.1: either side of MAXSTIR (143.01608, where stirf splits its power),
         // up to and past MAXGAM, and the reflection below -33 down to underflow. The Lanczos
         // sum that served |x| > 33 was up to 2.6e-13 off here.
+        //
+        // The shipped gamma toggles decide which path runs, and other tests flip them under
+        // this lock, so a bit-for-bit reader must hold it too: without it rgamma(143) once came
+        // back 402 ulp off mid-run (frankenscipy-1ixfw).
+        let _guard = gamma_toggle_lock();
         let cases = [
             (33.25, 6.288_735_965_374_881e35, 1.590_144_673_756_212_3e-36),
             (
