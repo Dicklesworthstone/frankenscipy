@@ -5017,13 +5017,6 @@ pub fn log_comb(n: f64, k: f64) -> f64 {
     lgn1 - lgk1 - lgnk1
 }
 
-/// Regularized incomplete beta function I_x(a, b).
-///
-/// Scalar convenience wrapper for `scipy.special.betainc`.
-fn betainc_conv(a: f64, b: f64, x: f64) -> f64 {
-    crate::betainc_scalar(a, b, x, fsci_runtime::RuntimeMode::Strict).unwrap_or(f64::NAN)
-}
-
 /// Inverse of the regularized incomplete beta function.
 ///
 /// Finds x such that I_x(a, b) = y.
@@ -5045,8 +5038,17 @@ pub fn betaincinv(
 }
 
 /// Scalar helper for the inverse regularized incomplete beta function.
+///
+/// SciPy's domain first: a shape that is not finite and positive is NaN at every `y`, the
+/// endpoints included (`betaincinv(0, 3, 0)` and `betaincinv(inf, 3, 0.5)` are nan in SciPy
+/// 1.17.1). The root is `crate::beta::ibeta_inv_pair`'s, which solves against the smaller of
+/// `y` and `1 − y` and keeps `x` to full relative precision down to the 1e-300 tail
+/// (frankenscipy-xzrpr).
 pub fn betaincinv_scalar(a: f64, b: f64, y: f64) -> f64 {
     if a.is_nan() || b.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    if !(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite()) {
         return f64::NAN;
     }
     if y == 0.0 {
@@ -5058,75 +5060,7 @@ pub fn betaincinv_scalar(a: f64, b: f64, y: f64) -> f64 {
     if !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
-
-    // Symmetry I_x(a,b) = 1 - I_{1-x}(b,a): solve the smaller tail so the small-y
-    // seed and the dominant-term inverse stay well-conditioned at both ends.
-    // frankenscipy-dmkvd.
-    if y > 0.5 {
-        return 1.0 - betaincinv_scalar(b, a, 1.0 - y);
-    }
-
-    let mode = fsci_runtime::RuntimeMode::Strict;
-    let ln_beta = crate::betaln_scalar(a, b, mode).unwrap_or(f64::NAN);
-
-    // Small-y seed: I_x(a,b) ~ x^a / (a·B(a,b)) ⟹ x ~ (y·a·B(a,b))^{1/a}.
-    // The old x = a/(a+b) (the mean) is far from the root in the tail, which the
-    // bracketed Newton could not reach before the (formerly absolute) tolerance
-    // tripped.
-    let mut x = (y * a * ln_beta.exp()).powf(1.0 / a);
-    if !(x > 0.0 && x < 1.0) {
-        x = a / (a + b);
-    }
-
-    // Bracketed Newton with bisection fallback
-    let mut lo = 0.0_f64;
-    let mut hi = 1.0_f64;
-
-    for _ in 0..120 {
-        let val = betainc_conv(a, b, x);
-        let err = val - y;
-        // Relative tolerance: 1e-15 absolute is ~100% relative when y is tiny.
-        if err.abs() <= 1e-15 * y.max(1e-300) {
-            break;
-        }
-
-        // Update brackets
-        if val < y {
-            lo = x;
-        } else {
-            hi = x;
-        }
-
-        // Newton step: dI_x/dx = x^(a-1) * (1-x)^(b-1) / B(a,b)
-        let dpx = if x > 0.0 && x < 1.0 {
-            ((a - 1.0) * x.ln() + (b - 1.0) * (1.0 - x).ln() - ln_beta).exp()
-        } else {
-            0.0
-        };
-
-        let x_new = if dpx > 1e-30 {
-            let step = x - err / dpx;
-            if step > lo && step < hi {
-                step
-            } else {
-                0.5 * (lo + hi)
-            }
-        } else {
-            0.5 * (lo + hi)
-        };
-
-        // Iterate-convergence break: once the estimate stops moving, x is the root
-        // to machine precision. Without this, the (necessarily) tight `1e-15·y`
-        // residual tolerance above is often unreachable (betainc carries ~1e-15
-        // relative noise), so Newton oscillated at the ULP floor to the 120-iter
-        // cap — the cause of a ~90-eval, ~18× SciPy loss on stdtrit / t- & F-quantiles
-        // (each eval is a full betainc). Newton converges in ~5-7 iterates instead.
-        if (x_new - x).abs() <= 4.0 * f64::EPSILON * x.abs().max(f64::MIN_POSITIVE) {
-            return x_new;
-        }
-        x = x_new;
-    }
-    x
+    crate::beta::ibeta_inv_pair(a, b, y, 1.0 - y).0
 }
 
 /// Regularized incomplete gamma function P(a, x).

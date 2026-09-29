@@ -8,6 +8,12 @@
 //! diff_stats_nbinom which exercise the same kernel indirectly.
 //!
 //! Tolerances: 1e-12 abs cdf/sf, 1e-9 rel ppf.
+//!
+//! Tail cases (frankenscipy-xzrpr): values near the bottom of the double range and inverses at
+//! a probability near 1 or in the 1e-300 tail, compared RELATIVE to SciPy's value (the same
+//! constants, with |SciPy| as the scale), where an absolute bound would accept any tiny number.
+//! Each was mpmath-checked (60 digits) with SciPy within 1e-13 of it; points where SciPy is
+//! wrong are pinned to mpmath in fsci-special's unit tests instead.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -34,6 +40,8 @@ struct PointCase {
     k: f64,
     n: f64,
     arg: f64,
+    /// Compared relative to |SciPy| (see the module docs).
+    tail: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +142,7 @@ fn generate_query() -> OracleQuery {
                     k: kf,
                     n,
                     arg: p,
+                    tail: false,
                 });
             }
         }
@@ -150,6 +159,7 @@ fn generate_query() -> OracleQuery {
                     k: kf,
                     n,
                     arg: y,
+                    tail: false,
                 });
             }
         }
@@ -164,6 +174,7 @@ fn generate_query() -> OracleQuery {
                     k: kf,
                     n: nn,
                     arg: p,
+                    tail: false,
                 });
             }
         }
@@ -176,9 +187,34 @@ fn generate_query() -> OracleQuery {
                     k: kf,
                     n: nn,
                     arg: y,
+                    tail: false,
                 });
             }
         }
+    }
+    // frankenscipy-xzrpr tail cases, (func, k, n, arg). Old fsci: bdtr 4.59e-300 for 2.4754e-300
+    // and 0 for 9.12e-310, bdtrc 6.2e-4 off, nbdtr 3.39e-298 for 2.2499e-298, nbdtrc 6.36e-300
+    // for 3.808e-300, bdtri 0 for 2.09e-17, nbdtri 1.49e-37 for 6.48e-136 and 6.7e-4 off. (bdtri
+    // near 1 with k > 0 is not here: SciPy forms p as 1 − incbi(…) there and is off itself.)
+    let tail_cases: [(&str, f64, f64, f64); 8] = [
+        ("bdtr", 21.0, 64.0, 0.9999999557370799),
+        ("bdtr", 30.0, 80.0, 0.9999997599847374),
+        ("bdtrc", 27.0, 56.0, 8.866662069093556e-12),
+        ("nbdtr", 22.0, 24.0, 1.1498145979637354e-13),
+        ("nbdtrc", 29.0, 21.0, 0.9999999999633916),
+        ("bdtri", 0.0, 69.0, 0.9999999999999986),
+        ("nbdtri", 5.0, 2.0, 8.815118692845373e-270),
+        ("nbdtri", 28.0, 17.0, 2.412547387592462e-211),
+    ];
+    for (i, &(func, k, n, arg)) in tail_cases.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("{func}_tail{i}_k{k}_n{n}_arg{arg:e}"),
+            func: func.into(),
+            k,
+            n,
+            arg,
+            tail: true,
+        });
     }
     OracleQuery { points }
 }
@@ -296,13 +332,19 @@ fn diff_special_bdtr() {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let scale = scipy_v.abs().max(1.0);
+        // A tail case is held to the same constants relative to |SciPy|.
+        let scale = if case.tail {
+            scipy_v.abs()
+        } else {
+            scipy_v.abs().max(1.0)
+        };
         let rel_diff = abs_diff / scale;
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
 
+        let cdf_scale = if case.tail { scale } else { 1.0 };
         let pass = match arm {
-            "bdtr" | "bdtrc" | "nbdtr" | "nbdtrc" => abs_diff <= CDF_TOL,
+            "bdtr" | "bdtrc" | "nbdtr" | "nbdtrc" => abs_diff <= CDF_TOL * cdf_scale,
             "bdtri" | "nbdtri" => abs_diff <= PPF_TOL_REL * scale,
             _ => false,
         };

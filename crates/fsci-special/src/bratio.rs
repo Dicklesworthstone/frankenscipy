@@ -194,9 +194,16 @@ pub(crate) fn bratio(a: f64, b: f64, x: f64, y: f64) -> (f64, f64) {
 /// Boost's `binomial_ccdf(n, k, x, y)` (`special_functions/beta.hpp`): P(X > k) for
 /// X ~ Binomial(n, x), with `y = 1 − x` passed exactly. The terms are summed from `x^n` down to
 /// `i = k + 1`, each from the last by `C(n, i) / C(n, i + 1) = (i + 1) / (n − i)`. When `x^n`
-/// underflows, the sum starts just above the mode and runs outwards, or, if that term
-/// underflows as well, adds the terms one by one. Boost takes the binomial coefficient from an
-/// exact factorial table; [`binomial_coefficient`] here is exact up to its final rounding.
+/// underflows, the sum starts just above the mode and runs outwards. Boost takes the binomial
+/// coefficient from an exact factorial table; [`binomial_coefficient`] here is exact up to its
+/// final rounding.
+///
+/// Not Boost: when that starting term is not a product of normal numbers, the sum is formed by
+/// [`binomial_ccdf_log_anchored`] instead (frankenscipy-xzrpr). Boost then added the terms one
+/// by one as `x^i·y^(n−i)·C(n, i)`, and a factor that had already gone subnormal (or to 0) took
+/// the result's digits with it: `bdtr(21, 64, 1 − 4.43e-8)` came out 4.59e-300 for 2.4754e-300,
+/// and the results of `bdtr`, `bdtrc`, `nbdtr` and `nbdtrc` below about 1e-290 that take this
+/// route were 0 or wrong in their leading digits (SciPy's `incbet` holds 1e-13 there).
 fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
     let mut result = x.powf(n);
     if result > f64::MIN_POSITIVE {
@@ -213,15 +220,13 @@ fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
     if start <= k + 1.0 {
         start = (k + 2.0).trunc();
     }
-    let choose = |i: f64| binomial_coefficient(n, i);
-    result = x.powf(start) * y.powf(n - start) * choose(start);
-    if result == 0.0 {
-        let mut i = start - 1.0;
-        while i > k {
-            result += x.powf(i) * y.powf(n - i) * choose(i);
-            i -= 1.0;
-        }
-        return result;
+    let x_pow = x.powf(start);
+    let y_pow = y.powf(n - start);
+    let xy_pow = x_pow * y_pow;
+    result = xy_pow * binomial_coefficient(n, start);
+    let normal = |v: f64| (f64::MIN_POSITIVE..=f64::MAX).contains(&v);
+    if !(normal(x_pow) && normal(y_pow) && normal(xy_pow) && normal(result)) {
+        return binomial_ccdf_log_anchored(n, k, x, y);
     }
     let start_term = result;
     let mut term = result;
@@ -239,6 +244,113 @@ fn binomial_ccdf(n: f64, k: f64, x: f64, y: f64) -> f64 {
         i += 1.0;
     }
     result
+}
+
+/// [`binomial_ccdf`]'s sum when its terms leave the normal range (frankenscipy-xzrpr).
+///
+/// [`crate::bratio::bratio`] only takes the binomial route with `x` at or below the mean
+/// (`λ ≥ 0`), so `n·x < k + 1` and the largest term of the tail `i = k + 1, …, n` is its first
+/// one, `t = C(n, k+1)·x^(k+1)·y^(n−k−1)`. The others enter relative to it through the ratio
+/// recurrence, in the normal range: each ratio is below 1, so the relative terms fall
+/// monotonically and the loop stops once they no longer move the sum.
+///
+/// `t` itself is formed with its binary exponent carried apart: `x = m_x·2^e_x` and
+/// `y = m_y·2^e_y` with `m ∈ [½, 1)`, so `x^i = (m_x^i)·2^(i·e_x)` where `m_x^i` stays normal
+/// for `i < 1000`. The mantissas multiply to a normal number and the exponents add exactly;
+/// [`scale_by_pow2`] then rounds the result once, into the subnormal range if it is that small.
+/// Every step is a correctly rounded `powf`, product or sum, so the result carries a few ulps.
+/// Beyond that range (`k + 1` or `n − k − 1` of 1000 or more) `t` is `exp` of its log, whose
+/// rounding is `|ln t|·ε`: about 1e-13 relative at the bottom of the normal range, what
+/// SciPy's `incbet` holds there by the same `exp`.
+fn binomial_ccdf_log_anchored(n: f64, k: f64, x: f64, y: f64) -> f64 {
+    let i0 = k + 1.0;
+    let j0 = n - i0;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    let mut i = i0 + 1.0;
+    while i <= n {
+        term *= (n - i + 1.0) * x / (i * y);
+        sum += term;
+        if term <= f64::EPSILON * sum {
+            break;
+        }
+        i += 1.0;
+    }
+    let c = binomial_coefficient(n, i0);
+    if i0 < 1000.0 && j0 < 1000.0 && c.is_finite() {
+        let (mx, ex) = split_exponent(x);
+        let (my, ey) = split_exponent(y);
+        let (px, epx) = split_exponent(mx.powf(i0));
+        let (py, epy) = split_exponent(my.powf(j0));
+        // i0, j0 < 1000 and |e| ≤ 1074, so the products are exact integers.
+        let exponent = (ex as f64 * i0) as i64 + (ey as f64 * j0) as i64 + epx + epy;
+        return scale_by_pow2(c * px * py * sum, exponent);
+    }
+    let ln_first = ln_binomial_coefficient(n, i0) + i0 * x.ln() + j0 * y.ln();
+    (ln_first + sum.ln()).exp()
+}
+
+/// `x = m·2^e` with `m ∈ [½, 1)`, for finite `x > 0` (C's `frexp`).
+fn split_exponent(x: f64) -> (f64, i64) {
+    // A subnormal x is first scaled into the normal range by 2^54.
+    let (x, bias) = if x < f64::MIN_POSITIVE {
+        (x * 18_014_398_509_481_984.0, 54)
+    } else {
+        (x, 0)
+    };
+    let bits = x.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i64 - 1022;
+    let m = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    (m, e - bias)
+}
+
+/// `2^e` for `−1074 ≤ e ≤ 1023`, exactly (a subnormal below −1022).
+fn pow2(e: i64) -> f64 {
+    if e >= -1022 {
+        f64::from_bits(((e + 1023) as u64) << 52)
+    } else {
+        f64::from_bits(1_u64 << (e + 1074))
+    }
+}
+
+/// `m·2^e` for finite `m > 0`, rounded once (C's `ldexp`). A result in the normal range is
+/// exact; a subnormal one is the single rounding of an exact normal number times an exact
+/// power of two.
+fn scale_by_pow2(m: f64, e: i64) -> f64 {
+    let (mm, me) = split_exponent(m);
+    let t = me + e; // the result is mm·2^t with mm ∈ [½, 1)
+    if t > 1024 {
+        return f64::INFINITY;
+    }
+    if t == 1024 {
+        return (2.0 * mm) * pow2(1023);
+    }
+    if t >= -1021 {
+        return mm * pow2(t);
+    }
+    let shift = -1021 - t; // mm·2^−1021 is normal; the multiply by 2^−shift rounds once
+    if shift > 1074 {
+        return 0.0;
+    }
+    (mm * pow2(-1021)) * pow2(-shift)
+}
+
+/// `ln C(n, k)` for integers `0 ≤ k ≤ n`: the log of [`binomial_coefficient`] while that is
+/// finite, and otherwise the sum of the logs of its factors `(n − i)/(i + 1)`,
+/// `i < min(k, n − k)`, which is short wherever [`binomial_ccdf`] is used.
+fn ln_binomial_coefficient(n: f64, k: f64) -> f64 {
+    let c = binomial_coefficient(n, k);
+    if c.is_finite() {
+        return c.ln();
+    }
+    let m = k.min(n - k);
+    let mut sum = 0.0;
+    let mut i = 0.0;
+    while i < m {
+        sum += ((n - i) / (i + 1.0)).ln();
+        i += 1.0;
+    }
+    sum
 }
 
 /// C(n, k) for integers 0 ≤ k ≤ n (as f64). The recurrence C(n, i + 1) = C(n, i)·(n − i)/(i + 1)
@@ -502,7 +614,7 @@ fn bcorr(a0: f64, b0: f64) -> f64 {
 }
 
 /// `ln B(a0, b0)`.
-fn betaln(a0: f64, b0: f64) -> f64 {
+pub(crate) fn betaln(a0: f64, b0: f64) -> f64 {
     let e = 0.918938533204673;
     let mut a = a0.min(b0);
     let mut b = a0.max(b0);

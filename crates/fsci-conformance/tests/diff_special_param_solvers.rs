@@ -184,6 +184,25 @@ fn generate_query() -> OracleQuery {
             p3: 0.0,
         });
     }
+    // frankenscipy-xzrpr: p within 1e-15 of 1, solved on the exact q = 1 − p as cdflib does,
+    // and a tiny p at a negative t, which the old recursion on 1 − p rounded to 1. mpmath
+    // (60 digits): 15780.81688367567, 369.2856360993614, 91.93674280315364, 290.4526719576585,
+    // with SciPy within 3e-14 of each. Old fsci: the 1e10 sentinel, 372.81, 92.175, 1e10.
+    let t_tail = [
+        (0.9999999999999992_f64, 7.980712957861126),
+        (0.9999999999999991, 8.31550025349924),
+        (0.9999999999999986, 9.477519167442498),
+        (1e-20, -10.0),
+    ];
+    for (i, &(p, t)) in t_tail.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("stdtridf_tail{i}_p{p:e}_t{t}"),
+            func: "stdtridf".into(),
+            p1: p,
+            p2: t,
+            p3: 0.0,
+        });
+    }
     OracleQuery { points }
 }
 

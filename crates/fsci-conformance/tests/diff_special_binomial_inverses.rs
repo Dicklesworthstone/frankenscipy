@@ -4,6 +4,10 @@
 //! Resolves [frankenscipy-0h0tz]. Covers `bdtrik`, `bdtrin`, `nbdtrik`,
 //! and `nbdtrin`, the inverse-with-respect-to-shape variants adjacent to the
 //! existing binomial and negative-binomial CDF helpers.
+//!
+//! Tail cases (frankenscipy-xzrpr): nbdtrin at y within 1e-15 of 1, held to the same tolerance
+//! relative to |SciPy| alone, since several roots are far below 1. Each was mpmath-checked
+//! (60 digits) with SciPy within 7e-15 of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -30,6 +34,8 @@ struct PointCase {
     a: f64,
     b: f64,
     c: f64,
+    /// Compared relative to |SciPy| alone (see the module docs).
+    tail: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,17 +126,37 @@ fn generate_query() -> OracleQuery {
         ("nbdtrin", 5.0, 0.9, 0.5),
         ("nbdtrin", 0.0, 0.5, 0.5),
     ];
+    // frankenscipy-xzrpr: y near 1, solved on the exact 1 − y as cdflib does. mpmath (60
+    // digits): 3.550530782425072, 9.580739296434116e-9, 2.473670531085059e-12. Old fsci solved
+    // `nbdtr − y`, which has no digits there: 3.4846, 6.19e-9, 2.456e-12.
+    let tail_cases: &[(&str, f64, f64, f64)] = &[
+        ("nbdtrin", 48.0, 0.9999999999999996, 0.58222028333915),
+        ("nbdtrin", 12.0, 0.9999999999999998, 0.6929942510172469),
+        ("nbdtrin", 41.0, 0.9999999999999971, 0.11319859040422878),
+    ];
+    let point = |idx: usize, (func, a, b, c): &(&str, f64, f64, f64), tail: bool| PointCase {
+        case_id: if tail {
+            format!("{func}_tail{idx}")
+        } else {
+            format!("{func}_{idx}")
+        },
+        func: (*func).into(),
+        a: *a,
+        b: *b,
+        c: *c,
+        tail,
+    };
     OracleQuery {
         points: cases
             .iter()
             .enumerate()
-            .map(|(idx, (func, a, b, c))| PointCase {
-                case_id: format!("{func}_{idx}"),
-                func: (*func).into(),
-                a: *a,
-                b: *b,
-                c: *c,
-            })
+            .map(|(idx, case)| point(idx, case, false))
+            .chain(
+                tail_cases
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, case)| point(idx, case, true)),
+            )
             .collect(),
     }
 }
@@ -259,7 +285,11 @@ fn diff_special_binomial_inverses() -> Result<(), Box<dyn Error>> {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let scale = scipy_v.abs().max(1.0);
+        let scale = if case.tail {
+            scipy_v.abs()
+        } else {
+            scipy_v.abs().max(1.0)
+        };
         let rel_diff = abs_diff / scale;
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);

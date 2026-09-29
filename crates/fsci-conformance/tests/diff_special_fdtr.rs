@@ -11,6 +11,11 @@
 //! 6 (dfn, dfd) pairs × 7 x or q = 84 cases × 3 funcs cap.
 //! Tolerances: 1e-12 abs cdf/sf (regularized incomplete beta),
 //! 1e-9 rel ppf.
+//!
+//! Tail cases (frankenscipy-xzrpr): fdtri with q in the 1e-300 tail and within 1e-11 of 1,
+//! held to the same 1e-9 relative to |SciPy| itself (the tail roots are far below 1). Each was
+//! mpmath-checked (60 digits) with SciPy within 6e-16 of it; points where SciPy is NaN are
+//! pinned to mpmath in fsci-special's unit tests instead.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -37,6 +42,8 @@ struct PointCase {
     dfn: f64,
     dfd: f64,
     arg: f64,
+    /// Compared relative to |SciPy| itself (see the module docs).
+    tail: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +138,7 @@ fn generate_query() -> OracleQuery {
                     dfn,
                     dfd,
                     arg: x,
+                    tail: false,
                 });
             }
         }
@@ -141,8 +149,48 @@ fn generate_query() -> OracleQuery {
                 dfn,
                 dfd,
                 arg: q,
+                tail: false,
             });
         }
+    }
+    // frankenscipy-xzrpr. mpmath (60 digits): 6.598208468062813e-106, 5.917252068222744e-68,
+    // 1.869629141547289e-28, 2.875419174435946e-25, 1.421218821030826e18, 3.729539123404430e20,
+    // 4.303389216365210e16. Old fsci: 1.86e-29, 9.0e-48, 4.02e-19 and 2.35e-19 in the tail, and
+    // inf for the three near 1, whose complement 1 − x it formed by subtraction.
+    let tail_cases: [(f64, f64, f64); 7] = [
+        (
+            5.324849525451424,
+            0.5324224027327918,
+            5.864793095899144e-279,
+        ),
+        (
+            3.3416874749375753,
+            36.15028804913585,
+            7.578048166151894e-113,
+        ),
+        (
+            15.363963908108275,
+            21.306223081330756,
+            2.2377004571426287e-210,
+        ),
+        (
+            15.677099968700094,
+            23.498175505473483,
+            1.0393981743088624e-189,
+        ),
+        (33.707123878628366, 1.208342874971375, 0.9999999999911681),
+        (33.687472437582684, 1.0707827876516371, 0.9999999999922503),
+        (26.55909782270653, 0.6721604835185495, 0.999998022105552),
+    ];
+    for (i, &(dfn, dfd, q)) in tail_cases.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("fdtri_tail{i}_dfn{dfn}_dfd{dfd}_q{q:e}"),
+            func: "fdtri".into(),
+            dfn,
+            dfd,
+            arg: q,
+            tail: true,
+        });
     }
     OracleQuery { points }
 }
@@ -256,7 +304,11 @@ fn diff_special_fdtr() {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let scale = scipy_v.abs().max(1.0);
+        let scale = if case.tail {
+            scipy_v.abs()
+        } else {
+            scipy_v.abs().max(1.0)
+        };
         let rel_diff = abs_diff / scale;
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
