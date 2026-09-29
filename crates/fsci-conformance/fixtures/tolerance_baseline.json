@@ -1290,7 +1290,7 @@
     "ABS_TOL": 1e-6
   },
   "diff_special_hyp0f1.rs": {
-    "REL_TOL": 1e-8
+    "REL_TOL": 1e-10
   },
   "diff_special_hyp1f1.rs": {
     "CANCELLATION_REL_TOL": 1e-13
