@@ -1560,8 +1560,21 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(hi);
-        println!("n={n} op={op} domain=[{lo}, {hi}]");
-        let x: Vec<f64> = (0..n).map(|i| lo + unit(i) * (hi - lo)).collect();
+        // `FSCI_SPECIAL_ARG0=<sampler>` replaces the box here too, as in the multi-argument
+        // loop: erfinv near ±1, ndtri in the 1e-300 tail, zeta near its pole.
+        let x: Vec<f64> = match std::env::var("FSCI_SPECIAL_ARG0") {
+            Ok(spec) => {
+                let sampler = ArgSampler::parse(&spec).expect(
+                    "FSCI_SPECIAL_ARG0 is lo,hi | log:lo,hi | near:c,dmin,dmax | below:c,dmin,dmax",
+                );
+                println!("n={n} op={op} domain={spec}");
+                (0..n).map(|i| sampler.sample(unit(i), i)).collect()
+            }
+            Err(_) => {
+                println!("n={n} op={op} domain=[{lo}, {hi}]");
+                (0..n).map(|i| lo + unit(i) * (hi - lo)).collect()
+            }
+        };
 
         let mut scipy = Scipy::start(op, &x);
         println!("{}", scipy.ready);
