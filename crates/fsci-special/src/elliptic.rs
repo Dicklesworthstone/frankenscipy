@@ -1870,43 +1870,89 @@ pub fn ellipj_many(u: &[f64], m: f64) -> Vec<(f64, f64, f64, f64)> {
 ///   RC(x, y) = (1/2) ∫₀^∞ (t + x)^{-1/2} (t + y)^{-1} dt
 /// ```
 ///
-/// Closed forms (assuming `x ≥ 0` and `y ≠ 0`):
-///   * `x < y`:  `RC(x, y) = arccos(√(x/y)) / √(y − x)`
-///   * `x > y > 0`: `RC(x, y) = arccosh(√(x/y)) / √(x − y)`
-///   * `x = y > 0`: `RC(x, y) = 1 / √x`
-///   * `y < 0`: Cauchy principal value via Carlson 1995 identity
-///     `RC(x, y) = √(x/(x − y)) · RC(x − y, −y)`. Always real.
+/// SciPy's bits: this is `ellint_carlson::rc` from SciPy 1.17.1's
+/// `ellint_carlson_cpp_lite/_rc.hh` at the relative error bound its ufunc passes (5e-16).
+/// Carlson's duplication runs until the arguments agree to that bound, then the degree-7
+/// series of Carlson (1995) eq. (20) is summed with a compensated Horner scheme.
 ///
-/// Resolves [frankenscipy-mxxij]; Cauchy-PV branch closes
-/// [frankenscipy-43vts].
+/// The closed forms `arccos(√(x/y))/√(y − x)` and `arccosh(√(x/y))/√(x − y)` this replaced
+/// cancel as `x → y`: 1.9e-11 relative off at (9.95527, 9.955275). That is the argument pair
+/// `elliprj`'s duplication hands RC once `p ≈ x`, and it made RJ 8e-5 off
+/// (frankenscipy-2f8h7). Their diagonal test was an absolute `8·eps·max(x, y, 1)`, so tiny
+/// arguments snapped to `1/√x` (3.3e-10 off at (1e-300, 1.000000001e-300)). `x/y`
+/// overflowed at (1e300, 1e-300).
+///
+/// SciPy's domain: `y` zero or subnormal, or `x` negative or NaN, is NaN; an infinite
+/// argument is 0; a negative `y` is the Cauchy principal value
+/// `RC(x − y, −y)·√(x/(x − y))` (Carlson 1995, eq. 2.14).
 #[must_use]
 pub fn elliprc(x: f64, y: f64) -> f64 {
-    if x.is_nan() || y.is_nan() || x < 0.0 {
-        return f64::NAN;
-    }
-    if y == 0.0 {
-        // scipy.special.elliprc treats y = 0 as outside the domain and returns
-        // NaN (not +∞), even though the defining integral diverges there.
-        return f64::NAN;
-    }
+    /// SciPy's `constants::RC_C`, lowest degree first: 80080 times the series
+    /// 1 + 3s²/10 + s³/7 + 3s⁴/8 + 9s⁵/22 + 159s⁶/208 + 9s⁷/8.
+    const RC_C: [f64; 8] = [
+        80080.0, 0.0, 24024.0, 11440.0, 30030.0, 32760.0, 61215.0, 90090.0,
+    ];
     if y < 0.0 {
-        // Cauchy principal value (Carlson 1995, eq. 2.13):
-        //   RC(x, y) = √(x / (x − y)) · RC(x − y, −y)   for y < 0, x ≥ 0.
-        // x − y > 0 and −y > 0 land cleanly in the positive branch.
-        let xm = x - y;
-        let yp = -y;
-        return (x / xm).sqrt() * elliprc(xm, yp);
+        return elliprc(x - y, -y) * (x / (x - y)).sqrt();
     }
-    let diagonal_tol = 8.0 * f64::EPSILON * x.abs().max(y.abs()).max(1.0);
-    if (x - y).abs() <= diagonal_tol {
-        return 1.0 / x.sqrt();
+    if y.is_nan() || y == 0.0 || y.is_subnormal() || x.is_nan() || x < 0.0 {
+        return f64::NAN;
     }
-    let ratio = (x / y).sqrt();
-    if x < y {
-        ratio.acos() / (y - x).sqrt()
-    } else {
-        ratio.acosh() / (x - y).sqrt()
+    if x.is_infinite() || y.is_infinite() {
+        return 0.0;
     }
+    let mut am = (x + 2.0 * y) / 3.0;
+    let mut fterm = (am - x).abs() / (3.0 * CARLSON_RERR).sqrt().sqrt().sqrt();
+    let (mut xm, mut ym) = (x, y);
+    let mut sm = y - am;
+    let mut m = 0_u32;
+    loop {
+        // SciPy continues while `std::max(|xm − ym|, fterm) >= |Am|`; the C++ max keeps its
+        // first argument unless the second is larger.
+        let d = (xm - ym).abs();
+        if !((if d < fterm { fterm } else { d }) >= am.abs()) {
+            break;
+        }
+        if m > CARLSON_MAX_ITER {
+            break;
+        }
+        let lam = 2.0 * xm.sqrt() * ym.sqrt() + ym;
+        am = (am + lam) * 0.25;
+        xm = (xm + lam) * 0.25;
+        ym = (ym + lam) * 0.25;
+        sm *= 0.25;
+        fterm *= 0.25;
+        m += 1;
+    }
+    am = (xm + ym + ym) / 3.0;
+    sm /= am;
+    carlson_comp_horner(sm, &RC_C) / (am.sqrt() * RC_C[0])
+}
+
+/// The relative error bound SciPy passes to every Carlson integral (`ellip_rerr` in
+/// `ellint_carlson_wrap.cxx`).
+const CARLSON_RERR: f64 = 5e-16;
+
+/// SciPy's `config::max_iter` for the Carlson duplication loops.
+const CARLSON_MAX_ITER: u32 = 1000;
+
+/// Compensated Horner evaluation of `poly` (lowest degree first) at `x`: SciPy's
+/// `arithmetic::dcomp_horner` (Graillat, Langlois and Louvet, Algorithm 9). The rounding
+/// error of each product (by FMA) and each sum (Knuth's TwoSum) is carried in `r` and added
+/// once at the end.
+fn carlson_comp_horner<const N: usize>(x: f64, poly: &[f64; N]) -> f64 {
+    let mut s = poly[N - 1];
+    let mut r = 0.0;
+    for &c in poly[..N - 1].iter().rev() {
+        let prod = s * x;
+        let prod_err = s.mul_add(x, -prod);
+        let sum = prod + c;
+        let z = sum - prod;
+        let sum_err = (prod - (sum - z)) + (c - z);
+        s = sum;
+        r = r * x + (prod_err + sum_err);
+    }
+    s + r
 }
 
 /// Carlson symmetric elliptic integral of the first kind, `RF(x, y, z)`.
@@ -3451,6 +3497,64 @@ mod tests {
         // y=0 is outside scipy.special.elliprc's domain → NaN (frankenscipy-rmrmx).
         assert!(elliprc(1.0, 0.0).is_nan());
         assert!(elliprc(0.0, 0.0).is_nan());
+    }
+
+    #[test]
+    fn elliprc_is_scipys_carlson_duplication_bit_for_bit() {
+        // frankenscipy-2f8h7: RC is SciPy 1.17.1's ellint_carlson::rc, so its bits are pinned.
+        // A Python emulation of _rc.hh matched scipy.special.elliprc on 110,013 of 110,013
+        // points. The closed forms it replaced miss most of these: near the diagonal, where
+        // elliprj's duplication calls RC; at tiny arguments, where an absolute diagonal test
+        // snapped to 1/sqrt(x); and at (1e300, 1e-300), where x/y overflowed. The last point
+        // is the one in that sweep where an uncompensated Horner gives different bits.
+        // (x, y, scipy.special.elliprc(x, y)).
+        let cases: [(f64, f64, f64); 17] = [
+            (1.0, 2.0, 0.7853981633974482),
+            (2.0, 1.0, 0.881373587019543),
+            (0.0, 1.0, 1.5707963267948963),
+            (0.0, 0.25, 3.1415926535897927),
+            (4.0, 4.000000000003638, 0.49999999999984845),
+            (4.0, 3.999999999996362, 0.5000000000001517),
+            (9.955270134189597, 9.955274904175287, 0.31693733816370123),
+            (1e-300, 1.0000000010000002e-300, 9.999999996666667e149),
+            (1e300, 1e-300, 6.914686750787736e-148),
+            (1e-300, 1e300, 1.5707963267948966e-150),
+            (1.0, -1.0, 0.6232252401402306),
+            (0.0, -1.0, 0.0),
+            (3.0, -1.0, 0.6584789484624084),
+            (0.5, -1e-12, 20.028211473896718),
+            (7.0, 7.0, 0.37796447300922725),
+            (2.5e-8, 31000000.0, 0.00028212334359609825),
+            (
+                169768.46417187434,
+                2557356.0496944487,
+                0.0008479294238313679,
+            ),
+        ];
+        for (x, y, want) in cases {
+            let got = elliprc(std::hint::black_box(x), std::hint::black_box(y));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "elliprc({x:?}, {y:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        // SciPy's domain edges: a subnormal y is NaN like y = 0; an infinite argument is 0,
+        // including y = -inf through the principal value.
+        assert!(elliprc(1.0, 5e-324).is_nan());
+        assert!(elliprc(-0.5, -1.0).is_nan());
+        for (x, y) in [
+            (f64::INFINITY, 1.0),
+            (1.0, f64::INFINITY),
+            (1.0, f64::NEG_INFINITY),
+        ] {
+            let got = elliprc(std::hint::black_box(x), std::hint::black_box(y));
+            assert_eq!(
+                got.to_bits(),
+                0.0_f64.to_bits(),
+                "elliprc({x}, {y}) = {got:?}"
+            );
+        }
     }
 
     #[test]

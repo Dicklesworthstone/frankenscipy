@@ -20,14 +20,12 @@ use fsci_special::{elliprc, elliprd, elliprf, elliprg, elliprj};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-006";
-// Tolerances loosened from 1e-9 to 1e-7 to absorb the precision
-// floor of fsci's Carlson elliptic-integral series evaluation
-// (max observed ~1.8e-8 abs / ~8.5e-9 rel across 48 fixtures of
-// RF / RD / RG / RJ at varied (x, y, z, p) — the AGM-style
-// duplication theorem converges to ~10× ε of the magnitude,
-// well inside the 1e-7 envelope).
-const ABS_TOL: f64 = 1.0e-7;
-const REL_TOL: f64 = 1.0e-7;
+// elliprc is SciPy's own `ellint_carlson::rc` (frankenscipy-2f8h7), so it must be SciPy's bits.
+// RF, RD, RG and RJ are fsci's duplication kernels: over 200,000 random points each, their
+// largest relative difference from SciPy 1.17.1 was 2.8e-14 (RG), and RJ's was 1.7e-15 once RC
+// was exact. The former 1e-7 absolute-or-pseudo-relative gate could not see RC's 1.9e-11 error
+// near its diagonal, nor the 8e-5 it caused in RJ where p is close to x.
+const REL_TOL: f64 = 1.0e-13;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per Carlson integral.
 const ARMS: [&str; 5] = ["elliprc", "elliprf", "elliprd", "elliprg", "elliprj"];
@@ -67,7 +65,6 @@ struct DiffLog {
     compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
-    abs_tol: f64,
     rel_tol: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -145,6 +142,14 @@ fn generate_carlson_cases() -> Vec<CarlsonCase> {
         (10.0, 0.1),
         (0.0, 1.0),
         (0.0, 4.0),
+        // Near the diagonal, where the arccos/arccosh closed forms cancelled; the third pair
+        // is the one elliprj's duplication handed RC at the RJ point below.
+        (4.0, 4.000000000003638),
+        (4.0, 3.999999999996362),
+        (9.955270134189597, 9.955274904175287),
+        (1e-300, 1.0000000010000002e-300),
+        (1e300, 1e-300),
+        (169768.46417187434, 2557356.0496944487),
     ] {
         cases.push(carlson_binary_case(
             format!("rc_pos_{idx:02}"),
@@ -251,6 +256,18 @@ fn generate_carlson_cases() -> Vec<CarlsonCase> {
         (0.25, 0.5, 1.0, 0.75),
         (3.0, 5.0, 7.0, 11.0),
         (0.1, 0.2, 0.3, 0.4),
+        // p close to one of x, y, z: RJ's duplication then calls RC near its diagonal. The
+        // first point is the n-ary perf sweep's worst, 7.95e-5 off before RC was exact.
+        (
+            9.955270134189597,
+            2.8704213887358336,
+            9.51902144293567,
+            9.955274904175287,
+        ),
+        (1.0, 2.0, 3.0, 1.000001),
+        (0.5, 4.0, 2.0, 0.5000001),
+        (2.0, 3.0, 4.0, 3.000000001),
+        (1.0, 2.0, 5.0, 4.9999999),
     ] {
         cases.push(carlson_rj_case(format!("rj_{idx:02}"), x, y, z, p));
         idx += 1;
@@ -395,8 +412,12 @@ fn diff_special_carlson() {
         };
 
         let abs_diff = (rust_value - scipy_value).abs();
-        let rel_diff = abs_diff / scipy_value.abs().max(1.0);
-        let pass = abs_diff <= ABS_TOL || rel_diff <= REL_TOL;
+        let rel_diff = abs_diff / scipy_value.abs().max(f64::MIN_POSITIVE);
+        let pass = if case.op == "elliprc" {
+            rust_value.to_bits() == scipy_value.to_bits()
+        } else {
+            rel_diff <= REL_TOL
+        };
         ledger.compared(&case.op, &case.case_id, pass);
 
         max_abs_overall = max_abs_overall.max(abs_diff);
@@ -422,7 +443,6 @@ fn diff_special_carlson() {
         compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
-        abs_tol: ABS_TOL,
         rel_tol: REL_TOL,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),

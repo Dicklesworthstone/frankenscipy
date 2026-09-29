@@ -1188,8 +1188,7 @@
     "ROUND_TRIP_TOL": 1e-6
   },
   "diff_special_carlson.rs": {
-    "ABS_TOL": 1e-7,
-    "REL_TOL": 1e-7
+    "REL_TOL": 1e-13
   },
   "diff_special_chdtriv.rs": {
     "REL_TOL": 1e-6
