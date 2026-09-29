@@ -114,6 +114,17 @@ fn generate_query() -> OracleQuery {
         (-1.0, 2.0, 1.0),
         (0.0, 2.0, 1.0),
         (1.0, 2.0, -1.0),
+        // Tiny x with b 1e-9 from 1 (frankenscipy-14k5d): the connection formula's cancellation
+        // sent these to the confluent integral, which misses the integrand beyond t = e^180
+        // (fsci had 179.0 for 574.07 at the first).
+        (2.0, 1.000000001, 1.0e-250),
+        (1.25, 1.000000002, 1.0e-280),
+        (0.6, 1.0000000015, 1.0e-290),
+        (3.5, 0.999999998, 1.0e-260),
+        // ... and tiny x away from b = 1.
+        (1.5, 0.4, 1.0e-200),
+        (0.3, 4.02, 1.0e-40),
+        (2.5, 1.95, 1.0e-3),
     ];
 
     let mut points = Vec::new();

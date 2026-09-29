@@ -10,10 +10,10 @@
 //! z<0 and 0<z<1 series regimes; near-z=1 and |z|>1 are tested
 //! separately.
 //!
-//! 33 finite-valued (a, b, c, z) cases plus 4 real branch-cut
-//! cases via subprocess. Tolerances: 5e-7 rel — same as hyp1f1;
-//! Gauss hypergeometric is wide-tolerance coverage, not a
-//! precision claim.
+//! 40 finite-valued (a, b, c, z) cases plus 4 real branch-cut
+//! cases via subprocess. Tolerance: 1e-9 of max(|value|, 1); the widest
+//! gap measured against SciPy 1.17.1 is 2.6e-14 (frankenscipy-14k5d, which
+//! added the z down to -1e8 cases and tightened this from 5e-7).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -29,7 +29,7 @@ use fsci_special::types::SpecialTensor;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL_REL: f64 = 5.0e-7;
+const TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,6 +187,31 @@ fn generate_query() -> OracleQuery {
         (1.0, 1.0, 2.0, 0.999),
         (2.0, 3.0, 4.0, -5.0),
         (0.3, 0.7, 1.5, -3.0),
+        // z far below -1 (frankenscipy-14k5d): Pfaff's series at z/(z - 1) → 1 ran out of
+        // terms and fsci returned NaN past z ≈ -140. b - a near an integer (-3.05), generic
+        // (-1.71, -0.38), an integer (2), c - a a nonpositive integer, and |z| = 1e8.
+        (
+            3.960983117050649,
+            0.910412268763193,
+            8.652771041686874,
+            -648.335145138167,
+        ),
+        (
+            2.516937449187653,
+            0.802092593722219,
+            3.0624938125185626,
+            -2007.9925247805832,
+        ),
+        (
+            1.0728917813246568,
+            0.693772918681244,
+            6.97221658335025,
+            -6219.058167385678,
+        ),
+        (1.5, 3.5, 2.25, -1000.0),
+        (3.5, 1.25, 1.5, -2000.0),
+        (0.5, 1.75, 2.5, -1.0e8),
+        (-2.5, 1.5, 4.0, -300.0),
     ];
     let mut points = Vec::new();
     for (i, &(a, b, c, z)) in cases.iter().enumerate() {

@@ -3,8 +3,9 @@
 //!
 //! Resolves [frankenscipy-w7u9j]. Probes 0F1(; b; z) at various
 //! (b, z) including small/large/negative z and several positive b.
-//! Tolerance: 1e-8 rel for moderate magnitudes; series convergence
-//! degrades for |z| >> 1 so the magnitudes stay bounded.
+//! Tolerance: 1e-10 rel. The widest gap, 1.7e-12, is SciPy's own error
+//! at (8.93, -130.6), next to a zero of J where fsci is 2e-14 off mpmath
+//! (frankenscipy-14k5d, which added the |z| up to 5000 points).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -20,7 +21,7 @@ use fsci_special::types::SpecialTensor;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const REL_TOL: f64 = 1.0e-8;
+const REL_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +110,27 @@ fn generate_query() -> OracleQuery {
                 z,
             });
         }
+    }
+    // Large negative z (frankenscipy-14k5d): Hankel's expansion of J was cut at its first
+    // growing term (846 relative off at the first point, 1.9 at the second), and below
+    // |z| = 50 the alternating series was summed in double.
+    let far: [(f64, f64); 9] = [
+        (8.92868821393536, -130.57548644060603),
+        (9.9, -300.0),
+        (7.3, -2500.0),
+        (0.75, -5000.0),
+        (6.1, -75.0),
+        (2.0, -40.0),
+        (5.5, -45.0),
+        (3.25, -49.0),
+        (1.3, -20.0),
+    ];
+    for (i, &(b, z)) in far.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("far_b{b}_z{z}_i{i}"),
+            b,
+            z,
+        });
     }
     OracleQuery { points }
 }
