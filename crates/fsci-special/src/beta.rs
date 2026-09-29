@@ -3302,19 +3302,46 @@ pub fn betaln_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
             v.abs().ln()
         });
     }
-    // `betaln(a,b) = ln|B(a,b)| = gammaln(a) + gammaln(b) - gammaln(a+b)` is valid
-    // for ALL real a, b, not just positives: SciPy returns finite values for
-    // negative non-integer arguments (e.g. betaln(-2.5, 3.0) = 0.0645) and the
-    // pole limits (+/-inf) elsewhere. `gammaln_scalar(_, Strict)` returns the
-    // reflection-formula value for negative non-integers and +inf at nonpositive-
-    // integer poles, so the sum reproduces SciPy across the real line. (Only the
-    // rare both-nonpositive-integer pole-cancellation, e.g. betaln(-3, 2), is left
-    // as NaN; SciPy resolves it via a finite gamma-ratio, see frankenscipy notes.)
-    let lg_a = gammaln_scalar(a, RuntimeMode::Strict)?;
-    let lg_b = gammaln_scalar(b, RuntimeMode::Strict)?;
-    let lg_ab = gammaln_scalar(a + b, RuntimeMode::Strict)?;
-    Ok(lg_a + lg_b - lg_ab)
+    // SciPy's betaln is xsf's Cephes `lbeta`, taken branch for branch (frankenscipy-v0oof).
+    // The old `gammaln(a) + gammaln(b) − gammaln(a+b)` cancelled when a ≫ b: 3.3e-6 relative
+    // off at (4.8e9, 0.57), where `lbeta_asymp` keeps SciPy at 1e-10. It was also 3.1e-14 off
+    // in the ordinary domain, where lbeta takes ln|Γ(a)·Γ(b)/Γ(a+b)| rather than log-gamma
+    // sums. With a ≥ b in magnitude:
+    // - a > 1e6·|b| and a > 1e6: the asymptotic series in 1/a;
+    // - any of a, b, a + b past MAXGAM: `lgam(a) + (lgam(b) − lgam(a+b))` in that grouping;
+    // - otherwise Γ(a)·Γ(b)·(1/Γ(a+b)), pairing first the factor whose product with 1/Γ(a+b)
+    //   sits closer to 1, as `beta` does.
+    let (a, b) = if a.abs() < b.abs() { (b, a) } else { (a, b) };
+    if a.abs() > BETA_ASYMP_FACTOR * b.abs() && a > BETA_ASYMP_FACTOR {
+        let mut r = gammaln_scalar(b, RuntimeMode::Strict)?;
+        r -= b * a.ln();
+        r += b * (1.0 - b) / (2.0 * a);
+        r += b * (1.0 - b) * (1.0 - 2.0 * b) / (12.0 * a * a);
+        r += -b * b * (1.0 - b) * (1.0 - b) / (12.0 * a * a * a);
+        return Ok(r);
+    }
+    let y = a + b;
+    if y.abs() > BETA_MAXGAM || a.abs() > BETA_MAXGAM || b.abs() > BETA_MAXGAM {
+        let lg_y = gammaln_scalar(y, RuntimeMode::Strict)?;
+        let tail = gammaln_scalar(b, RuntimeMode::Strict)? - lg_y;
+        return Ok(gammaln_scalar(a, RuntimeMode::Strict)? + tail);
+    }
+    let inv_y = gamma::rgamma_value(y, RuntimeMode::Strict);
+    let ga = gamma::gamma_core(a);
+    let gb = gamma::gamma_core(b);
+    if inv_y.is_infinite() {
+        return Ok(f64::INFINITY);
+    }
+    let value = if ((ga * inv_y).abs() - 1.0).abs() > ((gb * inv_y).abs() - 1.0).abs() {
+        (gb * inv_y) * ga
+    } else {
+        (ga * inv_y) * gb
+    };
+    Ok(value.abs().ln())
 }
+
+/// Cephes' `beta_ASYMP_FACTOR`: `lbeta` switches to its 1/a series once a > 1e6·|b| and a > 1e6.
+const BETA_ASYMP_FACTOR: f64 = 1e6;
 
 pub fn complex_betaln_scalar(a: Complex64, b: Complex64) -> Complex64 {
     let lg_a = gamma::complex_gammaln(a);
@@ -5071,6 +5098,44 @@ mod tests {
             (result - 0.6875).abs() < 1e-10,
             "btdtr(2,3,0.5) got {result}, expected 0.6875"
         );
+    }
+
+    #[test]
+    fn betaln_is_scipys_lbeta_bit_for_bit() -> Result<(), SpecialError> {
+        // frankenscipy-v0oof: betaln is xsf's Cephes lbeta, branch for branch. SciPy 1.17.1's
+        // bits in each: the a >> b asymptotic series (the old log-gamma sum was 3.3e-6 off at
+        // the first point), the MAXGAM log-gamma grouping, the direct Gamma product, negative
+        // non-integer arguments, and a tiny argument. (a, b, scipy.special.betaln(a, b)).
+        let cases: [(f64, f64, f64); 15] = [
+            (4823351920.0840225, 0.5672287983136051, -12.196614989213927),
+            (9316678.13758063, 11.860758417724748, -173.17031994462013),
+            (10000000.0, 2.5, -40.01055644442287),
+            (2000000.0, 1.5, -21.883769032921542),
+            (1.5, 3.0, -1.8813716279177422),
+            (0.5, 0.5, 1.1447298858494),
+            (10.0, 30.0, -22.572893813393982),
+            (100.0, 100.0, -139.66525908670667),
+            (150.0, 30.0, -81.78864670798873),
+            (200.0, 3.0, -15.216742791448382),
+            (1000.0, 1000.0, -1388.482601635902),
+            (-2.5, 3.0, 0.06453852113757116),
+            (3.0, -2.5, 0.06453852113757116),
+            (1e-300, 2.0, 690.7755278982137),
+            (0.25, 10000000000.0, -4.468440207777662),
+        ];
+        for (a, b, want) in cases {
+            let got = betaln_scalar(
+                std::hint::black_box(a),
+                std::hint::black_box(b),
+                RuntimeMode::Strict,
+            )?;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "betaln({a:?}, {b:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
