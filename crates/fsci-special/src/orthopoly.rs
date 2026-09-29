@@ -764,16 +764,17 @@ fn assoc_inverse_factorial_ratio(n: u32, abs_m: u32) -> f64 {
 /// normalized, matching `scipy.special.assoc_legendre_p(n, m, z, norm=norm)`
 /// (the default `branch_cut=2`, `diff_n=0` case for real `z`).
 ///
-/// With `norm = false` this is exactly [`lpmv`]`(m, n, z)`. With `norm = true`
+/// With `norm = false` this is exactly [`lpmv`]`(m, n, z)` for `|m| ≤ n`. With `norm = true`
 /// it carries the additional factor `√((2n+1)/2 · (n−|m|)!/(n+|m|)!)`, and for
 /// `m < 0` the sign `(−1)^|m|` relative to the `|m|` value (SciPy's convention).
-/// `|m| > n` gives `0`.
+/// `|m| > n` gives `0` in both, as SciPy 1.17.1's `assoc_legendre_p` does; [`lpmv`] itself
+/// returns the Ferrers value `P_n^{−|m|}` there (frankenscipy-k5mkb).
 #[must_use]
 pub fn assoc_legendre_p(n: u32, m: i32, z: f64, norm: bool) -> f64 {
-    if !norm {
-        return lpmv(m, n, z);
-    }
     let abs_m = m.unsigned_abs();
+    if !norm {
+        return if abs_m > n { 0.0 } else { lpmv(m, n, z) };
+    }
     if abs_m > n {
         return 0.0;
     }
@@ -2606,9 +2607,15 @@ pub fn lpmv(m: i32, l: u32, x: f64) -> f64 {
     let li = l as i32;
     let am = m.unsigned_abs();
 
-    // |m| > l is zero by definition
+    // P_l^m vanishes for m > l, but P_l^{-μ} for μ > l does not. The old answer here was 0.0
+    // for both, and the reflection below cannot supply it: its (l − μ)! is a pole times a zero
+    // P_l^μ (frankenscipy-k5mkb).
     if am > l {
-        return 0.0;
+        return if m > 0 {
+            0.0
+        } else {
+            lpmv_negative_order_above_degree(am, l, x)
+        };
     }
 
     // Compute P_l^{|m|}(x)
@@ -2625,6 +2632,38 @@ pub fn lpmv(m: i32, l: u32, x: f64) -> f64 {
     } else {
         plm
     }
+}
+
+/// Ferrers `P_l^{−μ}(x)` for an order `μ > l`, where the reflection through `P_l^μ = 0` is
+/// 0·∞. DLMF 14.3.1 gives `((1−x)/(1+x))^{μ/2}·F(−l, l+1; 1+μ; (1−x)/2)/μ!`. Pfaff's
+/// transformation turns the terminating ₂F₁ into
+/// `Σₖ C(l,k)·(μ−l)ₖ/(μ+1)ₖ·((1−x)/2)ᵏ((1+x)/2)^{l−k}`, whose terms are all non-negative on
+/// [−1, 1], so nothing cancels. Against mpmath's `legenp(l, −μ, x, type=2)` this is within
+/// 1.4e-15 for μ ≤ 11. SciPy 1.17.1 returns NaN for every such point; outside [−1, 1] it is
+/// NaN here too, as SciPy's is for every order.
+fn lpmv_negative_order_above_degree(mu: u32, l: u32, x: f64) -> f64 {
+    if !(-1.0..=1.0).contains(&x) {
+        return f64::NAN;
+    }
+    let (lo, hi) = ((1.0 - x) / 2.0, (1.0 + x) / 2.0);
+    let (muf, lf) = (f64::from(mu), f64::from(l));
+    let mut sum = 0.0;
+    let mut coef = 1.0;
+    for k in 0..=l {
+        let kf = f64::from(k);
+        sum += coef * lo.powi(k as i32) * hi.powi((l - k) as i32);
+        coef *= (lf - kf) / (kf + 1.0) * (muf - lf + kf) / (muf + 1.0 + kf);
+    }
+    let ratio = (1.0 - x) / (1.0 + x);
+    let prefactor = if mu <= 170 {
+        // ((1−x)/(1+x))^{μ/2}/μ! as one running product: no overflow in μ! on the way.
+        let h = ratio.sqrt();
+        (1..=mu).fold(1.0, |acc, j| acc * (h / f64::from(j)))
+    } else {
+        let ln_fact = crate::gammaln_scalar(muf + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        (0.5 * muf * ratio.ln() - ln_fact).exp()
+    };
+    prefactor * sum
 }
 
 /// Compute P_l^m(x) for m >= 0 using stable upward recurrence.
@@ -6677,7 +6716,29 @@ mod tests {
     #[test]
     fn lpmv_m_exceeds_l_is_zero() {
         assert_eq!(lpmv(5, 3, 0.5), 0.0);
-        assert_eq!(lpmv(-5, 3, 0.5), 0.0);
+    }
+
+    #[test]
+    fn lpmv_negative_order_above_degree_is_the_ferrers_function() {
+        // frankenscipy-k5mkb: P_l^{-mu} for mu > l is not zero (the old answer), and SciPy's
+        // NaN there is a refusal. (m, l, x, mpmath legenp(l, m, x, type=2)).
+        let cases: [(i32, u32, f64, f64); 6] = [
+            (-4, 3, -0.3596459210622368, 0.021265629560781363),
+            (-3, 2, 0.6981029056912829, 0.0098356475972985),
+            (-1, 0, 0.5, 0.5773502691896257),
+            (-21, 20, 0.1, 4.3930978021785126e-26),
+            (-25, 3, -0.9, 3.939856989254815e-10),
+            (-5, 3, 0.5, 0.0003120393009943104),
+        ];
+        for (m, l, x, want) in cases {
+            let got = lpmv(m, l, std::hint::black_box(x));
+            assert!(
+                ((got - want) / want).abs() < 1e-14,
+                "lpmv({m}, {l}, {x}) = {got:e}, mpmath {want:e}"
+            );
+        }
+        // Outside [-1, 1] it is NaN, as SciPy's lpmv is for every order.
+        assert!(lpmv(-4, 3, 1.5).is_nan());
     }
 
     #[test]
