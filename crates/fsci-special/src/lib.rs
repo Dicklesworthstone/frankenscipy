@@ -27,6 +27,9 @@ mod bratio;
 pub mod convenience;
 pub mod elliptic;
 pub mod error;
+// The Faddeeva package (`w(z)`, `erfcx`, `w_im`) as SciPy builds it, behind `wofz` and
+// `voigt_profile` (frankenscipy-k64p7). Private and std-only, bit-for-bit the C.
+mod faddeeva;
 pub mod gamma;
 pub mod hyper;
 mod igam_temme;

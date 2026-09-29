@@ -6282,9 +6282,9 @@ pub fn log1pmx_scalar(x: f64) -> f64 {
 
 /// Compute the Faddeeva function w(z) = exp(−z²) · erfc(−iz).
 ///
-/// Matches `scipy.special.wofz` for real inputs and the stable upper-half-plane
-/// complex region used by the Voigt-profile family. Real inputs are returned as
-/// complex values because SciPy exposes `wofz` as a complex-valued function.
+/// Matches `scipy.special.wofz` bit for bit over the whole complex plane (see
+/// [`wofz_scalar`]). Real inputs are returned as complex values because SciPy
+/// exposes `wofz` as a complex-valued function.
 pub fn wofz(z_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     match z_tensor {
         SpecialTensor::RealScalar(x) => Ok(SpecialTensor::ComplexScalar(wofz_scalar(
@@ -6380,150 +6380,36 @@ fn erfc_via_wofz(z: Complex64, mode: RuntimeMode) -> Complex64 {
     (-z * z).exp() * w
 }
 
-/// Weideman's rational approximation of the Faddeeva function w(z) for the upper
-/// half plane (Im z ≥ 0). One Horner pass over N=32 real coefficients plus a
-/// Möbius map Z = (L+iz)/(L−iz): w = 2·p(Z)/(L−iz)² + (1/√π)/(L−iz). Uniformly
-/// accurate (worst rel err 2.3e-13 over |z|<4, no near-real-axis pole), far
-/// cheaper than the erf-Maclaurin series it replaces. J.A.C. Weideman, SIAM J.
-/// Numer. Anal. 31 (1994) 1497.
-fn wofz_weideman(z: Complex64) -> Complex64 {
-    const L: f64 = 4.756_828_460_010_884;
-    const A: [f64; 32] = [
-        -1.303_179_786_305_008_7e-12,
-        3.740_881_293_165_362_5e-12,
-        8.030_367_899_963_89e-12,
-        -2.154_363_207_783_877e-11,
-        -5.544_235_948_166_462_4e-11,
-        1.165_825_109_352_377_4e-10,
-        4.153_743_091_833_453e-10,
-        -5.231_020_481_196_329e-10,
-        -3.208_015_091_723_369e-9,
-        8.124_889_456_846_652e-10,
-        2.379_755_677_989_741_7e-8,
-        2.293_043_906_509_996_6e-8,
-        -1.481_307_891_512_097_7e-7,
-        -4.184_076_370_216_977_6e-7,
-        4.255_833_137_575_008_5e-7,
-        4.401_531_731_578_55e-6,
-        6.821_031_944_001_985e-6,
-        -2.140_961_920_171_075e-5,
-        -1.307_544_925_461_534_6e-4,
-        -2.453_298_027_002_143e-4,
-        3.925_913_607_007_031e-4,
-        4.519_541_105_349_217e-3,
-        1.900_615_578_484_540_8e-2,
-        5.730_440_352_983_722e-2,
-        1.406_071_622_689_376_9e-1,
-        2.954_445_107_150_873e-1,
-        5.460_139_720_639_341e-1,
-        9.019_254_893_647_999e-1,
-        1.345_544_169_234_545,
-        1.825_669_629_632_481_5,
-        2.263_537_299_900_267_6,
-        2.572_253_408_124_569_6,
-    ];
-    let iz = Complex64::new(-z.im, z.re); // i·z
-    let l_minus = Complex64::new(L - iz.re, -iz.im); // L − iz
-    let l_plus = Complex64::new(L + iz.re, iz.im); // L + iz
-    let zz = l_plus / l_minus; // Z = (L+iz)/(L−iz)
-    // Horner: p(Z) = ((…(a0·Z + a1)·Z + a2)…)·Z + a31.
-    let mut p = Complex64::from_real(A[0]);
-    for &c in &A[1..] {
-        p = p * zz + Complex64::from_real(c);
-    }
-    let l_minus_sq = l_minus * l_minus;
-    // 1/√π = 0.5641895835477563.
-    const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
-    Complex64::from_real(2.0) * p / l_minus_sq + Complex64::from_real(INV_SQRT_PI) / l_minus
-}
-
+/// The Faddeeva function w(z) = exp(−z²) · erfc(−iz) at one complex point.
+///
+/// This is the Faddeeva package SciPy builds (`xsf/faddeeva.h`, see the private
+/// `faddeeva` module), so it returns `scipy.special.wofz`'s bits everywhere, the
+/// limits at ±∞ and NaN included. Against mpmath over 51,773 upper-half-plane
+/// points (|x| ≤ 30 and 1e-12 ≤ y ≤ 10, plus |z| up to 1e3) that is at most
+/// 3.0e-14 relative in Re w and 2.4e-13 in Im w. The dispatch it replaced
+/// (erf series, Weideman N = 32, a 24-term continued fraction, an asymptotic
+/// series) lost Re w near the real axis, where Re w ≈ e^{−x²} is far below |w|:
+/// 100% of it at |x| ≈ 4.5, which put `voigt_profile` 2.3e-5 off
+/// (frankenscipy-k64p7). Hardened mode fails closed on a non-finite argument.
 pub fn wofz_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
-    if !z.is_finite() {
-        if mode == RuntimeMode::Hardened {
-            record_special_trace(
-                "wofz",
-                mode,
-                "domain_error",
-                "nonfinite_input",
-                "fail_closed",
-                "complex Faddeeva input must be finite",
-                false,
-            );
-            return Err(SpecialError {
-                function: "wofz",
-                kind: SpecialErrorKind::DomainError,
-                mode,
-                detail: "complex Faddeeva input must be finite",
-            });
-        }
-        return Ok(Complex64::new(f64::NAN, f64::NAN));
+    if !z.is_finite() && mode == RuntimeMode::Hardened {
+        record_special_trace(
+            "wofz",
+            mode,
+            "domain_error",
+            "nonfinite_input",
+            "fail_closed",
+            "complex Faddeeva input must be finite",
+            false,
+        );
+        return Err(SpecialError {
+            function: "wofz",
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail: "complex Faddeeva input must be finite",
+        });
     }
-
-    if z.im == 0.0 {
-        let (re, im) = wofz_real(z.re);
-        return Ok(Complex64::new(re, im));
-    }
-
-    if z.im < 0.0 {
-        let reflected = wofz_scalar(-z, mode)?;
-        return Ok(Complex64::from_real(2.0) * (-(z * z)).exp() - reflected);
-    }
-
-    // Upper half plane (im > 0). Near the real axis the contour integral below
-    // has a pole at t = Re(z) that sits within a single Simpson step (h ≈ 0.03),
-    // so fixed-step quadrature misses it — wofz(0.5+0.001i) was ~10× off, with
-    // error growing as im → 0 across |im| ≲ 0.15. For |z| < 4 use the exact
-    // Faddeeva relation w(z) = e^{-z²} erfc(-iz); erfc(-iz) = 1 − erf(-iz) goes
-    // through the pole-free erf Maclaurin series there (|-iz| = |z| < 4, so no
-    // recursion back into wofz). frankenscipy-wsv5b.
-    if z.abs() < 0.5 {
-        // Tiny |z|: the erf-Maclaurin series converges in ~2-3 terms — cheaper
-        // than the fixed 32-term Weideman rational. -i·z = Im(z) − i·Re(z).
-        let erf_val = crate::error::erf_complex_scalar(Complex64::new(z.im, -z.re));
-        return Ok((-(z * z)).exp() * (Complex64::from_real(1.0) - erf_val));
-    }
-    if z.abs() < 4.0 {
-        // Weideman (1994) rational approximation of the Faddeeva function on the
-        // upper half plane — uniformly accurate (including near the real axis, no
-        // pole issue) and ~2-4× faster than the former erf-Maclaurin path here
-        // (which needed many terms as |z| → 4). N = 32 → worst rel err 2.3e-13 over
-        // |z| < 4 (scipy's own wofz is ~1e-13); the complex-wofz tests use 5e-8.
-        return Ok(wofz_weideman(z));
-    }
-
-    if z.abs() >= 8.0 {
-        return Ok(wofz_asymptotic_upper_half_plane(z));
-    }
-
-    Ok(wofz_integral_upper_half_plane(z))
-}
-
-fn wofz_asymptotic_upper_half_plane(z: Complex64) -> Complex64 {
-    let two_z_squared = (z * z) * 2.0;
-    let mut term = Complex64::from_real(1.0);
-    let mut sum = term;
-    for k in 1..30 {
-        term = term * f64::from(2 * k - 1) / two_z_squared;
-        sum = sum + term;
-        if term.abs() <= f64::EPSILON * sum.abs().max(1.0) {
-            break;
-        }
-    }
-    Complex64::new(0.0, 1.0 / PI.sqrt()) * (sum / z)
-}
-
-fn wofz_integral_upper_half_plane(z: Complex64) -> Complex64 {
-    // Gautschi/Laplace continued fraction for the Faddeeva function in the upper half-plane:
-    //   w(z) = (i/√π) / (z − a₁/(z − a₂/(z − a₃/…))),   aₖ = k/2.
-    // This band is gated to 4 ≤ |z| < 8, where the CF converges geometrically — ~24 terms reach ~1e-13
-    // (more accurate than, and ~30× fewer ops than, the former 768-step Simpson quadrature, whose cost
-    // made fsci's wofz/voigt ~70× slower per point than SciPy's Faddeeva). Evaluated bottom-up.
-    const TERMS: usize = 24;
-    let mut cf = Complex64::new(0.0, 0.0);
-    for k in (1..=TERMS).rev() {
-        cf = Complex64::from_real(k as f64 / 2.0) / (z - cf);
-    }
-    Complex64::new(0.0, 1.0 / PI.sqrt()) * (z - cf).recip()
+    Ok(crate::faddeeva::w(z))
 }
 
 /// Compute the Faddeeva function w(z) = exp(−z²) · erfc(−iz) at a real
@@ -6532,47 +6418,47 @@ fn wofz_integral_upper_half_plane(z: Complex64) -> Complex64 {
 /// On the real axis the closed form is
 ///   Re[w(x)] = exp(−x²)
 ///   Im[w(x)] = (2/√π) · F(x)
-/// where F is the Dawson function `dawsn`. This matches
-/// `scipy.special.wofz(x + 0j)` for real x.
+/// where F is the Dawson function. The imaginary part is the Faddeeva package's
+/// `w_im`, so this is `scipy.special.wofz(x + 0j)` bit for bit, and equal to
+/// `wofz_scalar(x + 0i)`.
 pub fn wofz_real(x: f64) -> (f64, f64) {
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN);
-    }
-    let re = (-x * x).exp();
-    let two_over_sqrt_pi = 2.0 / std::f64::consts::PI.sqrt();
-    let im = two_over_sqrt_pi * dawsn_scalar(x);
-    (re, im)
+    let w = crate::faddeeva::w(Complex64::from_real(x));
+    (w.re, w.im)
 }
+
+/// `1/√2` and `√(2π)` as xsf's `voigt_profile` spells them.
+const VOIGT_INV_SQRT_2: f64 = 0.707106781186547524401;
+const VOIGT_SQRT_2PI: f64 = 2.5066282746310002416123552393401042;
 
 /// Voigt profile V(x; σ, γ) on the real axis.
 ///
-/// Matches `scipy.special.voigt_profile` for scalar real inputs. The general
-/// case is expressed through the Faddeeva function,
-/// `Re[w((x + iγ)/(sqrt(2)σ))] / (σ sqrt(2π))`, with SciPy's point-mass and
-/// Lorentzian edge cases when `sigma == 0`.
+/// `scipy.special.voigt_profile`, bit for bit: xsf's `voigt_profile` operation for
+/// operation, `Re[w((x + iγ)/(√2σ))] / σ / √(2π)` over the Faddeeva package's `w`,
+/// with SciPy's point-mass (`σ = γ = 0`), Lorentzian (`σ = 0`) and Gaussian
+/// (`γ = 0`) cases. Like SciPy it does not reject a negative `σ` or `γ`.
 pub fn voigt_profile(x: f64, sigma: f64, gamma: f64) -> f64 {
-    if x.is_nan() || sigma.is_nan() || gamma.is_nan() {
-        return f64::NAN;
-    }
-    if x.is_infinite() {
-        return 0.0;
-    }
     if sigma == 0.0 {
         if gamma == 0.0 {
+            if x.is_nan() {
+                return x;
+            }
             return if x == 0.0 { f64::INFINITY } else { 0.0 };
         }
-        return gamma / (PI * (x * x + gamma * gamma));
+        return gamma / PI / (x * x + gamma * gamma);
     }
-    if gamma == 0.0 && sigma > 0.0 {
-        return voigt_profile_real_gamma_zero(x, sigma);
+    if gamma == 0.0 {
+        return voigt_gaussian(x, sigma);
     }
+    let zreal = x / sigma * VOIGT_INV_SQRT_2;
+    let zimag = gamma / sigma * VOIGT_INV_SQRT_2;
+    let w = crate::faddeeva::w(Complex64::new(zreal, zimag));
+    w.re / sigma / VOIGT_SQRT_2PI
+}
 
-    let scale = SQRT_2 * sigma;
-    let z = Complex64::new(x / scale, gamma / scale);
-    match wofz_scalar(z, RuntimeMode::Strict) {
-        Ok(w) => w.re / (sigma * (2.0 * PI).sqrt()),
-        Err(_) => f64::NAN,
-    }
+/// xsf's `γ = 0` branch of `voigt_profile`, the normal density with mean 0 and
+/// standard deviation `sigma`.
+fn voigt_gaussian(x: f64, sigma: f64) -> f64 {
+    1.0 / VOIGT_SQRT_2PI / sigma * (-(x / sigma) * (x / sigma) / 2.0).exp()
 }
 
 /// Voigt profile evaluated over an array of `x` at fixed `(sigma, gamma)` — the batched form of
@@ -6590,14 +6476,13 @@ pub fn voigt_profile_many(xs: &[f64], sigma: f64, gamma: f64) -> Vec<f64> {
 /// Voigt profile V(x; σ, γ) on the real axis at γ = 0.
 ///
 /// `scipy.special.voigt_profile(x, sigma, 0)` collapses to a Gaussian and is
-/// a useful real-only fast path.
+/// a useful real-only fast path; for `sigma > 0` it returns SciPy's bits. Unlike
+/// `voigt_profile`, a non-positive or NaN `sigma` is NaN here.
 pub fn voigt_profile_real_gamma_zero(x: f64, sigma: f64) -> f64 {
     if sigma <= 0.0 || sigma.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    // Gaussian PDF with mean 0 and stddev sigma.
-    let coeff = 1.0 / (sigma * (2.0 * std::f64::consts::PI).sqrt());
-    coeff * (-(x * x) / (2.0 * sigma * sigma)).exp()
+    voigt_gaussian(x, sigma)
 }
 
 /// Compute the Tukey-lambda CDF F(x; λ).
@@ -9993,12 +9878,11 @@ mod tests {
     }
 
     #[test]
-    fn wofz_weideman_region_matches_scipy() {
-        // |z| < 4 now uses the Weideman rational (was the erf-Maclaurin series).
-        // References from scipy.special.wofz (1.17.1); asserted to 1e-11 (well
-        // inside Weideman N=32's 2.3e-13 and far tighter than the old 5e-8 test).
-        // Includes a near-real-axis point (im=0.001) where a naive contour
-        // quadrature would miss the pole.
+    fn wofz_mid_region_matches_scipy() {
+        // |z| < 4, the region a Weideman rational used to serve. References from
+        // scipy.special.wofz (1.17.1), 13 digits, asserted to 1e-11. Includes a
+        // near-real-axis point (im=0.001) where a naive contour quadrature would
+        // miss the pole. Bit parity is `wofz_is_scipy_faddeeva_bit_for_bit`.
         let cases = [
             (0.5, 0.5, 0.5331567079122, 0.2304882313845),
             (2.0, 3.0, 0.1307574696698, 0.08111265047746),
@@ -16108,6 +15992,147 @@ mod tests {
             "wofz conjugation for upper half-plane pair",
         );
         Ok(())
+    }
+
+    #[test]
+    fn wofz_is_scipy_faddeeva_bit_for_bit() {
+        // frankenscipy-k64p7. `wofz_scalar` is xsf's `Faddeeva::w`, so every branch of it
+        // reproduces `scipy.special.wofz` to the bit. The dispatch it replaced (erf series,
+        // Weideman N = 32, a 24-term continued fraction, an asymptotic series) lost Re w near
+        // the real axis, where Re w ≈ e^{-x²} is tiny against |w|: 100% off at |x| ≈ 4.5,
+        // 1e-2 at |x| ≈ 7, 1e-7 at |x| ≈ 3. Values are scipy.special.wofz 1.17.1; each comment
+        // is SciPy's own relative error against mpmath at 80 digits.
+        let cases: [(f64, f64, f64, f64); 21] = [
+            // voigt_profile's worst point (x, sigma, gamma) = (-9.9622, 1.6646, 0.11926) -> z
+            (
+                -4.23185309219969,
+                0.05065875922475325,
+                0.0017530159382948228,
+                -0.13738578027618212,
+            ), // 7.3e-15, 7.3e-15
+            // the old continued-fraction band 4 <= |z| < 8, near the axis
+            (4.5, 0.001, 3.023933506934306e-05, 0.1287352036338017), // 4.9e-15, 4.9e-15
+            (5.2, 1e-08, 2.2326832689018905e-10, 0.11062744390776813), // 6.7e-15, 7.5e-15
+            (7.0, 1e-07, 1.1885945814534224e-09, 0.08144750806500302), // 1.0e-15, 8.4e-16
+            // lower half plane, same band
+            (4.8, -0.001, -2.6287682156816214e-05, 0.12027780130668135), // 6.3e-17, 2.7e-17
+            // the old Weideman band 0.5 <= |z| < 4, near the axis
+            (3.0, 1e-06, 0.0001234883688197116, 0.20115731629710729), // 3.8e-16, 1.3e-15
+            // the old erf-series band |z| < 0.5, near the axis
+            (0.3, 0.0001, 0.9138374897892162, 0.3188608529001802), // 2.1e-16, 2.7e-16
+            // Re z == 0: erfcx(Im z)
+            (0.0, 2.5, 0.2108063640611436, 0.0),  // 2.7e-17
+            (0.0, -3.0, 16205.988853999586, 0.0), // 1.7e-17
+            // Im z == 0: (exp(-x²), w_im(x))
+            (3.0, 0.0, 0.00012340980408667956, 0.20115731703760037), // 9.5e-17, 8.6e-17
+            // x < 5e-4: sum4 and sum5 by Taylor series
+            (0.0001, 0.3, 0.7345993292845208, 6.876195628274159e-05), // 3.3e-16, 1.5e-16
+            // x < 10, y > 5: the imaginary terms cancel
+            (1.0, 6.0, 0.09042061181059989, 0.014686964935703239), // 3.2e-16, 5.9e-15
+            // x < 10, lower half plane
+            (2.0, -1.0, -0.20532558064658757, 0.14685548503016754), // 2.7e-16, 1.0e-15
+            // x < 10, y < -6: 2·exp(y² − x²) replaces exp(−x²)·erfcx(y)
+            (1.0, -6.5, 1.4910717386437524e+18, 6.903977257164115e+17), // 6.2e-17, 1.4e-16
+            // 10 <= x <= 28, |y| <= 1e-10: sums in both directions from n0
+            (15.0, 1e-12, 2.5244146785924235e-15, 0.03769678605913684), // 1.5e-16, 1.1e-16
+            // general continued fraction, and its lower half plane (glibc cexp)
+            (7.0, 0.5, 0.005910424131058674, 0.08101143885794782), // 1.1e-16, 8.1e-17
+            (7.0, -0.5, -0.005910424131058674, 0.08101143885794782), // 1.1e-16, 8.1e-17
+            // x > 28 takes the continued fraction even on the axis
+            (29.0, 1e-12, 6.720557322671423e-16, 0.019466400393582408), // 1.9e-16, 4.6e-17
+            // nu == 2 (x + |y| > 4000)
+            (3000.0, 2000.0, 8.679840337528545e-05, 0.0001301975950477282), // 1.2e-15, 3.5e-15
+            // nu == 1 (x + |y| > 1e7), both orderings of x and |y|
+            (
+                20000000.0,
+                1.0,
+                1.4104739588693873e-15,
+                2.8209479177387746e-08,
+            ), // 3.7e-15, 1.2e-15
+            (
+                1.0,
+                20000000.0,
+                2.8209479177387746e-08,
+                1.4104739588693873e-15,
+            ), // 1.3e-15, 3.8e-15
+        ];
+        for (re, im, wr, wi) in cases {
+            let z = Complex64::new(std::hint::black_box(re), std::hint::black_box(im));
+            let w = wofz_scalar(z, RuntimeMode::Strict).unwrap();
+            assert_eq!(
+                (w.re.to_bits(), w.im.to_bits()),
+                (wr.to_bits(), wi.to_bits()),
+                "wofz({re}{im:+}i) = {}{:+}i, scipy {wr}{wi:+}i",
+                w.re,
+                w.im
+            );
+            if im == 0.0 {
+                let (rr, ri) = wofz_real(std::hint::black_box(re));
+                assert_eq!((rr.to_bits(), ri.to_bits()), (wr.to_bits(), wi.to_bits()));
+            }
+        }
+    }
+
+    #[test]
+    fn wofz_non_finite_follows_scipy_in_strict_and_fails_closed_in_hardened() {
+        // scipy.special.wofz 1.17.1 at non-finite arguments. (−∞ − i) is (0, −0): the sign
+        // of the zero is part of the contract.
+        let inf = f64::INFINITY;
+        let cases = [
+            ((inf, 0.0), (0.0, 0.0)),
+            ((0.0, inf), (0.0, 0.0)),
+            ((inf, 1.0), (0.0, 0.0)),
+            ((-inf, -1.0), (0.0, -0.0)),
+        ];
+        for ((re, im), (wr, wi)) in cases {
+            let w = wofz_scalar(Complex64::new(re, im), RuntimeMode::Strict).unwrap();
+            assert_eq!(
+                (w.re.to_bits(), w.im.to_bits()),
+                (f64::to_bits(wr), f64::to_bits(wi)),
+                "wofz({re}{im:+}i) = {w:?}"
+            );
+        }
+        // (NaN + 0i) → (NaN, NaN); (0 + NaN·i) → (NaN, 0), keeping Re z's zero; (1 − ∞i) → NaN.
+        let w = wofz_scalar(Complex64::new(f64::NAN, 0.0), RuntimeMode::Strict).unwrap();
+        assert!(w.re.is_nan() && w.im.is_nan());
+        let w = wofz_scalar(Complex64::new(0.0, f64::NAN), RuntimeMode::Strict).unwrap();
+        assert!(w.re.is_nan() && w.im.to_bits() == 0.0_f64.to_bits());
+        let w = wofz_scalar(Complex64::new(1.0, -inf), RuntimeMode::Strict).unwrap();
+        assert!(w.re.is_nan() && w.im.is_nan());
+        assert!(wofz_scalar(Complex64::new(inf, 0.0), RuntimeMode::Hardened).is_err());
+    }
+
+    #[test]
+    fn voigt_profile_is_scipy_bit_for_bit_near_the_real_axis() {
+        // frankenscipy-k64p7: the first point was 2.3e-5 relative off (SciPy: 7.5e-15 against
+        // mpmath). voigt_profile is xsf's, operation for operation, over Faddeeva::w. Values
+        // are scipy.special.voigt_profile 1.17.1; comments are SciPy's error against mpmath.
+        let cases: [(f64, f64, f64, f64); 7] = [
+            (
+                -9.96220011339966,
+                1.6645991962024114,
+                0.1192557222328333,
+                0.00042013247248880344,
+            ), // 7.5e-15
+            (-7.25, 1.0, 0.001, 6.439693401395942e-06), // 2.9e-15
+            (6.5, 1.2, 1e-09, 1.4144724764659558e-07),  // 3.2e-15
+            (3.1, 0.7, 0.05, 0.0020520634639960597),    // 9.5e-16
+            (0.4, 1.0, 1e-05, 0.3682674402029819),      // 8.7e-17
+            (2.0, 1.5, 0.0, 0.10934004978399577),       // 1.8e-16, gamma == 0 Gaussian
+            (2.0, 0.0, 0.5, 0.03744822190397538),       // 1.2e-16, sigma == 0 Lorentzian
+        ];
+        for (x, sigma, gamma, expected) in cases {
+            let got = voigt_profile(
+                std::hint::black_box(x),
+                std::hint::black_box(sigma),
+                std::hint::black_box(gamma),
+            );
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "voigt_profile({x}, {sigma}, {gamma}) = {got:e}, scipy {expected:e}"
+            );
+        }
     }
 
     #[test]

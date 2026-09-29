@@ -1368,7 +1368,7 @@
   "diff_special_misc_scalars.rs": {
     "STDTRIDF_TOL": 1e-6,
     "TIGHT_TOL": 1e-12,
-    "VOIGT_TOL": 5e-8
+    "VOIGT_TOL_REL": 1e-15
   },
   "diff_special_modstruve.rs": {
     "ABS_TOL": 1e-7,
@@ -1481,7 +1481,7 @@
     "ABS_TOL": 1e-12
   },
   "diff_special_wofz_wrightomega.rs": {
-    "WOFZ_TOL": 1e-7,
+    "WOFZ_TOL_REL": 1e-15,
     "WRIGHTOMEGA_TOL_REL": 1e-15
   },
   "diff_special_wright_bessel.rs": {

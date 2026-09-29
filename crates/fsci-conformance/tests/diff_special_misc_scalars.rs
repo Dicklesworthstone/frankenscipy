@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-002";
 const TIGHT_TOL: f64 = 1.0e-12;
-const VOIGT_TOL: f64 = 5.0e-8;
+// voigt_profile is xsf's over a port of the Faddeeva package, bit-identical to SciPy. This is a
+// TRUE relative tolerance, a few ulp. It was an absolute 5e-8, blind to the 2.3e-5 relative error
+// near the real axis on values of order 1e-4 (frankenscipy-k64p7).
+const VOIGT_TOL_REL: f64 = 1.0e-15;
 const STDTRIDF_TOL: f64 = 1.0e-6; // df-inversion is iterative
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
@@ -136,6 +139,18 @@ fn generate_query() -> OracleQuery {
         (0.0, 0.0, 1.0),
         (1.0, 0.0, 1.0),
         (2.0, 0.0, 0.5),
+        // Near the real axis, z = (x + iγ)/(√2σ) with |Re z| in [2, 8] and Im z small, where
+        // Re w(z) ≈ e^{-Re z²} is tiny against |w|. The first row was 2.3e-5 relative off
+        // (frankenscipy-k64p7).
+        (-9.96220011339966, 1.6645991962024114, 0.1192557222328333),
+        (-7.25, 1.0, 1.0e-3),
+        (6.5, 1.2, 1.0e-9),
+        (3.1, 0.7, 0.05),
+        (8.0, 1.0, 0.02),
+        (-5.5, 0.9, 1.0e-4),
+        (4.2, 1.0, 1.0e-6),
+        (0.4, 1.0, 1.0e-5),
+        (12.0, 1.0, 0.3),
     ];
     for &(x, sigma, gamma) in voigt_cases {
         points.push(PointCase {
@@ -283,7 +298,10 @@ fn diff_special_misc_scalars() {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (fsci_v, tol) = match case.func.as_str() {
             "tklmbda" => (tklmbda(case.arg1, case.arg2), TIGHT_TOL),
-            "voigt_profile" => (voigt_profile(case.arg1, case.arg2, case.arg3), VOIGT_TOL),
+            "voigt_profile" => (
+                voigt_profile(case.arg1, case.arg2, case.arg3),
+                VOIGT_TOL_REL,
+            ),
             "stdtridf" => (stdtridf(case.arg1, case.arg2), STDTRIDF_TOL),
             other => panic!("unknown func {other} in {}", case.case_id),
         };
@@ -293,6 +311,12 @@ fn diff_special_misc_scalars() {
             continue;
         };
         let abs_d = (fsci_v - scipy_v).abs();
+        // voigt_profile's tolerance is relative to SciPy's value.
+        let tol = if case.func == "voigt_profile" {
+            tol * scipy_v.abs()
+        } else {
+            tol
+        };
         ledger.compared(&case.func, &case.case_id, abs_d <= tol);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {

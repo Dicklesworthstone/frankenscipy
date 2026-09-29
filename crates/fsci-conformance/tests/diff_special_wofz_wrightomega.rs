@@ -3,11 +3,12 @@
 //! special functions:
 //!   - `wofz_real(x)` vs `(Re, Im) of scipy.special.wofz(x + 0j)`
 //!     (Faddeeva function for real argument)
+//!   - `wofz_scalar(x + iy)` vs `scipy.special.wofz(x + iy)` over every
+//!     branch of the Faddeeva package, densest near the real axis
 //!   - `wrightomega_scalar(z)` vs `scipy.special.wrightomega(z)`
 //!     (Wright omega, principal real branch)
 //!
-//! Resolves [frankenscipy-713ui]. Both are deterministic scalar
-//! functions; 1e-10 abs tolerance covers iterative-solver floors.
+//! Resolves [frankenscipy-713ui]; the complex arm is frankenscipy-k64p7.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -17,27 +18,31 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_special::{wofz_real, wrightomega_scalar};
+use fsci_runtime::RuntimeMode;
+use fsci_special::{Complex64, wofz_real, wofz_scalar, wrightomega_scalar};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-002";
-/// wofz_real depends on fsci's Dawson-function implementation, whose
-/// precision floor is ~1e-7 on |x| ≥ 1.5. wrightomega is essentially
-/// Newton-on-machine-precision so 1e-12 is fine there.
-const WOFZ_TOL: f64 = 1.0e-7;
+// wofz is a port of the Faddeeva package SciPy runs, bit-identical to it. This is a TRUE relative
+// tolerance per component, a few ulp. It was an absolute 1e-7 on the real axis only, and the
+// complex plane was not compared at all: Re w near the axis, where it is e^{-x²} and tiny against
+// |w|, was up to 100% off at |x| ≈ 4.5 (frankenscipy-k64p7).
+const WOFZ_TOL_REL: f64 = 1.0e-15;
 // wrightomega is xsf's, bit-identical to SciPy. This is a TRUE relative tolerance, a few ulp. It
 // was an absolute 1e-12, blind to relative error on the tiny values below z = -18 where e^z
 // was returned early (frankenscipy-i20cg).
 const WRIGHTOMEGA_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per function.
-const ARMS: [&str; 2] = ["wofz_real", "wrightomega"];
+const ARMS: [&str; 3] = ["wofz_real", "wofz_complex", "wrightomega"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
     case_id: String,
     func: String,
     x: f64,
+    /// Imaginary part of the argument; 0 for the real-argument arms.
+    y: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,7 +53,7 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
-    /// wofz_real: [re, im]; wrightomega: [val].
+    /// wofz_real and wofz_complex: [re, im]; wrightomega: [val].
     values: Option<Vec<f64>>,
 }
 
@@ -110,6 +115,45 @@ fn generate_query() -> OracleQuery {
             case_id: format!("wofz_real_{i:02}_x{x}"),
             func: "wofz_real".into(),
             x: *x,
+            y: 0.0,
+        });
+    }
+    // wofz complex argument samples. The grid is densest near the real axis across the band
+    // edges of the dispatch fsci used before (|z| = 0.5, 4, 8), where Re w lost its digits;
+    // |x| up to 29.5 crosses the Faddeeva package's own switches (x = 6, 8, 10, 28).
+    let near_axis_xs: &[f64] = &[
+        0.3, 1.1, 2.7, 3.3, 4.23, -4.23, 4.9, 5.6, 6.5, 7.4, 9.0, 12.0, 20.0, 29.5,
+    ];
+    let near_axis_ys: &[f64] = &[1.0e-10, 1.0e-6, 1.0e-3, 0.05, 0.3, 2.0, 6.0];
+    let mut complex_zs: Vec<(f64, f64)> = Vec::new();
+    for &x in near_axis_xs {
+        for &y in near_axis_ys {
+            complex_zs.push((x, y));
+        }
+    }
+    for &x in &[0.3, 2.7, 4.9, 7.4] {
+        for &y in &[-1.0e-3, -0.5, -3.0] {
+            complex_zs.push((x, y));
+        }
+    }
+    complex_zs.extend_from_slice(&[
+        // voigt_profile's worst point, z = (x + iγ)/(√2σ) at (-9.9622, 1.6646, 0.11926)
+        (-4.23185309219969, 0.05065875922475325),
+        // Re z == 0 (erfcx), x < 5e-4 (Taylor sums), y < -6, x + |y| > 4000 and > 1e7
+        (0.0, 2.5),
+        (0.0, -3.0),
+        (1.0e-4, 0.3),
+        (1.0, -6.5),
+        (3000.0, 2000.0),
+        (2.0e7, 1.0),
+        (1.0, 2.0e7),
+    ]);
+    for (i, &(x, y)) in complex_zs.iter().enumerate() {
+        points.push(PointCase {
+            case_id: format!("wofz_complex_{i:03}_x{x}_y{y}"),
+            func: "wofz_complex".into(),
+            x,
+            y,
         });
     }
     // wrightomega real-argument samples
@@ -123,6 +167,7 @@ fn generate_query() -> OracleQuery {
             case_id: format!("wrightomega_{i:02}_z{x}"),
             func: "wrightomega".into(),
             x: *x,
+            y: 0.0,
         });
     }
     OracleQuery { points }
@@ -145,10 +190,10 @@ def fnone(v):
 q = json.load(sys.stdin)
 points = []
 for case in q["points"]:
-    cid = case["case_id"]; fn = case["func"]; x = float(case["x"])
+    cid = case["case_id"]; fn = case["func"]; x = float(case["x"]); y = float(case["y"])
     try:
-        if fn == "wofz_real":
-            v = special.wofz(complex(x, 0.0))
+        if fn in ("wofz_real", "wofz_complex"):
+            v = special.wofz(complex(x, y if fn == "wofz_complex" else 0.0))
             re = fnone(v.real); im = fnone(v.imag)
             if re is None or im is None:
                 points.append({"case_id": cid, "values": None})
@@ -236,12 +281,18 @@ fn diff_special_wofz_wrightomega() {
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let arm = case.func.as_str();
-        let (fsci_v, tol): (Vec<f64>, f64) = match arm {
+        let (fsci_v, tol): (Option<Vec<f64>>, f64) = match arm {
             "wofz_real" => {
                 let (re, im) = wofz_real(case.x);
-                (vec![re, im], WOFZ_TOL)
+                (Some(vec![re, im]), WOFZ_TOL_REL)
             }
-            "wrightomega" => (vec![wrightomega_scalar(case.x)], WRIGHTOMEGA_TOL_REL),
+            "wofz_complex" => (
+                wofz_scalar(Complex64::new(case.x, case.y), RuntimeMode::Strict)
+                    .ok()
+                    .map(|w| vec![w.re, w.im]),
+                WOFZ_TOL_REL,
+            ),
+            "wrightomega" => (Some(vec![wrightomega_scalar(case.x)]), WRIGHTOMEGA_TOL_REL),
             other => panic!("unknown func {other} in {}", case.case_id),
         };
         // The ledger rejects a length mismatch and a non-finite fsci element.
@@ -249,7 +300,7 @@ fn diff_special_wofz_wrightomega() {
             arm,
             &case.case_id,
             scipy_arm.values.as_deref(),
-            Some(fsci_v.as_slice()),
+            fsci_v.as_deref(),
         ) else {
             continue;
         };
@@ -259,18 +310,18 @@ fn diff_special_wofz_wrightomega() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
-        // wrightomega's tolerance is relative to SciPy's value.
-        let tol = if case.func == "wrightomega" {
-            tol * scipy_v[0].abs()
-        } else {
-            tol
-        };
-        ledger.compared(arm, &case.case_id, abs_d <= tol);
+        // Every tolerance is relative to SciPy's value, component by component: Re w near the
+        // real axis is orders of magnitude below |w|, so one tolerance on |w| would not see it.
+        let pass = fsci_v
+            .iter()
+            .zip(scipy_v.iter())
+            .all(|(a, b)| (a - b).abs() <= tol * b.abs());
+        ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= tol,
+            pass,
         });
     }
 
@@ -278,7 +329,7 @@ fn diff_special_wofz_wrightomega() {
 
     let log = DiffLog {
         test_id: "diff_special_wofz_wrightomega".into(),
-        category: "scipy.special.wofz (real) + wrightomega".into(),
+        category: "scipy.special.wofz (real and complex) + wrightomega".into(),
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
