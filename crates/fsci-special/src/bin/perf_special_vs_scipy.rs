@@ -79,11 +79,12 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialTensor, beta, betainc, betaln, cosm1, dawsn, digamma, ellipe, ellipk, ellipkm1, entr,
-    erf, erfc, erfcinv, erfcx, erfi, erfinv, exp1, expi, expit, exprel, gamma, gammainc, gammaincc,
-    gammaln, gammasgn, hyp0f1, i0, i0e, i1, i1e, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e,
+    SpecialError, SpecialErrorKind, SpecialTensor, bei, beip, ber, berp, beta, betainc, betaln,
+    cbrt, cosdg, cosm1, cotdg, dawsn, digamma, ellipe, ellipk, ellipkm1, entr, erf, erfc, erfcinv,
+    erfcx, erfi, erfinv, exp1, expi, expit, exprel, gamma, gammainc, gammaincc, gammaln, gammasgn,
+    hyp0f1, i0, i0e, i1, i1e, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e, kei, keip, ker, kerp,
     kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit, ndtr, ndtri, ndtri_exp,
-    rgamma, spence, wrightomega, y0, y1, yn, yv, yve, zeta, zetac,
+    rgamma, sindg, spence, tandg, wrightomega, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -303,6 +304,21 @@ const CASES: &[(&str, f64, f64)] = &[
     ("gammasgn", -10.5, 10.0),
     ("zetac", -20.0, 30.0),
     ("wrightomega", -20.0, 20.0),
+    // Kelvin functions and their derivatives; ker/kei are singular at 0.
+    ("ber", 0.0, 30.0),
+    ("bei", 0.0, 30.0),
+    ("berp", 0.0, 30.0),
+    ("beip", 0.0, 30.0),
+    ("ker", 0.01, 30.0),
+    ("kei", 0.01, 30.0),
+    ("kerp", 0.01, 30.0),
+    ("keip", 0.01, 30.0),
+    // Trigonometry in degrees, over two turns each way, and the cube root.
+    ("sindg", -720.0, 720.0),
+    ("cosdg", -720.0, 720.0),
+    ("tandg", -720.0, 720.0),
+    ("cotdg", -720.0, 720.0),
+    ("cbrt", -1000.0, 1000.0),
 ];
 
 /// Two-argument cases: the `scipy.special` name and a domain for each argument.
@@ -413,7 +429,36 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "gammasgn" => gammasgn(tensor, mode),
         "zetac" => zetac(tensor, mode),
         "wrightomega" => wrightomega(tensor, mode),
+        "ber" => scalar_map(tensor, ber),
+        "bei" => scalar_map(tensor, bei),
+        "berp" => scalar_map(tensor, berp),
+        "beip" => scalar_map(tensor, beip),
+        "ker" => scalar_map(tensor, ker),
+        "kei" => scalar_map(tensor, kei),
+        "kerp" => scalar_map(tensor, kerp),
+        "keip" => scalar_map(tensor, keip),
+        "sindg" => scalar_map(tensor, sindg),
+        "cosdg" => scalar_map(tensor, cosdg),
+        "tandg" => scalar_map(tensor, tandg),
+        "cotdg" => scalar_map(tensor, cotdg),
+        "cbrt" => scalar_map(tensor, cbrt),
         other => panic!("no fsci entry point wired for {other}"),
+    }
+}
+
+/// fsci's scalar-only kernels (no tensor entry point) mapped over the fixture, as SciPy's ufunc
+/// maps its C kernel. The map is inside the timed region, as SciPy's loop is inside its.
+fn scalar_map(tensor: &SpecialTensor, kernel: fn(f64) -> f64) -> fsci_special::SpecialResult {
+    match tensor {
+        SpecialTensor::RealVec(values) => Ok(SpecialTensor::RealVec(
+            values.iter().map(|&x| kernel(x)).collect(),
+        )),
+        _ => Err(SpecialError {
+            function: "scalar_map",
+            kind: SpecialErrorKind::DomainError,
+            mode: RuntimeMode::Hardened,
+            detail: "scalar kernels take a real vector",
+        }),
     }
 }
 
@@ -1036,6 +1081,22 @@ fn main() {
         };
 
         black_box(ours());
+
+        // `FSCI_SPECIAL_DUMP=<file>` appends `op x fsci(x)` for every fixture point in `{:?}`
+        // (round-trip) form. The CHECK column only says fsci and SciPy DISAGREE; where SciPy
+        // is itself inaccurate (its Kelvin functions are 1e-9..2e-6 off), a high-precision
+        // reference has to judge our value directly, and this is how it gets our value.
+        if let Ok(path) = std::env::var("FSCI_SPECIAL_DUMP") {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open FSCI_SPECIAL_DUMP");
+            let mut file = std::io::BufWriter::new(file);
+            for (xi, yi) in x.iter().zip(ours()) {
+                writeln!(file, "{op} {xi:?} {yi:?}").expect("write FSCI_SPECIAL_DUMP");
+            }
+        }
 
         // `FSCI_SPECIAL_PROBE=<k>` runs EXACTLY k calls of our arm and exits before SciPy
         // is ever timed. It exists so `perf stat --no-inherit -e instructions` divided by
