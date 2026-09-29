@@ -182,7 +182,7 @@ jobs:
       - name: fsci-runtime tests (byte-exact audit-ledger golden)
         run: cargo test -p fsci-runtime
       - name: Tolerance ratchet (G9) incl. unanchored diff files
-        run: cargo run -p fsci-conformance --bin tolerance_lint -- --max-violations 360
+        run: cargo run -p fsci-conformance --bin tolerance_lint -- --max-violations 169
 
   # ── G2: Unit + Property Tests, one job per crate ─────────────────
   # A failure names its crate, the wall is parallel, and the conformance crate's 796
@@ -613,7 +613,7 @@ jobs:
           cache-on-failure: true
       - run: |
           cargo run --release -p fsci-conformance --bin tolerance_lint -- \
-            --max-violations 360
+            --max-violations 169
       # Every scipy.* attribute an inline oracle names must exist in the pinned SciPy
       # (frankenscipy-olv0j.3). A removed function raises AttributeError, the harness maps that
       # to "no SciPy value", and the column silently compares nothing: nine such references

@@ -25,8 +25,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.772453850905516,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
     },
@@ -39,8 +39,8 @@
       "expected": {
         "kind": "scalar",
         "value": 3.1780538303479458,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gammaln"
       }
     },
@@ -92,8 +92,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.5772156649015329,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::digamma"
       }
     },
@@ -106,8 +106,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.103156640645243,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::digamma"
       }
     },
@@ -120,8 +120,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4903577561002349,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::polygamma"
       }
     },
@@ -134,8 +134,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.8287966442343201,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::polygamma"
       }
     },
@@ -254,8 +254,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::j0"
       }
     },
@@ -625,8 +625,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jn"
       }
     },
@@ -639,8 +639,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jn"
       }
     },
@@ -653,8 +653,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jn"
       }
     },
@@ -667,8 +667,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0558123276692518,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jn"
       }
     },
@@ -681,8 +681,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.09751182812517514,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jn"
       }
     },
@@ -717,8 +717,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.09806499547007692,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::yn"
       }
     },
@@ -731,8 +731,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.05679566856201487,
-        "atol": 0.0001,
-        "rtol": 0.0001,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::yn"
       }
     },
@@ -745,8 +745,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.9376748882454876,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -759,8 +759,8 @@
       "expected": {
         "kind": "scalar",
         "value": 26.477547497559065,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -773,8 +773,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4610685044478946,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -787,8 +787,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0037766133746428825,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -801,8 +801,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -815,8 +815,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -829,8 +829,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.005247497074078575,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -865,8 +865,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.019299320569842265,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_yn"
       }
     },
@@ -879,8 +879,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -893,8 +893,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -918,8 +918,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.26424111765711533,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
     },
@@ -932,8 +932,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7357588823428847,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
     },
@@ -1072,8 +1072,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8427007929497149,
-        "atol": 2e-7,
-        "rtol": 2e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -1086,8 +1086,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.15729920705028513,
-        "atol": 2e-7,
-        "rtol": 2e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erfc"
       }
     },
@@ -1100,8 +1100,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 4e-6,
-        "rtol": 4e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erfinv"
       }
     },
@@ -1114,8 +1114,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 4e-6,
-        "rtol": 4e-6
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1197,8 +1197,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6875,
-        "atol": 2e-11,
-        "rtol": 2e-11,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::beta"
       }
     },
@@ -1211,8 +1211,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5798250000000003,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtr"
       }
     },
@@ -1225,8 +1225,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4201749999999999,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtrc"
       }
     },
@@ -1238,9 +1238,9 @@
       "args": [2.0, 3.0, 0.999999],
       "expected": {
         "kind": "scalar",
-        "value": 3.9999969999999994e-18,
+        "value": 3.9999970003450675e-18,
         "atol": 1e-20,
-        "rtol": 2e-10,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtrc"
       }
     },
@@ -1253,8 +1253,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.2225835336154239,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtri"
       }
     },
@@ -1267,8 +1267,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0249306894715173,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtria"
       }
     },
@@ -1281,8 +1281,8 @@
       "expected": {
         "kind": "scalar",
         "value": 6.500293340049934,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtria"
       }
     },
@@ -1295,8 +1295,8 @@
       "expected": {
         "kind": "scalar",
         "value": 4.246702175718102,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtrib"
       }
     },
@@ -1309,8 +1309,8 @@
       "expected": {
         "kind": "scalar",
         "value": 21.139084078921783,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::btdtrib"
       }
     },
@@ -1323,8 +1323,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.49953413669564345,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fdtr"
       }
     },
@@ -1337,8 +1337,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5004658633043565,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fdtrc"
       }
     },
@@ -1351,8 +1351,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.6084273054201277,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fdtri"
       }
     },
@@ -1364,9 +1364,9 @@
       "args": [5.0, 0.7, 1.5],
       "expected": {
         "kind": "scalar",
-        "value": 7.1205455518861855,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "value": 7.120545552061591,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fdtridfd"
       }
     },
@@ -1393,8 +1393,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8801196948723322,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::stdtr"
       }
     },
@@ -1407,8 +1407,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.1198803051276678,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::stdtrc"
       }
     },
@@ -1421,8 +1421,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.2176499408295116,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::stdtridf"
       }
     },
@@ -1435,8 +1435,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8790578285505889,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::stdtrit"
       }
     },
@@ -1449,8 +1449,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.3822806016000002,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::bdtr"
       }
     },
@@ -1463,8 +1463,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6177193983999998,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::bdtrc"
       }
     },
@@ -1477,8 +1477,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.3183961714766643,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::bdtri"
       }
     },
@@ -1491,8 +1491,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7734375000000002,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::nbdtr"
       }
     },
@@ -1505,8 +1505,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.2265624999999998,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::nbdtrc"
       }
     },
@@ -1519,8 +1519,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4331406303324592,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::nbdtri"
       }
     },
@@ -1533,8 +1533,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7575761331330662,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::pdtr"
       }
     },
@@ -1547,8 +1547,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.2424238668669339,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::pdtrc"
       }
     },
@@ -1561,8 +1561,8 @@
       "expected": {
         "kind": "scalar",
         "value": 3.211322780120959,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::pdtri"
       }
     },
@@ -1575,8 +1575,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.692718092203629,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::pdtrik"
       }
     },
@@ -1589,8 +1589,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.522121655511276,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::chdtr"
       }
     },
@@ -1603,8 +1603,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.477878344488724,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::chdtrc"
       }
     },
@@ -1617,8 +1617,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.7528426841257754,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::chdtri"
       }
     },
@@ -1631,8 +1631,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.6285000206907014,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::chdtriv"
       }
     },
@@ -1645,8 +1645,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.986246032255997,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtr"
       }
     },
@@ -1659,8 +1659,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.013753967744002971,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrc"
       }
     },
@@ -1673,8 +1673,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.22483440431273446,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtria"
       }
     },
@@ -1687,8 +1687,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.8077838329329956,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtria"
       }
     },
@@ -1701,8 +1701,8 @@
       "expected": {
         "kind": "scalar",
         "value": 9.05581244967315,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrib"
       }
     },
@@ -1715,8 +1715,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.472602993054606,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrib"
       }
     },
@@ -1729,8 +1729,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.28778803752030013,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrix"
       }
     },
@@ -1743,8 +1743,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.8077838329329956,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrix"
       }
     },
@@ -1768,8 +1768,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.28778803752030013,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gdtrix"
       }
     },
@@ -1782,8 +1782,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7651976865579666,
-        "atol": 0.0005,
-        "rtol": 0.0005
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1795,8 +1795,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4400505857449335,
-        "atol": 0.0005,
-        "rtol": 0.0005
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1808,8 +1808,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.08825696421567697,
-        "atol": 0.008,
-        "rtol": 0.008
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1821,8 +1821,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 3e-7,
-        "rtol": 3e-7
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1834,8 +1834,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 3e-7,
-        "rtol": 3e-7
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1847,8 +1847,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 2e-10,
-        "rtol": 2e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
     },
@@ -1861,8 +1861,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 2e-12,
-        "rtol": 2e-12,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::beta"
       }
     },
@@ -1875,8 +1875,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 2e-12,
-        "rtol": 2e-12
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -1888,8 +1888,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 3e-6,
-        "rtol": 3e-6
+        "atol": 1e-12,
+        "rtol": 1e-12
       }
     },
     {
@@ -2014,8 +2014,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6366197723675814,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::sinc"
       }
     },
@@ -2028,8 +2028,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.2660658777520084,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -2042,8 +2042,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.590636854637329,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -2056,8 +2056,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.42102443824070834,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -2070,8 +2070,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.13986588181652246,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -2176,8 +2176,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.5106232603198806,
-        "atol": 0.0005,
-        "rtol": 0.0005,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -2190,8 +2190,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.23740747701538087,
-        "atol": 0.0005,
-        "rtol": 0.0005,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -2214,8 +2214,8 @@
           "re": -0.11214969843562081,
           "im": -0.4076726886839208
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -2228,8 +2228,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.2539729859462456,
-        "atol": 0.0005,
-        "rtol": 0.0005,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::yvp"
       }
     },
@@ -2252,8 +2252,8 @@
           "re": 0.7637865221106478,
           "im": -0.24054051327926187
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::yvp"
       }
     },
@@ -2266,8 +2266,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.637488876453882,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -2290,8 +2290,8 @@
           "re": 0.6780846475208375,
           "im": 0.44317266980331826
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -2304,8 +2304,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.5097600271670271,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -2328,8 +2328,8 @@
           "re": -0.1566369922006784,
           "im": 0.3554607702130256
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -2342,8 +2342,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8414709848078965,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -2356,8 +2356,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.43539777497999166,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -2384,8 +2384,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.5403023058681398,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_yn"
       }
     },
@@ -2409,8 +2409,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.35061200427605527,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_yn"
       }
     },
@@ -2423,8 +2423,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.2815352642406603,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -2437,8 +2437,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.20843886982513898,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -2451,8 +2451,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.36003254601368373,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_kn"
       }
     },
@@ -2465,8 +2465,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.3486505539304314,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spherical_kn"
       }
     },
@@ -2493,8 +2493,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.1972245773362196,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::xlogy"
       }
     },
@@ -2521,8 +2521,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8109302162163288,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::xlog1py"
       }
     },
@@ -2577,8 +2577,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.999999693714313,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kolmogi"
       }
     },
@@ -2591,8 +2591,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.2238478702170823,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kolmogi"
       }
     },
@@ -2871,8 +2871,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.34657359027997264,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::entr"
       }
     },
@@ -2899,8 +2899,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.8109302162163288,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::rel_entr"
       }
     },
@@ -2913,8 +2913,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.18906978378367123,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kl_div"
       }
     },
@@ -2941,8 +2941,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8943502263331446,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ndtr"
       }
     },
@@ -2955,8 +2955,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.959963984540054,
-        "atol": 5e-5,
-        "rtol": 5e-5,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ndtri"
       }
     },
@@ -3072,8 +3072,8 @@
       "expected": {
         "kind": "scalar",
         "value": -35.01343715991456,
-        "atol": 1e-6,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::log_ndtr"
       }
     },
@@ -3086,8 +3086,8 @@
       "expected": {
         "kind": "scalar",
         "value": 3.40760596444438,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::logsumexp"
       }
     },
@@ -3100,8 +3100,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4382591473903547,
-        "atol": 5e-8,
-        "rtol": 5e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fresnel"
       }
     },
@@ -3114,8 +3114,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.779893400376823,
-        "atol": 5e-8,
-        "rtol": 5e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::fresnel"
       }
     },
@@ -3128,8 +3128,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5380795069127684,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::dawsn"
       }
     },
@@ -3142,8 +3142,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.9460830703671831,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::sici"
       }
     },
@@ -3156,8 +3156,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.33740392290096816,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::sici"
       }
     },
@@ -3170,8 +3170,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.0572508753757286,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::shichi"
       }
     },
@@ -3184,8 +3184,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8378669409802082,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::shichi"
       }
     },
@@ -3198,8 +3198,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5686566270482881,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::struve"
       }
     },
@@ -3212,8 +3212,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.710243185937891,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::modstruve"
       }
     },
@@ -3254,8 +3254,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.28670620872831604,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ker"
       }
     },
@@ -3268,8 +3268,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.49499463651872,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kei"
       }
     },
@@ -3282,8 +3282,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5822405264650135,
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::spence"
       }
     },
@@ -3296,8 +3296,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.6449340668482264,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::zeta"
       }
     },
@@ -3310,8 +3310,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6449340668482264,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::zetac"
       }
     },
@@ -3324,8 +3324,8 @@
       "expected": {
         "kind": "scalar",
         "value": 4.93480220054468,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::hurwitz_zeta"
       }
     },
@@ -3352,8 +3352,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8807970779778823,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expit"
       }
     },
@@ -3380,8 +3380,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.3862943611198906,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::logit"
       }
     },
@@ -3394,8 +3394,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.00000000005,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::exprel"
       }
     },
@@ -3408,8 +3408,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.718281828459045,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::exprel"
       }
     },
@@ -3422,8 +3422,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.8540746773013719,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipk"
       }
     },
@@ -3436,8 +3436,8 @@
       "expected": {
         "kind": "scalar",
         "value": 2.156515647499643,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipkm1"
       }
     },
@@ -3450,8 +3450,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.3506438810476755,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipe"
       }
     },
@@ -3464,8 +3464,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7107841364378853,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipkinc"
       }
     },
@@ -3478,8 +3478,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6894990277704386,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipeinc"
       }
     },
@@ -3492,8 +3492,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6362806256364313,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3506,8 +3506,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.771457688690515,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3520,8 +3520,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.9586602073143238,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3534,8 +3534,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6896673935732983,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3562,8 +3562,8 @@
       "expected": {
         "kind": "scalar",
         "value": 15.201815980070121,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipk"
       }
     },
@@ -3618,8 +3618,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.826017876249245,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipkinc"
       }
     },
@@ -3632,8 +3632,8 @@
       "expected": {
         "kind": "scalar",
         "value": 3.695637362989875,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipkinc"
       }
     },
@@ -3660,8 +3660,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7481865041776612,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipeinc"
       }
     },
@@ -3674,8 +3674,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.015993545025224,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipeinc"
       }
     },
@@ -3702,8 +3702,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.47421562271182066,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3716,8 +3716,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8804087364264624,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3730,8 +3730,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.9656789647459512,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3744,8 +3744,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4940728937110473,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3758,8 +3758,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.7624477227446591,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3772,8 +3772,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6470498204013996,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3786,8 +3786,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.6515264656026404,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3800,8 +3800,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.8670876269614121,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ellipj"
       }
     },
@@ -3836,8 +3836,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.3247595264191645,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lpmv"
       }
     },
@@ -3850,8 +3850,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.02706329386826371,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lpmv"
       }
     },
@@ -4332,8 +4332,8 @@
       "expected": {
         "kind": "scalar",
         "value": 6.319300497896596,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_genlaguerre"
       }
     },
@@ -4346,8 +4346,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.11894878057553862,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_genlaguerre"
       }
     },
@@ -4360,8 +4360,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.23082864090118665,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_jacobi"
       }
     },
@@ -4374,8 +4374,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5011891464890381,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_jacobi"
       }
     },
@@ -4388,8 +4388,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.29640932576492884,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_gegenbauer"
       }
     },
@@ -4402,8 +4402,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5366920142035819,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::roots_gegenbauer"
       }
     },
@@ -4500,8 +4500,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.5671432904097838,
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4522,8 +4522,8 @@
           "re": -0.3181315052047642,
           "im": 1.3372357014306893
         },
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4558,8 +4558,8 @@
             "im": -0.34711702315061466
           }
         ],
-        "atol": 1e-10,
-        "rtol": 1e-10,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4572,8 +4572,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.2193839343955205,
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -4594,8 +4594,8 @@
           "re": -9.933832570625416,
           "im": -3.141592653589793
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -4608,8 +4608,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.895117816355937,
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -4630,8 +4630,8 @@
           "re": 0.33740392290096816,
           "im": 2.5168793971620795
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -4644,8 +4644,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.14849550677592194,
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expn"
       }
     },
@@ -4658,8 +4658,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.1752011936438014,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::hyp0f1"
       }
     },
@@ -4672,8 +4672,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.2974425414002564,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::hyp1f1"
       }
     },
@@ -4686,8 +4686,8 @@
       "expected": {
         "kind": "scalar",
         "value": 1.3862943611198901,
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::hyp2f1"
       }
     },
@@ -4708,8 +4708,8 @@
           "re": 0.408340591652994,
           "im": 0.34711702315061466
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4730,8 +4730,8 @@
           "re": 0.36952511391841775,
           "im": 0.6785354011085766
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4752,8 +4752,8 @@
           "re": -0.59587823367154,
           "im": 0.23777430918164083
         },
-        "atol": 1e-9,
-        "rtol": 1e-9,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -4774,8 +4774,8 @@
           "re": 0.0002816244519814326,
           "im": -0.17932453503935886
         },
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -4796,8 +4796,8 @@
           "re": -0.0002816244519814326,
           "im": 2.9622681185504343
         },
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -4818,8 +4818,8 @@
           "re": -0.0002816244519814326,
           "im": -2.9622681185504343
         },
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -4840,8 +4840,8 @@
           "re": 0.8901275333915287,
           "im": 2.939664001213473
         },
-        "atol": 1e-8,
-        "rtol": 1e-8,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -4864,8 +4864,8 @@
           "re": -0.19223259376895815,
           "im": 0.0953019560177715
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -4888,8 +4888,8 @@
           "re": 0.26748064523955956,
           "im": 0.36276374710793996
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -4912,8 +4912,8 @@
           "re": 0.07621252944147514,
           "im": 2.6014005823050814
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::yvp"
       }
     },
@@ -4936,8 +4936,8 @@
           "re": -0.1804902751582525,
           "im": 0.15516306557796217
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -4960,8 +4960,8 @@
           "re": 0.042756480365161366,
           "im": -0.06214397988657908
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -4984,8 +4984,8 @@
           "re": 0.08060111568567119,
           "im": -3.9979885617571163
         },
-        "atol": 1e-7,
-        "rtol": 1e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -5012,8 +5012,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.8427007929497148,
-        "atol": 2e-7,
-        "rtol": 2e-7,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -5027,7 +5027,7 @@
         "kind": "scalar",
         "value": 1.1283791670955126e-10,
         "atol": 1e-15,
-        "rtol": 1e-6,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -5041,7 +5041,7 @@
         "kind": "scalar",
         "value": 0.9999999999984626,
         "atol": 1e-12,
-        "rtol": 1e-7,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -5069,7 +5069,7 @@
         "kind": "scalar",
         "value": 1.9999999999984626,
         "atol": 1e-12,
-        "rtol": 1e-7,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erfc"
       }
     },
@@ -5096,8 +5096,8 @@
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 1e-7,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erfinv"
       }
     },
@@ -5110,8 +5110,8 @@
       "expected": {
         "kind": "scalar",
         "value": -0.4769362762044699,
-        "atol": 1e-7,
-        "rtol": 1e-6,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "contract_ref": "fsci_special::erfinv"
       }
     },

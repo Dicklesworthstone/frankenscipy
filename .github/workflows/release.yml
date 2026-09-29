@@ -64,7 +64,7 @@ jobs:
       - name: G9 tolerance ratchet (fixtures + diff harnesses)
         run: |
           cargo run --release -p fsci-conformance --bin tolerance_lint -- \
-            --max-violations 360
+            --max-violations 169
 
   package-check:
     name: Package dry-run (${{ matrix.crate }})
