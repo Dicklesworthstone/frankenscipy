@@ -3304,7 +3304,7 @@ pub fn berp(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-    kelvin_derivatives(x).0
+    kelvin_ber_bei_prime(x).re
 }
 
 /// Kelvin function bei(x): imaginary part of J_0(x * sqrt(j)).
@@ -3366,7 +3366,7 @@ pub fn beip(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-    kelvin_derivatives(x).1
+    kelvin_ber_bei_prime(x).im
 }
 
 /// Kelvin function ker(x): real part of K_0(x * sqrt(j)).
@@ -3503,28 +3503,41 @@ fn complex_k1_series(z: Complex64) -> Complex64 {
     z.recip() + half.ln() * i1 - (z * Complex64::from_real(0.25)) * sum
 }
 
-/// (ber'(x), bei'(x), ker'(x), kei'(x)) from the analytic Kelvin-derivative
-/// identities ber'+i·bei' = e^{iπ/4} I₁(z) and ker'+i·kei' = -e^{iπ/4} K₁(z),
-/// z = x e^{iπ/4}. I₁/K₁ use complex series (small x) and asymptotics (large x).
-/// Replaces the finite-difference / cancelling direct-series forms that were
-/// ~1e-8..4e-6 off scipy. frankenscipy-l3kwr.
-fn kelvin_derivatives(x: f64) -> (f64, f64, f64, f64) {
+/// The analytic Kelvin-derivative identities ber'+i·bei' = e^{iπ/4} I₁(z) and
+/// ker'+i·kei' = -e^{iπ/4} K₁(z), z = x e^{iπ/4}. I₁/K₁ use complex series (small x) and
+/// asymptotics (large x). They replace the finite-difference / cancelling direct-series forms
+/// that were ~1e-8..4e-6 off scipy (frankenscipy-l3kwr).
+///
+/// The two pairs are separate functions: each derivative needs only one of I₁ and K₁, and the
+/// K₁ series recomputes I₁ itself, so a shared helper made ber'/bei' evaluate three series for
+/// the one they use.
+fn kelvin_rotation(x: f64) -> (Complex64, Complex64) {
     use std::f64::consts::FRAC_1_SQRT_2;
     let rot = Complex64::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2); // e^{iπ/4}
     let z = Complex64::new(x * FRAC_1_SQRT_2, x * FRAC_1_SQRT_2);
+    (rot, z)
+}
+
+/// ber'(x) + i·bei'(x) = e^{iπ/4} I₁(x e^{iπ/4}).
+fn kelvin_ber_bei_prime(x: f64) -> Complex64 {
+    let (rot, z) = kelvin_rotation(x);
     let i1 = if x < 20.0 {
         complex_i1_series(z)
     } else {
         complex_i1_asymptotic(z)
     };
+    rot * i1
+}
+
+/// ker'(x) + i·kei'(x) = -e^{iπ/4} K₁(x e^{iπ/4}).
+fn kelvin_ker_kei_prime(x: f64) -> Complex64 {
+    let (rot, z) = kelvin_rotation(x);
     let k1 = if x < KELVIN_ASYMP_X {
         complex_k1_series(z)
     } else {
         complex_k1_asymptotic(z)
     };
-    let bb = rot * i1; // ber' + i·bei'
-    let kk = -(rot * k1); // ker' + i·kei'
-    (bb.re, bb.im, kk.re, kk.im)
+    -(rot * k1)
 }
 
 pub fn ker(x: f64) -> f64 {
@@ -3630,7 +3643,7 @@ pub fn kerp(x: f64) -> f64 {
     if x == 0.0 {
         return f64::NEG_INFINITY;
     }
-    kelvin_derivatives(x).2
+    kelvin_ker_kei_prime(x).re
 }
 
 /// Kelvin function derivative kei'(x).
@@ -3643,7 +3656,7 @@ pub fn keip(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-    kelvin_derivatives(x).3
+    kelvin_ker_kei_prime(x).im
 }
 
 /// Vectorized Kelvin functions over many arguments. fsci exposed these only as
