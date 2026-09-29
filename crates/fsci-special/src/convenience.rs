@@ -1701,15 +1701,68 @@ pub fn itstruve0(x: f64) -> f64 {
 /// for real inputs, so the integral is even in x.
 pub fn itmodstruve0(x: f64) -> f64 {
     // L_0's series has all-positive terms, so its term-by-term integral cannot cancel: summed
-    // in f64 it is within 1.3e-15 of the exact integral at every x up to the overflow near 713,
-    // where it goes to inf as SciPy does, in about x terms. The Simpson quadrature this replaced
-    // past 16 was 3e-10 off and ~100x slower, and SciPy's own asymptotic past 20 is 7e-9 off at
-    // 25 (frankenscipy-ch0z1).
-    if x.is_finite() {
+    // in f64 it is within 1.3e-15 of the exact integral at every x. It costs about x terms,
+    // though, so from |x| = 45 the asymptotic form below takes over. The Simpson quadrature
+    // this replaced past 16 was 3e-10 off and ~100x slower, and SciPy's own asymptotic past 20
+    // is 7e-9 off at 25 (frankenscipy-ch0z1).
+    let ax = x.abs();
+    if ax < ITMODSTRUVE0_ASYMPTOTIC_MIN {
         struve0_integral_series(x, 1.0)
+    } else if ax.is_finite() {
+        itmodstruve0_asymptotic(ax)
     } else {
         f64::NAN
     }
+}
+
+/// From this |x| on, [`itmodstruve0`] takes [`itmodstruve0_asymptotic`].
+const ITMODSTRUVE0_ASYMPTOTIC_MIN: f64 = 45.0;
+
+/// `bₙ` of `∫₀ˣ I₀ ~ eˣ/√(2πx) Σ bₙ x⁻ⁿ`: `bₙ = Σ_{k≤n} aₖ (k + ½)_{n−k}`, with
+/// `aₖ = ((2k−1)!!)² / (k! 8ᵏ)` the coefficients of I₀'s own large-argument expansion. Each
+/// `aₖ t^{−k−½} eᵗ` integrates by parts to `eˣ x^{−k−½} Σ_m (k+½)_m x⁻ᵐ`. Summed in mpmath at
+/// 60 digits and rounded once.
+#[allow(clippy::excessive_precision)]
+const ITI0_ASYMPTOTIC: [f64; 20] = [
+    1.0,
+    0.625,
+    1.0078125,
+    2.5927734375,
+    9.186859130859375,
+    41.56797409057617,
+    229.19635891914368,
+    1491.5040604770184,
+    11192.354495578911,
+    95159.3937421203,
+    904124.2576904121,
+    9493856.041645449,
+    109182382.56943358,
+    1364798039.8733943,
+    18424892376.71708,
+    267161772321.70163,
+    4141013723937.8687,
+    68326776514564.37,
+    1195719014944093.0,
+    2.21208056127209e16,
+];
+
+/// `∫₀ˣ L₀` for `x ≥ 45`: `∫₀ˣ I₀ − (2/π)(ln 2x + γ)`.
+///
+/// `I₀ − L₀ = (2/π) ∫₀¹ e^{−xt} (1−t²)^{−1/2} dt` (DLMF 11.5.4), so the difference of the two
+/// integrals grows only like `(2/π)(ln 2x + γ)`, next to a value near `e^x`. `∫₀ˣ I₀` is 20
+/// terms of its asymptotic series; the smallest term is below 1e-16 of the sum from x = 45. The
+/// exponential is formed as `e^{x/2} · e^{x/2}/√(2πx)`, so it does not overflow before the value
+/// does, near 713. Against the exact series at 50 digits the worst over x in [45, 712] is
+/// 5.5e-16.
+fn itmodstruve0_asymptotic(x: f64) -> f64 {
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let inv_x = 1.0 / x;
+    let mut sum = 0.0;
+    for &b in ITI0_ASYMPTOTIC.iter().rev() {
+        sum = sum * inv_x + b;
+    }
+    let half = (0.5 * x).exp();
+    half * (half / (2.0 * PI * x).sqrt()) * sum - (2.0 / PI) * ((2.0 * x).ln() + EULER_GAMMA)
 }
 
 /// Integrals of the modified Bessel functions `I₀` and `K₀` from 0 to `x`.
@@ -16513,23 +16566,28 @@ mod tests {
         );
     }
 
-    /// frankenscipy-ch0z1. `itmodstruve0` is its all-positive series at every finite x. Each pin
-    /// is the series summed in mpmath at 50 digits; the Simpson quadrature it replaced past 16 was
-    /// 3e-10 off, and SciPy's asymptotic past 20 is 7e-9 off at 25.
+    /// frankenscipy-ch0z1. `itmodstruve0` is its all-positive series below |x| = 45 and the
+    /// asymptotic `∫I₀ − (2/π)(ln 2x + γ)` from there, including past 709.78, where `e^x` alone
+    /// overflows. Each pin is the series summed in mpmath at 50 digits. The Simpson quadrature
+    /// this replaced past 16 was 3e-10 off, and SciPy's asymptotic past 20 is 7e-9 off at 25.
     #[test]
     fn itmodstruve0_is_the_exact_integral_up_to_overflow() {
         #[rustfmt::skip]
-        const PINS: [(f64, f64); 10] = [
+        const PINS: [(f64, f64); 14] = [
             (16.5, 1499803.0549157115),
             (18.25, 8170935.521923119),
             (20.0, 44758596.19878038),
             (25.0, 5899173181.422938),
             (-25.0, 5899173181.422938),
             (30.0, 795538858181.7499),
+            (45.0, 2.1075225881890097e18),
+            (-45.5, 3.45501222001195e18),
             (50.0, 2.9629659299472146e20),
             (100.0, 1.079217066847346e42),
             (400.0, 1.0431665100985694e172),
             (700.0, 1.530688656412344e302),
+            (709.9, 3.0293345555359286e306),
+            (712.0, 2.470148769369148e307),
         ];
         for (x, want) in PINS {
             let got = itmodstruve0(std::hint::black_box(x));
