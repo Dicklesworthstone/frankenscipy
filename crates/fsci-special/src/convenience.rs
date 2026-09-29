@@ -4465,114 +4465,31 @@ pub fn expi_scalar(x: f64) -> f64 {
 // Polygamma Functions
 // ══════════════════════════════════════════════════════════════════════
 
-/// Trigamma function ψ₁(x) = d²ln(Γ(x))/dx².
+/// Trigamma function ψ₁(x) = d²ln(Γ(x))/dx², SciPy's `polygamma(1, x)` bit for bit.
 ///
-/// Matches `scipy.special.polygamma(1, x)`.
+/// See `polygamma_cephes` in gamma.rs. This used to stop its asymptotic series at B₆ after
+/// shifting to 8, which left ~2e-9 relative error (frankenscipy-a79hb).
+#[must_use]
 pub fn trigamma(x: f64) -> f64 {
-    if x <= 0.0 && x == x.floor() {
-        return f64::INFINITY;
-    }
-    if x < 0.0 {
-        let pi = std::f64::consts::PI;
-        let sin_pi_x = (pi * x).sin();
-        return (pi * pi) / (sin_pi_x * sin_pi_x) - trigamma(1.0 - x);
-    }
-
-    let mut val = x;
-    let mut result = 0.0;
-    while val < 8.0 {
-        result += 1.0 / (val * val);
-        val += 1.0;
-    }
-
-    let inv_x = 1.0 / val;
-    let inv_x2 = inv_x * inv_x;
-    result += inv_x + inv_x2 / 2.0 + inv_x2 * inv_x / 6.0 - inv_x2 * inv_x2 * inv_x / 30.0
-        + inv_x2 * inv_x2 * inv_x2 * inv_x / 42.0;
-
-    result
+    crate::gamma::polygamma_cephes(1, x)
 }
 
-/// Pentagamma function ψ₃(x) = d⁴ln(Γ(x))/dx⁴.
+/// Pentagamma function ψ₃(x) = d⁴ln(Γ(x))/dx⁴, SciPy's `polygamma(3, x)` bit for bit.
 ///
-/// Matches `scipy.special.polygamma(3, x)`. Same shift-then-asymptotic
-/// structure as `tetragamma`, with the recurrence
-///   ψ₃(x) = ψ₃(x + 1) + 6 / x⁴
-/// applied until x ≥ 8 and the asymptotic series
-///   ψ₃(x) ≈ 2/x³ + 3/x⁴ + 2/x⁵ − 1/x⁷ + 4/(3 x⁹)
-/// (from B_2 = 1/6, B_4 = −1/30, B_6 = 1/42) truncated thereafter.
+/// See `polygamma_cephes` in gamma.rs. SciPy's poles are one-signed (+inf here); this used to
+/// return NaN at them.
+#[must_use]
 pub fn pentagamma(x: f64) -> f64 {
-    if x <= 0.0 && x == x.floor() {
-        return f64::NAN;
-    }
-    if x < 0.0 {
-        let pi = std::f64::consts::PI;
-        let s = (pi * x).sin();
-        let c = (pi * x).cos();
-        // d/dx [-π³ cos(πx)/sin³(πx)] · 2 — directly differentiate the
-        // tetragamma reflection. Closed form for the reflection of ψ₃
-        // is:  ψ₃(1 − x) − π⁴ (2 + 4 cos²(πx)) / sin⁴(πx).
-        let s2 = s * s;
-        return pentagamma(1.0 - x)
-            - pi * pi * pi * pi * 2.0_f64.mul_add(c * c, 1.0) * 2.0 / (s2 * s2);
-    }
-
-    let mut val = x;
-    let mut result = 0.0;
-    while val < 8.0 {
-        let v2 = val * val;
-        result += 6.0 / (v2 * v2);
-        val += 1.0;
-    }
-
-    let inv_x = 1.0 / val;
-    let inv_x2 = inv_x * inv_x;
-    let inv_x3 = inv_x2 * inv_x;
-    let inv_x5 = inv_x3 * inv_x2;
-    let inv_x7 = inv_x5 * inv_x2;
-    let inv_x9 = inv_x7 * inv_x2;
-    result += 2.0 * inv_x3 + 3.0 * inv_x2 * inv_x2 + 2.0 * inv_x5 - inv_x7 + 4.0 / 3.0 * inv_x9;
-
-    result
+    crate::gamma::polygamma_cephes(3, x)
 }
 
-/// Tetragamma function ψ₂(x) = d³ln(Γ(x))/dx³.
+/// Tetragamma function ψ₂(x) = d³ln(Γ(x))/dx³, SciPy's `polygamma(2, x)` bit for bit.
 ///
-/// Matches `scipy.special.polygamma(2, x)`.
+/// See `polygamma_cephes` in gamma.rs. It was 3.6e-13 off at 1.5, where SciPy is 1.3e-16, and
+/// returned NaN at the poles, where SciPy returns −inf (frankenscipy-a79hb).
+#[must_use]
 pub fn tetragamma(x: f64) -> f64 {
-    if x <= 0.0 && x == x.floor() {
-        return f64::NAN;
-    }
-    if x < 0.0 {
-        let pi = std::f64::consts::PI;
-        let sin_pi_x = (pi * x).sin();
-        let cos_pi_x = (pi * x).cos();
-        return tetragamma(1.0 - x)
-            - 2.0 * pi * pi * pi * cos_pi_x / (sin_pi_x * sin_pi_x * sin_pi_x);
-    }
-
-    let mut val = x;
-    let mut result = 0.0;
-    while val < 8.0 {
-        result -= 2.0 / (val * val * val);
-        val += 1.0;
-    }
-
-    let inv_x = 1.0 / val;
-    let inv_x2 = inv_x * inv_x;
-    let inv_x3 = inv_x2 * inv_x;
-    let inv_x4 = inv_x2 * inv_x2;
-    let inv_x6 = inv_x4 * inv_x2;
-    let inv_x8 = inv_x6 * inv_x2;
-    let inv_x10 = inv_x8 * inv_x2;
-    let inv_x12 = inv_x10 * inv_x2;
-    // ψ''(x) ~ -1/x² - 1/x³ - 1/(2x⁴) + 1/(6x⁶) - 1/(6x⁸) + 3/(10x¹⁰) - 5/(6x¹²),
-    // extended through the B₁₀ term (was truncated at x⁶, ~6e-9 residual at the
-    // shift point). frankenscipy-luxsz.
-    result += -inv_x2 - inv_x3 - inv_x4 / 2.0 + inv_x6 / 6.0 - inv_x8 / 6.0 + 3.0 * inv_x10 / 10.0
-        - 5.0 * inv_x12 / 6.0;
-
-    result
+    crate::gamma::polygamma_cephes(2, x)
 }
 
 /// Digamma function ψ(x) = d(ln Γ(x))/dx (scalar).

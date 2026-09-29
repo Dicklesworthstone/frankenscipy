@@ -92,9 +92,9 @@ use fsci_special::{
     log_ndtr, log_wright_bessel, loggamma, logit, lpmv, mathieu_a, mathieu_b, modstruve, nbdtr,
     nbdtrc, nbdtri, nbdtrik, nbdtrin, ncfdtr, ncfdtri, nctdtr, nctdtridf, nctdtrinc, nctdtrit,
     ndtr, ndtri, ndtri_exp, nrdtrimn, nrdtrisd, obl_cv, owens_t, pdtr, pdtrc, pdtri, pdtrik, poch,
-    pro_cv, pseudo_huber, radian, rel_entr, rgamma, sindg, smirnov, smirnovi, spence, stdtr,
-    stdtridf, stdtrit, struve, tandg, tklmbda, voigt_profile, wright_bessel, wrightomega, xlog1py,
-    xlogy, y0, y1, yn, yv, yve, zeta, zetac,
+    polygamma, pro_cv, pseudo_huber, radian, rel_entr, rgamma, sindg, smirnov, smirnovi, spence,
+    stdtr, stdtridf, stdtrit, struve, tandg, tklmbda, voigt_profile, wright_bessel, wrightomega,
+    xlog1py, xlogy, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -424,6 +424,10 @@ const CASES2_INTEGER_ORDER: &[(&str, f64, f64, f64, f64)] = &[
     ("smirnovi", 1.0, 200.0, 0.001, 0.999),
     ("mathieu_a", 0.0, 21.0, 0.0, 50.0),
     ("mathieu_b", 1.0, 21.0, 0.0, 50.0),
+    // The order domain lies inside one integer, so it floors to n = 2 everywhere: fsci's
+    // polygamma takes one order per call. x > 0: the fixture holds exact negative integers,
+    // which Hardened refuses (frankenscipy-a79hb).
+    ("polygamma", 2.0, 2.999, 0.01, 30.0),
 ];
 
 /// Three- and four-argument cases: the name, one domain per argument, and the positions that
@@ -837,6 +841,21 @@ fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::S
         "mathieu_b" => scalar_map2(a, b, |m, q| mathieu_b(m as u32, q)),
         "agm" => scalar_map2(a, b, agm),
         "zeta" => scalar_map2(a, b, hurwitz_zeta),
+        "polygamma" => match a {
+            SpecialTensor::RealVec(orders)
+                if orders
+                    .first()
+                    .is_some_and(|&n| orders.iter().all(|&m| m == n)) =>
+            {
+                polygamma(orders[0] as usize, b, mode)
+            }
+            _ => Err(SpecialError {
+                function: "polygamma",
+                kind: SpecialErrorKind::DomainError,
+                mode,
+                detail: "fsci's polygamma takes one order per call",
+            }),
+        },
         other => panic!("no fsci two-argument entry point wired for {other}"),
     }
 }
