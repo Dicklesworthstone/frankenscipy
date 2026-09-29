@@ -996,7 +996,19 @@ pub fn ive_scalar(v: f64, x: f64) -> f64 {
     let ax = x.abs();
     let hankel = ax > 50.0 && ax > v * v;
     if !(ax.is_finite() && (hankel || ax >= IVE_SCALED_MIN_X)) || v.is_nan() {
-        return iv_scalar(v, x) * (-ax).exp();
+        let product = iv_scalar(v, x) * (-ax).exp();
+        // I_v alone can overflow where I_v·e^{-x} does not. For a large negative order the
+        // reflection term (2/π) sin(pπ) K_p carries the value: ive(-1500.3, 600) = 1.97e109
+        // came back inf (SciPy NaN). Past |v| = 50 a non-finite product takes the scaled Debye
+        // form below, which never forms the unscaled value (frankenscipy-5mpzg).
+        let rescue = !product.is_finite()
+            && ax.is_finite()
+            && ax > 0.0
+            && !v.is_nan()
+            && v.abs() > IV_UNIFORM_MIN_ORDER;
+        if !rescue {
+            return product;
+        }
     }
     // Domain and parity exactly as `iv_scalar`: I_{-n} = I_n, and for x < 0 an integer
     // order takes (-1)^n while any other order is complex (NaN).
@@ -2418,6 +2430,20 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
         };
     }
 
+    // Past |v| = 50: Debye's uniform expansion, the method Cephes' iv (SciPy's) uses at these
+    // orders. The power series below starts from (z/2)^v / Γ(v+1), formed as one exponential of
+    // v·ln(z/2) − lgamma(v+1). That underflows long before I_v does: iv(5000, 3000) = 2.2e-258
+    // came back 0. Where it does not underflow, the two logs cancel (35414 − 35915 at
+    // (4800, 3200)) and cost 4e-12 (frankenscipy-5mpzg).
+    if v > IV_UNIFORM_MIN_ORDER {
+        let value = iv_uniform_asymptotic(v, az);
+        return if z < 0.0 && (v as i64) % 2 != 0 {
+            -value
+        } else {
+            value
+        };
+    }
+
     // Power series: I_v(z) = (z/2)^v Σ (z²/4)^k / (k! Γ(v+k+1))
     let quarter_z2 = az * az / 4.0;
     let log_half_z = az.ln() - std::f64::consts::LN_2;
@@ -2629,13 +2655,36 @@ const IV_UNIFORM_U: [&[f64]; 10] = [
 /// alone would overflow. Accurate wherever v is large or t = 1/√(1+z²) is small: the k-th
 /// term is u_k(t)/v^k with u_k(t) = O(t^k).
 fn ik_uniform_asymptotic_scaled(v: f64, x: f64) -> (f64, f64) {
+    let (t, r, a, i_sum, k_sum) = ik_uniform_parts(v, x);
+    let i_exponent = v * v / (r + x) - a;
+    let k_exponent = a - r - x;
+    let i_scaled = (t / (2.0 * PI * v)).sqrt() * i_exponent.exp() * i_sum;
+    let k_scaled = (PI * t / (2.0 * v)).sqrt() * k_exponent.exp() * k_sum;
+    (i_scaled, k_scaled)
+}
+
+/// Past this order `iv_scalar` takes [`iv_uniform_asymptotic`] instead of its power series:
+/// Cephes' own threshold for the uniform expansion.
+const IV_UNIFORM_MIN_ORDER: f64 = 50.0;
+
+/// I_v(x), unscaled, by the same expansion: `√(t/(2πv)) · e^{v·η} · Σ u_k(t)/v^k` with
+/// `v·η = √(v²+x²) − v·asinh(v/x)`, the exponential applied as two halves so the result
+/// overflows only where I_v does (frankenscipy-5mpzg).
+fn iv_uniform_asymptotic(v: f64, x: f64) -> f64 {
+    let (t, r, a, i_sum, _) = ik_uniform_parts(v, x);
+    let half = (0.5 * (r - a)).exp();
+    (t / (2.0 * PI * v)).sqrt() * half * i_sum * half
+}
+
+/// The parts of Debye's expansion that [`ik_uniform_asymptotic_scaled`] and
+/// [`iv_uniform_asymptotic`] share: `t = v/r`, `r = √(v²+x²)`, `a = v·asinh(v/x)`, and the sums
+/// `Σ u_k(t)/v^k` (for I) and `Σ (−1)^k u_k(t)/v^k` (for K).
+fn ik_uniform_parts(v: f64, x: f64) -> (f64, f64, f64, f64, f64) {
     const MACHEP: f64 = f64::EPSILON / 2.0;
     let r = v.hypot(x);
     let t = v / r;
     let t2 = t * t;
     let a = v * (v / x).asinh();
-    let i_exponent = v * v / (r + x) - a;
-    let k_exponent = a - r - x;
 
     let mut i_sum = 1.0;
     let mut k_sum = 1.0;
@@ -2656,9 +2705,7 @@ fn ik_uniform_asymptotic_scaled(v: f64, x: f64) -> (f64, f64) {
         }
         divisor *= v;
     }
-    let i_scaled = (t / (2.0 * PI * v)).sqrt() * i_exponent.exp() * i_sum;
-    let k_scaled = (PI * t / (2.0 * v)).sqrt() * k_exponent.exp() * k_sum;
-    (i_scaled, k_scaled)
+    (t, r, a, i_sum, k_sum)
 }
 
 /// K_v(z) for real order v.
@@ -11282,6 +11329,49 @@ mod tests {
     /// frankenscipy-jd905: `ive` past |x| ≈ 710 was I_v(x)·e^{-|x|} = inf·0 = NaN — at
     /// every point of x in [1e3, 1e8] — where the scaled value is O(1/√x). References are
     /// mpmath at 60 digits.
+    #[test]
+    fn iv_huge_order_is_finite_where_the_series_cannot_start() {
+        // frankenscipy-5mpzg. (v, x, mpmath besseli at 50 digits). For v ≳ 4500 and x ≈ 0.6v the
+        // series' leading term (x/2)^v/Γ(v+1) underflows while I_v is a normal double; the old
+        // code returned 0 at the first, third and fourth rows. SciPy (Cephes' Debye expansion)
+        // is 6e-13 off at (4800, 3200): v·η = √(v²+x²) − v·asinh(v/x) cancels, as it does here.
+        #[rustfmt::skip]
+        const IV_PINS: [(f64, f64, f64); 7] = [
+            (5000.0, 3000.0, 2.19487255369417e-258),
+            (4800.0, 3200.0, 3122137884911.008),
+            (4500.5, 2700.0, 4.199039318886258e-233),
+            (4999.0, 3500.0, 8.19537169296009e141),
+            (60.0, 0.5, 9.050459746362107e-119),
+            (300.0, 40.0, 2.5065059939580037e-224),
+            (1000.0, 60.0, 0.0),
+        ];
+        for (v, x, want) in IV_PINS {
+            let got = iv_scalar(std::hint::black_box(v), std::hint::black_box(x));
+            if want == 0.0 {
+                assert_eq!(got, 0.0, "iv({v}, {x}) underflows: got {got:e}");
+                continue;
+            }
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-12,
+                "iv({v}, {x}) = {got:e}, mpmath {want:e}, rel {rel:e}"
+            );
+        }
+        // ive at a large negative order: the reflection's K term overflows I_v itself, not
+        // I_v·e^{-x}. SciPy returns NaN at both.
+        for (v, x, want) in [
+            (-1500.3, 600.0, 1.970338109932199e109),
+            (-800.7, 200.0, 6.010952111529279e281),
+        ] {
+            let got = ive_scalar(std::hint::black_box(v), std::hint::black_box(x));
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-12,
+                "ive({v}, {x}) = {got:e}, mpmath {want:e}, rel {rel:e}"
+            );
+        }
+    }
+
     #[test]
     fn ive_huge_x_is_the_scaled_expansion_not_inf_times_zero() {
         use std::hint::black_box;
