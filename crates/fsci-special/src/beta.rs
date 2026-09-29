@@ -3867,8 +3867,8 @@ fn beta_nonpos_integer_special(a: f64, b: f64) -> Option<f64> {
 /// the logarithmic form because the direct product overflows.
 const BETA_MAXGAM: f64 = 171.624_376_956_302_725;
 
-/// Form `B(a,b)` from `Γ(a)·Γ(b)·(1/Γ(a+b))` directly for positive arguments (`true`,
-/// shipping) instead of `exp(betaln(a,b))`.
+/// Form `B(a,b)` from `Γ(a)·Γ(b)·(1/Γ(a+b))` directly within MAXGAM (`true`, shipping) instead
+/// of `exp(betaln(a,b))`: positive arguments in every mode, negative non-integer ones in Strict.
 ///
 /// NOT bit-identical to the log form and not intended to be: it is a different route, and
 /// it is the incumbent's. Accuracy against the live SciPy arm is the contract.
@@ -3885,8 +3885,31 @@ pub(crate) fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, Spec
     if let Some(v) = beta_nonpos_integer_special(a, b) {
         return Ok(v);
     }
-    // Symmetry beta(a,b)=beta(b,a)
-    let (a, b) = if a < b { (b, a) } else { (a, b) };
+    // Symmetry beta(a,b)=beta(b,a), ordered as xsf's Cephes `beta` orders it: |a| >= |b|. For
+    // positive arguments that is the old `a >= b`.
+    let (a, b) = if a.abs() < b.abs() { (b, a) } else { (a, b) };
+
+    // SciPy's beta is xsf's Cephes `beta` (frankenscipy-9fybk). Two of its branches were
+    // missing here:
+    // - a > 1e6·|b| and a > 1e6: `sign(Γ(b))·exp(lbeta_asymp(a, b))`. The log-gamma sums the
+    //   log route below takes cancel there: beta(4.8e9, 0.57) was 1.4e-5 relative off (SciPy
+    //   9.4e-16). `betaln` already had this branch (frankenscipy-v0oof); `beta` did not.
+    // - negative non-integer arguments within MAXGAM: the direct Γ(a)·Γ(b)/Γ(a+b) below, with
+    //   Γ's reflection. The log route gave the same value to a few ulp, so 8,678 of 20,000
+    //   `binom` points with k > n (beta(1+n−k, 1+k)) missed SciPy's bits by up to 1.6e-15.
+    // Hardened keeps its fail-closed domain error on negative arguments (the log route's
+    // `betaln` call).
+    let finite_pair = a.is_finite() && b.is_finite();
+    let takes_cephes_route =
+        finite_pair && ((a > 0.0 && b > 0.0) || !matches!(mode, RuntimeMode::Hardened));
+    if takes_cephes_route && a.abs() > BETA_ASYMP_FACTOR * b.abs() && a > BETA_ASYMP_FACTOR {
+        let mut r = gammaln_scalar(b, RuntimeMode::Strict)?;
+        r -= b * a.ln();
+        r += b * (1.0 - b) / (2.0 * a);
+        r += b * (1.0 - b) * (1.0 - 2.0 * b) / (12.0 * a * a);
+        r += -b * b * (1.0 - b) * (1.0 - b) / (12.0 * a * a * a);
+        return Ok(gamma_sign(b) * r.exp());
+    }
 
     // ── direct-Gamma fast path ───────────────────────────────────────────────────────
     //
@@ -3897,16 +3920,15 @@ pub(crate) fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, Spec
     // worst cell in this crate — found only because the survey was widened to TWO-argument
     // ufuncs, which had never been measured at all.
     //
-    // SCOPED TO POSITIVE ARGUMENTS ON PURPOSE. Every Γ factor is then positive, so the sign
-    // bookkeeping below is unnecessary here rather than merely unused, and the Hardened
-    // overflow contract stays entirely on the log path. Anything else — negative, huge, or
-    // a value that does not come out finite — falls through untouched.
+    // Positive arguments in every mode, and in Strict negative non-integer ones as Cephes
+    // takes them: Γ carries each factor's sign, so the product is signed without bookkeeping.
+    // The Hardened overflow contract stays entirely on the log path: a value that does not
+    // come out finite falls through untouched.
     if BETA_CEPHES_DIRECT.load(std::sync::atomic::Ordering::Relaxed)
-        && a > 0.0
-        && b > 0.0
-        && a <= BETA_MAXGAM
-        && b <= BETA_MAXGAM
-        && a + b <= BETA_MAXGAM
+        && takes_cephes_route
+        && a.abs() <= BETA_MAXGAM
+        && b.abs() <= BETA_MAXGAM
+        && (a + b).abs() <= BETA_MAXGAM
     {
         let inv_sum = gamma::rgamma_value(a + b, mode);
         let ga = gamma::gamma_core(a);
@@ -4830,6 +4852,16 @@ fn gammaln_scalar(value: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that flip `BETA_CEPHES_DIRECT` with the tests that read `beta`'s
+    /// bits: a reader running while a writer has the direct arm off takes the log route,
+    /// which is a few ulp away (frankenscipy-9fybk).
+    pub(crate) fn beta_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+        static BETA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        BETA_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The direct-Gamma product agrees with the `exp(betaln)` route it replaces, and the arm
     /// actually fires.
     ///
@@ -4840,10 +4872,7 @@ mod tests {
     #[test]
     fn beta_direct_gamma_matches_the_log_route() {
         use std::sync::atomic::Ordering::Relaxed;
-        static BETA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BETA_TOGGLE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = beta_toggle_lock();
         let restore = BETA_CEPHES_DIRECT.load(Relaxed);
 
         let mut worst = 0.0_f64;
@@ -6415,6 +6444,62 @@ mod tests {
                 "beta({a},{b}) got {got}, want {want}"
             );
         }
+    }
+
+    /// frankenscipy-9fybk. `beta` is xsf's Cephes `beta` branch for branch, so it returns
+    /// scipy.special.beta 1.17.1's bits where the old routing did not:
+    /// - negative non-integer arguments, now on the direct Γ route (the log route was a few ulp
+    ///   off);
+    /// - a > 1e6·|b|, now on `lbeta_asymp` (the log route was 1.4e-5 off at (4.8e9, 0.57)).
+    ///
+    /// Through `binom`, k > n takes beta(1 + n − k, 1 + k) with a negative first argument.
+    /// Hardened still refuses negative arguments.
+    #[test]
+    fn beta_is_scipys_cephes_beta_bit_for_bit() -> Result<(), SpecialError> {
+        let _guard = beta_toggle_lock();
+        #[rustfmt::skip]
+        const BETA_PINS: [(f64, f64, f64); 10] = [
+            (-2.5, 3.0, -1.0666666666666667),
+            (-7.25, 1.5, 0.0479281020096655),
+            (2.0251439245682263, -27.09365971902084, 0.0009706547086633058),
+            (-30.3, 5.2, -3.603657064479252e-07),
+            (-0.5, -0.25, -3.5944207042067755),
+            (-150.5, 20.25, 5.642488173517831e-27),
+            (4.8e9, 0.57, 4.73638025663024e-06),
+            (1e7, 2.5, 4.203742624096684e-18),
+            (3e6, 0.1, 2.141058605246269),
+            (2e6, -0.3, -336.1095924926587),
+        ];
+        for (a, b, want) in BETA_PINS {
+            let got = beta_scalar(
+                std::hint::black_box(a),
+                std::hint::black_box(b),
+                RuntimeMode::Strict,
+            )?;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "beta({a}, {b}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        #[rustfmt::skip]
+        const BINOM_PINS: [(f64, f64, f64); 5] = [
+            (2.0251439245682263, 30.09365971902084, 5.205802651715707e-06),
+            (23.415029754910734, 29.822860531418407, 4.946695846721744e-08),
+            (16.19480141559575, 29.281262156213533, -8.026912844513777e-11),
+            (8.974573076280771, 28.739663781008655, -1.2131731689958517e-09),
+            (1.2127463617609147, 24.406876779369664, -0.00018205615092152402),
+        ];
+        for (n, k, want) in BINOM_PINS {
+            let got = crate::gamma::binom(std::hint::black_box(n), std::hint::black_box(k));
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "binom({n}, {k}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        assert!(beta_scalar(-2.5, 3.0, RuntimeMode::Hardened).is_err());
+        Ok(())
     }
 
     #[test]
