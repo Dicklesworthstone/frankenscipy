@@ -8,10 +8,14 @@
 //!   • smirnov(n, d) is the one-sided KS sf for sample size n
 //!     at deviation d.
 //!
-//! 17 y for kolmogorov + 5 n × 7 d for smirnov = 52 cases via
-//! subprocess. Tolerances: 1e-9 abs for kolmogorov (canonical
-//! series); 5e-3 abs for smirnov (fsci uses an O(1/n)-corrected
-//! asymptotic, scipy uses the exact Birnbaum-Tingey series).
+//! 17 y for kolmogorov; for smirnov, n from 1 to 2·10^6 (every branch of xsf `_smirnov`:
+//! d ≤ 1/n, the lower and upper Birnbaum–Tingey sums, d ≥ 1 − 1/n, the underflow cut-off
+//! and the n > 10^6 approximation) against a fixed d grid, points on the 1/n and 1/√n
+//! scales, and 1 − 1/2n. Tolerances: 1e-15 relative for both; kolmogorov is xsf's
+//! `_kolmogorov` (frankenscipy-11wqg) and smirnov ports xsf's double-double sum operation
+//! for operation (frankenscipy-k4c2c). The C `int` products SciPy overflows from n = 46342
+//! on, and which fsci keeps exact, feed only the pdf (and through it smirnovi), never the
+//! sf, so n = 10^5 is compared here like every other n.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -31,9 +35,9 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 // a few ulp. It was an absolute 1e-9 over y >= 0.1, which never reached the small-y region where
 // the old truncated series was 0.1376 off (frankenscipy-11wqg).
 const KOLMOGOROV_TOL_REL: f64 = 1.0e-15;
-// fsci's smirnov asymptotic lands ~3e-2 abs even for n=50;
-// 5e-2 absorbs cleanly across n ∈ [50, 500].
-const SMIRNOV_TOL: f64 = 5.0e-2;
+// Relative to SciPy's value: fsci's smirnov is xsf's algorithm evaluated in the same order,
+// so it agrees to the last bit; an exact 0 must be matched exactly.
+const SMIRNOV_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per SciPy function compared.
 const ARMS: [&str; 2] = ["kolmogorov", "smirnov"];
@@ -77,6 +81,7 @@ struct DiffLog {
     case_count: usize,
     compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
+    max_smirnov_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -126,16 +131,10 @@ fn generate_query() -> OracleQuery {
         0.01_f64, 0.02, 0.035, 0.05, 0.1, 0.3, 0.5, 0.75, 0.82, 1.0, 1.36, 1.5, 1.95, 2.0, 2.5,
         3.0, 5.0,
     ];
-    // n restricted to ≥50: fsci's smirnov uses an O(1/n)-corrected
-    // asymptotic exp(-2nd²), scipy uses the exact Birnbaum-Tingey
-    // series. The asymptotic is significantly off at small n
-    // (n=1 case lands ~0.30 abs at d=0.3 — the asymptotic
-    // doesn't even satisfy the moment match there). Asymptotic
-    // becomes useful only for n ≥ 50.
-    let ns = [50_i32, 100, 200, 500];
-    // d range: stay below ~0.3 since asymptotic also breaks down
-    // at large d (smirnov saturates to 0 too quickly).
-    let ds = [0.02_f64, 0.05, 0.08, 0.12, 0.18, 0.25];
+    let ns = [
+        1_i32, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000, 10_000, 100_000, 2_000_000,
+    ];
+    let grid = [0.02_f64, 0.05, 0.08, 0.12, 0.18, 0.25, 0.4, 0.6, 0.9];
 
     let mut points = Vec::new();
     for &y in &ys {
@@ -147,7 +146,16 @@ fn generate_query() -> OracleQuery {
         });
     }
     for &n in &ns {
-        for &d in &ds {
+        let nf = f64::from(n);
+        // Below, at and just above 1/n (d ≤ 1/n closed form, then the upper sum), across the
+        // 1/√n scale where the probability moves, and within 1/n of 1.
+        let mut ds: Vec<f64> = grid.to_vec();
+        ds.extend([0.5 / nf, 1.0 / nf, 2.5 / nf, 1.0 - 0.5 / nf]);
+        ds.extend([0.3, 0.8, 1.5].map(|c| c / nf.sqrt()));
+        ds.retain(|d| (0.0..=1.0).contains(d));
+        ds.sort_by(f64::total_cmp);
+        ds.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        for d in ds {
             points.push(PointCase {
                 case_id: format!("smirnov_n{n}_d{d}"),
                 func: "smirnov".into(),
@@ -251,6 +259,7 @@ fn diff_special_ks() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut max_smirnov_rel = 0.0_f64;
     let mut ledger = CompareLedger::new("diff_special_ks", &ARMS);
 
     for case in &query.points {
@@ -266,17 +275,22 @@ fn diff_special_ks() {
         };
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
-        let tol = match case.func.as_str() {
-            "kolmogorov" => KOLMOGOROV_TOL_REL * scipy_v.abs(),
-            "smirnov" => SMIRNOV_TOL,
-            _ => 0.0,
+        let pass = match case.func.as_str() {
+            "kolmogorov" => abs_diff <= KOLMOGOROV_TOL_REL * scipy_v.abs(),
+            "smirnov" => {
+                if scipy_v != 0.0 {
+                    max_smirnov_rel = max_smirnov_rel.max(abs_diff / scipy_v.abs());
+                }
+                abs_diff <= SMIRNOV_TOL_REL * scipy_v.abs()
+            }
+            _ => false,
         };
-        ledger.compared(arm, &case.case_id, abs_diff <= tol);
+        ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
             abs_diff,
-            pass: abs_diff <= tol,
+            pass,
         });
     }
 
@@ -288,6 +302,7 @@ fn diff_special_ks() {
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
+        max_smirnov_rel_diff: max_smirnov_rel,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),

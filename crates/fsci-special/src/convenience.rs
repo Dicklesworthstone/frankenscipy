@@ -6915,106 +6915,1033 @@ pub fn kolmogi_pair(psf: f64, pcdf: f64) -> f64 {
     x
 }
 
-/// One-sided Kolmogorov-Smirnov distribution (Smirnov distribution).
+/// One-sided Kolmogorov–Smirnov survival function `P(D_n^+ ≥ d)` for sample size `n`.
 ///
-/// Computes P(D_n^+ ≥ d) where D_n^+ is the one-sided KS statistic
-/// for sample size n.
-///
-/// For n < 1000 uses the exact Birnbaum-Tingey series
+/// A port of xsf `cephes::smirnov` (the code SciPy 1.17.1 compiles, xsf 0d0a593f): the
+/// Birnbaum–Tingey sum
 ///
 /// ```text
-///   P(D_n^+ ≥ d) = d · Σ_{v=0}^{m} C(n, v) · (d + v/n)^{v−1} · (1 − d − v/n)^{n−v}
+///   P(D_n^+ ≥ d) = d · Σ_{v=0}^{⌊n(1−d)⌋} C(n, v) · (d + v/n)^{v−1} · (1 − d − v/n)^{n−v}
 /// ```
 ///
-/// where m = ⌊n(1−d)⌋. The (v=0) term has the (d + 0)^{-1} = 1/d
-/// factor, so v=0 contributes (1−d)^n; subsequent terms are positive.
-/// For n ≥ 1000 the asymptotic exp(−2nd²) is used (relative error
-/// O(1/n) per Smirnov).
+/// evaluated term by term in double-double arithmetic with an early exit once the remaining
+/// terms cannot move the sum (or, when it has at most three terms, the alternating
+/// complementary sum over `v > n(1−d)`), the closed forms `d(1+d)^{n−1}` for `d ≤ 1/n` and
+/// `(1−d)^n` for `d ≥ 1 − 1/n`, zero where `−2nd²` is below `log(2^-1075)`, and
+/// `exp(−(6nd + 1)² / 18n)` for `n > 10^6`. NaN for `n < 1`, a NaN `d`, or `d` outside
+/// `[0, 1]`. frankenscipy-k4c2c
 ///
-/// Pre-fix the small-n branch only carried the asymptotic with a
-/// hand-tuned correction and could be off by 0.3 absolute at n=1
-/// (e.g. smirnov(1, 0.5) gave ≈0.39 instead of the exact 0.5)
-/// — frankenscipy-5bura.
-///
-/// Matches `scipy.special.smirnov(n, d)`.
+/// Matches `scipy.special.smirnov(n, d)` bit for bit.
 #[must_use]
 pub fn smirnov(n: i32, d: f64) -> f64 {
-    if n <= 0 || d.is_nan() {
+    if d.is_nan() {
         return f64::NAN;
     }
-    if d <= 0.0 {
-        return 1.0;
-    }
-    if d >= 1.0 {
-        return 0.0;
-    }
-
-    let nf = n as f64;
-
-    if n < 1000 {
-        // Exact Birnbaum-Tingey series. Compute terms in log-space to avoid
-        // overflow of C(n, v). Stream log C(n, v) by the ratio recurrence
-        //   log C(n, v+1) = log C(n, v) + ln(n − v) − ln(v + 1),
-        // so each term costs two `ln` instead of two `gammaln` (~5-10× cheaper
-        // per term); the dominant cost of this O(n) series. frankenscipy.
-        let m = ((nf * (1.0 - d)).floor() as i64).max(0);
-        let mut sum = 0.0_f64;
-        let mut log_binom = 0.0_f64; // log C(n, 0) = 0
-        for v in 0..=m {
-            let vf = v as f64;
-            let evn = d + vf / nf;
-            if evn < 1.0 {
-                // (1 − d − v/n) > 0; otherwise no real contribution.
-                let omevn = 1.0 - evn;
-                let log_term = log_binom + (vf - 1.0) * evn.ln() + (nf - vf) * omevn.ln();
-                sum += log_term.exp();
-            }
-            if v < m {
-                log_binom += (nf - vf).ln() - (vf + 1.0).ln();
-            }
-        }
-        return (sum * d).clamp(0.0, 1.0);
-    }
-
-    // Asymptotic for large n.
-    let x = 2.0 * nf * d * d;
-    (-x).exp().clamp(0.0, 1.0)
+    xsf_smirnov::smirnov3(i64::from(n), d).sf
 }
 
-/// Inverse one-sided Kolmogorov-Smirnov distribution.
+/// `(sf, cdf, pdf)` of the one-sided statistic `D_n^+` at `d`: `scipy.special.smirnov`,
+/// SciPy's private `_smirnovc` and `-_smirnovp`, computed together by the kernel behind
+/// [`smirnov`]. `n` is 64-bit so that `scipy.stats.kstwo`'s sample size is never narrowed.
 ///
-/// Returns d such that smirnov(n, d) = p.
+/// The pdf is the true derivative. SciPy's differs from it for 46342 ≤ n ≤ 10^6, where xsf's
+/// C `int` products overflow (see [`smirnovi`]); `sf` and `cdf` are SciPy's bit for bit.
+/// frankenscipy-k4c2c
+#[must_use]
+pub fn smirnov_sf_cdf_pdf(n: i64, d: f64) -> (f64, f64, f64) {
+    let p = xsf_smirnov::smirnov3(n, d);
+    (p.sf, p.cdf, p.pdf)
+}
+
+/// Inverse of [`smirnov`] in `d`: the `d` with `smirnov(n, d) = p`.
 ///
-/// Matches `scipy.special.smirnovi(n, p)`.
+/// A port of xsf `cephes::smirnovi` (SciPy 1.17.1): `(1 − p)^{1/n}` solved exactly when the
+/// root lies above `1 − 1/n` (for `n < 150`), otherwise a bracketed Newton–Raphson iteration
+/// on the double-double Birnbaum–Tingey sum, started from `d(1+d)^{n−1} = 1 − p` near zero or
+/// from `sqrt(−log p / 2n) − 1/6n` elsewhere. `smirnovi(n, 0) = 1`, `smirnovi(n, 1) = 0`;
+/// NaN for `n < 1` or `p` outside `[0, 1]`. frankenscipy-k4c2c
+///
+/// Matches `scipy.special.smirnovi(n, p)` bit for bit, except where SciPy's result comes from
+/// C undefined behaviour, which fsci does not reproduce: xsf forms `n·(v−1)` and `(n−v)·n` in
+/// the Newton derivative, and `6n` in the starting point, as C `int`s, which overflow for
+/// 46342 ≤ n ≤ 10^6 and for n > 357913941. There fsci's products are exact and its root can
+/// differ from SciPy's: in the first range fsci's is the nearer to the exact root (SciPy's was
+/// up to ~1400 ulp off at the points checked against mpmath), in the second the two land 1–2
+/// ulp apart.
 #[must_use]
 pub fn smirnovi(n: i32, p: f64) -> f64 {
-    if n <= 0 || p.is_nan() {
+    if p.is_nan() {
         return f64::NAN;
     }
-    if !(0.0..=1.0).contains(&p) {
-        return f64::NAN;
-    }
-    if p == 0.0 {
-        return 1.0;
-    }
-    if p >= 1.0 {
-        return 0.0;
+    xsf_smirnov::smirnovi(i64::from(n), p, 1.0 - p)
+}
+
+/// xsf `cephes/kolmogorov.h` (the one-sided half, xsf 0d0a593f as compiled by SciPy 1.17.1)
+/// with the parts of `cephes/dd_real.h` and `cephes/unity.h` it calls, ported operation for
+/// operation: every `double_double` operator and libm call is reproduced in the order xsf
+/// evaluates it, because [`smirnov`] and [`smirnovi`] are pinned to SciPy bit for bit. xsf's
+/// C `int` arithmetic is done in `i64`, which agrees with it wherever it does not overflow;
+/// where it does (undefined behaviour), fsci keeps the exact value. frankenscipy-k4c2c
+mod xsf_smirnov {
+    use std::f64::consts::LN_2;
+
+    /// `n` above this uses `exp(−(6nx + 1)² / 18n)` instead of summing.
+    const SMIRNOV_MAX_COMPUTE_N: i64 = 1_000_000;
+    /// The alternating upper sum is used only when it has at most this many terms...
+    const SM_UPPER_MAX_TERMS: i64 = 3;
+    /// ...and only from this `n` up.
+    const SM_UPPERSUM_MIN_N: i64 = 10;
+    /// Largest power taken in one `pow` by `pow2_scaled` (below 1023 − 52, so both words of
+    /// the double-double stay normal).
+    const SM_MAX_EXPONENT: i64 = 960;
+    const KOLMOG_MAXITER: i32 = 500;
+    const XTOL: f64 = f64::EPSILON;
+    const RTOL: f64 = 2.0 * XTOL;
+    /// cephes `MINLOG`, log(2^-1075): `exp` of anything below it is 0.
+    const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
+
+    /// cephes `expm1` (`unity.h`): a rational approximation on [−0.5, 0.5], not libm's
+    /// `expm1`, from which it differs in the last bit.
+    fn cephes_expm1(x: f64) -> f64 {
+        const EP: [f64; 3] = [
+            1.261_771_930_748_105_908_779_8e-4,
+            3.029_944_077_074_419_612_995_6e-2,
+            9.999_999_999_999_999_999_102_5e-1,
+        ];
+        const EQ: [f64; 4] = [
+            3.001_985_051_386_644_550_415_9e-6,
+            2.524_483_403_496_841_041_922_4e-3,
+            2.272_655_482_081_550_287_659_3e-1,
+            2.000_000_000_000_000_000_089_7,
+        ];
+        let polevl = |x: f64, coef: &[f64]| coef[1..].iter().fold(coef[0], |ans, &c| ans * x + c);
+        if !x.is_finite() {
+            if x.is_nan() || x > 0.0 {
+                return x;
+            }
+            return -1.0;
+        }
+        if !(-0.5..=0.5).contains(&x) {
+            return x.exp() - 1.0;
+        }
+        let xx = x * x;
+        let r = x * polevl(xx, &EP[..]);
+        let r = r / (polevl(xx, &EQ[..]) - r);
+        r + r
     }
 
-    // smirnov(n, ·) is continuous and strictly decreasing from 1 (at d=0) to 0
-    // (at d=1), so invert by bisection on [0, 1]. The previous Newton iteration
-    // overshot catastrophically when seeded in the flat upper tail (e.g. p=1e-6,
-    // n=5: d0≈0.99 where d/dd smirnov ≈ −5e-8, so the step was ≈20, clamping to
-    // the 1e-15 floor and returning ~0 instead of 0.937). Bisection is
-    // unconditionally convergent here. frankenscipy-e6i43
-    // smirnov(n, ·) is strictly decreasing from 1 (d=0) to 0 (d=1), and each
-    // evaluation is an O(n) Birnbaum-Tingey series (gammaln-heavy). Solve the
-    // INCREASING residual g(d) = p − smirnov(n, d) with Illinois false-position
-    // (~13 smirnov evals) instead of the ~53-step bisection this ran — a ~4×
-    // cut in the dominant cost. The bracket [0, 1] needs no kernel calls at the
-    // ends: smirnov(n, 0) = 1 and smirnov(n, 1) = 0, so g(0) = p − 1 < 0 and
-    // g(1) = p > 0. Bracket-preserving, so no Newton-style tail overshoot.
-    crate::beta::illinois_root(|d| p - smirnov(n, d), 0.0, 1.0, p - 1.0, p)
+    /// C `ldexp`: `x · 2^exp` with one rounding (musl `scalbn`; the scaling is split so that a
+    /// subnormal result is rounded once).
+    fn ldexp(x: f64, exp: i32) -> f64 {
+        const P1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
+        const PM969: f64 = f64::from_bits(0x0360_0000_0000_0000); // 2^-1022 · 2^53
+        let mut y = x;
+        let mut n = exp;
+        if n > 1023 {
+            y *= P1023;
+            n -= 1023;
+            if n > 1023 {
+                y *= P1023;
+                n = (n - 1023).min(1023);
+            }
+        } else if n < -1022 {
+            y *= PM969;
+            n += 1022 - 53;
+            if n < -1022 {
+                y *= PM969;
+                n = (n + 1022 - 53).max(-1022);
+            }
+        }
+        y * f64::from_bits(((0x3ff + n) as u64) << 52)
+    }
+
+    /// C `frexp`: significand in [0.5, 1) and binary exponent; zero, ±inf and NaN come back
+    /// unchanged with exponent 0.
+    fn frexp(x: f64) -> (f64, i32) {
+        let bits = x.to_bits();
+        let biased = ((bits >> 52) & 0x7ff) as i32;
+        if biased == 0 {
+            if x == 0.0 {
+                return (x, 0);
+            }
+            let (m, e) = frexp(x * f64::from_bits(0x43f0_0000_0000_0000)); // · 2^64
+            return (m, e - 64);
+        }
+        if biased == 0x7ff {
+            return (x, 0);
+        }
+        (
+            f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000),
+            biased - 0x3fe,
+        )
+    }
+
+    /// `fl(a + b)` and its rounding error, for `|a| ≥ |b|` (`quick_two_sum`).
+    fn quick_two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let c = s - a;
+        (s, b - c)
+    }
+
+    /// `fl(a + b)` and its rounding error (`two_sum`).
+    fn two_sum(a: f64, b: f64) -> (f64, f64) {
+        let s = a + b;
+        let c = s - a;
+        let d = b - c;
+        let e = s - c;
+        (s, (a - e) + d)
+    }
+
+    /// `fl(a · b)` and its rounding error. xsf takes the error from `std::fma`; `mul_add` is
+    /// the same exactly rounded operation.
+    fn two_prod(a: f64, b: f64) -> (f64, f64) {
+        let p = a * b;
+        (p, a.mul_add(b, -p))
+    }
+
+    /// xsf `double_double`: the unevaluated sum `hi + lo`. Each method is one C++ operator of
+    /// `dd_real.h`; the suffix names the operand types where xsf overloads on them.
+    #[derive(Clone, Copy, Debug)]
+    struct Dd {
+        hi: f64,
+        lo: f64,
+    }
+
+    /// e (`dd_real.h` `E`).
+    const DD_E: Dd = Dd {
+        hi: 2.718_281_828_459_045_091e0,
+        lo: 1.445_646_891_729_250_158e-16,
+    };
+    /// log 2 (`dd_real.h` `LOG2`).
+    const DD_LOG2: Dd = Dd {
+        hi: 6.931_471_805_599_452_862e-1,
+        lo: 2.319_046_813_846_299_558e-17,
+    };
+    /// 2^-104 (`dd_real.h` `EPS`).
+    const DD_EPS: f64 = 4.930_380_657_631_32e-32;
+    /// 1/3!, …, 1/8! (`dd_real.h` `inv_fact`; `exp` reads no further).
+    const INV_FACT: [Dd; 6] = [
+        Dd {
+            hi: 1.666_666_666_666_666_57e-1,
+            lo: 9.251_858_538_542_970_66e-18,
+        },
+        Dd {
+            hi: 4.166_666_666_666_666_44e-2,
+            lo: 2.312_964_634_635_742_66e-18,
+        },
+        Dd {
+            hi: 8.333_333_333_333_333_22e-3,
+            lo: 1.156_482_317_317_871_38e-19,
+        },
+        Dd {
+            hi: 1.388_888_888_888_888_94e-3,
+            lo: -5.300_543_954_373_577_06e-20,
+        },
+        Dd {
+            hi: 1.984_126_984_126_984_13e-4,
+            lo: 1.720_955_829_342_070_53e-22,
+        },
+        Dd {
+            hi: 2.480_158_730_158_730_16e-5,
+            lo: 2.151_194_786_677_588_16e-23,
+        },
+    ];
+
+    impl Dd {
+        const fn new(hi: f64) -> Self {
+            Self { hi, lo: 0.0 }
+        }
+
+        const fn splat(v: f64) -> Self {
+            Self { hi: v, lo: v }
+        }
+
+        const fn neg(self) -> Self {
+            Self {
+                hi: -self.hi,
+                lo: -self.lo,
+            }
+        }
+
+        /// `dd == double`
+        fn eq_f64(self, rhs: f64) -> bool {
+            self.hi == rhs && self.lo == 0.0
+        }
+
+        /// `dd < double`
+        fn lt_f64(self, rhs: f64) -> bool {
+            if self.hi < rhs {
+                return true;
+            }
+            if self.hi > rhs {
+                return false;
+            }
+            self.lo < 0.0
+        }
+
+        /// `dd + dd` (the Briggs–Kahan IEEE-style sum).
+        fn add(self, rhs: Self) -> Self {
+            let (s1, s2) = two_sum(self.hi, rhs.hi);
+            let (t1, t2) = two_sum(self.lo, rhs.lo);
+            let (s1, s2) = quick_two_sum(s1, s2 + t1);
+            let (hi, lo) = quick_two_sum(s1, s2 + t2);
+            Self { hi, lo }
+        }
+
+        /// `dd + double`
+        fn add_f64(self, rhs: f64) -> Self {
+            let (s1, s2) = two_sum(self.hi, rhs);
+            let (hi, lo) = quick_two_sum(s1, s2 + self.lo);
+            Self { hi, lo }
+        }
+
+        /// `dd - dd`, which xsf evaluates as `lhs + (-rhs)`.
+        fn sub(self, rhs: Self) -> Self {
+            self.add(rhs.neg())
+        }
+
+        /// `dd - double`
+        fn sub_f64(self, rhs: f64) -> Self {
+            let (s1, s2) = two_sum(self.hi, -rhs);
+            let (hi, lo) = quick_two_sum(s1, s2 + self.lo);
+            Self { hi, lo }
+        }
+
+        /// `double - dd`, i.e. `lhs - self`.
+        fn rsub_f64(self, lhs: f64) -> Self {
+            let (s1, s2) = two_sum(lhs, -self.hi);
+            let (hi, lo) = quick_two_sum(s1, s2 - self.lo);
+            Self { hi, lo }
+        }
+
+        /// `dd * dd`
+        fn mul(self, rhs: Self) -> Self {
+            let (p1, p2) = two_prod(self.hi, rhs.hi);
+            let (hi, lo) = quick_two_sum(p1, p2 + (self.hi * rhs.lo + self.lo * rhs.hi));
+            Self { hi, lo }
+        }
+
+        /// `dd * double`; xsf's `double * dd` forms the same two exact products, so it is this
+        /// too.
+        fn mul_f64(self, rhs: f64) -> Self {
+            let (p1, e1) = two_prod(self.hi, rhs);
+            let (p2, e2) = two_prod(self.lo, rhs);
+            let (hi, lo) = quick_two_sum(p1, e2 + p2 + e1);
+            Self { hi, lo }
+        }
+
+        /// `dd / dd` (three quotient digits).
+        fn div(self, rhs: Self) -> Self {
+            let q1 = self.hi / rhs.hi;
+            let r = self.sub(rhs.mul_f64(q1));
+            let q2 = r.hi / rhs.hi;
+            let r = r.sub(rhs.mul_f64(q2));
+            let q3 = r.hi / rhs.hi;
+            let (hi, lo) = quick_two_sum(q1, q2);
+            Self { hi, lo }.add_f64(q3)
+        }
+
+        /// `dd / double`, which xsf evaluates as `lhs / double_double(rhs)`.
+        fn div_f64(self, rhs: f64) -> Self {
+            self.div(Self::new(rhs))
+        }
+
+        /// `double / dd`, i.e. `double_double(lhs) / self`.
+        fn rdiv_f64(self, lhs: f64) -> Self {
+            Self::new(lhs).div(self)
+        }
+
+        /// `mul_pwr2`: scale both words by a power of two.
+        fn mul_pwr2(self, rhs: f64) -> Self {
+            Self {
+                hi: self.hi * rhs,
+                lo: self.lo * rhs,
+            }
+        }
+
+        fn square(self) -> Self {
+            let p1 = self.hi * self.hi;
+            let mut p2 = self.hi.mul_add(self.hi, -p1);
+            p2 += 2.0 * self.hi * self.lo;
+            p2 += self.lo * self.lo;
+            let (hi, lo) = quick_two_sum(p1, p2);
+            Self { hi, lo }
+        }
+
+        fn floor(self) -> Self {
+            let hi = self.hi.floor();
+            if hi == self.hi {
+                // The high word is an integer already: round the low word.
+                let (hi, lo) = quick_two_sum(hi, self.lo.floor());
+                return Self { hi, lo };
+            }
+            Self { hi, lo: 0.0 }
+        }
+
+        fn ldexp(self, exp: i32) -> Self {
+            Self {
+                hi: ldexp(self.hi, exp),
+                lo: ldexp(self.lo, exp),
+            }
+        }
+
+        /// `(b, e)` with `self = b · 2^e`, `0.5 ≤ |b.hi| < 1` (or `|b.hi| = 1` with the words of
+        /// opposite sign).
+        fn frexp(self) -> (Self, i32) {
+            let (mut man, mut exponent) = frexp(self.hi);
+            let mut b1 = ldexp(self.lo, -exponent);
+            if man.abs() == 0.5 && man * b1 < 0.0 {
+                man *= 2.0;
+                b1 *= 2.0;
+                exponent -= 1;
+            }
+            (Self { hi: man, lo: b1 }, exponent)
+        }
+
+        /// `exp`: reduce by `m log 2` and a factor 512, Taylor series, square nine times.
+        fn exp(self) -> Self {
+            const K: f64 = 512.0;
+            const INV_K: f64 = 1.0 / K;
+            if self.hi <= -709.0 {
+                return Self::new(0.0);
+            }
+            if self.hi >= 709.0 {
+                return Self::splat(f64::INFINITY);
+            }
+            if self.eq_f64(0.0) {
+                return Self::new(1.0);
+            }
+            if self.eq_f64(1.0) {
+                return DD_E;
+            }
+            let m = (self.hi / DD_LOG2.hi + 0.5).floor();
+            let r = self.sub(DD_LOG2.mul_f64(m)).mul_pwr2(INV_K);
+            let mut p = r.square();
+            let mut s = r.add(p.mul_pwr2(0.5));
+            p = p.mul(r);
+            let mut t = p.mul(INV_FACT[0]);
+            let mut i = 0;
+            loop {
+                s = s.add(t);
+                p = p.mul(r);
+                i += 1;
+                t = p.mul(INV_FACT[i]);
+                if !(t.hi.abs() > INV_K * DD_EPS && i < 5) {
+                    break;
+                }
+            }
+            s = s.add(t);
+            for _ in 0..9 {
+                s = s.mul_pwr2(2.0).add(s.square());
+            }
+            s.add_f64(1.0).ldexp(m as i32)
+        }
+
+        /// Natural log: one Newton step `x + a·exp(−x) − 1` from libm's `log(hi)`.
+        fn ln(self) -> Self {
+            if self.eq_f64(1.0) {
+                return Self::new(0.0);
+            }
+            if self.hi <= 0.0 {
+                return Self::splat(f64::NAN);
+            }
+            let x = Self::new(self.hi.ln());
+            x.add(self.mul(x.neg().exp())).sub_f64(1.0)
+        }
+
+        fn ln_1p(self) -> Self {
+            if self.hi <= -1.0 {
+                return Self::splat(f64::NEG_INFINITY);
+            }
+            let la = self.hi.ln_1p();
+            let elam1 = cephes_expm1(la);
+            let mut ll = (self.lo / (1.0 + self.hi)).ln_1p();
+            if self.hi > 0.0 {
+                ll -= (elam1 - self.hi) / (elam1 + 1.0);
+            }
+            Self::new(la).add_f64(ll)
+        }
+    }
+
+    /// An x87 80-bit `long double`, `±sig · 2^exp` with the top bit of `sig` set (or zero).
+    ///
+    /// `_smirnovi` evaluates three bracket expressions in `long double` (the constant
+    /// `SCIPY_El` and the literals `2.0L` and `1.0L` promote them): each operation rounds to a
+    /// 64-bit significand and the result rounds again to `double`. Plain `f64` arithmetic lands
+    /// an ulp away often enough to change the Newton iterates (7 of 2016 SciPy roots over
+    /// n ≤ 1000 moved by 1–2 ulp), so the rounding is emulated exactly here.
+    #[derive(Clone, Copy, Debug)]
+    struct X87 {
+        neg: bool,
+        sig: u64,
+        exp: i32,
+    }
+
+    impl X87 {
+        /// xsf `SCIPY_El`, e rounded to a 64-bit significand.
+        const E: Self = Self {
+            neg: false,
+            sig: 0xadf8_5458_a2bb_4a9b,
+            exp: -62,
+        };
+
+        /// The exact value `±mant · 2^exp` rounded to 64 bits, to nearest, ties to even.
+        fn round(neg: bool, mant: u128, exp: i32) -> Self {
+            if mant == 0 {
+                return Self {
+                    neg: false,
+                    sig: 0,
+                    exp: 0,
+                };
+            }
+            let bits = 128 - mant.leading_zeros();
+            if bits <= 64 {
+                let shift = 64 - bits;
+                return Self {
+                    neg,
+                    sig: (mant << shift) as u64,
+                    exp: exp - shift as i32,
+                };
+            }
+            let shift = bits - 64;
+            let rem = mant & ((1_u128 << shift) - 1);
+            let half = 1_u128 << (shift - 1);
+            let mut sig = (mant >> shift) as u64;
+            let mut exp = exp + shift as i32;
+            if rem > half || (rem == half && sig & 1 == 1) {
+                sig = sig.wrapping_add(1);
+                if sig == 0 {
+                    sig = 1 << 63;
+                    exp += 1;
+                }
+            }
+            Self { neg, sig, exp }
+        }
+
+        fn from_f64(x: f64) -> Self {
+            let bits = x.to_bits();
+            let biased = ((bits >> 52) & 0x7ff) as i32;
+            let frac = bits & ((1 << 52) - 1);
+            let (mant, exp) = if biased == 0 {
+                (frac, -1074)
+            } else {
+                (frac | (1 << 52), biased - 1075)
+            };
+            Self::round(bits >> 63 == 1, u128::from(mant), exp)
+        }
+
+        fn from_i64(v: i64) -> Self {
+            Self::round(v < 0, u128::from(v.unsigned_abs()), 0)
+        }
+
+        /// Round to `double` (every value `_smirnovi` converts lies in the normal range, where
+        /// both parts below are exact and the one `f64` addition rounds the 64-bit value).
+        fn to_f64(self) -> f64 {
+            if self.sig == 0 {
+                return 0.0;
+            }
+            let hi = ldexp((self.sig >> 11) as f64, self.exp + 11);
+            let lo = ldexp((self.sig & 0x7ff) as f64, self.exp);
+            if self.neg { -(hi + lo) } else { hi + lo }
+        }
+
+        fn add(self, rhs: Self) -> Self {
+            if rhs.sig == 0 {
+                return self;
+            }
+            if self.sig == 0 {
+                return rhs;
+            }
+            let (big, small) = if (self.exp, self.sig) >= (rhs.exp, rhs.sig) {
+                (self, rhs)
+            } else {
+                (rhs, self)
+            };
+            // 62 guard bits below both significands; bits shifted out of the smaller one are
+            // folded into its last bit, which keeps every rounding decision exact.
+            let a = u128::from(big.sig) << 62;
+            let shifted = u128::from(small.sig) << 62;
+            let d = (big.exp - small.exp) as u32;
+            let b = if d >= 127 {
+                1
+            } else {
+                (shifted >> d) | u128::from(shifted & ((1_u128 << d) - 1) != 0)
+            };
+            let mant = if big.neg == small.neg { a + b } else { a - b };
+            Self::round(big.neg, mant, big.exp - 62)
+        }
+
+        fn sub(self, rhs: Self) -> Self {
+            self.add(Self {
+                neg: !rhs.neg,
+                ..rhs
+            })
+        }
+
+        fn div(self, rhs: Self) -> Self {
+            // (sig·2^64) / rhs.sig has 64 or 65 bits; two more quotient bits and a sticky bit
+            // below them keep the value on the correct side of every rounding boundary.
+            let den = u128::from(rhs.sig);
+            let num = u128::from(self.sig) << 64;
+            let (q, r) = (num / den, num % den);
+            let (q2, r2) = ((r << 2) / den, (r << 2) % den);
+            let mant = (((q << 2) | q2) << 1) | u128::from(r2 != 0);
+            Self::round(self.neg != rhs.neg, mant, self.exp - rhs.exp - 67)
+        }
+
+        fn sqrt(self) -> Self {
+            // Radicand in [2^126, 2^128) with an even exponent; round the 64-bit integer root up
+            // when the remainder exceeds the root (sqrt never lands exactly on a tie).
+            let s = if (self.exp - 63) % 2 == 0 { 63 } else { 64 };
+            let rad = u128::from(self.sig) << s;
+            let root = rad.isqrt();
+            let rem = rad - root * root;
+            Self::round(false, root + u128::from(rem > root), (self.exp - s) / 2)
+        }
+    }
+
+    /// C `std::clamp(v, lo, hi)`, which (unlike `f64::clamp`) does not require `lo <= hi`.
+    fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+        if v < lo {
+            lo
+        } else if hi < v {
+            hi
+        } else {
+            v
+        }
+    }
+
+    /// `a^m`: libm `pow` of the high word, corrected to first order in `lo/hi` (`pow_D`).
+    fn pow_dd(a: Dd, m: i64) -> Dd {
+        if m <= 0 {
+            if m == 0 {
+                return Dd::new(1.0);
+            }
+            return pow_dd(a, -m).rdiv_f64(1.0);
+        }
+        if a.eq_f64(0.0) {
+            return Dd::new(0.0);
+        }
+        let mf = m as f64;
+        let ans = a.hi.powf(mf);
+        let r = a.lo / a.hi;
+        let mut adj = mf * r;
+        if adj.abs() > 1e-8 {
+            if adj.abs() < 1e-4 {
+                // First two Taylor terms of (1 + r)^m.
+                adj += (mf * r) * ((m - 1) as f64 / 2.0 * r);
+            } else {
+                adj = cephes_expm1(mf * r.ln_1p());
+            }
+        }
+        Dd::new(ans).add_f64(ans * adj)
+    }
+
+    /// `(a + b)^m` rounded to `double` (`pow2`).
+    fn pow2(a: f64, b: f64, m: i64) -> f64 {
+        pow_dd(Dd::new(a).add_f64(b), m).hi
+    }
+
+    /// xsf `nextPowerOf2`: `|x + x·2^-52|` (its `int` round trip never changes the value).
+    fn next_power_of_2(x: f64) -> f64 {
+        let l = (ldexp(x, 1 - 53) + x).abs();
+        if l == 0.0 { x.abs() } else { l }
+    }
+
+    /// `a^m` as `(significand, binary exponent)`, which cannot underflow (`pow2Scaled_D`).
+    fn pow2_scaled(a: Dd, m: i64) -> (Dd, i64) {
+        if m <= 0 {
+            if m == 0 {
+                return (Dd::new(1.0), 0);
+            }
+            let (ans, e1) = pow2_scaled(a, -m);
+            let (ans, e2) = ans.rdiv_f64(1.0).frexp();
+            return (ans, -e1 + i64::from(e2));
+        }
+        let (y, ye) = a.frexp();
+        let ye = i64::from(ye);
+        if m == 1 {
+            return (y, ye);
+        }
+        let mut max_expt = SM_MAX_EXPONENT;
+        let mf = m as f64;
+        let neg_max = -(SM_MAX_EXPONENT as f64);
+        // y^max_expt must stay >= 2^-960; a cheap test before calling log().
+        if mf * (y.hi - 1.0) / y.hi < neg_max * LN_2 {
+            let lg2y = y.hi.ln() / LN_2;
+            let lg_ans = mf * lg2y;
+            if lg_ans <= neg_max {
+                max_expt = (next_power_of_2(neg_max / lg2y + 1.0) / 2.0) as i64;
+            }
+        }
+        if m <= max_expt {
+            let (ans, ans_e) = pow_dd(y, m).frexp();
+            return (ans, i64::from(ans_e) + m * ye);
+        }
+        // y^m = (y^max_expt)^q · y^r
+        let q = m / max_expt;
+        let r = m % max_expt;
+        let (y2r, y2r_e) = pow2_scaled(y, r);
+        let (y2m, y2m_e) = pow2_scaled(y, max_expt);
+        let (y2mq, y2mq_e) = pow2_scaled(y2m, q);
+        let (ans, ans_e) = y2r.mul(y2mq).frexp();
+        (
+            ans,
+            i64::from(ans_e) + (y2mq_e + y2m_e * q) + y2r_e + m * ye,
+        )
+    }
+
+    /// `((a + b) / (c + d))^m` (`pow4_D`).
+    fn pow4_dd(a: f64, b: f64, c: f64, d: f64, m: i64) -> Dd {
+        if m <= 0 {
+            if m == 0 {
+                return Dd::new(1.0);
+            }
+            return pow4_dd(c, d, a, b, -m);
+        }
+        let num = Dd::new(a).add_f64(b);
+        let den = Dd::new(c).add_f64(d);
+        if num.eq_f64(0.0) {
+            return if den.eq_f64(0.0) {
+                Dd::splat(f64::NAN)
+            } else {
+                Dd::new(0.0)
+            };
+        }
+        if den.eq_f64(0.0) {
+            return Dd::splat(if num.lt_f64(0.0) {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
+        pow_dd(num.div(den), m)
+    }
+
+    /// `m · log((a + b) / (c + d))` rounded to `double` (`logpow4`).
+    fn logpow4(a: f64, b: f64, c: f64, d: f64, m: i64) -> f64 {
+        if m == 0 {
+            return 0.0;
+        }
+        let num = Dd::new(a).add_f64(b);
+        let den = Dd::new(c).add_f64(d);
+        if num.eq_f64(0.0) {
+            return if den.eq_f64(0.0) {
+                0.0
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
+        if den.eq_f64(0.0) {
+            return f64::INFINITY;
+        }
+        let x = num.div(den);
+        let ans = if (0.5..=1.5).contains(&x.hi) {
+            num.sub(den).div(den).ln_1p()
+        } else {
+            x.ln()
+        };
+        ans.mul_f64(m as f64).hi
+    }
+
+    /// `floor(n x)` and the remainder, exactly, as `(alpha, floor, n·x)`; a remainder that
+    /// rounds to 1 carries into the floor (`modNX`).
+    fn mod_nx(n: i64, x: f64) -> (f64, i64, f64) {
+        let nx = Dd::new(x).mul_f64(n as f64);
+        let nx_floor = nx.floor();
+        let mut alpha = nx.sub(nx_floor).hi;
+        let mut nxfloor = nx_floor.hi as i64;
+        if alpha == 1.0 {
+            nxfloor += 1;
+            alpha = 0.0;
+        }
+        (alpha, nxfloor, nx.hi)
+    }
+
+    /// C(n, j) held as (significand, exponent), advanced to C(n, j + 1) (`updateBinomial`).
+    fn update_binomial(cman: &mut Dd, cexpt: &mut i64, n: i64, j: i64) {
+        let rat = Dd::new((n - j) as f64).div_f64(j as f64 + 1.0);
+        let (man, expt) = cman.mul(rat).frexp();
+        *cexpt += i64::from(expt);
+        *cman = man;
+    }
+
+    /// `A_v(n, x) = C(n, v) (1 − x − v/n)^(n−v) (x + v/n)^(v−1)` (`computeAv`).
+    fn compute_av(n: i64, x: f64, v: i64, cman: Dd, cexpt: i64) -> Dd {
+        let nf = n as f64;
+        let t2x = Dd::new((n - v) as f64).div_f64(nf).sub_f64(x);
+        let (t2, t2e) = pow2_scaled(t2x, n - v);
+        let t1x = Dd::new(v as f64).div_f64(nf).add_f64(x);
+        let (t1, t1e) = pow2_scaled(t1x, v - 1);
+        // The exponent stays far inside i32 for the n <= 10^6 that are summed; beyond ±2^30 the
+        // value is 0 or inf either way.
+        let expt = (cexpt + t1e + t2e).clamp(-(1 << 30), 1 << 30) as i32;
+        t1.mul(t2).mul(cman).ldexp(expt)
+    }
+
+    /// (sf, cdf, pdf) of `D_n^+`, computed together (`ThreeProbs`).
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ThreeProbs {
+        pub(super) sf: f64,
+        pub(super) cdf: f64,
+        pub(super) pdf: f64,
+    }
+
+    /// xsf `_smirnov(n, x)`.
+    pub(super) fn smirnov3(n: i64, x: f64) -> ThreeProbs {
+        let probs = |sf, cdf, pdf| ThreeProbs { sf, cdf, pdf };
+        if !(n > 0 && (0.0..=1.0).contains(&x)) {
+            return probs(f64::NAN, f64::NAN, f64::NAN);
+        }
+        if n == 1 {
+            return probs(1.0 - x, x, 1.0);
+        }
+        if x == 0.0 {
+            return probs(1.0, 0.0, 1.0);
+        }
+        if x == 1.0 {
+            return probs(0.0, 1.0, 0.0);
+        }
+        let (alpha, nxfl, nx) = mod_nx(n, x);
+        let mut n1mxfl = n - nxfl - i64::from(alpha != 0.0);
+        let mut n1mxceil = n - nxfl;
+        // With alpha == 0 the last term belongs to neither sum.
+        if alpha == 0.0 {
+            n1mxfl -= 1;
+            n1mxceil += 1;
+        }
+        // x <= 1/n
+        if nxfl == 0 || (nxfl == 1 && alpha == 0.0) {
+            let t = pow2(1.0, x, n - 1);
+            let mut pdf = (nx + 1.0) * t / (1.0 + x);
+            let cdf = x * t;
+            // Adjust if x = 1/n exactly.
+            if nxfl == 1 {
+                pdf -= 0.5;
+            }
+            return probs(1.0 - cdf, cdf, pdf);
+        }
+        let nf = n as f64;
+        // The sf underflows. (xsf forms -2n in a C int, which overflows above 2^30 and skips
+        // this test; the branches it falls to return the same (0, 1, 0).)
+        if -2.0 * nf * x * x < MINLOG {
+            return probs(0.0, 1.0, 0.0);
+        }
+        // x >= 1 - 1/n
+        if nxfl >= n - 1 {
+            let sf = pow2(1.0, -x, n);
+            return probs(sf, 1.0 - sf, nf * sf / (1.0 - x));
+        }
+        // n too large to sum: p ~ exp(-(6nx + 1)^2 / 18n).
+        if n > SMIRNOV_MAX_COMPUTE_N {
+            let s = 6.0 * nf * x + 1.0;
+            // xsf writes std::pow(s, 2), which compiles to s·s.
+            let logp = -(s * s) / 18.0 / nf;
+            let (sf, cdf) = if logp < -LN_2 {
+                let sf = logp.exp();
+                (sf, 1.0 - sf)
+            } else {
+                let cdf = -cephes_expm1(logp);
+                (1.0 - cdf, cdf)
+            };
+            return probs(sf, cdf, (6.0 * nf * x + 1.0) * 2.0 * sf / 3.0);
+        }
+        // The upper sum alternates in sign and loses ~1.6 bits per term: use it only when it
+        // has very few terms.
+        let n_upper_terms = n - n1mxceil + 1;
+        let use_upper = (n_upper_terms <= 1 && x < 0.5)
+            || (n >= SM_UPPERSUM_MIN_N
+                && n_upper_terms <= SM_UPPER_MAX_TERMS
+                && x <= 0.5 / nf.sqrt());
+        let vmid = n / 2;
+        let one_over_x = Dd::new(1.0).div_f64(x);
+        let (start, step, n_terms, mut aj, daj_coeff) = if use_upper {
+            let aj = pow4_dd(1.0, x, 1.0, 0.0, n - 1);
+            let coeff = Dd::new(1.0)
+                .add_f64(x)
+                .rdiv_f64((n - 1) as f64)
+                .add(one_over_x);
+            (n, -1, n - n1mxceil + 1, aj, coeff)
+        } else {
+            let aj = pow4_dd(1.0, -x, 1.0, 0.0, n).div_f64(x);
+            let coeff = Dd::new((n - 1) as f64)
+                .mul_f64(x)
+                .rsub_f64(-1.0)
+                .div(Dd::new(1.0).sub_f64(x))
+                .div_f64(x)
+                .add(one_over_x);
+            (0, 1, n1mxfl + 1, aj, coeff)
+        };
+        let daj = aj.mul(daj_coeff);
+        let mut aj_sum = Dd::new(0.0).add(aj);
+        let mut daj_sum = Dd::new(0.0).add(daj);
+        let mut cman = Dd::new(1.0);
+        let mut cexpt = 0;
+        update_binomial(&mut cman, &mut cexpt, n, 0);
+        let mut j = 1;
+        while j < n_terms {
+            let v = start + j * step;
+            aj = compute_av(n, x, v, cman, cexpt);
+            if aj.hi.is_finite() && !aj.eq_f64(0.0) {
+                // coeff = 1/x + (v-1)/(x+v/n) - (n-v)/(1-x-v/n). SciPy's C forms n·(v-1)
+                // and (n-v)·n as ints, which overflow from n = 46342 on (46341·46340 is the
+                // last product below 2^31) and corrupt its pdf and smirnovi's Newton steps.
+                // fsci deliberately does not reproduce that UB: the i64 products are exact.
+                let coeff = Dd::new((nxfl + v) as f64)
+                    .add_f64(alpha)
+                    .rdiv_f64((n * (v - 1)) as f64)
+                    .sub(
+                        Dd::new((n - nxfl - v) as f64)
+                            .sub_f64(alpha)
+                            .rdiv_f64(((n - v) * n) as f64),
+                    )
+                    .add(one_over_x);
+                aj_sum = aj_sum.add(aj);
+                daj_sum = daj_sum.add(aj.mul(coeff));
+            }
+            // Safe to stop early?
+            if !aj.eq_f64(0.0) {
+                if (4 * (n_terms - j)) as f64 * aj.hi.abs() < f64::EPSILON * aj_sum.hi
+                    && j != n_terms - 1
+                {
+                    break;
+                }
+            } else if j > vmid {
+                break;
+            }
+            update_binomial(&mut cman, &mut cexpt, n, j);
+            j += 1;
+        }
+        let deriv = daj_sum.mul_f64(x).hi;
+        let prob = aj_sum.mul_f64(x).hi;
+        let (sf, cdf, pdf) = if step < 0 {
+            (1.0 - prob, prob, deriv)
+        } else {
+            (prob, 1.0 - prob, -deriv)
+        };
+        // std::fmax(0, pdf) sends NaN and -0.0 to +0.0 as well.
+        let pdf = if pdf > 0.0 { pdf } else { 0.0 };
+        probs(sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), pdf)
+    }
+
+    /// xsf `_smirnovi(n, psf, pcdf)`: the `x` with `smirnov(n, x) = psf` and
+    /// `smirnovc(n, x) = pcdf`.
+    // `x < a || x > b` is kept as xsf writes it: `!(a..=b).contains(&x)` differs on NaN.
+    #[allow(clippy::manual_range_contains)]
+    pub(super) fn smirnovi(n: i64, psf: f64, pcdf: f64) -> f64 {
+        if !(n > 0 && (0.0..=1.0).contains(&psf) && (0.0..=1.0).contains(&pcdf)) {
+            return f64::NAN;
+        }
+        if (1.0 - pcdf - psf).abs() > 4.0 * f64::EPSILON {
+            return f64::NAN;
+        }
+        if pcdf == 0.0 {
+            return 0.0;
+        }
+        if psf == 0.0 {
+            return 1.0;
+        }
+        if n == 1 {
+            return pcdf;
+        }
+        let nf = n as f64;
+        // psf very close to 0: the root lies in ((n-1)/n, 1), where psf = (1-x)^n exactly.
+        let psfrootn = psf.powf(1.0 / nf);
+        if n < 150 && nf * psfrootn <= 1.0 {
+            return 1.0 - psfrootn;
+        }
+        let logpcdf = if pcdf < 0.5 {
+            pcdf.ln()
+        } else {
+            (-psf).ln_1p()
+        };
+        // Bracket and starting point for Newton-Raphson.
+        let maxlogpcdf = logpow4(1.0, 0.0, nf, 0.0, 1) + logpow4(nf, 1.0, nf, 0.0, n - 1);
+        let (mut a, mut b, mut x);
+        if logpcdf <= maxlogpcdf {
+            // 0 < x <= 1/n: pcdf = x (1+x)^(n-1). One Newton step on z e^(z-1) = R.
+            let xmin = X87::from_f64(pcdf).div(X87::E).to_f64();
+            let xmax = pcdf;
+            let p1 = pow4_dd(nf, 1.0, nf, 0.0, n - 1).hi / nf;
+            let r = pcdf / p1;
+            if r >= 1.0 {
+                // R > 1 is truncation error at x = 1/n.
+                return 1.0 / nf;
+            }
+            let z0 = (r * r + r * (1.0 - r).exp()) / (1.0 + r);
+            x = z0 / nf;
+            a = (xmin * (1.0 - 4.0 * f64::EPSILON)).max(0.0);
+            b = (xmax * (1.0 + 4.0 * f64::EPSILON)).min(1.0 / nf);
+            x = clamp(x, a, b);
+        } else {
+            // 1/n < x < (n-1)/n. (xsf also scales xmin and xmax by 1 ∓ 4 eps, into
+            // variables it then overwrites.)
+            let xmin = 1.0 - psfrootn;
+            let logpsf = if psf < 0.5 { psf.ln() } else { (-pcdf).ln_1p() };
+            // std::sqrt(-logpsf / (2.0L * n)) and xmax - 1.0L / (6 * n). SciPy's C forms 6n as
+            // an int, which overflows for n > 357913941 and moves its starting point; fsci
+            // deliberately does not reproduce that UB and keeps 6n exact.
+            let xmax = X87::from_f64(-logpsf)
+                .div(X87::from_i64(2 * n))
+                .sqrt()
+                .to_f64();
+            let xmax6 = X87::from_f64(xmax)
+                .sub(X87::from_i64(1).div(X87::from_i64(6 * n)))
+                .to_f64();
+            a = xmin.max(1.0 / nf);
+            b = xmax.min(1.0 - 1.0 / nf);
+            x = xmax6;
+        }
+        if x < a || x > b {
+            x = (a + b) / 2.0;
+        }
+        // Newton-Raphson on smirnov(n, x) - psf or pcdf - smirnovc(n, x), whichever has the
+        // smaller p, falling back to bisection of the bracket.
+        let mut dxold = b - a;
+        let mut dx = dxold;
+        let mut iterations = 0;
+        loop {
+            let x0 = x;
+            let p = smirnov3(n, x0);
+            let df = if pcdf < 0.5 { pcdf - p.cdf } else { p.sf - psf };
+            let dfdx = -p.pdf;
+            if df == 0.0 {
+                return x;
+            }
+            if df > 0.0 && x > a {
+                a = x;
+            } else if df < 0.0 && x < b {
+                b = x;
+            }
+            let deltax = if dfdx == 0.0 {
+                x = (a + b) / 2.0;
+                x0 - x
+            } else {
+                let deltax = df / dfdx;
+                x = x0 - deltax;
+                deltax
+            };
+            if (a..=b).contains(&x)
+                && ((2.0 * deltax).abs() <= dxold.abs() || dxold.abs() < 256.0 * f64::EPSILON)
+            {
+                dxold = dx;
+                dx = deltax;
+            } else {
+                dxold = dx;
+                dx /= 2.0;
+                x = (a + b) / 2.0;
+            }
+            // Not purely relative: near psf = 1 the root is close to 0.
+            let atol = if psf < 0.5 { 0.0 } else { XTOL };
+            if (x - x0).abs() <= atol + RTOL * x0.abs() {
+                return x;
+            }
+            iterations += 1;
+            if iterations > KOLMOG_MAXITER {
+                return x;
+            }
+        }
+    }
 }
 
 // --- Cephes degree-trig support (sindg.c / tandg.c) ---
@@ -11066,14 +11993,14 @@ mod tests {
 
     #[test]
     fn smirnovi_inverse() {
-        // smirnovi should be inverse of smirnov (within tolerance)
-        for &n in &[20, 50, 100] {
-            for &d in &[0.2, 0.3, 0.4, 0.5] {
+        // smirnovi(n, smirnov(n, d)) recovers d to a few ulp away from the flat tails.
+        for &n in &[20, 50, 100, 1000] {
+            for &d in &[0.05, 0.2, 0.3, 0.4, 0.5] {
                 let p = smirnov(n, d);
                 if p > 0.01 && p < 0.99 {
                     let d_recovered = smirnovi(n, p);
                     assert!(
-                        (d_recovered - d).abs() < 0.05,
+                        (d_recovered - d).abs() <= 1e-12 * d,
                         "smirnovi failed: n={n}, d={d}, p={p}, d_recovered={d_recovered}"
                     );
                 }
@@ -11081,68 +12008,234 @@ mod tests {
         }
     }
 
-    /// Anchor smirnov against scipy.special.smirnov (frankenscipy-5bura).
-    ///
-    /// Pre-fix the asymptotic-with-correction was off by up to ~0.3 abs
-    /// at small n (e.g. smirnov(1, 0.5) returned ≈0.39 vs the exact 0.5).
-    /// The new Birnbaum-Tingey exact branch matches scipy to floating
-    /// point for n ≤ 100. The asymptotic kicks in for n ≥ 1000 and
-    /// stays within the well-known O(1/n) bound.
+    /// `smirnov` against `scipy.special.smirnov` (SciPy 1.17.1) bit for bit, through every
+    /// branch of xsf `_smirnov`: n = 1; d = 0 and 1; d < 1/n; d = 1/n exactly; d ≥ 1 − 1/n;
+    /// the lower sum at small and large n (the `int` products SciPy's C overflows from
+    /// n = 46342 on feed only the pdf, so the sf stays SciPy's there too); the three-term
+    /// upper sum; the underflow cut-off; the n > 10^6 approximation (both its `exp`
+    /// and cephes `expm1` arms, and n = i32::MAX). The old exp(−2nd²) path for n ≥ 1000
+    /// missed (1000, 0.03) by 3.3e-3. frankenscipy-k4c2c
     #[test]
-    fn smirnov_matches_scipy_at_small_n() {
-        // (n, d, scipy.special.smirnov(n, d))
-        let cases: [(i32, f64, f64); 14] = [
-            (1, 0.1, 0.9),
-            (1, 0.5, 0.5),
-            (1, 0.8, 0.2),
-            (2, 0.3, 0.61),
-            (2, 0.5, 0.25),
-            (5, 0.1, 0.85359),
-            (5, 0.3, 0.34282),
-            (5, 0.5, 0.056),
-            (10, 0.1, 0.7642052309),
-            (10, 0.3, 0.1354635556),
-            (10, 0.5, 0.003888705),
-            (50, 0.1, 0.34490701996888),
-            (100, 0.1, 0.12659065846),
-            (500, 0.1, 4.171146533e-5),
+    fn smirnov_matches_scipy_bit_for_bit() {
+        // (n, d, scipy.special.smirnov(n, d).to_bits())
+        let cases: [(i32, f64, u64); 26] = [
+            (1, 0.3, 0x3fe6_6666_6666_6666),
+            (7, 0.0, 0x3ff0_0000_0000_0000),
+            (7, 1.0, 0x0000_0000_0000_0000),
+            (10, 0.05, 0x3fed_8493_724b_3766),
+            (10, 0.1, 0x3fe8_745e_8744_b960),
+            (5, 0.85, 0x3f13_e814_50ef_dca0),
+            (3, 0.5, 0x3fc5_5555_5555_5555),
+            (5, 0.3, 0x3fd5_f0c3_4c1a_8ac6),
+            (10, 0.3, 0x3fc1_56de_aa8d_0a54),
+            (20, 0.25, 0x3fb1_9ea1_c70c_c735),
+            (50, 0.1, 0x3fd6_12f4_e4bb_5691),
+            (100, 0.2, 0x3f32_314b_50b0_7424),
+            (500, 0.1, 0x3f05_de6b_0930_dbda),
+            (1000, 0.03, 0x3fc4_bd74_882c_c070),
+            (100, 0.025, 0x3feb_c807_3493_2cc0),
+            (1000, 0.0025, 0x3fef_8ccd_2dfa_bb66),
+            (100_000, 1.5e-5, 0x3fef_ff8c_f42c_852f),
+            (1000, 0.7, 0x0000_0000_0000_0000),
+            (46341, 0.004, 0x3fcc_f9bf_a7b3_8e06),
+            (100_000, 0.003, 0x3fc5_1db1_a439_2120),
+            (1_000_000, 0.001, 0x3fc1_4fb6_0abe_10e3),
+            (2_000_000, 0.0005, 0x3fd7_8953_ebf7_ec61),
+            (2_000_000, 1e-5, 0x3fef_fcab_45f9_dbe3),
+            (2_000_000, 1e-7, 0x3fef_ffff_be6d_2b90),
+            (i32::MAX, 1e-5, 0x3fe4_d39e_17ac_f1bb),
+            (20, 1e-300, 0x3ff0_0000_0000_0000),
         ];
-        for (n, d, expected) in cases {
-            let got = smirnov(n, d);
-            let scale = expected.abs().max(1e-12);
-            let rel = (got - expected).abs() / scale;
-            assert!(
-                rel < 1e-9,
-                "smirnov({n}, {d}) = {got}, expected {expected}, rel = {rel}"
-            );
-        }
+        let bad: Vec<String> = cases
+            .iter()
+            .filter_map(|&(n, d, bits)| {
+                let got = smirnov(n, d);
+                (got.to_bits() != bits).then(|| {
+                    format!(
+                        "smirnov({n}, {d:e}) = {got:e}, SciPy {:e}",
+                        f64::from_bits(bits)
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} of {} differ from SciPy:\n{}",
+            bad.len(),
+            cases.len(),
+            bad.join("\n")
+        );
     }
 
+    /// `smirnovi` against `scipy.special.smirnovi` (SciPy 1.17.1) bit for bit wherever SciPy's
+    /// C does not overflow an `int`: n = 1; p = 0 and 1; the exact `1 − p^{1/n}` root; the
+    /// d ≤ 1/n start (p near 1); the Newton path at small and large n, up to n = 46341 (the
+    /// last n whose derivative products fit an int), at 2·10^6 and at 357913941 (the last n
+    /// whose 6n does); and five roots whose `long double` bracket arithmetic moves the answer:
+    /// with the brackets in plain `f64` they come out 1–2 ulp low or high. frankenscipy-k4c2c
     #[test]
-    fn smirnovi_matches_scipy_reference_points() {
-        // smirnovi(n, p) inverts smirnov(n, ·); now via Illinois (was ~53-step
-        // bisection). References from scipy.special.smirnovi (1.17.1), 1e-10.
-        let cases = [
-            (10, 0.3, 0.23044687172686085),
-            (50, 0.1, 0.14839812573875719),
-            (100, 0.05, 0.12066568772965514),
-            (20, 0.5, 0.12404490303120737),
-            (200, 0.2, 0.062610868788876894),
-            (5, 0.9, 0.074906194963475184),
-            (1, 0.5, 0.5),
+    fn smirnovi_matches_scipy_bit_for_bit() {
+        // (n, p, scipy.special.smirnovi(n, p).to_bits())
+        let cases: [(i32, f64, u64); 22] = [
+            (1, 0.3, 0x3fe6_6666_6666_6666),
+            (5, 0.0, 0x3ff0_0000_0000_0000),
+            (5, 1.0, 0x0000_0000_0000_0000),
+            (5, 1e-6, 0x3fed_fb1e_a780_eac1),
+            (100, 0.99, 0x3f77_56aa_c1fe_04b1),
+            (1000, 0.999, 0x3f42_97c0_ed83_5b70),
+            (50, 0.1, 0x3fc2_feb5_b46a_f6d7),
+            (20, 0.5, 0x3fbf_c168_21c1_28ad),
+            (10, 0.3, 0x3fcd_7f48_78c4_24d8),
+            (500, 0.797_590_610_435_077_3, 0x3f8e_2143_eeff_02f4),
+            (10, 0.736_725_688_351_261_4, 0x3fbb_b29a_34a4_4c91),
+            (150, 0.768_144_465_873_938_9, 0x3f9d_4435_2ba5_27ca),
+            (999, 0.851_869_681_922_895_8, 0x3f82_0241_331e_832e),
+            (500, 0.9, 0x3f84_5abf_afa1_aca5),
+            (10_000, 0.05, 0x3f89_07da_95df_3c02),
+            (46_341, 0.5, 0x3f66_5f9f_a334_6ed6),
+            (2_000_000, 0.2, 0x3f44_c858_d5aa_0b96),
+            (2_000_000, 0.9, 0x3f25_42f7_d480_fff6),
+            (357_913_941, 0.75, 0x3ef5_053b_ed3a_6900),
+            (1000, 1e-100, 0x3fd5_6ccd_c2db_7495),
+            (200, 1e-300, 0x3fee_fcf2_3b15_fc64),
+            (10, 1e-300, 0x3ff0_0000_0000_0000),
         ];
-        for (n, p, expected) in cases {
-            let got = smirnovi(n, p);
-            assert!(
-                (got - expected).abs() <= 1e-10 * expected.abs().max(1.0),
-                "smirnovi({n}, {p}) = {got}, expected {expected}"
+        let bad: Vec<String> = cases
+            .iter()
+            .filter_map(|&(n, p, bits)| {
+                let got = smirnovi(n, p);
+                (got.to_bits() != bits).then(|| {
+                    format!(
+                        "smirnovi({n}, {p:e}) = {got:e}, SciPy {:e}",
+                        f64::from_bits(bits)
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} of {} differ from SciPy:\n{}",
+            bad.len(),
+            cases.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// Where SciPy's C overflows an `int` (`n·(v−1)`, `(n−v)·n` in the Newton derivative for
+    /// 46342 ≤ n ≤ 10^6; `6n` in the starting point above n = 357913941), fsci keeps the exact
+    /// products instead of reproducing that undefined behaviour, so these roots are pinned to
+    /// fsci's own values. Each was checked against the root of the same function in mpmath
+    /// (45 digits, one Newton step from fsci's root). In the derivative range fsci's root is
+    /// the nearer one at every point: within 0.5 ulp for p ≤ 0.9, and 24–41 ulp near p = 1,
+    /// where xsf's stopping test is absolute, against SciPy's 45–1421. In the 6n range the
+    /// two land 1–2 ulp apart either way (SciPy is the nearer at (i32::MAX, 0.99)).
+    /// frankenscipy-k4c2c
+    #[test]
+    fn smirnovi_keeps_exact_products_where_scipy_overflows_an_int() {
+        // (n, p, fsci bits, scipy.special.smirnovi(n, p) bits); fsci − SciPy in ulp, then each
+        // one's distance from the mpmath root in ulp.
+        let cases: [(i32, f64, u64, u64); 10] = [
+            // −21; fsci +24.5, SciPy +45.5
+            (46_342, 0.99, 0x3f35_58b1_5355_08b2, 0x3f35_58b1_5355_08c7),
+            // +381; fsci −0.33, SciPy −381.3
+            (50_000, 0.5, 0x3f65_8a56_a052_7549, 0x3f65_8a56_a052_73cc),
+            // −3; fsci +0.16, SciPy +3.16
+            (100_000, 0.01, 0x3f73_a5dd_502c_0eb1, 0x3f73_a5dd_502c_0eb4),
+            // −1; fsci +0.04, SciPy +1.04
+            (100_000, 0.3, 0x3f64_15f4_f5a2_5a11, 0x3f64_15f4_f5a2_5a12),
+            // −993; fsci +0.13, SciPy +993.1
+            (100_000, 0.9, 0x3f47_ba97_4c26_9c89, 0x3f47_ba97_4c26_a06a),
+            // −1380; fsci +40.8, SciPy +1420.8
+            (100_000, 0.99, 0x3f2d_2a26_a6e2_2ce0, 0x3f2d_2a26_a6e2_3244),
+            // +1; fsci +0.39, SciPy −0.61
+            (
+                357_913_942,
+                0.75,
+                0x3ef5_053b_ecbc_4a59,
+                0x3ef5_053b_ecbc_4a58,
+            ),
+            // −2; fsci −0.85, SciPy +1.15
+            (
+                1_073_741_831,
+                0.693_484_131_989_360_3,
+                0x3eeb_6100_f3e3_e30b,
+                0x3eeb_6100_f3e3_e30d,
+            ),
+            // +1; fsci +0.01, SciPy −0.99
+            (i32::MAX, 0.75, 0x3ee1_29d1_d332_8d77, 0x3ee1_29d1_d332_8d76),
+            // −1; fsci −0.53, SciPy +0.47
+            (i32::MAX, 0.99, 0x3eb9_a9bd_71bb_df87, 0x3eb9_a9bd_71bb_df88),
+        ];
+        let bad: Vec<String> = cases
+            .iter()
+            .filter_map(|&(n, p, bits, scipy_bits)| {
+                assert_ne!(
+                    bits, scipy_bits,
+                    "({n}, {p:e}) is not a point where SciPy differs"
+                );
+                let got = smirnovi(n, p);
+                (got.to_bits() != bits).then(|| {
+                    let scipy_note = if got.to_bits() == scipy_bits {
+                        " (SciPy's overflowed value)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "smirnovi({n}, {p:e}) = {got:e}{scipy_note}, pinned {:e}",
+                        f64::from_bits(bits)
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} of {} differ from the exact-product roots:\n{}",
+            bad.len(),
+            cases.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `smirnov_sf_cdf_pdf` (the kernel fsci-stats' kstwo calls): sf is SciPy's `smirnov`
+    /// bit for bit, cdf its complement, and pdf SciPy's `-_smirnovp` where xsf's `int`
+    /// products fit (n ≤ 46341). Beyond that SciPy's pdf is corrupted by the overflow (it
+    /// returns 0.0 at both points below); fsci's is the true derivative, pinned to values
+    /// within 1.5e-17 relative of mpmath's (45 digits). frankenscipy-k4c2c
+    #[test]
+    fn smirnov_sf_cdf_pdf_is_scipys_sf_with_the_true_pdf() {
+        // (n, d, pdf bits); SciPy's -_smirnovp is the same for the first two, 0.0 for the rest.
+        let cases: [(i64, f64, u64); 4] = [
+            (1000, 0.03, 0x4033_8e2c_68e4_429d),
+            (46_341, 0.004, 0x4064_ffdf_0d76_8869),
+            (50_000, 0.005, 0x4054_7777_f436_d159),
+            (100_000, 0.003, 0x4068_c254_032b_ba80),
+        ];
+        for (n, d, pdf_bits) in cases {
+            let (sf, cdf, pdf) = smirnov_sf_cdf_pdf(n, d);
+            let small_n = i32::try_from(n).expect("test n fits i32");
+            assert_eq!(sf.to_bits(), smirnov(small_n, d).to_bits(), "sf({n}, {d})");
+            // All four take the lower sum, where xsf forms the cdf as 1 − sf.
+            assert_eq!(cdf.to_bits(), (1.0 - sf).to_bits(), "cdf({n}, {d})");
+            assert_eq!(
+                pdf.to_bits(),
+                pdf_bits,
+                "pdf({n}, {d}) = {pdf:e}, pinned {:e}",
+                f64::from_bits(pdf_bits)
             );
-            // Round-trip: smirnov(n, smirnovi(n, p)) == p.
-            let back = smirnov(n, got);
-            assert!(
-                (back - p).abs() <= 1e-9 * p.max(1e-12),
-                "smirnovi round-trip: smirnov({n}, {got}) = {back} != {p}"
-            );
+        }
+        let (sf, cdf, pdf) = smirnov_sf_cdf_pdf(0, 0.5);
+        assert!(sf.is_nan() && cdf.is_nan() && pdf.is_nan(), "n = 0");
+    }
+
+    /// SciPy's domain: NaN for n < 1, a NaN argument, or an argument outside [0, 1] (the old
+    /// implementation returned 1 and 0 for d below 0 and above 1). frankenscipy-k4c2c
+    #[test]
+    fn smirnov_and_smirnovi_are_nan_outside_the_domain() {
+        for (n, d) in [(0, 0.5), (-3, 0.5), (5, -0.1), (5, 1.5), (5, f64::NAN)] {
+            assert!(smirnov(n, d).is_nan(), "smirnov({n}, {d})");
+        }
+        for (n, p) in [(0, 0.5), (-3, 0.5), (5, -0.1), (5, 1.1), (5, f64::NAN)] {
+            assert!(smirnovi(n, p).is_nan(), "smirnovi({n}, {p})");
         }
     }
 

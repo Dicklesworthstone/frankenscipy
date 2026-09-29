@@ -46462,28 +46462,6 @@ fn ks_ldexp(x: f64, exp: i32) -> f64 {
     y * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
 
-/// Mantissa in [0.5, 1) and binary exponent, as C `frexp` (musl); zero, inf and NaN come
-/// back unchanged with exponent 0.
-fn ks_frexp(x: f64) -> (f64, i32) {
-    let bits = x.to_bits();
-    let biased = ((bits >> 52) & 0x7ff) as i32;
-    if biased == 0 {
-        if x == 0.0 {
-            return (x, 0);
-        }
-        // Subnormal: scale by 2^64 into the normal range first.
-        let (m, e) = ks_frexp(x * f64::from_bits(0x43f0_0000_0000_0000));
-        return (m, e - 64);
-    }
-    if biased == 0x7ff {
-        return (x, 0);
-    }
-    (
-        f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000),
-        biased - 0x3fe,
-    )
-}
-
 fn ks_matmul(a: &[Vec<f64>], b: &[Vec<f64>], m: usize) -> Vec<Vec<f64>> {
     let mut c = vec![vec![0.0f64; m]; m];
     for i in 0..m {
@@ -46767,7 +46745,7 @@ fn kolmogn(n: usize, x: f64, cdf: bool) -> f64 {
     }
     if x >= 0.5 {
         // Exact: the two one-sided events cannot both occur.
-        let prob = 2.0 * ks_smirnov3(n, x).0;
+        let prob = 2.0 * fsci_special::smirnov_sf_cdf_pdf(n as i64, x).0;
         return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
     let nxsquared = t * x;
@@ -46781,7 +46759,7 @@ fn kolmogn(n: usize, x: f64, cdf: bool) -> f64 {
             return ks_select_and_clip(prob, 1.0 - prob, cdf);
         }
         // Miller's approximation 2·smirnov.
-        let prob = 2.0 * ks_smirnov3(n, x).0;
+        let prob = 2.0 * fsci_special::smirnov_sf_cdf_pdf(n as i64, x).0;
         return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
     // n > 140: the CDF and the SF have different cutoffs on n·x².
@@ -46790,7 +46768,7 @@ fn kolmogn(n: usize, x: f64, cdf: bool) -> f64 {
             return 0.0;
         }
         if nxsquared >= 2.2 {
-            return (2.0 * ks_smirnov3(n, x).0).clamp(0.0, 1.0);
+            return (2.0 * fsci_special::smirnov_sf_cdf_pdf(n as i64, x).0).clamp(0.0, 1.0);
         }
     }
     let cdfprob = if nxsquared >= 18.0 {
@@ -46837,7 +46815,7 @@ fn kolmogn_p(n: usize, x: f64) -> f64 {
         return 2.0 * (1.0 - x).powf(nf - 1.0) * nf;
     }
     if x >= 0.5 {
-        return 2.0 * ks_smirnov3(n, x).2;
+        return 2.0 * fsci_special::smirnov_sf_cdf_pdf(n as i64, x).2;
     }
     let delta = (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x);
     let weights = [1.0 / 12.0, -8.0 / 12.0, 0.0 / 12.0, 8.0 / 12.0, -1.0 / 12.0];
@@ -47065,413 +47043,9 @@ fn ks_stirling_poly(z: f64) -> f64 {
     acc
 }
 
-// ── xsf `cephes/dd_real.h` + `cephes/kolmogorov.h` and SciPy `brentq.c`, the pieces that
-// `scipy.stats.kstwo` calls through `scipy.special` / `scipy.optimize`. frankenscipy-1ksfv.16
-
-/// Unevaluated sum `hi + lo`: the double-double subset of xsf `cephes/dd_real.h` (Bailey's
-/// QD, Briggs–Kahan addition) that `_smirnov` uses, operation for operation.
-#[derive(Clone, Copy, Debug)]
-struct KsDd {
-    hi: f64,
-    lo: f64,
-}
-
-fn ks_quick_two_sum(a: f64, b: f64) -> (f64, f64) {
-    let s = a + b;
-    let c = s - a;
-    (s, b - c)
-}
-
-fn ks_two_sum(a: f64, b: f64) -> (f64, f64) {
-    let s = a + b;
-    let c = s - a;
-    let d = b - c;
-    let e = s - c;
-    (s, (a - e) + d)
-}
-
-fn ks_two_prod(a: f64, b: f64) -> (f64, f64) {
-    let p = a * b;
-    (p, a.mul_add(b, -p))
-}
-
-impl KsDd {
-    const fn new(hi: f64) -> Self {
-        Self { hi, lo: 0.0 }
-    }
-
-    fn is_zero(self) -> bool {
-        self.hi == 0.0 && self.lo == 0.0
-    }
-
-    fn neg(self) -> Self {
-        Self {
-            hi: -self.hi,
-            lo: -self.lo,
-        }
-    }
-
-    fn add(self, rhs: Self) -> Self {
-        let (s1, s2) = ks_two_sum(self.hi, rhs.hi);
-        let (t1, t2) = ks_two_sum(self.lo, rhs.lo);
-        let (s1, s2) = ks_quick_two_sum(s1, s2 + t1);
-        let (hi, lo) = ks_quick_two_sum(s1, s2 + t2);
-        Self { hi, lo }
-    }
-
-    fn add_f64(self, rhs: f64) -> Self {
-        let (s1, s2) = ks_two_sum(self.hi, rhs);
-        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
-        Self { hi, lo }
-    }
-
-    fn sub(self, rhs: Self) -> Self {
-        self.add(rhs.neg())
-    }
-
-    fn sub_f64(self, rhs: f64) -> Self {
-        let (s1, s2) = ks_two_sum(self.hi, -rhs);
-        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
-        Self { hi, lo }
-    }
-
-    /// `lhs - self` for a plain `lhs`.
-    fn sub_from_f64(self, lhs: f64) -> Self {
-        let (s1, s2) = ks_two_sum(lhs, -self.hi);
-        let (hi, lo) = ks_quick_two_sum(s1, s2 - self.lo);
-        Self { hi, lo }
-    }
-
-    fn mul(self, rhs: Self) -> Self {
-        let (p1, p2) = ks_two_prod(self.hi, rhs.hi);
-        let (hi, lo) = ks_quick_two_sum(p1, p2 + (self.hi * rhs.lo + self.lo * rhs.hi));
-        Self { hi, lo }
-    }
-
-    fn mul_f64(self, rhs: f64) -> Self {
-        let (p1, e1) = ks_two_prod(self.hi, rhs);
-        let (p2, e2) = ks_two_prod(self.lo, rhs);
-        let (hi, lo) = ks_quick_two_sum(p1, e2 + p2 + e1);
-        Self { hi, lo }
-    }
-
-    fn div(self, rhs: Self) -> Self {
-        let q1 = self.hi / rhs.hi;
-        let r = self.sub(rhs.mul_f64(q1));
-        let q2 = r.hi / rhs.hi;
-        let r = r.sub(rhs.mul_f64(q2));
-        let q3 = r.hi / rhs.hi;
-        let (hi, lo) = ks_quick_two_sum(q1, q2);
-        Self { hi, lo }.add_f64(q3)
-    }
-
-    fn div_f64(self, rhs: f64) -> Self {
-        self.div(Self::new(rhs))
-    }
-
-    /// `lhs / self` for a plain `lhs`.
-    fn div_into_f64(self, lhs: f64) -> Self {
-        Self::new(lhs).div(self)
-    }
-
-    fn floor(self) -> Self {
-        let hi = self.hi.floor();
-        if hi == self.hi {
-            // The high word is an integer already: round the low word.
-            let (hi, lo) = ks_quick_two_sum(hi, self.lo.floor());
-            return Self { hi, lo };
-        }
-        Self { hi, lo: 0.0 }
-    }
-
-    fn ldexp(self, exp: i32) -> Self {
-        Self {
-            hi: ks_ldexp(self.hi, exp),
-            lo: ks_ldexp(self.lo, exp),
-        }
-    }
-
-    fn frexp(self) -> (Self, i32) {
-        let (mut man, mut exponent) = ks_frexp(self.hi);
-        let mut b1 = ks_ldexp(self.lo, -exponent);
-        if man.abs() == 0.5 && man * b1 < 0.0 {
-            man *= 2.0;
-            b1 *= 2.0;
-            exponent -= 1;
-        }
-        (Self { hi: man, lo: b1 }, exponent)
-    }
-}
-
-/// a^m (xsf `pow_D`): `pow` of the high word, corrected to first order in lo/hi.
-fn ks_pow_dd(a: KsDd, m: i64) -> KsDd {
-    if m <= 0 {
-        if m == 0 {
-            return KsDd::new(1.0);
-        }
-        return ks_pow_dd(a, -m).div_into_f64(1.0);
-    }
-    if a.is_zero() {
-        return KsDd::new(0.0);
-    }
-    let mf = m as f64;
-    let ans = a.hi.powf(mf);
-    let r = a.lo / a.hi;
-    let mut adj = mf * r;
-    if adj.abs() > 1e-8 {
-        if adj.abs() < 1e-4 {
-            // First two Taylor terms of (1 + r)^m.
-            adj += (mf * r) * ((m - 1) as f64 / 2.0 * r);
-        } else {
-            adj = (mf * r.ln_1p()).exp_m1();
-        }
-    }
-    KsDd::new(ans).add_f64(ans * adj)
-}
-
-/// ((a + b) / (c + d))^m (xsf `pow4_D`).
-fn ks_pow4_dd(a: f64, b: f64, c: f64, d: f64, m: i64) -> KsDd {
-    if m <= 0 {
-        if m == 0 {
-            return KsDd::new(1.0);
-        }
-        return ks_pow4_dd(c, d, a, b, -m);
-    }
-    let num = KsDd::new(a).add_f64(b);
-    let den = KsDd::new(c).add_f64(d);
-    if num.is_zero() {
-        return if den.is_zero() {
-            KsDd::new(f64::NAN)
-        } else {
-            KsDd::new(0.0)
-        };
-    }
-    if den.is_zero() {
-        let negative = num.hi < 0.0 || (num.hi == 0.0 && num.lo < 0.0);
-        return KsDd::new(if negative {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        });
-    }
-    ks_pow_dd(num.div(den), m)
-}
-
-/// xsf `nextPowerOf2` (which, despite the name, rounds `x` up by one ulp-ish step).
-fn ks_next_power_of_2(x: f64) -> f64 {
-    let q = ks_ldexp(x, 1 - 53);
-    let l = (q + x).abs();
-    if l == 0.0 {
-        return x.abs();
-    }
-    let lint = l as i32;
-    if f64::from(lint) == l {
-        f64::from(lint)
-    } else {
-        l
-    }
-}
-
-/// a^m as (significand, binary exponent) so it cannot underflow (xsf `pow2Scaled_D`).
-fn ks_pow2_scaled_dd(a: KsDd, m: i64) -> (KsDd, i64) {
-    const SM_MAX_EXPONENT: i64 = 960;
-    if m <= 0 {
-        if m == 0 {
-            return (KsDd::new(1.0), 0);
-        }
-        let (ans, e1) = ks_pow2_scaled_dd(a, -m);
-        let (ans, e2) = ans.div_into_f64(1.0).frexp();
-        return (ans, -e1 + i64::from(e2));
-    }
-    let (y, ye) = a.frexp();
-    let ye = i64::from(ye);
-    if m == 1 {
-        return (y, ye);
-    }
-    let mf = m as f64;
-    let mut max_expt = SM_MAX_EXPONENT;
-    // y^max_expt must stay >= 2^-960; check cheaply before calling log().
-    if mf * (y.hi - 1.0) / y.hi < -(SM_MAX_EXPONENT as f64) * std::f64::consts::LN_2 {
-        let lg2y = y.hi.ln() / std::f64::consts::LN_2;
-        let lg_ans = mf * lg2y;
-        if lg_ans <= -(SM_MAX_EXPONENT as f64) {
-            max_expt = (ks_next_power_of_2(-(SM_MAX_EXPONENT as f64) / lg2y + 1.0) / 2.0) as i64;
-        }
-    }
-    if m <= max_expt {
-        let (ans, ans_e) = ks_pow_dd(y, m).frexp();
-        return (ans, i64::from(ans_e) + m * ye);
-    }
-    // y^m = (y^max_expt)^q · y^r
-    let q = m / max_expt;
-    let r = m % max_expt;
-    let (y2r, y2r_e) = ks_pow2_scaled_dd(y, r);
-    let (y2m, y2m_e) = ks_pow2_scaled_dd(y, max_expt);
-    let (y2mq, y2mq_e) = ks_pow2_scaled_dd(y2m, q);
-    let (ans, ans_e) = y2r.mul(y2mq).frexp();
-    (
-        ans,
-        i64::from(ans_e) + (y2mq_e + y2m_e * q) + y2r_e + m * ye,
-    )
-}
-
-/// C(n, j) stored as (significand, exponent), advanced to C(n, j + 1) (xsf `updateBinomial`).
-fn ks_update_binomial(cman: &mut KsDd, cexpt: &mut i64, n: i64, j: i64) {
-    let rat = KsDd::new((n - j) as f64).div_f64(j as f64 + 1.0);
-    let (man, expt) = cman.mul(rat).frexp();
-    *cexpt += i64::from(expt);
-    *cman = man;
-}
-
-/// A_v(n, x) = C(n, v) (1 - x - v/n)^(n-v) (x + v/n)^(v-1) (xsf `computeAv`).
-fn ks_smirnov_term(n: i64, x: f64, v: i64, cman: KsDd, cexpt: i64) -> KsDd {
-    let t2x = KsDd::new((n - v) as f64).div_f64(n as f64).sub_f64(x);
-    let (t2, t2e) = ks_pow2_scaled_dd(t2x, n - v);
-    let t1x = KsDd::new(v as f64).div_f64(n as f64).add_f64(x);
-    let (t1, t1e) = ks_pow2_scaled_dd(t1x, v - 1);
-    let expt = cexpt + t1e + t2e;
-    // Beyond ±2^31 the value is 0 or inf either way; clamp so the i32 ldexp cannot wrap.
-    t1.mul(t2)
-        .mul(cman)
-        .ldexp(expt.clamp(-(1 << 30), 1 << 30) as i32)
-}
-
-/// (sf, cdf, pdf) of the one-sided statistic D_n^+: `scipy.special.smirnov`, `smirnovc` and
-/// `-smirnovp`, ported from xsf `cephes::detail::_smirnov` (Birnbaum–Tingey sum in
-/// double-double; van Mulbregt 2018). `n` is 64-bit here where xsf has a C `int`; the two
-/// agree for every `n <= i32::MAX`.
-fn ks_smirnov3(n: usize, x: f64) -> (f64, f64, f64) {
-    const SMIRNOV_MAX_COMPUTE_N: i64 = 1_000_000;
-    const SM_UPPER_MAX_TERMS: i64 = 3;
-    const SM_UPPERSUM_MIN_N: i64 = 10;
-    // log(2^-1075): exp() of anything below returns 0 (xsf `MINLOG`).
-    #[allow(clippy::excessive_precision)]
-    const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
-    let n = n as i64;
-    if !(n > 0 && (0.0..=1.0).contains(&x)) {
-        return (f64::NAN, f64::NAN, f64::NAN);
-    }
-    let nf = n as f64;
-    if n == 1 {
-        return (1.0 - x, x, 1.0);
-    }
-    if x == 0.0 {
-        return (1.0, 0.0, 1.0);
-    }
-    if x == 1.0 {
-        return (0.0, 1.0, 0.0);
-    }
-    // floor(n x) and its remainder, exactly (xsf `modNX`).
-    let nx_dd = KsDd::new(x).mul_f64(nf);
-    let nx_floor = nx_dd.floor();
-    let mut alpha = nx_dd.sub(nx_floor).hi;
-    let mut nxfl = nx_floor.hi as i64;
-    if alpha == 1.0 {
-        nxfl += 1;
-        alpha = 0.0;
-    }
-    let nx = nx_dd.hi;
-    let mut n1mxfl = n - nxfl - i64::from(alpha != 0.0);
-    let mut n1mxceil = n - nxfl;
-    // With alpha == 0 the last term belongs to neither sum.
-    if alpha == 0.0 {
-        n1mxfl -= 1;
-        n1mxceil += 1;
-    }
-    // x <= 1/n
-    if nxfl == 0 || (nxfl == 1 && alpha == 0.0) {
-        let t = ks_pow_dd(KsDd::new(1.0).add_f64(x), n - 1).hi;
-        let mut pdf = (nx + 1.0) * t / (1.0 + x);
-        let cdf = x * t;
-        if nxfl == 1 {
-            pdf -= 0.5;
-        }
-        return (1.0 - cdf, cdf, pdf);
-    }
-    // sf underflows.
-    if -2.0 * nf * x * x < MINLOG {
-        return (0.0, 1.0, 0.0);
-    }
-    // x >= 1 - 1/n
-    if nxfl >= n - 1 {
-        let sf = ks_pow_dd(KsDd::new(1.0).add_f64(-x), n).hi;
-        return (sf, 1.0 - sf, nf * sf / (1.0 - x));
-    }
-    // n too large to sum: p ~ exp(-(6nx + 1)^2 / 18n).
-    if n > SMIRNOV_MAX_COMPUTE_N {
-        let logp = -(6.0 * nf * x + 1.0).powi(2) / 18.0 / nf;
-        let (sf, cdf) = if logp < -std::f64::consts::LN_2 {
-            let sf = logp.exp();
-            (sf, 1.0 - sf)
-        } else {
-            let cdf = -logp.exp_m1();
-            (1.0 - cdf, cdf)
-        };
-        return (sf, cdf, (6.0 * nf * x + 1.0) * 2.0 * sf / 3.0);
-    }
-    // The upper sum alternates in sign; use it only when it has very few terms.
-    let n_upper_terms = n - n1mxceil + 1;
-    let use_upper = (n_upper_terms <= 1 && x < 0.5)
-        || (n >= SM_UPPERSUM_MIN_N && n_upper_terms <= SM_UPPER_MAX_TERMS && x <= 0.5 / nf.sqrt());
-    let vmid = n / 2;
-    let one_over_x = KsDd::new(1.0).div_f64(x);
-    let (start, step, n_terms, mut aj, first_coeff) = if use_upper {
-        let aj = ks_pow4_dd(1.0, x, 1.0, 0.0, n - 1);
-        let coeff = KsDd::new(1.0).add_f64(x).div_into_f64((n - 1) as f64);
-        (n, -1, n - n1mxceil + 1, aj, coeff.add(one_over_x))
-    } else {
-        let aj = ks_pow4_dd(1.0, -x, 1.0, 0.0, n).div_f64(x);
-        let coeff = KsDd::new((n - 1) as f64)
-            .mul_f64(x)
-            .sub_from_f64(-1.0)
-            .div(KsDd::new(1.0).sub_f64(x))
-            .div_f64(x);
-        (0, 1, n1mxfl + 1, aj, coeff.add(one_over_x))
-    };
-    let mut aj_sum = KsDd::new(0.0).add(aj);
-    let mut daj_sum = KsDd::new(0.0).add(aj.mul(first_coeff));
-    let mut cman = KsDd::new(1.0);
-    let mut cexpt = 0_i64;
-    ks_update_binomial(&mut cman, &mut cexpt, n, 0);
-    let mut j = 1_i64;
-    while j < n_terms {
-        let v = start + j * step;
-        aj = ks_smirnov_term(n, x, v, cman, cexpt);
-        if aj.hi.is_finite() && !aj.is_zero() {
-            // d/dx log A_v = 1/x + (v-1)/(x+v/n) - (n-v)/(1-x-v/n)
-            let coeff = KsDd::new((nxfl + v) as f64)
-                .add_f64(alpha)
-                .div_into_f64(nf * (v - 1) as f64)
-                .sub(
-                    KsDd::new((n - nxfl - v) as f64)
-                        .sub_f64(alpha)
-                        .div_into_f64((n - v) as f64 * nf),
-                )
-                .add(one_over_x);
-            aj_sum = aj_sum.add(aj);
-            daj_sum = daj_sum.add(aj.mul(coeff));
-        }
-        if !aj.is_zero() {
-            if (4 * (n_terms - j)) as f64 * aj.hi.abs() < f64::EPSILON * aj_sum.hi
-                && j != n_terms - 1
-            {
-                break;
-            }
-        } else if j > vmid {
-            break;
-        }
-        ks_update_binomial(&mut cman, &mut cexpt, n, j);
-        j += 1;
-    }
-    let deriv = daj_sum.mul_f64(x).hi;
-    let prob = aj_sum.mul_f64(x).hi;
-    let (sf, cdf, pdf) = if step < 0 {
-        (1.0 - prob, prob, deriv)
-    } else {
-        (prob, 1.0 - prob, -deriv)
-    };
-    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(pdf))
-}
+// ── xsf `cephes/kolmogorov.h` and SciPy `brentq.c`, the pieces that `scipy.stats.kstwo`
+// calls through `scipy.special` / `scipy.optimize`. frankenscipy-1ksfv.16 (The one-sided
+// `_smirnov` is fsci_special::smirnov_sf_cdf_pdf, frankenscipy-k4c2c.)
 
 /// SciPy's `brentq` (`scipy/optimize/Zeros/brentq.c`, C. Harris), step for step. Returns NaN
 /// where SciPy raises: no sign change on the bracket, a NaN function value, or no
@@ -78980,8 +78554,8 @@ mod tests {
 
     /// SciPy 1.17.1 `ks_1samp` always takes the exact law: `pvalue = kstwo.sf(D, n)` for every
     /// n (`if mode == 'auto': mode = 'exact'`). Before frankenscipy-1ksfv.16 fsci used the
-    /// asymptotic Kolmogorov series above n = 10000 and `fsci_special::smirnov`, which is
-    /// exp(-2 n d²) from n = 1000 on. Data x_i = (i + 1/2)/n + shift against the uniform CDF;
+    /// asymptotic Kolmogorov series above n = 10000 and `fsci_special::smirnov`, which was
+    /// then exp(-2 n d²) from n = 1000 on. Data x_i = (i + 1/2)/n + shift against the uniform CDF;
     /// statistic and p-value from `scipy.stats.ks_1samp(x, uniform.cdf)`, measured
     /// bit-identical. The old code gave 0.0013236624257262728 and 0.006152616450366392.
     #[test]

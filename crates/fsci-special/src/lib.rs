@@ -305,6 +305,7 @@ pub use convenience::{
     sindg,
     sinpi,
     smirnov,
+    smirnov_sf_cdf_pdf,
     smirnovi,
     softmax,
     softplus,
