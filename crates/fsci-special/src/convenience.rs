@@ -25,6 +25,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, record_special_trace,
 };
+use crate::{par_map_indices, par_map_indices_with_threads, par_map_light, par_map_moderate};
 
 pub const CONVENIENCE_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
@@ -3029,52 +3030,6 @@ fn comb_f64(n: u64, k: u64) -> f64 {
 // Helpers
 // ══════════════════════════════════════════════════════════════════════
 
-/// Evaluate `f(0..n)` into a `Vec<f64>`, parallel over index chunks for large `n`.
-/// Convenience-module kernels (ndtr/ndtri normal CDF/quantile, spence, kolmogorov, the ML
-/// activations, ...) are non-trivial per element and each index writes its own slot, so
-/// chunking across cores and concatenating in index order is bit-identical to
-/// `(0..n).map(f).collect()` — including returning the first failing index's error in order.
-fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("convenience array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
 /// Above this length the cheap-but-COMPUTE-BOUND convenience kernels (e.g. `expit`'s
 /// `exp`+reciprocal, ~8 ns/call) parallelize via [`par_map_light`]. The earlier
 /// blanket-serial rule blamed "~40 ns/element of overhead", but that was the loose
@@ -3083,99 +3038,6 @@ where
 /// from a ~1.8x cephes loss to a win from ~128k up. Memory-bound kernels see no
 /// benefit, so only the compute-bound ones (expit/logit/…) are routed here.
 const LIGHT_KERNEL_PAR_MIN: usize = 1 << 18;
-
-/// Work-capped parallel map for cheap compute-bound kernels — caps workers at
-/// `min(cores, n/32768)` so each owns enough elements to amortize the OS-thread
-/// spawn (the loose `n/128` cap of [`par_map_indices`] over-subscribes them).
-/// Order-preserving → byte-identical to the serial map.
-fn par_map_light<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 32768)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("convenience light worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
-/// Work-capped parallel map for MODERATE real kernels (~50-300 ns/elt:
-/// erfcx/dawsn/erfi/spence/wrightomega). Caps workers at `min(cores, n/8192)` —
-/// fewer elements/worker than [`par_map_light`] (these kernels are heavier so a
-/// smaller chunk still amortizes the spawn) but far fewer threads than the loose
-/// `n/128` of [`par_map_indices`], which over-subscribes ~64 OS threads onto a
-/// sub-µs kernel and leaves a flat ~3 ms spawn floor (measured on `dawsn`:
-/// constant ~2.8-3.3 ms across n=50k-500k). Order-preserving → byte-identical.
-fn par_map_moderate<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 8192)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("convenience moderate worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
 
 /// Like [`map_real`] but parallelizes a real array of length ≥ [`LIGHT_KERNEL_PAR_MIN`]
 /// through the work-capped [`par_map_light`]. For COMPUTE-bound cheap kernels only.
@@ -3259,10 +3121,7 @@ where
             if parallel {
                 par_map_indices(values.len(), |i| kernel(values[i])).map(SpecialTensor::RealVec)
             } else {
-                values
-                    .iter()
-                    .map(|&x| kernel(x))
-                    .collect::<Result<Vec<_>, _>>()
+                par_map_indices_with_threads(values.len(), 1, |i| kernel(values[i]))
                     .map(SpecialTensor::RealVec)
             }
         }
@@ -3308,7 +3167,7 @@ where
         // Order-preserving ⇒ byte-identical either way. The COMPLEX kernels are much
         // heavier (Faddeeva/series), so their break-even is tiny — left eager.
         SpecialTensor::RealVec(values) => {
-            par_map_indices_gated(values.len(), real_par_min, |i| real_kernel(values[i]))
+            par_map_moderate_gated(values.len(), real_par_min, |i| real_kernel(values[i]))
                 .map(SpecialTensor::RealVec)
         }
         SpecialTensor::ComplexScalar(value) => {
@@ -3338,30 +3197,23 @@ where
     }
 }
 
-/// `par_map_indices` with a work-gate: stay serial (no thread spawn, no per-chunk
-/// Vec alloc/concat) until the array is large enough to amortise par_map_indices'
-/// overhead. The established break-even for this helper is ~1<<20 even for ~25-30ns
+/// [`par_map_moderate`] with a work-gate: serial (no thread spawn) until the array is large
+/// enough to amortise the fan-out. The established break-even is ~1<<20 even for ~25-30ns
 /// kernels (see GAMMA_FAMILY_PAR_MIN and the error.rs erf/erfc gate). Order-preserving
 /// ⇒ byte-identical to the ungated call either way.
-fn par_map_indices_gated<T, H>(n: usize, real_par_min: usize, f: H) -> Result<Vec<T>, SpecialError>
+fn par_map_moderate_gated<T, H>(n: usize, real_par_min: usize, f: H) -> Result<Vec<T>, SpecialError>
 where
-    T: Send,
+    T: Send + Default + Clone,
     H: Fn(usize) -> Result<T, SpecialError> + Sync,
 {
     if n >= real_par_min {
         par_map_moderate(n, f)
     } else {
-        // Preallocated and filled in place, not `(0..n).map(f).collect()`: collecting
-        // `Result`s goes through a shunt whose size hint is 0, so the Vec regrew as it went.
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(f(i)?);
-        }
-        Ok(out)
+        par_map_indices_with_threads(n, 1, f)
     }
 }
 
-/// Eager binary dispatch (real-array path always through `par_map_indices`). For
+/// Eager binary dispatch (real-array path always through `par_map_moderate`). For
 /// EXPENSIVE kernels (gammaincinv/gammainccinv/owens_t/stirling2 — µs-scale per call)
 /// where parallelism amortises well below 1<<20.
 fn map_real_binary_eager<F>(
@@ -3411,12 +3263,12 @@ where
         }
         (SpecialTensor::RealVec(left), SpecialTensor::RealScalar(right)) => {
             let right = *right;
-            par_map_indices_gated(left.len(), real_par_min, |i| kernel(left[i], right))
+            par_map_moderate_gated(left.len(), real_par_min, |i| kernel(left[i], right))
                 .map(SpecialTensor::RealVec)
         }
         (SpecialTensor::RealScalar(left), SpecialTensor::RealVec(right)) => {
             let left = *left;
-            par_map_indices_gated(right.len(), real_par_min, |i| kernel(left, right[i]))
+            par_map_moderate_gated(right.len(), real_par_min, |i| kernel(left, right[i]))
                 .map(SpecialTensor::RealVec)
         }
         (SpecialTensor::RealVec(left), SpecialTensor::RealVec(right)) => {
@@ -3437,7 +3289,7 @@ where
                     detail: "vector inputs must have matching lengths",
                 });
             }
-            par_map_indices_gated(left.len(), real_par_min, |i| kernel(left[i], right[i]))
+            par_map_moderate_gated(left.len(), real_par_min, |i| kernel(left[i], right[i]))
                 .map(SpecialTensor::RealVec)
         }
         _ => {
@@ -6647,7 +6499,7 @@ fn voigt_gaussian(x: f64, sigma: f64) -> f64 {
 /// it across cores is a clean win. `out[i]` is bit-identical to `voigt_profile(xs[i], sigma, gamma)`;
 /// parallel above 1<<14 points (the wofz kernel amortises the spawn floor well below that for huge arrays).
 pub fn voigt_profile_many(xs: &[f64], sigma: f64, gamma: f64) -> Vec<f64> {
-    par_map_indices_gated(xs.len(), 1 << 14, |i| {
+    par_map_moderate_gated(xs.len(), 1 << 14, |i| {
         Ok(voigt_profile(xs[i], sigma, gamma))
     })
     .expect("voigt_profile is infallible")

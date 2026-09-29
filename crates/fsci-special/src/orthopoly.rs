@@ -1127,15 +1127,7 @@ pub fn mathieu_series_many(m: u32, q: f64, xs: &[f64], even: bool) -> Vec<(f64, 
     }
     let (a, k0) = mathieu_periodic_fourier(m, q, even);
     let npts = xs.len();
-    let nthreads = if npts < 512 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(npts / 256)
-            .max(1)
-    };
+    let nthreads = crate::par_workers(npts, 256);
     if nthreads <= 1 {
         return xs
             .iter()
@@ -1587,15 +1579,7 @@ pub fn spheroidal_ang1_many(m: u32, n: u32, c: f64, xs: &[f64], prolate: bool) -
     // fan the points across threads once the batch amortises the spawn. Serial gate
     // avoids the availability syscall for small batches. Order-preserving ⇒
     // bit-identical to the serial map.
-    let nthreads = if npts < 512 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(npts / 256)
-            .max(1)
-    };
+    let nthreads = crate::par_workers(npts, 256);
     if nthreads <= 1 {
         return xs
             .iter()

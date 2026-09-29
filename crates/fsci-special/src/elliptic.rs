@@ -19,6 +19,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, record_special_trace,
 };
+use crate::{par_map_indices, par_map_indices_gated};
 
 pub const ELLIPTIC_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
@@ -1317,52 +1318,6 @@ fn expi_complex_asymptotic(z: Complex64) -> Result<Complex64, SpecialError> {
 // Helpers
 // ══════════════════════════════════════════════════════════════════════
 
-/// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
-/// Elliptic-integral kernels (AGM / Carlson symmetric forms) are non-trivial per element
-/// and each index writes its own slot, so chunking across cores and concatenating in index
-/// order is bit-identical to `(0..n).map(f).collect()` — including returning the first
-/// failing index's error in index order. Generic over the output type (f64 or Complex64).
-fn par_map_indices<T, G>(n: usize, f: G) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    G: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("elliptic array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
 /// Default per-element threshold below which the REAL arm runs serially. Cheap real kernels
 /// (O(1) polynomial/rational, e.g. ellipk/ellipe Cephes) are slower under par_map_indices than
 /// serial at any practical length (thread overhead >> ~14ns/call); callers pass `usize::MAX` to
@@ -1401,16 +1356,8 @@ where
     match input {
         SpecialTensor::RealScalar(x) => real_kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
-            if values.len() < real_par_min {
-                values
-                    .iter()
-                    .map(|&x| real_kernel(x))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
-            } else {
-                par_map_indices(values.len(), |i| real_kernel(values[i]))
-                    .map(SpecialTensor::RealVec)
-            }
+            par_map_indices_gated(values.len(), real_par_min, |i| real_kernel(values[i]))
+                .map(SpecialTensor::RealVec)
         }
         SpecialTensor::ComplexScalar(value) => {
             complex_kernel(*value).map(SpecialTensor::ComplexScalar)
@@ -1436,21 +1383,6 @@ where
                 detail: "empty tensor is not a valid special-function input",
             })
         }
-    }
-}
-
-/// Order-preserving work-gate for the binary real path (ellipkinc/ellipeinc Carlson,
-/// moderate ~150-300ns/elt). The raw n/32 par_map_indices gate over-subscribes ~16
-/// threads onto a sub-µs kernel (2-4x slower at n<=16k; BlackThrush A/B 2026-06-22).
-fn par_map_indices_gated<T, H>(n: usize, real_par_min: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    if n >= real_par_min {
-        par_map_indices(n, f)
-    } else {
-        (0..n).map(f).collect()
     }
 }
 

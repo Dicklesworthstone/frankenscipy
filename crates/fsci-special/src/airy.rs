@@ -8,6 +8,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, record_special_trace,
 };
+use crate::{par_map_indices, par_map_indices_gated};
 
 pub const AIRY_DISPATCH_PLAN: &[DispatchPlan] = &[DispatchPlan {
     function: "airy",
@@ -44,7 +45,7 @@ pub const AIRYE_DISPATCH_PLAN: &[DispatchPlan] = &[DispatchPlan {
 }];
 
 /// Result of the Airy function evaluation: (Ai, Ai', Bi, Bi').
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AiryResult {
     pub ai: f64,
     pub aip: f64,
@@ -116,7 +117,9 @@ pub fn airy(x: &SpecialTensor, mode: RuntimeMode) -> Result<Vec<SpecialTensor>, 
             // AIRY_REAL_PAR_MIN) then unzip the four outputs in element order. par_map_indices
             // preserves order and returns the first failing index's error, so the result is
             // bit-identical to the sequential push loop.
-            let results = par_map_indices_gated(values.len(), |i| airy_scalar(values[i], mode))?;
+            let results = par_map_indices_gated(values.len(), AIRY_REAL_PAR_MIN, |i| {
+                airy_scalar(values[i], mode)
+            })?;
             let mut ai_vec = Vec::with_capacity(results.len());
             let mut aip_vec = Vec::with_capacity(results.len());
             let mut bi_vec = Vec::with_capacity(results.len());
@@ -190,7 +193,9 @@ pub fn airye(x: &SpecialTensor, mode: RuntimeMode) -> Result<Vec<SpecialTensor>,
             let mut aip_vec = Vec::with_capacity(values.len());
             let mut bi_vec = Vec::with_capacity(values.len());
             let mut bip_vec = Vec::with_capacity(values.len());
-            let results = par_map_indices_gated(values.len(), |i| airye_scalar(values[i], mode))?;
+            let results = par_map_indices_gated(values.len(), AIRY_REAL_PAR_MIN, |i| {
+                airye_scalar(values[i], mode)
+            })?;
             for result in &results {
                 ai_vec.push(result.ai);
                 aip_vec.push(result.aip);
@@ -878,70 +883,11 @@ fn oscillatory_coefficients(zeta: f64) -> (f64, f64, f64, f64) {
     (l, m, n, o)
 }
 
-/// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
-/// Airy kernels (`airy_scalar` / `airy_complex_scalar`, Bessel-form across the complex
-/// plane) are expensive per element and each index writes its own slot, so chunking across
-/// cores and concatenating in index order is bit-identical to `(0..n).map(f).collect()` —
-/// including returning the first failing index's error in index order. Generic over the
-/// output type (f64 or Complex64).
-fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("airy array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
 /// Airy real kernels (airy/airye, ~50ns/elt: Ai/Aip/Bi/Bip via series/asymptotic)
 /// over-subscribe the raw n/32 par_map_indices gate (~16 threads onto a sub-µs
 /// kernel), measured 4-9x SLOWER than serial at n<=16k (BlackThrush A/B 2026-06-22;
 /// break-even ~68k). Stay serial below the gate. Order-preserving => bit-identical.
 const AIRY_REAL_PAR_MIN: usize = 1 << 17; // airy 1.05x@65536→win@131072; airye wins 0.89x@65536
-
-fn par_map_indices_gated<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    H: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    if n >= AIRY_REAL_PAR_MIN {
-        par_map_indices(n, f)
-    } else {
-        (0..n).map(f).collect()
-    }
-}
 
 fn map_airy_component<F, G>(
     function: &'static str,

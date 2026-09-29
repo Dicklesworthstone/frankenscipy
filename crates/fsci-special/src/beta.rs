@@ -7,6 +7,7 @@ use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
     SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
 };
+use crate::{par_map_indices, par_map_indices_gated};
 
 pub const BETA_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
@@ -3787,69 +3788,11 @@ where
     lo + (hi - lo) * 0.5
 }
 
-/// Evaluate `f(0..n)` into a `Vec`, parallel over index chunks for large `n`.
-/// Beta-family kernels (incomplete-beta continued fractions) are expensive per element
-/// and each index writes its own slot, so chunking across cores and concatenating in
-/// index order is bit-identical to `(0..n).map(f).collect()` — including returning the
-/// first failing index's error in index order. Used by the array arms below.
-fn par_map_indices<T, G>(n: usize, f: G) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    G: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    let nthreads = if n < 256 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n / 128)
-            .max(1)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("beta array worker panicked"))
-            .collect()
-    });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
 /// beta/betaln are moderate ~lgamma-cost kernels; their par_map_indices break-even
 /// is ~45-60k (BlackThrush A/B 2026-06-22), far above the raw n/32 gate that
 /// over-subscribes ~16 threads onto a sub-microsecond kernel (2.6-6.5x slower at n<=16k).
 /// Stay serial below the shared gate. Order-preserving => byte-identical either way.
 const BETA_REAL_PAR_MIN: usize = 1 << 16; // beta wins 0.91x@49152, betaln 0.91x@65536
-
-fn par_map_indices_gated<T, G>(n: usize, f: G) -> Result<Vec<T>, SpecialError>
-where
-    T: Send,
-    G: Fn(usize) -> Result<T, SpecialError> + Sync,
-{
-    if n >= BETA_REAL_PAR_MIN {
-        par_map_indices(n, f)
-    } else {
-        (0..n).map(f).collect()
-    }
-}
 
 fn map_real_binary<F>(
     function: &'static str,
@@ -3867,11 +3810,13 @@ where
         }
         (SpecialTensor::RealVec(lhs), SpecialTensor::RealScalar(rhs)) => {
             let rhs = *rhs;
-            par_map_indices_gated(lhs.len(), |i| kernel(lhs[i], rhs)).map(SpecialTensor::RealVec)
+            par_map_indices_gated(lhs.len(), BETA_REAL_PAR_MIN, |i| kernel(lhs[i], rhs))
+                .map(SpecialTensor::RealVec)
         }
         (SpecialTensor::RealScalar(lhs), SpecialTensor::RealVec(rhs)) => {
             let lhs = *lhs;
-            par_map_indices_gated(rhs.len(), |i| kernel(lhs, rhs[i])).map(SpecialTensor::RealVec)
+            par_map_indices_gated(rhs.len(), BETA_REAL_PAR_MIN, |i| kernel(lhs, rhs[i]))
+                .map(SpecialTensor::RealVec)
         }
         (SpecialTensor::RealVec(lhs), SpecialTensor::RealVec(rhs)) => {
             if lhs.len() != rhs.len() {
@@ -3891,7 +3836,8 @@ where
                     detail: "vector inputs must have matching lengths",
                 });
             }
-            par_map_indices_gated(lhs.len(), |i| kernel(lhs[i], rhs[i])).map(SpecialTensor::RealVec)
+            par_map_indices_gated(lhs.len(), BETA_REAL_PAR_MIN, |i| kernel(lhs[i], rhs[i]))
+                .map(SpecialTensor::RealVec)
         }
         (SpecialTensor::ComplexScalar(_), _)
         | (SpecialTensor::ComplexVec(_), _)
