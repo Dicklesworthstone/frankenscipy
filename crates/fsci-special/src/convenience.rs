@@ -494,7 +494,7 @@ fn ndtri_kernel<const UNROLL: bool>(y: f64) -> f64 {
 
     let x = {
         let z = (-2.0 * p.ln()).sqrt();
-        let z0 = z - z.ln() / z;
+        let z0 = z - ndtri_log_ratio(z);
         let inv_z = 1.0 / z;
         let correction = if z < 8.0 {
             inv_z * ndtri_pe::<_, UNROLL>(inv_z, &CEPHES_NDTRI_P1)
@@ -507,6 +507,16 @@ fn ndtri_kernel<const UNROLL: bool>(y: f64) -> f64 {
     };
 
     if lower_tail { -x } else { x }
+}
+
+/// Cephes ndtri's `log(z) / z`, out of line on purpose (frankenscipy-r28ge).
+///
+/// Inline, LLVM packs this division with the tail's `1.0 / z` into one `vdivpd`. `1 / z` then
+/// waits for the `log` call, and so does the whole rational correction built on it, which could
+/// otherwise run while `log` does. Same arithmetic either way.
+#[inline(never)]
+fn ndtri_log_ratio(z: f64) -> f64 {
+    z.ln() / z
 }
 
 /// Scalar-map baseline for the pre-AVX2 `ndtri` SIMD retry.
