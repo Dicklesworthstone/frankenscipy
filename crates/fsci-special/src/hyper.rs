@@ -953,13 +953,13 @@ pub fn hyp0f1_scalar(b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
     match decision.branch {
         // z < 0 is the oscillatory J-Bessel side at every magnitude: its series alternates, so
         // both branches hand it to the cancellation-controlled route.
-        HypergeometricBranch::DirectSeries | HypergeometricBranch::AsymptoticExpansion
-            if z < 0.0 =>
-        {
-            Ok(hyp0f1_negative(b, z))
+        HypergeometricBranch::DirectSeries | HypergeometricBranch::AsymptoticExpansion => {
+            Ok(if z < 0.0 {
+                hyp0f1_negative(b, z)
+            } else {
+                hyp0f1_series(b, z)
+            })
         }
-        HypergeometricBranch::DirectSeries => Ok(hyp0f1_series(b, z)),
-        HypergeometricBranch::AsymptoticExpansion => Ok(hyp0f1_asymptotic(b, z)),
         HypergeometricBranch::ParameterGuard => {
             guarded_hypergeometric_parameter("hyp0f1", mode, decision.reason)
         }
@@ -974,19 +974,33 @@ pub fn hyp0f1_scalar(b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
     }
 }
 
+/// Term cap for [`hyp0f1_series`]: 471 terms are used at the overflow near z = 1.26e5.
+const HYP0F1_SERIES_MAX_TERMS: usize = 5000;
+
 /// Power series for 0F1(; b; z).
 /// 0F1(; b; z) = Σ_{n=0}^∞ z^n / ((b)_n * n!)
+///
+/// For z ≥ 0 past n = −b every term has one sign, so the sum cannot cancel at any z. It serves
+/// z < 0 only below |z| = 50 through the CASP selector (`hyp0f1_negative` takes the rest). From
+/// z = 50 on, the stopping test also waits for the terms to pass their peak near n = √z.
+///
+/// Large positive z used to take Γ(b) z^((1−b)/2) times ten terms of I_ν's large-argument
+/// expansion, stopped at an absolute 1e-15. With ν = b − 1 of order x = 2√z those terms were
+/// still O(1): hyp0f1(9.59, 55.4) was 5.2e-6 off, where SciPy is 1.4e-14 (frankenscipy-n5ub1).
+/// The worst of 213 points with z in [50, 1e5] and b in [−9.9, 20] is now 1.1e-14 against
+/// mpmath (SciPy 5.5e-14).
 fn hyp0f1_series(b: f64, z: f64) -> f64 {
     let mut sum = 1.0;
     let mut term = 1.0;
+    let peak = if z >= 50.0 { z.sqrt() } else { 0.0 };
 
-    for n in 1..300 {
+    for n in 1..HYP0F1_SERIES_MAX_TERMS {
         let nf = n as f64;
         // term_n = term_{n-1} * z / (n * (b + n - 1))
         term *= z / (nf * (b + nf - 1.0));
         sum += term;
 
-        if term.abs() < 1e-16 * sum.abs() {
+        if term.abs() < 1e-16 * sum.abs() && nf > peak {
             break;
         }
         if !sum.is_finite() {
@@ -1237,6 +1251,18 @@ fn select_hyp0f1_branch(problem: HyperCaspProblem) -> HyperCaspDecision {
             300,
             HYP0F1_DIRECT_CHAIN,
             "moderate real 0F1 argument uses the direct power series",
+        );
+    }
+    if problem.z > 0.0 {
+        // Past n = -b every term of the series has one sign, so it cannot cancel; it peaks
+        // near n = sqrt(z) and needs 471 terms at the overflow near z = 1.26e5
+        // (frankenscipy-n5ub1).
+        return hyper_casp_decision(
+            HypergeometricBranch::DirectSeries,
+            problem,
+            HYP0F1_SERIES_MAX_TERMS,
+            HYP0F1_DIRECT_CHAIN,
+            "large positive real 0F1 argument sums the one-signed power series",
         );
     }
 
@@ -1574,45 +1600,6 @@ fn hyp0f1_series_complex(
     }
 
     Ok(sum)
-}
-
-/// Asymptotic expansion for 0F1(; b; z) for large positive z (z < 0 goes to
-/// `hyp0f1_negative`): 0F1(; b; x²/4) = Γ(b) (x/2)^(1-b) I_{b-1}(x).
-fn hyp0f1_asymptotic(b: f64, z: f64) -> f64 {
-    // Compute gamma(b) via exp(gammaln(b))
-    // Use gammaln_scalar with Strict mode (won't fail for b > 0)
-    let ln_gamma_b = crate::gamma::gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let gamma_b = ln_gamma_b.exp();
-
-    // z = x²/4, so x = 2*sqrt(z)
-    let x = 2.0 * z.sqrt();
-    let nu = b - 1.0;
-
-    // 0F1(; b; z) = Γ(b) * z^((1-b)/2) * I_{b-1}(x)
-    let i_val = bessel_i_asymptotic(nu, x);
-    gamma_b * z.powf((1.0 - b) / 2.0) * i_val
-}
-
-/// Asymptotic approximation for I_nu(x) for large x.
-fn bessel_i_asymptotic(nu: f64, x: f64) -> f64 {
-    // I_nu(x) ~ exp(x) / sqrt(2*pi*x) * (1 - (4*nu²-1)/(8x) + ...)
-    let coeff = (2.0 * std::f64::consts::PI * x).sqrt().recip();
-    let mu = 4.0 * nu * nu;
-
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    let x_inv = 1.0 / x;
-
-    for k in 1..10 {
-        let kf = k as f64;
-        term *= -(mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf) * x_inv;
-        sum += term;
-        if term.abs() < 1e-15 {
-            break;
-        }
-    }
-
-    x.exp() * coeff * sum
 }
 
 /// Gauss hypergeometric function 2F1(a, b; c; z).
@@ -5006,13 +4993,55 @@ mod tests {
     }
 
     #[test]
-    fn hyper_casp_selects_asymptotic_for_large_hyp0f1_argument() {
-        let problem = HyperCaspProblem::hyp0f1(2.0, 75.0, 1.0e-14);
+    fn hyper_casp_selects_asymptotic_for_large_negative_hyp0f1_argument() {
+        let problem = HyperCaspProblem::hyp0f1(2.0, -75.0, 1.0e-14);
         let decision = select_casp_for_test(problem);
 
         assert_eq!(decision.branch, HypergeometricBranch::AsymptoticExpansion);
         assert_eq!(decision.max_terms, 10);
         assert_eq!(decision.fallback_chain, HYP0F1_ASYMPTOTIC_CHAIN);
+    }
+
+    #[test]
+    fn hyper_casp_selects_series_for_large_positive_hyp0f1_argument() {
+        let problem = HyperCaspProblem::hyp0f1(2.0, 75.0, 1.0e-14);
+        let decision = select_casp_for_test(problem);
+
+        assert_eq!(decision.branch, HypergeometricBranch::DirectSeries);
+        assert_eq!(decision.max_terms, HYP0F1_SERIES_MAX_TERMS);
+        assert_eq!(decision.fallback_chain, HYP0F1_DIRECT_CHAIN);
+    }
+
+    /// frankenscipy-n5ub1. For z ≥ 50, 0F1(; b; z) is its one-signed power series. Each pin is
+    /// mpmath's hyp0f1 at 40 digits, rounded once. The ten-term I_ν asymptotic this replaced
+    /// missed the first row by 5.2e-6, and SciPy misses the last three by 6e-15 to 2.5e-14.
+    #[test]
+    fn hyp0f1_large_positive_argument_matches_mpmath() -> Result<(), SpecialError> {
+        #[rustfmt::skip]
+        const PINS: [(f64, f64, f64); 9] = [
+            (9.59440821677535, 55.440961118258954, 119.12593635290669),
+            (2.0, 75.0, 360255.9531733624),
+            (20.0, 50.0, 10.697180100765156),
+            (0.884777345667963, 1213.1046800236074, 1.394434768293365e29),
+            (-2.5, 300.0, -1.2875989417785567e18),
+            (-7.3, 60.0, 582195137.2437112),
+            (4.75, 8000.0, 1.1174323671135915e70),
+            (12.25, 99999.0, 3.716452594823181e252),
+            (1.5, 125000.0, 8.751010155855365e303),
+        ];
+        for (b, z, want) in PINS {
+            let got = hyp0f1_scalar(
+                std::hint::black_box(b),
+                std::hint::black_box(z),
+                RuntimeMode::Strict,
+            )?;
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-15,
+                "hyp0f1({b}, {z}) = {got:e}, mpmath {want:e}, rel {rel:e}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
