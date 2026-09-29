@@ -1938,59 +1938,140 @@ fn carlson_comp_horner<const N: usize>(x: f64, poly: &[f64; N]) -> f64 {
 ///   RF(x, y, z) = (1/2) ∫₀^∞ [(t + x)(t + y)(t + z)]^{-1/2} dt
 /// ```
 ///
-/// Computed via Carlson's duplication algorithm: iterate the
-/// substitution `(x, y, z) → ((x + λ)/4, (y + λ)/4, (z + λ)/4)` with
-/// `λ = √(xy) + √(yz) + √(xz)` until the relative residuals
-/// `1 - x/μ` are small, then apply a 5th-order Taylor correction
-/// around the geometric mean.
+/// SciPy's bits: this is `ellint_carlson::rf` from SciPy 1.17.1's
+/// `ellint_carlson_cpp_lite/_rf.hh` at the ufunc's relative error bound (5e-16). The
+/// arguments are sorted by size and duplicated, with `λ = √x√y + √y√z + √z√x` as a compensated
+/// dot product, until they agree to that bound (up to 1000 steps). Then Carlson's
+/// degree-7 series in E₂, E₃ (DLMF 19.36.1) is summed with the compensated Horner scheme. A
+/// zero smallest argument goes through an AGM instead (`rf0`, DLMF 19.27.3).
 ///
-/// All three arguments must be non-negative, and at most one may be 0.
-/// Returns NaN on negative or NaN inputs and on the all-zero corner.
+/// The kernel this replaced stopped after 32 duplications and fell back to `1/√mean`, and
+/// formed `√(xz)` from the product. With z near 1e257 against x, y near 10 that returned garbage
+/// (relative error 1.0 where SciPy is 2e-16), and `x·z` overflowed near 1e300
+/// (frankenscipy-mo0yq).
 ///
-/// Resolves [frankenscipy-1ww0j].
+/// SciPy's domain: a negative or NaN argument is NaN; any infinite argument is 0; two
+/// arguments that are zero or subnormal are +∞.
 #[must_use]
 pub fn elliprf(x: f64, y: f64, z: f64) -> f64 {
-    if x.is_nan() || y.is_nan() || z.is_nan() {
+    /// SciPy's `constants::RF_C1`, `RF_C2`, `RF_c33` and `RF_DENOM`, lowest degree first.
+    const RF_C1: [f64; 4] = [0.0, -24024.0, 10010.0, -5775.0];
+    const RF_C2: [f64; 3] = [17160.0, -16380.0, 15015.0];
+    const RF_C33: f64 = 6930.0;
+    const RF_DENOM: f64 = 240240.0;
+    // `ph_good` is `x >= 0.0`, which a NaN fails.
+    if !(x >= 0.0 && y >= 0.0 && z >= 0.0) {
         return f64::NAN;
     }
-    if x < 0.0 || y < 0.0 || z < 0.0 {
-        return f64::NAN;
+    if x.is_infinite() || y.is_infinite() || z.is_infinite() {
+        return 0.0;
     }
-    let zero_count = (x == 0.0) as usize + (y == 0.0) as usize + (z == 0.0) as usize;
-    if zero_count >= 2 {
-        // RF diverges when two or more arguments are zero (the integrand
-        // singularity is non-integrable).
-        return f64::INFINITY;
-    }
-
-    // Carlson duplication: shrink the spread between (xn, yn, zn).
-    let mut xn = x;
-    let mut yn = y;
-    let mut zn = z;
-    const TOL: f64 = 2e-3; // Carlson's recommended threshold for
-    // truncating duplication and switching to
-    // the Taylor series.
-    for _ in 0..32 {
-        let mu = (xn + yn + zn) / 3.0;
-        let ex = 1.0 - xn / mu;
-        let ey = 1.0 - yn / mu;
-        let ez = 1.0 - zn / mu;
-        let max_e = ex.abs().max(ey.abs()).max(ez.abs());
-        if max_e < TOL {
-            // 5th-order Taylor correction.
-            let e2 = ex * ey + ey * ez + ex * ez;
-            let e3 = ex * ey * ez;
-            return mu.powf(-0.5)
-                * (1.0 - e2 / 10.0 + e3 / 14.0 + e2 * e2 / 24.0 - 3.0 * e2 * e3 / 44.0);
+    let mut sorted = [x, y, z];
+    sorted.sort_by(f64::total_cmp);
+    let [mut xm, mut ym, mut zm] = sorted;
+    if carlson_too_small(xm) {
+        if carlson_too_small(ym) {
+            return f64::INFINITY;
         }
-        let lambda = (xn * yn).sqrt() + (yn * zn).sqrt() + (xn * zn).sqrt();
-        xn = 0.25 * (xn + lambda);
-        yn = 0.25 * (yn + lambda);
-        zn = 0.25 * (zn + lambda);
+        return carlson_rf0(ym, zm, CARLSON_RERR * 0.5) - (xm / (ym * zm)).sqrt();
     }
-    // Fallback if convergence is slow (shouldn't happen for valid input).
-    let mu = (xn + yn + zn) / 3.0;
-    1.0 / mu.sqrt()
+    let mut am = carlson_sum3(xm, ym, zm) / 3.0;
+    let mut xxm = am - xm;
+    let mut yym = am - ym;
+    let mut fterm = carlson_abs_max3(xxm, yym, am - zm) / (3.0 * CARLSON_RERR).sqrt().sqrt().sqrt();
+    let mut m = 0_u32;
+    loop {
+        let aam = am.abs();
+        if !(aam <= fterm || aam <= carlson_abs_max3(xxm, yym, am - zm)) {
+            break;
+        }
+        if m > CARLSON_MAX_ITER {
+            break;
+        }
+        let (sx, sy, sz) = (xm.sqrt(), ym.sqrt(), zm.sqrt());
+        let lam = carlson_dot3([sx, sy, sz], [sy, sz, sx]);
+        am = (am + lam) * 0.25;
+        xm = (xm + lam) * 0.25;
+        ym = (ym + lam) * 0.25;
+        zm = (zm + lam) * 0.25;
+        xxm *= 0.25;
+        yym *= 0.25;
+        fterm *= 0.25;
+        m += 1;
+    }
+    am = carlson_sum3(xm, ym, zm) / 3.0;
+    xxm /= am;
+    yym /= am;
+    let zzm = -(xxm + yym);
+    let e2 = xxm * yym - zzm * zzm;
+    let e3 = xxm * (yym * zzm);
+    let mut s = carlson_comp_horner(e2, &RF_C1);
+    s += e3 * (carlson_comp_horner(e2, &RF_C2) + e3 * RF_C33);
+    s /= RF_DENOM;
+    s += 1.0;
+    s / am.sqrt()
+}
+
+/// SciPy's `argcheck::too_small`: zero or subnormal.
+fn carlson_too_small(v: f64) -> bool {
+    v == 0.0 || v.is_subnormal()
+}
+
+/// `|std::max({a, b, c}, abscmp)|`: the largest magnitude of the three.
+fn carlson_abs_max3(a: f64, b: f64, c: f64) -> f64 {
+    let mut best = a;
+    for v in [b, c] {
+        if best.abs() < v.abs() {
+            best = v;
+        }
+    }
+    best.abs()
+}
+
+/// Knuth's TwoSum: `x + y` and its exact rounding error (SciPy's `arithmetic::eft_sum`).
+fn carlson_two_sum(x: f64, y: f64) -> (f64, f64) {
+    let s = x + y;
+    let z = s - x;
+    (s, (x - (s - z)) + (y - z))
+}
+
+/// SciPy's `arithmetic::sum2` of three terms: compensated, in order.
+fn carlson_sum3(a: f64, b: f64, c: f64) -> f64 {
+    let (mut p, mut s) = (0.0, 0.0);
+    for v in [a, b, c] {
+        let (t, e) = carlson_two_sum(v, p);
+        p = t;
+        s += e;
+    }
+    p + s
+}
+
+/// SciPy's `arithmetic::dot2` of three pairs: each product's error by FMA, each sum's by TwoSum.
+fn carlson_dot3(x: [f64; 3], y: [f64; 3]) -> f64 {
+    let (mut p, mut s) = (0.0, 0.0);
+    for (a, b) in x.into_iter().zip(y) {
+        let h = a * b;
+        let r = a.mul_add(b, -h);
+        let (t, q) = carlson_two_sum(p, h);
+        p = t;
+        s += q + r;
+    }
+    p + s
+}
+
+/// SciPy's `rf0`: `RF(0, x, y)` by the arithmetic-geometric mean, to `2√rerr`.
+fn carlson_rf0(x: f64, y: f64, rerr: f64) -> f64 {
+    let rsq = 2.0 * rerr.sqrt();
+    let (mut xm, mut ym) = (x.sqrt(), y.sqrt());
+    let mut m = 0_u32;
+    while (xm - ym).abs() >= rsq * xm.abs().min(ym.abs()) {
+        if m > CARLSON_MAX_ITER {
+            break;
+        }
+        (xm, ym) = ((xm + ym) * 0.5, (xm * ym).sqrt());
+        m += 1;
+    }
+    PI / (xm + ym)
 }
 
 /// Carlson symmetric elliptic integral of the second kind, `RD(x, y, z)`.
@@ -3504,6 +3585,66 @@ mod tests {
         // y=0 is outside scipy.special.elliprc's domain → NaN (frankenscipy-rmrmx).
         assert!(elliprc(1.0, 0.0).is_nan());
         assert!(elliprc(0.0, 0.0).is_nan());
+    }
+
+    #[test]
+    fn elliprf_is_scipys_carlson_duplication_bit_for_bit() {
+        // frankenscipy-mo0yq: RF is SciPy 1.17.1's ellint_carlson::rf. A Python emulation of
+        // _rf.hh matched scipy.special.elliprf on 90,008 of 90,008 points. The old kernel
+        // stopped after 32 duplications, so the 1e257 and 1e300 spreads came back as garbage.
+        // The zero and subnormal smallest arguments take the AGM route. The last two points
+        // are ones where an uncompensated dot/sum gives other bits. (x, y, z, SciPy).
+        let cases: [(f64, f64, f64, f64); 15] = [
+            (1.0, 2.0, 3.0, 0.7269459354689082),
+            (0.5, 1.5, 4.0, 0.7763737038752115),
+            (1.0, 1.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0, 1.5707963267948966),
+            (0.0, 2.0, 4.0, 0.9270373386506858),
+            (
+                8.960983117050649,
+                5.910412268763193,
+                7.609714370453767e257,
+                3.3999741139146905e-127,
+            ),
+            (1.0, 2.0, 1e300, 3.458926847232072e-148),
+            (1e300, 1e300, 1e300, 1e-150),
+            (1e-300, 1e-300, 1e-300, 1e150),
+            (5e-324, 1.0, 2.0, 1.3110287771460598),
+            (1e-200, 3.0, 7.0, 0.7256311852272992),
+            (1e-08, 0.0001, 10000.0, 0.10586684426237014),
+            (3.0, 5.0, 7.0, 0.454895415591073),
+            (
+                8.069528945079265,
+                8.09861381839129,
+                5.201723054317205,
+                0.37691120417664714,
+            ),
+            (
+                2.787370884848005,
+                8.808546616015729,
+                0.735722929390691,
+                0.5593580230850238,
+            ),
+        ];
+        for (x, y, z, want) in cases {
+            let got = elliprf(
+                std::hint::black_box(x),
+                std::hint::black_box(y),
+                std::hint::black_box(z),
+            );
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "elliprf({x:?}, {y:?}, {z:?}) = {got:?}, SciPy {want:?}"
+            );
+        }
+        // SciPy's domain edges: two zeros are +inf, an infinite argument 0, a negative one NaN.
+        assert_eq!(elliprf(0.0, 0.0, 1.0), f64::INFINITY);
+        assert_eq!(
+            elliprf(f64::INFINITY, 1.0, 1.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert!(elliprf(-1.0, 1.0, 1.0).is_nan());
     }
 
     #[test]
