@@ -1585,95 +1585,312 @@ fn shichi_series(x: f64) -> (f64, f64) {
 // Struve functions
 // ══════════════════════════════════════════════════════════════════════
 
-/// Struve function H_v(x) for integer order v.
+/// Struve function H_v(x), `scipy.special.struve(v, x)`.
 ///
-/// H_v(x) = (x/2)^{v+1} Σ_{k=0}^∞ (-1)^k (x/2)^{2k} / (Γ(k+3/2) Γ(k+v+3/2))
+/// A port of xsf 0d0a593f `cephes/struve.h`, the code SciPy 1.17.1 compiles. It tries the
+/// large-x asymptotic expansion (DLMF 11.6.1, `Y_v` plus a divergent correction series), the
+/// power series (DLMF 11.2.1, summed in double-double) and the Bessel-function series (DLMF
+/// 11.4.19, a sum of `J_{n+v+1/2}`), each with an estimate of its own rounding and truncation
+/// error, takes the first whose estimate is below 1e-12 of its value, and otherwise the most
+/// accurate of the three if it is within 1e-7. Where the chosen expansion calls no Bessel
+/// function (the power series, which covers most of `x ≲ 0.7v + 12` and the band beyond it
+/// where the asymptotic expansion is not yet accurate) the result is SciPy's bit for bit.
+/// Where it does (`Y_v` in the asymptotic expansion, `J_v` in the Bessel series and at
+/// v = -n - 1/2) it carries the difference between fsci's `J_v`/`Y_v` and SciPy's AMOS ones:
+/// usually a few ulp, but up to ~1.4e-9 relative for 10 ≲ x < 14, where fsci's `J_v` series
+/// loses digits, and a finite value for v ≲ -200 at small x, where AMOS overflows to ±inf.
+/// frankenscipy-00cad
 ///
-/// Appears in electromagnetics and acoustics (e.g., radiation impedance).
+/// The previous version summed the plain power series below x = 18 and the asymptotic
+/// expansion to its smallest term above, which is a truncation error of ~e^{-x} relative to
+/// a value that can be much smaller: struve(0.287, 19.57) was 1.25e-8 relative off.
+///
+/// For x < 0 the function is defined only for integer v, `H_v(-x) = (-1)^{v+1} H_v(x)`; any
+/// other v gives NaN. At x = 0 it is 0 for v > -1, 2/π for v = -1, and below that the sign
+/// of Γ(v + 3/2) times infinity (NaN where v + 3/2 is a negative integer), as in SciPy.
 pub fn struve(v: f64, x: f64) -> f64 {
-    if x.is_nan() || v.is_nan() {
-        return f64::NAN;
-    }
-    if x == 0.0 {
-        // Leading term (x/2)^(v+1) / (Γ(3/2)·Γ(v+3/2)). Resolves
-        // [frankenscipy-udtt9].
-        if v > -1.0 {
-            return 0.0;
-        }
-        if v == -1.0 {
-            // 1 / (Γ(3/2) · Γ(1/2)) = 1 / ((√π/2)·√π) = 2/π
-            return 2.0 / PI;
-        }
-        // v < -1: leading term diverges; sign depends on Γ(v+3/2)
-        // which oscillates at half-integer poles. Return NaN rather
-        // than guessing.
-        return f64::NAN;
-    }
-    if x.abs() > 18.0 && v.abs() < x.abs() / 2.0 {
-        return struve_asymptotic(v, x);
-    }
-    struve_series(v, x)
+    xsf_struve::struve_hl(v, x, true)
 }
 
-/// Modified Struve function L_v(x).
+/// Modified Struve function L_v(x), `scipy.special.modstruve(v, x)`.
 ///
-/// L_v(x) = -i * exp(-i*v*π/2) * H_v(ix) (for real x, this is real)
-/// L_v(x) = (x/2)^{v+1} Σ_{k=0}^∞ (x/2)^{2k} / (Γ(k+3/2) Γ(k+v+3/2))
-///
-/// Note: same as Struve series but without the (-1)^k alternating sign.
+/// The same port of xsf's `cephes/struve.h` as [`struve`], with the signs of the modified
+/// function: the asymptotic expansion adds `I_v` (DLMF 11.6.2) and the Bessel series sums
+/// `I_{n+v+1/2}` with alternating coefficients. Bit for bit with SciPy wherever the power
+/// series is taken; where an expansion calls `I_v`, it carries the difference between fsci's
+/// `I_v` and SciPy's Cephes one, up to ~1e-12 relative, and where SciPy overflows to ±inf
+/// (v < -1 as x → 0, or v ≲ -200) fsci's `I_v` of negative order can return a finite value
+/// instead. frankenscipy-00cad
 pub fn modstruve(v: f64, x: f64) -> f64 {
-    if x.is_nan() || v.is_nan() {
-        return f64::NAN;
-    }
-    if x == 0.0 {
-        // Same leading-term behavior as struve at x=0; the only
-        // difference between H_v and L_v is the (-1)^k alternation
-        // which doesn't affect the k=0 term.
-        if v > -1.0 {
-            return 0.0;
-        }
-        if v == -1.0 {
-            return 2.0 / PI;
-        }
-        return f64::NAN;
-    }
-    // modstruve_series caps at BESSEL_SERIES_MAX_TERMS (96); its peak term is at
-    // k≈x/2, so for x≳190 it truncates BEFORE the dominant terms and grossly
-    // underestimates (modstruve(0,300) gave 2.2e119 vs scipy 4.5e128). For large
-    // x use the asymptotic L_v(x) = I_v(x) − correction instead (frankenscipy-kjtmn).
-    if x.abs() > 40.0 && v.abs() < x.abs() / 2.0 {
-        return modstruve_asymptotic(v, x);
-    }
-    modstruve_series(v, x)
+    xsf_struve::struve_hl(v, x, false)
 }
 
-/// Modified Struve L_v(x) large-x asymptotic (DLMF 11.6.2):
-/// `L_v(x) = I_v(x) − (1/π) Σ_{k≥0} Γ(k+1/2)/Γ(v+1/2−k) (x/2)^{v−2k−1}`.
-/// I_v from the (accurate large-x) Bessel routine; the correction is the same
-/// asymptotic series as [`struve_asymptotic`] but SUBTRACTED from I_v. The
-/// correction is exponentially small relative to I_v for large x, so its
-/// asymptotic-truncation error is negligible in L_v.
-fn modstruve_asymptotic(v: f64, x: f64) -> f64 {
-    let iv = crate::bessel::iv_scalar(v, x);
-    let half_x = 0.5 * x;
-    let mut term = gamma_fn(0.5) / gamma_fn(v + 0.5) * half_x.powf(v - 1.0);
-    let mut sum = term;
-    let mut prev_abs = term.abs();
-    let two_over_x_sq = (2.0 / x) * (2.0 / x);
-    for k in 0..200 {
-        let kf = k as f64;
-        term *= (kf + 0.5) * (v - 0.5 - kf) * two_over_x_sq;
-        let abs_term = term.abs();
-        if abs_term > prev_abs {
-            break; // past the smallest term of the asymptotic series
-        }
-        sum += term;
-        prev_abs = abs_term;
-        if abs_term <= 1.0e-18 * sum.abs() {
-            break;
+/// xsf `cephes/struve.h` (xsf 0d0a593f, as SciPy 1.17.1 compiles it), ported operation for
+/// operation so that [`struve`] and [`modstruve`] round as SciPy's do. The Bessel functions it
+/// calls are fsci's: `J_v` for xsf's AMOS `cyl_bessel_j`, `Y_v` for `cyl_bessel_y`, and `I_v`
+/// for Cephes `iv`. A C `int` conversion keeps x86-64's result, `INT_MIN`, for NaN and out of
+/// range values. frankenscipy-00cad
+mod xsf_struve {
+    use super::xsf_smirnov::Dd;
+    use crate::bessel::{iv_scalar, jv_scalar, yv_scalar};
+    use crate::gamma::{gammaln_scalar, gammasgn_scalar, rgamma_value};
+    use fsci_runtime::RuntimeMode;
+    use std::f64::consts::PI;
+
+    const MAXITER: i32 = 10_000;
+    /// A double-precision sum stops once a term is below this, relative to the sum.
+    const SUM_EPS: f64 = 1e-16;
+    /// The double-double power series stops once a term is below this, relative to the sum.
+    const SUM_TINY: f64 = 1e-100;
+    /// An expansion whose error estimate is below this, relative to its value, is taken.
+    const GOOD_EPS: f64 = 1e-12;
+    /// Failing that, the best of the three is taken if its estimate is below this...
+    const ACCEPTABLE_EPS: f64 = 1e-7;
+    /// ...relative to its value, or below this absolutely.
+    const ACCEPTABLE_ATOL: f64 = 1e-300;
+
+    /// C `(int)x` as compiled for x86-64: truncation, and `INT_MIN` for NaN or out of range.
+    fn c_int(x: f64) -> i32 {
+        if x.is_nan() || x >= 2_147_483_648.0 || x <= -2_147_483_649.0 {
+            i32::MIN
+        } else {
+            x as i32
         }
     }
-    iv - sum / PI
+
+    /// Cephes `lgam`: fsci's `gammaln` is the same kernel, bit for bit (frankenscipy-bmyh2).
+    fn lgam(x: f64) -> f64 {
+        gammaln_scalar(x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    }
+
+    /// Cephes `gammasgn`.
+    fn gammasgn(x: f64) -> f64 {
+        gammasgn_scalar(x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    }
+
+    /// xsf `cyl_bessel_y` for real arguments.
+    fn bessel_y(v: f64, x: f64) -> f64 {
+        yv_scalar(v, x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    }
+
+    /// Large-x expansion for H and L (DLMF 11.6.1), summed up to its divergence point x/2.
+    /// Returns the value and its error estimate.
+    fn asymp_large_z(v: f64, z: f64, is_h: bool) -> (f64, f64) {
+        let sgn: i32 = if is_h { -1 } else { 1 };
+        let m = z / 2.0;
+        let maxiter = if m <= 0.0 {
+            0
+        } else if m > f64::from(MAXITER) {
+            MAXITER
+        } else {
+            c_int(m)
+        };
+        if maxiter == 0 {
+            return (f64::NAN, f64::INFINITY);
+        }
+        if z < v {
+            // The error estimate fails here.
+            return (f64::NAN, f64::INFINITY);
+        }
+
+        let mut term = f64::from(-sgn) / PI.sqrt()
+            * (-lgam(v + 0.5) + (v - 1.0) * (z / 2.0).ln()).exp()
+            * gammasgn(v + 0.5);
+        let mut sum = term;
+        let mut maxterm = 0.0_f64;
+        for n in 0..maxiter {
+            term *= f64::from(sgn * (1 + 2 * n)) * (f64::from(1 + 2 * n) - 2.0 * v) / (z * z);
+            sum += term;
+            if term.abs() > maxterm {
+                maxterm = term.abs();
+            }
+            if term.abs() < SUM_EPS * sum.abs() || term == 0.0 || !sum.is_finite() {
+                break;
+            }
+        }
+        if is_h {
+            sum += bessel_y(v, z);
+        } else {
+            sum += iv_scalar(v, z);
+        }
+        // Strictly valid only for n > v - 1/2, but it works in practice (xsf).
+        (sum, term.abs() + maxterm.abs() * SUM_EPS)
+    }
+
+    /// Power series for H and L (DLMF 11.2.1), summed in double-double. It converges from
+    /// roughly n > |z|. Returns the value and its error estimate.
+    fn power_series(v: f64, z: f64, is_h: bool) -> (f64, f64) {
+        let sgn: i32 = if is_h { -1 } else { 1 };
+
+        let mut tmp = -lgam(v + 1.5) + (v + 1.0) * (z / 2.0).ln();
+        // A NaN `tmp` takes the scaling arm here and not in xsf; the sum is NaN either way.
+        let scaleexp = if !(-600.0..=600.0).contains(&tmp) {
+            // Scale the exponent to postpone underflow or overflow.
+            let half = tmp / 2.0;
+            tmp -= half;
+            half
+        } else {
+            0.0
+        };
+
+        let mut term = 2.0 / PI.sqrt() * tmp.exp() * gammasgn(v + 1.5);
+        let mut sum = term;
+        let mut maxterm = 0.0_f64;
+
+        let mut cterm = Dd::new(term);
+        let mut csum = Dd::new(sum);
+        let z2 = Dd::new(f64::from(sgn) * z * z);
+        let c2v = Dd::new(2.0 * v);
+
+        for n in 0..MAXITER {
+            // cdiv = (3 + 2n)(3 + 2n + 2v)
+            let cdiv = Dd::new(f64::from(3 + 2 * n));
+            let ctmp = Dd::new(f64::from(3 + 2 * n)).add(c2v);
+            let cdiv = cdiv.mul(ctmp);
+
+            // cterm *= z2 / cdiv
+            cterm = cterm.mul(z2).div(cdiv);
+            csum = csum.add(cterm);
+
+            term = cterm.hi;
+            sum = csum.hi;
+
+            if term.abs() > maxterm {
+                maxterm = term.abs();
+            }
+            if term.abs() < SUM_TINY * sum.abs() || term == 0.0 || !sum.is_finite() {
+                break;
+            }
+        }
+
+        let mut err = term.abs() + maxterm.abs() * 1e-22;
+        if scaleexp != 0.0 {
+            sum *= scaleexp.exp();
+            err *= scaleexp.exp();
+        }
+        if sum == 0.0 && term == 0.0 && v < 0.0 && !is_h {
+            // Spurious underflow.
+            return (f64::NAN, f64::INFINITY);
+        }
+        (sum, err)
+    }
+
+    /// Bessel-function series for H and L (DLMF 11.4.19). Returns the value and its error
+    /// estimate.
+    fn bessel_series(v: f64, z: f64, is_h: bool) -> (f64, f64) {
+        if is_h && v < 0.0 {
+            // Less reliable in this region.
+            return (f64::NAN, f64::INFINITY);
+        }
+
+        let mut sum = 0.0_f64;
+        let mut maxterm = 0.0_f64;
+        let mut term = 0.0_f64;
+        let mut cterm = (z / (2.0 * PI)).sqrt();
+
+        for n in 0..MAXITER {
+            let order = f64::from(n) + v + 0.5;
+            let divisor = f64::from(n) + 0.5;
+            if is_h {
+                term = cterm * jv_scalar(order, z) / divisor;
+                cterm *= z / 2.0 / f64::from(n + 1);
+            } else {
+                term = cterm * iv_scalar(order, z) / divisor;
+                cterm *= -z / 2.0 / f64::from(n + 1);
+            }
+            sum += term;
+            if term.abs() > maxterm {
+                maxterm = term.abs();
+            }
+            if term.abs() < SUM_EPS * sum.abs() || term == 0.0 || !sum.is_finite() {
+                break;
+            }
+        }
+
+        let mut err = term.abs() + maxterm.abs() * 1e-16;
+        // Account for potential underflow of the Bessel functions.
+        err += 1e-300 * cterm.abs();
+        (sum, err)
+    }
+
+    /// xsf `struve_hl`: H_v(z) when `is_h`, else L_v(z).
+    pub(super) fn struve_hl(v: f64, z: f64, is_h: bool) -> f64 {
+        if z < 0.0 {
+            let n = c_int(v);
+            if v == f64::from(n) {
+                let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
+                return sign * struve_hl(v, -z, is_h);
+            }
+            return f64::NAN;
+        } else if z == 0.0 {
+            if v < -1.0 {
+                return gammasgn(v + 1.5) * f64::INFINITY;
+            } else if v == -1.0 {
+                return 2.0 / PI.sqrt() * rgamma_value(0.5, RuntimeMode::Strict);
+            }
+            return 0.0;
+        }
+
+        // v = -n - 1/2, n > 0: a spherical Bessel function.
+        let n = c_int(-v - 0.5);
+        if f64::from(n) == -v - 0.5 && n > 0 {
+            let order = f64::from(n) + 0.5;
+            if is_h {
+                let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+                return sign * jv_scalar(order, z);
+            }
+            return iv_scalar(order, z);
+        }
+
+        // The asymptotic expansion is not worth trying below z ~ 0.7v + 12.
+        let asymp = if z >= 0.7 * v + 12.0 {
+            let (value, err) = asymp_large_z(v, z, is_h);
+            if err < GOOD_EPS * value.abs() {
+                return value;
+            }
+            (value, err)
+        } else {
+            (f64::NAN, f64::INFINITY)
+        };
+
+        let power = power_series(v, z, is_h);
+        if power.1 < GOOD_EPS * power.0.abs() {
+            return power.0;
+        }
+
+        // The Bessel series tends to fail for |z| >~ |v|.
+        let bessel = if z.abs() < v.abs() + 20.0 {
+            let (value, err) = bessel_series(v, z, is_h);
+            if err < GOOD_EPS * value.abs() {
+                return value;
+            }
+            (value, err)
+        } else {
+            (f64::NAN, f64::INFINITY)
+        };
+
+        // The best of the three, if it is acceptable.
+        let mut best = asymp;
+        if power.1 < best.1 {
+            best = power;
+        }
+        if bessel.1 < best.1 {
+            best = bessel;
+        }
+        if best.1 < ACCEPTABLE_EPS * best.0.abs() || best.1 < ACCEPTABLE_ATOL {
+            return best.0;
+        }
+
+        // Maybe it really is an overflow.
+        let mut tmp = -lgam(v + 1.5) + (v + 1.0) * (z / 2.0).ln();
+        if !is_h {
+            tmp = tmp.abs();
+        }
+        if tmp > 700.0 {
+            return f64::INFINITY * gammasgn(v + 1.5);
+        }
+        f64::NAN
+    }
 }
 
 /// Integral of the Struve function H_0 from 0 to x.
@@ -2424,80 +2641,7 @@ fn struve0_over_t(t: f64) -> f64 {
     }
 }
 
-/// Struve function via power series.
-fn struve_series(v: f64, x: f64) -> f64 {
-    let half_x = x / 2.0;
-    let half_x_sq = half_x * half_x;
-
-    // H_v(x) = (x/2)^{v+1} Σ (-1)^k (x/2)^{2k} / (Γ(k+3/2) Γ(k+v+3/2))
-    let mut sum = 0.0;
-    let mut term = 1.0 / (gamma_fn(1.5) * gamma_fn(v + 1.5));
-
-    for k in 0..100 {
-        sum += term;
-        let kf = k as f64;
-        term *= -half_x_sq / ((kf + 1.5) * (kf + v + 1.5));
-        if term.abs() < 1e-16 * sum.abs().max(1e-300) {
-            break;
-        }
-    }
-
-    sum * half_x.powf(v + 1.0)
-}
-
-/// Modified Struve function via power series.
-fn modstruve_series(v: f64, x: f64) -> f64 {
-    let half_x = x / 2.0;
-    let half_x_sq = half_x * half_x;
-
-    let mut sum = 0.0;
-    let mut term = 1.0 / (gamma_fn(1.5) * gamma_fn(v + 1.5));
-
-    for k in 0..100 {
-        sum += term;
-        let kf = k as f64;
-        term *= half_x_sq / ((kf + 1.5) * (kf + v + 1.5));
-        if term.abs() < 1e-16 * sum.abs().max(1e-300) {
-            break;
-        }
-    }
-
-    sum * half_x.powf(v + 1.0)
-}
-
-/// Struve asymptotic expansion for large x.
-fn struve_asymptotic(v: f64, x: f64) -> f64 {
-    // DLMF 11.6.1: H_v(x) = Y_v(x) + (1/π) Σ_{k≥0} Γ(k+1/2)/Γ(v+1/2-k) (x/2)^{v-2k-1}.
-    // Y_v from the Bessel routine (accurate large-x asymptotic); the correction
-    // series is asymptotic (divergent) — sum to its smallest term. The previous
-    // code kept only the leading term for v≈0 (≈0.17% error) and fell back to the
-    // power series for v≠0, which catastrophically cancels at large x (struve(1,50)
-    // was -3531 vs 0.58; struve(1,200) was -5.7e83 vs 0.65). frankenscipy-3z6wd.
-    let yv = crate::bessel::yv_scalar(v, x, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let half_x = 0.5 * x;
-    // k = 0 term: Γ(1/2)/Γ(v+1/2) (x/2)^{v-1}.
-    let mut term = gamma_fn(0.5) / gamma_fn(v + 0.5) * half_x.powf(v - 1.0);
-    let mut sum = term;
-    let mut prev_abs = term.abs();
-    let two_over_x_sq = (2.0 / x) * (2.0 / x);
-    for k in 0..200 {
-        let kf = k as f64;
-        // term_{k+1} = term_k (k+1/2)(v-1/2-k)(2/x)².
-        term *= (kf + 0.5) * (v - 0.5 - kf) * two_over_x_sq;
-        let abs_term = term.abs();
-        if abs_term > prev_abs {
-            break; // past the smallest term of the asymptotic series
-        }
-        sum += term;
-        prev_abs = abs_term;
-        if abs_term <= 1.0e-18 * sum.abs() {
-            break;
-        }
-    }
-    yv + sum / PI
-}
-
-/// Simple gamma function for use in Struve computation.
+/// Simple Lanczos gamma function.
 fn gamma_fn(x: f64) -> f64 {
     // Use Lanczos approximation
     if x <= 0.0 && x.fract().abs() < 1e-14 {
@@ -6065,12 +6209,12 @@ pub fn modstruve_scalar(v: f64, x: f64) -> f64 {
 
 /// Vectorized Struve function H_v(x) for a fixed order `v` over many arguments.
 ///
-/// Matches `scipy.special.struve(v, x)` for scalar `v` and an array `x`. fsci
-/// previously exposed only the scalar `struve`; SciPy's vectorized struve ufunc
-/// is remarkably slow (~5 µs/point — 10.5 s for 2M points) because it drives a
-/// per-point series/integral, whereas fsci's scalar kernel is ~47 ns. Fanning
-/// that kernel across cores via the crate's order-preserving parallel map is a
-/// ~500× win and fills the missing vectorized API. Bit-identical to a serial
+/// Matches `scipy.special.struve(v, x)` for scalar `v` and an array `x`, fanning the
+/// scalar kernel across cores via the crate's order-preserving parallel map. The
+/// kernel is SciPy's algorithm (see [`struve`]), often tens to hundreds of double-double
+/// power-series terms per point, so the per-point cost is of SciPy's order; the
+/// earlier ~47 ns kernel that this map was measured against was the inaccurate
+/// series/asymptotic switch it replaced (frankenscipy-00cad). Bit-identical to a serial
 /// `x.iter().map(|&xi| struve(v, xi))` (each element is an independent, pure call).
 #[must_use]
 pub fn struve_many(v: f64, x: &[f64]) -> Vec<f64> {
@@ -7154,11 +7298,12 @@ mod xsf_smirnov {
     }
 
     /// xsf `double_double`: the unevaluated sum `hi + lo`. Each method is one C++ operator of
-    /// `dd_real.h`; the suffix names the operand types where xsf overloads on them.
+    /// `dd_real.h`; the suffix names the operand types where xsf overloads on them. The Struve
+    /// power series ([`super::xsf_struve`]) sums in it too.
     #[derive(Clone, Copy, Debug)]
-    struct Dd {
-        hi: f64,
-        lo: f64,
+    pub(super) struct Dd {
+        pub(super) hi: f64,
+        pub(super) lo: f64,
     }
 
     /// e (`dd_real.h` `E`).
@@ -7202,7 +7347,7 @@ mod xsf_smirnov {
     ];
 
     impl Dd {
-        const fn new(hi: f64) -> Self {
+        pub(super) const fn new(hi: f64) -> Self {
             Self { hi, lo: 0.0 }
         }
 
@@ -7234,7 +7379,7 @@ mod xsf_smirnov {
         }
 
         /// `dd + dd` (the Briggs–Kahan IEEE-style sum).
-        fn add(self, rhs: Self) -> Self {
+        pub(super) fn add(self, rhs: Self) -> Self {
             let (s1, s2) = two_sum(self.hi, rhs.hi);
             let (t1, t2) = two_sum(self.lo, rhs.lo);
             let (s1, s2) = quick_two_sum(s1, s2 + t1);
@@ -7269,7 +7414,7 @@ mod xsf_smirnov {
         }
 
         /// `dd * dd`
-        fn mul(self, rhs: Self) -> Self {
+        pub(super) fn mul(self, rhs: Self) -> Self {
             let (p1, p2) = two_prod(self.hi, rhs.hi);
             let (hi, lo) = quick_two_sum(p1, p2 + (self.hi * rhs.lo + self.lo * rhs.hi));
             Self { hi, lo }
@@ -7285,7 +7430,7 @@ mod xsf_smirnov {
         }
 
         /// `dd / dd` (three quotient digits).
-        fn div(self, rhs: Self) -> Self {
+        pub(super) fn div(self, rhs: Self) -> Self {
             let q1 = self.hi / rhs.hi;
             let r = self.sub(rhs.mul_f64(q1));
             let q2 = r.hi / rhs.hi;
@@ -16390,7 +16535,8 @@ mod tests {
             (l_minus_one - expected).abs() < 1e-12,
             "modstruve(-1, 0) = {l_minus_one}, expected {expected}"
         );
-        assert!(modstruve(-2.0, 0.0).is_nan());
+        // For v < -1, SciPy returns sign(Γ(v + 3/2))·∞ (frankenscipy-00cad).
+        assert_eq!(modstruve(-2.0, 0.0), f64::NEG_INFINITY);
     }
 
     #[test]
@@ -16433,10 +16579,113 @@ mod tests {
             (h_minus_one - expected).abs() < 1e-12,
             "struve(-1, 0) = {h_minus_one}, expected {expected}"
         );
-        // For v < -1, the leading term diverges and the limit sign is
-        // undefined; we conservatively return NaN.
-        assert!(struve(-1.5, 0.0).is_nan());
-        assert!(struve(-2.0, 0.0).is_nan());
+        // For v < -1 the leading term diverges; SciPy returns sign(Γ(v + 3/2))·∞,
+        // which is NaN where v + 3/2 is a negative integer (frankenscipy-00cad).
+        assert_eq!(struve(-1.5, 0.0), f64::INFINITY);
+        assert_eq!(struve(-2.0, 0.0), f64::NEG_INFINITY);
+        assert!(struve(-2.5, 0.0).is_nan());
+    }
+
+    /// scipy.special.struve / modstruve 1.17.1 (xsf 0d0a593f `cephes/struve.h`) in every branch
+    /// of `struve_hl`. The branches that never call a Bessel function are SciPy's bits: the
+    /// double-double power series (the first H row is the point the old series/asymptotic
+    /// switch had 1.25e-8 wrong), x < 0 and x = 0 on it, the best-of-three fallback when it
+    /// picks the power series, overflow and failure. The branches that call J_v, Y_v or I_v
+    /// (v = -n - 1/2, the asymptotic expansion, the Bessel series) carry fsci's Bessel values,
+    /// which are not SciPy's AMOS/Cephes bits. They are held to mpmath at 60 digits instead:
+    /// struve(-3.5, 7.5) is 3e-16 off mpmath here and 7.3e-15 in SciPy. Inputs go through
+    /// `black_box` so no constant folding stands in for the runtime path. frankenscipy-00cad
+    #[test]
+    fn struve_and_modstruve_every_branch_is_scipys_bits_or_mpmath() {
+        use std::hint::black_box;
+        let h_cases: [(f64, f64, u64); 19] = [
+            (0.287, 19.57, 0x3f71_f050_e6ef_1bd4),      // power series
+            (0.0, 20.0, 0x3fb8_2a2f_7635_3139),         // power series
+            (1.0, 25.0, 0x3fe1_3de1_1792_18d6),         // power series
+            (0.287, 5.0, 0x3fa5_d32b_1e82_9132),        // power series
+            (-40.0, 20.0, 0xc161_5253_0d72_37a3),       // power series
+            (-299.856, 202.743, 0xc540_21d3_b019_7a8d), // power series
+            (2.0, -3.0, 0xbfe7_c1a1_b068_0962),         // x < 0, power series
+            (0.5, -1.0, 0x7ff8_0000_0000_0000),         // x < 0, non-integer v: NaN
+            (-1.0, 0.0, 0x3fe4_5f30_6dc9_c882),         // x = 0
+            (-1.5, 0.0, 0x7ff0_0000_0000_0000),         // x = 0
+            (-2.0, 0.0, 0xfff0_0000_0000_0000),         // x = 0
+            (-2.5, 0.0, 0x7ff8_0000_0000_0000),         // x = 0
+            (0.5, 0.0, 0x0000_0000_0000_0000),          // x = 0
+            (0.287, 24.0, 0xbfa0_5e99_1b98_ec2c),       // best of three: power series
+            (-74.98, 68.57, 0x3fee_c711_e5aa_4c86),     // best of three: power series
+            (262.957, 2.874, 0x0000_0000_0000_0000),    // best of three: power series
+            (-259.432, 5.815, 0x7ff0_0000_0000_0000),   // overflow
+            (f64::NAN, 1.0, 0x7ff8_0000_0000_0000),     // failure
+            (1.0, f64::NAN, 0x7ff8_0000_0000_0000),     // failure
+        ];
+        let l_cases: [(f64, f64, u64); 15] = [
+            (0.287, 5.0, 0x403a_bba1_6dcd_79e4),        // power series
+            (12.0, 20.0, 0x4132_7a12_12a9_8ede),        // power series
+            (-13.32, 10.27, 0x3ff3_1008_f6e3_d950),     // power series
+            (206.653, 166.291, 0x4414_7e2f_97e4_6761),  // power series
+            (2.0, -3.0, 0xbffb_f667_87b3_df84),         // x < 0, power series
+            (0.5, -1.0, 0x7ff8_0000_0000_0000),         // x < 0, non-integer v: NaN
+            (-1.0, 0.0, 0x3fe4_5f30_6dc9_c882),         // x = 0
+            (-1.5, 0.0, 0x7ff0_0000_0000_0000),         // x = 0
+            (-2.0, 0.0, 0xfff0_0000_0000_0000),         // x = 0
+            (-2.5, 0.0, 0x7ff8_0000_0000_0000),         // x = 0
+            (0.5, 0.0, 0x0000_0000_0000_0000),          // x = 0
+            (-247.3, 166.6, 0x4162_1f6c_1899_9e65),     // best of three: power series
+            (262.957, 2.874, 0x0000_0000_0000_0000),    // best of three: power series
+            (-233.0, 0.97, 0x7ff0_0000_0000_0000),      // overflow
+            (-299.856, 202.743, 0x7ff8_0000_0000_0000), // failure
+        ];
+        for (name, f, cases) in [
+            ("struve", struve as fn(f64, f64) -> f64, &h_cases[..]),
+            ("modstruve", modstruve, &l_cases[..]),
+        ] {
+            for &(v, x, bits) in cases {
+                let want = f64::from_bits(bits);
+                let got = f(black_box(v), black_box(x));
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{name}({v}, {x}) = {got:e}, SciPy NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        bits,
+                        "{name}({v}, {x}) = {got:e}, SciPy {want:e}"
+                    );
+                }
+            }
+        }
+        // The branches that call J_v, Y_v or I_v, against mpmath's struveh / struvel at 60
+        // digits. SciPy's error at each is at most 8.4e-16, except 7.3e-15 at H(-3.5, 7.5) and
+        // 6.6e-13 at H(-3.3, 30).
+        #[rustfmt::skip]
+        let bessel_cases: [(&str, fn(f64, f64) -> f64, f64, f64, f64, f64); 16] = [
+            ("struve", struve, 3.0, -30.0, 38.343491008657196, 1e-14),       // x < 0, asymptotic
+            ("struve", struve, -3.5, 7.5, 0.13484950550869113, 1e-14),       // v = -n - 1/2
+            ("struve", struve, -1.5, 31.0, 0.1329542636128643, 1e-14),       // v = -n - 1/2
+            ("struve", struve, 2.5, 21.0, 9.57067437442845, 1e-14),          // asymptotic
+            ("struve", struve, 1.0, 60.0, 0.7286660738055736, 1e-14),        // asymptotic
+            ("struve", struve, 2.0, 100.0, 21.303864052674466, 1e-14),       // asymptotic
+            ("struve", struve, 0.25, 100.0, -0.05453173410693158, 1e-14),    // asymptotic
+            ("struve", struve, 189.5, 183.4, 9.035113849118622e19, 1e-14),   // Bessel series
+            ("struve", struve, 283.0, 252.9, 1.4034988401917428e21, 1e-14),  // Bessel series
+            // Best of three on the asymptotic expansion: 7.0e-13 here and 6.6e-13 in SciPy, the
+            // truncation of Cephes' expansion itself.
+            ("struve", struve, -3.3, 30.0, -0.002651512976579513, 1e-12),
+            ("modstruve", modstruve, 3.0, -30.0, 671140461759.4525, 1e-14),  // x < 0, asymptotic
+            ("modstruve", modstruve, -3.5, 0.5, 0.0006810359708579382, 1e-14), // v = -n - 1/2
+            ("modstruve", modstruve, -3.5, 5.0, 7.417560126111555, 1e-14),   // v = -n - 1/2
+            ("modstruve", modstruve, 0.0, 18.5, 10110921.471720433, 1e-14),  // asymptotic
+            ("modstruve", modstruve, -0.75, 20.0, 42934125.4551164, 1e-14),  // asymptotic
+            ("modstruve", modstruve, 2.5, 100.0, 1.0405531961408039e42, 1e-14), // asymptotic
+        ];
+        for (name, f, v, x, want, bound) in bessel_cases {
+            let got = f(black_box(v), black_box(x));
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= bound,
+                "{name}({v}, {x}) = {got:e}, mpmath {want:e}, rel {rel:e}"
+            );
+        }
     }
 
     #[test]

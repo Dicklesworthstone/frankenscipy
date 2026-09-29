@@ -5,10 +5,20 @@
 //! Resolves [frankenscipy-j5jm9]. Struve has no dedicated diff
 //! harness in fsci-conformance.
 //!
-//! 5 v-values × 9 x-values = 45 cases via subprocess.
-//! Tolerances: 1e-7 abs/rel — fsci's struve is precision-
-//! sensitive at the series-asymptotic seam; the harness
-//! restricts to safe (v, x) regimes.
+//! `struve` is a port of the xsf `cephes/struve.h` SciPy 1.17.1 compiles
+//! (frankenscipy-00cad), so each of the 94 cases is held to the class of
+//! the expansion SciPy takes there (found with a bit-exact Python
+//! emulation of xsf):
+//! - no Bessel function called (the power series, and x < 0 by
+//!   reflection): fsci must equal SciPy bit for bit;
+//! - `Y_v`, `J_v` called (the asymptotic expansion, v = -n - 1/2, the
+//!   Bessel series, the best-of-three fallback on them): fsci's Bessel
+//!   functions are not SciPy's AMOS ones, so a true relative gate,
+//!   `REL_TOL`.
+//!
+//! The cases span v in [-60, 250] and x in [-30, 200], including the
+//! bead's point (0.287, 19.57) where the old series/asymptotic switch was
+//! 1.25e-8 off.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -22,8 +32,10 @@ use fsci_special::{it2struve0, itmodstruve0, itstruve0, struve};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const ABS_TOL: f64 = 1.0e-7;
-const REL_TOL: f64 = 1.0e-7;
+/// True relative gate for the cases whose SciPy value calls a Bessel function. Its floor
+/// is fsci's `Y_v` at v = ±1/2 for x just below 14, where fsci's `J_v` power series
+/// loses digits: struve(0.5, 12.5) is 1.40e-9 off SciPy (frankenscipy-00cad).
+const REL_TOL: f64 = 2.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// One ledger arm per Struve integral.
 const INTEGRAL_ARMS: [&str; 3] = ["itstruve0", "it2struve0", "itmodstruve0"];
@@ -33,6 +45,8 @@ struct PointCase {
     case_id: String,
     v: f64,
     x: f64,
+    /// SciPy's expansion here calls `Y_v` or `J_v`: gated by `REL_TOL`, not bit for bit.
+    calls_bessel: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,19 +131,125 @@ fn fsci_integral_eval(func: &str, x: f64) -> Option<f64> {
     Some(result)
 }
 
+/// `(v, x, calls_bessel)`: whether SciPy 1.17.1's expansion at (v, x) calls `Y_v`/`J_v`,
+/// from a Python emulation of xsf's `struve.h` that matches SciPy bit for bit.
+const STRUVE_CASES: [(f64, f64, bool); 94] = [
+    // v = 0, 1/2, 1, 3/2, 2 on x in [0.1, 15]: the power series, except the asymptotic
+    // expansion at x = 15 for v = 1/2 and 3/2.
+    (0.0, 0.1, false),
+    (0.0, 0.5, false),
+    (0.0, 1.0, false),
+    (0.0, 2.0, false),
+    (0.0, 3.0, false),
+    (0.0, 5.0, false),
+    (0.0, 8.0, false),
+    (0.0, 10.0, false),
+    (0.0, 15.0, false),
+    (0.5, 0.1, false),
+    (0.5, 0.5, false),
+    (0.5, 1.0, false),
+    (0.5, 2.0, false),
+    (0.5, 3.0, false),
+    (0.5, 5.0, false),
+    (0.5, 8.0, false),
+    (0.5, 10.0, false),
+    (0.5, 15.0, true),
+    (1.0, 0.1, false),
+    (1.0, 0.5, false),
+    (1.0, 1.0, false),
+    (1.0, 2.0, false),
+    (1.0, 3.0, false),
+    (1.0, 5.0, false),
+    (1.0, 8.0, false),
+    (1.0, 10.0, false),
+    (1.0, 15.0, false),
+    (1.5, 0.1, false),
+    (1.5, 0.5, false),
+    (1.5, 1.0, false),
+    (1.5, 2.0, false),
+    (1.5, 3.0, false),
+    (1.5, 5.0, false),
+    (1.5, 8.0, false),
+    (1.5, 10.0, false),
+    (1.5, 15.0, true),
+    (2.0, 0.1, false),
+    (2.0, 0.5, false),
+    (2.0, 1.0, false),
+    (2.0, 2.0, false),
+    (2.0, 3.0, false),
+    (2.0, 5.0, false),
+    (2.0, 8.0, false),
+    (2.0, 10.0, false),
+    (2.0, 15.0, false),
+    // The bead's point, where the old code was 1.25e-8 off, and its neighbourhood.
+    (0.287, 19.57, false),
+    (0.287, 16.0, false),
+    (0.287, 24.0, false),
+    (-0.5, 17.5, true),
+    (1.0, 19.57, false),
+    (2.5, 21.0, true),
+    // v in [-2, 10], x in [0, 30].
+    (-1.7, 3.0, false),
+    (-1.7, 14.5, false),
+    (-1.7, 27.0, true),
+    (-1.0, 9.0, false),
+    (-1.0, 22.0, false),
+    (-0.3, 6.5, false),
+    (-0.3, 28.5, true),
+    (3.3, 12.0, false),
+    (4.2, 17.0, false),
+    (4.2, 29.0, true),
+    (5.5, 25.0, true),
+    (7.9, 9.5, false),
+    (7.9, 22.5, true),
+    (10.0, 4.0, false),
+    (10.0, 19.57, false),
+    (10.0, 30.0, true),
+    // Large x: the asymptotic expansion.
+    (0.0, 35.0, true),
+    (0.0, 50.0, true),
+    (1.0, 50.0, true),
+    (0.5, 80.0, true),
+    (2.0, 100.0, true),
+    (3.0, 150.0, true),
+    (1.0, 200.0, true),
+    (-1.3, 44.0, true),
+    // The asymptotic expansion taken below x = 14, where fsci's Y_v is weakest.
+    (0.5, 12.5, true),
+    (-0.5, 12.5, true),
+    (0.5, 13.5, true),
+    // x < 0, integer v: H_v(-x) = (-1)^(v+1) H_v(x).
+    (0.0, -4.0, false),
+    (1.0, -19.57, false),
+    (2.0, -30.0, true),
+    (3.0, -7.5, false),
+    // v = -n - 1/2: J_{n+1/2}.
+    (-1.5, 2.0, true),
+    (-2.5, 7.25, true),
+    (-3.5, 12.0, true),
+    (-1.5, 20.0, true),
+    (-3.5, 31.0, true),
+    // Large order: the Bessel-function series, and the power series.
+    (170.5, 170.421, true),
+    (206.653, 166.291, true),
+    (250.228, 199.376, true),
+    (120.0, 60.0, false),
+    // Negative order: best of three (asymptotic), power series, asymptotic.
+    (-18.822_302_607_005_35, 38.822_302_607_005_35, true),
+    (-40.0, 20.0, false),
+    (-60.0, 70.0, true),
+];
+
 fn generate_query() -> OracleQuery {
-    let vs = [0.0_f64, 0.5, 1.0, 1.5, 2.0];
-    let xs = [0.1_f64, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0];
-    let mut points = Vec::new();
-    for &v in &vs {
-        for &x in &xs {
-            points.push(PointCase {
-                case_id: format!("v{v}_x{x}"),
-                v,
-                x,
-            });
-        }
-    }
+    let points = STRUVE_CASES
+        .iter()
+        .map(|&(v, x, calls_bessel)| PointCase {
+            case_id: format!("v{v}_x{x}"),
+            v,
+            x,
+            calls_bessel,
+        })
+        .collect();
     OracleQuery { points }
 }
 
@@ -348,17 +468,14 @@ fn diff_special_struve() {
             continue;
         };
         let abs_diff = (rust_v - scipy_v).abs();
-        let rel_diff = if scipy_v.abs() > 1.0 {
-            abs_diff / scipy_v.abs()
-        } else {
-            abs_diff
-        };
+        // True relative difference; every case's SciPy value is nonzero.
+        let rel_diff = abs_diff / scipy_v.abs();
         max_abs_overall = max_abs_overall.max(abs_diff);
         max_rel_overall = max_rel_overall.max(rel_diff);
-        let pass = if scipy_v.abs() > 1.0 {
+        let pass = if case.calls_bessel {
             rel_diff <= REL_TOL
         } else {
-            abs_diff <= ABS_TOL
+            abs_diff == 0.0
         };
         ledger.compared("struve", &case.case_id, pass);
         diffs.push(CaseDiff {

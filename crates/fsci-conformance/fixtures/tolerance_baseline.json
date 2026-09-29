@@ -1464,8 +1464,7 @@
   "diff_special_struve.rs": {
     "@abs_diff": 5e-6,
     "@rel_diff": 5e-6,
-    "ABS_TOL": 1e-7,
-    "REL_TOL": 1e-7
+    "REL_TOL": 2e-9
   },
   "diff_special_take_special_traces.rs": {},
   "diff_special_trig_deg.rs": {
