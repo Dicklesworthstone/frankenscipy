@@ -228,19 +228,9 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    // `FSCI_STATS_KS_BANDED=0` restores the full-rectangle exact KS sweep.
+    // `FSCI_STATS_KS_SERIES=0` sends equal sample sizes through the lattice recursion SciPy
+    // uses for unequal ones instead of the closed-form series.
     // Only-override-when-asked, so an unset variable cannot overwrite a flipped default.
-    match std::env::var("FSCI_STATS_KS_BANDED").ok().as_deref() {
-        Some("1") | Some("true") => {
-            fsci_stats::KS_2SAMP_BANDED_EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        Some("0") | Some("false") => {
-            fsci_stats::KS_2SAMP_BANDED_EXACT.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        _ => {}
-    }
-
-    // `FSCI_STATS_KS_SERIES=0` restores the path-counting sweep for equal sample sizes.
     match std::env::var("FSCI_STATS_KS_SERIES").ok().as_deref() {
         Some("1") | Some("true") => {
             fsci_stats::KS_2SAMP_SQUARE_SERIES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -253,8 +243,7 @@ fn main() {
 
     println!("elf_sha256={}", elf_sha256());
     println!(
-        "n={n} tie_factor={tie_factor} ks_banded={} ks_series={}",
-        fsci_stats::KS_2SAMP_BANDED_EXACT.load(std::sync::atomic::Ordering::Relaxed),
+        "n={n} tie_factor={tie_factor} ks_series={}",
         fsci_stats::KS_2SAMP_SQUARE_SERIES.load(std::sync::atomic::Ordering::Relaxed)
     );
 

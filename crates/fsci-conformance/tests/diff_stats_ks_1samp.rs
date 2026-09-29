@@ -4,16 +4,18 @@
 //! `scipy.stats.ks_1samp(data, 'norm')`.
 //!
 //! Resolves [frankenscipy-ktefe]. Cross-checks both the D
-//! statistic (max |F_n(x) - F(x)|) and the p-value
-//! (asymptotic Kolmogorov series via fsci's
-//! kolmogorov_pvalue) across 4 datasets.
+//! statistic (max |F_n(x) - F(x)|) and the p-value across 4
+//! datasets. The p-value is the exact finite-n Kolmogorov law,
+//! fsci's port of SciPy's `kolmogn` (frankenscipy-ksk1u), against
+//! SciPy's default `method='auto'`, which is exact as well.
 //!
 //! 4 fixtures × 2 arms = 8 cases via subprocess.
 //! Tolerances:
 //!   - statistic : 1e-12 abs (closed-form max-difference walk).
-//!   - pvalue    : 1e-7 abs. fsci's kolmogorov_pvalue uses a
-//!     truncated infinite series; scipy switches between
-//!     exact and asymptotic depending on sample size.
+//!   - pvalue    : 1e-7 abs. This predates the exact port, when
+//!     fsci's p-value was the truncated n → ∞ Kolmogorov series
+//!     (`kolmogorov_pvalue`, since removed); it has not been
+//!     re-measured.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

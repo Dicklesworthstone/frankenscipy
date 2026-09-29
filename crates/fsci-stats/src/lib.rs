@@ -41,7 +41,8 @@ use fsci_runtime::RuntimeMode;
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
 const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
-/// Largest sample size for which `ks_2samp` computes the EXACT p-value.
+/// Largest sample size for which `ks_2samp` and `ks_2samp_alternative` compute the EXACT
+/// p-value — for every alternative, as SciPy's 'auto' does (see `ks_2samp_pvalue`).
 ///
 /// This mirrors `scipy.stats.ks_2samp`'s `MAX_AUTO_N`, and the predicate is
 /// deliberately `max(n1, n2)` rather than the product `n1 * n2`:
@@ -56,35 +57,55 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// See `frankenscipy-6ozha`; same defect class as `frankenscipy-ksk1u`.
 ///
 /// The threshold matches SciPy's own `MAX_AUTO_N`, so both switch to the
-/// asymptotic p-value at the same size. The lcm `checked_mul` below still falls
-/// back to asymptotic on overflow, mirroring SciPy's own int32 lcm guard.
+/// asymptotic p-value at the same size. The lcm `checked_mul` in
+/// `ks_2samp_exact_pvalue` still falls back to asymptotic on overflow, which below
+/// this cap cannot happen.
 ///
 /// This comment used to claim the exact path was "O(n1*n2) time ... the same
 /// asymptotic cost SciPy pays in `_attempt_exact_2kssamp`". The first live-SciPy
 /// measurement of this op refuted that: at `n1 = n2 = 10000` we took 119 ms
 /// against SciPy's 2.1 ms. SciPy walks only the band where the recurrence is
 /// non-zero, which is `O(n1 · h/b)` and independent of `n` in width. Ours walked
-/// the whole rectangle. See `ks_2samp_exact_pvalue` and `KS_2SAMP_BANDED_EXACT`.
+/// the whole rectangle. The two-sided exact path is now SciPy's own windowed
+/// recursion; see `ks_outer_prob_inside_method`.
 const KS_2SAMP_EXACT_MAX_N: usize = 10_000;
 
-/// Walk only the non-zero band of the exact KS recurrence (`true`, shipping) instead of
-/// the full `(n1+1) × (n2+1)` rectangle. Bit-identical — see `ks_2samp_exact_pvalue`.
-pub static KS_2SAMP_BANDED_EXACT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
 /// Use the closed-form reflection series for EQUAL sample sizes (`true`, shipping), which
-/// is what SciPy does, instead of the path-counting sweep.
+/// is what SciPy does, instead of the lattice recursion SciPy uses for unequal sizes.
 ///
 /// ACCURACY CONTRACT: the two arms are NOT bit-identical to each other, and cannot be —
 /// they are different formulas for the same exact quantity. The contract is against SciPy,
 /// not against the other arm: the series reproduces `scipy.stats.ks_2samp(method='exact')`
 /// to within a few ULP across the pinned table in
-/// `ks_2samp_square_series_matches_scipy_exact_pvalues`, while the sweep it replaces forms
-/// the p-value as `1 − inside` and loses most of its significant digits once `p` is small
-/// (relative error 9e-5 at n = 25, three orders of magnitude at n = 10000). Switching this
-/// off restores the less accurate arm; it is not a neutral A/B.
+/// `ks_2samp_square_series_matches_scipy_exact_pvalues`. The off arm is
+/// `ks_outer_prob_inside_method`, which carries `1 − p` directly and so keeps its relative
+/// precision in the tail too (SciPy's own two routines agree to 1.3e-15 relative at equal
+/// sizes up to n = 1000); it costs `O(n · h)` against the series' `O(n + h)`. A speed lever,
+/// not an accuracy one — `ks_2samp_square_series_toggle_drives_both_arms` holds both arms to
+/// SciPy. (Until frankenscipy-qwa3t the off arm was a `1 − inside` sweep that lost most of
+/// its digits once `p` was small.)
 pub static KS_2SAMP_SQUARE_SERIES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+
+/// Accept an exact KS probability, or decline it so the caller falls back to the
+/// asymptotic p-value — which is what SciPy does, and NOT what clamping does.
+///
+/// `_attempt_exact_2kssamp` ends `if not (0 <= prob <= 1): return False, d, prob`, and its
+/// caller then recomputes the p-value asymptotically. Clamping instead reports a value the
+/// exact method never produced: at n1 = n2 = 60 with h = 2 the series returns
+/// 1.0000000000000002, where clamping says `1.0` and SciPy says `0.999999999998711697`.
+/// An out-of-range result is the exact path announcing it has lost its own precision, so
+/// the honest response is to stop using it rather than to round it into range.
+///
+/// The decline carries the SNAPPED statistic `h / lcm`: SciPy's fallback evaluates the
+/// asymptotic p-value at that `d` and reports it as the statistic.
+fn ks_exact_probability_or_fallback(snapped_d: f64, probability: f64) -> Result<(f64, f64), f64> {
+    if (0.0..=1.0).contains(&probability) {
+        Ok((snapped_d, probability))
+    } else {
+        Err(snapped_d)
+    }
+}
 
 /// Two-sided `Pr(D_{n,n} >= h/n)`: the proportion of lattice paths passing outside the
 /// diagonals `x − y = ±h`, evaluated as SciPy's `_compute_prob_outside_square` does.
@@ -97,23 +118,6 @@ pub static KS_2SAMP_SQUARE_SERIES: std::sync::atomic::AtomicBool =
 /// The operation ORDER mirrors SciPy's line for line — `(n − k·h − j) * p1 / (n + k·h + j + 1)`
 /// with the numerator and denominator formed in exact integer arithmetic before the
 /// conversion to float — so the two agree to the last bit rather than merely closely.
-/// Accept an exact KS probability, or decline it so the caller falls back to the
-/// asymptotic p-value — which is what SciPy does, and NOT what clamping does.
-///
-/// `_attempt_exact_2kssamp` ends `if not (0 <= prob <= 1): return False, d, prob`, and its
-/// caller then recomputes the p-value asymptotically. Clamping instead reports a value the
-/// exact method never produced: at n1 = n2 = 60 with h = 2 the series returns
-/// 1.0000000000000002, where clamping says `1.0` and SciPy says `0.999999999998711697`.
-/// An out-of-range result is the exact path announcing it has lost its own precision, so
-/// the honest response is to stop using it rather than to round it into range.
-fn ks_exact_probability_or_fallback(snapped_d: f64, probability: f64) -> Option<(f64, f64)> {
-    if (0.0..=1.0).contains(&probability) {
-        Some((snapped_d, probability))
-    } else {
-        None
-    }
-}
-
 fn ks_prob_outside_square(n: usize, h: u64) -> f64 {
     debug_assert!(h > 0, "h == 0 is handled by the caller as p = 1");
     let n_i = n as i64;
@@ -47681,7 +47685,8 @@ pub fn cramervonmises_2samp_with_method(
 ///
 /// Tests H0: two samples come from the same continuous distribution.
 ///
-/// Matches `scipy.stats.ks_2samp(data1, data2)`.
+/// Matches `scipy.stats.ks_2samp(data1, data2)` with its defaults, `alternative='two-sided'`
+/// and `method='auto'`; see [`ks_2samp_alternative`] for the p-value's method selection.
 pub fn ks_2samp(data1: &[f64], data2: &[f64]) -> GoodnessOfFitResult {
     let n1 = data1.len();
     let n2 = data2.len();
@@ -47736,25 +47741,23 @@ fn ks_2samp_sorted(sorted1: &[f64], sorted2: &[f64]) -> GoodnessOfFitResult {
         d_stat = d_stat.max(diff);
     }
 
-    let (statistic, pvalue) =
-        if let Some((exact_d, exact_pvalue)) = ks_2samp_exact_pvalue(d_stat, n1, n2) {
-            (exact_d, exact_pvalue)
-        } else {
-            let en = (n1f * n2f / (n1f + n2f)).sqrt();
-            (d_stat, kolmogorov_pvalue(d_stat, en * en))
-        };
-
+    let (statistic, pvalue) = ks_2samp_pvalue(d_stat, n1, n2, Ks2SampAlternative::TwoSided);
     GoodnessOfFitResult { statistic, pvalue }
 }
 
 /// Two-sample Kolmogorov-Smirnov test with alternative hypothesis.
 ///
-/// Matches `scipy.stats.ks_2samp(data1, data2, alternative=...)`.
+/// Matches `scipy.stats.ks_2samp(data1, data2, alternative=...)` with SciPy's default
+/// `method='auto'`.
 ///
 /// * `alternative` - "two-sided" (default), "less", or "greater"
 ///   - "two-sided": max|F1(x) - F2(x)|
 ///   - "greater": max(F1(x) - F2(x)) - tests if F1 > F2
 ///   - "less": max(F2(x) - F1(x)) - tests if F1 < F2
+///
+/// The p-value is SciPy's 'auto' choice for EVERY alternative: the exact null distribution
+/// whenever `max(n1, n2) <= 10000`, the asymptotic one above that, and the asymptotic one
+/// again wherever the exact computation fails in floating point (see `ks_2samp_pvalue`).
 pub fn ks_2samp_alternative(
     data1: &[f64],
     data2: &[f64],
@@ -47798,172 +47801,283 @@ pub fn ks_2samp_alternative(
         d_minus = d_minus.max(-diff);
     }
 
-    let (d_stat, mode) = match alternative {
-        "greater" => (d_plus, "greater"),
-        "less" => (d_minus, "less"),
-        _ => (d_plus.max(d_minus), "two-sided"),
+    let (d_stat, alternative) = match alternative {
+        "greater" => (d_plus, Ks2SampAlternative::Greater),
+        "less" => (d_minus, Ks2SampAlternative::Less),
+        _ => (d_plus.max(d_minus), Ks2SampAlternative::TwoSided),
     };
 
-    let en = (n1f * n2f / (n1f + n2f)).sqrt();
-    let pvalue = if mode == "two-sided" {
-        kolmogorov_pvalue(d_stat, en * en)
-    } else {
-        // One-sided asymptotic: Hodges' Eqn 5.3 correction (matches
-        // scipy.stats.ks_2samp asymp branch). scipy uses
-        //   z = sqrt(m*n/(m+n)) * d_stat
-        // where m = max(n1, n2), n = min(n1, n2). fsci's `en` above is
-        // ALREADY sqrt(n1*n2/(n1+n2)) (the inner ratio is already taken
-        // sqrt of), so z = en * d_stat directly — DON'T sqrt again.
-        //   expt = -2 z² - 2 z (m + 2n) / [3 sqrt(m n (m+n))]
-        // (See Hodges 1958, "The significance probability of the
-        // Smirnov two-sample test", Eqn 5.3.)
-        let z = en * d_stat;
-        let m = n1f.max(n2f);
-        let n_min = n1f.min(n2f);
-        let denom = (m * n_min * (m + n_min)).sqrt();
-        let correction = if denom > 0.0 {
-            2.0 * z * (m + 2.0 * n_min) / denom / 3.0
-        } else {
-            0.0
-        };
-        let expt = -2.0 * z * z - correction;
-        expt.exp()
-    };
-
-    GoodnessOfFitResult {
-        statistic: d_stat,
-        pvalue: pvalue.clamp(0.0, 1.0),
-    }
+    let (statistic, pvalue) = ks_2samp_pvalue(d_stat, n1, n2, alternative);
+    GoodnessOfFitResult { statistic, pvalue }
 }
 
-fn ks_2samp_exact_pvalue(d: f64, n1: usize, n2: usize) -> Option<(f64, f64)> {
-    if n1 == 0 || n2 == 0 || n1.max(n2) > KS_2SAMP_EXACT_MAX_N {
+/// Which tail(s) a two-sample KS p-value is for: `scipy.stats.ks_2samp`'s `alternative`.
+/// `Less` and `Greater` share one null distribution; they differ only in which directed
+/// statistic (`D⁻` or `D⁺`) is fed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ks2SampAlternative {
+    TwoSided,
+    Less,
+    Greater,
+}
+
+/// `(statistic, pvalue)` of `scipy.stats.ks_2samp` for the observed statistic `d`, under
+/// SciPy's default `method='auto'`.
+///
+/// 'auto' means 'exact' whenever `max(n1, n2) <= MAX_AUTO_N` (10000) — for EVERY alternative,
+/// not only two-sided — and 'asymp' above it. An exact attempt that fails in floating point
+/// (`_attempt_exact_2kssamp` returning `success=False`) drops to 'asymp' as well, and then the
+/// asymptotic p-value is evaluated at, and the statistic reported as, the value snapped to the
+/// lattice `h / lcm(n1, n2)`, exactly as SciPy's are. SciPy clips the result into `[0, 1]`.
+///
+/// This replaced two divergences (frankenscipy-qwa3t): the one-sided alternatives were ALWAYS
+/// asymptotic (Hodges) — for x = 1..=10 against y = 3..=12, `alternative='greater'`, that is
+/// 0.5488 where SciPy's exact value is 0.6818 — and the two-sided asymptotic branch was the
+/// n → ∞ Kolmogorov limit series instead of SciPy's finite-n `kstwo.sf(d, round(en))`.
+fn ks_2samp_pvalue(d: f64, n1: usize, n2: usize, alternative: Ks2SampAlternative) -> (f64, f64) {
+    let d = if n1.max(n2) <= KS_2SAMP_EXACT_MAX_N {
+        match ks_2samp_exact_pvalue(d, n1, n2, alternative) {
+            Ok(exact) => return exact,
+            Err(snapped_d) => snapped_d,
+        }
+    } else {
+        d
+    };
+    (
+        d,
+        ks_2samp_asymptotic_pvalue(d, n1, n2, alternative).clamp(0.0, 1.0),
+    )
+}
+
+/// SciPy's `method='asymp'` p-value for the two-sample KS statistic `d`.
+///
+/// With `m >= n` the larger and smaller sample sizes and `en = m·n / (m + n)`:
+/// * two-sided: `kstwo.sf(d, round(en))`, the EXACT finite-n law of the one-sample statistic
+///   at the effective size — not the n → ∞ Kolmogorov limit. `np.round` rounds half to even,
+///   so n1 = n2 = 10001 (en = 5000.5) uses size 5000, not 5001.
+/// * one-sided: Hodges' (1958) Eqn 5.3 approximation
+///   `exp(−2z² − 2z·(m + 2n) / √(m·n·(m + n)) / 3)` with `z = √en · d`.
+fn ks_2samp_asymptotic_pvalue(
+    d: f64,
+    n1: usize,
+    n2: usize,
+    alternative: Ks2SampAlternative,
+) -> f64 {
+    let (m, n) = if n1 >= n2 {
+        (n1 as f64, n2 as f64)
+    } else {
+        (n2 as f64, n1 as f64)
+    };
+    let en = m * n / (m + n);
+    if alternative == Ks2SampAlternative::TwoSided {
+        let size = en.round_ties_even();
+        // kstwo requires an integer size >= 1 and SciPy's bad-argument value is NaN. Only
+        // en = 1/2 (n1 = n2 = 1) rounds to 0, and 'auto' takes the exact path there.
+        if size < 1.0 {
+            return f64::NAN;
+        }
+        return kolmogn(size as usize, d, false);
+    }
+    let z = en.sqrt() * d;
+    // SciPy's `z**2` is numpy's float64 scalar power, i.e. libm `pow(z, 2.0)`, which rounds
+    // differently from `z * z` on about 0.1% of inputs (measured: 1681 of 2e6). LLVM folds a
+    // literal `powf(2.0)` into `z * z`, so the exponent goes through `black_box` to keep the
+    // libm call SciPy makes.
+    let z_squared = z.powf(std::hint::black_box(2.0));
+    let expt = -2.0 * z_squared - 2.0 * z * (m + 2.0 * n) / (m * n * (m + n)).sqrt() / 3.0;
+    expt.exp()
+}
+
+/// One-sided `Pr(D⁺ >= h / lcm(n1, n2))` under the null, the exact branch of SciPy's
+/// `_attempt_exact_2kssamp` for `alternative='less'` / `'greater'`.
+///
+/// `None` where SciPy's attempt fails in floating point and it falls back to the asymptotic
+/// p-value: an overflow or invalid operation raised under its
+/// `np.errstate(over='raise', invalid='raise')`, a binomial `C(n1 + n2, n1)` that is infinite,
+/// or a path count exceeding it. At max(n1, n2) <= 10000 this is what sends roughly
+/// balanced samples past ~500 each (where `C(n1 + n2, n1)` overflows) to Hodges' formula.
+fn ks_one_sided_exact_probability(n1: usize, n2: usize, g: u64, h: u64) -> Option<f64> {
+    if n1 == n2 {
+        // SciPy: `np.prod((n1 - j) / (n1 + j + 1.0))` over j < h, which is
+        // `C(2n, n − h) / C(2n, n)` evaluated as a product because forming the two binomials
+        // "incurs roundoff errors from special.binom". numpy reduces a product left to right.
+        debug_assert!(h as usize <= n1, "h <= lcm = n1 for equal sample sizes");
+        let mut probability = 1.0_f64;
+        for j in 0..h as usize {
+            probability *= (n1 - j) as f64 / (n1 + j + 1) as f64;
+        }
+        return Some(probability);
+    }
+    let num_paths = ks_count_paths_outside(n1, n2, g, h)?;
+    let total = fsci_special::binom((n1 + n2) as f64, n1 as f64);
+    if !total.is_finite() || num_paths > total {
         return None;
+    }
+    Some(num_paths / total)
+}
+
+/// SciPy's `_count_paths_outside_method(m, n, g, h)`: the number of lattice paths from (0, 0)
+/// to (m, n) that at some point (x, y) satisfy `m·y <= n·x − h·g` (Hodges' treatment of
+/// Drion/Gnedenko/Korolyuk).
+///
+/// `B[j]` counts the paths to the j-th boundary point `(x_j, j)` that have not touched the
+/// boundary before, as `C(x_j + j, j)` minus the paths that already had; the count is then
+/// `Σ B[j]·C((m − x_j) + (n − j), n − j)`.
+///
+/// Every binomial is `fsci_special::binom`, SciPy's `special.binom`, and the accumulation
+/// order is SciPy's. That matters more than it looks: special.binom's own rounding on these
+/// arguments (up to ~3e-11 relative, from its log-gamma route) DOMINATES the error of SciPy's
+/// p-value, so reproducing SciPy means reproducing those binomials, not computing the count
+/// more accurately.
+///
+/// `None` at the first non-finite intermediate. Under SciPy's errstate an overflow raises; an
+/// infinity produced without raising (a division by a zero beta inside `binom`) reaches the
+/// final count as ±inf or NaN, which SciPy's range checks then reject. Either way its exact
+/// attempt fails, and stopping early is also what bounds the cost at O(j²) for the few hundred
+/// rows before the binomials overflow.
+fn ks_count_paths_outside(m: usize, n: usize, g: u64, h: u64) -> Option<f64> {
+    let (m, n) = if m < n { (n, m) } else { (m, n) };
+    let (m, n, g, h) = (m as i64, n as i64, g as i64, h as i64);
+    let binom = |top: i64, bottom: i64| fsci_special::binom(top as f64, bottom as f64);
+    let mg = m / g;
+    let ng = n / g;
+    // Python floor division: `mg - h` is negative once h > mg. With h <= lcm the row count is
+    // at least 1, so the `lxj == 0` branch below is SciPy's guard rather than a live case.
+    let lxj = usize::try_from(n + (mg - h).div_euclid(mg)).ok()?;
+    if lxj == 0 {
+        let total = binom(m + n, n);
+        return total.is_finite().then_some(total);
+    }
+    // Wherever n·x/m + ng·h crosses an integer: the x at which the boundary is first reached
+    // on row j.
+    let xj: Vec<i64> = (0..lxj as i64)
+        .map(|j| (h + mg * j + ng - 1).div_euclid(ng))
+        .collect();
+    let mut b = vec![0.0_f64; lxj];
+    b[0] = 1.0;
+    for j in 1..lxj {
+        let (x_j, row) = (xj[j], j as i64);
+        let mut b_j = binom(x_j + row, row);
+        for (i, (&x_i, &b_i)) in xj.iter().zip(b.iter()).enumerate().take(j) {
+            let steps = row - i as i64;
+            b_j -= binom(x_j - x_i + steps, steps) * b_i;
+        }
+        if !b_j.is_finite() {
+            return None;
+        }
+        b[j] = b_j;
+    }
+    let mut num_paths = 0.0_f64;
+    for (j, (&x_j, &b_j)) in xj.iter().zip(b.iter()).enumerate() {
+        let rest = n - j as i64;
+        num_paths += b_j * binom((m - x_j) + rest, rest);
+    }
+    num_paths.is_finite().then_some(num_paths)
+}
+
+/// SciPy's `_attempt_exact_2kssamp(n1, n2, g, d, alternative)`: `Ok((d, p))` with the statistic
+/// snapped to `h / lcm(n1, n2)` and the exact null p-value, or `Err(snapped_d)` where SciPy's
+/// attempt reports failure and it computes the asymptotic p-value instead.
+fn ks_2samp_exact_pvalue(
+    d: f64,
+    n1: usize,
+    n2: usize,
+    alternative: Ks2SampAlternative,
+) -> Result<(f64, f64), f64> {
+    if n1 == 0 || n2 == 0 {
+        return Err(d);
     }
 
     let n1u = n1 as u64;
     let n2u = n2 as u64;
     let g = gcd_u64(n1u, n2u);
-    let lcm = (n1u / g).checked_mul(n2u)?;
-    let h = (d * lcm as f64).round() as u64;
+    let Some(lcm) = (n1u / g).checked_mul(n2u) else {
+        return Err(d);
+    };
+    // `int(np.round(d * lcm))`: numpy rounds half to even.
+    let h = (d * lcm as f64).round_ties_even() as u64;
     let snapped_d = h as f64 / lcm as f64;
 
     if h == 0 {
-        return Some((snapped_d, 1.0));
+        return Ok((snapped_d, 1.0));
+    }
+
+    if alternative != Ks2SampAlternative::TwoSided {
+        return match ks_one_sided_exact_probability(n1, n2, g, h) {
+            Some(probability) => ks_exact_probability_or_fallback(snapped_d, probability),
+            None => Err(snapped_d),
+        };
     }
 
     // EQUAL SAMPLE SIZES HAVE A CLOSED FORM AND SciPy USES IT. For `n1 == n2` the
     // two-sided probability is an alternating series over reflections,
     //   P = 2·A₀·(1 − A₁·(1 − A₂·(1 − …)))
     // with `floor(n/h) + 1` terms of `h` factors each, so the whole thing is `O(n + h)`
-    // against the band sweep's `O(n · h)`. At n1 = n2 = 10000 with h ≈ 1850 that is ~12k
-    // operations instead of ~18.5M, and it is what `scipy.stats.ks_2samp` actually calls
-    // (`_compute_prob_outside_square`); the band DP is only its UNEQUAL-size path.
-    //
-    // This is a DIFFERENT FORMULA, not a reordering, so it does not agree bit-for-bit with
-    // the sweep it replaces — it agrees with SCIPY, which is the contract. The sweep and
-    // the series are both exact in exact arithmetic; in floating point the series is the
-    // better-conditioned of the two (it is written in Horner form precisely to avoid the
-    // subtractive cancellation of the binomial-difference formulation), and before this
-    // change our p-value at n=10000 differed from SciPy's by orders of magnitude on the
-    // tiny values where the two methods part company.
+    // against the lattice recursion's `O(n · h)`. At n1 = n2 = 10000 with h ≈ 1850 that is
+    // ~12k operations instead of ~18.5M, and it is what `scipy.stats.ks_2samp` actually calls
+    // (`_compute_prob_outside_square`); the recursion is only its UNEQUAL-size path.
     if n1 == n2 && KS_2SAMP_SQUARE_SERIES.load(std::sync::atomic::Ordering::Relaxed) {
         return ks_exact_probability_or_fallback(snapped_d, ks_prob_outside_square(n1, h));
     }
+    ks_exact_probability_or_fallback(snapped_d, ks_outer_prob_inside_method(n1, n2, g, h))
+}
 
-    let a = (n2u / g) as i128;
-    let b = (n1u / g) as i128;
-    let mut inside_prob = vec![0.0_f64; n2 + 1];
-
-    if !KS_2SAMP_BANDED_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
-        for i in 0..=n1 {
-            let mut left_prob = 0.0_f64;
-            for (j, cell) in inside_prob.iter_mut().enumerate().take(n2 + 1) {
-                let top_prob = *cell;
-                let current = if i == 0 && j == 0 {
-                    1.0
-                } else {
-                    let delta = ((i as i128 * a) - (j as i128 * b)).unsigned_abs();
-                    if delta >= h as u128 {
-                        0.0
-                    } else if i == 0 {
-                        left_prob
-                    } else if j == 0 {
-                        top_prob
-                    } else {
-                        let denom = (i + j) as f64;
-                        top_prob * (i as f64 / denom) + left_prob * (j as f64 / denom)
-                    }
-                };
-                *cell = current;
-                left_prob = current;
-            }
+/// Two-sided `Pr(D_{m,n} >= h / lcm(m, n))`: SciPy's `_compute_outer_prob_inside_method`, the
+/// proportion of lattice paths from (0, 0) to (m, n) that do NOT stay strictly inside the
+/// diagonals `|x/m − y/n| < h / lcm(m, n)` (Hodges' "inside method").
+///
+/// The recursion carries `1 − p` rather than `p` (Viehmann 2021, arXiv:2102.08037): a cell
+/// OUTSIDE the band holds 1 (every path through it has exited), and a cell inside holds the
+/// probability that a path reaching it has already exited,
+/// `(A(x − 1, y)·x + A(x, y − 1)·y) / (x + y)`. The p-value is read off directly instead of as
+/// `1 − inside`, which is what keeps its relative precision in the tail. The inside-probability
+/// sweep this replaced returned `1 − (1 − 6.9e-44) = 2.2e-16` at n1 = 1000, n2 = 37,
+/// h = 35150, where SciPy says 6.92e-44 (frankenscipy-qwa3t).
+///
+/// Only a sliding window of one column is kept: column `x` is live for
+/// `floor((ng·x − h)/mg) < y < ceil((ng·x + h)/mg)`, so the cost is `O(m · h/mg)`. The window
+/// bounds are formed in floating point as SciPy forms them; quotients of integers below 2⁵³ by
+/// `mg <= 10000` sit at least `1/mg` from any integer they are not equal to, so the floor and
+/// ceil are the exact integer ones. Operation order is SciPy's line for line (a Python
+/// transcription of this function reproduces the compiled SciPy routine to the bit over 288
+/// (m, n, h) cases in both argument orders).
+fn ks_outer_prob_inside_method(m: usize, n: usize, g: u64, h: u64) -> f64 {
+    let (m, n) = if m < n { (n, m) } else { (m, n) };
+    let g = g as usize;
+    let (mg, ng) = ((m / g) as f64, (n / g) as f64);
+    let h = h as f64;
+    let mut minj = 0_usize;
+    let mut maxj = ((h / mg).ceil() as usize).min(n + 1);
+    let mut curlen = maxj - minj;
+    let len_a = (2 * maxj + 2).min(n + 1);
+    // Column 0: inside the band (y < maxj) no path has exited yet; beyond it every one has.
+    let mut column = vec![1.0_f64; len_a];
+    column[..maxj.min(len_a)].fill(0.0);
+    for i in 1..=m {
+        let (lastminj, lastlen) = (minj, curlen);
+        let x = i as f64;
+        minj = ((((ng * x - h) / mg).floor() as i64) + 1).max(0) as usize;
+        minj = minj.min(n);
+        maxj = (((ng * x + h) / mg).ceil() as usize).min(n + 1);
+        if maxj <= minj {
+            return 1.0;
         }
-        return ks_exact_probability_or_fallback(snapped_d, 1.0 - inside_prob[n2]);
-    }
-
-    // BANDED SWEEP. The recurrence sets every cell with `|i·a − j·b| >= h` to zero, and
-    // those cells are the overwhelming majority: the survivors form a band around the
-    // diagonal whose width is about `2h/b`, independent of `n`. Walking the full rectangle
-    // therefore costs `n1·n2` to compute a `n1 · bandwidth` answer — 10⁸ cells at
-    // n1=n2=10000 where roughly 2·10⁶ are non-zero.
-    //
-    // Solving `|i·a − j·b| < h` for `j` gives the row's live span directly, so the zeros are
-    // never visited rather than being visited and discarded.
-    //
-    // BIT-IDENTICAL to the full sweep, and the reasons are worth stating because they are
-    // what make skipping safe rather than merely plausible:
-    //   * arithmetic inside a live cell is untouched, and cells outside the band evaluate
-    //     to exactly 0.0 in the full sweep, which is what the untouched buffer already holds;
-    //   * `left_prob` entering a row's band is the cell just left of it, which is outside
-    //     the band and so 0.0 — the same value the full sweep would have carried in;
-    //   * the band's start is non-decreasing in `i` (its centre `i·a/b` only moves right),
-    //     so a later row never reads a cell to the left of its own span, and stale values
-    //     from earlier rows are unreachable rather than merely unlikely;
-    //   * cells to the RIGHT of a row's span have never been written by any earlier row,
-    //     since spans only move right, so they are still the initial 0.0.
-    // `inside_prob[n2]` is always live on the last row: `|n1·a − n2·b| == 0 < h`.
-    // `y` is always positive here (`b = n1/g >= 1`). Rust's `/` truncates toward zero, so a
-    // negative numerator needs correcting by one to reach floor/ceil; `i128::div_ceil` is
-    // still unstable, hence the explicit form.
-    let floor_div = |x: i128, y: i128| -> i128 {
-        let q = x / y;
-        if x % y != 0 && x < 0 { q - 1 } else { q }
-    };
-    let ceil_div = |x: i128, y: i128| -> i128 {
-        let q = x / y;
-        if x % y != 0 && x > 0 { q + 1 } else { q }
-    };
-    let h_i = h as i128;
-    let n2_i = n2 as i128;
-    for i in 0..=n1 {
-        let center = i as i128 * a;
-        // j must satisfy  (i·a − h)/b  <  j  <  (i·a + h)/b
-        let lo = (floor_div(center - h_i, b) + 1).max(0);
-        let hi = (ceil_div(center + h_i, b) - 1).min(n2_i);
-        if lo > hi {
-            continue;
+        // The cell just below the window is outside the band, so it holds 1 — unless the
+        // window starts at y = 0 and there is no such cell.
+        let shift = minj - lastminj;
+        let mut val = if minj == 0 { 0.0 } else { 1.0 };
+        for jj in 0..maxj - minj {
+            let y = (jj + minj) as f64;
+            val = (column[jj + shift] * x + val * y) / (x + y);
+            column[jj] = val;
         }
-        let (lo, hi) = (lo as usize, hi as usize);
-        let mut left_prob = 0.0_f64;
-        for (j, cell) in inside_prob.iter_mut().enumerate().take(hi + 1).skip(lo) {
-            let top_prob = *cell;
-            let current = if i == 0 && j == 0 {
-                1.0
-            } else if i == 0 {
-                left_prob
-            } else if j == 0 {
-                top_prob
-            } else {
-                let denom = (i + j) as f64;
-                top_prob * (i as f64 / denom) + left_prob * (j as f64 / denom)
-            };
-            *cell = current;
-            left_prob = current;
+        curlen = maxj - minj;
+        if lastlen > curlen {
+            // Carried-over cells that the narrower window no longer covers are outside it.
+            column[curlen..lastlen.min(len_a)].fill(1.0);
         }
     }
-
-    ks_exact_probability_or_fallback(snapped_d, 1.0 - inside_prob[n2])
+    column[maxj - minj - 1]
 }
 
 fn shapiro_poly(coeffs: &[f64], x: f64) -> f64 {
@@ -48586,37 +48700,6 @@ fn anderson_critical_values_norm(n: f64) -> [f64; 5] {
         round3(avals[3] / scale),
         round3(avals[4] / scale),
     ]
-}
-
-/// Kolmogorov distribution p-value: P(D_n >= d).
-/// Uses the Kolmogorov-Smirnov limiting distribution approximation.
-fn kolmogorov_pvalue(d: f64, n: f64) -> f64 {
-    if d <= 0.0 {
-        return 1.0;
-    }
-    if d >= 1.0 {
-        return 0.0;
-    }
-
-    // Effective value: sqrt(n) * d
-    let s = n.sqrt() * d;
-
-    // For large s, use asymptotic series (Kolmogorov's formula):
-    // P(sqrt(n)*D_n > s) ≈ 2 * sum_{k=1}^{inf} (-1)^{k+1} * exp(-2*k²*s²)
-    let mut pval = 0.0;
-    for k in 1..=100 {
-        let kf = k as f64;
-        let term = (-2.0 * kf * kf * s * s).exp();
-        if term < 1e-20 {
-            break;
-        }
-        if k % 2 == 1 {
-            pval += term;
-        } else {
-            pval -= term;
-        }
-    }
-    (2.0 * pval).clamp(0.0, 1.0)
 }
 
 /// D'Agostino's skewness test z-score.
@@ -85255,6 +85338,335 @@ mod tests {
         );
     }
 
+    /// `i/n + shift` for i in 0..n: IEEE-exact in both languages, so the SciPy goldens below
+    /// were computed on the identical samples (`np.arange(n) / n + shift`).
+    fn ks_grid(n: usize, shift: f64) -> Vec<f64> {
+        (0..n).map(|i| i as f64 / n as f64 + shift).collect()
+    }
+
+    fn assert_rel(got: f64, expected: f64, rel_tol: f64, what: &str) {
+        let rel = if got == expected {
+            0.0
+        } else {
+            (got - expected).abs() / expected.abs()
+        };
+        assert!(
+            rel <= rel_tol,
+            "{what}: got {got:e}, scipy {expected:e}, relative difference {rel:e} > {rel_tol:e}"
+        );
+    }
+
+    /// frankenscipy-qwa3t: the one-sided alternatives use SciPy's EXACT null distribution
+    /// whenever max(n1, n2) <= 10000, as `scipy.stats.ks_2samp`'s default `method='auto'`
+    /// does for every alternative.
+    ///
+    /// Goldens are `scipy.stats.ks_2samp(x, y, alternative=...)` on scipy 1.17.1. The cases
+    /// cover the equal-size closed form, small and coprime unequal sizes, and the lattice path
+    /// count with binomials past Γ's overflow point (n1 + n2 = 750 and 10050), where
+    /// `special.binom` goes through log-gamma and its own rounding is what the p-value carries.
+    /// 1e-14 relative is two orders tighter than the 1.1e-12 that a differently grouped
+    /// log-beta in `fsci_special::binom` produced here.
+    ///
+    /// NEGATIVE ARM: the last column is SciPy's `method='asymp'` value (Hodges' formula), which
+    /// is what this function returned for every one-sided test before. It is at least 1.5e-3
+    /// relative away from the exact value on every case, so returning it fails every row.
+    #[test]
+    fn ks_2samp_one_sided_uses_scipys_exact_distribution() {
+        let ints = |lo: f64| -> Vec<f64> { (0..10).map(|i| lo + f64::from(i)).collect() };
+        // (label, x, y, alternative, statistic, exact p-value, Hodges p-value)
+        let cases: Vec<(&str, Vec<f64>, Vec<f64>, &str, f64, f64, f64)> = vec![
+            (
+                "equal n=10",
+                ints(1.0),
+                ints(3.0),
+                "greater",
+                0.2,
+                0.681_818_181_818_181_8,
+                0.548_811_636_094_026_3,
+            ),
+            (
+                "equal n=10, swapped",
+                ints(3.0),
+                ints(1.0),
+                "less",
+                0.2,
+                0.681_818_181_818_181_8,
+                0.548_811_636_094_026_3,
+            ),
+            (
+                "3 vs 4",
+                vec![0.0, 1.0, 2.0],
+                vec![0.0, 2.0, 4.0, 6.0],
+                "greater",
+                0.5,
+                0.342_857_142_857_142_86,
+                0.263_597_138_115_726_8,
+            ),
+            (
+                "7 vs 11",
+                ks_grid(7, 0.0),
+                ks_grid(11, 0.2),
+                "greater",
+                0.337_662_337_662_337_66,
+                0.311_777_275_012_569_13,
+                0.275_788_975_254_261_8,
+            ),
+            (
+                "300 vs 450, shift 0.02",
+                ks_grid(300, 0.0),
+                ks_grid(450, 0.02),
+                "greater",
+                0.023_333_333_333_333_334,
+                0.813_166_055_668_039_1,
+                0.804_304_156_065_572_3,
+            ),
+            (
+                "300 vs 450, shift 0.1",
+                ks_grid(300, 0.0),
+                ks_grid(450, 0.1),
+                "greater",
+                0.103_333_333_333_333_33,
+                0.020_357_968_682_129_46,
+                0.019_439_573_014_914_22,
+            ),
+            (
+                "300 vs 450, shift 0.3",
+                ks_grid(300, 0.0),
+                ks_grid(450, 0.3),
+                "greater",
+                0.303_333_333_333_333_34,
+                2.186_661_237_845_517e-15,
+                3.100_815_941_518_157_4e-15,
+            ),
+            (
+                "10000 vs 50, shift 0.05",
+                ks_grid(10_000, 0.0),
+                ks_grid(50, 0.05),
+                "greater",
+                0.0501,
+                0.754_469_773_371_997_7,
+                0.753_279_899_354_326_5,
+            ),
+            (
+                "50 vs 10000, shift 0.3",
+                ks_grid(50, 0.3),
+                ks_grid(10_000, 0.0),
+                "less",
+                0.3001,
+                9.054_397_568_428_54e-5,
+                1.049_258_079_939_956_2e-4,
+            ),
+            (
+                "10000 vs 50, shift 0.8",
+                ks_grid(10_000, 0.0),
+                ks_grid(50, 0.8),
+                "greater",
+                0.8001,
+                5.078_003_083_770_92e-35,
+                1.269_744_170_533_918e-28,
+            ),
+        ];
+        for (label, x, y, alternative, statistic, exact, hodges) in &cases {
+            let r = ks_2samp_alternative(x, y, alternative);
+            assert_eq!(
+                r.statistic.to_bits(),
+                statistic.to_bits(),
+                "{label}: statistic {} is not SciPy's snapped {statistic}",
+                r.statistic
+            );
+            assert_rel(r.pvalue, *exact, 1e-14, label);
+            assert!(
+                (exact - hodges).abs() > 1.5e-3 * exact,
+                "{label}: the Hodges control no longer differs from the exact value"
+            );
+        }
+        assert_eq!(cases.len(), 10, "case table was truncated");
+    }
+
+    /// Where SciPy's exact one-sided attempt fails in floating point it falls back to Hodges'
+    /// formula — evaluated at, and reporting, the statistic SNAPPED to `h / lcm`.
+    ///
+    /// n1 = 600, n2 = 700: `C(1300, 600)` overflows, so `_attempt_exact_2kssamp` returns
+    /// `success=False` and SciPy warns and switches to 'asymp'. The raw statistic is
+    /// 0.04166666666666666; SciPy's snapped one is 0.041666666666666664, and its p-value
+    /// 0.3127368545311932 is Hodges at the snapped value (at the raw one it is ...9326).
+    #[test]
+    fn ks_2samp_one_sided_falls_back_to_hodges_where_scipys_exact_attempt_overflows() {
+        let r = ks_2samp_alternative(&ks_grid(600, 0.0), &ks_grid(700, 0.04), "greater");
+        assert_eq!(
+            r.statistic.to_bits(),
+            0.041_666_666_666_666_664_f64.to_bits(),
+            "statistic {} is not SciPy's snapped value",
+            r.statistic
+        );
+        assert_rel(
+            r.pvalue,
+            0.312_736_854_531_193_2,
+            1e-15,
+            "600 vs 700 fallback",
+        );
+    }
+
+    /// The two-sided exact series at n1 = n2 = 60, h = 2 returns 1.0000000000000002; SciPy
+    /// rejects it and computes `kstwo.sf(1/30, round(en) = 30)` = 0.9999999999987117. The
+    /// Kolmogorov LIMIT series this fallback used before gave 0.9999999999999987, 1.3e-12 away.
+    #[test]
+    fn ks_2samp_two_sided_exact_failure_falls_back_to_finite_n_kstwo() {
+        let x: Vec<f64> = (0..60).map(f64::from).collect();
+        let y: Vec<f64> = (2..62).map(f64::from).collect();
+        let r = ks_2samp(&x, &y);
+        assert_eq!(r.statistic.to_bits(), (2.0_f64 / 60.0).to_bits());
+        assert_rel(
+            r.pvalue,
+            0.999_999_999_998_711_7,
+            1e-15,
+            "n=60, h=2 fallback",
+        );
+        assert!((r.pvalue - 0.999_999_999_999_998_7).abs() > 1e-12);
+    }
+
+    /// Unequal-size two-sided exact p-values keep their RELATIVE precision in the tail.
+    ///
+    /// SciPy computes them with Viehmann's recursion, which carries `1 − p` directly
+    /// (`ks_outer_prob_inside_method`). The sweep this replaced formed `1 − inside`, which
+    /// cancels to ~1e-16 or exactly 0 once `p` is small: 2.2e-16 on the first case, 0 on the
+    /// third. Goldens are `scipy.stats.ks_2samp(x, y)` on scipy 1.17.1; at 1e-13 relative the
+    /// old values fail the first three rows by 18 or more orders of magnitude.
+    #[test]
+    fn ks_2samp_unequal_two_sided_exact_keeps_relative_precision_in_the_tail() {
+        // (n1, n2, shift, statistic, p-value)
+        let cases: [(usize, usize, f64, f64, f64); 4] = [
+            (
+                1000,
+                37,
+                0.9,
+                0.900_972_972_972_973,
+                3.987_943_003_618_177e-35,
+            ),
+            (400, 600, 0.3, 0.3025, 7.532_635_011_509_064e-20),
+            (
+                50,
+                120,
+                0.8,
+                0.818_333_333_333_333_4,
+                1.332_671_312_455_572_1e-24,
+            ),
+            (
+                7,
+                300,
+                0.5,
+                0.640_952_380_952_380_9,
+                2.883_685_060_122_37e-3,
+            ),
+        ];
+        for (n1, n2, shift, statistic, pvalue) in cases {
+            let r = ks_2samp(&ks_grid(n1, 0.0), &ks_grid(n2, shift));
+            let label = format!("{n1} vs {n2}, shift {shift}");
+            assert_eq!(
+                r.statistic.to_bits(),
+                statistic.to_bits(),
+                "{label}: statistic"
+            );
+            assert_rel(r.pvalue, pvalue, 1e-13, &label);
+        }
+    }
+
+    /// Above max(n1, n2) = 10000 SciPy's 'auto' is 'asymp': two-sided is
+    /// `kstwo.sf(d, round(en))` — the finite-n law at the effective size, rounded half to even —
+    /// and one-sided is Hodges' formula; the statistic is not snapped.
+    ///
+    /// Goldens from scipy 1.17.1's own expressions at the same `d`. NEGATIVE ARMS: rounding
+    /// en = 5000.5 half-up (size 5001) gives 0.20836794917442292 on the n1 = n2 = 10001 row,
+    /// 4.5e-4 away; the Kolmogorov limit series this branch used before gives 0.40078 on the
+    /// (0.4, 10001, 5) row, where the finite-n value is 0.3088. At the data level the 20000 vs
+    /// 15000 case is also where the exact value (0.16470043265492335) would be wrong.
+    #[test]
+    fn ks_2samp_asymptotic_branch_matches_scipy() {
+        use super::{Ks2SampAlternative, ks_2samp_pvalue};
+        // (d, n1, n2, two-sided, one-sided)
+        let cases: [(f64, usize, usize, f64, f64); 6] = [
+            (
+                0.02,
+                20_000,
+                15_000,
+                0.002_075_777_528_008_902,
+                0.001_032_068_254_332_723_9,
+            ),
+            (
+                0.012,
+                20_000,
+                15_000,
+                0.167_980_180_230_582_37,
+                0.083_743_225_592_195_92,
+            ),
+            (
+                0.03,
+                10_001,
+                10_001,
+                2.415_923_442_266_681_7e-4,
+                1.196_547_554_174_215_6e-4,
+            ),
+            (
+                0.015,
+                10_001,
+                10_001,
+                0.208_461_420_961_862_04,
+                0.103_806_675_411_025_85,
+            ),
+            (
+                0.4,
+                10_001,
+                5,
+                0.308_799_999_999_999_5,
+                0.154_741_329_237_889_1,
+            ),
+            (
+                0.004,
+                400_000,
+                250_000,
+                0.014_514_576_031_475_995,
+                0.007_249_888_201_122_843_5,
+            ),
+        ];
+        for (d, n1, n2, two_sided, one_sided) in cases {
+            let label = format!("d={d} n1={n1} n2={n2}");
+            let (s, p) = ks_2samp_pvalue(d, n1, n2, Ks2SampAlternative::TwoSided);
+            assert_eq!(s.to_bits(), d.to_bits(), "{label}: statistic was altered");
+            assert_rel(p, two_sided, 1e-14, &format!("{label} two-sided"));
+            let (_, p) = ks_2samp_pvalue(d, n2, n1, Ks2SampAlternative::Greater);
+            assert_rel(p, one_sided, 1e-14, &format!("{label} one-sided"));
+        }
+        // Must-differ: the half-to-even rounding is observable on the en = 5000.5 row.
+        let half_up = super::kolmogn(5001, 0.015, false);
+        assert_rel(
+            half_up,
+            0.208_367_949_174_422_92,
+            1e-14,
+            "size 5001 control",
+        );
+        assert!((half_up - 0.208_461_420_961_862_04).abs() > 9e-5);
+
+        let (x, y) = (ks_grid(20_000, 0.0), ks_grid(15_000, 0.012));
+        let two = ks_2samp(&x, &y);
+        assert_eq!(
+            two.statistic.to_bits(),
+            0.012_050_000_000_000_005_f64.to_bits()
+        );
+        assert_rel(
+            two.pvalue,
+            0.164_553_256_101_858,
+            1e-14,
+            "20000 vs 15000 two-sided",
+        );
+        let greater = ks_2samp_alternative(&x, &y, "greater");
+        assert_rel(
+            greater.pvalue,
+            0.082_030_684_149_916_03,
+            1e-14,
+            "20000 vs 15000 greater",
+        );
+    }
+
     #[test]
     fn kstest_dispatches_to_two_sample() {
         let data1: Vec<f64> = (0..60)
@@ -109103,90 +109515,6 @@ mod tests {
             .max(1)
     }
 
-    /// frankenscipy-5f06d — the FLOAT-REDUCTION slice.
-    ///
-    /// The bead predicts this is where the next stale byte-identity doc lives:
-    /// both levers that have failed their exact gate so far (logsumexp, softmax)
-    /// were float sums split across chunks, while every lever that passed merged
-    /// INTEGER counts or reduced with min/max. These four all reduce floats, so
-    /// the exact gate is a real hypothesis test here, not a formality.
-    ///
-    /// Work gates, which is why the fixtures are this big. Shrinking any of them
-    /// below its gate sends BOTH arms down the same code path and makes that
-    /// lever's comparison vacuous:
-    ///   JENSENSHANNON_FORCE_SERIAL         n < 2 * 200_000  ->   400_000
-    ///   KS_1SAMP_FORCE_SERIAL              n < 2 * 400_000  ->   800_000
-    ///   DIFFERENTIAL_ENTROPY_FORCE_SERIAL  count < 1 << 16  ->    70_000 values
-    ///   CVM_FORCE_SERIAL                   n < 4_000_000    -> 4_000_000
-    ///
-    /// Index arithmetic is in u64 per the bead header: at these sizes a product
-    /// in i32 overflows, and a debug build panics on it. A panic raised from
-    /// inside a LEVER rather than from the fixture is a real defect in a
-    /// parallel arm that has never run at its own gate size.
-    /// The banded exact KS sweep must return EXACTLY the bits the full-rectangle sweep
-    /// returns, across the shapes where skipping cells can go wrong.
-    ///
-    /// Bit equality is the right assertion: skipping changes only WHICH cells are visited,
-    /// never the arithmetic in a visited one, so any difference means the band excluded a
-    /// live cell or read a stale one. A tolerance would pass a band that is off by one at
-    /// the edges, which shifts probability mass slightly and is invisible on well-separated
-    /// samples but wrong on close ones.
-    ///
-    /// The sweep matters more than the sizes here. `n1 == n2` makes `g == n` and `a == b == 1`
-    /// (the widest, most forgiving band); UNEQUAL and COPRIME sizes make `a != b`, so the
-    /// band is sheared and its per-row endpoints stop being symmetric — that is where a
-    /// floor/ceil sign error on a negative numerator shows up. Effect sizes span from
-    /// nearly-identical samples (a NARROW band, the case the lever exists for) to disjoint
-    /// ones (`d == 1`, band covers everything, so the two arms must agree trivially).
-    #[test]
-    fn ks_2samp_banded_exact_matches_full_sweep_bits() {
-        let _toggle_guard = toggle_guard();
-        use std::sync::atomic::Ordering;
-        let was = super::KS_2SAMP_BANDED_EXACT.load(Ordering::Relaxed);
-
-        let value = |i: usize, salt: usize| -> f64 {
-            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
-            k as f64 / 100_003.0
-        };
-        // Coprime and unequal pairs, not just square ones, so `a != b` shears the band.
-        for &(n1, n2) in &[
-            (2usize, 2usize),
-            (5, 5),
-            (7, 11),
-            (13, 4),
-            (31, 17),
-            (64, 64),
-            (97, 41),
-            (200, 150),
-        ] {
-            for &shift in &[0.0_f64, 0.02, 0.35, 5.0] {
-                let a: Vec<f64> = (0..n1).map(|i| value(i, 7)).collect();
-                let b: Vec<f64> = (0..n2).map(|i| value(i, 29) + shift).collect();
-
-                super::KS_2SAMP_BANDED_EXACT.store(false, Ordering::Relaxed);
-                let full = super::ks_2samp(&a, &b);
-                super::KS_2SAMP_BANDED_EXACT.store(true, Ordering::Relaxed);
-                let banded = super::ks_2samp(&a, &b);
-
-                assert_eq!(
-                    full.statistic.to_bits(),
-                    banded.statistic.to_bits(),
-                    "n1={n1} n2={n2} shift={shift}: statistic differs ({} vs {})",
-                    full.statistic,
-                    banded.statistic
-                );
-                assert_eq!(
-                    full.pvalue.to_bits(),
-                    banded.pvalue.to_bits(),
-                    "n1={n1} n2={n2} shift={shift}: pvalue differs ({:e} vs {:e})",
-                    full.pvalue,
-                    banded.pvalue
-                );
-            }
-        }
-        super::KS_2SAMP_BANDED_EXACT.store(was, Ordering::Relaxed);
-    }
-
     /// The closed-form reflection series must reproduce SciPy's exact p-value.
     ///
     /// Pinned against SciPy's OWN OUTPUT rather than against our other arm. The first
@@ -109241,14 +109569,19 @@ mod tests {
         super::KS_2SAMP_SQUARE_SERIES.store(was, Ordering::Relaxed);
     }
 
-    /// The sweep the series replaced must be DEMONSTRABLY worse on the case that motivated
-    /// the change, or the replacement was unjustified.
+    /// Both arms of `KS_2SAMP_SQUARE_SERIES` reproduce SciPy's exact equal-size p-value.
     ///
-    /// This is the second arm of the control: the test above shows the series is right, and
-    /// this shows the old path was wrong on the same input — so the swap fixed something
-    /// rather than merely moving between two acceptable answers.
+    /// The off arm sends equal sizes through `ks_outer_prob_inside_method`, the recursion
+    /// SciPy uses for UNEQUAL sizes. It carries `1 − p` directly, so unlike the `1 − inside`
+    /// sweep that used to be this arm (7.911449e-13 against SciPy's 7.910729e-13 on the
+    /// n = 25, shift 0.9 row) it holds relative precision in the tail: SciPy's own recursion
+    /// is within 2.2 ULP of its series on every row of this table.
+    ///
+    /// MUST-DIFFER: the arms are different formulas, and SciPy's two routines disagree in the
+    /// last bits on 10 of these 11 rows. If no row differs, flipping the toggle did not change
+    /// the code path and the agreement above proves nothing about the off arm.
     #[test]
-    fn ks_2samp_path_sweep_loses_precision_where_the_series_does_not() {
+    fn ks_2samp_square_series_toggle_drives_both_arms() {
         let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let was = super::KS_2SAMP_SQUARE_SERIES.load(Ordering::Relaxed);
@@ -109257,61 +109590,70 @@ mod tests {
             let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
             k as f64 / 100_003.0
         };
-        let (n, shift) = (25usize, 0.9_f64);
-        let scipy = 7.910_728_602_448_615_1e-13;
-        let a: Vec<f64> = (0..n).map(|i| value(i, 7)).collect();
-        let b: Vec<f64> = (0..n).map(|i| value(i, 29) + shift).collect();
-
-        super::KS_2SAMP_SQUARE_SERIES.store(false, Ordering::Relaxed);
-        let sweep = super::ks_2samp(&a, &b).pvalue;
-        super::KS_2SAMP_SQUARE_SERIES.store(true, Ordering::Relaxed);
-        let series = super::ks_2samp(&a, &b).pvalue;
-        super::KS_2SAMP_SQUARE_SERIES.store(was, Ordering::Relaxed);
-
-        let sweep_error = (sweep - scipy).abs() / scipy;
-        let series_error = (series - scipy).abs() / scipy;
-        assert!(
-            sweep_error > 1.0e-6,
-            "the `1 - inside` sweep is no longer inaccurate here (relative error \
-             {sweep_error:e}); if it has been fixed, this test and the series' \
-             justification both need revisiting"
-        );
-        assert!(
-            series_error < 1.0e-14,
-            "series relative error {series_error:e} against scipy is too large"
-        );
-    }
-
-    /// The band must actually EXCLUDE cells, or the test above passes vacuously because
-    /// both arms visited the same rectangle.
-    ///
-    /// Asserts the live-cell count is a small fraction of the rectangle for a
-    /// nearly-identical pair — the case the lever exists for — using the same span
-    /// arithmetic the kernel uses. Without this arm a band computed as `0..=n2` would
-    /// satisfy every bit-equality assertion while saving nothing.
-    #[test]
-    fn ks_2samp_band_actually_skips_most_of_the_rectangle() {
-        // Mirrors the kernel: for equal sizes g == n so a == b == 1 and h == round(d·n).
-        let (n1, n2) = (4000usize, 4000usize);
-        let (a, b) = (1i128, 1i128);
-        let h = 40i128; // d = 0.01, a realistic statistic for similar samples
-        let mut live = 0u64;
-        for i in 0..=n1 {
-            let center = i as i128 * a;
-            let lo = (((center - h) as f64 / b as f64).floor() as i128 + 1).max(0);
-            let hi = (((center + h) as f64 / b as f64).ceil() as i128 - 1).min(n2 as i128);
-            if lo <= hi {
-                live += (hi - lo + 1) as u64;
-            }
+        // (n, shift, scipy p-value) — the table of the series test above.
+        let reference: &[(usize, f64, f64)] = &[
+            (4, 0.25, 7.714_285_714_285_715_7e-1),
+            (4, 0.9, 2.857_142_857_142_857_8e-2),
+            (9, 0.25, 7.301_110_654_051_831_1e-1),
+            (9, 0.9, 4.113_533_525_298_230_2e-5),
+            (25, 0.0, 9.999_997_345_599_950_2e-1),
+            (25, 0.05, 9.955_315_531_751_669_5e-1),
+            (25, 0.25, 1.557_602_520_061_934_8e-1),
+            (25, 0.9, 7.910_728_602_448_615_1e-13),
+            (60, 0.05, 9.999_997_074_905_671_0e-1),
+            (60, 0.25, 1.578_762_838_272_507_5e-2),
+            (60, 0.9, 3.945_105_911_446_686_5e-27),
+        ];
+        let mut differing = 0;
+        for &(n, shift, expected) in reference {
+            let a: Vec<f64> = (0..n).map(|i| value(i, 7)).collect();
+            let b: Vec<f64> = (0..n).map(|i| value(i, 29) + shift).collect();
+            super::KS_2SAMP_SQUARE_SERIES.store(false, Ordering::Relaxed);
+            let recursion = super::ks_2samp(&a, &b).pvalue;
+            super::KS_2SAMP_SQUARE_SERIES.store(true, Ordering::Relaxed);
+            let series = super::ks_2samp(&a, &b).pvalue;
+            let tolerance = 8.0 * f64::EPSILON;
+            assert_rel(
+                series,
+                expected,
+                tolerance,
+                &format!("series n={n} shift={shift}"),
+            );
+            assert_rel(
+                recursion,
+                expected,
+                tolerance,
+                &format!("recursion n={n} shift={shift}"),
+            );
+            differing += usize::from(recursion.to_bits() != series.to_bits());
         }
-        let rectangle = (n1 as u64 + 1) * (n2 as u64 + 1);
+        super::KS_2SAMP_SQUARE_SERIES.store(was, Ordering::Relaxed);
         assert!(
-            live * 20 < rectangle,
-            "band covers {live} of {rectangle} cells, so skipping saves little and the \
-             bit-equality test above proves nothing about the lever"
+            differing > 0,
+            "the two arms agreed to the bit on every row, so the toggle switched nothing"
         );
     }
 
+    /// frankenscipy-5f06d — the FLOAT-REDUCTION slice.
+    ///
+    /// The bead predicts this is where the next stale byte-identity doc lives:
+    /// both levers that have failed their exact gate so far (logsumexp, softmax)
+    /// were float sums split across chunks, while every lever that passed merged
+    /// INTEGER counts or reduced with min/max. These four all reduce floats, so
+    /// the exact gate is a real hypothesis test here, not a formality.
+    ///
+    /// Work gates, which is why the fixtures are this big. Shrinking any of them
+    /// below its gate sends BOTH arms down the same code path and makes that
+    /// lever's comparison vacuous:
+    ///   JENSENSHANNON_FORCE_SERIAL         n < 2 * 200_000  ->   400_000
+    ///   KS_1SAMP_FORCE_SERIAL              n < 2 * 400_000  ->   800_000
+    ///   DIFFERENTIAL_ENTROPY_FORCE_SERIAL  count < 1 << 16  ->    70_000 values
+    ///   CVM_FORCE_SERIAL                   n < 4_000_000    -> 4_000_000
+    ///
+    /// Index arithmetic is in u64 per the bead header: at these sizes a product
+    /// in i32 overflows, and a debug build panics on it. A panic raised from
+    /// inside a LEVER rather than from the fixture is a real defect in a
+    /// parallel arm that has never run at its own gate size.
     #[test]
     fn float_reduction_gate_levers_ab() {
         let _toggle_guard = toggle_guard();

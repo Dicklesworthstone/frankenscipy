@@ -1981,12 +1981,10 @@
     "STAT_TOL": 1e-12
   },
   "diff_stats_ks_2samp.rs": {
-    "PVALUE_TOL": 1e-7,
-    "STAT_TOL": 1e-12
+    "PVALUE_REL_TOL": 1e-13
   },
   "diff_stats_ks_2samp_alt.rs": {
-    "PVALUE_TOL": 1e-7,
-    "STAT_TOL": 1e-12
+    "PVALUE_REL_TOL": 1e-13
   },
   "diff_stats_kstat.rs": {
     "ABS_TOL": 1e-12
