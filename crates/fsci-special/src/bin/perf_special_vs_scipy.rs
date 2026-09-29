@@ -79,20 +79,22 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialError, SpecialErrorKind, SpecialTensor, bdtr, bdtrc, bdtri, bdtrik, bdtrin, bei, beip,
-    ber, berp, beta, betainc, betaincc, betainccinv, betaincinv, betaln, binom, boxcox, boxcox1p,
-    cbrt, chdtr, chdtrc, chdtri, chdtriv, chndtr, chndtridf, chndtrinc, chndtrix, cosdg, cosm1,
-    cotdg, dawsn, digamma, ellipe, ellipeinc, ellipk, ellipkinc, ellipkm1, elliprc, elliprd,
-    elliprf, elliprg, elliprj, entr, erf, erfc, erfcinv, erfcx, erfi, erfinv, eval_gegenbauer,
-    eval_genlaguerre, eval_jacobi, exp1, expi, expit, expn, exprel, fdtr, fdtrc, fdtri, fdtridfd,
-    gamma, gammainc, gammaincc, gammaln, gammasgn, gdtr, gdtrc, gdtria, gdtrib, gdtrix, huber,
-    hyp0f1, hyp1f1, hyp2f1, hyperu, i0, i0e, i1, i1e, inv_boxcox, iv, ive, j0, j1, jn, jv, jve, k0,
-    k0e, k1, k1e, kei, keip, ker, kerp, kl_div, kn, kolmogi, kolmogorov, kv, kve, log_expit,
-    log_ndtr, log_wright_bessel, loggamma, logit, lpmv, modstruve, nbdtr, nbdtrc, nbdtri, nbdtrik,
+    SpecialError, SpecialErrorKind, SpecialTensor, agm, bdtr, bdtrc, bdtri, bdtrik, bdtrin, bei,
+    beip, ber, berp, besselpoly, beta, betainc, betaincc, betainccinv, betaincinv, betaln, binom,
+    boxcox, boxcox1p, cbrt, chdtr, chdtrc, chdtri, chdtriv, chndtr, chndtridf, chndtrinc, chndtrix,
+    cosdg, cosm1, cotdg, dawsn, digamma, ellipe, ellipeinc, ellipk, ellipkinc, ellipkm1, elliprc,
+    elliprd, elliprf, elliprg, elliprj, entr, erf, erfc, erfcinv, erfcx, erfi, erfinv,
+    eval_gegenbauer, eval_genlaguerre, eval_jacobi, exp1, expi, expit, expn, exprel, fdtr, fdtrc,
+    fdtri, fdtridfd, gamma, gammainc, gammaincc, gammaln, gammasgn, gdtr, gdtrc, gdtria, gdtrib,
+    gdtrix, huber, hurwitz_zeta, hyp0f1, hyp1f1, hyp2f1, hyperu, i0, i0e, i1, i1e, inv_boxcox,
+    it2struve0, itmodstruve0, itstruve0, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e, kei, keip,
+    ker, kerp, kl_div, kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, log_wright_bessel,
+    loggamma, logit, lpmv, mathieu_a, mathieu_b, modstruve, nbdtr, nbdtrc, nbdtri, nbdtrik,
     nbdtrin, ncfdtr, ncfdtri, nctdtr, nctdtridf, nctdtrinc, nctdtrit, ndtr, ndtri, ndtri_exp,
-    owens_t, pdtr, pdtrc, pdtri, pdtrik, poch, pseudo_huber, rel_entr, rgamma, sindg, smirnov,
-    smirnovi, spence, stdtr, stdtridf, stdtrit, struve, tandg, tklmbda, voigt_profile,
-    wright_bessel, wrightomega, xlog1py, xlogy, y0, y1, yn, yv, yve, zeta, zetac,
+    nrdtrimn, nrdtrisd, obl_cv, owens_t, pdtr, pdtrc, pdtri, pdtrik, poch, pro_cv, pseudo_huber,
+    radian, rel_entr, rgamma, sindg, smirnov, smirnovi, spence, stdtr, stdtridf, stdtrit, struve,
+    tandg, tklmbda, voigt_profile, wright_bessel, wrightomega, xlog1py, xlogy, y0, y1, yn, yv, yve,
+    zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -340,6 +342,10 @@ const CASES: &[(&str, f64, f64)] = &[
     ("tandg", -720.0, 720.0),
     ("cotdg", -720.0, 720.0),
     ("cbrt", -1000.0, 1000.0),
+    // Never measured before: the integrated Struve functions.
+    ("itstruve0", 0.0, 30.0),
+    ("it2struve0", 0.0, 30.0),
+    ("itmodstruve0", 0.0, 20.0),
 ];
 
 /// Two-argument cases: the `scipy.special` name and a domain for each argument.
@@ -398,6 +404,10 @@ const CASES2: &[(&str, f64, f64, f64, f64)] = &[
     ("stdtridf", 0.51, 0.999, 0.1, 10.0),
     ("chdtriv", 0.001, 0.999, 0.1, 40.0),
     ("pdtrik", 0.001, 0.999, 0.1, 40.0),
+    // Never measured before: the arithmetic-geometric mean and the Hurwitz zeta, which
+    // scipy.special.zeta is when given a second argument.
+    ("agm", 0.0, 100.0, 0.0, 100.0),
+    ("zeta", 1.1, 20.0, 0.1, 10.0),
 ];
 
 /// Integer-order siblings, kept apart because their first argument is quantised.
@@ -408,6 +418,8 @@ const CASES2_INTEGER_ORDER: &[(&str, f64, f64, f64, f64)] = &[
     ("expn", 0.0, 20.0, 0.01, 30.0),
     ("smirnov", 1.0, 200.0, 0.0, 1.0),
     ("smirnovi", 1.0, 200.0, 0.001, 0.999),
+    ("mathieu_a", 0.0, 21.0, 0.0, 50.0),
+    ("mathieu_b", 1.0, 21.0, 0.0, 50.0),
 ];
 
 /// Three- and four-argument cases: the name, one domain per argument, and the positions that
@@ -552,6 +564,22 @@ const CASES_N: &[(&str, &[(f64, f64)], &[usize])] = &[
         &[(0.0, 10.0), (0.0, 10.0), (0.0, 10.0), (0.01, 10.0)],
         &[],
     ),
+    // Never measured before: the normal-distribution inverses in mean and sd, besselpoly,
+    // the spheroidal characteristic values (n >= m) and radian.
+    (
+        "nrdtrimn",
+        &[(0.001, 0.999), (0.1, 10.0), (-10.0, 10.0)],
+        &[],
+    ),
+    (
+        "nrdtrisd",
+        &[(-5.0, 5.0), (0.001, 0.999), (-10.0, 10.0)],
+        &[],
+    ),
+    ("besselpoly", &[(0.0, 5.0), (0.0, 5.0), (0.0, 5.0)], &[]),
+    ("obl_cv", &[(0.0, 5.0), (5.0, 11.0), (0.0, 10.0)], &[0, 1]),
+    ("pro_cv", &[(0.0, 5.0), (5.0, 11.0), (0.0, 10.0)], &[0, 1]),
+    ("radian", &[(-360.0, 360.0), (0.0, 60.0), (0.0, 60.0)], &[]),
 ];
 
 /// One argument's fixture distribution, from `FSCI_SPECIAL_ARG<k>`:
@@ -673,6 +701,12 @@ fn call_ours_n(op: &str, args: &[SpecialTensor]) -> fsci_special::SpecialResult 
         ("ncfdtr", [a, b, c, d]) => scalar_map4(a, b, c, d, ncfdtr),
         ("ncfdtri", [a, b, c, d]) => scalar_map4(a, b, c, d, ncfdtri),
         ("elliprj", [a, b, c, d]) => scalar_map4(a, b, c, d, elliprj),
+        ("nrdtrimn", [a, b, c]) => scalar_map3(a, b, c, nrdtrimn),
+        ("nrdtrisd", [a, b, c]) => scalar_map3(a, b, c, nrdtrisd),
+        ("besselpoly", [a, b, c]) => scalar_map3(a, b, c, besselpoly),
+        ("radian", [a, b, c]) => scalar_map3(a, b, c, radian),
+        ("obl_cv", [a, b, c]) => scalar_map3(a, b, c, |m, n, c| obl_cv(m as u32, n as u32, c)),
+        ("pro_cv", [a, b, c]) => scalar_map3(a, b, c, |m, n, c| pro_cv(m as u32, n as u32, c)),
         // The caller reports this with the op name.
         _ => Err(SpecialError {
             function: "call_ours_n",
@@ -793,6 +827,10 @@ fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::S
         "expn" => scalar_map2(a, b, |n, x| expn(n as usize, x)),
         "smirnov" => scalar_map2(a, b, |n, d| smirnov(n as i32, d)),
         "smirnovi" => scalar_map2(a, b, |n, p| smirnovi(n as i32, p)),
+        "mathieu_a" => scalar_map2(a, b, |m, q| mathieu_a(m as u32, q)),
+        "mathieu_b" => scalar_map2(a, b, |m, q| mathieu_b(m as u32, q)),
+        "agm" => scalar_map2(a, b, agm),
+        "zeta" => scalar_map2(a, b, hurwitz_zeta),
         other => panic!("no fsci two-argument entry point wired for {other}"),
     }
 }
@@ -881,6 +919,9 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "tandg" => scalar_map(tensor, tandg),
         "cotdg" => scalar_map(tensor, cotdg),
         "cbrt" => scalar_map(tensor, cbrt),
+        "itstruve0" => scalar_map(tensor, itstruve0),
+        "it2struve0" => scalar_map(tensor, it2struve0),
+        "itmodstruve0" => scalar_map(tensor, itmodstruve0),
         other => panic!("no fsci entry point wired for {other}"),
     }
 }
