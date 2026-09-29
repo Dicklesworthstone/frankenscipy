@@ -292,6 +292,7 @@ pub use convenience::{
     radian,
     reciprocal,
     rel_entr,
+    rel_entr_scalar,
     relu,
     rint,
     round,
