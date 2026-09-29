@@ -508,7 +508,10 @@ const CEPHES_ERFC_S: [f64; 6] = [
     9.60896809063285878198E0,
     3.36907645100081516050E0,
 ];
-const CEPHES_MAXLOG: f64 = 7.08396418532264106224E2;
+/// xsf's `MAXLOG`, log(DBL_MAX). The old Cephes value 7.08396418532264106224E2 is
+/// log(2^1022), the cutoff for a machine without subnormals: with it erfc was 0 for x in
+/// (26.6157, 26.6417), where SciPy returns subnormals down to 1.18e-310.
+const CEPHES_MAXLOG: f64 = 7.097_827_128_933_839_730_962_063_185_871E2;
 
 pub fn erf_scalar(x: f64) -> f64 {
     if x.is_nan() {
@@ -1623,6 +1626,45 @@ mod tests {
                 "erfc({x}) = {result}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn erfc_keeps_scipys_subnormal_tail() -> Result<(), String> {
+        // xsf underflows erfc at x² > log(DBL_MAX); the old log(2^1022) cutoff returned 0 on
+        // (26.6157, 26.6417), where SciPy 1.17.1 is subnormal. The last point is past the cut
+        // on both sides, and a negative argument is 2 either way. (x, scipy.special.erfc(x)).
+        let cases = [
+            (26.6157, 4.7177007360317e-310),
+            (26.62, 3.7518412526618e-310),
+            (26.63, 2.2020123818722e-310),
+            (26.6417, 1.1801648482633e-310),
+            (26.642, 0.0),
+            (-26.63, 2.0),
+        ];
+        for (x, want) in cases {
+            let got = erfc_scalar(std::hint::black_box(x));
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "erfc({x}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        // The tensor entry point's SIMD path hands x >= 25 to the scalar kernel.
+        let xs: Vec<f64> = (0..64).map(|i| cases[i % cases.len()].0).collect();
+        let out = erfc(&SpecialTensor::RealVec(xs), RuntimeMode::Strict)
+            .map_err(|e| format!("erfc over real input: {e}"))?;
+        let SpecialTensor::RealVec(out) = out else {
+            return Err(format!("erfc of a real vector returned {out:?}"));
+        };
+        for (i, got) in out.iter().enumerate() {
+            let (x, want) = cases[i % cases.len()];
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "tensor erfc({x}) = {got:e}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
