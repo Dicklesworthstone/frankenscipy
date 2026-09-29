@@ -10,13 +10,14 @@
 //! Weibull-mixture support. cdf splits at x=0 into mirrored
 //! branches; ppf folds q-by-side. 1e-13 abs holds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, DoubleWeibull};
 use serde::{Deserialize, Serialize};
 
@@ -49,13 +50,26 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // SciPy's pdf(0, c<1) is +inf; it arrives as "inf", distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     pdf: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     cdf: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PpfArm {
     case_id: String,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     ppf: Option<f64>,
 }
 
@@ -78,6 +92,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -144,12 +159,16 @@ import math
 import sys
 from scipy.stats import dweibull
 
-def finite_or_none(v):
+def fval(v):
+    # A non-finite answer is sent as "nan"/"inf"/"-inf", so the harness can tell it from a
+    # raised call (null): pdf(0, c=0.5) is +inf.
     try:
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
 
 q = json.load(sys.stdin)
 points = []
@@ -159,8 +178,8 @@ for case in q["points"]:
     try:
         points.append({
             "case_id": cid,
-            "pdf": finite_or_none(dweibull.pdf(x, c)),
-            "cdf": finite_or_none(dweibull.cdf(x, c)),
+            "pdf": fval(dweibull.pdf(x, c)),
+            "cdf": fval(dweibull.cdf(x, c)),
         })
     except Exception:
         points.append({"case_id": cid, "pdf": None, "cdf": None})
@@ -168,7 +187,7 @@ ppf = []
 for case in q["ppf"]:
     cid = case["case_id"]; c = float(case["c"]); qv = float(case["q"])
     try:
-        ppf.append({"case_id": cid, "ppf": finite_or_none(dweibull.ppf(qv, c))})
+        ppf.append({"case_id": cid, "ppf": fval(dweibull.ppf(qv, c))})
     except Exception:
         ppf.append({"case_id": cid, "ppf": None})
 print(json.dumps({"points": points, "ppf": ppf}))
@@ -243,13 +262,17 @@ fn diff_stats_dweibull() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_dweibull", &["pdf", "cdf", "ppf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = DoubleWeibull::new(case.c);
-        if let Some(spdf) = oracle.pdf {
-            let d = (dist.pdf(case.x) - spdf).abs();
+        if let Some((spdf, rpdf)) =
+            ledger.pair("pdf", &case.case_id, oracle.pdf, Some(dist.pdf(case.x)))
+        {
+            let d = (rpdf - spdf).abs();
             max_overall = max_overall.max(d);
+            ledger.compared("pdf", &case.case_id, d <= PDF_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 family: "pdf".into(),
@@ -257,9 +280,12 @@ fn diff_stats_dweibull() {
                 pass: d <= PDF_TOL,
             });
         }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.x) - scdf).abs();
+        if let Some((scdf, rcdf)) =
+            ledger.pair("cdf", &case.case_id, oracle.cdf, Some(dist.cdf(case.x)))
+        {
+            let d = (rcdf - scdf).abs();
             max_overall = max_overall.max(d);
+            ledger.compared("cdf", &case.case_id, d <= CDF_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 family: "cdf".into(),
@@ -271,19 +297,22 @@ fn diff_stats_dweibull() {
 
     for case in &query.ppf {
         let oracle = ppfmap.get(&case.case_id).expect("validated oracle");
-        if let Some(sppf) = oracle.ppf {
-            let dist = DoubleWeibull::new(case.c);
-            let rust = dist.ppf(case.q);
-            let d = (rust - sppf).abs();
-            let scale = sppf.abs().max(1.0);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "ppf".into(),
-                abs_diff: d,
-                pass: d <= PPF_TOL_REL * scale,
-            });
-        }
+        let dist = DoubleWeibull::new(case.c);
+        let Some((sppf, rust)) =
+            ledger.pair("ppf", &case.case_id, oracle.ppf, Some(dist.ppf(case.q)))
+        else {
+            continue;
+        };
+        let d = (rust - sppf).abs();
+        let scale = sppf.abs().max(1.0);
+        max_overall = max_overall.max(d);
+        ledger.compared("ppf", &case.case_id, d <= PPF_TOL_REL * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            family: "ppf".into(),
+            abs_diff: d,
+            pass: d <= PPF_TOL_REL * scale,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -292,6 +321,7 @@ fn diff_stats_dweibull() {
         test_id: "diff_stats_dweibull".into(),
         category: "scipy.stats.dweibull".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -316,4 +346,6 @@ fn diff_stats_dweibull() {
         diffs.len(),
         max_overall
     );
+    // pdf/cdf run over query.points, ppf over query.ppf; each arm must compare all of its own.
+    ledger.finish(query.points.len().min(query.ppf.len()));
 }

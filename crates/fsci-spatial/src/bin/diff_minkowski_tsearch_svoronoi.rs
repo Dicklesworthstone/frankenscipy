@@ -68,7 +68,8 @@ fn main() {
         (0.7, 0.25),
         (0.25, 0.75),
     ];
-    let tri = Delaunay::new(&pts).expect("delaunay");
+    let rows: Vec<Vec<f64>> = pts.iter().map(|&(x, y)| vec![x, y]).collect();
+    let tri = Delaunay::new(&rows).expect("delaunay");
     let queries: Vec<(f64, f64)> = vec![
         (0.5, 0.5),
         (0.2, 0.2),
@@ -79,7 +80,8 @@ fn main() {
         (1.5, 0.5),
         (0.5, -0.4),
     ];
-    let found = tsearch(&tri, &queries);
+    let query_rows: Vec<Vec<f64>> = queries.iter().map(|&(x, y)| vec![x, y]).collect();
+    let found = tsearch(&tri, &query_rows).expect("tsearch");
     // Canonical: inside the hull or not.
     let inside: Vec<f64> = found.iter().map(|&s| f64::from(s >= 0)).collect();
     dump("tsearch_inside", &inside);
@@ -90,10 +92,10 @@ fn main() {
         if s < 0 {
             continue;
         }
-        let (i0, i1, i2) = tri.simplices[s as usize];
-        let (ax, ay) = pts[i0];
-        let (bx, by) = pts[i1];
-        let (cx, cy) = pts[i2];
+        let simplex = &tri.simplices[s as usize];
+        let (ax, ay) = pts[simplex[0]];
+        let (bx, by) = pts[simplex[1]];
+        let (cx, cy) = pts[simplex[2]];
         let det = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
         let l1 = ((bx - q.0) * (cy - q.1) - (cx - q.0) * (by - q.1)) / det;
         let l2 = ((cx - q.0) * (ay - q.1) - (ax - q.0) * (cy - q.1)) / det;

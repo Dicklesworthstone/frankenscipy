@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-jure3]. 1e-12 abs (integer/rational data).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, add_csr, scale_csr, spdiags, spmv_csr, sub_csr};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +100,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -436,33 +438,41 @@ print(json.dumps({"arith": arith_out, "scale": scale_out, "spmv": spmv_out, "spd
     Some(serde_json::from_str(&stdout).expect("parse ops_arith oracle JSON"))
 }
 
+/// Records the case in the ledger under `op`; returns a diff row only when both sides produced a
+/// matrix whose dense values `slices` accepted.
 fn compare_dense(
+    ledger: &mut CompareLedger,
     case_id: &str,
     op: &str,
-    fsci: &CsrMatrix,
-    scipy_rows: Option<usize>,
-    scipy_cols: Option<usize>,
-    expected: Option<&Vec<f64>>,
+    fsci: Option<&CsrMatrix>,
+    scipy: &DenseArm,
 ) -> Option<CaseDiff> {
-    let expected = expected?;
-    let (Some(rows), Some(cols)) = (scipy_rows, scipy_cols) else {
-        return None;
+    let expected = scipy
+        .rows
+        .zip(scipy.cols)
+        .and_then(|shape| Some((shape, scipy.dense.as_deref()?)));
+    let fsci = fsci.map(|m| {
+        let s = m.shape();
+        ((s.rows, s.cols), dense_from_csr(m))
+    });
+    let (expected_dense, fsci_dense) = ledger.slices(
+        op,
+        case_id,
+        expected.map(|(_, d)| d),
+        fsci.as_ref().map(|(_, d)| d.as_slice()),
+    )?;
+    // slices returned both sides, so this compares the two output shapes
+    let shape_ok = expected.map(|(s, _)| s) == fsci.as_ref().map(|(s, _)| *s);
+    let abs_d = if shape_ok {
+        fsci_dense
+            .iter()
+            .zip(expected_dense.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max)
+    } else {
+        f64::INFINITY
     };
-    let fsci_shape = fsci.shape();
-    if fsci_shape.rows != rows || fsci_shape.cols != cols {
-        return Some(CaseDiff {
-            case_id: case_id.into(),
-            op: op.into(),
-            abs_diff: f64::INFINITY,
-            pass: false,
-        });
-    }
-    let fsci_dense = dense_from_csr(fsci);
-    let abs_d = fsci_dense
-        .iter()
-        .zip(expected.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
+    ledger.compared(op, case_id, abs_d <= ABS_TOL);
     Some(CaseDiff {
         case_id: case_id.into(),
         op: op.into(),
@@ -506,6 +516,10 @@ fn diff_sparse_ops_arith() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_ops_arith",
+        &["add", "sub", "scale", "spmv", "spdiags"],
+    );
 
     // arith
     for case in &query.arith {
@@ -515,18 +529,15 @@ fn diff_sparse_ops_arith() {
         let fsci_result = match case.op.as_str() {
             "add" => add_csr(&a_csr, &b_csr),
             "sub" => sub_csr(&a_csr, &b_csr),
-            _ => continue,
+            other => unreachable!("generate_query emits no `{other}` arith case"),
         };
-        let Ok(fsci_csr) = fsci_result else {
-            continue;
-        };
+        let fsci_csr = fsci_result.ok();
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             &case.op,
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -537,16 +548,13 @@ fn diff_sparse_ops_arith() {
     for case in &query.scale {
         let scipy_arm = scale_map.get(&case.case_id).expect("validated oracle");
         let a_csr = dense_to_csr(&case.a);
-        let Ok(fsci_csr) = scale_csr(&a_csr, case.alpha) else {
-            continue;
-        };
+        let fsci_csr = scale_csr(&a_csr, case.alpha).ok();
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             "scale",
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -556,23 +564,23 @@ fn diff_sparse_ops_arith() {
     // spmv
     for case in &query.spmv {
         let scipy_arm = spmv_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
-            continue;
-        };
         let a_csr = dense_to_csr(&case.a);
-        let Ok(fsci_y) = spmv_csr(&a_csr, &case.x) else {
+        let fsci_y = spmv_csr(&a_csr, &case.x).ok();
+        let Some((expected, fsci_y)) = ledger.slices(
+            "spmv",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_y.as_deref(),
+        ) else {
             continue;
         };
-        let abs_d = if fsci_y.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_y
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_y
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("spmv", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "spmv".into(),
@@ -585,19 +593,15 @@ fn diff_sparse_ops_arith() {
     for case in &query.spdiags {
         let scipy_arm = spdiags_map.get(&case.case_id).expect("validated oracle");
         let offsets_is: Vec<isize> = case.offsets.iter().map(|&o| o as isize).collect();
-        let Ok(fsci_dia) = spdiags(&case.diagonals, &offsets_is, case.rows, case.cols) else {
-            continue;
-        };
-        let Ok(fsci_csr) = fsci_dia.to_csr() else {
-            continue;
-        };
+        let fsci_csr = spdiags(&case.diagonals, &offsets_is, case.rows, case.cols)
+            .ok()
+            .and_then(|fsci_dia| fsci_dia.to_csr().ok());
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             "spdiags",
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -610,6 +614,7 @@ fn diff_sparse_ops_arith() {
         test_id: "diff_sparse_ops_arith".into(),
         category: "scipy.sparse arith + spdiags".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -630,4 +635,15 @@ fn diff_sparse_ops_arith() {
         diffs.len(),
         max_overall
     );
+    let min_cases = [
+        query.arith.iter().filter(|c| c.op == "add").count(),
+        query.arith.iter().filter(|c| c.op == "sub").count(),
+        query.scale.len(),
+        query.spmv.len(),
+        query.spdiags.len(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+    ledger.finish(min_cases);
 }

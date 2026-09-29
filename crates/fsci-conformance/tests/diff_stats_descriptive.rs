@@ -17,13 +17,14 @@
 //! match scipy's defaults (linear interpolation, ddof, floor
 //! ncut) so the closed-form arithmetic should align exactly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{iqr, trim_mean, zscore, zscore_ddof};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -252,51 +254,62 @@ fn diff_stats_descriptive() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_descriptive",
+        &[
+            "iqr",
+            "zscore",
+            "zscore_ddof1",
+            "trim_mean_010",
+            "trim_mean_025",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let abs_diff: Option<f64> = match case.arm.as_str() {
-            "iqr" => scipy_arm.scalar.map(|s| (iqr(&case.data) - s).abs()),
-            "trim_mean_010" | "trim_mean_025" => scipy_arm.scalar.map(|s| {
-                (trim_mean(&case.data, case.param).unwrap_or_else(|e| {
-                    panic!(
-                        "scipy produced a trim_mean for case {} (prop {}) but ours refused: {e:?}",
-                        case.case_id, case.param
-                    )
-                }) - s)
-                    .abs()
-            }),
-            "zscore" => scipy_arm.vector.as_ref().map(|v| {
-                let r = zscore(&case.data);
-                let mut m = 0.0_f64;
-                for (a, b) in r.iter().zip(v.iter()) {
-                    if a.is_finite() {
-                        m = m.max((a - b).abs());
-                    }
-                }
-                m
-            }),
-            "zscore_ddof1" => scipy_arm.vector.as_ref().map(|v| {
-                let r = zscore_ddof(&case.data, 1);
-                let mut m = 0.0_f64;
-                for (a, b) in r.iter().zip(v.iter()) {
-                    if a.is_finite() {
-                        m = m.max((a - b).abs());
-                    }
-                }
-                m
-            }),
-            _ => None,
+        let arm = case.arm.as_str();
+        let abs_diff: f64 = match arm {
+            "iqr" | "trim_mean_010" | "trim_mean_025" => {
+                // a trim_mean refusal where SciPy produced a value is recorded as rust_failed
+                let rust_v = if arm == "iqr" {
+                    Some(iqr(&case.data))
+                } else {
+                    trim_mean(&case.data, case.param).ok()
+                };
+                let Some((s, r)) = ledger.pair(arm, &case.case_id, scipy_arm.scalar, rust_v) else {
+                    continue;
+                };
+                (r - s).abs()
+            }
+            "zscore" | "zscore_ddof1" => {
+                let r = if arm == "zscore" {
+                    zscore(&case.data)
+                } else {
+                    zscore_ddof(&case.data, 1)
+                };
+                let Some((v, r)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(r.as_slice()),
+                ) else {
+                    continue;
+                };
+                r.iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
+            }
+            other => panic!("descriptive: unknown arm {other}"),
         };
-        if let Some(abs_diff) = abs_diff {
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: case.arm.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            arm: case.arm.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -305,6 +318,7 @@ fn diff_stats_descriptive() {
         test_id: "diff_stats_descriptive".into(),
         category: "scipy.stats.iqr/zscore/trim_mean".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -329,4 +343,6 @@ fn diff_stats_descriptive() {
         diffs.len(),
         max_overall
     );
+    // each dataset is one case of each arm
+    ledger.finish(query.points.iter().filter(|c| c.arm == "iqr").count());
 }

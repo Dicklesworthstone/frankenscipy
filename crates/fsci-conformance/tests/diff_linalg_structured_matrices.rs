@@ -9,13 +9,14 @@
 //!   - hilbert, invhilbert, hadamard, companion
 //!   - block_diag, pascal, helmert/full helmert, kron
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{
     block_diag, circulant, companion, hadamard, hankel, helmert, helmert_full, hilbert, invhilbert,
     kron, pascal, toeplitz,
@@ -129,6 +130,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -419,7 +421,8 @@ print(json.dumps(result, allow_nan=False))
         eprintln!("skipping structured linalg oracle: scipy unavailable\n{stderr}");
         return None;
     }
-    serde_json::from_slice(&output.stdout).ok()
+    // An unparseable answer used to end the test here as a silent skip.
+    Some(serde_json::from_slice(&output.stdout).expect("parse structured linalg oracle JSON"))
 }
 
 fn max_abs_diff_mat(actual: &[Vec<f64>], expected: &[Vec<f64>]) -> f64 {
@@ -456,12 +459,23 @@ fn expected_map(arms: &[MatrixArm]) -> HashMap<String, Option<Vec<Vec<f64>>>> {
 
 fn record_case(
     diffs: &mut Vec<CaseDiff>,
+    ledger: &mut CompareLedger,
     expected: &HashMap<String, Option<Vec<Vec<f64>>>>,
     function: &str,
     case_id: &str,
     actual: Option<Vec<Vec<f64>>>,
 ) {
     let expected_matrix = expected.get(case_id);
+    // "Both implementations rejected" below is not a comparison: the ledger records it as
+    // SciPy giving no value, so an arm whose oracle never answers fails `finish`.
+    let both_present = ledger
+        .both(
+            function,
+            case_id,
+            expected_matrix.and_then(Option::as_ref),
+            actual.as_ref(),
+        )
+        .is_some();
     let (max_abs_diff, pass, detail) = match (actual, expected_matrix) {
         (Some(actual), Some(Some(expected))) => {
             let diff = max_abs_diff_mat(&actual, expected);
@@ -495,6 +509,9 @@ fn record_case(
             "SciPy oracle did not return this case".into(),
         ),
     };
+    if both_present {
+        ledger.compared(function, case_id, pass);
+    }
 
     diffs.push(CaseDiff {
         case_id: case_id.to_string(),
@@ -526,10 +543,27 @@ fn diff_linalg_structured_matrices() {
     let kron_expected = expected_map(&oracle.kron);
 
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_structured_matrices",
+        &[
+            "toeplitz",
+            "circulant",
+            "hankel",
+            "hilbert",
+            "invhilbert",
+            "hadamard",
+            "companion",
+            "block_diag",
+            "pascal",
+            "helmert",
+            "kron",
+        ],
+    );
 
     for case in &query.toeplitz {
         record_case(
             &mut diffs,
+            &mut ledger,
             &toeplitz_expected,
             "toeplitz",
             &case.case_id,
@@ -539,6 +573,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.circulant {
         record_case(
             &mut diffs,
+            &mut ledger,
             &circulant_expected,
             "circulant",
             &case.case_id,
@@ -548,6 +583,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.hankel {
         record_case(
             &mut diffs,
+            &mut ledger,
             &hankel_expected,
             "hankel",
             &case.case_id,
@@ -557,6 +593,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.hilbert {
         record_case(
             &mut diffs,
+            &mut ledger,
             &hilbert_expected,
             "hilbert",
             &case.case_id,
@@ -566,6 +603,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.invhilbert {
         record_case(
             &mut diffs,
+            &mut ledger,
             &invhilbert_expected,
             "invhilbert",
             &case.case_id,
@@ -575,6 +613,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.hadamard {
         record_case(
             &mut diffs,
+            &mut ledger,
             &hadamard_expected,
             "hadamard",
             &case.case_id,
@@ -584,6 +623,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.companion {
         record_case(
             &mut diffs,
+            &mut ledger,
             &companion_expected,
             "companion",
             &case.case_id,
@@ -593,6 +633,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.block_diag {
         record_case(
             &mut diffs,
+            &mut ledger,
             &block_diag_expected,
             "block_diag",
             &case.case_id,
@@ -602,6 +643,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.pascal {
         record_case(
             &mut diffs,
+            &mut ledger,
             &pascal_expected,
             "pascal",
             &case.case_id,
@@ -616,6 +658,7 @@ fn diff_linalg_structured_matrices() {
         };
         record_case(
             &mut diffs,
+            &mut ledger,
             &helmert_expected,
             "helmert",
             &case.case_id,
@@ -625,6 +668,7 @@ fn diff_linalg_structured_matrices() {
     for case in &query.kron {
         record_case(
             &mut diffs,
+            &mut ledger,
             &kron_expected,
             "kron",
             &case.case_id,
@@ -641,6 +685,7 @@ fn diff_linalg_structured_matrices() {
         test_id: "diff_linalg_structured_matrices".into(),
         category: "scipy.linalg structured matrix constructors".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         pass,
         timestamp_ms: timestamp_ms(),
@@ -654,4 +699,21 @@ fn diff_linalg_structured_matrices() {
         "structured linalg conformance failed: {} cases, max_diff={}",
         log.case_count, log.max_abs_diff
     );
+    let min_per_function = [
+        query.toeplitz.len(),
+        query.circulant.len(),
+        query.hankel.len(),
+        query.hilbert.len(),
+        query.invhilbert.len(),
+        query.hadamard.len(),
+        query.companion.len(),
+        query.block_diag.len(),
+        query.pascal.len(),
+        query.helmert.len(),
+        query.kron.len(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+    ledger.finish(min_per_function);
 }

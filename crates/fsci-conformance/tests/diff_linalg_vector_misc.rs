@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-ceof2]. All deterministic; 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{antidiag, hadamard_product, rot2d, vdot, vector_norm, vnorm};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,10 @@ struct Case {
     /// vector_norm / vnorm / vdot
     v: Vec<f64>,
     w: Vec<f64>, // for vdot
+    /// Sent as its `{:?}` string ("inf", "-inf", "2.0"): serde_json writes an infinite f64 as
+    /// null, which blanked the 6 ord=±inf vector_norm cases until the compared-case ledger
+    /// (olv0j.1).
+    #[serde(serialize_with = "f64_as_string")]
     ord: f64,
     /// hadamard_product
     a: Vec<Vec<f64>>,
@@ -67,11 +72,17 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
     cases: Vec<CaseDiff>,
+}
+
+/// `{:?}` renders ±inf as "inf"/"-inf", which Python's `float()` parses; JSON cannot carry them.
+fn f64_as_string<S: serde::Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{value:?}"))
 }
 
 fn output_dir() -> PathBuf {
@@ -238,11 +249,7 @@ for case in q["points"]:
     try:
         if op == "vector_norm":
             v = np.array(case["v"], dtype=float)
-            ord_v = case["ord"]
-            if not math.isfinite(ord_v):
-                # +/- infinity sent as JSON number — read sign
-                pass
-            v_ord = ord_v
+            v_ord = float(case["ord"])  # "inf" / "-inf" / "2.0"
             res = float(np.linalg.norm(v, ord=v_ord))
             points.append({"case_id": cid, "values": [res], "out_rows": None, "out_cols": None})
         elif op == "vnorm":
@@ -351,14 +358,22 @@ fn diff_linalg_vector_misc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_vector_misc",
+        &[
+            "vector_norm",
+            "vnorm",
+            "vdot",
+            "hadamard",
+            "rot2d",
+            "antidiag",
+        ],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
         let actual: Vec<f64> = match case.op.as_str() {
             "vector_norm" => vec![vector_norm(&case.v, case.ord)],
             "vnorm" => vec![vnorm(&case.v)],
@@ -366,10 +381,16 @@ fn diff_linalg_vector_misc() {
             "hadamard" => flatten_matrix(&hadamard_product(&case.a, &case.b)),
             "rot2d" => flatten_matrix(&rot2d(case.theta)),
             "antidiag" => flatten_matrix(&antidiag(&case.v)),
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
         };
-        let abs_d = vec_max_diff(&actual, expected);
+        let Some((expected, actual)) =
+            ledger.slices(&case.op, &case.case_id, scipy, Some(actual.as_slice()))
+        else {
+            continue;
+        };
+        let abs_d = vec_max_diff(actual, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -384,6 +405,7 @@ fn diff_linalg_vector_misc() {
         test_id: "diff_linalg_vector_misc".into(),
         category: "fsci_linalg vector & misc utilities vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -404,4 +426,18 @@ fn diff_linalg_vector_misc() {
         diffs.len(),
         max_overall
     );
+    // vdot and hadamard have two cases each: the smallest designed count over the ops.
+    let min_per_op = [
+        "vector_norm",
+        "vnorm",
+        "vdot",
+        "hadamard",
+        "rot2d",
+        "antidiag",
+    ]
+    .iter()
+    .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+    .min()
+    .unwrap_or(0);
+    ledger.finish(min_per_op);
 }

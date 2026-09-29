@@ -5,13 +5,14 @@
 //! (1..=num_labels). Compared against scipy.ndimage.{minimum, maximum}
 //! with index=1..num. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, extrema_labels};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -239,41 +241,43 @@ fn diff_ndimage_extrema_labels() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_extrema_labels", &["mins", "maxs"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_mins) = scipy_arm.mins.as_ref() else {
-            continue;
-        };
-        let Some(scipy_maxs) = scipy_arm.maxs.as_ref() else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.input.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let Ok(labels) = NdArray::new(case.labels.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let (fsci_mins, fsci_maxs) = extrema_labels(&input, &labels, case.num_labels);
-        if fsci_mins.len() != scipy_mins.len() || fsci_maxs.len() != scipy_maxs.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                min_diff: f64::INFINITY,
-                max_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
+        let fsci = NdArray::new(case.input.clone(), case.input_shape.clone())
+            .ok()
+            .zip(NdArray::new(case.labels.clone(), case.input_shape.clone()).ok())
+            .map(|(input, labels)| extrema_labels(&input, &labels, case.num_labels));
+        let arms = [
+            (
+                "mins",
+                scipy_arm.mins.as_deref(),
+                fsci.as_ref().map(|r| r.0.as_slice()),
+            ),
+            (
+                "maxs",
+                scipy_arm.maxs.as_deref(),
+                fsci.as_ref().map(|r| r.1.as_slice()),
+            ),
+        ];
+        let mut arm_diffs = [f64::NAN; 2];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let d = f
+                .iter()
+                .zip(s.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
         }
-        let min_diff = fsci_mins
-            .iter()
-            .zip(scipy_mins.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let max_diff = fsci_maxs
-            .iter()
-            .zip(scipy_maxs.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [min_diff, max_diff] = arm_diffs;
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             min_diff,
@@ -288,6 +292,7 @@ fn diff_ndimage_extrema_labels() {
         test_id: "diff_ndimage_extrema_labels".into(),
         category: "scipy.ndimage.minimum + maximum (per-label)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -309,4 +314,5 @@ fn diff_ndimage_extrema_labels() {
         "scipy.ndimage extrema_labels conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

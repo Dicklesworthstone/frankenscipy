@@ -9,6 +9,7 @@
 //! All tests emit structured JSON logs to
 //! `fixtures/artifacts/FSCI-P2C-004/diff/`.
 
+use fsci_conformance::CompareLedger;
 use fsci_runtime::{RuntimeMode, SparseSolverPortfolio};
 use fsci_sparse::{
     BsrMatrix, CooArray, CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray,
@@ -68,6 +69,24 @@ fn emit_log(log: &DiffTestLog) {
     fs::write(path, json).expect("write log");
 }
 
+/// `emit_log` for the live-SciPy tests: the same fields plus the compared-case ledger counts
+/// under `compared`. The dense-reference, metamorphic and adversarial tests compare no SciPy
+/// value and keep the plain log.
+fn emit_ledgered_log(log: &DiffTestLog, ledger: &CompareLedger) {
+    ensure_output_dir();
+    let mut value = serde_json::to_value(log).expect("serialize log");
+    value
+        .as_object_mut()
+        .expect("a diff log serializes as a JSON object")
+        .insert(
+            "compared".into(),
+            serde_json::to_value(ledger.counts()).expect("serialize ledger counts"),
+        );
+    let path = output_dir().join(format!("{}.json", log.test_id));
+    let json = serde_json::to_string_pretty(&value).expect("serialize log");
+    fs::write(path, json).expect("write log");
+}
+
 const TOL: f64 = 1e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
@@ -92,13 +111,7 @@ fn max_abs_diff_vec(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        })
+        .fold(0.0_f64, nan_max)
 }
 
 fn max_abs_diff_matrix(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
@@ -106,13 +119,17 @@ fn max_abs_diff_matrix(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     a.iter()
         .zip(b.iter())
         .map(|(ra, rb)| max_abs_diff_vec(ra, rb))
-        .fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        })
+        .fold(0.0_f64, nan_max)
+}
+
+/// `f64::max` returns the other operand when one is NaN, so combining residuals with it reads a
+/// NaN as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 fn dense_add(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -1066,7 +1083,7 @@ fn diff_015_scale_coo_and_csc_match_csr() {
     );
     let diff1 = max_abs_diff_matrix(&scaled_coo_dense, &scaled_csr_dense);
     let diff2 = max_abs_diff_matrix(&scaled_coo_dense, &scaled_csc_dense);
-    let diff = diff1.max(diff2);
+    let diff = nan_max(diff1, diff2);
     let pass = diff <= TOL;
     emit_log(&DiffTestLog {
         test_id: "diff_015_scale_all_formats_match".into(),
@@ -1134,25 +1151,42 @@ fn diff_017_spsolve_vs_scipy_superlu_4x4() {
     );
     let csr = coo.to_csr().expect("csr");
     let rhs = vec![15.0, 10.0, 10.0, 10.0];
-    let rust_result = spsolve(&csr, &rhs, SolveOptions::default())
-        .expect("rust spsolve")
-        .solution;
-    let diff = max_abs_diff_vec(&rust_result, &scipy_result);
+    let rust_result = spsolve(&csr, &rhs, SolveOptions::default()).map(|r| r.solution);
     let tolerance = 1e-10;
-    let pass = diff <= tolerance;
-    emit_log(&DiffTestLog {
-        test_id: "diff_017_spsolve_vs_scipy_superlu_4x4".into(),
-        category: "scipy_differential".into(),
-        input_summary: "4x4 SPD tridiagonal CSR solve vs scipy.sparse.linalg.spsolve".into(),
-        expected: format!("scipy={scipy_result:?}"),
-        actual: format!("rust={rust_result:?}"),
-        diff,
-        tolerance,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
+    let test_id = "diff_017_spsolve_vs_scipy_superlu_4x4";
+    let mut ledger = CompareLedger::new(test_id, &["spsolve"]);
+    let (diff, pass) = match ledger.slices(
+        "spsolve",
+        test_id,
+        Some(scipy_result.as_slice()),
+        rust_result.as_deref().ok(),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff <= tolerance;
+            ledger.compared("spsolve", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary: "4x4 SPD tridiagonal CSR solve vs scipy.sparse.linalg.spsolve".into(),
+            expected: format!("scipy={scipy_result:?}"),
+            actual: format!("rust={rust_result:?}"),
+            diff,
+            tolerance,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(pass, "spsolve SciPy oracle diff={diff} > tol={tolerance}");
+    ledger.finish(1);
 }
 
 #[test]
@@ -1181,31 +1215,49 @@ fn diff_018_large_spsolve_native_sparse_direct_vs_scipy() {
         false,
     )
     .expect("large diagonal CSR");
-    let rust_result = spsolve(&csr, &rhs, SolveOptions::default())
-        .expect("native sparse direct spsolve above dense fallback threshold")
-        .solution;
-    let rust_samples: Vec<f64> = sample_indices.iter().map(|&idx| rust_result[idx]).collect();
-    let diff = max_abs_diff_vec(&rust_samples, &scipy_samples);
+    // The native sparse direct path above the dense fallback threshold; an fsci error is
+    // recorded as an fsci failure against SciPy's samples.
+    let rust_samples: Result<Vec<f64>, SparseError> = spsolve(&csr, &rhs, SolveOptions::default())
+        .map(|r| sample_indices.iter().map(|&idx| r.solution[idx]).collect());
     let tolerance = 1e-10;
-    let pass = diff <= tolerance;
-    emit_log(&DiffTestLog {
-        test_id: "diff_018_large_spsolve_native_sparse_direct_vs_scipy".into(),
-        category: "scipy_differential".into(),
-        input_summary:
-            "32769x32769 diagonal CSR solve above dense fallback guard vs scipy.sparse.linalg.spsolve"
-                .into(),
-        expected: format!("scipy_samples={scipy_samples:?}"),
-        actual: format!("rust_samples={rust_samples:?}"),
-        diff,
-        tolerance,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    let test_id = "diff_018_large_spsolve_native_sparse_direct_vs_scipy";
+    let mut ledger = CompareLedger::new(test_id, &["spsolve"]);
+    let (diff, pass) = match ledger.slices(
+        "spsolve",
+        test_id,
+        Some(scipy_samples.as_slice()),
+        rust_samples.as_deref().ok(),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff <= tolerance;
+            ledger.compared("spsolve", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary:
+                "32769x32769 diagonal CSR solve above dense fallback guard vs scipy.sparse.linalg.spsolve"
+                    .into(),
+            expected: format!("scipy_samples={scipy_samples:?}"),
+            actual: format!("rust_samples={rust_samples:?}"),
+            diff,
+            tolerance,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(
         pass,
         "large spsolve SciPy oracle diff={diff} > tol={tolerance}"
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -1318,22 +1370,42 @@ fn diff_019_sparse_index_array_utilities_vs_scipy() {
         Err(SparseError::Unsupported { .. })
     ))));
 
-    let diff = max_abs_diff_vec(&rust_values, &scipy_values);
-    let pass = diff == 0.0;
-    emit_log(&DiffTestLog {
-        test_id: "diff_019_sparse_index_array_utilities_vs_scipy".into(),
-        category: "scipy_differential".into(),
-        input_summary:
-            "get_index_dtype boundaries plus checked CSR/COO/DIA/DOK index-array casting".into(),
-        expected: format!("scipy={scipy_values:?}"),
-        actual: format!("rust={rust_values:?}"),
-        diff,
-        tolerance: 0.0,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    // One case: the whole contract vector. `slices` records a length mismatch or a
+    // non-finite element instead of letting `max_abs_diff_vec` assert or swallow it.
+    let test_id = "diff_019_sparse_index_array_utilities_vs_scipy";
+    let mut ledger = CompareLedger::new(test_id, &["index_array_utilities"]);
+    let (diff, pass) = match ledger.slices(
+        "index_array_utilities",
+        test_id,
+        Some(scipy_values.as_slice()),
+        Some(rust_values.as_slice()),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff == 0.0;
+            ledger.compared("index_array_utilities", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary:
+                "get_index_dtype boundaries plus checked CSR/COO/DIA/DOK index-array casting".into(),
+            expected: format!("scipy={scipy_values:?}"),
+            actual: format!("rust={rust_values:?}"),
+            diff,
+            tolerance: 0.0,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(pass, "sparse index-array utility diff={diff}");
+    ledger.finish(1);
 }
 
 #[test]
@@ -1406,22 +1478,42 @@ fn diff_020_nd_sparse_array_shape_operations_vs_scipy() {
         f64::from(u8::from(!legacy.is_matrix())),
     ]);
 
-    let diff = max_abs_diff_vec(&rust_values, &scipy_values);
-    let pass = diff == 0.0;
-    emit_log(&DiffTestLog {
-        test_id: "diff_020_nd_sparse_array_shape_operations_vs_scipy".into(),
-        category: "scipy_differential".into(),
-        input_summary: "3-D COO expand_dims/permute_dims/swapaxes plus array/matrix predicates"
-            .into(),
-        expected: format!("scipy={scipy_values:?}"),
-        actual: format!("rust={rust_values:?}"),
-        diff,
-        tolerance: 0.0,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    // One case: the whole contract vector. `slices` records a length mismatch or a
+    // non-finite element instead of letting `max_abs_diff_vec` assert or swallow it.
+    let test_id = "diff_020_nd_sparse_array_shape_operations_vs_scipy";
+    let mut ledger = CompareLedger::new(test_id, &["nd_array_shape_ops"]);
+    let (diff, pass) = match ledger.slices(
+        "nd_array_shape_ops",
+        test_id,
+        Some(scipy_values.as_slice()),
+        Some(rust_values.as_slice()),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff == 0.0;
+            ledger.compared("nd_array_shape_ops", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary: "3-D COO expand_dims/permute_dims/swapaxes plus array/matrix predicates"
+                .into(),
+            expected: format!("scipy={scipy_values:?}"),
+            actual: format!("rust={rust_values:?}"),
+            diff,
+            tolerance: 0.0,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(pass, "N-dimensional sparse-array contract diff={diff}");
+    ledger.finish(1);
 }
 
 #[test]
@@ -1461,33 +1553,72 @@ fn diff_021_sparse_npz_wire_compatibility_vs_scipy() {
         .expect("Rust must write SciPy-compatible N-D COO NPZ");
     rust_archives.push(archive.into_inner());
 
-    let Some(scipy_loaded_rust) = scipy_contract_for_npz_archives(&rust_archives) else {
-        eprintln!("SciPy sparse NPZ reader oracle unavailable; skipping diff_021");
-        return;
-    };
+    // The writer oracle above already proved SciPy is available, so no contract from the reader
+    // means SciPy could not load the Rust-written archives (or its script failed). That used to
+    // return early and pass; it now reaches the ledger and fails the `rust_to_scipy` arm.
+    let scipy_loaded_rust = scipy_contract_for_npz_archives(&rust_archives);
+    if scipy_loaded_rust.is_none() {
+        eprintln!("diff_021: SciPy produced no contract for the Rust-written NPZ archives");
+    }
 
-    let scipy_to_rust_diff = max_abs_diff_vec(&rust_loaded_scipy, &expected);
-    let rust_to_scipy_diff = max_abs_diff_vec(&scipy_loaded_rust, &expected);
-    let diff = scipy_to_rust_diff.max(rust_to_scipy_diff);
+    let test_id = "diff_021_sparse_npz_wire_compatibility_vs_scipy";
+    let mut ledger = CompareLedger::new(test_id, &["scipy_to_rust", "rust_to_scipy"]);
+    // SciPy-written archives read by Rust: the contract is the reference, Rust's reading the
+    // fsci side.
+    let scipy_to_rust_diff = match ledger.slices(
+        "scipy_to_rust",
+        test_id,
+        Some(expected.as_slice()),
+        Some(rust_loaded_scipy.as_slice()),
+    ) {
+        Some((contract, rust)) => {
+            let d = max_abs_diff_vec(rust, contract);
+            ledger.compared("scipy_to_rust", test_id, d == 0.0);
+            d
+        }
+        None => f64::INFINITY,
+    };
+    // Rust-written archives read by SciPy: SciPy's reading is the SciPy side, checked against
+    // the contract of the fixtures Rust wrote.
+    let rust_to_scipy_diff = match ledger.slices(
+        "rust_to_scipy",
+        test_id,
+        scipy_loaded_rust.as_deref(),
+        Some(expected.as_slice()),
+    ) {
+        Some((scipy, contract)) => {
+            let d = max_abs_diff_vec(scipy, contract);
+            ledger.compared("rust_to_scipy", test_id, d == 0.0);
+            d
+        }
+        None => f64::INFINITY,
+    };
+    let diff = nan_max(scipy_to_rust_diff, rust_to_scipy_diff);
     let pass = diff == 0.0;
-    emit_log(&DiffTestLog {
-        test_id: "diff_021_sparse_npz_wire_compatibility_vs_scipy".into(),
-        category: "scipy_differential".into(),
-        input_summary:
-            "two-way compressed NPZ wire compatibility for CSR/CSC/COO/BSR/DIA and N-D COO array"
-                .into(),
-        expected: format!("contract={expected:?}"),
-        actual: format!("scipy_to_rust={rust_loaded_scipy:?}; rust_to_scipy={scipy_loaded_rust:?}"),
-        diff,
-        tolerance: 0.0,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary:
+                "two-way compressed NPZ wire compatibility for CSR/CSC/COO/BSR/DIA and N-D COO array"
+                    .into(),
+            expected: format!("contract={expected:?}"),
+            actual: format!(
+                "scipy_to_rust={rust_loaded_scipy:?}; rust_to_scipy={scipy_loaded_rust:?}"
+            ),
+            diff,
+            tolerance: 0.0,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(
         pass,
         "sparse NPZ wire diff={diff}; scipy->rust={scipy_to_rust_diff}; rust->scipy={rust_to_scipy_diff}"
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -1517,26 +1648,43 @@ fn diff_022_spsolve_with_casp_vs_scipy_superlu_4x4() {
     let csr = coo.to_csr().expect("csr");
     let rhs = vec![15.0, 10.0, 10.0, 10.0];
     let mut portfolio = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
-    let rust_result = spsolve_with_casp(&csr, &rhs, SolveOptions::default(), &mut portfolio)
-        .expect("rust spsolve_with_casp")
-        .solution;
-    let diff = max_abs_diff_vec(&rust_result, &scipy_result);
+    let rust_result =
+        spsolve_with_casp(&csr, &rhs, SolveOptions::default(), &mut portfolio).map(|r| r.solution);
     let tolerance = 1e-10;
-    let pass = diff <= tolerance;
-    emit_log(&DiffTestLog {
-        test_id: "diff_022_spsolve_with_casp_vs_scipy_superlu_4x4".into(),
-        category: "scipy_differential".into(),
-        input_summary:
-            "4x4 SPD tridiagonal CSR solve via spsolve_with_casp vs scipy.sparse.linalg.spsolve"
-                .into(),
-        expected: format!("scipy={scipy_result:?}"),
-        actual: format!("rust={rust_result:?}"),
-        diff,
-        tolerance,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
+    let test_id = "diff_022_spsolve_with_casp_vs_scipy_superlu_4x4";
+    let mut ledger = CompareLedger::new(test_id, &["spsolve_with_casp"]);
+    let (diff, pass) = match ledger.slices(
+        "spsolve_with_casp",
+        test_id,
+        Some(scipy_result.as_slice()),
+        rust_result.as_deref().ok(),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff <= tolerance;
+            ledger.compared("spsolve_with_casp", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary:
+                "4x4 SPD tridiagonal CSR solve via spsolve_with_casp vs scipy.sparse.linalg.spsolve"
+                    .into(),
+            expected: format!("scipy={scipy_result:?}"),
+            actual: format!("rust={rust_result:?}"),
+            diff,
+            tolerance,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &ledger,
+    );
     assert!(
         pass,
         "spsolve_with_casp SciPy oracle diff={diff} > tol={tolerance}"
@@ -1546,6 +1694,7 @@ fn diff_022_spsolve_with_casp_vs_scipy_superlu_4x4() {
         1,
         "portfolio should record evidence entry"
     );
+    ledger.finish(1);
 }
 
 #[test]
@@ -1578,25 +1727,42 @@ fn diff_023_spsolve_with_audit_records_evidence_and_matches_scipy() {
     let ledger = sync_audit_ledger();
     let rust_result =
         spsolve_with_audit(&csr, &rhs, SolveOptions::default(), &mut portfolio, &ledger)
-            .expect("rust spsolve_with_audit")
-            .solution;
-    let diff = max_abs_diff_vec(&rust_result, &scipy_result);
+            .map(|r| r.solution);
     let tolerance = 1e-10;
-    let pass = diff <= tolerance;
-    emit_log(&DiffTestLog {
-        test_id: "diff_023_spsolve_with_audit_records_evidence_and_matches_scipy".into(),
-        category: "scipy_differential".into(),
-        input_summary:
-            "4x4 SPD tridiagonal CSR solve via spsolve_with_audit vs scipy.sparse.linalg.spsolve"
-                .into(),
-        expected: format!("scipy={scipy_result:?}"),
-        actual: format!("rust={rust_result:?}"),
-        diff,
-        tolerance,
-        pass,
-        timestamp_ms: timestamp_ms(),
-        duration_ns: start.elapsed().as_nanos(),
-    });
+    // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
+    let test_id = "diff_023_spsolve_with_audit_records_evidence_and_matches_scipy";
+    let mut compare_ledger = CompareLedger::new(test_id, &["spsolve_with_audit"]);
+    let (diff, pass) = match compare_ledger.slices(
+        "spsolve_with_audit",
+        test_id,
+        Some(scipy_result.as_slice()),
+        rust_result.as_deref().ok(),
+    ) {
+        Some((scipy, rust)) => {
+            let diff = max_abs_diff_vec(rust, scipy);
+            let pass = diff <= tolerance;
+            compare_ledger.compared("spsolve_with_audit", test_id, pass);
+            (diff, pass)
+        }
+        None => (f64::INFINITY, false),
+    };
+    emit_ledgered_log(
+        &DiffTestLog {
+            test_id: test_id.into(),
+            category: "scipy_differential".into(),
+            input_summary:
+                "4x4 SPD tridiagonal CSR solve via spsolve_with_audit vs scipy.sparse.linalg.spsolve"
+                    .into(),
+            expected: format!("scipy={scipy_result:?}"),
+            actual: format!("rust={rust_result:?}"),
+            diff,
+            tolerance,
+            pass,
+            timestamp_ms: timestamp_ms(),
+            duration_ns: start.elapsed().as_nanos(),
+        },
+        &compare_ledger,
+    );
     assert!(
         pass,
         "spsolve_with_audit SciPy oracle diff={diff} > tol={tolerance}"
@@ -1606,6 +1772,7 @@ fn diff_023_spsolve_with_audit_records_evidence_and_matches_scipy() {
         1,
         "portfolio should record evidence entry"
     );
+    compare_ledger.finish(1);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2019,9 +2186,11 @@ fn adv_008_boundary_single_element_matrix_all_formats() {
     let r_csr = spmv_csr(&csr, &x).expect("csr spmv");
     let r_csc = spmv_csc(&csc, &x).expect("csc spmv");
     let expected = vec![84.0];
-    let diff = max_abs_diff_vec(&r_coo, &expected)
-        .max(max_abs_diff_vec(&r_csr, &expected))
-        .max(max_abs_diff_vec(&r_csc, &expected));
+    let diff = [&r_csr, &r_csc]
+        .into_iter()
+        .fold(max_abs_diff_vec(&r_coo, &expected), |acc, r| {
+            nan_max(acc, max_abs_diff_vec(r, &expected))
+        });
     let pass = diff <= TOL;
     emit_log(&DiffTestLog {
         test_id: "adv_008_single_element_all_formats".into(),

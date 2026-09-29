@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-b7ib6]. 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, matrix_power, signm};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -250,33 +252,34 @@ fn diff_linalg_matrix_power_signm() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["matrix_power", "signm"];
+    let mut ledger = CompareLedger::new("diff_linalg_matrix_power_signm", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
-            continue;
-        };
         let a = rows_of(&case.a, case.rows, case.cols);
         let opts = DecompOptions::default();
         let fsci_mat = match case.op.as_str() {
             "matrix_power" => matrix_power(&a, case.power as i32, opts),
             "signm" => signm(&a, opts),
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
-        let Ok(m) = fsci_mat else {
+        let fsci_flat = fsci_mat.ok().map(|m| flatten(&m));
+        let Some((expected, fsci_flat)) = ledger.slices(
+            case.op.as_str(),
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_flat.as_deref(),
+        ) else {
             continue;
         };
-        let fsci_flat = flatten(&m);
-        let abs_d = if fsci_flat.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_flat
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_flat
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(case.op.as_str(), &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -291,6 +294,7 @@ fn diff_linalg_matrix_power_signm() {
         test_id: "diff_linalg_matrix_power_signm".into(),
         category: "numpy.linalg.matrix_power + scipy.linalg.signm".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -310,5 +314,11 @@ fn diff_linalg_matrix_power_signm() {
         "matrix_power_signm conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

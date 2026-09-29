@@ -5,13 +5,14 @@
 //! fftn, then compares fsci's ifftn vs scipy's ifftn on identical
 //! complex inputs. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{FftOptions, ifftn};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -219,44 +221,45 @@ fn diff_fft_ifftn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_fft_ifftn", &["ifftn"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_out) = scipy_arm.output.as_ref() else {
-            continue;
-        };
-        let Some(packed) = scipy_arm.complex_input.as_ref() else {
-            continue;
-        };
-        let complex_input: Vec<(f64, f64)> = packed
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|p| (p[0], p[1]))
-            .collect();
-        let opts = FftOptions::default();
-        let Ok(rec) = ifftn(&complex_input, &case.shape, &opts) else {
-            continue;
-        };
-        let mut fsci_v = Vec::with_capacity(rec.len() * 2);
-        for c in &rec {
-            fsci_v.push(c.0);
-            fsci_v.push(c.1);
-        }
-        if fsci_v.len() != scipy_out.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
+        let complex_input: Option<Vec<(f64, f64)>> =
+            scipy_arm.complex_input.as_ref().map(|packed| {
+                packed
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| (p[0], p[1]))
+                    .collect()
             });
+        let opts = FftOptions::default();
+        let fsci_v = complex_input
+            .as_ref()
+            .and_then(|input| ifftn(input, &case.shape, &opts).ok())
+            .map(|rec| {
+                let mut fsci_v = Vec::with_capacity(rec.len() * 2);
+                for c in &rec {
+                    fsci_v.push(c.0);
+                    fsci_v.push(c.1);
+                }
+                fsci_v
+            });
+        // SciPy's fftn output is the input both sides invert; without it there is no oracle.
+        let scipy_out = complex_input.as_ref().and(scipy_arm.output.as_deref());
+        let Some((scipy_out, fsci_v)) =
+            ledger.slices("ifftn", &case.case_id, scipy_out, fsci_v.as_deref())
+        else {
             continue;
-        }
+        };
         let abs_d = fsci_v
             .iter()
             .zip(scipy_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("ifftn", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -270,6 +273,7 @@ fn diff_fft_ifftn() {
         test_id: "diff_fft_ifftn".into(),
         category: "scipy.fft.ifftn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -290,4 +294,5 @@ fn diff_fft_ifftn() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

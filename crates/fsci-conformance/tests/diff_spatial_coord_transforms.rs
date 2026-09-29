@@ -18,13 +18,14 @@
 //! 5 fixtures × {forward sph, forward cyl, sph round-trip, cyl
 //! round-trip} ≈ 20 cases. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{
     cartesian_to_cylindrical, cartesian_to_spherical, cylindrical_to_cartesian,
     spherical_to_cartesian,
@@ -73,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -255,18 +257,37 @@ fn diff_spatial_coord_transforms() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_coord_transforms",
+        &[
+            "cartesian_to_spherical",
+            "sph_round_trip_identity",
+            "cartesian_to_cylindrical",
+            "cyl_round_trip_identity",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
+        let orig = [case.x, case.y, case.z];
 
-        // Forward spherical
-        if let Some(scipy_sph) = scipy_arm.sph {
-            let (r, t, p) = cartesian_to_spherical(case.x, case.y, case.z);
+        // Forward spherical. slices rejects a non-finite fsci component, which the max fold
+        // in the detail would swallow.
+        let (r, t, p) = cartesian_to_spherical(case.x, case.y, case.z);
+        let fsci_sph = [r, t, p];
+        if let Some((scipy_sph, _)) = ledger.slices(
+            "cartesian_to_spherical",
+            &case.case_id,
+            scipy_arm.sph.as_ref().map(|s| s.as_slice()),
+            Some(fsci_sph.as_slice()),
+        ) {
             let abs_diff = [
                 (r - scipy_sph[0]).abs(),
                 (t - scipy_sph[1]).abs(),
                 (p - scipy_sph[2]).abs(),
             ];
+            let pass = abs_diff.iter().all(|d| *d <= ABS_TOL);
+            ledger.compared("cartesian_to_spherical", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "cartesian_to_spherical".into(),
@@ -274,16 +295,30 @@ fn diff_spatial_coord_transforms() {
                     "rust=({r}, {t}, {p}), numpy={scipy_sph:?}, max_abs={}",
                     abs_diff.iter().cloned().fold(0.0_f64, f64::max)
                 ),
-                pass: abs_diff.iter().all(|d| *d <= ABS_TOL),
+                pass,
             });
+        }
 
-            // Round-trip: sph → cart, expect ≈ original (x, y, z).
-            let (rx, ry, rz) = spherical_to_cartesian(r, t, p);
+        // Round-trip: sph → cart, expect ≈ original (x, y, z). The reference is the original
+        // point, so this arm does not depend on the oracle.
+        let (rx, ry, rz) = spherical_to_cartesian(r, t, p);
+        let recovered = [rx, ry, rz];
+        if ledger
+            .slices(
+                "sph_round_trip_identity",
+                &case.case_id,
+                Some(orig.as_slice()),
+                Some(recovered.as_slice()),
+            )
+            .is_some()
+        {
             let rt_diff = [
                 (rx - case.x).abs(),
                 (ry - case.y).abs(),
                 (rz - case.z).abs(),
             ];
+            let pass = rt_diff.iter().all(|d| *d <= ABS_TOL);
+            ledger.compared("sph_round_trip_identity", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "sph_round_trip_identity".into(),
@@ -294,18 +329,26 @@ fn diff_spatial_coord_transforms() {
                     case.z,
                     rt_diff.iter().cloned().fold(0.0_f64, f64::max)
                 ),
-                pass: rt_diff.iter().all(|d| *d <= ABS_TOL),
+                pass,
             });
         }
 
         // Forward cylindrical
-        if let Some(scipy_cyl) = scipy_arm.cyl {
-            let (rho, t, zz) = cartesian_to_cylindrical(case.x, case.y, case.z);
+        let (rho, t, zz) = cartesian_to_cylindrical(case.x, case.y, case.z);
+        let fsci_cyl = [rho, t, zz];
+        if let Some((scipy_cyl, _)) = ledger.slices(
+            "cartesian_to_cylindrical",
+            &case.case_id,
+            scipy_arm.cyl.as_ref().map(|s| s.as_slice()),
+            Some(fsci_cyl.as_slice()),
+        ) {
             let abs_diff = [
                 (rho - scipy_cyl[0]).abs(),
                 (t - scipy_cyl[1]).abs(),
                 (zz - scipy_cyl[2]).abs(),
             ];
+            let pass = abs_diff.iter().all(|d| *d <= ABS_TOL);
+            ledger.compared("cartesian_to_cylindrical", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "cartesian_to_cylindrical".into(),
@@ -313,16 +356,29 @@ fn diff_spatial_coord_transforms() {
                     "rust=({rho}, {t}, {zz}), numpy={scipy_cyl:?}, max_abs={}",
                     abs_diff.iter().cloned().fold(0.0_f64, f64::max)
                 ),
-                pass: abs_diff.iter().all(|d| *d <= ABS_TOL),
+                pass,
             });
+        }
 
-            // Round-trip
-            let (rx, ry, rz) = cylindrical_to_cartesian(rho, t, zz);
+        // Round-trip
+        let (rx, ry, rz) = cylindrical_to_cartesian(rho, t, zz);
+        let recovered = [rx, ry, rz];
+        if ledger
+            .slices(
+                "cyl_round_trip_identity",
+                &case.case_id,
+                Some(orig.as_slice()),
+                Some(recovered.as_slice()),
+            )
+            .is_some()
+        {
             let rt_diff = [
                 (rx - case.x).abs(),
                 (ry - case.y).abs(),
                 (rz - case.z).abs(),
             ];
+            let pass = rt_diff.iter().all(|d| *d <= ABS_TOL);
+            ledger.compared("cyl_round_trip_identity", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "cyl_round_trip_identity".into(),
@@ -333,7 +389,7 @@ fn diff_spatial_coord_transforms() {
                     case.z,
                     rt_diff.iter().cloned().fold(0.0_f64, f64::max)
                 ),
-                pass: rt_diff.iter().all(|d| *d <= ABS_TOL),
+                pass,
             });
         }
     }
@@ -345,6 +401,7 @@ fn diff_spatial_coord_transforms() {
         test_id: "diff_spatial_coord_transforms".into(),
         category: "fsci_spatial coordinate transforms".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -369,4 +426,5 @@ fn diff_spatial_coord_transforms() {
         pass_count,
         cases.len()
     );
+    ledger.finish(query.points.len());
 }

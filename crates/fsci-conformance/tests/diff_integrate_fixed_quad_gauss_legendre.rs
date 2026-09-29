@@ -16,19 +16,22 @@
 //! Probes restricted to integrands within these exactness windows
 //! so tolerances stay tight (1e-10 abs).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{dblquad_rect, fixed_quad, gauss_legendre, tplquad_rect};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci entry point (the case `op`).
+const ARMS: [&str; 4] = ["fixed_quad", "gl", "dbl", "tpl"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -76,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -341,42 +345,44 @@ fn diff_integrate_fixed_quad_gauss_legendre() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_fixed_quad_gauss_legendre", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let actual = match case.op.as_str() {
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
+        let arm = case.op.as_str();
+        let actual = match arm {
             "fixed_quad" => {
                 let fname = case.func.clone();
                 let f = move |x: f64| f1d(&fname, x);
-                match fixed_quad(&f, case.a, case.b, case.n) {
-                    Ok((v, _)) => v,
-                    Err(_) => continue,
-                }
+                fixed_quad(&f, case.a, case.b, case.n).ok().map(|(v, _)| v)
             }
             "gl" => {
                 let fname = case.func.clone();
                 let f = move |x: f64| f1d(&fname, x);
-                gauss_legendre(&f, case.a, case.b, case.n)
+                Some(gauss_legendre(&f, case.a, case.b, case.n))
             }
             "dbl" => {
                 let fname = case.func.clone();
                 let f = move |x: f64, y: f64| f2d(&fname, x, y);
-                dblquad_rect(&f, case.a, case.b, case.c, case.d, case.n, case.ny)
+                Some(dblquad_rect(
+                    &f, case.a, case.b, case.c, case.d, case.n, case.ny,
+                ))
             }
             "tpl" => {
                 let fname = case.func.clone();
                 let f = move |x: f64, y: f64, z: f64| f3d(&fname, x, y, z);
-                tplquad_rect(&f, case.a, case.b, case.c, case.d, case.e, case.g, case.n)
+                Some(tplquad_rect(
+                    &f, case.a, case.b, case.c, case.d, case.e, case.g, case.n,
+                ))
             }
-            _ => continue,
+            _ => None,
+        };
+        let Some((expected, actual)) = ledger.pair(arm, &case.case_id, scipy, actual) else {
+            continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -393,6 +399,7 @@ fn diff_integrate_fixed_quad_gauss_legendre() {
             "fsci_integrate::{fixed_quad, gauss_legendre, dblquad_rect, tplquad_rect} vs scipy.integrate"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -413,4 +420,11 @@ fn diff_integrate_fixed_quad_gauss_legendre() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (`tpl` has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

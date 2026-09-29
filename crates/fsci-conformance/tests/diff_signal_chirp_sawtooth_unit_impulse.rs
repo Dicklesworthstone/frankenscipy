@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-y3osz]. 1e-10 abs on time-domain output.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{ChirpMethod, chirp, sawtooth, unit_impulse};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -273,49 +275,42 @@ fn diff_signal_chirp_sawtooth_unit_impulse() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_chirp_sawtooth_unit_impulse",
+        &["chirp", "sawtooth", "unit_impulse"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let fsci_v: Vec<f64> = match case.op.as_str() {
+        let fsci_v: Option<Vec<f64>> = match case.op.as_str() {
             "chirp" => {
                 let method = match case.method.as_str() {
-                    "linear" => ChirpMethod::Linear,
-                    "quadratic" => ChirpMethod::Quadratic,
-                    "logarithmic" => ChirpMethod::Logarithmic,
-                    _ => continue,
+                    "linear" => Some(ChirpMethod::Linear),
+                    "quadratic" => Some(ChirpMethod::Quadratic),
+                    "logarithmic" => Some(ChirpMethod::Logarithmic),
+                    _ => None,
                 };
-                let Ok(y) = chirp(&case.t, case.f0, case.t1, case.f1, method) else {
-                    continue;
-                };
-                y
+                method.and_then(|m| chirp(&case.t, case.f0, case.t1, case.f1, m).ok())
             }
-            "sawtooth" => {
-                let Ok(y) = sawtooth(&case.t, case.width) else {
-                    continue;
-                };
-                y
-            }
-            "unit_impulse" => {
-                let Ok(y) = unit_impulse(case.shape, Some(case.idx)) else {
-                    continue;
-                };
-                y
-            }
-            _ => continue,
+            "sawtooth" => sawtooth(&case.t, case.width).ok(),
+            "unit_impulse" => unit_impulse(case.shape, Some(case.idx)).ok(),
+            _ => None,
         };
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let Some((expected, fsci_v)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
+            continue;
         };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -330,6 +325,7 @@ fn diff_signal_chirp_sawtooth_unit_impulse() {
         test_id: "diff_signal_chirp_sawtooth_unit_impulse".into(),
         category: "scipy.signal chirp + sawtooth + unit_impulse".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -349,5 +345,11 @@ fn diff_signal_chirp_sawtooth_unit_impulse() {
         "chirp_sawtooth_unit_impulse conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        per_op("chirp")
+            .min(per_op("sawtooth"))
+            .min(per_op("unit_impulse")),
     );
 }

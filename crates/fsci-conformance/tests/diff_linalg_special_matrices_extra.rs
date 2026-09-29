@@ -10,16 +10,30 @@
 //!   * helmert(n)     vs scipy.linalg.helmert(n, full=False)
 //!   * helmert_full(n) vs scipy.linalg.helmert(n, full=True)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{hankel, helmert, helmert_full, leslie, pascal, vander};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// Every `CasePoint::op`; each is a ledger arm.
+const OPS: [&str; 9] = [
+    "leslie",
+    "pascal_sym",
+    "pascal_lower",
+    "vander_inc",
+    "vander_dec",
+    "hankel_with_r",
+    "hankel_zero_r",
+    "helmert_sub",
+    "helmert_full",
+];
 const REL_TOL: f64 = 1.0e-10;
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -75,6 +89,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -321,33 +336,44 @@ fn diff_linalg_special_matrices_extra() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_special_matrices_extra", &OPS);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_rows), Some(exp_cols), Some(exp_data)) = (o.rows, o.cols, o.data.as_ref())
-        else {
-            continue;
+        let scipy = match (o.rows, o.cols, o.data.as_deref()) {
+            (Some(exp_rows), Some(exp_cols), Some(exp_data)) => {
+                Some((exp_rows, exp_cols, exp_data))
+            }
+            _ => None,
         };
 
         let actual = match fsci_compute(case) {
-            Ok(m) => m,
+            Ok(m) => Some(m),
             Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    op: case.op.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    max_rel_diff: f64::INFINITY,
-                    rows: 0,
-                    cols: 0,
-                    pass: false,
-                    note: e,
-                });
-                continue;
+                if scipy.is_some() {
+                    diffs.push(CaseDiff {
+                        case_id: case.case_id.clone(),
+                        op: case.op.clone(),
+                        max_abs_diff: f64::INFINITY,
+                        max_rel_diff: f64::INFINITY,
+                        rows: 0,
+                        cols: 0,
+                        pass: false,
+                        note: e,
+                    });
+                }
+                None
             }
+        };
+        let Some(((exp_rows, exp_cols, exp_data), actual)) =
+            ledger.both(&case.op, &case.case_id, scipy, actual)
+        else {
+            continue;
         };
         let rows = actual.len();
         let cols = actual.first().map_or(0, |r| r.len());
         if rows != exp_rows || cols != exp_cols {
+            ledger.compared(&case.op, &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 op: case.op.clone(),
@@ -358,6 +384,19 @@ fn diff_linalg_special_matrices_extra() {
                 pass: false,
                 note: format!("shape mismatch: fsci {rows}x{cols} scipy {exp_rows}x{exp_cols}"),
             });
+            continue;
+        }
+        // A ragged row or a NaN entry (which the max folds below would swallow) is recorded here.
+        let actual_flat: Vec<f64> = actual.iter().flatten().copied().collect();
+        if ledger
+            .slices(
+                &case.op,
+                &case.case_id,
+                Some(exp_data),
+                Some(actual_flat.as_slice()),
+            )
+            .is_none()
+        {
             continue;
         }
 
@@ -373,6 +412,7 @@ fn diff_linalg_special_matrices_extra() {
             }
         }
         let pass = max_rel <= REL_TOL || max_abs <= ABS_TOL;
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -391,6 +431,7 @@ fn diff_linalg_special_matrices_extra() {
         category: "fsci_linalg::{leslie, pascal, vander, hankel, helmert*} vs scipy.linalg/numpy"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -412,4 +453,11 @@ fn diff_linalg_special_matrices_extra() {
         "special-matrices parity failed: {} cases",
         diffs.len()
     );
+    // hankel_* and vander_inc have one case each: the smallest designed count over the ops.
+    let min_per_op = OPS
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_op);
 }

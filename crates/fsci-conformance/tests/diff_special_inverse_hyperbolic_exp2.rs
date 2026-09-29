@@ -6,16 +6,21 @@
 //! plus exp2_iterated which computes exp(exp(x)) — closed-form
 //! comparison against the same f64 primitives.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::convenience::exp2_iterated;
 use fsci_special::{arccosh, arcsinh, arctanh};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-14;
+/// One ledger arm per fsci function; the reference side is the std f64 primitive or the
+/// round-trip input.
+const ARMS: [&str; 4] = ["arcsinh", "arccosh", "arctanh", "exp2_iterated"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -32,6 +37,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -63,8 +69,14 @@ fn emit_log(log: &DiffLog) {
 fn diff_special_inverse_hyperbolic_exp2() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
-    let mut check = |id: &str, actual: f64, expected: f64| {
+    let mut ledger = CompareLedger::new("diff_special_inverse_hyperbolic_exp2", &ARMS);
+    let mut check = |arm: &str, id: &str, actual: f64, expected: f64| {
+        // Every reference is finite; a non-finite fsci value is recorded as an fsci failure.
+        let Some((expected, actual)) = ledger.pair(arm, id, Some(expected), Some(actual)) else {
+            return;
+        };
         let abs_diff = (actual - expected).abs();
+        ledger.compared(arm, id, abs_diff <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: id.into(),
             actual,
@@ -76,41 +88,49 @@ fn diff_special_inverse_hyperbolic_exp2() {
     };
 
     // arcsinh: defined for all real x; identity arcsinh(sinh(x)) = x
-    for &x in &[-3.0_f64, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 100.0] {
-        check(&format!("arcsinh_{x}"), arcsinh(x), x.asinh());
+    let arcsinh_xs = [-3.0_f64, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 100.0];
+    for &x in &arcsinh_xs {
+        check("arcsinh", &format!("arcsinh_{x}"), arcsinh(x), x.asinh());
     }
     // sinh-arcsinh round-trip
-    for &x in &[-2.5_f64, 0.0, 1.5] {
+    let arcsinh_round_trip_xs = [-2.5_f64, 0.0, 1.5];
+    for &x in &arcsinh_round_trip_xs {
         let s = x.sinh();
         let back = arcsinh(s);
-        check(&format!("arcsinh_round_trip_{x}"), back, x);
+        check("arcsinh", &format!("arcsinh_round_trip_{x}"), back, x);
     }
 
     // arccosh: defined for x >= 1
-    for &x in &[1.0_f64, 1.5, 2.0, 5.0, 100.0] {
-        check(&format!("arccosh_{x}"), arccosh(x), x.acosh());
+    let arccosh_xs = [1.0_f64, 1.5, 2.0, 5.0, 100.0];
+    for &x in &arccosh_xs {
+        check("arccosh", &format!("arccosh_{x}"), arccosh(x), x.acosh());
     }
     // cosh-arccosh round-trip for x >= 0 (arccosh always non-negative)
-    for &x in &[0.0_f64, 0.5, 2.0, 3.5] {
+    let arccosh_round_trip_xs = [0.0_f64, 0.5, 2.0, 3.5];
+    for &x in &arccosh_round_trip_xs {
         let c = x.cosh();
         let back = arccosh(c);
-        check(&format!("arccosh_round_trip_{x}"), back, x);
+        check("arccosh", &format!("arccosh_round_trip_{x}"), back, x);
     }
 
     // arctanh: defined for |x| < 1
-    for &x in &[-0.99_f64, -0.5, -0.1, 0.0, 0.1, 0.5, 0.99] {
-        check(&format!("arctanh_{x}"), arctanh(x), x.atanh());
+    let arctanh_xs = [-0.99_f64, -0.5, -0.1, 0.0, 0.1, 0.5, 0.99];
+    for &x in &arctanh_xs {
+        check("arctanh", &format!("arctanh_{x}"), arctanh(x), x.atanh());
     }
     // tanh-arctanh round-trip
-    for &x in &[-2.0_f64, -0.5, 0.0, 0.5, 2.0] {
+    let arctanh_round_trip_xs = [-2.0_f64, -0.5, 0.0, 0.5, 2.0];
+    for &x in &arctanh_round_trip_xs {
         let t = x.tanh();
         let back = arctanh(t);
-        check(&format!("arctanh_round_trip_{x}"), back, x);
+        check("arctanh", &format!("arctanh_round_trip_{x}"), back, x);
     }
 
     // exp2_iterated(x) = exp(exp(x))
-    for &x in &[-2.0_f64, -1.0, 0.0, 0.5, 1.0, 2.0] {
+    let exp2_iterated_xs = [-2.0_f64, -1.0, 0.0, 0.5, 1.0, 2.0];
+    for &x in &exp2_iterated_xs {
         check(
+            "exp2_iterated",
             &format!("exp2_iterated_{x}"),
             exp2_iterated(x),
             x.exp().exp(),
@@ -122,6 +142,7 @@ fn diff_special_inverse_hyperbolic_exp2() {
         test_id: "diff_special_inverse_hyperbolic_exp2".into(),
         category: "fsci_special::{arcsinh, arccosh, arctanh, exp2_iterated} coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -143,4 +164,16 @@ fn diff_special_inverse_hyperbolic_exp2() {
         "inv_hyper/exp2 coverage failed: {} cases",
         diffs.len()
     );
+    // Arms have different case sets (exp2_iterated has the fewest); each must compare all of
+    // its own.
+    let min_per_arm = [
+        arcsinh_xs.len() + arcsinh_round_trip_xs.len(),
+        arccosh_xs.len() + arccosh_round_trip_xs.len(),
+        arctanh_xs.len() + arctanh_round_trip_xs.len(),
+        exp2_iterated_xs.len(),
+    ]
+    .into_iter()
+    .min()
+    .expect("four arms");
+    ledger.finish(min_per_arm);
 }

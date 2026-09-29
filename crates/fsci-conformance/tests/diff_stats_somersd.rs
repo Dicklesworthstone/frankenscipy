@@ -11,13 +11,14 @@
 //! subprocess. Tol 1e-9 abs (closed-form concordant -
 //! discordant ratio + normal-tail).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{SomersDInput, somersd};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -224,34 +226,33 @@ fn diff_stats_somersd() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_somersd", &["statistic", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let result = match somersd(SomersDInput::Rankings(&case.x, &case.y), Some("two-sided")) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if let Some(scipy_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - scipy_stat).abs();
+        let result = somersd(SomersDInput::Rankings(&case.x, &case.y), Some("two-sided")).ok();
+        let arms = [
+            (
+                "statistic",
+                scipy_arm.statistic,
+                result.as_ref().map(|r| r.statistic),
+            ),
+            (
+                "pvalue",
+                scipy_arm.pvalue,
+                result.as_ref().map(|r| r.pvalue),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -264,6 +265,7 @@ fn diff_stats_somersd() {
         test_id: "diff_stats_somersd".into(),
         category: "scipy.stats.somersd".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -288,4 +290,5 @@ fn diff_stats_somersd() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

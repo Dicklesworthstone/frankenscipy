@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-bi1ec]. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::digamma;
 use fsci_special::types::Complex64 as FsciComplex;
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -218,19 +220,22 @@ fn diff_special_digamma_complex() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_digamma_complex", &["digamma"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.re.zip(a.im));
+        let Some(((ere, eim), (re, im))) = ledger.both(
+            "digamma",
+            &case.case_id,
+            scipy,
+            fsci_eval(case.z_re, case.z_im),
+        ) else {
             continue;
         };
-        let (Some(ere), Some(eim)) = (arm.re, arm.im) else {
-            continue;
-        };
-        let Some((re, im)) = fsci_eval(case.z_re, case.z_im) else {
-            continue;
-        };
+        // A NaN component makes abs_d NaN, which fails `<=`; the oracle sends only finite pairs.
         let abs_d = ((re - ere).powi(2) + (im - eim).powi(2)).sqrt();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("digamma", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -244,6 +249,7 @@ fn diff_special_digamma_complex() {
         test_id: "diff_special_digamma_complex".into(),
         category: "fsci_special::digamma(ComplexScalar) vs scipy.special.digamma".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -267,4 +273,5 @@ fn diff_special_digamma_complex() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

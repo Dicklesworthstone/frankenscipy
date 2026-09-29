@@ -12,13 +12,14 @@
 //! arithmetic / integer counts; bin edges via linspace —
 //! numpy aligns to fsci when range = (min, max)).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{diff, histogram};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,58 +240,85 @@ fn diff_stats_diff_histogram() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_diff_histogram",
+        &["diff", "histogram.counts", "histogram.edges"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
             "diff" => {
-                if let Some(scipy_d) = &scipy_arm.diffs {
-                    let rust_d = diff(&case.data);
-                    if rust_d.len() == scipy_d.len() {
-                        let mut max_local = 0.0_f64;
-                        for (r, s) in rust_d.iter().zip(scipy_d.iter()) {
-                            if r.is_finite() {
-                                max_local = max_local.max((r - s).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            arm: "diff".into(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
-                    }
-                }
+                let rust_d = diff(&case.data);
+                let Some((scipy_d, rust_d)) = ledger.slices(
+                    "diff",
+                    &case.case_id,
+                    scipy_arm.diffs.as_deref(),
+                    Some(rust_d.as_slice()),
+                ) else {
+                    continue;
+                };
+                let max_local = rust_d
+                    .iter()
+                    .zip(scipy_d.iter())
+                    .map(|(r, s)| (r - s).abs())
+                    .fold(0.0_f64, f64::max);
+                max_overall = max_overall.max(max_local);
+                ledger.compared("diff", &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    arm: "diff".into(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
             }
             "histogram" => {
                 let (rust_counts, rust_edges) = histogram(&case.data, case.bins);
-                if let Some(scipy_counts) = &scipy_arm.counts
-                    && rust_counts.len() == scipy_counts.len()
-                {
-                    let mut max_local = 0.0_f64;
-                    for (r, s) in rust_counts.iter().zip(scipy_counts.iter()) {
-                        let abs = (*r as i64 - *s).unsigned_abs() as f64;
-                        max_local = max_local.max(abs);
-                    }
-                    max_overall = max_overall.max(max_local);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        arm: "histogram.counts".into(),
-                        abs_diff: max_local,
-                        pass: max_local <= ABS_TOL,
-                    });
-                }
-                if let Some(scipy_edges) = &scipy_arm.edges
-                    && rust_edges.len() == scipy_edges.len()
-                {
-                    let mut max_local = 0.0_f64;
-                    for (r, s) in rust_edges.iter().zip(scipy_edges.iter()) {
-                        if r.is_finite() {
-                            max_local = max_local.max((r - s).abs());
+                // counts are integers: presence through the ledger, then compared as before; a
+                // length mismatch is a compared failure, not a skip
+                if let Some((scipy_counts, rust_counts)) = ledger.both(
+                    "histogram.counts",
+                    &case.case_id,
+                    scipy_arm.counts.as_ref(),
+                    Some(&rust_counts),
+                ) {
+                    if rust_counts.len() == scipy_counts.len() {
+                        let mut max_local = 0.0_f64;
+                        for (r, s) in rust_counts.iter().zip(scipy_counts.iter()) {
+                            let abs = (*r as i64 - *s).unsigned_abs() as f64;
+                            max_local = max_local.max(abs);
                         }
+                        max_overall = max_overall.max(max_local);
+                        ledger.compared("histogram.counts", &case.case_id, max_local <= ABS_TOL);
+                        diffs.push(CaseDiff {
+                            case_id: case.case_id.clone(),
+                            arm: "histogram.counts".into(),
+                            abs_diff: max_local,
+                            pass: max_local <= ABS_TOL,
+                        });
+                    } else {
+                        ledger.compared("histogram.counts", &case.case_id, false);
+                        diffs.push(CaseDiff {
+                            case_id: case.case_id.clone(),
+                            arm: "histogram.counts".into(),
+                            abs_diff: f64::INFINITY,
+                            pass: false,
+                        });
                     }
+                }
+                if let Some((scipy_edges, rust_edges)) = ledger.slices(
+                    "histogram.edges",
+                    &case.case_id,
+                    scipy_arm.edges.as_deref(),
+                    Some(rust_edges.as_slice()),
+                ) {
+                    let max_local = rust_edges
+                        .iter()
+                        .zip(scipy_edges.iter())
+                        .map(|(r, s)| (r - s).abs())
+                        .fold(0.0_f64, f64::max);
                     max_overall = max_overall.max(max_local);
+                    ledger.compared("histogram.edges", &case.case_id, max_local <= ABS_TOL);
                     diffs.push(CaseDiff {
                         case_id: case.case_id.clone(),
                         arm: "histogram.edges".into(),
@@ -298,7 +327,7 @@ fn diff_stats_diff_histogram() {
                     });
                 }
             }
-            _ => continue,
+            other => panic!("diff_histogram: unknown func {other}"),
         }
     }
 
@@ -308,6 +337,7 @@ fn diff_stats_diff_histogram() {
         test_id: "diff_stats_diff_histogram".into(),
         category: "numpy.{diff, histogram}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -332,4 +362,6 @@ fn diff_stats_diff_histogram() {
         diffs.len(),
         max_overall
     );
+    // each dataset is one diff case and one histogram case (feeding counts and edges)
+    ledger.finish(query.points.iter().filter(|c| c.func == "diff").count());
 }

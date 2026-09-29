@@ -116,14 +116,26 @@ fn write_bundle(scenario_id: &str, bundle: &ForensicLogBundle) {
     fs::write(&path, &json).expect("write interpolate e2e artifact bundle");
 }
 
+/// `zip` stops at the shorter side, so a short or empty result would fold to 0 and read as exact
+/// agreement. A length mismatch is infinitely wrong instead.
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
-        .fold(
-            0.0_f64,
-            |acc, v| if v.is_nan() { f64::NAN } else { acc.max(v) },
-        )
+        .fold(0.0_f64, nan_max)
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 #[test]
@@ -538,7 +550,7 @@ fn scenario_05_akima_smoothness() {
         || {
             let pts: Vec<f64> = (-50..=50).map(|i| i as f64 / 10.0).collect();
             let vals: Vec<f64> = pts.iter().map(|&t| akima.eval(t)).collect();
-            let max_val = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let max_val = vals.iter().cloned().fold(f64::NEG_INFINITY, nan_max);
             let min_val = vals.iter().cloned().fold(f64::INFINITY, f64::min);
             // Akima should not overshoot badly - values should be reasonable
             if max_val <= 1.5 && min_val >= -0.5 {
@@ -611,16 +623,16 @@ fn scenario_15_rect_bivariate_spline_scipy_shape() {
         || {
             let result = spline.eval_grid(&[0.5, 1.5], &[0.5, 1.5]);
             let expected = [vec![5.5, 6.5], vec![15.5, 16.5]];
-            let max_err = result
-                .iter()
-                .zip(expected.iter())
-                .flat_map(|(got_row, expected_row)| {
-                    got_row
-                        .iter()
-                        .zip(expected_row.iter())
-                        .map(|(&got, &want)| (got - want).abs())
-                })
-                .fold(0.0_f64, f64::max);
+            // A missing row or a short row reads as INFINITY, not as a small error.
+            let max_err = if result.len() == expected.len() {
+                result
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(got_row, expected_row)| max_abs_diff(got_row, expected_row))
+                    .fold(0.0_f64, nan_max)
+            } else {
+                f64::INFINITY
+            };
             if max_err < 1e-10 {
                 Ok(format!("max_grid_error={max_err:.2e}"))
             } else {
@@ -714,10 +726,10 @@ fn scenario_16_smooth_bivariate_spline_scattered_surface() {
             let dx = spline.eval_derivative(0.25, 0.5, 1, 0);
             let dy = spline.eval_derivative(0.25, 0.5, 0, 1);
             let integral = spline.integral(0.0, 1.0, 0.0, 1.0);
-            let max_err = (dx - 5.5)
-                .abs()
-                .max((dy + 2.75).abs())
-                .max((integral - 2.75).abs());
+            let max_err = nan_max(
+                nan_max((dx - 5.5).abs(), (dy + 2.75).abs()),
+                (integral - 2.75).abs(),
+            );
             if max_err < 1e-10 {
                 Ok(format!(
                     "dx={dx}, dy={dy}, integral={integral}, max_err={max_err:.2e}"
@@ -1094,7 +1106,7 @@ fn scenario_10_spline_derivative_integral() {
             let max_err = test_pts
                 .iter()
                 .map(|&t| (deriv.eval(t) - t.cos()).abs())
-                .fold(0.0_f64, f64::max);
+                .fold(0.0_f64, nan_max);
             if max_err < 0.05 {
                 Ok(format!("max_derivative_error={max_err:.4}"))
             } else {

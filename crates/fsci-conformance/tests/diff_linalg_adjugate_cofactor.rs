@@ -7,13 +7,14 @@
 //! Resolves [frankenscipy-yeu5m]. 1e-9 abs covers the LU/inv roundoff
 //! on small probe matrices.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{adjugate, cofactor};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -241,30 +243,26 @@ fn diff_linalg_adjugate_cofactor() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_linalg_adjugate_cofactor", &["adjugate", "cofactor"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
+        let fsci_v = fsci_eval(case);
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            case.op.as_str(),
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Some(fsci_v) = fsci_eval(case) else {
-            continue;
-        };
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(case.op.as_str(), &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -279,6 +277,7 @@ fn diff_linalg_adjugate_cofactor() {
         test_id: "diff_linalg_adjugate_cofactor".into(),
         category: "fsci.adjugate/cofactor vs det(A)*inv(A)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -302,4 +301,5 @@ fn diff_linalg_adjugate_cofactor() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.op == "adjugate").count());
 }

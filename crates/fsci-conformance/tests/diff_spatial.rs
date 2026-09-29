@@ -3,14 +3,18 @@
 //!
 //! Tests FrankenSciPy distance metrics against SciPy subprocess oracle
 //! across deterministic input families.
+//!
+//! br-olv0j.2: every test keeps one compared-case ledger arm per SciPy metric, so each metric's
+//! compared count (wminkowski and minkowski included) is quotable on its own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{
     braycurtis, canberra, chebyshev, cityblock, correlation, cosine, euclidean, hamming, jaccard,
     jensenshannon, mahalanobis, minkowski, seuclidean, sqeuclidean, wminkowski,
@@ -55,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -323,6 +328,8 @@ fn distance_cases() -> Vec<DistanceCase> {
     cases
 }
 
+/// `None` only when the case lacks a parameter its metric needs, or names an unknown metric. A
+/// non-finite distance is returned as is: the ledger classifies it against SciPy's value.
 fn rust_output(case: &DistanceCase) -> Option<f64> {
     let result = match case.metric.as_str() {
         "euclidean" => euclidean(&case.u, &case.v),
@@ -342,11 +349,7 @@ fn rust_output(case: &DistanceCase) -> Option<f64> {
         "wminkowski" => wminkowski(&case.u, &case.v, case.p?, case.w.as_ref()?),
         _ => return None,
     };
-    if result.is_finite() {
-        Some(result)
-    } else {
-        None
-    }
+    Some(result)
 }
 
 fn run_scipy_oracle(cases: &[DistanceCase]) -> Option<Vec<OracleCase>> {
@@ -438,18 +441,19 @@ json.dump(results, sys.stdout)
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn scipy_oracle_or_skip(cases: &[DistanceCase]) -> Vec<OracleCase> {
-    match run_scipy_oracle(cases) {
-        Some(results) => results,
-        None => {
-            assert!(
-                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
-                "SciPy oracle required but not available"
-            );
-            eprintln!("SciPy oracle not available, skipping diff test");
-            Vec::new()
-        }
+/// `None` only when the oracle could not run. The oracle drops a case that raised, so an empty
+/// result from a running oracle is SciPy raising on every case, which must reach
+/// `complete_oracle_map`'s coverage assertion rather than read as "oracle unavailable".
+fn scipy_oracle_or_skip(cases: &[DistanceCase]) -> Option<Vec<OracleCase>> {
+    let results = run_scipy_oracle(cases);
+    if results.is_none() {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "SciPy oracle required but not available"
+        );
+        eprintln!("SciPy oracle not available, skipping diff test");
     }
+    results
 }
 
 fn complete_oracle_map(
@@ -520,28 +524,30 @@ fn diff_001_basic_distances() {
         .cloned()
         .collect();
 
-    let oracle_results = scipy_oracle_or_skip(&basic_cases);
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&basic_cases) else {
         return;
-    }
+    };
 
     let oracle_map = complete_oracle_map("diff_001_basic_distances", &basic_cases, &oracle_results);
 
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_001_basic_distances", &basic_metrics);
 
     for case in &basic_cases {
-        let rust_val = match rust_output(case) {
-            Some(v) => v,
-            None => continue,
-        };
-        let scipy_val = match oracle_map.get(&case.case_id) {
-            Some(&v) => v,
-            None => continue,
+        let arm = case.metric.as_str();
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_output(case),
+        ) else {
+            continue;
         };
 
         let abs_diff = (rust_val - scipy_val).abs();
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= TOL);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -561,6 +567,7 @@ fn diff_001_basic_distances() {
         test_id: "diff_001_basic_distances".into(),
         category: "scipy.spatial.distance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -577,6 +584,12 @@ fn diff_001_basic_distances() {
             diff.case_id, diff.rust_value, diff.scipy_value, diff.abs_diff
         );
     }
+    let min_per_arm = basic_metrics
+        .iter()
+        .map(|m| basic_cases.iter().filter(|c| c.metric == *m).count())
+        .min()
+        .expect("basic_metrics is non-empty");
+    ledger.finish(min_per_arm);
 }
 
 #[test]
@@ -590,10 +603,9 @@ fn diff_002_minkowski_variants() {
         .cloned()
         .collect();
 
-    let oracle_results = scipy_oracle_or_skip(&minkowski_cases);
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&minkowski_cases) else {
         return;
-    }
+    };
 
     let oracle_map = complete_oracle_map(
         "diff_002_minkowski_variants",
@@ -603,19 +615,22 @@ fn diff_002_minkowski_variants() {
 
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_002_minkowski_variants", &["minkowski"]);
 
     for case in &minkowski_cases {
-        let rust_val = match rust_output(case) {
-            Some(v) => v,
-            None => continue,
-        };
-        let scipy_val = match oracle_map.get(&case.case_id) {
-            Some(&v) => v,
-            None => continue,
+        let arm = case.metric.as_str();
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_output(case),
+        ) else {
+            continue;
         };
 
         let abs_diff = (rust_val - scipy_val).abs();
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= TOL);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -635,6 +650,7 @@ fn diff_002_minkowski_variants() {
         test_id: "diff_002_minkowski_variants".into(),
         category: "scipy.spatial.distance.minkowski".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -651,6 +667,7 @@ fn diff_002_minkowski_variants() {
             diff.case_id, diff.rust_value, diff.scipy_value, diff.abs_diff
         );
     }
+    ledger.finish(minkowski_cases.len());
 }
 
 #[test]
@@ -658,35 +675,39 @@ fn diff_003_binary_distances() {
     let start = Instant::now();
     let cases = distance_cases();
 
+    let binary_metrics = ["hamming", "jaccard"];
+
     let binary_cases: Vec<_> = cases
         .iter()
         .filter(|c| c.metric == "hamming" || c.metric == "jaccard")
         .cloned()
         .collect();
 
-    let oracle_results = scipy_oracle_or_skip(&binary_cases);
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&binary_cases) else {
         return;
-    }
+    };
 
     let oracle_map =
         complete_oracle_map("diff_003_binary_distances", &binary_cases, &oracle_results);
 
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_003_binary_distances", &binary_metrics);
 
     for case in &binary_cases {
-        let rust_val = match rust_output(case) {
-            Some(v) => v,
-            None => continue,
-        };
-        let scipy_val = match oracle_map.get(&case.case_id) {
-            Some(&v) => v,
-            None => continue,
+        let arm = case.metric.as_str();
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_output(case),
+        ) else {
+            continue;
         };
 
         let abs_diff = (rust_val - scipy_val).abs();
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= TOL);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -706,6 +727,7 @@ fn diff_003_binary_distances() {
         test_id: "diff_003_binary_distances".into(),
         category: "scipy.spatial.distance.binary".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -722,6 +744,12 @@ fn diff_003_binary_distances() {
             diff.case_id, diff.rust_value, diff.scipy_value, diff.abs_diff
         );
     }
+    let min_per_arm = binary_metrics
+        .iter()
+        .map(|m| binary_cases.iter().filter(|c| c.metric == *m).count())
+        .min()
+        .expect("binary_metrics is non-empty");
+    ledger.finish(min_per_arm);
 }
 
 #[test]
@@ -737,10 +765,9 @@ fn diff_004_weighted_distances() {
         .cloned()
         .collect();
 
-    let oracle_results = scipy_oracle_or_skip(&weighted_cases);
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&weighted_cases) else {
         return;
-    }
+    };
 
     let oracle_map = complete_oracle_map(
         "diff_004_weighted_distances",
@@ -750,19 +777,22 @@ fn diff_004_weighted_distances() {
 
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_004_weighted_distances", &weighted_metrics);
 
     for case in &weighted_cases {
-        let rust_val = match rust_output(case) {
-            Some(v) => v,
-            None => continue,
-        };
-        let scipy_val = match oracle_map.get(&case.case_id) {
-            Some(&v) => v,
-            None => continue,
+        let arm = case.metric.as_str();
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle_map.get(&case.case_id).copied(),
+            rust_output(case),
+        ) else {
+            continue;
         };
 
         let abs_diff = (rust_val - scipy_val).abs();
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= TOL);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -788,6 +818,7 @@ fn diff_004_weighted_distances() {
         test_id: "diff_004_weighted_distances".into(),
         category: "scipy.spatial.distance.weighted".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -804,4 +835,12 @@ fn diff_004_weighted_distances() {
             diff.case_id, diff.rust_value, diff.scipy_value, diff.abs_diff
         );
     }
+    // Arms have different case sets (wminkowski has 12, the others 6); each must compare all of
+    // its own.
+    let min_per_arm = weighted_metrics
+        .iter()
+        .map(|m| weighted_cases.iter().filter(|c| c.metric == *m).count())
+        .min()
+        .expect("weighted_metrics is non-empty");
+    ledger.finish(min_per_arm);
 }

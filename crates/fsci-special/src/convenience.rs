@@ -74,45 +74,8 @@ pub const CONVENIENCE_DISPATCH_PLAN: &[DispatchPlan] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 const DILOG_SERIES_MAX_TERMS: usize = 128;
 const PI_SQUARED_OVER_SIX: f64 = PI * PI / 6.0;
-const NDTRI_EXP_LOG_P_LOW: f64 = -3.719_338_661_598_645;
-const NDTRI_EXP_LOG_P_HIGH: f64 = -0.024_548_872_921_412_7;
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_A: [f64; 6] = [
-    -3.969_683_028_665_376e1,
-    2.209_460_984_245_205e2,
-    -2.759_285_104_469_687e2,
-    1.383_577_518_672_690e2,
-    -3.066_479_806_614_716e1,
-    2.506_628_277_459_239,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_B: [f64; 5] = [
-    -5.447_609_879_822_406e1,
-    1.615_858_368_580_409e2,
-    -1.556_989_798_598_866e2,
-    6.680_131_188_771_972e1,
-    -1.328_068_155_288_572e1,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_C: [f64; 6] = [
-    -7.784_894_002_430_293e-3,
-    -3.223_964_580_411_365e-1,
-    -2.400_758_277_161_838,
-    -2.549_732_539_343_734,
-    4.374_664_141_464_968,
-    2.938_163_982_698_783,
-];
-
-#[allow(clippy::excessive_precision)]
-const NDTRI_EXP_D: [f64; 4] = [
-    7.784_695_709_041_462e-3,
-    3.224_671_290_700_398e-1,
-    2.445_134_137_142_996,
-    3.754_408_661_907_416,
-];
+/// `log1p(-exp(-2))`, where xsf's `ndtri_exp` switches to `-ndtri(-expm1(y))`.
+const NDTRI_EXP_UPPER: f64 = -0.14541345786885906;
 
 /// Normalized sinc function: sin(πx) / (πx).
 ///
@@ -430,9 +393,32 @@ pub fn ndtr_scalar(x: f64) -> f64 {
 
 /// Inverse standard normal cumulative distribution function Φ⁻¹(y).
 ///
-/// Matches `scipy.special.ndtri(y)`.
+/// Matches `scipy.special.ndtri(y)`. Under `errstate`, `y` outside `[0, 1]` is SciPy's
+/// "domain error".
 pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_wg("ndtri", y_tensor, mode, |y| Ok(ndtri_scalar(y)))
+    // The evaluator choice is read ONCE per call, never per element.
+    let unrolled = NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
+    if unrolled {
+        NDTRI_UNROLL_POLEVL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // ndtri cannot fail per element (out of domain is NaN), so a serial batch maps the kernel
+    // directly instead of collecting a `Result` per element. The parallel path (>= 2^20
+    // elements) is unchanged.
+    let value = match y_tensor {
+        SpecialTensor::RealVec(values) if values.len() < 1 << 20 => SpecialTensor::RealVec(
+            values
+                .iter()
+                .map(|&y| ndtri_scalar_with(y, unrolled))
+                .collect(),
+        ),
+        _ => map_real_wg("ndtri", y_tensor, mode, |y| {
+            Ok(ndtri_scalar_with(y, unrolled))
+        })?,
+    };
+    crate::sf_error_unary("ndtri", y_tensor, mode, |y| {
+        (!(0.0..=1.0).contains(&y) && !y.is_nan()).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 #[must_use]
@@ -585,69 +571,80 @@ fn cephes_ndtri_p1evl_simd(x: Simd<f64, 8>, coefficients: &[f64]) -> Simd<f64, 8
 const CEPHES_NDTRI_EXP_NEG2: f64 = 0.135_335_283_236_612_7;
 const CEPHES_NDTRI_SQRT_2PI: f64 = 2.506_628_274_631_000_7;
 
+// The Cephes tables verbatim from xsf/cephes/ndtri.h, which SciPy's ndtri uses. They were
+// once each rounded to 16 significant digits, and seven entries of Q0, P1 and P2 then parsed
+// to a double 1-2 ulp away from Cephes's. That made ndtri, erfcinv and every quantile built
+// on them differ from SciPy in the last bit (frankenscipy-qbwth). The full decimals below
+// parse to Cephes's doubles.
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P0: [f64; 5] = [
-    -5.996_335_010_141_079e1,
-    9.800_107_541_859_997e1,
-    -5.667_628_574_690_703e1,
-    1.393_126_093_872_796_8e1,
-    -1.239_165_838_673_812_5,
+    -5.99633501014107895267E1,
+    9.80010754185999661536E1,
+    -5.66762857469070293439E1,
+    1.39312609387279679503E1,
+    -1.23916583867381258016E0,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q0: [f64; 8] = [
-    1.954_488_583_381_417_6,
-    4.676_279_128_988_815,
-    8.636_024_213_908_906e1,
-    -2.254_626_878_541_193_8e2,
-    2.002_602_123_800_606_6e2,
-    -8.203_722_561_683_333e1,
-    1.590_562_251_262_117e1,
-    -1.183_316_211_213_300_1,
+    1.95448858338141759834E0,
+    4.67627912898881538453E0,
+    8.63602421390890590575E1,
+    -2.25462687854119370527E2,
+    2.00260212380060660359E2,
+    -8.20372256168333339912E1,
+    1.59056225126211695515E1,
+    -1.18331621121330003142E0,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P1: [f64; 9] = [
-    4.055_448_923_059_624,
-    3.152_510_945_998_938_5e1,
-    5.716_281_922_464_213e1,
-    4.408_050_738_932_008e1,
-    1.468_495_619_288_580_2e1,
-    2.186_633_068_507_902_5,
-    -1.402_560_791_713_545e-1,
-    -3.504_246_268_278_482e-2,
-    -8.574_567_851_546_854e-4,
+    4.05544892305962419923E0,
+    3.15251094599893866154E1,
+    5.71628192246421288162E1,
+    4.40805073893200834700E1,
+    1.46849561928858024014E1,
+    2.18663306850790267539E0,
+    -1.40256079171354495875E-1,
+    -3.50424626827848203418E-2,
+    -8.57456785154685413611E-4,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q1: [f64; 8] = [
-    1.577_998_832_564_667_5e1,
-    4.539_076_351_288_792e1,
-    4.131_720_382_546_72e1,
-    1.504_253_856_929_075e1,
-    2.504_649_462_083_094,
-    -1.421_829_228_547_877_8e-1,
-    -3.808_064_076_915_783e-2,
-    -9.332_594_808_954_574e-4,
+    1.57799883256466749731E1,
+    4.53907635128879210584E1,
+    4.13172038254672030440E1,
+    1.50425385692907503408E1,
+    2.50464946208309415979E0,
+    -1.42182922854787788574E-1,
+    -3.80806407691578277194E-2,
+    -9.33259480895457427372E-4,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_P2: [f64; 9] = [
-    3.237_748_917_769_460_3,
-    6.915_228_890_689_842,
-    3.938_810_252_924_744_4,
-    1.333_034_608_158_075_5,
-    2.014_853_895_491_790_8e-1,
-    1.237_166_348_178_200_2e-2,
-    3.015_815_535_082_354e-4,
-    2.658_069_746_867_375_5e-6,
-    6.239_745_391_849_833e-9,
+    3.23774891776946035970E0,
+    6.91522889068984211695E0,
+    3.93881025292474443415E0,
+    1.33303460815807542389E0,
+    2.01485389549179081538E-1,
+    1.23716634817820021358E-2,
+    3.01581553508235416007E-4,
+    2.65806974686737550832E-6,
+    6.23974539184983293730E-9,
 ];
 
+#[allow(clippy::excessive_precision)]
 const CEPHES_NDTRI_Q2: [f64; 8] = [
-    6.024_270_393_647_42,
-    3.679_835_638_561_608_7,
-    1.377_020_994_890_813_2,
-    2.162_369_935_944_966_3e-1,
-    1.342_040_060_885_431_8e-2,
-    3.280_144_646_821_277_4e-4,
-    2.892_478_647_453_806_8e-6,
-    6.790_194_080_099_813e-9,
+    6.02427039364742014255E0,
+    3.67983563856160859403E0,
+    1.37702099489081330271E0,
+    2.16236993594496635890E-1,
+    1.34204006088543189037E-2,
+    3.28014464682127739104E-4,
+    2.89247864745380683936E-6,
+    6.79019408009981274425E-9,
 ];
 
 /// Horner with the degree known at COMPILE time, taking the table as an array rather than a
@@ -711,64 +708,45 @@ pub fn ndtri_exp(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real("ndtri_exp", y_tensor, mode, |y| Ok(ndtri_exp_scalar(y)))
 }
 
-/// Scalar helper for `ndtri_exp`.
+/// Scalar helper for `ndtri_exp`: xsf's `ndtri_exp`, bit-identical to SciPy 1.17.1 on 150,006
+/// points (log-magnitudes 1e-300 to 1e300).
+/// - y < -2: Cephes ndtri's tail rational applied directly to sqrt(-2y).
+/// - y above log1p(-exp(-2)): -ndtri(-expm1(y)).
+/// - Otherwise: ndtri(exp(y)).
+///
+/// It replaces Acklam's rational with no refinement, which was 1.1e-9 relative off SciPy
+/// (frankenscipy-qbwth). NaN and y > 0 give NaN, y = 0 gives +inf and -inf gives -inf, as in
+/// SciPy.
 #[must_use]
 pub fn ndtri_exp_scalar(log_p: f64) -> f64 {
-    if log_p.is_nan() {
-        return f64::NAN;
-    }
-    if log_p > 0.0 {
-        return f64::NAN;
-    }
-    if log_p == 0.0 {
-        return f64::INFINITY;
-    }
-    if log_p == f64::NEG_INFINITY {
+    if log_p < -f64::MAX {
         return f64::NEG_INFINITY;
     }
-
-    if log_p <= NDTRI_EXP_LOG_P_LOW {
-        return ndtri_exp_lower_tail_from_log_p(log_p);
+    if log_p < -2.0 {
+        return ndtri_exp_small_y(log_p);
     }
-    if log_p >= NDTRI_EXP_LOG_P_HIGH {
-        let upper_tail = -log_p.exp_m1();
-        if upper_tail == 0.0 {
-            return f64::INFINITY;
-        }
-        return -ndtri_exp_lower_tail_from_log_p(upper_tail.ln());
+    if log_p > NDTRI_EXP_UPPER {
+        return -ndtri_scalar(-log_p.exp_m1());
     }
-
-    ndtri_exp_central(log_p.exp())
+    ndtri_scalar(log_p.exp())
 }
 
-fn ndtri_exp_lower_tail_from_log_p(log_p: f64) -> f64 {
-    let q = (-2.0 * log_p).sqrt();
-    let numerator =
-        (((((NDTRI_EXP_C[0] * q + NDTRI_EXP_C[1]) * q + NDTRI_EXP_C[2]) * q + NDTRI_EXP_C[3]) * q
-            + NDTRI_EXP_C[4])
-            * q)
-            + NDTRI_EXP_C[5];
-    let denominator =
-        ((((NDTRI_EXP_D[0] * q + NDTRI_EXP_D[1]) * q + NDTRI_EXP_D[2]) * q + NDTRI_EXP_D[3]) * q)
-            + 1.0;
-    numerator / denominator
-}
-
-fn ndtri_exp_central(p: f64) -> f64 {
-    let q = p - 0.5;
-    let r = q * q;
-    let numerator =
-        (((((NDTRI_EXP_A[0] * r + NDTRI_EXP_A[1]) * r + NDTRI_EXP_A[2]) * r + NDTRI_EXP_A[3]) * r
-            + NDTRI_EXP_A[4])
-            * r
-            + NDTRI_EXP_A[5])
-            * q;
-    let denominator =
-        (((((NDTRI_EXP_B[0] * r + NDTRI_EXP_B[1]) * r + NDTRI_EXP_B[2]) * r + NDTRI_EXP_B[3]) * r
-            + NDTRI_EXP_B[4])
-            * r)
-            + 1.0;
-    numerator / denominator
+/// xsf's `ndtri_exp_small_y`: `sqrt(-2y)` rather than `sqrt(-2 log p)`, since p itself would
+/// underflow.
+fn ndtri_exp_small_y(y: f64) -> f64 {
+    let x = if y >= -f64::MAX * 0.5 {
+        (-2.0 * y).sqrt()
+    } else {
+        std::f64::consts::SQRT_2 * (-y).sqrt()
+    };
+    let x0 = x - x.ln() / x;
+    let z = 1.0 / x;
+    let x1 = if x < 8.0 {
+        z * ndtri_pe::<_, true>(z, &CEPHES_NDTRI_P1) / ndtri_p1e::<_, true>(z, &CEPHES_NDTRI_Q1)
+    } else {
+        z * ndtri_pe::<_, true>(z, &CEPHES_NDTRI_P2) / ndtri_p1e::<_, true>(z, &CEPHES_NDTRI_Q2)
+    };
+    x1 - x0
 }
 
 /// Recover the mean of a normal distribution from a CDF value, standard deviation, and quantile.
@@ -2595,92 +2573,90 @@ pub fn euler(n: u32) -> f64 {
 ///
 /// Generalizes the Riemann zeta function: ζ(s) = ζ(s, 1).
 ///
-/// Matches `scipy.special.zeta(s, a)` (the two-argument form).
+/// Matches `scipy.special.zeta(s, a)` (the two-argument form) bit for bit: this is the
+/// Cephes `zeta(x, q)` SciPy calls, checked on 30,000 points including negative `a`.
 ///
-/// Uses Euler-Maclaurin summation:
+/// - s = 1 is a pole (+inf), and s < 1 is outside the domain (NaN). This implementation used
+///   to return +inf for every s <= 1.
+/// - A nonpositive-integer `a` is a pole (+inf). A negative non-integer `a` needs an integer
+///   `s`, so that `(a + k)^-s` stays real; otherwise the result is NaN.
+/// - For a > 1e8 it uses the asymptotic (1/(s-1) + 1/(2a))·a^(1-s) (DLMF 25.11.43).
+/// - Otherwise it sums directly until a + k > 9 (at least nine terms), then applies up to
+///   twelve Euler-Maclaurin Bernoulli corrections, stopping once a term is below 2^-53 of
+///   the sum.
 ///
-/// ```text
-///   ζ(s, a) ≈ Σ_{n=0}^{N-1} (n+a)^{-s}
-///           + (N+a)^{1-s} / (s-1)               [integral tail]
-///           - (1/2) (N+a)^{-s}                  [half-term]
-///           + (s/12) (N+a)^{-s-1}               [B_2 correction]
-///           - s(s+1)(s+2)/720 · (N+a)^{-s-3}    [B_4 correction]
-///           + s..(s+4)/30240 · (N+a)^{-s-5}     [B_6 correction]
-///           - s..(s+6)/1209600 · (N+a)^{-s-7}   [B_8 correction]
-/// ```
-///
-/// Direct sum to N=20 with four Bernoulli terms gives ~1e-13 absolute
-/// accuracy down to s≈1.1 (the previous implementation, which used a
-/// 10 000-term direct sum and only the integral tail, missed the
-/// half-term and Bernoulli corrections and so floored at ~1e-5 abs at
-/// s=1.1) — frankenscipy-3u8ze.
+/// It replaces an N = 20 Euler-Maclaurin sum with four Bernoulli terms (~1e-13) and a separate
+/// shift recurrence for negative `a` (frankenscipy-re34v).
 pub fn hurwitz_zeta(s: f64, a: f64) -> f64 {
+    const MACHEP: f64 = 1.110_223_024_625_156_5e-16; // 2^-53, Cephes' MACHEP
+    // (2k)! / B_2k
+    #[allow(clippy::excessive_precision)]
+    const EULER_MACLAURIN: [f64; 12] = [
+        12.0,
+        -720.0,
+        30240.0,
+        -1209600.0,
+        47900160.0,
+        -1.8924375803183791606e9,
+        7.47242496e10,
+        -2.950130727918164224e12,
+        1.1646782814350067249e14,
+        -4.5979787224074726105e15,
+        1.8152105401943546773e17,
+        -7.1661652561756670113e18,
+    ];
     if s.is_nan() || a.is_nan() {
         return f64::NAN;
     }
+    if s == 1.0 {
+        return f64::INFINITY;
+    }
+    if s < 1.0 {
+        return f64::NAN;
+    }
     if a <= 0.0 {
-        // A nonpositive-integer a hits a pole (some a+k = 0) => +inf (scipy).
         if a == a.floor() {
             return f64::INFINITY;
         }
-        // For negative non-integer a, scipy.special.zeta(s, a) is real only when s
-        // is an integer (so the negative-base terms (a+j)^{-s} stay real), via the
-        // shift recurrence ζ(s,a) = Σ_{j<m} (a+j)^{-s} + ζ(s, a+m), a+m ∈ (0,1].
-        // Non-integer s with a<0 is NaN in scipy; reproduce that.
-        if s != s.round() || s <= 1.0 {
+        if s != s.floor() {
             return f64::NAN;
         }
-        let exp = -(s as i64);
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&exp) {
-            return f64::NAN;
+    }
+    if a > 1e8 {
+        return (1.0 / (s - 1.0) + 1.0 / (2.0 * a)) * a.powf(1.0 - s);
+    }
+
+    let mut sum = a.powf(-s);
+    let mut base = a;
+    let mut terms = 0;
+    let mut b = 0.0;
+    while terms < 9 || base <= 9.0 {
+        terms += 1;
+        base += 1.0;
+        b = base.powf(-s);
+        sum += b;
+        if (b / sum).abs() < MACHEP {
+            return sum;
         }
-        let exp = exp as i32;
-        let m = (-a).ceil() as i64;
-        let mut acc = 0.0;
-        for j in 0..m {
-            acc += (a + j as f64).powi(exp);
+    }
+    let w = base;
+    sum += b * w / (s - 1.0);
+    sum -= 0.5 * b;
+    let mut poch = 1.0;
+    let mut k = 0.0;
+    for divisor in EULER_MACLAURIN {
+        poch *= s + k;
+        b /= w;
+        let t = poch * b / divisor;
+        sum += t;
+        if (t / sum).abs() < MACHEP {
+            return sum;
         }
-        return acc + hurwitz_zeta(s, a + m as f64);
+        k += 1.0;
+        poch *= s + k;
+        b /= w;
+        k += 1.0;
     }
-    if s <= 1.0 {
-        return f64::INFINITY; // Pole at s=1
-    }
-
-    let n_direct: usize = 20;
-    let mut sum = 0.0;
-    for k in 0..n_direct {
-        sum += (k as f64 + a).powf(-s);
-    }
-
-    let na = n_direct as f64 + a;
-    let na_inv_sq = 1.0 / (na * na);
-
-    // (N+a)^{-s} computed via powf for accuracy across the supported
-    // s range; subsequent factors are obtained by multiplying by 1/na².
-    let na_neg_s = na.powf(-s);
-
-    // Integral tail: (N+a)^{1-s} / (s-1) = (N+a) · (N+a)^{-s} / (s-1).
-    sum += na * na_neg_s / (s - 1.0);
-    // Half-term: +(1/2) · (N+a)^{-s}. Direct sum covers k = 0..N-1,
-    // the Euler-Maclaurin tail Σ_{k=N}^∞ f(k+a) starts at k = N,
-    // so the half-term sits on the included left boundary y = N+a.
-    sum += 0.5 * na_neg_s;
-
-    // Bernoulli corrections. `term` tracks (N+a)^{-s-(2j-1)} for j=1,2,…
-    // and `poch` tracks the Pochhammer symbol [s]_{2j-1}.
-    let mut term = na_neg_s / na;
-    let mut poch = s;
-    sum += (1.0 / 12.0) * poch * term; // j=1
-    term *= na_inv_sq;
-    poch *= (s + 1.0) * (s + 2.0);
-    sum -= (1.0 / 720.0) * poch * term; // j=2
-    term *= na_inv_sq;
-    poch *= (s + 3.0) * (s + 4.0);
-    sum += (1.0 / 30240.0) * poch * term; // j=3
-    term *= na_inv_sq;
-    poch *= (s + 5.0) * (s + 6.0);
-    sum -= (1.0 / 1209600.0) * poch * term; // j=4
-
     sum
 }
 
@@ -4377,64 +4353,14 @@ pub fn tetragamma(x: f64) -> f64 {
 }
 
 /// Digamma function ψ(x) = d(ln Γ(x))/dx (scalar).
+///
+/// The crate's one digamma kernel, SciPy's xsf `digamma`. It keeps SciPy's signed pole at
+/// zero, ψ(+0) = -inf and ψ(-0) = +inf (frankenscipy-eaqem), and NaN at the negative
+/// integers. This was a second, separately maintained shift-to-12 asymptotic
+/// (frankenscipy-re34v).
+#[must_use]
 pub fn digamma_scalar(x: f64) -> f64 {
-    // ZERO IS A POLE WITH A SIGN, not a NaN. scipy 1.17.1:
-    //   psi( 0.0) = -inf
-    //   psi(-0.0) = +inf
-    // In IEEE arithmetic `x == 0.0` is TRUE for -0.0, so the old guard
-    // `x <= 0.0 && x == x.floor()` collapsed both zeros into one NaN
-    // (frankenscipy-eaqem). The sign is INVERTED relative to intuition -- +0.0
-    // gives NEGATIVE infinity -- so these are copied from the measurement, not
-    // reasoned out.
-    //
-    // `gammasgn_scalar` in gamma.rs already handles the same input correctly
-    // with `if x == 0.0 { if x.is_sign_negative() {..} }`, which is the positive
-    // control proving this pattern is known here; digamma simply omitted it.
-    if x == 0.0 {
-        return if x.is_sign_negative() {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        };
-    }
-    // The negative integers remain genuine NaN poles: psi(-1.0) = psi(-2.0) = nan.
-    if x < 0.0 && x == x.floor() {
-        return f64::NAN;
-    }
-
-    let mut val = x;
-    let mut result = 0.0;
-
-    if val < 0.0 {
-        result -= std::f64::consts::PI / (std::f64::consts::PI * val).tan();
-        val = 1.0 - val;
-    }
-
-    // Recur up to val ≥ 12 then apply the Stirling-type asymptotic through the
-    // 1/x^10 term. The previous (shift-to-8, through 1/x^6) form left a ~2e-10
-    // absolute error (worst ~4e-9 relative) that capped the accuracy of every
-    // digamma-based series (e.g. the hyp2f1/hyperu logarithmic connection forms);
-    // this reaches ~4e-14 worst relative — verified vs mpmath over x∈[0.01,1000]
-    // and the reflected negative axis — for ~4 extra recur steps and 2 terms.
-    while val < 12.0 {
-        result -= 1.0 / val;
-        val += 1.0;
-    }
-
-    let inv_x = 1.0 / val;
-    let inv_x2 = inv_x * inv_x;
-    let mut term = inv_x2;
-    result += val.ln() - inv_x / 2.0 - term / 12.0; // 1/x^2
-    term *= inv_x2;
-    result += term / 120.0; // +1/(120 x^4)
-    term *= inv_x2;
-    result -= term / 252.0; // -1/(252 x^6)
-    term *= inv_x2;
-    result += term / 240.0; // +1/(240 x^8)
-    term *= inv_x2;
-    result -= term / 132.0; // -1/(132 x^10)
-
-    result
+    crate::gamma::digamma_core(x)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -4545,7 +4471,17 @@ pub fn log_softmax(x: &[f64]) -> Vec<f64> {
 /// (scipy accepts complex `spence` and `cspence`, returning finite values
 /// across the whole plane — our previous real-only kernel fail-closed on
 /// complex input).
+///
+/// Under `errstate`, a negative real argument is SciPy's "domain error".
 pub fn spence(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = spence_dispatch(x_tensor, mode)?;
+    crate::sf_error_unary("spence", x_tensor, mode, |x| {
+        (x < 0.0).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
+}
+
+fn spence_dispatch(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_or_complex(
         "spence",
         x_tensor,
@@ -4574,15 +4510,19 @@ const SPENCE_A: [f64; 8] = [
     3.297_713_409_852_251e0,
     1.000_000_000_000_000_1e0,
 ];
+// Verbatim from xsf/cephes/spence.h. Rounded to 16 digits, two entries parsed 1 ulp away from
+// Cephes's doubles; the last, 9.99999999999999998740E-1, is exactly 1.0 as a double
+// (frankenscipy-qbwth).
+#[allow(clippy::excessive_precision)]
 const SPENCE_B: [f64; 8] = [
-    6.909_904_889_125_533e-4,
-    2.540_437_639_325_444e-2,
-    2.829_748_606_025_681e-1,
-    1.411_725_977_518_310_7e0,
-    3.638_005_333_451_371e0,
-    5.032_788_801_433_170e0,
-    3.547_713_409_852_251e0,
-    9.999_999_999_999_999e-1,
+    6.90990488912553276999E-4,
+    2.54043763932544379113E-2,
+    2.82974860602568089943E-1,
+    1.41172597751831069617E0,
+    3.63800533345137075418E0,
+    5.03278880143316990390E0,
+    3.54771340985225096217E0,
+    9.99999999999999998740E-1,
 ];
 
 #[inline]
@@ -4788,36 +4728,47 @@ pub fn wrightomega(z_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult
 
 /// Scalar Wright Omega helper.
 pub fn wrightomega_scalar(z: f64) -> f64 {
-    let exp_z = z.exp();
-
-    // Initial guess via Lambert W approximation
-    let mut w = if z > 1.0 {
-        z - z.ln()
-    } else if z > -2.0 {
-        z.exp() / (1.0 + z.exp())
-    } else {
-        if exp_z <= 1.0e-8 {
-            return exp_z;
-        }
-        exp_z
-    };
-
-    // Newton iteration: f(w) = w + ln(w) - z, f'(w) = 1 + 1/w
-    for _ in 0..50 {
-        if z < 0.0 && (!w.is_finite() || w <= 0.0) {
-            return exp_z;
-        }
-        let residual = w + w.ln() - z;
-        if residual.abs() < 1e-15 {
-            break;
-        }
-        let next = w - residual / (1.0 + 1.0 / w);
-        if z < 0.0 && (!next.is_finite() || next <= 0.0) {
-            return exp_z;
-        }
-        w = next;
+    // xsf `wrightomega(double)`, bit-identical to SciPy 1.17.1 on 140,006 points. The seed is:
+    // - e^z below -2;
+    // - e^(2(z-1)/3) on [-2, 1);
+    // - z - ln z + ln z / z beyond.
+    // Then one Fritsch-Shafer-Crowley step, and a second when the condition estimate asks.
+    // e^z alone is returned only below -50, where W(e^z) = e^z - e^2z + ... already rounds to
+    // e^z. The previous Newton returned e^z from -18.4, 1e-8 relative off (frankenscipy-i20cg).
+    if z.is_nan() {
+        return z;
     }
-
+    if z.is_infinite() {
+        return if z > 0.0 { z } else { 0.0 };
+    }
+    if z < -50.0 {
+        return z.exp();
+    }
+    if z > 1e20 {
+        return z;
+    }
+    let mut w = if z < -2.0 {
+        z.exp()
+    } else if z < 1.0 {
+        (2.0 * (z - 1.0) / 3.0).exp()
+    } else {
+        let l = z.ln();
+        z - l + l / z
+    };
+    let fsc_step = |w: f64| -> (f64, f64, f64) {
+        let r = z - w - w.ln();
+        let wp1 = w + 1.0;
+        let e = r / wp1 * (2.0 * wp1 * (wp1 + 2.0 / 3.0 * r) - r)
+            / (2.0 * wp1 * (wp1 + 2.0 / 3.0 * r) - 2.0 * r);
+        (w * (1.0 + e), r, wp1)
+    };
+    let (next, r, wp1) = fsc_step(w);
+    w = next;
+    if ((2.0 * w * w - 8.0 * w - 1.0) * r.abs().powf(4.0)).abs()
+        >= f64::EPSILON * 72.0 * wp1.abs().powf(6.0)
+    {
+        w = fsc_step(w).0;
+    }
     w
 }
 
@@ -5220,7 +5171,12 @@ pub fn gammaincinv(
 
 /// Scalar helper for the inverse regularized incomplete gamma function.
 pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
-    if !(0.0..=1.0).contains(&y) {
+    // A NaN or negative `a` makes the bracket `hi = a + 4·√a + 10` NaN, and
+    // `x0.clamp(lo + 1e-300, hi)` below PANICS on a NaN bound (frankenscipy-qu5po). SciPy
+    // 1.17.1 rejects both before its p = 0 / p = 1 shortcuts: gammaincinv(nan, y) and
+    // gammaincinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1. A signed zero is not negative
+    // there, so gammaincinv(-0.0, 0) = 0.0 and gammaincinv(-0.0, 1) = inf still.
+    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 0.0 {
@@ -5228,6 +5184,15 @@ pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
     }
     if y == 1.0 {
         return f64::INFINITY;
+    }
+    // a = ±0 and a = inf keep only the y = 0 / y = 1 edges above. For an interior y SciPy
+    // 1.17.1 is nan: gammaincinv(a, y) = nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95
+    // (frankenscipy-g9yid). The Newton loop below answered a number there instead. P(0, x)
+    // and P(inf, x) are NaN, so it bisected on NaN residuals: a float emulation of the loop
+    // ends at about 1.5e-323 for a = 0 and for a = inf with y < 0.5, and at inf for a = inf
+    // with y ≥ 0.5.
+    if a == 0.0 || a == f64::INFINITY {
+        return f64::NAN;
     }
 
     let mode = fsci_runtime::RuntimeMode::Strict;
@@ -5332,7 +5297,10 @@ pub fn gammainccinv(
 
 /// Scalar helper for the inverse complemented regularized incomplete gamma function.
 pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
-    if !(0.0..=1.0).contains(&y) {
+    // Same domain as `gammaincinv_scalar`, whose clamp panicked when this delegated a NaN or
+    // negative `a` to it (frankenscipy-qu5po). SciPy 1.17.1: gammainccinv(nan, y) and
+    // gammainccinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1.
+    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 1.0 {
@@ -5340,6 +5308,11 @@ pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
     }
     if y == 0.0 {
         return f64::INFINITY;
+    }
+    // Same as `gammaincinv_scalar` (frankenscipy-g9yid): SciPy 1.17.1 gammainccinv(a, y) =
+    // nan for a = 0, -0.0 and inf at y = 0.3, 0.5 and 0.95; only the edges above answer.
+    if a == 0.0 || a == f64::INFINITY {
+        return f64::NAN;
     }
 
     // Q(a,x) = y. Routing through gammaincinv(a, 1-y) computes P = 1-Q near 1,
@@ -5521,10 +5494,19 @@ pub fn erfcx_scalar(x: f64) -> f64 {
         // directly — no exp(x²)·exp(−x²) round-trip (~2× faster, more accurate).
         crate::error::erfcx_cephes_real(x)
     } else {
-        // Asymptotic: erfcx(x) ≈ 1/(x√π) * (1 - 1/(2x²) + 3/(4x⁴) - ...)
+        // Asymptotic series erfcx(x) = 1/(x√π)·Σ_k (−1)^k·(2k−1)!!/(2x²)^k. From x = 25 each
+        // term is at most (2k+1)/1250 of the one before, so eight terms reach ε: the ninth is
+        // 5e-21 of the sum. Three terms stopped at 15/(8x⁶), 7.7e-9 at x = 25
+        // (frankenscipy-k5qew).
         let inv_x = 1.0 / x;
-        let inv_x2 = inv_x * inv_x;
-        inv_x / std::f64::consts::PI.sqrt() * (1.0 - 0.5 * inv_x2 + 0.75 * inv_x2 * inv_x2)
+        let t = 0.5 * inv_x * inv_x;
+        let mut term = 1.0_f64;
+        let mut sum = 1.0_f64;
+        for k in 1..=8_u32 {
+            term *= -f64::from(2 * k - 1) * t;
+            sum += term;
+        }
+        inv_x / std::f64::consts::PI.sqrt() * sum
     }
 }
 
@@ -6746,52 +6728,84 @@ where
     hess
 }
 
-/// Kolmogorov distribution CDF.
+/// Survival function of the Kolmogorov distribution, P(sqrt(n) D_n > x) in the limit.
 ///
-/// Computes the complementary CDF of the Kolmogorov distribution,
-/// P(D_n > x) where D_n is the Kolmogorov-Smirnov statistic.
-///
-/// Uses the series: K(x) = 1 - 2 * sum_{k=1}^{inf} (-1)^{k-1} * exp(-2*k^2*x^2)
-///
-/// Matches `scipy.special.kolmogorov(y)`.
+/// Matches `scipy.special.kolmogorov(y)`: xsf's `cephes::detail::_kolmogorov`, bit-identical to
+/// SciPy 1.17.1 on 130,006 points.
 pub fn kolmogorov(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_par("kolmogorov", y_tensor, mode, |y| Ok(kolmogorov_scalar(y)))
 }
 
 #[must_use]
 pub fn kolmogorov_scalar(y: f64) -> f64 {
-    if y.is_nan() {
-        return f64::NAN;
-    }
-    if y <= 0.0 {
-        return 1.0;
-    }
-    if y >= 3.0 {
-        // Asymptotic: K(y) ~ 2*exp(-2*y^2) for large y
-        return 2.0 * (-2.0 * y * y).exp();
-    }
-
-    // Series expansion: K(y) = 1 - 2 * sum_{k=1}^{inf} (-1)^{k-1} * exp(-2*k^2*y^2)
-    let y2 = y * y;
-    let mut sum = 0.0;
-    let mut sign = 1.0;
-
-    for k in 1..100 {
-        let kf = k as f64;
-        let term = sign * (-2.0 * kf * kf * y2).exp();
-        sum += term;
-        if term.abs() < 1e-16 * sum.abs().max(1e-30) {
-            break;
-        }
-        sign = -sign;
-    }
-
-    2.0 * sum
+    kolmogorov_sf_cdf_pdf(y).0
 }
 
-/// Inverse Kolmogorov distribution CDF.
+/// (sf, cdf, pdf) of the Kolmogorov limit law: `scipy.special.kolmogorov`, SciPy's private
+/// `_kolmogc`, and `-_kolmogp`. Ported from xsf `cephes::detail::_kolmogorov`.
+/// - x <= 0.82: the Jacobi-theta dual series. SciPy returns exactly 1 below
+///   pi / sqrt(8 * 746), where its terms underflow.
+/// - Otherwise: the alternating series 2(v - v^4 + v^9 - ...), with v = exp(-2x^2).
 ///
-/// Returns y such that kolmogorov(y) = p.
+/// This replaced a 100-term alternating series used everywhere. For x below ~0.035 its terms
+/// stay near 1 for ~4.3/x of them, and it was up to 0.1376 off SciPy (frankenscipy-11wqg).
+fn kolmogorov_sf_cdf_pdf(x: f64) -> (f64, f64, f64) {
+    use std::f64::consts::PI;
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    // x <= pi / sqrt(8 · 746): exp(-pi^2/8x^2) underflows.
+    if x <= 0.0 || x <= PI / f64::from(746 * 8).sqrt() {
+        return (1.0, 0.0, 0.0);
+    }
+    let mut p = 1.0_f64;
+    let mut d = 0.0_f64;
+    let (sf, cdf);
+    if x <= 0.82 {
+        // P = w u (1 + u^8 + u^24 + u^48 + ...), u = e^(-pi^2/8x^2), w = sqrt(2pi)/x
+        let w = (2.0 * PI).sqrt() / x;
+        let logu8 = -PI * PI / (x * x);
+        let u = (logu8 / 8.0).exp();
+        if u == 0.0 {
+            p = (logu8 / 8.0 + w.ln()).exp();
+        } else {
+            let u8 = logu8.exp();
+            let u8cub = u8.powf(3.0);
+            p = 1.0 + u8cub * p;
+            d = 5.0 * 5.0 + u8cub * d;
+            p = 1.0 + u8 * u8 * p;
+            d = 3.0 * 3.0 + u8 * u8 * d;
+            p = 1.0 + u8 * p;
+            d = 1.0 * 1.0 + u8 * d;
+            d = PI * PI / 4.0 / (x * x) * d - p;
+            d *= w * u / x;
+            p *= w * u;
+        }
+        cdf = p;
+        sf = 1.0 - p;
+    } else {
+        // P = 2 (v - v^4 + v^9 - ...), v = e^(-2x^2)
+        let v = (-2.0 * x * x).exp();
+        let vsq = v * v;
+        let v3 = v.powf(3.0);
+        let mut vpwr = v3 * v3 * v;
+        p = 1.0 - vpwr * p;
+        d = 3.0 * 3.0 - vpwr * d;
+        vpwr = v3 * vsq;
+        p = 1.0 - vpwr * p;
+        d = 2.0 * 2.0 - vpwr * d;
+        vpwr = v3;
+        p = 1.0 - vpwr * p;
+        d = 1.0 * 1.0 - vpwr * d;
+        p *= 2.0 * v;
+        d *= 8.0 * v * x;
+        sf = p;
+        cdf = 1.0 - sf;
+    }
+    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(d))
+}
+
+/// Inverse of the Kolmogorov survival function: y with kolmogorov(y) = p.
 ///
 /// Matches `scipy.special.kolmogi(p)`.
 pub fn kolmogi(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -6803,80 +6817,102 @@ pub fn kolmogi_scalar(p: f64) -> f64 {
     if p.is_nan() {
         return f64::NAN;
     }
-    if !(0.0..=1.0).contains(&p) {
+    kolmogi_pair(p, 1.0 - p)
+}
+
+/// x with kolmogorov(x) = psf and the cdf at x = pcdf, where psf + pcdf = 1: xsf
+/// `cephes::detail::_kolmogi`, a bracketed Newton iteration on `kolmogorov_sf_cdf_pdf`.
+/// Giving both tails lets a caller holding the smaller one keep its precision. SciPy's
+/// `kolmogi(p)` is `(p, 1 - p)`, and its private `_kolmogci(p)` is `(1 - p, p)`.
+///
+/// NaN when either is outside [0, 1] or they do not sum to 1 within 4 eps.
+///
+/// Against SciPy 1.17.1, `(p, 1 - p)` is bit-identical on 99.8% of 40,003 points and 1 ulp off
+/// on the rest (p in 0.59-0.68). The xsf source SciPy pins is semantically this code, so the
+/// cause is not known. The previous safeguarded Newton here was 6.3e-14 off.
+#[must_use]
+pub fn kolmogi_pair(psf: f64, pcdf: f64) -> f64 {
+    use std::f64::consts::{PI, SQRT_2};
+    #[allow(clippy::excessive_precision)]
+    const LOGSQRT2PI: f64 = 9.189_385_332_046_727_417_803_297e-1;
+    const XTOL: f64 = f64::EPSILON;
+    const RTOL: f64 = 2.0 * f64::EPSILON;
+    let within_tol = |x: f64, y: f64| (x - y).abs() <= XTOL + RTOL * y.abs();
+    if !((0.0..=1.0).contains(&psf) && (0.0..=1.0).contains(&pcdf))
+        || (1.0 - pcdf - psf).abs() > 4.0 * f64::EPSILON
+    {
         return f64::NAN;
     }
-    if p == 0.0 {
-        return f64::INFINITY;
-    }
-    if p >= 1.0 {
+    if pcdf == 0.0 {
         return 0.0;
     }
-
-    // K(y) decreases monotonically from K(0) = 1 to 0, so the inverse is
-    // bracketed by [lo, hi] with K(lo) ≥ p ≥ K(hi). K(0) = 1 ≥ p gives the
-    // lower bound; grow the upper bound until the survival value drops
-    // below p.
-    let mut lo = 0.0_f64;
-    let mut hi = 1.0_f64;
-    while kolmogorov_scalar(hi) > p {
-        hi *= 2.0;
-        if hi > 1.0e6 {
-            return hi; // p indistinguishable from 0
+    if psf == 0.0 {
+        return f64::INFINITY;
+    }
+    let (mut a, mut b, mut x);
+    if pcdf <= 0.5 {
+        // p ~ (sqrt(2pi)/x) exp(-pi^2/8x^2): two fixed-point steps for each bound.
+        let logpcdf = pcdf.ln();
+        let bound = |logx: f64| PI / (2.0 * SQRT_2 * (-(logpcdf + logx - LOGSQRT2PI)).sqrt());
+        a = bound(logpcdf / 2.0);
+        b = bound(0.0);
+        a = bound(a.ln());
+        b = bound(b.ln());
+        x = (a + b) / 2.0;
+    } else {
+        // p ~ 2 exp(-2x^2), inverted as a power series in p/2.
+        let jiggerb = 256.0 * f64::EPSILON;
+        let pba = psf / (1.0 - (-4.0_f64).exp()) / 2.0;
+        let pbb = psf * (1.0 - jiggerb) / 2.0;
+        a = (-0.5 * pba.ln()).sqrt();
+        b = (-0.5 * pbb.ln()).sqrt();
+        let ph = psf / 2.0;
+        let p2 = ph * ph;
+        let p3 = ph * ph * ph;
+        let q0 = (1.0
+            + p3 * (1.0 + p3 * (4.0 + p2 * (-1.0 + ph * (22.0 + p2 * (-13.0 + 140.0 * ph))))))
+            * ph;
+        x = (-q0.ln() / 2.0).sqrt();
+        if x < a || x > b {
+            x = (a + b) / 2.0;
         }
     }
-
-    // Asymptotic seed from the dominant term p ≈ 2·exp(-2y²); valid for
-    // every p ∈ (0, 1) since p/2 ≤ 1/2. A bare Newton iteration from a
-    // fixed seed overshoots and diverges (notably at p = 0.5), so each
-    // step is safeguarded: it is accepted only while it stays inside the
-    // bracket, otherwise the method falls back to bisection.
-    let mut y = (-(p / 2.0).ln() / 2.0).sqrt().clamp(1.0e-12, hi);
-    for _ in 0..100 {
-        let f = kolmogorov_scalar(y) - p;
-        if f > 0.0 {
-            lo = y; // K(y) > p ⇒ y below the root
-        } else {
-            hi = y;
-        }
-        if f.abs() < 1.0e-15 {
+    for _ in 0..=500 {
+        let x0 = x;
+        let (sf_x, cdf_x, pdf_x) = kolmogorov_sf_cdf_pdf(x0);
+        let df = if pcdf < 0.5 { pcdf - cdf_x } else { sf_x - psf };
+        if df == 0.0 {
             break;
         }
-
-        // dK/dy = -8y · Σ_{k≥1} (-1)^{k-1} k² exp(-2k²y²).
-        let y2 = y * y;
-        let mut dsum = 0.0;
-        let mut sign = 1.0;
-        for k in 1..100 {
-            let kf = f64::from(k);
-            let term = sign * kf * kf * (-2.0 * kf * kf * y2).exp();
-            dsum += term;
-            if term.abs() < 1.0e-18 {
+        if df > 0.0 && x > a {
+            a = x;
+        } else if df < 0.0 && x < b {
+            b = x;
+        }
+        let dfdx = -pdf_x;
+        x = if dfdx.abs() <= 0.0 {
+            (a + b) / 2.0
+        } else {
+            x0 - df / dfdx
+        };
+        if x >= a && x <= b {
+            if within_tol(x, x0) {
                 break;
             }
-            sign = -sign;
-        }
-        let df = -8.0 * y * dsum;
-
-        let next = if df.abs() > 1.0e-300 {
-            let candidate = y - f / df;
-            if candidate > lo && candidate < hi {
-                candidate
-            } else {
-                0.5 * (lo + hi)
+            if x == a || x == b {
+                x = (a + b) / 2.0;
+                if x == a || x == b {
+                    break;
+                }
             }
         } else {
-            0.5 * (lo + hi)
-        };
-
-        if (next - y).abs() < 1.0e-15 * (1.0 + y) {
-            y = next;
-            break;
+            x = (a + b) / 2.0;
+            if within_tol(x, x0) {
+                break;
+            }
         }
-        y = next;
     }
-
-    y
+    x
 }
 
 /// One-sided Kolmogorov-Smirnov distribution (Smirnov distribution).
@@ -10064,6 +10100,102 @@ mod tests {
         }
     }
 
+    /// frankenscipy-qu5po. A NaN or negative `a` made the bracket `hi = a + 4·√a + 10` NaN,
+    /// and `x0.clamp(lo + 1e-300, hi)` panicked on the NaN bound. gammainccinv panicked too,
+    /// through its delegation to gammaincinv. SciPy 1.17.1 is nan for all of these:
+    /// gammaincinv(nan, y), gammaincinv(-1, y), gammainccinv(nan, y) and gammainccinv(-1, y)
+    /// at y = 0, 0.3, 0.95 and 1.
+    ///
+    /// Must not change. The signed zero is not negative, so SciPy's p = 0 / p = 1 edges still
+    /// answer: gammaincinv(-0.0, 0) = 0.0, gammaincinv(-0.0, 1) = inf,
+    /// gammainccinv(-0.0, 0) = inf and gammainccinv(-0.0, 1) = 0.0. A guard written as
+    /// `a <= 0.0` or `is_sign_negative` would break these. The finite path is also unchanged
+    /// (existing goldens): gammaincinv(2, 0.5) = 1.6783469900166612 and
+    /// gammainccinv(0.5, 0.5) = 0.2274682115597862.
+    #[test]
+    fn gammaincinv_nan_or_negative_shape_is_nan_not_a_panic() {
+        // Interior y first, where the clamp panicked. The y = 0 and y = 1 edges did not panic,
+        // but they answered 0 or inf where SciPy gives nan.
+        for a in [f64::NAN, -1.0] {
+            for y in [0.3, 0.95, 0.0, 1.0] {
+                let p = gammaincinv_scalar(a, y);
+                let q = gammainccinv_scalar(a, y);
+                assert!(
+                    p.is_nan(),
+                    "gammaincinv({a}, {y}) = {p}, SciPy 1.17.1 gives nan"
+                );
+                assert!(
+                    q.is_nan(),
+                    "gammainccinv({a}, {y}) = {q}, SciPy 1.17.1 gives nan"
+                );
+            }
+        }
+
+        assert_eq!(gammaincinv_scalar(-0.0, 0.0), 0.0);
+        assert_eq!(gammaincinv_scalar(-0.0, 1.0), f64::INFINITY);
+        assert_eq!(gammainccinv_scalar(-0.0, 0.0), f64::INFINITY);
+        assert_eq!(gammainccinv_scalar(-0.0, 1.0), 0.0);
+        let p = gammaincinv_scalar(2.0, 0.5);
+        assert!(
+            ((p - 1.678_346_990_016_661_2) / 1.678_346_990_016_661_2).abs() < 1e-11,
+            "gammaincinv(2, 0.5) = {p}, SciPy 1.17.1 gives 1.6783469900166612"
+        );
+        let q = gammainccinv_scalar(0.5, 0.5);
+        assert!(
+            ((q - 0.227_468_211_559_786_2) / 0.227_468_211_559_786_2).abs() < 1e-11,
+            "gammainccinv(0.5, 0.5) = {q}, SciPy 1.17.1 gives 0.2274682115597862"
+        );
+    }
+
+    /// frankenscipy-g9yid. At a = 0, -0.0 and inf, SciPy 1.17.1 answers only the y edges;
+    /// gammaincinv(a, y) and gammainccinv(a, y) are nan for y = 0.3, 0.5 and 0.95. fsci's
+    /// Newton loop ran with P(0, x) = P(inf, x) = NaN and bisected on NaN residuals. A float
+    /// emulation of that loop ends at about 1.5e-323, or at inf for a = inf with y ≥ 0.5.
+    ///
+    /// Must not change, SciPy 1.17.1: the edges gammaincinv(a, 0) = 0.0,
+    /// gammaincinv(a, 1) = inf, gammainccinv(a, 0) = inf and gammainccinv(a, 1) = 0.0 for
+    /// a = 0, -0.0 and inf; and the finite path, gammaincinv(2, 0.5) = 1.6783469900166612 and
+    /// gammainccinv(0.5, 0.5) = 0.2274682115597862.
+    #[test]
+    fn gammaincinv_zero_or_infinite_shape_is_nan_inside_the_unit_interval() {
+        for a in [0.0, -0.0, f64::INFINITY] {
+            for y in [0.3, 0.5, 0.95] {
+                let p = gammaincinv_scalar(a, y);
+                let q = gammainccinv_scalar(a, y);
+                assert!(
+                    p.is_nan(),
+                    "gammaincinv({a}, {y}) = {p}, SciPy 1.17.1 gives nan"
+                );
+                assert!(
+                    q.is_nan(),
+                    "gammainccinv({a}, {y}) = {q}, SciPy 1.17.1 gives nan"
+                );
+            }
+            assert_eq!(gammaincinv_scalar(a, 0.0), 0.0, "gammaincinv({a}, 0)");
+            assert_eq!(
+                gammaincinv_scalar(a, 1.0),
+                f64::INFINITY,
+                "gammaincinv({a}, 1)"
+            );
+            assert_eq!(
+                gammainccinv_scalar(a, 0.0),
+                f64::INFINITY,
+                "gammainccinv({a}, 0)"
+            );
+            assert_eq!(gammainccinv_scalar(a, 1.0), 0.0, "gammainccinv({a}, 1)");
+        }
+        let p = gammaincinv_scalar(2.0, 0.5);
+        assert!(
+            ((p - 1.678_346_990_016_661_2) / 1.678_346_990_016_661_2).abs() < 1e-11,
+            "gammaincinv(2, 0.5) = {p}, SciPy 1.17.1 gives 1.6783469900166612"
+        );
+        let q = gammainccinv_scalar(0.5, 0.5);
+        assert!(
+            ((q - 0.227_468_211_559_786_2) / 0.227_468_211_559_786_2).abs() < 1e-11,
+            "gammainccinv(0.5, 0.5) = {q}, SciPy 1.17.1 gives 0.2274682115597862"
+        );
+    }
+
     #[test]
     #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
     fn ndtri_erfcinv_deep_tail_match_scipy() {
@@ -10731,6 +10863,67 @@ mod tests {
         assert!(ke_neg.im.is_nan());
         assert!(kep_neg.re.is_nan());
         assert!(kep_neg.im.is_nan());
+    }
+
+    #[test]
+    fn wrightomega_real_is_scipy_xsf_bit_for_bit() {
+        // scipy.special.wrightomega 1.17.1 on real input. -18.96 was the regression: e^z was
+        // returned from -18.4 down, 1e-8 relative off.
+        for (z, want) in [
+            (-40.0, 4.248354255291589e-18),
+            (-18.96, 5.831450863789683e-09),
+            (-5.0, 0.0066930004977309955),
+            (-1.0, 0.27846454276107374),
+            (0.5, 0.7662486081617502),
+            (3.0, 2.207940031569323),
+            (50.0, 46.167719165492095),
+            (1e21, 1e21),
+        ] {
+            let got = wrightomega_scalar(z);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "wrightomega({z}) = {got:e}, SciPy {want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn kolmogorov_and_kolmogi_match_scipy_xsf() {
+        // scipy.special.kolmogorov 1.17.1, bit for bit, across its branches. x = 0.02 was the
+        // regression: the 100-term alternating series returned a value far from SciPy's 1.0.
+        for (x, want) in [
+            (0.02, 1.0),
+            (0.0406, 1.0),
+            (0.1, 1.0),
+            (0.5, 0.9639452436648751),
+            (0.82, 0.5119717052984973),
+            (0.9, 0.3927307079406543),
+            (1.5, 0.022217962616525127),
+            (3.2, 2.5508152590520792e-09),
+        ] {
+            let got = kolmogorov_scalar(x);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "kolmogorov({x}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        // scipy.special.kolmogi 1.17.1, within 2 ulp: the port matches SciPy's bits on 99.8%
+        // of points and is 1 ulp off on the rest.
+        for (p, want) in [
+            (1e-10, 3.4437623401231106),
+            (0.1, 1.2238478702170823),
+            (0.5, 0.8275735551899059),
+            (0.9, 0.5711732651063401),
+            (0.999999, 0.2775393539988728),
+        ] {
+            let got = kolmogi_scalar(p);
+            assert!(
+                (got - want).abs() <= 2.0 * f64::EPSILON * want,
+                "kolmogi({p}) = {got:e}, SciPy {want:e}"
+            );
+        }
     }
 
     #[test]
@@ -12614,13 +12807,32 @@ mod tests {
     }
 
     #[test]
-    fn erfcx_large_x_uses_stable_asymptotic_path() -> Result<(), String> {
-        let result = erfcx(&SpecialTensor::RealScalar(30.0), RuntimeMode::Strict)
-            .map_err(|err| err.to_string())?;
-        let value = expect_real_scalar(result)?;
-        let expected = erfcx_scalar(30.0);
-        assert!(value.is_finite());
-        assert!((value - expected).abs() < 1e-16);
+    fn erfcx_large_x_asymptotic_series_matches_scipy() -> Result<(), String> {
+        // scipy.special.erfcx 1.17.1, each within 2e-16 of mpmath at 40 digits. The x ≥ 25
+        // branch was a three-term series and missed these by 7.7e-9 at x = 25 and 6.8e-9 at
+        // 25.5 (frankenscipy-k5qew). This test used to compare erfcx with erfcx_scalar, which
+        // could not see that.
+        for (x, want) in [
+            (24.999, 0.022_550_473_014_042_085),
+            (25.0, 0.022_549_572_432_641_357),
+            (25.5, 0.022_108_108_052_519_827),
+            (26.0, 0.021_683_584_850_562_91),
+            (30.0, 0.018_795_888_861_416_754),
+            (40.0, 0.014_100_335_983_377_815),
+            (50.0, 0.011_281_536_265_323_772),
+            (100.0, 0.005_641_613_782_989_433),
+            (1e3, 0.000_564_189_301_453_387_6),
+            (1e8, 5.641_895_835_477_563e-9),
+            (1e150, 5.641_895_835_477_563e-151),
+        ] {
+            let result = erfcx(&SpecialTensor::RealScalar(x), RuntimeMode::Strict)
+                .map_err(|err| err.to_string())?;
+            let value = expect_real_scalar(result)?;
+            assert!(
+                (value - want).abs() <= 1e-15 * want,
+                "erfcx({x}) = {value}, SciPy {want}"
+            );
+        }
         Ok(())
     }
 

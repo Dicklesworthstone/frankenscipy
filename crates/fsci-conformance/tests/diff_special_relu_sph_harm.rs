@@ -14,13 +14,14 @@
 //! sph_harm is omitted at m<0 (m=0 m_max≤l): fsci's sign convention
 //! for negative-m branches diverges from scipy (defect 39e3y).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{relu, sph_harm};
@@ -34,6 +35,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const RELU_TOL: f64 = 1.0e-14;
 const SPH_TOL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op compared.
+const ARMS: [&str; 2] = ["relu", "sph_harm"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -78,6 +81,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -258,10 +262,8 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse relu_sph oracle JSON"))
 }
 
+/// Both slices come from `CompareLedger::slices`, which has already rejected a length mismatch.
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -284,30 +286,51 @@ fn diff_special_relu_sph_harm() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_relu_sph_harm", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let (abs_d, tol) = match case.op.as_str() {
+        // A case missing from the oracle output is recorded as SciPy giving no value.
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let op = case.op.as_str();
+        let (abs_d, tol) = match op {
             "relu" => {
-                let Some(y) = fsci_relu(&case.x) else {
+                let y = fsci_relu(&case.x);
+                let Some((expected, y)) = ledger.slices(op, &case.case_id, expected, y.as_deref())
+                else {
                     continue;
                 };
-                (vec_max_diff(&y, expected), RELU_TOL)
+                (vec_max_diff(y, expected), RELU_TOL)
             }
             "sph_harm" => {
                 let c = sph_harm(case.m, case.l, case.theta, case.phi);
-                let d_re = (c.re - expected[0]).abs();
-                let d_im = (c.im - expected[1]).abs();
+                // SciPy's [re, im]; each part goes through the ledger, and the first that is
+                // missing or non-finite records this case.
+                let Some((s_re, f_re)) = ledger.pair(
+                    op,
+                    &case.case_id,
+                    expected.and_then(|v| v.first().copied()),
+                    Some(c.re),
+                ) else {
+                    continue;
+                };
+                let Some((s_im, f_im)) = ledger.pair(
+                    op,
+                    &case.case_id,
+                    expected.and_then(|v| v.get(1).copied()),
+                    Some(c.im),
+                ) else {
+                    continue;
+                };
+                let d_re = (f_re - s_re).abs();
+                let d_im = (f_im - s_im).abs();
                 (d_re.max(d_im), SPH_TOL)
             }
-            _ => continue,
+            other => panic!("relu_sph_harm: no fsci call for op `{other}`"),
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -322,6 +345,7 @@ fn diff_special_relu_sph_harm() {
         test_id: "diff_special_relu_sph_harm".into(),
         category: "fsci_special::{relu, sph_harm (legacy m≥0)} vs scipy/numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -342,4 +366,11 @@ fn diff_special_relu_sph_harm() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (relu has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

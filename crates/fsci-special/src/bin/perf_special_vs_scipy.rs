@@ -79,9 +79,11 @@ fn incumbent() -> &'static ScipyIncumbent {
     })
 }
 use fsci_special::{
-    SpecialTensor, beta, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma,
-    gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0, k1, kn, kv,
-    kve, rgamma, spence, y0, y1, yn, yv, yve, zeta,
+    SpecialTensor, beta, betainc, betaln, cosm1, dawsn, digamma, ellipe, ellipk, ellipkm1, entr,
+    erf, erfc, erfcinv, erfcx, erfi, erfinv, exp1, expi, expit, exprel, gamma, gammainc, gammaincc,
+    gammaln, gammasgn, hyp0f1, i0, i0e, i1, i1e, iv, ive, j0, j1, jn, jv, jve, k0, k0e, k1, k1e,
+    kn, kolmogi, kolmogorov, kv, kve, log_expit, log_ndtr, loggamma, logit, ndtr, ndtri, ndtri_exp,
+    rgamma, spence, wrightomega, y0, y1, yn, yv, yve, zeta, zetac,
 };
 
 const PYTHON: &str = r#"
@@ -250,6 +252,7 @@ const CASES: &[(&str, f64, f64)] = &[
     ("erfc", -6.0, 6.0),
     ("erfinv", -0.999, 0.999),
     ("erfcinv", 0.001, 1.999),
+    ("ndtri", 0.001, 0.999),
     ("dawsn", -10.0, 10.0),
     // Bessel: oscillatory small-argument series through to the asymptotic expansion.
     ("j0", -30.0, 30.0),
@@ -264,6 +267,42 @@ const CASES: &[(&str, f64, f64)] = &[
     ("spence", 0.0, 10.0),
     ("expit", -20.0, 20.0),
     ("exprel", -10.0, 10.0),
+    // Widened after the CHECK column of these rows found erfinv (7.4e-12) and digamma
+    // (2.4e-11) off SciPy: every remaining real unary ufunc with a SciPy twin, so the
+    // accuracy column covers them too.
+    // The normal distribution and its logarithms.
+    ("ndtr", -10.0, 10.0),
+    ("log_ndtr", -40.0, 10.0),
+    ("ndtri_exp", -40.0, -0.001),
+    // Error-function relatives.
+    ("erfcx", -5.0, 50.0),
+    ("erfi", -5.0, 5.0),
+    // Exponential integrals across their series/continued-fraction switch.
+    ("exp1", 0.01, 50.0),
+    ("expi", -30.0, 30.0),
+    // Complete elliptic integrals in the parameter m. SciPy also takes m < 0, but this harness
+    // runs Hardened, where fsci's ellipk refuses m < 0 by policy, so the domain starts at 0.
+    ("ellipk", 0.0, 0.999),
+    ("ellipkm1", 0.001, 1.0),
+    ("ellipe", 0.0, 1.0),
+    // Exponentially scaled Bessel functions.
+    ("i0e", -50.0, 50.0),
+    ("i1e", -50.0, 50.0),
+    ("k0e", 0.01, 50.0),
+    ("k1e", 0.01, 50.0),
+    // Kolmogorov's distribution and its inverse.
+    ("kolmogorov", 0.01, 3.0),
+    ("kolmogi", 0.001, 0.999),
+    // Logistic, entropy and cosine helpers.
+    ("logit", 0.001, 0.999),
+    ("log_expit", -30.0, 30.0),
+    ("entr", 0.0, 10.0),
+    ("cosm1", -10.0, 10.0),
+    // Gamma and zeta relatives; zetac's range crosses its reflection.
+    ("loggamma", 0.01, 60.0),
+    ("gammasgn", -10.5, 10.0),
+    ("zetac", -20.0, 30.0),
+    ("wrightomega", -20.0, 20.0),
 ];
 
 /// Two-argument cases: the `scipy.special` name and a domain for each argument.
@@ -337,6 +376,7 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "erfc" => erfc(tensor, mode),
         "erfinv" => erfinv(tensor, mode),
         "erfcinv" => erfcinv(tensor, mode),
+        "ndtri" => ndtri(tensor, mode),
         "dawsn" => dawsn(tensor, mode),
         "j0" => j0(tensor, mode),
         "j1" => j1(tensor, mode),
@@ -349,6 +389,30 @@ fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
         "spence" => spence(tensor, mode),
         "expit" => expit(tensor, mode),
         "exprel" => exprel(tensor, mode),
+        "ndtr" => ndtr(tensor, mode),
+        "log_ndtr" => log_ndtr(tensor, mode),
+        "ndtri_exp" => ndtri_exp(tensor, mode),
+        "erfcx" => erfcx(tensor, mode),
+        "erfi" => erfi(tensor, mode),
+        "exp1" => exp1(tensor, mode),
+        "expi" => expi(tensor, mode),
+        "ellipk" => ellipk(tensor, mode),
+        "ellipkm1" => ellipkm1(tensor, mode),
+        "ellipe" => ellipe(tensor, mode),
+        "i0e" => i0e(tensor, mode),
+        "i1e" => i1e(tensor, mode),
+        "k0e" => k0e(tensor, mode),
+        "k1e" => k1e(tensor, mode),
+        "kolmogorov" => kolmogorov(tensor, mode),
+        "kolmogi" => kolmogi(tensor, mode),
+        "logit" => logit(tensor, mode),
+        "log_expit" => log_expit(tensor, mode),
+        "entr" => entr(tensor, mode),
+        "cosm1" => cosm1(tensor, mode),
+        "loggamma" => loggamma(tensor, mode),
+        "gammasgn" => gammasgn(tensor, mode),
+        "zetac" => zetac(tensor, mode),
+        "wrightomega" => wrightomega(tensor, mode),
         other => panic!("no fsci entry point wired for {other}"),
     }
 }
@@ -708,9 +772,28 @@ fn main() {
             if !selected.split(',').any(|name| name.trim() == op) {
                 continue;
             }
+            // `FSCI_SPECIAL_A_RANGE=lo,hi` replaces the first argument's domain (log-uniform
+            // when hi/lo > 100), and `FSCI_SPECIAL_B_NEAR_A=w` puts the second at a·(1 ± w)
+            // instead of its own box. Together they reach regimes a box cannot, such as the
+            // Temme zones of gammainc near x = a for large a (frankenscipy-6fpkm).
+            let a_range = std::env::var("FSCI_SPECIAL_A_RANGE").ok().map(|s| {
+                let v: Vec<f64> = s
+                    .split(',')
+                    .map(|t| t.trim().parse().expect("A_RANGE lo,hi"))
+                    .collect();
+                (v[0], v[1])
+            });
+            let near_a: Option<f64> = std::env::var("FSCI_SPECIAL_B_NEAR_A")
+                .ok()
+                .map(|s| s.trim().parse().expect("B_NEAR_A width"));
+            let (alo, ahi) = a_range.unwrap_or((alo, ahi));
             let a: Vec<f64> = (0..n)
                 .map(|i| {
-                    let v = alo + unit(i) * (ahi - alo);
+                    let v = if ahi / alo > 100.0 {
+                        (alo.ln() + unit(i) * (ahi / alo).ln()).exp()
+                    } else {
+                        alo + unit(i) * (ahi - alo)
+                    };
                     if integer_order { v.floor() } else { v }
                 })
                 .collect();
@@ -718,9 +801,14 @@ fn main() {
             // both would put every sample on the diagonal and exercise one line of a
             // two-dimensional domain.
             let b: Vec<f64> = (0..n)
-                .map(|i| blo + unit(i * 7 + 13) * (bhi - blo))
+                .map(|i| match near_a {
+                    Some(w) => a[i] * unit(i * 7 + 13).mul_add(2.0 * w, 1.0 - w),
+                    None => blo + unit(i * 7 + 13) * (bhi - blo),
+                })
                 .collect();
-            println!("n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}]");
+            println!(
+                "n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}] b_near_a={near_a:?}"
+            );
 
             let mut scipy = Scipy::start_n(op, &[&a, &b]);
             println!("{}", scipy.ready);
@@ -780,6 +868,135 @@ fn main() {
                 sci / fsci,
                 f1.max(f2) / f1.min(f2),
                 s1.max(s2) / s1.min(s2),
+            );
+        }
+    }
+
+    // ── betainc(a, b, x): the three-argument case (frankenscipy-d0u95) ──────────────
+    //
+    // The kernel became TOMS 708 `bratio` in 5pnba, a correctness fix whose everyday cost was
+    // never measured, and betainc sits under the t, F, beta and binomial CDFs. A uniform box
+    // would put almost every x deep in a tail where both sides return 0 or 1 cheaply, so the
+    // fixture is a GRID instead: every (a, b) in {0.5, 2, 10, 30, 200}², each at x = mean
+    // + {−3, −1, 0, 1, 3}·sd (clamped into (0, 1)) with a small jitter. That spans bratio's
+    // branches (power series, continued fraction, the asymptotic `basym` for large a and b)
+    // at the probabilities a p-value actually asks for.
+    if selected.split(',').any(|name| name.trim() == "betainc") {
+        // `FSCI_SPECIAL_BETAINC_A` / `_B` (comma lists) narrow the shape grid to ONE regime,
+        // which is how a loss is located; the full grid is the headline.
+        const OFFSETS: [f64; 5] = [-3.0, -1.0, 0.0, 1.0, 3.0];
+        let shapes = |key: &str| -> Vec<f64> {
+            std::env::var(key)
+                .ok()
+                .map(|list| {
+                    list.split(',')
+                        .map(|v| v.trim().parse().expect("shape list of numbers"))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![0.5, 2.0, 10.0, 30.0, 200.0])
+        };
+        let (a_shapes, b_shapes) = (
+            shapes("FSCI_SPECIAL_BETAINC_A"),
+            shapes("FSCI_SPECIAL_BETAINC_B"),
+        );
+        let pairs = a_shapes.len() * b_shapes.len();
+        let (mut a, mut b, mut x) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for i in 0..n {
+            let pair = i % pairs;
+            let (ai, bi) = (
+                a_shapes[pair / b_shapes.len()],
+                b_shapes[pair % b_shapes.len()],
+            );
+            let mean = ai / (ai + bi);
+            let sd = (ai * bi / ((ai + bi) * (ai + bi) * (ai + bi + 1.0))).sqrt();
+            let offset = OFFSETS[(i / pairs) % 5] + 0.2 * (unit(i) - 0.5);
+            a.push(ai);
+            b.push(bi);
+            x.push(offset.mul_add(sd, mean).clamp(1.0e-6, 1.0 - 1.0e-6));
+        }
+        println!(
+            "n={n} op=betainc grid a in {a_shapes:?} b in {b_shapes:?} x = mean + {OFFSETS:?}*sd"
+        );
+
+        let mut scipy = Scipy::start_n("betainc", &[&a, &b, &x]);
+        println!("{}", scipy.ready);
+
+        let (ta, tb, tx) = (
+            SpecialTensor::RealVec(a.clone()),
+            SpecialTensor::RealVec(b.clone()),
+            SpecialTensor::RealVec(x.clone()),
+        );
+        let ours = || -> Vec<f64> {
+            let out = betainc(&ta, &tb, &tx, RuntimeMode::Hardened);
+            real_vec(out.expect("fsci betainc over the grid"), "betainc")
+        };
+        black_box(ours());
+
+        if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
+            let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
+            let started = Instant::now();
+            for _ in 0..k {
+                black_box(ours());
+            }
+            let ms = started.elapsed().as_secs_f64() * 1.0e3;
+            println!(
+                "PROBE op=betainc calls={k} n={n} elements={} ms={ms:.3}",
+                k * n
+            );
+        } else {
+            let _ = scipy.time(1, 1);
+            const MIN_SAMPLE_MS3: f64 = 20.0;
+            let mut single = f64::INFINITY;
+            for _ in 0..3 {
+                let started = Instant::now();
+                black_box(ours());
+                single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+            }
+            let reps = fixed_reps
+                .unwrap_or_else(|| (MIN_SAMPLE_MS3 / single.max(1.0e-6)).ceil() as usize)
+                .clamp(1, 4096);
+            println!("op=betainc calibration single={single:.4}ms reps={reps}");
+            let time_ours = || -> f64 {
+                let started = Instant::now();
+                for _ in 0..reps {
+                    black_box(ours());
+                }
+                started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+            };
+            // Position-balanced A-B-B-A / B-A-A-B rounds, as the one-argument cases use.
+            let (mut fsci, mut sp, mut null_f, mut null_s) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for round in 0..rounds {
+                let (a1, s1, s2, a2) = if round % 2 == 0 {
+                    let a1 = time_ours();
+                    let s1 = scipy.time(reps, 1);
+                    let s2 = scipy.time(reps, 1);
+                    let a2 = time_ours();
+                    (a1, s1, s2, a2)
+                } else {
+                    let s1 = scipy.time(reps, 1);
+                    let a1 = time_ours();
+                    let a2 = time_ours();
+                    let s2 = scipy.time(reps, 1);
+                    (a1, s1, s2, a2)
+                };
+                fsci.push(a1.min(a2));
+                sp.push(s1.min(s2));
+                null_f.push(a1.max(a2) / a1.min(a2));
+                null_s.push(s1.max(s2) / s1.min(s2));
+            }
+            let (fsci_ms, scipy_ms) = (median(fsci), median(sp));
+            let check = scipy.check(&ours());
+            emit!(
+                "case=n{n} op=betainc fsci={fsci_ms:.3}ms scipy={scipy_ms:.3}ms \
+                 scipy/fsci={:.3}x null_fsci={:.3} null_scipy={:.3} {check}",
+                scipy_ms / fsci_ms,
+                median(null_f),
+                median(null_s),
             );
         }
     }
@@ -1042,10 +1259,17 @@ fn main() {
     // says the host was quiet when the process began and nothing about whether it stayed
     // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
     // visible in the row rather than hidden inside a median.
-    gamma_gate_size_sweep();
+    // Both studies belong to their op: a run narrowed with FSCI_SPECIAL_OPS to another op used
+    // to execute them anyway, ~10 s of unrequested work inside its profile and its rows.
+    let op_selected = |op: &str| selected.split(',').any(|name| name.trim() == op);
+    if op_selected("gamma") {
+        gamma_gate_size_sweep();
+    }
     // y1 is the worst cell and its deficit survives every structural explanation tried so
     // far; x = 5 is where its kernel changes shape, so that is where to look next.
-    band_sweep("y1", (0.01, 30.0), 5.0, 9);
+    if op_selected("y1") {
+        band_sweep("y1", (0.01, 30.0), 5.0, 9);
+    }
 
     emit!("provenance_after {}", host_provenance());
 }
@@ -1349,17 +1573,18 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
             },
             true,
         )),
-        // erfinv's live question is now its polynomial evaluator's shape: the Cephes tables
-        // are fixed-size arrays but `cephes_ndtri_polevl` takes a slice, so the degree is a
-        // runtime length. SciPy's equivalent is a compile-time-degree template.
-        "erfinv" => Some((
+        // ndtri's live question is its polynomial evaluator's shape: the Cephes tables are
+        // fixed-size arrays but `cephes_ndtri_polevl` takes a slice, so the degree is a
+        // runtime length. SciPy's equivalent is a compile-time-degree template. It was asked
+        // through erfinv until erfinv became Boost's erf_inv and stopped calling ndtri.
+        "ndtri" => Some((
             "ndtri_unroll_polevl",
             |on| {
                 fsci_special::NDTRI_UNROLL_POLEVL.store(on, std::sync::atomic::Ordering::Relaxed);
             },
             true,
         )),
-        "erfinv_old" => Some((
+        "erfinv" => Some((
             "infallible_batch",
             |on| {
                 fsci_special::ERFINV_INFALLIBLE_BATCH
@@ -1451,8 +1676,11 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfcinv" => {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
-        "erfinv" => Some(|| {
+        "ndtri" => Some(|| {
             fsci_special::NDTRI_UNROLL_POLEVL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
+        "erfinv" => Some(|| {
+            fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         "y1" => Some(|| {
             fsci_special::BESSEL_Y01_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed)

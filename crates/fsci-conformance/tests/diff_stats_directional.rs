@@ -11,13 +11,14 @@
 //! 12 cases via subprocess. Tol 1e-12 abs (closed-form sums
 //! of unit vectors).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::directional_stats;
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +40,22 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // The `dispersed` and `antipodal` unit vectors cancel to a zero resultant, where SciPy's
+    // mean direction is 0/0 = NaN; it arrives as "nan", distinct from null (SciPy raised).
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     mean_dir_x: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     mean_dir_y: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     mean_resultant_length: Option<f64>,
 }
 
@@ -62,6 +77,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -162,11 +178,14 @@ import numpy as np
 from scipy import stats
 
 def fnone(v):
+    # A NaN answer is sent as "nan", so the harness can tell it from a raised call (null).
     try:
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
 
 q = json.load(sys.stdin)
 points = []
@@ -259,6 +278,10 @@ fn diff_stats_directional() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_directional",
+        &["mean_dir_x", "mean_dir_y", "mean_resultant_length"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -283,18 +306,19 @@ fn diff_stats_directional() {
         ];
 
         for (arm_name, scipy_v, rust_v) in arms {
-            if let (Some(scipy_v), Some(rust_v)) = (scipy_v, rust_v)
-                && rust_v.is_finite()
-            {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: arm_name.into(),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
+            let Some((scipy_v, rust_v)) = ledger.pair(arm_name, &case.case_id, scipy_v, rust_v)
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm_name, &case.case_id, abs_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: arm_name.into(),
+                abs_diff,
+                pass: abs_diff <= ABS_TOL,
+            });
         }
     }
 
@@ -304,6 +328,7 @@ fn diff_stats_directional() {
         test_id: "diff_stats_directional".into(),
         category: "scipy.stats.directional_stats".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -328,4 +353,5 @@ fn diff_stats_directional() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

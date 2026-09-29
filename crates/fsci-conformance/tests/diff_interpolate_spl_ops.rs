@@ -13,13 +13,14 @@
 //!
 //! Tolerances: 1e-9 abs for tck/values.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{splantider, splder, splev, splint, splrep, sproot};
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +93,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -311,6 +313,15 @@ fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// SciPy's (t, c, k) triple, present only when all three parts are.
+fn scipy_tck<'a>(
+    t: Option<&'a [f64]>,
+    c: Option<&'a [f64]>,
+    k: Option<usize>,
+) -> Option<(&'a [f64], &'a [f64], usize)> {
+    Some((t?, c?, k?))
+}
+
 #[test]
 fn diff_interpolate_spl_ops() {
     let cases = generate_cases();
@@ -322,6 +333,7 @@ fn diff_interpolate_spl_ops() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.arms.len(), cases.len());
 
     let arm_map: HashMap<String, ScipyArm> = oracle
         .arms
@@ -336,101 +348,131 @@ fn diff_interpolate_spl_ops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_interpolate_spl_ops",
+        &[
+            "splder_tck",
+            "splder_eval",
+            "splantider_tck",
+            "splantider_eval",
+            "splint",
+            "sproot",
+        ],
+    );
 
     for case in &cases {
-        let Some(arm) = arm_map.get(&case.case_id) else {
-            continue;
-        };
-        let Some(tck) = tck_map.get(&case.case_id) else {
-            continue;
-        };
+        let arm = arm_map.get(&case.case_id).expect("validated oracle");
+        // SciPy's spline ops run on fsci's own splrep tck: without it neither side has a value.
+        let tck = tck_map
+            .get(&case.case_id)
+            .expect("fsci splrep builds the tck both sides operate on");
+        let fsci_tck = (tck.t.clone(), tck.c.clone(), tck.k);
 
         // splder: tck triple equality
-        if let (Some(et), Some(ec), Some(ek)) = (arm.der_t.as_ref(), arm.der_c.as_ref(), arm.der_k)
-        {
-            let Ok((dt, dc, dk)) = splder(&(tck.t.clone(), tck.c.clone(), tck.k)) else {
-                continue;
-            };
-            let t_diff = vec_max_diff(&dt, et);
-            let c_diff = vec_max_diff(&dc, ec);
-            let k_diff = if dk == ek { 0.0 } else { f64::INFINITY };
+        let der = splder(&fsci_tck).ok();
+        if let Some(((et, ec, ek), (dt, dc, dk))) = ledger.both(
+            "splder_tck",
+            &case.case_id,
+            scipy_tck(arm.der_t.as_deref(), arm.der_c.as_deref(), arm.der_k),
+            der.as_ref(),
+        ) {
+            let t_diff = vec_max_diff(dt, et);
+            let c_diff = vec_max_diff(dc, ec);
+            let k_diff = if *dk == ek { 0.0 } else { f64::INFINITY };
             let abs_d = t_diff.max(c_diff).max(k_diff);
+            // vec_max_diff's max fold swallows a NaN knot or coefficient.
+            let no_nan = dt.iter().chain(dc).all(|v| !v.is_nan());
+            let pass = abs_d <= TCK_TOL && no_nan;
+            ledger.compared("splder_tck", &case.case_id, pass);
             max_overall = max_overall.max(abs_d);
             diffs.push(CaseDiff {
                 case_id: format!("{}_splder_tck", case.case_id),
                 op: "splder_tck".into(),
                 abs_diff: abs_d,
-                pass: abs_d <= TCK_TOL,
+                pass,
             });
+        }
 
-            // Evaluated derivative spline values
-            if let Some(ev_exp) = arm.der_eval.as_ref()
-                && let Ok(ev) = splev(&case.eval, &(dt, dc, dk))
-            {
-                let abs_d = vec_max_diff(&ev, ev_exp);
-                max_overall = max_overall.max(abs_d);
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_splder_eval", case.case_id),
-                    op: "splder_eval".into(),
-                    abs_diff: abs_d,
-                    pass: abs_d <= VAL_TOL,
-                });
-            }
+        // Evaluated derivative spline values
+        let der_eval = der.as_ref().and_then(|d| splev(&case.eval, d).ok());
+        if let Some((ev_exp, ev)) = ledger.slices(
+            "splder_eval",
+            &case.case_id,
+            arm.der_eval.as_deref(),
+            der_eval.as_deref(),
+        ) {
+            let abs_d = vec_max_diff(ev, ev_exp);
+            max_overall = max_overall.max(abs_d);
+            ledger.compared("splder_eval", &case.case_id, abs_d <= VAL_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_splder_eval", case.case_id),
+                op: "splder_eval".into(),
+                abs_diff: abs_d,
+                pass: abs_d <= VAL_TOL,
+            });
         }
 
         // splantider: tck + eval
-        if let (Some(et), Some(ec), Some(ek)) =
-            (arm.anti_t.as_ref(), arm.anti_c.as_ref(), arm.anti_k)
-        {
-            let Ok((at, ac, ak)) = splantider(&(tck.t.clone(), tck.c.clone(), tck.k)) else {
-                continue;
-            };
-            let t_diff = vec_max_diff(&at, et);
-            let c_diff = vec_max_diff(&ac, ec);
-            let k_diff = if ak == ek { 0.0 } else { f64::INFINITY };
+        let anti = splantider(&fsci_tck).ok();
+        if let Some(((et, ec, ek), (at, ac, ak))) = ledger.both(
+            "splantider_tck",
+            &case.case_id,
+            scipy_tck(arm.anti_t.as_deref(), arm.anti_c.as_deref(), arm.anti_k),
+            anti.as_ref(),
+        ) {
+            let t_diff = vec_max_diff(at, et);
+            let c_diff = vec_max_diff(ac, ec);
+            let k_diff = if *ak == ek { 0.0 } else { f64::INFINITY };
             let abs_d = t_diff.max(c_diff).max(k_diff);
+            // vec_max_diff's max fold swallows a NaN knot or coefficient.
+            let no_nan = at.iter().chain(ac).all(|v| !v.is_nan());
+            let pass = abs_d <= TCK_TOL && no_nan;
+            ledger.compared("splantider_tck", &case.case_id, pass);
             max_overall = max_overall.max(abs_d);
             diffs.push(CaseDiff {
                 case_id: format!("{}_splantider_tck", case.case_id),
                 op: "splantider_tck".into(),
                 abs_diff: abs_d,
-                pass: abs_d <= TCK_TOL,
+                pass,
             });
+        }
 
-            // Antiderivatives in scipy and fsci differ by an integration
-            // constant. Subtract the value at the first eval point so we
-            // compare shapes (slopes).
-            if let Some(ev_exp) = arm.anti_eval.as_ref()
-                && let Ok(ev) = splev(&case.eval, &(at, ac, ak))
-                && !ev.is_empty()
-                && !ev_exp.is_empty()
-            {
-                let off_actual = ev[0];
-                let off_expected = ev_exp[0];
-                let shifted_actual: Vec<f64> = ev.iter().map(|v| v - off_actual).collect();
-                let shifted_expected: Vec<f64> = ev_exp.iter().map(|v| v - off_expected).collect();
-                let abs_d = vec_max_diff(&shifted_actual, &shifted_expected);
-                max_overall = max_overall.max(abs_d);
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_splantider_eval_shifted", case.case_id),
-                    op: "splantider_eval".into(),
-                    abs_diff: abs_d,
-                    pass: abs_d <= VAL_TOL,
-                });
-            }
+        // Antiderivatives in scipy and fsci differ by an integration
+        // constant. Subtract the value at the first eval point so we
+        // compare shapes (slopes).
+        let anti_eval = anti.as_ref().and_then(|a| splev(&case.eval, a).ok());
+        if let Some((ev_exp, ev)) = ledger.slices(
+            "splantider_eval",
+            &case.case_id,
+            arm.anti_eval.as_deref(),
+            anti_eval.as_deref(),
+        ) {
+            let off_actual = ev[0];
+            let off_expected = ev_exp[0];
+            let shifted_actual: Vec<f64> = ev.iter().map(|v| v - off_actual).collect();
+            let shifted_expected: Vec<f64> = ev_exp.iter().map(|v| v - off_expected).collect();
+            let abs_d = vec_max_diff(&shifted_actual, &shifted_expected);
+            max_overall = max_overall.max(abs_d);
+            ledger.compared("splantider_eval", &case.case_id, abs_d <= VAL_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_splantider_eval_shifted", case.case_id),
+                op: "splantider_eval".into(),
+                abs_diff: abs_d,
+                pass: abs_d <= VAL_TOL,
+            });
         }
 
         // splint: definite integral over [integ_a, integ_b]
         // (frankenscipy-05m2t — the splantider indexing fix restored parity).
-        if let Some(expected) = arm.splint_value
-            && let Ok(value) = splint(
-                case.integ_a,
-                case.integ_b,
-                &(tck.t.clone(), tck.c.clone(), tck.k),
-            )
-        {
+        if let Some((expected, value)) = ledger.pair(
+            "splint",
+            &case.case_id,
+            arm.splint_value,
+            splint(case.integ_a, case.integ_b, &fsci_tck).ok(),
+        ) {
             let abs_d = (value - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared("splint", &case.case_id, abs_d <= VAL_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_splint", case.case_id),
                 op: "splint".into(),
@@ -441,19 +483,27 @@ fn diff_interpolate_spl_ops() {
 
         // sproot: zeros of a cubic spline, sorted ascending
         // (frankenscipy-5lyd8 — analytic per-interval cubic root finder).
-        if case.do_sproot
-            && let Some(expected) = arm.sproot.as_ref()
-            && let Ok(mut found) = sproot(&(tck.t.clone(), tck.c.clone(), tck.k))
-        {
-            found.sort_by(f64::total_cmp);
-            let abs_d = vec_max_diff(&found, expected);
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: format!("{}_sproot", case.case_id),
-                op: "sproot".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= VAL_TOL,
+        if case.do_sproot {
+            let found = sproot(&fsci_tck).ok().map(|mut found| {
+                found.sort_by(f64::total_cmp);
+                found
             });
+            if let Some((expected, found)) = ledger.slices(
+                "sproot",
+                &case.case_id,
+                arm.sproot.as_deref(),
+                found.as_deref(),
+            ) {
+                let abs_d = vec_max_diff(found, expected);
+                max_overall = max_overall.max(abs_d);
+                ledger.compared("sproot", &case.case_id, abs_d <= VAL_TOL);
+                diffs.push(CaseDiff {
+                    case_id: format!("{}_sproot", case.case_id),
+                    op: "sproot".into(),
+                    abs_diff: abs_d,
+                    pass: abs_d <= VAL_TOL,
+                });
+            }
         }
     }
 
@@ -463,6 +513,7 @@ fn diff_interpolate_spl_ops() {
         test_id: "diff_interpolate_spl_ops".into(),
         category: "fsci_interpolate splder/splantider vs scipy.interpolate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -483,4 +534,6 @@ fn diff_interpolate_spl_ops() {
         diffs.len(),
         max_overall
     );
+    // sproot runs only on the do_sproot cases; every other arm runs on every case.
+    ledger.finish(cases.iter().filter(|c| c.do_sproot).count());
 }

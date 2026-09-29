@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-wf3yt]. All deterministic; 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, CsrMatrix, FormatConvertible, Shape2D, sparse_add, sparse_is_symmetric, sparse_nnz,
     sparse_scale, sparse_transpose,
@@ -73,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -418,68 +420,72 @@ fn diff_sparse_basic_ops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let ops = ["add", "scale", "transpose", "nnz", "is_sym"];
+    let mut ledger = CompareLedger::new("diff_sparse_basic_ops", &ops);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(csr_a) = build_csr(case.a_rows, case.a_cols, &case.a_triplets) else {
-            continue;
-        };
+        let scipy_arm = pmap.get(&case.case_id);
+        let csr_a = build_csr(case.a_rows, case.a_cols, &case.a_triplets);
         let abs_d = match case.op.as_str() {
             "add" => {
-                let Some(csr_b) = build_csr(case.b_rows, case.b_cols, &case.b_triplets) else {
+                let fsci_dense = csr_a.as_ref().and_then(|a| {
+                    let csr_b = build_csr(case.b_rows, case.b_cols, &case.b_triplets)?;
+                    Some(csr_to_dense(&sparse_add(a, &csr_b)))
+                });
+                let Some((expected, d)) = ledger.slices(
+                    "add",
+                    &case.case_id,
+                    scipy_arm.and_then(|a| a.dense.as_deref()),
+                    fsci_dense.as_deref(),
+                ) else {
                     continue;
                 };
-                let Some(expected) = arm.dense.as_ref() else {
-                    continue;
-                };
-                let result = sparse_add(&csr_a, &csr_b);
-                let d = csr_to_dense(&result);
-                if d.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    d.iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                d.iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             }
             "scale" => {
-                let Some(expected) = arm.dense.as_ref() else {
+                let fsci_dense = csr_a
+                    .as_ref()
+                    .map(|a| csr_to_dense(&sparse_scale(a, case.alpha)));
+                let Some((expected, d)) = ledger.slices(
+                    "scale",
+                    &case.case_id,
+                    scipy_arm.and_then(|a| a.dense.as_deref()),
+                    fsci_dense.as_deref(),
+                ) else {
                     continue;
                 };
-                let result = sparse_scale(&csr_a, case.alpha);
-                let d = csr_to_dense(&result);
-                if d.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    d.iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                d.iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             }
             "transpose" => {
-                let Some(expected) = arm.dense.as_ref() else {
+                let fsci_dense = csr_a.as_ref().map(|a| csr_to_dense(&sparse_transpose(a)));
+                let Some((expected, d)) = ledger.slices(
+                    "transpose",
+                    &case.case_id,
+                    scipy_arm.and_then(|a| a.dense.as_deref()),
+                    fsci_dense.as_deref(),
+                ) else {
                     continue;
                 };
-                let result = sparse_transpose(&csr_a);
-                let d = csr_to_dense(&result);
-                if d.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    d.iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                d.iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             }
             "nnz" => {
-                let Some(expected) = arm.nnz else {
+                let Some((expected, actual)) = ledger.both(
+                    "nnz",
+                    &case.case_id,
+                    scipy_arm.and_then(|a| a.nnz),
+                    csr_a.as_ref().map(sparse_nnz),
+                ) else {
                     continue;
                 };
-                let actual = sparse_nnz(&csr_a);
                 if actual == expected {
                     0.0
                 } else {
@@ -487,15 +493,20 @@ fn diff_sparse_basic_ops() {
                 }
             }
             "is_sym" => {
-                let Some(expected) = arm.is_sym else {
+                let Some((expected, actual)) = ledger.both(
+                    "is_sym",
+                    &case.case_id,
+                    scipy_arm.and_then(|a| a.is_sym),
+                    csr_a.as_ref().map(|a| sparse_is_symmetric(a, 1e-12)),
+                ) else {
                     continue;
                 };
-                let actual = sparse_is_symmetric(&csr_a, 1e-12);
                 if actual == expected { 0.0 } else { 1.0 }
             }
-            _ => continue,
+            other => panic!("diff_sparse_basic_ops: unhandled op `{other}`"),
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -510,6 +521,7 @@ fn diff_sparse_basic_ops() {
         test_id: "diff_sparse_basic_ops".into(),
         category: "fsci_sparse::{add, scale, transpose, nnz, is_symmetric} vs scipy.sparse".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -529,5 +541,11 @@ fn diff_sparse_basic_ops() {
         "sparse_basic_ops conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        ops.iter()
+            .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+            .min()
+            .unwrap_or(0),
     );
 }

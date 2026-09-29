@@ -4,19 +4,22 @@
 //!
 //! Resolves [frankenscipy-1bh5o]. Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{logsumexp_axis_2d, logsumexp_axis_2d_with_b, logsumexp_with_b};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci variant compared.
+const ARMS: [&str; 3] = ["lse_with_b", "lse_axis_2d", "lse_axis_2d_with_b"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -62,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -301,10 +305,8 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse logsumexp oracle JSON"))
 }
 
+/// Both slices come from `CompareLedger::slices`, which has already rejected a length mismatch.
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -327,43 +329,55 @@ fn diff_special_logsumexp_variants() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_logsumexp_variants", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let abs_d = match case.op.as_str() {
+        // A case missing from the oracle output is recorded as SciPy giving no value.
+        let scipy = pmap.get(&case.case_id);
+        let op = case.op.as_str();
+        let abs_d = match op {
             "lse_with_b" => {
-                let Some(expected) = arm.scalar else { continue };
-                let Ok(actual) = logsumexp_with_b(&case.data_flat, &case.b_flat) else {
+                let Some((expected, actual)) = ledger.pair(
+                    op,
+                    &case.case_id,
+                    scipy.and_then(|arm| arm.scalar),
+                    logsumexp_with_b(&case.data_flat, &case.b_flat).ok(),
+                ) else {
                     continue;
                 };
                 (actual - expected).abs()
             }
             "lse_axis_2d" => {
-                let Some(expected) = arm.values.as_ref() else {
-                    continue;
-                };
                 let data = unflatten(&case.data_flat, case.rows, case.cols);
-                let Ok(actual) = logsumexp_axis_2d(&data, case.axis) else {
+                let actual = logsumexp_axis_2d(&data, case.axis).ok();
+                let Some((expected, actual)) = ledger.slices(
+                    op,
+                    &case.case_id,
+                    scipy.and_then(|arm| arm.values.as_deref()),
+                    actual.as_deref(),
+                ) else {
                     continue;
                 };
-                vec_max_diff(&actual, expected)
+                vec_max_diff(actual, expected)
             }
             "lse_axis_2d_with_b" => {
-                let Some(expected) = arm.values.as_ref() else {
-                    continue;
-                };
                 let data = unflatten(&case.data_flat, case.rows, case.cols);
                 let b = unflatten(&case.b_flat, case.b_rows, case.b_cols);
-                let Ok(actual) = logsumexp_axis_2d_with_b(&data, case.axis, &b) else {
+                let actual = logsumexp_axis_2d_with_b(&data, case.axis, &b).ok();
+                let Some((expected, actual)) = ledger.slices(
+                    op,
+                    &case.case_id,
+                    scipy.and_then(|arm| arm.values.as_deref()),
+                    actual.as_deref(),
+                ) else {
                     continue;
                 };
-                vec_max_diff(&actual, expected)
+                vec_max_diff(actual, expected)
             }
-            _ => continue,
+            other => panic!("logsumexp variants: no fsci call for op `{other}`"),
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -378,6 +392,7 @@ fn diff_special_logsumexp_variants() {
         test_id: "diff_special_logsumexp_variants".into(),
         category: "fsci_special logsumexp_with_b/axis_2d/axis_2d_with_b vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -398,4 +413,12 @@ fn diff_special_logsumexp_variants() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (lse_with_b and lse_axis_2d_with_b have two each); each must
+    // compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

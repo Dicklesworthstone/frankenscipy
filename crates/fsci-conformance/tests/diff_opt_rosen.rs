@@ -11,13 +11,14 @@
 //! P2C-003. Both are closed-form polynomials, so machine-precision
 //! agreement is the right bar.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{rosen, rosen_der};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -218,13 +220,17 @@ fn diff_opt_rosen() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_rosen", &["rosen", "rosen_der"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let fsci_r = rosen(&case.x);
-        if let Some(scipy_r) = scipy_arm.rosen {
+        if let Some((scipy_r, fsci_r)) =
+            ledger.pair("rosen", &case.case_id, scipy_arm.rosen, Some(fsci_r))
+        {
             let abs_d = (fsci_r - scipy_r).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared("rosen", &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "rosen".into(),
@@ -233,22 +239,27 @@ fn diff_opt_rosen() {
             });
         }
         let fsci_der = rosen_der(&case.x);
-        if let Some(scipy_der) = scipy_arm.der.as_ref()
-            && fsci_der.len() == scipy_der.len()
-        {
-            let abs_d = fsci_der
-                .iter()
-                .zip(scipy_der.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "rosen_der".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        let Some((scipy_der, fsci_der)) = ledger.slices(
+            "rosen_der",
+            &case.case_id,
+            scipy_arm.der.as_deref(),
+            Some(fsci_der.as_slice()),
+        ) else {
+            continue;
+        };
+        let abs_d = fsci_der
+            .iter()
+            .zip(scipy_der.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        max_overall = max_overall.max(abs_d);
+        ledger.compared("rosen_der", &case.case_id, abs_d <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            arm: "rosen_der".into(),
+            abs_diff: abs_d,
+            pass: abs_d <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -257,6 +268,7 @@ fn diff_opt_rosen() {
         test_id: "diff_opt_rosen".into(),
         category: "scipy.optimize.rosen / rosen_der".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -280,4 +292,5 @@ fn diff_opt_rosen() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

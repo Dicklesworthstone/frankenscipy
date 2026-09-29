@@ -1,17 +1,9 @@
-//! Timing + bit-identity harness for `HalfspaceIntersection::from_nd` bounded-
-//! region test.
+//! Timing + checksum harness for N-D `HalfspaceIntersection::new`.
 //!
-//! `halfspace_region_is_bounded_nd` decided boundedness by MATERIALIZING every
-//! C(m, ndim+1) subset of normals (m/(ndim+1)× more than the vertex enumeration —
-//! e.g. 8.2M tiny Vecs for m=120, ndim=3) and then `.any(..)`. It now streams the
-//! subsets in the same lexicographic order, short-circuiting on the first
-//! boundedness witness, so it never allocates the full subset list.
-//!
-//! Boolean-identical (same subsets, same order, same `.any`) => `is_bounded` and
-//! every other field are byte-identical to the sequential build.
-//!
-//! Dumps a golden checksum for fixed small inputs (compare across the stashed
-//! pre-change build) and times large-m builds.
+//! The intersection is the dual convex hull of `m` dual points (the exact-predicate Quickhull),
+//! replacing an enumeration of all C(m, ndim) halfspace subsets and a C(m, ndim+1) boundedness
+//! scan. Dumps a checksum for fixed small inputs (compare across builds) and times large-m
+//! builds.
 //! Run: `cargo run --profile release-perf -p fsci-spatial --bin perf_halfspace_nd`.
 
 use std::hint::black_box;
@@ -79,7 +71,7 @@ fn main() {
     for &(m, ndim, seed) in &[(10usize, 3usize, 1u64), (20, 3, 2), (16, 4, 3)] {
         let hs = halfspaces(m, ndim, seed);
         let interior = if ndim == 3 { &interior_3 } else { &interior_4 };
-        match HalfspaceIntersection::from_nd(&hs, interior) {
+        match HalfspaceIntersection::new(&hs, interior) {
             Ok(h) => println!(
                 "m={m} ndim={ndim} seed={seed} nverts={} chk={:016x}",
                 h.intersections.len(),
@@ -94,11 +86,11 @@ fn main() {
         let hs = halfspaces(m, ndim, 7);
         let interior = if ndim == 3 { &interior_3 } else { &interior_4 };
         let reps = 3;
-        let _ = HalfspaceIntersection::from_nd(&hs, interior);
+        let _ = HalfspaceIntersection::new(&hs, interior);
         let t0 = Instant::now();
         let mut acc = 0u64;
         for _ in 0..reps {
-            let h = HalfspaceIntersection::from_nd(black_box(&hs), interior).unwrap();
+            let h = HalfspaceIntersection::new(black_box(&hs), interior).unwrap();
             acc ^= h.intersections.len() as u64;
         }
         println!(

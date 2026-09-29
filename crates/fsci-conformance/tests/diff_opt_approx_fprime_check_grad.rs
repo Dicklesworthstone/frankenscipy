@@ -11,13 +11,14 @@
 //! for approx_fprime (forward-diff truncation+roundoff floor) and
 //! ~5e-6 for check_grad (which sums forward-diff errors in quadrature).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{approx_fprime, check_grad, rosen, rosen_der};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,7 @@ const PACKET_ID: &str = "FSCI-P2C-003";
 const FPRIME_TOL: f64 = 1.0e-6;
 const CHECK_GRAD_TOL: f64 = 5.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["approx_fprime", "check_grad"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -66,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -316,48 +319,40 @@ fn diff_opt_approx_fprime_check_grad() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_approx_fprime_check_grad", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
+        let arm = case.routine.as_str();
+        let f = fsci_eval_func(&case.func);
+        let (fsci_v, tol) = match arm {
+            "approx_fprime" => (
+                f.and_then(|f| approx_fprime(&case.x, f, case.eps).ok()),
+                FPRIME_TOL,
+            ),
+            "check_grad" => (
+                f.zip(fsci_eval_grad(&case.func))
+                    .and_then(|(f, gfn)| check_grad(f, gfn, &case.x).ok())
+                    .map(|v| vec![v]),
+                CHECK_GRAD_TOL,
+            ),
+            other => panic!("unknown routine {other}"),
+        };
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            arm,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Some(f) = fsci_eval_func(&case.func) else {
-            continue;
-        };
-        let (fsci_v, tol) = match case.routine.as_str() {
-            "approx_fprime" => {
-                let Ok(g) = approx_fprime(&case.x, f, case.eps) else {
-                    continue;
-                };
-                (g, FPRIME_TOL)
-            }
-            "check_grad" => {
-                let Some(gfn) = fsci_eval_grad(&case.func) else {
-                    continue;
-                };
-                let Ok(v) = check_grad(f, gfn, &case.x) else {
-                    continue;
-                };
-                (vec![v], CHECK_GRAD_TOL)
-            }
-            _ => continue,
-        };
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                routine: case.routine.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             routine: case.routine.clone(),
@@ -372,6 +367,7 @@ fn diff_opt_approx_fprime_check_grad() {
         test_id: "diff_opt_approx_fprime_check_grad".into(),
         category: "scipy.optimize.approx_fprime / check_grad".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -395,4 +391,11 @@ fn diff_opt_approx_fprime_check_grad() {
         diffs.len(),
         max_overall
     );
+    // Each (func, x) pair yields one case per routine; each arm must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.routine == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

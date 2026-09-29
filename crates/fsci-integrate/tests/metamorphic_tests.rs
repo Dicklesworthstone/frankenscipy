@@ -637,22 +637,28 @@ fn mr_gauss_legendre_exact_on_degree_2n_minus_1() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// MR26 — cumulative_trapezoid_initial(y, x, c)[0] = c (the initial
-// value sets the first sample).
+// MR26 — cumulative_trapezoid_initial(y, x, 0) = [0] ++ cumulative_trapezoid(y, x),
+// and any other initial is refused (SciPy >= 1.12: `initial` must be None or 0).
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn mr_cumulative_trapezoid_initial_first_entry() {
     let x: Vec<f64> = vec![0.0, 1.0, 2.0, 3.0, 4.0];
     let y: Vec<f64> = x.iter().map(|&xi| xi * xi).collect();
-    for &c in &[0.0_f64, 1.5, -3.0, 100.0] {
-        let cum = cumulative_trapezoid_initial(&y, &x, c);
+    let cum = cumulative_trapezoid_initial(&y, &x, 0.0).expect("initial = 0");
+    let tail = cumulative_trapezoid(&y, &x).expect("valid samples");
+    assert_eq!(cum.len(), x.len(), "MR26 length should equal input");
+    assert_eq!(cum[0], 0.0, "MR26 first entry is the initial zero");
+    assert_eq!(
+        &cum[1..],
+        tail.as_slice(),
+        "MR26 rest is cumulative_trapezoid"
+    );
+    for &c in &[1.5_f64, -3.0, 100.0] {
         assert!(
-            (cum[0] - c).abs() < 1e-12,
-            "MR26 cumulative_trapezoid_initial[0] = {} vs initial = {c}",
-            cum[0]
+            cumulative_trapezoid_initial(&y, &x, c).is_err(),
+            "MR26 initial = {c} must be refused"
         );
-        assert_eq!(cum.len(), x.len(), "MR26 length should equal input");
     }
 }
 

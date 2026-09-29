@@ -9,13 +9,14 @@
 //!      either put them in the same component or in different
 //!      components.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, label};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -257,28 +259,32 @@ fn diff_ndimage_label() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_label", &["label"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_num) = scipy_arm.num_features else {
-            continue;
-        };
-        let Some(scipy_labels) = scipy_arm.labels.as_ref() else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.input.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let Ok((fsci_labels, fsci_num)) = label(&input) else {
+        let fsci_out = NdArray::new(case.input.clone(), case.input_shape.clone())
+            .ok()
+            .and_then(|input| label(&input).ok());
+        let Some(((scipy_num, scipy_labels), (fsci_labels, fsci_num))) = ledger.both(
+            "label",
+            &case.case_id,
+            scipy_arm.num_features.zip(scipy_arm.labels.as_ref()),
+            fsci_out,
+        ) else {
             continue;
         };
         let num_match = fsci_num == scipy_num;
         let partition_match = same_partition(&fsci_labels.data, scipy_labels);
+        // `same_partition` casts each label with `as i64`, which maps NaN to 0 (background).
+        let no_nan = !fsci_labels.data.iter().any(|v| v.is_nan());
+        let pass = num_match && partition_match && no_nan;
+        ledger.compared("label", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             num_match,
             partition_match,
-            pass: num_match && partition_match,
+            pass,
         });
     }
 
@@ -288,6 +294,7 @@ fn diff_ndimage_label() {
         test_id: "diff_ndimage_label".into(),
         category: "scipy.ndimage.label".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -309,4 +316,5 @@ fn diff_ndimage_label() {
         "scipy.ndimage.label conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

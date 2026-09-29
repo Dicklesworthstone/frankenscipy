@@ -10,13 +10,14 @@
 //! cases via subprocess. Tol 1e-12 abs (closed-form Cholesky
 //! + log det).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::MultivariateNormal;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -268,21 +270,29 @@ fn diff_stats_mvn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_mvn", &["pdf", "logpdf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, &case.mean, &case.cov, &case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        // fsci_eval is None when fsci errs or returns a non-finite value; against a
+        // SciPy value that is an fsci failure, not a skip.
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            &case.func,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, &case.mean, &case.cov, &case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -291,6 +301,7 @@ fn diff_stats_mvn() {
         test_id: "diff_stats_mvn".into(),
         category: "scipy.stats.multivariate_normal.pdf/logpdf".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -312,4 +323,6 @@ fn diff_stats_mvn() {
         diffs.len(),
         max_overall
     );
+    let per_func = |f: &str| query.points.iter().filter(|c| c.func == f).count();
+    ledger.finish(per_func("pdf").min(per_func("logpdf")));
 }

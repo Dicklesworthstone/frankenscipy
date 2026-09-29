@@ -5,19 +5,30 @@
 //!
 //! Resolves [frankenscipy-ac42u]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{celu, elu, gelu, hard_swish_scalar, leaky_relu, selu, swish};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Every op the query generates; each is a ledger arm.
+const OPS: [&str; 7] = [
+    "gelu",
+    "selu",
+    "hard_swish",
+    "elu",
+    "leaky_relu",
+    "swish",
+    "celu",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -57,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -265,24 +277,29 @@ fn diff_special_activations() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_activations", &OPS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
-            "gelu" => gelu(case.x),
-            "selu" => selu(case.x),
-            "hard_swish" => hard_swish_scalar(case.x),
-            "elu" => elu(case.x, case.param),
-            "leaky_relu" => leaky_relu(case.x, case.param),
-            "swish" => swish(case.x, case.param),
-            "celu" => celu(case.x, case.param),
-            _ => continue,
+            "gelu" => Some(gelu(case.x)),
+            "selu" => Some(selu(case.x)),
+            "hard_swish" => Some(hard_swish_scalar(case.x)),
+            "elu" => Some(elu(case.x, case.param)),
+            "leaky_relu" => Some(leaky_relu(case.x, case.param)),
+            "swish" => Some(swish(case.x, case.param)),
+            "celu" => Some(celu(case.x, case.param)),
+            // An unknown op is an undeclared arm: the ledger call below panics on it.
+            _ => None,
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -297,6 +314,7 @@ fn diff_special_activations() {
         test_id: "diff_special_activations".into(),
         category: "fsci_special activations (formula-derived)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -317,4 +335,7 @@ fn diff_special_activations() {
         diffs.len(),
         max_overall
     );
+    // The x-only ops have one case per x; the parameterised ops have three per x.
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(OPS.into_iter().map(per_op).min().unwrap_or(0));
 }

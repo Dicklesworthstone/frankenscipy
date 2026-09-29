@@ -15,13 +15,14 @@
 //! 3 datasets × 3 funcs (multi-arm where applicable) =
 //! ~18 cases. Tol 1e-9 abs (incomplete-beta weights for HD).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{expectile, hdmedian, hdquantiles};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -258,61 +260,72 @@ fn diff_stats_hd_expectile() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["hdmedian", "hdquantiles", "expectile"];
+    let mut ledger = CompareLedger::new("diff_stats_hd_expectile", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
             "hdmedian" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = hdmedian(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
+                let rust_v = hdmedian(&case.data);
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair("hdmedian", &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared("hdmedian", &case.case_id, abs_diff <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
             }
             "hdquantiles" => {
-                if let Some(scipy_vec) = &scipy_arm.vector {
-                    let rust_vec = hdquantiles(&case.data, &case.probs);
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
+                let rust_vec = hdquantiles(&case.data, &case.probs);
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    "hdquantiles",
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(rust_vec.as_slice()),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    if a.is_finite() {
+                        max_local = max_local.max((a - b).abs());
                     }
                 }
+                max_overall = max_overall.max(max_local);
+                ledger.compared("hdquantiles", &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
             }
             "expectile" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = expectile(&case.data, case.alpha);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
+                let rust_v = expectile(&case.data, case.alpha);
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair("expectile", &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared("expectile", &case.case_id, abs_diff <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
             }
-            _ => {}
+            other => panic!("hd_expectile: generate_query produced unknown func {other}"),
         }
     }
 
@@ -322,6 +335,7 @@ fn diff_stats_hd_expectile() {
         test_id: "diff_stats_hd_expectile".into(),
         category: "hdmedian + hdquantiles + expectile".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -346,4 +360,11 @@ fn diff_stats_hd_expectile() {
         diffs.len(),
         max_overall
     );
+    // hdmedian and hdquantiles get one case per dataset, expectile three (one per alpha).
+    let min_per_arm = arms
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("arms declared");
+    ledger.finish(min_per_arm);
 }

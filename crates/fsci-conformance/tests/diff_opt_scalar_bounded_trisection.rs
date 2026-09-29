@@ -5,10 +5,12 @@
 //! function on a bracket. Test on unimodal functions with known
 //! analytical minima.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{minimize_scalar_bounded, minimize_trisection};
 use serde::Serialize;
 
@@ -28,6 +30,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -79,30 +82,58 @@ fn diff_opt_scalar_bounded_trisection() {
         ),
     ];
 
-    for (label, f, a, b, x_star, f_star) in probes {
-        let (x1, f1) = minimize_scalar_bounded(*f, (*a, *b), 1e-8, 200);
-        let d_x = (x1 - x_star).abs();
-        let d_f = (f1 - f_star).abs();
-        let abs_d_bounded = d_x.max(d_f);
-        max_overall = max_overall.max(abs_d_bounded);
-        diffs.push(CaseDiff {
-            case_id: format!("bounded_{label}"),
-            op: "bounded".into(),
-            abs_diff: abs_d_bounded,
-            pass: abs_d_bounded <= TOL,
-        });
+    let mut ledger = CompareLedger::new(
+        "diff_opt_scalar_bounded_trisection",
+        &["bounded", "trisection"],
+    );
 
+    for (label, f, a, b, x_star, f_star) in probes {
+        // (x*, f*) as one vector, so a NaN in either that `d_x.max(d_f)` would drop is caught.
+        let expected = [*x_star, *f_star];
+
+        let bounded_id = format!("bounded_{label}");
+        let (x1, f1) = minimize_scalar_bounded(*f, (*a, *b), 1e-8, 200);
+        let got1 = [x1, f1];
+        if let Some((_, got1)) = ledger.slices(
+            "bounded",
+            &bounded_id,
+            Some(expected.as_slice()),
+            Some(got1.as_slice()),
+        ) {
+            let d_x = (got1[0] - x_star).abs();
+            let d_f = (got1[1] - f_star).abs();
+            let abs_d_bounded = d_x.max(d_f);
+            max_overall = max_overall.max(abs_d_bounded);
+            ledger.compared("bounded", &bounded_id, abs_d_bounded <= TOL);
+            diffs.push(CaseDiff {
+                case_id: bounded_id,
+                op: "bounded".into(),
+                abs_diff: abs_d_bounded,
+                pass: abs_d_bounded <= TOL,
+            });
+        }
+
+        let trisection_id = format!("trisection_{label}");
         let (x2, f2) = minimize_trisection(*f, *a, *b, 1e-8, 1000);
-        let d_x2 = (x2 - x_star).abs();
-        let d_f2 = (f2 - f_star).abs();
-        let abs_d_tri = d_x2.max(d_f2);
-        max_overall = max_overall.max(abs_d_tri);
-        diffs.push(CaseDiff {
-            case_id: format!("trisection_{label}"),
-            op: "trisection".into(),
-            abs_diff: abs_d_tri,
-            pass: abs_d_tri <= TOL,
-        });
+        let got2 = [x2, f2];
+        if let Some((_, got2)) = ledger.slices(
+            "trisection",
+            &trisection_id,
+            Some(expected.as_slice()),
+            Some(got2.as_slice()),
+        ) {
+            let d_x2 = (got2[0] - x_star).abs();
+            let d_f2 = (got2[1] - f_star).abs();
+            let abs_d_tri = d_x2.max(d_f2);
+            max_overall = max_overall.max(abs_d_tri);
+            ledger.compared("trisection", &trisection_id, abs_d_tri <= TOL);
+            diffs.push(CaseDiff {
+                case_id: trisection_id,
+                op: "trisection".into(),
+                abs_diff: abs_d_tri,
+                pass: abs_d_tri <= TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -111,6 +142,7 @@ fn diff_opt_scalar_bounded_trisection() {
         test_id: "diff_opt_scalar_bounded_trisection".into(),
         category: "fsci_opt::{minimize_scalar_bounded, minimize_trisection} property test".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -131,4 +163,5 @@ fn diff_opt_scalar_bounded_trisection() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(probes.len());
 }

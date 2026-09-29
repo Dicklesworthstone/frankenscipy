@@ -6,13 +6,14 @@
 //!
 //! Resolves [frankenscipy-frqz4]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{
     ceil, fabs, floor, fmax, fmin, hypot, ldexp, maximum, minimum, modf, nan_to_num, negative,
     positive, power, reciprocal, round, sign, signbit, square, trunc,
@@ -22,6 +23,29 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op.
+const ARMS: [&str; 20] = [
+    "floor",
+    "ceil",
+    "fabs",
+    "trunc",
+    "round",
+    "sign",
+    "reciprocal",
+    "square",
+    "positive",
+    "negative",
+    "signbit",
+    "modf",
+    "maximum",
+    "minimum",
+    "fmax",
+    "fmin",
+    "hypot",
+    "power",
+    "ldexp",
+    "nan_to_num",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -68,6 +92,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -345,83 +370,103 @@ fn diff_special_basic_math() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_basic_math", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let pass = match case.op.as_str() {
+        let arm = case.op.as_str();
+        match arm {
             "signbit" => {
-                let Some(b_exp) = scipy_arm.bool_value else {
+                let Some((b_exp, fsci_b)) = ledger.both(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.bool_value,
+                    Some(signbit(case.a)),
+                ) else {
                     continue;
                 };
-                let fsci_b = signbit(case.a);
                 let pass = fsci_b == b_exp;
+                ledger.compared(arm, &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: "signbit".into(),
                     abs_diff: if pass { 0.0 } else { 1.0 },
                     pass,
                 });
-                continue;
             }
             "modf" => {
-                let Some(whole_exp) = scipy_arm.value else {
-                    continue;
-                };
-                let Some(frac_exp) = scipy_arm.aux else {
-                    continue;
-                };
+                // [whole, frac] on both sides: `slices` rejects a NaN part that the
+                // `max` of the two differences below would swallow.
+                let scipy_parts = scipy_arm
+                    .value
+                    .zip(scipy_arm.aux)
+                    .map(|(whole, frac)| vec![whole, frac]);
                 let (frac_f, whole_f) = modf(case.a);
+                let fsci_parts = [whole_f, frac_f];
+                let Some((s, f)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_parts.as_deref(),
+                    Some(fsci_parts.as_slice()),
+                ) else {
+                    continue;
+                };
+                let (whole_exp, frac_exp) = (s[0], s[1]);
+                let (whole_f, frac_f) = (f[0], f[1]);
                 let d = (whole_f - whole_exp).abs().max((frac_f - frac_exp).abs());
                 max_overall = max_overall.max(d);
+                ledger.compared(arm, &case.case_id, d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: "modf".into(),
                     abs_diff: d,
                     pass: d <= ABS_TOL,
                 });
-                continue;
             }
-            _ => true,
-        };
-        let _ = pass;
-        // For NaN-returning ops: handle NaN equality
-        let scipy_v = match scipy_arm.value {
-            Some(v) => v,
-            None => continue,
-        };
-        let fsci_v = match case.op.as_str() {
-            "floor" => floor(case.a),
-            "ceil" => ceil(case.a),
-            "fabs" => fabs(case.a),
-            "trunc" => trunc(case.a),
-            "round" => round(case.a),
-            "sign" => sign(case.a),
-            "reciprocal" => reciprocal(case.a),
-            "square" => square(case.a),
-            "positive" => positive(case.a),
-            "negative" => negative(case.a),
-            "maximum" => maximum(case.a, case.b),
-            "minimum" => minimum(case.a, case.b),
-            "fmax" => fmax(case.a, case.b),
-            "fmin" => fmin(case.a, case.b),
-            "hypot" => hypot(case.a, case.b),
-            "power" => power(case.a, case.b),
-            "ldexp" => ldexp(case.a, case.n as i32),
-            "nan_to_num" => nan_to_num(case.a, 0.0, case.b, -case.b),
-            _ => continue,
-        };
-        let abs_d = if scipy_v.is_nan() && fsci_v.is_nan() {
-            0.0
-        } else {
-            (fsci_v - scipy_v).abs()
-        };
-        max_overall = max_overall.max(abs_d);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            op: case.op.clone(),
-            abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
-        });
+            _ => {
+                let fsci_v = match arm {
+                    "floor" => floor(case.a),
+                    "ceil" => ceil(case.a),
+                    "fabs" => fabs(case.a),
+                    "trunc" => trunc(case.a),
+                    "round" => round(case.a),
+                    "sign" => sign(case.a),
+                    "reciprocal" => reciprocal(case.a),
+                    "square" => square(case.a),
+                    "positive" => positive(case.a),
+                    "negative" => negative(case.a),
+                    "maximum" => maximum(case.a, case.b),
+                    "minimum" => minimum(case.a, case.b),
+                    "fmax" => fmax(case.a, case.b),
+                    "fmin" => fmin(case.a, case.b),
+                    "hypot" => hypot(case.a, case.b),
+                    "power" => power(case.a, case.b),
+                    "ldexp" => ldexp(case.a, case.n as i32),
+                    "nan_to_num" => nan_to_num(case.a, 0.0, case.b, -case.b),
+                    other => panic!("unknown op {other} in {}", case.case_id),
+                };
+                // A non-finite value on either side is classified by the ledger (a SciPy NaN
+                // matches an fsci NaN); only finite pairs reach the metric below.
+                let Some((scipy_v, fsci_v)) =
+                    ledger.pair(arm, &case.case_id, scipy_arm.value, Some(fsci_v))
+                else {
+                    continue;
+                };
+                let abs_d = if scipy_v.is_nan() && fsci_v.is_nan() {
+                    0.0
+                } else {
+                    (fsci_v - scipy_v).abs()
+                };
+                max_overall = max_overall.max(abs_d);
+                ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    op: case.op.clone(),
+                    abs_diff: abs_d,
+                    pass: abs_d <= ABS_TOL,
+                });
+            }
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -430,6 +475,7 @@ fn diff_special_basic_math() {
         test_id: "diff_special_basic_math".into(),
         category: "fsci_special basic math wrappers".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -450,4 +496,11 @@ fn diff_special_basic_math() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (nan_to_num has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

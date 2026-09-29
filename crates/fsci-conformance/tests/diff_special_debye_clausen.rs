@@ -10,13 +10,14 @@
 //! truncated series with N=100000 terms (clausen). Tolerance: 5e-6
 //! abs (Simpson-rule debye + finite Clausen series).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{clausen, debye};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -267,17 +269,18 @@ fn diff_special_debye_clausen() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_debye_clausen", &["debye", "clausen"]);
 
     for case in &query.debye {
-        let Some(arm) = debye_map.get(&case.case_id) else {
+        let scipy = debye_map.get(&case.case_id).and_then(|a| a.value);
+        let Some((expected, actual)) =
+            ledger.pair("debye", &case.case_id, scipy, Some(debye(case.n, case.x)))
+        else {
             continue;
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let actual = debye(case.n, case.x);
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("debye", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "debye".into(),
@@ -287,15 +290,15 @@ fn diff_special_debye_clausen() {
     }
 
     for case in &query.clausen {
-        let Some(arm) = clausen_map.get(&case.case_id) else {
+        let scipy = clausen_map.get(&case.case_id).and_then(|a| a.value);
+        let Some((expected, actual)) =
+            ledger.pair("clausen", &case.case_id, scipy, Some(clausen(case.theta)))
+        else {
             continue;
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let actual = clausen(case.theta);
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("clausen", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "clausen".into(),
@@ -310,6 +313,7 @@ fn diff_special_debye_clausen() {
         test_id: "diff_special_debye_clausen".into(),
         category: "fsci_special::debye + clausen vs scipy.integrate / series".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -330,4 +334,6 @@ fn diff_special_debye_clausen() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (clausen has fewer); each must compare all of its own.
+    ledger.finish(query.debye.len().min(query.clausen.len()));
 }

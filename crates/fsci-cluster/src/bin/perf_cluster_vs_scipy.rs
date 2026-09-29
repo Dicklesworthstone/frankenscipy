@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use fsci_cluster::{LinkageMethod, kmeans2, linkage, vq};
+use fsci_cluster::{FclusterCriterion, LinkageMethod, fcluster, kmeans2, linkage, vq};
 use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 
 /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
@@ -49,7 +49,7 @@ const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
 import scipy
-from scipy.cluster.hierarchy import linkage
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.cluster.vq import kmeans2, vq
 
 op = os.environ['FSCI_CLUSTER_OP']
@@ -64,10 +64,14 @@ pts = np.frombuffer(raw, dtype='<f8').reshape(n, dim).copy()
 craw = sys.stdin.buffer.read(k * dim * 8)
 if len(craw) != k * dim * 8: raise RuntimeError('short centroids')
 cent = np.frombuffer(craw, dtype='<f8').reshape(k, dim).copy()
+# fcluster times the cut alone, on a linkage built outside the timed region.
+Z = linkage(pts, method='single') if op == 'fcluster' else None
 
 def run():
     if op == 'linkage':
         return np.ascontiguousarray(linkage(pts, method='single')[:, 2], dtype='<f8')
+    if op == 'fcluster':
+        return np.ascontiguousarray(fcluster(Z, k, criterion='maxclust'), dtype='<f8')
     if op == 'kmeans2':
         _centroids, labels = kmeans2(pts, cent, iter=iterations, minit='matrix')
         return np.ascontiguousarray(labels, dtype='<f8')
@@ -308,7 +312,8 @@ fn main() {
 
     // `FSCI_CLUSTER_OPS=vq` restricts the run to one op. Needed to attribute a hardware
     // counter to a single op: with both ops in the run, a `perf stat` total mixes them and
-    // a change in either moves the number.
+    // a change in either moves the number. `fcluster` (a maxclust cut into `FSCI_CLUSTER_K`
+    // clusters) runs only when named.
     let selected =
         std::env::var("FSCI_CLUSTER_OPS").unwrap_or_else(|_| "vq,linkage,kmeans2".to_owned());
     // `FSCI_CLUSTER_FIXED_REPS=N` pins the repetition count instead of calibrating it, so two
@@ -319,15 +324,25 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    for op in ["vq", "linkage", "kmeans2"] {
+    for op in ["vq", "linkage", "kmeans2", "fcluster"] {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
         let mut scipy = Scipy::start(op, &points, &centroids, iterations);
         println!("{}", scipy.ready);
 
+        // As on the SciPy side, fcluster cuts a single linkage built outside the timed region;
+        // CHECK compares the labels, so a linkage that differed would show there.
+        let z = (op == "fcluster")
+            .then(|| linkage(&points, LinkageMethod::Single).expect("fsci linkage"));
         let ours = || -> Vec<f64> {
-            if op == "vq" {
+            if let Some(z) = &z {
+                fcluster(z, FclusterCriterion::MaxClust(k))
+                    .expect("fsci fcluster")
+                    .into_iter()
+                    .map(|label| label as f64)
+                    .collect()
+            } else if op == "vq" {
                 vq(&points, &centroids).expect("fsci vq").1
             } else if op == "kmeans2" {
                 kmeans2(&points, &centroids, iterations)

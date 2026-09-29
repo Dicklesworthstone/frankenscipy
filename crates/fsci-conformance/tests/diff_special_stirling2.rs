@@ -5,13 +5,14 @@
 //! floating-output path for integer scalar inputs, including SciPy's zero
 //! rules for negative inputs and `K > N`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::stirling2;
 use fsci_special::types::SpecialTensor;
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -220,27 +222,33 @@ fn diff_special_stirling2() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_stirling2", &["stirling2"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.n, case.k)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= STIRLING2_TOL_REL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n: case.n,
-                k: case.k,
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "stirling2",
+            &case.case_id,
+            oracle.value,
+            fsci_eval(case.n, case.k),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= STIRLING2_TOL_REL * scale;
+        ledger.compared("stirling2", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            n: case.n,
+            k: case.k,
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -248,6 +256,7 @@ fn diff_special_stirling2() {
         test_id: "diff_special_stirling2".into(),
         category: "scipy.special.stirling2".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -273,4 +282,5 @@ fn diff_special_stirling2() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

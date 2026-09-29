@@ -12,13 +12,14 @@
 //! lib-side `modified_bessel_i` precision floor), so it gets a
 //! dedicated looser tolerance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{
     bartlett, blackmanharris, bohman_window, boxcar, flattop, gaussian, kaiser, nuttall_window,
     parzen, triang, tukey_window,
@@ -34,6 +35,21 @@ const STRICT_TOL: f64 = 1.0e-13;
 // magnitudes of large-argument I0 accumulate the I0 series rounding
 // error. Documented looser tol; tighten once the I0 floor closes.
 const KAISER_TOL: f64 = 5.0e-8;
+
+/// Every window family the query generates; one ledger arm each.
+const FUNCS: [&str; 11] = [
+    "bartlett",
+    "triang",
+    "blackmanharris",
+    "nuttall",
+    "flattop",
+    "boxcar",
+    "parzen",
+    "bohman",
+    "tukey",
+    "gaussian",
+    "kaiser",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -74,6 +90,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -287,24 +304,19 @@ fn diff_signal_windows_extras() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_windows_extras", &FUNCS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(fsci_v) = fsci_eval(&case.func, case.n, case.param) else {
+        let fsci_v = fsci_eval(&case.func, case.n, case.param);
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(scipy_v.iter())
@@ -312,6 +324,7 @@ fn diff_signal_windows_extras() {
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
         let tol = func_tol(&case.func);
+        ledger.compared(&case.func, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -327,6 +340,7 @@ fn diff_signal_windows_extras() {
         category: "scipy.signal.windows.{bartlett,triang,blackmanharris,nuttall,flattop,boxcar,parzen,bohman,tukey,gaussian,kaiser}"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -350,4 +364,10 @@ fn diff_signal_windows_extras() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = FUNCS
+        .iter()
+        .map(|func| query.points.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("FUNCS is non-empty");
+    ledger.finish(min_per_arm);
 }

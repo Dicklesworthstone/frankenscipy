@@ -9,13 +9,14 @@
 //! the saturated tail). Skips cleanly if scipy/python3 is
 //! unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, ExponPow};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,41 +240,31 @@ fn diff_stats_exponpow() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_exponpow", &["pdf", "cdf", "sf", "ppf"]);
 
     for case in &query.pdf_cdf_sf_cases {
         let oracle = pdf_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
         let dist = ExponPow::new(case.b);
-        if let Some(scipy_pdf) = oracle.pdf {
-            let d = (dist.pdf(case.x) - scipy_pdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "pdf".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL_TIGHT,
-            });
-        }
-        if let Some(scipy_cdf) = oracle.cdf {
-            let d = (dist.cdf(case.x) - scipy_cdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL_TIGHT,
-            });
-        }
-        if let Some(scipy_sf) = oracle.sf {
-            let d = (dist.sf(case.x) - scipy_sf).abs();
-            max_overall = max_overall.max(d);
+        let arms = [
+            ("pdf", oracle.pdf, dist.pdf(case.x), ABS_TOL_TIGHT),
+            ("cdf", oracle.cdf, dist.cdf(case.x), ABS_TOL_TIGHT),
             // sf can saturate near 0 in deep tail — looser tol.
+            ("sf", oracle.sf, dist.sf(case.x), ABS_TOL_LOOSE),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
+            max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "sf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= ABS_TOL_LOOSE,
+                pass: d <= tol,
             });
         }
     }
@@ -281,19 +273,22 @@ fn diff_stats_exponpow() {
         let oracle = ppf_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        if let Some(scipy_ppf) = oracle.ppf {
-            let dist = ExponPow::new(case.b);
-            let rust_ppf = dist.ppf(case.q);
-            let d = (rust_ppf - scipy_ppf).abs();
-            let scale = scipy_ppf.abs().max(1.0);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "ppf".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL_TIGHT * scale,
-            });
-        }
+        let dist = ExponPow::new(case.b);
+        let Some((scipy_ppf, rust_ppf)) =
+            ledger.pair("ppf", &case.case_id, oracle.ppf, Some(dist.ppf(case.q)))
+        else {
+            continue;
+        };
+        let d = (rust_ppf - scipy_ppf).abs();
+        let scale = scipy_ppf.abs().max(1.0);
+        max_overall = max_overall.max(d);
+        ledger.compared("ppf", &case.case_id, d <= ABS_TOL_TIGHT * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            family: "ppf".into(),
+            abs_diff: d,
+            pass: d <= ABS_TOL_TIGHT * scale,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -302,6 +297,7 @@ fn diff_stats_exponpow() {
         test_id: "diff_stats_exponpow".into(),
         category: "scipy.stats.exponpow".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,4 +322,6 @@ fn diff_stats_exponpow() {
         diffs.len(),
         max_overall
     );
+    // pdf/cdf/sf run over pdf_cdf_sf_cases, ppf over ppf_cases; each arm must compare all of its own.
+    ledger.finish(query.pdf_cdf_sf_cases.len().min(query.ppf_cases.len()));
 }

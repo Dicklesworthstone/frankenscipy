@@ -6,15 +6,25 @@
 //! max_order and tol. quad_explain wraps quad() and returns
 //! (QuadResult, human-readable explanation string).
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{QuadOptions, quad_explain, romb_func};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per routine; a case's arm is its id prefix.
+const ARMS: [&str; 2] = ["romb_func", "quad_explain"];
+
+fn arm_of(case_id: &str) -> &'static str {
+    ARMS.into_iter()
+        .find(|arm| case_id.starts_with(&format!("{arm}_")))
+        .unwrap_or_else(|| panic!("case {case_id} names no declared arm"))
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -28,6 +38,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -59,7 +70,11 @@ fn emit_log(log: &DiffLog) {
 fn diff_integrate_romb_func_quad_explain() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_romb_func_quad_explain", &ARMS);
+    // Every check records one CaseDiff, so `diffs` is the designed case list, and one ledger
+    // verdict (a NaN integral fails its own comparison).
     let mut check = |id: &str, ok: bool, note: String| {
+        ledger.compared(arm_of(id), id, ok);
         diffs.push(CaseDiff {
             case_id: id.into(),
             pass: ok,
@@ -183,6 +198,7 @@ fn diff_integrate_romb_func_quad_explain() {
         test_id: "diff_integrate_romb_func_quad_explain".into(),
         category: "fsci_integrate::{romb_func, quad_explain} coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -204,4 +220,11 @@ fn diff_integrate_romb_func_quad_explain() {
         "romb_func/quad_explain coverage failed: {} cases",
         diffs.len()
     );
+    // romb_func has 7 checks and quad_explain 4; each arm must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| diffs.iter().filter(|d| arm_of(&d.case_id) == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

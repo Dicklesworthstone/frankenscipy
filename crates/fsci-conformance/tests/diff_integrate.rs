@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy integration functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{
     cumulative_trapezoid, cumulative_trapezoid_uniform, romb, simpson, simpson_uniform, trapezoid,
     trapezoid_uniform,
@@ -20,6 +21,16 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-008";
 const TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Ledger arms of `diff_integrate_scalar`: the `func` of each case.
+const SCALAR_FUNCS: [&str; 5] = [
+    "trapezoid",
+    "trapezoid_uniform",
+    "simpson",
+    "simpson_uniform",
+    "romb",
+];
+/// Ledger arms of `diff_integrate_cumulative`: the `func` of each case.
+const CUMULATIVE_FUNCS: [&str; 2] = ["cumtrapz", "cumtrapz_uniform"];
 
 #[derive(Debug, Clone, Serialize)]
 struct IntegrateCase {
@@ -58,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -228,18 +240,18 @@ json.dump(results, sys.stdout)
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn scipy_oracle_or_skip(cases: &[IntegrateCase]) -> Vec<OracleResult> {
-    match run_scipy_oracle(cases) {
-        Some(results) => results,
-        None => {
-            assert!(
-                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
-                "SciPy oracle required but not available"
-            );
-            eprintln!("SciPy oracle not available, skipping diff test");
-            Vec::new()
-        }
+/// `None` only when the oracle could not run. A run whose every case raised (the script drops
+/// those rows) is `Some` of an empty list, which the coverage check below rejects.
+fn scipy_oracle_or_skip(cases: &[IntegrateCase]) -> Option<Vec<OracleResult>> {
+    let results = run_scipy_oracle(cases);
+    if results.is_none() {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "SciPy oracle required but not available"
+        );
+        eprintln!("SciPy oracle not available, skipping diff test");
     }
+    results
 }
 
 fn compute_rust_value(case: &IntegrateCase) -> Option<f64> {
@@ -317,31 +329,32 @@ fn complete_scalar_oracle_map(
 #[test]
 fn diff_integrate_scalar() {
     let cases = scalar_cases();
-    let oracle_results = scipy_oracle_or_skip(&cases);
-
-    if oracle_results.is_empty() {
+    let Some(oracle_results) = scipy_oracle_or_skip(&cases) else {
         return;
-    }
+    };
 
     let oracle_map = complete_scalar_oracle_map("diff_integrate_scalar", &cases, oracle_results);
 
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_scalar", &SCALAR_FUNCS);
 
     for case in &cases {
-        let rust_val = compute_rust_value(case)
-            .expect("complete scalar oracle map validates Rust evaluator coverage");
-        let scipy_result = oracle_map
-            .get(&case.case_id)
-            .expect("complete scalar oracle map validates SciPy case coverage");
+        let arm = case.func.as_str();
+        let scipy_val = oracle_map.get(&case.case_id).map(|r| r.value);
+        let Some((scipy_val, rust_val)) =
+            ledger.pair(arm, &case.case_id, scipy_val, compute_rust_value(case))
+        else {
+            continue;
+        };
 
-        let scipy_val = scipy_result.value;
         let abs_diff = (rust_val - scipy_val).abs();
         let rel_scale = rust_val.abs().max(scipy_val.abs()).max(1.0);
         let effective_tol = TOL * rel_scale;
 
         max_diff = max_diff.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= effective_tol);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -360,6 +373,7 @@ fn diff_integrate_scalar() {
         test_id: "diff_integrate_scalar".into(),
         category: "scipy.integrate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass: all_pass,
@@ -385,6 +399,14 @@ fn diff_integrate_scalar() {
         diffs.len(),
         max_diff
     );
+    // Every func has its own cases (romb only where n - 1 is a power of two); each arm must
+    // compare all of its own.
+    let min_per_arm = SCALAR_FUNCS
+        .iter()
+        .map(|func| cases.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("SCALAR_FUNCS is non-empty");
+    ledger.finish(min_per_arm);
 }
 
 #[test]
@@ -492,9 +514,8 @@ json.dump(results, sys.stdout)
         }
     };
 
-    if oracle_results.is_empty() {
-        return;
-    }
+    // A run that returned no rows ran and raised on every case (the script drops raised rows);
+    // that is a broken oracle column, not a skip, and fails the coverage check.
     assert_eq!(
         oracle_results.len(),
         cases.len(),
@@ -523,39 +544,36 @@ json.dump(results, sys.stdout)
 
     let mut all_pass = true;
     let mut max_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_cumulative", &CUMULATIVE_FUNCS);
 
     for case in &cases {
-        let rust_vals: Vec<f64> = match case.func.as_str() {
+        let arm = case.func.as_str();
+        let rust_vals: Option<Vec<f64>> = match arm {
             "cumtrapz" => {
                 let x = case.x.as_ref().expect("cumtrapz cases include explicit x");
-                cumulative_trapezoid(&case.y, x)
-                    .expect("Rust cumulative_trapezoid should evaluate conformance case")
+                cumulative_trapezoid(&case.y, x).ok()
             }
             "cumtrapz_uniform" => {
                 let dx = case.dx.expect("uniform cumulative cases include dx");
-                cumulative_trapezoid_uniform(&case.y, dx)
-                    .expect("Rust cumulative_trapezoid_uniform should evaluate conformance case")
+                cumulative_trapezoid_uniform(&case.y, dx).ok()
             }
             other => {
                 eprintln!("unsupported cumulative integrate function {other}");
                 all_pass = false;
-                continue;
+                None
             }
         };
 
-        let scipy_result = oracle_map
-            .get(&case.case_id)
-            .expect("complete cumulative oracle map validates SciPy case coverage");
-        assert_eq!(
-            rust_vals.len(),
-            scipy_result.values.len(),
-            "{} cumulative output length mismatch: rust={} scipy={}",
-            case.case_id,
-            rust_vals.len(),
-            scipy_result.values.len()
-        );
+        let scipy_vals = oracle_map.get(&case.case_id).map(|r| r.values.as_slice());
+        // Length, and a NaN element, which `diff > tol` below would let through.
+        let Some((scipy_vals, rust_vals)) =
+            ledger.slices(arm, &case.case_id, scipy_vals, rust_vals.as_deref())
+        else {
+            continue;
+        };
 
-        for (i, (&rv, &sv)) in rust_vals.iter().zip(scipy_result.values.iter()).enumerate() {
+        let mut case_pass = true;
+        for (i, (&rv, &sv)) in rust_vals.iter().zip(scipy_vals.iter()).enumerate() {
             let diff = (rv - sv).abs();
             max_diff = max_diff.max(diff);
             let rel_scale = rv.abs().max(sv.abs()).max(1.0);
@@ -565,8 +583,10 @@ json.dump(results, sys.stdout)
                     case.case_id, i, rv, sv, diff
                 );
                 all_pass = false;
+                case_pass = false;
             }
         }
+        ledger.compared(arm, &case.case_id, case_pass);
     }
 
     assert!(
@@ -574,4 +594,10 @@ json.dump(results, sys.stdout)
         "scipy.integrate cumulative conformance failed, max_diff={}",
         max_diff
     );
+    let min_per_arm = CUMULATIVE_FUNCS
+        .iter()
+        .map(|func| cases.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("CUMULATIVE_FUNCS is non-empty");
+    ledger.finish(min_per_arm);
 }

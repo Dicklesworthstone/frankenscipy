@@ -11,12 +11,14 @@
 //!
 //! Error paths: matmul/matvec with incompatible shapes.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{diag, diagm, eye, matmul, matvec, outer};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -342,30 +345,28 @@ fn diff_linalg_basic_matrix_ops() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let arms = ["diag", "diagm", "eye", "matmul", "matvec", "outer"];
+    let mut ledger = CompareLedger::new("diff_linalg_basic_matrix_ops", &arms);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
         match case.op.as_str() {
             "diag" => {
-                let Some(exp_flat) = o.flat.as_ref() else {
+                let actual = diag(&case.a);
+                let Some((exp_flat, actual)) = ledger.slices(
+                    "diag",
+                    &case.case_id,
+                    o.flat.as_deref(),
+                    Some(actual.as_slice()),
+                ) else {
                     continue;
                 };
-                let actual = diag(&case.a);
-                if actual.len() != exp_flat.len() {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        max_abs_diff: f64::INFINITY,
-                        pass: false,
-                        note: format!("len mismatch: {} vs {}", actual.len(), exp_flat.len()),
-                    });
-                    continue;
-                }
                 let max_abs = actual
                     .iter()
                     .zip(exp_flat.iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max);
+                ledger.compared("diag", &case.case_id, max_abs <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -375,27 +376,21 @@ fn diff_linalg_basic_matrix_ops() {
                 });
             }
             "matvec" => {
-                let Some(exp_flat) = o.flat.as_ref() else {
+                let actual = matvec(&case.a, &case.vec_a).ok();
+                let Some((exp_flat, actual)) = ledger.slices(
+                    "matvec",
+                    &case.case_id,
+                    o.flat.as_deref(),
+                    actual.as_deref(),
+                ) else {
                     continue;
-                };
-                let actual = match matvec(&case.a, &case.vec_a) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            op: case.op.clone(),
-                            max_abs_diff: f64::INFINITY,
-                            pass: false,
-                            note: format!("error: {e:?}"),
-                        });
-                        continue;
-                    }
                 };
                 let max_abs = actual
                     .iter()
                     .zip(exp_flat.iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max);
+                ledger.compared("matvec", &case.case_id, max_abs <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -405,52 +400,44 @@ fn diff_linalg_basic_matrix_ops() {
                 });
             }
             op => {
-                let (Some(exp_rows), Some(exp_cols), Some(exp_data)) =
-                    (o.rows, o.cols, o.data.as_ref())
-                else {
-                    continue;
-                };
-                let actual_mat: Vec<Vec<f64>> = match op {
-                    "diagm" => diagm(&case.vec_a),
-                    "eye" => eye(case.n, case.m),
-                    "matmul" => match matmul(&case.a, &case.b) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            diffs.push(CaseDiff {
-                                case_id: case.case_id.clone(),
-                                op: case.op.clone(),
-                                max_abs_diff: f64::INFINITY,
-                                pass: false,
-                                note: format!("matmul error: {e:?}"),
-                            });
-                            continue;
-                        }
-                    },
-                    "outer" => outer(&case.vec_a, &case.vec_b),
+                let actual_mat: Option<Vec<Vec<f64>>> = match op {
+                    "diagm" => Some(diagm(&case.vec_a)),
+                    "eye" => Some(eye(case.n, case.m)),
+                    "matmul" => matmul(&case.a, &case.b).ok(),
+                    "outer" => Some(outer(&case.vec_a, &case.vec_b)),
                     other => panic!("unknown op {other}"),
                 };
-                let (rows, cols, flat) = flatten(&actual_mat);
-                if rows != exp_rows || cols != exp_cols {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        max_abs_diff: f64::INFINITY,
-                        pass: false,
-                        note: format!("shape mismatch: {rows}x{cols} vs {exp_rows}x{exp_cols}"),
-                    });
+                let actual = actual_mat.as_deref().map(flatten);
+                let Some((exp_data, flat)) = ledger.slices(
+                    op,
+                    &case.case_id,
+                    o.data.as_deref(),
+                    actual.as_ref().map(|(_, _, flat)| flat.as_slice()),
+                ) else {
                     continue;
-                }
-                let max_abs = flat
-                    .iter()
-                    .zip(exp_data.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max);
+                };
+                let (rows, cols) = actual.as_ref().map_or((0, 0), |(r, c, _)| (*r, *c));
+                let shape_ok = o.rows == Some(rows) && o.cols == Some(cols);
+                let max_abs = if shape_ok {
+                    flat.iter()
+                        .zip(exp_data.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f64, f64::max)
+                } else {
+                    f64::INFINITY
+                };
+                let pass = shape_ok && max_abs <= ABS_TOL;
+                ledger.compared(op, &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     max_abs_diff: max_abs,
-                    pass: max_abs <= ABS_TOL,
-                    note: String::new(),
+                    pass,
+                    note: if shape_ok {
+                        String::new()
+                    } else {
+                        format!("shape mismatch: {rows}x{cols} vs {:?}x{:?}", o.rows, o.cols)
+                    },
                 });
             }
         }
@@ -489,6 +476,7 @@ fn diff_linalg_basic_matrix_ops() {
         test_id: "diff_linalg_basic_matrix_ops".into(),
         category: "fsci_linalg::{diag, diagm, eye, matmul, matvec, outer} numpy parity".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -506,4 +494,10 @@ fn diff_linalg_basic_matrix_ops() {
     }
 
     assert!(all_pass, "matrix-ops parity failed: {} cases", diffs.len());
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
+    );
 }

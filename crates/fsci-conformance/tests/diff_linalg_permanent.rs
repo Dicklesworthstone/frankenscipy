@@ -7,13 +7,14 @@
 //! matrices, for both even and odd n ∈ {2, 3, 4, 5} (the odd-n Ryser
 //! doubled-sign-flip is fixed — frankenscipy-lsney).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::permanent;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -243,20 +245,21 @@ fn diff_linalg_permanent() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_linalg_permanent", &["permanent"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
+        let Some((expected, actual)) = ledger.pair(
+            "permanent",
+            &case.case_id,
+            scipy,
+            Some(permanent(&case.rows)),
+        ) else {
             continue;
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let actual = permanent(&case.rows);
-        if !actual.is_finite() {
-            continue;
-        }
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("permanent", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -270,6 +273,7 @@ fn diff_linalg_permanent() {
         test_id: "diff_linalg_permanent".into(),
         category: "fsci_linalg::permanent (Ryser) vs naive sum-over-permutations".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -290,4 +294,5 @@ fn diff_linalg_permanent() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

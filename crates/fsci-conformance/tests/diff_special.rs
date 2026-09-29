@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy orthogonal polynomial evaluators against SciPy's
 //! `scipy.special.eval_*` reference functions via a subprocess oracle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::orthopoly::{
     eval_chebyt, eval_chebyu, eval_gegenbauer, eval_genlaguerre, eval_hermite, eval_hermitenorm,
     eval_jacobi, eval_laguerre, eval_legendre,
@@ -21,6 +22,18 @@ const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-10;
 const REL_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per `scipy.special.eval_*` op in the orthopoly test.
+const ORTHOPOLY_ARMS: [&str; 9] = [
+    "eval_legendre",
+    "eval_chebyt",
+    "eval_chebyu",
+    "eval_laguerre",
+    "eval_hermite",
+    "eval_hermitenorm",
+    "eval_genlaguerre",
+    "eval_gegenbauer",
+    "eval_jacobi",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct SpecialCase {
@@ -60,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     tolerance_abs: f64,
@@ -311,14 +325,19 @@ fn diff_001_special_orthopoly_live_scipy() {
         &oracle_results,
     );
 
+    let mut ledger = CompareLedger::new("diff_001_special_orthopoly_live_scipy", &ORTHOPOLY_ARMS);
     let mut case_diffs = Vec::with_capacity(cases.len());
     for case in &cases {
-        let actual = rust_value(case).expect("supported special op");
-        let expected = oracle_results
+        let scipy = oracle_results
             .get(case.case_id.as_str())
-            .expect("complete oracle coverage")
-            .value;
+            .map(|result| result.value);
+        let Some((expected, actual)) =
+            ledger.pair(&case.op, &case.case_id, scipy, rust_value(case))
+        else {
+            continue;
+        };
         let (abs_diff, rel_diff, pass) = close_enough(actual, expected);
+        ledger.compared(&case.op, &case.case_id, pass);
         case_diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -349,6 +368,7 @@ fn diff_001_special_orthopoly_live_scipy() {
         test_id: String::from("diff_001_special_orthopoly_live_scipy"),
         category: String::from("live_scipy_differential"),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         max_rel_diff,
         tolerance_abs: ABS_TOL,
@@ -364,4 +384,12 @@ fn diff_001_special_orthopoly_live_scipy() {
         pass,
         "special orthopoly live SciPy diff max_abs={max_abs_diff:.3e} max_rel={max_rel_diff:.3e}"
     );
+    // Ops have different case sets (hermite and hermitenorm have the fewest); each must compare
+    // all of its own.
+    let min_per_arm = ORTHOPOLY_ARMS
+        .iter()
+        .map(|arm| cases.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ORTHOPOLY_ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

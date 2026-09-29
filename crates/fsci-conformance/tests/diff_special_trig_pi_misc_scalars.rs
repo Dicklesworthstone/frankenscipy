@@ -7,26 +7,43 @@
 //! scipy.special.{cospi, sinpi, tanpi} / numpy.{heaviside, frexp,
 //! isposinf, isneginf}. Tight 1e-15 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{cospi, frexp, heaviside, isneginf, isposinf, sinpi};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op the query generates (tanpi has no cases).
+const ARMS: [&str; 6] = [
+    "cospi",
+    "sinpi",
+    "heaviside",
+    "frexp",
+    "isposinf",
+    "isneginf",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
     case_id: String,
     op: String, // "cospi" | "sinpi" | "tanpi" | "heaviside" | "frexp" | "isposinf" | "isneginf"
+    /// Sent as a string: serde_json writes inf/NaN as null, and the isposinf/isneginf grid is
+    /// built around exactly those inputs. Python's `float()` reads "inf", "-inf" and "NaN".
+    #[serde(serialize_with = "f64_as_string")]
     x: f64,
     h0: f64,
+}
+
+fn f64_as_string<S: serde::Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{value:?}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -283,63 +301,65 @@ fn diff_special_trig_pi_misc_scalars() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_trig_pi_misc_scalars", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let abs_d = match case.op.as_str() {
-            "cospi" => {
-                let Some(expected) = arm.values.as_ref().and_then(|v| v.first().copied()) else {
+        let point = pmap.get(&case.case_id);
+        let arm = case.op.as_str();
+        let first_value = point
+            .and_then(|p| p.values.as_ref())
+            .and_then(|v| v.first().copied());
+        let abs_d = match arm {
+            "cospi" | "sinpi" | "heaviside" => {
+                let fsci = match arm {
+                    "cospi" => cospi(case.x),
+                    "sinpi" => sinpi(case.x),
+                    _ => heaviside(case.x, case.h0),
+                };
+                let Some((expected, actual)) =
+                    ledger.pair(arm, &case.case_id, first_value, Some(fsci))
+                else {
                     continue;
                 };
-                (cospi(case.x) - expected).abs()
-            }
-            "sinpi" => {
-                let Some(expected) = arm.values.as_ref().and_then(|v| v.first().copied()) else {
-                    continue;
-                };
-                (sinpi(case.x) - expected).abs()
-            }
-            "heaviside" => {
-                let Some(expected) = arm.values.as_ref().and_then(|v| v.first().copied()) else {
-                    continue;
-                };
-                (heaviside(case.x, case.h0) - expected).abs()
+                (actual - expected).abs()
             }
             "frexp" => {
-                let Some(values) = arm.values.as_ref() else {
+                let (m, e) = frexp(case.x);
+                let fsci_values = [m, f64::from(e)];
+                // slices rejects a short oracle row and a NaN mantissa the max below would swallow.
+                let Some((values, _)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    point.and_then(|p| p.values.as_deref()),
+                    Some(&fsci_values[..]),
+                ) else {
                     continue;
                 };
-                let (m, e) = frexp(case.x);
                 let exp_m = values[0];
                 let exp_e = values[1] as i32;
                 let dm = (m - exp_m).abs();
                 let de = if e == exp_e { 0.0 } else { 1.0 };
                 dm.max(de)
             }
-            "isposinf" => {
-                let Some(expected) = arm.boolean else {
+            "isposinf" | "isneginf" => {
+                let fsci = if arm == "isposinf" {
+                    isposinf(case.x)
+                } else {
+                    isneginf(case.x)
+                };
+                let Some((expected, actual)) = ledger.both(
+                    arm,
+                    &case.case_id,
+                    point.and_then(|p| p.boolean),
+                    Some(fsci),
+                ) else {
                     continue;
                 };
-                if isposinf(case.x) == expected {
-                    0.0
-                } else {
-                    1.0
-                }
+                if actual == expected { 0.0 } else { 1.0 }
             }
-            "isneginf" => {
-                let Some(expected) = arm.boolean else {
-                    continue;
-                };
-                if isneginf(case.x) == expected {
-                    0.0
-                } else {
-                    1.0
-                }
-            }
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
         };
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -357,6 +377,7 @@ fn diff_special_trig_pi_misc_scalars() {
             "fsci_special::{cospi, sinpi, tanpi, heaviside, frexp, isposinf, isneginf} vs scipy/numpy"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -377,4 +398,12 @@ fn diff_special_trig_pi_misc_scalars() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (isposinf/isneginf have the fewest); each must compare all
+    // of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

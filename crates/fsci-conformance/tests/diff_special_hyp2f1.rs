@@ -10,18 +10,19 @@
 //! z<0 and 0<z<1 series regimes; near-z=1 and |z|>1 are tested
 //! separately.
 //!
-//! 24 finite-valued (a, b, c, z) cases plus 4 real branch-cut
+//! 33 finite-valued (a, b, c, z) cases plus 4 real branch-cut
 //! cases via subprocess. Tolerances: 5e-7 rel — same as hyp1f1;
 //! Gauss hypergeometric is wide-tolerance coverage, not a
 //! precision claim.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::hyp2f1;
 use fsci_special::types::SpecialTensor;
@@ -86,6 +87,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -141,7 +143,7 @@ fn generate_query() -> OracleQuery {
     //   ₂F₁(1, 1, 2, z) = -ln(1-z)/z
     //   ₂F₁(0.5, 0.5, 1, z) = (2/π)·K(z) (related to ellipk)
     //   ₂F₁(1, 1, 3/2, z²) = arcsin(z)/(z√(1-z²))
-    let cases: [(f64, f64, f64, f64); 24] = [
+    let cases: &[(f64, f64, f64, f64)] = &[
         // Identity: -ln(1-z)/z
         (1.0, 1.0, 2.0, 0.5),
         (1.0, 1.0, 2.0, -0.5),
@@ -165,10 +167,7 @@ fn generate_query() -> OracleQuery {
         // Small z
         (1.5, 2.5, 3.5, 0.001),
         (2.0, 4.0, 6.0, 1.0e-6),
-        // Negative-only z (faster series convergence). Stop
-        // short of -1 because fsci's hyp2f1 series returns NaN
-        // for |z| ≥ 0.99 in some (a, b, c) regimes — likely a
-        // truncation-vs-Pfaff-transformation seam.
+        // Negative z.
         (1.0, 2.0, 3.0, -0.9),
         (0.5, 1.5, 2.5, -0.5),
         // ₂F₁(a, b, b, z) = (1-z)^(-a)
@@ -177,6 +176,17 @@ fn generate_query() -> OracleQuery {
         // Misc
         (1.0, 0.5, 1.5, -0.3),
         (2.5, 1.5, 4.0, 0.2),
+        // |z| near and at 1, and z < −1. These were left out because fsci's series returned
+        // NaN for |z| ≥ 0.99 in some regimes.
+        (1.0, 2.0, 3.0, -0.99),
+        (1.0, 2.0, 3.0, -0.999),
+        (1.0, 2.0, 3.0, -1.0),
+        (0.5, 1.5, 2.5, -0.995),
+        (1.5, 2.5, 3.0, -0.99),
+        (0.5, 0.5, 1.0, 0.99),
+        (1.0, 1.0, 2.0, 0.999),
+        (2.0, 3.0, 4.0, -5.0),
+        (0.3, 0.7, 1.5, -3.0),
     ];
     let mut points = Vec::new();
     for (i, &(a, b, c, z)) in cases.iter().enumerate() {
@@ -325,37 +335,53 @@ fn diff_special_hyp2f1() {
     let mut branch_cut_diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_hyp2f1", &["hyp2f1", "branch_cut"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.a, case.b, case.c, case.z)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass: abs_diff <= TOL_REL * scale,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "hyp2f1",
+            &case.case_id,
+            oracle.value,
+            fsci_eval(case.a, case.b, case.c, case.z),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        ledger.compared("hyp2f1", &case.case_id, abs_diff <= TOL_REL * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass: abs_diff <= TOL_REL * scale,
+        });
     }
 
     for case in &query.branch_cut_points {
         let oracle = branch_cut_map
             .get(&case.case_id)
             .expect("validated branch-cut oracle");
-        let rust_positive_infinity = fsci_eval(case.a, case.b, case.c, case.z)
-            .is_some_and(|v| v.is_infinite() && v.is_sign_positive());
+        // The oracle always reports a bool (a raise reads as `false`, which fails the case);
+        // a strict-mode fsci error is recorded as an fsci failure.
+        let Some((scipy_positive_infinity, rust_v)) = ledger.both(
+            "branch_cut",
+            &case.case_id,
+            Some(oracle.positive_infinity),
+            fsci_eval(case.a, case.b, case.c, case.z),
+        ) else {
+            continue;
+        };
+        let rust_positive_infinity = rust_v.is_infinite() && rust_v.is_sign_positive();
         let hardened_error = fsci_hardened_errors(case.a, case.b, case.c, case.z);
-        let pass = oracle.positive_infinity && rust_positive_infinity && hardened_error;
+        let pass = scipy_positive_infinity && rust_positive_infinity && hardened_error;
+        ledger.compared("branch_cut", &case.case_id, pass);
         branch_cut_diffs.push(BranchCutDiff {
             case_id: case.case_id.clone(),
-            scipy_positive_infinity: oracle.positive_infinity,
+            scipy_positive_infinity,
             rust_positive_infinity,
             hardened_error,
             pass,
@@ -368,6 +394,7 @@ fn diff_special_hyp2f1() {
         test_id: "diff_special_hyp2f1".into(),
         category: "scipy.special.hyp2f1".into(),
         case_count: diffs.len() + branch_cut_diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -403,4 +430,7 @@ fn diff_special_hyp2f1() {
         max_abs_overall,
         max_rel_overall
     );
+    // The two arms have separate case lists (branch_cut has the fewest); each must compare all
+    // of its own.
+    ledger.finish(query.points.len().min(query.branch_cut_points.len()));
 }

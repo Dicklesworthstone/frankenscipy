@@ -13,12 +13,14 @@
 //! both fsci and scipy use iterative root-finders; the absolute
 //! parameter value can drift more than the CDF it solves for.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{btdtr, btdtria, btdtrib, fdtr, fdtridfd};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const REL_TOL: f64 = 1.0e-4;
 const ROUND_TRIP_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 3] = ["btdtria", "btdtrib", "fdtridfd"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CasePoint {
@@ -71,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -244,18 +249,18 @@ fn diff_special_btdtria_btdtrib_fdtridfd() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_special_btdtria_btdtrib_fdtridfd", &ARMS);
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let Some(expected) = o.value else {
-            continue;
-        };
-
-        let actual = match c.func.as_str() {
+        let fsci = match c.func.as_str() {
             "btdtria" => btdtria(c.arg1, c.arg2, c.arg3),
             "btdtrib" => btdtrib(c.arg1, c.arg2, c.arg3),
             "fdtridfd" => fdtridfd(c.arg1, c.arg2, c.arg3),
             other => panic!("unknown func {other}"),
+        };
+        let Some((expected, actual)) = ledger.pair(&c.func, &c.case_id, o.value, Some(fsci)) else {
+            continue;
         };
 
         // Round-trip residual
@@ -284,6 +289,7 @@ fn diff_special_btdtria_btdtrib_fdtridfd() {
         // (Iterative inverse solvers in scipy use CDFlib; tiny differences
         // in the parameter are OK if the inverted CDF lands on the right p.)
         let pass = rel_diff <= REL_TOL || round_trip_err <= ROUND_TRIP_TOL;
+        ledger.compared(&c.func, &c.case_id, pass);
         diffs.push(CaseDiff {
             case_id: c.case_id.clone(),
             func: c.func.clone(),
@@ -300,6 +306,7 @@ fn diff_special_btdtria_btdtrib_fdtridfd() {
         test_id: "diff_special_btdtria_btdtrib_fdtridfd".into(),
         category: "scipy.special inverse-of-shape-parameter solvers".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -321,4 +328,11 @@ fn diff_special_btdtria_btdtrib_fdtridfd() {
         "btdtria/btdtrib/fdtridfd parity failed: {} cases",
         diffs.len()
     );
+    // Arms have different case sets (fdtridfd has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

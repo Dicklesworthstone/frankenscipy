@@ -6,13 +6,14 @@
 //! zeros (a row's max/min considers the implicit 0s mixed in with
 //! stored nonzeros). 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, Shape2D, sparse_row_max, sparse_row_min};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -207,14 +209,31 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse row_max_min oracle JSON"))
 }
 
+/// Callers pass slices `CompareLedger::slices` accepted, so the lengths agree.
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f64, f64::max)
+}
+
+fn fsci_row_extreme(case: &Case) -> Option<Vec<f64>> {
+    let mut data = Vec::new();
+    let mut rs = Vec::new();
+    let mut cs = Vec::new();
+    for &(r, c, v) in &case.triplets {
+        data.push(v);
+        rs.push(r);
+        cs.push(c);
+    }
+    let coo =
+        CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    match case.op.as_str() {
+        "max" => Some(sparse_row_max(&csr)),
+        "min" => Some(sparse_row_min(&csr)),
+        _ => None,
+    }
 }
 
 #[test]
@@ -233,37 +252,24 @@ fn diff_sparse_row_max_min() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_row_max_min", &["max", "min"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy_values = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let fsci_values = fsci_row_extreme(case);
+        let Some((expected, result)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_values,
+            fsci_values.as_deref(),
+        ) else {
             continue;
         };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let mut data = Vec::new();
-        let mut rs = Vec::new();
-        let mut cs = Vec::new();
-        for &(r, c, v) in &case.triplets {
-            data.push(v);
-            rs.push(r);
-            cs.push(c);
-        }
-        let Ok(coo) =
-            CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true)
-        else {
-            continue;
-        };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let result = match case.op.as_str() {
-            "max" => sparse_row_max(&csr),
-            "min" => sparse_row_min(&csr),
-            _ => continue,
-        };
-        let abs_d = vec_max_diff(&result, expected);
+        let abs_d = vec_max_diff(result, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -279,6 +285,7 @@ fn diff_sparse_row_max_min() {
         category: "fsci_sparse::{sparse_row_max, sparse_row_min} vs scipy.sparse {max,min}(axis=1)"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +306,10 @@ fn diff_sparse_row_max_min() {
         diffs.len(),
         max_overall
     );
+    let per_op = ["max", "min"]
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_op);
 }

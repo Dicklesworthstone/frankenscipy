@@ -19,6 +19,7 @@
 pub mod audit;
 pub mod construct;
 pub mod formats;
+#[cfg(feature = "npz")]
 pub mod io;
 pub mod linalg;
 pub mod ops;
@@ -40,18 +41,17 @@ pub use formats::{
     SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec,
     get_index_dtype, safely_cast_index_arrays,
 };
+#[cfg(feature = "npz")]
 pub use io::{
     NpzWritable, SparseMatrixOutput, SparseNpz, load_npz, load_npz_from_reader, save_npz,
     save_npz_to_writer,
 };
 
-/// Base warning class for sparse matrix operations, matching `scipy.sparse.SparseWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparseWarning(pub String);
-
-/// Warning emitted for potentially inefficient sparse operations, matching `scipy.sparse.SparseEfficiencyWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparseEfficiencyWarning(pub String);
+// `scipy.sparse.SparseWarning` and `SparseEfficiencyWarning` are not applicable: SciPy raises
+// the latter when a CSR/CSC structure is changed element by element or a solver is handed a
+// format it must convert, and the typed API here has no CSR/CSC element insertion and takes
+// solver inputs in the format they need. Structs of those names that nothing raised used to
+// be counted as covered (frankenscipy-8dndw.1).
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
 // `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API
@@ -92,14 +92,22 @@ pub use linalg::{
     CaspMatvecCost,
     CaspPortfolioSolveResult,
     ConnectedComponentsResult,
+    Connection,
     EigsOptions,
     EigsResult,
+    EigsWhich,
     ExpmOptions,
+    IluDropRule,
     IluOptions,
+    IluStatistics,
     IterativeSolveOptions,
     IterativeSolveResult,
     LgmresOptions,
     LuOptions,
+    MaskedGraph,
+    MatchingPermType,
+    MaximumFlowMethod,
+    MaximumFlowResult,
     MstResult,
     PerfToggle,
     PermutationOrdering,
@@ -147,6 +155,7 @@ pub use linalg::{
     SparseIluFactorization,
     SparseLuFactorization,
     SvdsResult,
+    YenResult,
     average_clustering,
     bellman_ford,
     // Graph algorithms
@@ -154,7 +163,9 @@ pub use linalg::{
     betweenness_centrality,
     bicg,
     bicgstab,
+    bicgstab_preconditioned,
     breadth_first_order,
+    breadth_first_tree,
     casp_iterative_solve,
     casp_iterative_solve_with_audit,
     // Iterative solvers
@@ -164,8 +175,15 @@ pub use linalg::{
     clustering_coefficient,
     connected_component_sizes,
     connected_components,
+    construct_dist_matrix,
+    csgraph_from_dense,
+    csgraph_from_masked,
+    csgraph_masked_from_dense,
+    csgraph_to_dense,
+    csgraph_to_masked,
     degree_sequence,
     depth_first_order,
+    depth_first_tree,
     dijkstra,
     dijkstra_all_pairs,
     dijkstra_multi_source,
@@ -178,6 +196,7 @@ pub use linalg::{
     floyd_warshall,
     gmres,
     gmres_batch,
+    gmres_preconditioned,
     graph_diameter,
     is_connected,
     is_sptriangular,
@@ -192,6 +211,9 @@ pub use linalg::{
     lsqr_damped,
     lsqr_regularized,
     matrix_power,
+    maximum_bipartite_matching,
+    maximum_flow,
+    min_weight_full_bipartite_matching,
     minimum_spanning_tree,
     minres,
     onenormest,
@@ -199,6 +221,7 @@ pub use linalg::{
     pcg,
     qmr,
     qmr_batch,
+    reconstruct_path,
     reverse_cuthill_mckee,
     select_casp_iterative_solver,
     shortest_path,
@@ -244,6 +267,7 @@ pub use linalg::{
     svds,
     tfqmr,
     topological_sort,
+    yen,
 };
 pub use ops::{
     ConversionLogEntry, FormatConvertible, add_coo, add_csc, add_csr, coo_to_csr_with_mode,
@@ -2406,11 +2430,11 @@ mod tests {
         serde_json::from_str(&encoded).expect("log json parse")
     }
 
-    // ── ILU(0) preconditioner tests ─────────────────────────────────
+    // ── spilu (ILUTP) preconditioner tests ──────────────────────────
 
     #[test]
     fn spilu_diagonal_matrix() {
-        // ILU(0) of a diagonal matrix should give L=I, U=diag
+        // The incomplete LU of a diagonal matrix is L=I, U=diag
         let coo = CooMatrix::from_triplets(
             Shape2D::new(3, 3),
             vec![2.0, 5.0, 3.0],
@@ -2457,7 +2481,7 @@ mod tests {
         let csc = coo.to_csc().expect("coo->csc");
         let ilu = spilu(&csc, IluOptions::default()).expect("spilu tridiagonal");
 
-        // For a tridiagonal matrix, ILU(0) = exact LU (no fill-in discarded)
+        // A tridiagonal matrix has no fill to drop, so the incomplete LU is exact
         let b = vec![1.0; n];
         let x = ilu.solve(&b).expect("ilu solve");
 
@@ -2477,7 +2501,7 @@ mod tests {
     #[test]
     fn spilu_as_preconditioner_for_cg() {
         // Use ILU as preconditioner: solve M^-1 * A * x = M^-1 * b
-        // where M = LU from ILU(0)
+        // where M = LU from spilu
         let n = 4;
         // SPD matrix: diag(10, 10, 10, 10) + off-diag(-1)
         let mut rows = Vec::new();
@@ -2566,7 +2590,7 @@ mod tests {
         let csr = coo.to_csr().expect("csr");
         let csc = coo.to_csc().expect("csc");
 
-        // Build ILU(0) preconditioner
+        // Build the spilu preconditioner
         let ilu = spilu(&csc, IluOptions::default()).expect("ilu");
 
         let b: Vec<f64> = (0..n).map(|i| (i + 1) as f64).collect();
@@ -2911,6 +2935,90 @@ mod tests {
         }
     }
 
+    /// frankenscipy-szq1n.4: `backend_used` names the arm that produced x. Before, the banded
+    /// Cholesky and banded LU arms said NativeSparseLu, the dense LU said Auto, and the CASP
+    /// wrapper said Auto for every iterative choice even when its direct fallback had solved.
+    #[test]
+    fn backend_used_names_the_arm_that_produced_x() {
+        use fsci_runtime::SparseSolverAction;
+        // Tridiagonal (diag, below, above), plus an optional symmetric coupling at distance
+        // `far` that widens the band past the banded arms' 128 limit.
+        fn matrix(n: usize, diag: f64, below: f64, above: f64, far: Option<usize>) -> CsrMatrix {
+            let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                rows.push(i);
+                cols.push(i);
+                data.push(diag);
+                if i > 0 {
+                    rows.extend([i, i - 1]);
+                    cols.extend([i - 1, i]);
+                    data.extend([below, above]);
+                }
+                if let Some(d) = far
+                    && i + d < n
+                {
+                    rows.extend([i, i + d]);
+                    cols.extend([i + d, i]);
+                    data.extend([-0.5, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        }
+        let arm = |a: &CsrMatrix| {
+            let b = vec![1.0; a.shape().rows];
+            let res = spsolve(a, &b, SolveOptions::default()).expect("spsolve");
+            let ax = spmv_csr(a, &res.solution).unwrap();
+            let worst = ax
+                .iter()
+                .zip(&b)
+                .map(|(l, r)| (l - r).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-10, "{:?}: |Ax - b| = {worst}", res.backend_used);
+            res.backend_used
+        };
+        assert_eq!(
+            arm(&matrix(50, 4.0, -1.0, -1.0, None)),
+            SparseBackend::DenseLu
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -1.0, None)),
+            SparseBackend::BandedCholesky
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -2.0, None)),
+            SparseBackend::BandedLu
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -1.0, Some(200))),
+            SparseBackend::NativeSparseLu
+        );
+
+        // CASP: a converged iterate reports its method; the direct fallback reports the arm
+        // the fallback ran.
+        let a = matrix(100, 2.0, -1.0, -1.0, None);
+        let b = vec![1.0; 100];
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = spsolve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio)
+            .expect("spsolve_with_casp");
+        assert!(
+            matches!(res.backend_used, SparseBackend::Iterative(action) if action != SparseSolverAction::SuperLU),
+            "{:?}",
+            res.backend_used
+        );
+        let starved = IterativeSolveOptions {
+            max_iter: Some(3),
+            ..IterativeSolveOptions::default()
+        };
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = solve_with_casp_portfolio(&a, &b, None, &mut portfolio, starved)
+            .expect("portfolio solve");
+        assert!(res.fallback_active);
+        assert_eq!(res.direct_backend, Some(SparseBackend::DenseLu));
+    }
+
     #[test]
     fn test_spsolve_with_casp_spd_system() {
         let n = 5;
@@ -2968,7 +3076,9 @@ mod tests {
             .expect("spsolve_with_casp");
 
         assert_eq!(res.solution.len(), n);
-        assert_eq!(res.backend_used, SparseBackend::NativeSparseLu);
+        // The direct action's spsolve factors a 4x4 system densely, and says so
+        // (frankenscipy-szq1n.4; it used to report NativeSparseLu for every direct choice).
+        assert_eq!(res.backend_used, SparseBackend::DenseLu);
         assert_eq!(portfolio.evidence_len(), 1);
     }
 

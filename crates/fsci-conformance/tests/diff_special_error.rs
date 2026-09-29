@@ -8,17 +8,17 @@
 //! × 2 (erf, erfc) plus q-grids for erfinv (in (-1,1)) and
 //! erfcinv (in (0,2)) = ~50 cases via subprocess.
 //!
-//! Tolerances: 1e-13 abs for erf/erfc, 1e-9 rel for erfinv/
-//! erfcinv (the rational-approximation floor is wider than the
-//! canonical erf/erfc kernel).
+//! Tolerances: 1e-13 abs for erf/erfc, 1e-15 relative for erfinv
+//! (bit-identical Boost erf_inv), 5e-9 scaled for erfcinv.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{erf, erfc, erfcinv, erfinv};
@@ -26,10 +26,17 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ERF_TOL: f64 = 1.0e-13;
+// erfinv is Boost's erf_inv, as SciPy's is, and matches it bit for bit. This is a TRUE
+// relative tolerance, a few ulp, for a libm log that rounds differently. It used to be an
+// absolute 5e-9 below |value| 1, which could not see erfinv's 8.3e-8 relative error at
+// q = 1e-10 (frankenscipy-pi4e0).
+const ERFINV_TOL_REL: f64 = 1.0e-15;
 // erfcinv lands ~1.1e-9 rel at q=0.01/q=1.99 (rational approx
 // floor); 5e-9 absorbs with margin.
-const ERFINV_TOL_REL: f64 = 5.0e-9;
+const ERFCINV_TOL_REL: f64 = 5.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function.
+const ARMS: [&str; 4] = ["erf", "erfc", "erfinv", "erfcinv"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -68,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -117,9 +125,29 @@ fn generate_query() -> OracleQuery {
     let xs_erf = [
         -8.0_f64, -3.0, -1.5, -0.5, -0.1, 0.0, 0.1, 0.5, 1.5, 3.0, 5.0, 8.0,
     ];
-    // erfinv: q in (-1, 1).
+    // erfinv: q in (-1, 1). The small |q| are where an erfinv built on ndtri((q + 1) / 2)
+    // loses digits (8.3e-8 relative at 1e-10); 0.75 and 0.9999 sit in Boost's middle and
+    // first tail band, 1 - 1e-15 in its last reachable one.
     let qs_erfinv = [
-        -0.999_f64, -0.99, -0.9, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9, 0.99, 0.999,
+        -0.999_f64,
+        -0.99,
+        -0.9,
+        -0.5,
+        -0.1,
+        0.0,
+        0.1,
+        0.5,
+        0.9,
+        0.99,
+        0.999,
+        1.0e-30,
+        -1.0e-10,
+        1.0e-6,
+        -3.0e-4,
+        0.01,
+        0.75,
+        -0.9999,
+        0.999_999_999_999_999,
     ];
     // erfcinv: q in (0, 2).
     let qs_erfcinv = [
@@ -263,37 +291,45 @@ fn diff_special_error() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_error", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let rel_diff = if scipy_v.abs() > 1.0 {
-                abs_diff / scipy_v.abs()
-            } else {
-                abs_diff
-            };
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let rel_diff = if scipy_v.abs() > 1.0 {
+            abs_diff / scipy_v.abs()
+        } else {
+            abs_diff
+        };
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
 
-            let pass = match case.func.as_str() {
-                "erf" | "erfc" => abs_diff <= ERF_TOL,
-                "erfinv" | "erfcinv" => {
-                    let scale = scipy_v.abs().max(1.0);
-                    abs_diff <= ERFINV_TOL_REL * scale
-                }
-                _ => false,
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let pass = match arm {
+            "erf" | "erfc" => abs_diff <= ERF_TOL,
+            "erfinv" => abs_diff <= ERFINV_TOL_REL * scipy_v.abs(),
+            "erfcinv" => {
+                let scale = scipy_v.abs().max(1.0);
+                abs_diff <= ERFCINV_TOL_REL * scale
+            }
+            _ => false,
+        };
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -302,6 +338,7 @@ fn diff_special_error() {
         test_id: "diff_special_error".into(),
         category: "scipy.special.erf/erfc/erfinv/erfcinv".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -328,4 +365,12 @@ fn diff_special_error() {
         max_abs_overall,
         max_rel_overall
     );
+    // Arms have different case sets (erfinv/erfcinv have the fewest); each must compare all of
+    // its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

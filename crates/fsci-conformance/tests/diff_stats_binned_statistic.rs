@@ -13,13 +13,14 @@
 //! subprocess. Tol 1e-12 abs (closed-form bin assignment +
 //! per-bin reduce).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::binned_statistic;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -244,72 +246,57 @@ fn diff_stats_binned_statistic() {
     };
     assert_eq!(oracle.points.len(), query.points.len());
 
-    let pmap: HashMap<String, Option<PointArm>> = oracle
+    let pmap: HashMap<String, PointArm> = oracle
         .points
         .into_iter()
-        .map(|r| (r.case_id.clone(), Some(r)))
+        .map(|r| (r.case_id.clone(), r))
         .collect();
 
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_binned_statistic", &["stats_max", "edges_max"]);
 
     for case in &query.points {
-        let scipy_arm = match pmap.get(&case.case_id) {
-            Some(Some(a)) => a,
-            _ => continue,
-        };
+        let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_stats, rust_edges) =
             binned_statistic(&case.x, &case.values, case.bins as usize, &case.statistic);
 
-        // stats vector: scipy nests `null` in JSON for empty bins (NaN
-        // in numpy); fsci returns NaN. Compare per-element only when
-        // both are finite-or-both-NaN.
-        if let Some(scipy_stats) = &scipy_arm.stats
-            && rust_stats.len() == scipy_stats.len()
-        {
+        // stats vector: the oracle nests `null` in JSON only for SciPy's NaN
+        // (an empty bin); fsci returns NaN there. Decoded back to NaN, the
+        // ledger requires fsci's NaN at exactly those bins.
+        let scipy_stats: Option<Vec<f64>> = scipy_arm
+            .stats
+            .as_ref()
+            .map(|v| v.iter().map(|b| b.unwrap_or(f64::NAN)).collect());
+        let arms = [
+            (
+                "stats_max",
+                scipy_stats.as_deref(),
+                Some(rust_stats.as_slice()),
+            ),
+            (
+                "edges_max",
+                scipy_arm.bin_edges.as_deref(),
+                Some(rust_edges.as_slice()),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
             let mut max_local = 0.0_f64;
-            let mut shape_ok = true;
-            for (a, b_opt) in rust_stats.iter().zip(scipy_stats.iter()) {
-                match (a.is_finite(), b_opt) {
-                    (true, Some(b)) => {
-                        max_local = max_local.max((a - b).abs());
-                    }
-                    (false, None) => {
-                        // Both NaN/empty-bin; OK.
-                    }
-                    _ => {
-                        shape_ok = false;
-                        break;
-                    }
-                }
-            }
-            if shape_ok {
-                max_overall = max_overall.max(max_local);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    statistic: case.statistic.clone(),
-                    arm: "stats_max".into(),
-                    abs_diff: max_local,
-                    pass: max_local <= ABS_TOL,
-                });
-            }
-        }
-
-        if let Some(scipy_edges) = &scipy_arm.bin_edges
-            && rust_edges.len() == scipy_edges.len()
-        {
-            let mut max_local = 0.0_f64;
-            for (a, b) in rust_edges.iter().zip(scipy_edges.iter()) {
-                if a.is_finite() {
+            for (a, b) in f.iter().zip(s.iter()) {
+                if b.is_finite() {
                     max_local = max_local.max((a - b).abs());
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(arm, &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 statistic: case.statistic.clone(),
-                arm: "edges_max".into(),
+                arm: arm.into(),
                 abs_diff: max_local,
                 pass: max_local <= ABS_TOL,
             });
@@ -322,6 +309,7 @@ fn diff_stats_binned_statistic() {
         test_id: "diff_stats_binned_statistic".into(),
         category: "scipy.stats.binned_statistic".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -346,4 +334,5 @@ fn diff_stats_binned_statistic() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

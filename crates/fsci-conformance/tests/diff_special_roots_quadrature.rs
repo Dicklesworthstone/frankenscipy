@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-9r4on]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{
     roots_chebyt, roots_hermite, roots_hermitenorm, roots_laguerre, roots_legendre,
 };
@@ -20,6 +21,14 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per family; each case checks both the nodes and the weights.
+const ARMS: [&str; 5] = [
+    "roots_legendre",
+    "roots_chebyt",
+    "roots_hermite",
+    "roots_hermitenorm",
+    "roots_laguerre",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -58,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -225,45 +235,50 @@ fn diff_special_roots_quadrature() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_roots_quadrature", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(nodes_exp) = scipy_arm.nodes.as_ref() else {
-            continue;
-        };
-        let Some(weights_exp) = scipy_arm.weights.as_ref() else {
-            continue;
-        };
-        let (n_raw, w_raw) = match case.family.as_str() {
+        let arm = case.family.as_str();
+        let (n_raw, w_raw) = match arm {
             "roots_legendre" => roots_legendre(case.n),
             "roots_chebyt" => roots_chebyt(case.n),
             "roots_hermite" => roots_hermite(case.n),
             "roots_hermitenorm" => roots_hermitenorm(case.n),
             "roots_laguerre" => roots_laguerre(case.n),
-            _ => continue,
+            other => panic!("unknown family {other} in {}", case.case_id),
         };
         let (nodes, weights) = sort_pairs(n_raw, w_raw);
-        if nodes.len() != nodes_exp.len() || weights.len() != weights_exp.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: case.family.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        // One outcome per case: the weights are checked only once the nodes line up.
+        let Some((nodes_exp, nodes_got)) = ledger.slices(
+            arm,
+            &case.case_id,
+            scipy_arm.nodes.as_deref(),
+            Some(nodes.as_slice()),
+        ) else {
             continue;
-        }
-        let d_nodes = nodes
+        };
+        let Some((weights_exp, weights_got)) = ledger.slices(
+            arm,
+            &case.case_id,
+            scipy_arm.weights.as_deref(),
+            Some(weights.as_slice()),
+        ) else {
+            continue;
+        };
+        let d_nodes = nodes_got
             .iter()
             .zip(nodes_exp.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        let d_weights = weights
+        let d_weights = weights_got
             .iter()
             .zip(weights_exp.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         let abs_d = d_nodes.max(d_weights);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             family: case.family.clone(),
@@ -278,6 +293,7 @@ fn diff_special_roots_quadrature() {
         test_id: "diff_special_roots_quadrature".into(),
         category: "scipy.special.roots_* (Gauss-quadrature nodes & weights)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -301,4 +317,11 @@ fn diff_special_roots_quadrature() {
         diffs.len(),
         max_overall
     );
+    // Each family must compare all of its own degrees.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.family == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

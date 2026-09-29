@@ -6,13 +6,14 @@
 //!
 //! Resolves [frankenscipy-i4e4c]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{
     CorrelationMode, autocorrelation, correlation_lags, spectral_bandwidth, spectral_centroid,
     spectral_rolloff,
@@ -92,6 +93,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -387,17 +389,29 @@ fn diff_signal_corr_spectral_helpers() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_corr_spectral_helpers",
+        &[
+            "correlation_lags",
+            "autocorrelation",
+            "centroid",
+            "bandwidth",
+            "rolloff",
+        ],
+    );
 
     // correlation_lags
     for case in &query.lags {
         let scipy_arm = lags_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let lags = mode_of(&case.mode).map(|mode| correlation_lags(case.in1, case.in2, mode));
+        let Some((expected, lags)) = ledger.both(
+            "correlation_lags",
+            &case.case_id,
+            scipy_arm.values.as_ref(),
+            lags.as_ref(),
+        ) else {
             continue;
         };
-        let Some(mode) = mode_of(&case.mode) else {
-            continue;
-        };
-        let lags = correlation_lags(case.in1, case.in2, mode);
         let abs_d = if lags.len() != expected.len() {
             f64::INFINITY
         } else {
@@ -407,6 +421,7 @@ fn diff_signal_corr_spectral_helpers() {
                 .fold(0.0_f64, f64::max)
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("correlation_lags", &case.case_id, abs_d == 0.0);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "correlation_lags".into(),
@@ -418,19 +433,22 @@ fn diff_signal_corr_spectral_helpers() {
     // autocorrelation
     for case in &query.autoc {
         let scipy_arm = autoc_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let auto = autocorrelation(&case.x, case.max_lag);
+        let Some((expected, auto)) = ledger.slices(
+            "autocorrelation",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(auto.as_slice()),
+        ) else {
             continue;
         };
-        let auto = autocorrelation(&case.x, case.max_lag);
-        let abs_d = if auto.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            auto.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = auto
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("autocorrelation", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "autocorrelation".into(),
@@ -442,17 +460,24 @@ fn diff_signal_corr_spectral_helpers() {
     // spectral
     for case in &query.spectral {
         let scipy_arm = spectral_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
-            "centroid" => spectral_centroid(&case.magnitudes, &case.freqs),
-            "bandwidth" => spectral_bandwidth(&case.magnitudes, &case.freqs),
-            "rolloff" => spectral_rolloff(&case.magnitudes, &case.freqs, case.rolloff_pct),
-            _ => continue,
+            "centroid" => Some(spectral_centroid(&case.magnitudes, &case.freqs)),
+            "bandwidth" => Some(spectral_bandwidth(&case.magnitudes, &case.freqs)),
+            "rolloff" => Some(spectral_rolloff(
+                &case.magnitudes,
+                &case.freqs,
+                case.rolloff_pct,
+            )),
+            _ => None,
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -467,6 +492,7 @@ fn diff_signal_corr_spectral_helpers() {
         test_id: "diff_signal_corr_spectral_helpers".into(),
         category: "fsci_signal correlation_lags + spectral helpers".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -486,5 +512,15 @@ fn diff_signal_corr_spectral_helpers() {
         "corr_spectral_helpers conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let per_op = |op: &str| query.spectral.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        query
+            .lags
+            .len()
+            .min(query.autoc.len())
+            .min(per_op("centroid"))
+            .min(per_op("bandwidth"))
+            .min(per_op("rolloff")),
     );
 }

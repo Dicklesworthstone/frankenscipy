@@ -3251,7 +3251,9 @@ fn result_from_error(
         }
         OptError::SignChangeRequired { detail } => (ConvergenceStatus::InvalidInput, detail),
         OptError::NotImplemented { detail } => (ConvergenceStatus::NotImplemented, detail),
-        OptError::NotConverged { detail } => (ConvergenceStatus::MaxIterations, detail),
+        OptError::NotConverged { detail } | OptError::NoConvergence { detail } => {
+            (ConvergenceStatus::MaxIterations, detail)
+        }
     };
     OptimizeResult {
         x: x.to_vec(),
@@ -4381,11 +4383,19 @@ where
             .filter(|(c, _)| c.kind == ConstraintType::Eq)
             .map(|(_, &s)| s)
             .sum();
+        // NaN-propagating: `(-v).max(0.0)` and `f64::max` both drop a NaN, which reported a
+        // constraint that had gone NaN as maxcv 0.
         values
             .iter()
             .enumerate()
-            .map(|(i, &v)| if i < meq { v.abs() } else { (-v).max(0.0) })
-            .fold(0.0, f64::max)
+            .map(|(i, &v)| if i < meq { v.abs() } else { -v })
+            .fold(0.0, |worst: f64, v| {
+                if worst.is_nan() || v.is_nan() {
+                    f64::NAN
+                } else {
+                    worst.max(v)
+                }
+            })
     }
 }
 
@@ -7260,6 +7270,40 @@ mod tests {
         assert!(fd.x.iter().all(|v| v.abs() < 1e-6), "x={:?}", fd.x);
     }
 
+    /// Without `gradient`, fsci differences the objective as SciPy's
+    /// `approx_derivative(f, x, '2-point', abs_step=√ε)` does. SciPy's Newton-CG refuses to run
+    /// without `jac`, but given that same gradient explicitly (`jac=lambda x:
+    /// approx_derivative(...)`), SciPy 1.17.1 on sum(x²) at default options reports:
+    /// - from (2, −1): precision loss (status 2) after 1 iteration, njev 17, at x = (0, 0)
+    ///   exactly. The line search cannot decrease f = 0, so success = false is SciPy's verdict
+    ///   too (frankenscipy-fd4wz);
+    /// - from (2, −3): success after 4 iterations, njev 9, at
+    ///   x = (−7.450623592173823e-9, −7.450516104046771e-9).
+    ///
+    /// fsci's nfev also counts the differencing evaluations, which SciPy's jac hides, so it is not
+    /// compared.
+    #[test]
+    fn newton_cg_fd_gradient_follows_scipy_on_the_sphere() {
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::NewtonCg),
+            ..MinimizeOptions::default()
+        };
+        let stalled = minimize(sphere, &[2.0, -1.0], options).expect("minimize");
+        assert!(!stalled.success, "{}", stalled.message);
+        assert_eq!(stalled.status, ConvergenceStatus::PrecisionLoss);
+        assert_eq!((stalled.nit, stalled.njev, stalled.nhev), (1, 17, 0));
+        assert_eq!(stalled.x, vec![0.0, 0.0]);
+        assert_eq!(stalled.fun, Some(0.0));
+
+        let converged = minimize(sphere, &[2.0, -3.0], options).expect("minimize");
+        assert!(converged.success, "{}", converged.message);
+        assert_eq!((converged.nit, converged.njev, converged.nhev), (4, 9, 0));
+        assert_eq!(
+            converged.x,
+            vec![-7.450_623_592_173_823e-9, -7.450_516_104_046_771e-9]
+        );
+    }
+
     #[test]
     fn newton_cg_rosenbrock() {
         let options = MinimizeOptions {
@@ -8296,6 +8340,39 @@ mod tests {
 
     // SciPy converts LinearConstraint / NonlinearConstraint for SLSQP with
     // `new_constraint_to_old`; these are its results (SciPy 1.17.1, default method).
+    #[test]
+    fn slsqp_does_not_report_a_nan_constraint_as_satisfied() {
+        // SciPy: minimize(f, [0, 0], method="SLSQP", constraints=[{"type": "ineq",
+        // "fun": lambda x: nan}]) fails (status 4, "Inequality constraints incompatible").
+        // maxcv used to come out 0 here, the NaN dropped by `max`.
+        let f = |v: &[f64]| (v[0] - 1.0).powi(2) + (v[1] - 2.0).powi(2);
+        let cons = [Constraint::ineq(|_: &[f64]| vec![f64::NAN])];
+        let r = minimize(
+            f,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                constraints: &cons,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(!r.success, "{r:?}");
+        assert!(r.maxcv.is_some_and(f64::is_nan), "maxcv {:?}", r.maxcv);
+        // A satisfied constraint still reports maxcv 0.
+        let ok_cons = [Constraint::ineq(|v: &[f64]| vec![2.0 - v[0]])];
+        let ok = minimize(
+            f,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                constraints: &ok_cons,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(ok.success, "{ok:?}");
+        assert_eq!(ok.maxcv, Some(0.0));
+    }
+
     #[test]
     fn slsqp_converts_linear_and_nonlinear_constraints_like_scipy() {
         let sphere2 = |v: &[f64]| v[0] * v[0] + v[1] * v[1];

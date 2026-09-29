@@ -5,15 +5,18 @@
 //! Resolves [frankenscipy-1dg9v]. Uses hard-coded models with known
 //! analytic roots; no scipy oracle needed. 1e-9 abs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{RootOptions, bisect, brenth, brentq, ridder, toms748};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-9;
+const METHODS: [&str; 5] = ["bisect", "brentq", "brenth", "ridder", "toms748"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -28,6 +31,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -101,23 +105,29 @@ fn diff_opt_scalar_root_finders() {
         ),
     ];
 
+    let mut ledger = CompareLedger::new("diff_opt_scalar_root_finders", &METHODS);
     for (label, f, br, expected) in &cases {
-        for method in ["bisect", "brentq", "brenth", "ridder", "toms748"] {
+        for method in METHODS {
             let res = match method {
                 "bisect" => bisect(f, *br, opts),
                 "brentq" => brentq(f, *br, opts),
                 "brenth" => brenth(f, *br, opts),
                 "ridder" => ridder(f, *br, opts),
                 "toms748" => toms748(f, *br, opts),
-                _ => continue,
+                other => panic!("unknown method {other}"),
             };
-            let Ok(r) = res else {
+            let case_id = format!("{label}_{method}");
+            // The bracket holds the analytic root, so a non-converged fsci run is an fsci failure.
+            let root = res.ok().filter(|r| r.converged).map(|r| r.root);
+            let Some((expected, root)) = ledger.pair(method, &case_id, Some(*expected), root)
+            else {
                 continue;
             };
-            let d = (r.root - expected).abs();
+            let d = (root - expected).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(method, &case_id, d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("{label}_{method}"),
+                case_id,
                 method: method.into(),
                 abs_diff: d,
                 pass: d <= ABS_TOL,
@@ -131,6 +141,7 @@ fn diff_opt_scalar_root_finders() {
         test_id: "diff_opt_scalar_root_finders".into(),
         category: "fsci_opt scalar root finders vs analytic".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -154,4 +165,5 @@ fn diff_opt_scalar_root_finders() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

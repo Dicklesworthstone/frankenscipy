@@ -3,19 +3,21 @@
 //!
 //! Resolves [frankenscipy-rggr1]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{FftOptions, irfftn, rfftn};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-005";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["rfftn", "irfftn"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -62,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -245,57 +248,55 @@ fn diff_fft_rfftn_irfftn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_fft_rfftn_irfftn", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.expected.as_ref() else {
-            continue;
-        };
         let opts = FftOptions::default();
-        let fsci_v = match case.op.as_str() {
+        let (expected, fsci_v) = match case.op.as_str() {
             "rfftn" => {
-                let Ok(out) = rfftn(&case.real_input, &case.shape, &opts) else {
-                    continue;
-                };
-                let mut packed = Vec::with_capacity(out.len() * 2);
-                for c in &out {
-                    packed.push(c.0);
-                    packed.push(c.1);
-                }
-                packed
+                let fsci_v = rfftn(&case.real_input, &case.shape, &opts).ok().map(|out| {
+                    let mut packed = Vec::with_capacity(out.len() * 2);
+                    for c in &out {
+                        packed.push(c.0);
+                        packed.push(c.1);
+                    }
+                    packed
+                });
+                (scipy_arm.expected.as_deref(), fsci_v)
             }
             "irfftn" => {
-                let Some(packed) = scipy_arm.complex_input.as_ref() else {
-                    continue;
-                };
-                let complex_in: Vec<(f64, f64)> = packed
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|p| (p[0], p[1]))
-                    .collect();
-                let Ok(out) = irfftn(&complex_in, &case.shape, &opts) else {
-                    continue;
-                };
-                out
+                let complex_in: Option<Vec<(f64, f64)>> =
+                    scipy_arm.complex_input.as_ref().map(|packed| {
+                        packed
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|p| (p[0], p[1]))
+                            .collect()
+                    });
+                let fsci_v = complex_in
+                    .as_ref()
+                    .and_then(|input| irfftn(input, &case.shape, &opts).ok());
+                // SciPy's rfftn output is the input both sides invert; without it there is
+                // no oracle value.
+                let expected = complex_in.as_ref().and(scipy_arm.expected.as_deref());
+                (expected, fsci_v)
             }
-            _ => continue,
+            _ => (scipy_arm.expected.as_deref(), None),
         };
-        if fsci_v.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        let Some((expected, fsci_v)) =
+            ledger.slices(&case.op, &case.case_id, expected, fsci_v.as_deref())
+        else {
             continue;
-        }
+        };
         let abs_d = fsci_v
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -310,6 +311,7 @@ fn diff_fft_rfftn_irfftn() {
         test_id: "diff_fft_rfftn_irfftn".into(),
         category: "scipy.fft.rfftn + irfftn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -333,4 +335,10 @@ fn diff_fft_rfftn_irfftn() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

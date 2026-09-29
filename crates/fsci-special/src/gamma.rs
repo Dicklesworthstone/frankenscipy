@@ -72,6 +72,10 @@ pub const GAMMA_DISPATCH_PLAN: &[DispatchPlan] = &[
         function: "gammainc",
         steps: &[
             DispatchStep {
+                regime: KernelRegime::Asymptotic,
+                when: "SciPy's Temme zones (20 < a < 200, |x-a|/a < 0.3; a > 200, |x-a|/a < 4.5/sqrt(a))",
+            },
+            DispatchStep {
                 regime: KernelRegime::Series,
                 when: "x < a + 1 via stable lower-tail expansion",
             },
@@ -85,6 +89,10 @@ pub const GAMMA_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
         function: "gammaincc",
         steps: &[
+            DispatchStep {
+                regime: KernelRegime::Asymptotic,
+                when: "SciPy's Temme zones, summed directly for Q (not as 1 - P)",
+            },
             DispatchStep {
                 regime: KernelRegime::Series,
                 when: "complement from lower-tail expansion",
@@ -152,8 +160,11 @@ const LANCZOS_COEFFS: [f64; 9] = [
     0.000_000_150_563_273_514_931_16,
 ];
 
+/// Under `errstate`, a negative-integer pole is SciPy's "singularity" (`Gamma`).
 pub fn gamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gamma_dispatch("gamma", z, mode)
+    let value = gamma_dispatch("gamma", z, mode)?;
+    crate::sf_error_unary("Gamma", z, mode, crate::sf_negative_integer_pole)?;
+    Ok(value)
 }
 
 /// Audit-emitting variant of [`gamma`]. Every error it returns, in either mode, records one
@@ -180,8 +191,11 @@ pub fn gamma_with_audit(
     result
 }
 
+/// Under `errstate`, a non-positive integer is SciPy's "singularity" (`lgam`).
 pub fn gammaln(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammaln_dispatch("gammaln", x, mode)
+    let value = gammaln_dispatch("gammaln", x, mode)?;
+    crate::sf_error_unary("lgam", x, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
 pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -194,8 +208,14 @@ pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     )
 }
 
+/// Under `errstate`, a real zero is SciPy's "singularity" (`lgam`); the real negative axis
+/// returns NaN without an error, as in SciPy.
 pub fn loggamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    loggamma_dispatch("loggamma", z, mode)
+    let value = loggamma_dispatch("loggamma", z, mode)?;
+    crate::sf_error_unary("lgam", z, mode, |x| {
+        (x == 0.0).then_some(crate::SpecialErrorCode::Singular)
+    })?;
+    Ok(value)
 }
 
 /// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
@@ -728,12 +748,18 @@ fn loggamma_dispatch(
     }
 }
 
+/// Under `errstate`, a non-positive integer is SciPy's "singularity" (`psi`).
 pub fn digamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    digamma_dispatch("digamma", z, mode)
+    let value = digamma_dispatch("digamma", z, mode)?;
+    crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
+/// [`digamma`] under SciPy's other name.
 pub fn psi(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    digamma_dispatch("psi", z, mode)
+    let value = digamma_dispatch("psi", z, mode)?;
+    crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
 fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -794,12 +820,23 @@ fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
     }
 }
 
-pub fn gammainc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammainc_dispatch("gammainc", a, x, mode, true)
+/// SciPy's `gammainc`/`gammaincc` domain test: a negative `a` or `x`.
+fn sf_incomplete_gamma_domain(a: f64, x: f64) -> Option<crate::SpecialErrorCode> {
+    (a < 0.0 || x < 0.0).then_some(crate::SpecialErrorCode::Domain)
 }
 
+/// Under `errstate`, a negative `a` or `x` is SciPy's "domain error".
+pub fn gammainc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = gammainc_dispatch("gammainc", a, x, mode, true)?;
+    crate::sf_error_binary("gammainc", a, x, mode, sf_incomplete_gamma_domain)?;
+    Ok(value)
+}
+
+/// Under `errstate`, a negative `a` or `x` is SciPy's "domain error".
 pub fn gammaincc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammainc_dispatch("gammaincc", a, x, mode, false)
+    let value = gammainc_dispatch("gammaincc", a, x, mode, false)?;
+    crate::sf_error_binary("gammaincc", a, x, mode, sf_incomplete_gamma_domain)?;
+    Ok(value)
 }
 
 fn gammainc_dispatch(
@@ -2290,6 +2327,188 @@ fn validate_incomplete_gamma_domain(
     Ok(())
 }
 
+/// Shape from which the gamma- and beta-type power terms are formed in Loader's saddle-point
+/// form instead of in log space (frankenscipy-g9yid).
+///
+/// Four places formed a term like `λˣe^(−λ)/Γ(x+1)` or `xᵃ(1−x)ᵇ/B(a,b)` as the `exp` of a
+/// sum of logs: the Poisson weight and increment anchors of the noncentral walks
+/// ([`poisson_term`], [`crate::beta::beta_term`]), the prefactor of [`regularized_gamma_pair`]
+/// and the front factor of [`crate::beta::betainc_scalar`]. The logs are of size `a·ln a`
+/// while their sum is O(ln a), so the exponent carries an absolute error of about
+/// `ε·a·ln a`: at most about 1e-13 below 100, 2.5e-7 at 1e8 and 4e-3 at 1e12 (the table is in
+/// [`poisson_term`]). From 100 up, the saddle-point form holds about 1e-15. Below 100 each of
+/// the four keeps its log-space form, so small-shape results are unchanged.
+pub(crate) const SADDLE_POINT_MIN_SHAPE: f64 = 100.0;
+
+/// `ln √(2π)`.
+const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
+
+/// `stirlerr(k/2)` for `k = 0..=30`, from mpmath at 40 digits. Index 0 is a placeholder:
+/// `stirlerr(0)` is never formed.
+const STIRLERR_HALVES: [f64; 31] = [
+    0.0,
+    0.153_426_409_720_027_36,
+    0.081_061_466_795_327_26,
+    0.054_814_121_051_917_65,
+    0.041_340_695_955_409_3,
+    0.033_162_873_519_936_29,
+    0.027_677_925_684_998_34,
+    0.023_746_163_656_297_496,
+    0.020_790_672_103_765_093,
+    0.018_488_450_532_673_187,
+    0.016_644_691_189_821_193,
+    0.015_134_973_221_917_378,
+    0.013_876_128_823_070_748,
+    0.012_810_465_242_920_227,
+    0.011_896_709_945_891_77,
+    0.011_104_559_758_206_917,
+    0.010_411_265_261_972_096,
+    0.009_799_416_126_158_804,
+    0.009_255_462_182_712_733,
+    0.008_768_700_134_139_386,
+    0.008_330_563_433_362_87,
+    0.007_934_114_564_314_02,
+    0.007_573_675_487_951_841,
+    0.007_244_554_301_320_383,
+    0.006_942_840_107_209_53,
+    0.006_665_247_032_707_682,
+    0.006_408_994_188_004_207,
+    0.006_171_712_263_039_458,
+    0.005_951_370_112_758_847_5,
+    0.005_746_216_513_010_115_5,
+    0.005_554_733_551_962_801,
+];
+
+/// Loader's Stirling-series error `stirlerr(n) = lnΓ(n+1) − (n + ½)·ln n + n − ln √(2π)`,
+/// for `n > 0` (C. Loader, "Fast and Accurate Computation of Binomial Probabilities", 2000;
+/// R's `stirlerr`). Exact table at the half-integers up to 15, `lnΓ` below 15 otherwise, and
+/// the asymptotic series `1/(12n) − 1/(360n³) + …` above 15, truncated where the next term
+/// is below 3e-17.
+pub(crate) fn stirlerr(n: f64) -> f64 {
+    const S0: f64 = 1.0 / 12.0;
+    const S1: f64 = 1.0 / 360.0;
+    const S2: f64 = 1.0 / 1260.0;
+    const S3: f64 = 1.0 / 1680.0;
+    const S4: f64 = 1.0 / 1188.0;
+    if n <= 15.0 {
+        let nn = n + n;
+        if nn == nn.floor() {
+            return STIRLERR_HALVES[nn as usize];
+        }
+        return gammaln_scalar(n + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            - (n + 0.5) * n.ln()
+            + n
+            - LN_SQRT_2PI;
+    }
+    let nn = n * n;
+    if n > 500.0 {
+        return (S0 - S1 / nn) / n;
+    }
+    if n > 80.0 {
+        return (S0 - (S1 - S2 / nn) / nn) / n;
+    }
+    if n > 35.0 {
+        return (S0 - (S1 - (S2 - S3 / nn) / nn) / nn) / n;
+    }
+    (S0 - (S1 - (S2 - (S3 - S4 / nn) / nn) / nn) / nn) / n
+}
+
+/// Loader's deviance term `bd0(x, m) = x·ln(x/m) + m − x`, for `x, m > 0`. Near `x = m` it is
+/// summed as the series in `v = (x−m)/(x+m)`, `(x−m)·v + 2x·Σ v^(2j+1)/(2j+1)`, so the
+/// cancellation between `x·ln(x/m)` and `m − x` never happens.
+pub(crate) fn bd0(x: f64, m: f64) -> f64 {
+    if (x - m).abs() < 0.1 * (x + m) {
+        let v = (x - m) / (x + m);
+        let mut s = (x - m) * v;
+        if s.abs() < f64::MIN_POSITIVE {
+            return s;
+        }
+        let mut ej = 2.0 * x * v;
+        let v2 = v * v;
+        let mut odd = 3.0_f64;
+        while odd < 2000.0 {
+            ej *= v2;
+            let s1 = s + ej / odd;
+            if s1 == s {
+                return s1;
+            }
+            s = s1;
+            odd += 2.0;
+        }
+    }
+    x * (x / m).ln() + m - x
+}
+
+/// `λˣ·e^(−λ) / Γ(x+1)` for real `x ≥ 0`: the Poisson weight at `x`, and also the incomplete
+/// gamma increment `yᵃe^(−y)/Γ(a+1)` with `(x, λ) = (a, y)`. Loader's saddle-point form
+/// `exp(−stirlerr(x) − bd0(x, λ)) / √(2πx)` (R's `dpois_raw`), with R's guards at the edges.
+///
+/// The noncentral walks (chndtr, chndtrc, ncfdtr, ncfdtrc, nctdtr) used to form their mode
+/// anchors as `exp(−λ + x·ln λ − lnΓ(x+1))`. The three terms have size `λ·ln λ` and their sum
+/// is `−½·ln(2πλ)`, so the anchor lost about `λ·ln λ·ε` (frankenscipy-g9yid). Relative error
+/// of the Poisson weight at the mode `x = ⌊λ⌋` against mpmath (60 digits, the same f64
+/// inputs):
+///
+/// ```text
+/// λ        log-space   saddle point
+/// 1e-3     3.0e-17     3.0e-17
+/// 15       2.8e-15     3.2e-17
+/// 100      4.2e-14     3.2e-17
+/// 1e4      1.1e-13     8.3e-17
+/// 1e6      6.8e-10     3.0e-17
+/// 1e8      2.5e-7      2.3e-17
+/// 1e10     9.8e-6      9.0e-17
+/// 1e12     7.4e-5      9.7e-17   (4.0e-3 at x = ⌊λ⌋ ± 1)
+/// 1e14     3.8e-2      2.4e-17
+/// 2^52     1.7e8       8.1e-17
+/// ```
+///
+/// Over `x` within `±3√λ` of the mode the saddle-point error stays below 1.2e-15, and within
+/// `±10√λ` below 1.2e-13 (λ = 1000, a weight of 2e-22, where `bd0` takes its direct branch).
+///
+/// With `x` and `λ` both below [`SADDLE_POINT_MIN_SHAPE`] the log-space form is kept: it is
+/// the walks' old anchor expression operation for operation, so their small-λ results are
+/// bit-identical.
+pub(crate) fn poisson_term(x: f64, lam: f64) -> f64 {
+    if x.is_nan() || lam.is_nan() {
+        return f64::NAN;
+    }
+    if lam == 0.0 {
+        return if x == 0.0 { 1.0 } else { 0.0 };
+    }
+    if lam.is_infinite() || x < 0.0 {
+        return 0.0;
+    }
+    let log_space = || {
+        let lg = gammaln_scalar(x + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        (-lam + x * lam.ln() - lg).exp()
+    };
+    if x < SADDLE_POINT_MIN_SHAPE && lam < SADDLE_POINT_MIN_SHAPE {
+        return log_space();
+    }
+    if x <= lam * f64::MIN_POSITIVE {
+        return (-lam).exp();
+    }
+    if lam < x * f64::MIN_POSITIVE {
+        return if x.is_infinite() { 0.0 } else { log_space() };
+    }
+    (-stirlerr(x) - bd0(x, lam)).exp() / (std::f64::consts::TAU * x).sqrt()
+}
+
+/// Iteration cap of the incomplete gamma series and continued fraction: `12·√a + 200`.
+///
+/// Near `x ≈ a` the series needs about `8.3·√a` terms and the continued fraction about
+/// `9·a^(1/3)`. The cap used to be bounded by 2,000,000, which cut the series short from
+/// `a ≈ 2.8e10`: `P(1e12, 1e12)` came out 4.4e-2 low (frankenscipy-g9yid). The bound now
+/// applies only from `a = 2^53`, where `ap + 1.0` stops moving and no count of terms helps.
+fn incomplete_gamma_iteration_cap(a: f64) -> usize {
+    if a < crate::beta::POISSON_INDEX_LIMIT {
+        (12.0 * a.sqrt()) as usize + 200
+    } else {
+        2_000_000
+    }
+}
+
 fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64), SpecialError> {
     if a.is_nan() || x.is_nan() {
         return Ok((f64::NAN, f64::NAN));
@@ -2304,27 +2523,84 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
         return Ok((1.0, 0.0));
     }
 
+    // SciPy's Temme zones, 20 < a < 200 with |x − a|/a < 0.3 and a > 200 with
+    // |x − a|/a < 4.5/√a, take Temme's uniform expansion exactly as SciPy's `igam` and `igamc`
+    // do (frankenscipy-6fpkm; see `crate::igam_temme`). Everything outside them runs the
+    // series and continued fraction below, unchanged.
+    if let Some(pair) = crate::igam_temme::igam_igamc_asymptotic(a, x) {
+        return Ok(pair);
+    }
+
     const EPS: f64 = 1.0e-14;
     const FPMIN: f64 = 1.0e-300;
 
-    let lg = gammaln_scalar(a, RuntimeMode::Strict)?;
-    let prefactor = (-x + a * x.ln() - lg).exp();
+    // From a = SADDLE_POINT_MIN_SHAPE up, the large-shape path (frankenscipy-g9yid): the
+    // prefactor xᵃe⁻ˣ/Γ(a) = a·poisson_term(a, x) in saddle-point form, a compensated series
+    // sum, and a stop test that bounds the unsummed tail. Worst relative error of P and Q
+    // over x = a + {0, ±1, 0.9, 2, 10, ±√a, ±3√a}, against scipy.special (Temme's expansion
+    // there; it matched an mpmath series to 2e-15 at a = 1e8):
+    //
+    //     a        before     after
+    //     100      6.1e-14    1.1e-14
+    //     1e4      1.7e-11    5.1e-15
+    //     1e6      1.2e-9     6.0e-15
+    //     1e8      4.5e-7     7.3e-15
+    //     1e10     3.8e-5     2.4e-14
+    //     1e12     4.4e-2     1.2e-13   (continued fraction, x = a + 10; the series ~1e-14)
+    //
+    // Before, the prefactor lost ε·a·ln a, the plain stop `term ≤ 1e-14·sum` left a tail of
+    // about 1e-14·√a/6, the uncompensated sum of ~8√a terms drifted by up to 8e-12 at
+    // a = 1e12, and from a ≈ 2.8e10 the 2,000,000 cap cut the series off. Below the gate the
+    // old code runs unchanged.
+    //
+    // Since frankenscipy-6fpkm the table's points from a = 1e4 up, and all but x = a ± 3√a
+    // at a = 100, are inside SciPy's Temme zones and are answered above; the table records
+    // this series and continued fraction, which still serve everything outside the zones.
+    let large = a >= SADDLE_POINT_MIN_SHAPE;
+    let prefactor = if large {
+        a * poisson_term(a, x)
+    } else {
+        let lg = gammaln_scalar(a, RuntimeMode::Strict)?;
+        (-x + a * x.ln() - lg).exp()
+    };
     let (p, q) = if x < a + 1.0 {
         // The lower series Σ xᵏ/(a)_{k+1} needs ~12√a terms to converge near
         // x≈a (the term ratio x/(a+k) ≈ 1 there); the old fixed 200-term cap
         // truncated it for large a — e.g. P(5000,5000) was 0.5% off (needs 558
         // terms). Scale the cap with √a so it stays exact at large a while the
         // ε-break keeps small/typical a cheap. frankenscipy.
-        let series_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+        let series_max = incomplete_gamma_iteration_cap(a);
         let mut ap = a;
         let mut term = 1.0 / a;
         let mut sum = term;
-        for _ in 0..series_max {
-            ap += 1.0;
-            term *= x / ap;
-            sum += term;
-            if term.abs() <= sum.abs() * EPS {
-                break;
+        if large {
+            // Neumaier-compensated. Every term is positive and below the first, so
+            // `sum ≥ term` and the fast two-sum is exact. With r = x/(ap + 1) < 1 the terms
+            // left after this one sum to at most term·r/(1 − r), so stopping at
+            // term ≤ ε·sum·(1 − r) bounds the truncation by ε·sum. r is also the next
+            // term's ratio, so each step divides once.
+            let mut carry = 0.0_f64;
+            let mut r = x / (ap + 1.0);
+            for _ in 0..series_max {
+                ap += 1.0;
+                term *= r;
+                let next = sum + term;
+                carry += (sum - next) + term;
+                sum = next;
+                r = x / (ap + 1.0);
+                if term <= sum * f64::EPSILON * (1.0 - r) {
+                    break;
+                }
+            }
+            sum += carry;
+        } else {
+            for _ in 0..series_max {
+                ap += 1.0;
+                term *= x / ap;
+                sum += term;
+                if term.abs() <= sum.abs() * EPS {
+                    break;
+                }
             }
         }
         let lower = prefactor * sum;
@@ -2336,11 +2612,12 @@ fn regularized_gamma_pair(a: f64, x: f64, mode: RuntimeMode) -> Result<(f64, f64
         let mut c = 1.0 / FPMIN;
         let mut d = 1.0 / b;
         let mut h = d;
-        // The upper continued fraction needs ~√a steps near x≈a; the fixed
-        // 200-iter cap truncated it for very large a (Q(100000,100001) was ~1e-5
-        // off). Scale the cap with √a (the EPS-break keeps typical a cheap),
-        // mirroring the lower-series fix. frankenscipy.
-        let cf_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+        // The upper continued fraction needs ~9·a^(1/3) steps near x≈a (measured
+        // from a = 1e6 to 1e14, frankenscipy-g9yid); the fixed 200-iter cap
+        // truncated it for very large a (Q(100000,100001) was ~1e-5 off). Scale
+        // the cap with √a (the EPS-break keeps typical a cheap), mirroring the
+        // lower-series fix. frankenscipy.
+        let cf_max = incomplete_gamma_iteration_cap(a);
         for i in 1..=cf_max {
             let i_f = i as f64;
             let an = -i_f * (i_f - a);
@@ -2653,7 +2930,7 @@ fn gamma_lanczos(x: f64) -> f64 {
     log_abs_value.exp().copysign(coeff_sum)
 }
 
-fn digamma_core(x: f64) -> f64 {
+pub(crate) fn digamma_core(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
@@ -2674,27 +2951,130 @@ fn digamma_core(x: f64) -> f64 {
     if is_negative_integer_pole(x) {
         return f64::NAN;
     }
+    // SciPy's xsf `digamma`, bit-identical on 150,022 points. Near the negative root it
+    // sums a Taylor series, whose coefficients are Hurwitz zeta values at the root; anywhere
+    // else it is Cephes `psi`.
+    //
+    // This used to shift x up to 12 and apply the Bernoulli asymptotic series. Near either
+    // root that cancels about 2.5 - 2.5, so an absolute error of about 3e-15 became relative
+    // error of 1e-12 or worse (frankenscipy-re34v).
+    if (x - DIGAMMA_NEGROOT).abs() < 0.3 {
+        let z = x - DIGAMMA_NEGROOT;
+        let mut res = DIGAMMA_NEGROOT_VALUE;
+        let mut coeff = -1.0;
+        for n in 1..100 {
+            coeff *= -z;
+            let term = coeff * crate::convenience::hurwitz_zeta(f64::from(n + 1), DIGAMMA_NEGROOT);
+            res += term;
+            if term.abs() < f64::EPSILON * res.abs() {
+                break;
+            }
+        }
+        return res;
+    }
+    cephes_psi(x)
+}
 
+/// The negative root of digamma nearest the origin, and digamma's value there as a double.
+const DIGAMMA_NEGROOT: f64 = -0.504_083_008_264_455_4;
+const DIGAMMA_NEGROOT_VALUE: f64 = 7.289_763_902_976_895e-17;
+
+/// Cephes `psi` for finite, nonzero x that is not a negative integer.
+fn cephes_psi(mut x: f64) -> f64 {
+    let mut y = 0.0;
     if x < 0.0 {
-        return digamma_core(1.0 - x) - PI / crate::convenience::tanpi(x);
+        // Reduce before tan(pi * x); fract() is Cephes' modf remainder, exact.
+        y = -PI / (PI * x.fract()).tan();
+        x = 1.0 - x;
     }
-
-    let mut shifted = x;
-    let mut acc = 0.0;
-    while shifted < 12.0 {
-        acc -= 1.0 / shifted;
-        shifted += 1.0;
+    if x <= 10.0 && x == x.floor() {
+        let n = x as u32;
+        for i in 1..n {
+            y += 1.0 / f64::from(i);
+        }
+        return y - CEPHES_EULER;
     }
+    if x < 1.0 {
+        y -= 1.0 / x;
+        x += 1.0;
+    } else if x < 10.0 {
+        while x > 2.0 {
+            x -= 1.0;
+            y += 1.0 / x;
+        }
+    }
+    if (1.0..=2.0).contains(&x) {
+        return y + digamma_imp_1_2(x);
+    }
+    y + psi_asy(x)
+}
 
-    let inv = 1.0 / shifted;
-    let inv2 = inv * inv;
-    // Bernoulli asymptotic extended through the B₁₀ term (was truncated at B₆,
-    // leaving ~2.5e-10 at the shift point). frankenscipy-luxsz.
-    acc + shifted.ln()
-        - 0.5 * inv
-        - inv2
-            * (1.0 / 12.0
-                - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))))
+/// Euler's constant as Cephes spells it (the same double as `std`'s `EGAMMA`).
+#[allow(clippy::excessive_precision)]
+const CEPHES_EULER: f64 = 0.577215664901532860606512090082402431;
+
+/// Boost's rational on [1, 2], anchored at the positive root:
+/// (x - root) · (Y + P(x-1)/Q(x-1)). The root is split into three doubles so that
+/// x - root is exact to well below an ulp of the result.
+fn digamma_imp_1_2(x: f64) -> f64 {
+    const Y: f64 = 0.995_581_626_892_089_84; // a float in Boost; exact in f64
+    const ROOT1: f64 = 1_569_415_565.0 / 1_073_741_824.0;
+    const ROOT2: f64 = (381_566_830.0 / 1_073_741_824.0) / 1_073_741_824.0;
+    #[allow(clippy::excessive_precision)]
+    const ROOT3: f64 = 0.9016312093258695918615325266959189453125e-19;
+    const P: [f64; 6] = [
+        -0.002_071_332_116_774_595_2,
+        -0.045_251_321_448_739_056,
+        -0.289_191_264_447_747_84,
+        -0.650_318_537_708_965_07,
+        -0.325_550_311_868_044_91,
+        0.254_798_510_611_315_51,
+    ];
+    const Q: [f64; 7] = [
+        -0.557_898_413_216_755_13e-6,
+        0.002_128_498_701_782_114_4,
+        0.054_151_797_245_674_225,
+        0.435_935_296_926_659_69,
+        1.460_624_290_976_351_5,
+        2.076_711_702_373_046_9,
+        1.0,
+    ];
+    let mut g = x - ROOT1;
+    g -= ROOT2;
+    g -= ROOT3;
+    let r = cephes_polevl_exact(x - 1.0, &P) / cephes_polevl_exact(x - 1.0, &Q);
+    g * Y + g * r
+}
+
+/// Cephes' asymptotic series for x >= 10.
+fn psi_asy(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const A: [f64; 7] = [
+        8.33333333333333333333E-2,
+        -2.10927960927960927961E-2,
+        7.57575757575757575758E-3,
+        -4.16666666666666666667E-3,
+        3.96825396825396825397E-3,
+        -8.33333333333333333333E-3,
+        8.33333333333333333333E-2,
+    ];
+    let y = if x < 1.0e17 {
+        let z = 1.0 / (x * x);
+        z * cephes_polevl_exact(z, &A)
+    } else {
+        0.0
+    };
+    x.ln() - 0.5 / x - y
+}
+
+/// Cephes `polevl`: Horner from the leading coefficient.
+#[inline(always)]
+fn cephes_polevl_exact<const N: usize>(x: f64, coef: &[f64; N]) -> f64 {
+    let mut ans = coef[0];
+    for &c in &coef[1..] {
+        ans = ans * x + c;
+    }
+    ans
 }
 
 fn trigamma_core(x: f64) -> f64 {
@@ -3363,11 +3743,33 @@ pub fn chdtrc(v: f64, x: f64) -> f64 {
 /// ```
 ///
 /// The sum is accumulated outward from the Poisson mode `j₀ = ⌊λ⌋` (whose
-/// weight is formed in log space) so that large `nc` neither underflows the
-/// leading `e^{−λ}` factor nor loses precision.
+/// weight is formed by `poisson_term`, in saddle-point form from λ = 100) so that
+/// large `nc` neither underflows the leading `e^{−λ}` factor nor loses precision.
 #[must_use]
 pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     if x.is_nan() || df.is_nan() || nc.is_nan() {
+        return f64::NAN;
+    }
+    if nc == f64::INFINITY {
+        // λ = ∞ has no Poisson mode to walk from: j₀ = ∞ and `j -= 1.0` never reaches 0, so
+        // the downward loop below never ended (frankenscipy-qu5po). SciPy 1.17.1 returns
+        // the limit, 0, at finite x ≥ 0 with df > 0: chndtr(x, 3, inf) = 0.0 at x = 0,
+        // 1e-300, 5, 1e300, and chndtr(5, inf, inf) = 0.0. It returns nan at x = ±inf, at
+        // x = -2, and at df = 0 or -1.
+        return if (0.0..f64::INFINITY).contains(&x) && df > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        };
+    }
+    // Domain, as SciPy 1.17.1 has it (frankenscipy-g9yid). A negative x is outside the
+    // support and is nan, not 0: chndtr(-inf, 3, 3), chndtr(-2, 3, 3) and chndtr(-2, 3, 0)
+    // are all nan, while chndtr(±0, 3, 3) = 0. A negative nc is nan: chndtr(5, 3, -1) is nan,
+    // where this used to answer the central chdtr(3, 5). With nc > 0, df must be positive and
+    // finite: chndtr(x, df, 3) is nan for df = 0, -1 and inf, at x = 0 and x = inf as well.
+    // Before this check the walk took df + 2j0 as its degrees of freedom and returned a
+    // number.
+    if x < 0.0 || nc < 0.0 || (nc > 0.0 && (df <= 0.0 || df == f64::INFINITY)) {
         return f64::NAN;
     }
     if x <= 0.0 {
@@ -3376,12 +3778,22 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     if nc <= 0.0 {
         return chdtr(df, x);
     }
+    if x == f64::INFINITY {
+        // The whole mass is below x. The mode anchor would be exp(a·ln ∞ − ∞) = exp(NaN), so
+        // the walk returned NaN here (frankenscipy-g9yid). SciPy 1.17.1: chndtr(inf, 3, 3) =
+        // chndtr(inf, 3, 1e6) = chndtr(inf, 1e-300, 3) = 1.0.
+        return 1.0;
+    }
     let lam = nc / 2.0;
     let j0 = lam.floor();
-    // Poisson weight at the mode j0, formed in log space to avoid underflow.
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // frankenscipy-qu5po: the walk cannot step from here (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if j0 >= crate::beta::POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
+    // Poisson weight at the mode j0. It and t0 below were formed in log space, which lost
+    // about λ·ln λ·ε: 2.5e-7 at λ = 1e8 and 4e-3 at λ = 1e12, and chndtr carried that error
+    // whole. The saddle-point `poisson_term` holds 1e-16 (frankenscipy-g9yid).
+    let w0 = poisson_term(j0, lam);
 
     // Each Poisson term needs chdtr(df + 2j, x) = P(a, y), the regularized lower
     // incomplete gamma with a = df/2 + j, y = x/2. Computing it fresh per term
@@ -3398,18 +3810,23 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     let y = x / 2.0;
     let a0 = 0.5 * df + j0;
     let p0 = chdtr(df + 2.0 * j0, x); // = P(a0, y)
-    let t0 =
-        (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    let t0 = poisson_term(a0, y); // = y^a0 e^{−y} / Γ(a0 + 1)
+    // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if p0 == 0.0 && t0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
-    // Upward from the mode.
+    // Upward from the mode. The cap scales with √λ (frankenscipy-g9yid; see
+    // `crate::beta::poisson_upward_step_cap`).
     let mut w = w0;
     let mut j = j0;
     let mut a = a0;
     let mut p = p0;
     let mut t = t0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = crate::beta::poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * p.clamp(0.0, 1.0);
         // advance j → j+1, a → a+1
         p -= t;
@@ -3420,7 +3837,7 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
         if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     w = w0;
@@ -3488,33 +3905,60 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     if x.is_nan() || df.is_nan() || nc.is_nan() {
         return f64::NAN;
     }
+    // scipy.stats.ncx2 accepts only df > 0 finite and nc ≥ 0, and answers nan for any x
+    // outside that (frankenscipy-g9yid). In 1.17.1, ncx2.sf(x, df, nc) is nan at df = 0,
+    // -1 and inf and at nc = -1, for x = -2, 0, 5 and inf alike. Without this check the walk
+    // took df + 2j0 as its degrees of freedom and returned a number, and a negative nc fell
+    // through to the central chdtrc.
+    if df <= 0.0 || df == f64::INFINITY || nc < 0.0 {
+        return f64::NAN;
+    }
     if x <= 0.0 {
         return 1.0;
+    }
+    if nc == f64::INFINITY {
+        // No Poisson mode to walk from (frankenscipy-qu5po; see `chndtr`).
+        // scipy.stats.ncx2.sf(x, 3, inf), which this mirrors, is nan at x = 5 and x = 1e300
+        // and 0.0 at x = inf in 1.17.1. Its x = 0 → 1.0 is the return above.
+        return if x == f64::INFINITY { 0.0 } else { f64::NAN };
+    }
+    if x == f64::INFINITY {
+        // No mass above x. The walk's anchor exp(a·ln ∞ − ∞) was NaN (frankenscipy-g9yid).
+        // SciPy 1.17.1: ncx2.sf(inf, 3, 3) = ncx2.sf(inf, 3, 0) = 0.0.
+        return 0.0;
     }
     if nc <= 0.0 {
         return chdtrc(df, x);
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
-    let logw0 =
-        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
-    let w0 = logw0.exp();
+    // frankenscipy-qu5po: the walk cannot step from here (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if j0 >= crate::beta::POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
+    // Saddle-point anchors, as in `chndtr` (frankenscipy-g9yid).
+    let w0 = poisson_term(j0, lam);
 
     let y = x / 2.0;
     let a0 = 0.5 * df + j0;
     let q0 = chdtrc(df + 2.0 * j0, x); // = Q(a0, y), computed directly, never as 1 - P
-    let t0 =
-        (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    let t0 = poisson_term(a0, y); // = y^a0 e^{−y} / Γ(a0 + 1)
+    // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if q0 == 0.0 && t0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
-    // Upward from the mode: Q grows by adding positive t — the stable direction here.
+    // Upward from the mode: Q grows by adding positive t — the stable direction here. The
+    // cap scales with √λ (frankenscipy-g9yid; see `crate::beta::poisson_upward_step_cap`).
     let mut w = w0;
     let mut j = j0;
     let mut a = a0;
     let mut q = q0;
     let mut t = t0;
-    let mut steps = 0;
-    while steps < 100_000 {
+    let cap = crate::beta::poisson_upward_step_cap(lam);
+    let mut steps = 0.0_f64;
+    while steps < cap {
         total += w * q.clamp(0.0, 1.0);
         q += t;
         j += 1.0;
@@ -3524,7 +3968,7 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
         if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
-        steps += 1;
+        steps += 1.0;
     }
     // Downward from the mode.
     w = w0;
@@ -3549,12 +3993,33 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
 /// Inverse of [`chndtr`] in the argument `x`.
 ///
 /// Returns `x` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtrix(p, df, nc)`. The CDF is monotonically increasing in
-/// `x`, so the root is found by bracket-and-bisect. Boundaries follow scipy:
+/// `scipy.special.chndtrix(p, df, nc)`. Boundaries follow scipy:
 /// `p = 0 → 0`, `p = 1 → +∞`, and `p ∉ [0, 1]` (or NaN inputs) → NaN.
+///
+/// SciPy 1.17.1 answers with Boost's quantile, which brackets the root by a geometric walk and
+/// uses the complement `q − sf(x)` as the residual for `p ≥ 1/2`
+/// (boost/math/distributions/detail/generic_quantile.hpp 26-28, 83-94). This does the same with
+/// `bracket_and_solve_root` from `x = 1` and [`chndtrc`] (frankenscipy-g9yid),
+/// so a root far below 1 is bracketed in O(log) CDF calls and resolved to a relative
+/// tolerance: SciPy gives `chndtrix(1e-20, 3, 2) = 2.1860014721757718e-13`, where the old
+/// `[0, hi]` search stopped at its first false-position step, 2.28e-19. The answer is only as
+/// good as [`chndtr`] at the root: where both of its mode anchors underflow it returns 0, so a
+/// `p` near `1e-300` (SciPy: `chndtrix(1e-300, 3, 2) = 4.7095974041160384e-200`) is not
+/// resolved there. Boost starts from Pearson's approximation instead of 1, which moves only
+/// the escape value when the root is below `f64::MIN_POSITIVE`.
+///
+/// SciPy is NaN from `nc ≈ 4.18e10` at `p = 1/2` (the edge moves with `p`: 2.2e11 at 0.01,
+/// 4.3e10 at 0.99) because Boost's series hits its term limit. [`chndtr`] deliberately stays
+/// finite there, and this inverse stays consistent with it and answers. The owner may
+/// revisit that choice.
 #[must_use]
 pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     if p.is_nan() || df.is_nan() || nc.is_nan() || !(0.0..=1.0).contains(&p) {
+        return f64::NAN;
+    }
+    // nc = inf: SciPy 1.17.1 returns nan for p = 0, 0.5 and 1. Without this, chndtr's limit
+    // of 0 would double `hi` up to 1e300 and answer +inf (frankenscipy-qu5po).
+    if nc == f64::INFINITY {
         return f64::NAN;
     }
     if p == 0.0 {
@@ -3563,77 +4028,103 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     if p == 1.0 {
         return f64::INFINITY;
     }
-    let mut hi = 1.0_f64;
-    let mut fhi = chndtr(hi, df, nc);
-    while fhi < p {
-        hi *= 2.0;
-        if hi > 1e300 {
-            return f64::INFINITY;
-        }
-        fhi = chndtr(hi, df, nc);
+    // A NaN CDF (the `crate::beta::POISSON_INDEX_LIMIT` exit) makes the walk return NaN
+    // rather than a bracket. SciPy 1.17.1: chndtrix(0.5, 3, 2^60) = nan.
+    let q = 1.0 - p;
+    if p < q {
+        crate::beta::bracket_and_solve_root(|x| chndtr(x, df, nc) - p, 1.0, true)
+    } else {
+        crate::beta::bracket_and_solve_root(|x| q - chndtrc(x, df, nc), 1.0, true)
     }
-    // chndtr(·, df, nc) is increasing in x with chndtr(0, ·) = 0, so
-    // f(x) = chndtr(x, df, nc) − p is increasing with f(0) = −p < 0 < f(hi).
-    // Illinois false-position converges in ~12 chndtr evals vs the old fixed
-    // 100-step bisection — each eval is a full Poisson-weighted mixture, so this
-    // ~8× cuts chndtrix's dominant cost. (Its siblings chndtridf/chndtrinc
-    // already route through the Illinois `invert_monotone`.) The final doubling
-    // eval is reused as `fhi`; f(0) = −p needs no chndtr call.
-    let fhi_resid = fhi - p;
-    if fhi_resid == 0.0 {
-        return hi;
-    }
-    crate::beta::illinois_root(|m| chndtr(m, df, nc) - p, 0.0, hi, -p, fhi_resid)
 }
 
-/// Bisect for `v ∈ [a, b]` with `f(v) = target`, where `f` is monotone on
-/// `[a, b]` (direction auto-detected). If `target` is outside the range spanned
-/// by `f(a)..f(b)`, the nearer bound is returned (the unsolvable-tail clamp).
-fn invert_monotone(f: impl Fn(f64) -> f64, target: f64, a: f64, b: f64) -> f64 {
-    let (fa, fb) = (f(a), f(b));
-    if target <= fa.min(fb) {
-        return if fa <= fb { a } else { b };
-    }
-    if target >= fa.max(fb) {
-        return if fa >= fb { a } else { b };
-    }
-    // Superlinear Illinois (~12 evals) instead of 200 fixed bisection steps — each
-    // eval here is a full chndtr (Poisson-weighted mixture), so this is a large win
-    // for chndtridf/chndtrinc. The clamp guards above guarantee `target` is strictly
-    // inside (min(fa,fb), max(fa,fb)), so neither endpoint is the root. Illinois
-    // solves an INCREASING residual, so flip the sign when f is decreasing.
-    if fb >= fa {
-        crate::beta::illinois_root(|m| f(m) - target, a, b, fa - target, fb - target)
+/// The residual Boost's `degrees_of_freedom_finder` and `non_centrality_finder` solve for the
+/// noncentral χ² (boost/math/distributions/non_central_chi_squared.hpp 551-569 and 606-624):
+/// `cdf − p` when `p < q = 1 − p`, and the complement form `q − sf` otherwise.
+fn chndtr_inverse_residual(x: f64, df: f64, nc: f64, p: f64) -> f64 {
+    let q = 1.0 - p;
+    if p < q {
+        chndtr(x, df, nc) - p
     } else {
-        crate::beta::illinois_root(|m| target - f(m), a, b, target - fa, target - fb)
+        q - chndtrc(x, df, nc)
     }
 }
 
 /// Inverse of [`chndtr`] in the degrees of freedom `df`.
 ///
 /// Returns `df` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtridf(x, p, nc)`. The CDF is monotone (decreasing) in
-/// `df`, so the root is found by bisection. `p ∉ (0, 1)` (or NaN) → NaN.
+/// `scipy.special.chndtridf(x, p, nc)`.
+///
+/// SciPy 1.17.1 answers with Boost's `find_degrees_of_freedom`
+/// (boost/math/distributions/non_central_chi_squared.hpp 572-603): from the guess
+/// `max(x − nc, 1)` it walks by `bracket_and_solve_root` (the CDF falls as
+/// `df` grows). When no `df > 0` reaches `p`, the downward walk leaves the normal range and
+/// returns half the first subnormal it reaches: `chndtridf(5, 0.5, nc) = 2.65249474e-315` for
+/// `nc = 30`, `1e6`, `1e8` and `1e16`, and `chndtridf(5, 1 − 2⁻⁵³, 2) = 7.957484216e-315`. The
+/// old fixed
+/// `[1e-6, 1e10]` search returned its `1e-6` bound there, and `1e-6` for `x = 3e10` too, where
+/// SciPy gives 29999999998.66667 (frankenscipy-g9yid). `p ∈ {0, 1}`, `x = 0`, negative `x` or
+/// `nc`, and NaN are NaN, as in SciPy.
+///
+/// SciPy is NaN from `x ≈ 4.18e10` (Boost's series hits its term limit). [`chndtr`]
+/// deliberately stays finite there, and this inverse stays consistent with it and answers.
+/// The owner may revisit that choice.
 #[must_use]
 pub fn chndtridf(x: f64, p: f64, nc: f64) -> f64 {
-    if x.is_nan() || p.is_nan() || nc.is_nan() || p <= 0.0 || p >= 1.0 {
+    if x.is_nan() || p.is_nan() || nc.is_nan() {
         return f64::NAN;
     }
-    invert_monotone(|df| chndtr(x, df, nc), p, 1e-6, 1e10)
+    // SciPy's wrapper rejects nc < 0, x < 0 and p ∉ [0, 1]; Boost raises for p ∈ {0, 1}; and
+    // SciPy 1.17.1 is nan at x = 0: chndtridf(0, 0.5, 2) = nan.
+    if nc < 0.0 || x <= 0.0 || p <= 0.0 || p >= 1.0 {
+        return f64::NAN;
+    }
+    // nc = inf: SciPy 1.17.1 chndtridf(5, 0.5, inf) = nan (frankenscipy-qu5po). x = inf:
+    // chndtridf(inf, 0.5, 2) = chndtridf(inf, 0.5, 3) = nan, while chndtr is 1.0 there
+    // (frankenscipy-g9yid).
+    if nc == f64::INFINITY || x == f64::INFINITY {
+        return f64::NAN;
+    }
+    let guess = (x - nc).max(1.0);
+    crate::beta::bracket_and_solve_root(|df| chndtr_inverse_residual(x, df, nc, p), guess, false)
 }
 
 /// Inverse of [`chndtr`] in the non-centrality `nc`.
 ///
 /// Returns `nc` such that `chndtr(x, df, nc) = p`, matching
-/// `scipy.special.chndtrinc(x, df, p)`. The CDF is monotone (decreasing) in
-/// `nc ≥ 0`; if `p` exceeds the central value `chndtr(x, df, 0)` the result
-/// clamps toward 0 (as scipy does). `p ∉ (0, 1)` (or NaN) → NaN.
+/// `scipy.special.chndtrinc(x, df, p)`.
+///
+/// SciPy 1.17.1 answers with Boost's `find_non_centrality`
+/// (boost/math/distributions/non_central_chi_squared.hpp 627-658): from the guess
+/// `max(x − df, 1)` it walks by `bracket_and_solve_root` (the CDF falls as
+/// `nc` grows). When `p` is above the central CDF no `nc ≥ 0` reaches it, and the downward
+/// walk returns half the first subnormal it reaches: `chndtrinc(5, 3, 0.9) =
+/// 5.304989477e-315`, where the old fixed `[0, 1e8]` search returned its bound 0. That search
+/// also returned 0 for `chndtrinc(1e9, 3, 0.5)`, whose root is 999999997.9999998 in SciPy
+/// (frankenscipy-g9yid). `p ∈ {0, 1}`, `x = 0`, negative `x` or `df`, and NaN are NaN, as in
+/// SciPy.
+///
+/// SciPy is NaN from `x ≈ 4.18e10` (7.8e9 at `p = 0.99`), because Boost's series hits its term
+/// limit. [`chndtr`] deliberately stays finite there, and this inverse stays consistent with
+/// it and answers; each CDF call there walks on the order of `√x` Poisson terms. The owner may
+/// revisit that choice.
 #[must_use]
 pub fn chndtrinc(x: f64, df: f64, p: f64) -> f64 {
-    if x.is_nan() || df.is_nan() || p.is_nan() || p <= 0.0 || p >= 1.0 {
+    if x.is_nan() || df.is_nan() || p.is_nan() {
         return f64::NAN;
     }
-    invert_monotone(|nc| chndtr(x, df, nc), p, 0.0, 1e8)
+    // SciPy's wrapper rejects df < 0, x < 0 and p ∉ [0, 1]; Boost raises for p ∈ {0, 1}; and
+    // SciPy 1.17.1 is nan at x = 0: chndtrinc(0, 3, 0.5) = nan.
+    if df < 0.0 || x <= 0.0 || p <= 0.0 || p >= 1.0 {
+        return f64::NAN;
+    }
+    // x = inf: SciPy 1.17.1 chndtrinc(inf, 3, 0.5) = nan, while chndtr is 1.0 there
+    // (frankenscipy-g9yid).
+    if x == f64::INFINITY {
+        return f64::NAN;
+    }
+    let guess = (x - df).max(1.0);
+    crate::beta::bracket_and_solve_root(|nc| chndtr_inverse_residual(x, df, nc, p), guess, false)
 }
 
 /// Inverse complemented chi-squared distribution.
@@ -4137,13 +4628,13 @@ fn zetac_positive_rational(x: f64) -> f64 {
     }
 
     if x <= 10.0 {
-        let b = 2.0_f64.powf(x) * (x - 1.0);
+        let b = pow2_cephes(x) * (x - 1.0);
         let w = 1.0 / x;
         return (x * polevl(w, &ZETAC_P)) / (b * p1evl(w, &ZETAC_Q));
     }
 
     if x <= 50.0 {
-        let b = 2.0_f64.powf(-x);
+        let b = pow2_cephes(-x);
         let w = polevl(x, &ZETAC_A) / p1evl(x, &ZETAC_B);
         return w.exp() + b;
     }
@@ -4162,8 +4653,15 @@ fn zetac_positive_rational(x: f64) -> f64 {
             break;
         }
     }
-    let b = 2.0_f64.powf(-x);
+    let b = pow2_cephes(-x);
     (s + b) / (1.0 - b)
+}
+
+/// `pow(2, x)` as Cephes calls it. LLVM rewrites `2.0_f64.powf(x)` into `exp2(x)`, and glibc's
+/// `exp2` rounds differently from its `pow` on ~0.1% of arguments (108 of 100,000 on (1, 50)),
+/// which moved zetac an ulp or two off SciPy there. Hiding the base keeps the `pow` call.
+fn pow2_cephes(x: f64) -> f64 {
+    std::hint::black_box(2.0_f64).powf(x)
 }
 
 fn zeta_positive(s: f64) -> f64 {
@@ -4327,42 +4825,153 @@ pub fn zetac(s_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input_rp("zetac", s_tensor, mode, |s| Ok(zetac_scalar(s)), 1 << 15) // be ~30k
 }
 
-/// Compute the Riemann zeta function complement: zetac(s) = zeta(s) - 1 for scalar `s`.
+/// Riemann zeta function minus one, zetac(s) = ζ(s) - 1, for scalar `s`.
 ///
-/// Matches `scipy.special.zetac(s)`.
+/// Matches `scipy.special.zetac(s)`: xsf's Cephes `zetac`, bit-identical to SciPy 1.17.1 on
+/// 75,042 points.
+/// - s >= 0: `zetac_positive`, which is tabulated at integers 0..=30; the (1-x) rational R/S
+///   for s < 1; `zetac_positive_rational` beyond 1.
+/// - -0.01 < s < 0: a Taylor polynomial.
+/// - s <= -0.01: the reflection formula with Cephes' Lanczos sum.
 ///
-/// This is useful when zeta(s) is close to 1 (i.e., for large s > 1),
-/// where direct computation of zeta(s) - 1 would suffer from catastrophic
-/// cancellation. For large s, zetac(s) ≈ 2^(-s).
-///
-/// # Arguments
-/// * `s` - Real argument
-///
-/// # Returns
-/// ζ(s) - 1 for any real s ≠ 1
+/// It replaces a direct sum for s > 10, which stopped at an absolute 1e-18 term and so was
+/// 1e-9 relative off at s = 30, and `zeta(s) - 1` elsewhere, which was up to 5e-13 off on the
+/// negative axis (frankenscipy-i20cg).
 pub fn zetac_scalar(s: f64) -> f64 {
     if s.is_nan() {
+        return s;
+    }
+    if s == f64::NEG_INFINITY {
         return f64::NAN;
     }
+    if s < 0.0 && s > -0.01 {
+        return polevl(s, &ZETAC_TAYLOR0);
+    }
+    if s < 0.0 {
+        return zeta_reflection(-s) - 1.0;
+    }
     if s == 1.0 {
-        return f64::INFINITY; // pole of zeta
+        return f64::INFINITY;
     }
-    if s > 10.0 {
-        // For large s > 10, zetac(s) = sum_{n=2}^∞ n^(-s) ≈ 2^(-s) + 3^(-s) + ...
-        // Direct computation avoids subtraction from 1
-        let mut sum = 0.0_f64;
-        for n in 2..=100 {
-            let term = (n as f64).powf(-s);
-            if term < 1e-18 {
-                break;
-            }
-            sum += term;
+    if s < 1.0 {
+        // Integer 0 is tabulated (-1.5), as Cephes looks up integers before this branch.
+        if s == 0.0 {
+            return ZETAC_INTEGER[0];
         }
-        sum
-    } else {
-        // For smaller s, just compute zeta(s) - 1
-        zeta_scalar(s) - 1.0
+        return polevl(s, &ZETAC_R) / ((1.0 - s) * p1evl(s, &ZETAC_S));
     }
+    zetac_positive_rational(s)
+}
+
+/// `(1 - x)(ζ(x) - 1) = R(x)/S(x)` for `0 <= x <= 1`.
+#[allow(clippy::excessive_precision)]
+const ZETAC_R: [f64; 6] = [
+    -3.28717474506562731748E-1,
+    1.55162528742623950834E1,
+    -2.48762831680821954401E2,
+    1.01050368053237678329E3,
+    1.26726061410235149405E4,
+    -1.11578094770515181334E5,
+];
+
+/// Denominator for [`ZETAC_R`]; monic, so the leading `1.0` is implicit.
+#[allow(clippy::excessive_precision)]
+const ZETAC_S: [f64; 5] = [
+    1.95107674914060531512E1,
+    3.17710311750646984099E2,
+    3.03835500874445748734E3,
+    2.03665876435770579345E4,
+    7.43853965136767874343E4,
+];
+
+/// Taylor polynomial of `ζ(x) - 1` about 0, for `-0.01 < x < 0`, where the reflection's
+/// `1 - x` rounds to 1.
+#[allow(clippy::excessive_precision)]
+const ZETAC_TAYLOR0: [f64; 10] = [
+    -1.0000000009110164892,
+    -1.0000000057646759799,
+    -9.9999983138417361078e-1,
+    -1.0000013011460139596,
+    -1.000001940896320456,
+    -9.9987929950057116496e-1,
+    -1.000785194477042408,
+    -1.0031782279542924256,
+    -9.1893853320467274178e-1,
+    -1.5,
+];
+
+/// ζ(-x) for `x > 0` by the reflection formula (DLMF 25.4.2), as Cephes computes it: Cephes'
+/// Lanczos sum for Γ, with the large factors grouped so that they do not overflow first.
+fn zeta_reflection(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const SQRT2OPI: f64 = 7.978845608028653558798921198687637369517E-1;
+    let hx = x / 2.0;
+    if hx == hx.floor() {
+        // A zero of the sine factor: ζ at a negative even integer.
+        return 0.0;
+    }
+    let x_shift = x % 4.0;
+    let mut small_term = -SQRT2OPI * (0.5 * PI * x_shift).sin();
+    small_term *=
+        cephes_lanczos_sum_expg_scaled(x + 1.0) * crate::convenience::hurwitz_zeta(x + 1.0, 1.0);
+    let base = (x + CEPHES_LANCZOS_G + 0.5) / (2.0 * PI * std::f64::consts::E);
+    let large_term = base.powf(x + 0.5);
+    if large_term.is_finite() {
+        return large_term * small_term;
+    }
+    let large_term = base.powf(0.5 * x + 0.25);
+    (large_term * small_term) * large_term
+}
+
+/// Cephes' Lanczos `g` (Boost's lanczos13m53), which is exact in binary.
+#[allow(clippy::excessive_precision)]
+const CEPHES_LANCZOS_G: f64 = 6.024680040776729583740234375;
+
+/// Cephes `lanczos_sum_expg_scaled`: `ratevl` over the tables below, evaluated in `1/x` for
+/// `|x| > 1`. Numerator and denominator have equal degree, so Cephes' `pow(x, M - N)` factor is
+/// exactly 1.
+fn cephes_lanczos_sum_expg_scaled(x: f64) -> f64 {
+    #[allow(clippy::excessive_precision)]
+    const NUM: [f64; 13] = [
+        0.006061842346248906525783753964555936883222,
+        0.5098416655656676188125178644804694509993,
+        19.51992788247617482847860966235652136208,
+        449.9445569063168119446858607650988409623,
+        6955.999602515376140356310115515198987526,
+        75999.29304014542649875303443598909137092,
+        601859.6171681098786670226533699352302507,
+        3481712.15498064590882071018964774556468,
+        14605578.08768506808414169982791359218571,
+        43338889.32467613834773723740590533316085,
+        86363131.28813859145546927288977868422342,
+        103794043.1163445451906271053616070238554,
+        56906521.91347156388090791033559122686859,
+    ];
+    const DENOM: [f64; 13] = [
+        1.0,
+        66.0,
+        1925.0,
+        32670.0,
+        357423.0,
+        2637558.0,
+        13339535.0,
+        45995730.0,
+        105258076.0,
+        150917976.0,
+        120543840.0,
+        39916800.0,
+        0.0,
+    ];
+    let reversed = x.abs() > 1.0;
+    let y = if reversed { 1.0 / x } else { x };
+    let at = |table: &[f64; 13], i: usize| if reversed { table[12 - i] } else { table[i] };
+    let mut num = at(&NUM, 0);
+    let mut denom = at(&DENOM, 0);
+    for i in 1..13 {
+        num = num * y + at(&NUM, i);
+        denom = denom * y + at(&DENOM, i);
+    }
+    num / denom
 }
 
 // ============================================================================
@@ -7011,6 +7620,254 @@ mod tests {
         assert!(chndtrinc(8.0, 5.0, 1.0).is_nan());
     }
 
+    /// A NaN endpoint value leaves the chndtr inversion undefined. SciPy 1.17.1:
+    /// chndtrinc(inf, 3, 0.5) = nan, chndtridf(inf, 0.5, 2) = nan, chndtrinc(1, inf, 0.5) = nan.
+    /// fsci's chndtr was NaN at those bracket endpoints (x = inf with nc > 0, df = inf), and
+    /// `invert_monotone` folded fa/fb with `f64::min`/`max`, which drop the NaN: chndtrinc
+    /// returned the nc = 1e8 bound and chndtridf an Illinois iterate on NaN residuals.
+    /// Since frankenscipy-g9yid, chndtr(inf, df, nc) is SciPy's 1.0, and an explicit x = inf
+    /// guard in chndtrinc and chndtridf holds the x = inf rows. df = inf is still a NaN
+    /// endpoint.
+    /// Must not change, SciPy 1.17.1: chndtrinc(5, 3, 0.5) = 2.8985299934839217,
+    /// chndtridf(5, 0.5, 2) = 3.8373619908260497, and the below-range clamp
+    /// chndtrinc(2, 3, 0.5) = 2.65249474e-315 (fsci returned the nc = 0 bound until
+    /// frankenscipy-g9yid ported Boost's walk; the exact value is asserted in
+    /// `chndtridf_chndtrinc_follow_boosts_walk`).
+    #[test]
+    fn chndtr_inverses_return_nan_on_a_nan_endpoint_like_scipy() {
+        assert!(chndtrinc(f64::INFINITY, 3.0, 0.5).is_nan());
+        assert!(chndtridf(f64::INFINITY, 0.5, 2.0).is_nan());
+        assert!(chndtrinc(1.0, f64::INFINITY, 0.5).is_nan());
+        let nc = chndtrinc(5.0, 3.0, 0.5);
+        assert!(
+            (nc - 2.898_529_993_483_921_7).abs() < 1e-7,
+            "chndtrinc {nc}"
+        );
+        let df = chndtridf(5.0, 0.5, 2.0);
+        assert!(
+            (df - 3.837_361_990_826_049_7).abs() < 1e-7,
+            "chndtridf {df}"
+        );
+        let clamped = chndtrinc(2.0, 3.0, 0.5);
+        assert!(clamped.abs() < 1e-300, "chndtrinc clamp {clamped}");
+    }
+
+    /// frankenscipy-g9yid. chndtridf and chndtrinc follow Boost's `find_degrees_of_freedom` /
+    /// `find_non_centrality` walk (guess `max(x − nc, 1)` / `max(x − df, 1)`, factor 2, the
+    /// complement residual for `p ≥ 1/2`), which is what SciPy 1.17.1 runs. Every expected value
+    /// is SciPy read live. The first row of each group is one the old fixed-range search got
+    /// wrong: it returned its bound `1e-6` (chndtridf) or `0` (chndtrinc).
+    #[test]
+    fn chndtridf_chndtrinc_follow_boosts_walk() {
+        let p1 = 1.0 - f64::EPSILON / 2.0;
+        // No df > 0 (nc ≥ 0) reaches p, so the downward walk escapes below f64::MIN_POSITIVE
+        // and answers half of that point: guess·2⁻¹⁰⁴⁵.
+        let exact = [
+            (
+                "chndtridf(5, 0.5, 30)",
+                chndtridf(5.0, 0.5, 30.0),
+                2.65249474e-315,
+            ),
+            (
+                "chndtridf(5, 0.5, 1e8)",
+                chndtridf(5.0, 0.5, 1e8),
+                2.65249474e-315,
+            ),
+            (
+                "chndtridf(5, 1 - 2^-53, 2)",
+                chndtridf(5.0, p1, 2.0),
+                7.957484216e-315,
+            ),
+            (
+                "chndtridf(1e-300, 0.5, 2)",
+                chndtridf(1e-300, 0.5, 2.0),
+                2.65249474e-315,
+            ),
+            (
+                "chndtrinc(5, 3, 0.9)",
+                chndtrinc(5.0, 3.0, 0.9),
+                5.304989477e-315,
+            ),
+            (
+                "chndtrinc(30, 3, 0.9999999)",
+                chndtrinc(30.0, 3.0, 0.9999999),
+                7.1617357945e-314,
+            ),
+            (
+                "chndtrinc(2, 3, 0.5)",
+                chndtrinc(2.0, 3.0, 0.5),
+                2.65249474e-315,
+            ),
+        ];
+        for (label, got, want) in exact {
+            assert!(
+                got == want,
+                "{label} = {got:e}, SciPy 1.17.1 gives {want:e}"
+            );
+        }
+        // Domain edges SciPy answers NaN (the old search returned its bound at x = 0).
+        let nan_rows = [
+            ("chndtridf(0, 0.5, 2)", chndtridf(0.0, 0.5, 2.0)),
+            ("chndtrinc(0, 3, 0.5)", chndtrinc(0.0, 3.0, 0.5)),
+            ("chndtridf(5, 0.5, -1)", chndtridf(5.0, 0.5, -1.0)),
+            ("chndtridf(-1, 0.5, 2)", chndtridf(-1.0, 0.5, 2.0)),
+            ("chndtrinc(5, -1, 0.5)", chndtrinc(5.0, -1.0, 0.5)),
+            ("chndtrinc(5, 0, 0.5)", chndtrinc(5.0, 0.0, 0.5)),
+            ("chndtrinc(-1, 3, 0.5)", chndtrinc(-1.0, 3.0, 0.5)),
+        ];
+        for (label, got) in nan_rows {
+            assert!(got.is_nan(), "{label} = {got}, SciPy 1.17.1 gives nan");
+        }
+        // Roots outside the old fixed ranges, or on an underflow plateau of the CDF.
+        let roots = [
+            (
+                "chndtridf(3e10, 0.5, 2)",
+                chndtridf(3e10, 0.5, 2.0),
+                29999999998.66667,
+                1e-12,
+            ),
+            (
+                "chndtridf(5, 1e-300, 2)",
+                chndtridf(5.0, 1e-300, 2.0),
+                403.3387893865996,
+                1e-11,
+            ),
+            (
+                "chndtrinc(1e9, 3, 0.5)",
+                chndtrinc(1e9, 3.0, 0.5),
+                999999997.9999998,
+                1e-11,
+            ),
+            (
+                "chndtrinc(1000, 3, 1 - 2^-53)",
+                chndtrinc(1000.0, 3.0, p1),
+                546.465079667596,
+                1e-10,
+            ),
+            // Must not change: interior roots.
+            (
+                "chndtridf(5, 0.5, 2)",
+                chndtridf(5.0, 0.5, 2.0),
+                3.8373619908260497,
+                1e-12,
+            ),
+            (
+                "chndtrinc(5, 3, 0.5)",
+                chndtrinc(5.0, 3.0, 0.5),
+                2.8985299934839217,
+                1e-12,
+            ),
+        ];
+        for (label, got, want, rel) in roots {
+            assert!(
+                (got - want).abs() <= rel * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want} (rel tol {rel})"
+            );
+        }
+    }
+
+    /// frankenscipy-g9yid. chndtrix brackets by Boost's geometric walk, so a root far below 1 is
+    /// resolved to a relative tolerance. SciPy 1.17.1 values read live; the old `[0, hi]`
+    /// search returned 2.28e-19 for the first row (its absolute tolerance stopped at the first
+    /// false-position step).
+    #[test]
+    fn chndtrix_resolves_small_roots_like_scipy() {
+        let rows = [
+            (
+                "chndtrix(1e-20, 3, 2)",
+                chndtrix(1e-20, 3.0, 2.0),
+                2.1860014721757718e-13,
+            ),
+            (
+                "chndtrix(0.5, 3, 2)",
+                chndtrix(0.5, 3.0, 2.0),
+                4.137515123399119,
+            ),
+        ];
+        for (label, got, want) in rows {
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs(),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
+    /// frankenscipy-g9yid. chndtr and chndtrc at x = ±inf and at the edges of their domain,
+    /// against SciPy 1.17.1 read live (chndtrc mirrors scipy.stats.ncx2.sf):
+    ///
+    /// ```text
+    /// chndtr(inf, 3, 3) = 1.0        was nan: the mode anchor was exp(a·ln ∞ − ∞)
+    /// chndtr(inf, 1e-300, 3) = 1.0   was nan
+    /// ncx2.sf(inf, 3, 3) = 0.0       was nan
+    /// chndtr(-inf, 3, 3) = nan       was 0
+    /// chndtr(-2, 3, 3) = nan         was 0
+    /// chndtr(-2, 3, 0) = nan         was 0
+    /// chndtr(5, 0, 3) = nan          was a number: the walk took df + 2j0 as its dof
+    /// chndtr(5, -1, 3) = nan         was a number
+    /// chndtr(0, 0, 3) = nan          was 0
+    /// chndtr(5, 3, -1) = nan         was chdtr(3, 5)
+    /// ncx2.sf(5, 0, 3) = nan         was a number
+    /// ncx2.sf(0, -1, 3) = nan        was 1
+    /// ncx2.sf(5, 3, -1) = nan        was chdtrc(3, 5)
+    /// chndtridf(inf, 0.5, 3) = nan   chndtr's new 1.0 at x = inf would make both bracket
+    /// chndtrinc(inf, 3, 0.5) = nan   ends equal and return a bound, so x = inf is guarded
+    /// ```
+    ///
+    /// Must not change, SciPy 1.17.1: chndtr(0, 3, 3) = chndtr(-0.0, 3, 3) = 0.0,
+    /// chndtr(inf, 3, 0) = 1.0, ncx2.sf(-2, 3, 3) = ncx2.sf(0, 3, 3) = 1.0,
+    /// chndtr(5, inf, 3) = ncx2.sf(5, inf, 3) = nan, chndtr(5, 3, 3) = 0.4900713457395342 and
+    /// ncx2.sf(5, 3, 3) = 0.5099286542604659.
+    #[test]
+    fn chndtr_chndtrc_follow_scipy_at_infinite_x_and_domain_edges() {
+        let inf = f64::INFINITY;
+        let nan = f64::NAN;
+        for (label, got, want) in [
+            ("chndtr(inf, 3, 3)", chndtr(inf, 3.0, 3.0), 1.0),
+            ("chndtr(inf, 1e-300, 3)", chndtr(inf, 1e-300, 3.0), 1.0),
+            ("chndtrc(inf, 3, 3)", chndtrc(inf, 3.0, 3.0), 0.0),
+            ("chndtr(-inf, 3, 3)", chndtr(-inf, 3.0, 3.0), nan),
+            ("chndtr(-2, 3, 3)", chndtr(-2.0, 3.0, 3.0), nan),
+            ("chndtr(-2, 3, 0)", chndtr(-2.0, 3.0, 0.0), nan),
+            ("chndtr(5, 0, 3)", chndtr(5.0, 0.0, 3.0), nan),
+            ("chndtr(5, -1, 3)", chndtr(5.0, -1.0, 3.0), nan),
+            ("chndtr(0, 0, 3)", chndtr(0.0, 0.0, 3.0), nan),
+            ("chndtr(5, 3, -1)", chndtr(5.0, 3.0, -1.0), nan),
+            ("chndtrc(5, 0, 3)", chndtrc(5.0, 0.0, 3.0), nan),
+            ("chndtrc(0, -1, 3)", chndtrc(0.0, -1.0, 3.0), nan),
+            ("chndtrc(5, 3, -1)", chndtrc(5.0, 3.0, -1.0), nan),
+            ("chndtridf(inf, 0.5, 3)", chndtridf(inf, 0.5, 3.0), nan),
+            ("chndtrinc(inf, 3, 0.5)", chndtrinc(inf, 3.0, 0.5), nan),
+            // Must not change.
+            ("chndtr(0, 3, 3)", chndtr(0.0, 3.0, 3.0), 0.0),
+            ("chndtr(-0.0, 3, 3)", chndtr(-0.0, 3.0, 3.0), 0.0),
+            ("chndtr(inf, 3, 0)", chndtr(inf, 3.0, 0.0), 1.0),
+            ("chndtrc(-2, 3, 3)", chndtrc(-2.0, 3.0, 3.0), 1.0),
+            ("chndtrc(0, 3, 3)", chndtrc(0.0, 3.0, 3.0), 1.0),
+            ("chndtr(5, inf, 3)", chndtr(5.0, inf, 3.0), nan),
+            ("chndtrc(5, inf, 3)", chndtrc(5.0, inf, 3.0), nan),
+        ] {
+            let matches = if want.is_nan() {
+                got.is_nan()
+            } else {
+                got == want
+            };
+            assert!(matches, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+        for (label, got, want) in [
+            ("chndtr(5, 3, 3)", chndtr(5.0, 3.0, 3.0), 0.4900713457395342),
+            (
+                "chndtrc(5, 3, 3)",
+                chndtrc(5.0, 3.0, 3.0),
+                0.5099286542604659,
+            ),
+        ] {
+            assert!(
+                ((got - want) / want).abs() <= 1e-10,
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
+    }
+
     #[test]
     fn chdtriv_reference_values() {
         let cases = [
@@ -7893,14 +8750,83 @@ mod tests {
         // a non-positive integer. Independent of any specific value;
         // catches drift in either the recurrence-shift branch or the
         // asymptotic series. Pin across multiple x.
-        // 1e-9 envelope reflects the asymptotic-series truncation
-        // residual (~5e-11 for moderate x, growing with x).
         for &x in &[0.25_f64, 0.5, 1.5, 2.7, 5.3, 9.1, 17.4] {
             let lhs = digamma_core(x + 1.0);
             let rhs = digamma_core(x) + 1.0 / x;
             assert!(
                 (lhs - rhs).abs() < 1e-9,
                 "ψ({x}+1) = {lhs}, expected ψ({x}) + 1/{x} = {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn zetac_is_scipy_cephes_bit_for_bit() {
+        // scipy.special.zetac 1.17.1 in each Cephes branch: reflection, the small-negative
+        // Taylor polynomial, (1-x)R/S, the rational in 1/x, exp-rational, and the power sum.
+        // 30.5 was the regression: the old direct sum stopped at an absolute 1e-18 term. The
+        // four with 17 significant digits are where exp2(x) and pow(2, x) round apart: an
+        // optimised build turns `2.0.powf(x)` into exp2, which missed SciPy there by an ulp.
+        // Only `cargo test --release` can see that; the dev profile never rewrites the call.
+        let cases = [
+            (-18.05, -0.27543197971002975),
+            (-3.5, -0.9955589886645205),
+            (-0.005, -1.4954302623133413),
+            (0.5, -2.4603545088095866),
+            (1.5, 1.6123753486854882),
+            (1.372_713_090_679_940_5, 2.286_695_030_344_013),
+            (8.893_732_445_416_685, 0.002_164_711_184_352_902),
+            (10.244_420_980_078_344, 0.000_838_079_028_326_297_6),
+            (31.645_327_310_579_106, 2.977_202_803_942_258e-10),
+            (12.5, 0.0001737517336431782),
+            (30.0, 9.313274324196682e-10),
+            (30.5, 6.585473125700447e-10),
+            (60.0, 8.673617380119933e-19),
+        ];
+        for (s, want) in cases {
+            // Opaque, so an optimised build cannot constant-fold `pow(2, s)` with the host's
+            // `pow` and hide what the compiled call does at run time.
+            let got = zetac_scalar(std::hint::black_box(s));
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "zetac({s}) = {got:e}, SciPy {want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn digamma_is_scipy_xsf_bit_for_bit() {
+        // scipy.special.digamma 1.17.1. Both roots and their neighbours are the regression:
+        // the old shift-to-12 asymptotic cancelled ~2.5 - 2.5 there and was off by 1e-12
+        // relative or worse. -0.504..., -0.3 and -0.5040830081644554 take the zeta series;
+        // -10.5 the reflection; 7.0 the harmonic sum; 12.5 and 1e18 the asymptotic.
+        let cases = [
+            (1.4616321449683622, -9.241265521729427e-17),
+            (1.4616321449693623, 9.676658594180966e-13),
+            (1.46, -0.0015805619870834522),
+            (-0.5040830082644554, 7.289763902976895e-17),
+            (-0.5040830081644554, 8.939800027369837e-10),
+            (-0.3, 2.1133097796353972),
+            (0.3, -3.502524222200133),
+            (2.5, 0.7031566406452432),
+            (7.0, 1.872784335098467),
+            (12.5, 2.4851956512749123),
+            (-10.5, 2.3982391295357814),
+            (1e-300, -9.999999999999999e299),
+            (1e18, 41.44653167389282),
+        ];
+        for (x, expected) in cases {
+            let got = digamma_core(x);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(expected),
+                "digamma({x:e}) = {got:e}, SciPy {expected:e}"
+            );
+            assert_eq!(
+                crate::convenience::digamma_scalar(x).to_bits(),
+                got.to_bits(),
+                "convenience::digamma_scalar({x:e}) left the one kernel"
             );
         }
     }
@@ -7922,10 +8848,7 @@ mod tests {
             (3.0, 1.5 - gamma_em),
             (4.0, 1.0 + 0.5 + 1.0 / 3.0 - gamma_em),
         ];
-        // Tolerance reflects the ~2e-10 residual of the asymptotic-
-        // with-shift digamma_core (Euler-Maclaurin truncated at
-        // order 1/x⁷). Tighter than 1e-9 would require extending the
-        // series; pin the current envelope.
+        // Closed forms, not SciPy's doubles: `digamma_is_scipy_xsf_bit_for_bit` pins those.
         for &(x, expected) in cases {
             let got = digamma_core(x);
             assert!(

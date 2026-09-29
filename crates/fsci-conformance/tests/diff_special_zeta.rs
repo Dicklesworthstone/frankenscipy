@@ -13,13 +13,14 @@
 //! canonical for s>1, a>0; tightening only requires a higher-
 //! order Euler-Maclaurin expansion.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::hurwitz_zeta;
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -93,11 +95,6 @@ fn emit_log(log: &DiffLog) {
     let path = output_dir().join(format!("{}.json", log.test_id));
     let json = serde_json::to_string_pretty(log).expect("serialize zeta diff log");
     fs::write(path, json).expect("write zeta diff log");
-}
-
-fn fsci_eval(s: f64, a: f64) -> Option<f64> {
-    let v = hurwitz_zeta(s, a);
-    if v.is_finite() { Some(v) } else { None }
 }
 
 fn generate_query() -> OracleQuery {
@@ -212,29 +209,36 @@ fn diff_special_zeta() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_zeta", &["zeta"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.s, case.a)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let rel_diff = if scipy_v.abs() > 1.0 {
-                abs_diff / scipy_v.abs()
-            } else {
-                abs_diff
-            };
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let scale = scipy_v.abs().max(1.0);
-            let pass = abs_diff <= ABS_TOL || rel_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        // A non-finite fsci value is passed as is: the ledger classifies it against SciPy's.
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "zeta",
+            &case.case_id,
+            oracle.value,
+            Some(hurwitz_zeta(case.s, case.a)),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let rel_diff = if scipy_v.abs() > 1.0 {
+            abs_diff / scipy_v.abs()
+        } else {
+            abs_diff
+        };
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let scale = scipy_v.abs().max(1.0);
+        let pass = abs_diff <= ABS_TOL || rel_diff <= REL_TOL * scale;
+        ledger.compared("zeta", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -243,6 +247,7 @@ fn diff_special_zeta() {
         test_id: "diff_special_zeta".into(),
         category: "scipy.special.zeta".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -269,4 +274,5 @@ fn diff_special_zeta() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

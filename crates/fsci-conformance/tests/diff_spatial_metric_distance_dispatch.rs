@@ -4,19 +4,33 @@
 //!
 //! Resolves [frankenscipy-tkjro]. Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{DistanceMetric, metric_distance};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Every metric `generate_query` emits cases for: one ledger arm each.
+const ARMS: [&str; 10] = [
+    "euclidean",
+    "sqeuclidean",
+    "cityblock",
+    "chebyshev",
+    "cosine",
+    "correlation",
+    "canberra",
+    "braycurtis",
+    "hamming",
+    "jaccard",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -55,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -252,20 +267,21 @@ fn diff_spatial_metric_distance_dispatch() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_spatial_metric_distance_dispatch", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let ledger_arm = case.metric.as_str();
+        let Some((expected, actual)) = ledger.pair(
+            ledger_arm,
+            &case.case_id,
+            pmap.get(&case.case_id).and_then(|arm| arm.value),
+            parse_metric(&case.metric).map(|metric| metric_distance(&case.a, &case.b, metric)),
+        ) else {
             continue;
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Some(metric) = parse_metric(&case.metric) else {
-            continue;
-        };
-        let actual = metric_distance(&case.a, &case.b, metric);
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(ledger_arm, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             metric: case.metric.clone(),
@@ -280,6 +296,7 @@ fn diff_spatial_metric_distance_dispatch() {
         test_id: "diff_spatial_metric_distance_dispatch".into(),
         category: "fsci_spatial::metric_distance dispatcher vs scipy.spatial.distance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -303,4 +320,11 @@ fn diff_spatial_metric_distance_dispatch() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (hamming/jaccard 1, correlation 2, the rest 3).
+    let min_per_arm = ARMS
+        .iter()
+        .map(|m| query.points.iter().filter(|c| c.metric == *m).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

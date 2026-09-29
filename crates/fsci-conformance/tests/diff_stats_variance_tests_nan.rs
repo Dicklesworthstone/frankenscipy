@@ -14,13 +14,14 @@
 //! 3 group-set fixtures × 3 tests × 2 arms (statistic +
 //! pvalue) = 18 cases via subprocess. Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{bartlett_with_nan_policy, kruskal_with_nan_policy, levene_with_nan_policy};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -276,32 +278,44 @@ fn diff_stats_variance_tests_nan() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let tests = ["levene", "bartlett", "kruskal"];
+    let mut ledger = CompareLedger::new(
+        "diff_stats_variance_tests_nan",
+        &[
+            "levene_statistic",
+            "levene_pvalue",
+            "bartlett_statistic",
+            "bartlett_pvalue",
+            "kruskal_statistic",
+            "kruskal_pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let groups: Vec<&[f64]> = case.groups.iter().map(|g| g.as_slice()).collect();
-        let Some((stat, pval)) = fsci_eval(&case.test, &groups) else {
-            continue;
-        };
+        let result = fsci_eval(&case.test, &groups);
 
-        if let Some(scipy_stat) = scipy_arm.statistic {
-            let abs_diff = (stat - scipy_stat).abs();
+        let arms = [
+            (
+                "statistic",
+                scipy_arm.statistic,
+                result.map(|(stat, _)| stat),
+            ),
+            ("pvalue", scipy_arm.pvalue, result.map(|(_, pval)| pval)),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let ledger_arm = format!("{}_{arm}", case.test);
+            let Some((s, f)) = ledger.pair(&ledger_arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(&ledger_arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 test: case.test.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue {
-            let abs_diff = (pval - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                test: case.test.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -314,6 +328,7 @@ fn diff_stats_variance_tests_nan() {
         test_id: "diff_stats_variance_tests_nan".into(),
         category: "scipy.stats levene/bartlett/kruskal nan_policy='omit'".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -338,4 +353,10 @@ fn diff_stats_variance_tests_nan() {
         diffs.len(),
         max_overall
     );
+    let min_per_test = tests
+        .iter()
+        .map(|&test| query.points.iter().filter(|c| c.test == test).count())
+        .min()
+        .expect("variance_tests_nan declares its tests");
+    ledger.finish(min_per_test);
 }

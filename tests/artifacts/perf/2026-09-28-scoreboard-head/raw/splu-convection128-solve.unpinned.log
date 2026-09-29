@@ -1,0 +1,30 @@
+elf_sha256=cdd4b18dc5104a73a9af4583cb08174f6bbf96219f64d7d865b25b247a604258
+frankenscipy_engine_sha256=cdd4b18dc5104a73a9af4583cb08174f6bbf96219f64d7d865b25b247a604258
+elf_path=/data/projects/.worktrees/frankenscipy-scoreboard/rch-probe-bin/scoreboard/perf_splu
+provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=64 loadavg=9.19 14.54 20.43 9/3198 616544
+supernodal_arm=DISABLED (per-pivot elimination)
+partial_inplace_arm=ENABLED (coincident prefix updated in place)
+back_merge_arm=DISABLED (shared scratch plus copy-back)
+row_head_cache_arm=ENABLED (shipping dense head projection)
+fixture=convection_diffusion_2d side=128 rounds=21 warmup=4 arm=general-sparse-LU (cubic spectral fast path DISABLED)
+fixture_sha256=fdbb4bdd81cb15eef6aef1455144774c7f46931258e9ad3b94ae0fc08cb5f991 n=16384 nnz=81408
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+scipy_identity: READY scipy=1.17.1 numpy=2.4.3 engine_module=scipy.sparse.linalg._dsolve.linsolve scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388 fixture_sha256=fdbb4bdd81cb15eef6aef1455144774c7f46931258e9ad3b94ae0fc08cb5f991 n=16384 nnz=81408 lu_nnz=1221240 observed_os_tasks=1 affinity=64 fsci_loaded=False genuine=True
+parity: worst_rel_solution_diff=2.509e-14 scale=6.886019e2
+fsci_arm_ordering=ReverseCuthillMcKee
+execution_proof: fsci_backend=NativeSparseLu fsci_ordering=ReverseCuthillMcKee fsci_lu_payload_bytes=34337296 scipy_lu_nnz=0 cubic_spectral_factor_hits=0 cubic_spectral_toggle_reads=1 arm_expected_spectral=false
+execution_proof: row_head_cache_enabled=true row_head_cache_factor_hits=0 row_head_cache_toggle_reads=0
+execution_proof: back_merge_enabled=false back_merge_factor_hits=0 back_merge_toggle_reads=0
+execution_proof: partial_inplace_enabled=true partial_inplace_factor_hits=0 partial_inplace_toggle_reads=0
+execution_proof: banded_eliminate_ms=0.000 banded_unpack_ms=0.000 unpack_share=0.0000 unpack_reserve=true unpack_reserve_hits=1 instrumented=false
+execution_proof: banded_requested=true banded_factor_hits=1
+splu_stages: ordering_ms=0.000 (0.00%) setup_ms=0.000 (0.00%) eliminate_ms=0.000 (0.00%) assemble_ms=0.000 (0.00%) one_time_share=0.0000
+execution_proof: contiguous_solve_enabled=true contiguous_solve_hits=1349
+execution_proof: swap_writeback_enabled=false swap_writeback_hits=0
+execution_proof: supernodal_enabled=false supernodal_factor_hits=0 supernodal_toggle_reads=1
+pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.095) post_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.089)
+NULL scipy/scipy=1.0078 NULL fsci/fsci=0.9966 bound=+/-0.02 null_edge=0.0078 decided_if_ci_lo>1.0155_or_ci_hi<0.9845
+quiescence=clear method=balanced-square criterion=both_A/A_nulls_within_0.020
+absolute: scipy_median_ns=30726029 ci95=[29621512,31222164] fsci_median_ns=53455818 ci95=[53244988,54802624] scipy_median_us=30726.029 fsci_median_us=53455.818
+per_unit: scipy_ns_per_lu_nonzero=NaN fsci_ns_per_lu_nonzero=NaN scipy_ns_per_row=1875.37 fsci_ns_per_row=3262.68 lu_nnz=0 n=16384
+Incumbent ratio: SciPy / FrankenSciPy = 0.5649x  ci95=[0.5460,0.5767]  rounds=21  verdict=ADMISSIBLE: FrankenSciPy SLOWER

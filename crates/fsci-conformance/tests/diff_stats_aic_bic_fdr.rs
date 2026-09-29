@@ -17,13 +17,14 @@
 //! (3 fixtures × 2 methods, vector compared) = 18 cases via
 //! subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{aic, bic, false_discovery_control};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -266,69 +268,63 @@ fn diff_stats_aic_bic_fdr() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_aic_bic_fdr",
+        &["aic", "bic", "false_discovery_control"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
-            "aic" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = aic(case.log_lik, case.n_params as usize);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
-            "bic" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = bic(
+            "aic" | "bic" => {
+                let rust_v = if case.func == "aic" {
+                    aic(case.log_lik, case.n_params as usize)
+                } else {
+                    bic(
                         case.log_lik,
                         case.n_params as usize,
                         case.n_samples as usize,
-                    );
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
+                    )
+                };
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair(&case.func, &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= ABS_TOL,
+                });
             }
             "false_discovery_control" => {
-                if let Some(scipy_vec) = &scipy_arm.vector {
-                    let rust_vec = match false_discovery_control(&case.pvalues, Some(&case.method))
-                    {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
-                    }
+                let rust_vec = false_discovery_control(&case.pvalues, Some(&case.method)).ok();
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    &case.func,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    rust_vec.as_deref(),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    max_local = max_local.max((a - b).abs());
                 }
+                max_overall = max_overall.max(max_local);
+                ledger.compared(&case.func, &case.case_id, max_local <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff: max_local,
+                    pass: max_local <= ABS_TOL,
+                });
             }
-            _ => {}
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -338,6 +334,7 @@ fn diff_stats_aic_bic_fdr() {
         test_id: "diff_stats_aic_bic_fdr".into(),
         category: "aic + bic + false_discovery_control".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -362,4 +359,5 @@ fn diff_stats_aic_bic_fdr() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "aic").count());
 }

@@ -10,13 +10,14 @@
 //! - `kaiserord(ripple, width)`: returns (numtaps, beta) — Kaiser's
 //!   empirical FIR-design formula. Compare against scipy.signal.kaiserord.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{hz_to_mel, kaiserord, mel_to_hz};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -228,28 +230,43 @@ fn diff_signal_hz_mel_kaiserord() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arm_names = ["hz2mel", "mel2hz", "kord"];
+    let mut ledger = CompareLedger::new("diff_signal_hz_mel_kaiserord", &arm_names);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let abs_d = match case.op.as_str() {
-            "hz2mel" => (hz_to_mel(case.x) - expected[0]).abs(),
-            "mel2hz" => (mel_to_hz(case.x) - expected[0]).abs(),
-            "kord" => {
-                let Ok((numtaps, beta)) = kaiserord(case.ripple, case.width) else {
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
+        let op = case.op.as_str();
+        let abs_d = match op {
+            "hz2mel" | "mel2hz" => {
+                let fsci = if op == "hz2mel" {
+                    hz_to_mel(case.x)
+                } else {
+                    mel_to_hz(case.x)
+                };
+                let scipy = arm.values.as_ref().and_then(|v| v.first().copied());
+                let Some((expected, got)) = ledger.pair(op, &case.case_id, scipy, Some(fsci))
+                else {
                     continue;
                 };
-                let d_taps = (numtaps as f64 - expected[0]).abs();
-                let d_beta = (beta - expected[1]).abs();
+                (got - expected).abs()
+            }
+            "kord" => {
+                let fsci_v = kaiserord(case.ripple, case.width)
+                    .ok()
+                    .map(|(numtaps, beta)| vec![numtaps as f64, beta]);
+                let Some((expected, got)) =
+                    ledger.slices(op, &case.case_id, arm.values.as_deref(), fsci_v.as_deref())
+                else {
+                    continue;
+                };
+                let d_taps = (got[0] - expected[0]).abs();
+                let d_beta = (got[1] - expected[1]).abs();
                 d_taps.max(d_beta)
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -264,6 +281,7 @@ fn diff_signal_hz_mel_kaiserord() {
         test_id: "diff_signal_hz_mel_kaiserord".into(),
         category: "fsci_signal::{hz_to_mel, mel_to_hz, kaiserord} vs scipy/numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -284,4 +302,10 @@ fn diff_signal_hz_mel_kaiserord() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = arm_names
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

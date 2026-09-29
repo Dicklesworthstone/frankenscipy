@@ -10,13 +10,14 @@
 //!
 //! 5 fixtures × 2 functions = 10 cases. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{directed_hausdorff, hausdorff_distance};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -236,15 +238,27 @@ fn diff_spatial_hausdorff() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_hausdorff",
+        &["directed_hausdorff(a,b)", "hausdorff_distance"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
-        if let Some(scipy_ab) = scipy_arm.directed_ab
-            && let Ok(rust_ab) = directed_hausdorff(&case.xa, &case.xb)
-        {
+        if let Some((scipy_ab, rust_ab)) = ledger.pair(
+            "directed_hausdorff(a,b)",
+            &case.case_id,
+            scipy_arm.directed_ab,
+            directed_hausdorff(&case.xa, &case.xb).ok(),
+        ) {
             let abs_diff = (rust_ab - scipy_ab).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(
+                "directed_hausdorff(a,b)",
+                &case.case_id,
+                abs_diff <= ABS_TOL,
+            );
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 fn_name: "directed_hausdorff(a,b)".into(),
@@ -255,11 +269,15 @@ fn diff_spatial_hausdorff() {
             });
         }
 
-        if let Some(scipy_sym) = scipy_arm.symmetric
-            && let Ok(rust_sym) = hausdorff_distance(&case.xa, &case.xb)
-        {
+        if let Some((scipy_sym, rust_sym)) = ledger.pair(
+            "hausdorff_distance",
+            &case.case_id,
+            scipy_arm.symmetric,
+            hausdorff_distance(&case.xa, &case.xb).ok(),
+        ) {
             let abs_diff = (rust_sym - scipy_sym).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared("hausdorff_distance", &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 fn_name: "hausdorff_distance".into(),
@@ -277,6 +295,7 @@ fn diff_spatial_hausdorff() {
         test_id: "diff_spatial_hausdorff".into(),
         category: "fsci_spatial::directed_hausdorff + hausdorff_distance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -301,4 +320,5 @@ fn diff_spatial_hausdorff() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -15,13 +15,14 @@
 //! `P(X=j) for j in 0..=n where P(X=j) <= P(X=k)`, which is
 //! a closed-form rational arithmetic chain.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::binomtest;
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -216,32 +218,35 @@ fn diff_stats_binomtest() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_binomtest", &["binomtest"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = scipy_arm.pvalue {
-            // binomtest now returns Result: scipy validates k/n/p and raises,
-            // so we do too (frankenscipy-xb7so). We are inside `if let Some(scipy_v)`,
-            // meaning the ORACLE produced a p-value for this case -- so a refusal
-            // here is a genuine divergence, not a case to skip. Skipping it would
-            // be the silent-empty-column failure: a green pass over a case that
-            // tested nothing.
-            let rust_v = binomtest(case.k, case.n, case.p).unwrap_or_else(|e| {
-                panic!(
-                    "case {}: scipy returned pvalue {scipy_v} but binomtest refused (k={}, n={}, p={}): {e:?}",
+        // binomtest returns Result: scipy validates k/n/p and raises, so we do
+        // too (frankenscipy-xb7so). Where the ORACLE produced a p-value, a
+        // refusal here is a genuine divergence, not a case to skip: the ledger
+        // records it as an fsci failure and `finish` fails the test on it.
+        let rust_v = binomtest(case.k, case.n, case.p)
+            .inspect_err(|e| {
+                eprintln!(
+                    "case {}: binomtest refused (k={}, n={}, p={}): {e:?}",
                     case.case_id, case.k, case.n, case.p
-                )
-            });
-            if rust_v.is_finite() {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
-        }
+                );
+            })
+            .ok();
+        let Some((scipy_v, rust_v)) =
+            ledger.pair("binomtest", &case.case_id, scipy_arm.pvalue, rust_v)
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared("binomtest", &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -250,6 +255,7 @@ fn diff_stats_binomtest() {
         test_id: "diff_stats_binomtest".into(),
         category: "scipy.stats.binomtest(k,n,p).pvalue".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -271,4 +277,5 @@ fn diff_stats_binomtest() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

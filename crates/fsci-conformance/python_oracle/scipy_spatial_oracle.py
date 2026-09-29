@@ -97,9 +97,8 @@ def _run_case(case: Dict[str, Any], np: Any, spatial: Any, distance: Any) -> Dic
             # br-d1jx: scipy.spatial.Voronoi parity. Emit only
             # permutation-invariant scalars + lex-sorted vertex
             # multiset since region / ridge orderings have no
-            # canonical sort. Cospherical degenerate inputs can
-            # collapse to fewer vertices in scipy's Qhull-backed
-            # impl than fsci's Delaunay-dual triangulation reports.
+            # canonical sort. Cospherical inputs collapse to one
+            # vertex per merged cell, in scipy's Qhull and in fsci.
             points = np.asarray(args[0], dtype=float)
             v = spatial.Voronoi(points)
             sorted_v = sorted(v.vertices.tolist(), key=lambda p: (p[0], p[1]))

@@ -14,18 +14,14 @@ impl Lcg {
 fn main() {
     let mut r = Lcg(11);
     for &n in &[3000usize, 10000] {
-        let pts: Vec<(f64, f64)> = (0..n).map(|_| (r.u(), r.u())).collect();
+        let pts: Vec<Vec<f64>> = (0..n).map(|_| vec![r.u(), r.u()]).collect();
         let nq = 200000usize;
-        let xi: Vec<(f64, f64)> = (0..nq).map(|_| (r.u(), r.u())).collect();
+        let xi: Vec<Vec<f64>> = (0..nq).map(|_| vec![r.u(), r.u()]).collect();
         let mut f =
             std::io::BufWriter::new(std::fs::File::create(format!("/tmp/del_{n}.f64")).unwrap());
-        for &(x, y) in &pts {
-            f.write_all(&x.to_le_bytes()).unwrap();
-            f.write_all(&y.to_le_bytes()).unwrap();
-        }
-        for &(x, y) in &xi {
-            f.write_all(&x.to_le_bytes()).unwrap();
-            f.write_all(&y.to_le_bytes()).unwrap();
+        for p in pts.iter().chain(&xi) {
+            f.write_all(&p[0].to_le_bytes()).unwrap();
+            f.write_all(&p[1].to_le_bytes()).unwrap();
         }
         drop(f);
         let tb = {
@@ -46,7 +42,7 @@ fn main() {
             let mut b = std::time::Duration::MAX;
             for _ in 0..6 {
                 let t = Instant::now();
-                let s = tsearch(&tri, &xi);
+                let s = tsearch(&tri, &xi).unwrap();
                 let e = t.elapsed();
                 std::hint::black_box(s.len());
                 if e < b {

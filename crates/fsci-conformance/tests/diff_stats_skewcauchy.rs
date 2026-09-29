@@ -8,13 +8,14 @@
 //! subprocess and asserts byte-stable agreement on pdf and cdf at
 //! tol 1e-12. Skips cleanly if scipy/python3 is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, SkewCauchy};
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     pass: bool,
@@ -190,21 +192,32 @@ fn diff_stats_skewcauchy() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_skewcauchy", &["pdf", "cdf"]);
 
     for case in &cases {
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let (Some(scipy_pdf), Some(scipy_cdf)) = (oracle.pdf, oracle.cdf) else {
+        let dist = SkewCauchy::new(case.a);
+        let arms = [
+            ("pdf", oracle.pdf, dist.pdf(case.x)),
+            ("cdf", oracle.cdf, dist.cdf(case.x)),
+        ];
+        let mut arm_diffs: [Option<f64>; 2] = [None; 2];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
+            max_overall = max_overall.max(d);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = Some(d);
+        }
+        // The combined row needs both arms; a missing one is already in the ledger.
+        let [Some(pdf_diff), Some(cdf_diff)] = arm_diffs else {
             continue;
         };
-        let dist = SkewCauchy::new(case.a);
-        let rust_pdf = dist.pdf(case.x);
-        let rust_cdf = dist.cdf(case.x);
-        let pdf_diff = (rust_pdf - scipy_pdf).abs();
-        let cdf_diff = (rust_cdf - scipy_cdf).abs();
         let pass = pdf_diff <= ABS_TOL && cdf_diff <= ABS_TOL;
-        max_overall = max_overall.max(pdf_diff).max(cdf_diff);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             pdf_diff,
@@ -219,6 +232,7 @@ fn diff_stats_skewcauchy() {
         test_id: "diff_stats_skewcauchy".into(),
         category: "scipy.stats.skewcauchy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         pass: all_pass,
@@ -244,4 +258,5 @@ fn diff_stats_skewcauchy() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

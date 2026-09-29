@@ -3,18 +3,22 @@
 //!
 //! Covers `scipy.fft.hfft2`, `ihfft2`, `hfftn`, and `ihfftn`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{Complex64, FftOptions, hfft2, hfftn, ihfft2, ihfftn};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-005";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const TOL: f64 = 1e-8;
+/// One ledger arm per SciPy entrypoint compared.
+const ARMS: [&str; 4] = ["ihfft2", "hfft2", "ihfftn", "hfftn"];
 
 #[derive(Debug, Clone, Serialize)]
 struct CasePoint {
@@ -56,6 +60,7 @@ struct DiffLog<'a> {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -232,11 +237,14 @@ fn max_abs_diff_real(lhs: &[f64], rhs: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-fn max_abs_diff_complex(lhs: &[Complex64], rhs: &[Complex64]) -> f64 {
-    lhs.iter()
-        .zip(rhs.iter())
-        .map(|(&(lr, li), &(rr, ri))| (lr - rr).abs().max((li - ri).abs()))
-        .fold(0.0_f64, f64::max)
+/// Interleaved `[re, im, re, im, ...]`: the max of the element-wise |diff| over this is the
+/// max over elements of `max(|d_re|, |d_im|)`, and `ledger.slices` sees every component.
+fn interleave_complex(values: &[Complex64]) -> Vec<f64> {
+    values.iter().flat_map(|&(re, im)| [re, im]).collect()
+}
+
+fn interleave_pairs(values: &[[f64; 2]]) -> Vec<f64> {
+    values.iter().flatten().copied().collect()
 }
 
 #[test]
@@ -250,40 +258,55 @@ fn diff_fft_hfft_nd() -> Result<(), String> {
     let opts = FftOptions::default();
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_fft_hfft_nd", &ARMS);
 
     for (case, expected) in query.cases.iter().zip(oracle.cases.iter()) {
         assert_eq!(case.case_id, expected.case_id);
-        let max_abs_diff = match case.op {
+        // (SciPy's output, fsci's output), both flattened to f64 so the ledger checks length and
+        // every component. The hfft ops take SciPy's own ihfft spectrum as their input.
+        let (scipy_out, fsci_out): (Option<Vec<f64>>, Option<Vec<f64>>) = match case.op {
             "ihfft2" => {
                 let shape = shape2(&case.shape)?;
-                let actual = ihfft2(&case.values, shape, &opts).expect("ihfft2");
-                let expected_complex =
-                    complex_from_pairs(expected.complex.as_ref().expect("oracle complex"));
-                max_abs_diff_complex(&actual, &expected_complex)
+                let actual = ihfft2(&case.values, shape, &opts).ok();
+                (
+                    expected.complex.as_deref().map(interleave_pairs),
+                    actual.as_deref().map(interleave_complex),
+                )
             }
             "ihfftn" => {
-                let actual = ihfftn(&case.values, &case.shape, &opts).expect("ihfftn");
-                let expected_complex =
-                    complex_from_pairs(expected.complex.as_ref().expect("oracle complex"));
-                max_abs_diff_complex(&actual, &expected_complex)
+                let actual = ihfftn(&case.values, &case.shape, &opts).ok();
+                (
+                    expected.complex.as_deref().map(interleave_pairs),
+                    actual.as_deref().map(interleave_complex),
+                )
             }
             "hfft2" => {
                 let shape = shape2(&case.shape)?;
-                let spectrum = complex_from_pairs(
-                    expected.input_complex.as_ref().expect("oracle hfft2 input"),
-                );
-                let actual = hfft2(&spectrum, shape, &opts).expect("hfft2");
-                max_abs_diff_real(&actual, expected.real.as_ref().expect("oracle real"))
+                let actual = expected
+                    .input_complex
+                    .as_deref()
+                    .and_then(|input| hfft2(&complex_from_pairs(input), shape, &opts).ok());
+                (expected.real.clone(), actual)
             }
             "hfftn" => {
-                let spectrum = complex_from_pairs(
-                    expected.input_complex.as_ref().expect("oracle hfftn input"),
-                );
-                let actual = hfftn(&spectrum, &case.shape, &opts).expect("hfftn");
-                max_abs_diff_real(&actual, expected.real.as_ref().expect("oracle real"))
+                let actual = expected
+                    .input_complex
+                    .as_deref()
+                    .and_then(|input| hfftn(&complex_from_pairs(input), &case.shape, &opts).ok());
+                (expected.real.clone(), actual)
             }
             other => return Err(format!("unknown hfft n-d op: {other}")),
         };
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            case.op,
+            case.case_id,
+            scipy_out.as_deref(),
+            fsci_out.as_deref(),
+        ) else {
+            continue;
+        };
+        let max_abs_diff = max_abs_diff_real(fsci_v, scipy_v);
+        ledger.compared(case.op, case.case_id, max_abs_diff <= TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id,
             op: case.op,
@@ -298,6 +321,7 @@ fn diff_fft_hfft_nd() -> Result<(), String> {
         test_id: "diff_fft_hfft_nd".into(),
         category: "scipy.fft hfft2/ihfft2/hfftn/ihfftn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -314,12 +338,18 @@ fn diff_fft_hfft_nd() -> Result<(), String> {
         }
     }
 
-    if all_pass {
-        Ok(())
-    } else {
-        Err(format!(
+    if !all_pass {
+        return Err(format!(
             "scipy.fft Hermitian n-D conformance failed: {} cases",
             diffs.len()
-        ))
+        ));
     }
+    // Each op has its own case set; every arm must compare all of its cases.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.cases.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
+    Ok(())
 }

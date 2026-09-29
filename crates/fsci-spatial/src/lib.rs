@@ -7,10 +7,13 @@
 //! - `KDTree` — k-d tree for fast nearest-neighbor queries
 //! - `cKDTree` — SciPy parity alias to `KDTree`
 //! - `Rectangle` — hyperrectangle utility used by SciPy spatial search
-//! - `HalfspaceIntersection` — N-D halfspace intersection
+//! - `ConvexHull`, `Delaunay`, `Voronoi`, `HalfspaceIntersection` — N-D Qhull-equivalent
+//!   geometry on an exact-predicate Quickhull (`qhull` module)
 //! - `distance` — pairwise distance computations
 
 use std::collections::BTreeMap;
+
+mod qhull;
 
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
@@ -684,7 +687,8 @@ pub fn braycurtis(a: &[f64], b: &[f64]) -> f64 {
         }
         (num, den)
     };
-    if den == 0.0 { 0.0 } else { num / den }
+    // Plain IEEE division, as SciPy: Σ|a+b| = 0 gives inf (a = -b ≠ 0) or NaN (a = b = 0).
+    num / den
 }
 
 fn relative_entropy(x: f64, y: f64) -> f64 {
@@ -2451,15 +2455,14 @@ fn cdist_row_canberra_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
 }
 
 /// SoA-across-pairs Bray-Curtis cdist row (small `d`): per-lane
-/// `Σ|ai[k]-b[k][lane]| / Σ|ai[k]+b[k][lane]|` with the `den==0 ⇒ 0` guard. The
-/// numerator/denominator left-folds over `k=0..d` match the scalar `braycurtis`
-/// helper's two `.sum()` passes (same accumulation order), so this is bit-identical
-/// for `d < 8`.
+/// `Σ|ai[k]-b[k][lane]| / Σ|ai[k]+b[k][lane]|` by plain IEEE division, as SciPy (a zero
+/// denominator gives inf or NaN). The numerator/denominator left-folds over `k=0..d` match
+/// the scalar `braycurtis` helper's two `.sum()` passes (same accumulation order), so this is
+/// bit-identical for `d < 8`.
 fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
-    use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdFloat};
+    use std::simd::{Simd, num::SimdFloat};
     const L: usize = 8;
     let d = ai.len();
-    let zero = Simd::<f64, L>::splat(0.0);
     let mut row = vec![0.0_f64; nb];
     let mut j = 0usize;
     while j + L <= nb {
@@ -2471,7 +2474,7 @@ fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
             num += (av - bv).abs();
             den += (av + bv).abs();
         }
-        let res = den.simd_eq(zero).select(zero, num / den);
+        let res = num / den;
         res.copy_to_slice(&mut row[j..j + L]);
         j += L;
     }
@@ -2481,7 +2484,7 @@ fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
             num += (ai[k] - b[k][j]).abs();
             den += (ai[k] + b[k][j]).abs();
         }
-        row[j] = if den == 0.0 { 0.0 } else { num / den };
+        row[j] = num / den;
         j += 1;
     }
     row
@@ -4116,124 +4119,235 @@ fn ball_search(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Convex Hull (2D)
+// Qhull-equivalent geometry: shared input handling
+// ══════════════════════════════════════════════════════════════════════
+//
+// `ConvexHull`, `Delaunay`, `Voronoi` and `HalfspaceIntersection` are N-dimensional, as SciPy's
+// Qhull-backed classes are, and are built on the exact-predicate Quickhull in `qhull.rs`.
+// Facet, simplex, vertex and ridge ORDER is Qhull's implementation artifact and is not
+// reproduced; the sets, the geometry and SciPy's documented orderings (counterclockwise 2-D hull
+// vertices, counterclockwise 2-D Delaunay simplices, `-1` placement in Voronoi lists) are.
+
+/// Validate an `(npoints, ndim)` point array the way SciPy's `_Qhull` does, and flatten it.
+fn qhull_input(points: &[Vec<f64>]) -> Result<(usize, Vec<f64>), SpatialError> {
+    let Some(first) = points.first() else {
+        return Err(SpatialError::InvalidArgument("No points given".to_string()));
+    };
+    let ndim = first.len();
+    if ndim < 2 {
+        return Err(SpatialError::InvalidArgument(
+            "Need at least 2-D data".to_string(),
+        ));
+    }
+    let mut flat = Vec::with_capacity(points.len() * ndim);
+    for row in points {
+        if row.len() != ndim {
+            return Err(SpatialError::DimensionMismatch {
+                expected: ndim,
+                actual: row.len(),
+            });
+        }
+        if row.iter().any(|value| value.is_nan()) {
+            return Err(SpatialError::InvalidArgument(
+                "Points cannot contain NaN".to_string(),
+            ));
+        }
+        if row.iter().any(|value| value.is_infinite()) {
+            return Err(SpatialError::InvalidArgument(
+                "Points cannot contain infinite values".to_string(),
+            ));
+        }
+        flat.extend_from_slice(row);
+    }
+    Ok((ndim, flat))
+}
+
+fn kernel_error(err: qhull::KernelError) -> SpatialError {
+    match err {
+        qhull::KernelError::TooFewPoints { have, need } => qhull_error(format!(
+            "QH6214 qhull input error: not enough points({have}) to construct initial simplex (need {need})"
+        )),
+        qhull::KernelError::Flat => qhull_error(
+            "QH6154 Qhull precision error: Initial simplex is flat (a facet is coplanar with the interior point)",
+        ),
+        qhull::KernelError::Topology => {
+            qhull_error("qhull internal error: the horizon of a visible region did not close")
+        }
+    }
+}
+
+fn coordinate_bounds(points: &[Vec<f64>], ndim: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut min_bound = vec![f64::INFINITY; ndim];
+    let mut max_bound = vec![f64::NEG_INFINITY; ndim];
+    for row in points {
+        for (k, &value) in row.iter().enumerate() {
+            min_bound[k] = min_bound[k].min(value);
+            max_bound[k] = max_bound[k].max(value);
+        }
+    }
+    (min_bound, max_bound)
+}
+
+/// `[unit normal, offset]` and the (ndim-1)-volume of each facet, from the input coordinates.
+fn facet_equations(points: &[Vec<f64>], facets: &[Vec<usize>]) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let mut equations = Vec::with_capacity(facets.len());
+    let mut measures = Vec::with_capacity(facets.len());
+    for facet in facets {
+        let rows: Vec<&[f64]> = facet.iter().map(|&i| points[i].as_slice()).collect();
+        let (mut normal, offset, measure) = qhull::hyperplane(&rows);
+        normal.push(offset);
+        equations.push(normal);
+        measures.push(measure);
+    }
+    (equations, measures)
+}
+
+/// Volume of a hull as the sum of the pyramids from an interior point to every facet.
+fn hull_volume(
+    points: &[Vec<f64>],
+    vertices: &[usize],
+    equations: &[Vec<f64>],
+    measures: &[f64],
+) -> f64 {
+    let ndim = equations.first().map_or(0, |eq| eq.len() - 1);
+    if ndim == 0 || vertices.is_empty() {
+        return 0.0;
+    }
+    let mut center = vec![0.0; ndim];
+    for &v in vertices {
+        for (c, x) in center.iter_mut().zip(&points[v]) {
+            *c += x;
+        }
+    }
+    for c in &mut center {
+        *c /= vertices.len() as f64;
+    }
+    equations
+        .iter()
+        .zip(measures)
+        .map(|(eq, measure)| {
+            let dist = -(eq[..ndim]
+                .iter()
+                .zip(&center)
+                .map(|(n, c)| n * c)
+                .sum::<f64>()
+                + eq[ndim]);
+            measure * dist / ndim as f64
+        })
+        .sum()
+}
+
+/// Counterclockwise vertex cycle of a 2-D hull. Every facet `[a, b]` of the kernel has the
+/// interior on its right (clockwise), so `b -> a` runs counterclockwise. Starts at the lowest
+/// point index; SciPy starts wherever Qhull's facet list does.
+fn counterclockwise_cycle(facets: &[Vec<usize>], npoints: usize) -> Vec<usize> {
+    let mut next = vec![usize::MAX; npoints];
+    let mut start = usize::MAX;
+    for facet in facets {
+        next[facet[1]] = facet[0];
+        start = start.min(facet[1]);
+    }
+    let mut cycle = Vec::with_capacity(facets.len());
+    let mut current = start;
+    while current != usize::MAX && cycle.len() < facets.len() {
+        cycle.push(current);
+        current = next[current];
+        if current == start {
+            break;
+        }
+    }
+    cycle
+}
+
+fn sorted_unique_vertices(facets: &[Vec<usize>]) -> Vec<usize> {
+    let mut vertices: Vec<usize> = facets.iter().flatten().copied().collect();
+    vertices.sort_unstable();
+    vertices.dedup();
+    vertices
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Convex Hull (N-D)
 // ══════════════════════════════════════════════════════════════════════
 
-/// Result of a 2D convex hull computation.
-///
-/// Matches `scipy.spatial.ConvexHull(points)` for 2D point sets.
+/// Convex hull of an N-dimensional point set, matching `scipy.spatial.ConvexHull(points)` with
+/// SciPy's default options (`"Qt"` always, `"Qx"` from 5-D up): triangulated facets, and points
+/// on the hull boundary that are not extreme are not vertices.
 #[derive(Debug, Clone)]
 pub struct ConvexHull {
-    /// Indices of input points that form the convex hull (in CCW order).
+    /// Input points, `(npoints, ndim)`.
+    pub points: Vec<Vec<f64>>,
+    /// Dimension of the points.
+    pub ndim: usize,
+    /// Number of input points.
+    pub npoints: usize,
+    /// Indices of the hull vertices: counterclockwise in 2-D (as SciPy), ascending otherwise
+    /// (SciPy's "input order").
     pub vertices: Vec<usize>,
-    /// Hull edges as pairs of vertex indices (into the original points array).
-    pub simplices: Vec<(usize, usize)>,
-    /// Area enclosed by the convex hull.
+    /// Simplicial facets, `(nfacet, ndim)` point indices.
+    pub simplices: Vec<Vec<usize>>,
+    /// `neighbors[i][k]` is the facet sharing every vertex of facet `i` except
+    /// `simplices[i][k]`.
+    pub neighbors: Vec<Vec<usize>>,
+    /// `[normal, offset]` per facet, `(nfacet, ndim + 1)`: unit outward normal, and
+    /// `normal . x + offset <= 0` for every point of the hull.
+    pub equations: Vec<Vec<f64>>,
+    /// `[point, facet, nearest vertex]` for coplanar points. SciPy computes these only under
+    /// Qhull option `"Qc"`, which its defaults do not include, so this is always empty.
+    pub coplanar: Vec<[usize; 3]>,
+    /// Surface area; the perimeter for 2-D input.
     pub area: f64,
-    /// Perimeter of the convex hull (called "volume" in SciPy for consistency
-    /// with higher dimensions, but for 2D it's the perimeter).
-    pub perimeter: f64,
+    /// Volume; the enclosed area for 2-D input.
+    pub volume: f64,
+    /// Coordinate-wise minimum of the input points.
+    pub min_bound: Vec<f64>,
+    /// Coordinate-wise maximum of the input points.
+    pub max_bound: Vec<f64>,
 }
 
 impl ConvexHull {
-    /// Compute the convex hull of a set of 2D points using Andrew's monotone chain algorithm.
+    /// Compute the convex hull of `points` (`npoints` rows of `ndim >= 2` coordinates).
     ///
-    /// Time complexity: O(n log n).
-    ///
-    /// # Arguments
-    /// * `points` — Slice of (x, y) coordinate pairs.
-    pub fn new(points: &[(f64, f64)]) -> Result<Self, SpatialError> {
-        if points.len() < 3 {
-            return Err(qhull_error(
-                "QH6214 qhull input error: not enough points to construct initial simplex",
-            ));
-        }
-
-        let n = points.len();
-
-        // Sort points by x, then by y (lexicographic)
-        let mut sorted_indices: Vec<usize> = (0..n).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            points[a]
-                .0
-                .total_cmp(&points[b].0)
-                .then(points[a].1.total_cmp(&points[b].1))
-        });
-
-        // Build lower hull
-        let mut lower: Vec<usize> = Vec::new();
-        for &idx in &sorted_indices {
-            while lower.len() >= 2
-                && cross(
-                    points[lower[lower.len() - 2]],
-                    points[lower[lower.len() - 1]],
-                    points[idx],
-                ) <= 0.0
-            {
-                lower.pop();
-            }
-            lower.push(idx);
-        }
-
-        // Build upper hull
-        let mut upper: Vec<usize> = Vec::new();
-        for &idx in sorted_indices.iter().rev() {
-            while upper.len() >= 2
-                && cross(
-                    points[upper[upper.len() - 2]],
-                    points[upper[upper.len() - 1]],
-                    points[idx],
-                ) <= 0.0
-            {
-                upper.pop();
-            }
-            upper.push(idx);
-        }
-
-        // Remove last point of each half because it's repeated
-        lower.pop();
-        upper.pop();
-
-        let mut vertices: Vec<usize> = lower;
-        vertices.extend(upper);
-
-        // Handle degenerate cases (all collinear)
-        if vertices.len() < 3 {
-            return Err(qhull_error(
-                "QH6154 Qhull precision error: initial simplex is flat",
-            ));
-        }
-
-        // Compute simplices (edges)
-        let nv = vertices.len();
-        let simplices: Vec<(usize, usize)> = (0..nv)
-            .map(|i| (vertices[i], vertices[(i + 1) % nv]))
-            .collect();
-
-        // Compute area using the shoelace formula
-        let mut area = 0.0;
-        for i in 0..nv {
-            let j = (i + 1) % nv;
-            let pi = points[vertices[i]];
-            let pj = points[vertices[j]];
-            area += pi.0 * pj.1 - pj.0 * pi.1;
-        }
-        area = area.abs() / 2.0;
-
-        // Compute perimeter
-        let mut perimeter = 0.0;
-        for &(a, b) in &simplices {
-            let dx = points[b].0 - points[a].0;
-            let dy = points[b].1 - points[a].1;
-            perimeter += (dx * dx + dy * dy).sqrt();
-        }
-
+    /// # Errors
+    /// `InvalidArgument` for empty, 1-D or non-finite input, `DimensionMismatch` for ragged
+    /// rows, and `Qhull` when there are fewer than `ndim + 1` points (QH6214) or every point lies
+    /// in a lower-dimensional flat (QH6154), as SciPy raises `QhullError`.
+    pub fn new(points: &[Vec<f64>]) -> Result<Self, SpatialError> {
+        let (ndim, flat) = qhull_input(points)?;
+        let npoints = points.len();
+        let pts = qhull::Points::new(&flat, ndim);
+        let hull = qhull::quickhull(&pts, npoints).map_err(kernel_error)?;
+        let simplices: Vec<Vec<usize>> = hull.facets.iter().map(|f| f.vertices.clone()).collect();
+        let neighbors: Vec<Vec<usize>> = hull.facets.iter().map(|f| f.neighbors.clone()).collect();
+        let (equations, measures) = facet_equations(points, &simplices);
+        let vertices = if ndim == 2 {
+            counterclockwise_cycle(&simplices, npoints)
+        } else {
+            sorted_unique_vertices(&simplices)
+        };
+        let area = measures.iter().sum();
+        let volume = hull_volume(points, &vertices, &equations, &measures);
+        let (min_bound, max_bound) = coordinate_bounds(points, ndim);
         Ok(Self {
+            points: points.to_vec(),
+            ndim,
+            npoints,
             vertices,
             simplices,
+            neighbors,
+            equations,
+            coplanar: Vec::new(),
             area,
-            perimeter,
+            volume,
+            min_bound,
+            max_bound,
         })
+    }
+
+    /// Number of facets.
+    #[must_use]
+    pub fn nsimplex(&self) -> usize {
+        self.simplices.len()
     }
 }
 
@@ -4241,111 +4355,110 @@ impl ConvexHull {
 // Halfspace Intersection
 // ══════════════════════════════════════════════════════════════════════
 
-type Point2 = (f64, f64);
-type Halfspace2 = [f64; 3];
-type Equation2 = [f64; 3];
-type NdVertices = Vec<Vec<f64>>;
-type NdFacets = Vec<Vec<usize>>;
-type NdVertexCandidate = (Vec<f64>, Vec<usize>);
-
-/// Halfspace intersection result for bounded N-D halfspaces.
-///
-/// Mirrors the core public attributes of
-/// `scipy.spatial.HalfspaceIntersection(halfspaces, interior_point)`. The 2D
-/// constructor retains the richer dual-hull metadata surface; `from_nd`
-/// generalizes bounded intersections to higher dimensions with vector-backed
-/// fields while leaving `dual_area`, `dual_volume`, and `dual_equations`
-/// populated only for the 2D fast path.
+/// Intersection of N-D halfspaces, matching
+/// `scipy.spatial.HalfspaceIntersection(halfspaces, interior_point)` with SciPy's default
+/// options: Qhull's dual construction, reported WITHOUT triangulation. Each halfspace
+/// `A x + b <= 0` becomes the dual point `-A / (A x0 + b)`; every facet of the dual points' convex
+/// hull is one vertex of the intersection. Dual facets lying in one hyperplane (a primal vertex
+/// where more than `ndim` halfspaces meet) are merged into a single facet, as Qhull merges them.
 #[derive(Debug, Clone)]
 pub struct HalfspaceIntersection {
     /// Input halfspaces in SciPy row format `[a_0, ..., a_{n-1}, b]`.
     pub halfspaces: Vec<Vec<f64>>,
     /// Feasible point that must be strictly inside every halfspace.
     pub interior_point: Vec<f64>,
-    /// Primal intersection vertices.
+    /// Intersection vertices, one per dual facet: `-normal / offset + interior_point`. Non-finite
+    /// rows appear where the dual hull does not contain the interior point strictly (an unbounded
+    /// region), exactly as SciPy produces them.
     pub intersections: Vec<Vec<f64>>,
-    /// Qhull-style dual points `-A / (A * interior_point + b)`.
+    /// Dual points `-A / (A * interior_point + b)`.
     pub dual_points: Vec<Vec<f64>>,
-    /// Indices of dual points forming each dual convex-hull facet.
+    /// Indices of the dual points on each (merged) dual facet, ascending.
     pub dual_facets: Vec<Vec<usize>>,
-    /// Indices of halfspaces that form the dual convex-hull vertices.
+    /// Indices of the halfspaces whose dual points are dual hull vertices, ascending (SciPy
+    /// 1.17.1 reports them ascending in every dimension).
     pub dual_vertices: Vec<usize>,
-    /// Dual hull facet equations. Populated only for the 2D fast path.
+    /// `[normal, offset]` of each dual facet, `(nfacet, ndim + 1)`.
     pub dual_equations: Vec<Vec<f64>>,
-    /// Perimeter of the 2D dual convex hull, matching SciPy's `dual_area`.
-    /// `NaN` for higher-dimensional bounded intersections.
+    /// Surface area of the dual hull (its perimeter in 2-D), SciPy's `dual_area`.
     pub dual_area: f64,
-    /// Area of the 2D dual convex hull, matching SciPy's `dual_volume`.
-    /// `NaN` for higher-dimensional bounded intersections.
+    /// Volume of the dual hull (its area in 2-D), SciPy's `dual_volume`.
     pub dual_volume: f64,
     /// Spatial dimension.
     pub ndim: usize,
     /// Number of input inequalities.
     pub nineq: usize,
-    /// Whether the primal feasible region is bounded.
+    /// Whether the feasible region is bounded: the interior point is strictly inside the dual
+    /// hull, decided with exact orientation predicates. Not a SciPy attribute.
     pub is_bounded: bool,
 }
 
 impl HalfspaceIntersection {
-    /// Compute the intersection of 2D halfspaces.
-    pub fn new(halfspaces: &[Halfspace2], interior_point: Point2) -> Result<Self, SpatialError> {
-        validate_halfspace_intersection_inputs(halfspaces, interior_point)?;
-
-        let dual_points = halfspace_dual_points(halfspaces, interior_point);
-        let dual_hull = ConvexHull::new(&dual_points).map_err(|err| match err {
-            SpatialError::Qhull(qhull) => SpatialError::Qhull(qhull),
-            other => qhull_error(format!(
-                "Qhull failed to construct halfspace dual hull: {other}"
-            )),
-        })?;
-
-        let dual_facets = dual_hull
-            .simplices
-            .iter()
-            .map(|&(a, b)| vec![a, b])
-            .collect::<Vec<_>>();
-        let dual_equations = dual_hull
-            .simplices
-            .iter()
-            .map(|&(a, b)| dual_edge_equation(dual_points[a], dual_points[b]))
-            .collect::<Vec<_>>();
-        let intersections = dual_equations
-            .iter()
-            .map(|equation| intersection_from_dual_equation(*equation, interior_point))
-            .collect::<Vec<_>>();
-
-        Ok(Self {
-            halfspaces: halfspaces.iter().map(|row| row.to_vec()).collect(),
-            interior_point: vec![interior_point.0, interior_point.1],
-            intersections: intersections.into_iter().map(|(x, y)| vec![x, y]).collect(),
-            dual_points: dual_points.into_iter().map(|(x, y)| vec![x, y]).collect(),
-            dual_facets,
-            dual_vertices: dual_hull.vertices,
-            dual_equations: dual_equations.into_iter().map(|eq| eq.to_vec()).collect(),
-            dual_area: dual_hull.perimeter,
-            dual_volume: dual_hull.area,
-            ndim: 2,
-            nineq: halfspaces.len(),
-            is_bounded: halfspace_region_is_bounded(halfspaces),
-        })
-    }
-
-    /// Construct from SciPy-shaped rows.
-    pub fn from_nd(halfspaces: &[Vec<f64>], interior_point: &[f64]) -> Result<Self, SpatialError> {
+    /// Intersect `halfspaces` (`nineq` rows `[A; b]` of `A x + b <= 0`) around the strictly
+    /// feasible `interior_point`.
+    ///
+    /// # Errors
+    /// `DimensionMismatch` for rows of the wrong width, `InvalidArgument` for non-finite input,
+    /// and `Qhull` for too few halfspaces (QH6214), an interior point not clearly inside every
+    /// halfspace (QH6023) or dual points in a lower-dimensional flat (QH6154).
+    pub fn new(halfspaces: &[Vec<f64>], interior_point: &[f64]) -> Result<Self, SpatialError> {
         validate_halfspace_intersection_inputs_nd(halfspaces, interior_point)?;
         let ndim = interior_point.len();
-        if ndim == 2 {
-            let rows = halfspaces
-                .iter()
-                .map(|row| [row[0], row[1], row[2]])
-                .collect::<Vec<_>>();
-            return Self::new(&rows, (interior_point[0], interior_point[1]));
+        if ndim < 2 {
+            return Err(SpatialError::InvalidArgument(
+                "Need at least 2-D data".to_string(),
+            ));
         }
-
-        let is_bounded = halfspace_region_is_bounded_nd(halfspaces, ndim);
         let dual_points = halfspace_dual_points_nd(halfspaces, interior_point);
-        let (intersections, dual_facets) = enumerate_halfspace_vertices_nd(halfspaces, ndim)?;
-        let dual_vertices = collect_dual_vertices(&dual_facets, halfspaces.len());
+        let nineq = dual_points.len();
+
+        // The dual points, then the origin (the interior point in dual coordinates) as an extra
+        // row the hull does not use, so boundedness is an exact orientation test against it.
+        let mut flat: Vec<f64> = dual_points.iter().flatten().copied().collect();
+        flat.extend(std::iter::repeat_n(0.0, ndim));
+        let pts = qhull::Points::new(&flat, ndim);
+        let hull = qhull::quickhull(&pts, nineq).map_err(kernel_error)?;
+        let simplices: Vec<Vec<usize>> = hull.facets.iter().map(|f| f.vertices.clone()).collect();
+        let (equations, measures) = facet_equations(&dual_points, &simplices);
+
+        let is_bounded = hull.facets.iter().all(|facet| {
+            let mut idx = facet.vertices.clone();
+            idx.push(nineq);
+            pts.orient(&idx) < 0
+        });
+
+        let class = vec![0u8; simplices.len()];
+        let groups = qhull::coplanar_groups(&pts, &hull, &class, pts.distround(nineq));
+        let ngroups = groups.iter().copied().max().map_or(0, |g| g + 1);
+        let mut dual_facets: Vec<Vec<usize>> = vec![Vec::new(); ngroups];
+        let mut best_member = vec![usize::MAX; ngroups];
+        for (f, &g) in groups.iter().enumerate() {
+            dual_facets[g].extend_from_slice(&simplices[f]);
+            if best_member[g] == usize::MAX || measures[f] > measures[best_member[g]] {
+                best_member[g] = f;
+            }
+        }
+        for facet in &mut dual_facets {
+            facet.sort_unstable();
+            facet.dedup();
+        }
+        let dual_equations: Vec<Vec<f64>> =
+            best_member.iter().map(|&f| equations[f].clone()).collect();
+        let intersections = dual_equations
+            .iter()
+            .map(|eq| {
+                (0..ndim)
+                    .map(|k| eq[k] / -eq[ndim] + interior_point[k])
+                    .collect()
+            })
+            .collect();
+
+        // Ascending in every dimension. SciPy's 2-D branch (counterclockwise extremes) tests
+        // `qhull.ndim == 2`, but in halfspace mode that `ndim` counts the offset column, so SciPy
+        // 1.17.1 reports 2-D dual vertices ascending too.
+        let dual_vertices = sorted_unique_vertices(&simplices);
+        let dual_area = measures.iter().sum();
+        let dual_volume = hull_volume(&dual_points, &dual_vertices, &equations, &measures);
 
         Ok(Self {
             halfspaces: halfspaces.to_vec(),
@@ -4354,20 +4467,22 @@ impl HalfspaceIntersection {
             dual_points,
             dual_facets,
             dual_vertices,
-            dual_equations: Vec::new(),
-            dual_area: f64::NAN,
-            dual_volume: f64::NAN,
+            dual_equations,
+            dual_area,
+            dual_volume,
             ndim,
-            nineq: halfspaces.len(),
+            nineq,
             is_bounded,
         })
     }
 
     /// Recompute the intersection after appending halfspaces.
     ///
-    /// The current pure-Rust implementation does not retain a live Qhull handle;
-    /// `restart` is accepted for SciPy surface parity and recomputation is always
-    /// deterministic from the complete halfspace set.
+    /// There is no live Qhull handle to extend incrementally; `restart` is accepted for SciPy
+    /// surface parity and the result is always recomputed from the complete halfspace set.
+    ///
+    /// # Errors
+    /// As [`HalfspaceIntersection::new`] on the combined halfspaces.
     pub fn add_halfspaces(
         &mut self,
         halfspaces: &[Vec<f64>],
@@ -4375,7 +4490,7 @@ impl HalfspaceIntersection {
     ) -> Result<(), SpatialError> {
         let mut combined = self.halfspaces.clone();
         combined.extend_from_slice(halfspaces);
-        *self = Self::from_nd(&combined, &self.interior_point)?;
+        *self = Self::new(&combined, &self.interior_point)?;
         Ok(())
     }
 
@@ -4384,619 +4499,781 @@ impl HalfspaceIntersection {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Delaunay Triangulation (2D)
+// Delaunay triangulation (N-D)
 // ══════════════════════════════════════════════════════════════════════
 
-/// Result of a 2D Delaunay triangulation.
+/// Batches of at least this many 2-D queries take `Delaunay::locate_grid_2d`: building its index
+/// costs O(nsimplex), which a handful of walked queries does not repay.
+const FIND_SIMPLEX_GRID_MIN_QUERIES: usize = 64;
+
+/// The lifted convex hull behind [`Delaunay`] and [`Voronoi`], built the way SciPy's default
+/// `"Qbb Qc Qz"` options have Qhull build it.
+struct LiftedHull {
+    /// Hull of the lifted points plus the `"Qz"` point at infinity (index `npoints`).
+    hull: qhull::Hull,
+    /// Per hull facet: whether it is a lower facet, i.e. a Delaunay simplex.
+    lower: Vec<bool>,
+    /// The lifted points (point at infinity last), rescaled for the kernel's predicates.
+    lifted_pts: qhull::Points,
+    /// Lifted coordinates `[x, |x|^2 * scale + shift]` of the input points.
+    lifted: Vec<Vec<f64>>,
+    paraboloid_scale: f64,
+    paraboloid_shift: f64,
+}
+
+fn lifted_hull(points: &[Vec<f64>], ndim: usize, flat: &[f64]) -> Result<LiftedHull, SpatialError> {
+    let npoints = points.len();
+    if npoints < ndim + 1 {
+        // Qhull counts the "Qz" point at infinity among its input points.
+        return Err(kernel_error(qhull::KernelError::TooFewPoints {
+            have: npoints + 1,
+            need: ndim + 2,
+        }));
+    }
+    // A triangulation needs full-dimensional input. Test it with Qhull's roundoff criterion on
+    // the points themselves, where that criterion has its meaning.
+    let input_pts = qhull::Points::new(flat, ndim);
+    qhull::initial_simplex(&input_pts, npoints).map_err(kernel_error)?;
+
+    // "Qbb" scales the paraboloid coordinate to [0, max|x|]. Qhull's range includes the "Qz"
+    // point, which it places at 1.1 x the largest |x|^2, so the scale divides by that height.
+    let sums: Vec<f64> = points
+        .iter()
+        .map(|p| p.iter().map(|x| x * x).sum())
+        .collect();
+    let low = sums.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = sums.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max_abs = flat.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let paraboloid_scale = max_abs / (high * 1.1 - low);
+    let paraboloid_shift = -low * paraboloid_scale;
+    let lifted: Vec<Vec<f64>> = points
+        .iter()
+        .zip(&sums)
+        .map(|(p, &s)| {
+            let mut row = p.clone();
+            row.push(s * paraboloid_scale + paraboloid_shift);
+            row
+        })
+        .collect();
+    let top = lifted
+        .iter()
+        .map(|row| row[ndim])
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // "Qz": a point above every lifted point, over the centroid. Every facet through it is an
+    // upper facet, so it leaves the lower hull alone while making cospherical input (all lifted
+    // points in one hyperplane) full-dimensional.
+    let mut lifted_flat: Vec<f64> = lifted.iter().flatten().copied().collect();
+    for k in 0..ndim {
+        lifted_flat.push(points.iter().map(|p| p[k]).sum::<f64>() / npoints as f64);
+    }
+    lifted_flat.push(top + max_abs);
+    let lifted_pts = qhull::Points::new(&lifted_flat, ndim + 1);
+    let hull = qhull::quickhull(&lifted_pts, npoints + 1).map_err(kernel_error)?;
+
+    // A lower facet's outward normal points down, which is exactly when its projection is a
+    // positively oriented simplex. Exact, so vertical facets (a zero-volume projection) are
+    // upper facets, as Qhull classifies them `upperdelaunay`.
+    let lower = hull
+        .facets
+        .iter()
+        .map(|facet| !facet.vertices.contains(&npoints) && input_pts.orient(&facet.vertices) > 0)
+        .collect();
+    Ok(LiftedHull {
+        hull,
+        lower,
+        lifted_pts,
+        lifted,
+        paraboloid_scale,
+        paraboloid_shift,
+    })
+}
+
+/// SciPy's barycentric transform of one simplex: `T^-1` (rows) and then `r_n`, where
+/// `T[i][j] = (r_j - r_n)[i]`. All `NaN` when the simplex is degenerate, i.e. when the
+/// reciprocal condition number of `T` falls below `1000 * eps` as SciPy's `dgecon` test does.
+fn barycentric_transform(points: &[Vec<f64>], simplex: &[usize], ndim: usize) -> Vec<Vec<f64>> {
+    let last = &points[simplex[ndim]];
+    let t: Vec<Vec<f64>> = (0..ndim)
+        .map(|i| (0..ndim).map(|j| points[simplex[j]][i] - last[i]).collect())
+        .collect();
+    let degenerate = || vec![vec![f64::NAN; ndim]; ndim + 1];
+    // SciPy hands the C-ordered `T` to LAPACK, which sees its transpose, so its 1-norm condition
+    // estimate is the infinity-norm condition number of `T`.
+    let norm_inf = |m: &[Vec<f64>]| {
+        m.iter()
+            .map(|row| row.iter().map(|x| x.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    };
+    let Some(inverse) = invert_square(&t) else {
+        return degenerate();
+    };
+    let rcond = 1.0 / (norm_inf(&t) * norm_inf(&inverse));
+    if !(rcond >= 1000.0 * f64::EPSILON) {
+        return degenerate();
+    }
+    let mut out = inverse;
+    out.push(last.clone());
+    out
+}
+
+/// Inverse by Gauss-Jordan elimination with partial pivoting; `None` for an exactly singular
+/// pivot or a non-finite result.
+fn invert_square(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = m.len();
+    let mut a: Vec<Vec<f64>> = m.to_vec();
+    let mut inv: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+        .collect();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&x, &y| a[x][col].abs().total_cmp(&a[y][col].abs()))?;
+        if a[pivot][col] == 0.0 {
+            return None;
+        }
+        a.swap(pivot, col);
+        inv.swap(pivot, col);
+        let p = a[col][col];
+        for k in 0..n {
+            a[col][k] /= p;
+            inv[col][k] /= p;
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = a[row][col];
+            if factor == 0.0 {
+                continue;
+            }
+            for k in 0..n {
+                let (da, di) = (factor * a[col][k], factor * inv[col][k]);
+                a[row][k] -= da;
+                inv[row][k] -= di;
+            }
+        }
+    }
+    inv.iter().flatten().all(|x| x.is_finite()).then_some(inv)
+}
+
+/// Delaunay triangulation of an N-dimensional point set, matching
+/// `scipy.spatial.Delaunay(points)` with SciPy's default options (`"Qbb Qc Qz Q12"`, `"Qx"` from
+/// 5-D up, `"Qt"` always): the lower hull of the points lifted onto the paraboloid
+/// `|x|^2 * paraboloid_scale + paraboloid_shift`.
 ///
-/// Matches the core surface of `scipy.spatial.Delaunay(points)` for 2D point
-/// sets: the original points, the triangle simplices, and simplex lookup.
+/// Every simplex is positively oriented, `det [[x_0, 1], ..., [x_ndim, 1]] > 0`: counterclockwise
+/// in 2-D as SciPy guarantees, and consistently so in higher dimensions where SciPy's orientation
+/// is Qhull's. Input points that are not vertices (duplicates) are reported in `coplanar`.
 #[derive(Debug, Clone)]
 pub struct Delaunay {
-    /// Input points in the original order.
-    pub points: Vec<(f64, f64)>,
-    /// Triangle simplices as triples of indices into `points`.
-    pub simplices: Vec<(usize, usize, usize)>,
+    /// Input points, `(npoints, ndim)`.
+    pub points: Vec<Vec<f64>>,
+    /// Dimension of the points.
+    pub ndim: usize,
+    /// Number of input points.
+    pub npoints: usize,
+    /// Simplices, `(nsimplex, ndim + 1)` point indices.
+    pub simplices: Vec<Vec<usize>>,
+    /// `neighbors[i][k]` is the simplex opposite vertex `simplices[i][k]`, `-1` on the boundary.
+    pub neighbors: Vec<Vec<isize>>,
+    /// `[normal, offset]` of each simplex's lifted facet, `(nsimplex, ndim + 2)`, in the lifted
+    /// coordinates [`Delaunay::lift_points`] produces; the normal's last component is negative.
+    pub equations: Vec<Vec<f64>>,
+    /// Barycentric transforms, `(nsimplex, ndim + 1, ndim)`: `c = T[:ndim] . (x - T[ndim])`
+    /// gives the first `ndim` barycentric coordinates. `NaN` for degenerate simplices.
+    pub transform: Vec<Vec<Vec<f64>>>,
+    /// For each point, some simplex it is a vertex of, `-1` if none. For a coplanar point SciPy
+    /// stores the third column of its `coplanar` row (the nearest VERTEX), and so does this.
+    pub vertex_to_simplex: Vec<isize>,
+    /// `(nfaces, ndim)` point indices of the boundary facets of the triangulation.
+    pub convex_hull: Vec<Vec<usize>>,
+    /// `[point, simplex, nearest vertex]` for input points that are not vertices (`"Qc"`).
+    pub coplanar: Vec<[usize; 3]>,
+    /// CSR `(indptr, indices)` of each point's neighbouring vertices, ascending per point.
+    pub vertex_neighbor_vertices: (Vec<usize>, Vec<usize>),
+    /// Scale of the paraboloid coordinate (Qhull option `"Qbb"`).
+    pub paraboloid_scale: f64,
+    /// Shift of the paraboloid coordinate.
+    pub paraboloid_shift: f64,
+    /// Coordinate-wise minimum of the input points.
+    pub min_bound: Vec<f64>,
+    /// Coordinate-wise maximum of the input points.
+    pub max_bound: Vec<f64>,
 }
 
 impl Delaunay {
-    /// Compute a 2D Delaunay triangulation with a Bowyer-Watson sweep.
-    pub fn new(points: &[(f64, f64)]) -> Result<Self, SpatialError> {
-        let n = points.len();
-        if n < 3 {
-            return Err(qhull_error(
-                "QH6214 qhull input error: not enough points to construct initial simplex",
-            ));
-        }
-        if points
-            .iter()
-            .any(|&(x, y)| !x.is_finite() || !y.is_finite())
-        {
-            return Err(SpatialError::InvalidArgument(
-                "delaunay triangulation requires finite points".to_string(),
-            ));
-        }
-
-        let mut min_x = f64::INFINITY;
-        let mut min_y = f64::INFINITY;
-        let mut max_x = f64::NEG_INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        for &(x, y) in points {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
-
-        let dx = (max_x - min_x).max(1e-10);
-        let dy = (max_y - min_y).max(1e-10);
-
-        // SUPER-TRIANGLE MARGIN, ESCALATED UNTIL THE RESULT IS PROVABLY COMPLETE.
-        //
-        // Bowyer-Watson starts from a super-triangle and deletes the triangles still touching its
-        // vertices at the end. If the super-triangle is too close, a genuine near-boundary
-        // triangle gets attached to a super-vertex and is deleted with it, leaving a HOLE inside
-        // the convex hull. `LinearNDInterpolator` then returns NaN for points in that hole, which
-        // is indistinguishable from "outside the hull" (frankenscipy-tkpwa).
-        //
-        // The margin used to be a fixed 10.0, and a fixed value CANNOT be right: the deficit was
-        // measured to grow with the point count.
-        //
-        //     margin   N=400   N=800   N=2000
-        //         10       1       4        8      <- triangles missing
-        //         30       1       2        6
-        //        100       0       0        4
-        //        300       0       0        1
-        //       1000       0       0        0
-        //
-        // So this escalates instead, and checks the result rather than trusting the constant.
-        // Euler's identity gives the exact triangle count for a complete triangulation of points
-        // in general position: `2N - 2 - h`, with `h` the number of convex-hull vertices. The
-        // first margin whose output satisfies it is accepted. Escalation is capped, and the last
-        // attempt is returned either way so a pathological input degrades to the old behaviour
-        // rather than failing outright.
-        //
-        // Starting at 1000 rather than 10 because the sweep above shows small margins essentially
-        // always leave holes; starting low would just pay for a discarded attempt every call.
-        let hull_vertices = ConvexHull::new(points).ok().map(|h| h.vertices.len());
-        let mut simplices = Vec::new();
-        for &margin in &[1000.0_f64, 1.0e5, 1.0e7] {
-            let mut all_points = points.to_vec();
-            all_points.push((min_x - margin * dx, min_y - margin * dy));
-            all_points.push((max_x + margin * dx, min_y - margin * dy));
-            all_points.push(((min_x + max_x) / 2.0, max_y + margin * dy));
-
-            simplices = if n >= DELAUNAY_CIRCLE_GRID_THRESHOLD {
-                delaunay_triangulate_circle_grid(&all_points, n, min_x, min_y, dx, dy)
-            } else {
-                delaunay_triangulate_linear(&all_points, n)
-            };
-
-            // Degenerate inputs (all-collinear, duplicate-heavy) have no `2N - 2 - h` to meet;
-            // when the hull is unavailable or the count cannot apply, accept the first result.
-            match hull_vertices {
-                Some(h) if n >= 3 && 2 * n >= 2 + h => {
-                    if simplices.len() >= 2 * n - 2 - h {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        if simplices.is_empty() {
-            return Err(qhull_error(
-                "QH6154 Qhull precision error: initial simplex is flat",
-            ));
-        }
-
-        Ok(Self {
-            points: points.to_vec(),
-            simplices,
-        })
-    }
-
-    /// Find the simplex containing a query point.
+    /// Triangulate `points` (`npoints` rows of `ndim >= 2` coordinates).
     ///
-    /// Returns the simplex index and its barycentric coordinates when the point
-    /// lies in or on a triangle, or `None` if it falls outside the triangulation.
-    pub fn find_simplex(&self, query: (f64, f64)) -> Option<(usize, f64, f64, f64)> {
-        for (idx, &(a, b, c)) in self.simplices.iter().enumerate() {
-            let (l1, l2, l3) =
-                barycentric_2d(self.points[a], self.points[b], self.points[c], query);
-            if l1 >= -1e-10 && l2 >= -1e-10 && l3 >= -1e-10 {
-                return Some((idx, l1, l2, l3));
-            }
-        }
-        None
+    /// # Errors
+    /// `InvalidArgument` for empty, 1-D or non-finite input, `DimensionMismatch` for ragged
+    /// rows, and `Qhull` for fewer than `ndim + 1` points (QH6214) or points in a
+    /// lower-dimensional flat (QH6154), as SciPy raises `QhullError`.
+    pub fn new(points: &[Vec<f64>]) -> Result<Self, SpatialError> {
+        let (ndim, flat) = qhull_input(points)?;
+        let lifted = lifted_hull(points, ndim, &flat)?;
+        Ok(Self::from_lifted(points, ndim, &lifted))
     }
 
-    /// Locate the containing simplex for a BATCH of query points — matches
-    /// `scipy.spatial.Delaunay.find_simplex(X)` (with fsci's barycentric return).
-    /// Bit-for-bit identical to calling [`Delaunay::find_simplex`] per point: it
-    /// returns the same lowest-index containing simplex and identical barycentric
-    /// coordinates. Two amortized accelerations over the per-point linear scan:
-    /// (1) each triangle's padded axis-aligned bbox is precomputed ONCE for the
-    /// whole batch and used as a cheap reject before the barycentric test — the
-    /// pad (`1e-8·extent`) safely dominates the `1e-10` barycentric tolerance, so
-    /// a triangle is skipped only when it cannot contain the point; (2) the
-    /// independent per-point scans are parallelized across the batch.
-    pub fn find_simplex_many(&self, queries: &[(f64, f64)]) -> Vec<Option<(usize, f64, f64, f64)>> {
-        let ns = self.simplices.len();
-        let bboxes: Vec<(f64, f64, f64, f64)> = self
-            .simplices
+    fn from_lifted(points: &[Vec<f64>], ndim: usize, lifted: &LiftedHull) -> Self {
+        let npoints = points.len();
+        let facets = &lifted.hull.facets;
+        let mut index = vec![-1isize; facets.len()];
+        let mut simplices: Vec<Vec<usize>> = Vec::new();
+        for (f, facet) in facets.iter().enumerate() {
+            if lifted.lower[f] {
+                index[f] = simplices.len() as isize;
+                simplices.push(facet.vertices.clone());
+            }
+        }
+        let neighbors: Vec<Vec<isize>> = facets
             .iter()
-            .map(|&(a, b, c)| {
-                let (pa, pb, pc) = (self.points[a], self.points[b], self.points[c]);
-                let minx = pa.0.min(pb.0).min(pc.0);
-                let maxx = pa.0.max(pb.0).max(pc.0);
-                let miny = pa.1.min(pb.1).min(pc.1);
-                let maxy = pa.1.max(pb.1).max(pc.1);
-                let pad = (maxx - minx).max(maxy - miny) * 1e-8 + 1e-12;
-                (minx - pad, maxx + pad, miny - pad, maxy + pad)
+            .enumerate()
+            .filter(|&(f, _)| lifted.lower[f])
+            .map(|(_, facet)| facet.neighbors.iter().map(|&g| index[g]).collect())
+            .collect();
+        let equations: Vec<Vec<f64>> = simplices
+            .iter()
+            .map(|simplex| {
+                let rows: Vec<&[f64]> = simplex
+                    .iter()
+                    .map(|&i| lifted.lifted[i].as_slice())
+                    .collect();
+                let (mut normal, offset, _) = qhull::hyperplane(&rows);
+                normal.push(offset);
+                normal
             })
             .collect();
-        let nq = queries.len();
-        let mut out: Vec<Option<(usize, f64, f64, f64)>> = vec![None; nq];
-        let points = &self.points;
-        let simplices = &self.simplices;
-        let bb = &bboxes;
+        let transform = simplices
+            .iter()
+            .map(|simplex| barycentric_transform(points, simplex, ndim))
+            .collect();
+        let (min_bound, max_bound) = coordinate_bounds(points, ndim);
+        let mut tri = Self {
+            points: points.to_vec(),
+            ndim,
+            npoints,
+            simplices,
+            neighbors,
+            equations,
+            transform,
+            vertex_to_simplex: Vec::new(),
+            convex_hull: Vec::new(),
+            coplanar: Vec::new(),
+            vertex_neighbor_vertices: (Vec::new(), Vec::new()),
+            paraboloid_scale: lifted.paraboloid_scale,
+            paraboloid_shift: lifted.paraboloid_shift,
+            min_bound,
+            max_bound,
+        };
+        tri.coplanar = tri.coplanar_points();
 
-        // Uniform grid over the points' bbox. Each triangle is binned (in ASCENDING
-        // index order, so every cell list stays sorted) into every cell its padded
-        // bbox overlaps; a query then scans only its own cell's candidate list and
-        // returns the first (= lowest-index) containing triangle. That cell list is a
-        // superset of every triangle whose padded bbox contains the query point, so
-        // the result is bit-for-bit identical to the O(num_simplices) bbox linear
-        // scan. Degenerate / small inputs use g=1 (one cell = the full scan).
-        let (mut gminx, mut gminy, mut gmaxx, mut gmaxy) = (
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for &(x, y) in points {
-            gminx = gminx.min(x);
-            gmaxx = gmaxx.max(x);
-            gminy = gminy.min(y);
-            gmaxy = gmaxy.max(y);
+        let mut vertex_to_simplex = vec![-1isize; npoints];
+        for row in &tri.coplanar {
+            vertex_to_simplex[row[0]] = row[2] as isize;
         }
-        let degenerate = !matches!(gmaxx.partial_cmp(&gminx), Some(std::cmp::Ordering::Greater))
-            || !matches!(gmaxy.partial_cmp(&gminy), Some(std::cmp::Ordering::Greater))
-            || !gminx.is_finite();
-        let g: usize = if ns >= 64 && !degenerate {
-            ((ns as f64).sqrt().ceil()).clamp(1.0, 1024.0) as usize
+        for (s, simplex) in tri.simplices.iter().enumerate() {
+            for &v in simplex {
+                if vertex_to_simplex[v] == -1 {
+                    vertex_to_simplex[v] = s as isize;
+                }
+            }
+        }
+        tri.vertex_to_simplex = vertex_to_simplex;
+
+        let mut convex_hull = Vec::new();
+        for (simplex, nbrs) in tri.simplices.iter().zip(&tri.neighbors) {
+            for k in 0..=ndim {
+                if nbrs[k] == -1 {
+                    let face: Vec<usize> = simplex
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| j != k)
+                        .map(|(_, &v)| v)
+                        .collect();
+                    convex_hull.push(face);
+                }
+            }
+        }
+        tri.convex_hull = convex_hull;
+
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); npoints];
+        for simplex in &tri.simplices {
+            for &a in simplex {
+                for &b in simplex {
+                    if a != b {
+                        adjacency[a].push(b);
+                    }
+                }
+            }
+        }
+        let mut indptr = Vec::with_capacity(npoints + 1);
+        let mut indices = Vec::new();
+        indptr.push(0);
+        for mut list in adjacency {
+            list.sort_unstable();
+            list.dedup();
+            indices.extend(list);
+            indptr.push(indices.len());
+        }
+        tri.vertex_neighbor_vertices = (indptr, indices);
+        tri
+    }
+
+    /// Input points that are not vertices of any simplex, with the simplex SciPy's point
+    /// location puts them in and that simplex's nearest vertex.
+    fn coplanar_points(&self) -> Vec<[usize; 3]> {
+        let mut used = vec![false; self.npoints];
+        for simplex in &self.simplices {
+            for &v in simplex {
+                used[v] = true;
+            }
+        }
+        let eps = 100.0 * f64::EPSILON;
+        let mut start = 0usize;
+        let mut out = Vec::new();
+        for p in 0..self.npoints {
+            if used[p] || self.simplices.is_empty() {
+                continue;
+            }
+            let x = &self.points[p];
+            let located = self.locate(x, &mut start, eps, eps.sqrt());
+            let simplex = if located >= 0 {
+                located as usize
+            } else {
+                // Outside by roundoff: the simplex whose lifted hyperplane is highest above it.
+                let z = self.lift(x);
+                (0..self.simplices.len())
+                    .max_by(|&a, &b| self.distplane(a, &z).total_cmp(&self.distplane(b, &z)))
+                    .unwrap_or(0)
+            };
+            let nearest = self.simplices[simplex]
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    sqeuclidean(x, &self.points[a]).total_cmp(&sqeuclidean(x, &self.points[b]))
+                })
+                .unwrap_or(0);
+            out.push([p, simplex, nearest]);
+        }
+        out
+    }
+
+    /// Number of simplices.
+    #[must_use]
+    pub fn nsimplex(&self) -> usize {
+        self.simplices.len()
+    }
+
+    /// Lift one point onto the paraboloid, as SciPy's `_lift_point`.
+    fn lift(&self, x: &[f64]) -> Vec<f64> {
+        let mut z = x.to_vec();
+        let mut sum = 0.0;
+        for &value in x {
+            sum += value * value;
+        }
+        z.push(sum * self.paraboloid_scale + self.paraboloid_shift);
+        z
+    }
+
+    /// Signed distance of the lifted point `z` from simplex `s`'s hyperplane (`qh_distplane`).
+    fn distplane(&self, s: usize, z: &[f64]) -> f64 {
+        let eq = &self.equations[s];
+        let mut dist = eq[self.ndim + 1];
+        for k in 0..=self.ndim {
+            dist += eq[k] * z[k];
+        }
+        dist
+    }
+
+    fn fully_outside(&self, x: &[f64], eps: f64) -> bool {
+        (0..self.ndim).any(|i| x[i] < self.min_bound[i] - eps || x[i] > self.max_bound[i] + eps)
+    }
+
+    fn transform_is_valid(&self, s: usize) -> bool {
+        !self.transform[s][0][0].is_nan()
+    }
+
+    fn barycentric_inside(&self, s: usize, x: &[f64], c: &mut [f64], eps: f64) -> bool {
+        let d = self.ndim;
+        let t = &self.transform[s];
+        c[d] = 1.0;
+        for i in 0..d {
+            c[i] = 0.0;
+            for j in 0..d {
+                c[i] += t[i][j] * (x[j] - t[d][j]);
+            }
+            c[d] -= c[i];
+            if !(-eps <= c[i] && c[i] <= 1.0 + eps) {
+                return false;
+            }
+        }
+        -eps <= c[d] && c[d] <= 1.0 + eps
+    }
+
+    fn barycentric_single(&self, s: usize, x: &[f64], c: &mut [f64], i: usize) {
+        let d = self.ndim;
+        let t = &self.transform[s];
+        if i == d {
+            c[d] = 1.0;
+            for j in 0..d {
+                c[d] -= c[j];
+            }
+        } else {
+            c[i] = 0.0;
+            for j in 0..d {
+                c[i] += t[i][j] * (x[j] - t[d][j]);
+            }
+        }
+    }
+
+    fn barycentric_all(&self, s: usize, x: &[f64], c: &mut [f64]) {
+        let d = self.ndim;
+        let t = &self.transform[s];
+        c[d] = 1.0;
+        for i in 0..d {
+            c[i] = 0.0;
+            for j in 0..d {
+                c[i] += t[i][j] * (x[j] - t[d][j]);
+            }
+            c[d] -= c[i];
+        }
+    }
+
+    /// SciPy's `_find_simplex_bruteforce`.
+    fn locate_bruteforce(&self, x: &[f64], eps: f64, eps_broad: f64) -> isize {
+        if self.fully_outside(x, eps) {
+            return -1;
+        }
+        let d = self.ndim;
+        let mut c = vec![0.0; d + 1];
+        for s in 0..self.simplices.len() {
+            if self.transform_is_valid(s) {
+                if self.barycentric_inside(s, x, &mut c, eps) {
+                    return s as isize;
+                }
+            } else {
+                // A degenerate simplex: check its neighbours with extra leeway towards it.
+                for k in 0..=d {
+                    let neighbor = self.neighbors[s][k];
+                    if neighbor == -1 || !self.transform_is_valid(neighbor as usize) {
+                        continue;
+                    }
+                    let nb = neighbor as usize;
+                    self.barycentric_all(nb, x, &mut c);
+                    let inside = (0..=d).all(|m| {
+                        let lower = if self.neighbors[nb][m] == s as isize {
+                            -eps_broad
+                        } else {
+                            -eps
+                        };
+                        lower <= c[m] && c[m] <= 1.0 + eps
+                    });
+                    if inside {
+                        return neighbor;
+                    }
+                }
+            }
+        }
+        -1
+    }
+
+    /// SciPy's `_find_simplex_directed`: walk towards the point by barycentric signs.
+    fn locate_directed(&self, x: &[f64], start: &mut usize, eps: f64, eps_broad: f64) -> isize {
+        let d = self.ndim;
+        let mut c = vec![0.0; d + 1];
+        let mut s = if *start < self.simplices.len() {
+            *start
+        } else {
+            0
+        };
+        let mut found: Option<isize> = None;
+        for _ in 0..(1 + self.simplices.len() / 4) {
+            let mut state = 1i8;
+            let mut hop = usize::MAX;
+            for k in 0..=d {
+                self.barycentric_single(s, x, &mut c, k);
+                if c[k] < -eps {
+                    let m = self.neighbors[s][k];
+                    if m == -1 {
+                        *start = s;
+                        return -1;
+                    }
+                    hop = m as usize;
+                    state = -1;
+                    break;
+                } else if c[k] <= 1.0 + eps {
+                    // inside along this coordinate
+                } else {
+                    // outside, or NaN from a degenerate simplex
+                    state = 0;
+                }
+            }
+            match state {
+                -1 => s = hop,
+                1 => {
+                    found = Some(s as isize);
+                    break;
+                }
+                _ => {
+                    found = Some(self.locate_bruteforce(x, eps, eps_broad));
+                    break;
+                }
+            }
+        }
+        let result = found.unwrap_or_else(|| self.locate_bruteforce(x, eps, eps_broad));
+        // SciPy stores -1 here too, which the next query clamps back to simplex 0.
+        *start = usize::try_from(result).unwrap_or(usize::MAX);
+        result
+    }
+
+    /// SciPy's `_find_simplex`: climb the lifted hyperplane distances to a simplex near the
+    /// point, then finish with the directed walk.
+    fn locate(&self, x: &[f64], start: &mut usize, eps: f64, eps_broad: f64) -> isize {
+        if self.fully_outside(x, eps) || self.simplices.is_empty() {
+            return -1;
+        }
+        let mut s = if *start < self.simplices.len() {
+            *start
+        } else {
+            0
+        };
+        let z = self.lift(x);
+        let mut best = self.distplane(s, &z);
+        let mut changed = true;
+        while changed {
+            if best > 0.0 {
+                break;
+            }
+            changed = false;
+            for k in 0..=self.ndim {
+                // Deliberately re-read after a hop: SciPy continues the sweep from the new
+                // simplex at the next k.
+                let neighbor = self.neighbors[s][k];
+                if neighbor == -1 {
+                    continue;
+                }
+                let dist = self.distplane(neighbor as usize, &z);
+                if dist > best + eps * (1.0 + best.abs()) {
+                    s = neighbor as usize;
+                    best = dist;
+                    changed = true;
+                }
+            }
+        }
+        *start = s;
+        self.locate_directed(x, start, eps, eps_broad)
+    }
+
+    fn check_query_dimension(&self, xi: &[Vec<f64>]) -> Result<(), SpatialError> {
+        match xi.iter().find(|x| x.len() != self.ndim) {
+            Some(bad) => Err(SpatialError::DimensionMismatch {
+                expected: self.ndim,
+                actual: bad.len(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The simplex containing each query point, `-1` outside the triangulation, as
+    /// `scipy.spatial.Delaunay.find_simplex(xi, bruteforce, tol)` (default `tol` is
+    /// `100 * eps`). Simplex indices refer to this triangulation's own order. A `NaN` query is
+    /// outside.
+    ///
+    /// A 2-D batch of at least 64 queries over non-degenerate simplices is answered from a
+    /// uniform grid index, in parallel. That answer is exactly the
+    /// brute-force scan's (the lowest-index simplex containing the query within `tol`); SciPy's
+    /// walk, used otherwise, can return a different containing simplex only for a query within
+    /// `tol` of a shared boundary.
+    ///
+    /// # Errors
+    /// `DimensionMismatch` when a query does not have `ndim` coordinates.
+    pub fn find_simplex(
+        &self,
+        xi: &[Vec<f64>],
+        bruteforce: bool,
+        tol: Option<f64>,
+    ) -> Result<Vec<isize>, SpatialError> {
+        self.check_query_dimension(xi)?;
+        let eps = tol.unwrap_or(100.0 * f64::EPSILON);
+        let eps_broad = eps.sqrt();
+        if !bruteforce
+            && self.ndim == 2
+            && xi.len() >= FIND_SIMPLEX_GRID_MIN_QUERIES
+            && (0..self.simplices.len()).all(|s| self.transform_is_valid(s))
+        {
+            return Ok(self.locate_grid_2d(xi, eps));
+        }
+        let mut start = 0usize;
+        Ok(xi
+            .iter()
+            .map(|x| {
+                if bruteforce {
+                    self.locate_bruteforce(x, eps, eps_broad)
+                } else {
+                    self.locate(x, &mut start, eps, eps_broad)
+                }
+            })
+            .collect())
+    }
+
+    /// Batch point location for 2-D triangulations (the `find-simplex-grid` lever of the old
+    /// Bowyer-Watson `find_simplex_many`). Every triangle is binned, in ascending index order,
+    /// into the cells of a uniform grid that its padded bounding box overlaps; a query scans its
+    /// own cell and returns the first triangle whose barycentric coordinates lie in
+    /// `[-eps, 1 + eps]`. The pad (`1e-8` of the box extent) dominates the `eps`-inside region,
+    /// so each cell list holds every triangle that could accept a query in it, and the answer
+    /// equals `locate_bruteforce`'s: the lowest-index accepting triangle, or -1.
+    fn locate_grid_2d(&self, xi: &[Vec<f64>], eps: f64) -> Vec<isize> {
+        let ns = self.simplices.len();
+        let boxes: Vec<[f64; 4]> = self
+            .simplices
+            .iter()
+            .map(|s| {
+                let (mut lx, mut hx, mut ly, mut hy) = (
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                );
+                for &v in s {
+                    let p = &self.points[v];
+                    lx = lx.min(p[0]);
+                    hx = hx.max(p[0]);
+                    ly = ly.min(p[1]);
+                    hy = hy.max(p[1]);
+                }
+                let pad = (hx - lx).max(hy - ly) * 1e-8 + 1e-12;
+                [lx - pad, hx + pad, ly - pad, hy + pad]
+            })
+            .collect();
+        let (x0, y0) = (self.min_bound[0], self.min_bound[1]);
+        let (wx, wy) = (self.max_bound[0] - x0, self.max_bound[1] - y0);
+        let g = if ns >= 64 && wx > 0.0 && wy > 0.0 {
+            ((ns as f64).sqrt().ceil() as usize).clamp(1, 1024)
         } else {
             1
         };
-        let inv_cw = if g > 1 {
-            g as f64 / (gmaxx - gminx)
+        let (inv_x, inv_y) = if g > 1 {
+            (g as f64 / wx, g as f64 / wy)
         } else {
-            0.0
+            (0.0, 0.0)
         };
-        let inv_ch = if g > 1 {
-            g as f64 / (gmaxy - gminy)
-        } else {
-            0.0
-        };
-        let cell_x = move |x: f64| -> usize {
-            (((x - gminx) * inv_cw) as isize).clamp(0, g as isize - 1) as usize
-        };
-        let cell_y = move |y: f64| -> usize {
-            (((y - gminy) * inv_ch) as isize).clamp(0, g as isize - 1) as usize
-        };
+        // A NaN coordinate casts to cell 0; its barycentric test then fails, as brute force's.
+        let cell_x = |x: f64| (((x - x0) * inv_x) as isize).clamp(0, g as isize - 1) as usize;
+        let cell_y = |y: f64| (((y - y0) * inv_y) as isize).clamp(0, g as isize - 1) as usize;
         let mut cells: Vec<Vec<u32>> = vec![Vec::new(); g * g];
-        for (idx, &(lx, hx, ly, hy)) in bb.iter().enumerate().take(ns) {
-            for cy in cell_y(ly)..=cell_y(hy) {
-                let row = cy * g;
-                for cx in cell_x(lx)..=cell_x(hx) {
-                    cells[row + cx].push(idx as u32);
+        for (s, b) in boxes.iter().enumerate() {
+            for cy in cell_y(b[2])..=cell_y(b[3]) {
+                for cx in cell_x(b[0])..=cell_x(b[1]) {
+                    cells[cy * g + cx].push(s as u32);
                 }
             }
         }
-        let cells = &cells;
-        let eval = move |q: (f64, f64)| -> Option<(usize, f64, f64, f64)> {
-            for &idx in &cells[cell_y(q.1) * g + cell_x(q.0)] {
-                let idx = idx as usize;
-                let (lx, hx, ly, hy) = bb[idx];
-                if q.0 < lx || q.0 > hx || q.1 < ly || q.1 > hy {
+        // Each triangle's transform flattened to [T00, T01, T10, T11, r0, r1]. The public
+        // `transform` is three levels of Vec, and chasing them in every barycentric test made
+        // this path 1.7x slower than the Bowyer-Watson one it replaced. The arithmetic is
+        // `barycentric_inside`'s, in its order, so the answers are unchanged.
+        let flat: Vec<[f64; 6]> = self
+            .transform
+            .iter()
+            .map(|t| [t[0][0], t[0][1], t[1][0], t[1][1], t[2][0], t[2][1]])
+            .collect();
+        let inside = |s: usize, x: &[f64]| -> bool {
+            let t = &flat[s];
+            let (dx, dy) = (x[0] - t[4], x[1] - t[5]);
+            let c0 = t[0] * dx + t[1] * dy;
+            if !(-eps <= c0 && c0 <= 1.0 + eps) {
+                return false;
+            }
+            let c1 = t[2] * dx + t[3] * dy;
+            if !(-eps <= c1 && c1 <= 1.0 + eps) {
+                return false;
+            }
+            let c2 = 1.0 - c0 - c1;
+            -eps <= c2 && c2 <= 1.0 + eps
+        };
+        let locate = |x: &[f64]| -> isize {
+            if self.fully_outside(x, eps) {
+                return -1;
+            }
+            for &s in &cells[cell_y(x[1]) * g + cell_x(x[0])] {
+                let s = s as usize;
+                let b = &boxes[s];
+                if x[0] < b[0] || x[0] > b[1] || x[1] < b[2] || x[1] > b[3] {
                     continue;
                 }
-                let (a, b, c) = simplices[idx];
-                let (l1, l2, l3) = barycentric_2d(points[a], points[b], points[c], q);
-                if l1 >= -1e-10 && l2 >= -1e-10 && l3 >= -1e-10 {
-                    return Some((idx, l1, l2, l3));
+                if inside(s, x) {
+                    return s as isize;
                 }
             }
-            None
+            -1
         };
+        let nq = xi.len();
         let cores = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
-        let nthreads = if nq >= 64 {
-            cores.min(16).min(nq / 16).max(1)
-        } else {
-            1
-        };
-        if nthreads <= 1 {
-            for (slot, &q) in out.iter_mut().zip(queries) {
-                *slot = eval(q);
+        let workers = cores.min(16).min(nq / 16).max(1);
+        let mut out = vec![-1isize; nq];
+        if workers <= 1 {
+            for (slot, x) in out.iter_mut().zip(xi) {
+                *slot = locate(x);
             }
             return out;
         }
-        let chunk = nq.div_ceil(nthreads);
-        std::thread::scope(|s| {
-            for (qchunk, ochunk) in queries.chunks(chunk).zip(out.chunks_mut(chunk)) {
-                s.spawn(move || {
-                    for (slot, &q) in ochunk.iter_mut().zip(qchunk) {
-                        *slot = eval(q);
+        let chunk = nq.div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (queries, slots) in xi.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                let locate = &locate;
+                scope.spawn(move || {
+                    for (slot, x) in slots.iter_mut().zip(queries) {
+                        *slot = locate(x);
                     }
                 });
             }
         });
         out
     }
-}
 
-const DELAUNAY_CIRCLE_GRID_THRESHOLD: usize = 4096;
-
-fn delaunay_triangulate_linear(all_points: &[(f64, f64)], n: usize) -> Vec<(usize, usize, usize)> {
-    let mut triangles = vec![(n, n + 1, n + 2)];
-    // Circumcircles kept parallel to `triangles` so the bad scan tests dist²<r²
-    // instead of a per-pair in-circle determinant. frankenscipy-9l5oo.
-    let mut circ: Vec<(f64, f64, f64)> = vec![circumcircle_of(
-        all_points[n],
-        all_points[n + 1],
-        all_points[n + 2],
-    )];
-    // Per-point scratch hoisted out of the insertion loop and cleared each pass
-    // (both are fully rebuilt every point -> byte-identical), saving 2n Vec
-    // allocations. frankenscipy-8d2z2.
-    let mut bad: Vec<usize> = Vec::new();
-    let mut boundary: Vec<(usize, usize)> = Vec::new();
-    for p_idx in 0..n {
-        let point = all_points[p_idx];
-        bad.clear();
-        for (t_idx, &(cx, cy, r2)) in circ.iter().enumerate() {
-            let ddx = point.0 - cx;
-            let ddy = point.1 - cy;
-            if ddx * ddx + ddy * ddy < r2 {
-                bad.push(t_idx);
-            }
-        }
-
-        boundary.clear();
-        delaunay_collect_boundary(&triangles, &bad, &mut boundary);
-
-        bad.sort_unstable();
-        for &idx in bad.iter().rev() {
-            triangles.swap_remove(idx);
-            circ.swap_remove(idx);
-        }
-        for &(e0, e1) in &boundary {
-            triangles.push((p_idx, e0, e1));
-            circ.push(circumcircle_of(
-                all_points[p_idx],
-                all_points[e0],
-                all_points[e1],
-            ));
-        }
+    /// Signed distance of each lifted query point from every simplex's lifted hyperplane,
+    /// `(nquery, nsimplex)`, as `scipy.spatial.Delaunay.plane_distance`.
+    ///
+    /// # Errors
+    /// `DimensionMismatch` when a query does not have `ndim` coordinates.
+    pub fn plane_distance(&self, xi: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, SpatialError> {
+        self.check_query_dimension(xi)?;
+        Ok(xi
+            .iter()
+            .map(|x| {
+                let z = self.lift(x);
+                (0..self.simplices.len())
+                    .map(|s| self.distplane(s, &z))
+                    .collect()
+            })
+            .collect())
     }
 
-    triangles
-        .into_iter()
-        .filter(|&(a, b, c)| a < n && b < n && c < n)
-        .collect()
-}
-
-fn delaunay_triangulate_circle_grid(
-    all_points: &[(f64, f64)],
-    n: usize,
-    min_x: f64,
-    min_y: f64,
-    dx: f64,
-    dy: f64,
-) -> Vec<(usize, usize, usize)> {
-    let mut triangles = vec![(n, n + 1, n + 2)];
-    let mut circ: Vec<(f64, f64, f64)> = vec![circumcircle_of(
-        all_points[n],
-        all_points[n + 1],
-        all_points[n + 2],
-    )];
-    let mut active = vec![true];
-    let mut grid = DelaunayCircleGrid::new(n, min_x, min_y, dx, dy);
-    grid.insert_circle(circ[0], 0);
-
-    let mut bad: Vec<usize> = Vec::new();
-    let mut boundary: Vec<(usize, usize)> = Vec::new();
-    for p_idx in 0..n {
-        let point = all_points[p_idx];
-        bad.clear();
-        grid.bad_triangles(point, &circ, &active, &mut bad);
-        if bad.is_empty() {
-            delaunay_scan_active_bad_triangles(point, &circ, &active, &mut bad);
-        }
-        bad.sort_unstable();
-        bad.dedup();
-
-        boundary.clear();
-        delaunay_collect_boundary(&triangles, &bad, &mut boundary);
-
-        for &idx in &bad {
-            active[idx] = false;
-        }
-        for &(e0, e1) in &boundary {
-            let triangle_idx = triangles.len();
-            let circle = circumcircle_of(all_points[p_idx], all_points[e0], all_points[e1]);
-            triangles.push((p_idx, e0, e1));
-            circ.push(circle);
-            active.push(true);
-            grid.insert_circle(circle, triangle_idx);
-        }
-    }
-
-    triangles
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, (a, b, c))| {
-            (active[idx] && a < n && b < n && c < n).then_some((a, b, c))
-        })
-        .collect()
-}
-
-fn delaunay_scan_active_bad_triangles(
-    point: (f64, f64),
-    circ: &[(f64, f64, f64)],
-    active: &[bool],
-    bad: &mut Vec<usize>,
-) {
-    for (t_idx, &(cx, cy, r2)) in circ.iter().enumerate() {
-        if !active[t_idx] {
-            continue;
-        }
-        let ddx = point.0 - cx;
-        let ddy = point.1 - cy;
-        if ddx * ddx + ddy * ddy < r2 {
-            bad.push(t_idx);
-        }
-    }
-}
-
-fn delaunay_collect_boundary(
-    triangles: &[(usize, usize, usize)],
-    bad: &[usize],
-    boundary: &mut Vec<(usize, usize)>,
-) {
-    for &t_idx in bad {
-        let (a, b, c) = triangles[t_idx];
-        for &(e0, e1) in &[(a, b), (b, c), (c, a)] {
-            if !bad.iter().any(|&other_idx| {
-                other_idx != t_idx
-                    && triangle_has_edge(
-                        triangles[other_idx].0,
-                        triangles[other_idx].1,
-                        triangles[other_idx].2,
-                        e0,
-                        e1,
-                    )
-            }) {
-                boundary.push((e0, e1));
-            }
-        }
-    }
-}
-
-struct DelaunayCircleGrid {
-    min_x: f64,
-    min_y: f64,
-    inv_dx: f64,
-    inv_dy: f64,
-    dim: usize,
-    cells: Vec<Vec<usize>>,
-}
-
-impl DelaunayCircleGrid {
-    fn new(n: usize, min_x: f64, min_y: f64, dx: f64, dy: f64) -> Self {
-        let dim = ((n as f64).sqrt() as usize).clamp(16, 128);
-        Self {
-            min_x,
-            min_y,
-            inv_dx: dim as f64 / dx.max(1e-10),
-            inv_dy: dim as f64 / dy.max(1e-10),
-            dim,
-            cells: vec![Vec::new(); dim * dim],
-        }
-    }
-
-    fn insert_circle(&mut self, circle: (f64, f64, f64), triangle_idx: usize) {
-        let (cx, cy, r2) = circle;
-        if !cx.is_finite() || !cy.is_finite() || !r2.is_finite() || r2 < 0.0 {
-            return;
-        }
-        let r = r2.sqrt();
-        let x0 = self.cell_x(cx - r);
-        let x1 = self.cell_x(cx + r);
-        let y0 = self.cell_y(cy - r);
-        let y1 = self.cell_y(cy + r);
-        for y in y0..=y1 {
-            let row = y * self.dim;
-            for x in x0..=x1 {
-                self.cells[row + x].push(triangle_idx);
-            }
-        }
-    }
-
-    fn bad_triangles(
-        &self,
-        point: (f64, f64),
-        circ: &[(f64, f64, f64)],
-        active: &[bool],
-        bad: &mut Vec<usize>,
-    ) {
-        let cell = self.point_cell(point);
-        for &t_idx in &self.cells[cell] {
-            if !active[t_idx] {
-                continue;
-            }
-            let (cx, cy, r2) = circ[t_idx];
-            let ddx = point.0 - cx;
-            let ddy = point.1 - cy;
-            if ddx * ddx + ddy * ddy < r2 {
-                bad.push(t_idx);
-            }
-        }
-    }
-
-    fn point_cell(&self, point: (f64, f64)) -> usize {
-        self.cell_y(point.1) * self.dim + self.cell_x(point.0)
-    }
-
-    fn cell_x(&self, x: f64) -> usize {
-        clamp_delaunay_grid_cell((x - self.min_x) * self.inv_dx, self.dim)
-    }
-
-    fn cell_y(&self, y: f64) -> usize {
-        clamp_delaunay_grid_cell((y - self.min_y) * self.inv_dy, self.dim)
-    }
-}
-
-fn clamp_delaunay_grid_cell(scaled: f64, dim: usize) -> usize {
-    if scaled <= 0.0 {
-        0
-    } else if scaled >= dim as f64 {
-        dim - 1
-    } else {
-        scaled as usize
+    /// Lift points onto the paraboloid, `[x, |x|^2 * paraboloid_scale + paraboloid_shift]`, as
+    /// `scipy.spatial.Delaunay.lift_points`.
+    ///
+    /// # Errors
+    /// `DimensionMismatch` when a point does not have `ndim` coordinates.
+    pub fn lift_points(&self, x: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, SpatialError> {
+        self.check_query_dimension(x)?;
+        Ok(x.iter().map(|row| self.lift(row)).collect())
     }
 }
 
 /// Find the simplices containing the given points, matching
-/// `scipy.spatial.tsearch(tri, xi)`.
+/// `scipy.spatial.tsearch(tri, xi)`: [`Delaunay::find_simplex`] with SciPy's defaults, `-1` for
+/// points outside the triangulation.
 ///
-/// This is the functional form of [`Delaunay::find_simplex`]: for each query
-/// point it returns the index of the containing simplex, or `-1` for points
-/// that fall outside the triangulation (scipy's sentinel). As with
-/// [`Delaunay::find_simplex`], the simplex indices refer to this crate's own
-/// Bowyer-Watson triangulation ordering rather than qhull's.
-#[must_use]
-pub fn tsearch(tri: &Delaunay, xi: &[(f64, f64)]) -> Vec<i64> {
-    // Route through the grid-accelerated batch locator instead of an
-    // O(nq·num_simplices) per-point linear scan. `find_simplex_many` is
-    // documented bit-for-bit identical to calling `find_simplex` per point
-    // (same lowest-index containing simplex), so the result is unchanged while
-    // the cost drops from O(nq·S) to roughly O(nq) for well-distributed inputs.
-    tri.find_simplex_many(xi)
-        .into_iter()
-        .map(|hit| match hit {
-            Some((idx, _, _, _)) => idx as i64,
-            None => -1,
-        })
-        .collect()
-}
-
-/// Cross product of vectors OA and OB where O, A, B are 2D points.
-/// Positive = counter-clockwise, negative = clockwise, zero = collinear.
-fn cross(o: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
-}
-
-#[allow(dead_code)]
-fn point_in_circumcircle(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
-    let (ax, ay) = (a.0 - d.0, a.1 - d.1);
-    let (bx, by) = (b.0 - d.0, b.1 - d.1);
-    let (cx, cy) = (c.0 - d.0, c.1 - d.1);
-    let det = ax * (by * (cx * cx + cy * cy) - cy * (bx * bx + by * by))
-        - ay * (bx * (cx * cx + cy * cy) - cx * (bx * bx + by * by))
-        + (ax * ax + ay * ay) * (bx * cy - by * cx);
-    let orient = cross(a, b, c);
-    if orient > 0.0 { det > 0.0 } else { det < 0.0 }
-}
-
-/// Circumcircle (center_x, center_y, radius²) of a non-degenerate triangle. Precomputed
-/// once per triangle so the Bowyer-Watson bad-triangle scan tests `dist² < r²` (~5 flops)
-/// instead of recomputing the full in-circle determinant + orientation per (point,
-/// triangle) pair (~20 flops). For non-degenerate points this is the same in/out verdict
-/// as `point_in_circumcircle`; cocircular boundary cases agree (det=0 ⇔ dist²=r², both
-/// excluded by the strict `<`). frankenscipy-9l5oo.
-fn circumcircle_of(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> (f64, f64, f64) {
-    let (ax, ay) = a;
-    let (bx, by) = b;
-    let (cx, cy) = c;
-    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
-    let a2 = ax * ax + ay * ay;
-    let b2 = bx * bx + by * by;
-    let c2 = cx * cx + cy * cy;
-    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
-    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
-    let r2 = (ax - ux) * (ax - ux) + (ay - uy) * (ay - uy);
-    (ux, uy, r2)
-}
-
-fn triangle_has_edge(a: usize, b: usize, c: usize, e0: usize, e1: usize) -> bool {
-    [(a, b), (b, c), (c, a)]
-        .iter()
-        .any(|&(x, y)| (x == e0 && y == e1) || (x == e1 && y == e0))
-}
-
-fn barycentric_2d(a: (f64, f64), b: (f64, f64), c: (f64, f64), p: (f64, f64)) -> (f64, f64, f64) {
-    let (v0x, v0y) = (b.0 - a.0, b.1 - a.1);
-    let (v1x, v1y) = (c.0 - a.0, c.1 - a.1);
-    let (v2x, v2y) = (p.0 - a.0, p.1 - a.1);
-    let d00 = v0x * v0x + v0y * v0y;
-    let d01 = v0x * v1x + v0y * v1y;
-    let d11 = v1x * v1x + v1y * v1y;
-    let d20 = v2x * v0x + v2y * v0y;
-    let d21 = v2x * v1x + v2y * v1y;
-    let denom = d00 * d11 - d01 * d01;
-    if denom.abs() < 1e-30 {
-        return (f64::NAN, f64::NAN, f64::NAN);
-    }
-    let l2 = (d11 * d20 - d01 * d21) / denom;
-    let l3 = (d00 * d21 - d01 * d20) / denom;
-    (1.0 - l2 - l3, l2, l3)
+/// # Errors
+/// `DimensionMismatch` when a query does not have `tri.ndim` coordinates.
+pub fn tsearch(tri: &Delaunay, xi: &[Vec<f64>]) -> Result<Vec<isize>, SpatialError> {
+    tri.find_simplex(xi, false, None)
 }
 
 fn qhull_error(message: impl Into<String>) -> SpatialError {
     SpatialError::Qhull(QhullError::new(message))
-}
-
-fn validate_halfspace_intersection_inputs(
-    halfspaces: &[Halfspace2],
-    interior_point: Point2,
-) -> Result<(), SpatialError> {
-    if halfspaces.len() < 3 {
-        return Err(qhull_error(format!(
-            "QH6214 qhull input error: not enough halfspaces({}) to construct initial simplex (need 3)",
-            halfspaces.len()
-        )));
-    }
-    if !interior_point.0.is_finite() || !interior_point.1.is_finite() {
-        return Err(SpatialError::InvalidArgument(
-            "interior_point must contain finite coordinates".to_string(),
-        ));
-    }
-
-    for (idx, &[a, b, offset]) in halfspaces.iter().enumerate() {
-        if !a.is_finite() || !b.is_finite() || !offset.is_finite() {
-            return Err(SpatialError::InvalidArgument(format!(
-                "halfspace row {idx} contains a non-finite coefficient"
-            )));
-        }
-        let normal_norm = a.hypot(b);
-        if normal_norm <= f64::EPSILON {
-            return Err(qhull_error(format!(
-                "QH6154 Qhull precision error: halfspace row {idx} has zero normal"
-            )));
-        }
-        let signed_distance = a * interior_point.0 + b * interior_point.1 + offset;
-        let clear_inside_tol = 1e-12 * normal_norm.max(1.0);
-        if signed_distance >= -clear_inside_tol {
-            return Err(qhull_error(
-                "QH6023 qhull input error: feasible point is not clearly inside halfspace",
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_halfspace_intersection_inputs_nd(
@@ -5061,16 +5338,6 @@ fn validate_halfspace_intersection_inputs_nd(
     Ok(())
 }
 
-fn halfspace_dual_points(halfspaces: &[Halfspace2], interior_point: Point2) -> Vec<Point2> {
-    halfspaces
-        .iter()
-        .map(|&[a, b, offset]| {
-            let distance = a * interior_point.0 + b * interior_point.1 + offset;
-            (-a / distance, -b / distance)
-        })
-        .collect()
-}
-
 fn halfspace_dual_points_nd(halfspaces: &[Vec<f64>], interior_point: &[f64]) -> Vec<Vec<f64>> {
     let ndim = interior_point.len();
     halfspaces
@@ -5085,306 +5352,6 @@ fn halfspace_dual_points_nd(halfspaces: &[Vec<f64>], interior_point: &[f64]) -> 
             row[..ndim].iter().map(|value| -value / distance).collect()
         })
         .collect()
-}
-
-fn dual_edge_equation(lhs: Point2, rhs: Point2) -> Equation2 {
-    let dx = rhs.0 - lhs.0;
-    let dy = rhs.1 - lhs.1;
-    let length = dx.hypot(dy);
-    if length <= f64::EPSILON {
-        return [f64::NAN, f64::NAN, f64::NAN];
-    }
-
-    let mut normal_x = -dy / length;
-    let mut normal_y = dx / length;
-    let mut offset = -(normal_x * lhs.0 + normal_y * lhs.1);
-    if offset > 0.0 {
-        normal_x = -normal_x;
-        normal_y = -normal_y;
-        offset = -offset;
-    }
-    [normal_x, normal_y, offset]
-}
-
-fn intersection_from_dual_equation(equation: Equation2, interior_point: Point2) -> Point2 {
-    let denominator = -equation[2];
-    (
-        interior_point.0 + equation[0] / denominator,
-        interior_point.1 + equation[1] / denominator,
-    )
-}
-
-fn halfspace_region_is_bounded(halfspaces: &[Halfspace2]) -> bool {
-    let mut angles = halfspaces
-        .iter()
-        .map(|&[a, b, _]| {
-            let mut angle = b.atan2(a);
-            if angle < 0.0 {
-                angle += std::f64::consts::TAU;
-            }
-            angle
-        })
-        .collect::<Vec<_>>();
-    angles.sort_by(f64::total_cmp);
-    angles.dedup_by(|lhs, rhs| (*lhs - *rhs).abs() < 1e-12);
-    if angles.len() < 3 {
-        return false;
-    }
-
-    for idx in 0..angles.len() {
-        let next = if idx + 1 == angles.len() {
-            angles[0] + std::f64::consts::TAU
-        } else {
-            angles[idx + 1]
-        };
-        if next - angles[idx] >= std::f64::consts::PI - 1e-12 {
-            return false;
-        }
-    }
-    true
-}
-
-fn halfspace_region_is_bounded_nd(halfspaces: &[Vec<f64>], ndim: usize) -> bool {
-    let normals = halfspaces
-        .iter()
-        .map(|row| row[..ndim].to_vec())
-        .collect::<Vec<_>>();
-
-    // The region is bounded iff some (ndim+1)-subset of normals has the origin
-    // strictly inside its positive cone. Test each (ndim+1)-subset LAZILY in
-    // lexicographic order, short-circuiting on the first witness — identical to
-    // `combinations_recursive(..).into_iter().any(..)` but WITHOUT first
-    // materializing all C(m, ndim+1) subsets (≈ m/(ndim+1)× more than the vertex
-    // enumeration, e.g. 8.2M tiny Vecs for m=120, ndim=3). For bounded regions a
-    // witness is found almost immediately; unbounded regions still scan all
-    // subsets but no longer pay the O(C(m,ndim+1)) allocation up front.
-    combinations_any(normals.len(), ndim + 1, |combo| {
-        let mut matrix = vec![vec![0.0; ndim + 1]; ndim + 1];
-        let mut rhs = vec![0.0; ndim + 1];
-        rhs[ndim] = 1.0;
-
-        for (col, &normal_idx) in combo.iter().enumerate() {
-            for row in 0..ndim {
-                matrix[row][col] = normals[normal_idx][row];
-            }
-            matrix[ndim][col] = 1.0;
-        }
-
-        solve_linear_system(&matrix, &rhs, 1e-10)
-            .is_some_and(|weights| weights.iter().all(|value| *value > 1e-9))
-    })
-}
-
-/// Evaluate `pred` on each k-subset of `0..n` in the SAME lexicographic order as
-/// [`combinations_recursive`], short-circuiting (true) on the first subset that
-/// satisfies it. Equivalent to
-/// `combinations_recursive(n, k, ..).into_iter().any(pred)` but streams the
-/// subsets instead of materializing all C(n, k) of them first.
-fn combinations_any(n: usize, k: usize, mut pred: impl FnMut(&[usize]) -> bool) -> bool {
-    fn rec(
-        n: usize,
-        k: usize,
-        start: usize,
-        current: &mut Vec<usize>,
-        pred: &mut dyn FnMut(&[usize]) -> bool,
-    ) -> bool {
-        if current.len() == k {
-            return pred(current);
-        }
-        if start >= n {
-            return false;
-        }
-        for next in start..=n - (k - current.len()) {
-            current.push(next);
-            if rec(n, k, next + 1, current, pred) {
-                return true;
-            }
-            current.pop();
-        }
-        false
-    }
-    let mut current = Vec::with_capacity(k);
-    rec(n, k, 0, &mut current, &mut pred)
-}
-
-fn enumerate_halfspace_vertices_nd(
-    halfspaces: &[Vec<f64>],
-    ndim: usize,
-) -> Result<(NdVertices, NdFacets), SpatialError> {
-    let mut combos = Vec::new();
-    combinations_recursive(halfspaces.len(), ndim, 0, &mut Vec::new(), &mut combos);
-
-    let mut vertices = Vec::<Vec<f64>>::new();
-    let mut facets = Vec::<Vec<usize>>::new();
-    for (solution, combo) in halfspace_vertex_candidates_nd(halfspaces, ndim, &combos) {
-        if let Some(existing_idx) = vertices
-            .iter()
-            .position(|vertex| points_approx_eq(vertex, &solution, 1e-8))
-        {
-            merge_sorted_unique(&mut facets[existing_idx], &combo);
-        } else {
-            vertices.push(solution);
-            facets.push(combo);
-        }
-    }
-
-    if vertices.is_empty() {
-        return Err(qhull_error(
-            "QH6154 Qhull precision error: initial simplex is flat",
-        ));
-    }
-
-    Ok((vertices, facets))
-}
-
-fn halfspace_vertex_candidates_nd(
-    halfspaces: &[Vec<f64>],
-    ndim: usize,
-    combos: &[Vec<usize>],
-) -> Vec<NdVertexCandidate> {
-    let worker_count = halfspace_vertex_enum_thread_count(combos.len(), halfspaces.len(), ndim);
-    halfspace_vertex_candidates_nd_with_workers(halfspaces, ndim, combos, worker_count)
-}
-
-fn halfspace_vertex_candidates_nd_with_workers(
-    halfspaces: &[Vec<f64>],
-    ndim: usize,
-    combos: &[Vec<usize>],
-    worker_count: usize,
-) -> Vec<NdVertexCandidate> {
-    if worker_count <= 1 {
-        return combos
-            .iter()
-            .filter_map(|combo| halfspace_vertex_candidate_nd(halfspaces, ndim, combo))
-            .collect();
-    }
-
-    let worker_count = worker_count.min(combos.len()).max(1);
-    let chunk_len = combos.len().div_ceil(worker_count);
-    let parts: Vec<Vec<NdVertexCandidate>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = combos
-            .chunks(chunk_len)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .filter_map(|combo| halfspace_vertex_candidate_nd(halfspaces, ndim, combo))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("halfspace vertex enumeration worker panicked")
-            })
-            .collect()
-    });
-    parts.into_iter().flatten().collect()
-}
-
-fn halfspace_vertex_enum_thread_count(
-    combo_count: usize,
-    halfspace_count: usize,
-    ndim: usize,
-) -> usize {
-    let work = (combo_count as u64)
-        .saturating_mul(halfspace_count as u64)
-        .saturating_mul(ndim.max(1) as u64);
-    if combo_count < 4096 || work < 1 << 20 {
-        return 1;
-    }
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    cores.min(combo_count / 1024).clamp(1, 16)
-}
-
-fn halfspace_vertex_candidate_nd(
-    halfspaces: &[Vec<f64>],
-    ndim: usize,
-    combo: &[usize],
-) -> Option<NdVertexCandidate> {
-    let mut matrix = vec![vec![0.0; ndim]; ndim];
-    let mut rhs = vec![0.0; ndim];
-    for (row_idx, &halfspace_idx) in combo.iter().enumerate() {
-        matrix[row_idx].copy_from_slice(&halfspaces[halfspace_idx][..ndim]);
-        rhs[row_idx] = -halfspaces[halfspace_idx][ndim];
-    }
-
-    let solution = solve_linear_system(&matrix, &rhs, 1e-10)?;
-    if !point_satisfies_halfspaces(&solution, halfspaces, 1e-8) {
-        return None;
-    }
-
-    Some((solution, combo.to_vec()))
-}
-
-fn collect_dual_vertices(facets: &[Vec<usize>], total_halfspaces: usize) -> Vec<usize> {
-    let mut present = vec![false; total_halfspaces];
-    for facet in facets {
-        for &index in facet {
-            present[index] = true;
-        }
-    }
-    present
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, used)| used.then_some(index))
-        .collect()
-}
-
-fn point_satisfies_halfspaces(point: &[f64], halfspaces: &[Vec<f64>], tol: f64) -> bool {
-    let ndim = point.len();
-    halfspaces.iter().all(|row| {
-        row[..ndim]
-            .iter()
-            .zip(point.iter())
-            .map(|(a, x)| a * x)
-            .sum::<f64>()
-            + row[ndim]
-            <= tol
-    })
-}
-
-fn points_approx_eq(lhs: &[f64], rhs: &[f64], tol: f64) -> bool {
-    lhs.len() == rhs.len()
-        && lhs
-            .iter()
-            .zip(rhs.iter())
-            .all(|(left, right)| (left - right).abs() <= tol)
-}
-
-fn merge_sorted_unique(target: &mut Vec<usize>, incoming: &[usize]) {
-    for &value in incoming {
-        if !target.contains(&value) {
-            target.push(value);
-        }
-    }
-    target.sort_unstable();
-}
-
-fn combinations_recursive(
-    n: usize,
-    k: usize,
-    start: usize,
-    current: &mut Vec<usize>,
-    output: &mut Vec<Vec<usize>>,
-) {
-    if current.len() == k {
-        output.push(current.clone());
-        return;
-    }
-    if start >= n {
-        return;
-    }
-    for next in start..=n - (k - current.len()) {
-        current.push(next);
-        combinations_recursive(n, k, next + 1, current, output);
-        current.pop();
-    }
 }
 
 fn solve_linear_system(matrix: &[Vec<f64>], rhs: &[f64], tol: f64) -> Option<Vec<f64>> {
@@ -5444,109 +5411,309 @@ fn solve_linear_system(matrix: &[Vec<f64>], rhs: &[f64], tol: f64) -> Option<Vec
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Voronoi Diagram (2D)
+// Voronoi diagram (N-D)
 // ══════════════════════════════════════════════════════════════════════
 
-/// Result of a 2D Voronoi diagram construction.
+/// Voronoi diagram of an N-dimensional point set, matching `scipy.spatial.Voronoi(points)` with
+/// SciPy's default options (`"Qbb Qc Qz"`, `"Qx"` from 5-D up, NOT triangulated): the dual of the
+/// Delaunay triangulation, in which a cell of cospherical points is one Voronoi vertex.
 ///
-/// Matches the core SciPy surface for `scipy.spatial.Voronoi(points)`:
-/// input points, Voronoi vertices, ridge connectivity, and point regions.
+/// Which point pairs get a ridge follows Qhull's `qh_eachvoronoi` rule: a pair is a ridge when the
+/// number of Delaunay cells containing both, plus one if they also share an upper (unbounded)
+/// facet, is at least `ndim`. In 2-D that is every Delaunay edge; in 3-D and up a hull edge
+/// contained in fewer cells has no ridge, exactly as SciPy reports.
 #[derive(Debug, Clone)]
 pub struct Voronoi {
-    /// Input points in the original order.
-    pub points: Vec<(f64, f64)>,
-    /// Voronoi vertices (circumcenters of Delaunay simplices).
-    pub vertices: Vec<(f64, f64)>,
-    /// Input-point pairs whose dual Delaunay edge defines each Voronoi ridge.
-    pub ridge_points: Vec<(usize, usize)>,
-    /// Voronoi vertex pairs for each ridge. `-1` denotes an unbounded ray.
-    pub ridge_vertices: Vec<(isize, isize)>,
-    /// Region vertex indices for each Voronoi region. `-1` denotes infinity.
+    /// Input points, `(npoints, ndim)`.
+    pub points: Vec<Vec<f64>>,
+    /// Dimension of the points.
+    pub ndim: usize,
+    /// Number of input points.
+    pub npoints: usize,
+    /// Voronoi vertices, `(nvertices, ndim)`: circumcenters of the Delaunay cells.
+    pub vertices: Vec<Vec<f64>>,
+    /// The point pair each ridge separates, ascending within the pair.
+    pub ridge_points: Vec<[usize; 2]>,
+    /// Voronoi vertices of each ridge, `-1` (once) for a ridge extending to infinity. Ascending
+    /// with `-1` first, except in 3-D, where they run around the ridge polygon as SciPy's do.
+    pub ridge_vertices: Vec<Vec<isize>>,
+    /// Voronoi vertices of each region, `-1` (once) for an unbounded region. `regions[0]` is the
+    /// empty region of Qhull's `"Qz"` point at infinity, which SciPy reports too. In 2-D a region
+    /// runs counterclockwise around its point (from `-1` when unbounded); in higher dimensions it
+    /// is ascending with `-1` first, as SciPy's are.
     pub regions: Vec<Vec<isize>>,
-    /// Region index for each input point.
+    /// Index into `regions` of each input point; a duplicate shares its twin's region.
     pub point_region: Vec<usize>,
+    /// Coordinate-wise minimum of the input points.
+    pub min_bound: Vec<f64>,
+    /// Coordinate-wise maximum of the input points.
+    pub max_bound: Vec<f64>,
 }
 
 impl Voronoi {
-    /// Compute a 2D Voronoi diagram via the dual of the Delaunay triangulation.
-    pub fn new(points: &[(f64, f64)]) -> Result<Self, SpatialError> {
-        let delaunay = Delaunay::new(points)?;
-        let n = points.len();
+    /// Compute the Voronoi diagram of `points` (`npoints` rows of `ndim >= 2` coordinates).
+    ///
+    /// # Errors
+    /// As [`Delaunay::new`].
+    pub fn new(points: &[Vec<f64>]) -> Result<Self, SpatialError> {
+        let (ndim, flat) = qhull_input(points)?;
+        let lifted = lifted_hull(points, ndim, &flat)?;
+        let tri = Delaunay::from_lifted(points, ndim, &lifted);
+        let npoints = points.len();
+        let hull = &lifted.hull;
 
-        let mut vertices = Vec::with_capacity(delaunay.simplices.len());
-        for &(a, b, c) in &delaunay.simplices {
-            vertices.push(circumcenter_2d(points[a], points[b], points[c])?);
+        // Qhull does not triangulate Voronoi output: cospherical cells merge into one vertex,
+        // and coplanar upper facets merge too, which decides the upper-facet sharing below.
+        let class: Vec<u8> = lifted.lower.iter().map(|&lower| u8::from(!lower)).collect();
+        let groups = qhull::coplanar_groups(
+            &lifted.lifted_pts,
+            hull,
+            &class,
+            lifted.lifted_pts.distround(npoints),
+        );
+        let ngroups = groups.iter().copied().max().map_or(0, |g| g + 1);
+
+        // Voronoi vertices, numbered in Delaunay simplex order.
+        let mut group_vertex = vec![-1isize; ngroups];
+        let mut vertices: Vec<Vec<f64>> = Vec::new();
+        let mut simplex = 0usize;
+        for (f, &lower) in lifted.lower.iter().enumerate() {
+            if !lower {
+                continue;
+            }
+            if group_vertex[groups[f]] < 0 {
+                group_vertex[groups[f]] = vertices.len() as isize;
+                vertices.push(voronoi_center(&tri, simplex));
+            }
+            simplex += 1;
         }
+        let label = |f: usize| {
+            if lifted.lower[f] {
+                group_vertex[groups[f]]
+            } else {
+                -1
+            }
+        };
 
-        let mut edge_to_triangles: std::collections::HashMap<(usize, usize), Vec<usize>> =
-            std::collections::HashMap::new();
-        let mut point_to_triangles = vec![Vec::new(); n];
-        for (tri_idx, &(a, b, c)) in delaunay.simplices.iter().enumerate() {
-            point_to_triangles[a].push(tri_idx);
-            point_to_triangles[b].push(tri_idx);
-            point_to_triangles[c].push(tri_idx);
-            for (u, v) in [(a, b), (b, c), (c, a)] {
-                let edge = canonical_edge(u, v);
-                edge_to_triangles.entry(edge).or_default().push(tri_idx);
+        let mut group_points: Vec<Vec<usize>> = vec![Vec::new(); ngroups];
+        let mut group_lower = vec![false; ngroups];
+        let mut incident: Vec<Vec<usize>> = vec![Vec::new(); npoints];
+        for (f, facet) in hull.facets.iter().enumerate() {
+            group_lower[groups[f]] = lifted.lower[f];
+            for &v in &facet.vertices {
+                if v < npoints {
+                    group_points[groups[f]].push(v);
+                    incident[v].push(f);
+                }
             }
         }
-
-        let mut ridge_points = Vec::with_capacity(edge_to_triangles.len());
-        let mut ridge_vertices = Vec::with_capacity(edge_to_triangles.len());
-        let mut point_is_unbounded = vec![false; n];
-
-        for (&(u, v), triangles) in &edge_to_triangles {
-            ridge_points.push((u, v));
-            match triangles.as_slice() {
-                [tri_idx] => {
-                    point_is_unbounded[u] = true;
-                    point_is_unbounded[v] = true;
-                    ridge_vertices.push((-1, *tri_idx as isize));
-                }
-                [left, right] => {
-                    ridge_vertices.push((*left as isize, *right as isize));
-                }
-                _ => {
-                    return Err(qhull_error(
-                        "Qhull topology error: Voronoi construction encountered a non-manifold Delaunay edge",
-                    ));
-                }
-            }
+        for list in &mut group_points {
+            list.sort_unstable();
+            list.dedup();
         }
 
-        let mut regions = vec![Vec::new()];
-        let mut point_region = vec![0usize; n];
-        for point_idx in 0..n {
-            let point = points[point_idx];
-            // Each point's incident-triangle list is read exactly once here and
-            // never reused, so MOVE it out instead of cloning. Byte-identical.
-            let mut incident = std::mem::take(&mut point_to_triangles[point_idx]);
-            incident.sort_by(|&lhs, &rhs| {
-                let a = vertices[lhs];
-                let b = vertices[rhs];
-                let angle_a = (a.1 - point.1).atan2(a.0 - point.0);
-                let angle_b = (b.1 - point.1).atan2(b.0 - point.0);
-                angle_a.total_cmp(&angle_b)
-            });
-
-            let mut region: Vec<isize> = incident.into_iter().map(|idx| idx as isize).collect();
-            if point_is_unbounded[point_idx] {
-                region.insert(0, -1);
+        let mut regions: Vec<Vec<isize>> = vec![Vec::new()];
+        let mut point_region = vec![0usize; npoints];
+        for p in 0..npoints {
+            if !incident[p].iter().any(|&f| lifted.lower[f]) {
+                continue; // not a vertex: a coplanar point, mapped below
             }
-
-            point_region[point_idx] = regions.len();
+            let region = if ndim == 2 {
+                let ring = facet_ring(hull, incident[p][0], &[p]);
+                let labels = cyclic_labels(ring.iter().map(|&f| label(f)).collect());
+                counterclockwise_region(labels, &points[p], &vertices)
+            } else {
+                sorted_labels(incident[p].iter().map(|&f| label(f)).collect())
+            };
+            point_region[p] = regions.len();
             regions.push(region);
         }
+        for row in &tri.coplanar {
+            point_region[row[0]] = point_region[row[2]];
+        }
 
+        let mut pairs: BTreeMap<(usize, usize), (Vec<usize>, bool)> = BTreeMap::new();
+        for (g, list) in group_points.iter().enumerate() {
+            for i in 0..list.len() {
+                for j in i + 1..list.len() {
+                    let entry = pairs.entry((list[i], list[j])).or_default();
+                    if group_lower[g] {
+                        entry.0.push(g);
+                    } else {
+                        entry.1 = true;
+                    }
+                }
+            }
+        }
+        let mut ridge_points = Vec::new();
+        let mut ridge_vertices = Vec::new();
+        for ((a, b), (cells, unbounded)) in pairs {
+            if cells.len() + usize::from(unbounded) < ndim {
+                continue;
+            }
+            let start = incident[a]
+                .iter()
+                .copied()
+                .find(|&f| hull.facets[f].vertices.contains(&b));
+            let ridge = match (ndim, start) {
+                (3, Some(first)) => cyclic_labels(
+                    facet_ring(hull, first, &[a, b])
+                        .iter()
+                        .map(|&f| label(f))
+                        .collect(),
+                ),
+                _ => {
+                    let mut labels: Vec<isize> = cells.iter().map(|&g| group_vertex[g]).collect();
+                    if unbounded {
+                        labels.push(-1);
+                    }
+                    sorted_labels(labels)
+                }
+            };
+            ridge_points.push([a, b]);
+            ridge_vertices.push(ridge);
+        }
+
+        let (min_bound, max_bound) = coordinate_bounds(points, ndim);
         Ok(Self {
             points: points.to_vec(),
+            ndim,
+            npoints,
             vertices,
             ridge_points,
             ridge_vertices,
             regions,
             point_region,
+            min_bound,
+            max_bound,
         })
     }
+
+    /// Ridge vertices keyed by the point pair they separate, as SciPy's `ridge_dict`.
+    #[must_use]
+    pub fn ridge_dict(&self) -> BTreeMap<(usize, usize), Vec<isize>> {
+        self.ridge_points
+            .iter()
+            .zip(&self.ridge_vertices)
+            .map(|(pair, ridge)| ((pair[0], pair[1]), ridge.clone()))
+            .collect()
+    }
+}
+
+/// Circumcenter of Delaunay simplex `s` (Qhull's `qh_voronoi_center`), falling back to the
+/// center implied by its lifted hyperplane when the simplex is too flat for Cramer's rule.
+fn voronoi_center(tri: &Delaunay, s: usize) -> Vec<f64> {
+    let rows: Vec<&[f64]> = tri.simplices[s]
+        .iter()
+        .map(|&i| tri.points[i].as_slice())
+        .collect();
+    qhull::circumcenter(&rows).unwrap_or_else(|| {
+        let eq = &tri.equations[s];
+        let d = tri.ndim;
+        (0..d)
+            .map(|k| -eq[k] / (2.0 * eq[d] * tri.paraboloid_scale))
+            .collect()
+    })
+}
+
+/// The facets containing every vertex of `fixed` (`D - 2` of them in a `D`-dimensional hull)
+/// form a cycle; walk it from `start`, crossing each time the ridge through the vertex shared
+/// with the previous facet.
+fn facet_ring(hull: &qhull::Hull, start: usize, fixed: &[usize]) -> Vec<usize> {
+    let others = |f: usize| -> Vec<usize> {
+        hull.facets[f]
+            .vertices
+            .iter()
+            .copied()
+            .filter(|v| !fixed.contains(v))
+            .collect()
+    };
+    let slot = |f: usize, v: usize| hull.facets[f].vertices.iter().position(|&x| x == v);
+    let mut ring = vec![start];
+    let first = others(start);
+    if first.len() != 2 {
+        return ring;
+    }
+    let mut shared = first[1];
+    let Some(k) = slot(start, first[0]) else {
+        return ring;
+    };
+    let mut current = hull.facets[start].neighbors[k];
+    while current != start && ring.len() <= hull.facets.len() {
+        ring.push(current);
+        let pair = others(current);
+        if pair.len() != 2 {
+            break;
+        }
+        let next_shared = if pair[0] == shared { pair[1] } else { pair[0] };
+        let Some(k) = slot(current, shared) else {
+            break;
+        };
+        current = hull.facets[current].neighbors[k];
+        shared = next_shared;
+    }
+    ring
+}
+
+/// Cyclic labels with consecutive repeats (a merged cell, a run of upper facets) collapsed and a
+/// single `-1`.
+fn cyclic_labels(mut labels: Vec<isize>) -> Vec<isize> {
+    labels.dedup();
+    while labels.len() > 1 && labels.first() == labels.last() {
+        labels.pop();
+    }
+    let mut seen_infinity = false;
+    labels.retain(|&label| {
+        if label != -1 {
+            return true;
+        }
+        let keep = !seen_infinity;
+        seen_infinity = true;
+        keep
+    });
+    labels
+}
+
+fn sorted_labels(mut labels: Vec<isize>) -> Vec<isize> {
+    labels.sort_unstable();
+    labels.dedup();
+    labels
+}
+
+/// Orient a 2-D region's cyclic vertex list counterclockwise around its point and start it at
+/// `-1` (unbounded) or at its lowest vertex.
+fn counterclockwise_region(
+    mut labels: Vec<isize>,
+    point: &[f64],
+    vertices: &[Vec<f64>],
+) -> Vec<isize> {
+    let n = labels.len();
+    let mut turning = 0.0;
+    for i in 0..n {
+        let (a, b) = (labels[i], labels[(i + 1) % n]);
+        if n < 3 || a < 0 || b < 0 {
+            continue;
+        }
+        let (va, vb) = (&vertices[a as usize], &vertices[b as usize]);
+        turning +=
+            (va[0] - point[0]) * (vb[1] - point[1]) - (va[1] - point[1]) * (vb[0] - point[0]);
+    }
+    if turning < 0.0 {
+        labels.reverse();
+    }
+    let start = labels
+        .iter()
+        .position(|&label| label == -1)
+        .or_else(|| {
+            labels
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &label)| label)
+                .map(|(i, _)| i)
+        })
+        .unwrap_or(0);
+    labels.rotate_left(start);
+    labels
 }
 
 /// Lightweight 2D plot representation matching matplotlib Figure data for spatial plots.
@@ -5556,79 +5723,77 @@ pub struct SpatialPlot2D {
     pub lines: Vec<((f64, f64), (f64, f64))>,
 }
 
-/// Plot the given convex hull, matching `scipy.spatial.convex_hull_plot_2d`.
-#[must_use]
-pub fn convex_hull_plot_2d(hull: &ConvexHull, points: &[(f64, f64)]) -> SpatialPlot2D {
-    let mut lines = Vec::with_capacity(hull.simplices.len());
-    for &(i, j) in &hull.simplices {
-        if i < points.len() && j < points.len() {
-            lines.push((points[i], points[j]));
-        }
-    }
-    SpatialPlot2D {
-        points: points.to_vec(),
-        lines,
-    }
+fn plot_points(points: &[Vec<f64>]) -> Vec<(f64, f64)> {
+    points.iter().map(|p| (p[0], p[1])).collect()
 }
 
-/// Plot the given Delaunay triangulation, matching `scipy.spatial.delaunay_plot_2d`.
-#[must_use]
-pub fn delaunay_plot_2d(tri: &Delaunay) -> SpatialPlot2D {
-    let mut lines = Vec::new();
-    for &(i, j, k) in &tri.simplices {
-        if i < tri.points.len() && j < tri.points.len() && k < tri.points.len() {
-            lines.push((tri.points[i], tri.points[j]));
-            lines.push((tri.points[j], tri.points[k]));
-            lines.push((tri.points[k], tri.points[i]));
-        }
-    }
-    SpatialPlot2D {
-        points: tri.points.clone(),
-        lines,
-    }
-}
-
-/// Plot the given Voronoi diagram, matching `scipy.spatial.voronoi_plot_2d`.
-#[must_use]
-pub fn voronoi_plot_2d(vor: &Voronoi) -> SpatialPlot2D {
-    let mut lines = Vec::new();
-    for &(v1, v2) in &vor.ridge_vertices {
-        if v1 >= 0 && v2 >= 0 {
-            let u1 = v1 as usize;
-            let u2 = v2 as usize;
-            if u1 < vor.vertices.len() && u2 < vor.vertices.len() {
-                lines.push((vor.vertices[u1], vor.vertices[u2]));
-            }
-        }
-    }
-    SpatialPlot2D {
-        points: vor.points.clone(),
-        lines,
-    }
-}
-
-fn canonical_edge(a: usize, b: usize) -> (usize, usize) {
-    if a < b { (a, b) } else { (b, a) }
-}
-
-fn circumcenter_2d(
-    a: (f64, f64),
-    b: (f64, f64),
-    c: (f64, f64),
-) -> Result<(f64, f64), SpatialError> {
-    let d = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
-    if d.abs() < 1e-30 {
-        return Err(qhull_error(
-            "QH6154 Qhull precision error: initial simplex is flat",
+/// Plot the given convex hull, matching `scipy.spatial.convex_hull_plot_2d`: its points and
+/// its facet edges.
+///
+/// # Errors
+/// `InvalidArgument("Convex hull is not 2-D")` for any other dimension, as SciPy raises.
+pub fn convex_hull_plot_2d(hull: &ConvexHull) -> Result<SpatialPlot2D, SpatialError> {
+    if hull.ndim != 2 {
+        return Err(SpatialError::InvalidArgument(
+            "Convex hull is not 2-D".to_string(),
         ));
     }
+    let points = plot_points(&hull.points);
+    let lines = hull
+        .simplices
+        .iter()
+        .map(|facet| (points[facet[0]], points[facet[1]]))
+        .collect();
+    Ok(SpatialPlot2D { points, lines })
+}
 
-    let a2 = a.0 * a.0 + a.1 * a.1;
-    let b2 = b.0 * b.0 + b.1 * b.1;
-    let c2 = c.0 * c.0 + c.1 * c.1;
-    let ux = (a2 * (b.1 - c.1) + b2 * (c.1 - a.1) + c2 * (a.1 - b.1)) / d;
-    let uy = (a2 * (c.0 - b.0) + b2 * (a.0 - c.0) + c2 * (b.0 - a.0)) / d;
-    Ok((ux, uy))
+/// Plot the given Delaunay triangulation, matching `scipy.spatial.delaunay_plot_2d`: its points
+/// and every triangle's three edges.
+///
+/// # Errors
+/// `InvalidArgument("Delaunay triangulation is not 2-D")` for any other dimension.
+pub fn delaunay_plot_2d(tri: &Delaunay) -> Result<SpatialPlot2D, SpatialError> {
+    if tri.ndim != 2 {
+        return Err(SpatialError::InvalidArgument(
+            "Delaunay triangulation is not 2-D".to_string(),
+        ));
+    }
+    let points = plot_points(&tri.points);
+    let mut lines = Vec::with_capacity(3 * tri.simplices.len());
+    for s in &tri.simplices {
+        lines.push((points[s[0]], points[s[1]]));
+        lines.push((points[s[1]], points[s[2]]));
+        lines.push((points[s[2]], points[s[0]]));
+    }
+    Ok(SpatialPlot2D { points, lines })
+}
+
+/// Plot the given Voronoi diagram, matching `scipy.spatial.voronoi_plot_2d`'s finite ridges.
+///
+/// # Errors
+/// `InvalidArgument("Voronoi diagram is not 2-D")` for any other dimension.
+pub fn voronoi_plot_2d(vor: &Voronoi) -> Result<SpatialPlot2D, SpatialError> {
+    if vor.ndim != 2 {
+        return Err(SpatialError::InvalidArgument(
+            "Voronoi diagram is not 2-D".to_string(),
+        ));
+    }
+    let lines = vor
+        .ridge_vertices
+        .iter()
+        .filter(|ridge| ridge.len() == 2 && ridge.iter().all(|&v| v >= 0))
+        .map(|ridge| {
+            let (a, b) = (
+                &vor.vertices[ridge[0] as usize],
+                &vor.vertices[ridge[1] as usize],
+            );
+            ((a[0], a[1]), (b[0], b[1]))
+        })
+        .collect();
+    Ok(SpatialPlot2D {
+        points: plot_points(&vor.points),
+        lines,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -7002,7 +7167,18 @@ pub fn mahalanobis(x: &[f64], y: &[f64], vi: &[Vec<f64>]) -> f64 {
         *vd = simd_dot(row, &diff);
     }
     let result = simd_dot(&diff, &vi_diff);
-    result.max(0.0).sqrt()
+    mahalanobis_root(result)
+}
+
+/// `sqrt(max(q, 0))` of a Mahalanobis quadratic form, keeping a NaN form NaN. `f64::max` alone
+/// would turn a NaN coordinate into distance 0 where SciPy's `np.sqrt` returns NaN.
+#[inline]
+fn mahalanobis_root(q: f64) -> f64 {
+    if q.is_nan() {
+        f64::NAN
+    } else {
+        q.max(0.0).sqrt()
+    }
 }
 
 /// Pairwise Mahalanobis distance matrix between the rows of `xa` and `xb` given the inverse
@@ -7088,7 +7264,7 @@ pub fn cdist_mahalanobis(
         let qxi = qx[i];
         let ci = &cross[i];
         (0..nb)
-            .map(|j| (qxi + qy[j] - 2.0 * ci[j]).max(0.0).sqrt())
+            .map(|j| mahalanobis_root(qxi + qy[j] - 2.0 * ci[j]))
             .collect()
     };
     // The assembly is a CHEAP per-cell op (one sqrt), so it needs a much higher work gate than the
@@ -7193,7 +7369,7 @@ pub fn pdist_mahalanobis(x: &[Vec<f64>], vi: &[Vec<f64>]) -> Result<Vec<f64>, Sp
             let qi = q[i];
             let gi = &g[i];
             for j in (i + 1)..n {
-                out.push((qi + q[j] - 2.0 * gi[j]).max(0.0).sqrt());
+                out.push(mahalanobis_root(qi + q[j] - 2.0 * gi[j]));
             }
         }
         return Ok(out);
@@ -7216,7 +7392,7 @@ pub fn pdist_mahalanobis(x: &[Vec<f64>], vi: &[Vec<f64>]) -> Result<Vec<f64>, Sp
                     let gi = &g_ref[i];
                     let k0 = offset(i) - base;
                     for (slot, j) in head[k0..].iter_mut().zip((i + 1)..n) {
-                        *slot = (qi + q_ref[j] - 2.0 * gi[j]).max(0.0).sqrt();
+                        *slot = mahalanobis_root(qi + q_ref[j] - 2.0 * gi[j]);
                     }
                 }
             });
@@ -7340,10 +7516,18 @@ fn minkowski_rowwise(
         }
         // Mirror scipy's exact three-way branch on p.
         let val = if p == f64::INFINITY {
+            // numpy's `amax` keeps a NaN; `f64::max` would drop it and report the largest
+            // finite coordinate gap instead.
             a.iter()
                 .zip(b.iter())
                 .map(|(&ai, &bi)| (bi - ai).abs())
-                .fold(0.0_f64, f64::max)
+                .fold(0.0_f64, |m, d| {
+                    if m.is_nan() || d.is_nan() {
+                        f64::NAN
+                    } else {
+                        m.max(d)
+                    }
+                })
         } else if p == 1.0 {
             a.iter()
                 .zip(b.iter())
@@ -9511,10 +9695,6 @@ mod tests {
     /// `query_ball_point_many` must be bit-for-bit identical to calling
     /// `query_ball_point` per point (same sorted index lists), across dims,
     /// radii, and batch sizes spanning the gate, plus error/empty handling.
-    /// `find_simplex_many` must be bit-for-bit identical to calling
-    /// `find_simplex` per point (same simplex index, same barycentric bits),
-    /// across interior / exterior / on-vertex queries and a batch that crosses
-    /// the serial/parallel gate.
     /// The (now parallel) `sparse_distance_matrix_triplets` must equal a
     /// brute-force all-pairs reference, bit-for-bit, at a size that triggers the
     /// parallel collection path (the final (row,col) sort makes the result
@@ -9561,43 +9741,86 @@ mod tests {
         }
     }
 
+    /// Point location has three paths and they must agree with the brute-force scan:
+    /// * the 2-D grid index (batches of >= 64 queries) returns EXACTLY brute force's answer for
+    ///   every query, vertices and outside points included;
+    /// * SciPy's walk (smaller batches, and every batch in 3-D and up) returns brute force's
+    ///   simplex for a query strictly inside one simplex, -1 for a query outside, and some
+    ///   containing simplex for an input point (a vertex shared by several simplices).
+    ///
+    /// Negative arm: most queries are not in simplex 0, where every walk starts, so the walk
+    /// must actually travel, and the batch must hit both inside and outside.
     #[test]
-    fn delaunay_find_simplex_many_matches_per_point() {
-        // Deterministic scattered points (mirror the perf bench distribution).
+    fn delaunay_find_simplex_paths_agree_with_bruteforce() {
+        fn contains(tri: &Delaunay, s: isize, q: &[f64]) -> bool {
+            let d = tri.ndim;
+            let t = &tri.transform[s as usize];
+            let mut last = 1.0;
+            for i in 0..d {
+                let c: f64 = (0..d).map(|j| t[i][j] * (q[j] - t[d][j])).sum();
+                if c < -1e-9 {
+                    return false;
+                }
+                last -= c;
+            }
+            last >= -1e-9
+        }
         let n = 400usize;
-        let pts: Vec<(f64, f64)> = (0..n)
+        let pts: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 let t = i as f64;
-                ((t * 0.137).sin() * 0.5 + 0.5, (t * 0.071).cos() * 0.5 + 0.5)
+                vec![(t * 0.137).sin() * 0.5 + 0.5, (t * 0.071).cos() * 0.5 + 0.5]
             })
             .collect();
         let tri = Delaunay::new(&pts).expect("delaunay");
-        let mut queries: Vec<(f64, f64)> = (0..2000)
+        let mut queries: Vec<Vec<f64>> = (0..2000)
             .map(|i| {
                 let t = i as f64;
-                ((t * 0.0191).fract(), (t * 0.0233).fract())
+                vec![
+                    (t * 0.0191).fract() * 1.2 - 0.1,
+                    (t * 0.0233).fract() * 1.2 - 0.1,
+                ]
             })
             .collect();
-        // include some exact input points (on-vertex / shared-edge stress)
-        queries.extend(pts.iter().copied().take(50));
-        let batch = tri.find_simplex_many(&queries);
-        assert_eq!(batch.len(), queries.len());
-        for (q, got) in queries.iter().zip(&batch) {
-            let expect = tri.find_simplex(*q);
-            match (got, expect) {
-                (Some((gi, g1, g2, g3)), Some((ei, e1, e2, e3))) => {
-                    assert_eq!(gi, &ei, "simplex idx q={q:?}");
-                    assert_eq!(g1.to_bits(), e1.to_bits(), "l1 q={q:?}");
-                    assert_eq!(g2.to_bits(), e2.to_bits(), "l2 q={q:?}");
-                    assert_eq!(g3.to_bits(), e3.to_bits(), "l3 q={q:?}");
-                }
-                (None, None) => {}
-                _ => assert_eq!(
-                    got.is_some(),
-                    expect.is_some(),
-                    "mismatch presence q={q:?}: {got:?} vs {expect:?}"
-                ),
+        queries.extend(pts.iter().take(50).cloned());
+        let brute = tri.find_simplex(&queries, true, None).expect("brute");
+        let grid = tri.find_simplex(&queries, false, None).expect("grid");
+        assert_eq!(
+            grid, brute,
+            "the 2-D grid path answers exactly as brute force"
+        );
+        let inside = brute.iter().filter(|&&s| s >= 0).count();
+        assert!(inside > 1000 && brute.len() - inside > 50, "{inside}");
+
+        // The walk: batches below the grid threshold in 2-D, and a 3-D triangulation.
+        let pts3 = qhull_lcg_points(200, 3, 12);
+        let tri3 = Delaunay::new(&pts3).expect("3-D delaunay");
+        let mut queries3: Vec<Vec<f64>> = qhull_lcg_points(300, 3, 13)
+            .into_iter()
+            .map(|q| q.into_iter().map(|x| 1.2 * x - 0.1).collect())
+            .collect();
+        queries3.extend(pts3.iter().take(30).cloned());
+        for (tri, queries, generic) in [(&tri, &queries, 2000usize), (&tri3, &queries3, 300)] {
+            let brute = tri.find_simplex(queries, true, None).expect("brute");
+            let mut walked = Vec::new();
+            for batch in queries.chunks(50) {
+                walked.extend(tri.find_simplex(batch, false, None).expect("walk"));
             }
+            let mut moved = 0usize;
+            for (i, q) in queries.iter().enumerate() {
+                let (w, b) = (walked[i], brute[i]);
+                assert_eq!(w < 0, b < 0, "inside/outside disagree at {q:?}");
+                if w < 0 {
+                    continue;
+                }
+                moved += usize::from(w != 0);
+                assert!(contains(tri, w, q) && contains(tri, b, q), "{q:?}");
+                if i < generic {
+                    // A generic query lies strictly inside exactly one simplex.
+                    assert_eq!(w, b, "walk and brute force disagree at {q:?}");
+                }
+            }
+            assert!(moved > generic / 4, "the walk must travel: {moved}");
         }
     }
 
@@ -9945,21 +10168,22 @@ mod tests {
 
     #[test]
     fn convex_hull_2d_match_scipy() {
-        // Unit square + interior point. scipy: area(=perimeter)=4, volume(=2D
-        // area)=1, 4 hull vertices (interior point excluded). fsci swaps the
-        // area/perimeter names (documented): area=2D area, perimeter=scipy area.
-        let pts = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.5, 0.5)];
+        // Unit square + interior point. SciPy 1.17.1: area (the perimeter) 4, volume (the
+        // enclosed area) 1, 4 hull vertices (interior point excluded).
+        let pts = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+            vec![0.5, 0.5],
+        ];
         let h = ConvexHull::new(&pts).expect("hull");
         assert_eq!(h.vertices.len(), 4, "interior point excluded");
+        assert!((h.area - 4.0).abs() < 1e-12, "area (perimeter): {}", h.area);
         assert!(
-            (h.area - 1.0).abs() < 1e-12,
-            "area (scipy volume): {}",
-            h.area
-        );
-        assert!(
-            (h.perimeter - 4.0).abs() < 1e-12,
-            "perimeter (scipy area): {}",
-            h.perimeter
+            (h.volume - 1.0).abs() < 1e-12,
+            "volume (area): {}",
+            h.volume
         );
     }
 
@@ -10766,9 +10990,13 @@ mod tests {
     }
 
     fn point_set_contains(points: &[Vec<f64>], expected: &[f64]) -> bool {
-        points
-            .iter()
-            .any(|point| points_approx_eq(point, expected, 1e-10))
+        points.iter().any(|point| {
+            point.len() == expected.len()
+                && point
+                    .iter()
+                    .zip(expected)
+                    .all(|(got, want)| (got - want).abs() <= 1e-10)
+        })
     }
 
     #[test]
@@ -11586,6 +11814,24 @@ mod tests {
     }
 
     #[test]
+    fn braycurtis_zero_denominator_is_ieee_like_scipy() {
+        // SciPy 1.17.1: braycurtis([1,0], [-1,0]) = inf and braycurtis([0,0], [0,0]) = nan,
+        // in the scalar function and in pdist/cdist alike. fsci used to return 0.0 for both.
+        assert_eq!(braycurtis(&[1.0, 0.0], &[-1.0, 0.0]), f64::INFINITY);
+        assert!(braycurtis(&[0.0, 0.0], &[0.0, 0.0]).is_nan());
+        // the cdist row kernel: 9 columns so both the 8-lane body and the scalar tail run
+        let zeros = vec![vec![0.0; 9], vec![0.0; 9]];
+        let row = cdist_row_braycurtis_soa(&[0.0, 0.0], &zeros, 9);
+        assert!(row.iter().all(|v| v.is_nan()), "{row:?}");
+        let mut opposite = vec![vec![0.0; 9], vec![0.0; 9]];
+        opposite[0][8] = -1.0;
+        opposite[0][0] = -1.0;
+        let row = cdist_row_braycurtis_soa(&[1.0, 0.0], &opposite, 9);
+        assert_eq!((row[0], row[8]), (f64::INFINITY, f64::INFINITY));
+        assert_eq!(row[1], 1.0);
+    }
+
+    #[test]
     fn jensenshannon_matches_scipy_default_base() {
         let distance = jensenshannon(&[1.0, 0.0], &[0.5, 0.5], None);
         assert!((distance - 0.464501404022459).abs() < 1e-15);
@@ -11882,43 +12128,90 @@ mod tests {
 
     // ── ConvexHull tests ─────────────────────────────────────────────
 
+    /// Portable LCG point sets: the same stream is reproducible bit for bit in Python, which is
+    /// how the SciPy 1.17.1 values below were produced.
+    fn qhull_lcg_points(n: usize, d: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                (0..d)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        (state >> 11) as f64 / (1u64 << 53) as f64
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn rows2(points: &[[f64; 2]]) -> Vec<Vec<f64>> {
+        points.iter().map(|p| p.to_vec()).collect()
+    }
+
+    fn is_qhull_error(err: &SpatialError, code: &str) -> bool {
+        matches!(err, SpatialError::Qhull(q) if q.message().contains(code))
+    }
+
+    fn is_rotation(got: &[usize], want: &[usize]) -> bool {
+        got.len() == want.len()
+            && (0..want.len())
+                .any(|shift| (0..want.len()).all(|i| got[(i + shift) % got.len()] == want[i]))
+    }
+
+    fn close_rel(got: f64, want: f64, rtol: f64) -> bool {
+        (got - want).abs() <= rtol * want.abs().max(1.0)
+    }
+
     #[test]
     fn convex_hull_square() {
-        let points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
         let hull = ConvexHull::new(&points).expect("hull");
         assert_eq!(hull.vertices.len(), 4, "square has 4 hull vertices");
-        assert!((hull.area - 1.0).abs() < 1e-10, "area = {}", hull.area);
+        assert_eq!(hull.ndim, 2);
+        assert_eq!(hull.npoints, 4);
         assert!(
-            (hull.perimeter - 4.0).abs() < 1e-10,
-            "perimeter = {}",
-            hull.perimeter
+            (hull.area - 4.0).abs() < 1e-12,
+            "area (perimeter) = {}",
+            hull.area
         );
+        assert!(
+            (hull.volume - 1.0).abs() < 1e-12,
+            "volume = {}",
+            hull.volume
+        );
+        assert_eq!(hull.min_bound, vec![0.0, 0.0]);
+        assert_eq!(hull.max_bound, vec![1.0, 1.0]);
+        assert!(hull.coplanar.is_empty());
     }
 
     #[test]
     fn convex_hull_triangle() {
-        let points = [(0.0, 0.0), (4.0, 0.0), (2.0, 3.0)];
+        let points = rows2(&[[0.0, 0.0], [4.0, 0.0], [2.0, 3.0]]);
         let hull = ConvexHull::new(&points).expect("hull");
         assert_eq!(hull.vertices.len(), 3, "triangle has 3 hull vertices");
-        // Area of triangle with base 4, height 3 = 6
-        assert!((hull.area - 6.0).abs() < 1e-10, "area = {}", hull.area);
+        assert!(
+            (hull.volume - 6.0).abs() < 1e-12,
+            "volume = {}",
+            hull.volume
+        );
+        let perimeter = 4.0 + 2.0 * 13.0_f64.sqrt();
+        assert!(
+            (hull.area - perimeter).abs() < 1e-12,
+            "area = {}",
+            hull.area
+        );
     }
 
     #[test]
     fn convex_hull_interior_points_excluded() {
-        // Square with interior point
-        let points = [
-            (0.0, 0.0),
-            (2.0, 0.0),
-            (2.0, 2.0),
-            (0.0, 2.0),
-            (1.0, 1.0), // interior
-        ];
+        let points = rows2(&[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]]);
         let hull = ConvexHull::new(&points).expect("hull");
         assert_eq!(
             hull.vertices.len(),
             4,
-            "interior point should be excluded: {:?}",
+            "interior point excluded: {:?}",
             hull.vertices
         );
         assert!(!hull.vertices.contains(&4), "point 4 is interior");
@@ -11926,57 +12219,286 @@ mod tests {
 
     #[test]
     fn convex_hull_simplices_form_closed_polygon() {
-        let points = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]);
         let hull = ConvexHull::new(&points).expect("hull");
-        // Each vertex appears exactly twice in simplices (as start and end of adjacent edges)
         let mut vertex_count = std::collections::HashMap::new();
-        for &(a, b) in &hull.simplices {
-            *vertex_count.entry(a).or_insert(0) += 1;
-            *vertex_count.entry(b).or_insert(0) += 1;
+        for facet in &hull.simplices {
+            assert_eq!(facet.len(), 2);
+            for &v in facet {
+                *vertex_count.entry(v).or_insert(0) += 1;
+            }
         }
         for &v in &hull.vertices {
-            assert_eq!(
-                vertex_count.get(&v),
-                Some(&2),
-                "vertex {v} should appear exactly twice in simplices"
-            );
+            assert_eq!(vertex_count.get(&v), Some(&2), "vertex {v} ends two edges");
         }
     }
 
     #[test]
     fn convex_hull_too_few_points() {
-        let points = [(0.0, 0.0), (1.0, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 1.0]]);
         let err = ConvexHull::new(&points).expect_err("too few");
-        assert!(matches!(err, SpatialError::Qhull(_)));
+        // SciPy 1.17.1: "QH6214 qhull input error: not enough points(2) to construct initial
+        // simplex (need 3)".
+        assert!(is_qhull_error(&err, "QH6214"), "{err}");
+        assert!(err.to_string().contains("points(2)") && err.to_string().contains("need 3"));
     }
 
     #[test]
     fn convex_hull_collinear_points_rejected() {
-        let points = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]);
         let err = ConvexHull::new(&points).expect_err("collinear");
-        assert!(matches!(err, SpatialError::Qhull(_)));
+        assert!(is_qhull_error(&err, "QH6154"), "{err}");
+    }
+
+    #[test]
+    fn convex_hull_rejects_malformed_input() {
+        assert!(matches!(
+            ConvexHull::new(&[]),
+            Err(SpatialError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            ConvexHull::new(&[vec![0.0], vec![1.0]]),
+            Err(SpatialError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            ConvexHull::new(&[vec![0.0, 0.0], vec![1.0], vec![0.0, 1.0]]),
+            Err(SpatialError::DimensionMismatch { .. })
+        ));
+        assert!(matches!(
+            ConvexHull::new(&[vec![0.0, 0.0], vec![1.0, f64::NAN], vec![0.0, 1.0]]),
+            Err(SpatialError::InvalidArgument(_))
+        ));
+    }
+
+    /// SciPy raises QhullError for coplanar 3-D input, exactly coplanar or coplanar up to the
+    /// rounding of 1/3; a hull that merely skipped the degenerate case would return 2-D facets.
+    #[test]
+    fn convex_hull_coplanar_3d_input_is_qhull_error() {
+        let square = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let err = ConvexHull::new(&square).expect_err("coplanar");
+        assert!(is_qhull_error(&err, "QH6154"), "{err}");
+
+        let third = 1.0 / 3.0;
+        let near = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![third, third, third],
+        ];
+        let err = ConvexHull::new(&near).expect_err("coplanar up to rounding");
+        assert!(is_qhull_error(&err, "QH6154"), "{err}");
+
+        // Many points in a tilted plane, plus the negative arm: one point lifted off the plane
+        // makes the same set full-dimensional.
+        let mut plane: Vec<Vec<f64>> = qhull_lcg_points(30, 2, 41)
+            .into_iter()
+            .map(|p| vec![p[0], p[1], 0.5 * p[0] - 0.25 * p[1]])
+            .collect();
+        assert!(ConvexHull::new(&plane).is_err());
+        plane.push(vec![0.5, 0.5, 1.0]);
+        let hull = ConvexHull::new(&plane).expect("lifted apex makes it 3-D");
+        assert!(hull.vertices.contains(&30));
     }
 
     #[test]
     fn convex_hull_many_points() {
-        // Generate points on a circle (all should be on hull) + center
         let n = 20;
-        let mut points: Vec<(f64, f64)> = (0..n)
+        let mut points: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 let theta = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
-                (theta.cos(), theta.sin())
+                vec![theta.cos(), theta.sin()]
             })
             .collect();
-        points.push((0.0, 0.0)); // center point
+        points.push(vec![0.0, 0.0]);
         let hull = ConvexHull::new(&points).expect("hull");
         assert_eq!(hull.vertices.len(), n, "circle points all on hull");
         assert!(!hull.vertices.contains(&n), "center point excluded");
-        // Area should approximate π
+        // Counterclockwise from the lowest index: 0, 1, 2, ... around the circle.
+        assert_eq!(hull.vertices, (0..n).collect::<Vec<_>>());
         assert!(
-            (hull.area - std::f64::consts::PI).abs() < 0.1,
-            "area ≈ π: {}",
+            (hull.volume - std::f64::consts::PI).abs() < 0.1,
+            "{}",
+            hull.volume
+        );
+    }
+
+    /// SciPy 1.17.1, `ConvexHull(lcg(15, 2, seed=11))`: vertices `[2, 11, 6, 1, 12, 9, 5]`
+    /// (counterclockwise), area 2.859491696712964, volume 0.546525156954192. The cycle must be a
+    /// rotation of SciPy's; the clockwise reading of the same vertices must NOT be.
+    #[test]
+    fn convex_hull_2d_vertices_counterclockwise_match_scipy() {
+        let points = qhull_lcg_points(15, 2, 11);
+        let hull = ConvexHull::new(&points).expect("hull");
+        let scipy = [2, 11, 6, 1, 12, 9, 5];
+        assert!(is_rotation(&hull.vertices, &scipy), "{:?}", hull.vertices);
+        let mut clockwise = hull.vertices.clone();
+        clockwise.reverse();
+        assert!(!is_rotation(&clockwise, &scipy));
+        assert!(
+            close_rel(hull.area, 2.859_491_696_712_964, 1e-13),
+            "{}",
             hull.area
         );
+        assert!(
+            close_rel(hull.volume, 0.546_525_156_954_192, 1e-13),
+            "{}",
+            hull.volume
+        );
+    }
+
+    /// Non-convex inputs: reflex points of a plus-shaped set and inward-dented face centres of a
+    /// cube lie inside the hull and must not be vertices (SciPy 1.17.1: vertices `[2, 3, 0, 1]`,
+    /// area 11.31370849898476, volume 8; and the 8 cube corners, 12 facets, area 6, volume 1).
+    #[test]
+    fn convex_hull_non_convex_points_are_not_vertices() {
+        let plus = rows2(&[
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [-2.0, 0.0],
+            [0.0, -2.0],
+            [0.5, 0.5],
+            [-0.5, 0.5],
+            [-0.5, -0.5],
+            [0.5, -0.5],
+            [0.0, 0.0],
+        ]);
+        let hull = ConvexHull::new(&plus).expect("hull");
+        assert!(
+            is_rotation(&hull.vertices, &[2, 3, 0, 1]),
+            "{:?}",
+            hull.vertices
+        );
+        assert!(close_rel(hull.area, 11.313_708_498_984_76, 1e-13));
+        assert!(close_rel(hull.volume, 8.0, 1e-13));
+
+        let mut dented: Vec<Vec<f64>> = Vec::new();
+        for x in [0.0, 1.0] {
+            for y in [0.0, 1.0] {
+                for z in [0.0, 1.0] {
+                    dented.push(vec![x, y, z]);
+                }
+            }
+        }
+        for c in [
+            [0.5, 0.5, 0.2],
+            [0.5, 0.5, 0.8],
+            [0.5, 0.2, 0.5],
+            [0.5, 0.8, 0.5],
+            [0.2, 0.5, 0.5],
+            [0.8, 0.5, 0.5],
+        ] {
+            dented.push(c.to_vec());
+        }
+        let hull = ConvexHull::new(&dented).expect("hull");
+        assert_eq!(hull.vertices, (0..8).collect::<Vec<_>>());
+        assert_eq!(hull.nsimplex(), 12);
+        assert!(close_rel(hull.area, 6.0, 1e-13) && close_rel(hull.volume, 1.0, 1e-13));
+    }
+
+    /// The bead's 3-D reference: a unit cube's 8 corners plus 20 interior points. SciPy 1.17.1
+    /// gives 8 vertices, 12 triangular facets, area 6 and volume 1. Every equation must be an
+    /// axis-aligned unit normal, and every neighbour must share all but the opposite vertex.
+    #[test]
+    fn convex_hull_cube_with_interior_points() {
+        let mut points: Vec<Vec<f64>> = Vec::new();
+        for x in [0.0, 1.0] {
+            for y in [0.0, 1.0] {
+                for z in [0.0, 1.0] {
+                    points.push(vec![x, y, z]);
+                }
+            }
+        }
+        points.extend(
+            qhull_lcg_points(20, 3, 0)
+                .into_iter()
+                .map(|p| p.into_iter().map(|x| 0.1 + 0.8 * x).collect::<Vec<_>>()),
+        );
+        let hull = ConvexHull::new(&points).expect("hull");
+        assert_eq!(hull.vertices, (0..8).collect::<Vec<_>>());
+        assert_eq!(hull.nsimplex(), 12);
+        assert!((hull.area - 6.0).abs() < 1e-13 && (hull.volume - 1.0).abs() < 1e-13);
+        for (i, (facet, eq)) in hull.simplices.iter().zip(&hull.equations).enumerate() {
+            let axis: Vec<f64> = eq[..3].iter().map(|x| x.abs()).collect();
+            assert!(
+                axis.iter().filter(|&&x| (x - 1.0).abs() < 1e-15).count() == 1
+                    && axis.iter().filter(|&&x| x < 1e-15).count() == 2,
+                "facet {i} normal {eq:?}"
+            );
+            for p in &points {
+                let dist: f64 = eq[..3].iter().zip(p).map(|(n, x)| n * x).sum::<f64>() + eq[3];
+                assert!(dist <= 1e-15, "point outside facet {i}: {dist}");
+            }
+            for (k, &nb) in hull.neighbors[i].iter().enumerate() {
+                let other = &hull.simplices[nb];
+                assert!(!other.contains(&facet[k]));
+                assert!(
+                    facet
+                        .iter()
+                        .enumerate()
+                        .all(|(j, v)| j == k || other.contains(v))
+                );
+                assert!(
+                    hull.neighbors[nb].contains(&i),
+                    "neighbour relation is symmetric"
+                );
+            }
+        }
+    }
+
+    /// SciPy 1.17.1 in 4-D and 5-D (random points in general position, so the facet count is
+    /// unique): `lcg(30, 4, 7)` has 26 vertices, 112 facets, area 1.9892361798057656, volume
+    /// 0.18105462901852706; `lcg(40, 5, 9)` has 37 vertices, 436 facets, area
+    /// 1.4684215515471477, volume 0.11367635131536527.
+    #[test]
+    fn convex_hull_4d_5d_match_scipy() {
+        let hull = ConvexHull::new(&qhull_lcg_points(30, 4, 7)).expect("4-D hull");
+        assert_eq!(
+            hull.vertices,
+            vec![
+                0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25,
+                26, 27, 28
+            ]
+        );
+        assert_eq!(hull.nsimplex(), 112);
+        assert!(
+            close_rel(hull.area, 1.989_236_179_805_765_6, 1e-12),
+            "{}",
+            hull.area
+        );
+        assert!(
+            close_rel(hull.volume, 0.181_054_629_018_527_06, 1e-12),
+            "{}",
+            hull.volume
+        );
+
+        let hull = ConvexHull::new(&qhull_lcg_points(40, 5, 9)).expect("5-D hull");
+        assert_eq!(
+            hull.vertices,
+            vec![
+                0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24,
+                25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 37, 38, 39
+            ]
+        );
+        assert_eq!(hull.nsimplex(), 436);
+        assert!(
+            close_rel(hull.area, 1.468_421_551_547_147_7, 1e-12),
+            "{}",
+            hull.area
+        );
+        assert!(
+            close_rel(hull.volume, 0.113_676_351_315_365_27, 1e-12),
+            "{}",
+            hull.volume
+        );
+        for eq in &hull.equations {
+            let norm: f64 = eq[..5].iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-14);
+        }
     }
 
     // ── HalfspaceIntersection tests ──────────────────────────────────
@@ -11992,18 +12514,19 @@ mod tests {
 
     #[test]
     fn halfspace_intersection_square_matches_dual_surface() {
-        let halfspaces = [
-            [-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [1.0, 0.0, -1.0],
-            [0.0, 1.0, -1.0],
+        let halfspaces = vec![
+            vec![-1.0, 0.0, 0.0],
+            vec![0.0, -1.0, 0.0],
+            vec![1.0, 0.0, -1.0],
+            vec![0.0, 1.0, -1.0],
         ];
-        let hs = HalfspaceIntersection::new(&halfspaces, (0.5, 0.5)).expect("halfspaces");
+        let hs = HalfspaceIntersection::new(&halfspaces, &[0.5, 0.5]).expect("halfspaces");
 
         assert_eq!(hs.ndim, 2);
         assert_eq!(hs.nineq, 4);
         assert!(hs.is_bounded);
-        assert_eq!(hs.dual_vertices.len(), 4);
+        // SciPy 1.17.1: dual_vertices [0, 1, 2, 3], 4 dual facets.
+        assert_eq!(hs.dual_vertices, vec![0, 1, 2, 3]);
         assert_eq!(hs.dual_facets.len(), 4);
         assert!((hs.dual_points[0][0] + 2.0).abs() < 1e-10);
         assert!((hs.dual_points[1][1] + 2.0).abs() < 1e-10);
@@ -12021,24 +12544,25 @@ mod tests {
 
     #[test]
     fn halfspace_intersection_rejects_boundary_feasible_point_as_qhull_error() {
-        let halfspaces = [
-            [-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [1.0, 0.0, -1.0],
-            [0.0, 1.0, -1.0],
+        let halfspaces = vec![
+            vec![-1.0, 0.0, 0.0],
+            vec![0.0, -1.0, 0.0],
+            vec![1.0, 0.0, -1.0],
+            vec![0.0, 1.0, -1.0],
         ];
-        let err = HalfspaceIntersection::new(&halfspaces, (0.0, 0.5))
+        let err = HalfspaceIntersection::new(&halfspaces, &[0.0, 0.5])
             .expect_err("boundary feasible point");
-        assert!(matches!(
-            err,
-            SpatialError::Qhull(ref qhull) if qhull.message().contains("QH6023")
-        ));
+        assert!(is_qhull_error(&err, "QH6023"), "{err}");
     }
 
     #[test]
     fn halfspace_intersection_unbounded_region_is_marked() {
-        let halfspaces = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0]];
-        let hs = HalfspaceIntersection::new(&halfspaces, (0.5, 0.5)).expect("halfspaces");
+        let halfspaces = vec![
+            vec![-1.0, 0.0, 0.0],
+            vec![0.0, -1.0, 0.0],
+            vec![1.0, 0.0, -1.0],
+        ];
+        let hs = HalfspaceIntersection::new(&halfspaces, &[0.5, 0.5]).expect("halfspaces");
 
         assert!(!hs.is_bounded);
         assert!(point_set_contains(&hs.intersections, &[0.0, 0.0]));
@@ -12051,18 +12575,24 @@ mod tests {
         );
     }
 
+    /// SciPy 1.17.1 on the unit tetrahedron `x, y, z >= 0, x + y + z <= 1` around
+    /// `(0.2, 0.2, 0.2)`: dual_area 101.20014797809756, dual_volume 52.083333333333336,
+    /// dual_vertices `[0, 1, 2, 3]`, and the dual facet of the three coordinate halfspaces has
+    /// equation `[-1/sqrt(3)] * 3 ++ [-2.8867513459481287]`.
     #[test]
-    fn halfspace_intersection_from_nd_supports_bounded_3d_tetrahedron() {
+    fn halfspace_intersection_bounded_3d_tetrahedron_matches_scipy() {
         let halfspaces = vec![
             vec![-1.0, 0.0, 0.0, 0.0],
             vec![0.0, -1.0, 0.0, 0.0],
             vec![0.0, 0.0, -1.0, 0.0],
             vec![1.0, 1.0, 1.0, -1.0],
         ];
-        let hs = HalfspaceIntersection::from_nd(&halfspaces, &[0.2, 0.2, 0.2]).expect("3D bounded");
+        let hs = HalfspaceIntersection::new(&halfspaces, &[0.2, 0.2, 0.2]).expect("3D bounded");
         assert_eq!(hs.ndim, 3);
         assert!(hs.is_bounded);
         assert_eq!(hs.dual_vertices, vec![0, 1, 2, 3]);
+        assert_eq!(hs.dual_facets.len(), 4);
+        assert_eq!(hs.intersections.len(), 4);
         for expected in [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -12075,140 +12605,46 @@ mod tests {
                 hs.intersections
             );
         }
-        assert!(hs.dual_area.is_nan());
-        assert!(hs.dual_volume.is_nan());
-        assert!(hs.dual_equations.is_empty());
+        assert!(
+            close_rel(hs.dual_area, 101.200_147_978_097_56, 1e-13),
+            "{}",
+            hs.dual_area
+        );
+        assert!(
+            close_rel(hs.dual_volume, 52.083_333_333_333_336, 1e-13),
+            "{}",
+            hs.dual_volume
+        );
+        let facet = hs
+            .dual_facets
+            .iter()
+            .position(|f| f == &vec![0, 1, 2])
+            .expect("dual facet of the coordinate halfspaces");
+        let eq = &hs.dual_equations[facet];
+        let third = -(1.0_f64 / 3.0).sqrt();
+        for k in 0..3 {
+            assert!((eq[k] - third).abs() < 1e-15, "{eq:?}");
+        }
+        assert!((eq[3] + 2.886_751_345_948_128_7).abs() < 1e-14, "{eq:?}");
     }
 
+    /// SciPy 1.17.1 on an unbounded 3-D region (`x, y, z >= 0, x + y <= 1`): four intersection
+    /// rows, one of them non-finite (`[nan, nan, inf]`), dual_area 77.83930748727167 and
+    /// dual_volume 34.722222222222214.
     #[test]
-    fn halfspace_vertex_candidates_parallel_matches_serial_bits_and_order() {
-        let halfspaces = vec![
-            vec![-1.0, 0.0, 0.0, 0.0],
-            vec![0.0, -1.0, 0.0, 0.0],
-            vec![0.0, 0.0, -1.0, 0.0],
-            vec![1.0, 0.0, 0.0, -1.0],
-            vec![0.0, 1.0, 0.0, -1.0],
-            vec![0.0, 0.0, 1.0, -1.0],
-            vec![1.0, 1.0, 1.0, -1.8],
-            vec![-1.0, -1.0, 0.0, 0.1],
-        ];
-        let ndim = 3;
-        let mut combos = Vec::new();
-        combinations_recursive(halfspaces.len(), ndim, 0, &mut Vec::new(), &mut combos);
-
-        let serial = halfspace_vertex_candidates_nd_with_workers(&halfspaces, ndim, &combos, 1);
-        let parallel = halfspace_vertex_candidates_nd_with_workers(&halfspaces, ndim, &combos, 4);
-
-        assert_eq!(serial.len(), parallel.len());
-        for ((serial_point, serial_combo), (parallel_point, parallel_combo)) in
-            serial.iter().zip(parallel.iter())
-        {
-            assert_eq!(serial_combo, parallel_combo);
-            assert_eq!(serial_point.len(), parallel_point.len());
-            for (&serial_coord, &parallel_coord) in serial_point.iter().zip(parallel_point.iter()) {
-                assert_eq!(serial_coord.to_bits(), parallel_coord.to_bits());
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn halfspace_vertex_candidates_parallel_perf_probe() {
-        fn next_u64(state: &mut u64) -> u64 {
-            *state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *state
-        }
-        fn unit(state: &mut u64) -> f64 {
-            (next_u64(state) >> 11) as f64 / (1u64 << 53) as f64
-        }
-        fn halfspaces(m: usize, ndim: usize, seed: u64) -> Vec<Vec<f64>> {
-            let mut state = seed;
-            let mut out = Vec::with_capacity(m);
-            while out.len() < m {
-                let a = (0..ndim)
-                    .map(|_| unit(&mut state) * 2.0 - 1.0)
-                    .collect::<Vec<_>>();
-                let nrm = a.iter().map(|value| value * value).sum::<f64>().sqrt();
-                if nrm < 1e-6 {
-                    continue;
-                }
-                let mut row = a.iter().map(|value| value / nrm).collect::<Vec<_>>();
-                row.push(-1.0);
-                out.push(row);
-            }
-            out
-        }
-        fn digest(candidates: &[NdVertexCandidate]) -> u64 {
-            let mut h = 1469598103934665603u64;
-            for (point, combo) in candidates {
-                for &coord in point {
-                    h = (h ^ coord.to_bits()).wrapping_mul(1099511628211);
-                }
-                h = h.wrapping_mul(31);
-                for &idx in combo {
-                    h = (h ^ idx as u64).wrapping_mul(1099511628211);
-                }
-                h = h.wrapping_mul(31);
-            }
-            h
-        }
-
-        for &(m, ndim) in &[(120usize, 3usize), (60, 4)] {
-            let halfspaces = halfspaces(m, ndim, 7);
-            let mut combos = Vec::new();
-            combinations_recursive(halfspaces.len(), ndim, 0, &mut Vec::new(), &mut combos);
-            let workers = halfspace_vertex_enum_thread_count(combos.len(), halfspaces.len(), ndim);
-
-            let serial = halfspace_vertex_candidates_nd_with_workers(&halfspaces, ndim, &combos, 1);
-            let parallel = halfspace_vertex_candidates_nd(&halfspaces, ndim, &combos);
-            let serial_digest = digest(&serial);
-            let parallel_digest = digest(&parallel);
-            assert_eq!(serial.len(), parallel.len());
-            assert_eq!(serial_digest, parallel_digest);
-
-            let reps = 3;
-            let start = std::time::Instant::now();
-            let mut serial_acc = 0u64;
-            for _ in 0..reps {
-                let candidates =
-                    halfspace_vertex_candidates_nd_with_workers(&halfspaces, ndim, &combos, 1);
-                serial_acc ^= digest(std::hint::black_box(&candidates));
-            }
-            let serial_ms = start.elapsed().as_secs_f64() * 1000.0 / reps as f64;
-
-            let start = std::time::Instant::now();
-            let mut parallel_acc = 0u64;
-            for _ in 0..reps {
-                let candidates = halfspace_vertex_candidates_nd(&halfspaces, ndim, &combos);
-                parallel_acc ^= digest(std::hint::black_box(&candidates));
-            }
-            let parallel_ms = start.elapsed().as_secs_f64() * 1000.0 / reps as f64;
-            assert_eq!(serial_acc, parallel_acc);
-
-            println!(
-                "halfspace_vertex_candidates m={m} ndim={ndim} combos={} workers={workers} serial_ms={serial_ms:.6} parallel_ms={parallel_ms:.6} speedup={:.6} digest=0x{serial_digest:016x}",
-                combos.len(),
-                serial_ms / parallel_ms
-            );
-        }
-    }
-
-    #[test]
-    fn halfspace_intersection_from_nd_marks_unbounded_3d_region() {
+    fn halfspace_intersection_marks_unbounded_3d_region() {
         let halfspaces = vec![
             vec![-1.0, 0.0, 0.0, 0.0],
             vec![0.0, -1.0, 0.0, 0.0],
             vec![0.0, 0.0, -1.0, 0.0],
             vec![1.0, 1.0, 0.0, -1.0],
         ];
-        let hs =
-            HalfspaceIntersection::from_nd(&halfspaces, &[0.2, 0.2, 0.2]).expect("3D unbounded");
+        let hs = HalfspaceIntersection::new(&halfspaces, &[0.2, 0.2, 0.2]).expect("3D unbounded");
 
         assert_eq!(hs.ndim, 3);
         assert!(!hs.is_bounded);
         assert_eq!(hs.dual_vertices, vec![0, 1, 2, 3]);
+        assert_eq!(hs.intersections.len(), 4);
         for expected in [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
             assert!(
                 point_set_contains(&hs.intersections, &expected),
@@ -12216,30 +12652,110 @@ mod tests {
                 hs.intersections
             );
         }
-        assert_eq!(hs.intersections.len(), 3);
-        assert!(hs.dual_area.is_nan());
-        assert!(hs.dual_volume.is_nan());
-        assert!(hs.dual_equations.is_empty());
+        let infinite: Vec<&Vec<f64>> = hs
+            .intersections
+            .iter()
+            .filter(|row| row.iter().any(|v| !v.is_finite()))
+            .collect();
+        assert_eq!(infinite.len(), 1, "{:?}", hs.intersections);
+        assert!(infinite[0][0].is_nan() && infinite[0][1].is_nan());
+        assert_eq!(infinite[0][2], f64::INFINITY);
+        assert!(
+            close_rel(hs.dual_area, 77.839_307_487_271_67, 1e-13),
+            "{}",
+            hs.dual_area
+        );
+        assert!(
+            close_rel(hs.dual_volume, 34.722_222_222_222_214, 1e-13),
+            "{}",
+            hs.dual_volume
+        );
+    }
+
+    /// A square pyramid's apex is where four halfspaces meet, so its dual facet is not a simplex.
+    /// SciPy 1.17.1 reports it MERGED: dual facets `{0,2,4}, {0,1,4}, {0,2,3}, {0,1,3},
+    /// {1,2,3,4}` and five intersections, the apex `(0, 0, 2)` once; dual_area
+    /// 14.222222222222221, dual_volume 3.1604938271604937. A triangulated dual would report the
+    /// apex twice.
+    #[test]
+    fn halfspace_intersection_merges_non_simplicial_dual_facets() {
+        let halfspaces = vec![
+            vec![0.0, 0.0, -1.0, 0.0],
+            vec![1.0, 0.0, 0.5, -1.0],
+            vec![-1.0, 0.0, 0.5, -1.0],
+            vec![0.0, 1.0, 0.5, -1.0],
+            vec![0.0, -1.0, 0.5, -1.0],
+        ];
+        let hs = HalfspaceIntersection::new(&halfspaces, &[0.0, 0.0, 0.5]).expect("pyramid");
+        let mut facets = hs.dual_facets.clone();
+        facets.sort();
+        assert_eq!(
+            facets,
+            vec![
+                vec![0, 1, 3],
+                vec![0, 1, 4],
+                vec![0, 2, 3],
+                vec![0, 2, 4],
+                vec![1, 2, 3, 4]
+            ]
+        );
+        assert_eq!(hs.intersections.len(), 5);
+        for expected in [
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [-1.0, -1.0, 0.0],
+            [0.0, 0.0, 2.0],
+        ] {
+            assert!(
+                point_set_contains(&hs.intersections, &expected),
+                "{expected:?}"
+            );
+        }
+        assert!(
+            close_rel(hs.dual_area, 14.222_222_222_222_221, 1e-13),
+            "{}",
+            hs.dual_area
+        );
+        assert!(
+            close_rel(hs.dual_volume, 3.160_493_827_160_493_7, 1e-13),
+            "{}",
+            hs.dual_volume
+        );
     }
 
     #[test]
-    fn halfspace_intersection_from_nd_rejects_invalid_higher_dimensional_inputs() {
+    fn halfspace_intersection_rejects_invalid_higher_dimensional_inputs() {
         let too_few_halfspaces = vec![vec![-1.0, 0.0, 0.0, 0.0]; 4];
-        let err = HalfspaceIntersection::from_nd(&too_few_halfspaces, &[0.25, 0.25, 0.25, 0.25])
+        let err = HalfspaceIntersection::new(&too_few_halfspaces, &[0.25, 0.25, 0.25, 0.25])
             .expect_err("4D input needs at least 5 halfspaces");
         assert!(matches!(err, SpatialError::Qhull(_)));
 
         let bad_rows = vec![vec![-1.0, 0.0, 0.0], vec![0.0, -1.0], vec![1.0, 1.0, -1.0]];
-        let err = HalfspaceIntersection::from_nd(&bad_rows, &[0.25, 0.25])
-            .expect_err("row shape mismatch");
+        let err =
+            HalfspaceIntersection::new(&bad_rows, &[0.25, 0.25]).expect_err("row shape mismatch");
         assert!(matches!(err, SpatialError::DimensionMismatch { .. }));
+
+        // Normals spanning only the xy-plane: the dual points are flat, which Qhull refuses.
+        let slab = vec![
+            vec![-1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, -1.0],
+            vec![0.0, -1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, -1.0],
+        ];
+        let err = HalfspaceIntersection::new(&slab, &[0.5, 0.5, 0.5]).expect_err("flat dual");
+        assert!(is_qhull_error(&err, "QH6154"), "{err}");
     }
 
     #[test]
     fn halfspace_intersection_add_halfspaces_recomputes_region() {
         let mut hs = HalfspaceIntersection::new(
-            &[[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0]],
-            (0.5, 0.5),
+            &[
+                vec![-1.0, 0.0, 0.0],
+                vec![0.0, -1.0, 0.0],
+                vec![1.0, 0.0, -1.0],
+            ],
+            &[0.5, 0.5],
         )
         .expect("initial halfspaces");
         assert!(!hs.is_bounded);
@@ -12253,140 +12769,549 @@ mod tests {
 
     // ── Delaunay tests ──────────────────────────────────────────────
 
+    fn sorted_tuples(sets: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        let mut out: Vec<Vec<usize>> = sets
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                s.sort_unstable();
+                s
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn homogeneous_det(points: &[Vec<f64>], simplex: &[usize]) -> f64 {
+        let rows: Vec<Vec<f64>> = simplex
+            .iter()
+            .map(|&i| {
+                let mut row = points[i].clone();
+                row.push(1.0);
+                row
+            })
+            .collect();
+        let n = rows.len();
+        let mut m = rows;
+        let mut det = 1.0;
+        for col in 0..n {
+            let pivot = (col..n)
+                .max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))
+                .unwrap();
+            if m[pivot][col] == 0.0 {
+                return 0.0;
+            }
+            if pivot != col {
+                m.swap(pivot, col);
+                det = -det;
+            }
+            det *= m[col][col];
+            for row in col + 1..n {
+                let f = m[row][col] / m[col][col];
+                for k in col..n {
+                    let delta = f * m[col][k];
+                    m[row][k] -= delta;
+                }
+            }
+        }
+        det
+    }
+
+    /// SciPy 1.17.1 on the unit square: 2 counterclockwise triangles, paraboloid_scale 1/2.2,
+    /// shift 0, and both lifted equations `[0.3823595564509363, 0.3823595564509363,
+    /// -0.8411910241920598, 0]` (the four corners are cocircular, so both triangles lie in one
+    /// lifted plane).
     #[test]
     fn delaunay_square_triangulates() {
-        let points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
         let tri = Delaunay::new(&points).expect("triangulation");
         assert_eq!(tri.points, points);
-        assert_eq!(
-            tri.simplices.len(),
-            2,
-            "square should split into 2 triangles"
-        );
-        for &(a, b, c) in &tri.simplices {
-            assert!(a < points.len() && b < points.len() && c < points.len());
-            assert_ne!(cross(points[a], points[b], points[c]), 0.0);
+        assert_eq!(tri.nsimplex(), 2, "square should split into 2 triangles");
+        assert!((tri.paraboloid_scale - 0.454_545_454_545_454_53).abs() < 1e-16);
+        assert_eq!(tri.paraboloid_shift, 0.0);
+        for (s, simplex) in tri.simplices.iter().enumerate() {
+            assert!(homogeneous_det(&points, simplex) > 0.0, "counterclockwise");
+            assert_eq!(tri.neighbors[s].iter().filter(|&&n| n >= 0).count(), 1);
+            let eq = &tri.equations[s];
+            let want = [
+                0.382_359_556_450_936_3,
+                0.382_359_556_450_936_3,
+                -0.841_191_024_192_059_8,
+                0.0,
+            ];
+            for k in 0..4 {
+                assert!((eq[k] - want[k]).abs() < 1e-15, "{eq:?}");
+            }
         }
+        assert_eq!(tri.convex_hull.len(), 4);
+        assert!(tri.coplanar.is_empty());
     }
 
     #[test]
     fn delaunay_find_simplex_inside_triangle() {
-        let points = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)];
+        let points = rows2(&[[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]);
         let tri = Delaunay::new(&points).expect("triangulation");
-        let (_, l1, l2, l3) = tri.find_simplex((0.25, 0.5)).expect("inside simplex");
-        assert!(l1 >= 0.0 && l2 >= 0.0 && l3 >= 0.0);
-        assert!(((l1 + l2 + l3) - 1.0).abs() < 1e-10);
+        let found = tri
+            .find_simplex(&[vec![0.25, 0.5]], false, None)
+            .expect("query");
+        assert_eq!(found, vec![0]);
+        let t = &tri.transform[0];
+        let c0 = t[0][0] * (0.25 - t[2][0]) + t[0][1] * (0.5 - t[2][1]);
+        let c1 = t[1][0] * (0.25 - t[2][0]) + t[1][1] * (0.5 - t[2][1]);
+        let c2 = 1.0 - c0 - c1;
+        assert!(c0 > 0.0 && c1 > 0.0 && c2 > 0.0, "{c0} {c1} {c2}");
     }
 
     #[test]
-    fn delaunay_find_simplex_outside_returns_none() {
-        let points = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)];
+    fn delaunay_find_simplex_outside_and_nan_return_minus_one() {
+        let points = rows2(&[[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]);
         let tri = Delaunay::new(&points).expect("triangulation");
-        assert!(tri.find_simplex((3.0, 3.0)).is_none());
+        let queries = vec![vec![3.0, 3.0], vec![1.5, 1.5], vec![f64::NAN, 0.5]];
+        assert_eq!(
+            tri.find_simplex(&queries, false, None).unwrap(),
+            vec![-1, -1, -1]
+        );
+        assert_eq!(
+            tri.find_simplex(&queries, true, None).unwrap(),
+            vec![-1, -1, -1]
+        );
+        assert!(matches!(
+            tri.find_simplex(&[vec![0.1]], false, None),
+            Err(SpatialError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
     fn tsearch_matches_find_simplex_and_marks_outside() {
-        // Unit square -> two triangles; mix of inside and outside query points.
-        let points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]);
         let tri = Delaunay::new(&points).expect("triangulation");
-        let xi = [(0.25, 0.25), (0.75, 0.75), (5.0, 5.0), (-1.0, 0.5)];
-        let got = tsearch(&tri, &xi);
-        assert_eq!(got.len(), xi.len());
-        for (&point, &idx) in xi.iter().zip(&got) {
-            // tsearch is the functional form of find_simplex: same index, -1 outside.
-            match tri.find_simplex(point) {
-                Some((expected, _, _, _)) => assert_eq!(idx, expected as i64),
-                None => assert_eq!(idx, -1),
-            }
-            // When a simplex is reported, the point must actually lie in it.
-            if idx >= 0 {
-                let (a, b, c) = tri.simplices[idx as usize];
-                let (l1, l2, l3) =
-                    barycentric_2d(tri.points[a], tri.points[b], tri.points[c], point);
-                assert!(l1 >= -1e-10 && l2 >= -1e-10 && l3 >= -1e-10);
-            }
-        }
-        // The two interior points sit in real triangles; the two far points are out.
-        assert!(got[0] >= 0 && got[1] >= 0);
-        assert_eq!(got[2], -1);
-        assert_eq!(got[3], -1);
+        // Off both diagonals, so each query is strictly inside one triangle whichever diagonal
+        // splits the (cocircular) square.
+        let xi = rows2(&[[0.2, 0.1], [0.8, 0.9], [5.0, 5.0], [-1.0, 0.5]]);
+        let got = tsearch(&tri, &xi).expect("tsearch");
+        assert_eq!(got, tri.find_simplex(&xi, false, None).unwrap());
+        assert!(got[0] >= 0 && got[1] >= 0 && got[0] != got[1]);
+        assert_eq!(&got[2..], &[-1, -1]);
     }
 
     #[test]
     fn delaunay_collinear_points_rejected() {
-        let points = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]);
         let err = Delaunay::new(&points).expect_err("collinear");
-        assert!(matches!(err, SpatialError::Qhull(_)));
+        assert!(is_qhull_error(&err, "QH6154"), "{err}");
     }
 
     #[test]
     fn delaunay_too_few_points_rejected() {
-        let points = [(0.0, 0.0), (1.0, 0.0)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0]]);
         let err = Delaunay::new(&points).expect_err("too few");
-        assert!(matches!(err, SpatialError::Qhull(_)));
+        assert!(is_qhull_error(&err, "QH6214"), "{err}");
     }
 
     #[test]
     fn delaunay_non_finite_points_rejected() {
-        let points = [(0.0, 0.0), (1.0, 0.0), (f64::NAN, f64::NAN)];
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [f64::NAN, f64::NAN]]);
         let err = Delaunay::new(&points).expect_err("non-finite points");
         assert!(matches!(err, SpatialError::InvalidArgument(_)));
+    }
+
+    /// SciPy 1.17.1, `Delaunay(lcg(12, 2, seed=5))`: the simplex set below (points in general
+    /// position, so the triangulation is unique), paraboloid_scale 0.7529539474027401, shift
+    /// -0.06460133512933994, the 7 hull edges, `find_simplex` of (0.5, 0.5) and (0.3, 0.7) in
+    /// the simplices {1, 2, 10} and {3, 8, 9}, and a largest plane distance 0.04990216869579203
+    /// at (0.5, 0.5).
+    #[test]
+    fn delaunay_2d_matches_scipy() {
+        let points = qhull_lcg_points(12, 2, 5);
+        let tri = Delaunay::new(&points).expect("delaunay");
+        let want: Vec<Vec<usize>> = vec![
+            vec![0, 1, 6],
+            vec![0, 4, 6],
+            vec![1, 2, 6],
+            vec![1, 2, 10],
+            vec![2, 3, 9],
+            vec![2, 3, 10],
+            vec![2, 4, 6],
+            vec![2, 4, 11],
+            vec![2, 9, 11],
+            vec![3, 7, 8],
+            vec![3, 7, 10],
+            vec![3, 8, 9],
+            vec![4, 5, 11],
+            vec![5, 8, 9],
+            vec![5, 9, 11],
+        ];
+        assert_eq!(sorted_tuples(&tri.simplices), want);
+        assert!(close_rel(
+            tri.paraboloid_scale,
+            0.752_953_947_402_740_1,
+            1e-15
+        ));
+        assert!(close_rel(
+            tri.paraboloid_shift,
+            -0.064_601_335_129_339_94,
+            1e-14
+        ));
+        assert_eq!(
+            sorted_tuples(&tri.convex_hull),
+            vec![
+                vec![0, 1],
+                vec![0, 4],
+                vec![1, 10],
+                vec![4, 5],
+                vec![5, 8],
+                vec![7, 8],
+                vec![7, 10]
+            ]
+        );
+        let queries = rows2(&[[0.5, 0.5], [0.3, 0.7], [2.0, 2.0]]);
+        let found = tri.find_simplex(&queries, false, None).expect("find");
+        let named = |s: isize| {
+            let mut v = tri.simplices[s as usize].clone();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(named(found[0]), vec![1, 2, 10]);
+        assert_eq!(named(found[1]), vec![3, 8, 9]);
+        assert_eq!(found[2], -1);
+        let dist = tri.plane_distance(&queries[..1]).expect("plane distance");
+        let best = dist[0].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(close_rel(best, 0.049_902_168_695_792_03, 1e-12), "{best}");
+
+        // Lifted geometry: every simplex's vertices lie on its hyperplane, every other lifted
+        // point lies above it (outward normal points down), and vertex_to_simplex is honest.
+        let lifted = tri.lift_points(&points).expect("lift");
+        for (s, eq) in tri.equations.iter().enumerate() {
+            assert!(eq[2] < 0.0);
+            for (i, z) in lifted.iter().enumerate() {
+                let d: f64 = eq[..3].iter().zip(z).map(|(a, b)| a * b).sum::<f64>() + eq[3];
+                if tri.simplices[s].contains(&i) {
+                    assert!(d.abs() < 1e-14, "vertex off its plane: {d}");
+                } else {
+                    assert!(d < 1e-14, "point {i} below lower facet {s}: {d}");
+                }
+            }
+        }
+        for (v, &s) in tri.vertex_to_simplex.iter().enumerate() {
+            assert!(tri.simplices[s as usize].contains(&v));
+        }
+        let (indptr, indices) = &tri.vertex_neighbor_vertices;
+        assert_eq!(indptr.len(), 13);
+        assert!(
+            indices[indptr[0]..indptr[1]].contains(&1)
+                && indices[indptr[0]..indptr[1]].contains(&6)
+        );
+    }
+
+    /// SciPy 1.17.1, `Delaunay(lcg(14, 3, seed=3))`: 34 tetrahedra with the vertex sets below;
+    /// their volumes must also sum to the convex hull's volume.
+    #[test]
+    fn delaunay_3d_matches_scipy() {
+        let points = qhull_lcg_points(14, 3, 3);
+        let tri = Delaunay::new(&points).expect("delaunay");
+        let want: Vec<Vec<usize>> = [
+            [0, 2, 4, 10],
+            [0, 2, 4, 13],
+            [0, 2, 5, 11],
+            [0, 2, 5, 13],
+            [0, 2, 8, 10],
+            [0, 2, 8, 11],
+            [0, 4, 5, 13],
+            [0, 4, 10, 12],
+            [0, 8, 10, 12],
+            [0, 8, 11, 12],
+            [1, 2, 6, 7],
+            [1, 2, 6, 11],
+            [1, 2, 7, 9],
+            [1, 2, 8, 9],
+            [1, 2, 8, 11],
+            [1, 6, 7, 9],
+            [1, 6, 9, 12],
+            [1, 6, 11, 12],
+            [1, 8, 9, 12],
+            [1, 8, 11, 12],
+            [2, 4, 10, 13],
+            [2, 5, 6, 11],
+            [2, 5, 6, 13],
+            [2, 6, 7, 13],
+            [2, 7, 9, 10],
+            [2, 7, 10, 13],
+            [2, 8, 9, 10],
+            [3, 4, 10, 13],
+            [3, 5, 6, 13],
+            [3, 6, 7, 13],
+            [3, 7, 10, 13],
+            [6, 7, 9, 12],
+            [7, 9, 10, 12],
+            [8, 9, 10, 12],
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+        assert_eq!(sorted_tuples(&tri.simplices), want);
+        let hull = ConvexHull::new(&points).expect("hull");
+        let total: f64 = tri
+            .simplices
+            .iter()
+            .map(|s| {
+                let det = homogeneous_det(&points, s);
+                assert!(det > 0.0, "positively oriented");
+                det / 6.0
+            })
+            .sum();
+        assert!(
+            close_rel(total, hull.volume, 1e-13),
+            "{total} vs {}",
+            hull.volume
+        );
+    }
+
+    /// The cube with 20 interior points: the tetrahedra tile the unit cube, so their volumes sum
+    /// to exactly its volume, 1 (SciPy 1.17.1 likewise).
+    #[test]
+    fn delaunay_cube_volumes_sum_to_hull_volume() {
+        let mut points: Vec<Vec<f64>> = Vec::new();
+        for x in [0.0, 1.0] {
+            for y in [0.0, 1.0] {
+                for z in [0.0, 1.0] {
+                    points.push(vec![x, y, z]);
+                }
+            }
+        }
+        points.extend(
+            qhull_lcg_points(20, 3, 0)
+                .into_iter()
+                .map(|p| p.into_iter().map(|x| 0.1 + 0.8 * x).collect::<Vec<_>>()),
+        );
+        let tri = Delaunay::new(&points).expect("delaunay");
+        let total: f64 = tri
+            .simplices
+            .iter()
+            .map(|s| homogeneous_det(&points, s) / 6.0)
+            .sum();
+        assert!((total - 1.0).abs() < 1e-13, "{total}");
+        assert!(tri.coplanar.is_empty());
+        assert_eq!(tri.convex_hull.len(), 12);
+    }
+
+    /// Duplicates are not vertices; SciPy 1.17.1 reports them in `coplanar` as `[5, _, 1]` and
+    /// `[6, _, 4]` (point, simplex, nearest vertex), and its `vertex_to_simplex` stores the
+    /// nearest VERTEX for them (1 and 4).
+    #[test]
+    fn delaunay_duplicates_are_coplanar_like_scipy() {
+        let points = rows2(&[
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.3, 0.4],
+            [1.0, 0.0],
+            [0.3, 0.4],
+        ]);
+        let tri = Delaunay::new(&points).expect("delaunay");
+        assert_eq!(tri.nsimplex(), 4);
+        let pairs: Vec<(usize, usize)> = tri.coplanar.iter().map(|r| (r[0], r[2])).collect();
+        assert_eq!(pairs, vec![(5, 1), (6, 4)]);
+        for row in &tri.coplanar {
+            assert!(tri.simplices[row[1]].contains(&row[2]));
+        }
+        assert_eq!(tri.vertex_to_simplex[5], 1);
+        assert_eq!(tri.vertex_to_simplex[6], 4);
     }
 
     // ── Voronoi tests ───────────────────────────────────────────────
 
     #[test]
     fn voronoi_triangle_has_single_vertex_and_infinite_ridges() {
-        let points = [(0.0, 0.0), (2.0, 0.0), (1.0, 2.0)];
+        let points = rows2(&[[0.0, 0.0], [2.0, 0.0], [1.0, 2.0]]);
         let vor = Voronoi::new(&points).expect("voronoi");
 
         assert_eq!(vor.points, points);
         assert_eq!(vor.vertices.len(), 1);
-        assert!((vor.vertices[0].0 - 1.0).abs() < 1e-10);
-        assert!((vor.vertices[0].1 - 0.75).abs() < 1e-10);
+        assert!((vor.vertices[0][0] - 1.0).abs() < 1e-12);
+        assert!((vor.vertices[0][1] - 0.75).abs() < 1e-12);
         assert_eq!(vor.ridge_points.len(), 3);
-        assert_eq!(vor.ridge_vertices.len(), 3);
-        assert!(vor.ridge_vertices.iter().all(|&(a, b)| a == -1 && b == 0));
+        assert!(vor.ridge_vertices.iter().all(|r| r == &vec![-1, 0]));
         assert_eq!(vor.point_region.len(), 3);
+        assert_eq!(
+            vor.regions.len(),
+            4,
+            "three regions plus the empty Qz region"
+        );
+        assert!(vor.regions[0].is_empty());
         for &region_idx in &vor.point_region {
-            let region = &vor.regions[region_idx];
-            assert!(region.contains(&-1));
-            assert!(region.contains(&0));
+            assert_eq!(vor.regions[region_idx], vec![-1, 0]);
         }
     }
 
     #[test]
     fn voronoi_center_point_gets_finite_region() {
-        let points = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (1.0, 1.0)];
+        let points = rows2(&[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]]);
         let vor = Voronoi::new(&points).expect("voronoi");
 
+        // SciPy 1.17.1: 4 vertices, 8 ridges, a bounded 4-vertex region for the centre.
         assert_eq!(vor.vertices.len(), 4);
+        assert_eq!(vor.ridge_points.len(), 8);
         let center_region = &vor.regions[vor.point_region[4]];
         assert_eq!(center_region.len(), 4);
         assert!(center_region.iter().all(|&idx| idx >= 0));
+        for expected in [[2.0, 1.0], [1.0, 0.0], [1.0, 2.0], [0.0, 1.0]] {
+            assert!(point_set_contains(&vor.vertices, &expected), "{expected:?}");
+        }
+        // Counterclockwise around (1, 1).
+        let mut turning = 0.0;
+        for i in 0..4 {
+            let a = &vor.vertices[center_region[i] as usize];
+            let b = &vor.vertices[center_region[(i + 1) % 4] as usize];
+            turning += (a[0] - 1.0) * (b[1] - 1.0) - (a[1] - 1.0) * (b[0] - 1.0);
+        }
+        assert!(turning > 0.0);
+    }
 
-        let expected = [(2.0, 1.0), (1.0, 0.0), (1.0, 2.0), (0.0, 1.0)];
-        for &(ex, ey) in &expected {
+    /// The four corners of a square are cocircular, so Qhull merges the two Delaunay triangles
+    /// into one cell: SciPy 1.17.1 gives ONE vertex (0.5, 0.5) and four ridges `[-1, 0]`. A dual
+    /// of the triangulation would give two coincident vertices and a fifth (diagonal) ridge.
+    #[test]
+    fn voronoi_unit_square_merges_cocircular_cell() {
+        let points = rows2(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        let vor = Voronoi::new(&points).expect("voronoi");
+        assert_eq!(vor.vertices, vec![vec![0.5, 0.5]]);
+        let mut pairs = vor.ridge_points.clone();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![[0, 1], [0, 3], [1, 2], [2, 3]]);
+        assert!(vor.ridge_vertices.iter().all(|r| r == &vec![-1, 0]));
+        assert_eq!(vor.regions.len(), 5);
+        for &r in &vor.point_region {
+            assert_eq!(vor.regions[r], vec![-1, 0]);
+        }
+    }
+
+    /// SciPy 1.17.1, `Voronoi(lcg(10, 2, seed=17))`: the 13 vertices below (sorted), the 22
+    /// ridges, 5 of them unbounded, and region sizes per point.
+    #[test]
+    fn voronoi_2d_matches_scipy() {
+        let points = qhull_lcg_points(10, 2, 17);
+        let vor = Voronoi::new(&points).expect("voronoi");
+        let want = [
+            [-0.768_539_432_180_978_2, 0.706_079_466_605_593_8],
+            [0.178_736_477_338_242_22, 0.651_328_790_360_965_2],
+            [0.185_055_592_676_744_7, 0.219_349_900_731_334_1],
+            [0.334_034_908_217_240_25, 0.303_937_873_176_758_6],
+            [0.343_091_964_902_104_1, 0.327_468_297_284_955_4],
+            [0.344_566_372_243_707_56, 0.748_238_777_940_867_5],
+            [0.400_994_592_850_028_25, 0.224_518_934_632_315_68],
+            [0.405_292_852_990_597_14, 0.715_678_603_709_353],
+            [0.505_071_076_917_852_4, 0.423_748_384_193_007_14],
+            [0.623_455_812_903_262_8, -0.117_461_705_491_395_73],
+            [0.825_395_484_805_471_2, 0.288_055_536_838_146_9],
+            [0.914_085_195_793_493, 0.440_192_788_927_845_97],
+            [1.230_361_483_410_393_5, 0.675_357_991_239_276],
+        ];
+        let mut got = vor.vertices.clone();
+        got.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
             assert!(
-                vor.vertices
-                    .iter()
-                    .any(|&(vx, vy)| (vx - ex).abs() < 1e-10 && (vy - ey).abs() < 1e-10),
-                "missing Voronoi vertex ({ex}, {ey})"
+                (g[0] - w[0]).abs() < 1e-12 && (g[1] - w[1]).abs() < 1e-12,
+                "{g:?} {w:?}"
             );
         }
-
-        for &vertex_idx in center_region {
-            let vertex = vor.vertices[vertex_idx as usize];
+        let pairs: Vec<[usize; 2]> = vor.ridge_points.clone();
+        assert_eq!(
+            pairs,
+            vec![
+                [0, 1],
+                [0, 4],
+                [0, 5],
+                [0, 6],
+                [0, 7],
+                [1, 3],
+                [1, 4],
+                [1, 5],
+                [1, 8],
+                [2, 3],
+                [2, 5],
+                [2, 6],
+                [2, 7],
+                [2, 9],
+                [3, 5],
+                [3, 8],
+                [3, 9],
+                [4, 5],
+                [5, 7],
+                [6, 7],
+                [6, 9],
+                [8, 9]
+            ]
+        );
+        let unbounded: Vec<[usize; 2]> = vor
+            .ridge_points
+            .iter()
+            .zip(&vor.ridge_vertices)
+            .filter(|(_, r)| r.contains(&-1))
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(unbounded, vec![[0, 1], [0, 6], [1, 8], [6, 9], [8, 9]]);
+        let sizes: Vec<usize> = (0..10)
+            .map(|i| vor.regions[vor.point_region[i]].len())
+            .collect();
+        assert_eq!(sizes, vec![5, 5, 5, 5, 3, 6, 4, 4, 3, 4]);
+        for ridge in &vor.ridge_vertices {
+            assert_eq!(ridge.len(), 2);
             assert!(
-                expected
-                    .iter()
-                    .any(|&(ex, ey)| (vertex.0 - ex).abs() < 1e-10 && (vertex.1 - ey).abs() < 1e-10),
-                "unexpected center-region vertex ({}, {})",
-                vertex.0,
-                vertex.1
+                ridge[0] < ridge[1],
+                "2-D ridges ascending with -1 first: {ridge:?}"
             );
         }
+    }
+
+    /// Qhull's ridge rule in 3-D: a Delaunay edge gets a Voronoi ridge only when the cells
+    /// around it (plus one for the unbounded side) number at least 3. SciPy 1.17.1 on
+    /// `lcg(14, 3, seed=23)`: 33 vertices and 51 ridges, while the triangulation has 56 edges;
+    /// the edges (1,3), (1,7), (3,7), (4,6) and (4,12) have no ridge.
+    #[test]
+    fn voronoi_3d_ridges_follow_qhull_count_rule() {
+        let points = qhull_lcg_points(14, 3, 23);
+        let vor = Voronoi::new(&points).expect("voronoi");
+        assert_eq!(vor.vertices.len(), 33);
+        assert_eq!(vor.ridge_points.len(), 51);
+        let tri = Delaunay::new(&points).expect("delaunay");
+        let mut edges = std::collections::BTreeSet::new();
+        for s in &tri.simplices {
+            for i in 0..4 {
+                for j in i + 1..4 {
+                    edges.insert([s[i].min(s[j]), s[i].max(s[j])]);
+                }
+            }
+        }
+        assert_eq!(edges.len(), 56);
+        let ridges: std::collections::BTreeSet<[usize; 2]> =
+            vor.ridge_points.iter().copied().collect();
+        let missing: Vec<[usize; 2]> = edges.difference(&ridges).copied().collect();
+        assert_eq!(missing, vec![[1, 3], [1, 7], [3, 7], [4, 6], [4, 12]]);
+        for region in &vor.regions[1..] {
+            let mut sorted = region.clone();
+            sorted.sort_unstable();
+            assert_eq!(region, &sorted, "3-D regions ascending with -1 first");
+        }
+    }
+
+    #[test]
+    fn voronoi_duplicate_point_shares_its_twins_region() {
+        let points = rows2(&[
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.3, 0.4],
+            [1.0, 0.0],
+        ]);
+        let vor = Voronoi::new(&points).expect("voronoi");
+        // SciPy 1.17.1: 6 regions (5 points + the empty Qz region), point_region[5] ==
+        // point_region[1], and 8 ridges.
+        assert_eq!(vor.regions.len(), 6);
+        assert_eq!(vor.point_region[5], vor.point_region[1]);
+        assert_eq!(vor.ridge_points.len(), 8);
     }
 
     // ── Spherical Voronoi tests ─────────────────────────────────────
@@ -13989,80 +14914,81 @@ mod tests {
 
     #[test]
     fn convex_hull_area_matches_scipy_reference_values() {
-        // scipy.spatial.ConvexHull([[0,0], [1,0], [1,1], [0,1], [0.5,0.5]]).volume
-        // -> 1.0 (area of unit square)
-        let points: Vec<(f64, f64)> =
-            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.5, 0.5)];
+        // scipy.spatial.ConvexHull([[0,0], [1,0], [1,1], [0,1], [0.5,0.5]]): volume 1.0 (the
+        // enclosed area), area 4.0 (the perimeter).
+        let points = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+            vec![0.5, 0.5],
+        ];
         let hull = ConvexHull::new(&points).expect("convex_hull");
-        // Hull should be the 4 corner vertices
         assert_eq!(hull.vertices.len(), 4, "hull should have 4 vertices");
-        // Area should be 1.0
-        assert!(
-            (hull.area - 1.0).abs() < 1e-10,
-            "hull area got {}, expected 1.0",
-            hull.area
-        );
+        assert!((hull.volume - 1.0).abs() < 1e-12, "volume {}", hull.volume);
+        assert!((hull.area - 4.0).abs() < 1e-12, "area {}", hull.area);
     }
 
     #[test]
     fn delaunay_triangulation_matches_scipy_reference_values() {
-        // scipy.spatial.Delaunay([[0,0], [1,0], [1,1], [0,1]]).simplices
-        // -> 2 triangles covering the square
-        let points: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        // scipy.spatial.Delaunay([[0,0], [1,0], [1,1], [0,1]]).simplices -> 2 triangles
+        let points = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+        ];
         let tri = Delaunay::new(&points).expect("delaunay");
-        // Should have exactly 2 triangles
         assert_eq!(tri.simplices.len(), 2, "should have 2 triangles");
     }
 
+    /// The defining property (frankenscipy-9l5oo): no input point lies strictly inside any
+    /// simplex's circumsphere. Checked in 2-D on low-discrepancy points (no exact cocircular
+    /// quadruples) and in 3-D on LCG points, with a relative margin for the floating-point
+    /// circumsphere.
     #[test]
-    fn delaunay_empty_circumcircle_property_random() {
-        // Delaunay safety net (frankenscipy-9l5oo): the defining property is that no
-        // input point lies strictly inside any triangle's circumcircle. This validates
-        // the O(n²) Bowyer-Watson on a non-degenerate scattered point set AND is the
-        // invariant any future O(n log n) point-location rewrite must preserve — the
-        // existing test only covers 4 points / 2 triangles. Deterministic low-
-        // discrepancy (golden-ratio) points avoid exact cocircular degeneracies.
+    fn delaunay_empty_circumsphere_property_random() {
         let n = 200usize;
-        let pts: Vec<(f64, f64)> = (0..n)
+        let planar: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 let t = i as f64;
-                (
+                vec![
                     (t * 0.618_033_988_75).fract() * 100.0,
                     (t * 0.414_213_562_37).fract() * 100.0,
-                )
+                ]
             })
             .collect();
-        let tri = Delaunay::new(&pts).expect("delaunay");
-        assert!(!tri.simplices.is_empty(), "should produce triangles");
-        for &(a, b, c) in &tri.simplices {
-            let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
-            for (k, &p) in pts.iter().enumerate() {
-                if k == a || k == b || k == c {
-                    continue;
+        for pts in [planar, qhull_lcg_points(80, 3, 77)] {
+            let tri = Delaunay::new(&pts).expect("delaunay");
+            assert!(!tri.simplices.is_empty(), "should produce simplices");
+            for simplex in &tri.simplices {
+                let rows: Vec<&[f64]> = simplex.iter().map(|&i| pts[i].as_slice()).collect();
+                let center = qhull::circumcenter(&rows).expect("non-degenerate simplex");
+                let r2 = sqeuclidean(&center, &pts[simplex[0]]);
+                for (k, p) in pts.iter().enumerate() {
+                    if simplex.contains(&k) {
+                        continue;
+                    }
+                    assert!(
+                        sqeuclidean(&center, p) >= r2 * (1.0 - 1e-9),
+                        "point {k} inside the circumsphere of {simplex:?}"
+                    );
                 }
-                assert!(
-                    !point_in_circumcircle(pa, pb, pc, p),
-                    "Delaunay property violated: point {k} inside circumcircle of \
-                     triangle ({a},{b},{c})"
-                );
             }
         }
     }
 
     #[test]
     fn voronoi_vertices_matches_scipy_reference_values() {
-        // scipy.spatial.Voronoi([[0,0], [1,0], [1,1], [0,1]]).vertices
-        // -> [[0.5, 0.5]] (center of square)
-        let points: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        // scipy.spatial.Voronoi([[0,0], [1,0], [1,1], [0,1]]).vertices -> [[0.5, 0.5]]
+        let points = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+        ];
         let vor = Voronoi::new(&points).expect("voronoi");
-        // Should have 1 finite vertex at the center
-        assert!(!vor.vertices.is_empty(), "should have at least 1 vertex");
-        // Check that center vertex exists
-        let has_center = vor
-            .vertices
-            .iter()
-            .any(|&(x, y)| (x - 0.5).abs() < 1e-10 && (y - 0.5).abs() < 1e-10);
-        assert!(has_center, "should have vertex at center (0.5, 0.5)");
+        assert_eq!(vor.vertices, vec![vec![0.5, 0.5]]);
     }
 
     #[test]
@@ -14096,6 +15022,67 @@ mod tests {
         ];
         let n = num_obs_dm(&matrix);
         assert_eq!(n, 3, "num_obs_dm should return 3");
+    }
+
+    /// A NaN coordinate makes the p = ∞ row distance NaN, as numpy's `amax` does. SciPy 1.17.1:
+    /// `minkowski_distance([[nan, 1], [0, 3]], [[0, 0], [0, 0]], inf)` and `minkowski_distance_p`
+    /// on the same rows both return `[nan, 3.0]`; the finite `[[1, -3]]` vs `[[0, 0]]` returns
+    /// `[3.0]`. fsci's `fold(0.0, f64::max)` dropped the NaN and returned 1.0 for row 0.
+    #[test]
+    fn minkowski_distance_inf_keeps_a_nan_like_scipy() {
+        let x = vec![vec![f64::NAN, 1.0], vec![0.0, 3.0]];
+        let y = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        for d in [
+            minkowski_distance(&x, &y, f64::INFINITY).expect("row counts match"),
+            minkowski_distance_p(&x, &y, f64::INFINITY).expect("row counts match"),
+        ] {
+            assert!(
+                d[0].is_nan(),
+                "SciPy returns NaN for the NaN row; fsci {d:?}"
+            );
+            assert_eq!(d[1], 3.0);
+        }
+        let finite = minkowski_distance(&[vec![1.0, -3.0]], &[vec![0.0, 0.0]], f64::INFINITY)
+            .expect("row counts match");
+        assert_eq!(finite, vec![3.0]);
+    }
+
+    /// A NaN coordinate makes the Mahalanobis distance NaN, as SciPy's `np.sqrt` of a NaN quadratic
+    /// form does. SciPy 1.17.1 with VI = I₂: `mahalanobis([nan, 1], [0, 0], VI)` is nan;
+    /// `cdist([[nan, 1], [0, 3]], [[0, 0], [0, 0]], 'mahalanobis', VI=VI)` is
+    /// `[[nan, nan], [3, 3]]`; `pdist([[nan, 1], [0, 3], [1, 1]], 'mahalanobis', VI=VI)` is
+    /// `[nan, nan, 2.23606797749979]`. Finite: `mahalanobis([3, 4], [0, 0], VI)` is 5.0 and
+    /// `pdist([[0, 0], [3, 4], [1, 1]], ...)` is `[5.0, 1.4142135623730951, 3.605551275463989]`.
+    /// fsci clamped the form with `f64::max(q, 0.0)`, which turned a NaN into distance 0.
+    #[test]
+    fn mahalanobis_family_keeps_a_nan_like_scipy() {
+        let vi = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        assert!(mahalanobis(&[f64::NAN, 1.0], &[0.0, 0.0], &vi).is_nan());
+        assert_eq!(mahalanobis(&[3.0, 4.0], &[0.0, 0.0], &vi), 5.0);
+
+        let xa = vec![vec![f64::NAN, 1.0], vec![0.0, 3.0]];
+        let xb = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        let c = cdist_mahalanobis(&xa, &xb, &vi).expect("shapes agree");
+        assert!(
+            c[0].iter().all(|v| v.is_nan()),
+            "SciPy row 0 is [nan, nan]; fsci {c:?}"
+        );
+        assert_eq!(c[1], vec![3.0, 3.0]);
+
+        let with_nan = [vec![f64::NAN, 1.0], vec![0.0, 3.0], vec![1.0, 1.0]];
+        let p = pdist_mahalanobis(&with_nan, &vi).expect("shapes agree");
+        assert!(
+            p[0].is_nan() && p[1].is_nan(),
+            "SciPy [nan, nan, 2.236..]; fsci {p:?}"
+        );
+        assert!((p[2] - 2.23606797749979).abs() < 1e-12, "{p:?}");
+        let finite = [vec![0.0, 0.0], vec![3.0, 4.0], vec![1.0, 1.0]];
+        let q = pdist_mahalanobis(&finite, &vi).expect("shapes agree");
+        let expected = [5.0, 1.4142135623730951, 3.605551275463989];
+        assert_eq!(q.len(), expected.len());
+        for (got, want) in q.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-12, "{q:?}");
+        }
     }
 }
 
@@ -14661,7 +15648,8 @@ mod toggle_ab_mahalanobis_assembly {
             (0.7, 0.25),
             (0.25, 0.75),
         ];
-        let tri = Delaunay::new(&pts).expect("delaunay");
+        let rows: Vec<Vec<f64>> = pts.iter().map(|&(x, y)| vec![x, y]).collect();
+        let tri = Delaunay::new(&rows).expect("delaunay");
         let queries: Vec<(f64, f64)> = vec![
             (0.5, 0.5),
             (0.2, 0.2),
@@ -14672,7 +15660,8 @@ mod toggle_ab_mahalanobis_assembly {
             (1.5, 0.5),
             (0.5, -0.4),
         ];
-        let found = tsearch(&tri, &queries);
+        let query_rows: Vec<Vec<f64>> = queries.iter().map(|&(x, y)| vec![x, y]).collect();
+        let found = tsearch(&tri, &query_rows).expect("tsearch");
         let inside: Vec<f64> = found.iter().map(|&s| f64::from(s >= 0)).collect();
         close(
             "tsearch/inside",
@@ -14689,8 +15678,9 @@ mod toggle_ab_mahalanobis_assembly {
             if s < 0 {
                 continue;
             }
-            let (i0, i1, i2) = tri.simplices[s as usize];
-            let ((ax, ay), (bx, by), (cx, cy)) = (pts[i0], pts[i1], pts[i2]);
+            let simplex = &tri.simplices[s as usize];
+            let ((ax, ay), (bx, by), (cx, cy)) =
+                (pts[simplex[0]], pts[simplex[1]], pts[simplex[2]]);
             let det = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
             let l1 = ((bx - q.0) * (cy - q.1) - (cx - q.0) * (by - q.1)) / det;
             let l2 = ((cx - q.0) * (ay - q.1) - (ax - q.0) * (cy - q.1)) / det;
@@ -14821,13 +15811,13 @@ mod toggle_ab_mahalanobis_assembly {
     /// tolerance in `find_simplex` to have been the cause, so widening that tolerance was never
     /// the fix.
     ///
-    /// The cause was a FIXED super-triangle margin of 10.0 in `Delaunay::new`, and a fixed value
-    /// cannot be right: the required margin was measured to grow with N (100 suffices at N=800,
-    /// while N=2000 still lost 4 triangles and needed 1000). The margin now escalates and the
-    /// result is checked against `2N - 2 - h`, so the constant is verified rather than trusted.
+    /// The cause was a FIXED super-triangle margin of 10.0 in the old Bowyer-Watson
+    /// `Delaunay::new`, which grew into an escalating margin checked against `2N - 2 - h`. The
+    /// triangulation is now the lower hull of the lifted points from the exact-predicate
+    /// Quickhull, which has no super-triangle at all; this test keeps the arithmetic invariant
+    /// that caught the defect.
     ///
-    /// N=2000 is included here deliberately: it is the size that survived every intermediate
-    /// margin, so a regression that reintroduced a too-small constant would pass at 400 and 800.
+    /// N=2000 is included deliberately: it is the size that survived every intermediate margin.
     #[test]
     fn delaunay_triangulation_is_complete() {
         use super::{ConvexHull, Delaunay};
@@ -14844,8 +15834,9 @@ mod toggle_ab_mahalanobis_assembly {
         for n in [400usize, 800, 2000] {
             let mut s = 0x9e37_79b9_7f4a_7c15u64;
             let pts: Vec<(f64, f64)> = (0..n).map(|_| (lcg(&mut s), lcg(&mut s))).collect();
-            let tri = Delaunay::new(&pts).expect("delaunay");
-            let hull = ConvexHull::new(&pts).expect("hull");
+            let rows: Vec<Vec<f64>> = pts.iter().map(|&(x, y)| vec![x, y]).collect();
+            let tri = Delaunay::new(&rows).expect("delaunay");
+            let hull = ConvexHull::new(&rows).expect("hull");
             let expected = 2 * n - 2 - hull.vertices.len();
             assert_eq!(
                 tri.simplices.len(),
@@ -14866,7 +15857,7 @@ mod toggle_ab_mahalanobis_assembly {
             let tri_area: f64 = tri
                 .simplices
                 .iter()
-                .map(|&(i, j, k)| area(pts[i], pts[j], pts[k]))
+                .map(|s| area(pts[s[0]], pts[s[1]], pts[s[2]]))
                 .sum();
             let hv: Vec<(f64, f64)> = hull.vertices.iter().map(|&i| pts[i]).collect();
             let mut hull_area = 0.0;
@@ -14885,14 +15876,26 @@ mod toggle_ab_mahalanobis_assembly {
             // inside that triangle, so `find_simplex` must locate one for each. This catches a
             // triangulation and a point-location routine that disagree with each other, which the
             // two area/count measures above cannot see.
+            let centroids: Vec<Vec<f64>> = tri
+                .simplices
+                .iter()
+                .map(|s| {
+                    vec![
+                        (pts[s[0]].0 + pts[s[1]].0 + pts[s[2]].0) / 3.0,
+                        (pts[s[0]].1 + pts[s[1]].1 + pts[s[2]].1) / 3.0,
+                    ]
+                })
+                .collect();
+            let located = tri.find_simplex(&centroids, false, None).expect("locate");
             let mut centroid_not_found = 0usize;
-            for &(i, j, k) in &tri.simplices {
-                let c = (
-                    (pts[i].0 + pts[j].0 + pts[k].0) / 3.0,
-                    (pts[i].1 + pts[j].1 + pts[k].1) / 3.0,
-                );
-                if tri.find_simplex(c).is_none() {
+            for (s, &found) in located.iter().enumerate() {
+                if found < 0 {
                     centroid_not_found += 1;
+                } else {
+                    assert_eq!(
+                        found as usize, s,
+                        "a centroid is strictly inside its own simplex"
+                    );
                 }
             }
             assert_eq!(

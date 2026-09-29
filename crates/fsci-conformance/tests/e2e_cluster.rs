@@ -11,9 +11,10 @@
 //! `fixtures/artifacts/FSCI-P2C-009/e2e/`.
 
 use fsci_cluster::{
-    LinkageMethod, adjusted_rand_score, calinski_harabasz_score, completeness_score,
-    davies_bouldin_score, dbscan, fcluster, homogeneity_score, is_monotonic, is_valid_linkage,
-    kmeans, linkage, normalized_mutual_info, silhouette_score, v_measure_score, whiten,
+    FclusterCriterion, LinkageMethod, adjusted_rand_score, calinski_harabasz_score,
+    completeness_score, davies_bouldin_score, dbscan, fcluster, homogeneity_score, is_monotonic,
+    is_valid_linkage, kmeans, linkage, normalized_mutual_info, silhouette_score, v_measure_score,
+    whiten,
 };
 use fsci_conformance::PacketFamily;
 use serde::Serialize;
@@ -346,7 +347,8 @@ fn scenario_02_hierarchical() {
         "Strict",
         || {
             let z = linkage(&data, LinkageMethod::Ward).map_err(|e| format!("{e}"))?;
-            let labels = fcluster(&z, 3).map_err(|e| format!("{e}"))?;
+            let labels =
+                fcluster(&z, FclusterCriterion::MaxClust(3)).map_err(|e| format!("{e}"))?;
             if labels.len() != data.len() {
                 return Err(format!("expected {} labels", data.len()));
             }

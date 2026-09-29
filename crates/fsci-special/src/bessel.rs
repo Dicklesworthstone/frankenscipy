@@ -233,7 +233,15 @@ pub fn jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
     map_real_binary("jn", n, z, mode, |order, x| jn_scalar(order, x, mode))
 }
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`y0`).
 pub fn y0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = y0_dispatch(z, mode)?;
+    crate::sf_error_unary("y0", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn y0_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -244,7 +252,15 @@ pub fn y0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input("y0", z, mode, 1 << 16, |x| y0_scalar(x, mode))
 }
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`y1`).
 pub fn y1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = y1_dispatch(z, mode)?;
+    crate::sf_error_unary("y1", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn y1_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -270,8 +286,14 @@ pub static BESSEL_Y01_HOIST_FLAG: std::sync::atomic::AtomicBool =
 pub static BESSEL_Y01_HOIST_FLAG_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`yn`), for every order.
 pub fn yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_binary("yn", n, z, mode, |order, x| yn_scalar(order, x, mode))
+    let value = map_real_binary("yn", n, z, mode, |order, x| yn_scalar(order, x, mode))?;
+    crate::sf_error_binary("yn", n, z, mode, |_, x| {
+        crate::sf_negative_domain_zero_pole(x)
+    })?;
+    Ok(value)
 }
 
 /// Bessel function of the first kind for real order v: J_v(z).
@@ -524,39 +546,65 @@ const I1_CHEB_B: [f64; 25] = [
     7.78576235018280120474E-1,
 ];
 
-/// Largest `x` for which `exp(x)` is finite; beyond it Cephes splits the exponential in two
-/// halves because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows.
+/// Largest `x` for which `exp(x)` is finite. Beyond it, current xsf splits the exponential in two
+/// halves, because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows. The xsf
+/// that SciPy 1.17.1 pins (0d0a593f) returns inf there instead; fsci follows the later, finite
+/// form.
 const CEPHES_MAXLOG: f64 = 7.09782712893383996732E2;
 
-/// `I0(x)` by SciPy's own Chebyshev kernels.
+/// `I0(x)` by SciPy's own Chebyshev kernels, associated as Cephes writes them:
+/// `(exp(x) · chbevl) / sqrt(x)`, not `exp(x) · (chbevl / sqrt(x))`, which differs in the last
+/// bit (frankenscipy-wyn06).
 fn i0_cephes(x: f64) -> f64 {
     let x = x.abs();
     if x <= 8.0 {
         let y = (x / 2.0) - 2.0;
         return x.exp() * cephes_chbevl(y, &I0_CHEB_A);
     }
-    let cheb = cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt();
+    let cheb = cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B);
     if x > CEPHES_MAXLOG {
         let e = (x / 2.0).exp();
-        return e * cheb * e;
+        return e * cheb / x.sqrt() * e;
     }
-    x.exp() * cheb
+    x.exp() * cheb / x.sqrt()
 }
 
-/// `I1(x)` by SciPy's own Chebyshev kernels. Odd in `x`, so the sign is restored at the end.
+/// `I1(x)` by SciPy's own Chebyshev kernels, associated as Cephes writes them. Odd in `x`, so
+/// the sign is restored at the end.
 fn i1_cephes(x: f64) -> f64 {
     let z = x.abs();
     let out = if z <= 8.0 {
         let y = (z / 2.0) - 2.0;
         cephes_chbevl(y, &I1_CHEB_A) * z * z.exp()
     } else {
-        let cheb = cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt();
+        let cheb = cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B);
         if z > CEPHES_MAXLOG {
             let e = (z / 2.0).exp();
-            e * cheb * e
+            e * cheb / z.sqrt() * e
         } else {
-            z.exp() * cheb
+            z.exp() * cheb / z.sqrt()
         }
+    };
+    if x < 0.0 { -out } else { out }
+}
+
+/// `I0(x)·exp(-|x|)`: Cephes `i0e`, the same Chebyshev tables without the exponential, so it is
+/// finite for every finite `x` (frankenscipy-wyn06).
+fn i0e_cephes(x: f64) -> f64 {
+    let x = x.abs();
+    if x <= 8.0 {
+        return cephes_chbevl((x / 2.0) - 2.0, &I0_CHEB_A);
+    }
+    cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt()
+}
+
+/// `I1(x)·exp(-|x|)`: Cephes `i1e`.
+fn i1e_cephes(x: f64) -> f64 {
+    let z = x.abs();
+    let out = if z <= 8.0 {
+        cephes_chbevl((z / 2.0) - 2.0, &I1_CHEB_A) * z
+    } else {
+        cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt()
     };
     if x < 0.0 { -out } else { out }
 }
@@ -696,9 +744,10 @@ pub static BESSEL_K01_CEPHES_HITS: std::sync::atomic::AtomicUsize =
 /// `exp(x)`. That branch therefore paid TWO exponentials and a rounding round-trip to
 /// arrive back where it started. Cephes computes `K0` below 2 with no exponential at all.
 fn k0_cephes(x: f64) -> f64 {
+    // Cephes writes log(0.5 x) and calls its own i0. `ln(x) - ln 2` rounds differently, and
+    // `i0_scalar` read a toggle and bumped a shared counter per element (frankenscipy-wyn06).
     if x <= 2.0 {
-        return cephes_chbevl(x * x - 2.0, &K0_A)
-            - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
+        return cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_cephes(x);
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
 }
@@ -706,8 +755,7 @@ fn k0_cephes(x: f64) -> f64 {
 /// `K1(x)` for `x > 0`, UNSCALED. Same story as [`k0_cephes`].
 fn k1_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        return (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
-            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        return (0.5 * x).ln() * i1_cephes(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
 }
@@ -722,8 +770,15 @@ pub fn kv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 
 /// Modified Bessel function of the second kind of order 0: K_0(z).
 ///
-/// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`.
+/// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`. Under `errstate`, a
+/// negative argument is SciPy's "domain error" and zero its "singularity".
 pub fn k0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = k0_dispatch(z, mode)?;
+    crate::sf_error_unary("k0", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn k0_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if let Some(cephes) = hoisted_k01_flag() {
         return map_real_input("k0", z, mode, 1 << 12, move |x| {
             k0_order_scalar_with(x, mode, cephes, false)
@@ -812,8 +867,15 @@ fn k1_order_scalar_with(
 
 /// Modified Bessel function of the second kind of order 1: K_1(z).
 ///
-/// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`.
+/// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`. Under `errstate`, a
+/// negative argument is SciPy's "domain error" and zero its "singularity".
 pub fn k1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = k1_dispatch(z, mode)?;
+    crate::sf_error_unary("k1", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn k1_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if let Some(cephes) = hoisted_k01_flag() {
         return map_real_input("k1", z, mode, 1 << 12, move |x| {
             k1_order_scalar_with(x, mode, cephes, false)
@@ -902,13 +964,15 @@ pub fn kve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRe
 /// Scalar: i0e(x) = I_0(x) * exp(-|x|).
 #[must_use]
 pub fn i0e_scalar(x: f64) -> f64 {
-    iv_scalar(0.0, x) * (-x.abs()).exp()
+    // Cephes' own scaled kernel, as SciPy. It was iv(0, x)·exp(-|x|): 4x slower than SciPy,
+    // and inf·0 past |x| ~ 709 (frankenscipy-wyn06).
+    i0e_cephes(x)
 }
 
 /// Scalar: i1e(x) = I_1(x) * exp(-|x|).
 #[must_use]
 pub fn i1e_scalar(x: f64) -> f64 {
-    iv_scalar(1.0, x) * (-x.abs()).exp()
+    i1e_cephes(x)
 }
 
 /// Scalar: ive(v, x) = I_v(x) * exp(-|x|).
@@ -989,13 +1053,27 @@ pub fn log_ive_scalar(v: f64, x: f64) -> f64 {
 /// Scalar: k0e(x) = K_0(x) * exp(x).
 #[must_use]
 pub fn k0e_scalar(x: f64) -> f64 {
-    k0_scalar(x) * x.exp()
+    // Cephes `k0e`, as SciPy. It was k0(x)·exp(x): 0·inf = NaN past x ~ 745, and slower
+    // (frankenscipy-wyn06).
+    if x == 0.0 {
+        return f64::INFINITY;
+    }
+    if x < 0.0 {
+        return f64::NAN;
+    }
+    k0e_cephes(x)
 }
 
 /// Scalar: k1e(x) = K_1(x) * exp(x).
 #[must_use]
 pub fn k1e_scalar(x: f64) -> f64 {
-    k1_scalar(x) * x.exp()
+    if x == 0.0 {
+        return f64::INFINITY;
+    }
+    if x < 0.0 {
+        return f64::NAN;
+    }
+    k1e_cephes(x)
 }
 
 /// Scalar: kve(v, x) = K_v(x) * exp(x).
@@ -2251,20 +2329,20 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
     k_curr
 }
 
+/// Cephes `k0e` for `x > 0`: `K0(x)·exp(x)`, finite for every finite `x`.
 fn k0e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y =
-            cephes_chbevl(x * x - 2.0, &K0_A) - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
+        let y = cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_cephes(x);
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
     }
 }
 
+/// Cephes `k1e` for `x > 0`: `K1(x)·exp(x)`.
 fn k1e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y = (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
-            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        let y = (0.5 * x).ln() * i1_cephes(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
@@ -3745,23 +3823,7 @@ where
         | (_, _, SpecialTensor::ComplexVec(_)) => {
             not_yet_implemented(function, mode, "complex-valued path pending")
         }
-        _ => {
-            record_special_trace(
-                function,
-                mode,
-                "domain_error",
-                "unsupported_broadcast_pattern",
-                "fail_closed",
-                "unsupported broadcast pattern for ternary inputs",
-                false,
-            );
-            Err(SpecialError {
-                function,
-                kind: SpecialErrorKind::DomainError,
-                mode,
-                detail: "unsupported broadcast pattern for ternary inputs",
-            })
-        }
+        _ => crate::beta::broadcast_real_ternary(function, a, b, c, mode, kernel),
     }
 }
 
@@ -6463,7 +6525,23 @@ pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
     // TAKE THE MEASURED DOMAIN, NOT THE MESSAGE: scipy says "argument must be
     // > 0." but v == 0.0 is ACCEPTED and returns 0.22389077914123562 at x = 2.
     // Only v < 0 is rejected.
-    if v < 0.0 {
+    //
+    // A NaN order is rejected too: scipy's `int(v)` raises ValueError ("cannot convert
+    // float NaN to integer"), while `v.floor().max(0.0)` below would turn NaN into n = 0
+    // and lmbda(NaN, 0.0) would answer ([1.0], [0.0]).
+    //
+    // So is any order of i32::MAX (2^31 - 1) or more, +inf included (frankenscipy-qu5po).
+    // `v.floor() as usize` saturates at inf and 1e20, so `n + 1` overflowed (a panic in
+    // debug builds). Finite orders short of that sized all three work vectors by n, a
+    // multi-GiB allocation. SciPy 1.17.1 raises for every integer order in this range (its
+    // lamn takes a C int), and we signal that with the same NaN pair:
+    //   lmbda(inf, 1.0)          -> OverflowError: cannot convert float infinity to integer
+    //   lmbda(1e20, 1.0)         -> OverflowError: Python int too large to convert to C long
+    //   lmbda(2147483648.0, 1.0) -> OverflowError: value too large to convert to int
+    //   lmbda(2147483647.0, 1.0) -> ValueError: negative dimensions are not allowed
+    // A non-integer order in that range asks numpy for >= 16 GiB per array.
+    // lmbda(2147483647.5, 1.0) raised MemoryError under an 8 GB address-space cap.
+    if v.is_nan() || v < 0.0 || v >= f64::from(i32::MAX) {
         return (vec![f64::NAN], vec![f64::NAN]);
     }
     let n = v.floor().max(0.0) as usize;
@@ -7316,6 +7394,79 @@ mod tests {
             "dl {}",
             dl[0]
         );
+    }
+
+    /// A NaN order must not become order 0. SciPy 1.17.1 raises ValueError ("cannot convert
+    /// float NaN to integer") for lmbda(nan, 0.0) and lmbda(nan, 2.0); fsci signals that
+    /// domain error with NaN, as it does for v < 0. `v.floor().max(0.0)` used to drop the
+    /// NaN, so lmbda(NaN, 0.0) took the x = 0 branch and answered ([1.0], [0.0]).
+    /// Must not change, SciPy 1.17.1: lmbda(0.5, 0.0) = ([1.0], [-0.0]) and
+    /// lmbda(2.0, 0.0) = ([1.0, 0.0, 0.0], [0.0, 0.5, 0.0]).
+    #[test]
+    fn lmbda_signals_a_nan_order_like_scipy_raises() {
+        for x in [0.0, 2.0] {
+            let (vl, dl) = lmbda(f64::NAN, x);
+            assert!(
+                vl.iter().all(|z| z.is_nan()) && dl.iter().all(|z| z.is_nan()),
+                "lmbda(NaN, {x}) must be NaN-signalled, got vl={vl:?} dl={dl:?}"
+            );
+        }
+        assert_eq!(lmbda(0.5, 0.0), (vec![1.0], vec![0.0]));
+        assert_eq!(lmbda(2.0, 0.0), (vec![1.0, 0.0, 0.0], vec![0.0, 0.5, 0.0]));
+    }
+
+    /// frankenscipy-qu5po. `v.floor() as usize` saturates at v = inf and v = 1e20, so the
+    /// `n + 1` that sizes the output overflowed. That panics in a debug build and wraps to an
+    /// empty answer in release. SciPy 1.17.1 raises for both, and fsci signals it with the
+    /// NaN pair it already uses for v < 0 and v = NaN:
+    ///   lmbda(inf, 1.0), lmbda(inf, 0.0)
+    ///     -> OverflowError: cannot convert float infinity to integer
+    ///   lmbda(1e20, 1.0)
+    ///     -> OverflowError: Python int too large to convert to C long
+    /// Must not change, SciPy 1.17.1: lmbda(2.5, 1.5) =
+    ///   ([0.6649966577360363, 0.7923459414244445, 0.8489952245893881],
+    ///    [-0.39617297071222224, -0.25469856737681645, -0.18883094388314534]).
+    /// A float emulation of this kernel agrees with those to 1.3e-15.
+    #[test]
+    fn lmbda_signals_an_order_scipy_cannot_convert_like_scipy_raises() {
+        for (v, x) in [(f64::INFINITY, 1.0), (f64::INFINITY, 0.0), (1e20, 1.0)] {
+            let (vl, dl) = lmbda(v, x);
+            assert!(
+                vl.len() == 1 && dl.len() == 1 && vl[0].is_nan() && dl[0].is_nan(),
+                "lmbda({v}, {x}) must be the NaN pair, got vl={vl:?} dl={dl:?}"
+            );
+        }
+
+        let (vl, dl) = lmbda(2.5, 1.5);
+        let want_vl = [
+            0.664_996_657_736_036_3,
+            0.792_345_941_424_444_5,
+            0.848_995_224_589_388_1,
+        ];
+        let want_dl = [
+            -0.396_172_970_712_222_24,
+            -0.254_698_567_376_816_45,
+            -0.188_830_943_883_145_34,
+        ];
+        assert_eq!(
+            (vl.len(), dl.len()),
+            (3, 3),
+            "lmbda(2.5, 1.5) has orders 0.5, 1.5, 2.5"
+        );
+        for i in 0..3 {
+            assert!(
+                ((vl[i] - want_vl[i]) / want_vl[i]).abs() < 1e-12,
+                "lmbda(2.5, 1.5) vl[{i}] = {}, SciPy 1.17.1 gives {}",
+                vl[i],
+                want_vl[i]
+            );
+            assert!(
+                ((dl[i] - want_dl[i]) / want_dl[i]).abs() < 1e-12,
+                "lmbda(2.5, 1.5) dl[{i}] = {}, SciPy 1.17.1 gives {}",
+                dl[i],
+                want_dl[i]
+            );
+        }
     }
 
     #[test]
@@ -10131,6 +10282,124 @@ mod tests {
         assert!(super::k0_scalar(-1.0).is_nan());
         assert!(super::k1_scalar(-1.0).is_nan());
         assert!(super::kn_scalar(0, -1.0).is_nan());
+    }
+
+    #[test]
+    fn scaled_and_unscaled_i01_k01_are_scipy_cephes_bit_for_bit() {
+        // scipy.special 1.17.1, bit for bit, either side of the x = 2 and x = 8 kernel switches.
+        // At x = 1000 the old i0e/i1e (iv·exp(-x)) and k0e/k1e (k·exp(x)) were not finite.
+        let scaled = [
+            (
+                0.5,
+                0.64503527044915,
+                0.15642080318487173,
+                1.5241093857739092,
+                2.7310097082117855,
+            ),
+            (
+                1.9,
+                0.31824316288914156,
+                0.21661191117477055,
+                0.861450616751756,
+                1.0674709298145695,
+            ),
+            (
+                7.9,
+                0.14436986414104191,
+                0.13489649943989365,
+                0.43930008190021524,
+                0.4663177847368799,
+            ),
+            (
+                8.5,
+                0.13900184305484758,
+                0.13054935509459586,
+                0.423935999333698,
+                0.4482133915630794,
+            ),
+            (
+                50.0,
+                0.056561626647454184,
+                0.055993123892895395,
+                0.17680715585742932,
+                0.17856655855881556,
+            ),
+            (
+                1000.0,
+                0.012617240455891257,
+                0.01261093025692863,
+                0.03962832160075422,
+                0.03964813081296021,
+            ),
+        ];
+        for (x, i0e, i1e, k0e, k1e) in scaled {
+            for (name, got, want) in [
+                ("i0e", super::i0e_scalar(x), i0e),
+                ("i1e", super::i1e_scalar(x), i1e),
+                ("i1e(-x)", super::i1e_scalar(-x), -i1e),
+                ("k0e", super::k0e_scalar(x), k0e),
+                ("k1e", super::k1e_scalar(x), k1e),
+            ] {
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "{name}({x}) = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        let unscaled = [
+            (
+                0.5,
+                1.0634833707413234,
+                0.25789430539089636,
+                0.9244190712276656,
+                1.6564411200033007,
+            ),
+            (
+                1.9,
+                2.1277401940538874,
+                1.448244373054889,
+                0.12884597927604755,
+                0.15966015303266756,
+            ),
+            (
+                7.9,
+                389.406283282158,
+                363.8539440845081,
+                0.00016286766768765324,
+                0.0001728843064923898,
+            ),
+            (
+                8.5,
+                683.1619269901155,
+                641.6199025400667,
+                8.625756634932507e-05,
+                9.119724775006897e-05,
+            ),
+            (
+                50.0,
+                2.9325537838493355e20,
+                2.9030785901035566e20,
+                3.410167749789495e-23,
+                3.4441022267175555e-23,
+            ),
+        ];
+        for (x, i0, i1, k0, k1) in unscaled {
+            for (name, got, want) in [
+                ("i0", super::i0_cephes(x), i0),
+                ("i1", super::i1_cephes(x), i1),
+                ("k0", super::k0_cephes(x), k0),
+                ("k1", super::k1_cephes(x), k1),
+            ] {
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "{name}({x}) = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        assert_eq!(super::k0e_scalar(0.0), f64::INFINITY);
+        assert!(super::k1e_scalar(-1.0).is_nan());
     }
 
     #[test]

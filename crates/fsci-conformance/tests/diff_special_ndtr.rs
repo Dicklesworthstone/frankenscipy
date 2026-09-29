@@ -16,13 +16,14 @@
 //!   ndtri_exp 2e-6 rel-scaled abs (Acklam log-tail inverse; finite
 //!                         at y=-800 and y≈0 where exp(y) would fail)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{log_ndtr, ndtr, ndtri, ndtri_exp};
@@ -31,9 +32,17 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const NDTR_TOL: f64 = 5.0e-13;
 const LOG_NDTR_TOL: f64 = 1.0e-6;
-const NDTRI_TOL_REL: f64 = 1.0e-7;
-const NDTRI_EXP_TOL_REL: f64 = 2.0e-6;
+// ndtri is Cephes' with Cephes' own coefficient doubles, bit-identical to SciPy. This is a TRUE
+// relative tolerance, a few ulp. It used to be 1e-7 scaled by max(|value|, 1), which could
+// not see tables transcribed 1-2 ulp off (frankenscipy-qbwth).
+const NDTRI_TOL_REL: f64 = 1.0e-15;
+// ndtri_exp is xsf's, bit-identical to SciPy. This is a TRUE relative tolerance, a few ulp. It
+// was 2e-6 scaled by max(|value|, 1), wide enough to pass the Acklam rational it replaced at
+// 1.1e-9 relative (frankenscipy-qbwth).
+const NDTRI_EXP_TOL_REL: f64 = 1.0e-15;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 4] = ["ndtr", "log_ndtr", "ndtri", "ndtri_exp"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -72,6 +81,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -133,6 +143,12 @@ fn generate_query() -> OracleQuery {
         0.999,
         1.0 - 1.0e-6,
         1.0 - 1.0e-9,
+        // Points where the 16-digit tables missed SciPy by an ulp: the central rational, the
+        // z < 8 tail, its reflection, and 1e-20 for the z >= 8 table.
+        0.798_523_345_806_105_5,
+        0.048_965_581_752_949_63,
+        0.870_088_502_327_503_3,
+        1.0e-20,
     ];
     // ndtri_exp takes log-probabilities directly and must stay finite
     // in both tails where ndtri(exp(y)) loses information.
@@ -148,6 +164,13 @@ fn generate_query() -> OracleQuery {
         -0.1,
         -1.0e-9,
         -1.0e-20,
+        // Either side of xsf's switches at -2 and log1p(-exp(-2)), and one inside the central
+        // range, where the Acklam rational this replaced was ~1e-9 off.
+        -2.0001,
+        -1.9999,
+        -0.5,
+        -0.145,
+        -1.0e10,
     ];
 
     let mut points = Vec::new();
@@ -274,42 +297,43 @@ fn diff_special_ndtr() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_ndtr", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let rel_diff = if scipy_v.abs() > 1.0 {
-                abs_diff / scipy_v.abs()
-            } else {
-                abs_diff
-            };
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let rel_diff = if scipy_v.abs() > 1.0 {
+            abs_diff / scipy_v.abs()
+        } else {
+            abs_diff
+        };
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
 
-            let pass = match case.func.as_str() {
-                "ndtr" => abs_diff <= NDTR_TOL,
-                "log_ndtr" => abs_diff <= LOG_NDTR_TOL,
-                "ndtri" => {
-                    let scale = scipy_v.abs().max(1.0);
-                    abs_diff <= NDTRI_TOL_REL * scale
-                }
-                "ndtri_exp" => {
-                    let scale = scipy_v.abs().max(1.0);
-                    abs_diff <= NDTRI_EXP_TOL_REL * scale
-                }
-                _ => false,
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let pass = match case.func.as_str() {
+            "ndtr" => abs_diff <= NDTR_TOL,
+            "log_ndtr" => abs_diff <= LOG_NDTR_TOL,
+            "ndtri" => abs_diff <= NDTRI_TOL_REL * scipy_v.abs(),
+            "ndtri_exp" => abs_diff <= NDTRI_EXP_TOL_REL * scipy_v.abs(),
+            _ => false,
+        };
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -318,6 +342,7 @@ fn diff_special_ndtr() {
         test_id: "diff_special_ndtr".into(),
         category: "scipy.special.ndtr/ndtri/ndtri_exp/log_ndtr".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -344,4 +369,11 @@ fn diff_special_ndtr() {
         max_abs_overall,
         max_rel_overall
     );
+    // Arms have different case sets (ndtri has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

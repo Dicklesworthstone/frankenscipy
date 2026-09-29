@@ -11,6 +11,32 @@ mod tests {
     const TOL: f64 = 1e-10;
     const LOOSE_TOL: f64 = 1e-6;
 
+    /// Residual fold that keeps a NaN. `f64::max` returns the other operand when one is NaN, so
+    /// `fold(0.0, f64::max)` reads a NaN residual as zero and the relation passes on garbage.
+    fn nan_max(acc: f64, d: f64) -> f64 {
+        if acc.is_nan() || d.is_nan() {
+            f64::NAN
+        } else {
+            acc.max(d)
+        }
+    }
+
+    #[test]
+    fn nan_max_fails_a_nan_residual_that_f64_max_passes() {
+        let residuals = [1e-12, f64::NAN, 2e-12];
+        // The old fold: the NaN vanishes and the relation reads as satisfied.
+        let swallowed = residuals.iter().copied().fold(0.0, f64::max);
+        assert!(swallowed < TOL);
+        // The NaN survives in any position, and `< TOL` rejects it.
+        for rotation in 0..residuals.len() {
+            let mut r = residuals;
+            r.rotate_left(rotation);
+            assert!(!(r.iter().copied().fold(0.0, nan_max) < TOL));
+        }
+        // Finite residuals keep the plain maximum.
+        assert_eq!([1e-12, 3e-12, 2e-12].into_iter().fold(0.0, nan_max), 3e-12);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // FFT METAMORPHIC RELATIONS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -29,7 +55,7 @@ mod tests {
             a.iter()
                 .zip(b.iter())
                 .map(|(x, y)| complex_norm(&(x.0 - y.0, x.1 - y.1)))
-                .fold(0.0, f64::max)
+                .fold(0.0, nan_max)
         }
 
         proptest! {
@@ -79,7 +105,7 @@ mod tests {
                 let max_diff: f64 = input.iter()
                     .zip(roundtrip.iter())
                     .map(|(a, b)| (a - b).abs())
-                    .fold(0.0, f64::max);
+                    .fold(0.0, nan_max);
 
                 let max_input = input.iter().map(|x| x.abs()).fold(0.0, f64::max);
                 let rel_tol = if max_input > 1.0 { TOL * max_input } else { TOL };
@@ -166,14 +192,14 @@ mod tests {
             a.iter()
                 .zip(b.iter())
                 .map(|(x, y)| (x - y).abs())
-                .fold(0.0, f64::max)
+                .fold(0.0, nan_max)
         }
 
         fn max_diff_mat(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
             a.iter()
                 .zip(b.iter())
                 .flat_map(|(ra, rb)| ra.iter().zip(rb.iter()).map(|(x, y)| (x - y).abs()))
-                .fold(0.0, f64::max)
+                .fold(0.0, nan_max)
         }
 
         proptest! {
@@ -709,7 +735,7 @@ mod tests {
                     .expect("minimize should succeed");
                 let max_err = res.x.iter().zip(&c)
                     .map(|(xi, ci)| (xi - ci).abs())
-                    .fold(0.0, f64::max);
+                    .fold(0.0, nan_max);
                 prop_assert!(
                     max_err < 1e-3,
                     "minimize did not recover center: x={:?}, c={:?}",
@@ -818,7 +844,7 @@ mod tests {
                 let recon = matmul(&res.q, &res.r);
                 let max_diff = a.iter().zip(&recon)
                     .flat_map(|(ra, rr)| ra.iter().zip(rr).map(|(x, y)| (x - y).abs()))
-                    .fold(0.0, f64::max);
+                    .fold(0.0, nan_max);
                 prop_assert!(max_diff < LOOSE_TOL, "Q@R != A: max_diff={max_diff}, n={n}");
             }
 
@@ -938,7 +964,7 @@ mod tests {
                         let recon: f64 = (0..res.s.len())
                             .map(|k| res.u[i][k] * res.s[k] * res.vt[k][j])
                             .sum();
-                        max_diff = max_diff.max((recon - a[i][j]).abs());
+                        max_diff = nan_max(max_diff, (recon - a[i][j]).abs());
                     }
                 }
                 prop_assert!(

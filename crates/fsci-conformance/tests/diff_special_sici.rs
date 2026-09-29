@@ -10,19 +10,22 @@
 //! Si is odd in x, Ci defined only for x>0; harness covers both
 //! signs of x for Si and x>0 only for Ci.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::sici;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per output of `sici`.
+const ARMS: [&str; 2] = ["Si", "Ci"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -60,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -213,21 +217,28 @@ fn diff_special_sici() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_sici", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -236,6 +247,7 @@ fn diff_special_sici() {
         test_id: "diff_special_sici".into(),
         category: "scipy.special.sici".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -257,4 +269,11 @@ fn diff_special_sici() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (Ci covers x > 0 only); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

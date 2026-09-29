@@ -3,13 +3,14 @@
 //!
 //! Tests FrankenSciPy signal processing functions against SciPy subprocess oracle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{
     ConvolveMode, blackman, convolve, correlate, hamming, hann, kaiser, lombscargle, ricker,
     savgol_coeffs,
@@ -84,6 +85,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -334,7 +336,7 @@ fn lombscargle_cases() -> Vec<LombScargleCase> {
     cases
 }
 
-fn run_scipy_window_oracle(cases: &[WindowCase]) -> HashMap<String, Vec<f64>> {
+fn run_scipy_window_oracle(cases: &[WindowCase]) -> HashMap<String, Option<Vec<f64>>> {
     let python_code = r#"
 import sys
 import json
@@ -389,13 +391,11 @@ print(json.dumps(results))
     }
 
     let results: Vec<OracleResult> = serde_json::from_slice(&output.stdout).expect("parse oracle");
-    results
-        .into_iter()
-        .filter_map(|r| r.values.map(|v| (r.case_id, v)))
-        .collect()
+    // A case SciPy raised on keeps its `None`, so the compared-case ledger records it.
+    results.into_iter().map(|r| (r.case_id, r.values)).collect()
 }
 
-fn run_scipy_convolve_oracle(cases: &[ConvolveCase]) -> HashMap<String, Vec<f64>> {
+fn run_scipy_convolve_oracle(cases: &[ConvolveCase]) -> HashMap<String, Option<Vec<f64>>> {
     let python_code = r#"
 import sys
 import json
@@ -446,13 +446,11 @@ print(json.dumps(results))
     }
 
     let results: Vec<OracleResult> = serde_json::from_slice(&output.stdout).expect("parse oracle");
-    results
-        .into_iter()
-        .filter_map(|r| r.values.map(|v| (r.case_id, v)))
-        .collect()
+    // A case SciPy raised on keeps its `None`, so the compared-case ledger records it.
+    results.into_iter().map(|r| (r.case_id, r.values)).collect()
 }
 
-fn run_scipy_savgol_oracle(cases: &[SavgolCase]) -> HashMap<String, Vec<f64>> {
+fn run_scipy_savgol_oracle(cases: &[SavgolCase]) -> HashMap<String, Option<Vec<f64>>> {
     let python_code = r#"
 import sys
 import json
@@ -498,13 +496,11 @@ print(json.dumps(results))
     }
 
     let results: Vec<OracleResult> = serde_json::from_slice(&output.stdout).expect("parse oracle");
-    results
-        .into_iter()
-        .filter_map(|r| r.values.map(|v| (r.case_id, v)))
-        .collect()
+    // A case SciPy raised on keeps its `None`, so the compared-case ledger records it.
+    results.into_iter().map(|r| (r.case_id, r.values)).collect()
 }
 
-fn run_scipy_lombscargle_oracle(cases: &[LombScargleCase]) -> HashMap<String, Vec<f64>> {
+fn run_scipy_lombscargle_oracle(cases: &[LombScargleCase]) -> HashMap<String, Option<Vec<f64>>> {
     let python_code = r#"
 import sys
 import json
@@ -553,13 +549,11 @@ print(json.dumps(results))
     }
 
     let results: Vec<OracleResult> = serde_json::from_slice(&output.stdout).expect("parse oracle");
-    results
-        .into_iter()
-        .filter_map(|r| r.values.map(|v| (r.case_id, v)))
-        .collect()
+    // A case SciPy raised on keeps its `None`, so the compared-case ledger records it.
+    results.into_iter().map(|r| (r.case_id, r.values)).collect()
 }
 
-fn run_scipy_ricker_oracle(cases: &[RickerCase]) -> HashMap<String, Vec<f64>> {
+fn run_scipy_ricker_oracle(cases: &[RickerCase]) -> HashMap<String, Option<Vec<f64>>> {
     // scipy.signal.ricker was deprecated in scipy 1.13 and removed in
     // 1.15. Reproduce the closed-form Mexican-hat (Ricker) wavelet in
     // numpy directly:
@@ -613,10 +607,8 @@ print(json.dumps(results))
     }
 
     let results: Vec<OracleResult> = serde_json::from_slice(&output.stdout).expect("parse oracle");
-    results
-        .into_iter()
-        .filter_map(|r| r.values.map(|v| (r.case_id, v)))
-        .collect()
+    // A case SciPy raised on keeps its `None`, so the compared-case ledger records it.
+    results.into_iter().map(|r| (r.case_id, r.values)).collect()
 }
 
 fn run_rust_window(case: &WindowCase) -> Vec<f64> {
@@ -630,9 +622,6 @@ fn run_rust_window(case: &WindowCase) -> Vec<f64> {
 }
 
 fn max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -660,25 +649,32 @@ fn diff_lombscargle() {
     let mut diffs = Vec::new();
     let mut max_global = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_lombscargle", &["lombscargle"]);
 
     for case in &cases {
-        let rust_vals =
-            lombscargle(&case.x, &case.y, &case.freqs, case.normalize).unwrap_or_default();
-        if let Some(scipy_vals) = scipy.get(&case.case_id) {
-            let md = max_diff(&rust_vals, scipy_vals);
-            let pass = md <= LOMBSCARGLE_TOL;
-            max_global = max_global.max(md);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: "lombscargle".into(),
-                rust_values: rust_vals,
-                scipy_values: scipy_vals.clone(),
-                max_diff: md,
-                tolerance: LOMBSCARGLE_TOL,
-                pass,
-            });
-        }
+        let rust_vals = lombscargle(&case.x, &case.y, &case.freqs, case.normalize).ok();
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            "lombscargle",
+            &case.case_id,
+            scipy.get(&case.case_id).and_then(|v| v.as_deref()),
+            rust_vals.as_deref(),
+        ) else {
+            continue;
+        };
+        let md = max_diff(rust_vals, scipy_vals);
+        let pass = md <= LOMBSCARGLE_TOL;
+        max_global = max_global.max(md);
+        all_pass = all_pass && pass;
+        ledger.compared("lombscargle", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: "lombscargle".into(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
+            max_diff: md,
+            tolerance: LOMBSCARGLE_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -686,6 +682,7 @@ fn diff_lombscargle() {
         test_id: "diff_signal_lombscargle".into(),
         category: "scipy.signal.lombscargle".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_global,
         tolerance: LOMBSCARGLE_TOL,
         pass: all_pass,
@@ -697,6 +694,7 @@ fn diff_lombscargle() {
     emit_log(&log);
     assert_all_cases_compared("lombscargle", log.case_count, cases.len());
     assert!(all_pass, "lombscargle diff failed: max_diff={max_global}");
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -717,24 +715,33 @@ fn diff_windows() {
     let mut diffs = Vec::new();
     let mut max_global = 0.0f64;
     let mut all_pass = true;
+    let window_arms = ["hann", "hamming", "blackman", "kaiser"];
+    let mut ledger = CompareLedger::new("diff_windows", &window_arms);
 
     for case in &cases {
         let rust_vals = run_rust_window(case);
-        if let Some(scipy_vals) = scipy.get(&case.case_id) {
-            let md = max_diff(&rust_vals, scipy_vals);
-            let pass = md <= WINDOW_TOL;
-            max_global = max_global.max(md);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.window_type.clone(),
-                rust_values: rust_vals,
-                scipy_values: scipy_vals.clone(),
-                max_diff: md,
-                tolerance: WINDOW_TOL,
-                pass,
-            });
-        }
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            &case.window_type,
+            &case.case_id,
+            scipy.get(&case.case_id).and_then(|v| v.as_deref()),
+            Some(rust_vals.as_slice()),
+        ) else {
+            continue;
+        };
+        let md = max_diff(rust_vals, scipy_vals);
+        let pass = md <= WINDOW_TOL;
+        max_global = max_global.max(md);
+        all_pass = all_pass && pass;
+        ledger.compared(&case.window_type, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: case.window_type.clone(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
+            max_diff: md,
+            tolerance: WINDOW_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -742,6 +749,7 @@ fn diff_windows() {
         test_id: "windows".into(),
         category: "signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_global,
         tolerance: WINDOW_TOL,
         pass: all_pass,
@@ -753,6 +761,13 @@ fn diff_windows() {
     emit_log(&log);
     assert_all_cases_compared("windows", log.case_count, cases.len());
     assert!(all_pass, "window diff failed: max_diff={max_global}");
+    ledger.finish(
+        window_arms
+            .iter()
+            .map(|w| cases.iter().filter(|c| c.window_type == *w).count())
+            .min()
+            .unwrap_or(0),
+    );
 }
 
 #[test]
@@ -773,40 +788,53 @@ fn diff_convolve() {
     let mut diffs = Vec::new();
     let mut max_global = 0.0f64;
     let mut all_pass = true;
+    let method_of = |case: &ConvolveCase| {
+        if case.case_id.starts_with("corr") {
+            "correlate"
+        } else {
+            "convolve"
+        }
+    };
+    let method_arms = ["convolve", "correlate"];
+    let mut ledger = CompareLedger::new("diff_convolve", &method_arms);
 
     for case in &cases {
         let mode = match case.mode.as_str() {
             "full" => ConvolveMode::Full,
             "same" => ConvolveMode::Same,
             "valid" => ConvolveMode::Valid,
-            _ => continue,
+            other => panic!("unknown convolve mode {other}"),
         };
+        let method = method_of(case);
 
-        let rust_vals = if case.case_id.starts_with("corr") {
-            correlate(&case.a, &case.b, mode).unwrap_or_default()
+        let rust_vals = if method == "correlate" {
+            correlate(&case.a, &case.b, mode).ok()
         } else {
-            convolve(&case.a, &case.b, mode).unwrap_or_default()
+            convolve(&case.a, &case.b, mode).ok()
         };
 
-        if let Some(scipy_vals) = scipy.get(&case.case_id) {
-            let md = max_diff(&rust_vals, scipy_vals);
-            let pass = md <= CONV_TOL;
-            max_global = max_global.max(md);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: if case.case_id.starts_with("corr") {
-                    "correlate".into()
-                } else {
-                    "convolve".into()
-                },
-                rust_values: rust_vals,
-                scipy_values: scipy_vals.clone(),
-                max_diff: md,
-                tolerance: CONV_TOL,
-                pass,
-            });
-        }
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            method,
+            &case.case_id,
+            scipy.get(&case.case_id).and_then(|v| v.as_deref()),
+            rust_vals.as_deref(),
+        ) else {
+            continue;
+        };
+        let md = max_diff(rust_vals, scipy_vals);
+        let pass = md <= CONV_TOL;
+        max_global = max_global.max(md);
+        all_pass = all_pass && pass;
+        ledger.compared(method, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: method.into(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
+            max_diff: md,
+            tolerance: CONV_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -814,6 +842,7 @@ fn diff_convolve() {
         test_id: "convolve".into(),
         category: "signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_global,
         tolerance: CONV_TOL,
         pass: all_pass,
@@ -825,6 +854,13 @@ fn diff_convolve() {
     emit_log(&log);
     assert_all_cases_compared("convolve", log.case_count, cases.len());
     assert!(all_pass, "convolve diff failed: max_diff={max_global}");
+    ledger.finish(
+        method_arms
+            .iter()
+            .map(|m| cases.iter().filter(|&c| method_of(c) == *m).count())
+            .min()
+            .unwrap_or(0),
+    );
 }
 
 #[test]
@@ -845,25 +881,32 @@ fn diff_savgol_coeffs() {
     let mut diffs = Vec::new();
     let mut max_global = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_savgol_coeffs", &["savgol_coeffs"]);
 
     for case in &cases {
-        if let Ok(rust_vals) = savgol_coeffs(case.window_length, case.polyorder, case.deriv)
-            && let Some(scipy_vals) = scipy.get(&case.case_id)
-        {
-            let md = max_diff(&rust_vals, scipy_vals);
-            let pass = md <= CONV_TOL;
-            max_global = max_global.max(md);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: "savgol_coeffs".into(),
-                rust_values: rust_vals,
-                scipy_values: scipy_vals.clone(),
-                max_diff: md,
-                tolerance: CONV_TOL,
-                pass,
-            });
-        }
+        let rust_vals = savgol_coeffs(case.window_length, case.polyorder, case.deriv).ok();
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            "savgol_coeffs",
+            &case.case_id,
+            scipy.get(&case.case_id).and_then(|v| v.as_deref()),
+            rust_vals.as_deref(),
+        ) else {
+            continue;
+        };
+        let md = max_diff(rust_vals, scipy_vals);
+        let pass = md <= CONV_TOL;
+        max_global = max_global.max(md);
+        all_pass = all_pass && pass;
+        ledger.compared("savgol_coeffs", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: "savgol_coeffs".into(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
+            max_diff: md,
+            tolerance: CONV_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -871,6 +914,7 @@ fn diff_savgol_coeffs() {
         test_id: "savgol_coeffs".into(),
         category: "signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_global,
         tolerance: CONV_TOL,
         pass: all_pass,
@@ -882,6 +926,7 @@ fn diff_savgol_coeffs() {
     emit_log(&log);
     assert_all_cases_compared("savgol_coeffs", log.case_count, cases.len());
     assert!(all_pass, "savgol_coeffs diff failed: max_diff={max_global}");
+    ledger.finish(cases.len());
 }
 
 #[test]
@@ -902,24 +947,32 @@ fn diff_ricker() {
     let mut diffs = Vec::new();
     let mut max_global = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_ricker", &["ricker"]);
 
     for case in &cases {
         let rust_vals = ricker(case.points, case.a);
-        if let Some(scipy_vals) = scipy.get(&case.case_id) {
-            let md = max_diff(&rust_vals, scipy_vals);
-            let pass = md <= WINDOW_TOL;
-            max_global = max_global.max(md);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: "ricker".into(),
-                rust_values: rust_vals,
-                scipy_values: scipy_vals.clone(),
-                max_diff: md,
-                tolerance: WINDOW_TOL,
-                pass,
-            });
-        }
+        let Some((scipy_vals, rust_vals)) = ledger.slices(
+            "ricker",
+            &case.case_id,
+            scipy.get(&case.case_id).and_then(|v| v.as_deref()),
+            Some(rust_vals.as_slice()),
+        ) else {
+            continue;
+        };
+        let md = max_diff(rust_vals, scipy_vals);
+        let pass = md <= WINDOW_TOL;
+        max_global = max_global.max(md);
+        all_pass = all_pass && pass;
+        ledger.compared("ricker", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: "ricker".into(),
+            rust_values: rust_vals.to_vec(),
+            scipy_values: scipy_vals.to_vec(),
+            max_diff: md,
+            tolerance: WINDOW_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -927,6 +980,7 @@ fn diff_ricker() {
         test_id: "ricker".into(),
         category: "signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_global,
         tolerance: WINDOW_TOL,
         pass: all_pass,
@@ -938,6 +992,7 @@ fn diff_ricker() {
     emit_log(&log);
     assert_all_cases_compared("ricker", log.case_count, cases.len());
     assert!(all_pass, "ricker diff failed: max_diff={max_global}");
+    ledger.finish(cases.len());
 }
 
 #[test]

@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-ff74z].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_constants as fc;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -212,13 +214,14 @@ fn diff_constants_physical() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_constants_physical", &["constant"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
-        let Some(&fsci_v) = entry_map.get(&case.case_id) else {
+        let fsci_v = entry_map.get(&case.case_id).copied();
+        let Some((scipy_v, fsci_v)) =
+            ledger.pair("constant", &case.case_id, scipy_arm.value, fsci_v)
+        else {
             continue;
         };
         let rel = if scipy_v.abs() > 0.0 {
@@ -227,6 +230,7 @@ fn diff_constants_physical() {
             (fsci_v - scipy_v).abs()
         };
         max_overall = max_overall.max(rel);
+        ledger.compared("constant", &case.case_id, rel <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rel_diff: rel,
@@ -240,6 +244,7 @@ fn diff_constants_physical() {
         test_id: "diff_constants_physical".into(),
         category: "scipy.constants fundamental CODATA values".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -260,4 +265,5 @@ fn diff_constants_physical() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

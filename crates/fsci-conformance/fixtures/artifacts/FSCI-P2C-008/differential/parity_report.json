@@ -41,17 +41,17 @@
     {
       "case_id": "solver_moderate_condition",
       "passed": true,
-      "message": "solver action matched: pivoted_qr"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_ill_conditioned",
       "passed": true,
-      "message": "solver action matched: svd_fallback"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_near_singular",
       "passed": true,
-      "message": "solver action matched: svd_fallback"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_well_conditioned_hardened",
@@ -83,8 +83,7 @@
   "failed_cases": 0,
   "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-008_runtime_casp.json",
   "oracle_status": {
-    "status": "missing",
-    "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+    "status": "available"
   },
   "differential_case_results": [
     {
@@ -98,8 +97,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -113,8 +111,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -128,8 +125,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -143,8 +139,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -158,8 +153,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -173,8 +167,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -188,14 +181,13 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
       "case_id": "solver_moderate_condition",
       "passed": true,
-      "message": "solver action matched: pivoted_qr",
+      "message": "solver action matched: direct_lu",
       "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
@@ -203,14 +195,13 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
       "case_id": "solver_ill_conditioned",
       "passed": true,
-      "message": "solver action matched: svd_fallback",
+      "message": "solver action matched: direct_lu",
       "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
@@ -218,14 +209,13 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
       "case_id": "solver_near_singular",
       "passed": true,
-      "message": "solver action matched: svd_fallback",
+      "message": "solver action matched: direct_lu",
       "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
@@ -233,8 +223,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -248,8 +237,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -263,8 +251,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -278,8 +265,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -293,8 +279,7 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     },
     {
@@ -308,11 +293,10 @@
         "comparison_mode": "exact"
       },
       "oracle_status": {
-        "status": "missing",
-        "reason": "script not found: /data/projects/frankenscipy/crates/fsci-conformance/python_oracle/NO_DEFAULT_ORACLE_SET.py"
+        "status": "available"
       }
     }
   ],
   "report_kind": "self_check",
-  "generated_unix_ms": 1777873167250
+  "generated_unix_ms": 1790392932180
 }

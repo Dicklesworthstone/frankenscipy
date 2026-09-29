@@ -9,13 +9,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::morlet2;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -206,30 +208,31 @@ fn diff_signal_morlet2() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_morlet2", &["morlet2"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.packed.as_ref() else {
-            continue;
-        };
         let out = morlet2(case.m, case.s, case.w);
         let mut packed = Vec::with_capacity(out.len() * 2);
         for &(re, im) in &out {
             packed.push(re);
             packed.push(im);
         }
-        let abs_d = if packed.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            packed
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let Some((expected, packed)) = ledger.slices(
+            "morlet2",
+            &case.case_id,
+            pmap.get(&case.case_id)
+                .and_then(|arm| arm.packed.as_deref()),
+            Some(packed.as_slice()),
+        ) else {
+            continue;
         };
+        let abs_d = packed
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("morlet2", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -243,6 +246,7 @@ fn diff_signal_morlet2() {
         test_id: "diff_signal_morlet2".into(),
         category: "fsci_signal::morlet2 vs numpy formula (scipy.signal.morlet2 removed)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -263,4 +267,5 @@ fn diff_signal_morlet2() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

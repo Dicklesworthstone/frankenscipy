@@ -11,13 +11,14 @@
 //! Tolerances: 1e-9 rel against scipy_v with scale =
 //! max(|scipy|, 1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::betaincinv;
 use fsci_special::types::SpecialTensor;
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -222,24 +224,30 @@ fn diff_special_betaincinv() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_betaincinv", &["betaincinv"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.a, case.b, case.q)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass: abs_diff <= TOL_REL * scale,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "betaincinv",
+            &case.case_id,
+            oracle.value,
+            fsci_eval(case.a, case.b, case.q),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        ledger.compared("betaincinv", &case.case_id, abs_diff <= TOL_REL * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass: abs_diff <= TOL_REL * scale,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -248,6 +256,7 @@ fn diff_special_betaincinv() {
         test_id: "diff_special_betaincinv".into(),
         category: "scipy.special.betaincinv".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -274,4 +283,5 @@ fn diff_special_betaincinv() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

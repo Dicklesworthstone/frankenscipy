@@ -5,13 +5,14 @@
 //! inverts a 2-D real FFT. Complex inputs are pre-computed via scipy
 //! rfft2 on a known real signal and passed in (re, im) pairs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{FftOptions, irfft2};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -235,40 +237,38 @@ fn diff_fft_irfft2() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_fft_irfft2", &["irfft2"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_out) = scipy_arm.output.as_ref() else {
-            continue;
-        };
-        let Some(packed_complex) = scipy_arm.complex_input.as_ref() else {
-            continue;
-        };
         // Unpack scipy's rfft2 output into Complex64 tuples.
-        let complex_input: Vec<(f64, f64)> = packed_complex
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|p| (p[0], p[1]))
-            .collect();
+        let complex_input: Option<Vec<(f64, f64)>> =
+            scipy_arm.complex_input.as_ref().map(|packed_complex| {
+                packed_complex
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| (p[0], p[1]))
+                    .collect()
+            });
         let opts = FftOptions::default();
-        let Ok(rec) = irfft2(&complex_input, (case.rows, case.cols), &opts) else {
+        let fsci_rec = complex_input
+            .as_ref()
+            .and_then(|input| irfft2(input, (case.rows, case.cols), &opts).ok());
+        // SciPy's rfft2 output is the input both sides invert; without it there is no oracle.
+        let scipy_out = complex_input.as_ref().and(scipy_arm.output.as_deref());
+        let Some((scipy_out, rec)) =
+            ledger.slices("irfft2", &case.case_id, scipy_out, fsci_rec.as_deref())
+        else {
             continue;
         };
-        if rec.len() != scipy_out.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = rec
             .iter()
             .zip(scipy_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("irfft2", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -282,6 +282,7 @@ fn diff_fft_irfft2() {
         test_id: "diff_fft_irfft2".into(),
         category: "scipy.fft.irfft2".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -302,4 +303,5 @@ fn diff_fft_irfft2() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -10,13 +10,14 @@
 //! n=1, x=1 — likely a series-asymptotic seam at x≈1. Same
 //! pattern as Bessel/Spence — tracked alongside frankenscipy-0om9c.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::expn;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -86,11 +88,6 @@ fn emit_log(log: &DiffLog) {
     let path = output_dir().join(format!("{}.json", log.test_id));
     let json = serde_json::to_string_pretty(log).expect("serialize expn diff log");
     fs::write(path, json).expect("write expn diff log");
-}
-
-fn fsci_eval(n: usize, x: f64) -> Option<f64> {
-    let v = expn(n, x);
-    if v.is_finite() { Some(v) } else { None }
 }
 
 fn generate_query() -> OracleQuery {
@@ -202,21 +199,28 @@ fn diff_special_expn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_expn", &["expn"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.n, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n: case.n,
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        // A non-finite fsci value is recorded by `pair` as an fsci failure, not skipped.
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "expn",
+            &case.case_id,
+            oracle.value,
+            Some(expn(case.n, case.x)),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared("expn", &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            n: case.n,
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -225,6 +229,7 @@ fn diff_special_expn() {
         test_id: "diff_special_expn".into(),
         category: "scipy.special.expn".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -246,4 +251,5 @@ fn diff_special_expn() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

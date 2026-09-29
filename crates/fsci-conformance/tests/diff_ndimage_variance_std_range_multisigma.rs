@@ -14,13 +14,14 @@
 //! Tolerance: 1e-12 abs for variance/std/range, 1e-10 abs for gaussian
 //! (per-axis sequential convolution accumulates more rounding).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     BoundaryMode, NdArray, gaussian_filter_multi_sigma, range_filter, std_filter, variance_filter,
 };
@@ -74,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -290,51 +292,43 @@ fn diff_ndimage_variance_std_range_multisigma() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["var", "std", "range", "gauss_multi"];
+    let mut ledger = CompareLedger::new("diff_ndimage_variance_std_range_multisigma", &arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let tol = match case.op.as_str() {
+            "gauss_multi" => GAUSS_ABS_TOL,
+            _ => FLOOR_ABS_TOL,
+        };
+        let result_data = parse_mode(&case.mode)
+            .zip(NdArray::new(case.data.clone(), vec![case.rows, case.cols]).ok())
+            .and_then(|(mode, input)| {
+                let result = match case.op.as_str() {
+                    "var" => variance_filter(&input, case.size, mode, 0.0),
+                    "std" => std_filter(&input, case.size, mode, 0.0),
+                    "range" => range_filter(&input, case.size, mode, 0.0),
+                    "gauss_multi" => gaussian_filter_multi_sigma(
+                        &input,
+                        &[case.sigma_y, case.sigma_x],
+                        mode,
+                        0.0,
+                    ),
+                    _ => return None,
+                };
+                result.ok()
+            })
+            .map(|r| r.data);
+        let Some((expected, result_data)) =
+            ledger.slices(&case.op, &case.case_id, expected, result_data.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let Some(mode) = parse_mode(&case.mode) else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.data.clone(), vec![case.rows, case.cols]) else {
-            continue;
-        };
-        let (result_data, tol): (Vec<f64>, f64) = match case.op.as_str() {
-            "var" => {
-                let Ok(r) = variance_filter(&input, case.size, mode, 0.0) else {
-                    continue;
-                };
-                (r.data, FLOOR_ABS_TOL)
-            }
-            "std" => {
-                let Ok(r) = std_filter(&input, case.size, mode, 0.0) else {
-                    continue;
-                };
-                (r.data, FLOOR_ABS_TOL)
-            }
-            "range" => {
-                let Ok(r) = range_filter(&input, case.size, mode, 0.0) else {
-                    continue;
-                };
-                (r.data, FLOOR_ABS_TOL)
-            }
-            "gauss_multi" => {
-                let Ok(r) =
-                    gaussian_filter_multi_sigma(&input, &[case.sigma_y, case.sigma_x], mode, 0.0)
-                else {
-                    continue;
-                };
-                (r.data, GAUSS_ABS_TOL)
-            }
-            _ => continue,
-        };
-        let abs_d = vec_max_diff(&result_data, expected);
+        let abs_d = vec_max_diff(result_data, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -351,6 +345,7 @@ fn diff_ndimage_variance_std_range_multisigma() {
             "fsci_ndimage::{variance_filter, std_filter, range_filter, gaussian_filter_multi_sigma} vs scipy.ndimage"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -370,5 +365,11 @@ fn diff_ndimage_variance_std_range_multisigma() {
         "ndimage var/std/range/multi-sigma conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

@@ -8,13 +8,14 @@
 //! for ppf, all driven through scipy via subprocess. Skips
 //! cleanly if scipy is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, KsTwoBign};
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -241,55 +243,48 @@ fn diff_stats_kstwobign() {
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
     let dist = KsTwoBign;
+    let mut ledger = CompareLedger::new("diff_stats_kstwobign", &["pdf", "cdf", "sf", "ppf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(spdf) = oracle.pdf {
-            let d = (dist.pdf(case.x) - spdf).abs();
+        let arms = [
+            ("pdf", oracle.pdf, dist.pdf(case.x), PDF_TOL),
+            ("cdf", oracle.cdf, dist.cdf(case.x), CDF_TOL),
+            ("sf", oracle.sf, dist.sf(case.x), CDF_TOL),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pdf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= PDF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.x) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
-            });
-        }
-        if let Some(ssf) = oracle.sf {
-            let d = (dist.sf(case.x) - ssf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "sf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
 
     for case in &query.ppf {
         let oracle = ppfmap.get(&case.case_id).expect("validated oracle");
-        if let Some(sppf) = oracle.ppf {
-            let rust = dist.ppf(case.q);
-            let d = (rust - sppf).abs();
-            let scale = sppf.abs().max(1.0);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "ppf".into(),
-                abs_diff: d,
-                pass: d <= PPF_TOL_REL * scale,
-            });
-        }
+        let Some((sppf, rust)) =
+            ledger.pair("ppf", &case.case_id, oracle.ppf, Some(dist.ppf(case.q)))
+        else {
+            continue;
+        };
+        let d = (rust - sppf).abs();
+        let scale = sppf.abs().max(1.0);
+        max_overall = max_overall.max(d);
+        ledger.compared("ppf", &case.case_id, d <= PPF_TOL_REL * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            family: "ppf".into(),
+            abs_diff: d,
+            pass: d <= PPF_TOL_REL * scale,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -298,6 +293,7 @@ fn diff_stats_kstwobign() {
         test_id: "diff_stats_kstwobign".into(),
         category: "scipy.stats.kstwobign".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -322,4 +318,6 @@ fn diff_stats_kstwobign() {
         diffs.len(),
         max_overall
     );
+    // pdf/cdf/sf compare every point case; ppf has its own (smaller) q-grid.
+    ledger.finish(query.points.len().min(query.ppf.len()));
 }

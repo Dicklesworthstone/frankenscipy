@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-4rer9]. Probed against scipy.ndimage.histogram
 //! with labels= and index=1..num. Bit-exact integer comparison.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, histogram_labels};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -235,38 +237,39 @@ fn diff_ndimage_histogram_labels() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_histogram_labels", &["histogram_labels"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_counts) = scipy_arm.counts.as_ref() else {
+        let input = NdArray::new(case.input.clone(), case.input_shape.clone()).ok();
+        let labels = NdArray::new(case.labels.clone(), case.input_shape.clone()).ok();
+        let fsci_counts: Option<Vec<usize>> = input.zip(labels).map(|(input, labels)| {
+            histogram_labels(
+                &input,
+                &labels,
+                case.num_labels,
+                case.min_val,
+                case.max_val,
+                case.nbins,
+            )
+            .into_iter()
+            .flatten()
+            .collect()
+        });
+        let Some((scipy_counts, fsci_counts)) = ledger.both(
+            "histogram_labels",
+            &case.case_id,
+            scipy_arm.counts.as_ref(),
+            fsci_counts,
+        ) else {
             continue;
         };
-        let Ok(input) = NdArray::new(case.input.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let Ok(labels) = NdArray::new(case.labels.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let hists = histogram_labels(
-            &input,
-            &labels,
-            case.num_labels,
-            case.min_val,
-            case.max_val,
-            case.nbins,
-        );
-        let fsci_counts: Vec<usize> = hists.into_iter().flatten().collect();
-        if fsci_counts.len() != scipy_counts.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                pass: false,
-            });
-            continue;
-        }
-        let pass = fsci_counts
-            .iter()
-            .zip(scipy_counts.iter())
-            .all(|(a, b)| *a == *b);
+        let pass = fsci_counts.len() == scipy_counts.len()
+            && fsci_counts
+                .iter()
+                .zip(scipy_counts.iter())
+                .all(|(a, b)| *a == *b);
+        ledger.compared("histogram_labels", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             pass,
@@ -279,6 +282,7 @@ fn diff_ndimage_histogram_labels() {
         test_id: "diff_ndimage_histogram_labels".into(),
         category: "scipy.ndimage.histogram (per-label)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -297,4 +301,5 @@ fn diff_ndimage_histogram_labels() {
         "scipy.ndimage.histogram (per-label) conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

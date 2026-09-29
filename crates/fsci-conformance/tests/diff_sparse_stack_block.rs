@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-tcopn]. 1e-12 abs (integer-valued data).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, block_diag, bmat, eye_rectangular, hstack, vstack};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -379,33 +381,41 @@ print(json.dumps({"stack": stack_out, "bmat": bmat_out, "eye": eye_out}))
     Some(serde_json::from_str(&stdout).expect("parse stack_block oracle JSON"))
 }
 
+/// Records the case in the ledger under `op`; returns a diff row only when both sides produced a
+/// matrix whose dense values `slices` accepted.
 fn compare_dense(
+    ledger: &mut CompareLedger,
     case_id: &str,
     op: &str,
-    fsci: &CsrMatrix,
-    scipy_rows: Option<usize>,
-    scipy_cols: Option<usize>,
-    expected: Option<&Vec<f64>>,
+    fsci: Option<&CsrMatrix>,
+    scipy: &DenseArm,
 ) -> Option<CaseDiff> {
-    let expected = expected?;
-    let (Some(rows), Some(cols)) = (scipy_rows, scipy_cols) else {
-        return None;
+    let expected = scipy
+        .rows
+        .zip(scipy.cols)
+        .and_then(|shape| Some((shape, scipy.dense.as_deref()?)));
+    let fsci = fsci.map(|m| {
+        let s = m.shape();
+        ((s.rows, s.cols), dense_from_csr(m))
+    });
+    let (expected_dense, fsci_dense) = ledger.slices(
+        op,
+        case_id,
+        expected.map(|(_, d)| d),
+        fsci.as_ref().map(|(_, d)| d.as_slice()),
+    )?;
+    // slices returned both sides, so this compares the two output shapes
+    let shape_ok = expected.map(|(s, _)| s) == fsci.as_ref().map(|(s, _)| *s);
+    let abs_d = if shape_ok {
+        fsci_dense
+            .iter()
+            .zip(expected_dense.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max)
+    } else {
+        f64::INFINITY
     };
-    let fsci_shape = fsci.shape();
-    if fsci_shape.rows != rows || fsci_shape.cols != cols {
-        return Some(CaseDiff {
-            case_id: case_id.into(),
-            op: op.into(),
-            abs_diff: f64::INFINITY,
-            pass: false,
-        });
-    }
-    let fsci_dense = dense_from_csr(fsci);
-    let abs_d = fsci_dense
-        .iter()
-        .zip(expected.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
+    ledger.compared(op, case_id, abs_d <= ABS_TOL);
     Some(CaseDiff {
         case_id: case_id.into(),
         op: op.into(),
@@ -443,6 +453,10 @@ fn diff_sparse_stack_block() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_stack_block",
+        &["hstack", "vstack", "block_diag", "bmat", "eye"],
+    );
 
     // stack cases
     for case in &query.stack_cases {
@@ -465,18 +479,15 @@ fn diff_sparse_stack_block() {
                 vstack(&dyn_refs)
             }
             "block_diag" => block_diag(&refs),
-            _ => continue,
+            other => unreachable!("generate_query emits no `{other}` stack case"),
         };
-        let Ok(fsci_csr) = fsci_result else {
-            continue;
-        };
+        let fsci_csr = fsci_result.ok();
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             &case.op,
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -495,16 +506,13 @@ fn diff_sparse_stack_block() {
             .iter()
             .map(|row| row.iter().map(|b| b.as_ref()).collect())
             .collect();
-        let Ok(fsci_csr) = bmat(&blocks_refs) else {
-            continue;
-        };
+        let fsci_csr = bmat(&blocks_refs).ok();
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             "bmat",
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -514,16 +522,13 @@ fn diff_sparse_stack_block() {
     // eye_rectangular cases
     for case in &query.eye_cases {
         let scipy_arm = eye_map.get(&case.case_id).expect("validated oracle");
-        let Ok(fsci_csr) = eye_rectangular(case.m, case.n, case.k as isize) else {
-            continue;
-        };
+        let fsci_csr = eye_rectangular(case.m, case.n, case.k as isize).ok();
         if let Some(d) = compare_dense(
+            &mut ledger,
             &case.case_id,
             "eye",
-            &fsci_csr,
-            scipy_arm.rows,
-            scipy_arm.cols,
-            scipy_arm.dense.as_ref(),
+            fsci_csr.as_ref(),
+            scipy_arm,
         ) {
             max_overall = max_overall.max(d.abs_diff);
             diffs.push(d);
@@ -536,6 +541,7 @@ fn diff_sparse_stack_block() {
         test_id: "diff_sparse_stack_block".into(),
         category: "scipy.sparse.hstack + vstack + block_diag + bmat + eye".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -556,4 +562,11 @@ fn diff_sparse_stack_block() {
         diffs.len(),
         max_overall
     );
+    let min_cases = ["hstack", "vstack", "block_diag"]
+        .iter()
+        .map(|op| query.stack_cases.iter().filter(|c| c.op == *op).count())
+        .chain([query.bmat_cases.len(), query.eye_cases.len()])
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_cases);
 }

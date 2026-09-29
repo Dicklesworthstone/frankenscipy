@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-vhigd]. CSD = X * conj(Y) / (n * fs).
 //! 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::cross_spectral_density;
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -214,37 +216,45 @@ fn diff_fft_cross_spectral_density() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_fft_cross_spectral_density", &["csd", "freqs"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(csd_exp), Some(freqs_exp)) =
-            (scipy_arm.csd_packed.as_ref(), scipy_arm.freqs.as_ref())
-        else {
-            continue;
-        };
-        let Ok((freqs, csd)) = cross_spectral_density(&case.x, &case.y, case.fs) else {
-            continue;
-        };
-        let mut packed = Vec::with_capacity(csd.len() * 2);
-        for &(re, im) in &csd {
-            packed.push(re);
-            packed.push(im);
+        let result = cross_spectral_density(&case.x, &case.y, case.fs).ok();
+        let packed = result.as_ref().map(|(_, csd)| {
+            let mut packed = Vec::with_capacity(csd.len() * 2);
+            for &(re, im) in csd {
+                packed.push(re);
+                packed.push(im);
+            }
+            packed
+        });
+        let arms = [
+            ("csd", scipy_arm.csd_packed.as_deref(), packed.as_deref()),
+            (
+                "freqs",
+                scipy_arm.freqs.as_deref(),
+                result.as_ref().map(|(freqs, _)| freqs.as_slice()),
+            ),
+        ];
+        let mut arm_diffs = [f64::NAN; 2];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let d = f
+                .iter()
+                .zip(s.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
         }
-        let abs_d = if packed.len() != csd_exp.len() || freqs.len() != freqs_exp.len() {
-            f64::INFINITY
-        } else {
-            let dc = packed
-                .iter()
-                .zip(csd_exp.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            let df = freqs
-                .iter()
-                .zip(freqs_exp.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            dc.max(df)
-        };
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [dc, df] = arm_diffs;
+        let abs_d = dc.max(df);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -259,6 +269,7 @@ fn diff_fft_cross_spectral_density() {
         test_id: "diff_fft_cross_spectral_density".into(),
         category: "fsci_fft::cross_spectral_density".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -279,4 +290,5 @@ fn diff_fft_cross_spectral_density() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

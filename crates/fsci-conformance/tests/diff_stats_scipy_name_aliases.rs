@@ -10,16 +10,18 @@
 //! cdf with the named `scipy.stats` distribution at several points. A wrong
 //! alias, or a wrong parameter convention behind a right one, fails here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_stats::{
     Beta, Betabinom, Betanbinom, Binom, Burr, Chi2, ContinuousDistribution, Cosine,
     CosineDistribution, Dgamma, DiscreteDistribution, Dlaplace, Dweibull, Expon, Exponweib, F,
     Foldcauchy, Foldnorm, Gamma, Genexpon, Geom, GumbelL, GumbelR, HalfNormal, Halfnorm, Hypergeom,
-    Invgamma, Invgauss, LevyL, Lognorm, Logser, Nbinom, Ncf, Nct, Ncx2, Nhypergeom, Norm, T,
-    Triang, Truncnorm, WeibullMin,
+    Invgamma, Invgauss, Kstwo, Landau, LevyL, LevyStable, Lognorm, Logser, Nbinom, Ncf,
+    NchypergeomFisher, Nct, Ncx2, Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, VonmisesLine,
+    Wald, WeibullMin, rv_histogram,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +65,10 @@ fn cases() -> Vec<AliasCase> {
         eval,
     };
     let halfnorm: Halfnorm = HalfNormal;
+    // NoncentralHypergeomFisher has inherent pmf/cdf on usize, not the DiscreteDistribution trait.
+    let fisher = NchypergeomFisher::new(20, 7, 12, 2.5);
+    let nchypergeom_fisher: Eval =
+        Box::new(move |k| (fisher.pmf(k as usize), fisher.cdf(k as usize)));
     let cosine: Cosine = CosineDistribution;
     vec![
         c(
@@ -271,6 +277,66 @@ fn cases() -> Vec<AliasCase> {
             &[0.3, 1.5, 4.0],
             cont(WeibullMin::new(1.8, 1.5)),
         ),
+        c(
+            "Reciprocal",
+            "stats.reciprocal(0.5, 4)",
+            &[0.6, 1.5, 3.9],
+            cont(Reciprocal::new(0.5, 4.0)),
+        ),
+        // scipy.stats.wald has no shape parameter: it is invgauss with mu = 1.
+        c(
+            "Wald",
+            "stats.wald()",
+            &[0.2, 1.0, 3.0],
+            cont(Wald::new(1.0)),
+        ),
+        // The four szq1n.2 names that aliased a DIFFERENT law now name their own types
+        // (frankenscipy-1ksfv.16), and each point is one where the old alias disagreed:
+        // kstwobign.cdf(0.3) = 9.3e-6 against kstwo(10) 0.729; moyal.pdf(0) = 0.242 against
+        // landau 0.262; vonmises at x = 4 has density and cdf 1.0035, vonmises_line 0 and 1.
+        c(
+            "Kstwo",
+            "stats.kstwo(10)",
+            &[0.1, 0.3, 0.6],
+            cont(Kstwo::new(10).expect("kstwo n = 10")),
+        ),
+        c(
+            "Landau",
+            "stats.landau()",
+            &[-1.0, 0.0, 3.0],
+            cont(Landau::new(0.0, 1.0)),
+        ),
+        c(
+            "VonmisesLine",
+            "stats.vonmises_line(2)",
+            &[-2.0, 1.0, 4.0],
+            cont(VonmisesLine::new(2.0, 0.0)),
+        ),
+        // The fourth: levy_stable(1.5, 0.3), the bead's spot law (pdf(0.5) = 0.2244), where the
+        // old `LevyStable = Levy` alias is supported on (0, ∞) and cannot even take α, β.
+        c(
+            "LevyStable",
+            "stats.levy_stable(1.5, 0.3)",
+            &[-1.0, 0.5, 2.0],
+            cont(LevyStable::new(1.5, 0.3, 0.0, 1.0)),
+        ),
+        d(
+            "NchypergeomFisher",
+            "stats.nchypergeom_fisher(20, 7, 12, 2.5)",
+            &[2.0, 5.0, 7.0],
+            nchypergeom_fisher,
+        ),
+        c(
+            "rv_histogram",
+            // SciPy's default density=None means density=True (heights are densities, which
+            // matters with unequal bin widths); explicit here to silence its warning.
+            "stats.rv_histogram(([1.0, 3.0, 2.0], [0.0, 1.0, 2.5, 3.0]), density=True)",
+            &[0.5, 1.7, 2.9],
+            cont(
+                rv_histogram::new(&[1.0, 3.0, 2.0], &[0.0, 1.0, 2.5, 3.0], true)
+                    .expect("histogram"),
+            ),
+        ),
         c("Cosine", "stats.cosine()", &[-2.0, 0.0, 1.0], cont(cosine)),
         c(
             "Exponweib",
@@ -355,6 +421,40 @@ fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() <= ABS_TOL + REL_TOL * expected.abs()
 }
 
+/// Every top-level `pub type` in fsci-stats is a SciPy-name alias with a row in `cases()`, so a
+/// new alias cannot land unguarded (br-szq1n.2 found three that had none: Reciprocal, Wald,
+/// NchypergeomFisher). Needs no SciPy.
+#[test]
+fn every_stats_alias_has_a_row() {
+    // Not distribution aliases: a trait-object alias and a result tuple.
+    const NOT_ALIASES: [&str; 2] = ["rv_continuous", "StatPValueMatrices"];
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fsci-stats/src/lib.rs"
+    ))
+    .expect("read fsci-stats/src/lib.rs");
+    let aliases: Vec<&str> = src
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub type "))
+        .filter_map(|rest| rest.split([' ', '<', '=']).next())
+        .filter(|name| !NOT_ALIASES.contains(name))
+        .collect();
+    // Must-hit: a scan that finds nothing would pass the check below vacuously.
+    assert!(
+        aliases.len() >= 41,
+        "found only {} aliases; the scan is broken",
+        aliases.len()
+    );
+    let cases = cases();
+    let covered: HashSet<&str> = cases.iter().map(|c| c.alias).collect();
+    let missing: Vec<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|a| !covered.contains(a))
+        .collect();
+    assert!(missing.is_empty(), "aliases without a row: {missing:?}");
+}
+
 #[test]
 fn diff_stats_scipy_name_aliases() {
     let cases = cases();
@@ -373,22 +473,38 @@ fn diff_stats_scipy_name_aliases() {
 
     let mut compared = 0usize;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_stats_scipy_name_aliases", &["density", "cdf"]);
     for case in &cases {
-        let Some(Some(expected)) = oracle.get(case.alias) else {
+        let expected = oracle.get(case.alias).and_then(Option::as_ref);
+        if expected.is_none() {
             failures.push(format!(
                 "{}: SciPy did not evaluate `{}`",
                 case.alias, case.scipy
             ));
-            continue;
-        };
-        for (&x, &(e_dens, e_cdf)) in case.points.iter().zip(expected) {
+        }
+        for (i, &x) in case.points.iter().enumerate() {
+            let case_id = format!("{}_x{x}", case.alias);
             let (dens, cdf) = (case.eval)(x);
-            compared += 1;
-            if !close(dens, e_dens) || !close(cdf, e_cdf) {
-                failures.push(format!(
-                    "{} vs {} at x={x}: density {dens:e} vs {e_dens:e}, cdf {cdf:e} vs {e_cdf:e}",
-                    case.alias, case.scipy
-                ));
+            // A point SciPy did not evaluate is recorded per arm as a missing oracle value.
+            let scipy = expected.and_then(|v| v.get(i)).copied();
+            let arms = [
+                ("density", scipy.map(|(e_dens, _)| e_dens), dens),
+                ("cdf", scipy.map(|(_, e_cdf)| e_cdf), cdf),
+            ];
+            for (arm, e, got) in arms {
+                let Some((s, f)) = ledger.pair(arm, &case_id, e, Some(got)) else {
+                    continue;
+                };
+                ledger.compared(arm, &case_id, close(f, s));
+            }
+            if let Some((e_dens, e_cdf)) = scipy {
+                compared += 1;
+                if !close(dens, e_dens) || !close(cdf, e_cdf) {
+                    failures.push(format!(
+                        "{} vs {} at x={x}: density {dens:e} vs {e_dens:e}, cdf {cdf:e} vs {e_cdf:e}",
+                        case.alias, case.scipy
+                    ));
+                }
             }
         }
     }
@@ -403,4 +519,6 @@ fn diff_stats_scipy_name_aliases() {
         "alias divergences:\n{}",
         failures.join("\n")
     );
+    // Both arms are designed to compare every point of every alias row.
+    ledger.finish(expected_points);
 }

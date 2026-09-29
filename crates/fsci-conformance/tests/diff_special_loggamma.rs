@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-qq65q]. Tolerance: 1e-10 abs for finite values;
 //! non-finite branch-cut and pole outputs compare by classification.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::loggamma;
 use fsci_special::types::Complex64 as FsciComplex;
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -305,11 +307,23 @@ fn diff_special_loggamma() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_loggamma", &["loggamma"]);
 
     for case in &query.points {
         let expected = pmap.get(&case.case_id).expect("oracle case present");
         let actual = fsci_eval(case);
-        let diff = compare(case, &actual, expected);
+        // An "error" class on either side is a missing value, never a matching class; NaN and
+        // infinite pole/branch-cut answers still compare by class below.
+        let Some((expected, actual)) = ledger.both(
+            "loggamma",
+            &case.case_id,
+            (expected.re_class != "error").then_some(expected),
+            (actual.re_class != "error").then_some(&actual),
+        ) else {
+            continue;
+        };
+        let diff = compare(case, actual, expected);
+        ledger.compared("loggamma", &case.case_id, diff.pass);
         max_overall = max_overall.max(diff.abs_diff);
         diffs.push(diff);
     }
@@ -319,6 +333,7 @@ fn diff_special_loggamma() {
         test_id: "diff_special_loggamma".into(),
         category: "fsci_special::loggamma vs scipy.special.loggamma".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -339,4 +354,5 @@ fn diff_special_loggamma() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

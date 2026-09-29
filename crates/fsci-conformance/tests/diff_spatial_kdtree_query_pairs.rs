@@ -4,14 +4,14 @@
 //! Resolves [frankenscipy-m1p1d]. Pairs returned as sorted (i, j) with
 //! i < j; compare sets for exact equality.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::KDTree;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -206,10 +207,19 @@ fn diff_spatial_kdtree_query_pairs() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_spatial_kdtree_query_pairs", &["query_pairs"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_flat) = scipy_arm.pairs_flat.as_ref() else {
+        let fsci_pairs = KDTree::new(&case.pts)
+            .and_then(|t| t.query_pairs(case.r))
+            .ok();
+        let Some((scipy_flat, fsci_pairs)) = ledger.both(
+            "query_pairs",
+            &case.case_id,
+            scipy_arm.pairs_flat.as_ref(),
+            fsci_pairs,
+        ) else {
             continue;
         };
         let scipy_set: HashSet<(usize, usize)> = scipy_flat
@@ -218,17 +228,12 @@ fn diff_spatial_kdtree_query_pairs() {
             .iter()
             .map(|c| (c[0] as usize, c[1] as usize))
             .collect();
-        let Ok(t) = KDTree::new(&case.pts) else {
-            continue;
-        };
-        let Ok(fsci_pairs) = t.query_pairs(case.r) else {
-            continue;
-        };
         let fsci_set: HashSet<(usize, usize)> = fsci_pairs
             .into_iter()
             .map(|(i, j)| if i < j { (i, j) } else { (j, i) })
             .collect();
         let pass = scipy_set == fsci_set;
+        ledger.compared("query_pairs", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci_count: fsci_set.len(),
@@ -243,6 +248,7 @@ fn diff_spatial_kdtree_query_pairs() {
         test_id: "diff_spatial_kdtree_query_pairs".into(),
         category: "scipy.spatial.cKDTree.query_pairs".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -264,4 +270,5 @@ fn diff_spatial_kdtree_query_pairs() {
         "query_pairs conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

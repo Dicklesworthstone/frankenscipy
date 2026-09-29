@@ -237,10 +237,31 @@ fn evaluate_case(packet: &PacketFixture, case: &FixtureCase) -> EventEntry {
 
     match (&case.expected.kind[..], actual) {
         ("scalar", Actual::Scalar(value)) => {
-            let expected = case.expected.value.unwrap_or(f64::NAN);
-            let diff = (value - expected).abs();
             let tol = tolerance(&case.expected);
-            let pass = diff <= tol || (value.is_nan() && expected.is_nan());
+            // JSON has no NaN literal, so every scalar expectation in the fixture is a number,
+            // and a scalar case without a `value` is a fixture defect. It fails here; it used to
+            // default to NaN, and a NaN-equals-NaN clause then passed it against a NaN result.
+            let (pass, diff, message) = match case.expected.value {
+                Some(expected) => {
+                    let diff = (value - expected).abs();
+                    (
+                        diff <= tol,
+                        Some(diff),
+                        format!(
+                            "actual={value:.17e}, expected={expected:.17e}, diff={diff:.3e}, contract={}",
+                            case.expected.contract_ref
+                        ),
+                    )
+                }
+                None => (
+                    false,
+                    None,
+                    format!(
+                        "scalar case has no expected value in the fixture; actual={value:.17e}, contract={}",
+                        case.expected.contract_ref
+                    ),
+                ),
+            };
             EventEntry {
                 packet_id: packet.packet_id.clone(),
                 family: packet.family.clone(),
@@ -250,18 +271,17 @@ fn evaluate_case(packet: &PacketFixture, case: &FixtureCase) -> EventEntry {
                 mode: case.mode.clone(),
                 expected_kind: case.expected.kind.clone(),
                 outcome: if pass { "PASS" } else { "FAIL" }.to_string(),
-                max_abs_diff: Some(diff),
+                max_abs_diff: diff,
                 tolerance: Some(tol),
-                message: format!(
-                    "actual={value:.17e}, expected={expected:.17e}, diff={diff:.3e}, contract={}",
-                    case.expected.contract_ref
-                ),
+                message,
                 duration_ns: elapsed,
             }
         }
         ("error", Actual::Error(err)) => {
+            // `contains("")` matches every error, so a case without an expected error text fails
+            // instead of passing whatever error came back.
             let expected = case.expected.error.as_deref().unwrap_or_default();
-            let pass = err.contains(expected);
+            let pass = !expected.is_empty() && err.contains(expected);
             EventEntry {
                 packet_id: packet.packet_id.clone(),
                 family: packet.family.clone(),

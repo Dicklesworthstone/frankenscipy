@@ -10,13 +10,14 @@
 //! Tolerances: 1e-13 abs sin/cos; tan/cot scale with their
 //! magnitude near singularities so use 1e-12 rel for those.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{cosdg, cotdg, sindg, tandg};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,8 @@ const SC_TOL: f64 = 1.0e-13;
 // rel absorbs cleanly.
 const TC_TOL_REL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per degree-mode function.
+const ARMS: [&str; 4] = ["sindg", "cosdg", "tandg", "cotdg"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -43,6 +46,12 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // The grid includes tandg/cotdg singularities (tandg 90/270, cotdg 0/180/360/720) where
+    // SciPy's answer is +inf; it arrives as "inf", distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     value: Option<f64>,
 }
 
@@ -65,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -95,6 +105,7 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn fsci_eval(func: &str, x: f64) -> Option<f64> {
+    // A non-finite value is returned as is: the ledger classifies it against SciPy's.
     let v = match func {
         "sindg" => sindg(x),
         "cosdg" => cosdg(x),
@@ -102,7 +113,7 @@ fn fsci_eval(func: &str, x: f64) -> Option<f64> {
         "cotdg" => cotdg(x),
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -116,10 +127,10 @@ fn generate_query() -> OracleQuery {
     let mut points = Vec::new();
     for &x in &xs {
         for func in ["sindg", "cosdg", "tandg", "cotdg"] {
-            // Skip tandg/cotdg at angles where they're singular
-            // (90° + 180k for tan, 0° + 180k for cot). scipy
-            // returns ±∞ which we filter via finite_or_none on
-            // the python side anyway.
+            // tandg/cotdg at angles where they're singular
+            // (90° + 180k for tan, 0° + 180k for cot) stay in the
+            // grid: scipy returns +∞, sent as "inf", and the ledger
+            // compares it against fsci's infinity.
             points.push(PointCase {
                 case_id: format!("{func}_x{x}"),
                 func: func.to_string(),
@@ -142,7 +153,8 @@ def finite_or_none(v):
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    # A NaN/inf answer is sent as "nan"/"inf"/"-inf", so it is not read as a raised call.
+    return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))
 
 q = json.load(sys.stdin)
 points = []
@@ -224,30 +236,37 @@ fn diff_special_trig_deg() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_trig_deg", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = match case.func.as_str() {
-                "sindg" | "cosdg" => abs_diff <= SC_TOL,
-                "tandg" | "cotdg" => abs_diff <= TC_TOL_REL * scale,
-                _ => false,
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = match arm {
+            "sindg" | "cosdg" => abs_diff <= SC_TOL,
+            "tandg" | "cotdg" => abs_diff <= TC_TOL_REL * scale,
+            _ => false,
+        };
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -256,6 +275,7 @@ fn diff_special_trig_deg() {
         test_id: "diff_special_trig_deg".into(),
         category: "scipy.special.sindg/cosdg/tandg/cotdg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -282,4 +302,11 @@ fn diff_special_trig_deg() {
         max_abs_overall,
         max_rel_overall
     );
+    // Each function arm must compare all of its own cases, singularities included.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

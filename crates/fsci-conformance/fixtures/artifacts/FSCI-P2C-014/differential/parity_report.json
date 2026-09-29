@@ -106,7 +106,7 @@
     {
       "case_id": "cubic_spline_tuple_first_derivative_asymmetric",
       "passed": true,
-      "message": "interpolate vector matched (max_diff=4.44e-16)"
+      "message": "interpolate vector matched (max_diff=2.22e-16)"
     },
     {
       "case_id": "cubic_spline_tuple_zero_derivative_matches_clamped",
@@ -398,8 +398,8 @@
     {
       "case_id": "cubic_spline_tuple_first_derivative_asymmetric",
       "passed": true,
-      "message": "interpolate vector matched (max_diff=4.44e-16)",
-      "max_diff": 4.440892098500626e-16,
+      "message": "interpolate vector matched (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -453,5 +453,5 @@
     }
   ],
   "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666502255
+  "generated_unix_ms": 1790392934999
 }

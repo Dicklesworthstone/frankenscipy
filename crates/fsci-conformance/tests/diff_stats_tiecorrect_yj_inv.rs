@@ -16,13 +16,14 @@
 //! 8 cases. Tol 1e-12 (tiecorrect, closed-form integer ratios)
 //! / 1e-10 (yeojohnson_inv per-element max-abs, powf chain).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{tiecorrect, yeojohnson_inv};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -278,46 +280,58 @@ fn diff_stats_tiecorrect_yj_inv() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_tiecorrect_yj_inv",
+        &["tiecorrect", "yeojohnson_inv"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.func.as_str() {
             "tiecorrect" => {
-                if let Some(scipy_v) = scipy_arm.value {
-                    let rust_v = tiecorrect(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= TIE_TOL,
-                        });
-                    }
-                }
+                let Some((scipy_v, rust_v)) = ledger.pair(
+                    "tiecorrect",
+                    &case.case_id,
+                    scipy_arm.value,
+                    Some(tiecorrect(&case.data)),
+                ) else {
+                    continue;
+                };
+                let abs_diff = (rust_v - scipy_v).abs();
+                max_overall = max_overall.max(abs_diff);
+                ledger.compared("tiecorrect", &case.case_id, abs_diff <= TIE_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff,
+                    pass: abs_diff <= TIE_TOL,
+                });
             }
             "yeojohnson_inv" => {
-                if let Some(scipy_vec) = &scipy_arm.values {
-                    let rust_vec = yeojohnson_inv(&case.data, case.lam);
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (r, s) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if r.is_finite() {
-                                max_local = max_local.max((r - s).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff: max_local,
-                            pass: max_local <= YJ_TOL,
-                        });
-                    }
+                let rust_vec = yeojohnson_inv(&case.data, case.lam);
+                // slices rejects a length mismatch and a non-finite fsci element.
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    "yeojohnson_inv",
+                    &case.case_id,
+                    scipy_arm.values.as_deref(),
+                    Some(rust_vec.as_slice()),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (r, s) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    max_local = max_local.max((r - s).abs());
                 }
+                max_overall = max_overall.max(max_local);
+                ledger.compared("yeojohnson_inv", &case.case_id, max_local <= YJ_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    func: case.func.clone(),
+                    abs_diff: max_local,
+                    pass: max_local <= YJ_TOL,
+                });
             }
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         }
     }
 
@@ -327,6 +341,7 @@ fn diff_stats_tiecorrect_yj_inv() {
         test_id: "diff_stats_tiecorrect_yj_inv".into(),
         category: "scipy.stats.tiecorrect + numpy reference yeojohnson_inv".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -351,4 +366,6 @@ fn diff_stats_tiecorrect_yj_inv() {
         diffs.len(),
         max_overall
     );
+    let per_func = |func: &str| query.points.iter().filter(|c| c.func == func).count();
+    ledger.finish(per_func("tiecorrect").min(per_func("yeojohnson_inv")));
 }

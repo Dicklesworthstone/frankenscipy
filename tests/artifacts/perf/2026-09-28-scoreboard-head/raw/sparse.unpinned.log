@@ -1,0 +1,4 @@
+elf_sha256=6f25167539bdb99ba76b60322903913372b4def8130ba2ee6b1bb9ac25ea4107
+frankenscipy_engine_sha256=6f25167539bdb99ba76b60322903913372b4def8130ba2ee6b1bb9ac25ea4107
+cpu_affinity=0-63
+ABORT: pin this invocation to exactly one CPU with taskset

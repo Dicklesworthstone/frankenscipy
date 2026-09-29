@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-ubfdy]. 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{isotonic_regression, nnls};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -296,18 +298,17 @@ fn diff_opt_nnls_isotonic() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_nnls_isotonic", &["nnls", "isotonic"]);
 
     // nnls
     for case in &query.nnls {
         let scipy_arm = nnls_map.get(&case.case_id).expect("validated oracle");
-        let Some(x_exp) = scipy_arm.x.as_ref() else {
-            continue;
-        };
-        let Some(r_exp) = scipy_arm.residual else {
-            continue;
-        };
+        let scipy = scipy_arm.x.as_deref().zip(scipy_arm.residual);
         let a_rows = rows_of(&case.a, case.rows, case.cols);
-        let Ok((fsci_x, fsci_r)) = nnls(&a_rows, &case.b) else {
+        let fsci = nnls(&a_rows, &case.b).ok();
+        let Some(((x_exp, r_exp), (fsci_x, fsci_r))) =
+            ledger.both("nnls", &case.case_id, scipy, fsci)
+        else {
             continue;
         };
         let abs_d = if fsci_x.len() != x_exp.len() {
@@ -321,31 +322,37 @@ fn diff_opt_nnls_isotonic() {
             dx.max((fsci_r - r_exp).abs())
         };
         max_overall = max_overall.max(abs_d);
+        // The max folds above swallow a NaN, so a NaN in fsci's x or residual fails explicitly.
+        let no_nan = !fsci_x.iter().any(|v| v.is_nan()) && !fsci_r.is_nan();
+        let pass = no_nan && abs_d <= ABS_TOL;
+        ledger.compared("nnls", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "nnls".into(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
     // isotonic_regression
     for case in &query.iso {
         let scipy_arm = iso_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v = isotonic_regression(&case.y, case.weights.as_deref());
+        let Some((expected, fsci_v)) = ledger.slices(
+            "isotonic",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(fsci_v.as_slice()),
+        ) else {
             continue;
         };
-        let fsci_v = isotonic_regression(&case.y, case.weights.as_deref());
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("isotonic", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "isotonic".into(),
@@ -360,6 +367,7 @@ fn diff_opt_nnls_isotonic() {
         test_id: "diff_opt_nnls_isotonic".into(),
         category: "scipy.optimize.nnls + isotonic_regression".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -380,4 +388,6 @@ fn diff_opt_nnls_isotonic() {
         diffs.len(),
         max_overall
     );
+    // nnls and isotonic have separate case sets; each must compare all of its own.
+    ledger.finish(query.nnls.len().min(query.iso.len()));
 }

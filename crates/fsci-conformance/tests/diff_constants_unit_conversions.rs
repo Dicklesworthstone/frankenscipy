@@ -8,18 +8,36 @@
 //! algebraic conversions; the only source of drift is the underlying
 //! CODATA constants, which fsci pins to CODATA-2018).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_constants as fc;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REL_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// Every op `build_query` emits cases for: one ledger arm each.
+const OPS: [&str; 13] = [
+    "convert_temperature",
+    "deg2rad",
+    "rad2deg",
+    "mph_to_mps",
+    "kmh_to_mps",
+    "knots_to_mps",
+    "psi_to_pa",
+    "kg_to_lb",
+    "lb_to_kg",
+    "ev_to_joules",
+    "joules_to_ev",
+    "wavelength_to_freq",
+    "freq_to_wavelength",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CasePoint {
@@ -64,6 +82,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -359,26 +378,20 @@ fn diff_constants_unit_conversions() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_constants_unit_conversions", &OPS);
 
     for (q, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(q.case_id, o.case_id, "oracle returned out-of-order points");
-        let Some(expected) = o.value else {
-            continue; // oracle skipped this case; skip
-        };
-        let Some(actual) = fsci_compute(q) else {
-            diffs.push(CaseDiff {
-                case_id: q.case_id.clone(),
-                actual: f64::NAN,
-                expected,
-                rel_diff: f64::INFINITY,
-                pass: false,
-            });
+        let op = q.op.as_str();
+        // An fsci failure against a SciPy value is recorded by the ledger as rust_failed.
+        let Some((expected, actual)) = ledger.pair(op, &q.case_id, o.value, fsci_compute(q)) else {
             continue;
         };
         // Relative error guarded against tiny denominators
         let denom = expected.abs().max(1.0e-300);
         let rel = (actual - expected).abs() / denom;
         max_rel = max_rel.max(rel);
+        ledger.compared(op, &q.case_id, rel <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: q.case_id.clone(),
             actual,
@@ -394,6 +407,7 @@ fn diff_constants_unit_conversions() {
         test_id: "diff_constants_unit_conversions".into(),
         category: "fsci_constants unit conversions vs scipy.constants/numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -417,4 +431,11 @@ fn diff_constants_unit_conversions() {
         diffs.len(),
         max_rel
     );
+    // Ops have different case counts (2 to 80); each arm must compare at least the smallest.
+    let min_per_arm = OPS
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("OPS is non-empty");
+    ledger.finish(min_per_arm);
 }

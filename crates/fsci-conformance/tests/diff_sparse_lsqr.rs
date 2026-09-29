@@ -12,13 +12,14 @@
 //! own live-SciPy column in `diff_sparse_iterative_solvers`. Only
 //! `lsqr` is under test here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, lsqr};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -255,7 +257,8 @@ fn fsci_eval(case: &PointCase) -> Option<Vec<f64>> {
         ..Default::default()
     };
     let res = lsqr(&csr, &case.b, opts).ok()?;
-    Some(res.solution)
+    // An unconverged result (iteration limit) is an fsci failure, not a comparable value.
+    res.converged.then_some(res.solution)
 }
 
 #[test]
@@ -280,31 +283,31 @@ fn diff_sparse_lsqr() {
     // harness that compared nothing still reported "pass". Skips are now
     // recorded and asserted on below.
     let mut skipped: Vec<String> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_sparse_lsqr", &["lsqr"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_x) = scipy_arm.x.as_ref() else {
+        let fsci_x = fsci_eval(case);
+        if scipy_arm.x.is_none() {
             skipped.push(format!("{} (scipy arm returned no solution)", case.case_id));
-            continue;
-        };
-        let Some(fsci_x) = fsci_eval(case) else {
+        } else if fsci_x.is_none() {
             skipped.push(format!("{} (fsci arm did not converge)", case.case_id));
+        }
+        let Some((scipy_x, fsci_x)) = ledger.slices(
+            "lsqr",
+            &case.case_id,
+            scipy_arm.x.as_deref(),
+            fsci_x.as_deref(),
+        ) else {
             continue;
         };
-        if fsci_x.len() != scipy_x.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_x
             .iter()
             .zip(scipy_x.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("lsqr", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -333,6 +336,7 @@ fn diff_sparse_lsqr() {
         test_id: "diff_sparse_lsqr".into(),
         category: "scipy.sparse.linalg.lsqr".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -353,4 +357,5 @@ fn diff_sparse_lsqr() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

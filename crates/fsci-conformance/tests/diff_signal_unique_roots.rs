@@ -7,13 +7,14 @@
 //! scipy.signal.unique_roots and diffs the unique roots and
 //! multiplicities. Skips cleanly if scipy/python3 is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::unique_roots;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +51,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     pass: bool,
@@ -90,6 +92,11 @@ fn generate_cases() -> Vec<UniqueRootsCase> {
         ("single", vec![3.14], 1e-3),
         ("two_close", vec![1.0, 1.0001], 1e-3),
         ("scattered", vec![0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], 0.4),
+        // Unsorted inputs: SciPy groups by a ball around each first-unused root in INPUT
+        // order, so these separate that from sorting and chaining runs.
+        ("unsorted_ball", vec![2.0, 1.0, 3.0], 1.0),
+        ("unsorted_order", vec![3.0, 1.0, 2.0], 1.0),
+        ("interleaved_pairs", vec![5.0, 1.0, 5.0, 1.0], 0.1),
     ];
 
     for (label, p, tol) in inputs {
@@ -213,32 +220,34 @@ fn diff_signal_unique_roots() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_unique_roots", &["unique_roots"]);
 
     for case in &cases {
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let (Some(scipy_roots), Some(scipy_mult)) = (&oracle.roots, &oracle.mult) else {
+        let Some(((scipy_roots, scipy_mult), (rust_roots, rust_mult))) = ledger.both(
+            "unique_roots",
+            &case.case_id,
+            oracle.roots.as_ref().zip(oracle.mult.as_ref()),
+            unique_roots(&case.p, case.tol, &case.rtype).ok(),
+        ) else {
             continue;
         };
 
-        let (rust_roots, rust_mult) = unique_roots(&case.p, case.tol, &case.rtype);
-
-        // Sort both sides by root value for comparison (scipy returns
-        // groups in greedy order; we return in sorted order; for unique
-        // group representatives the multiset is order-independent).
-        let mut rust_pairs: Vec<(f64, usize)> = rust_roots
+        // Compared in order: both sides return groups in order of first appearance (fsci used
+        // to return them sorted, and a sort here hid that its grouping differed on unsorted
+        // input).
+        let rust_pairs: Vec<(f64, usize)> = rust_roots
             .iter()
             .copied()
             .zip(rust_mult.iter().copied())
             .collect();
-        let mut scipy_pairs: Vec<(f64, usize)> = scipy_roots
+        let scipy_pairs: Vec<(f64, usize)> = scipy_roots
             .iter()
             .copied()
             .zip(scipy_mult.iter().copied())
             .collect();
-        rust_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        scipy_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut max_root_diff = 0.0_f64;
         let mut mult_match = rust_pairs.len() == scipy_pairs.len();
@@ -252,8 +261,12 @@ fn diff_signal_unique_roots() {
             }
         }
 
-        let pass = mult_match && max_root_diff <= ABS_TOL;
+        // The max fold drops a NaN root difference (0.0_f64.max(NaN) is 0.0), so reject a
+        // non-finite fsci root here.
+        let roots_finite = rust_roots.iter().all(|v| v.is_finite());
+        let pass = mult_match && max_root_diff <= ABS_TOL && roots_finite;
         max_overall = max_overall.max(max_root_diff);
+        ledger.compared("unique_roots", &case.case_id, pass);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -270,6 +283,7 @@ fn diff_signal_unique_roots() {
         test_id: "diff_signal_unique_roots".into(),
         category: "scipy.signal.unique_roots".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         pass: all_pass,
@@ -295,4 +309,5 @@ fn diff_signal_unique_roots() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

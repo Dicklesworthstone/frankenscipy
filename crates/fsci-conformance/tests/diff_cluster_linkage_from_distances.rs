@@ -18,7 +18,7 @@
 //! equality on merged-cluster IDs (cols 0, 1) and member
 //! counts (col 3).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{LinkageMethod, linkage_from_distances};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-012";
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,21 +240,23 @@ fn diff_cluster_linkage_from_distances() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_linkage_from_distances",
+        &["single", "complete", "average"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_z) = scipy_arm.rows.as_ref() else {
+        let method = method_for(&case.method).expect("generated linkage method");
+        let rust_z = linkage_from_distances(&case.condensed, case.n, method).ok();
+        let Some((scipy_z, rust_z)) =
+            ledger.both(&case.method, &case.case_id, scipy_arm.rows.as_ref(), rust_z)
+        else {
             continue;
-        };
-        let Some(method) = method_for(&case.method) else {
-            continue;
-        };
-        let rust_z = match linkage_from_distances(&case.condensed, case.n, method) {
-            Ok(v) => v,
-            Err(_) => continue,
         };
 
         if rust_z.len() != scipy_z.len() {
+            ledger.compared(&case.method, &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 method: case.method.clone(),
@@ -284,13 +288,18 @@ fn diff_cluster_linkage_from_distances() {
             }
         }
 
+        // The max fold and the `as i64` casts above both swallow a NaN in fsci's Z.
+        let no_nan = rust_z.iter().flatten().all(|v| !v.is_nan());
+        let pass = max_h <= ABS_TOL && struct_ok && no_nan;
+        ledger.compared(&case.method, &case.case_id, pass);
+
         max_overall = max_overall.max(max_h);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: case.method.clone(),
             max_height_diff: max_h,
             structural_match: struct_ok,
-            pass: max_h <= ABS_TOL && struct_ok,
+            pass,
         });
     }
 
@@ -300,6 +309,7 @@ fn diff_cluster_linkage_from_distances() {
         test_id: "diff_cluster_linkage_from_distances".into(),
         category: "fsci_cluster::linkage_from_distances".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -324,4 +334,5 @@ fn diff_cluster_linkage_from_distances() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.method == "single").count());
 }

@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, Shape2D, sparse_submatrix};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -281,6 +283,33 @@ fn csr_to_dense(
     out
 }
 
+/// fsci's submatrix as ((rows, cols), row-major dense), or `None` when the input matrix fails to
+/// build.
+fn fsci_submatrix(case: &SubCase) -> Option<((usize, usize), Vec<f64>)> {
+    let mut data = Vec::with_capacity(case.triplets.len());
+    let mut rs = Vec::with_capacity(case.triplets.len());
+    let mut cs = Vec::with_capacity(case.triplets.len());
+    for &(r, c, v) in &case.triplets {
+        data.push(v);
+        rs.push(r);
+        cs.push(c);
+    }
+    let coo =
+        CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true).ok()?;
+    let csr = coo.to_csr().ok()?;
+    let sub = sparse_submatrix(&csr, case.r_start, case.r_end, case.c_start, case.c_end);
+    let actual_rows = sub.shape().rows;
+    let actual_cols = sub.shape().cols;
+    let actual_dense = csr_to_dense(
+        actual_rows,
+        actual_cols,
+        sub.indptr(),
+        sub.indices(),
+        sub.data(),
+    );
+    Some(((actual_rows, actual_cols), actual_dense))
+}
+
 #[test]
 fn diff_sparse_submatrix() {
     let query = generate_query();
@@ -297,53 +326,34 @@ fn diff_sparse_submatrix() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_submatrix", &["sparse_submatrix"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| Some(((arm.out_rows?, arm.out_cols?), arm.dense.as_deref()?)));
+        let fsci = fsci_submatrix(case);
+        let Some((edense, actual_dense)) = ledger.slices(
+            "sparse_submatrix",
+            &case.case_id,
+            scipy.map(|(_, d)| d),
+            fsci.as_ref().map(|(_, d)| d.as_slice()),
+        ) else {
             continue;
         };
-        let (Some(eor), Some(eoc), Some(edense)) = (arm.out_rows, arm.out_cols, arm.dense.as_ref())
-        else {
-            continue;
+        // slices returned both sides, so this compares the two output shapes
+        let shape_ok = scipy.map(|(s, _)| s) == fsci.as_ref().map(|(s, _)| *s);
+        let abs_d = if shape_ok {
+            actual_dense
+                .iter()
+                .zip(edense.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
         };
-        let mut data = Vec::with_capacity(case.triplets.len());
-        let mut rs = Vec::with_capacity(case.triplets.len());
-        let mut cs = Vec::with_capacity(case.triplets.len());
-        for &(r, c, v) in &case.triplets {
-            data.push(v);
-            rs.push(r);
-            cs.push(c);
-        }
-        let Ok(coo) =
-            CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true)
-        else {
-            continue;
-        };
-        let Ok(csr) = coo.to_csr() else {
-            continue;
-        };
-        let sub = sparse_submatrix(&csr, case.r_start, case.r_end, case.c_start, case.c_end);
-        let actual_rows = sub.shape().rows;
-        let actual_cols = sub.shape().cols;
-        let actual_dense = csr_to_dense(
-            actual_rows,
-            actual_cols,
-            sub.indptr(),
-            sub.indices(),
-            sub.data(),
-        );
-
-        let abs_d =
-            if actual_rows != eor || actual_cols != eoc || actual_dense.len() != edense.len() {
-                f64::INFINITY
-            } else {
-                actual_dense
-                    .iter()
-                    .zip(edense.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
-            };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("sparse_submatrix", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -357,6 +367,7 @@ fn diff_sparse_submatrix() {
         test_id: "diff_sparse_submatrix".into(),
         category: "fsci_sparse::sparse_submatrix vs scipy.sparse slicing".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -377,4 +388,5 @@ fn diff_sparse_submatrix() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

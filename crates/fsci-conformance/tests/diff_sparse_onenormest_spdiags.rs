@@ -11,13 +11,14 @@
 //! - `spdiags`: deterministic DIA construction. Compare dense
 //!   reconstruction at 1e-12.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, CsrMatrix, FormatConvertible, Shape2D, onenormest, spdiags};
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +75,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -329,22 +331,22 @@ fn diff_sparse_onenormest_spdiags() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_onenormest_spdiags", &["onenorm", "spdiags"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
         match case.op.as_str() {
             "onenorm" => {
-                let Some(expected) = arm.value else {
+                let fsci = build_csr(case.a_rows, case.a_cols, &case.a_triplets)
+                    .map(|csr| onenormest(&csr));
+                let Some((expected, actual)) =
+                    ledger.pair("onenorm", &case.case_id, arm.and_then(|a| a.value), fsci)
+                else {
                     continue;
                 };
-                let Some(csr) = build_csr(case.a_rows, case.a_cols, &case.a_triplets) else {
-                    continue;
-                };
-                let actual = onenormest(&csr);
                 let abs_d = (actual - expected).abs();
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("onenorm", &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -353,39 +355,36 @@ fn diff_sparse_onenormest_spdiags() {
                 });
             }
             "spdiags" => {
-                let (Some(expected), Some(or), Some(oc)) =
-                    (arm.dense.as_ref(), arm.out_rows, arm.out_cols)
-                else {
-                    continue;
-                };
-                let Ok(dia) = spdiags(&case.diag_data, &case.offsets, case.rows, case.cols) else {
-                    continue;
-                };
-                let Ok(csr) = dia.to_csr() else {
-                    continue;
-                };
-                let s = csr.shape();
-                if s.rows != or || s.cols != oc {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
+                let scipy =
+                    arm.and_then(|a| Some(((a.out_rows?, a.out_cols?), a.dense.as_deref()?)));
+                let fsci = spdiags(&case.diag_data, &case.offsets, case.rows, case.cols)
+                    .ok()
+                    .and_then(|dia| dia.to_csr().ok())
+                    .map(|csr| {
+                        let s = csr.shape();
+                        ((s.rows, s.cols), csr_to_dense(&csr))
                     });
-                    max_overall = f64::INFINITY;
+                let Some((expected, dense)) = ledger.slices(
+                    "spdiags",
+                    &case.case_id,
+                    scipy.map(|(_, d)| d),
+                    fsci.as_ref().map(|(_, d)| d.as_slice()),
+                ) else {
                     continue;
-                }
-                let dense = csr_to_dense(&csr);
-                let abs_d = if dense.len() != expected.len() {
-                    f64::INFINITY
-                } else {
+                };
+                // slices returned both sides, so this compares the two output shapes
+                let shape_ok = scipy.map(|(s, _)| s) == fsci.as_ref().map(|(s, _)| *s);
+                let abs_d = if shape_ok {
                     dense
                         .iter()
                         .zip(expected.iter())
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0_f64, f64::max)
+                } else {
+                    f64::INFINITY
                 };
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("spdiags", &case.case_id, abs_d <= ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -393,7 +392,7 @@ fn diff_sparse_onenormest_spdiags() {
                     pass: abs_d <= ABS_TOL,
                 });
             }
-            _ => continue,
+            other => unreachable!("generate_query emits no `{other}` case"),
         }
     }
 
@@ -403,6 +402,7 @@ fn diff_sparse_onenormest_spdiags() {
         test_id: "diff_sparse_onenormest_spdiags".into(),
         category: "fsci_sparse::onenormest + spdiags vs scipy.sparse".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -423,4 +423,10 @@ fn diff_sparse_onenormest_spdiags() {
         diffs.len(),
         max_overall
     );
+    let per_op = ["onenorm", "spdiags"]
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_op);
 }

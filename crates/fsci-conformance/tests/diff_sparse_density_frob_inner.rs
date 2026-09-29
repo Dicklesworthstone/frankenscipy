@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-pm8kb]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, sparse_density, sparse_frobenius_inner};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -300,16 +302,23 @@ fn diff_sparse_density_frob_inner() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger =
+        CompareLedger::new("diff_sparse_density_frob_inner", &["density", "frob_inner"]);
 
     for case in &query.density {
         let scipy_arm = density_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
+        let csr = dense_to_csr(case.rows, case.cols, &case.dense);
+        let Some((expected, fsci_v)) = ledger.pair(
+            "density",
+            &case.case_id,
+            scipy_arm.value,
+            Some(sparse_density(&csr)),
+        ) else {
             continue;
         };
-        let csr = dense_to_csr(case.rows, case.cols, &case.dense);
-        let fsci_v = sparse_density(&csr);
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("density", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "density".into(),
@@ -320,14 +329,19 @@ fn diff_sparse_density_frob_inner() {
 
     for case in &query.frob {
         let scipy_arm = frob_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let a_csr = dense_to_csr(case.rows, case.cols, &case.a);
         let b_csr = dense_to_csr(case.rows, case.cols, &case.b);
-        let fsci_v = sparse_frobenius_inner(&a_csr, &b_csr);
+        let Some((expected, fsci_v)) = ledger.pair(
+            "frob_inner",
+            &case.case_id,
+            scipy_arm.value,
+            Some(sparse_frobenius_inner(&a_csr, &b_csr)),
+        ) else {
+            continue;
+        };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("frob_inner", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "frob_inner".into(),
@@ -342,6 +356,7 @@ fn diff_sparse_density_frob_inner() {
         test_id: "diff_sparse_density_frob_inner".into(),
         category: "fsci_sparse density + frobenius_inner".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -362,4 +377,5 @@ fn diff_sparse_density_frob_inner() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.density.len().min(query.frob.len()));
 }

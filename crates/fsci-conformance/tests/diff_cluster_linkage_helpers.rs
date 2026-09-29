@@ -6,7 +6,7 @@
 //! Resolves [frankenscipy-cid3l]. 1e-9 abs for cophenet/inconsistent;
 //! exact equality for leaves_list/is_monotonic/num_obs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use fsci_cluster::{
     LinkageMethod, cophenet, inconsistent, is_monotonic, leaves_list, linkage, num_obs_linkage,
 };
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -247,29 +249,38 @@ fn diff_cluster_linkage_helpers() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_linkage_helpers",
+        &[
+            "cophenet",
+            "leaves_list",
+            "is_monotonic",
+            "num_obs_linkage",
+            "inconsistent",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(method) = method_of(&case.method) else {
-            continue;
-        };
+        let method = method_of(&case.method).expect("generated linkage method");
         let data = rows_of(&case.data, case.n_points, case.n_dim);
-        let Ok(z) = linkage(&data, method) else {
-            continue;
-        };
+        let z = linkage(&data, method).ok();
 
         // cophenet
-        if let Some(coph_exp) = scipy_arm.cophenet.as_ref() {
-            let coph = cophenet(&z);
-            let abs_d = if coph.len() != coph_exp.len() {
-                f64::INFINITY
-            } else {
-                coph.iter()
-                    .zip(coph_exp.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
-            };
+        let coph = z.as_deref().map(cophenet);
+        if let Some((coph_exp, coph)) = ledger.slices(
+            "cophenet",
+            &case.case_id,
+            scipy_arm.cophenet.as_deref(),
+            coph.as_deref(),
+        ) {
+            let abs_d = coph
+                .iter()
+                .zip(coph_exp.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
             max_overall = max_overall.max(abs_d);
+            ledger.compared("cophenet", &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_cophenet", case.case_id),
                 op: "cophenet".into(),
@@ -279,8 +290,13 @@ fn diff_cluster_linkage_helpers() {
         }
 
         // leaves_list
-        if let Some(leaves_exp) = scipy_arm.leaves.as_ref() {
-            let leaves = leaves_list(&z);
+        let leaves = z.as_deref().map(leaves_list);
+        if let Some((leaves_exp, leaves)) = ledger.both(
+            "leaves_list",
+            &case.case_id,
+            scipy_arm.leaves.as_ref(),
+            leaves,
+        ) {
             let abs_d = if leaves.len() != leaves_exp.len() {
                 f64::INFINITY
             } else {
@@ -291,6 +307,7 @@ fn diff_cluster_linkage_helpers() {
                     .fold(0.0_f64, f64::max)
             };
             max_overall = max_overall.max(abs_d);
+            ledger.compared("leaves_list", &case.case_id, abs_d == 0.0);
             diffs.push(CaseDiff {
                 case_id: format!("{}_leaves", case.case_id),
                 op: "leaves_list".into(),
@@ -300,8 +317,11 @@ fn diff_cluster_linkage_helpers() {
         }
 
         // is_monotonic
-        if let Some(monot_exp) = scipy_arm.monotonic {
-            let monot = is_monotonic(&z);
+        let monot = z.as_deref().map(is_monotonic);
+        if let Some((monot_exp, monot)) =
+            ledger.both("is_monotonic", &case.case_id, scipy_arm.monotonic, monot)
+        {
+            ledger.compared("is_monotonic", &case.case_id, monot == monot_exp);
             diffs.push(CaseDiff {
                 case_id: format!("{}_monotonic", case.case_id),
                 op: "is_monotonic".into(),
@@ -311,9 +331,12 @@ fn diff_cluster_linkage_helpers() {
         }
 
         // num_obs_linkage
-        if let Some(n_exp) = scipy_arm.n_obs {
-            let n = num_obs_linkage(&z) as i64;
+        let n_obs = z.as_deref().map(|z| num_obs_linkage(z) as i64);
+        if let Some((n_exp, n)) =
+            ledger.both("num_obs_linkage", &case.case_id, scipy_arm.n_obs, n_obs)
+        {
             let abs_d = (n - n_exp).unsigned_abs() as f64;
+            ledger.compared("num_obs_linkage", &case.case_id, abs_d == 0.0);
             diffs.push(CaseDiff {
                 case_id: format!("{}_num_obs", case.case_id),
                 op: "num_obs_linkage".into(),
@@ -323,19 +346,25 @@ fn diff_cluster_linkage_helpers() {
         }
 
         // inconsistent
-        if let Some(inc_exp) = scipy_arm.inconsistent.as_ref() {
-            let inc = inconsistent(&z, case.depth);
-            let inc_flat: Vec<f64> = inc.iter().flat_map(|r| r.iter().copied()).collect();
-            let abs_d = if inc_flat.len() != inc_exp.len() {
-                f64::INFINITY
-            } else {
-                inc_flat
-                    .iter()
-                    .zip(inc_exp.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
-            };
+        let inc_flat: Option<Vec<f64>> = z.as_deref().map(|z| {
+            inconsistent(z, case.depth)
+                .iter()
+                .flat_map(|r| r.iter().copied())
+                .collect()
+        });
+        if let Some((inc_exp, inc_flat)) = ledger.slices(
+            "inconsistent",
+            &case.case_id,
+            scipy_arm.inconsistent.as_deref(),
+            inc_flat.as_deref(),
+        ) {
+            let abs_d = inc_flat
+                .iter()
+                .zip(inc_exp.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
             max_overall = max_overall.max(abs_d);
+            ledger.compared("inconsistent", &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_inconsistent", case.case_id),
                 op: "inconsistent".into(),
@@ -351,6 +380,7 @@ fn diff_cluster_linkage_helpers() {
         test_id: "diff_cluster_linkage_helpers".into(),
         category: "scipy.cluster.hierarchy linkage helpers".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -371,4 +401,5 @@ fn diff_cluster_linkage_helpers() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

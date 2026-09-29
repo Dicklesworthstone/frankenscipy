@@ -1,32 +1,32 @@
 #![forbid(unsafe_code)]
 //! Live scipy differential coverage for fsci's
-//! `fclusterdata(data, max_clusters, method)` — chained
+//! `fclusterdata(data, FclusterCriterion::MaxClust(k), method)` — chained
 //! linkage + fcluster from raw data, equivalent to
 //! `scipy.cluster.hierarchy.fclusterdata(X, t, criterion='maxclust',
 //! method=method)`.
 //!
 //! Resolves [frankenscipy-i2fyz]. Existing `diff_cluster_fcluster`
 //! covers `fcluster` against scipy's linkage matrix; this harness
-//! covers the full data → partition pipeline.
+//! covers the full data → labels pipeline.
 //!
-//! Cluster labels are arbitrary names (any two implementations can
-//! permute them), so this harness compares partitions via the
-//! pair-coassignment matrix M[i,j] = 1 iff labels[i] == labels[j].
-//! That matrix is permutation-invariant. Equality of M (rust vs
-//! scipy) is the canonical correctness check.
+//! The labels themselves are compared, not only the partition: SciPy
+//! numbers flat clusters in the order of its depth-first walk from the
+//! root, and fsci ports that walk (frankenscipy-3h1yw). The evenly
+//! spaced chain has every single-linkage merge at the same height;
+//! SciPy's maxclust then keeps the whole tie, forming fewer than k
+//! clusters, and fsci must do the same.
 //!
-//! 3 fixtures × 3 methods (Single/Complete/Average) = 9 cases.
-//! All fixtures use carefully spread points so all pairwise
-//! distances are distinct → no tie-breaking divergence.
+//! 4 fixtures × 3 methods (Single/Complete/Average) = 12 cases.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_cluster::{LinkageMethod, fclusterdata};
+use fsci_cluster::{FclusterCriterion::MaxClust, LinkageMethod, fclusterdata};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-012";
@@ -60,6 +60,7 @@ struct OracleResult {
 struct CaseDiff {
     case_id: String,
     method: String,
+    labels_match: bool,
     coassign_match: bool,
     pass: bool,
 }
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -139,11 +141,6 @@ fn generate_query() -> OracleQuery {
         vec![10.2, 0.15],
         vec![10.35, -0.05],
     ];
-    // Well-separated four-cluster pattern. Avoids chain/uniform-
-    // gap fixtures: when all linkage merges happen at the same
-    // height (e.g. evenly-spaced chain data), maxclust splitting
-    // is ambiguous between scipy and fsci because there is no
-    // canonical way to choose which (n-1)-k merges to drop.
     let four_clusters: Vec<Vec<f64>> = vec![
         vec![0.0, 0.0],
         vec![0.1, 0.15],
@@ -157,10 +154,14 @@ fn generate_query() -> OracleQuery {
         vec![5.2, 5.15],
     ];
 
+    // Unit gaps: every single-linkage merge ties at height 1.
+    let tied_chain: Vec<Vec<f64>> = (0..8).map(|i| vec![f64::from(i), 0.0]).collect();
+
     let fixtures: Vec<(&str, usize, Vec<Vec<f64>>)> = vec![
         ("two_clusters_n6_k2", 2, two_clusters),
         ("three_clusters_n9_k3", 3, three_clusters),
         ("four_clusters_n10_k4", 4, four_clusters),
+        ("tied_chain_n8_k3", 3, tied_chain),
     ];
     let methods = ["single", "complete", "average"];
     let mut points = Vec::new();
@@ -267,18 +268,24 @@ fn diff_cluster_fclusterdata() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_fclusterdata",
+        &["single", "complete", "average"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_labels) = scipy_arm.labels.as_ref() else {
+        let method = method_for(&case.method).expect("generated linkage method");
+        let rust_labels = fclusterdata(&case.data, MaxClust(case.max_clusters), method)
+            .ok()
+            .map(|v| v.into_iter().map(|x| x as i64).collect::<Vec<_>>());
+        let Some((scipy_labels, rust_labels)) = ledger.both(
+            &case.method,
+            &case.case_id,
+            scipy_arm.labels.as_ref(),
+            rust_labels,
+        ) else {
             continue;
-        };
-        let Some(method) = method_for(&case.method) else {
-            continue;
-        };
-        let rust_labels = match fclusterdata(&case.data, case.max_clusters, method) {
-            Ok(v) => v.into_iter().map(|x| x as i64).collect::<Vec<_>>(),
-            Err(_) => continue,
         };
 
         let coassign = if rust_labels.len() == scipy_labels.len() {
@@ -286,12 +293,17 @@ fn diff_cluster_fclusterdata() {
         } else {
             false
         };
+        // Both sides are 1-based. The co-assignment check stays as a diagnostic: it tells a
+        // numbering difference from a different partition.
+        let labels_match = &rust_labels == scipy_labels;
+        ledger.compared(&case.method, &case.case_id, labels_match);
 
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: case.method.clone(),
+            labels_match,
             coassign_match: coassign,
-            pass: coassign,
+            pass: labels_match,
         });
     }
 
@@ -301,6 +313,7 @@ fn diff_cluster_fclusterdata() {
         test_id: "diff_cluster_fclusterdata".into(),
         category: "fsci_cluster::fclusterdata".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -312,8 +325,8 @@ fn diff_cluster_fclusterdata() {
     for d in &diffs {
         if !d.pass {
             eprintln!(
-                "fclusterdata mismatch: {} ({}) coassign_match={}",
-                d.case_id, d.method, d.coassign_match
+                "fclusterdata mismatch: {} ({}) labels_match={} coassign_match={}",
+                d.case_id, d.method, d.labels_match, d.coassign_match
             );
         }
     }
@@ -323,4 +336,5 @@ fn diff_cluster_fclusterdata() {
         "fclusterdata conformance failed across {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.iter().filter(|c| c.method == "single").count());
 }

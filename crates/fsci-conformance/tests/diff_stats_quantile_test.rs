@@ -11,13 +11,14 @@
 //! cases via subprocess. Tol 1e-12 abs (closed-form
 //! binomial pmf sums). Statistic compared as integer count.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::quantile_test;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -230,14 +232,21 @@ fn diff_stats_quantile_test() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_quantile_test", &["statistic", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = quantile_test(&case.data, case.q, case.p);
 
-        if let Some(scipy_stat) = scipy_arm.statistic {
-            let abs_diff = (result.statistic as i64 - scipy_stat).unsigned_abs() as f64;
+        if let Some((scipy_stat, rust_stat)) = ledger.both(
+            "statistic",
+            &case.case_id,
+            scipy_arm.statistic,
+            Some(result.statistic),
+        ) {
+            let abs_diff = (rust_stat as i64 - scipy_stat).unsigned_abs() as f64;
             max_overall = max_overall.max(abs_diff);
+            ledger.compared("statistic", &case.case_id, abs_diff <= PVAL_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "statistic".into(),
@@ -245,11 +254,15 @@ fn diff_stats_quantile_test() {
                 pass: abs_diff <= PVAL_TOL,
             });
         }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - scipy_p).abs();
+        if let Some((scipy_p, rust_p)) = ledger.pair(
+            "pvalue",
+            &case.case_id,
+            scipy_arm.pvalue,
+            Some(result.pvalue),
+        ) {
+            let abs_diff = (rust_p - scipy_p).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared("pvalue", &case.case_id, abs_diff <= PVAL_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "pvalue".into(),
@@ -265,6 +278,7 @@ fn diff_stats_quantile_test() {
         test_id: "diff_stats_quantile_test".into(),
         category: "scipy.stats.quantile_test".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -289,4 +303,5 @@ fn diff_stats_quantile_test() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

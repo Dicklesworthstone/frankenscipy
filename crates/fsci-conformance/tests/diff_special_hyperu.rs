@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `scipy.special.hyperu`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::hyperu;
 use fsci_special::types::SpecialTensor;
@@ -33,6 +35,12 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // The grid includes x < 0, where SciPy's documented answer is NaN; it arrives as "nan",
+    // distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     value: Option<f64>,
 }
 
@@ -54,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -131,9 +140,8 @@ def finite_or_none(v):
         v = float(v)
     except Exception:
         return None
-    if math.isfinite(v):
-        return v
-    return None
+    # A NaN/inf answer is sent as "nan"/"inf"/"-inf", so it is not read as a raised call.
+    return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))
 
 query = json.loads(os.environ["FSCI_HYPERU_QUERY"])
 points = []
@@ -228,13 +236,19 @@ fn diff_special_hyperu() {
     let mut cases = Vec::new();
     let mut max_abs_diff = 0.0_f64;
     let mut max_rel_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_hyperu", &["hyperu"]);
     for (case, oracle_point) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, oracle_point.case_id);
-        let actual = fsci_eval(case).unwrap_or(f64::NAN);
-        let expected = oracle_point.value.unwrap_or(f64::NAN);
+        // SciPy NaN (x < 0) against fsci NaN or a refusal is a matching compared case.
+        let Some((expected, actual)) =
+            ledger.pair("hyperu", &case.case_id, oracle_point.value, fsci_eval(case))
+        else {
+            continue;
+        };
         let (abs_diff, rel_diff, pass) = close_enough(actual, expected);
         max_abs_diff = max_abs_diff.max(abs_diff);
         max_rel_diff = max_rel_diff.max(rel_diff);
+        ledger.compared("hyperu", &case.case_id, pass);
         cases.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff,
@@ -248,6 +262,7 @@ fn diff_special_hyperu() {
         test_id: "diff_special_hyperu".into(),
         category: "scipy.special.hyperu".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         max_rel_diff,
         pass,
@@ -262,4 +277,5 @@ fn diff_special_hyperu() {
         "hyperu conformance failed: {} cases, max_abs={} max_rel={}",
         log.case_count, log.max_abs_diff, log.max_rel_diff
     );
+    ledger.finish(query.points.len());
 }

@@ -9,13 +9,14 @@
 //!
 //! Tolerances: 1e-12 abs OR 1e-10 rel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     Bernoulli, Binomial, DiscreteDistribution, Geometric, Hypergeometric, LogSeries, NegBinomial,
     Poisson,
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -169,7 +171,8 @@ fn fsci_eval(dist: &str, moment: &str, params: &[f64]) -> Option<f64> {
         }
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    // A non-finite moment is returned as-is: the ledger records it against SciPy's answer.
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -319,27 +322,34 @@ fn diff_stats_discrete_moments() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    // one arm per moment, each across the discrete family
+    let mut ledger = CompareLedger::new(
+        "diff_stats_discrete_moments",
+        &["mean", "var", "skew", "kurt"],
+    );
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.dist, &case.moment, &case.params)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                dist: case.dist.clone(),
-                moment: case.moment.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let arm = case.moment.as_str();
+        let rust_v = fsci_eval(&case.dist, &case.moment, &case.params);
+        let Some((scipy_v, rust_v)) = ledger.pair(arm, &case.case_id, oracle.value, rust_v) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            dist: case.dist.clone(),
+            moment: case.moment.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -348,6 +358,7 @@ fn diff_stats_discrete_moments() {
         test_id: "diff_stats_discrete_moments".into(),
         category: "scipy.stats.<discrete-dist>.stats(moments='mvsk')".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -374,4 +385,6 @@ fn diff_stats_discrete_moments() {
         max_abs_overall,
         max_rel_overall
     );
+    // kurt has the fewest cases (hypergeom kurt is not generated)
+    ledger.finish(query.points.iter().filter(|c| c.moment == "kurt").count());
 }

@@ -6,13 +6,14 @@
 //!
 //! Resolves [frankenscipy-liw7a]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{pade, polyadd, polysub, ratval};
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -323,74 +325,98 @@ fn diff_interpolate_poly_arith() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_interpolate_poly_arith",
+        &["polyadd", "polysub", "pade_p", "pade_q", "ratval"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let abs_d = match case.op.as_str() {
             "polyadd" => {
-                let Some(expected) = scipy_arm.vec_value.as_ref() else {
+                let fsci_v = polyadd(&case.a, &case.b);
+                let Some((expected, fsci_v)) = ledger.slices(
+                    "polyadd",
+                    &case.case_id,
+                    scipy_arm.vec_value.as_deref(),
+                    Some(fsci_v.as_slice()),
+                ) else {
                     continue;
                 };
-                let fsci_v = polyadd(&case.a, &case.b);
-                if fsci_v.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    fsci_v
-                        .iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                let d = fsci_v
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                ledger.compared("polyadd", &case.case_id, d <= ABS_TOL);
+                d
             }
             "polysub" => {
-                let Some(expected) = scipy_arm.vec_value.as_ref() else {
+                let fsci_v = polysub(&case.a, &case.b);
+                let Some((expected, fsci_v)) = ledger.slices(
+                    "polysub",
+                    &case.case_id,
+                    scipy_arm.vec_value.as_deref(),
+                    Some(fsci_v.as_slice()),
+                ) else {
                     continue;
                 };
-                let fsci_v = polysub(&case.a, &case.b);
-                if fsci_v.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    fsci_v
+                let d = fsci_v
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                ledger.compared("polysub", &case.case_id, d <= ABS_TOL);
+                d
+            }
+            "pade" => {
+                let fsci = pade(&case.a, case.m, case.n).ok();
+                let arms = [
+                    (
+                        "pade_p",
+                        scipy_arm.vec_value.as_deref(),
+                        fsci.as_ref().map(|(p, _)| p.as_slice()),
+                    ),
+                    (
+                        "pade_q",
+                        scipy_arm.aux_vec.as_deref(),
+                        fsci.as_ref().map(|(_, q)| q.as_slice()),
+                    ),
+                ];
+                let mut arm_diffs = [f64::NAN; 2];
+                for (slot, (arm, scipy, got)) in arm_diffs.iter_mut().zip(arms) {
+                    let Some((expected, actual)) = ledger.slices(arm, &case.case_id, scipy, got)
+                    else {
+                        continue;
+                    };
+                    let d = actual
                         .iter()
                         .zip(expected.iter())
                         .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
-            }
-            "pade" => {
-                let Some(p_exp) = scipy_arm.vec_value.as_ref() else {
-                    continue;
-                };
-                let Some(q_exp) = scipy_arm.aux_vec.as_ref() else {
-                    continue;
-                };
-                let Ok((p, q)) = pade(&case.a, case.m, case.n) else {
-                    continue;
-                };
-                if p.len() != p_exp.len() || q.len() != q_exp.len() {
-                    f64::INFINITY
-                } else {
-                    let dp = p
-                        .iter()
-                        .zip(p_exp.iter())
-                        .map(|(a, b)| (a - b).abs())
                         .fold(0.0_f64, f64::max);
-                    let dq = q
-                        .iter()
-                        .zip(q_exp.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max);
-                    dp.max(dq)
+                    ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+                    *slot = d;
                 }
+                if arm_diffs.iter().any(|d| d.is_nan()) {
+                    continue; // the ledger recorded why this case was not compared
+                }
+                let [dp, dq] = arm_diffs;
+                dp.max(dq)
             }
             "ratval" => {
-                let Some(scalar) = scipy_arm.scalar_value else {
+                let Some((scalar, fsci_v)) = ledger.pair(
+                    "ratval",
+                    &case.case_id,
+                    scipy_arm.scalar_value,
+                    Some(ratval(&case.a, &case.b, case.x)),
+                ) else {
                     continue;
                 };
-                let fsci_v = ratval(&case.a, &case.b, case.x);
-                (fsci_v - scalar).abs()
+                let d = (fsci_v - scalar).abs();
+                ledger.compared("ratval", &case.case_id, d <= ABS_TOL);
+                d
             }
-            _ => continue,
+            other => panic!("unknown poly_arith op {other} in {}", case.case_id),
         };
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
@@ -407,6 +433,7 @@ fn diff_interpolate_poly_arith() {
         test_id: "diff_interpolate_poly_arith".into(),
         category: "numpy.polyadd/polysub + scipy.interpolate.pade + ratval".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -426,5 +453,13 @@ fn diff_interpolate_poly_arith() {
         "poly_arith conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        ["polyadd", "polysub", "pade", "ratval"]
+            .into_iter()
+            .map(per_op)
+            .min()
+            .expect("four ops"),
     );
 }

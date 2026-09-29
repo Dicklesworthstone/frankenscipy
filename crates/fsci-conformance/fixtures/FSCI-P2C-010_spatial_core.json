@@ -82,9 +82,11 @@
       "expected": {
         "kind": "convex_hull",
         "vertices": [0, 1, 2, 3],
-        "area": 1.0,
+        "area": 4.0,
+        "volume": 1.0,
         "atol": 1e-10,
         "rtol": 1e-10,
+        "note": "GOLDEN-CHANGE (frankenscipy-1ksfv.13): the enclosed area 1.0 was stored under `area`, the name SciPy gives the perimeter of a 2-D hull. It moves to `volume` (unchanged value) and `area` now holds the perimeter; both from scipy 1.17.1 ConvexHull.",
         "contract_ref": "fsci_spatial::ConvexHull"
       }
     },
@@ -245,10 +247,11 @@
       "expected": {
         "kind": "convex_hull",
         "vertices": [0, 1, 2],
-        "area": 1.5,
+        "area": 5.60555127546399,
+        "volume": 1.5,
         "atol": 1e-10,
         "rtol": 1e-10,
-        "note": "Triangle has area = 0.5 * base * height = 0.5 * 2 * 1.5 = 1.5",
+        "note": "Triangle area 0.5 * 2 * 1.5 = 1.5 is SciPy's `volume`; SciPy's `area` is the perimeter 2 + 2*sqrt(3.25). GOLDEN-CHANGE (frankenscipy-1ksfv.13): 1.5 was stored under `area`; both values from scipy 1.17.1 ConvexHull.",
         "contract_ref": "fsci_spatial::ConvexHull"
       }
     },
@@ -405,7 +408,7 @@
         },
         "atol": 1e-10,
         "rtol": 1e-10,
-        "contract_ref": "fsci_spatial::HalfspaceIntersection::from_nd"
+        "contract_ref": "fsci_spatial::HalfspaceIntersection"
       }
     },
     {
@@ -425,7 +428,7 @@
       "expected": {
         "kind": "error_contains",
         "value": "need 5",
-        "contract_ref": "fsci_spatial::HalfspaceIntersection::from_nd"
+        "contract_ref": "fsci_spatial::HalfspaceIntersection"
       }
     },
     {
@@ -740,11 +743,12 @@
       "args": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
       "expected": {
         "kind": "voronoi_result",
-        "vertex_count": 2,
-        "ridge_count": 5,
-        "sorted_vertices": [[0.5, 0.5], [0.5, 0.5]],
+        "vertex_count": 1,
+        "ridge_count": 4,
+        "sorted_vertices": [[0.5, 0.5]],
         "atol": 1e-12,
         "rtol": 1e-10,
+        "note": "GOLDEN-CHANGE (frankenscipy-1ksfv.13): the four corners are cocircular, so Qhull merges the two Delaunay triangles into one cell; scipy 1.17.1 reports ONE vertex (0.5, 0.5) and four ridges. The previous 2 vertices / 5 ridges pinned the old triangulated dual (a duplicate vertex and a diagonal ridge SciPy does not have).",
         "contract_ref": "fsci_spatial::Voronoi"
       }
     },

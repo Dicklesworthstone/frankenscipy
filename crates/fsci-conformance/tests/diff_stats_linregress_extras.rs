@@ -20,13 +20,14 @@
 //!     `t.ppf` vs fsci's `StudentT::ppf`; small drift expected
 //!     at the 1e-11 level on small df).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{linregress, linregress_ci};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -260,6 +262,17 @@ fn diff_stats_linregress_extras() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_linregress_extras",
+        &[
+            "stderr",
+            "intercept_stderr",
+            "slope_lo",
+            "slope_hi",
+            "intercept_lo",
+            "intercept_hi",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -291,18 +304,20 @@ fn diff_stats_linregress_extras() {
         ];
 
         for (arm_name, scipy_v, rust_v, tol) in arms {
-            if let Some(scipy_v) = scipy_v
-                && rust_v.is_finite()
-            {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: arm_name.into(),
-                    abs_diff,
-                    pass: abs_diff <= tol,
-                });
-            }
+            let Some((scipy_v, rust_v)) =
+                ledger.pair(arm_name, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm_name, &case.case_id, abs_diff <= tol);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: arm_name.into(),
+                abs_diff,
+                pass: abs_diff <= tol,
+            });
         }
     }
 
@@ -312,6 +327,7 @@ fn diff_stats_linregress_extras() {
         test_id: "diff_stats_linregress_extras".into(),
         category: "scipy.stats.linregress (stderr + CI)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -336,4 +352,5 @@ fn diff_stats_linregress_extras() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

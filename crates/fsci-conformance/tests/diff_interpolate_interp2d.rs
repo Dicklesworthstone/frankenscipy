@@ -12,13 +12,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::interp2d;
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -251,30 +253,26 @@ fn diff_interpolate_interp2d() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_interp2d", &["interp2d"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        // A failed query point fails the whole case; a non-finite value reaches the ledger.
+        let actual: Option<Vec<f64>> = case
+            .queries
+            .iter()
+            .map(|&(xi, yi)| interp2d(&case.x, &case.y, &case.z, xi, yi).ok())
+            .collect();
+        let Some((expected, actual)) =
+            ledger.slices("interp2d", &case.case_id, expected, actual.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let mut actual = Vec::new();
-        let mut all_finite = true;
-        for &(xi, yi) in &case.queries {
-            match interp2d(&case.x, &case.y, &case.z, xi, yi) {
-                Ok(v) if v.is_finite() => actual.push(v),
-                _ => {
-                    all_finite = false;
-                    break;
-                }
-            }
-        }
-        if !all_finite {
-            continue;
-        }
-        let abs_d = vec_max_diff(&actual, expected);
+        let abs_d = vec_max_diff(actual, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("interp2d", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -289,6 +287,7 @@ fn diff_interpolate_interp2d() {
         category: "fsci_interpolate::interp2d vs scipy.interpolate.RegularGridInterpolator(linear)"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -309,4 +308,5 @@ fn diff_interpolate_interp2d() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

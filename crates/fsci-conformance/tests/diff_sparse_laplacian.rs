@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-k7110]. 1e-10 abs on flat matrix.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, laplacian};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -244,26 +246,17 @@ fn diff_sparse_laplacian() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_laplacian", &["laplacian"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.matrix.as_ref() else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let lap = match laplacian(&csr, case.normed) {
-            Ok(lap) => lap,
-            Err(err) => {
-                // SciPy returned a finite Laplacian; an fsci error is a divergence.
-                eprintln!("laplacian: fsci error on {}: {err:?}", case.case_id);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                continue;
-            }
-        };
+        let lap = laplacian(&csr, case.normed);
+        if let Err(err) = &lap {
+            // An fsci error where SciPy returned a finite Laplacian is a divergence; the
+            // ledger records it as an fsci failure.
+            eprintln!("laplacian: fsci error on {}: {err:?}", case.case_id);
+        }
         // `laplacian` returns canonical CSR (857ecbe9d), restored under
         // frankenscipy-laplacian-dense-regression-4lfu1, so this scatters the
         // CSR entries into the dense layout the oracle produces.
@@ -285,21 +278,30 @@ fn diff_sparse_laplacian() {
         // HEAD and is what 4lfu1 tracks. Do not "fix" a future compile break
         // here by adapting to whichever shape happens to be current — that is
         // what left the unit tests in fsci-sparse green across the same change.
-        let mut flat = vec![0.0; case.rows * case.cols];
-        for row in 0..case.rows {
-            for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
-                flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
+        let fsci_flat = lap.ok().map(|lap| {
+            let mut flat = vec![0.0; case.rows * case.cols];
+            for row in 0..case.rows {
+                for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
+                    flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
+                }
             }
-        }
-        let abs_d = if flat.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            flat.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+            flat
+        });
+        let Some((expected, flat)) = ledger.slices(
+            "laplacian",
+            &case.case_id,
+            scipy_arm.matrix.as_deref(),
+            fsci_flat.as_deref(),
+        ) else {
+            continue;
         };
+        let abs_d = flat
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("laplacian", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -313,6 +315,7 @@ fn diff_sparse_laplacian() {
         test_id: "diff_sparse_laplacian".into(),
         category: "scipy.sparse.csgraph.laplacian".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -342,4 +345,5 @@ fn diff_sparse_laplacian() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

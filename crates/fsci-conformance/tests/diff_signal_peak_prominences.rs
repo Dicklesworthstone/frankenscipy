@@ -5,13 +5,14 @@
 //! rbases). Bit-exact comparison on prominences (closed-form max-min)
 //! and bases (integer indices).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::peak_prominences;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_prom_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -227,35 +229,50 @@ fn diff_signal_peak_prominences() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_prom: f64 = 0.0;
+    let mut ledger = CompareLedger::new("diff_signal_peak_prominences", &["prominences", "bases"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_prom) = scipy_arm.prominences.as_ref() else {
-            continue;
-        };
-        let Some(scipy_lb) = scipy_arm.left_bases.as_ref() else {
-            continue;
-        };
-        let Some(scipy_rb) = scipy_arm.right_bases.as_ref() else {
-            continue;
-        };
         let (fsci_prom, fsci_lb, fsci_rb) = peak_prominences(&case.x, &case.peaks);
-        if fsci_prom.len() != scipy_prom.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                prom_diff: f64::INFINITY,
-                bases_match: false,
-                pass: false,
+        let prom_diff = ledger
+            .slices(
+                "prominences",
+                &case.case_id,
+                scipy_arm.prominences.as_deref(),
+                Some(fsci_prom.as_slice()),
+            )
+            .map(|(scipy_prom, fsci_prom)| {
+                fsci_prom
+                    .iter()
+                    .zip(scipy_prom.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             });
-            continue;
+        if let Some(d) = prom_diff {
+            ledger.compared("prominences", &case.case_id, d <= ABS_TOL);
         }
-        let prom_diff = fsci_prom
-            .iter()
-            .zip(scipy_prom.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let bases_match = fsci_lb.iter().zip(scipy_lb.iter()).all(|(a, b)| *a == *b)
-            && fsci_rb.iter().zip(scipy_rb.iter()).all(|(a, b)| *a == *b);
+        let bases_match = ledger
+            .both(
+                "bases",
+                &case.case_id,
+                scipy_arm
+                    .left_bases
+                    .as_ref()
+                    .zip(scipy_arm.right_bases.as_ref()),
+                Some((&fsci_lb, &fsci_rb)),
+            )
+            .map(|((scipy_lb, scipy_rb), (fsci_lb, fsci_rb))| {
+                fsci_lb.len() == scipy_lb.len()
+                    && fsci_rb.len() == scipy_rb.len()
+                    && fsci_lb.iter().zip(scipy_lb.iter()).all(|(a, b)| *a == *b)
+                    && fsci_rb.iter().zip(scipy_rb.iter()).all(|(a, b)| *a == *b)
+            });
+        if let Some(m) = bases_match {
+            ledger.compared("bases", &case.case_id, m);
+        }
+        let (Some(prom_diff), Some(bases_match)) = (prom_diff, bases_match) else {
+            continue; // the ledger recorded why this case was not compared
+        };
         max_prom = max_prom.max(prom_diff);
         let pass = prom_diff <= ABS_TOL && bases_match;
         diffs.push(CaseDiff {
@@ -272,6 +289,7 @@ fn diff_signal_peak_prominences() {
         test_id: "diff_signal_peak_prominences".into(),
         category: "scipy.signal.peak_prominences".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_prom_diff: max_prom,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -295,4 +313,5 @@ fn diff_signal_peak_prominences() {
         diffs.len(),
         max_prom
     );
+    ledger.finish(query.points.len());
 }

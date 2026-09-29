@@ -8,13 +8,14 @@
 //! Resolves [frankenscipy-z4an6]. find_peaks was previously covered
 //! only via e2e_signal scenarios; argrelextrema had no test at all.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{FindPeaksOptions, argrelextrema, find_peaks};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -215,18 +217,19 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse find_peaks oracle JSON"))
 }
 
-fn fsci_eval(func: &str, x: &[f64], order: usize) -> Vec<usize> {
+/// `None` when fsci refused the call (the ledger records it as an fsci failure).
+fn fsci_eval(func: &str, x: &[f64], order: usize) -> Option<Vec<usize>> {
     match func {
-        "find_peaks" => {
-            find_peaks(x, FindPeaksOptions::default())
-                .expect("default find_peaks options are valid")
-                .peaks
-        }
-        "argrelextrema_max" => argrelextrema(x, order, true),
-        "argrelextrema_min" => argrelextrema(x, order, false),
-        _ => Vec::new(),
+        "find_peaks" => find_peaks(x, FindPeaksOptions::default())
+            .ok()
+            .map(|r| r.peaks),
+        "argrelextrema_max" => Some(argrelextrema(x, order, true)),
+        "argrelextrema_min" => Some(argrelextrema(x, order, false)),
+        other => unreachable!("generate_query emits no func {other}"),
     }
 }
+
+const FUNCS: [&str; 3] = ["find_peaks", "argrelextrema_max", "argrelextrema_min"];
 
 #[test]
 fn diff_signal_find_peaks_argrelextrema() {
@@ -244,14 +247,21 @@ fn diff_signal_find_peaks_argrelextrema() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_find_peaks_argrelextrema", &FUNCS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_idx) = scipy_arm.indices.as_ref() else {
+        let fsci_idx = fsci_eval(&case.func, &case.x, case.order);
+        let Some((scipy_idx, fsci_idx)) = ledger.both(
+            &case.func,
+            &case.case_id,
+            scipy_arm.indices.as_ref(),
+            fsci_idx,
+        ) else {
             continue;
         };
-        let fsci_idx = fsci_eval(&case.func, &case.x, case.order);
         let pass = fsci_idx == *scipy_idx;
+        ledger.compared(&case.func, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -267,6 +277,7 @@ fn diff_signal_find_peaks_argrelextrema() {
         test_id: "diff_signal_find_peaks_argrelextrema".into(),
         category: "scipy.signal.find_peaks / argrelextrema".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -288,4 +299,6 @@ fn diff_signal_find_peaks_argrelextrema() {
         "scipy.signal find_peaks/argrelextrema conformance failed: {} cases",
         diffs.len()
     );
+    let per_func = |func: &str| query.points.iter().filter(|c| c.func == func).count();
+    ledger.finish(FUNCS.into_iter().map(per_func).min().unwrap_or(0));
 }

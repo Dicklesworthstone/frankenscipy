@@ -420,7 +420,7 @@
       "case_id": "savgol_filter_9pt_w5_p2",
       "passed": true,
       "message": "array match (9 elements)",
-      "max_diff": 1.7763568394002505e-14,
+      "max_diff": 1.4210854715202004e-14,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -434,7 +434,7 @@
       "case_id": "savgol_filter_9pt_w5_p2_nearest",
       "passed": true,
       "message": "array match (9 elements)",
-      "max_diff": 1.7763568394002505e-14,
+      "max_diff": 1.4210854715202004e-14,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -448,7 +448,7 @@
       "case_id": "savgol_filter_9pt_w5_p2_constant",
       "passed": true,
       "message": "array match (9 elements)",
-      "max_diff": 1.7763568394002505e-14,
+      "max_diff": 1.4210854715202004e-14,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -462,7 +462,7 @@
       "case_id": "savgol_filter_9pt_w5_p2_mirror",
       "passed": true,
       "message": "array match (9 elements)",
-      "max_diff": 1.7763568394002505e-14,
+      "max_diff": 1.4210854715202004e-14,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -476,7 +476,7 @@
       "case_id": "savgol_filter_9pt_w5_p2_wrap",
       "passed": true,
       "message": "array match (9 elements)",
-      "max_diff": 1.7763568394002505e-14,
+      "max_diff": 1.4210854715202004e-14,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -584,7 +584,7 @@
       "case_id": "butter_lowpass_order4",
       "passed": true,
       "message": "iir coeffs match",
-      "max_diff": 8.881784197001252e-16,
+      "max_diff": 1.3322676295501878e-15,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -654,7 +654,7 @@
       "case_id": "iir_cheby1_lowpass_order2",
       "passed": true,
       "message": "iir coeffs match",
-      "max_diff": 1.6653345369377348e-16,
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -724,7 +724,7 @@
       "case_id": "iir_cheby2_highpass_order3",
       "passed": true,
       "message": "iir coeffs match",
-      "max_diff": 3.3306690738754696e-16,
+      "max_diff": 2.7755575615628914e-16,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -766,7 +766,7 @@
       "case_id": "iir_ellip_lowpass_order2",
       "passed": true,
       "message": "iir coeffs match",
-      "max_diff": 3.3306690738754696e-16,
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -1078,7 +1078,7 @@
       "case_id": "firwin_lp_15_0p25_hann",
       "passed": true,
       "message": "array match (15 elements)",
-      "max_diff": 8.326672684688674e-17,
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-9,
@@ -1162,7 +1162,7 @@
       "case_id": "remez_lp_11_passband_0p2_stopband_0p3",
       "passed": true,
       "message": "array match (11 elements)",
-      "max_diff": 1.1102230246251565e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -1176,7 +1176,7 @@
       "case_id": "remez_bp_15_3band",
       "passed": true,
       "message": "array match (15 elements)",
-      "max_diff": 4.163336342344337e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -1312,7 +1312,7 @@
       "case_id": "bohman_window_7",
       "passed": true,
       "message": "array match (7 elements)",
-      "max_diff": 3.191891195797325e-16,
+      "max_diff": 3.3306690738754696e-16,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -1396,7 +1396,7 @@
       "case_id": "exponential_window_7_tau_2",
       "passed": true,
       "message": "array match (7 elements)",
-      "max_diff": 2.7755575615628914e-17,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -1494,7 +1494,7 @@
       "case_id": "dpss_window_8_nw_2_5_symmetric",
       "passed": true,
       "message": "array match (8 elements)",
-      "max_diff": 3.3306690738754696e-16,
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-9,
@@ -1519,6 +1519,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501921
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392932715
 }

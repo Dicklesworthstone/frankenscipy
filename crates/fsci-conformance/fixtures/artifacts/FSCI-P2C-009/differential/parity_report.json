@@ -403,7 +403,7 @@
       "case_id": "inconsistent_single_5pt_d2",
       "passed": true,
       "message": "matrix matched",
-      "max_diff": 4.440892098500626e-16,
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -629,7 +629,7 @@
       "case_id": "linkage_ward_5pts",
       "passed": true,
       "message": "linkage matched",
-      "max_diff": 2.220446049250313e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -699,7 +699,7 @@
       "case_id": "linkage_complete_6pt_2D",
       "passed": true,
       "message": "linkage matched",
-      "max_diff": 1.7763568394002505e-15,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -727,7 +727,7 @@
       "case_id": "linkage_centroid_6pt_2D",
       "passed": true,
       "message": "linkage matched",
-      "max_diff": 1.7763568394002505e-15,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -741,7 +741,7 @@
       "case_id": "linkage_median_6pt_2D",
       "passed": true,
       "message": "linkage matched",
-      "max_diff": 2.220446049250313e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -780,6 +780,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501935
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392932281
 }

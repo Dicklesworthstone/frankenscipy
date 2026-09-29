@@ -14,13 +14,14 @@
 //! subprocess. Tol 1e-12 abs (closed-form normalisation /
 //! linear-interpolation quantile chain).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{gzscore, scoreatpercentile, zscore};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -246,37 +248,33 @@ fn diff_stats_zscore_score() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let funcs = ["zscore", "gzscore", "scoreatpercentile"];
+    let mut ledger = CompareLedger::new("diff_stats_zscore_score", &funcs);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.values else {
-            continue;
-        };
         let rust_vec = match case.func.as_str() {
-            "zscore" => zscore(&case.data),
-            "gzscore" => gzscore(&case.data),
-            "scoreatpercentile" => match scoreatpercentile(&case.data, &case.per, None, None) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            _ => continue,
+            "zscore" => Some(zscore(&case.data)),
+            "gzscore" => Some(gzscore(&case.data)),
+            "scoreatpercentile" => scoreatpercentile(&case.data, &case.per, None, None).ok(),
+            other => panic!("unknown zscore_score func `{other}`"),
         };
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            rust_vec.as_deref(),
+        ) else {
             continue;
-        }
+        };
+        // `slices` rejects a non-finite fsci element against SciPy's finite one, so every
+        // element reaching this fold is compared (the old `r.is_finite()` guard dropped them).
         let mut max_local = 0.0_f64;
         for (r, s) in rust_vec.iter().zip(scipy_vec.iter()) {
-            if r.is_finite() {
-                max_local = max_local.max((r - s).abs());
-            }
+            max_local = max_local.max((r - s).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared(&case.func, &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -291,6 +289,7 @@ fn diff_stats_zscore_score() {
         test_id: "diff_stats_zscore_score".into(),
         category: "scipy.stats.{zscore, gzscore, scoreatpercentile}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -315,4 +314,10 @@ fn diff_stats_zscore_score() {
         diffs.len(),
         max_overall
     );
+    let min_per_func = funcs
+        .iter()
+        .map(|&func| query.points.iter().filter(|c| c.func == func).count())
+        .min()
+        .expect("zscore_score declares its functions");
+    ledger.finish(min_per_func);
 }

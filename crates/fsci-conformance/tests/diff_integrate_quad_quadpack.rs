@@ -16,13 +16,14 @@
 //! Not compared: a cos weight with `omega == 0` on `[a, ∞)`, where SciPy (as netlib QUADPACK
 //! `dqawfe`) integrates from 0 instead of `a` and fsci deliberately does not.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{
     QuadInfo, QuadOptions, QuadResult, QuadWeight, QuadWeightOptions, quad_full_output,
     quad_weighted_full_output,
@@ -220,6 +221,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     exact_structure_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -410,6 +412,7 @@ fn diff_integrate_quad_quadpack() {
     let options = QuadOptions::default();
     let missing: Row = (f64::NAN, f64::NAN, 0, 0, 0);
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_quad_quadpack", &["quad"]);
     for case in &cases {
         let arm = &arms[case.id];
         let fsci = fsci_row(case, options);
@@ -417,11 +420,19 @@ fn diff_integrate_quad_quadpack() {
             (Some(v), Some(e), Some(n), Some(l), Some(i)) => Some((v, e, n, l, i)),
             _ => None,
         };
-        let (pass, reason, fsci_row, scipy_row) = match (fsci, scipy) {
-            (Ok(f), Some(s)) => {
+        // The ledger records a missing SciPy row or an fsci error; the case is still logged as
+        // a failed diff below, as before.
+        let both = ledger.both("quad", case.id, scipy, fsci.as_ref().ok().copied());
+        let (pass, reason, fsci_row, scipy_row) = match (both, fsci) {
+            (Some((s, f)), _) => {
                 let mut problems = Vec::new();
                 if f.4 != s.4 {
                     problems.push(format!("ier {} vs {}", f.4, s.4));
+                }
+                // The abserr ratio below takes max/min, which drop a NaN: a NaN value or error
+                // estimate from fsci must match a NaN from SciPy.
+                if (f.0.is_nan() && !s.0.is_nan()) || (f.1.is_nan() && !s.1.is_nan()) {
+                    problems.push(format!("fsci value/abserr NaN: {f:?} vs {s:?}"));
                 }
                 if s.4 == 0 {
                     let request = options.epsabs.max(options.epsrel * s.0.abs());
@@ -439,15 +450,16 @@ fn diff_integrate_quad_quadpack() {
                 } else if !f.0.is_finite() && s.0.is_finite() {
                     problems.push("fsci value is not finite".to_string());
                 }
+                ledger.compared("quad", case.id, problems.is_empty());
                 (problems.is_empty(), problems.join("; "), f, s)
             }
-            (Err(e), s) => (
+            (None, Err(e)) => (
                 false,
                 format!("fsci error {e}"),
                 missing,
-                s.unwrap_or(missing),
+                scipy.unwrap_or(missing),
             ),
-            (Ok(f), None) => (false, "SciPy produced no result".to_string(), f, missing),
+            (None, Ok(f)) => (false, "SciPy produced no result".to_string(), f, missing),
         };
         let exact =
             pass && (fsci_row.2, fsci_row.3, fsci_row.4) == (scipy_row.2, scipy_row.3, scipy_row.4);
@@ -469,6 +481,7 @@ fn diff_integrate_quad_quadpack() {
             "scipy.integrate.quad full_output (QUADPACK qagse/qagie/qagpe/qawoe/qawfe/qawse/qawce)"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         exact_structure_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -494,4 +507,5 @@ fn diff_integrate_quad_quadpack() {
     );
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
     assert!(all_pass, "quad vs scipy.integrate.quad (QUADPACK) failed");
+    ledger.finish(cases.len());
 }

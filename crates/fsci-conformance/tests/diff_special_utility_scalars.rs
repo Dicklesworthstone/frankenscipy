@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-hn2dz]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{
     copysign, divmod, fix, kl_div, log_comb, nextafter, radian, rint, sinc_squared, spacing,
 };
@@ -20,6 +21,19 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op.
+const ARMS: [&str; 10] = [
+    "kl_div",
+    "sinc_squared",
+    "log_comb",
+    "copysign",
+    "nextafter",
+    "spacing",
+    "rint",
+    "fix",
+    "divmod",
+    "radian",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -64,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -352,31 +367,51 @@ fn diff_special_utility_scalars() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_utility_scalars", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
+        let arm = case.op.as_str();
+        let abs_d = if arm == "divmod" {
+            // Quotient and remainder go through the ledger together, so a NaN in either one
+            // cannot vanish in the max below.
+            let scipy_qr = scipy_arm
+                .value
+                .zip(scipy_arm.remainder)
+                .map(|(v, r)| [v, r]);
+            let (q, r) = divmod(case.a, case.b);
+            let fsci_qr = [q, r];
+            let Some((s, _)) = ledger.slices(
+                arm,
+                &case.case_id,
+                scipy_qr.as_ref().map(|a| &a[..]),
+                Some(&fsci_qr[..]),
+            ) else {
+                continue;
+            };
+            let (expected, rem_exp) = (s[0], s[1]);
+            (q - expected).abs().max((r - rem_exp).abs())
+        } else {
+            let fsci = match arm {
+                "kl_div" => kl_div(case.a, case.b),
+                "sinc_squared" => sinc_squared(case.a),
+                "log_comb" => log_comb(case.a, case.b),
+                "copysign" => copysign(case.a, case.b),
+                "nextafter" => nextafter(case.a, case.b),
+                "spacing" => spacing(case.a),
+                "rint" => rint(case.a),
+                "fix" => fix(case.a),
+                "radian" => radian(case.a, case.b, case.c),
+                other => panic!("unknown op {other} in {}", case.case_id),
+            };
+            let Some((expected, actual)) =
+                ledger.pair(arm, &case.case_id, scipy_arm.value, Some(fsci))
+            else {
+                continue;
+            };
+            (actual - expected).abs()
         };
-        let abs_d = match case.op.as_str() {
-            "kl_div" => (kl_div(case.a, case.b) - expected).abs(),
-            "sinc_squared" => (sinc_squared(case.a) - expected).abs(),
-            "log_comb" => (log_comb(case.a, case.b) - expected).abs(),
-            "copysign" => (copysign(case.a, case.b) - expected).abs(),
-            "nextafter" => (nextafter(case.a, case.b) - expected).abs(),
-            "spacing" => (spacing(case.a) - expected).abs(),
-            "rint" => (rint(case.a) - expected).abs(),
-            "fix" => (fix(case.a) - expected).abs(),
-            "divmod" => {
-                let Some(rem_exp) = scipy_arm.remainder else {
-                    continue;
-                };
-                let (q, r) = divmod(case.a, case.b);
-                (q - expected).abs().max((r - rem_exp).abs())
-            }
-            "radian" => (radian(case.a, case.b, case.c) - expected).abs(),
-            _ => continue,
-        };
+        ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -392,6 +427,7 @@ fn diff_special_utility_scalars() {
         test_id: "diff_special_utility_scalars".into(),
         category: "fsci_special utility scalars".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -412,4 +448,12 @@ fn diff_special_utility_scalars() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (nextafter/divmod/radian have the fewest); each must compare
+    // all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

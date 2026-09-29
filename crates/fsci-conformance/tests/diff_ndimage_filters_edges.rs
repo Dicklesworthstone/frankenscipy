@@ -5,19 +5,27 @@
 //! Resolves [frankenscipy-1igc9]. 1e-10 abs (exact integer arithmetic
 //! for sobel/prewitt/laplace; rational divisions for uniform_filter).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, laplace, median_filter, prewitt, sobel, uniform_filter};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 5] = [
+    "uniform_filter",
+    "median_filter",
+    "sobel",
+    "prewitt",
+    "laplace",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -63,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -280,39 +289,39 @@ fn diff_ndimage_filters_edges() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_filters_edges", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_out = mode_of(&case.mode)
+            .zip(NdArray::new(case.input.clone(), case.shape.clone()).ok())
+            .and_then(|(mode, input)| {
+                let fsci_result = match case.op.as_str() {
+                    "uniform_filter" => uniform_filter(&input, case.size, mode, case.cval),
+                    "median_filter" => median_filter(&input, case.size, mode, case.cval),
+                    "sobel" => sobel(&input, case.axis, mode, case.cval),
+                    "prewitt" => prewitt(&input, case.axis, mode, case.cval),
+                    "laplace" => laplace(&input, mode, case.cval),
+                    other => panic!("unknown filters_edges op `{other}`"),
+                };
+                fsci_result.ok()
+            })
+            .map(|out| out.data);
+        let Some((expected, out_data)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_out.as_deref(),
+        ) else {
             continue;
         };
-        let Some(mode) = mode_of(&case.mode) else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.input.clone(), case.shape.clone()) else {
-            continue;
-        };
-        let fsci_result = match case.op.as_str() {
-            "uniform_filter" => uniform_filter(&input, case.size, mode, case.cval),
-            "median_filter" => median_filter(&input, case.size, mode, case.cval),
-            "sobel" => sobel(&input, case.axis, mode, case.cval),
-            "prewitt" => prewitt(&input, case.axis, mode, case.cval),
-            "laplace" => laplace(&input, mode, case.cval),
-            _ => continue,
-        };
-        let Ok(out) = fsci_result else {
-            continue;
-        };
-        let abs_d = if out.data.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            out.data
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = out_data
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -327,6 +336,7 @@ fn diff_ndimage_filters_edges() {
         test_id: "diff_ndimage_filters_edges".into(),
         category: "scipy.ndimage uniform/median/sobel/prewitt/laplace".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +357,11 @@ fn diff_ndimage_filters_edges() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (laplace has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

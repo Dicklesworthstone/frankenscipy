@@ -9,13 +9,14 @@
 //!
 //! Tolerance: 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::airy;
 use fsci_special::types::SpecialTensor;
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -217,24 +219,20 @@ fn diff_special_airy_full() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_airy_full", &["Ai", "Aip", "Bi", "Bip"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(eai), Some(eaip), Some(ebi), Some(ebip)) = (arm.ai, arm.aip, arm.bi, arm.bip)
-        else {
-            continue;
-        };
-        let Some((ai, aip, bi, bip)) = fsci_eval(case.x) else {
-            continue;
-        };
-        for (op, actual, expected) in [
-            ("Ai", ai, eai),
-            ("Aip", aip, eaip),
-            ("Bi", bi, ebi),
-            ("Bip", bip, ebip),
+        let arm = pmap.get(&case.case_id);
+        let result = fsci_eval(case.x);
+        for (op, scipy, fsci) in [
+            ("Ai", arm.and_then(|a| a.ai), result.map(|r| r.0)),
+            ("Aip", arm.and_then(|a| a.aip), result.map(|r| r.1)),
+            ("Bi", arm.and_then(|a| a.bi), result.map(|r| r.2)),
+            ("Bip", arm.and_then(|a| a.bip), result.map(|r| r.3)),
         ] {
+            let Some((expected, actual)) = ledger.pair(op, &case.case_id, scipy, fsci) else {
+                continue;
+            };
             let abs_d = (actual - expected).abs();
             // Bi grows large for x > 0; relax to relative tol where mag > 1.
             let pass = if expected.abs() > 1.0 {
@@ -243,6 +241,7 @@ fn diff_special_airy_full() {
                 abs_d <= ABS_TOL
             };
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: format!("{}_{}", case.case_id, op),
                 op: op.into(),
@@ -258,6 +257,7 @@ fn diff_special_airy_full() {
         test_id: "diff_special_airy_full".into(),
         category: "fsci_special::airy (4-tuple) vs scipy.special.airy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -278,4 +278,5 @@ fn diff_special_airy_full() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

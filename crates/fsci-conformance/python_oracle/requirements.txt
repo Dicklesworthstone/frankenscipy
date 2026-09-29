@@ -5,3 +5,8 @@
 # (cache-dependency-path in .github/workflows/ci.yml).
 scipy==1.17.1
 numpy==2.4.3
+# Oracles for routines SciPy does not have: the csgraph centrality/clustering/summary diff tests
+# compare against networkx, and diff_special_agm uses mpmath when it is present. Without them
+# those oracles answer nothing, and a ledgered test fails with "SciPy gave no value".
+networkx==3.6.1
+mpmath==1.4.1

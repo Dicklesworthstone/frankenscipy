@@ -13,19 +13,23 @@
 //! subprocess. Each case compares the coefficient vector
 //! element-wise (max-abs aggregation). Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::ridge_regression;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// x2 = x1 + 0.1 beside the intercept column, with no regularisation: the normal equations are
+/// singular (cond 1.6e18) and numpy's reference raises (frankenscipy-cb36a).
+const SINGULAR_DESIGN_CASE: &str = "two_correlated_a0";
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -63,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -245,28 +250,37 @@ fn diff_stats_ridge_regression() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_ridge_regression", &["ridge_regression"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_coeffs) = &scipy_arm.coeffs else {
+        let rust_coeffs = ridge_regression(&case.x, &case.y, case.alpha);
+        if case.case_id == SINGULAR_DESIGN_CASE && scipy_arm.coeffs.is_none() {
+            ledger.allowlisted(
+                "ridge_regression",
+                &case.case_id,
+                "frankenscipy-cb36a",
+                "alpha=0 on a collinear design: numpy.linalg.solve raises Singular matrix, fsci \
+                 returns a rounding-chosen minimizer",
+            );
+            continue;
+        }
+        // slices rejects a length mismatch and any non-finite fsci coefficient,
+        // so every element that reaches the max below is finite on both sides.
+        let Some((scipy_coeffs, rust_coeffs)) = ledger.slices(
+            "ridge_regression",
+            &case.case_id,
+            scipy_arm.coeffs.as_deref(),
+            Some(rust_coeffs.as_slice()),
+        ) else {
             continue;
         };
-        let rust_coeffs = ridge_regression(&case.x, &case.y, case.alpha);
-        if rust_coeffs.len() != scipy_coeffs.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (a, b) in rust_coeffs.iter().zip(scipy_coeffs.iter()) {
-            if a.is_finite() {
-                max_local = max_local.max((a - b).abs());
-            }
+            max_local = max_local.max((a - b).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared("ridge_regression", &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: max_local,
@@ -280,6 +294,7 @@ fn diff_stats_ridge_regression() {
         test_id: "diff_stats_ridge_regression".into(),
         category: "ridge_regression (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -304,4 +319,6 @@ fn diff_stats_ridge_regression() {
         diffs.len(),
         max_overall
     );
+    // Every case but the allowlisted singular design compares.
+    ledger.finish(query.points.len() - 1);
 }

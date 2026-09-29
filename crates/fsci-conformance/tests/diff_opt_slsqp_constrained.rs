@@ -17,13 +17,14 @@
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case, not a
 //! skipped one (frankenscipy-olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
     Bound, Constraint, LinearConstraint, MinimizeOptions, NonlinearConstraint, OptimizeMethod,
     minimize,
@@ -257,6 +258,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     same_iteration_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -430,6 +432,7 @@ fn diff_opt_slsqp_constrained() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_opt_slsqp_constrained", &["slsqp"]);
     for case in &cases {
         let arm = &arms[case.id];
         let constraints = constraints_of(case.id, &linear, &nonlinear);
@@ -455,16 +458,23 @@ fn diff_opt_slsqp_constrained() {
             pass: false,
             reason: String::new(),
         };
-        match (fsci, arm.status) {
-            (Err(e), _) => diff.reason = format!("fsci error {e}"),
-            (Ok(_), None) => diff.reason = "SciPy produced no result".to_string(),
-            (Ok(r), Some(status)) => {
+        match ledger.both("slsqp", case.id, arm.status, fsci.as_ref().ok()) {
+            // Recorded by the ledger: SciPy produced nothing (oracle_missing) or fsci erred.
+            None => {
+                diff.reason = match &fsci {
+                    Err(e) => format!("fsci error {e}"),
+                    Ok(_) => "SciPy produced no result".to_string(),
+                };
+            }
+            Some((status, r)) => {
                 diff.fsci_x.clone_from(&r.x);
                 diff.fsci_fun = r.fun.unwrap_or(f64::NAN);
                 diff.fsci_message.clone_from(&r.message);
                 diff.fsci_nit = r.nit;
                 diff.maxcv = r.maxcv;
                 let mut problems = Vec::new();
+                // Set when `slices` below already recorded this case's single ledger outcome.
+                let mut recorded = false;
                 if r.message != diff.scipy_message {
                     problems.push(format!(
                         "exit '{}' vs SciPy '{}'",
@@ -475,14 +485,24 @@ fn diff_opt_slsqp_constrained() {
                     problems.push(format!("success {} vs SciPy status {status}", r.success));
                 }
                 if status == 0 {
-                    let dx =
-                        r.x.iter()
-                            .zip(&diff.scipy_x)
-                            .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-                            .fold(0.0, f64::max);
-                    // NaN in any measure fails the case.
-                    if r.x.len() != diff.scipy_x.len() || dx.is_nan() || dx > X_REL_TOL {
-                        problems.push(format!("x rel diff {dx:e}"));
+                    // `slices` rejects a length mismatch and a NaN in fsci's x, which the
+                    // `f64::max` fold below would otherwise drop.
+                    match ledger.slices("slsqp", case.id, arm.x.as_deref(), Some(r.x.as_slice())) {
+                        None => {
+                            recorded = true;
+                            problems
+                                .push(format!("x {:?} rejected against SciPy {:?}", r.x, arm.x));
+                        }
+                        Some((scipy_x, fsci_x)) => {
+                            let dx = fsci_x
+                                .iter()
+                                .zip(scipy_x)
+                                .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                                .fold(0.0, f64::max);
+                            if dx.is_nan() || dx > X_REL_TOL {
+                                problems.push(format!("x rel diff {dx:e}"));
+                            }
+                        }
                     }
                     let dfun =
                         (diff.fsci_fun - diff.scipy_fun).abs() / diff.scipy_fun.abs().max(1.0);
@@ -497,6 +517,9 @@ fn diff_opt_slsqp_constrained() {
                 }
                 diff.pass = problems.is_empty();
                 diff.reason = problems.join("; ");
+                if !recorded {
+                    ledger.compared("slsqp", case.id, diff.pass);
+                }
             }
         }
         diffs.push(diff);
@@ -511,6 +534,7 @@ fn diff_opt_slsqp_constrained() {
         test_id: "diff_opt_slsqp_constrained".into(),
         category: "scipy.optimize.minimize(method='SLSQP') with constraints and bounds".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         same_iteration_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -548,4 +572,5 @@ fn diff_opt_slsqp_constrained() {
         all_pass,
         "minimize(SLSQP) vs scipy.optimize.minimize(SLSQP) failed"
     );
+    ledger.finish(cases.len());
 }

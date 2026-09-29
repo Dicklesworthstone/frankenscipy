@@ -10,13 +10,14 @@
 //! 4 deltas × 9 x = 36 huber/pseudo_huber + 9 (x, y) = 81
 //! cases via subprocess. Tolerances: 1e-13 abs (closed-form).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{huber, kl_div, pseudo_huber};
@@ -25,6 +26,8 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-13;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 3] = ["huber", "pseudo_huber", "kl_div"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -63,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -106,7 +110,8 @@ fn fsci_eval(func: &str, a: f64, b: f64) -> Option<f64> {
         "kl_div" => kl_div(a, b),
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    // A non-finite value is returned as is: the ledger classifies it against SciPy's.
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -243,21 +248,28 @@ fn diff_special_robust_loss() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_robust_loss", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.a, case.b)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.a, case.b),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -266,6 +278,7 @@ fn diff_special_robust_loss() {
         test_id: "diff_special_robust_loss".into(),
         category: "scipy.special.huber/pseudo_huber/kl_div".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -290,4 +303,11 @@ fn diff_special_robust_loss() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (kl_div has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

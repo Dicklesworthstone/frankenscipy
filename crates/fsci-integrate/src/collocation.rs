@@ -625,7 +625,16 @@ pub(crate) fn solve(
 
         let col = collocation(prob, &y, &p, &x, &h)?;
         let bc_res = prob.bc(&y[..n], &y[(m - 1) * n..], &p)?;
-        let max_bc_res = bc_res.iter().fold(0.0_f64, |acc, r| acc.max(r.abs()));
+        // numpy's `np.max(abs(bc_res))`: one NaN residual makes it NaN, so `max_bc_res <= bc_tol`
+        // below is false, as in SciPy. `f64::max` drops a NaN, which read a NaN boundary residual
+        // as 0 and reported status 0 on an all-NaN solution.
+        let max_bc_res = bc_res.iter().fold(0.0_f64, |acc, r| {
+            if acc.is_nan() || r.is_nan() {
+                f64::NAN
+            } else {
+                acc.max(r.abs())
+            }
+        });
         let sol = Spline::new(&x, &y, &col.f, n);
         let rms = rms_residuals(prob, &sol, &x, &h, &p, &col)?;
 

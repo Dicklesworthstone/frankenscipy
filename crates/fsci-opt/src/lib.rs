@@ -84,13 +84,10 @@ pub use types::{
     RootOptions,
 };
 
-/// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OptimizeWarning(pub String);
-
-/// Error indicating solver failure to converge within iteration budget, matching `scipy.optimize.NoConvergence`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoConvergence(pub String);
+// SciPy's `OptimizeWarning` is `WarningCategory::OptimizeWarning` (raised by `curve_fit` when
+// the covariance cannot be estimated), and its `NoConvergence` exception is
+// `OptError::NoConvergence`.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
 /// Verbose display callback for linear programming, matching `scipy.optimize.linprog_verbose_callback`.
 pub fn linprog_verbose_callback(res: &OptimizeResult) {
@@ -103,12 +100,16 @@ pub fn linprog_verbose_callback(res: &OptimizeResult) {
 // option structs' rustdoc is the reference. A template-string stand-in used to be counted as
 // covered (frankenscipy-8dndw.1).
 
-/// Exit status for adaptive numerical differentiation.
+/// Exit status for adaptive numerical differentiation, `scipy.differentiate`'s `status`:
+/// `Converged` 0, `ErrorIncreased` −1, `MaxIterations` −2, `NonFiniteValue` −3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DifferentiateStatus {
     Converged,
     ErrorIncreased,
     MaxIterations,
+    /// A non-finite `x` or derivative estimate (a non-finite function value in the stencil);
+    /// `df` is NaN.
+    NonFiniteValue,
 }
 
 /// Direction of finite-difference steps for first derivatives.
@@ -3099,6 +3100,23 @@ impl gsa::Uniform for SimpleRng {
     }
 }
 
+/// The violation `cobyla` charges a constraint that evaluates to NaN: the maxcv SciPy's
+/// COBYLA reports for one.
+pub const COBYLA_NAN_VIOLATION: f64 = 1e30;
+
+/// The violation of `constraint >= 0` for a value `cv`, ignoring shortfalls within `slack`.
+/// NaN is `COBYLA_NAN_VIOLATION`: `(-cv).max(0.0)` would make it 0, so a constraint that
+/// had gone NaN read as satisfied and the final point was reported feasible.
+fn cobyla_violation(cv: f64, slack: f64) -> f64 {
+    if cv.is_nan() {
+        COBYLA_NAN_VIOLATION
+    } else if cv < -slack {
+        -cv
+    } else {
+        0.0
+    }
+}
+
 /// Derivative-free constrained minimization under SciPy's COBYLA name.
 ///
 /// Minimizes `func(x)` subject to `constraints[i](x) >= 0` for all i.
@@ -3108,7 +3126,8 @@ impl gsa::Uniform for SimpleRng {
 /// when no coordinate move improves it. It shares the signature of
 /// `scipy.optimize.fmin_cobyla` but not its iterates or results; a real COBYLA is
 /// tracked separately. `success` is true only when the step contracted below
-/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`).
+/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`); a
+/// constraint that evaluates to NaN counts as violated by `COBYLA_NAN_VIOLATION`.
 pub fn cobyla<F, G>(
     func: F,
     x0: &[f64],
@@ -3154,10 +3173,7 @@ where
         // Check constraints
         let mut max_violation = 0.0_f64;
         for constraint in constraints {
-            let cv = constraint(&x);
-            if cv < 0.0 {
-                max_violation = max_violation.max(-cv);
-            }
+            max_violation = max_violation.max(cobyla_violation(constraint(&x), 0.0));
         }
 
         // Try coordinate-wise descent with constraint penalty
@@ -3173,10 +3189,7 @@ where
                 // Check all constraints
                 let mut trial_violation = 0.0;
                 for constraint in constraints {
-                    let cv = constraint(&x_trial);
-                    if cv < -1e-10 {
-                        trial_violation += -cv;
-                    }
+                    trial_violation += cobyla_violation(constraint(&x_trial), 1e-10);
                 }
 
                 // Accept if: (feasible and better) or (less infeasible)
@@ -3207,7 +3220,7 @@ where
     // exhausted iteration budget.
     let maxcv = constraints
         .iter()
-        .map(|constraint| (-constraint(&x)).max(0.0))
+        .map(|constraint| cobyla_violation(constraint(&x), 0.0))
         .fold(0.0_f64, f64::max);
     let (success, status, message) = if maxcv > 1.0e-8 {
         (
@@ -3804,11 +3817,12 @@ where
     fmin_with_method(func, x0, OptimizeMethod::NewtonCg)
 }
 
-/// Minimize a function subject to inequality constraints using COBYLA.
+/// Minimize a function subject to inequality constraints `c(x) >= 0`.
 ///
-/// Matches `scipy.optimize.fmin_cobyla(func, x0, cons, rhobeg, maxfun)`: each
-/// constraint `c(x) >= 0` must hold at the solution. Returns the minimiser
-/// `xopt` (scipy's output). Use [`cobyla`] for the full result.
+/// Takes the arguments of `scipy.optimize.fmin_cobyla(func, x0, cons, rhobeg, maxfun)` and
+/// returns the minimiser `xopt`, but the search is [`cobyla`]'s coordinate compass search on
+/// a penalty, not Powell's COBYLA, so iterates and results differ from SciPy's. Use
+/// [`cobyla`] for the full result.
 pub fn fmin_cobyla<F, G>(
     func: F,
     x0: &[f64],
@@ -3893,8 +3907,11 @@ where
     Ok(f0)
 }
 
+/// Every component within `NONLIN_FTOL`. A NaN component is not: the max-norm fold this
+/// replaced let `f64::max` drop the NaN, so a residual gone NaN (x^2 + 1 = 0 from
+/// linearmixing) was returned as a root where SciPy raises NoConvergence.
 fn nonlin_converged(fx: &[f64]) -> bool {
-    fx.iter().fold(0.0_f64, |m, &v| m.max(v.abs())) < NONLIN_FTOL
+    fx.iter().all(|v| v.abs() < NONLIN_FTOL)
 }
 
 fn validate_nonlin_maxiter(maxiter: usize) -> Result<(), OptError> {
@@ -3974,7 +3991,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("diagbroyden failed to converge in {maxiter} iterations"),
     })
 }
@@ -3985,8 +4002,8 @@ where
 /// The Jacobian is fixed at `-1/alpha`, so the step is `dx = alpha·F(x)`,
 /// globalized by an Armijo line search. As scipy warns, convergence depends
 /// strongly on a well-chosen (often negative) `alpha`; when `alpha` is `None`
-/// it is auto-scaled like scipy's. Returns the converged root or
-/// `EvaluationBudgetExceeded`.
+/// it is auto-scaled like scipy's. Returns the converged root or, where SciPy
+/// raises `NoConvergence`, [`OptError::NoConvergence`].
 pub fn linearmixing<F>(
     func: F,
     x0: &[f64],
@@ -4014,7 +4031,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("linearmixing failed to converge in {maxiter} iterations"),
     })
 }
@@ -4074,7 +4091,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("excitingmixing failed to converge in {maxiter} iterations"),
     })
 }
@@ -4930,6 +4947,27 @@ fn dense_spd_solve(m: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
     Some((0..n).map(|i| aug[i][n] / aug[i][i]).collect())
 }
 
+/// Power of two that `lsq_linear` scales `A` and `b` by before forming `AᵀA` and `Aᵀb`.
+///
+/// `AᵀA` squares A's magnitude, so entries past ~1e154 overflow it and entries below ~1e-154
+/// underflow it although the least-squares problem is well posed: A = [[1e160], [-1e160]],
+/// b = [1e160, 0] gave x = [NaN] unbounded and [0] on [0, 1], where SciPy 1.17.1 (lstsq on A,
+/// never AᵀA) returns 0.5 (frankenscipy-vfs3g). Scaling A and b by the same power of two is exact
+/// and leaves the minimiser and the bounds unchanged, so bring max|A| near 1 whenever it lies
+/// outside [2^-500, 2^500]; inside that range the factor is 1 and nothing changes.
+fn lsq_gram_scale(a: &[Vec<f64>]) -> f64 {
+    let safe = 2.0_f64.powi(500);
+    let a_max = a
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if a_max > safe || (a_max > 0.0 && a_max < safe.recip()) {
+        2.0_f64.powi(-(a_max.log2().round() as i32).clamp(-1000, 1000))
+    } else {
+        1.0
+    }
+}
+
 /// Solve the bound-constrained linear least-squares problem
 /// `min ‖A·x − b‖²` subject to `lb ≤ x ≤ ub`, matching
 /// `scipy.optimize.lsq_linear(A, b, bounds=(lb, ub), method='bvls')`.
@@ -4981,12 +5019,18 @@ pub fn lsq_linear(a: &[Vec<f64>], b: &[f64], lb: &[f64], ub: &[f64]) -> Result<V
     // (a cache miss per element, O(n²·m) of them — the dominant cost for this routine). ~1e-13
     // reassociation only; lsq_linear's bounded LS has a unique minimizer (full column rank), so
     // the optimum is unchanged (the Gram only feeds the subproblem solves and the KKT gradient).
-    let a_flat: Vec<f64> = a.iter().flat_map(|row| row.iter().copied()).collect();
+    // A and b enter scaled by `lsq_gram_scale(a)`, which is exactly 1 unless |A| would overflow
+    // or underflow AᵀA.
+    let scale = lsq_gram_scale(a);
+    let a_flat: Vec<f64> = a
+        .iter()
+        .flat_map(|row| row.iter().map(move |&value| value * scale))
+        .collect();
     let mut gram = vec![0.0_f64; n * n]; // contiguous row-major (full symmetric); feeds nnls_chol_*
     let mut atb = vec![0.0_f64; n];
     for i in 0..m {
         let ai = &a_flat[i * n..i * n + n];
-        let bi = b[i];
+        let bi = b[i] * scale;
         for j1 in 0..n {
             let v1 = ai[j1];
             let grow = &mut gram[j1 * n..j1 * n + n];
@@ -5624,6 +5668,9 @@ where
         // closure `Fn` (adaptive_first_derivative wants `Fn`); the cell is thread-local.
         let scratch = std::cell::RefCell::new(x.to_vec());
         let base = x[column];
+        // A changed output length is an invalid `f`, not a non-finite value: it fails the
+        // whole Jacobian rather than ending this partial with status NonFiniteValue.
+        let reshaped = std::cell::Cell::new(false);
         let component = |value: f64| {
             let mut shifted = scratch.borrow_mut();
             shifted[column] = value;
@@ -5632,10 +5679,17 @@ where
             if values.len() == rows {
                 values[row]
             } else {
+                reshaped.set(true);
                 f64::NAN
             }
         };
-        adaptive_first_derivative(&component, x[column], options)
+        let partial = adaptive_first_derivative(&component, x[column], options)?;
+        if reshaped.get() {
+            return Err(OptError::NonFiniteInput {
+                detail: format!("f(x) changed its output length from {rows}"),
+            });
+        }
+        Ok(partial)
     };
 
     let nthreads = if pairs.len() < 16 {
@@ -5860,19 +5914,6 @@ fn step_at_iteration(initial_step: f64, step_factor: f64, iteration: usize) -> f
     initial_step / step_factor.powf(iteration as f64)
 }
 
-fn extrapolation_levels(
-    order: usize,
-    direction: StepDirection,
-    iteration: usize,
-    previous_levels: usize,
-) -> usize {
-    let maximum = match direction {
-        StepDirection::Central => (order / 2).max(1),
-        StepDirection::Forward | StepDirection::Backward => order.max(1),
-    };
-    maximum.min(iteration + 1).min(previous_levels + 1)
-}
-
 fn richardson_estimate(
     base: f64,
     previous_tableau: &[f64],
@@ -5890,20 +5931,6 @@ fn richardson_estimate(
         next_tableau.push(current);
     }
     (current, next_tableau)
-}
-
-fn evaluate_finite_scalar<F>(f: &F, x: f64, context: &str) -> Result<f64, OptError>
-where
-    F: Fn(f64) -> f64,
-{
-    let value = f(x);
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(OptError::NonFiniteInput {
-            detail: format!("{context} returned a non-finite value"),
-        })
-    }
 }
 
 fn evaluate_finite_vector_scalar<F>(f: &F, x: &[f64], context: &str) -> Result<f64, OptError>
@@ -5928,110 +5955,108 @@ fn adaptive_first_derivative<F>(
 where
     F: Fn(f64) -> f64,
 {
-    if !x.is_finite() {
-        return Err(OptError::NonFiniteInput {
-            detail: String::from("x must be finite"),
-        });
-    }
+    // SciPy 1.17.1's `scipy.differentiate.derivative` for one element (frankenscipy-3vcjx):
+    // a fixed-order stencil (`_derivative_weights`) over steps h, h/c, …, h/c^(n−1) (central)
+    // or h, h/√c, … (one-sided), the step divided by c each iteration so that two new
+    // abscissae reuse every stored value, `error = |df − df_last|`, and SciPy's termination
+    // order. The step is absolute (`initial_step`, not scaled by |x|), and a non-finite value
+    // is a status (−3), not an error. The previous Richardson scheme scaled the step by
+    // 1 + |x| and refused any non-finite evaluation, so log at x = 1 (x − h = 0) failed.
     let order = validate_differentiate_options(options)?;
-    let initial_step = component_step(options.initial_step, x);
-    let error_power = match options.step_direction {
-        StepDirection::Central => 2,
-        StepDirection::Forward | StepDirection::Backward => 1,
-    };
-    let mut nfev = 0;
-    let f0 = match options.step_direction {
-        StepDirection::Central => None,
-        StepDirection::Forward | StepDirection::Backward => {
-            nfev += 1;
-            Some(evaluate_finite_scalar(f, x, "f(x)")?)
-        }
-    };
-    let mut previous_estimate = None;
-    let mut previous_tableau = Vec::new();
-    let mut best_df = f64::NAN;
-    let mut best_error = f64::INFINITY;
-    let mut best_nit = 0;
-    let mut best_step = initial_step;
+    let n = order / 2;
+    let fac = options.step_factor;
+    let (central_weights, right_weights) = derivative_weights(n, fac);
+    let root = fac.sqrt();
+    let shrink = fac.powf((n - 1) as f64);
+    let direction = options.step_direction;
+    let tolerances = options.tolerances;
 
+    // f(x) is evaluated for every direction, as SciPy's initialisation does: it is the
+    // one-sided stencils' first point and the central stencil's zero-weighted middle, and a
+    // non-finite f(x) makes the estimate NaN through that zero weight as in SciPy.
+    let mut stored = vec![f(x)];
+    let mut nfev = 1;
+    let mut h = options.initial_step;
+    let mut df = f64::NAN;
+    let mut error = f64::NAN;
+    let mut step = h;
     for iteration in 0..options.maxiter {
-        let step = step_at_iteration(initial_step, options.step_factor, iteration);
-        let base = match options.step_direction {
-            StepDirection::Central => {
-                let plus = evaluate_finite_scalar(f, x + step, "f(x + h)")?;
-                let minus = evaluate_finite_scalar(f, x - step, "f(x - h)")?;
-                nfev += 2;
-                (plus - minus) / (2.0 * step)
+        let first = iteration == 0;
+        let offsets: Vec<f64> = match (direction, first) {
+            (StepDirection::Central, true) => {
+                let steps: Vec<f64> = (0..n).map(|k| h / fac.powf(k as f64)).collect();
+                steps
+                    .iter()
+                    .rev()
+                    .map(|&v| -v)
+                    .chain(steps.iter().copied())
+                    .collect()
             }
-            StepDirection::Forward => {
-                let plus = evaluate_finite_scalar(f, x + step, "f(x + h)")?;
-                nfev += 1;
-                let f_at_x = f0.ok_or_else(|| OptError::InvalidArgument {
-                    detail: String::from("one-sided derivative missing base evaluation"),
-                })?;
-                (plus - f_at_x) / step
-            }
-            StepDirection::Backward => {
-                let minus = evaluate_finite_scalar(f, x - step, "f(x - h)")?;
-                nfev += 1;
-                let f_at_x = f0.ok_or_else(|| OptError::InvalidArgument {
-                    detail: String::from("one-sided derivative missing base evaluation"),
-                })?;
-                (f_at_x - minus) / step
+            (StepDirection::Central, false) => vec![-h / shrink, h / shrink],
+            (_, true) => (0..2 * n).map(|k| h / root.powf(k as f64)).collect(),
+            (_, false) => vec![h / shrink, h / root / shrink],
+        };
+        let values: Vec<f64> = offsets
+            .iter()
+            .map(|&offset| match direction {
+                StepDirection::Backward => f(x - offset),
+                StepDirection::Central | StepDirection::Forward => f(x + offset),
+            })
+            .collect();
+        nfev += values.len();
+
+        let estimate = if direction == StepDirection::Central {
+            // The stored values stay in abscissa order: the new outermost-small pair wraps
+            // them. From the second iteration SciPy's middle slot is `work_fc[n]`, which is
+            // f(x − h) rather than f(x); its weight is 0 either way, but a non-finite value
+            // there still makes the estimate NaN, as it does in SciPy.
+            let fresh = if first { n } else { 1 };
+            let mut wrapped = Vec::with_capacity(stored.len() + 2 * fresh);
+            wrapped.extend_from_slice(&values[..fresh]);
+            wrapped.extend_from_slice(&stored);
+            wrapped.extend_from_slice(&values[values.len() - fresh..]);
+            stored = wrapped;
+            let last = stored.len();
+            let stencil: Vec<f64> = if first {
+                stored.clone()
+            } else {
+                stored[..=n]
+                    .iter()
+                    .chain(&stored[last - n..])
+                    .copied()
+                    .collect()
+            };
+            dot_product(&stencil, &central_weights) / h
+        } else {
+            stored.extend_from_slice(&values);
+            let last = stored.len();
+            let stencil: Vec<f64> = if first {
+                stored.clone()
+            } else {
+                std::iter::once(stored[0])
+                    .chain(stored[last - 2 * n..].iter().copied())
+                    .collect()
+            };
+            let one_sided = dot_product(&stencil, &right_weights) / h;
+            if direction == StepDirection::Backward {
+                -one_sided
+            } else {
+                one_sided
             }
         };
-        if !base.is_finite() {
-            return Err(OptError::NonFiniteInput {
-                detail: String::from("finite-difference estimate became non-finite"),
-            });
-        }
-
-        let levels = extrapolation_levels(
-            order,
-            options.step_direction,
-            iteration,
-            previous_tableau.len(),
-        );
-        let (estimate, next_tableau) = richardson_estimate(
-            base,
-            &previous_tableau,
-            levels,
-            options.step_factor,
-            error_power,
-        );
-        if !estimate.is_finite() {
-            return Err(OptError::NonFiniteInput {
-                detail: String::from("Richardson estimate became non-finite"),
-            });
-        }
-
-        let error =
-            previous_estimate.map_or(f64::INFINITY, |previous: f64| (estimate - previous).abs());
+        let df_last = df;
+        df = estimate;
+        step = h;
+        h /= fac;
+        let error_last = error;
+        error = (df - df_last).abs();
         let nit = iteration + 1;
-        if iteration == 0 || error < best_error {
-            best_df = estimate;
-            best_error = error;
-            best_nit = nit;
-            best_step = step;
-        } else if error.is_finite() && best_error.is_finite() && error > best_error {
-            return Ok(DerivativeResult {
-                df: best_df,
-                error: best_error,
-                success: false,
-                status: DifferentiateStatus::ErrorIncreased,
-                nit,
-                nfev,
-                step: best_step,
-            });
-        }
 
-        if error.is_finite()
-            && error <= options.tolerances.atol + options.tolerances.rtol * estimate.abs()
-        {
+        if error < tolerances.atol + tolerances.rtol * df.abs() {
             return Ok(DerivativeResult {
-                df: estimate,
+                df,
                 error,
-                // status: finite successive-estimate error ≤ atol + rtol·|estimate|
+                // status: SciPy's convergence test, error < atol + rtol·|df|
                 success: true,
                 status: DifferentiateStatus::Converged,
                 nit,
@@ -6039,19 +6064,125 @@ where
                 step,
             });
         }
-        previous_estimate = Some(estimate);
-        previous_tableau = next_tableau;
+        if !(x.is_finite() && df.is_finite()) {
+            return Ok(DerivativeResult {
+                df: f64::NAN,
+                error,
+                success: false,
+                status: DifferentiateStatus::NonFiniteValue,
+                nit,
+                nfev,
+                step,
+            });
+        }
+        if error > error_last * 10.0 {
+            return Ok(DerivativeResult {
+                df,
+                error,
+                success: false,
+                status: DifferentiateStatus::ErrorIncreased,
+                nit,
+                nfev,
+                step,
+            });
+        }
     }
 
     Ok(DerivativeResult {
-        df: best_df,
-        error: best_error,
+        df,
+        error,
         success: false,
         status: DifferentiateStatus::MaxIterations,
-        nit: best_nit,
+        nit: options.maxiter,
         nfev,
-        step: best_step,
+        step,
     })
+}
+
+/// `scipy.differentiate`'s `_derivative_weights` (frankenscipy-3vcjx): central weights over
+/// the step multiples `sign(i)/c^(|i|−1)` for `i = −n..=n`, with the middle weight set to 0 and
+/// the rest made exactly antisymmetric as SciPy enforces, and right one-sided weights over
+/// `0, 1, 1/√c, …, 1/√c^(2n−1)`.
+fn derivative_weights(n: usize, fac: f64) -> (Vec<f64>, Vec<f64>) {
+    let m = 2 * n + 1;
+    let central: Vec<f64> = (0..m)
+        .map(|j| {
+            let i = j as f64 - n as f64;
+            if i == 0.0 {
+                0.0
+            } else {
+                i.signum() / fac.powf(i.abs() - 1.0)
+            }
+        })
+        .collect();
+    let mut central_weights = first_derivative_weights(&central);
+    central_weights[n] = 0.0;
+    for k in 0..n {
+        central_weights[m - 1 - k] = -central_weights[k];
+    }
+    let root = fac.sqrt();
+    let right: Vec<f64> = (0..m)
+        .map(|j| {
+            if j == 0 {
+                0.0
+            } else {
+                1.0 / root.powf(j as f64 - 1.0)
+            }
+        })
+        .collect();
+    (central_weights, first_derivative_weights(&right))
+}
+
+/// Weights `w` with `Σ_j w_j·t_j^k = [k == 1]` for `k = 0..m−1` over the `m` nodes `t`: SciPy's
+/// `np.linalg.solve(np.vander(t, increasing=True).T, e_1)`, here by Gaussian elimination with
+/// partial pivoting (LAPACK `gesv`'s algorithm). The nodes are distinct, so the system is
+/// nonsingular.
+fn first_derivative_weights(nodes: &[f64]) -> Vec<f64> {
+    let m = nodes.len();
+    // Row k holds t_j^k, built by repeated multiplication as `np.vander` does.
+    let mut a = vec![vec![0.0; m]; m];
+    for (j, &t) in nodes.iter().enumerate() {
+        let mut power = 1.0;
+        for row in &mut a {
+            row[j] = power;
+            power *= t;
+        }
+    }
+    let mut b = vec![0.0; m];
+    if m > 1 {
+        b[1] = 1.0;
+    }
+    for col in 0..m {
+        let pivot = (col..m).fold(col, |best, row| {
+            if a[row][col].abs() > a[best][col].abs() {
+                row
+            } else {
+                best
+            }
+        });
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let inverse = 1.0 / a[col][col];
+        for row in col + 1..m {
+            let factor = a[row][col] * inverse;
+            if factor != 0.0 {
+                for k in col..m {
+                    a[row][k] -= factor * a[col][k];
+                }
+                b[row] -= factor * b[col];
+            }
+        }
+    }
+    let mut w = vec![0.0; m];
+    for col in (0..m).rev() {
+        let tail: f64 = (col + 1..m).map(|k| a[col][k] * w[k]).sum();
+        w[col] = (b[col] - tail) / a[col][col];
+    }
+    w
+}
+
+fn dot_product(values: &[f64], weights: &[f64]) -> f64 {
+    values.iter().zip(weights).map(|(v, w)| v * w).sum()
 }
 
 fn adaptive_hessian_component<F>(
@@ -6196,6 +6327,9 @@ fn merge_differentiate_status(
     right: DifferentiateStatus,
 ) -> DifferentiateStatus {
     match (left, right) {
+        (DifferentiateStatus::NonFiniteValue, _) | (_, DifferentiateStatus::NonFiniteValue) => {
+            DifferentiateStatus::NonFiniteValue
+        }
         (DifferentiateStatus::ErrorIncreased, _) | (_, DifferentiateStatus::ErrorIncreased) => {
             DifferentiateStatus::ErrorIncreased
         }
@@ -6677,6 +6811,51 @@ mod tests {
         assert!(matches!(err, crate::OptError::InvalidBounds { .. }));
     }
 
+    /// frankenscipy-vfs3g: `lsq_linear` formed AᵀA from A as given, so A = [[1e160], [-1e160]]
+    /// overflowed it and x came back [NaN] unbounded and [0] on [0, 1]. SciPy 1.17.1 (bvls and
+    /// trf, both through lstsq on A), b = [1e160, 0]: x = 0.5 (status 3) unbounded and on [0, 1];
+    /// bvls x = 0.2 on (-inf, 0.2]. The mirror A = [[1e-170], [-1e-170]], b = [1e-170, 0]
+    /// underflowed AᵀA to 0 (x = [0]); SciPy: 0.49999999999999994. Two columns,
+    /// A = [[1e160, 0], [-1e160, 1e160], [0, 2e160]], b = [1e160, 0, 3e160]: SciPy
+    /// [1.2222222222222225, 1.4444444444444449] unbounded, bvls [0.3, 1.0] on [0, 0.3]×[0, 1].
+    #[test]
+    fn lsq_linear_scales_an_overflowing_gram_like_scipy() -> Result<(), crate::OptError> {
+        use crate::lsq_linear;
+        let inf = f64::INFINITY;
+        let close = |got: &[f64], want: &[f64]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 1e-15)
+        };
+        let huge = [vec![1.0e160], vec![-1.0e160]];
+        for (lb, ub, want) in [(-inf, inf, 0.5), (0.0, 1.0, 0.5), (-inf, 0.2, 0.2)] {
+            let x = lsq_linear(&huge, &[1.0e160, 0.0], &[lb], &[ub])?;
+            assert!(
+                close(&x, &[want]),
+                "bounds [{lb}, {ub}]: {x:?}, SciPy {want}"
+            );
+        }
+        let tiny = [vec![1.0e-170], vec![-1.0e-170]];
+        let x = lsq_linear(&tiny, &[1.0e-170, 0.0], &[0.0], &[1.0])?;
+        assert!(close(&x, &[0.49999999999999994]), "{x:?}");
+        let two = [
+            vec![1.0e160, 0.0],
+            vec![-1.0e160, 1.0e160],
+            vec![0.0, 2.0e160],
+        ];
+        let b2 = [1.0e160, 0.0, 3.0e160];
+        let x = lsq_linear(&two, &b2, &[-inf, -inf], &[inf, inf])?;
+        assert!(
+            close(&x, &[1.2222222222222225, 1.4444444444444449]),
+            "{x:?}"
+        );
+        let x = lsq_linear(&two, &b2, &[0.0, 0.0], &[0.3, 1.0])?;
+        assert!(close(&x, &[0.3, 1.0]), "{x:?}");
+
+        // Must not change: at unit scale A enters as given (SciPy 0.4999999999999998).
+        let x = lsq_linear(&[vec![1.0], vec![-1.0]], &[1.0, 0.0], &[-inf], &[inf])?;
+        assert!(close(&x, &[0.4999999999999998]), "{x:?}");
+        Ok(())
+    }
+
     #[test]
     fn nonlinear_mixing_solvers_find_root() {
         use crate::{diagbroyden, linearmixing};
@@ -6709,6 +6888,19 @@ mod tests {
         assert!(linearmixing(f, &[0.0, 0.0], None, 0).is_err());
         assert!(linearmixing(f, &[0.0, 0.0], Some(0.0), 10).is_err());
         assert!(linearmixing(f, &[0.0, 0.0], Some(f64::INFINITY), 10).is_err());
+
+        // Running out of iterations is SciPy's NoConvergence, not an evaluation-budget error.
+        let no_root = |x: &[f64]| vec![x[0] * x[0] + 1.0];
+        for outcome in [
+            diagbroyden(no_root, &[1.0], None, 5),
+            linearmixing(no_root, &[1.0], None, 5),
+            crate::excitingmixing(no_root, &[1.0], None, 1.0, 5),
+        ] {
+            assert!(
+                matches!(outcome, Err(OptError::NoConvergence { .. })),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -6999,6 +7191,10 @@ mod tests {
         assert!(result.error.is_finite());
     }
 
+    /// d/dx x² at 0 with forward steps. scipy 1.17.1 `derivative(lambda t: t*t, 0.0,
+    /// step_direction=1)` gives df 4.119968255444917e-18, status −2 (maxiter), success False,
+    /// nit 10, nfev 27: with df ≈ 0 the default atol (the smallest normal) never admits
+    /// convergence. (This test used to assert success, which SciPy does not report here.)
     #[test]
     fn differentiate_derivative_supports_one_sided_steps() {
         let options = crate::DifferentiateOptions {
@@ -7006,7 +7202,9 @@ mod tests {
             ..crate::DifferentiateOptions::default()
         };
         let result = derivative(|x| x * x, 0.0, options).expect("forward derivative");
-        assert!(result.success, "status: {:?}", result.status);
+        assert_eq!(result.status, crate::DifferentiateStatus::MaxIterations);
+        assert!(!result.success);
+        assert_eq!((result.nit, result.nfev), (10, 27));
         assert!(result.df.abs() < 1.0e-8, "df = {}", result.df);
     }
 
@@ -7074,11 +7272,25 @@ mod tests {
         }
     }
 
+    /// A non-finite x or function value is SciPy's status −3, not an error: scipy 1.17.1
+    /// `derivative(lambda t: t, nan)` and `derivative(np.log, 0.5)` (x − h = 0) both give
+    /// df nan, status −3, success False, nit 1, nfev 9. (This test used to expect Err.)
     #[test]
-    fn differentiate_rejects_non_finite_inputs() {
-        let error = derivative(|x| x, f64::NAN, crate::DifferentiateOptions::default())
-            .expect_err("NaN x should fail");
-        assert!(matches!(error, crate::OptError::NonFiniteInput { .. }));
+    fn differentiate_reports_non_finite_values_like_scipy() {
+        for (label, x, f) in [
+            ("identity at NaN", f64::NAN, (|t: f64| t) as fn(f64) -> f64),
+            ("log at 0.5", 0.5, f64::ln),
+        ] {
+            let result = derivative(f, x, crate::DifferentiateOptions::default())
+                .expect("a non-finite value is a status, not an error");
+            assert_eq!(
+                result.status,
+                crate::DifferentiateStatus::NonFiniteValue,
+                "{label}"
+            );
+            assert!(!result.success && result.df.is_nan(), "{label}: {result:?}");
+            assert_eq!((result.nit, result.nfev), (1, 9), "{label}");
+        }
     }
 
     #[test]
@@ -8653,6 +8865,23 @@ mod tests {
     // ── COBYLA tests ─────────────────────────────────────────────────
 
     #[test]
+    fn cobyla_counts_a_nan_constraint_as_violated() {
+        // SciPy: minimize(f, [0, 0], method="COBYLA", constraints=[{"type": "ineq",
+        // "fun": lambda x: nan}]) reports success=False with maxcv 1e30. Here the NaN used to
+        // clamp to a violation of 0 and the result read as a feasible success.
+        let f = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2);
+        let nan_constraint = [|_: &[f64]| f64::NAN];
+        let result = cobyla(f, &[0.0, 0.0], &nan_constraint, 500, 0.5).expect("cobyla");
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.status, ConvergenceStatus::Infeasible);
+        assert!(result.message.contains("1.000e30"), "{}", result.message);
+        // The same problem with a satisfiable constraint still succeeds.
+        let x_below_2 = [|x: &[f64]| 2.0 - x[0]];
+        let ok = cobyla(f, &[0.0, 0.0], &x_below_2, 5000, 0.5).expect("cobyla");
+        assert!(ok.success, "{ok:?}");
+    }
+
+    #[test]
     fn cobyla_unconstrained_quadratic() {
         // Minimize x² + y² → (0, 0)
         let result = cobyla(
@@ -9467,6 +9696,138 @@ mod tests {
             "derivative got {}, expected 2.0",
             result.df
         );
+    }
+
+    /// frankenscipy-3vcjx: `derivative` follows scipy.differentiate.derivative's iteration
+    /// (stencil, absolute initial step, step division, termination order, status codes).
+    /// Values from scipy 1.17.1, live (scratchpad deriv/pins.py and find_status.py; a float64
+    /// transliteration matched SciPy bit for bit on 168 cases, deriv/translit.py). Before, fsci
+    /// scaled the step by 1 + |x| and refused any non-finite evaluation, so log at x = 1 and
+    /// sqrt at x = 0.5 returned Err.
+    #[test]
+    fn derivative_follows_scipy_iteration() {
+        use crate::{DifferentiateStatus, StepDirection};
+        struct Row {
+            label: &'static str,
+            f: fn(f64) -> f64,
+            x: f64,
+            options: DifferentiateOptions,
+            df: f64,
+            df_rtol: f64,
+            status: DifferentiateStatus,
+            nit: usize,
+            nfev: usize,
+        }
+        let defaults = DifferentiateOptions::default();
+        let rows = [
+            Row {
+                label: "log at 1",
+                f: f64::ln,
+                x: 1.0,
+                options: defaults,
+                df: 0.999_999_999_998_354_8,
+                df_rtol: 1e-13,
+                status: DifferentiateStatus::Converged,
+                nit: 3,
+                nfev: 13,
+            },
+            Row {
+                label: "sqrt at 0.5",
+                f: f64::sqrt,
+                x: 0.5,
+                options: defaults,
+                df: 0.707_106_781_186_311_7,
+                df_rtol: 1e-13,
+                status: DifferentiateStatus::Converged,
+                nit: 4,
+                nfev: 15,
+            },
+            Row {
+                label: "exp at 1, forward",
+                f: f64::exp,
+                x: 1.0,
+                options: DifferentiateOptions {
+                    step_direction: StepDirection::Forward,
+                    ..defaults
+                },
+                // One-sided weights are large, so the last bits of the weight solve and the
+                // dot product move df by ~1e-13: fsci gives 2.718281828459112, 6.7e-14 from
+                // e, where SciPy's value is 1.4e-13 from it.
+                df: 2.718_281_828_458_657_4,
+                df_rtol: 1e-12,
+                status: DifferentiateStatus::Converged,
+                nit: 2,
+                nfev: 11,
+            },
+            Row {
+                label: "exp at 1, backward, order 4",
+                f: f64::exp,
+                x: 1.0,
+                options: DifferentiateOptions {
+                    step_direction: StepDirection::Backward,
+                    order: 4,
+                    ..defaults
+                },
+                df: 2.718_281_825_794_747_4,
+                df_rtol: 1e-12,
+                status: DifferentiateStatus::Converged,
+                nit: 5,
+                nfev: 13,
+            },
+            Row {
+                label: "sin at 1, maxiter 3",
+                f: f64::sin,
+                x: 1.0,
+                options: DifferentiateOptions {
+                    maxiter: 3,
+                    ..defaults
+                },
+                df: 0.540_302_305_868_131_3,
+                df_rtol: 1e-13,
+                status: DifferentiateStatus::Converged,
+                nit: 2,
+                nfev: 11,
+            },
+            Row {
+                // sqrt(t) plus 1 at exactly t = 0.515625 = 0.5 + 2⁻⁶, the abscissa the third
+                // iteration adds: the error goes from 4.8e-5 to 46.2, SciPy's error-increase
+                // stop. (Rounding-noise cases such as log at 1e8 with step_factor 5 flip
+                // between the two implementations and cannot be pinned.)
+                label: "sqrt with a jump at 0.515625 (error increases)",
+                f: |t: f64| {
+                    t.sqrt()
+                        + if t.to_bits() == 0.515_625_f64.to_bits() {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                },
+                x: 0.5,
+                options: defaults,
+                df: 46.940_616_481_301_82,
+                df_rtol: 1e-12,
+                status: DifferentiateStatus::ErrorIncreased,
+                nit: 3,
+                nfev: 13,
+            },
+        ];
+        for row in rows {
+            let result = derivative(row.f, row.x, row.options).expect(row.label);
+            let label = row.label;
+            assert!(
+                (result.df - row.df).abs() <= row.df_rtol * row.df.abs(),
+                "{label}: df {} vs scipy {}",
+                result.df,
+                row.df
+            );
+            assert_eq!(result.status, row.status, "{label}");
+            assert_eq!(
+                result.success,
+                row.status == DifferentiateStatus::Converged,
+                "{label}"
+            );
+            assert_eq!((result.nit, result.nfev), (row.nit, row.nfev), "{label}");
+        }
     }
 
     #[test]

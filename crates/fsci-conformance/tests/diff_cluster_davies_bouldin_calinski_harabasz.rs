@@ -10,7 +10,7 @@
 //!
 //! Resolves [frankenscipy-wgvog]. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::{calinski_harabasz_score, davies_bouldin_score};
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -272,6 +274,7 @@ fn diff_cluster_davies_bouldin_calinski_harabasz() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -282,26 +285,27 @@ fn diff_cluster_davies_bouldin_calinski_harabasz() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_cluster_davies_bouldin_calinski_harabasz",
+        &["davies_bouldin", "calinski_harabasz"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(edb), Some(ech)) = (arm.db, arm.ch) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         let data = unflatten(&case.data_flat, case.n, case.d);
-        let Ok(db) = davies_bouldin_score(&data, &case.labels) else {
-            continue;
-        };
-        let Ok(ch) = calinski_harabasz_score(&data, &case.labels) else {
-            continue;
-        };
+        let db = davies_bouldin_score(&data, &case.labels).ok();
+        let ch = calinski_harabasz_score(&data, &case.labels).ok();
 
-        for (op, actual, expected) in [("davies_bouldin", db, edb), ("calinski_harabasz", ch, ech)]
-        {
+        for (op, actual, expected) in [
+            ("davies_bouldin", db, arm.db),
+            ("calinski_harabasz", ch, arm.ch),
+        ] {
+            let Some((expected, actual)) = ledger.pair(op, &case.case_id, expected, actual) else {
+                continue;
+            };
             let abs_d = (actual - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_{}", case.case_id, op),
                 op: op.into(),
@@ -317,6 +321,7 @@ fn diff_cluster_davies_bouldin_calinski_harabasz() {
         test_id: "diff_cluster_davies_bouldin_calinski_harabasz".into(),
         category: "fsci_cluster davies_bouldin + calinski_harabasz vs sklearn formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -337,4 +342,5 @@ fn diff_cluster_davies_bouldin_calinski_harabasz() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

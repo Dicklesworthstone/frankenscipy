@@ -14,13 +14,14 @@
 //! agreement at tol 1e-12. Skips cleanly if scipy/python3 is
 //! unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{kaiser_atten, kaiser_beta};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     pass: bool,
@@ -262,16 +264,21 @@ fn diff_signal_kaiser_meta() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger =
+        CompareLedger::new("diff_signal_kaiser_meta", &["kaiser_atten", "kaiser_beta"]);
 
     for case in &query.atten_cases {
-        let scipy_value = atten_oracle
-            .get(&case.case_id)
-            .and_then(|r| r.value)
-            .expect("scipy kaiser_atten produced a value for every case");
+        let scipy_value = atten_oracle.get(&case.case_id).and_then(|r| r.value);
         let rust_value = kaiser_atten(case.numtaps, case.width);
+        let Some((scipy_value, rust_value)) =
+            ledger.pair("kaiser_atten", &case.case_id, scipy_value, Some(rust_value))
+        else {
+            continue;
+        };
         let diff = (rust_value - scipy_value).abs();
         let pass = diff <= ABS_TOL;
         max_overall = max_overall.max(diff);
+        ledger.compared("kaiser_atten", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             family: "kaiser_atten".into(),
@@ -281,14 +288,17 @@ fn diff_signal_kaiser_meta() {
     }
 
     for case in &query.beta_cases {
-        let scipy_value = beta_oracle
-            .get(&case.case_id)
-            .and_then(|r| r.value)
-            .expect("scipy kaiser_beta produced a value for every case");
+        let scipy_value = beta_oracle.get(&case.case_id).and_then(|r| r.value);
         let rust_value = kaiser_beta(case.a);
+        let Some((scipy_value, rust_value)) =
+            ledger.pair("kaiser_beta", &case.case_id, scipy_value, Some(rust_value))
+        else {
+            continue;
+        };
         let diff = (rust_value - scipy_value).abs();
         let pass = diff <= ABS_TOL;
         max_overall = max_overall.max(diff);
+        ledger.compared("kaiser_beta", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             family: "kaiser_beta".into(),
@@ -303,6 +313,7 @@ fn diff_signal_kaiser_meta() {
         test_id: "diff_signal_kaiser_meta".into(),
         category: "scipy.signal.kaiser_atten+kaiser_beta".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         pass: all_pass,
@@ -328,4 +339,5 @@ fn diff_signal_kaiser_meta() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.atten_cases.len().min(query.beta_cases.len()));
 }

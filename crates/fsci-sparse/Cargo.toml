@@ -15,16 +15,22 @@ workspace = true
 # the hash implementation is a normal dependency of this benchmark crate.
 sparse-incumbent-bench = []
 live-scipy-bench = []
+# The .npz archive codec (`io`: load_npz / save_npz). On by default for direct
+# users. Workspace members that never touch .npz (fsci-integrate) leave it off,
+# so they do not resolve or build npyz and zip and their pest and zlib-rs
+# chains. The workspace dependency is default-features = false for that reason.
+default = ["npz"]
+npz = ["dep:npyz", "dep:zip"]
 
 [dependencies]
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
-npyz = { workspace = true }
+npyz = { workspace = true, optional = true }
 rayon = "1.12.0"
 sha2 = "0.10.9"
 thiserror = { workspace = true }
-zip = { workspace = true }
+zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

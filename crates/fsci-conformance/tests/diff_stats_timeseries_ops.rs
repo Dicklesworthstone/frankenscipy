@@ -16,13 +16,14 @@
 //! compares the output vector with max-abs aggregation. Tol
 //! 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{cumprod, cumsum, diff, ewma, moving_average};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -295,31 +297,28 @@ fn diff_stats_timeseries_ops() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let funcs = ["ewma", "moving_average", "cumsum", "cumprod", "diff"];
+    let mut ledger = CompareLedger::new("diff_stats_timeseries_ops", &funcs);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.out else {
+        let rust_vec = fsci_eval(case);
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            scipy_arm.out.as_deref(),
+            rust_vec.as_deref(),
+        ) else {
             continue;
         };
-        let Some(rust_vec) = fsci_eval(case) else {
-            continue;
-        };
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
+        // `slices` rejects a non-finite fsci element against SciPy's finite one, so every
+        // element reaching this fold is compared (the old `a.is_finite()` guard dropped them).
         let mut max_local = 0.0_f64;
         for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-            if a.is_finite() {
-                max_local = max_local.max((a - b).abs());
-            }
+            max_local = max_local.max((a - b).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared(&case.func, &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -334,6 +333,7 @@ fn diff_stats_timeseries_ops() {
         test_id: "diff_stats_timeseries_ops".into(),
         category: "ewma + moving_average + cumsum + cumprod + diff".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -358,4 +358,10 @@ fn diff_stats_timeseries_ops() {
         diffs.len(),
         max_overall
     );
+    let min_per_func = funcs
+        .iter()
+        .map(|&func| query.points.iter().filter(|c| c.func == func).count())
+        .min()
+        .expect("timeseries_ops declares its functions");
+    ledger.finish(min_per_func);
 }

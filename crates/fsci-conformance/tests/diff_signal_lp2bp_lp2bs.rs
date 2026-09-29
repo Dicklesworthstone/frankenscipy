@@ -11,12 +11,14 @@
 //! scipy on non-trivial inputs. The (b, a)-form transforms tested
 //! here are a separate code path that does NOT share that defect.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{lp2bp, lp2bs};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -240,6 +243,11 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// b then a in one vector, so the ledger's slice check sees a NaN or a length mismatch in either.
+fn packed(b: &[f64], a: &[f64]) -> Vec<f64> {
+    b.iter().chain(a).copied().collect()
+}
+
 #[test]
 fn diff_signal_lp2bp_lp2bs() {
     let query = build_query();
@@ -250,52 +258,43 @@ fn diff_signal_lp2bp_lp2bs() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_lp2bp_lp2bs", &["lp2bp", "lp2bs"]);
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let (Some(exp_b), Some(exp_a)) = (o.b.as_ref(), o.a.as_ref()) else {
-            continue;
-        };
 
         let result = match c.func.as_str() {
             "lp2bp" => lp2bp(&c.b, &c.a, c.wo, c.bw),
             "lp2bs" => lp2bs(&c.b, &c.a, c.wo, c.bw),
             other => panic!("unknown func {other}"),
         };
-        let (ba, aa) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: c.case_id.clone(),
-                    func: c.func.clone(),
-                    max_abs_diff_b: f64::INFINITY,
-                    max_abs_diff_a: f64::INFINITY,
-                    pass: false,
-                    note: format!("error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        if ba.len() != exp_b.len() || aa.len() != exp_a.len() {
-            diffs.push(CaseDiff {
-                case_id: c.case_id.clone(),
-                func: c.func.clone(),
-                max_abs_diff_b: f64::INFINITY,
-                max_abs_diff_a: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci b={} scipy b={} fsci a={} scipy a={}",
-                    ba.len(),
-                    exp_b.len(),
-                    aa.len(),
-                    exp_a.len()
-                ),
-            });
-            continue;
+        if let Err(e) = &result {
+            eprintln!("lp2bp/lp2bs fsci error: {} ({}) {e:?}", c.case_id, c.func);
         }
-        let mab = max_abs(&ba, exp_b);
-        let maa = max_abs(&aa, exp_a);
+        let result = result.ok();
+        let exp_ba = match (o.b.as_ref(), o.a.as_ref()) {
+            (Some(exp_b), Some(exp_a)) => Some((exp_b, exp_a)),
+            _ => None,
+        };
+        let exp_v = exp_ba.map(|(b, a)| packed(b, a));
+        let fsci_v = result.as_ref().map(|(b, a)| packed(b, a));
+        let Some((exp_v, fsci_v)) =
+            ledger.slices(&c.func, &c.case_id, exp_v.as_deref(), fsci_v.as_deref())
+        else {
+            continue;
+        };
+        // The packed lengths agree; the b/a split must agree too.
+        let nb = exp_ba.map_or(0, |(b, _)| b.len());
+        let (mab, maa) = if result.as_ref().map(|(b, _)| b.len()) == Some(nb) {
+            (
+                max_abs(&fsci_v[..nb], &exp_v[..nb]),
+                max_abs(&fsci_v[nb..], &exp_v[nb..]),
+            )
+        } else {
+            (f64::INFINITY, f64::INFINITY)
+        };
         let pass = mab <= ABS_TOL && maa <= ABS_TOL;
+        ledger.compared(&c.func, &c.case_id, pass);
         diffs.push(CaseDiff {
             case_id: c.case_id.clone(),
             func: c.func.clone(),
@@ -311,6 +310,7 @@ fn diff_signal_lp2bp_lp2bs() {
         test_id: "diff_signal_lp2bp_lp2bs".into(),
         category: "fsci_signal::{lp2bp, lp2bs} vs scipy.signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -328,4 +328,6 @@ fn diff_signal_lp2bp_lp2bs() {
     }
 
     assert!(all_pass, "lp2bp/lp2bs parity failed: {} cases", diffs.len());
+    let per_func = |func: &str| query.points.iter().filter(|c| c.func == func).count();
+    ledger.finish(per_func("lp2bp").min(per_func("lp2bs")));
 }

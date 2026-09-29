@@ -9,15 +9,33 @@
 //!   * chroma fixed length 12 (one per pitch class)
 //!   * spectral_contrast output length n_bands
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{chroma, hz_to_mel, mel_filterbank, mel_to_hz, mfcc, spectral_contrast};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REL_TOL: f64 = 1.0e-10;
+/// One ledger arm per property. `hz_mel_roundtrip` compares the round-tripped value against the
+/// input Hz (one case per input); every other arm is one fixed structural case recorded under its
+/// own name, whose reference is the analytic shape or range stated in its check.
+const ARMS: [&str; 11] = [
+    "hz_mel_roundtrip",
+    "mel_filterbank_shape",
+    "mel_filterbank_weights_in_unit_interval",
+    "mel_filterbank_each_filter_nonzero",
+    "mfcc_frame_count",
+    "mfcc_per_frame_dim_eq_n_mfcc",
+    "mfcc_empty_signal_returns_empty",
+    "chroma_length_12",
+    "chroma_values_finite",
+    "spectral_contrast_length_eq_n_bands",
+    "spectral_contrast_values_finite",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -31,6 +49,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -62,6 +81,7 @@ fn emit_log(log: &DiffLog) {
 fn diff_signal_mel_mfcc_chroma() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_mel_mfcc_chroma", &ARMS);
     let mut check = |id: &str, ok: bool, note: String| {
         diffs.push(CaseDiff {
             case_id: id.into(),
@@ -71,12 +91,22 @@ fn diff_signal_mel_mfcc_chroma() {
     };
 
     // === Hz ↔ Mel round-trip ===
-    for &hz in &[0.0_f64, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0] {
+    let roundtrip_hz = [0.0_f64, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
+    for &hz in &roundtrip_hz {
         let mel = hz_to_mel(hz);
         let hz_back = mel_to_hz(mel);
         let rel = ((hz_back - hz).abs()) / hz.abs().max(1.0e-6);
+        let case_id = format!("hz_mel_roundtrip_{hz}");
+        // The reference is the input Hz, always finite; pair records a non-finite hz_back as an
+        // fsci failure instead of letting `rel <= REL_TOL` be the only guard.
+        if ledger
+            .pair("hz_mel_roundtrip", &case_id, Some(hz), Some(hz_back))
+            .is_some()
+        {
+            ledger.compared("hz_mel_roundtrip", &case_id, rel <= REL_TOL);
+        }
         check(
-            &format!("hz_mel_roundtrip_{hz}"),
+            &case_id,
             rel <= REL_TOL,
             format!("hz={hz} mel={mel} hz_back={hz_back}"),
         );
@@ -89,20 +119,27 @@ fn diff_signal_mel_mfcc_chroma() {
         let sr = 16000.0;
         let fb = mel_filterbank(n_mels, n_fft, sr, 0.0, sr / 2.0);
         let n_freq = n_fft / 2 + 1;
+        let shape_ok = fb.len() == n_mels && fb.iter().all(|r| r.len() == n_freq);
+        ledger.compared("mel_filterbank_shape", "mel_filterbank_shape", shape_ok);
         check(
             "mel_filterbank_shape",
-            fb.len() == n_mels && fb.iter().all(|r| r.len() == n_freq),
+            shape_ok,
             format!(
                 "rows={} cols0={}",
                 fb.len(),
                 fb.first().map_or(0, |r| r.len())
             ),
         );
-        // All weights in [0, 1]
+        // All weights in [0, 1] (a NaN weight is outside the range, so it fails here)
         let in_range = fb
             .iter()
             .flat_map(|r| r.iter())
             .all(|&v| (0.0..=1.0).contains(&v));
+        ledger.compared(
+            "mel_filterbank_weights_in_unit_interval",
+            "mel_filterbank_weights_in_unit_interval",
+            in_range,
+        );
         check(
             "mel_filterbank_weights_in_unit_interval",
             in_range,
@@ -110,6 +147,11 @@ fn diff_signal_mel_mfcc_chroma() {
         );
         // Each filter has at least one non-zero entry (peaks at center)
         let all_have_peak = fb.iter().all(|r| r.iter().any(|&v| v > 0.0));
+        ledger.compared(
+            "mel_filterbank_each_filter_nonzero",
+            "mel_filterbank_each_filter_nonzero",
+            all_have_peak,
+        );
         check(
             "mel_filterbank_each_filter_nonzero",
             all_have_peak,
@@ -132,12 +174,22 @@ fn diff_signal_mel_mfcc_chroma() {
         let result = mfcc(&signal, sr, n_mfcc, n_mels, frame_len, hop_len);
         // n_frames = floor((n_samples - frame_len) / hop_len) + 1
         let expected_frames = (n_samples - frame_len) / hop_len + 1;
+        ledger.compared(
+            "mfcc_frame_count",
+            "mfcc_frame_count",
+            result.len() == expected_frames,
+        );
         check(
             "mfcc_frame_count",
             result.len() == expected_frames,
             format!("got {} expected {}", result.len(), expected_frames),
         );
         let mfcc_dim_ok = result.iter().all(|frame| frame.len() == n_mfcc);
+        ledger.compared(
+            "mfcc_per_frame_dim_eq_n_mfcc",
+            "mfcc_per_frame_dim_eq_n_mfcc",
+            mfcc_dim_ok,
+        );
         check(
             "mfcc_per_frame_dim_eq_n_mfcc",
             mfcc_dim_ok,
@@ -148,6 +200,11 @@ fn diff_signal_mel_mfcc_chroma() {
     // === mfcc on empty signal returns empty ===
     {
         let result = mfcc(&[], 16000.0, 13, 26, 512, 256);
+        ledger.compared(
+            "mfcc_empty_signal_returns_empty",
+            "mfcc_empty_signal_returns_empty",
+            result.is_empty(),
+        );
         check(
             "mfcc_empty_signal_returns_empty",
             result.is_empty(),
@@ -161,16 +218,15 @@ fn diff_signal_mel_mfcc_chroma() {
         let sr = 16000.0;
         let mags: Vec<f64> = (0..n_fft / 2 + 1).map(|i| (i as f64).sin().abs()).collect();
         let result = chroma(&mags, sr, n_fft);
+        ledger.compared("chroma_length_12", "chroma_length_12", result.len() == 12);
         check(
             "chroma_length_12",
             result.len() == 12,
             format!("got {}", result.len()),
         );
-        check(
-            "chroma_values_finite",
-            result.iter().all(|v| v.is_finite()),
-            String::new(),
-        );
+        let all_finite = result.iter().all(|v| v.is_finite());
+        ledger.compared("chroma_values_finite", "chroma_values_finite", all_finite);
+        check("chroma_values_finite", all_finite, String::new());
     }
 
     // === spectral_contrast: output length == n_bands ===
@@ -178,16 +234,23 @@ fn diff_signal_mel_mfcc_chroma() {
         let n_bands = 6;
         let mags: Vec<f64> = (0..257).map(|i| (i as f64 + 1.0).sqrt()).collect();
         let result = spectral_contrast(&mags, n_bands);
+        ledger.compared(
+            "spectral_contrast_length_eq_n_bands",
+            "spectral_contrast_length_eq_n_bands",
+            result.len() == n_bands,
+        );
         check(
             "spectral_contrast_length_eq_n_bands",
             result.len() == n_bands,
             format!("got {}", result.len()),
         );
-        check(
+        let all_finite = result.iter().all(|v| v.is_finite());
+        ledger.compared(
             "spectral_contrast_values_finite",
-            result.iter().all(|v| v.is_finite()),
-            String::new(),
+            "spectral_contrast_values_finite",
+            all_finite,
         );
+        check("spectral_contrast_values_finite", all_finite, String::new());
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -197,6 +260,7 @@ fn diff_signal_mel_mfcc_chroma() {
             "fsci_signal::{hz_to_mel, mel_to_hz, mel_filterbank, mfcc, chroma, spectral_contrast} coverage"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -215,4 +279,8 @@ fn diff_signal_mel_mfcc_chroma() {
         "audio feature coverage failed: {} cases",
         diffs.len()
     );
+    // Arms have different case sets: the structural arms are one fixed case each (the smallest
+    // designed count), the round-trip arm has one case per input Hz, each recorded through pair
+    // with an always-present reference, so a case it did not compare is a failure, not a gap.
+    ledger.finish(1);
 }

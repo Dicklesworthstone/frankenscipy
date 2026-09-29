@@ -12,13 +12,14 @@
 //! cases. Tol 1e-9 abs (two-sided normal CDF / chi-square
 //! tail chain via ndtri rational approximation).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kurtosistest, normaltest, skewtest};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -245,45 +247,59 @@ fn diff_stats_normality_tests() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let funcs = ["skewtest", "kurtosistest", "normaltest"];
+    let mut ledger = CompareLedger::new(
+        "diff_stats_normality_tests",
+        &[
+            "skewtest.statistic",
+            "skewtest.pvalue",
+            "kurtosistest.statistic",
+            "kurtosistest.pvalue",
+            "normaltest.statistic",
+            "normaltest.pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (rust_stat, rust_p) = match case.func.as_str() {
-            "skewtest" => {
-                let res = skewtest(&case.data, None, None).expect("skewtest");
-                (res.statistic, res.pvalue)
-            }
-            "kurtosistest" => {
-                let res = kurtosistest(&case.data, None, None).expect("kurtosistest");
-                (res.statistic, res.pvalue)
-            }
+        let result = match case.func.as_str() {
+            "skewtest" => skewtest(&case.data, None, None)
+                .ok()
+                .map(|res| (res.statistic, res.pvalue)),
+            "kurtosistest" => kurtosistest(&case.data, None, None)
+                .ok()
+                .map(|res| (res.statistic, res.pvalue)),
             "normaltest" => {
                 let res = normaltest(&case.data);
-                (res.statistic, res.pvalue)
+                Some((res.statistic, res.pvalue))
             }
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        if let Some(s_stat) = scipy_arm.statistic
-            && rust_stat.is_finite()
-        {
-            let abs_diff = (rust_stat - s_stat).abs();
+        let stat_arm = format!("{}.statistic", case.func);
+        let pvalue_arm = format!("{}.pvalue", case.func);
+        let arms = [
+            (
+                stat_arm.as_str(),
+                scipy_arm.statistic,
+                result.map(|(stat, _)| stat),
+            ),
+            (
+                pvalue_arm.as_str(),
+                scipy_arm.pvalue,
+                result.map(|(_, p)| p),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.statistic", case.func),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(s_p) = scipy_arm.pvalue
-            && rust_p.is_finite()
-        {
-            let abs_diff = (rust_p - s_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.pvalue", case.func),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -296,6 +312,7 @@ fn diff_stats_normality_tests() {
         test_id: "diff_stats_normality_tests".into(),
         category: "scipy.stats.{skewtest, kurtosistest, normaltest}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -320,4 +337,11 @@ fn diff_stats_normality_tests() {
         diffs.len(),
         max_overall
     );
+    // Each func runs on every dataset; each of its two arms must compare all of its cases.
+    let min_per_arm = funcs
+        .iter()
+        .map(|func| query.points.iter().filter(|c| c.func == *func).count())
+        .min()
+        .expect("funcs is non-empty");
+    ledger.finish(min_per_arm);
 }

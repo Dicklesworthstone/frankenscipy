@@ -13,12 +13,14 @@
 //! implementation-dependent (scipy pairs by pole magnitude; the
 //! mathematical filter is the same up to permutation).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{
     BaCoeffsOrSos, ButterOutput, FilterType, butter_sos, butter_with_output, sos2tf,
 };
@@ -68,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -213,127 +216,164 @@ fn diff_signal_butter_sos_output() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_signal_butter_sos_output",
+        &[
+            "ba_b",
+            "ba_a",
+            "sos_via_sos2tf_b",
+            "sos_via_sos2tf_a",
+            "butter_sos_eq_with_output",
+        ],
+    );
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let (Some(exp_b), Some(exp_a)) = (o.b.as_ref(), o.a.as_ref()) else {
-            continue;
-        };
+        // An fsci failure note goes into the diff log only where SciPy gave (b, a), as before;
+        // the ledger records every failure either way.
+        let scipy_ba = o.b.is_some() && o.a.is_some();
 
         let ftype = ftype_from(&c.btype);
 
         // === butter_with_output(Ba) ===
-        let ba_result = butter_with_output(c.order, &c.wn, ftype, ButterOutput::Ba);
-        let ba = match ba_result {
-            Ok(BaCoeffsOrSos::Ba(ba)) => ba,
-            Ok(BaCoeffsOrSos::Sos(_)) => {
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_ba", c.case_id),
-                    max_abs_diff_b: f64::INFINITY,
-                    max_abs_diff_a: f64::INFINITY,
-                    pass: false,
-                    note: "butter_with_output(Ba) returned Sos variant".into(),
-                });
+        let ba_case = format!("{}_ba", c.case_id);
+        let ba: Result<_, String> =
+            match butter_with_output(c.order, &c.wn, ftype, ButterOutput::Ba) {
+                Ok(BaCoeffsOrSos::Ba(ba)) => Ok(ba),
+                Ok(BaCoeffsOrSos::Sos(_)) => {
+                    Err("butter_with_output(Ba) returned Sos variant".to_string())
+                }
+                Err(e) => Err(format!("error: {e:?}")),
+            };
+        let arms = [
+            (
+                "ba_b",
+                o.b.as_deref(),
+                ba.as_ref().ok().map(|r| r.b.as_slice()),
+            ),
+            (
+                "ba_a",
+                o.a.as_deref(),
+                ba.as_ref().ok().map(|r| r.a.as_slice()),
+            ),
+        ];
+        let mut ba_diffs = [f64::NAN; 2];
+        for (slot, (arm, scipy, fsci)) in ba_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.slices(arm, &ba_case, scipy, fsci) else {
                 continue;
-            }
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_ba", c.case_id),
-                    max_abs_diff_b: f64::INFINITY,
-                    max_abs_diff_a: f64::INFINITY,
-                    pass: false,
-                    note: format!("error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        if ba.b.len() != exp_b.len() || ba.a.len() != exp_a.len() {
+            };
+            let d = max_abs(f, s);
+            ledger.compared(arm, &ba_case, d <= ABS_TOL);
+            *slot = d;
+        }
+        if let (Err(note), true) = (&ba, scipy_ba) {
             diffs.push(CaseDiff {
-                case_id: format!("{}_ba", c.case_id),
+                case_id: ba_case.clone(),
                 max_abs_diff_b: f64::INFINITY,
                 max_abs_diff_a: f64::INFINITY,
                 pass: false,
-                note: "length mismatch ba".to_string(),
+                note: note.clone(),
             });
-            continue;
         }
-        let mab = max_abs(&ba.b, exp_b);
-        let maa = max_abs(&ba.a, exp_a);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_ba", c.case_id),
-            max_abs_diff_b: mab,
-            max_abs_diff_a: maa,
-            pass: mab <= ABS_TOL && maa <= ABS_TOL,
-            note: String::new(),
-        });
+        if ba_diffs.iter().all(|d| !d.is_nan()) {
+            let [mab, maa] = ba_diffs;
+            diffs.push(CaseDiff {
+                case_id: ba_case,
+                max_abs_diff_b: mab,
+                max_abs_diff_a: maa,
+                pass: mab <= ABS_TOL && maa <= ABS_TOL,
+                note: String::new(),
+            });
+        }
 
         // === butter_with_output(Sos) reproduces same (b, a) via sos2tf ===
-        let sos_result = butter_with_output(c.order, &c.wn, ftype, ButterOutput::Sos);
-        let sos = match sos_result {
-            Ok(BaCoeffsOrSos::Sos(s)) => s,
-            Ok(BaCoeffsOrSos::Ba(_)) => {
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_sos_via_sos2tf", c.case_id),
-                    max_abs_diff_b: f64::INFINITY,
-                    max_abs_diff_a: f64::INFINITY,
-                    pass: false,
-                    note: "butter_with_output(Sos) returned Ba variant".into(),
-                });
-                continue;
-            }
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: format!("{}_sos_via_sos2tf", c.case_id),
-                    max_abs_diff_b: f64::INFINITY,
-                    max_abs_diff_a: f64::INFINITY,
-                    pass: false,
-                    note: format!("sos error: {e:?}"),
-                });
-                continue;
-            }
-        };
+        let sos_case = format!("{}_sos_via_sos2tf", c.case_id);
+        let sos: Result<_, String> =
+            match butter_with_output(c.order, &c.wn, ftype, ButterOutput::Sos) {
+                Ok(BaCoeffsOrSos::Sos(s)) => Ok(s),
+                Ok(BaCoeffsOrSos::Ba(_)) => {
+                    Err("butter_with_output(Sos) returned Ba variant".to_string())
+                }
+                Err(e) => Err(format!("sos error: {e:?}")),
+            };
+        if let (Err(note), true) = (&sos, scipy_ba) {
+            diffs.push(CaseDiff {
+                case_id: sos_case.clone(),
+                max_abs_diff_b: f64::INFINITY,
+                max_abs_diff_a: f64::INFINITY,
+                pass: false,
+                note: note.clone(),
+            });
+        }
         // sos_via_sos2tf check restricted to even orders. For odd N,
         // fsci pads to even via a degenerate first section, producing
         // an extra trailing/leading coefficient — the underlying
         // filter is mathematically equivalent but the explicit
         // coefficient list has different length from scipys.
         if c.order.is_multiple_of(2) {
-            let reconstructed = sos2tf(&sos);
-            let length_ok =
-                reconstructed.b.len() == exp_b.len() && reconstructed.a.len() == exp_a.len();
-            let (mab_s, maa_s) = if length_ok {
+            let reconstructed = sos.as_ref().ok().map(|s| sos2tf(s));
+            let arms = [
                 (
-                    max_abs(&reconstructed.b, exp_b),
-                    max_abs(&reconstructed.a, exp_a),
-                )
-            } else {
-                (f64::INFINITY, f64::INFINITY)
-            };
-            diffs.push(CaseDiff {
-                case_id: format!("{}_sos_via_sos2tf", c.case_id),
-                max_abs_diff_b: mab_s,
-                max_abs_diff_a: maa_s,
-                pass: length_ok && mab_s <= ABS_TOL && maa_s <= ABS_TOL,
-                note: format!(
-                    "fsci b_len={} a_len={} scipy b_len={} a_len={}",
-                    reconstructed.b.len(),
-                    reconstructed.a.len(),
-                    exp_b.len(),
-                    exp_a.len()
+                    "sos_via_sos2tf_b",
+                    o.b.as_deref(),
+                    reconstructed.as_ref().map(|r| r.b.as_slice()),
                 ),
-            });
+                (
+                    "sos_via_sos2tf_a",
+                    o.a.as_deref(),
+                    reconstructed.as_ref().map(|r| r.a.as_slice()),
+                ),
+            ];
+            let mut sos_diffs = [f64::NAN; 2];
+            for (slot, (arm, scipy, fsci)) in sos_diffs.iter_mut().zip(arms) {
+                let Some((s, f)) = ledger.slices(arm, &sos_case, scipy, fsci) else {
+                    continue;
+                };
+                let d = max_abs(f, s);
+                ledger.compared(arm, &sos_case, d <= ABS_TOL);
+                *slot = d;
+            }
+            if sos_diffs.iter().all(|d| !d.is_nan()) {
+                let [mab_s, maa_s] = sos_diffs;
+                let len = |v: Option<&[f64]>| v.map_or(0, <[f64]>::len);
+                diffs.push(CaseDiff {
+                    case_id: sos_case,
+                    max_abs_diff_b: mab_s,
+                    max_abs_diff_a: maa_s,
+                    pass: mab_s <= ABS_TOL && maa_s <= ABS_TOL,
+                    note: format!(
+                        "fsci b_len={} a_len={} scipy b_len={} a_len={}",
+                        len(reconstructed.as_ref().map(|r| r.b.as_slice())),
+                        len(reconstructed.as_ref().map(|r| r.a.as_slice())),
+                        len(o.b.as_deref()),
+                        len(o.a.as_deref())
+                    ),
+                });
+            }
         }
 
         // === butter_sos == butter_with_output(Sos) (convenience wrapper) ===
-        let sos_direct = butter_sos(c.order, &c.wn, ftype).expect("butter_sos");
+        // The reference side is fsci's own butter_with_output(Sos), not SciPy: its failure is
+        // recorded as a missing reference value, a butter_sos failure as an fsci failure.
+        let eq_case = format!("{}_butter_sos_eq_with_output", c.case_id);
+        let sos_direct = butter_sos(c.order, &c.wn, ftype).ok();
+        let Some((sos, sos_direct)) = ledger.both(
+            "butter_sos_eq_with_output",
+            &eq_case,
+            sos.as_ref().ok(),
+            sos_direct.as_ref(),
+        ) else {
+            continue;
+        };
         let sos_match = sos_direct.len() == sos.len()
             && sos_direct.iter().zip(sos.iter()).all(|(a, b)| {
                 a.iter()
                     .zip(b.iter())
                     .all(|(x, y)| (x - y).abs() <= ABS_TOL)
             });
+        ledger.compared("butter_sos_eq_with_output", &eq_case, sos_match);
         diffs.push(CaseDiff {
-            case_id: format!("{}_butter_sos_eq_with_output", c.case_id),
+            case_id: eq_case,
             max_abs_diff_b: 0.0,
             max_abs_diff_a: 0.0,
             pass: sos_match,
@@ -346,6 +386,7 @@ fn diff_signal_butter_sos_output() {
         test_id: "diff_signal_butter_sos_output".into(),
         category: "fsci_signal::{butter_with_output, butter_sos} vs scipy.signal.butter".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -366,5 +407,13 @@ fn diff_signal_butter_sos_output() {
         all_pass,
         "butter_sos/butter_with_output coverage failed: {} cases",
         diffs.len()
+    );
+    // The sos2tf arms run on the even orders only (see above); the other arms on every case.
+    ledger.finish(
+        query
+            .points
+            .iter()
+            .filter(|c| c.order.is_multiple_of(2))
+            .count(),
     );
 }

@@ -7,13 +7,14 @@
 //! spline orders 0 (nearest) and 1 (linear) to sidestep higher-order
 //! spline convention differences. 1e-10 abs tolerance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, zoom};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -257,21 +259,27 @@ fn diff_ndimage_zoom() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_zoom", &["zoom"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let Ok(input) = NdArray::new(case.input.clone(), case.input_shape.clone()) else {
-            continue;
-        };
-        let Ok(out) = zoom(
-            &input,
-            &case.zoom_factors,
-            case.order,
-            parse_mode(&case.mode),
-            case.cval,
+        let fsci_out = NdArray::new(case.input.clone(), case.input_shape.clone())
+            .ok()
+            .and_then(|input| {
+                zoom(
+                    &input,
+                    &case.zoom_factors,
+                    case.order,
+                    parse_mode(&case.mode),
+                    case.cval,
+                )
+                .ok()
+            });
+        let Some((scipy_v, out_data)) = ledger.slices(
+            "zoom",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_out.as_ref().map(|out| out.data.as_slice()),
         ) else {
             continue;
         };
@@ -280,22 +288,20 @@ fn diff_ndimage_zoom() {
         let shape_mismatch = scipy_arm
             .out_shape
             .as_ref()
-            .is_some_and(|shape| *shape != out.shape);
-        if shape_mismatch || out.data.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        let abs_d = out
-            .data
-            .iter()
-            .zip(scipy_v.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        max_overall = max_overall.max(abs_d);
+            .zip(fsci_out.as_ref())
+            .is_some_and(|(shape, out)| *shape != out.shape);
+        let abs_d = if shape_mismatch {
+            f64::INFINITY
+        } else {
+            let abs_d = out_data
+                .iter()
+                .zip(scipy_v.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(abs_d);
+            abs_d
+        };
+        ledger.compared("zoom", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -309,6 +315,7 @@ fn diff_ndimage_zoom() {
         test_id: "diff_ndimage_zoom".into(),
         category: "scipy.ndimage.zoom (orders 0, 1, grid_mode=False)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -329,4 +336,5 @@ fn diff_ndimage_zoom() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

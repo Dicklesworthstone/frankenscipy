@@ -1,0 +1,17 @@
+elf_sha256=29095f1270a106dc6bc0265e064eca4815196e0695bc09f107edc4aa887f1bd5
+vq_soa_scan=true
+mst_fused_scan=true
+dm_blocked_fold=true dm_force_block_fill=false available_parallelism=1
+scipy_incumbent: python=/home/ubuntu/.local/bin/python3.13 pythonpath=<default> scipy=1.17.1 numpy=2.4.3 fsci_loaded=false genuine=true pinned_scipy=1.17.1 pinned_numpy=2.4.3 blas=Haswell
+READY scipy=1.17.1 numpy=2.4.3 op=vq n=1500 dim=8 k=32 fixture_sha256=254a5e018bdf54e242030cdb6cabd497f89ec6225912a26e087c9d36275eb138 tasks=1 genuine=True out_len=1500
+op=vq calibration single=0.1477ms reps=136
+case=n1500d8 op=vq fsci=0.142ms scipy=0.110ms scipy/fsci=0.776x null_fsci=1.002 null_scipy=1.009 CHECK max_abs=1.49011611938476562e-08 max_rel=1.00000000000000000e+00
+READY scipy=1.17.1 numpy=2.4.3 op=linkage n=1500 dim=8 k=32 fixture_sha256=254a5e018bdf54e242030cdb6cabd497f89ec6225912a26e087c9d36275eb138 tasks=1 genuine=True out_len=1499
+op=linkage calibration single=6.0946ms reps=4
+op=linkage stages dm_build=3.411ms (65.3%) agglomerate=1.809ms (34.7%)
+case=n1500d8 op=linkage fsci=6.072ms scipy=6.855ms scipy/fsci=1.129x null_fsci=1.073 null_scipy=1.072 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+/home/ubuntu/.local/lib/python3.13/site-packages/scipy/_lib/_util.py:365: UserWarning: One of the clusters is empty. Re-run kmeans with a different initialization.
+  return fun(*args, **kwargs)
+READY scipy=1.17.1 numpy=2.4.3 op=kmeans2 n=1500 dim=8 k=32 fixture_sha256=254a5e018bdf54e242030cdb6cabd497f89ec6225912a26e087c9d36275eb138 tasks=1 genuine=True out_len=1500
+op=kmeans2 calibration single=3.9953ms reps=6
+case=n1500d8 op=kmeans2 fsci=4.002ms scipy=2.392ms scipy/fsci=0.598x null_fsci=1.004 null_scipy=1.009 CHECK max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00

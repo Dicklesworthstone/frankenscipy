@@ -15,13 +15,14 @@
 //! {1, …, N}. Both are valid scipy primitives with separate
 //! parameterisations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::Zipf;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -98,13 +100,10 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    // a > 1 required (zeta diverges otherwise). Skip a ≤ 3
-    // because fsci's riemann_zeta truncates the series at
-    // k=10000 with too-aggressive 1e-15 relative tolerance —
-    // tail error is significant for slow-convergent a (37% at
-    // a=1.1, 3e-3 at a=1.5, 4e-5 at a=2, 3.5e-9 at a=3).
-    // Tracked separately as [frankenscipy-3u8ze].
-    let as_ = [4.0_f64, 5.0, 6.0, 8.0, 10.0, 15.0];
+    // a > 1 required (zeta diverges otherwise). a ≤ 3 used to be skipped: riemann_zeta
+    // truncated its series at k=10000 (37% off at a=1.1). frankenscipy-3u8ze replaced it
+    // with Euler-Maclaurin, so the slowly convergent exponents are back in.
+    let as_ = [1.1_f64, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0];
     let ks = [1_u64, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 10000];
     let mut points = Vec::new();
     for &a in &as_ {
@@ -212,29 +211,28 @@ fn diff_stats_zipf() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_zipf", &["pmf", "cdf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = Zipf::new(case.a);
         let k_usize = case.k as usize;
-        if let Some(spmf) = oracle.pmf {
-            let d = (dist.pmf(k_usize) - spmf).abs();
+        let arms = [
+            ("pmf", oracle.pmf, dist.pmf(k_usize), PMF_TOL),
+            ("cdf", oracle.cdf, dist.cdf(k_usize), CDF_TOL),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pmf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= PMF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(k_usize) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
@@ -245,6 +243,7 @@ fn diff_stats_zipf() {
         test_id: "diff_stats_zipf".into(),
         category: "scipy.stats.zipf".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -269,4 +268,5 @@ fn diff_stats_zipf() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

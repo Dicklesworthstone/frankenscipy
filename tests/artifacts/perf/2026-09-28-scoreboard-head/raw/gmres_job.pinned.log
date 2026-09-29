@@ -1,0 +1,3 @@
+elf_sha256=3ba94af8efd3beb941840fedda199ba8e29beb99abbe0f38bbf96aec54e733b2
+frankenscipy_engine_sha256=3ba94af8efd3beb941840fedda199ba8e29beb99abbe0f38bbf96aec54e733b2
+ABORT: TRJ_BOOKING_CLAIM_MESSAGE_ID is required: send an addressed agent-mail message whose subject contains [MEASUREMENT BOOKING] and pass its id

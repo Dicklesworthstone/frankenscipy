@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-ooe3x]. Exact integer-index comparison.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{argrelmax, argrelmin};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -214,19 +216,27 @@ fn diff_signal_argrelminmax() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_argrelminmax", &["argrelmin", "argrelmax"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.indices.as_ref() else {
-            continue;
-        };
-        let fsci_idx = match case.op.as_str() {
+        let arm = case.op.as_str();
+        let fsci_idx = match arm {
             "argrelmin" => argrelmin(&case.x, case.order),
             "argrelmax" => argrelmax(&case.x, case.order),
-            _ => continue,
+            other => unreachable!("generate_query only emits argrelmin/argrelmax, not {other}"),
+        };
+        let Some((expected, fsci_idx)) = ledger.both(
+            arm,
+            &case.case_id,
+            scipy_arm.indices.as_ref(),
+            Some(fsci_idx),
+        ) else {
+            continue;
         };
         let exp_usize: Vec<usize> = expected.iter().map(|&i| i as usize).collect();
         let pass = fsci_idx == exp_usize;
+        ledger.compared(arm, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -242,6 +252,7 @@ fn diff_signal_argrelminmax() {
         test_id: "diff_signal_argrelminmax".into(),
         category: "scipy.signal argrelmin + argrelmax".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -263,4 +274,6 @@ fn diff_signal_argrelminmax() {
         "argrelminmax conformance failed: {} cases",
         diffs.len()
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("argrelmin").min(per_op("argrelmax")));
 }

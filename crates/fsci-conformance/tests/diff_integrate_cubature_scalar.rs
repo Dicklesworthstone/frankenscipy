@@ -9,13 +9,14 @@
 //! fsci's cubature_scalar takes `f(&[f64]) -> f64`. Reference values
 //! computed via scipy.cubature with default tolerances.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{CubatureOptions, cubature_scalar};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -241,20 +243,21 @@ fn diff_integrate_cubature_scalar() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_cubature_scalar", &["cubature_scalar"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
         let f = |x: &[f64]| integrand(&case.integrand, x);
-        let Ok(res) = cubature_scalar(f, &case.a, &case.b, opts.clone()) else {
+        let fsci = cubature_scalar(f, &case.a, &case.b, opts.clone())
+            .ok()
+            .map(|res| res.estimate);
+        let Some((expected, estimate)) = ledger.pair("cubature_scalar", &case.case_id, scipy, fsci)
+        else {
             continue;
         };
-        let abs_d = (res.estimate - expected).abs();
+        let abs_d = (estimate - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("cubature_scalar", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -268,6 +271,7 @@ fn diff_integrate_cubature_scalar() {
         test_id: "diff_integrate_cubature_scalar".into(),
         category: "fsci_integrate::cubature_scalar vs scipy.integrate.cubature".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -288,4 +292,5 @@ fn diff_integrate_cubature_scalar() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

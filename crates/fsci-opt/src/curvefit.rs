@@ -514,6 +514,15 @@ where
         .collect()
 }
 
+/// SciPy raises `ValueError` with this text when its `trf` SVD meets a non-finite matrix.
+impl From<trf::NonFiniteJacobian> for OptError {
+    fn from(_: trf::NonFiniteJacobian) -> Self {
+        Self::NonFiniteInput {
+            detail: String::from("array must not contain infs or NaNs"),
+        }
+    }
+}
+
 /// `method='trf'` with optional bounds, as SciPy's `least_squares` sets it up: tolerance and
 /// bound validation, `x0` made strictly feasible, the initial residuals required finite, then
 /// [`trf::trf`].
@@ -741,12 +750,26 @@ where
         n_params,
         options.absolute_sigma,
     );
+    warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
         popt: ls_result.x.clone(),
         pcov,
         ls_result,
     })
+}
+
+/// SciPy's `curve_fit` fills `pcov` with inf and warns `OptimizeWarning` when the covariance
+/// is indeterminate (a singular Jacobian) or, with relative sigma, when there are no more
+/// data points than parameters. `compute_covariance` returns the all-inf matrix in exactly
+/// those cases.
+fn warn_if_covariance_not_estimated(pcov: &[Vec<f64>]) {
+    if pcov.iter().flatten().any(|v| !v.is_finite()) {
+        fsci_runtime::warn(
+            fsci_runtime::WarningCategory::OptimizeWarning,
+            "Covariance of the parameters could not be estimated",
+        );
+    }
 }
 
 /// SciPy's `curve_fit` raises `RuntimeError("Optimal parameters not found: " + res.message)`
@@ -864,6 +887,7 @@ where
         n_params,
         options.absolute_sigma,
     );
+    warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
         popt: ls_result.x.clone(),
@@ -1983,12 +2007,43 @@ mod tests {
             ..CurveFitOptions::default()
         };
 
-        let result = curve_fit(model, &xdata, &ydata, options).expect("should converge");
+        let (result, warnings) =
+            fsci_runtime::catch_warnings(|| curve_fit(model, &xdata, &ydata, options));
+        let result = result.expect("should converge");
         // Covariance should be 2x2 and finite
         assert_eq!(result.pcov.len(), 2);
         assert_eq!(result.pcov[0].len(), 2);
         assert!(result.pcov[0][0].is_finite());
         assert!(result.pcov[1][1].is_finite());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn curve_fit_warns_when_the_jacobian_is_singular() {
+        // SciPy: curve_fit(lambda x, a, b: a*x + 0*b, [1, 2, 3], [2, 4, 6]) returns
+        // popt [2, 1], pcov all inf, and warns OptimizeWarning. SciPy's default p0 is ones;
+        // fsci cannot read a closure's arity, so it is passed.
+        let model = |x: f64, p: &[f64]| p[0] * x + 0.0 * p[1];
+        let (result, warnings) = fsci_runtime::catch_warnings(|| {
+            curve_fit(
+                model,
+                &[1.0, 2.0, 3.0],
+                &[2.0, 4.0, 6.0],
+                CurveFitOptions {
+                    p0: Some(vec![1.0, 1.0]),
+                    ..CurveFitOptions::default()
+                },
+            )
+        });
+        let result = result.expect("fit");
+        assert!((result.popt[0] - 2.0).abs() < 1e-10, "{:?}", result.popt);
+        assert!(result.pcov.iter().flatten().all(|v| v.is_infinite()));
+        let categories: Vec<_> = warnings.iter().map(|w| w.category).collect();
+        assert_eq!(categories, [fsci_runtime::WarningCategory::OptimizeWarning]);
+        assert_eq!(
+            warnings[0].message,
+            "Covariance of the parameters could not be estimated"
+        );
     }
 
     #[test]
@@ -1997,17 +2052,19 @@ mod tests {
         let ydata = [1.0, 3.0];
         let model = |x: f64, p: &[f64]| p[0] * x + p[1];
 
-        let result = curve_fit(
-            model,
-            &xdata,
-            &ydata,
-            CurveFitOptions {
-                p0: Some(vec![1.0, 1.0]),
-                absolute_sigma: false,
-                ..CurveFitOptions::default()
-            },
-        )
-        .expect("should fit exactly");
+        let (result, warnings) = fsci_runtime::catch_warnings(|| {
+            curve_fit(
+                model,
+                &xdata,
+                &ydata,
+                CurveFitOptions {
+                    p0: Some(vec![1.0, 1.0]),
+                    absolute_sigma: false,
+                    ..CurveFitOptions::default()
+                },
+            )
+        });
+        let result = result.expect("should fit exactly");
 
         assert!(
             result
@@ -2015,6 +2072,11 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|entry| entry.is_infinite())
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].category,
+            fsci_runtime::WarningCategory::OptimizeWarning
         );
     }
 
@@ -2055,6 +2117,38 @@ mod tests {
         )
         .expect_err("should reject zero diff_step");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
+    }
+
+    /// A forward-difference step that crosses a domain edge puts a NaN in the Jacobian while the
+    /// residuals stay finite. SciPy 1.17.1 on `[√(1 − x), x − 0.5]` from x0 = 1 − 1e-9 (default
+    /// step √ε·max(1, |x|) lands past 1) raises `ValueError: array must not contain infs or NaNs`
+    /// from trf's SVD, bounded or not; from x0 = 0.5 or 0.9 the step never crosses and SciPy runs
+    /// to max_nfev (status 0) without raising. fsci used to fold the NaN out of ‖g·v‖∞, read 0,
+    /// and report gtol convergence (status 1) at x0 (frankenscipy-qdb8s).
+    #[test]
+    fn least_squares_trf_refuses_a_nan_jacobian_like_scipy() {
+        let residuals = |x: &[f64]| vec![(1.0 - x[0]).sqrt(), x[0] - 0.5];
+        let edge = [1.0 - 1e-9];
+        let unbounded = least_squares(residuals, &edge, LeastSquaresOptions::default());
+        let bounded = least_squares_bounded(
+            residuals,
+            &edge,
+            &[-10.0],
+            &[10.0],
+            LeastSquaresOptions::default(),
+        );
+        for result in [unbounded, bounded] {
+            assert!(
+                matches!(&result, Err(OptError::NonFiniteInput { detail })
+                    if detail == "array must not contain infs or NaNs"),
+                "SciPy raises here; fsci returned {result:?}"
+            );
+        }
+        for x0 in [0.5, 0.9] {
+            let r = least_squares(residuals, &[x0], LeastSquaresOptions::default())
+                .expect("the step never crosses the edge, so SciPy does not raise");
+            assert_eq!((r.status, r.success), (0, false), "x0 = {x0}: {r:?}");
+        }
     }
 
     #[test]

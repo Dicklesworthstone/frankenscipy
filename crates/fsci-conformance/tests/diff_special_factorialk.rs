@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-kor3h]. 1e-9 rel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::factorialk;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -185,13 +187,18 @@ fn diff_special_factorialk() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_factorialk", &["factorialk"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
+        let Some((expected, fsci_v)) = ledger.pair(
+            "factorialk",
+            &case.case_id,
+            scipy_arm.value,
+            Some(factorialk(case.n, case.k)),
+        ) else {
             continue;
         };
-        let fsci_v = factorialk(case.n, case.k);
         let abs_d = (fsci_v - expected).abs();
         let rel = if expected.abs() > 0.0 {
             abs_d / expected.abs()
@@ -199,6 +206,7 @@ fn diff_special_factorialk() {
             abs_d
         };
         max_overall = max_overall.max(rel);
+        ledger.compared("factorialk", &case.case_id, rel <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rel_diff: rel,
@@ -212,6 +220,7 @@ fn diff_special_factorialk() {
         test_id: "diff_special_factorialk".into(),
         category: "scipy.special.factorialk".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -232,4 +241,5 @@ fn diff_special_factorialk() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

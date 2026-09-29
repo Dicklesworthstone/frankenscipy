@@ -2688,18 +2688,8 @@ fn hyp2f1_log_connection_mpos(a: f64, b: f64, m: i32, z: f64) -> f64 {
 ///
 /// 2F1(a, b; c; z) = Σ_{n=0}^∞ (a)_n (b)_n z^n / ((c)_n n!)
 fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    // c must not be zero or a negative integer (unless a or b is a negative
-    // integer with |a| or |b| < |c|)
     if c == 0.0 || (c < 0.0 && c == c.floor()) {
-        if mode == RuntimeMode::Hardened {
-            return Err(SpecialError {
-                function: "hyp2f1",
-                kind: SpecialErrorKind::DomainError,
-                mode,
-                detail: "c must not be zero or a negative integer",
-            });
-        }
-        return Ok(f64::NAN);
+        return hyp2f1_real_at_c_pole(a, b, c, z, mode);
     }
 
     // Special cases
@@ -2847,6 +2837,128 @@ fn hyp2f1_series(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
     Ok(f64::NAN)
 }
 
+/// 2F1(a, b; c; x) at a nonpositive-integer c, tested in the order SciPy's real routine (xsf's
+/// cephes `hyp2f1`) tests its special cases, because the order is what decides the value at the
+/// pole (frankenscipy-b3o4v): x = 0 gives 1; a or b = 0 gives 1 unless c = 0; Euler's transform
+/// (1-x)^(c-a-b) 2F1(c-a, c-b; c; x) when c-a-b <= -1 and neither a nor b is a nonpositive
+/// integer; for |x| < 1 (or x = -1) the b = c and a = c identities (1-x)^-a and (1-x)^-b, which
+/// fire even at the pole; then the series terminates before the pole when a (or b) is a
+/// nonpositive integer above c, and otherwise diverges to +inf. Hardened keeps its domain error
+/// at the divergent pole and refuses the NaN that cephes returns when it loses the value.
+fn hyp2f1_real_at_c_pole(
+    a: f64,
+    b: f64,
+    c: f64,
+    x: f64,
+    mode: RuntimeMode,
+) -> Result<f64, SpecialError> {
+    const EPS: f64 = 1.0e-13; // cephes hyp2f1_EPS
+    let value = |y: f64| {
+        if y.is_nan() && mode == RuntimeMode::Hardened {
+            return Err(SpecialError {
+                function: "hyp2f1",
+                kind: SpecialErrorKind::CancellationRisk,
+                mode,
+                detail: "2F1 at a nonpositive-integer c lost the value to cancellation",
+            });
+        }
+        Ok(y)
+    };
+    let divergent = || {
+        if mode == RuntimeMode::Hardened {
+            return Err(SpecialError {
+                function: "hyp2f1",
+                kind: SpecialErrorKind::DomainError,
+                mode,
+                detail: "2F1 diverges at a nonpositive-integer c unless its series terminates first",
+            });
+        }
+        Ok(f64::INFINITY)
+    };
+
+    if x == 0.0 {
+        return Ok(1.0);
+    }
+    if (a == 0.0 || b == 0.0) && c != 0.0 {
+        return Ok(1.0);
+    }
+    let neg_int_a = a <= 0.0 && (a - a.round()).abs() < EPS;
+    let neg_int_b = b <= 0.0 && (b - b.round()).abs() < EPS;
+    let d = c - a - b;
+    let s = 1.0 - x;
+    if d <= -1.0 && !((d - d.round()).abs() > EPS && s < 0.0) && !(neg_int_a || neg_int_b) {
+        // c - a and c - b are nonpositive integers here, so this recursion ends at the pole
+        // test below without transforming again (its c - a - b is -d >= 1).
+        return Ok(s.powf(d) * hyp2f1_real_at_c_pole(c - a, c - b, c, x, mode)?);
+    }
+    if d <= 0.0 && x == 1.0 && !(neg_int_a || neg_int_b) {
+        return divergent();
+    }
+    if x.abs() < 1.0 || x == -1.0 {
+        if (b - c).abs() < EPS {
+            return value(if neg_int_b {
+                hyp2f1_neg_c_equal_bc(a, b, x)
+            } else {
+                s.powf(-a)
+            });
+        }
+        if (a - c).abs() < EPS {
+            return Ok(s.powf(-b));
+        }
+    }
+    let ic = c.round();
+    if (neg_int_a && a.round() > ic) || (neg_int_b && b.round() > ic) {
+        return value(hyp2f1_cephes_direct_series(a, b, c, x));
+    }
+    divergent()
+}
+
+/// cephes `hyp2f1_neg_c_equal_bc` (A&S 15.4.2): 2F1(a, b; b; x) for a nonpositive-integer
+/// b = c, the (1-x)^-a series cut at degree -b; NaN past |b| = 1e5 or when cancellation leaves
+/// no correct digit.
+fn hyp2f1_neg_c_equal_bc(a: f64, b: f64, x: f64) -> f64 {
+    if b.is_nan() || b.abs() >= 1.0e5 {
+        return f64::NAN;
+    }
+    let mut collector = 1.0_f64;
+    let mut sum = 1.0_f64;
+    let mut collector_max = 1.0_f64;
+    let mut k = 1.0;
+    while k <= -b {
+        collector *= (a + k - 1.0) * x / k;
+        collector_max = collector_max.max(collector.abs());
+        sum += collector;
+        k += 1.0;
+    }
+    if 1.0e-16 * (1.0 + collector_max / sum.abs()) > 1.0e-7 {
+        return f64::NAN;
+    }
+    sum
+}
+
+/// cephes `hys2f1`'s direct loop, as SciPy's real routine runs it for a series that terminates
+/// before a nonpositive-integer c. It keeps summing while the partial sum is exactly zero, so a
+/// polynomial whose value is 0 walks on into the pole and comes back NaN, as SciPy's does
+/// (2F1(-1, 1; -2; -2) is NaN there). cephes hands |a| well past |c| to a recurrence in a
+/// instead; that path agrees with this loop to rounding, not bit for bit.
+fn hyp2f1_cephes_direct_series(a: f64, b: f64, c: f64, x: f64) -> f64 {
+    const MACHEP: f64 = f64::EPSILON / 2.0; // cephes MACHEP, 2^-53
+    const MAX_ITER: usize = 10_000; // cephes hyp2f1_MAXITER
+    let mut sum = 1.0_f64;
+    let mut term = 1.0_f64;
+    let mut k = 0.0_f64;
+    for _ in 0..MAX_ITER {
+        let m = k + 1.0;
+        term *= (a + k) * (b + k) * x / ((c + k) * m);
+        sum += term;
+        k = m;
+        if !(sum == 0.0 || (term / sum).abs() > MACHEP) {
+            return sum;
+        }
+    }
+    sum
+}
+
 fn is_integer(x: f64) -> bool {
     x.is_finite() && x == x.trunc() && x >= f64::from(i32::MIN) && x <= f64::from(i32::MAX)
 }
@@ -2862,6 +2974,13 @@ fn hyp2f1_complex_parameters(
     z: Complex64,
     mode: RuntimeMode,
 ) -> Result<Complex64, SpecialError> {
+    // SciPy's complex routine (real a, b, c) has its own rule at a nonpositive-integer c, and it
+    // holds for a z whose imaginary part is 0 too: the real routine's value at the pole is not
+    // the complex one (2F1(-2, 1; -2; 0.3) is 1/(1-0.3) in the real routine, 1.39+0j in the
+    // complex one), so the pole is decided before real inputs are handed over (frankenscipy-b3o4v).
+    if a.im == 0.0 && b.im == 0.0 && c.im == 0.0 && c.re <= 0.0 && c.re == c.re.trunc() {
+        return hyp2f1_complex_at_c_pole(a.re, b.re, c.re, z, mode);
+    }
     if z.im == 0.0 && a.im == 0.0 && b.im == 0.0 && c.im == 0.0 {
         return Ok(Complex64::from_real(hyp2f1_scalar(
             a.re, b.re, c.re, z.re, mode,
@@ -2965,6 +3084,72 @@ fn hyp2f1_complex_parameters(
     }
 
     Ok(complex_nan())
+}
+
+/// SciPy's complex `hyp2f1` (xsf; real a, b, c) at a nonpositive-integer c: 1 when a or b is 0,
+/// even at the pole; at z = 0, 1 unless c = 0, where it is NaN+0j (following mpmath); inf+0j
+/// unless a (or b) is a negative integer with c <= a < 0, in which case the series is a
+/// polynomial of degree |a| (of the negative integer nearer zero when both are), summed term by
+/// term in xsf's order. Hardened refuses the divergent pole and the undefined z = 0, c = 0.
+fn hyp2f1_complex_at_c_pole(
+    a: f64,
+    b: f64,
+    c: f64,
+    z: Complex64,
+    mode: RuntimeMode,
+) -> Result<Complex64, SpecialError> {
+    // A polynomial longer than this is refused rather than summed (SciPy would spend minutes).
+    const MAX_DEGREE: f64 = 1.0e7;
+    let refuse = |detail: &'static str| {
+        Err(SpecialError {
+            function: "hyp2f1",
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail,
+        })
+    };
+    if a == 0.0 || b == 0.0 {
+        return Ok(Complex64::new(1.0, 0.0));
+    }
+    if z.abs() == 0.0 {
+        if c != 0.0 {
+            return Ok(Complex64::new(1.0, 0.0));
+        }
+        if mode == RuntimeMode::Hardened {
+            return refuse("2F1 at z = 0 is undefined for c = 0");
+        }
+        return Ok(Complex64::new(f64::NAN, 0.0));
+    }
+    let a_neg_int = a == a.trunc() && a < 0.0;
+    let b_neg_int = b == b.trunc() && b < 0.0;
+    if !((a_neg_int && c <= a) || (b_neg_int && c <= b)) {
+        if mode == RuntimeMode::Hardened {
+            return refuse(
+                "2F1 diverges at a nonpositive-integer c unless its series terminates first",
+            );
+        }
+        return Ok(Complex64::new(f64::INFINITY, 0.0));
+    }
+    let degree = match (a_neg_int, b_neg_int) {
+        (true, true) => -a.max(b),
+        (true, false) => -a,
+        _ => -b,
+    };
+    if degree > MAX_DEGREE {
+        if mode == RuntimeMode::Hardened {
+            return refuse("2F1 terminating polynomial is too long to sum");
+        }
+        return Ok(complex_nan());
+    }
+    let mut sum = Complex64::new(0.0, 0.0);
+    let mut term = Complex64::new(1.0, 0.0);
+    let mut k = 0.0_f64;
+    while k <= degree {
+        sum = sum + term;
+        term = term * (a + k) * (b + k) / ((k + 1.0) * (c + k)) * z;
+        k += 1.0;
+    }
+    Ok(sum)
 }
 
 /// Linear z -> 1/z connection for 2F1 outside the unit disk (DLMF 15.8.2),
@@ -4351,6 +4536,166 @@ mod tests {
         assert_eq!(error_kind(&hardened), Some(SpecialErrorKind::DomainError));
     }
 
+    /// frankenscipy-b3o4v. Every value is live SciPy 1.17.1 / numpy 2.4.3 (both routines, a
+    /// 672-row grid a, b over 14 pairs, c in {0, -1, -2, -3}, 7 real and 5 complex z); these rows
+    /// cover each branch of the two rules. The old code returned NaN for all of them.
+    #[test]
+    fn hyp2f1_nonpositive_integer_c_matches_scipy_real_and_complex() {
+        fn same(got: f64, want: f64) -> bool {
+            if want.is_nan() || want.is_infinite() {
+                return got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan());
+            }
+            (got - want).abs() <= 4e-16 * want.abs().max(1.0)
+        }
+        // (a, b, c, x, scipy's real routine)
+        let real_rows = [
+            (1.0, 2.0, 0.0, 0.3, f64::INFINITY),      // Euler, then the pole
+            (1.0, 2.0, 0.0, -1.0, f64::INFINITY),     // Euler at x = -1
+            (1.0, 2.0, 0.0, 2.0, f64::NEG_INFINITY),  // Euler with (1-x)^d < 0
+            (1.0, 2.0, -3.0, 0.0, 1.0),               // x = 0 comes first
+            (0.0, 1.0, 0.0, 0.3, 1.4285714285714286), // a = c = 0: (1-x)^-b
+            (0.0, 1.0, 0.0, -1.0, 0.5),               // same, at x = -1
+            (0.0, 1.0, 0.0, 2.0, f64::INFINITY),      // |x| > 1: no identity, diverges
+            (0.0, 1.0, 0.0, 1.0, f64::INFINITY),      // x = 1
+            (0.0, 1.0, -1.0, 2.0, 1.0),               // a = 0 with c != 0
+            (1.0, 0.0, 0.0, 0.3, 1.0),                // b = c = 0, cut series
+            (1.0, 0.0, 0.0, 2.0, f64::INFINITY),      // b = c = 0 outside the disk
+            (-1.0, 1.0, -1.0, 0.3, 1.4285714285714286), // a = c: (1-x)^-b at the pole
+            (-2.0, 1.0, -2.0, 0.3, 1.4285714285714286), // the same, degree 2
+            (-2.0, 1.0, -2.0, 2.0, f64::INFINITY),    // a = c only inside the disk
+            (-1.0, 1.0, -2.0, 0.3, 1.15),             // terminates before the pole
+            (-1.0, 1.0, -2.0, -1.0, 0.5),
+            (-1.0, 1.0, -2.0, 2.0, 2.0),
+            (-1.0, 1.0, -2.0, -2.0, f64::NAN), // exact 0 walks on into the pole
+            (1.0, -1.0, -1.0, 0.3, 1.3),       // b = c negative integer
+            (1.0, -1.0, -1.0, -1.0, f64::NAN), // its sum is 0: cephes gives NaN
+            (-1.0, -1.0, -1.0, 0.3, 0.7),
+            (-1.0, -1.0, -2.0, 2.0, f64::NAN),
+            (-2.0, -3.0, -3.0, -2.0, 9.0),
+            (-3.0, -1.0, -2.0, 2.0, -2.0), // b terminates, a would not
+            (-2.0, 0.5, -3.0, 0.3, 1.11125),
+            (0.5, 1.0, -1.0, 0.3, f64::INFINITY),
+        ];
+        for (a, b, c, x, want) in real_rows {
+            let got = get_scalar(&hyp2f1(
+                &scalar(a),
+                &scalar(b),
+                &scalar(c),
+                &scalar(x),
+                RuntimeMode::Strict,
+            ))
+            .expect("real scalar");
+            assert!(
+                same(got, want),
+                "hyp2f1({a}, {b}, {c}, {x}) = {got}, scipy {want}"
+            );
+        }
+
+        // (a, b, c, z.re, z.im, scipy's complex routine re, im)
+        let complex_rows = [
+            (1.0, 2.0, 0.0, 0.3, 0.0, f64::INFINITY, 0.0),
+            (1.0, 2.0, -1.0, 0.3, 0.2, f64::INFINITY, 0.0),
+            (1.0, 2.0, -3.0, 2.0, 0.5, f64::INFINITY, 0.0),
+            (1.0, 2.0, 0.0, 0.0, 0.0, f64::NAN, 0.0), // z = 0, c = 0
+            (2.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0),     // z = 0, c != 0
+            (0.0, 1.0, 0.0, 0.3, 0.0, 1.0, 0.0),      // a = 0 even at c = 0 (real gives 1/0.7)
+            (0.0, 1.0, -1.0, 0.3, 0.2, 1.0, 0.0),
+            (-1.0, 1.0, -1.0, 0.3, 0.0, 1.3, 0.0), // real routine: 1/(1-0.3)
+            (-1.0, 1.0, -1.0, 0.3, 0.2, 1.3, 0.2),
+            (-1.0, 1.0, -1.0, 2.0, 0.5, 3.0, 0.5),
+            (-1.0, 1.0, -2.0, 0.3, 0.2, 1.15, 0.1),
+            (-1.0, 1.0, -3.0, 0.3, 0.0, 1.1, 0.0),
+            (-1.0, 1.0, 0.0, 0.3, 0.2, f64::INFINITY, 0.0), // c above a: the pole wins
+            (-1.0, -1.0, -1.0, 0.3, 0.2, 0.7, -0.2),
+            (-2.0, 1.0, -2.0, 0.3, 0.0, 1.3900000000000001, 0.0), // real routine: 1/(1-0.3)
+            (-2.0, 1.0, -2.0, 0.3, 0.2, 1.35, 0.32),
+            (-2.0, -3.0, -3.0, 0.3, 0.2, 0.45, -0.28),
+            (-3.0, -1.0, -2.0, 0.3, 0.2, 0.55, -0.30000000000000004), // degree from b
+        ];
+        for (a, b, c, zr, zi, want_re, want_im) in complex_rows {
+            let got = get_complex_scalar(&hyp2f1(
+                &complex(a, 0.0),
+                &complex(b, 0.0),
+                &complex(c, 0.0),
+                &complex(zr, zi),
+                RuntimeMode::Strict,
+            ))
+            .expect("complex scalar");
+            assert!(
+                same(got.re, want_re) && same(got.im, want_im),
+                "hyp2f1({a}, {b}, {c}, {zr}+{zi}j) = {got:?}, scipy {want_re}+{want_im}j"
+            );
+        }
+
+        // Must-hit rows away from the poles keep SciPy's values on both routes.
+        let away = [
+            (1.0, 2.0, 3.0, 0.3, 1.259443198638497),
+            (-2.0, 1.0, 3.0, 0.3, 0.815),
+        ];
+        for (a, b, c, x, want) in away {
+            let got = get_scalar(&hyp2f1(
+                &scalar(a),
+                &scalar(b),
+                &scalar(c),
+                &scalar(x),
+                RuntimeMode::Strict,
+            ))
+            .expect("real scalar");
+            assert!(
+                (got - want).abs() <= 1e-14 * want.abs(),
+                "hyp2f1({a}, {b}, {c}, {x}) = {got}"
+            );
+        }
+        let away = get_complex_scalar(&hyp2f1(
+            &complex(1.0, 0.0),
+            &complex(2.0, 0.0),
+            &complex(3.0, 0.0),
+            &complex(0.3, 0.2),
+            RuntimeMode::Strict,
+        ))
+        .expect("complex scalar");
+        let want = Complex64::new(1.2151379753269347, 0.21565521941980995);
+        assert!(
+            (away - want).abs() <= 1e-14 * want.abs(),
+            "{away:?} vs {want:?}"
+        );
+
+        // Hardened: the divergent pole and the lost value fail closed; a defined value is served.
+        for (c, x, kind) in [
+            (0.0, 0.3, SpecialErrorKind::DomainError),
+            (-2.0, -2.0, SpecialErrorKind::CancellationRisk),
+        ] {
+            let out = hyp2f1(
+                &scalar(-1.0),
+                &scalar(1.0),
+                &scalar(c),
+                &scalar(x),
+                RuntimeMode::Hardened,
+            );
+            assert_eq!(
+                error_kind(&out),
+                Some(kind),
+                "hardened hyp2f1(-1, 1, {c}, {x})"
+            );
+        }
+        let served = get_scalar(&hyp2f1(
+            &scalar(-1.0),
+            &scalar(1.0),
+            &scalar(-2.0),
+            &scalar(0.3),
+            RuntimeMode::Hardened,
+        ));
+        assert_eq!(served, Some(1.15));
+        let refused = hyp2f1(
+            &complex(1.0, 0.0),
+            &complex(2.0, 0.0),
+            &complex(-1.0, 0.0),
+            &complex(0.3, 0.2),
+            RuntimeMode::Hardened,
+        );
+        assert_eq!(error_kind(&refused), Some(SpecialErrorKind::DomainError));
+    }
+
     #[test]
     fn hyp1f1_b_zero_errors_hardened() {
         let r = hyp1f1(
@@ -5212,7 +5557,9 @@ mod tests {
     }
 
     #[test]
-    fn hyp2f1_c_zero_returns_nan_strict() {
+    fn hyp2f1_c_zero_diverges_like_scipy_strict() {
+        // scipy.special.hyp2f1(1, 1, 0, 0.5) is inf (Euler's transform lands on the pole); this
+        // test used to pin NaN (frankenscipy-b3o4v).
         let r = hyp2f1(
             &scalar(1.0),
             &scalar(1.0),
@@ -5220,8 +5567,7 @@ mod tests {
             &scalar(0.5),
             RuntimeMode::Strict,
         );
-        let val = get_scalar(&r).unwrap_or(f64::NAN);
-        assert!(val.is_nan(), "c=0 should return NaN in strict mode");
+        assert_eq!(get_scalar(&r), Some(f64::INFINITY));
     }
 
     #[test]

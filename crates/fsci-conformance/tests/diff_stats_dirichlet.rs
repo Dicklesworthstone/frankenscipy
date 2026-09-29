@@ -10,13 +10,14 @@
 //! 4 (alpha) fixtures × 4 simplex points × 2 funcs = 32
 //! cases via subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::Dirichlet;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -89,14 +91,14 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write dirichlet diff log");
 }
 
-fn fsci_eval(func: &str, alpha: &[f64], x: &[f64]) -> Option<f64> {
+// A non-finite value is returned as-is: the ledger records it against SciPy's answer.
+fn fsci_eval(func: &str, alpha: &[f64], x: &[f64]) -> f64 {
     let dist = Dirichlet::new(alpha);
-    let v = match func {
+    match func {
         "pdf" => dist.pdf(x),
         "logpdf" => dist.logpdf(x),
-        _ => return None,
-    };
-    if v.is_finite() { Some(v) } else { None }
+        other => panic!("dirichlet: unknown func {other}"),
+    }
 }
 
 fn generate_query() -> OracleQuery {
@@ -252,21 +254,25 @@ fn diff_stats_dirichlet() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_dirichlet", &["pdf", "logpdf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, &case.alpha, &case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let func = case.func.as_str();
+        let rust_v = fsci_eval(func, &case.alpha, &case.x);
+        let Some((scipy_v, rust_v)) = ledger.pair(func, &case.case_id, oracle.value, Some(rust_v))
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(func, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -275,6 +281,7 @@ fn diff_stats_dirichlet() {
         test_id: "diff_stats_dirichlet".into(),
         category: "scipy.stats.dirichlet.pdf/logpdf".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +306,6 @@ fn diff_stats_dirichlet() {
         diffs.len(),
         max_overall
     );
+    // every (alpha, x) point is one pdf case and one logpdf case
+    ledger.finish(query.points.iter().filter(|c| c.func == "pdf").count());
 }

@@ -1,0 +1,98 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+ Downloading crates ...
+  Downloaded pest_generator v2.8.8
+  Downloaded npyz v0.9.1
+  Downloaded pest_meta v2.8.8
+  Downloaded py_literal v0.4.0
+  Downloaded pest_derive v2.8.8
+  Downloaded pest v2.8.8
+  Downloaded zlib-rs v0.6.6
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.1
+   Compiling cfg-if v1.0.4
+   Compiling num-traits v0.2.19
+   Compiling memchr v2.8.3
+   Compiling syn v3.0.3
+   Compiling serde_core v1.0.229
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.4.0
+   Compiling cpufeatures v0.3.0
+   Compiling zmij v1.0.23
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling indexmap v2.14.0
+   Compiling blake3 v1.8.7
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling serde_derive v1.0.229
+   Compiling syn v2.0.119
+   Compiling crossbeam-utils v0.8.22
+   Compiling arrayvec v0.7.8
+   Compiling typenum v1.20.1
+   Compiling constant_time_eq v0.4.2
+   Compiling itoa v1.0.18
+   Compiling num-integer v0.1.46
+   Compiling crossbeam-epoch v0.9.20
+   Compiling fsci-runtime v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-runtime)
+   Compiling num-complex v0.4.6
+   Compiling crossbeam-deque v0.8.7
+   Compiling bytemuck v1.25.2
+   Compiling safe_arch v1.1.0
+   Compiling matrixmultiply v0.3.11
+   Compiling rayon-core v1.13.0
+   Compiling wide v1.5.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling approx v0.5.1
+   Compiling rawpointer v0.2.1
+   Compiling simba v0.10.0
+   Compiling digest v0.10.7
+   Compiling fsci-fft v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-fft)
+   Compiling num-rational v0.4.2
+   Compiling nalgebra-macros v0.3.0
+   Compiling either v1.17.0
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling rayon v1.12.0
+   Compiling nalgebra v0.35.0
+   Compiling ucd-trie v0.1.7
+   Compiling pest v2.8.8
+   Compiling pest_meta v2.8.8
+   Compiling pest_generator v2.8.8
+   Compiling crc32fast v1.5.0
+   Compiling pest_derive v2.8.8
+   Compiling num-bigint v0.4.8
+   Compiling fsci-linalg v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-linalg)
+   Compiling zlib-rs v0.6.6
+   Compiling thiserror v2.0.20
+   Compiling flate2 v1.1.9
+   Compiling py_literal v0.4.0
+   Compiling thiserror-impl v2.0.20
+   Compiling byteorder v1.5.0
+   Compiling typed-path v0.12.3
+   Compiling zip v8.6.0
+   Compiling npyz v0.9.1
+   Compiling fsci-sparse v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-sparse)
+   Compiling libc v0.2.189
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling chacha20 v0.10.1
+   Compiling rand v0.10.2
+   Compiling fsci-opt v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-opt)
+   Compiling fsci-integrate v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-integrate)
+   Compiling fsci-spatial v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-spatial)
+   Compiling fsci-interpolate v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-interpolate)
+   Compiling fsci-special v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-special)
+   Compiling fsci-ndimage v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-ndimage)
+   Compiling fsci-stats v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-stats)
+   Compiling fsci-signal v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-signal)
+   Compiling fsci-cluster v0.2.0 (/data/projects/.worktrees/frankenscipy-scoreboard/crates/fsci-cluster)
+error: could not compile `fsci-linalg` (bin "perf_eigh_vs_scipy") due to 3 previous errors; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...

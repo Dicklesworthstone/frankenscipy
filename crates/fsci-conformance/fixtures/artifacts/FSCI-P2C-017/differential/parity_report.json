@@ -73,8 +73,7 @@
   "failed_cases": 0,
   "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-017_io_core.json",
   "oracle_status": {
-    "status": "failed",
-    "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+    "status": "available"
   },
   "differential_case_results": [
     {
@@ -88,8 +87,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -103,8 +101,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -118,8 +115,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -133,8 +129,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -148,8 +143,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -163,8 +157,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -178,8 +171,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -193,8 +185,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -208,8 +199,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -223,8 +213,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -238,8 +227,7 @@
         "comparison_mode": "allclose"
       },
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -249,8 +237,7 @@
       "max_diff": null,
       "tolerance_used": null,
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     },
     {
@@ -260,11 +247,10 @@
       "max_diff": null,
       "tolerance_used": null,
       "oracle_status": {
-        "status": "failed",
-        "reason": "Traceback (most recent call last):\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 244, in <module>\n    raise SystemExit(main())\n                     ~~~~^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 234, in main\n    _run_case(case, scipy_io, wavfile, np) for case in fixture.get(\"cases\", [])\n    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 176, in _run_case\n    return _run_loadmat(case, scipy_io, np)\n  File \"/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_io_oracle.py\", line 92, in _run_loadmat\n    loaded = scipy_io.loadmat(stream)\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 235, in loadmat\n    MR, _ = mat_reader_factory(f, **kwargs)\n            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_mio.py\", line 74, in mat_reader_factory\n    mjv, mnv = _get_matfile_version(byte_stream)\n               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^\n  File \"/home/ubuntu/.local/lib/python3.13/site-packages/scipy/io/matlab/_miobase.py\", line 236, in _get_matfile_version\n    raise MatReadError(\"Mat file appears to be truncated\")\nscipy.io.matlab._miobase.MatReadError: Mat file appears to be truncated"
+        "status": "available"
       }
     }
   ],
-  "report_kind": "self_check",
-  "generated_unix_ms": 1777873168046
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1790392936392
 }

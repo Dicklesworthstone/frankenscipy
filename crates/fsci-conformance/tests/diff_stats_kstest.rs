@@ -22,13 +22,14 @@
 //! the first live-oracle run (2026-09-04). See [frankenscipy-8rfh5] and
 //! [frankenscipy-ksk1u].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, KstestTarget, Normal, kstest};
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -278,37 +280,52 @@ fn diff_stats_kstest() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_kstest",
+        &[
+            "cdf.statistic",
+            "cdf.pvalue",
+            "sample.statistic",
+            "sample.pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = match case.mode.as_str() {
             "cdf" => kstest(&case.data, KstestTarget::Cdf(standard_normal_cdf)),
             "sample" => kstest(&case.data, KstestTarget::Sample(&case.reference)),
-            _ => continue,
+            other => panic!("unknown mode {other} in {}", case.case_id),
         };
 
-        if let Some(s_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - s_stat).abs();
+        let stat_arm = format!("{}.statistic", case.mode);
+        let pvalue_arm = format!("{}.pvalue", case.mode);
+        let arms = [
+            (
+                stat_arm.as_str(),
+                scipy_arm.statistic,
+                result.statistic,
+                STAT_TOL,
+            ),
+            (
+                pvalue_arm.as_str(),
+                scipy_arm.pvalue,
+                result.pvalue,
+                PVALUE_TOL,
+            ),
+        ];
+        for (arm, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.statistic", case.mode),
+                arm: arm.into(),
                 abs_diff,
-                pass: abs_diff <= STAT_TOL,
-            });
-        }
-        if let Some(s_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - s_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.pvalue", case.mode),
-                abs_diff,
-                pass: abs_diff <= PVALUE_TOL,
+                pass: abs_diff <= tol,
             });
         }
     }
@@ -319,6 +336,7 @@ fn diff_stats_kstest() {
         test_id: "diff_stats_kstest".into(),
         category: "scipy.stats.kstest dispatch (cdf | sample)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -343,4 +361,11 @@ fn diff_stats_kstest() {
         diffs.len(),
         max_overall
     );
+    // Each dispatch mode has its own case set; each arm must compare all of its mode's cases.
+    let min_per_arm = ["cdf", "sample"]
+        .iter()
+        .map(|mode| query.points.iter().filter(|c| c.mode == *mode).count())
+        .min()
+        .expect("two dispatch modes");
+    ledger.finish(min_per_arm);
 }

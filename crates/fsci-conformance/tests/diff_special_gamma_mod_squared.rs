@@ -10,13 +10,14 @@
 //! acceptable for the scattering/physics use cases this helper
 //! targets but not high-precision.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::gamma_mod_squared;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -200,15 +202,17 @@ fn diff_special_gamma_mod_squared() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_gamma_mod_squared", &["gamma_mod_squared"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let Some((expected, actual)) = ledger.pair(
+            "gamma_mod_squared",
+            &case.case_id,
+            pmap.get(&case.case_id).and_then(|arm| arm.value),
+            Some(gamma_mod_squared(case.a, case.b)),
+        ) else {
             continue;
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let actual = gamma_mod_squared(case.a, case.b);
         let abs_d = (actual - expected).abs();
         let rel_d = if expected.abs() > 1.0e-12 {
             abs_d / expected.abs()
@@ -216,6 +220,7 @@ fn diff_special_gamma_mod_squared() {
             abs_d
         };
         max_rel = max_rel.max(rel_d);
+        ledger.compared("gamma_mod_squared", &case.case_id, rel_d <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rel_diff: rel_d,
@@ -229,6 +234,7 @@ fn diff_special_gamma_mod_squared() {
         test_id: "diff_special_gamma_mod_squared".into(),
         category: "fsci_special::gamma_mod_squared vs scipy.special.gamma".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -249,4 +255,5 @@ fn diff_special_gamma_mod_squared() {
         diffs.len(),
         max_rel
     );
+    ledger.finish(query.points.len());
 }

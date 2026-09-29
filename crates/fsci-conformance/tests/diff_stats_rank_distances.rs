@@ -11,13 +11,14 @@
 //! 4 (rank1, rank2) fixtures × 2 funcs = 8 cases via
 //! subprocess. Tol 1e-12 abs (closed-form integer sums).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kendall_distance, spearman_footrule};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,28 +240,34 @@ fn diff_stats_rank_distances() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_rank_distances",
+        &["spearman_footrule", "kendall_distance"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = scipy_arm.value {
-            let r1: Vec<usize> = case.rank1.iter().map(|&x| x as usize).collect();
-            let r2: Vec<usize> = case.rank2.iter().map(|&x| x as usize).collect();
-            let rust_v = match case.func.as_str() {
-                "spearman_footrule" => spearman_footrule(&r1, &r2),
-                "kendall_distance" => kendall_distance(&r1, &r2) as f64,
-                _ => continue,
-            };
-            if rust_v.is_finite() {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: case.func.clone(),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
-        }
+        let r1: Vec<usize> = case.rank1.iter().map(|&x| x as usize).collect();
+        let r2: Vec<usize> = case.rank2.iter().map(|&x| x as usize).collect();
+        let rust_v = match case.func.as_str() {
+            "spearman_footrule" => Some(spearman_footrule(&r1, &r2)),
+            "kendall_distance" => Some(kendall_distance(&r1, &r2) as f64),
+            _ => None,
+        };
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, rust_v)
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -268,6 +276,7 @@ fn diff_stats_rank_distances() {
         test_id: "diff_stats_rank_distances".into(),
         category: "spearman_footrule + kendall_distance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -292,4 +301,10 @@ fn diff_stats_rank_distances() {
         diffs.len(),
         max_overall
     );
+    let per_func = ["spearman_footrule", "kendall_distance"]
+        .iter()
+        .map(|f| query.points.iter().filter(|c| c.func == *f).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_func);
 }

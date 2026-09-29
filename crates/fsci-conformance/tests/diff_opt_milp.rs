@@ -6,13 +6,14 @@
 //!
 //! Tolerance: 1e-6 abs on x and fun (LP relaxations + B&B can drift).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{Integrality, MilpOptions, MilpProblem, milp};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -259,14 +261,11 @@ fn diff_opt_milp() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_milp", &["milp"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(efun) = arm.fun else {
-            continue;
-        };
+        // A missing oracle row is recorded as SciPy giving no value, not skipped.
+        let scipy_fun = pmap.get(&case.case_id).and_then(|arm| arm.fun);
         let integrality: Vec<Integrality> = case
             .integrality
             .iter()
@@ -281,16 +280,19 @@ fn diff_opt_milp() {
             b_eq: &case.b_eq,
             bounds: &case.bounds,
         };
-        let Ok(res) = milp(problem, opts) else {
+        // SciPy reports `fun` only on success, so an unsuccessful fsci solve is a failure.
+        let fsci_fun = milp(problem, opts)
+            .ok()
+            .filter(|res| res.success)
+            .map(|res| res.fun);
+        let Some((efun, fsci_fun)) = ledger.pair("milp", &case.case_id, scipy_fun, fsci_fun) else {
             continue;
         };
-        if !res.success {
-            continue;
-        }
         // Compare only objective value: x may be non-unique on degenerate
         // problems (e.g., mixed_eq has multiple optima).
-        let abs_d = (res.fun - efun).abs();
+        let abs_d = (fsci_fun - efun).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("milp", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -304,6 +306,7 @@ fn diff_opt_milp() {
         test_id: "diff_opt_milp".into(),
         category: "fsci_opt::milp vs scipy.optimize.milp".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -324,4 +327,5 @@ fn diff_opt_milp() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

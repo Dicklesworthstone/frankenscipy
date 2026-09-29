@@ -1958,14 +1958,18 @@ where
         MultivariateRootMethod::Hybr => {
             fsolve_with_options(func, x0, options.tol, options.max_iter)
         }
-        MultivariateRootMethod::Broyden1 => broyden1(func, x0, options.tol, options.max_iter),
-        MultivariateRootMethod::Broyden2 => broyden2(func, x0, options.tol, options.max_iter),
+        MultivariateRootMethod::Broyden1 => {
+            broyden1_iterate(func, x0, options.tol, options.max_iter)
+        }
+        MultivariateRootMethod::Broyden2 => {
+            broyden2_iterate(func, x0, options.tol, options.max_iter)
+        }
         MultivariateRootMethod::Anderson => {
-            anderson(func, x0, options.tol, options.max_iter, 5, 1.0)
+            anderson_iterate(func, x0, options.tol, options.max_iter, 5, 1.0)
         }
         MultivariateRootMethod::Lm => lm_root(func, x0, options.tol, options.max_iter),
         MultivariateRootMethod::NewtonKrylov => {
-            newton_krylov(func, x0, options.tol, options.max_iter)
+            newton_krylov_iterate(func, x0, options.tol, options.max_iter)
         }
         MultivariateRootMethod::DfSane => df_sane(func, x0, options.tol, options.max_iter),
     }
@@ -2046,7 +2050,39 @@ where
 /// using the rank-1 formula: B_{k+1} = B_k + (Δf - B_k Δx) Δx^T / ||Δx||²
 ///
 /// More efficient than Newton when the Jacobian is expensive to compute.
+///
+/// As `scipy.optimize.broyden1` raises `NoConvergence`, this fails with
+/// [`OptError::NoConvergence`] when `maxiter` iterations pass without meeting `tol`;
+/// [`root`] reports that case as an unconverged result instead.
 pub fn broyden1<F>(
+    func: F,
+    x0: &[f64],
+    tol: f64,
+    maxiter: usize,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    raise_no_convergence(broyden1_iterate(func, x0, tol, maxiter))
+}
+
+/// SciPy's nonlinear solvers raise `NoConvergence` when called directly, while `root` returns
+/// the unconverged result; the `*_iterate` cores return the result and the public entry
+/// points turn an unconverged one into the error.
+fn raise_no_convergence(
+    result: Result<MultivariateRootResult, OptError>,
+) -> Result<MultivariateRootResult, OptError> {
+    let result = result?;
+    if result.converged {
+        Ok(result)
+    } else {
+        Err(OptError::NoConvergence {
+            detail: result.message,
+        })
+    }
+}
+
+fn broyden1_iterate<F>(
     func: F,
     x0: &[f64],
     tol: f64,
@@ -2171,7 +2207,22 @@ where
 ///
 /// This is the "bad" Broyden method (as opposed to broyden1 which is "good").
 /// It tends to be slightly less robust but can work well on some problems.
+///
+/// Fails with [`OptError::NoConvergence`] where SciPy raises `NoConvergence`; see
+/// [`broyden1`].
 pub fn broyden2<F>(
+    func: F,
+    x0: &[f64],
+    tol: f64,
+    maxiter: usize,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    raise_no_convergence(broyden2_iterate(func, x0, tol, maxiter))
+}
+
+fn broyden2_iterate<F>(
     func: F,
     x0: &[f64],
     tol: f64,
@@ -2294,7 +2345,24 @@ where
 /// * `maxiter` - Maximum iterations
 /// * `m` - Number of previous iterates to store (mixing memory)
 /// * `beta` - Mixing parameter (step size, typically 1.0)
+///
+/// Fails with [`OptError::NoConvergence`] where SciPy raises `NoConvergence`; see
+/// [`broyden1`].
 pub fn anderson<F>(
+    func: F,
+    x0: &[f64],
+    tol: f64,
+    maxiter: usize,
+    m: usize,
+    beta: f64,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    raise_no_convergence(anderson_iterate(func, x0, tol, maxiter, m, beta))
+}
+
+fn anderson_iterate<F>(
     func: F,
     x0: &[f64],
     tol: f64,
@@ -2531,8 +2599,21 @@ where
 /// `J·v` by the forward finite difference `(F(x + εv) − F(x))/ε`
 /// (`ε = √ε_mach·(1+‖x‖)/‖v‖`, as in scipy's `KrylovJacobian`), globalized by an
 /// Armijo backtracking line search on `‖F‖`. Terminates when `‖F(x)‖ < f_tol`.
-/// Returns the same [`MultivariateRootResult`] as the other root methods.
+/// Returns the same [`MultivariateRootResult`] as the other root methods, and fails with
+/// [`OptError::NoConvergence`] where SciPy raises `NoConvergence`; see [`broyden1`].
 pub fn newton_krylov<F>(
+    func: F,
+    x0: &[f64],
+    f_tol: f64,
+    maxiter: usize,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    raise_no_convergence(newton_krylov_iterate(func, x0, f_tol, maxiter))
+}
+
+fn newton_krylov_iterate<F>(
     func: F,
     x0: &[f64],
     f_tol: f64,
@@ -4347,6 +4428,48 @@ mod tests {
         let f = |_x: &[f64]| vec![];
         let err = broyden1(f, &[], 1e-10, 200).expect_err("empty");
         assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn direct_nonlinear_solvers_raise_no_convergence_but_root_reports_it() {
+        // x^2 + 1 has no real root. SciPy: broyden1(F, [1.0], iter=5) raises NoConvergence,
+        // while root(F, [1.0], method='broyden1') returns success=False.
+        let f = |x: &[f64]| vec![x[0] * x[0] + 1.0];
+        let direct: [(&str, Result<super::MultivariateRootResult, crate::OptError>); 4] = [
+            ("broyden1", broyden1(f, &[1.0], 1e-10, 5)),
+            ("broyden2", broyden2(f, &[1.0], 1e-10, 5)),
+            ("anderson", anderson(f, &[1.0], 1e-10, 5, 5, 1.0)),
+            ("newton_krylov", newton_krylov(f, &[1.0], 1e-10, 5)),
+        ];
+        for (name, outcome) in direct {
+            assert!(
+                matches!(outcome, Err(crate::OptError::NoConvergence { .. })),
+                "{name}: {outcome:?}"
+            );
+        }
+        for method in [
+            MultivariateRootMethod::Broyden1,
+            MultivariateRootMethod::Broyden2,
+            MultivariateRootMethod::Anderson,
+            MultivariateRootMethod::NewtonKrylov,
+        ] {
+            let result = root(
+                f,
+                &[1.0],
+                MultivariateRootOptions {
+                    method,
+                    tol: 1e-10,
+                    max_iter: 5,
+                },
+            );
+            assert!(
+                matches!(&result, Ok(r) if !r.converged),
+                "{method:?}: root must report an unconverged result, not fail: {result:?}"
+            );
+        }
+        // A solvable system still returns Ok from the direct entry point.
+        let g = |x: &[f64]| vec![x[0] - 2.0];
+        assert!(broyden1(g, &[1.0], 1e-10, 50).expect("solvable").converged);
     }
 
     #[test]

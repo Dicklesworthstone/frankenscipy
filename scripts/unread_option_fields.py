@@ -35,21 +35,9 @@ EXCLUDED_CRATES = {"fsci-conformance"}
 STRUCT = re.compile(r"pub struct (\w+(?:Options|Config|Opts|Params|Settings))\b[^{;]*\{")
 FIELD = re.compile(r"pub\s+(\w+)\s*:")
 
-# (crate, struct, field) -> the open bead that owns wiring or removing it.
-KNOWN_OPEN = {
-    ("fsci-special", "SpecialErrConfig", field): "frankenscipy-8dndw.1 (seterr/errstate are names-only)"
-    for field in (
-        "singular",
-        "underflow",
-        "overflow",
-        "slow",
-        "loss",
-        "no_result",
-        "domain",
-        "arg",
-        "other",
-    )
-}
+# (crate, struct, field) -> the open bead that owns wiring or removing it. Empty: the nine
+# SpecialErrConfig fields listed here were wired by frankenscipy-8dndw.1 (errstate is real).
+KNOWN_OPEN: dict[tuple[str, str, str], str] = {}
 
 
 def library_code(text: str) -> str:

@@ -10,19 +10,21 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{polyint_definite, polyval_with_error};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["polyint_def", "polyval_err"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -63,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -228,21 +231,22 @@ fn diff_interpolate_polyint_def_polyval_err() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_polyint_def_polyval_err", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
+        let expected = pmap.get(&case.case_id).and_then(|arm| arm.value);
         let actual = match case.op.as_str() {
-            "polyint_def" => polyint_definite(&case.coeffs, case.a, case.b),
-            "polyval_err" => polyval_with_error(&case.coeffs, case.x).0,
-            _ => continue,
+            "polyint_def" => Some(polyint_definite(&case.coeffs, case.a, case.b)),
+            "polyval_err" => Some(polyval_with_error(&case.coeffs, case.x).0),
+            _ => None,
+        };
+        let Some((expected, actual)) = ledger.pair(&case.op, &case.case_id, expected, actual)
+        else {
+            continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -257,6 +261,7 @@ fn diff_interpolate_polyint_def_polyval_err() {
         test_id: "diff_interpolate_polyint_def_polyval_err".into(),
         category: "fsci_interpolate::polyint_definite + polyval_with_error vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -277,4 +282,10 @@ fn diff_interpolate_polyint_def_polyval_err() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

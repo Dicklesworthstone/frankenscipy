@@ -12,13 +12,14 @@
 //! 16 cases. Tol 1e-12 abs (closed-form integer / n
 //! histogram counts; bin edges via linspace).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{cumfreq, relfreq};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -237,45 +239,53 @@ fn diff_stats_freqhist() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_freqhist",
+        &[
+            "relfreq.frequencies",
+            "relfreq.bin_edges",
+            "cumfreq.frequencies",
+            "cumfreq.bin_edges",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let (rust_freqs, rust_edges) = match case.func.as_str() {
             "relfreq" => relfreq(&case.data, case.bins),
             "cumfreq" => cumfreq(&case.data, case.bins),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        if let Some(scipy_freqs) = &scipy_arm.freqs
-            && rust_freqs.len() == scipy_freqs.len()
-        {
+        let freq_arm = format!("{}.frequencies", case.func);
+        let edge_arm = format!("{}.bin_edges", case.func);
+        let arms = [
+            (
+                freq_arm.as_str(),
+                scipy_arm.freqs.as_deref(),
+                rust_freqs.as_slice(),
+            ),
+            (
+                edge_arm.as_str(),
+                scipy_arm.edges.as_deref(),
+                rust_edges.as_slice(),
+            ),
+        ];
+        // The ledger rejects a length mismatch or a non-finite element before the max fold.
+        for (arm, scipy, fsci) in arms {
+            let Some((scipy_v, rust_v)) = ledger.slices(arm, &case.case_id, scipy, Some(fsci))
+            else {
+                continue;
+            };
             let mut max_local = 0.0_f64;
-            for (r, s) in rust_freqs.iter().zip(scipy_freqs.iter()) {
-                if r.is_finite() {
-                    max_local = max_local.max((r - s).abs());
-                }
+            for (r, s) in rust_v.iter().zip(scipy_v.iter()) {
+                max_local = max_local.max((r - s).abs());
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(arm, &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.frequencies", case.func),
-                abs_diff: max_local,
-                pass: max_local <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_edges) = &scipy_arm.edges
-            && rust_edges.len() == scipy_edges.len()
-        {
-            let mut max_local = 0.0_f64;
-            for (r, s) in rust_edges.iter().zip(scipy_edges.iter()) {
-                if r.is_finite() {
-                    max_local = max_local.max((r - s).abs());
-                }
-            }
-            max_overall = max_overall.max(max_local);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.bin_edges", case.func),
+                arm: arm.into(),
                 abs_diff: max_local,
                 pass: max_local <= ABS_TOL,
             });
@@ -288,6 +298,7 @@ fn diff_stats_freqhist() {
         test_id: "diff_stats_freqhist".into(),
         category: "scipy.stats.{relfreq, cumfreq}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -312,4 +323,6 @@ fn diff_stats_freqhist() {
         diffs.len(),
         max_overall
     );
+    // Each func's two arms compare every dataset run through that func.
+    ledger.finish(query.points.iter().filter(|c| c.func == "relfreq").count());
 }

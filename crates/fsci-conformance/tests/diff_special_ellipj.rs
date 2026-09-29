@@ -14,13 +14,14 @@
 //! large-amplitude phase regime without papering over real
 //! drift.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::ellipj;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -216,6 +218,7 @@ fn diff_special_ellipj() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_ellipj", &["sn", "cn", "dn", "ph"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -227,21 +230,23 @@ fn diff_special_ellipj() {
             ("ph", scipy_arm.ph, ph),
         ];
         for (arm_name, scipy_v, rust_v) in arms {
-            if let Some(scipy_v) = scipy_v
-                && rust_v.is_finite()
-            {
-                let abs_d = (rust_v - scipy_v).abs();
-                let rel_d = abs_d / scipy_v.abs().max(f64::MIN_POSITIVE);
-                max_overall = max_overall.max(abs_d);
-                let pass = abs_d <= ABS_TOL || rel_d <= REL_TOL;
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: arm_name.into(),
-                    abs_diff: abs_d,
-                    rel_diff: rel_d,
-                    pass,
-                });
-            }
+            let Some((scipy_v, rust_v)) =
+                ledger.pair(arm_name, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_d = (rust_v - scipy_v).abs();
+            let rel_d = abs_d / scipy_v.abs().max(f64::MIN_POSITIVE);
+            max_overall = max_overall.max(abs_d);
+            let pass = abs_d <= ABS_TOL || rel_d <= REL_TOL;
+            ledger.compared(arm_name, &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: arm_name.into(),
+                abs_diff: abs_d,
+                rel_diff: rel_d,
+                pass,
+            });
         }
     }
 
@@ -251,6 +256,7 @@ fn diff_special_ellipj() {
         test_id: "diff_special_ellipj".into(),
         category: "scipy.special.ellipj".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -263,4 +269,5 @@ fn diff_special_ellipj() {
         all_pass,
         "ellipj diff harness failed; see fixtures/artifacts/{PACKET_ID}/diff/diff_special_ellipj.json"
     );
+    ledger.finish(query.points.len());
 }

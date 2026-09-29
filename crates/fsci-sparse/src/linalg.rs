@@ -28,7 +28,7 @@ use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
 // still builds clean, so a `cargo build` or `cargo check` does not see the breakage.
 #[cfg(test)]
 use crate::formats::CooMatrix;
-use crate::ops::FormatConvertible;
+use crate::ops::{FormatConvertible, scale_csr, sub_csr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseBackend {
@@ -38,6 +38,21 @@ pub enum SparseBackend {
     NativeSparseLu,
     CubicSpectralLu,
     PeriodicCuboidSpectralLu,
+    /// Reported, not requested: Cholesky of a narrowly banded symmetric matrix in band
+    /// storage, validated against A before it is accepted.
+    BandedCholesky,
+    /// Reported, not requested: LU with partial pivoting of a narrowly banded matrix in band
+    /// storage.
+    BandedLu,
+    /// Reported, not requested: dense LU of the densified matrix (small or dense-pattern
+    /// systems).
+    DenseLu,
+    /// Reported, not requested: the CASP portfolio's iterative method produced the answer.
+    /// Never `SparseSolverAction::SuperLU`; a direct solve reports the arm that ran.
+    Iterative(SparseSolverAction),
+    /// Reported, not requested: `spilu`'s native threshold ILU with partial pivoting, which
+    /// follows SuperLU's `dgsitrf` drop and pivot rules column by column.
+    NativeIlutp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +107,148 @@ impl Default for LuOptions {
     }
 }
 
+/// SuperLU's `ILU_DropRule` bit set, which SciPy's `spilu(drop_rule=...)` passes straight
+/// through (frankenscipy-1ksfv.11).
+///
+/// The bits keep SuperLU's values, including its one surprise: `SECONDARY` is not a bit of its
+/// own but `PROWS | COLUMN | AREA` (0x000E). `dgsitrf` tests `rule & DROP_SECONDARY`, so ANY of
+/// those three switches secondary (quota) dropping on — the default `BASIC | AREA` included —
+/// and naming `secondary` sets all three, which selects the PROWS quota because `dgsitrf` tests
+/// PROWS first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IluDropRule(u32);
+
+impl IluDropRule {
+    /// SuperLU `NODROP` (SciPy `drop_rule=0`): nothing is dropped.
+    pub const NONE: Self = Self(0x0000);
+    /// `DROP_BASIC`: drop L rows whose largest multiplier is below `drop_tol`.
+    pub const BASIC: Self = Self(0x0001);
+    /// `DROP_PROWS`: quota `fill_factor·nnz(A)/n` per row (ILUTP(p, tau)).
+    pub const PROWS: Self = Self(0x0002);
+    /// `DROP_COLUMN`: quota `fill_factor·nnz(A(:,j))` per column.
+    pub const COLUMN: Self = Self(0x0004);
+    /// `DROP_AREA`: quota from `fill_factor·nnz(A(:,1:j))`, the running area.
+    pub const AREA: Self = Self(0x0008);
+    /// `DROP_SECONDARY` = `PROWS | COLUMN | AREA`.
+    pub const SECONDARY: Self = Self(0x000E);
+    /// `DROP_DYNAMIC`: double or halve the tolerance as fill runs over or under the area quota.
+    pub const DYNAMIC: Self = Self(0x0010);
+    /// `DROP_INTERP`: secondary threshold by interpolation instead of selection.
+    pub const INTERP: Self = Self(0x0100);
+    const KNOWN_BITS: u32 = 0x011F;
+
+    /// The SuperLU bit pattern.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// From SuperLU bits, as SciPy accepts an integer `drop_rule`.
+    ///
+    /// # Errors
+    /// `InvalidArgument` for a bit SuperLU does not define.
+    pub fn from_bits(bits: u32) -> SparseResult<Self> {
+        if bits & !Self::KNOWN_BITS != 0 {
+            return Err(SparseError::InvalidArgument {
+                message: format!("invalid ILU drop rule bits {bits:#x}"),
+            });
+        }
+        Ok(Self(bits))
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Does this rule share any bit with `other`? (`rule & DROP_X` in SuperLU.)
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Parse SciPy's string form: comma-separated names from `basic`, `prows`, `column`, `area`,
+    /// `secondary`, `dynamic`, `interp`, compared as SciPy's `my_strxcmp` does (case, underscores
+    /// and whitespace ignored). Like SciPy, an empty name is an error.
+    ///
+    /// # Errors
+    /// `InvalidArgument` for an unknown or empty name.
+    pub fn from_scipy_spec(spec: &str) -> SparseResult<Self> {
+        let mut rule = Self::NONE;
+        for item in spec.split(',') {
+            let name: String = item
+                .chars()
+                .filter(|c| *c != '_' && !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect();
+            let one = match name.as_str() {
+                "basic" => Self::BASIC,
+                "prows" => Self::PROWS,
+                "column" => Self::COLUMN,
+                "area" => Self::AREA,
+                "secondary" => Self::SECONDARY,
+                "dynamic" => Self::DYNAMIC,
+                "interp" => Self::INTERP,
+                _ => {
+                    return Err(SparseError::InvalidArgument {
+                        message: format!("invalid value for 'ILU_DropRule' parameter: {item:?}"),
+                    });
+                }
+            };
+            rule = rule.union(one);
+        }
+        Ok(rule)
+    }
+}
+
+impl Default for IluDropRule {
+    /// SuperLU `ilu_set_default_options`: `DROP_BASIC | DROP_AREA`.
+    fn default() -> Self {
+        Self::BASIC.union(Self::AREA)
+    }
+}
+
+impl std::ops::BitOr for IluDropRule {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        self.union(other)
+    }
+}
+
+/// Options of [`spilu`], each meaning what the same-named `scipy.sparse.linalg.spilu` argument
+/// means. Defaults are SuperLU's `ilu_set_default_options` and `sp_ienv`, which SciPy uses when
+/// an argument is `None`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IluOptions {
+    /// Strict: a zero pivot fails the factorization, as SciPy's "Factor is exactly singular"
+    /// does. Hardened: non-finite input is refused, and a zero pivot is replaced the way
+    /// SuperLU itself replaces it (by `‖A(:,j)‖∞ · 0.01^(1 − j/n)`) and counted in
+    /// [`IluStatistics::zero_pivots`].
     pub mode: RuntimeMode,
+    /// SciPy `permc_spec`, reported back as `ordering_used`. `Colamd` is SuperLU's vendored
+    /// COLAMD 2.9.1; `MmdAta` / `MmdAtPlusA` run this crate's exact minimum degree on AᵀA /
+    /// A+Aᵀ (the same objective as SuperLU's `genmmd`, not its multiple-elimination variant);
+    /// `Amd` and `ReverseCuthillMcKee` are fsci extensions on A+Aᵀ.
     pub ordering: PermutationOrdering,
+    /// SciPy `drop_tol` (SuperLU `ILU_DropTol`, default 1e-4). U entries below
+    /// `drop_tol·‖A(:,j)‖∞` and L rows whose multipliers are all below `drop_tol` are dropped.
     pub drop_tol: f64,
+    /// SciPy `fill_factor` (SuperLU `ILU_FillFactor`, default 10): the quota scale of the
+    /// secondary dropping selected by `drop_rule`.
     pub fill_factor: f64,
+    /// SciPy `drop_rule` (SuperLU `ILU_DropRule`, default `BASIC | AREA`).
+    pub drop_rule: IluDropRule,
+    /// SciPy `diag_pivot_thresh` (SuperLU `DiagPivotThresh`, 0.1 for ILU): the diagonal entry is
+    /// the pivot when its magnitude is at least this fraction of the column's largest candidate.
+    pub diag_pivot_thresh: f64,
+    /// SciPy `relax` (SuperLU `sp_ienv(2)` = 10): elimination-tree leaf subtrees with fewer
+    /// descendants than this are factored as one relaxed supernode, whose U part is never
+    /// dropped.
+    pub relax: usize,
+    /// SciPy `panel_size` (SuperLU `sp_ienv(1)` = 20): columns factored as one panel, which see
+    /// the supernode that ended before the panel undropped.
+    pub panel_size: usize,
 }
 
 impl Default for IluOptions {
@@ -107,6 +258,10 @@ impl Default for IluOptions {
             ordering: PermutationOrdering::Colamd,
             drop_tol: 1e-4,
             fill_factor: 10.0,
+            drop_rule: IluDropRule::default(),
+            diag_pivot_thresh: 0.1,
+            relax: 10,
+            panel_size: 20,
         }
     }
 }
@@ -209,6 +364,8 @@ struct PackedTriangularRows {
 struct TriangularLevelSchedule {
     offsets: Vec<usize>,
     rows: Vec<usize>,
+    /// Stored entries each level's rows reduce over: the level's work.
+    work: Vec<usize>,
 }
 
 impl TriangularLevelSchedule {
@@ -256,33 +413,72 @@ impl TriangularLevelSchedule {
 
         let mut offsets = Vec::with_capacity(levels.len() + 1);
         let mut scheduled_rows = Vec::with_capacity(row_count);
+        let mut work = Vec::with_capacity(levels.len());
         offsets.push(0);
         for level in levels {
+            work.push(
+                level
+                    .iter()
+                    .map(|&row| rows.offsets[row + 1] - rows.offsets[row])
+                    .sum(),
+            );
             scheduled_rows.extend(level);
             offsets.push(scheduled_rows.len());
         }
         Some(Self {
             offsets,
             rows: scheduled_rows,
+            work,
         })
     }
 
+    #[cfg(test)]
     fn has_parallel_rows(&self) -> bool {
         self.offsets
             .windows(2)
             .any(|window| window[1] - window[0] > 1)
     }
 
-    fn levels(&self) -> impl Iterator<Item = &[usize]> {
+    /// Work in levels of at least [`LEVEL_PAR_MIN_WORK`], the only ones the pool runs.
+    fn pooled_work(&self) -> usize {
+        self.work
+            .iter()
+            .filter(|&&work| work >= LEVEL_PAR_MIN_WORK)
+            .sum()
+    }
+
+    fn total_work(&self) -> usize {
+        self.work.iter().sum()
+    }
+
+    /// Each level's rows with its work.
+    fn levels(&self) -> impl Iterator<Item = (&[usize], usize)> {
         self.offsets
             .windows(2)
-            .map(|window| &self.rows[window[0]..window[1]])
+            .zip(&self.work)
+            .map(|(window, &work)| (&self.rows[window[0]..window[1]], work))
     }
 }
 
+/// Stored entries a level reduces over before it goes to the rayon pool. A pooled level costs a
+/// dispatch and a barrier, microseconds, and before this gate every level took the pool as soon
+/// as any level had two rows. The factors of shift-invert eigsh are the example: a tridiagonal
+/// A − σI has wide levels of two-entry rows, microseconds of work each, and the eigensolve ran at
+/// 62–81 ms on 64 threads against 28–41 ms on one core (frankenscipy-moti4). A row-count gate
+/// (1024 rows) did not change that. Work is what the pool has to amortize.
+///
+/// Tuned on perf_splu's solve stage (3-D Laplacian, side 24, against live SuperLU): at 2^17 the
+/// solve lost ~4% (0.853x against 0.889–0.908x before the gate), because pooled levels had been
+/// helping there. At 2^15 it reads 0.889x, within the before runs, and the shift-invert case
+/// stays fixed.
+const LEVEL_PAR_MIN_WORK: usize = 1 << 15;
+
+/// A schedule pays only when most of the solve's work sits in levels big enough for the pool.
+/// Otherwise the plain row-order loop, with its sequential memory access, is the faster path.
 #[inline]
 fn level_schedule_is_useful(schedule: &TriangularLevelSchedule) -> bool {
-    schedule.has_parallel_rows()
+    2 * schedule.pooled_work() >= schedule.total_work()
+        && schedule.pooled_work() > 0
         && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() > 1)
 }
 
@@ -308,7 +504,16 @@ fn triangular_forward_substitute<F>(
         )
     };
     if let Some(schedule) = schedule {
-        for rows in schedule.levels() {
+        for (rows, work) in schedule.levels() {
+            // Rows in one level never read each other, so a light level solved in place, in
+            // any order, gives the same bits as the pooled collect.
+            if work < LEVEL_PAR_MIN_WORK {
+                for &row in rows {
+                    let value = reduce(row, solved);
+                    solved[row] = value;
+                }
+                continue;
+            }
             let completed = rows
                 .par_iter()
                 .map(|&row| (row, reduce(row, solved)))
@@ -355,7 +560,14 @@ fn triangular_backward_substitute(
         ) / pivot)
     };
     if let Some(schedule) = schedule {
-        for rows in schedule.levels() {
+        for (rows, work) in schedule.levels() {
+            if work < LEVEL_PAR_MIN_WORK {
+                for &row in rows {
+                    let value = reduce(row, solved)?;
+                    solved[row] = value;
+                }
+                continue;
+            }
             let completed = rows
                 .par_iter()
                 .map(|&row| reduce(row, solved).map(|value| (row, value)))
@@ -544,76 +756,115 @@ fn pivot_is_zero(pivot: f64) -> bool {
     pivot == 0.0
 }
 
-/// ILU(0) factorization result.
-///
-/// Stores L (unit lower triangular) and U (upper triangular) in CSR format,
-/// maintaining the same sparsity pattern as the original matrix.
-#[derive(Debug, Clone, PartialEq)]
+/// What one [`spilu`] factorization did (the bead's diagnosability list: pivots taken, entries
+/// dropped, supernodes formed). `nnz(L)`, `nnz(U)` and the ordering are on the factorization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IluStatistics {
+    /// Columns whose pivot was not the diagonal entry of A (threshold partial pivoting).
+    pub off_diagonal_pivots: usize,
+    /// Zero pivots replaced by SuperLU's fill tolerance. Nonzero only in Hardened mode; in Strict
+    /// mode a zero pivot fails the factorization, as it does in SciPy.
+    pub zero_pivots: usize,
+    /// Off-supernode U entries dropped by the drop tolerance or the fill quota.
+    pub dropped_u_entries: usize,
+    /// Stored L entries removed with their rows when a supernode ended.
+    pub dropped_l_entries: usize,
+    /// Supernodes formed, relaxed ones included.
+    pub supernodes: usize,
+    /// Relaxed supernodes: elimination-tree leaf subtrees factored as one dense block.
+    pub relaxed_supernodes: usize,
+}
+
+/// An incomplete factorization `Pr·A·Pc ≈ L·U` from [`spilu`], shaped like SciPy's `SuperLU`
+/// object: `L` unit lower triangular with its unit diagonal stored, `U` upper triangular, both in
+/// the permuted (step) numbering, with `perm_r[i]` the step at which row `i` of A was pivoted and
+/// `perm_c[j]` the position of column `j` of A in `A·Pc`.
+#[derive(Debug, Clone)]
 pub struct SparseIluFactorization {
     pub shape: (usize, usize),
     pub backend_used: SparseBackend,
     pub ordering_used: PermutationOrdering,
-    /// L factor data (unit lower triangular, stored in CSR row-by-row).
-    /// L diagonal entries are implicitly 1.0.
-    l_data: Vec<f64>,
-    l_indices: Vec<usize>,
-    l_indptr: Vec<usize>,
-    /// U factor data (upper triangular, stored in CSR row-by-row).
-    u_data: Vec<f64>,
-    u_indices: Vec<usize>,
-    u_indptr: Vec<usize>,
-    n: usize,
+    pub statistics: IluStatistics,
+    l: CscMatrix,
+    u: CscMatrix,
+    perm_r: Vec<usize>,
+    perm_c: Vec<usize>,
+    /// The row of A pivoted at each step, so the forward sweep reads `(Pr·b)[step]` as
+    /// `b[step_rows[step]]` without materialising `Pr·b`.
+    step_rows: Vec<usize>,
+    /// Strict lower rows of L and rows of U (diagonal first) for the shared triangular kernels.
+    lower: PackedTriangularRows,
+    upper: PackedTriangularRows,
+    lower_levels: TriangularLevelSchedule,
+    upper_levels: TriangularLevelSchedule,
 }
 
 impl SparseIluFactorization {
-    /// Solve L*U*x = b using forward/backward substitution.
-    pub fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        if b.len() != self.n {
-            return Err(SparseError::IncompatibleShape {
-                message: format!("rhs length {} != matrix size {}", b.len(), self.n),
-            });
-        }
-
-        // Forward substitution: L*y = b (L is unit lower triangular)
-        let mut y = b.to_vec();
-        for i in 0..self.n {
-            for idx in self.l_indptr[i]..self.l_indptr[i + 1] {
-                let j = self.l_indices[idx];
-                if j < i {
-                    y[i] -= self.l_data[idx] * y[j];
-                }
-            }
-        }
-
-        // Backward substitution: U*x = y
-        let mut x = y;
-        for i in (0..self.n).rev() {
-            for idx in self.u_indptr[i]..self.u_indptr[i + 1] {
-                let j = self.u_indices[idx];
-                if j > i {
-                    x[i] -= self.u_data[idx] * x[j];
-                }
-            }
-            // Divide by diagonal of U
-            let diag = self.get_u_diagonal(i);
-            if pivot_is_zero(diag) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero diagonal in U at row {i}"),
-                });
-            }
-            x[i] /= diag;
-        }
-
-        Ok(x)
+    /// L (SciPy `SuperLU.L`): unit lower triangular, unit diagonal stored, zeros not stored.
+    #[must_use]
+    pub const fn l(&self) -> &CscMatrix {
+        &self.l
     }
 
-    fn get_u_diagonal(&self, i: usize) -> f64 {
-        for idx in self.u_indptr[i]..self.u_indptr[i + 1] {
-            if self.u_indices[idx] == i {
-                return self.u_data[idx];
-            }
+    /// U (SciPy `SuperLU.U`): upper triangular with its diagonal, zeros not stored.
+    #[must_use]
+    pub const fn u(&self) -> &CscMatrix {
+        &self.u
+    }
+
+    /// SciPy `SuperLU.perm_r`: row `i` of A is row `perm_r[i]` of `Pr·A`.
+    #[must_use]
+    pub fn perm_r(&self) -> &[usize] {
+        &self.perm_r
+    }
+
+    /// SciPy `SuperLU.perm_c`: column `j` of A is column `perm_c[j]` of `A·Pc`.
+    #[must_use]
+    pub fn perm_c(&self) -> &[usize] {
+        &self.perm_c
+    }
+
+    /// `nnz(L) + nnz(U)`, SciPy's `ilu.L.nnz + ilu.U.nnz` (unit diagonal of L included). Not
+    /// SciPy's `SuperLU.nnz`, which counts supernodal storage including padding.
+    #[must_use]
+    pub fn lu_nnz(&self) -> usize {
+        self.l.nnz() + self.u.nnz()
+    }
+
+    /// Solve `L·U·z = Pr·b` and return `x = Pc·z`, SciPy's `SuperLU.solve(b)` (`trans='N'`).
+    ///
+    /// # Errors
+    /// `IncompatibleShape` when `b` does not have `n` entries.
+    pub fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let n = self.shape.0;
+        if b.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("rhs length {} != matrix size {n}", b.len()),
+            });
         }
-        0.0
+        let lower_schedule =
+            level_schedule_is_useful(&self.lower_levels).then_some(&self.lower_levels);
+        let upper_schedule =
+            level_schedule_is_useful(&self.upper_levels).then_some(&self.upper_levels);
+        let mut y = vec![0.0; n];
+        triangular_forward_substitute(
+            &self.lower.offsets,
+            &self.lower.columns,
+            &self.lower.values,
+            |row| b[self.step_rows[row]],
+            &mut y,
+            self.lower.contiguous,
+            lower_schedule,
+        );
+        triangular_backward_substitute(
+            &self.upper.offsets,
+            &self.upper.columns,
+            &self.upper.values,
+            &mut y,
+            self.upper.contiguous,
+            upper_schedule,
+        )?;
+        Ok(self.perm_c.iter().map(|&step| y[step]).collect())
     }
 }
 
@@ -5733,7 +5984,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             {
                 return Ok(SolveResult {
                     solution,
-                    backend_used: SparseBackend::NativeSparseLu,
+                    backend_used: SparseBackend::BandedCholesky,
                     ordering_used: options.ordering,
                     warnings: banded_warnings(),
                 });
@@ -5741,7 +5992,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             let solution = spsolve_banded_direct(a, b, options, bandwidth)?;
             return Ok(SolveResult {
                 solution,
-                backend_used: SparseBackend::NativeSparseLu,
+                backend_used: SparseBackend::BandedLu,
                 ordering_used: options.ordering,
                 warnings: banded_warnings(),
             });
@@ -5780,7 +6031,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
 
     Ok(SolveResult {
         solution: x.iter().copied().collect(),
-        backend_used: SparseBackend::Auto,
+        backend_used: SparseBackend::DenseLu,
         ordering_used: PermutationOrdering::Natural,
         warnings: Vec::new(),
     })
@@ -5886,7 +6137,7 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
         (
-            SparseBackend::Auto,
+            SparseBackend::DenseLu,
             PermutationOrdering::Natural,
             SparseLuInternal::Dense(matrix.lu()),
         )
@@ -5942,12 +6193,61 @@ pub fn splu_solve_many(
     }
 }
 
-/// ILU(0) incomplete LU factorization.
+/// SuperLU's `sp_ienv(7)`: the widest fundamental supernode `dgsitrf` forms, and half the tail
+/// (`2 · 10` columns) that `last_drop` exempts from L dropping.
+const ILU_MAX_SUPERNODE: usize = 10;
+/// SuperLU `ILU_FillTol` (`ilu_set_default_options`): a zero pivot at step `j` is replaced by
+/// `‖A(:,j)‖∞ · ILU_FILL_TOL^(1 − j/n)` (Hardened mode only; SciPy raises instead).
+const ILU_FILL_TOL: f64 = 1e-2;
+/// "No index": an unpivoted row, a column outside every relaxed supernode.
+const ILU_NONE: usize = usize::MAX;
+
+/// Threshold incomplete LU with partial pivoting: `scipy.sparse.linalg.spilu`
+/// (frankenscipy-1ksfv.11).
 ///
-/// Computes L and U factors maintaining the sparsity pattern of A.
-/// Matches `scipy.sparse.linalg.spilu(A, drop_tol=0)` behavior.
+/// SciPy's `spilu` is SuperLU's `dgsitrf` (ILUTP; X. S. Li and M. Shao, "A supernodal approach
+/// to incomplete LU factorization with partial pivoting", ACM TOMS 37(4), 2011) run with
+/// `ilu_set_default_options`. This is a column-by-column (left-looking, Gilbert–Peierls)
+/// factorization that follows `dgsitrf`'s rules for WHAT is dropped and WHEN, including the
+/// supernode bookkeeping those rules are phrased in:
 ///
-/// Input is CSC but internally converts to CSR for row-based ILU(0).
+/// * the column ordering `A·Pc` of `options.ordering` is followed (except for NATURAL) by the
+///   postorder of the column elimination tree, as SuperLU's `sp_preorder` does; NATURAL runs
+///   SuperLU's symmetric mode (etree of A+Aᵀ, no postorder), which SciPy's `spilu` requests;
+/// * relaxed supernodes: elimination-tree leaf subtrees with fewer than `relax` descendants are
+///   factored as one dense block whose U part is never dropped;
+/// * fundamental supernodes: column j joins column j−1's supernode when its L pattern is
+///   j−1's minus j−1's pivot row, up to 10 columns; U entries in the current supernode's rows
+///   are kept;
+/// * U column j: an off-supernode entry is dropped when `|u| < drop_tol·‖A(:,j)‖∞` or when the
+///   fill quota of `drop_rule` is used up, and beyond the quota only the largest survive
+///   (secondary dropping, selected on SIGNED values exactly as SuperLU's `dqselect` does);
+/// * threshold partial pivoting: the diagonal of A is the pivot when it is at least
+///   `diag_pivot_thresh` times the largest candidate, otherwise the largest candidate is;
+/// * L: when a supernode ends — after the next column is factored, or for the supernode that
+///   ended before a panel, after the whole panel — rows whose largest multiplier is below
+///   `drop_tol` are dropped, then rows beyond the quota; the last `max(20, 5%)` columns are
+///   exempt.
+///
+/// Not reproduced, and why: the supernodal ARITHMETIC (the same updates are applied column by
+/// column, so rounding differs); SuperLU's order of candidate rows (a tie between equal pivot
+/// candidates goes to the smallest row here); the misaligned norms in `ilu_ddrop_row`'s secondary
+/// loop (`m1--` before `temp[i] = temp[m1]`), which judge a row by its neighbour's norm — rows
+/// here are judged by their own; MILU and `ILU_Norm` other than the infinity norm, which SciPy
+/// reaches only through its raw `options` dictionary; SuperLU's `genmmd` for the two MMD orderings
+/// (fsci's exact minimum degree runs instead, see [`IluOptions::ordering`]). COLAMD itself IS
+/// SuperLU's (a port of its vendored COLAMD 2.9.1), so under the default ordering both sides
+/// factor the same `A·Pc`. Parity is therefore on the drop, fill and pivot RULES and on the
+/// preconditioner they
+/// produce: `diff_sparse_spilu_ilutp` checks nnz(L+U) within ±25% and preconditioned Krylov
+/// iteration counts within 1.5× of live SciPy's on the same matrices. Nothing tighter is claimed.
+///
+/// # Errors
+/// `InvalidShape` for a non-square matrix. `InvalidArgument` for a non-finite `drop_tol` or
+/// `diag_pivot_thresh`, a `fill_factor` that is not finite and positive (SciPy hangs at 0 and
+/// fails below), `panel_size == 0` (SciPy hangs), or `n >= 2^32`. `NonFiniteInput` for
+/// non-finite entries in Hardened mode. `SingularMatrix` in Strict mode at a zero pivot, where
+/// SciPy raises "Factor is exactly singular".
 pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactorization> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -5955,141 +6255,1618 @@ pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactor
             message: "spilu requires a square matrix".to_string(),
         });
     }
-    if options.drop_tol < 0.0 || options.fill_factor < 1.0 {
+    if !options.drop_tol.is_finite() {
         return Err(SparseError::InvalidArgument {
-            message: "drop_tol must be >= 0 and fill_factor must be >= 1".to_string(),
+            message: format!("spilu drop_tol must be finite, got {}", options.drop_tol),
         });
     }
-
+    if !(options.fill_factor.is_finite() && options.fill_factor > 0.0) {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "spilu fill_factor must be finite and positive, got {}",
+                options.fill_factor
+            ),
+        });
+    }
+    if !options.diag_pivot_thresh.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "spilu diag_pivot_thresh must be finite, got {}",
+                options.diag_pivot_thresh
+            ),
+        });
+    }
+    if options.panel_size == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "spilu panel_size must be at least 1".to_string(),
+        });
+    }
     let n = shape.rows;
-    if n == 0 {
-        return Ok(SparseIluFactorization {
-            shape: (0, 0),
-            backend_used: SparseBackend::Auto,
-            ordering_used: options.ordering,
-            l_data: Vec::new(),
-            l_indices: Vec::new(),
-            l_indptr: vec![0],
-            u_data: Vec::new(),
-            u_indices: Vec::new(),
-            u_indptr: vec![0],
-            n: 0,
+    if u32::try_from(n).is_err() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("spilu supports n < 2^32, got {n}"),
+        });
+    }
+    if options.mode == RuntimeMode::Hardened && a.data().iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "spilu matrix contains NaN or Inf".to_string(),
         });
     }
 
-    // Convert to CSR for row-based factorization
-    let csr = a.to_csr()?;
-    let indptr = csr.indptr();
-    let indices = csr.indices();
-    let data = csr.data();
+    let (colptr, rowind, values) = canonical_csc_columns(a);
+    let (row_ptr, row_cols) = transpose_pattern(n, &colptr, &rowind);
+    let (iperm_c, ordering_used, symmetric_mode) =
+        ilu_column_ordering(n, &colptr, &rowind, &row_ptr, &row_cols, options.ordering);
+    let relaxed = if symmetric_mode {
+        let parent = elimination_tree_of_permuted(&pattern_csr(n, &row_ptr, &row_cols), &iperm_c);
+        ilu_heap_relax_supernodes(&parent, options.relax)
+    } else {
+        ilu_relax_supernodes(&column_etree(n, &colptr, &rowind, &iperm_c), options.relax)
+    };
 
-    // Work on a dense-ish representation for the factorization:
-    // For each row, track L entries (j < i) and U entries (j >= i)
-    // using the original sparsity pattern.
-    let mut lu_data = data.to_vec(); // mutable copy of values
-    let lu_indices = indices;
-    let lu_indptr = indptr;
+    let mut factor = Ilutp::new(n, &colptr, &rowind, &values, &iperm_c, &relaxed, &options);
+    factor.run(&relaxed.end, options.panel_size)?;
+    factor.into_factorization(ordering_used)
+}
 
-    // IKJ variant of ILU(0): for each row i, for each nonzero a[i,k] with k < i,
-    // compute multiplier a[i,k] /= a[k,k], then for each nonzero a[k,j] with j > k,
-    // if (i,j) is in the sparsity pattern, subtract multiplier * a[k,j].
-    let mut row_lookup = vec![usize::MAX; n];
-    let mut row_lookup_touched = Vec::new();
+/// Relaxed supernodes: `end[first] = last` for each, `ILU_NONE` elsewhere, and their first
+/// columns in the order SuperLU found them (`relax_fsupc`), which `mark_relax` follows.
+struct RelaxedSupernodes {
+    end: Vec<usize>,
+    found: Vec<usize>,
+}
+
+/// The columns of `a` sorted by row with duplicates summed, as SciPy's `A.sum_duplicates()`
+/// leaves them. Explicit zeros stay: SuperLU treats every stored entry as structural.
+fn canonical_csc_columns(a: &CscMatrix) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let meta = a.canonical_meta();
+    if meta.sorted_indices && meta.deduplicated {
+        return (a.indptr().to_vec(), a.indices().to_vec(), a.data().to_vec());
+    }
+    let n = a.shape().cols;
+    let mut colptr = Vec::with_capacity(n + 1);
+    let mut rowind = Vec::with_capacity(a.nnz());
+    let mut values = Vec::with_capacity(a.nnz());
+    let mut entries: Vec<(usize, f64)> = Vec::new();
+    colptr.push(0);
+    for col in 0..n {
+        let range = a.indptr()[col]..a.indptr()[col + 1];
+        entries.clear();
+        entries.extend(
+            a.indices()[range.clone()]
+                .iter()
+                .copied()
+                .zip(a.data()[range].iter().copied()),
+        );
+        entries.sort_by_key(|&(row, _)| row);
+        for &(row, value) in &entries {
+            if rowind.len() > colptr[col] && rowind.last() == Some(&row) {
+                if let Some(last) = values.last_mut() {
+                    *last += value;
+                }
+            } else {
+                rowind.push(row);
+                values.push(value);
+            }
+        }
+        colptr.push(rowind.len());
+    }
+    (colptr, rowind, values)
+}
+
+/// Row lists of the pattern whose column lists are `colptr`/`rowind` (square, order `n`).
+fn transpose_pattern(n: usize, colptr: &[usize], rowind: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut row_ptr = vec![0usize; n + 1];
+    for &row in rowind {
+        row_ptr[row + 1] += 1;
+    }
+    for row in 0..n {
+        row_ptr[row + 1] += row_ptr[row];
+    }
+    let mut cursor = row_ptr[..n].to_vec();
+    let mut row_cols = vec![0usize; rowind.len()];
+    for col in 0..n {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            row_cols[cursor[row]] = col;
+            cursor[row] += 1;
+        }
+    }
+    (row_ptr, row_cols)
+}
+
+/// The pattern of the rows `row_ptr`/`row_cols` as a CSR matrix of ones.
+fn pattern_csr(n: usize, row_ptr: &[usize], row_cols: &[usize]) -> CsrMatrix {
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; row_cols.len()],
+        row_cols.to_vec(),
+        row_ptr.to_vec(),
+    )
+}
+
+/// The pattern of A + Aᵀ (ones, self loops kept) from both orientations of A.
+fn a_plus_at_pattern_csr(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+) -> CsrMatrix {
+    let mut indptr = Vec::with_capacity(n + 1);
+    let mut indices = Vec::with_capacity(2 * rowind.len());
+    indptr.push(0);
     for i in 0..n {
-        let row_start = lu_indptr[i];
-        let row_end = lu_indptr[i + 1];
-        row_lookup_touched.clear();
-        for (offset, &col) in lu_indices[row_start..row_end].iter().enumerate() {
-            let idx = row_start + offset;
-            row_lookup[col] = idx;
-            row_lookup_touched.push(col);
+        let start = indices.len();
+        indices.extend_from_slice(&row_cols[row_ptr[i]..row_ptr[i + 1]]);
+        indices.extend_from_slice(&rowind[colptr[i]..colptr[i + 1]]);
+        indices[start..].sort_unstable();
+        let mut write = start;
+        for read in start..indices.len() {
+            if write == start || indices[read] != indices[write - 1] {
+                indices[write] = indices[read];
+                write += 1;
+            }
+        }
+        indices.truncate(write);
+        indptr.push(indices.len());
+    }
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; indices.len()],
+        indices,
+        indptr,
+    )
+}
+
+/// The pattern of AᵀA (ones, diagonal kept), SuperLU `getata`'s input to MMD_ATA: column `col`
+/// of AᵀA is the union of the rows of A that column `col` of A touches.
+fn ata_pattern_csr(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+) -> CsrMatrix {
+    let mut mark = vec![ILU_NONE; n];
+    let mut indptr = Vec::with_capacity(n + 1);
+    let mut indices = Vec::new();
+    indptr.push(0);
+    for col in 0..n {
+        let start = indices.len();
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            for &other in &row_cols[row_ptr[row]..row_ptr[row + 1]] {
+                if mark[other] != col {
+                    mark[other] = col;
+                    indices.push(other);
+                }
+            }
+        }
+        indices[start..].sort_unstable();
+        indptr.push(indices.len());
+    }
+    CsrMatrix::from_components_unchecked(
+        Shape2D::new(n, n),
+        vec![1.0; indices.len()],
+        indices,
+        indptr,
+    )
+}
+
+/// `spilu`'s column ordering: the step → column map (`iperm_c`), the ordering that ran, and
+/// whether SuperLU's symmetric mode applies. Every ordering but NATURAL is followed by the
+/// postorder of the column elimination tree, as SuperLU's `sp_preorder` does.
+fn ilu_column_ordering(
+    n: usize,
+    colptr: &[usize],
+    rowind: &[usize],
+    row_ptr: &[usize],
+    row_cols: &[usize],
+    requested: PermutationOrdering,
+) -> (Vec<usize>, PermutationOrdering, bool) {
+    let natural = || {
+        (
+            (0..n).collect::<Vec<_>>(),
+            PermutationOrdering::Natural,
+            true,
+        )
+    };
+    let (base, used) = match requested {
+        PermutationOrdering::Natural => return natural(),
+        PermutationOrdering::Colamd => (
+            colamd_ordering(n, n, colptr, rowind),
+            PermutationOrdering::Colamd,
+        ),
+        PermutationOrdering::MmdAta => (
+            minimum_degree_ordering(&ata_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::MmdAta,
+        ),
+        PermutationOrdering::MmdAtPlusA => (
+            minimum_degree_ordering(&a_plus_at_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::MmdAtPlusA,
+        ),
+        PermutationOrdering::Amd => (
+            approximate_minimum_degree_ordering(&a_plus_at_pattern_csr(
+                n, colptr, rowind, row_ptr, row_cols,
+            )),
+            PermutationOrdering::Amd,
+        ),
+        PermutationOrdering::ReverseCuthillMcKee => (
+            reverse_cuthill_mckee(&a_plus_at_pattern_csr(n, colptr, rowind, row_ptr, row_cols)),
+            PermutationOrdering::ReverseCuthillMcKee,
+        ),
+    };
+    let mut seen = vec![false; n];
+    let is_permutation = base.len() == n
+        && base
+            .iter()
+            .all(|&col| col < n && !std::mem::replace(&mut seen[col], true));
+    if !is_permutation {
+        return natural();
+    }
+    let parent = column_etree(n, colptr, rowind, &base);
+    let postordered = postorder_forest(&parent)
+        .into_iter()
+        .map(|position| base[position])
+        .collect();
+    (postordered, used, false)
+}
+
+/// COLAMD's "empty" link and the dead markers of its column and row records.
+const COLAMD_EMPTY: i64 = -1;
+const COLAMD_DEAD_PRINCIPAL: i64 = -1;
+const COLAMD_DEAD_NON_PRINCIPAL: i64 = -2;
+const COLAMD_DEAD_ROW: i64 = -1;
+
+/// COLAMD's `Colamd_Col`. The four `shared` words are C unions and are kept as ONE word each,
+/// because the algorithm reads one member through another (a degree-list head's `prev`, which is
+/// EMPTY, is later read as its `headhash`):
+/// `shared1` thickness | parent, `shared2` score | order, `shared3` headhash | hash | prev,
+/// `shared4` degree_next | hash_next.
+#[derive(Debug, Clone, Copy)]
+struct ColamdCol {
+    start: i64,
+    length: i64,
+    shared1: i64,
+    shared2: i64,
+    shared3: i64,
+    shared4: i64,
+}
+
+/// COLAMD's `Colamd_Row`: `shared1` degree | p, `shared2` mark | first_column.
+#[derive(Debug, Clone, Copy)]
+struct ColamdRow {
+    start: i64,
+    length: i64,
+    shared1: i64,
+    shared2: i64,
+}
+
+/// COLAMD 2.9.1 exactly as SuperLU vendors it (`SRC/colamd.c`, default knobs: dense rows and
+/// columns at `max(16, 10·√n)`, aggressive absorption), which is what SciPy's
+/// `spilu(permc_spec='COLAMD')` and `splu(permc_spec='COLAMD')` run through `get_colamd`.
+/// Returns the column at each position (`p` after `order_children`); SuperLU's
+/// `perm_c[p[i]] = i` is its inverse.
+///
+/// A line-by-line port, not a re-derivation, because the ordering is only useful here if it
+/// is SciPy's ordering: ILUTP's fill quota is cumulative over columns, so a different minimum
+/// degree ordering of the same fill can land on the other side of the quota (measured on the
+/// bead's matrix at fill_factor = 10: AMD on AᵀA gave bicgstab 7 preconditioner applications
+/// where SciPy needs 3, and SciPy given that same AMD ordering needed 8). The workspace length
+/// is `colamd_recommended`'s, so garbage collections happen where SuperLU's do; the hash is
+/// 32-bit unsigned, as SciPy builds SuperLU with `int` indices. Input columns must be sorted
+/// with no duplicates (the "jumbled" repair path is therefore not ported).
+fn colamd_ordering(n_row: usize, n_col: usize, colptr: &[usize], rowind: &[usize]) -> Vec<usize> {
+    if n_col == 0 {
+        return Vec::new();
+    }
+    let nnz = colptr[n_col];
+    // colamd_recommended = 2·nnz + Col_size + Row_size + n_col + nnz/5, less the Col and Row
+    // records COLAMD_MAIN carves off its end.
+    let alen = (2 * nnz + n_col + nnz / 5) as i64;
+    // Slack past `alen` only turns an out-of-contract write into no-op room instead of a panic;
+    // every decision (garbage collection) reads `alen`, never the vector's length.
+    let mut a = vec![0i64; alen as usize + n_col + 1];
+    for (slot, &row) in a.iter_mut().zip(rowind) {
+        *slot = row as i64;
+    }
+    let mut cols = vec![
+        ColamdCol {
+            start: 0,
+            length: 0,
+            shared1: 0,
+            shared2: 0,
+            shared3: 0,
+            shared4: 0,
+        };
+        n_col + 1
+    ];
+    let mut rows = vec![
+        ColamdRow {
+            start: 0,
+            length: 0,
+            shared1: 0,
+            shared2: 0,
+        };
+        n_row + 1
+    ];
+
+    // --- init_rows_cols (sorted, duplicate-free input) ---
+    for col in 0..n_col {
+        cols[col] = ColamdCol {
+            start: colptr[col] as i64,
+            length: (colptr[col + 1] - colptr[col]) as i64,
+            shared1: 1,
+            shared2: 0,
+            shared3: COLAMD_EMPTY,
+            shared4: COLAMD_EMPTY,
+        };
+    }
+    for &row in &rowind[..nnz] {
+        rows[row].length += 1;
+    }
+    let mut next_start = nnz as i64;
+    for row in rows.iter_mut().take(n_row) {
+        row.start = next_start;
+        row.shared1 = next_start;
+        next_start += row.length;
+    }
+    for col in 0..n_col {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            let slot = rows[row].shared1 as usize;
+            a[slot] = col as i64;
+            rows[row].shared1 += 1;
+        }
+    }
+    for row in rows.iter_mut().take(n_row) {
+        row.shared2 = 0;
+        row.shared1 = row.length;
+    }
+
+    // --- init_scoring ---
+    let dense_degree = |count: usize| (10.0 * (count as f64).sqrt()).max(16.0) as i64;
+    let dense_row_count = dense_degree(n_col);
+    let dense_col_count = dense_degree(n_row.min(n_col));
+    let n_col_i = n_col as i64;
+    let mut max_deg = 0i64;
+    let mut n_col2 = n_col_i;
+    for c in (0..n_col).rev() {
+        if cols[c].length == 0 {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        }
+    }
+    for c in (0..n_col).rev() {
+        if cols[c].start < 0 {
+            continue;
+        }
+        if cols[c].length > dense_col_count {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            let start = cols[c].start as usize;
+            for i in start..start + cols[c].length as usize {
+                rows[a[i] as usize].shared1 -= 1;
+            }
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        }
+    }
+    for row in rows.iter_mut().take(n_row) {
+        let degree = row.shared1;
+        if degree > dense_row_count || degree == 0 {
+            row.shared2 = COLAMD_DEAD_ROW;
+        } else {
+            max_deg = max_deg.max(degree);
+        }
+    }
+    for c in (0..n_col).rev() {
+        if cols[c].start < 0 {
+            continue;
+        }
+        let start = cols[c].start as usize;
+        let mut write = start;
+        let mut score = 0i64;
+        for read in start..start + cols[c].length as usize {
+            let row = a[read] as usize;
+            if rows[row].shared2 < 0 {
+                continue;
+            }
+            a[write] = row as i64;
+            write += 1;
+            score += rows[row].shared1 - 1;
+            score = score.min(n_col_i);
+        }
+        let length = (write - start) as i64;
+        if length == 0 {
+            n_col2 -= 1;
+            cols[c].shared2 = n_col2;
+            cols[c].start = COLAMD_DEAD_PRINCIPAL;
+        } else {
+            cols[c].length = length;
+            cols[c].shared2 = score;
+        }
+    }
+    // `head` is COLAMD's reuse of `p`: degree-list heads and, between them, hash buckets.
+    let mut head = vec![COLAMD_EMPTY; n_col + 1];
+    for c in (0..n_col).rev() {
+        if cols[c].start >= 0 {
+            let score = cols[c].shared2 as usize;
+            let next = head[score];
+            cols[c].shared3 = COLAMD_EMPTY;
+            cols[c].shared4 = next;
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = c as i64;
+            }
+            head[score] = c as i64;
+        }
+    }
+
+    // --- find_ordering ---
+    let max_mark = i64::from(i32::MAX) - n_col_i;
+    let mut tag_mark = colamd_clear_mark(0, max_mark, &mut rows[..n_row]);
+    let mut min_score = 0usize;
+    let mut pfree = 2 * nnz as i64;
+    let mut k = 0i64;
+    while k < n_col2 {
+        while min_score < n_col && head[min_score] == COLAMD_EMPTY {
+            min_score += 1;
+        }
+        let pivot_col = head[min_score] as usize;
+        let next = cols[pivot_col].shared4;
+        head[min_score] = next;
+        if next != COLAMD_EMPTY {
+            cols[next as usize].shared3 = COLAMD_EMPTY;
+        }
+        let pivot_col_score = cols[pivot_col].shared2;
+        cols[pivot_col].shared2 = k;
+        let pivot_col_thickness = cols[pivot_col].shared1;
+        k += pivot_col_thickness;
+        let needed_memory = pivot_col_score.min(n_col_i - k);
+        if pfree + needed_memory >= alen {
+            pfree =
+                colamd_garbage_collection(&mut rows[..n_row], &mut cols[..n_col], &mut a, pfree);
+            tag_mark = colamd_clear_mark(0, max_mark, &mut rows[..n_row]);
         }
 
-        for idx_ik in row_start..row_end {
-            let k = lu_indices[idx_ik];
-            if k >= i {
-                break; // only process lower triangle (k < i)
+        // The pivot row: the union of the live rows of the pivot column.
+        let pivot_row_start = pfree;
+        let mut pivot_row_degree = 0i64;
+        cols[pivot_col].shared1 = -pivot_col_thickness;
+        let pc_start = cols[pivot_col].start as usize;
+        let pc_end = pc_start + cols[pivot_col].length as usize;
+        for ci in pc_start..pc_end {
+            let row = a[ci] as usize;
+            if rows[row].shared2 >= 0 {
+                let r_start = rows[row].start as usize;
+                for ri in r_start..r_start + rows[row].length as usize {
+                    let col = a[ri] as usize;
+                    let thickness = cols[col].shared1;
+                    if thickness > 0 && cols[col].start >= 0 {
+                        cols[col].shared1 = -thickness;
+                        a[pfree as usize] = col as i64;
+                        pfree += 1;
+                        pivot_row_degree += thickness;
+                    }
+                }
             }
+        }
+        cols[pivot_col].shared1 = pivot_col_thickness;
+        max_deg = max_deg.max(pivot_row_degree);
+        for ci in pc_start..pc_end {
+            rows[a[ci] as usize].shared2 = COLAMD_DEAD_ROW;
+        }
+        let pivot_row_length = pfree - pivot_row_start;
+        let pivot_row = if pivot_row_length > 0 {
+            a[cols[pivot_col].start as usize]
+        } else {
+            COLAMD_EMPTY
+        };
+        let pr_start = pivot_row_start as usize;
+        let pr_end = pr_start + pivot_row_length as usize;
 
-            // Find diagonal a[k,k]
-            let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-            if pivot_is_zero(diag_k) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero pivot at row {k} during ILU(0)"),
-                });
+        // Approximate degrees: |Le \ Lp| for every row element touched.
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            let thickness = -cols[col].shared1;
+            cols[col].shared1 = thickness;
+            let cur_score = cols[col].shared2;
+            let prev = cols[col].shared3;
+            let next = cols[col].shared4;
+            if prev == COLAMD_EMPTY {
+                head[cur_score as usize] = next;
+            } else {
+                cols[prev as usize].shared4 = next;
             }
-
-            // Compute multiplier: a[i,k] /= a[k,k]
-            lu_data[idx_ik] /= diag_k;
-            let multiplier = lu_data[idx_ik];
-
-            // For each nonzero in row k with column j > k
-            for idx_kj in lu_indptr[k]..lu_indptr[k + 1] {
-                let j = lu_indices[idx_kj];
-                if j <= k {
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = prev;
+            }
+            let c_start = cols[col].start as usize;
+            for ci in c_start..c_start + cols[col].length as usize {
+                let row = a[ci] as usize;
+                let row_mark = rows[row].shared2;
+                if row_mark < 0 {
                     continue;
                 }
-                let a_kj = lu_data[idx_kj];
-
-                // If (i, j) exists in the sparsity pattern, subtract
-                let idx_ij = row_lookup[j];
-                if idx_ij != usize::MAX {
-                    lu_data[idx_ij] -= multiplier * a_kj;
+                let mut set_difference = row_mark - tag_mark;
+                if set_difference < 0 {
+                    set_difference = rows[row].shared1;
                 }
-                // ILU(0): if (i,j) is NOT in pattern, we drop the fill-in
+                set_difference -= thickness;
+                if set_difference == 0 {
+                    // aggressive absorption (the default knob)
+                    rows[row].shared2 = COLAMD_DEAD_ROW;
+                } else {
+                    rows[row].shared2 = set_difference + tag_mark;
+                }
             }
         }
 
-        for &col in &row_lookup_touched {
-            row_lookup[col] = usize::MAX;
+        // Prune dead rows from each pivot-row column, score it and hash its row pattern.
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            let mut hash: u32 = 0;
+            let mut cur_score = 0i64;
+            let c_start = cols[col].start as usize;
+            let mut write = c_start;
+            for read in c_start..c_start + cols[col].length as usize {
+                let row = a[read] as usize;
+                let row_mark = rows[row].shared2;
+                if row_mark < 0 {
+                    continue;
+                }
+                a[write] = row as i64;
+                write += 1;
+                hash = hash.wrapping_add(row as u32);
+                cur_score += row_mark - tag_mark;
+                cur_score = cur_score.min(n_col_i);
+            }
+            cols[col].length = (write - c_start) as i64;
+            if cols[col].length == 0 {
+                cols[col].start = COLAMD_DEAD_PRINCIPAL;
+                pivot_row_degree -= cols[col].shared1;
+                cols[col].shared2 = k;
+                k += cols[col].shared1;
+            } else {
+                cols[col].shared2 = cur_score;
+                let bucket = (hash % (n_col as u32 + 1)) as usize;
+                let head_column = head[bucket];
+                let first_col = if head_column > COLAMD_EMPTY {
+                    let first = cols[head_column as usize].shared3;
+                    cols[head_column as usize].shared3 = col as i64;
+                    first
+                } else {
+                    let first = -(head_column + 2);
+                    head[bucket] = -(col as i64 + 2);
+                    first
+                };
+                cols[col].shared4 = first_col;
+                cols[col].shared3 = bucket as i64;
+            }
+        }
+
+        colamd_detect_super_cols(&mut cols, &a, &mut head, pr_start, pr_end);
+        cols[pivot_col].start = COLAMD_DEAD_PRINCIPAL;
+        tag_mark = colamd_clear_mark(tag_mark + max_deg + 1, max_mark, &mut rows[..n_row]);
+
+        // Finalize the pivot row and put its columns back on the degree lists.
+        let mut write = pr_start;
+        for ri in pr_start..pr_end {
+            let col = a[ri] as usize;
+            if cols[col].start < 0 {
+                continue;
+            }
+            a[write] = col as i64;
+            write += 1;
+            let slot = (cols[col].start + cols[col].length) as usize;
+            a[slot] = pivot_row;
+            cols[col].length += 1;
+            let mut cur_score = cols[col].shared2 + pivot_row_degree;
+            let max_score = n_col_i - k - cols[col].shared1;
+            cur_score -= cols[col].shared1;
+            cur_score = cur_score.min(max_score);
+            cols[col].shared2 = cur_score;
+            let next = head[cur_score as usize];
+            cols[col].shared4 = next;
+            cols[col].shared3 = COLAMD_EMPTY;
+            if next != COLAMD_EMPTY {
+                cols[next as usize].shared3 = col as i64;
+            }
+            head[cur_score as usize] = col as i64;
+            min_score = min_score.min(cur_score as usize);
+        }
+        if pivot_row_degree > 0 {
+            let row = pivot_row as usize;
+            rows[row].start = pivot_row_start;
+            rows[row].length = write as i64 - pivot_row_start;
+            rows[row].shared1 = pivot_row_degree;
+            rows[row].shared2 = 0;
         }
     }
 
-    // Extract L and U from the modified data
-    let mut l_data = Vec::new();
-    let mut l_indices = Vec::new();
-    let mut l_indptr = vec![0usize];
-    let mut u_data = Vec::new();
-    let mut u_indices = Vec::new();
-    let mut u_indptr = vec![0usize];
+    // --- order_children ---
+    for i in 0..n_col {
+        if cols[i].start != COLAMD_DEAD_PRINCIPAL && cols[i].shared2 == COLAMD_EMPTY {
+            let mut parent = i;
+            loop {
+                parent = cols[parent].shared1 as usize;
+                if cols[parent].start == COLAMD_DEAD_PRINCIPAL {
+                    break;
+                }
+            }
+            let mut c = i;
+            let mut order = cols[parent].shared2;
+            loop {
+                cols[c].shared2 = order;
+                order += 1;
+                cols[c].shared1 = parent as i64;
+                c = cols[c].shared1 as usize;
+                if cols[c].shared2 != COLAMD_EMPTY {
+                    break;
+                }
+            }
+            cols[parent].shared2 = order;
+        }
+    }
+    let mut position_to_col = vec![0usize; n_col];
+    for (c, col) in cols.iter().enumerate().take(n_col) {
+        position_to_col[col.shared2 as usize] = c;
+    }
+    position_to_col
+}
 
-    for i in 0..n {
-        // L entries: j < i (with implicit 1 on diagonal)
-        for idx in lu_indptr[i]..lu_indptr[i + 1] {
-            let j = lu_indices[idx];
-            if j < i {
-                l_data.push(lu_data[idx]);
-                l_indices.push(j);
+/// COLAMD `clear_mark`: restart the row tags when they would overflow.
+fn colamd_clear_mark(tag_mark: i64, max_mark: i64, rows: &mut [ColamdRow]) -> i64 {
+    if tag_mark <= 0 || tag_mark >= max_mark {
+        for row in rows.iter_mut() {
+            if row.shared2 >= 0 {
+                row.shared2 = 0;
             }
         }
-        // Add implicit diagonal
-        l_data.push(1.0);
-        l_indices.push(i);
-        l_indptr.push(l_data.len());
+        1
+    } else {
+        tag_mark
+    }
+}
 
-        // U entries: j >= i
-        for idx in lu_indptr[i]..lu_indptr[i + 1] {
-            let j = lu_indices[idx];
-            if j >= i {
-                u_data.push(lu_data[idx]);
-                u_indices.push(j);
+/// COLAMD `garbage_collection`: compact live column lists to the front of `a`, then the live
+/// rows after them (each row found by a one's-complement marker on its first slot). Returns the
+/// new free pointer.
+fn colamd_garbage_collection(
+    rows: &mut [ColamdRow],
+    cols: &mut [ColamdCol],
+    a: &mut [i64],
+    pfree: i64,
+) -> i64 {
+    let mut dest = 0usize;
+    for col in cols.iter_mut() {
+        if col.start >= 0 {
+            let src = col.start as usize;
+            col.start = dest as i64;
+            for j in 0..col.length as usize {
+                let row = a[src + j];
+                if rows[row as usize].shared2 >= 0 {
+                    a[dest] = row;
+                    dest += 1;
+                }
+            }
+            col.length = dest as i64 - col.start;
+        }
+    }
+    for (r, row) in rows.iter_mut().enumerate() {
+        if row.shared2 < 0 || row.length == 0 {
+            row.shared2 = COLAMD_DEAD_ROW;
+        } else {
+            let first = row.start as usize;
+            row.shared2 = a[first];
+            a[first] = -(r as i64) - 1;
+        }
+    }
+    let mut src = dest;
+    while (src as i64) < pfree {
+        if a[src] < 0 {
+            let r = (-a[src] - 1) as usize;
+            a[src] = rows[r].shared2;
+            rows[r].start = dest as i64;
+            for _ in 0..rows[r].length {
+                let col = a[src];
+                src += 1;
+                if cols[col as usize].start >= 0 {
+                    a[dest] = col;
+                    dest += 1;
+                }
+            }
+            rows[r].length = dest as i64 - rows[r].start;
+        } else {
+            src += 1;
+        }
+    }
+    dest as i64
+}
+
+/// COLAMD `detect_super_cols`: merge pivot-row columns with identical row patterns and scores
+/// (same hash bucket) into supercolumns, then empty the buckets used.
+fn colamd_detect_super_cols(
+    cols: &mut [ColamdCol],
+    a: &[i64],
+    head: &mut [i64],
+    row_start: usize,
+    row_end: usize,
+) {
+    for &entry in &a[row_start..row_end] {
+        let col = entry as usize;
+        if cols[col].start < 0 {
+            continue;
+        }
+        let hash = cols[col].shared3 as usize;
+        let head_column = head[hash];
+        let first_col = if head_column > COLAMD_EMPTY {
+            cols[head_column as usize].shared3
+        } else {
+            -(head_column + 2)
+        };
+        let mut super_c = first_col;
+        while super_c != COLAMD_EMPTY {
+            let sc = super_c as usize;
+            let length = cols[sc].length;
+            let mut prev_c = sc;
+            let mut c = cols[sc].shared4;
+            while c != COLAMD_EMPTY {
+                let cu = c as usize;
+                let same = cols[cu].length == length && cols[cu].shared2 == cols[sc].shared2 && {
+                    let (s1, s2) = (cols[sc].start as usize, cols[cu].start as usize);
+                    a[s1..s1 + length as usize] == a[s2..s2 + length as usize]
+                };
+                if !same {
+                    prev_c = cu;
+                    c = cols[cu].shared4;
+                    continue;
+                }
+                cols[sc].shared1 += cols[cu].shared1;
+                cols[cu].shared1 = sc as i64;
+                cols[cu].start = COLAMD_DEAD_NON_PRINCIPAL;
+                cols[cu].shared2 = COLAMD_EMPTY;
+                cols[prev_c].shared4 = cols[cu].shared4;
+                c = cols[cu].shared4;
+            }
+            super_c = cols[sc].shared4;
+        }
+        if head_column > COLAMD_EMPTY {
+            cols[head_column as usize].shared3 = COLAMD_EMPTY;
+        } else {
+            head[hash] = COLAMD_EMPTY;
+        }
+    }
+}
+
+/// Column elimination tree of `A·Pc` — the elimination tree of `(A·Pc)ᵀ(A·Pc)` — without
+/// forming the product (CSparse `cs_etree(A, 1)`; SuperLU's `sp_coletree` computes the same
+/// tree). `order[k]` is the column of A at position `k`; roots have parent `n`.
+fn column_etree(n: usize, colptr: &[usize], rowind: &[usize], order: &[usize]) -> Vec<usize> {
+    let mut parent = vec![n; n];
+    let mut ancestor = vec![ILU_NONE; n];
+    let mut prev = vec![ILU_NONE; n];
+    for (k, &col) in order.iter().enumerate() {
+        for &row in &rowind[colptr[col]..colptr[col + 1]] {
+            let mut i = prev[row];
+            while i != ILU_NONE && i < k {
+                let next = ancestor[i];
+                ancestor[i] = k;
+                if next == ILU_NONE {
+                    parent[i] = k;
+                }
+                i = next;
+            }
+            prev[row] = k;
+        }
+    }
+    parent
+}
+
+/// SuperLU `ilu_relax_snode`: on an elimination tree whose parents follow their children (every
+/// etree does), each leaf starts a relaxed supernode that climbs while the parent has fewer than
+/// `relax` descendants.
+fn ilu_relax_supernodes(parent: &[usize], relax: usize) -> RelaxedSupernodes {
+    let n = parent.len();
+    let mut descendants = vec![0usize; n];
+    for node in 0..n {
+        if parent[node] != n {
+            descendants[parent[node]] += descendants[node] + 1;
+        }
+    }
+    let mut relaxed = RelaxedSupernodes {
+        end: vec![ILU_NONE; n],
+        found: Vec::new(),
+    };
+    let mut j = 0;
+    while j < n {
+        let start = j;
+        let mut up = parent[j];
+        while up != n && descendants[up] < relax {
+            j = up;
+            up = parent[j];
+        }
+        relaxed.end[start] = j;
+        relaxed.found.push(start);
+        j += 1;
+        while j < n && descendants[j] != 0 {
+            j += 1;
+        }
+    }
+    relaxed
+}
+
+/// SuperLU `ilu_heap_relax_snode`, for the symmetric-mode etree, which is heap ordered but not
+/// postordered: relaxed supernodes are found on the postordered tree and kept only where they
+/// are contiguous in the original order; otherwise each of their leaves stands alone.
+fn ilu_heap_relax_supernodes(parent: &[usize], relax: usize) -> RelaxedSupernodes {
+    let n = parent.len();
+    let order = postorder_forest(parent);
+    let mut post = vec![0usize; n];
+    for (position, &node) in order.iter().enumerate() {
+        post[node] = position;
+    }
+    let mut post_parent = vec![n; n];
+    for node in 0..n {
+        if parent[node] != n {
+            post_parent[post[node]] = post[parent[node]];
+        }
+    }
+    let mut descendants = vec![0usize; n];
+    for node in 0..n {
+        if post_parent[node] != n {
+            descendants[post_parent[node]] += descendants[node] + 1;
+        }
+    }
+    let mut relaxed = RelaxedSupernodes {
+        end: vec![ILU_NONE; n],
+        found: Vec::new(),
+    };
+    let mut j = 0;
+    while j < n {
+        let start = j;
+        let mut up = post_parent[j];
+        while up != n && descendants[up] < relax {
+            j = up;
+            up = post_parent[j];
+        }
+        let first = (start..=j).map(|i| order[i]).min().unwrap_or(order[j]);
+        let last = order[j];
+        if last - first == j - start {
+            relaxed.end[first] = last;
+            relaxed.found.push(first);
+        } else {
+            for i in start..=j {
+                if descendants[i] == 0 {
+                    relaxed.end[order[i]] = order[i];
+                    relaxed.found.push(order[i]);
+                }
             }
         }
-        u_indptr.push(u_data.len());
+        j += 1;
+        while j < n && descendants[j] != 0 {
+            j += 1;
+        }
+    }
+    relaxed
+}
+
+/// Rows of a supernode whose removal from its pre-panel columns waits for the panel to end.
+struct DeferredRowDrop {
+    first: usize,
+    end: usize,
+    rows: Vec<usize>,
+}
+
+/// State of one `dgsitrf`-rules factorization. Rows are A's own row numbers until export;
+/// columns are steps (positions in `A·Pc`).
+struct Ilutp<'a> {
+    n: usize,
+    colptr: &'a [usize],
+    rowind: &'a [usize],
+    values: &'a [f64],
+    iperm_c: &'a [usize],
+    nnz_a: usize,
+    drop_tol: f64,
+    gamma: f64,
+    rule: IluDropRule,
+    pivot_thresh: f64,
+    hardened: bool,
+    last_drop: usize,
+    /// SuperLU `marker_relax`: the first column of the relaxed supernode whose A columns hold a
+    /// row; such a row is never an earlier column's pivot.
+    marker_relax: Vec<usize>,
+    pinv: Vec<usize>,
+    step_rows: Vec<usize>,
+    swap: Vec<usize>,
+    iswap: Vec<usize>,
+    l_rows: Vec<Vec<usize>>,
+    l_vals: Vec<Vec<f64>>,
+    u_steps: Vec<Vec<usize>>,
+    u_vals: Vec<Vec<f64>>,
+    u_diag: Vec<f64>,
+    sn_first: Vec<usize>,
+    sn_relaxed: Vec<bool>,
+    nnz_aj: usize,
+    nnz_lj: usize,
+    nnz_uj: usize,
+    tol_l: f64,
+    tol_u: f64,
+    x: Vec<f64>,
+    visit: Vec<usize>,
+    touched: Vec<usize>,
+    stack: Vec<usize>,
+    unodes: Vec<usize>,
+    lcand: Vec<usize>,
+    /// `prev_mark[row] == j + 1` when `row` is in column j's L pattern.
+    prev_mark: Vec<usize>,
+    /// Size of the previous panel column's L pattern; `None` after a relaxed supernode.
+    prev_len: Option<usize>,
+    row_mark: Vec<usize>,
+    mark_generation: usize,
+    norms: Vec<f64>,
+    deferred: Option<DeferredRowDrop>,
+    stats: IluStatistics,
+}
+
+impl<'a> Ilutp<'a> {
+    fn new(
+        n: usize,
+        colptr: &'a [usize],
+        rowind: &'a [usize],
+        values: &'a [f64],
+        iperm_c: &'a [usize],
+        relaxed: &RelaxedSupernodes,
+        options: &IluOptions,
+    ) -> Self {
+        // SuperLU `mark_relax`, in the order the supernodes were found: a later one overwrites.
+        let mut marker_relax = vec![ILU_NONE; n];
+        for &first in &relaxed.found {
+            let last = relaxed.end[first];
+            for step in first..=last {
+                let col = iperm_c[step];
+                for &row in &rowind[colptr[col]..colptr[col + 1]] {
+                    marker_relax[row] = first;
+                }
+            }
+        }
+        let mut perm_c = vec![0usize; n];
+        for (step, &col) in iperm_c.iter().enumerate() {
+            perm_c[col] = step;
+        }
+        // SuperLU: last_drop = max(min_mn - 2·sp_ienv(7), (int)(min_mn·0.95)).
+        let last_drop = n
+            .saturating_sub(2 * ILU_MAX_SUPERNODE)
+            .max((n as f64 * 0.95) as usize);
+        Self {
+            n,
+            colptr,
+            rowind,
+            values,
+            iperm_c,
+            nnz_a: rowind.len(),
+            drop_tol: options.drop_tol,
+            gamma: options.fill_factor,
+            rule: options.drop_rule,
+            pivot_thresh: options.diag_pivot_thresh,
+            hardened: options.mode == RuntimeMode::Hardened,
+            last_drop,
+            marker_relax,
+            pinv: vec![ILU_NONE; n],
+            step_rows: vec![ILU_NONE; n],
+            swap: iperm_c.to_vec(),
+            iswap: perm_c,
+            l_rows: vec![Vec::new(); n],
+            l_vals: vec![Vec::new(); n],
+            u_steps: vec![Vec::new(); n],
+            u_vals: vec![Vec::new(); n],
+            u_diag: vec![0.0; n],
+            sn_first: vec![0; n],
+            sn_relaxed: vec![false; n],
+            nnz_aj: 0,
+            nnz_lj: 0,
+            nnz_uj: 0,
+            tol_l: options.drop_tol,
+            tol_u: options.drop_tol,
+            x: vec![0.0; n],
+            visit: vec![0; n],
+            touched: Vec::new(),
+            stack: Vec::new(),
+            unodes: Vec::new(),
+            lcand: Vec::new(),
+            prev_mark: vec![0; n],
+            prev_len: None,
+            row_mark: vec![0; n],
+            mark_generation: 0,
+            norms: vec![0.0; n],
+            deferred: None,
+            stats: IluStatistics::default(),
+        }
     }
 
-    Ok(SparseIluFactorization {
-        shape: (n, n),
-        backend_used: SparseBackend::Auto,
-        ordering_used: options.ordering,
-        l_data,
-        l_indices,
-        l_indptr,
-        u_data,
-        u_indices,
-        u_indptr,
-        n,
-    })
+    fn a_range(&self, step: usize) -> std::ops::Range<usize> {
+        let col = self.iperm_c[step];
+        self.colptr[col]..self.colptr[col + 1]
+    }
+
+    /// `‖A(:,col(step))‖∞` (SuperLU `amax`).
+    fn column_amax(&self, step: usize) -> f64 {
+        self.values[self.a_range(step)]
+            .iter()
+            .fold(0.0, |largest, value| largest.max(value.abs()))
+    }
+
+    fn relax_allows(&self, row: usize, step: usize) -> bool {
+        let marker = self.marker_relax[row];
+        marker == ILU_NONE || marker <= step
+    }
+
+    /// Sparse triangular solve of column `step` against the L columns of steps `>= floor`:
+    /// `x` over the reach, `unodes` the U steps reached (ascending, a topological order since
+    /// L(:,k) only reaches steps after k), `lcand` the unpivoted rows — the L pattern. `seeds`
+    /// is the column's own pattern, or the union pattern of a relaxed supernode.
+    fn eliminate(&mut self, step: usize, floor: usize, seeds: &[usize]) {
+        let stamp = step + 1;
+        self.touched.clear();
+        self.stack.clear();
+        self.unodes.clear();
+        self.lcand.clear();
+        for &row in seeds {
+            if self.visit[row] != stamp {
+                self.visit[row] = stamp;
+                self.touched.push(row);
+                self.stack.push(row);
+            }
+        }
+        while let Some(row) = self.stack.pop() {
+            let k = self.pinv[row];
+            if k == ILU_NONE {
+                self.lcand.push(row);
+                continue;
+            }
+            if k < floor {
+                continue;
+            }
+            self.unodes.push(k);
+            for &next in &self.l_rows[k] {
+                if self.visit[next] != stamp {
+                    self.visit[next] = stamp;
+                    self.touched.push(next);
+                    self.stack.push(next);
+                }
+            }
+        }
+        for &row in &self.touched {
+            self.x[row] = 0.0;
+        }
+        for p in self.a_range(step) {
+            self.x[self.rowind[p]] += self.values[p];
+        }
+        self.unodes.sort_unstable();
+        for &k in &self.unodes {
+            let xk = self.x[self.step_rows[k]];
+            if xk != 0.0 {
+                for (&row, &multiplier) in self.l_rows[k].iter().zip(&self.l_vals[k]) {
+                    self.x[row] -= multiplier * xk;
+                }
+            }
+        }
+    }
+
+    /// SuperLU `ilu_dpivotL`: threshold partial pivoting among the L pattern. A zero pivot fails
+    /// in Strict mode (SciPy raises); in Hardened mode it is replaced by SuperLU's fill value.
+    fn choose_pivot(&mut self, step: usize, amax: f64) -> SparseResult<(usize, f64)> {
+        let diag_row = self.iperm_c[step];
+        let mut pivmax = -1.0_f64;
+        let mut pivot = ILU_NONE;
+        let mut diag_present = false;
+        let mut first = ILU_NONE;
+        for &row in &self.lcand {
+            if !self.relax_allows(row, step) {
+                continue;
+            }
+            let magnitude = self.x[row].abs();
+            if magnitude > pivmax || (magnitude == pivmax && row < pivot) {
+                pivmax = magnitude;
+                pivot = row;
+            }
+            diag_present |= row == diag_row;
+            first = first.min(row);
+        }
+        if !(pivmax > 0.0) {
+            if !self.hardened {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("Factor is exactly singular: zero pivot at step {step}"),
+                });
+            }
+            self.stats.zero_pivots += 1;
+            let row = if diag_present {
+                diag_row
+            } else if first != ILU_NONE {
+                first
+            } else {
+                (step..self.n)
+                    .map(|position| self.swap[position])
+                    .find(|&row| self.pinv[row] == ILU_NONE && self.relax_allows(row, step))
+                    .or_else(|| (0..self.n).find(|&row| self.pinv[row] == ILU_NONE))
+                    .unwrap_or(diag_row)
+            };
+            let amax = if amax > 0.0 { amax } else { ILU_FILL_TOL };
+            let value = amax * ILU_FILL_TOL.powf(1.0 - step as f64 / self.n as f64);
+            return Ok((row, value));
+        }
+        if diag_present {
+            let diagonal = self.x[diag_row].abs();
+            if diagonal != 0.0 && diagonal >= self.pivot_thresh * pivmax {
+                pivot = diag_row;
+            }
+        }
+        Ok((pivot, self.x[pivot]))
+    }
+
+    /// Record the pivot of `step`, with SuperLU's `swap`/`iswap` bookkeeping (read only by the
+    /// zero-pivot fallback), and store U's diagonal and L(:, step) = candidates / pivot.
+    fn finish_column(&mut self, step: usize, pivot: usize, value: f64) {
+        self.pinv[pivot] = step;
+        self.step_rows[step] = pivot;
+        if pivot != self.iperm_c[step] {
+            self.stats.off_diagonal_pivots += 1;
+        }
+        let (position, target) = (self.iswap[pivot], step);
+        if position != target {
+            let (a, b) = (self.swap[position], self.swap[target]);
+            self.swap[position] = b;
+            self.swap[target] = a;
+            self.iswap[a] = target;
+            self.iswap[b] = position;
+        }
+        self.u_diag[step] = value;
+        // SuperLU scales by the reciprocal (`cdiv`), not by division.
+        let reciprocal = 1.0 / value;
+        let mut rows = Vec::with_capacity(self.lcand.len().saturating_sub(1));
+        let mut vals = Vec::with_capacity(rows.capacity());
+        for &row in &self.lcand {
+            if row != pivot {
+                rows.push(row);
+                vals.push(self.x[row] * reciprocal);
+            }
+        }
+        self.l_rows[step] = rows;
+        self.l_vals[step] = vals;
+    }
+
+    /// The U quota of `ilu_dcopy_to_ucol`'s caller for column `step`.
+    fn u_quota(&self, step: usize, column_nnz: usize) -> i64 {
+        let (n, gamma) = (self.n as f64, self.gamma);
+        if self.rule.intersects(IluDropRule::PROWS) {
+            (gamma * self.nnz_a as f64 / n * step as f64 / n) as i64
+        } else if self.rule.intersects(IluDropRule::COLUMN) {
+            (gamma * column_nnz as f64 * (step + 1) as f64 / n) as i64
+        } else if self.rule.intersects(IluDropRule::AREA) {
+            (gamma * 0.9 * self.nnz_aj as f64 * 0.5 - self.nnz_uj as f64) as i64
+        } else {
+            self.n as i64
+        }
+    }
+
+    /// SuperLU `ilu_dcopy_to_ucol` for a panel column: U entries of the current supernode
+    /// (`>= fsupc`) are kept; the rest pass the drop tolerance and the quota, then secondary
+    /// dropping keeps the largest by SIGNED selection, as `dqselect` does on `ucol`.
+    fn store_u_column(&mut self, step: usize, fsupc: usize, amax: f64, column_nnz: usize) {
+        let (threshold, quota) = if self.rule == IluDropRule::NONE {
+            (-1.0, self.n as i64)
+        } else {
+            (amax * self.tol_u, self.u_quota(step, column_nnz))
+        };
+        let mut steps = Vec::with_capacity(self.unodes.len());
+        let mut vals = Vec::with_capacity(self.unodes.len());
+        let mut kept_steps = Vec::new();
+        let mut kept_vals = Vec::new();
+        let (mut d_max, mut d_min) = (0.0_f64, 1.0 / f64::MIN_POSITIVE);
+        for &k in &self.unodes {
+            let value = self.x[self.step_rows[k]];
+            if k >= fsupc {
+                steps.push(k);
+                vals.push(value);
+                continue;
+            }
+            let magnitude = value.abs();
+            if quota > 0 && magnitude >= threshold {
+                kept_steps.push(k);
+                kept_vals.push(value);
+                d_max = d_max.max(magnitude);
+                d_min = d_min.min(magnitude);
+            } else {
+                self.stats.dropped_u_entries += 1;
+            }
+        }
+        let kept = kept_vals.len() as i64;
+        if self.rule.intersects(IluDropRule::SECONDARY) && kept > quota {
+            let tol = if quota > 0 {
+                if self.rule.intersects(IluDropRule::INTERP) {
+                    let (inv_max, inv_min) = (1.0 / d_max, 1.0 / d_min);
+                    1.0 / (inv_max + (inv_min - inv_max) * quota as f64 / kept as f64)
+                } else {
+                    kth_largest(&kept_vals, quota as usize)
+                }
+            } else {
+                d_max
+            };
+            for (k, value) in kept_steps.into_iter().zip(kept_vals) {
+                if value.abs() <= tol {
+                    self.stats.dropped_u_entries += 1;
+                } else {
+                    steps.push(k);
+                    vals.push(value);
+                    self.nnz_uj += 1;
+                }
+            }
+        } else {
+            self.nnz_uj += kept_steps.len();
+            steps.extend(kept_steps);
+            vals.extend(kept_vals);
+        }
+        if self.rule.intersects(IluDropRule::DYNAMIC) {
+            // SuperLU compares against nnzLj here, not nnzUj; kept as written.
+            if self.gamma * 0.9 * self.nnz_aj as f64 * 0.5 < self.nnz_lj as f64 {
+                self.tol_u = (self.tol_u * 2.0).min(1.0);
+            } else {
+                self.tol_u = self.drop_tol.max(self.tol_u * 0.5);
+            }
+        }
+        self.u_steps[step] = steps;
+        self.u_vals[step] = vals;
+    }
+
+    /// The L quota of `ilu_ddrop_row`'s caller for the supernode `first..=last`.
+    fn l_quota(&self, first: usize, last: usize) -> i64 {
+        let (n, gamma) = (self.n as f64, self.gamma);
+        let width = (last - first + 1) as f64;
+        if self.rule.intersects(IluDropRule::PROWS) {
+            (gamma * self.nnz_a as f64 / n * (n - first as f64) / n * width) as i64
+        } else if self.rule.intersects(IluDropRule::COLUMN) {
+            let column_nnz: usize = (first..=last).map(|step| self.a_range(step).len()).sum();
+            (gamma * column_nnz as f64 * (n - first as f64) / n) as i64
+        } else if self.rule.intersects(IluDropRule::AREA) {
+            (gamma * self.nnz_aj as f64 * (1.0 - 0.5 * (last as f64 + 1.0) / n)
+                - self.nnz_lj as f64) as i64
+        } else {
+            (self.n * self.n) as i64
+        }
+    }
+
+    /// SuperLU `ilu_ddrop_row` for the supernode `first..=last`: rows below its diagonal block
+    /// whose largest multiplier is below the tolerance go, then rows beyond the quota. Columns
+    /// before `defer_before` keep the rows until the panel ends (`apply_deferred_drop`).
+    fn drop_supernode_rows(&mut self, first: usize, last: usize, defer_before: usize) {
+        let width = last - first + 1;
+        let below = self.l_rows[last].clone();
+        let m = width + below.len();
+        let quota = self.l_quota(first, last);
+        if m == width || self.rule == IluDropRule::NONE {
+            self.nnz_lj += m * width;
+            self.adapt_tol_l(last);
+            return;
+        }
+        self.mark_generation += 1;
+        let generation = self.mark_generation;
+        for &row in &below {
+            self.row_mark[row] = generation;
+            self.norms[row] = 0.0;
+        }
+        for step in first..=last {
+            for (&row, &value) in self.l_rows[step].iter().zip(&self.l_vals[step]) {
+                if self.row_mark[row] == generation {
+                    self.norms[row] = self.norms[row].max(value.abs());
+                }
+            }
+        }
+        let mut dropped = Vec::new();
+        let mut kept = Vec::with_capacity(below.len());
+        let (mut d_max, mut d_min) = (0.0_f64, 1.0_f64);
+        for &row in &below {
+            let norm = self.norms[row];
+            if self.rule.intersects(IluDropRule::BASIC) && norm < self.tol_l {
+                dropped.push(row);
+            } else {
+                kept.push(row);
+                d_max = d_max.max(norm);
+                d_min = d_min.min(norm);
+            }
+        }
+        let quota = (quota as f64 / width as f64).ceil() as i64;
+        let basic_dropped = dropped.len();
+        if self.rule.intersects(IluDropRule::SECONDARY) && ((m - basic_dropped) as i64) > quota {
+            let tol = if quota > width as i64 {
+                if self.rule.intersects(IluDropRule::INTERP) {
+                    let (inv_max, inv_min) = (1.0 / d_max, 1.0 / d_min);
+                    1.0 / (inv_max
+                        + (inv_min - inv_max) * quota as f64 / (m - width - basic_dropped) as f64)
+                } else {
+                    let norms: Vec<f64> = kept.iter().map(|&row| self.norms[row]).collect();
+                    kth_largest(&norms, (quota - width as i64) as usize)
+                }
+            } else {
+                d_max
+            };
+            let mut still_kept = Vec::with_capacity(kept.len());
+            for row in kept {
+                if self.norms[row] <= tol {
+                    dropped.push(row);
+                } else {
+                    still_kept.push(row);
+                }
+            }
+        }
+        self.nnz_lj += (m - dropped.len()) * width;
+        if !dropped.is_empty() {
+            self.mark_generation += 1;
+            let generation = self.mark_generation;
+            for &row in &dropped {
+                self.row_mark[row] = generation;
+            }
+            for step in first.max(defer_before)..=last {
+                self.remove_marked_rows(step, generation);
+            }
+            if first < defer_before {
+                debug_assert!(self.deferred.is_none(), "one pre-panel supernode per panel");
+                self.deferred = Some(DeferredRowDrop {
+                    first,
+                    end: defer_before.min(last + 1),
+                    rows: dropped,
+                });
+            }
+        }
+        self.adapt_tol_l(last);
+    }
+
+    /// `DROP_DYNAMIC` for L, which `dgsitrf` applies after every supernode drop — including the
+    /// ones `ilu_ddrop_row` returns from early because there was nothing below the block.
+    fn adapt_tol_l(&mut self, last: usize) {
+        if self.rule.intersects(IluDropRule::DYNAMIC) {
+            let n = self.n as f64;
+            if self.gamma * self.nnz_aj as f64 * (1.0 - 0.5 * (last as f64 + 1.0) / n)
+                < self.nnz_lj as f64
+            {
+                self.tol_l = (self.tol_l * 2.0).min(1.0);
+            } else {
+                self.tol_l = self.drop_tol.max(self.tol_l * 0.5);
+            }
+        }
+    }
+
+    fn remove_marked_rows(&mut self, step: usize, generation: usize) {
+        let rows = &mut self.l_rows[step];
+        let vals = &mut self.l_vals[step];
+        let mut write = 0;
+        for read in 0..rows.len() {
+            if self.row_mark[rows[read]] == generation {
+                self.stats.dropped_l_entries += 1;
+            } else {
+                rows[write] = rows[read];
+                vals[write] = vals[read];
+                write += 1;
+            }
+        }
+        rows.truncate(write);
+        vals.truncate(write);
+    }
+
+    fn apply_deferred_drop(&mut self) {
+        if let Some(drop) = self.deferred.take() {
+            self.mark_generation += 1;
+            let generation = self.mark_generation;
+            for &row in &drop.rows {
+                self.row_mark[row] = generation;
+            }
+            for step in drop.first..drop.end {
+                self.remove_marked_rows(step, generation);
+            }
+        }
+    }
+
+    /// Does column `step` (a panel column, pattern in `lcand`) join column `step − 1`'s
+    /// supernode? SuperLU `ilu_dcolumn_dfs`: same pattern less the previous pivot, not after a
+    /// relaxed supernode, not singular, at most `ILU_MAX_SUPERNODE` columns.
+    fn joins_previous_supernode(&self, step: usize) -> bool {
+        step > 0
+            && !self.sn_relaxed[step - 1]
+            && !self.lcand.is_empty()
+            && step - self.sn_first[step - 1] < ILU_MAX_SUPERNODE
+            && self.prev_len == Some(self.lcand.len() + 1)
+            && self.lcand.iter().all(|&row| self.prev_mark[row] == step)
+    }
+
+    /// `dgsitrf`'s main loop: relaxed supernodes and panels of `panel_size` columns.
+    fn run(&mut self, relax_end: &[usize], panel_size: usize) -> SparseResult<()> {
+        let n = self.n;
+        let rowind = self.rowind;
+        let mut union = Vec::new();
+        let mut jcol = 0;
+        while jcol < n {
+            if relax_end[jcol] != ILU_NONE {
+                let kcol = relax_end[jcol];
+                if jcol > 0 && jcol < self.last_drop {
+                    self.drop_supernode_rows(self.sn_first[jcol - 1], jcol - 1, 0);
+                }
+                self.stats.supernodes += 1;
+                self.stats.relaxed_supernodes += 1;
+                union.clear();
+                for step in jcol..=kcol {
+                    union.extend_from_slice(&rowind[self.a_range(step)]);
+                }
+                for icol in jcol..=kcol {
+                    self.nnz_aj += self.a_range(icol).len();
+                    let mut amax = self.column_amax(icol);
+                    if amax == 0.0 {
+                        amax = ILU_FILL_TOL;
+                    }
+                    self.eliminate(icol, jcol, &union);
+                    self.sn_first[icol] = jcol;
+                    self.sn_relaxed[icol] = true;
+                    // Every U step reached lies in this supernode: kept, never counted.
+                    self.u_steps[icol] = self.unodes.clone();
+                    self.u_vals[icol] = self
+                        .unodes
+                        .iter()
+                        .map(|&k| self.x[self.step_rows[k]])
+                        .collect();
+                    let (pivot, value) = self.choose_pivot(icol, amax)?;
+                    self.finish_column(icol, pivot, value);
+                }
+                self.prev_len = None;
+                jcol = kcol + 1;
+                continue;
+            }
+
+            let end = (jcol + panel_size).min(n);
+            let mut width = panel_size;
+            let mut k = jcol + 1;
+            while k < end {
+                if relax_end[k] != ILU_NONE {
+                    width = k - jcol;
+                    break;
+                }
+                k += 1;
+            }
+            if k == n {
+                width = n - jcol;
+            }
+            let panel_start = jcol;
+            for jj in jcol..jcol + width {
+                let range = self.a_range(jj);
+                let column_nnz = range.len();
+                self.nnz_aj += column_nnz;
+                let amax = self.column_amax(jj);
+                self.eliminate(jj, 0, &rowind[range]);
+                let joins = self.joins_previous_supernode(jj);
+                let fsupc = if joins {
+                    self.sn_first[jj - 1]
+                } else {
+                    self.stats.supernodes += 1;
+                    jj
+                };
+                self.sn_first[jj] = fsupc;
+                self.sn_relaxed[jj] = false;
+                if self.lcand.is_empty() {
+                    // SuperLU gives an empty column a (zero) fill-in position to pivot on.
+                    let fill_row = (jj..n)
+                        .map(|position| self.swap[position])
+                        .find(|&row| self.pinv[row] == ILU_NONE && self.relax_allows(row, jj));
+                    if let Some(row) = fill_row {
+                        self.x[row] = 0.0;
+                        self.lcand.push(row);
+                    }
+                }
+                for &row in &self.lcand {
+                    self.prev_mark[row] = jj + 1;
+                }
+                self.prev_len = Some(self.lcand.len());
+                self.store_u_column(jj, fsupc, amax, column_nnz);
+                let (pivot, value) = self.choose_pivot(jj, amax)?;
+                self.finish_column(jj, pivot, value);
+                if jj > 0 && !joins && jj < self.last_drop {
+                    self.drop_supernode_rows(self.sn_first[jj - 1], jj - 1, panel_start);
+                }
+            }
+            self.apply_deferred_drop();
+            jcol += width;
+        }
+        Ok(())
+    }
+
+    /// Export `Pr·A·Pc ≈ L·U` in the step numbering, exact zeros left out as SciPy's `L`/`U`
+    /// leave them out.
+    fn into_factorization(
+        self,
+        ordering_used: PermutationOrdering,
+    ) -> SparseResult<SparseIluFactorization> {
+        let n = self.n;
+        let mut l_indptr = Vec::with_capacity(n + 1);
+        let mut l_indices = Vec::new();
+        let mut l_data = Vec::new();
+        let mut u_indptr = Vec::with_capacity(n + 1);
+        let mut u_indices = Vec::new();
+        let mut u_data = Vec::new();
+        let mut lower_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut upper_rows: Vec<Vec<(usize, f64)>> =
+            (0..n).map(|step| vec![(step, self.u_diag[step])]).collect();
+        let mut entries: Vec<(usize, f64)> = Vec::new();
+        l_indptr.push(0);
+        u_indptr.push(0);
+        for step in 0..n {
+            entries.clear();
+            entries.push((step, 1.0));
+            for (&row, &value) in self.l_rows[step].iter().zip(&self.l_vals[step]) {
+                if value != 0.0 {
+                    entries.push((self.pinv[row], value));
+                }
+            }
+            entries.sort_unstable_by_key(|&(row, _)| row);
+            for &(row, value) in &entries {
+                l_indices.push(row);
+                l_data.push(value);
+                if row != step {
+                    lower_rows[row].push((step, value));
+                }
+            }
+            l_indptr.push(l_indices.len());
+
+            entries.clear();
+            for (&k, &value) in self.u_steps[step].iter().zip(&self.u_vals[step]) {
+                if value != 0.0 {
+                    entries.push((k, value));
+                }
+            }
+            entries.push((step, self.u_diag[step]));
+            entries.sort_unstable_by_key(|&(row, _)| row);
+            for &(row, value) in &entries {
+                u_indices.push(row);
+                u_data.push(value);
+                if row != step {
+                    upper_rows[row].push((step, value));
+                }
+            }
+            u_indptr.push(u_indices.len());
+        }
+        let lower = PackedTriangularRows::from_rows(&lower_rows);
+        let upper = PackedTriangularRows::from_rows(&upper_rows);
+        let invariant = |which: &str| SparseError::InvalidArgument {
+            message: format!("spilu {which} factor is not triangular in step order"),
+        };
+        let lower_levels = TriangularLevelSchedule::lower(&lower).ok_or_else(|| invariant("L"))?;
+        let upper_levels = TriangularLevelSchedule::upper(&upper).ok_or_else(|| invariant("U"))?;
+        let mut perm_c = vec![0usize; n];
+        for (step, &col) in self.iperm_c.iter().enumerate() {
+            perm_c[col] = step;
+        }
+        let shape = Shape2D::new(n, n);
+        Ok(SparseIluFactorization {
+            shape: (n, n),
+            backend_used: SparseBackend::NativeIlutp,
+            ordering_used,
+            statistics: self.stats,
+            l: CscMatrix::from_components(shape, l_data, l_indices, l_indptr, false)?,
+            u: CscMatrix::from_components(shape, u_data, u_indices, u_indptr, false)?,
+            perm_r: self.pinv,
+            perm_c,
+            step_rows: self.step_rows,
+            lower,
+            upper,
+            lower_levels,
+            upper_levels,
+        })
+    }
+}
+
+/// SuperLU `dqselect(n, A, k)`: the k-th largest value (0-based, `k` clamped to the length),
+/// compared as SIGNED numbers — which is what `ilu_dcopy_to_ucol` feeds it.
+fn kth_largest(values: &[f64], k: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut work = values.to_vec();
+    let k = k.min(work.len() - 1);
+    let (_, kth, _) = work.select_nth_unstable_by(k, |a, b| b.total_cmp(a));
+    *kth
 }
 
 /// Sparse matrix exponential via dense fallback.
@@ -7012,7 +8789,7 @@ fn csr_matvec_into_impl(
 
 /// Preconditioned Conjugate Gradient solver.
 ///
-/// Solves Ax = b using CG with an ILU(0) preconditioner M ≈ A.
+/// Solves Ax = b using CG with an incomplete-LU preconditioner M = L·U ≈ A from [`spilu`].
 /// The preconditioner solves M*z = r at each iteration instead of using r directly.
 /// Matches `scipy.sparse.linalg.cg(A, b, M=spilu(A).solve)`.
 pub fn pcg(
@@ -7136,6 +8913,371 @@ pub fn pcg(
     })
 }
 
+/// The Krylov dimension [`gmres`] restarts at, capped at `n`: SciPy's default `restart=20`
+/// (`scipy/sparse/linalg/_isolve/iterative.py`, `restart = min(restart, n)`).
+///
+/// frankenscipy-felow set it to 20 in f10be8e16, and a rustfmt pass (1e12c2d6e) applied
+/// afterwards put back 30. That left fsci at 244 inner iterations where SciPy takes 163 at
+/// side 64, while `perf_sparse_vs_scipy` kept printing 20. It is a named constant now, and the
+/// harness prints it.
+pub const GMRES_DEFAULT_RESTART: usize = 20;
+
+/// Shape checks and the initial iterate shared by the preconditioned Krylov ports.
+fn preconditioned_krylov_start(
+    name: &str,
+    a: &CsrMatrix,
+    b: &[f64],
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<f64>> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!("{name} requires a square matrix"),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, x0, options)?;
+    match x0 {
+        Some(initial) if initial.len() != n => Err(SparseError::IncompatibleShape {
+            message: "initial guess length must match matrix rows".to_string(),
+        }),
+        Some(initial) => Ok(initial.to_vec()),
+        None => Ok(vec![0.0; n]),
+    }
+}
+
+/// A preconditioner application with the length checked, so a wrong-sized `M` fails loudly
+/// instead of truncating a zip.
+fn apply_preconditioner<M>(preconditioner: &M, v: &[f64]) -> SparseResult<Vec<f64>>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let z = preconditioner(v)?;
+    if z.len() != v.len() {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "preconditioner returned {} entries for a vector of {}",
+                z.len(),
+                v.len()
+            ),
+        });
+    }
+    Ok(z)
+}
+
+/// LAPACK `dlartg` (the 3.10+ algorithm SciPy's bundled LAPACK runs): `c`, `s`, `r` with
+/// `[c s; −s c]·[f; g] = [r; 0]`, `r` carrying the sign of `f`.
+fn lapack_lartg(f: f64, g: f64) -> (f64, f64, f64) {
+    let safmin = f64::MIN_POSITIVE;
+    let safmax = 1.0 / safmin;
+    let rtmin = safmin.sqrt();
+    let rtmax = (safmax / 2.0).sqrt();
+    let (f1, g1) = (f.abs(), g.abs());
+    if g == 0.0 {
+        (1.0, 0.0, f)
+    } else if f == 0.0 {
+        (0.0, 1.0_f64.copysign(g), g1)
+    } else if f1 > rtmin && f1 < rtmax && g1 > rtmin && g1 < rtmax {
+        let d = (f * f + g * g).sqrt();
+        let r = d.copysign(f);
+        (f1 / d, g / r, r)
+    } else {
+        let u = safmin.max(f1).max(g1).min(safmax);
+        let (fs, gs) = (f / u, g / u);
+        let d = (fs * fs + gs * gs).sqrt();
+        let r = d.copysign(f);
+        (fs.abs() / d, gs / r, r * u)
+    }
+}
+
+/// Restarted GMRES with a LEFT preconditioner: SciPy 1.17.1's
+/// `scipy.sparse.linalg.gmres(A, b, M=M, restart=restart, rtol=tol, atol=0)`, ported step for
+/// step (modified Gram–Schmidt on `M⁻¹A`, LAPACK `lartg` Givens rotations, and SciPy's gh-8400
+/// inner tolerance `ptol` that tightens or relaxes between restarts). `preconditioner` is
+/// SciPy's `M.matvec`, e.g. `|r| ilu.solve(r)` for `M = spilu(A)`.
+///
+/// `restart` defaults to 20 (SciPy's default, capped at n); `options.max_iter` counts restart
+/// CYCLES as SciPy's `maxiter` does (default 10n). `iterations` is the number of inner Arnoldi
+/// steps, SciPy's `callback_type='pr_norm'` count. Convergence is SciPy's: the TRUE residual
+/// `‖b − A·x‖ ≤ tol·‖b‖` after a cycle.
+///
+/// The existing unpreconditioned [`gmres`] keeps its own restart length and is not this port.
+///
+/// # Errors
+/// Shape and input errors as [`gmres`], `InvalidArgument` for `restart == Some(0)`, and any
+/// error the preconditioner returns.
+pub fn gmres_preconditioned<M>(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: M,
+    x0: Option<&[f64]>,
+    restart: Option<usize>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = preconditioned_krylov_start("GMRES", a, b, x0, options)?;
+    if restart == Some(0) {
+        return Err(SparseError::InvalidArgument {
+            message: "GMRES restart must be at least 1".to_string(),
+        });
+    }
+    let n = b.len();
+    let b_norm = vec_norm(b);
+    if rhs_is_zero(b_norm) {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            // status: ‖b‖ = 0, so x = 0 solves exactly (SciPy returns b)
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let atol = options.tol * b_norm;
+    let eps = f64::EPSILON;
+    let max_cycles = options.max_iter.unwrap_or(n * 10);
+    let restart = restart.unwrap_or(20).min(n);
+
+    let mb_norm = vec_norm(&apply_preconditioner(&preconditioner, b)?);
+    let mut ptol_max_factor = 1.0_f64;
+    let mut ptol = mb_norm * ptol_max_factor.min(atol / b_norm);
+    let mut presid = 0.0_f64;
+    let mut v = vec![vec![0.0; n]; restart + 1];
+    let mut h = vec![vec![0.0; restart + 1]; restart];
+    let mut givens = vec![(0.0_f64, 0.0_f64); restart];
+    let mut inner = 0usize;
+    let mut r = if x.iter().any(|&value| value != 0.0) {
+        let ax = csr_matvec(a, &x);
+        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
+    } else {
+        b.to_vec()
+    };
+    if vec_norm(&r) < atol {
+        let residual_norm = vec_norm(&r) / b_norm;
+        return Ok(IterativeSolveResult {
+            solution: x,
+            // status: ‖b − A·x0‖ < tol·‖b‖ before any step
+            converged: true,
+            iterations: 0,
+            residual_norm,
+        });
+    }
+    let mut r_norm = f64::INFINITY;
+    let mut av = vec![0.0; n];
+    for _cycle in 0..max_cycles {
+        v[0] = apply_preconditioner(&preconditioner, &r)?;
+        let beta = vec_norm(&v[0]);
+        let inverse = 1.0 / beta;
+        v[0].iter_mut().for_each(|value| *value *= inverse);
+        let mut s = vec![0.0; restart + 1];
+        s[0] = beta;
+        let mut breakdown = false;
+        let mut col = 0;
+        for column in 0..restart {
+            col = column;
+            csr_matvec_into(a, &v[col], &mut av);
+            let mut w = apply_preconditioner(&preconditioner, &av)?;
+            let h0 = vec_norm(&w);
+            for k in 0..=col {
+                let projection = dot_product(&v[k], &w);
+                h[col][k] = projection;
+                subtract_scaled_basis_vector(&mut w, projection, &v[k]);
+            }
+            let h1 = vec_norm(&w);
+            h[col][col + 1] = h1;
+            if h1 <= eps * h0 {
+                h[col][col + 1] = 0.0;
+                breakdown = true;
+                v[col + 1] = w;
+            } else {
+                let inverse = 1.0 / h1;
+                w.iter_mut().for_each(|value| *value *= inverse);
+                v[col + 1] = w;
+            }
+            for k in 0..col {
+                let (c, sn) = givens[k];
+                let (n0, n1) = (h[col][k], h[col][k + 1]);
+                h[col][k] = c * n0 + sn * n1;
+                h[col][k + 1] = -sn * n0 + c * n1;
+            }
+            let (c, sn, magnitude) = lapack_lartg(h[col][col], h[col][col + 1]);
+            givens[col] = (c, sn);
+            h[col][col] = magnitude;
+            h[col][col + 1] = 0.0;
+            let rotated = -sn * s[col];
+            s[col] *= c;
+            s[col + 1] = rotated;
+            presid = rotated.abs();
+            inner += 1;
+            if presid <= ptol || breakdown {
+                break;
+            }
+        }
+        if h[col][col] == 0.0 {
+            s[col] = 0.0;
+        }
+        let mut y = s[..=col].to_vec();
+        for k in (1..=col).rev() {
+            if y[k] != 0.0 {
+                y[k] /= h[k][k];
+                let coefficient = y[k];
+                for i in 0..k {
+                    y[i] -= coefficient * h[k][i];
+                }
+            }
+        }
+        if y[0] != 0.0 {
+            y[0] /= h[0][0];
+        }
+        for (coefficient, basis) in y.iter().zip(&v) {
+            for (xi, bi) in x.iter_mut().zip(basis) {
+                *xi += coefficient * bi;
+            }
+        }
+        let ax = csr_matvec(a, &x);
+        r = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
+        r_norm = vec_norm(&r);
+        if r_norm <= atol || breakdown {
+            break;
+        }
+        if presid <= ptol {
+            ptol_max_factor = eps.max(0.25 * ptol_max_factor);
+        } else {
+            ptol_max_factor = (1.5 * ptol_max_factor).min(1.0);
+        }
+        ptol = presid * ptol_max_factor.min(atol / r_norm);
+    }
+    Ok(IterativeSolveResult {
+        solution: x,
+        // status: SciPy's `info = 0 if rnorm <= atol`
+        converged: r_norm <= atol,
+        iterations: inner,
+        residual_norm: r_norm / b_norm,
+    })
+}
+
+/// BiCGSTAB with a preconditioner: SciPy 1.17.1's
+/// `scipy.sparse.linalg.bicgstab(A, b, M=M, rtol=tol, atol=0)` ported step for step, including
+/// its breakdown tests (`|ρ| < ε²`, `|ω| < ε²`, `r̃ᵀv = 0`) and its half-step exit when
+/// `‖s‖ < tol·‖b‖`. `preconditioner` is SciPy's `M.matvec`.
+///
+/// `options.max_iter` defaults to 10n as SciPy's does. `iterations` counts the iterations
+/// entered, a half-step exit included (SciPy's callback count plus that last partial one).
+///
+/// # Errors
+/// Shape and input errors as [`bicgstab`], and any error the preconditioner returns.
+pub fn bicgstab_preconditioned<M>(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: M,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = preconditioned_krylov_start("BiCGSTAB", a, b, x0, options)?;
+    let n = b.len();
+    let b_norm = vec_norm(b);
+    if rhs_is_zero(b_norm) {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            // status: ‖b‖ = 0, so x = 0 solves exactly (SciPy returns b)
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let atol = options.tol * b_norm;
+    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let breakdown_tol = f64::EPSILON * f64::EPSILON;
+    let mut r: Vec<f64> = if x.iter().any(|&value| value != 0.0) {
+        let ax = csr_matvec(a, &x);
+        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
+    } else {
+        b.to_vec()
+    };
+    let r_tilde = r.clone();
+    let mut p = vec![0.0; n];
+    let mut v = vec![0.0; n];
+    let mut t = vec![0.0; n];
+    let (mut rho_prev, mut omega, mut alpha) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let finish = |x: Vec<f64>, r: &[f64], converged: bool, iterations: usize| {
+        let residual_norm = vec_norm(r) / b_norm;
+        IterativeSolveResult {
+            solution: x,
+            converged,
+            iterations,
+            residual_norm,
+        }
+    };
+    for iteration in 0..max_iter {
+        if vec_norm(&r) < atol {
+            // status: ‖r‖ < tol·‖b‖
+            return Ok(finish(x, &r, true, iteration));
+        }
+        let rho = dot_product(&r_tilde, &r);
+        if rho.abs() < breakdown_tol {
+            // status: ρ breakdown (SciPy info −10)
+            return Ok(finish(x, &r, false, iteration));
+        }
+        if iteration > 0 {
+            if omega.abs() < breakdown_tol {
+                // status: ω breakdown (SciPy info −11)
+                return Ok(finish(x, &r, false, iteration));
+            }
+            let beta = (rho / rho_prev) * (alpha / omega);
+            for i in 0..n {
+                p[i] -= omega * v[i];
+                p[i] *= beta;
+                p[i] += r[i];
+            }
+        } else {
+            p.copy_from_slice(&r);
+        }
+        let p_hat = apply_preconditioner(&preconditioner, &p)?;
+        csr_matvec_into(a, &p_hat, &mut v);
+        let rv = dot_product(&r_tilde, &v);
+        if rv == 0.0 {
+            // status: r̃ᵀv = 0 breakdown (SciPy info −11)
+            return Ok(finish(x, &r, false, iteration));
+        }
+        alpha = rho / rv;
+        for (ri, vi) in r.iter_mut().zip(&v) {
+            *ri -= alpha * vi;
+        }
+        if vec_norm(&r) < atol {
+            for (xi, pi) in x.iter_mut().zip(&p_hat) {
+                *xi += alpha * pi;
+            }
+            // status: ‖s‖ < tol·‖b‖ at the half step
+            return Ok(finish(x, &r, true, iteration + 1));
+        }
+        let s_hat = apply_preconditioner(&preconditioner, &r)?;
+        csr_matvec_into(a, &s_hat, &mut t);
+        omega = dot_product(&t, &r) / dot_product(&t, &t);
+        for i in 0..n {
+            x[i] += alpha * p_hat[i];
+        }
+        for i in 0..n {
+            x[i] += omega * s_hat[i];
+        }
+        for (ri, ti) in r.iter_mut().zip(&t) {
+            *ri -= omega * ti;
+        }
+        rho_prev = rho;
+    }
+    // status: SciPy returns `info = maxiter` here without re-testing the last residual.
+    Ok(finish(x, &r, false, max_iter))
+}
+
 /// GMRES (Generalized Minimal Residual) solver for general (non-symmetric) sparse systems.
 ///
 /// Solves Ax = b for general square A using restarted GMRES with Arnoldi iteration.
@@ -7160,7 +9302,7 @@ pub fn gmres(
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
     let max_iter = options.max_iter.unwrap_or(n * 10);
-    let restart = n.min(30); // Krylov subspace dimension before restart
+    let restart = n.min(GMRES_DEFAULT_RESTART);
 
     let mut x = match x0 {
         Some(initial) => {
@@ -7596,10 +9738,14 @@ pub fn lgmres(
         let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
         let r_norm = vec_norm(&r);
 
-        if r_norm / b_norm < options.tol {
+        // SciPy's test, `r_norm <= max(atol, rtol * b_norm)` with atol = 0. It must be the
+        // SAME comparison as lgmres_inner's `r_norm <= tol` (tol = options.tol * b_norm): with
+        // the old strict `r_norm / b_norm < tol` an exact x0 at tol = 0 passed the inner test
+        // (0 <= 0, zero iterations) and failed this one (0 < 0), so the loop never advanced.
+        if r_norm <= options.tol * b_norm {
             return Ok(IterativeSolveResult {
                 solution: x,
-                // status: true residual ‖b − Ax‖/‖b‖ < tol
+                // status: true residual ‖b − Ax‖ <= tol·‖b‖
                 converged: true,
                 iterations: total_iter,
                 residual_norm: r_norm / b_norm,
@@ -7626,6 +9772,11 @@ pub fn lgmres(
             (max_iter - total_iter).min(inner_m),
             &outer_v,
         )?;
+        if iters == 0 {
+            // No inner progress is possible (the inner cycle judged r already converged);
+            // the verdict after the loop reads the true residual.
+            break;
+        }
         total_iter += iters;
 
         // Update solution: x = x + z
@@ -7656,13 +9807,13 @@ pub fn lgmres(
     }
 
     let ax = csr_matvec(a, &x);
-    let r_norm = vec_norm_diff(&ax, b) / b_norm;
+    let r_norm = vec_norm_diff(&ax, b);
     Ok(IterativeSolveResult {
         solution: x,
         // The last cycle may have converged exactly as the budget ran out.
-        converged: r_norm < options.tol,
+        converged: r_norm <= options.tol * b_norm,
         iterations: total_iter,
-        residual_norm: r_norm,
+        residual_norm: r_norm / b_norm,
     })
 }
 
@@ -9864,6 +12015,9 @@ pub struct CaspPortfolioSolveResult {
     pub iterations: usize,
     pub residual_norm: f64,
     pub fallback_active: bool,
+    /// The arm `spsolve` reported when a direct solve produced `x` (the SuperLU action, or the
+    /// fallback after an unconverged iterate); `None` when the iterative method's answer stands.
+    pub direct_backend: Option<SparseBackend>,
 }
 
 /// Solve a sparse linear system using CASP Bayesian expected-loss portfolio selection.
@@ -9952,6 +12106,7 @@ pub fn solve_with_casp_portfolio(
     let (action, posterior, expected_losses, chosen_loss) =
         portfolio.select_action(cond_estimate, Some(structural));
 
+    let mut direct_backend = None;
     let (x, converged, iters, res_norm, fallback_active) = match action {
         SparseSolverAction::ConjugateGradient => {
             let res = cg(a, b, x0, iterative_opts)?;
@@ -10006,6 +12161,7 @@ pub fn solve_with_casp_portfolio(
         SparseSolverAction::SuperLU => {
             let res = spsolve(a, b, SolveOptions::default())?;
             let (ok, residual) = direct_solve_status(a, b, &res.solution);
+            direct_backend = Some(res.backend_used);
             (res.solution, ok, 1, residual, false)
         }
     };
@@ -10019,6 +12175,7 @@ pub fn solve_with_casp_portfolio(
             match spsolve(a, b, SolveOptions::default()) {
                 Ok(slv) => {
                     let (ok, residual) = direct_solve_status(a, b, &slv.solution);
+                    direct_backend = Some(slv.backend_used);
                     (slv.solution, ok, iters + 1, residual, true)
                 }
                 Err(_) => (x, converged, iters, res_norm, fallback_active),
@@ -10051,6 +12208,7 @@ pub fn solve_with_casp_portfolio(
         iterations: final_iters,
         residual_norm: final_res,
         fallback_active: final_fallback,
+        direct_backend,
     })
 }
 
@@ -10209,10 +12367,13 @@ fn spsolve_with_casp_internal(
         );
     }
 
-    let backend_used = match casp_res.chosen_action {
-        SparseSolverAction::SuperLU => SparseBackend::NativeSparseLu,
-        _ => SparseBackend::Auto,
-    };
+    // The arm that produced `x`: the direct solve's own report, or the iterative method whose
+    // converged iterate stands. This used to say NativeSparseLu for every SuperLU choice and
+    // Auto for every iterative one, even when the direct fallback had produced the answer
+    // (frankenscipy-szq1n.4).
+    let backend_used = casp_res
+        .direct_backend
+        .unwrap_or(SparseBackend::Iterative(casp_res.chosen_action));
 
     let mut warnings = Vec::new();
     if casp_res.fallback_active {
@@ -11169,11 +13330,22 @@ fn has_empty_structural_row(a: &CsrMatrix) -> bool {
 /// Returns an n×n matrix of shortest distances. Input is a CSR adjacency matrix
 /// where values are edge weights. Missing edges are treated as infinite distance.
 ///
-/// Matches `scipy.sparse.csgraph.floyd_warshall`.
-pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
+/// Matches `scipy.sparse.csgraph.floyd_warshall(graph, directed)`; with `directed = false`
+/// the pair `(i, j)` starts from the smaller of its two stored weights, as in SciPy.
+///
+/// A negative cycle is [`SparseError::NegativeCycle`], SciPy's `NegativeCycleError`: after the
+/// relaxation any `dist[i][i] < 0` refuses the whole matrix, whose distances through the cycle are unbounded
+/// below (frankenscipy-lna36). With `directed = false` one negative edge is such a cycle. A
+/// non-square graph is an error too, as SciPy's `ValueError`.
+pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<Vec<f64>>> {
     let shape = graph.shape();
     if shape.rows != shape.cols {
-        return vec![];
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "floyd_warshall needs a square graph, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
     }
     let n = shape.rows;
 
@@ -11195,6 +13367,18 @@ pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
             // here — negative-cycle detection is `bellman_ford`'s job.
             if j != i {
                 d[i * n + j] = graph.data()[idx];
+            }
+        }
+    }
+    if !directed {
+        // SciPy's `directed=False`: each pair takes the shorter of its two directions.
+        for i in 0..n {
+            for j in i + 1..n {
+                if d[j * n + i] <= d[i * n + j] {
+                    d[i * n + j] = d[j * n + i];
+                } else {
+                    d[j * n + i] = d[i * n + j];
+                }
             }
         }
     }
@@ -11220,7 +13404,15 @@ pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
         floyd_warshall_blocked(&mut d, n);
     }
 
-    d.chunks_exact(n).map(<[f64]>::to_vec).collect()
+    // SciPy: `if dist_matrix[i, i] < 0: raise NegativeCycleError("Negative cycle in nodes
+    // ...")` over the whole diagonal once the relaxation is done.
+    let cycle: Vec<usize> = (0..n).filter(|&i| d[i * n + i] < 0.0).collect();
+    if !cycle.is_empty() {
+        return Err(SparseError::NegativeCycle {
+            message: format!("Negative cycle in nodes {cycle:?}"),
+        });
+    }
+    Ok(d.chunks_exact(n).map(<[f64]>::to_vec).collect())
 }
 
 /// Block-pivot Floyd-Warshall. Pivots are processed B at a time (`n/B` rounds).
@@ -11348,11 +13540,25 @@ impl Ord for SpDijkstraState {
     }
 }
 
-pub fn shortest_path(graph: &CsrMatrix, source: usize, target: usize) -> (f64, Vec<usize>) {
+/// Shortest path from `source` to `target` and its length, by Dijkstra. With
+/// `directed = false` an edge can be walked either way (each settled node relaxes its row and
+/// then its column), as `scipy.sparse.csgraph.shortest_path(directed=False)` walks it.
+/// Unreachable or out-of-range endpoints give `(inf, [])`.
+pub fn shortest_path(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+    target: usize,
+) -> (f64, Vec<usize>) {
     let n = graph.shape().rows;
     if source >= n || target >= n {
         return (f64::INFINITY, vec![]);
     }
+    let transpose = if directed || graph.shape().cols != n {
+        None
+    } else {
+        Some(transpose_adjacency(graph))
+    };
 
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
@@ -11385,11 +13591,13 @@ pub fn shortest_path(graph: &CsrMatrix, source: usize, target: usize) -> (f64, V
             break;
         }
 
-        let row_start = graph.indptr()[u];
-        let row_end = graph.indptr()[u + 1];
-        for idx in row_start..row_end {
-            let v = graph.indices()[idx];
-            let w = graph.data()[idx];
+        let row = graph.indptr()[u]..graph.indptr()[u + 1];
+        let own = graph.indices()[row.clone()].iter().zip(&graph.data()[row]);
+        let reverse = transpose.as_ref().map(|t| {
+            let row = t.indptr[u]..t.indptr[u + 1];
+            t.indices[row.clone()].iter().zip(&t.data[row])
+        });
+        for (&v, &w) in own.chain(reverse.into_iter().flatten()) {
             let alt = dist[u] + w;
             if alt < dist[v] {
                 dist[v] = alt;
@@ -11677,8 +13885,9 @@ fn elimination_tree_of_permuted(a: &CsrMatrix, perm: &[usize]) -> Vec<usize> {
 /// Postorder of the forest described by `parent`, children visited in increasing order.
 ///
 /// Iterative so a deep tree cannot blow the stack -- an n=4096 banded matrix produces a chain
-/// thousands deep, which a recursive DFS would not survive.
-#[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
+/// thousands deep, which a recursive DFS would not survive. Children ascending and roots
+/// ascending is SuperLU's `TreePostorder` order, which `spilu` relies on to postorder its column
+/// elimination tree as `sp_preorder` does.
 fn postorder_forest(parent: &[usize]) -> Vec<usize> {
     let n = parent.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -12257,13 +14466,19 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 }
             }))
         }
+        // A NaN row sum makes the norm NaN, as numpy's max does (and as "1"/"-1" above);
+        // `f64::max` would drop it and report the largest finite row.
         "inf" => {
             let mut max_row = 0.0f64;
             for i in 0..n {
                 let start = a.indptr()[i];
                 let end = a.indptr()[i + 1];
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
-                max_row = max_row.max(row_sum);
+                max_row = if max_row.is_nan() || row_sum.is_nan() {
+                    f64::NAN
+                } else {
+                    max_row.max(row_sum)
+                };
             }
             Ok(max_row)
         }
@@ -12311,7 +14526,11 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 let start = a.indptr()[i];
                 let end = a.indptr()[i + 1];
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
-                min_row = min_row.min(row_sum);
+                min_row = if min_row.is_nan() || row_sum.is_nan() {
+                    f64::NAN
+                } else {
+                    min_row.min(row_sum)
+                };
             }
             Ok(min_row)
         }
@@ -12335,13 +14554,20 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 return Ok(0.0);
             }
             let result = svds(a, 1, EigsOptions::default())?;
-            result
-                .singular_values
-                .first()
-                .copied()
-                .ok_or_else(|| SparseError::InvalidArgument {
+            let sigma = result.singular_values.first().copied().ok_or_else(|| {
+                SparseError::InvalidArgument {
                     message: "spectral norm: svds returned no singular value".to_string(),
-                })
+                }
+            })?;
+            // A NaN or an infinity in A (or an AᵀA that overflows) leaves the Krylov basis
+            // NaN. SciPy's ARPACK raises there ("ARPACK error -9999: Could not build an
+            // Arnoldi factorization"); this used to return Ok(0.0).
+            if !sigma.is_finite() {
+                return Err(SparseError::NonFiniteInput {
+                    message: "spectral norm: svds produced a non-finite singular value".to_string(),
+                });
+            }
+            Ok(sigma)
         }
         // SciPy raises `ValueError: Invalid norm order for matrices.` and so
         // does this now. The two predecessors of this arm are why the signature
@@ -13158,88 +15384,110 @@ pub fn degree_sequence(graph: &CsrMatrix) -> Vec<usize> {
         .collect()
 }
 
-/// Find the strongly connected components of a directed graph (Tarjan's algorithm).
+/// Find the strongly connected components of a directed graph, labelled exactly as
+/// `scipy.sparse.csgraph.connected_components(graph, directed=True, connection='strong')`
+/// labels them.
 ///
-/// Returns a vector of component assignments (component index for each node).
+/// Returns the component label of each node. This is SciPy's iterative Pearce algorithm (see
+/// [`pearce_scc`]). It replaced a recursive Tarjan, which numbered components in a different
+/// order and overflowed the stack (aborting the process) on a directed path of 200,000 nodes.
 pub fn strongly_connected_components(graph: &CsrMatrix) -> Vec<usize> {
     let n = graph.shape().rows;
-    let mut index_counter = 0usize;
-    let mut stack = Vec::new();
-    let mut on_stack = vec![false; n];
-    let mut index = vec![usize::MAX; n];
-    let mut lowlink = vec![0usize; n];
-    let mut component = vec![0usize; n];
-    let mut n_components = 0usize;
+    pearce_scc(graph.indptr(), graph.indices(), n).1
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn strongconnect(
-        v: usize,
-        graph: &CsrMatrix,
-        index_counter: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut [bool],
-        index: &mut [usize],
-        lowlink: &mut [usize],
-        component: &mut [usize],
-        n_components: &mut usize,
-    ) {
-        index[v] = *index_counter;
-        lowlink[v] = *index_counter;
-        *index_counter += 1;
-        stack.push(v);
-        on_stack[v] = true;
+/// SciPy's `_connected_components_directed` (`sparse/csgraph/_traversal.pyx`): Pearce's
+/// iterative, O(V + E)-memory variant of Tarjan's algorithm, ported statement by statement.
+/// SciPy saves memory by aliasing two pairs of arrays, and the port keeps that aliasing
+/// because the algorithm relies on it. The DFS stack's forward links share storage with the
+/// component stack `SS` (a node is never on both), and the low-links array becomes the label
+/// array: finished nodes hold labels counting DOWN from `N - 1`, and those never compare below
+/// a live index. Returns `(n_components, labels)` with the labels turned to count up from 0,
+/// as SciPy returns them.
+fn pearce_scc(indptr: &[usize], indices: &[usize], n: usize) -> (usize, Vec<usize>) {
+    const VOID: i64 = -1;
+    const END: i64 = -2;
+    let n_i = n as i64;
+    let mut lowlinks: Vec<i64> = vec![VOID; n];
+    // SciPy's `SS` and `stack_f` are the same array.
+    let mut ss: Vec<i64> = vec![VOID; n];
+    let mut stack_b: Vec<i64> = vec![VOID; n];
+    let mut ss_head = END;
+    let mut index: i64 = 0;
+    let mut label: i64 = n_i - 1;
 
-        let row_start = graph.indptr()[v];
-        let row_end = graph.indptr()[v + 1];
-        for idx in row_start..row_end {
-            let w = graph.indices()[idx];
-            if index[w] == usize::MAX {
-                strongconnect(
-                    w,
-                    graph,
-                    index_counter,
-                    stack,
-                    on_stack,
-                    index,
-                    lowlink,
-                    component,
-                    n_components,
-                );
-                lowlink[v] = lowlink[v].min(lowlink[w]);
-            } else if on_stack[w] {
-                lowlink[v] = lowlink[v].min(index[w]);
-            }
+    for start in 0..n {
+        if lowlinks[start] != VOID {
+            continue;
         }
-
-        if lowlink[v] == index[v] {
-            while let Some(w) = stack.pop() {
-                on_stack[w] = false;
-                component[w] = *n_components;
-                if w == v {
-                    break;
+        let mut stack_head = start as i64;
+        ss[start] = END;
+        stack_b[start] = END;
+        while stack_head != END {
+            let v = stack_head as usize;
+            if lowlinks[v] == VOID {
+                lowlinks[v] = index;
+                index += 1;
+                // Push every unvisited neighbour, moving one already on the DFS stack to
+                // the top; the last neighbour pushed is visited first.
+                for &w in &indices[indptr[v]..indptr[v + 1]] {
+                    if lowlinks[w] == VOID {
+                        if ss[w] != VOID {
+                            let (f, b) = (ss[w], stack_b[w]);
+                            if b != END {
+                                ss[b as usize] = f;
+                            }
+                            if f != END {
+                                stack_b[f as usize] = b;
+                            }
+                        }
+                        ss[w] = stack_head;
+                        stack_b[w] = END;
+                        stack_b[stack_head as usize] = w as i64;
+                        stack_head = w as i64;
+                    }
+                }
+            } else {
+                // Every descendant is finished: pop v and settle its low-link.
+                stack_head = ss[v];
+                if stack_head >= 0 {
+                    stack_b[stack_head as usize] = END;
+                }
+                ss[v] = VOID;
+                stack_b[v] = VOID;
+                let mut root = true;
+                let mut low_v = lowlinks[v];
+                for &w in &indices[indptr[v]..indptr[v + 1]] {
+                    let low_w = lowlinks[w];
+                    if low_w < low_v {
+                        low_v = low_w;
+                        root = false;
+                    }
+                }
+                lowlinks[v] = low_v;
+                if root {
+                    index -= 1;
+                    while ss_head != END && lowlinks[v] <= lowlinks[ss_head as usize] {
+                        let w = ss_head as usize;
+                        ss_head = ss[w];
+                        ss[w] = VOID;
+                        lowlinks[w] = label;
+                        index -= 1;
+                    }
+                    lowlinks[v] = label;
+                    label -= 1;
+                } else {
+                    ss[v] = ss_head;
+                    ss_head = v as i64;
                 }
             }
-            *n_components += 1;
         }
     }
-
-    for v in 0..n {
-        if index[v] == usize::MAX {
-            strongconnect(
-                v,
-                graph,
-                &mut index_counter,
-                &mut stack,
-                &mut on_stack,
-                &mut index,
-                &mut lowlink,
-                &mut component,
-                &mut n_components,
-            );
-        }
-    }
-
-    component
+    let labels = lowlinks
+        .iter()
+        .map(|&raw| (n_i - 1 - raw) as usize)
+        .collect();
+    ((n_i - 1 - label) as usize, labels)
 }
 
 /// Topological sort of a directed acyclic graph (DAG).
@@ -13348,12 +15596,10 @@ pub fn pagerank(graph: &CsrMatrix, damping: f64, max_iter: usize, tol: f64) -> V
 
 /// Compute the graph diameter (longest shortest path between any two nodes).
 ///
-/// Uses Floyd-Warshall internally. Returns 0.0 for non-square matrices.
-pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
-    let dist = floyd_warshall(graph);
-    if dist.is_empty() {
-        return 0.0;
-    }
+/// Uses Floyd-Warshall internally, so a non-square graph or a negative cycle is an error
+/// ([`floyd_warshall`]); an empty graph has diameter 0.
+pub fn graph_diameter(graph: &CsrMatrix) -> SparseResult<f64> {
+    let dist = floyd_warshall(graph, true)?;
     let mut max_d = 0.0f64;
     for row in &dist {
         for &d in row {
@@ -13362,17 +15608,15 @@ pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
             }
         }
     }
-    max_d
+    Ok(max_d)
 }
 
 /// Compute the eccentricity of each node (max shortest path distance).
-/// Returns empty vec for non-square matrices.
-pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
-    let dist = floyd_warshall(graph);
-    if dist.is_empty() {
-        return vec![];
-    }
-    dist.iter()
+/// A non-square graph or a negative cycle is an error ([`floyd_warshall`]).
+pub fn eccentricity(graph: &CsrMatrix) -> SparseResult<Vec<f64>> {
+    let dist = floyd_warshall(graph, true)?;
+    Ok(dist
+        .iter()
         .map(|row| {
             row.iter()
                 .filter(|&&d| d.is_finite())
@@ -13385,7 +15629,7 @@ pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
                     }
                 })
         })
-        .collect()
+        .collect())
 }
 
 /// Compute the clustering coefficient for each node.
@@ -13512,14 +15756,12 @@ pub fn betweenness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 }
 
 /// Compute closeness centrality for each node.
-pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
+/// A non-square graph or a negative cycle is an error ([`floyd_warshall`]).
+pub fn closeness_centrality(graph: &CsrMatrix) -> SparseResult<Vec<f64>> {
     let n = graph.shape().rows;
-    let dist = floyd_warshall(graph);
-    if dist.is_empty() {
-        return vec![0.0; n];
-    }
+    let dist = floyd_warshall(graph, true)?;
 
-    (0..n)
+    Ok((0..n)
         .map(|i| {
             let reachable: Vec<f64> = dist[i]
                 .iter()
@@ -13539,7 +15781,7 @@ pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
                 }
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Apply an element-wise function to all nonzero entries of a CSR matrix.
@@ -14747,8 +16989,8 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
-        let ap = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
+        let ap = dijkstra_all_pairs(&g, true).expect("dijkstra_all_pairs");
         assert_eq!(ap.len(), n);
         for (i, (api, fwi)) in ap.iter().zip(fw.iter()).enumerate() {
             for (j, (&a, &b)) in api.distances.iter().zip(fwi.iter()).enumerate() {
@@ -14788,9 +17030,9 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let sources = [3usize, 17, 42, 0, 59];
-        let ms = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        let ms = dijkstra_multi_source(&g, true, &sources).expect("multi-source");
         assert_eq!(ms.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
             for (j, (&a, &b)) in ms[si].distances.iter().zip(fw[src].iter()).enumerate() {
@@ -14834,10 +17076,10 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let parallel = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        let parallel = dijkstra_all_pairs(&g, true).expect("dijkstra_all_pairs");
         assert_eq!(parallel.len(), n);
         for (source, row) in parallel.iter().enumerate() {
-            let serial = dijkstra(&g, source).expect("serial dijkstra");
+            let serial = dijkstra(&g, true, source).expect("serial dijkstra");
             for (node, (&left, &right)) in row
                 .distances
                 .iter()
@@ -14858,7 +17100,7 @@ mod tests {
 
         // Source order is the caller's, not sorted, and repeats are honoured.
         let sources = [n - 1, 0, 137, 0, 42];
-        let multi = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        let multi = dijkstra_multi_source(&g, true, &sources).expect("multi-source");
         assert_eq!(multi.len(), sources.len());
         for (slot, &source) in sources.iter().enumerate() {
             assert_eq!(
@@ -14868,7 +17110,7 @@ mod tests {
         }
 
         assert!(
-            dijkstra_multi_source(&g, &[n]).is_err(),
+            dijkstra_multi_source(&g, true, &[n]).is_err(),
             "out-of-bounds source must be rejected"
         );
     }
@@ -14901,9 +17143,9 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr");
-        let fw = floyd_warshall(&g);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let sources = [1usize, 9, 30, 54, 0];
-        let bf = bellman_ford_multi_source(&g, &sources).expect("bf multi");
+        let bf = bellman_ford_multi_source(&g, true, &sources).expect("bf multi");
         assert_eq!(bf.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
             for (j, (&a, &b)) in bf[si].distances.iter().zip(fw[src].iter()).enumerate() {
@@ -14949,8 +17191,8 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g);
-        let jh = johnson(&g).expect("johnson");
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
+        let jh = johnson(&g, true).expect("johnson");
         assert_eq!(jh.len(), n);
         for (i, (jhi, fwi)) in jh.iter().zip(fw.iter()).enumerate() {
             for (j, (&a, &b)) in jhi.distances.iter().zip(fwi.iter()).enumerate() {
@@ -15057,6 +17299,11 @@ mod tests {
         assert_eq!(options.ordering, PermutationOrdering::Colamd);
         assert!((options.drop_tol - 1e-4).abs() <= f64::EPSILON);
         assert!((options.fill_factor - 10.0).abs() <= f64::EPSILON);
+        // SuperLU ilu_set_default_options / sp_ienv, which SciPy uses for `None`.
+        assert_eq!(options.drop_rule.bits(), 0x0009);
+        assert!((options.diag_pivot_thresh - 0.1).abs() <= f64::EPSILON);
+        assert_eq!(options.relax, 10);
+        assert_eq!(options.panel_size, 20);
     }
 
     #[test]
@@ -15205,7 +17452,7 @@ mod tests {
         )
         .unwrap();
         // closeness = reachable_count / sum_dist: center=2/2=1, endpoints=2/3.
-        let cc = closeness_centrality(&g);
+        let cc = closeness_centrality(&g).expect("closeness_centrality");
         assert!(
             (cc[0] - 2.0 / 3.0).abs() < 1e-12
                 && (cc[1] - 1.0).abs() < 1e-12
@@ -15290,8 +17537,11 @@ mod tests {
         )
         .unwrap();
         assert!(is_connected(&g), "connected");
-        assert!((graph_diameter(&g) - 2.0).abs() < 1e-12, "diameter");
-        assert_eq!(eccentricity(&g), vec![2.0, 1.0, 2.0]);
+        assert!(
+            (graph_diameter(&g).expect("diameter") - 2.0).abs() < 1e-12,
+            "diameter"
+        );
+        assert_eq!(eccentricity(&g).expect("eccentricity"), vec![2.0, 1.0, 2.0]);
         assert!(average_clustering(&g).abs() < 1e-12, "no triangles -> 0");
         let mut deg = degree_sequence(&g);
         deg.sort_unstable_by(|a, b| b.cmp(a));
@@ -15394,7 +17644,8 @@ mod tests {
         let result = spsolve(&a, &b, SolveOptions::default())
             .expect("native sparse direct solve should avoid dense fallback guard");
 
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // A diagonal matrix is the narrowest band there is: the banded Cholesky arm takes it.
+        assert_eq!(result.backend_used, SparseBackend::BandedCholesky);
         assert_eq!(result.solution.len(), n);
         assert_eq!(result.solution[0], 1.0);
         assert_eq!(result.solution[n - 1], 1.0);
@@ -15420,7 +17671,9 @@ mod tests {
         let result = spsolve(&a, &b, SolveOptions::default())
             .expect("nonzero tiny pivots should remain solvable");
 
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // The banded Cholesky's self-validation rejects a 1e-300 diagonal, so the banded LU
+        // behind it is what solves this, and the label says so.
+        assert_eq!(result.backend_used, SparseBackend::BandedLu);
         assert!(
             result
                 .solution
@@ -15496,180 +17749,491 @@ mod tests {
         assert!(matches!(err, SparseError::InvalidShape { .. }));
     }
 
+    /// SciPy 1.17.1's `spilu` accepts what SuperLU accepts (measured live): a negative
+    /// `drop_tol` (nothing then falls under it) and a `fill_factor` below 1. It fails with
+    /// "gstrf was called with invalid arguments" at `fill_factor=-1` and HANGS at 0 and at
+    /// `panel_size=0`, so those, and non-finite values, are refused here instead.
     #[test]
-    fn spilu_rejects_negative_drop_tol() {
-        let a = square_csc();
-        let options = IluOptions {
-            drop_tol: -1e-6,
-            ..IluOptions::default()
-        };
-        let err = spilu(&a, options).expect_err("negative drop_tol");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    fn spilu_option_domain_follows_scipy_and_refuses_what_hangs_it() {
+        let a = spilu_convection_diffusion_csc(8, 1.5, 1.5);
+        for options in [
+            IluOptions {
+                drop_tol: -1e-6,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: 0.5,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                drop_rule: IluDropRule::NONE,
+                ..IluOptions::default()
+            },
+        ] {
+            spilu(&a, options).expect("SciPy accepts this option value");
+        }
+        for options in [
+            IluOptions {
+                drop_tol: f64::NAN,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: 0.0,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: -1.0,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                fill_factor: f64::INFINITY,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                diag_pivot_thresh: f64::NAN,
+                ..IluOptions::default()
+            },
+            IluOptions {
+                panel_size: 0,
+                ..IluOptions::default()
+            },
+        ] {
+            let err = spilu(&a, options).expect_err("refused option value");
+            assert!(
+                matches!(err, SparseError::InvalidArgument { .. }),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
-    fn spilu_rejects_fill_factor_below_one() {
-        let a = square_csc();
-        let options = IluOptions {
-            fill_factor: 0.9,
-            ..IluOptions::default()
-        };
-        let err = spilu(&a, options).expect_err("fill factor");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    fn spilu_drop_rule_parses_scipy_names_and_superlu_bits() {
+        assert_eq!(
+            IluDropRule::from_scipy_spec("basic,area").expect("default spelling"),
+            IluDropRule::default()
+        );
+        assert_eq!(
+            IluDropRule::from_scipy_spec(" Dynamic , INTERP,prows")
+                .expect("case, spaces")
+                .bits(),
+            0x0112
+        );
+        // SuperLU's SECONDARY is PROWS | COLUMN | AREA, not a bit of its own.
+        assert_eq!(
+            IluDropRule::from_scipy_spec("secondary")
+                .expect("secondary")
+                .bits(),
+            0x000E
+        );
+        assert!(IluDropRule::default().intersects(IluDropRule::SECONDARY));
+        assert!(IluDropRule::from_scipy_spec("").is_err());
+        assert!(IluDropRule::from_scipy_spec("basic,bogus").is_err());
+        assert_eq!(
+            IluDropRule::from_bits(0x0119).expect("valid bits").bits(),
+            0x0119
+        );
+        assert!(IluDropRule::from_bits(0x0200).is_err());
     }
 
-    #[test]
-    fn spilu_valid_input_succeeds() {
-        // ILU(0) now implemented — verify it produces a factorization
-        let a = square_csc();
-        let ilu = spilu(&a, IluOptions::default()).expect("spilu should succeed");
-        assert_eq!(ilu.shape, (a.shape().rows, a.shape().cols));
-    }
-
-    fn spilu_reference_find_index(
-        indices: &[usize],
-        indptr: &[usize],
-        row: usize,
-        col: usize,
-    ) -> Option<usize> {
-        (indptr[row]..indptr[row + 1]).find(|&idx| indices[idx] == col)
-    }
-
-    fn spilu_reference_linear_scan(a: &CscMatrix) -> SparseResult<SparseIluFactorization> {
-        let csr = a.to_csr()?;
-        let n = csr.shape().rows;
-        let lu_indptr = csr.indptr();
-        let lu_indices = csr.indices();
-        let mut lu_data = csr.data().to_vec();
-
-        for i in 0..n {
-            for idx_ik in lu_indptr[i]..lu_indptr[i + 1] {
-                let k = lu_indices[idx_ik];
-                if k >= i {
-                    break;
+    /// 2-D convection–diffusion on an m×m grid, central differences scaled by h²: `4` on the
+    /// diagonal, `−1 ∓ cx` on the x neighbours and `−1 ∓ cy` on the y neighbours (`c = pe·h/2`).
+    /// `(40, 0.4, 0.0)` is exactly the bead's reference matrix
+    /// `kron(I, diags([−1.4, 4, −0.6])) + kron(diags([−1, −1], [−1, 1]), I)`.
+    fn spilu_convection_diffusion_csc(m: usize, cx: f64, cy: f64) -> CscMatrix {
+        let n = m * m;
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for j in 0..m {
+            for i in 0..m {
+                let k = j * m + i;
+                let mut push = |col: usize, value: f64| {
+                    rows.push(k);
+                    cols.push(col);
+                    data.push(value);
+                };
+                push(k, 4.0);
+                if i > 0 {
+                    push(k - 1, -1.0 - cx);
                 }
-
-                let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-                if pivot_is_zero(diag_k) {
-                    return Err(SparseError::SingularMatrix {
-                        message: format!("zero pivot at row {k} during ILU(0)"),
-                    });
+                if i + 1 < m {
+                    push(k + 1, -1.0 + cx);
                 }
-
-                lu_data[idx_ik] /= diag_k;
-                let multiplier = lu_data[idx_ik];
-
-                for idx_kj in lu_indptr[k]..lu_indptr[k + 1] {
-                    let j = lu_indices[idx_kj];
-                    if j <= k {
-                        continue;
-                    }
-                    let a_kj = lu_data[idx_kj];
-
-                    if let Some(idx_ij) = spilu_reference_find_index(lu_indices, lu_indptr, i, j) {
-                        lu_data[idx_ij] -= multiplier * a_kj;
-                    }
+                if j > 0 {
+                    push(k - m, -1.0 - cy);
+                }
+                if j + 1 < m {
+                    push(k + m, -1.0 + cy);
                 }
             }
         }
-
-        let mut l_data = Vec::new();
-        let mut l_indices = Vec::new();
-        let mut l_indptr = vec![0usize];
-        let mut u_data = Vec::new();
-        let mut u_indices = Vec::new();
-        let mut u_indptr = vec![0usize];
-
-        for i in 0..n {
-            for idx in lu_indptr[i]..lu_indptr[i + 1] {
-                let j = lu_indices[idx];
-                if j < i {
-                    l_data.push(lu_data[idx]);
-                    l_indices.push(j);
-                }
-            }
-            l_data.push(1.0);
-            l_indices.push(i);
-            l_indptr.push(l_data.len());
-
-            for idx in lu_indptr[i]..lu_indptr[i + 1] {
-                let j = lu_indices[idx];
-                if j >= i {
-                    u_data.push(lu_data[idx]);
-                    u_indices.push(j);
-                }
-            }
-            u_indptr.push(u_data.len());
-        }
-
-        Ok(SparseIluFactorization {
-            shape: (n, n),
-            backend_used: SparseBackend::Auto,
-            ordering_used: IluOptions::default().ordering,
-            l_data,
-            l_indices,
-            l_indptr,
-            u_data,
-            u_indices,
-            u_indptr,
-            n,
-        })
-    }
-
-    fn spilu_banded_csc(n: usize, half_bandwidth: usize) -> CscMatrix {
-        let entries_per_row = half_bandwidth.saturating_mul(2).saturating_add(1);
-        let mut data = Vec::with_capacity(n.saturating_mul(entries_per_row));
-        let mut rows = Vec::with_capacity(data.capacity());
-        let mut cols = Vec::with_capacity(data.capacity());
-
-        for row in 0..n {
-            let start = row.saturating_sub(half_bandwidth);
-            let end = row.saturating_add(half_bandwidth).min(n.saturating_sub(1));
-            for col in start..=end {
-                rows.push(row);
-                cols.push(col);
-                if row == col {
-                    data.push(entries_per_row as f64 + 2.0 + (row % 17) as f64 * 0.001);
-                } else {
-                    data.push(-1.0 / (row.abs_diff(col) + 1) as f64);
-                }
-            }
-        }
-
         CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
-            .expect("spilu banded coo")
+            .expect("convection-diffusion coo")
             .to_csc()
-            .expect("spilu banded csc")
+            .expect("convection-diffusion csc")
     }
 
-    fn float_bits(values: &[f64]) -> Vec<u64> {
-        values.iter().map(|value| value.to_bits()).collect()
-    }
-
-    fn assert_spilu_factors_same_bits(
-        actual: &SparseIluFactorization,
-        expected: &SparseIluFactorization,
-    ) {
-        assert_eq!(actual.shape, expected.shape);
-        assert_eq!(actual.backend_used, expected.backend_used);
-        assert_eq!(actual.ordering_used, expected.ordering_used);
-        assert_eq!(actual.n, expected.n);
-        assert_eq!(actual.l_indptr, expected.l_indptr);
-        assert_eq!(actual.l_indices, expected.l_indices);
-        assert_eq!(float_bits(&actual.l_data), float_bits(&expected.l_data));
-        assert_eq!(actual.u_indptr, expected.u_indptr);
-        assert_eq!(actual.u_indices, expected.u_indices);
-        assert_eq!(float_bits(&actual.u_data), float_bits(&expected.u_data));
-    }
-
-    #[test]
-    fn spilu_row_workspace_matches_linear_scan_factor_bits() {
-        for &(n, half_bandwidth) in &[(16usize, 3usize), (64, 5), (160, 7)] {
-            let matrix = spilu_banded_csc(n, half_bandwidth);
-            let actual = spilu(&matrix, IluOptions::default()).expect("workspace spilu");
-            let expected = spilu_reference_linear_scan(&matrix).expect("reference spilu");
-            assert_spilu_factors_same_bits(&actual, &expected);
+    /// The bead's negative case 1: diagonal 0, sub-diagonal −1, super-diagonal +1.
+    fn spilu_zero_diagonal_skew_tridiagonal_csc(n: usize) -> CscMatrix {
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0);
+            }
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                data.push(1.0);
+            }
         }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("skew coo")
+            .to_csc()
+            .expect("skew csc")
+    }
+
+    /// `max |(Pr·A·Pc − L·U)_ij| / max |A_ij|`, densely.
+    fn spilu_factor_relative_error(a: &CscMatrix, ilu: &SparseIluFactorization) -> f64 {
+        let n = a.shape().rows;
+        let dense_a = csc_to_dense(a);
+        let (l, u) = (csc_to_dense(ilu.l()), csc_to_dense(ilu.u()));
+        let mut worst = 0.0_f64;
+        let a_max = dense_a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        for row in 0..n {
+            for col in 0..n {
+                // (Pr·A·Pc)[perm_r[i], perm_c[j]] = A[i, j].
+                let mut lu = 0.0;
+                let (step_row, step_col) = (ilu.perm_r()[row], ilu.perm_c()[col]);
+                for k in 0..n {
+                    lu += l[step_row * n + k] * u[k * n + step_col];
+                }
+                worst = worst.max((dense_a[row * n + col] - lu).abs());
+            }
+        }
+        worst / a_max
+    }
+
+    fn spilu_is_permutation(p: &[usize]) -> bool {
+        let mut seen = vec![false; p.len()];
+        p.iter()
+            .all(|&i| i < p.len() && !std::mem::replace(&mut seen[i], true))
+    }
+
+    /// The bead's unit test: with nothing dropped (drop_tol = 0, a fill factor no quota can
+    /// bind), ILUTP IS LU with threshold partial pivoting, so Pr·A·Pc = L·U to rounding, under
+    /// every ordering. The must-miss arm: the default drop_tol on the same matrix drops entries
+    /// and leaves a visible error, so the check can tell exact from incomplete.
+    #[test]
+    fn spilu_is_exact_lu_when_nothing_is_dropped() {
+        let a = spilu_convection_diffusion_csc(10, 2.7, 1.3);
+        for ordering in [
+            PermutationOrdering::Colamd,
+            PermutationOrdering::Natural,
+            PermutationOrdering::MmdAta,
+            PermutationOrdering::MmdAtPlusA,
+            PermutationOrdering::Amd,
+            PermutationOrdering::ReverseCuthillMcKee,
+        ] {
+            let exact = spilu(
+                &a,
+                IluOptions {
+                    ordering,
+                    drop_tol: 0.0,
+                    fill_factor: 1e6,
+                    ..IluOptions::default()
+                },
+            )
+            .expect("exact factorization");
+            assert!(spilu_is_permutation(exact.perm_r()) && spilu_is_permutation(exact.perm_c()));
+            let error = spilu_factor_relative_error(&a, &exact);
+            assert!(
+                error <= 1e-12,
+                "{ordering:?}: drop_tol=0 must be exact, ‖PrAPc − LU‖/‖A‖ = {error:e}"
+            );
+            assert_eq!(exact.statistics.dropped_u_entries, 0);
+            assert_eq!(exact.statistics.dropped_l_entries, 0);
+        }
+        let incomplete = spilu(
+            &a,
+            IluOptions {
+                drop_tol: 1e-1,
+                ..IluOptions::default()
+            },
+        )
+        .expect("incomplete factorization");
+        assert!(
+            incomplete.statistics.dropped_u_entries + incomplete.statistics.dropped_l_entries > 0
+        );
+        assert!(
+            spilu_factor_relative_error(&a, &incomplete) > 1e-6,
+            "drop_tol=0.1 must leave a visible factorization error"
+        );
+        assert_eq!(incomplete.ordering_used, PermutationOrdering::Colamd);
+        assert_eq!(incomplete.backend_used, SparseBackend::NativeIlutp);
+    }
+
+    /// `Colamd` is SuperLU's COLAMD followed by `sp_preorder`'s etree postorder, so `perm_c` is
+    /// SciPy's to the index. The pin is SciPy 1.17.1's own `spilu(A).perm_c` on the 6×6 member of
+    /// the bead's matrix family (measured live, not taken from this code), where it also returns
+    /// nnz(L+U) = 372. The must-differ arm: fsci's exact minimum degree on AᵀA (`MmdAta`) is a
+    /// different ordering, so the pin can tell COLAMD from another reasonable ordering.
+    #[test]
+    fn spilu_colamd_perm_c_is_scipys() {
+        let a = spilu_convection_diffusion_csc(6, 0.4, 0.0);
+        let scipy_perm_c: [usize; 36] = [
+            12, 14, 33, 35, 2, 0, 13, 15, 34, 32, 3, 1, 16, 19, 30, 31, 25, 28, 17, 18, 20, 26, 27,
+            29, 10, 11, 21, 22, 7, 6, 8, 9, 23, 24, 5, 4,
+        ];
+        let ilu = spilu(&a, IluOptions::default()).expect("spilu");
+        assert_eq!(ilu.ordering_used, PermutationOrdering::Colamd);
+        assert_eq!(ilu.perm_c(), &scipy_perm_c);
+        let mmd = spilu(
+            &a,
+            IluOptions {
+                ordering: PermutationOrdering::MmdAta,
+                ..IluOptions::default()
+            },
+        )
+        .expect("spilu mmd");
+        assert_ne!(mmd.perm_c(), &scipy_perm_c);
+    }
+
+    /// The bead's negative case 1 at unit scale: every diagonal entry of A is zero, so ILU(0)
+    /// — and any ILU that takes the diagonal — meets a zero pivot at the first column. ILUTP must
+    /// pivot away from it, stay exact (the factor of a tridiagonal has no dropped fill here), and
+    /// precondition GMRES to 1e-10.
+    #[test]
+    fn spilu_pivots_away_from_a_zero_diagonal() {
+        let n = 100;
+        let a = spilu_zero_diagonal_skew_tridiagonal_csc(n);
+        let ilu = spilu(&a, IluOptions::default()).expect("ILUTP pivots off the zero diagonal");
+        assert!(
+            ilu.statistics.off_diagonal_pivots >= n / 2,
+            "the zero diagonal can never be the pivot: {:?}",
+            ilu.statistics
+        );
+        assert_eq!(ilu.statistics.zero_pivots, 0);
+        assert!(spilu_factor_relative_error(&a, &ilu) <= 1e-12);
+        let csr = a.to_csr().expect("csr");
+        let b = vec![1.0; n];
+        let result = gmres_preconditioned(
+            &csr,
+            &b,
+            |r: &[f64]| ilu.solve(r),
+            None,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-10,
+                max_iter: Some(20),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("preconditioned gmres");
+        assert!(result.converged, "{result:?}");
+        assert!(relative_residual(&csr, &b, &result.solution) <= 1e-10);
+        // The same matrix with a pivot threshold of 0 on a nonzero diagonal would keep the
+        // diagonal; here there is none to keep, so a threshold of 0 must still pivot.
+        let forced = spilu(
+            &a,
+            IluOptions {
+                diag_pivot_thresh: 0.0,
+                ..IluOptions::default()
+            },
+        )
+        .expect("threshold 0 still cannot pivot on an exact zero");
+        assert!(forced.statistics.off_diagonal_pivots >= n / 2);
+    }
+
+    /// `diag_pivot_thresh` means what SciPy's does: 1e-300 on the diagonal is kept at
+    /// threshold 0 and replaced by the larger off-diagonal entry at the default 0.1 (SciPy
+    /// 1.17.1 on [[1e-300, 1], [1, 1]] returns perm_r = [1, 0]).
+    #[test]
+    fn spilu_threshold_pivoting_prefers_the_diagonal_only_above_the_threshold() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1e-300, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csc()
+        .expect("csc");
+        let natural = IluOptions {
+            ordering: PermutationOrdering::Natural,
+            ..IluOptions::default()
+        };
+        let pivoted = spilu(&a, natural).expect("default threshold");
+        assert_eq!(pivoted.perm_r(), &[1, 0]);
+        let kept = spilu(
+            &a,
+            IluOptions {
+                diag_pivot_thresh: 0.0,
+                ..natural
+            },
+        )
+        .expect("threshold 0");
+        assert_eq!(kept.perm_r(), &[0, 1]);
+    }
+
+    /// A structurally singular pivot: SciPy raises "Factor is exactly singular" for
+    /// [[1, 1], [1, 1]]; Strict mode refuses the same way, Hardened replaces the pivot the way
+    /// SuperLU does internally and reports it.
+    #[test]
+    fn spilu_zero_pivot_fails_strict_and_is_replaced_hardened() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csc()
+        .expect("csc");
+        let err = spilu(&a, IluOptions::default()).expect_err("SciPy raises here");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+        let hardened = spilu(
+            &a,
+            IluOptions {
+                mode: RuntimeMode::Hardened,
+                ..IluOptions::default()
+            },
+        )
+        .expect("hardened fills the pivot");
+        assert_eq!(hardened.statistics.zero_pivots, 1);
+        let x = hardened.solve(&[1.0, 2.0]).expect("finite solve");
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    /// The bead's negative case 2 (unit form, on the bead's own matrix family): nnz(L+U) grows
+    /// strictly as drop_tol falls, and fill_factor bounds it. SciPy 1.17.1 on the bead's matrix
+    /// gives 17326 / 31508 / 52188 / 59159; the live comparison is in
+    /// `diff_sparse_spilu_ilutp`. The cap `fill_factor·nnz(A) + n` is not a SuperLU guarantee —
+    /// SciPy itself exceeds it at fill_factor = 1 (9451 > 9440 on the bead's matrix) — so it is
+    /// asserted from fill_factor = 2 up.
+    #[test]
+    fn spilu_fill_grows_as_drop_tol_falls_and_fill_factor_caps_it() {
+        let a = spilu_convection_diffusion_csc(40, 0.4, 0.0);
+        let n = a.shape().rows;
+        let mut previous = 0;
+        for drop_tol in [1e-1, 1e-2, 1e-4, 1e-6] {
+            let ilu = spilu(
+                &a,
+                IluOptions {
+                    drop_tol,
+                    fill_factor: 20.0,
+                    ..IluOptions::default()
+                },
+            )
+            .expect("spilu");
+            let nnz = ilu.lu_nnz();
+            assert!(
+                nnz > previous,
+                "drop_tol={drop_tol}: {nnz} after {previous}"
+            );
+            previous = nnz;
+        }
+        for fill_factor in [2.0, 5.0, 10.0, 20.0] {
+            for drop_tol in [0.0, 1e-4] {
+                let ilu = spilu(
+                    &a,
+                    IluOptions {
+                        drop_tol,
+                        fill_factor,
+                        ..IluOptions::default()
+                    },
+                )
+                .expect("spilu");
+                let cap = fill_factor * a.nnz() as f64 + n as f64;
+                assert!(
+                    ilu.lu_nnz() as f64 <= cap,
+                    "fill_factor={fill_factor} drop_tol={drop_tol}: {} > {cap}",
+                    ilu.lu_nnz()
+                );
+            }
+        }
+    }
+
+    /// The factor is scale-covariant like SciPy's: scaling A by 2^-60 leaves L's bits alone and
+    /// scales U's exactly, and `solve` scales back, because every drop and pivot test is relative.
+    #[test]
+    fn spilu_is_scale_covariant() {
+        let a = spilu_convection_diffusion_csc(12, 3.0, 2.0);
+        let scale = 2.0_f64.powi(-60);
+        let scaled = CscMatrix::from_components(
+            a.shape(),
+            a.data().iter().map(|v| v * scale).collect(),
+            a.indices().to_vec(),
+            a.indptr().to_vec(),
+            false,
+        )
+        .expect("scaled");
+        let unit = spilu(&a, IluOptions::default()).expect("unit");
+        let small = spilu(&scaled, IluOptions::default()).expect("scaled");
+        assert_eq!(unit.l().indices(), small.l().indices());
+        assert_eq!(
+            unit.l()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            small
+                .l()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unit.u()
+                .data()
+                .iter()
+                .map(|v| (v * scale).to_bits())
+                .collect::<Vec<_>>(),
+            small
+                .u()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The preconditioned Krylov ports against a direct solve, and a must-differ arm: the
+    /// ILUTP preconditioner has to cut GMRES's inner iterations on convection–diffusion, or the
+    /// preconditioner argument is not being applied.
+    #[test]
+    fn preconditioned_gmres_and_bicgstab_converge_with_spilu() {
+        let a = spilu_convection_diffusion_csc(20, 2.4, 2.4);
+        let n = a.shape().rows;
+        let csr = a.to_csr().expect("csr");
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 5) as f64).collect();
+        let ilu = spilu(&a, IluOptions::default()).expect("spilu");
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        };
+        let with_m = gmres_preconditioned(&csr, &b, |r: &[f64]| ilu.solve(r), None, None, options)
+            .expect("gmres M");
+        let identity = |r: &[f64]| -> SparseResult<Vec<f64>> { Ok(r.to_vec()) };
+        let without_m =
+            gmres_preconditioned(&csr, &b, identity, None, None, options).expect("gmres I");
+        assert!(with_m.converged && without_m.converged);
+        assert!(relative_residual(&csr, &b, &with_m.solution) <= 1e-10);
+        assert!(
+            with_m.iterations * 4 < without_m.iterations,
+            "ILUTP must cut GMRES iterations: {} with M, {} without",
+            with_m.iterations,
+            without_m.iterations
+        );
+        let bicg = bicgstab_preconditioned(&csr, &b, |r: &[f64]| ilu.solve(r), None, options)
+            .expect("bicgstab M");
+        assert!(bicg.converged, "{bicg:?}");
+        assert!(relative_residual(&csr, &b, &bicg.solution) <= 1e-10);
+        let wrong_length = |r: &[f64]| -> SparseResult<Vec<f64>> { Ok(r[1..].to_vec()) };
+        assert!(gmres_preconditioned(&csr, &b, wrong_length, None, None, options).is_err());
     }
 
     #[test]
@@ -15903,7 +18467,8 @@ mod tests {
         assert!(a.nnz() > n * 16, "should exceed the density gate");
         let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 5) as f64).collect();
         let result = spsolve(&a, &b, SolveOptions::default()).expect("spsolve");
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // Symmetric and strictly diagonally dominant: the banded Cholesky arm.
+        assert_eq!(result.backend_used, SparseBackend::BandedCholesky);
         let mut max_res = 0.0_f64;
         for i in 0..n {
             let mut ax = 0.0;
@@ -17407,7 +19972,10 @@ mod tests {
         assert!(lu.lower_levels.has_parallel_rows());
         assert!(lu.upper_levels.has_parallel_rows());
         assert_eq!(
-            lu.lower_levels.levels().collect::<Vec<_>>(),
+            lu.lower_levels
+                .levels()
+                .map(|(rows, _)| rows)
+                .collect::<Vec<_>>(),
             vec![&[0, 1][..], &[2, 3][..]]
         );
 
@@ -17458,6 +20026,107 @@ mod tests {
                 "level-scheduled component {index} differs"
             );
         }
+    }
+
+    /// Levels with at least LEVEL_PAR_MIN_WORK stored entries go to the pool, lighter ones are
+    /// solved in place (frankenscipy-moti4). Here the second half of L and the first half of U
+    /// are one pooled level each (1024 rows × LEVEL_PAR_MIN_WORK/1024 entries = exactly the
+    /// gate), and the other
+    /// levels are light. Both paths must match the serial dependency order bit for bit. A
+    /// schedule the old rule accepted, one two-row level ahead of a chain, must not count as
+    /// useful.
+    #[test]
+    fn heavy_and_light_levels_both_match_the_serial_order_bits() {
+        let half = 1024;
+        let fan = LEVEL_PAR_MIN_WORK / half;
+        let n = 2 * half;
+        let lower_rows: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|row| {
+                if row < half {
+                    vec![]
+                } else {
+                    let i = row - half;
+                    let mut deps: Vec<usize> = (0..fan).map(|j| (i + 7 * j) % half).collect();
+                    deps.sort_unstable();
+                    deps.dedup();
+                    deps.into_iter()
+                        .map(|col| (col, 0.001 * ((row + col) % 13) as f64))
+                        .collect()
+                }
+            })
+            .collect();
+        let upper_rows: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|row| {
+                let diagonal = (row, 2.0 + (row % 5) as f64 * 0.125);
+                if row < half {
+                    let mut deps: Vec<usize> =
+                        (0..fan).map(|j| half + (row + 5 * j) % half).collect();
+                    deps.sort_unstable();
+                    deps.dedup();
+                    std::iter::once(diagonal)
+                        .chain(
+                            deps.into_iter()
+                                .map(|col| (col, 0.001 * ((row + col) % 11) as f64)),
+                        )
+                        .collect()
+                } else {
+                    vec![diagonal]
+                }
+            })
+            .collect();
+        let lu = NativeSparseLu::from_factor_rows(
+            n,
+            (0..n).collect(),
+            lower_rows,
+            upper_rows,
+            None,
+            PermutationOrdering::Natural,
+        );
+        assert!(lu.lower_levels.pooled_work() >= LEVEL_PAR_MIN_WORK);
+        assert!(lu.upper_levels.pooled_work() >= LEVEL_PAR_MIN_WORK);
+        let rhs: Vec<f64> = (0..n).map(|i| 1.0 + (i % 11) as f64 * 0.3).collect();
+        let solve = |schedule: bool| {
+            let mut x = vec![0.0; n];
+            triangular_forward_substitute(
+                &lu.lower.offsets,
+                &lu.lower.columns,
+                &lu.lower.values,
+                |row| rhs[row],
+                &mut x,
+                false,
+                schedule.then_some(&lu.lower_levels),
+            );
+            triangular_backward_substitute(
+                &lu.upper.offsets,
+                &lu.upper.columns,
+                &lu.upper.values,
+                &mut x,
+                false,
+                schedule.then_some(&lu.upper_levels),
+            )
+            .expect("valid diagonals");
+            x
+        };
+        let (scheduled, serial) = (solve(true), solve(false));
+        assert!(
+            scheduled
+                .iter()
+                .zip(&serial)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        // One two-row level ahead of a chain: the old rule (any level wider than one row) took
+        // the pool for every level of this; it is all thin and must not count as useful.
+        let chain = NativeSparseLu::from_factor_rows(
+            4,
+            vec![0, 1, 2, 3],
+            vec![vec![], vec![], vec![(1, 0.5)], vec![(2, 0.5)]],
+            (0..4).map(|row| vec![(row, 2.0)]).collect(),
+            None,
+            PermutationOrdering::Natural,
+        );
+        assert!(chain.lower_levels.has_parallel_rows());
+        assert_eq!(chain.lower_levels.pooled_work(), 0);
+        assert!(!level_schedule_is_useful(&chain.lower_levels));
     }
 
     #[test]
@@ -24696,7 +27365,7 @@ mod tests {
     /// A scale that is an exact power of two, chosen to land every pivot of the
     /// fixtures below well under the absolute floor `f64::EPSILON * 100.0`
     /// (2.22e-14) that the pivot guards used to apply. Scaling by a power of two
-    /// commutes with round-to-nearest, so a triangular solve and an ILU(0)
+    /// commutes with round-to-nearest, so a triangular solve and an incomplete-LU
     /// elimination on the scaled system owe a BIT-IDENTICAL answer — there is no
     /// tolerance here to argue about.
     const PIVOT_GUARD_SCALE: f64 = 8.673_617_379_884_035e-19; // 2^-60
@@ -24817,28 +27486,30 @@ mod tests {
         let unit = spd_uneven_row_csr(n);
         let scaled = scale_csr(&unit, PIVOT_GUARD_SCALE);
         let unit_ilu = spilu(&unit.to_csc().expect("csc"), IluOptions::default())
-            .expect("the unscaled ILU(0) is ordinary");
+            .expect("the unscaled ILU is ordinary");
         let scaled_ilu = spilu(&scaled.to_csc().expect("csc"), IluOptions::default()).expect(
             "SciPy's spilu factors this matrix at 2^-60; an absolute pivot floor is the \
              only reason we would not",
         );
 
         // The L multipliers are ratios of scaled quantities, so they are
-        // unchanged; the U entries carry the scale factor exactly.
+        // unchanged; the U entries carry the scale factor exactly. (Every ILUTP drop and
+        // pivot test is relative, so the same entries survive at both scales.)
         assert_eq!(
-            float_bits_fingerprint(&unit_ilu.l_data),
-            float_bits_fingerprint(&scaled_ilu.l_data),
-            "ILU(0) multipliers are ratios and must not move with the matrix scale"
+            float_bits_fingerprint(unit_ilu.l().data()),
+            float_bits_fingerprint(scaled_ilu.l().data()),
+            "ILU multipliers are ratios and must not move with the matrix scale"
         );
         let rescaled_u: Vec<f64> = unit_ilu
-            .u_data
+            .u()
+            .data()
             .iter()
             .map(|value| value * PIVOT_GUARD_SCALE)
             .collect();
         assert_eq!(
             float_bits_fingerprint(&rescaled_u),
-            float_bits_fingerprint(&scaled_ilu.u_data),
-            "ILU(0) U entries must scale exactly with the matrix, as SciPy's do"
+            float_bits_fingerprint(scaled_ilu.u().data()),
+            "ILU U entries must scale exactly with the matrix, as SciPy's do"
         );
 
         // The factorization's own triangular solve carries the third copy of the
@@ -24907,6 +27578,13 @@ mod tests {
     /// golden. The guard being relaxed only ever fired below 2.22e-14, and every
     /// pivot of this fixture is order 1, so the path taken here is unchanged and
     /// the bits must be too.
+    ///
+    /// GOLDEN-CHANGE (frankenscipy-1ksfv.11): this test also pinned `spilu`'s L and U bits
+    /// (0x4be3_da52_fddc_3876 / 0x176f_3410_334b_e541). Those were ILU(0)'s factors, and
+    /// `spilu` is no longer ILU(0) — it is ILUTP with fill, pivoting and a column ordering —
+    /// so the pins were removed, not regenerated. The pivot-guard property they protected for
+    /// the ILU is `pivot_guards_are_scale_invariant_like_the_incumbent`, which still runs
+    /// against the new factorization.
     #[test]
     fn a_well_scaled_factorization_is_untouched_by_the_pivot_guard_change() {
         let n = 64;
@@ -24916,11 +27594,6 @@ mod tests {
             .expect("well-scaled lower solve");
         let upper_solution = spsolve_triangular(&bidiagonal_triangular_csr(n, false), &rhs, false)
             .expect("well-scaled upper solve");
-        let ilu = spilu(
-            &spd_uneven_row_csr(n).to_csc().expect("csc"),
-            IluOptions::default(),
-        )
-        .expect("well-scaled ILU(0)");
 
         let mut drifted = Vec::new();
         for (label, fingerprint, expected) in [
@@ -24933,16 +27606,6 @@ mod tests {
                 "spsolve_triangular(upper)",
                 float_bits_fingerprint(&upper_solution),
                 0x1471_c933_7974_b97a_u64,
-            ),
-            (
-                "spilu L",
-                float_bits_fingerprint(&ilu.l_data),
-                0x4be3_da52_fddc_3876_u64,
-            ),
-            (
-                "spilu U",
-                float_bits_fingerprint(&ilu.u_data),
-                0x176f_3410_334b_e541_u64,
             ),
         ] {
             if fingerprint != expected {
@@ -26270,6 +28933,55 @@ mod tests {
     }
 
     #[test]
+    fn gmres_restart_and_inner_iterations_match_scipy() {
+        // 2-D convection-diffusion on an m×m grid (h = 1/(m+1)), rhs of ones, rtol 1e-8.
+        // SciPy 1.17.1 gmres, counting inner iterations with callback_type='pr_norm':
+        // 56, 98 and 108. Restart 30, which a rustfmt pass had put back, takes a different
+        // Krylov path (frankenscipy-felow).
+        fn convdiff(m: usize, pe: f64) -> CsrMatrix {
+            let h = 1.0 / (m as f64 + 1.0);
+            let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..m {
+                for j in 0..m {
+                    let k = i * m + j;
+                    vals.push(4.0);
+                    rows.push(k);
+                    cols.push(k);
+                    for (di, dj, c) in [
+                        (0_isize, 1_isize, -1.0 + pe * h / 2.0),
+                        (0, -1, -1.0 - pe * h / 2.0),
+                        (1, 0, -1.0),
+                        (-1, 0, -1.0),
+                    ] {
+                        let (ii, jj) = (i as isize + di, j as isize + dj);
+                        if (0..m as isize).contains(&ii) && (0..m as isize).contains(&jj) {
+                            vals.push(c);
+                            rows.push(k);
+                            cols.push(ii as usize * m + jj as usize);
+                        }
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(m * m, m * m), vals, rows, cols, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        }
+        assert_eq!(GMRES_DEFAULT_RESTART, 20);
+        for (m, pe, scipy_inner) in [(12, 10.0, 56), (16, 50.0, 98), (20, 5.0, 108)] {
+            let a = convdiff(m, pe);
+            let b = vec![1.0; m * m];
+            let options = IterativeSolveOptions {
+                tol: 1e-8,
+                ..IterativeSolveOptions::default()
+            };
+            let result = gmres(&a, &b, None, options).expect("gmres");
+            assert!(result.converged, "m={m} pe={pe}");
+            assert_eq!(result.iterations, scipy_inner, "m={m} pe={pe}");
+        }
+    }
+
+    #[test]
     fn gmres_diagonal_system() {
         let a = CooMatrix::from_triplets(
             Shape2D::new(2, 2),
@@ -27311,7 +30023,7 @@ mod tests {
         .to_csr()
         .expect("csr");
 
-        let distances = floyd_warshall(&looped);
+        let distances = floyd_warshall(&looped, true).expect("floyd_warshall");
         assert_eq!(
             distances[0][0], 0.0,
             "distance from a node to itself is the empty path, not its self-loop              (scipy gives 0 for a self-loop of weight 5, we gave {})",
@@ -27323,12 +30035,12 @@ mod tests {
         assert_eq!(distances[2][2], 0.0);
         assert!(distances[1][0].is_infinite(), "unreachable must be inf");
 
-        let from_zero = dijkstra(&looped, 0).expect("dijkstra");
+        let from_zero = dijkstra(&looped, true, 0).expect("dijkstra");
         assert_eq!(from_zero.distances[0], 0.0);
         assert_eq!(from_zero.distances[1], 1.0);
         assert_eq!(from_zero.distances[2], 3.0);
 
-        let bf = bellman_ford(&looped, 0).expect("bellman_ford");
+        let bf = bellman_ford(&looped, true, 0).expect("bellman_ford");
         assert_eq!(bf.distances[0], 0.0);
         assert_eq!(bf.distances[1], 1.0);
         assert_eq!(bf.distances[2], 3.0);
@@ -27345,13 +30057,13 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let reach = dijkstra(&disconnected, 0).expect("dijkstra");
+        let reach = dijkstra(&disconnected, true, 0).expect("dijkstra");
         assert!(
             reach.distances[3].is_infinite(),
             "unreachable node must be inf, got {}",
             reach.distances[3]
         );
-        let all_pairs = floyd_warshall(&disconnected);
+        let all_pairs = floyd_warshall(&disconnected, true).expect("floyd_warshall");
         assert!(all_pairs[0][3].is_infinite());
         assert_eq!(all_pairs[3][3], 0.0);
     }
@@ -27520,7 +30232,8 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let components = connected_components(&graph).expect("connected_components");
+        let components =
+            connected_components(&graph, false, Connection::Weak).expect("connected_components");
         assert_eq!(components.n_components, 2, "scipy finds 2 weak components");
         let labels = &components.labels;
         assert_eq!(
@@ -27611,6 +30324,99 @@ mod tests {
             .to_csr()
             .expect("csr");
         assert_eq!(sparse_norm(&zero, "2").expect("ord 2"), 0.0);
+    }
+
+    /// Live scipy 1.17.1 `scipy.sparse.linalg.norm` on [[4,1,0],[1,3,1],[0,1,2]] with A[2,2] =
+    /// NaN, and again with A[0,1] = NaN, is nan for ord = inf, -inf, 1, -1 and 'fro'. On the
+    /// finite matrix it is inf → 5.0, -inf → 3.0, 1 → 5.0, -1 → 3.0. The row-sum orders folded
+    /// with `f64::max` / `f64::min`, which dropped the NaN row and returned the finite extreme.
+    #[test]
+    fn sparse_norm_row_orders_keep_a_nan_like_scipy() {
+        let matrix = |corrupt: Option<usize>| {
+            let mut data = vec![4.0, 1.0, 1.0, 3.0, 1.0, 1.0, 2.0];
+            if let Some(slot) = corrupt {
+                data[slot] = f64::NAN;
+            }
+            CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                data,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+        };
+        // Slot 6 is A[2,2], slot 1 is A[0,1].
+        for slot in [6, 1] {
+            let a = matrix(Some(slot));
+            for kind in ["inf", "-inf", "1", "-1", "fro"] {
+                let norm = sparse_norm(&a, kind).expect("scipy returns a value");
+                assert!(
+                    norm.is_nan(),
+                    "slot {slot}, ord {kind}: scipy nan, fsci {norm}"
+                );
+            }
+        }
+        let finite = matrix(None);
+        for (kind, want) in [("inf", 5.0), ("-inf", 3.0), ("1", 5.0), ("-1", 3.0)] {
+            assert_eq!(
+                sparse_norm(&finite, kind).expect("finite"),
+                want,
+                "ord {kind}"
+            );
+        }
+    }
+
+    /// A NaN anywhere in A makes every Krylov vector of AᵀA NaN. Live scipy 1.17.1 on
+    /// [[4,1,0],[1,3,1],[0,1,2]] with A[2,2] = NaN, and again with A[0,1] = NaN: both
+    /// `norm(A, 2)` and `svds(A, k=1)` raise `ArpackError: ARPACK error -9999: Could not
+    /// build an Arnoldi factorization`. On the finite matrix `norm(A, 2)` is
+    /// 4.732050807568877 = 3 + √3. fsci used to fold the NaN eigenvalue of AᵀA through
+    /// `f64::max(0.0)` into σ = 0 and return Ok(0.0) as the spectral norm.
+    #[test]
+    fn sparse_norm_spectral_refuses_a_nan_matrix_like_scipy() {
+        let matrix = |corrupt: Option<usize>| {
+            let mut data = vec![4.0, 1.0, 1.0, 3.0, 1.0, 1.0, 2.0];
+            if let Some(slot) = corrupt {
+                data[slot] = f64::NAN;
+            }
+            CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                data,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+        };
+        // Slot 6 is A[2,2], slot 1 is A[0,1].
+        for slot in [6, 1] {
+            let a = matrix(Some(slot));
+            let norm = sparse_norm(&a, "2");
+            assert!(
+                matches!(norm, Err(SparseError::NonFiniteInput { .. })),
+                "slot {slot}: SciPy raises; fsci returned {norm:?}"
+            );
+            // svds refuses too: scipy 1.17.1 svds(a, k=1) raises ArpackError -9999 ("Could not
+            // build an Arnoldi factorization") at both slots, live. The restarted Lanczos
+            // (frankenscipy-1ksfv.10) reports the non-finite Krylov vector as an error; the
+            // one-pass solver it replaced returned converged = false with a NaN value.
+            let svd = svds(&a, 1, EigsOptions::default());
+            assert!(
+                matches!(svd, Err(SparseError::NonFiniteInput { .. })),
+                "slot {slot}: SciPy raises; fsci returned {svd:?}"
+            );
+        }
+        // MUST-NOT-CHANGE: the finite matrix still has its spectral norm.
+        let finite = sparse_norm(&matrix(None), "2").expect("finite matrix");
+        assert!(
+            (finite - (3.0 + 3.0_f64.sqrt())).abs() < 1e-9,
+            "spectral norm {finite} vs scipy 4.732050807568877"
+        );
     }
 
     /// Graph Laplacian conventions, pinned to live scipy 1.17.1
@@ -27859,12 +30665,10 @@ mod tests {
         )
         .expect("splu");
         assert_eq!(dense_route.ordering_used, PermutationOrdering::Natural);
-        // The remaining half of frankenscipy-h4yov, pinned as it stands rather
-        // than as it should be: a dense nalgebra LU still reports `Auto`, so
-        // `backend_used` cannot distinguish it from a routing decision that was
-        // never made. Change this assertion when that is split into its own
-        // variant; do not change it to make a relabelling look like a no-op.
-        assert_eq!(dense_route.backend_used, SparseBackend::Auto);
+        // The remaining half of frankenscipy-h4yov: the dense nalgebra LU used to
+        // report `Auto`, indistinguishable from a routing decision never made. It
+        // has its own variant now (frankenscipy-szq1n.4).
+        assert_eq!(dense_route.backend_used, SparseBackend::DenseLu);
     }
 
     /// frankenscipy-h4yov's second closing test: a cubic-grid factorization and
@@ -28325,11 +31129,15 @@ mod tests {
     }
 
     // br-szq1n.7: `converged` must come from the Ritz residuals. MUST-MISS arm: the
-    // Grcar matrix is highly non-normal with its eigenvalues on a curve, so a single
-    // 13-vector Arnoldi pass (k = 6) cannot resolve the top six; the old code said
-    // `converged: true` regardless.
+    // Grcar matrix is highly non-normal with its eigenvalues on a curve, so one Krylov–Schur
+    // cycle (k = 6, max_iter = 1) cannot resolve the top six; the old single-pass code said
+    // `converged: true` regardless. eigs now restarts, so the budget is pinned to one cycle,
+    // and non-convergence is an `EigsNoConvergence` error as SciPy raises
+    // `ArpackNoConvergence` (SciPy 1.17.1: eigs(grcar(200), k=6, maxiter=1) -> "0/6
+    // eigenvectors converged"; with the default maxiter it also fails, 0/6 after 2001
+    // iterations).
     #[test]
-    fn eigs_reports_nonconvergence_on_grcar() {
+    fn eigs_reports_nonconvergence_on_grcar() -> Result<(), String> {
         let n = 200usize;
         let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
@@ -28348,12 +31156,20 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr");
-        let result = eigs(&a, 6, EigsOptions::default()).expect("eigs runs");
-        assert!(
-            !result.converged,
-            "one short Arnoldi pass on Grcar(200) cannot have converged: {:?}",
-            result.eigenvalues
-        );
+        let one_cycle = EigsOptions {
+            max_iter: 1,
+            ..EigsOptions::default()
+        };
+        let outcome = eigs(&a, 6, one_cycle);
+        let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+            return Err(format!(
+                "one Krylov–Schur cycle on Grcar(200) cannot converge: {outcome:?}"
+            ));
+        };
+        println!("grcar(200) k=6 max_iter=1: {message}");
+        assert!(!partial.converged);
+        assert!(partial.eigenvalues.len() < 6);
+        Ok(())
     }
 
     // MUST-HIT arm: when the Krylov space is the whole space (m = n) the Ritz pairs
@@ -28755,7 +31571,7 @@ mod tests {
     #[test]
     fn connected_components_single_component() {
         let g = triangle_graph_csr();
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 1);
         assert!(
             result.labels.iter().all(|&l| l == 0),
@@ -28766,7 +31582,7 @@ mod tests {
     #[test]
     fn connected_components_two_components() {
         let g = disconnected_graph_csr();
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2, "should have 2 components");
         // Nodes 0,1 in one component, nodes 2,3 in another
         assert_eq!(result.labels[0], result.labels[1]);
@@ -28787,14 +31603,14 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = connected_components(&g).expect("cc");
+        let result = connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2);
     }
 
     #[test]
     fn dijkstra_triangle_graph() {
         let g = triangle_graph_csr();
-        let result = dijkstra(&g, 0).expect("dijkstra");
+        let result = dijkstra(&g, true, 0).expect("dijkstra");
         assert_eq!(result.distances[0], 0.0);
         // Node 1 takes the direct edge. Node 2 can use the direct edge or node 1 with equal cost.
         assert_eq!(result.distances[1], 1.0);
@@ -28808,7 +31624,7 @@ mod tests {
     #[test]
     fn dijkstra_unreachable_node() {
         let g = disconnected_graph_csr();
-        let result = dijkstra(&g, 0).expect("dijkstra");
+        let result = dijkstra(&g, true, 0).expect("dijkstra");
         assert_eq!(result.distances[0], 0.0);
         assert!(result.distances[1].is_finite());
         assert!(
@@ -28820,7 +31636,7 @@ mod tests {
     #[test]
     fn dijkstra_source_out_of_bounds() {
         let g = triangle_graph_csr();
-        let err = dijkstra(&g, 10).expect_err("oob");
+        let err = dijkstra(&g, true, 10).expect_err("oob");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
@@ -28836,12 +31652,12 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = dijkstra(&g, 0).expect("dijkstra negative edge");
+        let result = dijkstra(&g, true, 0).expect("dijkstra negative edge");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!((result.distances[2] - -1.0).abs() < 1e-10);
 
-        let unreachable = dijkstra(&g, 2).expect("dijkstra unreachable source");
+        let unreachable = dijkstra(&g, true, 2).expect("dijkstra unreachable source");
         assert!(unreachable.distances[0].is_infinite());
         assert!(unreachable.distances[1].is_infinite());
         assert_eq!(unreachable.distances[2], 0.0);
@@ -28859,7 +31675,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = dijkstra(&g, 0).expect("dijkstra with unreachable negative edge");
+        let result = dijkstra(&g, true, 0).expect("dijkstra with unreachable negative edge");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!(result.distances[2].is_infinite());
@@ -28965,11 +31781,11 @@ mod tests {
         .expect("csr");
 
         assert!(matches!(
-            connected_components(&g),
+            connected_components(&g, false, Connection::Weak),
             Err(SparseError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            dijkstra(&g, 0),
+            dijkstra(&g, true, 0),
             Err(SparseError::InvalidArgument { .. })
         ));
         assert!(matches!(
@@ -28984,7 +31800,7 @@ mod tests {
     fn bellman_ford_positive_weights() {
         // Same as Dijkstra test — should give identical results
         let g = triangle_graph_csr();
-        let result = bellman_ford(&g, 0).expect("bellman_ford");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 1.0);
         assert!(
@@ -29008,7 +31824,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = bellman_ford(&g, 0).expect("bellman_ford neg");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford neg");
         assert_eq!(result.distances[0], 0.0);
         assert_eq!(result.distances[1], 4.0);
         assert!(
@@ -29032,15 +31848,187 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let err = bellman_ford(&g, 0).expect_err("negative cycle");
-        assert!(matches!(err, SparseError::InvalidArgument { .. }));
+        // SciPy 1.17.1: NegativeCycleError("Negative cycle detected on node 0"), the source.
+        let err = bellman_ford(&g, true, 0).expect_err("negative cycle");
+        assert_eq!(
+            err,
+            SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            }
+        );
+    }
+
+    /// frankenscipy-lna36. floyd_warshall returned a distance matrix through a negative cycle.
+    /// scipy 1.17.1, live:
+    /// - the 3-cycle 0→1 (1), 1→2 (−1), 2→0 (−1), directed: NegativeCycleError "Negative cycle
+    ///   in nodes [0 1 2]";
+    /// - 0→1 (−1), 1→2 (2) undirected: nodes [0 1 2] (one negative edge is a 2-cycle);
+    ///   0→1 (1), 1→2 (−1) undirected: nodes [1 2];
+    /// - a 2×3 graph: ValueError "csgraph should be a square matrix";
+    /// - must not change, 0→1 (−1), 1→2 (2) directed: [[0, −1, 1], [inf, 0, 2], [inf, inf, 0]].
+    ///
+    /// The refusal is the parity; the node list is diagnostics. It must contain every node ON
+    /// the negative cycle. scipy's can list more: its inner loop re-reads `dist[i, k]` after
+    /// updating it within pass k, so node 2 above, which only reaches the 0–1 cycle, gets a
+    /// negative diagonal there; fsci hoists `d[i][k]` (identical whenever there is no negative
+    /// cycle) and lists [0, 1].
+    #[test]
+    fn floyd_warshall_refuses_a_negative_cycle_like_scipy() {
+        let graph = |weights: Vec<f64>, rows: Vec<usize>, cols: Vec<usize>| {
+            CooMatrix::from_triplets(Shape2D::new(3, 3), weights, rows, cols, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        };
+        let cycle = graph(vec![1.0, -1.0, -1.0], vec![0, 1, 2], vec![1, 2, 0]);
+        let neg_edge = graph(vec![-1.0, 2.0], vec![0, 1], vec![1, 2]);
+        let late_neg = graph(vec![1.0, -1.0], vec![0, 1], vec![1, 2]);
+        let cases: [(&str, &CsrMatrix, bool, &[usize]); 3] = [
+            ("cycle3", &cycle, true, &[0, 1, 2]),
+            ("negative edge, undirected", &neg_edge, false, &[0, 1]),
+            (
+                "second edge negative, undirected",
+                &late_neg,
+                false,
+                &[1, 2],
+            ),
+        ];
+        for (label, g, directed, on_cycle) in cases {
+            let result = floyd_warshall(g, directed);
+            // The reported node list, e.g. "... Negative cycle in nodes [0, 1]".
+            let reported: Option<Vec<usize>> = match &result {
+                Err(SparseError::NegativeCycle { message }) => message
+                    .split_once("Negative cycle in nodes [")
+                    .and_then(|(_, rest)| rest.split_once(']'))
+                    .map(|(list, _)| {
+                        list.split(", ")
+                            .filter_map(|node| node.parse().ok())
+                            .collect()
+                    }),
+                _ => None,
+            };
+            assert!(
+                reported
+                    .as_ref()
+                    .is_some_and(|listed| on_cycle.iter().all(|node| listed.contains(node))),
+                "{label}: scipy raises NegativeCycleError; nodes {on_cycle:?} are on the cycle, \
+                 got {result:?}"
+            );
+        }
+        let directed = floyd_warshall(&neg_edge, true).expect("no cycle when directed");
+        let inf = f64::INFINITY;
+        assert_eq!(
+            directed,
+            vec![
+                vec![0.0, -1.0, 1.0],
+                vec![inf, 0.0, 2.0],
+                vec![inf, inf, 0.0]
+            ]
+        );
+
+        let wide = CooMatrix::from_triplets(Shape2D::new(2, 3), vec![1.0], vec![0], vec![2], false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        assert!(matches!(
+            floyd_warshall(&wide, true),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            graph_diameter(&cycle),
+            Err(SparseError::NegativeCycle { .. })
+        ));
     }
 
     #[test]
     fn bellman_ford_unreachable() {
         let g = disconnected_graph_csr();
-        let result = bellman_ford(&g, 0).expect("bellman_ford");
+        let result = bellman_ford(&g, true, 0).expect("bellman_ford");
         assert!(result.distances[2].is_infinite());
+    }
+
+    fn edges_csr(n: usize, edges: &[(usize, usize, f64)]) -> CsrMatrix {
+        let coo = CooMatrix::from_triplets(
+            Shape2D::new(n, n),
+            edges.iter().map(|e| e.2).collect(),
+            edges.iter().map(|e| e.0).collect(),
+            edges.iter().map(|e| e.1).collect(),
+            false,
+        )
+        .expect("coo");
+        coo.to_csr().expect("csr")
+    }
+
+    // br-szq1n.3: strongly connected components are labelled as SciPy labels them. Pearce's
+    // DFS pushes every unvisited neighbour and visits the LAST one first, so on a fan
+    // 0 -> {1, 2} node 2 finishes first. SciPy 1.17.1: [2, 1, 0], and
+    // [3, 2, 2, 1, 0] for 0 -> {1, 3}, 1 <-> 2, 3 -> 4. A recursive Tarjan visits the first
+    // neighbour first and labels them [2, 0, 1] and [3, 0, 0, 2, 1].
+    #[test]
+    fn strong_components_carry_scipys_labels() {
+        let fan = edges_csr(3, &[(0, 1, 1.0), (0, 2, 1.0)]);
+        assert_eq!(strongly_connected_components(&fan), vec![2, 1, 0]);
+        let g = edges_csr(
+            5,
+            &[
+                (0, 1, 1.0),
+                (0, 3, 1.0),
+                (1, 2, 1.0),
+                (2, 1, 1.0),
+                (3, 4, 1.0),
+            ],
+        );
+        let r = connected_components(&g, true, Connection::Strong).expect("cc strong");
+        assert_eq!((r.n_components, r.labels), (4, vec![3, 2, 2, 1, 0]));
+        // Weak connection, or directed = false, is one component here.
+        let weak = connected_components(&g, true, Connection::Weak).expect("cc weak");
+        assert_eq!((weak.n_components, weak.labels), (1, vec![0; 5]));
+        let undirected = connected_components(&g, false, Connection::Strong).expect("cc");
+        assert_eq!(undirected.n_components, 1);
+    }
+
+    // The recursive Tarjan this replaced overflowed a 2 MB thread stack (process abort) on a
+    // directed path of 200,000 nodes. The iterative port finishes, one component per node,
+    // labelled from the sink back to the source as SciPy labels them.
+    #[test]
+    fn strong_components_of_a_long_chain_do_not_recurse() {
+        let n = 200_000;
+        let edges: Vec<(usize, usize, f64)> = (0..n - 1).map(|i| (i, i + 1, 1.0)).collect();
+        let g = edges_csr(n, &edges);
+        let labels = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || strongly_connected_components(&g))
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert_eq!(labels.len(), n);
+        assert_eq!(labels[n - 1], 0);
+        assert_eq!(labels[0], n - 1);
+    }
+
+    // br-szq1n.3: directed = false walks a stored edge either way. A graph stored as its
+    // lower triangle only is unreachable from node 0 directed, and reachable undirected;
+    // SciPy 1.17.1: dijkstra(L, directed=False, indices=0) = [0, 1, 3], predecessors
+    // [-9999, 0, 0].
+    #[test]
+    fn undirected_search_walks_lower_triangle_edges() {
+        let lower = edges_csr(3, &[(1, 0, 1.0), (2, 0, 3.0), (2, 1, 2.0)]);
+        let directed = dijkstra(&lower, true, 0).expect("directed");
+        assert!(directed.distances[1].is_infinite() && directed.distances[2].is_infinite());
+        let undirected = dijkstra(&lower, false, 0).expect("undirected");
+        assert_eq!(undirected.distances, vec![0.0, 1.0, 3.0]);
+        assert_eq!(undirected.predecessors, vec![-1, 0, 0]);
+        let bf = bellman_ford(&lower, false, 0).expect("undirected bellman-ford");
+        assert_eq!(bf.distances, vec![0.0, 1.0, 3.0]);
+        let (order, _) = breadth_first_order(&lower, 0, false).expect("bfs");
+        assert_eq!(order, vec![0, 1, 2]);
+        let fw = floyd_warshall(&lower, false).expect("floyd_warshall");
+        assert_eq!(fw[0], vec![0.0, 1.0, 3.0]);
+        assert_eq!(fw[2][0], 3.0);
+        // A negative stored edge is a negative cycle once it can be walked both ways.
+        let negative = edges_csr(2, &[(1, 0, -1.0)]);
+        assert!(bellman_ford(&negative, true, 1).is_ok());
+        assert!(bellman_ford(&negative, false, 1).is_err());
     }
 
     // ── BFS/DFS traversal tests ─────────────────────────────────────
@@ -29048,7 +32036,7 @@ mod tests {
     #[test]
     fn bfs_order_triangle() {
         let g = triangle_graph_csr();
-        let (order, pred) = breadth_first_order(&g, 0).expect("bfs");
+        let (order, pred) = breadth_first_order(&g, 0, true).expect("bfs");
         assert_eq!(order[0], 0, "BFS starts at source");
         assert_eq!(order.len(), 3, "BFS visits all 3 nodes");
         assert_eq!(pred[0], -1, "source has no predecessor");
@@ -29057,7 +32045,7 @@ mod tests {
     #[test]
     fn bfs_order_disconnected() {
         let g = disconnected_graph_csr();
-        let (order, _) = breadth_first_order(&g, 0).expect("bfs");
+        let (order, _) = breadth_first_order(&g, 0, true).expect("bfs");
         // Only visits nodes reachable from 0: nodes 0 and 1
         assert_eq!(order.len(), 2, "BFS only visits connected component");
         assert!(order.contains(&0));
@@ -29067,7 +32055,7 @@ mod tests {
     #[test]
     fn dfs_order_triangle() {
         let g = triangle_graph_csr();
-        let (order, pred) = depth_first_order(&g, 0).expect("dfs");
+        let (order, pred) = depth_first_order(&g, 0, true).expect("dfs");
         assert_eq!(order[0], 0, "DFS starts at source");
         assert_eq!(order.len(), 3, "DFS visits all 3 nodes");
         assert_eq!(pred[0], -1, "source has no predecessor");
@@ -29076,7 +32064,7 @@ mod tests {
     #[test]
     fn dfs_order_disconnected() {
         let g = disconnected_graph_csr();
-        let (order, _) = depth_first_order(&g, 0).expect("dfs");
+        let (order, _) = depth_first_order(&g, 0, true).expect("dfs");
         assert_eq!(order.len(), 2, "DFS only visits connected component");
     }
 
@@ -29093,7 +32081,7 @@ mod tests {
             false,
         )
         .expect("graph a");
-        let (order, pred) = depth_first_order(&a, 0).expect("dfs a");
+        let (order, pred) = depth_first_order(&a, 0, true).expect("dfs a");
         assert_eq!(order, vec![0, 1, 2]);
         assert_eq!(pred, vec![-1, 0, 1], "push-time marking gave pred[2] = 0");
 
@@ -29106,7 +32094,7 @@ mod tests {
             false,
         )
         .expect("graph b");
-        let (order, pred) = depth_first_order(&b, 0).expect("dfs b");
+        let (order, pred) = depth_first_order(&b, 0, true).expect("dfs b");
         assert_eq!(order, vec![0, 1, 3, 2]);
         assert_eq!(pred, vec![-1, 0, 3, 1]);
     }
@@ -29114,7 +32102,7 @@ mod tests {
     #[test]
     fn bfs_source_out_of_bounds() {
         let g = triangle_graph_csr();
-        let err = breadth_first_order(&g, 10).expect_err("oob");
+        let err = breadth_first_order(&g, 10, true).expect_err("oob");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
@@ -29499,6 +32487,44 @@ mod tests {
         let result = lgmres(&a, &b, None, LgmresOptions::default()).expect("lgmres works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &b, 1e-10);
+    }
+
+    // tol = 0 with an exact x0: the old strict outer test (0 < 0) disagreed with the inner
+    // cycle's `r <= tol` (0 <= 0, zero iterations) and the outer loop spun forever. Run on a
+    // thread with a deadline so that regression FAILS instead of hanging the suite. SciPy:
+    // lgmres(I, [1, 2], x0=[1, 2], rtol=0) returns x0 with info 0.
+    #[test]
+    fn lgmres_exact_x0_at_zero_tolerance_terminates_converged() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let a = identity_csr(2);
+            let options = LgmresOptions {
+                tol: 0.0,
+                ..LgmresOptions::default()
+            };
+            let _ = tx.send(lgmres(&a, &[1.0, 2.0], Some(&[1.0, 2.0]), options));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("lgmres at tol = 0 with an exact x0 did not return")
+            .expect("lgmres works");
+        assert!(result.converged);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.solution, vec![1.0, 2.0]);
+
+        // Must-miss arm: a wrong x0 at tol = 0 is not reported converged for free.
+        let result = lgmres(
+            &diagonally_dominant_csr_3x3(),
+            &[7.0, 7.0, 7.0],
+            Some(&[0.0, 0.0, 0.0]),
+            LgmresOptions {
+                tol: 0.0,
+                max_iter: Some(2),
+                ..LgmresOptions::default()
+            },
+        )
+        .expect("lgmres works");
+        assert!(!result.converged || result.residual_norm == 0.0);
     }
 
     #[test]
@@ -30209,7 +33235,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let dist = super::floyd_warshall(&g);
+        let dist = super::floyd_warshall(&g, true).expect("floyd_warshall");
         assert!((dist[0][0] - 0.0).abs() < 1e-10);
         assert!((dist[0][1] - 1.0).abs() < 1e-10);
         assert!((dist[0][2] - 3.0).abs() < 1e-10);
@@ -30233,7 +33259,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = super::connected_components(&g).expect("cc");
+        let result = super::connected_components(&g, false, Connection::Weak).expect("cc");
         assert_eq!(result.n_components, 2);
         assert_eq!(result.labels[0], result.labels[1]);
         assert_eq!(result.labels[2], result.labels[3]);
@@ -30246,12 +33272,12 @@ mod tests {
         // get a benchmark-tuned 18.
         for k in 1..=12 {
             assert_eq!(
-                eigsh_krylov_window(10_000, k),
+                arpack_default_ncv(10_000, k),
                 (2 * k + 1).max(20),
                 "k = {k}"
             );
         }
-        assert_eq!(eigsh_krylov_window(10, 6), 10, "window is capped at n");
+        assert_eq!(arpack_default_ncv(10, 6), 10, "window is capped at n");
     }
 
     #[test]
@@ -31001,62 +34027,318 @@ mod tests {
 // ══════════════════════════════════════════════════════════════════════
 
 /// Result of sparse eigenvalue computation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EigsResult {
-    /// Eigenvalues (real parts). For [`eigsh`]/[`svds`] (symmetric/PSD operators)
-    /// these are the full eigenvalues; for general [`eigs`] they are the real
-    /// parts of the (possibly complex) eigenvalues — see [`Self::eigenvalues_im`].
+    /// Eigenvalues (real parts). [`eigsh`] returns them in ascending order, as
+    /// `scipy.sparse.linalg.eigsh` does when it returns eigenvectors. [`eigs`] returns the most
+    /// wanted first under its `which` (of the shifted-and-inverted values when `sigma` is set),
+    /// with a complex-conjugate pair adjacent, positive imaginary part first. [`svds`] runs the
+    /// symmetric kernel on AᵀA, largest first.
     pub eigenvalues: Vec<f64>,
     /// Imaginary parts of the eigenvalues, aligned with [`Self::eigenvalues`].
     /// All zero for symmetric operators ([`eigsh`]/[`svds`]); for general
     /// [`eigs`] a complex-conjugate pair appears as `±im`, matching
     /// `scipy.sparse.linalg.eigs`, which returns a complex array.
     pub eigenvalues_im: Vec<f64>,
-    /// Eigenvectors as columns (row-major: `eigenvectors[i]` is the i-th eigenvector).
-    /// For general [`eigs`] this is the real part of the (possibly complex)
-    /// eigenvector — see [`Self::eigenvectors_im`].
+    /// Eigenvectors (`eigenvectors[i]` belongs to `eigenvalues[i]`). With a mass matrix `M` they
+    /// are M-orthonormal (ARPACK's B-normalization), otherwise of unit 2-norm. For general
+    /// [`eigs`] this is the real part of the (possibly complex) eigenvector — see
+    /// [`Self::eigenvectors_im`].
     pub eigenvectors: Vec<Vec<f64>>,
     /// Imaginary parts of the eigenvectors, aligned with [`Self::eigenvectors`].
     /// All zero for symmetric operators and for real eigenpairs of [`eigs`].
     pub eigenvectors_im: Vec<Vec<f64>>,
-    /// Number of matrix-vector products performed.
+    /// Operator applications (`A·x`, `M⁻¹A·x`, or one factored solve in shift-invert mode)
+    /// plus the matrix-vector products of the explicit residual check.
     pub nmatvec: usize,
-    /// Whether all requested eigenvalues converged.
+    /// Krylov–Schur restart cycles run (ARPACK's `iter`).
+    pub iterations: usize,
+    /// Krylov basis size used (SciPy's `ncv`).
+    pub ncv: usize,
+    /// Whether every requested pair converged. [`eigs`] and [`eigsh`] return
+    /// [`SparseError::EigsNoConvergence`] rather than an unconverged result, so their `Ok` value
+    /// always says `true`; the partial result inside that error (the pairs that did converge)
+    /// and [`svds`]'s result can say `false`.
     pub converged: bool,
 }
 
-/// Options for sparse eigenvalue computation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EigsOptions {
-    /// Tolerance for convergence.
-    pub tol: f64,
-    /// Maximum iterations.
-    pub max_iter: usize,
+/// Which eigenvalues [`eigsh`] and [`eigs`] compute: SciPy's `which=`.
+///
+/// [`eigsh`] accepts `LM`, `SM`, `LA`, `SA` and `BE`; [`eigs`] accepts `LM`, `SM`, `LR`, `SR`,
+/// `LI` and `SI`, as SciPy does. With `sigma` set the selection applies to the
+/// shifted-and-inverted eigenvalues `1/(λ − σ)`, so `LM` finds the eigenvalues nearest `σ`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EigsWhich {
+    /// `'LM'`: largest magnitude (the default).
+    #[default]
+    LargestMagnitude,
+    /// `'SM'`: smallest magnitude.
+    SmallestMagnitude,
+    /// `'LA'`: largest algebraic value ([`eigsh`] only).
+    LargestAlgebraic,
+    /// `'SA'`: smallest algebraic value ([`eigsh`] only).
+    SmallestAlgebraic,
+    /// `'BE'`: `k/2` from each end of the spectrum, one more from the high end when `k` is odd
+    /// ([`eigsh`] only; needs `k > 1`).
+    BothEnds,
+    /// `'LR'`: largest real part ([`eigs`] only).
+    LargestReal,
+    /// `'SR'`: smallest real part ([`eigs`] only).
+    SmallestReal,
+    /// `'LI'`: largest imaginary part in magnitude ([`eigs`] only).
+    LargestImaginary,
+    /// `'SI'`: smallest imaginary part in magnitude ([`eigs`] only).
+    SmallestImaginary,
 }
 
-impl Default for EigsOptions {
-    fn default() -> Self {
-        Self {
-            tol: 1e-10,
-            max_iter: 1000,
+impl EigsWhich {
+    /// SciPy's two-letter spelling.
+    #[must_use]
+    pub const fn scipy_name(self) -> &'static str {
+        match self {
+            Self::LargestMagnitude => "LM",
+            Self::SmallestMagnitude => "SM",
+            Self::LargestAlgebraic => "LA",
+            Self::SmallestAlgebraic => "SA",
+            Self::BothEnds => "BE",
+            Self::LargestReal => "LR",
+            Self::SmallestReal => "SR",
+            Self::LargestImaginary => "LI",
+            Self::SmallestImaginary => "SI",
+        }
+    }
+
+    /// Accepted by `eigsh` (ARPACK `dsaupd`).
+    const fn symmetric_mode(self) -> bool {
+        matches!(
+            self,
+            Self::LargestMagnitude
+                | Self::SmallestMagnitude
+                | Self::LargestAlgebraic
+                | Self::SmallestAlgebraic
+                | Self::BothEnds
+        )
+    }
+
+    /// Accepted by `eigs` (ARPACK `dnaupd`).
+    const fn general_mode(self) -> bool {
+        matches!(
+            self,
+            Self::LargestMagnitude
+                | Self::SmallestMagnitude
+                | Self::LargestReal
+                | Self::SmallestReal
+                | Self::LargestImaginary
+                | Self::SmallestImaginary
+        )
+    }
+}
+
+impl std::str::FromStr for EigsWhich {
+    type Err = SparseError;
+
+    /// Parses SciPy's spelling (`"LM"`, `"SA"`, ...).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "LM" => Ok(Self::LargestMagnitude),
+            "SM" => Ok(Self::SmallestMagnitude),
+            "LA" => Ok(Self::LargestAlgebraic),
+            "SA" => Ok(Self::SmallestAlgebraic),
+            "BE" => Ok(Self::BothEnds),
+            "LR" => Ok(Self::LargestReal),
+            "SR" => Ok(Self::SmallestReal),
+            "LI" => Ok(Self::LargestImaginary),
+            "SI" => Ok(Self::SmallestImaginary),
+            other => Err(SparseError::InvalidArgument {
+                message: format!("which must be one of LM SM LA SA BE LR SR LI SI, got {other:?}"),
+            }),
         }
     }
 }
 
-fn normalize_eigs_options(options: EigsOptions) -> EigsOptions {
-    let defaults = EigsOptions::default();
-    EigsOptions {
-        tol: if options.tol > 0.0 && options.tol.is_finite() {
-            options.tol
-        } else {
-            defaults.tol
-        },
-        max_iter: if options.max_iter == 0 {
-            defaults.max_iter
-        } else {
-            options.max_iter
-        },
+/// Options for [`eigsh`], [`eigs`] and [`svds`], after SciPy's keyword arguments. The default
+/// is SciPy's: `which='LM'`, `tol=0` (machine precision), `maxiter=None` (`n * 10`),
+/// `ncv=None`, no shift, no mass matrix, and a start vector chosen by the solver.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EigsOptions<'a> {
+    /// Relative accuracy of the Ritz values: a pair is converged when its residual estimate is
+    /// at most `tol·max(|θ|, ε^(2/3))`, ARPACK's `dsconv`/`dnconv` test on the operator's
+    /// eigenvalue θ, floored at the projected problem's rounding level `ncv·ε·max|θ|`. `0`
+    /// (the default) or a negative value means machine precision, as in SciPy/ARPACK; NaN and
+    /// ±∞ are refused.
+    pub tol: f64,
+    /// Maximum number of restart cycles (ARPACK's `maxiter`). `0` (the default) means SciPy's
+    /// `n * 10`.
+    pub max_iter: usize,
+    /// Which eigenvalues to compute.
+    pub which: EigsWhich,
+    /// Krylov basis size (`ncv`). `None` means SciPy's `min(n, max(2k + 1, 20))`; an explicit
+    /// value is capped at `n` and must exceed `k` ([`eigsh`]) or `k + 1` ([`eigs`]) unless it
+    /// spans the whole space.
+    pub ncv: Option<usize>,
+    /// Shift for shift-invert mode (SciPy's `sigma`, `mode='normal'`). The operator becomes
+    /// `(A − σM)⁻¹M` (`M = I` without a mass matrix), factored once with [`splu`]; eigenvalues
+    /// map back as `λ = σ + 1/θ`. A shift exactly at an eigenvalue fails with
+    /// [`SparseError::SingularMatrix`], where SciPy raises "Factor is exactly singular".
+    pub sigma: Option<f64>,
+    /// Mass matrix `M` of the generalized problem `A x = λ M x` (SciPy's `M`). It must be
+    /// symmetric positive definite (semi-definite suffices in shift-invert mode). Without
+    /// `sigma` the operator is `M⁻¹A` with `M` factored by [`splu`] (ARPACK mode 2).
+    pub mass: Option<&'a CsrMatrix>,
+    /// Starting vector (SciPy's `v0`). `None` uses a fixed-seed pseudo-random vector, so results
+    /// are reproducible (SciPy draws a random one).
+    pub v0: Option<&'a [f64]>,
+}
+
+/// The numeric settings of one `eigs`/`eigsh`/`svds` call after SciPy's defaults are applied.
+#[derive(Debug, Clone, Copy)]
+struct KrylovSettings {
+    tol: f64,
+    max_iter: usize,
+    ncv: usize,
+    which: EigsWhich,
+}
+
+/// SciPy's `choose_ncv(k)`, capped at `n`: `min(n, max(2k + 1, 20))`. One rule for every `k` and
+/// every matrix: the basis size is a function of `(n, k)` only (AGENTS #12; a `k == 6`
+/// benchmark special case was removed by frankenscipy-szq1n.15).
+fn arpack_default_ncv(n: usize, k: usize) -> usize {
+    (2 * k + 1).max(20).min(n)
+}
+
+/// Applies SciPy's defaults and argument checks to `options` for a problem of size `n` with `k`
+/// wanted pairs (`symmetric` selects the `eigsh` rules, otherwise the `eigs` rules).
+fn resolve_krylov_settings(
+    n: usize,
+    k: usize,
+    options: &EigsOptions<'_>,
+    symmetric: bool,
+) -> SparseResult<KrylovSettings> {
+    if !options.tol.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("tol must be finite, got {}", options.tol),
+        });
     }
+    let tol = if options.tol <= 0.0 {
+        f64::EPSILON
+    } else {
+        options.tol
+    };
+    let max_iter = if options.max_iter == 0 {
+        n.saturating_mul(10).max(1)
+    } else {
+        options.max_iter
+    };
+    let which = options.which;
+    if symmetric && !which.symmetric_mode() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "which must be one of LM SM LA SA BE, got {}",
+                which.scipy_name()
+            ),
+        });
+    }
+    if !symmetric && !which.general_mode() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "which must be one of LM SM LR SR LI SI, got {}",
+                which.scipy_name()
+            ),
+        });
+    }
+    if which == EigsWhich::BothEnds && k == 1 {
+        // ARPACK dsaupd error -13.
+        return Err(SparseError::InvalidArgument {
+            message: "NEV and WHICH = 'BE' are incompatible: which='BE' needs k > 1".to_string(),
+        });
+    }
+    let ncv = match options.ncv {
+        None => arpack_default_ncv(n, k),
+        Some(requested) => {
+            let ncv = requested.min(n);
+            let minimum = if symmetric { k + 1 } else { k + 2 };
+            if ncv < n && ncv < minimum {
+                return Err(SparseError::InvalidArgument {
+                    message: if symmetric {
+                        format!("ncv must be k<ncv<=n, ncv={requested}")
+                    } else {
+                        format!("ncv must be k+1<ncv<=n, ncv={requested}")
+                    },
+                });
+            }
+            ncv
+        }
+    };
+    Ok(KrylovSettings {
+        tol,
+        max_iter,
+        ncv,
+        which,
+    })
+}
+
+/// Checks `A`, `k`, `M`, `sigma` and `v0` for [`eigsh`]/[`eigs`]; returns `n`.
+fn validate_eigen_problem(
+    a: &CsrMatrix,
+    k: usize,
+    options: &EigsOptions<'_>,
+    name: &str,
+) -> SparseResult<usize> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!("{name} requires a square matrix"),
+        });
+    }
+    let n = shape.rows;
+    if k == 0 || k > n {
+        return Err(SparseError::InvalidArgument {
+            message: format!("k={k} must be in [1, {n}]"),
+        });
+    }
+    // SciPy's ARPACK cannot build an Arnoldi factorization from a NaN/Inf operator and raises
+    // (ARPACK error -9999); refuse up front rather than iterate on NaN.
+    if a.data().iter().any(|v| !v.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("{name}: the matrix contains NaN or Inf"),
+        });
+    }
+    if let Some(mass) = options.mass {
+        if mass.shape() != shape {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "wrong M dimensions {}x{}, should be {n}x{n}",
+                    mass.shape().rows,
+                    mass.shape().cols
+                ),
+            });
+        }
+        if mass.data().iter().any(|v| !v.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: format!("{name}: M contains NaN or Inf"),
+            });
+        }
+    }
+    if let Some(sigma) = options.sigma
+        && !sigma.is_finite()
+    {
+        return Err(SparseError::InvalidArgument {
+            message: format!("sigma must be finite, got {sigma}"),
+        });
+    }
+    if let Some(v0) = options.v0 {
+        if v0.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("v0 has length {}, expected {n}", v0.len()),
+            });
+        }
+        if v0.iter().any(|v| !v.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "v0 contains NaN or Inf".to_string(),
+            });
+        }
+    }
+    Ok(n)
 }
 
 /// Solve a sparse triangular system Ax = b.
@@ -31125,775 +34407,2740 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
     Ok(x)
 }
 
-/// Compute the `k` largest-magnitude eigenvalues/eigenvectors of a sparse symmetric matrix,
-/// as `scipy.sparse.linalg.eigsh(A, k=k, which='LM')`.
+/// `k` eigenpairs of the sparse symmetric matrix `A` (or of the symmetric-definite pencil
+/// `A x = λ M x`), as `scipy.sparse.linalg.eigsh(A, k, M, sigma, which, v0, ncv, maxiter, tol)`
+/// with `mode='normal'`.
 ///
-/// Thick-restart Lanczos ([`thick_restart_lanczos`]) with SciPy's basis size
-/// `ncv = min(n, max(2k+1, 20))`, restarting until the k wanted Ritz pairs converge (as
-/// ARPACK's implicit restarts do) or `options.max_iter` restarts pass. `converged` also
-/// requires every returned pair's explicit residual ‖Ax − λx‖ ≤ tol·max(|λ|, 1). `which`,
-/// `sigma` (shift-invert) and `M` are not supported.
-pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "eigsh requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if k == 0 || k > n {
-        return Err(SparseError::InvalidArgument {
-            message: format!("k={k} must be in [1, {n}]"),
-        });
-    }
-    let options = normalize_eigs_options(options);
+/// Symmetric Krylov–Schur, i.e. thick-restart Lanczos (Stewart 2001; Wu & Simon 2000), with
+/// full DGKS reorthogonalization and locking of converged Ritz pairs: mathematically the
+/// implicitly restarted Lanczos method of ARPACK's `dsaupd`, which SciPy wraps. It restarts
+/// until every wanted Ritz pair passes ARPACK's test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))` or
+/// `max_iter` cycles pass. The operator follows SciPy's modes: `A` (mode 1), `M⁻¹A` in the
+/// M inner product (mode 2, `mass` without `sigma`), or `(A − σM)⁻¹M` (mode 3, `sigma`), with
+/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified as ARPACK's `dseupd`
+/// does.
+///
+/// Eigenvalues come back in ascending order with their eigenvectors (M-orthonormal with a mass
+/// matrix). Without a shift each eigenvalue is the Rayleigh quotient `xᵀAx / xᵀMx` of its
+/// returned vector; in shift-invert mode it is `σ + 1/θ`, as in ARPACK's `dseupd`. The
+/// convergence test is floored at the rounding level of the projected eigenproblem
+/// (`ncv·ε·max|θ|`), which ARPACK reaches through exact QL deflations instead. Every returned
+/// pair must also pass an explicit residual check,
+/// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`, a guard against an operator that
+/// no longer matches `A`.
+///
+/// # Errors
+/// - [`SparseError::EigsNoConvergence`] (SciPy's `ArpackNoConvergence`) when some wanted pair
+///   has not converged after `max_iter` cycles; it carries the pairs that did converge.
+/// - [`SparseError::SingularMatrix`] when `A − σM` is exactly singular (SciPy: "Factor is
+///   exactly singular").
+/// - [`SparseError::InvalidArgument`] for a `which` that `eigsh` does not take, `which='BE'`
+///   with `k = 1`, an `ncv` outside `k < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or
+///   an `M` that is not positive definite.
+/// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
+///
+/// Differences from SciPy: `k` may equal `n` (SciPy refuses `k ≥ n` for a sparse `A` and
+/// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one;
+/// `mode='buckling'`/`'cayley'`, `OPinv`/`Minv` operators and `return_eigenvectors=False` are
+/// not offered.
+pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+    let n = validate_eigen_problem(a, k, &options, "eigsh")?;
+    let settings = resolve_krylov_settings(n, k, &options, true)?;
+    let transform = SpectralTransform::build(a, &options, n)?;
+    // ARPACK's dgetv0 forces the start vector into the range of OP for a generalized problem.
+    let run = symmetric_krylov_schur(
+        |x: &[f64], bx: &[f64]| transform.apply(a, x, bx),
+        options.mass,
+        n,
+        k,
+        &settings,
+        options.v0,
+        options.mass.is_some(),
+    )?;
 
-    // A single Lanczos subspace of this size (what this used to run) resolves only the
-    // extreme pairs of a well-separated spectrum; on ordinary sparse matrices it left 5-50%
-    // residuals, so the basis is restarted until the wanted pairs converge
-    // (frankenscipy-1ksfv.10).
-    //
-    // br-szq1n.15: k == 6 used to get an 18-vector window and skip the explicit
-    // residual check, both tuned to "the live k=6 sparse benchmark" (AGENTS #12:
-    // the measured path must be the path a user gets). One rule now holds for
-    // every k: SciPy's window, explicit residuals.
-    let m = eigsh_krylov_window(n, k);
-    let mut result = thick_restart_lanczos(|v| csr_matvec(a, v), n, k, &options, m);
-    let (residuals_ok, resid_matvec) = eigsh_residual_check(a, &result, options.tol.max(1e-8));
-    result.nmatvec += resid_matvec;
-    // Both: every returned pair passes its residual test AND all k pairs came back (the Krylov
-    // kernel's flag). The residual check alone reported eigsh(I_30, k=3) -- one pair, the
-    // subspace collapses on the identity -- as converged (frankenscipy-szq1n.7).
-    result.converged = result.converged && residuals_ok;
-    Ok(result)
+    let sigma = transform.shift();
+    let a_norm = csr_norm_bound(a);
+    let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let guard = settings.tol.max(f64::EPSILON.sqrt());
+    let mut nmatvec = run.applications;
+    // (λ, eigenvector, converged)
+    let mut pairs: Vec<(f64, Vec<f64>, bool)> = Vec::with_capacity(run.theta.len());
+    for (i, &theta) in run.theta.iter().enumerate() {
+        let mut x = run.vectors[i].clone();
+        if transform.is_shift_invert() && theta != 0.0 {
+            // dseupd's purification: OP x/θ = x + (β·y_last/θ)·v_next lies in range(OP).
+            let c = run.coupling[i] / theta;
+            for (xi, &ni) in x.iter_mut().zip(&run.next) {
+                *xi += c * ni;
+            }
+            b_normalize(&mut x, options.mass);
+        }
+        let ax = csr_matvec(a, &x);
+        let mx = options.mass.map(|m| csr_matvec(m, &x));
+        nmatvec += 1 + usize::from(mx.is_some());
+        // Modes 1 and 2 return the Rayleigh quotient xᵀAx / xᵀMx of the returned vector. It
+        // agrees with the Ritz value to within ‖r‖²/gap and is free of the rounding the projected
+        // matrix accumulates over thousands of restarts (the Ritz value of the 2000-point
+        // Laplacian's smallest eigenvalue 2.46e-6 drifted by 1.6e-13 over 4185 cycles). In
+        // shift-invert mode σ + 1/θ is the sharper value near σ (3.3e-16 against 1.6e-15 for the
+        // quotient on the same Laplacian at σ = 1.0003), and a few cycles leave no drift.
+        let quotient = dot_product(&x, &ax) / dot_product(&x, mx.as_deref().unwrap_or(&x));
+        let lambda = if transform.is_shift_invert() || !quotient.is_finite() {
+            transform.eigenvalue(theta)
+        } else {
+            quotient
+        };
+        let resid = ax
+            .iter()
+            .zip(mx.as_deref().unwrap_or(&x))
+            .map(|(&axi, &mxi)| (axi - lambda * mxi).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let bound = guard * (a_norm + (lambda.abs() + sigma.abs()) * m_norm) * vec_norm(&x);
+        // A NaN residual fails: `resid <= bound` is false for NaN.
+        let ok = run.converged[i] && resid <= bound;
+        pairs.push((lambda, x, ok));
+    }
+    pairs.sort_by(|p, q| p.0.total_cmp(&q.0));
+
+    let converged = pairs.len() == k && pairs.iter().all(|p| p.2);
+    let assemble = |pairs: Vec<(f64, Vec<f64>, bool)>, converged: bool| {
+        let count = pairs.len();
+        let (eigenvalues, eigenvectors): (Vec<f64>, Vec<Vec<f64>>) =
+            pairs.into_iter().map(|(l, x, _)| (l, x)).unzip();
+        EigsResult {
+            eigenvalues,
+            eigenvalues_im: vec![0.0; count],
+            eigenvectors,
+            eigenvectors_im: vec![vec![0.0; n]; count],
+            nmatvec,
+            iterations: run.iterations,
+            ncv: settings.ncv,
+            converged,
+        }
+    };
+    if converged {
+        return Ok(assemble(pairs, true));
+    }
+    let good: Vec<(f64, Vec<f64>, bool)> = pairs.into_iter().filter(|p| p.2).collect();
+    let good_count = good.len();
+    Err(eigs_no_convergence(
+        run.iterations,
+        good_count,
+        k,
+        assemble(good, false),
+    ))
 }
 
-/// Thick-restart Lanczos (Wu & Simon 2000) for the `k` largest-magnitude eigenpairs of the
-/// symmetric operator `op` on `R^n`, with an `m`-vector basis (SciPy's `ncv`).
-///
-/// Each cycle extends the basis to `m` vectors with full (two-pass) reorthogonalization, takes
-/// the Ritz pairs of the projection, and stops when the `k` wanted residual estimates
-/// `|β·y_last|` are within `options.tol·max(|θ|, eps^(2/3))`. Otherwise it restarts from the best
-/// `k + (m−k)/2` Ritz vectors plus the normalized residual direction, which leaves the
-/// projection an arrowhead matrix that the next extension fills in. This plays the role of
-/// ARPACK `dsaupd`'s implicit restarts (SciPy's `eigsh`); at most `options.max_iter` cycles.
-///
-/// `eigsh` used to take a single pass of this basis. On ordinary sparse matrices with k = 6
-/// and n = 120..800 (random diagonally dominant SPD, random graph Laplacians, a clustered top
-/// spectrum) that left relative residuals of 4e-2 to 5e-1 on every one of 24 matrices
-/// (frankenscipy-1ksfv.10, found by the frankenscipy-szq1n.15 sweep).
-fn thick_restart_lanczos<F: FnMut(&[f64]) -> Vec<f64>>(
-    mut op: F,
-    n: usize,
+/// SciPy's `ArpackNoConvergence` message, with the converged pairs as the partial result.
+fn eigs_no_convergence(
+    iterations: usize,
+    converged: usize,
     k: usize,
-    options: &EigsOptions,
-    m: usize,
-) -> EigsResult {
-    let m = m.min(n).max(k.min(n));
-    let keep = (k + (m.saturating_sub(k)) / 2)
-        .min(m.saturating_sub(1))
-        .max(k.min(m));
-    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
-    let tol = options.tol.max(f64::EPSILON);
-    let mut total_matvec = 0_usize;
-
-    // The same fixed-seed start vector as `krylov_arnoldi_eigs`.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut v0 = vec![0.0_f64; n];
-    for vi in v0.iter_mut() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        *vi = ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+    partial: EigsResult,
+) -> SparseError {
+    SparseError::EigsNoConvergence {
+        message: format!(
+            "No convergence ({iterations} iterations, {converged}/{k} eigenvectors converged)"
+        ),
+        partial: Box::new(partial),
     }
-    let v0_norm = vec_norm(&v0);
-    for vi in &mut v0 {
-        *vi /= v0_norm;
+}
+
+/// `max(‖A‖₁, ‖A‖∞)`, an upper bound on `‖A‖₂` for the explicit residual guard.
+fn csr_norm_bound(a: &CsrMatrix) -> f64 {
+    let (indptr, indices, data) = (a.indptr(), a.indices(), a.data());
+    let mut col_sums = vec![0.0_f64; a.shape().cols];
+    let mut row_max = 0.0_f64;
+    for row in 0..a.shape().rows {
+        let mut row_sum = 0.0;
+        for idx in indptr[row]..indptr[row + 1] {
+            let v = data[idx].abs();
+            row_sum += v;
+            col_sums[indices[idx]] += v;
+        }
+        row_max = row_max.max(row_sum);
+    }
+    col_sums.into_iter().fold(row_max, f64::max)
+}
+
+/// Scales `x` to unit B-norm (`B = M`, or the 2-norm without a mass matrix). A zero vector or a
+/// non-positive `xᵀMx` is left unchanged.
+fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
+    let norm_sq = match mass {
+        Some(m) => dot_product(x, &csr_matvec(m, x)),
+        None => dot_product(x, x),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        for xi in x.iter_mut() {
+            *xi *= inv;
+        }
+    }
+}
+
+/// SciPy's ARPACK modes 1-3 for one `eigs`/`eigsh` call: the operator the Krylov–Schur kernel
+/// iterates on, and how its eigenvalues θ map back to the problem's λ.
+enum SpectralTransform {
+    /// Mode 1: `OP = A`, `λ = θ`.
+    Standard,
+    /// Mode 2: `OP = M⁻¹A` in the M inner product, `λ = θ`. `M` is factored with [`splu`], as
+    /// SciPy's `get_inv_matvec(M)` does.
+    Generalized(SparseLuFactorization),
+    /// Mode 3: `OP = (A − σM)⁻¹M` (`M = I` without a mass matrix), `λ = σ + 1/θ`.
+    ShiftInvert {
+        sigma: f64,
+        factor: SparseLuFactorization,
+    },
+}
+
+impl SpectralTransform {
+    fn build(a: &CsrMatrix, options: &EigsOptions<'_>, n: usize) -> SparseResult<Self> {
+        match (options.sigma, options.mass) {
+            (None, None) => Ok(Self::Standard),
+            (None, Some(mass)) => Ok(Self::Generalized(splu(
+                &mass.to_csc()?,
+                LuOptions::default(),
+            )?)),
+            (Some(sigma), mass) => {
+                let shift = match mass {
+                    Some(m) => scale_csr(m, sigma)?,
+                    None => scale_csr(&eye(n)?, sigma)?,
+                };
+                let shifted = sub_csr(a, &shift)?;
+                let factor = splu(&shifted.to_csc()?, LuOptions::default())
+                    .map_err(|err| singular_shift_error(err, sigma))?;
+                Ok(Self::ShiftInvert { sigma, factor })
+            }
+        }
     }
 
-    let mut basis: Vec<Vec<f64>> = vec![v0];
-    let mut t = vec![vec![0.0; m]; m];
-    let mut theta: Vec<f64> = Vec::new();
-    let mut y = DMatrix::<f64>::zeros(0, 0);
-    let mut order: Vec<usize> = Vec::new();
-    let mut size = 0;
-    let mut converged = false;
+    /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`), which is all mode 3 needs.
+    fn apply(&self, a: &CsrMatrix, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
+        match self {
+            Self::Standard => Ok(csr_matvec(a, x)),
+            Self::Generalized(mass_factor) => splu_solve(mass_factor, &csr_matvec(a, x)),
+            Self::ShiftInvert { sigma, factor } => {
+                splu_solve(factor, bx).map_err(|err| singular_shift_error(err, *sigma))
+            }
+        }
+    }
 
-    for _cycle in 0..options.max_iter.max(1) {
-        // Extend the basis to m vectors; `residual` is the unnormalized next direction.
-        let mut residual = vec![0.0; n];
-        let mut beta = 0.0;
-        while basis.len() <= m {
-            let j = basis.len() - 1;
-            let mut w = op(&basis[j]);
-            total_matvec += 1;
-            let norm_before = vec_norm(&w);
-            let mut coeff = vec![0.0; basis.len()];
-            for _pass in 0..2 {
-                for (i, b) in basis.iter().enumerate() {
-                    let c = dot_product(&w, b);
-                    coeff[i] += c;
-                    for (wk, bk) in w.iter_mut().zip(b) {
-                        *wk -= c * bk;
+    const fn is_shift_invert(&self) -> bool {
+        matches!(self, Self::ShiftInvert { .. })
+    }
+
+    /// `σ`, or 0 outside shift-invert mode.
+    const fn shift(&self) -> f64 {
+        match self {
+            Self::ShiftInvert { sigma, .. } => *sigma,
+            Self::Standard | Self::Generalized(_) => 0.0,
+        }
+    }
+
+    /// λ for a real Ritz value θ of `OP`.
+    fn eigenvalue(&self, theta: f64) -> f64 {
+        match self {
+            Self::ShiftInvert { sigma, .. } => sigma + 1.0 / theta,
+            Self::Standard | Self::Generalized(_) => theta,
+        }
+    }
+
+    /// λ for a complex Ritz value θ of `OP`.
+    fn eigenvalue_complex(&self, theta: (f64, f64)) -> (f64, f64) {
+        match self {
+            Self::ShiftInvert { sigma, .. } => {
+                let inv = complex_div((1.0, 0.0), theta);
+                (sigma + inv.0, inv.1)
+            }
+            Self::Standard | Self::Generalized(_) => theta,
+        }
+    }
+}
+
+/// A singular `A − σM` is SciPy's "Factor is exactly singular" (`splu` raises at σ exactly on
+/// an eigenvalue); other errors pass through.
+fn singular_shift_error(err: SparseError, sigma: f64) -> SparseError {
+    match err {
+        SparseError::SingularMatrix { message } => SparseError::SingularMatrix {
+            message: format!(
+                "Factor is exactly singular: A - sigma*M is singular at sigma={sigma} ({message})"
+            ),
+        },
+        other => other,
+    }
+}
+
+/// `a / b` in complex arithmetic (Smith's algorithm).
+fn complex_div(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.0.abs() >= b.1.abs() {
+        let r = b.1 / b.0;
+        let d = b.0 + b.1 * r;
+        ((a.0 + a.1 * r) / d, (a.1 - a.0 * r) / d)
+    } else {
+        let r = b.0 / b.1;
+        let d = b.0 * r + b.1;
+        ((a.0 * r + a.1) / d, (a.1 * r - a.0) / d)
+    }
+}
+
+/// `a · b` in complex arithmetic.
+fn complex_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// ARPACK's `eps23 = ε^(2/3)`: the floor of the relative convergence test and the relative
+/// size below which a Krylov residual counts as an invariant subspace.
+fn arpack_eps23() -> f64 {
+    f64::EPSILON.powf(2.0 / 3.0)
+}
+
+/// The rounding level of a Ritz residual estimate `|β·y_last|` computed from a dense `size`×`size`
+/// projected eigenproblem whose Ritz values have magnitudes `magnitudes`: `size·ε·max|θ|`.
+///
+/// ARPACK's test `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))` asks, at `tol = ε` and `|θ| ≪ max|θ|`, for
+/// an estimate far below this level. ARPACK meets it through its tridiagonal QL, whose exact
+/// deflations make the last eigenvector components exactly zero; a dense eigensolver computes
+/// those components only to about this level, and the test would never pass (observed: `eigsh`
+/// with `which='BE'` on the 300-point Laplacian stalled at 4/6 converged for 3000 cycles, where
+/// ARPACK needs 234). The test is therefore floored here, which still bounds the true residual
+/// by `(size + 1)·ε·‖H‖`, a backward-stable Ritz pair.
+fn krylov_estimate_floor(size: usize, magnitudes: impl Iterator<Item = f64>) -> f64 {
+    let largest = magnitudes.fold(0.0_f64, f64::max);
+    size as f64 * f64::EPSILON * largest
+}
+
+/// `y += a·x`.
+fn add_scaled(y: &mut [f64], a: f64, x: &[f64]) {
+    for (yi, &xi) in y.iter_mut().zip(x) {
+        *yi += a * xi;
+    }
+}
+
+/// Entries per block in the Krylov basis kernels: 512 f64 (4 KiB) of the vector being built
+/// stays in L1 while each basis vector's block passes over it.
+const KRYLOV_BLOCK: usize = 512;
+
+/// `⟨a, b⟩` over eight independent partial sums, combined pairwise at the end.
+///
+/// The Krylov–Schur orthogonalization spends almost all of eigsh/eigs in these dots (80% of a
+/// k = 20 run on a 10⁴-point Laplacian, frankenscipy-f5kx5). `dot_product`'s single serial sum
+/// retires one element per add latency, where ARPACK's BLAS dot keeps several in flight. The
+/// summation order differs from `dot_product` in the last bits; nothing here is held to bit
+/// identity.
+fn krylov_dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = [0.0_f64; 8];
+    let (a8, a_rest) = a.as_chunks::<8>();
+    let (b8, b_rest) = b.as_chunks::<8>();
+    for (x, y) in a8.iter().zip(b8) {
+        for ((sum, &xi), &yi) in acc.iter_mut().zip(x).zip(y) {
+            *sum += xi * yi;
+        }
+    }
+    let tail: f64 = a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum();
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+/// Refuses a non-finite operator output: an overflowing `A·x`, or a solve through a singular
+/// factor, would otherwise be iterated on as if it were a direction.
+fn ensure_finite(w: &[f64]) -> SparseResult<()> {
+    if w.iter().all(|x| x.is_finite()) {
+        Ok(())
+    } else {
+        Err(SparseError::NonFiniteInput {
+            message: "the Krylov operator produced a non-finite vector".to_string(),
+        })
+    }
+}
+
+/// Scales `x` (and `bx = B·x`, when present) to unit B-norm; a zero vector is left alone.
+fn normalize_with(x: &mut [f64], bx: Option<&mut Vec<f64>>) {
+    let norm_sq = match bx.as_deref() {
+        Some(b) => dot_product(x, b),
+        None => dot_product(x, x),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        x.iter_mut().for_each(|xi| *xi *= inv);
+        if let Some(b) = bx {
+            b.iter_mut().for_each(|bi| *bi *= inv);
+        }
+    }
+}
+
+/// A B-orthonormal Krylov basis (`B = M`, or `I` without a mass matrix) with `B·v` stored beside
+/// each vector, so a B inner product costs one dot product.
+struct KrylovBasis<'b> {
+    mass: Option<&'b CsrMatrix>,
+    v: Vec<Vec<f64>>,
+    /// `B·v_i`; empty when `B = I`.
+    bv: Vec<Vec<f64>>,
+    n: usize,
+    rng: u64,
+}
+
+/// One orthogonalization of a new direction against the basis.
+struct Orthogonalized {
+    /// Gram–Schmidt coefficients `⟨v_i, w⟩_B` (both passes summed).
+    coeff: Vec<f64>,
+    /// B-norm of the direction before orthogonalization.
+    norm_before: f64,
+    /// B-norm after.
+    norm_after: f64,
+    /// `B·w` after (`None` when `B = I`).
+    bw: Option<Vec<f64>>,
+}
+
+impl<'b> KrylovBasis<'b> {
+    fn new(n: usize, mass: Option<&'b CsrMatrix>) -> Self {
+        Self {
+            mass,
+            v: Vec::new(),
+            bv: Vec::new(),
+            n,
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    /// Uniform(−1, 1) entries from a fixed-seed LCG: the default start vector, and the fresh
+    /// directions drawn after an invariant subspace. A constant start vector is orthogonal to
+    /// the antisymmetric eigenvectors of symmetric structured matrices (the 1-D Laplacian's
+    /// alternating mode) and never reaches them; a generic vector has a component along every
+    /// eigenvector and stays reproducible (SciPy draws a random one).
+    fn random_vector(&mut self) -> Vec<f64> {
+        let mut v = vec![0.0_f64; self.n];
+        for vi in &mut v {
+            self.rng = self
+                .rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *vi = ((self.rng >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+        }
+        v
+    }
+
+    fn b_times(&self, x: &[f64]) -> Option<Vec<f64>> {
+        self.mass.map(|m| csr_matvec(m, x))
+    }
+
+    /// `B·v_i` (`v_i` itself when `B = I`).
+    fn bvec(&self, i: usize) -> &[f64] {
+        if self.mass.is_some() {
+            &self.bv[i]
+        } else {
+            &self.v[i]
+        }
+    }
+
+    fn push(&mut self, v: Vec<f64>, bv: Option<Vec<f64>>) {
+        self.v.push(v);
+        if let Some(bv) = bv {
+            self.bv.push(bv);
+        }
+    }
+
+    fn replace(&mut self, v: Vec<Vec<f64>>, bv: Vec<Vec<f64>>) {
+        self.v = v;
+        self.bv = bv;
+    }
+
+    /// Two passes of classical Gram–Schmidt against every basis vector in the B inner product
+    /// ("twice is enough"; ARPACK applies the DGKS correction when the first pass cancels,
+    /// this always applies it). The norm before comes from Pythagoras.
+    fn orthogonalize(&self, w: &mut [f64]) -> SparseResult<Orthogonalized> {
+        let len = self.v.len();
+        let mut coeff = vec![0.0; len];
+        for _pass in 0..2 {
+            let c: Vec<f64> = (0..len).map(|i| krylov_dot(self.bvec(i), w)).collect();
+            for (total, &ci) in coeff.iter_mut().zip(&c) {
+                *total += ci;
+            }
+            // w −= Σ c_i v_i, blocked so a block of w stays in L1 while every basis vector
+            // passes over it; each entry subtracts in i order, as the unblocked loop did.
+            for start in (0..self.n).step_by(KRYLOV_BLOCK) {
+                let end = (start + KRYLOV_BLOCK).min(self.n);
+                let w_block = &mut w[start..end];
+                for (vi, &ci) in self.v.iter().zip(&c) {
+                    add_scaled(w_block, -ci, &vi[start..end]);
+                }
+            }
+        }
+        let bw = self.b_times(w);
+        let mut norm_sq = match &bw {
+            Some(b) => krylov_dot(w, b),
+            None => krylov_dot(w, w),
+        };
+        let coeff_sq: f64 = coeff.iter().map(|c| c * c).sum();
+        if norm_sq < 0.0 {
+            // Rounding can leave a tiny negative xᵀMx for a direction M (semi-definite in
+            // shift-invert mode) nearly annihilates; a sizeable one means M is indefinite.
+            if -norm_sq > arpack_eps23() * coeff_sq {
+                return Err(SparseError::InvalidArgument {
+                    message: "M must be positive definite: xᵀMx < 0 for a Krylov vector"
+                        .to_string(),
+                });
+            }
+            norm_sq = 0.0;
+        }
+        Ok(Orthogonalized {
+            coeff,
+            norm_before: (coeff_sq + norm_sq).sqrt(),
+            norm_after: norm_sq.sqrt(),
+            bw,
+        })
+    }
+
+    /// ARPACK `dgetv0` after an invariant subspace: a fresh random direction, B-orthogonal to
+    /// the basis and B-normalized. `None` when three draws all lie in the span (the basis
+    /// fills the space).
+    fn fresh_direction(&mut self) -> SparseResult<Option<(Vec<f64>, Option<Vec<f64>>)>> {
+        for _attempt in 0..3 {
+            let mut r = self.random_vector();
+            let orth = self.orthogonalize(&mut r)?;
+            if orth.norm_after > arpack_eps23() * orth.norm_before {
+                let mut br = orth.bw;
+                normalize_with(&mut r, br.as_mut());
+                return Ok(Some((r, br)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`Self::combine`] for several coefficient columns at once, `coefs[t][j]` weighting `v_j`
+    /// in output `t`. The loops run over blocks of [`KRYLOV_BLOCK`] entries, so each basis
+    /// block is read once for every output, as a dgemm reads it, where one `combine` per output
+    /// streamed the whole basis each time (the restarts were a quarter of a k = 20 eigsh,
+    /// frankenscipy-f5kx5). Every entry still adds its terms in `j` order, skipping zero
+    /// coefficients, so each output is bit-identical to `combine`'s.
+    fn combine_many(&self, count: usize, coefs: &[Vec<f64>]) -> Vec<(Vec<f64>, Option<Vec<f64>>)> {
+        let mut out: Vec<(Vec<f64>, Option<Vec<f64>>)> = coefs
+            .iter()
+            .map(|_| (vec![0.0; self.n], self.mass.map(|_| vec![0.0; self.n])))
+            .collect();
+        for start in (0..self.n).step_by(KRYLOV_BLOCK) {
+            let end = (start + KRYLOV_BLOCK).min(self.n);
+            for j in 0..count {
+                let vj = &self.v[j][start..end];
+                let bvj = self.mass.map(|_| &self.bv[j][start..end]);
+                for ((x, bx), c) in out.iter_mut().zip(coefs) {
+                    let cj = c[j];
+                    if cj == 0.0 {
+                        continue;
+                    }
+                    add_scaled(&mut x[start..end], cj, vj);
+                    if let (Some(bx), Some(bvj)) = (bx.as_mut(), bvj) {
+                        add_scaled(&mut bx[start..end], cj, bvj);
                     }
                 }
             }
-            for (i, &c) in coeff.iter().enumerate() {
-                t[i][j] = c;
-                t[j][i] = c;
-            }
-            beta = vec_norm(&w);
-            if beta <= breakdown_rel_tol * norm_before || basis.len() == m {
-                residual = w;
-                if beta <= breakdown_rel_tol * norm_before {
-                    beta = 0.0; // invariant subspace: the Ritz pairs are exact
-                }
-                break;
-            }
-            for wk in &mut w {
-                *wk /= beta;
-            }
-            basis.push(w);
         }
-        size = basis.len();
+        out
+    }
 
-        // Rayleigh–Ritz on the projection.
-        let projected = DMatrix::from_fn(size, size, |i, j| t[i][j]);
+    /// `Σ_j coef(j)·v_j` over the first `count` basis vectors, with the same combination of the
+    /// `B·v_j`. The unblocked reference [`Self::combine_many`] is held to, bit for bit.
+    #[cfg(test)]
+    fn combine(&self, count: usize, coef: impl Fn(usize) -> f64) -> (Vec<f64>, Option<Vec<f64>>) {
+        let mut x = vec![0.0; self.n];
+        let mut bx = self.mass.map(|_| vec![0.0; self.n]);
+        for j in 0..count {
+            let c = coef(j);
+            if c == 0.0 {
+                continue;
+            }
+            add_scaled(&mut x, c, &self.v[j]);
+            if let Some(bx) = bx.as_mut() {
+                add_scaled(bx, c, &self.bv[j]);
+            }
+        }
+        (x, bx)
+    }
+}
+
+/// Puts the B-normalized start vector into the empty basis: `v0`, or the fixed-seed random
+/// vector, first pushed through `OP` when `force_range` (ARPACK's `dgetv0` does this for a
+/// generalized problem so the start lies in the range of `OP`).
+fn krylov_start<F>(
+    basis: &mut KrylovBasis<'_>,
+    op: &mut F,
+    v0: Option<&[f64]>,
+    force_range: bool,
+    applications: &mut usize,
+) -> SparseResult<()>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let mut x = match v0 {
+        Some(v) => v.to_vec(),
+        None => basis.random_vector(),
+    };
+    if force_range {
+        let bx = basis.b_times(&x).unwrap_or_else(|| x.clone());
+        x = op(&x, &bx)?;
+        *applications += 1;
+        ensure_finite(&x)?;
+    }
+    let mut bx = basis.b_times(&x);
+    let norm_sq = match &bx {
+        Some(b) => dot_product(&x, b),
+        None => dot_product(&x, &x),
+    };
+    if !(norm_sq > 0.0) || !norm_sq.is_finite() {
+        // ARPACK error -9.
+        return Err(SparseError::InvalidArgument {
+            message: "starting vector is zero".to_string(),
+        });
+    }
+    normalize_with(&mut x, bx.as_mut());
+    basis.push(x, bx);
+    Ok(())
+}
+
+/// The B-normalized next Krylov direction and its `B·v`.
+type KrylovDirection = (Vec<f64>, Option<Vec<f64>>);
+
+/// Extends the basis to `m` vectors by Arnoldi/Lanczos steps with full reorthogonalization.
+/// Column `j`'s Gram–Schmidt coefficients and its coupling to vector `j + 1` go to
+/// `record(j, coeff, beta)`; the coupling is 0 where an invariant subspace was found and a
+/// fresh direction drawn, and is not a matrix entry for the last column. Returns the final
+/// coupling `β` and the next direction, or `(0, None)` when the basis is invariant.
+fn krylov_extend<F, R>(
+    basis: &mut KrylovBasis<'_>,
+    op: &mut F,
+    m: usize,
+    applications: &mut usize,
+    mut record: R,
+) -> SparseResult<(f64, Option<KrylovDirection>)>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+    R: FnMut(usize, &[f64], f64),
+{
+    while basis.len() <= m {
+        let j = basis.len() - 1;
+        let mut w = op(&basis.v[j], basis.bvec(j))?;
+        *applications += 1;
+        ensure_finite(&w)?;
+        let orth = basis.orthogonalize(&mut w)?;
+        let invariant = orth.norm_after <= arpack_eps23() * orth.norm_before;
+        let mut bw = orth.bw;
+        if j + 1 >= m {
+            record(j, &orth.coeff, 0.0);
+            if invariant {
+                return Ok((0.0, None));
+            }
+            normalize_with(&mut w, bw.as_mut());
+            return Ok((orth.norm_after, Some((w, bw))));
+        }
+        if invariant {
+            record(j, &orth.coeff, 0.0);
+            match basis.fresh_direction()? {
+                Some((r, br)) => basis.push(r, br),
+                None => return Ok((0.0, None)),
+            }
+        } else {
+            record(j, &orth.coeff, orth.norm_after);
+            normalize_with(&mut w, bw.as_mut());
+            basis.push(w, bw);
+        }
+    }
+    Ok((0.0, None))
+}
+
+/// Indices of the `count` Ritz values wanted under `which`, most wanted first (ARPACK's
+/// `dsgets`). `BE` takes `count/2` from the low end and the rest from the high end.
+fn select_symmetric(theta: &[f64], which: EigsWhich, count: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..theta.len()).collect();
+    let count = count.min(theta.len());
+    match which {
+        EigsWhich::BothEnds => {
+            idx.sort_by(|&a, &b| theta[a].total_cmp(&theta[b]));
+            let low = count / 2;
+            let high = count - low;
+            let mut out: Vec<usize> = idx[idx.len() - high..].iter().rev().copied().collect();
+            out.extend_from_slice(&idx[..low]);
+            return out;
+        }
+        EigsWhich::SmallestMagnitude => {
+            idx.sort_by(|&a, &b| theta[a].abs().total_cmp(&theta[b].abs()));
+        }
+        EigsWhich::LargestAlgebraic | EigsWhich::LargestReal => {
+            idx.sort_by(|&a, &b| theta[b].total_cmp(&theta[a]));
+        }
+        EigsWhich::SmallestAlgebraic | EigsWhich::SmallestReal => {
+            idx.sort_by(|&a, &b| theta[a].total_cmp(&theta[b]));
+        }
+        EigsWhich::LargestMagnitude
+        | EigsWhich::LargestImaginary
+        | EigsWhich::SmallestImaginary => {
+            idx.sort_by(|&a, &b| theta[b].abs().total_cmp(&theta[a].abs()));
+        }
+    }
+    idx.truncate(count);
+    idx
+}
+
+/// The wanted Ritz pairs of a symmetric Krylov–Schur run, most wanted first.
+struct SymmetricRitz {
+    theta: Vec<f64>,
+    /// B-orthonormal Ritz vectors.
+    vectors: Vec<Vec<f64>>,
+    /// `β·y_last`: the Ritz residual `OP x − θ x` is this multiple of `next`.
+    coupling: Vec<f64>,
+    /// ARPACK's convergence test, per pair.
+    converged: Vec<bool>,
+    /// The B-normalized residual direction (zero when the basis is invariant).
+    next: Vec<f64>,
+    iterations: usize,
+    applications: usize,
+}
+
+/// Symmetric Krylov–Schur (Stewart 2001), i.e. thick-restart Lanczos (Wu & Simon 2000), for the
+/// `k` Ritz pairs wanted under `settings.which` of an operator `op(x, B·x)` self-adjoint in the
+/// B inner product (`B = mass`, or `I`), with an `ncv`-vector basis.
+///
+/// Each cycle extends the basis to `ncv` vectors with full reorthogonalization (a fresh random
+/// direction replaces an invariant subspace, as in ARPACK), solves the projected symmetric
+/// eigenproblem, and tests every wanted pair with ARPACK's `dsconv`:
+/// `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))` — relative, since an absolute floor lets a matrix of
+/// norm 1e-11 pass on its first cycle whatever its Ritz values are — floored at the rounding
+/// level [`krylov_estimate_floor`], which scales with the operator. Otherwise it restarts from
+/// the `k + min(nconv, (ncv − k)/2)` most wanted Ritz vectors (ARPACK `dsaup2`'s adjustment of
+/// `nev`) plus the residual direction, which leaves the projection an arrowhead matrix; the
+/// arrow entry of a converged pair is zeroed (Stewart's deflation), which locks it. This is
+/// mathematically ARPACK's implicitly restarted Lanczos; at most `settings.max_iter` cycles.
+///
+/// A single unrestarted pass of such a basis, what `eigsh` used to run, left relative residuals
+/// of 4e-2 to 5e-1 on 24 ordinary sparse matrices with k = 6 and n = 120..800
+/// (frankenscipy-szq1n.15).
+fn symmetric_krylov_schur<F>(
+    mut op: F,
+    mass: Option<&CsrMatrix>,
+    n: usize,
+    k: usize,
+    settings: &KrylovSettings,
+    v0: Option<&[f64]>,
+    force_range: bool,
+) -> SparseResult<SymmetricRitz>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let m = settings.ncv.clamp(1, n);
+    let eps23 = arpack_eps23();
+    let tol = settings.tol;
+    let mut applications = 0_usize;
+    let mut basis = KrylovBasis::new(n, mass);
+    krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
+
+    // The projected matrix, row-major m×m.
+    let mut t = vec![0.0_f64; m * m];
+    // Leading kept Ritz vectors whose arrow entry was deflated.
+    let mut locked = vec![false; m];
+    let mut kept = 0_usize;
+    let mut iterations = 0_usize;
+    loop {
+        iterations += 1;
+        let (beta, next) = krylov_extend(
+            &mut basis,
+            &mut op,
+            m,
+            &mut applications,
+            |j, coeff, sub| {
+                for (i, &c) in coeff.iter().enumerate() {
+                    if i < kept && locked[i] {
+                        continue;
+                    }
+                    t[i * m + j] = c;
+                    t[j * m + i] = c;
+                }
+                if j + 1 < m {
+                    t[(j + 1) * m + j] = sub;
+                    t[j * m + j + 1] = sub;
+                }
+            },
+        )?;
+        let size = basis.len();
+        let projected = DMatrix::from_fn(size, size, |i, j| t[i * m + j]);
         let Some(eigen) =
             nalgebra::SymmetricEigen::try_new(projected, f64::EPSILON, 30 * size.max(10))
         else {
-            break;
+            let partial = EigsResult {
+                iterations,
+                ncv: m,
+                ..EigsResult::default()
+            };
+            return Err(eigs_no_convergence(iterations, 0, k, partial));
         };
-        theta = eigen.eigenvalues.iter().copied().collect();
-        y = eigen.eigenvectors;
-        order = (0..size).collect();
-        order.sort_by(|&a, &b| theta[b].abs().total_cmp(&theta[a].abs()));
+        let theta: Vec<f64> = eigen.eigenvalues.iter().copied().collect();
+        let y = eigen.eigenvectors;
+        let coupling = |i: usize| beta * y[(size - 1, i)];
+        let floor = krylov_estimate_floor(size, theta.iter().map(|t| t.abs()));
+        let passes = |i: usize| coupling(i).abs() <= (tol * theta[i].abs().max(eps23)).max(floor);
+        let wanted = select_symmetric(&theta, settings.which, k);
+        let nconv = wanted.iter().filter(|&&i| passes(i)).count();
+        let finished = (wanted.len() == k && nconv == k) || size <= k;
 
-        // ARPACK `dsconv` scales the test by max(|θ|, eps^(2/3)), not max(|θ|, 1): with the
-        // absolute floor a matrix of norm 1e-11 passes a 1e-10 tolerance on its first cycle
-        // whatever its Ritz values are.
-        let wanted = k.min(size);
-        let estimates_ok = order.iter().take(wanted).all(|&i| {
-            (beta * y[(size - 1, i)]).abs() <= tol * theta[i].abs().max(breakdown_rel_tol)
-        });
-        if (estimates_ok && wanted == k) || beta == 0.0 || keep >= size {
-            converged = estimates_ok && wanted == k;
-            break;
-        }
-
-        // Thick restart: the `keep` best Ritz vectors, then the residual direction.
-        let mut new_basis: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-        for &i in order.iter().take(keep) {
-            let mut ritz = vec![0.0; n];
-            for (j, b) in basis.iter().enumerate().take(size) {
-                let coef = y[(j, i)];
-                for (rk, bk) in ritz.iter_mut().zip(b) {
-                    *rk += coef * bk;
+        let (next_v, next_bv) = match next {
+            Some(direction) if !finished && iterations < settings.max_iter => direction,
+            last => {
+                let mut out = SymmetricRitz {
+                    theta: Vec::with_capacity(k),
+                    vectors: Vec::with_capacity(k),
+                    coupling: Vec::with_capacity(k),
+                    converged: Vec::with_capacity(k),
+                    next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
+                    iterations,
+                    applications,
+                };
+                let columns: Vec<Vec<f64>> = wanted
+                    .iter()
+                    .map(|&i| (0..size).map(|j| y[(j, i)]).collect())
+                    .collect();
+                for (&i, (mut x, mut bx)) in wanted.iter().zip(basis.combine_many(size, &columns)) {
+                    normalize_with(&mut x, bx.as_mut());
+                    out.theta.push(theta[i]);
+                    out.vectors.push(x);
+                    out.coupling.push(coupling(i));
+                    out.converged.push(passes(i));
                 }
+                return Ok(out);
             }
-            new_basis.push(ritz);
-        }
-        for row in &mut t {
-            row.fill(0.0);
-        }
-        for (slot, &i) in order.iter().take(keep).enumerate() {
-            t[slot][slot] = theta[i];
-            let arrow = beta * y[(size - 1, i)];
-            t[slot][keep] = arrow;
-            t[keep][slot] = arrow;
-        }
-        for rk in &mut residual {
-            *rk /= beta;
-        }
-        new_basis.push(residual);
-        basis = new_basis;
-    }
+        };
 
-    // The k wanted Ritz pairs of the last projection, largest magnitude first.
-    let k_actual = k.min(order.len());
-    let mut eigenvalues = Vec::with_capacity(k_actual);
-    let mut eigenvectors = Vec::with_capacity(k_actual);
-    for &i in order.iter().take(k_actual) {
-        eigenvalues.push(theta[i]);
-        let mut x = vec![0.0; n];
-        for (j, b) in basis.iter().enumerate().take(size) {
-            let coef = y[(j, i)];
-            for (xk, bk) in x.iter_mut().zip(b) {
-                *xk += coef * bk;
-            }
+        // Restart from the `keep` most wanted Ritz vectors (ARPACK dsaup2's nev adjustment).
+        let mut keep = k + nconv.min((size - k) / 2);
+        if keep == 1 && size >= 6 {
+            keep = size / 2;
+        } else if keep == 1 && size > 2 {
+            keep = 2;
         }
-        let norm = vec_norm(&x);
-        if norm > 0.0 {
-            for xk in &mut x {
-                *xk /= norm;
-            }
-        }
-        eigenvectors.push(x);
-    }
-    EigsResult {
-        eigenvalues_im: vec![0.0; k_actual],
-        eigenvectors_im: vec![vec![0.0; n]; k_actual],
-        eigenvalues,
-        eigenvectors,
-        nmatvec: total_matvec,
-        converged: converged && k_actual == k,
-    }
-}
-
-/// SciPy's `ncv` default for `eigsh`: `min(n, max(2k + 1, 20))`.
-fn eigsh_krylov_window(n: usize, k: usize) -> usize {
-    (2 * k + 1).max(20).min(n)
-}
-
-/// Returns `(all_top_k_converged, matvecs_used)` for an eigsh result by checking
-/// every returned Ritz pair's residual `‖A x − λ x‖ ≤ tol·max(|λ|, 1)`.
-fn eigsh_residual_check(a: &CsrMatrix, result: &EigsResult, tol: f64) -> (bool, usize) {
-    if result.eigenvalues.is_empty() {
-        return (false, 0);
-    }
-    // status: cleared below by any pair whose residual fails the test or is NaN
-    let mut converged = true;
-    let mut matvecs = 0;
-    for (&lambda, x) in result.eigenvalues.iter().zip(result.eigenvectors.iter()) {
-        let ax = csr_matvec(a, x);
-        matvecs += 1;
-        let resid: f64 = ax
+        let keep = keep.min(size - 1);
+        let kept_idx = select_symmetric(&theta, settings.which, keep);
+        let mut new_v = Vec::with_capacity(m + 1);
+        let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
+        let columns: Vec<Vec<f64>> = kept_idx
             .iter()
-            .zip(x.iter())
-            .map(|(&axi, &xi)| (axi - lambda * xi).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        // A NaN residual (a non-finite matrix reaches here: CSR accepts NaN) must fail the
-        // test; `resid > thr` alone is false for NaN (frankenscipy-szq1n.7).
-        if resid.is_nan() || resid > tol * lambda.abs().max(1.0) {
-            converged = false;
+            .map(|&i| (0..size).map(|j| y[(j, i)]).collect())
+            .collect();
+        for (x, bx) in basis.combine_many(size, &columns) {
+            new_v.push(x);
+            if let Some(bx) = bx {
+                new_bv.push(bx);
+            }
         }
+        t.fill(0.0);
+        locked.fill(false);
+        for (s, &i) in kept_idx.iter().enumerate() {
+            t[s * m + s] = theta[i];
+            // Locking: a converged pair's coupling to the residual is below tolerance, and
+            // zeroing it (Stewart's deflation) decouples the pair so later cycles keep it exact.
+            locked[s] = passes(i);
+            let arrow = if locked[s] { 0.0 } else { coupling(i) };
+            t[s * m + keep] = arrow;
+            t[keep * m + s] = arrow;
+        }
+        kept = keep;
+        basis.replace(new_v, new_bv);
+        basis.push(next_v, next_bv);
     }
-    (converged, matvecs)
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// eigs — Arnoldi-based eigenvalue solver for general sparse matrices
+// eigs — Krylov–Schur eigenvalue solver for general sparse matrices
 // ══════════════════════════════════════════════════════════════════════
 
-/// Compute the `k` eigenvalues of largest magnitude of a general sparse matrix, as
-/// `scipy.sparse.linalg.eigs(A, k=k, which='LM')`.
+/// One eigenpair of [`eigs`] before ordering: λ, the complex eigenvector, whether it passed
+/// both convergence tests, and its Schur block (shared by a conjugate pair).
+struct GeneralPair {
+    lambda: (f64, f64),
+    xr: Vec<f64>,
+    xi: Vec<f64>,
+    ok: bool,
+    block: usize,
+}
+
+/// `k` eigenpairs of a general sparse matrix `A` (or of `A x = λ M x`), as
+/// `scipy.sparse.linalg.eigs(A, k, M, sigma, which, v0, ncv, maxiter, tol)` with a real
+/// `sigma`.
 ///
-/// Arnoldi: ONE Krylov subspace of dimension `min(n, 2k+1)`, Ritz values from the projected
-/// upper-Hessenberg matrix. There are no implicit restarts (ARPACK restarts until
-/// convergence), so the result can be less accurate than SciPy's on a spectrum without a clear
-/// gap after the k-th eigenvalue. `converged` is true only when all `k` pairs came back.
-/// `which`, `sigma` and `M` are not supported.
-pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "eigs requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if k == 0 || k > n {
-        return Err(SparseError::InvalidArgument {
-            message: format!("k={k} must be in [1, {n}]"),
-        });
-    }
-    let options = normalize_eigs_options(options);
+/// Nonsymmetric Krylov–Schur (Stewart 2001): Arnoldi with full DGKS reorthogonalization,
+/// restarted from a reordered real Schur form of the projected matrix, with converged leading
+/// Schur blocks deflated (locked). It is mathematically ARPACK's implicitly restarted Arnoldi
+/// (`dnaupd`), which SciPy wraps: the same `ncv`, `maxiter`, `tol` and `which` semantics and
+/// the same test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))`, floored at the projected problem's rounding
+/// level `ncv·ε·max|θ|` as in [`eigsh`]. The operator follows SciPy's modes: `A`,
+/// `M⁻¹A` in the M inner product (M symmetric positive definite), or `(A − σM)⁻¹M` with
+/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified.
+///
+/// The pairs come back most wanted first (under `which`, applied to `1/(λ − σ)` when `sigma` is
+/// set), a complex-conjugate pair adjacent with the positive imaginary part first. When `k`
+/// splits a pair, the member with positive imaginary part is returned, as SciPy does for its
+/// `k + 1`-th candidate. Every pair must also pass the explicit residual check
+/// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`.
+///
+/// # Errors
+/// - [`SparseError::EigsNoConvergence`] (SciPy's `ArpackNoConvergence`) when some wanted pair
+///   has not converged after `max_iter` cycles; it carries the pairs that did converge.
+/// - [`SparseError::SingularMatrix`] when `A − σM` is exactly singular.
+/// - [`SparseError::InvalidArgument`] for a `which` that `eigs` does not take, an `ncv`
+///   outside `k + 1 < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or an indefinite `M`.
+/// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
+///
+/// Differences from SciPy: `k` may reach `n` (SciPy refuses `k ≥ n − 1` for a sparse `A`); the
+/// default start vector is a fixed-seed pseudo-random one; complex `sigma` (`OPpart`),
+/// `OPinv`/`Minv` operators and `return_eigenvectors=False` are not offered.
+pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+    let n = validate_eigen_problem(a, k, &options, "eigs")?;
+    let settings = resolve_krylov_settings(n, k, &options, false)?;
+    let transform = SpectralTransform::build(a, &options, n)?;
+    let run = general_krylov_schur(
+        |x: &[f64], bx: &[f64]| transform.apply(a, x, bx),
+        options.mass,
+        n,
+        k,
+        &settings,
+        options.v0,
+        options.mass.is_some(),
+    )?;
 
-    // Krylov subspace dimension (larger than k for better convergence).
-    let m = (2 * k + 1).min(n);
-    Ok(krylov_arnoldi_eigs(|v| csr_matvec(a, v), n, k, &options, m))
-}
-
-/// The Arnoldi eigensolver behind [`eigs`] (a general operator; the symmetric
-/// [`eigsh`]/[`svds`] run [`thick_restart_lanczos`]). Builds ONE `m`-dimensional Krylov
-/// subspace with full modified-Gram-Schmidt re-orthogonalization, takes the Ritz values of
-/// the projected upper-Hessenberg matrix `H`, and back-transforms the top-`k`-by-magnitude
-/// Ritz vectors. O(m) matvecs, no restarts (frankenscipy-1ksfv.10 tracks restarting it).
-fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
-    mut op: F,
-    n: usize,
-    k: usize,
-    options: &EigsOptions,
-    m: usize,
-) -> EigsResult {
-    let mut total_matvec = 0;
-
-    // Arnoldi iteration: build orthonormal basis V and upper Hessenberg H
-    // such that A * V_m ≈ V_m * H_m
-    let mut v: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-    let mut h = vec![vec![0.0; m]; m + 1]; // (m+1) x m upper Hessenberg
-
-    // Initial vector. A CONSTANT vector is orthogonal to the antisymmetric
-    // eigenvectors of symmetric structured matrices (e.g. the 1-D Laplacian
-    // [2,-1;-1,2,…], whose top "alternating-sign" mode is orthogonal to any
-    // equal-valued vector), so the Krylov subspace never reaches those eigenpairs
-    // and Lanczos silently returns the wrong "top" eigenvalue. scipy/ARPACK use a
-    // random start; we use a fixed-seed deterministic pseudo-random vector, which
-    // has generic (non-zero) components along every eigenvector while staying
-    // fully reproducible.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64; // golden-ratio fixed seed
-    let mut v0 = vec![0.0_f64; n];
-    for vi in v0.iter_mut() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        // top 53 bits → uniform in [0, 1), mapped to (-1, 1)
-        *vi = ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
-    }
-    let v0_norm = vec_norm(&v0);
-    if v0_norm > 0.0 {
-        for vi in &mut v0 {
-            *vi /= v0_norm;
+    let sigma = transform.shift();
+    let a_norm = csr_norm_bound(a);
+    let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let guard = settings.tol.max(f64::EPSILON.sqrt());
+    let mut nmatvec = run.applications;
+    let mut pairs: Vec<GeneralPair> = Vec::with_capacity(run.theta.len());
+    for (i, &theta) in run.theta.iter().enumerate() {
+        let (mut xr, mut xi) = run.vectors[i].clone();
+        let lambda = transform.eigenvalue_complex(theta);
+        if transform.is_shift_invert() && (theta.0 != 0.0 || theta.1 != 0.0) {
+            // dneupd's purification: OP x/θ = x + (β·y_last/θ)·v_next.
+            let c = complex_div(run.coupling[i], theta);
+            add_scaled(&mut xr, c.0, &run.next);
+            add_scaled(&mut xi, c.1, &run.next);
+            complex_b_normalize(&mut xr, &mut xi, options.mass);
         }
-    }
-    v.push(v0);
-
-    // ARPACK's `eps23` = ε^(2/3) ≈ 3.67e-11, used as a RELATIVE tolerance for the
-    // lucky-breakdown test below. Hoisted out of the loop; see the gate for why it
-    // cannot be an absolute threshold (frankenscipy-6bfm3).
-    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
-
-    let mut actual_m = 0usize;
-    for j in 0..m {
-        // w = op(v_j)  (A·v for eigs/eigsh; AᵀA·v for svds). The result becomes the
-        // next basis vector (v.push(w) below), so its allocation is necessary — but
-        // op itself (FnMut) may reuse internal scratch. frankenscipy-fo9cj.
-        let mut w = op(&v[j]);
-        total_matvec += 1;
-
-        // Modified Gram-Schmidt orthogonalization
-        for i in 0..=j {
-            h[i][j] = dot_product(&w, &v[i]);
-            for (wk, vik) in w.iter_mut().zip(v[i].iter()) {
-                *wk -= h[i][j] * vik;
-            }
-        }
-
-        h[j + 1][j] = vec_norm(&w);
-        // br-iq1e: count this column as completed BEFORE the breakdown
-        // check. Without this, a lucky-breakdown at j=0 (e.g. when the
-        // initial vector is already an eigenvector — common for
-        // structured matrices like the 4-cycle shift) leaves actual_m
-        // = v.len() - 1 = 0 and the caller sees zero eigenvalues even
-        // though h[0][0] holds the correct dominant eigenvalue.
-        actual_m = j + 1;
-
-        // ‖w‖₂ BEFORE orthogonalization, which is the scale the breakdown test
-        // has to be measured against. Recovered from the projection
-        // coefficients rather than a second pass over `w`: modified
-        // Gram-Schmidt is an orthogonal decomposition, so
-        //   ‖w_before‖² = Σᵢ h[i][j]² + ‖w_after‖².
-        let w_norm_before = {
-            let mut acc = h[j + 1][j] * h[j + 1][j];
-            for row in h.iter().take(j + 1) {
-                acc += row[j] * row[j];
-            }
-            acc.sqrt()
+        let (axr, axi) = (csr_matvec(a, &xr), csr_matvec(a, &xi));
+        let (mxr, mxi) = match options.mass {
+            Some(m) => (csr_matvec(m, &xr), csr_matvec(m, &xi)),
+            None => (xr.clone(), xi.clone()),
         };
-
-        // frankenscipy-6bfm3: this gate was `h[j+1][j] < f64::EPSILON * 1e6`,
-        // an ABSOLUTE 2.22e-10 applied to a NORM. h[j+1][j] carries the scale of
-        // the operator, so on a uniformly small matrix it declared an invariant
-        // Krylov subspace immediately and truncated the basis to one vector —
-        // returning fewer eigenvalues than requested, from a 1-D subspace, on a
-        // perfectly well-conditioned problem. svds is hit hardest because its
-        // operator is AᵀA: a matrix of norm 5e-6 gives an operator norm of
-        // 2.5e-11, already under the old threshold.
-        //
-        // The test must be RELATIVE to ‖w_before‖. `eps^(2/3)` is ARPACK's
-        // `eps23`, the same constant it uses to decide a Lanczos/Arnoldi
-        // quantity is numerically zero — loose enough to still catch a genuine
-        // lucky breakdown through modified-Gram-Schmidt rounding (which lands
-        // near eps·‖w‖), tight enough not to discard a live basis direction.
-        if h[j + 1][j] <= breakdown_rel_tol * w_norm_before {
-            // Lucky breakdown: Krylov subspace is invariant.
-            break;
+        nmatvec += if options.mass.is_some() { 4 } else { 2 };
+        let mut resid_sq = 0.0;
+        for t in 0..n {
+            let rr = axr[t] - (lambda.0 * mxr[t] - lambda.1 * mxi[t]);
+            let ri = axi[t] - (lambda.0 * mxi[t] + lambda.1 * mxr[t]);
+            resid_sq += rr * rr + ri * ri;
         }
-
-        // Normalize
-        for wi in &mut w {
-            *wi /= h[j + 1][j];
-        }
-        v.push(w);
+        let x_norm = (dot_product(&xr, &xr) + dot_product(&xi, &xi)).sqrt();
+        let bound = guard * (a_norm + (lambda.0.hypot(lambda.1) + sigma.abs()) * m_norm) * x_norm;
+        // A NaN residual fails: `<=` is false for NaN.
+        let ok = run.converged[i] && resid_sq.sqrt() <= bound;
+        pairs.push(GeneralPair {
+            lambda,
+            xr,
+            xi,
+            ok,
+            block: run.block[i],
+        });
     }
-
-    // The projected Hessenberg matrix can have complex-conjugate eigenpairs, which a real
-    // single-shift QR silently collapses to their real parts. Use the double-shift Francis QR
-    // (`hqr`) to recover the full complex spectrum, then complex back-substitution for the
-    // eigenvectors. Matches `scipy.sparse.linalg.eigs`, which returns a complex array.
-    krylov_extract_general(&v, &h, actual_m, n, k, options, total_matvec)
-}
-
-/// Top-`k`-by-magnitude complex eigenpairs of a general operator from its
-/// Arnoldi basis `v` and upper-Hessenberg projection `h[0..m, 0..m]`.
-///
-/// The projected matrix is reduced by the double-shift Francis QR (`hqr`) into
-/// real and imaginary eigenvalue parts; the corresponding Ritz vectors are
-/// obtained by complex back-substitution against the *original* `h` (which `hqr`
-/// leaves untouched, working on a copy) and back-transformed into the original
-/// space as `x = V @ y`.
-fn krylov_extract_general(
-    v: &[Vec<f64>],
-    h: &[Vec<f64>],
-    m: usize,
-    n: usize,
-    k: usize,
-    options: &EigsOptions,
-    total_matvec: usize,
-) -> EigsResult {
-    let pairs = hessenberg_eigenvalues_complex(h, m, options.max_iter, options.tol);
-
-    // Sort by magnitude (largest first), take top k. `sort_by` is stable, so a
-    // complex-conjugate pair (equal magnitude) keeps deflation order.
-    let mut indexed: Vec<(usize, (f64, f64))> = pairs.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| {
-        let ma = a.1.0 * a.1.0 + a.1.1 * a.1.1;
-        let mb = b.1.0 * b.1.0 + b.1.1 * b.1.1;
-        mb.total_cmp(&ma)
-    });
-
-    let k_actual = k.min(indexed.len());
-    let mut eigenvalues = Vec::with_capacity(k_actual);
-    let mut eigenvalues_im = Vec::with_capacity(k_actual);
-    let mut eigenvectors = Vec::with_capacity(k_actual);
-    let mut eigenvectors_im = Vec::with_capacity(k_actual);
-    // br-szq1n.7: convergence is established per Ritz pair, as in the symmetric
-    // path. This used to be a literal `true` after one unrestarted Arnoldi pass.
-    // Fewer pairs than requested is not convergence either.
-    let mut converged = k_actual > 0 && k_actual == k;
-    let residual_tol = options.tol.max(1e-8);
-
-    for &(_, (re, im)) in indexed.iter().take(k_actual) {
-        eigenvalues.push(re);
-        eigenvalues_im.push(im);
-
-        // Eigenvector y of the projected Hessenberg matrix, in complex arithmetic,
-        // then x = V @ y back into the original space (V is real).
-        let y = hessenberg_eigenvector_complex(h, m, (re, im));
-
-        // Arnoldi residual of the Ritz pair: ||A V y - lambda V y|| = ||H_bar y -
-        // lambda [y; 0]|| with H_bar the (m+1) x m Hessenberg matrix (V orthonormal).
-        let y_norm = y.iter().map(|&(r, i)| r * r + i * i).sum::<f64>().sqrt();
-        let projected_resid = if y_norm > 0.0 && m > 0 {
-            let mut resid_sq = 0.0;
-            for row in 0..=m.min(h.len() - 1) {
-                let (mut rr, mut ri) = (0.0, 0.0);
-                for (col, &(yr, yi)) in y.iter().enumerate().take(m) {
-                    let hv = h[row][col];
-                    rr += hv * yr;
-                    ri += hv * yi;
-                }
-                if row < m {
-                    let (yr, yi) = y[row];
-                    rr -= re * yr - im * yi;
-                    ri -= re * yi + im * yr;
-                }
-                resid_sq += rr * rr + ri * ri;
+    // A conjugate pair is adjacent; put the member with positive Im(λ) first (in shift-invert
+    // mode Im(λ) has the opposite sign of Im(θ)).
+    let mut i = 0;
+    while i + 1 < pairs.len() {
+        if pairs[i].block == pairs[i + 1].block {
+            if pairs[i].lambda.1 < pairs[i + 1].lambda.1 {
+                pairs.swap(i, i + 1);
             }
-            resid_sq.sqrt() / y_norm
+            i += 2;
         } else {
-            f64::INFINITY
-        };
-        if projected_resid.is_nan() || projected_resid > residual_tol * re.hypot(im).max(1.0) {
-            converged = false;
+            i += 1;
         }
-        let mut evec_re = vec![0.0; n];
-        let mut evec_im = vec![0.0; n];
-        for (j, &(yr, yi)) in y.iter().enumerate() {
-            if yr == 0.0 && yi == 0.0 {
-                continue;
-            }
-            for ((xr, xi), &vji) in evec_re.iter_mut().zip(evec_im.iter_mut()).zip(v[j].iter()) {
-                *xr += yr * vji;
-                *xi += yi * vji;
-            }
-        }
-        // Normalize by the complex 2-norm sqrt(Σ |x_i|²).
-        let norm = evec_re
-            .iter()
-            .zip(evec_im.iter())
-            .map(|(&r, &i)| r * r + i * i)
-            .sum::<f64>()
-            .sqrt();
-        if norm > 0.0 {
-            for (xr, xi) in evec_re.iter_mut().zip(evec_im.iter_mut()) {
-                *xr /= norm;
-                *xi /= norm;
-            }
-        }
-        eigenvectors.push(evec_re);
-        eigenvectors_im.push(evec_im);
     }
+    pairs.truncate(k);
 
-    EigsResult {
-        eigenvalues,
-        eigenvalues_im,
-        eigenvectors,
-        eigenvectors_im,
-        nmatvec: total_matvec,
-        converged,
+    let converged = pairs.len() == k && pairs.iter().all(|p| p.ok);
+    let assemble = |pairs: Vec<GeneralPair>, converged: bool| {
+        let mut result = EigsResult {
+            nmatvec,
+            iterations: run.iterations,
+            ncv: settings.ncv,
+            converged,
+            ..EigsResult::default()
+        };
+        for p in pairs {
+            result.eigenvalues.push(p.lambda.0);
+            result.eigenvalues_im.push(p.lambda.1);
+            result.eigenvectors.push(p.xr);
+            result.eigenvectors_im.push(p.xi);
+        }
+        result
+    };
+    if converged {
+        return Ok(assemble(pairs, true));
+    }
+    let good: Vec<GeneralPair> = pairs.into_iter().filter(|p| p.ok).collect();
+    let good_count = good.len();
+    Err(eigs_no_convergence(
+        run.iterations,
+        good_count,
+        k,
+        assemble(good, false),
+    ))
+}
+
+/// Scales the complex vector `xr + i·xi` to unit B-norm (`B = M`, or the 2-norm).
+fn complex_b_normalize(xr: &mut [f64], xi: &mut [f64], mass: Option<&CsrMatrix>) {
+    let norm_sq = match mass {
+        Some(m) => dot_product(xr, &csr_matvec(m, xr)) + dot_product(xi, &csr_matvec(m, xi)),
+        None => dot_product(xr, xr) + dot_product(xi, xi),
+    };
+    if norm_sq > 0.0 && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        xr.iter_mut().for_each(|x| *x *= inv);
+        xi.iter_mut().for_each(|x| *x *= inv);
     }
 }
 
-/// Complex eigenvalues of an upper-Hessenberg matrix `H[0..m, 0..m]` via the
-/// double-shift Francis QR (the classic EISPACK/Numerical-Recipes `hqr`).
+/// The wanted Ritz pairs of a nonsymmetric Krylov–Schur run, most wanted first, a
+/// complex-conjugate pair adjacent (positive imaginary part of θ first).
+struct GeneralRitz {
+    theta: Vec<(f64, f64)>,
+    /// Complex Ritz vectors `(re, im)`, B-normalized.
+    vectors: Vec<(Vec<f64>, Vec<f64>)>,
+    /// `β·y_last` (complex): the Ritz residual `OP x − θ x` is this multiple of `next`.
+    coupling: Vec<(f64, f64)>,
+    /// ARPACK's convergence test, per pair.
+    converged: Vec<bool>,
+    /// Schur block of each pair; the members of a conjugate pair share one.
+    block: Vec<usize>,
+    /// The B-normalized residual direction (zero when the basis is invariant).
+    next: Vec<f64>,
+    iterations: usize,
+    applications: usize,
+}
+
+/// A Ritz value of the projected matrix and the (stable) id of its Schur block.
+#[derive(Debug, Clone, Copy)]
+struct SchurValue {
+    re: f64,
+    im: f64,
+    block: usize,
+}
+
+/// Order of `values` under `which`, most wanted first (ARPACK's `dngets`). The members of a
+/// conjugate pair share a key and stay adjacent, positive imaginary part first.
+fn general_order(values: &[SchurValue], which: EigsWhich) -> Vec<usize> {
+    let key = |v: &SchurValue| -> f64 {
+        match which {
+            EigsWhich::LargestMagnitude | EigsWhich::BothEnds => v.re.hypot(v.im),
+            EigsWhich::SmallestMagnitude => -v.re.hypot(v.im),
+            EigsWhich::LargestReal | EigsWhich::LargestAlgebraic => v.re,
+            EigsWhich::SmallestReal | EigsWhich::SmallestAlgebraic => -v.re,
+            EigsWhich::LargestImaginary => v.im.abs(),
+            EigsWhich::SmallestImaginary => -v.im.abs(),
+        }
+    };
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let (va, vb) = (&values[a], &values[b]);
+        key(vb)
+            .total_cmp(&key(va))
+            .then_with(|| va.block.cmp(&vb.block))
+            .then_with(|| vb.im.total_cmp(&va.im))
+    });
+    idx
+}
+
+/// Nonsymmetric Krylov–Schur (Stewart 2001) for the `k` Ritz pairs wanted under
+/// `settings.which` of the operator `op(x, B·x)` (B = `mass`, or `I`), with an `ncv`-vector
+/// basis.
 ///
-/// Unlike a real single-shift QR (which collapses a complex-conjugate pair onto its
-/// real part), this deflates 1×1 and 2×2 blocks
-/// and returns each eigenvalue as a `(re, im)` pair — a 2×2 block with negative
-/// discriminant yields the conjugate pair `re ± im·i`. Operates on a private copy
-/// of `H`, so the caller's matrix is left intact for eigenvector recovery.
-// The double-QR sweep indexes offset rows/columns (a[i][k+2], a[k+1][j], the
-// diagonal a[i][i], …); a range loop is the natural and clearest expression.
-#[allow(clippy::needless_range_loop)]
-fn hessenberg_eigenvalues_complex(
-    h: &[Vec<f64>],
-    m: usize,
-    max_iter: usize,
-    _tol: f64,
-) -> Vec<(f64, f64)> {
-    if m == 0 {
-        return Vec::new();
+/// Each cycle extends the Krylov decomposition `OP·V = V·H + β·v·e_mᵀ` to `ncv` vectors by
+/// Arnoldi with full reorthogonalization, computes the real Schur form `H = Q·T·Qᵀ`, and tests
+/// every wanted Ritz pair with ARPACK's `dnconv`: `|β·y_last| ≤ tol·max(|θ|, ε^(2/3))`
+/// (floored at [`krylov_estimate_floor`]), with `y` the unit eigenvector of `H`. If `k` splits a conjugate pair the partner is wanted too
+/// (`dngets`). Otherwise the Schur form is reordered (LAPACK `dtrexc`-style block swaps) so
+/// the `k' + min(nconv, (ncv − k')/2)` most wanted eigenvalues — converged ones first — lead,
+/// the basis is truncated to their Schur vectors `V·Q₁` (an exact invariant subspace of `H`,
+/// so the decomposition stays a Krylov decomposition), and the leading converged blocks whose
+/// residual couplings are below tolerance are deflated. At most `settings.max_iter` cycles.
+fn general_krylov_schur<F>(
+    mut op: F,
+    mass: Option<&CsrMatrix>,
+    n: usize,
+    k: usize,
+    settings: &KrylovSettings,
+    v0: Option<&[f64]>,
+    force_range: bool,
+) -> SparseResult<GeneralRitz>
+where
+    F: FnMut(&[f64], &[f64]) -> SparseResult<Vec<f64>>,
+{
+    let m = settings.ncv.clamp(1, n);
+    let eps23 = arpack_eps23();
+    let tol = settings.tol;
+    let mut applications = 0_usize;
+    let mut basis = KrylovBasis::new(n, mass);
+    krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
+
+    // The projected matrix, row-major m×m (upper Hessenberg plus the restart's spike row).
+    let mut h = vec![0.0_f64; m * m];
+    let mut iterations = 0_usize;
+    loop {
+        iterations += 1;
+        let (beta, next) = krylov_extend(
+            &mut basis,
+            &mut op,
+            m,
+            &mut applications,
+            |j, coeff, sub| {
+                for (i, &c) in coeff.iter().enumerate() {
+                    h[i * m + j] = c;
+                }
+                if j + 1 < m {
+                    h[(j + 1) * m + j] = sub;
+                }
+            },
+        )?;
+        let size = basis.len();
+        let projected = DMatrix::from_fn(size, size, |i, j| h[i * m + j]);
+        let Some(mut schur) = RealSchur::new(projected) else {
+            let partial = EigsResult {
+                iterations,
+                ncv: m,
+                ..EigsResult::default()
+            };
+            return Err(eigs_no_convergence(iterations, 0, k, partial));
+        };
+        let values = schur.values();
+        let order = general_order(&values, settings.which);
+        let mut wanted = k.min(values.len());
+        if wanted > 0
+            && wanted < order.len()
+            && values[order[wanted - 1]].block == values[order[wanted]].block
+        {
+            wanted += 1;
+        }
+        // Unit eigenvectors of H for the wanted values, and their couplings to the residual.
+        let ritz: Vec<(Vec<(f64, f64)>, (f64, f64))> = order[..wanted]
+            .iter()
+            .map(|&r| {
+                let y = schur.projected_eigenvector(values[r]);
+                let last = y.last().copied().unwrap_or((0.0, 0.0));
+                (y, (beta * last.0, beta * last.1))
+            })
+            .collect();
+        let floor = krylov_estimate_floor(size, values.iter().map(|v| v.re.hypot(v.im)));
+        let passes = |idx: usize| {
+            let (_, c) = &ritz[idx];
+            let v = values[order[idx]];
+            c.0.hypot(c.1) <= (tol * v.re.hypot(v.im).max(eps23)).max(floor)
+        };
+        let nconv = (0..wanted).filter(|&i| passes(i)).count();
+        let finished = (wanted >= k && nconv == wanted) || size <= wanted;
+
+        let (next_v, next_bv) = match next {
+            Some(direction) if !finished && iterations < settings.max_iter => direction,
+            last => {
+                let mut out = GeneralRitz {
+                    theta: Vec::with_capacity(wanted),
+                    vectors: Vec::with_capacity(wanted),
+                    coupling: Vec::with_capacity(wanted),
+                    converged: Vec::with_capacity(wanted),
+                    block: Vec::with_capacity(wanted),
+                    next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
+                    iterations,
+                    applications,
+                };
+                let columns: Vec<Vec<f64>> = ritz
+                    .iter()
+                    .flat_map(|(y, _)| {
+                        [
+                            (0..size).map(|j| y[j].0).collect(),
+                            (0..size).map(|j| y[j].1).collect(),
+                        ]
+                    })
+                    .collect();
+                let mut parts = basis.combine_many(size, &columns).into_iter();
+                for (idx, (_, c)) in ritz.iter().enumerate() {
+                    let value = values[order[idx]];
+                    let (mut xr, _) = parts.next().unwrap_or_default();
+                    let (mut xi, _) = parts.next().unwrap_or_default();
+                    complex_b_normalize(&mut xr, &mut xi, mass);
+                    out.theta.push((value.re, value.im));
+                    out.vectors.push((xr, xi));
+                    out.coupling.push(*c);
+                    out.converged.push(passes(idx));
+                    out.block.push(value.block);
+                }
+                return Ok(out);
+            }
+        };
+
+        // Restart: keep the most wanted blocks (ARPACK dnaup2's nev adjustment), converged
+        // ones first so that they can be deflated.
+        let mut keep_target = wanted + nconv.min((size - wanted) / 2);
+        if keep_target == 1 && size >= 6 {
+            keep_target = size / 2;
+        } else if keep_target == 1 && size > 2 {
+            keep_target = 2;
+        }
+        let converged_blocks: Vec<usize> = (0..wanted)
+            .filter(|&i| passes(i))
+            .map(|i| values[order[i]].block)
+            .collect();
+        let mut ranked: Vec<usize> = Vec::with_capacity(values.len());
+        for &block in converged_blocks
+            .iter()
+            .chain(order.iter().map(|&r| &values[r].block))
+        {
+            if !ranked.contains(&block) {
+                ranked.push(block);
+            }
+        }
+        let mut chosen: Vec<usize> = Vec::new();
+        let mut count = 0_usize;
+        for block in ranked {
+            if count >= keep_target {
+                break;
+            }
+            count += schur.block_size(block);
+            chosen.push(block);
+        }
+        while count > size - 1 {
+            match chosen.pop() {
+                Some(block) => count -= schur.block_size(block),
+                None => break,
+            }
+        }
+        let moved = schur.move_to_front(&chosen);
+        // A refused swap (nearly equal eigenvalues) leaves a shorter prefix; any leading set of
+        // Schur blocks is still an invariant subspace, so the restart stays exact.
+        let keep = if moved == 0 {
+            schur.blocks.first().map_or(1, |b| b.1)
+        } else {
+            moved
+        };
+
+        let mut new_v = Vec::with_capacity(m + 1);
+        let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
+        let columns: Vec<Vec<f64>> = (0..keep)
+            .map(|s| (0..size).map(|j| schur.q[(j, s)]).collect())
+            .collect();
+        for (x, bx) in basis.combine_many(size, &columns) {
+            new_v.push(x);
+            if let Some(bx) = bx {
+                new_bv.push(bx);
+            }
+        }
+        h.fill(0.0);
+        for i in 0..keep {
+            for j in 0..keep {
+                h[i * m + j] = schur.t[(i, j)];
+            }
+        }
+        for s in 0..keep {
+            h[keep * m + s] = beta * schur.q[(size - 1, s)];
+        }
+        // Deflation (locking): a leading converged block whose couplings to the residual are
+        // below tolerance is decoupled, so it stays an exact invariant subspace of H.
+        for (pos, &(start, bsize)) in schur.blocks.iter().enumerate() {
+            if start + bsize > keep || !converged_blocks.contains(&schur.ids[pos]) {
+                break;
+            }
+            let magnitude = schur
+                .block_values((start, bsize))
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.0.hypot(v.1)));
+            let spike =
+                (start..start + bsize).fold(0.0_f64, |acc, s| acc.max(h[keep * m + s].abs()));
+            if spike > (tol * magnitude.max(eps23)).max(floor) {
+                break;
+            }
+            for s in start..start + bsize {
+                h[keep * m + s] = 0.0;
+            }
+        }
+        basis.replace(new_v, new_bv);
+        basis.push(next_v, next_bv);
     }
-    if m == 1 {
-        return vec![(h[0][0], 0.0)];
+}
+
+/// A real Schur decomposition `H = Q·T·Qᵀ` of a small dense matrix, `T` quasi-upper-triangular:
+/// 1×1 diagonal blocks for real eigenvalues and 2×2 blocks for complex-conjugate pairs.
+struct RealSchur {
+    t: DMatrix<f64>,
+    q: DMatrix<f64>,
+    /// `(start, size)` of each diagonal block, top to bottom.
+    blocks: Vec<(usize, usize)>,
+    /// A stable id per block that follows it through reordering.
+    ids: Vec<usize>,
+}
+
+impl RealSchur {
+    /// Householder reduction to Hessenberg form, then the Francis double-shift QR with
+    /// accumulated transformations (EISPACK `orthes` + the Schur part of `hqr2`, as in JAMA).
+    /// `None` when the QR iteration does not converge.
+    fn new(mut h: DMatrix<f64>) -> Option<Self> {
+        let mut q = hessenberg_reduce(&mut h);
+        let blocks = francis_real_schur(&mut h, &mut q)?;
+        let ids = (0..blocks.len()).collect();
+        Some(Self {
+            t: h,
+            q,
+            blocks,
+            ids,
+        })
     }
 
-    // Working copy of the m×m submatrix.
-    let mut a = vec![vec![0.0f64; m]; m];
-    for (ai, hi) in a.iter_mut().zip(h.iter()).take(m) {
-        ai[..m].copy_from_slice(&hi[..m]);
+    fn block_size(&self, id: usize) -> usize {
+        self.ids
+            .iter()
+            .position(|&b| b == id)
+            .map_or(0, |pos| self.blocks[pos].1)
     }
 
-    let mut wr = vec![0.0f64; m];
-    let mut wi = vec![0.0f64; m];
-
-    // |a|-style norm used by the subdiagonal-negligibility and exceptional-shift
-    // tests (NR `anorm`).
-    let mut anorm = 0.0f64;
-    for i in 0..m {
-        let start = i.saturating_sub(1);
-        for j in start..m {
-            anorm += a[i][j].abs();
+    /// The eigenvalues of the diagonal block `(start, size)`, positive imaginary part first.
+    fn block_values(&self, (start, size): (usize, usize)) -> Vec<(f64, f64)> {
+        if size == 1 {
+            return vec![(self.t[(start, start)], 0.0)];
+        }
+        let (a, b) = (self.t[(start, start)], self.t[(start, start + 1)]);
+        let (c, d) = (self.t[(start + 1, start)], self.t[(start + 1, start + 1)]);
+        let p = 0.5 * (a - d);
+        let disc = p * p + b * c;
+        let mid = 0.5 * (a + d);
+        if disc >= 0.0 {
+            // Rounding can leave a real pair in a 2×2 block after a swap.
+            let r = disc.sqrt();
+            vec![(mid + r, 0.0), (mid - r, 0.0)]
+        } else {
+            let im = (-disc).sqrt();
+            vec![(mid, im), (mid, -im)]
         }
     }
 
-    // sign(x, y) = |x| with the sign of y.
-    let sign = |x: f64, y: f64| if y >= 0.0 { x.abs() } else { -x.abs() };
-
-    let max_its = max_iter.max(30);
-    let mut nn: isize = m as isize - 1; // current active bottom-right index
-    let mut t = 0.0f64; // accumulated exceptional-shift origin
-
-    while nn >= 0 {
-        let mut its = 0usize;
-        loop {
-            // Find a small subdiagonal element to split off a sub-block.
-            let mut l = nn;
-            while l >= 1 {
-                let lu = l as usize;
-                let mut s = a[lu - 1][lu - 1].abs() + a[lu][lu].abs();
-                if s == 0.0 {
-                    s = anorm;
-                }
-                if a[lu][lu - 1].abs() + s == s {
-                    a[lu][lu - 1] = 0.0;
-                    break;
-                }
-                l -= 1;
+    fn values(&self) -> Vec<SchurValue> {
+        let mut out = Vec::with_capacity(self.t.nrows());
+        for (pos, &block) in self.blocks.iter().enumerate() {
+            for (re, im) in self.block_values(block) {
+                out.push(SchurValue {
+                    re,
+                    im,
+                    block: self.ids[pos],
+                });
             }
+        }
+        out
+    }
 
-            let x = a[nn as usize][nn as usize];
-            if l == nn {
-                // One real root.
-                wr[nn as usize] = x + t;
-                wi[nn as usize] = 0.0;
-                nn -= 1;
+    /// The unit eigenvector `Q·z` of `H` for `value`, with `z` from complex back substitution
+    /// on the quasi-triangular `T` (LAPACK `dtrevc`; a tiny pivot is replaced by `smin`).
+    fn projected_eigenvector(&self, value: SchurValue) -> Vec<(f64, f64)> {
+        let s = self.t.nrows();
+        let mut z = vec![(0.0_f64, 0.0_f64); s];
+        let Some(pos) = self.ids.iter().position(|&id| id == value.block) else {
+            return z;
+        };
+        let lambda = (value.re, value.im);
+        let t_max = self.t.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+        let smin = (f64::EPSILON * (lambda.0.abs() + lambda.1.abs()))
+            .max(f64::EPSILON * t_max)
+            .max(f64::MIN_POSITIVE);
+        let (start, size) = self.blocks[pos];
+        if size == 1 {
+            z[start] = (1.0, 0.0);
+        } else {
+            // (B − λI)·z = 0 for the 2×2 block B = [a b; c d]: z = [b, λ − a] or [λ − d, c].
+            let (a, b) = (self.t[(start, start)], self.t[(start, start + 1)]);
+            let (c, d) = (self.t[(start + 1, start)], self.t[(start + 1, start + 1)]);
+            let first = [(b, 0.0), (lambda.0 - a, lambda.1)];
+            let second = [(lambda.0 - d, lambda.1), (c, 0.0)];
+            let size_of = |v: &[(f64, f64); 2]| v[0].0.hypot(v[0].1).hypot(v[1].0.hypot(v[1].1));
+            let chosen = if size_of(&first) >= size_of(&second) {
+                first
+            } else {
+                second
+            };
+            z[start] = chosen[0];
+            z[start + 1] = chosen[1];
+        }
+        let end = start + size;
+        for bi in (0..pos).rev() {
+            let (bs, bsz) = self.blocks[bi];
+            let rhs = |row: usize, z: &[(f64, f64)]| {
+                let mut acc = (0.0, 0.0);
+                for (l, zl) in z.iter().enumerate().take(end).skip(bs + bsz) {
+                    acc.0 -= self.t[(row, l)] * zl.0;
+                    acc.1 -= self.t[(row, l)] * zl.1;
+                }
+                acc
+            };
+            if bsz == 1 {
+                let mut den = (self.t[(bs, bs)] - lambda.0, -lambda.1);
+                if den.0.hypot(den.1) < smin {
+                    den = (smin, 0.0);
+                }
+                z[bs] = complex_div(rhs(bs, &z), den);
+            } else {
+                let (r0, r1) = (rhs(bs, &z), rhs(bs + 1, &z));
+                let a00 = (self.t[(bs, bs)] - lambda.0, -lambda.1);
+                let a01 = (self.t[(bs, bs + 1)], 0.0);
+                let a10 = (self.t[(bs + 1, bs)], 0.0);
+                let a11 = (self.t[(bs + 1, bs + 1)] - lambda.0, -lambda.1);
+                let prod = complex_mul(a00, a11);
+                let cross = complex_mul(a01, a10);
+                let mut det = (prod.0 - cross.0, prod.1 - cross.1);
+                let scale = [a00, a01, a10, a11]
+                    .iter()
+                    .fold(0.0_f64, |acc, v| acc.max(v.0.hypot(v.1)));
+                if det.0.hypot(det.1) < smin * scale.max(smin) {
+                    det = (smin * scale.max(smin), 0.0);
+                }
+                let n0 = {
+                    let (p, q) = (complex_mul(r0, a11), complex_mul(a01, r1));
+                    (p.0 - q.0, p.1 - q.1)
+                };
+                let n1 = {
+                    let (p, q) = (complex_mul(a00, r1), complex_mul(a10, r0));
+                    (p.0 - q.0, p.1 - q.1)
+                };
+                z[bs] = complex_div(n0, det);
+                z[bs + 1] = complex_div(n1, det);
+            }
+            let z_max = z
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.0.abs().max(v.1.abs())));
+            if z_max > 1e100 {
+                for v in &mut z {
+                    v.0 /= z_max;
+                    v.1 /= z_max;
+                }
+            }
+        }
+        let mut y = vec![(0.0_f64, 0.0_f64); s];
+        for (i, yi) in y.iter_mut().enumerate() {
+            for (j, zj) in z.iter().enumerate() {
+                let qij = self.q[(i, j)];
+                yi.0 += qij * zj.0;
+                yi.1 += qij * zj.1;
+            }
+        }
+        let norm = y.iter().map(|v| v.0 * v.0 + v.1 * v.1).sum::<f64>().sqrt();
+        if norm > 0.0 && norm.is_finite() {
+            for v in &mut y {
+                v.0 /= norm;
+                v.1 /= norm;
+            }
+        }
+        y
+    }
+
+    /// Moves the blocks with ids `targets` to the top of `T`, in that order, by adjacent swaps
+    /// (LAPACK `dtrsen`/`dtrexc`). Returns the number of leading columns now holding target
+    /// blocks; stops at the first swap refused as unstable.
+    fn move_to_front(&mut self, targets: &[usize]) -> usize {
+        let mut placed = 0_usize;
+        let mut columns = 0_usize;
+        for &target in targets {
+            let Some(mut pos) = self.ids.iter().position(|&id| id == target) else {
+                continue;
+            };
+            while pos > placed {
+                let (start, p) = self.blocks[pos - 1];
+                let q = self.blocks[pos].1;
+                if !schur_swap_adjacent(&mut self.t, &mut self.q, start, p, q) {
+                    return columns;
+                }
+                self.blocks[pos - 1] = (start, q);
+                self.blocks[pos] = (start + q, p);
+                self.ids.swap(pos - 1, pos);
+                pos -= 1;
+            }
+            columns += self.blocks[placed].1;
+            placed += 1;
+        }
+        columns
+    }
+}
+
+/// Householder reduction of `h` to upper Hessenberg form in place, returning the orthogonal
+/// `V` with `H_in = V·H_out·Vᵀ` (EISPACK `orthes` + `ortran`, as in JAMA).
+fn hessenberg_reduce(h: &mut DMatrix<f64>) -> DMatrix<f64> {
+    let n = h.nrows();
+    let mut v = DMatrix::<f64>::identity(n, n);
+    if n < 3 {
+        return v;
+    }
+    let high = n - 1;
+    let mut ort = vec![0.0_f64; n];
+    for m in 1..high {
+        let scale: f64 = (m..=high).map(|i| h[(i, m - 1)].abs()).sum();
+        if scale == 0.0 {
+            continue;
+        }
+        let mut hh = 0.0;
+        for i in (m..=high).rev() {
+            ort[i] = h[(i, m - 1)] / scale;
+            hh += ort[i] * ort[i];
+        }
+        let mut g = hh.sqrt();
+        if ort[m] > 0.0 {
+            g = -g;
+        }
+        hh -= ort[m] * g;
+        ort[m] -= g;
+        for j in m..n {
+            let mut f = 0.0;
+            for i in (m..=high).rev() {
+                f += ort[i] * h[(i, j)];
+            }
+            f /= hh;
+            for i in m..=high {
+                h[(i, j)] -= f * ort[i];
+            }
+        }
+        for i in 0..=high {
+            let mut f = 0.0;
+            for j in (m..=high).rev() {
+                f += ort[j] * h[(i, j)];
+            }
+            f /= hh;
+            for j in m..=high {
+                h[(i, j)] -= f * ort[j];
+            }
+        }
+        ort[m] *= scale;
+        h[(m, m - 1)] = scale * g;
+    }
+    for m in (1..high).rev() {
+        if h[(m, m - 1)] == 0.0 {
+            continue;
+        }
+        for i in (m + 1)..=high {
+            ort[i] = h[(i, m - 1)];
+        }
+        for j in m..=high {
+            let mut g = 0.0;
+            for i in m..=high {
+                g += ort[i] * v[(i, j)];
+            }
+            // Double division avoids a possible underflow.
+            g = (g / ort[m]) / h[(m, m - 1)];
+            for i in m..=high {
+                v[(i, j)] += g * ort[i];
+            }
+        }
+    }
+    // The Householder vectors lived below the subdiagonal.
+    for j in 0..n {
+        for i in (j + 2)..n {
+            h[(i, j)] = 0.0;
+        }
+    }
+    v
+}
+
+/// The Francis double-shift QR on the upper Hessenberg `h`, accumulating into `z`, until `h` is
+/// quasi-upper-triangular (the Schur part of EISPACK `hqr2` as in JAMA, with Wilkinson's and
+/// MATLAB's exceptional shifts). A 2×2 block with real eigenvalues is split by a rotation, so
+/// every 2×2 block left holds a complex-conjugate pair. Returns the blocks top to bottom, or
+/// `None` after `30·max(10, n)` iterations on one eigenvalue.
+fn francis_real_schur(h: &mut DMatrix<f64>, z: &mut DMatrix<f64>) -> Option<Vec<(usize, usize)>> {
+    let nn = h.nrows();
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    if nn == 0 {
+        return Some(blocks);
+    }
+    let eps = f64::EPSILON;
+    let max_its = 30 * nn.max(10);
+    let mut exshift = 0.0_f64;
+    let mut norm = 0.0_f64;
+    for i in 0..nn {
+        for j in i.saturating_sub(1)..nn {
+            norm += h[(i, j)].abs();
+        }
+    }
+    let mut n = nn as isize - 1;
+    let mut iter = 0_usize;
+    while n >= 0 {
+        let nu = n as usize;
+        // Look for a single small subdiagonal element.
+        let mut l = nu;
+        while l > 0 {
+            let mut s = h[(l - 1, l - 1)].abs() + h[(l, l)].abs();
+            if s == 0.0 {
+                s = norm;
+            }
+            if h[(l, l - 1)].abs() < eps * s {
+                h[(l, l - 1)] = 0.0;
                 break;
             }
-
-            let y = a[(nn - 1) as usize][(nn - 1) as usize];
-            let w = a[nn as usize][(nn - 1) as usize] * a[(nn - 1) as usize][nn as usize];
-            if l == nn - 1 {
-                // A 2×2 block: solve its characteristic quadratic directly.
-                let p = 0.5 * (y - x);
-                let q = p * p + w;
-                let z = q.abs().sqrt();
-                let xb = x + t;
-                if q >= 0.0 {
-                    // Real eigenvalue pair.
-                    let zr = p + sign(z, p);
-                    wr[(nn - 1) as usize] = xb + zr;
-                    wr[nn as usize] = if zr != 0.0 { xb - w / zr } else { xb + zr };
-                    wi[(nn - 1) as usize] = 0.0;
-                    wi[nn as usize] = 0.0;
-                } else {
-                    // Complex-conjugate pair re ± im·i.
-                    wr[(nn - 1) as usize] = xb + p;
-                    wr[nn as usize] = xb + p;
-                    wi[(nn - 1) as usize] = -z;
-                    wi[nn as usize] = z;
+            l -= 1;
+        }
+        if l == nu {
+            // One real root.
+            h[(nu, nu)] += exshift;
+            blocks.push((nu, 1));
+            n -= 1;
+            iter = 0;
+        } else if l + 1 == nu {
+            // Two roots.
+            let w = h[(nu, nu - 1)] * h[(nu - 1, nu)];
+            let p = (h[(nu - 1, nu - 1)] - h[(nu, nu)]) / 2.0;
+            let q = p * p + w;
+            h[(nu, nu)] += exshift;
+            h[(nu - 1, nu - 1)] += exshift;
+            if q >= 0.0 {
+                // A real pair: split it with a rotation.
+                let zz = if p >= 0.0 { p + q.sqrt() } else { p - q.sqrt() };
+                let x = h[(nu, nu - 1)];
+                let s = x.abs() + zz.abs();
+                let (mut pr, mut qr) = (x / s, zz / s);
+                let r = (pr * pr + qr * qr).sqrt();
+                pr /= r;
+                qr /= r;
+                for j in (nu - 1)..nn {
+                    let t = h[(nu - 1, j)];
+                    h[(nu - 1, j)] = qr * t + pr * h[(nu, j)];
+                    h[(nu, j)] = qr * h[(nu, j)] - pr * t;
                 }
-                nn -= 2;
-                break;
-            }
-
-            if its >= max_its {
-                // Non-convergence backstop: deflate one real root and continue,
-                // rather than aborting as NR does.
-                wr[nn as usize] = x + t;
-                wi[nn as usize] = 0.0;
-                nn -= 1;
-                break;
-            }
-
-            // Form the (double) shift.
-            let mut xs = x;
-            let mut ys = y;
-            let mut ws = w;
-            if its == 10 || its == 20 {
-                // Exceptional shift to break a cycle.
-                t += xs;
-                for i in 0..=(nn as usize) {
-                    a[i][i] -= xs;
+                for i in 0..=nu {
+                    let t = h[(i, nu - 1)];
+                    h[(i, nu - 1)] = qr * t + pr * h[(i, nu)];
+                    h[(i, nu)] = qr * h[(i, nu)] - pr * t;
                 }
-                let s = a[nn as usize][(nn - 1) as usize].abs()
-                    + a[(nn - 1) as usize][(nn - 2) as usize].abs();
-                xs = 0.75 * s;
-                ys = xs;
-                ws = -0.4375 * s * s;
+                for i in 0..nn {
+                    let t = z[(i, nu - 1)];
+                    z[(i, nu - 1)] = qr * t + pr * z[(i, nu)];
+                    z[(i, nu)] = qr * z[(i, nu)] - pr * t;
+                }
+                h[(nu, nu - 1)] = 0.0;
+                blocks.push((nu, 1));
+                blocks.push((nu - 1, 1));
+            } else {
+                blocks.push((nu - 1, 2));
             }
-            its += 1;
-
-            // Locate two consecutive small subdiagonal elements (the bulge start).
-            let mut p = 0.0f64;
-            let mut q = 0.0f64;
-            let mut r = 0.0f64;
-            let mut mm = nn - 2;
-            while mm >= l {
-                let mu = mm as usize;
-                let z = a[mu][mu];
-                let rr = xs - z;
-                let ss = ys - z;
-                p = (rr * ss - ws) / a[mu + 1][mu] + a[mu][mu + 1];
-                q = a[mu + 1][mu + 1] - z - rr - ss;
-                r = a[mu + 2][mu + 1];
+            n -= 2;
+            iter = 0;
+        } else {
+            // No convergence yet: form the shift.
+            let mut x = h[(nu, nu)];
+            let mut y = h[(nu - 1, nu - 1)];
+            let mut w = h[(nu, nu - 1)] * h[(nu - 1, nu)];
+            if iter == 10 {
+                // Wilkinson's original ad hoc shift.
+                exshift += x;
+                for i in 0..=nu {
+                    h[(i, i)] -= x;
+                }
+                let s = h[(nu, nu - 1)].abs() + h[(nu - 1, nu - 2)].abs();
+                x = 0.75 * s;
+                y = x;
+                w = -0.4375 * s * s;
+            }
+            if iter == 30 {
+                // MATLAB's ad hoc shift.
+                let mut s = (y - x) / 2.0;
+                s = s * s + w;
+                if s > 0.0 {
+                    s = s.sqrt();
+                    if y < x {
+                        s = -s;
+                    }
+                    s = x - w / ((y - x) / 2.0 + s);
+                    for i in 0..=nu {
+                        h[(i, i)] -= s;
+                    }
+                    exshift += s;
+                    x = 0.964;
+                    y = x;
+                    w = x;
+                }
+            }
+            iter += 1;
+            if iter > max_its {
+                return None;
+            }
+            // Look for two consecutive small subdiagonal elements.
+            let mut m = nu - 2;
+            let (mut p, mut q, mut r);
+            loop {
+                let zm = h[(m, m)];
+                let rr = x - zm;
+                let ss = y - zm;
+                p = (rr * ss - w) / h[(m + 1, m)] + h[(m, m + 1)];
+                q = h[(m + 1, m + 1)] - zm - rr - ss;
+                r = h[(m + 2, m + 1)];
                 let s = p.abs() + q.abs() + r.abs();
                 p /= s;
                 q /= s;
                 r /= s;
-                if mm == l {
+                if m == l {
                     break;
                 }
-                let u = a[mu][mu - 1].abs() * (q.abs() + r.abs());
-                let vv = p.abs() * (a[mu - 1][mu - 1].abs() + z.abs() + a[mu + 1][mu + 1].abs());
-                if u + vv == vv {
+                if h[(m, m - 1)].abs() * (q.abs() + r.abs())
+                    < eps
+                        * (p.abs() * (h[(m - 1, m - 1)].abs() + zm.abs() + h[(m + 1, m + 1)].abs()))
+                {
                     break;
                 }
-                mm -= 1;
+                m -= 1;
             }
-
-            for i in (mm + 2)..=nn {
-                let iu = i as usize;
-                a[iu][iu - 2] = 0.0;
-                if i != mm + 2 {
-                    a[iu][iu - 3] = 0.0;
+            for i in (m + 2)..=nu {
+                h[(i, i - 2)] = 0.0;
+                if i > m + 2 {
+                    h[(i, i - 3)] = 0.0;
                 }
             }
-
-            // Double-QR sweep (chase the bulge) over rows/cols l..=nn.
-            let mut kk = mm;
-            while kk < nn {
-                let ku = kk as usize;
-                if kk != mm {
-                    p = a[ku][ku - 1];
-                    q = a[ku + 1][ku - 1];
-                    r = 0.0;
-                    if kk != nn - 1 {
-                        r = a[ku + 2][ku - 1];
+            // Double QR step on rows l..=n and columns m..=n.
+            for k in m..nu {
+                let notlast = k + 1 != nu;
+                let mut xk = 0.0;
+                if k != m {
+                    p = h[(k, k - 1)];
+                    q = h[(k + 1, k - 1)];
+                    r = if notlast { h[(k + 2, k - 1)] } else { 0.0 };
+                    xk = p.abs() + q.abs() + r.abs();
+                    if xk == 0.0 {
+                        continue;
                     }
-                    xs = p.abs() + q.abs() + r.abs();
-                    if xs != 0.0 {
-                        p /= xs;
-                        q /= xs;
-                        r /= xs;
-                    }
+                    p /= xk;
+                    q /= xk;
+                    r /= xk;
                 }
-                let s = sign((p * p + q * q + r * r).sqrt(), p);
-                if s != 0.0 {
-                    if kk == mm {
-                        if l != mm {
-                            a[ku][ku - 1] = -a[ku][ku - 1];
-                        }
-                    } else {
-                        a[ku][ku - 1] = -s * xs;
-                    }
-                    p += s;
-                    let xp = p / s;
-                    let yp = q / s;
-                    let zp = r / s;
-                    let qp = q / p;
-                    let rp = r / p;
-                    // Row modification.
-                    for j in ku..m {
-                        let mut pp = a[ku][j] + qp * a[ku + 1][j];
-                        if kk != nn - 1 {
-                            pp += rp * a[ku + 2][j];
-                            a[ku + 2][j] -= pp * zp;
-                        }
-                        a[ku + 1][j] -= pp * yp;
-                        a[ku][j] -= pp * xp;
-                    }
-                    let mmin = if nn < kk + 3 { nn } else { kk + 3 };
-                    // Column modification.
-                    for i in (l as usize)..=(mmin as usize) {
-                        let mut pp = xp * a[i][ku] + yp * a[i][ku + 1];
-                        if kk != nn - 1 {
-                            pp += zp * a[i][ku + 2];
-                            a[i][ku + 2] -= pp * rp;
-                        }
-                        a[i][ku + 1] -= pp * qp;
-                        a[i][ku] -= pp;
-                    }
+                let mut s = (p * p + q * q + r * r).sqrt();
+                if p < 0.0 {
+                    s = -s;
                 }
-                kk += 1;
+                if s == 0.0 {
+                    continue;
+                }
+                if k != m {
+                    h[(k, k - 1)] = -s * xk;
+                } else if l != m {
+                    h[(k, k - 1)] = -h[(k, k - 1)];
+                }
+                p += s;
+                let (xx, yy, zz) = (p / s, q / s, r / s);
+                let (qq, rr) = (q / p, r / p);
+                for j in k..nn {
+                    let mut pp = h[(k, j)] + qq * h[(k + 1, j)];
+                    if notlast {
+                        pp += rr * h[(k + 2, j)];
+                        h[(k + 2, j)] -= pp * zz;
+                    }
+                    h[(k, j)] -= pp * xx;
+                    h[(k + 1, j)] -= pp * yy;
+                }
+                for i in 0..=nu.min(k + 3) {
+                    let mut pp = xx * h[(i, k)] + yy * h[(i, k + 1)];
+                    if notlast {
+                        pp += zz * h[(i, k + 2)];
+                        h[(i, k + 2)] -= pp * rr;
+                    }
+                    h[(i, k)] -= pp;
+                    h[(i, k + 1)] -= pp * qq;
+                }
+                for i in 0..nn {
+                    let mut pp = xx * z[(i, k)] + yy * z[(i, k + 1)];
+                    if notlast {
+                        pp += zz * z[(i, k + 2)];
+                        z[(i, k + 2)] -= pp * rr;
+                    }
+                    z[(i, k)] -= pp;
+                    z[(i, k + 1)] -= pp * qq;
+                }
             }
         }
     }
-
-    (0..m).map(|i| (wr[i], wi[i])).collect()
+    blocks.reverse();
+    // Clean the strictly lower part outside the 2×2 blocks.
+    let mut pair_start = vec![false; nn];
+    for &(start, size) in &blocks {
+        pair_start[start] = size == 2;
+    }
+    for j in 0..nn {
+        for i in (j + 1)..nn {
+            if !(i == j + 1 && pair_start[j]) {
+                h[(i, j)] = 0.0;
+            }
+        }
+    }
+    Some(blocks)
 }
 
-/// Complex eigenvector of `H[0..m, 0..m]` for the (possibly complex) eigenvalue
-/// `lambda`: solve `(H - lambda·I) y = 0` by back-substitution against the
-/// subdiagonal with `y[m-1] = 1`. For a real `lambda` and real `H` every component
-/// stays real.
-fn hessenberg_eigenvector_complex(h: &[Vec<f64>], m: usize, lambda: (f64, f64)) -> Vec<(f64, f64)> {
-    if m == 0 {
-        return Vec::new();
-    }
-    if m == 1 {
-        return vec![(1.0, 0.0)];
-    }
-    let (lr, li) = lambda;
-    let mut y = vec![(0.0f64, 0.0f64); m];
-    y[m - 1] = (1.0, 0.0);
-    for rr in (1..m).rev() {
-        // acc = -lambda*y[r] + Σ_{c>=r} h[r][c]*y[c]   (h is real)
-        let yr = y[rr];
-        let mut acc = (-lr * yr.0 + li * yr.1, -lr * yr.1 - li * yr.0);
-        for c in rr..m {
-            acc.0 += h[rr][c] * y[c].0;
-            acc.1 += h[rr][c] * y[c].1;
+/// Swaps the adjacent diagonal blocks of the quasi-triangular `t` that start at column `j`
+/// (sizes `p` then `q`) by an orthogonal similarity accumulated into `z`: LAPACK `dlaexc`'s
+/// direct swap, which solves the Sylvester equation `T₁₁X − XT₂₂ = T₁₂` and takes the QR
+/// factorization of `[−X; I]`. Leaves everything untouched and returns `false` when the
+/// swapped form would not be backward stable (nearly equal eigenvalues), as `dlaexc` refuses.
+fn schur_swap_adjacent(
+    t: &mut DMatrix<f64>,
+    z: &mut DMatrix<f64>,
+    j: usize,
+    p: usize,
+    q: usize,
+) -> bool {
+    let s = p + q;
+    let nrow = t.nrows();
+    let d = t.view((j, j), (s, s)).clone_owned();
+    let d_max = d.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+    let eps = f64::EPSILON;
+    let thresh = (10.0 * eps * d_max).max(f64::MIN_POSITIVE);
+    // Kronecker form of T₁₁X − XT₂₂ = T₁₂ for the column-major vec(X), X p×q.
+    let dim = p * q;
+    let mut kron = DMatrix::<f64>::zeros(dim, dim);
+    let mut rhs = DVector::<f64>::zeros(dim);
+    for c in 0..q {
+        for r in 0..p {
+            let row = c * p + r;
+            rhs[row] = d[(r, p + c)];
+            for cc in 0..q {
+                for rr in 0..p {
+                    let mut val = 0.0;
+                    if c == cc {
+                        val += d[(r, rr)];
+                    }
+                    if r == rr {
+                        val -= d[(p + cc, p + c)];
+                    }
+                    kron[(row, cc * p + rr)] = val;
+                }
+            }
         }
-        let sub = h[rr][rr - 1];
-        if sub.abs() < f64::MIN_POSITIVE {
-            // Decoupled block: leave the remaining components at zero.
-            break;
-        }
-        y[rr - 1] = (-acc.0 / sub, -acc.1 / sub);
     }
-    y
+    let smin = (eps * d_max).max(f64::MIN_POSITIVE);
+    let x = solve_small_perturbed(kron, rhs, smin);
+    // [−X, I_p; I_q, 0]: its Q's first q columns span [−X; I_q], the T₂₂ invariant subspace.
+    let mut basis = DMatrix::<f64>::zeros(s, s);
+    for r in 0..p {
+        for c in 0..q {
+            basis[(r, c)] = -x[c * p + r];
+        }
+        basis[(r, q + r)] = 1.0;
+    }
+    for c in 0..q {
+        basis[(p + c, c)] = 1.0;
+    }
+    let rot = basis.qr().q();
+    let swapped = rot.transpose() * &d * &rot;
+    let mut lower = 0.0_f64;
+    for r in q..s {
+        for c in 0..q {
+            lower = lower.max(swapped[(r, c)].abs());
+        }
+    }
+    if !(lower <= thresh) {
+        return false;
+    }
+    let rows = t.view((j, j), (s, nrow - j)).clone_owned();
+    t.view_mut((j, j), (s, nrow - j))
+        .copy_from(&(rot.transpose() * rows));
+    let cols = t.view((0, j), (j + s, s)).clone_owned();
+    t.view_mut((0, j), (j + s, s)).copy_from(&(cols * &rot));
+    let z_cols = z.view((0, j), (nrow, s)).clone_owned();
+    z.view_mut((0, j), (nrow, s)).copy_from(&(z_cols * &rot));
+    // The block below the new leading block is zero to within `thresh`; make it exact.
+    for r in (j + q)..(j + s) {
+        for c in j..(j + q) {
+            t[(r, c)] = 0.0;
+        }
+    }
+    true
+}
+
+/// Solves the small system `a·x = b` by Gaussian elimination with partial pivoting, replacing a
+/// pivot below `smin` by `±smin` (LAPACK `dlasy2`'s perturbation for a nearly singular
+/// Sylvester operator).
+fn solve_small_perturbed(mut a: DMatrix<f64>, mut b: DVector<f64>, smin: f64) -> DVector<f64> {
+    let n = a.nrows();
+    for col in 0..n {
+        let pivot = (col..n)
+            .max_by(|&i, &j| a[(i, col)].abs().total_cmp(&a[(j, col)].abs()))
+            .unwrap_or(col);
+        if pivot != col {
+            a.swap_rows(pivot, col);
+            b.swap_rows(pivot, col);
+        }
+        if a[(col, col)].abs() < smin {
+            a[(col, col)] = if a[(col, col)] < 0.0 { -smin } else { smin };
+        }
+        for r in (col + 1)..n {
+            let f = a[(r, col)] / a[(col, col)];
+            if f != 0.0 {
+                for c in col..n {
+                    a[(r, c)] -= f * a[(col, c)];
+                }
+                b[r] -= f * b[col];
+            }
+        }
+    }
+    let mut x = DVector::<f64>::zeros(n);
+    for r in (0..n).rev() {
+        let mut acc = b[r];
+        for c in (r + 1)..n {
+            acc -= a[(r, c)] * x[c];
+        }
+        x[r] = acc / a[(r, r)];
+    }
+    x
+}
+
+#[cfg(test)]
+mod krylov_eigen_tests {
+    use super::*;
+
+    fn laplacian_1d(n: usize) -> CsrMatrix {
+        let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            vals.push(2.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                vals.extend([-1.0, -1.0]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// Exact eigenvalues of `tridiag(-1, 2, -1)`, ascending: `2 − 2cos(jπ/(n+1))`.
+    fn laplacian_eigenvalues(n: usize) -> Vec<f64> {
+        (1..=n)
+            .map(|j| 2.0 - 2.0 * (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos())
+            .collect()
+    }
+
+    fn csr(n: usize, vals: Vec<f64>, rows: Vec<usize>, cols: Vec<usize>) -> CsrMatrix {
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn diagonal(d: &[f64]) -> CsrMatrix {
+        let idx: Vec<usize> = (0..d.len()).collect();
+        csr(d.len(), d.to_vec(), idx.clone(), idx)
+    }
+
+    /// Ten eigenvalues in [1, 1 + 9e-9] above a spread in [0.01, 0.9].
+    fn clustered_diag(n: usize) -> CsrMatrix {
+        let mut d: Vec<f64> = (0..10).map(|i| 1.0 + 1e-9 * i as f64).collect();
+        let rest = n - 10;
+        for i in 0..rest {
+            d.push(0.01 + (0.9 - 0.01) * i as f64 / (rest - 1) as f64);
+        }
+        diagonal(&d)
+    }
+
+    /// Linear finite elements for `−u'' = λu` on (0, 1) with `n` interior nodes: stiffness
+    /// `K = tridiag(−1, 2, −1)/h`, mass `M = h·tridiag(1, 4, 1)/6`, and the exact generalized
+    /// eigenvalues `(6/h²)(1 − cos θ_j)/(2 + cos θ_j)`, `θ_j = jπ/(n+1)`, ascending.
+    fn fem_pair(n: usize) -> (CsrMatrix, CsrMatrix, Vec<f64>) {
+        let h = 1.0 / (n + 1) as f64;
+        let (mut kv, mut mv, mut rows, mut cols) = (vec![], vec![], vec![], vec![]);
+        for i in 0..n {
+            kv.push(2.0 / h);
+            mv.push(4.0 * h / 6.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                kv.extend([-1.0 / h, -1.0 / h]);
+                mv.extend([h / 6.0, h / 6.0]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        let exact = (1..=n)
+            .map(|j| {
+                let c = (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos();
+                6.0 / (h * h) * (1.0 - c) / (2.0 + c)
+            })
+            .collect();
+        (
+            csr(n, kv, rows.clone(), cols.clone()),
+            csr(n, mv, rows, cols),
+            exact,
+        )
+    }
+
+    /// A normal nonsymmetric matrix with known eigenvalues: 2×2 blocks `[[a, b], [−b, a]]`
+    /// (eigenvalues `a ± ib`) on a spread where the real part rises as the imaginary part falls,
+    /// scattered by a fixed permutation similarity.
+    /// With `reals` real eigenvalues `0.2 + 0.13·i` to the left of the pairs (the smallest
+    /// magnitudes and real parts).
+    fn normal_nonsymmetric(pairs: usize, reals: usize) -> (CsrMatrix, Vec<(f64, f64)>) {
+        let n = 2 * pairs + reals;
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut state = 0x5DEE_CE66_D1CE_u64;
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            perm.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        let (mut vals, mut rows, mut cols, mut exact) = (vec![], vec![], vec![], vec![]);
+        for j in 0..pairs {
+            let a = 1.0 + 0.9 * j as f64;
+            let b = 0.1 + 0.35 * (pairs - j) as f64;
+            let (p, q) = (perm[2 * j], perm[2 * j + 1]);
+            vals.extend([a, b, -b, a]);
+            rows.extend([p, p, q, q]);
+            cols.extend([p, q, p, q]);
+            exact.push((a, b));
+            exact.push((a, -b));
+        }
+        for i in 0..reals {
+            let r = 0.2 + 0.13 * i as f64;
+            let p = perm[2 * pairs + i];
+            vals.push(r);
+            rows.push(p);
+            cols.push(p);
+            exact.push((r, 0.0));
+        }
+        (csr(n, vals, rows, cols), exact)
+    }
+
+    /// `tridiag(−1 − c, 2, −1 + c)`: 1-D convection–diffusion, eigenvalues
+    /// `2 − 2·sqrt(1 − c²)·cos(jπ/(n+1))` (real for |c| < 1), ascending.
+    fn convection_diffusion(n: usize, c: f64) -> (CsrMatrix, Vec<f64>) {
+        let (mut vals, mut rows, mut cols) = (vec![], vec![], vec![]);
+        for i in 0..n {
+            vals.push(2.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < n {
+                vals.extend([-1.0 + c, -1.0 - c]);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
+            }
+        }
+        let s = (1.0 - c * c).sqrt();
+        let exact = (1..=n)
+            .map(|j| 2.0 - 2.0 * s * (j as f64 * std::f64::consts::PI / (n + 1) as f64).cos())
+            .collect();
+        (csr(n, vals, rows, cols), exact)
+    }
+
+    /// The `k` values of the symmetric spectrum `exact` that SciPy's `which` selects (applied to
+    /// `1/(λ − σ)` with a shift), ascending: the definition, written independently of the
+    /// solver's selection code.
+    fn expected_symmetric(
+        exact: &[f64],
+        which: EigsWhich,
+        k: usize,
+        sigma: Option<f64>,
+    ) -> Vec<f64> {
+        let theta = |l: f64| sigma.map_or(l, |s| 1.0 / (l - s));
+        let mut v: Vec<f64> = exact.to_vec();
+        let picked: Vec<f64> = match which {
+            EigsWhich::BothEnds => {
+                v.sort_by(|x, y| theta(*x).total_cmp(&theta(*y)));
+                let low = k / 2;
+                let mut out = v[..low].to_vec();
+                out.extend_from_slice(&v[v.len() - (k - low)..]);
+                out
+            }
+            _ => {
+                let key = |l: f64| match which {
+                    EigsWhich::LargestMagnitude => theta(l).abs(),
+                    EigsWhich::SmallestMagnitude => -theta(l).abs(),
+                    EigsWhich::LargestAlgebraic => theta(l),
+                    _ => -theta(l),
+                };
+                v.sort_by(|x, y| key(*y).total_cmp(&key(*x)));
+                v[..k].to_vec()
+            }
+        };
+        let mut picked = picked;
+        picked.sort_by(f64::total_cmp);
+        picked
+    }
+
+    /// The `k` complex eigenvalues SciPy's `eigs` `which` selects, sorted by (re, im). A pair
+    /// split by `k` contributes its positive-imaginary member.
+    fn expected_general(
+        exact: &[(f64, f64)],
+        which: EigsWhich,
+        k: usize,
+        sigma: Option<f64>,
+    ) -> Vec<(f64, f64)> {
+        let theta = |l: (f64, f64)| match sigma {
+            Some(s) => complex_div((1.0, 0.0), (l.0 - s, l.1)),
+            None => l,
+        };
+        let key = |l: (f64, f64)| {
+            let t = theta(l);
+            match which {
+                EigsWhich::LargestMagnitude => t.0.hypot(t.1),
+                EigsWhich::SmallestMagnitude => -t.0.hypot(t.1),
+                EigsWhich::LargestReal => t.0,
+                EigsWhich::SmallestReal => -t.0,
+                EigsWhich::LargestImaginary => t.1.abs(),
+                _ => -t.1.abs(),
+            }
+        };
+        let mut v = exact.to_vec();
+        v.sort_by(|x, y| {
+            key(*y)
+                .total_cmp(&key(*x))
+                .then_with(|| y.1.total_cmp(&x.1))
+        });
+        let mut picked = v[..k].to_vec();
+        picked.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        picked
+    }
+
+    /// `max_i ‖A x_i − λ_i M x_i‖ / ‖A‖∞` over the returned (complex) pairs.
+    fn max_relative_residual(a: &CsrMatrix, mass: Option<&CsrMatrix>, r: &EigsResult) -> f64 {
+        let a_norm = csr_norm_bound(a);
+        let mut worst = 0.0_f64;
+        for i in 0..r.eigenvalues.len() {
+            let (lr, li) = (r.eigenvalues[i], r.eigenvalues_im[i]);
+            let (xr, xi) = (&r.eigenvectors[i], &r.eigenvectors_im[i]);
+            let (axr, axi) = (csr_matvec(a, xr), csr_matvec(a, xi));
+            let (mxr, mxi) = match mass {
+                Some(m) => (csr_matvec(m, xr), csr_matvec(m, xi)),
+                None => (xr.clone(), xi.clone()),
+            };
+            let mut sq = 0.0;
+            for t in 0..xr.len() {
+                let rr = axr[t] - (lr * mxr[t] - li * mxi[t]);
+                let ri = axi[t] - (lr * mxi[t] + li * mxr[t]);
+                sq += rr * rr + ri * ri;
+            }
+            worst = worst.max(sq.sqrt() / a_norm);
+        }
+        worst
+    }
+
+    /// `max |X^T B X − I|` over the returned real eigenvectors (`B = M` or `I`).
+    fn orthonormality_defect(r: &EigsResult, mass: Option<&CsrMatrix>) -> f64 {
+        let mut worst = 0.0_f64;
+        for (i, xi) in r.eigenvectors.iter().enumerate() {
+            let bxi = mass.map_or_else(|| xi.clone(), |m| csr_matvec(m, xi));
+            for (j, xj) in r.eigenvectors.iter().enumerate() {
+                let target = if i == j { 1.0 } else { 0.0 };
+                worst = worst.max((dot_product(xj, &bxi) - target).abs());
+            }
+        }
+        worst
+    }
+
+    fn max_abs_diff(got: &[f64], want: &[f64]) -> f64 {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        got.iter()
+            .zip(want)
+            .fold(0.0_f64, |acc, (g, w)| acc.max((g - w).abs()))
+    }
+
+    fn sorted_complex(r: &EigsResult) -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = r
+            .eigenvalues
+            .iter()
+            .copied()
+            .zip(r.eigenvalues_im.iter().copied())
+            .collect();
+        v.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        v
+    }
+
+    fn with_which(which: EigsWhich) -> EigsOptions<'static> {
+        EigsOptions {
+            which,
+            ..EigsOptions::default()
+        }
+    }
+
+    #[test]
+    fn eigsh_every_which_and_k_matches_the_laplacian_closed_form() {
+        let n = 300;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        for which in [
+            EigsWhich::LargestMagnitude,
+            EigsWhich::SmallestMagnitude,
+            EigsWhich::LargestAlgebraic,
+            EigsWhich::SmallestAlgebraic,
+            EigsWhich::BothEnds,
+        ] {
+            for k in [1_usize, 6, 20] {
+                if which == EigsWhich::BothEnds && k == 1 {
+                    continue;
+                }
+                let r = eigsh(&a, k, with_which(which)).expect("eigsh converges");
+                let want = expected_symmetric(&exact, which, k, None);
+                let err = max_abs_diff(&r.eigenvalues, &want);
+                let resid = max_relative_residual(&a, None, &r);
+                let ortho = orthonormality_defect(&r, None);
+                println!(
+                    "eigsh {} k={k}: iterations={} nmatvec={} ncv={} max|dλ|={err:e} resid={resid:e} ortho={ortho:e}",
+                    which.scipy_name(),
+                    r.iterations,
+                    r.nmatvec,
+                    r.ncv
+                );
+                assert!(r.converged);
+                assert_eq!(r.ncv, (2 * k + 1).max(20));
+                assert!(
+                    err <= 1e-12,
+                    "{} k={k}: max|dλ| = {err:e}",
+                    which.scipy_name()
+                );
+                assert!(
+                    resid <= 1e-8,
+                    "{} k={k}: residual {resid:e}",
+                    which.scipy_name()
+                );
+                assert!(
+                    ortho <= 1e-12,
+                    "{} k={k}: orthonormality {ortho:e}",
+                    which.scipy_name()
+                );
+                assert!(r.eigenvalues.windows(2).all(|w| w[0] <= w[1]), "ascending");
+            }
+        }
+    }
+
+    // Negative case 1 (frankenscipy-1ksfv.10). Before arm, original code at d46cb9476 (log
+    // scratchpad/eigs/before_arm.log, worker hz2): `EigsOptions` had no `sigma`, and
+    // `eigsh(L2000, k=6)` returned the six largest eigenvalues 3.99988..3.99999 with
+    // converged=false. SciPy 1.17.1: eigsh(k=6, sigma=1.0003, which='LM') returns the six
+    // eigenvalues nearest 1.0003 with max abs error 3.3e-16 against the closed form.
+    #[test]
+    fn eigsh_shift_invert_finds_the_eigenvalues_nearest_sigma() {
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let options = EigsOptions {
+            sigma: Some(1.0003),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&a, 6, options).expect("shift-invert converges");
+        let want = expected_symmetric(&exact, EigsWhich::LargestMagnitude, 6, Some(1.0003));
+        let err = max_abs_diff(&r.eigenvalues, &want);
+        let resid = max_relative_residual(&a, None, &r);
+        println!(
+            "sigma=1.0003: {:?} iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+            r.eigenvalues, r.iterations, r.nmatvec
+        );
+        assert!(err <= 1e-13, "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(orthonormality_defect(&r, None) <= 1e-12);
+        // Must-differ control: without the shift the same call finds the other end.
+        let plain = eigsh(&a, 6, EigsOptions::default()).expect("LM converges");
+        assert!(plain.eigenvalues.iter().all(|&l| l > 3.9));
+        assert!(r.eigenvalues.iter().all(|&l| (l - 1.0003).abs() < 0.01));
+    }
+
+    #[test]
+    fn eigsh_smallest_algebraic_laplacian_2000() {
+        // SciPy 1.17.1: eigsh(k=4, which='SA') max abs error 6.5e-17 against the closed form.
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let r = eigsh(&a, 4, with_which(EigsWhich::SmallestAlgebraic)).expect("SA converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[..4]);
+        let resid = max_relative_residual(&a, None, &r);
+        println!(
+            "SA k=4: {:?} iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+            r.eigenvalues, r.iterations, r.nmatvec
+        );
+        assert!(err <= 1e-13, "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+    }
+
+    #[test]
+    fn eigsh_shift_exactly_at_an_eigenvalue_is_a_singular_factor() {
+        // 2 − 2cos(667π/2001) = 1 exactly, so A − I is singular; SciPy 1.17.1 raises
+        // RuntimeError("Factor is exactly singular").
+        let a = laplacian_1d(2000);
+        let options = EigsOptions {
+            sigma: Some(1.0),
+            ..EigsOptions::default()
+        };
+        let err = eigsh(&a, 6, options).expect_err("sigma on an eigenvalue");
+        println!("sigma=1.0: {err}");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+        let err = eigs(&a, 6, options).expect_err("sigma on an eigenvalue");
+        assert!(matches!(err, SparseError::SingularMatrix { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn eigsh_generalized_fem_pair_is_m_orthonormal() {
+        let n = 400;
+        let (k_mat, m_mat, exact) = fem_pair(n);
+        // Shift-invert at 0: the lowest vibration modes, `eigsh(K, 6, M, sigma=0)`.
+        let low = EigsOptions {
+            sigma: Some(0.0),
+            mass: Some(&m_mat),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&k_mat, 6, low).expect("shift-invert with M converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[..6]);
+        let resid = max_relative_residual(&k_mat, Some(&m_mat), &r);
+        let ortho = orthonormality_defect(&r, Some(&m_mat));
+        println!(
+            "FEM sigma=0: {:?} err={err:e} resid={resid:e} M-ortho={ortho:e}",
+            r.eigenvalues
+        );
+        assert!(err <= 1e-9 * exact[5], "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(ortho <= 1e-12);
+        // Mode 2 (M⁻¹K in the M inner product), the largest end.
+        let high = EigsOptions {
+            mass: Some(&m_mat),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&k_mat, 6, high).expect("mode 2 converges");
+        let err = max_abs_diff(&r.eigenvalues, &exact[n - 6..]);
+        let resid = max_relative_residual(&k_mat, Some(&m_mat), &r);
+        let ortho = orthonormality_defect(&r, Some(&m_mat));
+        println!(
+            "FEM mode 2 LM: iterations={} err={err:e} resid={resid:e} M-ortho={ortho:e}",
+            r.iterations
+        );
+        assert!(err <= 1e-9 * exact[n - 1], "max|dλ| = {err:e}");
+        assert!(resid <= 1e-8);
+        assert!(ortho <= 1e-12);
+    }
+
+    #[test]
+    fn eigs_every_which_and_k_matches_a_normal_matrix() {
+        // SciPy 1.17.1 converges on every (which, k) below; it does not on 'SI' with k = 20
+        // (ArpackNoConvergence after 1201 iterations) or on 'SM' with k = 1 for the pairs-only
+        // matrix, whose smallest-magnitude pair sits on a flat stretch of the spectrum, so those
+        // are not asked for.
+        let mixed = normal_nonsymmetric(55, 10);
+        let pairs = normal_nonsymmetric(60, 0);
+        let plan: [(&(CsrMatrix, Vec<(f64, f64)>), EigsWhich, &[usize]); 6] = [
+            (&mixed, EigsWhich::LargestMagnitude, &[1, 6, 20]),
+            (&mixed, EigsWhich::SmallestMagnitude, &[1, 6, 20]),
+            (&mixed, EigsWhich::LargestReal, &[1, 6, 20]),
+            (&mixed, EigsWhich::SmallestReal, &[1, 6, 20]),
+            (&mixed, EigsWhich::LargestImaginary, &[1, 6, 20]),
+            (&pairs, EigsWhich::SmallestImaginary, &[1, 6]),
+        ];
+        for ((a, exact), which, ks) in plan {
+            for &k in ks {
+                let r = eigs(a, k, with_which(which)).expect("eigs converges");
+                let got = sorted_complex(&r);
+                let want = expected_general(exact, which, k, None);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .fold(0.0_f64, |acc, (g, w)| acc.max((g.0 - w.0).hypot(g.1 - w.1)));
+                let resid = max_relative_residual(a, None, &r);
+                println!(
+                    "eigs {} k={k}: iterations={} nmatvec={} max|dλ|={err:e} resid={resid:e}",
+                    which.scipy_name(),
+                    r.iterations,
+                    r.nmatvec
+                );
+                assert_eq!(got.len(), k);
+                assert!(
+                    err <= 1e-10,
+                    "{} k={k}: {got:?} vs {want:?}",
+                    which.scipy_name()
+                );
+                assert!(
+                    resid <= 1e-8,
+                    "{} k={k}: residual {resid:e}",
+                    which.scipy_name()
+                );
+                // A conjugate pair is adjacent, positive imaginary part first.
+                for i in 0..r.eigenvalues.len() {
+                    if r.eigenvalues_im[i] < 0.0 {
+                        assert!(
+                            i > 0 && r.eigenvalues_im[i - 1] == -r.eigenvalues_im[i],
+                            "unpaired negative member at {i}: {:?}",
+                            r.eigenvalues_im
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eigs_shift_invert_on_nonsymmetric_matrices() {
+        let (a, exact) = normal_nonsymmetric(60, 0);
+        let options = EigsOptions {
+            sigma: Some(20.3),
+            ..EigsOptions::default()
+        };
+        let r = eigs(&a, 6, options).expect("shift-invert converges");
+        let got = sorted_complex(&r);
+        let want = expected_general(&exact, EigsWhich::LargestMagnitude, 6, Some(20.3));
+        let err = got
+            .iter()
+            .zip(&want)
+            .fold(0.0_f64, |acc, (g, w)| acc.max((g.0 - w.0).hypot(g.1 - w.1)));
+        println!("normal sigma=20.3: {got:?} err={err:e}");
+        assert!(err <= 1e-10);
+        assert!(max_relative_residual(&a, None, &r) <= 1e-8);
+
+        // Convection–diffusion (mildly non-normal, real spectrum): nearest to 1.5.
+        let (cd, cd_exact) = convection_diffusion(100, 0.1);
+        let options = EigsOptions {
+            sigma: Some(1.5),
+            ..EigsOptions::default()
+        };
+        let r = eigs(&cd, 6, options).expect("shift-invert converges");
+        let mut got = r.eigenvalues.clone();
+        got.sort_by(f64::total_cmp);
+        let want = expected_symmetric(&cd_exact, EigsWhich::LargestMagnitude, 6, Some(1.5));
+        let err = max_abs_diff(&got, &want);
+        println!("convection-diffusion sigma=1.5: {got:?} err={err:e}");
+        assert!(r.eigenvalues_im.iter().all(|&im| im == 0.0));
+        assert!(err <= 1e-9, "max|dλ| = {err:e}");
+        assert!(max_relative_residual(&cd, None, &r) <= 1e-8);
+        // And the extreme real parts without a shift.
+        for which in [EigsWhich::LargestReal, EigsWhich::SmallestReal] {
+            let r = eigs(&cd, 6, with_which(which)).expect("eigs converges");
+            let mut got = r.eigenvalues.clone();
+            got.sort_by(f64::total_cmp);
+            let want = expected_symmetric(
+                &cd_exact,
+                if which == EigsWhich::LargestReal {
+                    EigsWhich::LargestAlgebraic
+                } else {
+                    EigsWhich::SmallestAlgebraic
+                },
+                6,
+                None,
+            );
+            let err = max_abs_diff(&got, &want);
+            println!(
+                "convection-diffusion {}: err={err:e} iterations={}",
+                which.scipy_name(),
+                r.iterations
+            );
+            assert!(err <= 1e-9, "max|dλ| = {err:e}");
+        }
+    }
+
+    // Negative case 2. Before arm, original code (scratchpad/eigs/before_arm.log): with
+    // max_iter 1 and 3 eigsh and eigs returned Ok with converged=false; with max_iter 1000 eigs
+    // still returned Ok(converged=false) holding [0.99999940, 0.894, 0.843, ...], values that are
+    // not the cluster. SciPy 1.17.1 raises ArpackNoConvergence (0/6 converged) for maxiter 1..10.
+    #[test]
+    fn clustered_spectrum_with_a_small_budget_reports_no_convergence() -> Result<(), String> {
+        let a = clustered_diag(200);
+        let small = EigsOptions {
+            max_iter: 1,
+            ..EigsOptions::default()
+        };
+        for (name, outcome) in [("eigsh", eigsh(&a, 6, small)), ("eigs", eigs(&a, 6, small))] {
+            let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+                return Err(format!(
+                    "{name}: expected EigsNoConvergence, got {outcome:?}"
+                ));
+            };
+            println!(
+                "{name} max_iter=1: {message}; partial {:?}",
+                partial.eigenvalues
+            );
+            assert!(!partial.converged);
+            assert!(partial.eigenvalues.len() < 6);
+            assert_eq!(partial.iterations, 1);
+        }
+        // With SciPy's default budget (maxiter = 10·n) the cluster is not resolved either: scipy
+        // 1.17.1 eigsh(a, k=6) with its default start vector raises ArpackNoConvergence ("2001
+        // iterations, 1/6 eigenvectors converged"), and over five random v0 it converged twice
+        // (scratchpad eigs/clustered.py). fsci must report the same honestly, and whatever it
+        // reports as converged must be a member of the cluster.
+        let outcome = eigsh(&a, 6, EigsOptions::default());
+        let Err(SparseError::EigsNoConvergence { message, partial }) = outcome else {
+            return Err(format!(
+                "eigsh default: SciPy raises ArpackNoConvergence here, got {outcome:?}"
+            ));
+        };
+        println!(
+            "eigsh clustered default: {message}; partial {:?}",
+            partial.eigenvalues
+        );
+        assert!(!partial.converged && partial.eigenvalues.len() < 6);
+        for value in &partial.eigenvalues {
+            assert!(
+                (value - 1.0).abs() <= 1e-8 + 1e-12,
+                "reported {value} is not in the cluster [1, 1 + 1e-8]"
+            );
+        }
+        Ok(())
+    }
+
+    // Negative case 3. The basis size is SciPy's rule min(n, max(2k+1, 20)) for every k: k = 6
+    // and k = 7 both run 20 vectors (before: eigsh_krylov_window gave 20 and 20 at d46cb9476,
+    // after frankenscipy-szq1n.15 removed a k == 6 special case), and k = 10 runs 21.
+    #[test]
+    fn neighbouring_k_use_the_same_window_rule() {
+        let n = 2000;
+        let a = laplacian_1d(n);
+        let exact = laplacian_eigenvalues(n);
+        let mut previous: Option<Vec<f64>> = None;
+        for (k, ncv) in [(6_usize, 20_usize), (7, 20), (10, 21)] {
+            let options = EigsOptions {
+                sigma: Some(1.0003),
+                ..EigsOptions::default()
+            };
+            let r = eigsh(&a, k, options).expect("converges");
+            assert_eq!(r.ncv, ncv, "k = {k}");
+            assert_eq!(r.ncv, arpack_default_ncv(n, k));
+            let want = expected_symmetric(&exact, EigsWhich::LargestMagnitude, k, Some(1.0003));
+            assert!(max_abs_diff(&r.eigenvalues, &want) <= 1e-13, "k = {k}");
+            if let Some(prev) = &previous {
+                // The k nearest contain the k−1 nearest.
+                for l in prev {
+                    assert!(r.eigenvalues.iter().any(|x| (x - l).abs() <= 1e-13));
+                }
+            }
+            previous = Some(r.eigenvalues);
+        }
+    }
+
+    #[test]
+    fn invariant_start_subspace_restarts_with_a_fresh_direction() {
+        // SciPy's docstring example: eigsh(eye(13), k=6) returns six ones.
+        let identity = diagonal(&[1.0; 30]);
+        let r = eigsh(&identity, 3, EigsOptions::default()).expect("identity converges");
+        assert_eq!(r.eigenvalues.len(), 3);
+        assert!(
+            r.eigenvalues.iter().all(|&l| (l - 1.0).abs() <= 1e-14),
+            "{:?}",
+            r.eigenvalues
+        );
+        let r = eigs(&identity, 3, EigsOptions::default()).expect("identity converges");
+        assert_eq!(r.eigenvalues.len(), 3);
+        assert!(
+            r.eigenvalues.iter().all(|&l| (l - 1.0).abs() <= 1e-14),
+            "{:?}",
+            r.eigenvalues
+        );
+        // A start vector inside the invariant subspace of diag(1, 2, 3): the first Krylov space
+        // is that subspace, and the wanted 10 and 9 live outside it.
+        let mut d = vec![1.0, 2.0, 3.0];
+        d.extend((0..40).map(|i| 10.0 - 0.2 * f64::from(i)));
+        let a = diagonal(&d);
+        let mut v0 = vec![0.0; d.len()];
+        v0[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        let options = EigsOptions {
+            v0: Some(&v0),
+            ..EigsOptions::default()
+        };
+        let r = eigsh(&a, 2, options).expect("converges");
+        assert!(
+            max_abs_diff(&r.eigenvalues, &[9.8, 10.0]) <= 1e-13,
+            "{:?}",
+            r.eigenvalues
+        );
+        let r = eigs(&a, 2, options).expect("converges");
+        let mut got = r.eigenvalues.clone();
+        got.sort_by(f64::total_cmp);
+        // eigs returns Ritz values (no Rayleigh quotient): relative 1e-13.
+        assert!(max_abs_diff(&got, &[9.8, 10.0]) <= 1e-12, "{got:?}");
+    }
+
+    #[test]
+    fn argument_errors_match_scipy() {
+        let a = laplacian_1d(50);
+        let invalid =
+            |r: SparseResult<EigsResult>| matches!(r, Err(SparseError::InvalidArgument { .. }));
+        // which: eigsh takes LM SM LA SA BE, eigs takes LM SM LR SR LI SI.
+        assert!(invalid(eigsh(&a, 3, with_which(EigsWhich::LargestReal))));
+        assert!(invalid(eigs(
+            &a,
+            3,
+            with_which(EigsWhich::LargestAlgebraic)
+        )));
+        assert!(invalid(eigsh(&a, 1, with_which(EigsWhich::BothEnds))));
+        // ncv must exceed k (eigsh) or k + 1 (eigs).
+        let ncv = |ncv| EigsOptions {
+            ncv: Some(ncv),
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 6, ncv(6))));
+        // Accepted (it may still run out of cycles with so small a basis; that is not an
+        // argument error).
+        assert!(!invalid(eigsh(&a, 6, ncv(7))));
+        assert!(invalid(eigs(&a, 6, ncv(7))));
+        assert!(!invalid(eigs(&a, 6, ncv(8))));
+        let zero = vec![0.0; 50];
+        let with_v0 = EigsOptions {
+            v0: Some(&zero),
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 2, with_v0)));
+        let nan_tol = EigsOptions {
+            tol: f64::NAN,
+            ..EigsOptions::default()
+        };
+        assert!(invalid(eigsh(&a, 2, nan_tol)));
+        let mut vals = vec![1.0; 5];
+        vals[2] = f64::NAN;
+        assert!(matches!(
+            eigsh(&diagonal(&vals), 2, EigsOptions::default()),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+        assert_eq!(
+            "SA".parse::<EigsWhich>().ok(),
+            Some(EigsWhich::SmallestAlgebraic)
+        );
+        assert!("XX".parse::<EigsWhich>().is_err());
+    }
+
+    /// combine_many (blocked over KRYLOV_BLOCK entries) against one unblocked combine per
+    /// output, to the bit, with a mass matrix, a length that is not a multiple of the block,
+    /// zero coefficients and signed zeros (frankenscipy-f5kx5).
+    #[test]
+    fn blocked_basis_combinations_are_bit_identical() {
+        let n = 2 * KRYLOV_BLOCK + 37;
+        let mass = csr(n, vec![2.0; n], (0..n).collect(), (0..n).collect());
+        let mut basis = KrylovBasis::new(n, Some(&mass));
+        for j in 0..7 {
+            let v: Vec<f64> = (0..n)
+                .map(|i| ((i * 31 + j * 17) % 97) as f64 / 97.0 - 0.5)
+                .collect();
+            let bv: Vec<f64> = v.iter().map(|x| 2.0 * x).collect();
+            basis.push(v, Some(bv));
+        }
+        let columns: Vec<Vec<f64>> = (0..4)
+            .map(|t| {
+                (0..7)
+                    .map(|j| match (t + j) % 5 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        r => (r as f64).mul_add(0.37, -(t as f64) * 0.11),
+                    })
+                    .collect()
+            })
+            .collect();
+        let blocked = basis.combine_many(7, &columns);
+        assert_eq!(blocked.len(), columns.len());
+        for (column, (x, bx)) in columns.iter().zip(&blocked) {
+            let (rx, rbx) = basis.combine(7, |j| column[j]);
+            assert!(x.iter().zip(&rx).all(|(a, b)| a.to_bits() == b.to_bits()));
+            let (bx, rbx) = (bx.as_ref().expect("mass"), rbx.expect("mass"));
+            assert!(bx.iter().zip(&rbx).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        // Must-differ control: the comparison sees a one-ulp change.
+        let (rx, _) = basis.combine(7, |j| columns[0][j]);
+        let mut nudged = blocked[0].0.clone();
+        nudged[n - 1] = f64::from_bits(nudged[n - 1].to_bits() ^ 1);
+        assert!(
+            !nudged
+                .iter()
+                .zip(&rx)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+
+    #[test]
+    fn real_schur_reorders_and_keeps_the_similarity() {
+        // H = Q0·B·Q0ᵀ with B block-diagonal (eigenvalues known) and Q0 a Householder-built
+        // orthogonal matrix; H is dense, not Hessenberg.
+        let blocks: [(f64, f64); 5] = [
+            (3.0, 0.0),
+            (-1.0, 2.0),
+            (0.5, 0.0),
+            (2.0, 0.25),
+            (-4.0, 0.0),
+        ];
+        let size = 7;
+        let mut b = DMatrix::<f64>::zeros(size, size);
+        let mut at = 0;
+        let mut exact = vec![];
+        // block_end[i]: the first column after the diagonal block holding row i.
+        let mut block_end = vec![0; size];
+        for &(re, im) in &blocks {
+            if im == 0.0 {
+                b[(at, at)] = re;
+                exact.push((re, 0.0));
+                block_end[at] = at + 1;
+                at += 1;
+            } else {
+                // [[re, 2·im], [−im/2, re]] has eigenvalues re ± i·im.
+                b[(at, at)] = re;
+                b[(at, at + 1)] = im * 2.0;
+                b[(at + 1, at)] = -im / 2.0;
+                b[(at + 1, at + 1)] = re;
+                exact.push((re, im));
+                exact.push((re, -im));
+                block_end[at] = at + 2;
+                block_end[at + 1] = at + 2;
+                at += 2;
+            }
+        }
+        // Couple the blocks above the block diagonal (the spectrum is unchanged).
+        for i in 0..size {
+            for j in block_end[i]..size {
+                b[(i, j)] += 0.1 * ((i * 7 + j * 3) % 5) as f64;
+            }
+        }
+        let u = DVector::from_fn(size, |i, _| 1.0 + (i as f64).sin());
+        let q0 = DMatrix::<f64>::identity(size, size) - &u * u.transpose() * (2.0 / u.dot(&u));
+        let h = &q0 * &b * q0.transpose();
+        let mut schur = RealSchur::new(h.clone()).expect("Schur converges");
+        let check = |s: &RealSchur| {
+            let back = &s.q * &s.t * s.q.transpose();
+            let err = (back - &h).abs().max();
+            let ortho = (s.q.transpose() * &s.q - DMatrix::<f64>::identity(size, size))
+                .abs()
+                .max();
+            assert!(err <= 1e-13, "‖QTQᵀ − H‖ = {err:e}");
+            assert!(ortho <= 1e-14, "‖QᵀQ − I‖ = {ortho:e}");
+            for (start, bsize) in &s.blocks {
+                for i in (start + bsize)..size {
+                    for j in *start..(start + bsize) {
+                        assert_eq!(s.t[(i, j)], 0.0, "T not quasi-triangular at ({i},{j})");
+                    }
+                }
+            }
+        };
+        check(&schur);
+        let mut got: Vec<(f64, f64)> = schur.values().iter().map(|v| (v.re, v.im)).collect();
+        got.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        exact.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| x.1.total_cmp(&y.1)));
+        for (g, w) in got.iter().zip(&exact) {
+            assert!(
+                (g.0 - w.0).hypot(g.1 - w.1) <= 1e-12,
+                "{got:?} vs {exact:?}"
+            );
+        }
+        // Move the block holding −4 and then the pair 2 ± 0.25i to the front.
+        let values = schur.values();
+        let id_of = |re: f64| {
+            values
+                .iter()
+                .find(|v| (v.re - re).abs() < 1e-9)
+                .map(|v| v.block)
+                .expect("block present")
+        };
+        let targets = [id_of(-4.0), id_of(2.0)];
+        let moved = schur.move_to_front(&targets);
+        assert_eq!(moved, 3);
+        check(&schur);
+        let lead = schur.block_values(schur.blocks[0]);
+        assert!((lead[0].0 + 4.0).abs() <= 1e-12, "{lead:?}");
+        let second = schur.block_values(schur.blocks[1]);
+        assert!(
+            (second[0].0 - 2.0).abs() <= 1e-12 && (second[0].1 - 0.25).abs() <= 1e-12,
+            "{second:?}"
+        );
+        // The leading Schur vectors span an invariant subspace: H·Q₁ = Q₁·T₁₁.
+        let q1 = schur.q.columns(0, 3).clone_owned();
+        let t11 = schur.t.view((0, 0), (3, 3)).clone_owned();
+        let invariance = (&h * &q1 - &q1 * t11).abs().max();
+        assert!(invariance <= 1e-13, "‖H·Q₁ − Q₁·T₁₁‖ = {invariance:e}");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -31919,7 +37166,12 @@ pub struct SvdsResult {
 /// Uses the eigenvalue decomposition of A^T A to find singular values.
 /// σ_i = √(λ_i(A^T A)), u_i = A v_i / σ_i.
 /// Matches `scipy.sparse.linalg.svds(A, k=k)`.
-pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsResult> {
+///
+/// `options.tol`, `max_iter` and `ncv` apply to the symmetric Krylov–Schur run on AᵀA (SciPy's
+/// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass` and `v0` are refused
+/// ([`SparseError::Unsupported`]). A NaN/Inf in `A` (or an overflowing AᵀA) is refused with
+/// [`SparseError::NonFiniteInput`], where SciPy's ARPACK raises.
+pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<SvdsResult> {
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
@@ -31929,7 +37181,16 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
             message: format!("k={k} must be in [1, {}]", m.min(n)),
         });
     }
-    let options = normalize_eigs_options(options);
+    if options.which != EigsWhich::LargestMagnitude
+        || options.sigma.is_some()
+        || options.mass.is_some()
+        || options.v0.is_some()
+    {
+        return Err(SparseError::Unsupported {
+            feature: "svds supports which='LM' without sigma, M or v0".to_string(),
+        });
+    }
+    let settings = resolve_krylov_settings(n, k, &options, true)?;
 
     // Cache A in CSC once so the operator Aᵀ·w is a byte-identical parallel
     // column-gather (`csc_matvec`), reused across all Krylov steps.
@@ -31937,20 +37198,25 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
 
     // The top-k singular values of A are the square roots of the top-k eigenvalues
     // of the n×n SPSD matrix AᵀA, with right singular vectors = its eigenvectors.
-    // Build the k largest eigenpairs of AᵀA by thick-restart Lanczos on the operator
+    // Build the k largest eigenpairs of AᵀA by symmetric Krylov–Schur on the operator
     // v ↦ Aᵀ(A v), restarting until they converge (a single max(2k+1, 20) subspace,
     // what this used to run, resolves only a well-separated spectrum).
-    let ncv = (2 * k + 1).max(20).min(n);
     // AᵀA·v: reuse a hoisted `tmp` (rows-length) for the discarded intermediate
     // A·v instead of allocating it every Arnoldi step; the Aᵀ·tmp result is
     // returned fresh because it becomes the next basis vector. frankenscipy-fo9cj
     // (byte-identical: same kernels, tmp fully overwritten each call).
     let mut tmp = vec![0.0; a.shape().rows];
-    let ata_op = move |v: &[f64]| -> Vec<f64> {
+    let ata_op = move |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
         csr_matvec_into(a, v, &mut tmp);
-        csc_matvec(&a_csc, &tmp)
+        Ok(csc_matvec(&a_csc, &tmp))
     };
-    let eig = thick_restart_lanczos(ata_op, n, k, &options, ncv);
+    let run = symmetric_krylov_schur(ata_op, None, n, k, &settings, None, false)?;
+    let eig = EigsResult {
+        converged: run.theta.len() == k && run.converged.iter().all(|&c| c),
+        eigenvalues: run.theta,
+        eigenvectors: run.vectors,
+        ..EigsResult::default()
+    };
 
     let mut singular_values = Vec::with_capacity(k);
     let mut v_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
@@ -31969,8 +37235,14 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
         .fold(0.0f64, |acc, &e| acc.max(e.max(0.0).sqrt()));
 
     for (eigenvalue, v) in eig.eigenvalues.iter().zip(eig.eigenvectors.iter()) {
-        // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding.
-        let sigma = eigenvalue.max(0.0).sqrt();
+        // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding. A NaN
+        // eigenvalue stays NaN: `f64::max` would drop it and report σ = 0 for a matrix
+        // holding a NaN, where SciPy's ARPACK raises.
+        let sigma = if eigenvalue.is_nan() {
+            f64::NAN
+        } else {
+            eigenvalue.max(0.0).sqrt()
+        };
         singular_values.push(sigma);
         v_vecs.push(v.clone());
 
@@ -32039,14 +37311,75 @@ fn validate_csgraph(graph: &CsrMatrix) -> SparseResult<()> {
     Ok(())
 }
 
-/// Find connected components of a sparse graph.
+/// The adjacency of a graph's transpose, as SciPy's `csgraph.T.tocsr()`: node `i`'s
+/// neighbours are the `j` with a stored entry at `(j, i)`, in increasing `j`, with that
+/// entry's weight. SciPy's undirected traversals and shortest paths scan it right after the
+/// graph's own row, which fixes their visit order and tie-breaking.
+struct TransposeAdjacency {
+    indptr: Vec<usize>,
+    indices: Vec<usize>,
+    data: Vec<f64>,
+}
+
+fn transpose_adjacency(graph: &CsrMatrix) -> TransposeAdjacency {
+    let n = graph.shape().rows;
+    let (indptr, indices, data) = (graph.indptr(), graph.indices(), graph.data());
+    let mut starts = vec![0usize; n + 1];
+    for &col in indices {
+        starts[col + 1] += 1;
+    }
+    for i in 0..n {
+        starts[i + 1] += starts[i];
+    }
+    let mut next = starts.clone();
+    let mut t_indices = vec![0usize; indices.len()];
+    let mut t_data = vec![0.0; indices.len()];
+    for row in 0..n {
+        for idx in indptr[row]..indptr[row + 1] {
+            let col = indices[idx];
+            t_indices[next[col]] = row;
+            t_data[next[col]] = data[idx];
+            next[col] += 1;
+        }
+    }
+    TransposeAdjacency {
+        indptr: starts,
+        indices: t_indices,
+        data: t_data,
+    }
+}
+
+/// `connection=` for [`connected_components`] on a directed graph, as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    /// Components of the graph with every edge made undirected (SciPy's default).
+    Weak,
+    /// Strongly connected components: mutual reachability along directed edges.
+    Strong,
+}
+
+/// Find connected components of a sparse graph:
+/// `scipy.sparse.csgraph.connected_components(graph, directed, connection)`.
 ///
-/// Matches `scipy.sparse.csgraph.connected_components(graph, directed=False)`.
-///
-/// The input CSR matrix is treated as an adjacency matrix (nonzero = edge).
-/// For undirected graphs, the matrix should be symmetric.
-pub fn connected_components(graph: &CsrMatrix) -> SparseResult<ConnectedComponentsResult> {
+/// Nonzero stored entries are edges. With `directed = false`, or with
+/// [`Connection::Weak`], an edge joins its endpoints both ways; components are numbered in
+/// order of their smallest node, as SciPy numbers them. With `directed = true` and
+/// [`Connection::Strong`] the components are the strongly connected ones, labelled exactly as
+/// SciPy labels them (see [`strongly_connected_components`]).
+pub fn connected_components(
+    graph: &CsrMatrix,
+    directed: bool,
+    connection: Connection,
+) -> SparseResult<ConnectedComponentsResult> {
     validate_csgraph(graph)?;
+    if directed && connection == Connection::Strong {
+        let n = graph.shape().rows;
+        let (n_components, labels) = pearce_scc(graph.indptr(), graph.indices(), n);
+        return Ok(ConnectedComponentsResult {
+            n_components,
+            labels,
+        });
+    }
     let n = graph.shape().rows;
     let indptr = graph.indptr();
     let indices = graph.indices();
@@ -32118,19 +37451,30 @@ impl PartialOrd for DijkstraState {
 }
 
 impl Ord for DijkstraState {
+    /// SciPy's heap holds `(-distance, vertex)` pairs in a max-heap: the smallest distance
+    /// pops first and, between equal distances, the LARGEST vertex index. Ties decide
+    /// predecessors, so this order is part of the observable result.
     fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.total_cmp(&self.cost)
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| self.position.cmp(&other.position))
     }
 }
 
-/// Single-source shortest paths using Dijkstra's algorithm.
+/// Single-source shortest paths using Dijkstra's algorithm:
+/// `scipy.sparse.csgraph.dijkstra(graph, directed, indices=source)`.
 ///
-/// Matches `scipy.sparse.csgraph.dijkstra(graph, indices=source)`.
-///
-/// The CSR matrix values are edge weights. When negative edges are present,
-/// SciPy warns and still computes distances; we follow that observable result
+/// The CSR matrix values are edge weights. With `directed = false` an edge `(i, j)` can be
+/// walked either way; as in SciPy, each settled vertex relaxes its own row and then its column
+/// (the transpose's row), so the shorter of `(i, j)` and `(j, i)` wins. When negative edges are
+/// present, SciPy warns and still computes distances; we follow that observable result
 /// surface by delegating to Bellman-Ford instead of hard-failing.
-pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathResult> {
+pub fn dijkstra(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+) -> SparseResult<ShortestPathResult> {
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if source >= n {
@@ -32144,26 +37488,64 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
     let data = graph.data();
 
     if data.iter().any(|&weight| weight < 0.0) {
-        return bellman_ford(graph, source);
+        return bellman_ford(graph, directed, source);
     }
 
-    Ok(dijkstra_core(indptr, indices, data, n, source))
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
+    Ok(dijkstra_core(
+        indptr,
+        indices,
+        data,
+        transpose.as_ref(),
+        n,
+        source,
+    ))
 }
 
-/// Core Dijkstra heap loop over already-extracted CSR components. No validation
-/// or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
-/// once. Pure in its inputs, so it parallelizes byte-identically across sources.
+/// Core Dijkstra heap loop over already-extracted CSR components, SciPy's `_dijkstra`. No
+/// validation or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
+/// once. `transpose` is `Some` for an undirected search. Pure in its inputs, so it
+/// parallelizes byte-identically across sources.
 fn dijkstra_core(
     indptr: &[usize],
     indices: &[usize],
     data: &[f64],
+    transpose: Option<&TransposeAdjacency>,
     n: usize,
     source: usize,
 ) -> ShortestPathResult {
     let mut dist = vec![f64::INFINITY; n];
     let mut pred = vec![-1_i64; n];
-    dist[source] = 0.0;
+    let transpose = transpose.map(|t| (&t.indptr[..], &t.indices[..], &t.data[..]));
+    dijkstra_scan(
+        (indptr, indices, data),
+        transpose,
+        &mut dist,
+        &mut pred,
+        source,
+    );
+    ShortestPathResult {
+        distances: dist,
+        predecessors: pred,
+    }
+}
 
+/// A CSR adjacency as `(indptr, indices, weights)`: [`dijkstra_scan`] takes the weights apart
+/// from the structure because [`yen`] masks edges by overwriting weights with infinity.
+type CsrAdjacency<'a> = (&'a [usize], &'a [usize], &'a [f64]);
+
+/// SciPy's `_dijkstra` heap loop for one source over caller-initialised `dist` and `pred`
+/// (whatever `dist` already holds bounds the relaxations, as in SciPy; [`yen`] relies on that).
+/// `transpose` is `Some` for an undirected search: each settled vertex relaxes its own row and
+/// then its transpose row.
+fn dijkstra_scan(
+    graph: CsrAdjacency<'_>,
+    transpose: Option<CsrAdjacency<'_>>,
+    dist: &mut [f64],
+    pred: &mut [i64],
+    source: usize,
+) {
+    dist[source] = 0.0;
     let mut heap = BinaryHeap::new();
     heap.push(DijkstraState {
         cost: 0.0,
@@ -32174,25 +37556,23 @@ fn dijkstra_core(
         if cost > dist[position] {
             continue;
         }
-        // Relax edges from position
-        for idx in indptr[position]..indptr[position + 1] {
-            let v = indices[idx];
-            let weight = data[idx];
-            let alt = cost + weight;
-            if alt < dist[v] {
-                dist[v] = alt;
-                pred[v] = position as i64;
-                heap.push(DijkstraState {
-                    cost: alt,
-                    position: v,
-                });
+        let mut relax = |row_indices: &[usize], row_data: &[f64]| {
+            for (&v, &weight) in row_indices.iter().zip(row_data) {
+                let alt = cost + weight;
+                if alt < dist[v] {
+                    dist[v] = alt;
+                    pred[v] = position as i64;
+                    heap.push(DijkstraState {
+                        cost: alt,
+                        position: v,
+                    });
+                }
             }
+        };
+        for (indptr, indices, weights) in std::iter::once(graph).chain(transpose) {
+            let row = indptr[position]..indptr[position + 1];
+            relax(&indices[row.clone()], &weights[row]);
         }
-    }
-
-    ShortestPathResult {
-        distances: dist,
-        predecessors: pred,
     }
 }
 
@@ -32204,6 +37584,7 @@ fn dijkstra_parallel_sources(
     indptr: &[usize],
     indices: &[usize],
     data: &[f64],
+    transpose: Option<&TransposeAdjacency>,
     n: usize,
     sources: &[usize],
 ) -> Vec<ShortestPathResult> {
@@ -32220,7 +37601,7 @@ fn dijkstra_parallel_sources(
                 scope.spawn(move || {
                     batch
                         .iter()
-                        .map(|&source| dijkstra_core(indptr, indices, data, n, source))
+                        .map(|&source| dijkstra_core(indptr, indices, data, transpose, n, source))
                         .collect::<Vec<_>>()
                 })
             })
@@ -32232,12 +37613,23 @@ fn dijkstra_parallel_sources(
     })
 }
 
-/// Single-source shortest paths using Bellman-Ford algorithm.
+/// Single-source shortest paths using Bellman-Ford algorithm:
+/// `scipy.sparse.csgraph.bellman_ford(graph, directed, indices=source)`.
 ///
-/// Matches `scipy.sparse.csgraph.bellman_ford(graph, indices=source)`.
-///
-/// Supports negative edge weights (unlike Dijkstra). Detects negative cycles.
-pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathResult> {
+/// Supports negative edge weights (unlike Dijkstra). Detects negative cycles with SciPy's
+/// `1e-15` slack and reports them as [`SparseError::NegativeCycle`], SciPy's
+/// `NegativeCycleError` (so do [`johnson`], [`dijkstra`] on a negative weight, and their
+/// multi-source forms, which run this per source). This follows SciPy's `_bellman_ford_directed` / `_bellman_ford_undirected`
+/// pass for pass, including reading each row's source distance once per pass. Undirected, a
+/// stored edge relaxes both of its endpoints, so a negative edge is itself a negative cycle.
+/// The passes stop early once one changes nothing; the remaining passes would not change
+/// anything either.
+pub fn bellman_ford(
+    graph: &CsrMatrix,
+    directed: bool,
+    source: usize,
+) -> SparseResult<ShortestPathResult> {
+    const EPS: f64 = 1e-15; // SciPy's DTYPE_EPS
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if source >= n {
@@ -32254,40 +37646,45 @@ pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPa
     let mut pred = vec![-1_i64; n];
     dist[source] = 0.0;
 
-    // Relax all edges n-1 times
     for _ in 0..n.saturating_sub(1) {
         let mut changed = false;
-        for u in 0..n {
-            if dist[u] == f64::INFINITY {
-                continue;
-            }
-            for idx in indptr[u]..indptr[u + 1] {
-                let v = indices[idx];
-                let weight = data[idx];
-                let alt = dist[u] + weight;
-                if alt < dist[v] {
-                    dist[v] = alt;
-                    pred[v] = u as i64;
+        for j in 0..n {
+            let mut d1 = dist[j];
+            for idx in indptr[j]..indptr[j + 1] {
+                let (k, w12) = (indices[idx], data[idx]);
+                let mut d2 = dist[k];
+                if d1 + w12 < d2 {
+                    d2 = d1 + w12;
+                    dist[k] = d2;
+                    pred[k] = j as i64;
+                    changed = true;
+                }
+                if !directed && d2 + w12 < d1 {
+                    d1 = d2 + w12;
+                    dist[j] = d1;
+                    pred[j] = k as i64;
                     changed = true;
                 }
             }
         }
         if !changed {
-            break; // Early termination: no updates in this pass
+            break;
         }
     }
 
-    // Check for negative cycles: one more pass
-    for u in 0..n {
-        if dist[u] == f64::INFINITY {
-            continue;
-        }
-        for idx in indptr[u]..indptr[u + 1] {
-            let v = indices[idx];
-            let weight = data[idx];
-            if dist[u] + weight < dist[v] {
-                return Err(SparseError::InvalidArgument {
-                    message: "graph contains a negative-weight cycle".to_string(),
+    for j in 0..n {
+        let d1 = dist[j];
+        for idx in indptr[j]..indptr[j + 1] {
+            let (d2, w12) = (dist[indices[idx]], data[idx]);
+            let violated = if directed {
+                d1 + w12 + EPS < d2
+            } else {
+                (d2 - d1).abs() > w12 + EPS
+            };
+            if violated {
+                // SciPy's `_bellman_ford_*` return the SOURCE index, which its message names.
+                return Err(SparseError::NegativeCycle {
+                    message: format!("Negative cycle detected on node {source}"),
                 });
             }
         }
@@ -32299,14 +37696,32 @@ pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPa
     })
 }
 
+/// The transpose adjacency an undirected traversal needs, after checking the graph is
+/// square (a transpose of a non-square graph has no node for some of its columns).
+fn undirected_transpose(graph: &CsrMatrix) -> SparseResult<TransposeAdjacency> {
+    let shape = graph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "an undirected traversal needs a square graph, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    Ok(transpose_adjacency(graph))
+}
+
 /// Breadth-first search traversal order from a source node.
 ///
 /// Returns the node indices in BFS order and a predecessor array.
 ///
-/// Matches `scipy.sparse.csgraph.breadth_first_order(graph, i_start)`.
+/// Matches `scipy.sparse.csgraph.breadth_first_order(graph, i_start, directed)`. With
+/// `directed = false` each node's own row is scanned and then its column (the transpose's
+/// row), which is SciPy's visit order.
 pub fn breadth_first_order(
     graph: &CsrMatrix,
     source: usize,
+    directed: bool,
 ) -> SparseResult<(Vec<usize>, Vec<i64>)> {
     let n = graph.shape().rows;
     if source >= n {
@@ -32316,6 +37731,11 @@ pub fn breadth_first_order(
     }
     let indptr = graph.indptr();
     let indices = graph.indices();
+    let transpose = if directed {
+        None
+    } else {
+        Some(undirected_transpose(graph)?)
+    };
 
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
@@ -32328,7 +37748,11 @@ pub fn breadth_first_order(
 
     while let Some(node) = queue.pop_front() {
         order.push(node);
-        for &neighbor in indices.iter().take(indptr[node + 1]).skip(indptr[node]) {
+        let own = &indices[indptr[node]..indptr[node + 1]];
+        let reverse = transpose
+            .as_ref()
+            .map_or(&[][..], |t| &t.indices[t.indptr[node]..t.indptr[node + 1]]);
+        for &neighbor in own.iter().chain(reverse) {
             if !visited[neighbor] {
                 visited[neighbor] = true;
                 predecessors[neighbor] = node as i64;
@@ -32344,8 +37768,14 @@ pub fn breadth_first_order(
 ///
 /// Returns the node indices in DFS pre-order and a predecessor array.
 ///
-/// Matches `scipy.sparse.csgraph.depth_first_order(graph, i_start)`.
-pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<usize>, Vec<i64>)> {
+/// Matches `scipy.sparse.csgraph.depth_first_order(graph, i_start, directed)`. With
+/// `directed = false` a node's column (the transpose's row) is searched only when its own row
+/// has no unvisited neighbour left, as in SciPy's `_depth_first_undirected`.
+pub fn depth_first_order(
+    graph: &CsrMatrix,
+    source: usize,
+    directed: bool,
+) -> SparseResult<(Vec<usize>, Vec<i64>)> {
     let n = graph.shape().rows;
     if source >= n {
         return Err(SparseError::InvalidArgument {
@@ -32354,6 +37784,14 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
     }
     let indptr = graph.indptr();
     let indices = graph.indices();
+    let transpose = if directed {
+        None
+    } else {
+        Some(undirected_transpose(graph)?)
+    };
+    let mut t_cursor: Vec<usize> = transpose
+        .as_ref()
+        .map_or_else(Vec::new, |t| t.indptr[..n].to_vec());
 
     // br-szq1n.3: SciPy's `_depth_first_directed` descends into the FIRST unvisited
     // neighbour immediately, recording it in the order and its predecessor at that
@@ -32386,6 +37824,20 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
                 break;
             }
         }
+        if let (false, Some(t)) = (descended, transpose.as_ref()) {
+            while t_cursor[node] < t.indptr[node + 1] {
+                let child = t.indices[t_cursor[node]];
+                t_cursor[node] += 1;
+                if !visited[child] {
+                    visited[child] = true;
+                    predecessors[child] = node as i64;
+                    order.push(child);
+                    stack.push(child);
+                    descended = true;
+                    break;
+                }
+            }
+        }
         if order.len() == n {
             break;
         }
@@ -32395,6 +37847,2253 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
     }
 
     Ok((order, predecessors))
+}
+
+// ── csgraph trees, predecessor tools, dense and masked conversions, maximum flow, bipartite
+// matchings and Yen's k shortest paths (frankenscipy-fdepw). Each is a port of SciPy 1.17.1's
+// `scipy/sparse/csgraph/_tools.pyx`, `_traversal.pyx`, `_flow.pyx`, `_matching.pyx` or
+// `_shortest_path.pyx`, pass for pass: which flow, matching, tree edge or path comes out when
+// several are optimal depends on the exact scan order, and these return SciPy's.
+
+/// The node count of a square graph, or SciPy's `validate_graph` error for a non-square one.
+fn square_csgraph_order(graph: &CsrMatrix) -> SparseResult<usize> {
+    let shape = graph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "compressed-sparse graph must be shape (N, N), got ({}, {})",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    Ok(shape.rows)
+}
+
+/// The transpose of a CSR pattern with `n_cols` columns, as SciPy's `csr_tocsc` builds it: a
+/// stable counting sort, so row `c` of the transpose lists the rows holding column `c` in
+/// increasing order, and a duplicated entry keeps its storage order. Returns the transpose's
+/// `indptr` and `indices`, and for each of its positions the position of the same entry in the
+/// input (`order`), which carries values across and is SciPy's `_make_edge_pointers`.
+fn csr_transpose_order(
+    indptr: &[usize],
+    indices: &[usize],
+    n_cols: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut t_indptr = vec![0usize; n_cols + 1];
+    for &col in indices {
+        t_indptr[col + 1] += 1;
+    }
+    for col in 0..n_cols {
+        t_indptr[col + 1] += t_indptr[col];
+    }
+    let mut next = t_indptr[..n_cols].to_vec();
+    let mut t_indices = vec![0usize; indices.len()];
+    let mut order = vec![0usize; indices.len()];
+    for row in 0..indptr.len().saturating_sub(1) {
+        for entry in indptr[row]..indptr[row + 1] {
+            let slot = &mut next[indices[entry]];
+            t_indices[*slot] = row;
+            order[*slot] = entry;
+            *slot += 1;
+        }
+    }
+    (t_indptr, t_indices, order)
+}
+
+/// `scipy.sparse.csgraph.breadth_first_tree(csgraph, i_start, directed)`: the tree of edges
+/// from each node's [`breadth_first_order`] predecessor to it, built by [`reconstruct_path`].
+pub fn breadth_first_tree(
+    csgraph: &CsrMatrix,
+    i_start: usize,
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let (_, predecessors) = breadth_first_order(csgraph, i_start, directed)?;
+    reconstruct_path(csgraph, &predecessors, directed)
+}
+
+/// `scipy.sparse.csgraph.depth_first_tree(csgraph, i_start, directed)`: the tree of edges from
+/// each node's [`depth_first_order`] predecessor to it, built by [`reconstruct_path`]. Which of
+/// several depth-first trees comes out is SciPy's, since the traversal is SciPy's.
+pub fn depth_first_tree(
+    csgraph: &CsrMatrix,
+    i_start: usize,
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let (_, predecessors) = depth_first_order(csgraph, i_start, directed)?;
+    reconstruct_path(csgraph, &predecessors, directed)
+}
+
+/// A predecessor entry as a node: `None` for any negative value, an error past the last node.
+fn predecessor_node(predecessor: i64, n: usize) -> SparseResult<Option<usize>> {
+    if predecessor < 0 {
+        return Ok(None);
+    }
+    match usize::try_from(predecessor) {
+        Ok(node) if node < n => Ok(Some(node)),
+        _ => Err(SparseError::IndexOutOfBounds {
+            axis: "predecessor",
+            index: usize::try_from(predecessor).unwrap_or(usize::MAX),
+            bound: n,
+        }),
+    }
+}
+
+/// For each entry `(row, column)` of the CSR pattern `(want_indptr, want_indices)`, the value
+/// `graph[row, column]` as SciPy's `csr_sample_values` reads it: the sum of the entries stored
+/// there, in storage order, and 0 when there are none.
+fn csgraph_pattern_values(
+    graph: CsrAdjacency<'_>,
+    want_indptr: &[usize],
+    want_indices: &[usize],
+    n: usize,
+) -> Vec<f64> {
+    let (indptr, indices, data) = graph;
+    let mut sums: Vec<Option<f64>> = vec![None; n];
+    let mut out = vec![0.0; want_indices.len()];
+    for row in 0..want_indptr.len().saturating_sub(1) {
+        let wanted = want_indptr[row]..want_indptr[row + 1];
+        if wanted.is_empty() {
+            continue;
+        }
+        let stored = indptr[row]..indptr[row + 1];
+        for (&col, &w) in indices[stored.clone()].iter().zip(&data[stored.clone()]) {
+            sums[col] = Some(sums[col].map_or(w, |s| s + w));
+        }
+        for (slot, &col) in out[wanted.clone()].iter_mut().zip(&want_indices[wanted]) {
+            *slot = sums[col].unwrap_or(0.0);
+        }
+        for &col in &indices[stored] {
+            sums[col] = None;
+        }
+    }
+    out
+}
+
+/// `np.minimum`: NaN if either side is NaN.
+fn nan_propagating_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
+    }
+}
+
+/// `scipy.sparse.csgraph.reconstruct_path(csgraph, predecessors, directed)`: the N x N tree
+/// with an edge from `predecessors[i]` to `i` for every node that has a predecessor.
+///
+/// The edge `(p, i)` carries `csgraph[p, i]`: the sum of the entries stored there, 0 when there
+/// are none, and a stored zero is kept as an explicit zero of the tree. With `directed = false`
+/// it carries the smaller of `csgraph[p, i]` and `csgraph[i, p]`, where a 0 on either side
+/// first counts as infinity, as in SciPy: a pair whose only weight is an explicit zero carries
+/// infinity.
+///
+/// Each row lists its children in increasing index. SciPy orders them with `np.argsort` of the
+/// predecessors, which is not stable, so past 16 nodes a SciPy row can hold the same children
+/// in another storage order; the matrix is the same.
+///
+/// Every negative predecessor means "none": fsci's traversals write -1, SciPy's -9999 (SciPy
+/// itself treats only its "none" as such). `predecessors` needs one entry per node, and an
+/// entry past the last node is an error.
+pub fn reconstruct_path(
+    csgraph: &CsrMatrix,
+    predecessors: &[i64],
+    directed: bool,
+) -> SparseResult<CsrMatrix> {
+    let n = square_csgraph_order(csgraph)?;
+    if predecessors.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "predecessors has {} entries for a graph of {n} nodes",
+                predecessors.len()
+            ),
+        });
+    }
+    let parents = predecessors
+        .iter()
+        .map(|&p| predecessor_node(p, n))
+        .collect::<SparseResult<Vec<_>>>()?;
+    let mut indptr = vec![0usize; n + 1];
+    for &p in parents.iter().flatten() {
+        indptr[p + 1] += 1;
+    }
+    for row in 0..n {
+        indptr[row + 1] += indptr[row];
+    }
+    let mut next = indptr[..n].to_vec();
+    let mut indices = vec![0usize; indptr[n]];
+    for (child, parent) in parents.iter().enumerate() {
+        if let Some(p) = *parent {
+            indices[next[p]] = child;
+            next[p] += 1;
+        }
+    }
+    let forward = csgraph_pattern_values(
+        (csgraph.indptr(), csgraph.indices(), csgraph.data()),
+        &indptr,
+        &indices,
+        n,
+    );
+    let data = if directed {
+        forward
+    } else {
+        // csgraph[i, p] for the tree entry (p, i) is row p of the transpose.
+        let t = transpose_adjacency(csgraph);
+        let backward =
+            csgraph_pattern_values((&t.indptr, &t.indices, &t.data), &indptr, &indices, n);
+        let unset_zero = |w: f64| if w == 0.0 { f64::INFINITY } else { w };
+        forward
+            .iter()
+            .zip(&backward)
+            .map(|(&a, &b)| nan_propagating_min(unset_zero(a), unset_zero(b)))
+            .collect()
+    };
+    CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+}
+
+/// `scipy.sparse.csgraph.construct_dist_matrix(graph, predecessors, directed, null_value)`:
+/// `dist[i][j]` is the length of the path from `i` to `j` that row `i` of `predecessors`
+/// encodes, walked back from `j`.
+///
+/// As in SciPy, edge weights are read from [`csgraph_to_dense`] with infinity for non-edges
+/// (the lightest of duplicated entries); with `directed = false` a 0 first becomes infinity
+/// and each pair takes the lighter of its two directions. A walk that stops at a node with no
+/// predecessor keeps the length summed so far; `null_value` is written only where `j != i` has
+/// no predecessor at all. A step along a pair that is not an edge adds infinity.
+///
+/// Every negative predecessor means "none" (fsci -1, SciPy -9999). SciPy loops forever on a
+/// predecessor row that cycles without reaching `i`, and indexes out of bounds on a node past
+/// the last; both are errors here.
+pub fn construct_dist_matrix(
+    graph: &CsrMatrix,
+    predecessors: &[Vec<i64>],
+    directed: bool,
+    null_value: f64,
+) -> SparseResult<Vec<Vec<f64>>> {
+    let mut weights = csgraph_to_dense(graph, f64::INFINITY)?;
+    let n = weights.len();
+    if predecessors.len() != n || predecessors.iter().any(|row| row.len() != n) {
+        return Err(SparseError::IncompatibleShape {
+            message: "graph and predecessors must have the same shape".to_string(),
+        });
+    }
+    if !directed {
+        for w in weights.iter_mut().flatten() {
+            if *w == 0.0 {
+                *w = f64::INFINITY;
+            }
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                if weights[j][i] <= weights[i][j] {
+                    weights[i][j] = weights[j][i];
+                } else {
+                    weights[j][i] = weights[i][j];
+                }
+            }
+        }
+    }
+    let mut dist = vec![vec![0.0; n]; n];
+    for (i, (row_pred, row_dist)) in predecessors.iter().zip(&mut dist).enumerate() {
+        for (j, d) in row_dist.iter_mut().enumerate() {
+            let mut null_path = true;
+            let mut k2 = j;
+            let mut steps = 0usize;
+            while k2 != i {
+                let Some(k1) = predecessor_node(row_pred[k2], n)? else {
+                    break;
+                };
+                if steps == n {
+                    return Err(SparseError::InvalidArgument {
+                        message: format!(
+                            "predecessors[{i}] cycles: the walk back from node {j} never reaches {i}"
+                        ),
+                    });
+                }
+                steps += 1;
+                *d += weights[k1][k2];
+                null_path = false;
+                k2 = k1;
+            }
+            if null_path && i != j {
+                *d = null_value;
+            }
+        }
+    }
+    Ok(dist)
+}
+
+/// `scipy.sparse.csgraph.csgraph_to_dense(csgraph, null_value)`: the dense N x N graph, with
+/// `null_value` where nothing is stored.
+///
+/// Unlike `toarray`, duplicated entries do not add up: the smallest one is kept, and a stored
+/// zero is a zero-weight edge, not a non-edge. A stored NaN is never "smaller" than the
+/// infinity the cell starts at, so it reads as infinity (not `null_value`), as in SciPy.
+pub fn csgraph_to_dense(csgraph: &CsrMatrix, null_value: f64) -> SparseResult<Vec<Vec<f64>>> {
+    let shape = csgraph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "csgraph should be a square matrix, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let n = shape.rows;
+    let mut graph = vec![vec![f64::INFINITY; n]; n];
+    let mut stored = vec![vec![false; n]; n];
+    let (indptr, indices, data) = (csgraph.indptr(), csgraph.indices(), csgraph.data());
+    for row in 0..n {
+        for entry in indptr[row]..indptr[row + 1] {
+            let col = indices[entry];
+            stored[row][col] = true;
+            if data[entry] < graph[row][col] {
+                graph[row][col] = data[entry];
+            }
+        }
+    }
+    for (row, stored_row) in graph.iter_mut().zip(&stored) {
+        for (w, &is_stored) in row.iter_mut().zip(stored_row) {
+            if !is_stored {
+                *w = null_value;
+            }
+        }
+    }
+    Ok(graph)
+}
+
+/// A dense graph and its mask: the Rust form of the NumPy masked arrays that SciPy's
+/// `csgraph_masked_from_dense`, `csgraph_from_masked` and `csgraph_to_masked` pass around.
+/// `mask[i][j]` true means `(i, j)` is not an edge; `data[i][j]` keeps the underlying value
+/// either way, as a masked array does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaskedGraph {
+    /// The values, row-major.
+    pub data: Vec<Vec<f64>>,
+    /// `true` where the value is masked (not an edge).
+    pub mask: Vec<Vec<bool>>,
+}
+
+/// The side of a square dense graph, or SciPy's error for a ragged or non-square one.
+fn square_dense_order<T>(graph: &[Vec<T>]) -> SparseResult<usize> {
+    let n = graph.len();
+    if graph.iter().any(|row| row.len() != n) {
+        return Err(SparseError::InvalidShape {
+            message: "graph should be a square array".to_string(),
+        });
+    }
+    Ok(n)
+}
+
+/// `scipy.sparse.csgraph.csgraph_masked_from_dense(graph, null_value, nan_null,
+/// infinity_null)`: the graph with its non-edges masked.
+///
+/// `null_value = None` masks no value. A NaN `null_value` turns on `nan_null` instead, and an
+/// infinite one `infinity_null` (both signs), as in SciPy. Any other `null_value` masks the
+/// entries NumPy's `masked_values` finds equal to it, and for float data that is
+/// `np.isclose(x, null_value)` with `rtol = 1e-5`, `atol = 1e-8`: with the default
+/// `null_value = 0`, an entry of magnitude at most 1e-8 is a non-edge too.
+pub fn csgraph_masked_from_dense(
+    graph: &[Vec<f64>],
+    null_value: Option<f64>,
+    nan_null: bool,
+    infinity_null: bool,
+) -> SparseResult<MaskedGraph> {
+    square_dense_order(graph)?;
+    let (mut nan_null, mut infinity_null) = (nan_null, infinity_null);
+    let null_value = match null_value {
+        Some(v) if v.is_nan() => {
+            nan_null = true;
+            None
+        }
+        Some(v) if v.is_infinite() => {
+            infinity_null = true;
+            None
+        }
+        other => other,
+    };
+    let is_null = |x: f64| {
+        null_value.is_some_and(|v| (x - v).abs() <= 1e-8 + 1e-5 * v.abs() || x == v)
+            || (infinity_null && x.is_infinite())
+            || (nan_null && x.is_nan())
+    };
+    Ok(MaskedGraph {
+        data: graph.to_vec(),
+        mask: graph
+            .iter()
+            .map(|row| row.iter().map(|&x| is_null(x)).collect())
+            .collect(),
+    })
+}
+
+/// `scipy.sparse.csgraph.csgraph_from_masked(graph)`: the CSR graph of the unmasked entries,
+/// row by row in column order.
+pub fn csgraph_from_masked(graph: &MaskedGraph) -> SparseResult<CsrMatrix> {
+    let n = square_dense_order(&graph.data)?;
+    if square_dense_order(&graph.mask)? != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "mask and data shapes differ".to_string(),
+        });
+    }
+    let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+    for (values, masked) in graph.data.iter().zip(&graph.mask) {
+        for (col, (&value, &is_masked)) in values.iter().zip(masked).enumerate() {
+            if !is_masked {
+                data.push(value);
+                indices.push(col);
+            }
+        }
+        indptr.push(data.len());
+    }
+    CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+}
+
+/// `scipy.sparse.csgraph.csgraph_from_dense(graph, null_value, nan_null, infinity_null)`:
+/// [`csgraph_from_masked`] of [`csgraph_masked_from_dense`]. With SciPy's defaults
+/// (`Some(0.0)`, `true`, `true`) zeros, NaNs and infinities are non-edges, and so is any entry
+/// of magnitude at most 1e-8 (see [`csgraph_masked_from_dense`]).
+pub fn csgraph_from_dense(
+    graph: &[Vec<f64>],
+    null_value: Option<f64>,
+    nan_null: bool,
+    infinity_null: bool,
+) -> SparseResult<CsrMatrix> {
+    csgraph_from_masked(&csgraph_masked_from_dense(
+        graph,
+        null_value,
+        nan_null,
+        infinity_null,
+    )?)
+}
+
+/// `scipy.sparse.csgraph.csgraph_to_masked(csgraph)`: `np.ma.masked_invalid` of
+/// [`csgraph_to_dense`] with NaN for non-edges, so a stored infinity or NaN is masked too.
+pub fn csgraph_to_masked(csgraph: &CsrMatrix) -> SparseResult<MaskedGraph> {
+    let data = csgraph_to_dense(csgraph, f64::NAN)?;
+    let mask = data
+        .iter()
+        .map(|row| row.iter().map(|x| !x.is_finite()).collect())
+        .collect();
+    Ok(MaskedGraph { data, mask })
+}
+
+/// `method=` of [`maximum_flow`], as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaximumFlowMethod {
+    /// Dinic's algorithm, blocking flows in breadth-first level graphs; SciPy's default.
+    #[default]
+    Dinic,
+    /// Edmonds–Karp: one shortest augmenting path per breadth-first search.
+    EdmondsKarp,
+}
+
+/// What [`maximum_flow`] returns: SciPy's `MaximumFlowResult`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaximumFlowResult {
+    /// The value of the flow: the sum of the flow on the source's row.
+    pub flow_value: i64,
+    /// SciPy's `.flow`: the flow on every edge of the graph after the missing reverse edges are
+    /// added as explicit zeros, rows sorted by column. An edge's reverse carries its negated
+    /// flow, so the matrix is antisymmetric; its entries are integers.
+    pub flow: CsrMatrix,
+}
+
+/// A capacity as SciPy's int32 (`ITYPE`). SciPy refuses a non-integer dtype; with f64 storage
+/// that is a non-integral value. SciPy casts wider integers to int32 silently (2**31 + 5 wraps
+/// to a negative capacity); fsci refuses a value outside int32 instead.
+fn flow_capacity(w: f64) -> SparseResult<i32> {
+    if !(w.is_finite() && w.fract() == 0.0) {
+        return Err(SparseError::InvalidArgument {
+            message: "graph capacities must be integers".to_string(),
+        });
+    }
+    if w < f64::from(i32::MIN) || w > f64::from(i32::MAX) {
+        return Err(SparseError::InvalidArgument {
+            message: format!("graph capacity {w} does not fit SciPy's int32 capacities"),
+        });
+    }
+    Ok(w as i32)
+}
+
+/// `scipy.sparse.csgraph.maximum_flow(csgraph, source, sink, method)`: a maximum flow from
+/// `source` to `sink` of the directed graph whose stored entries are integer capacities.
+///
+/// Validation follows SciPy's order: non-integral capacities, `source == sink`, a non-square
+/// graph, then out-of-range `source` and `sink`. A row stored out of column order is sorted
+/// first (stably; SciPy's `sorted_indices` is not stable, which matters only for a row that is
+/// both unsorted and holds duplicated entries). The reverse of every edge is then added with
+/// capacity 0 unless it is stored, and SciPy's `_edmonds_karp` or `_dinic` runs on that graph
+/// in its int32 arithmetic (wrapping as SciPy's C does, which only capacities near 2^31 reach).
+/// Which of several maximum flows comes out is SciPy's.
+pub fn maximum_flow(
+    csgraph: &CsrMatrix,
+    source: usize,
+    sink: usize,
+    method: MaximumFlowMethod,
+) -> SparseResult<MaximumFlowResult> {
+    let mut capacities = csgraph
+        .data()
+        .iter()
+        .map(|&w| flow_capacity(w))
+        .collect::<SparseResult<Vec<i32>>>()?;
+    if source == sink {
+        return Err(SparseError::InvalidArgument {
+            message: "source and sink vertices must differ".to_string(),
+        });
+    }
+    let shape = csgraph.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidShape {
+            message: "graph must be specified as a square matrix.".to_string(),
+        });
+    }
+    let n = shape.rows;
+    for (name, vertex) in [("source", source), ("sink", sink)] {
+        if vertex >= n {
+            return Err(SparseError::InvalidArgument {
+                message: format!(
+                    "{name} value ({vertex}) must be between 0 and {}",
+                    n.cast_signed() - 1
+                ),
+            });
+        }
+    }
+
+    let indptr = csgraph.indptr();
+    let mut indices = csgraph.indices().to_vec();
+    for row in 0..n {
+        let range = indptr[row]..indptr[row + 1];
+        if indices[range.clone()].is_sorted() {
+            continue;
+        }
+        let mut entries: Vec<(usize, i32)> = indices[range.clone()]
+            .iter()
+            .copied()
+            .zip(capacities[range.clone()].iter().copied())
+            .collect();
+        entries.sort_by_key(|&(col, _)| col);
+        for (slot, (col, cap)) in range.zip(entries) {
+            indices[slot] = col;
+            capacities[slot] = cap;
+        }
+    }
+
+    // SciPy's `_add_reverse_edges`: merge each row of the graph with the same row of its
+    // transpose, keeping the graph's capacity where both have the entry and 0 otherwise.
+    let (at_indptr, at_indices, _) = csr_transpose_order(indptr, &indices, n);
+    let mut edge_ptr = vec![0usize; n + 1];
+    let mut heads = Vec::with_capacity(2 * indices.len());
+    let mut edge_caps = Vec::with_capacity(2 * indices.len());
+    for i in 0..n {
+        let (mut a, a_end) = (indptr[i], indptr[i + 1]);
+        let (mut b, b_end) = (at_indptr[i], at_indptr[i + 1]);
+        while a != a_end || b != b_end {
+            let move_a = a != a_end && (b == b_end || indices[a] <= at_indices[b]);
+            let move_b = b != b_end && (a == a_end || at_indices[b] <= indices[a]);
+            if move_a {
+                heads.push(indices[a]);
+                edge_caps.push(capacities[a]);
+                a += 1;
+            }
+            if move_b {
+                if !move_a {
+                    heads.push(at_indices[b]);
+                    edge_caps.push(0);
+                }
+                b += 1;
+            }
+        }
+        edge_ptr[i + 1] = heads.len();
+    }
+    // SciPy's `_make_edge_pointers`: position q of the transpose holds the edge reversed.
+    let (_, _, rev_edge) = csr_transpose_order(&edge_ptr, &heads, n);
+
+    let flows = match method {
+        MaximumFlowMethod::EdmondsKarp => {
+            let mut tails = vec![0usize; heads.len()];
+            for v in 0..n {
+                tails[edge_ptr[v]..edge_ptr[v + 1]].fill(v);
+            }
+            edmonds_karp_flows(
+                &edge_ptr, &tails, &heads, &edge_caps, &rev_edge, source, sink,
+            )
+        }
+        MaximumFlowMethod::Dinic => {
+            dinic_flows(&edge_ptr, &heads, &mut edge_caps, &rev_edge, source, sink)
+        }
+    };
+    let flow_value = flows[edge_ptr[source]..edge_ptr[source + 1]]
+        .iter()
+        .map(|&f| i64::from(f))
+        .sum();
+    let flow = CsrMatrix::from_components(
+        Shape2D::new(n, n),
+        flows.iter().map(|&f| f64::from(f)).collect(),
+        heads,
+        edge_ptr,
+        false,
+    )?;
+    Ok(MaximumFlowResult { flow_value, flow })
+}
+
+/// SciPy's `_edmonds_karp`: breadth-first augmenting paths over a graph whose every edge has
+/// its reverse (`rev_edge`). Returns the flow on each edge.
+fn edmonds_karp_flows(
+    edge_ptr: &[usize],
+    tails: &[usize],
+    heads: &[usize],
+    capacities: &[i32],
+    rev_edge: &[usize],
+    source: usize,
+    sink: usize,
+) -> Vec<i32> {
+    const NO_EDGE: usize = usize::MAX;
+    let n = edge_ptr.len() - 1;
+    let mut flow = vec![0i32; heads.len()];
+    let mut queue = vec![0usize; n];
+    let mut pred_edge = vec![NO_EDGE; n];
+    loop {
+        pred_edge.fill(NO_EDGE);
+        queue[0] = source;
+        let (mut start, mut end) = (0usize, 1usize);
+        let mut path_found = false;
+        while start != end && !path_found {
+            let cur = queue[start];
+            start += 1;
+            for e in edge_ptr[cur]..edge_ptr[cur + 1] {
+                let t = heads[e];
+                if pred_edge[t] == NO_EDGE && t != source && capacities[e] > flow[e] {
+                    pred_edge[t] = e;
+                    if t == sink {
+                        path_found = true;
+                        break;
+                    }
+                    queue[end] = t;
+                    end += 1;
+                }
+            }
+        }
+        if !path_found {
+            return flow;
+        }
+        let mut df = i32::MAX;
+        let mut t = sink;
+        while t != source {
+            let e = pred_edge[t];
+            df = df.min(capacities[e].wrapping_sub(flow[e]));
+            t = tails[e];
+        }
+        let mut t = sink;
+        while t != source {
+            let e = pred_edge[t];
+            flow[e] = flow[e].wrapping_add(df);
+            flow[rev_edge[e]] = flow[rev_edge[e]].wrapping_sub(df);
+            t = tails[e];
+        }
+    }
+}
+
+/// SciPy's `_dinic`: blocking flows in level graphs. `capacities` are the residual capacities
+/// and are consumed. Returns the flow on each edge.
+fn dinic_flows(
+    edge_ptr: &[usize],
+    heads: &[usize],
+    capacities: &mut [i32],
+    rev_edge: &[usize],
+    source: usize,
+    sink: usize,
+) -> Vec<i32> {
+    let n = edge_ptr.len() - 1;
+    let mut levels = vec![-1i64; n];
+    let mut progress = vec![0usize; n];
+    let mut queue = vec![0usize; n];
+    let mut stack = vec![(0usize, 0i32); n];
+    let mut flows = vec![0i32; heads.len()];
+    loop {
+        levels.fill(-1);
+        // SciPy's `_build_level_graph`: breadth-first levels over edges with residual capacity,
+        // stopping when the sink is dequeued.
+        queue[0] = source;
+        let (mut start, mut end) = (0usize, 1usize);
+        levels[source] = 0;
+        let mut reached_sink = false;
+        while start != end {
+            let cur = queue[start];
+            start += 1;
+            if cur == sink {
+                reached_sink = true;
+                break;
+            }
+            for e in edge_ptr[cur]..edge_ptr[cur + 1] {
+                let dst = heads[e];
+                if capacities[e] > 0 && levels[dst] == -1 {
+                    levels[dst] = levels[cur] + 1;
+                    queue[end] = dst;
+                    end += 1;
+                }
+            }
+        }
+        if !reached_sink {
+            return flows;
+        }
+        progress.copy_from_slice(&edge_ptr[..n]);
+        while dinic_augment(
+            edge_ptr,
+            source,
+            sink,
+            &levels,
+            heads,
+            rev_edge,
+            capacities,
+            &mut progress,
+            &mut flows,
+            &mut stack,
+        ) {}
+    }
+}
+
+/// SciPy's `_augment_paths`: one depth-first augmenting path in the level graph, resuming each
+/// vertex's edge scan at `progress`. Every vertex it stands on has an edge (it was reached along
+/// one, and that edge's reverse starts at it; the source reached the sink), so `progress` of a
+/// stacked vertex always names one of its own edges.
+fn dinic_augment(
+    edge_ptr: &[usize],
+    source: usize,
+    sink: usize,
+    levels: &[i64],
+    heads: &[usize],
+    rev_edge: &[usize],
+    capacities: &mut [i32],
+    progress: &mut [usize],
+    flows: &mut [i32],
+    stack: &mut [(usize, i32)],
+) -> bool {
+    let mut top = 0usize;
+    stack[0] = (source, i32::MAX);
+    loop {
+        let (mut current, flow) = stack[top];
+        let e = progress[current];
+        let dst = heads[e];
+        if capacities[e] > 0 && levels[dst] == levels[current] + 1 {
+            let current_flow = flow.min(capacities[e]);
+            if dst == sink {
+                for &(vertex, _) in stack[..=top].iter().rev() {
+                    let e = progress[vertex];
+                    let r = rev_edge[e];
+                    capacities[e] = capacities[e].wrapping_sub(current_flow);
+                    capacities[r] = capacities[r].wrapping_add(current_flow);
+                    flows[e] = flows[e].wrapping_add(current_flow);
+                    flows[r] = flows[r].wrapping_sub(current_flow);
+                }
+                return true;
+            }
+            top += 1;
+            stack[top] = (dst, current_flow);
+        } else {
+            while progress[current] + 1 == edge_ptr[current + 1] {
+                if top == 0 {
+                    return false;
+                }
+                top -= 1;
+                current = stack[top].0;
+            }
+            progress[current] += 1;
+        }
+    }
+}
+
+/// `perm_type=` of [`maximum_bipartite_matching`], as in SciPy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchingPermType {
+    /// One entry per column: the row matched to it. SciPy's default.
+    #[default]
+    Row,
+    /// One entry per row: the column matched to it.
+    Column,
+}
+
+/// SciPy's `_hopcroft_karp` on a CSR pattern with `n_rows` rows and `n_cols` columns. Returns
+/// `(x, y)`: `x[row]` is the column matched to `row` and `y[col]` the row matched to `col`, -1
+/// when unmatched.
+fn hopcroft_karp(
+    indptr: &[usize],
+    indices: &[usize],
+    n_rows: usize,
+    n_cols: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    const INF: i64 = i32::MAX as i64;
+    // Every unmatched column is matched to the auxiliary row `aux`.
+    let aux = n_rows;
+    let mut x = vec![-1i64; n_rows];
+    let mut y = vec![aux; n_cols];
+    let mut dist = vec![0i64; n_rows + 1];
+    let mut queue = vec![0usize; n_rows + 1];
+    let mut stack: Vec<usize> = Vec::with_capacity(n_rows + 1);
+    let mut parents = vec![0usize; n_rows];
+    loop {
+        let (mut head, mut tail) = (0usize, 0usize);
+        for v in 0..n_rows {
+            if x[v] < 0 {
+                dist[v] = 0;
+                queue[tail] = v;
+                tail += 1;
+            } else {
+                dist[v] = INF;
+            }
+        }
+        dist[aux] = INF;
+        while head < tail {
+            let v = queue[head];
+            head += 1;
+            if dist[v] < dist[aux] {
+                for &u in &indices[indptr[v]..indptr[v + 1]] {
+                    let yu = y[u];
+                    if dist[yu] == INF {
+                        dist[yu] = dist[v] + 1;
+                        queue[tail] = yu;
+                        tail += 1;
+                    }
+                }
+            }
+        }
+        if dist[aux] == INF {
+            break;
+        }
+        // Depth-first search from every unmatched row, along the BFS layers.
+        for w in 0..n_rows {
+            if x[w] >= 0 {
+                continue;
+            }
+            stack.clear();
+            stack.push(w);
+            let mut done = false;
+            while let Some(popped) = stack.pop() {
+                let mut v = popped;
+                for up in indptr[v]..indptr[v + 1] {
+                    let mut u = indices[up];
+                    let yu = y[u];
+                    if dist[yu] == dist[v] + 1 {
+                        if yu == aux {
+                            done = true;
+                            // Flip the matching along the path back to the root.
+                            loop {
+                                dist[v] = INF;
+                                let u_old = x[v];
+                                y[u] = v;
+                                x[v] = u as i64;
+                                if v == w {
+                                    break;
+                                }
+                                u = u_old as usize;
+                                v = parents[v];
+                            }
+                            break;
+                        }
+                        stack.push(yu);
+                        parents[yu] = v;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    let y = y
+        .into_iter()
+        .map(|row| if row == aux { -1 } else { row as i64 })
+        .collect();
+    (x, y)
+}
+
+/// `scipy.sparse.csgraph.maximum_bipartite_matching(graph, perm_type)`: a maximum matching of
+/// the bipartite graph whose rows are one side and columns the other (every stored entry is an
+/// edge, explicit zeros included), by SciPy's Hopcroft–Karp. `Row` returns, per column, the row
+/// matched to it; `Column`, per row, the column; -1 marks an unmatched vertex. Which of several
+/// maximum matchings comes out is SciPy's: rows are scanned in storage order.
+#[must_use]
+pub fn maximum_bipartite_matching(graph: &CsrMatrix, perm_type: MatchingPermType) -> Vec<i64> {
+    let shape = graph.shape();
+    let (x, y) = hopcroft_karp(graph.indptr(), graph.indices(), shape.rows, shape.cols);
+    match perm_type {
+        MatchingPermType::Row => y,
+        MatchingPermType::Column => x,
+    }
+}
+
+fn no_full_matching() -> SparseError {
+    SparseError::InvalidArgument {
+        message: "no full matching exists".to_string(),
+    }
+}
+
+/// `scipy.sparse.csgraph.min_weight_full_bipartite_matching(biadjacency, maximize)`: a
+/// matching of `min(rows, cols)` edges with the least total weight (the most, with `maximize`),
+/// as `(row_ind, col_ind)` with `row_ind` increasing.
+///
+/// As in SciPy: with `maximize` the weights are negated first; then +infinity entries and zeros
+/// (explicit zeros included; SciPy warns about those) are not edges. An error "no full matching
+/// exists" when Hopcroft–Karp finds no matching of that size, or LAPJVsp runs out of columns (a
+/// row of NaN weights, a -infinity weight). A wide or square graph runs SciPy's LAPJVsp port
+/// directly; a tall one runs it on the transpose. Which of several optimal matchings comes out
+/// is SciPy's.
+pub fn min_weight_full_bipartite_matching(
+    biadjacency: &CsrMatrix,
+    maximize: bool,
+) -> SparseResult<(Vec<usize>, Vec<usize>)> {
+    let shape = biadjacency.shape();
+    let (n_rows, n_cols) = (shape.rows, shape.cols);
+    let (in_indptr, in_indices, in_data) = (
+        biadjacency.indptr(),
+        biadjacency.indices(),
+        biadjacency.data(),
+    );
+    let mut indptr = vec![0usize; n_rows + 1];
+    let mut indices = Vec::with_capacity(in_indices.len());
+    let mut data = Vec::with_capacity(in_data.len());
+    for row in 0..n_rows {
+        for entry in in_indptr[row]..in_indptr[row + 1] {
+            let w = if maximize {
+                -in_data[entry]
+            } else {
+                in_data[entry]
+            };
+            if w != 0.0 && w != f64::INFINITY {
+                indices.push(in_indices[entry]);
+                data.push(w);
+            }
+        }
+        indptr[row + 1] = indices.len();
+    }
+    let full = n_rows.min(n_cols);
+    if n_cols < n_rows {
+        let (t_indptr, t_indices, order) = csr_transpose_order(&indptr, &indices, n_cols);
+        let t_data: Vec<f64> = order.iter().map(|&entry| data[entry]).collect();
+        let (matching, _) = hopcroft_karp(&t_indptr, &t_indices, n_cols, n_rows);
+        if matching.iter().filter(|&&m| m != -1).count() != full {
+            return Err(no_full_matching());
+        }
+        let b = lapjvsp((&t_indptr, &t_indices, &t_data), n_cols, n_rows)?;
+        // np.argsort(b): b is a matching, so its values are distinct and the order unambiguous.
+        let mut pairs: Vec<(usize, usize)> = b
+            .into_iter()
+            .enumerate()
+            .map(|(col, row)| (row, col))
+            .collect();
+        pairs.sort_unstable();
+        Ok(pairs.into_iter().unzip())
+    } else {
+        let (matching, _) = hopcroft_karp(&indptr, &indices, n_rows, n_cols);
+        if matching.iter().filter(|&&m| m != -1).count() != full {
+            return Err(no_full_matching());
+        }
+        let b = lapjvsp((&indptr, &indices, &data), n_rows, n_cols)?;
+        Ok(((0..full).collect(), b))
+    }
+}
+
+/// The working arrays of SciPy's `_lapjvsp` (Volgenant's LAPJVS.P), with -1 for "none".
+struct Lapjvsp {
+    v: Vec<f64>,
+    x: Vec<isize>,
+    y: Vec<isize>,
+    d: Vec<f64>,
+    ok: Vec<bool>,
+    free: Vec<isize>,
+    todo: Vec<isize>,
+    lab: Vec<usize>,
+}
+
+/// An index SciPy's port would read out of bounds (a -1 "none" used as an index) can only come
+/// from an infeasible problem there; here it is the same "no full matching exists" error.
+fn lapjvsp_index(i: isize) -> SparseResult<usize> {
+    usize::try_from(i).map_err(|_| no_full_matching())
+}
+
+/// SciPy's `_lapjvsp` on the CSR graph `(first, kk, cc)` with `nr <= nc`: for each row, the
+/// column matched to it in a minimum-weight matching that covers every row.
+fn lapjvsp(graph: CsrAdjacency<'_>, nr: usize, nc: usize) -> SparseResult<Vec<usize>> {
+    const INF: f64 = f64::INFINITY;
+    let (first, kk, cc) = graph;
+    let at = lapjvsp_index;
+    let mut s = Lapjvsp {
+        v: vec![0.0; nc],
+        x: vec![-1; nr],
+        y: vec![-1; nc],
+        d: vec![0.0; nc],
+        ok: vec![false; nc],
+        free: vec![-1; nr],
+        todo: vec![-1; nc],
+        lab: vec![0; nc],
+    };
+    let l0 = if nr == nc {
+        // Column reduction (from line 55 of LAPJVS.P).
+        s.v.fill(INF);
+        for i in 0..nr {
+            for t in first[i]..first[i + 1] {
+                let jp = kk[t];
+                if cc[t] < s.v[jp] {
+                    s.v[jp] = cc[t];
+                    s.y[jp] = i.cast_signed();
+                }
+            }
+        }
+        let mut xinv = vec![false; nr];
+        for jp in (0..nc).rev() {
+            let i = at(s.y[jp])?;
+            if s.x[i] == -1 {
+                s.x[i] = jp.cast_signed();
+            } else {
+                s.y[jp] = -1;
+                xinv[i] = true;
+            }
+        }
+        // Reduction transfer.
+        let mut lp = 0usize;
+        for i in 0..nr {
+            if xinv[i] {
+                continue;
+            }
+            if s.x[i] != -1 {
+                let j1 = at(s.x[i])?;
+                let mut min_diff = INF;
+                for t in first[i]..first[i + 1] {
+                    let jp = kk[t];
+                    if jp != j1 && cc[t] - s.v[jp] < min_diff {
+                        min_diff = cc[t] - s.v[jp];
+                    }
+                }
+                let mut tp = first[i];
+                while kk[tp] != j1 {
+                    tp += 1;
+                }
+                s.v[j1] = cc[tp] - min_diff;
+            } else {
+                s.free[lp] = i.cast_signed();
+                lp += 1;
+            }
+        }
+        // Two rounds of augmenting row reduction.
+        for _ in 0..2 {
+            let mut h = 0usize;
+            let l0p = lp;
+            lp = 0;
+            while h < l0p {
+                let i = at(s.free[h])?;
+                h += 1;
+                let (mut j0p, mut j1p) = (-1isize, -1isize);
+                let (mut v0, mut vj) = (INF, INF);
+                for t in first[i]..first[i + 1] {
+                    let jp = kk[t];
+                    let dj = cc[t] - s.v[jp];
+                    if dj < vj {
+                        if dj >= v0 {
+                            vj = dj;
+                            j1p = jp.cast_signed();
+                        } else {
+                            vj = v0;
+                            v0 = dj;
+                            j1p = j0p;
+                            j0p = jp.cast_signed();
+                        }
+                    }
+                }
+                let mut i0 = s.y[at(j0p)?];
+                if v0 < vj {
+                    s.v[at(j0p)?] += v0 - vj;
+                } else if i0 != -1 {
+                    j0p = j1p;
+                    i0 = s.y[at(j0p)?];
+                }
+                s.x[i] = j0p;
+                s.y[at(j0p)?] = i.cast_signed();
+                if i0 != -1 {
+                    if v0 < vj {
+                        h -= 1;
+                        s.free[h] = i0;
+                    } else {
+                        s.free[lp] = i0;
+                        lp += 1;
+                    }
+                }
+            }
+        }
+        lp
+    } else {
+        for (i, slot) in s.free.iter_mut().enumerate() {
+            *slot = i.cast_signed();
+        }
+        nr
+    };
+    // Augmentation, one free row at a time. `td1` carries over between rows, as in SciPy.
+    let mut td1 = -1isize;
+    for l in 0..l0 {
+        td1 = s.single_l(graph, l, nc, td1)?;
+    }
+    s.x.into_iter().map(at).collect()
+}
+
+impl Lapjvsp {
+    /// SciPy's `_lapjvsp_single_l`: a shortest augmenting path from free row `free[l]`.
+    fn single_l(
+        &mut self,
+        graph: CsrAdjacency<'_>,
+        l: usize,
+        nc: usize,
+        mut td1: isize,
+    ) -> SparseResult<isize> {
+        const INF: f64 = f64::INFINITY;
+        let (first, kk, cc) = graph;
+        let at = lapjvsp_index;
+        self.d.fill(INF);
+        self.ok.fill(false);
+        let mut min_diff = INF;
+        let i0 = at(self.free[l])?;
+        for t in first[i0]..first[i0 + 1] {
+            let j = kk[t];
+            let dj = cc[t] - self.v[j];
+            self.d[j] = dj;
+            self.lab[j] = i0;
+            if dj <= min_diff {
+                if dj < min_diff {
+                    td1 = -1;
+                    min_diff = dj;
+                }
+                td1 += 1;
+                self.todo[at(td1)?] = j.cast_signed();
+            }
+        }
+        for hp in 0..=td1 {
+            let j = at(self.todo[at(hp)?])?;
+            if self.y[j] == -1 {
+                self.update_assignments(j, i0)?;
+                return Ok(td1);
+            }
+            self.ok[j] = true;
+        }
+        let mut td2 = nc.cast_signed() - 1;
+        let mut last = nc;
+        loop {
+            if td1 < 0 {
+                return Err(no_full_matching());
+            }
+            let j0 = at(self.todo[at(td1)?])?;
+            td1 -= 1;
+            let i = at(self.y[j0])?;
+            self.todo[at(td2)?] = j0.cast_signed();
+            td2 -= 1;
+            let mut tp = first[i];
+            while kk[tp] != j0 {
+                tp += 1;
+            }
+            let h = cc[tp] - self.v[j0] - min_diff;
+            for t in first[i]..first[i + 1] {
+                let j = kk[t];
+                if self.ok[j] {
+                    continue;
+                }
+                let vj = cc[t] - self.v[j] - h;
+                if vj < self.d[j] {
+                    self.d[j] = vj;
+                    self.lab[j] = i;
+                    if vj == min_diff {
+                        if self.y[j] == -1 {
+                            self.update_dual(nc, last, min_diff)?;
+                            self.update_assignments(j, i0)?;
+                            return Ok(td1);
+                        }
+                        td1 += 1;
+                        self.todo[at(td1)?] = j.cast_signed();
+                        self.ok[j] = true;
+                    }
+                }
+            }
+            if td1 == -1 {
+                // LAPJVS.P uses large finite numbers where this uses infinity.
+                min_diff = INF;
+                last = at(td2 + 1)?;
+                for jp in 0..nc {
+                    let dj = self.d[jp];
+                    if dj != INF && dj <= min_diff && !self.ok[jp] {
+                        if dj < min_diff {
+                            td1 = -1;
+                            min_diff = dj;
+                        }
+                        td1 += 1;
+                        self.todo[at(td1)?] = jp.cast_signed();
+                    }
+                }
+                for hp in 0..=td1 {
+                    let j = at(self.todo[at(hp)?])?;
+                    if self.y[j] == -1 {
+                        self.update_dual(nc, last, min_diff)?;
+                        self.update_assignments(j, i0)?;
+                        return Ok(td1);
+                    }
+                    self.ok[j] = true;
+                }
+            }
+        }
+    }
+
+    /// SciPy's `_lapjvsp_update_dual`.
+    fn update_dual(&mut self, nc: usize, last: usize, min_diff: f64) -> SparseResult<()> {
+        for k in last..nc {
+            let j0 = lapjvsp_index(self.todo[k])?;
+            self.v[j0] += self.d[j0] - min_diff;
+        }
+        Ok(())
+    }
+
+    /// SciPy's `_lapjvsp_update_assignments`: flip the alternating path ending at column `j`.
+    fn update_assignments(&mut self, mut j: usize, i0: usize) -> SparseResult<()> {
+        loop {
+            let i = self.lab[j];
+            self.y[j] = i.cast_signed();
+            let next = self.x[i];
+            self.x[i] = j.cast_signed();
+            if i == i0 {
+                return Ok(());
+            }
+            j = lapjvsp_index(next)?;
+        }
+    }
+}
+
+/// What [`yen`] returns: SciPy's `yen(..., return_predecessors=True)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YenResult {
+    /// The lengths of the loopless paths found, shortest first; at most `k` of them.
+    pub distances: Vec<f64>,
+    /// `predecessors[m][j]`: the node before `j` on the `m`-th path, -1 for a node off the path
+    /// and for the source (SciPy's -9999).
+    pub predecessors: Vec<Vec<i64>>,
+}
+
+/// SciPy's `_johnson_directed` / `_johnson_undirected`: Bellman–Ford potentials from a virtual
+/// node joined to every node by a zero-weight edge, `n` passes, then the `1e-15` check. `Err`
+/// names the node whose check failed, as SciPy's `NegativeCycleError` does.
+fn johnson_potentials(
+    graph: CsrAdjacency<'_>,
+    n: usize,
+    directed: bool,
+) -> Result<Vec<f64>, usize> {
+    const EPS: f64 = 1e-15; // SciPy's DTYPE_EPS
+    let (indptr, indices, weights) = graph;
+    let mut h = vec![0.0; n];
+    for _ in 0..n {
+        for j in 0..n {
+            let mut d1 = h[j];
+            for e in indptr[j]..indptr[j + 1] {
+                let (k, w) = (indices[e], weights[e]);
+                let d2 = h[k];
+                if d1 + w < d2 {
+                    h[k] = d1 + w;
+                }
+                // SciPy's undirected pass tests the reverse direction against the d2 it read
+                // BEFORE the update above.
+                if !directed && d2 + w < d1 {
+                    d1 = d2 + w;
+                    h[j] = d1;
+                }
+            }
+        }
+    }
+    for j in 0..n {
+        let d1 = h[j];
+        for e in indptr[j]..indptr[j + 1] {
+            let (d2, w) = (h[indices[e]], weights[e]);
+            let violated = if directed {
+                d1 + w + EPS < d2
+            } else {
+                (d2 - d1).abs() > w + EPS
+            };
+            if violated {
+                return Err(j);
+            }
+        }
+    }
+    Ok(h)
+}
+
+/// SciPy's `_johnson_add_weights`: `w(u, v) += h(u)`, then `-= h(v)`.
+fn johnson_reweight(indptr: &[usize], indices: &[usize], weights: &mut [f64], h: &[f64]) {
+    for j in 0..indptr.len().saturating_sub(1) {
+        for e in indptr[j]..indptr[j + 1] {
+            weights[e] += h[j];
+            weights[e] -= h[indices[e]];
+        }
+    }
+}
+
+/// SciPy's `_YenCandidatePaths`: the best candidate paths so far, shortest first. A path is
+/// stored from the sink back to the source.
+struct YenCandidates {
+    items: Vec<(f64, Vec<usize>, usize)>,
+    required: usize,
+}
+
+impl YenCandidates {
+    /// Insert before any candidate of equal length (`std::lower_bound`), then keep the
+    /// `required` shortest.
+    fn insert(
+        &mut self,
+        distance: f64,
+        source_to_spur: &[i64],
+        spur_to_sink: &[i64],
+        spur: usize,
+        sink: usize,
+    ) {
+        if self.items.len() >= self.required
+            && self
+                .items
+                .last()
+                .is_some_and(|&(longest, _, _)| distance >= longest)
+        {
+            return;
+        }
+        let mut path = Vec::new();
+        let mut node = sink;
+        while node != spur {
+            path.push(node);
+            match usize::try_from(spur_to_sink[node]) {
+                Ok(prev) => node = prev,
+                Err(_) => return,
+            }
+        }
+        let mut node = i64::try_from(spur).unwrap_or(-1);
+        while let Ok(at) = usize::try_from(node) {
+            path.push(at);
+            node = source_to_spur[at];
+        }
+        let at = self.items.partition_point(|&(d, _, _)| d < distance);
+        self.items.insert(at, (distance, path, spur));
+        self.items.truncate(self.required);
+    }
+
+    /// Remove the shortest candidate into `target` (one predecessor row) and return its spur.
+    fn pop_into(&mut self, target: &mut [i64]) -> usize {
+        let (_, path, spur) = self.items.remove(0);
+        for pair in path.windows(2) {
+            target[pair[0]] = pair[1] as i64;
+        }
+        self.required -= 1;
+        spur
+    }
+}
+
+/// `scipy.sparse.csgraph.yen(csgraph, source, sink, K, directed, return_predecessors=True,
+/// unweighted)`: up to `k` loopless paths from `source` to `sink`, shortest first.
+///
+/// A port of SciPy's `_yen`, spur node by spur node, over SciPy's Dijkstra ([`dijkstra`]'s heap
+/// order), so which of several equally long paths comes first is SciPy's: a new candidate goes
+/// before any queued one of the same length. Negative weights are first made non-negative with
+/// Johnson's potentials, and a negative cycle is [`SparseError::NegativeCycle`] (undirected, any
+/// negative edge is one). `unweighted` counts edges. Like [`dijkstra`], and unlike SciPy, NaN
+/// or infinite weights are refused. `k = 0` finds nothing; `source == sink` finds the empty
+/// path, of length 0.
+pub fn yen(
+    csgraph: &CsrMatrix,
+    source: usize,
+    sink: usize,
+    k: usize,
+    directed: bool,
+    unweighted: bool,
+) -> SparseResult<YenResult> {
+    validate_csgraph(csgraph)?;
+    let n = csgraph.shape().rows;
+    if source >= n || sink >= n {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "For csgraph with shape (N, N), must have 0 <= source < N and 0 <= sink < N. \
+                 Got N={n}, source={source}, sink={sink}."
+            ),
+        });
+    }
+    let (indptr, indices) = (csgraph.indptr(), csgraph.indices());
+    let nnz = indices.len();
+    let mut weights = if unweighted {
+        vec![1.0; nnz]
+    } else {
+        csgraph.data().to_vec()
+    };
+    let potentials = if !unweighted && weights.iter().any(|&w| w < 0.0) {
+        let h = johnson_potentials((indptr, indices, &weights), n, directed).map_err(|node| {
+            SparseError::NegativeCycle {
+                message: format!("Negative cycle detected on node {node}"),
+            }
+        })?;
+        johnson_reweight(indptr, indices, &mut weights, &h);
+        Some(h)
+    } else {
+        None
+    };
+    let transpose = (!directed).then(|| {
+        let (t_indptr, t_indices, order) = csr_transpose_order(indptr, indices, n);
+        let mut t_weights: Vec<f64> = if unweighted {
+            vec![1.0; nnz]
+        } else {
+            order.iter().map(|&e| csgraph.data()[e]).collect()
+        };
+        if let Some(h) = &potentials {
+            johnson_reweight(&t_indptr, &t_indices, &mut t_weights, h);
+        }
+        (t_indptr, t_indices, t_weights)
+    });
+    let (mut distances, mut predecessors) = yen_paths(
+        (indptr, indices, &weights),
+        transpose.as_ref().map(|(p, i, w)| (&p[..], &i[..], &w[..])),
+        n,
+        source,
+        sink,
+        k,
+    )?;
+    if let Some(h) = &potentials {
+        let shift = h[sink] - h[source];
+        for d in &mut distances {
+            *d += shift;
+        }
+    }
+    let found = distances.iter().filter(|&&d| d < f64::INFINITY).count();
+    distances.truncate(found);
+    predecessors.truncate(found);
+    Ok(YenResult {
+        distances,
+        predecessors,
+    })
+}
+
+/// SciPy's `_yen` over non-negative `graph` weights (and the transpose's, undirected). Returns
+/// `k` distances (infinity past the last path found) and `k` predecessor rows.
+fn yen_paths(
+    graph: CsrAdjacency<'_>,
+    transpose: Option<CsrAdjacency<'_>>,
+    n: usize,
+    source: usize,
+    sink: usize,
+    k: usize,
+) -> SparseResult<(Vec<f64>, Vec<Vec<i64>>)> {
+    const INF: f64 = f64::INFINITY;
+    let mut distances = vec![INF; k];
+    let mut paths = vec![vec![-1_i64; n]; k];
+    if k == 0 {
+        return Ok((distances, paths));
+    }
+    let (indptr, indices, original) = graph;
+    let mut dist = vec![INF; n];
+    let mut pred = vec![-1_i64; n];
+    dijkstra_scan(graph, transpose, &mut dist, &mut pred, source);
+    distances[0] = dist[sink];
+    if distances[0] == INF {
+        return Ok((distances, paths));
+    }
+    let mut weights = original.to_vec();
+    let mut t_weights: Vec<f64> = transpose.map_or_else(Vec::new, |(_, _, w)| w.to_vec());
+    let mut node = i64::try_from(sink).unwrap_or(-1);
+    while let Ok(at) = usize::try_from(node) {
+        paths[0][at] = pred[at];
+        node = pred[at];
+    }
+    // The node before `node` on a path row, which the walks below only ask of nodes on it.
+    let before = |row: &[i64], node: usize| -> SparseResult<usize> {
+        usize::try_from(row[node]).map_err(|_| SparseError::InvalidArgument {
+            message: format!("node {node} has no predecessor on the previous path"),
+        })
+    };
+
+    let mut candidates = YenCandidates {
+        items: Vec::new(),
+        required: k,
+    };
+    let mut previous_spur = source;
+    for kth in 1..k {
+        let mut spur = sink;
+        let mut root_distance = distances[kth - 1];
+        while spur != previous_spur {
+            // Step the spur node back along the previous path, shortening the root path by
+            // the (lightest current) weight of the edge crossed.
+            let tmp_i = before(&paths[kth - 1], spur)?;
+            let mut tmp_d = INF;
+            for e in indptr[tmp_i]..indptr[tmp_i + 1] {
+                if indices[e] == spur {
+                    tmp_d = weights[e];
+                    break;
+                }
+            }
+            if let Some((t_indptr, t_indices, _)) = transpose {
+                for e in t_indptr[tmp_i]..t_indptr[tmp_i + 1] {
+                    if t_indices[e] == spur && t_weights[e] < tmp_d {
+                        tmp_d = t_weights[e];
+                        break;
+                    }
+                }
+            }
+            if tmp_d == INF {
+                return Err(SparseError::InvalidArgument {
+                    message: format!("No edge between nodes {tmp_i} and {spur}"),
+                });
+            }
+            root_distance -= tmp_d;
+            spur = tmp_i;
+            let spur_id = spur as i64;
+
+            // Remove the next edge of every path found so far that shares this root path.
+            for found in &paths[..kth] {
+                let mut node = spur;
+                while found[node] == paths[kth - 1][node] {
+                    if node == source {
+                        for e in indptr[spur]..indptr[spur + 1] {
+                            if found[indices[e]] == spur_id {
+                                weights[e] = INF;
+                            }
+                        }
+                        if let Some((t_indptr, t_indices, _)) = transpose {
+                            for e in t_indptr[spur]..t_indptr[spur + 1] {
+                                if found[t_indices[e]] == spur_id {
+                                    t_weights[e] = INF;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    node = before(found, node)?;
+                }
+            }
+            // Remove the root path's nodes other than the spur node.
+            let mut node = paths[kth - 1][spur];
+            while let Ok(at) = usize::try_from(node) {
+                weights[indptr[at]..indptr[at + 1]].fill(INF);
+                if let Some((t_indptr, _, _)) = transpose {
+                    t_weights[t_indptr[at]..t_indptr[at + 1]].fill(INF);
+                }
+                node = paths[kth - 1][at];
+            }
+
+            pred.fill(-1);
+            dist.fill(INF);
+            dist[source] = 0.0;
+            dijkstra_scan(
+                (indptr, indices, &weights),
+                transpose.map(|(t_indptr, t_indices, _)| (t_indptr, t_indices, &t_weights[..])),
+                &mut dist,
+                &mut pred,
+                spur,
+            );
+            let total = dist[sink] + root_distance;
+            if total != INF {
+                candidates.insert(total, &paths[kth - 1], &pred, spur, sink);
+            }
+
+            // Restore the weights of the root path's nodes, the spur node included.
+            let mut node = spur_id;
+            while let Ok(at) = usize::try_from(node) {
+                let row = indptr[at]..indptr[at + 1];
+                weights[row.clone()].copy_from_slice(&original[row]);
+                if let Some((t_indptr, _, t_original)) = transpose {
+                    let row = t_indptr[at]..t_indptr[at + 1];
+                    t_weights[row.clone()].copy_from_slice(&t_original[row]);
+                }
+                node = paths[kth - 1][at];
+            }
+        }
+        let Some(&(shortest, _, _)) = candidates.items.first() else {
+            break;
+        };
+        distances[kth] = shortest;
+        previous_spur = candidates.pop_into(&mut paths[kth]);
+    }
+    Ok((distances, paths))
+}
+
+/// frankenscipy-fdepw. Every expected value below was printed by live SciPy 1.17.1 (numpy
+/// 2.4.3) from the scratchpad scripts `csgraph/probe1.py` .. `probe4.py`, `gen_unit.py`,
+/// `gen_unit2.py` and `search_flow4.py`; SciPy's -9999 "no predecessor" is written -1.
+#[cfg(test)]
+mod csgraph_fdepw_tests {
+    use super::*;
+
+    const INF: f64 = f64::INFINITY;
+
+    /// A CSR matrix from entries listed in storage order (grouped by row, in the order given):
+    /// explicit zeros, duplicates and unsorted rows are kept as listed.
+    fn csr(n_rows: usize, n_cols: usize, entries: &[(usize, usize, f64)]) -> CsrMatrix {
+        assert!(
+            entries.windows(2).all(|w| w[0].0 <= w[1].0),
+            "grouped by row"
+        );
+        let mut indptr = vec![0usize; n_rows + 1];
+        for &(row, _, _) in entries {
+            indptr[row + 1] += 1;
+        }
+        for row in 0..n_rows {
+            indptr[row + 1] += indptr[row];
+        }
+        CsrMatrix::from_components(
+            Shape2D::new(n_rows, n_cols),
+            entries.iter().map(|e| e.2).collect(),
+            entries.iter().map(|e| e.1).collect(),
+            indptr,
+            false,
+        )
+        .expect("csr")
+    }
+
+    fn dense_csr(rows: &[&[f64]]) -> CsrMatrix {
+        let entries: Vec<(usize, usize, f64)> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| {
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &w)| w != 0.0)
+                    .map(move |(c, &w)| (r, c, w))
+            })
+            .collect();
+        csr(rows.len(), rows.first().map_or(0, |r| r.len()), &entries)
+    }
+
+    fn parts(m: &CsrMatrix) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+        (m.indptr().to_vec(), m.indices().to_vec(), m.data().to_vec())
+    }
+
+    fn to_dense(m: &CsrMatrix) -> Vec<Vec<f64>> {
+        let shape = m.shape();
+        let mut out = vec![vec![0.0; shape.cols]; shape.rows];
+        for row in 0..shape.rows {
+            for e in m.indptr()[row]..m.indptr()[row + 1] {
+                out[row][m.indices()[e]] += m.data()[e];
+            }
+        }
+        out
+    }
+
+    /// The message of an InvalidArgument error. Anything else maps to a sentinel that the
+    /// callers' expected messages never equal.
+    fn invalid_argument(result: SparseResult<impl std::fmt::Debug>) -> String {
+        match result {
+            Err(SparseError::InvalidArgument { message }) => message,
+            _ => "<not an InvalidArgument error>".to_string(),
+        }
+    }
+
+    /// SciPy 1.17.1 (`search_flow4.py`): the smallest random graph whose SciPy flow differs from
+    /// a depth-first Ford–Fulkerson's. Dinic and Edmonds–Karp agree with each other (both augment
+    /// the first shortest path in edge order; 40,000 random graphs never separated them), and
+    /// SciPy sends 1 -> 2 -> 4 where the DFS sends 1 -> 3 -> 4. Every pair with edges both ways
+    /// keeps its own capacity, and the missing reverses are explicit zeros.
+    #[test]
+    fn maximum_flow_returns_scipys_flow_among_the_maximum_flows() {
+        let g = csr(
+            5,
+            5,
+            &[
+                (0, 1, 3.0),
+                (0, 2, 1.0),
+                (1, 2, 2.0),
+                (1, 3, 1.0),
+                (1, 4, 2.0),
+                (2, 0, 2.0),
+                (2, 1, 1.0),
+                (2, 4, 2.0),
+                (3, 2, 2.0),
+                (3, 4, 3.0),
+                (4, 1, 3.0),
+                (4, 3, 3.0),
+            ],
+        );
+        let want = (
+            vec![0, 2, 6, 10, 13, 16],
+            vec![1, 2, 0, 2, 3, 4, 0, 1, 3, 4, 1, 2, 4, 1, 2, 3],
+            vec![
+                3.0, 1.0, -3.0, 1.0, 0.0, 2.0, -1.0, -1.0, 0.0, 2.0, 0.0, 0.0, 0.0, -2.0, -2.0, 0.0,
+            ],
+        );
+        // The depth-first Ford–Fulkerson's flow, same value 4.
+        let dfs: [[f64; 5]; 5] = [
+            [0.0, 3.0, 1.0, 0.0, 0.0],
+            [-3.0, 0.0, 0.0, 1.0, 2.0],
+            [-1.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0, 0.0, 1.0],
+            [0.0, -2.0, -1.0, -1.0, 0.0],
+        ];
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&g, 0, 4, method).expect("maximum_flow");
+            assert_eq!(r.flow_value, 4, "{method:?}");
+            assert_eq!(parts(&r.flow), want, "{method:?}");
+            // Must-miss arm: the pinned answer is not the other maximum flow.
+            let ours = to_dense(&r.flow);
+            assert!(ours.iter().zip(&dfs).any(|(a, b)| a[..] != b[..]));
+            assert_eq!(dfs[0].iter().sum::<f64>(), 4.0);
+        }
+    }
+
+    /// SciPy's docstring example (CLRS 26.1), value 23, and its flow CSR from `probe1.py`.
+    #[test]
+    fn maximum_flow_clrs_example() {
+        let g = dense_csr(&[
+            &[0.0, 16.0, 13.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 10.0, 12.0, 0.0, 0.0],
+            &[0.0, 4.0, 0.0, 0.0, 14.0, 0.0],
+            &[0.0, 0.0, 9.0, 0.0, 0.0, 20.0],
+            &[0.0, 0.0, 0.0, 7.0, 0.0, 4.0],
+            &[0.0; 6],
+        ]);
+        let want = (
+            vec![0, 2, 5, 9, 13, 16, 18],
+            vec![1, 2, 0, 2, 3, 0, 1, 3, 4, 1, 2, 4, 5, 2, 3, 5, 3, 4],
+            vec![
+                12.0, 11.0, -12.0, 0.0, 12.0, -11.0, 0.0, 0.0, 11.0, -12.0, 0.0, -7.0, 19.0, -11.0,
+                7.0, 4.0, -19.0, -4.0,
+            ],
+        );
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&g, 0, 5, method).expect("maximum_flow");
+            assert_eq!(r.flow_value, 23);
+            assert_eq!(parts(&r.flow), want);
+        }
+    }
+
+    /// `probe1.py`: an unsorted row is sorted first; duplicated edges stay separate edges;
+    /// negative capacities are never used; an isolated source gives the reversed pattern with
+    /// zero flow.
+    #[test]
+    fn maximum_flow_storage_edge_cases() {
+        let unsorted = csr(3, 3, &[(0, 2, 5.0), (0, 1, 3.0)]);
+        let r = maximum_flow(&unsorted, 0, 2, MaximumFlowMethod::Dinic).expect("unsorted");
+        assert_eq!(
+            parts(&r.flow),
+            (
+                vec![0, 2, 3, 4],
+                vec![1, 2, 0, 0],
+                vec![0.0, 5.0, 0.0, -5.0]
+            )
+        );
+        assert_eq!(r.flow_value, 5);
+
+        let duplicated = csr(3, 3, &[(0, 1, 2.0), (0, 1, 3.0), (1, 2, 4.0)]);
+        for method in [MaximumFlowMethod::Dinic, MaximumFlowMethod::EdmondsKarp] {
+            let r = maximum_flow(&duplicated, 0, 2, method).expect("duplicated");
+            assert_eq!(r.flow_value, 4);
+            assert_eq!(
+                parts(&r.flow),
+                (
+                    vec![0, 2, 5, 6],
+                    vec![1, 1, 0, 0, 2, 1],
+                    vec![2.0, 2.0, -2.0, -2.0, 4.0, -4.0]
+                )
+            );
+        }
+
+        let negative = dense_csr(&[&[0.0, 3.0, -2.0], &[0.0, 0.0, 5.0], &[4.0, 0.0, 0.0]]);
+        let r = maximum_flow(&negative, 0, 2, MaximumFlowMethod::EdmondsKarp).expect("negative");
+        assert_eq!(r.flow_value, 3);
+        assert_eq!(
+            parts(&r.flow),
+            (
+                vec![0, 2, 4, 6],
+                vec![1, 2, 0, 2, 0, 1],
+                vec![3.0, 0.0, -3.0, 3.0, 0.0, -3.0]
+            )
+        );
+
+        let isolated = dense_csr(&[&[0.0; 3], &[0.0, 0.0, 1.0], &[0.0; 3]]);
+        let r = maximum_flow(&isolated, 0, 2, MaximumFlowMethod::Dinic).expect("isolated");
+        assert_eq!(r.flow_value, 0);
+        assert_eq!(
+            parts(&r.flow),
+            (vec![0, 0, 1, 2], vec![2, 1], vec![0.0, 0.0])
+        );
+    }
+
+    /// SciPy's ValueErrors, in SciPy's order: capacities first, then source == sink, shape,
+    /// then the bounds. fsci also refuses a capacity outside int32, which SciPy wraps.
+    #[test]
+    fn maximum_flow_refusals() {
+        let g = dense_csr(&[&[0.0, 5.0], &[0.0, 0.0]]);
+        let fractional = dense_csr(&[&[0.0, 1.5], &[0.0, 0.0]]);
+        assert_eq!(
+            invalid_argument(maximum_flow(&fractional, 0, 0, MaximumFlowMethod::Dinic)),
+            "graph capacities must be integers"
+        );
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 1, 1, MaximumFlowMethod::Dinic)),
+            "source and sink vertices must differ"
+        );
+        let wide = csr(2, 3, &[(0, 1, 1.0)]);
+        assert!(matches!(
+            maximum_flow(&wide, 0, 1, MaximumFlowMethod::Dinic),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 0, 7, MaximumFlowMethod::Dinic)),
+            "sink value (7) must be between 0 and 1"
+        );
+        assert_eq!(
+            invalid_argument(maximum_flow(&g, 9, 1, MaximumFlowMethod::Dinic)),
+            "source value (9) must be between 0 and 1"
+        );
+        let huge = dense_csr(&[&[0.0, 2_147_483_653.0], &[0.0, 0.0]]);
+        assert!(maximum_flow(&huge, 0, 1, MaximumFlowMethod::Dinic).is_err());
+        let r = maximum_flow(&g, 0, 1, MaximumFlowMethod::default()).expect("2-node flow");
+        assert_eq!(r.flow_value, 5);
+    }
+
+    /// `gen_unit.py`: Hopcroft–Karp finds 3 matched rows where a greedy first-free-column
+    /// matcher stops at 2 ([1, -1, -1, 0]); SciPy's choice is pinned per row and per column.
+    #[test]
+    fn maximum_bipartite_matching_is_hopcroft_karp_not_greedy() {
+        let g = csr(
+            4,
+            5,
+            &[
+                (0, 1, 1.0),
+                (0, 2, 1.0),
+                (0, 3, 1.0),
+                (1, 1, 1.0),
+                (2, 1, 1.0),
+                (3, 0, 1.0),
+                (3, 3, 1.0),
+                (3, 4, 1.0),
+            ],
+        );
+        let column = maximum_bipartite_matching(&g, MatchingPermType::Column);
+        assert_eq!(column, vec![2, 1, -1, 0]);
+        assert_ne!(column, vec![1, -1, -1, 0], "the greedy matching");
+        assert_eq!(
+            maximum_bipartite_matching(&g, MatchingPermType::Row),
+            vec![3, 1, 0, -1, -1]
+        );
+        // SciPy's docstring: explicit zeros are edges too.
+        let doc = csr(2, 3, &[(0, 2, 0.0), (1, 0, 0.0), (1, 1, 0.0)]);
+        assert_eq!(
+            maximum_bipartite_matching(&doc, MatchingPermType::Column),
+            vec![2, 0]
+        );
+        assert_eq!(
+            maximum_bipartite_matching(&doc, MatchingPermType::default()),
+            vec![1, -1, 0]
+        );
+        let empty = csr(2, 0, &[]);
+        assert_eq!(
+            maximum_bipartite_matching(&empty, MatchingPermType::Column),
+            vec![-1, -1]
+        );
+        assert!(maximum_bipartite_matching(&empty, MatchingPermType::Row).is_empty());
+    }
+
+    /// `gen_unit.py` / `probe3.py`. Among equally light matchings SciPy's LAPJVsp picks a
+    /// particular one: all-ones 4x4 gives [3, 0, 1, 2], not the identity a naive solver returns.
+    #[test]
+    fn min_weight_full_bipartite_matching_picks_scipys_optimum() {
+        let run = |rows: &[&[f64]], maximize: bool| {
+            min_weight_full_bipartite_matching(&dense_csr(rows), maximize)
+        };
+        let ones: &[&[f64]] = &[&[1.0; 4], &[1.0; 4], &[1.0; 4], &[1.0; 4]];
+        let got = run(ones, false).expect("ones");
+        assert_eq!(got, (vec![0, 1, 2, 3], vec![3, 0, 1, 2]));
+        assert_ne!(got.1, vec![0, 1, 2, 3]);
+        let doc: &[&[f64]] = &[&[3.0, 3.0, 6.0], &[4.0, 3.0, 5.0], &[10.0, 1.0, 8.0]];
+        assert_eq!(
+            run(doc, false).expect("doc"),
+            (vec![0, 1, 2], vec![0, 2, 1])
+        );
+        assert_eq!(run(doc, true).expect("max"), (vec![0, 1, 2], vec![2, 1, 0]));
+        let ties: &[&[f64]] = &[
+            &[2.0, 1.0, 1.0, 3.0],
+            &[1.0, 1.0, 2.0, 2.0],
+            &[3.0, 2.0, 1.0, 1.0],
+        ];
+        assert_eq!(
+            run(ties, false).expect("wide"),
+            (vec![0, 1, 2], vec![1, 0, 2])
+        );
+        assert_eq!(
+            run(ties, true).expect("wide max"),
+            (vec![0, 1, 2], vec![3, 2, 0])
+        );
+        let tall: Vec<Vec<f64>> = (0..4)
+            .map(|c| ties.iter().map(|r| r[c]).collect())
+            .collect();
+        let tall: Vec<&[f64]> = tall.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            run(&tall, false).expect("tall"),
+            (vec![0, 1, 2], vec![1, 0, 2])
+        );
+        let doc3: &[&[f64]] = &[&[0.0, 1.0, 1.0], &[0.0, 2.0, 3.0]];
+        assert_eq!(run(doc3, false).expect("doc3"), (vec![0, 1], vec![2, 1]));
+        let doc4: &[&[f64]] = &[&[0.0, 1.0], &[3.0, 1.0], &[1.0, 4.0]];
+        assert_eq!(run(doc4, false).expect("doc4"), (vec![0, 2], vec![1, 0]));
+        // +inf is not an edge; NaN is; -inf is with maximize (it becomes +inf and is dropped).
+        assert_eq!(
+            run(&[&[INF, 1.0], &[2.0, 3.0]], false).expect("inf"),
+            (vec![0, 1], vec![1, 0])
+        );
+        assert_eq!(
+            run(&[&[f64::NAN, 1.0], &[2.0, 3.0]], false).expect("nan"),
+            (vec![0, 1], vec![1, 0])
+        );
+        assert_eq!(
+            run(&[&[-INF, 1.0], &[2.0, 3.0]], true).expect("max -inf"),
+            (vec![0, 1], vec![1, 0])
+        );
+        // Explicit zeros are removed before matching.
+        let explicit = csr(2, 2, &[(0, 0, 0.0), (0, 1, 1.0), (1, 0, 2.0), (1, 1, 3.0)]);
+        assert_eq!(
+            min_weight_full_bipartite_matching(&explicit, false).expect("explicit zero"),
+            (vec![0, 1], vec![1, 0])
+        );
+        let empty = csr(2, 0, &[]);
+        let (rows, cols) = min_weight_full_bipartite_matching(&empty, false).expect("empty");
+        assert!(rows.is_empty() && cols.is_empty());
+    }
+
+    /// SciPy raises ValueError("no full matching exists") for each of these.
+    #[test]
+    fn min_weight_full_bipartite_matching_refusals() {
+        let cases: [&[&[f64]]; 5] = [
+            &[&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.0, 1.0, 1.0]],
+            &[&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0]],
+            &[&[f64::NAN, f64::NAN], &[2.0, 3.0]],
+            &[&[-INF, 1.0], &[2.0, 3.0]],
+            &[&[INF, 0.0], &[2.0, 3.0]],
+        ];
+        for rows in cases {
+            assert_eq!(
+                invalid_argument(min_weight_full_bipartite_matching(&dense_csr(rows), false)),
+                "no full matching exists",
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// SciPy's docstring graph (`gen_unit.py`) and a stored zero (`probe2.py`): undirected, an
+    /// edge whose only weight is an explicit zero carries infinity; directed, it stays 0.
+    #[test]
+    fn traversal_trees() {
+        let x = dense_csr(&[
+            &[0.0, 8.0, 0.0, 3.0],
+            &[0.0, 0.0, 2.0, 5.0],
+            &[0.0, 0.0, 0.0, 6.0],
+            &[0.0; 4],
+        ]);
+        for directed in [true, false] {
+            assert_eq!(
+                parts(&breadth_first_tree(&x, 0, directed).expect("bft")),
+                (vec![0, 2, 3, 3, 3], vec![1, 3, 2], vec![8.0, 3.0, 2.0])
+            );
+            assert_eq!(
+                parts(&depth_first_tree(&x, 0, directed).expect("dft")),
+                (vec![0, 1, 2, 3, 3], vec![1, 2, 3], vec![8.0, 2.0, 6.0])
+            );
+        }
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0), (2, 0, 5.0)]);
+        assert_eq!(
+            parts(&breadth_first_tree(&zero, 0, false).expect("bft zero")),
+            (vec![0, 2, 2, 2], vec![1, 2], vec![INF, 3.0])
+        );
+        assert_eq!(
+            parts(&depth_first_tree(&zero, 0, true).expect("dft zero")),
+            (vec![0, 2, 2, 2], vec![1, 2], vec![0.0, 3.0])
+        );
+    }
+
+    /// `probe2.py`: duplicates add up; a predecessor that is not an edge gives a stored 0; any
+    /// negative predecessor is "none".
+    #[test]
+    fn reconstruct_path_values() {
+        let dup = csr(3, 3, &[(0, 1, 2.0), (0, 1, 3.0), (1, 2, 4.0)]);
+        for directed in [true, false] {
+            assert_eq!(
+                parts(&reconstruct_path(&dup, &[-1, 0, 1], directed).expect("dup")),
+                (vec![0, 1, 2, 2], vec![1, 2], vec![5.0, 4.0])
+            );
+        }
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0), (2, 0, 5.0)]);
+        assert_eq!(
+            parts(&reconstruct_path(&zero, &[-9999, 2, 0], true).expect("nonedge")),
+            (vec![0, 1, 1, 2], vec![2, 1], vec![3.0, 0.0])
+        );
+        assert_eq!(
+            reconstruct_path(&zero, &[-1, 0, 0], false),
+            reconstruct_path(&zero, &[-9999, 0, 0], false)
+        );
+        assert!(matches!(
+            reconstruct_path(&zero, &[-1, 0], true),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            reconstruct_path(&zero, &[-1, 0, 3], true),
+            Err(SparseError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    /// `probe2.py` / `gen_unit2.py`.
+    #[test]
+    fn construct_dist_matrix_values() {
+        let g = dense_csr(&[
+            &[0.0, 1.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[0.0, 0.0, 0.0, 3.0],
+            &[0.0; 4],
+        ]);
+        let pred = vec![
+            vec![-1, 0, 0, 2],
+            vec![1, -1, 0, 1],
+            vec![2, 0, -1, 2],
+            vec![1, 3, 3, -1],
+        ];
+        assert_eq!(
+            construct_dist_matrix(&g, &pred, false, INF).expect("undirected"),
+            vec![
+                vec![0.0, 1.0, 2.0, 5.0],
+                vec![1.0, 0.0, 3.0, 1.0],
+                vec![2.0, 3.0, 0.0, 3.0],
+                vec![2.0, 1.0, 3.0, 0.0]
+            ]
+        );
+        assert_eq!(
+            construct_dist_matrix(&g, &pred, true, INF).expect("directed"),
+            vec![
+                vec![0.0, 1.0, 2.0, 5.0],
+                vec![INF, 0.0, INF, 1.0],
+                vec![INF, INF, 0.0, 3.0],
+                vec![INF, INF, INF, 0.0]
+            ]
+        );
+        // A chain that stops short keeps its partial sum; null_value only for no step at all.
+        let mut broken = vec![vec![-9999; 4]; 4];
+        broken[0][3] = 2;
+        broken[0][1] = 0;
+        assert_eq!(
+            construct_dist_matrix(&g, &broken, true, -1.0).expect("broken"),
+            vec![
+                vec![0.0, 1.0, -1.0, 3.0],
+                vec![-1.0, 0.0, -1.0, -1.0],
+                vec![-1.0, -1.0, 0.0, -1.0],
+                vec![-1.0, -1.0, -1.0, 0.0]
+            ]
+        );
+        // A stored zero: 0 directed, infinity undirected (where 0 means "no edge").
+        let zero = csr(3, 3, &[(0, 1, 0.0), (0, 2, 3.0)]);
+        let pz = vec![vec![-1, 0, 0], vec![-1; 3], vec![-1; 3]];
+        assert_eq!(
+            construct_dist_matrix(&zero, &pz, true, -7.5).expect("zero directed"),
+            vec![
+                vec![0.0, 0.0, 3.0],
+                vec![-7.5, 0.0, -7.5],
+                vec![-7.5, -7.5, 0.0]
+            ]
+        );
+        assert_eq!(
+            construct_dist_matrix(&zero, &pz, false, INF).expect("zero undirected")[0],
+            vec![0.0, INF, 3.0]
+        );
+        // SciPy loops forever here; fsci refuses.
+        let cyclic = vec![vec![-1, 2, 1, -1], vec![-1; 4], vec![-1; 4], vec![-1; 4]];
+        assert!(construct_dist_matrix(&g, &cyclic, true, INF).is_err());
+        assert!(matches!(
+            construct_dist_matrix(&g, &pred[..3], true, INF),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    /// `probe1.py`.
+    #[test]
+    fn dense_and_masked_conversions() {
+        let nan = f64::NAN;
+        let a = vec![
+            vec![0.0, 1e-9, 2.0],
+            vec![1e-7, 0.0, 3.0],
+            vec![INF, nan, 0.0],
+        ];
+        // The default null is np.isclose(x, 0): 1e-9 is a non-edge, 1e-7 an edge.
+        assert_eq!(
+            parts(&csgraph_from_dense(&a, Some(0.0), true, true).expect("default")),
+            (vec![0, 1, 3, 3], vec![2, 0, 2], vec![2.0, 1e-7, 3.0])
+        );
+        let b = vec![
+            vec![5.00001, 5.0, 2.0],
+            vec![4.99996, 0.0, 3.0],
+            vec![-INF, nan, 0.0],
+        ];
+        assert_eq!(
+            parts(&csgraph_from_dense(&b, Some(5.0), true, true).expect("null 5")),
+            (vec![0, 1, 3, 4], vec![2, 1, 2, 2], vec![2.0, 0.0, 3.0, 0.0])
+        );
+        let all = csgraph_from_dense(&b, None, false, false).expect("no null");
+        assert_eq!(all.indptr(), &[0, 3, 6, 9]);
+        assert!(all.data()[7].is_nan() && all.data()[6] == -INF);
+        let nan_null = csgraph_from_dense(&b, Some(nan), false, false).expect("null nan");
+        assert_eq!(
+            parts(&nan_null),
+            (
+                vec![0, 3, 6, 8],
+                vec![0, 1, 2, 0, 1, 2, 0, 2],
+                vec![5.00001, 5.0, 2.0, 4.99996, 0.0, 3.0, -INF, 0.0]
+            )
+        );
+        let inf_null = csgraph_from_dense(&b, Some(-INF), false, false).expect("null -inf");
+        assert_eq!(inf_null.indices(), &[0, 1, 2, 0, 1, 2, 1, 2]);
+        assert!(inf_null.data()[6].is_nan());
+
+        let masked = csgraph_masked_from_dense(
+            &[
+                vec![0.0, 1.0, 2.0],
+                vec![3.0, 0.0, nan],
+                vec![0.0, INF, 0.0],
+            ],
+            Some(0.0),
+            true,
+            true,
+        )
+        .expect("masked");
+        assert_eq!(
+            masked.mask,
+            vec![
+                vec![true, false, false],
+                vec![false, true, true],
+                vec![true, true, true]
+            ]
+        );
+        assert!(masked.data[1][2].is_nan() && masked.data[2][1] == INF);
+
+        // A stored NaN reads as infinity, not null; duplicates keep the smallest.
+        let t = csr(3, 3, &[(0, 0, nan), (1, 1, 3.0), (1, 1, 2.0), (2, 2, 0.0)]);
+        assert_eq!(
+            csgraph_to_dense(&t, -1.0).expect("to_dense"),
+            vec![
+                vec![INF, -1.0, -1.0],
+                vec![-1.0, 2.0, -1.0],
+                vec![-1.0, -1.0, 0.0]
+            ]
+        );
+        let tm = csgraph_to_masked(&t).expect("to_masked");
+        assert_eq!(
+            tm.mask,
+            vec![
+                vec![true, true, true],
+                vec![true, false, true],
+                vec![true, true, false]
+            ]
+        );
+        assert!(tm.data[0][0] == INF && tm.data[0][1].is_nan() && tm.data[1][1] == 2.0);
+        let fm = csgraph_from_masked(&MaskedGraph {
+            data: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            mask: vec![vec![false, true], vec![true, false]],
+        })
+        .expect("from_masked");
+        assert_eq!(parts(&fm), (vec![0, 1, 2], vec![0, 1], vec![1.0, 4.0]));
+        assert!(csgraph_to_dense(&csr(2, 3, &[]), 0.0).is_err());
+        assert!(csgraph_from_dense(&[vec![1.0, 2.0]], Some(0.0), true, true).is_err());
+    }
+
+    /// `gen_unit.py` / `probe4.py`: on the 3x3 unit grid, eight corner-to-corner paths, six of
+    /// length 4 then two of length 6, in SciPy's order.
+    #[test]
+    fn yen_grid_ties_follow_scipys_candidate_order() {
+        let mut edges = Vec::new();
+        for i in 0..9usize {
+            let (r, c) = (i / 3, i % 3);
+            let mut row: Vec<usize> = Vec::new();
+            if r > 0 {
+                row.push(i - 3);
+            }
+            if c > 0 {
+                row.push(i - 1);
+            }
+            if c < 2 {
+                row.push(i + 1);
+            }
+            if r < 2 {
+                row.push(i + 3);
+            }
+            edges.extend(row.into_iter().map(|j| (i, j, 1.0)));
+        }
+        let grid = csr(9, 9, &edges);
+        let r = yen(&grid, 0, 8, 8, true, false).expect("yen grid");
+        assert_eq!(r.distances, vec![4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 6.0, 6.0]);
+        assert_eq!(
+            r.predecessors,
+            vec![
+                vec![-1, -1, -1, 0, -1, -1, 3, 6, 7],
+                vec![-1, 0, -1, -1, 1, -1, -1, 4, 7],
+                vec![-1, 0, 1, -1, -1, 2, -1, -1, 5],
+                vec![-1, 0, -1, -1, 1, 4, -1, -1, 5],
+                vec![-1, -1, -1, 0, 3, -1, -1, 4, 7],
+                vec![-1, -1, -1, 0, 3, 4, -1, -1, 5],
+                vec![-1, 0, -1, 4, 1, -1, 3, 6, 7],
+                vec![-1, 0, 1, -1, 5, 2, -1, 4, 7],
+            ]
+        );
+    }
+
+    /// `gen_unit.py` / `probe4.py`.
+    #[test]
+    fn yen_weights_signs_and_edge_cases() {
+        let doc = dense_csr(&[
+            &[0.0, 1.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[2.0, 0.0, 0.0, 3.0],
+            &[0.0; 4],
+        ]);
+        let r = yen(&doc, 0, 3, 5, false, false).expect("doc");
+        assert_eq!(r.distances, vec![2.0, 5.0]);
+        assert_eq!(r.predecessors, vec![vec![-1, 0, -1, 1], vec![-1, -1, 0, 2]]);
+        let r = yen(&doc, 0, 3, 5, false, true).expect("unweighted");
+        assert_eq!(r.distances, vec![2.0, 2.0]);
+        assert_eq!(r.predecessors, vec![vec![-1, -1, 0, 2], vec![-1, 0, -1, 1]]);
+        let none = yen(&doc, 0, 3, 0, true, false).expect("k = 0");
+        assert!(none.distances.is_empty() && none.predecessors.is_empty());
+        let same = yen(&doc, 1, 1, 3, true, false).expect("source = sink");
+        assert_eq!(
+            (same.distances, same.predecessors),
+            (vec![0.0], vec![vec![-1; 4]])
+        );
+        assert!(
+            yen(&doc, 3, 0, 3, true, false)
+                .expect("no path")
+                .distances
+                .is_empty()
+        );
+        assert_eq!(
+            invalid_argument(yen(&doc, 0, 9, 2, true, false)),
+            "For csgraph with shape (N, N), must have 0 <= source < N and 0 <= sink < N. \
+             Got N=4, source=0, sink=9."
+        );
+
+        // A negative edge is reweighted by Johnson's potentials, directed.
+        let neg = dense_csr(&[
+            &[0.0, 4.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 1.0],
+            &[0.0, -1.0, 0.0, 5.0],
+            &[0.0; 4],
+        ]);
+        let r = yen(&neg, 0, 3, 4, true, false).expect("negative edge");
+        assert_eq!(r.distances, vec![2.0, 5.0, 7.0]);
+        assert_eq!(
+            r.predecessors,
+            vec![vec![-1, 2, 0, 1], vec![-1, 0, -1, 1], vec![-1, -1, 0, 2]]
+        );
+        // Undirected, the negative edge is a negative cycle.
+        assert_eq!(
+            yen(&neg, 0, 3, 4, false, false),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            })
+        );
+        let cycle = dense_csr(&[&[0.0, 1.0, 0.0], &[0.0, 0.0, -3.0], &[1.0, 0.0, 0.0]]);
+        assert_eq!(
+            yen(&cycle, 0, 2, 2, true, false),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 0".to_string()
+            })
+        );
+        assert_eq!(
+            bellman_ford(&cycle, true, 1),
+            Err(SparseError::NegativeCycle {
+                message: "Negative cycle detected on node 1".to_string()
+            })
+        );
+    }
 }
 
 /// Compute the graph Laplacian matrix L = D - A.
@@ -33810,9 +41509,12 @@ where
 /// `result[i].distances[j]` is the shortest distance from `i` to `j`
 /// (`f64::INFINITY` if unreachable). Matches
 /// `scipy.sparse.csgraph.shortest_path(graph, method='D')` /
-/// `dijkstra(graph)` over all sources. Negative edges (where Dijkstra is invalid)
-/// fall back to per-source Bellman-Ford, propagating negative-cycle errors.
-pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+/// `dijkstra(graph, directed)` over all sources. Negative edges (where Dijkstra is
+/// invalid) fall back to per-source Bellman-Ford, propagating negative-cycle errors.
+pub fn dijkstra_all_pairs(
+    graph: &CsrMatrix,
+    directed: bool,
+) -> SparseResult<Vec<ShortestPathResult>> {
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
     if n == 0 {
@@ -33823,14 +41525,18 @@ pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathRes
     if data.iter().any(|&weight| weight < 0.0) {
         // Negative edges: Dijkstra is invalid. Per-source Bellman-Ford, serial,
         // propagating any negative-cycle error like SciPy. Not the hot path.
-        return (0..n).map(|source| bellman_ford(graph, source)).collect();
+        return (0..n)
+            .map(|source| bellman_ford(graph, directed, source))
+            .collect();
     }
 
     let sources: Vec<usize> = (0..n).collect();
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
     Ok(dijkstra_parallel_sources(
         graph.indptr(),
         graph.indices(),
         data,
+        transpose.as_ref(),
         n,
         &sources,
     ))
@@ -33839,9 +41545,10 @@ pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathRes
 /// Compute paths from the requested sources, retaining source order.
 ///
 /// Same parallel fan-out as [`dijkstra_all_pairs`] over an arbitrary source
-/// list. Matches `scipy.sparse.csgraph.dijkstra(graph, indices=sources)`.
+/// list. Matches `scipy.sparse.csgraph.dijkstra(graph, directed, indices=sources)`.
 pub fn dijkstra_multi_source(
     graph: &CsrMatrix,
+    directed: bool,
     sources: &[usize],
 ) -> SparseResult<Vec<ShortestPathResult>> {
     validate_csgraph(graph)?;
@@ -33859,34 +41566,39 @@ pub fn dijkstra_multi_source(
     if data.iter().any(|&weight| weight < 0.0) {
         return sources
             .iter()
-            .map(|&source| bellman_ford(graph, source))
+            .map(|&source| bellman_ford(graph, directed, source))
             .collect();
     }
 
+    let transpose = (!directed).then(|| transpose_adjacency(graph));
     Ok(dijkstra_parallel_sources(
         graph.indptr(),
         graph.indices(),
         data,
+        transpose.as_ref(),
         n,
         sources,
     ))
 }
 
-/// Compute all-pairs paths for arbitrary edge signs, rejecting negative cycles.
-pub fn johnson(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+/// All-pairs shortest paths for arbitrary edge signs, rejecting negative cycles:
+/// `scipy.sparse.csgraph.johnson(graph, directed)` distances. Undirected, any negative edge
+/// is a negative cycle (walk it and back), which SciPy reports too.
+pub fn johnson(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<ShortestPathResult>> {
     (0..graph.shape().rows)
-        .map(|source| bellman_ford(graph, source))
+        .map(|source| bellman_ford(graph, directed, source))
         .collect()
 }
 
 /// Compute Bellman-Ford paths for a requested set of sources.
 pub fn bellman_ford_multi_source(
     graph: &CsrMatrix,
+    directed: bool,
     sources: &[usize],
 ) -> SparseResult<Vec<ShortestPathResult>> {
     sources
         .iter()
-        .map(|&source| bellman_ford(graph, source))
+        .map(|&source| bellman_ford(graph, directed, source))
         .collect()
 }
 
@@ -33929,11 +41641,14 @@ mod truncation_recovery_tests {
             vec![1, 2],
             vec![0, 1, 2, 2],
         );
-        let paths = dijkstra_multi_source(&graph, &[1, 0]).expect("multi-source paths");
+        let paths = dijkstra_multi_source(&graph, true, &[1, 0]).expect("multi-source paths");
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].distances, vec![f64::INFINITY, 0.0, 1.0]);
         assert_eq!(paths[1].distances, vec![0.0, 1.0, 2.0]);
-        assert_eq!(dijkstra_all_pairs(&graph).expect("all pairs").len(), 3);
+        assert_eq!(
+            dijkstra_all_pairs(&graph, true).expect("all pairs").len(),
+            3
+        );
     }
 }
 

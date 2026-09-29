@@ -14,13 +14,14 @@
 //! pvalue (ndtri rational chain) / 1e-9 elsewhere; harness uses
 //! 1e-6 uniformly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     bartlett_with_nan_policy, f_oneway_with_nan_policy, kruskal_with_nan_policy,
     levene_with_nan_policy,
@@ -47,7 +48,16 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // SciPy's nan_policy='propagate' answer is NaN; it arrives as "nan", distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     statistic: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     pvalue: Option<f64>,
 }
 
@@ -69,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -155,13 +166,14 @@ import numpy as np
 from scipy import stats
 
 def fnone(v):
+    # A NaN answer is sent as "nan", so the harness can tell it from a raised call (null).
     try:
         v = float(v)
     except Exception:
         return None
-    if v != v:  # NaN
-        return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
 
 q = json.load(sys.stdin)
 points = []
@@ -254,66 +266,64 @@ fn diff_stats_nan_policy() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_nan_policy",
+        &[
+            "levene.statistic",
+            "levene.pvalue",
+            "bartlett.statistic",
+            "bartlett.pvalue",
+            "kruskal.statistic",
+            "kruskal.pvalue",
+            "f_oneway.statistic",
+            "f_oneway.pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let group_refs: Vec<&[f64]> = case.groups.iter().map(|g| g.as_slice()).collect();
         let nan_policy = case.nan_policy.as_str();
-        let (rust_stat, rust_p) = match case.func.as_str() {
-            "levene" => match levene_with_nan_policy(&group_refs, Some(nan_policy)) {
-                Ok(r) => (r.statistic, r.pvalue),
-                Err(_) => continue,
-            },
-            "bartlett" => match bartlett_with_nan_policy(&group_refs, Some(nan_policy)) {
-                Ok(r) => (r.statistic, r.pvalue),
-                Err(_) => continue,
-            },
-            "kruskal" => match kruskal_with_nan_policy(&group_refs, Some(nan_policy)) {
-                Ok(r) => (r.statistic, r.pvalue),
-                Err(_) => continue,
-            },
-            "f_oneway" => match f_oneway_with_nan_policy(&group_refs, Some(nan_policy)) {
-                Ok(r) => (r.statistic, r.pvalue),
-                Err(_) => continue,
-            },
-            _ => continue,
+        let result = match case.func.as_str() {
+            "levene" => levene_with_nan_policy(&group_refs, Some(nan_policy))
+                .ok()
+                .map(|r| (r.statistic, r.pvalue)),
+            "bartlett" => bartlett_with_nan_policy(&group_refs, Some(nan_policy))
+                .ok()
+                .map(|r| (r.statistic, r.pvalue)),
+            "kruskal" => kruskal_with_nan_policy(&group_refs, Some(nan_policy))
+                .ok()
+                .map(|r| (r.statistic, r.pvalue)),
+            "f_oneway" => f_oneway_with_nan_policy(&group_refs, Some(nan_policy))
+                .ok()
+                .map(|r| (r.statistic, r.pvalue)),
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        // Both sides may be NaN under propagate — that's a pass.
-        if !rust_stat.is_finite() && scipy_arm.statistic.is_none() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.statistic", case.func),
-                abs_diff: 0.0,
-                pass: true,
-            });
-        } else if let Some(s_stat) = scipy_arm.statistic
-            && rust_stat.is_finite()
-        {
-            let abs_diff = (rust_stat - s_stat).abs();
+        let stat_arm = format!("{}.statistic", case.func);
+        let pvalue_arm = format!("{}.pvalue", case.func);
+        let arms = [
+            (
+                stat_arm.as_str(),
+                scipy_arm.statistic,
+                result.map(|(stat, _)| stat),
+            ),
+            (
+                pvalue_arm.as_str(),
+                scipy_arm.pvalue,
+                result.map(|(_, p)| p),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.statistic", case.func),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if !rust_p.is_finite() && scipy_arm.pvalue.is_none() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.pvalue", case.func),
-                abs_diff: 0.0,
-                pass: true,
-            });
-        } else if let Some(s_p) = scipy_arm.pvalue
-            && rust_p.is_finite()
-        {
-            let abs_diff = (rust_p - s_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.pvalue", case.func),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -326,6 +336,7 @@ fn diff_stats_nan_policy() {
         test_id: "diff_stats_nan_policy".into(),
         category: "scipy.stats {levene, bartlett, kruskal, f_oneway} (nan_policy)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -350,4 +361,5 @@ fn diff_stats_nan_policy() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "levene").count());
 }

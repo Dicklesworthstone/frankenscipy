@@ -110,8 +110,25 @@ fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// numpy's `norm(a, ord=inf)`: one NaN entry makes it NaN. `f64::max` would drop the NaN, and
+/// `g_norm < gtol` would then report convergence on a NaN gradient (frankenscipy-qdb8s).
 fn norm_inf(a: &[f64]) -> f64 {
-    a.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+    a.iter().fold(0.0_f64, |m, v| {
+        if m.is_nan() || v.is_nan() {
+            f64::NAN
+        } else {
+            m.max(v.abs())
+        }
+    })
+}
+
+/// The matrix the dense subproblem factors held a NaN or an infinity. SciPy's `trf` passes it to
+/// `scipy.linalg.svd`, whose `check_finite` raises `ValueError: array must not contain infs or
+/// NaNs` at exactly this point, after the gtol and max_nfev exits have been tested.
+pub(crate) struct NonFiniteJacobian;
+
+fn all_finite(m: &[Vec<f64>]) -> bool {
+    m.iter().flatten().all(|v| v.is_finite())
 }
 
 fn mat_vec(j: &[Vec<f64>], s: &[f64]) -> Vec<f64> {
@@ -726,7 +743,10 @@ pub(crate) fn trf<E>(
     max_nfev: Option<usize>,
     x_scale: &XScale,
     loss: Option<&Loss>,
-) -> Result<TrfOutcome, E> {
+) -> Result<TrfOutcome, E>
+where
+    E: From<NonFiniteJacobian>,
+{
     let bounded =
         lb.iter().any(|v| *v != f64::NEG_INFINITY) || ub.iter().any(|v| *v != f64::INFINITY);
     let n = x0.len();
@@ -828,12 +848,18 @@ pub(crate) fn trf<E>(
                 row[i] = dh.sqrt();
                 aug.push(row);
             }
+            if !all_finite(&aug) {
+                return Err(NonFiniteJacobian.into());
+            }
             let (u, s, vv) = svd_thin(&aug, n);
             let mut f_aug = f.clone();
             f_aug.extend(std::iter::repeat_n(0.0, n));
             let uf: Vec<f64> = u.iter().map(|col| dot(col, &f_aug)).collect();
             (s, vv, uf)
         } else {
+            if !all_finite(&j_h) {
+                return Err(NonFiniteJacobian.into());
+            }
             let (u, s, vv) = svd_thin(&j_h, n);
             let uf: Vec<f64> = u.iter().map(|col| dot(col, &f)).collect();
             (s, vv, uf)

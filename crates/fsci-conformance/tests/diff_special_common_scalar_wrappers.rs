@@ -8,13 +8,14 @@
 //! 1e-7 abs for spence and zeta (their numerical paths use
 //! continued fractions / series with slightly looser tolerances).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{
     dawsn_scalar, digamma_scalar, expi_scalar, gammaincinv_scalar, log_expit_scalar,
     log_ndtr_scalar, spence_scalar, zeta_scalar,
@@ -28,6 +29,17 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const TIGHT_TOL: f64 = 1.0e-6;
 const LOOSE_TOL: f64 = 1.0e-5;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op.
+const ARMS: [&str; 8] = [
+    "dawsn",
+    "digamma",
+    "expi",
+    "ginv",
+    "log_expit",
+    "log_ndtr",
+    "spence",
+    "zeta",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -69,6 +81,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -284,15 +297,11 @@ fn diff_special_common_scalar_wrappers() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_common_scalar_wrappers", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let (actual, tol) = match case.op.as_str() {
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
+        let (fsci, tol) = match case.op.as_str() {
             "dawsn" => (dawsn_scalar(case.x), TIGHT_TOL),
             "digamma" => (digamma_scalar(case.x), TIGHT_TOL),
             "expi" => (expi_scalar(case.x), TIGHT_TOL),
@@ -301,13 +310,15 @@ fn diff_special_common_scalar_wrappers() {
             "log_ndtr" => (log_ndtr_scalar(case.x), TIGHT_TOL),
             "spence" => (spence_scalar(case.x), LOOSE_TOL),
             "zeta" => (zeta_scalar(case.s), LOOSE_TOL),
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
         };
-        if !actual.is_finite() {
+        let Some((expected, actual)) = ledger.pair(&case.op, &case.case_id, scipy, Some(fsci))
+        else {
             continue;
-        }
+        };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -323,6 +334,7 @@ fn diff_special_common_scalar_wrappers() {
         category: "fsci_special scalar wrappers (dawsn/digamma/expi/ginv/log_expit/log_ndtr/spence/zeta) vs scipy.special"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -343,4 +355,11 @@ fn diff_special_common_scalar_wrappers() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

@@ -5,13 +5,14 @@
 //! bipartite matching across the row/column nonzero pattern — a
 //! deterministic integer. Bit-exact agreement expected.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, Shape2D, structural_rank};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -257,14 +259,19 @@ fn diff_sparse_structural_rank() {
     let start = Instant::now();
     let mut diffs = Vec::new();
 
+    let mut ledger = CompareLedger::new("diff_sparse_structural_rank", &["structural_rank"]);
+
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_rk) = scipy_arm.rank else {
+        let Some((scipy_rk, fsci_rk)) = ledger.both(
+            "structural_rank",
+            &case.case_id,
+            scipy_arm.rank,
+            fsci_eval(case),
+        ) else {
             continue;
         };
-        let Some(fsci_rk) = fsci_eval(case) else {
-            continue;
-        };
+        ledger.compared("structural_rank", &case.case_id, fsci_rk == scipy_rk);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci: fsci_rk,
@@ -279,6 +286,7 @@ fn diff_sparse_structural_rank() {
         test_id: "diff_sparse_structural_rank".into(),
         category: "scipy.sparse.csgraph.structural_rank".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -300,4 +308,5 @@ fn diff_sparse_structural_rank() {
         "scipy.sparse.csgraph.structural_rank conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

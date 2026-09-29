@@ -11,13 +11,14 @@
 //! Tolerances: 1e-12 abs cdf/sf (regularized incomplete gamma);
 //! 1e-9 rel ppf (gammaincinv composition).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{chdtr, chdtrc, chdtri, gdtr, gdtrc, pdtr, pdtrc, pdtri};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,10 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const CDF_TOL: f64 = 1.0e-12;
 const PPF_TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per generated function.
+const ARMS: [&str; 8] = [
+    "gdtr", "gdtrc", "pdtr", "pdtrc", "pdtri", "chdtr", "chdtrc", "chdtri",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -65,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -106,7 +112,8 @@ fn fsci_eval(func: &str, p1: f64, p2: f64, arg: f64) -> Option<f64> {
         "chdtri" => chdtri(p1, arg),
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    // A non-finite value reaches the ledger, which records it as an fsci failure.
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -154,15 +161,21 @@ fn generate_query() -> OracleQuery {
                 });
             }
         }
-        let _ = mu;
-        // pdtri intentionally omitted — fsci's local gammaincinv
-        // (gamma.rs:1723) diverges for small (k+1, 1-p), returning
-        // ~1e13 vs scipy 0.149 at k=1, p=0.99. Tracked separately
-        // as [frankenscipy-jr3na]. The fsci_special::gammaincinv
-        // export in convenience.rs is fine (validated by
-        // diff_special_gammainc); pdtri should be re-pointed to
-        // it.
-        let _ = qs;
+    }
+    // pdtri(k, q): the mean with pdtr(k, m) = q. It used to be omitted: the local gammaincinv
+    // returned ~1e13 where SciPy gives 0.149 at k=1, q=0.99. frankenscipy-jr3na re-pointed it
+    // at the validated gammaincinv.
+    for &k in &ks {
+        for &q in &qs {
+            let kf = f64::from(k);
+            points.push(PointCase {
+                case_id: format!("pdtri_k{k}_q{q}"),
+                func: "pdtri".to_string(),
+                p1: kf,
+                p2: 0.0,
+                arg: q,
+            });
+        }
     }
     for &df in &dfs {
         for &x in &xs_chdtr {
@@ -176,11 +189,17 @@ fn generate_query() -> OracleQuery {
                 });
             }
         }
-        // chdtri intentionally omitted — same root cause as
-        // pdtri: the local gammaincinv in gamma.rs diverges
-        // (chdtri(3, 0.99) returns ~5.6e5 vs scipy 0.115).
-        // Tracked in expanded frankenscipy-jr3na.
-        let _ = qs;
+        // chdtri(df, q): x with chdtrc(df, x) = q; it was omitted with pdtri, same cause
+        // (chdtri(3, 0.99) returned ~5.6e5 where SciPy gives 0.115), same fix.
+        for &q in &qs {
+            points.push(PointCase {
+                case_id: format!("chdtri_df{df}_q{q}"),
+                func: "chdtri".to_string(),
+                p1: df,
+                p2: 0.0,
+                arg: q,
+            });
+        }
     }
     OracleQuery { points }
 }
@@ -289,31 +308,38 @@ fn diff_special_gdtr_pdtr_chdtr() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_gdtr_pdtr_chdtr", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.p1, case.p2, case.arg)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.p1, case.p2, case.arg),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
 
-            let pass = match case.func.as_str() {
-                "gdtr" | "gdtrc" | "pdtr" | "pdtrc" | "chdtr" | "chdtrc" => abs_diff <= CDF_TOL,
-                "pdtri" | "chdtri" => abs_diff <= PPF_TOL_REL * scale,
-                _ => false,
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let pass = match arm {
+            "gdtr" | "gdtrc" | "pdtr" | "pdtrc" | "chdtr" | "chdtrc" => abs_diff <= CDF_TOL,
+            "pdtri" | "chdtri" => abs_diff <= PPF_TOL_REL * scale,
+            _ => false,
+        };
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -322,6 +348,7 @@ fn diff_special_gdtr_pdtr_chdtr() {
         test_id: "diff_special_gdtr_pdtr_chdtr".into(),
         category: "scipy.special.gdtr/pdtr/chdtr family".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -348,4 +375,12 @@ fn diff_special_gdtr_pdtr_chdtr() {
         max_abs_overall,
         max_rel_overall
     );
+    // Arms have different case sets (gdtr/gdtrc and chdtr/chdtrc have the fewest); each must
+    // compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

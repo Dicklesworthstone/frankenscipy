@@ -32,12 +32,14 @@
 //! `float_roundtrip` misreads some 17-digit decimals by one ULP — which would defeat the
 //! bit-exact half of the above.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::interpolative::{
     id_to_svd, reconstruct_interp_matrix, reconstruct_matrix_from_id, reconstruct_skel_matrix,
 };
@@ -83,6 +85,12 @@ const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// Relative tolerance for the arithmetic comparisons. Generous enough for BLAS reassociation
 /// over the small ranks used here, tight enough that a wrong formula cannot pass.
 const REL_TOL: f64 = 1e-11;
+
+/// Ledger arms, one per reconstruction function.
+const INTERP: &str = "reconstruct_interp_matrix";
+const SKEL: &str = "reconstruct_skel_matrix";
+const FROM_ID: &str = "reconstruct_matrix_from_id";
+const SVD: &str = "id_to_svd";
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -139,6 +147,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     total_exact_entries: usize,
     total_toleranced_entries: usize,
@@ -416,6 +425,12 @@ fn diff_linalg_interpolative_reconstruct() {
     let mut total_exact = 0usize;
     let mut total_toleranced = 0usize;
     let mut worst = 0.0f64;
+    // The incumbent's answers stay guarded by the asserts below (a raise or a null field
+    // panics); every fsci call and every comparison are recorded in the ledger.
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_interpolative_reconstruct",
+        &[INTERP, SKEL, FROM_ID, SVD],
+    );
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -474,12 +489,22 @@ fn diff_linalg_interpolative_reconstruct() {
         let proj = reshape(&as_floats(proj_bits), proj_rows, proj_cols);
 
         // --- EXACT: pure placement, no arithmetic -----------------------------------------
-        let p = reconstruct_interp_matrix(idx, &proj).unwrap_or_else(|e| {
-            panic!(
-                "case {}: reconstruct_interp_matrix failed: {e}",
-                case.case_id
-            )
-        });
+        let p = reconstruct_interp_matrix(idx, &proj)
+            .inspect_err(|e| {
+                eprintln!(
+                    "case {}: reconstruct_interp_matrix failed: {e}",
+                    case.case_id
+                );
+            })
+            .ok();
+        let Some((p_bits, p)) = ledger.both(INTERP, &case.case_id, Some(p_bits), p) else {
+            continue;
+        };
+        ledger.compared(
+            INTERP,
+            &case.case_id,
+            p.len() == k && same_bits(&flatten(&p), p_bits),
+        );
         assert_eq!(p.len(), k, "case {}: P must be k×n", case.case_id);
         assert!(
             same_bits(&flatten(&p), p_bits),
@@ -491,9 +516,15 @@ fn diff_linalg_interpolative_reconstruct() {
             &as_floats(p_bits)[..p_bits.len().min(16)]
         );
 
-        let b = reconstruct_skel_matrix(&a, k, idx).unwrap_or_else(|e| {
-            panic!("case {}: reconstruct_skel_matrix failed: {e}", case.case_id)
-        });
+        let b = reconstruct_skel_matrix(&a, k, idx)
+            .inspect_err(|e| {
+                eprintln!("case {}: reconstruct_skel_matrix failed: {e}", case.case_id);
+            })
+            .ok();
+        let Some((b_bits, b)) = ledger.both(SKEL, &case.case_id, Some(b_bits), b) else {
+            continue;
+        };
+        ledger.compared(SKEL, &case.case_id, same_bits(&flatten(&b), b_bits));
         assert!(
             same_bits(&flatten(&b), b_bits),
             "case {}: skeleton matrix differs from the incumbent's BIT-EXACTLY; it is a pure \
@@ -503,13 +534,28 @@ fn diff_linalg_interpolative_reconstruct() {
         total_exact += p_bits.len() + b_bits.len();
 
         // --- TOLERANCED: matrix product ----------------------------------------------------
-        let c = reconstruct_matrix_from_id(&b, idx, &proj).unwrap_or_else(|e| {
-            panic!(
-                "case {}: reconstruct_matrix_from_id failed: {e}",
-                case.case_id
-            )
-        });
-        let c_diff = max_relative_difference(&flatten(&c), &as_floats(c_bits));
+        // `slices` records a non-finite entry, which max_relative_difference's fold would
+        // swallow, and a length mismatch.
+        let c = reconstruct_matrix_from_id(&b, idx, &proj)
+            .inspect_err(|e| {
+                eprintln!(
+                    "case {}: reconstruct_matrix_from_id failed: {e}",
+                    case.case_id
+                );
+            })
+            .ok()
+            .map(|c| flatten(&c));
+        let c_theirs = as_floats(c_bits);
+        let Some((c_theirs, c)) = ledger.slices(
+            FROM_ID,
+            &case.case_id,
+            Some(c_theirs.as_slice()),
+            c.as_deref(),
+        ) else {
+            continue;
+        };
+        let c_diff = max_relative_difference(c, c_theirs);
+        ledger.compared(FROM_ID, &case.case_id, c_diff <= REL_TOL);
         assert!(
             c_diff <= REL_TOL,
             "case {}: reconstructed matrix differs by {c_diff:e}, above {REL_TOL:e}",
@@ -518,7 +564,11 @@ fn diff_linalg_interpolative_reconstruct() {
 
         // --- TOLERANCED: SVD, compared on values and reconstruction only -------------------
         let result = id_to_svd(&b, idx, &proj)
-            .unwrap_or_else(|e| panic!("case {}: id_to_svd failed: {e}", case.case_id));
+            .inspect_err(|e| eprintln!("case {}: id_to_svd failed: {e}", case.case_id))
+            .ok();
+        let Some((s_bits, result)) = ledger.both(SVD, &case.case_id, Some(s_bits), result) else {
+            continue;
+        };
         assert_eq!(result.u.len(), m, "case {}: U must be m×k", case.case_id);
         assert_eq!(
             result.s.len(),
@@ -528,14 +578,16 @@ fn diff_linalg_interpolative_reconstruct() {
         );
         assert_eq!(result.v.len(), n, "case {}: V must be n×k", case.case_id);
 
-        let s_diff = max_relative_difference(&result.s, &as_floats(s_bits));
-        assert!(
-            s_diff <= REL_TOL,
-            "case {}: singular values differ by {s_diff:e}, above {REL_TOL:e}.\n  ours:  {:?}\n  scipy: {:?}",
-            case.case_id,
-            result.s,
-            as_floats(s_bits)
-        );
+        let s_theirs = as_floats(s_bits);
+        let Some((s_theirs, s_ours)) = ledger.slices(
+            SVD,
+            &case.case_id,
+            Some(s_theirs.as_slice()),
+            Some(result.s.as_slice()),
+        ) else {
+            continue;
+        };
+        let s_diff = max_relative_difference(s_ours, s_theirs);
 
         // U·diag(s)·Vᵀ, which is well defined even though U and V individually are not.
         let mut ours_rec = Vec::with_capacity(m * n);
@@ -548,14 +600,35 @@ fn diff_linalg_interpolative_reconstruct() {
                 );
             }
         }
-        let rec_diff = max_relative_difference(&ours_rec, &as_floats(svd_rec_bits));
+        let rec_theirs = as_floats(svd_rec_bits);
+        let Some((rec_theirs, ours_rec)) = ledger.slices(
+            SVD,
+            &case.case_id,
+            Some(rec_theirs.as_slice()),
+            Some(ours_rec.as_slice()),
+        ) else {
+            continue;
+        };
+        let rec_diff = max_relative_difference(ours_rec, rec_theirs);
+        // And it must equal the matrix product route, which is the whole claim of id_to_svd.
+        let self_consistency = max_relative_difference(ours_rec, c);
+        ledger.compared(
+            SVD,
+            &case.case_id,
+            s_diff <= REL_TOL && rec_diff <= REL_TOL && self_consistency <= REL_TOL,
+        );
+        assert!(
+            s_diff <= REL_TOL,
+            "case {}: singular values differ by {s_diff:e}, above {REL_TOL:e}.\n  ours:  {:?}\n  scipy: {:?}",
+            case.case_id,
+            result.s,
+            s_theirs
+        );
         assert!(
             rec_diff <= REL_TOL,
             "case {}: SVD reconstruction differs by {rec_diff:e}, above {REL_TOL:e}",
             case.case_id
         );
-        // And it must equal the matrix product route, which is the whole claim of id_to_svd.
-        let self_consistency = max_relative_difference(&ours_rec, &flatten(&c));
         assert!(
             self_consistency <= REL_TOL,
             "case {}: id_to_svd disagrees with reconstruct_matrix_from_id by {self_consistency:e}",
@@ -582,6 +655,7 @@ fn diff_linalg_interpolative_reconstruct() {
         test_id: "diff_linalg_interpolative_reconstruct".to_string(),
         category: "linalg.interpolative".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         total_exact_entries: total_exact,
         total_toleranced_entries: total_toleranced,
@@ -599,7 +673,8 @@ fn diff_linalg_interpolative_reconstruct() {
     assert_eq!(
         compared,
         query.points.len(),
-        "every case must be compared, not skipped"
+        "every case must be compared, not skipped; {}",
+        ledger.verdict(1, false).err().unwrap_or_default()
     );
     assert!(
         total_exact > 500,
@@ -609,6 +684,7 @@ fn diff_linalg_interpolative_reconstruct() {
         total_toleranced > 500,
         "only {total_toleranced} toleranced entries compared"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-HIT / MUST-MISS control for the bit-exact comparator.

@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-m5p9v]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::sos2tf;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -212,12 +214,10 @@ fn diff_signal_sos2tf() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_sos2tf", &["b", "a"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(b_exp), Some(a_exp)) = (scipy_arm.b.as_ref(), scipy_arm.a.as_ref()) else {
-            continue;
-        };
         // Reshape SOS flat into [f64; 6] sections
         let sos: Vec<[f64; 6]> = case
             .sos_flat
@@ -227,21 +227,29 @@ fn diff_signal_sos2tf() {
             .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
             .collect();
         let ba = sos2tf(&sos);
-        let abs_d = if ba.b.len() != b_exp.len() || ba.a.len() != a_exp.len() {
-            f64::INFINITY
-        } else {
-            let db =
-                ba.b.iter()
-                    .zip(b_exp.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max);
-            let da =
-                ba.a.iter()
-                    .zip(a_exp.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max);
-            db.max(da)
-        };
+        let arms = [
+            ("b", scipy_arm.b.as_deref(), ba.b.as_slice()),
+            ("a", scipy_arm.a.as_deref(), ba.a.as_slice()),
+        ];
+        let mut arm_diffs = [f64::NAN; 2];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((expected, actual)) = ledger.slices(arm, &case.case_id, scipy, Some(fsci))
+            else {
+                continue;
+            };
+            let d = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [db, da] = arm_diffs;
+        let abs_d = db.max(da);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -256,6 +264,7 @@ fn diff_signal_sos2tf() {
         test_id: "diff_signal_sos2tf".into(),
         category: "scipy.signal.sos2tf".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -276,4 +285,5 @@ fn diff_signal_sos2tf() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

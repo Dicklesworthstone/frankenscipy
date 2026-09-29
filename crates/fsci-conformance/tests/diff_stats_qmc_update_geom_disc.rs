@@ -7,13 +7,14 @@
 //! `update_centered_discrepancy` is checked against
 //! scipy.stats.qmc.update_discrepancy since frankenscipy-wzk18.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     GeometricDiscrepancyMethod, centered_discrepancy, geometric_discrepancy,
     update_centered_discrepancy,
@@ -73,6 +74,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -266,27 +268,38 @@ fn diff_stats_qmc_update_geom_disc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_qmc_update_geom_disc",
+        &[
+            "update_centered_discrepancy",
+            "geometric_discrepancy_mindist",
+            "geometric_discrepancy_mst",
+        ],
+    );
 
     // update_centered_discrepancy vs scipy.stats.qmc.update_discrepancy,
     // both seeded with the centered discrepancy of the existing sample
     // (frankenscipy-wzk18 — additive-update formula fixed).
     for case in &query.update {
-        let Some(arm) = upd_map.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Ok(prev) = centered_discrepancy(&case.existing, case.dimension) else {
-            continue;
-        };
-        let Ok(actual) =
-            update_centered_discrepancy(&case.existing, case.dimension, prev, &case.new_point)
+        let scipy = upd_map.get(&case.case_id).and_then(|arm| arm.value);
+        let fsci = centered_discrepancy(&case.existing, case.dimension)
+            .ok()
+            .and_then(|prev| {
+                update_centered_discrepancy(&case.existing, case.dimension, prev, &case.new_point)
+                    .ok()
+            });
+        let Some((expected, actual)) =
+            ledger.pair("update_centered_discrepancy", &case.case_id, scipy, fsci)
         else {
             continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(
+            "update_centered_discrepancy",
+            &case.case_id,
+            abs_d <= ABS_TOL,
+        );
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "update_centered_discrepancy".into(),
@@ -296,22 +309,22 @@ fn diff_stats_qmc_update_geom_disc() {
     }
 
     for case in &query.geom {
-        let Some(arm) = geom_map.get(&case.case_id) else {
-            continue;
+        let scipy = geom_map.get(&case.case_id).and_then(|arm| arm.value);
+        let (op, method) = match case.method.as_str() {
+            "mindist" => (
+                "geometric_discrepancy_mindist",
+                GeometricDiscrepancyMethod::MinDist,
+            ),
+            "mst" => ("geometric_discrepancy_mst", GeometricDiscrepancyMethod::Mst),
+            other => panic!("unknown geometric_discrepancy method `{other}`"),
         };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let method = match case.method.as_str() {
-            "mindist" => GeometricDiscrepancyMethod::MinDist,
-            "mst" => GeometricDiscrepancyMethod::Mst,
-            _ => continue,
-        };
-        let Ok(actual) = geometric_discrepancy(&case.sample, case.dimension, method) else {
+        let fsci = geometric_discrepancy(&case.sample, case.dimension, method).ok();
+        let Some((expected, actual)) = ledger.pair(op, &case.case_id, scipy, fsci) else {
             continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: format!("geometric_discrepancy_{}", case.method),
@@ -328,6 +341,7 @@ fn diff_stats_qmc_update_geom_disc() {
             "fsci_stats qmc update_centered_discrepancy + geometric_discrepancy vs scipy.stats.qmc"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,5 +361,13 @@ fn diff_stats_qmc_update_geom_disc() {
         "qmc upd/geom conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let per_method = |m: &str| query.geom.iter().filter(|c| c.method == m).count();
+    ledger.finish(
+        query
+            .update
+            .len()
+            .min(per_method("mindist"))
+            .min(per_method("mst")),
     );
 }

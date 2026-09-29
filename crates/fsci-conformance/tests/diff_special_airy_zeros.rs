@@ -11,19 +11,22 @@
 //! 5 n-counts × 2 funcs = 10 batches via subprocess. Tolerances:
 //! 1e-6 abs — Airy precision floor is wider than Bessel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{ai_zeros, bi_zeros};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function compared.
+const ARMS: [&str; 2] = ["ai_zeros", "bi_zeros"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -61,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -90,16 +94,13 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn fsci_eval(func: &str, n: usize) -> Option<Vec<f64>> {
+    // A non-finite zero is returned as is: the ledger classifies it against SciPy's.
     let zs = match func {
         "ai_zeros" => ai_zeros(n),
         "bi_zeros" => bi_zeros(n),
         _ => return None,
     };
-    if zs.iter().all(|z| z.is_finite()) {
-        Some(zs)
-    } else {
-        None
-    }
+    Some(zs)
 }
 
 fn generate_query() -> OracleQuery {
@@ -222,34 +223,30 @@ fn diff_special_airy_zeros() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_airy_zeros", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_zs) = oracle.zeros.as_ref()
-            && let Some(rust_zs) = fsci_eval(&case.func, case.n)
-        {
-            if rust_zs.len() != scipy_zs.len() {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: case.func.clone(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                continue;
-            }
-            let max_abs = rust_zs
-                .iter()
-                .zip(scipy_zs.iter())
-                .map(|(r, s)| (r - s).abs())
-                .fold(0.0_f64, f64::max);
-            max_overall = max_overall.max(max_abs);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: max_abs,
-                pass: max_abs <= ABS_TOL,
-            });
-        }
+        let arm = case.func.as_str();
+        let fsci = fsci_eval(&case.func, case.n);
+        let Some((scipy_zs, rust_zs)) =
+            ledger.slices(arm, &case.case_id, oracle.zeros.as_deref(), fsci.as_deref())
+        else {
+            continue;
+        };
+        let max_abs = rust_zs
+            .iter()
+            .zip(scipy_zs.iter())
+            .map(|(r, s)| (r - s).abs())
+            .fold(0.0_f64, f64::max);
+        max_overall = max_overall.max(max_abs);
+        ledger.compared(arm, &case.case_id, max_abs <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff: max_abs,
+            pass: max_abs <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -258,6 +255,7 @@ fn diff_special_airy_zeros() {
         test_id: "diff_special_airy_zeros".into(),
         category: "scipy.special.ai_zeros/bi_zeros".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -282,4 +280,10 @@ fn diff_special_airy_zeros() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

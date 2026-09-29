@@ -12,13 +12,14 @@
 //! 3 datasets × (CV + excess_kurtosis + expected_freq_uniform)
 //! = 9 cases via subprocess. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{coefficient_of_variation, excess_kurtosis, expected_freq_uniform};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,62 +240,56 @@ fn diff_stats_misc_summary() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_misc_summary",
+        &["cv", "excess_kurtosis", "expected_freq_uniform"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        match case.func.as_str() {
-            "cv" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = coefficient_of_variation(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
-            }
-            "excess_kurtosis" => {
-                if let Some(scipy_v) = scipy_arm.scalar {
-                    let rust_v = excess_kurtosis(&case.data);
-                    if rust_v.is_finite() {
-                        let abs_diff = (rust_v - scipy_v).abs();
-                        max_overall = max_overall.max(abs_diff);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff,
-                            pass: abs_diff <= ABS_TOL,
-                        });
-                    }
-                }
+        let arm = case.func.as_str();
+        let abs_diff = match arm {
+            "cv" | "excess_kurtosis" => {
+                let rust_v = if arm == "cv" {
+                    coefficient_of_variation(&case.data)
+                } else {
+                    excess_kurtosis(&case.data)
+                };
+                let Some((scipy_v, rust_v)) =
+                    ledger.pair(arm, &case.case_id, scipy_arm.scalar, Some(rust_v))
+                else {
+                    continue;
+                };
+                (rust_v - scipy_v).abs()
             }
             "expected_freq_uniform" => {
-                if let Some(scipy_vec) = &scipy_arm.vector {
-                    let rust_vec = expected_freq_uniform(&case.data);
-                    if rust_vec.len() == scipy_vec.len() {
-                        let mut max_local = 0.0_f64;
-                        for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
-                            if a.is_finite() {
-                                max_local = max_local.max((a - b).abs());
-                            }
-                        }
-                        max_overall = max_overall.max(max_local);
-                        diffs.push(CaseDiff {
-                            case_id: case.case_id.clone(),
-                            func: case.func.clone(),
-                            abs_diff: max_local,
-                            pass: max_local <= ABS_TOL,
-                        });
+                let rust_vec = expected_freq_uniform(&case.data);
+                let Some((scipy_vec, rust_vec)) = ledger.slices(
+                    arm,
+                    &case.case_id,
+                    scipy_arm.vector.as_deref(),
+                    Some(rust_vec.as_slice()),
+                ) else {
+                    continue;
+                };
+                let mut max_local = 0.0_f64;
+                for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
+                    if b.is_finite() {
+                        max_local = max_local.max((a - b).abs());
                     }
                 }
+                max_local
             }
-            _ => {}
-        }
+            other => panic!("unknown func {other} in {}", case.case_id),
+        };
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -302,6 +298,7 @@ fn diff_stats_misc_summary() {
         test_id: "diff_stats_misc_summary".into(),
         category: "coefficient_of_variation + excess_kurtosis + expected_freq_uniform".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,4 +323,6 @@ fn diff_stats_misc_summary() {
         diffs.len(),
         max_overall
     );
+    // Every func runs on every dataset, so each arm has the same case count.
+    ledger.finish(query.points.iter().filter(|c| c.func == "cv").count());
 }

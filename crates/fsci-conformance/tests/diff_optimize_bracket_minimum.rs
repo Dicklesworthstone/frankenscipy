@@ -28,12 +28,14 @@
 //! equally have been erased. `bit_transport_survives_values_decimal_json_would_corrupt` pins
 //! the exact value that exposed it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{MinimumBracketOptions, MinimumBracketStatus, bracket_minimum};
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +140,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     total_samples_compared: usize,
     statuses_seen: Vec<String>,
@@ -432,6 +435,7 @@ fn diff_optimize_bracket_minimum() {
     let mut compared = 0usize;
     let mut total_samples = 0usize;
     let mut statuses_seen: Vec<String> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_optimize_bracket_minimum", &["bracket_minimum"]);
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -445,15 +449,8 @@ fn diff_optimize_bracket_minimum() {
             case.case_id,
             arm.error
         );
-        let (
-            Some(sampled),
-            Some(bracket),
-            Some(f_bracket),
-            Some(nit),
-            Some(nfev),
-            Some(status),
-            Some(success),
-        ) = (
+        // A half-populated arm (a null field and no error) is recorded as a missing SciPy value.
+        let scipy = match (
             arm.sampled_bits.as_ref(),
             arm.bracket_bits.as_ref(),
             arm.f_bracket_bits.as_ref(),
@@ -461,19 +458,30 @@ fn diff_optimize_bracket_minimum() {
             arm.nfev,
             arm.status,
             arm.success,
-        )
-        else {
-            panic!(
-                "case {} came back with a null field and no error; a half-populated arm \
-                 would compare vacuously",
-                case.case_id
-            );
+        ) {
+            (
+                Some(sampled),
+                Some(bracket),
+                Some(f_bracket),
+                Some(nit),
+                Some(nfev),
+                Some(status),
+                Some(success),
+            ) => Some((sampled, bracket, f_bracket, nit, nfev, status, success)),
+            _ => {
+                eprintln!(
+                    "case {} came back with a null field and no error; a half-populated arm \
+                     would compare vacuously",
+                    case.case_id
+                );
+                None
+            }
         };
 
         let visited = std::cell::RefCell::new(Vec::new());
         let kind = case.kind;
         let c = case.c;
-        let result = bracket_minimum(
+        let fsci = bracket_minimum(
             |x| {
                 visited.borrow_mut().push(x);
                 kind.eval(x, c)
@@ -488,8 +496,14 @@ fn diff_optimize_bracket_minimum() {
                 maxiter: case.maxiter,
             },
         )
-        .unwrap_or_else(|e| panic!("case {} failed on our arm: {e}", case.case_id));
+        .inspect_err(|e| eprintln!("case {} failed on our arm: {e}", case.case_id))
+        .ok();
         let ours = visited.into_inner();
+        let Some(((sampled, bracket, f_bracket, nit, nfev, status, success), result)) =
+            ledger.both("bracket_minimum", &case.case_id, scipy, fsci)
+        else {
+            continue;
+        };
 
         // NOTHING is permitted to differ here — see the module comment.
         assert!(
@@ -563,6 +577,8 @@ fn diff_optimize_bracket_minimum() {
             );
         }
 
+        // Every check above is an assertion, so reaching here means this case matched.
+        ledger.compared("bracket_minimum", &case.case_id, true);
         compared += 1;
         total_samples += ours.len();
         let name = status_name(result.status).to_string();
@@ -585,6 +601,7 @@ fn diff_optimize_bracket_minimum() {
         test_id: "diff_optimize_bracket_minimum".to_string(),
         category: "optimize.elementwise".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         total_samples_compared: total_samples,
         statuses_seen: statuses_seen.clone(),
@@ -618,6 +635,7 @@ fn diff_optimize_bracket_minimum() {
         ],
         "every reachable termination status must be exercised"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-HIT / MUST-MISS control for the bitwise comparator every assertion above depends on.

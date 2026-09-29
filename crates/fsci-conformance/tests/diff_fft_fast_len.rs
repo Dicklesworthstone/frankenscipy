@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-wiz6v]. fsci uses {2, 3, 5} factors; scipy's
 //! `real=True` flag selects the same scheme.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{next_fast_len, prev_fast_len};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -186,17 +188,21 @@ fn diff_fft_fast_len() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_fft_fast_len", &["next", "prev"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
             "next" => next_fast_len(case.target, true),
             "prev" => prev_fast_len(case.target, true),
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
+        let Some((scipy_v, fsci_v)) =
+            ledger.both(&case.op, &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
+            continue;
+        };
+        ledger.compared(&case.op, &case.case_id, fsci_v == scipy_v);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -213,6 +219,7 @@ fn diff_fft_fast_len() {
         test_id: "diff_fft_fast_len".into(),
         category: "scipy.fft.next_fast_len + prev_fast_len".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -234,4 +241,6 @@ fn diff_fft_fast_len() {
         "scipy.fft.next_fast_len/prev_fast_len conformance failed: {} cases",
         diffs.len()
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("next").min(per_op("prev")));
 }

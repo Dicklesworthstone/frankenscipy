@@ -10,13 +10,14 @@
 //! worN=n returns w_k = π·k/n via `whole=False`. Phase is unwrapped
 //! on both sides for direct comparison. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{magnitude_response, magnitude_response_db, phase_response};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -224,9 +226,6 @@ print(json.dumps({"points": points}))
 }
 
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -249,83 +248,108 @@ fn diff_signal_magnitude_phase_response() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_magnitude_phase_response",
+        &["freqs", "magnitude", "magnitude_db", "phase"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(efreqs), Some(emag), Some(emag_db), Some(ephase)) = (
-            arm.freqs.as_ref(),
-            arm.mag.as_ref(),
-            arm.mag_db.as_ref(),
-            arm.phase.as_ref(),
-        ) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
 
         let (mfreqs, mag) = magnitude_response(&case.b, &case.a, case.n_freqs);
         let (_, mag_db) = magnitude_response_db(&case.b, &case.a, case.n_freqs);
         let (_, phase_raw) = phase_response(&case.b, &case.a, case.n_freqs);
-        let phase_units = phase_to_unit(&phase_raw);
-        let expected_units = phase_to_unit(ephase);
 
         // frequency grid
-        let f_diff = vec_max_diff(&mfreqs, efreqs);
-        max_overall = max_overall.max(f_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_freqs", case.case_id),
-            op: "freqs".into(),
-            abs_diff: f_diff,
-            pass: f_diff <= ABS_TOL,
-        });
+        if let Some((efreqs, mfreqs)) = ledger.slices(
+            "freqs",
+            &case.case_id,
+            arm.and_then(|a| a.freqs.as_deref()),
+            Some(mfreqs.as_slice()),
+        ) {
+            let f_diff = vec_max_diff(mfreqs, efreqs);
+            max_overall = max_overall.max(f_diff);
+            ledger.compared("freqs", &case.case_id, f_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_freqs", case.case_id),
+                op: "freqs".into(),
+                abs_diff: f_diff,
+                pass: f_diff <= ABS_TOL,
+            });
+        }
 
-        let m_diff = vec_max_diff(&mag, emag);
-        max_overall = max_overall.max(m_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_mag", case.case_id),
-            op: "magnitude".into(),
-            abs_diff: m_diff,
-            pass: m_diff <= ABS_TOL,
-        });
+        if let Some((emag, mag)) = ledger.slices(
+            "magnitude",
+            &case.case_id,
+            arm.and_then(|a| a.mag.as_deref()),
+            Some(mag.as_slice()),
+        ) {
+            let m_diff = vec_max_diff(mag, emag);
+            max_overall = max_overall.max(m_diff);
+            ledger.compared("magnitude", &case.case_id, m_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_mag", case.case_id),
+                op: "magnitude".into(),
+                abs_diff: m_diff,
+                pass: m_diff <= ABS_TOL,
+            });
+        }
 
-        // magnitude_db: skip indices where either side flagged a sub-floor magnitude.
-        let mdb_diff = if mag_db.len() != emag_db.len() {
-            f64::INFINITY
-        } else {
-            mag_db
+        // magnitude_db: the oracle's None marks a sub-floor magnitude, which fsci reports as
+        // NEG_INFINITY; the ledger requires both sides to flag the same indices.
+        let emag_db: Option<Vec<f64>> = arm
+            .and_then(|a| a.mag_db.as_ref())
+            .map(|v| v.iter().map(|e| e.unwrap_or(f64::NEG_INFINITY)).collect());
+        if let Some((emag_db, mag_db)) = ledger.slices(
+            "magnitude_db",
+            &case.case_id,
+            emag_db.as_deref(),
+            Some(mag_db.as_slice()),
+        ) {
+            let mdb_diff = mag_db
                 .iter()
                 .zip(emag_db.iter())
-                .map(|(actual, expected)| match expected {
-                    Some(e) if actual.is_finite() => (actual - e).abs(),
-                    Some(_) | None => 0.0, // skip
+                .map(|(actual, expected)| {
+                    if expected.is_finite() {
+                        (actual - expected).abs()
+                    } else {
+                        0.0 // both sides flagged a sub-floor magnitude
+                    }
                 })
-                .fold(0.0_f64, f64::max)
-        };
-        max_overall = max_overall.max(mdb_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_mag_db", case.case_id),
-            op: "magnitude_db".into(),
-            abs_diff: mdb_diff,
-            pass: mdb_diff <= ABS_TOL,
-        });
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(mdb_diff);
+            ledger.compared("magnitude_db", &case.case_id, mdb_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_mag_db", case.case_id),
+                op: "magnitude_db".into(),
+                abs_diff: mdb_diff,
+                pass: mdb_diff <= ABS_TOL,
+            });
+        }
 
         // phase as (cos, sin) — agnostic to 2π wrapping.
-        let p_diff = if phase_units.len() != expected_units.len() {
-            f64::INFINITY
-        } else {
-            phase_units
+        if let Some((ephase, phase_raw)) = ledger.slices(
+            "phase",
+            &case.case_id,
+            arm.and_then(|a| a.phase.as_deref()),
+            Some(phase_raw.as_slice()),
+        ) {
+            let phase_units = phase_to_unit(phase_raw);
+            let expected_units = phase_to_unit(ephase);
+            let p_diff = phase_units
                 .iter()
                 .zip(expected_units.iter())
                 .map(|(&(ac, as_), &(ec, es))| ((ac - ec).powi(2) + (as_ - es).powi(2)).sqrt())
-                .fold(0.0_f64, f64::max)
-        };
-        max_overall = max_overall.max(p_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_phase", case.case_id),
-            op: "phase".into(),
-            abs_diff: p_diff,
-            pass: p_diff <= ABS_TOL,
-        });
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(p_diff);
+            ledger.compared("phase", &case.case_id, p_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_phase", case.case_id),
+                op: "phase".into(),
+                abs_diff: p_diff,
+                pass: p_diff <= ABS_TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -334,6 +358,7 @@ fn diff_signal_magnitude_phase_response() {
         test_id: "diff_signal_magnitude_phase_response".into(),
         category: "fsci_signal magnitude/phase response vs scipy.signal.freqz".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -354,4 +379,5 @@ fn diff_signal_magnitude_phase_response() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

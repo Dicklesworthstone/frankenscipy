@@ -11,13 +11,14 @@
 //! via subprocess. Tol 1e-12 abs (closed-form median of
 //! medians).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::siegelslopes;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -233,31 +235,26 @@ fn diff_stats_siegelslopes() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_siegelslopes", &["slope", "intercept"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = siegelslopes(&case.x, &case.y);
 
-        if let Some(scipy_slope) = scipy_arm.slope
-            && result.slope.is_finite()
-        {
-            let abs_diff = (result.slope - scipy_slope).abs();
+        let arms = [
+            ("slope", scipy_arm.slope, result.slope),
+            ("intercept", scipy_arm.intercept, result.intercept),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "slope".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_int) = scipy_arm.intercept
-            && result.intercept.is_finite()
-        {
-            let abs_diff = (result.intercept - scipy_int).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "intercept".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -270,6 +267,7 @@ fn diff_stats_siegelslopes() {
         test_id: "diff_stats_siegelslopes".into(),
         category: "scipy.stats.siegelslopes".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -294,4 +292,5 @@ fn diff_stats_siegelslopes() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

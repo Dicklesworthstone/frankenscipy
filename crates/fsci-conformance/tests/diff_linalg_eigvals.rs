@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-8 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, eigvals};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -234,41 +236,43 @@ fn diff_linalg_eigvals() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_linalg_eigvals", &["eigvals"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.eigs_packed.as_ref() else {
-            continue;
-        };
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.eigs_packed.as_deref());
         let a = unpack_2d(&case.a, case.n);
-        let Ok((re, im)) = eigvals(&a, opts) else {
+        let fsci_flat = eigvals(&a, opts)
+            .ok()
+            .filter(|(re, im)| re.len() == im.len())
+            .map(|(re, im)| {
+                let mut pairs: Vec<(f64, f64)> =
+                    re.iter().zip(im.iter()).map(|(&r, &i)| (r, i)).collect();
+                pairs.sort_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap()
+                        .then(a.1.partial_cmp(&b.1).unwrap())
+                });
+                let mut flat = Vec::with_capacity(pairs.len() * 2);
+                for &(r, i) in &pairs {
+                    flat.push(r);
+                    flat.push(i);
+                }
+                flat
+            });
+        let Some((expected, flat)) =
+            ledger.slices("eigvals", &case.case_id, expected, fsci_flat.as_deref())
+        else {
             continue;
         };
-        if re.len() != im.len() {
-            continue;
-        }
-        let mut pairs: Vec<(f64, f64)> = re.iter().zip(im.iter()).map(|(&r, &i)| (r, i)).collect();
-        pairs.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap()
-                .then(a.1.partial_cmp(&b.1).unwrap())
-        });
-        let mut flat = Vec::with_capacity(pairs.len() * 2);
-        for &(r, i) in &pairs {
-            flat.push(r);
-            flat.push(i);
-        }
-        let abs_d = if flat.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            flat.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = flat
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("eigvals", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -282,6 +286,7 @@ fn diff_linalg_eigvals() {
         test_id: "diff_linalg_eigvals".into(),
         category: "fsci_linalg::eigvals vs scipy.linalg.eigvals (sorted)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -302,4 +307,5 @@ fn diff_linalg_eigvals() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

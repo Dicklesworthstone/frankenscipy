@@ -16,13 +16,14 @@
 //! (chi-square / F-tail chain via regularized incomplete
 //! gamma / beta).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{bartlett, jarque_bera, levene};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -299,6 +301,17 @@ fn diff_stats_variance_normality_tests() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_variance_normality_tests",
+        &[
+            "levene.statistic",
+            "levene.pvalue",
+            "bartlett.statistic",
+            "bartlett.pvalue",
+            "jarque_bera.statistic",
+            "jarque_bera.pvalue",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -317,29 +330,26 @@ fn diff_stats_variance_normality_tests() {
                 let r = jarque_bera(&case.data);
                 (r.statistic, r.pvalue)
             }
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
 
-        if let Some(s_stat) = scipy_arm.statistic
-            && rust_stat.is_finite()
-        {
-            let abs_diff = (rust_stat - s_stat).abs();
+        let stat_arm = format!("{}.statistic", case.func);
+        let pvalue_arm = format!("{}.pvalue", case.func);
+        let arms = [
+            (stat_arm, scipy_arm.statistic, rust_stat),
+            (pvalue_arm, scipy_arm.pvalue, rust_p),
+        ];
+        for (arm, scipy_v, rust_v) in arms {
+            let Some((scipy_v, rust_v)) = ledger.pair(&arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(&arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.statistic", case.func),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(s_p) = scipy_arm.pvalue
-            && rust_p.is_finite()
-        {
-            let abs_diff = (rust_p - s_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: format!("{}.pvalue", case.func),
+                arm,
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -352,6 +362,7 @@ fn diff_stats_variance_normality_tests() {
         test_id: "diff_stats_variance_normality_tests".into(),
         category: "scipy.stats.{levene, bartlett, jarque_bera}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -376,4 +387,12 @@ fn diff_stats_variance_normality_tests() {
         diffs.len(),
         max_overall
     );
+    // levene/bartlett compare one case per group fixture, jarque_bera one per dataset.
+    let levene_cases = query.points.iter().filter(|c| c.func == "levene").count();
+    let jb_cases = query
+        .points
+        .iter()
+        .filter(|c| c.func == "jarque_bera")
+        .count();
+    ledger.finish(levene_cases.min(jb_cases));
 }

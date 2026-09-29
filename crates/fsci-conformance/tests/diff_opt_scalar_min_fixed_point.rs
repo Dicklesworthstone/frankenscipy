@@ -15,13 +15,14 @@
 //! since closures can't be serialized. xmin agreement at ~5e-6 abs
 //! (Brent's xtol floor); fixed-point agreement at 1e-8.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{brent_minimize, fixed_point, golden};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,7 @@ const PACKET_ID: &str = "FSCI-P2C-003";
 const XMIN_TOL: f64 = 5.0e-6; // Brent's documented xtol floor
 const FIXED_POINT_TOL: f64 = 1.0e-8;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 3] = ["brent", "golden", "fixed_point"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -70,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -318,40 +321,40 @@ fn diff_opt_scalar_min_fixed_point() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_scalar_min_fixed_point", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
+        let arm = case.routine.as_str();
+        let (fsci_v, tol) = match arm {
+            "brent" => (
+                fsci_minimization_target(&case.func).map(|f| {
+                    let (xmin, _fmin) = brent_minimize(f, case.a, case.b, 1.0e-8, 500);
+                    xmin
+                }),
+                XMIN_TOL,
+            ),
+            "golden" => (
+                fsci_minimization_target(&case.func).map(|f| {
+                    let (xmin, _fmin) = golden(f, case.a, case.b, 1.0e-8, 500);
+                    xmin
+                }),
+                XMIN_TOL,
+            ),
+            "fixed_point" => (
+                fsci_fixed_point_target(&case.func)
+                    .and_then(|f| fixed_point(f, case.x0, 1.0e-10, 500).ok()),
+                FIXED_POINT_TOL,
+            ),
+            other => panic!("unknown routine {other}"),
         };
-        let (fsci_v, tol) = match case.routine.as_str() {
-            "brent" => {
-                let Some(f) = fsci_minimization_target(&case.func) else {
-                    continue;
-                };
-                let (xmin, _fmin) = brent_minimize(f, case.a, case.b, 1.0e-8, 500);
-                (xmin, XMIN_TOL)
-            }
-            "golden" => {
-                let Some(f) = fsci_minimization_target(&case.func) else {
-                    continue;
-                };
-                let (xmin, _fmin) = golden(f, case.a, case.b, 1.0e-8, 500);
-                (xmin, XMIN_TOL)
-            }
-            "fixed_point" => {
-                let Some(f) = fsci_fixed_point_target(&case.func) else {
-                    continue;
-                };
-                let Ok(xfp) = fixed_point(f, case.x0, 1.0e-10, 500) else {
-                    continue;
-                };
-                (xfp, FIXED_POINT_TOL)
-            }
-            _ => continue,
+        let Some((scipy_v, fsci_v)) = ledger.pair(arm, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - scipy_v).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             routine: case.routine.clone(),
@@ -366,6 +369,7 @@ fn diff_opt_scalar_min_fixed_point() {
         test_id: "diff_opt_scalar_min_fixed_point".into(),
         category: "scipy.optimize.fminbound / fixed_point".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -389,4 +393,11 @@ fn diff_opt_scalar_min_fixed_point() {
         diffs.len(),
         max_overall
     );
+    // brent, golden and fixed_point have separate case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.routine == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

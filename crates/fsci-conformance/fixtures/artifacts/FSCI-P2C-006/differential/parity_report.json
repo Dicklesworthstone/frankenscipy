@@ -486,12 +486,12 @@
     {
       "case_id": "diff_btdtria_0p5_2_0p3",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)"
+      "message": "special scalar matched (diff=4.44e-16)"
     },
     {
       "case_id": "diff_btdtria_high_tail_complement_branch",
       "passed": true,
-      "message": "special scalar matched (diff=4.26e-14)"
+      "message": "special scalar matched (diff=1.24e-14)"
     },
     {
       "case_id": "diff_btdtrib_2_0p5_0p3",
@@ -626,12 +626,12 @@
     {
       "case_id": "diff_gdtrc_2_3_4",
       "passed": true,
-      "message": "special scalar matched (diff=5.20e-18)"
+      "message": "special scalar matched (diff=3.47e-18)"
     },
     {
       "case_id": "diff_gdtria_0p4_1p25_3p2",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)"
+      "message": "special scalar matched (diff=2.78e-17)"
     },
     {
       "case_id": "diff_gdtria_0p7_3_2",
@@ -771,7 +771,7 @@
     {
       "case_id": "diff_iv_v0_x1",
       "passed": true,
-      "message": "special scalar matched (diff=8.88e-16)"
+      "message": "special scalar matched (diff=2.22e-16)"
     },
     {
       "case_id": "diff_iv_v1_x2",
@@ -801,7 +801,7 @@
     {
       "case_id": "diff_wright_bessel_large_a_50_0p25_0p1",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_wright_bessel_large_a_100_0_1e20",
@@ -836,7 +836,7 @@
     {
       "case_id": "diff_jvp_complex_z_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.38e-16)"
+      "message": "special complex scalar matched (max_diff=6.52e-16)"
     },
     {
       "case_id": "diff_yvp_v0_x1p75_n1",
@@ -866,7 +866,7 @@
     {
       "case_id": "diff_kvp_complex_z_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.11e-16)"
+      "message": "special complex scalar matched (max_diff=5.55e-16)"
     },
     {
       "case_id": "diff_spherical_jn_n0_x1",
@@ -906,7 +906,7 @@
     {
       "case_id": "diff_spherical_in_n3_x2p5",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)"
+      "message": "special scalar matched (diff=2.78e-17)"
     },
     {
       "case_id": "diff_spherical_kn_n0_x1p25",
@@ -996,7 +996,7 @@
     {
       "case_id": "diff_pseudo_huber_1_2",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_cosdg_90",
@@ -1116,7 +1116,7 @@
     {
       "case_id": "diff_nrdtrisd_3_0p9331927987311419_6",
       "passed": true,
-      "message": "special scalar matched (diff=1.33e-15)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_nrdtrisd_0p5_0p5_0p5",
@@ -1126,7 +1126,7 @@
     {
       "case_id": "diff_nrdtrisd_midpoint_sentinel",
       "passed": true,
-      "message": "special scalar matched (diff=1.00e0)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_nrdtrisd_p0_invalid",
@@ -1161,7 +1161,7 @@
     {
       "case_id": "diff_sici_si_1",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)"
+      "message": "special scalar matched (diff=1.11e-16)"
     },
     {
       "case_id": "diff_sici_ci_1",
@@ -1261,7 +1261,7 @@
     {
       "case_id": "diff_ellipk_0p5",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_ellipkm1_0p25",
@@ -1311,7 +1311,7 @@
     {
       "case_id": "diff_ellipk_near_one",
       "passed": true,
-      "message": "special scalar matched (diff=1.78e-15)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_ellipkm1_one",
@@ -1501,12 +1501,12 @@
     {
       "case_id": "diff_roots_chebyt_4_node_left",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_roots_chebyt_4_node_right",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "diff_roots_chebyt_4_weight_left",
@@ -1581,7 +1581,7 @@
     {
       "case_id": "diff_roots_laguerre_3_weight_right",
       "passed": true,
-      "message": "special scalar matched (diff=5.20e-18)"
+      "message": "special scalar matched (diff=3.47e-18)"
     },
     {
       "case_id": "diff_roots_genlaguerre_4_1p5_node_inner",
@@ -1596,7 +1596,7 @@
     {
       "case_id": "diff_roots_jacobi_4_0p5_1_node_inner",
       "passed": true,
-      "message": "special scalar matched (diff=1.94e-16)"
+      "message": "special scalar matched (diff=1.67e-16)"
     },
     {
       "case_id": "diff_roots_jacobi_4_0p5_1_weight_inner",
@@ -1696,7 +1696,7 @@
     {
       "case_id": "diff_hyp2f1_1_1_2_0p5",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)"
+      "message": "special scalar matched (diff=2.22e-16)"
     },
     {
       "case_id": "diff_lambertw_complex_pos0p4_pos0p7i",
@@ -1736,22 +1736,22 @@
     {
       "case_id": "diff_jvp_complex_order2_neg0p75_pos0p5i_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=1.39e-16)"
+      "message": "special complex scalar matched (max_diff=2.78e-17)"
     },
     {
       "case_id": "diff_jvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.11e-16)"
+      "message": "special complex scalar matched (max_diff=5.55e-16)"
     },
     {
       "case_id": "diff_yvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=2.22e-15)"
+      "message": "special complex scalar matched (max_diff=4.88e-15)"
     },
     {
       "case_id": "diff_ivp_complex_order2_neg0p75_pos0p5i_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=1.11e-16)"
+      "message": "special complex scalar matched (max_diff=5.55e-17)"
     },
     {
       "case_id": "diff_ivp_complex_order1p5_pos0p2_neg_i_n2",
@@ -1761,7 +1761,7 @@
     {
       "case_id": "diff_kvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=4.00e-15)"
+      "message": "special complex scalar matched (max_diff=7.55e-15)"
     },
     {
       "case_id": "br_8aac_erf_zero",
@@ -1791,7 +1791,7 @@
     {
       "case_id": "br_8aac_erfc_negative_x",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)"
+      "message": "special scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "br_8aac_erfinv_zero",
@@ -3052,8 +3052,8 @@
     {
       "case_id": "diff_btdtria_0p5_2_0p3",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "special scalar matched (diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
       "tolerance_used": {
         "atol": 2e-10,
         "rtol": 2e-10,
@@ -3066,8 +3066,8 @@
     {
       "case_id": "diff_btdtria_high_tail_complement_branch",
       "passed": true,
-      "message": "special scalar matched (diff=4.26e-14)",
-      "max_diff": 4.263256414560601e-14,
+      "message": "special scalar matched (diff=1.24e-14)",
+      "max_diff": 1.2434497875801753e-14,
       "tolerance_used": {
         "atol": 2e-10,
         "rtol": 2e-10,
@@ -3444,8 +3444,8 @@
     {
       "case_id": "diff_gdtrc_2_3_4",
       "passed": true,
-      "message": "special scalar matched (diff=5.20e-18)",
-      "max_diff": 5.204170427930421e-18,
+      "message": "special scalar matched (diff=3.47e-18)",
+      "max_diff": 3.469446951953614e-18,
       "tolerance_used": {
         "atol": 2e-10,
         "rtol": 2e-10,
@@ -3458,8 +3458,8 @@
     {
       "case_id": "diff_gdtria_0p4_1p25_3p2",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "special scalar matched (diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
       "tolerance_used": {
         "atol": 2e-10,
         "rtol": 2e-10,
@@ -3810,8 +3810,8 @@
     {
       "case_id": "diff_iv_v0_x1",
       "passed": true,
-      "message": "special scalar matched (diff=8.88e-16)",
-      "max_diff": 8.881784197001252e-16,
+      "message": "special scalar matched (diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -3894,8 +3894,8 @@
     {
       "case_id": "diff_wright_bessel_large_a_50_0p25_0p1",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -3984,8 +3984,8 @@
     {
       "case_id": "diff_jvp_complex_z_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.38e-16)",
-      "max_diff": 6.38378239159465e-16,
+      "message": "special complex scalar matched (max_diff=6.52e-16)",
+      "max_diff": 6.522560269672795e-16,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -4068,8 +4068,8 @@
     {
       "case_id": "diff_kvp_complex_z_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.11e-16)",
-      "max_diff": 6.106226635438361e-16,
+      "message": "special complex scalar matched (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-9,
@@ -4176,8 +4176,8 @@
     {
       "case_id": "diff_spherical_in_n3_x2p5",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "special scalar matched (diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -4428,8 +4428,8 @@
     {
       "case_id": "diff_pseudo_huber_1_2",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -4756,8 +4756,8 @@
     {
       "case_id": "diff_nrdtrisd_3_0p9331927987311419_6",
       "passed": true,
-      "message": "special scalar matched (diff=1.33e-15)",
-      "max_diff": 1.3322676295501878e-15,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -4784,8 +4784,8 @@
     {
       "case_id": "diff_nrdtrisd_midpoint_sentinel",
       "passed": true,
-      "message": "special scalar matched (diff=1.00e0)",
-      "max_diff": 1.0,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 8192.0,
         "rtol": 1e-15,
@@ -4878,8 +4878,8 @@
     {
       "case_id": "diff_sici_si_1",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "special scalar matched (diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -5158,8 +5158,8 @@
     {
       "case_id": "diff_ellipk_0p5",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -5298,8 +5298,8 @@
     {
       "case_id": "diff_ellipk_near_one",
       "passed": true,
-      "message": "special scalar matched (diff=1.78e-15)",
-      "max_diff": 1.7763568394002505e-15,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -5822,8 +5822,8 @@
     {
       "case_id": "diff_roots_chebyt_4_node_left",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -5836,8 +5836,8 @@
     {
       "case_id": "diff_roots_chebyt_4_node_right",
       "passed": true,
-      "message": "special scalar matched (diff=1.11e-16)",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -6046,8 +6046,8 @@
     {
       "case_id": "diff_roots_laguerre_3_weight_right",
       "passed": true,
-      "message": "special scalar matched (diff=5.20e-18)",
-      "max_diff": 5.204170427930421e-18,
+      "message": "special scalar matched (diff=3.47e-18)",
+      "max_diff": 3.469446951953614e-18,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-12,
@@ -6088,8 +6088,8 @@
     {
       "case_id": "diff_roots_jacobi_4_0p5_1_node_inner",
       "passed": true,
-      "message": "special scalar matched (diff=1.94e-16)",
-      "max_diff": 1.942890293094024e-16,
+      "message": "special scalar matched (diff=1.67e-16)",
+      "max_diff": 1.6653345369377348e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -6368,8 +6368,8 @@
     {
       "case_id": "diff_hyp2f1_1_1_2_0p5",
       "passed": true,
-      "message": "special scalar matched (diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "special scalar matched (diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-8,
         "rtol": 1e-8,
@@ -6480,8 +6480,8 @@
     {
       "case_id": "diff_jvp_complex_order2_neg0p75_pos0p5i_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=1.39e-16)",
-      "max_diff": 1.3877787807814457e-16,
+      "message": "special complex scalar matched (max_diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-7,
@@ -6494,8 +6494,8 @@
     {
       "case_id": "diff_jvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=6.11e-16)",
-      "max_diff": 6.106226635438361e-16,
+      "message": "special complex scalar matched (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-7,
@@ -6508,8 +6508,8 @@
     {
       "case_id": "diff_yvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=2.22e-15)",
-      "max_diff": 2.220446049250313e-15,
+      "message": "special complex scalar matched (max_diff=4.88e-15)",
+      "max_diff": 4.884981308350689e-15,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-7,
@@ -6522,8 +6522,8 @@
     {
       "case_id": "diff_ivp_complex_order2_neg0p75_pos0p5i_n1",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=1.11e-16)",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "special complex scalar matched (max_diff=5.55e-17)",
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-7,
@@ -6550,8 +6550,8 @@
     {
       "case_id": "diff_kvp_complex_order1p5_pos0p2_neg_i_n2",
       "passed": true,
-      "message": "special complex scalar matched (max_diff=4.00e-15)",
-      "max_diff": 3.9968028886505635e-15,
+      "message": "special complex scalar matched (max_diff=7.55e-15)",
+      "max_diff": 7.549516567451064e-15,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-7,
@@ -6634,8 +6634,8 @@
     {
       "case_id": "br_8aac_erfc_negative_x",
       "passed": true,
-      "message": "special scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "special scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-7,
@@ -6702,6 +6702,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501923
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392911374
 }

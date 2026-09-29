@@ -12,12 +12,14 @@
 //! converts to a dense matrix, and compares element-wise to a scipy
 //! oracle that performs the same construction.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, CsrMatrix, FormatConvertible, Shape2D, block_diag, bmat, hstack, vstack,
 };
@@ -85,6 +87,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -347,13 +350,11 @@ fn diff_sparse_construct_block_stack() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let arms = ["block_diag", "vstack", "hstack", "bmat"];
+    let mut ledger = CompareLedger::new("diff_sparse_construct_block_stack", &arms);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_rows), Some(exp_cols), Some(exp_dense)) = (o.rows, o.cols, o.dense.as_ref())
-        else {
-            continue;
-        };
 
         let inputs_csr: Vec<CsrMatrix> = case.inputs.iter().map(to_csr).collect();
 
@@ -397,23 +398,21 @@ fn diff_sparse_construct_block_stack() {
             other => panic!("unknown op {other}"),
         };
 
-        let csr = match result_csr {
-            Ok(m) => m,
+        let fsci_v = match result_csr {
+            Ok(m) => Some(csr_to_dense(&m)),
             Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    op: case.op.clone(),
-                    rows: 0,
-                    cols: 0,
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("construct error: {e:?}"),
-                });
-                continue;
+                eprintln!("construct error: {} ({}) {e:?}", case.case_id, case.op);
+                None
             }
         };
-        let (rows, cols, dense) = csr_to_dense(&csr);
+        let scipy_v = o.rows.zip(o.cols).zip(o.dense.as_deref());
+        let Some((((exp_rows, exp_cols), exp_dense), (rows, cols, dense))) =
+            ledger.both(&case.op, &case.case_id, scipy_v, fsci_v)
+        else {
+            continue;
+        };
         if rows != exp_rows || cols != exp_cols {
+            ledger.compared(&case.op, &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 op: case.op.clone(),
@@ -423,22 +422,28 @@ fn diff_sparse_construct_block_stack() {
                 pass: false,
                 note: format!("shape mismatch: fsci {rows}x{cols} scipy {exp_rows}x{exp_cols}"),
             });
-            continue;
+        } else if let Some((exp_dense, dense)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            Some(exp_dense),
+            Some(dense.as_slice()),
+        ) {
+            let mut max_abs = 0.0_f64;
+            for (a, e) in dense.iter().zip(exp_dense.iter()) {
+                max_abs = max_abs.max((a - e).abs());
+            }
+            let pass = max_abs <= ABS_TOL;
+            ledger.compared(&case.op, &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                op: case.op.clone(),
+                rows,
+                cols,
+                max_abs_diff: max_abs,
+                pass,
+                note: String::new(),
+            });
         }
-        let mut max_abs = 0.0_f64;
-        for (a, e) in dense.iter().zip(exp_dense.iter()) {
-            max_abs = max_abs.max((a - e).abs());
-        }
-        let pass = max_abs <= ABS_TOL;
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            op: case.op.clone(),
-            rows,
-            cols,
-            max_abs_diff: max_abs,
-            pass,
-            note: String::new(),
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -446,6 +451,7 @@ fn diff_sparse_construct_block_stack() {
         test_id: "diff_sparse_construct_block_stack".into(),
         category: "fsci_sparse::{block_diag, bmat, vstack, hstack} vs scipy.sparse".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -463,4 +469,10 @@ fn diff_sparse_construct_block_stack() {
     }
 
     assert!(all_pass, "construct parity failed: {} cases", diffs.len());
+    let min_per_arm = arms
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

@@ -13,13 +13,14 @@
 //!   poles by (re, im) before comparing. 1e-10 abs on root coords
 //!   and gain.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{find_delay, sos2zpk};
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -304,6 +306,7 @@ fn diff_signal_find_delay_sos2zpk() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -314,25 +317,27 @@ fn diff_signal_find_delay_sos2zpk() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_find_delay_sos2zpk", &["fd", "sos"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         match case.op.as_str() {
             "fd" => {
-                let Some(shift) = arm.expected_shift else {
+                let x = synth_signal(case.n, case.seed);
+                let y = shift_right(&x, case.shift);
+                let lag = find_delay(&x, &y);
+                let Some((shift, lag)) =
+                    ledger.both("fd", &case.case_id, arm.expected_shift, Some(lag))
+                else {
                     continue;
                 };
                 // fsci's lag convention has opposite sign to typical
                 // scipy correlate.argmax(); when y is x shifted right
                 // by `shift`, fsci returns -shift.
                 let expected = -shift;
-                let x = synth_signal(case.n, case.seed);
-                let y = shift_right(&x, case.shift);
-                let lag = find_delay(&x, &y);
                 let abs_d = (lag - expected).abs() as f64;
                 max_overall = max_overall.max(abs_d);
+                ledger.compared("fd", &case.case_id, lag == expected);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -341,14 +346,17 @@ fn diff_signal_find_delay_sos2zpk() {
                 });
             }
             "sos" => {
-                let (Some(z_re), Some(z_im), Some(p_re), Some(p_im), Some(g)) = (
+                let scipy = match (
                     arm.z_re.as_ref(),
                     arm.z_im.as_ref(),
                     arm.p_re.as_ref(),
                     arm.p_im.as_ref(),
                     arm.gain,
-                ) else {
-                    continue;
+                ) {
+                    (Some(z_re), Some(z_im), Some(p_re), Some(p_im), Some(g)) => {
+                        Some((z_re, z_im, p_re, p_im, g))
+                    }
+                    _ => None,
                 };
                 let mut sos_sections: Vec<[f64; 6]> = Vec::new();
                 for chunk in case.sos.chunks(6) {
@@ -359,26 +367,38 @@ fn diff_signal_find_delay_sos2zpk() {
                     sos_sections.push(s);
                 }
                 let zpk = sos2zpk(&sos_sections);
+                // A non-finite fsci gain or root is a failure, not a value: a NaN gain would
+                // vanish in the f64::max fold below and a NaN root panics the sort.
+                let fsci_finite = zpk.gain.is_finite()
+                    && zpk
+                        .zeros_re
+                        .iter()
+                        .chain(&zpk.zeros_im)
+                        .chain(&zpk.poles_re)
+                        .chain(&zpk.poles_im)
+                        .all(|v| v.is_finite());
+                let Some(((z_re, z_im, p_re, p_im, g), zpk)) =
+                    ledger.both("sos", &case.case_id, scipy, fsci_finite.then_some(zpk))
+                else {
+                    continue;
+                };
                 let zs = sort_complex_pairs(&zpk.zeros_re, &zpk.zeros_im);
                 let ps = sort_complex_pairs(&zpk.poles_re, &zpk.poles_im);
-                if zs.len() != z_re.len() || ps.len() != p_re.len() {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    max_overall = f64::INFINITY;
-                    continue;
-                }
-                let mut max_d = (zpk.gain - g).abs();
-                for ((re, im), (er, ei)) in zs.iter().zip(z_re.iter().zip(z_im.iter())) {
-                    max_d = max_d.max((re - er).abs()).max((im - ei).abs());
-                }
-                for ((re, im), (er, ei)) in ps.iter().zip(p_re.iter().zip(p_im.iter())) {
-                    max_d = max_d.max((re - er).abs()).max((im - ei).abs());
-                }
+                // A root-count mismatch is a compared failure.
+                let max_d = if zs.len() != z_re.len() || ps.len() != p_re.len() {
+                    f64::INFINITY
+                } else {
+                    let mut max_d = (zpk.gain - g).abs();
+                    for ((re, im), (er, ei)) in zs.iter().zip(z_re.iter().zip(z_im.iter())) {
+                        max_d = max_d.max((re - er).abs()).max((im - ei).abs());
+                    }
+                    for ((re, im), (er, ei)) in ps.iter().zip(p_re.iter().zip(p_im.iter())) {
+                        max_d = max_d.max((re - er).abs()).max((im - ei).abs());
+                    }
+                    max_d
+                };
                 max_overall = max_overall.max(max_d);
+                ledger.compared("sos", &case.case_id, max_d <= SOS_ABS_TOL);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
@@ -386,7 +406,7 @@ fn diff_signal_find_delay_sos2zpk() {
                     pass: max_d <= SOS_ABS_TOL,
                 });
             }
-            _ => continue,
+            other => unreachable!("generate_query emits only fd and sos cases, got {other}"),
         }
     }
 
@@ -396,6 +416,7 @@ fn diff_signal_find_delay_sos2zpk() {
         test_id: "diff_signal_find_delay_sos2zpk".into(),
         category: "fsci_signal::{find_delay, sos2zpk} vs property + scipy.signal.sos2zpk".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -416,4 +437,6 @@ fn diff_signal_find_delay_sos2zpk() {
         diffs.len(),
         max_overall
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("fd").min(per_op("sos")));
 }

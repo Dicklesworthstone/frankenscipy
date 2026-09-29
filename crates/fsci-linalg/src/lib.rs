@@ -7,11 +7,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 #![allow(clippy::type_complexity)]
-// Numeric kernels: fixture vectors, deliberate min/max comparisons, and helper
-// aliases kept for the variants these modules can be switched to.
+// Numeric kernels: fixture vectors and deliberate min/max comparisons.
 #![allow(clippy::useless_vec)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
 #![allow(clippy::min_max)]
 #![allow(clippy::absurd_extreme_comparisons)]
 
@@ -54,15 +51,11 @@ pub mod interpolative;
 mod hessenberg_qr;
 
 // Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
-// not yet wired into any factorization. See panel_pool.rs.
-//
-// DECLARED DELIBERATELY, and the reason is frankenscipy-ozg54. This module shipped
-// undeclared because its fix was unverified: rch worker vmi1153651 served a
-// snapshot that was current as of the last COMMIT but dropped the UNCOMMITTED
-// working-tree edit, so three consecutive builds returned exit 0 while compiling
-// none of it. Committing the declaration is therefore the only way to get the file
-// in front of a compiler, AND it is a direct test of that diagnosis: if committed
-// edits do reach the worker, the test count moves 596 -> 602.
+// wired into no factorization. Its own doc records why it cannot serve the
+// cholesky k-loop without an index-addressed redesign, so no library path uses it
+// and it compiles with its tests only. Once `#![allow(dead_code)]` was lifted
+// (frankenscipy-szq1n.12) every item in it was reported unused.
+#[cfg(test)]
 mod panel_pool;
 
 // Tiled (PLASMA-style) Cholesky — foundation for the task-DAG dense-lane
@@ -5203,11 +5196,24 @@ pub fn lu_solve(lu_factor: &LuFactorResult, b: &[f64]) -> Result<SolveResult, Li
     })
 }
 
-/// QR decomposition: A = QR.
+/// QR decomposition `A = Q·R` in SciPy's default `mode='full'`: `Q` is m×m orthogonal and `R`
+/// is m×n upper trapezoidal, with zero rows below `min(m, n)`.
 ///
-/// Returns orthogonal Q and upper triangular R.
-/// Matches `scipy.linalg.qr(a)`.
+/// Matches `scipy.linalg.qr(a)` up to the signs of Q's columns and R's rows (the Householder
+/// sign convention). For a tall `A` this used to return the economic factors (Q m×n) under the
+/// default name (frankenscipy-kqeao); those are now [`qr_economic`]. For `m ≤ n` the two modes
+/// coincide and the result is unchanged.
 pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgError> {
+    qr_factors(a, options, true)
+}
+
+/// Economic QR, `scipy.linalg.qr(a, mode='economic')`: `Q` is m×k and `R` is k×n with
+/// `k = min(m, n)`.
+pub fn qr_economic(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgError> {
+    qr_factors(a, options, false)
+}
+
+fn qr_factors(a: &[Vec<f64>], options: DecompOptions, full: bool) -> Result<QrResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
@@ -5221,11 +5227,22 @@ pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgErro
 
     let matrix = dmatrix_from_rows(a)?;
     let qr_decomp = matrix.qr();
-    let q_mat = qr_decomp.q();
-    let r_mat = qr_decomp.r();
+    let (q, r) = if full && rows > cols {
+        // The complete Q: the Householder reflectors applied to the m×m identity give Qᵀ.
+        let mut q_transpose = DMatrix::<f64>::identity(rows, rows);
+        qr_decomp.q_tr_mul(&mut q_transpose);
+        let mut r = rows_from_dmatrix(&qr_decomp.r());
+        r.resize(rows, vec![0.0; cols]);
+        (rows_from_dmatrix(&q_transpose.transpose()), r)
+    } else {
+        (
+            rows_from_dmatrix(&qr_decomp.q()),
+            rows_from_dmatrix(&qr_decomp.r()),
+        )
+    };
 
     emit_trace(LinalgTrace {
-        operation: "qr",
+        operation: if full { "qr" } else { "qr_economic" },
         matrix_size: (rows, cols),
         mode: options.mode,
         rcond: None,
@@ -5233,10 +5250,7 @@ pub fn qr(a: &[Vec<f64>], options: DecompOptions) -> Result<QrResult, LinalgErro
         error: None,
     });
 
-    Ok(QrResult {
-        q: rows_from_dmatrix(&q_mat),
-        r: rows_from_dmatrix(&r_mat),
-    })
+    Ok(QrResult { q, r })
 }
 
 /// QR decomposition returning only the upper-trapezoidal factor `R`, skipping the
@@ -5269,7 +5283,10 @@ pub fn qr_r(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Lin
         error: None,
     });
 
-    Ok(rows_from_dmatrix(&r_mat))
+    // SciPy's mode='r' R is m×n, like mode='full' (frankenscipy-kqeao).
+    let mut r = rows_from_dmatrix(&r_mat);
+    r.resize(rows, vec![0.0; cols]);
+    Ok(r)
 }
 
 /// RQ decomposition: factor `A = R·Q` with `R` upper-trapezoidal (m×n) and `Q`
@@ -5551,6 +5568,7 @@ pub fn svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, LinalgEr
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
+    reject_nan_for_svd(a)?;
 
     if rows == 0 || cols == 0 {
         return Ok(SvdResult {
@@ -5881,6 +5899,7 @@ pub fn svdvals(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<f64>, Linal
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
+    reject_nan_for_svd(a)?;
 
     if rows == 0 || cols == 0 {
         return Ok(Vec::new());
@@ -10238,6 +10257,12 @@ pub fn expm_frechet(
     e: &[Vec<f64>],
     options: DecompOptions,
 ) -> Result<(DenseMatrix, DenseMatrix), LinalgError> {
+    // SciPy 1.17.1 raises "array must not contain infs or NaNs" for a non-finite A or E, first
+    // (asarray_chkfinite) and even with check_finite=False (its internal solve re-checks), so
+    // `options.check_finite` cannot switch this off. It used to be ignored and NaN came back
+    // as Ok(NaN).
+    validate_finite_matrix(a, options.mode, true)?;
+    validate_finite_matrix(e, options.mode, true)?;
     let (n, nc) = matrix_shape(a)?;
     if n != nc {
         return Err(LinalgError::ExpectedSquareMatrix);
@@ -10249,7 +10274,6 @@ pub fn expm_frechet(
         });
     }
 
-    let _ = options;
     let a_m = dmatrix_from_rows(a)?;
     let e_m = dmatrix_from_rows(e)?;
     let (expm_a, frechet) = expm_frechet_blocks(&a_m, &e_m);
@@ -11119,7 +11143,7 @@ fn schur_parlett_complex(
     f: impl Fn(Complex<f64>) -> Complex<f64>,
 ) -> DMatrix<f64> {
     // f(A) = Q · Re(W F_tri Wᴴ) · Qᵀ.
-    let ft = schur_parlett_complex_schur_basis(t, n, f, false);
+    let ft = schur_parlett_complex_schur_basis(t, n, f, false).f_schur_basis;
     let mut ft_real = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
         for j in 0..n {
@@ -11143,7 +11167,7 @@ fn schur_parlett_complex_schur_basis(
     n: usize,
     f: impl Fn(Complex<f64>) -> Complex<f64>,
     scipy_confluent: bool,
-) -> DMatrix<Complex<f64>> {
+) -> SchurParlett {
     let zero = Complex::new(0.0, 0.0);
     let mut tc = DMatrix::<Complex<f64>>::from_element(n, n, zero);
     for i in 0..n {
@@ -11188,6 +11212,11 @@ fn schur_parlett_complex_schur_basis(
     for i in 0..n {
         fmat[(i, i)] = f(tt[(i, i)]);
     }
+    let mut min_separation = if n > 0 {
+        tt[(0, 0)].norm()
+    } else {
+        f64::INFINITY
+    };
     for j in 1..n {
         for i in (0..j).rev() {
             let mut sum = tt[(i, j)] * (fmat[(j, j)] - fmat[(i, i)]);
@@ -11195,6 +11224,7 @@ fn schur_parlett_complex_schur_basis(
                 sum += tt[(i, k)] * fmat[(k, j)] - fmat[(i, k)] * tt[(k, j)];
             }
             let denom = tt[(j, j)] - tt[(i, i)];
+            min_separation = min_separation.min(denom.norm());
             fmat[(i, j)] = if scipy_confluent {
                 if denom != zero { sum / denom } else { sum }
             } else if denom.norm() > 1e-300 {
@@ -11204,8 +11234,26 @@ fn schur_parlett_complex_schur_basis(
             };
         }
     }
+    let upper_norm1 = (1..n)
+        .map(|j| (0..j).map(|i| tt[(i, j)].norm()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
 
-    &w * &fmat * w.adjoint()
+    SchurParlett {
+        f_schur_basis: &w * &fmat * w.adjoint(),
+        min_separation,
+        upper_norm1,
+    }
+}
+
+/// [`schur_parlett_complex_schur_basis`]'s result: `f(T)` in the Schur basis, plus the two
+/// inputs of SciPy's `funm` error estimate.
+struct SchurParlett {
+    f_schur_basis: DMatrix<Complex<f64>>,
+    /// Smallest `|T[j,j] - T[i,i]|` the recurrence divided by, seeded with `|T[0,0]|` as
+    /// SciPy's `minden` is.
+    min_separation: f64,
+    /// 1-norm of the strictly upper triangle of the complex triangular factor.
+    upper_norm1: f64,
 }
 
 /// Matrix function `f(A)` of a real square matrix, matching
@@ -11226,19 +11274,53 @@ fn schur_parlett_complex_schur_basis(
 /// br-szq1n.6: this used to take `Fn(f64) -> f64` and evaluate it on the REAL
 /// Schur diagonal, which is wrong (or NaN) whenever `A` has complex eigenvalues:
 /// the 2×2 real-Schur blocks were treated as if `func(t[i,i])` were `f(λ)`.
+///
+/// When SciPy's error estimate (see [`funm_with_error`]) exceeds `1000·eps`, the
+/// warning SciPy prints ("funm result may be inaccurate, approximate err = ...")
+/// is emitted as a trace, so a confluent spectrum does not pass silently.
 pub fn funm(
     a: &[Vec<f64>],
     func: impl Fn(Complex<f64>) -> Complex<f64>,
     options: DecompOptions,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let (f, err) = funm_with_error(a, func, options)?;
+    if err > 1000.0 * f64::EPSILON {
+        emit_trace(LinalgTrace {
+            operation: "funm",
+            matrix_size: (f.len(), f.len()),
+            mode: options.mode,
+            rcond: None,
+            warning: Some(format!(
+                "funm result may be inaccurate, approximate err = {err:e}"
+            )),
+            error: None,
+        });
+    }
+    Ok(f)
+}
+
+/// `scipy.linalg.funm(A, func, disp=False)`: `f(A)` with SciPy's error estimate
+/// `err = min(1, max(eps, eps/minden · ‖triu(T, 1)‖₁))`, where `T` is the complex
+/// Schur factor and `minden` the smallest `|T[j,j] - T[i,i]|` the Parlett
+/// recurrence divided by, seeded with `|T[0,0]|` (0 is replaced by eps), and
+/// `err = inf` when every entry of `f(A)` is non-finite. A repeated eigenvalue
+/// the recurrence cannot resolve gives `err = 1` (frankenscipy-szq1n.6: the value
+/// was wrong and nothing said so). The estimate depends on the Schur form's
+/// eigenvalue order through `|T[0,0]|`, as SciPy's does.
+pub fn funm_with_error(
+    a: &[Vec<f64>],
+    func: impl Fn(Complex<f64>) -> Complex<f64>,
+    options: DecompOptions,
+) -> Result<(Vec<Vec<f64>>, f64), LinalgError> {
     let matrix = validated_square_dmatrix(a, options)?;
     let n = matrix.nrows();
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), f64::EPSILON));
     }
     let schur = bounded_schur(matrix)?;
     let (q, t) = schur.unpack();
-    let ft = schur_parlett_complex_schur_basis(&t, n, func, true);
+    let parlett = schur_parlett_complex_schur_basis(&t, n, func, true);
+    let ft = &parlett.f_schur_basis;
     let mut ft_re = DMatrix::<f64>::zeros(n, n);
     let mut ft_im = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
@@ -11260,7 +11342,21 @@ pub fn funm(
             ),
         });
     }
-    Ok(rows_from_dmatrix(&(&q * ft_re * q.transpose())))
+    let f = &q * ft_re * q.transpose();
+    let eps = f64::EPSILON;
+    let min_separation = if parlett.min_separation == 0.0 {
+        eps
+    } else {
+        parlett.min_separation
+    };
+    let err = if f.iter().all(|v| !v.is_finite()) {
+        f64::INFINITY
+    } else {
+        (eps / min_separation * parlett.upper_norm1)
+            .max(eps)
+            .min(1.0)
+    };
+    Ok((rows_from_dmatrix(&f), err))
 }
 
 /// General logm for non-symmetric matrices. A real spectrum (no 2×2 Schur
@@ -13190,6 +13286,17 @@ fn matrix_shape(a: &[Vec<f64>]) -> Result<(usize, usize), LinalgError> {
         return Err(LinalgError::RaggedMatrix);
     }
     Ok((a.len(), cols))
+}
+
+/// SciPy 1.17.1 `svd` / `svdvals` raise "A has a NaN entry" for any NaN even with
+/// `check_finite=False` (an infinity there is not refused: `svdvals([[inf, 1], [1, 2]],
+/// check_finite=False)` returns `[nan, nan]`). Without this, a single NaN column came back as
+/// `Ok` with s = [0] from the one-column Jacobi path.
+fn reject_nan_for_svd(a: &[Vec<f64>]) -> Result<(), LinalgError> {
+    if a.iter().flatten().any(|v| v.is_nan()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    Ok(())
 }
 
 fn validate_finite_matrix(
@@ -21170,6 +21277,13 @@ pub fn matrix_balance(
     permute: bool,
     scale: bool,
 ) -> Result<MatrixBalance, LinalgError> {
+    // SciPy validates with `check_finite=True` before anything else. Without it, the scaling
+    // loop's column/row maxima `ca`/`ra` (folded with `f64::max`) dropped a NaN that only they
+    // saw and the balance returned Ok with the NaN in it; a NaN inside the active block kept
+    // resetting `conv` and never terminated (LAPACK `dgebal` exits on `DISNAN` for this).
+    if a.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
     let n = a.len();
     if a.iter().any(|r| r.len() != n) {
         return Err(LinalgError::InvalidArgument {
@@ -24615,7 +24729,15 @@ fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
             }
             let ri = b[i] - s;
             r[i] = ri;
-            res = res.max(ri.abs());
+            // numpy's `max(abs(r))`: one NaN entry makes it NaN. `f64::max` dropped it, so a NaN
+            // in `x` (the f32 back substitution forms `inf·0` when an entry of `A` exceeds f32's
+            // range) made every `r_i` NaN, `res` read as 0 and passed the bar below. A NaN `res`
+            // passes neither that bar nor the stall test, so the loop runs out and returns None.
+            res = if res.is_nan() || ri.is_nan() {
+                f64::NAN
+            } else {
+                res.max(ri.abs())
+            };
         }
         let xnorm = x.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         // Backward-stability bar that an f64 LU solve itself satisfies.
@@ -28610,6 +28732,80 @@ mod tests {
         }
     }
 
+    /// A NaN in the mixed-precision `x` must not pass as refined. A = I₁₂₈ with
+    /// A[0][1] = 1e39 (beyond f32's range, so the f32 factor holds +inf there) and
+    /// A[127][2] = 0.5 (so the structure detection says general and `solve` takes this path).
+    /// With b = 1 except b[1] = 0 the f32 back substitution forms `inf·0` = NaN in x[0], every
+    /// residual entry is NaN, and the `f64::max` fold read that residual as 0. With b = 1 it
+    /// forms x[0] = -inf, and the fold kept only r[0] = inf, against a bar that was inf too.
+    ///
+    /// SciPy 1.17.1 `scipy.linalg.solve(A, b)` returns (with LinAlgWarning rcond = 1e-78):
+    /// - b[1] = 0: x[0] = 1.0, x[1] = 0.0, x[2..127] = 1.0, x[127] = 0.5.
+    /// - b = 1: x[0] = -1e39, x[1] = 1.0, x[127] = 0.5.
+    ///
+    /// Must not change: a diagonally dominant general 128×128 system with x = 1, which SciPy
+    /// solves to max |x − 1| = 2.7e-15, still takes the mixed-precision path here.
+    #[test]
+    fn solve_mixed_precision_refuses_a_nan_residual_like_scipy() {
+        let n = 128;
+        let mut a = vec![vec![0.0; n]; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        a[0][1] = 1e39;
+        a[127][2] = 0.5;
+        let mut b = vec![1.0; n];
+        b[1] = 0.0;
+
+        let refined = lu_solve_mixed_precision(&a, &b);
+        assert!(
+            refined
+                .as_ref()
+                .is_none_or(|x| x.iter().all(|v| v.is_finite())),
+            "mixed precision accepted a non-finite x: x[0] = {:?}",
+            refined.as_ref().map(|x| x[0])
+        );
+        let x = solve(&a, &b, SolveOptions::default())
+            .expect("SciPy solves this system")
+            .x;
+        assert_eq!(x[0], 1.0, "x[0]");
+        assert_eq!(x[1], 0.0, "x[1]");
+        assert!(x[2..127].iter().all(|&v| v == 1.0), "x[2..127]: {x:?}");
+        assert_eq!(x[127], 0.5, "x[127]");
+
+        let ones = vec![1.0; n];
+        let x = solve(&a, &ones, SolveOptions::default())
+            .expect("SciPy solves this system")
+            .x;
+        assert_eq!(x[0], -1e39, "x[0]");
+        assert_eq!(x[1], 1.0, "x[1]");
+        assert_eq!(x[127], 0.5, "x[127]");
+
+        // Must not change: an ordinary general system still refines to f64 quality.
+        let m: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        if i == j {
+                            2.0 * n as f64
+                        } else {
+                            (((i * 7 + j * 13) % 11) as f64 - 5.0) / 11.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let bm: Vec<f64> = m.iter().map(|row| row.iter().sum()).collect();
+        assert!(
+            lu_solve_mixed_precision(&m, &bm).is_some(),
+            "the mixed path declined a well-conditioned system"
+        );
+        let x = solve(&m, &bm, SolveOptions::default())
+            .expect("well-conditioned solve")
+            .x;
+        assert!(x.iter().all(|v| (v - 1.0).abs() < 1e-12), "x != 1: {x:?}");
+    }
+
     #[test]
     fn flat_lu_permutation_parity_tracks_row_swaps() {
         let identity = vec![0usize, 1, 2, 3];
@@ -28976,12 +29172,6 @@ mod tests {
             .lock()
             .expect("ledger poison should have been cleared");
         assert_eq!(ledger.len(), 4);
-    }
-
-    fn rotated_diagonal(lambda1: f64, lambda2: f64) -> Vec<Vec<f64>> {
-        let diag = 0.5 * (lambda1 + lambda2);
-        let off_diag = 0.5 * (lambda1 - lambda2);
-        vec![vec![diag, off_diag], vec![off_diag, diag]]
     }
 
     fn reconstruct_qr_result(result: &QrResult) -> Vec<Vec<f64>> {
@@ -31065,6 +31255,380 @@ mod tests {
         );
     }
 
+    /// frankenscipy-7tb8d.14, acceptance item 2: on a corpus of rcond 1e-6..1e-10 matrices
+    /// (Hilbert, Vandermonde, random with prescribed condition number), the forward error of the
+    /// action Strict `solve` chooses is no worse than LU's, against the EXACT solution.
+    ///
+    /// Every system is exact in f64, so no reference solver's error enters the comparison: `A` is
+    /// an integer matrix, `x_true` the integer vector `(-1)^i (1 + 3i mod 7)` (‖x_true‖∞ = 7),
+    /// and `b = A·x_true` is formed in i128 with every entry of `A` and `b` below 2^53
+    /// (asserted), so `x_true` is the exact solution of the f64 system. Forward error is
+    /// ‖x − x_true‖∞ / ‖x_true‖∞; each `x_i − x_true_i` is exact (Sterbenz).
+    /// - Hilbert: `lcm(1..2n−1)·H_n`, n = 5..8 (n = 8 is rcond 2.95e-11, just past the band).
+    /// - Vandermonde: `V[i][j] = t_i^j` on consecutive integer nodes.
+    /// - randsvd: `A = Q1·diag(σ)·Q2ᵀ` scaled to integers, `σ_k = r^(n−1−k)`, so cond₂ = r^(n−1)
+    ///   exactly. `Q = P0·H1·P1·…·Hm·Pm` with random signed permutations `P` and Householder
+    ///   reflectors `H = I − v·vᵀ/2`, `v ∈ {0, ±1}ⁿ` with four nonzeros, so `2^m·Q` is an integer
+    ///   matrix (orthogonality asserted). Non-symmetric (`Q2 ≠ Q1`, the LU route) and SPD
+    ///   (`Q2 = Q1`, the Cholesky route) variants.
+    ///
+    /// Each matrix's weighted sum `Σ a_ij·(i·n + j + 1)` is pinned, so the matrices here are the
+    /// ones SciPy was measured on below.
+    ///
+    /// Arms: Strict `solve` (the CASP action, from its certificate; n ≤ 12 is below every
+    /// fast-path gate, so the portfolio decides) and `solve_with_action(DirectLU)` (nalgebra's
+    /// partial-pivoting LU, the factorization the portfolio's LU action runs at these sizes).
+    /// Non-symmetric input must be answered by that same LU, bit for bit; exactly symmetric input
+    /// by Cholesky, SciPy's `assume_a=None` route (2342adf05).
+    ///
+    /// The assertion is `chosen ≤ max(LU·(1 + SLACK), FLOOR)` per matrix, with `SLACK = 0`: both
+    /// arms are deterministic f64 computations in one process, so there is no noise for a slack
+    /// to absorb, and the ratio is exactly 1 wherever the chosen action is LU. `FLOOR = ε`, one
+    /// ulp of relative error in the largest component; it never binds here. The comparator's
+    /// two arms are checked on every row: LU against itself passes, and LU with its worst
+    /// component's error doubled fails.
+    ///
+    /// fsci's errors below were PREDICTED before this test first ran, by a bit-level Python
+    /// transliteration of `cholesky_lower_simd` + `cho_solve_lower_flat` and nalgebra 0.35's
+    /// `LU::new` + `LU::solve`. On unscaled Hilbert(6)·ones it reproduces the two components of
+    /// fsci's Cholesky answer recorded on frankenscipy-pvghr to every printed digit, and fsci's
+    /// recorded LU error there (6.6e-7). The test prints the measured table. rcond₁ is exact
+    /// (rational inverse):
+    ///
+    /// ```text
+    /// matrix              n  rcond1    chosen    chosen err  LU err    chosen/LU
+    /// hilbert5*2520       5  1.06e-06  Cholesky  2.02e-12    2.47e-12  0.82
+    /// hilbert6*27720      6  3.44e-08  Cholesky  1.01e-10    3.25e-11  3.12
+    /// hilbert7*360360     7  1.02e-09  Cholesky  4.57e-09    6.34e-10  7.21
+    /// hilbert8*360360     8  2.95e-11  Cholesky  5.48e-08    1.00e-08  5.48
+    /// vander[1..=6]       6  7.81e-07  LU        8.74e-12    8.74e-12  1.00
+    /// vander[1..=7]       7  2.42e-08  LU        2.71e-11    2.71e-11  1.00
+    /// vander[0..=7]       8  1.19e-08  LU        1.68e-10    1.68e-10  1.00
+    /// vander[-4..=5]     10  1.12e-07  LU        6.87e-11    6.87e-11  1.00
+    /// vander[1..=8]       8  6.02e-10  LU        8.70e-10    8.70e-10  1.00
+    /// vander[0..=8]       9  3.22e-10  LU        6.40e-12    6.40e-12  1.00
+    /// randsvd_gen_n8_r7   8  5.54e-07  LU        2.00e-11    2.00e-11  1.00
+    /// randsvd_gen_n8_r13  8  8.29e-09  LU        9.20e-10    9.20e-10  1.00
+    /// randsvd_gen_n8_r23  8  2.80e-10  LU        2.18e-10    2.18e-10  1.00
+    /// randsvd_spd_n8_r7   8  8.96e-07  Cholesky  1.07e-11    3.19e-13  33.52
+    /// randsvd_spd_n8_r13  8  8.38e-09  Cholesky  5.97e-10    1.90e-10  3.14
+    /// randsvd_spd_n8_r23  8  1.94e-10  Cholesky  1.01e-09    1.33e-10  7.60
+    /// randsvd_gen_n12_r4 12  1.27e-07  LU        1.16e-11    1.16e-11  1.00
+    /// randsvd_gen_n12_r7 12  1.93e-10  LU        6.06e-09    6.06e-09  1.00
+    /// randsvd_spd_n12_r4 12  1.21e-07  Cholesky  6.03e-11    6.09e-11  0.99
+    /// randsvd_spd_n12_r7 12  2.54e-10  Cholesky  1.58e-08    1.81e-08  0.87
+    /// ```
+    ///
+    /// Predicted verdict: the 11 non-symmetric rows pass (the chosen action IS LU), and 6 of the
+    /// 9 symmetric rows fail, by 3.1x to 33.5x, every one of them inside cond₂·u. Not hidden by
+    /// a slack: whether Cholesky must beat LU per matrix is the owner decision the bead records.
+    ///
+    /// SciPy 1.17.1 / numpy 2.4.3 (`~/.local/bin/python3.13`) on the same matrices: `solve`
+    /// default (on the symmetric rows bit-identical to `assume_a='pos'`, elsewhere to 'gen') and
+    /// `assume_a='gen'`, on the host kernel (threadpoolctl: libscipy_openblas `Haswell`,
+    /// `OPENBLAS_CORETYPE` unset), and the range over `OPENBLAS_CORETYPE` = Katmai, Nehalem,
+    /// Sandybridge, Haswell (Prescott runs Katmai's kernel and Zen Haswell's; SkylakeX cannot run
+    /// on this host, frankenscipy-pvghr). SciPy's own default is worse than its own LU on 5 of
+    /// the 9 symmetric rows on Haswell (Katmai 5, Nehalem 4, Sandybridge 3).
+    ///
+    /// ```text
+    /// matrix              default   gen       default, 4 kernels  gen, 4 kernels
+    /// hilbert5*2520      1.13e-12  4.37e-12  1.13e-12..4.64e-12  4.37e-12..4.37e-12
+    /// hilbert6*27720     1.58e-11  8.22e-11  1.58e-11..5.38e-11  5.99e-11..8.22e-11
+    /// hilbert7*360360    6.67e-09  1.30e-09  1.77e-09..6.67e-09  6.99e-10..1.92e-09
+    /// hilbert8*360360    1.99e-07  9.99e-10  4.43e-08..1.99e-07  9.99e-10..5.63e-08
+    /// vander[1..=6]      8.70e-12  8.70e-12  8.65e-12..8.70e-12  8.65e-12..8.70e-12
+    /// vander[1..=7]      7.99e-11  7.99e-11  7.99e-11..3.42e-10  7.99e-11..3.42e-10
+    /// vander[0..=7]      2.96e-10  2.96e-10  7.45e-11..2.97e-10  7.45e-11..2.97e-10
+    /// vander[-4..=5]     3.76e-11  3.76e-11  3.76e-11..2.30e-10  3.76e-11..2.30e-10
+    /// vander[1..=8]      2.49e-11  2.49e-11  2.49e-11..9.00e-10  2.49e-11..9.00e-10
+    /// vander[0..=8]      1.66e-08  1.66e-08  1.61e-08..1.66e-08  1.61e-08..1.66e-08
+    /// randsvd_gen_n8_r7  1.26e-11  1.26e-11  1.26e-11..1.69e-11  1.26e-11..1.69e-11
+    /// randsvd_gen_n8_r13 1.21e-09  1.21e-09  1.04e-09..1.43e-09  1.04e-09..1.43e-09
+    /// randsvd_gen_n8_r23 1.49e-08  1.49e-08  1.04e-09..1.49e-08  1.04e-09..1.49e-08
+    /// randsvd_spd_n8_r7  2.42e-12  3.26e-12  1.39e-12..4.32e-12  8.75e-13..3.26e-12
+    /// randsvd_spd_n8_r13 3.01e-10  2.48e-10  1.06e-10..3.10e-10  5.94e-11..5.10e-10
+    /// randsvd_spd_n8_r23 1.41e-10  1.16e-10  1.41e-10..2.01e-10  1.16e-10..2.04e-10
+    /// randsvd_gen_n12_r4 4.62e-12  4.62e-12  4.62e-12..5.24e-11  4.62e-12..5.24e-11
+    /// randsvd_gen_n12_r7 2.29e-09  2.29e-09  1.46e-09..1.99e-08  1.46e-09..1.99e-08
+    /// randsvd_spd_n12_r4 6.66e-11  4.00e-11  3.77e-11..8.08e-11  1.87e-11..4.48e-11
+    /// randsvd_spd_n12_r7 4.26e-09  1.79e-08  3.36e-09..1.87e-08  1.02e-08..2.48e-08
+    /// ```
+    #[test]
+    #[ignore = "frankenscipy-7tb8d.14: measured RED on vmi1227854 (2026-09-26): Strict solve's \
+                Cholesky route (SciPy's own dispatch for exactly-symmetric input) has a larger \
+                forward error than fsci's LU on 6/20 rows (3.1x-33.5x); SciPy's default is \
+                also worse than its own LU on 5/9 SPD rows. The acceptance criterion needs an \
+                owner decision; run with --ignored to reproduce the table."]
+    fn casp_forward_error_is_no_worse_than_lu_on_a_conditioning_corpus() {
+        /// Relative slack on LU's error; zero, see the doc comment.
+        const SLACK: f64 = 0.0;
+        /// One ulp of relative error in the largest component: "worse" below it is not resolvable.
+        const FLOOR: f64 = f64::EPSILON;
+        const EXACT_IN_F64: i128 = 1 << 53;
+
+        fn gcd(a: i128, b: i128) -> i128 {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        fn matmul_i(a: &[Vec<i128>], b: &[Vec<i128>]) -> Vec<Vec<i128>> {
+            a.iter()
+                .map(|row| {
+                    (0..b[0].len())
+                        .map(|j| row.iter().zip(b).map(|(&x, b_row)| x * b_row[j]).sum())
+                        .collect()
+                })
+                .collect()
+        }
+        fn signed_permutation(rng: &mut TestRng, n: usize) -> Vec<Vec<i128>> {
+            let mut perm: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let j = rng.int(0, i as i64) as usize;
+                perm.swap(i, j);
+            }
+            let mut p = vec![vec![0_i128; n]; n];
+            for (row, &column) in p.iter_mut().zip(&perm) {
+                row[column] = if rng.int(0, 1) == 0 { 1 } else { -1 };
+            }
+            p
+        }
+        /// `2·H` for `H = I − v·vᵀ/2`, `v ∈ {0, ±1}ⁿ` with four nonzeros (vᵀv = 4).
+        fn reflector_times_two(rng: &mut TestRng, n: usize) -> Vec<Vec<i128>> {
+            let mut support: Vec<usize> = Vec::with_capacity(4);
+            while support.len() < 4 {
+                let k = rng.int(0, n as i64 - 1) as usize;
+                if !support.contains(&k) {
+                    support.push(k);
+                }
+            }
+            let mut v = vec![0_i128; n];
+            for &k in &support {
+                v[k] = if rng.int(0, 1) == 0 { 1 } else { -1 };
+            }
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| 2 * i128::from(i == j) - v[i] * v[j])
+                        .collect()
+                })
+                .collect()
+        }
+        /// `2^reflectors·Q` for `Q = P0·H1·P1·…·Hm·Pm`; its Gram matrix must be `4^reflectors·I`.
+        fn orthogonal_times_scale(rng: &mut TestRng, n: usize, reflectors: u32) -> Vec<Vec<i128>> {
+            let mut q = signed_permutation(rng, n);
+            for _ in 0..reflectors {
+                q = matmul_i(&q, &reflector_times_two(rng, n));
+                q = matmul_i(&q, &signed_permutation(rng, n));
+            }
+            let transpose: Vec<Vec<i128>> = (0..n)
+                .map(|j| q.iter().map(|row| row[j]).collect())
+                .collect();
+            let scale_squared = 1_i128 << (2 * reflectors);
+            for (i, row) in matmul_i(&q, &transpose).iter().enumerate() {
+                for (j, &g) in row.iter().enumerate() {
+                    assert_eq!(g, scale_squared * i128::from(i == j), "Q is not orthogonal");
+                }
+            }
+            q
+        }
+
+        // (name, A, pinned Σ a_ij·(i·n + j + 1)).
+        let mut corpus: Vec<(String, Vec<Vec<i128>>, i128)> = Vec::new();
+        for (n, fingerprint) in [
+            (5, 156_460),
+            (6, 2_949_510),
+            (7, 60_660_978),
+            (8, 90_406_820),
+        ] {
+            let scale = (1..2 * n as i128).fold(1, |l, k| l / gcd(l, k) * k);
+            let a: Vec<Vec<i128>> = (0..n)
+                .map(|i| (0..n).map(|j| scale / (i + j + 1) as i128).collect())
+                .collect();
+            corpus.push((format!("hilbert{n}*{scale}"), a, fingerprint));
+        }
+        for (lo, hi, fingerprint) in [
+            (1_i128, 6_i128, 489_656),
+            (1, 7, 9_896_866),
+            (0, 7, 85_714_468),
+            (-4, 5, 274_840_972),
+            (1, 8, 227_405_620),
+            (0, 8, 2_190_560_805),
+        ] {
+            let n = (hi - lo + 1) as u32;
+            let a: Vec<Vec<i128>> = (lo..=hi)
+                .map(|t| (0..n).map(|j| t.pow(j)).collect())
+                .collect();
+            corpus.push((format!("vander[{lo}..={hi}]"), a, fingerprint));
+        }
+        let mut rng = TestRng(0x7B8D_1400_0000_0001);
+        for (n, ratio, symmetric, fingerprint) in [
+            (8, 7_i128, false, -70_352_311_616),
+            (8, 13, false, 4_390_428_176_640),
+            (8, 23, false, 895_392_297_468_800),
+            (8, 7, true, 19_472_150_528),
+            (8, 13, true, 2_149_590_116_864),
+            (8, 23, true, 783_529_406_021_632),
+            (12, 4, false, -21_782_237_250_560),
+            (12, 7, false, -29_799_663_371_660_288),
+            (12, 4, true, 11_400_619_755_264),
+            (12, 7, true, 6_048_275_088_344_064),
+        ] {
+            let reflectors = if n == 8 { 6 } else { 8 };
+            let q1 = orthogonal_times_scale(&mut rng, n, reflectors);
+            let q2 = if symmetric {
+                q1.clone()
+            } else {
+                orthogonal_times_scale(&mut rng, n, reflectors)
+            };
+            let sigma: Vec<i128> = (0..n).map(|k| ratio.pow((n - 1 - k) as u32)).collect();
+            let a: Vec<Vec<i128>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| (0..n).map(|k| q1[i][k] * sigma[k] * q2[j][k]).sum())
+                        .collect()
+                })
+                .collect();
+            let kind = if symmetric { "spd" } else { "gen" };
+            corpus.push((format!("randsvd_{kind}_n{n}_r{ratio}"), a, fingerprint));
+        }
+
+        let no_worse = |chosen: f64, lu: f64| chosen <= (lu * (1.0 + SLACK)).max(FLOOR);
+        let (mut lowest_rcond, mut highest_rcond) = (f64::INFINITY, 0.0_f64);
+        let mut table = String::new();
+        let mut losses = Vec::new();
+        for (name, ai, fingerprint) in &corpus {
+            let n = ai.len();
+            let weighted: i128 = ai
+                .iter()
+                .enumerate()
+                .flat_map(|(i, row)| {
+                    row.iter()
+                        .enumerate()
+                        .map(move |(j, &v)| v * (i * n + j + 1) as i128)
+                })
+                .sum();
+            assert_eq!(
+                weighted, *fingerprint,
+                "{name}: not the matrix SciPy was run on"
+            );
+            let x_true: Vec<i128> = (0..n)
+                .map(|i| (-1_i128).pow(i as u32) * (1 + (3 * i as i128) % 7))
+                .collect();
+            let bi: Vec<i128> = ai
+                .iter()
+                .map(|row| row.iter().zip(&x_true).map(|(&a, &x)| a * x).sum())
+                .collect();
+            assert!(
+                ai.iter()
+                    .flatten()
+                    .chain(&bi)
+                    .all(|v| v.abs() < EXACT_IN_F64),
+                "{name}: A or b is not exact in f64"
+            );
+            let a: Vec<Vec<f64>> = ai
+                .iter()
+                .map(|row| row.iter().map(|&v| v as f64).collect())
+                .collect();
+            let b: Vec<f64> = bi.iter().map(|&v| v as f64).collect();
+            let symmetric = (0..n).all(|i| (0..n).all(|j| ai[i][j] == ai[j][i]));
+            let x_scale = x_true.iter().map(|v| v.abs()).max().expect("n > 0") as f64;
+            let forward_error = |x: &[f64]| {
+                assert!(x.iter().all(|v| v.is_finite()), "{name}: x = {x:?}");
+                x.iter()
+                    .zip(&x_true)
+                    .map(|(xi, &ti)| (xi - ti as f64).abs())
+                    .fold(0.0_f64, f64::max)
+                    / x_scale
+            };
+
+            let chosen = solve(&a, &b, SolveOptions::default()).expect("Strict solve");
+            let certificate = chosen
+                .certificate
+                .as_ref()
+                .expect("the portfolio path certifies its action");
+            let lu = solve_with_action(&a, &b, SolverAction::DirectLU).expect("LU solve");
+            assert!(!certificate.fallback_active, "{name}: fallback");
+            if symmetric {
+                assert_eq!(
+                    certificate.structural_evidence,
+                    StructuralEvidence::Symmetric,
+                    "{name}"
+                );
+                assert_eq!(
+                    certificate.action,
+                    SolverAction::SymmetricFastPath,
+                    "{name}"
+                );
+            } else {
+                assert_eq!(
+                    certificate.structural_evidence,
+                    StructuralEvidence::General,
+                    "{name}"
+                );
+                assert_eq!(certificate.action, SolverAction::DirectLU, "{name}");
+                let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&chosen.x),
+                    bits(&lu.x),
+                    "{name}: Strict's LU is not the LU arm"
+                );
+            }
+            let rcond = certificate.rcond_estimate;
+            assert!(
+                rcond > 1e-13 && rcond < 1e-4,
+                "{name}: rcond estimate {rcond:e} is outside the corpus band"
+            );
+            lowest_rcond = lowest_rcond.min(rcond);
+            highest_rcond = highest_rcond.max(rcond);
+
+            let (chosen_error, lu_error) = (forward_error(&chosen.x), forward_error(&lu.x));
+            // The comparator's two arms: LU against itself is no worse, and LU with its worst
+            // component's error doubled is worse.
+            assert!(
+                lu_error > 2.0 * FLOOR,
+                "{name}: LU is exact, so the comparison cannot resolve anything"
+            );
+            assert!(no_worse(lu_error, lu_error), "{name}: LU against itself");
+            let worst = (0..n)
+                .max_by(|&i, &j| {
+                    let error = |k: usize| (lu.x[k] - x_true[k] as f64).abs();
+                    error(i).total_cmp(&error(j))
+                })
+                .expect("n > 0");
+            let mut doubled = lu.x.clone();
+            let worst_error = doubled[worst] - x_true[worst] as f64;
+            doubled[worst] += worst_error;
+            assert!(
+                !no_worse(forward_error(&doubled), lu_error),
+                "{name}: the comparator does not see a doubled error"
+            );
+
+            // Derived Debug ignores width, so pad the action's name as a String.
+            let action = format!("{:?}", certificate.action);
+            let line = format!(
+                "{name:<22} n={n:<2} rcond_est={rcond:9.3e} {action:<17} \
+                 chosen={chosen_error:9.3e} lu={lu_error:9.3e} chosen/lu={:.2}",
+                chosen_error / lu_error
+            );
+            eprintln!("{line}");
+            table.push_str(&line);
+            table.push('\n');
+            if !no_worse(chosen_error, lu_error) {
+                losses.push(format!("{name} ({:.2}x)", chosen_error / lu_error));
+            }
+        }
+        assert!(
+            lowest_rcond < 1e-9 && highest_rcond > 1e-7,
+            "the corpus does not span the band: rcond estimates {lowest_rcond:e}..{highest_rcond:e}"
+        );
+        assert!(
+            losses.is_empty(),
+            "the chosen action's forward error is worse than LU's on {} of {}: {}\n{table}",
+            losses.len(),
+            corpus.len(),
+            losses.join(", ")
+        );
+    }
+
     /// frankenscipy-7tb8d.6: a certificate is checkable from `(A, b, x)` alone, and the check
     /// rejects an answer the certificate does not describe.
     #[test]
@@ -32987,6 +33551,114 @@ mod tests {
     }
 
     // ── QR decomposition tests ──────────────────────────────────────
+
+    /// frankenscipy-kqeao: `qr` is scipy.linalg.qr's default mode='full' (Q m×m, R m×n); for a
+    /// tall A it returned the economic factors (Q 4×3), which are now `qr_economic`. scipy
+    /// 1.17.1, live, on a = [[2, −1, 0], [1, 3, 1], [0, 1, 4], [1, 0, 1]]: Q 4×4 and R 4×3
+    /// below, mode='economic' Q 4×3 / R 3×3, and mode='r' R 4×3. Q's columns and R's rows are
+    /// compared up to the Householder sign of each column (for m − k = 1 the fourth column is
+    /// unique up to sign too).
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn qr_default_mode_is_scipys_full_mode() {
+        let a = vec![
+            vec![2.0, -1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 4.0],
+            vec![1.0, 0.0, 1.0],
+        ];
+        let scipy_q: [[f64; 4]; 4] = [
+            [
+                -0.816_496_580_927_726,
+                0.405_095_746_833_466_7,
+                -0.042_295_493_443_781_36,
+                -0.409_196_603_682_284_1,
+            ],
+            [
+                -0.408_248_290_463_863,
+                -0.860_828_462_021_116_8,
+                0.296_068_454_106_469_5,
+                -0.068_199_433_947_047_36,
+            ],
+            [
+                0.0,
+                -0.303_821_810_125_1,
+                -0.930_500_855_763_189_7,
+                -0.204_598_301_841_142_03,
+            ],
+            [
+                -0.408_248_290_463_863,
+                0.050_636_968_354_183_34,
+                -0.211_477_467_218_906_76,
+                0.886_592_641_311_615_5,
+            ],
+        ];
+        let scipy_r: [[f64; 3]; 4] = [
+            [
+                -2.449_489_742_783_178,
+                -0.408_248_290_463_863,
+                -0.816_496_580_927_726,
+            ],
+            [0.0, -3.291_402_943_021_916_3, -2.025_478_734_167_333_7],
+            [0.0, 0.0, -3.637_412_436_165_197],
+            [0.0, 0.0, 0.0],
+        ];
+        let full = qr(&a, DecompOptions::default()).expect("qr");
+        assert_eq!((full.q.len(), full.q[0].len()), (4, 4), "Q is m x m");
+        assert_eq!((full.r.len(), full.r[0].len()), (4, 3), "R is m x n");
+        assert_eq!(full.r[3], vec![0.0; 3], "R's row below min(m, n) is zero");
+        for j in 0..4 {
+            // The column's sign from its largest SciPy entry.
+            let pivot = (0..4)
+                .max_by(|&x, &y| scipy_q[x][j].abs().total_cmp(&scipy_q[y][j].abs()))
+                .unwrap_or(0);
+            let sign = (full.q[pivot][j] * scipy_q[pivot][j]).signum();
+            for i in 0..4 {
+                assert!(
+                    (sign * full.q[i][j] - scipy_q[i][j]).abs() <= 1e-14,
+                    "Q[{i}][{j}] = {} vs scipy {}",
+                    full.q[i][j],
+                    scipy_q[i][j]
+                );
+            }
+            if j < 3 {
+                for k in 0..3 {
+                    assert!(
+                        (sign * full.r[j][k] - scipy_r[j][k]).abs() <= 1e-13,
+                        "R[{j}][{k}] = {} vs scipy {}",
+                        full.r[j][k],
+                        scipy_r[j][k]
+                    );
+                }
+            }
+        }
+        // Q is orthogonal and Q·R reproduces A.
+        for i in 0..4 {
+            for j in 0..4 {
+                let dot: f64 = (0..4).map(|k| full.q[k][i] * full.q[k][j]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - want).abs() <= 1e-14, "QᵀQ[{i}][{j}] = {dot}");
+            }
+            for j in 0..3 {
+                let qr_val: f64 = (0..4).map(|k| full.q[i][k] * full.r[k][j]).sum();
+                assert!(
+                    (qr_val - a[i][j]).abs() <= 1e-14,
+                    "(QR)[{i}][{j}] = {qr_val}"
+                );
+            }
+        }
+        let economic = qr_economic(&a, DecompOptions::default()).expect("economic qr");
+        assert_eq!((economic.q.len(), economic.q[0].len()), (4, 3));
+        assert_eq!((economic.r.len(), economic.r[0].len()), (3, 3));
+        let r_only = qr_r(&a, DecompOptions::default()).expect("qr_r");
+        assert_eq!(r_only, full.r, "mode='r' is the full R");
+        // Square and wide inputs: both modes coincide.
+        let wide = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 7.0]];
+        assert_eq!(
+            qr(&wide, DecompOptions::default()).expect("wide"),
+            qr_economic(&wide, DecompOptions::default()).expect("wide economic")
+        );
+    }
 
     #[test]
     #[allow(clippy::needless_range_loop)]
@@ -39686,6 +40358,50 @@ mod tests {
         assert!(matches!(err, LinalgError::ExpectedSquareMatrix));
     }
 
+    /// With `check_finite = false` a NaN reaches the block swap. For A = [[1, nan], [0, -1]],
+    /// B = I, `qz` returns the pencil unchanged, as SciPy's does, and sorting 'lhp' swaps its
+    /// two 1×1 blocks. That swap turns both blocks into NaN; its residual was folded with
+    /// `f64::max`, which dropped the NaN, so the swap was accepted and `ordqz` returned Ok.
+    ///
+    /// SciPy 1.17.1 `ordqz(A, B, sort='lhp', check_finite=False)` raises `ValueError:
+    /// Reordering of (A, B) failed because the transformed matrix pair (A, B) would be too far
+    /// from generalized Schur form` (dtgsen INFO = 1); with `check_finite=True` it raises
+    /// `ValueError: array must not contain infs or NaNs`. Must not change: the finite pencil
+    /// [[1, 2], [0, -1]], I sorts to AA = [[-1, 2], [0, 1]], BB = I (ratios [-1, 1]).
+    #[test]
+    fn ordqz_refuses_a_nan_block_swap_like_scipy() {
+        let b = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let unchecked = DecompOptions {
+            mode: RuntimeMode::Strict,
+            check_finite: false,
+        };
+        let a_nan = vec![vec![1.0, f64::NAN], vec![0.0, -1.0]];
+        let err = ordqz(&a_nan, &b, OrdQzSort::LeftHalfPlane, unchecked)
+            .expect_err("SciPy's dtgsen refuses this swap");
+        assert!(
+            matches!(err, LinalgError::ConvergenceFailure { .. }),
+            "{err:?}"
+        );
+        let err = ordqz(
+            &a_nan,
+            &b,
+            OrdQzSort::LeftHalfPlane,
+            DecompOptions::default(),
+        )
+        .expect_err("check_finite rejects NaN");
+        assert_eq!(err, LinalgError::NonFiniteInput);
+
+        let a = vec![vec![1.0, 2.0], vec![0.0, -1.0]];
+        let sorted =
+            ordqz(&a, &b, OrdQzSort::LeftHalfPlane, unchecked).expect("a finite pencil sorts");
+        assert_qz_form(&a, &b, &sorted);
+        let ratios: Vec<f64> = (0..2).map(|i| sorted.aa[i][i] / sorted.bb[i][i]).collect();
+        assert!(
+            (ratios[0] + 1.0).abs() < 1e-14 && (ratios[1] - 1.0).abs() < 1e-14,
+            "{ratios:?}"
+        );
+    }
+
     // ── Matrix exponential tests ──────────────────────────────────────
 
     #[test]
@@ -40290,6 +41006,42 @@ mod tests {
         assert!(res.transform.is_empty());
         assert!(res.scaling.is_empty());
         assert!(res.perm.is_empty());
+    }
+
+    /// SciPy 1.17.1's `matrix_balance` validates with `check_finite=True` first:
+    /// [[1, nan, 0], [0, 2, 3], [0, 4, 5]] and [[1, inf], [1, 1]] both raise
+    /// `ValueError: array must not contain infs or NaNs`. In the first, the permutation isolates
+    /// column 0, so the NaN sits outside the active block where only the column maximum `ca`
+    /// sees it; `f64::max` dropped it and the balance returned Ok with the NaN in it. Must not
+    /// change: with 7 in place of the NaN, SciPy returns B = A and T = I.
+    #[test]
+    fn matrix_balance_rejects_non_finite_input_like_scipy() {
+        let nan = vec![
+            vec![1.0, f64::NAN, 0.0],
+            vec![0.0, 2.0, 3.0],
+            vec![0.0, 4.0, 5.0],
+        ];
+        assert_eq!(
+            matrix_balance(&nan, true, true).map(|res| res.balanced),
+            Err(LinalgError::NonFiniteInput)
+        );
+        let inf = vec![vec![1.0, f64::INFINITY], vec![1.0, 1.0]];
+        assert_eq!(
+            matrix_balance(&inf, true, true).map(|res| res.balanced),
+            Err(LinalgError::NonFiniteInput)
+        );
+
+        let finite = vec![
+            vec![1.0, 7.0, 0.0],
+            vec![0.0, 2.0, 3.0],
+            vec![0.0, 4.0, 5.0],
+        ];
+        let res = matrix_balance(&finite, true, true).expect("SciPy balances a finite matrix");
+        assert_eq!(res.balanced, finite);
+        let identity: Vec<Vec<f64>> = (0..3)
+            .map(|i| (0..3).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        assert_eq!(res.transform, identity);
     }
 
     #[test]
@@ -43619,6 +44371,48 @@ mod proptest_tests {
             matches!(err, LinalgError::InvalidArgument { .. }),
             "{err:?}"
         );
+    }
+
+    /// frankenscipy-szq1n.6: the confluent value above is wrong, and SciPy says so with
+    /// `funm(A, func, disp=False)`'s error estimate. Every expected err is live SciPy 1.17.1
+    /// (these inputs are triangular or normal, so both Schur forms keep SciPy's T).
+    #[test]
+    fn funm_error_estimate_flags_what_the_recurrence_cannot_resolve() {
+        let estimate = |a: &[Vec<f64>]| {
+            funm_with_error(a, |z| z.exp(), DecompOptions::default())
+                .expect("funm_with_error")
+                .1
+        };
+        let eps = f64::EPSILON;
+        // Repeated eigenvalues: err = 1 (min(1, ...) with minden = 0 -> eps).
+        assert_eq!(estimate(&[vec![1.0, 1.0], vec![0.0, 1.0]]), 1.0);
+        assert_eq!(
+            estimate(&[
+                vec![2.0, 1.0, 0.0],
+                vec![0.0, 2.0, 1.0],
+                vec![0.0, 0.0, 2.0],
+            ]),
+            1.0
+        );
+        // Nearly repeated: eps / 1e-9 * ||triu(T,1)||_1. SciPy 2.2204458655297983e-07.
+        let near = estimate(&[vec![1.0, 1.0], vec![0.0, 1.0 + 1e-9]]);
+        assert!((near - 2.2204458655297983e-07).abs() <= 1e-15, "{near:e}");
+        // Well separated: SciPy 4.440892098500626e-16 (eps / 1 * 2) and eps.
+        assert_eq!(estimate(&[vec![1.0, 2.0], vec![0.0, 3.0]]), 2.0 * eps);
+        assert_eq!(estimate(&[vec![0.0, -1.0], vec![1.0, 0.0]]), eps);
+        // SciPy's seed quirk, kept: |T[0,0]| = 0 counts as a zero separation.
+        assert_eq!(estimate(&[vec![0.0, 1.0], vec![0.0, 2.0]]), 1.0);
+        // The value itself is unchanged by the estimate.
+        let (f, _) = funm_with_error(
+            &[vec![0.0, -1.0], vec![1.0, 0.0]],
+            |z| z.exp(),
+            DecompOptions::default(),
+        )
+        .expect("rotation");
+        let (c, s) = (1.0_f64.cos(), 1.0_f64.sin());
+        for (got, want) in f.iter().flatten().zip([c, -s, s, c]) {
+            assert!((got - want).abs() <= 1e-14, "{got} vs {want}");
+        }
     }
 
     #[test]
@@ -47302,6 +48096,65 @@ mod proptest_tests {
         let x1 = solve_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         let x2 = solve_continuous_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn svd_rejects_nan_even_without_check_finite_like_scipy() {
+        // SciPy 1.17.1: svd / svdvals of [[nan], [1]] and [[nan, 1], [1, 2]] raise "A has a NaN
+        // entry" with check_finite=False (and "array must not contain infs or NaNs" with True).
+        // svdvals([[1, 2], [3, 4]]) = [5.464985704219043, 0.3659661906262578].
+        let unchecked = DecompOptions {
+            check_finite: false,
+            ..DecompOptions::default()
+        };
+        for a in [
+            vec![vec![f64::NAN], vec![1.0]],
+            vec![vec![f64::NAN, 1.0], vec![1.0, 2.0]],
+        ] {
+            assert!(
+                matches!(svd(&a, unchecked), Err(LinalgError::NonFiniteInput)),
+                "svd {a:?}"
+            );
+            assert!(
+                matches!(svdvals(&a, unchecked), Err(LinalgError::NonFiniteInput)),
+                "svdvals {a:?}"
+            );
+        }
+        let s = svdvals(&[vec![1.0, 2.0], vec![3.0, 4.0]], unchecked).expect("finite");
+        assert!((s[0] - 5.464985704219043).abs() < 1e-12, "{s:?}");
+        assert!((s[1] - 0.3659661906262578).abs() < 1e-12, "{s:?}");
+    }
+
+    #[test]
+    fn expm_frechet_rejects_non_finite_input_like_scipy() {
+        // SciPy 1.17.1: expm_frechet([[1, nan], [0, 2]], I) raises "array must not contain infs
+        // or NaNs", with check_finite=False too, and so does a NaN in E. [[1, 2], [0, 3]] with
+        // E = I gives expm = [[2.71828183, 17.36725509], [0, 20.08553692]].
+        let nan_a = vec![vec![1.0, f64::NAN], vec![0.0, 2.0]];
+        let eye = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let nan_e = vec![vec![f64::NAN, 0.0], vec![0.0, 0.0]];
+        for check_finite in [true, false] {
+            let options = DecompOptions {
+                check_finite,
+                ..DecompOptions::default()
+            };
+            for (a, e) in [(&nan_a, &eye), (&eye, &nan_e)] {
+                assert!(
+                    matches!(
+                        expm_frechet(a, e, options),
+                        Err(LinalgError::NonFiniteInput)
+                    ),
+                    "check_finite={check_finite}: scipy raises"
+                );
+            }
+        }
+        let (expm, _) = expm_frechet(
+            &[vec![1.0, 2.0], vec![0.0, 3.0]],
+            &eye,
+            DecompOptions::default(),
+        )
+        .expect("finite input");
+        assert!((expm[0][1] - 17.36725509).abs() < 1e-7, "{expm:?}");
     }
 
     #[test]

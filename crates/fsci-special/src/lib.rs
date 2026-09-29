@@ -21,11 +21,15 @@ pub mod airy;
 pub mod audit;
 pub mod bessel;
 pub mod beta;
+// TOMS 708 `bratio`, the incomplete beta kernel behind `beta` (frankenscipy-5pnba). Private and
+// std-only: a self-contained port with its own cdflib helpers, checked bit-for-bit against the C.
+mod bratio;
 pub mod convenience;
 pub mod elliptic;
 pub mod error;
 pub mod gamma;
 pub mod hyper;
+mod igam_temme;
 pub mod orthopoly;
 pub mod types;
 
@@ -55,9 +59,9 @@ pub use beta::{
     betainccinv_scalar, betaln, betaln_scalar, btdtr, btdtrc, btdtri, btdtria, btdtrib, fdtr,
     fdtrc, fdtri, fdtridfd, log_betainc_scalar, nbdtr, nbdtrc, nbdtri, nbdtrik, nbdtrik_many,
     nbdtrin, ncfdtr, ncfdtrc, ncfdtri, ncfdtri_many, ncfdtridfd, ncfdtridfd_many, ncfdtridfn,
-    ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many, nctdtr, nctdtr_many, nctdtridf, nctdtridf_many,
-    nctdtrinc, nctdtrinc_many, nctdtrit, nctdtrit_many, stdtr, stdtrc, stdtridf, stdtrit,
-    stdtrit_many,
+    ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many, nctdtr, nctdtr_many, nctdtrc, nctdtridf,
+    nctdtridf_many, nctdtrinc, nctdtrinc_many, nctdtrit, nctdtrit_many, stdtr, stdtrc, stdtridf,
+    stdtrit, stdtrit_many,
 };
 pub use convenience::{
     CONVENIENCE_DISPATCH_PLAN,
@@ -209,6 +213,7 @@ pub use convenience::{
     kerp_zeros,
     kl_div,
     kolmogi,
+    kolmogi_pair,
     kolmogorov,
     lambertw_scalar,
     ldexp,
@@ -390,21 +395,62 @@ pub use types::{
 /// SciPy-compatible type alias for [`SpecialError`], matching `scipy.special.SpecialFunctionError`.
 pub type SpecialFunctionError = SpecialError;
 
-/// Warning emitted when special function evaluations encounter numerical degradation, matching `scipy.special.SpecialFunctionWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpecialFunctionWarning(pub String);
+// SciPy's `SpecialFunctionWarning` is `WarningCategory::SpecialFunctionWarning`, raised under
+// `errstate` mode "warn"; `catch_warnings` records it.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
-/// Special function error handling mode, matching `scipy.special.seterr` modes.
+use fsci_runtime::RuntimeMode;
+
+/// SciPy's special-function error classes: the `sf_error` codes, which are the keys of
+/// `scipy.special.geterr()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpecialErrorCode {
+    Singular,
+    Underflow,
+    Overflow,
+    Slow,
+    Loss,
+    NoResult,
+    Domain,
+    Arg,
+    Other,
+    Memory,
+}
+
+impl SpecialErrorCode {
+    /// SciPy's message for the code, as in `"scipy.special/Gamma: singularity"`.
+    #[must_use]
+    pub const fn scipy_message(self) -> &'static str {
+        match self {
+            Self::Singular => "singularity",
+            Self::Underflow => "underflow",
+            Self::Overflow => "overflow",
+            Self::Slow => "too slow convergence",
+            Self::Loss => "loss of precision",
+            Self::NoResult => "no result obtained",
+            Self::Domain => "domain error",
+            Self::Arg => "invalid input argument",
+            Self::Other => "other error",
+            Self::Memory => "memory allocation failed",
+        }
+    }
+}
+
+/// What to do on a special-function error, matching `scipy.special.seterr` modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpecialErrMode {
+    /// Return SciPy's value (NaN or ±inf) silently.
     #[default]
     Ignore,
+    /// Return the value and raise `SpecialFunctionWarning`, once per failing element.
     Warn,
+    /// Return `Err` with [`SpecialErrorKind::Errstate`].
     Raise,
 }
 
-/// Special function error settings, matching `scipy.special.geterr` / `seterr`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Special-function error settings, matching `scipy.special.geterr` / `seterr`. The default
+/// is SciPy's: every class ignored except `memory`, which raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpecialErrConfig {
     pub singular: SpecialErrMode,
     pub underflow: SpecialErrMode,
@@ -415,20 +461,92 @@ pub struct SpecialErrConfig {
     pub domain: SpecialErrMode,
     pub arg: SpecialErrMode,
     pub other: SpecialErrMode,
+    pub memory: SpecialErrMode,
 }
 
-/// Get current special function error handling settings, matching `scipy.special.geterr`.
+impl SpecialErrConfig {
+    /// SciPy's initial state.
+    pub const SCIPY_DEFAULT: Self = Self {
+        memory: SpecialErrMode::Raise,
+        ..Self::all(SpecialErrMode::Ignore)
+    };
+
+    /// Every class set to `mode`, as `errstate(all=mode)`.
+    #[must_use]
+    pub const fn all(mode: SpecialErrMode) -> Self {
+        Self {
+            singular: mode,
+            underflow: mode,
+            overflow: mode,
+            slow: mode,
+            loss: mode,
+            no_result: mode,
+            domain: mode,
+            arg: mode,
+            other: mode,
+            memory: mode,
+        }
+    }
+
+    /// The mode for one class.
+    #[must_use]
+    pub const fn mode(&self, code: SpecialErrorCode) -> SpecialErrMode {
+        match code {
+            SpecialErrorCode::Singular => self.singular,
+            SpecialErrorCode::Underflow => self.underflow,
+            SpecialErrorCode::Overflow => self.overflow,
+            SpecialErrorCode::Slow => self.slow,
+            SpecialErrorCode::Loss => self.loss,
+            SpecialErrorCode::NoResult => self.no_result,
+            SpecialErrorCode::Domain => self.domain,
+            SpecialErrorCode::Arg => self.arg,
+            SpecialErrorCode::Other => self.other,
+            SpecialErrorCode::Memory => self.memory,
+        }
+    }
+
+    /// Whether the classes the kernels report (all but `memory`) are all ignored, the state in
+    /// which reporting costs nothing beyond reading it.
+    fn reports_nothing(&self) -> bool {
+        let ignore = |m: SpecialErrMode| matches!(m, SpecialErrMode::Ignore);
+        ignore(self.singular)
+            && ignore(self.underflow)
+            && ignore(self.overflow)
+            && ignore(self.slow)
+            && ignore(self.loss)
+            && ignore(self.no_result)
+            && ignore(self.domain)
+            && ignore(self.arg)
+            && ignore(self.other)
+    }
+}
+
+impl Default for SpecialErrConfig {
+    fn default() -> Self {
+        Self::SCIPY_DEFAULT
+    }
+}
+
+thread_local! {
+    /// Per thread, like SciPy's (a `seterr` in one thread is not seen by another).
+    static SPECIAL_ERR_STATE: std::cell::Cell<SpecialErrConfig> =
+        const { std::cell::Cell::new(SpecialErrConfig::SCIPY_DEFAULT) };
+}
+
+/// The calling thread's error settings, matching `scipy.special.geterr`.
 #[must_use]
 pub fn geterr() -> SpecialErrConfig {
-    SpecialErrConfig::default()
+    SPECIAL_ERR_STATE.with(std::cell::Cell::get)
 }
 
-/// Set special function error handling settings, matching `scipy.special.seterr`.
-pub fn seterr(_config: &SpecialErrConfig) -> SpecialErrConfig {
-    SpecialErrConfig::default()
+/// Replace the calling thread's error settings and return the previous ones, matching
+/// `scipy.special.seterr`.
+pub fn seterr(config: &SpecialErrConfig) -> SpecialErrConfig {
+    SPECIAL_ERR_STATE.with(|state| state.replace(*config))
 }
 
-/// Scoped error handling state guard, matching `scipy.special.errstate`.
+/// Scoped error settings, matching `scipy.special.errstate`: the previous settings come back
+/// when the guard drops, including on unwind.
 #[derive(Debug)]
 pub struct Errstate {
     old: SpecialErrConfig,
@@ -454,6 +572,121 @@ pub fn errstate(config: &SpecialErrConfig) -> Errstate {
     Errstate::new(config)
 }
 
+/// Act on SciPy's `sf_error(scipy_name, code)` for one failing element under the current
+/// settings.
+fn sf_error(
+    config: &SpecialErrConfig,
+    scipy_name: &'static str,
+    code: SpecialErrorCode,
+    mode: RuntimeMode,
+) -> Result<(), SpecialError> {
+    match config.mode(code) {
+        SpecialErrMode::Ignore => Ok(()),
+        SpecialErrMode::Warn => {
+            fsci_runtime::warn(
+                WarningCategory::SpecialFunctionWarning,
+                format!("scipy.special/{scipy_name}: {}", code.scipy_message()),
+            );
+            Ok(())
+        }
+        SpecialErrMode::Raise => Err(SpecialError {
+            function: scipy_name,
+            kind: SpecialErrorKind::Errstate(code),
+            mode,
+            detail: code.scipy_message(),
+        }),
+    }
+}
+
+/// Apply `errstate` to a real one-argument call: `condition` is SciPy's explicit `sf_error`
+/// test for the function, evaluated per element only when some class is not ignored, so the
+/// default state costs one thread-local read per call. Complex inputs are not checked.
+///
+/// Only the conditions SciPy's kernels report by calling `sf_error` are reproduced. SciPy
+/// also reports floating-point exception flags raised inside its C kernels (a NaN input
+/// raising "domain error", a subnormal one "underflow", an intermediate overflow
+/// "overflow"); those depend on the C code's arithmetic and are not reproduced.
+pub(crate) fn sf_error_unary(
+    scipy_name: &'static str,
+    x: &SpecialTensor,
+    mode: RuntimeMode,
+    condition: fn(f64) -> Option<SpecialErrorCode>,
+) -> Result<(), SpecialError> {
+    let config = geterr();
+    if config.reports_nothing() {
+        return Ok(());
+    }
+    let values: &[f64] = match x {
+        SpecialTensor::RealScalar(v) => std::slice::from_ref(v),
+        SpecialTensor::RealVec(v) => v,
+        _ => return Ok(()),
+    };
+    for &v in values {
+        if let Some(code) = condition(v) {
+            sf_error(&config, scipy_name, code, mode)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`sf_error_unary`] for a real two-argument call, broadcasting a scalar against a vector.
+pub(crate) fn sf_error_binary(
+    scipy_name: &'static str,
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    mode: RuntimeMode,
+    condition: fn(f64, f64) -> Option<SpecialErrorCode>,
+) -> Result<(), SpecialError> {
+    let config = geterr();
+    if config.reports_nothing() {
+        return Ok(());
+    }
+    let as_slice = |t: &SpecialTensor| -> Option<Vec<f64>> {
+        match t {
+            SpecialTensor::RealScalar(v) => Some(vec![*v]),
+            SpecialTensor::RealVec(v) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let (Some(a), Some(b)) = (as_slice(a), as_slice(b)) else {
+        return Ok(());
+    };
+    let n = a.len().max(b.len());
+    if (a.len() != n && a.len() != 1) || (b.len() != n && b.len() != 1) {
+        return Ok(());
+    }
+    for i in 0..n {
+        let ai = a[if a.len() == 1 { 0 } else { i }];
+        let bi = b[if b.len() == 1 { 0 } else { i }];
+        if let Some(code) = condition(ai, bi) {
+            sf_error(&config, scipy_name, code, mode)?;
+        }
+    }
+    Ok(())
+}
+
+/// SciPy's pole test for `Gamma`: a finite negative integer.
+pub(crate) fn sf_negative_integer_pole(x: f64) -> Option<SpecialErrorCode> {
+    (x.is_finite() && x < 0.0 && x == x.floor()).then_some(SpecialErrorCode::Singular)
+}
+
+/// SciPy's pole test for `lgam` and `psi`: a finite non-positive integer, zero included.
+pub(crate) fn sf_nonpositive_integer_pole(x: f64) -> Option<SpecialErrorCode> {
+    (x.is_finite() && x <= 0.0 && x == x.floor()).then_some(SpecialErrorCode::Singular)
+}
+
+/// SciPy's test for `y0`, `y1`, `k0` and `k1`: negative is a domain error, zero a
+/// singularity.
+pub(crate) fn sf_negative_domain_zero_pole(x: f64) -> Option<SpecialErrorCode> {
+    if x < 0.0 {
+        Some(SpecialErrorCode::Domain)
+    } else if x == 0.0 {
+        Some(SpecialErrorCode::Singular)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
@@ -461,6 +694,91 @@ mod tests {
     use fsci_runtime::RuntimeMode;
 
     use super::*;
+
+    #[test]
+    fn seterr_round_trips_and_errstate_restores_on_drop_and_unwind() {
+        // The error state is per thread, so this test owns it outright.
+        assert_eq!(geterr(), SpecialErrConfig::SCIPY_DEFAULT);
+        assert_eq!(geterr().memory, SpecialErrMode::Raise);
+        let raise_singular = SpecialErrConfig {
+            singular: SpecialErrMode::Raise,
+            ..SpecialErrConfig::default()
+        };
+        // seterr returns the previous settings and geterr reads the new ones back; both
+        // used to ignore their argument and return the default.
+        assert_eq!(seterr(&raise_singular), SpecialErrConfig::SCIPY_DEFAULT);
+        assert_eq!(geterr(), raise_singular);
+        assert_eq!(seterr(&SpecialErrConfig::default()), raise_singular);
+        {
+            let _outer = errstate(&SpecialErrConfig::all(SpecialErrMode::Warn));
+            {
+                let _inner = errstate(&raise_singular);
+                assert_eq!(geterr(), raise_singular);
+            }
+            assert_eq!(geterr(), SpecialErrConfig::all(SpecialErrMode::Warn));
+        }
+        assert_eq!(geterr(), SpecialErrConfig::SCIPY_DEFAULT);
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = errstate(&raise_singular);
+            std::panic::resume_unwind(Box::new("inside errstate"));
+        });
+        assert!(unwound.is_err());
+        assert_eq!(geterr(), SpecialErrConfig::SCIPY_DEFAULT);
+        // Another thread starts from SciPy's default, whatever this one set.
+        let _guard = errstate(&raise_singular);
+        let there = std::thread::spawn(geterr).join().expect("thread");
+        assert_eq!(there, SpecialErrConfig::SCIPY_DEFAULT);
+    }
+
+    #[test]
+    fn errstate_modes_act_like_scipys_at_a_pole() {
+        let pole = SpecialTensor::RealScalar(-1.0);
+        let is_nan = |r: SpecialResult| matches!(r, Ok(SpecialTensor::RealScalar(v)) if v.is_nan());
+        // Ignore (the default): SciPy's value, gamma(-1) = nan, and nothing else.
+        let (r, warnings) = catch_warnings(|| gamma(&pole, RuntimeMode::Strict));
+        assert!(is_nan(r));
+        assert!(warnings.is_empty());
+        // Raise: SciPy raises SpecialFunctionError("scipy.special/Gamma: singularity").
+        {
+            let _guard = errstate(&SpecialErrConfig {
+                singular: SpecialErrMode::Raise,
+                ..SpecialErrConfig::default()
+            });
+            let err = gamma(&pole, RuntimeMode::Strict).expect_err("singular=raise");
+            assert_eq!(
+                err.kind,
+                SpecialErrorKind::Errstate(SpecialErrorCode::Singular)
+            );
+            assert_eq!(err.function, "Gamma");
+            assert_eq!(err.detail, "singularity");
+            // Only the class that was set raises: a domain error is still ignored.
+            assert!(ndtri(&SpecialTensor::RealScalar(1.5), RuntimeMode::Strict).is_ok());
+            // An ordinary argument is untouched.
+            assert!(gamma(&SpecialTensor::RealScalar(2.5), RuntimeMode::Strict).is_ok());
+        }
+        // Warn: the value, plus one SpecialFunctionWarning per failing element, as SciPy's
+        // gamma([-1, -2, 3, -3]) warns three times.
+        let _guard = errstate(&SpecialErrConfig::all(SpecialErrMode::Warn));
+        let (r, warnings) = catch_warnings(|| {
+            gamma(
+                &SpecialTensor::RealVec(vec![-1.0, -2.0, 3.0, -3.0]),
+                RuntimeMode::Strict,
+            )
+        });
+        assert!(
+            matches!(r, Ok(SpecialTensor::RealVec(_))),
+            "warn mode must return the values: {r:?}"
+        );
+        let Ok(SpecialTensor::RealVec(values)) = r else {
+            unreachable!("checked by the assert above")
+        };
+        assert_eq!(values[2], 2.0);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().all(|w| {
+            w.category == WarningCategory::SpecialFunctionWarning
+                && w.message == "scipy.special/Gamma: singularity"
+        }));
+    }
 
     #[test]
     fn scalar_kernels_follow_primary_contract_points() {
@@ -3021,6 +3339,31 @@ mod tests {
         assert!(hurwitz_zeta(1.0, 1.0).is_infinite());
     }
 
+    #[test]
+    fn hurwitz_zeta_is_scipy_cephes_zeta_bit_for_bit() {
+        // scipy.special.zeta(s, a) 1.17.1: the direct sum plus Euler-Maclaurin, a negative
+        // a (integer s), and the a > 1e8 asymptotic.
+        let cases = [
+            (1.1, 1.0, 10.584448464950801),
+            (1.5, 2.0, 1.6123753486854886),
+            (30.0, 2.5, 1.152969168563024e-12),
+            (2.0, -0.5, 8.934802200544679),
+            (4.0, -2.5, 32.457979369864596),
+            (3.0, 1e9, 5.0000000050000005e-19),
+        ];
+        for (s, a, expected) in cases {
+            let got = hurwitz_zeta(s, a);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(expected),
+                "zeta({s}, {a}) = {got:e}, SciPy {expected:e}"
+            );
+        }
+        // s < 1 is outside the domain: NaN, not the +inf this used to return.
+        assert!(hurwitz_zeta(0.5, 1.0).is_nan());
+        assert!(hurwitz_zeta(0.5, 2.5).is_nan());
+    }
+
     // ── sici tests ───────────────────────────────────────────────────
 
     #[test]
@@ -3327,6 +3670,79 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-10,
                 "ndtri({p}) got {got}, expected {want} at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn ndtri_ndtri_exp_and_erfcinv_are_scipy_bit_for_bit() {
+        // scipy.special.ndtri / erfcinv 1.17.1, one point per branch: central rational, lower
+        // tail with z < 8 and z >= 8, and the reflected upper tail. With the old 16-digit
+        // tables each of these came out 1 ulp off SciPy (frankenscipy-qbwth).
+        let cases = [
+            (0.7985233458061055, 0.8363583994945307),
+            (0.04896558175294963, -1.654967140649188),
+            (4.934218154990496e-287, -36.18666428536214),
+            (0.8700885023275033, 1.126809589148029),
+        ];
+        for (p, want) in cases {
+            for unrolled in [true, false] {
+                let got = crate::convenience::ndtri_scalar_with(p, unrolled);
+                assert_eq!(
+                    got.to_bits(),
+                    f64::to_bits(want),
+                    "ndtri({p:e}) unrolled={unrolled} = {got:e}, SciPy {want:e}"
+                );
+            }
+        }
+        // ndtri_exp: xsf's three routes (tail rational in sqrt(-2y), ndtri(exp(y)),
+        // -ndtri(-expm1(y))). The Acklam rational it replaced was ~1e-9 relative off.
+        for (y, want) in [
+            (-0.001, 3.090380786917045),
+            (-0.5, 0.27028802073873587),
+            (-1.9999, -1.1014574009882083),
+            (-2.0001, -1.101581854051879),
+            (-10.0, -3.913946240531893),
+            (-700.0, -37.295079632647415),
+            (-1e10, -141421.35614695237),
+        ] {
+            let got = crate::convenience::ndtri_exp_scalar(y);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "ndtri_exp({y:e}) = {got:e}, SciPy {want:e}"
+            );
+        }
+        for (y, want) in [(0.5, 0.4769362762044699), (1.5, -0.4769362762044699)] {
+            // Anything but a real scalar becomes NaN, which the bit comparison rejects.
+            let got = match erfcinv(&SpecialTensor::RealScalar(y), RuntimeMode::Strict) {
+                Ok(SpecialTensor::RealScalar(v)) => v,
+                _ => f64::NAN,
+            };
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "erfcinv({y}) = {got:e}, SciPy {want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn spence_is_scipy_cephes_bit_for_bit() {
+        // scipy.special.spence 1.17.1 in each of Cephes' four argument ranges. With the old
+        // 16-digit SPENCE_B each came out 1-6 ulp off SciPy (frankenscipy-qbwth).
+        let cases = [
+            (0.6515419737010752, 0.38470911102299943),
+            (0.2658773446759721, 0.9494745952599211),
+            (1.9508639347904655, -0.7881726116023027),
+            (2.8681720908755537, -1.3633736011234079),
+        ];
+        for (x, want) in cases {
+            let got = crate::convenience::spence_scalar(x);
+            assert_eq!(
+                got.to_bits(),
+                f64::to_bits(want),
+                "spence({x}) = {got:e}, SciPy {want:e}"
             );
         }
     }

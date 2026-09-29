@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-0spk8]. polar is unique (when full rank), so
 //! both factors compared. subspace_angles compared element-wise.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, khatri_rao, matrix_rank, polar, subspace_angles};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -367,90 +369,95 @@ fn diff_linalg_subspace_polar() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["khatri_rao", "matrix_rank", "subspace_angles", "polar"];
+    let mut ledger = CompareLedger::new("diff_linalg_subspace_polar", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let a = rows_of(&case.a, case.a_rows, case.a_cols);
         let abs_d: f64 = match case.op.as_str() {
             "khatri_rao" => {
-                let Some(expected) = scipy_arm.values.as_ref() else {
-                    continue;
-                };
                 let b = rows_of(&case.b, case.b_rows, case.b_cols);
-                let Ok(m) = khatri_rao(&a, &b) else {
+                let fsci_flat = khatri_rao(&a, &b).ok().map(|m| flatten(&m));
+                let Some((expected, fsci_flat)) = ledger.slices(
+                    "khatri_rao",
+                    &case.case_id,
+                    scipy_arm.values.as_deref(),
+                    fsci_flat.as_deref(),
+                ) else {
                     continue;
                 };
-                let fsci_flat = flatten(&m);
-                if fsci_flat.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    fsci_flat
-                        .iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                fsci_flat
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             }
             "matrix_rank" => {
-                let Some(expected) = scipy_arm.scalar else {
-                    continue;
-                };
                 let opts = DecompOptions::default();
-                let Ok(r) = matrix_rank(&a, None, opts) else {
+                let fsci_rank = matrix_rank(&a, None, opts).ok().map(|r| r as f64);
+                let Some((expected, r)) =
+                    ledger.pair("matrix_rank", &case.case_id, scipy_arm.scalar, fsci_rank)
+                else {
                     continue;
                 };
-                ((r as f64) - expected).abs()
+                (r - expected).abs()
             }
             "subspace_angles" => {
-                let Some(expected) = scipy_arm.values.as_ref() else {
-                    continue;
-                };
                 let b = rows_of(&case.b, case.b_rows, case.b_cols);
                 let opts = DecompOptions::default();
-                let Ok(v) = subspace_angles(&a, &b, opts) else {
+                let fsci_v = subspace_angles(&a, &b, opts).ok();
+                let Some((expected, v)) = ledger.slices(
+                    "subspace_angles",
+                    &case.case_id,
+                    scipy_arm.values.as_deref(),
+                    fsci_v.as_deref(),
+                ) else {
                     continue;
                 };
-                if v.len() != expected.len() {
-                    f64::INFINITY
-                } else {
-                    v.iter()
-                        .zip(expected.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max)
-                }
+                v.iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max)
             }
             "polar" => {
-                let Some(u_exp) = scipy_arm.values.as_ref() else {
-                    continue;
-                };
-                let Some(p_exp) = scipy_arm.aux.as_ref() else {
-                    continue;
-                };
                 let opts = DecompOptions::default();
-                let Ok(res) = polar(&a, opts) else {
+                let res = polar(&a, opts).ok();
+                let u_flat = res.as_ref().map(|r| flatten(&r.u));
+                let p_flat = res.as_ref().map(|r| flatten(&r.p));
+                // Each factor is checked in turn; the first that fails records this case.
+                let Some((u_exp, u_flat)) = ledger.slices(
+                    "polar",
+                    &case.case_id,
+                    scipy_arm.values.as_deref(),
+                    u_flat.as_deref(),
+                ) else {
                     continue;
                 };
-                let u_flat = flatten(&res.u);
-                let p_flat = flatten(&res.p);
-                if u_flat.len() != u_exp.len() || p_flat.len() != p_exp.len() {
-                    f64::INFINITY
-                } else {
-                    let du = u_flat
-                        .iter()
-                        .zip(u_exp.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max);
-                    let dp = p_flat
-                        .iter()
-                        .zip(p_exp.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f64, f64::max);
-                    du.max(dp)
-                }
+                let Some((p_exp, p_flat)) = ledger.slices(
+                    "polar",
+                    &case.case_id,
+                    scipy_arm.aux.as_deref(),
+                    p_flat.as_deref(),
+                ) else {
+                    continue;
+                };
+                let du = u_flat
+                    .iter()
+                    .zip(u_exp.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                let dp = p_flat
+                    .iter()
+                    .zip(p_exp.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                du.max(dp)
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(case.op.as_str(), &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -465,6 +472,7 @@ fn diff_linalg_subspace_polar() {
         test_id: "diff_linalg_subspace_polar".into(),
         category: "scipy.linalg.khatri_rao + matrix_rank + subspace_angles + polar".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -484,5 +492,11 @@ fn diff_linalg_subspace_polar() {
         "subspace_polar conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

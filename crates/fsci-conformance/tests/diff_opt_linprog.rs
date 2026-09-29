@@ -6,13 +6,14 @@
 //! vertices, but the optimal objective is always unique for a
 //! feasible bounded LP.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::linprog;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -267,13 +269,12 @@ fn diff_opt_linprog() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_linprog", &["linprog"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_fun) = scipy_arm.fun else {
-            continue;
-        };
-        let Ok(res) = linprog(
+        // SciPy reports `fun` only at status 0 (optimal); an unsuccessful fsci solve is a failure.
+        let fsci_fun = linprog(
             &case.c,
             &case.a_ub,
             &case.b_ub,
@@ -281,11 +282,18 @@ fn diff_opt_linprog() {
             &case.b_eq,
             &case.bounds,
             Some(2000),
-        ) else {
+        )
+        .ok()
+        .filter(|res| res.success)
+        .map(|res| res.fun);
+        let Some((scipy_fun, fsci_fun)) =
+            ledger.pair("linprog", &case.case_id, scipy_arm.fun, fsci_fun)
+        else {
             continue;
         };
-        let abs_d = (res.fun - scipy_fun).abs();
+        let abs_d = (fsci_fun - scipy_fun).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("linprog", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -299,6 +307,7 @@ fn diff_opt_linprog() {
         test_id: "diff_opt_linprog".into(),
         category: "scipy.optimize.linprog (HiGHS / objective value)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -322,4 +331,5 @@ fn diff_opt_linprog() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

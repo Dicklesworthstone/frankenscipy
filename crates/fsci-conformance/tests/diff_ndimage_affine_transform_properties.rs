@@ -12,15 +12,19 @@
 //!   * Error: order > 5
 //!   * Error: input.ndim != 2
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, affine_transform};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
+/// Interpolation orders of the identity cases.
+const IDENTITY_ORDERS: [usize; 2] = [0, 1];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -34,6 +38,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -65,6 +70,14 @@ fn emit_log(log: &DiffLog) {
 fn diff_ndimage_affine_transform_properties() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    // The reference side is the input itself (identity) or recorded SciPy values; the error
+    // cases are ones SciPy 1.17.1 raises on (RuntimeError "spline order not supported" /
+    // "affine matrix has wrong number of rows"). A NaN in fsci's output used to vanish in the
+    // max fold below.
+    let mut ledger = CompareLedger::new(
+        "diff_ndimage_affine_transform_properties",
+        &["identity", "scipy_parity", "errors"],
+    );
     let mut check = |id: &str, ok: bool, note: String| {
         diffs.push(CaseDiff {
             case_id: id.into(),
@@ -83,20 +96,26 @@ fn diff_ndimage_affine_transform_properties() {
     // For both order=0 and order=1, output should equal input.
     {
         let identity: [[f64; 3]; 2] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        for order in [0_usize, 1] {
+        for order in IDENTITY_ORDERS {
+            let case_id = format!("identity_order{order}");
             let result = affine_transform(&arr, &identity, order, BoundaryMode::Constant, 0.0)
                 .expect("identity affine");
-            let max_diff = result
-                .data
+            let Some((expected, actual)) = ledger.slices(
+                "identity",
+                &case_id,
+                Some(data.as_slice()),
+                Some(result.data.as_slice()),
+            ) else {
+                continue;
+            };
+            let max_diff = actual
                 .iter()
-                .zip(data.iter())
+                .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            check(
-                &format!("identity_order{order}"),
-                result.shape == arr.shape && max_diff <= ABS_TOL,
-                format!("max_diff={max_diff}"),
-            );
+            let pass = result.shape == arr.shape && max_diff <= ABS_TOL;
+            ledger.compared("identity", &case_id, pass);
+            check(&case_id, pass, format!("max_diff={max_diff}"));
         }
     }
 
@@ -241,18 +260,24 @@ fn diff_ndimage_affine_transform_properties() {
             ),
         ];
         for (order, mode, tol, expected) in references {
+            let case_id = format!("scipy_parity_order{order}_{mode:?}");
             let result = affine_transform(&arr, &matrix, order, mode, 0.0).expect("general affine");
-            let max_diff = result
-                .data
+            let Some((expected, actual)) = ledger.slices(
+                "scipy_parity",
+                &case_id,
+                Some(expected.as_slice()),
+                Some(result.data.as_slice()),
+            ) else {
+                continue;
+            };
+            let max_diff = actual
                 .iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            check(
-                &format!("scipy_parity_order{order}_{mode:?}"),
-                result.shape == arr.shape && max_diff <= tol,
-                format!("max_diff={max_diff}"),
-            );
+            let pass = result.shape == arr.shape && max_diff <= tol;
+            ledger.compared("scipy_parity", &case_id, pass);
+            check(&case_id, pass, format!("max_diff={max_diff}"));
         }
     }
 
@@ -260,6 +285,7 @@ fn diff_ndimage_affine_transform_properties() {
     {
         let identity: [[f64; 3]; 2] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let result = affine_transform(&arr, &identity, 6, BoundaryMode::Constant, 0.0);
+        ledger.expected_raise("errors", "order_too_large_errors", result.is_err());
         check(
             "order_too_large_errors",
             result.is_err(),
@@ -272,6 +298,7 @@ fn diff_ndimage_affine_transform_properties() {
         let arr_1d = NdArray::new(vec![1.0, 2.0, 3.0], vec![3]).expect("ndarray 1d");
         let identity: [[f64; 3]; 2] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let result = affine_transform(&arr_1d, &identity, 0, BoundaryMode::Constant, 0.0);
+        ledger.expected_raise("errors", "non_2d_errors", result.is_err());
         check("non_2d_errors", result.is_err(), format!("res={result:?}"));
     }
 
@@ -280,6 +307,7 @@ fn diff_ndimage_affine_transform_properties() {
         let arr_3d = NdArray::new(vec![1.0; 8], vec![2, 2, 2]).expect("ndarray 3d");
         let identity: [[f64; 3]; 2] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let result = affine_transform(&arr_3d, &identity, 0, BoundaryMode::Constant, 0.0);
+        ledger.expected_raise("errors", "ndim_3_errors", result.is_err());
         check("ndim_3_errors", result.is_err(), format!("res={result:?}"));
     }
 
@@ -300,6 +328,7 @@ fn diff_ndimage_affine_transform_properties() {
         test_id: "diff_ndimage_affine_transform_properties".into(),
         category: "fsci_ndimage::affine_transform property-based coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -318,4 +347,6 @@ fn diff_ndimage_affine_transform_properties() {
         "affine_transform property coverage failed: {} cases",
         diffs.len()
     );
+    // identity (one case per order) is the smallest of the three arms: parity has 4, errors 3.
+    ledger.finish(IDENTITY_ORDERS.len());
 }

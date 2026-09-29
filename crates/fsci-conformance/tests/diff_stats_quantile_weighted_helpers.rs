@@ -7,12 +7,14 @@
 //! weighted_var is the population variance (weights/sum-of-weights),
 //! computable directly from numpy.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{quantile, weighted_mean, weighted_var};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -248,34 +251,27 @@ fn diff_stats_quantile_weighted_helpers() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_stats_quantile_weighted_helpers",
+        &["quantile", "weighted_mean", "weighted_var"],
+    );
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.out.as_ref() else {
-            continue;
-        };
-
         let actual: Vec<f64> = match case.op.as_str() {
             "quantile" => quantile(&case.data, &case.q),
             "weighted_mean" => vec![weighted_mean(&case.data, &case.weights)],
             "weighted_var" => vec![weighted_var(&case.data, &case.weights)],
             other => panic!("unknown op {other}"),
         };
-        if actual.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                max_abs_diff: f64::INFINITY,
-                max_rel_diff: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} numpy={}",
-                    actual.len(),
-                    expected.len()
-                ),
-            });
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            o.out.as_deref(),
+            Some(actual.as_slice()),
+        ) else {
             continue;
-        }
+        };
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
@@ -286,6 +282,7 @@ fn diff_stats_quantile_weighted_helpers() {
             max_rel = max_rel.max(abs_d / denom);
         }
         let pass = max_rel <= REL_TOL || max_abs <= ABS_TOL;
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -301,6 +298,7 @@ fn diff_stats_quantile_weighted_helpers() {
         test_id: "diff_stats_quantile_weighted_helpers".into(),
         category: "fsci_stats::{quantile, weighted_mean, weighted_var} vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -321,5 +319,11 @@ fn diff_stats_quantile_weighted_helpers() {
         all_pass,
         "quantile/weighted parity failed: {} cases",
         diffs.len()
+    );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        per_op("quantile")
+            .min(per_op("weighted_mean"))
+            .min(per_op("weighted_var")),
     );
 }

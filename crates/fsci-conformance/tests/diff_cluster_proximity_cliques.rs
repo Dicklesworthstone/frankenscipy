@@ -15,7 +15,7 @@
 //!
 //! 4 fixtures × 1 eps each = 4 cases.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::proximity_cliques;
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-012";
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -272,13 +274,19 @@ fn diff_cluster_proximity_cliques() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_cluster_proximity_cliques", &["proximity_cliques"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(nx_cliques) = scipy_arm.cliques.as_ref() else {
+        let rust_cliques = proximity_cliques(&case.data, case.eps);
+        let Some((nx_cliques, rust_cliques)) = ledger.both(
+            "proximity_cliques",
+            &case.case_id,
+            scipy_arm.cliques.as_ref(),
+            Some(rust_cliques),
+        ) else {
             continue;
         };
-        let rust_cliques = proximity_cliques(&case.data, case.eps);
 
         let rust_set = normalize_cliques(
             rust_cliques
@@ -288,6 +296,7 @@ fn diff_cluster_proximity_cliques() {
         let nx_set = normalize_cliques(nx_cliques.iter().cloned());
 
         let set_match = rust_set == nx_set;
+        ledger.compared("proximity_cliques", &case.case_id, set_match);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rust_n_cliques: rust_set.len(),
@@ -303,6 +312,7 @@ fn diff_cluster_proximity_cliques() {
         test_id: "diff_cluster_proximity_cliques".into(),
         category: "fsci_cluster::proximity_cliques (networkx reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -325,4 +335,5 @@ fn diff_cluster_proximity_cliques() {
         "proximity_cliques conformance failed across {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

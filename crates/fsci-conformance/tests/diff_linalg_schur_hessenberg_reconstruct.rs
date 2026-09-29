@@ -9,13 +9,14 @@
 //!    spectra).
 //!  - Hessenberg: A ≈ Q H Qᵀ. Q orthogonal (QQᵀ ≈ I).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, hessenberg, schur};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -266,17 +268,30 @@ fn diff_linalg_schur_hessenberg_reconstruct() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["schur", "hessenberg"];
+    let mut ledger = CompareLedger::new("diff_linalg_schur_hessenberg_reconstruct", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected_eigs) = scipy_arm.eigvals_sorted.as_ref() else {
-            continue;
-        };
         let a = rows_of(&case.a, case.rows, case.cols);
         let opts = DecompOptions::default();
-        let abs_d = match case.op.as_str() {
+        // The folds below read a NaN as 0.0, so each arm also requires NaN-free factors.
+        let (abs_d, no_nan) = match case.op.as_str() {
             "schur" => {
-                let Ok(res) = schur(&a, opts) else { continue };
+                let Some((expected_eigs, res)) = ledger.both(
+                    "schur",
+                    &case.case_id,
+                    scipy_arm.eigvals_sorted.as_ref(),
+                    schur(&a, opts).ok(),
+                ) else {
+                    continue;
+                };
+                let no_nan = !res
+                    .z
+                    .iter()
+                    .chain(res.t.iter())
+                    .flatten()
+                    .any(|v| v.is_nan());
                 // Reconstruction: A ≈ Z T Z^T
                 let z_t = mat_mul(&res.z, &res.t);
                 let zt_zt = mat_mul(&z_t, &transpose(&res.z));
@@ -293,12 +308,23 @@ fn diff_linalg_schur_hessenberg_reconstruct() {
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0_f64, f64::max)
                 };
-                recon.max(eig_d)
+                (recon.max(eig_d), no_nan)
             }
             "hessenberg" => {
-                let Ok(res) = hessenberg(&a, opts) else {
+                let Some((_, res)) = ledger.both(
+                    "hessenberg",
+                    &case.case_id,
+                    scipy_arm.eigvals_sorted.as_ref(),
+                    hessenberg(&a, opts).ok(),
+                ) else {
                     continue;
                 };
+                let no_nan = !res
+                    .q
+                    .iter()
+                    .chain(res.h.iter())
+                    .flatten()
+                    .any(|v| v.is_nan());
                 // Reconstruction: A ≈ Q H Q^T
                 let q_h = mat_mul(&res.q, &res.h);
                 let qhq = mat_mul(&q_h, &transpose(&res.q));
@@ -313,16 +339,18 @@ fn diff_linalg_schur_hessenberg_reconstruct() {
                         ortho = ortho.max((qqt[i][j] - target).abs());
                     }
                 }
-                recon.max(ortho)
+                (recon.max(ortho), no_nan)
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
         max_overall = max_overall.max(abs_d);
+        let pass = no_nan && abs_d <= ABS_TOL;
+        ledger.compared(case.op.as_str(), &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -332,6 +360,7 @@ fn diff_linalg_schur_hessenberg_reconstruct() {
         test_id: "diff_linalg_schur_hessenberg_reconstruct".into(),
         category: "fsci_linalg.schur + hessenberg reconstruction".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -351,5 +380,11 @@ fn diff_linalg_schur_hessenberg_reconstruct() {
         "schur_hessenberg conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

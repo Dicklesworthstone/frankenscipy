@@ -32,12 +32,14 @@
 //! EXCEED the true norm. That is a property of the method, and it catches a wrong normalisation
 //! even when the number looks reasonable.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::interpolative::{
     DEFAULT_SPECTRAL_NORM_ITERATIONS, estimate_spectral_norm, estimate_spectral_norm_diff,
 };
@@ -200,6 +202,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     difference_form_cases: usize,
     tight_cases: usize,
@@ -447,6 +450,12 @@ fn diff_linalg_interpolative_spectral_norm() {
     let mut difference_cases = 0usize;
     let mut tight_cases = 0usize;
     let mut worst = 0.0f64;
+    // The incumbent's answers stay guarded by the asserts below (a raise or a null field
+    // panics); the fsci call and every comparison are recorded in the ledger.
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_interpolative_spectral_norm",
+        &["estimate_spectral_norm", "estimate_spectral_norm_diff"],
+    );
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -473,20 +482,35 @@ fn diff_linalg_interpolative_spectral_norm() {
         let gap = f64::from_bits(gap_bits);
 
         let a = reshape(&case.a_bits, case.rows, case.cols);
-        let ours = match case.b_bits.as_ref() {
+        let (func, ours) = match case.b_bits.as_ref() {
             Some(b_bits) => {
                 difference_cases += 1;
                 let b = reshape(b_bits, case.rows, case.cols);
-                estimate_spectral_norm_diff(&a, &b, case.its)
-                    .unwrap_or_else(|e| panic!("case {}: {e}", case.case_id))
+                (
+                    "estimate_spectral_norm_diff",
+                    estimate_spectral_norm_diff(&a, &b, case.its)
+                        .inspect_err(|e| eprintln!("case {}: {e}", case.case_id))
+                        .ok(),
+                )
             }
-            None => estimate_spectral_norm(&a, case.its)
-                .unwrap_or_else(|e| panic!("case {}: {e}", case.case_id)),
+            None => (
+                "estimate_spectral_norm",
+                estimate_spectral_norm(&a, case.its)
+                    .inspect_err(|e| eprintln!("case {}: {e}", case.case_id))
+                    .ok(),
+            ),
+        };
+        // An fsci error or a non-finite estimate is recorded as an fsci failure.
+        let Some((scipy_estimate, ours)) =
+            ledger.pair(func, &case.case_id, Some(scipy_estimate), ours)
+        else {
+            continue;
         };
 
         // The zero operator: both arms must report exactly zero rather than a NaN from
         // normalising by a zero magnitude.
         if true_norm == 0.0 {
+            ledger.compared(func, &case.case_id, ours == 0.0 && scipy_estimate == 0.0);
             assert_eq!(ours, 0.0, "case {}: zero operator", case.case_id);
             assert_eq!(
                 scipy_estimate, 0.0,
@@ -537,6 +561,15 @@ fn diff_linalg_interpolative_spectral_norm() {
         let ours_error = (ours - true_norm).abs() / true_norm;
         let scipy_error = (scipy_estimate - true_norm).abs() / true_norm;
         let arms_difference = (ours - scipy_estimate).abs() / true_norm;
+        ledger.compared(
+            func,
+            &case.case_id,
+            ours <= true_norm * (1.0 + 1e-12)
+                && scipy_estimate <= true_norm * (1.0 + 1e-12)
+                && ours_error <= tolerance
+                && scipy_error <= tolerance
+                && arms_difference <= 2.0 * tolerance,
+        );
 
         assert!(
             ours_error <= tolerance,
@@ -581,6 +614,7 @@ fn diff_linalg_interpolative_spectral_norm() {
         test_id: "diff_linalg_interpolative_spectral_norm".to_string(),
         category: "linalg.interpolative".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         difference_form_cases: difference_cases,
         tight_cases,
@@ -598,7 +632,8 @@ fn diff_linalg_interpolative_spectral_norm() {
     assert_eq!(
         compared,
         query.points.len(),
-        "every case must be compared, not skipped"
+        "every case must be compared, not skipped; {}",
+        ledger.verdict(1, false).err().unwrap_or_default()
     );
     assert!(
         difference_cases >= 4,
@@ -610,6 +645,16 @@ fn diff_linalg_interpolative_spectral_norm() {
         tight_cases * 2 >= compared,
         "only {tight_cases} of {compared} cases were held to the machine-precision floor; \
          the suite has drifted toward cases its tolerances cannot constrain"
+    );
+    // Each estimator is designed to compare every case of its form; the difference form has
+    // fewer cases, so it sets the minimum.
+    ledger.finish(
+        query
+            .points
+            .iter()
+            .filter(|c| c.b_bits.is_some())
+            .count()
+            .min(query.points.iter().filter(|c| c.b_bits.is_none()).count()),
     );
 }
 

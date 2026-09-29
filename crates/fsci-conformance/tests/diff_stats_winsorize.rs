@@ -13,13 +13,14 @@
 //! element-wise with max-abs aggregation. Tol 1e-12 abs
 //! (closed-form clamp).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::winsorize;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -225,21 +227,21 @@ fn diff_stats_winsorize() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_winsorize", &["winsorize"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.transformed else {
+        let rust_vec = winsorize(&case.data, (case.lo, case.hi));
+        // slices records a length mismatch as a compared failure and a non-finite fsci element
+        // against SciPy's finite one as an fsci failure, so neither can hide from the fold.
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            "winsorize",
+            &case.case_id,
+            scipy_arm.transformed.as_deref(),
+            Some(rust_vec.as_slice()),
+        ) else {
             continue;
         };
-        let rust_vec = winsorize(&case.data, (case.lo, case.hi));
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (a, b) in rust_vec.iter().zip(scipy_vec.iter()) {
             if a.is_finite() {
@@ -247,6 +249,7 @@ fn diff_stats_winsorize() {
             }
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared("winsorize", &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: max_local,
@@ -260,6 +263,7 @@ fn diff_stats_winsorize() {
         test_id: "diff_stats_winsorize".into(),
         category: "scipy.stats.mstats.winsorize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -281,4 +285,5 @@ fn diff_stats_winsorize() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

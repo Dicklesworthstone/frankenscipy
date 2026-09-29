@@ -7,12 +7,14 @@
 //! nearest, wrap). For sobel/prewitt, both axes (0 and 1) are
 //! exercised.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, laplace, prewitt, sobel};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -241,12 +244,11 @@ fn diff_ndimage_sobel_prewitt_laplace() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let arms = ["sobel", "prewitt", "laplace"];
+    let mut ledger = CompareLedger::new("diff_ndimage_sobel_prewitt_laplace", &arms);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let Some(expected) = o.out.as_ref() else {
-            continue;
-        };
 
         let arr =
             NdArray::new(case.data.clone(), vec![case.rows, case.cols]).expect("NdArray build");
@@ -258,45 +260,31 @@ fn diff_ndimage_sobel_prewitt_laplace() {
             other => panic!("unknown func {other}"),
         };
         let actual = match result {
-            Ok(a) => a,
+            Ok(a) => Some(a.data),
             Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: case.func.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    max_rel_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("filter error: {e:?}"),
-                });
-                continue;
+                eprintln!("edge filter error: {} ({}): {e:?}", case.case_id, case.func);
+                None
             }
         };
-
-        if actual.data.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                max_abs_diff: f64::INFINITY,
-                max_rel_diff: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} scipy={}",
-                    actual.data.len(),
-                    expected.len()
-                ),
-            });
+        let Some((expected, actual)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            o.out.as_deref(),
+            actual.as_deref(),
+        ) else {
             continue;
-        }
+        };
 
         let mut max_abs = 0.0_f64;
         let mut max_rel = 0.0_f64;
-        for (a, e) in actual.data.iter().zip(expected.iter()) {
+        for (a, e) in actual.iter().zip(expected.iter()) {
             let abs_d = (a - e).abs();
             let denom = e.abs().max(1.0e-300);
             max_abs = max_abs.max(abs_d);
             max_rel = max_rel.max(abs_d / denom);
         }
         let pass = max_rel <= REL_TOL || max_abs <= ABS_TOL;
+        ledger.compared(&case.func, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -312,6 +300,7 @@ fn diff_ndimage_sobel_prewitt_laplace() {
         test_id: "diff_ndimage_sobel_prewitt_laplace".into(),
         category: "fsci_ndimage::{sobel, prewitt, laplace} vs scipy.ndimage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -332,5 +321,11 @@ fn diff_ndimage_sobel_prewitt_laplace() {
         all_pass,
         "sobel/prewitt/laplace parity failed: {} cases",
         diffs.len()
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+            .min()
+            .unwrap_or(0),
     );
 }

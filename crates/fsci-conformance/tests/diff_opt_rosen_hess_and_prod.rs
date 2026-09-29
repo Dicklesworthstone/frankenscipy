@@ -8,12 +8,14 @@
 //! closed-form analytic expressions so the parity tolerance is tight
 //! (rel 1e-12, abs 1e-14).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{rosen_hess, rosen_hess_prod};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -223,86 +226,82 @@ fn diff_opt_rosen_hess_and_prod() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_opt_rosen_hess_and_prod",
+        &["rosen_hess", "rosen_hess_prod"],
+    );
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_hess), Some(exp_prod)) = (o.hess.as_ref(), o.hess_prod.as_ref()) else {
-            continue;
-        };
 
         let n = case.x.len();
         let h_fsci = rosen_hess(&case.x);
         let p_fsci = rosen_hess_prod(&case.x, &case.p);
+        let mut notes: Vec<String> = Vec::new();
 
-        if h_fsci.len() != n || h_fsci.iter().any(|row| row.len() != n) {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n,
-                max_abs_diff_hess: f64::INFINITY,
-                max_rel_diff_hess: f64::INFINITY,
-                max_abs_diff_prod: f64::INFINITY,
-                max_rel_diff_prod: f64::INFINITY,
-                pass: false,
-                note: format!(
+        // Row-major like the oracle's flattening. `slices` rejects a length mismatch against
+        // SciPy's n*n and a NaN that the `f64::max` folds below would drop.
+        let h_flat: Vec<f64> = h_fsci.iter().flatten().copied().collect();
+        let mut max_abs_h = f64::INFINITY;
+        let mut max_rel_h = f64::INFINITY;
+        let mut hess_pass = None;
+        if let Some((exp_hess, h_flat)) = ledger.slices(
+            "rosen_hess",
+            &case.case_id,
+            o.hess.as_deref(),
+            Some(h_flat.as_slice()),
+        ) {
+            if h_fsci.len() != n || h_fsci.iter().any(|row| row.len() != n) {
+                notes.push(format!(
                     "hess shape mismatch: fsci {}x{}",
                     h_fsci.len(),
                     h_fsci.first().map_or(0, |r| r.len())
-                ),
-            });
-            continue;
-        }
-        if exp_hess.len() != n * n {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n,
-                max_abs_diff_hess: f64::INFINITY,
-                max_rel_diff_hess: f64::INFINITY,
-                max_abs_diff_prod: f64::INFINITY,
-                max_rel_diff_prod: f64::INFINITY,
-                pass: false,
-                note: format!("scipy hess flat length {} != n*n {}", exp_hess.len(), n * n),
-            });
-            continue;
-        }
-
-        let mut max_abs_h = 0.0_f64;
-        let mut max_rel_h = 0.0_f64;
-        for i in 0..n {
-            for j in 0..n {
-                let (abs_d, rel_d) = compare_pair(h_fsci[i][j], exp_hess[i * n + j]);
-                max_abs_h = max_abs_h.max(abs_d);
-                max_rel_h = max_rel_h.max(rel_d);
+                ));
+                ledger.compared("rosen_hess", &case.case_id, false);
+                hess_pass = Some(false);
+            } else {
+                max_abs_h = 0.0;
+                max_rel_h = 0.0;
+                for (&actual, &expected) in h_flat.iter().zip(exp_hess) {
+                    let (abs_d, rel_d) = compare_pair(actual, expected);
+                    max_abs_h = max_abs_h.max(abs_d);
+                    max_rel_h = max_rel_h.max(rel_d);
+                }
+                let pass = max_rel_h <= REL_TOL || max_abs_h <= ABS_TOL;
+                ledger.compared("rosen_hess", &case.case_id, pass);
+                hess_pass = Some(pass);
             }
+        } else {
+            notes.push("rosen_hess not compared (see the ledger)".into());
         }
 
-        let mut max_abs_p = 0.0_f64;
-        let mut max_rel_p = 0.0_f64;
-        if p_fsci.len() != exp_prod.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n,
-                max_abs_diff_hess: max_abs_h,
-                max_rel_diff_hess: max_rel_h,
-                max_abs_diff_prod: f64::INFINITY,
-                max_rel_diff_prod: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "hess_prod length mismatch: fsci={} scipy={}",
-                    p_fsci.len(),
-                    exp_prod.len()
-                ),
-            });
+        let mut max_abs_p = f64::INFINITY;
+        let mut max_rel_p = f64::INFINITY;
+        let mut prod_pass = None;
+        if let Some((exp_prod, p_fsci)) = ledger.slices(
+            "rosen_hess_prod",
+            &case.case_id,
+            o.hess_prod.as_deref(),
+            Some(p_fsci.as_slice()),
+        ) {
+            max_abs_p = 0.0;
+            max_rel_p = 0.0;
+            for (&actual, &expected) in p_fsci.iter().zip(exp_prod) {
+                let (abs_d, rel_d) = compare_pair(actual, expected);
+                max_abs_p = max_abs_p.max(abs_d);
+                max_rel_p = max_rel_p.max(rel_d);
+            }
+            let pass = max_rel_p <= REL_TOL || max_abs_p <= ABS_TOL;
+            ledger.compared("rosen_hess_prod", &case.case_id, pass);
+            prod_pass = Some(pass);
+        } else {
+            notes.push("rosen_hess_prod not compared (see the ledger)".into());
+        }
+
+        if hess_pass.is_none() && prod_pass.is_none() {
+            // Both arms were recorded by the ledger calls above, which returned None.
             continue;
         }
-        for (a, e) in p_fsci.iter().zip(exp_prod.iter()) {
-            let (abs_d, rel_d) = compare_pair(*a, *e);
-            max_abs_p = max_abs_p.max(abs_d);
-            max_rel_p = max_rel_p.max(rel_d);
-        }
-
-        let hess_pass = max_rel_h <= REL_TOL || max_abs_h <= ABS_TOL;
-        let prod_pass = max_rel_p <= REL_TOL || max_abs_p <= ABS_TOL;
-        let pass = hess_pass && prod_pass;
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             n,
@@ -310,8 +309,8 @@ fn diff_opt_rosen_hess_and_prod() {
             max_rel_diff_hess: max_rel_h,
             max_abs_diff_prod: max_abs_p,
             max_rel_diff_prod: max_rel_p,
-            pass,
-            note: String::new(),
+            pass: hess_pass == Some(true) && prod_pass == Some(true),
+            note: notes.join("; "),
         });
     }
 
@@ -320,6 +319,7 @@ fn diff_opt_rosen_hess_and_prod() {
         test_id: "diff_opt_rosen_hess_and_prod".into(),
         category: "fsci_opt::{rosen_hess, rosen_hess_prod} vs scipy.optimize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -346,4 +346,5 @@ fn diff_opt_rosen_hess_and_prod() {
         "rosen_hess/rosen_hess_prod parity failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

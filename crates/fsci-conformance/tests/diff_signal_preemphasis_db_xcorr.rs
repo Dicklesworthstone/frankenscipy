@@ -10,13 +10,14 @@
 //!   power_db(x, ref):  10·log10(mean(x²) / ref)
 //!   xcorr_coefficient(x, y): Pearson correlation coefficient
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{deemphasis, power_db, preemphasis, xcorr_coefficient};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -255,9 +257,6 @@ print(json.dumps({"points": points}))
 }
 
 fn vec_max_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -280,45 +279,61 @@ fn diff_signal_preemphasis_db_xcorr() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let op_arms = ["preemphasis", "deemphasis", "power_db", "xcorr"];
+    let mut ledger = CompareLedger::new("diff_signal_preemphasis_db_xcorr", &op_arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
+        let op = case.op.as_str();
 
-        let abs_d = match case.op.as_str() {
+        let abs_d = match op {
             "preemphasis" => {
-                let Some(expected) = arm.values.as_ref() else {
+                let actual = preemphasis(&case.x, case.coeff);
+                let Some((expected, actual)) = ledger.slices(
+                    op,
+                    &case.case_id,
+                    arm.and_then(|a| a.values.as_deref()),
+                    Some(actual.as_slice()),
+                ) else {
                     continue;
                 };
-                let actual = preemphasis(&case.x, case.coeff);
-                vec_max_diff(&actual, expected)
+                vec_max_diff(actual, expected)
             }
             "deemphasis" => {
-                let Some(expected) = arm.values.as_ref() else {
+                let actual = deemphasis(&case.x, case.coeff);
+                let Some((expected, actual)) = ledger.slices(
+                    op,
+                    &case.case_id,
+                    arm.and_then(|a| a.values.as_deref()),
+                    Some(actual.as_slice()),
+                ) else {
                     continue;
                 };
-                let actual = deemphasis(&case.x, case.coeff);
-                vec_max_diff(&actual, expected)
+                vec_max_diff(actual, expected)
             }
             "power_db" => {
-                let Some(expected) = arm.scalar else {
+                let actual = power_db(&case.x, case.coeff);
+                let Some((expected, actual)) =
+                    ledger.pair(op, &case.case_id, arm.and_then(|a| a.scalar), Some(actual))
+                else {
                     continue;
                 };
-                let actual = power_db(&case.x, case.coeff);
                 (actual - expected).abs()
             }
             "xcorr" => {
-                let Some(expected) = arm.scalar else {
+                let actual = xcorr_coefficient(&case.x, &case.y);
+                let Some((expected, actual)) =
+                    ledger.pair(op, &case.case_id, arm.and_then(|a| a.scalar), Some(actual))
+                else {
                     continue;
                 };
-                let actual = xcorr_coefficient(&case.x, &case.y);
                 (actual - expected).abs()
             }
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
 
         max_overall = max_overall.max(abs_d);
+        ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -334,6 +349,7 @@ fn diff_signal_preemphasis_db_xcorr() {
         category: "fsci_signal preemphasis/deemphasis/power_db/xcorr_coefficient vs numpy formula"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -353,5 +369,12 @@ fn diff_signal_preemphasis_db_xcorr() {
         "preemphasis_db_xcorr conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        op_arms
+            .iter()
+            .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+            .min()
+            .unwrap_or(0),
     );
 }

@@ -1,16 +1,16 @@
 {
   "packet_id": "FSCI-P2C-015",
   "family": "ndimage_core",
-  "generated_unix_ms": 1788666502122,
+  "generated_unix_ms": 1790392935329,
   "runtime": {
     "python_version": "3.13.12",
     "numpy_version": "2.4.3",
     "scipy_version": "1.17.1"
   },
   "provenance": {
-    "fixture_input_blake3": "4f72d49b23aec2bd2fab848592846e1c57aba4e1060f8043eb1280f8e5c0dded",
+    "fixture_input_blake3": "e9857aa5861bf2907f675b20eb6aa987f35b4a96cafc11d867536aa540f3ffd9",
     "oracle_output_blake3": "e9de8b0e276ce6cda68b4f85a4e35234fa4b00c35411ef82770a72c2fb31d1fa",
-    "capture_blake3": "c60d369aec9e674117f02bedd7e6b0a06c6729eed1b24c9c6f4fbcd69b924ea3"
+    "capture_blake3": "34f021deea0790e00094b28e010d1af8dce78bb614881ebbd978aa86bdfe272a"
   },
   "case_outputs": [
     {

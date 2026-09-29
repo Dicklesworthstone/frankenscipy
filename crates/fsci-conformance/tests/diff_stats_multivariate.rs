@@ -7,12 +7,14 @@
 //!
 //! Cross-checks FrankenSciPy against live SciPy reference oracle.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     Covariance, Dirichlet, DirichletMultinomial, InvWishart, MatrixNormal, MatrixT, Multinomial,
     MultivariateHypergeom, MultivariateNormal, MultivariateT, NormalInverseGamma, VonMisesFisher,
@@ -24,6 +26,44 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+
+// Tolerance contracts. Every comparison below names one of these instead of
+// passing a literal: G9's ratchet (`tolerance_lint`) reads `*_TOL` consts, and
+// literal arguments to `check_pair` were invisible to it, so a 10x loosening at
+// a call site passed the gate (zbtht.4). Tiers are `artifacts/TOLERANCE_POLICY.md` §1.
+
+/// Closed-form moments, covariances, Mahalanobis distances, Cholesky entries,
+/// and the Gaussian / Student-t densities: T3 rtol, atol one decade tighter.
+const CLOSED_FORM_ABS_TOL: f64 = 1e-11;
+const CLOSED_FORM_REL_TOL: f64 = 1e-10;
+/// Densities and entropies built on multigammaln / digamma / Bessel series
+/// (Wishart, InvWishart, MatrixNormal, MatrixT, VonMisesFisher, Dirichlet, and
+/// the discrete pmfs): T4 ("special-function series") allows 1e-8.
+const SPECIAL_FN_ABS_TOL: f64 = 1e-10;
+const SPECIAL_FN_REL_TOL: f64 = 1e-9;
+/// Entropies that sum a support or a Bessel-ratio series (VonMisesFisher,
+/// Multinomial): T4.
+const SERIES_ENTROPY_ABS_TOL: f64 = 1e-9;
+const SERIES_ENTROPY_REL_TOL: f64 = 1e-8;
+/// Worst deviation from unit norm of von Mises-Fisher samples, fsci vs SciPy: T4.
+const UNIT_NORM_ERR_TOL: f64 = 1e-9;
+/// SciPy's ortho_group / special_ortho_group determinant against 1: T4.
+const ORTHO_DET_TOL: f64 = 1e-8;
+/// Identities between two fsci constructions of one distribution
+/// (`from_covariance` vs direct): a few roundings apart.
+const FROM_COVARIANCE_IDENTITY_TOL: f64 = 1e-14;
+/// Orthonormality / unitarity residual of a sampled matrix, fsci and SciPy.
+const ORTHONORMALITY_TOL: f64 = 1e-10;
+/// Unit diagonal of a random_correlation sample, fsci and SciPy: T5.
+const CORRELATION_DIAG_TOL: f64 = 1e-7;
+/// Sample means of fsci's seeded rvs (N = 1000-2000 draws) against the exact
+/// mean. These check a sampler's consistency, not SciPy agreement, and they sit
+/// ABOVE the policy's T6 ceiling (1e-1) without a §5 exception. They are named
+/// here so they cannot loosen further; replacing them with a z-score bound is
+/// frankenscipy-el4n5.
+const MVHYPERGEOM_RVS_MEAN_TOL: f64 = 0.2;
+const RVS_MEAN_TOL: f64 = 0.25;
+const MATRIX_T_RVS_MEAN_TOL: f64 = 0.35;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiffRecord {
@@ -41,6 +81,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -170,12 +211,6 @@ struct DirichletMultinomialCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RandomGeneratorCase {
-    case_id: String,
-    dim: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     mvn_cases: Vec<MvnCase>,
     mvt_cases: Vec<MvtCase>,
@@ -189,7 +224,6 @@ struct OracleQuery {
     nig_cases: Vec<NormalInverseGammaCase>,
     multinomial_cases: Vec<MultinomialCase>,
     dirichlet_multinomial_cases: Vec<DirichletMultinomialCase>,
-    random_generator_cases: Vec<RandomGeneratorCase>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,19 +347,6 @@ struct DirichletMultinomialOracleResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RandomGeneratorOracleResponse {
-    case_id: String,
-    q_ortho_err: f64,
-    q_det: f64,
-    so_det: f64,
-    u_unitarity_err: f64,
-    v_norm: f64,
-    corr_diag_err: f64,
-    tbl_row0: f64,
-    tbl_col0: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct OracleResponse {
     mvn: Vec<MvnOracleResponse>,
     mvt: Vec<MvtOracleResponse>,
@@ -339,7 +360,6 @@ struct OracleResponse {
     nig: Vec<NormalInverseGammaOracleResponse>,
     multinomial: Vec<MultinomialOracleResponse>,
     dirichlet_multinomial: Vec<DirichletMultinomialOracleResponse>,
-    random_generators: Vec<RandomGeneratorOracleResponse>,
 }
 
 fn run_python_oracle(query: &OracleQuery) -> Option<OracleResponse> {
@@ -363,7 +383,6 @@ out = {
     "nig": [],
     "multinomial": [],
     "dirichlet_multinomial": [],
-    "random_generators": [],
 }
 
 for c in query["mvn_cases"]:
@@ -578,43 +597,6 @@ for c in query["dirichlet_multinomial_cases"]:
         "cov": cov_mat,
     })
 
-for c in query.get("random_generator_cases", []):
-    cid = c["case_id"]
-    dim = int(c["dim"])
-    q = stats.ortho_group.rvs(dim, random_state=42)
-    q_ortho = float(np.max(np.abs(q @ q.T - np.eye(dim))))
-    q_det = float(np.abs(np.linalg.det(q)))
-
-    so = stats.special_ortho_group.rvs(dim, random_state=42)
-    so_det = float(np.linalg.det(so))
-
-    u = stats.unitary_group.rvs(dim, random_state=42)
-    u_unitarity = float(np.max(np.abs(u @ u.conj().T - np.eye(dim))))
-
-    v = stats.uniform_direction.rvs(dim, random_state=42)
-    v_norm = float(np.linalg.norm(v))
-
-    eigs = np.linspace(1.5, 0.5, dim)
-    eigs = eigs * (dim / np.sum(eigs))
-    r_corr = stats.random_correlation.rvs(eigs, random_state=42)
-    r_diag_err = float(np.max(np.abs(np.diag(r_corr) - 1.0)))
-
-    tbl = stats.random_table.rvs([10 * dim, 20 * dim], [15 * dim, 15 * dim], random_state=42)
-    tbl_row0 = int(np.sum(tbl[0]))
-    tbl_col0 = int(np.sum(tbl[:, 0]))
-
-    out["random_generators"].append({
-        "case_id": cid,
-        "q_ortho_err": q_ortho,
-        "q_det": q_det,
-        "so_det": so_det,
-        "u_unitarity_err": u_unitarity,
-        "v_norm": v_norm,
-        "corr_diag_err": r_diag_err,
-        "tbl_row0": float(tbl_row0),
-        "tbl_col0": float(tbl_col0),
-    })
-
 json.dump(out, sys.stdout)
 "#;
 
@@ -640,6 +622,13 @@ json.dump(out, sys.stdout)
     serde_json::from_slice(&output.stdout).ok()
 }
 
+/// Every value the SciPy-oracle test compares: the per-value records for the diff log, and the
+/// compared-case ledger (one arm per distribution family) that counts them.
+struct Checks {
+    records: Vec<DiffRecord>,
+    ledger: CompareLedger,
+}
+
 fn check_pair(
     case_id: &str,
     family: &str,
@@ -647,8 +636,16 @@ fn check_pair(
     scipy_val: f64,
     atol: f64,
     rtol: f64,
-    records: &mut Vec<DiffRecord>,
+    checks: &mut Checks,
 ) {
+    // A non-finite value on either side is recorded by the ledger (and fails `finish` unless
+    // both sides agree on it) instead of reaching the tolerance below.
+    let recorded = checks
+        .ledger
+        .pair(family, case_id, Some(scipy_val), Some(rust_val));
+    let Some((scipy_val, rust_val)) = recorded else {
+        return;
+    };
     let abs_diff = (rust_val - scipy_val).abs();
     let rel_diff = if scipy_val.abs() > 1e-15 {
         abs_diff / scipy_val.abs()
@@ -656,7 +653,8 @@ fn check_pair(
         abs_diff
     };
     let pass = abs_diff <= atol || rel_diff <= rtol;
-    records.push(DiffRecord {
+    checks.ledger.compared(family, case_id, pass);
+    checks.records.push(DiffRecord {
         case_id: case_id.to_string(),
         family: family.to_string(),
         rust_val,
@@ -941,21 +939,6 @@ fn diff_multivariate_stats_scipy_oracle() {
         },
     ];
 
-    let random_generator_cases = vec![
-        RandomGeneratorCase {
-            case_id: "random_gen_2d".into(),
-            dim: 2,
-        },
-        RandomGeneratorCase {
-            case_id: "random_gen_3d".into(),
-            dim: 3,
-        },
-        RandomGeneratorCase {
-            case_id: "random_gen_4d".into(),
-            dim: 4,
-        },
-    ];
-
     let query = OracleQuery {
         mvn_cases: mvn_cases.clone(),
         mvt_cases: mvt_cases.clone(),
@@ -969,7 +952,6 @@ fn diff_multivariate_stats_scipy_oracle() {
         nig_cases: nig_cases.clone(),
         multinomial_cases: multinomial_cases.clone(),
         dirichlet_multinomial_cases: dirichlet_multinomial_cases.clone(),
-        random_generator_cases: random_generator_cases.clone(),
     };
 
     let oracle_opt = run_python_oracle(&query);
@@ -981,8 +963,44 @@ fn diff_multivariate_stats_scipy_oracle() {
         return;
     }
     let oracle = oracle_opt.unwrap();
+    // Every family loop below zips cases with oracle rows; a short oracle list would
+    // truncate the zip and silently drop cases.
+    assert_eq!(oracle.mvn.len(), query.mvn_cases.len());
+    assert_eq!(oracle.mvt.len(), query.mvt_cases.len());
+    assert_eq!(oracle.wishart.len(), query.wishart_cases.len());
+    assert_eq!(oracle.invwishart.len(), query.invwishart_cases.len());
+    assert_eq!(oracle.matrix_normal.len(), query.matrix_normal_cases.len());
+    assert_eq!(oracle.matrix_t.len(), query.matrix_t_cases.len());
+    assert_eq!(oracle.vmf.len(), query.vmf_cases.len());
+    assert_eq!(oracle.dirichlet.len(), query.dirichlet_cases.len());
+    assert_eq!(oracle.mhypergeom.len(), query.mhypergeom_cases.len());
+    assert_eq!(oracle.nig.len(), query.nig_cases.len());
+    assert_eq!(oracle.multinomial.len(), query.multinomial_cases.len());
+    assert_eq!(
+        oracle.dirichlet_multinomial.len(),
+        query.dirichlet_multinomial_cases.len()
+    );
 
-    let mut records = Vec::new();
+    let mut checks = Checks {
+        records: Vec::new(),
+        ledger: CompareLedger::new(
+            "diff_multivariate_stats_scipy_oracle",
+            &[
+                "MultivariateNormal",
+                "MultivariateT",
+                "Wishart",
+                "InvWishart",
+                "MatrixNormal",
+                "MatrixT",
+                "VonMisesFisher",
+                "Dirichlet",
+                "MultivariateHypergeom",
+                "NormalInverseGamma",
+                "Multinomial",
+                "DirichletMultinomial",
+            ],
+        ),
+    };
 
     // Test MultivariateNormal
     for (case, resp) in mvn_cases.iter().zip(oracle.mvn.iter()) {
@@ -997,18 +1015,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_pdf,
             resp.pdf,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "MultivariateNormal",
             rust_logpdf,
             resp.logpdf,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // entropy
@@ -1018,9 +1036,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_entropy,
             resp.entropy,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // mahalanobis squared
@@ -1030,9 +1048,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_maha_sq,
             resp.mahalanobis_sq,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         let rust_maha = dist.mahalanobis(&case.x).expect("mvn maha");
         check_pair(
@@ -1040,9 +1058,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_maha,
             resp.mahalanobis_sq.sqrt(),
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // Test from_covariance parity
@@ -1052,9 +1070,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dim(), dist_from_cov.dim());
         assert_eq!(dist.mean(), dist_from_cov.mean());
         assert_eq!(dist.cov(), dist_from_cov.cov());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1071,18 +1090,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateT",
             rust_pdf,
             resp.pdf,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "MultivariateT",
             rust_logpdf,
             resp.logpdf,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // mahalanobis squared
@@ -1092,9 +1111,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateT",
             rust_maha_sq,
             resp.mahalanobis_sq,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // cov check
@@ -1105,11 +1124,17 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "MultivariateT",
                 rust_cov[0][0],
                 scipy_c00,
-                1e-11,
-                1e-10,
-                &mut records,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
+                &mut checks,
             );
         } else {
+            // The oracle documents no covariance for df <= 2; fsci must refuse too.
+            checks.ledger.expected_raise(
+                "MultivariateT",
+                &format!("{}_cov_00", case.case_id),
+                dist.cov().is_none(),
+            );
             assert!(dist.cov().is_none(), "mvt cov must be None for df <= 2");
         }
 
@@ -1122,7 +1147,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.shape(), dist_from_cov.shape());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1139,18 +1165,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "Wishart",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         // entropy
@@ -1160,9 +1186,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_entropy,
             resp.entropy,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         // mean
@@ -1172,9 +1198,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_mean[0][0],
             resp.mean_00,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // c and C accessors
@@ -1185,18 +1211,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_chol[0][0],
             resp.chol_00,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_chol_10", case.case_id),
             "Wishart",
             rust_chol[1][0],
             resp.chol_10,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // Test from_covariance parity
@@ -1205,9 +1231,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dim(), dist_from_cov.dim());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert_eq!(dist.scale(), dist_from_cov.scale());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1224,18 +1251,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "InvWishart",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         // mean
@@ -1246,9 +1273,15 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "InvWishart",
                 rust_mean[0][0],
                 scipy_m00,
-                1e-11,
-                1e-10,
-                &mut records,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
+                &mut checks,
+            );
+        } else {
+            checks.ledger.oracle_missing(
+                "InvWishart",
+                &format!("{}_mean_00", case.case_id),
+                "oracle gives no mean for df <= p + 1",
             );
         }
 
@@ -1260,18 +1293,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_chol[0][0],
             resp.chol_00,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_chol_10", case.case_id),
             "InvWishart",
             rust_chol[1][0],
             resp.chol_10,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // Test from_covariance parity
@@ -1282,7 +1315,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.df(), dist_from_cov.df());
         assert_eq!(dist.scale(), dist_from_cov.scale());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1304,18 +1338,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixNormal",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "MatrixNormal",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         let rust_entropy = dist.entropy();
@@ -1324,9 +1358,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixNormal",
             rust_entropy,
             resp.entropy,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         // from_covariance
@@ -1335,9 +1369,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         let dist_from_cov =
             MatrixNormal::from_covariance(&case.mean, &cov_u, &cov_v).expect("from_covariance");
         assert_eq!(dist.dims(), dist_from_cov.dims());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
 
         // rvs differential test
@@ -1365,9 +1400,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MatrixNormal",
                     m_est,
                     case.mean[r][c],
-                    0.25,
-                    0.25,
-                    &mut records,
+                    RVS_MEAN_TOL,
+                    RVS_MEAN_TOL,
+                    &mut checks,
                 );
             }
         }
@@ -1392,18 +1427,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixT",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "MatrixT",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         // from_covariance
@@ -1414,7 +1449,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dims(), dist_from_cov.dims());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
 
         // rvs differential test
@@ -1442,9 +1478,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MatrixT",
                     m_est,
                     case.mean[r][c],
-                    0.35,
-                    0.35,
-                    &mut records,
+                    MATRIX_T_RVS_MEAN_TOL,
+                    MATRIX_T_RVS_MEAN_TOL,
+                    &mut checks,
                 );
             }
         }
@@ -1466,18 +1502,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "VonMisesFisher",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         let rust_entropy = dist.entropy();
@@ -1486,9 +1522,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             rust_entropy,
             resp.entropy,
-            1e-9,
-            1e-8,
-            &mut records,
+            SERIES_ENTROPY_ABS_TOL,
+            SERIES_ENTROPY_REL_TOL,
+            &mut checks,
         );
 
         // rvs differential test
@@ -1510,9 +1546,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             max_norm_err,
             resp.rvs_norm_err,
-            1e-9,
-            1e-9,
-            &mut records,
+            UNIT_NORM_ERR_TOL,
+            UNIT_NORM_ERR_TOL,
+            &mut checks,
         );
         let dot_mu: f64 = mean_dir.iter().zip(&case.mu).map(|(&d, &m)| d * m).sum();
         assert!(dot_mu > 0.0, "vmf sample mean aligns with concentration mu");
@@ -1532,44 +1568,60 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Dirichlet",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "Dirichlet",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
+        // slices records a length mismatch (which a zip would truncate) before the
+        // element-wise comparison.
         let rust_mean = dist.mean();
-        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
-            check_pair(
-                &format!("{}_mean_{k}", case.case_id),
-                "Dirichlet",
-                rm,
-                sm,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_mean, rust_mean)) = checks.ledger.slices(
+            "Dirichlet",
+            &format!("{}_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(rust_mean.as_slice()),
+        ) {
+            for (k, (&rm, &sm)) in rust_mean.iter().zip(scipy_mean).enumerate() {
+                check_pair(
+                    &format!("{}_mean_{k}", case.case_id),
+                    "Dirichlet",
+                    rm,
+                    sm,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_var = dist.var();
-        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
-            check_pair(
-                &format!("{}_var_{k}", case.case_id),
-                "Dirichlet",
-                rv,
-                sv,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_var, rust_var)) = checks.ledger.slices(
+            "Dirichlet",
+            &format!("{}_var", case.case_id),
+            Some(resp.var.as_slice()),
+            Some(rust_var.as_slice()),
+        ) {
+            for (k, (&rv, &sv)) in rust_var.iter().zip(scipy_var).enumerate() {
+                check_pair(
+                    &format!("{}_var_{k}", case.case_id),
+                    "Dirichlet",
+                    rv,
+                    sv,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_cov = dist.cov();
@@ -1580,9 +1632,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "Dirichlet",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
-                    &mut records,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
                 );
             }
         }
@@ -1605,44 +1657,60 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateHypergeom",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpmf", case.case_id),
             "MultivariateHypergeom",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
+        // slices records a length mismatch (which a zip would truncate) before the
+        // element-wise comparison.
         let rust_mean = dist.mean();
-        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
-            check_pair(
-                &format!("{}_mean_{k}", case.case_id),
-                "MultivariateHypergeom",
-                rm,
-                sm,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_mean, rust_mean)) = checks.ledger.slices(
+            "MultivariateHypergeom",
+            &format!("{}_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(rust_mean.as_slice()),
+        ) {
+            for (k, (&rm, &sm)) in rust_mean.iter().zip(scipy_mean).enumerate() {
+                check_pair(
+                    &format!("{}_mean_{k}", case.case_id),
+                    "MultivariateHypergeom",
+                    rm,
+                    sm,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_var = dist.var();
-        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
-            check_pair(
-                &format!("{}_var_{k}", case.case_id),
-                "MultivariateHypergeom",
-                rv,
-                sv,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_var, rust_var)) = checks.ledger.slices(
+            "MultivariateHypergeom",
+            &format!("{}_var", case.case_id),
+            Some(resp.var.as_slice()),
+            Some(rust_var.as_slice()),
+        ) {
+            for (k, (&rv, &sv)) in rust_var.iter().zip(scipy_var).enumerate() {
+                check_pair(
+                    &format!("{}_var_{k}", case.case_id),
+                    "MultivariateHypergeom",
+                    rv,
+                    sv,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_cov = dist.cov();
@@ -1653,9 +1721,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MultivariateHypergeom",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
-                    &mut records,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
                 );
             }
         }
@@ -1678,17 +1746,24 @@ fn diff_multivariate_stats_scipy_oracle() {
                 sample_sum[idx] += v as f64;
             }
         }
-        for (k, (&sm, &exp_m)) in sample_sum.iter().zip(&resp.mean).enumerate() {
-            let m_est = sm / 1000.0;
-            check_pair(
-                &format!("{}_rvs_mean_{k}", case.case_id),
-                "MultivariateHypergeom",
-                m_est,
-                exp_m,
-                0.2,
-                0.2,
-                &mut records,
-            );
+        if let Some((scipy_mean, sample_sum)) = checks.ledger.slices(
+            "MultivariateHypergeom",
+            &format!("{}_rvs_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(sample_sum.as_slice()),
+        ) {
+            for (k, (&sm, &exp_m)) in sample_sum.iter().zip(scipy_mean).enumerate() {
+                let m_est = sm / 1000.0;
+                check_pair(
+                    &format!("{}_rvs_mean_{k}", case.case_id),
+                    "MultivariateHypergeom",
+                    m_est,
+                    exp_m,
+                    MVHYPERGEOM_RVS_MEAN_TOL,
+                    MVHYPERGEOM_RVS_MEAN_TOL,
+                    &mut checks,
+                );
+            }
         }
     }
 
@@ -1709,18 +1784,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpdf", case.case_id),
             "NormalInverseGamma",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
         let (mean_x, mean_s2) = dist.mean();
@@ -1729,18 +1804,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             mean_x,
             resp.mean_x,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_mean_s2", case.case_id),
             "NormalInverseGamma",
             mean_s2,
             resp.mean_s2,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         let (var_x, var_s2) = dist.var();
@@ -1749,18 +1824,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             var_x,
             resp.var_x,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_var_s2", case.case_id),
             "NormalInverseGamma",
             var_s2,
             resp.var_s2,
-            1e-11,
-            1e-10,
-            &mut records,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
+            &mut checks,
         );
 
         // rvs differential test
@@ -1785,18 +1860,18 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             est_mean_x,
             resp.mean_x,
-            0.25,
-            0.25,
-            &mut records,
+            RVS_MEAN_TOL,
+            RVS_MEAN_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_rvs_mean_s2", case.case_id),
             "NormalInverseGamma",
             est_mean_s2,
             resp.mean_s2,
-            0.25,
-            0.25,
-            &mut records,
+            RVS_MEAN_TOL,
+            RVS_MEAN_TOL,
+            &mut checks,
         );
     }
 
@@ -1816,31 +1891,40 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Multinomial",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpmf", case.case_id),
             "Multinomial",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
+        // slices records a length mismatch (which a zip would truncate) before the
+        // element-wise comparison.
         let rust_mean = dist.mean();
-        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
-            check_pair(
-                &format!("{}_mean_{k}", case.case_id),
-                "Multinomial",
-                rm,
-                sm,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_mean, rust_mean)) = checks.ledger.slices(
+            "Multinomial",
+            &format!("{}_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(rust_mean.as_slice()),
+        ) {
+            for (k, (&rm, &sm)) in rust_mean.iter().zip(scipy_mean).enumerate() {
+                check_pair(
+                    &format!("{}_mean_{k}", case.case_id),
+                    "Multinomial",
+                    rm,
+                    sm,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_cov = dist.cov();
@@ -1851,9 +1935,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "Multinomial",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
-                    &mut records,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
                 );
             }
         }
@@ -1865,9 +1949,9 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Multinomial",
                 rv,
                 resp.cov[k][k],
-                1e-11,
-                1e-10,
-                &mut records,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
+                &mut checks,
             );
         }
 
@@ -1877,9 +1961,9 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Multinomial",
             rust_entropy,
             resp.entropy,
-            1e-9,
-            1e-8,
-            &mut records,
+            SERIES_ENTROPY_ABS_TOL,
+            SERIES_ENTROPY_REL_TOL,
+            &mut checks,
         );
 
         // rvs differential test
@@ -1897,17 +1981,24 @@ fn diff_multivariate_stats_scipy_oracle() {
                 sample_sum[idx] += v as f64;
             }
         }
-        for (k, (&sm, &exp_m)) in sample_sum.iter().zip(&resp.mean).enumerate() {
-            let m_est = sm / 1500.0;
-            check_pair(
-                &format!("{}_rvs_mean_{k}", case.case_id),
-                "Multinomial",
-                m_est,
-                exp_m,
-                0.25,
-                0.25,
-                &mut records,
-            );
+        if let Some((scipy_mean, sample_sum)) = checks.ledger.slices(
+            "Multinomial",
+            &format!("{}_rvs_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(sample_sum.as_slice()),
+        ) {
+            for (k, (&sm, &exp_m)) in sample_sum.iter().zip(scipy_mean).enumerate() {
+                let m_est = sm / 1500.0;
+                check_pair(
+                    &format!("{}_rvs_mean_{k}", case.case_id),
+                    "Multinomial",
+                    m_est,
+                    exp_m,
+                    RVS_MEAN_TOL,
+                    RVS_MEAN_TOL,
+                    &mut checks,
+                );
+            }
         }
     }
 
@@ -1930,44 +2021,60 @@ fn diff_multivariate_stats_scipy_oracle() {
             "DirichletMultinomial",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
         check_pair(
             &format!("{}_logpmf", case.case_id),
             "DirichletMultinomial",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
-            &mut records,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
+            &mut checks,
         );
 
+        // slices records a length mismatch (which a zip would truncate) before the
+        // element-wise comparison.
         let rust_mean = dist.mean();
-        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
-            check_pair(
-                &format!("{}_mean_{k}", case.case_id),
-                "DirichletMultinomial",
-                rm,
-                sm,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_mean, rust_mean)) = checks.ledger.slices(
+            "DirichletMultinomial",
+            &format!("{}_mean", case.case_id),
+            Some(resp.mean.as_slice()),
+            Some(rust_mean.as_slice()),
+        ) {
+            for (k, (&rm, &sm)) in rust_mean.iter().zip(scipy_mean).enumerate() {
+                check_pair(
+                    &format!("{}_mean_{k}", case.case_id),
+                    "DirichletMultinomial",
+                    rm,
+                    sm,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_var = dist.var();
-        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
-            check_pair(
-                &format!("{}_var_{k}", case.case_id),
-                "DirichletMultinomial",
-                rv,
-                sv,
-                1e-11,
-                1e-10,
-                &mut records,
-            );
+        if let Some((scipy_var, rust_var)) = checks.ledger.slices(
+            "DirichletMultinomial",
+            &format!("{}_var", case.case_id),
+            Some(resp.var.as_slice()),
+            Some(rust_var.as_slice()),
+        ) {
+            for (k, (&rv, &sv)) in rust_var.iter().zip(scipy_var).enumerate() {
+                check_pair(
+                    &format!("{}_var_{k}", case.case_id),
+                    "DirichletMultinomial",
+                    rv,
+                    sv,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
+                );
+            }
         }
 
         let rust_cov = dist.cov();
@@ -1978,159 +2085,622 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "DirichletMultinomial",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
-                    &mut records,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
+                    &mut checks,
                 );
             }
         }
     }
 
-    // Test Random Matrix & Direction Generators
-    for (case, resp) in random_generator_cases
-        .iter()
-        .zip(oracle.random_generators.iter())
-    {
-        assert_eq!(case.case_id, resp.case_id);
-        let n = case.dim;
-        let mut rng = StdRng::seed_from_u64(42);
-
-        // ortho_group
-        let q = ortho_group::rvs_with_rng(n, &mut rng);
-        let mut max_ortho_err = 0.0_f64;
-        for i in 0..n {
-            for j in 0..n {
-                let dot: f64 = (0..n).map(|k| q[i][k] * q[j][k]).sum();
-                let expected = if i == j { 1.0 } else { 0.0 };
-                max_ortho_err = max_ortho_err.max((dot - expected).abs());
-            }
-        }
-        assert!(max_ortho_err < 1e-10, "rust ortho_group orthonormality");
-        assert!(resp.q_ortho_err < 1e-10, "scipy ortho_group orthonormality");
-        check_pair(
-            &format!("{}_q_det", case.case_id),
-            "ortho_group",
-            1.0,
-            resp.q_det,
-            1e-8,
-            1e-7,
-            &mut records,
-        );
-
-        // special_ortho_group
-        let _so = special_ortho_group::rvs_with_rng(n, &mut rng);
-        assert!((resp.so_det - 1.0).abs() < 1e-8, "scipy SO(N) det is 1.0");
-        check_pair(
-            &format!("{}_so_det", case.case_id),
-            "special_ortho_group",
-            1.0,
-            resp.so_det,
-            1e-8,
-            1e-7,
-            &mut records,
-        );
-
-        // unitary_group
-        let u = unitary_group::rvs_with_rng(n, &mut rng);
-        let mut max_unit_err = 0.0_f64;
-        for i in 0..n {
-            for j in 0..n {
-                let mut re_dot = 0.0;
-                let mut im_dot = 0.0;
-                for k in 0..n {
-                    let (u_ik_re, u_ik_im) = u[i][k];
-                    let (u_jk_re, u_jk_im) = u[j][k];
-                    re_dot += u_ik_re * u_jk_re + u_ik_im * u_jk_im;
-                    im_dot += u_ik_im * u_jk_re - u_ik_re * u_jk_im;
-                }
-                let expected_re = if i == j { 1.0 } else { 0.0 };
-                max_unit_err = max_unit_err.max((re_dot - expected_re).abs().max(im_dot.abs()));
-            }
-        }
-        assert!(max_unit_err < 1e-10, "rust unitary_group unitarity");
-        assert!(
-            resp.u_unitarity_err < 1e-10,
-            "scipy unitary_group unitarity"
-        );
-
-        // uniform_direction
-        let v = uniform_direction::rvs_with_rng(n, &mut rng);
-        let rust_v_norm: f64 = v.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        check_pair(
-            &format!("{}_v_norm", case.case_id),
-            "uniform_direction",
-            rust_v_norm,
-            resp.v_norm,
-            1e-11,
-            1e-10,
-            &mut records,
-        );
-
-        // random_correlation
-        let mut eigs = Vec::with_capacity(n);
-        let sum_raw: f64 = (0..n)
-            .map(|i| 1.5 - i as f64 * (1.0 / (n as f64 - 1.0).max(1.0)))
-            .sum();
-        for i in 0..n {
-            let val = 1.5 - i as f64 * (1.0 / (n as f64 - 1.0).max(1.0));
-            eigs.push(val * (n as f64 / sum_raw));
-        }
-        let r_corr = random_correlation::rvs_with_rng(&eigs, &mut rng);
-        let mut max_diag_err = 0.0_f64;
-        for i in 0..n {
-            max_diag_err = max_diag_err.max((r_corr[i][i] - 1.0).abs());
-        }
-        assert!(max_diag_err < 1e-7, "rust random_correlation diag is 1.0");
-        assert!(
-            resp.corr_diag_err < 1e-7,
-            "scipy random_correlation diag is 1.0"
-        );
-
-        // random_table
-        let rows = vec![10 * n, 20 * n];
-        let cols = vec![15 * n, 15 * n];
-        let tbl = random_table::rvs_with_rng(&rows, &cols, &mut rng);
-        let rust_row0: usize = tbl[0].iter().sum();
-        let rust_col0: usize = (0..rows.len()).map(|i| tbl[i][0]).sum();
-        check_pair(
-            &format!("{}_tbl_row0", case.case_id),
-            "random_table",
-            rust_row0 as f64,
-            resp.tbl_row0,
-            1e-12,
-            1e-12,
-            &mut records,
-        );
-        check_pair(
-            &format!("{}_tbl_col0", case.case_id),
-            "random_table",
-            rust_col0 as f64,
-            resp.tbl_col0,
-            1e-12,
-            1e-12,
-            &mut records,
-        );
-    }
+    // The random matrix / direction / table generators are compared distributionally in
+    // `diff_random_generators_match_scipys_distributions` below (frankenscipy-olv0j.9).
 
     let duration_ns = t0.elapsed().as_nanos();
-    let max_abs_diff = records.iter().map(|r| r.abs_diff).fold(0.0_f64, f64::max);
-    let max_rel_diff = records.iter().map(|r| r.rel_diff).fold(0.0_f64, f64::max);
-    let all_pass = records.iter().all(|r| r.pass);
+    // Log summaries only: a NaN residual never reaches `records`, the ledger holds it.
+    let max_abs_diff = checks
+        .records
+        .iter()
+        .map(|r| r.abs_diff)
+        .fold(0.0_f64, f64::max);
+    let max_rel_diff = checks
+        .records
+        .iter()
+        .map(|r| r.rel_diff)
+        .fold(0.0_f64, f64::max);
+    let all_pass = checks.records.iter().all(|r| r.pass);
 
     let log = DiffLog {
         test_id: "diff_stats_multivariate".into(),
         category: "stats.multivariate_distributions".into(),
-        case_count: records.len(),
+        case_count: checks.records.len(),
+        compared: checks.ledger.counts().clone(),
         max_abs_diff,
         max_rel_diff,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns,
-        records,
+        records: checks.records,
     };
     emit_log(&log);
     assert!(
         all_pass,
         "all multivariate differential test cases must pass"
     );
+    // Every family compares several values per case; the smallest case list is the floor
+    // each family arm must reach.
+    checks.ledger.finish(
+        [
+            query.mvn_cases.len(),
+            query.mvt_cases.len(),
+            query.wishart_cases.len(),
+            query.invwishart_cases.len(),
+            query.matrix_normal_cases.len(),
+            query.matrix_t_cases.len(),
+            query.vmf_cases.len(),
+            query.dirichlet_cases.len(),
+            query.mhypergeom_cases.len(),
+            query.nig_cases.len(),
+            query.multinomial_cases.len(),
+            query.dirichlet_multinomial_cases.len(),
+        ]
+        .into_iter()
+        .min()
+        .expect("twelve families"),
+    );
+}
+
+// ── Random generators, compared by distribution (frankenscipy-olv0j.9) ──────────────────
+//
+// These generators draw from different RNG streams than SciPy's, so no single sample can
+// be compared. They used to be "compared" by checks the identity matrix passes (orthogonal,
+// unit norm, unit diagonal) and by a literal 1.0 held against SciPy's |det|; the stubs that
+// returned I, a zero table and a constant survived them for a week. Here each generator's
+// marginals are held against a large SciPy sample with a two-sample Kolmogorov-Smirnov
+// test, the invariants are checked on fsci's OWN samples, and every detector is shown to
+// reject the old stub's output (the must-miss arm).
+
+/// Draws per generator per dimension, on each side.
+const GENERATOR_DRAWS: usize = 4000;
+/// Two-sample KS rejection level per comparison. There are about 26 statistical checks per
+/// run, so a correct generator fails a run with probability below 1e-6.
+const KS_ALPHA: f64 = 2.5e-8;
+/// |z| bound for the det-sign balance and the mean tests (two-sided p about 4e-8).
+const Z_BOUND: f64 = 5.5;
+/// A correlation matrix with the requested spectrum has ||R||_F^2 = sum(eig^2), relative.
+const SPECTRUM_FROBENIUS_TOL: f64 = 1e-9;
+/// |R[0,1]| below this is a structural zero's rounding residue (see the random_correlation
+/// comparison). In 20000 SciPy draws the residues run from 1e-19 to 1.7e-12 and every other
+/// value is at least 1e-3, with nothing in between, so the cut sits inside that gap.
+const STRUCTURAL_ZERO_SNAP: f64 = 1e-9;
+
+#[derive(Debug, Deserialize)]
+struct GeneratorSamples {
+    q00: Vec<f64>,
+    so00: Vec<f64>,
+    u00_abs2: Vec<f64>,
+    u00_arg: Vec<f64>,
+    v0: Vec<f64>,
+    r01: Vec<f64>,
+    t00: Vec<f64>,
+}
+
+fn scipy_generator_samples(
+    dims: &[usize],
+    eigs: &[Vec<f64>],
+) -> Option<std::collections::BTreeMap<String, GeneratorSamples>> {
+    let script = r#"
+import json, sys
+import numpy as np
+from scipy import stats
+q = json.load(sys.stdin)
+n = q["draws"]
+out = {}
+for dim, eigs in zip(q["dims"], q["eigs"]):
+    rng = np.random.default_rng(20260925 + dim)
+    o = stats.ortho_group.rvs(dim, size=n, random_state=rng)
+    so = stats.special_ortho_group.rvs(dim, size=n, random_state=rng)
+    u = stats.unitary_group.rvs(dim, size=n, random_state=rng)
+    v = stats.uniform_direction.rvs(dim, size=n, random_state=rng)
+    eigs = np.array(eigs)
+    r01 = [float(stats.random_correlation.rvs(eigs, random_state=rng)[0, 1]) for _ in range(n)]
+    t = stats.random_table.rvs([10 * dim, 20 * dim], [15 * dim, 15 * dim], size=n,
+                               random_state=rng)
+    out[str(dim)] = {
+        "q00": o[:, 0, 0].tolist(),
+        "so00": so[:, 0, 0].tolist(),
+        "u00_abs2": (np.abs(u[:, 0, 0]) ** 2).tolist(),
+        "u00_arg": np.angle(u[:, 0, 0]).tolist(),
+        "v0": v[:, 0].tolist(),
+        "r01": r01,
+        "t00": t[:, 0, 0].astype(float).tolist(),
+    }
+json.dump(out, sys.stdout)
+"#;
+    let query = serde_json::json!({ "draws": GENERATOR_DRAWS, "dims": dims, "eigs": eigs });
+    let mut child = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "failed to spawn the generator oracle: {e}"
+            );
+            return None;
+        }
+    };
+    child
+        .stdin
+        .as_mut()
+        .expect("oracle stdin")
+        .write_all(query.to_string().as_bytes())
+        .expect("write generator query");
+    let output = child
+        .wait_with_output()
+        .expect("wait for the generator oracle");
+    if !output.status.success() {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "generator oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    Some(serde_json::from_slice(&output.stdout).expect("parse generator oracle JSON"))
+}
+
+/// Two-sample Kolmogorov-Smirnov statistic, correct under ties (both ECDFs are advanced past
+/// every copy of a value before they are compared).
+fn ks_statistic(a: &[f64], b: &[f64]) -> f64 {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort_by(f64::total_cmp);
+    b.sort_by(f64::total_cmp);
+    let (na, nb) = (a.len() as f64, b.len() as f64);
+    let (mut i, mut j, mut d) = (0usize, 0usize, 0.0_f64);
+    while i < a.len() && j < b.len() {
+        let x = a[i].min(b[j]);
+        while i < a.len() && a[i] <= x {
+            i += 1;
+        }
+        while j < b.len() && b[j] <= x {
+            j += 1;
+        }
+        d = d.max((i as f64 / na - j as f64 / nb).abs());
+    }
+    d
+}
+
+/// The asymptotic two-sample KS critical value at `KS_ALPHA`.
+fn ks_critical(na: usize, nb: usize) -> f64 {
+    let (na, nb) = (na as f64, nb as f64);
+    (-(KS_ALPHA / 2.0).ln() / 2.0).sqrt() * ((na + nb) / (na * nb)).sqrt()
+}
+
+/// The 10th, 50th and 90th percentiles, rounded, for the log.
+fn deciles(v: &[f64]) -> [f64; 3] {
+    if v.is_empty() {
+        return [f64::NAN; 3];
+    }
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    let at = |q: f64| {
+        let x = s[((s.len() - 1) as f64 * q).round() as usize];
+        (x * 1e4).round() / 1e4
+    };
+    [at(0.1), at(0.5), at(0.9)]
+}
+
+fn ks_rejects(a: &[f64], b: &[f64]) -> bool {
+    ks_statistic(a, b) > ks_critical(a.len(), b.len())
+}
+
+/// Determinant by Gaussian elimination with partial pivoting.
+fn det(m: &[Vec<f64>]) -> f64 {
+    let n = m.len();
+    let mut a: Vec<Vec<f64>> = m.to_vec();
+    let mut product = 1.0;
+    for col in 0..n {
+        let pivot = (col..n)
+            .max_by(|&x, &y| a[x][col].abs().total_cmp(&a[y][col].abs()))
+            .expect("non-empty column");
+        if a[pivot][col] == 0.0 {
+            return 0.0;
+        }
+        if pivot != col {
+            a.swap(pivot, col);
+            product = -product;
+        }
+        product *= a[col][col];
+        for row in col + 1..n {
+            let factor = a[row][col] / a[col][col];
+            for k in col..n {
+                a[row][k] -= factor * a[col][k];
+            }
+        }
+    }
+    product
+}
+
+fn max_orthonormality_error(q: &[Vec<f64>]) -> f64 {
+    let n = q.len();
+    let mut worst = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            let dot: f64 = (0..n).map(|k| q[i][k] * q[j][k]).sum();
+            worst = worst.max((dot - f64::from(u8::from(i == j))).abs());
+        }
+    }
+    worst
+}
+
+fn max_unitarity_error(u: &[Vec<(f64, f64)>]) -> f64 {
+    let n = u.len();
+    let mut worst = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            let (mut re, mut im) = (0.0, 0.0);
+            for k in 0..n {
+                let (a_re, a_im) = u[i][k];
+                let (b_re, b_im) = u[j][k];
+                re += a_re * b_re + a_im * b_im;
+                im += a_im * b_re - a_re * b_im;
+            }
+            worst = worst.max((re - f64::from(u8::from(i == j))).abs().max(im.abs()));
+        }
+    }
+    worst
+}
+
+/// |z| of `successes` out of `n` Bernoulli(1/2) trials.
+fn sign_balance_z(successes: usize, n: usize) -> f64 {
+    (successes as f64 - n as f64 / 2.0).abs() / (n as f64 / 4.0).sqrt()
+}
+
+fn margins_are(table: &[Vec<usize>], rows: &[usize], cols: &[usize]) -> bool {
+    table.len() == rows.len()
+        && table
+            .iter()
+            .zip(rows)
+            .all(|(row, &r)| row.len() == cols.len() && row.iter().sum::<usize>() == r)
+        && (0..cols.len()).all(|c| table.iter().map(|row| row[c]).sum::<usize>() == cols[c])
+}
+
+fn frobenius_matches_spectrum(r: &[Vec<f64>], eigs: &[f64]) -> bool {
+    let frob: f64 = r.iter().flatten().map(|v| v * v).sum();
+    let spectrum: f64 = eigs.iter().map(|e| e * e).sum();
+    (frob - spectrum).abs() <= SPECTRUM_FROBENIUS_TOL * spectrum
+}
+
+#[test]
+fn diff_random_generators_match_scipys_distributions() {
+    let dims = [3usize, 5];
+    // SciPy's own example spectrum shape: linspace(1.5, 0.5) rescaled to sum to dim.
+    let eigs: Vec<Vec<f64>> = dims
+        .iter()
+        .map(|&n| {
+            let raw: Vec<f64> = (0..n).map(|i| 1.5 - i as f64 / (n as f64 - 1.0)).collect();
+            let sum: f64 = raw.iter().sum();
+            raw.iter().map(|v| v * n as f64 / sum).collect()
+        })
+        .collect();
+    let Some(scipy) = scipy_generator_samples(&dims, &eigs) else {
+        return;
+    };
+    let draws = GENERATOR_DRAWS;
+    let mut failures = Vec::new();
+    let mut ks_checks = 0usize;
+    // One arm per KS comparison family; each is compared once per dimension.
+    let mut ledger = CompareLedger::new(
+        "diff_random_generators_match_scipys_distributions",
+        &[
+            "ortho_group",
+            "special_ortho_group",
+            "unitary_group_abs2",
+            "unitary_group_arg",
+            "uniform_direction",
+            "random_correlation",
+            "random_table",
+        ],
+    );
+    let mut ks = |arm: &str,
+                  n: usize,
+                  name: String,
+                  fsci: &[f64],
+                  scipy: &[f64],
+                  failures: &mut Vec<String>| {
+        ks_checks += 1;
+        let case_id = format!("n={n}");
+        // A generator that failed its invariant stops early; a short sample must not pass
+        // (the KS statistic of an empty sample is 0).
+        if fsci.len() != draws || scipy.len() != draws {
+            ledger.compared(arm, &case_id, false);
+            failures.push(format!(
+                "{name}: compared {} fsci and {} SciPy draws, not {draws}",
+                fsci.len(),
+                scipy.len()
+            ));
+            return;
+        }
+        // The invariant checks above read a NaN draw as passing (`f64::max` folds and `>`
+        // comparisons), and the KS ordering would absorb it; slices records a non-finite
+        // fsci draw as an fsci failure. The samples are independent, so only its
+        // finiteness checks apply here: the lengths already match.
+        if ledger
+            .slices(arm, &case_id, Some(scipy), Some(fsci))
+            .is_none()
+        {
+            failures.push(format!("{name}: a non-finite draw"));
+            return;
+        }
+        let (d, crit) = (
+            ks_statistic(fsci, scipy),
+            ks_critical(fsci.len(), scipy.len()),
+        );
+        println!(
+            "{name}: KS D = {d:.4} (critical {crit:.4}); deciles 1/5/9 fsci {:?} scipy {:?}",
+            deciles(fsci),
+            deciles(scipy)
+        );
+        ledger.compared(arm, &case_id, d <= crit);
+        if d > crit {
+            failures.push(format!("{name}: KS D = {d:.4} > {crit:.4}"));
+        }
+    };
+
+    for (&n, eigs) in dims.iter().zip(&eigs) {
+        let s = &scipy[&n.to_string()];
+        let mut rng = StdRng::seed_from_u64(20_260_925 + n as u64);
+
+        // ortho_group: Haar on O(n). det is +1 or -1 with probability 1/2 each.
+        let mut q00 = Vec::with_capacity(draws);
+        let mut positive = 0usize;
+        for _ in 0..draws {
+            let q = ortho_group::rvs_with_rng(n, &mut rng);
+            let d = det(&q);
+            if max_orthonormality_error(&q) > ORTHONORMALITY_TOL
+                || (d.abs() - 1.0).abs() > ORTHO_DET_TOL
+            {
+                failures.push(format!("ortho_group n={n}: not orthogonal (det {d})"));
+                break;
+            }
+            positive += usize::from(d > 0.0);
+            q00.push(q[0][0]);
+        }
+        let z = sign_balance_z(positive, draws);
+        if z > Z_BOUND {
+            failures.push(format!(
+                "ortho_group n={n}: det > 0 in {positive} of {draws} (z = {z:.2})"
+            ));
+        }
+        ks(
+            "ortho_group",
+            n,
+            format!("ortho_group n={n} Q[0,0]"),
+            &q00,
+            &s.q00,
+            &mut failures,
+        );
+
+        // special_ortho_group: Haar on SO(n); every det is +1.
+        let mut so00 = Vec::with_capacity(draws);
+        for _ in 0..draws {
+            let q = special_ortho_group::rvs_with_rng(n, &mut rng);
+            let d = det(&q);
+            if max_orthonormality_error(&q) > ORTHONORMALITY_TOL || (d - 1.0).abs() > ORTHO_DET_TOL
+            {
+                failures.push(format!("special_ortho_group n={n}: det {d}"));
+                break;
+            }
+            so00.push(q[0][0]);
+        }
+        ks(
+            "special_ortho_group",
+            n,
+            format!("special_ortho_group n={n} Q[0,0]"),
+            &so00,
+            &s.so00,
+            &mut failures,
+        );
+
+        // unitary_group: Haar on U(n).
+        let (mut abs2, mut arg) = (Vec::with_capacity(draws), Vec::with_capacity(draws));
+        for _ in 0..draws {
+            let u = unitary_group::rvs_with_rng(n, &mut rng);
+            if max_unitarity_error(&u) > ORTHONORMALITY_TOL {
+                failures.push(format!("unitary_group n={n}: not unitary"));
+                break;
+            }
+            let (re, im) = u[0][0];
+            abs2.push(re * re + im * im);
+            arg.push(im.atan2(re));
+        }
+        ks(
+            "unitary_group_abs2",
+            n,
+            format!("unitary_group n={n} |U[0,0]|^2"),
+            &abs2,
+            &s.u00_abs2,
+            &mut failures,
+        );
+        ks(
+            "unitary_group_arg",
+            n,
+            format!("unitary_group n={n} arg U[0,0]"),
+            &arg,
+            &s.u00_arg,
+            &mut failures,
+        );
+
+        // uniform_direction: uniform on the unit sphere; each coordinate has mean 0 and
+        // variance 1/n.
+        let mut v0 = Vec::with_capacity(draws);
+        let mut sums = vec![0.0_f64; n];
+        for _ in 0..draws {
+            let v = uniform_direction::rvs_with_rng(n, &mut rng);
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if (norm - 1.0).abs() > ORTHONORMALITY_TOL {
+                failures.push(format!("uniform_direction n={n}: norm {norm}"));
+                break;
+            }
+            for (acc, x) in sums.iter_mut().zip(&v) {
+                *acc += x;
+            }
+            v0.push(v[0]);
+        }
+        let se = (1.0 / n as f64 / draws as f64).sqrt();
+        for (i, sum) in sums.iter().enumerate() {
+            let z = (sum / draws as f64).abs() / se;
+            if z > Z_BOUND {
+                failures.push(format!(
+                    "uniform_direction n={n}: coordinate {i} mean z = {z:.2}"
+                ));
+            }
+        }
+        ks(
+            "uniform_direction",
+            n,
+            format!("uniform_direction n={n} v[0]"),
+            &v0,
+            &s.v0,
+            &mut failures,
+        );
+
+        // random_correlation: unit diagonal and the requested spectrum, varying draw to draw.
+        let mut r01 = Vec::with_capacity(draws);
+        for _ in 0..draws {
+            let r = random_correlation::rvs_with_rng(eigs, &mut rng);
+            let diag_ok = (0..n).all(|i| (r[i][i] - 1.0).abs() <= CORRELATION_DIAG_TOL);
+            if !diag_ok || !frobenius_matches_spectrum(&r, eigs) {
+                failures.push(format!(
+                    "random_correlation n={n}: not a correlation matrix with spectrum {eigs:?}"
+                ));
+                break;
+            }
+            r01.push(r[0][1]);
+        }
+        let mut distinct = r01.clone();
+        distinct.sort_by(f64::total_cmp);
+        distinct.dedup();
+        if distinct.len() < draws / 2 {
+            failures.push(format!(
+                "random_correlation n={n}: only {} distinct R[0,1] in {draws} draws",
+                distinct.len()
+            ));
+        }
+        // For n = 3 with this spectrum, R[0,1] is structurally zero in about 59% of draws
+        // (SciPy: 58.6% of 20000 below 1e-11), and the sign of the rounding residue there
+        // is an artifact of each library's arithmetic (SciPy's splits 29.4% / 29.1%).
+        // On raw values KS compares those residue signs, so both samples are snapped to 0
+        // below STRUCTURAL_ZERO_SNAP first: the atom's MASS is still compared, and so is
+        // everything off it.
+        let snap = |v: &[f64]| -> Vec<f64> {
+            v.iter()
+                .map(|&x| {
+                    if x.abs() < STRUCTURAL_ZERO_SNAP {
+                        0.0
+                    } else {
+                        x
+                    }
+                })
+                .collect()
+        };
+        let (fsci_r01, scipy_r01) = (snap(&r01), snap(&s.r01));
+        let atom = |v: &[f64]| v.iter().filter(|&&x| x == 0.0).count() as f64 / v.len() as f64;
+        println!(
+            "random_correlation n={n}: share of R[0,1] at the structural zero, fsci {:.4} scipy {:.4}",
+            atom(&fsci_r01),
+            atom(&scipy_r01)
+        );
+        ks(
+            "random_correlation",
+            n,
+            format!("random_correlation n={n} R[0,1]"),
+            &fsci_r01,
+            &scipy_r01,
+            &mut failures,
+        );
+
+        // random_table: exact margins; T[0,0] is hypergeometric.
+        let rows = [10 * n, 20 * n];
+        let cols = [15 * n, 15 * n];
+        let mut t00 = Vec::with_capacity(draws);
+        for _ in 0..draws {
+            let t = random_table::rvs_with_rng(&rows, &cols, &mut rng);
+            if !margins_are(&t, &rows, &cols) {
+                failures.push(format!("random_table n={n}: margins {t:?}"));
+                break;
+            }
+            t00.push(t[0][0] as f64);
+        }
+        let total = (rows[0] + rows[1]) as f64;
+        let (r0, r1, c0, c1) = (
+            rows[0] as f64,
+            rows[1] as f64,
+            cols[0] as f64,
+            cols[1] as f64,
+        );
+        let mean = r0 * c0 / total;
+        let var = r0 * r1 * c0 * c1 / (total * total * (total - 1.0));
+        let z = (t00.iter().sum::<f64>() / draws as f64 - mean).abs() / (var / draws as f64).sqrt();
+        if z > Z_BOUND {
+            failures.push(format!("random_table n={n}: T[0,0] mean z = {z:.2}"));
+        }
+        ks(
+            "random_table",
+            n,
+            format!("random_table n={n} T[0,0]"),
+            &t00,
+            &s.t00,
+            &mut failures,
+        );
+
+        // Must-miss: each detector rejects the stub output these generators used to return
+        // (identity matrices, the first basis vector, the identity correlation matrix, a zero
+        // table) and, for O(5), a plausible wrong marginal (uniform on [-1, 1], which is the
+        // right marginal only for n = 3).
+        let ones = vec![1.0; draws];
+        let zeros = vec![0.0; draws];
+        let stubs_seen = ks_rejects(&ones, &s.q00)
+            && ks_rejects(&ones, &s.so00)
+            && ks_rejects(&ones, &s.u00_abs2)
+            && ks_rejects(&zeros, &s.u00_arg)
+            && ks_rejects(&ones, &s.v0)
+            && ks_rejects(&zeros, &s.r01)
+            && ks_rejects(&zeros, &s.t00)
+            && sign_balance_z(draws, draws) > Z_BOUND
+            && !margins_are(&[vec![0, 0], vec![0, 0]], &rows, &cols)
+            && !frobenius_matches_spectrum(&identity_rows(n), eigs);
+        assert!(stubs_seen, "n={n}: a detector accepted the old stub output");
+        if n == 5 {
+            let uniform: Vec<f64> = (0..draws)
+                .map(|i| -1.0 + 2.0 * (i as f64 + 0.5) / draws as f64)
+                .collect();
+            assert!(
+                ks_rejects(&uniform, &s.q00),
+                "the O(5) detector accepted uniform[-1, 1] as Haar's Q[0,0] marginal"
+            );
+        }
+    }
+
+    println!("{ks_checks} KS comparisons against SciPy samples of {draws}");
+    println!("compared per arm: {:?}", ledger.counts());
+    assert_eq!(ks_checks, 7 * dims.len(), "a KS comparison was skipped");
+    assert!(
+        failures.is_empty(),
+        "random generators disagree with SciPy's distributions:\n{}",
+        failures.join("\n")
+    );
+    ledger.finish(dims.len());
+}
+
+fn identity_rows(n: usize) -> Vec<Vec<f64>> {
+    (0..n)
+        .map(|i| (0..n).map(|j| f64::from(u8::from(i == j))).collect())
+        .collect()
 }

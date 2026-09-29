@@ -3,7 +3,7 @@
 //!
 //! Tests FrankenSciPy analytic signal functions against SciPy subprocess oracle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::PI;
 use std::fs;
 use std::io::Write;
@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{hilbert, hilbert_envelope};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -339,9 +341,6 @@ print(json.dumps(results))
 }
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| (x - y).abs())
@@ -371,47 +370,49 @@ fn diff_signal_hilbert() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_diff_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_hilbert", &["real", "imag", "envelope"]);
 
     for case in &cases {
         let scipy_result = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
 
-        let (Some(scipy_real), Some(scipy_imag), Some(scipy_env)) = (
-            &scipy_result.real,
-            &scipy_result.imag,
-            &scipy_result.envelope,
-        ) else {
-            continue;
-        };
+        let rust_analytic = hilbert(&case.signal).ok();
+        let rust_real: Option<Vec<f64>> = rust_analytic
+            .as_ref()
+            .map(|a| a.iter().map(|&(r, _)| r).collect());
+        let rust_imag: Option<Vec<f64>> = rust_analytic
+            .as_ref()
+            .map(|a| a.iter().map(|&(_, i)| i).collect());
+        let rust_env = hilbert_envelope(&case.signal).ok();
 
-        let rust_analytic = match hilbert(&case.signal) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let rust_real: Vec<f64> = rust_analytic.iter().map(|&(r, _)| r).collect();
-        let rust_imag: Vec<f64> = rust_analytic.iter().map(|&(_, i)| i).collect();
+        let arms = [
+            ("real", scipy_result.real.as_deref(), rust_real.as_deref()),
+            ("imag", scipy_result.imag.as_deref(), rust_imag.as_deref()),
+            (
+                "envelope",
+                scipy_result.envelope.as_deref(),
+                rust_env.as_deref(),
+            ),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((scipy_v, rust_v)) = ledger.slices(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let max_diff = max_abs_diff(rust_v, scipy_v);
 
-        let rust_env = match hilbert_envelope(&case.signal) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+            let pass = max_diff <= HILBERT_TOL;
+            max_diff_overall = max_diff_overall.max(max_diff);
+            ledger.compared(arm, &case.case_id, pass);
 
-        let real_diff = max_abs_diff(&rust_real, scipy_real);
-        let imag_diff = max_abs_diff(&rust_imag, scipy_imag);
-        let env_diff = max_abs_diff(&rust_env, scipy_env);
-        let max_diff = real_diff.max(imag_diff).max(env_diff);
-
-        let pass = max_diff <= HILBERT_TOL;
-        max_diff_overall = max_diff_overall.max(max_diff);
-
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            method: "hilbert".to_string(),
-            max_diff,
-            tolerance: HILBERT_TOL,
-            pass,
-        });
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                method: format!("hilbert_{arm}"),
+                max_diff,
+                tolerance: HILBERT_TOL,
+                pass,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -420,6 +421,7 @@ fn diff_signal_hilbert() {
         test_id: "diff_signal_hilbert".into(),
         category: "scipy.signal.hilbert".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff_overall,
         tolerance: HILBERT_TOL,
         pass: all_pass,
@@ -433,8 +435,8 @@ fn diff_signal_hilbert() {
     for diff in &diffs {
         if !diff.pass {
             eprintln!(
-                "hilbert mismatch: {} max_diff={} tolerance={}",
-                diff.case_id, diff.max_diff, diff.tolerance
+                "hilbert mismatch: {} {} max_diff={} tolerance={}",
+                diff.method, diff.case_id, diff.max_diff, diff.tolerance
             );
         }
     }
@@ -445,4 +447,5 @@ fn diff_signal_hilbert() {
         diffs.len(),
         max_diff_overall
     );
+    ledger.finish(cases.len());
 }

@@ -8,13 +8,14 @@
 //! Reference values are computed in scipy.integrate.tplquad with
 //! identical bound functions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{DblquadOptions, tplquad};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -271,24 +273,24 @@ fn diff_integrate_tplquad() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_tplquad", &["tplquad"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
         let f = |x: f64, y: f64, z: f64| integrand(&case.integrand, x, y, z);
         let g = |x: f64| gfun(&case.bound_pattern, x);
         let h = |x: f64| hfun(&case.bound_pattern, x);
         let q = |x: f64, y: f64| qfun(&case.bound_pattern, x, y);
         let r = |x: f64, y: f64| rfun(&case.bound_pattern, x, y);
-        let Ok(res) = tplquad(f, case.a, case.b, g, h, q, r, opts) else {
+        let fsci = tplquad(f, case.a, case.b, g, h, q, r, opts)
+            .ok()
+            .map(|res| res.integral);
+        let Some((expected, integral)) = ledger.pair("tplquad", &case.case_id, scipy, fsci) else {
             continue;
         };
-        let abs_d = (res.integral - expected).abs();
+        let abs_d = (integral - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("tplquad", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -302,6 +304,7 @@ fn diff_integrate_tplquad() {
         test_id: "diff_integrate_tplquad".into(),
         category: "fsci_integrate::tplquad vs scipy.integrate.tplquad".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -322,4 +325,5 @@ fn diff_integrate_tplquad() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

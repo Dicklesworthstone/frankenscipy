@@ -12,13 +12,14 @@
 //! decomposition (iterative) — scipy's implementation differs
 //! in detail from fsci's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, coshm, cosm, expm, logm, sinhm, sinm, sqrtm, tanhm, tanm};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -299,36 +301,42 @@ fn diff_linalg_matrix_functions() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = [
+        "expm", "sqrtm", "logm", "sinm", "cosm", "tanm", "sinhm", "coshm", "tanhm",
+    ];
+    let mut ledger = CompareLedger::new("diff_linalg_matrix_functions", &arms);
 
     for case in &query.points {
         for fn_name in &case.fns {
-            let Some(scipy_mat) = map.get(&(case.case_id.clone(), fn_name.clone())) else {
+            let scipy_mat = map.get(&(case.case_id.clone(), fn_name.clone()));
+            let rust_mat = dispatch_fn(fn_name, &case.a);
+            let Some((scipy_mat, rust_mat)) =
+                ledger.both(fn_name, &case.case_id, scipy_mat, rust_mat)
+            else {
                 continue;
             };
-            let Some(rust_mat) = dispatch_fn(fn_name, &case.a) else {
-                continue;
-            };
-            if rust_mat.len() != scipy_mat.len()
-                || rust_mat
+            let shape_ok = rust_mat.len() == scipy_mat.len()
+                && rust_mat
                     .iter()
                     .zip(scipy_mat.iter())
-                    .any(|(rr, sr)| rr.len() != sr.len())
-            {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fn_name: fn_name.clone(),
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                continue;
+                    .all(|(rr, sr)| rr.len() == sr.len());
+            // max_abs_diff_mat reads a NaN as 0.0; a NaN entry fails the case.
+            let no_nan = !rust_mat.iter().flatten().any(|v| v.is_nan());
+            let max_d = if shape_ok {
+                max_abs_diff_mat(&rust_mat, scipy_mat)
+            } else {
+                f64::INFINITY
+            };
+            if shape_ok {
+                max_overall = max_overall.max(max_d);
             }
-            let max_d = max_abs_diff_mat(&rust_mat, scipy_mat);
-            max_overall = max_overall.max(max_d);
+            let pass = shape_ok && no_nan && max_d <= ABS_TOL;
+            ledger.compared(fn_name, &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 fn_name: fn_name.clone(),
                 max_abs_diff: max_d,
-                pass: max_d <= ABS_TOL,
+                pass,
             });
         }
     }
@@ -339,6 +347,7 @@ fn diff_linalg_matrix_functions() {
         test_id: "diff_linalg_matrix_functions".into(),
         category: "fsci_linalg matrix functions".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -362,5 +371,17 @@ fn diff_linalg_matrix_functions() {
         "matrix-functions conformance failed: {} cases, max_abs={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        arms.iter()
+            .map(|arm| {
+                query
+                    .points
+                    .iter()
+                    .filter(|c| c.fns.iter().any(|f| f == arm))
+                    .count()
+            })
+            .min()
+            .unwrap_or(0),
     );
 }

@@ -10,13 +10,14 @@
 //! over the sparse structure, so machine-precision agreement (1e-12)
 //! is appropriate.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CooMatrix, FormatConvertible, Shape2D, sparse_diagonal, sparse_norm, sparse_trace,
 };
@@ -68,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -317,6 +319,10 @@ fn diff_sparse_basic_queries() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_basic_queries",
+        &["norm_fro", "norm_1", "norm_inf", "diagonal", "trace"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -324,11 +330,9 @@ fn diff_sparse_basic_queries() {
         let r: Vec<usize> = case.triplets.iter().map(|t| t.0).collect();
         let c: Vec<usize> = case.triplets.iter().map(|t| t.1).collect();
         let d: Vec<f64> = case.triplets.iter().map(|t| t.2).collect();
-        let Ok(coo) = CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), d, r, c, false)
-        else {
-            continue;
-        };
-        let Ok(csr) = coo.to_csr() else { continue };
+        let csr = CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), d, r, c, false)
+            .ok()
+            .and_then(|coo| coo.to_csr().ok());
 
         // Norm comparisons only make sense on square matrices for fsci's
         // sparse_norm impl (it iterates by rows assuming shape().rows is the
@@ -336,77 +340,60 @@ fn diff_sparse_basic_queries() {
         // scipy has a value. fsci's impl computes "fro" purely from data
         // so it's well-defined for any shape; same for "1" (col_sums) and
         // "inf" (row_sums). We probe all three arms uniformly.
-        if let Some(nfro) = scipy_arm.norm_fro {
-            let f = sparse_norm(&csr, "fro").expect("ord fro");
-            let abs_d = (f - nfro).abs();
+        let scalar_arms = [
+            (
+                "norm_fro",
+                scipy_arm.norm_fro,
+                csr.as_ref().and_then(|m| sparse_norm(m, "fro").ok()),
+            ),
+            (
+                "norm_1",
+                scipy_arm.norm_1,
+                csr.as_ref().and_then(|m| sparse_norm(m, "1").ok()),
+            ),
+            (
+                "norm_inf",
+                scipy_arm.norm_inf,
+                csr.as_ref().and_then(|m| sparse_norm(m, "inf").ok()),
+            ),
+            ("trace", scipy_arm.trace, csr.as_ref().map(sparse_trace)),
+        ];
+        for (arm, scipy, fsci) in scalar_arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            let abs_d = (f - s).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared(arm, &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "norm_fro".into(),
+                arm: arm.into(),
                 abs_diff: abs_d,
                 pass: abs_d <= ABS_TOL,
             });
         }
-        // sparse_norm '1' and 'inf' assume square matrix in fsci impl
-        // (m bound on col_sums comes from shape().cols, ok for rect, but
-        // skip if scipy returned None).
-        if let Some(n1) = scipy_arm.norm_1 {
-            let f = sparse_norm(&csr, "1").expect("ord 1");
-            let abs_d = (f - n1).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "norm_1".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
-        if let Some(ninf) = scipy_arm.norm_inf {
-            let f = sparse_norm(&csr, "inf").expect("ord inf");
-            let abs_d = (f - ninf).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "norm_inf".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
-        if let Some(diag) = scipy_arm.diagonal.as_ref() {
-            let f = sparse_diagonal(&csr);
-            if f.len() == diag.len() {
-                let abs_d = f
-                    .iter()
-                    .zip(diag.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max);
-                max_overall = max_overall.max(abs_d);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: "diagonal".into(),
-                    abs_diff: abs_d,
-                    pass: abs_d <= ABS_TOL,
-                });
-            } else {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: "diagonal".into(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-            }
-        }
-        if let Some(tr) = scipy_arm.trace {
-            let f = sparse_trace(&csr);
-            let abs_d = (f - tr).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "trace".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        let fsci_diag = csr.as_ref().map(sparse_diagonal);
+        let Some((diag, f)) = ledger.slices(
+            "diagonal",
+            &case.case_id,
+            scipy_arm.diagonal.as_deref(),
+            fsci_diag.as_deref(),
+        ) else {
+            continue;
+        };
+        let abs_d = f
+            .iter()
+            .zip(diag.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        max_overall = max_overall.max(abs_d);
+        ledger.compared("diagonal", &case.case_id, abs_d <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            arm: "diagonal".into(),
+            abs_diff: abs_d,
+            pass: abs_d <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -415,6 +402,7 @@ fn diff_sparse_basic_queries() {
         test_id: "diff_sparse_basic_queries".into(),
         category: "scipy.sparse.linalg.norm + A.diagonal/trace".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -438,4 +426,5 @@ fn diff_sparse_basic_queries() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

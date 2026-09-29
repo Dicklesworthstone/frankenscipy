@@ -383,6 +383,10 @@ const KEXSH: usize = 10;
 /// this routine can never reproduce the sez4r hang even if the exceptional shifts
 /// fail to break a cycle. That is deliberate: a bound plus a better shift strategy
 /// is strictly safer than either alone.
+///
+/// Library callers take the full `real_schur_francis`; only the tests below use
+/// this eigenvalues-only form.
+#[cfg(test)]
 pub(crate) fn eigenvalues_francis(
     a: &[Vec<f64>],
     eps: f64,

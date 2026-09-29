@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 //! Live scipy.special.airye parity for fsci_special::airye.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::airye;
 use fsci_special::types::{Complex64, SpecialTensor};
@@ -29,9 +31,19 @@ struct OracleQuery {
     points: Vec<PointCase>,
 }
 
+/// SciPy's documented NaN answer (eAi / eAip of a negative real argument) arrives as "nan",
+/// distinct from a missing value (null).
 #[derive(Debug, Clone, Deserialize)]
 struct ComponentArm {
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     re: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     im: Option<f64>,
 }
 
@@ -59,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -142,12 +155,14 @@ except Exception as exc:
     print(f"scipy import failed: {exc}", file=sys.stderr)
     sys.exit(2)
 
+def fval(v):
+    v = float(v)
+    return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))
+
 def component(value):
-    real = float(value.real)
-    imag = float(value.imag)
-    if math.isnan(real) or math.isnan(imag):
-        return {"re": None, "im": None}
-    return {"re": real, "im": imag}
+    # A non-finite part is sent as "nan" / "inf" / "-inf", so the harness can tell SciPy's
+    # NaN answer (eAi of a negative real) from a missing value.
+    return {"re": fval(value.real), "im": fval(value.imag)}
 
 q = json.loads(os.environ["FSCI_AIRYE_QUERY"])
 points = []
@@ -265,18 +280,43 @@ fn diff_special_airye() -> Result<(), String> {
     let mut max_abs_diff = 0.0_f64;
     let mut diffs = Vec::new();
     let component_names = ["eAi", "eAip", "eBi", "eBip"];
+    let mut ledger = CompareLedger::new("diff_special_airye", &component_names);
 
     for (case, expected) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, expected.case_id);
         assert_eq!(expected.components.len(), 4);
-        let actual = fsci_eval(case)?;
-        for ((name, actual_component), expected_component) in component_names
+        let actual = fsci_eval(case);
+        if let Err(err) = &actual {
+            eprintln!("airye fsci failure: {} {err}", case.case_id);
+        }
+        let actual = actual.ok();
+        for (i, (name, expected_component)) in component_names
             .iter()
-            .zip(actual.iter())
             .zip(expected.components.iter())
+            .enumerate()
         {
-            let (abs_diff, pass) = component_pass(*actual_component, expected_component);
+            // Each component is the pair (re, im); slices requires a SciPy NaN part to be
+            // matched by NaN and rejects a non-finite fsci part where SciPy's is finite (the
+            // max in component_pass would otherwise swallow a NaN real part).
+            let scipy_parts = expected_component
+                .re
+                .zip(expected_component.im)
+                .map(|(re, im)| [re, im]);
+            let actual_component = actual.as_ref().map(|a| a[i]);
+            let fsci_parts = actual_component.map(|c| [c.re, c.im]);
+            let gate = ledger.slices(
+                name,
+                case.case_id,
+                scipy_parts.as_ref().map(|p| p.as_slice()),
+                fsci_parts.as_ref().map(|p| p.as_slice()),
+            );
+            // gate is Some only when fsci produced this component.
+            let (Some(_), Some(actual_component)) = (gate, actual_component) else {
+                continue;
+            };
+            let (abs_diff, pass) = component_pass(actual_component, expected_component);
             max_abs_diff = max_abs_diff.max(abs_diff);
+            ledger.compared(name, case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.into(),
                 component: (*name).into(),
@@ -291,6 +331,7 @@ fn diff_special_airye() -> Result<(), String> {
         test_id: "diff_special_airye".into(),
         category: "fsci_special::airye vs scipy.special.airye".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -308,12 +349,12 @@ fn diff_special_airye() -> Result<(), String> {
         }
     }
 
-    if all_pass {
-        Ok(())
-    } else {
-        Err(format!(
+    if !all_pass {
+        return Err(format!(
             "scipy.special.airye conformance failed: {} cases, max_diff={max_abs_diff}",
             diffs.len()
-        ))
+        ));
     }
+    ledger.finish(query.points.len());
+    Ok(())
 }

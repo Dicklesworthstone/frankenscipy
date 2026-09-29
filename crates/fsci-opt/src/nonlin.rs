@@ -1031,8 +1031,17 @@ pub struct NonlinResult {
 /// The distinction is not cosmetic at large `n`: the 2-norm of a residual grows like
 /// `sqrt(n)` for a fixed per-component error, so a 2-norm tolerance silently tightens as
 /// the problem grows while a max-norm one means the same thing at every size.
+///
+/// NaN-propagating, as numpy's `max` is. `f64::max` drops a NaN operand, so a residual that
+/// had gone NaN used to have norm 0 and pass `fx_norm == 0.0` as converged.
 fn max_norm(v: &[f64]) -> f64 {
-    v.iter().fold(0.0_f64, |a, b| a.max(b.abs()))
+    v.iter().fold(0.0_f64, |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.max(b.abs())
+        }
+    })
 }
 
 /// Armijo backtracking with quadratic then cubic interpolation
@@ -1473,6 +1482,17 @@ mod nonlin_tests {
             .zip(b)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0, f64::max)
+    }
+
+    /// A NaN anywhere in a residual is a NaN norm, never 0: `fx_norm == 0.0` is
+    /// `nonlin_solve`'s first success test.
+    #[test]
+    fn max_norm_propagates_nan_in_any_position() {
+        assert!(super::max_norm(&[f64::NAN]).is_nan());
+        assert!(super::max_norm(&[1.0, f64::NAN]).is_nan());
+        assert!(super::max_norm(&[f64::NAN, 1.0]).is_nan());
+        assert_eq!(super::max_norm(&[-3.0, 2.0]), 3.0);
+        assert_eq!(super::max_norm(&[]), 0.0);
     }
 
     /// MUST-HIT: the Sherman-Morrison-Woodbury solve agrees with a dense solve of the

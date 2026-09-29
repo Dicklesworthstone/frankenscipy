@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::brute;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -250,16 +252,19 @@ fn diff_opt_brute() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_opt_brute", &["brute"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(ex), Some(ef)) = (arm.x.clone(), arm.fun) else {
-            continue;
-        };
+        // A missing oracle row or a missing x/fun is recorded as SciPy giving no value.
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.x.as_deref().zip(arm.fun));
         let f = |x: &[f64]| evaluate(&case.func, x);
-        let Ok(res) = brute(f, &case.ranges, case.ns) else {
+        // An unsuccessful fsci result where SciPy produced a grid minimum is an fsci failure.
+        let res = brute(f, &case.ranges, case.ns)
+            .ok()
+            .filter(|res| res.success);
+        let Some(((ex, ef), res)) = ledger.both("brute", &case.case_id, scipy, res) else {
             continue;
         };
         let abs_x = if res.x.len() != ex.len() {
@@ -274,11 +279,15 @@ fn diff_opt_brute() {
         let abs_f = res.fun.map(|v| (v - ef).abs()).unwrap_or(f64::INFINITY);
         let abs_d = abs_x.max(abs_f);
         max_overall = max_overall.max(abs_d);
+        // The max folds above swallow a NaN, so a NaN in fsci's x or fun fails explicitly.
+        let no_nan = !res.x.iter().any(|v| v.is_nan()) && !res.fun.is_some_and(f64::is_nan);
+        let pass = no_nan && abs_d <= ABS_TOL;
+        ledger.compared("brute", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "brute".into(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -288,6 +297,7 @@ fn diff_opt_brute() {
         test_id: "diff_opt_brute".into(),
         category: "fsci_opt::brute vs scipy.optimize.brute (finish=None)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -308,4 +318,5 @@ fn diff_opt_brute() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

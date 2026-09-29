@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-b67vw]. For real-valued matrices, the two
 //! functions coincide. Tolerance: exact (boolean result).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{ishermitian, issymmetric};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -223,33 +225,39 @@ fn diff_linalg_issymmetric_ishermitian() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_issymmetric_ishermitian",
+        &["issymmetric", "ishermitian"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(esym), Some(eher)) = (arm.sym, arm.her) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id);
         let a = unpack_2d(&case.a, case.n);
-
-        let Ok(sym) = issymmetric(&a, case.atol, case.rtol) else {
-            continue;
-        };
-        let Ok(her) = ishermitian(&a, case.atol, case.rtol) else {
-            continue;
-        };
-
-        diffs.push(CaseDiff {
-            case_id: format!("{}_sym", case.case_id),
-            op: "issymmetric".into(),
-            pass: sym == esym,
-        });
-        diffs.push(CaseDiff {
-            case_id: format!("{}_her", case.case_id),
-            op: "ishermitian".into(),
-            pass: her == eher,
-        });
+        let checks = [
+            (
+                "issymmetric",
+                "sym",
+                arm.and_then(|r| r.sym),
+                issymmetric(&a, case.atol, case.rtol).ok(),
+            ),
+            (
+                "ishermitian",
+                "her",
+                arm.and_then(|r| r.her),
+                ishermitian(&a, case.atol, case.rtol).ok(),
+            ),
+        ];
+        for (op, suffix, scipy, fsci) in checks {
+            let Some((expected, got)) = ledger.both(op, &case.case_id, scipy, fsci) else {
+                continue;
+            };
+            ledger.compared(op, &case.case_id, got == expected);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_{suffix}", case.case_id),
+                op: op.into(),
+                pass: got == expected,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -258,6 +266,7 @@ fn diff_linalg_issymmetric_ishermitian() {
         test_id: "diff_linalg_issymmetric_ishermitian".into(),
         category: "fsci_linalg::issymmetric + ishermitian vs scipy.linalg".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -276,4 +285,5 @@ fn diff_linalg_issymmetric_ishermitian() {
         "issym/isher conformance failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

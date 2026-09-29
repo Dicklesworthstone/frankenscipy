@@ -9,12 +9,14 @@
 //! ker/kei use a series with harmonic-number correction terms; the
 //! oracle compares within rel tol 1e-3 to allow for moderate drift.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{bei, beip, ber, berp, kei, keip, kelvin, ker, kerp};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +26,25 @@ const REL_TOL_KER_KEI: f64 = 1.0e-3;
 const REL_TOL_KER_DERIV: f64 = 5.0e-3;
 const ABS_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function (and per kelvin() tuple component) compared.
+const ARMS: [&str; 16] = [
+    "ber",
+    "bei",
+    "ker",
+    "kei",
+    "berp",
+    "beip",
+    "kerp",
+    "keip",
+    "kelvin_be_re",
+    "kelvin_be_im",
+    "kelvin_ke_re",
+    "kelvin_ke_im",
+    "kelvin_bep_re",
+    "kelvin_bep_im",
+    "kelvin_kep_re",
+    "kelvin_kep_im",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CasePoint {
@@ -64,6 +85,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -219,14 +241,11 @@ fn diff_special_kelvin_ber_bei_ker_kei() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_special_kelvin_ber_bei_ker_kei", &ARMS);
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let Some(expected) = o.value else {
-            continue;
-        };
-
-        let actual = match c.func.as_str() {
+        let fsci = match c.func.as_str() {
             "ber" => ber(c.x),
             "bei" => bei(c.x),
             "ker" => ker(c.x),
@@ -245,6 +264,9 @@ fn diff_special_kelvin_ber_bei_ker_kei() {
             "kelvin_kep_im" => kelvin(c.x).3.im,
             _ => f64::NAN,
         };
+        let Some((expected, actual)) = ledger.pair(&c.func, &c.case_id, o.value, Some(fsci)) else {
+            continue;
+        };
 
         let abs_d = (actual - expected).abs();
         let denom = expected.abs().max(1.0e-300);
@@ -256,6 +278,7 @@ fn diff_special_kelvin_ber_bei_ker_kei() {
             _ => REL_TOL_KER_KEI,
         };
         let pass = rel_diff <= tol || abs_d <= ABS_TOL;
+        ledger.compared(&c.func, &c.case_id, pass);
         diffs.push(CaseDiff {
             case_id: c.case_id.clone(),
             func: c.func.clone(),
@@ -271,6 +294,7 @@ fn diff_special_kelvin_ber_bei_ker_kei() {
         test_id: "diff_special_kelvin_ber_bei_ker_kei".into(),
         category: "scipy.special Kelvin functions, derivatives, and combined tuple".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -292,4 +316,10 @@ fn diff_special_kelvin_ber_bei_ker_kei() {
         "Kelvin function parity failed: {} cases",
         diffs.len()
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

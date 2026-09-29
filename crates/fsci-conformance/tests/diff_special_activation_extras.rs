@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-qjwtj]. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{
@@ -22,6 +23,19 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op compared.
+const ARMS: [&str; 10] = [
+    "log1mexp",
+    "log1pexp",
+    "log_cosh",
+    "softsign",
+    "silu",
+    "mish",
+    "xlogx",
+    "hard_sigmoid",
+    "hard_tanh",
+    "logsigmoid",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -59,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -282,19 +297,18 @@ fn diff_special_activation_extras() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_activation_extras", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Some(actual) = fsci_eval(&case.op, case.x) else {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.value);
+        let Some((expected, actual)) =
+            ledger.pair(&case.op, &case.case_id, scipy, fsci_eval(&case.op, case.x))
+        else {
             continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -309,6 +323,7 @@ fn diff_special_activation_extras() {
         test_id: "diff_special_activation_extras".into(),
         category: "fsci_special activation/link extras vs python formula".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -329,4 +344,11 @@ fn diff_special_activation_extras() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (log1mexp has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

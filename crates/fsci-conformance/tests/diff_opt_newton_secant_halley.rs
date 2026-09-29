@@ -7,13 +7,14 @@
 //! value; scipy and fsci default to xtol ~ 1e-12 so 1e-9 absorbs
 //! convergence-criterion drift.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{RootOptions, halley, newton_scalar, secant};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -271,14 +273,13 @@ fn diff_opt_newton_secant_halley() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_opt_newton_secant_halley",
+        &["newton", "secant", "halley"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.root else {
-            continue;
-        };
+        let scipy_root = pmap.get(&case.case_id).and_then(|arm| arm.root);
         let res = match case.method.as_str() {
             "newton" => newton_scalar(|x| f(&case.func, x), |x| fp(&case.func, x), case.x0, opts),
             "secant" => secant(|x| f(&case.func, x), case.x0, Some(case.x1), opts),
@@ -289,14 +290,18 @@ fn diff_opt_newton_secant_halley() {
                 case.x0,
                 opts,
             ),
-            _ => continue,
+            other => panic!("unknown method {other} in {}", case.case_id),
         };
-        let Ok(rr) = res else { continue };
-        if !rr.converged {
+        // SciPy reports a root only when it converged; an unconverged fsci run is a failure.
+        let fsci_root = res.ok().filter(|rr| rr.converged).map(|rr| rr.root);
+        let Some((expected, root)) =
+            ledger.pair(&case.method, &case.case_id, scipy_root, fsci_root)
+        else {
             continue;
-        }
-        let abs_d = (rr.root - expected).abs();
+        };
+        let abs_d = (root - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.method, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.method.clone(),
@@ -311,6 +316,7 @@ fn diff_opt_newton_secant_halley() {
         test_id: "diff_opt_newton_secant_halley".into(),
         category: "fsci_opt::{newton_scalar, secant, halley} vs scipy.optimize.newton".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -331,4 +337,6 @@ fn diff_opt_newton_secant_halley() {
         diffs.len(),
         max_overall
     );
+    // The smallest arm: secant and halley have four probes each, newton five.
+    ledger.finish(query.points.iter().filter(|c| c.method == "secant").count());
 }

@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-zsa85]. 1e-12 abs for the scalar avg
 //! clustering; exact match for the boolean / degree vector.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, average_clustering, degree_sequence, is_connected};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -249,15 +251,24 @@ fn diff_sparse_graph_summary() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_graph_summary",
+        &["avg_clustering", "is_connected", "degree_sequence"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
 
-        if let Some(expected) = scipy_arm.avg_clustering {
-            let fsci_v = average_clustering(&csr);
+        if let Some((expected, fsci_v)) = ledger.pair(
+            "avg_clustering",
+            &case.case_id,
+            scipy_arm.avg_clustering,
+            Some(average_clustering(&csr)),
+        ) {
             let abs_d = (fsci_v - expected).abs();
             max_overall = max_overall.max(abs_d);
+            ledger.compared("avg_clustering", &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_avg_clustering", case.case_id),
                 op: "avg_clustering".into(),
@@ -266,9 +277,14 @@ fn diff_sparse_graph_summary() {
             });
         }
 
-        if let Some(expected) = scipy_arm.is_connected {
-            let fsci_v = is_connected(&csr);
+        if let Some((expected, fsci_v)) = ledger.both(
+            "is_connected",
+            &case.case_id,
+            scipy_arm.is_connected,
+            Some(is_connected(&csr)),
+        ) {
             let pass = fsci_v == expected;
+            ledger.compared("is_connected", &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: format!("{}_is_connected", case.case_id),
                 op: "is_connected".into(),
@@ -277,8 +293,12 @@ fn diff_sparse_graph_summary() {
             });
         }
 
-        if let Some(expected) = scipy_arm.degree_sequence.as_ref() {
-            let fsci_v = degree_sequence(&csr);
+        if let Some((expected, fsci_v)) = ledger.both(
+            "degree_sequence",
+            &case.case_id,
+            scipy_arm.degree_sequence.as_ref(),
+            Some(degree_sequence(&csr)),
+        ) {
             let abs_d = if fsci_v.len() != expected.len() {
                 f64::INFINITY
             } else {
@@ -288,6 +308,7 @@ fn diff_sparse_graph_summary() {
                     .map(|(&a, &b)| ((a as i64) - b).unsigned_abs() as f64)
                     .fold(0.0_f64, f64::max)
             };
+            ledger.compared("degree_sequence", &case.case_id, abs_d == 0.0);
             diffs.push(CaseDiff {
                 case_id: format!("{}_degree_sequence", case.case_id),
                 op: "degree_sequence".into(),
@@ -303,6 +324,7 @@ fn diff_sparse_graph_summary() {
         test_id: "diff_sparse_graph_summary".into(),
         category: "fsci_sparse avg_clustering + is_connected + degree_sequence vs networkx".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -323,4 +345,5 @@ fn diff_sparse_graph_summary() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

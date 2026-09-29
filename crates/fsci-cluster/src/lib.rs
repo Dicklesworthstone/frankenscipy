@@ -4616,6 +4616,14 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
     let build_start = std::time::Instant::now();
     let dm = linkage_distance_matrix(&flat, n, d);
     let build_nanos = build_start.elapsed().as_nanos();
+    // Finite observations can still overflow to an infinite distance (|±1e200| apart squares
+    // to inf); SciPy checks the condensed matrix it builds and raises, where the centroid
+    // update would otherwise form inf - inf = NaN and clamp it to a 0.0 merge height.
+    if dm.iter().any(|v| !v.is_finite()) {
+        return Err(ClusterError::InvalidArgument(
+            "The condensed distance matrix must contain only finite values.".to_string(),
+        ));
+    }
     let agglomerate_start = std::time::Instant::now();
     let z = linkage_from_dm(n, dm, method);
     record_linkage_stage(0, build_nanos);
@@ -5015,66 +5023,231 @@ fn nn_chain_linkage(n: usize, mut dm: Vec<f64>, method: LinkageMethod) -> Vec<[f
     z
 }
 
-/// Cut a linkage tree to form flat clusters.
+/// How [`fcluster`] forms flat clusters: `scipy.cluster.hierarchy.fcluster`'s `criterion`
+/// together with the `t`, `depth`, `R` and `monocrit` arguments that criterion reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FclusterCriterion<'a> {
+    /// `criterion='inconsistent'`, SciPy's default: a node and its descendants form a flat
+    /// cluster when no inconsistency coefficient among them exceeds `t`. `r` is the
+    /// inconsistency matrix; `None` computes [`inconsistent`]`(z, depth)` (SciPy's default
+    /// depth is 2).
+    Inconsistent {
+        t: f64,
+        depth: usize,
+        r: Option<&'a [[f64; 4]]>,
+    },
+    /// `criterion='distance'`: flat clusters whose members are at most `t` apart in
+    /// cophenetic distance.
+    Distance(f64),
+    /// `criterion='maxclust'`: the lowest cut among the node heights of [`maxdists`] that
+    /// forms at most this many flat clusters.
+    MaxClust(usize),
+    /// `criterion='monocrit'`: node `n + i` and its descendants form a flat cluster when
+    /// `monocrit[i] <= t`. `monocrit` should be monotonic up the tree, as [`maxdists`] and
+    /// [`maxinconsts`] are.
+    Monocrit { t: f64, monocrit: &'a [f64] },
+    /// `criterion='maxclust_monocrit'`: the lowest `monocrit` threshold that forms at most
+    /// `max_clusters` flat clusters.
+    MaxClustMonocrit {
+        max_clusters: usize,
+        monocrit: &'a [f64],
+    },
+}
+
+/// Form flat clusters from a linkage matrix.
 ///
-/// Matches `scipy.cluster.hierarchy.fcluster` with criterion='maxclust'.
-pub fn fcluster(z: &[[f64; 4]], max_clusters: usize) -> Result<Vec<usize>, ClusterError> {
-    if !is_valid_linkage(z) {
+/// Matches `scipy.cluster.hierarchy.fcluster(Z, t, criterion, depth, R, monocrit)`. This is a
+/// port of SciPy 1.17.1's `_hierarchy.pyx` cluster formation:
+/// - each criterion becomes a per-node value that is the maximum over the node's subtree
+///   ([`maxdists`] or [`maxinconsts`]), or the caller's `monocrit`;
+/// - `maxclust` binary-searches the node values as thresholds exactly as SciPy does, so a cut
+///   through tied heights takes the whole tie;
+/// - labels `1..=k` are numbered in the order SciPy's depth-first walk from the root assigns
+///   them.
+///
+/// # Errors
+///
+/// - an invalid or empty linkage matrix;
+/// - an inconsistency matrix that is not valid, or whose row count differs from `z`'s;
+/// - a `monocrit` whose length is not `z.len()`;
+/// - a cluster count of 0, or a `monocrit` threshold search that finds no admissible cut. In
+///   both cases SciPy reads past the end of its criterion array.
+pub fn fcluster(
+    z: &[[f64; 4]],
+    criterion: FclusterCriterion<'_>,
+) -> Result<Vec<usize>, ClusterError> {
+    if z.is_empty() || !is_valid_linkage(z) {
         return Err(ClusterError::InvalidArgument(
             "invalid linkage matrix".to_string(),
         ));
     }
+    let check_monocrit = |monocrit: &[f64]| {
+        if monocrit.len() == z.len() {
+            Ok(())
+        } else {
+            Err(ClusterError::InvalidArgument(
+                "monocrit must have one entry per linkage row".to_string(),
+            ))
+        }
+    };
+    match criterion {
+        FclusterCriterion::Inconsistent { t, depth, r } => {
+            let computed;
+            let r = match r {
+                Some(r) if !is_valid_im(r) => {
+                    return Err(ClusterError::InvalidArgument(
+                        "invalid inconsistency matrix".to_string(),
+                    ));
+                }
+                Some(r) => r,
+                None => {
+                    computed = inconsistent(z, depth);
+                    &computed
+                }
+            };
+            Ok(cluster_monocrit(z, &maxinconsts(z, r)?, t))
+        }
+        FclusterCriterion::Distance(t) => Ok(cluster_monocrit(z, &maxdists(z), t)),
+        FclusterCriterion::MaxClust(max_clusters) => {
+            cluster_maxclust_monocrit(z, &maxdists(z), max_clusters)
+        }
+        FclusterCriterion::Monocrit { t, monocrit } => {
+            check_monocrit(monocrit)?;
+            Ok(cluster_monocrit(z, monocrit, t))
+        }
+        FclusterCriterion::MaxClustMonocrit {
+            max_clusters,
+            monocrit,
+        } => {
+            check_monocrit(monocrit)?;
+            cluster_maxclust_monocrit(z, monocrit, max_clusters)
+        }
+    }
+}
 
+/// SciPy's `_hierarchy.cluster_monocrit`. It walks the tree depth first from the root. The
+/// first node on a path with `mc[node] <= cutoff` leads a flat cluster of all its leaves, and
+/// a leaf with no leader above it is a singleton. A node's leaf children get their label when
+/// the walk finishes that node's internal children, which fixes SciPy's label numbering.
+fn cluster_monocrit(z: &[[f64; 4]], mc: &[f64], cutoff: f64) -> Vec<usize> {
     let n = z.len() + 1;
-    if max_clusters >= n || max_clusters == 0 {
+    let mut labels = vec![0_usize; n];
+    let mut visited = vec![false; 2 * n - 1];
+    let mut stack = Vec::with_capacity(n);
+    stack.push(2 * n - 2);
+    let mut n_cluster = 0_usize;
+    let mut leader = None;
+    while let Some(&node) = stack.last() {
+        let root = node - n;
+        let (lc, rc) = (z[root][0] as usize, z[root][1] as usize);
+        if leader.is_none() && mc[root] <= cutoff {
+            leader = Some(root);
+            n_cluster += 1;
+        }
+        if lc >= n && !visited[lc] {
+            visited[lc] = true;
+            stack.push(lc);
+            continue;
+        }
+        if rc >= n && !visited[rc] {
+            visited[rc] = true;
+            stack.push(rc);
+            continue;
+        }
+        for leaf in [lc, rc] {
+            if leaf < n {
+                if leader.is_none() {
+                    n_cluster += 1;
+                }
+                labels[leaf] = n_cluster;
+            }
+        }
+        if leader == Some(root) {
+            leader = None;
+        }
+        stack.pop();
+    }
+    labels
+}
+
+/// SciPy's `_hierarchy.cluster_maxclust_monocrit`. It binary-searches the node values
+/// `mc[i]`, taken as cutoffs by INDEX (SciPy does not sort them), for the lowest one that forms
+/// at most `max_nc` clusters, then cuts there with [`cluster_monocrit`].
+fn cluster_maxclust_monocrit(
+    z: &[[f64; 4]],
+    mc: &[f64],
+    max_nc: usize,
+) -> Result<Vec<usize>, ClusterError> {
+    let n = z.len() + 1;
+    if max_nc >= n {
         return Ok((1..=n).collect());
     }
-
-    // Union-find over the 2n-1 dendrogram nodes. Each set's label is the minimum
-    // original-leaf index it contains — exactly what the previous code's
-    // min-propagation produced — so the final renumbering is byte-identical, but
-    // agglomeration is O(n·α(n)) instead of relabeling every node on each of the
-    // up-to-n merges (the old O(n²) `for v in cluster_of` rescan).
-    let total = 2 * n - 1;
-    let mut parent: Vec<usize> = (0..total).collect();
-    let mut min_leaf: Vec<usize> = (0..total)
-        .map(|i| if i < n { i } else { usize::MAX })
-        .collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]]; // path halving
-            x = parent[x];
+    if max_nc == 0 {
+        return Err(ClusterError::InvalidArgument(
+            "maxclust needs at least one cluster".to_string(),
+        ));
+    }
+    let mut visited = vec![false; 2 * n - 1];
+    let mut stack = Vec::with_capacity(n);
+    // `lo` and `hi` are SciPy's lower_idx + 1 and upper_idx + 1. SciPy starts lower_idx at -1,
+    // which stands for minus infinity and is never read.
+    let (mut lo, mut hi) = (0_usize, n);
+    while hi - lo > 1 {
+        let i = (lo + hi) / 2 - 1;
+        let thresh = mc[i];
+        visited.fill(false);
+        stack.clear();
+        stack.push(2 * n - 2);
+        let mut nc = 0_usize;
+        while let Some(&node) = stack.last() {
+            let root = node - n;
+            let (lc, rc) = (z[root][0] as usize, z[root][1] as usize);
+            if mc[root] <= thresh {
+                nc += 1;
+                if nc > max_nc {
+                    break;
+                }
+                stack.pop();
+                visited[lc] = true;
+                visited[rc] = true;
+                continue;
+            }
+            if !visited[lc] {
+                visited[lc] = true;
+                if lc >= n {
+                    stack.push(lc);
+                    continue;
+                }
+                nc += 1;
+                if nc > max_nc {
+                    break;
+                }
+            }
+            if !visited[rc] {
+                visited[rc] = true;
+                if rc >= n {
+                    stack.push(rc);
+                    continue;
+                }
+                nc += 1;
+                if nc > max_nc {
+                    break;
+                }
+            }
+            stack.pop();
         }
-        x
+        if nc > max_nc {
+            lo = i + 1;
+        } else {
+            hi = i + 1;
+        }
     }
-
-    // Process merges in order, stopping when we have max_clusters
-    let n_merges = n - max_clusters;
-    for (step, row) in z.iter().enumerate().take(n_merges) {
-        let new_id = n + step;
-        let ci = find(&mut parent, row[0] as usize);
-        let cj = find(&mut parent, row[1] as usize);
-        // Root the merged set at the new node, carrying the minimum leaf index.
-        let label = min_leaf[ci].min(min_leaf[cj]).min(min_leaf[new_id]);
-        parent[ci] = new_id;
-        parent[cj] = new_id;
-        min_leaf[new_id] = label;
-    }
-
-    // Renumber labels to be contiguous 1..k
-    let leaf_labels: Vec<usize> = (0..n)
-        .map(|i| {
-            let r = find(&mut parent, i);
-            min_leaf[r]
-        })
-        .collect();
-    let mut unique: Vec<usize> = leaf_labels.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    Ok(leaf_labels
-        .iter()
-        .map(|&l| unique.binary_search(&l).unwrap_or(0) + 1)
-        .collect())
+    // With a count of at least one, the probe at the root's index always passes, so `hi`
+    // falls below n. It can only stay at n when a NaN makes that probe fail.
+    let cutoff = *mc.get(hi - 1).ok_or_else(|| {
+        ClusterError::InvalidArgument("no monocrit threshold forms max_clusters clusters".into())
+    })?;
+    Ok(cluster_monocrit(z, mc, cutoff))
 }
 
 /// Validate a linkage matrix.
@@ -5471,14 +5644,15 @@ pub fn optimal_leaf_ordering(z: &[[f64; 4]], y: &[f64]) -> Result<Vec<[f64; 4]>,
 /// Combines distance computation, linkage, and fcluster into one step.
 /// Equivalent to calling `linkage` then `fcluster`.
 ///
-/// Matches `scipy.cluster.hierarchy.fclusterdata`.
+/// Matches `scipy.cluster.hierarchy.fclusterdata(X, t, criterion, metric='euclidean', depth,
+/// method, R)`: `criterion` carries `t`, `depth` and `R` as in [`fcluster`].
 pub fn fclusterdata(
     data: &[Vec<f64>],
-    max_clusters: usize,
+    criterion: FclusterCriterion<'_>,
     method: LinkageMethod,
 ) -> Result<Vec<usize>, ClusterError> {
     let z = linkage(data, method)?;
-    fcluster(&z, max_clusters)
+    fcluster(&z, criterion)
 }
 
 /// Compute cophenetic distances from a linkage matrix.
@@ -5617,6 +5791,14 @@ fn collect_depths(z: &[[f64; 4]], node: usize, n: usize, depth: usize, dists: &m
     }
 }
 
+/// SciPy's `_hierarchy` subtree maximum, `max(acc, child)` in Cython: `acc` is kept
+/// unless `child > acc`. So a NaN in a node's own value makes that node's entry NaN,
+/// while a NaN child is skipped. `f64::max` would instead drop a NaN `acc` and report
+/// the children's maximum.
+fn subtree_max(acc: f64, child: f64) -> f64 {
+    if child > acc { child } else { acc }
+}
+
 /// Maximum linkage distance within each non-singleton cluster's subtree.
 ///
 /// Matches `scipy.cluster.hierarchy.maxdists`. `MD[i]` is the largest link
@@ -5634,10 +5816,10 @@ pub fn maxdists(z: &[[f64; 4]]) -> Vec<f64> {
         let c1 = row[0] as usize;
         let c2 = row[1] as usize;
         if c1 >= n {
-            m = m.max(md[c1 - n]);
+            m = subtree_max(m, md[c1 - n]);
         }
         if c2 >= n {
-            m = m.max(md[c2 - n]);
+            m = subtree_max(m, md[c2 - n]);
         }
         md[i] = m;
     }
@@ -5753,10 +5935,10 @@ pub fn max_rstat(z: &[[f64; 4]], r: &[[f64; 4]], i: usize) -> Result<Vec<f64>, C
         let c1 = row[0] as usize;
         let c2 = row[1] as usize;
         if c1 >= n {
-            m = m.max(out[c1 - n]);
+            m = subtree_max(m, out[c1 - n]);
         }
         if c2 >= n {
-            m = m.max(out[c2 - n]);
+            m = subtree_max(m, out[c2 - n]);
         }
         out[j] = m;
     }
@@ -10222,6 +10404,27 @@ mod tests {
         assert!((z[0][2] - 1.0).abs() < 1e-10);
     }
 
+    /// SciPy 1.17.1 `linkage([[1e200], [-1e200], [0]], method='centroid')` raises `ValueError:
+    /// The condensed distance matrix must contain only finite values.`: the points are finite
+    /// but two of them are 2e200 apart, whose square overflows to inf in the euclidean distance.
+    /// fsci checked only the observations, and the centroid update then formed inf - inf = NaN
+    /// and clamped it to a 0.0 merge height. `[[1], [3], [0]]` is SciPy's
+    /// [[0, 2, 1, 2], [1, 3, 2.5, 3]] and must not change.
+    #[test]
+    fn linkage_refuses_an_overflowing_distance_like_scipy() {
+        for method in [LinkageMethod::Centroid, LinkageMethod::Single] {
+            let err = linkage(&[vec![1e200], vec![-1e200], vec![0.0]], method)
+                .expect_err("scipy raises on a non-finite condensed distance");
+            assert!(
+                matches!(&err, ClusterError::InvalidArgument(msg) if msg.contains("only finite values")),
+                "{method:?}: {err:?}"
+            );
+        }
+        let z = linkage(&[vec![1.0], vec![3.0], vec![0.0]], LinkageMethod::Centroid)
+            .expect("finite data links");
+        assert_eq!(z, vec![[0.0, 2.0, 1.0, 2.0], [1.0, 3.0, 2.5, 3.0]]);
+    }
+
     #[test]
     fn linkage_from_distances_skips_inactive_clusters_after_merge() {
         let condensed = vec![10.0, 4.0, 9.0, 8.0, 8.0, 1.0];
@@ -10396,87 +10599,219 @@ mod tests {
     fn fcluster_two_groups() {
         let data = vec![vec![0.0], vec![1.0], vec![10.0], vec![11.0]];
         let z = linkage(&data, LinkageMethod::Complete).unwrap();
-        let labels = fcluster(&z, 2).unwrap();
+        let labels = fcluster(&z, FclusterCriterion::MaxClust(2)).unwrap();
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[2], labels[3]);
         assert_ne!(labels[0], labels[2]);
     }
 
     #[test]
-    fn fcluster_unionfind_matches_relabel_reference() {
-        // The union-find maxclust cut must reproduce the original O(n^2)
-        // per-merge relabel exactly (same partition, same min-leaf labels, same
-        // 1..k renumbering) across linkage methods, sizes, and cut counts.
-        fn relabel(z: &[[f64; 4]], max_clusters: usize) -> Vec<usize> {
-            let n = z.len() + 1;
-            if max_clusters >= n || max_clusters == 0 {
-                return (1..=n).collect();
-            }
-            let mut cluster_of = vec![0usize; 2 * n - 1];
-            for (i, c) in cluster_of.iter_mut().enumerate().take(n) {
-                *c = i;
-            }
-            for (step, row) in z.iter().enumerate().take(n - max_clusters) {
-                let new_id = n + step;
-                let (ci, cj) = (row[0] as usize, row[1] as usize);
-                let label = cluster_of[ci].min(cluster_of[cj]);
-                let (oi, oj) = (cluster_of[ci], cluster_of[cj]);
-                for v in cluster_of.iter_mut().take(new_id + 1) {
-                    if *v == oi || *v == oj {
-                        *v = label;
-                    }
-                }
-                cluster_of[new_id] = label;
-            }
-            let leaf: Vec<usize> = cluster_of[..n].to_vec();
-            let mut u = leaf.clone();
-            u.sort_unstable();
-            u.dedup();
-            leaf.iter()
-                .map(|&l| u.binary_search(&l).unwrap() + 1)
-                .collect()
-        }
-        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 11) as f64 / (1u64 << 53) as f64 * 10.0
-        };
-        let methods = [
-            LinkageMethod::Single,
-            LinkageMethod::Complete,
-            LinkageMethod::Average,
-            LinkageMethod::Ward,
-            LinkageMethod::Centroid,
-            LinkageMethod::Median,
+    fn fcluster_maxclust_takes_whole_ties_and_numbers_like_scipy() {
+        use FclusterCriterion::MaxClust;
+        // SciPy 1.17.1 linkage([[0],[1],[2],[10],[11],[12]], 'single'): four merges tie at 1.
+        let line = [
+            [0.0, 1.0, 1.0, 2.0],
+            [2.0, 6.0, 1.0, 3.0],
+            [3.0, 4.0, 1.0, 2.0],
+            [5.0, 8.0, 1.0, 3.0],
+            [7.0, 9.0, 8.0, 6.0],
         ];
-        for &n in &[2usize, 5, 30, 90] {
-            for &m in &methods {
-                let data: Vec<Vec<f64>> = (0..n).map(|_| vec![next(), next()]).collect();
-                let Ok(z) = linkage(&data, m) else { continue };
-                for k in 1..=n {
-                    assert_eq!(fcluster(&z, k).unwrap(), relabel(&z, k), "n={n} k={k}");
-                }
-            }
+        // No cut through the tie exists, so 3, 4 and 5 clusters all give SciPy's two.
+        for k in 2..=5 {
+            assert_eq!(
+                fcluster(&line, MaxClust(k)).unwrap(),
+                [1, 1, 1, 2, 2, 2],
+                "k={k}"
+            );
         }
+        assert_eq!(fcluster(&line, MaxClust(1)).unwrap(), [1; 6]);
+        assert_eq!(fcluster(&line, MaxClust(6)).unwrap(), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(fcluster(&line, MaxClust(7)).unwrap(), [1, 2, 3, 4, 5, 6]);
+
+        // Ward linkage of diff_cluster's n=10 seed-100 points, from SciPy: rows 5 and 6 tie
+        // at 6.184..., so maxclust 4 gives three clusters. The pre-port code cut after
+        // n - k = 6 merges and returned four.
+        let ward = [
+            [3.0, 8.0, 1.2999999999999998, 2.0],
+            [0.0, 5.0, 1.3000000000000007, 2.0],
+            [4.0, 9.0, 1.3000000000000007, 2.0],
+            [1.0, 6.0, 1.8384776310850226, 2.0],
+            [2.0, 7.0, 1.8384776310850233, 2.0],
+            [12.0, 14.0, 6.184254199173899, 4.0],
+            [10.0, 13.0, 6.184254199173899, 4.0],
+            [15.0, 16.0, 19.23330444827409, 8.0],
+            [11.0, 17.0, 21.949259668608413, 10.0],
+        ];
+        let scipy = [1, 3, 2, 3, 2, 1, 3, 2, 3, 2];
+        assert_eq!(fcluster(&ward, MaxClust(4)).unwrap(), scipy);
+        assert_eq!(fcluster(&ward, MaxClust(3)).unwrap(), scipy);
+
+        // Label numbering follows SciPy's depth-first walk, not the smallest member: leaf 2
+        // is the root's left child and is labelled only after the right subtree.
+        let ward6 = [
+            [0.0, 5.0, 1.8384776310850235, 2.0],
+            [1.0, 3.0, 3.9962482405376174, 2.0],
+            [4.0, 7.0, 8.874870891079674, 3.0],
+            [6.0, 8.0, 15.854547192104437, 5.0],
+            [2.0, 9.0, 16.526544305046553, 6.0],
+        ];
+        assert_eq!(fcluster(&ward6, MaxClust(4)).unwrap(), [1, 2, 4, 2, 3, 1]);
     }
 
     #[test]
-    fn fcluster_singleton_fast_path_is_one_based() {
+    fn fcluster_distance_inconsistent_and_monocrit_criteria_match_scipy() {
+        use FclusterCriterion::{Distance, Inconsistent, MaxClustMonocrit, Monocrit};
+        // SciPy 1.17.1 linkage(X, 'average') for
+        // X = [[0,0],[0,1],[5,0],[5,1.5],[5.2,3],[12,0],[0.4,0.3]].
+        let z = [
+            [0.0, 6.0, 0.5, 2.0],
+            [1.0, 7.0, 0.9031128874149275, 3.0],
+            [2.0, 3.0, 1.5, 2.0],
+            [4.0, 9.0, 2.259966935358369, 3.0],
+            [8.0, 10.0, 5.198864908984187, 6.0],
+            [5.0, 11.0, 9.539457573791843, 7.0],
+        ];
+        for (t, want) in [
+            (0.5, [1, 2, 3, 4, 5, 6, 1]),
+            (1.2, [1, 1, 2, 3, 4, 5, 1]),
+            (2.0, [1, 1, 2, 2, 3, 4, 1]),
+            (5.0, [1, 1, 2, 2, 2, 3, 1]),
+            (20.0, [1; 7]),
+        ] {
+            assert_eq!(fcluster(&z, Distance(t)).unwrap(), want, "distance t={t}");
+        }
+        for (t, depth, want) in [
+            (0.5, 2, [1, 2, 3, 3, 4, 5, 1]),
+            (0.8, 2, [1, 1, 2, 2, 2, 3, 1]),
+            (1.2, 2, [1; 7]),
+            (1.2, 3, [1, 1, 2, 2, 2, 3, 1]),
+        ] {
+            let got = fcluster(&z, Inconsistent { t, depth, r: None }).unwrap();
+            assert_eq!(got, want, "inconsistent t={t} depth={depth}");
+        }
+        let r1 = inconsistent(&z, 1);
+        let got = fcluster(
+            &z,
+            Inconsistent {
+                t: 1.0,
+                depth: 2,
+                r: Some(&r1),
+            },
+        )
+        .unwrap();
+        assert_eq!(got, [1; 7], "an explicit R overrides depth");
+
+        let md = maxdists(&z);
+        assert_eq!(
+            fcluster(
+                &z,
+                Monocrit {
+                    t: 2.0,
+                    monocrit: &md
+                }
+            )
+            .unwrap(),
+            [1, 1, 2, 2, 3, 4, 1]
+        );
+        let got = fcluster(
+            &z,
+            MaxClustMonocrit {
+                max_clusters: 3,
+                monocrit: &md,
+            },
+        )
+        .unwrap();
+        assert_eq!(got, [1, 1, 2, 2, 2, 3, 1]);
+        let mi = maxinconsts(&z, &inconsistent(&z, 2)).unwrap();
+        let got = fcluster(
+            &z,
+            MaxClustMonocrit {
+                max_clusters: 2,
+                monocrit: &mi,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            got, [1; 7],
+            "tied top inconsistencies leave no two-cluster cut"
+        );
+    }
+
+    #[test]
+    fn fcluster_singletons_and_rejected_inputs() {
+        use FclusterCriterion::{Inconsistent, MaxClust, MaxClustMonocrit, Monocrit};
         let data = vec![vec![0.0], vec![1.0], vec![10.0], vec![11.0]];
         let z = linkage(&data, LinkageMethod::Complete).unwrap();
 
-        assert_eq!(fcluster(&z, 0).unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(fcluster(&z, 4).unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(fcluster(&z, 5).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(fcluster(&z, MaxClust(4)).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(fcluster(&z, MaxClust(5)).unwrap(), vec![1, 2, 3, 4]);
+        // SciPy reads past its criterion array for t = 0 and raises for an empty Z.
+        assert!(fcluster(&z, MaxClust(0)).is_err());
+        assert!(fcluster(&[], MaxClust(1)).is_err());
+        let short = [0.0, 1.0];
+        assert!(
+            fcluster(
+                &z,
+                Monocrit {
+                    t: 1.0,
+                    monocrit: &short
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            fcluster(
+                &z,
+                MaxClustMonocrit {
+                    max_clusters: 2,
+                    monocrit: &short
+                }
+            )
+            .is_err()
+        );
+        let r_short = [[1.0, 0.0, 1.0, 0.0]];
+        assert!(
+            fcluster(
+                &z,
+                Inconsistent {
+                    t: 1.0,
+                    depth: 2,
+                    r: Some(&r_short)
+                }
+            )
+            .is_err()
+        );
+        let r_bad = [[1.0, -1.0, 1.0, 0.0]; 3];
+        assert!(
+            fcluster(
+                &z,
+                Inconsistent {
+                    t: 1.0,
+                    depth: 2,
+                    r: Some(&r_bad)
+                }
+            )
+            .is_err()
+        );
+        // A NaN at the root makes every maxclust probe fail; SciPy would read out of bounds.
+        let nan_root = [0.0, 1.0, f64::NAN];
+        assert!(
+            fcluster(
+                &z,
+                MaxClustMonocrit {
+                    max_clusters: 1,
+                    monocrit: &nan_root
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn fcluster_rejects_invalid_linkage_indices() {
         let invalid = [[0.0, 99.0, 1.0, 2.0]];
         assert!(matches!(
-            fcluster(&invalid, 1),
+            fcluster(&invalid, FclusterCriterion::MaxClust(1)),
             Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
         ));
         assert!(matches!(
@@ -10888,7 +11223,12 @@ mod tests {
     #[test]
     fn fclusterdata_combines_workflow() {
         let data = vec![vec![0.0], vec![1.0], vec![10.0], vec![11.0]];
-        let labels = fclusterdata(&data, 2, LinkageMethod::Complete).unwrap();
+        let labels = fclusterdata(
+            &data,
+            FclusterCriterion::MaxClust(2),
+            LinkageMethod::Complete,
+        )
+        .unwrap();
         assert_eq!(labels.len(), 4);
         // First two in one cluster, last two in another
         assert_eq!(labels[0], labels[1]);
@@ -11239,7 +11579,7 @@ mod tests {
             [5.0, 8.0, 1.0, 3.0],
             [7.0, 9.0, 6.4031242374328485, 6.0],
         ];
-        let labels = fcluster(&z, 2).expect("fcluster should succeed");
+        let labels = fcluster(&z, FclusterCriterion::MaxClust(2)).expect("fcluster should succeed");
         let expected = [1, 1, 1, 2, 2, 2];
         for (i, (&got, &want)) in labels.iter().zip(expected.iter()).enumerate() {
             assert_eq!(got, want, "fcluster[{i}] got {got}, expected {want}");
@@ -11450,9 +11790,10 @@ mod tests {
             [2.0, 3.0, 1.0, 2.0],
             [4.0, 5.0, 6.403_124_237_432_849, 4.0],
         ];
-        assert_eq!(fcluster(&z, 2).expect("fc2"), vec![1, 1, 2, 2]);
-        assert_eq!(fcluster(&z, 1).expect("fc1"), vec![1, 1, 1, 1]);
-        assert_eq!(fcluster(&z, 4).expect("fc4"), vec![1, 2, 3, 4]);
+        let maxclust = |k| fcluster(&z, FclusterCriterion::MaxClust(k));
+        assert_eq!(maxclust(2).expect("fc2"), vec![1, 1, 2, 2]);
+        assert_eq!(maxclust(1).expect("fc1"), vec![1, 1, 1, 1]);
+        assert_eq!(maxclust(4).expect("fc4"), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -11610,7 +11951,8 @@ mod tests {
             vec![4.0, 4.0],
             vec![4.0, 5.0],
         ];
-        let result = fclusterdata(&data, 2, LinkageMethod::Single).expect("fclusterdata");
+        let result = fclusterdata(&data, FclusterCriterion::MaxClust(2), LinkageMethod::Single)
+            .expect("fclusterdata");
         // First two points should be in same cluster, last two in another
         assert_eq!(result[0], result[1], "points 0,1 should be in same cluster");
         assert_eq!(result[2], result[3], "points 2,3 should be in same cluster");
@@ -12042,6 +12384,80 @@ mod tests {
         assert_eq!(m2, vec![2, 1]);
         // Invalid (cluster split across two subtrees) is rejected.
         assert!(leaders(&z, &[1, 2, 1, 2, 1]).is_err());
+    }
+
+    /// SciPy takes these subtree maxima as Cython's `max(acc, child)`, which keeps `acc` unless
+    /// `child > acc`: a node whose own value is NaN reports NaN, and a NaN child is skipped.
+    /// Neither `is_valid_linkage` nor `is_valid_im` rejects a NaN. SciPy 1.17.1, with
+    /// Z = [[0,1,l,2],[2,3,r,2],[4,5,root,4]] and R = [[1,0,1,0],[2,0,1,0],[2,1,3,1]]
+    /// (inconsistent(Z) for l, r, root = 1, 2, 3):
+    /// - maxdists, root = nan: [1, 2, nan]. fsci's `f64::max` fold dropped the NaN: [1, 2, 2].
+    /// - maxdists on the chain [[0,1,1,2],[4,2,nan,3],[5,3,3,4]]: [1, nan, 3]. fsci: [1, 1, 3].
+    /// - maxRstat(Z, R, 0), R[2,0] = nan: [1, 2, nan]. maxinconsts, R[2,3] = nan: [0, 0, nan].
+    ///
+    /// Must not change. A NaN child is skipped: l = nan, r = 5 gives maxdists [nan, 5, 5], and
+    /// R[0,0] = nan gives maxRstat(Z, R, 0) = [nan, 2, 2]. A fold that propagated every NaN would
+    /// break both. Finite: maxdists [1, 2, 3], the inversion l = 5 gives [5, 2, 5], and
+    /// maxRstat(Z, R, 0) = [1, 2, 2].
+    #[test]
+    fn subtree_maxima_keep_scipys_nan_semantics() {
+        let same = |got: &[f64], want: &[f64]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|(g, w)| (g.is_nan() && w.is_nan()) || g == w)
+        };
+        let nan = f64::NAN;
+        let tree = |left: f64, right: f64, root: f64| {
+            [
+                [0.0, 1.0, left, 2.0],
+                [2.0, 3.0, right, 2.0],
+                [4.0, 5.0, root, 4.0],
+            ]
+        };
+        let r_base = [
+            [1.0, 0.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0, 0.0],
+            [2.0, 1.0, 3.0, 1.0],
+        ];
+        let z = tree(1.0, 2.0, 3.0);
+
+        // SciPy keeps a node's own NaN.
+        let got = maxdists(&tree(1.0, 2.0, nan));
+        assert!(same(&got, &[1.0, 2.0, nan]), "root NaN: {got:?}");
+        let chain = [
+            [0.0, 1.0, 1.0, 2.0],
+            [4.0, 2.0, nan, 3.0],
+            [5.0, 3.0, 3.0, 4.0],
+        ];
+        let got = maxdists(&chain);
+        assert!(same(&got, &[1.0, nan, 3.0]), "chain middle NaN: {got:?}");
+        let mut r = r_base;
+        r[2][0] = nan;
+        let got = max_rstat(&z, &r, 0).expect("valid Z and R");
+        assert!(same(&got, &[1.0, 2.0, nan]), "maxRstat root NaN: {got:?}");
+        let mut r = r_base;
+        r[2][3] = nan;
+        let got = maxinconsts(&z, &r).expect("valid Z and R");
+        assert!(
+            same(&got, &[0.0, 0.0, nan]),
+            "maxinconsts root NaN: {got:?}"
+        );
+
+        // Must not change: SciPy skips a NaN child, and finite inputs are untouched.
+        let got = maxdists(&tree(nan, 5.0, 3.0));
+        assert!(same(&got, &[nan, 5.0, 5.0]), "NaN child: {got:?}");
+        let mut r = r_base;
+        r[0][0] = nan;
+        let got = max_rstat(&z, &r, 0).expect("valid Z and R");
+        assert!(same(&got, &[nan, 2.0, 2.0]), "maxRstat NaN child: {got:?}");
+        assert_eq!(maxdists(&z), vec![1.0, 2.0, 3.0]);
+        assert_eq!(maxdists(&tree(5.0, 2.0, 3.0)), vec![5.0, 2.0, 5.0]);
+        assert_eq!(
+            max_rstat(&z, &r_base, 0).expect("valid Z and R"),
+            vec![1.0, 2.0, 2.0]
+        );
     }
 
     #[test]

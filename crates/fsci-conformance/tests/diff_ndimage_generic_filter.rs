@@ -12,10 +12,12 @@
 //!
 //! Plus edge-case errors: size = 0, empty input.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     BoundaryMode, NdArray, generic_filter, maximum_filter, minimum_filter, uniform_filter,
 };
@@ -36,6 +38,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -70,9 +73,35 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// One equivalence case: the plain filter is the reference side (its failure is
+/// `oracle_missing`), the `generic_filter` closure is the fsci side. Returns the verdict and
+/// note for the diff log when both sides produced an array.
+fn compare_equivalent(
+    ledger: &mut CompareLedger,
+    arm: &str,
+    case_id: &str,
+    reference: Option<&NdArray>,
+    variant: Option<&NdArray>,
+) -> Option<(bool, String)> {
+    let (r, v) = ledger.slices(
+        arm,
+        case_id,
+        reference.map(|r| r.data.as_slice()),
+        variant.map(|v| v.data.as_slice()),
+    )?;
+    let d = max_abs(v, r);
+    let pass = variant.map(|v| &v.shape) == reference.map(|r| &r.shape) && d <= ABS_TOL;
+    ledger.compared(arm, case_id, pass);
+    Some((pass, format!("max_abs={d}")))
+}
+
 #[test]
 fn diff_ndimage_generic_filter() {
     let start = Instant::now();
+    let mut ledger = CompareLedger::new(
+        "diff_ndimage_generic_filter",
+        &["maximum_filter", "minimum_filter", "uniform_filter"],
+    );
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut check = |id: &str, ok: bool, note: String| {
         diffs.push(CaseDiff {
@@ -98,13 +127,18 @@ fn diff_ndimage_generic_filter() {
             mode,
             0.0,
         )
-        .expect("generic max");
-        let m = maximum_filter(&arr, size, mode, 0.0).expect("maximum_filter");
-        check(
-            "max_closure_eq_maximum_filter",
-            g.shape == m.shape && max_abs(&g.data, &m.data) <= ABS_TOL,
-            format!("max_abs={}", max_abs(&g.data, &m.data)),
-        );
+        .ok();
+        let m = maximum_filter(&arr, size, mode, 0.0).ok();
+        let case_id = "max_closure_eq_maximum_filter";
+        if let Some((ok, note)) = compare_equivalent(
+            &mut ledger,
+            "maximum_filter",
+            case_id,
+            m.as_ref(),
+            g.as_ref(),
+        ) {
+            check(case_id, ok, note);
+        }
     }
 
     // === closure = min → equals minimum_filter ===
@@ -116,26 +150,35 @@ fn diff_ndimage_generic_filter() {
             mode,
             0.0,
         )
-        .expect("generic min");
-        let m = minimum_filter(&arr, size, mode, 0.0).expect("minimum_filter");
-        check(
-            "min_closure_eq_minimum_filter",
-            g.shape == m.shape && max_abs(&g.data, &m.data) <= ABS_TOL,
-            format!("max_abs={}", max_abs(&g.data, &m.data)),
-        );
+        .ok();
+        let m = minimum_filter(&arr, size, mode, 0.0).ok();
+        let case_id = "min_closure_eq_minimum_filter";
+        if let Some((ok, note)) = compare_equivalent(
+            &mut ledger,
+            "minimum_filter",
+            case_id,
+            m.as_ref(),
+            g.as_ref(),
+        ) {
+            check(case_id, ok, note);
+        }
     }
 
     // === closure = sum / size² → equals uniform_filter ===
     {
         let size_sq = (size * size) as f64;
-        let g = generic_filter(&arr, |w| w.iter().sum::<f64>() / size_sq, size, mode, 0.0)
-            .expect("generic uniform");
-        let u = uniform_filter(&arr, size, mode, 0.0).expect("uniform_filter");
-        check(
-            "sum_closure_eq_uniform_filter",
-            g.shape == u.shape && max_abs(&g.data, &u.data) <= ABS_TOL,
-            format!("max_abs={}", max_abs(&g.data, &u.data)),
-        );
+        let g = generic_filter(&arr, |w| w.iter().sum::<f64>() / size_sq, size, mode, 0.0).ok();
+        let u = uniform_filter(&arr, size, mode, 0.0).ok();
+        let case_id = "sum_closure_eq_uniform_filter";
+        if let Some((ok, note)) = compare_equivalent(
+            &mut ledger,
+            "uniform_filter",
+            case_id,
+            u.as_ref(),
+            g.as_ref(),
+        ) {
+            check(case_id, ok, note);
+        }
     }
 
     // === Closure receives exactly size^ndim values per call ===
@@ -199,6 +242,7 @@ fn diff_ndimage_generic_filter() {
         test_id: "diff_ndimage_generic_filter".into(),
         category: "fsci_ndimage::generic_filter coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -217,4 +261,6 @@ fn diff_ndimage_generic_filter() {
         "generic_filter coverage failed: {} cases",
         diffs.len()
     );
+    // Each arm is one equivalence case against its plain filter.
+    ledger.finish(1);
 }

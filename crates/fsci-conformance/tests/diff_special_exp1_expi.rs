@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-jwpvv]. exp1(x) = E_1(x), expi(x) = Ei(x).
 //! Tolerance: 1e-8 rel for moderate magnitudes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{exp1, expi};
@@ -19,6 +20,8 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REL_TOL: f64 = 1.0e-8;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op compared.
+const ARMS: [&str; 2] = ["exp1", "expi"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -57,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -205,15 +209,13 @@ fn diff_special_exp1_expi() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_exp1_expi", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
-        let Some(actual) = fsci_eval(&case.op, case.x) else {
+        let scipy = pmap.get(&case.case_id).and_then(|a| a.value);
+        let Some((expected, actual)) =
+            ledger.pair(&case.op, &case.case_id, scipy, fsci_eval(&case.op, case.x))
+        else {
             continue;
         };
         let abs_d = (actual - expected).abs();
@@ -223,6 +225,7 @@ fn diff_special_exp1_expi() {
             abs_d
         };
         max_rel = max_rel.max(rel_d);
+        ledger.compared(&case.op, &case.case_id, rel_d <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -238,6 +241,7 @@ fn diff_special_exp1_expi() {
         test_id: "diff_special_exp1_expi".into(),
         category: "fsci_special::exp1 + expi vs scipy.special".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -261,4 +265,11 @@ fn diff_special_exp1_expi() {
         diffs.len(),
         max_rel
     );
+    // Arms have different case sets (exp1 has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

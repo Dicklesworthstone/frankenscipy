@@ -1,25 +1,24 @@
 #![forbid(unsafe_code)]
-//! Live SciPy differential coverage for `scipy.stats.vonmises`.
+//! Live SciPy differential coverage for `scipy.stats.vonmises` and `scipy.stats.vonmises_line`.
 //!
 //! Resolves [frankenscipy-q291n]. VonMises (circular Gaussian
 //! analogue) has anchor tests in `fsci-stats/src/lib.rs` but no
-//! dedicated scipy diff harness. 6 (kappa, loc) pairs × 9
-//! x-values × 2 families (pdf, cdf) via subprocess.
+//! dedicated scipy diff harness. 9 (kappa, loc) pairs × 11
+//! x-values × 2 families (pdf, cdf) via subprocess, and the same points for VonmisesLine's pdf,
+//! cdf and ppf (frankenscipy-1ksfv.16), two of them outside [loc−π, loc+π] where the two
+//! distributions differ.
 //!
 //! pdf is closed-form via the modified Bessel I0 helper.
-//! cdf uses 2048-step trapezoidal integration over one period;
-//! the O(h²) floor at h ≈ 2π/2048 ≈ 3e-3 yields ~1e-5 abs.
+//! The cdf is the Bessel–Fourier series (frankenscipy-1qmf4), which replaced a trapezoid
+//! integration; CDF_TOL (1e-5) dates from the trapezoid and also bounds the ppf rows, which
+//! both sides get by root finding on the cdf. Every kappa but 50 is below SciPy's series cutoff
+//! (10.5). Past it SciPy's cdf is a normal approximation that drifts ~3e-6 from the exact
+//! series fsci keeps (frankenscipy-1qmf4), which CDF_TOL also covers.
 //!
-//! ppf is intentionally omitted — VonMises has no explicit
-//! ppf, so it would inherit the trait-default `ppf_bisection`
-//! over the 1e-5-noisy cdf, producing meaningless tolerances.
-//!
-//! x-grid is bounded within one period [loc−π, loc+π] so we
-//! exercise the within-period base_cdf branch (both fsci and
-//! scipy use the same "cycles + within-period cdf" convention,
-//! verified at vonmises.cdf(2π) ≈ 1.5).
+//! Outside one period the circular vonmises follows SciPy's "cycles + within-period cdf"
+//! convention (vonmises.cdf(2π) ≈ 1.5); vonmises_line is 0 or 1 there.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::PI;
 use std::fs;
 use std::io::Write;
@@ -27,7 +26,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_stats::{ContinuousDistribution, VonMises};
+use fsci_conformance::{ArmCounts, CompareLedger};
+use fsci_stats::{ContinuousDistribution, VonMises, VonmisesLine};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -41,6 +41,9 @@ struct PointCase {
     kappa: f64,
     loc: f64,
     x: f64,
+    /// The probability vonmises_line's ppf is compared at: 0 and 1 (the window's ends) for the
+    /// points outside the window.
+    level: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +56,9 @@ struct PointArm {
     case_id: String,
     pdf: Option<f64>,
     cdf: Option<f64>,
+    line_pdf: Option<f64>,
+    line_cdf: Option<f64>,
+    line_ppf: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -104,7 +111,11 @@ fn emit_log(log: &DiffLog) {
 fn generate_query() -> OracleQuery {
     // kappa = 0 ⇒ uniform on circle. kappa = ∞ ⇒ delta at loc.
     // Pick small/medium/large kappa and a few loc shifts.
-    let pairs: [(f64, f64); 6] = [
+    // The first three are frankenscipy-1ksfv.16's κ grid for vonmises_line.
+    let pairs: [(f64, f64); 9] = [
+        (0.1, 0.0),
+        (2.0, 0.0),
+        (50.0, 0.0),
         (0.5, 0.0),
         (1.0, 0.0),
         (3.0, 0.0),
@@ -114,8 +125,11 @@ fn generate_query() -> OracleQuery {
     ];
     let mut points = Vec::new();
     for &(kappa, loc) in &pairs {
-        // 9 x-values within one period [loc-π, loc+π]
-        let frac = [-0.95_f64, -0.7, -0.4, -0.15, 0.0, 0.15, 0.4, 0.7, 0.95];
+        // 9 x-values within one period [loc-π, loc+π], and two outside it, where the circular
+        // vonmises repeats and vonmises_line is 0 (pdf) or 0/1 (cdf).
+        let frac = [
+            -1.3_f64, -0.95, -0.7, -0.4, -0.15, 0.0, 0.15, 0.4, 0.7, 0.95, 1.27,
+        ];
         for &f in &frac {
             let x = loc + f * PI;
             points.push(PointCase {
@@ -123,6 +137,7 @@ fn generate_query() -> OracleQuery {
                 kappa,
                 loc,
                 x,
+                level: f.mul_add(0.5, 0.5).clamp(0.0, 1.0),
             });
         }
     }
@@ -133,21 +148,26 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import sys
-from scipy.stats import vonmises
+from scipy.stats import vonmises, vonmises_line
 
 q = json.load(sys.stdin)
 points = []
 for case in q["points"]:
     cid = case["case_id"]
     kappa = float(case["kappa"]); loc = float(case["loc"]); x = float(case["x"])
+    level = float(case["level"])
     try:
         points.append({
             "case_id": cid,
             "pdf": float(vonmises.pdf(x, kappa, loc=loc)),
             "cdf": float(vonmises.cdf(x, kappa, loc=loc)),
+            "line_pdf": float(vonmises_line.pdf(x, kappa, loc=loc)),
+            "line_cdf": float(vonmises_line.cdf(x, kappa, loc=loc)),
+            "line_ppf": float(vonmises_line.ppf(level, kappa, loc=loc)),
         })
     except Exception:
-        points.append({"case_id": cid, "pdf": None, "cdf": None})
+        points.append({"case_id": cid, "pdf": None, "cdf": None, "line_pdf": None,
+                       "line_cdf": None, "line_ppf": None})
 print(json.dumps({"points": points}))
 "#;
 
@@ -214,28 +234,36 @@ fn diff_stats_vonmises() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_vonmises",
+        &["pdf", "cdf", "line_pdf", "line_cdf", "line_ppf"],
+    );
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = VonMises::new(case.kappa, case.loc);
-        if let Some(spdf) = oracle.pdf {
-            let d = (dist.pdf(case.x) - spdf).abs();
+        let line = VonmisesLine::new(case.kappa, case.loc);
+        // vonmises_line's ppf is SciPy's generic root find on the same cdf, so it is held to the
+        // cdf's tolerance.
+        let arms = [
+            ("pdf", oracle.pdf, dist.pdf(case.x), PDF_TOL),
+            ("cdf", oracle.cdf, dist.cdf(case.x), CDF_TOL),
+            ("line_pdf", oracle.line_pdf, line.pdf(case.x), PDF_TOL),
+            ("line_cdf", oracle.line_cdf, line.cdf(case.x), CDF_TOL),
+            ("line_ppf", oracle.line_ppf, line.ppf(case.level), CDF_TOL),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pdf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= PDF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.x) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
@@ -246,6 +274,7 @@ fn diff_stats_vonmises() {
         test_id: "diff_stats_vonmises".into(),
         category: "scipy.stats.vonmises".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -270,4 +299,5 @@ fn diff_stats_vonmises() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

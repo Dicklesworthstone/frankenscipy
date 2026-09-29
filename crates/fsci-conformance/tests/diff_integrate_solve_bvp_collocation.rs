@@ -14,17 +14,20 @@
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case, not a
 //! skipped one (frankenscipy-olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{BvpOptions, solve_bvp};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-008";
+/// The single ledger arm: one verdict per case (status, nodes, p and sol(x) together).
+const LEDGER_ARM: &str = "solve_bvp";
 const P_REL_TOL: f64 = 1.0e-6;
 const SOL_TOL_FACTOR: f64 = 10.0;
 const NODE_RATIO_TOL: f64 = 1.5;
@@ -217,6 +220,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     same_mesh_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -353,6 +357,7 @@ fn diff_integrate_solve_bvp_collocation() {
         .collect();
 
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_solve_bvp_collocation", &[LEDGER_ARM]);
     for case in &cases {
         let arm = &arms[case.id];
         let options = BvpOptions {
@@ -362,6 +367,11 @@ fn diff_integrate_solve_bvp_collocation() {
             ..BvpOptions::default()
         };
         let fsci = solve_bvp(case.fun, case.bc, &case.x, &case.y, &case.p, options);
+        let fsci_error = fsci.as_ref().err().map(|e| format!("fsci error {e}"));
+        let scipy = match (&arm.sol, &arm.x, &arm.p) {
+            (Some(sol), Some(x), Some(p)) => Some((sol, x, p)),
+            _ => None,
+        };
         let mut diff = CaseDiff {
             case_id: case.id.to_string(),
             fsci_status: usize::MAX,
@@ -374,12 +384,13 @@ fn diff_integrate_solve_bvp_collocation() {
             pass: false,
             reason: String::new(),
         };
-        match (fsci, &arm.sol, &arm.x, &arm.p) {
-            (Err(e), ..) => diff.reason = format!("fsci error {e}"),
-            (Ok(_), None, ..) | (Ok(_), _, None, _) | (Ok(_), _, _, None) => {
-                diff.reason = "SciPy produced no result".to_string();
+        // SciPy giving no result is recorded as oracle_missing, an fsci error as rust_failed;
+        // both leave the case failed below, as before.
+        match ledger.both(LEDGER_ARM, case.id, scipy, fsci.ok()) {
+            None => {
+                diff.reason = fsci_error.unwrap_or_else(|| "SciPy produced no result".to_string());
             }
-            (Ok(r), Some(scipy_sol), Some(scipy_x), Some(scipy_p)) => {
+            Some(((scipy_sol, scipy_x, scipy_p), r)) => {
                 diff.fsci_status = r.status;
                 diff.fsci_nodes = r.x.len();
                 diff.same_mesh = r.x.len() == scipy_x.len()
@@ -421,6 +432,32 @@ fn diff_integrate_solve_bvp_collocation() {
                 if diff.max_sol_diff.is_nan() || diff.max_sol_diff > SOL_TOL_FACTOR * case.tol {
                     problems.push(format!("sol diff {:e}", diff.max_sol_diff));
                 }
+                // The max folds above swallow a NaN component and their zips truncate; the
+                // ledger sees every sol(x) component and every p. It records a failure here
+                // itself, so only a case that passes both gets a compared verdict.
+                let fsci_sol: Vec<f64> = xs.iter().flat_map(|&t| r.sol(t)).collect();
+                let scipy_sol_flat: Vec<f64> = scipy_sol.iter().flatten().copied().collect();
+                let ledger_rejected = ledger
+                    .slices(
+                        LEDGER_ARM,
+                        case.id,
+                        Some(scipy_sol_flat.as_slice()),
+                        Some(fsci_sol.as_slice()),
+                    )
+                    .is_none()
+                    || ledger
+                        .slices(
+                            LEDGER_ARM,
+                            case.id,
+                            Some(scipy_p.as_slice()),
+                            Some(r.p.as_slice()),
+                        )
+                        .is_none();
+                if ledger_rejected {
+                    problems.push("non-finite or mis-sized sol(x) or p".to_string());
+                } else {
+                    ledger.compared(LEDGER_ARM, case.id, problems.is_empty());
+                }
                 diff.pass = problems.is_empty();
                 diff.reason = problems.join("; ");
             }
@@ -434,6 +471,7 @@ fn diff_integrate_solve_bvp_collocation() {
         test_id: "diff_integrate_solve_bvp_collocation".into(),
         category: "scipy.integrate.solve_bvp (collocation)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         same_mesh_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -465,4 +503,5 @@ fn diff_integrate_solve_bvp_collocation() {
     );
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
     assert!(all_pass, "solve_bvp vs scipy.integrate.solve_bvp failed");
+    ledger.finish(cases.len());
 }

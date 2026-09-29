@@ -15,13 +15,14 @@
 //! (statistic + pvalue + df) = 36 cases via subprocess.
 //! Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::ttest_rel;
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +46,21 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // Identical samples give SciPy's NaN statistic and pvalue; they arrive as "nan", not null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     statistic: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     pvalue: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     df: Option<f64>,
 }
 
@@ -68,6 +82,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -148,11 +163,14 @@ import numpy as np
 from scipy import stats
 
 def fnone(v):
+    # A NaN answer is sent as "nan", so the harness can tell it from a raised call (null).
     try:
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    if math.isfinite(v):
+        return v
+    return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
 
 q = json.load(sys.stdin)
 points = []
@@ -235,33 +253,40 @@ fn diff_stats_ttest_rel() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_ttest_rel", &["statistic", "pvalue", "df"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let result = match ttest_rel(&case.a, &case.b, Some(&case.alternative)) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let result = ttest_rel(&case.a, &case.b, Some(&case.alternative)).ok();
 
-        let arms: [(&str, Option<f64>, f64); 3] = [
-            ("statistic", scipy_arm.statistic, result.statistic),
-            ("pvalue", scipy_arm.pvalue, result.pvalue),
-            ("df", scipy_arm.df, result.df),
+        let arms: [(&str, Option<f64>, Option<f64>); 3] = [
+            (
+                "statistic",
+                scipy_arm.statistic,
+                result.as_ref().map(|r| r.statistic),
+            ),
+            (
+                "pvalue",
+                scipy_arm.pvalue,
+                result.as_ref().map(|r| r.pvalue),
+            ),
+            ("df", scipy_arm.df, result.as_ref().map(|r| r.df)),
         ];
 
         for (arm_name, scipy_v, rust_v) in arms {
-            if let Some(scipy_v) = scipy_v
-                && rust_v.is_finite()
-            {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: arm_name.into(),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
+            let Some((scipy_v, rust_v)) = ledger.pair(arm_name, &case.case_id, scipy_v, rust_v)
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm_name, &case.case_id, abs_diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                arm: arm_name.into(),
+                abs_diff,
+                pass: abs_diff <= ABS_TOL,
+            });
         }
     }
 
@@ -271,6 +296,7 @@ fn diff_stats_ttest_rel() {
         test_id: "diff_stats_ttest_rel".into(),
         category: "scipy.stats.ttest_rel".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -295,4 +321,8 @@ fn diff_stats_ttest_rel() {
         diffs.len(),
         max_overall
     );
+    // SciPy 1.17.1 answers NaN for statistic and pvalue when every paired difference is zero
+    // (`matched_equal`). The oracle sends that NaN as "nan", so those cases compare as matching
+    // refusals when fsci also gives NaN, and every case counts.
+    ledger.finish(query.points.len());
 }

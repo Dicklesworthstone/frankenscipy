@@ -15,13 +15,14 @@
 //! 4 (a, b, c, d) fixtures × 3 funcs = 12 cases. Tol 1e-12 abs
 //! (closed-form integer-cast ratios — no transcendentals).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{odds_ratio, phi_coefficient, relative_risk};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -229,12 +231,13 @@ fn diff_stats_2x2_effect_sizes() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_2x2_effect_sizes",
+        &["relative_risk", "odds_ratio", "phi_coefficient"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
         let table = [
             [case.table[0], case.table[1]],
             [case.table[2], case.table[3]],
@@ -243,12 +246,15 @@ fn diff_stats_2x2_effect_sizes() {
             "relative_risk" => relative_risk(&table),
             "odds_ratio" => odds_ratio(&table),
             "phi_coefficient" => phi_coefficient(&table),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
-        if !rust_v.is_finite() {
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, Some(rust_v))
+        else {
             continue;
-        }
+        };
         let abs_diff = (rust_v - scipy_v).abs();
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
         max_overall = max_overall.max(abs_diff);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -264,6 +270,7 @@ fn diff_stats_2x2_effect_sizes() {
         test_id: "diff_stats_2x2_effect_sizes".into(),
         category: "scipy.stats.contingency.relative_risk + numpy reference".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -287,5 +294,12 @@ fn diff_stats_2x2_effect_sizes() {
         "2x2_effect_sizes conformance failed: {} cases, max_abs={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        query
+            .points
+            .iter()
+            .filter(|c| c.func == "relative_risk")
+            .count(),
     );
 }

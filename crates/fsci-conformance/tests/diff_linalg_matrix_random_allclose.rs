@@ -18,14 +18,37 @@
 //!   * symmetric (A == A^T) within tol
 //!   * positive definite (cholesky succeeds)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, cholesky, mat_allclose, random_matrix, random_spd};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per property check, each a single fixed case recorded under its own name.
+/// There is no SciPy side: the mat_allclose arms compare fsci's verdict with the documented
+/// boolean, the random_* arms are boolean invariants of fsci's own output, and
+/// `random_spd_symmetric` compares the element-wise asymmetry with its analytic value 0.
+const ARMS: [&str; 15] = [
+    "mat_allclose_within_tol_true",
+    "mat_allclose_outside_tol_false",
+    "mat_allclose_shape_mismatch_rows_false",
+    "mat_allclose_shape_mismatch_cols_false",
+    "mat_allclose_nan_nan_true",
+    "mat_allclose_inf_inf_true",
+    "mat_allclose_nan_vs_finite_false",
+    "random_matrix_shape",
+    "random_matrix_values_in_unit_interval",
+    "random_matrix_deterministic_same_seed",
+    "random_matrix_different_seed_different_matrix",
+    "random_spd_shape",
+    "random_spd_symmetric",
+    "random_spd_cholesky_succeeds",
+    "random_spd_deterministic_same_seed",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -39,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -70,7 +94,20 @@ fn emit_log(log: &DiffLog) {
 fn diff_linalg_matrix_random_allclose() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
-    let mut check = |id: &str, ok: bool, note: String| {
+    let mut ledger = CompareLedger::new("diff_linalg_matrix_random_allclose", &ARMS);
+    // Every check id is its own arm and its own case id. A numeric property passes its analytic
+    // reference and fsci's observed values as `values`: `slices` records a length mismatch or a
+    // non-finite element itself, and otherwise the check's existing pass condition is the
+    // compared verdict. A boolean property (`values` None) is compared directly.
+    let mut check = |id: &str, values: Option<(&[f64], &[f64])>, ok: bool, note: String| {
+        let present = values.is_none_or(|(reference, observed)| {
+            ledger
+                .slices(id, id, Some(reference), Some(observed))
+                .is_some()
+        });
+        if present {
+            ledger.compared(id, id, ok);
+        }
         diffs.push(CaseDiff {
             case_id: id.into(),
             pass: ok,
@@ -84,6 +121,7 @@ fn diff_linalg_matrix_random_allclose() {
         let b = vec![vec![1.0 + 1e-12, 2.0], vec![3.0 - 1e-12, 4.0]];
         check(
             "mat_allclose_within_tol_true",
+            None,
             mat_allclose(&a, &b, 1e-9, 1e-9),
             String::new(),
         );
@@ -91,6 +129,7 @@ fn diff_linalg_matrix_random_allclose() {
         let c = vec![vec![1.0, 2.0], vec![3.0, 99.0]];
         check(
             "mat_allclose_outside_tol_false",
+            None,
             !mat_allclose(&a, &c, 1e-9, 1e-9),
             String::new(),
         );
@@ -98,6 +137,7 @@ fn diff_linalg_matrix_random_allclose() {
         let d = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
         check(
             "mat_allclose_shape_mismatch_rows_false",
+            None,
             !mat_allclose(&a, &d, 1e-9, 1e-9),
             String::new(),
         );
@@ -110,6 +150,7 @@ fn diff_linalg_matrix_random_allclose() {
         let f = vec![vec![1.0, 2.0], vec![4.0, 5.0], vec![7.0, 8.0]];
         check(
             "mat_allclose_shape_mismatch_cols_false",
+            None,
             !mat_allclose(&e, &f, 1e-9, 1e-9),
             String::new(),
         );
@@ -119,6 +160,7 @@ fn diff_linalg_matrix_random_allclose() {
         let nan_b = vec![vec![f64::NAN, 1.0]];
         check(
             "mat_allclose_nan_nan_true",
+            None,
             mat_allclose(&nan_a, &nan_b, 1e-9, 1e-9),
             String::new(),
         );
@@ -128,6 +170,7 @@ fn diff_linalg_matrix_random_allclose() {
         let inf_b = vec![vec![f64::INFINITY, f64::NEG_INFINITY]];
         check(
             "mat_allclose_inf_inf_true",
+            None,
             mat_allclose(&inf_a, &inf_b, 1e-9, 1e-9),
             String::new(),
         );
@@ -137,6 +180,7 @@ fn diff_linalg_matrix_random_allclose() {
         let mixed_b = vec![vec![0.0, 1.0]];
         check(
             "mat_allclose_nan_vs_finite_false",
+            None,
             !mat_allclose(&mixed_a, &mixed_b, 1e-9, 1e-9),
             String::new(),
         );
@@ -147,11 +191,13 @@ fn diff_linalg_matrix_random_allclose() {
         let m = random_matrix(4, 5, 42);
         check(
             "random_matrix_shape",
+            None,
             m.len() == 4 && m.iter().all(|r| r.len() == 5),
             format!("rows={}", m.len()),
         );
         check(
             "random_matrix_values_in_unit_interval",
+            None,
             m.iter().flatten().all(|&v| (0.0..1.0).contains(&v)),
             "range_check".to_string(),
         );
@@ -159,6 +205,7 @@ fn diff_linalg_matrix_random_allclose() {
         let m2 = random_matrix(4, 5, 42);
         check(
             "random_matrix_deterministic_same_seed",
+            None,
             m == m2,
             String::new(),
         );
@@ -166,6 +213,7 @@ fn diff_linalg_matrix_random_allclose() {
         let m3 = random_matrix(4, 5, 99);
         check(
             "random_matrix_different_seed_different_matrix",
+            None,
             m != m3,
             String::new(),
         );
@@ -177,19 +225,27 @@ fn diff_linalg_matrix_random_allclose() {
         let s = random_spd(n, 123);
         check(
             "random_spd_shape",
+            None,
             s.len() == n && s.iter().all(|r| r.len() == n),
             format!("rows={}", s.len()),
         );
 
         // Symmetric: s[i][j] == s[j][i] within tight tol
         let mut max_asym = 0.0_f64;
+        // The element-wise asymmetry, whose analytic value is 0 everywhere. The max fold below
+        // swallows a NaN (`0.0_f64.max(NaN)` is 0.0); slices against the zeros does not.
+        let mut asym = Vec::with_capacity(n * n);
         for i in 0..n {
             for j in 0..n {
-                max_asym = max_asym.max((s[i][j] - s[j][i]).abs());
+                let d = (s[i][j] - s[j][i]).abs();
+                asym.push(d);
+                max_asym = max_asym.max(d);
             }
         }
+        let zeros = vec![0.0_f64; n * n];
         check(
             "random_spd_symmetric",
+            Some((zeros.as_slice(), asym.as_slice())),
             max_asym <= 1e-12,
             format!("max_asym={max_asym}"),
         );
@@ -198,13 +254,19 @@ fn diff_linalg_matrix_random_allclose() {
         let chol = cholesky(&s, true, DecompOptions::default());
         check(
             "random_spd_cholesky_succeeds",
+            None,
             chol.is_ok(),
             format!("chol_err={:?}", chol.err()),
         );
 
         // Determinism
         let s2 = random_spd(n, 123);
-        check("random_spd_deterministic_same_seed", s == s2, String::new());
+        check(
+            "random_spd_deterministic_same_seed",
+            None,
+            s == s2,
+            String::new(),
+        );
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -212,6 +274,7 @@ fn diff_linalg_matrix_random_allclose() {
         test_id: "diff_linalg_matrix_random_allclose".into(),
         category: "fsci_linalg::{mat_allclose, random_matrix, random_spd} coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -226,4 +289,6 @@ fn diff_linalg_matrix_random_allclose() {
     }
 
     assert!(all_pass, "matrand coverage failed: {} cases", diffs.len());
+    // Every arm is one fixed case, so each must have compared it.
+    ledger.finish(1);
 }

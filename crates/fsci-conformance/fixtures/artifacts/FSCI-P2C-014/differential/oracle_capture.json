@@ -1,16 +1,16 @@
 {
   "packet_id": "FSCI-P2C-014",
   "family": "interpolate_core",
-  "generated_unix_ms": 1788666502212,
+  "generated_unix_ms": 1790392934919,
   "runtime": {
     "python_version": "3.13.12",
     "numpy_version": "2.4.3",
     "scipy_version": "1.17.1"
   },
   "provenance": {
-    "fixture_input_blake3": "4b43ccdef7613c8450e8e5d954ae55962c4a2557e030404826ffe0f60e014620",
-    "oracle_output_blake3": "5837de2c2635ad4de297e0c395243a28b1a246c03d1760657121b72d7a6dbe10",
-    "capture_blake3": "83615099fa6b4f1d2bd9e45f4a192a9d2554118530b39c6c6a4cb784756e292a"
+    "fixture_input_blake3": "4f342c651e3e9070f46465bdc2d372c0899bbce2cbc8a6f6eda511ff2b79b8b8",
+    "oracle_output_blake3": "13714ca5879dfee08cdc5f5e6bd50b10a3b887033d79f705b6f32a8f509fbfde",
+    "capture_blake3": "dd3d01a8a88bacbf5f29734cc7e52239cc1537afdbf6cd1014a8a2c2c2bf179d"
   },
   "case_outputs": [
     {
@@ -156,7 +156,7 @@
       "result": {
         "values": [
           0.08795144690870421,
-          0.9837507595321284,
+          0.9837507595321283,
           4.817667418408722,
           12.343973112562663
         ]
@@ -267,7 +267,7 @@
         "values": [
           0.13805803571428574,
           1.1097098214285714,
-          1.9981026785714289,
+          1.9981026785714286,
           2.1478794642857144
         ]
       },

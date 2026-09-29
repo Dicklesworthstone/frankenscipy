@@ -72,6 +72,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501928
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392909532
 }

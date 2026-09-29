@@ -11,13 +11,14 @@
 //! via subprocess. Tol 1e-12 abs (closed-form rational
 //! arithmetic over hypergeometric pmf).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::fisher_exact;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -217,39 +219,28 @@ fn diff_stats_fisher_exact() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_fisher_exact", &["odds_ratio", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = fisher_exact(&case.table);
 
-        if let Some(scipy_or) = scipy_arm.odds_ratio {
-            let abs_diff = if scipy_or.is_infinite()
-                && result.odds_ratio.is_infinite()
-                && scipy_or.signum() == result.odds_ratio.signum()
-            {
-                0.0
-            } else if result.odds_ratio.is_finite() && scipy_or.is_finite() {
-                (result.odds_ratio - scipy_or).abs()
-            } else {
-                f64::INFINITY
+        // An infinite odds ratio (b*c = 0) is recorded by `pair` itself: compared, passing only
+        // when fsci's infinity has SciPy's sign. Both-finite cases are handed back here.
+        let arms = [
+            ("odds_ratio", scipy_arm.odds_ratio, result.odds_ratio),
+            ("pvalue", scipy_arm.pvalue, result.pvalue),
+        ];
+        for (arm, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
             };
+            let abs_diff = (f - s).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "odds_ratio".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-            && scipy_p.is_finite()
-        {
-            let abs_diff = (result.pvalue - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -262,6 +253,7 @@ fn diff_stats_fisher_exact() {
         test_id: "diff_stats_fisher_exact".into(),
         category: "scipy.stats.fisher_exact".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -286,4 +278,5 @@ fn diff_stats_fisher_exact() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

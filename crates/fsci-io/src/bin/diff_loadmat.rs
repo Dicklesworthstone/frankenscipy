@@ -1,10 +1,22 @@
-//! Broad v5 differential: numeric multi-array + rejection of compressed/complex.
-use fsci_io::loadmat;
+//! Broad v5 differential over SciPy-written files: a multi-array file with narrowed integer
+//! storage, an miCOMPRESSED file and a complex array. Prints each variable's class, dims, dtype
+//! and column-major values for comparison with `scipy.io.loadmat` of the same bytes.
+use fsci_io::{LoadmatOptions, MatValue, loadmat};
 fn show(tag: &str, bytes: &[u8]) {
-    match loadmat(bytes) {
-        Ok(arrays) => {
-            for a in &arrays {
-                println!("{tag}:{}|{}x{}|{:?}", a.name, a.rows, a.cols, a.data);
+    match loadmat(bytes, &LoadmatOptions::default()) {
+        Ok(file) => {
+            for (name, value) in &file.variables {
+                match value {
+                    MatValue::Numeric(n) => println!(
+                        "{tag}:{name}|{}|{:?}|{}|{:?}|{:?}",
+                        value.class_name(),
+                        n.dims,
+                        n.real.dtype().name(),
+                        n.real,
+                        n.imag
+                    ),
+                    other => println!("{tag}:{name}|{other:?}"),
+                }
             }
         }
         Err(e) => println!("{tag}:ERR:{e:?}"),

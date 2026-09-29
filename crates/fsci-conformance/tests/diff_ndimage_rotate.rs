@@ -8,12 +8,14 @@
 //! since spline interpolation order > 0 has implementation-dependent
 //! boundary handling at sub-pixel offsets.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, rotate};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -114,14 +117,10 @@ fn build_query() -> OracleQuery {
     //   * angle=0 (identity) for all order/mode/reshape combinations
     //   * angle=90 and 180 with order=0 (nearest-neighbor — boundary
     //     handling is independent of mode for these cell-aligned rotations)
-    //   * angle=90 and 180 with order=1 restricted to reflect/nearest
-    //     modes — constant/wrap diverge slightly at boundary cells
-    //     because fsci and scipy handle the cval-fill region differently
-    //     under the linear-interp branch. Documented limitation; not
-    //     enough to be a defect since both produce mathematically valid
-    //     rotated images, but exact element parity isnt achievable.
+    //   * angle=90 and 180 with order=1 in every mode. constant and wrap used to be left out
+    //     as "exact element parity isn't achievable"; they are back so the diff can show
+    //     whether that holds.
     let modes_all = ["reflect", "constant", "nearest", "wrap"];
-    let modes_safe = ["reflect", "nearest"];
     for mode in &modes_all {
         for &reshape in &[true, false] {
             for &order in &[0_usize, 1] {
@@ -162,7 +161,11 @@ fn build_query() -> OracleQuery {
                 });
             }
         }
-        for mode in &modes_safe {
+        for mode in &modes_all {
+            // As for order 0: 180° under constant has no stable SciPy reference.
+            if angle == 180.0 && *mode == "constant" {
+                continue;
+            }
             for &reshape in &[true, false] {
                 pts.push(CasePoint {
                     case_id: format!("rot{angle}_order1_{mode}_reshape{reshape}"),
@@ -174,6 +177,26 @@ fn build_query() -> OracleQuery {
                     order: 1,
                     mode: (*mode).into(),
                 });
+            }
+        }
+    }
+    // Non-cardinal angles, where every output pixel interpolates: orders 1 and 3 over all
+    // four modes. The module doc listed these, but no case generated them.
+    for &angle in &[30.0_f64, 45.0] {
+        for mode in &modes_all {
+            for &reshape in &[true, false] {
+                for &order in &[1_usize, 3] {
+                    pts.push(CasePoint {
+                        case_id: format!("rot{angle}_order{order}_{mode}_reshape{reshape}"),
+                        rows,
+                        cols,
+                        data: data.clone(),
+                        angle,
+                        reshape,
+                        order,
+                        mode: (*mode).into(),
+                    });
+                }
             }
         }
     }
@@ -265,13 +288,10 @@ fn diff_ndimage_rotate() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_rotate", &["rotate"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_rows), Some(exp_cols), Some(exp_data)) = (o.rows, o.cols, o.data.as_ref())
-        else {
-            continue;
-        };
 
         let arr = NdArray::new(case.data.clone(), vec![case.rows, case.cols]).expect("ndarray");
         let result = match rotate(
@@ -282,22 +302,36 @@ fn diff_ndimage_rotate() {
             mode_from(&case.mode),
             0.0,
         ) {
-            Ok(r) => r,
+            Ok(r) => Some(r),
             Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    rows: 0,
-                    cols: 0,
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("rotate error: {e:?}"),
-                });
-                continue;
+                if o.data.is_some() {
+                    diffs.push(CaseDiff {
+                        case_id: case.case_id.clone(),
+                        rows: 0,
+                        cols: 0,
+                        max_abs_diff: f64::INFINITY,
+                        pass: false,
+                        note: format!("rotate error: {e:?}"),
+                    });
+                }
+                None
             }
         };
-        let rows = result.shape[0];
-        let cols = result.shape[1];
-        if rows != exp_rows || cols != exp_cols {
+        let fsci_shape = result.as_ref().map(|r| (r.shape[0], r.shape[1]));
+        // SciPy's rows, cols and data are all present or all null. A differing element count is a
+        // shape mismatch, which the ledger records as a failed comparison.
+        let Some((exp_data, got)) = ledger.slices(
+            "rotate",
+            &case.case_id,
+            o.data.as_deref(),
+            result.as_ref().map(|r| r.data.as_slice()),
+        ) else {
+            continue;
+        };
+        let (rows, cols) = fsci_shape.unwrap_or_default();
+        if fsci_shape != o.rows.zip(o.cols) {
+            let (exp_rows, exp_cols) = o.rows.zip(o.cols).unwrap_or_default();
+            ledger.compared("rotate", &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 rows,
@@ -306,21 +340,43 @@ fn diff_ndimage_rotate() {
                 pass: false,
                 note: format!("shape mismatch: fsci {rows}x{cols} scipy {exp_rows}x{exp_cols}"),
             });
-            continue;
+        } else {
+            let mut max_abs = 0.0_f64;
+            for (a, e) in got.iter().zip(exp_data.iter()) {
+                max_abs = max_abs.max((a - e).abs());
+            }
+            let pass = max_abs <= ABS_TOL;
+            // frankenscipy-q74y3: order >= 2 under reflect is ~1e-5 off SciPy at 30/45 degrees.
+            // Only that signature is allowlisted, and only while it fails and stays below 1e-4:
+            // anything larger or different is a compared failure. Once fixed, these cases
+            // count as compared again with no edit here.
+            if !pass && case.order >= 2 && case.mode == "reflect" && max_abs < 1e-4 {
+                ledger.allowlisted(
+                    "rotate",
+                    &case.case_id,
+                    "frankenscipy-q74y3",
+                    "order >= 2 reflect differs from SciPy by ~1e-5 at non-cardinal angles",
+                );
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    rows,
+                    cols,
+                    max_abs_diff: max_abs,
+                    pass: true,
+                    note: "allowlisted under frankenscipy-q74y3".into(),
+                });
+                continue;
+            }
+            ledger.compared("rotate", &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                rows,
+                cols,
+                max_abs_diff: max_abs,
+                pass,
+                note: String::new(),
+            });
         }
-        let mut max_abs = 0.0_f64;
-        for (a, e) in result.data.iter().zip(exp_data.iter()) {
-            max_abs = max_abs.max((a - e).abs());
-        }
-        let pass = max_abs <= ABS_TOL;
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            rows,
-            cols,
-            max_abs_diff: max_abs,
-            pass,
-            note: String::new(),
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -328,6 +384,7 @@ fn diff_ndimage_rotate() {
         test_id: "diff_ndimage_rotate".into(),
         category: "fsci_ndimage::rotate vs scipy.ndimage.rotate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -345,4 +402,6 @@ fn diff_ndimage_rotate() {
     }
 
     assert!(all_pass, "rotate parity failed: {} cases", diffs.len());
+    let allowlisted = ledger.counts().get("rotate").map_or(0, |c| c.allowlisted);
+    ledger.finish(query.points.len() - allowlisted);
 }

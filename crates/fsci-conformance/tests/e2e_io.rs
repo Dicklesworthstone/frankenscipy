@@ -190,6 +190,16 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol || (a.is_nan() && b.is_nan())
 }
 
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // SCENARIOS 1-5: HAPPY-PATH
 // ═══════════════════════════════════════════════════════════════════════
@@ -225,6 +235,13 @@ fn scenario_01_matrix_market() {
             // Row 0: [1, 4], Row 1: [2, 5], Row 2: [3, 6]
             // So data = [1, 4, 2, 5, 3, 6]
             let expected = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+            if result.data.len() != expected.len() {
+                return Err(format!(
+                    "expected {} values, got {}",
+                    expected.len(),
+                    result.data.len()
+                ));
+            }
             for (i, (&a, &e)) in result.data.iter().zip(expected.iter()).enumerate() {
                 if !approx_eq(a, e, 1e-10) {
                     return Err(format!("data[{i}]: expected {e}, got {a}"));
@@ -403,8 +420,16 @@ fn scenario_02_wav_audio() {
             }
 
             // Check samples (allow some quantization error from int16 encoding)
+            if wav.data.len() != data.len() {
+                return Err(format!(
+                    "sample count mismatch: wrote {}, read {}",
+                    data.len(),
+                    wav.data.len()
+                ));
+            }
             for (i, (&orig, &read)) in data.iter().zip(wav.data.iter()).enumerate() {
-                if (orig - read).abs() > 0.001 {
+                let err = (orig - read).abs();
+                if err.is_nan() || err > 0.001 {
                     return Err(format!("sample {i} mismatch: wrote {orig}, read {read}"));
                 }
             }
@@ -470,6 +495,13 @@ fn scenario_03_text_files() {
                 return Err(format!("expected 3x3, got {}x{}", rows, cols));
             }
             let expected: Vec<f64> = (1..=9).map(|i| i as f64).collect();
+            if data.len() != expected.len() {
+                return Err(format!(
+                    "expected {} values, got {}",
+                    expected.len(),
+                    data.len()
+                ));
+            }
             for (i, (&a, &e)) in data.iter().zip(expected.iter()).enumerate() {
                 if !approx_eq(a, e, 1e-10) {
                     return Err(format!("data[{i}]: expected {e}, got {a}"));
@@ -507,6 +539,13 @@ fn scenario_03_text_files() {
             if rows != 2 || cols != 3 {
                 return Err(format!("dimension mismatch: {}x{}", rows, cols));
             }
+            if data.len() != original.len() {
+                return Err(format!(
+                    "value count mismatch: wrote {}, read {}",
+                    original.len(),
+                    data.len()
+                ));
+            }
             for (i, (&o, &r)) in original.iter().zip(data.iter()).enumerate() {
                 if !approx_eq(o, r, 1e-10) {
                     return Err(format!("data[{i}] mismatch: {o} vs {r}"));
@@ -538,7 +577,7 @@ fn scenario_04_csv_files() {
             if header.is_some() {
                 return Err("expected no header".to_string());
             }
-            if data.len() != 3 || data[0].len() != 3 {
+            if data.len() != 3 || data.iter().any(|row| row.len() != 3) {
                 return Err(format!(
                     "expected 3x3, got {}x{}",
                     data.len(),
@@ -1069,6 +1108,14 @@ fn scenario_09_format_conversion() {
             let (_, _, txt_read) = loadtxt(&txt).map_err(|e| format!("{e}"))?;
             let json_read = read_json_array(&json).map_err(|e| format!("{e}"))?;
 
+            if txt_read.len() != flat_data.len() || json_read.len() != flat_data.len() {
+                return Err(format!(
+                    "value count mismatch: wrote {}, txt read {}, json read {}",
+                    flat_data.len(),
+                    txt_read.len(),
+                    json_read.len()
+                ));
+            }
             for (i, (&t, &j)) in txt_read.iter().zip(json_read.iter()).enumerate() {
                 if !approx_eq(t, j, 1e-10) {
                     return Err(format!("mismatch at {i}: txt={t}, json={j}"));
@@ -1106,16 +1153,24 @@ fn scenario_10_precision() {
             let txt = savetxt(1, 4, &data, " ").map_err(|e| format!("{e}"))?;
             let (_, _, read) = loadtxt(&txt).map_err(|e| format!("{e}"))?;
 
+            // zip stops at the shorter side, so a short read would fold to a small max_error.
+            if read.len() != data.len() {
+                return Err(format!(
+                    "value count mismatch: wrote {}, read {}",
+                    data.len(),
+                    read.len()
+                ));
+            }
             let mut max_error = 0.0_f64;
             for (&orig, &back) in data.iter().zip(read.iter()) {
-                max_error = max_error.max((orig - back).abs());
+                max_error = nan_max(max_error, (orig - back).abs());
             }
 
-            if max_error > 1e-10 {
-                return Err(format!("precision loss: max_error={max_error}"));
+            if max_error <= 1e-10 {
+                Ok(format!("max roundtrip error: {max_error:.2e}"))
+            } else {
+                Err(format!("precision loss: max_error={max_error}"))
             }
-
-            Ok(format!("max roundtrip error: {max_error:.2e}"))
         },
     );
 
@@ -1130,6 +1185,13 @@ fn scenario_10_precision() {
             let mm = mmwrite(1, 3, &data).map_err(|e| format!("{e}"))?;
             let result = mmread(&mm).map_err(|e| format!("{e}"))?;
 
+            if result.data.len() != data.len() {
+                return Err(format!(
+                    "value count mismatch: wrote {}, read {}",
+                    data.len(),
+                    result.data.len()
+                ));
+            }
             let mut max_rel_error = 0.0_f64;
             for (&orig, &back) in data.iter().zip(result.data.iter()) {
                 let rel_error = if orig != 0.0 {
@@ -1137,14 +1199,14 @@ fn scenario_10_precision() {
                 } else {
                     back.abs()
                 };
-                max_rel_error = max_rel_error.max(rel_error);
+                max_rel_error = nan_max(max_rel_error, rel_error);
             }
 
-            if max_rel_error > 1e-10 {
-                return Err(format!("precision loss: rel_error={max_rel_error}"));
+            if max_rel_error <= 1e-10 {
+                Ok(format!("max relative error: {max_rel_error:.2e}"))
+            } else {
+                Err(format!("precision loss: rel_error={max_rel_error}"))
             }
-
-            Ok(format!("max relative error: {max_rel_error:.2e}"))
         },
     );
 
@@ -1172,17 +1234,24 @@ fn scenario_11_wav_bit_depth() {
             let wav = wav_read(&bytes).map_err(|e| format!("{e}"))?;
 
             // 16-bit quantization: step size is about 1/32768 ≈ 3e-5
+            if wav.data.len() != data.len() {
+                return Err(format!(
+                    "sample count mismatch: wrote {}, read {}",
+                    data.len(),
+                    wav.data.len()
+                ));
+            }
             let max_error = data
                 .iter()
                 .zip(wav.data.iter())
                 .map(|(&o, &r)| (o - r).abs())
-                .fold(0.0_f64, f64::max);
+                .fold(0.0_f64, nan_max);
 
-            if max_error > 0.001 {
-                return Err(format!("quantization error too large: {max_error}"));
+            if max_error <= 0.001 {
+                Ok(format!("max quantization error: {max_error:.6}"))
+            } else {
+                Err(format!("quantization error too large: {max_error}"))
             }
-
-            Ok(format!("max quantization error: {max_error:.6}"))
         },
     );
 
@@ -1199,6 +1268,13 @@ fn scenario_11_wav_bit_depth() {
             let wav = wav_read(&bytes).map_err(|e| format!("{e}"))?;
 
             // Check clipping: values should be clamped to [-1, 1]
+            if wav.data.len() != data.len() {
+                return Err(format!(
+                    "sample count mismatch: wrote {}, read {}",
+                    data.len(),
+                    wav.data.len()
+                ));
+            }
             for &sample in &wav.data {
                 if !(-1.0..=1.0).contains(&sample) {
                     return Err(format!("sample out of range: {sample}"));

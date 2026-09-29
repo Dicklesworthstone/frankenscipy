@@ -8,13 +8,14 @@
 //!   - solve_circulant, solve_toeplitz
 //!   - lu_solve, cho_solve, cho_solve_banded
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{
     DecompOptions, SolveOptions, TriangularSolveOptions, TriangularTranspose, cho_factor,
     cho_solve, cho_solve_banded, lu_factor, lu_solve, solve_banded, solve_circulant,
@@ -127,6 +128,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -443,7 +445,8 @@ print(json.dumps(result, allow_nan=False))
         eprintln!("skipping structured solver oracle: scipy unavailable\n{stderr}");
         return None;
     }
-    serde_json::from_slice(&output.stdout).ok()
+    // An unparseable answer used to end the test here as a silent skip.
+    Some(serde_json::from_slice(&output.stdout).expect("parse structured solver oracle JSON"))
 }
 
 fn max_abs_diff_vec(actual: &[f64], expected: &[f64]) -> f64 {
@@ -470,12 +473,23 @@ fn expected_map(arms: &[VectorArm]) -> HashMap<String, Option<Vec<f64>>> {
 
 fn record_case(
     diffs: &mut Vec<CaseDiff>,
+    ledger: &mut CompareLedger,
     expected: &HashMap<String, Option<Vec<f64>>>,
     function: &str,
     case_id: &str,
     actual: Option<Vec<f64>>,
 ) {
     let expected_vector = expected.get(case_id);
+    // "Both implementations rejected" below is not a comparison: the ledger records it as
+    // SciPy giving no value, so an arm whose oracle never answers fails `finish`.
+    let both_present = ledger
+        .slices(
+            function,
+            case_id,
+            expected_vector.and_then(Option::as_deref),
+            actual.as_deref(),
+        )
+        .is_some();
     let (max_abs_diff, pass, detail) = match (actual, expected_vector) {
         (Some(actual), Some(Some(expected))) => {
             let diff = max_abs_diff_vec(&actual, expected);
@@ -503,6 +517,9 @@ fn record_case(
             "SciPy oracle did not return this case".into(),
         ),
     };
+    if both_present {
+        ledger.compared(function, case_id, pass);
+    }
 
     diffs.push(CaseDiff {
         case_id: case_id.to_string(),
@@ -548,6 +565,19 @@ fn diff_linalg_structured_solvers() {
         check_finite: true,
     };
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_structured_solvers",
+        &[
+            "solve_triangular",
+            "solve_banded",
+            "solveh_banded",
+            "solve_circulant",
+            "solve_toeplitz",
+            "lu_solve",
+            "cho_solve",
+            "cho_solve_banded",
+        ],
+    );
 
     for case in &query.triangular {
         let actual = solve_triangular(
@@ -565,6 +595,7 @@ fn diff_linalg_structured_solvers() {
         .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &triangular_expected,
             "solve_triangular",
             &case.case_id,
@@ -582,6 +613,7 @@ fn diff_linalg_structured_solvers() {
         .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &banded_expected,
             "solve_banded",
             &case.case_id,
@@ -594,6 +626,7 @@ fn diff_linalg_structured_solvers() {
             .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &solveh_banded_expected,
             "solveh_banded",
             &case.case_id,
@@ -603,6 +636,7 @@ fn diff_linalg_structured_solvers() {
     for case in &query.circulant {
         record_case(
             &mut diffs,
+            &mut ledger,
             &circulant_expected,
             "solve_circulant",
             &case.case_id,
@@ -612,6 +646,7 @@ fn diff_linalg_structured_solvers() {
     for case in &query.toeplitz {
         record_case(
             &mut diffs,
+            &mut ledger,
             &toeplitz_expected,
             "solve_toeplitz",
             &case.case_id,
@@ -625,6 +660,7 @@ fn diff_linalg_structured_solvers() {
             .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &lu_solve_expected,
             "lu_solve",
             &case.case_id,
@@ -638,6 +674,7 @@ fn diff_linalg_structured_solvers() {
             .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &cho_solve_expected,
             "cho_solve",
             &case.case_id,
@@ -650,6 +687,7 @@ fn diff_linalg_structured_solvers() {
             .map(|result| result.x);
         record_case(
             &mut diffs,
+            &mut ledger,
             &cho_solve_banded_expected,
             "cho_solve_banded",
             &case.case_id,
@@ -666,6 +704,7 @@ fn diff_linalg_structured_solvers() {
         test_id: "diff_linalg_structured_solvers".into(),
         category: "scipy.linalg structured and factorized solvers".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         pass,
         timestamp_ms: timestamp_ms(),
@@ -679,4 +718,19 @@ fn diff_linalg_structured_solvers() {
         "structured solver conformance failed: {} cases, max_diff={}",
         log.case_count, log.max_abs_diff
     );
+    // lu_solve and cho_solve have one case each: the smallest designed count over the arms.
+    let min_per_function = [
+        query.triangular.len(),
+        query.banded.len(),
+        query.solveh_banded.len(),
+        query.circulant.len(),
+        query.toeplitz.len(),
+        query.lu_solve.len(),
+        query.cho_solve.len(),
+        query.cho_solve_banded.len(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+    ledger.finish(min_per_function);
 }

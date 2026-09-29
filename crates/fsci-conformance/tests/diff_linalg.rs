@@ -7,12 +7,14 @@
 //! All tests emit structured JSON logs to
 //! `fixtures/artifacts/FSCI-P2C-002/diff/`.
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{
     DecompOptions, SolveOptions, det, solve, solve_with_audit, solve_with_casp, svd,
     sync_audit_ledger,
 };
 use fsci_runtime::{RuntimeMode, SolverPortfolio};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +29,7 @@ struct DiffTestLog {
     diff: f64,
     tolerance: f64,
     pass: bool,
+    compared: BTreeMap<String, ArmCounts>,
     timestamp_ms: u128,
     duration_ns: u128,
 }
@@ -242,6 +245,15 @@ fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
     };
     let rust_result = solve(a, b, opts);
     let scipy_result = scipy_solve(a, b);
+    // One case per #[test]: a missing SciPy answer or a failed fsci call is recorded, and an
+    // fsci error beside a missing SciPy answer no longer passes as "both raised".
+    let mut ledger = CompareLedger::new(test_id, &["solve"]);
+    let both_present = ledger.slices(
+        "solve",
+        test_id,
+        scipy_result.as_ref().map(|s| s.x.as_slice()),
+        rust_result.as_ref().ok().map(|r| r.x.as_slice()),
+    );
 
     let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
         (Ok(rust), Some(scipy)) => {
@@ -267,6 +279,9 @@ fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
             format!("{:?}", e),
         ),
     };
+    if both_present.is_some() {
+        ledger.compared("solve", test_id, pass);
+    }
 
     let log = DiffTestLog {
         test_id: test_id.to_string(),
@@ -277,6 +292,7 @@ fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
         diff,
         tolerance: TOL,
         pass,
+        compared: ledger.counts().clone(),
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
     };
@@ -287,6 +303,7 @@ fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
         eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
     }
     assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+    ledger.finish(1);
 }
 
 fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) {
@@ -303,6 +320,13 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
     let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 1);
     let rust_result = solve_with_casp(a, b, opts, &mut portfolio);
     let scipy_result = scipy_solve(a, b);
+    let mut ledger = CompareLedger::new(test_id, &["solve_with_casp"]);
+    let both_present = ledger.slices(
+        "solve_with_casp",
+        test_id,
+        scipy_result.as_ref().map(|s| s.x.as_slice()),
+        rust_result.as_ref().ok().map(|r| r.x.as_slice()),
+    );
 
     let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
         (Ok(rust), Some(scipy)) => {
@@ -335,6 +359,9 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
             format!("{:?}", e),
         ),
     };
+    if both_present.is_some() {
+        ledger.compared("solve_with_casp", test_id, pass);
+    }
 
     let log = DiffTestLog {
         test_id: test_id.to_string(),
@@ -345,6 +372,7 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
         diff,
         tolerance: tol,
         pass,
+        compared: ledger.counts().clone(),
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
     };
@@ -362,6 +390,7 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
         "Differential test {} failed: diff={}; scipy={}; fsci={}",
         test_id, diff, log.expected, log.actual
     );
+    ledger.finish(1);
 }
 
 fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) {
@@ -382,6 +411,14 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
     let scipy_result = scipy_solve(a, b);
     let post_entries = ledger.lock().map_or(0, |g| g.len());
     let recorded_audit = post_entries > initial_entries;
+    // `ledger` above is fsci's audit ledger; this one records the SciPy comparison.
+    let mut compare_ledger = CompareLedger::new(test_id, &["solve_with_audit"]);
+    let both_present = compare_ledger.slices(
+        "solve_with_audit",
+        test_id,
+        scipy_result.as_ref().map(|s| s.x.as_slice()),
+        rust_result.as_ref().ok().map(|r| r.x.as_slice()),
+    );
 
     let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
         (Ok(rust), Some(scipy)) => {
@@ -420,6 +457,9 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
             format!("{:?}", e),
         ),
     };
+    if both_present.is_some() {
+        compare_ledger.compared("solve_with_audit", test_id, pass);
+    }
 
     let log = DiffTestLog {
         test_id: test_id.to_string(),
@@ -430,6 +470,7 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
         diff,
         tolerance: tol,
         pass,
+        compared: compare_ledger.counts().clone(),
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
     };
@@ -444,6 +485,7 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
         "Differential test {} failed: diff={}, audit_recorded={}; scipy={}; fsci={}",
         test_id, diff, recorded_audit, log.expected, log.actual
     );
+    compare_ledger.finish(1);
 }
 
 fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
@@ -454,6 +496,13 @@ fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
     let start = Instant::now();
     let rust_result = det(a, RuntimeMode::Strict, true);
     let scipy_result = scipy_det(a);
+    let mut ledger = CompareLedger::new(test_id, &["det"]);
+    let both_present = ledger.pair(
+        "det",
+        test_id,
+        scipy_result.as_ref().map(|s| s.det),
+        rust_result.as_ref().ok().copied(),
+    );
 
     let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
         (Ok(rust_det), Some(scipy)) => {
@@ -480,6 +529,9 @@ fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
             format!("{:?}", e),
         ),
     };
+    if both_present.is_some() {
+        ledger.compared("det", test_id, pass);
+    }
 
     let log = DiffTestLog {
         test_id: test_id.to_string(),
@@ -490,6 +542,7 @@ fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
         diff,
         tolerance: TOL,
         pass,
+        compared: ledger.counts().clone(),
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
     };
@@ -500,6 +553,7 @@ fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
         eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
     }
     assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+    ledger.finish(1);
 }
 
 fn run_svd_singular_values_diff(test_id: &str, a: &[Vec<f64>]) {
@@ -514,6 +568,13 @@ fn run_svd_singular_values_diff(test_id: &str, a: &[Vec<f64>]) {
     };
     let rust_result = svd(a, opts);
     let scipy_result = scipy_svd(a);
+    let mut ledger = CompareLedger::new(test_id, &["svd"]);
+    let both_present = ledger.slices(
+        "svd",
+        test_id,
+        scipy_result.as_ref().map(|s| s.s.as_slice()),
+        rust_result.as_ref().ok().map(|r| r.s.as_slice()),
+    );
 
     let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
         (Ok(rust), Some(scipy)) => {
@@ -539,6 +600,9 @@ fn run_svd_singular_values_diff(test_id: &str, a: &[Vec<f64>]) {
             format!("{:?}", e),
         ),
     };
+    if both_present.is_some() {
+        ledger.compared("svd", test_id, pass);
+    }
 
     let log = DiffTestLog {
         test_id: test_id.to_string(),
@@ -549,6 +613,7 @@ fn run_svd_singular_values_diff(test_id: &str, a: &[Vec<f64>]) {
         diff,
         tolerance: TOL,
         pass,
+        compared: ledger.counts().clone(),
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
     };
@@ -559,6 +624,7 @@ fn run_svd_singular_values_diff(test_id: &str, a: &[Vec<f64>]) {
         eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
     }
     assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+    ledger.finish(1);
 }
 
 // ═══════════════════════════════════════════════════════════════

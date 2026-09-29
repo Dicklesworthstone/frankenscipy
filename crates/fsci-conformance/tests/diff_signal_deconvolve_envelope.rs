@@ -9,13 +9,14 @@
 //! long division; hilbert_envelope round-trips through real FFT and
 //! is dominated by O(log N) ULP accumulation. 1e-10 abs tolerance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{deconvolve, hilbert_envelope};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -271,57 +273,47 @@ fn diff_signal_deconvolve_envelope() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_deconvolve_envelope",
+        &["deconvolve", "envelope"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
-            continue;
-        };
-        let fsci_v = match case.op.as_str() {
-            "deconvolve" => {
-                let Ok((q, r)) = deconvolve(&case.a, &case.b) else {
-                    continue;
-                };
-                // Match scipy's q-len boundary so we compare apples to apples.
-                let Some(q_len) = scipy_arm.q_len else {
-                    continue;
-                };
-                if q.len() != q_len {
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        op: case.op.clone(),
-                        abs_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    continue;
+        let (fsci_v, fsci_q_len) = match case.op.as_str() {
+            "deconvolve" => match deconvolve(&case.a, &case.b) {
+                Ok((q, r)) => {
+                    let q_len = q.len();
+                    let mut combined = q;
+                    combined.extend(r);
+                    (Some(combined), Some(q_len))
                 }
-                let mut combined = q;
-                combined.extend(r);
-                combined
-            }
-            "envelope" => {
-                let Ok(v) = hilbert_envelope(&case.a) else {
-                    continue;
-                };
-                v
-            }
-            _ => continue,
+                Err(_) => (None, None),
+            },
+            "envelope" => (hilbert_envelope(&case.a).ok(), None),
+            // An unknown op is an undeclared arm: the ledger call below panics on it.
+            _ => (None, None),
         };
-        if fsci_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
+        let Some((scipy_v, fsci_v)) = ledger.slices(
+            case.op.as_str(),
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
-        }
-        let abs_d = fsci_v
-            .iter()
-            .zip(scipy_v.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        };
+        // Match scipy's q-len boundary so we compare apples to apples.
+        let abs_d = if fsci_q_len == scipy_arm.q_len {
+            fsci_v
+                .iter()
+                .zip(scipy_v.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
+        };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(case.op.as_str(), &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -336,6 +328,7 @@ fn diff_signal_deconvolve_envelope() {
         test_id: "diff_signal_deconvolve_envelope".into(),
         category: "scipy.signal.deconvolve + |hilbert(x)|".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -359,4 +352,6 @@ fn diff_signal_deconvolve_envelope() {
         diffs.len(),
         max_overall
     );
+    // deconvolve has 6 cases and envelope 4; each arm must compare all of the smaller set.
+    ledger.finish(query.points.iter().filter(|c| c.op == "envelope").count());
 }

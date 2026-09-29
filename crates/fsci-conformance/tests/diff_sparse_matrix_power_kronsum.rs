@@ -6,13 +6,14 @@
 //! matrices that are exactly determined by inputs (no iteration,
 //! no sign ambiguity), so a tight 1e-12 dense comparison applies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, CsrMatrix, FormatConvertible, Shape2D, kronsum, matrix_power};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -124,6 +126,18 @@ fn build_csr(rows: usize, cols: usize, trips: &[(usize, usize, f64)]) -> Option<
     }
     let coo = CooMatrix::from_triplets(Shape2D::new(rows, cols), data, rs, cs, true).ok()?;
     coo.to_csr().ok()
+}
+
+fn fsci_eval(case: &Case) -> Option<CsrMatrix> {
+    let csr_a = build_csr(case.a_rows, case.a_cols, &case.a_triplets)?;
+    match case.op.as_str() {
+        "power" => matrix_power(&csr_a, case.n).ok(),
+        "kronsum" => {
+            let csr_b = build_csr(case.b_rows, case.b_cols, &case.b_triplets)?;
+            kronsum(&csr_a, &csr_b).ok()
+        }
+        _ => None,
+    }
 }
 
 fn generate_query() -> OracleQuery {
@@ -331,53 +345,37 @@ fn diff_sparse_matrix_power_kronsum() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_sparse_matrix_power_kronsum", &["power", "kronsum"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| Some(((arm.out_rows?, arm.out_cols?), arm.dense.as_deref()?)));
+        let fsci = fsci_eval(case).map(|out| {
+            let shape = out.shape();
+            ((shape.rows, shape.cols), csr_to_dense(&out))
+        });
+        let Some((expected, dense)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy.map(|(_, d)| d),
+            fsci.as_ref().map(|(_, d)| d.as_slice()),
+        ) else {
             continue;
         };
-        let (Some(expected), Some(or), Some(oc)) = (arm.dense.as_ref(), arm.out_rows, arm.out_cols)
-        else {
-            continue;
-        };
-        let Some(csr_a) = build_csr(case.a_rows, case.a_cols, &case.a_triplets) else {
-            continue;
-        };
-        let result = match case.op.as_str() {
-            "power" => matrix_power(&csr_a, case.n),
-            "kronsum" => {
-                let Some(csr_b) = build_csr(case.b_rows, case.b_cols, &case.b_triplets) else {
-                    continue;
-                };
-                kronsum(&csr_a, &csr_b)
-            }
-            _ => continue,
-        };
-        let Ok(out) = result else {
-            continue;
-        };
-        let shape = out.shape();
-        if shape.rows != or || shape.cols != oc {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            max_overall = f64::INFINITY;
-            continue;
-        }
-        let dense = csr_to_dense(&out);
-        let abs_d = if dense.len() != expected.len() {
-            f64::INFINITY
-        } else {
+        // slices returned both sides, so this compares the two output shapes
+        let shape_ok = scipy.map(|(s, _)| s) == fsci.as_ref().map(|(s, _)| *s);
+        let abs_d = if shape_ok {
             dense
                 .iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -392,6 +390,7 @@ fn diff_sparse_matrix_power_kronsum() {
         test_id: "diff_sparse_matrix_power_kronsum".into(),
         category: "fsci_sparse::matrix_power + kronsum vs scipy.sparse".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -412,4 +411,10 @@ fn diff_sparse_matrix_power_kronsum() {
         diffs.len(),
         max_overall
     );
+    let per_op = ["power", "kronsum"]
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_op);
 }

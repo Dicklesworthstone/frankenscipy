@@ -1,0 +1,4 @@
+t	la1	la5	la15	procs_running	own_running	foreign_running	fsci_threads	child_threads	pinned_busy	sibling_busy	host_busy
+0.00	13.19	25.32	22.67	7	1	5	1	0	0.000	0.000	0.092
+1.00	13.19	25.32	22.67	3	1	1	1	1	0.707	0.100	0.119
+2.00	13.19	25.32	22.67	6	2	3	1	1	1.000	0.080	0.113

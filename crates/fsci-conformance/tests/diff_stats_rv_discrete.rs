@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::RvDiscrete;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -242,35 +244,33 @@ fn diff_stats_rv_discrete() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_rv_discrete", &["pmf", "cdf"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(epmf), Some(ecdf)) = (arm.pmf.as_ref(), arm.cdf.as_ref()) else {
-            continue;
-        };
+        // A case the oracle did not return is recorded as SciPy giving no value.
+        let arm = pmap.get(&case.case_id);
         let rv = RvDiscrete::new(case.xk.clone(), case.pk.clone());
         let pmf: Vec<f64> = case.queries.iter().map(|&x| rv.pmf(x)).collect();
         let cdf: Vec<f64> = case.queries.iter().map(|&x| rv.cdf(x)).collect();
 
-        let pmf_diff = vec_max_diff(&pmf, epmf);
-        max_overall = max_overall.max(pmf_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_pmf", case.case_id),
-            op: "pmf".into(),
-            abs_diff: pmf_diff,
-            pass: pmf_diff <= ABS_TOL,
-        });
-
-        let cdf_diff = vec_max_diff(&cdf, ecdf);
-        max_overall = max_overall.max(cdf_diff);
-        diffs.push(CaseDiff {
-            case_id: format!("{}_cdf", case.case_id),
-            op: "cdf".into(),
-            abs_diff: cdf_diff,
-            pass: cdf_diff <= ABS_TOL,
-        });
+        let ops = [
+            ("pmf", arm.and_then(|a| a.pmf.as_deref()), pmf.as_slice()),
+            ("cdf", arm.and_then(|a| a.cdf.as_deref()), cdf.as_slice()),
+        ];
+        for (op, scipy, fsci) in ops {
+            let Some((expected, got)) = ledger.slices(op, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let diff = vec_max_diff(got, expected);
+            max_overall = max_overall.max(diff);
+            ledger.compared(op, &case.case_id, diff <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id: format!("{}_{op}", case.case_id),
+                op: op.into(),
+                abs_diff: diff,
+                pass: diff <= ABS_TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -279,6 +279,7 @@ fn diff_stats_rv_discrete() {
         test_id: "diff_stats_rv_discrete".into(),
         category: "fsci_stats::RvDiscrete vs scipy.stats.rv_discrete".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +300,5 @@ fn diff_stats_rv_discrete() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

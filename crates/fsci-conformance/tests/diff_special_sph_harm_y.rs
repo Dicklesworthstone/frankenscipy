@@ -5,13 +5,14 @@
 //! sph_harm_y(n, m, theta, phi) where theta is polar (colatitude)
 //! and phi is azimuth. Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::sph_harm_y;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -219,17 +221,19 @@ fn diff_special_sph_harm_y() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_sph_harm_y", &["sph_harm_y"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.re.zip(arm.im));
+        let fsci = Some(sph_harm_y(case.n, case.m, case.theta, case.phi));
+        let Some(((ere, eim), actual)) = ledger.both("sph_harm_y", &case.case_id, scipy, fsci)
+        else {
             continue;
         };
-        let (Some(ere), Some(eim)) = (arm.re, arm.im) else {
-            continue;
-        };
-        let actual = sph_harm_y(case.n, case.m, case.theta, case.phi);
         let abs_d = ((actual.re - ere).powi(2) + (actual.im - eim).powi(2)).sqrt();
         max_overall = max_overall.max(abs_d);
+        // A NaN component makes abs_d NaN, which fails `<=`.
+        ledger.compared("sph_harm_y", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -243,6 +247,7 @@ fn diff_special_sph_harm_y() {
         test_id: "diff_special_sph_harm_y".into(),
         category: "fsci_special::sph_harm_y vs scipy.special.sph_harm_y".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -263,4 +268,5 @@ fn diff_special_sph_harm_y() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

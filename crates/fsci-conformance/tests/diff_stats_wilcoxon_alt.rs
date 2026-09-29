@@ -4,25 +4,24 @@
 //! — `'less'` and `'greater'`. The default two-sided is
 //! covered by diff_stats.rs.
 //!
-//! Resolves [frankenscipy-4my70]. fsci's wilcoxon_alternative
-//! returns the T+ statistic and a normal-approximation
-//! pvalue. scipy's mode='auto' default flips to an exact
-//! permutation table at small n and applies continuity
-//! correction by default; the oracle pins
-//! `mode='approx', correction=False` to match fsci's
-//! asymptotic-no-correction path.
+//! Resolves [frankenscipy-4my70]. The oracle calls SciPy's own default
+//! (`method='auto'`: exact without ties or zeros up to n = 50, a
+//! permutation test with them up to n = 13, else the normal
+//! approximation; `correction=False`). The n = 60 and 120 fixtures pin the
+//! n > 50 switch that fsci missed (frankenscipy-hlu5b).
 //!
-//! 4 paired fixtures × 2 alternatives × 2 active arms
-//! (statistic + pvalue) = 16 cases via subprocess. Tol 1e-9
+//! 6 paired fixtures × 3 alternatives × 2 active arms
+//! (statistic + pvalue) = 36 cases via subprocess. Tol 1e-9
 //! abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::wilcoxon_alternative;
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -94,6 +94,14 @@ fn emit_log(log: &DiffLog) {
     let path = output_dir().join(format!("{}.json", log.test_id));
     let json = serde_json::to_string_pretty(log).expect("serialize wilcoxon_alt diff log");
     fs::write(path, json).expect("write wilcoxon_alt diff log");
+}
+
+/// `y = x + d` for `x = 0..n` with differences `d_i = shift + (i·37 mod 101)/97 − 0.5`,
+/// scaled so no two `|d_i|` tie and none is zero.
+fn untied_shift(n: u32, shift: f64) -> Vec<f64> {
+    (0..n)
+        .map(|i| f64::from(i) + shift + f64::from(i * 37 % 101) / 97.0 - 0.5 + f64::from(i) * 1e-4)
+        .collect()
 }
 
 fn generate_query() -> OracleQuery {
@@ -126,8 +134,23 @@ fn generate_query() -> OracleQuery {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
             vec![2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
         ),
+        // More than 50 differences with no ties or zeros: SciPy's auto takes the normal
+        // approximation here, not the exact distribution. The shifts are small so the p-values
+        // are moderate: at a strong shift both are ~1e-11 and a 1e-9 tolerance cannot tell the
+        // exact tail from the normal one.
+        (
+            "no_ties_n60",
+            (0..60).map(f64::from).collect(),
+            untied_shift(60, 0.06),
+        ),
+        (
+            "no_ties_n120",
+            (0..120).map(f64::from).collect(),
+            untied_shift(120, -0.03),
+        ),
     ];
-    let alternatives = ["less", "greater"];
+    // two-sided too, for the n > 50 fixtures' sake: the plain `wilcoxon` had the same cut.
+    let alternatives = ["less", "greater", "two-sided"];
 
     let mut points = Vec::new();
     for (name, x, y) in &fixtures {
@@ -165,18 +188,11 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     y = np.array(case["y"], dtype=float)
     try:
-        # Mirror fsci's dispatch: exact permutation for len(x) <= 13,
-        # asymptotic normal beyond (frankenscipy-qghyr). The earlier blanket
-        # mode='approx' pin compared scipy's normal approximation against
-        # fsci's exact permutation on small tied cases and diverged by up
-        # to 0.0033 (2026-09-04, ia47s).
-        method = "exact" if len(x) <= 13 else "approx"
-        # fsci's asymptotic path has no continuity correction.
-        correction = False
-        res = stats.wilcoxon(
-            x, y, alternative=alt, mode=method, correction=correction,
-            zero_method='wilcox',
-        )
+        # SciPy's own default: method='auto', correction=False, zero_method='wilcox'. This
+        # oracle used to mirror fsci's dispatch instead ('exact' up to n = 13, else 'approx'),
+        # which hid fsci taking the exact path up to n = 1000 where SciPy's auto switches to
+        # the normal approximation above n = 50 (frankenscipy-hlu5b).
+        res = stats.wilcoxon(x, y, alternative=alt)
         points.append({
             "case_id": cid,
             "statistic": fnone(res.statistic),
@@ -254,31 +270,27 @@ fn diff_stats_wilcoxon_alt() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_wilcoxon_alt", &["statistic", "pvalue"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let result = wilcoxon_alternative(&case.x, &case.y, &case.alternative);
 
-        if let Some(scipy_stat) = scipy_arm.statistic
-            && result.statistic.is_finite()
-        {
-            let abs_diff = (result.statistic - scipy_stat).abs();
+        let arms: [(&str, Option<f64>, f64); 2] = [
+            ("statistic", scipy_arm.statistic, result.statistic),
+            ("pvalue", scipy_arm.pvalue, result.pvalue),
+        ];
+        for (arm, scipy_v, rust_v) in arms {
+            let Some((scipy_v, rust_v)) = ledger.pair(arm, &case.case_id, scipy_v, Some(rust_v))
+            else {
+                continue;
+            };
+            let abs_diff = (rust_v - scipy_v).abs();
             max_overall = max_overall.max(abs_diff);
+            ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: "statistic".into(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
-        if let Some(scipy_p) = scipy_arm.pvalue
-            && result.pvalue.is_finite()
-        {
-            let abs_diff = (result.pvalue - scipy_p).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                arm: "pvalue".into(),
+                arm: arm.into(),
                 abs_diff,
                 pass: abs_diff <= ABS_TOL,
             });
@@ -291,6 +303,7 @@ fn diff_stats_wilcoxon_alt() {
         test_id: "diff_stats_wilcoxon_alt".into(),
         category: "scipy.stats.wilcoxon(alternative=less/greater)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -315,4 +328,5 @@ fn diff_stats_wilcoxon_alt() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

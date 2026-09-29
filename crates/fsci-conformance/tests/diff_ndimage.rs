@@ -5,12 +5,14 @@
 //! invariant checks. This harness adds a process-based SciPy oracle for concrete
 //! filter semantics across deterministic input families.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{
     BoundaryMode, NdArray, binary_dilation, binary_dilation_axes, binary_erosion,
     binary_erosion_axes, gaussian_filter, laplace, maximum_filter, median_filter, minimum_filter,
@@ -57,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -224,6 +227,14 @@ fn max_abs_diff(left: &[f64], right: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// The fewest cases any arm (op) is designed to compare, for `CompareLedger::finish`.
+fn min_cases_per_arm<'a>(ops: impl Iterator<Item = &'a str> + Clone, arms: &[&str]) -> usize {
+    arms.iter()
+        .map(|arm| ops.clone().filter(|op| op == arm).count())
+        .min()
+        .unwrap_or(0)
+}
+
 #[test]
 fn max_abs_diff_flags_nonfinite_mismatches() {
     assert_eq!(max_abs_diff(&[f64::NAN], &[f64::NAN]), 0.0);
@@ -346,14 +357,25 @@ fn diff_001_ndimage_filters_live_scipy() {
         "SciPy ndimage oracle case count mismatch"
     );
 
+    let arms = ["uniform_filter", "gaussian_filter"];
+    let mut ledger = CompareLedger::new("diff_001_ndimage_filters_live_scipy", &arms);
     let mut case_diffs = Vec::with_capacity(cases.len());
     for (case, oracle) in cases.iter().zip(oracle_cases.iter()) {
         assert_eq!(
             case.case_id, oracle.case_id,
             "ndimage oracle case id mismatch"
         );
-        let actual = rust_output(case).unwrap_or_default();
-        let diff = max_abs_diff(&actual, &oracle.values);
+        let actual = rust_output(case);
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            Some(oracle.values.as_slice()),
+            actual.as_deref(),
+        ) else {
+            continue;
+        };
+        let diff = max_abs_diff(actual, expected);
+        ledger.compared(&case.op, &case.case_id, diff <= TOL);
         let parameter = match case.op.as_str() {
             "uniform_filter" => format!("size={}", case.size.expect("uniform size")),
             "gaussian_filter" => format!("sigma={:.2}", case.sigma.expect("gaussian sigma")),
@@ -383,6 +405,7 @@ fn diff_001_ndimage_filters_live_scipy() {
         test_id: String::from("diff_001_ndimage_filters_live_scipy"),
         category: String::from("live_scipy_differential"),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass,
@@ -396,6 +419,10 @@ fn diff_001_ndimage_filters_live_scipy() {
         pass,
         "ndimage live SciPy diff max_abs_diff={max_diff:.3e} exceeds tolerance {TOL:.3e}"
     );
+    ledger.finish(min_cases_per_arm(
+        cases.iter().map(|c| c.op.as_str()),
+        &arms,
+    ));
 }
 
 #[test]
@@ -419,14 +446,25 @@ fn diff_002_ndimage_rank_filters_live_scipy() {
         "SciPy ndimage rank-filter oracle case count mismatch"
     );
 
+    let arms = ["median_filter", "minimum_filter", "maximum_filter"];
+    let mut ledger = CompareLedger::new("diff_002_ndimage_rank_filters_live_scipy", &arms);
     let mut case_diffs = Vec::with_capacity(cases.len());
     for (case, oracle) in cases.iter().zip(oracle_cases.iter()) {
         assert_eq!(
             case.case_id, oracle.case_id,
             "ndimage rank-filter oracle case id mismatch"
         );
-        let actual = rust_output(case).unwrap_or_default();
-        let diff = max_abs_diff(&actual, &oracle.values);
+        let actual = rust_output(case);
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            Some(oracle.values.as_slice()),
+            actual.as_deref(),
+        ) else {
+            continue;
+        };
+        let diff = max_abs_diff(actual, expected);
+        ledger.compared(&case.op, &case.case_id, diff <= TOL);
         case_diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -448,6 +486,7 @@ fn diff_002_ndimage_rank_filters_live_scipy() {
         test_id: String::from("diff_002_ndimage_rank_filters_live_scipy"),
         category: String::from("live_scipy_differential"),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass,
@@ -461,6 +500,10 @@ fn diff_002_ndimage_rank_filters_live_scipy() {
         pass,
         "ndimage live SciPy rank-filter diff max_abs_diff={max_diff:.3e} exceeds tolerance {TOL:.3e}"
     );
+    ledger.finish(min_cases_per_arm(
+        cases.iter().map(|c| c.op.as_str()),
+        &arms,
+    ));
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -641,11 +684,22 @@ fn diff_003_ndimage_edge_detection_live_scipy() {
         "SciPy edge detection oracle case count mismatch"
     );
 
+    let arms = ["sobel", "prewitt", "laplace"];
+    let mut ledger = CompareLedger::new("diff_003_ndimage_edge_detection_live_scipy", &arms);
     let mut case_diffs = Vec::with_capacity(cases.len());
     for (case, oracle) in cases.iter().zip(oracle_cases.iter()) {
         assert_eq!(case.case_id, oracle.case_id, "edge oracle case id mismatch");
-        let actual = rust_edge_output(case).unwrap_or_default();
-        let diff = max_abs_diff(&actual, &oracle.values);
+        let actual = rust_edge_output(case);
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            Some(oracle.values.as_slice()),
+            actual.as_deref(),
+        ) else {
+            continue;
+        };
+        let diff = max_abs_diff(actual, expected);
+        ledger.compared(&case.op, &case.case_id, diff <= TOL);
         let parameter = match case.op.as_str() {
             "sobel" | "prewitt" => format!("axis={}", case.axis.unwrap_or(0)),
             "laplace" => String::from("n/a"),
@@ -672,6 +726,7 @@ fn diff_003_ndimage_edge_detection_live_scipy() {
         test_id: String::from("diff_003_ndimage_edge_detection_live_scipy"),
         category: String::from("live_scipy_differential"),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass,
@@ -685,6 +740,10 @@ fn diff_003_ndimage_edge_detection_live_scipy() {
         pass,
         "ndimage edge detection diff max_abs_diff={max_diff:.3e} exceeds tolerance {TOL:.3e}"
     );
+    ledger.finish(min_cases_per_arm(
+        cases.iter().map(|c| c.op.as_str()),
+        &arms,
+    ));
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -897,14 +956,25 @@ fn diff_004_ndimage_binary_morphology_live_scipy() {
         "SciPy binary morph oracle case count mismatch"
     );
 
+    let arms = ["binary_erosion", "binary_dilation"];
+    let mut ledger = CompareLedger::new("diff_004_ndimage_binary_morphology_live_scipy", &arms);
     let mut case_diffs = Vec::with_capacity(cases.len());
     for (case, oracle) in cases.iter().zip(oracle_cases.iter()) {
         assert_eq!(
             case.case_id, oracle.case_id,
             "binary morph oracle case id mismatch"
         );
-        let actual = rust_binary_morph_output(case).unwrap_or_default();
-        let diff = max_abs_diff(&actual, &oracle.values);
+        let actual = rust_binary_morph_output(case);
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            Some(oracle.values.as_slice()),
+            actual.as_deref(),
+        ) else {
+            continue;
+        };
+        let diff = max_abs_diff(actual, expected);
+        ledger.compared(&case.op, &case.case_id, diff <= TOL);
         case_diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -929,6 +999,7 @@ fn diff_004_ndimage_binary_morphology_live_scipy() {
         test_id: String::from("diff_004_ndimage_binary_morphology_live_scipy"),
         category: String::from("live_scipy_differential"),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: TOL,
         pass,
@@ -942,4 +1013,8 @@ fn diff_004_ndimage_binary_morphology_live_scipy() {
         pass,
         "ndimage binary morph diff max_abs_diff={max_diff:.3e} exceeds tolerance {TOL:.3e}"
     );
+    ledger.finish(min_cases_per_arm(
+        cases.iter().map(|c| c.op.as_str()),
+        &arms,
+    ));
 }

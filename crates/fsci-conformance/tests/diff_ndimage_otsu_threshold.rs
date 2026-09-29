@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-4vtfv]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{NdArray, otsu_threshold};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -263,23 +265,24 @@ fn diff_ndimage_otsu_threshold() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_ndimage_otsu_threshold", &["otsu_threshold"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
+        let scipy_threshold = pmap.get(&case.case_id).and_then(|arm| arm.threshold);
+        let fsci_threshold = NdArray::new(case.data.clone(), vec![case.rows, case.cols])
+            .ok()
+            .map(|arr| otsu_threshold(&arr));
+        let Some((expected, actual)) = ledger.pair(
+            "otsu_threshold",
+            &case.case_id,
+            scipy_threshold,
+            fsci_threshold,
+        ) else {
             continue;
         };
-        let Some(expected) = arm.threshold else {
-            continue;
-        };
-        let Ok(arr) = NdArray::new(case.data.clone(), vec![case.rows, case.cols]) else {
-            continue;
-        };
-        let actual = otsu_threshold(&arr);
-        if !actual.is_finite() {
-            continue;
-        }
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("otsu_threshold", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -293,6 +296,7 @@ fn diff_ndimage_otsu_threshold() {
         test_id: "diff_ndimage_otsu_threshold".into(),
         category: "fsci_ndimage::otsu_threshold vs Python reference".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -313,4 +317,5 @@ fn diff_ndimage_otsu_threshold() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

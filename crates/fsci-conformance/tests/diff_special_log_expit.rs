@@ -4,13 +4,14 @@
 //! Resolves [frankenscipy-lxqen]. Tolerance: 1e-13 absolute for finite
 //! outputs; NaN/infinity outputs compare by classification.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::log_expit;
 use fsci_special::types::SpecialTensor;
@@ -56,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -292,11 +294,23 @@ fn diff_special_log_expit() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_log_expit", &["log_expit"]);
 
     for case in &query.points {
         let expected = pmap.get(&case.case_id).expect("oracle case present");
         let actual = fsci_eval(case);
-        let diff = compare(case, &actual, expected);
+        // An "error" class on either side is a missing value, never a matching class; NaN and
+        // infinite answers still compare by class below.
+        let Some((expected, actual)) = ledger.both(
+            "log_expit",
+            &case.case_id,
+            (expected.value_class != "error").then_some(expected),
+            (actual.value_class != "error").then_some(&actual),
+        ) else {
+            continue;
+        };
+        let diff = compare(case, actual, expected);
+        ledger.compared("log_expit", &case.case_id, diff.pass);
         max_overall = max_overall.max(diff.abs_diff);
         diffs.push(diff);
     }
@@ -306,6 +320,7 @@ fn diff_special_log_expit() {
         test_id: "diff_special_log_expit".into(),
         category: "fsci_special::log_expit vs scipy.special.log_expit".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,4 +341,5 @@ fn diff_special_log_expit() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

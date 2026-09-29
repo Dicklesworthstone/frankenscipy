@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-xgtlt]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
     CsrMatrix, Shape2D, sparse_abs, sparse_col_sums, sparse_power, sparse_row_sums, sparse_sum,
 };
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -346,21 +348,37 @@ fn diff_sparse_elementwise_reductions() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_elementwise_reductions",
+        &[
+            "sparse_abs",
+            "sparse_power",
+            "sparse_sum",
+            "sparse_row_sums",
+            "sparse_col_sums",
+        ],
+    );
 
     for case in &query.abs {
         let scipy_arm = abs_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.dense.as_ref() else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.dense);
         let out = sparse_abs(&csr);
         let flat = dense_from_csr(&out);
+        let Some((expected, flat)) = ledger.slices(
+            "sparse_abs",
+            &case.case_id,
+            scipy_arm.dense.as_deref(),
+            Some(flat.as_slice()),
+        ) else {
+            continue;
+        };
         let abs_d = flat
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("sparse_abs", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "sparse_abs".into(),
@@ -371,18 +389,24 @@ fn diff_sparse_elementwise_reductions() {
 
     for case in &query.power {
         let scipy_arm = power_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.dense.as_ref() else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.dense);
         let out = sparse_power(&csr, case.p);
         let flat = dense_from_csr(&out);
+        let Some((expected, flat)) = ledger.slices(
+            "sparse_power",
+            &case.case_id,
+            scipy_arm.dense.as_deref(),
+            Some(flat.as_slice()),
+        ) else {
+            continue;
+        };
         let abs_d = flat
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("sparse_power", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "sparse_power".into(),
@@ -393,28 +417,47 @@ fn diff_sparse_elementwise_reductions() {
 
     for case in &query.sums {
         let scipy_arm = sums_map.get(&case.case_id).expect("validated oracle");
-        let (Some(total_exp), Some(rs_exp), Some(cs_exp)) = (
-            scipy_arm.total,
-            scipy_arm.row_sums.as_ref(),
-            scipy_arm.col_sums.as_ref(),
-        ) else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.dense);
         let total = sparse_sum(&csr);
         let rs = sparse_row_sums(&csr);
         let cs = sparse_col_sums(&csr);
-        let dt = (total - total_exp).abs();
-        let dr = rs
-            .iter()
-            .zip(rs_exp.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let dc = cs
-            .iter()
-            .zip(cs_exp.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        // One slot per arm; NaN until that arm's case is compared.
+        let mut arm_diffs = [f64::NAN; 3];
+        if let Some((total_exp, total)) =
+            ledger.pair("sparse_sum", &case.case_id, scipy_arm.total, Some(total))
+        {
+            let dt = (total - total_exp).abs();
+            ledger.compared("sparse_sum", &case.case_id, dt <= ABS_TOL);
+            arm_diffs[0] = dt;
+        }
+        let vec_arms = [
+            (
+                "sparse_row_sums",
+                scipy_arm.row_sums.as_deref(),
+                rs.as_slice(),
+            ),
+            (
+                "sparse_col_sums",
+                scipy_arm.col_sums.as_deref(),
+                cs.as_slice(),
+            ),
+        ];
+        for (slot, (arm, scipy, fsci)) in arm_diffs[1..].iter_mut().zip(vec_arms) {
+            let Some((expected, got)) = ledger.slices(arm, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = got
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            ledger.compared(arm, &case.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            continue; // the ledger recorded why this case was not compared
+        }
+        let [dt, dr, dc] = arm_diffs;
         let abs_d = dt.max(dr).max(dc);
         max_overall = max_overall.max(abs_d);
         diffs.push(CaseDiff {
@@ -431,6 +474,7 @@ fn diff_sparse_elementwise_reductions() {
         test_id: "diff_sparse_elementwise_reductions".into(),
         category: "fsci_sparse abs/power/sums vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -451,4 +495,6 @@ fn diff_sparse_elementwise_reductions() {
         diffs.len(),
         max_overall
     );
+    // Every arm is designed to compare every case of its family; the smallest family bounds all.
+    ledger.finish(query.abs.len().min(query.power.len()).min(query.sums.len()));
 }

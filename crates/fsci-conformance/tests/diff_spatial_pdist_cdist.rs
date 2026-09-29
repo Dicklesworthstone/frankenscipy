@@ -9,13 +9,14 @@
 //! 3 fixtures × 10 metrics × {pdist, cdist} ≈ 60 cases.
 //! Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{DistanceMetric, cdist_metric, pdist};
 use serde::{Deserialize, Serialize};
 
@@ -44,16 +45,30 @@ struct OracleQuery {
     cdist: Vec<CdistCase>,
 }
 
+/// One oracle element: a number, or `"nan"` / `"inf"` / `"-inf"` (JSON has no NaN). SciPy answers
+/// NaN on the degenerate rows here (correlation of 1-element or constant vectors, cosine against
+/// the zero vector) and inf for Bray-Curtis when `Σ|u+v| = 0`; those reach the ledger as values
+/// instead of dropping the whole case.
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct OracleNum(
+    #[serde(deserialize_with = "fsci_conformance::compare_ledger::oracle_f64")] Option<f64>,
+);
+
+/// `None` when any element is missing, so a partial vector is never compared.
+fn oracle_vec(values: &[OracleNum]) -> Option<Vec<f64>> {
+    values.iter().map(|n| n.0).collect()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct PdistArm {
     case_id: String,
-    values: Option<Vec<f64>>,
+    values: Option<Vec<OracleNum>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct CdistArm {
     case_id: String,
-    rows: Option<Vec<Vec<f64>>>,
+    rows: Option<Vec<Vec<OracleNum>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +91,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -224,14 +240,14 @@ def fnone(v):
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))
 
 def listify(arr):
     out = []
     for v in arr.tolist():
         f = fnone(v)
         if f is None:
-            return None  # whole case is unsupported (NaN/inf produced)
+            return None  # whole case is unsupported (not a number)
         out.append(f)
     return out
 
@@ -349,35 +365,29 @@ fn diff_spatial_pdist_cdist() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_spatial_pdist_cdist", &["pdist", "cdist"]);
 
     for case in &query.pdist {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.values.as_ref() else {
+        let scipy_all = scipy_arm.values.as_deref().and_then(oracle_vec);
+        let rust_all = metric_for(&case.metric).and_then(|metric| pdist(&case.x, metric).ok());
+        // slices rejects a length mismatch and any non-finite element that does not match
+        // SciPy's, so the max fold below only ever drops a matched NaN/inf pair.
+        let Some((scipy_v, rust_v)) = ledger.slices(
+            "pdist",
+            &case.case_id,
+            scipy_all.as_deref(),
+            rust_all.as_deref(),
+        ) else {
             continue;
         };
-        let Some(metric) = metric_for(&case.metric) else {
-            continue;
-        };
-        let rust_v = match pdist(&case.x, metric) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if rust_v.len() != scipy_v.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                fn_name: "pdist".into(),
-                metric: case.metric.clone(),
-                max_abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let max_d = rust_v
             .iter()
             .zip(scipy_v.iter())
             .map(|(r, s)| (r - s).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(max_d);
+        ledger.compared("pdist", &case.case_id, max_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fn_name: "pdist".into(),
@@ -389,44 +399,40 @@ fn diff_spatial_pdist_cdist() {
 
     for case in &query.cdist {
         let scipy_arm = cmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_rows) = scipy_arm.rows.as_ref() else {
+        let scipy_rows: Option<Vec<Vec<f64>>> = scipy_arm
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.iter().map(Vec::as_slice).map(oracle_vec).collect());
+        let rust_rows = metric_for(&case.metric)
+            .and_then(|metric| cdist_metric(&case.xa, &case.xb, metric).ok());
+        // Element values go through slices on the row-major flattening (NaN/inf must match
+        // SciPy's); the row structure is checked separately below.
+        let scipy_all = scipy_rows.as_ref().map(|rows| rows.concat());
+        let rust_all = rust_rows.as_ref().map(|rows| rows.concat());
+        let Some((scipy_flat, rust_flat)) = ledger.slices(
+            "cdist",
+            &case.case_id,
+            scipy_all.as_deref(),
+            rust_all.as_deref(),
+        ) else {
             continue;
         };
-        let Some(metric) = metric_for(&case.metric) else {
-            continue;
-        };
-        let rust_rows = match cdist_metric(&case.xa, &case.xb, metric) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if rust_rows.len() != scipy_rows.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                fn_name: "cdist".into(),
-                metric: case.metric.clone(),
-                max_abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
-        let mut max_d = 0.0_f64;
-        let mut shape_ok = true;
-        for (rr, sr) in rust_rows.iter().zip(scipy_rows.iter()) {
-            if rr.len() != sr.len() {
-                shape_ok = false;
-                break;
-            }
-            for (r, s) in rr.iter().zip(sr.iter()) {
-                max_d = max_d.max((r - s).abs());
-            }
-        }
+        let row_lens = |rows: &[Vec<f64>]| rows.iter().map(Vec::len).collect::<Vec<usize>>();
+        let shape_ok = scipy_rows.as_deref().map(row_lens) == rust_rows.as_deref().map(row_lens);
+        let max_d = rust_flat
+            .iter()
+            .zip(scipy_flat.iter())
+            .map(|(r, s)| (r - s).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(max_d);
+        let pass = shape_ok && max_d <= ABS_TOL;
+        ledger.compared("cdist", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fn_name: "cdist".into(),
             metric: case.metric.clone(),
             max_abs_diff: if shape_ok { max_d } else { f64::INFINITY },
-            pass: shape_ok && max_d <= ABS_TOL,
+            pass,
         });
     }
 
@@ -436,6 +442,7 @@ fn diff_spatial_pdist_cdist() {
         test_id: "diff_spatial_pdist_cdist".into(),
         category: "fsci_spatial::pdist + cdist_metric".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -460,4 +467,5 @@ fn diff_spatial_pdist_cdist() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.pdist.len().min(query.cdist.len()));
 }

@@ -5,13 +5,14 @@
 //! Resolves [frankenscipy-vpaa7]. 1e-9 abs. Compares sorted eigenvalues
 //! and sign-aligned eigenvectors in lower/upper band storage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, eig_banded};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -362,18 +364,20 @@ fn diff_linalg_eig_banded() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_linalg_eig_banded", &["eig_banded"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.eigvals_sorted.as_ref() else {
-            continue;
-        };
-        let Some(expected_vectors) = scipy_arm.eigvecs.as_ref() else {
-            continue;
-        };
         let ab = rows_of(&case.ab_flat, case.rows, case.cols);
         let opts = DecompOptions::default();
-        let Ok((w, vectors)) = eig_banded(&ab, case.lower, false, opts) else {
+        let fsci = eig_banded(&ab, case.lower, false, opts).ok();
+        let scipy = scipy_arm
+            .eigvals_sorted
+            .as_ref()
+            .zip(scipy_arm.eigvecs.as_ref());
+        let Some(((expected, expected_vectors), (w, vectors))) =
+            ledger.both("eig_banded", &case.case_id, scipy, fsci)
+        else {
             continue;
         };
         let abs_d = if w.len() != expected.len() {
@@ -389,11 +393,15 @@ fn diff_linalg_eig_banded() {
         let dense = dense_from_case(case);
         let residual_abs = eigenvector_residual_max_abs(&dense, &w, &vectors);
         let orthogonality_abs = eigenvector_orthogonality_max_abs(&vectors);
-        let pass = abs_d <= ABS_TOL
+        // The max folds above read a NaN as 0.0; a NaN eigenvalue or eigenvector entry fails.
+        let no_nan = !w.iter().any(|v| v.is_nan()) && !vectors.iter().flatten().any(|v| v.is_nan());
+        let pass = no_nan
+            && abs_d <= ABS_TOL
             && eigvec_abs_diff <= 1.0e-8
             && residual_abs <= 1.0e-8
             && orthogonality_abs <= 1.0e-8;
         max_overall = max_overall.max(abs_d);
+        ledger.compared("eig_banded", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -410,6 +418,7 @@ fn diff_linalg_eig_banded() {
         test_id: "diff_linalg_eig_banded".into(),
         category: "scipy.linalg.eig_banded".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -433,4 +442,5 @@ fn diff_linalg_eig_banded() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

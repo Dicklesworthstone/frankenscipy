@@ -14,13 +14,14 @@
 //! tie-breaking divergence. Indices must match exactly,
 //! distances at 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{k_nearest_neighbors, nearest_neighbors};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -271,15 +273,21 @@ fn diff_spatial_neighbors() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_neighbors",
+        &["nearest_neighbors", "k_nearest_neighbors"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
-        // nearest_neighbors
-        if let (Some(scipy_idx), Some(scipy_dist)) =
-            (scipy_arm.nn_idx.as_ref(), scipy_arm.nn_dist.as_ref())
-        {
-            let (rust_idx_opt, rust_dist) = nearest_neighbors(&case.data);
+        // nearest_neighbors. A NaN distance fails the `<= ABS_TOL` test below.
+        if let Some(((scipy_idx, scipy_dist), (rust_idx_opt, rust_dist))) = ledger.both(
+            "nearest_neighbors",
+            &case.case_id,
+            scipy_arm.nn_idx.as_ref().zip(scipy_arm.nn_dist.as_ref()),
+            Some(nearest_neighbors(&case.data)),
+        ) {
             let rust_idx: Vec<i64> = rust_idx_opt
                 .iter()
                 .map(|o| o.map_or(-1_i64, |v| v as i64))
@@ -290,6 +298,7 @@ fn diff_spatial_neighbors() {
                     .iter()
                     .zip(scipy_dist.iter())
                     .all(|(r, s)| (r - s).abs() <= ABS_TOL);
+            ledger.compared("nearest_neighbors", &case.case_id, idx_match && dist_pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "nearest_neighbors".into(),
@@ -301,10 +310,12 @@ fn diff_spatial_neighbors() {
         }
 
         // k_nearest_neighbors
-        if let (Some(scipy_idx), Some(scipy_dist)) =
-            (scipy_arm.knn_idx.as_ref(), scipy_arm.knn_dist.as_ref())
-        {
-            let (rust_idx, rust_dist) = k_nearest_neighbors(&case.data, case.k);
+        if let Some(((scipy_idx, scipy_dist), (rust_idx, rust_dist))) = ledger.both(
+            "k_nearest_neighbors",
+            &case.case_id,
+            scipy_arm.knn_idx.as_ref().zip(scipy_arm.knn_dist.as_ref()),
+            Some(k_nearest_neighbors(&case.data, case.k)),
+        ) {
             let idx_match = rust_idx.len() == scipy_idx.len()
                 && rust_idx
                     .iter()
@@ -318,6 +329,7 @@ fn diff_spatial_neighbors() {
                             .zip(sr.iter())
                             .all(|(r, s)| (r - s).abs() <= ABS_TOL)
                 });
+            ledger.compared("k_nearest_neighbors", &case.case_id, idx_match && dist_pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "k_nearest_neighbors".into(),
@@ -334,6 +346,7 @@ fn diff_spatial_neighbors() {
         test_id: "diff_spatial_neighbors".into(),
         category: "fsci_spatial::{nearest_neighbors,k_nearest_neighbors}".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -358,4 +371,5 @@ fn diff_spatial_neighbors() {
         pass_count,
         cases.len()
     );
+    ledger.finish(query.points.len());
 }

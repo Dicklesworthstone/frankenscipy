@@ -138,7 +138,14 @@ fn factorize_sparse(
     let cols = triplets.iter().map(|t| t.1).collect();
     let data = triplets.iter().map(|t| t.2).collect();
     let coo = CooMatrix::from_triplets(Shape2D::new(size, size), data, rows, cols, true).ok()?;
-    let lu = splu(&coo.to_csc().ok()?, LuOptions::default()).ok()?;
+    let csc = coo.to_csc().ok()?;
+    // SciPy's `splu` (SuperLU) refuses a Jacobian holding a NaN with `RuntimeError: Factor is
+    // exactly singular`, which `solve_newton` reports as a singular Jacobian (status 2). fsci's LU
+    // would factor it and hand NaN Newton steps back instead.
+    if csc.data().iter().any(|v| v.is_nan()) {
+        return None;
+    }
+    let lu = splu(&csc, LuOptions::default()).ok()?;
     Some(Box::new(SparseLu(lu)))
 }
 
@@ -572,6 +579,87 @@ mod tests {
         assert!(r.success, "{}", r.message);
         // Bratu's upper branch: SciPy y'(0) = 10.846976018307315 (finite differences).
         assert!((r.sol(0.0)[1] - 10.846_976_018_307_315).abs() < 1e-3);
+    }
+
+    /// A residual that goes NaN must not read as converged. SciPy 1.17.1 `solve_bvp` on
+    /// x = linspace(0, 1, 5) from y = 0:
+    /// - y'' = −e^y, bc [y(0), √(y(1) − 1)] (NaN at the guess), finite-difference Jacobians:
+    ///   `splu` refuses the NaN Jacobian, so status 2 ("A singular Jacobian ..."), niter 1, y
+    ///   left at the guess.
+    /// - y'' = √(x − 0.5) (NaN left of 0.5), bc [y(0), y(1)], exact constant `fun_jac`/`bc_jac`:
+    ///   the Jacobian stays finite, y goes NaN, `np.max(abs(bc_res))` is NaN and fails `bc_tol`
+    ///   every iteration, so status 3, niter 10.
+    /// - Must not change: y'' = √(x + 0.5) with the same Jacobians is status 0, niter 1,
+    ///   y'(0) = −0.4519992886777857.
+    ///
+    /// fsci folded max|bc_res| with `f64::max`, which drops the NaN, and returned status 0 with
+    /// `success` on both NaN problems.
+    #[test]
+    fn solve_bvp_refuses_a_nan_residual_like_scipy() {
+        let x = linspace(0.0, 1.0, 5);
+        let guess = [vec![0.0; 5], vec![0.0; 5]];
+
+        let nan_bc = solve_bvp(
+            |_, y, _| vec![y[1], -y[0].exp()],
+            |ya, yb, _| vec![ya[0], (yb[0] - 1.0).sqrt()],
+            &x,
+            &guess,
+            &[],
+            BvpOptions::default(),
+        )
+        .expect("solve_bvp");
+        assert_eq!(
+            (nan_bc.status, nan_bc.niter, nan_bc.success),
+            (2, 1, false),
+            "SciPy: singular Jacobian; fsci returned {nan_bc:?}"
+        );
+        assert!(
+            nan_bc.y.iter().flatten().all(|&v| v == 0.0),
+            "SciPy returns the guess: {:?}",
+            nan_bc.y
+        );
+
+        let fun_jac = |_: f64, _: &[f64], _: &[f64]| {
+            (vec![vec![0.0, 1.0], vec![0.0, 0.0]], vec![vec![], vec![]])
+        };
+        let bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+            (
+                vec![vec![1.0, 0.0], vec![0.0, 0.0]],
+                vec![vec![0.0, 0.0], vec![1.0, 0.0]],
+                vec![vec![], vec![]],
+            )
+        };
+        let forced = |c: f64| {
+            solve_bvp(
+                move |t, y, _| vec![y[1], (t - c).sqrt()],
+                |ya, yb, _| vec![ya[0], yb[0]],
+                &x,
+                &guess,
+                &[],
+                BvpOptions {
+                    fun_jac: Some(&fun_jac),
+                    bc_jac: Some(&bc_jac),
+                    ..BvpOptions::default()
+                },
+            )
+            .expect("solve_bvp")
+        };
+
+        let nan_forcing = forced(0.5);
+        assert_eq!(
+            (nan_forcing.status, nan_forcing.niter, nan_forcing.success),
+            (3, 10, false),
+            "SciPy: bc_tol never met; fsci returned {nan_forcing:?}"
+        );
+
+        let finite_forcing = forced(-0.5);
+        assert!(finite_forcing.success, "{}", finite_forcing.message);
+        assert_eq!((finite_forcing.status, finite_forcing.niter), (0, 1));
+        assert!(
+            (finite_forcing.sol(0.0)[1] + 0.451_999_288_677_785_7).abs() < 1e-10,
+            "y'(0) = {}",
+            finite_forcing.sol(0.0)[1]
+        );
     }
 
     #[test]

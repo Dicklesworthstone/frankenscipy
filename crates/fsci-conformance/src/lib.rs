@@ -59,12 +59,15 @@
 pub struct ReadmeDoctests;
 
 pub mod ci_gates;
+pub mod compare_ledger;
 pub mod dashboard;
 pub mod e2e;
 pub mod forensics;
 pub mod metamorphic;
 pub mod perf_gate;
 pub mod quality_gates;
+
+pub use compare_ledger::{ArmCounts, CompareLedger};
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::systematic::SystematicEncoder;
@@ -99,7 +102,10 @@ use fsci_interpolate::{
     BSpline, CubicSplineStandalone, Interp1d, Interp1dOptions, InterpKind as FsciInterpKind,
     RegularGridInterpolator, RegularGridMethod as FsciRegularGridMethod, SplineBc as FsciSplineBc,
 };
-use fsci_io::{MatArray, loadmat, loadtxt, mmread, mmwrite, savemat, savetxt, wav_read, wav_write};
+use fsci_io::{
+    LoadmatOptions, MatFile, MatFormat, MatNumeric, MatValue, SavematOptions, loadmat, loadtxt,
+    mmread, mmwrite, savemat, savetxt, wav_read, wav_write,
+};
 use fsci_linalg::{
     DecompOptions, InvOptions, LinalgError, LstsqDriver, LstsqOptions, MatrixAssumption,
     PinvOptions, SolveOptions, TriangularSolveOptions, TriangularTranspose, cholesky, det,
@@ -1045,6 +1051,7 @@ pub enum InterpolateRegularGridMethod {
     Linear,
     Nearest,
     Pchip,
+    Slinear,
     Cubic,
     Quintic,
 }
@@ -4776,7 +4783,7 @@ fn execute_fcluster(case: &ClusterCase) -> ClusterObserved {
         Ok(k) => k,
         Err(e) => return ClusterObserved::Error(format!("parse max_clusters: {e}")),
     };
-    match fsci_cluster::fcluster(&z, max_clusters) {
+    match fsci_cluster::fcluster(&z, fsci_cluster::FclusterCriterion::MaxClust(max_clusters)) {
         Ok(labels) => ClusterObserved::Labels(labels),
         Err(e) => ClusterObserved::Error(format!("{e:?}")),
     }
@@ -5256,7 +5263,11 @@ pub struct SpatialExpected {
     pub index: Option<usize>,
     pub distance: Option<f64>,
     pub vertices: Option<Vec<usize>>,
+    /// `ConvexHull.area`: the surface area, i.e. the perimeter of a 2-D hull.
     pub area: Option<f64>,
+    /// `ConvexHull.volume`: the volume, i.e. the enclosed area of a 2-D hull.
+    #[serde(default)]
+    pub volume: Option<f64>,
     pub disparity: Option<f64>,
     pub atol: Option<f64>,
     pub rtol: Option<f64>,
@@ -5304,9 +5315,11 @@ enum SpatialObserved {
     KdTreeBallPoint {
         indices: Vec<usize>,
     },
+    /// Sorted hull vertices with SciPy's `area` and `volume`.
     ConvexHull {
         vertices: Vec<usize>,
         area: f64,
+        volume: f64,
     },
     /// br-uufs: KDTree.query_ball_tree result — list of neighbor
     /// index lists (one per point in tree A; each list contains the
@@ -5734,14 +5747,14 @@ fn execute_convex_hull(case: &SpatialCase) -> SpatialObserved {
         Ok(v) => v,
         Err(e) => return SpatialObserved::Error(format!("parse points: {e}")),
     };
-    let points_2d: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
-    match fsci_spatial::ConvexHull::new(&points_2d) {
+    match fsci_spatial::ConvexHull::new(&points) {
         Ok(hull) => {
             let mut vertices = hull.vertices.clone();
-            vertices.sort();
+            vertices.sort_unstable();
             SpatialObserved::ConvexHull {
                 vertices,
                 area: hull.area,
+                volume: hull.volume,
             }
         }
         Err(e) => SpatialObserved::Error(format!("{e:?}")),
@@ -5758,11 +5771,13 @@ fn execute_voronoi(case: &SpatialCase) -> SpatialObserved {
         Ok(v) => v,
         Err(e) => return SpatialObserved::Error(format!("parse points: {e}")),
     };
-    let points_2d: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
-    match fsci_spatial::Voronoi::new(&points_2d) {
+    if points.iter().any(|p| p.len() != 2) {
+        return SpatialObserved::Error("voronoi_result fixtures are 2-D".to_string());
+    }
+    match fsci_spatial::Voronoi::new(&points) {
         Ok(v) => {
             let mut sorted_vertices: Vec<[f64; 2]> =
-                v.vertices.iter().map(|(x, y)| [*x, *y]).collect();
+                v.vertices.iter().map(|p| [p[0], p[1]]).collect();
             sorted_vertices.sort_by(|a, b| {
                 a[0].partial_cmp(&b[0])
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -5788,7 +5803,7 @@ fn execute_halfspace_intersection(case: &SpatialCase) -> SpatialObserved {
         Err(e) => return SpatialObserved::Error(format!("parse interior_point: {e}")),
     };
 
-    match fsci_spatial::HalfspaceIntersection::from_nd(&halfspaces, &interior_point) {
+    match fsci_spatial::HalfspaceIntersection::new(&halfspaces, &interior_point) {
         Ok(result) => SpatialObserved::HalfspaceIntersection {
             intersections: result.intersections,
             dual_points: result.dual_points,
@@ -5996,24 +6011,43 @@ fn compare_spatial_outcome(case: &SpatialCase, observed: &SpatialObserved) -> (b
                 format!("kdtree ball_point match: {} hits", indices.len()),
             )
         }
-        ("convex_hull", SpatialObserved::ConvexHull { vertices, area }) => {
+        (
+            "convex_hull",
+            SpatialObserved::ConvexHull {
+                vertices,
+                area,
+                volume,
+            },
+        ) => {
             let exp_vertices = case.expected.vertices.as_ref().cloned().unwrap_or_default();
-            let exp_area = case.expected.area.unwrap_or(0.0);
             if *vertices != exp_vertices {
                 return (
                     false,
                     format!("vertices mismatch: got {vertices:?}, expected {exp_vertices:?}"),
                 );
             }
-            if !allclose_scalar(*area, exp_area, atol, rtol) {
+            if case.expected.area.is_none() && case.expected.volume.is_none() {
                 return (
                     false,
-                    format!("area mismatch: got {area}, expected {exp_area}"),
+                    "convex_hull expectation names neither area nor volume".to_string(),
                 );
+            }
+            for (field, got, expected) in [
+                ("area", *area, case.expected.area),
+                ("volume", *volume, case.expected.volume),
+            ] {
+                if let Some(expected) = expected
+                    && !allclose_scalar(got, expected, atol, rtol)
+                {
+                    return (
+                        false,
+                        format!("{field} mismatch: got {got}, expected {expected}"),
+                    );
+                }
             }
             (
                 true,
-                format!("convex hull match: vertices={vertices:?}, area={area}"),
+                format!("convex hull match: vertices={vertices:?}, area={area}, volume={volume}"),
             )
         }
         ("kdtree_ball_tree_result", SpatialObserved::KdTreeBallTree { neighbors }) => {
@@ -8392,6 +8426,7 @@ fn execute_integrate_solve_ivp(case: &IntegrateCase) -> IntegrateObserved {
         first_step: args.first_step,
         max_step: args.max_step.unwrap_or(f64::INFINITY),
         mode: case.mode,
+        jac: None,
     };
     let mut rhs_mut = rhs_fn;
     match fsci_integrate::solve_ivp(&mut rhs_mut, &opts) {
@@ -9462,15 +9497,30 @@ fn compare_spatial_case_differential(
             };
             (passed, message, Some(diff), Some(tolerance()))
         }
-        ("convex_hull", SpatialObserved::ConvexHull { vertices, area }) => {
+        (
+            "convex_hull",
+            SpatialObserved::ConvexHull {
+                vertices,
+                area,
+                volume,
+            },
+        ) => {
             let expected_vertices = case.expected.vertices.as_deref().unwrap_or(&[]);
-            let expected_area = case.expected.area.unwrap_or(0.0);
             let vertex_diff = if vertices.as_slice() == expected_vertices {
                 0.0
             } else {
                 f64::INFINITY
             };
-            let diff = vertex_diff.max((area - expected_area).abs());
+            let measure_diff = [(*area, case.expected.area), (*volume, case.expected.volume)]
+                .into_iter()
+                .filter_map(|(got, expected)| expected.map(|e| (got - e).abs()))
+                // A NaN difference must surface, not vanish into `f64::max`.
+                .fold(0.0_f64, |m, d| if d.is_nan() || d > m { d } else { m });
+            let diff = if measure_diff.is_nan() {
+                measure_diff
+            } else {
+                vertex_diff.max(measure_diff)
+            };
             (passed, message, Some(diff), Some(tolerance()))
         }
         ("procrustes_result", SpatialObserved::Procrustes { disparity }) => {
@@ -12134,6 +12184,7 @@ fn fixture_regular_grid_method_to_runtime(
         InterpolateRegularGridMethod::Linear => FsciRegularGridMethod::Linear,
         InterpolateRegularGridMethod::Nearest => FsciRegularGridMethod::Nearest,
         InterpolateRegularGridMethod::Pchip => FsciRegularGridMethod::Pchip,
+        InterpolateRegularGridMethod::Slinear => FsciRegularGridMethod::Slinear,
         InterpolateRegularGridMethod::Cubic => FsciRegularGridMethod::Cubic,
         InterpolateRegularGridMethod::Quintic => FsciRegularGridMethod::Quintic,
     }
@@ -12680,12 +12731,21 @@ fn decode_io_hex_bytes(content_hex: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn first_mat_array_as_matrix(arrays: Vec<MatArray>) -> Result<(usize, usize, Vec<f64>), String> {
-    let first = arrays
+/// The first variable of a MAT file as a row-major real matrix, the shape the io fixtures and
+/// the SciPy oracle's `_matrix_payload` compare.
+fn first_mat_array_as_matrix(file: MatFile) -> Result<(usize, usize, Vec<f64>), String> {
+    let (_, first) = file
+        .variables
         .into_iter()
         .next()
         .ok_or_else(|| "MAT file did not contain any arrays".to_owned())?;
-    Ok((first.rows, first.cols, first.data))
+    match first {
+        MatValue::Numeric(numeric) => numeric.to_row_major_f64().map_err(|e| e.to_string()),
+        other => Err(format!(
+            "first MAT variable is a {} array, not a numeric matrix",
+            other.class_name()
+        )),
+    }
 }
 
 fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
@@ -12711,7 +12771,9 @@ fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
         IoCase::Loadmat { content_hex, .. } => {
             match decode_io_hex_bytes(content_hex)
                 .map_err(|error| error.to_string())
-                .and_then(|bytes| loadmat(&bytes).map_err(|error| error.to_string()))
+                .and_then(|bytes| {
+                    loadmat(&bytes, &LoadmatOptions::default()).map_err(|error| error.to_string())
+                })
                 .and_then(first_mat_array_as_matrix)
             {
                 Ok((rows, cols, values)) => IoObservedOutcome::Matrix { rows, cols, values },
@@ -12725,14 +12787,14 @@ fn execute_io_case(case: &IoCase) -> IoObservedOutcome {
             data,
             ..
         } => {
-            let array = MatArray {
-                name: name.clone(),
-                rows: *rows,
-                cols: *cols,
-                data: data.clone(),
+            // The oracle writes these with `format="4"`.
+            let options = SavematOptions {
+                format: MatFormat::V4,
+                ..SavematOptions::default()
             };
-            match savemat(&[array])
-                .and_then(|bytes| loadmat(&bytes))
+            match MatNumeric::from_row_major(*rows, *cols, data)
+                .and_then(|array| savemat(&[(name.clone(), MatValue::Numeric(array))], &options))
+                .and_then(|bytes| loadmat(&bytes, &LoadmatOptions::default()))
                 .map_err(|error| error.to_string())
                 .and_then(first_mat_array_as_matrix)
             {
@@ -13810,8 +13872,24 @@ pub struct ConformanceReport {
     pub oracle_status: OracleStatus,
     /// Per-case results with max_diff and tolerance information.
     pub per_case_results: Vec<DifferentialCaseResult>,
+    /// Cases compared against SciPy output captured in THIS run. It is what makes the report
+    /// `OracleBacked`: a runner that only probes the oracle, or captures its output and then
+    /// checks the fixture's embedded values anyway, reports 0 and is a self-check whatever
+    /// `oracle_status` says (frankenscipy-olv0j.8).
+    #[serde(default)]
+    pub oracle_compared_cases: usize,
     /// Timestamp when this report was generated.
     pub generated_unix_ms: u128,
+}
+
+/// The cases of a fixture that have a captured SciPy output to be compared against.
+fn oracle_compared_count<'a, V>(
+    case_ids: impl Iterator<Item = &'a str>,
+    oracle_cases: Option<&std::collections::HashMap<&str, V>>,
+) -> usize {
+    oracle_cases.map_or(0, |cases| {
+        case_ids.filter(|id| cases.contains_key(id)).count()
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -13975,10 +14053,11 @@ impl From<&ConformanceReport> for PacketReport {
             fixture_path: Some(report.fixture_path.clone()),
             oracle_status: Some(report.oracle_status.clone()),
             differential_case_results: Some(report.per_case_results.clone()),
-            // ConformanceReport comes from the differential lane; mark as
-            // OracleBacked when the oracle_status indicates availability,
-            // otherwise SelfCheck. Per frankenscipy-fytm.
-            report_kind: if matches!(report.oracle_status, OracleStatus::Available) {
+            // OracleBacked only when this run compared cases against captured SciPy output.
+            // It used to follow `oracle_status`, so a runner that merely found SciPy installed
+            // and then checked the fixture's embedded values published a self-check as live
+            // evidence (frankenscipy-olv0j.8; the rule was frankenscipy-fytm's).
+            report_kind: if report.oracle_compared_cases > 0 {
                 ReportKind::OracleBacked
             } else {
                 ReportKind::SelfCheck
@@ -14109,14 +14188,16 @@ fn recover_sync_audit_ledger<'a>(
 ///
 /// # Oracle wiring state
 ///
-/// Step 4 currently captures Python oracle output for linalg packet
-/// helpers and for the generic differential lanes that explicitly call
-/// `capture_python_oracle_inner` (stats, array_api, constants). Other
-/// family-specific scripts may exist on disk and be routable through
-/// `default_differential_oracle_script_path(family)`, but a runner that
-/// only probes availability and then compares Rust output against the
-/// fixture's embedded expected values remains **self-checking**, not
-/// oracle-backed.
+/// A report is `OracleBacked` only when its runner compared cases against SciPy output
+/// captured in the same run (`ConformanceReport::oracle_compared_cases > 0`); otherwise it
+/// is `SelfCheck`, whatever `oracle_status` says (frankenscipy-olv0j.8).
+/// - Compare against a capture: array_api, interpolate, io, ndimage, stats, constants.
+/// - Probe availability, then compare the fixture's embedded expected values (self-checks):
+///   validate_tol, linalg, optimize, special, integrate, signal, spatial, cluster, casp, fft.
+/// - Capture, but still compare the fixture's expected values (self-check): sparse.
+///
+/// The linalg packet's live lane is `run_linalg_packet_with_oracle_capture`, not this entry
+/// point.
 pub fn run_differential_test(
     fixture_path: &Path,
     oracle_config: &DifferentialOracleConfig,
@@ -14291,6 +14372,8 @@ fn run_differential_validate_tol(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14338,6 +14421,8 @@ fn run_differential_linalg(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14435,6 +14520,10 @@ fn run_differential_array_api(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14483,6 +14572,8 @@ fn run_differential_optimize(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14583,6 +14674,10 @@ fn run_differential_interpolate(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14680,6 +14775,10 @@ fn run_differential_io(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14777,6 +14876,10 @@ fn run_differential_ndimage(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14825,6 +14928,8 @@ fn run_differential_special(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14866,6 +14971,8 @@ fn run_differential_integrate(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14963,6 +15070,10 @@ fn run_differential_stats(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15011,6 +15122,8 @@ fn run_differential_signal(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15062,6 +15175,8 @@ fn run_differential_spatial(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15113,6 +15228,8 @@ fn run_differential_cluster(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15164,6 +15281,8 @@ fn run_differential_casp(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15214,6 +15333,8 @@ fn run_differential_fft(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15683,6 +15804,10 @@ fn run_differential_constants(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15775,6 +15900,9 @@ fn run_differential_sparse(
         fail_count,
         oracle_status,
         per_case_results,
+        // Captures SciPy's output but compares the fixture's expected values, so nothing in
+        // this report was checked against the capture.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -24373,6 +24501,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                 }),
                 oracle_status: OracleStatus::Available,
             }],
+            oracle_compared_cases: 1,
             generated_unix_ms: 42,
         };
 
@@ -24397,6 +24526,45 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         );
         assert!(artifacts.sidecar_path.exists());
         assert!(artifacts.decode_proof_path.exists());
+        assert_eq!(parsed.report_kind, super::ReportKind::OracleBacked);
+    }
+
+    /// frankenscipy-olv0j.8: the kind follows what was compared, not whether SciPy was found.
+    #[test]
+    fn report_kind_is_oracle_backed_only_when_cases_were_compared_against_a_capture() {
+        let report =
+            |oracle_status: OracleStatus, oracle_compared_cases: usize| ConformanceReport {
+                fixture_path: "FSCI-P2C-002_linalg_core.json".to_owned(),
+                packet_id: "FSCI-P2C-002".to_owned(),
+                family: "linalg_core".to_owned(),
+                pass_count: 1,
+                fail_count: 0,
+                oracle_status,
+                per_case_results: Vec::new(),
+                oracle_compared_cases,
+                generated_unix_ms: 0,
+            };
+        // Probe-only: SciPy was found but nothing was compared with it.
+        let probed = PacketReport::from(&report(OracleStatus::Available, 0));
+        assert_eq!(probed.report_kind, super::ReportKind::SelfCheck);
+        assert_eq!(probed.oracle_status, Some(OracleStatus::Available));
+        let compared = PacketReport::from(&report(OracleStatus::Available, 3));
+        assert_eq!(compared.report_kind, super::ReportKind::OracleBacked);
+        let missing = PacketReport::from(&report(
+            OracleStatus::Missing {
+                reason: "no python".to_owned(),
+            },
+            0,
+        ));
+        assert_eq!(missing.report_kind, super::ReportKind::SelfCheck);
+        // A report written before the field existed reads as compared-nothing.
+        let mut legacy = serde_json::to_value(report(OracleStatus::Available, 5)).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("oracle_compared_cases");
+        let legacy: ConformanceReport = serde_json::from_value(legacy).expect("legacy parses");
+        assert_eq!(legacy.oracle_compared_cases, 0);
     }
 
     #[test]
@@ -24436,6 +24604,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                     oracle_status: OracleStatus::Available,
                 },
             ],
+            oracle_compared_cases: 2,
             generated_unix_ms: 123,
         };
 

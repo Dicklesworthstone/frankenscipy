@@ -236,7 +236,7 @@
     {
       "case_id": "dct_impulse_4pt",
       "passed": true,
-      "message": "real vector matched (max_diff=2.22e-16)"
+      "message": "real vector matched (max_diff=1.11e-16)"
     },
     {
       "case_id": "dct_constant_4pt",
@@ -261,7 +261,7 @@
     {
       "case_id": "dst_ii_impulse_4pt",
       "passed": true,
-      "message": "real vector matched (max_diff=2.22e-16)"
+      "message": "real vector matched (max_diff=1.11e-16)"
     },
     {
       "case_id": "dct_iii_8pt",
@@ -431,7 +431,7 @@
     {
       "case_id": "br_mhnr_dst_iii_8pt_ortho",
       "passed": true,
-      "message": "real vector matched (max_diff=4.44e-16)"
+      "message": "real vector matched (max_diff=3.33e-16)"
     },
     {
       "case_id": "br_mhnr_dst_iii_8pt_forward",
@@ -441,7 +441,7 @@
     {
       "case_id": "br_mhnr_dct_5pt_backward",
       "passed": true,
-      "message": "real vector matched (max_diff=3.55e-15)"
+      "message": "real vector matched (max_diff=1.78e-15)"
     },
     {
       "case_id": "br_mhnr_dct_5pt_ortho",
@@ -1123,8 +1123,8 @@
     {
       "case_id": "dct_impulse_4pt",
       "passed": true,
-      "message": "real vector matched (max_diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "real vector matched (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-8,
@@ -1193,8 +1193,8 @@
     {
       "case_id": "dst_ii_impulse_4pt",
       "passed": true,
-      "message": "real vector matched (max_diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "real vector matched (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-8,
@@ -1669,8 +1669,8 @@
     {
       "case_id": "br_mhnr_dst_iii_8pt_ortho",
       "passed": true,
-      "message": "real vector matched (max_diff=4.44e-16)",
-      "max_diff": 4.440892098500626e-16,
+      "message": "real vector matched (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-9,
@@ -1697,8 +1697,8 @@
     {
       "case_id": "br_mhnr_dct_5pt_backward",
       "passed": true,
-      "message": "real vector matched (max_diff=3.55e-15)",
-      "max_diff": 3.552713678800501e-15,
+      "message": "real vector matched (max_diff=1.78e-15)",
+      "max_diff": 1.7763568394002505e-15,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-9,
@@ -1779,6 +1779,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501937
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392910666
 }

@@ -11,13 +11,14 @@
 //! abs/rel — the series composes Gamma in the denominator
 //! and is conditionally convergent across (a, b, x) regimes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{log_wright_bessel, wright_bessel};
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -321,25 +323,31 @@ fn diff_special_wright_bessel() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_wright_bessel", &["wright_bessel"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.a, case.b, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "wright_bessel",
+            &case.case_id,
+            oracle.value,
+            fsci_eval(case.a, case.b, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared("wright_bessel", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -348,6 +356,7 @@ fn diff_special_wright_bessel() {
         test_id: "diff_special_wright_bessel".into(),
         category: "scipy.special.wright_bessel".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -374,6 +383,7 @@ fn diff_special_wright_bessel() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }
 
 #[test]
@@ -394,25 +404,31 @@ fn diff_special_log_wright_bessel() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_log_wright_bessel", &["log_wright_bessel"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_log_eval(case.a, case.b, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "log_wright_bessel",
+            &case.case_id,
+            oracle.value,
+            fsci_log_eval(case.a, case.b, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared("log_wright_bessel", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -421,6 +437,7 @@ fn diff_special_log_wright_bessel() {
         test_id: "diff_special_log_wright_bessel".into(),
         category: "scipy.special.log_wright_bessel".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -447,4 +464,5 @@ fn diff_special_log_wright_bessel() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -15,13 +15,14 @@
 //! 4 (y_true, y_pred) fixtures × 5 funcs = 20 cases. Tol 1e-12
 //! abs (closed-form sums; no transcendentals).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     mean_absolute_error, mean_absolute_percentage_error, mean_squared_error, r2_score,
     root_mean_squared_error,
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -262,25 +264,29 @@ fn diff_stats_regression_metrics() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_regression_metrics",
+        &["r2", "mae", "mse", "rmse", "mape"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
         let rust_v = match case.func.as_str() {
             "r2" => r2_score(&case.y_true, &case.y_pred),
             "mae" => mean_absolute_error(&case.y_true, &case.y_pred),
             "mse" => mean_squared_error(&case.y_true, &case.y_pred),
             "rmse" => root_mean_squared_error(&case.y_true, &case.y_pred),
             "mape" => mean_absolute_percentage_error(&case.y_true, &case.y_pred),
-            _ => continue,
+            other => panic!("unknown func {other} in {}", case.case_id),
         };
-        if !rust_v.is_finite() {
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, Some(rust_v))
+        else {
             continue;
-        }
+        };
         let abs_diff = (rust_v - scipy_v).abs();
         max_overall = max_overall.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             func: case.func.clone(),
@@ -295,6 +301,7 @@ fn diff_stats_regression_metrics() {
         test_id: "diff_stats_regression_metrics".into(),
         category: "regression metrics: r2 / mae / mse / rmse / mape (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -319,4 +326,5 @@ fn diff_stats_regression_metrics() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.iter().filter(|c| c.func == "r2").count());
 }

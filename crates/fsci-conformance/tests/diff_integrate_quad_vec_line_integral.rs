@@ -11,13 +11,14 @@
 //!   closed-form line integrals on unit circle and line segments at
 //!   1e-4 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{QuadOptions, line_integral, quad_vec};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,9 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const QV_ABS_TOL: f64 = 1.0e-8;
 const LI_ABS_TOL: f64 = 1.0e-4;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per fsci entry point (the case `op`). The `li` arm's reference is the
+/// analytical value the oracle echoes back, not a SciPy computation.
+const ARMS: [&str; 2] = ["qv", "li"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -69,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -283,64 +288,70 @@ fn diff_integrate_quad_vec_line_integral() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_integrate_quad_vec_line_integral", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let (abs_d, tol) = match case.op.as_str() {
+        let scipy = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let arm = case.op.as_str();
+        let fsci: Option<Vec<f64>> = match arm {
             "qv" => {
                 let fname = case.func.clone();
                 let f = move |x: f64| f_vec(&fname, x);
-                let Ok(r) = quad_vec(&f, case.a, case.b, opts) else {
-                    continue;
-                };
-                (vec_max_diff(&r.integral, expected), QV_ABS_TOL)
+                quad_vec(&f, case.a, case.b, opts).ok().map(|r| r.integral)
             }
             "li" => {
                 let v = match case.func.as_str() {
-                    "circle_one" => line_integral(
+                    "circle_one" => Some(line_integral(
                         |_x, _y| 1.0,
                         |t: f64| t.cos(),
                         |t: f64| t.sin(),
                         case.a,
                         case.b,
                         case.n,
-                    ),
-                    "circle_unit_r" => line_integral(
+                    )),
+                    "circle_unit_r" => Some(line_integral(
                         |x, y| x * x + y * y,
                         |t: f64| t.cos(),
                         |t: f64| t.sin(),
                         case.a,
                         case.b,
                         case.n,
-                    ),
-                    "segment_one" => line_integral(
+                    )),
+                    "segment_one" => Some(line_integral(
                         |_x, _y| 1.0,
                         |t: f64| 3.0 * t,
                         |t: f64| 4.0 * t,
                         case.a,
                         case.b,
                         case.n,
-                    ),
-                    "segment_x" => line_integral(
+                    )),
+                    "segment_x" => Some(line_integral(
                         |x, _y| x,
                         |t: f64| 3.0 * t,
                         |t: f64| 4.0 * t,
                         case.a,
                         case.b,
                         case.n,
-                    ),
-                    _ => continue,
+                    )),
+                    _ => None,
                 };
-                ((v - expected[0]).abs(), LI_ABS_TOL)
+                v.map(|v| vec![v])
             }
-            _ => continue,
+            _ => None,
+        };
+        let Some((expected, fsci)) = ledger.slices(arm, &case.case_id, scipy, fsci.as_deref())
+        else {
+            continue;
+        };
+        let (abs_d, tol) = if arm == "qv" {
+            (vec_max_diff(fsci, expected), QV_ABS_TOL)
+        } else {
+            ((fsci[0] - expected[0]).abs(), LI_ABS_TOL)
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared(arm, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -355,6 +366,7 @@ fn diff_integrate_quad_vec_line_integral() {
         test_id: "diff_integrate_quad_vec_line_integral".into(),
         category: "fsci_integrate::{quad_vec, line_integral} vs scipy & analytical".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -375,4 +387,11 @@ fn diff_integrate_quad_vec_line_integral() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (`qv` has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

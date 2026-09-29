@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-3sja3]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{RegularGridMethod, interpn};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -275,42 +277,39 @@ fn diff_interpolate_interpn() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_interpn", &["linear", "nearest"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.expected.as_ref() else {
-            continue;
-        };
         let method = match case.method.as_str() {
             "linear" => RegularGridMethod::Linear,
             "nearest" => RegularGridMethod::Nearest,
-            _ => continue,
+            other => panic!("unknown interpn method {other} in {}", case.case_id),
         };
-        let Ok(fsci_v) = interpn(
+        let fsci_v = interpn(
             case.points.clone(),
             case.values.clone(),
             &case.xi,
             method,
             true,
             None,
+        )
+        .ok();
+        let Some((expected, fsci_v)) = ledger.slices(
+            &case.method,
+            &case.case_id,
+            scipy_arm.expected.as_deref(),
+            fsci_v.as_deref(),
         ) else {
             continue;
         };
-        if fsci_v.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.method.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.method, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: case.method.clone(),
@@ -325,6 +324,7 @@ fn diff_interpolate_interpn() {
         test_id: "diff_interpolate_interpn".into(),
         category: "scipy.interpolate.interpn (linear, nearest)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -348,4 +348,6 @@ fn diff_interpolate_interpn() {
         diffs.len(),
         max_overall
     );
+    let per_method = |m: &str| query.points.iter().filter(|c| c.method == m).count();
+    ledger.finish(per_method("linear").min(per_method("nearest")));
 }

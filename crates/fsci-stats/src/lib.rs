@@ -14,6 +14,8 @@
 pub mod audit;
 pub mod censored;
 pub mod covariance;
+mod landau;
+mod levy_stable;
 pub mod qmc;
 
 pub use audit::{
@@ -1511,7 +1513,8 @@ impl ContinuousDistribution for StudentT {
     }
 
     fn mean(&self) -> f64 {
-        if self.df > 1.0 { 0.0 } else { f64::NAN }
+        // scipy.stats.t reports inf, not NaN, for df <= 1 (frankenscipy-szq1n.14 sweep).
+        if self.df > 1.0 { 0.0 } else { f64::INFINITY }
     }
 
     fn var(&self) -> f64 {
@@ -1641,8 +1644,12 @@ impl ContinuousDistribution for StudentT {
     }
 
     fn kurtosis(&self) -> f64 {
+        // scipy.stats.t: 6/(df-4) for df > 4, inf for 2 < df <= 4 (the fourth moment diverges
+        // while the variance exists), NaN for df <= 2 (frankenscipy-szq1n.14 sweep).
         if self.df > 4.0 {
             6.0 / (self.df - 4.0)
+        } else if self.df > 2.0 {
+            f64::INFINITY
         } else {
             f64::NAN
         }
@@ -1988,10 +1995,11 @@ impl ContinuousDistribution for NoncentralT {
         if self.nc.abs() < 1e-10 {
             return StudentT::new(self.df).sf(x);
         }
-        // sf(t; ν, δ) = 1 − F(t) = F(−t; ν, −δ) (noncentral-t reflection), so
-        // evaluate the tail DIRECTLY via `nctdtr` with reflected args — fast and
-        // cancellation-free (no 1 − cdf), matching the former local tail integrate.
-        fsci_special::nctdtr(self.df, -self.nc, -x).clamp(0.0, 1.0)
+        // The survival function computed directly (frankenscipy-g9yid). The reflection
+        // F(−t; ν, −δ) this used to evaluate is, for x > 0, nctdtr at a NEGATIVE t, which was
+        // itself 1 − nctdtr(ν, δ, t): the upper tail cancelled to 0 below ~1e-16, e.g.
+        // sf(4405362.28162058; 5, 3) was 0 where the law is 1e-30.
+        fsci_special::nctdtrc(self.df, self.nc, x).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -2804,6 +2812,13 @@ impl ContinuousDistribution for Uniform {
     }
 
     fn mean(&self) -> f64 {
+        self.loc + 0.5 * self.scale
+    }
+
+    /// The midpoint. Every point of the support maximises the pdf, so the trait's NaN default
+    /// for a non-unique mode would apply, but SciPy does define one: `Uniform._mode_formula`
+    /// returns `a + 0.5*(b - a)`.
+    fn mode(&self) -> f64 {
         self.loc + 0.5 * self.scale
     }
 
@@ -4337,6 +4352,11 @@ impl StudentizedRange {
 
     /// Survival function: P(Q > q)
     pub fn sf(&self, q: f64) -> f64 {
+        // SciPy 1.17.1: studentized_range.{cdf,sf,pdf}(nan, 3, 10) are all nan; the
+        // `!q.is_finite()` branches below are for ±inf and used to answer NaN with 0 / 1.
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 {
             return 1.0;
         }
@@ -4353,6 +4373,9 @@ impl StudentizedRange {
     ///
     /// where f_chi is the PDF of sqrt(chi2(df)/df).
     pub fn cdf(&self, q: f64) -> f64 {
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 {
             return 0.0;
         }
@@ -4415,6 +4438,9 @@ impl StudentizedRange {
     ///
     /// `f_Q(q) = ∫_0^∞ f_chi2(v; df) · F_R'(q·s) · s dv`, `s = sqrt(v/df)`.
     pub fn pdf(&self, q: f64) -> f64 {
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 || !q.is_finite() {
             return 0.0;
         }
@@ -5091,9 +5117,10 @@ impl Weibull {
 }
 
 /// Same-binary A/B toggle for `Weibull::fit`: when `true`, the MLE Newton loop
-/// recomputes `x.powf(c)` each iteration (powf recomputes `ln(x)`); when `false`
-/// (default) it reuses the precomputed `ln_data` as `(c·lx).exp()`, dropping one
-/// `ln` per element per iteration. Agrees to ~1e-15; the fixed point is unchanged.
+/// recomputes `(x / x_max).powf(c)` each iteration (powf recomputes `ln`); when `false`
+/// (default) it reuses the precomputed `ln_data` as `(c·(lx − ln x_max)).exp()`, dropping one
+/// `ln` per element per iteration. Both arms are anchored at the largest sample. Agrees to
+/// ~1e-15; the fixed point is unchanged.
 pub static WEIBULL_FIT_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5269,14 +5296,24 @@ impl ContinuousDistribution for Weibull {
         let n = data.len() as f64;
         let ln_data: Vec<f64> = data.iter().map(|&x| x.ln()).collect();
         let mean_ln: f64 = ln_data.iter().sum::<f64>() / n;
+        // Every x^c below is anchored at the largest sample, (x / x_max)^c ∈ (0, 1]: the Newton
+        // terms are ratios in which the common factor x_max^c cancels, so the iteration is the
+        // same, but a large shape can no longer overflow. Unanchored, tight data at 1e10 (MLE
+        // shape ≈ 2127) sent exp(c·ln x) to inf, the iterate to NaN, and `c.max(1e-6)` reset
+        // it, returning c ≈ 1.05 where SciPy's weibull_min.fit(floc=0) gives 2127.25.
+        let x_max = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let ln_max = x_max.ln();
         // powf(x,c) = exp(c·ln(x)); ln(x) is already in `ln_data`, so reuse it and
         // drop powf's internal `ln` on every element of every Newton iteration.
         let reuse = !WEIBULL_FIT_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         let pow_c = |c: f64| -> Vec<f64> {
             if reuse {
-                ln_data.iter().map(|&lx| (c * lx).exp()).collect()
+                ln_data
+                    .iter()
+                    .map(|&lx| (c * (lx - ln_max)).exp())
+                    .collect()
             } else {
-                data.iter().map(|&x| x.powf(c)).collect()
+                data.iter().map(|&x| (x / x_max).powf(c)).collect()
             }
         };
 
@@ -5303,7 +5340,8 @@ impl ContinuousDistribution for Weibull {
             c = c.max(1e-6);
         }
         let xc_sum: f64 = pow_c(c).iter().sum();
-        let scale = (xc_sum / n).powf(1.0 / c);
+        // ((1/n) Σ x^c)^{1/c} with the anchor restored: x_max · ((1/n) Σ (x/x_max)^c)^{1/c}.
+        let scale = x_max * (xc_sum / n).powf(1.0 / c);
         Self { c, scale }
     }
 
@@ -11033,6 +11071,128 @@ impl ContinuousDistribution for VonMises {
                 "VonMises circular fit produced invalid kappa: {kappa}"
             )))
         }
+    }
+}
+
+/// `scipy.stats.vonmises_line(kappa, loc)`: the von Mises law on the line, supported on the
+/// single period `[loc − π, loc + π]`.
+///
+/// SciPy builds it as `vonmises_gen(a=-π, b=π)`, so inside that window its density, cdf and
+/// moments are [`VonMises`]'s. Outside it the density is 0 and the cdf stays at 0 below and 1
+/// above, where the circular `vonmises` repeats its density and adds one to the cdf per period.
+/// `ppf(0)`/`ppf(1)` are the window's ends, not ±∞. The fit is [`VonMises`]'s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VonmisesLine {
+    pub kappa: f64,
+    pub loc: f64,
+}
+
+impl VonmisesLine {
+    #[must_use]
+    pub fn new(kappa: f64, loc: f64) -> Self {
+        assert!(kappa >= 0.0, "kappa must be non-negative, got {kappa}");
+        Self { kappa, loc }
+    }
+
+    /// The support `[loc − π, loc + π]`, as SciPy's `support()`.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (self.loc - PI, self.loc + PI)
+    }
+
+    fn circular(&self) -> VonMises {
+        VonMises {
+            kappa: self.kappa,
+            loc: self.loc,
+        }
+    }
+}
+
+impl ContinuousDistribution for VonmisesLine {
+    fn pdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x < a || x > b {
+            return 0.0;
+        }
+        self.circular().pdf(x)
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x < a || x > b {
+            return f64::NEG_INFINITY;
+        }
+        self.circular().logpdf(x)
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        let (a, b) = self.support();
+        if x <= a {
+            return 0.0;
+        }
+        if x >= b {
+            return 1.0;
+        }
+        self.circular().base_cdf(x)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (a, b) = self.support();
+        if q == 0.0 {
+            return a;
+        }
+        if q == 1.0 {
+            return b;
+        }
+        self.circular().ppf(q)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (a, b) = self.support();
+        if q == 0.0 {
+            return b;
+        }
+        if q == 1.0 {
+            return a;
+        }
+        self.circular().isf(q)
+    }
+
+    fn mean(&self) -> f64 {
+        self.circular().mean()
+    }
+
+    fn var(&self) -> f64 {
+        self.circular().var()
+    }
+
+    fn entropy(&self) -> f64 {
+        self.circular().entropy()
+    }
+
+    fn skewness(&self) -> f64 {
+        self.circular().skewness()
+    }
+
+    fn kurtosis(&self) -> f64 {
+        self.circular().kurtosis()
+    }
+
+    fn mode(&self) -> f64 {
+        self.loc
+    }
+
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        VonMises::try_fit(data).map(|fitted| Self {
+            kappa: fitted.kappa,
+            loc: fitted.loc,
+        })
     }
 }
 
@@ -17619,7 +17779,9 @@ impl ContinuousDistribution for InverseGaussian {
         let sqrt_x = x.sqrt();
         let t1 = standard_normal_cdf(-(sqrt_x / mu - 1.0 / sqrt_x));
         let t2 = (2.0 / mu).exp() * standard_normal_cdf(-(sqrt_x / mu + 1.0 / sqrt_x));
-        (t1 - t2).max(0.0)
+        let sf = t1 - t2;
+        // The clamp is for rounding below zero; `NaN.max(0.0)` would turn sf(NaN) into 0.0.
+        if sf.is_nan() { f64::NAN } else { sf.max(0.0) }
     }
 
     fn mean(&self) -> f64 {
@@ -22609,18 +22771,46 @@ pub type Exponweib = ExponWeibull;
 // finite-n KS law, kstwobign its n -> inf limit; vonmises_line is zero outside
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
+// `Kstwo` is now its own type, the finite-n law, and so are `VonmisesLine`, the law on
+// [loc - pi, loc + pi], `Landau`, the Boost-backed law SciPy computes, and `LevyStable`,
+// the (alpha, beta) stable law by Nolan's piecewise integration (frankenscipy-1ksfv.16).
 
-/// Warning emitted when input data is constant, matching `scipy.stats.ConstantInputWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConstantInputWarning(pub String);
+// SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
+// are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
+// `spearmanr` and `bootstrap` raise them under SciPy's conditions; `catch_warnings`
+// records them.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
-/// Warning emitted when data is degenerate, matching `scipy.stats.DegenerateDataWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DegenerateDataWarning(pub String);
+const CONSTANT_INPUT_MESSAGE: &str =
+    "An input array is constant; the correlation coefficient is not defined.";
 
-/// Warning emitted when input data is nearly constant, matching `scipy.stats.NearConstantInputWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NearConstantInputWarning(pub String);
+/// SciPy's `const_x | const_y` test: an input whose elements all equal its first (so an
+/// input holding a NaN is not constant). A constant input raises `ConstantInputWarning`,
+/// and the correlation is NaN.
+fn correlation_input_is_constant(x: &[f64], y: &[f64]) -> bool {
+    let constant = |v: &[f64]| v.iter().all(|&e| e == v[0]);
+    let degenerate = constant(x) || constant(y);
+    if degenerate {
+        fsci_runtime::warn(
+            WarningCategory::ConstantInputWarning,
+            CONSTANT_INPUT_MESSAGE,
+        );
+    }
+    degenerate
+}
+
+/// SciPy's `pearsonr` near-constant test: an input whose centred norm is below
+/// `eps^0.75 * |mean|` has lost most of its digits to the subtraction of the mean.
+fn warn_if_nearly_constant(normxm: f64, xmean: f64, normym: f64, ymean: f64) {
+    let threshold = f64::EPSILON.powf(0.75);
+    if normxm < threshold * xmean.abs() || normym < threshold * ymean.abs() {
+        fsci_runtime::warn(
+            WarningCategory::NearConstantInputWarning,
+            "An input array is nearly constant; the computed correlation coefficient may be \
+             inaccurate.",
+        );
+    }
+}
 
 /// SciPy-compatible alias for continuous distribution trait object, matching `scipy.stats.rv_continuous`.
 #[allow(non_camel_case_types)]
@@ -24953,6 +25143,1738 @@ impl ContinuousDistribution for Moyal {
     }
 }
 
+/// Landau distribution with location `loc` and scale `scale`.
+///
+/// Matches `scipy.stats.landau(loc, scale)`. SciPy computes the standard law with Boost.Math's
+/// `landau_distribution`; `pdf`, `cdf`, `sf`, `ppf` and `isf` here run a port of Boost's
+/// double-precision branches (the private `landau` module) on `z = (x - loc) / scale`, as
+/// `rv_continuous` does, and `sf`/`isf` are Boost's complemented forms rather than `1 - cdf`.
+///
+/// The textbook parameterization (location `mu`, scale `c`) also shifts the location with the
+/// scale: it corresponds to `loc = mu + 2c/π·ln(c)`, `scale = c` here, as in SciPy.
+///
+/// The law has no finite moments, so `mean`, `var`, `skewness` and `kurtosis` are NaN, as SciPy
+/// reports them. frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landau {
+    pub loc: f64,
+    pub scale: f64,
+}
+
+impl Landau {
+    /// `scipy.stats.landau(loc, scale)`.
+    ///
+    /// # Panics
+    ///
+    /// If `scale` is not positive or `loc` is not finite.
+    #[must_use]
+    pub fn new(loc: f64, scale: f64) -> Self {
+        assert!(scale > 0.0, "scale must be positive, got {scale}");
+        assert!(loc.is_finite(), "loc must be finite, got {loc}");
+        Self { loc, scale }
+    }
+}
+
+impl ContinuousDistribution for Landau {
+    // Rational approximations behind at most two `exp` and a `sqrt`, or one `log2`.
+    fn cdf_sf_is_cheap(&self) -> bool {
+        true
+    }
+
+    fn ppf_isf_is_cheap(&self) -> bool {
+        true
+    }
+
+    fn pdf(&self, x: f64) -> f64 {
+        landau::landau_pdf((x - self.loc) / self.scale) / self.scale
+    }
+
+    /// SciPy's `log(_pdf(z)) - log(scale)`.
+    fn logpdf(&self, x: f64) -> f64 {
+        log_probability(landau::landau_pdf((x - self.loc) / self.scale)) - self.scale.ln()
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        landau::landau_cdf((x - self.loc) / self.scale)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        landau::landau_sf((x - self.loc) / self.scale)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        self.loc + self.scale * landau::landau_ppf(q)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        self.loc + self.scale * landau::landau_isf(q)
+    }
+
+    fn mean(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn var(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn skewness(&self) -> f64 {
+        f64::NAN
+    }
+
+    fn kurtosis(&self) -> f64 {
+        f64::NAN
+    }
+
+    /// SciPy's `_entropy` for the standard law, 2.37263644000448182 (mpmath, gh-19145), plus
+    /// `ln(scale)` as `rv_continuous.entropy` adds it.
+    fn entropy(&self) -> f64 {
+        2.372_636_440_004_481_7 + self.scale.ln()
+    }
+}
+
+#[cfg(test)]
+mod landau_matches_scipy {
+    use super::{ContinuousDistribution, Landau, Moyal};
+
+    /// Every pinned value below is bit-identical to SciPy 1.17.1 on the host that produced
+    /// it; 1e-14 leaves room only for a last-bit `exp`/`log2` difference between C libraries.
+    const TOL: f64 = 1e-14;
+
+    /// Relative agreement; a zero or infinite SciPy value must be matched exactly.
+    fn check(got: f64, want: f64, tol: f64, what: &str) {
+        if want == 0.0 || want.is_infinite() {
+            assert!(got == want, "{what}: got {got:e}, scipy {want:e}");
+        } else {
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= tol,
+                "{what}: got {got:e}, scipy {want:e}, rel {rel:e}"
+            );
+        }
+    }
+
+    /// One x in every interval of Boost's pdf and cdf branch chains. x < 0: [-1, 0), [-2, -1),
+    /// [-4, -2), [-5.1328125, -4) and the zero tail below. x >= 0: [0, 1), [1, 2), [2, 4),
+    /// [4, 8), [8, 16), [16, 32), [32, 64), then ilogb(x) < 8, 16, 32, 64 and the 2/(πx²)
+    /// tail, where π·x·x overflows at 1e200 and the pdf is 0 in SciPy too.
+    /// Columns: x, pdf, cdf, sf from `scipy.stats.landau`.
+    #[test]
+    fn pdf_cdf_sf_every_branch() {
+        let rows: [(f64, f64, f64, f64); 22] = [
+            (-5.2, 0.0, 0.0, 1.0),
+            (-5.0, 1.5190233064966156e-261, 1.6016174425058606e-264, 1.0),
+            (-4.5, 3.6174016008363494e-119, 8.357151723578122e-122, 1.0),
+            (-3.2, 1.1813573766726455e-15, 2.0786272497981016e-17, 1.0),
+            (
+                -2.5,
+                1.491956791108867e-05,
+                7.68815894016075e-07,
+                0.9999992311841059,
+            ),
+            (
+                -1.5,
+                0.08445596455553546,
+                0.018750043329448494,
+                0.9812499566705515,
+            ),
+            (
+                -0.7,
+                0.2709748925849106,
+                0.17103005206208358,
+                0.8289699479379165,
+            ),
+            (
+                -0.1,
+                0.27023174151919616,
+                0.3386047147644277,
+                0.6613952852355722,
+            ),
+            (
+                0.0,
+                0.26224012637535166,
+                0.3652387015123748,
+                0.6347612984876252,
+            ),
+            (
+                0.5,
+                0.2123184676750643,
+                0.48423925192325135,
+                0.5157607480767487,
+            ),
+            (
+                1.5,
+                0.1245839037914385,
+                0.6494530810783575,
+                0.35054691892164247,
+            ),
+            (
+                3.0,
+                0.058639488338036186,
+                0.7792966733588684,
+                0.22070332664113163,
+            ),
+            (
+                6.0,
+                0.01926154504862334,
+                0.8814405316227936,
+                0.11855946837720639,
+            ),
+            (
+                12.0,
+                0.005078037397657038,
+                0.9412844008396675,
+                0.058715599160332546,
+            ),
+            (
+                25.0,
+                0.0011386197364553709,
+                0.9726873569919952,
+                0.027312643008004858,
+            ),
+            (
+                50.0,
+                0.000274514183763706,
+                0.9866896366811772,
+                0.0133103633188229,
+            ),
+            (
+                100.0,
+                6.671040287844643e-05,
+                0.9934615333703324,
+                0.006538466629667619,
+            ),
+            (
+                300.0,
+                7.218696437831841e-06,
+                0.9978539611537297,
+                0.0021460388462702807,
+            ),
+            (
+                1e5,
+                6.367056207292683e-11,
+                0.9999936333527817,
+                6.3666472183572795e-06,
+            ),
+            (
+                1e10,
+                6.366197741591884e-21,
+                0.999999999936338,
+                6.366197732836492e-11,
+            ),
+            (1e30, 6.366197723675813e-61, 1.0, 6.3661977236758135e-31),
+            (1e200, 0.0, 1.0, 6.366197723675814e-201),
+        ];
+        let d = Landau::new(0.0, 1.0);
+        for (x, pdf, cdf, sf) in rows {
+            check(d.pdf(x), pdf, TOL, &format!("pdf({x:e})"));
+            check(d.cdf(x), cdf, TOL, &format!("cdf({x:e})"));
+            check(d.sf(x), sf, TOL, &format!("sf({x:e})"));
+        }
+    }
+
+    /// ppf walks Boost's lower-quantile chain for p <= 1/2 (p >= 0.375, 0.25, 0.125, then
+    /// ilogb(p) >= -4, -8, -16, -32, -64, -128, -256, -512, -1024 and -inf below) and the
+    /// upper chain on 1 - p above 1/2. isf walks the upper chain for q <= 1/2 (down to its
+    /// 2/(πq) tail, which overflows to inf at 1e-310) and the lower chain on 1 - q above.
+    #[test]
+    fn ppf_isf_every_branch() {
+        let ppf_rows: [(f64, f64); 22] = [
+            (1e-310, f64::NEG_INFINITY),
+            (1e-300, -5.082339425297071),
+            (1e-100, -4.376686695411364),
+            (1e-50, -3.9271296121139336),
+            (1e-30, -3.5918684814254718),
+            (1e-15, -3.127971832130881),
+            (1e-08, -2.6926105199042794),
+            (0.001, -1.9612653085775507),
+            (0.01, -1.6275061069535208),
+            (0.1, -0.9828373080642456),
+            (0.2, -0.5948319348759157),
+            (0.3, -0.24045468945638124),
+            (0.4, 0.13571822158688304),
+            (0.5, 0.5756301439450783),
+            (0.55, 0.836970410018457),
+            (0.7, 1.9574701757202584),
+            (0.8, 3.3842882761238124),
+            (0.9, 7.128678485028738),
+            (0.99, 66.02051286847637),
+            (0.999, 640.4590655726022),
+            (0.999999, 636628.0109354313),
+            (0.999999999999, 636633855820.5931),
+        ];
+        let isf_rows: [(f64, f64); 20] = [
+            (1e-310, f64::INFINITY),
+            (1e-300, 6.366197723675814e+299),
+            (1e-20, 6.366197723675814e+19),
+            (1e-12, 636619772384.6152),
+            (1e-06, 636628.0109537379),
+            (0.001, 640.4590655726026),
+            (0.01, 66.02051286847643),
+            (0.1, 7.128678485028738),
+            (0.2, 3.3842882761238107),
+            (0.3, 1.957470175720259),
+            (0.4, 1.1405756669701925),
+            (0.5, 0.5756301439450783),
+            (0.6, 0.13571822158688304),
+            (0.7, -0.24045468945638102),
+            (0.8, -0.5948319348759158),
+            (0.9, -0.9828373080642459),
+            (0.99, -1.6275061069535206),
+            (0.999, -1.9612653085775507),
+            (0.999999, -2.486311469659321),
+            (0.999999999999, -2.975430133850267),
+        ];
+        let d = Landau::new(0.0, 1.0);
+        for (p, want) in ppf_rows {
+            check(d.ppf(p), want, TOL, &format!("ppf({p:e})"));
+        }
+        for (q, want) in isf_rows {
+            check(d.isf(q), want, TOL, &format!("isf({q:e})"));
+        }
+    }
+
+    /// `scipy.stats.landau(loc=1.5, scale=2)`: x, pdf, logpdf, cdf, sf; then p, ppf, isf.
+    #[test]
+    fn loc_scale_rows() {
+        let d = Landau::new(1.5, 2.0);
+        for (x, pdf, logpdf, cdf, sf) in [
+            (
+                -5.0,
+                3.325073476292881e-17,
+                -37.94245480890192,
+                1.0828050366151318e-18,
+                1.0,
+            ),
+            (
+                0.0,
+                0.13272676982203357,
+                -2.0194626260973796,
+                0.15761490419728172,
+                0.8423850958027183,
+            ),
+            (
+                4.0,
+                0.07136413432449544,
+                -2.6399598562269664,
+                0.6160933636942969,
+                0.38390663630570304,
+            ),
+            (
+                30.0,
+                0.0017956471355326678,
+                -6.322389800825928,
+                0.9508961817992597,
+                0.049103818200740265,
+            ),
+        ] {
+            check(d.pdf(x), pdf, TOL, &format!("loc/scale pdf({x})"));
+            check(d.logpdf(x), logpdf, TOL, &format!("loc/scale logpdf({x})"));
+            check(d.cdf(x), cdf, TOL, &format!("loc/scale cdf({x})"));
+            check(d.sf(x), sf, TOL, &format!("loc/scale sf({x})"));
+        }
+        for (p, ppf, isf) in [
+            (1e-10, -4.19851353435383, 12732395477.055773),
+            (0.05, -0.982609392200156, 29.50960888222876),
+            (0.9, 15.757356970057476, -0.4656746161284917),
+            (0.999999999, 1273239607.5172403, -4.051245191844796),
+        ] {
+            check(d.ppf(p), ppf, TOL, &format!("loc/scale ppf({p:e})"));
+            check(d.isf(p), isf, TOL, &format!("loc/scale isf({p:e})"));
+        }
+        check(d.median(), 2.6512602878901568, TOL, "loc/scale median");
+        check(d.entropy(), 3.065783620564427, TOL, "loc/scale entropy");
+    }
+
+    /// Non-finite and out-of-range arguments, the moments SciPy leaves undefined, and logpdf.
+    #[test]
+    fn edges_moments_entropy_logpdf() {
+        let d = Landau::new(0.0, 1.0);
+        // SciPy 1.17.1 hands ±inf to Boost, which refuses non-finite x: pdf(±inf) is NaN.
+        assert!(d.pdf(f64::INFINITY).is_nan());
+        assert!(d.pdf(f64::NEG_INFINITY).is_nan());
+        assert!(d.pdf(f64::NAN).is_nan());
+        assert!(d.logpdf(f64::INFINITY).is_nan());
+        assert_eq!(d.cdf(f64::NEG_INFINITY), 0.0);
+        assert_eq!(d.cdf(f64::INFINITY), 1.0);
+        assert_eq!(d.sf(f64::NEG_INFINITY), 1.0);
+        assert_eq!(d.sf(f64::INFINITY), 0.0);
+        assert!(d.cdf(f64::NAN).is_nan());
+        assert!(d.sf(f64::NAN).is_nan());
+
+        assert_eq!(d.ppf(0.0), f64::NEG_INFINITY);
+        assert_eq!(d.ppf(1.0), f64::INFINITY);
+        assert_eq!(d.isf(0.0), f64::INFINITY);
+        assert_eq!(d.isf(1.0), f64::NEG_INFINITY);
+        for bad in [-0.1, 1.1, f64::NAN] {
+            assert!(d.ppf(bad).is_nan(), "ppf({bad}) must be NaN");
+            assert!(d.isf(bad).is_nan(), "isf({bad}) must be NaN");
+        }
+
+        assert!(d.mean().is_nan());
+        assert!(d.var().is_nan());
+        assert!(d.std().is_nan());
+        assert!(d.skewness().is_nan());
+        assert!(d.kurtosis().is_nan());
+        check(d.entropy(), 2.3726364400044817, TOL, "entropy");
+        check(d.median(), 0.5756301439450783, TOL, "median");
+
+        // logpdf: -inf where the pdf underflows to 0 (x = -5.2), else log(pdf).
+        assert_eq!(d.logpdf(-5.2), f64::NEG_INFINITY);
+        for (x, want) in [
+            (-4.5, -272.72187008801245),
+            (0.0, -1.338494682079505),
+            (1000.0, -14.259466824641148),
+        ] {
+            check(d.logpdf(x), want, TOL, &format!("logpdf({x})"));
+        }
+    }
+
+    /// cdf(ppf(p)) and sf(isf(q)) come back to p and q. The left tail is ill-conditioned
+    /// (d ln F / dx grows like σ = exp(-πx/2 - 1.4516)); SciPy itself is 1.6e-14 off at
+    /// p = 1e-12, hence 1e-13 here.
+    #[test]
+    fn round_trip() {
+        let d = Landau::new(0.0, 1.0);
+        for p in [1e-12, 1e-4, 0.01, 0.2, 0.365, 0.5, 0.8, 0.99, 0.999999] {
+            check(d.cdf(d.ppf(p)), p, 1e-13, &format!("cdf(ppf({p:e}))"));
+        }
+        for q in [1e-12, 1e-4, 0.01, 0.3, 0.635, 0.9] {
+            check(d.sf(d.isf(q)), q, 1e-13, &format!("sf(isf({q:e}))"));
+        }
+    }
+
+    /// Negative control: `Landau` used to be an alias of `Moyal` (br-szq1n.2). The two
+    /// densities differ at 0 (landau 0.26224, moyal 0.24197), so a regression to the alias
+    /// fails here.
+    #[test]
+    fn is_not_moyal() {
+        let landau = Landau::new(0.0, 1.0);
+        check(landau.pdf(0.0), 0.26224012637535166, TOL, "landau pdf(0)");
+        check(Moyal.pdf(0.0), 0.24197072451914337, 1e-13, "moyal pdf(0)");
+        assert!(
+            (landau.pdf(0.0) - Moyal.pdf(0.0)).abs() > 0.02,
+            "Landau must not reproduce Moyal's density"
+        );
+        assert!((landau.cdf(0.0) - Moyal.cdf(0.0)).abs() > 0.01);
+    }
+}
+
+/// The parameterization of a [`LevyStable`] law: SciPy's class attribute
+/// `levy_stable.parameterization`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LevyStableParameterization {
+    /// Nolan's S1, SciPy's default: characteristic function
+    /// `exp(i·t·loc - |scale·t|^alpha·(1 - i·beta·sign(t)·tan(pi·alpha/2)))` for alpha != 1.
+    #[default]
+    S1,
+    /// Nolan's S0 (Zolotarev's M): continuous in alpha at 1; the same law as S1 with the location
+    /// moved by `beta·scale·tan(pi·alpha/2)` (by `2·beta·scale·ln(scale)/pi` at alpha = 1).
+    S0,
+}
+
+/// Lévy-stable distribution with stability `alpha` in (0, 2], skewness `beta` in [-1, 1],
+/// location `loc` and scale `scale`.
+///
+/// Matches `scipy.stats.levy_stable(alpha, beta, loc, scale)` with SciPy's default methods, in
+/// either parameterization (SciPy's `levy_stable.parameterization`). The private `levy_stable`
+/// module ports SciPy 1.17.1's code: Nolan's piecewise integration for `pdf` and `cdf` (on
+/// `fsci_integrate`'s QUADPACK), its closed forms at alpha = 2 (normal with scale √2), alpha = 1
+/// with beta = 0 (Cauchy), alpha = 1/2 with beta = 1 (Lévy) and alpha = 1/2 with beta = 0, and
+/// its rounding of alpha within 0.005 of 1 to 1. `ppf` is `rv_continuous`'s root finding on the
+/// cdf (a ×10 bracket search from ±10, then SciPy's `brentq` with `xtol = 1e-14`); `rvs` is
+/// Chambers–Mallows–Stuck; [`LevyStable::fitstart`] is McCulloch's quantile estimator.
+///
+/// As `rv_continuous` does, everything is evaluated at `z = (x - loc) / scale`, except that in
+/// S1 with `alpha == 1` loc is first moved by `2·beta·scale·ln(scale)/pi` (Nolan 2018, Definition
+/// 1.8). SciPy applies that move only in its `pdf`, `cdf` and `rvs` overrides; its inherited
+/// `sf`, `logpdf` and `ppf` skip it (SciPy 1.17.1: `levy_stable.sf(1.7, 1, 0.5, loc=1, scale=2)`
+/// is 0.4676 while `1 - cdf` is 0.5256). Here every method applies it, so `sf`, `logpdf`, `ppf`
+/// and `isf` depart from SciPy in that corner (S1, alpha exactly 1, beta != 0, scale != 1) and
+/// agree with its `pdf` and `cdf`.
+///
+/// `mean`, `var`, `skewness` and `kurtosis` are what SciPy's `_stats` reports, in both
+/// parameterizations: `loc` for alpha > 1 (else NaN), `2·scale²` at alpha = 2 (else +inf), and 0
+/// at alpha = 2 (else NaN). In S0 the law's actual mean for alpha > 1 is
+/// `loc - beta·scale·tan(pi·alpha/2)`; SciPy reports `loc` there too, and so does `mean`.
+/// `entropy` is not implemented (SciPy integrates it numerically). frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LevyStable {
+    pub alpha: f64,
+    pub beta: f64,
+    pub loc: f64,
+    pub scale: f64,
+    pub parameterization: LevyStableParameterization,
+}
+
+impl LevyStable {
+    /// `scipy.stats.levy_stable(alpha, beta, loc, scale)` in SciPy's default S1
+    /// parameterization.
+    ///
+    /// # Panics
+    ///
+    /// As [`LevyStable::with_parameterization`].
+    #[must_use]
+    pub fn new(alpha: f64, beta: f64, loc: f64, scale: f64) -> Self {
+        Self::with_parameterization(alpha, beta, loc, scale, LevyStableParameterization::S1)
+    }
+
+    /// `scipy.stats.levy_stable(alpha, beta, loc, scale)` with `levy_stable.parameterization`
+    /// set to `parameterization`.
+    ///
+    /// # Panics
+    ///
+    /// Outside SciPy's `_argcheck` (0 < alpha <= 2, -1 <= beta <= 1), if `scale` is not
+    /// positive, or if `loc` is not finite.
+    #[must_use]
+    pub fn with_parameterization(
+        alpha: f64,
+        beta: f64,
+        loc: f64,
+        scale: f64,
+        parameterization: LevyStableParameterization,
+    ) -> Self {
+        assert!(
+            alpha > 0.0 && alpha <= 2.0,
+            "alpha must be in (0, 2], got {alpha}"
+        );
+        assert!(
+            (-1.0..=1.0).contains(&beta),
+            "beta must be in [-1, 1], got {beta}"
+        );
+        assert!(scale > 0.0, "scale must be positive, got {scale}");
+        assert!(loc.is_finite(), "loc must be finite, got {loc}");
+        Self {
+            alpha,
+            beta,
+            loc,
+            scale,
+            parameterization,
+        }
+    }
+
+    /// SciPy's `levy_stable._fitstart(data)` in S1: McCulloch's (1986) quantile estimates
+    /// `(alpha, beta, loc, scale)` from the 5th, 25th, 50th, 75th and 95th percentiles
+    /// (numpy's linear method), interpolated bilinearly in his tables as SciPy's
+    /// `RectBivariateSpline(kx=1, ky=1)` does. It is the start of SciPy's MLE `fit`, which is
+    /// not ported. All NaN for empty data, where SciPy raises.
+    #[must_use]
+    pub fn fitstart(data: &[f64]) -> (f64, f64, f64, f64) {
+        levy_stable::fitstart_s1(data)
+    }
+
+    /// [`LevyStable::fitstart`] in either parameterization (`_fitstart_S0` moves only the
+    /// location).
+    #[must_use]
+    pub fn fitstart_with_parameterization(
+        data: &[f64],
+        parameterization: LevyStableParameterization,
+    ) -> (f64, f64, f64, f64) {
+        match parameterization {
+            LevyStableParameterization::S1 => levy_stable::fitstart_s1(data),
+            LevyStableParameterization::S0 => levy_stable::fitstart_s0(data),
+        }
+    }
+
+    /// The location `rv_continuous` standardizes with: SciPy's `pdf`/`cdf` overrides move it by
+    /// `2·beta·scale·ln(scale)/pi` in S1 at alpha = 1.
+    fn effective_loc(&self) -> f64 {
+        if self.parameterization == LevyStableParameterization::S1 && self.alpha == 1.0 {
+            self.loc + 2.0 * self.beta * self.scale * self.scale.ln() / PI
+        } else {
+            self.loc
+        }
+    }
+
+    /// The standard (loc 0, scale 1) density at a finite `z`: SciPy's `_pdf`.
+    fn standard_pdf(&self, z: f64) -> f64 {
+        match self.parameterization {
+            LevyStableParameterization::S1 => levy_stable::pdf_z1(z, self.alpha, self.beta),
+            LevyStableParameterization::S0 => levy_stable::pdf_z0(z, self.alpha, self.beta),
+        }
+    }
+
+    /// The standard cdf with `rv_continuous.cdf`'s edges: NaN at NaN, 0 at -inf, 1 at +inf.
+    fn standard_cdf(&self, z: f64) -> f64 {
+        if z.is_nan() {
+            f64::NAN
+        } else if z == f64::INFINITY {
+            1.0
+        } else if z == f64::NEG_INFINITY {
+            0.0
+        } else {
+            match self.parameterization {
+                LevyStableParameterization::S1 => levy_stable::cdf_z1(z, self.alpha, self.beta),
+                LevyStableParameterization::S0 => levy_stable::cdf_z0(z, self.alpha, self.beta),
+            }
+        }
+    }
+
+    /// `rv_continuous._ppf_single` on the standard law, 0 < q < 1: widen `[-10, 10]` by factors
+    /// of 10 until it brackets `cdf(z) = q`, then SciPy's `brentq` with `xtol = 1e-14`,
+    /// `rtol = 4·eps` and 100 iterations.
+    fn standard_ppf(&self, q: f64) -> f64 {
+        const FACTOR: f64 = 10.0;
+        let f = |z: f64| self.standard_cdf(z) - q;
+        let mut left = -FACTOR;
+        let mut right = f64::INFINITY;
+        while f(left) > 0.0 {
+            right = left;
+            left *= FACTOR;
+        }
+        if right.is_infinite() {
+            right = FACTOR.max(left);
+            while f(right) < 0.0 {
+                left = right;
+                right *= FACTOR;
+            }
+        }
+        ks_brentq(f, left, right, 1e-14, 4.0 * f64::EPSILON, 100)
+    }
+}
+
+impl ContinuousDistribution for LevyStable {
+    fn pdf(&self, x: f64) -> f64 {
+        let z = (x - self.effective_loc()) / self.scale;
+        if z.is_nan() {
+            f64::NAN
+        } else if z.is_infinite() {
+            0.0
+        } else {
+            self.standard_pdf(z) / self.scale
+        }
+    }
+
+    /// SciPy's `log(_pdf(z)) - log(scale)`.
+    fn logpdf(&self, x: f64) -> f64 {
+        let z = (x - self.effective_loc()) / self.scale;
+        if z.is_nan() {
+            f64::NAN
+        } else if z.is_infinite() {
+            f64::NEG_INFINITY
+        } else {
+            log_probability(self.standard_pdf(z)) - self.scale.ln()
+        }
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        self.standard_cdf((x - self.effective_loc()) / self.scale)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if q == 1.0 {
+            return f64::INFINITY;
+        }
+        self.standard_ppf(q) * self.scale + self.effective_loc()
+    }
+
+    fn mean(&self) -> f64 {
+        if self.alpha > 1.0 { self.loc } else { f64::NAN }
+    }
+
+    fn var(&self) -> f64 {
+        if self.alpha == 2.0 {
+            2.0 * self.scale * self.scale
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn skewness(&self) -> f64 {
+        if self.alpha == 2.0 { 0.0 } else { f64::NAN }
+    }
+
+    fn kurtosis(&self) -> f64 {
+        if self.alpha == 2.0 { 0.0 } else { f64::NAN }
+    }
+
+    /// SciPy's `rvs`: `_rvs_Z1` on `th = uniform(-pi/2, pi)` and `w = expon()` draws, scaled and
+    /// shifted, with the S1 alpha = 1 location move, then moved to S0 if asked.
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        let alpha_one_shift = 2.0 * self.beta * self.scale * self.scale.ln() / PI;
+        (0..n)
+            .map(|_| {
+                let th = rng.random::<f64>() * PI - PI / 2.0;
+                let w = -(1.0 - rng.random::<f64>()).ln();
+                let mut x =
+                    levy_stable::rvs_z1(self.alpha, self.beta, th, w) * self.scale + self.loc;
+                if self.alpha == 1.0 {
+                    x += alpha_one_shift;
+                }
+                match self.parameterization {
+                    LevyStableParameterization::S1 => x,
+                    LevyStableParameterization::S0 if self.alpha == 1.0 => {
+                        x - self.beta * 2.0 * self.scale * self.scale.ln() / PI
+                    }
+                    LevyStableParameterization::S0 => {
+                        x - self.scale * self.beta * (PI * self.alpha / 2.0).tan()
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod levy_stable_matches_scipy {
+    use super::{
+        ContinuousDistribution, Levy, LevyL, LevyStable, LevyStableParameterization, Normal,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::f64::consts::{FRAC_1_PI, FRAC_2_PI};
+
+    const S0: LevyStableParameterization = LevyStableParameterization::S0;
+
+    /// Relative agreement with SciPy 1.17.1: none needed. Every pinned pdf, cdf, ppf, isf and
+    /// fitstart value below is reproduced bit for bit (observed on worker vmi1227854 against
+    /// SciPy on this host): the port runs SciPy's arithmetic in SciPy's order on the same libm,
+    /// QUADPACK and bisection. The bead's stated piecewise accuracy is 1e-7; a last-bit libm
+    /// difference on another platform would show up here first, and the tail cdfs that SciPy
+    /// computes as 1 - (1 - tiny) would amplify it.
+    const TOL: f64 = 0.0;
+
+    /// The comparison can see what an all-exact slice must be able to see: one ulp, and a
+    /// nonzero value where SciPy has 0 (the sign of a zero is not compared).
+    #[test]
+    fn exact_check_detects_one_ulp_and_a_lost_zero() {
+        for v in [
+            0.22439915549671538,
+            6.294649246285644e-10,
+            -1559.7261037251076,
+        ] {
+            assert!(rel_err(v, v) <= TOL);
+            assert!(rel_err(f64::from_bits(v.to_bits() + 1), v) > TOL);
+        }
+        assert!(rel_err(1e-300, 0.0) > TOL);
+        assert!(rel_err(-0.0, 0.0) <= TOL);
+    }
+
+    /// Relative error; a zero or non-finite SciPy value must be matched exactly.
+    fn rel_err(got: f64, want: f64) -> f64 {
+        if want == 0.0 || !want.is_finite() {
+            if got == want || (got.is_nan() && want.is_nan()) {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            ((got - want) / want).abs()
+        }
+    }
+
+    fn check(got: f64, want: f64, tol: f64, what: &str) {
+        let rel = rel_err(got, want);
+        assert!(
+            rel <= tol,
+            "{what}: got {got:e}, scipy {want:e}, rel {rel:e}"
+        );
+    }
+
+    /// SciPy's `levy_stable.pdf(x, alpha, beta)` and `.cdf` in S1 over alpha in {0.5, 0.8, 1,
+    /// 1.3, 1.5, 1.9, 2} and beta in {-1, -0.3, 0, 0.3, 1}: both tails, x = 0 (the S0 point
+    /// x0 = zeta, Nolan's closed form) and x = 0.001 (rounded to it, except at alpha = 1).
+    /// Columns: alpha, beta, x, pdf, cdf.
+    #[test]
+    fn pdf_cdf_s1_grid() {
+        let rows: [(f64, f64, f64, f64, f64); 210] = [
+            (0.5, -1.0, -8.0, 0.016562720771501782, 0.2763263901682368),
+            (0.5, -1.0, -0.6, 0.3730535026483988, 0.8032943975410531),
+            (0.5, -1.0, 0.0, 1.949085916259688e-17, 1.0),
+            (0.5, -1.0, 0.001, 1.949085916259688e-17, 1.0),
+            (0.5, -1.0, 0.7, 0.0, 1.0),
+            (0.5, -1.0, 25.0, 0.0, 1.0),
+            (0.5, -0.3, -8.0, 0.009208314398718736, 0.1652548038252042),
+            (0.5, -0.3, -0.6, 0.21521527029304066, 0.4461760537407995),
+            (0.5, -0.3, 0.0, 0.48760541440493155, 0.6855471581554846),
+            (0.5, -0.3, 0.001, 0.48760541440493155, 0.6855471581554846),
+            (0.5, -0.3, 0.7, 0.07382584641394412, 0.805797221628825),
+            (0.5, -0.3, 25.0, 0.0009091205575524781, 0.9495373000646657),
+            (0.5, 0.0, -8.0, 0.006600448104972907, 0.12261012256487436),
+            (0.5, 0.0, -0.6, 0.14431983047158575, 0.31562067900091306),
+            (0.5, 0.0, 0.0, FRAC_2_PI, 0.5),
+            (0.5, 0.0, 0.001, FRAC_2_PI, 0.5),
+            (0.5, 0.0, 0.7, 0.12432225141116775, 0.6977677513262337),
+            (0.5, 0.0, 25.0, 0.0013570056406911766, 0.9263125233154991),
+            (0.5, 0.3, -8.0, 0.004297394478004458, 0.08277279588863995),
+            (0.5, 0.3, -0.6, 0.08528401119473829, 0.20213347441135632),
+            (0.5, 0.3, 0.0, 0.48760541440493155, 0.31445284184451533),
+            (0.5, 0.3, 0.001, 0.48760541440493155, 0.31445284184451533),
+            (0.5, 0.3, 0.7, 0.18542360813816966, 0.5737931986676515),
+            (0.5, 0.3, 25.0, 0.001842231510533302, 0.9020842116463124),
+            (0.5, 1.0, -8.0, 0.0, 0.0),
+            (0.5, 1.0, -0.6, 0.0, 0.0),
+            (0.5, 1.0, 0.0, 0.0, 0.0),
+            (0.5, 1.0, 0.001, 0.0, 0.0),
+            (0.5, 1.0, 0.7, 0.33346684575982144, 0.23199772362873405),
+            (0.5, 1.0, 25.0, 0.003128341551803647, 0.8414805811217939),
+            (0.8, -1.0, -8.0, 0.028659473674421877, 0.20110155202915803),
+            (0.8, -1.0, -0.6, 4.390880815162571e-39, 1.0),
+            (0.8, -1.0, 0.0, 5.087917201638111e-18, 1.0),
+            (0.8, -1.0, 0.001, 5.087917201638111e-18, 1.0),
+            (0.8, -1.0, 0.7, 0.0, 1.0),
+            (0.8, -1.0, 25.0, 0.0, 1.0),
+            (0.8, -0.3, -8.0, 0.009964804895649677, 0.09353535970685645),
+            (0.8, -0.3, -0.6, 0.34427466928219846, 0.6495982201609063),
+            (0.8, -0.3, 0.0, 0.14628132801326832, 0.7966419920006298),
+            (0.8, -0.3, 0.001, 0.14628132801326832, 0.7966419920006298),
+            (0.8, -0.3, 0.7, 0.059826687358587, 0.8620425306535849),
+            (0.8, -0.3, 25.0, 0.0005243806248791977, 0.9824469138187117),
+            (0.8, 0.0, -8.0, 0.006014072228519541, 0.06355153246297007),
+            (0.8, 0.0, -0.6, 0.20978750936432486, 0.32263875830265665),
+            (0.8, 0.0, 0.0, 0.3606460866352935, 0.5),
+            (0.8, 0.0, 0.001, 0.3606460866352935, 0.5),
+            (0.8, 0.0, 0.7, 0.18576351902279306, 0.697110501940675),
+            (0.8, 0.0, 25.0, 0.0008262734243697763, 0.9736631689381322),
+            (0.8, 0.3, -8.0, 0.0033535978288649613, 0.039687150487486056),
+            (0.8, 0.3, -0.6, 0.06640281480075298, 0.14426000650245863),
+            (0.8, 0.3, 0.0, 0.14628132801326832, 0.20335800799937015),
+            (0.8, 0.3, 0.001, 0.14628132801326832, 0.20335800799937015),
+            (0.8, 0.3, 0.7, 0.3525253840823327, 0.3853725422600267),
+            (0.8, 0.3, 25.0, 0.0011882961026735128, 0.9639746259276096),
+            (0.8, 1.0, -8.0, 0.0, 0.0),
+            (0.8, 1.0, -0.6, 0.0, 0.0),
+            (0.8, 1.0, 0.0, 5.087917201638111e-18, 0.0),
+            (0.8, 1.0, 0.001, 5.087917201638111e-18, 0.0),
+            (0.8, 1.0, 0.7, 5.576464363369111e-28, 1.0475219086964941e-54),
+            (0.8, 1.0, 25.0, 0.0023418744622336076, 0.9371065209029789),
+            (1.0, -1.0, -8.0, 0.011265632388028761, 0.08904691474117488),
+            (1.0, -1.0, -0.6, 0.2019789415129265, 0.4950473315171391),
+            (1.0, -1.0, 0.0, 0.2622401263753516, 0.6347612984876252),
+            (1.0, -1.0, 0.001, 0.26232590131782624, 0.6350235815102823),
+            (1.0, -1.0, 0.7, 0.27097489258491053, 0.8289699479379163),
+            (1.0, -1.0, 25.0, 0.0, 1.0),
+            (1.0, -0.3, -8.0, 0.006657731596500192, 0.05334752180736446),
+            (1.0, -0.3, -0.6, 0.21763380759466974, 0.3767538697715216),
+            (1.0, -0.3, 0.0, 0.3064321945515475, 0.5361683269173996),
+            (1.0, -0.3, 0.001, 0.30651643037060294, 0.5364748012644079),
+            (1.0, -0.3, 0.7, 0.23754491499847713, 0.7412747663940105),
+            (1.0, -0.3, 25.0, 0.00034398941525584143, 0.9912770178292325),
+            (1.0, 0.0, -8.0, 0.004897075172058319, 0.03958342416056554),
+            (1.0, 0.0, -0.6, 0.23405138689984611, 0.3279791303773693),
+            (1.0, 0.0, 0.0, FRAC_1_PI, 0.5),
+            (1.0, 0.0, 0.001, FRAC_1_PI, 0.5),
+            (1.0, 0.0, 0.7, 0.21363079609650382, 0.6944001122142147),
+            (1.0, 0.0, 25.0, 0.0005084822462999851, 0.9872743886520082),
+            (1.0, 0.3, -8.0, 0.0032698055218573683, 0.026710866191316036),
+            (1.0, 0.3, -0.6, 0.26110440209857916, 0.2836740208488117),
+            (1.0, 0.3, 0.0, 0.3064321945515475, 0.4638316730826004),
+            (1.0, 0.3, 0.001, 0.3063475447137699, 0.4641380629866888),
+            (1.0, 0.3, 0.7, 0.20161439263918113, 0.6442026456423113),
+            (1.0, 0.3, 25.0, 0.000683917036548624, 0.983104360905433),
+            (1.0, 1.0, -8.0, 0.0, 0.0),
+            (1.0, 1.0, -0.6, 0.2789054117819384, 0.19855781495200256),
+            (1.0, 1.0, 0.0, 0.2622401263753516, 0.3652387015123748),
+            (1.0, 1.0, 0.001, 0.2621542458904714, 0.3655008987072878),
+            (1.0, 1.0, 0.7, 0.1918622052163606, 0.5246424983134796),
+            (1.0, 1.0, 25.0, 0.0011386197364553871, 0.9726873569919952),
+            (1.3, -1.0, -8.0, 0.004190309728781619, 0.029745165983032562),
+            (1.3, -1.0, -0.6, 0.07413364098765113, 0.17728028014431485),
+            (1.3, -1.0, 0.0, 0.10619566580883097, 0.23076923076923073),
+            (1.3, -1.0, 0.001, 0.10619566580883097, 0.23076923076923073),
+            (1.3, -1.0, 0.7, 0.1606125766767349, 0.32303974211025976),
+            (1.3, -1.0, 25.0, 0.0, 1.0),
+            (1.3, -0.3, -8.0, 0.0034882950369826246, 0.02187433262698979),
+            (1.3, -0.3, -0.6, 0.16227588179437863, 0.24904222050605385),
+            (1.3, -0.3, 0.0, 0.24052511350974823, 0.369705727046296),
+            (1.3, -0.3, 0.001, 0.24052511350974823, 0.369705727046296),
+            (1.3, -0.3, 0.7, 0.2922293177017521, 0.561586433150799),
+            (1.3, -0.3, 25.0, 0.000148047540646656, 0.9972205258414658),
+            (1.3, 0.0, -8.0, 0.00302677940108581, 0.017854203302254734),
+            (1.3, 0.0, -0.6, 0.2482532977465233, 0.33320967508512944),
+            (1.3, 0.0, 0.0, 0.2939836011204819, 0.5),
+            (1.3, 0.0, 0.001, 0.2939836011204819, 0.5),
+            (1.3, 0.0, 0.7, 0.2342793541405378, 0.690924943255216),
+            (1.3, 0.0, 25.0, 0.00020598423999000127, 0.9960810787922774),
+            (1.3, 0.3, -8.0, 0.0024165855094997572, 0.013325079065414913),
+            (1.3, 0.3, -0.6, 0.29130625897978674, 0.46761298219347536),
+            (1.3, 0.3, 0.0, 0.24052511350974823, 0.630294272953704),
+            (1.3, 0.3, 0.001, 0.24052511350974823, 0.630294272953704),
+            (1.3, 0.3, 0.7, 0.15038062012414083, 0.7665854972491388),
+            (1.3, 0.3, 25.0, 0.0002609115772024291, 0.9949708198272604),
+            (1.3, 1.0, -8.0, 3.8236132577985704e-19, 0.0),
+            (1.3, 1.0, -0.6, 0.15169193099920864, 0.6925725883712198),
+            (1.3, 1.0, 0.0, 0.10619566580883097, 0.7692307692307693),
+            (1.3, 1.0, 0.001, 0.10619566580883097, 0.7692307692307693),
+            (1.3, 1.0, 0.7, 0.06989944266000792, 0.8299190340929501),
+            (1.3, 1.0, 25.0, 0.0003783919954251735, 0.9924871244799549),
+            (1.5, -1.0, -8.0, 0.0032251755152504207, 0.017484756444451244),
+            (1.5, -1.0, -0.6, 0.1385974500427236, 0.23294151904565508),
+            (1.5, -1.0, 0.0, 0.19751617184719183, 0.3333333333333333),
+            (1.5, -1.0, 0.001, 0.19751617184719183, 0.3333333333333333),
+            (1.5, -1.0, 0.7, 0.26210737427179515, 0.4956105647817015),
+            (1.5, -1.0, 25.0, 3.0305506512567044e-67, 1.0),
+            (1.5, -0.3, -8.0, 0.0023522398516789755, 0.01201308354884112),
+            (1.5, -0.3, -0.6, 0.2121333415970665, 0.29062743465443797),
+            (1.5, -0.3, 0.0, 0.2739614887777256, 0.4381509472815051),
+            (1.5, -0.3, 0.001, 0.2739614887777256, 0.4381509472815051),
+            (1.5, -0.3, 0.7, 0.27424897614974053, 0.6357905096367407),
+            (1.5, -0.3, 25.0, 6.931311581842246e-05, 0.9988640578792797),
+            (1.5, 0.0, -8.0, 0.0019064977468556735, 0.009474084702482344),
+            (1.5, 0.0, -0.6, 0.25214695100878964, 0.3348624199606438),
+            (1.5, 0.0, 0.0, 0.28735275145216443, 0.5),
+            (1.5, 0.0, 0.001, 0.28735275145216443, 0.5),
+            (1.5, 0.0, 0.7, 0.24078419849245475, 0.689793171445247),
+            (1.5, 0.0, 25.0, 9.823094437431082e-05, 0.9983836357577905),
+            (1.5, 0.3, -8.0, 0.0014087343664917218, 0.00680423463203117),
+            (1.5, 0.3, -0.6, 0.28031606301209966, 0.39195411557407334),
+            (1.5, 0.3, 0.0, 0.2739614887777256, 0.561849052718495),
+            (1.5, 0.3, 0.001, 0.2739614887777256, 0.561849052718495),
+            (1.5, 0.3, 0.7, 0.1996121436132396, 0.729961116695548),
+            (1.5, 0.3, 25.0, 0.0001266870897070833, 0.997907000996804),
+            (1.5, 1.0, -8.0, 2.7221809653183074e-17, 0.0),
+            (1.5, 1.0, -0.6, 0.25476754041558336, 0.5302415367068819),
+            (1.5, 1.0, 0.0, 0.19751617184719183, 0.6666666666666667),
+            (1.5, 1.0, 0.001, 0.19751617184719183, 0.6666666666666667),
+            (1.5, 1.0, 0.7, 0.12988232773465644, 0.7804791156739815),
+            (1.5, 1.0, 25.0, 0.0001913317163790853, 0.9968093544691081),
+            (1.9, -1.0, -8.0, 0.0005385072561569232, 0.002037391036924685),
+            (1.9, -1.0, -0.6, 0.24126395979151005, 0.31533318974397995),
+            (1.9, -1.0, 0.0, 0.2796624164821193, 0.47368421052631576),
+            (1.9, -1.0, 0.001, 0.2796624164821193, 0.47368421052631576),
+            (1.9, -1.0, 0.7, 0.2625550729802318, 0.6675837977300723),
+            (1.9, -1.0, 25.0, 2.8013218963501338e-77, 1.0),
+            (
+                1.9,
+                -0.3,
+                -8.0,
+                0.0003522619223978566,
+                0.0013277301865413094,
+            ),
+            (1.9, -0.3, -0.6, 0.2524309439323494, 0.32929471951450884),
+            (1.9, -0.3, 0.0, 0.28220080309975265, 0.4920456668200823),
+            (1.9, -0.3, 0.001, 0.28220080309975265, 0.4920456668200823),
+            (1.9, -0.3, 0.7, 0.2528716574204996, 0.683243470023103),
+            (1.9, -0.3, 25.0, 5.748182611248954e-06, 0.9999251872895237),
+            (
+                1.9,
+                0.0,
+                -8.0,
+                0.00027165910975856275,
+                0.0010224052551321972,
+            ),
+            (1.9, 0.0, -0.6, 0.25685957100498374, 0.3357465222250591),
+            (1.9, 0.0, 0.0, 0.282456516085198, 0.5),
+            (1.9, 0.0, 0.001, 0.282456516085198, 0.5),
+            (1.9, 0.0, 0.7, 0.24821801937009746, 0.6895158822271009),
+            (1.9, 0.0, 25.0, 8.210313802028654e-06, 0.999893133549616),
+            (
+                1.9,
+                0.3,
+                -8.0,
+                0.00019062132090107573,
+                0.0007164111442938825,
+            ),
+            (1.9, 0.3, -0.6, 0.26099632645460524, 0.3424591818881181),
+            (1.9, 0.3, 0.0, 0.28220080309975265, 0.5079543331799177),
+            (1.9, 0.3, 0.001, 0.28220080309975265, 0.5079543331799177),
+            (1.9, 0.3, 0.7, 0.24333967281684793, 0.6955015720822886),
+            (1.9, 0.3, 25.0, 1.0671611067081213e-05, 0.9998610851565186),
+            (1.9, 1.0, -8.0, 3.146023332289839e-09, 6.294649246285644e-10),
+            (1.9, 1.0, -0.6, 0.26923747914356494, 0.3590165416168569),
+            (1.9, 1.0, 0.0, 0.2796624164821193, 0.5263157894736842),
+            (1.9, 1.0, 0.001, 0.2796624164821193, 0.5263157894736842),
+            (1.9, 1.0, 0.7, 0.23139062318879178, 0.7083054736010856),
+            (1.9, 1.0, 25.0, 1.6411361938206534e-05, 0.9997863265076803),
+            (2.0, -1.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, -1.0, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, -1.0, 0.0, 0.28209479177387814, 0.49999999999999994),
+            (2.0, -1.0, 0.001, 0.28209479177387814, 0.49999999999999994),
+            (2.0, -1.0, 0.7, 0.24957092803615247, 0.6896910267811551),
+            (2.0, -1.0, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, -0.3, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, -0.3, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, -0.3, 0.0, 0.28209479177387814, 0.5),
+            (2.0, -0.3, 0.001, 0.28209479177387814, 0.5),
+            (2.0, -0.3, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, -0.3, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 0.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 0.0, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, 0.0, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 0.0, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 0.0, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 0.0, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 0.3, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 0.3, -0.6, 0.2578152274047408, 0.3356866202704363),
+            (2.0, 0.3, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 0.3, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 0.3, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 0.3, 25.0, 3.9073496024030386e-69, 1.0),
+            (2.0, 1.0, -8.0, 3.174558667966651e-08, 7.70862895014001e-09),
+            (2.0, 1.0, -0.6, 0.2578152274047408, 0.33568662027043633),
+            (2.0, 1.0, 0.0, 0.28209479177387814, 0.5),
+            (2.0, 1.0, 0.001, 0.28209479177387814, 0.5),
+            (2.0, 1.0, 0.7, 0.24957092803615244, 0.6896910267811551),
+            (2.0, 1.0, 25.0, 3.9073496024030386e-69, 1.0),
+        ];
+        // Worst relative error per (alpha, beta) group, printed with --nocapture.
+        let mut worst: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (alpha, beta, x, pdf, cdf) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            let (ep, ec) = (rel_err(d.pdf(x), pdf), rel_err(d.cdf(x), cdf));
+            match worst.iter_mut().find(|w| w.0 == alpha && w.1 == beta) {
+                Some(w) => {
+                    w.2 = w.2.max(ep);
+                    w.3 = w.3.max(ec);
+                }
+                None => worst.push((alpha, beta, ep, ec)),
+            }
+        }
+        for (alpha, beta, ep, ec) in &worst {
+            eprintln!("levy_stable S1 alpha={alpha} beta={beta}: pdf {ep:e}, cdf {ec:e}");
+        }
+        for (alpha, beta, x, pdf, cdf) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            let what = format!("S1 alpha={alpha} beta={beta} x={x}");
+            check(d.pdf(x), pdf, TOL, &format!("pdf {what}"));
+            check(d.cdf(x), cdf, TOL, &format!("cdf {what}"));
+        }
+    }
+
+    /// The bead's spot value, S0 rows around zeta = -beta·tan(pi·alpha/2) (0.503 rounds to
+    /// zeta = 0.5 at alpha = 1.5, 0.52 does not), loc/scale rows in both parameterizations
+    /// including the S1 alpha = 1 location move, and alpha within 0.005 of 1, which SciPy
+    /// shifts by its own zeta and then treats as 1.
+    /// Columns: alpha, beta, loc, scale, x, pdf, cdf.
+    #[test]
+    fn pdf_cdf_s0_loc_scale_and_alpha_near_one() {
+        let d = LevyStable::new(1.5, 0.3, 0.0, 1.0);
+        check(d.pdf(0.5), 0.22439915549671538, TOL, "spot pdf");
+        check(d.cdf(0.5), 0.6875429387815427, TOL, "spot cdf");
+
+        let s0_rows: [(f64, f64, f64, f64, f64, f64, f64); 21] = [
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                -2.0,
+                0.0729514702833168,
+                0.06571542941283859,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.5,
+                0.2541126866022294,
+                0.5983890784336222,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.503,
+                0.2541126866022294,
+                0.5983890784336222,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                0.52,
+                0.2521997161081318,
+                0.6034522688733577,
+            ),
+            (
+                1.5,
+                0.5,
+                0.0,
+                1.0,
+                3.0,
+                0.04284619301847879,
+                0.9212012247259922,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                -1.5,
+                0.09202528714229978,
+                0.2618211709605025,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                0.9,
+                0.15188566709069184,
+                0.7931681554701584,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                0.93,
+                0.14472430504409473,
+                0.7976161115228116,
+            ),
+            (
+                0.8,
+                -0.3,
+                0.0,
+                1.0,
+                4.0,
+                0.01321799423471113,
+                0.9279031888680158,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                -3.0,
+                0.023301629432233868,
+                0.011666863100042502,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                -0.4,
+                0.27163149990559843,
+                0.37027163372395777,
+            ),
+            (
+                1.9,
+                1.0,
+                0.0,
+                1.0,
+                2.0,
+                0.1050785882885927,
+                0.8994601818635383,
+            ),
+            (0.5, 1.0, 0.0, 1.0, -1.2, 0.0, 0.0),
+            (
+                0.5,
+                1.0,
+                0.0,
+                1.0,
+                -0.5,
+                0.4151074974205947,
+                0.15729920705028516,
+            ),
+            (
+                0.5,
+                1.0,
+                0.0,
+                1.0,
+                0.5,
+                0.1555995547570865,
+                0.4142161782425253,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                -2.0,
+                0.10382723397538259,
+                0.22684307112115798,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                1.0,
+                0.21521713882120536,
+                0.8632216427510822,
+            ),
+            (
+                1.3,
+                -1.0,
+                0.0,
+                1.0,
+                1.5,
+                0.12154786593145031,
+                0.9479673043005242,
+            ),
+            (
+                1.5,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.13351911966380473,
+                0.5592694218395138,
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.12364376233084097,
+                0.5324311112999968,
+            ),
+            (
+                0.8,
+                -0.3,
+                -1.0,
+                0.5,
+                -0.2,
+                0.12253051796109418,
+                0.8606316070202891,
+            ),
+        ];
+        let s1_rows: [(f64, f64, f64, f64, f64, f64, f64); 13] = [
+            (
+                1.5,
+                0.3,
+                1.0,
+                2.0,
+                -3.0,
+                0.05440348128867137,
+                0.10919047132050375,
+            ),
+            (
+                1.5,
+                0.3,
+                1.0,
+                2.0,
+                1.7,
+                0.1209209848141138,
+                0.6525567570399271,
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                1.7,
+                0.13887514101063092,
+                0.4744347570441515,
+            ),
+            (
+                1.0,
+                -0.4,
+                0.5,
+                0.3,
+                0.2,
+                0.42248384201263395,
+                0.27556411500662836,
+            ),
+            (
+                1.0,
+                1.0,
+                0.0,
+                5.0,
+                3.0,
+                0.056753963334066196,
+                0.24806041671319412,
+            ),
+            (
+                0.5,
+                1.0,
+                0.3,
+                1.7,
+                2.0,
+                0.14233572030537844,
+                0.31731050786291415,
+            ),
+            (
+                2.0,
+                0.6,
+                -1.0,
+                3.0,
+                0.5,
+                0.08833451078134286,
+                0.6381631950841185,
+            ),
+            (0.998, 0.5, 0.0, 1.0, -1.0, 6.103589830227616e-06, 0.0),
+            (0.998, 0.5, 0.0, 1.0, 0.3, 6.203263472125152e-06, 0.0),
+            (0.998, 0.5, 0.0, 1.0, 2.0, 6.337335339383234e-06, 0.0),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                -1.0,
+                4.4205229628133885e-05,
+                0.9953986396137107,
+            ),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                0.3,
+                4.312308121402212e-05,
+                0.9954553986621298,
+            ),
+            (
+                1.003,
+                0.5,
+                0.0,
+                1.0,
+                2.0,
+                4.176684247378353e-05,
+                0.99552754589759,
+            ),
+        ];
+        for (rows, parameterization) in [
+            (&s0_rows[..], S0),
+            (&s1_rows[..], LevyStableParameterization::S1),
+        ] {
+            for &(alpha, beta, loc, scale, x, pdf, cdf) in rows {
+                let d =
+                    LevyStable::with_parameterization(alpha, beta, loc, scale, parameterization);
+                let what = format!("{parameterization:?} ({alpha}, {beta}, {loc}, {scale}) x={x}");
+                check(d.pdf(x), pdf, TOL, &format!("pdf {what}"));
+                check(d.cdf(x), cdf, TOL, &format!("cdf {what}"));
+            }
+        }
+    }
+
+    /// SciPy's `levy_stable.ppf` (generic root finding on the cdf) and `isf`.
+    #[test]
+    fn ppf_isf_rows() {
+        let ps = [0.01, 0.1, 0.5, 0.9, 0.99];
+        let rows: [(f64, f64, [f64; 5]); 7] = [
+            (
+                1.5,
+                0.3,
+                [
+                    -6.371307605716798,
+                    -2.0886224017914774,
+                    -0.22085552172957038,
+                    2.06680235533958,
+                    8.996966077267839,
+                ],
+            ),
+            (
+                0.8,
+                -0.3,
+                [
+                    -120.60758663157674,
+                    -7.3974104296497885,
+                    -1.0445416039861481,
+                    1.626854274821318,
+                    52.44040339388944,
+                ],
+            ),
+            (
+                1.0,
+                0.5,
+                [
+                    -15.16799305416683,
+                    -1.5477766789257335,
+                    0.22349210573932446,
+                    5.006386933270669,
+                    48.82826894159045,
+                ],
+            ),
+            (
+                2.0,
+                0.0,
+                [
+                    -3.2899527142663745,
+                    -1.8123876048736467,
+                    0.0,
+                    1.812387604873647,
+                    3.289952714266372,
+                ],
+            ),
+            (
+                0.5,
+                1.0,
+                [
+                    0.1507182493011396,
+                    0.36961150946819477,
+                    2.1981093383177317,
+                    63.32811767701677,
+                    6365.864385106271,
+                ],
+            ),
+            (
+                1.9,
+                -1.0,
+                [
+                    -4.205426893249391,
+                    -1.8467650006526712,
+                    0.09375287798650755,
+                    1.853531955701531,
+                    3.234759759840619,
+                ],
+            ),
+            (
+                0.5,
+                0.0,
+                [
+                    -1559.7261037251076,
+                    -12.741342661576967,
+                    0.0,
+                    12.741342661576983,
+                    1559.7261037250983,
+                ],
+            ),
+        ];
+        for (alpha, beta, want) in rows {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            for (p, w) in ps.into_iter().zip(want) {
+                check(d.ppf(p), w, TOL, &format!("ppf({p}) ({alpha}, {beta})"));
+            }
+        }
+        let d = LevyStable::new(1.5, 0.3, 1.0, 2.0);
+        check(d.ppf(0.3), -0.8865842731747346, TOL, "ppf(0.3) loc/scale");
+        check(d.isf(0.3), 2.1127466012802953, TOL, "isf(0.3) loc/scale");
+        let d = LevyStable::with_parameterization(1.5, 0.5, 0.0, 1.0, S0);
+        for (p, w) in [
+            (0.05, -2.2541858411797433),
+            (0.5, 0.13385304231281092),
+            (0.95, 3.933658790179654),
+        ] {
+            check(d.ppf(p), w, TOL, &format!("S0 ppf({p})"));
+        }
+    }
+
+    /// `levy_stable.stats(alpha, beta, loc, scale, moments='mvsk')`, the same in S0 and S1.
+    #[test]
+    fn stats_rows() {
+        let rows: [(f64, f64, f64, f64, [f64; 4]); 5] = [
+            (1.5, 0.5, 1.0, 2.0, [1.0, f64::INFINITY, f64::NAN, f64::NAN]),
+            (
+                0.8,
+                0.3,
+                1.0,
+                2.0,
+                [f64::NAN, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+            (
+                1.0,
+                0.5,
+                1.0,
+                2.0,
+                [f64::NAN, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+            (2.0, 0.7, 1.0, 2.0, [1.0, 8.0, 0.0, 0.0]),
+            (
+                1.9,
+                -1.0,
+                -3.0,
+                0.5,
+                [-3.0, f64::INFINITY, f64::NAN, f64::NAN],
+            ),
+        ];
+        for (alpha, beta, loc, scale, want) in rows {
+            for parameterization in [LevyStableParameterization::S1, S0] {
+                let d =
+                    LevyStable::with_parameterization(alpha, beta, loc, scale, parameterization);
+                let got = [d.mean(), d.var(), d.skewness(), d.kurtosis()];
+                for (g, w) in got.into_iter().zip(want) {
+                    assert!(
+                        g == w || (g.is_nan() && w.is_nan()),
+                        "{parameterization:?} ({alpha}, {beta}, {loc}, {scale}) stats {got:?}, \
+                         scipy {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SciPy's `_argcheck` (0 < alpha <= 2, -1 <= beta <= 1) plus scale > 0 and a finite loc.
+    #[test]
+    fn argcheck_rejects_and_accepts_the_edges() {
+        let bad: [(f64, f64, f64, f64); 10] = [
+            (0.0, 0.0, 0.0, 1.0),
+            (-0.5, 0.0, 0.0, 1.0),
+            (2.0000001, 0.0, 0.0, 1.0),
+            (f64::NAN, 0.0, 0.0, 1.0),
+            (1.5, 1.0000001, 0.0, 1.0),
+            (1.5, -1.0000001, 0.0, 1.0),
+            (1.5, f64::NAN, 0.0, 1.0),
+            (1.5, 0.0, 0.0, 0.0),
+            (1.5, 0.0, 0.0, -1.0),
+            (1.5, 0.0, f64::INFINITY, 1.0),
+        ];
+        for (alpha, beta, loc, scale) in bad {
+            assert!(
+                std::panic::catch_unwind(|| LevyStable::new(alpha, beta, loc, scale)).is_err(),
+                "({alpha}, {beta}, {loc}, {scale}) must be rejected"
+            );
+        }
+        for (alpha, beta) in [(2.0, 1.0), (2.0, -1.0), (1e-3, 0.0), (1.0, 1.0)] {
+            let d = LevyStable::new(alpha, beta, 0.0, 1.0);
+            assert_eq!((d.alpha, d.beta), (alpha, beta));
+            assert_eq!(d.parameterization, LevyStableParameterization::S1);
+        }
+    }
+
+    /// Non-finite x, p in {0, 1} and out-of-range p, as `rv_continuous` answers them.
+    #[test]
+    fn edges() {
+        for parameterization in [LevyStableParameterization::S1, S0] {
+            let d = LevyStable::with_parameterization(1.5, 0.3, 0.5, 2.0, parameterization);
+            assert_eq!(d.pdf(f64::INFINITY), 0.0);
+            assert_eq!(d.pdf(f64::NEG_INFINITY), 0.0);
+            assert!(d.pdf(f64::NAN).is_nan());
+            assert_eq!(d.cdf(f64::INFINITY), 1.0);
+            assert_eq!(d.cdf(f64::NEG_INFINITY), 0.0);
+            assert!(d.cdf(f64::NAN).is_nan());
+            assert_eq!(d.sf(f64::INFINITY), 0.0);
+            assert_eq!(d.sf(f64::NEG_INFINITY), 1.0);
+            assert_eq!(d.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+            assert_eq!(d.ppf(0.0), f64::NEG_INFINITY);
+            assert_eq!(d.ppf(1.0), f64::INFINITY);
+            assert_eq!(d.isf(0.0), f64::INFINITY);
+            assert_eq!(d.isf(1.0), f64::NEG_INFINITY);
+            for bad in [-0.1, 1.1, f64::NAN] {
+                assert!(d.ppf(bad).is_nan(), "ppf({bad}) must be NaN");
+            }
+            // logpdf is log(f(z)) - log(scale); sf is 1 - cdf.
+            let x = 1.3;
+            check(d.logpdf(x), d.pdf(x).ln(), 1e-15, "logpdf");
+            assert_eq!(d.sf(x), 1.0 - d.cdf(x));
+            // ppf inverts the cdf to brentq's xtol.
+            for p in [0.02, 0.4, 0.97] {
+                check(d.cdf(d.ppf(p)), p, 1e-12, &format!("cdf(ppf({p}))"));
+            }
+        }
+        // The S1 alpha = 1 location move reaches sf, logpdf and ppf too (SciPy's own sf, logpdf
+        // and ppf skip it; its pdf and cdf, pinned above, do not).
+        let d = LevyStable::new(1.0, 0.5, 1.0, 2.0);
+        check(d.sf(1.7), 1.0 - 0.4744347570441515, TOL, "S1 alpha=1 sf");
+        check(
+            d.logpdf(1.7),
+            0.13887514101063092_f64.ln(),
+            1e-14,
+            "S1 alpha=1 logpdf",
+        );
+        check(d.cdf(d.ppf(0.3)), 0.3, 1e-12, "S1 alpha=1 cdf(ppf)");
+    }
+
+    /// `levy_stable._fitstart(data)` (S1 and S0) on deterministic samples: Cauchy quantiles,
+    /// heavy two-sided tails skewed right and (negated) left, light right-skewed data (the
+    /// nu_alpha < 2.439 branch, alpha = 2, beta = sign(nu_beta)), and a golden-ratio sequence.
+    #[test]
+    fn fitstart_rows() {
+        let n = 401;
+        let u: Vec<f64> = (0..n)
+            .map(|i| (f64::from(i) + 0.5) / f64::from(n))
+            .collect();
+        let cauchy: Vec<f64> = u
+            .iter()
+            .map(|&v| (std::f64::consts::PI * (v - 0.5)).tan())
+            .collect();
+        let right: Vec<f64> = u
+            .iter()
+            .map(|&v| v.powf(-1.0 / 1.3) - 0.5 * (1.0 - v).powf(-1.0 / 1.7))
+            .collect();
+        let left: Vec<f64> = right.iter().map(|&v| -v).collect();
+        let light: Vec<f64> = u.iter().map(|&v| v * v).collect();
+        let golden: Vec<f64> = (1..=250)
+            .map(|i| {
+                let v = (f64::from(i) * 0.6180339887498949) % 1.0;
+                (std::f64::consts::PI * (v - 0.5)).tan() * (1.0 + 0.5 * v)
+            })
+            .collect();
+        // (data, S1 (alpha, beta, delta, gamma), S0 delta)
+        let rows: [(&[f64], [f64; 4], f64); 5] = [
+            (
+                &cauchy,
+                [1.0158960249888753, -0.0, 0.0, 0.9976763632502582],
+                0.0,
+            ),
+            (
+                &right,
+                [
+                    1.0569100642826337,
+                    0.5332182241201249,
+                    6.419640594017776,
+                    0.9565996492264762,
+                ],
+                0.7289204860098151,
+            ),
+            (
+                &left,
+                [
+                    1.0569100642826337,
+                    -0.5332182241201249,
+                    -6.419640594017776,
+                    0.9565996492264762,
+                ],
+                -0.7289204860098151,
+            ),
+            (
+                &light,
+                [2.0, 1.0, 0.25000000000000006, 0.2614010048254625],
+                0.25,
+            ),
+            (
+                &golden,
+                [
+                    1.0132603158061595,
+                    0.12525788451248404,
+                    7.215217726938392,
+                    1.2092049810123457,
+                ],
+                -0.055351970138906914,
+            ),
+        ];
+        for (k, (data, s1, s0_delta)) in rows.into_iter().enumerate() {
+            let (a, b, d, g) = LevyStable::fitstart(data);
+            for (got, want, what) in [
+                (a, s1[0], "alpha"),
+                (b, s1[1], "beta"),
+                (d, s1[2], "loc"),
+                (g, s1[3], "scale"),
+            ] {
+                check(got, want, TOL, &format!("fitstart S1 dataset {k} {what}"));
+            }
+            let (a0, b0, d0, g0) = LevyStable::fitstart_with_parameterization(data, S0);
+            assert_eq!((a0, b0, g0), (a, b, g), "S0 changes only the location");
+            check(d0, s0_delta, TOL, &format!("fitstart S0 dataset {k} loc"));
+        }
+        let (a, b, d, g) = LevyStable::fitstart(&[]);
+        assert!(a.is_nan() && b.is_nan() && d.is_nan() && g.is_nan());
+        // np.percentile is NaN on NaN data: alpha falls to 2 and the rest is NaN, as in SciPy.
+        let (a, b, d, g) = LevyStable::fitstart(&[1.0, f64::NAN, 3.0]);
+        assert!(a == 2.0 && b.is_nan() && d.is_nan() && g.is_nan());
+    }
+
+    /// Fraction of `xs` at or below `x`.
+    fn ecdf(xs: &[f64], x: f64) -> f64 {
+        xs.iter().filter(|&&v| v <= x).count() as f64 / xs.len() as f64
+    }
+
+    /// `rvs` draws follow the law: the empirical cdf at SciPy's quantiles (S1) or at points
+    /// where the cdf is pinned (S0; S1 at alpha = 1 with scale 3, where the location move is
+    /// 1.049) is within 0.015 of it, six standard errors at n = 40000. The alpha = 1 draws are
+    /// also checked to MISS the unmoved law, so a dropped move fails.
+    #[test]
+    fn rvs_follow_the_cdf() {
+        const N: usize = 40_000;
+        const TOL_ECDF: f64 = 0.015;
+        let mut rng = StdRng::seed_from_u64(0x1e_5ab1e);
+
+        let d = LevyStable::new(1.5, 0.3, 0.0, 1.0);
+        let xs = d.rvs(N, &mut rng);
+        for (p, x) in [
+            (0.1, -2.0886224017914774),
+            (0.5, -0.22085552172957038),
+            (0.9, 2.06680235533958),
+        ] {
+            let e = ecdf(&xs, x);
+            assert!(
+                (e - p).abs() < TOL_ECDF,
+                "S1 (1.5, 0.3): ecdf {e} at ppf({p})"
+            );
+        }
+
+        let d = LevyStable::new(1.0, 0.5, 1.0, 3.0);
+        let unmoved = LevyStable::with_parameterization(1.0, 0.5, 1.0, 3.0, S0);
+        let xs = d.rvs(N, &mut rng);
+        let mut max_miss = 0.0_f64;
+        for x in [-2.0, 1.0, 2.0, 6.0] {
+            let e = ecdf(&xs, x);
+            let f = d.cdf(x);
+            assert!(
+                (e - f).abs() < TOL_ECDF,
+                "S1 alpha=1: ecdf {e} vs cdf {f} at {x}"
+            );
+            max_miss = max_miss.max((e - unmoved.cdf(x)).abs());
+        }
+        assert!(
+            max_miss > 5.0 * TOL_ECDF,
+            "the unmoved law must be distinguishable, max gap {max_miss}"
+        );
+
+        let d = LevyStable::with_parameterization(0.8, -0.3, -1.0, 2.0, S0);
+        let xs = d.rvs(N, &mut rng);
+        for x in [-8.0, -1.0, 0.5, 3.0] {
+            let (e, f) = (ecdf(&xs, x), d.cdf(x));
+            assert!(
+                (e - f).abs() < TOL_ECDF,
+                "S0 (0.8, -0.3): ecdf {e} vs cdf {f} at {x}"
+            );
+        }
+
+        // alpha = 2: normal with mean loc and variance 2·scale² = 18.
+        let d = LevyStable::new(2.0, 0.6, -1.0, 3.0);
+        let xs = d.rvs(N, &mut rng);
+        let mean = xs.iter().sum::<f64>() / N as f64;
+        let var = xs.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (N - 1) as f64;
+        assert!((mean + 1.0).abs() < 0.11, "alpha=2 sample mean {mean}");
+        assert!(
+            (var / 18.0 - 1.0).abs() < 0.05,
+            "alpha=2 sample variance {var}"
+        );
+    }
+
+    /// Negative control for the removed `LevyStable = Levy` alias (br-szq1n.2). In S1,
+    /// levy_stable(1/2, 1, loc, scale) IS levy(loc, scale) (SciPy agrees to 5e-15) and
+    /// levy_stable(1/2, -1) is levy_l; but S0 moves it by -scale, and any other (alpha, beta)
+    /// is a different law, where the old alias would have returned Lévy's numbers.
+    #[test]
+    fn levy_is_the_s1_half_one_case_and_nothing_else() {
+        let (loc, scale) = (0.3, 1.7);
+        let levy = Levy::new(loc, scale);
+        let s1 = LevyStable::new(0.5, 1.0, loc, scale);
+        let s0 = LevyStable::with_parameterization(0.5, 1.0, loc, scale, S0);
+        let s0_as_levy = Levy::new(loc - scale, scale);
+        let near = LevyStable::new(0.5, 0.9, loc, scale);
+        for x in [0.35, 0.8, 1.7, 4.0, 30.0] {
+            check(
+                s1.pdf(x),
+                levy.pdf(x),
+                1e-13,
+                &format!("S1 pdf({x}) = levy"),
+            );
+            check(
+                s1.cdf(x),
+                levy.cdf(x),
+                1e-13,
+                &format!("S1 cdf({x}) = levy"),
+            );
+            check(s0.pdf(x), s0_as_levy.pdf(x), 1e-13, &format!("S0 pdf({x})"));
+            assert!(
+                rel_err(s0.pdf(x), levy.pdf(x)) > 0.05,
+                "S0 (1/2, 1) must not be levy(loc, scale) at {x}"
+            );
+            assert!(
+                rel_err(near.pdf(x), levy.pdf(x)) > 0.01,
+                "(1/2, 0.9) must not be levy at {x}"
+            );
+        }
+        let levy_l = LevyL::new(0.0, 1.0);
+        let mirrored = LevyStable::new(0.5, -1.0, 0.0, 1.0);
+        for x in [-3.0, -0.5] {
+            check(
+                mirrored.pdf(x),
+                levy_l.pdf(x),
+                1e-13,
+                &format!("levy_l pdf({x})"),
+            );
+        }
+        // alpha = 2 is the normal law with scale sqrt(2)·scale, whatever beta.
+        let normal = Normal::new(1.0, std::f64::consts::SQRT_2 * 2.0);
+        for beta in [-1.0, 0.4] {
+            let d = LevyStable::new(2.0, beta, 1.0, 2.0);
+            for x in [-4.0, 1.0, 6.0] {
+                check(
+                    d.pdf(x),
+                    normal.pdf(x),
+                    1e-14,
+                    &format!("alpha=2 beta={beta} pdf({x})"),
+                );
+            }
+        }
+    }
+}
+
 /// Gompertz distribution.
 ///
 /// Matches `scipy.stats.gompertz`.
@@ -25622,7 +27544,8 @@ pub(crate) fn kstwobign_pdf_large(x: f64) -> f64 {
             break;
         }
     }
-    sum.max(0.0)
+    // The clamp is for rounding below zero; `NaN.max(0.0)` would turn pdf(NaN) into 0.0.
+    if sum.is_nan() { f64::NAN } else { sum.max(0.0) }
 }
 
 pub(crate) fn kstwobign_cdf_large(x: f64) -> f64 {
@@ -25850,6 +27773,107 @@ impl ContinuousDistribution for KsTwoBign {
             1e-12,
             10,
         )
+    }
+}
+
+/// Exact finite-sample distribution of the two-sided one-sample Kolmogorov–Smirnov
+/// statistic D_n = sup_x |F_n(x) − F(x)| (the distribution of `ks_1samp`'s statistic under
+/// the null). Matches `scipy.stats.kstwo(n)`; [`KsTwoBign`] is its n → ∞ limit of √n·D_n.
+///
+/// Support is SciPy's `[1/(2n), 1]`. `cdf`, `sf`, `pdf`, `ppf` and `isf` follow SciPy's
+/// `kolmogn`, `kolmognp` and `kolmogni` branch for branch; the upper tail `sf` stays
+/// accurate where `1 − cdf` would cancel to 0. `mean` and `var` integrate `1 − cdf` (see
+/// [`Kstwo::mean`]). frankenscipy-1ksfv.16
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kstwo {
+    n: usize,
+}
+
+impl Kstwo {
+    /// The law of D_n for a sample of size `n`.
+    ///
+    /// # Errors
+    ///
+    /// `n == 0`: SciPy's `kstwo` requires an integer `n ≥ 1` (`kstwo(0)` fails to
+    /// freeze, and `kstwo.cdf(x, 0)` is NaN).
+    pub fn new(n: usize) -> Result<Self, StatsError> {
+        if n == 0 {
+            return Err(StatsError::InvalidArgument(
+                "kstwo requires a sample size n >= 1".to_string(),
+            ));
+        }
+        Ok(Self { n })
+    }
+
+    /// The sample size `n`.
+    #[must_use]
+    pub const fn n(&self) -> usize {
+        self.n
+    }
+
+    /// SciPy `kstwo.support(n)`: `(1/(2n), 1)`.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (0.5 / self.n as f64, 1.0)
+    }
+}
+
+impl ContinuousDistribution for Kstwo {
+    fn pdf(&self, x: f64) -> f64 {
+        kolmogn_p(self.n, x)
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        kolmogn(self.n, x, true)
+    }
+
+    /// Computed directly (2·smirnov in the upper tail), not as `1 − cdf`.
+    fn sf(&self, x: f64) -> f64 {
+        kolmogn(self.n, x, false)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.support().0;
+        }
+        if q == 1.0 {
+            return 1.0;
+        }
+        kolmogni(self.n, q, 1.0 - q, false)
+    }
+
+    /// Inverts `sf` itself for q < 1/2 (see [`kolmogni`]); SciPy inverts the CDF at 1 - q.
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return 1.0;
+        }
+        if q == 1.0 {
+            return self.support().0;
+        }
+        kolmogni(self.n, 1.0 - q, q, q < 0.5)
+    }
+
+    /// E[D_n] = ∫₀¹ (1 − cdf(x)) dx by adaptive Gauss–Kronrod.
+    ///
+    /// SciPy has no closed form either: `kstwo.mean(n)` is `quad(x·pdf)` with the pdf a
+    /// finite difference of the CDF, and lands 3e-10 to 2e-6 (relative) away from the exact
+    /// mean, and up to 3e-5 from the exact variance (n = 141) — e.g. n = 5 gives
+    /// 0.3583385977550 where the exact mean is 0.358338666…. The integral of 1 − cdf agrees
+    /// with exact (mpmath) moments to 1e-14.
+    fn mean(&self) -> f64 {
+        kstwo_raw_moments_12(self.n).0
+    }
+
+    /// E[D_n²] − E[D_n]², with E[D_n²] = ∫₀¹ 2x·(1 − cdf(x)) dx (see [`Kstwo::mean`]).
+    fn var(&self) -> f64 {
+        let (m1, m2) = kstwo_raw_moments_12(self.n);
+        m2 - m1 * m1
     }
 }
 
@@ -26358,6 +28382,11 @@ impl IrwinHall {
 
 impl ContinuousDistribution for IrwinHall {
     fn pdf(&self, x: f64) -> f64 {
+        // SciPy's pdf(NaN) is NaN. Without this, n = 1 answers 0.0 from the range test and
+        // n > 1 from the final `.max(0.0)` clamp, which turns the NaN sum into 0.0.
+        if x.is_nan() {
+            return f64::NAN;
+        }
         let nf = self.n as f64;
         // n=1 collapses to Uniform(0, 1). Handle directly so the
         // closed boundary at x=0 and x=1 returns 1 (matches scipy's
@@ -30289,6 +32318,12 @@ pub static NANMINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// zeros, so the chunk-then-merge result equals the left fold, and NaN is filtered per chunk
 /// identically. Work-gated (the syscall + spawn cost more than the fold below the gate).
 fn par_nan_fold(data: &[f64], ident: f64, reduce: fn(f64, f64) -> f64) -> f64 {
+    // numpy's nanmin/nanmax of an all-NaN slice is NaN ("All-NaN slice encountered"); the
+    // NaN-skipping fold would return its ±inf seed. `all` stops at the first non-NaN, so
+    // ordinary input pays one comparison. Empty input keeps its seed as before.
+    if !data.is_empty() && data.iter().all(|x| x.is_nan()) {
+        return f64::NAN;
+    }
     let n = data.len();
     let serial = |d: &[f64]| {
         d.iter()
@@ -33163,7 +35198,12 @@ pub fn alexander_govern(groups: &[&[f64]]) -> TtestResult {
     }
 
     let df = (k - 1) as f64;
-    let pvalue = 1.0 - ChiSquared::new(df).cdf(a_stat.max(0.0));
+    // `NaN.max(0.0)` is 0.0, which would turn a NaN statistic into p = 1; SciPy returns NaN.
+    let pvalue = if a_stat.is_nan() {
+        f64::NAN
+    } else {
+        1.0 - ChiSquared::new(df).cdf(a_stat.max(0.0))
+    };
 
     TtestResult {
         statistic: a_stat,
@@ -35195,6 +37235,10 @@ fn wilcoxon_tie_sum_by_resort(abs_diffs: &[f64]) -> f64 {
     tie_sum
 }
 
+/// SciPy's `wilcoxon(method='auto')` takes the normal approximation outright for more than
+/// this many differences (`_wilcoxon.py`: `if method == "auto" and d.shape[-1] > 50`).
+const WILCOXON_AUTO_EXACT_MAX_N: usize = 50;
+
 pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() != y.len() || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -35252,9 +37296,12 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
         .map(|(r, _)| *r)
         .sum();
 
-    // scipy `method='auto'` uses the EXACT signed-rank null distribution when no
-    // zeros were dropped and the absolute differences have no ties (ranks 1..n);
-    // it falls back to the normal approximation otherwise. frankenscipy-78v5y
+    // scipy `method='auto'` (1.17.1 `_wilcoxon.py`): more than 50 differences take the
+    // normal approximation outright. At most 50 take the EXACT signed-rank null distribution
+    // when no zeros were dropped and the absolute differences have no ties (ranks 1..n),
+    // frankenscipy-78v5y. Otherwise it is the permutation test (n ≤ 13) or the normal
+    // approximation. The cut was nr ≤ 1000, which gave the exact p-value where SciPy's
+    // default gives the approximation, for every 50 < n ≤ 1000 (frankenscipy-hlu5b).
     let no_zeros = x.len() == nr;
     // HISTORICAL (frankenscipy-78v5y): computing `no_ties` used to sort a clone of
     // abs_diffs, so it was gated behind the cheap `no_zeros && nr <= 1000` checks to spare
@@ -35270,9 +37317,9 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     let no_ties = || tie_sum == 0.0;
     let take_exact = if WILCOXON_FORCE_EAGER_NOTIES.load(std::sync::atomic::Ordering::Relaxed) {
         let nt = no_ties();
-        no_zeros && nt && nr <= 1000
+        no_zeros && nt && x.len() <= WILCOXON_AUTO_EXACT_MAX_N
     } else {
-        no_zeros && nr <= 1000 && no_ties()
+        no_zeros && x.len() <= WILCOXON_AUTO_EXACT_MAX_N && no_ties()
     };
     if take_exact {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, "two-sided");
@@ -35396,7 +37443,7 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // from the ranking pass answers that for free — it is zero exactly when no tie group
     // has size >= 2. BYTE-IDENTICAL as a predicate: both test exact equality.
     let no_ties = tie_sum == 0.0;
-    if no_zeros && no_ties && nr <= 1000 {
+    if no_zeros && no_ties && x.len() <= WILCOXON_AUTO_EXACT_MAX_N {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, alternative);
         return TtestResult {
             statistic: stat,
@@ -36107,7 +38154,7 @@ fn par_two_means(x: &[f64], y: &[f64]) -> (f64, f64) {
 /// Tests for non-correlation: H0: ρ = 0 (no linear relationship).
 pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36165,6 +38212,7 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
                 })
         };
 
+    warn_if_nearly_constant(ssxm.sqrt(), xmean, ssym.sqrt(), ymean);
     let denom = (ssxm * ssym).sqrt();
     if denom == 0.0 || denom.is_nan() || ssxym.is_nan() {
         return CorrelationResult {
@@ -36212,7 +38260,7 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
 /// * `alternative` - "two-sided" (default), "less", or "greater"
 pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36242,6 +38290,7 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     }
     let normxm = xmax * xm.iter().map(|v| (v / xmax).powi(2)).sum::<f64>().sqrt();
     let normym = ymax * ym.iter().map(|v| (v / ymax).powi(2)).sum::<f64>().sqrt();
+    warn_if_nearly_constant(normxm, xmean, normym, ymean);
     if normxm == 0.0 || normym == 0.0 || normxm.is_nan() || normym.is_nan() {
         return CorrelationResult {
             statistic: f64::NAN,
@@ -36352,7 +38401,9 @@ fn rank_two_average(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    // SciPy tests the raw inputs for constancy before ranking; ranks of a non-constant input
+    // are never constant, so the Pearson step below cannot warn a second time.
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36372,7 +38423,7 @@ pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
 /// Matches `scipy.stats.spearmanr(a, b, alternative=...)`.
 pub fn spearmanr_alternative(x: &[f64], y: &[f64], alternative: &str) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -40295,7 +42346,14 @@ pub fn mjci(data: &[f64], prob: &[f64]) -> Vec<f64> {
                 c1 += w * d;
                 c2 += w * d * d;
             }
-            (c2 - c1 * c1).max(0.0).sqrt()
+            // An infinite datum makes `c2 − c1²` NaN; SciPy's sqrt keeps it, where
+            // `NaN.max(0.0)` would report 0.0. The clamp stays for rounding below zero.
+            let var = c2 - c1 * c1;
+            if var.is_nan() {
+                f64::NAN
+            } else {
+                var.max(0.0).sqrt()
+            }
         })
         .collect()
 }
@@ -42053,22 +44111,32 @@ where
 
 /// The trimmed minimum, or NaN if no values remain.
 pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
+    // A NaN is kept and propagates, as under scipy.stats.tmin's default nan_policy='propagate';
+    // `f64::min` alone would drop it.
     let keep = |x: f64| {
-        x.is_finite()
-            && if inclusive {
-                x >= lowerlimit
-            } else {
-                x > lowerlimit
-            }
+        x.is_nan()
+            || (x.is_finite()
+                && if inclusive {
+                    x >= lowerlimit
+                } else {
+                    x > lowerlimit
+                })
+    };
+    let nan_min: fn(f64, f64) -> f64 = |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.min(b)
+        }
     };
     if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
         let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
         if filtered.is_empty() {
             return f64::NAN;
         }
-        return filtered.iter().copied().fold(f64::INFINITY, f64::min);
+        return filtered.iter().copied().fold(f64::INFINITY, nan_min);
     }
-    par_filter_fold(data, f64::INFINITY, keep, f64::min).unwrap_or(f64::NAN)
+    par_filter_fold(data, f64::INFINITY, keep, nan_min).unwrap_or(f64::NAN)
 }
 
 /// Compute the trimmed maximum.
@@ -42085,22 +44153,32 @@ pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
 /// # Returns
 /// The trimmed maximum, or NaN if no values remain.
 pub fn tmax(data: &[f64], upperlimit: f64, inclusive: bool) -> f64 {
+    // A NaN is kept and propagates, as under scipy.stats.tmax's default nan_policy='propagate';
+    // `f64::max` alone would drop it.
     let keep = |x: f64| {
-        x.is_finite()
-            && if inclusive {
-                x <= upperlimit
-            } else {
-                x < upperlimit
-            }
+        x.is_nan()
+            || (x.is_finite()
+                && if inclusive {
+                    x <= upperlimit
+                } else {
+                    x < upperlimit
+                })
+    };
+    let nan_max: fn(f64, f64) -> f64 = |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.max(b)
+        }
     };
     if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
         let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
         if filtered.is_empty() {
             return f64::NAN;
         }
-        return filtered.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        return filtered.iter().copied().fold(f64::NEG_INFINITY, nan_max);
     }
-    par_filter_fold(data, f64::NEG_INFINITY, keep, f64::max).unwrap_or(f64::NAN)
+    par_filter_fold(data, f64::NEG_INFINITY, keep, nan_max).unwrap_or(f64::NAN)
 }
 
 /// Compute the expectile at a given alpha level.
@@ -42394,99 +44472,231 @@ pub fn obrientransform(groups: &[&[f64]]) -> Vec<Vec<f64>> {
     })
 }
 
+/// How [`page_trend_test`] computes its p-value: `scipy.stats.page_trend_test(method=...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageTrendMethod {
+    /// `'auto'`: exact unless the table has more than 8 columns, more than 12 rows with more
+    /// than 3 columns, or more than 20 rows.
+    #[default]
+    Auto,
+    /// `'exact'`: the null distribution of L, convolved over rows (Odiase and Ogbonmwan).
+    Exact,
+    /// `'asymptotic'`: the normal approximation to L.
+    Asymptotic,
+}
+
 /// Result of Page's trend test.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageTrendResult {
     /// Page's L statistic.
     pub statistic: f64,
-    /// Approximate p-value (one-sided, for increasing trend).
+    /// One-sided p-value for an increasing trend in the predicted order.
     pub pvalue: f64,
+    /// The method that computed `pvalue`: `Exact` or `Asymptotic`, never `Auto`.
+    pub method: PageTrendMethod,
 }
 
-/// Perform Page's L test for a monotonic trend in ranked data.
+/// The largest column count the exact method handles. The single-row distribution comes from a
+/// subset DP over 2^k states; SciPy enumerates all k! permutations instead, which exhausts
+/// memory near k = 12, so this covers every table SciPy can complete.
+const PAGE_EXACT_MAX_COLUMNS: usize = 12;
+
+/// Page's L test for a monotonic trend across ordered conditions: rows are subjects or blocks,
+/// columns are conditions.
 ///
-/// Tests whether there is a monotonic trend across ordered conditions.
-/// Data should be organized as rows (subjects/blocks) by columns (conditions).
+/// Matches `scipy.stats.page_trend_test(data, ranked, predicted_ranks, method)` (SciPy
+/// 1.17.1):
+/// - rows are ranked with average ranks for ties, unless `ranked` says they already are;
+/// - `L = Σ_j predicted_ranks[j] · (column j's rank sum)`, with `1..=n` as the default
+///   prediction;
+/// - the exact p-value is `P(L' ≥ trunc(L))`. SciPy convolves the single-row distribution
+///   across rows, and so does this;
+/// - the asymptotic p-value is `norm.sf((L − E0)/√V0)`.
 ///
-/// Matches `scipy.stats.page_trend_test(data)`.
+/// # Errors
 ///
-/// # Arguments
-/// * `data` — 2D data where each inner slice is a row (subject), columns are conditions
+/// As SciPy raises:
+/// - fewer than 2 rows or 3 columns, or ragged rows;
+/// - a NaN in `data`;
+/// - `ranked` data outside `[1, n]`;
+/// - `predicted_ranks` that is not a permutation of `1..=n`.
 ///
-/// # Returns
-/// `PageTrendResult` with L statistic and approximate p-value.
-pub fn page_trend_test(data: &[&[f64]]) -> PageTrendResult {
-    let n = data.len(); // number of subjects/blocks
-    if n == 0 {
-        return PageTrendResult {
-            statistic: f64::NAN,
-            pvalue: f64::NAN,
-        };
+/// Also an error: the exact method on more than 12 columns (see `PAGE_EXACT_MAX_COLUMNS`).
+pub fn page_trend_test(
+    data: &[&[f64]],
+    ranked: bool,
+    predicted_ranks: Option<&[usize]>,
+    method: PageTrendMethod,
+) -> Result<PageTrendResult, StatsError> {
+    let m = data.len();
+    let n = data.first().map_or(0, |row| row.len());
+    if data.iter().any(|row| row.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "`data` must be a 2d array.".to_string(),
+        ));
     }
-
-    let k = data[0].len(); // number of conditions
-    if k < 2 || data.iter().any(|row| row.len() != k) {
-        return PageTrendResult {
-            statistic: f64::NAN,
-            pvalue: f64::NAN,
-        };
+    if m < 2 || n < 3 {
+        return Err(StatsError::InvalidArgument(
+            "Page's L is only appropriate for data with two or more rows and three or more \
+             columns."
+                .to_string(),
+        ));
     }
+    if data.iter().any(|row| row.iter().any(|v| v.is_nan())) {
+        return Err(StatsError::InvalidArgument(
+            "`data` contains NaNs, which cannot be ranked meaningfully".to_string(),
+        ));
+    }
+    let n_f = n as f64;
+    if ranked
+        && data
+            .iter()
+            .any(|row| row.iter().any(|&v| !(1.0..=n_f).contains(&v)))
+    {
+        return Err(StatsError::InvalidArgument(
+            "`data` is not properly ranked. Rank the data or pass `ranked=False`.".to_string(),
+        ));
+    }
+    let default_prediction: Vec<usize>;
+    let predicted = match predicted_ranks {
+        Some(p) => {
+            let mut seen = vec![false; n];
+            let is_permutation = p.len() == n
+                && p.iter()
+                    .all(|&r| (1..=n).contains(&r) && !std::mem::replace(&mut seen[r - 1], true));
+            if !is_permutation {
+                return Err(StatsError::InvalidArgument(format!(
+                    "`predicted_ranks` must include each integer from 1 to {n} (the number of \
+                     columns in `data`) exactly once."
+                )));
+            }
+            p
+        }
+        None => {
+            default_prediction = (1..=n).collect();
+            &default_prediction
+        }
+    };
 
-    // Rank within each row
-    let mut rank_sums = vec![0.0; k];
-    // Per-row scratch hoisted out of the loop: indexed is cleared+rebuilt each row,
-    // ranks is fully overwritten (the while loop assigns every column) -> byte-
-    // identical, saving 2×n_rows allocations. frankenscipy-26zjo.
-    let mut indexed: Vec<(usize, f64)> = Vec::with_capacity(k);
-    let mut ranks = vec![0.0; k];
-
+    // Column rank sums, adding the rows in order as numpy's sum over axis 0 does.
+    let mut rank_sums = vec![0.0; n];
+    let mut indexed: Vec<(usize, f64)> = Vec::with_capacity(n);
+    let mut ranks = vec![0.0; n];
     for row in data {
-        // Get ranks for this row
-        indexed.clear();
-        indexed.extend(row.iter().copied().enumerate());
-        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        let mut i = 0;
-        while i < k {
-            let mut j = i + 1;
-            while j < k && indexed[j].1 == indexed[i].1 {
-                j += 1;
+        if ranked {
+            ranks.copy_from_slice(row);
+        } else {
+            indexed.clear();
+            indexed.extend(row.iter().copied().enumerate());
+            indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut i = 0;
+            while i < n {
+                let mut j = i + 1;
+                while j < n && indexed[j].1 == indexed[i].1 {
+                    j += 1;
+                }
+                let avg_rank = (i + 1 + j) as f64 / 2.0;
+                for entry in &indexed[i..j] {
+                    ranks[entry.0] = avg_rank;
+                }
+                i = j;
             }
-            let avg_rank = (i + 1 + j) as f64 / 2.0;
-            for idx in i..j {
-                ranks[indexed[idx].0] = avg_rank;
-            }
-            i = j;
         }
-
-        for (col, &rank) in ranks.iter().enumerate() {
-            rank_sums[col] += rank;
+        for (sum, &rank) in rank_sums.iter_mut().zip(&ranks) {
+            *sum += rank;
         }
     }
-
-    // Compute L statistic: sum of (condition_index + 1) * rank_sum
-    let l: f64 = rank_sums
+    let l: f64 = predicted
         .iter()
-        .enumerate()
-        .map(|(i, &r)| (i + 1) as f64 * r)
+        .zip(&rank_sums)
+        .map(|(&p, &s)| p as f64 * s)
         .sum();
 
-    // Expected value and variance under null hypothesis
-    let n_f = n as f64;
-    let k_f = k as f64;
-    let expected_l = n_f * k_f * (k_f + 1.0).powi(2) / 4.0;
-    let var_l = n_f * k_f.powi(2) * (k_f + 1.0).powi(2) * (k_f - 1.0) / 144.0;
-
-    // Z-score approximation
-    let z = (l - expected_l) / var_l.sqrt();
-
-    // One-sided p-value (testing for increasing trend)
-    let pvalue = 1.0 - standard_normal_cdf(z);
-
-    PageTrendResult {
+    let method = match method {
+        PageTrendMethod::Auto if n > 8 || (m > 12 && n > 3) || m > 20 => {
+            PageTrendMethod::Asymptotic
+        }
+        PageTrendMethod::Auto => PageTrendMethod::Exact,
+        chosen => chosen,
+    };
+    let pvalue = if method == PageTrendMethod::Exact {
+        page_l_exact_sf(l, m, n)?
+    } else {
+        // SciPy evaluates E0 and V0 in Python integers before the true division.
+        let (mi, ni) = (m as u128, n as u128);
+        let e0 = (mi * ni * (ni + 1) * (ni + 1)) as f64 / 4.0;
+        let v0 = (mi * ni * ni * (ni + 1) * (ni * ni - 1)) as f64 / 144.0;
+        Normal::standard().sf((l - e0) / v0.sqrt())
+    };
+    Ok(PageTrendResult {
         statistic: l,
         pvalue,
+        method,
+    })
+}
+
+/// SciPy's `_l_p_exact`: `P(L' ≥ trunc(l))` for `rows` independent rows of `k` columns. The
+/// single-row distribution counts `Σ i·π(i)` over all permutations π of `1..=k` (a subset DP,
+/// where SciPy enumerates the permutations; the counts are integers either way). The row
+/// distributions are convolved in the order and summation order of SciPy's recursive
+/// `_PageL.pmf`.
+fn page_l_exact_sf(l: f64, rows: usize, k: usize) -> Result<f64, StatsError> {
+    if k > PAGE_EXACT_MAX_COLUMNS {
+        return Err(StatsError::InvalidArgument(format!(
+            "the exact Page's L distribution is limited to {PAGE_EXACT_MAX_COLUMNS} columns; \
+             use the asymptotic method"
+        )));
     }
+    // One row's L runs from a = Σ i(k+1-i) to b = Σ i².
+    let a = k * (k + 1) * (k + 2) / 6;
+    let b = k * (k + 1) * (2 * k + 1) / 6;
+    // counts[mask][s]: ways to give columns 1..=popcount(mask) the ranks in `mask` with
+    // Σ column·rank = s.
+    let mut counts = vec![vec![0_u64; b + 1]; 1 << k];
+    counts[0][0] = 1;
+    for mask in 0..(1_usize << k) {
+        let column = mask.count_ones() as usize + 1;
+        if column > k {
+            continue;
+        }
+        for rank in 0..k {
+            if mask & (1 << rank) != 0 {
+                continue;
+            }
+            let (from, to) = (mask, mask | (1 << rank));
+            let step = column * (rank + 1);
+            for s in 0..=b - step {
+                let c = counts[from][s];
+                if c != 0 {
+                    counts[to][s + step] += c;
+                }
+            }
+        }
+    }
+    let factorial: u64 = (1..=k as u64).product();
+    let single: Vec<f64> = counts[(1 << k) - 1][a..=b]
+        .iter()
+        .map(|&c| c as f64 / factorial as f64)
+        .collect();
+    // pmf over L for `r` rows lives on [r·a, r·b]; `pmf[i]` is P(L = r·a + i).
+    let mut pmf = single.clone();
+    for r in 2..=rows {
+        let mut next = vec![0.0; r * (b - a) + 1];
+        for (i, slot) in next.iter_mut().enumerate() {
+            let target = r * a + i;
+            let low = target.saturating_sub((r - 1) * b).max(a);
+            let high = (target - (r - 1) * a).min(b);
+            let mut p = 0.0;
+            for t in low..=high {
+                p += pmf[target - t - (r - 1) * a] * single[t - a];
+            }
+            *slot = p;
+        }
+        pmf = next;
+    }
+    // SciPy truncates L with int() before summing the pmf from there to the maximum.
+    let start = (l.trunc() as usize).max(rows * a) - rows * a;
+    Ok(pmf.get(start..).map_or(0.0, |tail| tail.iter().sum()))
 }
 
 /// Compute a weighted Kendall's tau correlation.
@@ -44224,17 +46434,54 @@ pub fn anderson_ksamp(
 const KS_EP128: f64 = 3.402823669209385e38; // 2^128
 const KS_EM128: f64 = 2.938735877055719e-39; // 2^-128
 
-/// x · 2^exp without intermediate overflow (matches numpy.ldexp).
-fn ks_ldexp(mut x: f64, mut exp: i32) -> f64 {
-    while exp > 1000 {
-        x *= 2f64.powi(1000);
-        exp -= 1000;
+/// x · 2^exp with ONE rounding, as C `ldexp` / `numpy.ldexp` (musl `scalbn`). The final
+/// scaling is kept above 2^-53 of the subnormal range so a subnormal result is not rounded
+/// twice.
+fn ks_ldexp(x: f64, exp: i32) -> f64 {
+    const P1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000); // 2^1023
+    const PM969: f64 = f64::from_bits(0x0360_0000_0000_0000); // 2^-1022 · 2^53
+    let mut y = x;
+    let mut n = exp;
+    if n > 1023 {
+        y *= P1023;
+        n -= 1023;
+        if n > 1023 {
+            y *= P1023;
+            n -= 1023;
+            n = n.min(1023);
+        }
+    } else if n < -1022 {
+        y *= PM969;
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= PM969;
+            n += 1022 - 53;
+            n = n.max(-1022);
+        }
     }
-    while exp < -1000 {
-        x *= 2f64.powi(-1000);
-        exp += 1000;
+    y * f64::from_bits(((0x3ff + n) as u64) << 52)
+}
+
+/// Mantissa in [0.5, 1) and binary exponent, as C `frexp` (musl); zero, inf and NaN come
+/// back unchanged with exponent 0.
+fn ks_frexp(x: f64) -> (f64, i32) {
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    if biased == 0 {
+        if x == 0.0 {
+            return (x, 0);
+        }
+        // Subnormal: scale by 2^64 into the normal range first.
+        let (m, e) = ks_frexp(x * f64::from_bits(0x43f0_0000_0000_0000));
+        return (m, e - 64);
     }
-    x * 2f64.powi(exp)
+    if biased == 0x7ff {
+        return (x, 0);
+    }
+    (
+        f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000),
+        biased - 0x3fe,
+    )
 }
 
 fn ks_matmul(a: &[Vec<f64>], b: &[Vec<f64>], m: usize) -> Vec<Vec<f64>> {
@@ -44467,63 +46714,245 @@ fn kolmogn_pomeranz(n: usize, x: f64) -> f64 {
     ans.clamp(0.0, 1.0)
 }
 
-/// Exact SF P(D_n ≥ x) for the two-sided one-sample KS statistic, matching
-/// scipy.stats `_kolmogn(n, x, cdf=False)` (kstwo.sf). Returns `None` only for
-/// the n>140 Pelz-Good body, where the caller uses the asymptotic series.
-/// frankenscipy-ksk1u
-fn kolmogn_sf(n: usize, x: f64) -> Option<f64> {
+/// log(n! / n^n) by Stirling's series with n·log(n) removed up front (scipy
+/// `_log_nfactorial_div_n_pow_n`).
+fn ks_log_nfactorial_div_n_pow_n(n: usize) -> f64 {
+    let nf = n as f64;
+    let rn = 1.0 / nf;
+    nf.ln() / 2.0 - nf + (2.0 * std::f64::consts::PI).ln() / 2.0 + rn * ks_stirling_poly(rn / nf)
+}
+
+/// scipy `_select_and_clip_prob`: the CDF or the SF, clipped to [0, 1] (NaN passes through).
+fn ks_select_and_clip(cdfprob: f64, sfprob: f64, cdf: bool) -> f64 {
+    (if cdf { cdfprob } else { sfprob }).clamp(0.0, 1.0)
+}
+
+/// P(D_n ≤ x) (`cdf = true`) or P(D_n ≥ x) for the two-sided one-sample KS statistic D_n:
+/// scipy.stats `_kolmogn`, dispatch for dispatch (Simard & L'Ecuyer 2011). Exact for
+/// n ≤ 140 (Ruben–Gambino edges, Durbin/MTW, Pomeranz, 2·smirnov); for n > 140 the SF
+/// above n·x² = 2.2 is 2·smirnov and the rest is Durbin/MTW or the Pelz–Good expansion.
+/// frankenscipy-ksk1u, frankenscipy-1ksfv.16
+fn kolmogn(n: usize, x: f64, cdf: bool) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
     if x >= 1.0 {
-        return Some(0.0);
+        return ks_select_and_clip(1.0, 0.0, cdf);
     }
     if x <= 0.0 {
-        return Some(1.0);
+        return ks_select_and_clip(0.0, 1.0, cdf);
     }
     let nf = n as f64;
     let t = nf * x;
     if t <= 1.0 {
-        // Ruben-Gambino, 1/2n ≤ x ≤ 1/n.
+        // Ruben–Gambino: P(D_n ≤ x) = n!/n^n (2t - 1)^n for 1/2n ≤ x ≤ 1/n.
         if t <= 0.5 {
-            return Some(1.0);
+            return ks_select_and_clip(0.0, 1.0, cdf);
         }
-        let cdf = if n <= 140 {
+        let prob = if n <= 140 {
             let mut p = 1.0;
             for i in 1..=n {
-                p *= (i as f64 / nf) * (2.0 * t - 1.0);
+                p *= (i as f64 * (1.0 / nf)) * (2.0 * t - 1.0);
             }
             p
         } else {
-            let rn = 1.0 / nf;
-            let log_nfac = nf.ln() / 2.0 - nf
-                + (2.0 * std::f64::consts::PI).ln() / 2.0
-                + rn * ks_stirling_poly(rn / nf);
-            (log_nfac + nf * (2.0 * t - 1.0).ln()).exp()
+            (ks_log_nfactorial_div_n_pow_n(n) + nf * (2.0 * t - 1.0).ln()).exp()
         };
-        return Some((1.0 - cdf).clamp(0.0, 1.0));
+        return ks_select_and_clip(prob, 1.0 - prob, cdf);
     }
     if t >= nf - 1.0 {
-        return Some((2.0 * (1.0 - x).powi(n as i32)).clamp(0.0, 1.0));
+        // Ruben–Gambino: P(D_n ≥ x) = 2 (1 - x)^n for x ≥ 1 - 1/n.
+        let prob = 2.0 * (1.0 - x).powf(nf);
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
     if x >= 0.5 {
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+        // Exact: the two one-sided events cannot both occur.
+        let prob = 2.0 * ks_smirnov3(n, x).0;
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
-    let nxsq = t * x;
+    let nxsquared = t * x;
     if n <= 140 {
-        if nxsq <= 0.754693 {
-            return Some((1.0 - kolmogn_dmtw(n, x)).clamp(0.0, 1.0));
+        if nxsquared <= 0.754_693 {
+            let prob = kolmogn_dmtw(n, x);
+            return ks_select_and_clip(prob, 1.0 - prob, cdf);
         }
-        if nxsq <= 4.0 {
-            return Some((1.0 - kolmogn_pomeranz(n, x)).clamp(0.0, 1.0));
+        if nxsquared <= 4.0 {
+            let prob = kolmogn_pomeranz(n, x);
+            return ks_select_and_clip(prob, 1.0 - prob, cdf);
         }
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+        // Miller's approximation 2·smirnov.
+        let prob = 2.0 * ks_smirnov3(n, x).0;
+        return ks_select_and_clip(1.0 - prob, prob, cdf);
     }
-    // n > 140.
-    if nxsq >= 2.2 {
-        return Some((2.0 * fsci_special::smirnov(n as i32, x)).clamp(0.0, 1.0));
+    // n > 140: the CDF and the SF have different cutoffs on n·x².
+    if !cdf {
+        if nxsquared >= 370.0 {
+            return 0.0;
+        }
+        if nxsquared >= 2.2 {
+            return (2.0 * ks_smirnov3(n, x).0).clamp(0.0, 1.0);
+        }
     }
-    if n <= 100_000 && nf * x.powf(1.5) <= 1.4 {
-        return Some((1.0 - kolmogn_dmtw(n, x)).clamp(0.0, 1.0));
+    let cdfprob = if nxsquared >= 18.0 {
+        1.0
+    } else if n <= 100_000 && nf * x.powf(1.5) <= 1.4 {
+        kolmogn_dmtw(n, x)
+    } else {
+        kolmogn_pelzgood_cdf(n, x)
+    };
+    ks_select_and_clip(cdfprob, 1.0 - cdfprob, cdf)
+}
+
+/// Density of D_n: scipy.stats `_kolmogn_p`. Closed forms on the Ruben–Gambino edges,
+/// 2·ksone.pdf for x ≥ 1/2, and elsewhere SciPy's 5-point central difference of the CDF with
+/// its step x/2^16 (kept inside (1/n, 1/2), the CDF being a piecewise polynomial).
+/// frankenscipy-1ksfv.16
+fn kolmogn_p(n: usize, x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
     }
-    Some((1.0 - kolmogn_pelzgood_cdf(n, x)).clamp(0.0, 1.0))
+    if x >= 1.0 || x <= 0.0 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let t = nf * x;
+    if t <= 1.0 {
+        // d/dx n!/n^n (2t - 1)^n = 2 n² · n!/n^n (2t - 1)^(n-1)
+        if t <= 0.5 {
+            return 0.0;
+        }
+        let prd = if n <= 140 {
+            let mut p = 1.0;
+            for i in 1..n {
+                p *= (i as f64 * (1.0 / nf)) * (2.0 * t - 1.0);
+            }
+            p
+        } else {
+            (ks_log_nfactorial_div_n_pow_n(n) + (nf - 1.0) * (2.0 * t - 1.0).ln()).exp()
+        };
+        return prd * 2.0 * (nf * nf);
+    }
+    if t >= nf - 1.0 {
+        // d/dx (1 - 2(1 - x)^n) = 2n (1 - x)^(n-1)
+        return 2.0 * (1.0 - x).powf(nf - 1.0) * nf;
+    }
+    if x >= 0.5 {
+        return 2.0 * ks_smirnov3(n, x).2;
+    }
+    let delta = (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x);
+    let weights = [1.0 / 12.0, -8.0 / 12.0, 0.0 / 12.0, 8.0 / 12.0, -1.0 / 12.0];
+    // SciPy's _kolmogn_p differentiates the CDF with this stencil everywhere. Where the CDF is
+    // near 1 the differences keep only a few of its digits: SciPy's kstwo.pdf(0.1107, 1000) is
+    // 3.5e-4 off a difference of its own sf, and this port's CDF noise put fsci 7.4e-3 off.
+    // In that deep tail (sf < 1e-3) the stencil runs on −sf, which keeps its relative
+    // precision. Elsewhere it stays on the CDF as SciPy's does: there the CDF stencil is
+    // accurate, and for n > 140 the sf is a different approximation (2·smirnov against
+    // Pelz–Good), whose derivative moved pdf(0.146, 141) by 4.7e-5.
+    let upper = kolmogn(n, x, false) < 1e-3;
+    let mut val = 0.0;
+    for (k, w) in weights.iter().enumerate() {
+        let xk = x + (k as f64 - 2.0) * delta;
+        val += if upper {
+            -w * kolmogn(n, xk, false)
+        } else {
+            w * kolmogn(n, xk, true)
+        };
+    }
+    val / delta
+}
+
+/// The x with P(D_n ≤ x) = p, given p and its complement q = 1 - p: scipy.stats
+/// `_kolmogni`. Closed forms on the Ruben–Gambino edges; otherwise SciPy's brentq
+/// (xtol = 1e-14, rtol = 4·eps, maxiter = 100) on [1/n, min(kolmogci(p)/√n, 1 - 1/n)] for
+/// `cdf(x) - p`.
+///
+/// `upper = true` runs that brentq on `q - sf(x)` from [1/n, min(kolmogi(q)/√n, 1 - 1/n)]
+/// instead, which is what `isf` needs for q < 1/2. SciPy's `kstwo.isf` takes the CDF route
+/// at p = 1 - q, which rounds away the digits of q below eps/q and, for n > 140, inverts the
+/// Pelz–Good CDF rather than the 2·smirnov SF: `kstwo.sf(kstwo.isf(q))` misses q by 1.4e-5
+/// (n = 141, q = 1e-3) up to 100 % (`kstwo.isf(1e-20, 100) = 0.99`, where `kstwo.sf` is
+/// 2e-200). frankenscipy-1ksfv.16
+fn kolmogni(n: usize, p: f64, q: f64, upper: bool) -> f64 {
+    let nf = n as f64;
+    if p <= 0.0 {
+        return 1.0 / nf;
+    }
+    if q <= 0.0 {
+        return 1.0;
+    }
+    let delta = ((p.ln() - ln_gamma(nf + 1.0)) / nf).exp();
+    if delta <= 1.0 / nf {
+        return (delta + 1.0 / nf) / 2.0;
+    }
+    let x = -((q / 2.0).ln() / nf).exp_m1();
+    if x >= 1.0 - 1.0 / nf {
+        return x;
+    }
+    let (lo, hi_cap) = (1.0 / nf, 1.0 - 1.0 / nf);
+    let (xtol, rtol) = (1e-14, 4.0 * f64::EPSILON);
+    if upper {
+        let x1 = (fsci_special::kolmogi_pair(q, p) / nf.sqrt()).min(hi_cap);
+        return ks_brentq(|x| q - kolmogn(n, x, false), lo, x1, xtol, rtol, 100);
+    }
+    // SciPy's private `_kolmogci(p)`: the cdf-side inverse.
+    let x1 = (fsci_special::kolmogi_pair(1.0 - p, p) / nf.sqrt()).min(hi_cap);
+    ks_brentq(|x| kolmogn(n, x, true) - p, lo, x1, xtol, rtol, 100)
+}
+
+/// (E[D_n], E[D_n²]) of the law whose CDF `kolmogn` reports: E[X^k] = ∫₀¹ k x^(k-1)
+/// (1 - cdf(x)) dx, with cdf = 0 below the support edge 1/2n.
+///
+/// Adaptive Gauss–Kronrod between the places where `kolmogn` switches formula (the
+/// Ruben–Gambino edges, 1/2, n·x² = 0.754693, 4, 18 and n·x^1.5 = 1.4), truncated at
+/// √(40/n): past it Massart's P(D_n ≥ x) ≤ 2 e^(-2n x²) bounds the dropped mass by 4e-35.
+/// The CDF's knots at the multiples of 1/2n need no breakpoints: adding every one of them
+/// moved no mean or variance for n ≤ 140 by more than 5.9e-14 (relative) and cost 6×.
+///
+/// 1 - cdf rather than sf: for n > 140 the two are different approximations on
+/// 2.2 ≤ n x² < 18 (Pelz–Good vs 2·smirnov), and SciPy's `kstwo.mean` integrates x·pdf with
+/// the pdf taken from the CDF. The 2·smirnov SF is also ~10^4 times dearer to evaluate at
+/// n = 10^5.
+fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
+    let nf = n as f64;
+    let a = 0.5 / nf;
+    let hi = (40.0 / nf).sqrt().min(1.0);
+    let mut cuts = vec![
+        a,
+        hi,
+        1.0 / nf,
+        0.5,
+        1.0 - 1.0 / nf,
+        (0.754_693 / nf).sqrt(),
+        (4.0 / nf).sqrt(),
+        (18.0 / nf).sqrt(),
+        (1.4 / nf).powf(2.0 / 3.0),
+    ];
+    cuts.retain(|&c| c >= a && c <= hi);
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    let integrand = |x: f64| {
+        let upper = 1.0 - kolmogn(n, x, true);
+        vec![upper, 2.0 * x * upper]
+    };
+    let (mut m1, mut m2) = (a, a * a);
+    for w in cuts.windows(2) {
+        // GK15/G7 bisection to 1e-15 of the panel width (depth <= 12); valid finite bounds
+        // and tolerances, so quad_vec cannot fail here.
+        let options = fsci_integrate::QuadOptions {
+            epsabs: 1e-15 * (w[1] - w[0]),
+            epsrel: 0.0,
+            limit: 12,
+        };
+        let Ok(r) = fsci_integrate::quad_vec(integrand, w[0], w[1], options) else {
+            return (f64::NAN, f64::NAN);
+        };
+        let [i1, i2] = r.integral[..] else {
+            return (f64::NAN, f64::NAN);
+        };
+        m1 += i1;
+        m2 += i2;
+    }
+    (m1, m2)
 }
 
 /// Pelz-Good theta-function approximation to the CDF P(D_n ≤ x). Port of
@@ -44636,6 +47065,502 @@ fn ks_stirling_poly(z: f64) -> f64 {
     acc
 }
 
+// ── xsf `cephes/dd_real.h` + `cephes/kolmogorov.h` and SciPy `brentq.c`, the pieces that
+// `scipy.stats.kstwo` calls through `scipy.special` / `scipy.optimize`. frankenscipy-1ksfv.16
+
+/// Unevaluated sum `hi + lo`: the double-double subset of xsf `cephes/dd_real.h` (Bailey's
+/// QD, Briggs–Kahan addition) that `_smirnov` uses, operation for operation.
+#[derive(Clone, Copy, Debug)]
+struct KsDd {
+    hi: f64,
+    lo: f64,
+}
+
+fn ks_quick_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let c = s - a;
+    (s, b - c)
+}
+
+fn ks_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let c = s - a;
+    let d = b - c;
+    let e = s - c;
+    (s, (a - e) + d)
+}
+
+fn ks_two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, a.mul_add(b, -p))
+}
+
+impl KsDd {
+    const fn new(hi: f64) -> Self {
+        Self { hi, lo: 0.0 }
+    }
+
+    fn is_zero(self) -> bool {
+        self.hi == 0.0 && self.lo == 0.0
+    }
+
+    fn neg(self) -> Self {
+        Self {
+            hi: -self.hi,
+            lo: -self.lo,
+        }
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, rhs.hi);
+        let (t1, t2) = ks_two_sum(self.lo, rhs.lo);
+        let (s1, s2) = ks_quick_two_sum(s1, s2 + t1);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + t2);
+        Self { hi, lo }
+    }
+
+    fn add_f64(self, rhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, rhs);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
+        Self { hi, lo }
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        self.add(rhs.neg())
+    }
+
+    fn sub_f64(self, rhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(self.hi, -rhs);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 + self.lo);
+        Self { hi, lo }
+    }
+
+    /// `lhs - self` for a plain `lhs`.
+    fn sub_from_f64(self, lhs: f64) -> Self {
+        let (s1, s2) = ks_two_sum(lhs, -self.hi);
+        let (hi, lo) = ks_quick_two_sum(s1, s2 - self.lo);
+        Self { hi, lo }
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let (p1, p2) = ks_two_prod(self.hi, rhs.hi);
+        let (hi, lo) = ks_quick_two_sum(p1, p2 + (self.hi * rhs.lo + self.lo * rhs.hi));
+        Self { hi, lo }
+    }
+
+    fn mul_f64(self, rhs: f64) -> Self {
+        let (p1, e1) = ks_two_prod(self.hi, rhs);
+        let (p2, e2) = ks_two_prod(self.lo, rhs);
+        let (hi, lo) = ks_quick_two_sum(p1, e2 + p2 + e1);
+        Self { hi, lo }
+    }
+
+    fn div(self, rhs: Self) -> Self {
+        let q1 = self.hi / rhs.hi;
+        let r = self.sub(rhs.mul_f64(q1));
+        let q2 = r.hi / rhs.hi;
+        let r = r.sub(rhs.mul_f64(q2));
+        let q3 = r.hi / rhs.hi;
+        let (hi, lo) = ks_quick_two_sum(q1, q2);
+        Self { hi, lo }.add_f64(q3)
+    }
+
+    fn div_f64(self, rhs: f64) -> Self {
+        self.div(Self::new(rhs))
+    }
+
+    /// `lhs / self` for a plain `lhs`.
+    fn div_into_f64(self, lhs: f64) -> Self {
+        Self::new(lhs).div(self)
+    }
+
+    fn floor(self) -> Self {
+        let hi = self.hi.floor();
+        if hi == self.hi {
+            // The high word is an integer already: round the low word.
+            let (hi, lo) = ks_quick_two_sum(hi, self.lo.floor());
+            return Self { hi, lo };
+        }
+        Self { hi, lo: 0.0 }
+    }
+
+    fn ldexp(self, exp: i32) -> Self {
+        Self {
+            hi: ks_ldexp(self.hi, exp),
+            lo: ks_ldexp(self.lo, exp),
+        }
+    }
+
+    fn frexp(self) -> (Self, i32) {
+        let (mut man, mut exponent) = ks_frexp(self.hi);
+        let mut b1 = ks_ldexp(self.lo, -exponent);
+        if man.abs() == 0.5 && man * b1 < 0.0 {
+            man *= 2.0;
+            b1 *= 2.0;
+            exponent -= 1;
+        }
+        (Self { hi: man, lo: b1 }, exponent)
+    }
+}
+
+/// a^m (xsf `pow_D`): `pow` of the high word, corrected to first order in lo/hi.
+fn ks_pow_dd(a: KsDd, m: i64) -> KsDd {
+    if m <= 0 {
+        if m == 0 {
+            return KsDd::new(1.0);
+        }
+        return ks_pow_dd(a, -m).div_into_f64(1.0);
+    }
+    if a.is_zero() {
+        return KsDd::new(0.0);
+    }
+    let mf = m as f64;
+    let ans = a.hi.powf(mf);
+    let r = a.lo / a.hi;
+    let mut adj = mf * r;
+    if adj.abs() > 1e-8 {
+        if adj.abs() < 1e-4 {
+            // First two Taylor terms of (1 + r)^m.
+            adj += (mf * r) * ((m - 1) as f64 / 2.0 * r);
+        } else {
+            adj = (mf * r.ln_1p()).exp_m1();
+        }
+    }
+    KsDd::new(ans).add_f64(ans * adj)
+}
+
+/// ((a + b) / (c + d))^m (xsf `pow4_D`).
+fn ks_pow4_dd(a: f64, b: f64, c: f64, d: f64, m: i64) -> KsDd {
+    if m <= 0 {
+        if m == 0 {
+            return KsDd::new(1.0);
+        }
+        return ks_pow4_dd(c, d, a, b, -m);
+    }
+    let num = KsDd::new(a).add_f64(b);
+    let den = KsDd::new(c).add_f64(d);
+    if num.is_zero() {
+        return if den.is_zero() {
+            KsDd::new(f64::NAN)
+        } else {
+            KsDd::new(0.0)
+        };
+    }
+    if den.is_zero() {
+        let negative = num.hi < 0.0 || (num.hi == 0.0 && num.lo < 0.0);
+        return KsDd::new(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    ks_pow_dd(num.div(den), m)
+}
+
+/// xsf `nextPowerOf2` (which, despite the name, rounds `x` up by one ulp-ish step).
+fn ks_next_power_of_2(x: f64) -> f64 {
+    let q = ks_ldexp(x, 1 - 53);
+    let l = (q + x).abs();
+    if l == 0.0 {
+        return x.abs();
+    }
+    let lint = l as i32;
+    if f64::from(lint) == l {
+        f64::from(lint)
+    } else {
+        l
+    }
+}
+
+/// a^m as (significand, binary exponent) so it cannot underflow (xsf `pow2Scaled_D`).
+fn ks_pow2_scaled_dd(a: KsDd, m: i64) -> (KsDd, i64) {
+    const SM_MAX_EXPONENT: i64 = 960;
+    if m <= 0 {
+        if m == 0 {
+            return (KsDd::new(1.0), 0);
+        }
+        let (ans, e1) = ks_pow2_scaled_dd(a, -m);
+        let (ans, e2) = ans.div_into_f64(1.0).frexp();
+        return (ans, -e1 + i64::from(e2));
+    }
+    let (y, ye) = a.frexp();
+    let ye = i64::from(ye);
+    if m == 1 {
+        return (y, ye);
+    }
+    let mf = m as f64;
+    let mut max_expt = SM_MAX_EXPONENT;
+    // y^max_expt must stay >= 2^-960; check cheaply before calling log().
+    if mf * (y.hi - 1.0) / y.hi < -(SM_MAX_EXPONENT as f64) * std::f64::consts::LN_2 {
+        let lg2y = y.hi.ln() / std::f64::consts::LN_2;
+        let lg_ans = mf * lg2y;
+        if lg_ans <= -(SM_MAX_EXPONENT as f64) {
+            max_expt = (ks_next_power_of_2(-(SM_MAX_EXPONENT as f64) / lg2y + 1.0) / 2.0) as i64;
+        }
+    }
+    if m <= max_expt {
+        let (ans, ans_e) = ks_pow_dd(y, m).frexp();
+        return (ans, i64::from(ans_e) + m * ye);
+    }
+    // y^m = (y^max_expt)^q · y^r
+    let q = m / max_expt;
+    let r = m % max_expt;
+    let (y2r, y2r_e) = ks_pow2_scaled_dd(y, r);
+    let (y2m, y2m_e) = ks_pow2_scaled_dd(y, max_expt);
+    let (y2mq, y2mq_e) = ks_pow2_scaled_dd(y2m, q);
+    let (ans, ans_e) = y2r.mul(y2mq).frexp();
+    (
+        ans,
+        i64::from(ans_e) + (y2mq_e + y2m_e * q) + y2r_e + m * ye,
+    )
+}
+
+/// C(n, j) stored as (significand, exponent), advanced to C(n, j + 1) (xsf `updateBinomial`).
+fn ks_update_binomial(cman: &mut KsDd, cexpt: &mut i64, n: i64, j: i64) {
+    let rat = KsDd::new((n - j) as f64).div_f64(j as f64 + 1.0);
+    let (man, expt) = cman.mul(rat).frexp();
+    *cexpt += i64::from(expt);
+    *cman = man;
+}
+
+/// A_v(n, x) = C(n, v) (1 - x - v/n)^(n-v) (x + v/n)^(v-1) (xsf `computeAv`).
+fn ks_smirnov_term(n: i64, x: f64, v: i64, cman: KsDd, cexpt: i64) -> KsDd {
+    let t2x = KsDd::new((n - v) as f64).div_f64(n as f64).sub_f64(x);
+    let (t2, t2e) = ks_pow2_scaled_dd(t2x, n - v);
+    let t1x = KsDd::new(v as f64).div_f64(n as f64).add_f64(x);
+    let (t1, t1e) = ks_pow2_scaled_dd(t1x, v - 1);
+    let expt = cexpt + t1e + t2e;
+    // Beyond ±2^31 the value is 0 or inf either way; clamp so the i32 ldexp cannot wrap.
+    t1.mul(t2)
+        .mul(cman)
+        .ldexp(expt.clamp(-(1 << 30), 1 << 30) as i32)
+}
+
+/// (sf, cdf, pdf) of the one-sided statistic D_n^+: `scipy.special.smirnov`, `smirnovc` and
+/// `-smirnovp`, ported from xsf `cephes::detail::_smirnov` (Birnbaum–Tingey sum in
+/// double-double; van Mulbregt 2018). `n` is 64-bit here where xsf has a C `int`; the two
+/// agree for every `n <= i32::MAX`.
+fn ks_smirnov3(n: usize, x: f64) -> (f64, f64, f64) {
+    const SMIRNOV_MAX_COMPUTE_N: i64 = 1_000_000;
+    const SM_UPPER_MAX_TERMS: i64 = 3;
+    const SM_UPPERSUM_MIN_N: i64 = 10;
+    // log(2^-1075): exp() of anything below returns 0 (xsf `MINLOG`).
+    #[allow(clippy::excessive_precision)]
+    const MINLOG: f64 = -7.451_332_191_019_412_076_235e2;
+    let n = n as i64;
+    if !(n > 0 && (0.0..=1.0).contains(&x)) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let nf = n as f64;
+    if n == 1 {
+        return (1.0 - x, x, 1.0);
+    }
+    if x == 0.0 {
+        return (1.0, 0.0, 1.0);
+    }
+    if x == 1.0 {
+        return (0.0, 1.0, 0.0);
+    }
+    // floor(n x) and its remainder, exactly (xsf `modNX`).
+    let nx_dd = KsDd::new(x).mul_f64(nf);
+    let nx_floor = nx_dd.floor();
+    let mut alpha = nx_dd.sub(nx_floor).hi;
+    let mut nxfl = nx_floor.hi as i64;
+    if alpha == 1.0 {
+        nxfl += 1;
+        alpha = 0.0;
+    }
+    let nx = nx_dd.hi;
+    let mut n1mxfl = n - nxfl - i64::from(alpha != 0.0);
+    let mut n1mxceil = n - nxfl;
+    // With alpha == 0 the last term belongs to neither sum.
+    if alpha == 0.0 {
+        n1mxfl -= 1;
+        n1mxceil += 1;
+    }
+    // x <= 1/n
+    if nxfl == 0 || (nxfl == 1 && alpha == 0.0) {
+        let t = ks_pow_dd(KsDd::new(1.0).add_f64(x), n - 1).hi;
+        let mut pdf = (nx + 1.0) * t / (1.0 + x);
+        let cdf = x * t;
+        if nxfl == 1 {
+            pdf -= 0.5;
+        }
+        return (1.0 - cdf, cdf, pdf);
+    }
+    // sf underflows.
+    if -2.0 * nf * x * x < MINLOG {
+        return (0.0, 1.0, 0.0);
+    }
+    // x >= 1 - 1/n
+    if nxfl >= n - 1 {
+        let sf = ks_pow_dd(KsDd::new(1.0).add_f64(-x), n).hi;
+        return (sf, 1.0 - sf, nf * sf / (1.0 - x));
+    }
+    // n too large to sum: p ~ exp(-(6nx + 1)^2 / 18n).
+    if n > SMIRNOV_MAX_COMPUTE_N {
+        let logp = -(6.0 * nf * x + 1.0).powi(2) / 18.0 / nf;
+        let (sf, cdf) = if logp < -std::f64::consts::LN_2 {
+            let sf = logp.exp();
+            (sf, 1.0 - sf)
+        } else {
+            let cdf = -logp.exp_m1();
+            (1.0 - cdf, cdf)
+        };
+        return (sf, cdf, (6.0 * nf * x + 1.0) * 2.0 * sf / 3.0);
+    }
+    // The upper sum alternates in sign; use it only when it has very few terms.
+    let n_upper_terms = n - n1mxceil + 1;
+    let use_upper = (n_upper_terms <= 1 && x < 0.5)
+        || (n >= SM_UPPERSUM_MIN_N && n_upper_terms <= SM_UPPER_MAX_TERMS && x <= 0.5 / nf.sqrt());
+    let vmid = n / 2;
+    let one_over_x = KsDd::new(1.0).div_f64(x);
+    let (start, step, n_terms, mut aj, first_coeff) = if use_upper {
+        let aj = ks_pow4_dd(1.0, x, 1.0, 0.0, n - 1);
+        let coeff = KsDd::new(1.0).add_f64(x).div_into_f64((n - 1) as f64);
+        (n, -1, n - n1mxceil + 1, aj, coeff.add(one_over_x))
+    } else {
+        let aj = ks_pow4_dd(1.0, -x, 1.0, 0.0, n).div_f64(x);
+        let coeff = KsDd::new((n - 1) as f64)
+            .mul_f64(x)
+            .sub_from_f64(-1.0)
+            .div(KsDd::new(1.0).sub_f64(x))
+            .div_f64(x);
+        (0, 1, n1mxfl + 1, aj, coeff.add(one_over_x))
+    };
+    let mut aj_sum = KsDd::new(0.0).add(aj);
+    let mut daj_sum = KsDd::new(0.0).add(aj.mul(first_coeff));
+    let mut cman = KsDd::new(1.0);
+    let mut cexpt = 0_i64;
+    ks_update_binomial(&mut cman, &mut cexpt, n, 0);
+    let mut j = 1_i64;
+    while j < n_terms {
+        let v = start + j * step;
+        aj = ks_smirnov_term(n, x, v, cman, cexpt);
+        if aj.hi.is_finite() && !aj.is_zero() {
+            // d/dx log A_v = 1/x + (v-1)/(x+v/n) - (n-v)/(1-x-v/n)
+            let coeff = KsDd::new((nxfl + v) as f64)
+                .add_f64(alpha)
+                .div_into_f64(nf * (v - 1) as f64)
+                .sub(
+                    KsDd::new((n - nxfl - v) as f64)
+                        .sub_f64(alpha)
+                        .div_into_f64((n - v) as f64 * nf),
+                )
+                .add(one_over_x);
+            aj_sum = aj_sum.add(aj);
+            daj_sum = daj_sum.add(aj.mul(coeff));
+        }
+        if !aj.is_zero() {
+            if (4 * (n_terms - j)) as f64 * aj.hi.abs() < f64::EPSILON * aj_sum.hi
+                && j != n_terms - 1
+            {
+                break;
+            }
+        } else if j > vmid {
+            break;
+        }
+        ks_update_binomial(&mut cman, &mut cexpt, n, j);
+        j += 1;
+    }
+    let deriv = daj_sum.mul_f64(x).hi;
+    let prob = aj_sum.mul_f64(x).hi;
+    let (sf, cdf, pdf) = if step < 0 {
+        (1.0 - prob, prob, deriv)
+    } else {
+        (prob, 1.0 - prob, -deriv)
+    };
+    (sf.clamp(0.0, 1.0), cdf.clamp(0.0, 1.0), 0.0_f64.max(pdf))
+}
+
+/// SciPy's `brentq` (`scipy/optimize/Zeros/brentq.c`, C. Harris), step for step. Returns NaN
+/// where SciPy raises: no sign change on the bracket, a NaN function value, or no
+/// convergence within `maxiter`.
+fn ks_brentq(
+    f: impl Fn(f64) -> f64,
+    xa: f64,
+    xb: f64,
+    xtol: f64,
+    rtol: f64,
+    maxiter: usize,
+) -> f64 {
+    let (mut xpre, mut xcur) = (xa, xb);
+    let (mut xblk, mut fblk, mut spre, mut scur) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut fpre = f(xpre);
+    let mut fcur = f(xcur);
+    if fpre.is_nan() || fcur.is_nan() {
+        return f64::NAN;
+    }
+    if fpre == 0.0 {
+        return xpre;
+    }
+    if fcur == 0.0 {
+        return xcur;
+    }
+    if fpre.is_sign_negative() == fcur.is_sign_negative() {
+        return f64::NAN;
+    }
+    for _ in 0..maxiter {
+        if fpre != 0.0 && fcur != 0.0 && fpre.is_sign_negative() != fcur.is_sign_negative() {
+            xblk = xpre;
+            fblk = fpre;
+            spre = xcur - xpre;
+            scur = spre;
+        }
+        if fblk.abs() < fcur.abs() {
+            xpre = xcur;
+            xcur = xblk;
+            xblk = xpre;
+            fpre = fcur;
+            fcur = fblk;
+            fblk = fpre;
+        }
+        let delta = (xtol + rtol * xcur.abs()) / 2.0;
+        let sbis = (xblk - xcur) / 2.0;
+        if fcur == 0.0 || sbis.abs() < delta {
+            return xcur;
+        }
+        if spre.abs() > delta && fcur.abs() < fpre.abs() {
+            let stry = if xpre == xblk {
+                // interpolate
+                -fcur * (xcur - xpre) / (fcur - fpre)
+            } else {
+                // extrapolate
+                let dpre = (fpre - fcur) / (xpre - xcur);
+                let dblk = (fblk - fcur) / (xblk - xcur);
+                -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))
+            };
+            let limit = if spre.abs() < 3.0 * sbis.abs() - delta {
+                spre.abs()
+            } else {
+                3.0 * sbis.abs() - delta
+            };
+            if 2.0 * stry.abs() < limit {
+                spre = scur;
+                scur = stry;
+            } else {
+                spre = sbis;
+                scur = sbis;
+            }
+        } else {
+            spre = sbis;
+            scur = sbis;
+        }
+        xpre = xcur;
+        fpre = fcur;
+        if scur.abs() > delta {
+            xcur += scur;
+        } else {
+            xcur += if sbis > 0.0 { delta } else { -delta };
+        }
+        fcur = f(xcur);
+        if fcur.is_nan() {
+            return f64::NAN;
+        }
+    }
+    f64::NAN
+}
+
 /// When `true`, [`ks_1samp`] computes its KS statistic serially (the ORIG behaviour); default `false`
 /// fans the independent per-point CDF evaluations + max reduction across cores for large inputs.
 /// Byte-identical. A/B knob.
@@ -44715,14 +47640,9 @@ pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessO
         parts.into_iter().fold(0.0_f64, nan_max)
     };
 
-    // scipy's two-sided ks_1samp uses the EXACT KS distribution for n ≤ 10000
-    // (method='auto'); only the n>140 Pelz-Good body falls back to the
-    // asymptotic Kolmogorov series. frankenscipy-ksk1u
-    let pvalue = if !d_stat.is_nan() && n <= 10_000 {
-        kolmogn_sf(n, d_stat).unwrap_or_else(|| kolmogorov_pvalue(d_stat, nf))
-    } else {
-        kolmogorov_pvalue(d_stat, nf)
-    };
+    // SciPy's two-sided ks_1samp (method='auto') always uses the exact law,
+    // `pvalue = kstwo.sf(D, n)`, for every n. frankenscipy-ksk1u, frankenscipy-1ksfv.16
+    let pvalue = kolmogn(n, d_stat, false);
 
     GoodnessOfFitResult {
         statistic: d_stat,
@@ -52655,9 +55575,12 @@ pub fn r_to_d(r: f64) -> f64 {
 
 /// Cramér's V: association measure for contingency tables.
 ///
-/// V = sqrt(χ²/(n * min(r-1, c-1))), where χ² is the chi-squared statistic.
+/// V = sqrt(χ²/(n * min(r-1, c-1))), where χ² is the chi-squared statistic WITHOUT Yates'
+/// continuity correction, as `scipy.stats.contingency.association(method='cramer')` computes it
+/// by default (`correction=False`). The correction only changes 2x2 tables, which is why a 2x3
+/// reference value could not tell the two apart.
 pub fn cramers_v(observed: &[Vec<f64>]) -> f64 {
-    let result = chi2_contingency(observed, true);
+    let result = chi2_contingency(observed, false);
     let n: f64 = observed.iter().flat_map(|row| row.iter()).sum();
     let r = observed.len();
     if r == 0 {
@@ -52944,14 +55867,26 @@ where
         bootstrap_sorted_quantile(&ordered, alpha),
         bootstrap_sorted_quantile(&ordered, 1.0 - alpha),
     );
-    let confidence_interval = match method.method {
-        BootstrapIntervalMethod::Percentile => percentile,
-        BootstrapIntervalMethod::Basic => {
-            (2.0 * observed - percentile.1, 2.0 * observed - percentile.0)
-        }
+    // SciPy warns when the quantiles it takes of the bootstrap distribution (at the BCa-adjusted
+    // levels for BCa) come out NaN, before the basic interval reflects them about `observed`.
+    let quantiles = match method.method {
+        BootstrapIntervalMethod::Percentile | BootstrapIntervalMethod::Basic => percentile,
         BootstrapIntervalMethod::Bca => {
             bootstrap_bca_interval(data, &statistic, observed, &distribution, &ordered, alpha)
         }
+    };
+    if quantiles.0.is_nan() || quantiles.1.is_nan() {
+        fsci_runtime::warn(
+            WarningCategory::DegenerateDataWarning,
+            "The BCa confidence interval cannot be calculated. This problem is known to occur \
+             when the distribution is degenerate or the statistic is np.min.",
+        );
+    }
+    let confidence_interval = match method.method {
+        BootstrapIntervalMethod::Basic => {
+            (2.0 * observed - quantiles.1, 2.0 * observed - quantiles.0)
+        }
+        BootstrapIntervalMethod::Percentile | BootstrapIntervalMethod::Bca => quantiles,
     };
 
     Ok(BootstrapResult {
@@ -55690,6 +58625,12 @@ pub fn logsumexp(x: &[f64]) -> f64 {
     }
     let max_x = par_max_fold(x);
     if !max_x.is_finite() {
+        // `par_max_fold` skips a NaN, so ±inf here can hide one, and an all-NaN input reads as
+        // −inf. numpy's max is NaN there, and so is scipy.special.logsumexp. On the finite path
+        // a NaN already reaches the sum.
+        if x.iter().any(|v| v.is_nan()) {
+            return f64::NAN;
+        }
         return max_x;
     }
     // `Σ exp(xᵢ − max_x)` — the per-element `exp` is a heavy transcendental (compute-bound). Sum it in
@@ -55736,6 +58677,11 @@ pub fn logsumexp_weighted(a: &[f64], b: &[f64]) -> f64 {
     }
     let max_a = a.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max_a.is_finite() {
+        // As in `logsumexp`: the fold skipped any NaN in `a`, and this early return also skips
+        // the sum that would carry a NaN in `b`. scipy.special.logsumexp is NaN for either.
+        if a.iter().chain(b).any(|v| v.is_nan()) {
+            return f64::NAN;
+        }
         return max_a;
     }
     let sum = a
@@ -62793,14 +65739,23 @@ pub fn gof_statistic<D: ContinuousDistribution>(
             -nf - s
         }
         GofStatistic::KolmogorovSmirnov => {
+            // NaN-propagating, as the numpy `max` in SciPy's `_ks_statistic` is: `f64::max` would
+            // drop a NaN cdf value and report the distance over the remaining points.
+            let nan_max = |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            };
             let mut d_plus = f64::NEG_INFINITY;
             let mut d_minus = f64::NEG_INFINITY;
             for (i, &xi) in x.iter().enumerate() {
                 let f = dist.cdf(xi);
-                d_plus = d_plus.max((i + 1) as f64 / nf - f);
-                d_minus = d_minus.max(f - i as f64 / nf);
+                d_plus = nan_max(d_plus, (i + 1) as f64 / nf - f);
+                d_minus = nan_max(d_minus, f - i as f64 / nf);
             }
-            d_plus.max(d_minus)
+            nan_max(d_plus, d_minus)
         }
         GofStatistic::CramerVonMises => {
             let mut acc = 0.0;
@@ -63341,7 +66296,16 @@ impl<D: ContinuousDistribution> Mixture<D> {
                 }
             })
             .collect();
-        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // NaN-propagating, as numpy's max is: `f64::max` would drop a NaN term, and when every
+        // term is NaN (x = NaN) the −inf seed would pass the test below and return −inf where
+        // SciPy's Mixture returns NaN.
+        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, |m, t| {
+            if m.is_nan() || t.is_nan() {
+                f64::NAN
+            } else {
+                m.max(t)
+            }
+        });
         if hi == f64::NEG_INFINITY {
             return f64::NEG_INFINITY;
         }
@@ -63567,6 +66531,29 @@ mod mixture_matches_scipy {
             Mixture::new(vec![Normal::standard(), Normal::new(3.0, 1.0)], &[0.0, 1.0]).is_ok(),
             "one zero weight is legal"
         );
+    }
+
+    /// SciPy 1.17.1, same fixture: `logpdf`, `logcdf` and `logccdf` at NaN are all NaN; at 0.0
+    /// they are -2.439546171981445, -0.8082737199525145 and -0.5899169546601949. fsci's
+    /// log-sum-exp folded its terms with `f64::max`, so an all-NaN set of terms left the −inf
+    /// seed, which took the "every term is −inf" exit and returned −inf.
+    #[test]
+    fn log_forms_at_nan_are_nan_like_scipy() {
+        let m = fixture();
+        for (name, v) in [
+            ("logpdf", m.logpdf(f64::NAN)),
+            ("logcdf", m.logcdf(f64::NAN)),
+            ("logsf", m.logsf(f64::NAN)),
+        ] {
+            assert!(v.is_nan(), "{name}(NaN): SciPy is NaN, fsci gave {v}");
+        }
+        for (got, want) in [
+            (m.logpdf(0.0), -2.439_546_171_981_445),
+            (m.logcdf(0.0), -0.808_273_719_952_514_5),
+            (m.logsf(0.0), -0.589_916_954_660_194_9),
+        ] {
+            assert!((got - want).abs() < 1e-12, "got {got}, SciPy {want}");
+        }
     }
 }
 
@@ -65725,7 +68712,13 @@ mod tests {
         let r0 = [1.0, 1.0 + d10, 3.0, 4.0];
         let r1 = [2.0, 2.0 + d10, 5.0, 6.0];
         let r2 = [3.0, 3.0 + d10, 7.0, 8.0];
-        let pt = page_trend_test(&[&r0[..], &r1[..], &r2[..]]);
+        let pt = page_trend_test(
+            &[&r0[..], &r1[..], &r2[..]],
+            false,
+            None,
+            PageTrendMethod::Auto,
+        )
+        .expect("page_trend_test");
         assert!(
             (pt.statistic - 90.0).abs() < 1e-9,
             "page_trend L {} != scipy 90.0 (tolerance grouping gives 88.5)",
@@ -66236,6 +69229,30 @@ mod tests {
         }
     }
 
+    /// frankenscipy-g9yid: NoncentralT::sf was nctdtr at the reflected, negative t, i.e.
+    /// `1 − cdf`, and cancelled to 0 below ~1e-16. Expected values are mpmath quadrature (34
+    /// digits; scratchpad nct_tail/refs.json). Both the mean's side (df 5, nc 3: SciPy's nct.sf
+    /// agrees, 1.0e-30) and across zero (df 30, nc −10: SciPy's nct.sf gives 1.5e-30, its
+    /// complement series cancelling) were 0 in fsci.
+    #[test]
+    fn noncentral_t_sf_keeps_its_upper_tail() {
+        for (df, nc, x, want) in [
+            (5.0, 3.0, 4_405_362.281_620_58, 9.999_999_999_993_671e-31),
+            (
+                30.0,
+                -10.0,
+                1.728_399_704_847_42,
+                1.000_000_000_000_881_6e-30,
+            ),
+        ] {
+            let got = NoncentralT::new(df, nc).sf(x);
+            assert!(
+                (got - want).abs() <= 1e-13 * want,
+                "NoncentralT({df}, {nc}).sf({x:e}) = {got:e}, mpmath {want:e}"
+            );
+        }
+    }
+
     #[test]
     fn noncentral_t_cdf_ppf_route_to_special_kernel_matches_scipy() {
         // NoncentralT cdf/ppf now delegate to nctdtr/nctdtrit. References from
@@ -66424,6 +69441,139 @@ mod tests {
                 d.statistic
             );
         }
+    }
+
+    /// Weibull MLE (loc = 0), against the exact root of the shape equation (mpmath, 50 digits)
+    /// and SciPy 1.17.1's `weibull_min.fit(x, floc=0)`. SciPy's fit is a generic optimizer, so it
+    /// only lands within about 1e-5 of the MLE:
+    /// - tight data 1e10·(1 + 1e-3·N(0,1)), 20 points (numpy default_rng(1)): exact c =
+    ///   2127.2454068940533, scale = 10003097126.688257; SciPy c = 2127.2453338826363. Before
+    ///   the anchoring fix, exp(c·ln x) overflowed at this shape and the Newton iterate went
+    ///   NaN; `c.max(1e-6)` then reset it, and fsci returned c ≈ 1.05.
+    /// - ordinary data weibull_min.rvs(2.5, scale=3, size=30, rng 2), must not change: exact
+    ///   c = 2.827993736301038, scale = 2.871746696837021; SciPy c = 2.828020734616824.
+    ///
+    /// Both toggle arms are checked. Newton stops at |score| < 1e-10, and at c ≈ 2127 the score's
+    /// slope is ≈ −2/c², so the tight shape is only determined to ~1e-7 relative.
+    #[test]
+    fn weibull_fit_anchors_large_shapes_like_scipy() {
+        let tight = [
+            10003455841.920649,
+            10008216181.435013,
+            10003304370.761833,
+            9986968427.683956,
+            10009053558.66673,
+            10004463745.72364,
+            9994630467.646397,
+            10005811181.041964,
+            10003645723.96186,
+            10002941324.966555,
+            10000284222.413158,
+            10005467129.866123,
+            9992635459.129984,
+            9998370900.52007,
+            9995178806.873201,
+            10005988462.126347,
+            10000397221.074818,
+            9997075432.490349,
+            9992180915.376432,
+            9997428077.593811,
+        ];
+        let moderate = [
+            1.8614964687386608,
+            1.981428523692351,
+            3.694689255368862,
+            1.1770233989829517,
+            2.8972249595942814,
+            3.336064478771532,
+            1.6012447863774533,
+            0.9519906072864844,
+            1.9055309187578797,
+            3.083782652859963,
+            2.779350793208036,
+            1.4506449139033082,
+            2.390431709594365,
+            3.1239738785027744,
+            2.361135693409575,
+            3.003472194428614,
+            4.908654653395088,
+            3.1714512275850537,
+            2.2680418532802205,
+            1.5987855113806138,
+            2.1296500900769866,
+            2.624048383669289,
+            4.1260239979482165,
+            3.5227401769091666,
+            2.043496134869586,
+            4.38289485026411,
+            2.5041881540429785,
+            3.2090116636839983,
+            1.2559368828660777,
+            1.242633411354162,
+        ];
+        // This test is the only test-side writer of the toggle, and its two arms agree to
+        // ~1e-15, so a concurrent Weibull::fit elsewhere cannot observe the flip.
+        for disable in [false, true] {
+            WEIBULL_FIT_LN_REUSE_DISABLE.store(disable, std::sync::atomic::Ordering::Relaxed);
+            for (label, data, c_want, scale_want, c_scipy) in [
+                (
+                    "tight",
+                    &tight[..],
+                    2127.2454068940533,
+                    10003097126.688257,
+                    2127.2453338826363,
+                ),
+                (
+                    "moderate",
+                    &moderate[..],
+                    2.827993736301038,
+                    2.871746696837021,
+                    2.828020734616824,
+                ),
+            ] {
+                let fit = Weibull::fit(data);
+                let (c_rel, s_rel) = (
+                    (fit.c - c_want).abs() / c_want,
+                    (fit.scale - scale_want).abs() / scale_want,
+                );
+                assert!(
+                    c_rel < 1e-6 && s_rel < 1e-9,
+                    "{label} disable={disable}: c {} vs MLE {c_want}, scale {} vs {scale_want}",
+                    fit.c,
+                    fit.scale
+                );
+                assert!(
+                    (fit.c - c_scipy).abs() / c_scipy < 1e-4,
+                    "{label}: c {} vs SciPy's fit {c_scipy}",
+                    fit.c
+                );
+            }
+        }
+        WEIBULL_FIT_LN_REUSE_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// SciPy 1.17.1: studentized_range cdf, sf, pdf and ppf of nan (k = 3, df = 10) are nan. At
+    /// q = 2 the cdf is 0.6294553249645047, the sf 0.37054467503549526, and the pdf
+    /// 0.3325724982523169. fsci's ±inf branches used to catch NaN and answer cdf 1, sf 0 and
+    /// pdf 0.
+    #[test]
+    fn studentized_range_at_nan_is_nan_like_scipy() {
+        let d = StudentizedRange::new(3, 10.0);
+        for (name, v) in [
+            ("cdf", d.cdf(f64::NAN)),
+            ("sf", d.sf(f64::NAN)),
+            ("pdf", d.pdf(f64::NAN)),
+            ("ppf", d.ppf(f64::NAN)),
+        ] {
+            assert!(v.is_nan(), "{name}(nan) = {v}, scipy nan");
+        }
+        // Finite q is untouched by the NaN guard; 1e-6 is the bar the pdf/ppf reference test
+        // above already holds this integrator to.
+        let (cdf, sf, pdf) = (d.cdf(2.0), d.sf(2.0), d.pdf(2.0));
+        assert!((cdf - 0.6294553249645047).abs() < 1e-6, "cdf(2) = {cdf}");
+        assert!((sf - 0.37054467503549526).abs() < 1e-6, "sf(2) = {sf}");
+        assert!((pdf - 0.3325724982523169).abs() < 1e-6, "pdf(2) = {pdf}");
+        assert_eq!((d.cdf(f64::INFINITY), d.sf(f64::INFINITY)), (1.0, 0.0));
     }
 
     #[test]
@@ -68029,6 +71179,35 @@ mod tests {
         assert!(t.var().is_nan(), "t(1) has no finite variance");
     }
 
+    /// frankenscipy-szq1n.14 sweep: `scipy.stats.t(df).stats('mvsk')` (1.17.1) at every
+    /// threshold. The mean was NaN for df <= 1 and the kurtosis NaN for 2 < df <= 4, where SciPy
+    /// reports inf.
+    #[test]
+    fn student_t_moments_follow_scipy_at_every_df_threshold() {
+        let inf = f64::INFINITY;
+        let nan = f64::NAN;
+        for (df, m, v, s, k) in [
+            (0.5, inf, nan, nan, nan),
+            (1.0, inf, nan, nan, nan),
+            (1.5, 0.0, inf, nan, nan),
+            (2.0, 0.0, inf, nan, nan),
+            (2.5, 0.0, 5.0, nan, inf),
+            (3.0, 0.0, 3.0, nan, inf),
+            (4.0, 0.0, 2.0, 0.0, inf),
+            (4.5, 0.0, 1.8, 0.0, 12.0),
+        ] {
+            let t = StudentT::new(df);
+            let same = |got: f64, want: f64| {
+                (got.is_nan() && want.is_nan()) || got == want || (got - want).abs() <= 1e-14
+            };
+            let got = [t.mean(), t.var(), t.skewness(), t.kurtosis()];
+            assert!(
+                same(got[0], m) && same(got[1], v) && same(got[2], s) && same(got[3], k),
+                "t({df}) mvsk {got:?}, scipy [{m}, {v}, {s}, {k}]"
+            );
+        }
+    }
+
     // ── Chi-squared distribution ────────────────────────────────────
 
     #[test]
@@ -68163,6 +71342,16 @@ mod tests {
         let u = Uniform::new(0.0, 12.0);
         assert_eq!(u.mean(), 6.0);
         assert_eq!(u.var(), 12.0);
+    }
+
+    /// SciPy 1.17.1: `stats.Uniform(a=1, b=5).mode()` is 3.0 (`_mode_formula` = a + 0.5*(b-a)),
+    /// not the trait's NaN default for a non-unique mode and not either endpoint.
+    #[test]
+    fn uniform_mode_is_scipys_midpoint() {
+        let u = Uniform::new(1.0, 4.0);
+        assert_eq!(u.mode(), 3.0);
+        assert_ne!(u.mode(), u.loc);
+        assert_eq!(Uniform::new(-2.0, 1.0).mode(), -1.5);
     }
 
     // ── ContinuousDistribution trait ────────────────────────────────
@@ -74814,6 +78003,72 @@ mod tests {
         }
     }
 
+    /// SciPy 1.17.1 `vonmises_line(κ, loc=0.5)` against `vonmises(κ, loc=0.5)`: they agree on
+    /// [loc − π, loc + π] and part outside it, where vonmises_line has density 0, cdf 1 above and
+    /// ppf/isf ending at the window's edges (frankenscipy-1ksfv.16).
+    #[test]
+    fn vonmises_line_is_vonmises_on_one_period() {
+        let loc = 0.5;
+        // (κ, cdf(1.0), cdf(-2.0), ppf(0.3), var, entropy), SciPy 1.17.1, except var: SciPy
+        // integrates x²·pdf with quad and at κ = 10 returns 0.10565504392755344, 1.1e-8 below
+        // the 40-digit mpmath value of ∫x²·pdf used here (which the Bessel series reproduces).
+        let cases = [
+            (
+                0.0,
+                0.579_577_471_545_947_6,
+                0.102_112_642_270_261_62,
+                -0.756_637_061_435_917_2,
+                3.289_868_133_696_452_9,
+                1.837_877_066_409_345_3,
+            ),
+            (
+                2.0,
+                0.738_192_214_418_519_1,
+                0.006_985_005_694_537_374_5,
+                0.090_740_763_537_030_64,
+                0.764_461_879_811_126_9,
+                1.266_321_291_964_285_2,
+            ),
+            // κ = 10 is below SciPy's series cutoff (10.5); above it SciPy's cdf is a normal
+            // approximation that fsci's exact series does not follow (frankenscipy-1qmf4).
+            (
+                10.0,
+                0.938_644_931_910_898_9,
+                3.909_338_117_114_025e-9,
+                0.331_759_218_938_926_7,
+                0.105_655_054_874_171_9,
+                0.294_850_889_979_581_86,
+            ),
+        ];
+        for (kappa, cdf_1, cdf_m2, ppf_03, var, entropy) in cases {
+            let line = VonmisesLine::new(kappa, loc);
+            let circular = VonMises::new(kappa, loc);
+            assert_eq!(line.support(), (loc - PI, loc + PI));
+            assert!((line.cdf(1.0) - cdf_1).abs() < 1e-13, "κ={kappa}");
+            assert!((line.cdf(-2.0) - cdf_m2).abs() < 1e-13, "κ={kappa}");
+            assert!((line.sf(1.0) - (1.0 - cdf_1)).abs() < 1e-13, "κ={kappa}");
+            assert!((line.ppf(0.3) - ppf_03).abs() < 1e-9, "κ={kappa}");
+            assert!((line.var() - var).abs() < 1e-12, "κ={kappa}");
+            assert!((line.entropy() - entropy).abs() < 1e-12, "κ={kappa}");
+            assert_eq!(line.pdf(1.0).to_bits(), circular.pdf(1.0).to_bits());
+            // Outside the window: SciPy's vonmises_line is 0 / -inf / 1 / 0 where vonmises
+            // repeats its density and counts a further cycle.
+            for x in [4.0, -2.9, 12.0] {
+                assert_eq!(line.pdf(x), 0.0, "κ={kappa} x={x}");
+                assert_eq!(line.logpdf(x), f64::NEG_INFINITY, "κ={kappa} x={x}");
+                assert!(circular.pdf(x) > 0.0, "κ={kappa} x={x}");
+            }
+            assert_eq!(line.cdf(4.0), 1.0);
+            assert_eq!(line.cdf(-2.9), 0.0);
+            assert!(circular.cdf(4.0) >= 1.0 && circular.cdf(12.0) > 2.0);
+            assert_eq!(line.ppf(0.0), loc - PI);
+            assert_eq!(line.ppf(1.0), loc + PI);
+            assert_eq!(line.isf(0.0), loc + PI);
+            assert_eq!(line.isf(1.0), loc - PI);
+            assert!(line.ppf(1.5).is_nan() && line.cdf(f64::NAN).is_nan());
+        }
+    }
+
     #[test]
     fn truncweibull_min_ppf_inverts_cdf() {
         // /porting-to-rust [frankenscipy-op097]: round-trip.
@@ -74931,6 +78186,819 @@ mod tests {
                 (pdf_l - pdf_s).abs() < 1e-12,
                 "pdf series disagree at x={x}: large={pdf_l}, small={pdf_s}, diff={}",
                 (pdf_l - pdf_s).abs()
+            );
+        }
+    }
+
+    /// `|got - want| <= tol·|want|`, and exact where `want` is 0 or 1.
+    fn assert_kstwo_rel(got: f64, want: f64, tol: f64, what: &str) {
+        if want == 0.0 || want == 1.0 {
+            assert!(
+                got == want,
+                "{what}: got {got:e}, expected exactly {want:e}"
+            );
+        } else {
+            assert!(
+                (got - want).abs() <= tol * want.abs(),
+                "{what}: got {got:e}, expected {want:e} (rel {:.2e}, tol {tol:.0e})",
+                (got - want).abs() / want.abs()
+            );
+        }
+    }
+
+    /// scipy.stats.kstwo, SciPy 1.17.1 (frankenscipy-1ksfv.16). Measured bit-identical;
+    /// asserted to 2 ulp. `kstwo(0)` cannot be frozen in SciPy and `kstwo.cdf(x, 0)` is NaN.
+    #[test]
+    fn kstwo_headline_values_match_scipy() -> Result<(), StatsError> {
+        let ten = Kstwo::new(10)?;
+        let ulp2 = 2.0 * f64::EPSILON;
+        assert_kstwo_rel(ten.cdf(0.3), 0.7294644252000005, ulp2, "kstwo.cdf(0.3, 10)");
+        assert_kstwo_rel(
+            ten.ppf(0.5),
+            0.24686329073080385,
+            ulp2,
+            "kstwo.ppf(0.5, 10)",
+        );
+        assert_kstwo_rel(ten.pdf(0.3), 3.4637450399714, ulp2, "kstwo.pdf(0.3, 10)");
+        assert_kstwo_rel(ten.median(), 0.24686329073080385, ulp2, "kstwo.median(10)");
+        assert_kstwo_rel(
+            Kstwo::new(20)?.sf(0.3),
+            0.04306706665851623,
+            ulp2,
+            "kstwo.sf(0.3, 20)",
+        );
+        assert_eq!(ten.support(), (0.05, 1.0), "kstwo.support(10)");
+        assert_eq!(ten.n(), 10);
+        assert!(matches!(Kstwo::new(0), Err(StatsError::InvalidArgument(_))));
+        // SciPy's rv_continuous ends: ppf(0) and isf(1) are the lower support edge.
+        assert_eq!((ten.ppf(0.0), ten.ppf(1.0)), (0.05, 1.0));
+        assert_eq!((ten.isf(0.0), ten.isf(1.0)), (1.0, 0.05));
+        assert!(ten.ppf(-0.1).is_nan() && ten.isf(1.5).is_nan() && ten.ppf(f64::NAN).is_nan());
+        assert!(
+            ten.cdf(f64::NAN).is_nan() && ten.sf(f64::NAN).is_nan() && ten.pdf(f64::NAN).is_nan()
+        );
+        Ok(())
+    }
+
+    /// `(n, x, kstwo.cdf(x, n), kstwo.sf(x, n))`, SciPy 1.17.1. Every n of the bead; x at the
+    /// support edge 1/2n, at 3/4n, 1/n and 1.5/n (Ruben–Gambino and its neighbour), 1/2 and
+    /// 1 - 1/n, at n·x² = 0.5, 2, 3, 10 (every `kolmogn` method: DMTW, Pomeranz, Pelz–Good,
+    /// 2·smirnov), and where sf ≈ 1e-10, 1e-20, 1e-30.
+    ///
+    /// Measured on these points: 170 of 176 bit-identical, worst relative difference 2.0e-15
+    /// (cdf) and 1.3e-13 (sf, where it is 1 - cdf of the Pomeranz CDF and SciPy's matmul
+    /// order differs). Tolerance 1e-12; 0 and 1 exactly.
+    #[test]
+    fn kstwo_cdf_sf_grid_matches_scipy() -> Result<(), StatsError> {
+        const GRID: [(usize, f64, f64, f64); 88] = [
+            (1, 0.5, 0.0, 1.0),
+            (
+                1,
+                0.7071067811865476,
+                0.41421356237309515,
+                0.5857864376269049,
+            ),
+            (1, 0.75, 0.5, 0.5),
+            (2, 0.25, 0.0, 1.0),
+            (2, 0.375, 0.125, 0.875),
+            (2, 0.5, 0.5, 0.5),
+            (2, 0.75, 0.875, 0.125),
+            (5, 0.1, 0.0, 1.0),
+            (5, 0.15, 0.0012000000000000005, 0.9988),
+            (5, 0.2, 0.03840000000000002, 0.9616),
+            (5, 0.3, 0.33599999999999997, 0.664),
+            (
+                5,
+                0.31622776601683794,
+                0.4001252938165754,
+                0.5998747061834246,
+            ),
+            (5, 0.5, 0.888, 0.112),
+            (
+                5,
+                0.6324555320336759,
+                0.9816016643558628,
+                0.018398335644137166,
+            ),
+            (
+                5,
+                0.7745966692414834,
+                0.9988330993602692,
+                0.0011669006397307495,
+            ),
+            (5, 0.8, 0.99936, 0.0006399999999999993),
+            (10, 0.05, 0.0, 1.0),
+            (10, 0.075, 3.543750000000003e-07, 0.999999645625),
+            (10, 0.1, 0.0003628800000000003, 0.99963712),
+            (10, 0.15, 0.04603473, 0.95396527),
+            (
+                10,
+                0.22360679774997896,
+                0.3769483199726603,
+                0.6230516800273397,
+            ),
+            (
+                10,
+                0.4472135954999579,
+                0.9757866372363937,
+                0.024213362763606305,
+            ),
+            (10, 0.5, 0.99222259, 0.00777741),
+            (
+                10,
+                0.5477225575051661,
+                0.9975803441442025,
+                0.002419655855797518,
+            ),
+            (10, 0.9, 0.9999999998, 1.9999999999999957e-10),
+            (20, 0.025, 0.0, 1.0),
+            (20, 0.0375, 2.2127114863693748e-14, 0.9999999999999779),
+            (20, 0.05, 2.3201961595312535e-08, 0.9999999767980384),
+            (20, 0.075, 0.0006186630064295565, 0.9993813369935705),
+            (
+                20,
+                0.15811388300841897,
+                0.3571180884786759,
+                0.6428819115213241,
+            ),
+            (
+                20,
+                0.31622776601683794,
+                0.9718459601234036,
+                0.02815403987659637,
+            ),
+            (
+                20,
+                0.3872983346207417,
+                0.9967234359225274,
+                0.0032765640774725657,
+            ),
+            (20, 0.5, 0.9999621240475947, 3.787595240539032e-05),
+            (
+                20,
+                0.7071067811865476,
+                0.9999999998624253,
+                1.3757474852040778e-10,
+            ),
+            (
+                20,
+                0.7700486690869026,
+                0.9999999999994125,
+                5.875829734552639e-13,
+            ),
+            (20, 0.95, 1.0, 1.9073486328125338e-26),
+            (100, 0.005, 0.0, 1.0),
+            (100, 0.0075, 7.362140279596113e-73, 1.0),
+            (100, 0.01, 9.332621544394438e-43, 1.0),
+            (100, 0.015, 9.479558244426184e-20, 1.0),
+            (
+                100,
+                0.07071067811865475,
+                0.32730992553281946,
+                0.6726900744671805,
+            ),
+            (
+                100,
+                0.1414213562373095,
+                0.966978708397777,
+                0.033021291602222995,
+            ),
+            (
+                100,
+                0.17320508075688773,
+                0.9957052952741073,
+                0.004294704725892679,
+            ),
+            (
+                100,
+                0.31622776601683794,
+                0.9999999978264121,
+                2.1735878868482512e-09,
+            ),
+            (
+                100,
+                0.34437623401231104,
+                0.9999999999572428,
+                4.275723083950648e-11,
+            ),
+            (100, 0.48345035443383877, 1.0, 4.891687769154079e-22),
+            (100, 0.5, 1.0, 1.2131434371817858e-23),
+            (100, 0.590638214012526, 1.0, 9.085769644882067e-34),
+            (100, 0.99, 1.0, 2.0000000000001775e-200),
+            (141, 0.0035460992907801418, 0.0, 1.0),
+            (141, 0.005319148936170213, 6.211619266380889e-103, 1.0),
+            (141, 0.0070921985815602835, 1.731546731623012e-60, 1.0),
+            (141, 0.010638297872340425, 5.86012458712038e-28, 1.0),
+            (
+                141,
+                0.05954913341754137,
+                0.323253586596061,
+                0.6767464134039389,
+            ),
+            (
+                141,
+                0.11909826683508273,
+                0.9663882216025402,
+                0.03361177839745977,
+            ),
+            (
+                141,
+                0.14586499149789456,
+                0.9955894286502954,
+                0.0044103835122001585,
+            ),
+            (
+                141,
+                0.26631182064565373,
+                0.9999999975264966,
+                2.560354084896187e-09,
+            ),
+            (
+                141,
+                0.2900171070431208,
+                0.9999999999508435,
+                5.3605782432509715e-11,
+            ),
+            (141, 0.40713864472674677, 1.0, 1.2263241585803237e-21),
+            (141, 0.4974071065859466, 1.0, 9.26529754982104e-33),
+            (141, 0.5, 1.0, 4.034017661079683e-33),
+            (141, 0.9929078014184397, 1.0, 1.8244632139623947e-303),
+            (1000, 0.0005, 0.0, 1.0),
+            (1000, 0.00075, 0.0, 1.0),
+            (1000, 0.001, 0.0, 1.0),
+            (1000, 0.0015, 4.426367026531291e-201, 1.0),
+            (
+                1000,
+                0.022360679774997897,
+                0.3093205758896512,
+                0.6906794241103489,
+            ),
+            (
+                1000,
+                0.044721359549995794,
+                0.9644770888674792,
+                0.03552291113252082,
+            ),
+            (
+                1000,
+                0.05477225575051661,
+                0.9952331435452236,
+                0.004766852502767219,
+            ),
+            (1000, 0.1, 0.9999999962983148, 3.703687096817711e-09),
+            (
+                1000,
+                0.10890132715100492,
+                0.9999999999123387,
+                8.776845364022322e-11,
+            ),
+            (1000, 0.15288042556266132, 1.0, 7.13197291254064e-21),
+            (1000, 0.18677620294135613, 1.0, 5.1620431121308565e-31),
+            (1000, 0.5, 1.0, 1.064517291557782e-231),
+            (1000, 0.999, 1.0, 0.0),
+            (100000, 5e-06, 0.0, 1.0),
+            (100000, 7.5e-06, 0.0, 1.0),
+            (100000, 1e-05, 0.0, 1.0),
+            (100000, 1.5e-05, 0.0, 1.0),
+            (
+                100000,
+                0.00223606797749979,
+                0.30150625406351494,
+                0.698493745936485,
+            ),
+            (
+                100000,
+                0.00447213595499958,
+                0.963478320505348,
+                0.036521679494652015,
+            ),
+            (
+                100000,
+                0.005477225575051661,
+                0.9950606968279061,
+                0.0049393032460430366,
+            ),
+            (100000, 0.01, 0.9999999959067223, 4.093278023549254e-09),
+            (
+                100000,
+                0.010890132715100491,
+                0.9999999999007806,
+                9.921978096088987e-11,
+            ),
+            (100000, 0.015288042556266132, 1.0, 9.875609454851835e-21),
+            (100000, 0.018677620294135614, 1.0, 9.824479607961967e-31),
+            (100000, 0.5, 1.0, 0.0),
+            (100000, 0.99999, 1.0, 0.0),
+        ];
+        for (n, x, cdf, sf) in GRID {
+            let d = Kstwo::new(n)?;
+            assert_kstwo_rel(d.cdf(x), cdf, 1e-12, &format!("kstwo.cdf({x:e}, {n})"));
+            assert_kstwo_rel(d.sf(x), sf, 1e-12, &format!("kstwo.sf({x:e}, {n})"));
+        }
+        Ok(())
+    }
+
+    /// `(n, x, kstwo.pdf(x, n))`, SciPy 1.17.1, on the points of the cdf grid plus x = 0.3
+    /// (0.7 for n < 5). On the Ruben–Gambino edges and for x ≥ 1/2 SciPy's pdf is a closed
+    /// form (measured bit-identical; tolerance 4 ulp). Elsewhere it is a 5-point central
+    /// difference of the CDF with step δ = min(x/2^16, x - 1/n, 1/2 - x): the two CDFs differ
+    /// by an ulp or two and the quotient scales that by 1/δ. Measured worst there is exactly
+    /// 1.0·eps/δ; tolerance 4·eps/δ. Where sf < 1e-3, fsci runs that stencil on −sf instead
+    /// (see `kolmogn_p`), and three rows where SciPy's CDF stencil is off its own sf's
+    /// derivative by more than the tolerance now hold that derivative (GOLDEN-CHANGE notes in
+    /// the table). The far-tail rows whose SciPy value is pure stencil noise (for example 9.1e-12,
+    /// where the density is ~1e-77) pass on both sides within 4·eps/δ absolute.
+    #[test]
+    fn kstwo_pdf_matches_scipy() -> Result<(), StatsError> {
+        const PDF: [(usize, f64, f64); 96] = [
+            (1, 0.5, 0.0),
+            (1, 0.7, 2.0),
+            (1, 0.7071067811865476, 2.0),
+            (1, 0.75, 2.0),
+            (2, 0.25, 0.0),
+            (2, 0.375, 2.0),
+            (2, 0.5, 4.0),
+            (2, 0.7, 1.2000000000000002),
+            (2, 0.75, 1.0),
+            (5, 0.1, 0.0),
+            (5, 0.15, 0.12000000000000005),
+            (5, 0.2, 1.9200000000000008),
+            (5, 0.3, 3.936000000009396),
+            (5, 0.31622776601683794, 3.951600846789102),
+            (5, 0.5, 1.326),
+            (5, 0.6324555320336759, 0.2935920383377193),
+            (5, 0.7745966692414834, 0.026316938422146333),
+            (5, 0.8, 0.015999999999999986),
+            (10, 0.05, 0.0),
+            (10, 0.075, 0.0001417500000000001),
+            (10, 0.1, 0.07257600000000006),
+            (10, 0.15, 2.42698680000179),
+            (10, 0.22360679774997896, 5.4029183366261355),
+            (10, 0.3, 3.4637450399714),
+            (10, 0.4472135954999579, 0.48597290560795886),
+            (10, 0.5, 0.17918018),
+            (10, 0.5477225575051661, 0.06274698408281501),
+            (10, 0.9, 1.999999999999996e-08),
+            (20, 0.025, 0.0),
+            (20, 0.0375, 3.5403383781909997e-11),
+            (20, 0.05, 1.8561569276250028e-05),
+            (20, 0.075, 0.13771367147841218),
+            (20, 0.15811388300841897, 7.617118475791654),
+            (20, 0.3, 1.0964841203895048),
+            (20, 0.31622776601683794, 0.7582389319312992),
+            (20, 0.3872983346207417, 0.11037196611624621),
+            (20, 0.5, 0.0017357691884712578),
+            (20, 0.7071067811865476, 1.0820302330420871e-08),
+            (20, 0.7700486690869026, 5.629843934118822e-11),
+            (20, 0.95, 7.629394531250128e-24),
+            (100, 0.005, 0.0),
+            (100, 0.0075, 2.944856111838445e-68),
+            (100, 0.01, 1.8665243088788874e-38),
+            (100, 0.015, 5.497466687728451e-16),
+            (100, 0.07071067811865475, 16.876153586409945),
+            (100, 0.1414213562373095, 1.9029795350318561),
+            (100, 0.17320508075688773, 0.3038678309517657),
+            (100, 0.3, 2.2256760227416334e-06),
+            (100, 0.31622776601683794, 2.891317973778561e-07),
+            (100, 0.34437623401231104, 6.2697137861486255e-09),
+            (100, 0.48345035443383877, 5.643773099544151e-12),
+            (100, 0.5, 2.7693233299033547e-21),
+            (100, 0.590638214012526, 2.6197946917281326e-31),
+            (100, 0.99, 2.000000000000176e-196),
+            (141, 0.0035460992907801418, 0.0),
+            (141, 0.005319148936170213, 4.9397281053967476e-98),
+            (141, 0.0070921985815602835, 6.88497611427942e-56),
+            (141, 0.010638297872340425, 6.776310692715603e-24),
+            (141, 0.05954913341754137, 20.014594779755498),
+            (141, 0.11909826683508273, 2.291152715873833),
+            (141, 0.14586499149789456, 0.36875196685662287),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16): SciPy's kstwo.pdf here is
+            // 3.88486925043919e-7. It differentiates the Pelz–Good CDF, 2.5% off the derivative
+            // of SciPy's own sf (central difference 3.98585e-7) and off 2·ksone.pdf
+            // (3.985847468353691e-7), which this row now holds. The sf is 2.56e-9, so fsci's
+            // stencil runs on −sf here.
+            (141, 0.26631182064565373, 3.985847468353691e-07),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16), the same Pelz–Good inconsistency: SciPy's
+            // kstwo.pdf gives 8.511113864206367e-9 and 1.546140993013978e-9, 7% and 8% off the
+            // derivative of its own sf (sf < 1e-10) and off 2·ksone.pdf, now held.
+            (141, 0.2900171070431208, 9.14329895336821e-09),
+            (141, 0.3, 1.6739653473796595e-09),
+            (141, 0.40713864472674677, 6.701609244560956e-12),
+            (141, 0.4974071065859466, 5.4854144003817764e-12),
+            (141, 0.5, 1.2980697810820992e-30),
+            (141, 0.9929078014184397, 3.627215315678632e-299),
+            (1000, 0.0005, 0.0),
+            (1000, 0.00075, 0.0),
+            (1000, 0.001, 0.0),
+            (1000, 0.0015, 2.5903128636230137e-195),
+            (1000, 0.022360679774997897, 53.0615385129308),
+            (1000, 0.044721359549995794, 6.382390553134707),
+            (1000, 0.05477225575051661, 1.0487155976089657),
+            // GOLDEN-CHANGE (frankenscipy-1ksfv.16): SciPy's CDF stencil gives
+            // 1.4897523215040565e-6, 3.5e-4 below the derivative of its sf (sf = 3.7e-9),
+            // 1.490271690824096e-6, and 2·ksone.pdf, which this row now holds.
+            (1000, 0.1, 1.490271653628224e-06),
+            (1000, 0.10890132715100492, 3.8550747297711846e-08),
+            (1000, 0.15288042556266132, 1.784717759174772e-11),
+            (1000, 0.18677620294135613, 1.460830695961558e-11),
+            (1000, 0.3, 9.094947017729282e-12),
+            (1000, 0.5, 2.4279570877941085e-228),
+            (1000, 0.999, 0.0),
+            (100000, 5e-06, 0.0),
+            (100000, 7.5e-06, 0.0),
+            (100000, 1e-05, 0.0),
+            (100000, 1.5e-05, 0.0),
+            (100000, 0.00223606797749979, 529.1777040662653),
+            (100000, 0.00447213595499958, 65.35555643047705),
+            (100000, 0.005477225575051661, 10.824883779171103),
+            (100000, 0.01, 1.6377725842176005e-05),
+            (100000, 0.010890132715100491, 4.3336184516426947e-07),
+            (100000, 0.015288042556266132, 1.7847177591747723e-10),
+            (100000, 0.018677620294135614, 1.460830695961558e-10),
+            (100000, 0.3, 9.094947017729282e-12),
+            (100000, 0.5, 0.0),
+            (100000, 0.99999, 0.0),
+        ];
+        for (n, x, want) in PDF {
+            let got = Kstwo::new(n)?.pdf(x);
+            let nf = n as f64;
+            let t = nf * x;
+            let tol = if t > 1.0 && t < nf - 1.0 && x < 0.5 {
+                4.0 * f64::EPSILON / (x / 65536.0).min(x - 1.0 / nf).min(0.5 - x)
+            } else {
+                4.0 * f64::EPSILON * want.abs()
+            };
+            assert!(
+                (got - want).abs() <= tol,
+                "kstwo.pdf({x:e}, {n}): got {got:e}, expected {want:e} (diff {:.2e}, tol {tol:.2e})",
+                (got - want).abs()
+            );
+        }
+        Ok(())
+    }
+
+    /// In the deep upper tail (sf < 1e-3) the density comes from a stencil on −sf, whose values
+    /// keep their relative precision, where SciPy differentiates its CDF near 1. The references are
+    /// central differences of SciPy 1.17.1's own `kstwo.sf` with h = 1e-5·x (the h = 1e-4·x
+    /// estimates agree with them to 1e-6), not `kstwo.pdf`. SciPy's pdf is 3.5e-4 below at
+    /// (1000, 0.1107), and fsci's old CDF stencil was 7.4e-3 off (frankenscipy-1ksfv.16).
+    #[test]
+    fn kstwo_pdf_upper_tail_differentiates_the_sf() -> Result<(), StatsError> {
+        let rows: [(usize, f64, f64); 5] = [
+            (100, 0.19, 0.095_965_646_680_839_11),
+            (1000, 0.082_219_219_164_377_87, 0.000_826_230_920_629_256_4),
+            (1000, 0.094_868_329_805_051_39, 1.056_376_915_245_900_4e-5),
+            (1000, 0.110_679_718_105_893_28, 1.782_148_949_456_587e-8),
+            (
+                100_000,
+                0.009_486_832_980_505_138,
+                0.000_114_846_430_421_294_59,
+            ),
+        ];
+        for (n, x, want) in rows {
+            let got = Kstwo::new(n)?.pdf(x);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 1e-6,
+                "kstwo.pdf({x}, {n}) = {got:e}, sf-difference {want:e} ({rel:.1e})"
+            );
+        }
+        Ok(())
+    }
+
+    /// ppf: `(n, q, kstwo.ppf(q, n))`, SciPy 1.17.1; measured worst relative difference
+    /// 6.9e-15 (41 of 45 bit-identical), tolerance 1e-13.
+    ///
+    /// isf: for q ≥ 1/2 the reference is `kstwo.isf(q, n)`. For q < 1/2 it is the root of
+    /// SciPy's own `kstwo.sf(x, n) = q` found by SciPy's `brentq` (xtol 1e-300, rtol 4·eps),
+    /// because `kstwo.isf` itself inverts the CDF at 1 - q and its x misses the root of its
+    /// own sf by 9.3e-7 (relative; n = 141, q = 1e-3) and 1.5e-3 (n = 141, q = 1e-10), and it
+    /// answers 0.99 for (n = 100, q = 1e-20) where the root is 0.4694. Measured worst 1.3e-13;
+    /// tolerance 1e-12. Both directions also round-trip through cdf/sf to within what the x
+    /// rounding (brentq xtol 1e-14 plus an ulp) moves them: (2e-14 + 4·eps·x)·pdf(x)/q.
+    #[test]
+    fn kstwo_ppf_isf_match_scipy_and_round_trip() -> Result<(), StatsError> {
+        const PPF: [(usize, f64, f64); 45] = [
+            (1, 1e-10, 0.50000000005),
+            (1, 0.01, 0.505),
+            (1, 0.5, 0.75),
+            (1, 0.9, 0.95),
+            (1, 0.99, 0.995),
+            (2, 1e-10, 0.2500035355339059),
+            (2, 0.01, 0.28535533905932736),
+            (2, 0.5, 0.5),
+            (2, 0.9, 0.7763932022500211),
+            (2, 0.99, 0.9292893218813452),
+            (5, 1e-10, 0.1019192597481869),
+            (5, 0.01, 0.17640710679078997),
+            (5, 0.5, 0.3419118604444544),
+            (5, 0.9, 0.5094493282201105),
+            (5, 0.99, 0.6685311015147539),
+            (10, 1e-10, 0.06104062606603004),
+            (10, 0.01, 0.1272582296994841),
+            (10, 0.5, 0.24686329073080385),
+            (10, 0.9, 0.36866167417172396),
+            (10, 0.99, 0.48893165941109124),
+            (20, 1e-10, 0.044039860999449586),
+            (20, 0.01, 0.09183952886231248),
+            (20, 0.5, 0.17734150203326088),
+            (20, 0.9, 0.2647305721955971),
+            (20, 0.99, 0.35241089163889466),
+            (100, 1e-10, 0.020636199618185313),
+            (100, 0.01, 0.04258351033765298),
+            (100, 0.5, 0.08114721899006636),
+            (100, 0.9, 0.12066340877827493),
+            (100, 0.99, 0.16080868092855588),
+            (141, 1e-10, 0.017531798442713117),
+            (141, 0.01, 0.036047675409580496),
+            (141, 0.5, 0.06854593312811394),
+            (141, 0.9, 0.10185176534199158),
+            (141, 0.99, 0.13571749333517924),
+            (1000, 1e-10, 0.006804232675149381),
+            (1000, 0.01, 0.013784616615373639),
+            (1000, 0.5, 0.026005301564520387),
+            (1000, 0.9, 0.03853304260042531),
+            (1000, 0.99, 0.05129418752666127),
+            (100000, 1e-10, 0.000694472878843657),
+            (100000, 0.01, 0.0013929901816356212),
+            (100000, 0.5, 0.0026153524979369023),
+            (100000, 0.9, 0.003868478341244626),
+            (100000, 0.99, 0.005145321961471824),
+        ];
+        const ISF: [(usize, f64, f64); 58] = [
+            (1, 0.99, 0.505),
+            (1, 0.5, 0.75),
+            (1, 0.1, 0.95),
+            (1, 0.001, 0.9995),
+            (2, 0.99, 0.28535533905932736),
+            (2, 0.5, 0.5),
+            (2, 0.1, 0.7763932022500211),
+            (2, 0.001, 0.9776393202250021),
+            (2, 1e-10, 0.9999929289321882),
+            (5, 0.99, 0.17640710679078997),
+            (5, 0.5, 0.3419118604444544),
+            (5, 0.1, 0.5094493282201105),
+            (5, 0.001, 0.7813687768563802),
+            (5, 1e-10, 0.9912944943670388),
+            (5, 1e-20, 0.9999129449436706),
+            (5, 1e-30, 0.9999991294494367),
+            (10, 0.99, 0.12725822969948414),
+            (10, 0.5, 0.24686329073080385),
+            (10, 0.1, 0.3686616741717244),
+            (10, 0.001, 0.5804173076502123),
+            (10, 1e-10, 0.9066967008463193),
+            (10, 1e-20, 0.9906696700846319),
+            (10, 1e-30, 0.999066967008463),
+            (20, 0.99, 0.09183952886231249),
+            (20, 0.5, 0.17734150203326088),
+            (20, 0.1, 0.264730572195597),
+            (20, 0.001, 0.42085118898477314),
+            (20, 1e-10, 0.7111391015548139),
+            (20, 1e-20, 0.9034072379706929),
+            (20, 1e-30, 0.969454411258959),
+            (100, 0.99, 0.04258351033765298),
+            (100, 0.5, 0.08114721899006636),
+            (100, 0.1, 0.12066340877827346),
+            (100, 0.001, 0.1926841642763453),
+            (100, 1e-10, 0.3385080774348269),
+            (100, 1e-20, 0.46938222632910426),
+            (100, 1e-30, 0.5655584108139194),
+            (141, 0.99, 0.036047675409580496),
+            (141, 0.5, 0.06854593312811394),
+            (141, 0.1, 0.10185176534199156),
+            (141, 0.001, 0.16263697830922436),
+            (141, 1e-10, 0.28633637467734935),
+            (141, 1e-20, 0.39862411005501386),
+            (141, 1e-30, 0.4824689984213987),
+            (1000, 0.99, 0.01378461661537364),
+            (1000, 0.5, 0.026005301564520387),
+            (1000, 0.1, 0.03853304260042531),
+            (1000, 0.001, 0.061462226219893994),
+            (1000, 1e-10, 0.10860338279506067),
+            (1000, 1e-20, 0.15233297955361028),
+            (1000, 1e-30, 0.18590350211485884),
+            (100000, 0.99, 0.0013929901816356212),
+            (100000, 0.5, 0.0026153524979369023),
+            (100000, 0.1, 0.0038684783412446275),
+            (100000, 0.001, 0.006163094369922933),
+            (100000, 1e-10, 0.010888334794141518),
+            (100000, 1e-20, 0.015285995978376566),
+            (100000, 1e-30, 0.01867525051424361),
+        ];
+        let round_trip_tol = |d: &Kstwo, x: f64, q: f64| {
+            1e-12 + (2e-14 + 4.0 * f64::EPSILON * x) * d.pdf(x).abs() / q
+        };
+        for (n, q, want) in PPF {
+            let d = Kstwo::new(n)?;
+            let x = d.ppf(q);
+            assert_kstwo_rel(x, want, 1e-13, &format!("kstwo.ppf({q:e}, {n})"));
+            let back = d.cdf(x);
+            assert!(
+                (back - q).abs() <= round_trip_tol(&d, x, q) * q,
+                "cdf(ppf({q:e})) = {back:e} for n = {n}"
+            );
+        }
+        for (n, q, want) in ISF {
+            let d = Kstwo::new(n)?;
+            let x = d.isf(q);
+            assert_kstwo_rel(x, want, 1e-12, &format!("kstwo.isf({q:e}, {n})"));
+            let back = d.sf(x);
+            assert!(
+                (back - q).abs() <= round_trip_tol(&d, x, q) * q,
+                "sf(isf({q:e})) = {back:e} for n = {n}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mean and variance. SciPy's `kstwo.mean` integrates x·pdf with the pdf a finite
+    /// difference of the CDF and is off in the 7th to 10th digit; the references here are
+    /// exact: n = 1 is uniform on [1/2, 1]; n = 2..20 are mpmath (40 digits) Gauss–Legendre
+    /// integrals of 1 - cdf with the Pomeranz CDF in exact arithmetic, piecewise between the
+    /// knots k/2n (converged: degree 6 and 7 agree to all digits); n ≥ 100 are live
+    /// `scipy.integrate.quad(1 - _kolmogn(n, x), points = knots and method switches,
+    /// epsrel = 1e-14)` of SciPy's own CDF. Measured worst relative difference 2.5e-14;
+    /// tolerance 1e-12. SciPy's `kstwo.stats(n, 'mv')` is also checked, to its own measured
+    /// error (worst: var at n = 141, 2.9e-5 relative).
+    #[test]
+    fn kstwo_mean_var_match_exact_integrals() -> Result<(), StatsError> {
+        // (n, exact mean, exact var, scipy mean, scipy var, scipy's relative error bound)
+        const MOMENTS: [(usize, f64, f64, f64, f64, f64); 10] = [
+            (1, 0.75, 1.0 / 48.0, 0.75, 0.02083333333333337, 1e-14),
+            (
+                2,
+                13.0 / 24.0,
+                7.0 / 288.0,
+                0.5416666666666666,
+                0.024305555555555525,
+                1e-14,
+            ),
+            (
+                3,
+                0.4521604938271605,
+                0.018493274653254076,
+                0.4521602111730302,
+                0.018493529226721594,
+                2e-5,
+            ),
+            (
+                5,
+                0.3583386666666667,
+                0.011997285685841269,
+                0.3583385977550372,
+                0.01199732935614592,
+                1e-5,
+            ),
+            (
+                10,
+                0.259193114905,
+                0.006375655442845361,
+                0.25919311741328144,
+                0.006375656177625533,
+                1e-6,
+            ),
+            (
+                20,
+                0.186328979779269,
+                0.003286912406329235,
+                0.18632897966055004,
+                0.003286913160728565,
+                1e-6,
+            ),
+            (
+                100,
+                0.08524354134404581,
+                0.0006735696142652053,
+                0.0852435413708329,
+                0.0006735696121693939,
+                1e-8,
+            ),
+            (
+                141,
+                0.07200051989416156,
+                0.0004785612816561582,
+                0.07200066194571433,
+                0.0004785473893618025,
+                5e-5,
+            ),
+            (
+                1000,
+                0.02730620825518912,
+                6.7731022937035e-05,
+                0.027306207865352792,
+                6.77310395342664e-05,
+                1e-6,
+            ),
+            (
+                100000,
+                0.002745503663194748,
+                6.77727797599271e-07,
+                0.0027455036644474648,
+                6.77728131589263e-07,
+                1e-6,
+            ),
+        ];
+        for (n, mean, var, sp_mean, sp_var, sp_tol) in MOMENTS {
+            let d = Kstwo::new(n)?;
+            let (m, v) = (d.mean(), d.var());
+            assert_kstwo_rel(m, mean, 1e-12, &format!("kstwo.mean({n})"));
+            assert_kstwo_rel(v, var, 1e-12, &format!("kstwo.var({n})"));
+            if n <= 20 {
+                // std is sqrt(var); one integration per call, so checked where it is cheap.
+                assert_kstwo_rel(d.std(), var.sqrt(), 1e-12, &format!("kstwo.std({n})"));
+            }
+            assert_kstwo_rel(m, sp_mean, sp_tol, &format!("scipy kstwo.mean({n})"));
+            assert_kstwo_rel(v, sp_var, sp_tol, &format!("scipy kstwo.var({n})"));
+        }
+        Ok(())
+    }
+
+    /// What a naive Kstwo gets wrong. (a) The old `Kstwo = KsTwoBign` alias: kstwobign is the
+    /// law of √n·D_n as n → ∞, and kstwobign.cdf(0.3) = 9.306e-06 against
+    /// kstwo.cdf(0.3, 10) = 0.7295. (b) sf as 1 - cdf: at n = 20, x = 0.9 the CDF rounds to 1
+    /// while kstwo.sf = 2·smirnov(20, 0.9) = 2.0e-20; at n = 1000, x = 0.2 it is 1.6e-35.
+    /// (c) Below the support edge 1/2n (and at it) the CDF is exactly 0 and the pdf 0, where
+    /// the Ruben–Gambino product n!/n^n·(2nx - 1)^n is not: at n = 10, x = 0.02 it is 2.2e-6.
+    #[test]
+    fn kstwo_negative_cases_a_naive_law_gets_wrong() -> Result<(), StatsError> {
+        let ten = Kstwo::new(10)?;
+        let bign = KsTwoBign.cdf(0.3);
+        assert!(
+            (bign - 9.305801334566636e-06).abs() <= 1e-15,
+            "kstwobign.cdf(0.3) = {bign:e}"
+        );
+        assert_kstwo_rel(
+            ten.cdf(0.3),
+            0.7294644252000005,
+            1e-15,
+            "kstwo.cdf(0.3, 10)",
+        );
+        assert!(
+            ten.cdf(0.3) / bign > 7e4,
+            "Kstwo must not be the n -> inf limit"
+        );
+
+        let twenty = Kstwo::new(20)?;
+        assert_eq!(1.0 - twenty.cdf(0.9), 0.0, "1 - cdf cancels here");
+        assert_kstwo_rel(
+            twenty.sf(0.9),
+            2.0006866455078037e-20,
+            1e-14,
+            "kstwo.sf(0.9, 20)",
+        );
+        let thousand = Kstwo::new(1000)?;
+        assert_eq!(1.0 - thousand.cdf(0.2), 0.0, "1 - cdf cancels here");
+        assert_kstwo_rel(
+            thousand.sf(0.2),
+            1.5528629204250538e-35,
+            1e-12,
+            "kstwo.sf(0.2, 1000)",
+        );
+
+        for x in [0.0, 0.01, 0.02, 0.05] {
+            assert_eq!(ten.cdf(x), 0.0, "kstwo.cdf({x}, 10)");
+            assert_eq!(ten.sf(x), 1.0, "kstwo.sf({x}, 10)");
+            assert_eq!(ten.pdf(x), 0.0, "kstwo.pdf({x}, 10)");
+            assert_eq!(ten.logcdf(x), f64::NEG_INFINITY, "kstwo.logcdf({x}, 10)");
+        }
+        assert_eq!((ten.cdf(1.5), ten.sf(1.5), ten.pdf(1.5)), (1.0, 0.0, 0.0));
+        assert_eq!(
+            (ten.cdf(-0.5), ten.sf(-0.5), ten.pdf(-0.5)),
+            (0.0, 1.0, 0.0)
+        );
+        // isf through ppf(1 - q): 1 - 1e-20 rounds to 1, so that answer is the upper edge.
+        let hundred = Kstwo::new(100)?;
+        assert_eq!(hundred.ppf(1.0 - 1e-20), 1.0);
+        assert_kstwo_rel(
+            hundred.isf(1e-20),
+            0.46938222632910426,
+            1e-12,
+            "kstwo isf(1e-20, 100)",
+        );
+        Ok(())
+    }
+
+    /// SciPy 1.17.1 `ks_1samp` always takes the exact law: `pvalue = kstwo.sf(D, n)` for every
+    /// n (`if mode == 'auto': mode = 'exact'`). Before frankenscipy-1ksfv.16 fsci used the
+    /// asymptotic Kolmogorov series above n = 10000 and `fsci_special::smirnov`, which is
+    /// exp(-2 n d²) from n = 1000 on. Data x_i = (i + 1/2)/n + shift against the uniform CDF;
+    /// statistic and p-value from `scipy.stats.ks_1samp(x, uniform.cdf)`, measured
+    /// bit-identical. The old code gave 0.0013236624257262728 and 0.006152616450366392.
+    #[test]
+    fn ks_1samp_pvalue_is_scipy_kstwo_sf_for_every_n() {
+        for (n, shift, d_want, p_want) in [
+            (1000_usize, 0.06, 0.06050000000000011, 0.0012657830219129972),
+            (20000, 0.012, 0.012025000000000063, 0.0061027461978601935),
+        ] {
+            let nf = n as f64;
+            let data: Vec<f64> = (0..n).map(|i| (i as f64 + 0.5) / nf + shift).collect();
+            let r = ks_1samp(&data, |x| x.clamp(0.0, 1.0));
+            assert_eq!(r.statistic, d_want, "ks_1samp statistic, n = {n}");
+            assert_kstwo_rel(
+                r.pvalue,
+                p_want,
+                1e-14,
+                &format!("ks_1samp pvalue, n = {n}"),
             );
         }
     }
@@ -78196,6 +82264,64 @@ mod tests {
     fn pearsonr_too_few_points() {
         let result = pearsonr(&[1.0], &[2.0]);
         assert!(result.statistic.is_nan());
+    }
+
+    #[test]
+    fn correlations_raise_scipys_constant_input_warnings() {
+        let categories = |warnings: Vec<Warning>| -> Vec<WarningCategory> {
+            warnings.iter().map(|w| w.category).collect()
+        };
+        let x = [0.1, 0.1, 0.1];
+        let y = [1.0, 2.0, 3.0];
+        // 0.1 * 3 / 3 is not 0.1, so the centred values are not exactly zero; the result
+        // must still be SciPy's NaN, decided by the constancy test and not the arithmetic.
+        let named: [(&str, fn(&[f64], &[f64]) -> CorrelationResult); 4] = [
+            ("pearsonr", pearsonr),
+            ("spearmanr", spearmanr),
+            ("pointbiserialr", pointbiserialr),
+            ("pearsonr_alternative", |x, y| {
+                pearsonr_alternative(x, y, "less")
+            }),
+        ];
+        for (name, f) in named {
+            for (a, b) in [(&x[..], &y[..]), (&y[..], &x[..])] {
+                let (r, warnings) = catch_warnings(|| f(a, b));
+                assert!(r.statistic.is_nan() && r.pvalue.is_nan(), "{name}: {r:?}");
+                assert_eq!(
+                    categories(warnings),
+                    [WarningCategory::ConstantInputWarning],
+                    "{name}"
+                );
+            }
+        }
+        let (r, warnings) =
+            catch_warnings(|| spearmanr_alternative(&[2.0, 2.0], &[1.0, 3.0], "less"));
+        assert!(r.statistic.is_nan());
+        assert_eq!(
+            categories(warnings),
+            [WarningCategory::ConstantInputWarning]
+        );
+
+        // SciPy: pearsonr([1, 1+1e-15, 1, 1], [1, 2, 3, 4]) warns NearConstantInputWarning
+        // and still returns r = -0.2564945880212885.
+        let near = [1.0, 1.0 + 1e-15, 1.0, 1.0];
+        let ramp = [1.0, 2.0, 3.0, 4.0];
+        for (r, warnings) in [
+            catch_warnings(|| pearsonr(&near, &ramp)),
+            catch_warnings(|| pearsonr_alternative(&near, &ramp, "two-sided")),
+        ] {
+            assert!((r.statistic + 0.2564945880212885).abs() < 1e-12, "{r:?}");
+            assert_eq!(
+                categories(warnings),
+                [WarningCategory::NearConstantInputWarning]
+            );
+        }
+
+        // An input holding a NaN is not constant, and ordinary input warns nothing.
+        let (_, warnings) = catch_warnings(|| pearsonr(&[f64::NAN, f64::NAN, 1.0], &y));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, warnings) = catch_warnings(|| pearsonr(&[1.0, 3.0, 2.0], &y));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -84762,42 +88888,219 @@ mod tests {
         assert_eq!(result[0].len(), 4);
     }
 
-    #[test]
-    fn page_trend_test_increasing() {
-        // Clear increasing trend across conditions
-        let row1 = [1.0, 2.0, 3.0, 4.0];
-        let row2 = [1.0, 3.0, 2.0, 4.0];
-        let row3 = [2.0, 1.0, 3.0, 4.0];
-        let result = page_trend_test(&[&row1, &row2, &row3]);
-        assert!(result.statistic.is_finite());
-        assert!(result.pvalue.is_finite());
-        // Strong trend should have small p-value
-        assert!(result.pvalue < 0.1);
+    fn page_close(got: &PageTrendResult, l: f64, p: f64, method: PageTrendMethod, label: &str) {
+        assert_eq!(got.statistic, l, "{label}: L");
+        assert!(
+            (got.pvalue - p).abs() <= 1e-13 * p,
+            "{label}: p {} vs SciPy {p}",
+            got.pvalue
+        );
+        assert_eq!(got.method, method, "{label}: method");
     }
 
     #[test]
-    fn page_trend_test_no_trend() {
-        // No clear trend
-        let row1 = [4.0, 1.0, 3.0, 2.0];
-        let row2 = [2.0, 4.0, 1.0, 3.0];
-        let row3 = [3.0, 2.0, 4.0, 1.0];
-        let result = page_trend_test(&[&row1, &row2, &row3]);
-        assert!(result.statistic.is_finite());
-        assert!(result.pvalue.is_finite());
+    fn page_trend_test_exact_and_asymptotic_match_scipy() {
+        use PageTrendMethod::{Asymptotic, Auto, Exact};
+        let page = |rows: &[&[f64]], method| {
+            page_trend_test(rows, false, None, method).expect("page_trend_test")
+        };
+        // SciPy 1.17.1 page_trend_test. With at most 8 columns and few rows, 'auto' is the
+        // exact distribution; the pre-port code always took the normal approximation.
+        let inc: [&[f64]; 3] = [
+            &[1.0, 2.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+        ];
+        page_close(
+            &page(&inc, Auto),
+            88.0,
+            0.0028935185185185184,
+            Exact,
+            "increasing",
+        );
+        let none: [&[f64]; 3] = [
+            &[4.0, 1.0, 3.0, 2.0],
+            &[2.0, 4.0, 1.0, 3.0],
+            &[3.0, 2.0, 4.0, 1.0],
+        ];
+        page_close(
+            &page(&none, Auto),
+            71.0,
+            0.8088107638888886,
+            Exact,
+            "no trend",
+        );
+        // Ties: average ranks make L = 88.5, and the exact sf starts from int(L) = 88.
+        let ties: [&[f64]; 3] = [
+            &[1.0, 1.0, 3.0, 4.0],
+            &[2.0, 2.0, 5.0, 6.0],
+            &[3.0, 3.0, 7.0, 8.0],
+        ];
+        page_close(
+            &page(&ties, Auto),
+            88.5,
+            0.0028935185185185184,
+            Exact,
+            "ties",
+        );
+
+        // 7 columns: exact over 7! orderings per row.
+        let big: [&[f64]; 6] = [
+            &[2.041, -2.256, 1.018, 0.332, 0.747, 1.284, -0.22],
+            &[-0.232, -0.565, 3.923, 1.126, 0.847, 1.219, 1.132],
+            &[-1.055, -0.091, 1.082, 0.661, 2.158, 1.3, 1.824],
+            &[1.546, 0.845, 0.095, 0.717, 1.741, 3.435, 1.53],
+            &[-0.244, 1.302, -0.286, 0.608, 2.083, 2.08, 1.892],
+            &[0.67, -2.528, 1.621, -0.06, -0.469, 1.776, 2.501],
+        ];
+        page_close(
+            &page(&big, Auto),
+            750.0,
+            0.0022749974281885857,
+            Exact,
+            "7 columns",
+        );
+        page_close(
+            &page(&big, Asymptotic),
+            750.0,
+            0.002670496262533603,
+            Asymptotic,
+            "7 asym",
+        );
+
+        // 22 rows: 'auto' switches to the normal approximation; 'exact' still convolves.
+        let tall_rows = [
+            [-0.445, -0.876, 0.426, 0.547],
+            [1.406, 0.947, 0.594, 1.712],
+            [-0.206, -0.726, 0.984, 1.183],
+            [-0.215, -0.583, 0.629, -1.894],
+            [0.69, 0.691, -1.239, 0.661],
+            [-0.964, 0.957, -1.634, -0.314],
+            [0.71, 1.356, -1.758, 0.102],
+            [0.328, -0.409, 1.991, -0.591],
+            [0.355, -0.848, 1.806, 0.578],
+            [-0.372, -1.518, 2.082, 1.353],
+            [0.754, 1.338, 0.749, -0.039],
+            [-0.8, -0.6, 1.77, -0.86],
+            [-0.596, -0.121, 0.625, 1.175],
+            [-1.249, -1.53, 0.396, 1.814],
+            [0.757, 0.416, 0.083, 0.893],
+            [-0.243, 1.017, -0.394, 0.734],
+            [-0.111, 0.743, 0.625, 3.15],
+            [1.499, 1.697, -1.64, 0.26],
+            [-0.609, 0.733, -1.879, 1.774],
+            [1.067, -1.102, -0.579, -0.201],
+            [0.043, 0.841, 2.448, 0.403],
+            [0.768, 0.355, 2.16, 1.342],
+        ];
+        let tall: Vec<&[f64]> = tall_rows.iter().map(|r| &r[..]).collect();
+        page_close(
+            &page(&tall, Auto),
+            567.0,
+            0.10464263040960536,
+            Asymptotic,
+            "22 rows",
+        );
+        page_close(
+            &page(&tall, Exact),
+            567.0,
+            0.11222420175699505,
+            Exact,
+            "22 rows exact",
+        );
+
+        // Deep upper tail: SciPy's norm.sf gives 1.97e-54, where 1 - cdf is exactly 0.
+        let strong_row: Vec<f64> = (1..=9).map(f64::from).collect();
+        let strong: Vec<&[f64]> = (0..30).map(|_| &strong_row[..]).collect();
+        page_close(
+            &page(&strong, Auto),
+            8550.0,
+            1.9664165896741723e-54,
+            Asymptotic,
+            "tail",
+        );
     }
 
     #[test]
-    fn page_trend_test_empty() {
-        let result = page_trend_test(&[]);
-        assert!(result.statistic.is_nan());
-        assert!(result.pvalue.is_nan());
+    fn page_trend_test_ranked_and_predicted_ranks_match_scipy() {
+        use PageTrendMethod::{Auto, Exact};
+        let rows: [&[f64]; 3] = [
+            &[1.0, 2.0, 3.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+        ];
+        let got = page_trend_test(&rows, true, None, Auto).expect("ranked");
+        page_close(&got, 88.0, 0.0028935185185185184, Exact, "ranked");
+        let tied: [&[f64]; 3] = [
+            &[1.5, 1.5, 3.0, 4.0],
+            &[2.0, 1.0, 3.0, 4.0],
+            &[1.0, 3.0, 2.0, 4.0],
+        ];
+        let got = page_trend_test(&tied, true, None, Auto).expect("ranked ties");
+        page_close(&got, 87.5, 0.007016782407407407, Exact, "ranked ties");
+        let data: [&[f64]; 3] = [
+            &[21.0, 22.0, 24.0, 26.0],
+            &[23.0, 25.0, 27.0, 30.0],
+            &[20.0, 26.0, 28.0, 30.0],
+        ];
+        let got = page_trend_test(&data, false, Some(&[2, 3, 1, 4]), Auto).expect("predicted");
+        page_close(&got, 81.0, 0.142578125, Exact, "predicted ranks");
     }
 
     #[test]
-    fn page_trend_test_single_condition() {
-        let row1 = [1.0];
-        let result = page_trend_test(&[&row1]);
-        assert!(result.statistic.is_nan());
+    fn page_trend_test_rejects_what_scipy_rejects() {
+        use PageTrendMethod::Auto;
+        // Anything but an InvalidArgument maps to a sentinel that every assertion below rejects.
+        let msg = |r: Result<PageTrendResult, StatsError>| match r {
+            Err(StatsError::InvalidArgument(m)) => m,
+            _ => "<not an InvalidArgument error>".to_string(),
+        };
+        let shape = "Page's L is only appropriate for data with two or more rows and three or more \
+                     columns.";
+        assert_eq!(msg(page_trend_test(&[], false, None, Auto)), shape);
+        assert_eq!(
+            msg(page_trend_test(&[&[1.0, 2.0, 3.0]], false, None, Auto)),
+            shape
+        );
+        assert_eq!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0], &[2.0, 1.0]],
+                false,
+                None,
+                Auto
+            )),
+            shape
+        );
+        assert!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0, f64::NAN], &[2.0, 1.0, 3.0]],
+                false,
+                None,
+                Auto
+            ))
+            .contains("NaN")
+        );
+        assert!(
+            msg(page_trend_test(
+                &[&[1.0, 2.0, 3.0, 5.0], &[2.0, 1.0, 3.0, 4.0]],
+                true,
+                None,
+                Auto
+            ))
+            .contains("not properly ranked")
+        );
+        let rows: [&[f64]; 2] = [&[1.0, 2.0, 3.0], &[2.0, 1.0, 3.0]];
+        assert!(
+            msg(page_trend_test(&rows, false, Some(&[1, 1, 3]), Auto)).contains("exactly once")
+        );
+        assert!(msg(page_trend_test(&rows, false, Some(&[1, 2]), Auto)).contains("exactly once"));
+        let wide: Vec<f64> = (0..13).map(f64::from).collect();
+        let wide_rows: [&[f64]; 2] = [&wide, &wide];
+        assert!(
+            page_trend_test(&wide_rows, false, None, PageTrendMethod::Exact).is_err(),
+            "exact beyond PAGE_EXACT_MAX_COLUMNS"
+        );
+        assert!(page_trend_test(&wide_rows, false, None, Auto).is_ok());
     }
 
     #[test]
@@ -91817,17 +96120,26 @@ mod tests {
             BootstrapIntervalMethod::Basic,
         ] {
             let method = BootstrapMethod::new(31, None, 0, interval_method).expect("valid method");
-            let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+            let (result, warnings) =
+                catch_warnings(|| bootstrap(&data, sample_mean, 0.95, &method));
+            let result = result.expect("bootstrap result");
             assert_eq!(result.confidence_interval, (1.0, 1.0));
             assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+            assert!(
+                warnings.is_empty(),
+                "{interval_method:?} warned: {warnings:?}"
+            );
         }
 
         let method = BootstrapMethod::new(31, None, 0, BootstrapIntervalMethod::Bca)
             .expect("valid BCa method");
-        let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+        let (result, warnings) = catch_warnings(|| bootstrap(&data, sample_mean, 0.95, &method));
+        let result = result.expect("bootstrap result");
         assert!(result.confidence_interval.0.is_nan());
         assert!(result.confidence_interval.1.is_nan());
         assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+        let categories: Vec<_> = warnings.iter().map(|w| w.category).collect();
+        assert_eq!(categories, [WarningCategory::DegenerateDataWarning]);
     }
 
     #[test]
@@ -92287,9 +96599,18 @@ mod tests {
         let t10 = StudentT::new(10.0);
         assert_close(t10.kurtosis(), 1.0, 1e-10, "StudentT(10) kurtosis");
 
-        // df <= 4: undefined
+        // 2 < df <= 4: the fourth moment diverges; scipy.stats.t(3).stats('k') is inf
+        // (this asserted NaN until the szq1n.14 sweep). df <= 2: NaN, as in SciPy.
         let t3 = StudentT::new(3.0);
-        assert!(t3.kurtosis().is_nan(), "StudentT(3) kurtosis should be NaN");
+        assert_eq!(
+            t3.kurtosis(),
+            f64::INFINITY,
+            "StudentT(3) kurtosis should be inf"
+        );
+        assert!(
+            StudentT::new(2.0).kurtosis().is_nan(),
+            "StudentT(2) kurtosis should be NaN"
+        );
     }
 
     #[test]
@@ -101854,16 +106175,15 @@ mod tests {
         let row4: Vec<f64> = vec![2.0, 1.0, 3.0];
         let row5: Vec<f64> = vec![2.0, 1.0, 3.0];
         let data: Vec<&[f64]> = vec![&row1, &row2, &row3, &row4, &row5];
-        let result = page_trend_test(&data);
-        assert!(
-            (result.statistic - 68.0).abs() < 1e-10,
-            "page_trend statistic got {}, expected 68.0",
-            result.statistic
-        );
-        assert!(
-            result.pvalue > 0.0 && result.pvalue < 0.01,
-            "page_trend pvalue got {}, expected <0.01 (significant)",
-            result.pvalue
+        let result =
+            page_trend_test(&data, false, None, PageTrendMethod::Auto).expect("page_trend_test");
+        // SciPy 1.17.1: statistic 68.0, exact p-value 0.006558641975308641.
+        page_close(
+            &result,
+            68.0,
+            0.006558641975308641,
+            PageTrendMethod::Exact,
+            "five rows",
         );
     }
 
@@ -103000,6 +107320,14 @@ mod tests {
             (result - 0.07273929674533079).abs() < 1e-10,
             "cramers_v got {result}, expected 0.07273929674533079"
         );
+        // A 2x2 table is where Yates' correction would bite: SciPy 1.17.1
+        // `association([[15, 5], [3, 17]], method='cramer')` = 0.6030226891555273, and with
+        // correction=True it is 0.5527707983925666 (what fsci returned before).
+        let two_by_two = cramers_v(&[vec![15.0, 5.0], vec![3.0, 17.0]]);
+        assert!(
+            (two_by_two - 0.6030226891555273).abs() < 1e-12,
+            "2x2 cramers_v got {two_by_two}, expected SciPy's uncorrected 0.6030226891555273"
+        );
     }
 
     #[test]
@@ -103279,17 +107607,25 @@ mod tests {
         let row2: Vec<f64> = vec![23.0, 25.0, 27.0, 30.0];
         let row3: Vec<f64> = vec![20.0, 26.0, 28.0, 30.0];
         let data: Vec<&[f64]> = vec![&row1, &row2, &row3];
-        let result = page_trend_test(&data);
-        assert!(
-            (result.statistic - 90.0).abs() < 1e-6,
-            "page_trend_test statistic got {}, expected 90.0",
-            result.statistic
+        // SciPy 1.17.1: 'auto' is exact here (7.2e-5); the normal approximation this function
+        // used to return for every table gives 1.35e-3, 18x larger.
+        let exact =
+            page_trend_test(&data, false, None, PageTrendMethod::Auto).expect("page_trend_test");
+        page_close(
+            &exact,
+            90.0,
+            7.233796296296296e-05,
+            PageTrendMethod::Exact,
+            "auto",
         );
-        // p-value calculation differs from scipy; verify it's small and significant
-        assert!(
-            result.pvalue < 0.01 && result.pvalue > 0.0,
-            "page_trend_test pvalue got {}, expected small positive",
-            result.pvalue
+        let asymptotic = page_trend_test(&data, false, None, PageTrendMethod::Asymptotic)
+            .expect("page_trend_test");
+        page_close(
+            &asymptotic,
+            90.0,
+            0.0013498980316300933,
+            PageTrendMethod::Asymptotic,
+            "asymptotic",
         );
     }
 
@@ -107456,6 +111792,143 @@ mod tests {
              sharing TOGGLE_LOCK"
         );
     }
+
+    /// SciPy 1.17.1 `scipy.special.logsumexp`: [NaN], [NaN, inf] and [NaN, -inf] are all NaN,
+    /// as is `b = [NaN]` with a = [-inf]; [1, 2] is 2.313261687518223, [1, inf] is inf and
+    /// [-inf, -inf] is -inf. fsci's `f64::max` fold skipped the NaN, so the non-finite-max early
+    /// return answered -inf, inf and -inf for the first three.
+    #[test]
+    fn logsumexp_nan_beside_a_nonfinite_max_is_nan_like_scipy() {
+        for x in [
+            vec![f64::NAN],
+            vec![f64::NAN, f64::INFINITY],
+            vec![f64::NAN, f64::NEG_INFINITY],
+        ] {
+            let got = logsumexp(&x);
+            assert!(got.is_nan(), "logsumexp({x:?}): SciPy NaN, fsci {got}");
+            let ones = vec![1.0; x.len()];
+            let got = logsumexp_weighted(&x, &ones);
+            assert!(got.is_nan(), "logsumexp({x:?}, b=1): SciPy NaN, fsci {got}");
+        }
+        let got = logsumexp_weighted(&[f64::NEG_INFINITY], &[f64::NAN]);
+        assert!(
+            got.is_nan(),
+            "logsumexp([-inf], b=[NaN]): SciPy NaN, fsci {got}"
+        );
+        assert!((logsumexp(&[1.0, 2.0]) - 2.313_261_687_518_223).abs() < 1e-14);
+        assert!(
+            (logsumexp_weighted(&[1.0, 2.0], &[1.0, 1.0]) - 2.313_261_687_518_223).abs() < 1e-14
+        );
+        assert_eq!(logsumexp(&[1.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(
+            logsumexp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+    }
+
+    /// SciPy 1.17.1 (default nan_policy='propagate'): `tmax([1, NaN, 3], 7)`,
+    /// `tmax([9, NaN], 4)` and `tmin([1, NaN, 3], 0)` are NaN; `tmax([1, 5, 3], 4)` and
+    /// `tmin([1, 5, 3], 2)` are 3.0. fsci's `keep` filter dropped the NaN before the fold.
+    #[test]
+    fn tmax_tmin_propagate_nan_like_scipy() {
+        assert!(tmax(&[1.0, f64::NAN, 3.0], 7.0, true).is_nan());
+        assert!(tmax(&[9.0, f64::NAN], 4.0, true).is_nan());
+        assert!(tmin(&[1.0, f64::NAN, 3.0], 0.0, true).is_nan());
+        assert_eq!(tmax(&[1.0, 5.0, 3.0], 4.0, true), 3.0);
+        assert_eq!(tmin(&[1.0, 5.0, 3.0], 2.0, true), 3.0);
+        assert!(
+            tmax(&[9.0], 4.0, true).is_nan(),
+            "all above the limit stays NaN"
+        );
+    }
+
+    /// SciPy 1.17.1 `alexandergovern([1, 2, NaN, 4], [2, 3, 5, 6])` is (NaN, NaN); with 3.5 in
+    /// place of the NaN it is (1.096458164282565, 0.2950447051938173). fsci clamped the NaN
+    /// statistic with `.max(0.0)` before the chi-squared cdf and reported p = 1.
+    #[test]
+    fn alexander_govern_nan_group_gives_nan_pvalue_like_scipy() {
+        let with_nan: &[f64] = &[1.0, 2.0, f64::NAN, 4.0];
+        let finite: &[f64] = &[1.0, 2.0, 3.5, 4.0];
+        let other: &[f64] = &[2.0, 3.0, 5.0, 6.0];
+        let r = alexander_govern(&[with_nan, other]);
+        assert!(
+            r.statistic.is_nan() && r.pvalue.is_nan(),
+            "SciPy (NaN, NaN), fsci {r:?}"
+        );
+        let r = alexander_govern(&[finite, other]);
+        assert!((r.statistic - 1.096_458_164_282_565).abs() < 1e-12, "{r:?}");
+        assert!((r.pvalue - 0.295_044_705_193_817_3).abs() < 1e-12, "{r:?}");
+    }
+
+    /// SciPy 1.17.1: `invgauss(1.5).sf(nan)` is NaN and `invgauss(1.5).sf(2)` is
+    /// 0.21912087830523477. fsci's `.max(0.0)` rounding clamp turned the NaN into 0.0.
+    #[test]
+    fn inverse_gaussian_sf_at_nan_is_nan_like_scipy() {
+        let ig = InverseGaussian::new(1.5);
+        let v = ig.sf(f64::NAN);
+        assert!(v.is_nan(), "SciPy NaN, fsci {v}");
+        assert!((ig.sf(2.0) - 0.219_120_878_305_234_77).abs() < 1e-12);
+    }
+
+    /// SciPy 1.17.1: `kstwobign.pdf(nan)` is NaN and `kstwobign.pdf(2)` is
+    /// 0.005367402045629683. fsci's `.max(0.0)` rounding clamp turned the NaN into 0.0.
+    #[test]
+    fn kstwobign_pdf_at_nan_is_nan_like_scipy() {
+        let v = KsTwoBign.pdf(f64::NAN);
+        assert!(v.is_nan(), "SciPy NaN, fsci {v}");
+        assert!((KsTwoBign.pdf(2.0) - 0.005_367_402_045_629_683).abs() < 1e-13);
+    }
+
+    /// SciPy 1.17.1: `irwinhall(3).pdf(nan)` and `irwinhall(1).pdf(nan)` are NaN;
+    /// `irwinhall(3).pdf(1.2)` = 0.6599999999999999 and `irwinhall(1).pdf(0.5)` = 1.0. fsci's
+    /// `.max(0.0)` rounding clamp turned the NaN sum into 0.0 for n > 1, and n = 1 answered 0.0
+    /// from its range test.
+    #[test]
+    fn irwin_hall_pdf_at_nan_is_nan_like_scipy() {
+        for n in [3_u32, 1] {
+            let v = IrwinHall::new(n).pdf(f64::NAN);
+            assert!(v.is_nan(), "IrwinHall({n}).pdf(NaN): SciPy NaN, fsci {v}");
+        }
+        assert!((IrwinHall::new(3).pdf(1.2) - 0.66).abs() < 1e-12);
+        assert_eq!(IrwinHall::new(1).pdf(0.5), 1.0);
+    }
+
+    /// SciPy 1.17.1 `mstats.mjci(data, prob=[0.25, 0.5, 0.75])`: data 1..=10 gives
+    /// [1.3428021800481427, 1.5976788815406902, 1.3428021800481522]; with the 10 replaced by inf
+    /// every entry is NaN (`c2 − c1²` is inf − inf). fsci's `.max(0.0)` turned that NaN into 0.0.
+    #[test]
+    fn mjci_infinite_datum_gives_nan_like_scipy() {
+        let mut data: Vec<f64> = (1..=10).map(f64::from).collect();
+        let prob = [0.25, 0.5, 0.75];
+        let got = mjci(&data, &prob);
+        let want = [
+            1.342_802_180_048_142_7,
+            1.597_678_881_540_690_2,
+            1.342_802_180_048_152_2,
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() <= 1e-9, "got {got:?}, SciPy {want:?}");
+        }
+        data[9] = f64::INFINITY;
+        let got = mjci(&data, &prob);
+        assert!(
+            got.iter().all(|v| v.is_nan()),
+            "SciPy all NaN, fsci {got:?}"
+        );
+    }
+
+    /// numpy 2.4.3 (under SciPy 1.17.1): `nanmax([nan, nan])` and `nanmin([nan, nan])` are NaN
+    /// ("All-NaN slice encountered"); `nanmax([nan, 2, 1])` = 2.0, `nanmin([nan, 2, 1])` = 1.0,
+    /// `nanmax([-inf, nan])` = -inf. fsci's NaN-skipping fold returned its ±inf seed when nothing
+    /// was left.
+    #[test]
+    fn nanmax_nanmin_all_nan_is_nan_like_numpy() {
+        assert!(nanmax(&[f64::NAN, f64::NAN]).is_nan());
+        assert!(nanmin(&[f64::NAN, f64::NAN]).is_nan());
+        assert_eq!(nanmax(&[f64::NAN, 2.0, 1.0]), 2.0);
+        assert_eq!(nanmin(&[f64::NAN, 2.0, 1.0]), 1.0);
+        assert_eq!(nanmax(&[f64::NEG_INFINITY, f64::NAN]), f64::NEG_INFINITY);
+    }
 }
 
 /// frankenscipy-clttw — the tie predicate must be EXACT EQUALITY, not a tolerance.
@@ -109274,6 +113747,27 @@ mod goodness_of_fit_matches_scipy {
         let empty: Result<super::GofOutcome<Normal>, _> =
             goodness_of_fit(&[], GofStatistic::AndersonDarling, 99, 1);
         assert!(empty.is_err(), "an empty sample cannot be fitted");
+    }
+
+    /// SciPy 1.17.1, `goodness_of_fit(norm, data, known_params={'loc': 0, 'scale': 1},
+    /// statistic='ks')`: on [0.1, -0.4, NaN, 0.7, -1.1] the statistic is NaN (`kstest` agrees);
+    /// on [0.1, -0.4, 1.3, 0.7, -1.1] it is 0.158036347776927. fsci's KS branch took its max
+    /// with `f64::max`, which dropped the NaN cdf value and reported the other points' distance.
+    #[test]
+    fn ks_statistic_propagates_a_nan_point_like_scipy() {
+        let d = Normal::standard();
+        let with_nan = [0.1, -0.4, f64::NAN, 0.7, -1.1];
+        let got = gof_statistic(&d, &with_nan, GofStatistic::KolmogorovSmirnov);
+        assert!(
+            got.is_nan(),
+            "SciPy's KS statistic is NaN here; fsci gave {got}"
+        );
+        let finite = [0.1, -0.4, 1.3, 0.7, -1.1];
+        let got = gof_statistic(&d, &finite, GofStatistic::KolmogorovSmirnov);
+        assert!(
+            (got - 0.158_036_347_776_927).abs() < 1e-12,
+            "SciPy 0.158036347776927, fsci {got}"
+        );
     }
 }
 

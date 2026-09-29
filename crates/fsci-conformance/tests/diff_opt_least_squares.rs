@@ -13,12 +13,14 @@
 //! (LM solvers can converge to mathematically equivalent points with
 //! small numerical drift).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{LeastSquaresMethod, LeastSquaresOptions, least_squares};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -352,11 +355,13 @@ fn diff_opt_least_squares() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_opt_least_squares", &["least_squares"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_x), Some(exp_cost)) = (o.x.as_ref(), o.cost) else {
-            continue;
+        let scipy = match (o.x.as_deref(), o.cost) {
+            (Some(exp_x), Some(exp_cost)) => Some((exp_x, exp_cost)),
+            _ => None,
         };
 
         let case_clone = case.clone();
@@ -366,21 +371,32 @@ fn diff_opt_least_squares() {
             method: Some(LeastSquaresMethod::Lm),
             ..LeastSquaresOptions::default()
         };
-        let result = match least_squares(f, &case.x0, lm) {
-            Ok(r) => r,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fsci_converged: false,
-                    scipy_converged: o.converged,
-                    fsci_cost: f64::INFINITY,
-                    scipy_cost: exp_cost,
-                    max_param_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("least_squares error: {e:?}"),
-                });
-                continue;
-            }
+        let result = least_squares(f, &case.x0, lm);
+        if let (Some((_, exp_cost)), Err(e)) = (scipy, &result) {
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                fsci_converged: false,
+                scipy_converged: o.converged,
+                fsci_cost: f64::INFINITY,
+                scipy_cost: exp_cost,
+                max_param_abs_diff: f64::INFINITY,
+                pass: false,
+                note: format!("least_squares error: {e:?}"),
+            });
+        }
+        let Some(((exp_x, exp_cost), result)) =
+            ledger.both("least_squares", &case.case_id, scipy, result.ok())
+        else {
+            continue;
+        };
+        // The ledger rejects a parameter-count mismatch and a NaN parameter.
+        let Some((exp_x, fsci_x)) = ledger.slices(
+            "least_squares",
+            &case.case_id,
+            Some(exp_x),
+            Some(result.x.as_slice()),
+        ) else {
+            continue;
         };
 
         let fsci_cost = result.cost;
@@ -390,8 +406,8 @@ fn diff_opt_least_squares() {
         let cost_pass = rel_cost_d <= COST_REL_TOL || abs_cost_d <= COST_ABS_TOL;
 
         let mut max_param_abs = 0.0_f64;
-        let mut param_pass = result.x.len() == exp_x.len();
-        for (a, e) in result.x.iter().zip(exp_x.iter()) {
+        let mut param_pass = true;
+        for (a, e) in fsci_x.iter().zip(exp_x.iter()) {
             let abs_d = (a - e).abs();
             let denom = e.abs().max(1.0e-300);
             let rel_d = abs_d / denom;
@@ -400,6 +416,7 @@ fn diff_opt_least_squares() {
         }
         let converged_both = result.success && o.converged;
         let pass = converged_both && cost_pass && param_pass;
+        ledger.compared("least_squares", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci_converged: result.success,
@@ -417,6 +434,7 @@ fn diff_opt_least_squares() {
         test_id: "diff_opt_least_squares".into(),
         category: "fsci_opt::least_squares vs scipy.optimize.least_squares(method=lm)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -444,4 +462,5 @@ fn diff_opt_least_squares() {
         "least_squares parity failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

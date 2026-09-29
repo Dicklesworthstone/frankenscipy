@@ -8,13 +8,14 @@
 //! at 1e-9 abs (Chebyshev attenuation parameter exposes more
 //! floating-point sensitivity in scipy's implementation).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{barthann, chebwin, general_cosine, general_gaussian, lanczos};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -290,14 +292,13 @@ fn diff_signal_window_more() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["barthann", "gcos", "ggauss", "lanczos", "chebwin"];
+    let mut ledger = CompareLedger::new("diff_signal_window_more", &arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        let scipy_v = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
         let (window, tol) = match case.op.as_str() {
             "barthann" => (barthann(case.n), TIGHT_TOL),
             "gcos" => (general_cosine(case.n, &case.coeffs, case.sym), TIGHT_TOL),
@@ -307,10 +308,16 @@ fn diff_signal_window_more() {
             ),
             "lanczos" => (lanczos(case.n), TIGHT_TOL),
             "chebwin" => (chebwin(case.n, case.at), CHEB_TOL),
-            _ => continue,
+            other => panic!("window_more: unknown op {other}"),
         };
-        let abs_d = vec_max_diff(&window, expected);
+        let Some((expected, window)) =
+            ledger.slices(&case.op, &case.case_id, scipy_v, Some(window.as_slice()))
+        else {
+            continue;
+        };
+        let abs_d = vec_max_diff(window, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -327,6 +334,7 @@ fn diff_signal_window_more() {
             "fsci_signal::{barthann, general_cosine, general_gaussian, lanczos, chebwin} vs scipy.signal.windows"
                 .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -347,4 +355,10 @@ fn diff_signal_window_more() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = arms
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

@@ -43,7 +43,7 @@
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case, not a skipped
 //! one (frankenscipy-olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -51,6 +51,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
     ConvergenceStatus, GradientFunc, HessFunc, HesspFunc, MinimizeOptions, OptimizeMethod, minimize,
 };
@@ -403,6 +404,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     same_path_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -647,6 +649,8 @@ fn diff_opt_bfgs() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let methods = ["BFGS", "CG", "Newton-CG"];
+    let mut ledger = CompareLedger::new("diff_opt_bfgs", &methods);
     for case in &cases {
         let problem = &problems[case.problem];
         let arm = &arms[&case.id];
@@ -659,6 +663,16 @@ fn diff_opt_bfgs() {
             ..MinimizeOptions::default()
         };
         let fsci = minimize(problem.fun, &problem.x0, options);
+        // SciPy's result is its x together with its status; an fsci error is `rust_failed`, and a
+        // NaN in fsci's x (which the max fold below would swallow) or a length mismatch is
+        // recorded instead of compared.
+        let scipy_x = arm.status.and(arm.x.as_deref());
+        let compared_x = ledger.slices(
+            case.scipy_method,
+            &case.id,
+            scipy_x,
+            fsci.as_ref().ok().map(|r| r.x.as_slice()),
+        );
         let scipy_counts = [
             arm.nit.unwrap_or(0),
             arm.nfev.unwrap_or(0),
@@ -677,12 +691,16 @@ fn diff_opt_bfgs() {
             pass: false,
             reason: String::new(),
         };
-        match (fsci, arm.status, &arm.x) {
-            (Err(e), _, _) => diff.reason = format!("fsci error {e}"),
-            (Ok(_), None, _) | (Ok(_), _, None) => {
-                diff.reason = "SciPy produced no result".to_string();
+        match (&fsci, arm.status.zip(compared_x)) {
+            (Err(e), _) => diff.reason = format!("fsci error {e}"),
+            (Ok(_), None) => {
+                diff.reason = if scipy_x.is_none() {
+                    "SciPy produced no result".to_string()
+                } else {
+                    "fsci x has a different length or a non-finite element".to_string()
+                };
             }
-            (Ok(r), Some(status), Some(scipy_x)) => {
+            (Ok(r), Some((status, (scipy_x, _)))) => {
                 diff.fsci_status = format!("{:?}", r.status);
                 diff.fsci_counts = [r.nit, r.nfev, r.njev, r.nhev];
                 diff.fsci_fun = r.fun.unwrap_or(f64::NAN);
@@ -736,6 +754,7 @@ fn diff_opt_bfgs() {
                     problems_found.push(format!("nit {} vs SciPy {}", r.nit, scipy_counts[0]));
                 }
                 diff.pass = problems_found.is_empty();
+                ledger.compared(case.scipy_method, &case.id, diff.pass);
                 diff.reason = problems_found.join("; ");
             }
         }
@@ -751,6 +770,7 @@ fn diff_opt_bfgs() {
         test_id: "diff_opt_bfgs".into(),
         category: "scipy.optimize.minimize(method='BFGS' | 'CG' | 'Newton-CG')".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         same_path_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -798,6 +818,13 @@ fn diff_opt_bfgs() {
             );
         }
     }
+    ledger.finish(
+        methods
+            .iter()
+            .map(|m| cases.iter().filter(|c| c.scipy_method == *m).count())
+            .min()
+            .unwrap_or(0),
+    );
 }
 
 /// The paths no OpenBLAS kernel moves (all five agree on every counter): BFGS with the

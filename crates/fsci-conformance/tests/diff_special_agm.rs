@@ -11,13 +11,14 @@
 //! AGM converges quadratically and fsci's stop criterion is
 //! 1e-15 relative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::agm;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -89,11 +91,6 @@ fn emit_log(log: &DiffLog) {
     let path = output_dir().join(format!("{}.json", log.test_id));
     let json = serde_json::to_string_pretty(log).expect("serialize agm diff log");
     fs::write(path, json).expect("write agm diff log");
-}
-
-fn fsci_eval(a: f64, b: f64) -> Option<f64> {
-    let v = agm(a, b);
-    if v.is_finite() { Some(v) } else { None }
 }
 
 fn generate_query() -> OracleQuery {
@@ -238,25 +235,32 @@ fn diff_special_agm() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_agm", &["agm"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.a, case.b)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        // pair records a non-finite fsci value against a finite oracle value as an fsci failure.
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "agm",
+            &case.case_id,
+            oracle.value,
+            Some(agm(case.a, case.b)),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared("agm", &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -265,6 +269,7 @@ fn diff_special_agm() {
         test_id: "diff_special_agm".into(),
         category: "scipy.special.agm (mpmath oracle)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -291,4 +296,5 @@ fn diff_special_agm() {
         max_abs_overall,
         max_rel_overall
     );
+    ledger.finish(query.points.len());
 }

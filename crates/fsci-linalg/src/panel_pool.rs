@@ -115,16 +115,9 @@ impl Drop for BatchGuard<'_, '_> {
 /// A pool of workers that stay alive across many batches.
 pub(crate) struct PanelPool<'a, 'env> {
     shared: &'a Shared<'env>,
-    workers: usize,
 }
 
 impl<'env> PanelPool<'_, 'env> {
-    /// Number of worker threads. A caller that wants to keep its own chunking
-    /// decisions consistent with the pool should size chunks against this.
-    pub(crate) fn workers(&self) -> usize {
-        self.workers
-    }
-
     /// Run every task and return once all of them have finished.
     ///
     /// Tasks may run in any order and on any worker; the caller is responsible for
@@ -212,7 +205,7 @@ pub(crate) fn with_panel_pool<'env, R>(
             });
         }
 
-        let pool = PanelPool { shared, workers };
+        let pool = PanelPool { shared };
         let result = body(&pool);
 
         // Retire the workers so `scope` can join them.

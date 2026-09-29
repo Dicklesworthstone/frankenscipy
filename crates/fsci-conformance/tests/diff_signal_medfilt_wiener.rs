@@ -9,13 +9,14 @@
 //! Tolerance: 1e-12 abs (medfilt) / 1e-10 abs (wiener — depends on
 //! mean/var arithmetic).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{medfilt, wiener};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -286,27 +288,25 @@ fn diff_signal_medfilt_wiener() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_medfilt_wiener", &["medfilt", "wiener"]);
 
     for case in &query.medfilt {
-        let Some(arm) = med_map.get(&case.case_id) else {
+        let scipy_v = med_map
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let fsci_v = medfilt(&case.data, case.kernel_size).ok();
+        let Some((expected, actual)) =
+            ledger.slices("medfilt", &case.case_id, scipy_v, fsci_v.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let Ok(actual) = medfilt(&case.data, case.kernel_size) else {
-            continue;
-        };
-        let abs_d = if actual.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("medfilt", &case.case_id, abs_d <= MED_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "medfilt".into(),
@@ -316,25 +316,22 @@ fn diff_signal_medfilt_wiener() {
     }
 
     for case in &query.wiener {
-        let Some(arm) = wn_map.get(&case.case_id) else {
+        let scipy_v = wn_map
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
+        let fsci_v = wiener(&case.data, case.mysize, case.noise).ok();
+        let Some((expected, actual)) =
+            ledger.slices("wiener", &case.case_id, scipy_v, fsci_v.as_deref())
+        else {
             continue;
         };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
-        let Ok(actual) = wiener(&case.data, case.mysize, case.noise) else {
-            continue;
-        };
-        let abs_d = if actual.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("wiener", &case.case_id, abs_d <= WIENER_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "wiener".into(),
@@ -349,6 +346,7 @@ fn diff_signal_medfilt_wiener() {
         test_id: "diff_signal_medfilt_wiener".into(),
         category: "fsci_signal::medfilt + wiener vs scipy.signal".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -369,4 +367,5 @@ fn diff_signal_medfilt_wiener() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.medfilt.len().min(query.wiener.len()));
 }

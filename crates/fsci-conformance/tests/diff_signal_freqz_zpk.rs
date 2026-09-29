@@ -7,13 +7,14 @@
 //! scipy.signal.freqz_zpk via subprocess oracle and diffs
 //! h_mag and h_phase. Skips cleanly if scipy is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{ZpkCoeffs, freqz_zpk};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     pass: bool,
@@ -251,14 +253,12 @@ fn diff_signal_freqz_zpk() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_freqz_zpk", &["h_mag", "h_phase"]);
 
     for case in &cases {
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let (Some(scipy_mag), Some(scipy_phase)) = (&oracle.h_mag, &oracle.h_phase) else {
-            continue;
-        };
 
         let zpk = ZpkCoeffs {
             zeros_re: case.zeros_re.clone(),
@@ -267,17 +267,40 @@ fn diff_signal_freqz_zpk() {
             poles_im: case.poles_im.clone(),
             gain: case.gain,
         };
-        let r = freqz_zpk(&zpk, Some(case.n_freqs)).expect("freqz_zpk");
+        let r = freqz_zpk(&zpk, Some(case.n_freqs)).ok();
 
-        let mut max_mag_diff = 0.0_f64;
-        let mut max_phase_diff = 0.0_f64;
-        for k in 0..case.n_freqs {
-            let m_diff = (r.h_mag[k] - scipy_mag[k]).abs();
-            max_mag_diff = max_mag_diff.max(m_diff);
-            // Phase has ±2π wrap ambiguity near jumps.
-            let raw = (r.h_phase[k] - scipy_phase[k]).abs();
-            let wrapped = (raw - std::f64::consts::TAU).abs().min(raw);
-            max_phase_diff = max_phase_diff.max(wrapped);
+        let mut max_mag_diff = f64::NAN;
+        if let Some((scipy_mag, fsci_mag)) = ledger.slices(
+            "h_mag",
+            &case.case_id,
+            oracle.h_mag.as_deref(),
+            r.as_ref().map(|r| r.h_mag.as_slice()),
+        ) {
+            max_mag_diff = fsci_mag
+                .iter()
+                .zip(scipy_mag)
+                .map(|(f, s)| (f - s).abs())
+                .fold(0.0_f64, f64::max);
+            ledger.compared("h_mag", &case.case_id, max_mag_diff <= ABS_TOL);
+        }
+        let mut max_phase_diff = f64::NAN;
+        if let Some((scipy_phase, fsci_phase)) = ledger.slices(
+            "h_phase",
+            &case.case_id,
+            oracle.h_phase.as_deref(),
+            r.as_ref().map(|r| r.h_phase.as_slice()),
+        ) {
+            max_phase_diff = 0.0_f64;
+            for (f, s) in fsci_phase.iter().zip(scipy_phase) {
+                // Phase has ±2π wrap ambiguity near jumps.
+                let raw = (f - s).abs();
+                let wrapped = (raw - std::f64::consts::TAU).abs().min(raw);
+                max_phase_diff = max_phase_diff.max(wrapped);
+            }
+            ledger.compared("h_phase", &case.case_id, max_phase_diff <= ABS_TOL);
+        }
+        if max_mag_diff.is_nan() || max_phase_diff.is_nan() {
+            continue; // the ledger recorded why this case was not compared
         }
         let pass = max_mag_diff <= ABS_TOL && max_phase_diff <= ABS_TOL;
         max_overall = max_overall.max(max_mag_diff).max(max_phase_diff);
@@ -296,6 +319,7 @@ fn diff_signal_freqz_zpk() {
         test_id: "diff_signal_freqz_zpk".into(),
         category: "scipy.signal.freqz_zpk".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         pass: all_pass,
@@ -321,4 +345,5 @@ fn diff_signal_freqz_zpk() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

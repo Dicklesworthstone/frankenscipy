@@ -9,10 +9,12 @@
 //! audit emission, not the values). Compare via dense reconstruction
 //! at 1e-15 abs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::ops::csr_to_csc_with_mode_and_audit;
 use fsci_sparse::{
@@ -37,6 +39,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -112,7 +115,7 @@ fn diff_sparse_conv_with_mode() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
-    let ledger = sync_audit_ledger();
+    let audit_ledger = sync_audit_ledger();
 
     let probes: &[(&str, usize, usize, Vec<(usize, usize, f64)>)] = &[
         (
@@ -141,6 +144,13 @@ fn diff_sparse_conv_with_mode() {
         ),
     ];
 
+    // The reference arm is the plain to_csr / to_csc conversion; each *_with_mode result is
+    // compared against it.
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_conv_with_mode",
+        &["coo_to_csr", "csr_to_csc", "csr_to_csc_audit", "csc_to_csr"],
+    );
+
     for (label, rows, cols, trips) in probes {
         let mut data = Vec::new();
         let mut rs = Vec::new();
@@ -150,83 +160,82 @@ fn diff_sparse_conv_with_mode() {
             rs.push(r);
             cs.push(c);
         }
-        let Ok(coo) = CooMatrix::from_triplets(Shape2D::new(*rows, *cols), data, rs, cs, true)
-        else {
-            continue;
-        };
+        let coo = CooMatrix::from_triplets(Shape2D::new(*rows, *cols), data, rs, cs, true)
+            .expect("plain coo from triplets");
         let plain_csr = coo.to_csr().expect("plain coo->csr");
         let plain_dense_csr = csr_to_dense(&plain_csr);
-
-        // coo_to_csr_with_mode under Strict
-        if let Ok((mode_csr, _log)) =
-            coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test-c2c-strict")
-        {
-            let d = vec_diff(&csr_to_dense(&mode_csr), &plain_dense_csr);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: format!("coo2csr_strict_{label}"),
-                op: "coo_to_csr".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL,
-            });
-        }
-        // coo_to_csr_with_mode under Hardened
-        if let Ok((mode_csr, _log)) =
-            coo_to_csr_with_mode(&coo, RuntimeMode::Hardened, "test-c2c-hard")
-        {
-            let d = vec_diff(&csr_to_dense(&mode_csr), &plain_dense_csr);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: format!("coo2csr_hard_{label}"),
-                op: "coo_to_csr".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL,
-            });
-        }
-
-        // csr_to_csc_with_mode
         let plain_csc = plain_csr.to_csc().expect("plain csr->csc");
         let plain_dense_csc = csc_to_dense(&plain_csc);
-        if let Ok((mode_csc, _log)) =
-            csr_to_csc_with_mode(&plain_csr, RuntimeMode::Strict, "test-r2c-strict")
-        {
-            let d = vec_diff(&csc_to_dense(&mode_csc), &plain_dense_csc);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: format!("csr2csc_strict_{label}"),
-                op: "csr_to_csc".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL,
-            });
-        }
-        // csr_to_csc_with_mode_and_audit (Strict — never emits, output identical)
-        if let Ok((mode_csc, _log)) = csr_to_csc_with_mode_and_audit(
-            &plain_csr,
-            RuntimeMode::Strict,
-            "test-r2c-audit",
-            &ledger,
-        ) {
-            let d = vec_diff(&csc_to_dense(&mode_csc), &plain_dense_csc);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: format!("csr2csc_audit_strict_{label}"),
-                op: "csr_to_csc_audit".into(),
-                abs_diff: d,
-                pass: d <= ABS_TOL,
-            });
-        }
-
-        // csc_to_csr_with_mode
         let plain_csr2 = plain_csc.to_csr().expect("plain csc->csr");
         let plain_dense_csr2 = csr_to_dense(&plain_csr2);
-        if let Ok((mode_csr2, _log)) =
-            csc_to_csr_with_mode(&plain_csc, RuntimeMode::Strict, "test-c2r-strict")
-        {
-            let d = vec_diff(&csr_to_dense(&mode_csr2), &plain_dense_csr2);
+
+        let checks = [
+            // coo_to_csr_with_mode under Strict
+            (
+                "coo_to_csr",
+                format!("coo2csr_strict_{label}"),
+                &plain_dense_csr,
+                coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test-c2c-strict")
+                    .ok()
+                    .map(|(mode_csr, _log)| csr_to_dense(&mode_csr)),
+            ),
+            // coo_to_csr_with_mode under Hardened
+            (
+                "coo_to_csr",
+                format!("coo2csr_hard_{label}"),
+                &plain_dense_csr,
+                coo_to_csr_with_mode(&coo, RuntimeMode::Hardened, "test-c2c-hard")
+                    .ok()
+                    .map(|(mode_csr, _log)| csr_to_dense(&mode_csr)),
+            ),
+            // csr_to_csc_with_mode
+            (
+                "csr_to_csc",
+                format!("csr2csc_strict_{label}"),
+                &plain_dense_csc,
+                csr_to_csc_with_mode(&plain_csr, RuntimeMode::Strict, "test-r2c-strict")
+                    .ok()
+                    .map(|(mode_csc, _log)| csc_to_dense(&mode_csc)),
+            ),
+            // csr_to_csc_with_mode_and_audit (Strict — never emits, output identical)
+            (
+                "csr_to_csc_audit",
+                format!("csr2csc_audit_strict_{label}"),
+                &plain_dense_csc,
+                csr_to_csc_with_mode_and_audit(
+                    &plain_csr,
+                    RuntimeMode::Strict,
+                    "test-r2c-audit",
+                    &audit_ledger,
+                )
+                .ok()
+                .map(|(mode_csc, _log)| csc_to_dense(&mode_csc)),
+            ),
+            // csc_to_csr_with_mode
+            (
+                "csc_to_csr",
+                format!("csc2csr_strict_{label}"),
+                &plain_dense_csr2,
+                csc_to_csr_with_mode(&plain_csc, RuntimeMode::Strict, "test-c2r-strict")
+                    .ok()
+                    .map(|(mode_csr2, _log)| csr_to_dense(&mode_csr2)),
+            ),
+        ];
+        for (op, case_id, plain_dense, mode_dense) in checks {
+            let Some((plain_dense, mode_dense)) = ledger.slices(
+                op,
+                &case_id,
+                Some(plain_dense.as_slice()),
+                mode_dense.as_deref(),
+            ) else {
+                continue;
+            };
+            let d = vec_diff(mode_dense, plain_dense);
             max_overall = max_overall.max(d);
+            ledger.compared(op, &case_id, d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("csc2csr_strict_{label}"),
-                op: "csc_to_csr".into(),
+                case_id,
+                op: op.into(),
                 abs_diff: d,
                 pass: d <= ABS_TOL,
             });
@@ -240,6 +249,7 @@ fn diff_sparse_conv_with_mode() {
         category: "fsci_sparse with-mode conversion variants equivalent to plain to_csr/to_csc"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -260,4 +270,5 @@ fn diff_sparse_conv_with_mode() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(probes.len());
 }

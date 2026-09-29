@@ -8,10 +8,12 @@
 //! `*_impl` worker; the only difference is whether an audit ledger
 //! is passed. Output should be bit-identical.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{
     Complex64, FftOptions, fft, fft_with_audit, ifft, ifft_with_audit, irfft, irfft_with_audit,
     rfft, rfft_with_audit, sync_audit_ledger,
@@ -34,6 +36,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -62,14 +65,10 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write log");
 }
 
-fn complex_max_diff(a: &[Complex64], b: &[Complex64]) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
-    a.iter()
-        .zip(b.iter())
-        .map(|((ar, ai), (br, bi))| (ar - br).abs().max((ai - bi).abs()))
-        .fold(0.0_f64, f64::max)
+/// Complex output as [re0, im0, re1, im1, ...]: `real_max_diff` over it is the per-element
+/// max(|d re|, |d im|) folded by max.
+fn flatten(v: &[Complex64]) -> Vec<f64> {
+    v.iter().flat_map(|&(re, im)| [re, im]).collect()
 }
 
 fn real_max_diff(a: &[f64], b: &[f64]) -> f64 {
@@ -88,9 +87,16 @@ fn diff_fft_audit_variants_equivalence() {
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
     let opts = FftOptions::default();
-    let ledger = sync_audit_ledger();
+    let audit_ledger = sync_audit_ledger();
+    let sizes = [16_usize, 32, 64, 128];
+    // The reference side is fsci's own non-audit variant, not SciPy: a failed plain call is
+    // recorded as a missing reference value, a failed audited call as an fsci failure.
+    let mut ledger = CompareLedger::new(
+        "diff_fft_audit_variants_equivalence",
+        &["fft", "ifft", "rfft", "irfft"],
+    );
 
-    for &n in &[16_usize, 32, 64, 128] {
+    for &n in &sizes {
         // fft
         let signal: Vec<Complex64> = (0..n)
             .map(|i| {
@@ -101,69 +107,61 @@ fn diff_fft_audit_variants_equivalence() {
                 )
             })
             .collect();
-        let Ok(plain) = fft(&signal, &opts) else {
-            continue;
-        };
-        let Ok(audited) = fft_with_audit(&signal, &opts, &ledger) else {
-            continue;
-        };
-        let d = complex_max_diff(&plain, &audited);
-        max_overall = max_overall.max(d);
-        diffs.push(CaseDiff {
-            case_id: format!("fft_n{n}"),
-            op: "fft".into(),
-            abs_diff: d,
-            pass: d <= ABS_TOL,
-        });
+        let plain = fft(&signal, &opts).ok();
+        let audited = fft_with_audit(&signal, &opts, &audit_ledger).ok();
 
         // ifft (round trip through fft)
-        let Ok(p_ifft) = ifft(&plain, &opts) else {
-            continue;
-        };
-        let Ok(a_ifft) = ifft_with_audit(&plain, &opts, &ledger) else {
-            continue;
-        };
-        let d = complex_max_diff(&p_ifft, &a_ifft);
-        max_overall = max_overall.max(d);
-        diffs.push(CaseDiff {
-            case_id: format!("ifft_n{n}"),
-            op: "ifft".into(),
-            abs_diff: d,
-            pass: d <= ABS_TOL,
-        });
+        let p_ifft = plain.as_ref().and_then(|x| ifft(x, &opts).ok());
+        let a_ifft = plain
+            .as_ref()
+            .and_then(|x| ifft_with_audit(x, &opts, &audit_ledger).ok());
 
         // rfft
         let real_sig: Vec<f64> = signal.iter().map(|(re, _)| *re).collect();
-        let Ok(p_rfft) = rfft(&real_sig, &opts) else {
-            continue;
-        };
-        let Ok(a_rfft) = rfft_with_audit(&real_sig, &opts, &ledger) else {
-            continue;
-        };
-        let d = complex_max_diff(&p_rfft, &a_rfft);
-        max_overall = max_overall.max(d);
-        diffs.push(CaseDiff {
-            case_id: format!("rfft_n{n}"),
-            op: "rfft".into(),
-            abs_diff: d,
-            pass: d <= ABS_TOL,
-        });
+        let p_rfft = rfft(&real_sig, &opts).ok();
+        let a_rfft = rfft_with_audit(&real_sig, &opts, &audit_ledger).ok();
 
         // irfft
-        let Ok(p_irfft) = irfft(&p_rfft, Some(n), &opts) else {
-            continue;
-        };
-        let Ok(a_irfft) = irfft_with_audit(&p_rfft, Some(n), &opts, &ledger) else {
-            continue;
-        };
-        let d = real_max_diff(&p_irfft, &a_irfft);
-        max_overall = max_overall.max(d);
-        diffs.push(CaseDiff {
-            case_id: format!("irfft_n{n}"),
-            op: "irfft".into(),
-            abs_diff: d,
-            pass: d <= ABS_TOL,
-        });
+        let p_irfft = p_rfft.as_ref().and_then(|x| irfft(x, Some(n), &opts).ok());
+        let a_irfft = p_rfft
+            .as_ref()
+            .and_then(|x| irfft_with_audit(x, Some(n), &opts, &audit_ledger).ok());
+
+        let arms = [
+            (
+                "fft",
+                plain.as_deref().map(flatten),
+                audited.as_deref().map(flatten),
+            ),
+            (
+                "ifft",
+                p_ifft.as_deref().map(flatten),
+                a_ifft.as_deref().map(flatten),
+            ),
+            (
+                "rfft",
+                p_rfft.as_deref().map(flatten),
+                a_rfft.as_deref().map(flatten),
+            ),
+            ("irfft", p_irfft, a_irfft),
+        ];
+        for (op, reference, with_audit) in arms {
+            let case_id = format!("{op}_n{n}");
+            let Some((r, a)) =
+                ledger.slices(op, &case_id, reference.as_deref(), with_audit.as_deref())
+            else {
+                continue;
+            };
+            let d = real_max_diff(r, a);
+            max_overall = max_overall.max(d);
+            ledger.compared(op, &case_id, d <= ABS_TOL);
+            diffs.push(CaseDiff {
+                case_id,
+                op: op.into(),
+                abs_diff: d,
+                pass: d <= ABS_TOL,
+            });
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -172,6 +170,7 @@ fn diff_fft_audit_variants_equivalence() {
         test_id: "diff_fft_audit_variants_equivalence".into(),
         category: "fsci_fft::*_with_audit equivalent to non-audit variants".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -192,4 +191,5 @@ fn diff_fft_audit_variants_equivalence() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(sizes.len());
 }

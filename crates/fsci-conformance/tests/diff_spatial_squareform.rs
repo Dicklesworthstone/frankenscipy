@@ -12,13 +12,14 @@
 //! 4 dimensional fixtures (n=3, 5, 8, 12) plus 4 invalid-DM
 //! probes (asymmetric, non-zero diag, negative entry, NaN).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{
     is_valid_dm, is_valid_y, num_obs_dm, num_obs_y, squareform_to_condensed, squareform_to_matrix,
 };
@@ -76,6 +77,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -322,73 +324,112 @@ fn diff_spatial_squareform() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_squareform",
+        &[
+            "squareform_to_condensed",
+            "squareform_to_matrix",
+            "num_obs_dm",
+            "num_obs_y",
+            "is_valid_dm_valid_input",
+            "is_valid_y_valid_input",
+            "is_valid_dm_invalid_input",
+        ],
+    );
 
     for case in &query.valid_dms {
         let scipy_arm = valid_map.get(&case.case_id).expect("validated oracle");
         let n = case.matrix.len();
+        // fsci's condensed form feeds the round-trip, num_obs_y and is_valid_y arms; when it
+        // fails, each of those arms records an fsci failure instead of skipping.
+        let rust_cond_res = squareform_to_condensed(&case.matrix);
+        let rust_cond = rust_cond_res.as_ref().ok();
 
-        // squareform_to_condensed
-        if let Some(scipy_cond) = scipy_arm.condensed.as_ref() {
-            match squareform_to_condensed(&case.matrix) {
-                Ok(rust_cond) => {
-                    let pass = rust_cond.len() == scipy_cond.len()
-                        && rust_cond
-                            .iter()
-                            .zip(scipy_cond.iter())
-                            .all(|(r, s)| (r - s).abs() <= ABS_TOL);
-                    cases.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        sub_check: "squareform_to_condensed".into(),
-                        pass,
-                        detail: format!(
-                            "rust_len={}, scipy_len={}",
-                            rust_cond.len(),
-                            scipy_cond.len()
-                        ),
-                    });
-                }
-                Err(e) => cases.push(CaseDiff {
+        // squareform_to_condensed. slices rejects a length mismatch and a non-finite element.
+        match (
+            ledger.slices(
+                "squareform_to_condensed",
+                &case.case_id,
+                scipy_arm.condensed.as_deref(),
+                rust_cond.map(Vec::as_slice),
+            ),
+            &rust_cond_res,
+        ) {
+            (Some((scipy_cond, rust_cond)), _) => {
+                let pass = rust_cond.len() == scipy_cond.len()
+                    && rust_cond
+                        .iter()
+                        .zip(scipy_cond.iter())
+                        .all(|(r, s)| (r - s).abs() <= ABS_TOL);
+                ledger.compared("squareform_to_condensed", &case.case_id, pass);
+                cases.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     sub_check: "squareform_to_condensed".into(),
-                    pass: false,
-                    detail: format!("rust err: {e:?}"),
-                }),
+                    pass,
+                    detail: format!(
+                        "rust_len={}, scipy_len={}",
+                        rust_cond.len(),
+                        scipy_cond.len()
+                    ),
+                });
             }
+            (None, Err(e)) if scipy_arm.condensed.is_some() => cases.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                sub_check: "squareform_to_condensed".into(),
+                pass: false,
+                detail: format!("rust err: {e:?}"),
+            }),
+            _ => {} // the ledger recorded why this case was not compared
         }
 
-        // squareform_to_matrix (round-trip on the condensed)
-        if let Some(scipy_mat) = scipy_arm.matrix.as_ref()
-            && let Ok(rust_cond) = squareform_to_condensed(&case.matrix)
-        {
-            match squareform_to_matrix(&rust_cond) {
-                Ok(rust_mat) => {
-                    let pass = rust_mat.len() == scipy_mat.len()
-                        && rust_mat.iter().zip(scipy_mat.iter()).all(|(rr, sr)| {
-                            rr.len() == sr.len()
-                                && rr
-                                    .iter()
-                                    .zip(sr.iter())
-                                    .all(|(r, s)| (r - s).abs() <= ABS_TOL)
-                        });
-                    cases.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        sub_check: "squareform_to_matrix".into(),
-                        pass,
-                        detail: format!("rust_n={}", rust_mat.len()),
+        // squareform_to_matrix (round-trip on the condensed). Element values go through
+        // slices on the row-major flattening; the row structure is checked below.
+        let rust_mat_res = rust_cond.map(|c| squareform_to_matrix(c));
+        let rust_mat = rust_mat_res.as_ref().and_then(|r| r.as_ref().ok());
+        let scipy_mat_flat = scipy_arm.matrix.as_ref().map(|m| m.concat());
+        let rust_mat_flat = rust_mat.map(|m| m.concat());
+        let gate = ledger.slices(
+            "squareform_to_matrix",
+            &case.case_id,
+            scipy_mat_flat.as_deref(),
+            rust_mat_flat.as_deref(),
+        );
+        // gate is Some only when both matrices are present.
+        match (gate, scipy_arm.matrix.as_ref(), rust_mat, &rust_mat_res) {
+            (Some(_), Some(scipy_mat), Some(rust_mat), _) => {
+                let pass = rust_mat.len() == scipy_mat.len()
+                    && rust_mat.iter().zip(scipy_mat.iter()).all(|(rr, sr)| {
+                        rr.len() == sr.len()
+                            && rr
+                                .iter()
+                                .zip(sr.iter())
+                                .all(|(r, s)| (r - s).abs() <= ABS_TOL)
                     });
-                }
-                Err(e) => cases.push(CaseDiff {
+                ledger.compared("squareform_to_matrix", &case.case_id, pass);
+                cases.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     sub_check: "squareform_to_matrix".into(),
-                    pass: false,
-                    detail: format!("rust err: {e:?}"),
-                }),
+                    pass,
+                    detail: format!("rust_n={}", rust_mat.len()),
+                });
             }
+            (_, Some(_), _, Some(Err(e))) => cases.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                sub_check: "squareform_to_matrix".into(),
+                pass: false,
+                detail: format!("rust err: {e:?}"),
+            }),
+            _ => {} // the ledger recorded why this case was not compared
         }
 
         // num_obs_dm
-        if let Some(scipy_n) = scipy_arm.num_obs_dm {
-            let rust_n = num_obs_dm(&case.matrix) as i64;
+        if let Some((scipy_n, rust_n)) = ledger.both(
+            "num_obs_dm",
+            &case.case_id,
+            scipy_arm.num_obs_dm,
+            Some(num_obs_dm(&case.matrix) as i64),
+        ) {
+            ledger.compared("num_obs_dm", &case.case_id, rust_n == scipy_n);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "num_obs_dm".into(),
@@ -398,10 +439,13 @@ fn diff_spatial_squareform() {
         }
 
         // num_obs_y
-        if let Some(scipy_n) = scipy_arm.num_obs_y
-            && let Ok(rust_cond) = squareform_to_condensed(&case.matrix)
-        {
-            let rust_n = num_obs_y(&rust_cond) as i64;
+        if let Some((scipy_n, rust_n)) = ledger.both(
+            "num_obs_y",
+            &case.case_id,
+            scipy_arm.num_obs_y,
+            rust_cond.map(|c| num_obs_y(c) as i64),
+        ) {
+            ledger.compared("num_obs_y", &case.case_id, rust_n == scipy_n);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "num_obs_y".into(),
@@ -411,8 +455,13 @@ fn diff_spatial_squareform() {
         }
 
         // is_valid_dm — both should agree (true on valid fixtures).
-        if let Some(scipy_b) = scipy_arm.is_valid_dm {
-            let rust_b = is_valid_dm(&case.matrix, ABS_TOL);
+        if let Some((scipy_b, rust_b)) = ledger.both(
+            "is_valid_dm_valid_input",
+            &case.case_id,
+            scipy_arm.is_valid_dm,
+            Some(is_valid_dm(&case.matrix, ABS_TOL)),
+        ) {
+            ledger.compared("is_valid_dm_valid_input", &case.case_id, rust_b == scipy_b);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "is_valid_dm_valid_input".into(),
@@ -422,10 +471,13 @@ fn diff_spatial_squareform() {
         }
 
         // is_valid_y — both should agree on the condensed form.
-        if let Some(scipy_b) = scipy_arm.is_valid_y
-            && let Ok(rust_cond) = squareform_to_condensed(&case.matrix)
-        {
-            let rust_b = is_valid_y(&rust_cond);
+        if let Some((scipy_b, rust_b)) = ledger.both(
+            "is_valid_y_valid_input",
+            &case.case_id,
+            scipy_arm.is_valid_y,
+            rust_cond.map(|c| is_valid_y(c)),
+        ) {
+            ledger.compared("is_valid_y_valid_input", &case.case_id, rust_b == scipy_b);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "is_valid_y_valid_input".into(),
@@ -435,10 +487,21 @@ fn diff_spatial_squareform() {
         }
     }
 
+    // The nan_entry matrix carries f64::NAN, which serde_json sends as null; the oracle's
+    // np.asarray(dtype=float64) reads null back as NaN, so SciPy sees the intended input.
     for case in &query.invalid_dms {
         let scipy_arm = invalid_map.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_b) = scipy_arm.is_valid_dm {
-            let rust_b = is_valid_dm(&case.matrix, ABS_TOL);
+        if let Some((scipy_b, rust_b)) = ledger.both(
+            "is_valid_dm_invalid_input",
+            &case.case_id,
+            scipy_arm.is_valid_dm,
+            Some(is_valid_dm(&case.matrix, ABS_TOL)),
+        ) {
+            ledger.compared(
+                "is_valid_dm_invalid_input",
+                &case.case_id,
+                rust_b == scipy_b,
+            );
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "is_valid_dm_invalid_input".into(),
@@ -455,6 +518,7 @@ fn diff_spatial_squareform() {
         test_id: "diff_spatial_squareform".into(),
         category: "fsci_spatial squareform / num_obs / is_valid".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -479,4 +543,5 @@ fn diff_spatial_squareform() {
         pass_count,
         cases.len()
     );
+    ledger.finish(query.valid_dms.len().min(query.invalid_dms.len()));
 }

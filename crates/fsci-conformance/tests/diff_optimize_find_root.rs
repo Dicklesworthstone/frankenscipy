@@ -19,12 +19,14 @@
 //! `"0.0017144775390624983"`, which it reads one ULP high — and that is large enough both to
 //! invent a disagreement and, worse, to erase a real one.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{FindRootOptions, FindRootStatus, find_root};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +135,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     total_samples_compared: usize,
     interpolating_cases: usize,
@@ -424,6 +427,7 @@ fn diff_optimize_find_root() {
     let mut total_samples = 0usize;
     let mut interpolating = 0usize;
     let mut statuses_seen: Vec<String> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_optimize_find_root", &["find_root"]);
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -437,17 +441,8 @@ fn diff_optimize_find_root() {
             case.case_id,
             arm.error
         );
-        let (
-            Some(sampled),
-            Some(x_bits),
-            Some(f_x_bits),
-            Some(bracket),
-            Some(f_bracket),
-            Some(nit),
-            Some(nfev),
-            Some(status),
-            Some(success),
-        ) = (
+        // A half-populated arm (a null field and no error) is recorded as a missing SciPy value.
+        let scipy = match (
             arm.sampled_bits.as_ref(),
             arm.x_bits,
             arm.f_x_bits,
@@ -457,19 +452,34 @@ fn diff_optimize_find_root() {
             arm.nfev,
             arm.status,
             arm.success,
-        )
-        else {
-            panic!(
-                "case {} came back with a null field and no error; a half-populated arm \
-                 would compare vacuously",
-                case.case_id
-            );
+        ) {
+            (
+                Some(sampled),
+                Some(x_bits),
+                Some(f_x_bits),
+                Some(bracket),
+                Some(f_bracket),
+                Some(nit),
+                Some(nfev),
+                Some(status),
+                Some(success),
+            ) => Some((
+                sampled, x_bits, f_x_bits, bracket, f_bracket, nit, nfev, status, success,
+            )),
+            _ => {
+                eprintln!(
+                    "case {} came back with a null field and no error; a half-populated arm \
+                     would compare vacuously",
+                    case.case_id
+                );
+                None
+            }
         };
 
         let visited = std::cell::RefCell::new(Vec::new());
         let kind = case.kind;
         let c = case.c;
-        let result = find_root(
+        let fsci = find_root(
             |x| {
                 visited.borrow_mut().push(x);
                 kind.eval(x, c)
@@ -483,8 +493,16 @@ fn diff_optimize_find_root() {
                 maxiter: case.maxiter,
             },
         )
-        .unwrap_or_else(|e| panic!("case {} failed on our arm: {e}", case.case_id));
+        .inspect_err(|e| eprintln!("case {} failed on our arm: {e}", case.case_id))
+        .ok();
         let ours = visited.into_inner();
+        let Some((
+            (sampled, x_bits, f_x_bits, bracket, f_bracket, nit, nfev, status, success),
+            result,
+        )) = ledger.both("find_root", &case.case_id, scipy, fsci)
+        else {
+            continue;
+        };
 
         assert!(
             same_bits(&ours, sampled),
@@ -567,6 +585,8 @@ fn diff_optimize_find_root() {
             );
         }
 
+        // Every check above is an assertion, so reaching here means this case matched.
+        ledger.compared("find_root", &case.case_id, true);
         let interpolated = took_an_interpolated_step(&ours);
         if interpolated {
             interpolating += 1;
@@ -594,6 +614,7 @@ fn diff_optimize_find_root() {
         test_id: "diff_optimize_find_root".to_string(),
         category: "optimize.elementwise".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         total_samples_compared: total_samples,
         interpolating_cases: interpolating,
@@ -632,6 +653,7 @@ fn diff_optimize_find_root() {
         ],
         "every reachable termination status must be exercised"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-HIT / MUST-MISS control for the bitwise comparator every assertion above depends on.

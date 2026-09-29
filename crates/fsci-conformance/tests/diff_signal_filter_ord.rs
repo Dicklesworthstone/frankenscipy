@@ -11,13 +11,14 @@
 //! Nyquist-normalized in (0, 1), with frequency prewarping and highpass
 //! support. Drop a case if scipy errors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{buttord, cheb1ord, cheb2ord, ellipord};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -220,19 +222,26 @@ fn diff_signal_filter_ord() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_signal_filter_ord",
+        &["buttord", "cheb1ord", "cheb2ord", "ellipord"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_n) = scipy_arm.n else { continue };
-        let Some(scipy_wn) = scipy_arm.wn else {
-            continue;
-        };
-        let Some((fsci_n, fsci_wn)) = fsci_eval(case) else {
+        let Some(((scipy_n, scipy_wn), (fsci_n, fsci_wn))) = ledger.both(
+            case.op.as_str(),
+            &case.case_id,
+            scipy_arm.n.zip(scipy_arm.wn),
+            fsci_eval(case),
+        ) else {
             continue;
         };
         let n_match = fsci_n == scipy_n;
+        // A NaN fsci Wn makes wn_diff NaN, which fails the `<=` below.
         let wn_diff = (fsci_wn - scipy_wn).abs();
         let pass = n_match && wn_diff <= WN_TOL;
+        ledger.compared(case.op.as_str(), &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -248,6 +257,7 @@ fn diff_signal_filter_ord() {
         test_id: "diff_signal_filter_ord".into(),
         category: "scipy.signal.{butt,cheb1,cheb2,ellip}ord".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -269,4 +279,6 @@ fn diff_signal_filter_ord() {
         "scipy.signal filter-order conformance failed: {} cases",
         diffs.len()
     );
+    // Every op runs over the same configs, so each arm is designed to compare this many.
+    ledger.finish(query.points.iter().filter(|c| c.op == "buttord").count());
 }

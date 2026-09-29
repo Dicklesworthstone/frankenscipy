@@ -13,10 +13,12 @@
 //! These four invariants together pin down the filter up to a single
 //! sign flip per p — strong enough to catch any coefficient corruption.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::daub;
 use serde::Serialize;
 
@@ -44,6 +46,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -90,26 +93,32 @@ fn diff_signal_daub_properties() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let sqrt2 = 2.0_f64.sqrt();
+    // The reference side is analytic (length 2p, sum sqrt(2), energy 1, zero correlation at
+    // even shifts), so it is always present; a daub error is an fsci failure.
+    let mut ledger = CompareLedger::new("diff_signal_daub_properties", &["daub"]);
+    let orders: Vec<usize> = (1..=10).collect();
 
-    for p in 1_usize..=10 {
-        let h = match daub(p) {
-            Ok(v) => v,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: format!("daub_p{p}"),
-                    p,
-                    length: 0,
-                    sum_minus_sqrt2: f64::INFINITY,
-                    energy_minus_1: f64::INFINITY,
-                    max_offdiag_corr: f64::INFINITY,
-                    pass: false,
-                    note: format!("daub error: {e:?}"),
-                });
-                continue;
-            }
+    for &p in &orders {
+        let case_id = format!("daub_p{p}");
+        let result = daub(p);
+        if let Err(e) = &result {
+            diffs.push(CaseDiff {
+                case_id: case_id.clone(),
+                p,
+                length: 0,
+                sum_minus_sqrt2: f64::INFINITY,
+                energy_minus_1: f64::INFINITY,
+                max_offdiag_corr: f64::INFINITY,
+                pass: false,
+                note: format!("daub error: {e:?}"),
+            });
+        }
+        let Some((expected_len, h)) = ledger.both("daub", &case_id, Some(2 * p), result.ok())
+        else {
+            continue;
         };
 
-        let length_ok = h.len() == 2 * p;
+        let length_ok = h.len() == expected_len;
         let sum: f64 = h.iter().sum();
         let sum_minus_sqrt2 = (sum - sqrt2).abs();
         let energy: f64 = h.iter().map(|v| v * v).sum();
@@ -125,9 +134,10 @@ fn diff_signal_daub_properties() {
             && sum_minus_sqrt2 <= ABS_TOL
             && energy_minus_1 <= ABS_TOL
             && max_offdiag <= ABS_TOL;
+        ledger.compared("daub", &case_id, pass);
 
         diffs.push(CaseDiff {
-            case_id: format!("daub_p{p}"),
+            case_id,
             p,
             length: h.len(),
             sum_minus_sqrt2,
@@ -147,6 +157,7 @@ fn diff_signal_daub_properties() {
         test_id: "diff_signal_daub_properties".into(),
         category: "fsci_signal::daub(p) property-based: length, sum, energy, orthogonality".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -168,4 +179,5 @@ fn diff_signal_daub_properties() {
         "daub property coverage failed: {} cases",
         diffs.len()
     );
+    ledger.finish(orders.len());
 }

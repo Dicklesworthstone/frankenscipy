@@ -5,13 +5,14 @@
 //! equivalent to scipy.stats.weibull_max(c). Both have support
 //! (-∞, 0]. Tolerance: 1e-10 abs (CDF/PDF), 1e-8 abs for ppf.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, FrechetR};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -208,23 +210,25 @@ fn diff_stats_frechet_r() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let ops = ["pdf", "cdf", "ppf"];
+    let mut ledger = CompareLedger::new("diff_stats_frechet_r", &ops);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.value else {
-            continue;
-        };
+        let scipy = pmap.get(&case.case_id).and_then(|arm| arm.value);
         let dist = FrechetR::new(case.c);
         let (actual, tol) = match case.op.as_str() {
             "pdf" => (dist.pdf(case.x), ABS_TOL_PDF_CDF),
             "cdf" => (dist.cdf(case.x), ABS_TOL_PDF_CDF),
             "ppf" => (dist.ppf(case.x), ABS_TOL_PPF),
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
+        };
+        let Some((expected, actual)) = ledger.pair(&case.op, &case.case_id, scipy, Some(actual))
+        else {
+            continue;
         };
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -239,6 +243,7 @@ fn diff_stats_frechet_r() {
         test_id: "diff_stats_frechet_r".into(),
         category: "fsci_stats::FrechetR vs scipy.stats.weibull_max".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -259,4 +264,11 @@ fn diff_stats_frechet_r() {
         diffs.len(),
         max_overall
     );
+    // pdf, cdf and ppf have different case sets (pdf has the fewest); each must compare all of its own.
+    let min_per_arm = ops
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("ops is non-empty");
+    ledger.finish(min_per_arm);
 }

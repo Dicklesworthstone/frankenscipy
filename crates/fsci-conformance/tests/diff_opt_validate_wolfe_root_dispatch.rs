@@ -7,10 +7,12 @@
 //! Anderson/Lm); we exercise all five on a small 2D rosenbrock-style
 //! gradient system and verify each finds the same root.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::linesearch::validate_wolfe_params;
 use fsci_opt::{MultivariateRootMethod, MultivariateRootOptions, WolfeParams, root};
 use serde::Serialize;
@@ -29,6 +31,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -141,14 +144,19 @@ fn diff_opt_validate_wolfe_root_dispatch() {
     // Simpler still: F(x) = [x0 - 1, x1]   → unique root (1, 0)
     let f = |x: &[f64]| -> Vec<f64> { vec![x[0] - 1.0, x[1]] };
     let x0 = vec![0.5, 0.5];
+    let expected_root = [1.0, 0.0];
 
-    for method in [
+    // The root() arm compares against the analytic root; the validate_wolfe_params checks above
+    // are fail-closed assertions with no reference value and stay outside the ledger.
+    let mut ledger = CompareLedger::new("diff_opt_validate_wolfe_root_dispatch", &["root"]);
+    let methods = [
         MultivariateRootMethod::Hybr,
         MultivariateRootMethod::Broyden1,
         MultivariateRootMethod::Broyden2,
         MultivariateRootMethod::Anderson,
         MultivariateRootMethod::Lm,
-    ] {
+    ];
+    for method in methods {
         let opts = MultivariateRootOptions {
             method,
             tol: 1.0e-8,
@@ -156,20 +164,24 @@ fn diff_opt_validate_wolfe_root_dispatch() {
         };
         let res = root(f, &x0, opts);
         let case_id = format!("root_method_{method:?}");
-        match res {
-            Ok(r) => {
-                let x = &r.x;
-                let close = (x[0] - 1.0).abs() < 1.0e-4 && x[1].abs() < 1.0e-4;
-                check(
-                    &case_id,
-                    close,
-                    format!("x={:?} converged={}", x, r.converged),
-                );
-            }
-            Err(e) => {
-                check(&case_id, false, format!("error: {e:?}"));
-            }
-        }
+        // The analytic root always exists: an error or an unconverged run is an fsci failure.
+        let fsci_x = res
+            .as_ref()
+            .ok()
+            .filter(|r| r.converged)
+            .map(|r| r.x.as_slice());
+        let Some((_, x)) = ledger.slices("root", &case_id, Some(expected_root.as_slice()), fsci_x)
+        else {
+            let note = match &res {
+                Ok(r) => format!("x={:?} converged={}", r.x, r.converged),
+                Err(e) => format!("error: {e:?}"),
+            };
+            check(&case_id, false, note);
+            continue;
+        };
+        let close = (x[0] - 1.0).abs() < 1.0e-4 && x[1].abs() < 1.0e-4;
+        ledger.compared("root", &case_id, close);
+        check(&case_id, close, format!("x={x:?} converged=true"));
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -177,6 +189,7 @@ fn diff_opt_validate_wolfe_root_dispatch() {
         test_id: "diff_opt_validate_wolfe_root_dispatch".into(),
         category: "fsci_opt::validate_wolfe_params + root() dispatch coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -195,4 +208,5 @@ fn diff_opt_validate_wolfe_root_dispatch() {
         "validate_wolfe + root dispatch coverage failed: {} cases",
         diffs.len(),
     );
+    ledger.finish(methods.len());
 }

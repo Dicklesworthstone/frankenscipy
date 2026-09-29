@@ -9,13 +9,14 @@
 //! Vec<i64>, no tolerance needed). Skips cleanly if scipy/python3
 //! is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{CorrelationMode, correlation_lags};
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -207,16 +209,23 @@ fn diff_signal_correlation_lags() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_correlation_lags", &["correlation_lags"]);
 
     for case in &cases {
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let Some(scipy_lags) = &oracle.lags else {
+        let rust_lags = correlation_lags(case.in1_len, case.in2_len, parse_mode(&case.mode));
+        let Some((scipy_lags, rust_lags)) = ledger.both(
+            "correlation_lags",
+            &case.case_id,
+            oracle.lags.as_ref(),
+            Some(rust_lags),
+        ) else {
             continue;
         };
-        let rust_lags = correlation_lags(case.in1_len, case.in2_len, parse_mode(&case.mode));
         let pass = &rust_lags == scipy_lags;
+        ledger.compared("correlation_lags", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rust_len: rust_lags.len(),
@@ -237,6 +246,7 @@ fn diff_signal_correlation_lags() {
         test_id: "diff_signal_correlation_lags".into(),
         category: "scipy.signal.correlation_lags".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -246,4 +256,5 @@ fn diff_signal_correlation_lags() {
     emit_log(&log);
 
     assert!(all_pass, "scipy.signal.correlation_lags conformance failed");
+    ledger.finish(cases.len());
 }

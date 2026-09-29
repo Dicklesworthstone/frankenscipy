@@ -2600,7 +2600,7 @@ fn e2e_021_dijkstra_negative_weight_handling() {
     .expect("reachable negative coo")
     .to_csr()
     .expect("reachable negative csr");
-    let reachable = dijkstra(&reachable_negative, 0).expect("reachable negative dijkstra");
+    let reachable = dijkstra(&reachable_negative, true, 0).expect("reachable negative dijkstra");
     let reachable_pass = max_abs_diff_vec(&reachable.distances, &[0.0, 1.0, -1.0]) <= TOL;
     steps.push(make_step(
         1,
@@ -2623,7 +2623,7 @@ fn e2e_021_dijkstra_negative_weight_handling() {
     .expect("split graph coo")
     .to_csr()
     .expect("split graph csr");
-    let split = dijkstra(&split_graph, 0).expect("split graph dijkstra");
+    let split = dijkstra(&split_graph, true, 0).expect("split graph dijkstra");
     let split_pass = split.distances[0] == 0.0
         && split.distances[1] == 1.0
         && split.distances[2].is_infinite()
