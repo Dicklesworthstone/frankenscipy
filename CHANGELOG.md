@@ -40,6 +40,11 @@
 
 ### Known limits
 
+- Complete registry metadata includes a pre-existing Tokio dependency under
+  the explicit unstable Emscripten configuration of `wasm-bindgen-futures`.
+  This branch is inactive in the default Linux graph; all-platform async-ban
+  compliance remains unqualified
+  ([#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15)).
 - Geometry above the documented bounds and broader covariance decomposition
   parity need further work ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2),
   [#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3)).
