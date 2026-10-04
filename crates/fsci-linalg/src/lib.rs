@@ -1151,6 +1151,46 @@ impl std::fmt::Display for LinalgError {
 
 impl std::error::Error for LinalgError {}
 
+/// Validate the original input before a selected triangle can discard non-finite entries.
+/// GH #7: checking the selected copy would miss NaN/Inf in the unused triangle.
+/// Other assumptions keep their existing validation path. The shape, RHS and dimension
+/// checks preserve that path's error precedence before checking finite values.
+fn validate_original_triangle_input(
+    a: &[Vec<f64>],
+    b: Option<&[f64]>,
+    assume_a: Option<MatrixAssumption>,
+    mode: RuntimeMode,
+    check_finite: bool,
+) -> Result<(), LinalgError> {
+    if !matches!(
+        assume_a,
+        Some(
+            MatrixAssumption::Symmetric
+                | MatrixAssumption::Hermitian
+                | MatrixAssumption::PositiveDefinite
+        )
+    ) {
+        return Ok(());
+    }
+    let (rows, cols) = matrix_shape(a)?;
+    if rows != cols {
+        return Err(LinalgError::ExpectedSquareMatrix);
+    }
+    if let Some(b) = b
+        && b.len() != rows
+    {
+        return Err(LinalgError::IncompatibleShapes {
+            a_shape: (rows, cols),
+            b_len: b.len(),
+        });
+    }
+    hardened_dimension_check(mode, rows, cols)?;
+    match b {
+        Some(b) => validate_finite_matrix_and_vector(a, b, mode, check_finite),
+        None => validate_finite_matrix(a, mode, check_finite),
+    }
+}
+
 /// The matrix SciPy's `assume_a in {'sym', 'her', 'pos'}` routines actually see: LAPACK reads
 /// ONE triangle (`lower` picks it; upper by default) and ignores the other, so the result is
 /// that triangle mirrored. `None` for every other assumption, and for a ragged or non-square
@@ -1190,6 +1230,13 @@ fn triangle_selected_matrix(
 }
 
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
+    validate_original_triangle_input(
+        a,
+        Some(b),
+        options.assume_a,
+        options.mode,
+        options.check_finite,
+    )?;
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     let n = a.len();
@@ -1457,6 +1504,13 @@ pub fn solve_banded_with_audit(
 }
 
 pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError> {
+    validate_original_triangle_input(
+        a,
+        None,
+        options.assume_a,
+        options.mode,
+        options.check_finite,
+    )?;
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     // Fast path for large general square matrices: factor once with the in-house
@@ -3480,6 +3534,13 @@ pub fn solve_with_casp(
     options: SolveOptions,
     portfolio: &mut SolverPortfolio,
 ) -> Result<SolveResult, LinalgError> {
+    validate_original_triangle_input(
+        a,
+        Some(b),
+        options.assume_a,
+        options.mode,
+        options.check_finite,
+    )?;
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     solve_with_portfolio_internal(a, b, options, portfolio, "solve_with_casp", true)
@@ -3518,8 +3579,6 @@ fn solve_audited(
     portfolio: &mut SolverPortfolio,
     audit: &AuditScope<'_>,
 ) -> Result<SolveResult, LinalgError> {
-    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
-    let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
 
     // Validation with audit logging
@@ -3577,6 +3636,8 @@ fn solve_audited(
         });
     }
 
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     let effective_a = if options.transposed {
         transpose(a)
     } else {
@@ -3737,8 +3798,6 @@ pub fn inv_with_casp(
     options: InvOptions,
     portfolio: &mut SolverPortfolio,
 ) -> Result<InvResult, LinalgError> {
-    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
-    let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
         return Err(LinalgError::ExpectedSquareMatrix);
@@ -3754,6 +3813,8 @@ pub fn inv_with_casp(
         });
     }
 
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     let diagnostics = condition_diagnostics_with_assumption(a, options.assume_a)?;
     let ConditionDiagnosticsWork {
         report,
@@ -44438,6 +44499,201 @@ mod proptest_tests {
                     "funm exp vs expm at [{i},{j}]: {} vs {}",
                     funm_result[i][j],
                     expm_result[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declared_triangle_checks_original_nonfinite_entries_on_every_entry_point() {
+        for assumption in [
+            MatrixAssumption::Symmetric,
+            MatrixAssumption::Hermitian,
+            MatrixAssumption::PositiveDefinite,
+        ] {
+            for lower in [false, true] {
+                for bad in [f64::NAN, f64::INFINITY] {
+                    // Exact integer Cholesky factors keep the unchecked control bit-exact.
+                    let mut a = vec![vec![4.0, 0.0], vec![0.0, 9.0]];
+                    if lower {
+                        a[0][1] = bad;
+                    } else {
+                        a[1][0] = bad;
+                    }
+                    let before: Vec<u64> = a.iter().flatten().map(|v| v.to_bits()).collect();
+                    for (mode, check_finite, rejects) in [
+                        (RuntimeMode::Strict, true, true),
+                        (RuntimeMode::Strict, false, false),
+                        (RuntimeMode::Hardened, true, true),
+                        (RuntimeMode::Hardened, false, true),
+                    ] {
+                        let opts = SolveOptions {
+                            assume_a: Some(assumption),
+                            lower,
+                            mode,
+                            check_finite,
+                            ..SolveOptions::default()
+                        };
+                        let inv_opts = InvOptions {
+                            assume_a: Some(assumption),
+                            lower,
+                            mode,
+                            check_finite,
+                        };
+                        let b = [4.0, 9.0];
+                        let solve_ledger = sync_audit_ledger();
+                        let inv_ledger = sync_audit_ledger();
+                        let mut solve_portfolio = SolverPortfolio::new(mode, 4);
+                        let mut audited_portfolio = SolverPortfolio::new(mode, 4);
+                        let mut inv_portfolio = SolverPortfolio::new(mode, 4);
+                        for (entry, outcome) in [
+                            ("solve", solve(&a, &b, opts)),
+                            (
+                                "solve_with_casp",
+                                solve_with_casp(&a, &b, opts, &mut solve_portfolio),
+                            ),
+                            (
+                                "solve_with_audit",
+                                solve_with_audit(
+                                    &a,
+                                    &b,
+                                    opts,
+                                    &mut audited_portfolio,
+                                    &solve_ledger,
+                                ),
+                            ),
+                        ] {
+                            if rejects {
+                                assert_eq!(outcome, Err(LinalgError::NonFiniteInput), "{entry}");
+                            } else {
+                                assert_close_slice(&outcome.expect(entry).x, &[1.0, 1.0], 0.0, 0.0);
+                            }
+                        }
+                        for (entry, outcome) in [
+                            ("inv", inv(&a, inv_opts)),
+                            (
+                                "inv_with_casp",
+                                inv_with_casp(&a, inv_opts, &mut inv_portfolio),
+                            ),
+                            ("inv_with_audit", inv_with_audit(&a, inv_opts, &inv_ledger)),
+                        ] {
+                            if rejects {
+                                assert_eq!(outcome, Err(LinalgError::NonFiniteInput), "{entry}");
+                            } else {
+                                assert_close_matrix(
+                                    &outcome.expect(entry).inverse,
+                                    &[vec![0.25, 0.0], vec![0.0, 1.0 / 9.0]],
+                                    1e-15,
+                                    0.0,
+                                );
+                            }
+                        }
+                        let solve_fingerprint =
+                            audit_fingerprint("fsci_linalg::solve", &opts, |f| {
+                                f.rows(&a).f64s(&b);
+                            });
+                        let inv_fingerprint =
+                            audit_fingerprint("fsci_linalg::inv", &inv_opts, |f| {
+                                f.rows(&a);
+                            });
+                        for (ledger, fingerprint, reason) in [
+                            (&solve_ledger, solve_fingerprint, "non_finite_matrix"),
+                            (&inv_ledger, inv_fingerprint, "non_finite_input"),
+                        ] {
+                            let ledger = lock_or_recover(ledger);
+                            assert!(!ledger.entries().is_empty());
+                            for event in ledger.entries() {
+                                assert_eq!(event.input_fingerprint, fingerprint);
+                            }
+                            if rejects {
+                                assert_eq!(ledger.entries().len(), 1);
+                                assert!(matches!(
+                                    &ledger.entries()[0].action,
+                                    AuditAction::FailClosed { reason: recorded } if recorded == reason
+                                ));
+                            } else {
+                                assert!(ledger.entries().iter().all(|event| !matches!(
+                                    event.action,
+                                    AuditAction::FailClosed { .. }
+                                )));
+                            }
+                        }
+                        assert_eq!(
+                            a.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            before,
+                            "the borrowed input must remain unchanged"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declared_triangle_preserves_shape_and_rhs_error_precedence() {
+        let opts = SolveOptions {
+            assume_a: Some(MatrixAssumption::Symmetric),
+            ..SolveOptions::default()
+        };
+        let inv_opts = InvOptions {
+            assume_a: opts.assume_a,
+            ..InvOptions::default()
+        };
+        for (a, b, expected) in [
+            (
+                vec![vec![f64::NAN], vec![0.0, 3.0]],
+                vec![1.0, 1.0],
+                LinalgError::RaggedMatrix,
+            ),
+            (
+                vec![vec![2.0, 0.0, f64::NAN]],
+                vec![1.0],
+                LinalgError::ExpectedSquareMatrix,
+            ),
+            (
+                vec![vec![2.0, 0.0], vec![f64::NAN, 3.0]],
+                vec![1.0],
+                LinalgError::IncompatibleShapes {
+                    a_shape: (2, 2),
+                    b_len: 1,
+                },
+            ),
+            (
+                vec![vec![f64::NAN, 0.0], vec![0.0, 3.0]],
+                vec![2.0, 3.0],
+                LinalgError::NonFiniteInput,
+            ),
+            (
+                vec![vec![2.0, 0.0], vec![0.0, 3.0]],
+                vec![f64::INFINITY, 3.0],
+                LinalgError::NonFiniteInput,
+            ),
+        ] {
+            let mut portfolio = SolverPortfolio::new(opts.mode, 4);
+            let mut audited_portfolio = SolverPortfolio::new(opts.mode, 4);
+            let ledger = sync_audit_ledger();
+            assert_eq!(solve(&a, &b, opts).err(), Some(expected.clone()));
+            assert_eq!(
+                solve_with_casp(&a, &b, opts, &mut portfolio).err(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                solve_with_audit(&a, &b, opts, &mut audited_portfolio, &ledger).err(),
+                Some(expected.clone())
+            );
+            if matches!(
+                expected,
+                LinalgError::RaggedMatrix | LinalgError::ExpectedSquareMatrix
+            ) {
+                let mut portfolio = SolverPortfolio::new(inv_opts.mode, 4);
+                assert_eq!(inv(&a, inv_opts).err(), Some(expected.clone()));
+                assert_eq!(
+                    inv_with_casp(&a, inv_opts, &mut portfolio).err(),
+                    Some(expected.clone())
+                );
+                assert_eq!(
+                    inv_with_audit(&a, inv_opts, &sync_audit_ledger()).err(),
+                    Some(expected)
                 );
             }
         }

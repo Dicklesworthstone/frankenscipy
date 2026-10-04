@@ -7977,6 +7977,10 @@ pub struct IterativeSolveOptions {
     pub mode: RuntimeMode,
     pub check_finite: bool,
     pub tol: f64,
+    /// Budget in the selected solver's units. For [`gmres`] and
+    /// [`gmres_preconditioned`], this counts restart cycles (default 10n),
+    /// while their result's `iterations` counts inner Arnoldi steps.
+    /// Other solvers retain their existing iteration units and defaults.
     pub max_iter: Option<usize>,
 }
 
@@ -7998,7 +8002,8 @@ pub struct IterativeSolveResult {
     pub solution: Vec<f64>,
     /// Whether the solver converged within the tolerance.
     pub converged: bool,
-    /// Number of iterations performed.
+    /// Number of iterations performed. GMRES reports inner Arnoldi steps,
+    /// not restart cycles, including batched and CASP-selected GMRES solves.
     pub iterations: usize,
     /// Final residual norm ||b - Ax|| / ||b||.
     pub residual_norm: f64,
@@ -8042,6 +8047,8 @@ pub enum CaspMatvecCost {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaspIterativeSolveOptions {
+    /// Options in the selected solver's units: GMRES's `max_iter` counts
+    /// restart cycles, and its result's `iterations` counts inner steps.
     pub iterative: IterativeSolveOptions,
     pub preconditioner_available: bool,
     pub matrix_vector_cost: CaspMatvecCost,
@@ -9282,6 +9289,12 @@ where
 ///
 /// Solves Ax = b for general square A using restarted GMRES with Arnoldi iteration.
 /// Matches `scipy.sparse.linalg.gmres(A, b)`.
+///
+/// `options.max_iter` counts restart cycles, matching SciPy's `maxiter` without
+/// a legacy callback (default 10n). Each cycle permits up to min(n, 20) inner
+/// Arnoldi steps; the result's `iterations` reports the actual inner-step count.
+/// With a nonzero RHS, a zero-cycle budget preserves the initial guess and checks
+/// its true residual. The zero-RHS shortcut still returns the zero solution.
 pub fn gmres(
     a: &CsrMatrix,
     b: &[f64],
@@ -9301,7 +9314,7 @@ pub fn gmres(
         });
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
-    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let max_cycles = options.max_iter.unwrap_or(n * 10);
     let restart = n.min(GMRES_DEFAULT_RESTART);
 
     let mut x = match x0 {
@@ -9327,28 +9340,24 @@ pub fn gmres(
         });
     }
 
-    let mut total_iter = 0;
+    let mut total_iter = 0usize;
 
     // Outer restart loop. As in SciPy (`info = 0 if rnorm <= atol else maxiter`), convergence is
     // decided on the TRUE residual after each cycle: the Givens estimate can pass while the true
     // residual does not (restart), and a lucky breakdown only means the Krylov space is exhausted,
     // which for a singular A leaves a residual that no further cycle can reduce (stop, unconverged).
-    for _ in 0..(max_iter / restart.max(1) + 1) {
-        let (stop, iters) = gmres_inner(
-            a,
-            b,
-            &mut x,
-            b_norm,
-            restart,
-            options.tol,
-            max_iter - total_iter,
-        )?;
-        total_iter += iters;
+    for _ in 0..max_cycles {
+        let (stop, iters) = gmres_inner(a, b, &mut x, b_norm, restart, options.tol, restart)?;
+        total_iter = total_iter
+            .checked_add(iters)
+            .ok_or_else(|| SparseError::InvalidArgument {
+                message: "GMRES inner iteration count exceeds usize".to_string(),
+            })?;
 
         let ax = csr_matvec(a, &x);
         let r_norm = vec_norm_diff(&ax, b) / b_norm;
         let converged = r_norm < options.tol;
-        if converged || stop == KrylovCycleStop::Breakdown || total_iter >= max_iter {
+        if converged || stop == KrylovCycleStop::Breakdown {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged,
@@ -9362,7 +9371,8 @@ pub fn gmres(
     let r_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
-        converged: false,
+        // status: true residual also decides convergence when no cycle ran
+        converged: r_norm < options.tol,
         iterations: total_iter,
         residual_norm: r_norm,
     })
@@ -11924,6 +11934,8 @@ pub fn select_casp_iterative_solver(
 }
 
 /// Run the CASP-selected iterative sparse solver.
+/// GMRES interprets `options.iterative.max_iter` as restart cycles and reports
+/// inner Arnoldi steps; other selected solvers retain their own budget units.
 pub fn casp_iterative_solve(
     a: &CsrMatrix,
     b: &[f64],
@@ -28982,6 +28994,85 @@ mod tests {
     }
 
     #[test]
+    fn gmres_max_iter_caps_restart_cycles_not_inner_steps() {
+        // 31 distinct, widely separated eigenvalues keep both short budgets
+        // unconverged. Powers of two are exact, and residuals below use the
+        // original diagonal directly rather than the solver's CSR matvec.
+        let diagonal = (0..31).map(|i| 2.0_f64.powi(i)).collect::<Vec<_>>();
+        let n = diagonal.len();
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(n, n),
+            diagonal.clone(),
+            (0..n).collect(),
+            (0..n).collect(),
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = vec![1.0; n];
+        for cycles in [1, 2] {
+            let options = IterativeSolveOptions {
+                tol: 1e-14,
+                max_iter: Some(cycles),
+                ..IterativeSolveOptions::default()
+            };
+            let result = gmres(&a, &b, None, options).expect("gmres");
+            assert_eq!(result.iterations, 20 * cycles, "cycles={cycles}");
+            assert!(!result.converged, "cycles={cycles}");
+            assert!(result.solution.iter().all(|x| x.is_finite()));
+            let residual = diagonal
+                .iter()
+                .zip(&result.solution)
+                .map(|(d, x)| (d * x - 1.0).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                / (n as f64).sqrt();
+            assert!(residual.is_finite() && residual >= options.tol);
+            assert!(result.residual_norm.is_finite() && result.residual_norm >= options.tol);
+            // Only accumulation order can differ for this 31-term norm.
+            assert!((result.residual_norm - residual).abs() <= 64.0 * f64::EPSILON * residual);
+        }
+    }
+
+    #[test]
+    fn gmres_zero_cycle_budget_preserves_guess_and_checks_true_residual() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![2.0, 4.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = [2.0, 8.0];
+        let options = IterativeSolveOptions {
+            tol: 1e-14,
+            max_iter: Some(0),
+            ..IterativeSolveOptions::default()
+        };
+        for (guess, expected, converged) in [
+            (None, vec![0.0, 0.0], false),
+            (Some(vec![1.0, 2.0]), vec![1.0, 2.0], true),
+            (Some(vec![1.0, 1.0]), vec![1.0, 1.0], false),
+        ] {
+            let result = gmres(&a, &b, guess.as_deref(), options).expect("gmres");
+            assert_eq!(result.solution, expected);
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.converged, converged);
+            let residual = ((2.0 * result.solution[0] - b[0]).powi(2)
+                + (4.0 * result.solution[1] - b[1]).powi(2))
+            .sqrt()
+                / (b[0] * b[0] + b[1] * b[1]).sqrt();
+            assert_eq!(residual == 0.0, converged);
+            assert_eq!(result.residual_norm == 0.0, converged);
+            assert!(result.residual_norm.is_finite());
+        }
+    }
+
+    #[test]
     fn gmres_diagonal_system() {
         let a = CooMatrix::from_triplets(
             Shape2D::new(2, 2),
@@ -41364,6 +41455,8 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
 }
 
 /// Solve independent GMRES systems for one sparse operator.
+/// `options.max_iter` bounds restart cycles separately for each RHS; each
+/// result's `iterations` counts its actual inner Arnoldi steps.
 pub fn gmres_batch(
     a: &CsrMatrix,
     rhses: &[Vec<f64>],

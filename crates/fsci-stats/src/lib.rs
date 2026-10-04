@@ -10031,17 +10031,75 @@ impl VonMisesFisher {
     }
 
     /// Draw `n` random sample vectors from the von Mises-Fisher distribution on S^(p-1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Self::try_rvs`] rejects the distribution's parameters or
+    /// sampling regime. Use that method to handle the refusal without panicking.
     pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        self.try_rvs(n, rng).expect(
+            "VonMisesFisher::rvs requires valid parameters and a supported sampling regime; use try_rvs to handle errors",
+        )
+    }
+
+    /// Draw samples after validating the current public `mu` and `kappa` fields.
+    ///
+    /// A zero sample count returns an empty vector without validating parameters
+    /// or consuming randomness. Otherwise `mu` must have at least two finite
+    /// entries and a norm within `1e-10` of one; `kappa` must be finite and
+    /// nonnegative. Zero concentration retains this API's uniform-sphere limit.
+    /// For dimension four and higher, concentrations above `1e6` are refused
+    /// pending a numerically robust rejection envelope; see
+    /// <https://github.com/Dicklesworthstone/frankenscipy/issues/4>.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError`] for invalid parameters or the unsupported
+    /// higher-dimensional concentration regime, before allocating samples or
+    /// consuming randomness.
+    pub fn try_rvs(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<Vec<f64>>, StatsError> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         let p = self.mu.len();
-        if p == 0 || n == 0 {
-            return Vec::new();
+        if p < 2 {
+            return Err(StatsError::DataTooSmall {
+                required: 2,
+                got: p,
+            });
+        }
+        if !self.kappa.is_finite() {
+            return Err(StatsError::NonFiniteInput { argument: "kappa" });
+        }
+        if self.kappa < 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "kappa must be nonnegative".to_string(),
+            ));
+        }
+        if self.mu.iter().any(|value| !value.is_finite()) {
+            return Err(StatsError::NonFiniteInput { argument: "mu" });
+        }
+        let norm = self
+            .mu
+            .iter()
+            .fold(0.0_f64, |norm, &value| norm.hypot(value));
+        if !norm.is_finite() || (norm - 1.0).abs() > 1e-10 {
+            return Err(StatsError::InvalidArgument(
+                "mu must be a unit vector".to_string(),
+            ));
+        }
+        if p >= 4 && self.kappa > 1e6 {
+            return Err(StatsError::Unsupported {
+                operation: "rvs with dimension >= 4 and kappa > 1e6",
+                distribution: "von Mises-Fisher",
+            });
         }
         if self.kappa <= 1e-12 {
             let mut samples = Vec::with_capacity(n);
             for _ in 0..n {
                 samples.push(uniform_direction::rvs_with_rng(p, rng));
             }
-            return samples;
+            return Ok(samples);
         }
         if p == 2 {
             let mean_angle = self.mu[1].atan2(self.mu[0]);
@@ -10050,7 +10108,7 @@ impl VonMisesFisher {
                 let theta = sample_von_mises_best_fisher(self.kappa, mean_angle, rng);
                 samples.push(vec![theta.cos(), theta.sin()]);
             }
-            return samples;
+            return Ok(samples);
         }
         let mut samples = Vec::with_capacity(n);
         let e1_dot_mu = self.mu[0];
@@ -10122,25 +10180,42 @@ impl VonMisesFisher {
             }
             samples.push(y);
         }
-        samples
+        Ok(samples)
     }
 }
 
 /// Draw a sample from the von Mises circular distribution using the Best & Fisher (1979) algorithm.
 fn sample_von_mises_best_fisher(kappa: f64, loc: f64, rng: &mut impl Rng) -> f64 {
-    if kappa <= 1e-12 {
+    // NumPy 2.4.3's random_vonmises parameter regimes avoid rho rounding to
+    // zero near uniformity and overflow at large finite concentration.
+    // https://github.com/numpy/numpy/blob/v2.4.3/numpy/random/src/distributions/distributions.c
+    if kappa < 1e-8 {
         return rng.random::<f64>() * 2.0 * PI - PI + loc;
     }
-    let tau = 1.0 + (1.0 + 4.0 * kappa * kappa).sqrt();
-    let rho = (tau - (2.0 * tau).sqrt()) / (2.0 * kappa);
-    let r = (1.0 + rho * rho) / (2.0 * rho);
+    if kappa > 1e6 {
+        let mut theta = loc + (1.0 / kappa).sqrt() * sample_standard_normals(1, rng)[0];
+        if theta < -PI {
+            theta += 2.0 * PI;
+        }
+        if theta > PI {
+            theta -= 2.0 * PI;
+        }
+        return theta;
+    }
+    let r = if kappa < 1e-5 {
+        1.0 / kappa + kappa
+    } else {
+        let tau = 1.0 + (1.0 + 4.0 * kappa * kappa).sqrt();
+        let rho = (tau - (2.0 * tau).sqrt()) / (2.0 * kappa);
+        (1.0 + rho * rho) / (2.0 * rho)
+    };
     loop {
         let u1 = rng.random::<f64>();
         let z = (PI * u1).cos();
         let f = (1.0 + r * z) / (r + z);
         let c = kappa * (r - f);
         let u2 = rng.random::<f64>();
-        if c * (2.0 - c) - u2 > 0.0 || (c / u2).ln() + 1.0 - c >= 0.0 {
+        if c * (2.0 - c) - u2 >= 0.0 || (c / u2).ln() + 1.0 - c >= 0.0 {
             let u3 = rng.random::<f64>();
             let mut theta = f.clamp(-1.0, 1.0).acos();
             if u3 > 0.5 {
@@ -69556,6 +69631,209 @@ mod tests {
             assert!((norm - 1.0).abs() < 1e-10);
         }
         assert_eq!(vmf_zero.rvs(0, &mut rng).len(), 0);
+    }
+
+    struct VmfUnusedRng;
+
+    impl rand::TryRng for VmfUnusedRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            panic!("VMF refusal must not consume randomness");
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            panic!("VMF refusal must not consume randomness");
+        }
+
+        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), Self::Error> {
+            panic!("VMF refusal must not consume randomness");
+        }
+    }
+
+    struct VmfBudgetRng {
+        inner: StdRng,
+        remaining: usize,
+    }
+
+    impl VmfBudgetRng {
+        fn seeded(seed: u64) -> Self {
+            Self {
+                inner: StdRng::seed_from_u64(seed),
+                remaining: 100_000,
+            }
+        }
+
+        fn charge_draw(&mut self) {
+            assert!(
+                self.remaining > 0,
+                "VMF sampler exhausted its RNG draw budget"
+            );
+            self.remaining -= 1;
+        }
+    }
+
+    impl rand::TryRng for VmfBudgetRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            self.charge_draw();
+            rand::TryRng::try_next_u32(&mut self.inner)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            self.charge_draw();
+            rand::TryRng::try_next_u64(&mut self.inner)
+        }
+
+        fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
+            self.charge_draw();
+            rand::TryRng::try_fill_bytes(&mut self.inner, bytes)
+        }
+    }
+
+    fn assert_vmf_finite_unit_samples(samples: &[Vec<f64>], dim: usize, count: usize) {
+        assert_eq!(samples.len(), count);
+        for sample in samples {
+            assert_eq!(sample.len(), dim);
+            assert!(sample.iter().all(|value| value.is_finite()));
+            let norm = sample.iter().map(|value| value * value).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-12, "sample norm {norm}");
+        }
+    }
+
+    #[test]
+    fn vonmises_fisher_try_rvs_validates_before_rng() {
+        let mut rng = VmfUnusedRng;
+        for mu in [&[][..], &[1.0][..]] {
+            assert_eq!(
+                VonMisesFisher::new(mu, 1.0).try_rvs(1, &mut rng),
+                Err(StatsError::DataTooSmall {
+                    required: 2,
+                    got: mu.len(),
+                })
+            );
+        }
+        for kappa in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                VonMisesFisher::new(&[1.0, 0.0], kappa).try_rvs(1, &mut rng),
+                Err(StatsError::NonFiniteInput { argument: "kappa" })
+            );
+        }
+        assert!(matches!(
+            VonMisesFisher::new(&[1.0, 0.0], -1.0).try_rvs(1, &mut rng),
+            Err(StatsError::InvalidArgument(_))
+        ));
+        for mu in [[f64::NAN, 0.0], [f64::INFINITY, 0.0]] {
+            assert_eq!(
+                VonMisesFisher::new(&mu, 1.0).try_rvs(1, &mut rng),
+                Err(StatsError::NonFiniteInput { argument: "mu" })
+            );
+        }
+        for mu in [[0.0, 0.0], [1.000_001, 0.0], [f64::MAX, f64::MAX]] {
+            assert!(matches!(
+                VonMisesFisher::new(&mu, 1.0).try_rvs(1, &mut rng),
+                Err(StatsError::InvalidArgument(_))
+            ));
+        }
+        // Public fields can change after construction; validation is per call.
+        let mut mutated = VonMisesFisher::new(&[1.0, 0.0], 1.0);
+        mutated.mu[0] = f64::NAN;
+        assert_eq!(
+            mutated.try_rvs(1, &mut rng),
+            Err(StatsError::NonFiniteInput { argument: "mu" })
+        );
+    }
+
+    #[test]
+    fn vonmises_fisher_try_rvs_refuses_extreme_high_dimensional_regime() {
+        let mut rng = VmfUnusedRng;
+        let above_limit = f64::from_bits(1e6_f64.to_bits() + 1);
+        for mu in [vec![0.5; 4], vec![1.0, 0.0, 0.0, 0.0, 0.0]] {
+            for kappa in [above_limit, 1e20, 1e308] {
+                assert!(matches!(
+                    VonMisesFisher::new(&mu, kappa).try_rvs(1, &mut rng),
+                    Err(StatsError::Unsupported { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn vonmises_fisher_zero_samples_do_not_validate_or_consume_rng() {
+        let mut rng = VmfUnusedRng;
+        for distribution in [
+            VonMisesFisher::new(&[], f64::NAN),
+            VonMisesFisher::new(&[f64::INFINITY, 0.0], -1.0),
+            VonMisesFisher::new(&[0.5; 4], 1e308),
+        ] {
+            assert!(
+                distribution
+                    .try_rvs(0, &mut rng)
+                    .expect("zero samples")
+                    .is_empty()
+            );
+            assert!(distribution.rvs(0, &mut rng).is_empty());
+        }
+    }
+
+    #[test]
+    fn vonmises_fisher_circular_sampling_handles_small_and_large_regimes() {
+        let mut rng = VmfBudgetRng::seeded(0x564d_4632);
+        let above_limit = f64::from_bits(1e6_f64.to_bits() + 1);
+        for kappa in [
+            0.0,
+            1e-12,
+            1e-9,
+            1e-8,
+            1e-7,
+            1e-5,
+            1e6,
+            above_limit,
+            1e7,
+            1e308,
+        ] {
+            let samples = VonMisesFisher::new(&[0.6, 0.8], kappa)
+                .try_rvs(32, &mut rng)
+                .expect("supported circular concentration");
+            assert_vmf_finite_unit_samples(&samples, 2, 32);
+        }
+        let near_uniform = VonMisesFisher::new(&[1.0, 0.0], 1e-9)
+            .try_rvs(256, &mut rng)
+            .expect("near-uniform circular samples");
+        let mean_x = near_uniform.iter().map(|sample| sample[0]).sum::<f64>() / 256.0;
+        let mean_y = near_uniform.iter().map(|sample| sample[1]).sum::<f64>() / 256.0;
+        assert!(
+            mean_x.hypot(mean_y) < 0.3,
+            "near-uniform mean is too concentrated"
+        );
+        // The wrapped-normal branch must handle means at the angular boundary.
+        for _ in 0..32 {
+            let theta = sample_von_mises_best_fisher(1e7, PI, &mut rng);
+            assert!((-PI..=PI).contains(&theta));
+        }
+    }
+
+    #[test]
+    fn vonmises_fisher_try_rvs_keeps_ordinary_and_limit_controls() {
+        let mut rng = VmfBudgetRng::seeded(0x564d_4634);
+        for distribution in [
+            VonMisesFisher::new(&[0.0, 0.0, 1.0], 10.0),
+            VonMisesFisher::new(&[0.5; 4], 4.0),
+            VonMisesFisher::new(&[0.5; 4], 1e6),
+            VonMisesFisher::new(&[1.0, 0.0, 0.0, 0.0, 0.0], 1e6),
+        ] {
+            let samples = distribution
+                .try_rvs(32, &mut rng)
+                .expect("supported regime");
+            assert_vmf_finite_unit_samples(&samples, distribution.dim(), 32);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "VonMisesFisher::rvs requires valid parameters")]
+    fn vonmises_fisher_legacy_rvs_documents_unsupported_regime_panic() {
+        let _ = VonMisesFisher::new(&[0.5; 4], 1e308).rvs(1, &mut VmfUnusedRng);
     }
 
     #[test]

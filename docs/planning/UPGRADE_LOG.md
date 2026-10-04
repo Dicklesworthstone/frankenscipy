@@ -1,5 +1,33 @@
 # Dependency Upgrade Log
 
+## 0.3.0 release
+
+Selected dependency changes from the published 0.2.0 workspace:
+
+| Dependency | 0.2.0 | 0.3.0 |
+|---|---|---|
+| asupersync | 0.3.9 | 0.5.0 |
+| ftui / ftui-core | 0.3.1 | 0.9.0 |
+| thiserror | 2.0.20 | 2.0.21 |
+| rand | 0.10.2 | 0.10.3 |
+| miniz_oxide | Transitive 0.8.9 | Add direct 0.9.1 for compressed MAT I/O |
+
+The current lockfile retains other transitive rand and miniz_oxide versions.
+The direct SHA-2 dependency remains 0.10.9; transitive 0.11.0 is also present.
+Migrating the source/ELF identity formatter remains a separate task
+([#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9)).
+
+Qualification covers default and published-enabled features. The full default
+suite, formatting and default all-target Clippy with warnings denied passed.
+Published-consumer E2E is part of the publication qualification. Optional benchmark, fuzz and instrumentation failures are
+tracked separately ([#10](https://github.com/Dicklesworthstone/frankenscipy/issues/10),
+[#11](https://github.com/Dicklesworthstone/frankenscipy/issues/11),
+[#12](https://github.com/Dicklesworthstone/frankenscipy/issues/12)).
+
+## Historical upgrade record — 2026-04-22
+
+The following entries describe the earlier upgrade window and its checks.
+
 **Date:** 2026-04-22  
 **Project:** frankenscipy  
 **Language:** Rust

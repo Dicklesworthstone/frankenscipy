@@ -3018,6 +3018,7 @@ fn hyperu_near_integer_b(a: f64, b: f64, x: f64, max_err: f64) -> Option<f64> {
         tail_abs += coef.abs() * (e_j.abs() + e_scale);
         let ratio = (a + jf) * x / ((1.0 + eps + n + jf) * (jf + 1.0));
         if j > 2 && ratio <= 0.5 && term.abs() <= 1.0e-18 * tail.abs() {
+            // status: j > 2 && ratio <= 0.5 && abs(term) <= 1e-18 * abs(tail)
             converged = true;
             break;
         }
@@ -3611,6 +3612,7 @@ fn hyp2f1_inv_one_minus_z_near_integer(a: f64, b: f64, c: f64, z: f64, m: f64, e
         let term = s_pow * coef * e_j;
         tail += term;
         if j > 2 && term.abs() <= 1.0e-17 * tail.abs() {
+            // status: j > 2 && abs(term) <= 1e-17 * abs(tail)
             converged = true;
             break;
         }

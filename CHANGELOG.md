@@ -1,25 +1,83 @@
 # Changelog
 
-All notable changes to FrankenSciPy are documented in this file.
+## [0.3.0] — 2026-10-04
 
-Scope window: project inception through HEAD on 2026-08-19.
+### Added
 
-## Version Timeline
+- Expanded LSODA/QUADPACK integration, boundary-value collocation, FITPACK
+  smoothing, optimization and sparse solvers.
+- Added Level 4/5 MAT-file I/O, N-dimensional geometry, covariance
+  representations and multivariate distribution sampling.
+- Added compared-case ledgers and an independently regenerated symbol census
+  to expose empty comparisons and incomplete coverage.
 
-| Version | Kind | Date | Summary |
-|---------|------|------|---------|
-| Unreleased | commits on `main` | through 2026-08-19 | vs-SciPy campaign + 2026-08-19 janitor docs-reorg |
-| workspace `0.1.0` | unreleased HEAD | 2026-08-19 | No git tags and no GitHub Releases exist |
+### Changed and fixed
 
-FrankenSciPy is a clean-room Rust reimplementation of SciPy with a
-Condition-Aware Solver Portfolio (CASP) at its core. The project has no
-formal releases yet; this changelog tracks landed capabilities organized
-by domain against the `main` branch.
+- GMRES `max_iter` now counts restart cycles. With the default restart of 20,
+  `Some(500)` permits up to 500 cycles, rather than 500 total inner steps.
+  Result `iterations` still reports actual inner Arnoldi steps, including
+  batched and CASP-selected GMRES. Other solver budget units are unchanged.
+  Qualified against the pinned SciPy oracle
+  ([#13](https://github.com/Dicklesworthstone/frankenscipy/issues/13)).
+- Refuse unsupported geometry dimensions before exponential allocation:
+  ConvexHull/HalfspaceIntersection support 2–8 dimensions; Delaunay/Voronoi
+  support 2–7 because their predicates use a lifted dimension
+  ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2)).
+- Validate Cholesky row shapes before indexing and preserve tiny positive
+  diagonal/factor scales in covariance rank, determinant and whitening
+  ([#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3)).
+- Add validated von Mises-Fisher `try_rvs`, stable circular sampling regimes
+  and safe refusal of unqualified concentration ranges. Legacy `rvs`
+  documents its panic on invalid or unsupported input
+  ([#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4)).
+- Bound header-only MAT character/String and sparse-pointer allocations to
+  16 MiB ([#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6));
+  validate original matrix entries before selected-triangle mirroring in
+  solve/inverse paths
+  ([#7](https://github.com/Dicklesworthstone/frankenscipy/issues/7)).
+- Remove the publisher's embedded credential fallback and require an existing
+  token ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)).
 
-Repository: <https://github.com/Dicklesworthstone/frankenscipy>
-License: MIT with OpenAI/Anthropic Rider
+### Known limits
 
----
+- Geometry above the documented bounds and broader covariance decomposition
+  parity need further work ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2),
+  [#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3)).
+- Von Mises-Fisher sampling at dimension four and above refuses `kappa > 1e6`;
+  extreme-concentration accuracy, seed-stream parity and near-unit mean
+  direction handling remain unqualified
+  ([#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4)).
+- Minimizer audit fingerprints omit some method-specific options
+  ([#5](https://github.com/Dicklesworthstone/frankenscipy/issues/5)). The MAT
+  header bounds do not provide an aggregate allocation/decompression limit
+  ([#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6)).
+- Credential-owner revocation remains necessary
+  ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)). The
+  optional batch publisher retains version/early-exit defects
+  ([#8](https://github.com/Dicklesworthstone/frankenscipy/issues/8)).
+- Direct source/ELF identity probes retain SHA-2 0.10.9 pending the 0.11
+  formatter migration ([#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9)).
+- Optional benchmark lint, fuzz adapters and the `spline-flags-const`
+  instrumentation test have separate known failures
+  ([#10](https://github.com/Dicklesworthstone/frankenscipy/issues/10),
+  [#11](https://github.com/Dicklesworthstone/frankenscipy/issues/11),
+  [#12](https://github.com/Dicklesworthstone/frankenscipy/issues/12)).
+- `NchypergeomWallenius`, `LogSeries`, `RandInt` and `Zipfian` inherit an
+  unsupported fitting fallback. Use fallible `try_fit`; the convenience
+  `fit` wrapper panics on errors as documented
+  ([#14](https://github.com/Dicklesworthstone/frankenscipy/issues/14)).
+
+## Previous releases
+
+- [0.2.0](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.2.0):
+  published 2026-09-12 UTC; source release and 19 crates, with no attached
+  binary assets.
+- [0.1.0](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.1.0):
+  published 2026-09-08 UTC; GitHub source release.
+
+## Historical development through 2026-08-19 (workspace version 0.1.0)
+
+At this historical cutoff, no git tags or GitHub Releases existed.
 
 ## [Unreleased] -- HEAD on main (workspace version 0.1.0)
 

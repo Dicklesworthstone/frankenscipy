@@ -32,7 +32,8 @@ impl Covariance {
                 ));
             }
             cov[i][i] = v;
-            if v > 1e-15 {
+            // gh#3: positive diagonal variances retain rank at every representable scale.
+            if v > 0.0 {
                 log_pdet += v.ln();
                 rank += 1;
                 chol[i][i] = v.sqrt();
@@ -54,16 +55,17 @@ impl Covariance {
         if dim == 0 {
             return Err("cholesky matrix must not be empty".to_string());
         }
+        // gh#3: validate every row before the product indexes another row's entries.
+        if l.iter().any(|row| row.len() != dim) {
+            return Err("cholesky factor must be square".to_string());
+        }
         let mut cov = vec![vec![0.0; dim]; dim];
         let mut log_pdet = 0.0;
         let mut rank = 0;
 
         for i in 0..dim {
-            if l[i].len() != dim {
-                return Err("cholesky factor must be square".to_string());
-            }
             let diag = l[i][i];
-            if diag > 1e-15 {
+            if diag > 0.0 {
                 log_pdet += 2.0 * diag.ln();
                 rank += 1;
             }
@@ -432,7 +434,7 @@ impl Covariance {
                 sum += chol[i][j] * y[j];
             }
             let denom = chol[i][i];
-            if denom.abs() < 1e-15 {
+            if denom == 0.0 {
                 y[i] = 0.0;
             } else {
                 y[i] = (x[i] - sum) / denom;
@@ -500,6 +502,30 @@ mod tests {
         let c = cov.colorize(&w).expect("colorize");
         assert!((c[0] - x[0]).abs() < 1e-12);
         assert!((c[1] - x[1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tiny_positive_diagonal_and_cholesky_keep_scale() {
+        for variance in [1e-16_f64, 1e-40, f64::MIN_POSITIVE] {
+            let scale = variance.sqrt();
+            let diagonal = Covariance::from_diagonal(&[variance]).expect("positive variance");
+            let cholesky = Covariance::from_cholesky(&[vec![scale]]).expect("positive factor");
+            for covariance in [diagonal, cholesky] {
+                assert_eq!(covariance.rank(), 1);
+                assert!((covariance.log_pdet() - variance.ln()).abs() < 1e-12);
+                assert_eq!(covariance.whiten(&[scale]).expect("whiten"), vec![1.0]);
+                assert_eq!(covariance.colorize(&[1.0]).expect("colorize"), vec![scale]);
+            }
+        }
+        let singular = Covariance::from_diagonal(&[0.0]).expect("zero variance");
+        assert_eq!(singular.rank(), 0);
+        assert_eq!(singular.whiten(&[1.0]).expect("singular whiten"), vec![0.0]);
+    }
+
+    #[test]
+    fn cholesky_checks_later_rows_before_matrix_product() {
+        assert!(Covariance::from_cholesky(&[vec![1.0, 0.0], vec![0.0]]).is_err());
+        assert!(Covariance::from_cholesky(&[vec![1.0], vec![0.0, 1.0]]).is_err());
     }
 
     #[test]

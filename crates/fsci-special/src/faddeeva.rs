@@ -625,6 +625,7 @@ pub(crate) fn w(z: Complex64) -> Complex64 {
             sum3 += tp + tm;
             sum5 += A * (np * tp + nm * tm);
             if A * (np * tp + nm * tm) < RELERR * sum5 {
+                // status: A * (np * tp + nm * tm) < RELERR * sum5
                 converged = true;
                 break;
             }

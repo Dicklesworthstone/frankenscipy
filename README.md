@@ -118,15 +118,15 @@ For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/pl
 
 ## Quick Example
 
-Add the crates you need (published on crates.io at 0.2.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
+Add the crates you need (published on crates.io at 0.3.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
 
 ```toml
 [dependencies]
-fsci-runtime    = "0.2"
-fsci-linalg     = "0.2"
-fsci-stats      = "0.2"
-fsci-special    = "0.2"
-fsci-integrate  = "0.2"
+fsci-runtime    = "0.3"
+fsci-linalg     = "0.3"
+fsci-stats      = "0.3"
+fsci-special    = "0.3"
+fsci-integrate  = "0.3"
 ```
 
 To track `main` instead, use `{ git = "https://github.com/Dicklesworthstone/frankenscipy" }` for each crate.
@@ -660,7 +660,7 @@ V1.0 is gated on the following items. Items 2, 4 and 6 are complete; 1, 3, 5 and
 3. **CI that stays green.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`); the first fully green fan-out was run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) on 2026-09-08 (43/43 jobs). The nightly fan-out did not stay green after it (green on 7 of the 16 nights to 2026-09-23); it was green again on 2026-09-25, run [`36123052714`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/36123052714) (45/45 jobs), and one green night is not yet a record of staying green. The work is tracked under `frankenscipy-zbtht`.
 4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
 5. **Extend CASP beyond `fsci-linalg`.** Opt-in portfolio types exist for sparse, optimize, ODE and hypergeometric selection (`SparseSolverPortfolio`, `OptSolverPortfolio`, `OdeSolverPortfolio`, `HyperSolverPortfolio`), but their features are mostly caller-supplied, their loss matrices are hand-set, and no default entry point uses them; making them evidence-driven and calibrated is tracked under `frankenscipy-xzuno` and the `frankenscipy-7tb8d` epic. The strict/hardened split with `HARDENED_MAX_DIM` is real in `fsci-linalg` and in one entry point each of signal, ndimage, interpolate, spatial, cluster and io (see **Participating Crates**).
-6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed: Git tag `v0.2.0` was released, and all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are published on crates.io at version `0.2.0` with full `#![forbid(unsafe_code)]` compliance.
+6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed with Git tag `v0.2.0`; all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are now published on crates.io at version `0.3.0` with full `#![forbid(unsafe_code)]` compliance.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are present in `crates/fsci-conformance/fixtures/artifacts/`; migration is tracked under `frankenscipy-icmu7`.
 
 `optimize.direct`, `stats.CensoredData` and `stats.Covariance` are implemented. The open work toward V1.0 is tracked in beads labelled `reality-check-2026-09-23` (capstone `frankenscipy-tit1y`); run `bv --robot-triage` for the live picture.
@@ -1670,7 +1670,7 @@ The active beads tracker (`.beads/issues.jsonl`) is the internal-state-of-truth 
 
 ## Installation
 
-FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.2.0 (tags `v0.1.0` and `v0.2.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
+FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.3.0 (tags `v0.1.0`, `v0.2.0` and `v0.3.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
 
 ### Prerequisites
 
@@ -1683,8 +1683,8 @@ FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.2.0
 ```toml
 # Cargo.toml of your project
 [dependencies]
-fsci-linalg = "0.2"
-fsci-stats  = "0.2"
+fsci-linalg = "0.3"
+fsci-stats  = "0.3"
 ```
 
 ### Per-crate, as a Git dependency (tracks `main`)
@@ -1693,7 +1693,7 @@ fsci-stats  = "0.2"
 [dependencies]
 fsci-linalg = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
 fsci-stats  = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
-# or pin: { git = "...", tag = "v0.2.0" } / { git = "...", rev = "<commit-sha>" }
+# or pin: { git = "...", tag = "v0.3.0" } / { git = "...", rev = "<commit-sha>" }
 ```
 
 ### From source (workspace clone)
@@ -1974,7 +1974,7 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
-- **Tagged release available.** The workspace is released at `0.2.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
+- **Tagged release available.** The workspace is released at `0.3.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
 - **Name coverage vs behavioural parity.** 1,194 of 1,300 `scipy.*` callables have a same-named public equivalent (91.8%; [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) explains what that census does and does not check). Active residual focus areas are `optimize.direct`, `stats.CensoredData`, and `stats.Covariance`.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.

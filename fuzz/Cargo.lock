@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,14 +653,14 @@ dependencies = [
  "fsci-special",
  "fsci-stats",
  "libfuzzer-sys",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "fsci-arrayapi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-runtime",
  "nalgebra",
@@ -662,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-cluster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-linalg",
  "fsci-runtime",
@@ -670,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asupersync",
  "blake3",
@@ -699,31 +705,32 @@ dependencies = [
 
 [[package]]
 name = "fsci-constants"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "fsci-datasets"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "fsci-fft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-runtime",
 ]
 
 [[package]]
 name = "fsci-integrate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-opt",
  "fsci-runtime",
+ "fsci-sparse",
  "nalgebra",
 ]
 
 [[package]]
 name = "fsci-interpolate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-fft",
  "fsci-linalg",
@@ -733,14 +740,15 @@ dependencies = [
 
 [[package]]
 name = "fsci-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-runtime",
+ "miniz_oxide",
 ]
 
 [[package]]
 name = "fsci-linalg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-fft",
  "fsci-runtime",
@@ -752,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-ndimage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-fft",
  "fsci-interpolate",
@@ -761,21 +769,21 @@ dependencies = [
 
 [[package]]
 name = "fsci-odr"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "fsci-opt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-runtime",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "fsci-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "serde",
@@ -784,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-signal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-fft",
  "fsci-linalg",
@@ -793,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-sparse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-linalg",
  "fsci-runtime",
@@ -807,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-spatial"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-linalg",
  "fsci-runtime",
@@ -816,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-special"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-integrate",
  "fsci-linalg",
@@ -825,14 +833,14 @@ dependencies = [
 
 [[package]]
 name = "fsci-stats"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fsci-fft",
  "fsci-integrate",
  "fsci-opt",
  "fsci-runtime",
  "fsci-special",
- "rand 0.10.2",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -1094,9 +1102,9 @@ checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
 name = "libfuzzer-sys"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12a681b7dd8ce12bff52488013ba614b869148d54dd79836ab85aafdd53f08d"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
@@ -1146,6 +1154,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
 ]
 
 [[package]]
@@ -1593,9 +1610,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -1979,18 +1996,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",

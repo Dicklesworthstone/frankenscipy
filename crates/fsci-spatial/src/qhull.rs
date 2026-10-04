@@ -2,7 +2,7 @@
 //!
 //! This is the geometric kernel behind [`crate::ConvexHull`], [`crate::Delaunay`],
 //! [`crate::Voronoi`] and [`crate::HalfspaceIntersection`]. It builds the simplicial convex hull
-//! of a point set in any dimension `D >= 2` with the Quickhull algorithm of Barber, Dobkin &
+//! of a point set in dimensions `2 <= D <= 8` with the Quickhull algorithm of Barber, Dobkin &
 //! Huhdanpaa (ACM TOMS 22(4), 1996): start from a full-dimensional simplex, repeatedly take the
 //! furthest outside point of a facet, delete the facets that point can see, and cone the horizon
 //! to the point.
@@ -26,6 +26,19 @@
 use std::collections::HashMap;
 
 const EPS: f64 = f64::EPSILON;
+/// gh#2: determinant tables grow as `2^D`; bound the kernel before any predicate allocation.
+pub(crate) const MAX_DIM: usize = 8;
+
+pub(crate) fn validate_dimension(dim: usize) -> Result<(), KernelError> {
+    if dim > MAX_DIM {
+        return Err(KernelError::DimensionTooLarge {
+            have: dim,
+            max: MAX_DIM,
+        });
+    }
+    Ok(())
+}
+
 /// Below this the filter's error bound could itself be lost to underflow, so the exact path
 /// decides instead.
 const TINY: f64 = 1.0e-250;
@@ -412,6 +425,8 @@ struct Plane {
 /// Why the kernel refused; the public types map these onto SciPy's `QhullError` texts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KernelError {
+    /// Exceeds the exact-predicate allocation budget.
+    DimensionTooLarge { have: usize, max: usize },
     /// Fewer points than `D + 1`.
     TooFewPoints { have: usize, need: usize },
     /// Every point lies, to Qhull's roundoff, in a lower-dimensional flat.
@@ -474,6 +489,7 @@ impl WorkFacet {
 /// when the centroid lies within `qh_distround` of one of the simplex's facets.
 pub(crate) fn initial_simplex(pts: &Points, count: usize) -> Result<Vec<usize>, KernelError> {
     let d = pts.dim;
+    validate_dimension(d)?;
     if count < d + 1 {
         return Err(KernelError::TooFewPoints {
             have: count,

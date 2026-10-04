@@ -4139,6 +4139,7 @@ fn qhull_input(points: &[Vec<f64>]) -> Result<(usize, Vec<f64>), SpatialError> {
             "Need at least 2-D data".to_string(),
         ));
     }
+    qhull::validate_dimension(ndim).map_err(kernel_error)?;
     let mut flat = Vec::with_capacity(points.len() * ndim);
     for row in points {
         if row.len() != ndim {
@@ -4164,6 +4165,11 @@ fn qhull_input(points: &[Vec<f64>]) -> Result<(usize, Vec<f64>), SpatialError> {
 
 fn kernel_error(err: qhull::KernelError) -> SpatialError {
     match err {
+        qhull::KernelError::DimensionTooLarge { have, max } => {
+            SpatialError::InvalidArgument(format!(
+                "exact geometry predicates support at most {max} kernel dimensions, got {have}"
+            ))
+        }
         qhull::KernelError::TooFewPoints { have, need } => qhull_error(format!(
             "QH6214 qhull input error: not enough points({have}) to construct initial simplex (need {need})"
         )),
@@ -4273,6 +4279,7 @@ fn sorted_unique_vertices(facets: &[Vec<usize>]) -> Vec<usize> {
 /// Convex hull of an N-dimensional point set, matching `scipy.spatial.ConvexHull(points)` with
 /// SciPy's default options (`"Qt"` always, `"Qx"` from 5-D up): triangulated facets, and points
 /// on the hull boundary that are not extreme are not vertices.
+/// Dimensions above eight are refused to bound the exact-predicate allocation budget.
 #[derive(Debug, Clone)]
 pub struct ConvexHull {
     /// Input points, `(npoints, ndim)`.
@@ -4306,10 +4313,10 @@ pub struct ConvexHull {
 }
 
 impl ConvexHull {
-    /// Compute the convex hull of `points` (`npoints` rows of `ndim >= 2` coordinates).
+    /// Compute the convex hull of `points` (`npoints` rows of `2 <= ndim <= 8` coordinates).
     ///
     /// # Errors
-    /// `InvalidArgument` for empty, 1-D or non-finite input, `DimensionMismatch` for ragged
+    /// `InvalidArgument` for empty, 1-D, above-8-D or non-finite input, `DimensionMismatch` for ragged
     /// rows, and `Qhull` when there are fewer than `ndim + 1` points (QH6214) or every point lies
     /// in a lower-dimensional flat (QH6154), as SciPy raises `QhullError`.
     pub fn new(points: &[Vec<f64>]) -> Result<Self, SpatialError> {
@@ -4361,6 +4368,7 @@ impl ConvexHull {
 /// `A x + b <= 0` becomes the dual point `-A / (A x0 + b)`; every facet of the dual points' convex
 /// hull is one vertex of the intersection. Dual facets lying in one hyperplane (a primal vertex
 /// where more than `ndim` halfspaces meet) are merged into a single facet, as Qhull merges them.
+/// Dimensions above eight are refused to bound the exact-predicate allocation budget.
 #[derive(Debug, Clone)]
 pub struct HalfspaceIntersection {
     /// Input halfspaces in SciPy row format `[a_0, ..., a_{n-1}, b]`.
@@ -4398,12 +4406,14 @@ impl HalfspaceIntersection {
     /// feasible `interior_point`.
     ///
     /// # Errors
-    /// `DimensionMismatch` for rows of the wrong width, `InvalidArgument` for non-finite input,
+    /// `DimensionMismatch` for rows of the wrong width, `InvalidArgument` for non-finite input
+    /// or dimensions above eight,
     /// and `Qhull` for too few halfspaces (QH6214), an interior point not clearly inside every
     /// halfspace (QH6023) or dual points in a lower-dimensional flat (QH6154).
     pub fn new(halfspaces: &[Vec<f64>], interior_point: &[f64]) -> Result<Self, SpatialError> {
         validate_halfspace_intersection_inputs_nd(halfspaces, interior_point)?;
         let ndim = interior_point.len();
+        qhull::validate_dimension(ndim).map_err(kernel_error)?;
         if ndim < 2 {
             return Err(SpatialError::InvalidArgument(
                 "Need at least 2-D data".to_string(),
@@ -4522,6 +4532,8 @@ struct LiftedHull {
 }
 
 fn lifted_hull(points: &[Vec<f64>], ndim: usize, flat: &[f64]) -> Result<LiftedHull, SpatialError> {
+    // gh#2: Delaunay/Voronoi add one paraboloid coordinate, so their input limit is seven.
+    qhull::validate_dimension(ndim + 1).map_err(kernel_error)?;
     let npoints = points.len();
     if npoints < ndim + 1 {
         // Qhull counts the "Qz" point at infinity among its input points.
@@ -4659,6 +4671,7 @@ fn invert_square(m: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
 /// `scipy.spatial.Delaunay(points)` with SciPy's default options (`"Qbb Qc Qz Q12"`, `"Qx"` from
 /// 5-D up, `"Qt"` always): the lower hull of the points lifted onto the paraboloid
 /// `|x|^2 * paraboloid_scale + paraboloid_shift`.
+/// Input dimensions above seven are refused because lifting adds one kernel coordinate.
 ///
 /// Every simplex is positively oriented, `det [[x_0, 1], ..., [x_ndim, 1]] > 0`: counterclockwise
 /// in 2-D as SciPy guarantees, and consistently so in higher dimensions where SciPy's orientation
@@ -4701,10 +4714,10 @@ pub struct Delaunay {
 }
 
 impl Delaunay {
-    /// Triangulate `points` (`npoints` rows of `ndim >= 2` coordinates).
+    /// Triangulate `points` (`npoints` rows of `2 <= ndim <= 7` coordinates).
     ///
     /// # Errors
-    /// `InvalidArgument` for empty, 1-D or non-finite input, `DimensionMismatch` for ragged
+    /// `InvalidArgument` for empty, 1-D, above-7-D or non-finite input, `DimensionMismatch` for ragged
     /// rows, and `Qhull` for fewer than `ndim + 1` points (QH6214) or points in a
     /// lower-dimensional flat (QH6154), as SciPy raises `QhullError`.
     pub fn new(points: &[Vec<f64>]) -> Result<Self, SpatialError> {
@@ -5417,6 +5430,7 @@ fn solve_linear_system(matrix: &[Vec<f64>], rhs: &[f64], tol: f64) -> Option<Vec
 /// Voronoi diagram of an N-dimensional point set, matching `scipy.spatial.Voronoi(points)` with
 /// SciPy's default options (`"Qbb Qc Qz"`, `"Qx"` from 5-D up, NOT triangulated): the dual of the
 /// Delaunay triangulation, in which a cell of cospherical points is one Voronoi vertex.
+/// Input dimensions above seven are refused because lifting adds one kernel coordinate.
 ///
 /// Which point pairs get a ridge follows Qhull's `qh_eachvoronoi` rule: a pair is a ridge when the
 /// number of Delaunay cells containing both, plus one if they also share an upper (unbounded)
@@ -5451,7 +5465,7 @@ pub struct Voronoi {
 }
 
 impl Voronoi {
-    /// Compute the Voronoi diagram of `points` (`npoints` rows of `ndim >= 2` coordinates).
+    /// Compute the Voronoi diagram of `points` (`npoints` rows of `2 <= ndim <= 7` coordinates).
     ///
     /// # Errors
     /// As [`Delaunay::new`].
@@ -9685,6 +9699,75 @@ impl RotationSpline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dimension_budget_simplex(dim: usize) -> Vec<Vec<f64>> {
+        let mut points = vec![vec![0.0; dim]];
+        for axis in 0..dim {
+            let mut point = vec![0.0; dim];
+            point[axis] = 1.0;
+            points.push(point);
+        }
+        points
+    }
+
+    fn dimension_budget_cube(dim: usize) -> Vec<Vec<f64>> {
+        let mut rows = Vec::new();
+        for axis in 0..dim {
+            for sign in [-1.0, 1.0] {
+                let mut row = vec![0.0; dim + 1];
+                row[axis] = sign;
+                row[dim] = -1.0;
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn oversized_geometry_returns_errors_before_predicate_allocations() {
+        for dim in [9, 25, 64] {
+            let points = dimension_budget_simplex(dim);
+            assert!(matches!(
+                ConvexHull::new(&points),
+                Err(SpatialError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                Delaunay::new(&points),
+                Err(SpatialError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                Voronoi::new(&points),
+                Err(SpatialError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                HalfspaceIntersection::new(&dimension_budget_cube(dim), &vec![0.0; dim]),
+                Err(SpatialError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn lifting_reserves_one_kernel_dimension() {
+        let points = dimension_budget_simplex(8);
+        assert!(ConvexHull::new(&points).is_ok());
+        assert!(matches!(
+            Delaunay::new(&points),
+            Err(SpatialError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            Voronoi::new(&points),
+            Err(SpatialError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn ordinary_geometry_keeps_working() {
+        let points = dimension_budget_simplex(2);
+        assert!(ConvexHull::new(&points).is_ok());
+        assert!(Delaunay::new(&points).is_ok());
+        assert!(Voronoi::new(&points).is_ok());
+        assert!(HalfspaceIntersection::new(&dimension_budget_cube(2), &[0.0, 0.0]).is_ok());
+    }
 
     /// `query_many` must be bit-for-bit identical to calling `query` per point
     /// (same traversal + sqrt), across dims and batch sizes that span the

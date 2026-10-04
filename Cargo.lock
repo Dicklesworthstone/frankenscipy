@@ -139,7 +139,7 @@ dependencies = [
  "franken-kernel",
  "futures-lite",
  "getrandom 0.4.3",
- "hashbrown 0.17.1",
+ "hashbrown",
  "hex",
  "hmac",
  "js-sys",
@@ -231,9 +231,9 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
-version = "2.13.1"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "blake3"
@@ -797,7 +797,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "zlib-rs",
 ]
 
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-arrayapi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-cluster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "asupersync",
  "blake3",
@@ -890,7 +890,7 @@ dependencies = [
  "fsci-stats",
  "ftui",
  "proptest",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -900,15 +900,15 @@ dependencies = [
 
 [[package]]
 name = "fsci-constants"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "fsci-datasets"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "fsci-fft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-integrate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-opt",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-interpolate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -945,17 +945,17 @@ dependencies = [
 
 [[package]]
 name = "fsci-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-runtime",
- "miniz_oxide",
+ "miniz_oxide 0.9.1",
  "proptest",
 ]
 
 [[package]]
 name = "fsci-linalg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-ndimage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -981,19 +981,19 @@ dependencies = [
 
 [[package]]
 name = "fsci-odr"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "fsci-opt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-runtime",
  "proptest",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-signal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-sparse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-spatial"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-special"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-integrate",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-stats"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -1071,16 +1071,17 @@ dependencies = [
  "fsci-runtime",
  "fsci-special",
  "proptest",
- "rand 0.10.2",
+ "rand 0.10.3",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "ftui"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "900bf8d3d1a7c167a07cce908118d1adecf777451200d34f54a25d84906350a3"
+checksum = "79e102fb7b452ec7ea40be8247c0f6491cb567fa7195f3f949844c3a5343c7e3"
 dependencies = [
+ "ftui-a11y",
  "ftui-core",
  "ftui-layout",
  "ftui-render",
@@ -1092,9 +1093,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "105dc9742b4b7d46f94a276b3b3d95eb33b248944619c8365b79eff1571cc817"
+checksum = "1588846fc0bdfabf3ef46a93d2dcd638ec87bde5097dac9c8d6d4ae4d4c70e70"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -1102,9 +1103,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f2599c0890f529da66184d4f70a0f755340694e1910243ebc47b6686e795db"
+checksum = "b86f12cc2258ee6607bd2d4d3c8b09450d7d917a735c53184cb09655f93fc7ea"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -1112,14 +1113,17 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac919691de3e2752ea689d3665a142d6885f67f859d3a8fa754f22faaf99b82"
+checksum = "c9fa81eb19de2703506b436bb443480c3572ebea287ebfb7a203f22e0e6bd220"
 dependencies = [
  "ahash",
  "arc-swap",
+ "base64",
  "bitflags",
  "crossterm",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "libc",
  "signal-hook 0.4.4",
  "unicode-display-width",
@@ -1130,31 +1134,33 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8511cfff5709b203550a764ec261ca28d8fe75c103d1ab5bc3ebd830eb8a85c"
+checksum = "7bdcb55816a850a21d4fc7b2d4b07a7e0c113f03cc8ce2cbb0cbf8076288555d"
 
 [[package]]
 name = "ftui-layout"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3691b957ebba9bea9ce86b74dc28368ca21018f614ec671840644c506d2e6430"
+checksum = "a0a6cbae56dceb3291452210310ed023fb12f9e007b3f757aa28166caff91cd7"
 dependencies = [
  "ftui-core",
  "rustc-hash",
  "serde",
+ "serde_json",
  "smallvec",
 ]
 
 [[package]]
 name = "ftui-render"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05eafaeb0b449cf7f18141cbe1fee78bba723d93d6ffe50e92c52da8a5823ad"
+checksum = "454167ebe88b41d4560f6f9d083dffe18b0a7a544a3dd1a5fe3e52fdf6d19223"
 dependencies = [
  "ahash",
  "bitflags",
  "bumpalo",
+ "ftui-a11y",
  "ftui-core",
  "memchr",
  "smallvec",
@@ -1164,11 +1170,12 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d70020c8019013da3314e12d554f405a8ea8246fd7a74bf1edf0c508508323f9"
+checksum = "a85a81b631408df20095d1384402ee23896a945dd3e33f30194951744f54fb35"
 dependencies = [
  "arc-swap",
+ "ftui-a11y",
  "ftui-backend",
  "ftui-core",
  "ftui-i18n",
@@ -1176,6 +1183,7 @@ dependencies = [
  "ftui-render",
  "ftui-style",
  "ftui-text",
+ "rustix",
  "tracing",
  "unicode-segmentation",
  "unicode-width",
@@ -1184,9 +1192,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcd2f8ee8eeffd651b40e1c81a8be9ed400550b0926631198744ed80f1174943"
+checksum = "4c46954b69c61b97aff7bcdfc199fbc19deb770957837e31db86240fc4d9d16c"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1196,9 +1204,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a20ca45ebbc7db9940ec028d607c4a260bdb1fbb9591697bd88bbcf41dfa1cfc"
+checksum = "72f043f8a08c8802fa59f0a130c2403f9ed6a9911732126dd90f8d663e5c2f6f"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -1215,9 +1223,9 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.3.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "383129a44d20f2684b69f05d16b6ba794e85883978548c038dbed6ddee1af2d6"
+checksum = "7ba05f7d99b86ad2a58752f4ad7393baf3785b488d8df51952dd21b64f57d706"
 dependencies = [
  "ahash",
  "bitflags",
@@ -1304,9 +1312,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1369,17 +1379,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -1426,7 +1425,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1508,11 +1507,11 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1548,6 +1547,15 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
 ]
 
 [[package]]
@@ -2076,9 +2084,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -2501,9 +2509,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "socket2"
@@ -2589,18 +2597,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -2372,6 +2372,19 @@ const MAT5_MAX_DIMS_BYTES: usize = 128;
 /// allocation the file does not pay for (a char array stored with zero bytes is that many spaces,
 /// and a Level 4 sparse matrix's column pointers are sized by its stated column count).
 const MAT_MAX_HEADER_ELEMENTS: usize = 1 << 28;
+/// Additional byte budget for allocations requested by a header without backing payload bytes.
+/// gh#6: this bounds the empty-char and MAT4 pointer paths, not aggregate MAT memory usage.
+const MAT_MAX_HEADER_BYTES: usize = 16 << 20;
+
+fn check_mat_header_bytes(bytes: Option<usize>, kind: &str) -> Result<(), IoError> {
+    if bytes.is_none_or(|bytes| bytes > MAT_MAX_HEADER_BYTES) {
+        return Err(IoError::InvalidFormat(format!(
+            "{kind} exceeds the {MAT_MAX_HEADER_BYTES}-byte header allocation budget"
+        )));
+    }
+    Ok(())
+}
+
 /// Bound on one decompressed variable: its `miMATRIX` tag counts bytes in a `u32`.
 const MAT5_MAX_INFLATED_BYTES: usize = (u32::MAX as usize).saturating_add(16);
 /// Deepest nesting of cells, structs and function handles read or written. Every level is a
@@ -2675,7 +2688,11 @@ fn decode_utf32_lossy(bytes: &[u8], big_endian: bool) -> Vec<char> {
 /// `uint16_codec`, the system default), `miINT8`/`miUINT8` as ASCII, `miUTF8/16/32` as that
 /// encoding. An element with no bytes is `product(dims)` spaces; otherwise the decoded text must
 /// hold at least that many characters, and the rest is ignored.
-fn read_mat5_char(s: &mut MatStream<'_>, header: &Mat5Header<'_>) -> Result<MatChar, IoError> {
+fn read_mat5_char(
+    s: &mut MatStream<'_>,
+    header: &Mat5Header<'_>,
+    as_strings: bool,
+) -> Result<MatChar, IoError> {
     let dims = header_dims(header)?;
     let length = element_count(&dims)?;
     let (mdtype, bytes) = s.read_element()?;
@@ -2685,6 +2702,24 @@ fn read_mat5_char(s: &mut MatStream<'_>, header: &Mat5Header<'_>) -> Result<MatC
                 "empty char data stands for {length} characters, above the {MAT_MAX_HEADER_ELEMENTS}-element bound"
             )));
         }
+        let mut requested_bytes = length.checked_mul(std::mem::size_of::<char>());
+        if as_strings {
+            let width = dims.last().copied().unwrap_or(1);
+            let count = length.checked_div(width).unwrap_or(0);
+            // Include String slots and both text copies while chars are converted.
+            requested_bytes = requested_bytes
+                .and_then(|bytes| {
+                    count
+                        .checked_mul(std::mem::size_of::<String>())
+                        .and_then(|slots| bytes.checked_add(slots))
+                })
+                .and_then(|bytes| {
+                    length
+                        .checked_mul(2)
+                        .and_then(|text| bytes.checked_add(text))
+                });
+        }
+        check_mat_header_bytes(requested_bytes, "empty char data")?;
         return Ok(MatChar {
             dims,
             chars: vec![' '; length],
@@ -2985,7 +3020,7 @@ impl Mat5Reader {
                 MatValue::Sparse(read_mat5_sparse(s, header)?)
             }
             MatClass::Char => {
-                let chars = read_mat5_char(s, header)?;
+                let chars = read_mat5_char(s, header, process && self.chars_as_strings)?;
                 if process && self.chars_as_strings {
                     MatValue::Strings(chars.into_strings())
                 } else {
@@ -3143,6 +3178,12 @@ fn inflate_zlib(input: &[u8], limit: usize) -> Result<(Vec<u8>, InflateEnd), IoE
             TINFLStatus::Failed | TINFLStatus::BadParam => {
                 return Err(IoError::InvalidFormat(format!(
                     "Error while decompressing MAT data: invalid zlib stream ({status:?})"
+                )));
+            }
+            // miniz_oxide 0.9 makes this status non-exhaustive; unknown states fail closed.
+            _ => {
+                return Err(IoError::InvalidFormat(format!(
+                    "Error while decompressing MAT data: unsupported zlib status ({status:?})"
                 )));
             }
         }
@@ -3621,6 +3662,12 @@ fn read_mat4_sparse(
     };
     let rows = dimension(at(nnz, 0), 9_007_199_254_740_992.0)?;
     let cols = dimension(at(nnz, 1), MAT_MAX_HEADER_ELEMENTS as f64)?;
+    let pointer_count = cols.checked_add(1);
+    check_mat_header_bytes(
+        pointer_count.and_then(|count| count.checked_mul(std::mem::size_of::<usize>())),
+        "MAT 4 sparse column pointers",
+    )?;
+    let pointer_count = pointer_count.expect("checked header allocation budget");
     let mut entries = Vec::with_capacity(nnz);
     for k in 0..nnz {
         let i = i64::from(numpy_f64_to_i32(at(k, 0))) - 1;
@@ -3639,7 +3686,7 @@ fn read_mat4_sparse(
         entries.push((j, i, at(k, 2), if width > 3 { at(k, 3) } else { 0.0 }));
     }
     entries.sort_by_key(|&(col, row, _, _)| (col, row));
-    let mut indptr = vec![0usize; cols + 1];
+    let mut indptr = vec![0usize; pointer_count];
     let (mut indices, mut real, mut imag) = (Vec::new(), Vec::new(), Vec::new());
     let mut previous = None;
     for (col, row, re, im) in entries {
@@ -9964,6 +10011,56 @@ mod tests {
             loadmat(&cut, &opts),
             Err(IoError::InvalidFormat(m)) if m.starts_with("Did not fully consume")
         ));
+    }
+
+    #[test]
+    fn loadmat_rejects_header_only_allocation_amplification() {
+        let char_file = |dims: &[i32]| {
+            mat5_file(&[mat5_matrix(4, 0, dims, b"c", &[mat5_element(MI_UTF8, b"")])])
+        };
+        let chars = i32::try_from(MAT_MAX_HEADER_BYTES / std::mem::size_of::<char>() + 1)
+            .expect("bounded dimensions");
+        let raw = LoadmatOptions {
+            chars_as_strings: false,
+            ..LoadmatOptions::default()
+        };
+        for options in [&raw, &LoadmatOptions::default()] {
+            assert!(matches!(
+                loadmat(&char_file(&[1, chars]), options),
+                Err(IoError::InvalidFormat(message)) if message.contains("header allocation budget")
+            ));
+        }
+        let string_slots = i32::try_from(MAT_MAX_HEADER_BYTES / std::mem::size_of::<String>() + 1)
+            .expect("bounded dimensions");
+        assert!(matches!(
+            loadmat(&char_file(&[string_slots, 1]), &LoadmatOptions::default()),
+            Err(IoError::InvalidFormat(message)) if message.contains("header allocation budget")
+        ));
+
+        let sparse_file = |cols: f64| {
+            let mut bytes: Vec<u8> = [2_i32, 1, 3, 0, 2]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            bytes.extend_from_slice(b"s\0");
+            bytes.extend(f64_bytes(&[3.0, cols, 0.0]));
+            bytes
+        };
+        let huge_cols = (MAT_MAX_HEADER_BYTES / std::mem::size_of::<usize>()) as f64;
+        assert!(matches!(
+            loadmat(&sparse_file(huge_cols), &LoadmatOptions::default()),
+            Err(IoError::InvalidFormat(message)) if message.contains("header allocation budget")
+        ));
+        let small = load_default(&sparse_file(2.0));
+        assert!(matches!(
+            small.get("s"),
+            Some(MatValue::Sparse(sparse)) if sparse.indptr == [0, 0, 0]
+                && sparse.rows == 3 && sparse.cols == 2
+        ));
+        assert_eq!(
+            load_default(&char_file(&[1, 3])).get("c"),
+            Some(&strings(&[1], 3, &["   "]))
+        );
     }
 
     #[test]

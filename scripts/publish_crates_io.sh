@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-TOKEN="${CARGO_REGISTRY_TOKEN:-cioYJQTi6A08oHgh2x6XEiQR3PEMM0oKFnq}"
+: "${CARGO_REGISTRY_TOKEN:?Set CARGO_REGISTRY_TOKEN from your existing registry credentials}"
+TOKEN="$CARGO_REGISTRY_TOKEN"
 
 CRATES=(
   fsci-runtime
