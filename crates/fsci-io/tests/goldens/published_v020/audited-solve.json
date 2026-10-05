@@ -1,0 +1,1 @@
+{"entries":[{"timestamp_ms":1791060756167,"input_fingerprint":"a26086c15dece0c4c8199df82e792bae3b20486b08534ad93affa644642ea753","action":{"kind":"mode_decision","mode":"Strict"},"outcome":"CASP selected DirectLU (rcond=2.68e-1)"}]}
