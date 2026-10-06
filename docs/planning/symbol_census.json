@@ -175,30 +175,19 @@
   },
   "scipy.fftpack": {
    "applicable": 10,
-   "compared": 0,
+   "compared": 10,
    "crate": "fsci-fft",
-   "declared": 1,
+   "declared": 10,
    "matched_by": {
     "case_fold": 0,
-    "exact": 1,
+    "exact": 10,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "cc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "cs_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "hilbert": "wrong_alias: fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence (frankenscipy-yrlc3)",
-    "ihilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "itilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "sc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "shift": "missing: legacy fftpack Fourier shift of a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "ss_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
-    "tilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)"
-   },
-   "real": 0,
+   "not_real": {},
+   "real": 10,
    "real_not_compared": [],
    "scipy": 10
   },
@@ -1324,17 +1313,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 877,
-  "declared": 1483,
+  "compared": 887,
+  "declared": 1492,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1278,
+   "exact": 1287,
    "reexport": 12,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1512,
+  "real": 1522,
   "scipy": 1555
  }
 }

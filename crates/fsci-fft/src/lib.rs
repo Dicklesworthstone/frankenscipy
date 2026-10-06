@@ -7,6 +7,10 @@
 //! - public signatures are stable for conformance wiring
 //! - kernels are populated in subsequent packet beads
 
+// The legacy `scipy.fftpack` pseudo-differential operators (`fftpack::diff`, `tilbert`,
+// `hilbert`, ..., `shift`). Kept in their own namespace: `fsci_fft::hilbert` is
+// `scipy.signal.hilbert`'s analytic signal, `fsci_fft::fftpack::hilbert` the periodic transform.
+pub mod fftpack;
 pub mod helpers;
 pub mod plan;
 pub mod transforms;
