@@ -612,6 +612,12 @@
     "X_REL_TOL": 1e-06
   },
   "diff_opt_tnc_slsqp_newton_cg_trust_constr.rs": {},
+  "diff_opt_trust_constr_constrained.rs": {
+    "FUN_REL_TOL": 1e-07,
+    "MAXCV_TOL": 1e-08,
+    "V_REL_TOL": 0.0001,
+    "X_REL_TOL": 1e-05
+  },
   "diff_opt_trust_region_family.rs": {
     "FUN_REL_TOL": 1e-10,
     "NIT_REL_TOL": 0.3,

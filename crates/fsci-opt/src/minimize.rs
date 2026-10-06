@@ -169,7 +169,9 @@ where
         )
     {
         return Err(OptError::InvalidArgument {
-            detail: format!("method {selected_method:?} cannot handle constraints; use SLSQP"),
+            detail: format!(
+                "method {selected_method:?} cannot handle constraints; use SLSQP or TrustConstr"
+            ),
         });
     }
 
@@ -3312,6 +3314,18 @@ fn accepted_method_options(method: OptimizeMethod) -> &'static [&'static str] {
         OptimizeMethod::LBfgsB => &["gtol", "ftol", "maxcor", "maxls"],
         OptimizeMethod::NelderMead => &["xatol", "fatol", "adaptive", "initial_simplex"],
         OptimizeMethod::Powell => &["xtol", "ftol", "direc"],
+        OptimizeMethod::TrustConstr => &[
+            "gtol",
+            "xtol",
+            "barrier_tol",
+            "initial_tr_radius",
+            "initial_constr_penalty",
+            "initial_barrier_parameter",
+            "initial_barrier_tolerance",
+            "factorization_method",
+            "finite_diff_rel_step",
+            "sparse_jacobian",
+        ],
         _ => &[],
     }
 }
@@ -3333,6 +3347,29 @@ fn set_method_options(options: &MinimizeMethodOptions<'_>) -> Vec<&'static str> 
         ("adaptive", options.adaptive.is_some()),
         ("initial_simplex", options.initial_simplex.is_some()),
         ("direc", options.direc.is_some()),
+        ("barrier_tol", options.barrier_tol.is_some()),
+        ("initial_tr_radius", options.initial_tr_radius.is_some()),
+        (
+            "initial_constr_penalty",
+            options.initial_constr_penalty.is_some(),
+        ),
+        (
+            "initial_barrier_parameter",
+            options.initial_barrier_parameter.is_some(),
+        ),
+        (
+            "initial_barrier_tolerance",
+            options.initial_barrier_tolerance.is_some(),
+        ),
+        (
+            "factorization_method",
+            options.factorization_method.is_some(),
+        ),
+        (
+            "finite_diff_rel_step",
+            options.finite_diff_rel_step.is_some(),
+        ),
+        ("sparse_jacobian", options.sparse_jacobian.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))
@@ -3351,31 +3388,7 @@ fn check_method_options(method: OptimizeMethod, options: MinimizeOptions) -> Res
         .into_iter()
         .filter(|name| !accepted.contains(name))
         .collect();
-    if !unknown.is_empty() {
-        let detail = format!(
-            "Unknown solver options for {method:?}: {}",
-            unknown.join(", ")
-        );
-        if options.mode == RuntimeMode::Hardened {
-            return Err(OptError::InvalidArgument { detail });
-        }
-        push_trace(OptimizeTraceEntry {
-            ts_unix_ms: now_unix_ms(),
-            event: String::from("unknown_solver_options"),
-            method,
-            iter_num: 0,
-            f_val: None,
-            grad_norm: None,
-            step_size: None,
-            mode: options.mode,
-            reason: Some(detail),
-            final_x: None,
-            final_f: None,
-            total_nfev: 0,
-            fixture_id: options.fixture_id.map(ToOwned::to_owned),
-            seed: options.seed,
-        });
-    }
+    report_unknown_options(method, options, &unknown)?;
     if matches!(
         method,
         OptimizeMethod::Bfgs | OptimizeMethod::ConjugateGradient
@@ -3407,6 +3420,58 @@ fn check_method_options(method: OptimizeMethod, options: MinimizeOptions) -> Res
         }
     }
     Ok(())
+}
+
+/// SciPy's `OptimizeWarning` for options the method does not read: Strict records it in the
+/// optimize trace and proceeds, Hardened refuses.
+fn report_unknown_options(
+    method: OptimizeMethod,
+    options: MinimizeOptions,
+    unknown: &[&str],
+) -> Result<(), OptError> {
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let detail = format!(
+        "Unknown solver options for {method:?}: {}",
+        unknown.join(", ")
+    );
+    if options.mode == RuntimeMode::Hardened {
+        return Err(OptError::InvalidArgument { detail });
+    }
+    push_trace(OptimizeTraceEntry {
+        ts_unix_ms: now_unix_ms(),
+        event: String::from("unknown_solver_options"),
+        method,
+        iter_num: 0,
+        f_val: None,
+        grad_norm: None,
+        step_size: None,
+        mode: options.mode,
+        reason: Some(detail),
+        final_x: None,
+        final_f: None,
+        total_nfev: 0,
+        fixture_id: options.fixture_id.map(ToOwned::to_owned),
+        seed: options.seed,
+    });
+    Ok(())
+}
+
+/// The option checks of [`trust_constr`]. SciPy's trust-constr has no `maxfev` and no `eps`
+/// (its differences take a relative step, `finite_diff_rel_step`), so `options.maxfev` and
+/// `options.gradient_eps` are unknown options there.
+pub(crate) fn check_trust_constr_options(options: MinimizeOptions) -> Result<(), OptError> {
+    validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::TrustConstr, options)?;
+    let mut unknown = Vec::new();
+    if options.maxfev.is_some() {
+        unknown.push("maxfev");
+    }
+    if options.gradient_eps.is_some() {
+        unknown.push("eps");
+    }
+    report_unknown_options(OptimizeMethod::TrustConstr, options, &unknown)
 }
 
 fn validate_bounds_for_x0(x0: &[f64], bounds: Option<&[Bound]>) -> Result<(), OptError> {
@@ -3569,18 +3634,6 @@ fn dot(lhs: &[f64], rhs: &[f64]) -> f64 {
 
 fn l2_norm(vec: &[f64]) -> f64 {
     dot(vec, vec).sqrt()
-}
-
-fn linf_norm(vec: &[f64]) -> f64 {
-    let mut norm: f64 = 0.0;
-    for value in vec {
-        let abs = value.abs();
-        if !abs.is_finite() {
-            return abs;
-        }
-        norm = norm.max(abs);
-    }
-    norm
 }
 
 fn scale_vector(input: &[f64], scale: f64) -> Vec<f64> {
@@ -4133,29 +4186,6 @@ fn conjugate_gradient_solve(a: &[Vec<f64>], b: &[f64], tol: f64, max_iter: usize
 // SLSQP (Sequential Least Squares Programming)
 // ══════════════════════════════════════════════════════════════════════
 
-/// Refuse bounds and constraints for a kernel that cannot honour them yet.
-///
-/// `trust_constr` below is an UNCONSTRAINED quasi-Newton kernel; the constrained algorithm SciPy
-/// runs under that name is frankenscipy-1ksfv.2. SciPy honours bounds and constraints for it, so
-/// ignoring them returned an infeasible optimum under `success = true` (`(x-3)^2` with bounds
-/// `[(0,2)]` came back as `x = 3`; frankenscipy-szq1n.7). Bounds: SLSQP, L-BFGS-B, TNC or
-/// Nelder-Mead. General constraints: SLSQP.
-fn reject_unhonoured_constraints(method: &str, options: MinimizeOptions) -> Result<(), OptError> {
-    if options.bounds.is_some_and(bounds_have_finite_limit) {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "{method} does not implement bounds yet; use SLSQP, L-BFGS-B, TNC or Nelder-Mead for box constraints"
-            ),
-        });
-    }
-    if !options.constraints.is_empty() {
-        return Err(OptError::InvalidArgument {
-            detail: format!("{method} does not implement constraints yet; use SLSQP"),
-        });
-    }
-    Ok(())
-}
-
 /// `scipy.optimize.minimize(method='SLSQP')`: Kraft's sequential least-squares QP (see
 /// [`crate::slsqp`]) under `options.bounds` and `options.constraints`.
 ///
@@ -4477,6 +4507,15 @@ where
 // Trust-Constr (Trust-Region Constrained)
 // ══════════════════════════════════════════════════════════════════════
 
+/// `scipy.optimize.minimize(method='trust-constr')`: SciPy's Byrd–Omojokun trust-region SQP
+/// when there are only equality constraints (or none), its trust-region interior-point method
+/// when there is any inequality or bound — under `options.constraints` and `options.bounds`.
+///
+/// This is the [`OptimizeResult`] part of [`crate::trust_constr::trust_constr_full`], which
+/// documents the options and SciPy's defaults (`gtol = xtol = barrier_tol = 1e-8`, filled by
+/// `tol`; `maxiter = 1000`), returns the multipliers, optimality and the rest of SciPy's
+/// trust-constr result, and also takes SciPy's native `LinearConstraint` /
+/// `NonlinearConstraint`. `maxcv` is the constraint violation; the message is SciPy's.
 pub fn trust_constr<F>(
     fun: &F,
     x0: &[f64],
@@ -4485,274 +4524,14 @@ pub fn trust_constr<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
-    validate_minimize_options(options)?;
-    check_method_options(OptimizeMethod::TrustConstr, options)?;
-    reject_unhonoured_constraints("trust-constr", options)?;
-
-    let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
-    let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    let mut x = x0.to_vec();
-    let mut f = objective.eval(&x)?;
-
-    let mut grad = evaluate_minimize_gradient(
-        &mut objective,
-        options.gradient,
-        &x,
-        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
-    )?;
-    let mut trust_radius = 1.0;
-    let eta = 0.15;
-    // Quasi-Newton Hessian approximation B for the quadratic trust-region
-    // model m(s) = f + g·s + ½ s^T B s, updated by BFGS. A pure Cauchy
-    // (steepest-descent) step ignores curvature and stalls in narrow valleys.
-    let mut b_hess = vec![vec![0.0; n]; n];
-    for (i, row) in b_hess.iter_mut().enumerate() {
-        row[i] = 1.0;
-    }
-
-    for iteration in 0..maxiter {
-        let kkt_optimality = unconstrained_kkt_optimality(&grad);
-        if kkt_optimality <= tol {
-            log_completion(
-                OptimizeMethod::TrustConstr,
-                options,
-                iteration,
-                &OptimizeResult {
-                    x: x.clone(),
-                    fun: Some(f),
-                    // status: KKT optimality ‖∇f‖_inf ≤ tol (unconstrained)
-                    success: true,
-                    status: ConvergenceStatus::Success,
-                    message: format!(
-                        "Convergence: KKT optimality {kkt_optimality:.3e} <= tolerance"
-                    ),
-                    nfev: objective.nfev,
-                    njev: iteration,
-                    nhev: iteration,
-                    nit: iteration,
-                    jac: Some(grad.clone()),
-                    hess_inv: None,
-                    maxcv: None,
-                },
-            );
-            return Ok(OptimizeResult {
-                x,
-                fun: Some(f),
-                // status: KKT optimality ‖∇f‖_inf ≤ tol (unconstrained)
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: format!("Convergence: KKT optimality {kkt_optimality:.3e} <= tolerance"),
-                nfev: objective.nfev,
-                njev: iteration,
-                nhev: iteration,
-                nit: iteration,
-                jac: Some(grad),
-                hess_inv: None,
-                maxcv: None,
-            });
-        }
-
-        let step = dogleg_step(&b_hess, &grad, trust_radius);
-
-        let x_new: Vec<f64> = x.iter().zip(step.iter()).map(|(xi, si)| xi + si).collect();
-        let f_new = match objective.eval(&x_new) {
-            Ok(v) => v,
-            Err(OptError::EvaluationBudgetExceeded { .. }) => {
-                return Ok(OptimizeResult {
-                    x,
-                    fun: Some(f),
-                    success: false,
-                    status: ConvergenceStatus::MaxEvaluations,
-                    message: String::from("Maximum function evaluations reached"),
-                    nfev: objective.nfev,
-                    njev: iteration,
-                    nhev: iteration,
-                    nit: iteration,
-                    jac: Some(grad),
-                    hess_inv: None,
-                    maxcv: None,
-                });
-            }
-            Err(e) => return Err(e),
-        };
-
-        // Reduction predicted by the quadratic model: -(g·s + ½ s^T B s).
-        let bs: Vec<f64> = (0..n)
-            .map(|i| (0..n).map(|j| b_hess[i][j] * step[j]).sum())
-            .collect();
-        let s_bs: f64 = step.iter().zip(bs.iter()).map(|(si, bsi)| si * bsi).sum();
-        let g_s: f64 = grad.iter().zip(step.iter()).map(|(gi, si)| gi * si).sum();
-        let predicted = -(g_s + 0.5 * s_bs);
-        let actual = f - f_new;
-        let rho = if predicted.abs() > 1.0e-15 {
-            actual / predicted
-        } else {
-            0.0
-        };
-
-        let step_norm = step.iter().map(|s| s * s).sum::<f64>().sqrt();
-        if rho < 0.25 {
-            trust_radius *= 0.25;
-        } else if rho > 0.75 && (step_norm - trust_radius).abs() < 1.0e-10 {
-            trust_radius = (2.0 * trust_radius).min(100.0);
-        }
-
-        if rho > eta {
-            let grad_new = evaluate_minimize_gradient(
-                &mut objective,
-                options.gradient,
-                &x_new,
-                options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
-            )?;
-            // BFGS update of the Hessian model:
-            //   B_{k+1} = B_k - (B s)(B s)^T / (s^T B s) + (y y^T) / (y^T s).
-            let y: Vec<f64> = grad_new
-                .iter()
-                .zip(grad.iter())
-                .map(|(gn, go)| gn - go)
-                .collect();
-            let sy: f64 = step.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
-            if sy > 1.0e-12 && s_bs > 1.0e-12 {
-                for i in 0..n {
-                    for j in 0..n {
-                        b_hess[i][j] += y[i] * y[j] / sy - bs[i] * bs[j] / s_bs;
-                    }
-                }
-            }
-            x = x_new;
-            f = f_new;
-            grad = grad_new;
-        }
-
-        if trust_radius < tol * 1.0e-6 {
-            return Ok(OptimizeResult {
-                x,
-                fun: Some(f),
-                // status: trust radius < tol·1e-6 (SciPy trust-constr xtol stop, status 2 = success)
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("Convergence: trust radius below tolerance"),
-                nfev: objective.nfev,
-                njev: iteration + 1,
-                nhev: iteration + 1,
-                nit: iteration + 1,
-                jac: Some(grad),
-                hess_inv: None,
-                maxcv: None,
-            });
-        }
-
-        if let Some(cb) = options.callback
-            && cb(&x)
-        {
-            return Ok(OptimizeResult {
-                x,
-                fun: Some(f),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("Optimization stopped by callback"),
-                nfev: objective.nfev,
-                njev: iteration + 1,
-                nhev: iteration + 1,
-                nit: iteration + 1,
-                jac: Some(grad),
-                hess_inv: None,
-                maxcv: None,
-            });
-        }
-    }
-
-    Ok(OptimizeResult {
-        x,
-        fun: Some(f),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: String::from("Maximum iterations reached"),
-        nfev: objective.nfev,
-        njev: maxiter,
-        nhev: maxiter,
-        nit: maxiter,
-        jac: Some(grad),
-        hess_inv: None,
-        maxcv: None,
-    })
-}
-
-fn unconstrained_kkt_optimality(grad: &[f64]) -> f64 {
-    linf_norm(grad)
-}
-
-/// Powell's dogleg step for the trust-region subproblem
-/// `min g·s + ½ s^T B s` subject to `||s|| <= trust_radius`.
-///
-/// Combines the Cauchy point (steepest-descent model minimizer) and the
-/// Newton point `-B^{-1} g`: returns the Newton point when it lies inside the
-/// region, the boundary-scaled steepest-descent step when even the Cauchy
-/// point lies outside, and otherwise the point where the segment joining them
-/// crosses the trust boundary.
-fn dogleg_step(b: &[Vec<f64>], grad: &[f64], trust_radius: f64) -> Vec<f64> {
-    let n = grad.len();
-    let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-    if grad_norm < 1.0e-15 {
-        return vec![0.0; n];
-    }
-
-    // Newton point p_b = -B^{-1} g.
-    let binv_g = conjugate_gradient_solve(b, grad, 1.0e-10, n.clamp(1, 50));
-    let p_newton: Vec<f64> = binv_g.iter().map(|v| -v).collect();
-    let newton_norm = p_newton.iter().map(|p| p * p).sum::<f64>().sqrt();
-    if newton_norm.is_finite() && newton_norm <= trust_radius {
-        return p_newton;
-    }
-
-    // Cauchy point p_u = -(g·g / g^T B g) g.
-    let gg = grad_norm * grad_norm;
-    let bg: Vec<f64> = (0..n)
-        .map(|i| (0..n).map(|j| b[i][j] * grad[j]).sum())
-        .collect();
-    let gbg: f64 = grad.iter().zip(bg.iter()).map(|(g, bgi)| g * bgi).sum();
-    if gbg <= 0.0 || gbg.is_nan() {
-        // Non-positive curvature: ride the boundary along -g.
-        let scale = trust_radius / grad_norm;
-        return grad.iter().map(|g| -scale * g).collect();
-    }
-    let p_cauchy: Vec<f64> = grad.iter().map(|g| -(gg / gbg) * g).collect();
-    let cauchy_norm = p_cauchy.iter().map(|p| p * p).sum::<f64>().sqrt();
-    if cauchy_norm >= trust_radius || !newton_norm.is_finite() {
-        let scale = trust_radius / grad_norm;
-        return grad.iter().map(|g| -scale * g).collect();
-    }
-
-    // Second dogleg leg: p(t) = p_cauchy + t (p_newton - p_cauchy), t in [0,1];
-    // pick t where ||p(t)|| = trust_radius.
-    let diff: Vec<f64> = p_newton
-        .iter()
-        .zip(p_cauchy.iter())
-        .map(|(pn, pc)| pn - pc)
-        .collect();
-    let a: f64 = diff.iter().map(|d| d * d).sum();
-    let b_coef: f64 = 2.0
-        * p_cauchy
-            .iter()
-            .zip(diff.iter())
-            .map(|(pc, d)| pc * d)
-            .sum::<f64>();
-    let c = cauchy_norm * cauchy_norm - trust_radius * trust_radius;
-    let t = if a.abs() < 1.0e-15 {
-        0.0
-    } else {
-        let disc = (b_coef * b_coef - 4.0 * a * c).max(0.0).sqrt();
-        ((-b_coef + disc) / (2.0 * a)).clamp(0.0, 1.0)
-    };
-    p_cauchy
-        .iter()
-        .zip(diff.iter())
-        .map(|(pc, d)| pc + t * d)
-        .collect()
+    let full = crate::trust_constr::trust_constr_full(fun, x0, &[], None, options)?;
+    log_completion(
+        OptimizeMethod::TrustConstr,
+        options,
+        full.result.nit,
+        &full.result,
+    );
+    Ok(full.result)
 }
 
 #[cfg(test)]
@@ -6877,10 +6656,12 @@ mod tests {
     }
 
     // frankenscipy-szq1n.7: these kernels used to ignore bounds and return x = 3 for (x-3)^2 on
-    // [0,2] under success = true. SLSQP now honours them (frankenscipy-1ksfv.1); trust-constr,
-    // whose constrained algorithm is frankenscipy-1ksfv.2, still refuses bounds and constraints.
+    // [0,2] under success = true. SLSQP honours them (frankenscipy-1ksfv.1) and so does
+    // trust-constr (frankenscipy-1ksfv.2), whose interior-point method stops where SciPy 1.17.1
+    // does, at x = 1.9995973376185818 (status 1: the barrier is not driven to zero once the
+    // gtol test passes).
     #[test]
-    fn slsqp_honours_bounds_and_trust_constr_refuses_them() {
+    fn slsqp_and_trust_constr_honour_bounds_and_constraints() {
         let bounds = [(Some(0.0), Some(2.0))];
         let quad = |x: &[f64]| (x[0] - 3.0).powi(2);
         let bounded = |method| MinimizeOptions {
@@ -6892,14 +6673,16 @@ mod tests {
         assert!(r.success, "{}", r.message);
         assert!((r.x[0] - 2.0).abs() < 1e-12, "x = {:?}", r.x);
 
-        let err = minimize(quad, &[1.0], bounded(OptimizeMethod::TrustConstr))
-            .expect_err("trust-constr must refuse bounds");
+        let r = minimize(quad, &[1.0], bounded(OptimizeMethod::TrustConstr)).expect("bounds");
+        assert!(r.success, "{}", r.message);
         assert!(
-            matches!(&err, OptError::InvalidArgument { detail } if detail.contains("bounds")),
-            "{err:?}"
+            (r.x[0] - 1.999_597_337_618_581_8).abs() < 1e-9,
+            "x = {:?}",
+            r.x
         );
+        assert_eq!(r.maxcv, Some(0.0));
         let constraints = [Constraint::ineq(|x: &[f64]| vec![2.0 - x[0]])];
-        let err = minimize(
+        let r = minimize(
             quad,
             &[1.0],
             MinimizeOptions {
@@ -6908,11 +6691,9 @@ mod tests {
                 ..MinimizeOptions::default()
             },
         )
-        .expect_err("trust-constr must refuse constraints");
-        assert!(
-            matches!(&err, OptError::InvalidArgument { detail } if detail.contains("constraints")),
-            "{err:?}"
-        );
+        .expect("constraints");
+        assert!(r.success, "{}", r.message);
+        assert!(r.x[0] <= 2.0 && r.x[0] > 1.99, "x = {:?}", r.x);
         for method in [OptimizeMethod::Slsqp, OptimizeMethod::TrustConstr] {
             let free = MinimizeOptions {
                 method: Some(method),
@@ -8491,7 +8272,6 @@ mod tests {
             method: Some(OptimizeMethod::TrustConstr),
             tol: Some(1e-7),
             maxiter: Some(500),
-            maxfev: Some(20_000),
             ..MinimizeOptions::default()
         };
         let result = trust_constr(&convex_bowl, &[0.0, 0.0], options).expect("trust_constr");
@@ -8525,13 +8305,14 @@ mod tests {
         );
     }
 
+    // SciPy's stop test runs before the first step and counts as iteration 1: a start whose
+    // Lagrangian gradient already has ∞-norm below gtol stops there, even with maxiter = 1.
     #[test]
     fn trust_constr_accepts_kkt_infinity_norm_stationarity() -> Result<(), OptError> {
         let options = MinimizeOptions {
             method: Some(OptimizeMethod::TrustConstr),
             tol: Some(1.0e-6),
             maxiter: Some(1),
-            maxfev: Some(100),
             ..MinimizeOptions::default()
         };
         let x0 = [7.5e-7; 4];
@@ -8547,12 +8328,9 @@ mod tests {
             result.message
         );
         assert_eq!(result.status, ConvergenceStatus::Success);
-        assert_eq!(result.nit, 0);
-        assert!(
-            result.message.contains("KKT optimality"),
-            "message={}",
-            result.message
-        );
+        assert_eq!(result.nit, 1);
+        assert_eq!(result.x, x0.to_vec());
+        assert_eq!(result.message, "`gtol` termination condition is satisfied.");
         let Some(jac) = result.jac else {
             return Err(OptError::InvalidArgument {
                 detail: String::from("trust_constr should return final KKT gradient"),

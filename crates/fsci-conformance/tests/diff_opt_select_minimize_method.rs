@@ -62,8 +62,8 @@ fn diff_opt_select_minimize_method() {
     let mut diffs: Vec<CaseDiff> = Vec::new();
 
     // 1. General constraints → Slsqp: scipy.optimize.minimize's own routing when constraints
-    // are given and no method is (frankenscipy-1ksfv.1). The old TrustConstr route led to a
-    // kernel that has to refuse constraints (frankenscipy-1ksfv.2).
+    // are given and no method is (frankenscipy-1ksfv.1). TrustConstr also honours constraints
+    // now (frankenscipy-1ksfv.2), but SciPy only runs it when asked for by name.
     let p1 = OptCaspProblem {
         dimension: 3,
         variable_scale_ratio: 1.0,

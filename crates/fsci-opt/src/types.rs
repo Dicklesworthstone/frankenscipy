@@ -172,8 +172,9 @@ pub type Bound = (Option<f64>, Option<f64>);
 /// proceeds), Hardened refuses.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MinimizeMethodOptions<'a> {
-    /// BFGS, CG, L-BFGS-B, trust-exact / trust-ncg / dogleg: the gradient-norm tolerance
-    /// (SciPy default 1e-5; 1e-8 for the trust-region methods).
+    /// BFGS, CG, L-BFGS-B, trust-exact / trust-ncg / dogleg, trust-constr: the gradient-norm
+    /// tolerance (SciPy default 1e-5; 1e-8 for the trust-region methods and trust-constr,
+    /// which also requires the constraint violation below it).
     pub gtol: Option<f64>,
     /// BFGS, CG: the order of the gradient norm tested against `gtol` (default ∞).
     pub norm: Option<f64>,
@@ -190,7 +191,8 @@ pub struct MinimizeMethodOptions<'a> {
     /// L-BFGS-B, Powell: the relative function-reduction tolerance (L-BFGS-B default
     /// 2.22e-9, Powell 1e-4).
     pub ftol: Option<f64>,
-    /// Powell: the relative x tolerance of the line searches (default 1e-4).
+    /// Powell: the relative x tolerance of the line searches (default 1e-4). trust-constr: the
+    /// trust radius below which it stops (default 1e-8).
     pub xtol: Option<f64>,
     /// Nelder-Mead: the absolute x and f tolerances of the simplex (default 1e-4 each).
     pub xatol: Option<f64>,
@@ -202,6 +204,27 @@ pub struct MinimizeMethodOptions<'a> {
     pub initial_simplex: Option<&'a [Vec<f64>]>,
     /// Powell: the initial direction set, one direction per row (default the identity).
     pub direc: Option<&'a [Vec<f64>]>,
+    /// trust-constr: with inequalities, the barrier parameter must fall below this for the
+    /// `xtol` stop (default 1e-8).
+    pub barrier_tol: Option<f64>,
+    /// trust-constr: the initial trust radius (default 1).
+    pub initial_tr_radius: Option<f64>,
+    /// trust-constr: the initial penalty weighting the constraints in the merit function
+    /// (default 1).
+    pub initial_constr_penalty: Option<f64>,
+    /// trust-constr: the initial barrier parameter (default 0.1).
+    pub initial_barrier_parameter: Option<f64>,
+    /// trust-constr: the initial tolerance of the barrier subproblems (default 0.1).
+    pub initial_barrier_tolerance: Option<f64>,
+    /// trust-constr: how the constraint Jacobian is factorised (default: QR for dense
+    /// Jacobians, the augmented system for sparse ones).
+    pub factorization_method: Option<crate::trust_constr::FactorizationMethod>,
+    /// trust-constr: the relative step of the `'2-point'` gradient (default √ε).
+    pub finite_diff_rel_step: Option<f64>,
+    /// trust-constr: treat every constraint Jacobian as sparse (`true`) or dense (`false`);
+    /// `None` keeps each one's format (the bounds' Jacobian is sparse when nothing else
+    /// decides).
+    pub sparse_jacobian: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,9 +238,9 @@ pub struct MinimizeOptions<'a> {
     pub gradient_eps: Option<f64>,
     pub callback: Option<MinimizeCallback>,
     pub gradient: Option<GradientFunc>,
-    /// SciPy `hess=`: used by trust-exact, dogleg, trust-ncg and Newton-CG.
+    /// SciPy `hess=`: used by trust-exact, dogleg, trust-ncg, Newton-CG and trust-constr.
     pub hess: Option<HessFunc>,
-    /// SciPy `hessp=`: used by trust-ncg and Newton-CG.
+    /// SciPy `hessp=`: used by trust-ncg, Newton-CG and trust-constr.
     pub hessp: Option<HesspFunc>,
     pub bounds: Option<&'a [Bound]>,
     /// SciPy `constraints=`: equality and inequality constraints. With `method: None` their

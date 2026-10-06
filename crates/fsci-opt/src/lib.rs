@@ -19,6 +19,7 @@ pub mod nonlin;
 pub mod root;
 mod slsqp;
 mod trf;
+pub mod trust_constr;
 mod trust_region;
 pub mod types;
 
@@ -53,6 +54,10 @@ pub use minimize::{
     select_minimize_method, trust_exact, trust_ncg,
 };
 pub use trf::LossKind;
+pub use trust_constr::{
+    FactorizationMethod, TrustBounds, TrustConstrMethod, TrustConstrResult, TrustConstraint,
+    trust_constr_full,
+};
 // NOTE on the two `anderson` functions, resolved conservatively rather than by
 // picking a winner. `root::anderson(func, x0, tol, maxiter, m, beta) ->
 // Result<MultivariateRootResult, OptError>` predates the nonlin family;
