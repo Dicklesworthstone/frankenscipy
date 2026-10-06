@@ -16,6 +16,11 @@
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
 
+// Complex dense linear algebra (`scipy.linalg` on complex128): LU/solve/inv/det, Cholesky,
+// QR, Hessenberg, Schur/eig via LAPACK's zlahqr, Hermitian eigh, SVD, lstsq, pinv, expm,
+// sqrtm, logm, and the real-input logm/sqrtm whose results are complex (frankenscipy-1ksfv.17).
+pub mod complex;
+
 // Reconstruction from an interpolative decomposition, and the spectral-norm estimators;
 // the CONSUMING half of `scipy.linalg.interpolative`, where `interp_decomp` in this file
 // only PRODUCES an ID.
@@ -11213,7 +11218,11 @@ fn matrix_one_norm(m: &DMatrix<f64>) -> f64 {
 /// Computes logm via eigendecomposition: if A = V D V^{-1}, then
 /// logm(A) = V diag(log(d_i)) V^{-1}.
 ///
-/// Requires all eigenvalues to be positive real.
+/// Requires all eigenvalues to be positive real: the result type is real, so a logarithm
+/// SciPy returns as COMPLEX (a negative real eigenvalue) cannot be represented here. Use
+/// [`complex::logm_real`], which returns SciPy's real-or-complex result
+/// (`logm(diag(-1, 1)) = diag(iπ, 0)`) by SciPy's algorithm, or [`complex::logm`] for complex
+/// input.
 pub fn logm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
@@ -11605,7 +11614,9 @@ fn logm_real_triangular(q: &DMatrix<f64>, t: &DMatrix<f64>, n: usize) -> DMatrix
 /// Deadman–Higham–Ralha, so results can differ in the last digits.
 ///
 /// Where SciPy returns a COMPLEX square root (a negative eigenvalue), this returns NaN: the
-/// whole matrix on the symmetric path, the affected entries on the Schur path.
+/// whole matrix on the symmetric path, the affected entries on the Schur path. Use
+/// [`complex::sqrtm_real`], which returns SciPy's real-or-complex result
+/// (`sqrtm(diag(-4, 1)) = diag(2i, 1)`), or [`complex::sqrtm`] for complex input.
 pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
@@ -21467,10 +21478,16 @@ pub fn matrix_balance(
     let mut early_return = false;
 
     if permute {
-        // Search for rows that isolate an eigenvalue and push them to the bottom.
-        let mut swapped = true;
-        while swapped {
-            swapped = false;
+        // LAPACK 3.12 `dgebal` (what SciPy's OpenBLAS 0.3.30 ships): each pass scans the rows
+        // once, from the bound it had on entry down to 0, pushing EVERY isolating row down as
+        // it meets it and carrying on with the next row; passes repeat until one swaps
+        // nothing. This used to restart the scan after each swap, which visits the rows in a
+        // different order: on random 2–6 square matrices with ~35% nonzeros it returned a
+        // different permutation (and so a different balanced matrix, and different `eig`
+        // input) from LAPACK on 215 of 4000.
+        let mut noconv = true;
+        while noconv && !early_return {
+            noconv = false;
             for i in (0..=ihi).rev() {
                 let isolated = (0..=ihi).all(|j| j == i || m[i][j] == 0.0);
                 if !isolated {
@@ -21483,41 +21500,36 @@ pub fn matrix_balance(
                     }
                     m.swap(i, ihi);
                 }
+                noconv = true;
                 if ihi == 0 {
                     sc[0] = 1.0;
                     early_return = true;
                     break;
                 }
                 ihi -= 1;
-                swapped = true;
-                break;
-            }
-            if early_return {
-                break;
             }
         }
-        // Search for columns that isolate an eigenvalue and push them left.
+        // Columns isolating an eigenvalue, pushed left: one scan per pass from the entry
+        // bound, continuing after each swap, exactly as the row search.
         if !early_return {
-            swapped = true;
-            while swapped {
-                swapped = false;
+            let mut noconv = true;
+            while noconv {
+                noconv = false;
                 let mut j = ilo;
                 while j <= ihi {
                     let isolated = (ilo..=ihi).all(|i| i == j || m[i][j] == 0.0);
-                    if !isolated {
-                        j += 1;
-                        continue;
-                    }
-                    sc[ilo] = j as f64;
-                    if j != ilo {
-                        for row in m.iter_mut().take(ihi + 1) {
-                            row.swap(j, ilo);
+                    if isolated {
+                        sc[ilo] = j as f64;
+                        if j != ilo {
+                            for row in m.iter_mut().take(ihi + 1) {
+                                row.swap(j, ilo);
+                            }
+                            m.swap(j, ilo);
                         }
-                        m.swap(j, ilo);
+                        noconv = true;
+                        ilo += 1;
                     }
-                    ilo += 1;
-                    swapped = true;
-                    break;
+                    j += 1;
                 }
             }
         }
