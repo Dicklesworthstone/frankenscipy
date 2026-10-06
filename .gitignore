@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target
+# The build directory .cargo/config.toml selects (`target-dir = "target-isolated"`).
+/target-isolated
 **/*.rs.bk
 
 # macOS resource forks
