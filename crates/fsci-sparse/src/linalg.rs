@@ -45421,6 +45421,379 @@ mod structure_predicate_tests {
     }
 }
 
+/// Options of [`funm_multiply_krylov`], with SciPy's defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FunmKrylovOptions {
+    /// `assume_a='hermitian'`: Lanczos (a tridiagonal `H`) instead of Arnoldi.
+    pub hermitian: bool,
+    /// `f` is applied to `t·H`, so the result approximates `f(t·A)·b`.
+    pub t: f64,
+    /// Absolute tolerance on the norm of a restart's update; must be non-negative.
+    pub atol: f64,
+    /// Relative tolerance: the restarts stop once an update is at most `max(atol, rtol·‖b‖)`.
+    pub rtol: f64,
+    /// Krylov vectors per restart cycle; `None` is SciPy's `min(20, n)`.
+    pub restart_every_m: Option<usize>,
+    /// Upper bound on the cycles (SciPy caps it further at `n / m + 1`).
+    pub max_restarts: usize,
+}
+
+impl Default for FunmKrylovOptions {
+    fn default() -> Self {
+        Self {
+            hermitian: false,
+            t: 1.0,
+            atol: 0.0,
+            rtol: 1e-6,
+            restart_every_m: None,
+            max_restarts: 20,
+        }
+    }
+}
+
+/// One restart cycle of SciPy's `_funm_multiply_krylov_arnoldi` / `_lanczos`: fills
+/// `v[1..=m]` (column-major Krylov vectors, `v[0]` already set) and the `(m+1) × m` block of
+/// `h` whose top-left corner is `(row0, col0)`. Returns `Some(k)` on a breakdown at step `k`
+/// (`h[k+1, k] < eps²`), `None` after `m` steps.
+fn funm_krylov_cycle(
+    a: &dyn LinearOperator,
+    v: &mut [Vec<f64>],
+    h: &mut [Vec<f64>],
+    corner: usize,
+    m: usize,
+    hermitian: bool,
+) -> SparseResult<Option<usize>> {
+    let norm_tol = f64::EPSILON * f64::EPSILON;
+    let dot = |x: &[f64], y: &[f64]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f64>();
+    for k in 0..m {
+        let mut w = a.matvec(&v[k])?;
+        if hermitian {
+            if k > 0 {
+                let beta = h[corner + k][corner + k - 1];
+                for (wi, vi) in w.iter_mut().zip(&v[k - 1]) {
+                    *wi -= beta * vi;
+                }
+            }
+            let alpha = dot(&w, &v[k]);
+            h[corner + k][corner + k] = alpha;
+            for (wi, vi) in w.iter_mut().zip(&v[k]) {
+                *wi -= alpha * vi;
+            }
+        } else {
+            // Modified Gram–Schmidt against this cycle's basis.
+            for (i, vi) in v.iter().enumerate().take(k + 1) {
+                let hik = dot(vi, &w);
+                h[corner + i][corner + k] = hik;
+                for (wj, vij) in w.iter_mut().zip(vi) {
+                    *wj -= hik * vij;
+                }
+            }
+        }
+        let hnorm = dot(&w, &w).sqrt();
+        h[corner + k + 1][corner + k] = hnorm;
+        if hnorm < norm_tol {
+            return Ok(Some(k));
+        }
+        for wi in &mut w {
+            *wi /= hnorm;
+        }
+        v[k + 1] = w;
+        if hermitian && k + 1 < m {
+            h[corner + k][corner + k + 1] = hnorm;
+        }
+    }
+    Ok(None)
+}
+
+/// `f(t·A)·b` for a square operator `A` by restarted Krylov projection, without forming
+/// `f(t·A)`: `scipy.sparse.linalg.funm_multiply_krylov(f, A, b, assume_a, t, atol, rtol,
+/// restart_every_m, max_restarts)` for real `A` and `b`.
+///
+/// `f` maps a small dense square matrix to `f` of it (e.g. `|h| fsci_linalg::expm(h, opts)`);
+/// it is called on `t·H[:j, :j]` where `H` is the block upper-Hessenberg matrix the restart
+/// cycles accumulate (Arnoldi with modified Gram–Schmidt, or Lanczos when `hermitian`), as in
+/// SciPy's `_funm_multiply_krylov.py`: each cycle of `m` vectors adds
+/// `‖b‖·V·f(t·H)[cycle rows, 0]` to the result, and the cycles stop when that update's norm is
+/// at most `max(atol, rtol·‖b‖)` or after `min(max_restarts, n/m + 1)` of them. `b = 0`
+/// returns `0` without calling `f`.
+///
+/// Breakdown (an exactly invariant Krylov subspace, `H[k+1, k] < eps²`) follows SciPy's
+/// arithmetic where SciPy returns a value: a breakdown at step `k ≥ 1` of the FIRST cycle
+/// returns `‖b‖·V[:, :k]·f(t·H[:k, :k])e₁`, which (as in SciPy) leaves out the last basis
+/// vector. Where SciPy raises, so does this: a first-cycle breakdown at step 0 (`b` an
+/// eigenvector; SciPy's IndexError) and any breakdown in a later cycle (SciPy's shape error)
+/// are [`SparseError::Unsupported`].
+///
+/// # Errors
+/// [`SparseError::InvalidArgument`] for `atol < 0`, `restart_every_m == Some(0)`,
+/// `max_restarts == 0`, a non-square `A`, or `b` of the wrong length; any error of `A`'s
+/// `matvec` or of `f`; [`SparseError::Unsupported`] for the breakdowns above.
+pub fn funm_multiply_krylov<F>(
+    mut f: F,
+    a: &dyn LinearOperator,
+    b: &[f64],
+    options: FunmKrylovOptions,
+) -> SparseResult<Vec<f64>>
+where
+    F: FnMut(&[Vec<f64>]) -> SparseResult<Vec<Vec<f64>>>,
+{
+    let shape = a.shape();
+    if shape.rows != shape.cols {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "funm_multiply_krylov needs a square operator, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let n = b.len();
+    if n != shape.cols {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "funm_multiply_krylov: b has length {n}, the operator is {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let m = options.restart_every_m.unwrap_or_else(|| n.min(20));
+    if m == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "scipy.sparse.linalg.funm_multiply_krylov: argument 'restart_every_m' \
+                      must be positive."
+                .to_string(),
+        });
+    }
+    if options.max_restarts == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "scipy.sparse.linalg.funm_multiply_krylov: argument 'max_restarts' must \
+                      be positive."
+                .to_string(),
+        });
+    }
+    if options.atol.is_nan() || options.atol < 0.0 {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "'scipy.sparse.linalg.funm_multiply_krylov' called with invalid `atol`={}; if \
+                 set, `atol` must be a real, non-negative number.",
+                options.atol
+            ),
+        });
+    }
+    let max_restarts = options.max_restarts.min(n / m + 1);
+    let mmax = m * max_restarts;
+    let bnorm = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let atol = options.atol.max(options.rtol * bnorm);
+    if bnorm == 0.0 {
+        return Ok(b.to_vec());
+    }
+    let t = options.t;
+    let mut v = vec![vec![0.0; n]; m + 1];
+    let mut h = vec![vec![0.0; mmax]; mmax + 1];
+    let breakdown_err = |cycle: usize, k: usize| SparseError::Unsupported {
+        feature: format!(
+            "funm_multiply_krylov: Krylov breakdown at step {k} of restart cycle {cycle} (an \
+             invariant subspace); SciPy raises here"
+        ),
+    };
+    // f(t·H[:size, :size]), returned as its first column.
+    let mut f_first_column = |h: &[Vec<f64>], size: usize| -> SparseResult<Vec<f64>> {
+        let th: Vec<Vec<f64>> = h[..size]
+            .iter()
+            .map(|row| row[..size].iter().map(|x| t * x).collect())
+            .collect();
+        let fh = f(&th)?;
+        if fh.len() != size || fh.iter().any(|row| row.len() != size) {
+            return Err(SparseError::InvalidArgument {
+                message: format!(
+                    "funm_multiply_krylov: f returned a {}x{} matrix for a {size}x{size} input",
+                    fh.len(),
+                    fh.first().map_or(0, Vec::len)
+                ),
+            });
+        }
+        Ok(fh.iter().map(|row| row[0]).collect())
+    };
+
+    v[0] = b.iter().map(|x| x / bnorm).collect();
+    let breakdown = funm_krylov_cycle(a, &mut v, &mut h, 0, m, options.hermitian)?;
+    let j = match breakdown {
+        Some(0) => return Err(breakdown_err(0, 0)),
+        Some(k) => k,
+        None => m,
+    };
+    let fh0 = f_first_column(&h, j)?;
+    let mut y = vec![0.0; n];
+    for (vk, &c) in v.iter().zip(&fh0) {
+        for (yi, vi) in y.iter_mut().zip(vk) {
+            *yi += vi * c;
+        }
+    }
+    for yi in &mut y {
+        *yi *= bnorm;
+    }
+    if breakdown.is_some() {
+        return Ok(y);
+    }
+    let norm = |x: &[f64]| x.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let mut update_norm = bnorm * norm(&fh0);
+    let mut restart = 1;
+    while restart < max_restarts && update_norm > atol {
+        let begin = restart * m;
+        let end = begin + m;
+        v[0] = std::mem::take(&mut v[m]);
+        if let Some(k) = funm_krylov_cycle(a, &mut v, &mut h, begin, m, options.hermitian)? {
+            return Err(breakdown_err(restart, k));
+        }
+        let fh = f_first_column(&h, end)?;
+        let coeffs = &fh[begin..end];
+        let mut update = vec![0.0; n];
+        for (vk, &c) in v.iter().zip(coeffs) {
+            for (ui, vi) in update.iter_mut().zip(vk) {
+                *ui += vi * c;
+            }
+        }
+        for (yi, ui) in y.iter_mut().zip(&update) {
+            *yi += bnorm * ui;
+        }
+        update_norm = bnorm * norm(coeffs);
+        restart += 1;
+    }
+    Ok(y)
+}
+
+#[cfg(test)]
+mod funm_multiply_krylov_tests {
+    use super::*;
+    use crate::formats::CooMatrix;
+    use crate::ops::FormatConvertible;
+
+    fn csr(a: &[Vec<f64>]) -> CsrMatrix {
+        let n = a.len();
+        let (mut r, mut c, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, row) in a.iter().enumerate() {
+            for (j, &x) in row.iter().enumerate() {
+                if x != 0.0 {
+                    r.push(i);
+                    c.push(j);
+                    v.push(x);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), v, r, c, true)
+            .and_then(|coo| coo.to_csr())
+            .expect("valid triplets")
+    }
+
+    fn expm(h: &[Vec<f64>]) -> SparseResult<Vec<Vec<f64>>> {
+        fsci_linalg::expm(h, fsci_linalg::DecompOptions::default()).map_err(|e| {
+            SparseError::InvalidArgument {
+                message: format!("{e:?}"),
+            }
+        })
+    }
+
+    #[test]
+    fn matches_the_dense_matrix_exponential_with_and_without_restarts() {
+        let n: usize = 30;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match i.abs_diff(j) {
+                        0 => -2.0,
+                        1 => 1.0,
+                        _ => 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let b: Vec<f64> = (0..n).map(|i| ((i * 7) % 5) as f64 - 2.0).collect();
+        let dense = fsci_linalg::expm(&a, fsci_linalg::DecompOptions::default()).unwrap();
+        let want: Vec<f64> = dense
+            .iter()
+            .map(|row| row.iter().zip(&b).map(|(x, y)| x * y).sum())
+            .collect();
+        for (hermitian, m) in [
+            (false, None),
+            (true, None),
+            (false, Some(4)),
+            (true, Some(6)),
+        ] {
+            let opts = FunmKrylovOptions {
+                hermitian,
+                rtol: 1e-12,
+                restart_every_m: m,
+                ..FunmKrylovOptions::default()
+            };
+            let y = funm_multiply_krylov(expm, &csr(&a), &b, opts).unwrap();
+            for (g, w) in y.iter().zip(&want) {
+                assert!(
+                    (g - w).abs() <= 1e-9,
+                    "hermitian={hermitian} m={m:?}: {g} vs {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn breakdowns_follow_scipy() {
+        // An invariant subspace closing at step 1: SciPy 1.17.1 returns [1, 0, 0] (it drops
+        // the last basis vector; the exact answer is [cosh 1, sinh 1, 0]).
+        let a = csr(&[
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 5.0],
+        ]);
+        for hermitian in [false, true] {
+            let opts = FunmKrylovOptions {
+                hermitian,
+                ..FunmKrylovOptions::default()
+            };
+            let y = funm_multiply_krylov(expm, &a, &[1.0, 0.0, 0.0], opts).unwrap();
+            assert_eq!(y, vec![1.0, 0.0, 0.0]);
+        }
+        // b an eigenvector: breakdown at step 0, SciPy's IndexError.
+        let d = csr(&[
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 3.0],
+        ]);
+        let err = funm_multiply_krylov(expm, &d, &[0.0, 2.0, 0.0], FunmKrylovOptions::default());
+        assert!(matches!(err, Err(SparseError::Unsupported { .. })));
+        // b = 0 returns 0 without calling f.
+        let y = funm_multiply_krylov(
+            |_: &[Vec<f64>]| -> SparseResult<Vec<Vec<f64>>> { panic!("f must not be called") },
+            &d,
+            &[0.0; 3],
+            FunmKrylovOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(y, vec![0.0; 3]);
+    }
+
+    #[test]
+    fn rejects_bad_arguments() {
+        let a = csr(&[vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let b = [1.0, 1.0];
+        let bad = |opts| funm_multiply_krylov(expm, &a, &b, opts).is_err();
+        assert!(bad(FunmKrylovOptions {
+            atol: -1.0,
+            ..FunmKrylovOptions::default()
+        }));
+        assert!(bad(FunmKrylovOptions {
+            restart_every_m: Some(0),
+            ..FunmKrylovOptions::default()
+        }));
+        assert!(bad(FunmKrylovOptions {
+            max_restarts: 0,
+            ..FunmKrylovOptions::default()
+        }));
+        assert!(funm_multiply_krylov(expm, &a, &[1.0; 3], FunmKrylovOptions::default()).is_err());
+        // f returning the wrong shape is refused rather than indexed out of bounds.
+        let wrong = |_: &[Vec<f64>]| -> SparseResult<Vec<Vec<f64>>> { Ok(vec![vec![1.0]]) };
+        assert!(funm_multiply_krylov(wrong, &a, &b, FunmKrylovOptions::default()).is_err());
+    }
+}
+
 /// Action of the matrix exponential on a vector -- `scipy.sparse.linalg.expm_multiply`.
 ///
 /// Computes `exp(t*A) @ b` WITHOUT ever forming `exp(A)`. That is the whole point:

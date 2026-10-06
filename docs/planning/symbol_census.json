@@ -830,12 +830,12 @@
   },
   "scipy.sparse.linalg": {
    "applicable": 37,
-   "compared": 28,
+   "compared": 29,
    "crate": "fsci-sparse",
-   "declared": 31,
+   "declared": 32,
    "matched_by": {
     "case_fold": 0,
-    "exact": 30,
+    "exact": 31,
     "reexport": 1,
     "trait": 0,
     "type_alias": 0
@@ -844,10 +844,9 @@
    "not_real": {
     "ArpackError": "missing: SparseError has no eigensolver error class (frankenscipy-6j5tz)",
     "MatrixRankWarning": "missing: spsolve on a singular matrix returns SingularMatrix instead of warning (frankenscipy-6j5tz)",
-    "funm_multiply_krylov": "missing: no Krylov f(A)b (frankenscipy-6j5tz)",
     "use_solver": "na: selects UMFPACK for spsolve; there is no UMFPACK"
    },
-   "real": 34,
+   "real": 35,
    "real_not_compared": [
     "SuperLU",
     "expm_multiply",
@@ -1310,17 +1309,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 889,
-  "declared": 1494,
+  "compared": 890,
+  "declared": 1495,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1289,
+   "exact": 1290,
    "reexport": 12,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1524,
+  "real": 1525,
   "scipy": 1555
  }
 }

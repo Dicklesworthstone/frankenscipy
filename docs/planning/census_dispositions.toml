@@ -339,13 +339,6 @@ reason = "selects UMFPACK for spsolve; there is no UMFPACK"
 
 [[entry]]
 module = "scipy.sparse.linalg"
-name = "funm_multiply_krylov"
-disposition = "missing"
-reason = "no Krylov f(A)b"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
 name = "MatrixRankWarning"
 disposition = "missing"
 reason = "spsolve on a singular matrix returns SingularMatrix instead of warning"
