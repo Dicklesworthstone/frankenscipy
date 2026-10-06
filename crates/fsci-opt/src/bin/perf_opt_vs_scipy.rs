@@ -32,7 +32,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use fsci_opt::{linear_sum_assignment, linprog, nnls};
+use fsci_opt::{LinprogOptions, linear_sum_assignment, linprog, nnls};
 use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 
 /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
@@ -317,7 +317,7 @@ fn main() {
                         &empty_rows,
                         &[],
                         &bounds,
-                        None,
+                        LinprogOptions::default(),
                     )
                     .expect("fsci linprog");
                     vec![if result.success { result.fun } else { f64::NAN }]

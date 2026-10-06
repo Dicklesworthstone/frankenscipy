@@ -8,13 +8,13 @@
 
 use fsci_opt::{
     BasinhoppingOptions, CurveFitOptions, DifferentialEvolutionOptions, LeastSquaresOptions,
-    MinimizeOptions, MinimizeScalarOptions, RootOptions, approx_fprime, basinhopping, bisect,
-    bracket, brent_minimize, brenth, brentq, brute, check_grad, cobyla, curve_fit,
-    differential_evolution, dual_annealing, fixed_point, fsolve, golden, gradient_descent, halley,
-    isotonic_regression, least_squares, linear_sum_assignment, linprog, minimize, minimize_scalar,
-    minimize_scalar_bounded, minimize_trisection, newton_scalar, nnls, numerical_gradient,
-    numerical_hessian, numerical_jacobian, projected_gradient_descent, pso, ridder, rosen,
-    rosen_der, rosen_hess, rosen_hess_prod, secant, shgo, toms748,
+    LinprogOptions, MinimizeOptions, MinimizeScalarOptions, RootOptions, approx_fprime,
+    basinhopping, bisect, bracket, brent_minimize, brenth, brentq, brute, check_grad, cobyla,
+    curve_fit, differential_evolution, dual_annealing, fixed_point, fsolve, golden,
+    gradient_descent, halley, isotonic_regression, least_squares, linear_sum_assignment, linprog,
+    minimize, minimize_scalar, minimize_scalar_bounded, minimize_trisection, newton_scalar, nnls,
+    numerical_gradient, numerical_hessian, numerical_jacobian, projected_gradient_descent, pso,
+    ridder, rosen, rosen_der, rosen_hess, rosen_hess_prod, secant, shgo, toms748,
 };
 
 const ATOL: f64 = 1e-6;
@@ -1158,7 +1158,11 @@ fn mr_linprog_simple_bounded() {
     let a_eq: Vec<Vec<f64>> = vec![];
     let b_eq: Vec<f64> = vec![];
     let bounds = vec![(Some(0.0), None), (Some(0.0), None)];
-    let res = linprog(&c, &a_ub, &b_ub, &a_eq, &b_eq, &bounds, Some(100)).unwrap();
+    let options = LinprogOptions {
+        maxiter: Some(100),
+        ..LinprogOptions::default()
+    };
+    let res = linprog(&c, &a_ub, &b_ub, &a_eq, &b_eq, &bounds, options).unwrap();
     // Optimal: x = 1, y = 0; objective = 2.
     assert!(
         (res.fun - 2.0).abs() < 1e-3,

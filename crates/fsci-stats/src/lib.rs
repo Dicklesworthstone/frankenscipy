@@ -34250,7 +34250,15 @@ pub fn wasserstein_distance_nd(
     }
 
     let bounds = vec![(Some(0.0), None); nvars];
-    match fsci_opt::linprog(&cost, &[], &[], &a_eq, &b_eq, &bounds, None) {
+    match fsci_opt::linprog(
+        &cost,
+        &[],
+        &[],
+        &a_eq,
+        &b_eq,
+        &bounds,
+        fsci_opt::LinprogOptions::default(),
+    ) {
         Ok(res) if res.success => res.fun,
         _ => f64::NAN,
     }

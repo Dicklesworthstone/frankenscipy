@@ -432,7 +432,7 @@ What follows is the technical-depth pass: which algorithms FrankenSciPy actually
 | Minimizers | Each method has its own kernel: Nelder-Mead with full simplex bookkeeping, BFGS with an Armijo backtracking line search, L-BFGS-B as projected L-BFGS, Powell with SciPy's Brent / bounded-Brent line searches, Newton-CG with truncated CG, TNC, trust-ncg / dogleg / trust-exact as SciPy's trust-region driver with its CG-Steihaug, dogleg and Moré–Sorensen subproblems (matching SciPy's iterates and evaluation counts when given `hess` or `hessp`; trust-exact without `hess`, which SciPy refuses, runs fsci's own BFGS-model trust region), SLSQP as Kraft's algorithm (a port of SciPy's C translation, matching its iterates on the Hock–Schittkowski test problems) with constraints and bounds, and trust-constr, which does not yet accept constraints or bounds. `cobyla` is a coordinate compass search on a penalty, not Powell's COBYLA, and reports failure when it ends infeasible. There is no trust-krylov. |
 | Root finders | brentq, brenth (brentq under another name), ridder, toms748, bisect, newton, halley, secant, anderson, broyden1/2, fsolve, lm_root; no automatic fallback between bracketing and Newton-type methods. |
 | Global optimizers | Differential Evolution, Basin Hopping, dual annealing as classical simulated annealing (no Tsallis visiting distribution), SHGO as a sampling grid plus multistart L-BFGS-B (no simplicial homology), Particle Swarm, brute force. |
-| LP / MILP | Dense two-phase tableau simplex (no interior point, no dual or marginal output); depth-first branch-and-bound for MILP. |
+| LP / MILP | `linprog` returns HiGHS's result shape (`con`, `slack`, and `ineqlin` / `eqlin` / `lower` / `upper` residuals and marginals) from fsci's own dense solvers: a bounded primal revised simplex (`highs` / `highs-ds`; HiGHS's is dual) with exact basis duals, and a Mehrotra predictor–corrector interior point method with crossover to a vertex (`highs-ipm`). No presolve, no scaling, no sparse input; on LPs with several optimal vertices or duals the answer can differ from HiGHS's while equally optimal. Depth-first branch-and-bound for MILP. |
 | `linear_sum_assignment` | Jonker–Volgenant shortest augmenting path (SciPy's algorithm) in `fsci-opt`; rectangular inputs are handled by transposition. |
 | Hypergeometric `2F1` | A rule-based region map: series, Pfaff and Euler transformations, terminating cases and the 1 − z connection formulas (DLMF 15.8.4 / 15.8.10). The opt-in CASP selector is not used by `hyp2f1`. |
 | Bessel `J`/`Y` | `j0`/`j1`/`y0`/`y1` use Cephes rational approximations; `jv` uses series, Hankel asymptotics and Miller recurrence, with overflow and underflow guards. |
@@ -931,7 +931,8 @@ Curve fitting: curve_fit, least_squares (SciPy's trf with bounds and robust
 Global:        differential_evolution, dual_annealing, basinhopping, shgo, brute,
                pso,
 
-LP / MILP:     linprog (dense two-phase tableau simplex), milp (branch and bound),
+LP / MILP:     linprog (bounded revised simplex + Mehrotra IPM, with marginals),
+               milp (branch and bound),
 
 Other:         linear_sum_assignment (Jonker-Volgenant), bracket,
                line_search_wolfe1, line_search_wolfe2, validate_wolfe_params,

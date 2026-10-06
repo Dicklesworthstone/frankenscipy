@@ -14,7 +14,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::linprog;
+use fsci_opt::{LinprogOptions, linprog};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-003";
@@ -281,7 +281,10 @@ fn diff_opt_linprog() {
             &case.a_eq,
             &case.b_eq,
             &case.bounds,
-            Some(2000),
+            LinprogOptions {
+                maxiter: Some(2000),
+                ..LinprogOptions::default()
+            },
         )
         .ok()
         .filter(|res| res.success)

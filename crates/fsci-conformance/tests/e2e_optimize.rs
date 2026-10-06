@@ -14,10 +14,10 @@
 use fsci_opt::types::OptimizeTraceEntry;
 use fsci_opt::{
     ConvergenceStatus, CurveFitOptions, DifferentialEvolutionOptions, Integrality,
-    LeastSquaresOptions, LinprogResult, MilpOptions, MilpProblem, MinimizeOptions, OptimizeMethod,
-    RootMethod, RootOptions, curve_fit, differential_evolution, fsolve, get_optimize_traces,
-    halley, least_squares, linprog, milp, minimize, newton_scalar, ridder, root_scalar, secant,
-    toms748,
+    LeastSquaresOptions, LinprogOptions, LinprogResult, MilpOptions, MilpProblem, MinimizeOptions,
+    OptimizeMethod, RootMethod, RootOptions, curve_fit, differential_evolution, fsolve,
+    get_optimize_traces, halley, least_squares, linprog, milp, minimize, newton_scalar, ridder,
+    root_scalar, secant, toms748,
 };
 use fsci_runtime::RuntimeMode;
 use serde::Serialize;
@@ -1075,8 +1075,16 @@ fn e2e_p2c003_12_linprog_basic() {
         let b_eq: Vec<f64> = vec![];
         let bounds = vec![(Some(0.0), None), (Some(0.0), None)]; // x >= 0
 
-        let result: LinprogResult = linprog(&c, &a_ub, &b_ub, &a_eq, &b_eq, &bounds, None)
-            .map_err(|e| format!("linprog failed: {e}"))?;
+        let result: LinprogResult = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &a_eq,
+            &b_eq,
+            &bounds,
+            LinprogOptions::default(),
+        )
+        .map_err(|e| format!("linprog failed: {e}"))?;
 
         if !result.success {
             return Err(format!("linprog did not converge: {}", result.message));
@@ -1114,8 +1122,16 @@ fn e2e_p2c003_12_linprog_basic() {
         let b_eq = vec![5.0];
         let bounds = vec![(Some(0.0), None), (Some(0.0), None)]; // x >= 0
 
-        let result = linprog(&c, &a_ub, &b_ub, &a_eq, &b_eq, &bounds, None)
-            .map_err(|e| format!("linprog failed: {e}"))?;
+        let result = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &a_eq,
+            &b_eq,
+            &bounds,
+            LinprogOptions::default(),
+        )
+        .map_err(|e| format!("linprog failed: {e}"))?;
 
         if !result.success {
             return Err(format!("linprog did not converge: {}", result.message));
@@ -1371,8 +1387,16 @@ fn e2e_p2c003_15_free_variable_linear_programs() {
         let b_ub = vec![-1.0];
         let bounds = vec![(None, None)];
 
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &bounds, None)
-            .map_err(|e| format!("linprog failed: {e}"))?;
+        let result = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &[],
+            &[],
+            &bounds,
+            LinprogOptions::default(),
+        )
+        .map_err(|e| format!("linprog failed: {e}"))?;
 
         if !result.success {
             return Err(format!("linprog did not converge: {}", result.message));

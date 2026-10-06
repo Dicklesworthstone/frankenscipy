@@ -13,6 +13,7 @@ mod gsa;
 pub mod lbfgs_inv_hess;
 mod lbfgsb;
 pub mod linesearch;
+mod linprog;
 pub mod minimize;
 pub mod nonlin;
 pub mod root;
@@ -42,6 +43,7 @@ pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,
     line_search_wolfe2,
 };
+pub use linprog::{LinprogMethod, LinprogOptions, LinprogResult, LinprogSensitivity, linprog};
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, OptCaspDecision, OptCaspProblem,
     OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
@@ -1208,27 +1210,8 @@ fn hungarian_rectangular_reference(cost_matrix: &[Vec<f64>]) -> Vec<usize> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Linear Programming: linprog
+// Mixed-integer linear programming: milp (linprog lives in linprog.rs)
 // ══════════════════════════════════════════════════════════════════════
-
-/// Result of a linear programming problem.
-#[derive(Debug, Clone)]
-pub struct LinprogResult {
-    /// Solution vector.
-    pub x: Vec<f64>,
-    /// Optimal objective value `c^T x`.
-    pub fun: f64,
-    /// Slack variables for inequality constraints.
-    pub slack: Vec<f64>,
-    /// Whether the solver succeeded.
-    pub success: bool,
-    /// Solver status: 0 = optimal, 1 = iteration limit, 2 = infeasible, 3 = unbounded.
-    pub status: u8,
-    /// Human-readable message.
-    pub message: String,
-    /// Number of iterations.
-    pub nit: usize,
-}
 
 /// Variable integrality kind for `milp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1276,19 +1259,6 @@ pub struct MilpOptions {
     pub lp_maxiter: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-struct StandardFormVariable {
-    offset: f64,
-    terms: Vec<(usize, f64)>,
-}
-
-#[derive(Debug, Clone)]
-struct StandardFormTransform {
-    original_vars: Vec<StandardFormVariable>,
-    decision_var_count: usize,
-    upper_bound_rows: Vec<(usize, f64)>,
-}
-
 fn validate_variable_bounds(index: usize, lo: f64, hi: f64) -> Result<(), OptError> {
     if lo.is_nan() || hi.is_nan() {
         return Err(OptError::InvalidBounds {
@@ -1311,453 +1281,6 @@ fn validate_variable_bounds(index: usize, lo: f64, hi: f64) -> Result<(), OptErr
         });
     }
     Ok(())
-}
-
-fn build_standard_form_transform(
-    var_bounds: &[(f64, f64)],
-) -> Result<StandardFormTransform, OptError> {
-    let mut original_vars = Vec::with_capacity(var_bounds.len());
-    let mut upper_bound_rows = Vec::new();
-    let mut next_index = 0usize;
-
-    for (index, &(lo, hi)) in var_bounds.iter().enumerate() {
-        validate_variable_bounds(index, lo, hi)?;
-        if lo.is_finite() {
-            let std_index = next_index;
-            next_index += 1;
-            original_vars.push(StandardFormVariable {
-                offset: lo,
-                terms: vec![(std_index, 1.0)],
-            });
-            if hi.is_finite() {
-                upper_bound_rows.push((std_index, hi - lo));
-            }
-        } else if hi.is_finite() {
-            let std_index = next_index;
-            next_index += 1;
-            original_vars.push(StandardFormVariable {
-                offset: hi,
-                terms: vec![(std_index, -1.0)],
-            });
-        } else {
-            let pos_index = next_index;
-            let neg_index = next_index + 1;
-            next_index += 2;
-            original_vars.push(StandardFormVariable {
-                offset: 0.0,
-                terms: vec![(pos_index, 1.0), (neg_index, -1.0)],
-            });
-        }
-    }
-
-    Ok(StandardFormTransform {
-        original_vars,
-        decision_var_count: next_index,
-        upper_bound_rows,
-    })
-}
-
-/// Solve a linear programming problem with a dense two-phase TABLEAU simplex.
-///
-/// Same problem statement and `status` codes as `scipy.optimize.linprog(c, A_ub, b_ub, A_eq,
-/// b_eq, bounds)`, but a different method. SciPy's default is HiGHS (dual simplex / IPM on
-/// sparse data); this is the textbook dense tableau with Dantzig pricing that falls back to
-/// Bland's rule after a run of degenerate pivots. It costs O(m·n) memory and time per pivot,
-/// and it returns no dual values (`marginals`) and no equality residuals (`con`). On an LP
-/// with several optimal vertices it can return a different optimal `x` from HiGHS. `fun` is
-/// the same.
-///
-/// Minimizes `c^T x` subject to:
-///   `A_ub @ x <= b_ub` (inequality constraints)
-///   `A_eq @ x == b_eq` (equality constraints)
-///   `lb <= x <= ub` (variable bounds)
-///
-/// # Arguments
-/// * `c` — Objective function coefficients (minimize c^T x).
-/// * `a_ub` — Inequality constraint matrix (each row: a_i^T x <= b_ub_i). Can be empty.
-/// * `b_ub` — Inequality constraint RHS.
-/// * `a_eq` — Equality constraint matrix. Can be empty.
-/// * `b_eq` — Equality constraint RHS.
-/// * `bounds` — Variable bounds as `(Option<lower>, Option<upper>)` per variable.
-///   `None` means unbounded in that direction. If empty, defaults to `(0, +inf)` per variable.
-/// * `maxiter` — Maximum number of simplex iterations.
-pub fn linprog(
-    c: &[f64],
-    a_ub: &[Vec<f64>],
-    b_ub: &[f64],
-    a_eq: &[Vec<f64>],
-    b_eq: &[f64],
-    bounds: &[(Option<f64>, Option<f64>)],
-    maxiter: Option<usize>,
-) -> Result<LinprogResult, OptError> {
-    let n = c.len();
-    if n == 0 {
-        return Err(OptError::InvalidArgument {
-            detail: "c must not be empty".to_string(),
-        });
-    }
-    if c.iter().any(|value| !value.is_finite()) {
-        return Err(OptError::NonFiniteInput {
-            detail: "c must contain only finite values".to_string(),
-        });
-    }
-    if maxiter == Some(0) {
-        return Err(OptError::InvalidArgument {
-            detail: "maxiter must be greater than zero".to_string(),
-        });
-    }
-
-    // Validate dimensions.
-    if a_ub.len() != b_ub.len() {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "A_ub rows ({}) must match b_ub length ({})",
-                a_ub.len(),
-                b_ub.len()
-            ),
-        });
-    }
-    for (i, row) in a_ub.iter().enumerate() {
-        if row.len() != n {
-            return Err(OptError::InvalidArgument {
-                detail: format!("A_ub row {i} has {} cols, expected {n}", row.len()),
-            });
-        }
-        if row.iter().any(|value| !value.is_finite()) {
-            return Err(OptError::NonFiniteInput {
-                detail: format!("A_ub row {i} contains non-finite values"),
-            });
-        }
-    }
-    if b_ub.iter().any(|value| !value.is_finite()) {
-        return Err(OptError::NonFiniteInput {
-            detail: "b_ub must contain only finite values".to_string(),
-        });
-    }
-    if a_eq.len() != b_eq.len() {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "A_eq rows ({}) must match b_eq length ({})",
-                a_eq.len(),
-                b_eq.len()
-            ),
-        });
-    }
-    for (i, row) in a_eq.iter().enumerate() {
-        if row.len() != n {
-            return Err(OptError::InvalidArgument {
-                detail: format!("A_eq row {i} has {} cols, expected {n}", row.len()),
-            });
-        }
-        if row.iter().any(|value| !value.is_finite()) {
-            return Err(OptError::NonFiniteInput {
-                detail: format!("A_eq row {i} contains non-finite values"),
-            });
-        }
-    }
-    if b_eq.iter().any(|value| !value.is_finite()) {
-        return Err(OptError::NonFiniteInput {
-            detail: "b_eq must contain only finite values".to_string(),
-        });
-    }
-
-    // Apply variable bounds by transforming to standard form.
-    // Default bounds: (0, +inf) if not specified.
-    let var_bounds: Vec<(f64, f64)> = if bounds.is_empty() {
-        vec![(0.0, f64::INFINITY); n]
-    } else {
-        if bounds.len() != n {
-            return Err(OptError::InvalidArgument {
-                detail: format!("bounds length ({}) must match c length ({n})", bounds.len()),
-            });
-        }
-        bounds
-            .iter()
-            .map(|(lo, hi)| (lo.unwrap_or(f64::NEG_INFINITY), hi.unwrap_or(f64::INFINITY)))
-            .collect()
-    };
-
-    let transform = build_standard_form_transform(&var_bounds)?;
-
-    // Transform to standard form: minimize c^T x, A x = b, x >= 0.
-    // 1. Finite-lower-bound variables are shifted to y >= 0.
-    // 2. Upper-only variables are reflected as x = ub - y with y >= 0.
-    // 3. Free variables are split as x = x_pos - x_neg with x_pos, x_neg >= 0.
-    // 4. Add slack variables for inequality constraints and finite shifted upper bounds.
-    let m_ub = a_ub.len();
-    let m_eq = a_eq.len();
-    let decision_var_count = transform.decision_var_count;
-    let ub_slacks = &transform.upper_bound_rows;
-    let n_ub_slack = ub_slacks.len();
-
-    // Total variables: transformed decision vars + inequality slack + upper-bound slack.
-    let total_vars = decision_var_count + m_ub + n_ub_slack;
-    let total_constraints = m_ub + m_eq + n_ub_slack;
-
-    // Build standard-form objective: c' = [c, 0, 0, ...]
-    let mut c_std = vec![0.0; total_vars];
-    for (&coeff, transformed) in c.iter().zip(transform.original_vars.iter()) {
-        for &(std_index, std_coeff) in &transformed.terms {
-            c_std[std_index] += coeff * std_coeff;
-        }
-    }
-
-    // Build constraint matrix A_std and b_std.
-    let mut a_std = vec![vec![0.0; total_vars]; total_constraints];
-    let mut b_std = vec![0.0; total_constraints];
-
-    // Row 0..m_ub: inequality constraints → A_ub x + s = b_ub.
-    for i in 0..m_ub {
-        b_std[i] = b_ub[i];
-        for (j, transformed) in transform.original_vars.iter().enumerate() {
-            for &(std_index, std_coeff) in &transformed.terms {
-                a_std[i][std_index] += a_ub[i][j] * std_coeff;
-            }
-            b_std[i] -= a_ub[i][j] * transformed.offset;
-        }
-        a_std[i][decision_var_count + i] = 1.0; // slack variable
-    }
-
-    // Row m_ub..m_ub+m_eq: equality constraints.
-    for i in 0..m_eq {
-        b_std[m_ub + i] = b_eq[i];
-        for (j, transformed) in transform.original_vars.iter().enumerate() {
-            for &(std_index, std_coeff) in &transformed.terms {
-                a_std[m_ub + i][std_index] += a_eq[i][j] * std_coeff;
-            }
-            b_std[m_ub + i] -= a_eq[i][j] * transformed.offset;
-        }
-    }
-
-    // Row m_ub+m_eq..: shifted finite upper bounds: y_i + s_ub = ub_i - lb_i.
-    for (k, &(std_index, bound_diff)) in ub_slacks.iter().enumerate() {
-        let row = m_ub + m_eq + k;
-        a_std[row][std_index] = 1.0;
-        a_std[row][decision_var_count + m_ub + k] = 1.0;
-        b_std[row] = bound_diff;
-    }
-
-    // Ensure all b_std >= 0 (multiply negative rows by -1); record which rows were
-    // flipped — their slack column becomes -1 and can no longer seed the basis.
-    let mut flipped = vec![false; total_constraints];
-    for i in 0..total_constraints {
-        if b_std[i] < 0.0 {
-            flipped[i] = true;
-            b_std[i] = -b_std[i];
-            for val in &mut a_std[i] {
-                *val = -*val;
-            }
-        }
-    }
-
-    // Phase I: find a basic feasible solution. Seed the basis from the natural
-    // slack columns — a ≤ or finite-upper-bound row that was NOT sign-flipped
-    // already carries a +1 unit slack, a basic FEASIBLE variable (value
-    // b_std[i] ≥ 0), so it needs NO artificial. Only equality rows and sign-flipped
-    // rows (slack became −1) get one. This shrinks Phase I and ELIMINATES it for an
-    // all-≤, b≥0 LP (origin feasible), where the old code added one artificial per
-    // constraint and pivoted them all out.
-    let obj_row = total_constraints;
-    let mut basis: Vec<usize> = vec![0; total_constraints];
-    let mut art_of_row = vec![usize::MAX; total_constraints];
-    let mut n_art = 0usize;
-    for (i, row_basis) in basis.iter_mut().enumerate() {
-        let slack = if flipped[i] {
-            None
-        } else if i < m_ub {
-            Some(decision_var_count + i)
-        } else if i >= m_ub + m_eq {
-            Some(decision_var_count + m_ub + (i - m_ub - m_eq))
-        } else {
-            None // equality row — no slack
-        };
-        match slack {
-            Some(col) => *row_basis = col,
-            None => {
-                art_of_row[i] = n_art;
-                n_art += 1;
-            }
-        }
-    }
-
-    let phase1_vars = total_vars + n_art;
-    let mut tableau = vec![vec![0.0; phase1_vars + 1]; total_constraints + 1];
-
-    // Fill constraint rows; an artificial column only where the row needs one.
-    for i in 0..total_constraints {
-        tableau[i][..total_vars].copy_from_slice(&a_std[i][..total_vars]);
-        if art_of_row[i] != usize::MAX {
-            let acol = total_vars + art_of_row[i];
-            tableau[i][acol] = 1.0;
-            basis[i] = acol;
-        }
-        tableau[i][phase1_vars] = b_std[i]; // RHS
-    }
-
-    // Phase I objective: minimize the sum of the artificials actually present,
-    // then eliminate each (basic) artificial from the objective by subtracting its
-    // row. With no artificials the objective row is already zero (Phase I no-op).
-    for i in 0..total_constraints {
-        if art_of_row[i] != usize::MAX {
-            tableau[obj_row][total_vars + art_of_row[i]] = 1.0;
-        }
-    }
-    for i in 0..total_constraints {
-        if art_of_row[i] != usize::MAX {
-            let (tableau_i, tableau_obj) = {
-                let (left, right) = tableau.split_at_mut(obj_row);
-                (&left[i], &mut right[0])
-            };
-            for (obj_val, &i_val) in tableau_obj
-                .iter_mut()
-                .zip(tableau_i.iter())
-                .take(phase1_vars + 1)
-            {
-                *obj_val -= i_val;
-            }
-        }
-    }
-    let maxiter = maxiter.unwrap_or(10_000);
-
-    // Simplex iterations for Phase I.
-    let phase1_nit = match simplex_iterate(&mut tableau, &mut basis, maxiter, phase1_vars) {
-        Ok(nit) => nit,
-        Err(err_code) => {
-            let (status, message) = if err_code == 3 {
-                (
-                    3,
-                    "Phase I problem is unbounded (should not happen)".to_string(),
-                )
-            } else {
-                (1, "Phase I iteration limit exceeded".to_string())
-            };
-            return Ok(LinprogResult {
-                x: vec![0.0; n],
-                fun: 0.0,
-                slack: vec![0.0; m_ub],
-                success: false,
-                status,
-                message,
-                nit: maxiter,
-            });
-        }
-    };
-
-    // Check if Phase I found a feasible solution (all artificials = 0).
-    // Phase I objective = -sum(artificials). If < -1e-8, some artificials are nonzero → infeasible.
-    let phase1_obj = tableau[obj_row][phase1_vars];
-    if phase1_obj < -1e-8 {
-        return Ok(LinprogResult {
-            x: vec![0.0; n],
-            fun: 0.0,
-            slack: vec![0.0; m_ub],
-            success: false,
-            status: 2,
-            message: "Problem is infeasible".to_string(),
-            nit: phase1_nit,
-        });
-    }
-
-    // Phase II: optimize with original objective.
-    // Remove artificial columns and set Phase II objective.
-    let mut tableau2 = vec![vec![0.0; total_vars + 1]; total_constraints + 1];
-    for i in 0..total_constraints {
-        for j in 0..total_vars {
-            tableau2[i][j] = tableau[i][j];
-        }
-        tableau2[i][total_vars] = tableau[i][phase1_vars]; // RHS
-    }
-
-    // Set Phase II objective row.
-    tableau2[obj_row][..total_vars].copy_from_slice(&c_std[..total_vars]);
-    tableau2[obj_row][total_vars] = 0.0;
-
-    // Eliminate basic variables from objective row.
-    for (row, &bj) in basis.iter().enumerate() {
-        if bj < total_vars {
-            let ratio = tableau2[obj_row][bj];
-            if ratio.abs() > 1e-15 {
-                let (row_vals, obj_vals) = {
-                    let (left, right) = tableau2.split_at_mut(obj_row);
-                    (&left[row], &mut right[0])
-                };
-                for (obj_val, &row_val) in obj_vals
-                    .iter_mut()
-                    .zip(row_vals.iter())
-                    .take(total_vars + 1)
-                {
-                    *obj_val -= ratio * row_val;
-                }
-            }
-        }
-    }
-
-    let phase2_result = simplex_iterate(&mut tableau2, &mut basis, maxiter, total_vars);
-    let nit = phase1_nit + phase2_result.unwrap_or(maxiter);
-
-    if let Err(err_code) = phase2_result {
-        let (status, message) = if err_code == 3 {
-            (3, "Problem is unbounded".to_string())
-        } else {
-            (1, "Phase II iteration limit exceeded".to_string())
-        };
-        return Ok(LinprogResult {
-            x: vec![0.0; n],
-            fun: 0.0,
-            slack: vec![0.0; m_ub],
-            success: false,
-            status,
-            message,
-            nit,
-        });
-    }
-
-    // Extract solution.
-    let mut x_std = vec![0.0; total_vars];
-    for (row, &bj) in basis.iter().enumerate() {
-        if bj < total_vars {
-            x_std[bj] = tableau2[row][total_vars];
-        }
-    }
-
-    // Check for unbounded (any non-basic variable with negative reduced cost
-    // and no positive column entry would have been caught during iteration).
-    // The simplex_iterate returns Err for unbounded.
-
-    // Recover original decision variables from the transformed non-negative basis.
-    let mut x_orig = vec![0.0; n];
-    for (i, transformed) in transform.original_vars.iter().enumerate() {
-        let mut value = transformed.offset;
-        for &(std_index, std_coeff) in &transformed.terms {
-            value += std_coeff * x_std[std_index];
-        }
-        x_orig[i] = value;
-    }
-
-    // Compute slack: s = b_ub - A_ub @ x.
-    let slack: Vec<f64> = (0..m_ub)
-        .map(|i| {
-            b_ub[i]
-                - a_ub[i]
-                    .iter()
-                    .zip(&x_orig)
-                    .map(|(&a, &x)| a * x)
-                    .sum::<f64>()
-        })
-        .collect();
-
-    let fun = c.iter().zip(&x_orig).map(|(&ci, &xi)| ci * xi).sum::<f64>();
-
-    Ok(LinprogResult {
-        x: x_orig,
-        fun,
-        slack,
-        // status: Phase I feasible (Σartificials ≤ 1e-8) and no Phase II reduced cost < -1e-12
-        success: true,
-        status: 0,
-        message: "Optimization terminated successfully".to_string(),
-        nit,
-    })
 }
 
 fn default_milp_bounds(
@@ -1819,6 +1342,13 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
     if options.max_nodes == Some(0) {
         return Err(OptError::InvalidArgument {
             detail: "max_nodes must be greater than zero".to_string(),
+        });
+    }
+    // `linprog` follows SciPy and answers `maxiter = 0` with an iteration-limit result; a
+    // branch-and-bound whose every node LP is starved that way could prove nothing.
+    if options.lp_maxiter == Some(0) {
+        return Err(OptError::InvalidArgument {
+            detail: "lp_maxiter must be greater than zero".to_string(),
         });
     }
 
@@ -1911,7 +1441,10 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             a_eq,
             b_eq,
             &bounds_to_options(&node_bounds),
-            options.lp_maxiter,
+            LinprogOptions {
+                maxiter: options.lp_maxiter,
+                ..LinprogOptions::default()
+            },
         )?;
         total_nit += lp.nit;
 
@@ -2012,112 +1545,6 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             }
         }
     })
-}
-
-/// Run simplex iterations on a tableau. Returns the number of iterations used.
-/// Returns Err if iteration limit exceeded or problem is unbounded.
-fn simplex_iterate(
-    tableau: &mut [Vec<f64>],
-    basis: &mut [usize],
-    maxiter: usize,
-    n_vars: usize,
-) -> Result<usize, u8> {
-    let m = basis.len(); // number of constraints
-    let obj_row = m;
-    let rhs_col = n_vars;
-    let tol = 1e-12;
-
-    // Entering-variable rule: Dantzig (most-negative reduced cost) converges in far
-    // fewer pivots than Bland's "first-negative", but can cycle on degenerate LPs.
-    // Count consecutive degenerate pivots (objective unchanged) and fall back to
-    // Bland's anti-cycling rule once they pile up, then resume Dantzig on progress.
-    // Same optimum either way (the simplex is exact); only the pivot path changes.
-    let bland_after = m + 16;
-    let mut degenerate_run = 0usize;
-    let mut last_obj = tableau[obj_row][rhs_col];
-
-    for iteration in 0..maxiter {
-        let mut pivot_col = None;
-        if degenerate_run >= bland_after {
-            // Bland's rule: smallest index with negative reduced cost.
-            for (j, &cost) in tableau[obj_row].iter().enumerate().take(n_vars) {
-                if cost < -tol {
-                    pivot_col = Some(j);
-                    break;
-                }
-            }
-        } else {
-            // Dantzig's rule: most negative reduced cost.
-            let mut best = -tol;
-            for (j, &cost) in tableau[obj_row].iter().enumerate().take(n_vars) {
-                if cost < best {
-                    best = cost;
-                    pivot_col = Some(j);
-                }
-            }
-        }
-
-        let pivot_col = match pivot_col {
-            Some(c) => c,
-            None => return Ok(iteration), // Optimal
-        };
-
-        // Minimum ratio test: find leaving variable.
-        let mut pivot_row = None;
-        let mut min_ratio = f64::INFINITY;
-        for (i, row) in tableau.iter().enumerate().take(m) {
-            if row[pivot_col] > tol {
-                let ratio = row[rhs_col] / row[pivot_col];
-                if ratio < min_ratio {
-                    min_ratio = ratio;
-                    pivot_row = Some(i);
-                }
-            }
-        }
-
-        let pivot_row = match pivot_row {
-            Some(r) => r,
-            None => return Err(3), // Unbounded
-        };
-
-        // Pivot.
-        let pivot_val = tableau[pivot_row][pivot_col];
-        for val in &mut tableau[pivot_row][..=rhs_col] {
-            *val /= pivot_val;
-        }
-
-        for i in 0..=obj_row {
-            if i != pivot_row {
-                let factor = tableau[i][pivot_col];
-                if factor.abs() > 1e-15 {
-                    let (p_row, t_row) = if i < pivot_row {
-                        let (left, right) = tableau.split_at_mut(pivot_row);
-                        (&right[0], &mut left[i])
-                    } else {
-                        let (left, right) = tableau.split_at_mut(i);
-                        (&left[pivot_row], &mut right[0])
-                    };
-
-                    for (t_val, &p_val) in t_row.iter_mut().zip(p_row.iter()).take(rhs_col + 1) {
-                        *t_val -= factor * p_val;
-                    }
-                }
-            }
-        }
-        basis[pivot_row] = pivot_col;
-
-        // A pivot that leaves the objective unchanged is degenerate (the cycling
-        // risk for Dantzig); track the run length to trigger the Bland fallback.
-        let obj = tableau[obj_row][rhs_col];
-        if (obj - last_obj).abs() > tol {
-            degenerate_run = 0;
-        } else {
-            degenerate_run += 1;
-        }
-        last_obj = obj;
-    }
-
-    Err(1) // Iteration limit
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -6645,15 +6072,16 @@ mod tests {
 
     use crate::{
         BasinhoppingOptions, Bounds, ConvergenceStatus, DifferentialEvolutionOptions,
-        DifferentiateOptions, Integrality, LinearConstraint, MilpOptions, MilpProblem,
-        MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, RootOptions, approx_fprime,
-        basinhopping, bracket, brent_minimize, brute, check_grad, cholesky_solve_spd, cobyla,
-        derivative, differential_evolution, differential_evolution_constrained, dual_annealing,
-        fixed_point, fixed_point_many, golden, gradient_descent, hessian, isotonic_regression,
-        jacobian, linear_sum_assignment, linprog, milp, minimize_scalar_bounded,
-        minimize_trisection, nnls, numerical_gradient, numerical_hessian, numerical_jacobian,
-        projected_gradient_descent, pso, quadratic_assignment, rosen, rosen_der, rosen_hess,
-        rosen_hess_prod, shgo, transpose_matrix,
+        DifferentiateOptions, Integrality, LinearConstraint, LinprogOptions, MilpOptions,
+        MilpProblem, MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, RootOptions,
+        approx_fprime, basinhopping, bracket, brent_minimize, brute, check_grad,
+        cholesky_solve_spd, cobyla, derivative, differential_evolution,
+        differential_evolution_constrained, dual_annealing, fixed_point, fixed_point_many, golden,
+        gradient_descent, hessian, isotonic_regression, jacobian, linear_sum_assignment, linprog,
+        milp, minimize_scalar_bounded, minimize_trisection, nnls, numerical_gradient,
+        numerical_hessian, numerical_jacobian, projected_gradient_descent, pso,
+        quadratic_assignment, rosen, rosen_der, rosen_hess, rosen_hess_prod, shgo,
+        transpose_matrix,
     };
 
     #[test]
@@ -7786,7 +7214,7 @@ mod tests {
         let c = vec![-5.0, -4.0];
         let a_ub = vec![vec![6.0, 4.0], vec![1.0, 2.0]];
         let b_ub = vec![24.0, 6.0];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], None).unwrap();
+        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], LinprogOptions::default()).unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.x[0] - 3.0).abs() < 0.01,
@@ -7811,7 +7239,7 @@ mod tests {
         let c = vec![1.0];
         let a_eq = vec![vec![1.0]];
         let b_eq = vec![-1.0]; // x = -1 but x >= 0
-        let result = linprog(&c, &[], &[], &a_eq, &b_eq, &[], None).unwrap();
+        let result = linprog(&c, &[], &[], &a_eq, &b_eq, &[], LinprogOptions::default()).unwrap();
         assert!(
             !result.success,
             "should be infeasible: success={}, status={}, x={:?}, fun={}",
@@ -7827,7 +7255,7 @@ mod tests {
         let c = vec![1.0, 1.0];
         let a_eq = vec![vec![1.0, 1.0]];
         let b_eq = vec![10.0];
-        let result = linprog(&c, &[], &[], &a_eq, &b_eq, &[], None).unwrap();
+        let result = linprog(&c, &[], &[], &a_eq, &b_eq, &[], LinprogOptions::default()).unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.fun - 10.0).abs() < 0.01,
@@ -7844,7 +7272,16 @@ mod tests {
         let a_ub = vec![vec![1.0, 1.0]];
         let b_ub = vec![4.0];
         let bounds = vec![(Some(0.0), Some(3.0)), (Some(0.0), Some(3.0))];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &bounds, None).unwrap();
+        let result = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &[],
+            &[],
+            &bounds,
+            LinprogOptions::default(),
+        )
+        .unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.fun - (-7.0)).abs() < 0.1,
@@ -7860,7 +7297,7 @@ mod tests {
         let c = vec![1.0];
         let a_ub = vec![vec![1.0], vec![1.0]];
         let b_ub = vec![5.0, 10.0];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], None).unwrap();
+        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], LinprogOptions::default()).unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(result.x[0].abs() < 0.01, "x={}, expected 0.0", result.x[0]);
     }
@@ -7871,7 +7308,7 @@ mod tests {
         let c = vec![1.0, 1.0];
         let a_ub = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let b_ub = vec![10.0, 10.0];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], None).unwrap();
+        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], LinprogOptions::default()).unwrap();
         assert!(result.success);
         // Slack = b_ub - A_ub @ x
         for (i, &s) in result.slack.iter().enumerate() {
@@ -7884,7 +7321,7 @@ mod tests {
         // Minimize -x, x in [2, 5] → optimal at x=5
         let c = vec![-1.0];
         let bounds = vec![(Some(2.0), Some(5.0))];
-        let result = linprog(&c, &[], &[], &[], &[], &bounds, None).unwrap();
+        let result = linprog(&c, &[], &[], &[], &[], &bounds, LinprogOptions::default()).unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.x[0] - 5.0).abs() < 0.01,
@@ -7900,7 +7337,16 @@ mod tests {
         let a_ub = vec![vec![-1.0]];
         let b_ub = vec![-1.0];
         let bounds = vec![(None, None)];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &bounds, None).unwrap();
+        let result = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &[],
+            &[],
+            &bounds,
+            LinprogOptions::default(),
+        )
+        .unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.x[0] - 1.0).abs() < 0.01,
@@ -7919,7 +7365,7 @@ mod tests {
         // Minimize -x, subject only to x <= 5.
         let c = vec![-1.0];
         let bounds = vec![(None, Some(5.0))];
-        let result = linprog(&c, &[], &[], &[], &[], &bounds, None).unwrap();
+        let result = linprog(&c, &[], &[], &[], &[], &bounds, LinprogOptions::default()).unwrap();
         assert!(result.success, "linprog failed: {}", result.message);
         assert!(
             (result.x[0] - 5.0).abs() < 0.01,
@@ -7938,29 +7384,57 @@ mod tests {
         let c = vec![1.0, 2.0];
         let a_ub = vec![vec![1.0]]; // wrong number of columns
         let b_ub = vec![5.0];
-        assert!(linprog(&c, &a_ub, &b_ub, &[], &[], &[], None).is_err());
+        assert!(linprog(&c, &a_ub, &b_ub, &[], &[], &[], LinprogOptions::default()).is_err());
     }
 
     #[test]
     fn linprog_rejects_non_finite_coefficients() {
-        let err = linprog(&[f64::NAN], &[], &[], &[], &[], &[], None)
+        let options = LinprogOptions::default();
+        let err = linprog(&[f64::NAN], &[], &[], &[], &[], &[], options)
             .expect_err("NaN objective should fail");
         assert!(matches!(err, crate::OptError::NonFiniteInput { .. }));
 
-        let err = linprog(&[1.0], &[vec![f64::INFINITY]], &[1.0], &[], &[], &[], None)
-            .expect_err("Inf inequality coefficient should fail");
+        let err = linprog(
+            &[1.0],
+            &[vec![f64::INFINITY]],
+            &[1.0],
+            &[],
+            &[],
+            &[],
+            options,
+        )
+        .expect_err("Inf inequality coefficient should fail");
         assert!(matches!(err, crate::OptError::NonFiniteInput { .. }));
 
-        let err = linprog(&[1.0], &[], &[], &[vec![1.0]], &[f64::NAN], &[], None)
+        let err = linprog(&[1.0], &[], &[], &[vec![1.0]], &[f64::NAN], &[], options)
             .expect_err("NaN equality RHS should fail");
         assert!(matches!(err, crate::OptError::NonFiniteInput { .. }));
     }
 
+    // SciPy 1.17.1 answers `options={'maxiter': 0}` on an LP that needs an iteration with
+    // status 1 ("Iteration limit reached. (HiGHS Status 14: ...)") rather than an exception.
     #[test]
-    fn linprog_rejects_zero_iteration_budget() {
-        let err = linprog(&[1.0], &[], &[], &[], &[], &[], Some(0))
-            .expect_err("zero maxiter should fail");
-        assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
+    fn linprog_zero_iteration_budget_is_an_iteration_limit() {
+        let c = vec![-5.0, -4.0];
+        let a_ub = vec![vec![6.0, 4.0], vec![1.0, 2.0]];
+        let b_ub = vec![24.0, 6.0];
+        let result = linprog(
+            &c,
+            &a_ub,
+            &b_ub,
+            &[],
+            &[],
+            &[],
+            LinprogOptions {
+                maxiter: Some(0),
+                ..LinprogOptions::default()
+            },
+        )
+        .expect("a zero budget is a result, not an error");
+        assert_eq!(result.status, 1, "{}", result.message);
+        assert!(!result.success);
+        assert_eq!(result.nit, 0);
+        assert!(result.x.is_empty());
     }
 
     // ── milp tests ──────────────────────────────────────────────────
@@ -7992,12 +7466,13 @@ mod tests {
     // frankenscipy-szq1n.7: a node LP stopped at its iteration limit was pruned as if infeasible.
     // At the root that turned "LP budget too small" into "Problem is infeasible" (status 2); below
     // the root it let the search finish with status 0 on an unproven incumbent. SciPy reports an
-    // iteration limit as status 1.
+    // iteration limit as status 1. The root LP needs several simplex iterations (its
+    // starting vertex (3, 3) violates both rows), so `lp_maxiter = 1` starves it.
     #[test]
     fn milp_lp_iteration_limit_is_not_infeasibility() {
-        let c = vec![-1.0, -2.0];
-        let a_ub = vec![vec![1.0, 1.0]];
-        let b_ub = vec![4.0];
+        let c = vec![-5.0, -4.0];
+        let a_ub = vec![vec![6.0, 4.0], vec![1.0, 2.0]];
+        let b_ub = vec![24.0, 6.0];
         let bounds = vec![(Some(0.0), Some(3.0)), (Some(0.0), Some(3.0))];
         let problem = MilpProblem {
             c: &c,
@@ -8024,7 +7499,9 @@ mod tests {
         assert_eq!(starved.status, 1, "{}", starved.message);
         let solved = milp(problem, MilpOptions::default()).expect("milp");
         assert_eq!(solved.status, 0, "{}", solved.message);
-        assert_eq!(solved.x, vec![1.0, 3.0]);
+        // LP relaxation optimum (3, 1.5); the integer optimum is (3, 1) with fun −19.
+        assert_eq!(solved.x, vec![3.0, 1.0]);
+        assert_eq!(solved.fun, -19.0);
     }
 
     #[test]
@@ -8135,14 +7612,11 @@ mod tests {
     }
 
     // MilpOptions has exactly two fields and both are solver budgets:
-    // `max_nodes` (covered above) and `lp_maxiter`. Only the first had a
-    // rejection test. `lp_maxiter` is forwarded verbatim to `linprog`, which
-    // rejects maxiter == Some(0) itself, so milp does reject a zero LP budget --
-    // but that had never been asserted, and it holds only as long as the
-    // forwarding stays intact. If milp ever grew a fast path that skipped the
-    // LP call, or clamped the budget before forwarding, a zero LP iteration
-    // budget would silently become a synthetic result -- exactly the failure
-    // mode frankenscipy-qgc24 was filed about for max_nodes.
+    // `max_nodes` (covered above) and `lp_maxiter`. `linprog` follows SciPy and
+    // answers maxiter == Some(0) with an iteration-limit result (status 1), so milp
+    // rejects a zero LP budget itself. Without that check a zero LP iteration
+    // budget would silently become a synthetic result -- exactly the failure mode
+    // frankenscipy-qgc24 was filed about for max_nodes.
     #[test]
     fn milp_rejects_zero_lp_iteration_budget() {
         let err = milp(
@@ -9665,7 +9139,8 @@ mod tests {
         let c = vec![-1.0, 4.0];
         let a_ub = vec![vec![-3.0, 1.0], vec![1.0, 2.0]];
         let b_ub = vec![6.0, 4.0];
-        let result = linprog(&c, &a_ub, &b_ub, &[], &[], &[], None).expect("linprog");
+        let result =
+            linprog(&c, &a_ub, &b_ub, &[], &[], &[], LinprogOptions::default()).expect("linprog");
         assert_eq!(result.x.len(), 2);
         assert!(
             (result.x[0] - 4.0).abs() < 1e-6,
