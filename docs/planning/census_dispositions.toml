@@ -289,13 +289,6 @@ reason = "no warning channel for skipped or malformed WAV chunks"
 bead = "frankenscipy-yrlc3"
 
 [[entry]]
-module = "scipy.linalg.interpolative"
-name = "estimate_rank"
-disposition = "missing"
-reason = "randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank"
-bead = "frankenscipy-yrlc3"
-
-[[entry]]
 module = "scipy.signal.windows"
 name = "bohman"
 disposition = "adapted"
@@ -391,13 +384,6 @@ module = "scipy.stats.mstats"
 name = "trim"
 disposition = "na"
 reason = "returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)"
-
-[[entry]]
-module = "scipy.stats.mstats"
-name = "trimmed_mean"
-disposition = "missing"
-reason = "asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case"
-bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.stats.qmc"

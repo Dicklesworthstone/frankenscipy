@@ -443,21 +443,19 @@
   },
   "scipy.linalg.interpolative": {
    "applicable": 8,
-   "compared": 6,
+   "compared": 7,
    "crate": "fsci-linalg",
-   "declared": 7,
+   "declared": 8,
    "matched_by": {
     "case_fold": 0,
-    "exact": 7,
+    "exact": 8,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "estimate_rank": "missing: randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank (frankenscipy-yrlc3)"
-   },
-   "real": 7,
+   "not_real": {},
+   "real": 8,
    "real_not_compared": [
     "interp_decomp"
    ],
@@ -1214,12 +1212,12 @@
   },
   "scipy.stats.mstats": {
    "applicable": 29,
-   "compared": 10,
+   "compared": 11,
    "crate": "fsci-stats",
-   "declared": 28,
+   "declared": 29,
    "matched_by": {
     "case_fold": 0,
-    "exact": 28,
+    "exact": 29,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
@@ -1227,10 +1225,9 @@
    "na": 2,
    "not_real": {
     "argstoarray": "na: builds a masked array; fsci has no masked-array type",
-    "trim": "na: returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)",
-    "trimmed_mean": "missing: asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case (frankenscipy-yrlc3)"
+    "trim": "na: returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)"
    },
-   "real": 28,
+   "real": 29,
    "real_not_compared": [
     "compare_medians_ms",
     "kendalltau_seasonal",
@@ -1313,17 +1310,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 887,
-  "declared": 1492,
+  "compared": 889,
+  "declared": 1494,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1287,
+   "exact": 1289,
    "reexport": 12,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1522,
+  "real": 1524,
   "scipy": 1555
  }
 }

@@ -412,6 +412,243 @@ pub fn estimate_spectral_norm_diff(
     Ok(power_method_norm(forward, adjoint, a_cols, its))
 }
 
+/// SplitMix64, the random stream behind [`estimate_rank`]'s sketch.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform on `[-1, 1)`, as SciPy's `rng.uniform(-1, 1)`.
+    fn uniform(&mut self) -> f64 {
+        ((self.next() >> 11) as f64 / (1u64 << 53) as f64).mul_add(2.0, -1.0)
+    }
+}
+
+/// SciPy `idd_poweroftwo`: the largest power of two STRICTLY below `m` (0 for `m <= 1`).
+fn power_of_two_below(m: usize) -> usize {
+    let mut n = 1usize;
+    while n < m {
+        n <<= 1;
+    }
+    n >> 1
+}
+
+/// LAPACK `dlarfgp` (3.12) on `x = [alpha, tail...]`: overwrites `x` with `[beta, v[1..]]`,
+/// the reflector `H = I − τ·v·vᵀ` (`v[0] = 1`) that maps `x` to `beta·e₁` with `beta ≥ 0`, and
+/// returns `τ`.
+fn dlarfgp(x: &mut [f64]) -> f64 {
+    let Some((alpha_slot, tail)) = x.split_first_mut() else {
+        return 0.0;
+    };
+    let mut alpha = *alpha_slot;
+    let mut xnorm = tail.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if xnorm <= f64::EPSILON * alpha.abs() {
+        if alpha >= 0.0 {
+            return 0.0;
+        }
+        tail.fill(0.0);
+        *alpha_slot = -alpha;
+        return 2.0;
+    }
+    let smlnum = f64::MIN_POSITIVE / (f64::EPSILON / 2.0);
+    let bignum = 1.0 / smlnum;
+    let mut beta = alpha.hypot(xnorm).copysign(alpha);
+    let mut knt = 0;
+    if beta.abs() < smlnum {
+        loop {
+            knt += 1;
+            tail.iter_mut().for_each(|v| *v *= bignum);
+            beta *= bignum;
+            alpha *= bignum;
+            if beta.abs() >= smlnum || knt >= 20 {
+                break;
+            }
+        }
+        xnorm = tail.iter().map(|v| v * v).sum::<f64>().sqrt();
+        beta = alpha.hypot(xnorm).copysign(alpha);
+    }
+    let savealpha = alpha;
+    alpha += beta;
+    let mut tau;
+    if beta < 0.0 {
+        beta = -beta;
+        tau = -alpha / beta;
+    } else {
+        alpha = xnorm * (xnorm / alpha);
+        tau = alpha / beta;
+        alpha = -alpha;
+    }
+    if tau.abs() <= smlnum {
+        if savealpha >= 0.0 {
+            tau = 0.0;
+        } else {
+            tau = 2.0;
+            tail.fill(0.0);
+            beta = -savealpha;
+        }
+    } else {
+        let scale = 1.0 / alpha;
+        tail.iter_mut().for_each(|v| *v *= scale);
+    }
+    for _ in 0..knt {
+        beta *= smlnum;
+    }
+    *alpha_slot = beta;
+    tau
+}
+
+/// Estimate the numerical rank of `a` to relative precision `eps`:
+/// `scipy.linalg.interpolative.estimate_rank(A, eps, rng)` for a real dense `A`.
+///
+/// This is SciPy's `idd_estrank` (the ID library of Martinsson, Rokhlin, Shkolnisky and
+/// Tygert), step for step except for the random stream: the rows of `A` are mixed by a
+/// subsampled randomized Fourier transform (three rounds of random Givens rotations and row
+/// permutations, a random subset of `n₂` rows where `n₂` is the largest power of two below
+/// `m`, a real FFT of each column in FFTPACK's packed layout, a final row permutation), then
+/// an unpivoted Householder pass over the sketch's rows counts a row as null when its
+/// residual norm is at most `eps` times the sketch's largest column norm, and stops at the
+/// seventh null row.
+///
+/// So, like SciPy's, the estimate is deliberately an OVERestimate: for a matrix of exact rank
+/// `r` it is `r + 7` (the rows processed up to the seventh null one), and it is `min(m, n)`,
+/// SciPy's "nearly full rank" answer, whenever the sketch runs out first (when
+/// `r + 12 >= min(n, n₂)`). The sketch is random (`seed` picks the stream; SciPy's comes from
+/// numpy's generator, which this does not reproduce), so a matrix with a singular value near
+/// the threshold can get a different estimate from a different seed, on either side; with a
+/// clear gap at `eps` the estimate does not depend on the seed.
+///
+/// As in SciPy, an all-zero matrix with enough room estimates 7, and `n = 0` gives 0.
+///
+/// # Errors
+///
+/// [`LinalgError::RaggedMatrix`] for ragged rows; [`LinalgError::NonFiniteInput`] for a NaN
+/// or infinite entry (SciPy returns `min(m, n)` there, since no residual compares below a
+/// NaN threshold); [`LinalgError::InvalidArgument`] for `m = 0` (SciPy's ValueError from the
+/// FFT) and for `m = 2`, where SciPy's sketch keeps one row, packs it to zero rows and the
+/// final permutation raises IndexError.
+pub fn estimate_rank(a: &[Vec<f64>], eps: f64, seed: u64) -> Result<usize, LinalgError> {
+    let (m, n) = matrix_shape(a)?;
+    if m == 0 {
+        return Err(LinalgError::InvalidArgument {
+            detail: "interpolative: estimate_rank needs at least one row".to_string(),
+        });
+    }
+    if m == 2 {
+        return Err(LinalgError::InvalidArgument {
+            detail: "interpolative: estimate_rank of a 2-row matrix (SciPy's sketch keeps no \
+                     row and raises IndexError)"
+                .to_string(),
+        });
+    }
+    if a.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    let n2 = power_of_two_below(m);
+    if n == 0 || n2 < 2 {
+        // m = 1: SciPy's sketch has no rows, the loop never runs, and the answer is min(m, n).
+        return Ok(m.min(n));
+    }
+
+    let mut rng = SplitMix64(seed ^ 0x2545_f491_4f6c_dd1d);
+
+    // idd_random_transf: three rounds of adjacent-row Givens rotations, each followed by a
+    // random row permutation.
+    let mut rta: Vec<Vec<f64>> = a.to_vec();
+    for _ in 0..3 {
+        for row in 0..m - 1 {
+            let (mut alpha, mut beta) = (rng.uniform(), rng.uniform());
+            let h = alpha.hypot(beta);
+            if h == 0.0 {
+                (alpha, beta) = (1.0, 0.0);
+            } else {
+                alpha /= h;
+                beta /= h;
+            }
+            let (upper, lower) = rta.split_at_mut(row + 1);
+            for (p, q) in upper[row].iter_mut().zip(lower[0].iter_mut()) {
+                let (x0, x1) = (*p, *q);
+                *p = alpha * x0 + beta * x1;
+                *q = -beta * x0 + alpha * x1;
+            }
+        }
+        for i in (1..m).rev() {
+            let j = (rng.next() % (i as u64 + 1)) as usize;
+            rta.swap(i, j);
+        }
+    }
+    // idd_subselect: n₂ distinct rows, in random order.
+    let mut order: Vec<usize> = (0..m).collect();
+    for i in 0..n2 {
+        let j = i + (rng.next() % (m - i) as u64) as usize;
+        order.swap(i, j);
+    }
+    let rows = &order[..n2];
+
+    // A real FFT of each column of the subsampled rows, in FFTPACK's packed layout
+    // [y₀, Re y₁, Im y₁, …, Re y_{n₂/2}], then a final random permutation of the n₂ rows.
+    let opts = fsci_fft::FftOptions::default();
+    let mut f = vec![vec![0.0; n]; n2];
+    let mut column = vec![0.0; n2];
+    for j in 0..n {
+        for (slot, &r) in column.iter_mut().zip(rows) {
+            *slot = rta[r][j];
+        }
+        let spec = fsci_fft::rfft(&column, &opts).map_err(|e| LinalgError::InvalidArgument {
+            detail: format!("interpolative: estimate_rank sketch FFT failed: {e:?}"),
+        })?;
+        f[0][j] = spec[0].0;
+        for k in 1..n2 / 2 {
+            f[2 * k - 1][j] = spec[k].0;
+            f[2 * k][j] = spec[k].1;
+        }
+        f[n2 - 1][j] = spec[n2 / 2].0;
+    }
+    for i in (1..n2).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        f.swap(i, j);
+    }
+
+    let ssmax = (0..n)
+        .map(|j| f.iter().map(|row| row[j] * row[j]).sum::<f64>().sqrt())
+        .fold(0.0_f64, f64::max);
+    let threshold = eps * ssmax;
+
+    // Unpivoted Householder over the rows; stop at the seventh null row, or when SciPy's
+    // `k + nulls < min(n, n₂)` bound is reached first.
+    let mut tau = vec![0.0; n];
+    let (mut k, mut nulls) = (0usize, 0usize);
+    let limit = n.min(n2);
+    while nulls < 7 && k + nulls < limit {
+        let (done, rest) = f.split_at_mut(k);
+        let row = &mut rest[0];
+        for (kk, reflector) in done.iter().enumerate() {
+            let d: f64 = reflector[kk..]
+                .iter()
+                .zip(&row[kk..])
+                .map(|(v, x)| v * x)
+                .sum();
+            let t = tau[kk] * d;
+            for (x, v) in row[kk..].iter_mut().zip(&reflector[kk..]) {
+                *x -= t * v;
+            }
+        }
+        tau[k] = dlarfgp(&mut row[k..]);
+        let beta = row[k];
+        row[k] = 1.0;
+        if beta <= threshold {
+            nulls += 1;
+        }
+        k += 1;
+    }
+    Ok(if nulls < 7 || k == 0 { m.min(n) } else { k })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +935,108 @@ mod tests {
         let b = reconstruct_skel_matrix(&a, 3, &idx).expect("valid selection");
         let c = reconstruct_matrix_from_id(&b, &idx, &proj).expect("well-formed ID");
         assert_eq!(c, a, "a full-rank ID reconstructs exactly");
+    }
+
+    /// `m × n` matrix of exact rank `r`: the product of two seeded random factors.
+    fn low_rank(m: usize, n: usize, r: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut state = seed;
+        let mut draw = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let left: Vec<Vec<f64>> = (0..m).map(|_| (0..r).map(|_| draw()).collect()).collect();
+        let right: Vec<Vec<f64>> = (0..r).map(|_| (0..n).map(|_| draw()).collect()).collect();
+        left.iter()
+            .map(|row| {
+                (0..n)
+                    .map(|j| row.iter().zip(&right).map(|(l, rr)| l * rr[j]).sum())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn estimate_rank_is_rank_plus_seven_or_the_full_rank_answer_as_in_scipy() {
+        // SciPy 1.17.1, any rng: (100,80,5) -> 12, (200,30,10) -> 17, (60,60,20) -> 60,
+        // (30,200,10) -> 30, (8,6,2) -> 6. With a clear gap at eps the seed does not matter.
+        for seed in 0..5 {
+            assert_eq!(
+                estimate_rank(&low_rank(100, 80, 5, 1), 1e-10, seed).unwrap(),
+                12
+            );
+            assert_eq!(
+                estimate_rank(&low_rank(200, 30, 10, 2), 1e-10, seed).unwrap(),
+                17
+            );
+            assert_eq!(
+                estimate_rank(&low_rank(60, 60, 20, 3), 1e-10, seed).unwrap(),
+                60
+            );
+            assert_eq!(
+                estimate_rank(&low_rank(30, 200, 10, 4), 1e-10, seed).unwrap(),
+                30
+            );
+            assert_eq!(
+                estimate_rank(&low_rank(8, 6, 2, 5), 1e-10, seed).unwrap(),
+                6
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_rank_edge_shapes_match_scipy() {
+        // SciPy: zeros((40, 30)) -> 7, eye(40)[:, :30] -> 30, ones((1, 5)) -> 1,
+        // ones((3, 5)) -> 3, ones((5, 0)) -> 0, ones((0, 5)) ValueError, ones((2, 5)) IndexError.
+        assert_eq!(
+            estimate_rank(&vec![vec![0.0; 30]; 40], 1e-10, 0).unwrap(),
+            7
+        );
+        let eye: Vec<Vec<f64>> = (0..40)
+            .map(|i| (0..30).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        assert_eq!(estimate_rank(&eye, 1e-10, 0).unwrap(), 30);
+        assert_eq!(estimate_rank(&[vec![1.0; 5]], 1e-10, 0).unwrap(), 1);
+        assert_eq!(estimate_rank(&vec![vec![1.0; 5]; 3], 1e-10, 0).unwrap(), 3);
+        assert_eq!(estimate_rank(&vec![Vec::new(); 5], 1e-10, 0).unwrap(), 0);
+        assert!(estimate_rank(&[], 1e-10, 0).is_err());
+        assert!(estimate_rank(&vec![vec![1.0; 5]; 2], 1e-10, 0).is_err());
+        let mut nan = low_rank(40, 30, 3, 9);
+        nan[3][4] = f64::NAN;
+        assert!(matches!(
+            estimate_rank(&nan, 1e-10, 0),
+            Err(LinalgError::NonFiniteInput)
+        ));
+        // A negative eps never declares a row null: the full-rank answer.
+        assert_eq!(
+            estimate_rank(&vec![vec![1.0; 30]; 40], -1.0, 0).unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn dlarfgp_maps_to_a_nonnegative_multiple_of_e1() {
+        for x0 in [
+            vec![3.0, 4.0],
+            vec![-3.0, 4.0],
+            vec![-2.0, 0.0],
+            vec![2.0, 0.0, 0.0],
+        ] {
+            let mut x = x0.clone();
+            let tau = dlarfgp(&mut x);
+            let beta = x[0];
+            let norm = x0.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!((beta - norm).abs() <= 1e-15 * norm, "{x0:?}: beta {beta}");
+            // H·x0 = x0 − τ·v·(vᵀx0) must equal beta·e₁.
+            let mut v = x.clone();
+            v[0] = 1.0;
+            let d: f64 = v.iter().zip(&x0).map(|(a, b)| a * b).sum();
+            for (i, (vi, xi)) in v.iter().zip(&x0).enumerate() {
+                let hx = xi - tau * vi * d;
+                let want = if i == 0 { beta } else { 0.0 };
+                assert!((hx - want).abs() <= 1e-14, "{x0:?}: (Hx)[{i}] = {hx}");
+            }
+        }
     }
 }

@@ -43673,6 +43673,94 @@ pub fn trimr(
     out
 }
 
+/// Mean of the data left after trimming each tail, matching
+/// `scipy.stats.mstats.trimmed_mean(a, limits, inclusive, relative)` for 1-D input.
+///
+/// With `relative = true` (SciPy's default) `limits = (lower, upper)` are proportions of `n`,
+/// trimmed by rank as `mstats.trimr` does: the lowest `int(lower·n)` and highest
+/// `int(upper·n)` values go when the matching `inclusive` flag is true, `round(·)`
+/// (half-to-even) of those counts when it is false; a lower limit of `0` or `None` keeps the
+/// low tail, an upper `None` keeps the high one. With `relative = false` the limits are
+/// absolute values, as `mstats.trima`: a value is dropped below `lower` (at or below it when
+/// `inclusive.0` is false) or above `upper` (at or above it when `inclusive.1` is false).
+/// SciPy's defaults are `limits = (Some(0.1), Some(0.1))`, `inclusive = (true, true)`,
+/// `relative = true`; unlike [`trim_mean`], the two tails and their rounding are independent.
+///
+/// As in SciPy (whose argsort puts NaN last), a NaN ranks above every number, so relative
+/// trimming can drop it and an untrimmed NaN makes the mean NaN; absolute limits never drop a
+/// NaN. Where SciPy returns the fully masked `masked` constant (everything trimmed, or empty
+/// input), this returns NaN.
+///
+/// # Errors
+/// [`StatsError::InvalidArgument`] for a relative limit outside `[0, 1]` (SciPy's ValueError).
+pub fn trimmed_mean(
+    data: &[f64],
+    limits: (Option<f64>, Option<f64>),
+    inclusive: (bool, bool),
+    relative: bool,
+) -> Result<f64, StatsError> {
+    let (lo, up) = limits;
+    let (loin, upin) = inclusive;
+    let n = data.len();
+    let mut keep = vec![true; n];
+    if relative {
+        for (limit, end) in [(lo, "beginning"), (up, "end")] {
+            if let Some(l) = limit
+                && !(0.0..=1.0).contains(&l)
+            {
+                return Err(StatsError::InvalidArgument(format!(
+                    "The proportion to cut from the {end} should be between 0. and 1.(got {l})"
+                )));
+            }
+        }
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| match (data[a].is_nan(), data[b].is_nan()) {
+            (false, false) => data[a].total_cmp(&data[b]),
+            (x, y) => x.cmp(&y),
+        });
+        let nf = n as f64;
+        let count = |limit: f64, truncate: bool| {
+            let raw = limit * nf;
+            (if truncate {
+                raw.trunc()
+            } else {
+                round_half_even(raw) as f64
+            }) as usize
+        };
+        if let Some(l) = lo
+            && l != 0.0
+        {
+            for &i in &idx[..count(l, loin).min(n)] {
+                keep[i] = false;
+            }
+        }
+        if let Some(u) = up {
+            for &i in &idx[n.saturating_sub(count(u, upin))..] {
+                keep[i] = false;
+            }
+        }
+    } else {
+        for (k, &x) in keep.iter_mut().zip(data) {
+            if let Some(l) = lo {
+                *k &= !(if loin { x < l } else { x <= l });
+            }
+            if let Some(u) = up {
+                *k &= !(if upin { x > u } else { x >= u });
+            }
+        }
+    }
+    let (sum, kept) = data
+        .iter()
+        .zip(&keep)
+        .filter(|&(_, &k)| k)
+        .fold((0.0, 0usize), |(s, c), (&x, _)| (s + x, c + 1));
+    Ok(if kept == 0 {
+        f64::NAN
+    } else {
+        sum / kept as f64
+    })
+}
+
 /// Trims a proportion of values from one tail of an array.
 ///
 /// Matches `scipy.stats.mstats.trimtail(data, proportiontocut, tail, inclusive)`.
@@ -73962,6 +74050,38 @@ mod tests {
         // trimmed_stde default limits (0.1, 0.1) and (0.2, 0.2).
         assert!((trimmed_stde(&d, (0.1, 0.1)) - 0.8076576349315084).abs() <= 1e-12);
         assert!((trimmed_stde(&d, (0.2, 0.2)) - 0.8972912453308391).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn mstats_trimmed_mean_matches_scipy() {
+        let d = [2.0, 4.0, 1.0, 7.0, 3.0, 9.0, 5.0, 6.0, 8.0, 10.0, 2.5, 0.3];
+        let m = |lim, inc, rel| trimmed_mean(&d, lim, inc, rel).unwrap();
+        // scipy: mstats.trimmed_mean(d) = 4.75 (defaults (0.1, 0.1), (1, 1), relative).
+        assert_eq!(m((Some(0.1), Some(0.1)), (true, true), true), 4.75);
+        // Asymmetric tails, low count rounded (round(3.0) = 3), high truncated (int(0.6) = 0).
+        assert!(
+            (m((Some(0.25), Some(0.05)), (false, true), true) - 6.055555555555555).abs() < 1e-15
+        );
+        // Absolute limits: drop x <= 3 and x > 8.
+        assert_eq!(m((Some(3.0), Some(8.0)), (false, true), false), 6.0);
+        // NaN ranks last, so trimming the top 20% of five values drops it: mean(1, 3, 2, 4).
+        let with_nan = [1.0, f64::NAN, 3.0, 2.0, 4.0];
+        assert_eq!(
+            trimmed_mean(&with_nan, (Some(0.0), Some(0.2)), (true, true), true).unwrap(),
+            2.5
+        );
+        // Everything trimmed, or nothing there: SciPy's `masked`, NaN here.
+        assert!(m((Some(0.5), Some(0.5)), (true, true), true).is_nan());
+        assert!(
+            trimmed_mean(&[], (Some(0.1), Some(0.1)), (true, true), true)
+                .unwrap()
+                .is_nan()
+        );
+        // Relative limits outside [0, 1] are SciPy's ValueError.
+        assert!(trimmed_mean(&d, (Some(-0.1), None), (true, true), true).is_err());
+        assert!(trimmed_mean(&d, (None, Some(1.5)), (true, true), true).is_err());
+        // ...but absolute limits are values, not proportions.
+        assert!(trimmed_mean(&d, (Some(-0.1), Some(1.5)), (true, true), false).is_ok());
     }
 
     #[test]
