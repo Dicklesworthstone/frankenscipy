@@ -6308,7 +6308,8 @@ impl<M: SparseInverse> SparseInverse for crate::formats::SparseArray2D<M> {
 /// SciPy solves `A·X = I` column by column through `factorized(A)` and keeps each column's
 /// nonzeros (`np.flatnonzero`), so exact zeros of the inverse are not stored; this does the
 /// same and returns the inverse in `A`'s format. As SciPy's docstring warns, the inverse of a
-/// sparse matrix is usually dense.
+/// sparse matrix is usually dense. For a 1×1 `A` SciPy returns a dense 1-D array (its `spsolve`
+/// reads the one-column identity as a vector); this returns the 1×1 inverse in `A`'s format.
 ///
 /// # Errors
 /// - [`SparseError::InvalidShape`] for a non-square or 0×0 `A` (SciPy: "matrix must be square";
@@ -38570,6 +38571,7 @@ impl LaplacianNd {
 
     /// `eigenvectors(m=None)`: the orthonormal eigenvectors in the order of
     /// [`eigenvalues`](Self::eigenvalues) (`eigenvectors[i]` belongs to `eigenvalues[i]`).
+    /// `Some(0)` gives no vectors, where SciPy raises (`np.column_stack` of no columns).
     #[must_use]
     pub fn eigenvectors(&self, m: Option<usize>) -> Vec<Vec<f64>> {
         let (_, order, grid) = self.eigenvalue_ordering(m);

@@ -416,58 +416,9 @@ reason = "selects UMFPACK for spsolve; there is no UMFPACK"
 
 [[entry]]
 module = "scipy.sparse.linalg"
-name = "LinearOperator"
-disposition = "missing"
-reason = "no matrix-free operator abstraction; iterative solvers take concrete matrices"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "aslinearoperator"
-disposition = "missing"
-reason = "no matrix-free operator abstraction"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "lobpcg"
-disposition = "missing"
-reason = "no block eigensolver"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "gcrotmk"
-disposition = "missing"
-reason = "no GCROT(m,k) solver"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "factorized"
-disposition = "missing"
-reason = "no solve callable over a cached LU"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "inv"
-disposition = "missing"
-reason = "no sparse inverse"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
 name = "funm_multiply_krylov"
 disposition = "missing"
 reason = "no Krylov f(A)b"
-bead = "frankenscipy-6j5tz"
-
-[[entry]]
-module = "scipy.sparse.linalg"
-name = "LaplacianNd"
-disposition = "missing"
-reason = "no grid Laplacian operator"
 bead = "frankenscipy-6j5tz"
 
 [[entry]]
@@ -487,8 +438,9 @@ bead = "frankenscipy-6j5tz"
 [[entry]]
 module = "scipy.sparse.linalg"
 name = "ArpackNoConvergence"
-disposition = "missing"
-reason = "SparseError has no eigensolver non-convergence class"
+disposition = "adapted"
+rust = "fsci_sparse::SparseError::EigsNoConvergence"
+reason = "an exception class is a SparseError variant; it carries the converged pairs as SciPy's does"
 bead = "frankenscipy-6j5tz"
 
 [[entry]]

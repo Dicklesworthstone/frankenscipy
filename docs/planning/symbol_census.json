@@ -843,32 +843,24 @@
   },
   "scipy.sparse.linalg": {
    "applicable": 37,
-   "compared": 20,
+   "compared": 28,
    "crate": "fsci-sparse",
-   "declared": 24,
+   "declared": 31,
    "matched_by": {
     "case_fold": 0,
-    "exact": 24,
-    "reexport": 0,
+    "exact": 30,
+    "reexport": 1,
     "trait": 0,
     "type_alias": 0
    },
    "na": 1,
    "not_real": {
     "ArpackError": "missing: SparseError has no eigensolver error class (frankenscipy-6j5tz)",
-    "ArpackNoConvergence": "missing: SparseError has no eigensolver non-convergence class (frankenscipy-6j5tz)",
-    "LaplacianNd": "missing: no grid Laplacian operator (frankenscipy-6j5tz)",
-    "LinearOperator": "missing: no matrix-free operator abstraction; iterative solvers take concrete matrices (frankenscipy-6j5tz)",
     "MatrixRankWarning": "missing: spsolve on a singular matrix returns SingularMatrix instead of warning (frankenscipy-6j5tz)",
-    "aslinearoperator": "missing: no matrix-free operator abstraction (frankenscipy-6j5tz)",
-    "factorized": "missing: no solve callable over a cached LU (frankenscipy-6j5tz)",
     "funm_multiply_krylov": "missing: no Krylov f(A)b (frankenscipy-6j5tz)",
-    "gcrotmk": "missing: no GCROT(m,k) solver (frankenscipy-6j5tz)",
-    "inv": "missing: no sparse inverse (frankenscipy-6j5tz)",
-    "lobpcg": "missing: no block eigensolver (frankenscipy-6j5tz)",
     "use_solver": "na: selects UMFPACK for spsolve; there is no UMFPACK"
    },
-   "real": 26,
+   "real": 34,
    "real_not_compared": [
     "SuperLU",
     "expm_multiply",
@@ -1332,17 +1324,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 869,
-  "declared": 1476,
+  "compared": 877,
+  "declared": 1483,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1272,
-   "reexport": 11,
+   "exact": 1278,
+   "reexport": 12,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1504,
+  "real": 1512,
   "scipy": 1555
  }
 }
