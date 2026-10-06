@@ -2,22 +2,21 @@
  "modules": {
   "scipy.cluster.hierarchy": {
    "applicable": 31,
-   "compared": 9,
+   "compared": 10,
    "crate": "fsci-cluster",
-   "declared": 30,
+   "declared": 31,
    "matched_by": {
     "case_fold": 1,
-    "exact": 29,
+    "exact": 30,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 1,
    "not_real": {
-    "dendrogram": "missing: no dendrogram layout (ivl, leaves, icoord, dcoord) (frankenscipy-yrlc3)",
     "set_link_color_palette": "na: sets matplotlib link colours; fsci does not plot"
    },
-   "real": 30,
+   "real": 31,
    "real_not_compared": [
     "ClusterNode",
     "DisjointSet",
@@ -408,7 +407,7 @@
   },
   "scipy.linalg": {
    "applicable": 95,
-   "compared": 62,
+   "compared": 71,
    "crate": "fsci-linalg",
    "declared": 95,
    "matched_by": {
@@ -434,21 +433,14 @@
     "cossin",
     "dft",
     "diagsvd",
-    "eig",
-    "eigh",
     "eigvals_banded",
     "eigvalsh_tridiagonal",
     "expm_cond",
     "expm_frechet",
-    "hessenberg",
     "invpascal",
-    "lu",
     "matmul_toeplitz",
-    "matrix_balance",
-    "norm",
     "orthogonal_procrustes",
     "pinvh",
-    "qr",
     "qr_delete",
     "qr_insert",
     "qr_multiply",
@@ -456,9 +448,7 @@
     "qz",
     "rq",
     "rsf2csf",
-    "schur",
-    "solve_lyapunov",
-    "svdvals"
+    "solve_lyapunov"
    ],
    "scipy": 98
   },
@@ -573,8 +563,8 @@
    "declared": 68,
    "matched_by": {
     "case_fold": 1,
-    "exact": 63,
-    "reexport": 2,
+    "exact": 62,
+    "reexport": 3,
     "trait": 1,
     "type_alias": 1
    },
@@ -1342,17 +1332,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 859,
-  "declared": 1475,
+  "compared": 869,
+  "declared": 1476,
   "matched_by": {
    "case_fold": 131,
    "exact": 1272,
-   "reexport": 10,
+   "reexport": 11,
    "trait": 2,
    "type_alias": 60
   },
   "na": 16,
-  "real": 1503,
+  "real": 1504,
   "scipy": 1555
  }
 }

@@ -5376,6 +5376,350 @@ pub fn leaves_list(z: &[[f64; 4]]) -> Vec<usize> {
     result
 }
 
+/// `dendrogram`'s `truncate_mode` with its `p`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DendrogramTruncate {
+    /// No truncation (SciPy `truncate_mode=None`).
+    #[default]
+    None,
+    /// Show only the last `p` merged clusters (`'lastp'`); `p == 0` or `p > n` means `n`.
+    LastP(usize),
+    /// Show no more than `p` levels below the root (`'level'`); `p == 0` means unlimited.
+    Level(usize),
+}
+
+/// `dendrogram`'s `count_sort` / `distance_sort` (SciPy reads `count_sort` first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DendrogramSort {
+    /// Children in linkage order.
+    #[default]
+    None,
+    /// The child with fewer original observations on the left (`count_sort='ascending'`).
+    CountAscending,
+    /// The child with more original observations on the left (`count_sort='descending'`).
+    CountDescending,
+    /// The child with the smaller merge distance on the left (`distance_sort='ascending'`).
+    DistanceAscending,
+    /// The child with the larger merge distance on the left (`distance_sort='descending'`).
+    DistanceDescending,
+}
+
+/// SciPy's default link colour cycle (`set_link_color_palette(None)`); `C0` is reserved for
+/// links above the colour threshold.
+pub const DENDROGRAM_DEFAULT_PALETTE: [&str; 9] =
+    ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"];
+
+/// Keyword arguments of `scipy.cluster.hierarchy.dendrogram` that shape its returned layout
+/// (the plotting-only keywords have no counterpart: fsci computes the `no_plot=True` result).
+#[derive(Clone, Copy)]
+pub struct DendrogramOptions<'a> {
+    pub truncate: DendrogramTruncate,
+    /// Links below this height take a palette colour per subtree; `None` is SciPy's default,
+    /// `0.7 · max(Z[:, 2])`. A threshold `<= 0` colours every link `above_threshold_color`.
+    pub color_threshold: Option<f64>,
+    /// One label per original observation; leaves are labelled by index otherwise.
+    pub labels: Option<&'a [String]>,
+    pub sort: DendrogramSort,
+    /// Label a truncated (non-singleton) leaf with its observation count `"(k)"`.
+    pub show_leaf_counts: bool,
+    /// Record `(x, height)` marks for the merges hidden inside truncated leaves.
+    pub show_contracted: bool,
+    /// The link colour cycle (SciPy's module-global `set_link_color_palette`).
+    pub palette: &'a [&'a str],
+    pub above_threshold_color: &'a str,
+    /// Overrides the colour of every link by its cluster index.
+    pub link_color_func: Option<&'a dyn Fn(usize) -> String>,
+    /// Overrides every leaf label by its cluster index.
+    pub leaf_label_func: Option<&'a dyn Fn(usize) -> String>,
+}
+
+impl Default for DendrogramOptions<'_> {
+    fn default() -> Self {
+        Self {
+            truncate: DendrogramTruncate::None,
+            color_threshold: None,
+            labels: None,
+            sort: DendrogramSort::None,
+            show_leaf_counts: true,
+            show_contracted: false,
+            palette: &DENDROGRAM_DEFAULT_PALETTE,
+            above_threshold_color: "C0",
+            link_color_func: None,
+            leaf_label_func: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for DendrogramOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DendrogramOptions")
+            .field("truncate", &self.truncate)
+            .field("color_threshold", &self.color_threshold)
+            .field("labels", &self.labels)
+            .field("sort", &self.sort)
+            .field("show_leaf_counts", &self.show_leaf_counts)
+            .field("show_contracted", &self.show_contracted)
+            .field("palette", &self.palette)
+            .field("above_threshold_color", &self.above_threshold_color)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The layout `scipy.cluster.hierarchy.dendrogram(Z, no_plot=True)` returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dendrogram {
+    /// x coordinates of each U-shaped link: `[left, left, right, right]`; leaves sit at
+    /// 5, 15, 25, ...
+    pub icoord: Vec<[f64; 4]>,
+    /// Heights of each link: `[left child, merge, merge, right child]`.
+    pub dcoord: Vec<[f64; 4]>,
+    /// Leaf labels, left to right.
+    pub ivl: Vec<String>,
+    /// Cluster index of each leaf, left to right.
+    pub leaves: Vec<usize>,
+    /// Colour of each link, in `icoord` order.
+    pub color_list: Vec<String>,
+    /// Colour of the link above each leaf (`None` where no link reaches the leaf).
+    pub leaves_color_list: Vec<Option<String>>,
+    /// `(x, height)` of each merge hidden in a truncated leaf (`show_contracted`).
+    pub contraction_marks: Vec<(f64, f64)>,
+}
+
+/// One pending call of SciPy's recursive `_dendrogram_calculate_info`.
+struct DendroFrame {
+    i: usize,
+    iv: f64,
+    level: usize,
+    ua: usize,
+    ub: usize,
+    /// `(left, width, height, max distance)` of the left child, once computed.
+    left: Option<(f64, f64, f64, f64)>,
+    color: String,
+}
+
+/// The layout of the dendrogram of a linkage matrix: `scipy.cluster.hierarchy.dendrogram(Z,
+/// no_plot=True)`, i.e. `icoord`, `dcoord`, `ivl`, `leaves`, `color_list` and
+/// `leaves_color_list`, computed by SciPy's `_dendrogram_calculate_info` (each leaf takes 10
+/// units of x, a link spans its children's midpoints; colours cycle through the palette per
+/// below-threshold subtree). SciPy recurses once per tree level; this walks an explicit stack,
+/// so a chain-shaped linkage of any depth is fine.
+///
+/// # Errors
+/// [`ClusterError::InvalidArgument`] for an invalid linkage, a `labels` slice whose length is
+/// not `Z.len() + 1`, or an empty palette.
+pub fn dendrogram(
+    z: &[[f64; 4]],
+    options: DendrogramOptions<'_>,
+) -> Result<Dendrogram, ClusterError> {
+    if z.is_empty() || !is_valid_linkage(z) {
+        return Err(ClusterError::InvalidArgument(
+            "Z is not a valid linkage matrix".to_string(),
+        ));
+    }
+    let n = z.len() + 1;
+    if let Some(labels) = options.labels
+        && labels.len() != n
+    {
+        return Err(ClusterError::InvalidArgument(
+            "Dimensions of Z and labels must be consistent.".to_string(),
+        ));
+    }
+    if options.palette.is_empty() {
+        return Err(ClusterError::InvalidArgument(
+            "the link colour palette must not be empty".to_string(),
+        ));
+    }
+    let max_height = z.iter().map(|row| row[2]).fold(f64::NEG_INFINITY, f64::max);
+    let color_threshold = options.color_threshold.unwrap_or(0.7 * max_height);
+    // SciPy's normalisation of p.
+    let lastp = match options.truncate {
+        DendrogramTruncate::LastP(p) if p == 0 || p > n => Some(n),
+        DendrogramTruncate::LastP(p) => Some(p),
+        _ => None,
+    };
+    let level_cap = match options.truncate {
+        DendrogramTruncate::Level(0) => Some(usize::MAX),
+        DendrogramTruncate::Level(p) => Some(p),
+        _ => None,
+    };
+
+    let mut out = Dendrogram {
+        icoord: Vec::new(),
+        dcoord: Vec::new(),
+        ivl: Vec::new(),
+        leaves: Vec::new(),
+        color_list: Vec::new(),
+        leaves_color_list: Vec::new(),
+        contraction_marks: Vec::new(),
+    };
+    let mut current_color = 0usize;
+    let mut below_threshold = false;
+
+    let singleton_leaf = |out: &mut Dendrogram, i: usize| {
+        out.leaves.push(i);
+        out.ivl
+            .push(match (options.leaf_label_func, options.labels) {
+                (Some(f), _) => f(i),
+                (None, Some(labels)) => labels[i].clone(),
+                (None, None) => i.to_string(),
+            });
+    };
+    let nonsingleton_leaf = |out: &mut Dendrogram, i: usize, iv: f64| {
+        out.leaves.push(i);
+        out.ivl.push(match options.leaf_label_func {
+            Some(f) => f(i),
+            None if options.show_leaf_counts => format!("({})", z[i - n][3] as i64),
+            None => String::new(),
+        });
+        if options.show_contracted {
+            // SciPy `_append_contraction_marks`: every merge below this leaf, depth first.
+            let mut stack = vec![z[i - n][1] as usize, z[i - n][0] as usize];
+            while let Some(c) = stack.pop() {
+                if c >= n {
+                    out.contraction_marks.push((iv + 5.0, z[c - n][2]));
+                    stack.push(z[c - n][1] as usize);
+                    stack.push(z[c - n][0] as usize);
+                }
+            }
+        }
+    };
+    // A leaf (truncated or original), or `None` when the node is drawn as a link.
+    let as_leaf = |out: &mut Dendrogram, i: usize, iv: f64, level: usize| {
+        if let Some(p) = lastp {
+            if i >= n && 2 * n - p > i {
+                nonsingleton_leaf(out, i, iv);
+                return Some((iv + 5.0, 10.0, 0.0, z[i - n][2]));
+            }
+        } else if let Some(p) = level_cap
+            && i > n
+            && level > p
+        {
+            nonsingleton_leaf(out, i, iv);
+            return Some((iv + 5.0, 10.0, 0.0, z[i - n][2]));
+        }
+        if i < n {
+            singleton_leaf(out, i);
+            return Some((iv + 5.0, 10.0, 0.0, 0.0));
+        }
+        None
+    };
+    let children = |i: usize| {
+        let row = z[i - n];
+        let (aa, ab) = (row[0] as usize, row[1] as usize);
+        let (na, da) = if aa >= n {
+            (z[aa - n][3], z[aa - n][2])
+        } else {
+            (1.0, 0.0)
+        };
+        let (nb, db) = if ab >= n {
+            (z[ab - n][3], z[ab - n][2])
+        } else {
+            (1.0, 0.0)
+        };
+        match options.sort {
+            DendrogramSort::CountAscending if na > nb => (ab, aa),
+            DendrogramSort::CountDescending if na <= nb => (ab, aa),
+            DendrogramSort::DistanceAscending if da > db => (ab, aa),
+            DendrogramSort::DistanceDescending if da <= db => (ab, aa),
+            _ => (aa, ab),
+        }
+    };
+
+    let root = 2 * n - 2;
+    let mut stack: Vec<DendroFrame> = Vec::new();
+    let mut ret = as_leaf(&mut out, root, 0.0, 0);
+    if ret.is_none() {
+        let (ua, ub) = children(root);
+        stack.push(DendroFrame {
+            i: root,
+            iv: 0.0,
+            level: 0,
+            ua,
+            ub,
+            left: None,
+            color: String::new(),
+        });
+    }
+    while let Some(frame) = stack.last_mut() {
+        match (frame.left, ret.take()) {
+            // Descend into the left child.
+            (None, None) => {
+                let (child, iv, level) = (frame.ua, frame.iv, frame.level + 1);
+                ret = as_leaf(&mut out, child, iv, level);
+                if ret.is_none() {
+                    let (ua, ub) = children(child);
+                    stack.push(DendroFrame {
+                        i: child,
+                        iv,
+                        level,
+                        ua,
+                        ub,
+                        left: None,
+                        color: String::new(),
+                    });
+                }
+            }
+            // The left child returned: colour this link, then descend into the right child.
+            (None, Some(left)) => {
+                let h = z[frame.i - n][2];
+                frame.color = if h >= color_threshold || color_threshold <= 0.0 {
+                    if below_threshold {
+                        current_color = (current_color + 1) % options.palette.len();
+                    }
+                    below_threshold = false;
+                    options.above_threshold_color.to_string()
+                } else {
+                    below_threshold = true;
+                    options.palette[current_color].to_string()
+                };
+                frame.left = Some(left);
+                let (child, iv, level) = (frame.ub, frame.iv + left.1, frame.level + 1);
+                ret = as_leaf(&mut out, child, iv, level);
+                if ret.is_none() {
+                    let (ua, ub) = children(child);
+                    stack.push(DendroFrame {
+                        i: child,
+                        iv,
+                        level,
+                        ua,
+                        ub,
+                        left: None,
+                        color: String::new(),
+                    });
+                }
+            }
+            // Both children returned: emit this link.
+            (Some((uiva, uwa, uah, uamd)), Some((uivb, uwb, ubh, ubmd))) => {
+                let frame = stack.pop().expect("frame on the stack");
+                let h = z[frame.i - n][2];
+                out.icoord.push([uiva, uiva, uivb, uivb]);
+                out.dcoord.push([uah, h, h, ubh]);
+                out.color_list.push(match options.link_color_func {
+                    Some(f) => f(frame.i),
+                    None => frame.color,
+                });
+                ret = Some(((uiva + uivb) / 2.0, uwa + uwb, h, uamd.max(ubmd).max(h)));
+            }
+            (Some(_), None) => unreachable!("a finished left child always yields a value"),
+        }
+    }
+
+    // SciPy `_get_leaves_color_list`: a link leg at height 0 whose x is an odd multiple of 5
+    // stands on leaf (x − 5) / 10.
+    out.leaves_color_list = vec![None; out.leaves.len()];
+    for ((xs, ys), color) in out.icoord.iter().zip(&out.dcoord).zip(&out.color_list) {
+        for (&x, &y) in xs.iter().zip(ys) {
+            if y == 0.0 && x % 5.0 == 0.0 && x % 2.0 == 1.0 {
+                let idx = ((x as i64 - 5) / 10) as usize;
+                if let Some(slot) = out.leaves_color_list.get_mut(idx) {
+                    *slot = Some(color.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Reorder a linkage matrix to minimize the sum of distances between adjacent
 /// leaves of the dendrogram (Bar-Joseph, Gifford & Jaakkola 2001), matching
 /// `scipy.cluster.hierarchy.optimal_leaf_ordering(Z, y)`.
@@ -11205,6 +11549,142 @@ mod tests {
         let mut sorted = leaves.clone();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn dendrogram_matches_scipy_on_a_three_point_tree() {
+        // scipy: dendrogram([[0,1,1,2],[2,3,3,3]], no_plot=True)
+        let z = [[0.0, 1.0, 1.0, 2.0], [2.0, 3.0, 3.0, 3.0]];
+        let d = dendrogram(&z, DendrogramOptions::default()).unwrap();
+        assert_eq!(
+            d.icoord,
+            vec![[15.0, 15.0, 25.0, 25.0], [5.0, 5.0, 20.0, 20.0]]
+        );
+        assert_eq!(d.dcoord, vec![[0.0, 1.0, 1.0, 0.0], [0.0, 3.0, 3.0, 1.0]]);
+        assert_eq!(d.ivl, vec!["2", "0", "1"]);
+        assert_eq!(d.leaves, vec![2, 0, 1]);
+        assert_eq!(d.color_list, vec!["C1", "C0"]);
+        assert_eq!(
+            d.leaves_color_list,
+            vec![
+                Some("C0".to_string()),
+                Some("C1".to_string()),
+                Some("C1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn dendrogram_lastp_contraction_marks_and_custom_functions() {
+        // scipy: dendrogram(Z4, truncate_mode='lastp', p=2, show_contracted=True, no_plot=True)
+        let z = [
+            [0.0, 1.0, 0.5, 2.0],
+            [2.0, 3.0, 1.0, 2.0],
+            [4.0, 5.0, 2.0, 4.0],
+        ];
+        let d = dendrogram(
+            &z,
+            DendrogramOptions {
+                truncate: DendrogramTruncate::LastP(2),
+                show_contracted: true,
+                ..DendrogramOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(d.icoord, vec![[5.0, 5.0, 15.0, 15.0]]);
+        assert_eq!(d.ivl, vec!["(2)", "(2)"]);
+        assert_eq!(d.leaves, vec![4, 5]);
+        // The merge hidden inside each truncated leaf, at that leaf's x.
+        assert_eq!(d.contraction_marks, vec![]);
+        let labels = |i: usize| format!("node{i}");
+        let colors = |i: usize| {
+            if i == 6 {
+                "k".to_string()
+            } else {
+                "m".to_string()
+            }
+        };
+        let d = dendrogram(
+            &z,
+            DendrogramOptions {
+                leaf_label_func: Some(&labels),
+                link_color_func: Some(&colors),
+                ..DendrogramOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(d.ivl, vec!["node0", "node1", "node2", "node3"]);
+        assert_eq!(d.color_list, vec!["m", "m", "k"]);
+    }
+
+    #[test]
+    fn dendrogram_contraction_marks_record_hidden_merges() {
+        // Five leaves: 5 = (0,1), 6 = (2,3), 7 = (5,6), 8 = (7,4). With p = 2 the root's
+        // children are drawn as leaves: cluster 7 (hiding merges 5 and 6) and observation 4.
+        let z = [
+            [0.0, 1.0, 0.5, 2.0],
+            [2.0, 3.0, 1.0, 2.0],
+            [5.0, 6.0, 2.0, 4.0],
+            [7.0, 4.0, 3.0, 5.0],
+        ];
+        let d = dendrogram(
+            &z,
+            DendrogramOptions {
+                truncate: DendrogramTruncate::LastP(2),
+                show_contracted: true,
+                ..DendrogramOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(d.leaves, vec![7, 4]);
+        assert_eq!(d.ivl, vec!["(4)", "4"]);
+        // SciPy `_append_contraction_marks`: depth first, left child before right, at the
+        // truncated leaf's x (5).
+        assert_eq!(d.contraction_marks, vec![(5.0, 0.5), (5.0, 1.0)]);
+    }
+
+    #[test]
+    fn dendrogram_handles_a_deep_chain_without_recursion() {
+        // A single-linkage chain on a line is a 4999-deep tree; SciPy recurses once per level.
+        let data: Vec<Vec<f64>> = (0..5000)
+            .map(|i| vec![f64::from(i) * f64::from(i)])
+            .collect();
+        let z = linkage(&data, LinkageMethod::Single).unwrap();
+        let d = dendrogram(&z, DendrogramOptions::default()).unwrap();
+        assert_eq!(d.leaves.len(), 5000);
+        assert_eq!(d.icoord.len(), 4999);
+        let mut sorted = d.leaves.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..5000).collect::<Vec<_>>());
+        assert_eq!(d.leaves, leaves_list(&z));
+    }
+
+    #[test]
+    fn dendrogram_rejects_bad_input() {
+        let z = [[0.0, 1.0, 1.0, 2.0]];
+        let labels = vec!["a".to_string()];
+        assert!(matches!(
+            dendrogram(
+                &z,
+                DendrogramOptions {
+                    labels: Some(&labels),
+                    ..DendrogramOptions::default()
+                }
+            ),
+            Err(ClusterError::InvalidArgument(_))
+        ));
+        assert!(dendrogram(&[], DendrogramOptions::default()).is_err());
+        assert!(dendrogram(&[[0.0, 0.0, 1.0, 2.0]], DendrogramOptions::default()).is_err());
+        assert!(
+            dendrogram(
+                &z,
+                DendrogramOptions {
+                    palette: &[],
+                    ..DendrogramOptions::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
