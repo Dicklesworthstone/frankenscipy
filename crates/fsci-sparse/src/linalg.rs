@@ -6194,6 +6194,169 @@ pub fn splu_solve_many(
     }
 }
 
+/// Whether a dense-backend factor has an exactly zero pivot. LAPACK `getrf` and SuperLU report
+/// that at factorization ("Factor is exactly singular"); the dense backend of [`splu`] only
+/// notices it at solve time, so [`factorized`] asks here.
+fn dense_lu_is_exactly_singular(factorization: &SparseLuFactorization) -> bool {
+    matches!(&factorization.lu_internal, SparseLuInternal::Dense(lu) if !lu.is_invertible())
+}
+
+/// The solver [`factorized`] returns: SciPy's `solve` callable (`splu(A).solve` without
+/// scikit-umfpack) over an LU factorization computed once and reused by every call.
+///
+/// As a [`LinearOperator`] it is `A⁻¹`: `matvec(b)` solves `A·x = b`, which is how SciPy users
+/// wrap `factorized(A)` as a preconditioner (`LinearOperator(A.shape, factorized(A))`).
+#[derive(Debug, Clone)]
+pub struct FactorizedSolve {
+    factorization: SparseLuFactorization,
+}
+
+impl FactorizedSolve {
+    /// `solve(b)`: the `x` with `A·x = b`.
+    ///
+    /// # Errors
+    /// [`SparseError::IncompatibleShape`] when `b.len()` is not `n` (SciPy: "b is of
+    /// incompatible size").
+    pub fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        splu_solve(&self.factorization, b)
+    }
+
+    /// The cached factorization.
+    #[must_use]
+    pub const fn factorization(&self) -> &SparseLuFactorization {
+        &self.factorization
+    }
+}
+
+impl LinearOperator for FactorizedSolve {
+    fn shape(&self) -> Shape2D {
+        let (rows, cols) = self.factorization.shape;
+        Shape2D::new(rows, cols)
+    }
+
+    fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        if y.len() != self.factorization.shape.0 {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "dimension mismatch: output has length {}, expected {}",
+                    y.len(),
+                    self.factorization.shape.0
+                ),
+            });
+        }
+        y.copy_from_slice(&self.solve(x)?);
+        Ok(())
+    }
+}
+
+/// `scipy.sparse.linalg.factorized(A)`: factor `A` once with [`splu`] (SciPy's default options)
+/// and return a reusable solver for `A·x = b`.
+///
+/// # Errors
+/// - [`SparseError::InvalidShape`] for a non-square `A` (SciPy: "can only factor square
+///   matrices").
+/// - [`SparseError::SingularMatrix`] when `A` is exactly singular (SciPy: "Factor is exactly
+///   singular").
+pub fn factorized(a: &CscMatrix) -> SparseResult<FactorizedSolve> {
+    let factorization = splu(a, LuOptions::default())?;
+    if dense_lu_is_exactly_singular(&factorization) {
+        return Err(SparseError::SingularMatrix {
+            message: "Factor is exactly singular".to_string(),
+        });
+    }
+    Ok(FactorizedSolve { factorization })
+}
+
+/// The sparse formats [`inv`] accepts. The inverse comes back in the input's format, as SciPy
+/// builds it with `A.__class__`: a CSC input gives a CSC inverse, a CSR input a CSR one.
+pub trait SparseInverse: Sized {
+    /// The matrix as CSC, the format [`splu`] factors.
+    fn to_csc_for_inverse(&self) -> SparseResult<CscMatrix>;
+    /// The inverse, assembled column by column as CSC, in `Self`'s format.
+    fn from_csc_inverse(inverse: CscMatrix) -> SparseResult<Self>;
+}
+
+impl SparseInverse for CscMatrix {
+    fn to_csc_for_inverse(&self) -> SparseResult<CscMatrix> {
+        Ok(self.clone())
+    }
+    fn from_csc_inverse(inverse: CscMatrix) -> SparseResult<Self> {
+        Ok(inverse)
+    }
+}
+
+impl SparseInverse for CsrMatrix {
+    fn to_csc_for_inverse(&self) -> SparseResult<CscMatrix> {
+        self.to_csc()
+    }
+    fn from_csc_inverse(inverse: CscMatrix) -> SparseResult<Self> {
+        inverse.to_csr()
+    }
+}
+
+impl<M: SparseInverse> SparseInverse for crate::formats::SparseArray2D<M> {
+    fn to_csc_for_inverse(&self) -> SparseResult<CscMatrix> {
+        self.as_matrix().to_csc_for_inverse()
+    }
+    fn from_csc_inverse(inverse: CscMatrix) -> SparseResult<Self> {
+        M::from_csc_inverse(inverse).map(Self::new)
+    }
+}
+
+/// `scipy.sparse.linalg.inv(A)`: the sparse inverse of a square sparse matrix.
+///
+/// SciPy solves `A·X = I` column by column through `factorized(A)` and keeps each column's
+/// nonzeros (`np.flatnonzero`), so exact zeros of the inverse are not stored; this does the
+/// same and returns the inverse in `A`'s format. As SciPy's docstring warns, the inverse of a
+/// sparse matrix is usually dense.
+///
+/// # Errors
+/// - [`SparseError::InvalidShape`] for a non-square or 0×0 `A` (SciPy: "matrix must be square";
+///   a 0×0 `A` fails inside SciPy's `spsolve`).
+/// - [`SparseError::SingularMatrix`] for an exactly singular `A` (SciPy: "Factor is exactly
+///   singular").
+pub fn inv<M: SparseInverse>(a: &M) -> SparseResult<M> {
+    let csc = a.to_csc_for_inverse()?;
+    let shape = csc.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "matrix must be square (has shape ({}, {}))",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let n = shape.rows;
+    if n == 0 {
+        return Err(SparseError::InvalidShape {
+            message: "inv of a 0x0 matrix: SciPy's spsolve fails here (need at least one array \
+                      to concatenate)"
+                .to_string(),
+        });
+    }
+    let solver = factorized(&csc)?;
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    let mut unit = vec![0.0; n];
+    for j in 0..n {
+        unit[j] = 1.0;
+        let column = solver.solve(&unit)?;
+        unit[j] = 0.0;
+        // `np.flatnonzero`: a NaN counts as nonzero, as `!= 0.0` does.
+        for (row, value) in column.into_iter().enumerate() {
+            if value != 0.0 {
+                indices.push(row);
+                data.push(value);
+            }
+        }
+        indptr.push(indices.len());
+    }
+    let inverse = CscMatrix::from_components(shape, data, indices, indptr, false)?;
+    M::from_csc_inverse(inverse)
+}
+
 /// SuperLU's `sp_ienv(7)`: the widest fundamental supernode `dgsitrf` forms, and half the tail
 /// (`2 · 10` columns) that `last_drop` exempts from L dropping.
 const ILU_MAX_SUPERNODE: usize = 10;
@@ -38181,6 +38344,416 @@ pub fn lobpcg(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// LaplacianNd — the grid Laplacian as a matrix-free operator
+// ══════════════════════════════════════════════════════════════════════
+
+/// Boundary conditions of a [`LaplacianNd`]: SciPy's `boundary_conditions=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaplacianBoundary {
+    /// `'dirichlet'`: zero outside the grid.
+    Dirichlet,
+    /// `'neumann'` (SciPy's default): zero normal derivative.
+    #[default]
+    Neumann,
+    /// `'periodic'`: the grid wraps around.
+    Periodic,
+}
+
+impl std::str::FromStr for LaplacianBoundary {
+    type Err = SparseError;
+
+    /// SciPy's spelling: `"dirichlet"`, `"neumann"` or `"periodic"`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dirichlet" => Ok(Self::Dirichlet),
+            "neumann" => Ok(Self::Neumann),
+            "periodic" => Ok(Self::Periodic),
+            other => Err(SparseError::InvalidArgument {
+                message: format!(
+                    "Unknown value {other:?} is given for 'boundary_conditions' parameter. The \
+                     valid options are 'dirichlet', 'periodic', and 'neumann' (default)."
+                ),
+            }),
+        }
+    }
+}
+
+/// `scipy.sparse.linalg.LaplacianNd(grid_shape, boundary_conditions=...)`: the negative-
+/// semidefinite N-dimensional grid Laplacian, transcribed from SciPy 1.17.1's
+/// `_special_sparse_arrays.py`.
+///
+/// It is a matrix-free [`LinearOperator`] of size `prod(grid_shape)` (its `matvec` is SciPy's
+/// roll-based stencil, so every solver in this crate takes it directly), with SciPy's
+/// closed-form [`eigenvalues`](Self::eigenvalues) and [`eigenvectors`](Self::eigenvectors), and
+/// its matrix as [`toarray`](Self::toarray) (dense) and [`tosparse`](Self::tosparse) (CSR here;
+/// SciPy builds it through DIA and `kron` and hands back CSR as well). Grid points are ordered as
+/// a C-order ravel of `grid_shape`.
+///
+/// SciPy's quirks are kept, not repaired: on an axis of length 1 `toarray`/`tosparse` put `−1`
+/// on the diagonal for Neumann and periodic conditions while `matvec` and the eigenvalues treat
+/// that axis as contributing 0; a periodic axis of length 2 has off-diagonal entries `2`; and
+/// `eigenvalues(m)` truncates the eigenvalue grid to the lexicographic minimum of `grid_shape` and
+/// `(m, …, m)`, as Python's `min` of two tuples does. Among exactly equal eigenvalues the order
+/// is stable (index order); NumPy's default `argsort` breaks those ties by an unspecified rule,
+/// so the eigenvectors of a repeated eigenvalue may come back in a different order (they span
+/// the same space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaplacianNd {
+    grid_shape: Vec<usize>,
+    boundary: LaplacianBoundary,
+    size: usize,
+}
+
+impl LaplacianNd {
+    /// # Errors
+    /// [`SparseError::InvalidShape`] for an empty `grid_shape` or a zero-length axis, and
+    /// [`SparseError::IndexOverflow`] when `prod(grid_shape)` overflows.
+    pub fn new(grid_shape: &[usize], boundary_conditions: LaplacianBoundary) -> SparseResult<Self> {
+        if grid_shape.is_empty() || grid_shape.contains(&0) {
+            return Err(SparseError::InvalidShape {
+                message: format!(
+                    "LaplacianNd needs a non-empty grid_shape of positive lengths, got \
+                     {grid_shape:?}"
+                ),
+            });
+        }
+        let size = grid_shape
+            .iter()
+            .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| SparseError::IndexOverflow {
+                message: format!("prod(grid_shape) of {grid_shape:?} overflows usize"),
+            })?;
+        Ok(Self {
+            grid_shape: grid_shape.to_vec(),
+            boundary: boundary_conditions,
+            size,
+        })
+    }
+
+    /// The grid shape.
+    #[must_use]
+    pub fn grid_shape(&self) -> &[usize] {
+        &self.grid_shape
+    }
+
+    /// The boundary conditions.
+    #[must_use]
+    pub const fn boundary_conditions(&self) -> LaplacianBoundary {
+        self.boundary
+    }
+
+    /// The grid SciPy enumerates eigenvalues on: all of it, or `min(grid_shape, (m,)*d)` in
+    /// Python's lexicographic tuple order.
+    fn eigen_grid(&self, m: Option<usize>) -> Vec<usize> {
+        match m {
+            None => self.grid_shape.clone(),
+            Some(m) => std::cmp::min(self.grid_shape.clone(), vec![m; self.grid_shape.len()]),
+        }
+    }
+
+    /// One axis' term `−4·sin²(·)` of the eigenvalue with 1-D index `j` on an axis of length `n`.
+    fn eigenvalue_term(&self, j: usize, n: usize) -> f64 {
+        use std::f64::consts::PI;
+        let s = match self.boundary {
+            LaplacianBoundary::Dirichlet => (PI * (j + 1) as f64 / (2 * (n + 1)) as f64).sin(),
+            LaplacianBoundary::Neumann => (PI * j as f64 / (2 * n) as f64).sin(),
+            LaplacianBoundary::Periodic => (PI * (((j + 1) as f64) / 2.0).floor() / n as f64).sin(),
+        };
+        -4.0 * (s * s)
+    }
+
+    /// SciPy's `_eigenvalue_ordering(m)`: the sorted eigenvalues and their raveled indices into
+    /// the eigen grid, the last `m` when `m` is given.
+    fn eigenvalue_ordering(&self, m: Option<usize>) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+        let grid = self.eigen_grid(m);
+        let total: usize = grid.iter().product();
+        let mut values = Vec::with_capacity(total);
+        let mut multi = vec![0_usize; grid.len()];
+        for _ in 0..total {
+            let mut value = 0.0;
+            for (&j, &n) in multi.iter().zip(&self.grid_shape) {
+                value += self.eigenvalue_term(j, n);
+            }
+            values.push(value);
+            // Next multi-index in C order.
+            for axis in (0..grid.len()).rev() {
+                multi[axis] += 1;
+                if multi[axis] < grid[axis] {
+                    break;
+                }
+                multi[axis] = 0;
+            }
+        }
+        let mut order: Vec<usize> = (0..total).collect();
+        order.sort_by(|&p, &q| values[p].total_cmp(&values[q]));
+        let mut sorted: Vec<f64> = order.iter().map(|&i| values[i]).collect();
+        if let Some(m) = m
+            && m > 0
+            && m < sorted.len()
+        {
+            // Python's `[-m:]`.
+            sorted.drain(..sorted.len() - m);
+            order.drain(..order.len() - m);
+        }
+        (sorted, order, grid)
+    }
+
+    /// `eigenvalues(m=None)`: all eigenvalues ascending, or the `m` largest (all ≤ 0; the
+    /// largest is 0 for Neumann and periodic conditions). `Some(0)` gives none.
+    #[must_use]
+    pub fn eigenvalues(&self, m: Option<usize>) -> Vec<f64> {
+        self.eigenvalue_ordering(m).0
+    }
+
+    /// SciPy's `_ev1d(j, n)`: the normalized 1-D eigenvector `j` of an axis of length `n`, with
+    /// entries below `ε` in magnitude made exact zeros.
+    fn eigenvector_1d(&self, j: usize, n: usize) -> Vec<f64> {
+        use std::f64::consts::PI;
+        let nf = n as f64;
+        let cosine = |scale: f64| -> Vec<f64> {
+            (0..n)
+                .map(|t| scale * ((PI * (t as f64 + 0.5) / nf) * j as f64).cos())
+                .collect()
+        };
+        let mut ev: Vec<f64> = match self.boundary {
+            LaplacianBoundary::Dirichlet => {
+                let scale = (2.0 / (nf + 1.0)).sqrt();
+                (0..n)
+                    .map(|t| {
+                        scale * ((PI * (t + 1) as f64 / (n + 1) as f64) * (j + 1) as f64).sin()
+                    })
+                    .collect()
+            }
+            LaplacianBoundary::Neumann => cosine((if j == 0 { 1.0 } else { 2.0 } / nf).sqrt()),
+            LaplacianBoundary::Periodic => {
+                if j == 0 {
+                    vec![(1.0 / nf).sqrt(); n]
+                } else if j + 1 == n && n.is_multiple_of(2) {
+                    let scale = (1.0 / nf).sqrt();
+                    (0..n)
+                        .map(|t| if t.is_multiple_of(2) { scale } else { -scale })
+                        .collect()
+                } else if (j + 1).is_multiple_of(2) {
+                    let scale = (2.0 / nf).sqrt();
+                    (0..n)
+                        .map(|t| scale * ((PI * (t as f64 + 0.5) / nf) * (j + 1) as f64).sin())
+                        .collect()
+                } else {
+                    cosine((2.0 / nf).sqrt())
+                }
+            }
+        };
+        for value in &mut ev {
+            if value.abs() < f64::EPSILON {
+                *value = 0.0;
+            }
+        }
+        ev
+    }
+
+    /// SciPy's `_one_eve(k)`: the tensor product of the 1-D eigenvectors, raveled in C order.
+    fn eigenvector_nd(&self, k: &[usize]) -> Vec<f64> {
+        let mut result = vec![1.0_f64];
+        for (axis, (&j, &n)) in k.iter().zip(&self.grid_shape).enumerate() {
+            let phi = self.eigenvector_1d(j, n);
+            if axis == 0 {
+                result = phi;
+                continue;
+            }
+            result = result
+                .iter()
+                .flat_map(|&r| phi.iter().map(move |&p| r * p))
+                .collect();
+        }
+        result
+    }
+
+    /// `eigenvectors(m=None)`: the orthonormal eigenvectors in the order of
+    /// [`eigenvalues`](Self::eigenvalues) (`eigenvectors[i]` belongs to `eigenvalues[i]`).
+    #[must_use]
+    pub fn eigenvectors(&self, m: Option<usize>) -> Vec<Vec<f64>> {
+        let (_, order, grid) = self.eigenvalue_ordering(m);
+        order
+            .into_iter()
+            .map(|flat| {
+                // `np.unravel_index(ind, grid_shape_min)`.
+                let mut k = vec![0_usize; grid.len()];
+                let mut rest = flat;
+                for axis in (0..grid.len()).rev() {
+                    k[axis] = rest % grid[axis];
+                    rest /= grid[axis];
+                }
+                self.eigenvector_nd(&k)
+            })
+            .collect()
+    }
+
+    /// The 1-D Laplacian of one axis as `(row, col, value)` entries, as SciPy's `toarray` and
+    /// `tosparse` build it.
+    fn axis_entries(&self, dim: usize) -> Vec<(usize, usize, f64)> {
+        let mut dense = vec![vec![0.0_f64; dim]; dim];
+        for (i, row) in dense.iter_mut().enumerate() {
+            row[i] = -2.0;
+            if i + 1 < dim {
+                row[i + 1] = 1.0;
+            }
+            if i > 0 {
+                row[i - 1] = 1.0;
+            }
+        }
+        match self.boundary {
+            LaplacianBoundary::Neumann => {
+                dense[0][0] = -1.0;
+                dense[dim - 1][dim - 1] = -1.0;
+            }
+            LaplacianBoundary::Periodic => {
+                if dim > 1 {
+                    dense[0][dim - 1] += 1.0;
+                    dense[dim - 1][0] += 1.0;
+                } else {
+                    dense[0][0] += 1.0;
+                }
+            }
+            LaplacianBoundary::Dirichlet => {}
+        }
+        let mut entries = Vec::new();
+        for (i, row) in dense.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                if value != 0.0 {
+                    entries.push((i, j, value));
+                }
+            }
+        }
+        entries
+    }
+
+    /// Every stored entry of the matrix, `Σ_axis I ⊗ L_axis ⊗ I`, duplicates not yet summed.
+    fn matrix_entries(&self) -> Vec<(usize, usize, f64)> {
+        let mut entries = Vec::new();
+        for (axis, &dim) in self.grid_shape.iter().enumerate() {
+            let before: usize = self.grid_shape[..axis].iter().product();
+            let after: usize = self.grid_shape[axis + 1..].iter().product();
+            let local = self.axis_entries(dim);
+            for b in 0..before {
+                for &(r1, c1, value) in &local {
+                    for a in 0..after {
+                        entries.push((
+                            (b * dim + r1) * after + a,
+                            (b * dim + c1) * after + a,
+                            value,
+                        ));
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// `toarray()`: the matrix, dense and row-major.
+    #[must_use]
+    pub fn toarray(&self) -> Vec<Vec<f64>> {
+        let mut dense = vec![vec![0.0; self.size]; self.size];
+        for (row, col, value) in self.matrix_entries() {
+            dense[row][col] += value;
+        }
+        dense
+    }
+
+    /// `tosparse()`: the matrix as CSR.
+    ///
+    /// # Errors
+    /// Only a failed sparse construction, which the entries rule out.
+    pub fn tosparse(&self) -> SparseResult<CsrMatrix> {
+        let entries = self.matrix_entries();
+        let mut rows = Vec::with_capacity(entries.len());
+        let mut cols = Vec::with_capacity(entries.len());
+        let mut data = Vec::with_capacity(entries.len());
+        for (row, col, value) in entries {
+            rows.push(row);
+            cols.push(col);
+            data.push(value);
+        }
+        crate::formats::CooMatrix::from_triplets(
+            Shape2D::new(self.size, self.size),
+            data,
+            rows,
+            cols,
+            true,
+        )?
+        .to_csr()
+    }
+}
+
+impl LinearOperator for LaplacianNd {
+    fn shape(&self) -> Shape2D {
+        Shape2D::new(self.size, self.size)
+    }
+
+    /// SciPy's `_matvec`: `−2N·X` plus the two rolls along every axis, with the wrapped
+    /// neighbours taken back out (Dirichlet, Neumann) and the boundary point itself added back
+    /// (Neumann), in SciPy's operation order.
+    fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        if x.len() != self.size || y.len() != self.size {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "dimension mismatch: LaplacianNd of size {} applied to length {} into {}",
+                    self.size,
+                    x.len(),
+                    y.len()
+                ),
+            });
+        }
+        let d = self.grid_shape.len();
+        let centre = -2.0 * d as f64;
+        let mut strides = vec![1_usize; d];
+        for axis in (0..d.saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1] * self.grid_shape[axis + 1];
+        }
+        let removes_wrap = matches!(
+            self.boundary,
+            LaplacianBoundary::Dirichlet | LaplacianBoundary::Neumann
+        );
+        let neumann = self.boundary == LaplacianBoundary::Neumann;
+        for (idx, out) in y.iter_mut().enumerate() {
+            let mut value = centre * x[idx];
+            for axis in 0..d {
+                let n = self.grid_shape[axis];
+                let stride = strides[axis];
+                let c = (idx / stride) % n;
+                let base = idx - c * stride;
+                let prev = base + ((c + n - 1) % n) * stride;
+                let next = base + ((c + 1) % n) * stride;
+                value += x[prev];
+                value += x[next];
+                if removes_wrap {
+                    if c == 0 {
+                        value -= x[prev];
+                    }
+                    if c == n - 1 {
+                        value -= x[next];
+                    }
+                    if neumann {
+                        if c == 0 {
+                            value += x[idx];
+                        }
+                        if c == n - 1 {
+                            value += x[idx];
+                        }
+                    }
+                }
+            }
+            *out = value;
+        }
+        Ok(())
+    }
+
+    /// The operator is symmetric (SciPy's `_adjoint` returns `self`).
+    fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        self.matvec_into(x, y)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Sparse Graph Algorithms (csgraph)
 // ══════════════════════════════════════════════════════════════════════
 
@@ -46097,6 +46670,319 @@ mod lobpcg_tests {
                 LobpcgOptions::default()
             ),
             Err(SparseError::InvalidShape { .. })
+        ));
+    }
+}
+
+/// `factorized`, `inv` and `LaplacianNd` (frankenscipy-6j5tz).
+#[cfg(test)]
+mod factorized_inv_laplacian_nd_tests {
+    use super::*;
+    use crate::interface::ScaledOperator;
+
+    fn csr(rows: &[Vec<f64>]) -> CsrMatrix {
+        let (mut r, mut c, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                if value != 0.0 {
+                    r.push(i);
+                    c.push(j);
+                    v.push(value);
+                }
+            }
+        }
+        let shape = Shape2D::new(rows.len(), rows.first().map_or(0, Vec::len));
+        CooMatrix::from_triplets(shape, v, r, c, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn dense_of_csc(m: &CscMatrix) -> Vec<Vec<f64>> {
+        LinearOperator::to_dense(m).expect("dense")
+    }
+
+    fn tridiagonal(n: usize) -> CsrMatrix {
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match i.abs_diff(j) {
+                        0 => 4.0,
+                        1 if j > i => -1.0,
+                        1 => -2.0,
+                        _ => 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        csr(&rows)
+    }
+
+    #[test]
+    fn factorized_solves_scipys_docstring_example() {
+        let a = csr(&[
+            vec![3.0, 2.0, -1.0],
+            vec![2.0, -2.0, 4.0],
+            vec![-1.0, 0.5, -1.0],
+        ]);
+        let solve = factorized(&a.to_csc().expect("csc")).expect("factorized");
+        let x = solve.solve(&[1.0, -2.0, 0.0]).expect("solve");
+        for (got, want) in x.iter().zip([1.0, -2.0, -2.0]) {
+            assert!((got - want).abs() < 1e-14, "{got} vs {want}");
+        }
+        // Reusable, and an A⁻¹ operator.
+        let y = solve.matvec(&[1.0, -2.0, 0.0]).expect("matvec");
+        assert_eq!(x, y);
+        assert!(matches!(
+            solve.solve(&[1.0; 4]),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    #[test]
+    fn factorized_on_a_large_sparse_matrix_and_as_a_preconditioner() {
+        let n = 400;
+        let a = tridiagonal(n);
+        let solve = factorized(&a.to_csc().expect("csc")).expect("factorized");
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).sin()).collect();
+        let x = solve.solve(&b).expect("solve");
+        let residual = vec_norm_diff(&csr_matvec(&a, &x), &b) / vec_norm(&b);
+        assert!(residual < 1e-14, "{residual:e}");
+        // The exact inverse as gcrotmk's preconditioner converges in one outer step.
+        let result = gcrotmk(
+            &a,
+            &b,
+            None,
+            Some(&solve),
+            None,
+            GcrotmkOptions {
+                rtol: 1e-12,
+                ..GcrotmkOptions::default()
+            },
+        )
+        .expect("gcrotmk");
+        assert_eq!(result.info, 0);
+        assert!(result.iterations <= 1, "{}", result.iterations);
+    }
+
+    #[test]
+    fn factorized_refuses_singular_and_rectangular_input() {
+        let singular = csr(&[vec![1.0, 2.0], vec![2.0, 4.0]])
+            .to_csc()
+            .expect("csc");
+        assert!(matches!(
+            factorized(&singular),
+            Err(SparseError::SingularMatrix { .. })
+        ));
+        let rectangular = csr(&[vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]])
+            .to_csc()
+            .expect("csc");
+        assert!(matches!(
+            factorized(&rectangular),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        let one = csr(&[vec![4.0]]).to_csc().expect("csc");
+        assert_eq!(
+            factorized(&one).expect("1x1").solve(&[2.0]).expect("solve"),
+            vec![0.5]
+        );
+    }
+
+    #[test]
+    fn inv_keeps_the_format_and_inverts() {
+        for n in [1, 5, 300] {
+            let a = tridiagonal(n);
+            let inverse_csr: CsrMatrix = inv(&a).expect("inv csr");
+            let inverse_csc: CscMatrix = inv(&a.to_csc().expect("csc")).expect("inv csc");
+            let dense_a = LinearOperator::to_dense(&a).expect("dense");
+            let dense_inv = dense_of_csc(&inverse_csc);
+            assert_eq!(
+                LinearOperator::to_dense(&inverse_csr).expect("dense"),
+                dense_inv
+            );
+            for i in 0..n {
+                for j in 0..n {
+                    let product: f64 = (0..n).map(|k| dense_a[i][k] * dense_inv[k][j]).sum();
+                    let want = if i == j { 1.0 } else { 0.0 };
+                    assert!((product - want).abs() < 1e-12, "({i},{j}) {product}");
+                }
+            }
+        }
+        // Exact zeros of the inverse are not stored.
+        let diagonal = csr(&[
+            vec![2.0, 0.0, 0.0],
+            vec![0.0, 4.0, 0.0],
+            vec![0.0, 0.0, -8.0],
+        ]);
+        let inverse = inv(&diagonal).expect("inv");
+        assert_eq!(inverse.nnz(), 3);
+        assert_eq!(inverse.data(), &[0.5, 0.25, -0.125]);
+        // Sparse arrays come back as arrays.
+        let array = crate::formats::SparseArray2D::new(diagonal);
+        let inverse_array = inv(&array).expect("inv array");
+        assert_eq!(inverse_array.as_matrix().data(), &[0.5, 0.25, -0.125]);
+    }
+
+    #[test]
+    fn inv_refuses_singular_rectangular_and_empty() {
+        assert!(matches!(
+            inv(&csr(&[vec![1.0, 2.0], vec![2.0, 4.0]])),
+            Err(SparseError::SingularMatrix { .. })
+        ));
+        assert!(matches!(
+            inv(&csr(&[vec![1.0, 2.0, 3.0]])),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        let empty = CsrMatrix::from_components(Shape2D::new(0, 0), vec![], vec![], vec![0], true)
+            .expect("0x0");
+        assert!(matches!(inv(&empty), Err(SparseError::InvalidShape { .. })));
+    }
+
+    #[test]
+    fn laplacian_nd_reproduces_scipys_small_cases() {
+        // Values observed from SciPy 1.17.1.
+        let periodic3 = LaplacianNd::new(&[3], LaplacianBoundary::Periodic).expect("new");
+        assert_eq!(
+            periodic3.toarray(),
+            vec![
+                vec![-2.0, 1.0, 1.0],
+                vec![1.0, -2.0, 1.0],
+                vec![1.0, 1.0, -2.0]
+            ]
+        );
+        let periodic2 = LaplacianNd::new(&[2], LaplacianBoundary::Periodic).expect("new");
+        assert_eq!(periodic2.toarray(), vec![vec![-2.0, 2.0], vec![2.0, -2.0]]);
+        assert_eq!(
+            periodic2.matvec(&[1.0, 2.0]).expect("matvec"),
+            vec![2.0, -2.0]
+        );
+        // A length-1 Neumann axis: toarray puts −1 on the diagonal, matvec contributes 0.
+        let quirk = LaplacianNd::new(&[1, 2], LaplacianBoundary::Neumann).expect("new");
+        assert_eq!(quirk.toarray(), vec![vec![-2.0, 1.0], vec![1.0, -2.0]]);
+        assert_eq!(quirk.matvec(&[1.0, 2.0]).expect("matvec"), vec![1.0, -1.0]);
+        // SciPy's repr is exactly this: −4·sin²(π/4) rounds to 1 ulp above −2.
+        assert_eq!(quirk.eigenvalues(None), vec![-1.999_999_999_999_999_6, 0.0]);
+        // eigenvalues(m) truncates the grid to min(grid_shape, (m, m)) lexicographically.
+        let close = |got: Vec<f64>, want: &[f64]| {
+            assert_eq!(got.len(), want.len(), "{got:?}");
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-8, "{got:?} vs {want:?}");
+            }
+        };
+        let neumann65 = LaplacianNd::new(&[6, 5], LaplacianBoundary::Neumann).expect("new");
+        close(
+            neumann65.eigenvalues(Some(3)),
+            &[-0.38196601, -0.26794919, 0.0],
+        );
+        let neumann25 = LaplacianNd::new(&[2, 5], LaplacianBoundary::Neumann).expect("new");
+        close(
+            neumann25.eigenvalues(Some(3)),
+            &[-1.38196601, -0.38196601, 0.0],
+        );
+        assert!(neumann65.eigenvalues(Some(0)).is_empty());
+    }
+
+    #[test]
+    fn laplacian_nd_spectrum_matvec_and_matrix_agree() {
+        for boundary in [
+            LaplacianBoundary::Dirichlet,
+            LaplacianBoundary::Neumann,
+            LaplacianBoundary::Periodic,
+        ] {
+            let lap = LaplacianNd::new(&[3, 4, 2], boundary).expect("new");
+            let n = 24;
+            assert_eq!(lap.shape(), Shape2D::new(n, n));
+            let dense = lap.toarray();
+            let sparse = LinearOperator::to_dense(&lap.tosparse().expect("sparse")).expect("d");
+            assert_eq!(dense, sparse, "{boundary:?}");
+            let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.77).cos()).collect();
+            let via_matvec = lap.matvec(&x).expect("matvec");
+            for (i, row) in dense.iter().enumerate() {
+                let want: f64 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+                assert!((via_matvec[i] - want).abs() < 1e-12, "{boundary:?} row {i}");
+            }
+            let values = lap.eigenvalues(None);
+            let vectors = lap.eigenvectors(None);
+            assert_eq!(values.len(), n);
+            assert!(values.windows(2).all(|w| w[0] <= w[1]));
+            for (lambda, v) in values.iter().zip(&vectors) {
+                assert!((vec_norm(v) - 1.0).abs() < 1e-12);
+                let av = lap.matvec(v).expect("matvec");
+                let residual: f64 = av
+                    .iter()
+                    .zip(v)
+                    .map(|(a, b)| (a - lambda * b).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    residual < 1e-12,
+                    "{boundary:?} λ={lambda} residual {residual:e}"
+                );
+            }
+            let top = lap.eigenvectors(Some(4));
+            assert_eq!(top.len(), 4);
+            assert_eq!(lap.eigenvalues(Some(4)), values[n - 4..].to_vec());
+        }
+    }
+
+    #[test]
+    fn laplacian_nd_is_solvable_matrix_free() {
+        // −L with Dirichlet conditions is SPD: CG and MINRES solve it without materializing.
+        let lap = LaplacianNd::new(&[12, 10], LaplacianBoundary::Dirichlet).expect("new");
+        let negated = ScaledOperator::new(&lap, -1.0);
+        let b: Vec<f64> = (0..120).map(|i| 1.0 + (i % 7) as f64).collect();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            ..IterativeSolveOptions::default()
+        };
+        for result in [
+            cg(&negated, &b, None, options).expect("cg"),
+            minres(&negated, &b, None, options).expect("minres"),
+        ] {
+            assert!(result.converged);
+            let ax = negated.matvec(&result.solution).expect("matvec");
+            assert!(vec_norm_diff(&ax, &b) / vec_norm(&b) <= 1e-10);
+        }
+        // The smallest-magnitude eigenvalues via eigsh match the closed form.
+        let found = eigsh(
+            &negated,
+            3,
+            EigsOptions {
+                which: EigsWhich::SmallestAlgebraic,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("eigsh");
+        let mut want: Vec<f64> = lap.eigenvalues(Some(3)).iter().map(|v| -v).collect();
+        want.sort_by(f64::total_cmp);
+        for (got, w) in found.eigenvalues.iter().zip(&want) {
+            assert!((got - w).abs() < 1e-10, "{got} vs {w}");
+        }
+    }
+
+    #[test]
+    fn laplacian_nd_refuses_degenerate_grids_and_unknown_conditions() {
+        assert!(matches!(
+            LaplacianNd::new(&[], LaplacianBoundary::Neumann),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            LaplacianNd::new(&[3, 0], LaplacianBoundary::Neumann),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            "robin".parse::<LaplacianBoundary>(),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+        assert_eq!(
+            "periodic".parse::<LaplacianBoundary>().expect("parse"),
+            LaplacianBoundary::Periodic
+        );
+        assert_eq!(LaplacianBoundary::default(), LaplacianBoundary::Neumann);
+        let lap = LaplacianNd::new(&[2, 2], LaplacianBoundary::Dirichlet).expect("new");
+        assert!(matches!(
+            lap.matvec(&[1.0; 3]),
+            Err(SparseError::IncompatibleShape { .. })
         ));
     }
 }
