@@ -7,6 +7,7 @@ pub mod audit;
 mod bfgs;
 pub mod bracket;
 pub mod chandrupatla;
+mod cobyla;
 pub mod curvefit;
 pub mod direct;
 mod gsa;
@@ -16,6 +17,7 @@ pub mod linesearch;
 mod linprog;
 pub mod minimize;
 pub mod nonlin;
+mod npx;
 pub mod root;
 mod slsqp;
 mod trf;
@@ -27,6 +29,10 @@ pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
 pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
+};
+pub use cobyla::{
+    CONSTRMAX as COBYLA_NAN_VIOLATION, CobylaInfo, FminCobylaOptions, cobyla, fmin_cobyla,
+    minimize_cobyla,
 };
 pub use direct::{DirectOptions, DirectResult, direct, direct_with_callback};
 pub use lbfgs_inv_hess::LbfgsInvHessProduct;
@@ -85,10 +91,10 @@ pub use root::{
     root_many, root_scalar, secant, secant_many, toms748,
 };
 pub use types::{
-    Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintType, ConvergenceStatus,
-    GradientFunc, HessFunc, HessInv, HesspFunc, LinearConstraint, MinimizeMethodOptions,
-    MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, OptimizeResult, RootMethod,
-    RootOptions,
+    Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintOrigin, ConstraintType,
+    ConvergenceStatus, GradientFunc, HessFunc, HessInv, HesspFunc, LinearConstraint,
+    MinimizeMethodOptions, MinimizeOptions, NewConstraint, NonlinearConstraint, OptError,
+    OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
 };
 
 // SciPy's `OptimizeWarning` is `WarningCategory::OptimizeWarning` (raised by `curve_fit` when
@@ -2532,164 +2538,6 @@ impl gsa::Uniform for SimpleRng {
     }
 }
 
-/// The violation `cobyla` charges a constraint that evaluates to NaN: the maxcv SciPy's
-/// COBYLA reports for one.
-pub const COBYLA_NAN_VIOLATION: f64 = 1e30;
-
-/// The violation of `constraint >= 0` for a value `cv`, ignoring shortfalls within `slack`.
-/// NaN is `COBYLA_NAN_VIOLATION`: `(-cv).max(0.0)` would make it 0, so a constraint that
-/// had gone NaN read as satisfied and the final point was reported feasible.
-fn cobyla_violation(cv: f64, slack: f64) -> f64 {
-    if cv.is_nan() {
-        COBYLA_NAN_VIOLATION
-    } else if cv < -slack {
-        -cv
-    } else {
-        0.0
-    }
-}
-
-/// Derivative-free constrained minimization under SciPy's COBYLA name.
-///
-/// Minimizes `func(x)` subject to `constraints[i](x) >= 0` for all i.
-///
-/// NOT Powell's COBYLA (no linear-interpolation models): this is a coordinate
-/// compass search on the penalty `f + 1000 * violation`, halving the step `rho`
-/// when no coordinate move improves it. It shares the signature of
-/// `scipy.optimize.fmin_cobyla` but not its iterates or results; a real COBYLA is
-/// tracked separately. `success` is true only when the step contracted below
-/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`); a
-/// constraint that evaluates to NaN counts as violated by `COBYLA_NAN_VIOLATION`.
-pub fn cobyla<F, G>(
-    func: F,
-    x0: &[f64],
-    constraints: &[G],
-    maxiter: usize,
-    rhobeg: f64,
-) -> Result<OptimizeResult, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: Fn(&[f64]) -> f64,
-{
-    let n = x0.len();
-    if n == 0 {
-        return Err(OptError::InvalidArgument {
-            detail: "x0 must be non-empty".to_string(),
-        });
-    }
-    if x0.iter().any(|v| !v.is_finite()) {
-        return Err(OptError::NonFiniteInput {
-            detail: "x0 must be finite".to_string(),
-        });
-    }
-    if maxiter == 0 {
-        return Err(OptError::InvalidArgument {
-            detail: "maxiter must be greater than zero".to_string(),
-        });
-    }
-    if !rhobeg.is_finite() || rhobeg <= 0.0 {
-        return Err(OptError::InvalidArgument {
-            detail: "rhobeg must be a positive finite value".to_string(),
-        });
-    }
-
-    let mut x = x0.to_vec();
-    let mut f_best = func(&x);
-    let mut nfev = 1usize;
-    let mut rho = rhobeg;
-    let mut iterations = 0usize;
-    let mut contracted = false;
-
-    for _iteration in 0..maxiter {
-        iterations += 1;
-        // Check constraints
-        let mut max_violation = 0.0_f64;
-        for constraint in constraints {
-            max_violation = max_violation.max(cobyla_violation(constraint(&x), 0.0));
-        }
-
-        // Try coordinate-wise descent with constraint penalty
-        let mut improved = false;
-        for d in 0..n {
-            for &direction in &[rho, -rho] {
-                let mut x_trial = x.clone();
-                x_trial[d] += direction;
-
-                let f_trial = func(&x_trial);
-                nfev += 1;
-
-                // Check all constraints
-                let mut trial_violation = 0.0;
-                for constraint in constraints {
-                    trial_violation += cobyla_violation(constraint(&x_trial), 1e-10);
-                }
-
-                // Accept if: (feasible and better) or (less infeasible)
-                let current_penalty = f_best + 1000.0 * max_violation;
-                let trial_penalty = f_trial + 1000.0 * trial_violation;
-
-                if trial_penalty < current_penalty - 1e-12 {
-                    x = x_trial;
-                    f_best = f_trial;
-                    max_violation = trial_violation;
-                    improved = true;
-                }
-            }
-        }
-
-        // Shrink trust region if no improvement
-        if !improved {
-            rho *= 0.5;
-            if rho < 1e-12 {
-                contracted = true;
-                break;
-            }
-        }
-    }
-
-    // br-szq1n.7: this used to report `success: true`, `nit = maxiter` and no
-    // `maxcv` whatever happened -- including an infeasible final point or an
-    // exhausted iteration budget.
-    let maxcv = constraints
-        .iter()
-        .map(|constraint| cobyla_violation(constraint(&x), 0.0))
-        .fold(0.0_f64, f64::max);
-    let (success, status, message) = if maxcv > 1.0e-8 {
-        (
-            false,
-            ConvergenceStatus::Infeasible,
-            format!("did not converge to a point satisfying the constraints (maxcv = {maxcv:.3e})"),
-        )
-    } else if contracted {
-        (
-            true,
-            ConvergenceStatus::Success,
-            "step size contracted below 1e-12 at a feasible point".to_string(),
-        )
-    } else {
-        (
-            false,
-            ConvergenceStatus::MaxIterations,
-            format!("maximum number of iterations ({maxiter}) reached"),
-        )
-    };
-
-    Ok(OptimizeResult {
-        x,
-        fun: Some(f_best),
-        nit: iterations,
-        nfev,
-        njev: 0,
-        nhev: 0,
-        success,
-        status,
-        message,
-        jac: None,
-        hess_inv: None,
-        maxcv: Some(maxcv),
-    })
-}
-
 // ══════════════════════════════════════════════════════════════════════
 // Constrained Optimization via Augmented Lagrangian
 // ══════════════════════════════════════════════════════════════════════
@@ -3247,26 +3095,6 @@ where
     F: Fn(&[f64]) -> f64,
 {
     fmin_with_method(func, x0, OptimizeMethod::NewtonCg)
-}
-
-/// Minimize a function subject to inequality constraints `c(x) >= 0`.
-///
-/// Takes the arguments of `scipy.optimize.fmin_cobyla(func, x0, cons, rhobeg, maxfun)` and
-/// returns the minimiser `xopt`, but the search is [`cobyla`]'s coordinate compass search on
-/// a penalty, not Powell's COBYLA, so iterates and results differ from SciPy's. Use
-/// [`cobyla`] for the full result.
-pub fn fmin_cobyla<F, G>(
-    func: F,
-    x0: &[f64],
-    constraints: &[G],
-    rhobeg: f64,
-    maxfun: usize,
-) -> Result<Vec<f64>, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: Fn(&[f64]) -> f64,
-{
-    cobyla(func, x0, constraints, maxfun, rhobeg).map(|result| result.x)
 }
 
 /// Squared Euclidean norm of a residual vector.
@@ -6359,18 +6187,26 @@ mod tests {
 
     #[test]
     fn fmin_cobyla_reaches_constrained_minimum() {
-        use crate::fmin_cobyla;
+        use crate::{FminCobylaOptions, fmin_cobyla};
         // min x0^2 + x1^2 s.t. x0 >= 1; scipy fmin_cobyla -> ~(1, 0).
         let f = |x: &[f64]| x[0] * x[0] + x[1] * x[1];
         let cons: Vec<fn(&[f64]) -> f64> = vec![|x: &[f64]| x[0] - 1.0];
-        let xopt = fmin_cobyla(f, &[3.0, 2.0], &cons, 1.0, 2000).expect("fmin_cobyla");
+        let opts = FminCobylaOptions {
+            maxfun: 2000,
+            ..FminCobylaOptions::default()
+        };
+        let xopt = fmin_cobyla(f, &[3.0, 2.0], &cons, opts).expect("fmin_cobyla");
         assert!((xopt[0] - 1.0).abs() < 1e-3, "x0 = {}", xopt[0]);
         assert!(xopt[1].abs() < 1e-3, "x1 = {}", xopt[1]);
-        assert!(cobyla(f, &[], &cons, 10, 1.0).is_err());
-        assert!(cobyla(f, &[f64::NAN, 2.0], &cons, 10, 1.0).is_err());
-        assert!(cobyla(f, &[3.0, 2.0], &cons, 0, 1.0).is_err());
-        assert!(cobyla(f, &[3.0, 2.0], &cons, 10, 0.0).is_err());
-        assert!(fmin_cobyla(f, &[3.0, 2.0], &cons, f64::INFINITY, 10).is_err());
+        assert!(cobyla(f, &[], &cons, opts).is_err());
+        assert!(cobyla(f, &[f64::NAN, 2.0], &cons, opts).is_err());
+        let no_budget = FminCobylaOptions { maxfun: 0, ..opts };
+        assert!(cobyla(f, &[3.0, 2.0], &cons, no_budget).is_err());
+        let bad_rhoend = FminCobylaOptions {
+            rhoend: f64::INFINITY,
+            ..opts
+        };
+        assert!(fmin_cobyla(f, &[3.0, 2.0], &cons, bad_rhoend).is_err());
     }
 
     #[test]
@@ -8339,110 +8175,6 @@ mod tests {
     fn shgo_rejects_invalid_bounds() {
         let err = shgo(|_| 0.0, &[(1.0, 1.0)]).expect_err("invalid bounds");
         assert!(matches!(err, crate::OptError::InvalidBounds { .. }));
-    }
-
-    // ── COBYLA tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn cobyla_counts_a_nan_constraint_as_violated() {
-        // SciPy: minimize(f, [0, 0], method="COBYLA", constraints=[{"type": "ineq",
-        // "fun": lambda x: nan}]) reports success=False with maxcv 1e30. Here the NaN used to
-        // clamp to a violation of 0 and the result read as a feasible success.
-        let f = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2);
-        let nan_constraint = [|_: &[f64]| f64::NAN];
-        let result = cobyla(f, &[0.0, 0.0], &nan_constraint, 500, 0.5).expect("cobyla");
-        assert!(!result.success, "{result:?}");
-        assert_eq!(result.status, ConvergenceStatus::Infeasible);
-        assert!(result.message.contains("1.000e30"), "{}", result.message);
-        // The same problem with a satisfiable constraint still succeeds.
-        let x_below_2 = [|x: &[f64]| 2.0 - x[0]];
-        let ok = cobyla(f, &[0.0, 0.0], &x_below_2, 5000, 0.5).expect("cobyla");
-        assert!(ok.success, "{ok:?}");
-    }
-
-    #[test]
-    fn cobyla_unconstrained_quadratic() {
-        // Minimize x² + y² → (0, 0)
-        let result = cobyla(
-            |x| x[0] * x[0] + x[1] * x[1],
-            &[1.0, 1.0],
-            &[] as &[fn(&[f64]) -> f64],
-            1000,
-            0.5,
-        )
-        .expect("cobyla");
-        assert!(
-            result.fun.unwrap() < 0.01,
-            "cobyla should minimize: {}",
-            result.fun.unwrap()
-        );
-    }
-
-    // br-szq1n.7: the status must describe what happened; it used to be a literal
-    // success with nit = maxiter and no maxcv.
-    #[test]
-    fn cobyla_status_is_honest() {
-        type ConstraintFn = dyn Fn(&[f64]) -> f64;
-        // x >= 1 and x <= 0 cannot both hold.
-        let contradictory: Vec<Box<ConstraintFn>> = vec![
-            Box::new(|x: &[f64]| x[0] - 1.0),
-            Box::new(|x: &[f64]| -x[0]),
-        ];
-        let refs: Vec<&ConstraintFn> = contradictory.iter().map(|b| b.as_ref()).collect();
-        let infeasible = cobyla(|x| x[0] * x[0], &[0.5], &refs, 500, 0.5).expect("runs");
-        assert!(!infeasible.success);
-        assert_eq!(infeasible.status, ConvergenceStatus::Infeasible);
-        assert!(infeasible.maxcv.expect("maxcv reported") > 1e-8);
-
-        // One iteration cannot contract rho from 0.5 below 1e-12.
-        let starved = cobyla(
-            |x| (x[0] - 3.0).powi(2),
-            &[0.0],
-            &[] as &[fn(&[f64]) -> f64],
-            1,
-            0.5,
-        )
-        .expect("runs");
-        assert!(!starved.success);
-        assert_eq!(starved.status, ConvergenceStatus::MaxIterations);
-        assert_eq!(starved.nit, 1);
-
-        // Positive arm: feasible, contracted.
-        let ok = cobyla(
-            |x| (x[0] - 3.0).powi(2),
-            &[0.0],
-            &[] as &[fn(&[f64]) -> f64],
-            5000,
-            0.5,
-        )
-        .expect("runs");
-        assert!(ok.success, "{}", ok.message);
-        assert_eq!(ok.status, ConvergenceStatus::Success);
-        assert!(ok.nit < 5000);
-        assert!((ok.x[0] - 3.0).abs() < 1e-6, "x = {:?}", ok.x);
-    }
-
-    #[test]
-    fn cobyla_with_constraint() {
-        // Minimize x + y subject to x + y >= 1
-        // Solution: x + y = 1 (constraint active), e.g. (0.5, 0.5)
-        type ConstraintFn = dyn Fn(&[f64]) -> f64;
-        let constraints: Vec<Box<ConstraintFn>> = vec![
-            Box::new(|x: &[f64]| x[0] + x[1] - 1.0), // x + y >= 1
-        ];
-        let constraint_fns: Vec<&ConstraintFn> = constraints.iter().map(|b| b.as_ref()).collect();
-        let result = cobyla(|x| x[0] + x[1], &[2.0, 2.0], &constraint_fns, 1000, 0.5)
-            .expect("cobyla constrained");
-        // x + y should be approximately 1
-        let sum = result.x[0] + result.x[1];
-        assert!((sum - 1.0).abs() < 0.1, "x+y should be ~1: {sum}");
-    }
-
-    #[test]
-    fn cobyla_empty_x0_rejected() {
-        let err = cobyla(|_: &[f64]| 0.0, &[], &[] as &[fn(&[f64]) -> f64], 100, 0.5)
-            .expect_err("empty x0");
-        assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
     }
 
     // ── Rosenbrock test function tests ──────────────────────────────

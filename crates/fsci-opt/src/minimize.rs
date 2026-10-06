@@ -165,12 +165,12 @@ where
     if !options.constraints.is_empty()
         && !matches!(
             selected_method,
-            OptimizeMethod::Slsqp | OptimizeMethod::TrustConstr
+            OptimizeMethod::Slsqp | OptimizeMethod::TrustConstr | OptimizeMethod::Cobyla
         )
     {
         return Err(OptError::InvalidArgument {
             detail: format!(
-                "method {selected_method:?} cannot handle constraints; use SLSQP or TrustConstr"
+                "method {selected_method:?} cannot handle constraints; use SLSQP, TrustConstr or COBYLA"
             ),
         });
     }
@@ -188,6 +188,7 @@ where
         OptimizeMethod::Tnc => tnc(&fun, x0, options),
         OptimizeMethod::Slsqp => slsqp(&fun, x0, options),
         OptimizeMethod::TrustConstr => trust_constr(&fun, x0, options),
+        OptimizeMethod::Cobyla => crate::cobyla::minimize_cobyla(&fun, x0, options),
     }
 }
 
@@ -3273,7 +3274,7 @@ fn result_from_error(
     }
 }
 
-fn validate_minimize_options(options: MinimizeOptions) -> Result<(), OptError> {
+pub(crate) fn validate_minimize_options(options: MinimizeOptions) -> Result<(), OptError> {
     if let Some(maxiter) = options.maxiter
         && maxiter == 0
     {
@@ -3326,6 +3327,7 @@ fn accepted_method_options(method: OptimizeMethod) -> &'static [&'static str] {
             "finite_diff_rel_step",
             "sparse_jacobian",
         ],
+        OptimizeMethod::Cobyla => &["rhobeg", "catol", "f_target"],
         _ => &[],
     }
 }
@@ -3370,6 +3372,9 @@ fn set_method_options(options: &MinimizeMethodOptions<'_>) -> Vec<&'static str> 
             options.finite_diff_rel_step.is_some(),
         ),
         ("sparse_jacobian", options.sparse_jacobian.is_some()),
+        ("rhobeg", options.rhobeg.is_some()),
+        ("catol", options.catol.is_some()),
+        ("f_target", options.f_target.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))
@@ -3381,7 +3386,10 @@ fn set_method_options(options: &MinimizeMethodOptions<'_>) -> Vec<&'static str> 
 /// which then proceeds: Strict does the same and records it in the optimize trace; Hardened
 /// refuses it. The values SciPy itself refuses (`0 < c1 < c2 < 1`, `maxls` and `maxcor` at
 /// least 1) are refused in both modes.
-fn check_method_options(method: OptimizeMethod, options: MinimizeOptions) -> Result<(), OptError> {
+pub(crate) fn check_method_options(
+    method: OptimizeMethod,
+    options: MinimizeOptions,
+) -> Result<(), OptError> {
     let method_options = options.method_options;
     let accepted = accepted_method_options(method);
     let unknown: Vec<&str> = set_method_options(&method_options)
@@ -3474,7 +3482,23 @@ pub(crate) fn check_trust_constr_options(options: MinimizeOptions) -> Result<(),
     report_unknown_options(OptimizeMethod::TrustConstr, options, &unknown)
 }
 
-fn validate_bounds_for_x0(x0: &[f64], bounds: Option<&[Bound]>) -> Result<(), OptError> {
+/// The option checks of [`crate::minimize_cobyla`]. SciPy's COBYLA takes neither `maxfev` nor
+/// `eps` (its evaluation budget is `maxiter`), so `options.maxfev` and `options.gradient_eps`
+/// are unknown options there.
+pub(crate) fn check_cobyla_options(options: MinimizeOptions) -> Result<(), OptError> {
+    validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::Cobyla, options)?;
+    let mut unknown = Vec::new();
+    if options.maxfev.is_some() {
+        unknown.push("maxfev");
+    }
+    if options.gradient_eps.is_some() {
+        unknown.push("eps");
+    }
+    report_unknown_options(OptimizeMethod::Cobyla, options, &unknown)
+}
+
+pub(crate) fn validate_bounds_for_x0(x0: &[f64], bounds: Option<&[Bound]>) -> Result<(), OptError> {
     let Some(bounds) = bounds else {
         return Ok(());
     };
@@ -3545,7 +3569,7 @@ fn log_iteration(
     push_trace(trace);
 }
 
-fn log_completion(
+pub(crate) fn log_completion(
     method: OptimizeMethod,
     options: MinimizeOptions,
     iter_num: usize,
@@ -3595,7 +3619,7 @@ fn trace_log() -> &'static Mutex<Vec<OptimizeTraceEntry>> {
     TRACE_LOG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn push_trace(entry: OptimizeTraceEntry) {
+pub(crate) fn push_trace(entry: OptimizeTraceEntry) {
     // Resolves [frankenscipy-be4cw] (deferred from kt4od): the previous
     // `if let Ok(mut guard) = trace_log().lock()` pattern silently
     // dropped trace entries on poisoned mutexes. Recover from poison so
@@ -3611,7 +3635,7 @@ fn push_trace(entry: OptimizeTraceEntry) {
     guard.push(entry);
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)

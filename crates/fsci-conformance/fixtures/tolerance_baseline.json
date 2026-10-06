@@ -506,6 +506,10 @@
   },
   "diff_opt_casp_problem_constructors.rs": {},
   "diff_opt_cobyla.rs": {},
+  "diff_opt_cobyla_minimize.rs": {
+    "FUN_REL_TOL": 0.0001,
+    "X_REL_TOL": 0.001
+  },
   "diff_opt_curve_fit.rs": {
     "ABS_TOL": 1e-6
   },

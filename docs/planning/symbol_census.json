@@ -545,13 +545,13 @@
   },
   "scipy.optimize": {
    "applicable": 70,
-   "compared": 28,
+   "compared": 29,
    "crate": "fsci-opt",
    "declared": 68,
    "matched_by": {
     "case_fold": 1,
-    "exact": 62,
-    "reexport": 3,
+    "exact": 61,
+    "reexport": 4,
     "trait": 1,
     "type_alias": 1
    },
@@ -584,7 +584,6 @@
     "fmin",
     "fmin_bfgs",
     "fmin_cg",
-    "fmin_cobyla",
     "fmin_l_bfgs_b",
     "fmin_ncg",
     "fmin_powell",
@@ -1309,12 +1308,12 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1539,
-  "compared": 890,
+  "compared": 891,
   "declared": 1495,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1290,
-   "reexport": 12,
+   "exact": 1289,
+   "reexport": 13,
    "trait": 2,
    "type_alias": 60
   },

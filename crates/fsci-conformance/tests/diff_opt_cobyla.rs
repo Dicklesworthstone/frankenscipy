@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::cobyla;
+use fsci_opt::{FminCobylaOptions, cobyla};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -70,7 +70,12 @@ fn diff_opt_cobyla() {
     // Analytical solution: (0.5, 0.5), f* = 0.5.
     let f1 = |x: &[f64]| x[0] * x[0] + x[1] * x[1];
     let c1: [fn(&[f64]) -> f64; 1] = [|x: &[f64]| x[0] + x[1] - 1.0];
-    let res1 = cobyla(f1, &[0.0_f64, 0.0], &c1, 500, 0.5).ok();
+    let opts = FminCobylaOptions {
+        rhobeg: 0.5,
+        maxfun: 500,
+        ..FminCobylaOptions::default()
+    };
+    let res1 = cobyla(f1, &[0.0_f64, 0.0], &c1, opts).ok();
     if let Some((f_star1, f_at1)) =
         ledger.pair("cobyla", "cobyla_linear", Some(0.5), res1.map(|r| f1(&r.x)))
     {
@@ -88,7 +93,7 @@ fn diff_opt_cobyla() {
     // Analytical: (2, 1), f* = 0
     let f2 = |x: &[f64]| (x[0] - 2.0).powi(2) + (x[1] - 1.0).powi(2);
     let c2: [fn(&[f64]) -> f64; 2] = [|x: &[f64]| x[0], |x: &[f64]| x[1]];
-    let res2 = cobyla(f2, &[1.0_f64, 0.5], &c2, 500, 0.5).ok();
+    let res2 = cobyla(f2, &[1.0_f64, 0.5], &c2, opts).ok();
     if let Some((f_star2, f_at2)) = ledger.pair(
         "cobyla",
         "cobyla_two_pos",

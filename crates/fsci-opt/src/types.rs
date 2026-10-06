@@ -22,6 +22,9 @@ pub enum OptimizeMethod {
     Tnc,
     Slsqp,
     TrustConstr,
+    /// SciPy `COBYLA`: Powell's derivative-free linear-approximation method (PRIMA), honouring
+    /// bounds and equality/inequality constraints.
+    Cobyla,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +228,14 @@ pub struct MinimizeMethodOptions<'a> {
     /// `None` keeps each one's format (the bounds' Jacobian is sparse when nothing else
     /// decides).
     pub sparse_jacobian: Option<bool>,
+    /// COBYLA: the initial trust-region radius, a reasonable first change to the variables
+    /// (default 1.0).
+    pub rhobeg: Option<f64>,
+    /// COBYLA: the absolute tolerance on the constraint violation for `success`
+    /// (default √ε ≈ 1.49e-8).
+    pub catol: Option<f64>,
+    /// COBYLA: stop once a feasible point with `f <= f_target` is found (default −∞).
+    pub f_target: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -631,10 +642,30 @@ pub type ConstraintJacFn<'a> = Box<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync
 ///
 /// `LinearConstraint` and `NonlinearConstraint` convert with [`Constraint::from_linear`] and
 /// [`Constraint::from_nonlinear`], exactly as SciPy's `new_constraint_to_old` does for SLSQP.
+/// The converted constraints remember the object they came from ([`Constraint::origin`]):
+/// COBYLA, like SciPy's, takes the original `LinearConstraint` / `NonlinearConstraint`.
 pub struct Constraint<'a> {
     pub kind: ConstraintType,
     pub fun: ConstraintFn<'a>,
     pub jac: Option<ConstraintJacFn<'a>>,
+    /// The new-style constraint this one was converted from, if any (`None` for a dict).
+    pub origin: Option<ConstraintOrigin<'a>>,
+}
+
+/// A SciPy new-style constraint object.
+#[derive(Debug, Clone, Copy)]
+pub enum NewConstraint<'a> {
+    Linear(&'a LinearConstraint),
+    Nonlinear(&'a NonlinearConstraint),
+}
+
+/// Which `LinearConstraint` / `NonlinearConstraint` a converted [`Constraint`] came from, and
+/// which piece of the conversion it is: `new_constraint_to_old` splits one object into an
+/// equality constraint and an inequality constraint, numbered 0 and 1 in the order produced.
+#[derive(Debug, Clone, Copy)]
+pub struct ConstraintOrigin<'a> {
+    pub object: NewConstraint<'a>,
+    pub piece: usize,
 }
 
 impl<'a> Constraint<'a> {
@@ -644,6 +675,7 @@ impl<'a> Constraint<'a> {
             kind: ConstraintType::Eq,
             fun: Box::new(fun),
             jac: None,
+            origin: None,
         }
     }
 
@@ -653,6 +685,7 @@ impl<'a> Constraint<'a> {
             kind: ConstraintType::Ineq,
             fun: Box::new(fun),
             jac: None,
+            origin: None,
         }
     }
 
@@ -676,7 +709,13 @@ impl<'a> Constraint<'a> {
                 .collect()
         };
         let jac = |_: &[f64]| con.a.clone();
-        split_constraint(&con.lb, &con.ub, rows, Some(jac))
+        split_constraint(
+            &con.lb,
+            &con.ub,
+            rows,
+            Some(jac),
+            NewConstraint::Linear(con),
+        )
     }
 
     /// SciPy `new_constraint_to_old` for `NonlinearConstraint(fun, lb, ub)` (finite-difference
@@ -684,12 +723,25 @@ impl<'a> Constraint<'a> {
     #[must_use]
     pub fn from_nonlinear(con: &'a NonlinearConstraint) -> Vec<Self> {
         let fun = con.fun;
-        split_constraint(&con.lb, &con.ub, fun, None::<fn(&[f64]) -> Vec<Vec<f64>>>)
+        split_constraint(
+            &con.lb,
+            &con.ub,
+            fun,
+            None::<fn(&[f64]) -> Vec<Vec<f64>>>,
+            NewConstraint::Nonlinear(con),
+        )
     }
 }
 
-/// Split `lb <= fun(x) <= ub` into SciPy's old-style equality and inequality constraints.
-fn split_constraint<'a, F, J>(lb: &[f64], ub: &[f64], fun: F, jac: Option<J>) -> Vec<Constraint<'a>>
+/// Split `lb <= fun(x) <= ub` into SciPy's old-style equality and inequality constraints, each
+/// remembering `object` as its origin.
+fn split_constraint<'a, F, J>(
+    lb: &[f64],
+    ub: &[f64],
+    fun: F,
+    jac: Option<J>,
+    object: NewConstraint<'a>,
+) -> Vec<Constraint<'a>>
 where
     F: Fn(&[f64]) -> Vec<f64> + Clone + Send + Sync + 'a,
     J: Fn(&[f64]) -> Vec<Vec<f64>> + Clone + Send + Sync + 'a,
@@ -712,6 +764,7 @@ where
                 rows.iter().map(|&i| y[i] - lo[i]).collect()
             }),
             jac: None,
+            origin: Some(ConstraintOrigin { object, piece: 0 }),
         };
         if let Some(j) = jac.clone() {
             let rows = eq_rows;
@@ -725,6 +778,7 @@ where
     if !below.is_empty() || !above.is_empty() {
         let (lo, hi) = (lb.to_vec(), ub.to_vec());
         let (b1, a1) = (below.clone(), above.clone());
+        let piece = out.len();
         let mut c = Constraint {
             kind: ConstraintType::Ineq,
             fun: Box::new(move |x: &[f64]| {
@@ -735,6 +789,7 @@ where
                     .collect()
             }),
             jac: None,
+            origin: Some(ConstraintOrigin { object, piece }),
         };
         if let Some(j) = jac {
             c.jac = Some(Box::new(move |x: &[f64]| {
@@ -761,6 +816,7 @@ impl std::fmt::Debug for Constraint<'_> {
             .field("kind", &self.kind)
             .field("fun", &"<function>")
             .field("jac", &self.jac.as_ref().map(|_| "<function>"))
+            .field("origin", &self.origin)
             .finish()
     }
 }

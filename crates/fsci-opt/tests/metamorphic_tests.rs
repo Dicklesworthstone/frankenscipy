@@ -7,14 +7,15 @@
 //! Run with: `cargo test -p fsci-opt --test metamorphic_tests`
 
 use fsci_opt::{
-    BasinhoppingOptions, CurveFitOptions, DifferentialEvolutionOptions, LeastSquaresOptions,
-    LinprogOptions, MinimizeOptions, MinimizeScalarOptions, RootOptions, approx_fprime,
-    basinhopping, bisect, bracket, brent_minimize, brenth, brentq, brute, check_grad, cobyla,
-    curve_fit, differential_evolution, dual_annealing, fixed_point, fsolve, golden,
-    gradient_descent, halley, isotonic_regression, least_squares, linear_sum_assignment, linprog,
-    minimize, minimize_scalar, minimize_scalar_bounded, minimize_trisection, newton_scalar, nnls,
-    numerical_gradient, numerical_hessian, numerical_jacobian, projected_gradient_descent, pso,
-    ridder, rosen, rosen_der, rosen_hess, rosen_hess_prod, secant, shgo, toms748,
+    BasinhoppingOptions, CurveFitOptions, DifferentialEvolutionOptions, FminCobylaOptions,
+    LeastSquaresOptions, LinprogOptions, MinimizeOptions, MinimizeScalarOptions, RootOptions,
+    approx_fprime, basinhopping, bisect, bracket, brent_minimize, brenth, brentq, brute,
+    check_grad, cobyla, curve_fit, differential_evolution, dual_annealing, fixed_point, fsolve,
+    golden, gradient_descent, halley, isotonic_regression, least_squares, linear_sum_assignment,
+    linprog, minimize, minimize_scalar, minimize_scalar_bounded, minimize_trisection,
+    newton_scalar, nnls, numerical_gradient, numerical_hessian, numerical_jacobian,
+    projected_gradient_descent, pso, ridder, rosen, rosen_der, rosen_hess, rosen_hess_prod, secant,
+    shgo, toms748,
 };
 
 const ATOL: f64 = 1e-6;
@@ -1180,12 +1181,24 @@ fn mr_linprog_simple_bounded() {
 fn mr_cobyla_convex_makes_progress() {
     let f = |x: &[f64]| (x[0] - 2.0).powi(2) + (x[1] + 1.0).powi(2);
     let constraints: Vec<fn(&[f64]) -> f64> = Vec::new();
-    let res = cobyla(f, &[5.0_f64, 5.0], &constraints, 200, 0.5).unwrap();
+    let opts = FminCobylaOptions {
+        rhobeg: 0.5,
+        maxfun: 200,
+        ..FminCobylaOptions::default()
+    };
+    let res = cobyla(f, &[5.0_f64, 5.0], &constraints, opts).unwrap();
     let f_init = (5.0_f64 - 2.0).powi(2) + (5.0_f64 + 1.0).powi(2);
     let f_final = res.fun.unwrap();
     assert!(
         f_final < f_init,
         "MR54 cobyla did not improve: f_final = {f_final} >= f_init = {f_init}"
+    );
+    // Powell's COBYLA converges here: the trust region shrinks to rhoend = 1e-4 near (2, -1).
+    assert!(res.success, "MR54 cobyla: {}", res.message);
+    assert!(
+        (res.x[0] - 2.0).abs() < 1e-3 && (res.x[1] + 1.0).abs() < 1e-3,
+        "MR54 cobyla x = {:?}",
+        res.x
     );
 }
 
