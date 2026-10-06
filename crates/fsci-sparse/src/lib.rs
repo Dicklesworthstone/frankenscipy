@@ -19,6 +19,7 @@
 pub mod audit;
 pub mod construct;
 pub mod formats;
+pub mod interface;
 #[cfg(feature = "npz")]
 pub mod io;
 pub mod linalg;
@@ -40,6 +41,11 @@ pub use formats::{
     IndexArray, IndexArrayRef, IndexDtype, LilMatrix, NalgebraBridge, Shape2D, SparseArray2D,
     SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec,
     get_index_dtype, safely_cast_index_arrays,
+};
+pub use interface::{
+    AdjointOperator, DenseLinearOperator, FunctionOperator, IdentityOperator, LinearOperator,
+    PowerOperator, ProductOperator, ScaledOperator, SumOperator, TransposeOperator,
+    aslinearoperator,
 };
 #[cfg(feature = "npz")]
 pub use io::{
@@ -97,12 +103,18 @@ pub use linalg::{
     EigsResult,
     EigsWhich,
     ExpmOptions,
+    GcrotmkOptions,
+    GcrotmkPair,
+    GcrotmkResult,
+    GcrotmkTruncate,
     IluDropRule,
     IluOptions,
     IluStatistics,
     IterativeSolveOptions,
     IterativeSolveResult,
     LgmresOptions,
+    LobpcgOptions,
+    LobpcgResult,
     LuOptions,
     MaskedGraph,
     MatchingPermType,
@@ -194,6 +206,7 @@ pub use linalg::{
     expm,
     expm_multiply,
     floyd_warshall,
+    gcrotmk,
     gmres,
     gmres_batch,
     gmres_preconditioned,
@@ -204,6 +217,7 @@ pub use linalg::{
     laplacian,
     lgmres,
     lgmres_batch,
+    lobpcg,
     lsmr,
     lsmr_damped,
     lsmr_regularized,

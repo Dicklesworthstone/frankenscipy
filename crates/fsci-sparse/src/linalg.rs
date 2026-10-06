@@ -28,6 +28,7 @@ use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
 // still builds clean, so a `cargo build` or `cargo check` does not see the breakage.
 #[cfg(test)]
 use crate::formats::CooMatrix;
+use crate::interface::LinearOperator;
 use crate::ops::{FormatConvertible, scale_csr, sub_csr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8085,8 +8086,11 @@ pub struct CaspIterativeSolveResult {
     pub result: IterativeSolveResult,
 }
 
+/// Finite-input checks shared by the iterative solvers. The operator's entries are checked only
+/// when it is a concrete CSR matrix: a matrix-free [`LinearOperator`] has none to inspect (SciPy
+/// checks none either), and a non-finite product then surfaces as a non-finite residual.
 fn validate_iterative_finite_inputs(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -8098,10 +8102,11 @@ fn validate_iterative_finite_inputs(
     }
     let must_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     let x0_has_non_finite = x0.is_some_and(|initial| initial.iter().any(|v| !v.is_finite()));
+    let matrix_has_non_finite = a
+        .as_csr()
+        .is_some_and(|matrix| matrix.data().iter().any(|v| !v.is_finite()));
     if must_check
-        && (a.data().iter().any(|v| !v.is_finite())
-            || b.iter().any(|v| !v.is_finite())
-            || x0_has_non_finite)
+        && (matrix_has_non_finite || b.iter().any(|v| !v.is_finite()) || x0_has_non_finite)
     {
         return Err(SparseError::NonFiniteInput {
             message: "matrix/rhs/initial guess contains NaN or Inf".to_string(),
@@ -8288,8 +8293,11 @@ fn cg_curvature_floor(p_sq: f64, ap_sq: f64) -> f64 {
     f64::EPSILON * 100.0 * p_sq.sqrt() * ap_sq.sqrt()
 }
 
+/// Conjugate Gradient for a symmetric positive-definite operator `A`, matrix or matrix-free:
+/// `scipy.sparse.linalg.cg(A, b, x0, rtol=tol, atol=0, maxiter)`. Any [`LinearOperator`] is
+/// accepted (a `&CsrMatrix` coerces); a concrete CSR matrix keeps the persistent-worker kernel.
 pub fn cg(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -8337,31 +8345,35 @@ pub fn cg(
     }
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
     // Large systems run a persistent worker team instead of respawning a
     // `thread::scope` per iteration: thread creation drops from
-    // O(iterations * workers) to O(workers).
-    let persistent_workers = if CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
-        || a.nnz() < 1 << 18
-        || n < 256
-    {
-        1
-    } else {
-        let shift = CG_WORKER_NNZ_SHIFT
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .clamp(8, 30);
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(a.nnz() >> shift)
-            .min(n)
-            .max(1)
-    };
-    if persistent_workers > 1 {
+    // O(iterations * workers) to O(workers). The team reads CSR storage directly, so it is
+    // only for a concrete matrix; any other operator takes the serial loop below.
+    let persistent = a.as_csr().and_then(|matrix| {
+        let workers = if CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
+            || matrix.nnz() < 1 << 18
+            || n < 256
+        {
+            1
+        } else {
+            let shift = CG_WORKER_NNZ_SHIFT
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .clamp(8, 30);
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(matrix.nnz() >> shift)
+                .min(n)
+                .max(1)
+        };
+        (workers > 1).then_some((matrix, workers))
+    });
+    if let Some((matrix, persistent_workers)) = persistent {
         return Ok(cg_persistent_workers(
-            a,
+            matrix,
             x,
             r,
             b_norm,
@@ -8389,7 +8401,7 @@ pub fn cg(
             });
         }
 
-        csr_matvec_into(a, &p, &mut ap);
+        a.matvec_into(&p, &mut ap)?;
         // The two operand norms that scale the breakdown test are fused into the
         // pᵀAp pass: same memory traffic, and `p_ap` keeps its original
         // single-accumulator order so the iterate stays bit-identical.
@@ -8719,7 +8731,7 @@ fn csr_matvec(a: &CsrMatrix, x: &[f64]) -> Vec<f64> {
 /// Buffer-reusing matvec: writes A·x into `out` (byte-identical to `csr_matvec`,
 /// but lets Krylov solvers hoist the result buffer out of their iteration loop
 /// instead of allocating a fresh Vec every step). `out.len()` must equal A.rows.
-fn csr_matvec_into(a: &CsrMatrix, x: &[f64], out: &mut [f64]) {
+pub(crate) fn csr_matvec_into(a: &CsrMatrix, x: &[f64], out: &mut [f64]) {
     let n = a.shape().rows;
     let indptr = a.indptr();
     let indices = a.indices();
@@ -8798,9 +8810,10 @@ fn csr_matvec_into_impl(
 ///
 /// Solves Ax = b using CG with an incomplete-LU preconditioner M = L·U ≈ A from [`spilu`].
 /// The preconditioner solves M*z = r at each iteration instead of using r directly.
-/// Matches `scipy.sparse.linalg.cg(A, b, M=spilu(A).solve)`.
+/// Matches `scipy.sparse.linalg.cg(A, b, M=spilu(A).solve)`. `A` may be any
+/// [`LinearOperator`].
 pub fn pcg(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     preconditioner: &SparseIluFactorization,
     x0: Option<&[f64]>,
@@ -8846,7 +8859,7 @@ pub fn pcg(
     }
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
     // z = M^{-1} * r (preconditioner application)
@@ -8869,7 +8882,7 @@ pub fn pcg(
             });
         }
 
-        csr_matvec_into(a, &p, &mut ap);
+        a.matvec_into(&p, &mut ap)?;
         // Same fused pass as `cg`: the two operand norms that scale the
         // breakdown test ride along with pᵀAp, whose accumulation order is
         // unchanged, so the iterate stays bit-identical (frankenscipy-bd2wq).
@@ -8932,7 +8945,7 @@ pub const GMRES_DEFAULT_RESTART: usize = 20;
 /// Shape checks and the initial iterate shared by the preconditioned Krylov ports.
 fn preconditioned_krylov_start(
     name: &str,
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -9007,7 +9020,8 @@ fn lapack_lartg(f: f64, g: f64) -> (f64, f64, f64) {
 /// `scipy.sparse.linalg.gmres(A, b, M=M, restart=restart, rtol=tol, atol=0)`, ported step for
 /// step (modified Gram–Schmidt on `M⁻¹A`, LAPACK `lartg` Givens rotations, and SciPy's gh-8400
 /// inner tolerance `ptol` that tightens or relaxes between restarts). `preconditioner` is
-/// SciPy's `M.matvec`, e.g. `|r| ilu.solve(r)` for `M = spilu(A)`.
+/// SciPy's `M.matvec`, e.g. `|r| ilu.solve(r)` for `M = spilu(A)`, or `|r| m.matvec(r)` for a
+/// preconditioner given as a [`LinearOperator`] `m`. `A` may itself be any operator.
 ///
 /// `restart` defaults to 20 (SciPy's default, capped at n); `options.max_iter` counts restart
 /// CYCLES as SciPy's `maxiter` does (default 10n). `iterations` is the number of inner Arnoldi
@@ -9018,9 +9032,9 @@ fn lapack_lartg(f: f64, g: f64) -> (f64, f64, f64) {
 ///
 /// # Errors
 /// Shape and input errors as [`gmres`], `InvalidArgument` for `restart == Some(0)`, and any
-/// error the preconditioner returns.
+/// error the preconditioner or the operator returns.
 pub fn gmres_preconditioned<M>(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     preconditioner: M,
     x0: Option<&[f64]>,
@@ -9061,7 +9075,7 @@ where
     let mut givens = vec![(0.0_f64, 0.0_f64); restart];
     let mut inner = 0usize;
     let mut r = if x.iter().any(|&value| value != 0.0) {
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
     } else {
         b.to_vec()
@@ -9089,7 +9103,7 @@ where
         let mut col = 0;
         for column in 0..restart {
             col = column;
-            csr_matvec_into(a, &v[col], &mut av);
+            a.matvec_into(&v[col], &mut av)?;
             let mut w = apply_preconditioner(&preconditioner, &av)?;
             let h0 = vec_norm(&w);
             for k in 0..=col {
@@ -9148,7 +9162,7 @@ where
                 *xi += coefficient * bi;
             }
         }
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         r = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
         r_norm = vec_norm(&r);
         if r_norm <= atol || breakdown {
@@ -9173,15 +9187,17 @@ where
 /// BiCGSTAB with a preconditioner: SciPy 1.17.1's
 /// `scipy.sparse.linalg.bicgstab(A, b, M=M, rtol=tol, atol=0)` ported step for step, including
 /// its breakdown tests (`|ρ| < ε²`, `|ω| < ε²`, `r̃ᵀv = 0`) and its half-step exit when
-/// `‖s‖ < tol·‖b‖`. `preconditioner` is SciPy's `M.matvec`.
+/// `‖s‖ < tol·‖b‖`. `preconditioner` is SciPy's `M.matvec` (`|r| m.matvec(r)` for a
+/// [`LinearOperator`] `m`); `A` may be any operator.
 ///
 /// `options.max_iter` defaults to 10n as SciPy's does. `iterations` counts the iterations
 /// entered, a half-step exit included (SciPy's callback count plus that last partial one).
 ///
 /// # Errors
-/// Shape and input errors as [`bicgstab`], and any error the preconditioner returns.
+/// Shape and input errors as [`bicgstab`], and any error the preconditioner or the operator
+/// returns.
 pub fn bicgstab_preconditioned<M>(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     preconditioner: M,
     x0: Option<&[f64]>,
@@ -9206,7 +9222,7 @@ where
     let max_iter = options.max_iter.unwrap_or(n * 10);
     let breakdown_tol = f64::EPSILON * f64::EPSILON;
     let mut r: Vec<f64> = if x.iter().any(|&value| value != 0.0) {
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
     } else {
         b.to_vec()
@@ -9250,7 +9266,7 @@ where
             p.copy_from_slice(&r);
         }
         let p_hat = apply_preconditioner(&preconditioner, &p)?;
-        csr_matvec_into(a, &p_hat, &mut v);
+        a.matvec_into(&p_hat, &mut v)?;
         let rv = dot_product(&r_tilde, &v);
         if rv == 0.0 {
             // status: r̃ᵀv = 0 breakdown (SciPy info −11)
@@ -9268,7 +9284,7 @@ where
             return Ok(finish(x, &r, true, iteration + 1));
         }
         let s_hat = apply_preconditioner(&preconditioner, &r)?;
-        csr_matvec_into(a, &s_hat, &mut t);
+        a.matvec_into(&s_hat, &mut t)?;
         omega = dot_product(&t, &r) / dot_product(&t, &t);
         for i in 0..n {
             x[i] += alpha * p_hat[i];
@@ -9295,8 +9311,10 @@ where
 /// Arnoldi steps; the result's `iterations` reports the actual inner-step count.
 /// With a nonzero RHS, a zero-cycle budget preserves the initial guess and checks
 /// its true residual. The zero-RHS shortcut still returns the zero solution.
+///
+/// `A` may be any [`LinearOperator`], matrix or matrix-free.
 pub fn gmres(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -9354,7 +9372,7 @@ pub fn gmres(
                 message: "GMRES inner iteration count exceeds usize".to_string(),
             })?;
 
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         let r_norm = vec_norm_diff(&ax, b) / b_norm;
         let converged = r_norm < options.tol;
         if converged || stop == KrylovCycleStop::Breakdown {
@@ -9367,7 +9385,7 @@ pub fn gmres(
         }
     }
 
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let r_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
@@ -9426,7 +9444,7 @@ fn subtract_scaled_basis_vector(destination: &mut [f64], scale: f64, basis: &[f6
 }
 
 fn gmres_inner(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x: &mut [f64],
     b_norm: f64,
@@ -9438,7 +9456,7 @@ fn gmres_inner(
     let m = restart.min(max_iter);
 
     // r = b - A*x
-    let ax = csr_matvec(a, x);
+    let ax = a.matvec(x)?;
     let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
     let r_norm = vec_norm(&r);
 
@@ -9473,7 +9491,7 @@ fn gmres_inner(
 
         // w = A * v_j
         let current_basis = &v[j * n..(j + 1) * n];
-        csr_matvec_into(a, current_basis, &mut wj);
+        a.matvec_into(current_basis, &mut wj)?;
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
         let w_norm_before = vec_norm(&wj);
@@ -9663,7 +9681,7 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// Matches `scipy.sparse.linalg.lgmres(A, b)`.
 ///
 /// # Arguments
-/// * `a` - Sparse matrix in CSR format
+/// * `a` - The operator: a sparse matrix (`&CsrMatrix` coerces) or any [`LinearOperator`]
 /// * `b` - Right-hand side vector
 /// * `x0` - Optional initial guess (defaults to zero vector)
 /// * `options` - Solver options (tolerance, max iterations, etc.)
@@ -9672,7 +9690,7 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// * `inner_m` - Number of inner GMRES iterations per outer iteration (default: 30)
 /// * `outer_k` - Number of outer vectors to store from previous cycles (default: 3)
 pub fn lgmres(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: LgmresOptions,
@@ -9700,10 +9718,10 @@ pub fn lgmres(
         });
     }
     let x0_has_non_finite = x0.is_some_and(|initial| initial.iter().any(|v| !v.is_finite()));
-    if a.data().iter().any(|v| !v.is_finite())
-        || b.iter().any(|v| !v.is_finite())
-        || x0_has_non_finite
-    {
+    let matrix_has_non_finite = a
+        .as_csr()
+        .is_some_and(|matrix| matrix.data().iter().any(|v| !v.is_finite()));
+    if matrix_has_non_finite || b.iter().any(|v| !v.is_finite()) || x0_has_non_finite {
         return Err(SparseError::NonFiniteInput {
             message: "matrix/rhs/initial guess contains NaN or Inf".to_string(),
         });
@@ -9744,7 +9762,7 @@ pub fn lgmres(
 
     while total_iter < max_iter {
         // r = b - A*x
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
         let r_norm = vec_norm(&r);
 
@@ -9805,7 +9823,7 @@ pub fn lgmres(
         if outer_k > 0 {
             let nz = vec_norm(&z);
             if nz > 0.0 && nz.is_finite() {
-                let az = csr_matvec(a, &z);
+                let az = a.matvec(&z)?;
                 let zn: Vec<f64> = z.iter().map(|v| v / nz).collect();
                 let azn: Vec<f64> = az.iter().map(|v| v / nz).collect();
                 if outer_v.len() >= outer_k {
@@ -9816,7 +9834,7 @@ pub fn lgmres(
         }
     }
 
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let r_norm = vec_norm_diff(&ax, b);
     Ok(IterativeSolveResult {
         solution: x,
@@ -9874,7 +9892,7 @@ impl Default for LgmresOptions {
 /// The stored `A z` products are reused rather than recomputed, saving one matvec per
 /// augmentation vector per cycle; the caller already has them.
 fn lgmres_inner(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     r0: &[f64],
     max_iter: usize,
     tol: f64,
@@ -9947,7 +9965,7 @@ fn lgmres_inner(
         // w = A * z, reusing the stored product where the caller already has it.
         match reused_av {
             Some(av) => wj.copy_from_slice(av),
-            None => csr_matvec_into(a, &z_dir, &mut wj),
+            None => a.matvec_into(&z_dir, &mut wj)?,
         }
         zs.push(z_dir);
         // Captured before orthogonalization: this is what the breakdown test
@@ -10041,13 +10059,34 @@ fn lgmres_inner(
 /// meant instead." We match the peer rather than improve on it.
 const KRYLOV_BREAKDOWN_TOL: f64 = f64::EPSILON * f64::EPSILON;
 
+/// `y = Aᵀ·x` for the two-sided solvers. A concrete CSR matrix keeps the explicit transpose its
+/// solver caches once per solve (the kernel these solvers ran before operators existed, so the
+/// iterates are unchanged); any other operator uses its own `rmatvec`, as SciPy's solvers call
+/// `A.rmatvec`.
+fn transpose_matvec_into(
+    a: &dyn LinearOperator,
+    cached_transpose: Option<&CsrMatrix>,
+    x: &[f64],
+    y: &mut [f64],
+) -> SparseResult<()> {
+    match cached_transpose {
+        Some(transpose) => {
+            csr_matvec_into(transpose, x, y);
+            Ok(())
+        }
+        None => a.rmatvec_into(x, y),
+    }
+}
+
 /// BiCG solver for general (non-symmetric) sparse linear systems.
 ///
 /// Solves Ax = b for general square A using the biconjugate gradient method.
 /// Works with both A and A^T. Less stable than BiCGSTAB but sometimes faster.
-/// Matches `scipy.sparse.linalg.bicg(A, b)`.
+/// Matches `scipy.sparse.linalg.bicg(A, b)`. `A` may be any [`LinearOperator`] that defines
+/// `rmatvec` (SciPy needs `A.rmatvec` too); without it the first transposed product fails with
+/// [`SparseError::Unsupported`].
 pub fn bicg(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -10091,11 +10130,11 @@ pub fn bicg(
         });
     }
 
-    // Compute A^T for the shadow system
-    let a_t = sparse_transpose(a);
+    // Compute A^T for the shadow system (a concrete matrix only; an operator uses rmatvec)
+    let a_t = a.as_csr().map(sparse_transpose);
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
     // r_tilde = r (shadow residual for A^T system)
@@ -10133,9 +10172,9 @@ pub fn bicg(
         }
 
         // q = A * p
-        csr_matvec_into(a, &p, &mut q);
+        a.matvec_into(&p, &mut q)?;
         // q_tilde = A^T * p_tilde
-        csr_matvec_into(&a_t, &p_tilde, &mut q_tilde);
+        transpose_matvec_into(a, a_t.as_ref(), &p_tilde, &mut q_tilde)?;
 
         // SciPy's `bicg` has no threshold gate here at all; it divides and
         // lets the rho gate above catch degeneracy. Guard only the exact
@@ -10200,9 +10239,9 @@ pub fn bicg(
 ///
 /// Conjugate Gradient Squared method. Squares the BiCG polynomial, which can
 /// lead to faster convergence but also more erratic behavior.
-/// Matches `scipy.sparse.linalg.cgs(A, b)`.
+/// Matches `scipy.sparse.linalg.cgs(A, b)`. `A` may be any [`LinearOperator`].
 pub fn cgs(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -10247,7 +10286,7 @@ pub fn cgs(
     }
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
     // r_tilde = r (shadow residual, kept constant)
@@ -10286,7 +10325,7 @@ pub fn cgs(
         }
 
         // v = A * p
-        csr_matvec_into(a, &p, &mut v);
+        a.matvec_into(&p, &mut v)?;
 
         // SciPy's `cgs` tests this one exactly (`if rv == 0`), not against a
         // threshold — the dot product shrinking is convergence, not breakdown.
@@ -10318,7 +10357,7 @@ pub fn cgs(
         }
 
         // r = r - alpha * A * (u + q)
-        csr_matvec_into(a, &u_plus_q, &mut a_upq);
+        a.matvec_into(&u_plus_q, &mut a_upq)?;
         for i in 0..n {
             r[i] -= alpha * a_upq[i];
         }
@@ -10355,9 +10394,9 @@ pub fn cgs(
 ///
 /// Solves Ax = b for general square A. More stable than BiCG, smoother convergence
 /// than GMRES for many problems. The default recommendation for non-symmetric systems.
-/// Matches `scipy.sparse.linalg.bicgstab(A, b)`.
+/// Matches `scipy.sparse.linalg.bicgstab(A, b)`. `A` may be any [`LinearOperator`].
 pub fn bicgstab(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -10402,7 +10441,7 @@ pub fn bicgstab(
     }
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
     // r_hat = r (shadow residual, kept constant)
@@ -10463,7 +10502,7 @@ pub fn bicgstab(
         }
 
         // v = A * p
-        csr_matvec_into(a, &p, &mut v);
+        a.matvec_into(&p, &mut v)?;
 
         // Exact test, as SciPy does (`if rv == 0`).
         let r_hat_v = dot_product(&r_hat, &v);
@@ -10499,7 +10538,7 @@ pub fn bicgstab(
         }
 
         // t = A * s
-        csr_matvec_into(a, &s, &mut t);
+        a.matvec_into(&s, &mut t)?;
 
         // omega = (t · s) / (t · t)
         //
@@ -10553,9 +10592,10 @@ pub fn bicgstab(
 /// `scipy.sparse.linalg.qmr(A, b)` runs: two-sided Lanczos with `A` and `Aᵀ`,
 /// WITHOUT look-ahead, so a Lanczos breakdown (ρ, ξ, δ or ε vanishing) ends the
 /// iteration with `converged = false`. Smoother convergence than BiCG. Unlike
-/// SciPy there are no `M1`/`M2` preconditioners.
+/// SciPy there are no `M1`/`M2` preconditioners. `A` may be any [`LinearOperator`] that defines
+/// `rmatvec` (SciPy's QMR needs `A.rmatvec` too).
 pub fn qmr(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -10600,11 +10640,12 @@ pub fn qmr(
     }
 
     // r = b - A*x
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
 
-    // Transpose of A for the dual Lanczos iteration
-    let at = csr_transpose(a);
+    // Transpose of A for the dual Lanczos iteration (a concrete matrix only; an operator
+    // uses rmatvec)
+    let at = a.as_csr().map(csr_transpose);
 
     // Initialize Lanczos vectors
     let r_norm = vec_norm(&r);
@@ -10650,7 +10691,7 @@ pub fn qmr(
         if rho.abs() < BREAKDOWN_TOL || xi.abs() < BREAKDOWN_TOL {
             let final_r = b
                 .iter()
-                .zip(csr_matvec(a, &x).iter())
+                .zip(a.matvec(&x)?.iter())
                 .map(|(bi, axi)| bi - axi)
                 .collect::<Vec<_>>();
             return Ok(IterativeSolveResult {
@@ -10673,7 +10714,7 @@ pub fn qmr(
             // Breakdown: w ⊥ v
             let final_r = b
                 .iter()
-                .zip(csr_matvec(a, &x).iter())
+                .zip(a.matvec(&x)?.iter())
                 .map(|(bi, axi)| bi - axi)
                 .collect::<Vec<_>>();
             return Ok(IterativeSolveResult {
@@ -10697,13 +10738,13 @@ pub fn qmr(
         }
 
         // epsilon = s^T * A * d
-        let ad = csr_matvec(a, &d);
+        let ad = a.matvec(&d)?;
         let epsilon = dot_product(&s, &ad);
         if epsilon.abs() < BREAKDOWN_TOL {
             // Breakdown
             let final_r = b
                 .iter()
-                .zip(csr_matvec(a, &x).iter())
+                .zip(a.matvec(&x)?.iter())
                 .map(|(bi, axi)| bi - axi)
                 .collect::<Vec<_>>();
             return Ok(IterativeSolveResult {
@@ -10722,7 +10763,8 @@ pub fn qmr(
         // where p_n = d, q_n = s and v_n = v, w_n = w. `ad = A d` is already
         // computed above; the v-recurrence must use A*p_n (not A*v_n) and the
         // w-recurrence A^T*q_n (not A^T*w_n).
-        let ats = csr_matvec(&at, &s);
+        let mut ats = vec![0.0; n];
+        transpose_matvec_into(a, at.as_ref(), &s, &mut ats)?;
         for i in 0..n {
             v_tilde[i] = ad[i] - beta * v[i];
             w_tilde[i] = ats[i] - beta * w[i];
@@ -10749,7 +10791,7 @@ pub fn qmr(
         // Check convergence
         let r_new = b
             .iter()
-            .zip(csr_matvec(a, &x).iter())
+            .zip(a.matvec(&x)?.iter())
             .map(|(bi, axi)| bi - axi)
             .collect::<Vec<_>>();
         let r_new_norm = vec_norm(&r_new);
@@ -10775,7 +10817,7 @@ pub fn qmr(
 
     let final_r = b
         .iter()
-        .zip(csr_matvec(a, &x).iter())
+        .zip(a.matvec(&x)?.iter())
         .map(|(bi, axi)| bi - axi)
         .collect::<Vec<_>>();
     Ok(IterativeSolveResult {
@@ -10851,9 +10893,9 @@ fn csr_transpose(a: &CsrMatrix) -> CsrMatrix {
 /// Solves Ax = b where A is symmetric but may have negative eigenvalues.
 /// Uses the Lanczos process to reduce to a tridiagonal system, then applies
 /// Givens rotations for the QR factorization of the tridiagonal matrix.
-/// Matches `scipy.sparse.linalg.minres(A, b)`.
+/// Matches `scipy.sparse.linalg.minres(A, b)`. `A` may be any symmetric [`LinearOperator`].
 pub fn minres(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -10896,7 +10938,7 @@ pub fn minres(
     };
 
     let mut ax = vec![0.0; n];
-    csr_matvec_into(a, &x, &mut ax);
+    a.matvec_into(&x, &mut ax)?;
     let mut r1: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
     let beta1 = vec_norm(&r1);
     if beta1 / b_norm <= options.tol {
@@ -10932,7 +10974,7 @@ pub fn minres(
 
         let inv_beta = 1.0 / beta;
         let v: Vec<f64> = r2.iter().map(|entry| entry * inv_beta).collect();
-        csr_matvec_into(a, &v, &mut lanczos);
+        a.matvec_into(&v, &mut lanczos)?;
         if iteration > 0 {
             let scale = beta / old_beta;
             for (entry, previous) in lanczos.iter_mut().zip(&r1) {
@@ -10993,7 +11035,7 @@ pub fn minres(
         // residual 7.271e-10 while this routine stopped at 1 iteration and
         // 1.349e-1 (frankenscipy-pfet9 item 3).
         if estimated_residual <= options.tol || beta / beta1 <= 10.0 * f64::EPSILON {
-            csr_matvec_into(a, &x, &mut ax);
+            a.matvec_into(&x, &mut ax)?;
             let residual_norm = vec_norm_diff(&ax, b) / b_norm;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -11004,7 +11046,7 @@ pub fn minres(
         }
     }
 
-    csr_matvec_into(a, &x, &mut ax);
+    a.matvec_into(&x, &mut ax)?;
     let residual_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
@@ -11033,8 +11075,11 @@ pub fn minres(
 /// function computed before `damp` existed: the damping rotation is skipped by an
 /// explicit branch rather than folded into the arithmetic, so the undamped path runs
 /// the same operations in the same order.
+///
+/// `A` may be any [`LinearOperator`] that defines `rmatvec` (LSQR applies `Aᵀ` every step, as
+/// SciPy's does).
 pub fn lsqr(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
@@ -11067,7 +11112,7 @@ pub fn lsqr(
 /// negative `damp` is accepted because it enters only as `damp^2`. A non-finite damp
 /// is rejected.
 pub fn lsqr_damped(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     options: IterativeSolveOptions,
@@ -11108,7 +11153,7 @@ pub fn lsqr_damped(
 /// behaviour is a consequence of damping the correction, not a special case, and it
 /// is the same in `lsmr_regularized`.
 pub fn lsqr_regularized(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     x0: Option<&[f64]>,
@@ -11134,7 +11179,7 @@ pub fn lsqr_regularized(
 }
 
 fn lsqr_impl(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     x0: Option<&[f64]>,
@@ -11170,7 +11215,7 @@ fn lsqr_impl(
             // started from zero; x = x0 + dx. The zero early return used to answer 0
             // here (frankenscipy-szq1n.7). `residual_norm` is then relative to ‖r0‖,
             // since a residual relative to ‖b‖ = 0 is undefined.
-            let r0: Vec<f64> = csr_matvec(a, start).iter().map(|v| -v).collect();
+            let r0: Vec<f64> = a.matvec(start)?.iter().map(|v| -v).collect();
             let mut correction = lsqr_impl(a, &r0, damp, None, options)?;
             for (xi, &si) in correction.solution.iter_mut().zip(start) {
                 *xi += si;
@@ -11188,8 +11233,9 @@ fn lsqr_impl(
 
     // Cache A in CSC once so every per-iteration Aᵀ·u is a byte-identical parallel
     // column-gather (`csc_matvec`) instead of a serial scatter; the O(nnz)
-    // conversion amortizes across the bidiagonalization iterations.
-    let a_csc = a.to_csc()?;
+    // conversion amortizes across the bidiagonalization iterations. A matrix-free
+    // operator has no entries to cache and applies its own rmatvec.
+    let a_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
 
     // Initialize: β₁u₁ = b
     let mut beta = b_norm;
@@ -11201,7 +11247,7 @@ fn lsqr_impl(
     let (mut u, beta_0) = match x0 {
         None => (b.to_vec(), beta),
         Some(start) => {
-            let ax0 = csr_matvec(a, start);
+            let ax0 = a.matvec(start)?;
             let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
             let norm = vec_norm(&residual);
             (residual, norm)
@@ -11224,7 +11270,8 @@ fn lsqr_impl(
     }
 
     // α₁v₁ = A^T u₁
-    let atb = csc_matvec(&a_csc, &u);
+    let mut atb = vec![0.0; n];
+    csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atb)?;
     let mut alpha = vec_norm(&atb);
     let mut v: Vec<f64> = if alpha > 0.0 {
         atb.iter().map(|ai| ai / alpha).collect()
@@ -11271,7 +11318,7 @@ fn lsqr_impl(
     for iteration in 0..max_iter {
         // Bidiagonalization step
         // u = A*v - alpha*u
-        csr_matvec_into(a, &v, &mut av);
+        a.matvec_into(&v, &mut av)?;
         for i in 0..m {
             u[i] = av[i] - alpha * u[i];
         }
@@ -11283,7 +11330,7 @@ fn lsqr_impl(
         }
 
         // v = A^T*u - beta*v
-        csc_matvec_into(&a_csc, &u, &mut atu);
+        csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atu)?;
         for i in 0..n {
             v[i] = atu[i] - beta * v[i];
         }
@@ -11390,7 +11437,7 @@ fn lsqr_impl(
             && r_norm > 0.0
             && ar_norm / (a_norm * r_norm) <= options.tol
         {
-            let ax = csr_matvec(a, &x);
+            let ax = a.matvec(&x)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 // status: istop 2, ‖Aᵀr‖/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
@@ -11404,7 +11451,7 @@ fn lsqr_impl(
         }
     }
 
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let final_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
@@ -11412,6 +11459,24 @@ fn lsqr_impl(
         iterations: max_iter,
         residual_norm: final_norm,
     })
+}
+
+/// `y = Aᵀ·x` for the bidiagonalization solvers (LSQR, LSMR, `svds`). A concrete CSR matrix
+/// keeps the CSC copy its solver caches once per solve, so `Aᵀ·x` is the same parallel column
+/// gather these solvers always ran; any other operator uses its own `rmatvec`.
+fn csc_transpose_matvec_into(
+    a: &dyn LinearOperator,
+    cached_csc: Option<&CscMatrix>,
+    x: &[f64],
+    y: &mut [f64],
+) -> SparseResult<()> {
+    match cached_csc {
+        Some(csc) => {
+            csc_matvec_into(csc, x, y);
+            Ok(())
+        }
+        None => a.rmatvec_into(x, y),
+    }
 }
 
 /// LSMR solver for sparse least-squares problems.
@@ -11439,8 +11504,10 @@ fn lsqr_impl(
 /// Equivalent to `lsmr_damped(a, b, 0.0, options)`, and BIT-FOR-BIT what this
 /// function computed before `damp` existed: at `damp = 0` the regularizing rotation
 /// is the identity, so no term in the recurrence changes value.
+///
+/// `A` may be any [`LinearOperator`] that defines `rmatvec`.
 pub fn lsmr(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
@@ -11484,7 +11551,7 @@ pub fn lsmr(
 /// propagate NaN into every subsequent iterate — the same reason
 /// `validate_iterative_finite_inputs` exists for `a` and `b`.
 pub fn lsmr_damped(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     options: IterativeSolveOptions,
@@ -11541,7 +11608,7 @@ pub fn lsmr_damped(
 /// supplies both expecting ridge-regression-toward-zero gets shrinkage toward
 /// their starting point instead.
 pub fn lsmr_regularized(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     x0: Option<&[f64]>,
@@ -11567,7 +11634,7 @@ pub fn lsmr_regularized(
 }
 
 fn lsmr_impl(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     damp: f64,
     x0: Option<&[f64]>,
@@ -11602,7 +11669,9 @@ fn lsmr_impl(
     // never gives. Ours was `n * 10`, so the divergence was both a factor and, on wide
     // matrices, the wrong dimension.
     let max_iter = options.max_iter.unwrap_or(n.min(m));
-    let a_csc = a.to_csc()?;
+    // A concrete matrix caches its CSC copy for the transposed products; an operator
+    // applies its own rmatvec.
+    let a_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
     // With an initial guess the iteration starts from the RESIDUAL of that
     // guess, `u = b - A x0`, and accumulates the correction into `x` -- SciPy
     // does exactly this (`_isolve/lsmr.py:243-245`).
@@ -11616,7 +11685,7 @@ fn lsmr_impl(
     let (mut u, beta_0) = match x0 {
         None => (b.to_vec(), b_norm),
         Some(start) => {
-            let ax0 = csr_matvec(a, start);
+            let ax0 = a.matvec(start)?;
             let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
             let norm = vec_norm(&residual);
             (residual, norm)
@@ -11636,7 +11705,8 @@ fn lsmr_impl(
     for entry in &mut u {
         *entry /= beta_0;
     }
-    let mut v = csc_matvec(&a_csc, &u);
+    let mut v = vec![0.0; n];
+    csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut v)?;
     let mut alpha = vec_norm(&v);
     // α = ‖Aᵀu‖ with u already normalized, so it carries the units of ‖A‖: a
     // bare `f64::EPSILON` here asked whether the MATRIX was small, and returned
@@ -11690,7 +11760,7 @@ fn lsmr_impl(
     let mut atu = vec![0.0; n];
 
     for iteration in 0..max_iter {
-        csr_matvec_into(a, &v, &mut av);
+        a.matvec_into(&v, &mut av)?;
         for index in 0..m {
             u[index] = av[index] - alpha * u[index];
         }
@@ -11702,7 +11772,7 @@ fn lsmr_impl(
             for entry in &mut u {
                 *entry /= beta;
             }
-            csc_matvec_into(&a_csc, &u, &mut atu);
+            csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atu)?;
             for index in 0..n {
                 v[index] = atu[index] - beta * v[index];
             }
@@ -11744,7 +11814,7 @@ fn lsmr_impl(
         // problem whose scale happened to be small (frankenscipy-xs7i2). SciPy
         // carries no clamp here at all.
         if rho == 0.0 || rho_bar == 0.0 {
-            csr_matvec_into(a, &x, &mut av);
+            a.matvec_into(&x, &mut av)?;
             let residual_norm = vec_norm_diff(&av, b) / b_norm;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -11801,7 +11871,7 @@ fn lsmr_impl(
             && unscaled_residual > 0.0
             && normal_residual / (a_norm * unscaled_residual) <= options.tol
         {
-            csr_matvec_into(a, &x, &mut av);
+            a.matvec_into(&x, &mut av)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 // status: istop 2, ‖Aᵀr‖ estimate |ζ̄|/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
@@ -11817,7 +11887,7 @@ fn lsmr_impl(
         // Golub-Kahan has terminated exactly when α or β is zero; below that it
         // is still producing information, however small the matrix happens to be.
         if estimated_residual <= options.tol || alpha == 0.0 || beta == 0.0 {
-            csr_matvec_into(a, &x, &mut av);
+            a.matvec_into(&x, &mut av)?;
             let residual_norm = vec_norm_diff(&av, b) / b_norm;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -11828,7 +11898,7 @@ fn lsmr_impl(
         }
     }
 
-    csr_matvec_into(a, &x, &mut av);
+    a.matvec_into(&x, &mut av)?;
     let residual_norm = vec_norm_diff(&av, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
@@ -12532,7 +12602,10 @@ fn csr_matvec_transpose(a: &CsrMatrix, x: &[f64]) -> Vec<f64> {
 /// order. Each output column is independent, so the gather parallelizes across
 /// row chunks (work-scaled, gated above ~256K nnz). Build the CSC ONCE and reuse
 /// it across a solver's iterations to amortize the O(nnz) conversion — this is
-/// the transpose companion to the parallel forward `csr_matvec`.
+/// the transpose companion to the parallel forward `csr_matvec`. The solvers reach it
+/// through [`csc_matvec_into`] (via `csc_transpose_matvec_into`); this allocating form
+/// remains for the tests that pin the identity.
+#[cfg(test)]
 fn csc_matvec(csc: &CscMatrix, x: &[f64]) -> Vec<f64> {
     let n = csc.shape().cols;
     let indptr = csc.indptr();
@@ -12557,7 +12630,7 @@ fn csc_matvec(csc: &CscMatrix, x: &[f64]) -> Vec<f64> {
 /// Buffer-reusing CSC matvec: writes A·x into `out` (byte-identical to
 /// `csc_matvec`, lets bidiagonalization/Krylov loops hoist the result buffer).
 /// `out.len()` must equal csc.cols.
-fn csc_matvec_into(csc: &CscMatrix, x: &[f64], out: &mut [f64]) {
+pub(crate) fn csc_matvec_into(csc: &CscMatrix, x: &[f64], out: &mut [f64]) {
     let n = csc.shape().cols;
     let indptr = csc.indptr();
     let indices = csc.indices();
@@ -34370,7 +34443,7 @@ fn resolve_krylov_settings(
 
 /// Checks `A`, `k`, `M`, `sigma` and `v0` for [`eigsh`]/[`eigs`]; returns `n`.
 fn validate_eigen_problem(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     k: usize,
     options: &EigsOptions<'_>,
     name: &str,
@@ -34388,8 +34461,11 @@ fn validate_eigen_problem(
         });
     }
     // SciPy's ARPACK cannot build an Arnoldi factorization from a NaN/Inf operator and raises
-    // (ARPACK error -9999); refuse up front rather than iterate on NaN.
-    if a.data().iter().any(|v| !v.is_finite()) {
+    // (ARPACK error -9999); refuse up front rather than iterate on NaN. A matrix-free operator
+    // has no entries to inspect; a non-finite product is refused by the Krylov kernel instead.
+    if a.as_csr()
+        .is_some_and(|matrix| matrix.data().iter().any(|v| !v.is_finite()))
+    {
         return Err(SparseError::NonFiniteInput {
             message: format!("{name}: the matrix contains NaN or Inf"),
         });
@@ -34530,11 +34606,20 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
 ///   an `M` that is not positive definite.
 /// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
 ///
+/// `A` may be any symmetric [`LinearOperator`] (a `&CsrMatrix` coerces). A matrix-free `A`
+/// runs modes 1 and 2; `sigma` needs a concrete matrix ([`SparseError::Unsupported`]). Without
+/// entries to bound `‖A‖`, the explicit residual check measures a matrix-free `A` against the
+/// largest Ritz magnitude of the final Krylov basis (times `‖M‖` in mode 2) instead.
+///
 /// Differences from SciPy: `k` may equal `n` (SciPy refuses `k ≥ n` for a sparse `A` and
 /// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one;
 /// `mode='buckling'`/`'cayley'`, `OPinv`/`Minv` operators and `return_eigenvectors=False` are
 /// not offered.
-pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+pub fn eigsh(
+    a: &dyn LinearOperator,
+    k: usize,
+    options: EigsOptions<'_>,
+) -> SparseResult<EigsResult> {
     let n = validate_eigen_problem(a, k, &options, "eigsh")?;
     let settings = resolve_krylov_settings(n, k, &options, true)?;
     let transform = SpectralTransform::build(a, &options, n)?;
@@ -34550,8 +34635,10 @@ pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<
     )?;
 
     let sigma = transform.shift();
-    let a_norm = csr_norm_bound(a);
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let a_norm = a
+        .as_csr()
+        .map_or(run.spectral_scale * m_norm, csr_norm_bound);
     let guard = settings.tol.max(f64::EPSILON.sqrt());
     let mut nmatvec = run.applications;
     // (λ, eigenvector, converged)
@@ -34566,7 +34653,7 @@ pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<
             }
             b_normalize(&mut x, options.mass);
         }
-        let ax = csr_matvec(a, &x);
+        let ax = a.matvec(&x)?;
         let mx = options.mass.map(|m| csr_matvec(m, &x));
         nmatvec += 1 + usize::from(mx.is_some());
         // Modes 1 and 2 return the Rayleigh quotient xᵀAx / xᵀMx of the returned vector. It
@@ -34686,7 +34773,11 @@ enum SpectralTransform {
 }
 
 impl SpectralTransform {
-    fn build(a: &CsrMatrix, options: &EigsOptions<'_>, n: usize) -> SparseResult<Self> {
+    /// Modes 1 and 2 only apply `A`, so any [`LinearOperator`] serves. Mode 3 factors `A − σM`
+    /// and needs `A`'s entries: a matrix-free `A` with `sigma` is refused
+    /// ([`SparseError::Unsupported`]) where SciPy would fall back to an inner GMRES solve
+    /// (`IterOpInv`).
+    fn build(a: &dyn LinearOperator, options: &EigsOptions<'_>, n: usize) -> SparseResult<Self> {
         match (options.sigma, options.mass) {
             (None, None) => Ok(Self::Standard),
             (None, Some(mass)) => Ok(Self::Generalized(splu(
@@ -34694,11 +34785,19 @@ impl SpectralTransform {
                 LuOptions::default(),
             )?)),
             (Some(sigma), mass) => {
+                let Some(matrix) = a.as_csr() else {
+                    return Err(SparseError::Unsupported {
+                        feature: "shift-invert (sigma) needs A as a concrete sparse matrix; a \
+                                  matrix-free LinearOperator supports the standard and \
+                                  generalized modes"
+                            .to_string(),
+                    });
+                };
                 let shift = match mass {
                     Some(m) => scale_csr(m, sigma)?,
                     None => scale_csr(&eye(n)?, sigma)?,
                 };
-                let shifted = sub_csr(a, &shift)?;
+                let shifted = sub_csr(matrix, &shift)?;
                 let factor = splu(&shifted.to_csc()?, LuOptions::default())
                     .map_err(|err| singular_shift_error(err, sigma))?;
                 Ok(Self::ShiftInvert { sigma, factor })
@@ -34707,10 +34806,10 @@ impl SpectralTransform {
     }
 
     /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`), which is all mode 3 needs.
-    fn apply(&self, a: &CsrMatrix, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
+    fn apply(&self, a: &dyn LinearOperator, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
         match self {
-            Self::Standard => Ok(csr_matvec(a, x)),
-            Self::Generalized(mass_factor) => splu_solve(mass_factor, &csr_matvec(a, x)),
+            Self::Standard => a.matvec(x),
+            Self::Generalized(mass_factor) => splu_solve(mass_factor, &a.matvec(x)?),
             Self::ShiftInvert { sigma, factor } => {
                 splu_solve(factor, bx).map_err(|err| singular_shift_error(err, *sigma))
             }
@@ -35187,6 +35286,9 @@ struct SymmetricRitz {
     next: Vec<f64>,
     iterations: usize,
     applications: usize,
+    /// `max|θ|` over every Ritz value of the final projected matrix: the operator scale a
+    /// matrix-free `A` (no entries for a norm bound) is measured against.
+    spectral_scale: f64,
 }
 
 /// Symmetric Krylov–Schur (Stewart 2001), i.e. thick-restart Lanczos (Wu & Simon 2000), for the
@@ -35285,6 +35387,9 @@ where
                     next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
                     iterations,
                     applications,
+                    spectral_scale: theta
+                        .iter()
+                        .fold(0.0_f64, |largest, t| largest.max(t.abs())),
                 };
                 let columns: Vec<Vec<f64>> = wanted
                     .iter()
@@ -35380,10 +35485,17 @@ struct GeneralPair {
 ///   outside `k + 1 < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or an indefinite `M`.
 /// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
 ///
+/// `A` may be any [`LinearOperator`]; as in [`eigsh`], a matrix-free `A` runs modes 1 and 2 and
+/// its residual check is measured against the largest Ritz magnitude of the final basis.
+///
 /// Differences from SciPy: `k` may reach `n` (SciPy refuses `k ≥ n − 1` for a sparse `A`); the
 /// default start vector is a fixed-seed pseudo-random one; complex `sigma` (`OPpart`),
 /// `OPinv`/`Minv` operators and `return_eigenvectors=False` are not offered.
-pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<EigsResult> {
+pub fn eigs(
+    a: &dyn LinearOperator,
+    k: usize,
+    options: EigsOptions<'_>,
+) -> SparseResult<EigsResult> {
     let n = validate_eigen_problem(a, k, &options, "eigs")?;
     let settings = resolve_krylov_settings(n, k, &options, false)?;
     let transform = SpectralTransform::build(a, &options, n)?;
@@ -35398,8 +35510,10 @@ pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<E
     )?;
 
     let sigma = transform.shift();
-    let a_norm = csr_norm_bound(a);
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
+    let a_norm = a
+        .as_csr()
+        .map_or(run.spectral_scale * m_norm, csr_norm_bound);
     let guard = settings.tol.max(f64::EPSILON.sqrt());
     let mut nmatvec = run.applications;
     let mut pairs: Vec<GeneralPair> = Vec::with_capacity(run.theta.len());
@@ -35413,7 +35527,7 @@ pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<E
             add_scaled(&mut xi, c.1, &run.next);
             complex_b_normalize(&mut xr, &mut xi, options.mass);
         }
-        let (axr, axi) = (csr_matvec(a, &xr), csr_matvec(a, &xi));
+        let (axr, axi) = (a.matvec(&xr)?, a.matvec(&xi)?);
         let (mxr, mxi) = match options.mass {
             Some(m) => (csr_matvec(m, &xr), csr_matvec(m, &xi)),
             None => (xr.clone(), xi.clone()),
@@ -35511,6 +35625,9 @@ struct GeneralRitz {
     next: Vec<f64>,
     iterations: usize,
     applications: usize,
+    /// `max|θ|` over every Ritz value of the final projected matrix: the operator scale a
+    /// matrix-free `A` (no entries for a norm bound) is measured against.
+    spectral_scale: f64,
 }
 
 /// A Ritz value of the projected matrix and the (stable) id of its Schur block.
@@ -35645,6 +35762,9 @@ where
                     next: last.map_or_else(|| vec![0.0; n], |(v, _)| v),
                     iterations,
                     applications,
+                    spectral_scale: values
+                        .iter()
+                        .fold(0.0_f64, |largest, v| largest.max(v.re.hypot(v.im))),
                 };
                 let columns: Vec<Vec<f64>> = ritz
                     .iter()
@@ -37262,7 +37382,14 @@ pub struct SvdsResult {
 /// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass` and `v0` are refused
 /// ([`SparseError::Unsupported`]). A NaN/Inf in `A` (or an overflowing AᵀA) is refused with
 /// [`SparseError::NonFiniteInput`], where SciPy's ARPACK raises.
-pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<SvdsResult> {
+///
+/// `A` may be any [`LinearOperator`] that defines `rmatvec` (the Krylov operator is
+/// `v ↦ Aᵀ(A v)`, as SciPy's `svds` builds from `A.matvec` and `A.rmatvec`).
+pub fn svds(
+    a: &dyn LinearOperator,
+    k: usize,
+    options: EigsOptions<'_>,
+) -> SparseResult<SvdsResult> {
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
@@ -37284,8 +37411,9 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<S
     let settings = resolve_krylov_settings(n, k, &options, true)?;
 
     // Cache A in CSC once so the operator Aᵀ·w is a byte-identical parallel
-    // column-gather (`csc_matvec`), reused across all Krylov steps.
-    let a_csc = a.to_csc()?;
+    // column-gather (`csc_matvec`), reused across all Krylov steps. A matrix-free
+    // operator applies its own rmatvec instead.
+    let a_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
 
     // The top-k singular values of A are the square roots of the top-k eigenvalues
     // of the n×n SPSD matrix AᵀA, with right singular vectors = its eigenvectors.
@@ -37298,8 +37426,10 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<S
     // (byte-identical: same kernels, tmp fully overwritten each call).
     let mut tmp = vec![0.0; a.shape().rows];
     let ata_op = move |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
-        csr_matvec_into(a, v, &mut tmp);
-        Ok(csc_matvec(&a_csc, &tmp))
+        a.matvec_into(v, &mut tmp)?;
+        let mut image = vec![0.0; n];
+        csc_transpose_matvec_into(a, a_csc.as_ref(), &tmp, &mut image)?;
+        Ok(image)
     };
     let run = symmetric_krylov_schur(ata_op, None, n, k, &settings, None, false)?;
     let eig = EigsResult {
@@ -37339,7 +37469,7 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<S
 
         // Left singular vector: u = A v / σ.
         if sigma > f64::EPSILON * sigma_max {
-            let mut u = csr_matvec(a, v);
+            let mut u = a.matvec(v)?;
             for ui in &mut u {
                 *ui /= sigma;
             }
@@ -37354,6 +37484,699 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions<'_>) -> SparseResult<S
         u: u_vecs,
         vt: v_vecs,
         converged: eig.converged,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// LOBPCG — Locally Optimal Block Preconditioned Conjugate Gradient
+// ══════════════════════════════════════════════════════════════════════
+
+/// Options for [`lobpcg`]: SciPy's keyword arguments with SciPy's defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LobpcgOptions {
+    /// `tol`: the residual-norm tolerance. `None` (or a value `≤ 0`) is SciPy's `√ε·n`.
+    pub tol: Option<f64>,
+    /// `maxiter` (default 20). The loop runs at most `maxiter + 1` Rayleigh–Ritz steps, as
+    /// SciPy's `while iterationNumber < maxiter` from −1 does.
+    pub max_iter: usize,
+    /// `largest` (default `true`): the largest eigenvalues, else the smallest.
+    pub largest: bool,
+    /// `restartControl` (default 20): a residual `2^restartControl` times the best one so far
+    /// forces a restart without the search directions `P`.
+    pub restart_control: i32,
+}
+
+impl Default for LobpcgOptions {
+    fn default() -> Self {
+        Self {
+            tol: None,
+            max_iter: 20,
+            largest: true,
+            restart_control: 20,
+        }
+    }
+}
+
+/// Result of [`lobpcg`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LobpcgResult {
+    /// The eigenvalues, largest first when `largest`, else smallest first.
+    pub eigenvalues: Vec<f64>,
+    /// `eigenvectors[j]` belongs to `eigenvalues[j]` (SciPy's column `X[:, j]`); B-orthonormal.
+    pub eigenvectors: Vec<Vec<f64>>,
+    /// `‖A·xⱼ − λⱼ·B·xⱼ‖` of the returned pairs.
+    pub residual_norms: Vec<f64>,
+    /// SciPy's `lambdaHistory` (`retLambdaHistory=True`): one row per recorded iteration.
+    /// Empty when the dense fallback ran.
+    pub lambda_history: Vec<Vec<f64>>,
+    /// SciPy's `residualNormsHistory` (`retResidualNormsHistory=True`). Empty for the dense
+    /// fallback.
+    pub residual_norms_history: Vec<Vec<f64>>,
+    /// SciPy's `iterationNumber` when the loop exited (0 for the dense fallback).
+    pub iterations: usize,
+    /// Whether every returned residual norm is within `tol`; SciPy warns (and still returns)
+    /// otherwise.
+    pub converged: bool,
+    /// `n − size(Y) < 5·k`: SciPy then solves the problem densely instead of iterating.
+    pub dense_fallback: bool,
+}
+
+/// A dense block of column vectors (SciPy's `blockVector*`).
+type LobpcgBlock = DMatrix<f64>;
+
+/// `op(X)` column by column (SciPy's `A(X)` for a `LinearOperator`, its default `matmat`).
+fn lobpcg_apply(op: &dyn LinearOperator, x: &LobpcgBlock) -> SparseResult<LobpcgBlock> {
+    let (n, k) = x.shape();
+    let rows = op.shape().rows;
+    let mut out = LobpcgBlock::zeros(rows, k);
+    for j in 0..k {
+        let input = &x.as_slice()[j * n..(j + 1) * n];
+        op.matvec_into(input, &mut out.as_mut_slice()[j * rows..(j + 1) * rows])?;
+    }
+    Ok(out)
+}
+
+/// The symmetric matrix built from the LOWER triangle of `m`, which is all LAPACK's
+/// `uplo='L'` routines (SciPy's `eigh` default) read.
+fn lower_symmetric(m: &DMatrix<f64>) -> DMatrix<f64> {
+    DMatrix::from_fn(m.nrows(), m.ncols(), |i, j| {
+        if i >= j { m[(i, j)] } else { m[(j, i)] }
+    })
+}
+
+/// `(M + Mᵀ)/2`, SciPy's explicit symmetrization of a Gram matrix.
+fn symmetrized(m: &DMatrix<f64>) -> DMatrix<f64> {
+    (m + m.transpose()) / 2.0
+}
+
+/// SciPy's `cholesky(M)` (upper, `potrf` with `uplo='U'`, which reads the UPPER triangle) as
+/// the nalgebra factor of the matching symmetric matrix; `None` is `LinAlgError`.
+fn upper_cholesky(m: &DMatrix<f64>) -> Option<nalgebra::Cholesky<f64, Dyn>> {
+    let symmetric = DMatrix::from_fn(m.nrows(), m.ncols(), |i, j| {
+        if i <= j { m[(i, j)] } else { m[(j, i)] }
+    });
+    nalgebra::Cholesky::new(symmetric)
+}
+
+/// `scipy.linalg.eigh(a, b)` for LOBPCG's small Gram matrices: ascending eigenvalues and
+/// eigenvectors normalized to `Xᵀ·B·X = I`, by the `sygv` reduction (`B = L·Lᵀ`,
+/// `C = L⁻¹·A·L⁻ᵀ`, `X = L⁻ᵀ·Z`). Only lower triangles are read. `None` is SciPy's
+/// `LinAlgError`: `B` not positive definite, or the eigensolver not converging.
+fn lobpcg_eigh(a: &DMatrix<f64>, b: Option<&DMatrix<f64>>) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    let n = a.nrows();
+    if n == 0 {
+        return Some((Vec::new(), DMatrix::zeros(0, 0)));
+    }
+    let a = lower_symmetric(a);
+    let (c, factor) = match b {
+        None => (a, None),
+        Some(b) => {
+            let l = nalgebra::Cholesky::new(lower_symmetric(b))?.l();
+            let linv_a = l.solve_lower_triangular(&a)?;
+            let c = l.solve_lower_triangular(&linv_a.transpose())?;
+            (lower_symmetric(&c), Some(l))
+        }
+    };
+    if c.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let eigen = nalgebra::SymmetricEigen::try_new(c, f64::EPSILON, 1000 * n.max(10))?;
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&p, &q| eigen.eigenvalues[p].total_cmp(&eigen.eigenvalues[q]));
+    let values: Vec<f64> = order.iter().map(|&i| eigen.eigenvalues[i]).collect();
+    let z = eigen.eigenvectors.select_columns(order.iter());
+    let vectors = match factor {
+        None => z,
+        Some(l) => l.tr_solve_lower_triangular(&z)?,
+    };
+    Some((values, vectors))
+}
+
+/// SciPy's `_get_indx`: the indices of the `num` largest (descending) or smallest (ascending)
+/// values.
+fn lobpcg_select(values: &[f64], num: usize, largest: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&p, &q| values[p].total_cmp(&values[q]));
+    if largest {
+        order.iter().rev().take(num).copied().collect()
+    } else {
+        order.truncate(num);
+        order
+    }
+}
+
+/// SciPy's `_b_orthonormalize(B, V, BV)`: `V·R⁻¹` with `Vᵀ·B·V = Rᵀ·R`, and `B·V·R⁻¹` when
+/// `B` is given. Returns `(V, BV, R⁻¹)`, `BV = None` meaning `V` itself (`B = I`), or `None`
+/// when the Cholesky factorization fails.
+#[allow(clippy::type_complexity)]
+fn lobpcg_b_orthonormalize(
+    b: Option<&dyn LinearOperator>,
+    v: &LobpcgBlock,
+    bv: Option<&LobpcgBlock>,
+) -> SparseResult<Option<(LobpcgBlock, Option<LobpcgBlock>, DMatrix<f64>)>> {
+    let computed;
+    let bv: Option<&LobpcgBlock> = match (bv, b) {
+        (Some(given), _) => Some(given),
+        (None, Some(op)) => {
+            computed = lobpcg_apply(op, v)?;
+            Some(&computed)
+        }
+        (None, None) => None,
+    };
+    let vbv = v.tr_mul(bv.unwrap_or(v));
+    let Some(factor) = upper_cholesky(&vbv) else {
+        return Ok(None);
+    };
+    // R = Lᵀ, so R⁻¹ = L⁻ᵀ.
+    let k = vbv.nrows();
+    let Some(inv_r) = factor
+        .l()
+        .tr_solve_lower_triangular(&DMatrix::identity(k, k))
+    else {
+        return Ok(None);
+    };
+    let v_new = v * &inv_r;
+    let bv_new = match (b, bv) {
+        (Some(_), Some(bv)) => Some(bv * &inv_r),
+        _ => None,
+    };
+    Ok(Some((v_new, bv_new, inv_r)))
+}
+
+/// SciPy's `_applyConstraints`: `V −= Y·(YᵀBY)⁻¹·(BY)ᵀ·V`.
+fn lobpcg_apply_constraints(
+    v: &mut LobpcgBlock,
+    gram_factor: &nalgebra::Cholesky<f64, Dyn>,
+    by: &LobpcgBlock,
+    y: &LobpcgBlock,
+) {
+    let ybv = by.tr_mul(v);
+    let tmp = gram_factor.solve(&ybv);
+    *v -= y * tmp;
+}
+
+/// The residual block `A·X − (B·X)·diag(λ)` (SciPy's `blockVectorAX - blockVectorBX * λ`).
+fn lobpcg_residual_block(ax: &LobpcgBlock, bx: &LobpcgBlock, lambda: &[f64]) -> LobpcgBlock {
+    let mut r = ax.clone();
+    for (j, &lam) in lambda.iter().enumerate() {
+        for i in 0..r.nrows() {
+            r[(i, j)] -= bx[(i, j)] * lam;
+        }
+    }
+    r
+}
+
+/// Column norms `√|Σ r²|` (SciPy's `np.sqrt(np.abs(np.sum(R.conj() * R, 0)))`).
+fn lobpcg_column_norms(r: &LobpcgBlock) -> Vec<f64> {
+    r.column_iter()
+        .map(|column| column.iter().map(|v| v * v).sum::<f64>().abs().sqrt())
+        .collect()
+}
+
+/// The residual norms of `(λ, X)`.
+fn lobpcg_residual(ax: &LobpcgBlock, bx: &LobpcgBlock, lambda: &[f64]) -> Vec<f64> {
+    lobpcg_column_norms(&lobpcg_residual_block(ax, bx, lambda))
+}
+
+/// `[[a, b], [bᵀ, c]]`.
+fn block2(a: &DMatrix<f64>, b: &DMatrix<f64>, c: &DMatrix<f64>) -> DMatrix<f64> {
+    let (p, q) = (a.nrows(), c.nrows());
+    DMatrix::from_fn(p + q, p + q, |i, j| match (i < p, j < p) {
+        (true, true) => a[(i, j)],
+        (true, false) => b[(i, j - p)],
+        (false, true) => b[(j, i - p)],
+        (false, false) => c[(i - p, j - p)],
+    })
+}
+
+/// `[[a, b, d], [bᵀ, c, e], [dᵀ, eᵀ, f]]`.
+fn block3(
+    a: &DMatrix<f64>,
+    b: &DMatrix<f64>,
+    d: &DMatrix<f64>,
+    c: &DMatrix<f64>,
+    e: &DMatrix<f64>,
+    f: &DMatrix<f64>,
+) -> DMatrix<f64> {
+    let upper = block2(a, b, c);
+    let right = DMatrix::from_fn(upper.nrows(), f.ncols(), |i, j| {
+        if i < a.nrows() {
+            d[(i, j)]
+        } else {
+            e[(i - a.nrows(), j)]
+        }
+    });
+    block2(&upper, &right, f)
+}
+
+/// The dense branch SciPy takes when `n − size(Y) < 5·k`: `scipy.linalg.eigh(A, B,
+/// subset_by_index=...)` on the materialized operators.
+fn lobpcg_dense(
+    a: &dyn LinearOperator,
+    b: Option<&dyn LinearOperator>,
+    n: usize,
+    size_x: usize,
+    largest: bool,
+) -> SparseResult<LobpcgResult> {
+    let size_x = size_x.min(n);
+    let to_matrix = |op: &dyn LinearOperator| -> SparseResult<DMatrix<f64>> {
+        let rows = op.to_dense()?;
+        Ok(DMatrix::from_fn(n, n, |i, j| rows[i][j]))
+    };
+    let a_dense = to_matrix(a)?;
+    let b_dense = b.map(to_matrix).transpose()?;
+    let Some((values, vectors)) = lobpcg_eigh(&a_dense, b_dense.as_ref()) else {
+        return Err(SparseError::InvalidArgument {
+            message: "lobpcg: the dense eigensolver failed (B not positive definite?)".to_string(),
+        });
+    };
+    let selected: Vec<usize> = if largest {
+        (n - size_x..n).rev().collect()
+    } else {
+        (0..size_x).collect()
+    };
+    let eigenvalues: Vec<f64> = selected.iter().map(|&i| values[i]).collect();
+    let x = vectors.select_columns(selected.iter());
+    let ax = &a_dense * &x;
+    let bx = b_dense.as_ref().map_or_else(|| x.clone(), |bd| bd * &x);
+    let residual_norms = lobpcg_residual(&ax, &bx, &eigenvalues);
+    Ok(LobpcgResult {
+        eigenvectors: (0..size_x)
+            .map(|j| x.column(j).iter().copied().collect())
+            .collect(),
+        eigenvalues,
+        residual_norms,
+        lambda_history: Vec::new(),
+        residual_norms_history: Vec::new(),
+        iterations: 0,
+        converged: true,
+        dense_fallback: true,
+    })
+}
+
+/// LOBPCG: `scipy.sparse.linalg.lobpcg(A, X, B=None, M=None, Y=None, tol=None, maxiter=20,
+/// largest=True, restartControl=20, retLambdaHistory=True, retResidualNormsHistory=True)`,
+/// transcribed from SciPy 1.17.1's `lobpcg.py` (Knyazev 2001).
+///
+/// Finds the `k = x.len()` largest (or smallest) eigenpairs of the symmetric pencil
+/// `A·x = λ·B·x` (`B = I` by default, otherwise symmetric positive definite), starting from the
+/// block `x` (`x[j]` is SciPy's column `X[:, j]`), with the preconditioner `m` (SciPy's `M`,
+/// an approximation of `A⁻¹`) and the constraints `y` (eigenvectors are kept B-orthogonal to
+/// `span(Y)`). Every operator may be matrix-free; only `matvec` is used.
+///
+/// The iteration is SciPy's step for step: B-orthonormalization by Cholesky, the
+/// `[X, R, P]` Rayleigh–Ritz with implicit Gram matrices until the residuals fall below `√ε`
+/// (explicit afterwards), the restart without `P` when its orthonormalization or the 3-block
+/// eigenproblem fails or `restartControl` trips, soft locking of converged columns, the
+/// best-iterate bookkeeping, and the final exact Rayleigh–Ritz on the best block. As in SciPy,
+/// `n − size(Y) < 5k` switches to a dense generalized eigensolve of the materialized operators.
+/// Non-convergence is not an error: SciPy warns and returns the best iterate, and so does this
+/// (`converged = false`). The small dense eigenproblems run through nalgebra (Cholesky reduction
+/// plus symmetric QR) instead of LAPACK, and block products are not BLAS-ordered, so iterates
+/// agree with SciPy's to rounding, not bitwise.
+///
+/// # Errors
+/// - [`SparseError::InvalidShape`] for a non-square `A`; [`SparseError::IncompatibleShape`]
+///   for `B`, `M`, `x` or `y` of the wrong size.
+/// - [`SparseError::InvalidArgument`] for an empty `x`, a NaN `tol`, linearly dependent
+///   constraints or initial vectors (SciPy's `ValueError`s), or a failed final eigensolve.
+/// - [`SparseError::Unsupported`] for constraints in the dense branch (SciPy's
+///   `NotImplementedError`).
+/// - Any error an operator returns.
+pub fn lobpcg(
+    a: &dyn LinearOperator,
+    x: &[Vec<f64>],
+    b: Option<&dyn LinearOperator>,
+    m: Option<&dyn LinearOperator>,
+    y: Option<&[Vec<f64>]>,
+    options: LobpcgOptions,
+) -> SparseResult<LobpcgResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!("lobpcg needs a square A, got {}x{}", shape.rows, shape.cols),
+        });
+    }
+    let n = shape.rows;
+    let size_x = x.len();
+    if size_x == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "lobpcg needs at least one initial vector".to_string(),
+        });
+    }
+    if x.iter().any(|column| column.len() != n) {
+        return Err(SparseError::IncompatibleShape {
+            message: format!("every initial vector must have length {n}"),
+        });
+    }
+    for (name, op) in [("B", b), ("M", m)] {
+        if let Some(op) = op
+            && op.shape() != shape
+        {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("lobpcg: {name} must be {n}x{n}"),
+            });
+        }
+    }
+    let y = y.filter(|columns| !columns.is_empty());
+    if let Some(columns) = y
+        && columns.iter().any(|column| column.len() != n)
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!("every constraint vector must have length {n}"),
+        });
+    }
+    if options.tol.is_some_and(f64::is_nan) {
+        return Err(SparseError::InvalidArgument {
+            message: "lobpcg tol must not be NaN".to_string(),
+        });
+    }
+    let size_y = y.map_or(0, <[Vec<f64>]>::len);
+    let largest = options.largest;
+    let max_iter = options.max_iter;
+
+    if (n as i128) - (size_y as i128) < 5 * (size_x as i128) {
+        if y.is_some() {
+            return Err(SparseError::Unsupported {
+                feature: "The dense eigensolver does not support constraints.".to_string(),
+            });
+        }
+        return lobpcg_dense(a, b, n, size_x, largest);
+    }
+
+    let tol = match options.tol {
+        Some(t) if t > 0.0 => t,
+        _ => f64::EPSILON.sqrt() * n as f64,
+    };
+    let to_block =
+        |columns: &[Vec<f64>]| LobpcgBlock::from_fn(n, columns.len(), |i, j| columns[j][i]);
+
+    let mut x_blk = to_block(x);
+    // Constraints.
+    let constraints = match y {
+        None => None,
+        Some(columns) => {
+            let y_blk = to_block(columns);
+            let by = match b {
+                Some(op) => lobpcg_apply(op, &y_blk)?,
+                None => y_blk.clone(),
+            };
+            let gram = y_blk.tr_mul(&by);
+            let Some(factor) = upper_cholesky(&gram) else {
+                return Err(SparseError::InvalidArgument {
+                    message: "Linearly dependent constraints".to_string(),
+                });
+            };
+            lobpcg_apply_constraints(&mut x_blk, &factor, &by, &y_blk);
+            Some((y_blk, by, factor))
+        }
+    };
+
+    // B-orthonormalize X.
+    let Some((orthonormal, bx_new, _)) = lobpcg_b_orthonormalize(b, &x_blk, None)? else {
+        return Err(SparseError::InvalidArgument {
+            message: "Linearly dependent initial approximations".to_string(),
+        });
+    };
+    x_blk = orthonormal;
+    let mut bx = bx_new;
+
+    // Initial Ritz vectors.
+    let mut ax = lobpcg_apply(a, &x_blk)?;
+    let Some((all_values, all_vectors)) = lobpcg_eigh(&x_blk.tr_mul(&ax), None) else {
+        return Err(SparseError::InvalidArgument {
+            message: "lobpcg: the initial Rayleigh-Ritz eigenproblem failed".to_string(),
+        });
+    };
+    let selected = lobpcg_select(&all_values, size_x, largest);
+    let mut lambda: Vec<f64> = selected.iter().map(|&i| all_values[i]).collect();
+    let rotation = all_vectors.select_columns(selected.iter());
+    x_blk = &x_blk * &rotation;
+    ax = &ax * &rotation;
+    bx = bx.map(|bx| bx * &rotation);
+
+    let mut lambda_history = vec![vec![0.0; size_x]; max_iter + 3];
+    let mut residual_history = vec![vec![0.0; size_x]; max_iter + 3];
+    lambda_history[0] = lambda.clone();
+
+    let mut active = vec![true; size_x];
+    let mut p: Option<LobpcgBlock> = None;
+    let mut ap: Option<LobpcgBlock> = None;
+    let mut bp: Option<LobpcgBlock> = None;
+    let mut smallest_residual = f64::MAX;
+    let mut best_iteration = max_iter;
+    let mut best_x = x_blk.clone();
+    let mut iteration: isize = -1;
+    let mut restart = true;
+    let mut forced_restart = false;
+    let mut explicit_gram = false;
+    let restart_factor = 2.0_f64.powi(options.restart_control);
+    let myeps = f64::EPSILON.sqrt();
+
+    while iteration < max_iter as isize {
+        iteration += 1;
+        let it = iteration as usize;
+        // The residual block is formed before a forced restart recomputes A·X, and it is this
+        // block whose active columns are used below, as in SciPy.
+        let r_full = lobpcg_residual_block(&ax, bx.as_ref().unwrap_or(&x_blk), &lambda);
+        let norms = lobpcg_column_norms(&r_full);
+        residual_history[it] = norms.clone();
+        let residual_norm = norms.iter().map(|v| v.abs()).sum::<f64>() / size_x as f64;
+        if residual_norm < smallest_residual {
+            smallest_residual = residual_norm;
+            best_iteration = it;
+            best_x = x_blk.clone();
+        } else if residual_norm > restart_factor * smallest_residual {
+            forced_restart = true;
+            ax = lobpcg_apply(a, &x_blk)?;
+            if let Some(op) = b {
+                bx = Some(lobpcg_apply(op, &x_blk)?);
+            }
+        }
+        for (flag, &norm) in active.iter_mut().zip(&norms) {
+            *flag = *flag && norm > tol;
+        }
+        let active_idx: Vec<usize> = (0..size_x).filter(|&j| active[j]).collect();
+        let current = active_idx.len();
+        if current == 0 {
+            break;
+        }
+
+        let mut active_r = r_full.select_columns(active_idx.iter());
+        let (mut active_p, mut active_ap, mut active_bp) = if it > 0 {
+            (
+                p.as_ref().map(|blk| blk.select_columns(active_idx.iter())),
+                ap.as_ref().map(|blk| blk.select_columns(active_idx.iter())),
+                bp.as_ref().map(|blk| blk.select_columns(active_idx.iter())),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        if let Some(op) = m {
+            active_r = lobpcg_apply(op, &active_r)?;
+        }
+        if let Some((y_blk, by, factor)) = &constraints {
+            lobpcg_apply_constraints(&mut active_r, factor, by, y_blk);
+        }
+        // B-orthogonalize the preconditioned residuals to X.
+        {
+            let basis = bx.as_ref().unwrap_or(&x_blk);
+            let projection = basis.tr_mul(&active_r);
+            active_r -= &x_blk * projection;
+        }
+        let Some((r_orthonormal, br_orthonormal, _)) = lobpcg_b_orthonormalize(b, &active_r, None)?
+        else {
+            // SciPy warns "Failed at iteration ..." and stops iterating.
+            break;
+        };
+        active_r = r_orthonormal;
+        let active_br = br_orthonormal;
+        let active_ar = lobpcg_apply(a, &active_r)?;
+
+        if it > 0 {
+            let p_blk = active_p.take().expect("P exists after the first iteration");
+            let orthonormalized = if b.is_some() {
+                lobpcg_b_orthonormalize(b, &p_blk, active_bp.as_ref())?
+            } else {
+                lobpcg_b_orthonormalize(None, &p_blk, None)?
+            };
+            match orthonormalized {
+                Some((p_on, bp_on, inv_r)) => {
+                    active_p = Some(p_on);
+                    if b.is_some() {
+                        active_bp = bp_on;
+                    }
+                    active_ap = active_ap.map(|blk| blk * &inv_r);
+                    restart = forced_restart;
+                }
+                None => {
+                    active_p = Some(p_blk);
+                    restart = true;
+                }
+            }
+        }
+
+        let max_norm = norms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let max_norm = if norms.iter().any(|v| v.is_nan()) {
+            f64::NAN
+        } else {
+            max_norm
+        };
+        explicit_gram = !(max_norm > myeps && !explicit_gram);
+
+        // Shared memory assignments: B = I makes BX = X, BR = R, BP = P.
+        let bx_ref = bx.as_ref().unwrap_or(&x_blk);
+        let br_ref = active_br.as_ref().unwrap_or(&active_r);
+
+        let gram_xar = x_blk.tr_mul(&active_ar);
+        let mut gram_rar = active_r.tr_mul(&active_ar);
+        let (gram_xax, gram_xbx, gram_rbr, gram_xbr) = if explicit_gram {
+            gram_rar = symmetrized(&gram_rar);
+            (
+                symmetrized(&x_blk.tr_mul(&ax)),
+                x_blk.tr_mul(bx_ref),
+                active_r.tr_mul(br_ref),
+                x_blk.tr_mul(br_ref),
+            )
+        } else {
+            (
+                DMatrix::from_diagonal(&DVector::from_column_slice(&lambda)),
+                DMatrix::identity(size_x, size_x),
+                DMatrix::identity(current, current),
+                DMatrix::zeros(size_x, current),
+            )
+        };
+
+        let mut eigen = None;
+        if !restart {
+            let p_ref = active_p.as_ref().expect("P after orthonormalization");
+            let ap_ref = active_ap.as_ref().expect("AP accompanies P");
+            let bp_ref = if b.is_some() {
+                active_bp.as_ref().expect("BP accompanies P")
+            } else {
+                p_ref
+            };
+            let gram_xap = x_blk.tr_mul(ap_ref);
+            let gram_rap = active_r.tr_mul(ap_ref);
+            let mut gram_pap = p_ref.tr_mul(ap_ref);
+            let gram_xbp = x_blk.tr_mul(bp_ref);
+            let gram_rbp = active_r.tr_mul(bp_ref);
+            let gram_pbp = if explicit_gram {
+                gram_pap = symmetrized(&gram_pap);
+                p_ref.tr_mul(bp_ref)
+            } else {
+                DMatrix::identity(current, current)
+            };
+            let gram_a = block3(
+                &gram_xax, &gram_xar, &gram_xap, &gram_rar, &gram_rap, &gram_pap,
+            );
+            let gram_b = block3(
+                &gram_xbx, &gram_xbr, &gram_xbp, &gram_rbr, &gram_rbp, &gram_pbp,
+            );
+            match lobpcg_eigh(&gram_a, Some(&gram_b)) {
+                Some(found) => eigen = Some(found),
+                // Try again after dropping the direction vectors P from the Rayleigh-Ritz.
+                None => restart = true,
+            }
+        }
+        if restart {
+            let gram_a = block2(&gram_xax, &gram_xar, &gram_rar);
+            let gram_b = block2(&gram_xbx, &gram_xbr, &gram_rbr);
+            match lobpcg_eigh(&gram_a, Some(&gram_b)) {
+                Some(found) => eigen = Some(found),
+                // SciPy warns "eigh failed at iteration ..." and stops iterating.
+                None => break,
+            }
+        }
+        let (all_values, all_vectors) = eigen.expect("an eigensolve succeeded or the loop broke");
+        let selected = lobpcg_select(&all_values, size_x, largest);
+        lambda = selected.iter().map(|&i| all_values[i]).collect();
+        let vectors = all_vectors.select_columns(selected.iter());
+        lambda_history[it + 1] = lambda.clone();
+
+        // Ritz vectors.
+        let e_x = vectors.rows(0, size_x).into_owned();
+        let e_r = vectors.rows(size_x, current).into_owned();
+        let (pp, app, bpp) = if restart {
+            (
+                &active_r * &e_r,
+                &active_ar * &e_r,
+                b.map(|_| br_ref * &e_r),
+            )
+        } else {
+            let e_p = vectors.rows(size_x + current, current).into_owned();
+            let p_ref = active_p.as_ref().expect("P after orthonormalization");
+            let ap_ref = active_ap.as_ref().expect("AP accompanies P");
+            (
+                &active_r * &e_r + p_ref * &e_p,
+                &active_ar * &e_r + ap_ref * &e_p,
+                b.map(|_| br_ref * &e_r + active_bp.as_ref().expect("BP accompanies P") * &e_p),
+            )
+        };
+        x_blk = &x_blk * &e_x + &pp;
+        ax = &ax * &e_x + &app;
+        if let (Some(bx_blk), Some(bpp)) = (bx.as_mut(), bpp.as_ref()) {
+            *bx_blk = &*bx_blk * &e_x + bpp;
+        }
+        p = Some(pp);
+        ap = Some(app);
+        bp = bpp;
+    }
+
+    // Use the old lambda in case of an early loop exit.
+    let exit_iteration = iteration.max(0) as usize;
+    let norms = lobpcg_residual(&ax, bx.as_ref().unwrap_or(&x_blk), &lambda);
+    lambda_history[exit_iteration + 1] = lambda.clone();
+    residual_history[exit_iteration + 1] = norms.clone();
+    let residual_norm = norms.iter().map(|v| v.abs()).sum::<f64>() / size_x as f64;
+    if residual_norm < smallest_residual {
+        best_iteration = exit_iteration + 1;
+        best_x = x_blk.clone();
+    }
+
+    // Final exact Rayleigh-Ritz on the best block.
+    let mut x_blk = best_x;
+    if let Some((y_blk, by, factor)) = &constraints {
+        lobpcg_apply_constraints(&mut x_blk, factor, by, y_blk);
+    }
+    let ax = lobpcg_apply(a, &x_blk)?;
+    let gram_xax = symmetrized(&x_blk.tr_mul(&ax));
+    let bx = match b {
+        Some(op) => lobpcg_apply(op, &x_blk)?,
+        None => x_blk.clone(),
+    };
+    let gram_xbx = symmetrized(&x_blk.tr_mul(&bx));
+    let Some((all_values, all_vectors)) = lobpcg_eigh(&gram_xax, Some(&gram_xbx)) else {
+        return Err(SparseError::InvalidArgument {
+            message: "eigh has failed in lobpcg postprocessing".to_string(),
+        });
+    };
+    let selected = lobpcg_select(&all_values, size_x, largest);
+    let lambda: Vec<f64> = selected.iter().map(|&i| all_values[i]).collect();
+    let rotation = all_vectors.select_columns(selected.iter());
+    let x_blk = &x_blk * &rotation;
+    let ax = &ax * &rotation;
+    let bx = &bx * &rotation;
+    let residual_norms = lobpcg_residual(&ax, &bx, &lambda);
+
+    lambda_history[best_iteration + 1] = lambda.clone();
+    residual_history[best_iteration + 1] = residual_norms.clone();
+    lambda_history.truncate(best_iteration + 2);
+    residual_history.truncate(best_iteration + 2);
+
+    let converged = residual_norms.iter().all(|&norm| norm <= tol);
+    Ok(LobpcgResult {
+        eigenvectors: (0..size_x)
+            .map(|j| x_blk.column(j).iter().copied().collect())
+            .collect(),
+        eigenvalues: lambda,
+        residual_norms,
+        lambda_history,
+        residual_norms_history: residual_history,
+        iterations: exit_iteration,
+        converged,
+        dense_fallback: false,
     })
 }
 
@@ -41508,7 +42331,7 @@ pub fn qmr_batch(
 }
 
 type IterativeSolver<Options> =
-    fn(&CsrMatrix, &[f64], Option<&[f64]>, Options) -> SparseResult<IterativeSolveResult>;
+    fn(&dyn LinearOperator, &[f64], Option<&[f64]>, Options) -> SparseResult<IterativeSolveResult>;
 
 /// Run one Krylov solver over an independent batch of right-hand sides.
 ///
@@ -42762,8 +43585,7 @@ mod lsqr_x0_tests {
 /// Transpose-Free Quasi-Minimal Residual -- `scipy.sparse.linalg.tfqmr`.
 ///
 /// One of the two iterative solvers SciPy ships that this crate did not have; the
-/// other is `gcrotmk`, which is a much larger piece of work (Krylov subspace
-/// recycling with outer and inner iterations) and is not attempted here.
+/// other was `gcrotmk`, now [`gcrotmk`]. `A` may be any [`LinearOperator`].
 ///
 /// TFQMR (Freund 1993) is a transpose-free variant of QMR for general nonsymmetric
 /// systems. Its appeal over BiCGSTAB is a smoother residual curve -- it quasi-minimizes
@@ -42792,7 +43614,7 @@ mod lsqr_x0_tests {
 ///   than reported from `tau`. The QMR bound is an upper bound and can sit well above
 ///   the achieved residual, so reporting it would understate the result.
 pub fn tfqmr(
-    a: &CsrMatrix,
+    a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
@@ -42841,7 +43663,7 @@ pub fn tfqmr(
         .max_iter
         .unwrap_or_else(|| n.saturating_mul(10).min(10_000));
 
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let r: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
 
     // `rstar` is the shadow residual, held fixed at r0. Because it EQUALS r0, the
@@ -42851,7 +43673,7 @@ pub fn tfqmr(
     let rstar = r.clone();
     let mut u = r.clone();
     let mut w = r.clone();
-    let mut v = csr_matvec(a, &r);
+    let mut v = a.matvec(&r)?;
     let mut uhat = v.clone();
     let mut d = vec![0.0_f64; n];
     let mut theta = 0.0_f64;
@@ -42914,7 +43736,7 @@ pub fn tfqmr(
         // The QMR bound on the true residual, which is what SciPy tests. It is an
         // UPPER bound, so passing it means the true residual is at least this good.
         if tau * ((iteration + 1) as f64).sqrt() < atol {
-            let ax = csr_matvec(a, &x);
+            let ax = a.matvec(&x)?;
             let residual_norm = vec_norm_diff(&ax, b) / b_norm;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -42926,7 +43748,7 @@ pub fn tfqmr(
         }
 
         if even {
-            uhat = csr_matvec(a, &u_next);
+            uhat = a.matvec(&u_next)?;
             u.copy_from_slice(&u_next);
             rho_last = rho;
         } else {
@@ -42936,14 +43758,14 @@ pub fn tfqmr(
                 u[i] = w[i] + beta * u[i];
                 v[i] = beta * uhat[i] + beta * beta * v[i];
             }
-            uhat = csr_matvec(a, &u);
+            uhat = a.matvec(&u)?;
             for i in 0..n {
                 v[i] += uhat[i];
             }
         }
     }
 
-    let ax = csr_matvec(a, &x);
+    let ax = a.matvec(&x)?;
     let residual_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
@@ -42951,6 +43773,688 @@ pub fn tfqmr(
         iterations: max_iter,
         residual_norm,
     })
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GCROT(m, k) — flexible inner-outer Krylov solver with subspace recycling
+// ══════════════════════════════════════════════════════════════════════
+
+/// What [`gcrotmk`] drops from its recycled subspace once it holds `k` pairs: SciPy's
+/// `truncate=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GcrotmkTruncate {
+    /// `'oldest'` (SciPy's default): drop the oldest recycled pairs.
+    #[default]
+    Oldest,
+    /// `'smallest'`: keep the `k − 1` directions of largest singular value of `B·R⁻¹`, the
+    /// optimal truncation of de Sturler (1999).
+    Smallest,
+}
+
+/// Options for [`gcrotmk`]: SciPy's keyword arguments with SciPy's defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GcrotmkOptions {
+    /// `rtol` (default `1e-5`). Converged when `‖b − A·x‖ ≤ max(atol, rtol·‖b‖)`.
+    pub rtol: f64,
+    /// `atol` (default `0`); must be finite and non-negative.
+    pub atol: f64,
+    /// `maxiter`: outer iterations (default 1000). Must be at least 1 unless `b = 0`.
+    pub max_iter: usize,
+    /// `m`: inner FGMRES iterations per outer iteration (default 20).
+    pub m: usize,
+    /// `k`: recycled pairs kept between outer iterations (`None` is SciPy's `k = m`).
+    pub k: Option<usize>,
+    /// `discard_C`: on return keep only the `u` half of every recycled pair.
+    pub discard_c: bool,
+    /// `truncate`.
+    pub truncate: GcrotmkTruncate,
+}
+
+impl Default for GcrotmkOptions {
+    fn default() -> Self {
+        Self {
+            rtol: 1e-5,
+            atol: 0.0,
+            max_iter: 1000,
+            m: 20,
+            k: None,
+            discard_c: false,
+            truncate: GcrotmkTruncate::Oldest,
+        }
+    }
+}
+
+/// One recycled pair of [`gcrotmk`], SciPy's `CU` entry `(c, u)` with `c = A·u`. `c = None`
+/// means only `u` is known (SciPy's `(None, u)`); the next solve recomputes `A·u`.
+pub type GcrotmkPair = (Option<Vec<f64>>, Vec<f64>);
+
+/// Result of [`gcrotmk`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GcrotmkResult {
+    /// The solution `x`.
+    pub solution: Vec<f64>,
+    /// SciPy's `info`: `0` on convergence, otherwise the number of outer iterations performed
+    /// (`maxiter` when the budget ran out; earlier when the inner iteration met a non-finite
+    /// value, SciPy's `LinAlgError` exit).
+    pub info: usize,
+    /// `info == 0`.
+    pub converged: bool,
+    /// Inner FGMRES cycles run (outer iterations that reached the inner solve); equals `info`
+    /// when not converged.
+    pub iterations: usize,
+    /// The true relative residual `‖b − A·x‖ / ‖b‖` of `solution` (0 for `b = 0`).
+    pub residual_norm: f64,
+}
+
+/// One inner FGMRES cycle of [`gcrotmk`] (SciPy's `_fgmres` with `cs`, no outer vectors).
+struct GcrotmkCycle {
+    /// The Hessenberg QR's Givens rotations `(c, s)`; rotation `i` acts on rows `i, i + 1`.
+    rotations: Vec<(f64, f64)>,
+    /// Columns of the upper-triangular `R`: `r_columns[j]` holds `R[0..=j, j]`.
+    r_columns: Vec<Vec<f64>>,
+    /// `B[i][j] = cᵢᵀ·w_j`: the projections removed against the recycled `C`.
+    b: Vec<Vec<f64>>,
+    /// Orthonormal Arnoldi basis `V` (`j + 2` vectors).
+    vs: Vec<Vec<f64>>,
+    /// Preconditioned directions `Z` (`j + 1` vectors).
+    zs: Vec<Vec<f64>>,
+    /// Least-squares coefficients `y` (`j + 1` entries).
+    y: Vec<f64>,
+}
+
+impl GcrotmkCycle {
+    /// `H·y = Q·(R·y)`, SciPy's `hy = Q.dot(R.dot(y))`.
+    fn hessenberg_times(&self, y: &[f64]) -> Vec<f64> {
+        let size = self.r_columns.len();
+        let mut out = vec![0.0; size + 1];
+        for (column, &yc) in self.r_columns.iter().zip(y) {
+            for (oi, &rij) in out.iter_mut().zip(column) {
+                *oi += rij * yc;
+            }
+        }
+        // Q = G₀ᵀ·G₁ᵀ ⋯ G_jᵀ: apply G_jᵀ first.
+        for (i, &(c, s)) in self.rotations.iter().enumerate().rev() {
+            let (p, q) = (out[i], out[i + 1]);
+            out[i] = c * p - s * q;
+            out[i + 1] = s * p + c * q;
+        }
+        out
+    }
+
+    /// `R'` (the leading square upper triangle) as a dense matrix.
+    fn r_square(&self) -> DMatrix<f64> {
+        let size = self.r_columns.len();
+        DMatrix::from_fn(
+            size,
+            size,
+            |i, j| {
+                if i <= j { self.r_columns[j][i] } else { 0.0 }
+            },
+        )
+    }
+}
+
+/// SciPy's `scipy.linalg.lstsq(R, rhs)` for a small square `R`: the minimum-norm solution
+/// through the SVD, with singular values at most `ε·σ_max` treated as zero (`gelsd` with
+/// `cond = eps`). `None` when the SVD does not converge.
+fn small_lstsq(r: DMatrix<f64>, rhs: &[f64]) -> Option<Vec<f64>> {
+    let size = r.nrows();
+    let svd = nalgebra::SVD::try_new(r, true, true, f64::EPSILON, 10_000)?;
+    let largest = svd.singular_values.iter().fold(0.0_f64, |m, &s| m.max(s));
+    let rhs = DVector::from_column_slice(rhs);
+    let y = svd.solve(&rhs, f64::EPSILON * largest).ok()?;
+    debug_assert_eq!(y.len(), size);
+    Some(y.iter().copied().collect())
+}
+
+/// SciPy's `_fgmres(matvec, v0, m, atol, rpsolve=psolve, cs=cs)`. `Ok(None)` is SciPy's
+/// `LinAlgError` (a non-finite pivot), which ends [`gcrotmk`]'s outer loop.
+fn gcrotmk_fgmres(
+    a: &dyn LinearOperator,
+    preconditioner: Option<&dyn LinearOperator>,
+    v0: Vec<f64>,
+    m: usize,
+    atol: f64,
+    cs: &[&[f64]],
+) -> SparseResult<Option<GcrotmkCycle>> {
+    let n = v0.len();
+    let eps = f64::EPSILON;
+    let mut cycle = GcrotmkCycle {
+        rotations: Vec::with_capacity(m),
+        r_columns: Vec::with_capacity(m),
+        b: vec![Vec::with_capacity(m); cs.len()],
+        vs: vec![v0],
+        zs: Vec::with_capacity(m),
+        y: Vec::new(),
+    };
+    // First row of Q, i.e. Qᵀ·e₀, grown one entry per column.
+    let mut q0 = vec![1.0_f64];
+    let mut w = vec![0.0; n];
+    for j in 0..m {
+        let last = cycle.vs.last().expect("v0 is always present");
+        let z = match preconditioner {
+            Some(p) => p.matvec(last)?,
+            None => last.clone(),
+        };
+        a.matvec_into(&z, &mut w)?;
+        let w_norm = vec_norm(&w);
+
+        // GCROT projection: orthogonalize against C, recording B.
+        for (row, c) in cycle.b.iter_mut().zip(cs) {
+            let alpha = dot_product(c, &w);
+            row.push(alpha);
+            subtract_scaled_basis_vector(&mut w, alpha, c);
+        }
+        // Modified Gram-Schmidt against V.
+        let mut hcur = vec![0.0; j + 2];
+        for (i, v) in cycle.vs.iter().enumerate() {
+            let alpha = dot_product(v, &w);
+            hcur[i] = alpha;
+            subtract_scaled_basis_vector(&mut w, alpha, v);
+        }
+        hcur[j + 1] = vec_norm(&w);
+        let inverse = 1.0 / hcur[j + 1];
+        let mut next = w.clone();
+        if inverse.is_finite() {
+            next.iter_mut().for_each(|value| *value *= inverse);
+        }
+        // `not (h > eps·‖w‖)`: true for a NaN too.
+        let breakdown =
+            hcur[j + 1].partial_cmp(&(eps * w_norm)) != Some(std::cmp::Ordering::Greater);
+        cycle.vs.push(next);
+        cycle.zs.push(z);
+
+        // qr_insert of column j: Q₂ᵀ·h through the previous rotations, then one rotation
+        // that annihilates h[j + 1].
+        for (i, &(c, s)) in cycle.rotations.iter().enumerate() {
+            let (p, q) = (hcur[i], hcur[i + 1]);
+            hcur[i] = c * p + s * q;
+            hcur[i + 1] = -s * p + c * q;
+        }
+        let (c, s, r) = lapack_lartg(hcur[j], hcur[j + 1]);
+        hcur[j] = r;
+        hcur.truncate(j + 1);
+        cycle.rotations.push((c, s));
+        cycle.r_columns.push(hcur);
+        q0.push(0.0);
+        let (p, q) = (q0[j], q0[j + 1]);
+        q0[j] = c * p + s * q;
+        q0[j + 1] = -s * p + c * q;
+
+        let res = q0[j + 1].abs();
+        if res < atol || breakdown {
+            break;
+        }
+    }
+
+    let size = cycle.r_columns.len();
+    if size == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "gcrotmk needs at least one inner iteration (m + k must be positive)"
+                .to_string(),
+        });
+    }
+    if !cycle.r_columns[size - 1][size - 1].is_finite() {
+        return Ok(None);
+    }
+    // SciPy's lstsq runs with check_finite=True and raises ValueError on a NaN/Inf.
+    if cycle
+        .r_columns
+        .iter()
+        .flatten()
+        .chain(&q0[..size])
+        .any(|v| !v.is_finite())
+    {
+        return Err(SparseError::NonFiniteInput {
+            message: "gcrotmk: array must not contain infs or NaNs".to_string(),
+        });
+    }
+    let Some(y) = small_lstsq(cycle.r_square(), &q0[..size]) else {
+        return Ok(None);
+    };
+    cycle.y = y;
+    Ok(Some(cycle))
+}
+
+/// Householder QR with column pivoting of the `n × p` matrix whose columns are `columns`:
+/// LAPACK `dgeqp3` (largest remaining column norm first, the first one on a tie), with `Q`
+/// formed as `dorgqr` does. Returns `(Q columns, R columns, permutation)`, economic sizes:
+/// `min(n, p)` columns of `Q`, `R` as `p` columns of length `min(n, p)`.
+#[allow(clippy::type_complexity)]
+fn pivoted_qr(columns: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<usize>) {
+    let p = columns.len();
+    let t = n.min(p);
+    let mut work: Vec<Vec<f64>> = columns.to_vec();
+    let mut perm: Vec<usize> = (0..p).collect();
+    let mut reflectors: Vec<(Vec<f64>, f64)> = Vec::with_capacity(t);
+    for k in 0..t {
+        let norm_of = |col: &Vec<f64>| col[k..].iter().map(|v| v * v).sum::<f64>().sqrt();
+        let mut pivot = k;
+        let mut best = norm_of(&work[k]);
+        for (j, col) in work.iter().enumerate().skip(k + 1) {
+            let norm = norm_of(col);
+            if norm > best {
+                best = norm;
+                pivot = j;
+            }
+        }
+        work.swap(k, pivot);
+        perm.swap(k, pivot);
+        // dlarfg: H = I − τ·v·vᵀ with v[0] = 1, mapping x to (β, 0, ..., 0).
+        let alpha = work[k][k];
+        let x_norm = work[k][k + 1..].iter().map(|v| v * v).sum::<f64>().sqrt();
+        let (v, tau) = if x_norm == 0.0 {
+            (vec![1.0], 0.0)
+        } else {
+            let beta = -alpha.hypot(x_norm).copysign(alpha);
+            let tau = (beta - alpha) / beta;
+            let scale = 1.0 / (alpha - beta);
+            let mut v = vec![1.0];
+            v.extend(work[k][k + 1..].iter().map(|x| x * scale));
+            work[k][k] = beta;
+            for entry in &mut work[k][k + 1..] {
+                *entry = 0.0;
+            }
+            (v, tau)
+        };
+        if tau != 0.0 {
+            for col in work.iter_mut().skip(k + 1) {
+                let dot: f64 = v.iter().zip(&col[k..]).map(|(a, b)| a * b).sum();
+                for (entry, &vi) in col[k..].iter_mut().zip(&v) {
+                    *entry -= tau * dot * vi;
+                }
+            }
+        }
+        reflectors.push((v, tau));
+    }
+    // Q = H₀·H₁ ⋯ H_{t−1} applied to the first t columns of the identity.
+    let mut q_columns = Vec::with_capacity(t);
+    for j in 0..t {
+        let mut e = vec![0.0; n];
+        e[j] = 1.0;
+        for (k, (v, tau)) in reflectors.iter().enumerate().rev() {
+            if *tau == 0.0 {
+                continue;
+            }
+            let dot: f64 = v.iter().zip(&e[k..]).map(|(a, b)| a * b).sum();
+            for (entry, &vi) in e[k..].iter_mut().zip(v) {
+                *entry -= tau * dot * vi;
+            }
+        }
+        q_columns.push(e);
+    }
+    let r_columns = work.into_iter().map(|col| col[..t].to_vec()).collect();
+    (q_columns, r_columns, perm)
+}
+
+/// The left singular vectors of the `p × q` matrix `d` (columns of a full `p × p` `W`, by
+/// descending singular value), SciPy's `svd(D)[0]`. Columns past `min(p, q)` complete an
+/// orthonormal basis, as LAPACK's full `U` does (their choice is arbitrary there too).
+fn full_left_singular_vectors(d: &DMatrix<f64>) -> Option<DMatrix<f64>> {
+    let (p, q) = d.shape();
+    let padded = if q < p {
+        DMatrix::from_fn(p, p, |i, j| if j < q { d[(i, j)] } else { 0.0 })
+    } else {
+        d.clone()
+    };
+    let svd = nalgebra::SVD::try_new(padded, true, false, f64::EPSILON, 10_000)?;
+    svd.u
+}
+
+/// GCROT(m, k): `scipy.sparse.linalg.gcrotmk(A, b, x0, rtol=, atol=, maxiter=, M=, m=, k=,
+/// CU=, discard_C=, truncate=)`, transcribed from SciPy 1.17.1's `_gcrotmk.py`.
+///
+/// A flexible inner-outer GMRES (Hicken & Zingg 2010) that carries a recycled subspace
+/// `span(U)` with `C = A·U` orthonormal across outer iterations, truncated to `k` pairs by
+/// `options.truncate`. `preconditioner` is SciPy's `M` (its `matvec` is applied to every inner
+/// direction); `cu` is SciPy's in/out `CU` list, which lets consecutive solves of related
+/// systems share their recycled space — it ends holding the new pairs plus `(None, x)`.
+///
+/// Convergence is SciPy's: the outer loop stops when `‖r‖ ≤ max(atol, rtol·‖b‖)`, the residual
+/// recomputed as `b − A·x` before that verdict whenever a correction has been applied. `A` may
+/// be any [`LinearOperator`]; `rmatvec` is never used.
+///
+/// Numerically this is SciPy's algorithm step for step; the Hessenberg QR is updated with the
+/// same LAPACK `lartg` Givens rotations `qr_insert` applies, the least-squares solve is SVD-based
+/// with SciPy's `cond = eps`, and the recycled-space reorthogonalization uses a column-pivoted
+/// Householder QR (`dgeqp3`). Dot products and norms are summed in index order rather than by
+/// BLAS, so iterates agree with SciPy's to rounding, not bitwise.
+///
+/// # Errors
+/// - [`SparseError::InvalidShape`] for a non-square `A`; [`SparseError::IncompatibleShape`]
+///   for a `b`, `x0`, `M` or `CU` vector of the wrong size.
+/// - [`SparseError::InvalidArgument`] for a non-finite `b` (SciPy: "RHS must contain only finite
+///   numbers"), a negative or non-finite `atol`, a non-finite `rtol`, `max_iter = 0` with
+///   `b ≠ 0`, or `m + k = 0` (SciPy fails with an unbound local in both of the last two).
+/// - [`SparseError::SingularMatrix`] when `truncate = Smallest` meets a singular `R` (SciPy's
+///   `solve` raises `LinAlgError`).
+/// - Any error the operator or the preconditioner returns.
+pub fn gcrotmk(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    x0: Option<&[f64]>,
+    preconditioner: Option<&dyn LinearOperator>,
+    cu: Option<&mut Vec<GcrotmkPair>>,
+    options: GcrotmkOptions,
+) -> SparseResult<GcrotmkResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "expected square matrix, but got shape=({}, {})",
+                shape.rows, shape.cols
+            ),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "shapes of A ({n}, {n}) and b ({},) are incompatible",
+                b.len()
+            ),
+        });
+    }
+    if let Some(p) = preconditioner
+        && p.shape() != shape
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: "matrix and preconditioner have different shapes".to_string(),
+        });
+    }
+    let mut x = match x0 {
+        Some(initial) if initial.len() != n => {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "shapes of A ({n}, {n}) and x0 ({},) are incompatible",
+                    initial.len()
+                ),
+            });
+        }
+        Some(initial) => initial.to_vec(),
+        None => vec![0.0; n],
+    };
+    if b.iter().any(|v| !v.is_finite()) {
+        return Err(SparseError::InvalidArgument {
+            message: "RHS must contain only finite numbers".to_string(),
+        });
+    }
+    if !options.atol.is_finite() || options.atol < 0.0 {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "'scipy.sparse.linalg.gcrotmk' called with invalid `atol`={}; if set, `atol` \
+                 must be a real, non-negative number.",
+                options.atol
+            ),
+        });
+    }
+    if !options.rtol.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("gcrotmk rtol must be finite, got {}", options.rtol),
+        });
+    }
+    let mut local_cu = Vec::new();
+    let cu: &mut Vec<GcrotmkPair> = cu.unwrap_or(&mut local_cu);
+    for (c, u) in cu.iter() {
+        if u.len() != n || c.as_ref().is_some_and(|c| c.len() != n) {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("every CU vector must have length {n}"),
+            });
+        }
+    }
+    let m = options.m;
+    let k = options.k.unwrap_or(m);
+
+    let mut r = match x0 {
+        None => b.to_vec(),
+        Some(_) => {
+            let ax = a.matvec(&x)?;
+            b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
+        }
+    };
+    let b_norm = vec_norm(b);
+    // `_get_atol_rtol`: atol = max(atol, rtol·‖b‖).
+    let atol = options.atol.max(options.rtol * b_norm);
+    let rtol = options.rtol;
+    if b_norm == 0.0 {
+        return Ok(GcrotmkResult {
+            solution: b.to_vec(),
+            info: 0,
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    if options.max_iter == 0 {
+        return Err(SparseError::InvalidArgument {
+            message: "gcrotmk maxiter must be at least 1".to_string(),
+        });
+    }
+
+    if options.discard_c {
+        for pair in cu.iter_mut() {
+            pair.0 = None;
+        }
+    }
+
+    // Reorthogonalize recycled vectors.
+    if !cu.is_empty() {
+        // `CU.sort(key=lambda cu: cu[0] is not None)`: stable, pairs without c first.
+        cu.sort_by_key(|pair| pair.0.is_some());
+        let mut c_columns = Vec::with_capacity(cu.len());
+        let mut us = Vec::with_capacity(cu.len());
+        for (c, u) in cu.drain(..) {
+            let c = match c {
+                Some(c) => c,
+                None => a.matvec(&u)?,
+            };
+            c_columns.push(c);
+            us.push(u);
+        }
+        let (q_columns, r_columns, perm) = pivoted_qr(&c_columns, n);
+        drop(c_columns);
+        // U := U·P·R⁻¹ by back-substitution. SciPy's axpy/scal update `us[P[j]]` in place, so
+        // the `us[P[i]]` it subtracts for i < j are the already-updated vectors.
+        let mut new_us: Vec<Vec<f64>> = Vec::with_capacity(q_columns.len());
+        for j in 0..q_columns.len() {
+            let mut u = us[perm[j]].clone();
+            for (i, previous) in new_us.iter().enumerate() {
+                subtract_scaled_basis_vector(&mut u, r_columns[j][i], previous);
+            }
+            if r_columns[j][j].abs() < 1e-12 * r_columns[0][0].abs() {
+                break;
+            }
+            let inverse = 1.0 / r_columns[j][j];
+            u.iter_mut().for_each(|value| *value *= inverse);
+            new_us.push(u);
+        }
+        let pairs: Vec<GcrotmkPair> = q_columns
+            .into_iter()
+            .zip(new_us)
+            .map(|(c, u)| (Some(c), u))
+            .collect();
+        cu.extend(pairs.into_iter().rev());
+    }
+
+    if !cu.is_empty() {
+        // x' = x + U·y with y = Cᴴ·(b − A·x).
+        for (c, u) in cu.iter() {
+            let c = c.as_deref().expect("reorthogonalized pairs carry c");
+            let yc = dot_product(c, &r);
+            add_scaled(&mut x, yc, u);
+            add_scaled(&mut r, -yc, c);
+        }
+    }
+
+    // SciPy's `j_outer`: −1 after a converged break.
+    let mut j_outer: isize = -1;
+    let mut converged_break = false;
+    for outer in 0..options.max_iter {
+        j_outer = outer as isize;
+        let mut beta = vec_norm(&r);
+        let beta_tol = atol.max(rtol * b_norm);
+        if beta <= beta_tol && (outer > 0 || !cu.is_empty()) {
+            // Recompute the residual to avoid rounding error.
+            let ax = a.matvec(&x)?;
+            r = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
+            beta = vec_norm(&r);
+        }
+        if beta <= beta_tol {
+            converged_break = true;
+            break;
+        }
+
+        let ml = m + k.saturating_sub(cu.len());
+        let cs: Vec<&[f64]> = cu
+            .iter()
+            .map(|(c, _)| {
+                c.as_deref()
+                    .expect("recycled pairs carry c inside the loop")
+            })
+            .collect();
+        let v0: Vec<f64> = r.iter().map(|v| v / beta).collect();
+        let Some(cycle) = gcrotmk_fgmres(
+            a,
+            preconditioner,
+            v0,
+            ml,
+            atol.max(rtol * b_norm) / beta,
+            &cs,
+        )?
+        else {
+            // Floating point over/underflow or a non-finite product: report failure.
+            break;
+        };
+        drop(cs);
+        let y: Vec<f64> = cycle.y.iter().map(|v| v * beta).collect();
+
+        // ux := (Z − U·B)·y
+        let mut ux: Vec<f64> = cycle.zs[0].iter().map(|z| z * y[0]).collect();
+        for (z, &yc) in cycle.zs.iter().zip(&y).skip(1) {
+            add_scaled(&mut ux, yc, z);
+        }
+        for ((_, u), row) in cu.iter().zip(&cycle.b) {
+            let byc: f64 = row.iter().zip(&y).map(|(bij, yj)| bij * yj).sum();
+            add_scaled(&mut ux, -byc, u);
+        }
+        // cx := V·H·y
+        let hy = cycle.hessenberg_times(&y);
+        let mut cx: Vec<f64> = cycle.vs[0].iter().map(|v| v * hy[0]).collect();
+        for (v, &hyc) in cycle.vs.iter().zip(&hy).skip(1) {
+            add_scaled(&mut cx, hyc, v);
+        }
+        // Normalize cx, maintaining cx = A·ux; it is orthogonal to the previous C.
+        let alpha = 1.0 / vec_norm(&cx);
+        if !alpha.is_finite() {
+            continue;
+        }
+        cx.iter_mut().for_each(|v| *v *= alpha);
+        ux.iter_mut().for_each(|v| *v *= alpha);
+
+        let gamma = dot_product(&cx, &r);
+        add_scaled(&mut r, -gamma, &cx);
+        add_scaled(&mut x, gamma, &ux);
+
+        match options.truncate {
+            GcrotmkTruncate::Oldest => {
+                while cu.len() >= k && !cu.is_empty() {
+                    cu.remove(0);
+                }
+            }
+            GcrotmkTruncate::Smallest => {
+                if cu.len() >= k && !cu.is_empty() {
+                    gcrotmk_truncate_smallest(cu, &cycle, k)?;
+                }
+            }
+        }
+        cu.push((Some(cx), ux));
+    }
+
+    // Include the solution vector in the span.
+    cu.push((None, x.clone()));
+    if options.discard_c {
+        for pair in cu.iter_mut() {
+            pair.0 = None;
+        }
+    }
+
+    let cycles = usize::try_from(j_outer + 1).unwrap_or(0);
+    let (info, iterations) = if converged_break {
+        (0, cycles.saturating_sub(1))
+    } else {
+        (cycles, cycles)
+    };
+    let ax = a.matvec(&x)?;
+    let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+    Ok(GcrotmkResult {
+        solution: x,
+        info,
+        converged: info == 0,
+        iterations,
+        residual_norm,
+    })
+}
+
+/// `truncate='smallest'`: replace `CU` by the `k − 1` combinations along the leading left
+/// singular vectors of `D = B·R'⁻¹`, reorthogonalized (SciPy's block of the same name).
+fn gcrotmk_truncate_smallest(
+    cu: &mut Vec<GcrotmkPair>,
+    cycle: &GcrotmkCycle,
+    k: usize,
+) -> SparseResult<()> {
+    let p = cu.len();
+    let size = cycle.r_columns.len();
+    // D = solve(R'ᵀ, Bᵀ)ᵀ: each row dᵢ solves R'ᵀ·dᵢ = bᵢ (forward substitution).
+    let mut d = DMatrix::<f64>::zeros(p, size);
+    for (i, row) in cycle.b.iter().enumerate() {
+        for j in 0..size {
+            let mut value = row[j];
+            for l in 0..j {
+                value -= cycle.r_columns[j][l] * d[(i, l)];
+            }
+            let pivot = cycle.r_columns[j][j];
+            if pivot == 0.0 {
+                return Err(SparseError::SingularMatrix {
+                    message: "gcrotmk truncate='smallest': R is singular".to_string(),
+                });
+            }
+            d[(i, j)] = value / pivot;
+        }
+    }
+    let Some(w) = full_left_singular_vectors(&d) else {
+        return Err(SparseError::NonFiniteInput {
+            message: "gcrotmk truncate='smallest': SVD did not converge".to_string(),
+        });
+    };
+    // Python's `W[:, :k-1]`: k = 0 slices `[:, :-1]`.
+    let keep = if k == 0 {
+        p.saturating_sub(1)
+    } else {
+        (k - 1).min(p)
+    };
+    let mut new_cu: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(keep);
+    for j in 0..keep {
+        let (c0, u0) = &cu[0];
+        let c0 = c0.as_deref().expect("recycled pairs carry c");
+        let mut c: Vec<f64> = c0.iter().map(|v| v * w[(0, j)]).collect();
+        let mut u: Vec<f64> = u0.iter().map(|v| v * w[(0, j)]).collect();
+        for (index, (cp, up)) in cu.iter().enumerate().skip(1) {
+            let cp = cp.as_deref().expect("recycled pairs carry c");
+            add_scaled(&mut c, w[(index, j)], cp);
+            add_scaled(&mut u, w[(index, j)], up);
+        }
+        for (cp, up) in &new_cu {
+            let alpha = dot_product(cp, &c);
+            add_scaled(&mut c, -alpha, cp);
+            add_scaled(&mut u, -alpha, up);
+        }
+        let inverse = 1.0 / vec_norm(&c);
+        c.iter_mut().for_each(|v| *v *= inverse);
+        u.iter_mut().for_each(|v| *v *= inverse);
+        new_cu.push((c, u));
+    }
+    *cu = new_cu.into_iter().map(|(c, u)| (Some(c), u)).collect();
+    Ok(())
 }
 
 /// TFQMR -- `scipy.sparse.linalg.tfqmr`, previously missing from this crate.
@@ -43629,5 +45133,970 @@ mod expm_multiply_tests {
             expm_multiply(&a, &[1.0, 2.0], 1.0, 0.0).is_ok(),
             "a valid call was rejected"
         );
+    }
+}
+
+/// The Krylov solvers on matrix-free [`LinearOperator`]s (frankenscipy-6j5tz).
+///
+/// The operator here is a nonsymmetric tridiagonal convection-diffusion stencil applied by a
+/// closure and never materialized. Its closure sums each row in the CSR column order starting
+/// from 0.0, exactly as the CSR row kernel does, so the matrix-free solve and the solve on the
+/// materialized CSR matrix must agree BIT FOR BIT: that is the evidence the operator path runs
+/// the same recurrence, not merely a similar one. A must-hit control (a perturbed stencil)
+/// shows the bitwise comparison can see a difference.
+#[cfg(test)]
+mod linear_operator_solver_tests {
+    use super::*;
+    use crate::interface::{
+        FunctionOperator, IdentityOperator, LinearOperator, ScaledOperator, SumOperator,
+    };
+
+    const LOWER: f64 = -1.5;
+    const DIAG: f64 = 4.0;
+    const UPPER: f64 = -0.5;
+
+    /// `y_i = LOWER·x_{i−1} + d·x_i + UPPER·x_{i+1}`, summed in CSR column order from 0.0.
+    fn stencil(x: &[f64], lower: f64, diag: f64, upper: f64) -> Vec<f64> {
+        let n = x.len();
+        (0..n)
+            .map(|i| {
+                let mut sum = 0.0;
+                if i > 0 {
+                    sum += lower * x[i - 1];
+                }
+                sum += diag * x[i];
+                if i + 1 < n {
+                    sum += upper * x[i + 1];
+                }
+                sum
+            })
+            .collect()
+    }
+
+    fn matrix_free(n: usize) -> FunctionOperator<'static> {
+        FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(stencil(x, LOWER, DIAG, UPPER))
+        })
+        // Aᵀ swaps the off-diagonals; summed in the CSC column order of A.
+        .with_rmatvec(|x: &[f64]| Ok(stencil(x, UPPER, DIAG, LOWER)))
+    }
+
+    fn materialized(n: usize) -> CsrMatrix {
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for (j, v) in [(i.wrapping_sub(1), LOWER), (i, DIAG), (i + 1, UPPER)] {
+                if j < n {
+                    rows.push(i);
+                    cols.push(j);
+                    vals.push(v);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn rhs(n: usize) -> Vec<f64> {
+        (0..n).map(|i| ((i as f64) * 0.37).sin() + 0.5).collect()
+    }
+
+    fn options() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-10,
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    type Solve = fn(&dyn LinearOperator, &[f64]) -> SparseResult<IterativeSolveResult>;
+
+    fn solvers() -> Vec<(&'static str, Solve)> {
+        vec![
+            ("cg", |a, b| cg(a, b, None, options())),
+            ("gmres", |a, b| gmres(a, b, None, options())),
+            ("bicg", |a, b| bicg(a, b, None, options())),
+            ("cgs", |a, b| cgs(a, b, None, options())),
+            ("bicgstab", |a, b| bicgstab(a, b, None, options())),
+            ("qmr", |a, b| qmr(a, b, None, options())),
+            ("minres", |a, b| minres(a, b, None, options())),
+            ("tfqmr", |a, b| tfqmr(a, b, None, options())),
+            ("lsqr", |a, b| lsqr(a, b, options())),
+            ("lsmr", |a, b| lsmr(a, b, options())),
+            ("lgmres", |a, b| {
+                lgmres(
+                    a,
+                    b,
+                    None,
+                    LgmresOptions {
+                        tol: 1e-10,
+                        ..LgmresOptions::default()
+                    },
+                )
+            }),
+            ("gmres_preconditioned", |a, b| {
+                gmres_preconditioned(a, b, |r: &[f64]| Ok(r.to_vec()), None, None, options())
+            }),
+            ("bicgstab_preconditioned", |a, b| {
+                bicgstab_preconditioned(a, b, |r: &[f64]| Ok(r.to_vec()), None, options())
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_krylov_solver_runs_matrix_free_bit_for_bit_with_the_csr_path() {
+        let n = 60;
+        let (op, csr, b) = (matrix_free(n), materialized(n), rhs(n));
+        for (name, solve) in solvers() {
+            let free = solve(&op, &b).unwrap_or_else(|e| panic!("{name} matrix-free: {e}"));
+            let concrete = solve(&csr, &b).unwrap_or_else(|e| panic!("{name} csr: {e}"));
+            assert_eq!(
+                bits(&free.solution),
+                bits(&concrete.solution),
+                "{name}: matrix-free iterate differs from the CSR one"
+            );
+            assert_eq!(free.iterations, concrete.iterations, "{name}");
+            assert_eq!(free.converged, concrete.converged, "{name}");
+        }
+    }
+
+    #[test]
+    fn bitwise_comparison_sees_a_perturbed_operator() {
+        // MUST-HIT control: a 1-ulp change to one stencil coefficient must be visible, or the
+        // bit-identity test above proves nothing.
+        let n = 60;
+        let perturbed = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(stencil(x, LOWER, f64::from_bits(DIAG.to_bits() + 1), UPPER))
+        });
+        let b = rhs(n);
+        let free = gmres(&perturbed, &b, None, options()).expect("gmres");
+        let concrete = gmres(&materialized(n), &b, None, options()).expect("gmres");
+        assert_ne!(bits(&free.solution), bits(&concrete.solution));
+    }
+
+    #[test]
+    fn matrix_free_solutions_match_the_dense_direct_solve() {
+        let n = 40;
+        let op = matrix_free(n);
+        let b = rhs(n);
+        let dense = op.to_dense().expect("dense");
+        let exact = fsci_linalg::solve(&dense, &b, DenseSolveOptions::default())
+            .expect("dense solve")
+            .x;
+        for (name, solve) in solvers() {
+            if name == "cg" || name == "minres" {
+                // Not symmetric: CG and MINRES are only defined for symmetric A.
+                continue;
+            }
+            let result = solve(&op, &b).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(result.converged, "{name} did not converge");
+            let error = vec_norm_diff(&result.solution, &exact) / vec_norm(&exact);
+            assert!(error < 1e-8, "{name}: relative error {error:e}");
+        }
+    }
+
+    #[test]
+    fn symmetric_matrix_free_laplacian_solved_by_cg_and_minres() {
+        let n = 50;
+        let laplacian = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(stencil(x, -1.0, 2.0, -1.0))
+        });
+        // x_i = i(n+1−i)/2 solves the 1-D Dirichlet Poisson problem with b = 1.
+        let b = vec![1.0; n];
+        let exact: Vec<f64> = (1..=n)
+            .map(|i| (i as f64) * ((n + 1 - i) as f64) / 2.0)
+            .collect();
+        for result in [
+            cg(&laplacian, &b, None, options()).expect("cg"),
+            minres(&laplacian, &b, None, options()).expect("minres"),
+            gmres(&laplacian, &b, None, options()).expect("gmres"),
+        ] {
+            assert!(result.converged);
+            let error = vec_norm_diff(&result.solution, &exact) / vec_norm(&exact);
+            assert!(error < 1e-8, "relative error {error:e}");
+        }
+    }
+
+    #[test]
+    fn transposed_products_require_rmatvec() {
+        let n = 10;
+        let no_rmatvec = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(stencil(x, LOWER, DIAG, UPPER))
+        });
+        let b = rhs(n);
+        let unsupported = |r: SparseResult<IterativeSolveResult>| {
+            matches!(r, Err(SparseError::Unsupported { .. }))
+        };
+        assert!(unsupported(bicg(&no_rmatvec, &b, None, options())));
+        assert!(unsupported(qmr(&no_rmatvec, &b, None, options())));
+        assert!(unsupported(lsqr(&no_rmatvec, &b, options())));
+        assert!(unsupported(lsmr(&no_rmatvec, &b, options())));
+        assert!(matches!(
+            svds(&no_rmatvec, 2, EigsOptions::default()),
+            Err(SparseError::Unsupported { .. })
+        ));
+        // The transpose-free solvers do not need it.
+        assert!(
+            gmres(&no_rmatvec, &b, None, options())
+                .expect("gmres")
+                .converged
+        );
+        assert!(
+            tfqmr(&no_rmatvec, &b, None, options())
+                .expect("tfqmr")
+                .converged
+        );
+    }
+
+    #[test]
+    fn shape_errors_for_operators() {
+        let rectangular =
+            FunctionOperator::new(Shape2D::new(3, 2), |x: &[f64]| Ok(vec![x[0], x[1], 0.0]));
+        assert!(matches!(
+            cg(&rectangular, &[1.0, 2.0, 3.0], None, options()),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            eigsh(&rectangular, 1, EigsOptions::default()),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        let op = matrix_free(4);
+        assert!(matches!(
+            gmres(&op, &[1.0, 2.0], None, options()),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            gcrotmk(
+                &op,
+                &[1.0, 2.0],
+                None,
+                None,
+                None,
+                GcrotmkOptions::default()
+            ),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        // A 1x1 operator.
+        let one = FunctionOperator::new(Shape2D::new(1, 1), |x: &[f64]| Ok(vec![4.0 * x[0]]));
+        let result = gmres(&one, &[2.0], None, options()).expect("gmres 1x1");
+        assert!((result.solution[0] - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn operator_returning_nan_does_not_report_convergence() {
+        let n = 8;
+        let poisoned =
+            FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| Ok(vec![f64::NAN; x.len()]));
+        let b = rhs(n);
+        let result = cg(&poisoned, &b, None, options()).expect("cg");
+        assert!(!result.converged);
+        let result = gmres(&poisoned, &b, None, options()).expect("gmres");
+        assert!(!result.converged);
+    }
+
+    #[test]
+    fn closure_errors_propagate_out_of_the_solver() {
+        let failing = FunctionOperator::new(Shape2D::new(3, 3), |_x: &[f64]| {
+            Err(SparseError::SingularMatrix {
+                message: "user operator failed".to_string(),
+            })
+        });
+        assert!(matches!(
+            cg(&failing, &[1.0, 1.0, 1.0], None, options()),
+            Err(SparseError::SingularMatrix { .. })
+        ));
+    }
+
+    #[test]
+    fn eigensolvers_run_matrix_free_bit_for_bit_with_the_csr_path() {
+        let n = 80;
+        let laplacian = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(stencil(x, -1.0, 2.0, -1.0))
+        })
+        .with_rmatvec(|x: &[f64]| Ok(stencil(x, -1.0, 2.0, -1.0)));
+        let csr = {
+            let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                for (j, v) in [(i.wrapping_sub(1), -1.0), (i, 2.0), (i + 1, -1.0)] {
+                    if j < n {
+                        rows.push(i);
+                        cols.push(j);
+                        vals.push(v);
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        };
+        let options = EigsOptions {
+            which: EigsWhich::LargestAlgebraic,
+            ..EigsOptions::default()
+        };
+        let free = eigsh(&laplacian, 4, options).expect("eigsh matrix-free");
+        let concrete = eigsh(&csr, 4, options).expect("eigsh csr");
+        assert_eq!(bits(&free.eigenvalues), bits(&concrete.eigenvalues));
+        // λ_j = 2 − 2cos(jπ/(n+1)), the four largest.
+        for (i, &lambda) in free.eigenvalues.iter().enumerate() {
+            let j = (n - 3 + i) as f64;
+            let exact = 2.0 - 2.0 * (j * std::f64::consts::PI / (n as f64 + 1.0)).cos();
+            assert!((lambda - exact).abs() < 1e-12, "{lambda} vs {exact}");
+        }
+
+        let free = eigs(&laplacian, 3, EigsOptions::default()).expect("eigs matrix-free");
+        let concrete = eigs(&csr, 3, EigsOptions::default()).expect("eigs csr");
+        assert_eq!(bits(&free.eigenvalues), bits(&concrete.eigenvalues));
+
+        let free = svds(&laplacian, 3, EigsOptions::default()).expect("svds matrix-free");
+        let concrete = svds(&csr, 3, EigsOptions::default()).expect("svds csr");
+        assert_eq!(bits(&free.singular_values), bits(&concrete.singular_values));
+        assert!(free.converged);
+
+        // Shift-invert factors A − σI and needs entries.
+        let shifted = EigsOptions {
+            sigma: Some(0.5),
+            ..EigsOptions::default()
+        };
+        assert!(matches!(
+            eigsh(&laplacian, 2, shifted),
+            Err(SparseError::Unsupported { .. })
+        ));
+        assert!(eigsh(&csr, 2, shifted).is_ok());
+    }
+
+    #[test]
+    fn composed_operators_are_solvable() {
+        // (A + 2I) x = b through the operator algebra equals the materialized solve.
+        let n = 30;
+        let csr = materialized(n);
+        let shifted = SumOperator::new(&csr, ScaledOperator::new(IdentityOperator::new(n), 2.0))
+            .expect("same shape");
+        let b = rhs(n);
+        let dense: Vec<Vec<f64>> = shifted.to_dense().expect("dense");
+        for (i, row) in dense.iter().enumerate() {
+            assert_eq!(row[i], DIAG + 2.0);
+        }
+        let exact = fsci_linalg::solve(&dense, &b, DenseSolveOptions::default())
+            .expect("dense")
+            .x;
+        let result = gmres(&shifted, &b, None, options()).expect("gmres");
+        assert!(result.converged);
+        assert!(vec_norm_diff(&result.solution, &exact) / vec_norm(&exact) < 1e-8);
+    }
+}
+
+/// `gcrotmk` (frankenscipy-6j5tz): SciPy's GCROT(m, k) port.
+#[cfg(test)]
+mod gcrotmk_tests {
+    use super::*;
+    use crate::interface::FunctionOperator;
+
+    /// Nonsymmetric convection-diffusion tridiagonal, diagonally dominant.
+    fn convection(n: usize, diag: f64) -> CsrMatrix {
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for (j, v) in [(i.wrapping_sub(1), -1.5), (i, diag), (i + 1, -0.5)] {
+                if j < n {
+                    rows.push(i);
+                    cols.push(j);
+                    vals.push(v);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn rhs(n: usize) -> Vec<f64> {
+        (0..n).map(|i| ((i as f64) * 0.61).cos() + 0.25).collect()
+    }
+
+    fn relative_residual(a: &CsrMatrix, x: &[f64], b: &[f64]) -> f64 {
+        vec_norm_diff(&csr_matvec(a, x), b) / vec_norm(b)
+    }
+
+    #[test]
+    fn converges_with_scipy_defaults() {
+        let (a, b) = (convection(120, 2.2), rhs(120));
+        let result = gcrotmk(&a, &b, None, None, None, GcrotmkOptions::default()).expect("ok");
+        assert_eq!(result.info, 0);
+        assert!(result.converged);
+        let residual = relative_residual(&a, &result.solution, &b);
+        assert!(residual <= 1e-5, "residual {residual:e}");
+        assert!((result.residual_norm - residual).abs() < 1e-15);
+    }
+
+    #[test]
+    fn tight_tolerance_with_small_m_and_k_and_both_truncations() {
+        let (a, b) = (convection(150, 2.05), rhs(150));
+        for truncate in [GcrotmkTruncate::Oldest, GcrotmkTruncate::Smallest] {
+            let options = GcrotmkOptions {
+                rtol: 1e-10,
+                m: 6,
+                k: Some(3),
+                truncate,
+                ..GcrotmkOptions::default()
+            };
+            let result = gcrotmk(&a, &b, None, None, None, options).expect("ok");
+            assert_eq!(result.info, 0, "{truncate:?}");
+            assert!(
+                result.iterations > 1,
+                "{truncate:?} should need several outer steps"
+            );
+            let residual = relative_residual(&a, &result.solution, &b);
+            assert!(residual <= 1e-10, "{truncate:?}: residual {residual:e}");
+        }
+    }
+
+    #[test]
+    fn matrix_free_runs_bit_for_bit_with_the_csr_path() {
+        let n = 80;
+        let a = convection(n, 2.1);
+        let op = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok((0..x.len())
+                .map(|i| {
+                    let mut s = 0.0;
+                    if i > 0 {
+                        s += -1.5 * x[i - 1];
+                    }
+                    s += 2.1 * x[i];
+                    if i + 1 < x.len() {
+                        s += -0.5 * x[i + 1];
+                    }
+                    s
+                })
+                .collect())
+        });
+        let b = rhs(n);
+        let options = GcrotmkOptions {
+            rtol: 1e-9,
+            m: 8,
+            truncate: GcrotmkTruncate::Smallest,
+            ..GcrotmkOptions::default()
+        };
+        let free = gcrotmk(&op, &b, None, None, None, options).expect("free");
+        let concrete = gcrotmk(&a, &b, None, None, None, options).expect("csr");
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&free.solution), bits(&concrete.solution));
+        assert_eq!(free.info, concrete.info);
+    }
+
+    #[test]
+    fn exhausted_budget_reports_maxiter_as_info() {
+        let (a, b) = (convection(100, 2.01), rhs(100));
+        let options = GcrotmkOptions {
+            rtol: 1e-14,
+            max_iter: 2,
+            m: 3,
+            k: Some(1),
+            ..GcrotmkOptions::default()
+        };
+        let result = gcrotmk(&a, &b, None, None, None, options).expect("ok");
+        assert_eq!(result.info, 2);
+        assert!(!result.converged);
+        assert_eq!(result.iterations, 2);
+    }
+
+    #[test]
+    fn recycled_space_speeds_up_a_second_solve() {
+        let (a, b) = (convection(150, 2.05), rhs(150));
+        let options = GcrotmkOptions {
+            rtol: 1e-9,
+            m: 6,
+            k: Some(6),
+            ..GcrotmkOptions::default()
+        };
+        let mut cu = Vec::new();
+        let first = gcrotmk(&a, &b, None, None, Some(&mut cu), options).expect("first");
+        assert_eq!(first.info, 0);
+        // CU holds the recycled pairs plus (None, x).
+        assert!(
+            cu.last()
+                .is_some_and(|(c, u)| c.is_none() && u == &first.solution)
+        );
+        let b2: Vec<f64> = b
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.1 * (i as f64).sin())
+            .collect();
+        let second = gcrotmk(&a, &b2, None, None, Some(&mut cu), options).expect("second");
+        assert_eq!(second.info, 0);
+        assert!(relative_residual(&a, &second.solution, &b2) <= 1e-9);
+        let cold = gcrotmk(&a, &b2, None, None, None, options).expect("cold");
+        assert!(
+            second.iterations < cold.iterations,
+            "recycled {} vs cold {}",
+            second.iterations,
+            cold.iterations
+        );
+    }
+
+    #[test]
+    fn discard_c_keeps_only_u() {
+        let (a, b) = (convection(60, 2.5), rhs(60));
+        let mut cu = Vec::new();
+        let options = GcrotmkOptions {
+            discard_c: true,
+            ..GcrotmkOptions::default()
+        };
+        gcrotmk(&a, &b, None, None, Some(&mut cu), options).expect("ok");
+        assert!(!cu.is_empty());
+        assert!(cu.iter().all(|(c, _)| c.is_none()));
+        // A second solve recomputes C = A·U.
+        let again = gcrotmk(&a, &b, None, None, Some(&mut cu), options).expect("again");
+        assert_eq!(again.info, 0);
+    }
+
+    #[test]
+    fn jacobi_preconditioner_as_an_operator() {
+        let n = 100;
+        let a = convection(n, 2.05);
+        let jacobi = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok(x.iter().map(|v| v / 2.05).collect())
+        });
+        let b = rhs(n);
+        let options = GcrotmkOptions {
+            rtol: 1e-10,
+            ..GcrotmkOptions::default()
+        };
+        let result = gcrotmk(&a, &b, None, Some(&jacobi), None, options).expect("ok");
+        assert_eq!(result.info, 0);
+        assert!(relative_residual(&a, &result.solution, &b) <= 1e-10);
+    }
+
+    #[test]
+    fn initial_guess_and_zero_rhs() {
+        let (a, b) = (convection(40, 3.0), rhs(40));
+        let exact = gcrotmk(
+            &a,
+            &b,
+            None,
+            None,
+            None,
+            GcrotmkOptions {
+                rtol: 1e-13,
+                ..GcrotmkOptions::default()
+            },
+        )
+        .expect("exact");
+        // Starting at the solution needs no inner cycle.
+        let warm = gcrotmk(
+            &a,
+            &b,
+            Some(&exact.solution),
+            None,
+            None,
+            GcrotmkOptions::default(),
+        )
+        .expect("warm");
+        assert_eq!(warm.info, 0);
+        assert_eq!(warm.iterations, 0);
+        let zero =
+            gcrotmk(&a, &[0.0; 40], None, None, None, GcrotmkOptions::default()).expect("zero");
+        assert_eq!(zero.solution, vec![0.0; 40]);
+        assert_eq!(zero.info, 0);
+        // 1x1.
+        let one = convection(1, 4.0);
+        let result =
+            gcrotmk(&one, &[2.0], None, None, None, GcrotmkOptions::default()).expect("1x1");
+        assert!((result.solution[0] - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn invalid_inputs_are_refused() {
+        let (a, b) = (convection(10, 3.0), rhs(10));
+        let default = GcrotmkOptions::default();
+        let rectangular =
+            CooMatrix::from_triplets(Shape2D::new(2, 3), vec![1.0], vec![0], vec![0], true)
+                .expect("coo")
+                .to_csr()
+                .expect("csr");
+        assert!(matches!(
+            gcrotmk(&rectangular, &[1.0, 1.0], None, None, None, default),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            gcrotmk(&a, &b, Some(&[1.0]), None, None, default),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        let mut nan_b = b.clone();
+        nan_b[3] = f64::NAN;
+        assert!(matches!(
+            gcrotmk(&a, &nan_b, None, None, None, default),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+        for options in [
+            GcrotmkOptions {
+                atol: -1.0,
+                ..default
+            },
+            GcrotmkOptions {
+                max_iter: 0,
+                ..default
+            },
+            GcrotmkOptions {
+                m: 0,
+                k: Some(0),
+                ..default
+            },
+        ] {
+            assert!(matches!(
+                gcrotmk(&a, &b, None, None, None, options),
+                Err(SparseError::InvalidArgument { .. })
+            ));
+        }
+        let wrong_m = IdentityOperator::new(3);
+        assert!(matches!(
+            gcrotmk(&a, &b, None, Some(&wrong_m), None, default),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        let mut bad_cu: Vec<GcrotmkPair> = vec![(None, vec![1.0; 3])];
+        assert!(matches!(
+            gcrotmk(&a, &b, None, None, Some(&mut bad_cu), default),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    use crate::interface::IdentityOperator;
+}
+
+/// `lobpcg` (frankenscipy-6j5tz): SciPy's LOBPCG port.
+#[cfg(test)]
+mod lobpcg_tests {
+    use super::*;
+    use crate::interface::FunctionOperator;
+
+    fn diagonal(values: Vec<f64>) -> CsrMatrix {
+        let n = values.len();
+        CooMatrix::from_triplets(
+            Shape2D::new(n, n),
+            values,
+            (0..n).collect(),
+            (0..n).collect(),
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr")
+    }
+
+    /// Uniform(−1, 1) start block from a 64-bit LCG (reproducible in Python for the oracle).
+    fn start(n: usize, k: usize) -> Vec<Vec<f64>> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..k)
+            .map(|_| {
+                (0..n)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn laplacian_1d(n: usize) -> FunctionOperator<'static> {
+        FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            Ok((0..x.len())
+                .map(|i| {
+                    let left = if i > 0 { x[i - 1] } else { 0.0 };
+                    let right = if i + 1 < x.len() { x[i + 1] } else { 0.0 };
+                    2.0 * x[i] - left - right
+                })
+                .collect())
+        })
+    }
+
+    fn laplacian_eigenvalue(n: usize, j: usize) -> f64 {
+        2.0 - 2.0 * (j as f64 * std::f64::consts::PI / (n as f64 + 1.0)).cos()
+    }
+
+    #[test]
+    fn largest_and_smallest_of_a_diagonal_matrix() {
+        let n = 100;
+        let a = diagonal((1..=n).map(|v| v as f64).collect());
+        let result = lobpcg(
+            &a,
+            &start(n, 3),
+            None,
+            None,
+            None,
+            LobpcgOptions {
+                max_iter: 100,
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("largest");
+        assert!(result.converged, "{:?}", result.residual_norms);
+        for (got, want) in result.eigenvalues.iter().zip([100.0, 99.0, 98.0]) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        // Smallest, with the exact inverse-diagonal preconditioner.
+        let inverse = diagonal((1..=n).map(|v| 1.0 / v as f64).collect());
+        let result = lobpcg(
+            &a,
+            &start(n, 3),
+            None,
+            Some(&inverse),
+            None,
+            LobpcgOptions {
+                largest: false,
+                max_iter: 100,
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("smallest");
+        assert!(result.converged);
+        for (got, want) in result.eigenvalues.iter().zip([1.0, 2.0, 3.0]) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        // Eigenvectors are unit vectors e_{i}.
+        for (j, vector) in result.eigenvectors.iter().enumerate() {
+            assert!((vector[j].abs() - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn matrix_free_laplacian_matches_the_analytic_spectrum() {
+        let n = 60;
+        let op = laplacian_1d(n);
+        let result = lobpcg(
+            &op,
+            &start(n, 4),
+            None,
+            None,
+            None,
+            LobpcgOptions {
+                max_iter: 300,
+                tol: Some(1e-9),
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("lobpcg");
+        assert!(result.converged, "{:?}", result.residual_norms);
+        for (i, &lambda) in result.eigenvalues.iter().enumerate() {
+            let want = laplacian_eigenvalue(n, n - i);
+            assert!((lambda - want).abs() < 1e-10, "{lambda} vs {want}");
+        }
+        // B-orthonormal (B = I) eigenvectors.
+        for (p, x) in result.eigenvectors.iter().enumerate() {
+            for (q, y) in result.eigenvectors.iter().enumerate() {
+                let dot = dot_product(x, y);
+                let want = if p == q { 1.0 } else { 0.0 };
+                assert!((dot - want).abs() < 1e-10);
+            }
+        }
+        // The history has one row per recorded step, the last being the final values.
+        assert!(!result.lambda_history.is_empty());
+        assert_eq!(
+            result.lambda_history.len(),
+            result.residual_norms_history.len()
+        );
+        assert_eq!(result.lambda_history.last(), Some(&result.eigenvalues));
+    }
+
+    #[test]
+    fn generalized_problem_and_constraints() {
+        let n = 80;
+        let a = diagonal((1..=n).map(|v| v as f64).collect());
+        let b = diagonal(vec![2.0; n]);
+        let result = lobpcg(
+            &a,
+            &start(n, 2),
+            Some(&b),
+            None,
+            None,
+            LobpcgOptions {
+                max_iter: 200,
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("generalized");
+        assert!(result.converged);
+        for (got, want) in result.eigenvalues.iter().zip([40.0, 39.5]) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        // xᵀBx = 1.
+        for x in &result.eigenvectors {
+            assert!((2.0 * dot_product(x, x) - 1.0).abs() < 1e-10);
+        }
+        // Constraining away the top eigenvector e_{n-1} yields the next ones.
+        let mut top = vec![0.0; n];
+        top[n - 1] = 1.0;
+        let constrained = lobpcg(
+            &a,
+            &start(n, 2),
+            None,
+            None,
+            Some(&[top]),
+            LobpcgOptions {
+                max_iter: 200,
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("constrained");
+        assert!(constrained.converged);
+        for (got, want) in constrained.eigenvalues.iter().zip([79.0, 78.0]) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        for x in &constrained.eigenvectors {
+            assert!(x[n - 1].abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn small_problems_take_the_dense_branch() {
+        let a = diagonal(vec![3.0, -1.0, 7.0, 2.0, 5.0, 0.5, 4.0, 6.0, 1.0, 8.0]);
+        let close = |got: &[f64], want: &[f64]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-13)
+        };
+        let result = lobpcg(
+            &a,
+            &start(10, 3),
+            None,
+            None,
+            None,
+            LobpcgOptions::default(),
+        )
+        .expect("dense");
+        assert!(result.dense_fallback);
+        assert!(
+            close(&result.eigenvalues, &[8.0, 7.0, 6.0]),
+            "{:?}",
+            result.eigenvalues
+        );
+        let result = lobpcg(
+            &a,
+            &start(10, 2),
+            None,
+            None,
+            None,
+            LobpcgOptions {
+                largest: false,
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("dense smallest");
+        assert!(
+            close(&result.eigenvalues, &[-1.0, 0.5]),
+            "{:?}",
+            result.eigenvalues
+        );
+        // 1x1.
+        let one = diagonal(vec![-2.5]);
+        let result = lobpcg(
+            &one,
+            &[vec![1.0]],
+            None,
+            None,
+            None,
+            LobpcgOptions::default(),
+        )
+        .expect("1x1");
+        assert!(
+            close(&result.eigenvalues, &[-2.5]),
+            "{:?}",
+            result.eigenvalues
+        );
+        // Constraints are not supported by the dense branch (SciPy: NotImplementedError).
+        assert!(matches!(
+            lobpcg(
+                &a,
+                &start(10, 3),
+                None,
+                None,
+                Some(&[vec![1.0; 10]]),
+                LobpcgOptions::default()
+            ),
+            Err(SparseError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn non_convergence_is_reported_not_raised() {
+        let n = 200;
+        let op = laplacian_1d(n);
+        let result = lobpcg(
+            &op,
+            &start(n, 3),
+            None,
+            None,
+            None,
+            LobpcgOptions {
+                largest: false,
+                max_iter: 3,
+                tol: Some(1e-12),
+                ..LobpcgOptions::default()
+            },
+        )
+        .expect("runs");
+        assert!(!result.converged);
+        assert_eq!(result.eigenvalues.len(), 3);
+    }
+
+    #[test]
+    fn invalid_inputs_are_refused() {
+        let n = 30;
+        let a = diagonal((1..=n).map(|v| v as f64).collect());
+        assert!(matches!(
+            lobpcg(&a, &[], None, None, None, LobpcgOptions::default()),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            lobpcg(
+                &a,
+                &[vec![1.0; 5]],
+                None,
+                None,
+                None,
+                LobpcgOptions::default()
+            ),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        let twin = start(n, 1)[0].clone();
+        assert!(matches!(
+            lobpcg(
+                &a,
+                &[twin.clone(), twin],
+                None,
+                None,
+                None,
+                LobpcgOptions::default()
+            ),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+        let wrong = diagonal(vec![1.0; 4]);
+        assert!(matches!(
+            lobpcg(
+                &a,
+                &start(n, 2),
+                Some(&wrong),
+                None,
+                None,
+                LobpcgOptions::default()
+            ),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        let rectangular = FunctionOperator::new(Shape2D::new(3, 2), |x: &[f64]| Ok(vec![x[0]; 3]));
+        assert!(matches!(
+            lobpcg(
+                &rectangular,
+                &[vec![1.0, 1.0]],
+                None,
+                None,
+                None,
+                LobpcgOptions::default()
+            ),
+            Err(SparseError::InvalidShape { .. })
+        ));
     }
 }
