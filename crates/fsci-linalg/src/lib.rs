@@ -1780,19 +1780,97 @@ fn matrix_norm1_rows(rows: &[Vec<f64>], ncols: usize) -> f64 {
     column_sums.into_iter().fold(0.0_f64, f64::max)
 }
 
-fn rcond_from_singular_values(values: &DVector<f64>) -> f64 {
-    let mut max_s = 0.0_f64;
-    let mut min_s = f64::MAX;
-    for &value in values.iter() {
+/// Jacobi sweeps after which [`small_matrix_rcond`] stops even if a column
+/// pair is still not orthogonal to working precision. Four columns converge
+/// quadratically in a handful of sweeps.
+const SMALL_RCOND_MAX_SWEEPS: usize = 40;
+
+/// `sigma_min / sigma_max` of a square matrix of at most four rows, by
+/// one-sided (Hestenes) Jacobi. Only +, -, *, / and sqrt are used, all IEEE
+/// correctly rounded, in a fixed order, so the bits are the same on every
+/// platform. nalgebra's SVD would bring in the platform libm's hypot, atan2 and
+/// sin_cos. One-sided Jacobi keeps small singular values to high relative
+/// accuracy, which the rcond of a near-singular system needs.
+///
+/// The matrix is first scaled by a power of two (exact), so that squaring an
+/// entry cannot overflow. rcond does not depend on scale. Column sums of
+/// squares underflow below about 1e-154 of the largest entry, so an rcond under
+/// that reads as 0, which is singular for every threshold that consults it. A
+/// non-finite entry gives 0.
+fn small_matrix_rcond(a: &DMatrix<f64>) -> f64 {
+    let n = a.nrows();
+    debug_assert!(
+        n == a.ncols() && n <= 4,
+        "small_matrix_rcond takes n x n, n <= 4"
+    );
+    let mut peak = 0.0_f64;
+    for value in a.iter() {
         if !value.is_finite() {
             return 0.0;
         }
-        if value > max_s {
-            max_s = value;
+        peak = peak.max(value.abs());
+    }
+    if n == 0 || peak == 0.0 {
+        return 0.0;
+    }
+    // 2^-e with peak in [2^e, 2^(e+1)), so the scaled peak is in [1, 2).
+    // Subnormal peaks keep e = -1022, which is still exact.
+    let biased = i32::try_from((peak.to_bits() >> 52) & 0x7ff).unwrap_or(1);
+    let e = (biased.max(1) - 1023).clamp(-1022, 1022);
+    let scale = f64::from_bits(u64::try_from(1023 - e).unwrap_or(1023) << 52);
+    let mut cols = [[0.0_f64; 4]; 4];
+    for j in 0..n {
+        for i in 0..n {
+            cols[j][i] = a[(i, j)] * scale;
         }
-        if value < min_s {
-            min_s = value;
+    }
+    let dot = |x: &[f64; 4], y: &[f64; 4]| {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += x[i] * y[i];
         }
+        sum
+    };
+    for _ in 0..SMALL_RCOND_MAX_SWEEPS {
+        let mut rotated = false;
+        for p in 0..n {
+            for q in p + 1..n {
+                let alpha = dot(&cols[p], &cols[p]);
+                let beta = dot(&cols[q], &cols[q]);
+                let gamma = dot(&cols[p], &cols[q]);
+                if gamma == 0.0 || gamma.abs() <= f64::EPSILON * alpha.sqrt() * beta.sqrt() {
+                    continue;
+                }
+                rotated = true;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let sign = if zeta >= 0.0 { 1.0 } else { -1.0 };
+                // tan of the rotation angle, the smaller root; for a huge zeta
+                // 1/(2 zeta) avoids squaring it.
+                let t = if zeta.abs() > 1e150 {
+                    0.5 / zeta
+                } else {
+                    sign / (zeta.abs() + (1.0 + zeta * zeta).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = c * t;
+                for i in 0..n {
+                    let up = cols[p][i];
+                    let uq = cols[q][i];
+                    cols[p][i] = c * up - s * uq;
+                    cols[q][i] = s * up + c * uq;
+                }
+            }
+        }
+        if !rotated {
+            break;
+        }
+    }
+    let mut max_s = 0.0_f64;
+    let mut min_s = f64::MAX;
+    for column in cols.iter().take(n) {
+        let sigma = dot(column, column).sqrt();
+        max_s = max_s.max(sigma);
+        min_s = min_s.min(sigma);
     }
     if max_s > 0.0 { min_s / max_s } else { 0.0 }
 }
@@ -2151,10 +2229,7 @@ fn condition_diagnostics_with_assumption_mode(
         let (matrix, matrix_norm_1) = dmatrix_from_rows_with_norm1(a)?;
         let lu = matrix.clone().lu();
         let rcond = if rows <= 4 {
-            match safe_svd(matrix.clone(), false, false) {
-                Ok(svd) => rcond_from_singular_values(&svd.singular_values),
-                Err(_) => fast_rcond_from_lu(&lu, matrix_norm_1, rows),
-            }
+            small_matrix_rcond(&matrix)
         } else {
             fast_rcond_from_lu(&lu, matrix_norm_1, rows)
         };
@@ -42532,6 +42607,73 @@ mod tests {
         assert_eq!(condition_signal_from_rcond(10.0), 0.0);
         assert_eq!(condition_signal_from_rcond(0.0), 16.0);
         assert_eq!(condition_signal_from_rcond(f64::NAN), 16.0);
+    }
+
+    // The n <= 4 rcond is one-sided Jacobi, not nalgebra's SVD with its platform hypot, atan2
+    // and sin_cos. It must agree with that SVD to the SVD's own accuracy, about eps * sigma_max
+    // on every singular value, so within 1e-13 in rcond.
+    #[test]
+    fn small_matrix_rcond_agrees_with_the_svd() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0
+        };
+        for n in 1..=4 {
+            for case in 0..300 {
+                let mut m = DMatrix::<f64>::from_fn(n, n, |_, _| next());
+                // Every other case spreads the columns over three decades each, so near-singular
+                // matrices are covered too.
+                if case % 2 == 1 {
+                    for j in 0..n {
+                        let spread = 10_f64.powi(-3 * j as i32);
+                        for i in 0..n {
+                            m[(i, j)] *= spread;
+                        }
+                    }
+                }
+                let sigma = m.clone().svd(false, false).singular_values;
+                let (min_s, max_s) = sigma
+                    .iter()
+                    .fold((f64::MAX, 0.0_f64), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+                let expected = min_s / max_s;
+                let got = small_matrix_rcond(&m);
+                assert!(
+                    (got - expected).abs() <= 1e-13,
+                    "n={n} case={case}: jacobi {got:e} vs svd {expected:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_matrix_rcond_exact_cases() {
+        let diagonal = DMatrix::from_row_slice(
+            4,
+            4,
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0,
+            ],
+        );
+        assert_eq!(small_matrix_rcond(&diagonal), 0.25);
+        assert_eq!(small_matrix_rcond(&DMatrix::<f64>::identity(3, 3)), 1.0);
+        let singular = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 4.0]);
+        assert!(small_matrix_rcond(&singular) < 1e-15);
+        assert_eq!(small_matrix_rcond(&DMatrix::<f64>::zeros(2, 2)), 0.0);
+        let poisoned = DMatrix::from_row_slice(2, 2, &[1.0, f64::NAN, 0.0, 1.0]);
+        assert_eq!(small_matrix_rcond(&poisoned), 0.0);
+        // A power-of-two scale changes no bit of the result, up to the edge of the range.
+        let m = DMatrix::from_row_slice(3, 3, &[2.0, -1.0, 0.5, 0.25, 3.0, -2.0, 1.0, 1.0, 1.0]);
+        let reference = small_matrix_rcond(&m).to_bits();
+        for exponent in [-1000, -300, 300, 1000] {
+            let factor = 2_f64.powi(exponent);
+            assert_eq!(
+                small_matrix_rcond(&(m.clone() * factor)).to_bits(),
+                reference
+            );
+        }
     }
 
     #[test]
