@@ -14,9 +14,11 @@
 //! | `scipy_incumbent` | [`ScipyIncumbent`]: the one live-SciPy oracle resolver |
 //! | `booking_claim` | [`BookingClaim`]: verifies the fleet measurement booking a timed row cites |
 //! | `warnings`  | SciPy's warning classes, [`warn`] and [`catch_warnings`]    |
+//! | `deterministic_math` | [`deterministic_exp`], [`deterministic_log10`]: the same bits on every platform |
 
 pub mod booking_claim;
 mod calibrated_losses;
+mod deterministic_math;
 pub mod eprocess;
 pub mod evidence;
 pub mod mode;
@@ -28,6 +30,7 @@ pub mod warnings;
 
 // ── Re-exports: preserve the flat public API ────────────────────────
 pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
+pub use deterministic_math::{deterministic_exp, deterministic_log10};
 pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionEvidenceEntry,
@@ -319,7 +322,9 @@ fn rcond_decade(rcond: f64) -> usize {
     if !rcond.is_finite() || rcond <= 0.0 {
         return RCOND_DECADES - 1;
     }
-    let decade = (-rcond.log10()).floor();
+    // Not the platform libm: a last-bit difference at a decade would count the outcome in
+    // another row on another platform (fsci-runtime deterministic_math).
+    let decade = (-deterministic_log10(rcond)).floor();
     if decade <= 0.0 {
         0
     } else {
@@ -605,7 +610,7 @@ impl SolverPortfolio {
             return [0.0, 0.0, 0.0, 1.0];
         }
 
-        let log_r = rcond.log10();
+        let log_r = deterministic_log10(rcond);
         let mut p = [0.0; 4];
 
         // Find the interval [centers[i+1], centers[i]] that contains log_r
@@ -1924,7 +1929,7 @@ mod tests {
             return [0.0, 0.0, 0.0, 1.0];
         }
 
-        let log_r = rcond.max(1e-25).log10();
+        let log_r = deterministic_log10(rcond.max(1e-25));
         let centers = [-2.0, -6.0, -11.0, -16.0];
         let mut posterior = [0.0; 4];
 

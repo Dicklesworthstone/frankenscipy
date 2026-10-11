@@ -2188,9 +2188,12 @@ pub fn condition_diagnostics(a: &[Vec<f64>]) -> Result<ConditionReport, LinalgEr
     Ok(condition_diagnostics_with_assumption(a, None)?.report)
 }
 
+/// `-log10(rcond)` for the solve policy. Through [`fsci_runtime::deterministic_log10`], not the
+/// platform libm: the signal decides `FailClosed` / `FullValidate`, and a last-bit difference at
+/// a threshold must not change that decision from one platform to the next.
 fn condition_signal_from_rcond(rcond: f64) -> f64 {
     if rcond.is_finite() && rcond > 0.0 {
-        (-rcond.log10()).clamp(0.0, 16.0)
+        (-fsci_runtime::deterministic_log10(rcond)).clamp(0.0, 16.0)
     } else {
         16.0
     }
@@ -42510,6 +42513,25 @@ mod tests {
                 mode == RuntimeMode::Strict
             );
         }
+    }
+
+    // The solve policy's condition signal is -log10(rcond) without the platform libm, so its
+    // bits, and the FailClosed / FullValidate decision taken on them, are the same on every
+    // platform; at each decade literal it is the exact integer.
+    #[test]
+    fn solve_policy_signal_is_exact_at_decades() {
+        for k in 0..=16 {
+            let rcond: f64 = format!("1e-{k}").parse().expect("decade literal");
+            assert_eq!(
+                condition_signal_from_rcond(rcond),
+                f64::from(k),
+                "rcond=1e-{k}"
+            );
+        }
+        assert_eq!(condition_signal_from_rcond(1e-20), 16.0);
+        assert_eq!(condition_signal_from_rcond(10.0), 0.0);
+        assert_eq!(condition_signal_from_rcond(0.0), 16.0);
+        assert_eq!(condition_signal_from_rcond(f64::NAN), 16.0);
     }
 
     #[test]

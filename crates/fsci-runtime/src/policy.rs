@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::deterministic_math::deterministic_exp;
 use crate::evidence::{DecisionEvidenceEntry, PolicyEvidenceLedger};
 use crate::mode::RuntimeMode;
 use crate::signals::DecisionSignals;
@@ -217,9 +218,12 @@ pub(crate) fn logits_from_signals(signals: DecisionSignals) -> [f64; 3] {
     [compatible, ill_conditioned, incompatible]
 }
 
+/// The posterior decides `FailClosed` / `FullValidate` at expected-loss crossovers, so its
+/// exponentials are [`deterministic_exp`]: a platform libm's last bit there could change the
+/// action from one platform to the next.
 pub(crate) fn softmax(logits: [f64; 3]) -> [f64; 3] {
     let max_logit = logits.iter().fold(f64::NEG_INFINITY, |acc, v| acc.max(*v));
-    let exps = logits.map(|v| (v - max_logit).exp());
+    let exps = logits.map(|v| deterministic_exp(v - max_logit));
     let denom = exps.iter().sum::<f64>();
     if denom <= 0.0 {
         return [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
