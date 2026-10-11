@@ -2598,11 +2598,45 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     (s, (a - (s - bb)) + (b - bb))
 }
 
-/// `a · b = p + e` exactly: a fused multiply-add rounds `a·b − p` once, and that value is
-/// representable, so `e` is exact (barring overflow and underflow).
+/// Veltkamp's splitter, 2^27 + 1: [`split`] cuts a double into halves of at most 26
+/// significant bits, so every product of two halves is exact.
+const VELTKAMP_SPLITTER: f64 = 134_217_729.0;
+
+/// 2^996: beyond this magnitude `VELTKAMP_SPLITTER * x` can overflow, so [`two_prod`]
+/// first scales such a factor by an exact power of two.
+const VELTKAMP_SPLIT_LIMIT: f64 = f64::from_bits((1023 + 996) << 52);
+
+/// `x = hi + lo` exactly, each half of at most 26 significant bits (Veltkamp).
+fn split(x: f64) -> (f64, f64) {
+    let t = VELTKAMP_SPLITTER * x;
+    let hi = t - (t - x);
+    (hi, x - hi)
+}
+
+/// `a · b = p + e` exactly (barring overflow and underflow), by Dekker's TwoProduct over
+/// Veltkamp's split: +, - and * only. A fused multiply-add gives the same `e`, since `a·b − p`
+/// is representable, but downstream bit-reproducible consumers keep FMA off their certified
+/// paths (franken_manim fm-g1ey). A factor above 2^996 is scaled by 2^-64 first, which is exact,
+/// and `e` is scaled back.
 fn two_prod(a: f64, b: f64) -> (f64, f64) {
+    const TWO_M64: f64 = f64::from_bits((1023 - 64) << 52);
+    const TWO_64: f64 = f64::from_bits((1023 + 64) << 52);
     let p = a * b;
-    (p, a.mul_add(b, -p))
+    let (a_s, a_up) = if a.abs() > VELTKAMP_SPLIT_LIMIT {
+        (a * TWO_M64, TWO_64)
+    } else {
+        (a, 1.0)
+    };
+    let (b_s, b_up) = if b.abs() > VELTKAMP_SPLIT_LIMIT {
+        (b * TWO_M64, TWO_64)
+    } else {
+        (b, 1.0)
+    };
+    let p_s = a_s * b_s;
+    let (a_hi, a_lo) = split(a_s);
+    let (b_hi, b_lo) = split(b_s);
+    let e = ((a_hi * b_hi - p_s) + a_hi * b_lo + a_lo * b_hi) + a_lo * b_lo;
+    (p, e * a_up * b_up)
 }
 
 /// `r = b − A·x`, each component a compensated dot product (Ogita–Rump–Oishi Dot2: as accurate
@@ -42674,6 +42708,48 @@ mod tests {
                 reference
             );
         }
+    }
+
+    // Dekker's TwoProduct gives the same exact error term a fused multiply-add does, wherever
+    // neither overflows nor underflows, including factors past 2^996 that are scaled first.
+    #[test]
+    fn two_prod_matches_the_fused_error_term() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            let mantissa = |bits: u64| 1.0 + (bits >> 12) as f64 / (1_u64 << 52) as f64;
+            let (ma, mb) = (mantissa(next()), mantissa(next()));
+            // Exponents keep a * b inside the normal range with room for the error term.
+            let ea = (next() % 1200) as i32 - 600;
+            let eb = (next() % 1200) as i32 - 600;
+            if !(-900..=900).contains(&(ea + eb)) {
+                continue;
+            }
+            let sign = if next() % 2 == 0 { 1.0 } else { -1.0 };
+            let a = sign * ma * 2_f64.powi(ea);
+            let b = mb * 2_f64.powi(eb);
+            let (p, e) = two_prod(a, b);
+            assert_eq!(p.to_bits(), (a * b).to_bits());
+            assert_eq!(
+                e.to_bits(),
+                a.mul_add(b, -p).to_bits(),
+                "two_prod({a:e}, {b:e})"
+            );
+            checked += 1;
+        }
+        assert!(checked > 100_000);
+        let (huge, small) = (
+            1.5 * 2_f64.powi(1000),
+            1.25 * 2_f64.powi(-200) + 2_f64.powi(-252),
+        );
+        let (p, e) = two_prod(huge, small);
+        assert_eq!(e.to_bits(), huge.mul_add(small, -p).to_bits());
     }
 
     #[test]
