@@ -30,10 +30,10 @@ impl<R: Read + Seek> NpzArchive<R> {
             .map_err(zip_io)
     }
 
-    fn array_names(&self) -> impl Iterator<Item = &str> {
-        self.zip
-            .file_names()
-            .filter_map(|name| name.strip_suffix(".npy"))
+    /// Exact-name lookup, the same one `by_name` uses, so the existence check
+    /// never decodes unrelated member names.
+    fn has_array(&self, name: &str) -> bool {
+        self.zip.index_for_name(&format!("{name}.npy")).is_some()
     }
 
     fn by_name<'a>(&'a mut self, name: &str) -> io::Result<Option<NpyFile<ZipFile<'a, R>>>> {
@@ -584,7 +584,7 @@ fn load_coo<R: Read + Seek>(
 ) -> io::Result<SparseNpz> {
     let (data, data_shape) = read_numeric_member(npz, "data")?;
     expect_shape("data", &data_shape, &[data.len()])?;
-    let has_coords = npz.array_names().any(|name| name == "coords");
+    let has_coords = npz.has_array("coords");
 
     let coordinates = if has_coords {
         let (flat, coordinate_shape) = read_usize_member(npz, "coords")?;
