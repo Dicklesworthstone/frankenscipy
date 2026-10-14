@@ -148,6 +148,23 @@ fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|w| format!("{w:08x}")).collect()
 }
 
+/// `is_x86_feature_detected!` exists only on x86; on any other ISA every x86 feature reads as
+/// absent, so these perf binaries also build on aarch64.
+#[cfg(target_arch = "x86_64")]
+fn cpu_has(feature: &str) -> bool {
+    match feature {
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_has(_feature: &str) -> bool {
+    false
+}
+
 /// Runtime ISA of the machine producing these numbers. A ratio measured on a binary compiled for
 /// baseline x86-64 (SSE2, 128-bit) is not comparable to one compiled with AVX2 (256-bit), and the
 /// fleet is heterogeneous — so record what the CPU offers and what the binary was built for.
@@ -155,9 +172,9 @@ fn isa() -> String {
     let has = |f: &str, on: bool| if on { format!("+{f}") } else { format!("-{f}") };
     let cpu = format!(
         "cpu:{} {} {}",
-        has("avx2", is_x86_feature_detected!("avx2")),
-        has("fma", is_x86_feature_detected!("fma")),
-        has("avx512f", is_x86_feature_detected!("avx512f"))
+        has("avx2", cpu_has("avx2")),
+        has("fma", cpu_has("fma")),
+        has("avx512f", cpu_has("avx512f"))
     );
     let built = format!(
         "built:{} {}",

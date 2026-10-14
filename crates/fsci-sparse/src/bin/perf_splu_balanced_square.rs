@@ -1012,11 +1012,9 @@ for raw_line in sys.stdin.buffer:
              actual_observed_frankenscipy_threads={} affinity={} loadavg={}",
             read_trimmed("/proc/sys/kernel/hostname"),
             read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-            if std::arch::is_x86_feature_detected!("avx512f") {
+            if super::cpu_has("avx512f") {
                 "avx512f+avx2+fma"
-            } else if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
+            } else if super::cpu_has("avx2") && super::cpu_has("fma") {
                 "avx2+fma"
             } else {
                 "baseline"
@@ -2118,6 +2116,23 @@ for raw_line in sys.stdin.buffer:
             assert!(!is_help_request(&args(&["help"])));
         }
     }
+}
+
+/// `is_x86_feature_detected!` exists only on x86; on any other ISA every x86 feature reads as
+/// absent, so these perf binaries also build on aarch64.
+#[cfg(target_arch = "x86_64")]
+fn cpu_has(feature: &str) -> bool {
+    match feature {
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_has(_feature: &str) -> bool {
+    false
 }
 
 fn main() {
