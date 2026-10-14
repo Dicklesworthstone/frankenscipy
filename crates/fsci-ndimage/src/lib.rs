@@ -1824,8 +1824,12 @@ impl SplineFlags {
     /// atomic survives anywhere in the per-pixel path and the compiler is free to specialise
     /// the loop. Hardcodes exactly the default values (`offsets = true` because the shipped
     /// `NDIMAGE_SPLINE_OFFSET_DISABLE` is `false`; `compact_disabled = false`).
+    /// Test builds count calls here too, so the frequency gate holds for both arms (GH #12);
+    /// the shipping constant arm is unchanged.
     #[cfg(feature = "spline-flags-const")]
     fn resolve() -> Self {
+        #[cfg(test)]
+        SPLINE_FLAGS_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             offsets: true,
             compact_disabled: false,
