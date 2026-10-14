@@ -1,5 +1,25 @@
 # Dependency Upgrade Log
 
+## 0.4.0 release
+
+Direct dependency changes from the published 0.3.0 workspace:
+
+| Dependency | 0.3.0 | 0.4.0 |
+|---|---|---|
+| zip | 8.6.0 | 9.0.3 |
+| serde_json | 1.0.151 | 1.0.154 |
+| toml | 1.1.6 | 1.1.8 |
+| proptest (dev) | 1.11.0 | 1.12.0 |
+
+zip 9 decodes member names lazily, so `ZipArchive::file_names` yields
+`ZipResult<Cow<str>>`. The `.npz` reader now checks for `coords.npy` with the
+exact-name lookup that `by_name` uses. proptest 1.12 adds borsh, core_detect
+and proc-macro-crate to the dev-only graph. asupersync 0.5.0, ftui 0.9.0 and
+the other direct dependencies were already at their latest stable versions.
+SHA-2 stays on 0.10.9 pending
+[#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9).
+Transitive dependencies were not refreshed beyond what these updates required.
+
 ## 0.3.0 release
 
 Selected dependency changes from the published 0.2.0 workspace:

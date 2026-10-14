@@ -1481,6 +1481,7 @@ fn lahqr(
                 h[(l, l - 1)] = CZERO;
             }
             if l >= iu {
+                // status: the active block is empty (l >= iu after zlahqr's small-subdiagonal test)
                 converged = true;
                 break;
             }

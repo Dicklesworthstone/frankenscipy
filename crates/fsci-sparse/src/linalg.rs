@@ -37933,6 +37933,7 @@ fn lobpcg_dense(
         lambda_history: Vec::new(),
         residual_norms_history: Vec::new(),
         iterations: 0,
+        // status: direct dense eigensolve (SciPy's small-problem fallback); nothing iterates
         converged: true,
         dense_fallback: true,
     })
@@ -44795,6 +44796,7 @@ pub fn gcrotmk(
         return Ok(GcrotmkResult {
             solution: b.to_vec(),
             info: 0,
+            // status: ||b|| == 0, so x = b = 0 solves exactly (SciPy returns info 0)
             converged: true,
             iterations: 0,
             residual_norm: 0.0,

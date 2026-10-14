@@ -1,5 +1,162 @@
 # Changelog
 
+## [0.4.0] — 2026-10-14
+
+### Added
+
+- `fsci_linalg::complex`: complex128 dense linear algebra. It covers solve,
+  LU, Cholesky, QR, Hessenberg, Schur, eig/eigh, SVD, lstsq, pinv, norm,
+  expm, sqrtm and logm. `logm_real` and `sqrtm_real` return SciPy's complex
+  result for real input with negative eigenvalues. 198 live-SciPy cases
+  pass, worst relative error 6.8e-15
+  ([`7ec9bee19`](https://github.com/Dicklesworthstone/frankenscipy/commit/7ec9bee195c94ac49566b7250180329f825b3d49)).
+- `fsci_cluster::dendrogram`: the layout of SciPy's
+  `dendrogram(Z, no_plot=True)` (icoord, dcoord, ivl, leaves, colours),
+  with truncation, sorting, colour-threshold and label options. All 408
+  compared layouts are exactly equal
+  ([`637985850`](https://github.com/Dicklesworthstone/frankenscipy/commit/6379858508c13dacba918fef44b5fb51c3da223e)).
+- `scipy.sparse.linalg` names:
+  - `LinearOperator` and `aslinearoperator`, with SciPy's operator algebra;
+  - `gcrotmk` and `lobpcg`
+    ([`f2f6d2cea`](https://github.com/Dicklesworthstone/frankenscipy/commit/f2f6d2cead59024a543859281b018bbb4e734b6a));
+  - `factorized`, `inv` and `LaplacianNd`
+    ([`96e419658`](https://github.com/Dicklesworthstone/frankenscipy/commit/96e419658794c435555bcc2be64c55f0bece1e88));
+  - `funm_multiply_krylov`
+    ([`c49647c80`](https://github.com/Dicklesworthstone/frankenscipy/commit/c49647c803ad52ea4072e59ec39faa3945e7094d)).
+
+  Each has live-SciPy diff tests
+  ([`269a29e4b`](https://github.com/Dicklesworthstone/frankenscipy/commit/269a29e4be29137969ca5633389a98c7dedb3f17)).
+- `fsci_fft::fftpack`: the `scipy.fftpack` pseudo-differential operators
+  `diff`, `tilbert`, `itilbert`, `hilbert`, `ihilbert`, `cs_diff`,
+  `sc_diff`, `ss_diff`, `cc_diff` and `shift`. 300 cases pass, worst
+  relative error 7.8e-16
+  ([`a2ada4878`](https://github.com/Dicklesworthstone/frankenscipy/commit/a2ada4878e83903154d3dd178cc37660b86c3029)).
+- `fsci_linalg::interpolative::estimate_rank` (SciPy's `idd_estrank`) and
+  `fsci_stats::trimmed_mean` (`mstats.trimmed_mean`)
+  ([`e24feca41`](https://github.com/Dicklesworthstone/frankenscipy/commit/e24feca41fdf92c25a55ed57c14457ebd16fb0bd)).
+- `fsci_runtime::deterministic_exp` and `deterministic_log10`, within 1 ulp
+  of the correctly rounded value on every platform
+  ([`d00db63ac`](https://github.com/Dicklesworthstone/frankenscipy/commit/d00db63ac9d4260c37870309a459f5e2d148206b)).
+
+### Changed (breaking)
+
+- **`linprog`** now has HiGHS's result shape. It is a bounded revised
+  simplex with exact duals, plus a Mehrotra interior-point method with
+  crossover. It takes `LinprogOptions` (method `Highs`, `HighsDs` or
+  `HighsIpm`, `maxiter`, tolerances) instead of `maxiter: Option<usize>`.
+  `LinprogResult` adds slack, con, status, message, nit, crossover_nit,
+  and the `ineqlin`/`eqlin`/`lower`/`upper` residuals and marginals.
+  - `maxiter = Some(0)` is now an iteration-limit result, not an error.
+  - Crossed or wrong-side infinite bounds are now status-2 results, not
+    `InvalidBounds` errors.
+  - A non-optimal result has empty vectors and a NaN `fun` where SciPy
+    returns None.
+  - 102 live-SciPy outcomes compared, none failed
+    ([`0f97e193d`](https://github.com/Dicklesworthstone/frankenscipy/commit/0f97e193de726e4feb2a4ca994ec5ba54e8dc785)).
+- **`minimize(method=TrustConstr)`** is SciPy's trust-constr: the
+  Byrd–Omojokun equality SQP and the trust-region interior point. It honours
+  constraints and bounds instead of refusing them, and `trust_constr_full`
+  returns the full `TrustConstrResult`. All 17 constrained cases agree with
+  SciPy
+  ([`5b4b3d948`](https://github.com/Dicklesworthstone/frankenscipy/commit/5b4b3d948a53a007302a754a110a892292e3d9d3)).
+- **`cobyla` and `minimize(method=Cobyla)`** are Powell's COBYLA,
+  transcribed from SciPy's PRIMA, with constraints and bounds. The compass
+  search that used the name is gone. 24 of 25 live-SciPy cases are
+  bit-identical
+  ([`9ec3a5475`](https://github.com/Dicklesworthstone/frankenscipy/commit/9ec3a54755a137d285227882ed3eb4b64e64ad8b)).
+- **`MinimizeMethodOptions`** gains the trust-constr and COBYLA options:
+  `barrier_tol`, `initial_tr_radius`, `initial_constr_penalty`,
+  `initial_barrier_parameter`, `initial_barrier_tolerance`,
+  `factorization_method`, `finite_diff_rel_step`, `sparse_jacobian`,
+  `rhobeg`, `catol` and `f_target`. Struct literals need
+  `..Default::default()`.
+- The sparse Krylov and eigen solvers take `&dyn LinearOperator`. A
+  `&CsrMatrix` still coerces, so existing calls compile unchanged
+  ([`f2f6d2cea`](https://github.com/Dicklesworthstone/frankenscipy/commit/f2f6d2cead59024a543859281b018bbb4e734b6a)).
+- `matrix_balance` now permutes as LAPACK 3.12 `dgebal` does, and real `eig`
+  uses that balancing
+  ([`7ec9bee19`](https://github.com/Dicklesworthstone/frankenscipy/commit/7ec9bee195c94ac49566b7250180329f825b3d49)).
+
+### Fixed
+
+- **Platform-identical solves.** `solve`'s policy and solver portfolio used
+  the platform libm, so a decision at a threshold could differ between
+  glibc and macOS. Three changes fix this:
+  - the decisions use deterministic exp and log10
+    ([`d00db63ac`](https://github.com/Dicklesworthstone/frankenscipy/commit/d00db63ac9d4260c37870309a459f5e2d148206b));
+  - the rcond estimate for matrices up to 4×4 uses one-sided Jacobi
+    instead of nalgebra's SVD and its libm calls
+    ([`ed84bdd15`](https://github.com/Dicklesworthstone/frankenscipy/commit/ed84bdd15e75e1257c624d12f90d1436f51e12d5));
+  - `two_prod` is Dekker's TwoProduct instead of a fused multiply-add
+    ([`ae52b6545`](https://github.com/Dicklesworthstone/frankenscipy/commit/ae52b65454841cd4976f6fbac907be0539508d9b)).
+- The fsci-sparse and fsci-ndimage perf binaries build on aarch64
+  ([`95fef4500`](https://github.com/Dicklesworthstone/frankenscipy/commit/95fef45004d9274786694dd2151ad123d9779849)).
+- All-feature Clippy passes: the live-SciPy bench binaries had unused imports
+  ([#10](https://github.com/Dicklesworthstone/frankenscipy/issues/10)).
+- The resolver-frequency test passes with `spline-flags-const` on
+  ([#12](https://github.com/Dicklesworthstone/frankenscipy/issues/12)).
+- The five fuzz targets that missed the signed-distribution and `find_peaks`
+  API changes compile again
+  ([#11](https://github.com/Dicklesworthstone/frankenscipy/issues/11)).
+- The conformance gate passes on the new code:
+  - three `converged` literals in the new linalg and sparse code now name
+    their `// status:` criterion;
+  - the 13 new live-SciPy harnesses are anchored in the tolerance ratchet;
+  - `diff_sparse_lobpcg` now bounds its stagnating case by SciPy's own
+    one-ulp spread over a fixed set of moves. With a single draw, the bound
+    depended on the BLAS kernel.
+- Dependencies:
+  - zip 9.0.3 hardens `.npz` archive reading;
+  - serde_json 1.0.154, toml 1.1.8 and proptest 1.12.0
+    ([`a268ed0b1`](https://github.com/Dicklesworthstone/frankenscipy/commit/a268ed0b19f1f2bc0f5e2f2c98aed0889a718658)).
+
+### Known limits
+
+- **Platform dependencies:** registry metadata still includes a Tokio
+  dependency under `wasm-bindgen-futures`' unstable Emscripten
+  configuration. It is inactive in the default Linux graph
+  ([#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15)).
+- **Earlier hardening work:**
+  - geometry above the documented bounds and covariance decomposition
+    parity ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2),
+    [#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3));
+  - von Mises-Fisher sampling at extreme concentration
+    ([#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4));
+  - minimizer audit fingerprints
+    ([#5](https://github.com/Dicklesworthstone/frankenscipy/issues/5));
+  - an aggregate MAT allocation limit
+    ([#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6)).
+
+  All of these remain open.
+- **Publishing:** credential-owner revocation is still needed
+  ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)). The
+  optional batch publisher keeps its version and early-exit defects, and its
+  order puts `fsci-integrate` before `fsci-sparse`, which it depends on
+  ([#8](https://github.com/Dicklesworthstone/frankenscipy/issues/8)). The
+  0.4.0 crates were published one at a time in dependency order.
+- **Dependencies:** source and ELF identity probes keep SHA-2 0.10
+  ([#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9)).
+- **Statistics:**
+  - `NchypergeomWallenius`, `LogSeries`, `RandInt` and `Zipfian` inherit an
+    unsupported fitting fallback; use `try_fit`
+    ([#14](https://github.com/Dicklesworthstone/frankenscipy/issues/14));
+  - the chi-square and Benford entry points have no documented exact or
+    integer contract yet
+    ([#16](https://github.com/Dicklesworthstone/frankenscipy/issues/16)).
+- **`linprog`:** dense rows only, with no presolve or scaling. `HighsDs` is a
+  primal simplex, so where several vertices or duals are optimal its answer
+  can differ from HiGHS's while being equally optimal. Iteration counts
+  differ from HiGHS's.
+- **trust-constr:** with finite-difference derivatives, iteration counts can
+  differ from SciPy's by a few, because OpenBLAS kernels round differently
+  from fsci's loops.
+- **COBYLA:** fsci follows OpenBLAS's SkylakeX evaluation order. On hosts where
+  NumPy and SciPy use other kernels (Haswell, Zen and older), borderline
+  problems can end with a different status. For example, in hs7 fsci stops
+  `Infeasible` at maxcv 4e-8 against catol 1.49e-8, while SciPy on Haswell
+  kernels reports success
+  ([#17](https://github.com/Dicklesworthstone/frankenscipy/issues/17)).
+
 ## [0.3.0] — 2026-10-04
 
 ### Added
