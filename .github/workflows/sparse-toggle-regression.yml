@@ -16,7 +16,8 @@ on:
     workflows: ['CI Gates (G1-G9)']
     types: [in_progress]
 
-# Never cancels a running qualification. No PR trigger and no ref updates here.
+# Never cancels a running qualification. Publishing is a guarded fast-forward
+# after the original-cycle probe and every high/low-concurrency check succeed.
 concurrency:
   group: sparse-toggle-regression-${{ github.ref }}
   cancel-in-progress: false
@@ -44,8 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      # Used only to store a verified, unattached Git commit. Publishing its ref
-      # remains a separate, explicit compare-and-swap operation on current main.
+      # The only write is the verified source-only commit and a non-forced update
+      # of main. A changed main stops publication rather than overwriting work.
       contents: write
     env:
       CARGO_INCREMENTAL: '0'
@@ -75,7 +76,7 @@ jobs:
           set -euo pipefail
           # These blobs contain the reviewed literal diffs, not scripts that rewrite
           # source by pattern. git apply checks every original context line.
-          for entry in '9333808e07b804eb5112603d0bb3b98ef48e10c6 candidate' 'eb2037ec112d5083a521c8d58ce3b360c832326a baseline'; do
+          for entry in 'e64151644b59d71c522cd91ff0cbaa3f9d60aaf0 candidate' 'eb2037ec112d5083a521c8d58ce3b360c832326a baseline'; do
             read -r sha label <<< "$entry"
             gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$label.patch"
             test "$(git hash-object "$RUNNER_TEMP/$label.patch")" = "$sha"
@@ -101,6 +102,9 @@ jobs:
             rustfmt --edition 2024 "$source"
             test "$(git diff --name-only)" = "$source"
             git diff --check
+            # Pin the exact bytes about to be tested. Publication refuses any
+            # post-validation edit, even if the earlier suite itself passed.
+            git hash-object "$source" > "$RUNNER_TEMP/issue19-evidence/validated-source.sha"
             echo 'changed=true' >> "$GITHUB_OUTPUT"
           else
             # Subsequent runs verify the already-landed regression. Never force an
@@ -111,25 +115,58 @@ jobs:
           fi
       - name: Full sparse suite at 32, 32, 32, 4 and 1 test threads
         run: python3 scripts/sparse_toggle_regression.py --repo "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/issue19-evidence/fixed"
-      - name: Store the verified source commit without moving any branch
+      - name: Publish the verified source fix directly to main
         if: steps.repair.outputs.changed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const crypto = require('crypto');
             const evidence = path.join(process.env.RUNNER_TEMP, 'issue19-evidence');
             const baseline = JSON.parse(fs.readFileSync(path.join(evidence, 'baseline/results.json'), 'utf8'));
             const fixed = JSON.parse(fs.readFileSync(path.join(evidence, 'fixed/results.json'), 'utf8'));
-            if (baseline.status !== 'negative_control_confirmed' || fixed.status !== 'passed') {
-              throw new Error('Missing successful baseline/fixed evidence; refuse to create candidate commit');
+            const expected = [
+              ['cargo', 'test', '--locked', '-p', 'fsci-sparse', '--no-run'],
+              ...[32, 32, 32, 4, 1].map(n =>
+                ['cargo', 'test', '--locked', '-p', 'fsci-sparse', '--', `--test-threads=${n}`]),
+              ['cargo', 'fmt', '--all', '--', '--check'],
+              ['cargo', 'check', '--locked', '-p', 'fsci-sparse', '--all-targets'],
+              ['cargo', 'clippy', '--locked', '-p', 'fsci-sparse', '--all-targets', '--', '-D', 'warnings']
+            ];
+            if (context.ref !== 'refs/heads/main' ||
+                baseline.status !== 'negative_control_confirmed' ||
+                baseline.runs?.length !== 2 ||
+                baseline.runs[0].returncode !== 0 || baseline.runs[0].timed_out !== false ||
+                baseline.runs[1].returncode !== 101 || baseline.runs[1].timed_out !== false ||
+                fixed.status !== 'passed' || fixed.runs?.length !== expected.length ||
+                !fixed.runs.every((run, i) =>
+                  run.returncode === 0 && run.timed_out === false &&
+                  JSON.stringify(run.command) === JSON.stringify(expected[i])) ||
+                !fixed.runs.slice(1, 6).every(run => run.test_results?.some(result =>
+                  result.passed >= 705 && result.failed === 0 && result.ignored === 50))) {
+              throw new Error('Incomplete or failed qualification; refuse to publish');
             }
             const repo = context.repo;
             const source = 'crates/fsci-sparse/src/linalg.rs';
+            const bytes = fs.readFileSync(source);
+            const sourceSha = crypto.createHash('sha1')
+              .update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+            if (sourceSha !== fs.readFileSync(path.join(evidence, 'validated-source.sha'), 'utf8').trim()) {
+              throw new Error('Source changed after validation started; refuse to publish');
+            }
+            const assertCurrentMain = async () => {
+              const ref = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+              if (ref.data.object.sha !== context.sha) {
+                throw new Error('Main advanced during qualification; rerun on the new head');
+              }
+            };
+            await assertCurrentMain();
             const parent = await github.rest.git.getCommit({...repo, commit_sha: context.sha});
             const blob = await github.rest.git.createBlob({
-              ...repo, content: fs.readFileSync(source).toString('base64'), encoding: 'base64'
+              ...repo, content: bytes.toString('base64'), encoding: 'base64'
             });
+            if (blob.data.sha !== sourceSha) throw new Error('Uploaded source blob does not match tested bytes');
             const tree = await github.rest.git.createTree({
               ...repo, base_tree: parent.data.tree.sha,
               tree: [{path: source, mode: '100644', type: 'blob', sha: blob.data.sha}]
@@ -146,12 +183,29 @@ jobs:
                 'formatting; sparse all-target check and Clippy with warnings denied.\nEvidence: ' + runUrl
             });
             core.info(`VERIFIED_CANDIDATE_COMMIT=${commit.data.sha}`);
-            fs.writeFileSync(path.join(evidence, 'candidate.json'), JSON.stringify({
+            const publication = {
               commit: commit.data.sha, parent: context.sha, tree: tree.data.sha,
               source_blob: blob.data.sha, run: runUrl, branch_updated: false
-            }, null, 2) + '\n');
-            await core.summary.addHeading('Verified sparse repair candidate')
-              .addRaw(`Commit: ${commit.data.sha}\n\nParent: ${context.sha}\n\nNo branch was updated.`).write();
+            };
+            const record = () => fs.writeFileSync(path.join(evidence, 'candidate.json'),
+              JSON.stringify(publication, null, 2) + '\n');
+            record();
+            await assertCurrentMain();
+            // The candidate's sole parent is the checked main. A concurrent push
+            // between this check and updateRef makes the update non-fast-forward
+            // and GitHub rejects it. Never force, merge untested work, or open a PR.
+            await github.rest.git.updateRef({...repo, ref: 'heads/main', sha: commit.data.sha, force: false});
+            publication.branch_updated = true;
+            record();
+            const published = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+            publication.observed_head = published.data.object.sha;
+            record();
+            if (publication.observed_head !== commit.data.sha) {
+              throw new Error('Main changed after publication; inspect recorded candidate before any retry');
+            }
+            core.info(`PUBLISHED_SOURCE_COMMIT=${commit.data.sha}`);
+            await core.summary.addHeading('Verified sparse repair published directly to main')
+              .addRaw(`Commit: ${commit.data.sha}\n\nParent: ${context.sha}\n\nEvidence: ${runUrl}`).write();
       - uses: actions/upload-artifact@v4
         if: always()
         with:
