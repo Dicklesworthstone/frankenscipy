@@ -8,6 +8,8 @@ on:
       - 'scripts/sparse_toggle_regression.py'
       - 'crates/fsci-sparse/**'
   workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 # Never cancels a running qualification. No PR trigger and no ref updates here.
 concurrency:
@@ -19,7 +21,15 @@ permissions:
 
 jobs:
   verify:
-    if: github.ref == 'refs/heads/main'
+    # Permit the repository owner to request this exact qualification on #19.
+    # Never run comment text as code or accept commands on pull requests.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.number == 19 &&
+        !github.event.issue.pull_request &&
+        github.event.comment.user.login == github.repository_owner &&
+        github.event.comment.body == '/verify-sparse-toggle'))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
