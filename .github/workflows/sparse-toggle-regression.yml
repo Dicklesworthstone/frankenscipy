@@ -1,0 +1,140 @@
+name: Sparse toggle concurrency regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sparse-toggle-regression.yml'
+      - 'scripts/sparse_toggle_regression.py'
+      - 'crates/fsci-sparse/**'
+  workflow_dispatch:
+
+# Never cancels a running qualification. No PR trigger and no ref updates here.
+concurrency:
+  group: sparse-toggle-regression-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      # Used only to store a verified, unattached Git commit. Publishing its ref
+      # remains a separate, explicit compare-and-swap operation on current main.
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUSTFLAGS: '-D warnings'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - name: Read immutable repair and negative-control patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These blobs contain the reviewed literal diffs, not scripts that rewrite
+          # source by pattern. git apply checks every original context line.
+          for entry in '9333808e07b804eb5112603d0bb3b98ef48e10c6 candidate' 'eb2037ec112d5083a521c8d58ce3b360c832326a baseline'; do
+            read -r sha label <<< "$entry"
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$label.patch"
+            test "$(git hash-object "$RUNNER_TEMP/$label.patch")" = "$sha"
+          done
+          test "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" = 'nightly-2026-08-31'
+      - name: Establish the original two-owner dependency cycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/issue19-baseline" 73aabdbe35b326b0fadd3ea48cf50b1783e4a574
+          git -C "$RUNNER_TEMP/issue19-baseline" apply --check "$RUNNER_TEMP/baseline.patch"
+          git -C "$RUNNER_TEMP/issue19-baseline" apply "$RUNNER_TEMP/baseline.patch"
+          python3 scripts/sparse_toggle_regression.py --repo "$RUNNER_TEMP/issue19-baseline" --output "$RUNNER_TEMP/issue19-evidence/baseline" --probe
+      - name: Apply the repair only to the inspected source
+        id: repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=crates/fsci-sparse/src/linalg.rs
+          if test "$(git hash-object "$source")" = 5c38f93bbbaa0f906bc3020ccf5a84771db6b76f; then
+            git apply --check "$RUNNER_TEMP/candidate.patch"
+            git apply "$RUNNER_TEMP/candidate.patch"
+            rustfmt --edition 2024 "$source"
+            test "$(git diff --name-only)" = "$source"
+            git diff --check
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            # Subsequent runs verify the already-landed regression. Never force an
+            # old diff over concurrent edits or silently validate the unfixed code.
+            grep -q 'fn perf_toggle_scaffolding_concurrent_numerical_regression' "$source"
+            if grep -q 'static BANDED_TOGGLE_LOCK:' "$source"; then exit 1; fi
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Full sparse suite at 32, 32, 32, 4 and 1 test threads
+        run: python3 scripts/sparse_toggle_regression.py --repo "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/issue19-evidence/fixed"
+      - name: Store the verified source commit without moving any branch
+        if: steps.repair.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const evidence = path.join(process.env.RUNNER_TEMP, 'issue19-evidence');
+            const baseline = JSON.parse(fs.readFileSync(path.join(evidence, 'baseline/results.json'), 'utf8'));
+            const fixed = JSON.parse(fs.readFileSync(path.join(evidence, 'fixed/results.json'), 'utf8'));
+            if (baseline.status !== 'negative_control_confirmed' || fixed.status !== 'passed') {
+              throw new Error('Missing successful baseline/fixed evidence; refuse to create candidate commit');
+            }
+            const repo = context.repo;
+            const source = 'crates/fsci-sparse/src/linalg.rs';
+            const parent = await github.rest.git.getCommit({...repo, commit_sha: context.sha});
+            const blob = await github.rest.git.createBlob({
+              ...repo, content: fs.readFileSync(source).toString('base64'), encoding: 'base64'
+            });
+            const tree = await github.rest.git.createTree({
+              ...repo, base_tree: parent.data.tree.sha,
+              tree: [{path: source, mode: '100644', type: 'blob', sha: blob.data.sha}]
+            });
+            const runUrl = `${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`;
+            const commit = await github.rest.git.createCommit({
+              ...repo, tree: tree.data.sha, parents: [context.sha],
+              message: 'fix(sparse): eliminate test toggle AB/BA deadlock (#19)\n\n' +
+                'Use the existing performance mutex for all banded guard callers. ' +
+                'Borrow its guard to snapshot and restore inside the critical section. ' +
+                'Keep numerical assertions, worker pools, and non-toggle test concurrency unchanged.\n\n' +
+                'Add unwind-restoration and killable concurrent numerical regressions.\n\n' +
+                'Verified: original two-owner negative control; full sparse runs at 32/32/32/4/1 threads; ' +
+                'formatting; sparse all-target check and Clippy with warnings denied.\nEvidence: ' + runUrl
+            });
+            core.info(`VERIFIED_CANDIDATE_COMMIT=${commit.data.sha}`);
+            fs.writeFileSync(path.join(evidence, 'candidate.json'), JSON.stringify({
+              commit: commit.data.sha, parent: context.sha, tree: tree.data.sha,
+              source_blob: blob.data.sha, run: runUrl, branch_updated: false
+            }, null, 2) + '\n');
+            await core.summary.addHeading('Verified sparse repair candidate')
+              .addRaw(`Commit: ${commit.data.sha}\n\nParent: ${context.sha}\n\nNo branch was updated.`).write();
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-toggle-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/issue19-evidence
+          if-no-files-found: warn
+          retention-days: 14
