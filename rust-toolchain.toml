@@ -1,15 +1,13 @@
 [toolchain]
-# PINNED 2026-07-25 (frankenscipy-q9nxz). Was `channel = "nightly"` (floating).
+# PINNED to `nightly-2026-08-31` (commit 5306413c6, 2026-09-04; originally pinned on
+# 2026-07-25 under frankenscipy-q9nxz instead of floating `channel = "nightly"`).
 #
-# WHY: the floating nightly advanced past 2026-07-21 and promoted ~34 lints that fail
-# ALREADY-COMMITTED code under `-D warnings` (fsci-linalg cossin.rs excessive-float-precision
-# ~40 hits, lib.rs needless_range_loop, useless vec!, plus rustfmt drift in
-# fsci-linalg/src/bin/perf_*.rs and fsci-signal). G1 (fmt + clippy) then breaks on any host or
-# CI that picks up the new nightly — a toolchain event, not a code regression, and it was
-# breaking the gate fleet-wide (franken_whisper hit the same wall the same week).
+# WHY: a floating nightly channel can promote new clippy lints or rustfmt changes that fail
+# already-committed code under `-D warnings`, turning a toolchain bump into a fleet-wide G1
+# failure. Pinning `nightly-2026-08-31` keeps G1 (`cargo fmt --all -- --check` and
+# `cargo clippy --workspace --all-targets -- -D warnings`) deterministic across hosts and CI.
 #
-# 2026-07-20 is the newest nightly that predates the promotion. Bumping the pin is a
-# deliberate, separately-benched act: raise it only together with the lint sweep tracked by
-# `frankenscipy-so4d3`, never as a drive-by.
+# Bumping the pin is a deliberate, separately-gated act: raise it only together with a full
+# workspace lint and rustfmt sweep (`frankenscipy-so4d3`), never as a drive-by.
 channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
