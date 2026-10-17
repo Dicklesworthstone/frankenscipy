@@ -151,6 +151,10 @@ jobs:
       # only shrinks.
       - name: Diff tests end in a compared-case ledger
         run: python3 scripts/unledgered_diff_tests.py
+      # Every <!-- fact:<name> --> marker in README.md must match live repository counts and
+      # docs/planning/symbol_census.json within its allowed tolerance (frankenscipy-1yifk.4).
+      - name: README numeric facts match the tree
+        run: python3 scripts/readme_facts.py --check
       - name: Every diff_*.rs belongs to exactly one G3 shard
         shell: bash
         run: |
@@ -179,8 +183,10 @@ jobs:
         with:
           shared-key: workspace-dev
           cache-on-failure: true
-      - name: fsci-runtime tests (byte-exact audit-ledger golden)
-        run: cargo test -p fsci-runtime
+      - name: fsci-runtime tests (byte-exact audit-ledger golden + bench-harness)
+        run: |
+          cargo test -p fsci-runtime
+          cargo test -p fsci-runtime --lib --features bench-harness
       - name: Tolerance ratchet (G9) incl. unanchored diff files
         run: cargo run -p fsci-conformance --bin tolerance_lint -- --max-violations 169
 
@@ -234,6 +240,9 @@ jobs:
           if [ "${{ matrix.crate }}" = "fsci-conformance" ]; then
             cargo test -p fsci-conformance --lib -- --nocapture
             cargo test -p fsci-conformance --doc -- --nocapture
+          elif [ "${{ matrix.crate }}" = "fsci-runtime" ]; then
+            cargo test -p fsci-runtime -- --nocapture
+            cargo test -p fsci-runtime --lib --features bench-harness -- --nocapture
           else
             cargo test -p ${{ matrix.crate }} -- --nocapture
           fi
@@ -560,6 +569,7 @@ jobs:
           shared-key: workspace-dev
           cache-on-failure: true
       - run: cargo test -p fsci-conformance --test schema_validation -- --nocapture
+      - run: cargo test -p fsci-conformance --test threat_matrix_references -- --nocapture
       - shell: bash
         run: |
           set -euo pipefail
