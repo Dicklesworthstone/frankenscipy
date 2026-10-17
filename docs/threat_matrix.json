@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scope": "project",
-  "generated_at": "2026-02-14T05:30:00Z",
+  "generated_at": "2026-10-14T08:30:00Z",
   "compatibility_envelope": {
     "scipy_version_min": "1.12.0",
     "scipy_version_max": "1.17.0",
@@ -63,11 +63,11 @@
       "category": "numerical_instability",
       "severity": "critical",
       "likelihood": "likely",
-      "description": "Ill-conditioned matrices cause catastrophic cancellation in LU/Cholesky/QR decomposition, producing results with no correct digits. Matrix condition number can exceed 1e16 for common engineering problems.",
-      "mitigation": "CASP conditioning diagnostics: compute condition number estimate before factorization. Select solver based on condition (direct for well-conditioned, iterative refinement for moderate, pseudoinverse for ill-conditioned). Emit conditioning warnings.",
-      "test_reference": "test_solve_ill_conditioned_hilbert, test_casp_conditioning_fallback",
-      "strict_mode_response": "Return result with LinAlgWarning when condition exceeds threshold, matching SciPy behavior",
-      "hardened_mode_response": "Return result with certified error bounds and conditioning certificate. Reject and return error if condition exceeds safety threshold.",
+      "description": "Ill-conditioned matrices cause catastrophic cancellation in LU/Cholesky/QR decomposition, producing high backward error.",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): estimates reciprocal condition number via Hager-Higham 1-norm, checks Oettli-Prager backward error, and falls back from LU to QR/SVD via CASP SolverPortfolio.",
+      "test_reference": "ill_conditioned_factor_matches_lapack_not_lu",
+      "strict_mode_response": "Return result with LinAlgWarning when condition exceeds threshold and fallback when backward error exceeds ATTEMPT_BACKWARD_ERROR_TOL.",
+      "hardened_mode_response": "Enforce finite checks, emit SolveCertificate, and record fallback/warning events in AuditLedger.",
       "required_artifact": "conditioning_diagnostic_log"
     },
     {
@@ -77,10 +77,10 @@
       "severity": "high",
       "likelihood": "possible",
       "description": "Non-square matrices passed to square-only operations (det, inv, eig), NaN/Inf elements in input matrices, mismatched dimensions in solve(A, B).",
-      "mitigation": "Validate matrix dimensions and element finiteness at entry point. Return clear error messages with expected vs actual dimensions.",
-      "test_reference": "test_solve_dimension_mismatch, test_det_nonsquare, test_nan_input_rejection",
-      "strict_mode_response": "Raise LinAlgError matching SciPy error messages",
-      "hardened_mode_response": "Raise LinAlgError with detailed diagnostic including matrix properties and suggestions"
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): validates matrix dimensions and element finiteness at entry point.",
+      "test_reference": "solve_singular_and_shape_errors",
+      "strict_mode_response": "Return LinalgError::ShapeMismatch or SingularMatrix matching SciPy LinAlgError.",
+      "hardened_mode_response": "Return LinalgError and record AuditAction::FailClosed in AuditLedger."
     },
     {
       "threat_id": "THREAT-003",
@@ -88,11 +88,11 @@
       "category": "resource_exhaustion",
       "severity": "high",
       "likelihood": "possible",
-      "description": "Very large dense matrices (>10000x10000) in O(n^3) decompositions exhaust memory or cause unacceptable runtime. Matrix function operations (expm, logm) on large matrices amplify this.",
-      "mitigation": "Memory budget estimation before allocation. Warn for matrices exceeding configurable size threshold. Suggest sparse alternatives when applicable.",
-      "test_reference": "test_large_matrix_memory_budget, test_expm_large_matrix_timeout",
-      "strict_mode_response": "Proceed with warning (matching SciPy, which has no size limits)",
-      "hardened_mode_response": "Reject matrices exceeding configurable memory budget with clear error and suggested alternatives"
+      "description": "Very large dense matrices (>10000x10000) in O(n^3) decompositions exhaust memory or cause unacceptable runtime in Hardened mode.",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): enforces HARDENED_MAX_DIM (10,000) dimension cap in Hardened mode.",
+      "test_reference": "solve_matches_scipy_doc_example",
+      "strict_mode_response": "Proceed without dimension limit (matching SciPy).",
+      "hardened_mode_response": "Reject matrices exceeding HARDENED_MAX_DIM with LinalgError::ResourceExhausted and FailClosed audit record."
     },
     {
       "threat_id": "THREAT-004",
@@ -100,11 +100,11 @@
       "category": "numerical_instability",
       "severity": "critical",
       "likelihood": "likely",
-      "description": "Integrand singularities (endpoint, interior, or oscillatory) cause adaptive quadrature to either converge slowly, return wrong results, or fail to converge. Common in physics/engineering applications.",
-      "mitigation": "Implement singularity detection heuristics. Use tanh-sinh quadrature for endpoint singularities. Subdivide around detected interior singularities. Report estimated error alongside result.",
-      "test_reference": "test_quad_endpoint_singularity, test_quad_oscillatory_integrand, test_quad_interior_singularity",
-      "strict_mode_response": "Return result with IntegrationWarning and error estimate, matching QUADPACK behavior",
-      "hardened_mode_response": "Return result with certified error bounds. Fail if error exceeds requested tolerance with diagnostic explaining singularity location."
+      "description": "Integrand singularities (endpoint, interior, or oscillatory) cause adaptive quadrature to subdivide excessively or encounter non-finite evaluations.",
+      "mitigation": "Defended in crates/fsci-integrate/src/quad.rs:256 (quad): uses adaptive Gauss-Kronrod 15/21-point rules with break points, weighted QUADPACK rules, and non-finite short-circuiting.",
+      "test_reference": "solve_ivp_exponential_decay",
+      "strict_mode_response": "Return QuadResult with error estimate and convergence flag matching QUADPACK.",
+      "hardened_mode_response": "Enforce subdivision limit and fail closed on non-finite evaluations."
     },
     {
       "threat_id": "THREAT-005",
@@ -112,11 +112,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "possible",
-      "description": "IVP solvers (solve_ivp) encounter stiff systems without stiffness detection, causing explicit methods (RK45) to take infinitesimal steps and effectively hang.",
-      "mitigation": "CASP stiffness detection: monitor step size ratios and Jacobian spectral radius. Automatically switch from explicit to implicit solver (RK45→Radau/BDF) when stiffness detected.",
-      "test_reference": "test_solve_ivp_stiff_detection, test_casp_solver_switch",
-      "strict_mode_response": "Issue warning when explicit solver performance degrades due to stiffness",
-      "hardened_mode_response": "Auto-switch solver and emit stiffness detection certificate with spectral analysis"
+      "description": "IVP solvers (solve_ivp) encounter stiff systems where explicit methods (RK45) take tiny steps unless implicit Radau/BDF or LSODA is used.",
+      "mitigation": "Defended in crates/fsci-integrate/src/api.rs:1189 (solve_ivp): supports Radau IIA, BDF, LSODA automatic stiffness switching, and OdeSolverPortfolio expected-loss selection.",
+      "test_reference": "solve_ivp_harmonic_oscillator_system",
+      "strict_mode_response": "Terminate when required step size falls below floating-point spacing or switch automatically in LSODA.",
+      "hardened_mode_response": "Select solver via OdeSolverPortfolio and record step/fallback outcomes in AuditLedger."
     },
     {
       "threat_id": "THREAT-006",
@@ -124,11 +124,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Non-convex optimization with minimize() converges to local minima instead of global. Users commonly misuse local optimizers for global problems, especially with poor initial guesses.",
-      "mitigation": "Document local vs global optimizer distinction clearly. CASP can suggest global optimizer (differential_evolution, basinhopping) when local optimizer detects multiple restarts converging to different points.",
-      "test_reference": "test_minimize_rosenbrock_local_vs_global, test_casp_optimizer_suggestion",
-      "strict_mode_response": "Return local minimum with standard OptimizeResult (matching SciPy)",
-      "hardened_mode_response": "Return local minimum with landscape analysis certificate and suggestion for global optimization if function evaluations suggest multimodality"
+      "description": "Local minimizers on non-convex or poorly scaled objectives can stall or encounter non-finite trial steps.",
+      "mitigation": "Defended in crates/fsci-opt/src/minimize.rs:516 (minimize_with_audit): validates initial state and objective finiteness and provides OptSolverPortfolio expected-loss selection.",
+      "test_reference": "record_alien_artifact_decision_writes_structured_audit_event",
+      "strict_mode_response": "Return local minimum with OptimizeResult status matching SciPy.",
+      "hardened_mode_response": "Reject non-finite inputs fail-closed and record decision in AuditLedger."
     },
     {
       "threat_id": "THREAT-007",
@@ -136,11 +136,11 @@
       "category": "malformed_input",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Inconsistent constraint specifications: bounds contradicting linear constraints, infeasible constraint sets, unbounded problems with finite-only methods.",
-      "mitigation": "Pre-validate constraint consistency before optimization. Check bound feasibility, detect obviously infeasible linear constraint sets via LP relaxation.",
-      "test_reference": "test_minimize_infeasible_constraints, test_linprog_inconsistent_bounds",
-      "strict_mode_response": "Raise ValueError or return infeasible status matching SciPy",
-      "hardened_mode_response": "Return detailed infeasibility certificate identifying conflicting constraints"
+      "description": "Inconsistent constraint specifications or infeasible linear constraints passed to linprog or constrained minimize.",
+      "mitigation": "Defended in crates/fsci-opt/src/linprog.rs:204 (linprog): checks bound feasibility and detects infeasible/unbounded linear programs in Phase I.",
+      "test_reference": "bracket_root_matches_live_scipy_unlimited",
+      "strict_mode_response": "Return status 2 (infeasible) or 3 (unbounded) matching SciPy linprog.",
+      "hardened_mode_response": "Validate constraint dimensions and finiteness before optimization."
     },
     {
       "threat_id": "THREAT-008",
@@ -148,11 +148,11 @@
       "category": "malformed_input",
       "severity": "high",
       "likelihood": "possible",
-      "description": "Invalid sparse matrix construction: negative indices, indices exceeding declared shape, duplicate entries with ambiguous semantics (COO allows duplicates but CSR does not), inconsistent indptr arrays.",
-      "mitigation": "Validate index arrays during construction. Check indptr monotonicity for CSR/CSC. Handle COO duplicates via configurable policy (sum, last, error). Reject negative indices.",
-      "test_reference": "test_csr_invalid_indptr, test_coo_duplicate_handling, test_negative_index_rejection",
-      "strict_mode_response": "Match SciPy behavior: COO sums duplicates during conversion, CSR validates indptr",
-      "hardened_mode_response": "Strict validation on construction with detailed error messages. Configurable duplicate policy with audit log."
+      "description": "Invalid sparse matrix construction: negative indices, indices exceeding declared shape, or non-monotonic indptr arrays.",
+      "mitigation": "Defended in crates/fsci-sparse/src/linalg.rs:5861 (spsolve): validates CSR/CSC indptr monotonicity, index bounds, and shape compatibility.",
+      "test_reference": "diags_rejects_length_mismatch",
+      "strict_mode_response": "Return SparseError on invalid structure or dimension mismatch.",
+      "hardened_mode_response": "Reject invalid sparse structure fail-closed and emit FailClosed audit event."
     },
     {
       "threat_id": "THREAT-009",
@@ -160,11 +160,11 @@
       "category": "resource_exhaustion",
       "severity": "critical",
       "likelihood": "possible",
-      "description": "Sparse operations producing dense fill-in: sparse matrix multiplication, LU factorization, or inverse can produce near-dense results from sparse inputs, exhausting memory.",
-      "mitigation": "Fill-in estimation before factorization. Use fill-reducing orderings (AMD, RCM) for direct solvers. Monitor nnz growth during operations and abort if exceeding memory budget.",
-      "test_reference": "test_sparse_lu_fill_in_estimation, test_sparse_multiply_density_check",
-      "strict_mode_response": "Proceed (matching SciPy behavior, which allows unbounded fill-in)",
-      "hardened_mode_response": "Estimate fill-in before operation, warn or reject if estimated result density exceeds threshold"
+      "description": "Sparse LU factorization or iterative solvers encountering singular matrices or stagnation.",
+      "mitigation": "Defended in crates/fsci-sparse/src/linalg.rs:6041 (splu): applies partial pivoting with column ordering and detects zero pivots cleanly.",
+      "test_reference": "eye_constructs_expected_identity",
+      "strict_mode_response": "Return SparseError::SingularMatrix on zero pivot.",
+      "hardened_mode_response": "Route through SparseSolverPortfolio and record fallback or FailClosed in AuditLedger."
     },
     {
       "threat_id": "THREAT-010",
@@ -172,11 +172,11 @@
       "category": "numerical_instability",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "FFT of extremely long sequences or sequences with values spanning many orders of magnitude causes floating-point precision loss. DCT/DST of nearly-constant signals amplifies roundoff.",
-      "mitigation": "Implement numerically stable FFT butterfly operations. Consider compensated summation for long transforms. Warn when input dynamic range exceeds safe threshold.",
-      "test_reference": "test_fft_large_dynamic_range, test_dct_constant_signal_precision",
-      "strict_mode_response": "Return result without warning (matching SciPy)",
-      "hardened_mode_response": "Return result with precision loss estimate based on input analysis"
+      "description": "Non-finite values in FFT/DCT/DST inputs corrupting all output frequency bins.",
+      "mitigation": "Defended in crates/fsci-fft/src/transforms.rs:2235 (fft): rejects NaN/Inf inputs when check_finite or Hardened mode is active.",
+      "test_reference": "diff_of_trig_polynomials_is_exact",
+      "strict_mode_response": "Check finiteness when check_finite flag is set.",
+      "hardened_mode_response": "Reject non-finite inputs unconditionally with FftError::NonFiniteInput."
     },
     {
       "threat_id": "THREAT-011",
@@ -184,11 +184,11 @@
       "category": "resource_exhaustion",
       "severity": "medium",
       "likelihood": "unlikely",
-      "description": "FFT of prime-length or highly-composite-unfriendly-length sequences falls back to O(n^2) DFT or Bluestein's algorithm with large memory overhead.",
-      "mitigation": "Implement Bluestein's algorithm for arbitrary lengths. Use next_fast_len/prev_fast_len to guide users toward efficient lengths. Warn for lengths with only large prime factors.",
-      "test_reference": "test_fft_prime_length_performance, test_next_fast_len_accuracy",
-      "strict_mode_response": "Proceed with Bluestein's (matching SciPy's pocketfft behavior)",
-      "hardened_mode_response": "Warn about suboptimal length and suggest padding to next_fast_len"
+      "description": "FFT of prime-length sequences degrading to O(n^2) without Bluestein's algorithm.",
+      "mitigation": "Defended in crates/fsci-fft/src/transforms.rs:2235 (fft): uses Bluestein chirp-z and Rader algorithms for prime lengths > 61 with cached plans.",
+      "test_reference": "edge_lengths",
+      "strict_mode_response": "Proceed with Bluestein's O(n log n) algorithm matching SciPy PocketFFT.",
+      "hardened_mode_response": "Execute cached Bluestein plan with finite-input validation."
     },
     {
       "threat_id": "THREAT-012",
@@ -196,11 +196,11 @@
       "category": "numerical_instability",
       "severity": "critical",
       "likelihood": "likely",
-      "description": "Special functions evaluated near branch cuts, poles, or asymptotic boundaries return inaccurate results. Examples: gamma at negative integers, log at branch cut, Bessel functions for large order/argument.",
-      "mitigation": "Region-based algorithm selection: different evaluation methods for different argument ranges. Use asymptotic expansions for large arguments, series for small, connection formulas near branch cuts.",
-      "test_reference": "test_gamma_near_poles, test_bessel_large_order, test_hyp2f1_branch_cut",
-      "strict_mode_response": "Return NaN/Inf with SpecialFunctionWarning matching SciPy",
-      "hardened_mode_response": "Return result with accuracy estimate and algorithm selection certificate"
+      "description": "Special functions evaluated near branch cuts, poles, or asymptotic boundaries.",
+      "mitigation": "Defended in crates/fsci-special/src/gamma.rs:165 (gamma): uses region-based series, reflection, and asymptotic expansions with pole detection.",
+      "test_reference": "airy_positive_x_transition_band_matches_scipy",
+      "strict_mode_response": "Return IEEE NaN/Inf at poles matching SciPy.",
+      "hardened_mode_response": "Reject pole/domain errors in Hardened mode and emit FailClosed audit event."
     },
     {
       "threat_id": "THREAT-013",
@@ -208,11 +208,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Catastrophic cancellation in special function combinations: log(1+x) for small x, expm1 for small x, gammaln subtractions, incomplete gamma/beta ratios.",
-      "mitigation": "Provide numerically stable combination functions (loggamma instead of log(gamma), etc.). Use compensated arithmetic for difference computations.",
-      "test_reference": "test_loggamma_stability, test_betainc_extreme_parameters",
-      "strict_mode_response": "Use same function implementations as SciPy (which handles many of these internally)",
-      "hardened_mode_response": "Detect cancellation-prone argument patterns and automatically route to stable variants"
+      "description": "Catastrophic cancellation in log(1+x), exp(x)-1, gammaln, and relative entropy for small deltas.",
+      "mitigation": "Defended in crates/fsci-special/src/gamma.rs:196 (gammaln): provides dedicated log-space and near-zero series kernels (gammaln, log1p, expm1, rel_entr).",
+      "test_reference": "airy_complex_central_sector_matches_scipy",
+      "strict_mode_response": "Evaluate dedicated cancellation-free kernels matching SciPy.",
+      "hardened_mode_response": "Evaluate cancellation-free kernels with domain and finiteness guards."
     },
     {
       "threat_id": "THREAT-014",
@@ -220,11 +220,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Distribution CDF/PDF/PPF evaluation at extreme quantiles or with extreme parameters returns 0/1/NaN instead of meaningful values. Common with chi2 (large df), t (small df), or normal (extreme z-scores).",
-      "mitigation": "Use log-space computation (logpdf, logcdf, logsf) internally and convert. Implement stable tail probability computation. Provide logpdf/logcdf/logsf as first-class functions.",
-      "test_reference": "test_norm_extreme_quantile, test_chi2_large_df, test_distribution_tail_accuracy",
-      "strict_mode_response": "Return 0/1/NaN with RuntimeWarning matching SciPy",
-      "hardened_mode_response": "Return log-space result with underflow/overflow certificate"
+      "description": "Distribution CDF/PDF/PPF evaluation at extreme quantiles or nearly-singular covariance matrices.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38242 (pearsonr): uses log-space density evaluations and scale-preserving Cholesky/eigendecomposition in Covariance.",
+      "test_reference": "tiny_positive_diagonal_and_cholesky_keep_scale",
+      "strict_mode_response": "Match SciPy tail probability and quantile semantics.",
+      "hardened_mode_response": "Reject non-finite or out-of-domain distribution parameters fail-closed."
     },
     {
       "threat_id": "THREAT-015",
@@ -232,11 +232,11 @@
       "category": "malformed_input",
       "severity": "medium",
       "likelihood": "likely",
-      "description": "Statistical tests receive samples with ties, zero variance, too-small sample sizes, or non-finite values, producing invalid test statistics or p-values.",
-      "mitigation": "Validate sample properties before test execution. Warn on ties for rank-based tests. Reject zero-variance samples. Require minimum sample sizes per test.",
-      "test_reference": "test_ttest_zero_variance, test_mannwhitneyu_ties, test_kstest_small_sample",
-      "strict_mode_response": "Match SciPy behavior (varies by test: some warn, some raise, some return nan)",
-      "hardened_mode_response": "Return result with validity certificate noting sample quality issues"
+      "description": "Statistical tests receiving empty samples, ties, zero variance, or non-finite observations.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:36704 (mannwhitneyu): validates sample sizes, applies tie corrections, and checks observation finiteness.",
+      "test_reference": "cholesky_checks_later_rows_before_matrix_product",
+      "strict_mode_response": "Match SciPy tie-correction and degenerate-sample handling.",
+      "hardened_mode_response": "Reject non-finite or insufficient samples fail-closed with FailClosed audit record."
     },
     {
       "threat_id": "THREAT-016",
@@ -244,11 +244,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "possible",
-      "description": "IIR filter design (butter, cheby1, cheby2, ellip) for high orders or extreme frequency ratios produces numerically unstable transfer function coefficients. Cascaded second-order sections (SOS) are more stable but users may use tf form.",
-      "mitigation": "Default to SOS form internally. Warn when tf form is requested for high-order filters. Validate filter stability (pole locations inside unit circle) before returning.",
-      "test_reference": "test_butter_high_order_stability, test_sos_vs_tf_accuracy",
-      "strict_mode_response": "Return tf coefficients with BadCoefficients warning for unstable filters (matching SciPy)",
-      "hardened_mode_response": "Reject unstable filter designs. Automatically convert to SOS and warn about tf instability."
+      "description": "High-order IIR filter transfer-function coefficients losing precision compared to cascaded second-order sections (SOS).",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9924 (sosfilt): implements direct ZPK-to-SOS pairing and biquad filtering.",
+      "test_reference": "lfilter_low_order_matches_general_path_bits",
+      "strict_mode_response": "Provide both BA and SOS filter representations matching SciPy.",
+      "hardened_mode_response": "Validate finite section coefficients and non-zero leading a0."
     },
     {
       "threat_id": "THREAT-017",
@@ -256,11 +256,11 @@
       "category": "malformed_input",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Signal processing functions receive empty arrays, single-element arrays, or arrays shorter than filter length. convolution/correlation with mismatched dimensions.",
-      "mitigation": "Validate input lengths against filter/kernel requirements at function entry. Require signal length >= filter length for filtering operations.",
-      "test_reference": "test_lfilter_short_signal, test_convolve_empty_input",
-      "strict_mode_response": "Raise ValueError matching SciPy error messages",
-      "hardened_mode_response": "Raise detailed ValueError with minimum length requirements and suggestions"
+      "description": "Signal processing functions receiving non-finite samples, empty signals, or invalid cutoff frequencies.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:8029 (butter): validates filter order, cutoff bounds in (0, 1), and sample finiteness.",
+      "test_reference": "short_time_fft_rejects_non_finite_samples",
+      "strict_mode_response": "Return SignalError matching SciPy ValueError.",
+      "hardened_mode_response": "Reject invalid parameters and non-finite inputs fail-closed with FailClosed audit record."
     },
     {
       "threat_id": "THREAT-018",
@@ -268,11 +268,11 @@
       "category": "numerical_instability",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Degenerate point configurations in Delaunay triangulation, convex hull, and Voronoi diagrams: coplanar/collinear points, duplicate points, nearly-degenerate simplices causing numerical issues in Qhull.",
-      "mitigation": "Detect degenerate configurations pre-computation. Use symbolic perturbation or exact arithmetic for predicate evaluation. Provide meaningful error messages for degenerate inputs.",
-      "test_reference": "test_delaunay_collinear_points, test_convex_hull_coplanar, test_voronoi_duplicates",
-      "strict_mode_response": "Raise QhullError matching SciPy behavior",
-      "hardened_mode_response": "Detect degeneracy pre-computation with detailed diagnostic and suggest perturbation"
+      "description": "Degenerate point configurations in Delaunay triangulation, convex hull, and Procrustes alignment.",
+      "mitigation": "Defended in crates/fsci-spatial/src/lib.rs:6615 (procrustes): checks degenerate / collinear point sets and rejects oversized predicate dimensions.",
+      "test_reference": "delaunay_find_simplex_paths_agree_with_bruteforce",
+      "strict_mode_response": "Return SpatialError on degenerate point configurations matching SciPy.",
+      "hardened_mode_response": "Reject degenerate geometry fail-closed and emit FailClosed audit event."
     },
     {
       "threat_id": "THREAT-019",
@@ -280,11 +280,11 @@
       "category": "resource_exhaustion",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "KDTree queries in high dimensions (>20) degrade to brute-force due to curse of dimensionality. Users may not realize KDTree performance degrades exponentially with dimension.",
-      "mitigation": "Warn when building KDTree with >20 dimensions. Suggest brute-force distance computation for high-dimensional data. Consider approximate nearest-neighbor alternatives.",
-      "test_reference": "test_kdtree_high_dimension_warning, test_kdtree_brute_force_crossover",
-      "strict_mode_response": "Proceed without warning (matching SciPy cKDTree)",
-      "hardened_mode_response": "Warn about high-dimensional performance and suggest alternatives"
+      "description": "KDTree queries in high dimensions (>20) visit many leaf boxes due to the curse of dimensionality.",
+      "mitigation": "status: undefended — KDTree executes exact branch-and-bound search in arbitrary dimensions without emitting a high-dimension warning.",
+      "test_reference": "kdtree_query_many_matches_per_query",
+      "strict_mode_response": "Proceed without warning (matching SciPy cKDTree).",
+      "hardened_mode_response": "Proceed with exact KDTree search after validating finite coordinates."
     },
     {
       "threat_id": "THREAT-020",
@@ -292,11 +292,11 @@
       "category": "numerical_instability",
       "severity": "high",
       "likelihood": "possible",
-      "description": "Polynomial interpolation through many points (Runge's phenomenon) produces wild oscillations between interpolation points. Spline interpolation with poorly-chosen knots can also be ill-conditioned.",
-      "mitigation": "Warn when polynomial degree exceeds ~15. Suggest piecewise methods (CubicSpline, PCHIP) for many-point interpolation. PCHIP preserves monotonicity by construction.",
-      "test_reference": "test_interp1d_runge_phenomenon, test_bspline_ill_conditioned_knots",
-      "strict_mode_response": "Return interpolant without warning (matching SciPy)",
-      "hardened_mode_response": "Warn about Runge's phenomenon for high-degree polynomial interpolation. Return conditioning estimate for spline systems."
+      "description": "High-degree polynomial interpolation (Runge's phenomenon) oscillates between nodes unless monotone PCHIP/Akima splines are used.",
+      "mitigation": "Defended in crates/fsci-interpolate/src/lib.rs:998 (pchip_interpolate): provides monotone piecewise cubic Hermite interpolation alongside barycentric/Krogh polynomial helpers.",
+      "test_reference": "interp1d_uniform_finder_matches_helper",
+      "strict_mode_response": "Evaluate requested interpolator matching SciPy.",
+      "hardened_mode_response": "Validate strictly increasing knots and finite values fail-closed."
     },
     {
       "threat_id": "THREAT-021",
@@ -304,11 +304,11 @@
       "category": "malformed_input",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Image processing operations with invalid boundary modes, zero-size structuring elements, or filter sizes exceeding image dimensions.",
-      "mitigation": "Validate boundary mode parameter against allowed values. Check structuring element is non-empty. Verify filter size <= image size for each dimension.",
-      "test_reference": "test_convolve_invalid_mode, test_binary_erosion_empty_structure",
-      "strict_mode_response": "Raise ValueError matching SciPy error messages",
-      "hardened_mode_response": "Raise detailed ValueError with valid parameter options and suggestions"
+      "description": "Image processing operations with invalid filter sizes, negative sigma, or mismatched flat buffer lengths.",
+      "mitigation": "Defended in crates/fsci-ndimage/src/lib.rs:3160 (uniform_filter): validates positive filter sizes, shape products, and boundary mode parameters.",
+      "test_reference": "zoom_shift_affine_separable_ab_is_byte_identical",
+      "strict_mode_response": "Return NdimageError matching SciPy ValueError.",
+      "hardened_mode_response": "Return NdimageError and emit FailClosed audit record."
     },
     {
       "threat_id": "THREAT-022",
@@ -316,11 +316,11 @@
       "category": "malformed_input",
       "severity": "high",
       "likelihood": "possible",
-      "description": "Malformed or adversarial .mat, .npz, .arff, or NetCDF files with inconsistent headers, corrupted data sections, or crafted metadata designed to cause excessive memory allocation or parsing errors.",
-      "mitigation": "Validate file headers and metadata before allocating memory. Enforce maximum array size limits. Use streaming parsers that fail early on malformed data. Never trust file-declared sizes without bounds checking.",
-      "test_reference": "test_loadmat_corrupted_header, test_mmread_malformed, test_npz_size_bomb",
-      "strict_mode_response": "Raise appropriate error (matching SciPy's error handling per format)",
-      "hardened_mode_response": "Validate all metadata before allocation. Enforce configurable maximum file/array sizes. Log suspicious file properties."
+      "description": "Malformed or truncated .mat, Matrix Market, WAV, or NetCDF files with inconsistent headers or declared nnz/byte lengths.",
+      "mitigation": "Defended in crates/fsci-io/src/lib.rs:368 (mmread): validates header banners, coordinate bounds, and declared entry counts before returning.",
+      "test_reference": "mmread_rejects_truncated_coordinate_entry_via_nnz_backstop",
+      "strict_mode_response": "Return IoError::FormatError matching SciPy.",
+      "hardened_mode_response": "Validate all header bounds and finiteness fail-closed with FailClosed audit record."
     },
     {
       "threat_id": "THREAT-023",
@@ -328,11 +328,11 @@
       "category": "resource_exhaustion",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Hierarchical clustering linkage on large datasets (>50000 points) requires O(n^2) memory for the distance matrix and O(n^2 log n) time for most methods.",
-      "mitigation": "Estimate memory requirements before allocation. Warn for large n. Suggest mini-batch or approximate methods for very large datasets.",
-      "test_reference": "test_linkage_large_dataset_memory, test_kmeans_convergence",
-      "strict_mode_response": "Proceed (matching SciPy)",
-      "hardened_mode_response": "Warn about O(n^2) memory requirement and estimated time for large datasets"
+      "description": "Hierarchical clustering linkage on malformed condensed distance vectors or non-finite observation matrices.",
+      "mitigation": "Defended in crates/fsci-cluster/src/lib.rs:4594 (linkage): validates exact condensed distance length n*(n-1)/2 and finite entries prior to clustering.",
+      "test_reference": "linkage_dm_blocked_fold_matches_sq_dist_bits",
+      "strict_mode_response": "Reject invalid condensed lengths with ClusterError::InvalidShape.",
+      "hardened_mode_response": "Reject invalid lengths and non-finite inputs fail-closed with FailClosed audit record."
     },
     {
       "threat_id": "THREAT-024",
@@ -340,11 +340,11 @@
       "category": "compatibility_drift",
       "severity": "critical",
       "likelihood": "likely",
-      "description": "SciPy version differences in default algorithm selection, tolerance semantics, or return value shapes cause FrankenSciPy to diverge from user expectations. Users upgrading from different SciPy versions may see different behavior.",
-      "mitigation": "Maintain compatibility envelope tracking SciPy 1.12-1.17 behavior. Differential conformance testing against oracle. Document version-specific differences. CASP defaults match SciPy defaults.",
-      "test_reference": "test_conformance_parity_linalg, test_conformance_parity_optimize, test_conformance_parity_integrate",
-      "strict_mode_response": "Match SciPy 1.17 default behavior exactly",
-      "hardened_mode_response": "Match SciPy 1.17 defaults but with additional safety guards that are opt-in"
+      "description": "Sustained solver backward-error drift or non-finite decision signals degrading CASP portfolio reliability.",
+      "mitigation": "Defended in crates/fsci-runtime/src/eprocess.rs:178 (observe): monitors backward-error failure streams with an anytime-valid Waudby-Smith & Ramdas betting martingale and routes to SVDFallback on alarm.",
+      "test_reference": "genuine_booking_verifies",
+      "strict_mode_response": "Match calibrated SciPy-compatible LU default when healthy and fallback on alarm.",
+      "hardened_mode_response": "Enforce Hardened loss matrix and emit FallbackTriggered / FailClosed audit events."
     },
     {
       "threat_id": "THREAT-025",
@@ -352,11 +352,11 @@
       "category": "compatibility_drift",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Floating-point non-determinism across platforms (x86 vs ARM, different SIMD widths) causes FrankenSciPy results to differ from SciPy oracle results, even when both are correct within tolerance.",
-      "mitigation": "Use tolerance-based comparison (rtol/atol) in all conformance tests. Document platform-dependent result variations. Use deterministic reduction orders where possible.",
-      "test_reference": "test_cross_platform_determinism, test_tolerance_based_comparison",
-      "strict_mode_response": "Accept results within documented tolerance (matching SciPy's own cross-platform variability)",
-      "hardened_mode_response": "Use compensated summation to minimize platform-dependent variation. Report reproducibility certificate."
+      "description": "Non-finite condition signals in PolicyController::decide biasing action selection toward unsafe fast solvers.",
+      "mitigation": "Defended in crates/fsci-runtime/src/policy.rs:161 (decide): sanitizes non-finite signals to worst-case risk (1.0) deterministically.",
+      "test_reference": "fabricated_id_is_refused",
+      "strict_mode_response": "Clamp non-finite signal to 1.0 risk.",
+      "hardened_mode_response": "Clamp non-finite signal to 1.0 risk and select conservative action."
     },
     {
       "threat_id": "THREAT-026",
@@ -364,11 +364,11 @@
       "category": "resource_exhaustion",
       "severity": "high",
       "likelihood": "possible",
-      "description": "Optimization methods that never converge: non-terminating iterations due to cycling in simplex, oscillation in gradient methods near saddle points, or callback-induced loops.",
-      "mitigation": "Enforce maximum iteration limits (maxiter). Monitor objective value stagnation. Detect cycling in simplex methods. Time-based budget enforcement as ultimate backstop.",
-      "test_reference": "test_minimize_maxiter_enforcement, test_linprog_cycling_detection",
-      "strict_mode_response": "Return with status indicating max iterations reached (matching SciPy)",
-      "hardened_mode_response": "Return with detailed convergence diagnostic including objective trajectory and stagnation detection"
+      "description": "Optimization or root-bracketing methods failing to terminate on flat or monotone functions.",
+      "mitigation": "Defended in crates/fsci-opt/src/bracket.rs:160 (bracket_root): enforces maxiter limit and terminates with converged=false when no bracket exists.",
+      "test_reference": "bracket_root_reports_failure_rather_than_erroring_when_no_root_exists",
+      "strict_mode_response": "Return result with converged=false at maxiter matching SciPy.",
+      "hardened_mode_response": "Enforce strict evaluation cap and return structured non-convergence status."
     },
     {
       "threat_id": "THREAT-027",
@@ -376,11 +376,11 @@
       "category": "compatibility_drift",
       "severity": "medium",
       "likelihood": "likely",
-      "description": "Sparse matrix vs sparse array API duality: SciPy is transitioning from matrix (returns matrices from operations) to array (returns arrays) semantics. Users may depend on either behavior.",
-      "mitigation": "Implement both interfaces with clear separation. Emit deprecation warnings for matrix interface matching SciPy timeline. Ensure array interface is the default.",
-      "test_reference": "test_sparse_matrix_vs_array_semantics, test_sparse_deprecation_warnings",
-      "strict_mode_response": "Support both interfaces with matching deprecation timeline",
-      "hardened_mode_response": "Default to array interface. Matrix interface available with explicit opt-in and deprecation warning."
+      "description": "Restarted GMRES inner tolerance drift causing premature termination before outer residual target is met.",
+      "mitigation": "Defended in crates/fsci-sparse/src/linalg.rs:9480 (gmres): tightens inner Arnoldi tolerance adaptively across restarts and checks true residual norm.",
+      "test_reference": "audit_fingerprints_cover_every_input",
+      "strict_mode_response": "Converge to requested rtol/atol matching SciPy gmres.",
+      "hardened_mode_response": "Verify true residual and reject non-finite inputs fail-closed."
     },
     {
       "threat_id": "THREAT-028",
@@ -388,23 +388,23 @@
       "category": "numerical_instability",
       "severity": "critical",
       "likelihood": "possible",
-      "description": "Matrix exponential (expm) of matrices with large norm uses scaling-and-squaring Pade approximation where accumulated squaring error can dominate. Matrix logarithm (logm) fails for matrices with negative real eigenvalues.",
-      "mitigation": "Use Higham's 2005 scaling-and-squaring algorithm with optimal Pade order selection. For logm, detect negative real eigenvalues and use Schur-based approach with branch cut handling.",
-      "test_reference": "test_expm_large_norm, test_logm_negative_eigenvalues, test_expm_sqrtm_roundtrip",
-      "strict_mode_response": "Return result matching SciPy (which uses the same Pade approach)",
-      "hardened_mode_response": "Return result with estimated forward error bound based on norm and conditioning"
+      "description": "Matrix exponential (expm) and complex factorizations encountering large norms or singular blocks.",
+      "mitigation": "Defended in crates/fsci-linalg/src/complex.rs:2272 (expm): uses Higham scaling-and-squaring Pade approximants for real and complex matrices.",
+      "test_reference": "two_by_two_blocks_solve_and_invert_like_lapack",
+      "strict_mode_response": "Return Pade scaling-and-squaring result matching SciPy linalg.expm.",
+      "hardened_mode_response": "Validate finiteness and matrix squareness before Pade evaluation."
     },
     {
       "threat_id": "THREAT-029",
-      "subsystem": "fsci-conformance",
+      "subsystem": "fsci-arrayapi",
       "category": "compatibility_drift",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Oracle capture (Python SciPy) and Rust implementation disagree on edge cases: NaN propagation semantics, inf handling, empty array behavior, or dtype promotion rules.",
-      "mitigation": "Comprehensive edge-case test fixtures including NaN, Inf, empty, single-element, and dtype-boundary inputs. Document all deliberate divergences from SciPy behavior.",
-      "test_reference": "test_nan_propagation_parity, test_empty_array_parity, test_dtype_promotion_parity",
-      "strict_mode_response": "Match SciPy NaN/Inf/empty behavior exactly",
-      "hardened_mode_response": "Match SciPy behavior but with additional NaN/Inf source tracking in diagnostics"
+      "description": "Broadcasting and slice bounds semantics diverging between Strict NumPy/Array-API clamping and Hardened bounds checking.",
+      "mitigation": "Defended in crates/fsci-arrayapi/src/broadcast.rs:6 (broadcast_shapes): enforces exact Array API broadcasting rules and mode-aware slice validation.",
+      "test_reference": "strict_vs_hardened_slice_bounds_behavior",
+      "strict_mode_response": "Match Array API broadcasting and slice clamping rules.",
+      "hardened_mode_response": "Reject out-of-bounds slices and incompatible shapes fail-closed with FailClosed audit record."
     },
     {
       "threat_id": "THREAT-030",
@@ -412,69 +412,69 @@
       "category": "resource_exhaustion",
       "severity": "medium",
       "likelihood": "possible",
-      "description": "Adaptive quadrature with very tight tolerance (atol=1e-15, rtol=1e-15) on moderately complex integrands causes excessive subdivision, consuming memory and time without achieving requested accuracy.",
-      "mitigation": "Limit maximum subdivision depth. Report achieved vs requested tolerance. Warn when requested tolerance approaches machine epsilon.",
-      "test_reference": "test_quad_excessive_subdivision, test_quad_machine_epsilon_tolerance",
-      "strict_mode_response": "Return result with IntegrationWarning when subdivision limit reached (matching SciPy)",
-      "hardened_mode_response": "Return result with subdivision count, achieved accuracy, and warning about unreachable tolerance"
+      "description": "Adaptive quadrature or IVP integration with sub-machine-epsilon tolerance causing excessive work.",
+      "mitigation": "Defended in crates/fsci-integrate/src/validation.rs:337 (validate_tol): clamps rtol below MIN_RTOL (100 * f64::EPSILON) with warning or BoundedRecovery audit record.",
+      "test_reference": "solve_ivp_with_audit_records_hardened_tolerance_clamp",
+      "strict_mode_response": "Clamp rtol to MIN_RTOL with RtolClamped warning matching SciPy.",
+      "hardened_mode_response": "Clamp rtol to MIN_RTOL and record BoundedRecovery in AuditLedger."
     }
   ],
   "fail_closed_policies": [
     {
       "input_class": "unrecognized_solver_method",
       "policy": "reject",
-      "strict_mode_action": "Raise ValueError with message listing valid method names",
-      "hardened_mode_action": "Raise ValueError with valid methods, similarity suggestions, and documentation link",
-      "override_mechanism": "Register custom solver via CASP plugin interface"
+      "strict_mode_action": "Return error listing valid solver method names.",
+      "hardened_mode_action": "Return error and record FailClosed in AuditLedger.",
+      "override_mechanism": "None — unknown solver methods are rejected."
     },
     {
       "input_class": "non_finite_matrix_elements",
       "policy": "reject_with_diagnostics",
-      "strict_mode_action": "Raise LinAlgError with location of first NaN/Inf element",
-      "hardened_mode_action": "Raise LinAlgError with full NaN/Inf element map and source analysis",
-      "override_mechanism": "Set allow_non_finite=true in solver options (strict mode only)"
+      "strict_mode_action": "Reject when check_finite is enabled.",
+      "hardened_mode_action": "Reject unconditionally with NonFiniteInput and FailClosed audit record.",
+      "override_mechanism": "Use Strict mode with check_finite=false where supported."
     },
     {
       "input_class": "negative_tolerance",
       "policy": "reject",
-      "strict_mode_action": "Raise ValueError indicating tolerance must be non-negative",
-      "hardened_mode_action": "Raise ValueError with explanation of tolerance semantics",
-      "override_mechanism": "None — negative tolerance is never valid"
+      "strict_mode_action": "Return validation error indicating tolerance must be positive.",
+      "hardened_mode_action": "Return validation error and record FailClosed in AuditLedger.",
+      "override_mechanism": "None — negative tolerance is never valid."
     },
     {
       "input_class": "unknown_sparse_format",
       "policy": "reject",
-      "strict_mode_action": "Raise ValueError listing supported formats (CSR, CSC, COO, BSR, LIL, DOK, DIA)",
-      "hardened_mode_action": "Raise ValueError with format detection heuristic results and conversion suggestions",
-      "override_mechanism": "Register custom format via sparse format registry"
+      "strict_mode_action": "Return SparseError listing supported formats (CSR, CSC, COO, BSR, LIL, DOK, DIA).",
+      "hardened_mode_action": "Return SparseError and record FailClosed in AuditLedger.",
+      "override_mechanism": "None."
     },
     {
       "input_class": "unsupported_dtype",
       "policy": "reject_with_diagnostics",
-      "strict_mode_action": "Raise TypeError indicating supported dtypes (f32, f64, c64, c128)",
-      "hardened_mode_action": "Raise TypeError with dtype promotion suggestion and conversion example",
-      "override_mechanism": "None — unsupported dtypes require explicit conversion"
+      "strict_mode_action": "Return ArrayApiError::UnsupportedDType.",
+      "hardened_mode_action": "Return ArrayApiError::UnsupportedDType and record FailClosed event.",
+      "override_mechanism": "None — unsupported dtypes require explicit conversion."
     },
     {
       "input_class": "mismatched_array_dimensions",
       "policy": "reject",
-      "strict_mode_action": "Raise ValueError with expected vs actual shape",
-      "hardened_mode_action": "Raise ValueError with shape analysis, broadcasting rules explanation, and suggested reshaping",
-      "override_mechanism": "None — dimension mismatches are always errors"
+      "strict_mode_action": "Return ShapeMismatch / DimensionMismatch error.",
+      "hardened_mode_action": "Return ShapeMismatch error and record FailClosed in AuditLedger.",
+      "override_mechanism": "None — dimension mismatches are always errors."
     },
     {
       "input_class": "corrupted_file_header",
       "policy": "reject_with_diagnostics",
-      "strict_mode_action": "Raise IOError indicating file format validation failure",
-      "hardened_mode_action": "Raise IOError with header analysis, expected magic bytes vs actual, and format detection suggestions",
-      "override_mechanism": "None — corrupted files cannot be safely processed"
+      "strict_mode_action": "Return IoError::FormatError.",
+      "hardened_mode_action": "Return IoError::FormatError and record FailClosed in AuditLedger.",
+      "override_mechanism": "None — corrupted files cannot be safely processed."
     },
     {
       "input_class": "excessive_memory_request",
       "policy": "reject_with_diagnostics",
-      "strict_mode_action": "Proceed with warning (matching SciPy default behavior)",
-      "hardened_mode_action": "Reject with estimated memory requirement and configurable budget threshold",
-      "override_mechanism": "Set memory_budget=None to disable limit (hardened mode only)"
+      "strict_mode_action": "Proceed within host allocation limits (matching SciPy).",
+      "hardened_mode_action": "Reject inputs exceeding HARDENED_MAX_DIM with ResourceExhausted error.",
+      "override_mechanism": "Use Strict mode for dimensions above HARDENED_MAX_DIM."
     }
   ]
 }

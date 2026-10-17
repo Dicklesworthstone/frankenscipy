@@ -678,29 +678,29 @@ and not a reason to retry the identical command. Narrow the job and re-issue.
 else's build — rch allows one build per project key, so when several agents are
 in this repo at once they queue behind each other.
 
-**Worker capability is not part of admission.** `vmi1153651` has no
-`cargo-clippy` for `nightly-2026-07-20` and rch scheduled a clippy job onto it
+**Worker capability is not part of admission.** Under the pinned nightly (`nightly-2026-08-31`),
+`vmi1153651` had no `cargo-clippy` installed and rch scheduled a clippy job onto it
 anyway (`error: 'cargo-clippy' is not installed for the toolchain`). Re-issuing
 landed on a capable worker and succeeded. Treat a toolchain-missing error as a
 worker lottery, not as a broken checkout — see `frankenscipy-118g9`.
 
 ### The clippy gate is a per-worker lottery — pin the worker (frankenscipy-a3rgs)
 
-`rust-toolchain.toml` pins `nightly-2026-07-20` and declares
+`rust-toolchain.toml` pins `nightly-2026-08-31` and declares
 `components = ["rustfmt", "clippy"]`, but **rustup does not install a
 toolchain's declared components on first use**, and `rch` admission does not
 consider toolchain components at all (see the `insufficient_slots` section and
 frankenscipy-a6916). So which worker you land on decides whether
 `cargo clippy ... -- -D warnings` **runs** or **errors**.
 
-Measured 2026-08-16, same command, same session:
+Historical worker table measured 2026-08-16 under the prior July 2026 nightly pin (re-verify for `nightly-2026-08-31` via `RCH_WORKER=<id> RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --version`):
 
 | cargo-clippy present | cargo-clippy MISSING |
 |---|---|
 | `hz1`, `hz2`, `vmi1149989`, `vmi1227854`, `vmi1293453` | `vmi1153651`, `vmi1264463`, `vmi1152480` |
 
 A worker without it fails with
-`error: 'cargo-clippy' is not installed for the toolchain 'nightly-2026-07-20-x86_64-unknown-linux-gnu'`,
+`error: 'cargo-clippy' is not installed for the toolchain 'nightly-2026-08-31-x86_64-unknown-linux-gnu'`,
 exit 1.
 
 **Two failure modes, both observed, and they point in opposite directions.**

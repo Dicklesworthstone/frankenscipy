@@ -72,25 +72,29 @@
   `fit` wrapper panics on errors as documented
   ([#14](https://github.com/Dicklesworthstone/frankenscipy/issues/14)).
 
-## Previous releases
+## [0.2.0] — 2026-09-12
 
-- [0.2.0](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.2.0):
-  published 2026-09-12 UTC; source release and 19 crates, with no attached
-  binary assets.
-- [0.1.0](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.1.0):
-  published 2026-09-08 UTC; GitHub source release.
+- Published all 19 workspace crates (`fsci-arrayapi`, `fsci-cluster`, `fsci-conformance`,
+  `fsci-constants`, `fsci-datasets`, `fsci-fft`, `fsci-integrate`, `fsci-interpolate`,
+  `fsci-io`, `fsci-linalg`, `fsci-ndimage`, `fsci-odr`, `fsci-opt`, `fsci-runtime`,
+  `fsci-signal`, `fsci-sparse`, `fsci-spatial`, `fsci-special`, `fsci-stats`) to crates.io
+  from tag [`v0.2.0`](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.2.0)
+  under `#![forbid(unsafe_code)]` (`nightly-2026-08-31`).
+- Restructured CI into G0/G1 push fast lanes and G2–G9 scheduled / `workflow_dispatch`
+  conformance, oracle-capture, E2E, perf-smoke, RaptorQ decode-proof and tolerance-ratchet
+  lanes (`frankenscipy-liel6`).
 
-## Historical development through 2026-08-19 (workspace version 0.1.0)
+## [0.1.0] — 2026-09-08
 
-At this historical cutoff, no git tags or GitHub Releases existed.
+- Initial GitHub source release [`v0.1.0`](https://github.com/Dicklesworthstone/frankenscipy/releases/tag/v0.1.0)
+  covering the 19-crate workspace and 18 `FSCI-P2C-*` conformance packets.
 
-## [Unreleased] -- HEAD on main (workspace version 0.1.0)
+## Historical development through 2026-08-19 (pre-tag history)
 
-No git tags and no GitHub Releases exist. Continuous development on `main`.
 The crate inventory below is the 2026-05-16 snapshot (19 crates). The
-current-window waves after it cover **2026-05-17 through HEAD 2026-08-19**:
+waves after it cover **2026-05-17 through 2026-08-19**:
 **5,455 non-merge commits**, bringing `main` to **8,790** non-merge / **8,798**
-total commits.
+total commits at that cutoff.
 
 ### 2026-08-19 — Repo-janitor docs-reorg
 
@@ -202,7 +206,7 @@ June is the peak (2,597 commits). Themes:
 | `fsci-conformance` | 2026-02-13 | ~31,400 (lib + 7 bins) + 767 test files | 3-lane differential harness (self-check, SciPy-oracle, dispatch), RaptorQ evidence packs, parity reports, golden journey artifacts; binaries: `conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint` |
 | `fsci-runtime` | 2026-02-13 | ~1,750 | CASP solver portfolio, conformal calibrator, loss matrix, evidence ledger, audit trail, strict vs hardened mode |
 | `fsci-cluster` | 2026-03-24 | ~3,200 | `kmeans` and `kmeans++`, DBSCAN, hierarchical linkage, dendrogram, `fcluster`, silhouette, Davies-Bouldin, Calinski-Harabasz |
-| `fsci-constants` | 2026-03-24 | ~960 | CODATA 2018 physical constants, SI prefixes, mathematical constants, unit conversions |
+| `fsci-constants` | 2026-03-24 | ~960 | CODATA 2022 physical constants, SI prefixes, mathematical constants, unit conversions |
 | `fsci-ndimage` | 2026-03-23 | ~3,900 | `uniform_filter`, `gaussian_filter`, `median_filter`, `minimum_filter`, `maximum_filter`, `convolve`/`correlate`, morphology (erosion/dilation/opening/closing/binary), `label`, `find_objects`, distance transforms, `affine_transform`, `rotate`, `zoom`, `shift`, Sobel/Prewitt/Laplace edge detectors, histograms and extrema by label |
 | `fsci-io` | 2026-03-23 | ~5,300 | `savemat`/`loadmat` (MATLAB v4 and v5), `mmread`/`mmwrite` (Matrix Market), WAV read/write, NetCDF (simplified), IDL `readsav`, Fortran sequential unformatted reader |
 | `fsci-odr` | 2026-05-03 | ~1,300 | Orthogonal Distance Regression — `ODR` driver, `Model`, `Data`, `Output`; explicit/implicit models, weighted, multi-response |
@@ -291,7 +295,7 @@ sections further below.
 
 ### `fsci-constants` (NEW, 2026-03-24)
 
-- CODATA 2018 physical constants, SI prefixes, mathematical constants
+- CODATA 2022 physical constants, SI prefixes, mathematical constants
   (`pi`, `e`, `euler_gamma`, etc.), and `convert_*` unit conversions. Full
   SciPy parity surface; conformance harness `diff_constants_physical`,
   `diff_constants_conversions`, `diff_constants_value_lookup`.

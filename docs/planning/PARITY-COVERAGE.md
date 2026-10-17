@@ -1,64 +1,76 @@
 # SciPy Parity Coverage Report
 
-**Regenerated: 2026-09-15** against **scipy 1.17.1** (live import) and the current crates.
+**Regenerated: 2026-10-14** via `scripts/symbol_census.py` against **scipy 1.17.1 / numpy 2.4.3** (live import) and `docs/planning/census_dispositions.toml`.
 
-## Overall Coverage: 100.0%
+## Overall Census Summary (33 SciPy Modules)
 
-**1,300 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+Across **1,555** public SciPy symbols (**16** not applicable to a native Rust library, **1,539** applicable):
 
-## Module-Level Coverage
+- **Declared (`1,495 / 1,539`, `97.1%`):** A public Rust item (`fn`, `struct`, `enum`, `type`, `const`, `trait`, or `pub use`) matches the SciPy symbol name (`exact: 1,289`, `case_fold: 131`, `reexport: 13`, `type_alias: 60`, `trait: 2`).
+- **Real (`1,525 / 1,539`, `99.1%`):** Implemented with non-placeholder semantics (including differently-named Rust APIs recorded in `docs/planning/census_dispositions.toml`; **14** symbols remain missing).
+- **Compared (`891 / 1,539`, `57.9%`):** Exercised in a `crates/fsci-conformance/tests/diff_*.rs` live-SciPy differential test.
 
-| Module | scipy | covered | missing | Coverage |
-|--------|------:|--------:|--------:|---------:|
-| cluster | 0 | 0 | 0 | 0.0%* |
-| constants | 8 | 8 | 0 | 100.0% |
-| datasets | 5 | 5 | 0 | 100.0% |
-| fft | 41 | 41 | 0 | 100.0% |
-| integrate | 33 | 33 | 0 | 100.0% |
-| interpolate | 56 | 56 | 0 | 100.0% |
-| io | 14 | 14 | 0 | 100.0% |
-| linalg | 98 | 98 | 0 | 100.0% |
-| ndimage | 75 | 75 | 0 | 100.0% |
-| odr | 10 | 10 | 0 | 100.0% |
-| optimize | 71 | 71 | 0 | 100.0% |
-| signal | 157 | 157 | 0 | 100.0% |
-| sparse | 53 | 53 | 0 | 100.0% |
-| spatial | 18 | 18 | 0 | 100.0% |
-| special | 358 | 358 | 0 | 100.0% |
-| stats | 303 | 303 | 0 | 100.0% |
+## Module-Level Coverage (`scripts/symbol_census.py`)
 
-* `scipy.cluster` exports only submodules (`vq`, `hierarchy`) at the top level, so it scores 0/0 here;
-its surface lives in `fsci-cluster` and is covered by the conformance suite, not by this census.
+| Module | Crate | SciPy | N/A | Applicable | Declared | Real | Compared | Real % | Compared % |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `scipy.cluster.hierarchy` | `fsci-cluster` | 32 | 1 | 31 | 31 | 31 | 10 | 100.0% | 32.3% |
+| `scipy.cluster.vq` | `fsci-cluster` | 4 | 0 | 4 | 4 | 4 | 2 | 100.0% | 50.0% |
+| `scipy.constants` | `fsci-constants` | 8 | 1 | 7 | 7 | 7 | 5 | 100.0% | 71.4% |
+| `scipy.datasets` | `fsci-datasets` | 5 | 0 | 5 | 5 | 5 | 0 | 100.0% | 0.0% |
+| `scipy.differentiate` | `fsci-opt` | 3 | 0 | 3 | 3 | 3 | 0 | 100.0% | 0.0% |
+| `scipy.fft` | `fsci-fft` | 41 | 4 | 37 | 37 | 37 | 20 | 100.0% | 54.1% |
+| `scipy.fftpack` | `fsci-fft` | 10 | 0 | 10 | 10 | 10 | 10 | 100.0% | 100.0% |
+| `scipy.integrate` | `fsci-integrate` | 33 | 1 | 32 | 31 | 32 | 14 | 100.0% | 43.8% |
+| `scipy.interpolate` | `fsci-interpolate` | 56 | 0 | 56 | 56 | 56 | 14 | 100.0% | 25.0% |
+| `scipy.io` | `fsci-io` | 14 | 0 | 14 | 14 | 14 | 3 | 100.0% | 21.4% |
+| `scipy.io.arff` | `fsci-io` | 4 | 0 | 4 | 0 | 2 | 0 | 50.0% | 0.0% |
+| `scipy.io.matlab` | `fsci-io` | 10 | 0 | 10 | 3 | 6 | 4 | 60.0% | 40.0% |
+| `scipy.io.wavfile` | `fsci-io` | 3 | 0 | 3 | 0 | 2 | 0 | 66.7% | 0.0% |
+| `scipy.linalg` | `fsci-linalg` | 98 | 3 | 95 | 95 | 95 | 71 | 100.0% | 74.7% |
+| `scipy.linalg.interpolative` | `fsci-linalg` | 8 | 0 | 8 | 8 | 8 | 7 | 100.0% | 87.5% |
+| `scipy.ndimage` | `fsci-ndimage` | 75 | 0 | 75 | 75 | 75 | 39 | 100.0% | 52.0% |
+| `scipy.odr` | `fsci-odr` | 10 | 0 | 10 | 10 | 10 | 2 | 100.0% | 20.0% |
+| `scipy.optimize` | `fsci-opt` | 71 | 1 | 70 | 68 | 70 | 29 | 100.0% | 41.4% |
+| `scipy.optimize.elementwise` | `fsci-opt` | 4 | 0 | 4 | 4 | 4 | 4 | 100.0% | 100.0% |
+| `scipy.signal` | `fsci-signal` | 157 | 0 | 157 | 153 | 157 | 77 | 100.0% | 49.0% |
+| `scipy.signal.windows` | `fsci-signal` | 25 | 0 | 25 | 22 | 25 | 9 | 100.0% | 36.0% |
+| `scipy.sparse` | `fsci-sparse` | 53 | 2 | 51 | 51 | 51 | 24 | 100.0% | 47.1% |
+| `scipy.sparse.csgraph` | `fsci-sparse` | 26 | 0 | 26 | 25 | 26 | 24 | 100.0% | 92.3% |
+| `scipy.sparse.linalg` | `fsci-sparse` | 38 | 1 | 37 | 32 | 35 | 29 | 94.6% | 78.4% |
+| `scipy.spatial` | `fsci-spatial` | 18 | 0 | 18 | 18 | 18 | 8 | 100.0% | 44.4% |
+| `scipy.spatial.distance` | `fsci-spatial` | 27 | 0 | 27 | 26 | 27 | 22 | 100.0% | 81.5% |
+| `scipy.spatial.transform` | `fsci-spatial` | 4 | 0 | 4 | 4 | 4 | 0 | 100.0% | 0.0% |
+| `scipy.special` | `fsci-special` | 358 | 0 | 358 | 357 | 358 | 208 | 100.0% | 58.1% |
+| `scipy.stats` | `fsci-stats` | 303 | 0 | 303 | 299 | 302 | 239 | 99.7% | 78.9% |
+| `scipy.stats.contingency` | `fsci-stats` | 6 | 0 | 6 | 6 | 6 | 2 | 100.0% | 33.3% |
+| `scipy.stats.mstats` | `fsci-stats` | 31 | 2 | 29 | 29 | 29 | 11 | 100.0% | 37.9% |
+| `scipy.stats.qmc` | `fsci-stats` | 11 | 0 | 11 | 7 | 11 | 4 | 100.0% | 36.4% |
+| `scipy.stats.sampling` | `fsci-stats` | 9 | 0 | 9 | 5 | 5 | 0 | 55.6% | 0.0% |
+| **TOTAL** | — | **1,555** | **16** | **1,539** | **1,495** | **1,525** | **891** | **99.1%** | **57.9%** |
 
 ---
 
 ## What this number does and does not mean
 
-**It is a name-matching census, not a behavioural-parity proof.** It reports that a public Rust symbol
-exists whose name normalises to the SciPy symbol's. It does *not* check signatures, semantics, dtypes,
-error behaviour, or numerical agreement. Behavioural parity is what `fsci-conformance` and the
-differential/metamorphic suites are for; treat the two as complementary and never quote this number as
-"parity".
+**It separates name-matching (`declared`), implementation (`real`), and differential verification (`compared`).** `declared` reports that a public Rust symbol exists whose name normalises to the SciPy symbol's; `real` excludes `na` and `missing` entries in `docs/planning/census_dispositions.toml` and includes `api_shape` mappings where the Rust API has a different name; `compared` requires a reference in `crates/fsci-conformance/tests/diff_*.rs`. Treat the three numbers as distinct and never quote `declared` or `real` alone as behavioural parity.
 
-**Conservative normalization.** The census uses lowercase-and-strip-underscores name matching, and handles:
+**Conservative normalization.** The census classifies name matches by kind (`exact`, `case_fold`, `reexport`, `type_alias`, `trait`), and handles:
 
 1. **Naming conventions & aliases.** SciPy exposes *distribution instances* in lowercase — `stats.norm`,
    `stats.beta`, `stats.gamma`, `stats.binom`, `stats.t`, `stats.f`. FrankenSciPy provides exact
-   SciPy-compatible aliases for all distribution instances, warnings, and traits alongside the Rust
-   struct types (`Normal`, `StudentT`, `ChiSquared`, `Binomial`, etc.), bringing `stats` to 303/303 (100.0%).
+   SciPy-compatible aliases for distribution instances, warnings, and traits alongside the Rust
+   struct types (`Normal`, `StudentT`, `ChiSquared`, `Binomial`, etc.), with `make_distribution` recorded as the sole missing `scipy.stats` top-level symbol (`302 / 303` real, `239 / 303` compared).
 2. **Case.** Symbols implemented verbatim behind `#[allow(non_snake_case)]` — `check_COLA`,
-   `check_NOLA` — match normalized case.
+   `check_NOLA` — match exact case (`1,289` exact matches vs `131` case-folded).
 3. **Re-exports & Traits.** Crates that expose their surface through `pub use` or Python ABC equivalents
-   implemented as `pub trait` (`BivariateSpline`, `HessianUpdateStrategy`) are fully scanned.
-
-**It also overcounts in one direction:** a same-named Rust symbol in an unrelated position counts as
-covered. Spot checks did not find such a case, but the census cannot rule it out.
+   implemented as `pub trait` (`BivariateSpline`, `HessianUpdateStrategy`) are scanned and classified separately.
 
 ---
 
 ## The residual, itemised
 
-**Residual count: not 0.** The 2026-09-15 census counted all 1,300 callable symbols as mapped, but 25 of those names were no-op stand-ins (frankenscipy-8dndw.1). Every one is now either implemented or recorded below as not applicable (N/A) or missing, and N/A and missing names must not be counted as covered: the BLAS/LAPACK introspection functions, the FFT backend hooks, `show_options`, `make_distribution`, `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning` and `ODEintWarning` (thirteen names). A declared / real / compared recount is frankenscipy-8dndw.2.
+**Residual count: 16 N/A + 14 missing (30 not-real out of 1,555).** The earlier 16-module name census counted 1,300 symbols including 25 no-op stand-ins (`frankenscipy-8dndw.1`). Those stand-ins were either implemented or removed and recorded in `docs/planning/census_dispositions.toml` as `na` (16 symbols) or `missing` (14 symbols), and `scripts/symbol_census.py` (`frankenscipy-8dndw.2`) enforces that every `na` or `missing` symbol is absent from `pub` declarations.
 
 ### Previously unmapped categories (now fully wired)
 
