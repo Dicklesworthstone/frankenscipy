@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-016",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-constants provides CODATA physical constants, SI/binary prefixes, unit conversions, lambda2nu/nu2lambda, and convert_temperature.",
+        "affected_functions": ["value", "unit", "precision", "find", "convert_temperature", "lambda2nu"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-constants",
+      "category": "numerical_instability",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Zero or negative wavelength/frequency passed to lambda2nu / nu2lambda producing division-by-zero Inf without explicit IEEE semantics.",
+      "mitigation": "Defended in crates/fsci-constants/src/lib.rs:499 (lambda2nu): computes c / lambda using exact CODATA speed_of_light (299792458.0 m/s) matching SciPy.",
+      "test_reference": "lambda2nu_nu2lambda_convert_temp_match_scipy",
+      "strict_mode_response": "Match SciPy c / lambda IEEE floating-point division.",
+      "hardened_mode_response": "Preserve exact CODATA speed_of_light constant."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-constants",
+      "category": "malformed_input",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Unknown physical constant key or unsupported temperature scale name passed to value / unit / convert_temperature.",
+      "mitigation": "Defended in crates/fsci-constants/src/lib.rs:1001 (convert_temperature): normalizes scale names and returns Err(ConstantsError) on unrecognized scale.",
+      "test_reference": "temperature_conversions",
+      "strict_mode_response": "Return None for unknown constant keys and Err for unknown temperature scales.",
+      "hardened_mode_response": "Fail closed on unknown scale names without silent fallback."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-constants",
+      "category": "resource_exhaustion",
+      "severity": "low",
+      "likelihood": "unlikely",
+      "description": "Repeated per-call string allocations during case-insensitive CODATA constant lookup.",
+      "mitigation": "Defended in crates/fsci-constants/src/lib.rs:957 (value): uses zero-allocation ASCII case-insensitive table lookup over static CODATA entries.",
+      "test_reference": "normalized_ascii_value_lookup_matches_former_bits",
+      "strict_mode_response": "Resolve constant value in bounded time without heap allocation.",
+      "hardened_mode_response": "Same static table lookup."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-constants",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "CODATA constant values, units, or relative uncertainties drifting from SciPy's physical_constants table.",
+      "mitigation": "Defended in crates/fsci-constants/src/lib.rs:970 (unit): serves value, unit, and relative precision from a unified static CODATA metadata table.",
+      "test_reference": "unit_and_precision_match_codata_metadata_and_aliases",
+      "strict_mode_response": "Return exact CODATA value, unit string, and relative precision.",
+      "hardened_mode_response": "Verify table uniqueness and alias consistency in unit tests."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "unknown physical constant name",
+      "policy": "reject",
+      "strict_mode_action": "Return None from value(), unit(), and precision().",
+      "hardened_mode_action": "Return None without partial prefix guessing."
+    },
+    {
+      "input_class": "unknown temperature scale in convert_temperature",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return Err(ConstantsError::UnknownScale) naming the invalid scale.",
+      "hardened_mode_action": "Return Err(ConstantsError::UnknownScale)."
+    },
+    {
+      "input_class": "duplicate or ambiguous CODATA table keys",
+      "policy": "reject",
+      "strict_mode_action": "Enforced by physical_constant_metadata_table_is_unique_and_fully_lookupable test.",
+      "hardened_mode_action": "Disallowed at compile/test time."
+    },
+    {
+      "input_class": "non-ASCII query in find()",
+      "policy": "allowlist_only",
+      "strict_mode_action": "Perform deterministic substring match over CODATA keys.",
+      "hardened_mode_action": "Perform deterministic substring match over CODATA keys."
+    }
+  ]
+}

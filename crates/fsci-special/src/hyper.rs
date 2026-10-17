@@ -378,6 +378,176 @@ pub fn select_hypergeometric_branch_with_casp(
     mode: RuntimeMode,
     portfolio: &mut HyperSolverPortfolio,
 ) -> Result<HyperCaspDecision, SpecialError> {
+    select_hypergeometric_branch_with_casp_impl(problem, mode, portfolio, None)
+}
+
+/// Audited variant of [`select_hypergeometric_branch_with_casp`] (frankenscipy-dbjm3): records
+/// the portfolio's branch choice as an [`fsci_runtime::AuditAction::CaspDecision`] under the
+/// call's [`fsci_runtime::Fingerprinter`] digest in `mode`, and any returned [`SpecialError`] as
+/// a single [`fsci_runtime::AuditAction::FailClosed`].
+pub fn select_hypergeometric_branch_with_casp_and_audit(
+    problem: HyperCaspProblem,
+    mode: RuntimeMode,
+    portfolio: &mut HyperSolverPortfolio,
+    ledger: &crate::audit::SyncSharedAuditLedger,
+) -> Result<HyperCaspDecision, SpecialError> {
+    let portfolio_mode = portfolio.mode();
+    let fingerprint_of = || hyper_casp_audit_fingerprint(&problem, mode, portfolio_mode);
+    let audit = fsci_runtime::AuditScope::new(ledger, &fingerprint_of);
+    let result =
+        select_hypergeometric_branch_with_casp_impl(problem, mode, portfolio, Some(&audit));
+    audit.finish(result, |err| {
+        format!(
+            "select_hypergeometric_branch_with_casp::{}::{:?}",
+            err.function, err.kind
+        )
+    })
+}
+
+fn hyper_casp_audit_fingerprint(
+    problem: &HyperCaspProblem,
+    mode: RuntimeMode,
+    portfolio_mode: RuntimeMode,
+) -> String {
+    let mut fingerprinter =
+        fsci_runtime::Fingerprinter::new("fsci_special::select_hypergeometric_branch_with_casp");
+    fingerprinter
+        .str(hyper_function_name(problem.function))
+        .f64(problem.a)
+        .f64(problem.b)
+        .bool(problem.c.is_some());
+    if let Some(c) = problem.c {
+        fingerprinter.f64(c);
+    }
+    fingerprinter
+        .f64(problem.z)
+        .f64(problem.z_abs)
+        .f64(problem.precision_target)
+        .f64(problem.parameter_stability_margin)
+        .str(&format!("{mode:?}"))
+        .str(&format!("{portfolio_mode:?}"));
+    fingerprinter.finish()
+}
+
+const HYP0F1_ALLOWED_ACTIONS: &[HyperBranchAction] = &[
+    HyperBranchAction::DirectSeries,
+    HyperBranchAction::Asymptotic,
+    HyperBranchAction::GuardedFallback,
+];
+const HYP1F1_ALLOWED_ACTIONS: &[HyperBranchAction] = &[
+    HyperBranchAction::DirectSeries,
+    HyperBranchAction::KummerTransform,
+    HyperBranchAction::Asymptotic,
+    HyperBranchAction::GuardedFallback,
+];
+const HYP2F1_ALLOWED_ACTIONS: &[HyperBranchAction] = &[
+    HyperBranchAction::DirectSeries,
+    HyperBranchAction::PfaffTransform,
+    HyperBranchAction::ContinuedFraction,
+    HyperBranchAction::GuardedFallback,
+];
+
+fn hyper_allowed_actions(function: HypergeometricFunction) -> &'static [HyperBranchAction] {
+    match function {
+        HypergeometricFunction::Hyp0f1 => HYP0F1_ALLOWED_ACTIONS,
+        HypergeometricFunction::Hyp1f1 => HYP1F1_ALLOWED_ACTIONS,
+        HypergeometricFunction::Hyp2f1 => HYP2F1_ALLOWED_ACTIONS,
+    }
+}
+
+fn hyper_function_posterior(problem: HyperCaspProblem, mode: RuntimeMode) -> [f64; 4] {
+    let strict_1f1_off_pole = mode == RuntimeMode::Strict
+        && problem.function == HypergeometricFunction::Hyp1f1
+        && problem.parameter_stability_margin > 0.0;
+    if problem.parameter_stability_margin <= problem.precision_target && !strict_1f1_off_pole {
+        return [0.0, 0.0, 0.0, 1.0]; // BoundaryNearPole -> GuardedFallback
+    }
+
+    match problem.function {
+        HypergeometricFunction::Hyp0f1 => {
+            if problem.z <= -50.0 {
+                [0.02, 0.02, 0.94, 0.02] // LargeArgumentAsymptotic -> Asymptotic
+            } else {
+                [0.92, 0.03, 0.03, 0.02] // NearZeroDirectSeries -> DirectSeries
+            }
+        }
+        HypergeometricFunction::Hyp1f1 => {
+            if problem.z < -1.0 {
+                if is_nonpositive_integer(problem.a) {
+                    [0.92, 0.03, 0.03, 0.02] // DirectSeries (terminating)
+                } else if problem.z < -HYP1F1_LARGE_Z_THRESHOLD {
+                    [0.02, 0.05, 0.91, 0.02] // LargeArgumentAsymptotic -> Asymptotic
+                } else {
+                    [0.02, 0.94, 0.02, 0.02] // TransformDomain -> KummerTransform
+                }
+            } else if problem.z > HYP1F1_LARGE_Z_THRESHOLD {
+                [0.02, 0.03, 0.93, 0.02] // LargeArgumentAsymptotic -> Asymptotic
+            } else {
+                [0.92, 0.03, 0.03, 0.02] // NearZeroDirectSeries -> DirectSeries
+            }
+        }
+        HypergeometricFunction::Hyp2f1 => {
+            if is_nonpositive_integer(problem.a) || is_nonpositive_integer(problem.b) {
+                [0.92, 0.03, 0.03, 0.02] // DirectSeries -> TerminatingPolynomial
+            } else if problem.z < 0.0 {
+                [0.02, 0.94, 0.02, 0.02] // TransformDomain -> PfaffTransform
+            } else if (problem.z - 1.0).abs() < f64::EPSILON || (0.9..1.0).contains(&problem.z) {
+                // Selects ContinuedFraction (loss 14.5 vs GuardedFallback 18.1, Pfaff 35.9, Direct 57.25)
+                [0.0, 0.45, 0.45, 0.10]
+            } else {
+                [0.92, 0.03, 0.03, 0.02]
+            }
+        }
+    }
+}
+
+fn estimate_hyper_truncation_error(problem: HyperCaspProblem, decision: &HyperCaspDecision) -> f64 {
+    match decision.branch {
+        HypergeometricBranch::TerminatingPolynomial
+        | HypergeometricBranch::GaussSummation
+        | HypergeometricBranch::LinearFractionalIdentity => f64::EPSILON,
+        HypergeometricBranch::DirectSeries
+        | HypergeometricBranch::KummerTransform
+        | HypergeometricBranch::PfaffTransform
+        | HypergeometricBranch::AsymptoticExpansion => {
+            let margin_scale = (1.0 / problem.parameter_stability_margin.max(1.0e-6)).min(1.0e4);
+            (f64::EPSILON * margin_scale).min(problem.precision_target)
+        }
+        HypergeometricBranch::ParameterGuard
+        | HypergeometricBranch::DivergentAtUnitArgument
+        | HypergeometricBranch::RealBranchCutInfinity
+        | HypergeometricBranch::UnsupportedAnalyticContinuation => 0.0,
+    }
+}
+
+thread_local! {
+    static DEFAULT_HYPER_PORTFOLIOS: std::cell::RefCell<(HyperSolverPortfolio, HyperSolverPortfolio)> =
+        std::cell::RefCell::new((
+            HyperSolverPortfolio::new(RuntimeMode::Strict, 64),
+            HyperSolverPortfolio::new(RuntimeMode::Hardened, 64),
+        ));
+}
+
+fn select_hypergeometric_branch_default_portfolio(
+    problem: HyperCaspProblem,
+    mode: RuntimeMode,
+) -> Result<HyperCaspDecision, SpecialError> {
+    DEFAULT_HYPER_PORTFOLIOS.with(|cell| {
+        let mut portfolios = cell.borrow_mut();
+        let portfolio = match mode {
+            RuntimeMode::Strict => &mut portfolios.0,
+            RuntimeMode::Hardened => &mut portfolios.1,
+        };
+        select_hypergeometric_branch_with_casp(problem, mode, portfolio)
+    })
+}
+
+fn select_hypergeometric_branch_with_casp_impl(
+    problem: HyperCaspProblem,
+    mode: RuntimeMode,
+    portfolio: &mut HyperSolverPortfolio,
+    audit: Option<&fsci_runtime::AuditScope<'_>>,
+) -> Result<HyperCaspDecision, SpecialError> {
     if !problem.precision_target.is_finite() || problem.precision_target <= 0.0 {
         return Err(SpecialError {
             function: hyper_function_name(problem.function),
@@ -410,19 +580,21 @@ pub fn select_hypergeometric_branch_with_casp(
         ));
     }
 
-    let is_negative_real_confluent =
-        problem.function == HypergeometricFunction::Hyp1f1 && problem.z < -2.0;
-
-    let (action, posterior, expected_losses, chosen_loss) = portfolio.select_action(
-        problem.z,
-        problem.parameter_stability_margin,
-        is_negative_real_confluent,
-    );
+    let posterior = hyper_function_posterior(problem, mode);
+    let allowed = hyper_allowed_actions(problem.function);
+    let (action, posterior, expected_losses, chosen_loss) =
+        portfolio.select_action_for_allowed(posterior, allowed);
 
     let fallback_active = portfolio.calibrator().should_fallback();
 
     let decision = match action {
-        HyperBranchAction::DirectSeries => select_hypergeometric_branch(problem, mode)?,
+        HyperBranchAction::GuardedFallback => hyper_casp_decision(
+            HypergeometricBranch::ParameterGuard,
+            problem,
+            0,
+            HYPER_GUARD_CHAIN,
+            "CASP portfolio selected parameter guard / conformal fallback",
+        ),
         HyperBranchAction::KummerTransform => hyper_casp_decision(
             HypergeometricBranch::KummerTransform,
             problem,
@@ -437,28 +609,28 @@ pub fn select_hypergeometric_branch_with_casp(
             HYP2F1_PFAFF_CHAIN,
             "CASP portfolio selected Pfaff linear transformation",
         ),
-        HyperBranchAction::Asymptotic => hyper_casp_decision(
-            HypergeometricBranch::AsymptoticExpansion,
-            problem,
-            500,
-            HYP1F1_ASYMPTOTIC_CHAIN,
-            "CASP portfolio selected asymptotic expansion for large argument",
-        ),
-        HyperBranchAction::ContinuedFraction => hyper_casp_decision(
-            HypergeometricBranch::GaussSummation,
-            problem,
-            300,
-            HYP2F1_GAUSS_CHAIN,
-            "CASP portfolio selected boundary continued fraction or summation",
-        ),
-        HyperBranchAction::GuardedFallback => hyper_casp_decision(
-            HypergeometricBranch::ParameterGuard,
-            problem,
-            0,
-            HYPER_GUARD_CHAIN,
-            "CASP portfolio selected parameter guard / conformal fallback",
-        ),
+        HyperBranchAction::Asymptotic => match problem.function {
+            HypergeometricFunction::Hyp0f1 => hyper_casp_decision(
+                HypergeometricBranch::AsymptoticExpansion,
+                problem,
+                10,
+                HYP0F1_ASYMPTOTIC_CHAIN,
+                "large real 0F1 argument uses the asymptotic Bessel expansion",
+            ),
+            _ => hyper_casp_decision(
+                HypergeometricBranch::AsymptoticExpansion,
+                problem,
+                500,
+                HYP1F1_ASYMPTOTIC_CHAIN,
+                "CASP portfolio selected asymptotic expansion for large argument",
+            ),
+        },
+        HyperBranchAction::DirectSeries | HyperBranchAction::ContinuedFraction => {
+            select_hypergeometric_branch(problem, mode)?
+        }
     };
+
+    let estimated_truncation_error = estimate_hyper_truncation_error(problem, &decision);
 
     portfolio.record_evidence(HyperSolverEvidenceEntry {
         component: "fsci-special",
@@ -471,7 +643,35 @@ pub fn select_hypergeometric_branch_with_casp(
         chosen_expected_loss: chosen_loss,
         fallback_active,
         term_count: Some(decision.max_terms),
+        estimated_truncation_error: Some(estimated_truncation_error),
     });
+
+    if let Some(audit) = audit {
+        audit.record(
+            fsci_runtime::AuditAction::CaspDecision {
+                portfolio: <HyperSolverPortfolio as fsci_runtime::PortfolioEvidence>::NAME
+                    .to_string(),
+                mode,
+                action: format!("{action:?}"),
+                posterior: posterior.to_vec(),
+                expected_losses: expected_losses.to_vec(),
+                chosen_expected_loss: chosen_loss,
+                fallback: fallback_active,
+                evidence: std::collections::BTreeMap::from([
+                    (
+                        "function_kind".to_string(),
+                        hyper_function_name(problem.function).to_string().into(),
+                    ),
+                    ("z_abs".to_string(), problem.z_abs.into()),
+                    (
+                        "parameter_stability_margin".to_string(),
+                        problem.parameter_stability_margin.into(),
+                    ),
+                ]),
+            },
+            &format!("CASP selected {action:?}"),
+        );
+    }
 
     Ok(decision)
 }
@@ -957,7 +1157,8 @@ pub fn hyp0f1_scalar(b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
         return Ok(1.0);
     }
 
-    let decision = select_hypergeometric_branch(HyperCaspProblem::hyp0f1(b, z, 1.0e-14), mode)?;
+    let decision =
+        select_hypergeometric_branch_default_portfolio(HyperCaspProblem::hyp0f1(b, z, 1.0e-14), mode)?;
     match decision.branch {
         // z < 0 is the oscillatory J-Bessel side at every magnitude: its series alternates, so
         // both branches hand it to the cancellation-controlled route.
@@ -1783,7 +1984,8 @@ pub(crate) fn hyp1f1_scalar(
         return Ok(0.0);
     }
 
-    let decision = select_hypergeometric_branch(HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14), mode)?;
+    let decision =
+        select_hypergeometric_branch_default_portfolio(HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14), mode)?;
     match decision.branch {
         HypergeometricBranch::KummerTransform => {
             hyp1f1_converged_or(hyp1f1_kummer_value(a, b, z), mode)
@@ -3310,55 +3512,18 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
         return Ok(1.0);
     }
 
-    // z near 1 with non-integer c−a−b: the direct 2F1 series converges like z^n, so
-    // it needs O(log ε / log z) terms — ~35 000 at z = 0.999, past hyp2f1_series's
-    // 5000-term cap → previously SLOW (z≈0.99) then WRONG (NaN for z ≳ 0.999). Use
-    // the DLMF 15.8.4 z→1−z connection formula: two series in the SMALL argument
-    // (1−z) that converge in ~10 terms, plus SciPy-matching gamma prefactors. The
-    // integer c−a−b case uses the 15.8.10 logarithmic form below.
-    if (0.9..1.0).contains(&z) {
-        let cab = c - a - b;
-        if (cab - cab.round()).abs() > 1e-6 {
-            let omz = 1.0 - z;
-            let pref1 = gamma_ratio_for_hyp2f1(c, cab, c - a, c - b);
-            let pref2 = gamma_ratio_for_hyp2f1(c, -cab, a, b);
-            if pref1.is_finite() && pref2.is_finite() {
-                let s1 = hyp2f1_series(a, b, 1.0 - cab, omz)?;
-                let s2 = hyp2f1_series(c - a, c - b, 1.0 + cab, omz)?;
-                let result = pref1 * s1 + omz.powf(cab) * pref2 * s2;
-                if result.is_finite() {
-                    return Ok(result);
-                }
-            }
-        } else if a > 0.0 && b > 0.0 {
-            // Integer c−a−b: the 15.8.4 gamma prefactors diverge, so use the DLMF
-            // 15.8.10 LOGARITHMIC connection formula (converges in the small (1−z)).
-            //   m = round(c−a−b) ≥ 0 → apply directly (m = 0 is the pure-log limit,
-            //     c = a+b; m > 0 adds a finite (1−z)-polynomial).
-            //   m < 0 → reduce to m > 0 by the Euler transform
-            //     2F1(a,b;c;z) = (1−z)^{c−a−b} 2F1(c−a,c−b;c;z), valid here since
-            //     c−a > 0 and c−b > 0 (otherwise a numerator terminates and the
-            //     normal path handles it). Validated vs high-precision to ~6e-15
-            //     across m ∈ [−4,4]; more accurate than SciPy in the z→1 tail.
-            let m = cab.round() as i32;
-            let omz = 1.0 - z;
-            let result = if m >= 0 {
-                hyp2f1_log_connection_mpos(a, b, m, z)
-            } else if c - a > 0.0 && c - b > 0.0 {
-                omz.powf(cab) * hyp2f1_log_connection_mpos(c - a, c - b, -m, z)
-            } else {
-                f64::NAN
-            };
-            if result.is_finite() {
-                return Ok(result);
-            }
-        }
-    }
-
-    let decision =
-        select_hypergeometric_branch(HyperCaspProblem::hyp2f1(a, b, c, z, 1.0e-14), mode)?;
+    let decision = select_hypergeometric_branch_default_portfolio(
+        HyperCaspProblem::hyp2f1(a, b, c, z, 1.0e-14),
+        mode,
+    )?;
     match decision.branch {
-        HypergeometricBranch::DirectSeries | HypergeometricBranch::TerminatingPolynomial => {
+        HypergeometricBranch::TerminatingPolynomial => hyp2f1_series(a, b, c, z),
+        HypergeometricBranch::DirectSeries => {
+            if (0.9..1.0).contains(&z)
+                && let Some(val) = hyp2f1_unit_neighborhood_connection(a, b, c, z)
+            {
+                return Ok(val);
+            }
             hyp2f1_series(a, b, c, z)
         }
         HypergeometricBranch::GaussSummation => {
@@ -3400,6 +3565,164 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
                 "selected branch is not valid for 2F1",
             )
         }
+    }
+}
+
+/// DLMF 15.8.4 / 15.8.10 connection formula at `s = 1 - z` for `z in [0.9, 1.0)`, with
+/// near-integer pole pairing (`hyp2f1_one_minus_z_near_integer`) when `c - a - b` is within
+/// `HYP2F1_NEAR_INTEGER_BAND` of an integer or when the two terms of 15.8.4 cancel.
+fn hyp2f1_unit_neighborhood_connection(a: f64, b: f64, c: f64, z: f64) -> Option<f64> {
+    if !is_nonpositive_integer(c - a) && !is_nonpositive_integer(c - b) {
+        let cab = Dd::sum_of(c, -a).add_sloppy(Dd::from_f64(-b));
+        let m = cab.hi.round();
+        let eps = (cab.hi - m) + cab.lo;
+        let pairable = m.abs() <= HYP2F1_NEAR_INTEGER_MAX_M;
+        let candidate = if eps.abs() < HYP2F1_NEAR_INTEGER_BAND && pairable {
+            hyp2f1_one_minus_z_near_integer(a, b, c, z, m, eps)
+        } else {
+            let (value, cancellation) = hyp2f1_one_minus_z(a, b, c, z, cab);
+            let paired = if cancellation > HYP2F1_CONNECTION_MAX_CANCELLATION && pairable {
+                hyp2f1_one_minus_z_near_integer(a, b, c, z, m, eps)
+            } else {
+                f64::NAN
+            };
+            if paired.is_finite() { paired } else { value }
+        };
+        if candidate.is_finite() {
+            return Some(candidate);
+        }
+    }
+
+    let cab = c - a - b;
+    if (cab - cab.round()).abs() > 1e-6 {
+        let omz = 1.0 - z;
+        let pref1 = gamma_ratio_for_hyp2f1(c, cab, c - a, c - b);
+        let pref2 = gamma_ratio_for_hyp2f1(c, -cab, a, b);
+        if pref1.is_finite()
+            && pref2.is_finite()
+            && let (Ok(s1), Ok(s2)) = (
+                hyp2f1_series(a, b, 1.0 - cab, omz),
+                hyp2f1_series(c - a, c - b, 1.0 + cab, omz),
+            )
+        {
+            let result = pref1 * s1 + omz.powf(cab) * pref2 * s2;
+            if result.is_finite() {
+                return Some(result);
+            }
+        }
+    } else if a > 0.0 && b > 0.0 {
+        let m = cab.round() as i32;
+        let omz = 1.0 - z;
+        let result = if m >= 0 {
+            hyp2f1_log_connection_mpos(a, b, m, z)
+        } else if c - a > 0.0 && c - b > 0.0 {
+            omz.powf(cab) * hyp2f1_log_connection_mpos(c - a, c - b, -m, z)
+        } else {
+            f64::NAN
+        };
+        if result.is_finite() {
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// DLMF 15.8.4 at `s = 1 - z` for `z in [0.9, 1.0)` with `cab = c - a - b` carried in
+/// double-double. Returns `(value, cancellation)`.
+fn hyp2f1_one_minus_z(a: f64, b: f64, c: f64, z: f64, cab: Dd) -> (f64, f64) {
+    let (s_hi, s_lo) = dd_two_sum(1.0, -z);
+    let s = s_hi + s_lo;
+    let (f1, _) = hyp2f1_series_measured(a, b, (1.0 - cab.hi) - cab.lo, s);
+    let (f2, _) = hyp2f1_series_measured(c - a, c - b, (1.0 + cab.hi) + cab.lo, s);
+    let neg_cab = Dd {
+        hi: -cab.hi,
+        lo: -cab.lo,
+    };
+    let t1 = hyp2f1_connection_term(c, cab, c - a, c - b, s_hi, s_lo, 0.0, f1);
+    let t2 = hyp2f1_connection_term(c, neg_cab, a, b, s_hi, s_lo, cab.hi + cab.lo, f2);
+    let value = t1 + t2;
+    (value, (t1.abs() + t2.abs()) / value.abs())
+}
+
+/// Paired DLMF 15.8.4 / 15.8.10 connection formula at `s = 1 - z` for `z in [0.9, 1.0)` when
+/// `c - a - b = m + eps` is near an integer `m` (`|eps| <= 1/2`), eliminating the `Γ(±eps)`
+/// pole cancellation between the two connection series.
+fn hyp2f1_one_minus_z_near_integer(a: f64, b: f64, c: f64, z: f64, m: f64, eps: f64) -> f64 {
+    let (p, q, cp, cq, m, eps, outer_exp) = if m >= 0.0 {
+        (a, b, c - a, c - b, m, eps, 0.0)
+    } else {
+        (c - a, c - b, a, b, -m, -eps, m + eps)
+    };
+    let (s_hi, s_lo) = dd_two_sum(1.0, -z);
+    let s = s_hi + s_lo;
+    let ln_s = s_hi.ln() + s_lo / s_hi;
+    let mi = m as usize;
+
+    let mut finite = 0.0_f64;
+    let mut t = 1.0_f64;
+    for k in 0..mi {
+        finite += t;
+        if k + 1 < mi {
+            let kf = k as f64;
+            t *= (p + kf) * (q + kf) / ((1.0 - m - eps + kf) * (kf + 1.0)) * s;
+        }
+    }
+
+    let mut coef = 1.0_f64;
+    for i in 0..mi {
+        let f = i as f64;
+        coef *= (p + f) * (q + f) / (f + 1.0);
+    }
+    let (l1, g1) = ln_gamma_ratio_over(p + m, eps);
+    let (l2, g2) = ln_gamma_ratio_over(q + m, eps);
+    let (l3, g3) = ln_gamma_ratio_over(1.0 + m, eps);
+    let (l4, g4) = ln_gamma_ratio_over(1.0, -eps);
+    let lambda = ln_s + l1 + l2 - l3 - l4;
+    let mut e_j = if g1 * g2 * g3 * g4 > 0.0 {
+        lambda * expm1_over(eps * lambda)
+    } else {
+        (-(eps * lambda).exp() - 1.0) / eps
+    };
+    let mut p_j = 1.0 + eps * e_j;
+    let mut s_pow = s.powi(mi as i32);
+    let mut tail = 0.0_f64;
+    let mut converged = false;
+    for j in 0..HYP2F1_PAIRED_MAX_TERMS {
+        let jf = j as f64;
+        let term = s_pow * coef * e_j;
+        tail += term;
+        if j > 2 && term.abs() <= 1.0e-17 * tail.abs() {
+            converged = true;
+            break;
+        }
+        let alpha = p + m + jf;
+        let beta = q + m + jf;
+        let gamma = 1.0 + m + jf;
+        let delta = 1.0 + jf;
+        let (ia, ib, ig, id) = (1.0 / alpha, 1.0 / beta, 1.0 / gamma, 1.0 / delta);
+        let r = (ia + ib - id - ig + eps * (ia * ib - ia * id - ib * id)
+            - eps * eps * ia * ib * id)
+            / (1.0 + eps * ig);
+        e_j += p_j * r;
+        p_j = 1.0 + eps * e_j;
+        coef *= alpha * beta / (gamma * (delta - eps));
+        s_pow *= s;
+    }
+    if !converged {
+        return f64::NAN;
+    }
+
+    let regular = if mi > 0 {
+        hyp2f1_connection_term(c, Dd::sum_of(m, eps), cp, cq, s_hi, s_lo, outer_exp, finite)
+    } else {
+        0.0
+    };
+    let paired =
+        hyp2f1_connection_term(c, Dd::sum_of(1.0, eps), cp, cq, s_hi, s_lo, outer_exp, tail);
+    if mi.is_multiple_of(2) {
+        regular - paired
+    } else {
+        regular + paired
     }
 }
 
@@ -5215,27 +5538,201 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hypergeometric_branch_with_casp_asymptotic() {
-        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 25.0, 1.0e-14);
+    fn test_select_hypergeometric_branch_with_casp_asymptotic_and_real_branch_cut() {
         let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
-        let decision =
-            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
-                .expect("casp branch selection");
 
-        assert_eq!(decision.branch, HypergeometricBranch::AsymptoticExpansion);
-        assert_eq!(portfolio.evidence_len(), 1);
+        // 1F1 large argument -> AsymptoticExpansion
+        let p_1f1 = HyperCaspProblem::hyp1f1(1.0, 2.0, 250.0, 1.0e-14);
+        let d_1f1 =
+            select_hypergeometric_branch_with_casp(p_1f1, RuntimeMode::Strict, &mut portfolio)
+                .expect("1f1 casp branch selection");
+        assert_eq!(d_1f1.branch, HypergeometricBranch::AsymptoticExpansion);
+
+        // 0F1 large negative argument -> AsymptoticExpansion
+        let p_0f1 = HyperCaspProblem::hyp0f1(2.0, -100.0, 1.0e-14);
+        let d_0f1 =
+            select_hypergeometric_branch_with_casp(p_0f1, RuntimeMode::Strict, &mut portfolio)
+                .expect("0f1 casp branch selection");
+        assert_eq!(d_0f1.branch, HypergeometricBranch::AsymptoticExpansion);
+
+        // 2F1 z > 1 -> RealBranchCutInfinity (never 1F1 AsymptoticExpansion)
+        let p_2f1 = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 25.0, 1.0e-14);
+        let d_2f1 =
+            select_hypergeometric_branch_with_casp(p_2f1, RuntimeMode::Strict, &mut portfolio)
+                .expect("2f1 casp branch selection");
+        assert_eq!(d_2f1.branch, HypergeometricBranch::RealBranchCutInfinity);
+
+        // 2F1 negative z -> PfaffTransform (never KummerTransform)
+        let p_pfaff = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, -3.0, 1.0e-14);
+        let d_pfaff =
+            select_hypergeometric_branch_with_casp(p_pfaff, RuntimeMode::Strict, &mut portfolio)
+                .expect("2f1 pfaff casp branch selection");
+        assert_eq!(d_pfaff.branch, HypergeometricBranch::PfaffTransform);
+        assert_eq!(portfolio.evidence_len(), 4);
     }
 
     #[test]
-    fn test_select_hypergeometric_branch_with_casp_boundary_near_pole() {
-        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 1.0, 1.0e-14);
+    fn test_select_hypergeometric_branch_with_casp_unit_divergent_and_pole_guard() {
         let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
-        let decision =
-            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
-                .expect("casp branch selection");
 
-        assert_eq!(decision.branch, HypergeometricBranch::ParameterGuard);
-        assert_eq!(portfolio.evidence_len(), 1);
+        // hyp2f1(1, 2, 3, 1): c - a - b = 0 <= 0 at z = 1 -> DivergentAtUnitArgument
+        let divergent = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 1.0, 1.0e-14);
+        let d_div =
+            select_hypergeometric_branch_with_casp(divergent, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+        assert_eq!(d_div.branch, HypergeometricBranch::DivergentAtUnitArgument);
+
+        // hyp2f1(0.5, 0.5, 2.0, 1.0): c - a - b = 1 > 0 at z = 1 -> GaussSummation
+        let gauss = HyperCaspProblem::hyp2f1(0.5, 0.5, 2.0, 1.0, 1.0e-14);
+        let d_gauss =
+            select_hypergeometric_branch_with_casp(gauss, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+        assert_eq!(d_gauss.branch, HypergeometricBranch::GaussSummation);
+
+        // Lower parameter near nonpositive integer pole -> ParameterGuard
+        let near_pole = HyperCaspProblem::hyp2f1(1.0, 2.0, -2.0 + 1.0e-15, 0.2, 1.0e-14);
+        let d_pole =
+            select_hypergeometric_branch_with_casp(near_pole, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+        assert_eq!(d_pole.branch, HypergeometricBranch::ParameterGuard);
+        assert_eq!(portfolio.evidence_len(), 3);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_50_benign_calls_never_latch() {
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 64);
+        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 0.2, 1.0e-14);
+        for call_idx in 0..50 {
+            let decision = select_hypergeometric_branch_with_casp(
+                problem,
+                RuntimeMode::Strict,
+                &mut portfolio,
+            )
+            .expect("benign casp call");
+            assert_eq!(
+                decision.branch,
+                HypergeometricBranch::DirectSeries,
+                "call {call_idx} latched onto {:?}",
+                decision.branch
+            );
+            assert!(!portfolio.calibrator().should_fallback());
+        }
+        assert_eq!(portfolio.evidence_len(), 50);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_agrees_with_production_region_map() {
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 64);
+        let problems = [
+            HyperCaspProblem::hyp0f1(2.0, 1.0, 1.0e-14),
+            HyperCaspProblem::hyp0f1(2.0, 100.0, 1.0e-14),
+            HyperCaspProblem::hyp0f1(2.0, -100.0, 1.0e-14),
+            HyperCaspProblem::hyp1f1(1.0, 2.0, 0.5, 1.0e-14),
+            HyperCaspProblem::hyp1f1(1.0, 2.0, -3.0, 1.0e-14),
+            HyperCaspProblem::hyp1f1(-2.0, 2.0, -5.0, 1.0e-14),
+            HyperCaspProblem::hyp1f1(1.0, 2.0, 250.0, 1.0e-14),
+            HyperCaspProblem::hyp1f1(1.0, 2.0, -250.0, 1.0e-14),
+            HyperCaspProblem::hyp2f1(-3.0, 1.5, 2.0, 0.5, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 1.5, 2.0, 0.5, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 1.5, 2.0, 0.95, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 1.5, 2.0, -0.5, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 1.5, 2.0, -5.0, 1.0e-14),
+            HyperCaspProblem::hyp2f1(0.5, 0.5, 2.0, 1.0, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 1.0, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 1.0, 1.0, 1.5, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 25.0, 1.0e-14),
+            HyperCaspProblem::hyp2f1(1.0, 2.0, -2.0 + 1.0e-15, 0.2, 1.0e-14),
+        ];
+        for problem in problems {
+            for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                let prod = select_hypergeometric_branch(problem, mode).expect("prod selector");
+                let casp = select_hypergeometric_branch_with_casp(problem, mode, &mut portfolio)
+                    .expect("casp selector");
+                assert_eq!(
+                    casp.branch, prod.branch,
+                    "mismatch for {problem:?} in {mode:?}: casp={:?} prod={:?}",
+                    casp.branch, prod.branch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_hypergeometric_branch_with_casp_and_audit_records_casp_decision_in_its_mode() {
+        use fsci_runtime::PortfolioEvidence;
+
+        let problem = HyperCaspProblem::hyp1f1(1.0, 2.0, -5.0, 1.0e-12);
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let ledger = crate::audit::sync_audit_ledger();
+            let mut portfolio = HyperSolverPortfolio::new(mode, 4);
+            let decision = select_hypergeometric_branch_with_casp_and_audit(
+                problem,
+                mode,
+                &mut portfolio,
+                &ledger,
+            )
+            .expect("audited casp branch selection");
+            assert_eq!(decision.branch, HypergeometricBranch::KummerTransform);
+
+            let recorded = portfolio.evidence().back().expect("evidence").clone();
+            let guard = ledger.lock().expect("ledger");
+            let decisions: Vec<_> = guard
+                .entries()
+                .iter()
+                .filter_map(|event| match &event.action {
+                    fsci_runtime::AuditAction::CaspDecision {
+                        portfolio,
+                        mode,
+                        action,
+                        posterior,
+                        expected_losses,
+                        chosen_expected_loss,
+                        fallback,
+                        ..
+                    } => Some((
+                        portfolio.clone(),
+                        *mode,
+                        action.clone(),
+                        posterior.clone(),
+                        expected_losses.clone(),
+                        *chosen_expected_loss,
+                        *fallback,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "expected exactly 1 CaspDecision in {mode:?}"
+            );
+            let (p_name, ev_mode, ev_action, ev_posterior, ev_losses, ev_chosen_loss, ev_fallback) =
+                &decisions[0];
+            assert_eq!(p_name, "hyper");
+            assert_eq!(*ev_mode, mode);
+            assert_eq!(*ev_action, format!("{:?}", recorded.chosen_action));
+            assert_eq!(
+                ev_posterior.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .posterior
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_losses.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .expected_losses
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_chosen_loss.to_bits(),
+                recorded.chosen_expected_loss.to_bits()
+            );
+            assert_eq!(*ev_fallback, recorded.fallback_active);
+        }
     }
 
     #[test]

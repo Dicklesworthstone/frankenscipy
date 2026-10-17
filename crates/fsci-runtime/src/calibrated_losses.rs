@@ -35,3 +35,21 @@ pub(crate) const SOLVER_FAILURE_RATE: [[f64; 4]; 6] = [
     [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
     [0.0, 0.0, 0.0, 0.0], // SymmetricFastPath
 ];
+
+/// Corpus seed used to generate the Conformal Risk Control (CRC) calibration (frankenscipy-7tb8d.3).
+pub(crate) const SOLVER_CRC_SEED: u64 = 0x7b8d_0002_ca11_b8a7;
+
+/// Number of exchangeable solvable calibration problems `n` in the W4.2 corpus (frankenscipy-7tb8d.3).
+pub(crate) const SOLVER_CRC_N: usize = 321;
+
+/// Default target risk level `alpha` for Conformal Risk Control (frankenscipy-7tb8d.3).
+pub(crate) const SOLVER_CRC_ALPHA: f64 = 0.05;
+
+/// Calibrated Conformal Risk Control escalation threshold `t_hat` at `SOLVER_CRC_ALPHA` (frankenscipy-7tb8d.3).
+pub(crate) const SOLVER_CRC_T_HAT: f64 = 0.0;
+
+/// Sorted `rcond` values of solvable corpus problems where `DirectLU` exceeds `ATTEMPT_BACKWARD_ERROR_TOL`
+/// and `PivotedQR` succeeds, allowing exact CRC threshold recomputation when `alpha` changes.
+#[rustfmt::skip]
+pub(crate) const SOLVER_CRC_EXCEEDANCE_RCONDS: [f64; 1] = [0.0078125];
+

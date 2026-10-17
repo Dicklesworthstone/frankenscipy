@@ -225,6 +225,8 @@ fn cases(problems: &[Problem]) -> Vec<Case> {
         for (method, scipy_method, use_hessp) in [
             (OptimizeMethod::TrustNcg, "trust-ncg", false),
             (OptimizeMethod::TrustNcg, "trust-ncg", true),
+            (OptimizeMethod::TrustKrylov, "trust-krylov", false),
+            (OptimizeMethod::TrustKrylov, "trust-krylov", true),
             (OptimizeMethod::Dogleg, "dogleg", false),
             (OptimizeMethod::TrustExact, "trust-exact", false),
         ] {
@@ -446,6 +448,8 @@ fn diff_opt_trust_region_family() {
             "trust-ncg/hessp",
             "dogleg/hess",
             "trust-exact/hess",
+            "trust-krylov/hess",
+            "trust-krylov/hessp",
         ],
     );
     for case in &cases {
@@ -547,7 +551,9 @@ fn diff_opt_trust_region_family() {
         .count();
     let log = DiffLog {
         test_id: "diff_opt_trust_region_family".into(),
-        category: "scipy.optimize.minimize(method='trust-ncg' | 'dogleg' | 'trust-exact')".into(),
+        category:
+            "scipy.optimize.minimize(method='trust-ncg' | 'trust-krylov' | 'dogleg' | 'trust-exact')"
+                .into(),
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         same_path_count,
@@ -583,7 +589,7 @@ fn diff_opt_trust_region_family() {
         diffs.len()
     );
 
-    assert_eq!(diffs.len(), 20, "every case must be compared");
+    assert_eq!(diffs.len(), 30, "every case must be compared");
     for d in &diffs {
         assert!(d.pass, "{}: {}", d.case_id, d.reason);
     }

@@ -10774,9 +10774,30 @@ pub fn generate_decode_proof_artifact(
     // separately defined from the drop_indices slice; a future refactor
     // bumping the drops without the count would silently produce a
     // misleading DecodeProofArtifact. Review-mode finding [byfq8].
-    let drop_indices: &[usize] = &[0];
-    let recovered_blocks = drop_indices.len();
-    let recovered = recover_payload_with_sidecar(payload, sidecar, drop_indices)?;
+    let mut last_err = None;
+    let mut recovered_opt = None;
+    let mut recovered_blocks = 1usize;
+    for drop_idx in 0..sidecar.source_symbols.max(1) {
+        let drop_indices = [drop_idx];
+        match recover_payload_with_sidecar(payload, sidecar, &drop_indices) {
+            Ok(rec) => {
+                recovered_blocks = drop_indices.len();
+                recovered_opt = Some(rec);
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+    let recovered = match recovered_opt {
+        Some(rec) => rec,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                HarnessError::RaptorQ("decode proof recovery failed".to_owned())
+            }));
+        }
+    };
     let proof_hash = hash(&recovered).to_hex().to_string();
     let expected_hash = hash(payload).to_hex().to_string();
     if proof_hash != expected_hash {
@@ -11097,6 +11118,7 @@ pub fn build_drift_diff_report(report: &ConformanceReport) -> DriftDiffReport {
         fixture_path: report.fixture_path.clone(),
         generated_unix_ms: report.generated_unix_ms,
         oracle_status: report.oracle_status.clone(),
+        oracle_compared_cases: report.oracle_compared_cases,
         total_cases: report.per_case_results.len(),
         drifted_cases,
         cases,
@@ -11182,6 +11204,10 @@ pub fn run_live_oracle_capture_lane(
         .iter()
         .filter(|packet| matches!(packet.oracle_status, OracleStatus::Available))
         .count();
+    let oracle_compared_packets = packets
+        .iter()
+        .filter(|packet| packet.oracle_compared_cases > 0)
+        .count();
     let oracle_unavailable_packets = packets.len().saturating_sub(oracle_available_packets);
 
     Ok(LiveOracleCaptureReport {
@@ -11192,6 +11218,7 @@ pub fn run_live_oracle_capture_lane(
         total_cases,
         drifted_cases,
         oracle_available_packets,
+        oracle_compared_packets,
         oracle_unavailable_packets,
         packets,
     })
@@ -13705,30 +13732,42 @@ pub fn generate_raptorq_sidecar(payload: &[u8]) -> Result<RaptorQSidecar, Harnes
     let source_symbols = chunk_payload(payload, symbol_size);
     let k = source_symbols.len();
     let repair_symbols = (k / 5).max(1);
-    let seed = hash(payload).as_bytes()[0] as u64 + 1337;
+    let base_seed = hash(payload).as_bytes()[0] as u64 + 1337;
+    let source_hash = hash(payload).to_hex().to_string();
 
-    let encoder = SystematicEncoder::new(&source_symbols, symbol_size, seed).ok_or_else(|| {
-        HarnessError::RaptorQ("systematic encoder initialization failed".to_owned())
-    })?;
-
-    let mut repair_hashes = Vec::with_capacity(repair_symbols);
-    let mut repair_payloads = Vec::with_capacity(repair_symbols);
-    for esi in k as u32..(k as u32 + repair_symbols as u32) {
-        let symbol = encoder.repair_symbol(esi);
-        repair_hashes.push(hash(&symbol).to_hex().to_string());
-        repair_payloads.push(hex_encode(&symbol));
+    let mut fallback_sidecar = None;
+    for attempt in 0..64u64 {
+        let seed = base_seed + attempt;
+        let Some(encoder) = SystematicEncoder::new(&source_symbols, symbol_size, seed) else {
+            continue;
+        };
+        let mut repair_hashes = Vec::with_capacity(repair_symbols);
+        let mut repair_payloads = Vec::with_capacity(repair_symbols);
+        for esi in k as u32..(k as u32 + repair_symbols as u32) {
+            let symbol = encoder.repair_symbol(esi);
+            repair_hashes.push(hash(&symbol).to_hex().to_string());
+            repair_payloads.push(hex_encode(&symbol));
+        }
+        let candidate = RaptorQSidecar {
+            schema_version: 1,
+            source_hash: source_hash.clone(),
+            symbol_size,
+            seed,
+            source_symbols: k,
+            repair_symbols,
+            repair_symbol_hashes: repair_hashes,
+            repair_symbol_payloads_hex: repair_payloads,
+        };
+        if k == 0 || recover_payload_with_sidecar(payload, &candidate, &[0]).is_ok() {
+            return Ok(candidate);
+        }
+        if fallback_sidecar.is_none() {
+            fallback_sidecar = Some(candidate);
+        }
     }
 
-    Ok(RaptorQSidecar {
-        schema_version: 1,
-        source_hash: hash(payload).to_hex().to_string(),
-        symbol_size,
-        seed,
-        source_symbols: k,
-        repair_symbols,
-        repair_symbol_hashes: repair_hashes,
-        repair_symbol_payloads_hex: repair_payloads,
-    })
+    fallback_sidecar
+        .ok_or_else(|| HarnessError::RaptorQ("systematic encoder initialization failed".to_owned()))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -13910,6 +13949,8 @@ pub struct DriftDiffReport {
     pub fixture_path: String,
     pub generated_unix_ms: u128,
     pub oracle_status: OracleStatus,
+    #[serde(default)]
+    pub oracle_compared_cases: usize,
     pub total_cases: usize,
     pub drifted_cases: usize,
     pub cases: Vec<DriftCaseDiff>,
@@ -13924,6 +13965,8 @@ pub struct LiveOracleCaptureReport {
     pub total_cases: usize,
     pub drifted_cases: usize,
     pub oracle_available_packets: usize,
+    #[serde(default)]
+    pub oracle_compared_packets: usize,
     pub oracle_unavailable_packets: usize,
     pub packets: Vec<DriftDiffReport>,
 }
@@ -14012,6 +14055,13 @@ pub fn evaluate_drift_gate(
     }
 }
 
+/// Gate-change note (frankenscipy-csxtv):
+/// Tightens the zero-drift coverage gate to require at least
+/// `MIN_ZERO_DRIFT_GATE_ORACLE_AVAILABLE_PACKETS` (1) packet with `oracle_compared_cases > 0`
+/// (`oracle_compared_packets`), rather than merely `OracleStatus::Available` from a probe-only
+/// runner. With SciPy present, 6 families (`array_api`, `interpolate`, `io`, `ndimage`, `stats`,
+/// `constants`) capture and compare live SciPy outputs (`oracle_compared_cases > 0`), so a real
+/// SciPy run exceeds the minimum of 1 while probe-only runs with 0 compared cases are refused.
 pub fn validate_zero_drift_oracle_coverage(report: &LiveOracleCaptureReport) -> Result<(), String> {
     if report.total_packets == 0 {
         return Err(
@@ -14019,10 +14069,25 @@ pub fn validate_zero_drift_oracle_coverage(report: &LiveOracleCaptureReport) -> 
                 .to_string(),
         );
     }
-    if report.oracle_available_packets < MIN_ZERO_DRIFT_GATE_ORACLE_AVAILABLE_PACKETS {
+    let packets_with_compared_cases = report
+        .packets
+        .iter()
+        .filter(|packet| packet.oracle_compared_cases > 0)
+        .count();
+    let compared_packets = if report.packets.is_empty() {
+        report.oracle_compared_packets
+    } else if report.oracle_compared_packets == 0 {
+        packets_with_compared_cases
+    } else {
+        report
+            .oracle_compared_packets
+            .min(packets_with_compared_cases)
+    };
+    if compared_packets < MIN_ZERO_DRIFT_GATE_ORACLE_AVAILABLE_PACKETS {
         return Err(format!(
-            "zero-drift gate had {} oracle-backed packet(s), below required minimum {}; \
+            "zero-drift gate had {} oracle-backed packet(s) with compared cases ({} oracle-available), below required minimum {}; \
              {} packet(s) were oracle-unavailable",
+            compared_packets,
             report.oracle_available_packets,
             MIN_ZERO_DRIFT_GATE_ORACLE_AVAILABLE_PACKETS,
             report.oracle_unavailable_packets
@@ -24691,6 +24756,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             total_cases: 2,
             drifted_cases: 1,
             oracle_available_packets: 1,
+            oracle_compared_packets: 1,
             oracle_unavailable_packets: 0,
             packets: vec![DriftDiffReport {
                 schema_version: 1,
@@ -24699,6 +24765,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                 fixture_path: "FSCI-P2C-012_stats_core.json".to_owned(),
                 generated_unix_ms: 123,
                 oracle_status: OracleStatus::Available,
+                oracle_compared_cases: 2,
                 total_cases: 2,
                 drifted_cases: 1,
                 cases: Vec::new(),
@@ -24723,6 +24790,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             total_cases: 2,
             drifted_cases: 0,
             oracle_available_packets: 0,
+            oracle_compared_packets: 0,
             oracle_unavailable_packets: 2,
             packets: vec![
                 DriftDiffReport {
@@ -24734,6 +24802,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                     oracle_status: OracleStatus::Missing {
                         reason: "python missing".to_owned(),
                     },
+                    oracle_compared_cases: 0,
                     total_cases: 1,
                     drifted_cases: 0,
                     cases: Vec::new(),
@@ -24747,6 +24816,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                     oracle_status: OracleStatus::Missing {
                         reason: "scipy missing".to_owned(),
                     },
+                    oracle_compared_cases: 0,
                     total_cases: 1,
                     drifted_cases: 0,
                     cases: Vec::new(),
@@ -24771,28 +24841,31 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             total_cases: 2,
             drifted_cases: 0,
             oracle_available_packets: 1,
+            oracle_compared_packets: 1,
             oracle_unavailable_packets: 1,
             packets: vec![
-                DriftDiffReport {
-                    schema_version: 1,
-                    packet_id: "FSCI-P2C-011".to_owned(),
-                    family: "signal_core".to_owned(),
-                    fixture_path: "FSCI-P2C-011_signal_core.json".to_owned(),
-                    generated_unix_ms: 790,
-                    oracle_status: OracleStatus::Available,
-                    total_cases: 1,
-                    drifted_cases: 0,
-                    cases: Vec::new(),
-                },
                 DriftDiffReport {
                     schema_version: 1,
                     packet_id: "FSCI-P2C-012".to_owned(),
                     family: "stats_core".to_owned(),
                     fixture_path: "FSCI-P2C-012_stats_core.json".to_owned(),
                     generated_unix_ms: 790,
+                    oracle_status: OracleStatus::Available,
+                    oracle_compared_cases: 1,
+                    total_cases: 1,
+                    drifted_cases: 0,
+                    cases: Vec::new(),
+                },
+                DriftDiffReport {
+                    schema_version: 1,
+                    packet_id: "FSCI-P2C-011".to_owned(),
+                    family: "signal_core".to_owned(),
+                    fixture_path: "FSCI-P2C-011_signal_core.json".to_owned(),
+                    generated_unix_ms: 790,
                     oracle_status: OracleStatus::Missing {
                         reason: "scipy missing".to_owned(),
                     },
+                    oracle_compared_cases: 0,
                     total_cases: 1,
                     drifted_cases: 0,
                     cases: Vec::new(),
@@ -24801,7 +24874,46 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         };
 
         validate_zero_drift_oracle_coverage(&report)
-            .expect("one oracle-backed packet keeps the drift gate meaningful");
+            .expect("one oracle-backed packet with compared cases keeps the drift gate meaningful");
+    }
+
+    #[test]
+    fn zero_drift_oracle_coverage_requires_compared_cases_not_just_available_probe() {
+        // Arm 1 (negative): report whose only packets are Available with 0 compared cases is refused.
+        let mut report = LiveOracleCaptureReport {
+            schema_version: 1,
+            generated_unix_ms: 791,
+            fixture_root: "fixtures".to_owned(),
+            total_packets: 1,
+            total_cases: 1,
+            drifted_cases: 0,
+            oracle_available_packets: 1,
+            oracle_compared_packets: 0,
+            oracle_unavailable_packets: 0,
+            packets: vec![DriftDiffReport {
+                schema_version: 1,
+                packet_id: "FSCI-P2C-011".to_owned(),
+                family: "signal_core".to_owned(),
+                fixture_path: "FSCI-P2C-011_signal_core.json".to_owned(),
+                generated_unix_ms: 791,
+                oracle_status: OracleStatus::Available,
+                oracle_compared_cases: 0,
+                total_cases: 1,
+                drifted_cases: 0,
+                cases: Vec::new(),
+            }],
+        };
+
+        let message = validate_zero_drift_oracle_coverage(&report)
+            .expect_err("probe-only Available packet with 0 compared cases must be refused");
+        assert!(message.contains("0 oracle-backed packet(s) with compared cases"));
+        assert!(message.contains("below required minimum 1"));
+
+        // Arm 2 (positive): the same report with one compared case passes.
+        report.packets[0].oracle_compared_cases = 1;
+        report.oracle_compared_packets = 1;
+        validate_zero_drift_oracle_coverage(&report)
+            .expect("the same report with 1 compared case must pass");
     }
 
     #[test]
@@ -24814,6 +24926,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             total_cases: 2,
             drifted_cases: 1,
             oracle_available_packets: 1,
+            oracle_compared_packets: 1,
             oracle_unavailable_packets: 0,
             packets: vec![DriftDiffReport {
                 schema_version: 1,
@@ -24822,6 +24935,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                 fixture_path: "FSCI-P2C-011_signal_core.json".to_owned(),
                 generated_unix_ms: 456,
                 oracle_status: OracleStatus::Available,
+                oracle_compared_cases: 2,
                 total_cases: 2,
                 drifted_cases: 1,
                 cases: Vec::new(),

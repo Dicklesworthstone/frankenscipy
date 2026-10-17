@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-001",
+  "family": "integrate.validate_tol",
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-001_validate_tol.json",
+  "generated_unix_ms": 1790392909532,
+  "oracle_status": {
+    "status": "available"
+  },
+  "total_cases": 4,
+  "drifted_cases": 0,
+  "cases": [
+    {
+      "case_id": "scalar_rtol_clamp",
+      "passed": true,
+      "message": "tolerance contract matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "vector_passthrough",
+      "passed": true,
+      "message": "tolerance contract matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wrong_shape",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "negative_atol",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ]
+}

@@ -1481,6 +1481,7 @@ fn lahqr(
                 h[(l, l - 1)] = CZERO;
             }
             if l >= iu {
+                // status: active QR subblock deflated to 1x1 (l >= iu)
                 converged = true;
                 break;
             }

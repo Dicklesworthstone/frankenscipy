@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-012",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-stats implements 105+ continuous/discrete distributions, hypothesis tests, correlations, CensoredData, Covariance, and QMC.",
+        "affected_functions": ["ttest_1samp", "ttest_ind", "kstest", "mannwhitneyu", "pearsonr", "spearmanr"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-stats",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Catastrophic cancellation in KL divergence / relative entropy when probability distributions p and q are nearly equal.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38242 (pearsonr): uses numerically stable centered inner products and delegates kl_divergence elementwise terms to fsci_special::rel_entr (log1p).",
+      "test_reference": "tiny_positive_diagonal_and_cholesky_keep_scale",
+      "strict_mode_response": "Compute accurate relative entropy and correlation within <= 2 ULPs of reference.",
+      "hardened_mode_response": "Reject non-finite or negative probability weights fail-closed."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-stats",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Empty sample arrays, mismatched paired sample lengths, or non-PSD covariance matrices passed to statistical routines.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:33610 (ttest_1samp): validates sample size and finiteness before computing t-statistics and p-values.",
+      "test_reference": "cholesky_checks_later_rows_before_matrix_product",
+      "strict_mode_response": "Return NaN or StatsError matching SciPy stats conventions.",
+      "hardened_mode_response": "Reject malformed or non-finite samples fail-closed and record AuditAction::FailClosed."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-stats",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Exact permutation/rank distribution recurrences in Mann-Whitney U or KS tests blowing up on large sample sizes.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:36704 (mannwhitneyu): switches from exact dynamic programming to normal/tie-corrected asymptotic approximation above threshold or when ties are present.",
+      "test_reference": "record_after_poison_still_lands_in_ledger",
+      "strict_mode_response": "Select exact vs asymptotic method matching SciPy auto rule.",
+      "hardened_mode_response": "Bound exact table allocation size and emit audit record on error."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-stats",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Two-sample Kolmogorov-Smirnov p-value calculation drifting between Smirnov exact and Kolmogorov asymptotic distributions.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:47407 (kstest): dispatches one-sample and two-sample KS statistics with exact/asymp p-value evaluation matching SciPy.",
+      "test_reference": "test_from_eigendecomposition",
+      "strict_mode_response": "Match SciPy kstest statistic and p-value across alternatives.",
+      "hardened_mode_response": "Validate finite sample observations before empirical CDF sort."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "empty or insufficient sample size",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return StatsError::InsufficientData or NaN per SciPy contract.",
+      "hardened_mode_action": "Return StatsError and record FailClosed in AuditLedger."
+    },
+    {
+      "input_class": "non-finite sample observations",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Propagate or reject per nan_policy.",
+      "hardened_mode_action": "Reject non-finite observations fail-closed with FailClosed audit record."
+    },
+    {
+      "input_class": "non-PSD matrix in Covariance::from_psd / from_cholesky",
+      "policy": "reject",
+      "strict_mode_action": "Return StatsError::InvalidParameter.",
+      "hardened_mode_action": "Return StatsError::InvalidParameter and log FailClosed event."
+    },
+    {
+      "input_class": "invalid distribution shape parameters",
+      "policy": "reject",
+      "strict_mode_action": "Return NaN or Err on domain violation.",
+      "hardened_mode_action": "Reject out-of-domain shape/scale parameters fail-closed."
+    }
+  ]
+}

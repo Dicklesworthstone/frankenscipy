@@ -17,6 +17,9 @@ pub enum OptimizeMethod {
     TrustExact,
     /// SciPy `trust-ncg`: Newton conjugate-gradient trust region (Steihaug–Toint).
     TrustNcg,
+    /// SciPy `trust-krylov`: nearly exact trust-region algorithm using Lanczos / GLTR
+    /// matrix-vector products with the Hessian.
+    TrustKrylov,
     /// SciPy `dogleg`: Powell's dogleg trust region; needs a positive-definite Hessian.
     Dogleg,
     Tnc,
@@ -236,6 +239,9 @@ pub struct MinimizeMethodOptions<'a> {
     pub catol: Option<f64>,
     /// COBYLA: stop once a feasible point with `f <= f_target` is found (default −∞).
     pub f_target: Option<f64>,
+    /// trust-krylov: whether to solve subproblems with inexact Lanczos tolerances
+    /// (default `true`; `false` uses tight tolerances `1e-8` / `1e-6`).
+    pub inexact: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]

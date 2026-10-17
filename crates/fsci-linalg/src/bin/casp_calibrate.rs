@@ -357,8 +357,8 @@ fn main() {
     let cases = corpus();
 
     let mut rows = Vec::new();
-    // Per matrix: its state weights and each applicable action's failure.
-    let mut per_cell: Vec<([f64; 4], Vec<(SolverAction, bool)>)> = Vec::new();
+    // Per matrix: its rcond, state weights and each applicable action's failure.
+    let mut per_cell: Vec<(f64, [f64; 4], Vec<(SolverAction, bool)>)> = Vec::new();
     let mut errors = [0_usize; 6];
     for case in &cases {
         let n = case.n;
@@ -405,7 +405,7 @@ fn main() {
             };
             failed_by_action.push((action, failed));
         }
-        per_cell.push((state_weights, failed_by_action));
+        per_cell.push((rcond, state_weights, failed_by_action));
         rows.push(format!(
             "{{\"family\":{:?},\"n\":{n},\"rcond_estimate\":{},\"structural_evidence\":\"{:?}\",\"state_weights\":[{}],\"outcomes\":[{}]}}",
             case.family,
@@ -427,7 +427,8 @@ fn main() {
     let mut weights = [[0.0_f64; 4]; 6];
     let mut square_weights = [[0.0_f64; 4]; 6];
     let mut unsolvable = 0_usize;
-    for (state_weights, outcomes) in &per_cell {
+    let mut crc_exceedance_rconds = Vec::new();
+    for (rcond, state_weights, outcomes) in &per_cell {
         let recovery = outcomes
             .iter()
             .filter(|(_, failed)| !failed)
@@ -436,6 +437,17 @@ fn main() {
         if recovery.is_infinite() {
             unsolvable += 1;
             continue;
+        }
+        let lu_failed = outcomes
+            .iter()
+            .find(|(a, _)| *a == SolverAction::DirectLU)
+            .is_some_and(|(_, failed)| *failed);
+        let qr_ok = outcomes
+            .iter()
+            .find(|(a, _)| *a == SolverAction::PivotedQR)
+            .is_some_and(|(_, failed)| !*failed);
+        if lu_failed && qr_ok {
+            crc_exceedance_rconds.push(*rcond);
         }
         for &(action, failed) in outcomes {
             let a = action.index();
@@ -449,6 +461,7 @@ fn main() {
             }
         }
     }
+    crc_exceedance_rconds.sort_by(f64::total_cmp);
 
     // Failure rates and losses; a (state, action) pair with no weight is flagged and priced as
     // an always-failing action recovered by the SVD.
@@ -480,7 +493,7 @@ fn main() {
     let mut chosen_failed = [0_usize; 6];
     let mut fallback_success = [0_usize; 6];
     let mut sole_success = [0_usize; 6];
-    for (state_weights, outcomes) in &per_cell {
+    for (_, state_weights, outcomes) in &per_cell {
         let expected = |action: SolverAction| -> f64 {
             (0..4)
                 .map(|s| state_weights[s] * losses[action.index()][s])
@@ -688,6 +701,46 @@ fn main() {
         );
     }
     module.push_str("];\n");
+    let crc_n = cases.len() - unsolvable;
+    let crc_alpha = 0.05_f64;
+    let crc_t_hat = {
+        let mut t_hat = 1.0_f64;
+        let mut candidates = vec![0.0_f64];
+        candidates.extend_from_slice(&crc_exceedance_rconds);
+        for t in candidates {
+            let unrecovered = crc_exceedance_rconds.iter().filter(|&&r| r > t).count();
+            if (unrecovered as f64 + 1.0) / (crc_n as f64 + 1.0) <= crc_alpha {
+                t_hat = t;
+                break;
+            }
+        }
+        t_hat
+    };
+    let _ = write!(
+        module,
+        "\n/// Corpus seed used to generate the Conformal Risk Control (CRC) calibration (frankenscipy-7tb8d.3).\n\
+         pub(crate) const SOLVER_CRC_SEED: u64 = 0x7b8d_0002_ca11_b8a7;\n\
+         \n\
+         /// Number of exchangeable solvable calibration problems `n` in the W4.2 corpus (frankenscipy-7tb8d.3).\n\
+         pub(crate) const SOLVER_CRC_N: usize = {crc_n};\n\
+         \n\
+         /// Default target risk level `alpha` for Conformal Risk Control (frankenscipy-7tb8d.3).\n\
+         pub(crate) const SOLVER_CRC_ALPHA: f64 = {crc_alpha:?};\n\
+         \n\
+         /// Calibrated Conformal Risk Control escalation threshold `t_hat` at `SOLVER_CRC_ALPHA` (frankenscipy-7tb8d.3).\n\
+         pub(crate) const SOLVER_CRC_T_HAT: f64 = {crc_t_hat:?};\n\
+         \n\
+         /// Sorted `rcond` values of solvable corpus problems where `DirectLU` exceeds `ATTEMPT_BACKWARD_ERROR_TOL`\n\
+         /// and `PivotedQR` succeeds, allowing exact CRC threshold recomputation when `alpha` changes.\n\
+         #[rustfmt::skip]\n\
+         pub(crate) const SOLVER_CRC_EXCEEDANCE_RCONDS: [f64; {}] = [{}];\n",
+        crc_exceedance_rconds.len(),
+        crc_exceedance_rconds
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     println!("===BEGIN casp-calibration-solver.json===");
     print!("{report}");

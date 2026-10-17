@@ -314,6 +314,7 @@ mod tests {
         oracle_unavailable_packets: usize,
         drifted_cases: usize,
     ) -> LiveOracleCaptureReport {
+        let oracle_compared_cases = usize::from(matches!(oracle_status, OracleStatus::Available));
         LiveOracleCaptureReport {
             schema_version: 1,
             generated_unix_ms: 123,
@@ -322,6 +323,7 @@ mod tests {
             total_cases: 1,
             drifted_cases,
             oracle_available_packets,
+            oracle_compared_packets: oracle_available_packets,
             oracle_unavailable_packets,
             packets: vec![DriftDiffReport {
                 schema_version: 1,
@@ -330,6 +332,7 @@ mod tests {
                 fixture_path: "FSCI-P2C-011_signal_core.json".to_owned(),
                 generated_unix_ms: 123,
                 oracle_status,
+                oracle_compared_cases,
                 total_cases: 1,
                 drifted_cases,
                 cases: Vec::new(),
@@ -379,6 +382,7 @@ mod tests {
             total_cases: 0,
             drifted_cases: 0,
             oracle_available_packets: 0,
+            oracle_compared_packets: 0,
             oracle_unavailable_packets: 0,
             packets: Vec::new(),
         };
@@ -395,6 +399,7 @@ mod tests {
             total_cases: 0,
             drifted_cases: 0,
             oracle_available_packets: 0,
+            oracle_compared_packets: 0,
             oracle_unavailable_packets: 0,
             packets: Vec::new(),
         };

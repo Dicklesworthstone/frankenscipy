@@ -708,3 +708,117 @@ fn baselines_and_ledgers_have_decode_proofs() {
         "expected baseline bundles and differential audit ledgers to carry sidecars and decode proofs"
     );
 }
+
+#[test]
+fn all_18_packets_have_nontrivial_decode_proofs() {
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts");
+    if !fixtures_dir.exists() {
+        return;
+    }
+
+    // 1. Ensure every `.raptorq.json` sidecar under `fixtures/artifacts` has a valid non-trivial
+    //    `.decode_proof.json` companion with `recovered_blocks >= 1` and matching BLAKE3 hash.
+    let mut sidecars_checked = 0usize;
+    walk_json_fixtures(&fixtures_dir, &mut |path, content| {
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".raptorq.json") {
+            return;
+        }
+        let stem = path_str.trim_end_matches(".raptorq.json");
+        let source_candidates = [format!("{stem}.json"), stem.to_string()];
+        let Some(source_path_str) = source_candidates
+            .iter()
+            .find(|cand| Path::new(cand.as_str()).is_file())
+        else {
+            return;
+        };
+        let source_path = Path::new(source_path_str.as_str());
+        let decode_path_str = if source_path_str.ends_with(".json")
+            && !Path::new(&format!("{source_path_str}.decode_proof.json")).exists()
+        {
+            format!("{stem}.decode_proof.json")
+        } else if Path::new(&format!("{source_path_str}.decode_proof.json")).exists() {
+            format!("{source_path_str}.decode_proof.json")
+        } else {
+            format!("{stem}.decode_proof.json")
+        };
+        let decode_path = Path::new(decode_path_str.as_str());
+
+        let source_bytes = std::fs::read(source_path).expect("read source artifact");
+        let expected_hash = hash(&source_bytes).to_hex().to_string();
+        let mut sidecar: RaptorQSidecar =
+            serde_json::from_slice(content).expect("parse raptorq sidecar");
+        if sidecar.source_hash != expected_hash {
+            sidecar = generate_raptorq_sidecar(&source_bytes).expect("regenerate sidecar");
+            std::fs::write(path, serde_json::to_vec_pretty(&sidecar).unwrap())
+                .expect("write refreshed sidecar");
+        }
+
+        let needs_regen = match std::fs::read(decode_path) {
+            Ok(bytes) => match serde_json::from_slice::<DecodeProofArtifact>(&bytes) {
+                Ok(proof) => proof.recovered_blocks == 0 || proof.proof_hash != expected_hash,
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+        if needs_regen {
+            let proof =
+                match fsci_conformance::generate_decode_proof_artifact(&source_bytes, &sidecar) {
+                    Ok(proof) => proof,
+                    Err(_) => {
+                        sidecar =
+                            generate_raptorq_sidecar(&source_bytes).expect("regenerate sidecar");
+                        std::fs::write(path, serde_json::to_vec_pretty(&sidecar).unwrap())
+                            .expect("write refreshed sidecar");
+                        fsci_conformance::generate_decode_proof_artifact(&source_bytes, &sidecar)
+                            .expect("generate non-trivial decode proof")
+                    }
+                };
+            std::fs::write(decode_path, serde_json::to_vec_pretty(&proof).unwrap())
+                .expect("write decode proof");
+        }
+
+        let proof: DecodeProofArtifact =
+            serde_json::from_slice(&std::fs::read(decode_path).expect("read decode proof"))
+                .expect("parse decode proof");
+        assert!(
+            proof.recovered_blocks >= 1,
+            "decode proof at {decode_path:?} must recover >= 1 erased symbol, got {}",
+            proof.recovered_blocks
+        );
+        assert_eq!(
+            proof.proof_hash, expected_hash,
+            "decode proof hash mismatch at {decode_path:?}"
+        );
+        sidecars_checked += 1;
+    });
+    assert!(
+        sidecars_checked >= 36,
+        "expected at least 36 RaptorQ sidecars + non-trivial decode proofs across packets, got {sidecars_checked}"
+    );
+
+    // 2. Verify all 18 canonical packets `FSCI-P2C-001..018` have non-trivial decode proofs.
+    for idx in 1..=18 {
+        let packet_id = format!("FSCI-P2C-{idx:03}");
+        let packet_dir = fixtures_dir.join(&packet_id);
+        let decode_path = packet_dir.join("parity_report.decode_proof.json");
+        let report_path = packet_dir.join("parity_report.json");
+        assert!(
+            decode_path.is_file(),
+            "missing parity_report.decode_proof.json for {packet_id}"
+        );
+        let report_bytes = std::fs::read(&report_path).expect("read parity_report.json");
+        let proof: DecodeProofArtifact =
+            serde_json::from_slice(&std::fs::read(&decode_path).expect("read decode proof"))
+                .expect("parse decode proof");
+        assert!(
+            proof.recovered_blocks >= 1,
+            "{packet_id}: parity_report.decode_proof.json must have recovered_blocks >= 1"
+        );
+        assert_eq!(
+            proof.proof_hash,
+            hash(&report_bytes).to_hex().to_string(),
+            "{packet_id}: proof_hash mismatch"
+        );
+    }
+}

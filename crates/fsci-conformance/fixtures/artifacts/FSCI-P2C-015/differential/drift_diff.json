@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-015",
+  "family": "ndimage_core",
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-015_ndimage_core.json",
+  "generated_unix_ms": 1790392935374,
+  "oracle_status": {
+    "status": "available"
+  },
+  "total_cases": 6,
+  "drifted_cases": 0,
+  "cases": [
+    {
+      "case_id": "gaussian_filter_constant_reflect_preserves_signal",
+      "passed": true,
+      "message": "ndimage array matched (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "gaussian_filter_non_positive_sigma_rejects",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "label_two_face_connected_components_2d",
+      "passed": true,
+      "message": "ndimage labels matched (2 features)",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "binary_erosion_square_shrinks_to_center",
+      "passed": true,
+      "message": "ndimage array matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "binary_dilation_center_pixel_expands_to_square",
+      "passed": true,
+      "message": "ndimage array matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_transform_center_background_2d",
+      "passed": true,
+      "message": "ndimage array matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ]
+}

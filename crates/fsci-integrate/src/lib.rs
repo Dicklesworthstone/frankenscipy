@@ -18,7 +18,7 @@ pub mod validation;
 pub use api::{
     EventFn, EventSpec, LsodaSolver, LsodaSolverConfig, OdePortfolioResult, OdeSolution,
     SolveIvpOptions, SolveIvpResult, SolverKind, solve_ivp, solve_ivp_many, solve_ivp_with_audit,
-    solve_ivp_with_casp, solve_ivp_with_casp_portfolio,
+    solve_ivp_with_casp, solve_ivp_with_casp_portfolio, solve_ivp_with_casp_portfolio_and_audit,
 };
 pub use bdf::{BdfSolver, BdfSolverConfig};
 pub use bvp::{BvpBcJac, BvpError, BvpFunJac, BvpOptions, BvpResult, solve_bvp, solve_bvp_many};

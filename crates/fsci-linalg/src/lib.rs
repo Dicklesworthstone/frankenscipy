@@ -80,8 +80,8 @@ use bunch_kaufman::{BunchKaufman, Triangle};
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
     AttemptOutcome, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionSignals,
-    Fingerprinter, PolicyAction, PolicyController, PolicyDecision, PortfolioEvidence, RuntimeMode,
-    SolverAction, SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
+    Fingerprinter, PolicyAction, PolicyDecision, PortfolioEvidence, RuntimeMode, SolverAction,
+    SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
 
@@ -824,6 +824,7 @@ struct FullRowRankWideLstsqResult {
 pub struct ConditionReport {
     pub matrix_shape: (usize, usize),
     pub rcond_estimate: f64,
+    pub pivot_growth: Option<f64>,
     pub structural_evidence: StructuralEvidence,
     pub diagonal: bool,
     pub upper_triangular: bool,
@@ -2238,10 +2239,13 @@ fn condition_diagnostics_with_assumption_mode(
         rcond
     };
 
+    let pivot_growth = lu_pivot_growth(a, lu_cache.as_ref());
+
     Ok(ConditionDiagnosticsWork {
         report: ConditionReport {
             matrix_shape: (rows, cols),
             rcond_estimate,
+            pivot_growth,
             structural_evidence,
             diagonal,
             upper_triangular,
@@ -2257,6 +2261,53 @@ fn condition_diagnostics_with_assumption_mode(
         lu_cache,
         cholesky_cache,
     })
+}
+
+/// Pivot growth factor `ρ = max_{i ≤ j} |U_{ij}| / max_{i,j} |A_{ij}|` when `condition_diagnostics`
+/// computed an LU factorization (frankenscipy-7tb8d.1).
+fn lu_pivot_growth(a: &[Vec<f64>], lu_cache: Option<&LuFactorStorage>) -> Option<f64> {
+    let lu = lu_cache?;
+    let max_a =
+        a.iter().flatten().fold(
+            0.0_f64,
+            |m, &v| if v.is_nan() { f64::NAN } else { m.max(v.abs()) },
+        );
+    if !max_a.is_finite() || max_a <= 0.0 {
+        return None;
+    }
+    let max_u = match lu {
+        LuFactorStorage::Flat(factors) => {
+            let n = factors.n;
+            let mut m = 0.0_f64;
+            for i in 0..n {
+                let row_start = i * n;
+                for j in i..n {
+                    let v = factors.data[row_start + j].abs();
+                    if v.is_nan() {
+                        return None;
+                    }
+                    m = m.max(v);
+                }
+            }
+            m
+        }
+        LuFactorStorage::Nalgebra(lu_decomp) => {
+            let u = lu_decomp.u();
+            let (rows, cols) = u.shape();
+            let mut m = 0.0_f64;
+            for i in 0..rows {
+                for j in i..cols {
+                    let v = u[(i, j)].abs();
+                    if v.is_nan() {
+                        return None;
+                    }
+                    m = m.max(v);
+                }
+            }
+            m
+        }
+    };
+    Some(max_u / max_a)
 }
 
 pub fn condition_diagnostics(a: &[Vec<f64>]) -> Result<ConditionReport, LinalgError> {
@@ -2332,17 +2383,19 @@ fn should_apply_solve_policy(
 }
 
 fn solve_policy_decision(
+    portfolio: &mut SolverPortfolio,
     mode: RuntimeMode,
     report: &ConditionReport,
     metadata_incompatibility_score: f64,
 ) -> Result<PolicyDecision, LinalgError> {
-    let mut controller = PolicyController::new(mode, 8);
     let signals = DecisionSignals::new(
         condition_signal_from_rcond(report.rcond_estimate),
         metadata_incompatibility_score,
         anomaly_signal_from_rcond(report.rcond_estimate),
     );
-    let decision = controller.decide(signals);
+    let decision = portfolio
+        .policy_controller_mut()
+        .decide_in_mode(mode, signals);
     if decision.action == PolicyAction::FailClosed {
         return Err(LinalgError::PolicyRejected {
             reason: decision.reason,
@@ -2741,7 +2794,7 @@ fn one_norm_estimate(
         apply_t(&mut z);
         let last = j;
         j = argmax_abs(&z);
-        if z[last] == z[j].abs() || iteration >= ITMAX {
+        if z[last].abs() >= z[j].abs() || iteration >= ITMAX {
             break;
         }
         iteration += 1;
@@ -3247,6 +3300,11 @@ fn symmetric_inverse(
         .collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    static INJECT_DIRECT_LU_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_solve_action(
     action: SolverAction,
@@ -3260,6 +3318,10 @@ fn dispatch_solve_action(
 ) -> Result<SolveResult, LinalgError> {
     match action {
         SolverAction::DirectLU => {
+            #[cfg(test)]
+            if INJECT_DIRECT_LU_FAILURE.with(|f| f.replace(false)) {
+                return Err(LinalgError::SingularMatrix);
+            }
             // A matrix the diagnostics factored by Cholesky has no LU yet (frankenscipy-w8bjb):
             // take the one they would have taken, so LU on it is the same factorization.
             let n = effective_a.len();
@@ -3559,6 +3621,7 @@ fn solve_with_portfolio_internal(
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
             Some(solve_policy_decision(
+                portfolio,
                 options.mode,
                 &report,
                 metadata_incompatibility_score,
@@ -3774,7 +3837,12 @@ fn solve_audited(
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
             Some(
-                match solve_policy_decision(options.mode, &report, metadata_incompatibility_score) {
+                match solve_policy_decision(
+                    portfolio,
+                    options.mode,
+                    &report,
+                    metadata_incompatibility_score,
+                ) {
                     Ok(decision) => decision,
                     Err(err) => {
                         audit.reject("policy_rejected", &format!("rejected: {err}"));
@@ -3861,6 +3929,23 @@ fn solve_audited(
             audit.fingerprint(),
             &format!("fallback from {:?} to {:?}", selected_action, actual_action),
             "recovered via safer solver",
+        );
+    }
+    if portfolio
+        .policy_controller()
+        .eprocess()
+        .is_alarm_triggered()
+    {
+        record_bounded_recovery(
+            audit.ledger(),
+            audit.fingerprint(),
+            "casp_eprocess_drift_alarm",
+            &format!(
+                "anytime-valid e-process alarm active (E_t={:.3e} >= 1/alpha={:.3e}); overriding to {:?}",
+                portfolio.policy_controller().eprocess().e_value(),
+                portfolio.policy_controller().eprocess().threshold(),
+                actual_action
+            ),
         );
     }
 
@@ -45148,6 +45233,279 @@ mod proptest_tests {
             fsci_runtime::EvidenceValue::Label("DirectLU".to_string())
         );
         assert!(event.outcome.contains("fallback"), "{}", event.outcome);
+        let diag = condition_diagnostics(&a).expect("wilkinson diagnostics");
+        assert_eq!(diag.pivot_growth, Some(2.0_f64.powi(59)));
+    }
+
+    #[test]
+    fn injected_direct_lu_failure_reranks_from_updated_posterior_and_records_in_ledger() {
+        let a = vec![
+            vec![4.0, 1.0, 0.5, 0.2],
+            vec![0.8, 5.0, 0.3, 0.1],
+            vec![0.2, 0.7, 6.0, 0.4],
+            vec![0.1, 0.2, 0.9, 7.0],
+        ];
+        let b = vec![1.0, 2.0, 3.0, 4.0];
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Hardened, 8);
+        let audit_ledger = sync_audit_ledger();
+
+        INJECT_DIRECT_LU_FAILURE.with(|f| f.set(true));
+        let res = solve_with_audit(
+            &a,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..SolveOptions::default()
+            },
+            &mut portfolio,
+            &audit_ledger,
+        )
+        .expect("fallback solve succeeds after injected DirectLU failure");
+        assert!(
+            !INJECT_DIRECT_LU_FAILURE.with(std::cell::Cell::get),
+            "injected failure flag must be consumed on first DirectLU attempt"
+        );
+        let cert = res.certificate.as_ref().expect("certificate");
+        assert_eq!(cert.decision.first_attempt, Some(SolverAction::DirectLU));
+        assert_eq!(cert.action, SolverAction::PivotedQR);
+        assert!(cert.fallback_active);
+        let counts = portfolio.outcome_counts(cert.rcond_estimate);
+        assert!(
+            (counts.iter().sum::<f64>() - 2.0).abs() < 1e-12,
+            "both failed DirectLU and successful PivotedQR outcomes must be recorded: {counts:?}"
+        );
+        let ledger = audit_ledger.lock().expect("audit ledger");
+        assert!(ledger.entries().iter().any(|e| matches!(
+            &e.action,
+            AuditAction::CaspDecision {
+                action,
+                fallback: true,
+                ..
+            } if action == "PivotedQR"
+        )));
+        assert!(ledger.entries().iter().any(|e| matches!(
+            &e.action,
+            AuditAction::BoundedRecovery {
+                recovery_action,
+                ..
+            } if recovery_action.contains("DirectLU") && recovery_action.contains("PivotedQR")
+        )));
+    }
+
+    #[test]
+    fn oettli_prager_omega_matches_exact_rationals_on_100_random_4x4_integer_systems() {
+        let mut state = 0x71B8_D100_CAFE_BEEFu64;
+        let mut next_i64 = |lo: i64, hi: i64| -> i64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let span = (hi - lo + 1) as u64;
+            lo + (state % span) as i64
+        };
+
+        // Include near-cancellation structure: A_ij = 2^24 * s_ij + c_ij, x_j = (2^24 * t_j + d_j) / 64,
+        // and b_i chosen near A_i * x so standard uncompensated dot product loses precision while
+        // Dot2 + Oettli-Prager matches exact i128 rational arithmetic within <= 1e-12 relative error.
+        let scale: i128 = 64;
+        for sys_idx in 0..100 {
+            let mut a_int = [[0i128; 4]; 4];
+            let mut a_f64 = vec![vec![0.0; 4]; 4];
+            for i in 0..4 {
+                for j in 0..4 {
+                    let base = if i == j {
+                        (1i128 << 22) + i128::from(next_i64(100, 500))
+                    } else {
+                        (1i128 << 20) * i128::from(next_i64(-3, 3)) + i128::from(next_i64(-50, 50))
+                    };
+                    a_int[i][j] = base;
+                    a_f64[i][j] = base as f64;
+                }
+            }
+            let mut x_num = [0i128; 4];
+            let mut x_f64 = [0.0f64; 4];
+            for j in 0..4 {
+                let num =
+                    (1i128 << 21) * i128::from(next_i64(-3, 3)) + i128::from(next_i64(-500, 500));
+                x_num[j] = if num == 0 { 13 } else { num };
+                x_f64[j] = (x_num[j] as f64) / (scale as f64);
+            }
+            let mut b_int = [0i128; 4];
+            let mut b_f64 = [0.0f64; 4];
+            for i in 0..4 {
+                let exact_ax_scaled: i128 = (0..4).map(|j| a_int[i][j] * x_num[j]).sum();
+                let delta = i128::from(next_i64(1, 25));
+                // Set b_i so scale * b_i is close to exact_ax_scaled (producing cancellation).
+                let bi = (exact_ax_scaled / scale) + delta;
+                b_int[i] = bi;
+                b_f64[i] = bi as f64;
+            }
+
+            let (r, mag) = residual_and_magnitude(&a_f64, &x_f64, &b_f64);
+            let omega = componentwise_backward_error(&r, &mag);
+
+            let mut exact_omega = 0.0_f64;
+            for i in 0..4 {
+                let num_i: i128 =
+                    (scale * b_int[i] - (0..4).map(|j| a_int[i][j] * x_num[j]).sum::<i128>()).abs();
+                let den_i: i128 = scale * b_int[i].abs()
+                    + (0..4)
+                        .map(|j| a_int[i][j].abs() * x_num[j].abs())
+                        .sum::<i128>();
+                let ratio = (num_i as f64) / (den_i as f64);
+                exact_omega = exact_omega.max(ratio);
+            }
+
+            let rel_err = (omega - exact_omega).abs() / exact_omega.max(1e-30);
+            assert!(
+                rel_err <= 1e-12,
+                "system {sys_idx}: omega={omega:.16e}, exact={exact_omega:.16e}, rel_err={rel_err:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn hager_higham_rcond_within_factor_3_of_true_kappa1_on_500_randsvd_matrices() {
+        let n = 6;
+        let mut state = 0x5EED_71B8_D101_2345u64;
+        let mut next_unit = || -> f64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) * 2.0 - 1.0
+        };
+
+        let random_orthogonal = |next: &mut dyn FnMut() -> f64| -> DMatrix<f64> {
+            let mut q = DMatrix::<f64>::identity(n, n);
+            for _ in 0..n {
+                let mut v = DVector::<f64>::from_fn(n, |_, _| next());
+                let norm = v.norm();
+                if norm > 1e-12 {
+                    v /= norm;
+                    q -= (&q * &v) * (2.0 * v.transpose());
+                }
+            }
+            q
+        };
+
+        for trial in 0..500 {
+            let u = random_orthogonal(&mut next_unit);
+            let v = random_orthogonal(&mut next_unit);
+            let log10_kappa = 1.0 + (trial % 7) as f64;
+            let mut s = DMatrix::<f64>::zeros(n, n);
+            for i in 0..n {
+                let frac = (i as f64) / ((n - 1) as f64);
+                s[(i, i)] = 10.0_f64.powf(-log10_kappa * frac);
+            }
+            let mat = &u * s * v.transpose();
+            let a_norm = matrix_norm1(&mat);
+            let inv = mat
+                .clone()
+                .try_inverse()
+                .expect("invertible randsvd matrix");
+            let inv_norm = matrix_norm1(&inv);
+            let true_rcond = 1.0 / (a_norm * inv_norm);
+            let lu = mat.lu();
+            let u_t = lu.u().transpose();
+            let l_t = lu.l().transpose();
+            let hager_inv_norm = one_norm_estimate(
+                n,
+                |v| {
+                    let dv = DVector::from_column_slice(v);
+                    let sol = lu.solve(&dv).expect("lu solve");
+                    v.copy_from_slice(sol.as_slice());
+                },
+                |v| {
+                    let dv = DVector::from_column_slice(v);
+                    let sol = solve_lu_transpose_with_transposes(&lu, &u_t, &l_t, &dv)
+                        .expect("lu^T solve");
+                    v.copy_from_slice(sol.as_slice());
+                },
+            );
+            let hager_rcond = 1.0 / (a_norm * hager_inv_norm);
+            let ratio = hager_rcond / true_rcond;
+            assert!(
+                (1.0 / 3.0..=3.0).contains(&ratio),
+                "trial {trial}: hager_rcond={hager_rcond:.6e}, true_rcond={true_rcond:.6e}, ratio={ratio:.4}"
+            );
+            let fast_rcond = fast_rcond_from_lu(&lu, a_norm, n);
+            let fast_ratio = fast_rcond / true_rcond;
+            assert!(
+                (0.1..=10.0).contains(&fast_ratio),
+                "trial {trial}: fast_rcond={fast_rcond:.6e}, true_rcond={true_rcond:.6e}, fast_ratio={fast_ratio:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_portfolio_evolves_policy_controller_across_1000_solves() {
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 16);
+        let a_well = vec![vec![4.0, 1.0], vec![2.0, 3.0]];
+        let b = vec![1.0, 2.0];
+        // rcond ~ 1e-11 triggers PolicyAction::FullValidate in Strict mode.
+        let a_ill = vec![vec![1.0, 1.0], vec![1.0, 1.0 + 1e-11]];
+
+        for step in 0..1000 {
+            let a = if (490..495).contains(&step) {
+                &a_ill
+            } else {
+                &a_well
+            };
+            let _ = solve_with_casp(a, &b, SolveOptions::default(), &mut portfolio)
+                .expect("solve_with_casp succeeds");
+            if step == 493 {
+                assert_eq!(
+                    portfolio.policy_controller().supervisor().status(),
+                    fsci_runtime::SupervisionStatus::Degraded,
+                    "4 consecutive FullValidate solves must transition supervisor to Degraded"
+                );
+            }
+        }
+
+        let sup = portfolio.policy_controller().supervisor();
+        assert_eq!(sup.total_steps(), 1000);
+        assert_eq!(sup.status(), fsci_runtime::SupervisionStatus::Healthy);
+        assert!(
+            sup.events().len() >= 2,
+            "supervisor must record Healthy -> Degraded -> Healthy transitions: {:?}",
+            sup.events()
+        );
+        assert_eq!(portfolio.policy_controller().ledger().len(), 16);
+
+        // Trip the e-process drift monitor and verify solve_with_audit emits BoundedRecovery
+        // and overrides solver selection to SVDFallback in Hardened mode.
+        for _ in 0..15 {
+            portfolio.observe_backward_error(1e-2);
+        }
+        assert!(
+            portfolio
+                .policy_controller()
+                .eprocess()
+                .is_alarm_triggered()
+        );
+        let audit_ledger = sync_audit_ledger();
+        let res = solve_with_audit(
+            &a_well,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..Default::default()
+            },
+            &mut portfolio,
+            &audit_ledger,
+        )
+        .expect("audited solve under e-process alarm");
+        assert_eq!(
+            res.certificate.as_ref().expect("certificate").action,
+            SolverAction::SVDFallback
+        );
+        let ledger = audit_ledger.lock().expect("audit ledger");
+        assert!(ledger.entries().iter().any(|e| matches!(
+            &e.action,
+            AuditAction::BoundedRecovery {
+                recovery_action,
+                ..
+            } if recovery_action == "casp_eprocess_drift_alarm"
+        )));
     }
 
     // br-szq1n.12: `driver` was never read. SciPy 1.17.1, lstsq([[1,0],[0,1],[1,1]], [1,2,4]):

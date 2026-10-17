@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-017",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-io implements MATLAB v4/v5 (incl. compressed miCOMPRESSED v7), Matrix Market, WAV PCM/float, NetCDF v1/v2, IDL .sav, Harwell-Boeing, ARFF, and Fortran unformatted I/O.",
+        "affected_functions": ["loadmat", "savemat", "whosmat", "mmread", "mmwrite"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-io",
+      "category": "malformed_input",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Truncated or corrupted Matrix Market coordinate files claiming more nonzeros (nnz) than lines present, or out-of-bounds 1-based indices.",
+      "mitigation": "Defended in crates/fsci-io/src/lib.rs:368 (mmread): validates banner, dimensions, 1-based coordinate bounds, and exact nnz entry count before returning.",
+      "test_reference": "mmread_rejects_truncated_coordinate_entry_via_nnz_backstop",
+      "strict_mode_response": "Return Err(IoError) on truncated coordinate entries or out-of-bounds indices.",
+      "hardened_mode_response": "Reject malformed Matrix Market payloads fail-closed and record FailClosed in AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-io",
+      "category": "resource_exhaustion",
+      "severity": "critical",
+      "likelihood": "possible",
+      "description": "Crafted MATLAB Level 5 miCOMPRESSED (zlib) or miMATRIX tags claiming multi-gigabyte dimensions or zip-bomb payloads.",
+      "mitigation": "Defended in crates/fsci-io/src/lib.rs:4555 (loadmat): bounds decompressed stream sizes, validates tag byte lengths against remaining slice, and rejects HDF5 v7.3 headers cleanly.",
+      "test_reference": "mat_data_elements_decode_typed_chunks_in_either_byte_order",
+      "strict_mode_response": "Return Err(IoError) on truncated tags, corrupt zlib streams, or v7.3 HDF5 files.",
+      "hardened_mode_response": "Enforce strict decompression and dimension caps and emit FailClosed audit event."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-io",
+      "category": "numerical_instability",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Non-finite entries in Matrix Market or MATLAB numeric arrays in Hardened mode.",
+      "mitigation": "Defended in crates/fsci-io/src/lib.rs:376 (mmread_with_mode): rejects NaN/Inf numeric entries when RuntimeMode::Hardened is selected.",
+      "test_reference": "mmread_coordinate",
+      "strict_mode_response": "Parse IEEE NaN/Inf tokens per format specification.",
+      "hardened_mode_response": "Reject non-finite matrix entries fail-closed with IoError::NonFiniteInput."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-io",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Endianness (IM vs MI) and Level 4 vs Level 5 MATLAB serialization round-trip drift against SciPy.",
+      "mitigation": "Defended in crates/fsci-io/src/lib.rs:4624 (savemat): writes canonical Level 5 or Level 4 headers and data elements matching SciPy savemat byte layout.",
+      "test_reference": "savemat_v5_round_trips_every_value_kind_compressed_and_not",
+      "strict_mode_response": "Round-trip numeric, complex, logical, char, cell, struct, and sparse arrays matching SciPy 1.17.1.",
+      "hardened_mode_response": "Validate variable names and array dimensions before serialization."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "truncated or malformed file header / chunk length",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return IoError::FormatError.",
+      "hardened_mode_action": "Return IoError::FormatError and record FailClosed in AuditLedger."
+    },
+    {
+      "input_class": "MATLAB v7.3 (HDF5) file in loadmat",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return IoError explaining v7.3 HDF5 requires an HDF5 reader, matching SciPy NotImplementedError.",
+      "hardened_mode_action": "Reject fail-closed with diagnostic message."
+    },
+    {
+      "input_class": "non-finite entries in Hardened mode",
+      "policy": "reject",
+      "strict_mode_action": "Allow IEEE NaN/Inf in Strict mode.",
+      "hardened_mode_action": "Reject non-finite entries in Hardened mode with IoError::NonFiniteInput."
+    },
+    {
+      "input_class": "coordinate index out of declared matrix dimensions",
+      "policy": "reject",
+      "strict_mode_action": "Return IoError::FormatError.",
+      "hardened_mode_action": "Return IoError::FormatError and emit FailClosed audit event."
+    }
+  ]
+}

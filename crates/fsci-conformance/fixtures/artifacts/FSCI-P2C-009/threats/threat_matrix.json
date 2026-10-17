@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-009",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-cluster implements vq (kmeans, kmeans2, whiten, vq) and hierarchy (linkage, fcluster, cophenet, inconsistent).",
+        "affected_functions": ["kmeans", "kmeans2", "whiten", "linkage", "fcluster"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-cluster",
+      "category": "numerical_instability",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Constant or zero-variance feature columns in whiten cause division by zero or NaN feature scaling.",
+      "mitigation": "Defended in crates/fsci-cluster/src/lib.rs:4094 (whiten): detects zero standard deviation columns and leaves them unscaled (or emits BoundedRecovery in Hardened mode).",
+      "test_reference": "whiten_parallel_is_bit_identical_to_serial",
+      "strict_mode_response": "Match SciPy whiten handling of zero-variance columns.",
+      "hardened_mode_response": "Avoid division by zero and record BoundedRecovery in AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-cluster",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Empty observation matrices, k == 0 clusters, or non-finite coordinates passed to kmeans / linkage.",
+      "mitigation": "Defended in crates/fsci-cluster/src/lib.rs:2879 (kmeans): validates observation shape, k >= 1, and finiteness before Lloyd iterations, recording FailClosed on error.",
+      "test_reference": "vq_soa_kernel_matches_sq_dist_bits",
+      "strict_mode_response": "Return Err(ClusterError) and emit FailClosed audit event.",
+      "hardened_mode_response": "Reject non-finite or malformed observations fail-closed."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-cluster",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Pairwise distance accumulation in agglomerative linkage exhausting memory on malformed condensed vectors.",
+      "mitigation": "Defended in crates/fsci-cluster/src/lib.rs:4594 (linkage): verifies condensed distance length n*(n-1)/2 and finite entries before MST/NN-chain clustering.",
+      "test_reference": "linkage_dm_blocked_fold_matches_sq_dist_bits",
+      "strict_mode_response": "Reject invalid condensed distance lengths immediately.",
+      "hardened_mode_response": "Reject invalid lengths or non-finite distances fail-closed."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-cluster",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Invalid linkage matrix rows (negative distances, out-of-range cluster indices) passed to fcluster.",
+      "mitigation": "Defended in crates/fsci-cluster/src/lib.rs:5075 (fcluster): validates linkage matrix dimensions and merge index bounds before cutting tree.",
+      "test_reference": "mst_fused_scan_matches_two_pass_bits",
+      "strict_mode_response": "Return Err(ClusterError) on invalid linkage matrix.",
+      "hardened_mode_response": "Reject malformed linkage tree fail-closed with audit entry."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "empty observations or k == 0",
+      "policy": "reject",
+      "strict_mode_action": "Return ClusterError and record FailClosed in AuditLedger.",
+      "hardened_mode_action": "Return ClusterError and record FailClosed in AuditLedger."
+    },
+    {
+      "input_class": "non-finite observation coordinates",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return ClusterError::NonFiniteInput.",
+      "hardened_mode_action": "Return ClusterError::NonFiniteInput and emit FailClosed audit event."
+    },
+    {
+      "input_class": "invalid condensed distance vector length",
+      "policy": "reject",
+      "strict_mode_action": "Return ClusterError::InvalidShape.",
+      "hardened_mode_action": "Return ClusterError::InvalidShape."
+    },
+    {
+      "input_class": "corrupted linkage matrix in fcluster/cophenet",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return ClusterError::InvalidLinkage.",
+      "hardened_mode_action": "Return ClusterError::InvalidLinkage and log FailClosed event."
+    }
+  ]
+}

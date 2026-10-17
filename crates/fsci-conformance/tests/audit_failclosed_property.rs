@@ -1358,6 +1358,87 @@ fn other_cases(cases: &mut Vec<Case>) {
             ));
         }
 
+        for (class, x0, expect) in [
+            (
+                "empty",
+                vec![],
+                Expect::Reject("minimize_with_casp_portfolio::invalid_argument"),
+            ),
+            (
+                "non_finite",
+                vec![f64::NAN, 1.0],
+                Expect::Reject("minimize_with_casp_portfolio::non_finite_input"),
+            ),
+            ("valid", vec![1.0, -1.0], Expect::Accept),
+        ] {
+            cases.push(case(
+                "opt::minimize_with_casp_portfolio_and_audit",
+                class,
+                label,
+                expect,
+                move |l| {
+                    let options = fsci_opt::MinimizeOptions {
+                        mode,
+                        ..fsci_opt::MinimizeOptions::default()
+                    };
+                    let mut portfolio = fsci_runtime::OptSolverPortfolio::new(mode, 4);
+                    let objective =
+                        |x: &[f64]| x.iter().map(|v| (v - 0.5) * (v - 0.5)).sum::<f64>();
+                    done(fsci_opt::minimize_with_casp_portfolio_and_audit(
+                        objective,
+                        &x0,
+                        options,
+                        &mut portfolio,
+                        false,
+                        false,
+                        l,
+                    ))
+                },
+            ));
+        }
+
+        for (class, y0, max_step, expect) in [
+            (
+                "non_finite",
+                vec![f64::NAN],
+                f64::INFINITY,
+                Expect::Reject("non_finite_y0"),
+            ),
+            (
+                "bad_max_step",
+                vec![1.0],
+                0.0,
+                Expect::Reject("max_step_must_be_positive"),
+            ),
+            ("valid", vec![1.0], f64::INFINITY, Expect::Accept),
+        ] {
+            cases.push(case(
+                "integrate::solve_ivp_with_casp_portfolio_and_audit",
+                class,
+                label,
+                expect,
+                move |l| {
+                    let ivp = SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &y0,
+                        max_step,
+                        mode,
+                        ..SolveIvpOptions::default()
+                    };
+                    let mut portfolio = fsci_runtime::OdeSolverPortfolio::new(mode, 4);
+                    let mut fun = |_t: f64, y: &[f64]| vec![-y[0]];
+                    done(fsci_integrate::solve_ivp_with_casp_portfolio_and_audit(
+                        &mut fun,
+                        &ivp,
+                        &mut portfolio,
+                        1.0,
+                        false,
+                        l,
+                    ))
+                },
+            ));
+        }
+
         // fsci-special: Strict follows SciPy (a negative-integer pole is NaN) and does not
         // reject; Hardened rejects such a pole, its one failure mode. NaN in is NaN out in both.
         for (class, z, hardened_reason) in [
@@ -1382,6 +1463,46 @@ fn other_cases(cases: &mut Vec<Case>) {
                         mode,
                         l,
                     ))
+                },
+            ));
+        }
+
+        for (class, z, precision_target, expect) in [
+            (
+                "bad_precision",
+                0.5,
+                0.0,
+                Expect::Reject("select_hypergeometric_branch_with_casp::hyp1f1::DomainError"),
+            ),
+            (
+                "non_finite_z",
+                f64::NAN,
+                1e-12,
+                if mode == RuntimeMode::Hardened {
+                    Expect::Reject("select_hypergeometric_branch_with_casp::hyp1f1::NonFiniteInput")
+                } else {
+                    Expect::Accept
+                },
+            ),
+            ("valid", -5.0, 1e-12, Expect::Accept),
+        ] {
+            cases.push(case(
+                "special::select_hypergeometric_branch_with_casp_and_audit",
+                class,
+                label,
+                expect,
+                move |l| {
+                    let problem =
+                        fsci_special::HyperCaspProblem::hyp1f1(1.0, 2.0, z, precision_target);
+                    let mut portfolio = fsci_runtime::HyperSolverPortfolio::new(mode, 4);
+                    done(
+                        fsci_special::select_hypergeometric_branch_with_casp_and_audit(
+                            problem,
+                            mode,
+                            &mut portfolio,
+                            l,
+                        ),
+                    )
                 },
             ));
         }
@@ -1503,8 +1624,8 @@ fn every_audited_error_is_one_fail_closed_event() {
     assert_eq!(compared, cases.len(), "every case in the table was run");
     assert_eq!(
         apis.len(),
-        46,
-        "the inventory has 46 audited APIs: {apis:?}"
+        49,
+        "the inventory has 49 audited APIs: {apis:?}"
     );
     assert!(
         failures.is_empty(),

@@ -9523,13 +9523,16 @@ pub fn gmres(
     }
 
     let mut total_iter = 0usize;
+    let mut ptol_max_factor = 1.0_f64;
+    let mut inner_tol = options.tol;
 
     // Outer restart loop. As in SciPy (`info = 0 if rnorm <= atol else maxiter`), convergence is
     // decided on the TRUE residual after each cycle: the Givens estimate can pass while the true
     // residual does not (restart), and a lucky breakdown only means the Krylov space is exhausted,
     // which for a singular A leaves a residual that no further cycle can reduce (stop, unconverged).
     for _ in 0..max_cycles {
-        let (stop, iters) = gmres_inner(a, b, &mut x, b_norm, restart, options.tol, restart)?;
+        let (stop, iters, presid_rel) =
+            gmres_inner(a, b, &mut x, b_norm, restart, inner_tol, restart)?;
         total_iter = total_iter
             .checked_add(iters)
             .ok_or_else(|| SparseError::InvalidArgument {
@@ -9547,6 +9550,12 @@ pub fn gmres(
                 residual_norm: r_norm,
             });
         }
+        if stop == KrylovCycleStop::Tolerance {
+            ptol_max_factor = f64::EPSILON.max(0.25 * ptol_max_factor);
+        } else {
+            ptol_max_factor = (1.5 * ptol_max_factor).min(1.0);
+        }
+        inner_tol = presid_rel * ptol_max_factor.min(options.tol / r_norm);
     }
 
     let ax = a.matvec(&x)?;
@@ -9615,7 +9624,7 @@ fn gmres_inner(
     restart: usize,
     tol: f64,
     max_iter: usize,
-) -> SparseResult<(KrylovCycleStop, usize)> {
+) -> SparseResult<(KrylovCycleStop, usize, f64)> {
     let n = x.len();
     let m = restart.min(max_iter);
 
@@ -9625,7 +9634,7 @@ fn gmres_inner(
     let r_norm = vec_norm(&r);
 
     if r_norm / b_norm < tol {
-        return Ok((KrylovCycleStop::Tolerance, 0));
+        return Ok((KrylovCycleStop::Tolerance, 0, r_norm / b_norm));
     }
 
     // Arnoldi process with modified Gram-Schmidt. The basis is one contiguous
@@ -9646,6 +9655,7 @@ fn gmres_inner(
     g[0] = r_norm;
 
     let mut iters = 0;
+    let mut last_presid_rel = r_norm / b_norm;
     // Reused Arnoldi vector A·v_j: the normalized copy is pushed into v, so wj
     // itself is free to reuse next step. frankenscipy-2hclc (byte-identical).
     let mut wj = vec![0.0; n];
@@ -9676,7 +9686,7 @@ fn gmres_inner(
             apply_givens_to_column(&mut h, &cs, &sn, j);
             // Solve the triangular system and update x
             update_solution_slab(x, &v, n, &h, &g, j + 1);
-            return Ok((KrylovCycleStop::Breakdown, iters));
+            return Ok((KrylovCycleStop::Breakdown, iters, last_presid_rel));
         }
 
         // Normalize
@@ -9700,15 +9710,16 @@ fn gmres_inner(
         g[j + 1] = -s * g_j;
 
         let residual = g[j + 1].abs() / b_norm;
+        last_presid_rel = residual;
         if residual < tol {
             update_solution_slab(x, &v, n, &h, &g, j + 1);
-            return Ok((KrylovCycleStop::Tolerance, iters));
+            return Ok((KrylovCycleStop::Tolerance, iters, residual));
         }
     }
 
     // Update solution with current approximation
     update_solution_slab(x, &v, n, &h, &g, m);
-    Ok((KrylovCycleStop::Exhausted, iters))
+    Ok((KrylovCycleStop::Exhausted, iters, last_presid_rel))
 }
 
 /// Apply previous Givens rotations to column j of H.
@@ -37933,6 +37944,7 @@ fn lobpcg_dense(
         lambda_history: Vec::new(),
         residual_norms_history: Vec::new(),
         iterations: 0,
+        // status: dense eigh fallback solved the full pencil when size_x * 5 >= n
         converged: true,
         dense_fallback: true,
     })
@@ -44795,6 +44807,7 @@ pub fn gcrotmk(
         return Ok(GcrotmkResult {
             solution: b.to_vec(),
             info: 0,
+            // status: ||b|| == 0, so x = 0 solves A*x = b with zero residual
             converged: true,
             iterations: 0,
             residual_norm: 0.0,

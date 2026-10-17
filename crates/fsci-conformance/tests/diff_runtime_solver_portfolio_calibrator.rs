@@ -281,6 +281,30 @@ fn diff_runtime_solver_portfolio_calibrator() {
         );
     }
 
+    // === 11. ConformalRiskControl offline threshold + portfolio set_alpha (frankenscipy-7tb8d.3) ===
+    {
+        let mut p = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        check(
+            "crc_default_alpha_005",
+            (p.alpha() - 0.05).abs() < 1e-12 && p.crc().t_hat() == 0.0,
+            format!("alpha={} t_hat={}", p.alpha(), p.crc().t_hat()),
+        );
+        p.set_alpha(0.005);
+        let (esc_action, _, _, _) = p.select_action(0.0078125, None);
+        check(
+            "crc_set_alpha_0005_escalates_wilkinson_rcond",
+            (p.crc().t_hat() - 0.0078125).abs() < 1e-15
+                && matches!(esc_action, SolverAction::PivotedQR),
+            format!("t_hat={} action={esc_action:?}", p.crc().t_hat()),
+        );
+        let cp = fsci_runtime::clopper_pearson_upper_bound(0, 161, 0.05);
+        check(
+            "crc_clopper_pearson_upper_95_below_alpha",
+            cp > 0.0 && cp <= 0.05,
+            format!("cp={cp:.6}"),
+        );
+    }
+
     let all_pass = diffs.iter().all(|d| d.pass);
     let log = DiffLog {
         test_id: "diff_runtime_solver_portfolio_calibrator".into(),

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-018",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-odr implements ODRPACK trust-region Levenberg-Marquardt orthogonal distance regression for explicit, implicit, and multi-response models.",
+        "affected_functions": ["odr", "run"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-odr",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Poorly scaled explanatory variables x or response y causing trust-region Levenberg-Marquardt step rank deficiency.",
+      "mitigation": "Defended in crates/fsci-odr/src/lib.rs:441 (run): computes scale-invariant relative parameter and sum-of-squares convergence measures matching ODRPACK.",
+      "test_reference": "odr_convergence_tests_are_invariant_to_data_scale",
+      "strict_mode_response": "Use scale-free relative convergence criteria and Levenberg-Marquardt damping.",
+      "hardened_mode_response": "Reject non-finite Jacobian/model evaluations fail-closed."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-odr",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Non-positive standard deviations (sx, sy <= 0) or mismatched observation counts between x, y, and weights.",
+      "mitigation": "Defended in crates/fsci-odr/src/lib.rs:709 (odr): validates observation dimensions, weight positivity, and finite initial beta0 before iteration.",
+      "test_reference": "realdata_stddevs_convert_to_inverse_variance_weights",
+      "strict_mode_response": "Return Err(OdrError) on mismatched lengths or non-positive standard deviations.",
+      "hardened_mode_response": "Reject invalid weights or non-finite inputs fail-closed."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-odr",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Non-convergent implicit ODR iterations spinning without bounded iteration cap.",
+      "mitigation": "Defended in crates/fsci-odr/src/lib.rs:441 (run): enforces maxit iteration cap (default 50) and reports stopreason when reached.",
+      "test_reference": "odr_matches_scipy_odr_on_noisy_data",
+      "strict_mode_response": "Terminate at maxit with info=4 (iteration limit reached) matching ODRPACK.",
+      "hardened_mode_response": "Enforce maxit bound and return structured OdrOutput."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-odr",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Fixed parameter masks (ifixb / ifixx) or OLS fit_type=2 drifting from SciPy ODR parameter covariance scaling.",
+      "mitigation": "Defended in crates/fsci-odr/src/lib.rs:141 (with_input_free): zeroes step columns for fixed parameters and reduces fit_type=2 to ordinary least squares.",
+      "test_reference": "fixed_beta_flag_holds_parameter_constant",
+      "strict_mode_response": "Hold masked parameters constant and compute cov_beta / sd_beta matching SciPy.",
+      "hardened_mode_response": "Validate mask lengths against beta0 and x dimensions."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "mismatched x and y observation counts",
+      "policy": "reject",
+      "strict_mode_action": "Return OdrError::DimensionMismatch.",
+      "hardened_mode_action": "Return OdrError::DimensionMismatch."
+    },
+    {
+      "input_class": "non-positive standard deviations in RealData",
+      "policy": "reject",
+      "strict_mode_action": "Return OdrError::InvalidWeights.",
+      "hardened_mode_action": "Return OdrError::InvalidWeights."
+    },
+    {
+      "input_class": "non-finite data or initial beta0",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return OdrError::NonFiniteInput.",
+      "hardened_mode_action": "Return OdrError::NonFiniteInput."
+    },
+    {
+      "input_class": "iteration limit reached without convergence",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return OdrOutput with info=4 and stopreason.",
+      "hardened_mode_action": "Return OdrOutput with info=4 and stopreason."
+    }
+  ]
+}

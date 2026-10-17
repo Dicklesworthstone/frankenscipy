@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-013",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-integrate implements solve_ivp (RK23, RK45, DOP853, Radau, BDF, LSODA), odeint, solve_bvp, quad, cubature, simpson, and trapezoid.",
+        "affected_functions": ["solve_ivp", "quad", "simpson", "trapezoid", "odeint"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-integrate",
+      "category": "numerical_instability",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Stiff ODE systems integrated with explicit RK methods suffer step-size collapse unless switched to implicit Radau/BDF or LSODA.",
+      "mitigation": "Defended in crates/fsci-integrate/src/api.rs:1189 (solve_ivp): supports Radau IIA, BDF, and automatic nonstiff/stiff switching in LSODA, plus step-floor termination.",
+      "test_reference": "solve_ivp_many_byte_identical_to_per_member",
+      "strict_mode_response": "Switch automatically in LSODA or terminate when step falls below machine spacing.",
+      "hardened_mode_response": "Record solver choice and step failures in OdeSolverPortfolio / AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-integrate",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Mismatched x and y array lengths or non-monotonic grid spacing in composite Simpson / trapezoid quadrature.",
+      "mitigation": "Defended in crates/fsci-integrate/src/quad.rs:1321 (simpson): validates matching sample and coordinate lengths and non-empty slices.",
+      "test_reference": "solve_ivp_rejects_empty_initial_state",
+      "strict_mode_response": "Return Err(IntegrateValidationError) on length mismatch or empty slice.",
+      "hardened_mode_response": "Reject non-finite samples and length mismatches fail-closed."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-integrate",
+      "category": "resource_exhaustion",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Non-finite integrand values in adaptive Gauss-Kronrod quadrature causing infinite interval subdivision.",
+      "mitigation": "Defended in crates/fsci-integrate/src/quad.rs:256 (quad): short-circuits subdivision when non-finite integrand values are encountered and enforces limit cap.",
+      "test_reference": "solve_ivp_rejects_wrong_size_initial_rhs_output",
+      "strict_mode_response": "Terminate adaptive subdivision at limit or non-finite evaluation.",
+      "hardened_mode_response": "Reject non-finite integrand evaluation fail-closed."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-integrate",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Legacy odeint wrapper (tfirst=false default) argument order drifting from solve_ivp (t, y).",
+      "mitigation": "Defended in crates/fsci-integrate/src/lib.rs:169 (odeint): preserves SciPy odeint (y, t) callback convention and time-grid interpolation.",
+      "test_reference": "solve_ivp_with_audit_preserves_non_finite_y0_fingerprint",
+      "strict_mode_response": "Evaluate RHS at (y, t) and return trajectory at requested t points.",
+      "hardened_mode_response": "Validate finite initial state and time grid before integration."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "empty initial state y0 or mismatched RHS dimension",
+      "policy": "reject",
+      "strict_mode_action": "Return IntegrateValidationError.",
+      "hardened_mode_action": "Return IntegrateValidationError and emit FailClosed audit event."
+    },
+    {
+      "input_class": "non-finite integrand or RHS evaluation",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Short-circuit adaptive subdivision or reject trial step.",
+      "hardened_mode_action": "Fail closed and record audit event."
+    },
+    {
+      "input_class": "mismatched x and y lengths in sample quadrature",
+      "policy": "reject",
+      "strict_mode_action": "Return IntegrateValidationError.",
+      "hardened_mode_action": "Return IntegrateValidationError."
+    },
+    {
+      "input_class": "quadrature subdivision limit exceeded",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return QuadResult with error estimate and convergence status.",
+      "hardened_mode_action": "Terminate at subdivision cap."
+    }
+  ]
+}

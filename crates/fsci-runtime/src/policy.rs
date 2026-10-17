@@ -69,17 +69,30 @@ pub struct PolicyDecision {
     pub reason: String,
 }
 
+use crate::eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 use crate::supervision::{PolicySupervisor, SupervisionConfig};
 
-/// Bayesian risk-state decision engine with bounded runtime supervision.
+/// Bayesian risk-state decision engine with bounded runtime supervision and anytime-valid
+/// e-process drift detection (frankenscipy-7tb8d.4).
 ///
-/// Records decisions to an evidence ledger and evaluates stability and
-/// degradation bounds through [`PolicySupervisor`].
+/// Records decisions to an evidence ledger, evaluates stability and degradation bounds
+/// through [`PolicySupervisor`], and monitors streaming exceedance indicators through
+/// [`EProcessMonitor`].
 #[derive(Debug, Clone)]
 pub struct PolicyController {
     mode: RuntimeMode,
     ledger: PolicyEvidenceLedger,
     supervisor: PolicySupervisor,
+    eprocess: EProcessMonitor,
+}
+
+fn default_policy_eprocess() -> EProcessMonitor {
+    EProcessMonitor::new(EProcessConfig {
+        null_bound: 0.05,
+        alpha: 0.01,
+        max_lambda: 2.5,
+    })
+    .expect("default policy e-process config is valid")
 }
 
 impl PolicyController {
@@ -89,6 +102,7 @@ impl PolicyController {
             mode,
             ledger: PolicyEvidenceLedger::new(ledger_capacity),
             supervisor: PolicySupervisor::new(SupervisionConfig::default()),
+            eprocess: default_policy_eprocess(),
         }
     }
 
@@ -102,6 +116,7 @@ impl PolicyController {
             mode,
             ledger: PolicyEvidenceLedger::new(ledger_capacity),
             supervisor: PolicySupervisor::new(config),
+            eprocess: default_policy_eprocess(),
         }
     }
 
@@ -124,22 +139,49 @@ impl PolicyController {
         &mut self.supervisor
     }
 
+    #[must_use]
+    pub const fn eprocess(&self) -> &EProcessMonitor {
+        &self.eprocess
+    }
+
+    pub fn eprocess_mut(&mut self) -> &mut EProcessMonitor {
+        &mut self.eprocess
+    }
+
+    /// Observe an exceedance indicator $X_t = \mathbf{1}\{\omega_t > \text{tol}\} \in \{0, 1\}$.
+    pub fn observe_exceedance(&mut self, exceeded: bool) -> EProcessStatus {
+        self.eprocess.observe(if exceeded { 1.0 } else { 0.0 })
+    }
+
+    /// Observe a bounded sentinel discrepancy $X_t \in [0, 1]$.
+    pub fn observe_discrepancy(&mut self, discrepancy: f64) -> EProcessStatus {
+        self.eprocess.observe(discrepancy)
+    }
+
     pub fn decide(&mut self, signals: DecisionSignals) -> PolicyDecision {
+        self.decide_in_mode(self.mode, signals)
+    }
+
+    pub fn decide_in_mode(
+        &mut self,
+        mode: RuntimeMode,
+        signals: DecisionSignals,
+    ) -> PolicyDecision {
         if !signals.is_finite() {
             let logits = [-1.0e30, -1.0e30, 0.0];
             let posterior = [0.0, 0.0, 1.0];
-            let expected_losses = expected_loss(self.mode, posterior);
+            let expected_losses = expected_loss(mode, posterior);
             let action = self
                 .supervisor
                 .observe_and_enforce(PolicyAction::FailClosed, &signals);
             let top_state = RiskState::IncompatibleMetadata;
             let reason = format!(
                 "mode={:?}; top_state={:?}; p=1.000000; non_finite_signals=true",
-                self.mode, top_state
+                mode, top_state
             );
 
             self.ledger.record(DecisionEvidenceEntry {
-                mode: self.mode,
+                mode,
                 signals,
                 logits,
                 posterior,
@@ -150,7 +192,7 @@ impl PolicyController {
             });
 
             return PolicyDecision {
-                mode: self.mode,
+                mode,
                 action,
                 top_state,
                 posterior,
@@ -161,13 +203,13 @@ impl PolicyController {
 
         let logits = logits_from_signals(signals);
         let posterior = softmax(logits);
-        let expected_losses = expected_loss(self.mode, posterior);
+        let expected_losses = expected_loss(mode, posterior);
         let (raw_action, action_idx) = select_action(expected_losses);
         let action = self.supervisor.observe_and_enforce(raw_action, &signals);
         let (top_state, top_state_prob) = top_risk_state(posterior);
         let mut reason = format!(
             "mode={:?}; top_state={:?}; p={top_state_prob:.6}; cond_log10={:.3}; metadata={:.3}; anomaly={:.3}",
-            self.mode,
+            mode,
             top_state,
             signals.condition_number_log10,
             signals.metadata_incompatibility_score,
@@ -178,7 +220,7 @@ impl PolicyController {
         }
 
         self.ledger.record(DecisionEvidenceEntry {
-            mode: self.mode,
+            mode,
             signals,
             logits,
             posterior,
@@ -194,7 +236,7 @@ impl PolicyController {
         );
 
         PolicyDecision {
-            mode: self.mode,
+            mode,
             action,
             top_state,
             posterior,

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-011",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-signal implements IIR/FIR design, SOS filtering, spectral analysis (welch, ShortTimeFFT, czt), Savitzky-Golay, and peak finding.",
+        "affected_functions": ["lfilter", "filtfilt", "sosfilt", "butter", "welch", "find_peaks"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-signal",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "High-order transfer-function (BA) IIR filtering suffers polynomial root sensitivity and state overflow.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9924 (sosfilt): cascades biquad second-order sections with normalized a0 and validates finite section coefficients.",
+      "test_reference": "lfilter_low_order_matches_general_path_bits",
+      "strict_mode_response": "Execute direct-form II transposed filtering matching SciPy.",
+      "hardened_mode_response": "Reject non-finite filter coefficients or signals fail-closed."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-signal",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Non-finite samples or invalid normalized cutoff frequencies (Wn <= 0 or Wn >= 1) passed to filter design or STFT/CZT.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:8029 (butter): validates filter order N >= 1 and cutoff frequencies within (0, 1) Nyquist interval.",
+      "test_reference": "short_time_fft_rejects_non_finite_samples",
+      "strict_mode_response": "Return Err(SignalError) on invalid cutoff or order matching SciPy ValueError.",
+      "hardened_mode_response": "Reject non-finite samples and invalid cutoffs fail-closed with FailClosed audit event."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-signal",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Degenerate chirp-z transform (CZT) or ZoomFFT parameters (m == 0 or non-finite spiral ratio) causing unbounded work or NaN output.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:12310 (welch): validates segment lengths, overlap bounds, and finite samples before spectral estimation.",
+      "test_reference": "czt_and_zoom_fft_reject_non_finite_samples",
+      "strict_mode_response": "Return Err(SignalError) on invalid segment/overlap or non-finite CZT parameters.",
+      "hardened_mode_response": "Reject degenerate spectral parameters fail-closed and record FailClosed in AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-signal",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Peak detection (find_peaks) prominence, width, and plateau conditions drifting from SciPy _peak_finding_utils.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:4132 (find_peaks): evaluates plateau, height, threshold, distance, prominence, and width filters in SciPy's exact order.",
+      "test_reference": "short_time_fft_matches_scipy",
+      "strict_mode_response": "Match SciPy find_peaks indices and properties dictionary.",
+      "hardened_mode_response": "Validate distance >= 1 and finite signal samples before peak scan."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "leading denominator coefficient a[0] == 0 in lfilter",
+      "policy": "reject",
+      "strict_mode_action": "Return SignalError::ZeroLeadingCoefficient.",
+      "hardened_mode_action": "Return SignalError::ZeroLeadingCoefficient and record FailClosed audit event."
+    },
+    {
+      "input_class": "cutoff frequency outside (0, 1) Nyquist range",
+      "policy": "reject",
+      "strict_mode_action": "Return SignalError::InvalidCutoff.",
+      "hardened_mode_action": "Return SignalError::InvalidCutoff and log FailClosed event."
+    },
+    {
+      "input_class": "non-finite signal or window samples",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Reject non-finite inputs in ShortTimeFFT, CZT, and audited routines.",
+      "hardened_mode_action": "Reject non-finite inputs fail-closed across signal routines."
+    },
+    {
+      "input_class": "noverlap >= nperseg in Welch/CSD spectral estimators",
+      "policy": "reject",
+      "strict_mode_action": "Return SignalError::InvalidSegmentConfig.",
+      "hardened_mode_action": "Return SignalError::InvalidSegmentConfig."
+    }
+  ]
+}

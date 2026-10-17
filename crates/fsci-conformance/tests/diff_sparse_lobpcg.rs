@@ -410,15 +410,22 @@ for case in q["cases"]:
                               retResidualNormsHistory=True)
         res = run(X)
         # SciPy's own sensitivity: the same call from a start block moved by one ulp.
-        alt = run(np.nextafter(X, np.inf))
-        lam_a, lam_b = np.asarray(res[0]), np.asarray(alt[0])
+        lam_a = np.asarray(res[0])
+        Va = np.asarray(res[1])
         scale = max(float(np.max(np.abs(lam_a))), 1e-300)
-        row["eig_sensitivity"] = float(np.max(np.abs(lam_a - lam_b)) / scale)
-        Va, Vb = np.asarray(res[1]), np.asarray(alt[1])
-        row["vec_sensitivity"] = max(
-            sine_to_span(Va[:, j], [Vb[:, i] for i in range(len(lam_b))
-                                    if abs(lam_b[i] - lam_a[j]) <= 1e-6 * scale] or [Vb[:, j]])
-            for j in range(len(lam_a)))
+        eig_sens = 0.0
+        vec_sens = 0.0
+        for target in (np.inf, -np.inf, 0.0):
+            alt = run(np.nextafter(X, target))
+            lam_b = np.asarray(alt[0])
+            Vb = np.asarray(alt[1])
+            eig_sens = max(eig_sens, float(np.max(np.abs(lam_a - lam_b)) / scale))
+            vec_sens = max(vec_sens, max(
+                sine_to_span(Va[:, j], [Vb[:, i] for i in range(len(lam_b))
+                                        if abs(lam_b[i] - lam_a[j]) <= 1e-6 * scale] or [Vb[:, j]])
+                for j in range(len(lam_a))))
+        row["eig_sensitivity"] = eig_sens
+        row["vec_sensitivity"] = vec_sens
         if len(res) == 4:
             lam, V, lh, rh = res
             used_tol = tol if (tol is not None and tol > 0) else np.sqrt(np.finfo(float).eps) * n

@@ -56,8 +56,8 @@ pub use minimize::{
     OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
     TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, dogleg, get_optimize_traces, lbfgsb,
     minimize, minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit,
-    minimize_with_casp, minimize_with_casp_portfolio, nelder_mead, newton_cg, powell,
-    select_minimize_method, trust_exact, trust_ncg,
+    minimize_with_casp, minimize_with_casp_portfolio, minimize_with_casp_portfolio_and_audit,
+    nelder_mead, newton_cg, powell, select_minimize_method, trust_exact, trust_krylov, trust_ncg,
 };
 pub use trf::LossKind;
 pub use trust_constr::{

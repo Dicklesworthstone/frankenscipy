@@ -50009,7 +50009,7 @@ pub fn kl_divergence(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
                 if qi == 0.0 {
                     return f64::INFINITY;
                 }
-                kl += pi * (pi / qi).ln();
+                kl += fsci_special::rel_entr_scalar(pi, qi);
             }
         }
         kl
@@ -50028,21 +50028,25 @@ pub fn kl_divergence(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
 }
 
 /// When `true`, [`kl_divergence`] sums its terms with the exact scalar loop (the ORIG behaviour). When
-/// `false` (default), the compute-bound `Σ pᵢ·ln(pᵢ/qᵢ)` fans across cores (chunked, 4-way-unrolled),
+/// `false` (default), the compute-bound `Σ rel_entr(pᵢ, qᵢ)` fans across cores (chunked, 4-way-unrolled),
 /// mirroring the parallel sibling `entropy`. WITHIN per-op ULP tolerance (same reordering as the
 /// shipped `entropy_h_sum`). For the same-binary A/B perf gate.
 #[doc(hidden)]
 pub static KL_DIVERGENCE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// `Σ (pₖ/Σpₖ)·ln((pₖ/Σpₖ)/(qₖ/Σqₖ))` over aligned probability vectors, fanned across cores exactly
+/// `Σ rel_entr(pₖ/Σpₖ, qₖ/Σqₖ)` over aligned probability vectors, fanned across cores exactly
 /// as [`entropy_h_sum`] (chunked, 4-way-unrolled). Within per-op ULP tolerance (parallel reorder).
 fn kl_sum(pk: &[f64], qk: &[f64], sum_p: f64, sum_q: f64) -> f64 {
     let chunk_sum = |pc: &[f64], qc: &[f64]| -> f64 {
         let term = |p: f64, q: f64| -> f64 {
             let pi = p / sum_p;
             let qi = q / sum_q;
-            if pi > 0.0 { pi * (pi / qi).ln() } else { 0.0 }
+            if pi > 0.0 {
+                fsci_special::rel_entr_scalar(pi, qi)
+            } else {
+                0.0
+            }
         };
         let mut a = [0.0f64; 4];
         let mut i = 0;
@@ -105968,6 +105972,66 @@ mod tests {
         assert!(rel_entr(f64::NAN, f64::NAN).is_nan());
         assert!(rel_entr(1.0, f64::NAN).is_nan());
         assert!(rel_entr(f64::NAN, 1.0).is_nan());
+    }
+
+    #[test]
+    fn kl_divergence_near_equal_uses_rel_entr_log1p() {
+        // frankenscipy-fn89o: when pk and qk are within ~1e-13 of each other, naive
+        // `pi * (pi / qi).ln()` loses ~11 digits of precision in `(pi / qi).ln()` near 1.0,
+        // whereas SciPy's `scipy.stats.entropy(pk, qk)` delegates to `rel_entr(pi, qi)` which
+        // evaluates `pi * ln_1p((pi - qi) / qi)` when `0.5 < pi / qi < 2.0`.
+        let delta = 3e-13_f64;
+        let pk = [
+            0.15 + delta,
+            0.35 - delta,
+            0.15 + delta,
+            0.35 - delta,
+            0.15 + delta,
+            0.35 - delta,
+            0.15 + delta,
+            0.35 - delta,
+        ];
+        let qk = [0.15, 0.35, 0.15, 0.35, 0.15, 0.35, 0.15, 0.35];
+        let sum_p: f64 = pk.iter().sum();
+        let sum_q: f64 = qk.iter().sum();
+
+        let expected: f64 = pk
+            .iter()
+            .zip(qk.iter())
+            .map(|(&p, &q)| fsci_special::rel_entr_scalar(p / sum_p, q / sum_q))
+            .sum();
+        let naive_cancelled: f64 = pk
+            .iter()
+            .zip(qk.iter())
+            .map(|(&p, &q)| {
+                let pi = p / sum_p;
+                let qi = q / sum_q;
+                pi * (pi / qi).ln()
+            })
+            .sum();
+
+        // Confirm the old naive formula suffers severe cancellation (> 1e-4 relative error).
+        let naive_rel_err = ((naive_cancelled - expected) / expected).abs();
+        assert!(
+            naive_rel_err > 1e-4,
+            "test precondition: naive p*ln(p/q) should lose precision on near-equal distributions, got rel_err={naive_rel_err:e}"
+        );
+
+        KL_DIVERGENCE_FORCE_SERIAL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let serial = kl_divergence(&pk, &qk, None);
+        KL_DIVERGENCE_FORCE_SERIAL.store(false, std::sync::atomic::Ordering::SeqCst);
+        let parallel = kl_divergence(&pk, &qk, None);
+
+        let serial_ulps = serial.to_bits().abs_diff(expected.to_bits());
+        let parallel_ulps = parallel.to_bits().abs_diff(expected.to_bits());
+        assert!(
+            serial_ulps <= 2,
+            "serial kl_divergence should match rel_entr_scalar within 2 ULPs: serial={serial:e} expected={expected:e} ulps={serial_ulps}"
+        );
+        assert!(
+            parallel_ulps <= 4,
+            "parallel/unrolled kl_divergence should match rel_entr_scalar within 4 ULPs: parallel={parallel:e} expected={expected:e} ulps={parallel_ulps}"
+        );
     }
 
     #[test]

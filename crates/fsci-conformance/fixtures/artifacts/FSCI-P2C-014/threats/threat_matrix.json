@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-014",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-interpolate implements CubicSpline, PCHIP, Akima1D, BSpline, RegularGridInterpolator, griddata, RBFInterpolator, and FITPACK wrappers.",
+        "affected_functions": ["pchip_interpolate", "akima1d_interpolate", "griddata", "interpn"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-interpolate",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Oscillatory overshoot on non-smooth 1D data when cubic splines are used instead of shape-preserving PCHIP or Akima splines.",
+      "mitigation": "Defended in crates/fsci-interpolate/src/lib.rs:998 (pchip_interpolate): computes Fritsch-Carlson monotone harmonic derivatives that prevent extrema between data knots.",
+      "test_reference": "interp1d_uniform_finder_matches_helper",
+      "strict_mode_response": "Preserve monotonicity on each subinterval matching SciPy PchipInterpolator.",
+      "hardened_mode_response": "Validate finite knots and values and emit FailClosed on violation."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-interpolate",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Non-strictly-increasing knot sequences x, duplicate abscissas, or mismatched x/y lengths passed to spline constructors.",
+      "mitigation": "Defended in crates/fsci-interpolate/src/lib.rs:1453 (akima1d_interpolate): verifies strictly increasing x, matching y length, and minimum knot count before constructing segments.",
+      "test_reference": "interp_cubic_cursor_toggle_is_bit_identical_through_public_eval_many",
+      "strict_mode_response": "Return Err(InterpolateError) on non-increasing x or shape mismatch.",
+      "hardened_mode_response": "Reject fail-closed and record AuditAction::FailClosed in AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-interpolate",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Full B-spline basis evaluation over large knot vectors wasting O(n_knots) work per query instead of compact-support O(k) evaluation.",
+      "mitigation": "Defended in crates/fsci-interpolate/src/lib.rs:4543 (interpn): restricts evaluation to the active knot span and grid cell via binary search.",
+      "test_reference": "ndbspline_compact_support_is_bit_identical_to_full_basis",
+      "strict_mode_response": "Evaluate only compactly supported basis functions matching full basis bit-for-bit.",
+      "hardened_mode_response": "Enforce grid bounds or extrapolation policy fail-closed."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-interpolate",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Scattered 2D/nD interpolation (griddata) behavior on points outside the convex hull of data sites.",
+      "mitigation": "Defended in crates/fsci-interpolate/src/lib.rs:3751 (griddata): returns fill_value (default NaN) for query points outside the Delaunay convex hull in linear/cubic modes.",
+      "test_reference": "rbf_kernel_and_distance_helpers_match_their_closed_forms",
+      "strict_mode_response": "Fill out-of-hull queries with fill_value matching SciPy griddata.",
+      "hardened_mode_response": "Validate point cloud dimension and finiteness before triangulation."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "non-increasing x coordinates or duplicate knots",
+      "policy": "reject",
+      "strict_mode_action": "Return InterpolateError::NonIncreasingX.",
+      "hardened_mode_action": "Return InterpolateError::NonIncreasingX and emit FailClosed audit event."
+    },
+    {
+      "input_class": "non-finite knot or value arrays",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Reject non-finite inputs when constructing interpolators.",
+      "hardened_mode_action": "Reject non-finite inputs and record FailClosed in AuditLedger."
+    },
+    {
+      "input_class": "out-of-bounds query when bounds_error is enabled",
+      "policy": "reject",
+      "strict_mode_action": "Return InterpolateError::OutOfBounds.",
+      "hardened_mode_action": "Return InterpolateError::OutOfBounds and log FailClosed event."
+    },
+    {
+      "input_class": "mismatched coordinate and value dimensions",
+      "policy": "reject",
+      "strict_mode_action": "Return InterpolateError::ShapeMismatch.",
+      "hardened_mode_action": "Return InterpolateError::ShapeMismatch."
+    }
+  ]
+}

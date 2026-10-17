@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-010",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-spatial implements KDTree, pdist/cdist distance metrics, Rotation/Slerp, Procrustes, and 2D/nD ConvexHull/Delaunay/Voronoi.",
+        "affected_functions": ["pdist", "cdist", "euclidean", "procrustes"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-spatial",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Degenerate or collinear point sets in Procrustes and Delaunay triangulation causing singular transformations or predicate flips.",
+      "mitigation": "Defended in crates/fsci-spatial/src/lib.rs:6615 (procrustes): checks zero-norm / degenerate point configurations and rejects or regularizes before SVD alignment.",
+      "test_reference": "delaunay_find_simplex_paths_agree_with_bruteforce",
+      "strict_mode_response": "Return SpatialError on degenerate zero-variance point sets matching SciPy.",
+      "hardened_mode_response": "Reject degenerate geometry fail-closed and record FailClosed audit event."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-spatial",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Mismatched vector dimensions, empty point clouds, or non-finite coordinates passed to euclidean / pdist / cdist.",
+      "mitigation": "Defended in crates/fsci-spatial/src/lib.rs:157 (euclidean): validates equal vector lengths and finite coordinates before computing norms.",
+      "test_reference": "kdtree_query_many_matches_per_query",
+      "strict_mode_response": "Return Err(SpatialError) on dimension mismatch.",
+      "hardened_mode_response": "Reject non-finite coordinates and dimension mismatches fail-closed."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-spatial",
+      "category": "resource_exhaustion",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "High-dimensional geometric predicate allocations in n-D hull/Delaunay exceeding safe kernel dimension limits.",
+      "mitigation": "Defended in crates/fsci-spatial/src/lib.rs:862 (pdist): guards allocation sizes and rejects oversized geometric dimensions before predicate scratch allocation.",
+      "test_reference": "oversized_geometry_returns_errors_before_predicate_allocations",
+      "strict_mode_response": "Return SpatialError when dimension exceeds supported predicate limit.",
+      "hardened_mode_response": "Reject oversized dimension before allocation and log FailClosed event."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-spatial",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Batch cdist / KDTree radius queries diverging from single-query tie-breaking and distance metrics.",
+      "mitigation": "Defended in crates/fsci-spatial/src/lib.rs:1735 (cdist): uses shared metric dispatch and verified batch kernels matching scalar reference.",
+      "test_reference": "kdtree_query_ball_point_many_matches_per_query",
+      "strict_mode_response": "Match SciPy cdist and KDTree query outputs across metrics.",
+      "hardened_mode_response": "Validate metric parameters (e.g., Minkowski p >= 1) fail-closed."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "vector dimension mismatch in distance metrics",
+      "policy": "reject",
+      "strict_mode_action": "Return SpatialError::DimensionMismatch.",
+      "hardened_mode_action": "Return SpatialError::DimensionMismatch and record FailClosed in AuditLedger."
+    },
+    {
+      "input_class": "non-finite point coordinates",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Reject non-finite KDTree and hull inputs.",
+      "hardened_mode_action": "Reject all non-finite spatial inputs and emit FailClosed audit event."
+    },
+    {
+      "input_class": "oversized geometric dimension for exact predicates",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return SpatialError before allocating predicate workspace.",
+      "hardened_mode_action": "Return SpatialError and log FailClosed event."
+    },
+    {
+      "input_class": "invalid Minkowski p-norm parameter (p <= 0)",
+      "policy": "reject",
+      "strict_mode_action": "Return SpatialError::InvalidArgument.",
+      "hardened_mode_action": "Return SpatialError::InvalidArgument."
+    }
+  ]
+}

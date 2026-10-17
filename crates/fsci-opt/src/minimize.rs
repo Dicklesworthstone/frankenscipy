@@ -184,6 +184,7 @@ where
         OptimizeMethod::NewtonCg => newton_cg(&fun, x0, options),
         OptimizeMethod::TrustExact => trust_exact(&fun, x0, options),
         OptimizeMethod::TrustNcg => trust_ncg(&fun, x0, options),
+        OptimizeMethod::TrustKrylov => trust_krylov(&fun, x0, options),
         OptimizeMethod::Dogleg => dogleg(&fun, x0, options),
         OptimizeMethod::Tnc => tnc(&fun, x0, options),
         OptimizeMethod::Slsqp => slsqp(&fun, x0, options),
@@ -214,6 +215,56 @@ pub fn minimize_with_casp_portfolio<F>(
     portfolio: &mut OptSolverPortfolio,
     is_noisy: bool,
     is_multimodal: bool,
+) -> Result<OptPortfolioResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    minimize_with_casp_portfolio_impl(fun, x0, options, portfolio, is_noisy, is_multimodal, None)
+}
+
+/// Audited variant of [`minimize_with_casp_portfolio`] (frankenscipy-dbjm3): records the
+/// portfolio's choice as an [`fsci_runtime::AuditAction::CaspDecision`] under the call's
+/// [`Fingerprinter`] digest in the portfolio's runtime mode, any bounded Nelder-Mead fallback as a
+/// [`fsci_runtime::AuditAction::BoundedRecovery`], and any returned [`OptError`] as a single
+/// [`fsci_runtime::AuditAction::FailClosed`].
+pub fn minimize_with_casp_portfolio_and_audit<F>(
+    fun: F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    portfolio: &mut OptSolverPortfolio,
+    is_noisy: bool,
+    is_multimodal: bool,
+    ledger: &crate::audit::SyncSharedAuditLedger,
+) -> Result<OptPortfolioResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let portfolio_mode = portfolio.mode();
+    let fingerprint_of =
+        || minimize_casp_audit_fingerprint(x0, &options, portfolio_mode, is_noisy, is_multimodal);
+    let audit = fsci_runtime::AuditScope::new(ledger, &fingerprint_of);
+    let result = minimize_with_casp_portfolio_impl(
+        fun,
+        x0,
+        options,
+        portfolio,
+        is_noisy,
+        is_multimodal,
+        Some(&audit),
+    );
+    audit.finish(result, |error| {
+        format!("minimize_with_casp_portfolio::{}", error.reason_code())
+    })
+}
+
+fn minimize_with_casp_portfolio_impl<F>(
+    fun: F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    portfolio: &mut OptSolverPortfolio,
+    is_noisy: bool,
+    is_multimodal: bool,
+    audit: Option<&fsci_runtime::AuditScope<'_>>,
 ) -> Result<OptPortfolioResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
@@ -338,6 +389,40 @@ where
         fallback_active: final_fallback,
         gradient_norm: None,
     });
+
+    if let Some(audit) = audit {
+        audit.record(
+            fsci_runtime::AuditAction::CaspDecision {
+                portfolio: <OptSolverPortfolio as fsci_runtime::PortfolioEvidence>::NAME
+                    .to_string(),
+                mode: portfolio.mode(),
+                action: format!("{action:?}"),
+                posterior: posterior.to_vec(),
+                expected_losses: expected_losses.to_vec(),
+                chosen_expected_loss: chosen_loss,
+                fallback: final_fallback,
+                evidence: std::collections::BTreeMap::from([
+                    (
+                        "condition_number_estimate".to_string(),
+                        cond_estimate.into(),
+                    ),
+                    ("dimension".to_string(), (x0.len() as f64).into()),
+                    ("is_noisy".to_string(), is_noisy.to_string().into()),
+                    (
+                        "is_multimodal".to_string(),
+                        is_multimodal.to_string().into(),
+                    ),
+                ]),
+            },
+            &format!("CASP selected {action:?}"),
+        );
+        if final_fallback {
+            audit.recover(
+                "casp_opt_to_nelder_mead_fallback",
+                "recovered: Nelder-Mead fallback succeeded after primary solver non-convergence",
+            );
+        }
+    }
 
     Ok(OptPortfolioResult {
         chosen_action: action,
@@ -478,7 +563,11 @@ where
 /// across processes nor unique, so only their presence is fed. It used to be a `Debug` string of
 /// `method`, `mode`, `x0`, `maxiter` and `maxfev` only, so calls differing in `tol`, `bounds`,
 /// `seed` or any other option shared a fingerprint, as did `x0`s differing only in a NaN payload.
-fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> String {
+fn feed_minimize_options(
+    fingerprinter: &mut Fingerprinter,
+    x0: &[f64],
+    options: &MinimizeOptions<'_>,
+) {
     fn optional_f64(fingerprinter: &mut Fingerprinter, value: Option<f64>) {
         fingerprinter.bool(value.is_some());
         if let Some(value) = value {
@@ -492,12 +581,11 @@ fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> Stri
         }
     }
 
-    let mut fingerprinter = Fingerprinter::new("fsci_opt::minimize");
     fingerprinter.f64s(x0).str(&format!("{:?}", options.method));
-    optional_f64(&mut fingerprinter, options.tol);
-    optional_u64(&mut fingerprinter, options.maxiter.map(|v| v as u64));
-    optional_u64(&mut fingerprinter, options.maxfev.map(|v| v as u64));
-    optional_f64(&mut fingerprinter, options.gradient_eps);
+    optional_f64(fingerprinter, options.tol);
+    optional_u64(fingerprinter, options.maxiter.map(|v| v as u64));
+    optional_u64(fingerprinter, options.maxfev.map(|v| v as u64));
+    optional_f64(fingerprinter, options.gradient_eps);
     fingerprinter
         .bool(options.callback.is_some())
         .bool(options.gradient.is_some())
@@ -507,8 +595,8 @@ fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> Stri
     if let Some(bounds) = options.bounds {
         fingerprinter.usize(bounds.len());
         for &(lower, upper) in bounds {
-            optional_f64(&mut fingerprinter, lower);
-            optional_f64(&mut fingerprinter, upper);
+            optional_f64(fingerprinter, lower);
+            optional_f64(fingerprinter, upper);
         }
     }
     fingerprinter.usize(options.constraints.len());
@@ -523,8 +611,29 @@ fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> Stri
     if let Some(fixture_id) = options.fixture_id {
         fingerprinter.str(fixture_id);
     }
-    optional_u64(&mut fingerprinter, options.seed);
+    optional_u64(fingerprinter, options.seed);
     fingerprinter.str(&format!("{:?}", options.mode));
+}
+
+fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_opt::minimize");
+    feed_minimize_options(&mut fingerprinter, x0, options);
+    fingerprinter.finish()
+}
+
+fn minimize_casp_audit_fingerprint(
+    x0: &[f64],
+    options: &MinimizeOptions<'_>,
+    portfolio_mode: RuntimeMode,
+    is_noisy: bool,
+    is_multimodal: bool,
+) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_opt::minimize_with_casp_portfolio");
+    feed_minimize_options(&mut fingerprinter, x0, options);
+    fingerprinter
+        .str(&format!("{portfolio_mode:?}"))
+        .bool(is_noisy)
+        .bool(is_multimodal);
     fingerprinter.finish()
 }
 
@@ -2042,6 +2151,38 @@ where
     )
 }
 
+/// `scipy.optimize.minimize(f, x0, method='trust-krylov')`: SciPy's trust-region driver with the
+/// GLTR / Lanczos Krylov subproblem (`TRLIBQuadraticSubproblem`), taking SciPy's iteration path.
+/// Needs `options.hess` or `options.hessp` (products use `hessp` when both are given, as in
+/// SciPy). Reads `options.method_options.inexact` (default `true`). Without `options.gradient`
+/// the gradient is forward-differenced (SciPy requires `jac`).
+pub fn trust_krylov<F>(
+    fun: &F,
+    x0: &[f64],
+    options: MinimizeOptions,
+) -> Result<OptimizeResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    check_method_options(OptimizeMethod::TrustKrylov, options)?;
+    if options.hess.is_none() && options.hessp.is_none() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "Either the Hessian or the Hessian-vector product is currently required for \
+                 trust-region methods",
+            ),
+        });
+    }
+    let inexact = options.method_options.inexact.unwrap_or(true);
+    trust_region_minimize(
+        fun,
+        x0,
+        options,
+        OptimizeMethod::TrustKrylov,
+        Subproblem::Krylov { inexact },
+    )
+}
+
 /// `scipy.optimize.minimize(f, x0, method='dogleg')`: SciPy's trust-region driver with the
 /// dogleg subproblem, taking SciPy's iteration path. Needs `options.hess`; a Hessian that is
 /// not positive definite at an iterate ends the solve with [`ConvergenceStatus::LinAlgError`]
@@ -2155,8 +2296,11 @@ where
         objective: &mut objective,
         gradient: options.gradient,
         hess: options.hess,
-        // SciPy hands `hessp` to trust-ncg only; dogleg and trust-exact use the Hessian.
-        hessp: if subproblem == Subproblem::CgSteihaug {
+        // SciPy hands `hessp` to trust-ncg and trust-krylov; dogleg and trust-exact use the Hessian.
+        hessp: if matches!(
+            subproblem,
+            Subproblem::CgSteihaug | Subproblem::Krylov { .. }
+        ) {
             options.hessp
         } else {
             None
@@ -3328,6 +3472,7 @@ fn accepted_method_options(method: OptimizeMethod) -> &'static [&'static str] {
             "sparse_jacobian",
         ],
         OptimizeMethod::Cobyla => &["rhobeg", "catol", "f_target"],
+        OptimizeMethod::TrustKrylov => &["inexact"],
         _ => &[],
     }
 }
@@ -3375,6 +3520,7 @@ fn set_method_options(options: &MinimizeMethodOptions<'_>) -> Vec<&'static str> 
         ("rhobeg", options.rhobeg.is_some()),
         ("catol", options.catol.is_some()),
         ("f_target", options.f_target.is_some()),
+        ("inexact", options.inexact.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))
@@ -4571,7 +4717,7 @@ mod tests {
 
     use super::{
         Objective, feasible_step_interval, minimize_with_casp, minimize_with_casp_portfolio,
-        powell_line_search,
+        minimize_with_casp_portfolio_and_audit, powell_line_search,
     };
     use crate::{
         Bound, Constraint, ConvergenceStatus, GradientFunc, HessFunc, HesspFunc, LinearConstraint,
@@ -7686,7 +7832,7 @@ mod tests {
             [f64; 2],
             f64,
         );
-        let cases: [Case; 4] = [
+        let cases: [Case; 6] = [
             (
                 OptimizeMethod::TrustNcg,
                 false,
@@ -7700,6 +7846,20 @@ mod tests {
                 (29, 30, 27, 82),
                 [0.9999996957772002, 0.9999993903385656],
                 9.269935987707732e-14,
+            ),
+            (
+                OptimizeMethod::TrustKrylov,
+                false,
+                (36, 37, 37, 32),
+                [0.9999303920730155, 0.9998605099754646],
+                4.853048482414378e-9,
+            ),
+            (
+                OptimizeMethod::TrustKrylov,
+                true,
+                (36, 37, 37, 86),
+                [0.9999303920730156, 0.9998605099754649],
+                4.853048482392726e-9,
             ),
             (
                 OptimizeMethod::Dogleg,
@@ -7747,9 +7907,9 @@ mod tests {
         }
     }
 
-    /// SciPy on the indefinite start: trust-ncg and trust-exact follow the negative curvature to
-    /// the minimizer near (1.0025, −0.0501, √10); dogleg's Cholesky fails at iteration 0
-    /// (status 3, "A linalg error occurred, such as a non-psd Hessian").
+    /// SciPy on the indefinite start: trust-ncg, trust-krylov and trust-exact follow the negative
+    /// curvature to the minimizer near (1.0025, −0.0501, √10); dogleg's Cholesky fails at
+    /// iteration 0 (status 3, "A linalg error occurred, such as a non-psd Hessian").
     #[test]
     fn trust_region_family_on_an_indefinite_hessian_matches_scipy() {
         let run = |method| {
@@ -7764,6 +7924,12 @@ mod tests {
         let ncg = run(OptimizeMethod::TrustNcg);
         assert!(ncg.success, "{}", ncg.message);
         assert_eq!((ncg.nit, ncg.nfev, ncg.njev, ncg.nhev), (10, 11, 9, 8));
+        let krylov = run(OptimizeMethod::TrustKrylov);
+        assert!(krylov.success, "{}", krylov.message);
+        assert_eq!(
+            (krylov.nit, krylov.nfev, krylov.njev, krylov.nhev),
+            (7, 8, 8, 6)
+        );
         let exact = run(OptimizeMethod::TrustExact);
         assert!(exact.success, "{}", exact.message);
         assert_eq!(
@@ -7775,6 +7941,11 @@ mod tests {
                 &ncg,
                 [1.0024982177076796, -0.050124205636529244, 3.162277722018637],
                 -5.252506249997705,
+            ),
+            (
+                &krylov,
+                [1.0024977430254545, -0.05012488715127273, 3.1622776603198086],
+                -5.252506249999256,
             ),
             (
                 &exact,
@@ -7805,14 +7976,18 @@ mod tests {
             gradient: Some(rosenbrock_gradient),
             ..MinimizeOptions::default()
         };
-        for method in [OptimizeMethod::TrustNcg, OptimizeMethod::Dogleg] {
+        for method in [
+            OptimizeMethod::TrustNcg,
+            OptimizeMethod::TrustKrylov,
+            OptimizeMethod::Dogleg,
+        ] {
             let outcome = minimize(rosenbrock, &[-1.2, 1.0], bare(method));
             assert!(
                 matches!(outcome, Err(OptError::InvalidArgument { .. })),
                 "{method:?} without a Hessian must be refused, got {outcome:?}"
             );
         }
-        // hessp is enough for trust-ncg, not for dogleg (SciPy passes it to trust-ncg only).
+        // hessp is enough for trust-ncg and trust-krylov, not for dogleg.
         let with_hessp = |method| MinimizeOptions {
             hessp: Some(rosenbrock_hessp),
             ..bare(method)
@@ -7822,6 +7997,14 @@ mod tests {
                 rosenbrock,
                 &[-1.2, 1.0],
                 with_hessp(OptimizeMethod::TrustNcg)
+            )
+            .is_ok()
+        );
+        assert!(
+            minimize(
+                rosenbrock,
+                &[-1.2, 1.0],
+                with_hessp(OptimizeMethod::TrustKrylov)
             )
             .is_ok()
         );
@@ -8459,6 +8642,90 @@ mod tests {
             "x = {:?}",
             res.result.x
         );
+    }
+
+    #[test]
+    fn minimize_with_casp_portfolio_and_audit_records_casp_decision_in_its_mode() {
+        use fsci_runtime::PortfolioEvidence;
+
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let ledger = crate::audit::sync_audit_ledger();
+            let mut portfolio = OptSolverPortfolio::new(mode, 4);
+            let options = MinimizeOptions {
+                mode,
+                ..MinimizeOptions::default()
+            };
+            let res = minimize_with_casp_portfolio_and_audit(
+                convex_bowl,
+                &[1.0, 1.0],
+                options,
+                &mut portfolio,
+                false,
+                false,
+                &ledger,
+            )
+            .expect("audited portfolio minimize");
+
+            let recorded = portfolio.evidence().back().expect("evidence").clone();
+            let guard = ledger.lock().expect("ledger");
+            let decisions: Vec<_> = guard
+                .entries()
+                .iter()
+                .filter_map(|event| match &event.action {
+                    fsci_runtime::AuditAction::CaspDecision {
+                        portfolio,
+                        mode,
+                        action,
+                        posterior,
+                        expected_losses,
+                        chosen_expected_loss,
+                        fallback,
+                        ..
+                    } => Some((
+                        portfolio.clone(),
+                        *mode,
+                        action.clone(),
+                        posterior.clone(),
+                        expected_losses.clone(),
+                        *chosen_expected_loss,
+                        *fallback,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "expected exactly 1 CaspDecision in {mode:?}"
+            );
+            let (p_name, ev_mode, ev_action, ev_posterior, ev_losses, ev_chosen_loss, ev_fallback) =
+                &decisions[0];
+            assert_eq!(p_name, "opt");
+            assert_eq!(*ev_mode, mode);
+            assert_eq!(*ev_action, format!("{:?}", recorded.chosen_action));
+            assert_eq!(*ev_action, format!("{:?}", res.chosen_action));
+            assert_eq!(
+                ev_posterior.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .posterior
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_losses.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .expected_losses
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_chosen_loss.to_bits(),
+                recorded.chosen_expected_loss.to_bits()
+            );
+            assert_eq!(*ev_fallback, recorded.fallback_active);
+        }
     }
 
     /// frankenscipy-szq1n.9: bounded L-BFGS-B built its step from the full gradient and

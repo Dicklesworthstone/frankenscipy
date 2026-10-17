@@ -1,7 +1,8 @@
-//! Trust-region Newton minimization: SciPy's `_minimize_trust_region` driver with its three
-//! subproblem solvers — CG-Steihaug (`trust-ncg`), dogleg, and the nearly-exact iterative
-//! solver of Moré & Sorensen / Conn, Gould & Toint (`trust-exact`) — transcribed from
-//! `scipy/optimize/_trustregion{,_ncg,_dogleg,_exact}.py` (SciPy 1.17.1).
+//! Trust-region Newton minimization: SciPy's `_minimize_trust_region` driver with its four
+//! subproblem solvers — CG-Steihaug (`trust-ncg`), dogleg, the nearly-exact iterative
+//! solver of Moré & Sorensen / Conn, Gould & Toint (`trust-exact`), and the Krylov / GLTR
+//! Lanczos tridiagonal solver of Gould, Lucidi, Roma & Toint (`trust-krylov`) — transcribed from
+//! `scipy/optimize/_trustregion{,_ncg,_dogleg,_exact,_krylov}.py` (SciPy 1.17.1).
 //!
 //! std-only: derivatives are reached through [`TrustObjective`]; matrices are dense row-major.
 
@@ -29,6 +30,10 @@ pub(crate) enum Subproblem {
     /// `maxiter` bounds the λ iterations per subproblem (SciPy `subproblem_maxiter`, default 25).
     Exact {
         maxiter: usize,
+    },
+    /// GLTR / Lanczos Krylov trust-region subproblem (`trust-krylov`, `TRLIBQuadraticSubproblem`).
+    Krylov {
+        inexact: bool,
     },
 }
 
@@ -84,6 +89,15 @@ struct ExactState {
     lambda_lb: f64,
 }
 
+/// Cached Lanczos basis and tridiagonal entries `(Q_m, δ_{0..m}, η_{1..m})` built across calls to
+/// `TRLIBQuadraticSubproblem.solve` at a single iterate (`hotstart` when `trust_radius` shrinks).
+#[derive(Default)]
+struct KrylovState {
+    q_basis: Vec<Vec<f64>>,
+    deltas: Vec<f64>,
+    etas: Vec<f64>,
+}
+
 /// SciPy's `BaseQuadraticSubproblem`: the quadratic model at one iterate, whose values are
 /// evaluated on demand and then kept.
 struct Model {
@@ -95,6 +109,7 @@ struct Model {
     cauchy_point: Option<Vec<f64>>,
     newton_point: Option<Vec<f64>>,
     exact: Option<ExactState>,
+    krylov: Option<KrylovState>,
 }
 
 impl Model {
@@ -112,6 +127,7 @@ impl Model {
             cauchy_point: None,
             newton_point: None,
             exact: None,
+            krylov: None,
         };
         // `IterativeSubproblem.__init__` reads the Hessian at once (its Gershgorin bounds and
         // norms), so trust-exact evaluates it at every proposed point, accepted or not.
@@ -132,6 +148,12 @@ impl Model {
                 previous_tr_radius: -1.0,
                 lambda_lb: 0.0,
             });
+        } else if matches!(subproblem, Subproblem::Krylov { .. }) {
+            // `TRLIBQuadraticSubproblem.__init__` calls `TrlibQuadraticSubproblem.__init__`, which
+            // accesses `self.jac` immediately (even on rejected trial points), so `njev` matches
+            // SciPy when we evaluate `jac` up front here.
+            let _ = model.jac(obj)?;
+            model.krylov = Some(KrylovState::default());
         }
         Ok(model)
     }
@@ -195,6 +217,7 @@ impl Model {
             Subproblem::CgSteihaug => Ok(self.solve_cg_steihaug(obj, trust_radius)?),
             Subproblem::Dogleg => self.solve_dogleg(obj, trust_radius),
             Subproblem::Exact { maxiter } => Ok(self.solve_exact(obj, trust_radius, maxiter)?),
+            Subproblem::Krylov { inexact } => Ok(self.solve_krylov(obj, trust_radius, inexact)?),
         }
     }
 
@@ -443,6 +466,125 @@ impl Model {
         }
         Ok((p, hits_boundary))
     }
+
+    /// Gould, Lucidi, Roma & Toint (GLTR) Lanczos trust-region subproblem solver
+    /// (`scipy/optimize/_trustregion_krylov.py`, `TRLIBQuadraticSubproblem.solve`).
+    ///
+    /// Builds the orthonormal Lanczos basis `Q_m = [q_0, ..., q_{m-1}]` with `q_0 = g / ‖g‖₂`
+    /// and symmetric tridiagonal `T_m = Q_mᵀ H Q_m` (`deltas` on the diagonal, `etas` on the
+    /// sub/superdiagonal), solving `min_{‖h‖₂ ≤ Δ} ½ hᵀ T_m h + ‖g‖₂ e₁ᵀ h` at each step until
+    /// the residual `|η_m h_{m-1}|` satisfies the interior (`tol_rel_i`) or boundary (`tol_rel_b`)
+    /// convergence rule of `trlib_krylov_min`. Caches `(Q_m, deltas, etas)` on `self.krylov` so
+    /// a shrunk `trust_radius` after a rejected trial step hotstarts on `T_m` without extra
+    /// Hessian-vector products.
+    fn solve_krylov<O: TrustObjective>(
+        &mut self,
+        obj: &mut O,
+        tr_radius: f64,
+        inexact: bool,
+    ) -> Result<(Vec<f64>, bool), O::Error> {
+        let n = self.x.len();
+        let g = self.jac(obj)?.to_vec();
+        let g_norm = norm2(&g);
+        if g_norm == 0.0 {
+            return Ok((vec![0.0; n], false));
+        }
+
+        // `trlib_krylov_min` relative tolerance rules:
+        // - `inexact = true`: `tol_rel_i = -2` ⇒ min(0.5, ‖g‖), `tol_rel_b = -3` ⇒ max(min(0.5, ‖g‖), min(0.5, √‖g‖))
+        // - `inexact = false`: `tol_rel_i = 1e-8`, `tol_rel_b = 1e-6`
+        let (tol_i, tol_b) = if inexact {
+            let ti = g_norm * 0.5_f64.min(g_norm);
+            let tb = g_norm * 0.5_f64.min(g_norm).max(0.5_f64.min(g_norm.sqrt()));
+            (ti, tb)
+        } else {
+            (1.0e-8 * g_norm, 1.0e-6 * g_norm)
+        };
+
+        let mut state = self.krylov.take().unwrap_or_default();
+        let max_lanczos = (2 * n).max(1);
+        let mut h_tridiag = Vec::new();
+        let mut hits_boundary = false;
+
+        if !state.deltas.is_empty() {
+            // Hotstart on cached Lanczos basis from the previous solve at this iterate.
+            let m = state.deltas.len();
+            let (h, boundary) =
+                solve_tridiag_tr(&state.deltas, &state.etas[..m - 1], g_norm, tr_radius);
+            let eta_last = *state.etas.last().unwrap_or(&0.0);
+            let res = (eta_last * h[m - 1]).abs();
+            let tol = if boundary { tol_b } else { tol_i };
+            h_tridiag = h;
+            hits_boundary = boundary;
+            if res <= tol || eta_last <= 1.0e-15 * g_norm || m >= max_lanczos {
+                let mut p = vec![0.0; n];
+                for (qj, &hj) in state.q_basis.iter().zip(&h_tridiag) {
+                    for i in 0..n {
+                        p[i] += hj * qj[i];
+                    }
+                }
+                self.krylov = Some(state);
+                return Ok((p, hits_boundary));
+            }
+        } else {
+            let q0: Vec<f64> = g.iter().map(|&gi| gi / g_norm).collect();
+            state.q_basis.push(q0);
+        }
+
+        while state.deltas.len() < max_lanczos {
+            let k = state.deltas.len();
+            // If returning from a hotstart where `q_{k}` was not yet pushed, push it first.
+            if state.q_basis.len() <= k {
+                break;
+            }
+            let qk = state.q_basis[k].clone();
+            let hq = self.hessp(obj, &qk)?;
+            let delta_k = dot(&qk, &hq);
+            state.deltas.push(delta_k);
+
+            let mut w: Vec<f64> = hq
+                .iter()
+                .zip(&qk)
+                .map(|(&hqi, &qki)| hqi - delta_k * qki)
+                .collect();
+            if k > 0 {
+                let eta_prev = state.etas[k - 1];
+                let q_prev = &state.q_basis[k - 1];
+                for i in 0..n {
+                    w[i] -= eta_prev * q_prev[i];
+                }
+            }
+            let eta_next = norm2(&w);
+            state.etas.push(eta_next);
+
+            let m = state.deltas.len();
+            let (h, boundary) =
+                solve_tridiag_tr(&state.deltas, &state.etas[..m - 1], g_norm, tr_radius);
+            let res = eta_next * h[m - 1].abs();
+            let tol = if boundary { tol_b } else { tol_i };
+            h_tridiag = h;
+            hits_boundary = boundary;
+
+            if res <= tol || eta_next <= 1.0e-15 * g_norm || m >= max_lanczos {
+                if eta_next > 1.0e-15 * g_norm && state.q_basis.len() == m {
+                    let q_next: Vec<f64> = w.iter().map(|&wi| wi / eta_next).collect();
+                    state.q_basis.push(q_next);
+                }
+                break;
+            }
+            let q_next: Vec<f64> = w.iter().map(|&wi| wi / eta_next).collect();
+            state.q_basis.push(q_next);
+        }
+
+        let mut p = vec![0.0; n];
+        for (qj, &hj) in state.q_basis.iter().zip(&h_tridiag) {
+            for i in 0..n {
+                p[i] += hj * qj[i];
+            }
+        }
+        self.krylov = Some(state);
+        Ok((p, hits_boundary))
+    }
 }
 
 const EXACT_UPDATE_COEFF: f64 = 0.01;
@@ -689,6 +831,221 @@ fn singular_leading_submatrix(a: &[f64], u: &[f64], n: usize, k: usize) -> (f64,
     (delta, v)
 }
 
+/// Solve the `m × m` symmetric tridiagonal trust-region subproblem
+/// `min_{‖h‖₂ ≤ Δ} ½ hᵀ T_m h + ‖g‖₂ e₁ᵀ h` (`trlib_tri_factor_min`) via symmetric tridiagonal
+/// eigendecomposition and Moré–Sorensen rational secular iteration on `‖h(λ)‖₂ = Δ`.
+fn solve_tridiag_tr(deltas: &[f64], etas: &[f64], g_norm: f64, tr_radius: f64) -> (Vec<f64>, bool) {
+    let m = deltas.len();
+    if m == 0 || g_norm == 0.0 {
+        return (vec![0.0; m], false);
+    }
+    if m == 1 {
+        let d0 = deltas[0];
+        if d0 > 0.0 && g_norm / d0 <= tr_radius {
+            return (vec![-g_norm / d0], false);
+        }
+        return (vec![-tr_radius], true);
+    }
+
+    let (evals, evecs) = sym_tridiag_eigh(deltas, etas);
+    let min_ev = evals[0];
+    // c_i = -g_norm * (e_1^T v_i) = -g_norm * V[0, i]
+    let c: Vec<f64> = (0..m).map(|i| -g_norm * evecs[i]).collect();
+
+    if min_ev > 0.0 {
+        let norm_sq: f64 = c
+            .iter()
+            .zip(&evals)
+            .map(|(&ci, &ev)| (ci / ev).powi(2))
+            .sum();
+        if norm_sq.sqrt() <= tr_radius {
+            let mut h = vec![0.0; m];
+            for row in 0..m {
+                let mut sum = 0.0;
+                for col in 0..m {
+                    sum += evecs[row * m + col] * (c[col] / evals[col]);
+                }
+                h[row] = sum;
+            }
+            return (h, false);
+        }
+    }
+
+    let lambda_min = (-min_ev).max(0.0);
+    let hard_tol = 1.0e-14 * evals.iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+    let mut non_hard_norm_sq = 0.0;
+    for i in 0..m {
+        if evals[i] - min_ev > hard_tol {
+            non_hard_norm_sq += (c[i] / (evals[i] + lambda_min)).powi(2);
+        } else if c[i].abs() > hard_tol * g_norm {
+            non_hard_norm_sq = f64::INFINITY;
+            break;
+        }
+    }
+
+    if min_ev <= 0.0 && non_hard_norm_sq <= tr_radius * tr_radius {
+        let tau = (tr_radius * tr_radius - non_hard_norm_sq).max(0.0).sqrt();
+        let mut h = vec![0.0; m];
+        for row in 0..m {
+            let mut sum = tau * evecs[row * m];
+            for col in 0..m {
+                if evals[col] - min_ev > hard_tol {
+                    sum += evecs[row * m + col] * (c[col] / (evals[col] + lambda_min));
+                }
+            }
+            h[row] = sum;
+        }
+        return (h, true);
+    }
+
+    // Standard boundary case: solve secular equation φ(λ) = 1 / ‖h(λ)‖₂ - 1 / Δ = 0 for λ > lambda_min.
+    let c_norm = norm2(&c);
+    let mut lam_lb = lambda_min;
+    for i in 0..m {
+        if c[i].abs() > 0.0 {
+            lam_lb = lam_lb.max(c[i].abs() / tr_radius - evals[i]);
+        }
+    }
+    let mut lam_ub = lambda_min + (c_norm / tr_radius).max(1.0e-12);
+    let mut lam = (0.5 * (lam_lb + lam_ub)).max(lam_lb + 1.0e-15 * (1.0 + lam_lb.abs()));
+
+    for _ in 0..100 {
+        let mut norm_sq = 0.0;
+        let mut deriv_sum = 0.0;
+        for i in 0..m {
+            let denom = (evals[i] + lam).max(1.0e-300);
+            let term = c[i] / denom;
+            norm_sq += term * term;
+            deriv_sum += term * term / denom;
+        }
+        let p_norm = norm_sq.sqrt();
+        if (p_norm - tr_radius).abs() <= 1.0e-14 * tr_radius {
+            break;
+        }
+        if p_norm > tr_radius {
+            lam_lb = lam_lb.max(lam);
+        } else {
+            lam_ub = lam_ub.min(lam);
+        }
+        let dlam = if deriv_sum > 0.0 {
+            (norm_sq / deriv_sum) * (p_norm - tr_radius) / tr_radius
+        } else {
+            0.5 * (lam_ub - lam_lb)
+        };
+        let mut lam_new = lam + dlam;
+        if !(lam_new > lam_lb && lam_new < lam_ub) {
+            lam_new = 0.5 * (lam_lb + lam_ub);
+        }
+        if (lam_new - lam).abs() <= 1.0e-15 * (1.0 + lam.abs()) {
+            lam = lam_new;
+            break;
+        }
+        lam = lam_new;
+    }
+
+    let mut h = vec![0.0; m];
+    for row in 0..m {
+        let mut sum = 0.0;
+        for col in 0..m {
+            let denom = (evals[col] + lam).max(1.0e-300);
+            sum += evecs[row * m + col] * (c[col] / denom);
+        }
+        h[row] = sum;
+    }
+    (h, true)
+}
+
+/// Implicitly shifted symmetric tridiagonal QR (`steqr` / Golub & Van Loan §8.3) returning
+/// eigenvalues in ascending order and row-major eigenvectors `V` (`m × m`, column `j` is the
+/// `j`-th eigenvector).
+fn sym_tridiag_eigh(deltas: &[f64], etas: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let m = deltas.len();
+    let mut d = deltas.to_vec();
+    let mut e = vec![0.0; m];
+    e[..m - 1].copy_from_slice(&etas[..m - 1]);
+    let mut z = vec![0.0; m * m];
+    for i in 0..m {
+        z[i * m + i] = 1.0;
+    }
+
+    for l in 0..m {
+        let mut iter = 0_usize;
+        loop {
+            let mut split = m - 1;
+            for idx in l..m - 1 {
+                let dd = d[idx].abs() + d[idx + 1].abs();
+                if e[idx].abs() <= f64::EPSILON * dd {
+                    e[idx] = 0.0;
+                    split = idx;
+                    break;
+                }
+            }
+            if split == l {
+                break;
+            }
+            iter += 1;
+            if iter > 30 * m {
+                break;
+            }
+            let mut g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+            let mut r = g.hypot(1.0);
+            g = d[split] - d[l] + e[l] / (g + r.copysign(g));
+            let mut s = 1.0;
+            let mut c = 1.0;
+            let mut p = 0.0;
+            let mut underflow = false;
+            for i in (l..split).rev() {
+                let f = s * e[i];
+                let b = c * e[i];
+                r = f.hypot(g);
+                e[i + 1] = r;
+                if r == 0.0 {
+                    d[i + 1] -= p;
+                    e[split] = 0.0;
+                    underflow = true;
+                    break;
+                }
+                s = f / r;
+                c = g / r;
+                g = d[i + 1] - p;
+                r = (d[i] - g) * s + 2.0 * c * b;
+                p = s * r;
+                d[i + 1] = g + p;
+                g = c * r - b;
+                for row in 0..m {
+                    let z_next = z[row * m + i + 1];
+                    let z_curr = z[row * m + i];
+                    z[row * m + i + 1] = s * z_curr + c * z_next;
+                    z[row * m + i] = c * z_curr - s * z_next;
+                }
+            }
+            if !underflow {
+                d[l] -= p;
+                e[l] = g;
+                e[split] = 0.0;
+            }
+        }
+    }
+
+    for i in 0..m - 1 {
+        let mut k = i;
+        let mut p = d[i];
+        for (j, &dj) in d.iter().enumerate().take(m).skip(i + 1) {
+            if dj < p {
+                k = j;
+                p = dj;
+            }
+        }
+        if k != i {
+            d.swap(i, k);
+            for row in 0..m {
+                z.swap(row * m + i, row * m + k);
+            }
+        }
+    }
+    (d, z)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,5 +1233,77 @@ mod tests {
         let r0 = 4.0 * v[0] + 2.0 * v[1];
         let r1 = 2.0 * v[0] + (0.5 + delta) * v[1];
         assert_eq!((r0, r1), (0.0, 0.0));
+    }
+
+    #[test]
+    fn krylov_subproblem_matches_trlib_and_hotstarts_without_extra_hessp() {
+        // 1. Indefinite 3×3: H = diag(−2, 1, 3), g = (1, 1, 1), Δ = 1.0.
+        // With `inexact = true`, Lanczos stops at m = 2 (T_2 = [[2/3, √38/3], [√38/3, 10/57]])
+        // because |η₂ h₁| = (6√57/19)·0.5639123373 = 1.34469 ≤ tol_b = √3 · 0.5 · √3 = 1.5,
+        // returning p = h₀ q₀ + h₁ q₁ = (−0.8993176951067285, −0.4239806304053968,
+        // −0.1070892539378423), hits_boundary = true, in 2 hessp calls.
+        let h = vec![-2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0];
+        let mut obj = Quadratic {
+            a: h.clone(),
+            b: vec![-1.0, -1.0, -1.0],
+            n: 3,
+            with_hessp: true,
+            hessp_calls: 0,
+        };
+        let mut model =
+            Model::new(vec![0.0; 3], Subproblem::Krylov { inexact: true }, &mut obj).unwrap();
+        let (p, hits) = model.solve_krylov(&mut obj, 1.0, true).unwrap();
+        assert!(hits);
+        let trlib_m2_ref = [
+            -0.8993176951067285,
+            -0.4239806304053968,
+            -0.1070892539378423,
+        ];
+        for (ours, theirs) in p.iter().zip(trlib_m2_ref) {
+            assert!(
+                (ours - theirs).abs() < 1e-13,
+                "p = {p:?} vs {trlib_m2_ref:?}"
+            );
+        }
+        assert_eq!(obj.hessp_calls, 2);
+
+        // 2. Hotstart with shrunk Δ = 0.5 on the same Model: solves on the cached T_2 with
+        // zero additional Hessian-vector products (hessp_calls stays 2).
+        let (p_shrunk, hits_shrunk) = model.solve_krylov(&mut obj, 0.5, true).unwrap();
+        assert!(hits_shrunk);
+        assert!((norm2(&p_shrunk) - 0.5).abs() < 1e-13);
+        assert_eq!(obj.hessp_calls, 2);
+
+        // 3. With `inexact = false` (`tol_rel_b = 1e-6`), Lanczos expands to full m = 3 and
+        // recovers the exact Moré–Sorensen global minimizer −(H + λ*I)⁻¹g.
+        let mut obj_exact = Quadratic {
+            a: h,
+            b: vec![-1.0, -1.0, -1.0],
+            n: 3,
+            with_hessp: true,
+            hessp_calls: 0,
+        };
+        let mut model_exact = Model::new(
+            vec![0.0; 3],
+            Subproblem::Krylov { inexact: false },
+            &mut obj_exact,
+        )
+        .unwrap();
+        let (p_exact, hits_exact) = model_exact
+            .solve_krylov(&mut obj_exact, 1.0, false)
+            .unwrap();
+        assert!(hits_exact);
+        let trlib_m3_ref = [
+            -0.9547825325445018,
+            -0.24707470237128842,
+            -0.16536144349892257,
+        ];
+        for (ours, theirs) in p_exact.iter().zip(trlib_m3_ref) {
+            assert!(
+                (ours - theirs).abs() < 1e-13,
+                "p_exact = {p_exact:?} vs {trlib_m3_ref:?}"
+            );
+        }
+        assert_eq!(obj_exact.hessp_calls, 3);
     }
 }

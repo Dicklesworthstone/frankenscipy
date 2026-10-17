@@ -566,12 +566,9 @@ fn write_sidecar_and_decode(
         timestamp: now_str(),
     });
 
-    let decode = DecodeProofArtifact {
-        ts_unix_ms: now_unix_ms(),
-        reason: "no recovery required; artifact remained intact".to_string(),
-        recovered_blocks: 0,
-        proof_hash: hash(&source_bytes).to_hex().to_string(),
-    };
+    let decode: DecodeProofArtifact =
+        fsci_conformance::generate_decode_proof_artifact(&source_bytes, &sidecar)
+            .expect("decode proof should recover from simulated corruption");
     let decode_name = format!("{stem}.decode_proof.json");
     let decode_path = evidence_dir.join(&decode_name);
     let decode_compact = serde_json::to_string(&decode).expect("decode proof should serialize");
@@ -646,14 +643,6 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_secs()
-}
-
-fn now_unix_ms() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_millis()
 }
 
 fn emit_artifact_marker(name: &str, compact_json: &str) {

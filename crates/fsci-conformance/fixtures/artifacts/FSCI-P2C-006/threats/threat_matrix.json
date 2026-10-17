@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-006",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "Special functions use reflection, continued fractions, and hypergeometric branch selection with Strict/Hardened mode guards.",
+        "affected_functions": ["gamma", "gammaln", "erf", "erfc", "jv", "yv", "airy"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-special",
+      "category": "numerical_instability",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Evaluation of Gamma and Bessel functions near negative-integer poles or transition bands causes catastrophic cancellation.",
+      "mitigation": "Defended in crates/fsci-special/src/gamma.rs:165 (gamma): handles non-positive integer poles explicitly and uses reflection + Lanczos approximation across domains.",
+      "test_reference": "airy_positive_x_transition_band_matches_scipy",
+      "strict_mode_response": "Return IEEE NaN/Inf at poles matching SciPy cephes/xsf.",
+      "hardened_mode_response": "Return pole error or bounded value and record audit event when audited entry point is called."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-special",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Out-of-domain parameters (e.g., negative degrees of freedom or probabilities outside [0, 1]) passed to special function inverses.",
+      "mitigation": "Defended in crates/fsci-special/src/audit.rs:72 (record_fail_closed): validates domain bounds and records AuditAction::FailClosed on domain error.",
+      "test_reference": "FSCI-P2C-006_special_core.json::diff_multigammaln_invalid_dimension",
+      "strict_mode_response": "Return NaN or SpecialError::DomainError matching SciPy.",
+      "hardened_mode_response": "Reject out-of-domain inputs fail-closed and emit FailClosed audit entry."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-special",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Slow series convergence near unit circle |z| = 1 in hypergeometric functions 1F1 and 2F1.",
+      "mitigation": "Defended in crates/fsci-special/src/gamma.rs:196 (gammaln): switches to asymptotic expansions and transformation formulas with bounded series term budgets.",
+      "test_reference": "airy_complex_central_sector_matches_scipy",
+      "strict_mode_response": "Select transformation branch and cap series terms at fixed iteration budget.",
+      "hardened_mode_response": "Same bounded iteration cap with CASP branch selection audit trail."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-special",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Complementary error function erfc underflow/overflow drift for large positive or negative arguments.",
+      "mitigation": "Defended in crates/fsci-special/src/error.rs:135 (erfc): uses rational Chebyshev approximations and scaled erfcx tail asymptotic expansion.",
+      "test_reference": "airy_metamorphic_wronskian_identity",
+      "strict_mode_response": "Match SciPy tail scaling to subnormal floor.",
+      "hardened_mode_response": "Preserve exact tail scaling and guard non-finite inputs."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "non-positive integer pole in gamma",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return NaN matching SciPy special.gamma.",
+      "hardened_mode_action": "Return SpecialError::PoleError and emit FailClosed audit event."
+    },
+    {
+      "input_class": "non-finite input arguments",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Propagate IEEE NaN/Inf per SciPy ufunc rules.",
+      "hardened_mode_action": "Reject non-finite arguments in Hardened mode with SpecialError::NonFiniteInput."
+    },
+    {
+      "input_class": "out-of-domain parameters",
+      "policy": "reject",
+      "strict_mode_action": "Return DomainError or NaN per routine contract.",
+      "hardened_mode_action": "Return SpecialError::DomainError and log FailClosed event."
+    },
+    {
+      "input_class": "series non-convergence within term budget",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Return best partial sum or ConvergenceError.",
+      "hardened_mode_action": "Fail closed with SpecialError::ConvergenceError."
+    }
+  ]
+}

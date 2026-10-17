@@ -230,8 +230,7 @@ fn validate_events_with_audit(
 /// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`,
 /// `mode` (`Debug`) and `jac` (presence flag only). The right-hand side, the event functions and
 /// the Jacobian are code, not data, and are not part of it.
-fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
-    let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp");
+fn feed_solve_ivp_options(fingerprinter: &mut Fingerprinter, options: &SolveIvpOptions<'_>) {
     fingerprinter
         .f64(options.t_span.0)
         .f64(options.t_span.1)
@@ -256,12 +255,32 @@ fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
         }
     }
     fingerprinter.f64(options.rtol);
-    fingerprint_tolerance(&mut fingerprinter, &options.atol);
-    fingerprint_optional_f64(&mut fingerprinter, options.first_step);
+    fingerprint_tolerance(fingerprinter, &options.atol);
+    fingerprint_optional_f64(fingerprinter, options.first_step);
     fingerprinter
         .f64(options.max_step)
         .str(&format!("{:?}", options.mode))
         .bool(options.jac.is_some());
+}
+
+fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp");
+    feed_solve_ivp_options(&mut fingerprinter, options);
+    fingerprinter.finish()
+}
+
+fn solve_ivp_casp_fingerprint(
+    options: &SolveIvpOptions<'_>,
+    portfolio_mode: RuntimeMode,
+    stiffness_ratio_estimate: f64,
+    is_algebraic_dae: bool,
+) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp_with_casp_portfolio");
+    feed_solve_ivp_options(&mut fingerprinter, options);
+    fingerprinter
+        .str(&format!("{portfolio_mode:?}"))
+        .f64(stiffness_ratio_estimate)
+        .bool(is_algebraic_dae);
     fingerprinter.finish()
 }
 
@@ -1230,6 +1249,63 @@ pub fn solve_ivp_with_casp_portfolio<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
+    solve_ivp_with_casp_portfolio_impl(
+        fun,
+        options,
+        portfolio,
+        stiffness_ratio_estimate,
+        is_algebraic_dae,
+        None,
+    )
+}
+
+/// Audited variant of [`solve_ivp_with_casp_portfolio`] (frankenscipy-dbjm3): records the
+/// portfolio's choice as an [`fsci_runtime::AuditAction::CaspDecision`] under the call's
+/// [`Fingerprinter`] digest in the portfolio's runtime mode, and any returned
+/// [`IntegrateValidationError`] as a single [`fsci_runtime::AuditAction::FailClosed`].
+pub fn solve_ivp_with_casp_portfolio_and_audit<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    portfolio: &mut OdeSolverPortfolio,
+    stiffness_ratio_estimate: f64,
+    is_algebraic_dae: bool,
+    audit_ledger: &SyncSharedAuditLedger,
+) -> Result<OdePortfolioResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    let portfolio_mode = portfolio.mode();
+    let fingerprint_of = || {
+        solve_ivp_casp_fingerprint(
+            options,
+            portfolio_mode,
+            stiffness_ratio_estimate,
+            is_algebraic_dae,
+        )
+    };
+    let audit = AuditScope::new(audit_ledger, &fingerprint_of);
+    let result = solve_ivp_with_casp_portfolio_impl(
+        fun,
+        options,
+        portfolio,
+        stiffness_ratio_estimate,
+        is_algebraic_dae,
+        Some(&audit),
+    );
+    audit.finish(result, IntegrateValidationError::reason_code)
+}
+
+fn solve_ivp_with_casp_portfolio_impl<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    portfolio: &mut OdeSolverPortfolio,
+    stiffness_ratio_estimate: f64,
+    is_algebraic_dae: bool,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<OdePortfolioResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
     let (action, posterior, expected_losses, chosen_loss) =
         portfolio.select_action(stiffness_ratio_estimate, is_algebraic_dae);
 
@@ -1237,7 +1313,7 @@ where
     let mut resolved_opts = options.clone();
     resolved_opts.method = method;
 
-    let res = solve_ivp(fun, &resolved_opts)?;
+    let res = solve_ivp_impl(fun, &resolved_opts, audit)?;
     let fallback_active = portfolio.calibrator().should_fallback();
 
     portfolio.observe_step(res.success);
@@ -1252,6 +1328,33 @@ where
         fallback_active,
         step_rejections: if res.success { Some(0) } else { Some(1) },
     });
+
+    if let Some(audit) = audit {
+        audit.record(
+            fsci_runtime::AuditAction::CaspDecision {
+                portfolio: <OdeSolverPortfolio as fsci_runtime::PortfolioEvidence>::NAME
+                    .to_string(),
+                mode: portfolio.mode(),
+                action: format!("{action:?}"),
+                posterior: posterior.to_vec(),
+                expected_losses: expected_losses.to_vec(),
+                chosen_expected_loss: chosen_loss,
+                fallback: fallback_active,
+                evidence: std::collections::BTreeMap::from([
+                    (
+                        "stiffness_ratio_estimate".to_string(),
+                        stiffness_ratio_estimate.into(),
+                    ),
+                    ("system_dim".to_string(), (options.y0.len() as f64).into()),
+                    (
+                        "is_algebraic_dae".to_string(),
+                        is_algebraic_dae.to_string().into(),
+                    ),
+                ]),
+            },
+            &format!("CASP selected {action:?}"),
+        );
+    }
 
     Ok(OdePortfolioResult {
         chosen_action: action,
@@ -3328,5 +3431,91 @@ mod tests {
         assert_eq!(res.chosen_action, OdeSolverAction::RK45);
         assert!(res.result.success);
         assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn solve_ivp_with_casp_portfolio_and_audit_records_casp_decision_in_its_mode() {
+        use fsci_runtime::PortfolioEvidence;
+
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let ledger = crate::validation::sync_audit_ledger();
+            let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+            let opts = SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &[1.0, 0.0],
+                mode,
+                ..SolveIvpOptions::default()
+            };
+            let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+            let res = solve_ivp_with_casp_portfolio_and_audit(
+                &mut f,
+                &opts,
+                &mut portfolio,
+                1.0,
+                false,
+                &ledger,
+            )
+            .expect("audited solve_ivp portfolio");
+
+            let recorded = portfolio.evidence().back().expect("evidence").clone();
+            let guard = ledger.lock().expect("ledger");
+            let decisions: Vec<_> = guard
+                .entries()
+                .iter()
+                .filter_map(|event| match &event.action {
+                    fsci_runtime::AuditAction::CaspDecision {
+                        portfolio,
+                        mode,
+                        action,
+                        posterior,
+                        expected_losses,
+                        chosen_expected_loss,
+                        fallback,
+                        ..
+                    } => Some((
+                        portfolio.clone(),
+                        *mode,
+                        action.clone(),
+                        posterior.clone(),
+                        expected_losses.clone(),
+                        *chosen_expected_loss,
+                        *fallback,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "expected exactly 1 CaspDecision in {mode:?}"
+            );
+            let (p_name, ev_mode, ev_action, ev_posterior, ev_losses, ev_chosen_loss, ev_fallback) =
+                &decisions[0];
+            assert_eq!(p_name, "ode");
+            assert_eq!(*ev_mode, mode);
+            assert_eq!(*ev_action, format!("{:?}", recorded.chosen_action));
+            assert_eq!(*ev_action, format!("{:?}", res.chosen_action));
+            assert_eq!(
+                ev_posterior.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .posterior
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_losses.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                recorded
+                    .expected_losses
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ev_chosen_loss.to_bits(),
+                recorded.chosen_expected_loss.to_bits()
+            );
+            assert_eq!(*ev_fallback, recorded.fallback_active);
+        }
     }
 }

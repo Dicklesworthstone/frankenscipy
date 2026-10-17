@@ -2,66 +2,92 @@
   "schema_version": 1,
   "packet_id": "FSCI-P2C-008",
   "scope": "packet",
-  "generated_at": "2026-03-13T05:15:00Z",
+  "generated_at": "2026-10-14T08:30:00Z",
   "compatibility_envelope": {
-    "scipy_version_min": "N/A",
-    "scipy_version_max": "N/A",
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
     "known_differences": [
       {
-        "version": "N/A",
-        "description": "CASP runtime is a FrankenSciPy innovation with no SciPy equivalent. All behavior is novel.",
-        "affected_functions": ["PolicyController", "SolverPortfolio", "ConformalCalibrator"]
+        "version": "1.17.0",
+        "description": "fsci-runtime provides FrankenSciPy-native CASP expected-loss decision engine, EProcessMonitor, PolicyController, and AuditLedger.",
+        "affected_functions": ["select_action", "decide", "observe", "record"]
       }
     ]
   },
   "threats": [
     {
-      "threat_id": "THREAT-CASP-001",
-      "subsystem": "fsci-runtime/policy",
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-runtime",
       "category": "numerical_instability",
       "severity": "high",
-      "likelihood": "moderate",
-      "description": "NaN or Inf signal values in DecisionSignals can corrupt logit computation and softmax posterior, leading to incorrect policy decisions. Clamping to [0,1] mitigates but extreme values (Inf) may still produce unexpected behavior before clamping.",
-      "mitigation": "DecisionSignals provides is_finite() check. Logit computation clamps all signal values to [0,1] range before use. NaN signals are clamped to 0.0.",
-      "test_reference": "FSCI-P2C-008_runtime_casp.json::policy_low_risk_strict",
-      "strict_mode_response": "Clamping applied unconditionally; no explicit error for non-finite signals.",
-      "hardened_mode_response": "Same clamping behavior; callers should check is_finite() pre-decision."
+      "likelihood": "possible",
+      "description": "NaN, negative, or > 1.0 reciprocal condition number rcond passed into SolverPortfolio::select_action.",
+      "mitigation": "Defended in crates/fsci-runtime/src/lib.rs:456 (select_action): sanitizes non-finite or out-of-range rcond into NearSingular posterior and routes to SVDFallback when drift or e-process alarms fire.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::solver_near_singular",
+      "strict_mode_response": "Clamp rcond to [0, 1] or assign NearSingular state weights deterministically.",
+      "hardened_mode_response": "Assign NearSingular posterior and trigger conservative fallback action."
     },
     {
-      "threat_id": "THREAT-CASP-002",
-      "subsystem": "fsci-runtime/solver_portfolio",
-      "category": "misclassification",
-      "severity": "critical",
-      "likelihood": "moderate",
-      "description": "Hard classification of matrix condition state into unit posterior (100% probability) means any misclassification of the condition state propagates directly into solver selection with no hedging. If condition estimation is wrong, the selected solver may be inappropriate.",
-      "mitigation": "ConformalCalibrator monitors backward errors and triggers SVD fallback when empirical miscoverage rate exceeds threshold, providing a safety net for systematic misclassification.",
-      "test_reference": "FSCI-P2C-008_runtime_casp.json::calibrator_high_violations",
-      "strict_mode_response": "SVD fallback triggered by calibrator when drift detected.",
-      "hardened_mode_response": "Same fallback mechanism."
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-runtime",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Non-finite condition_number_log10 or metadata_incompatibility_score signals passed into PolicyController::decide.",
+      "mitigation": "Defended in crates/fsci-runtime/src/policy.rs:161 (decide): sanitizes non-finite signals to maximal risk (1.0 logit probability) so non-finite telemetry never biases toward fast unsafe solvers.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::policy_high_metadata_hardened",
+      "strict_mode_response": "Sanitize non-finite signal to 1.0 risk and evaluate expected loss.",
+      "hardened_mode_response": "Sanitize non-finite signal to 1.0 risk with Hardened loss matrix (FailClosed bias)."
     },
     {
-      "threat_id": "THREAT-CASP-003",
-      "subsystem": "fsci-runtime/calibrator",
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-runtime",
       "category": "resource_exhaustion",
       "severity": "medium",
-      "likelihood": "low",
-      "description": "Bounded circular buffer (default 200 entries) means the calibrator has finite memory. Long-running applications that alternate between good and bad phases may not detect drift if the violation window is larger than the buffer capacity.",
-      "mitigation": "Buffer capacity is configurable at construction. Applications with long drift windows should increase capacity. Minimum 10 observations before fallback triggers prevents false positives during warmup.",
-      "test_reference": "FSCI-P2C-008_runtime_casp.json::calibrator_few_observations",
-      "strict_mode_response": "No fallback with fewer than 10 observations regardless of violation rate.",
-      "hardened_mode_response": "Same behavior; warmup threshold is unconditional."
+      "likelihood": "likely",
+      "description": "Unbounded memory growth in PolicyEvidenceLedger or conformal calibrator under long-running solver streams.",
+      "mitigation": "Defended in crates/fsci-runtime/src/evidence.rs:97 (record): enforces FIFO capacity ring buffer on decision and backward-error ledgers.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::calibrator_high_violations",
+      "strict_mode_response": "Evict oldest entry when capacity is reached.",
+      "hardened_mode_response": "Evict oldest entry while preserving EProcessMonitor wealth state."
     },
     {
-      "threat_id": "THREAT-CASP-004",
-      "subsystem": "fsci-runtime/policy",
-      "category": "information_leakage",
-      "severity": "low",
-      "likelihood": "low",
-      "description": "PolicyEvidenceLedger records all decision evidence including signal values, posteriors, and actions. In multi-tenant environments, this audit trail could leak information about one workload's numerical characteristics to another.",
-      "mitigation": "Evidence ledger is bounded (FIFO eviction) and local to each PolicyController instance. No cross-instance sharing. Callers are responsible for access control on evidence data.",
-      "test_reference": "N/A (architectural concern, not testable via fixture)",
-      "strict_mode_response": "Evidence recorded with full detail.",
-      "hardened_mode_response": "Same recording behavior."
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-runtime",
+      "category": "compatibility_drift",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Sustained regime shift in solver backward-error failure rate going undetected by static thresholds.",
+      "mitigation": "Defended in crates/fsci-runtime/src/eprocess.rs:178 (observe): updates Waudby-Smith & Ramdas betting martingale e-process and latches alarm when e_t >= 1/alpha.",
+      "test_reference": "genuine_booking_verifies",
+      "strict_mode_response": "Latch e-process alarm and routeSolverPortfolio to SVDFallback.",
+      "hardened_mode_response": "Latch e-process alarm and emit FallbackTriggered audit event."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "non-finite decision signals",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Clamp to worst-case risk (1.0) in PolicyController::decide.",
+      "hardened_mode_action": "Clamp to worst-case risk (1.0) and select FailClosed or SVDFallback."
+    },
+    {
+      "input_class": "sustained backward-error drift (e-process alarm)",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Override action selection to SVDFallback until reset_drift.",
+      "hardened_mode_action": "Override action selection to SVDFallback and record audit event."
+    },
+    {
+      "input_class": "zero-capacity evidence ledger",
+      "policy": "allowlist_only",
+      "strict_mode_action": "Clamp minimum ledger capacity to 1.",
+      "hardened_mode_action": "Clamp minimum ledger capacity to 1."
+    },
+    {
+      "input_class": "unverified benchmark booking claim",
+      "policy": "reject",
+      "strict_mode_action": "Refuse fabricated, stale, or conflicting Agent Mail booking ids.",
+      "hardened_mode_action": "Refuse fabricated, stale, or conflicting Agent Mail booking ids."
     }
   ]
 }

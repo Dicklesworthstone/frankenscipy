@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-017",
+  "family": "io_core",
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-017_io_core.json",
+  "generated_unix_ms": 1790392936392,
+  "oracle_status": {
+    "status": "available"
+  },
+  "total_cases": 13,
+  "drifted_cases": 0,
+  "cases": [
+    {
+      "case_id": "mmread_dense_array_column_major",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "mmread_symmetric_coordinate_expands",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "mmwrite_dense_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "loadmat_v4_real_double_scipy_bytes",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "loadmat_v4_row_vector_scipy_bytes",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savemat_v4_real_double_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savemat_v4_rectangular_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "loadtxt_comments_and_whitespace",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savetxt_space_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wav_write_mono_int16_quantization",
+      "passed": true,
+      "message": "io wav matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wav_write_stereo_int16_quantization",
+      "passed": true,
+      "message": "io wav matched (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "loadmat_v4_truncated_header_reject",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "loadtxt_ragged_rows_reject",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ]
+}

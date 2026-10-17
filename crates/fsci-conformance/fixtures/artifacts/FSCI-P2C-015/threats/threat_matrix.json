@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-015",
+  "scope": "packet",
+  "generated_at": "2026-10-14T08:30:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "fsci-ndimage implements separable Gaussian/uniform filters, HGW min/max filters, median filters, morphology, connected-component labeling, and spline geometric transforms.",
+        "affected_functions": ["gaussian_filter", "uniform_filter", "median_filter", "binary_erosion", "label"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-ndimage",
+      "category": "numerical_instability",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Boundary reflection / mirror coordinate mapping off-by-one drift during spline geometric interpolation.",
+      "mitigation": "Defended in crates/fsci-ndimage/src/lib.rs:3239 (gaussian_filter): applies exact SciPy boundary coordinate folding (reflect, mirror, wrap, nearest, constant) across 1D/nD axes.",
+      "test_reference": "affine_order1_reflect_mirror_matches_scipy_goldens",
+      "strict_mode_response": "Match SciPy boundary mode coordinate mapping bit-for-bit.",
+      "hardened_mode_response": "Validate sigma > 0 and finite image values before convolution."
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-ndimage",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Zero-sized filter footprints, negative Gaussian sigma, or shape-mismatched flat image buffers.",
+      "mitigation": "Defended in crates/fsci-ndimage/src/lib.rs:3160 (uniform_filter): validates positive kernel size, valid image shape product, and finite parameters.",
+      "test_reference": "zoom_shift_affine_separable_ab_is_byte_identical",
+      "strict_mode_response": "Return Err(NdimageError) on invalid filter size or shape mismatch.",
+      "hardened_mode_response": "Reject malformed shape or non-finite inputs fail-closed and record FailClosed in AuditLedger."
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-ndimage",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Large 1D/nD sliding window min/max filters degrading to O(N * W) per-window scans without Herk-Gil-Werman prefix/suffix blocks.",
+      "mitigation": "Defended in crates/fsci-ndimage/src/lib.rs:3679 (median_filter): uses O(1)-amortized Herk-Gil-Werman min/max scans and direct selection for small median footprints.",
+      "test_reference": "minmax_hgw_byte_identical_to_deque",
+      "strict_mode_response": "Execute linear-time HGW min/max and bounded median selection.",
+      "hardened_mode_response": "Validate footprint dimensions and finite image data before allocation."
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-ndimage",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Connected-component labeling (label) union-find equivalence class numbering drifting from canonical raster order.",
+      "mitigation": "Defended in crates/fsci-ndimage/src/lib.rs:7599 (label): performs two-pass union-find with sequential 1..=num_features relabeling in raster scan order.",
+      "test_reference": "bspline_local_support_byte_identical_to_full_eval",
+      "strict_mode_response": "Emit canonical 1..=num_features component labels matching SciPy ndimage.label.",
+      "hardened_mode_response": "Validate structuring element dimensions before labeling."
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "data buffer length != shape product",
+      "policy": "reject",
+      "strict_mode_action": "Return NdimageError::ShapeMismatch.",
+      "hardened_mode_action": "Return NdimageError::ShapeMismatch and emit FailClosed audit event."
+    },
+    {
+      "input_class": "non-positive filter size or negative sigma",
+      "policy": "reject",
+      "strict_mode_action": "Return NdimageError::InvalidParameter.",
+      "hardened_mode_action": "Return NdimageError::InvalidParameter and log FailClosed event."
+    },
+    {
+      "input_class": "non-finite image or kernel values in Hardened mode",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Propagate IEEE NaN per convolution rules.",
+      "hardened_mode_action": "Reject non-finite inputs fail-closed with NdimageError::NonFiniteInput."
+    },
+    {
+      "input_class": "unsupported spline order (> 5)",
+      "policy": "reject",
+      "strict_mode_action": "Return NdimageError::UnsupportedOrder.",
+      "hardened_mode_action": "Return NdimageError::UnsupportedOrder."
+    }
+  ]
+}
