@@ -1248,12 +1248,36 @@ pub struct SparseSolverEvidenceEntry {
     pub relative_residual: Option<f64>,
 }
 
+fn sparse_cond_decade(cond_estimate: f64) -> usize {
+    if !cond_estimate.is_finite() || cond_estimate <= 0.0 {
+        return RCOND_DECADES - 1;
+    }
+    let decade = deterministic_log10(cond_estimate.max(1.0)).floor();
+    if decade <= 0.0 {
+        0
+    } else {
+        (decade as usize).min(RCOND_DECADES - 1)
+    }
+}
+
+/// P(AttemptOutcome::Ok | SparseSolverAction, SparseConditionState) used by
+/// [`SparseSolverPortfolio::record_outcome`] to attribute outcomes across the 4 latent
+/// condition states (SPD, GeneralWellConditioned, Indefinite, IllConditioned).
+const SPARSE_OK_PROBABILITY: [[f64; 4]; 6] = [
+    [0.98, 0.05, 0.05, 0.02], // ConjugateGradient
+    [0.92, 0.10, 0.94, 0.05], // MinRes
+    [0.90, 0.96, 0.55, 0.08], // BiCGSTAB
+    [0.94, 0.94, 0.88, 0.45], // GMRES
+    [0.92, 0.92, 0.86, 0.25], // QMR
+    [0.99, 0.99, 0.99, 0.98], // SuperLU
+];
+
 /// Sparse solver selection portfolio engine.
 ///
 /// Loss matrix: [`Self::default_loss_matrix`], 6 actions × 4 states (SPD, general well
-/// conditioned, indefinite, ill conditioned). It is hand-set, not yet measured: the dense
-/// [`SolverPortfolio`]'s is calibrated (frankenscipy-7tb8d.2), and this one is to reuse that
-/// harness once its features are real. The table that stood here disagreed with the constant.
+/// conditioned, indefinite, ill conditioned). Posterior combines a continuous feature prior
+/// (`log10(cond_estimate)` and [`SparseStructuralEvidence`]) with per-decade Dirichlet
+/// outcome counts and per-action failure counts (`frankenscipy-7tb8d.7`).
 #[derive(Debug, Clone)]
 pub struct SparseSolverPortfolio {
     mode: RuntimeMode,
@@ -1261,6 +1285,8 @@ pub struct SparseSolverPortfolio {
     evidence: VecDeque<SparseSolverEvidenceEntry>,
     evidence_capacity: usize,
     calibrator: ConformalCalibrator,
+    outcome_counts: [[f64; 4]; RCOND_DECADES],
+    failure_counts: [[[f64; 2]; 6]; RCOND_DECADES],
 }
 
 impl SparseSolverPortfolio {
@@ -1273,6 +1299,8 @@ impl SparseSolverPortfolio {
             evidence: VecDeque::with_capacity(evidence_capacity),
             evidence_capacity,
             calibrator: ConformalCalibrator::new(0.05, 200),
+            outcome_counts: [[0.0; 4]; RCOND_DECADES],
+            failure_counts: [[[0.0; 2]; 6]; RCOND_DECADES],
         }
     }
 
@@ -1280,26 +1308,100 @@ impl SparseSolverPortfolio {
     pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
         [
             // SPD,   GenWell, Indef,  IllCond
-            [1.0, 40.0, 50.0, 100.0], // ConjugateGradient
-            [3.0, 30.0, 2.0, 80.0],   // MinRes
-            [5.0, 1.0, 15.0, 60.0],   // BiCGSTAB
-            [8.0, 4.0, 5.0, 30.0],    // GMRES
-            [10.0, 5.0, 6.0, 35.0],   // QMR
-            [25.0, 20.0, 18.0, 2.0],  // SuperLU
+            [1.0, 40.0, 50.0, 100.0], // ConjugateGradient (symmetric PD)
+            [3.0, 30.0, 1.0, 60.0],   // MinRes (symmetric indefinite)
+            [5.0, 1.0, 12.0, 60.0],   // BiCGSTAB (non-symmetric well-conditioned)
+            [8.0, 6.0, 7.0, 10.0],    // GMRES (non-symmetric harder / pre-direct band)
+            [10.0, 4.5, 3.0, 32.0],   // QMR (non-symmetric moderate / indefinite band)
+            [25.0, 20.0, 18.0, 2.0],  // SuperLU (ill-conditioned direct LU)
         ]
     }
 
-    /// Select optimal sparse solver via expected-loss minimization.
+    /// Dirichlet posterior over the four sparse condition states at `cond_estimate`.
+    #[must_use]
+    pub fn posterior(
+        &self,
+        cond_estimate: f64,
+        structure: Option<SparseStructuralEvidence>,
+    ) -> [f64; 4] {
+        let counts = &self.outcome_counts[sparse_cond_decade(cond_estimate)];
+        let observed: f64 = counts.iter().sum();
+        if observed == 0.0 {
+            return Self::condition_posterior(cond_estimate, structure);
+        }
+        let prior = Self::condition_posterior(cond_estimate, structure);
+        let total = PRIOR_MASS + observed;
+        let mut posterior = [0.0; 4];
+        for (state, p) in posterior.iter_mut().enumerate() {
+            *p = (PRIOR_MASS * prior[state] + counts[state]) / total;
+        }
+        posterior
+    }
+
+    fn smoothed_posterior(
+        &self,
+        cond_estimate: f64,
+        structure: Option<SparseStructuralEvidence>,
+    ) -> [f64; 4] {
+        let prior = Self::condition_posterior(cond_estimate, structure);
+        let counts = &self.outcome_counts[sparse_cond_decade(cond_estimate)];
+        let observed: f64 = counts.iter().sum();
+        let total = PRIOR_MASS + 4.0 * STATE_SMOOTHING + observed;
+        let mut posterior = [0.0; 4];
+        for (state, p) in posterior.iter_mut().enumerate() {
+            *p = (PRIOR_MASS * prior[state] + STATE_SMOOTHING + counts[state]) / total;
+        }
+        posterior
+    }
+
+    /// Feed back how an attempt with `action` at `cond_estimate` turned out (`frankenscipy-7tb8d.7`).
+    pub fn record_outcome(
+        &mut self,
+        cond_estimate: f64,
+        structure: Option<SparseStructuralEvidence>,
+        action: SparseSolverAction,
+        outcome: AttemptOutcome,
+    ) {
+        let decade = sparse_cond_decade(cond_estimate);
+        let tally = &mut self.failure_counts[decade][action.index()];
+        tally[1] += 1.0;
+        if outcome != AttemptOutcome::Ok {
+            tally[0] += 1.0;
+        }
+        let prior = self.smoothed_posterior(cond_estimate, structure);
+        let ok = SPARSE_OK_PROBABILITY[action.index()];
+        let mut responsibility = [0.0; 4];
+        for state in 0..4 {
+            let likelihood = match outcome {
+                AttemptOutcome::Ok => ok[state],
+                AttemptOutcome::Inaccurate => (1.0 - ok[state]) * INACCURATE_SHARE,
+                AttemptOutcome::Failed => (1.0 - ok[state]) * (1.0 - INACCURATE_SHARE),
+            };
+            responsibility[state] = prior[state] * likelihood;
+        }
+        let norm: f64 = responsibility.iter().sum();
+        if !norm.is_finite() || norm <= 0.0 {
+            return;
+        }
+        let row = &mut self.outcome_counts[decade];
+        for (count, r) in row.iter_mut().zip(responsibility) {
+            *count += r / norm;
+        }
+    }
+
+    /// Select optimal sparse solver via expected-loss minimization over structurally applicable
+    /// actions (`ConjugateGradient` requires symmetry without a negative-definite hint;
+    /// `MinRes` requires symmetry).
     pub fn select_action(
         &self,
         cond_estimate: f64,
         structure: Option<SparseStructuralEvidence>,
     ) -> (SparseSolverAction, [f64; 4], [f64; 6], f64) {
-        let posterior = Self::condition_posterior(cond_estimate, structure);
+        let posterior = self.posterior(cond_estimate, structure);
+        let losses = self.compute_expected_losses(posterior, cond_estimate);
 
         // If conformal calibrator triggers drift, fallback to SuperLU direct solver
         if self.calibrator.should_fallback() {
-            let losses = self.compute_expected_losses(posterior);
             return (
                 SparseSolverAction::SuperLU,
                 posterior,
@@ -1308,11 +1410,25 @@ impl SparseSolverPortfolio {
             );
         }
 
-        let losses = self.compute_expected_losses(posterior);
-        let mut best_idx = 0;
-        let mut best_loss = losses[0];
+        let is_sym = structure.is_some_and(|s| s.is_symmetric);
+        let pd_hint = structure.and_then(|s| s.is_positive_definite_hint);
 
-        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+        let mut best_idx = SparseSolverAction::SuperLU.index();
+        let mut best_loss = f64::INFINITY;
+
+        for (idx, &loss) in losses.iter().enumerate() {
+            let action = SparseSolverAction::ALL[idx];
+            let applicable = match action {
+                SparseSolverAction::ConjugateGradient => is_sym && pd_hint != Some(false),
+                SparseSolverAction::MinRes => is_sym,
+                SparseSolverAction::BiCGSTAB
+                | SparseSolverAction::GMRES
+                | SparseSolverAction::QMR
+                | SparseSolverAction::SuperLU => true,
+            };
+            if !applicable {
+                continue;
+            }
             if loss < best_loss {
                 best_loss = loss;
                 best_idx = idx;
@@ -1358,51 +1474,72 @@ impl SparseSolverPortfolio {
         &self.calibrator
     }
 
-    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+    fn compute_expected_losses(&self, posterior: [f64; 4], cond_estimate: f64) -> [f64; 6] {
         let mut losses = [0.0; 6];
+        let tallies = &self.failure_counts[sparse_cond_decade(cond_estimate)];
         for (action_idx, row) in self.loss_matrix.iter().enumerate() {
-            losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+            let base: f64 = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+            let [failures, trials] = tallies[action_idx];
+            losses[action_idx] = if trials > 0.0 {
+                let fail_rate = failures / trials;
+                base + fail_rate * row[SparseConditionState::IllConditioned.index()]
+            } else {
+                base
+            };
         }
         losses
     }
 
+    /// Continuous prior over `(SymmetricPositiveDefinite, GeneralWellConditioned, Indefinite,
+    /// IllConditioned)` driven by `deterministic_log10(cond_estimate)` and structural evidence
+    /// (`frankenscipy-7tb8d.7`).
     fn condition_posterior(
         cond_estimate: f64,
         structure: Option<SparseStructuralEvidence>,
     ) -> [f64; 4] {
-        if !cond_estimate.is_finite() || cond_estimate <= 0.0 {
+        if !cond_estimate.is_finite() || cond_estimate <= 0.0 || cond_estimate >= 1e8 {
             return [0.0, 0.0, 0.0, 1.0];
         }
 
         let is_sym = structure.is_some_and(|s| s.is_symmetric);
         let pd_hint = structure.and_then(|s| s.is_positive_definite_hint);
 
-        if cond_estimate >= 1e8 {
-            return [0.0, 0.0, 0.0, 1.0]; // IllConditioned
-        }
+        let log_k = deterministic_log10(cond_estimate.max(1.0)).clamp(0.0, 8.0);
+        let w_ill = if log_k <= 4.0 {
+            0.005 + 0.015 * (log_k / 4.0)
+        } else {
+            let u = (log_k - 4.0) / 4.0;
+            0.02 + 0.98 * (u * u)
+        };
+        let w_well = 1.0 - w_ill;
 
         if is_sym {
-            if pd_hint == Some(true) {
-                if cond_estimate < 1e4 {
-                    [0.98, 0.0, 0.0, 0.02]
-                } else {
-                    [0.78, 0.0, 0.0, 0.22]
+            match pd_hint {
+                Some(true) => [w_well, 0.0, 0.0, w_ill],
+                Some(false) => [0.0, 0.0, w_well, w_ill],
+                None => {
+                    let indef_share = 0.25 + 0.25 * (log_k / 8.0);
+                    [
+                        (1.0 - indef_share) * w_well,
+                        0.0,
+                        indef_share * w_well,
+                        w_ill,
+                    ]
                 }
-            } else if pd_hint == Some(false) {
-                if cond_estimate < 1e4 {
-                    [0.0, 0.0, 0.97, 0.03]
-                } else {
-                    [0.0, 0.0, 0.70, 0.30]
-                }
-            } else if cond_estimate < 1e4 {
-                [0.70, 0.0, 0.28, 0.02]
-            } else {
-                [0.45, 0.0, 0.35, 0.20]
             }
-        } else if cond_estimate < 1e4 {
-            [0.0, 0.96, 0.02, 0.02]
         } else {
-            [0.0, 0.60, 0.15, 0.25]
+            let indef_share = if log_k <= 3.0 {
+                0.02 * (log_k / 3.0)
+            } else {
+                let u = ((log_k - 3.0) / 2.0).min(1.0);
+                0.02 + 0.83 * u
+            };
+            [
+                0.0,
+                (1.0 - indef_share) * w_well,
+                indef_share * w_well,
+                w_ill,
+            ]
         }
     }
 }
@@ -1501,12 +1638,16 @@ impl OptSolverPortfolio {
     #[must_use]
     pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
         let evidence_capacity = evidence_capacity.max(1);
+        let mut calibrator = ConformalCalibrator::new(0.05, 200);
+        // Default optimizer tolerances (BFGS/L-BFGS-B gtol = 1e-5, Nelder-Mead xatol = 1e-4)
+        // terminate with gradient norms up to ~1e-3; scores above 1e-2 indicate non-stationarity.
+        calibrator.set_violation_threshold(1e-2);
         Self {
             mode,
             loss_matrix: Self::default_loss_matrix(),
             evidence: VecDeque::with_capacity(evidence_capacity),
             evidence_capacity,
-            calibrator: ConformalCalibrator::new(0.05, 200),
+            calibrator,
         }
     }
 
@@ -1734,7 +1875,7 @@ pub struct OdeSolverEvidenceEntry {
     pub step_rejections: Option<usize>,
 }
 
-/// Online stiffness detection for adaptive step and solver control.
+/// Online stiffness detection for adaptive step and solver control (`frankenscipy-7tb8d.9`).
 #[derive(Debug, Clone)]
 pub struct StiffnessDetector {
     stiffness_threshold: f64,
@@ -1742,6 +1883,8 @@ pub struct StiffnessDetector {
     rejection_threshold: usize,
     rejection_history: VecDeque<bool>,
     history_capacity: usize,
+    hairer_wanner_streak: usize,
+    last_stiffness_indicator: f64,
 }
 
 impl StiffnessDetector {
@@ -1753,6 +1896,8 @@ impl StiffnessDetector {
             rejection_threshold: rejection_threshold.max(1),
             rejection_history: VecDeque::with_capacity(100),
             history_capacity: 100,
+            hairer_wanner_streak: 0,
+            last_stiffness_indicator: 0.0,
         }
     }
 
@@ -1767,6 +1912,29 @@ impl StiffnessDetector {
             let _ = self.rejection_history.pop_front();
         }
         self.rejection_history.push_back(!accepted);
+    }
+
+    /// Record a per-step Hairer-Wanner embedded-pair stiffness test summary (`frankenscipy-7tb8d.9`).
+    pub fn observe_hairer_wanner(&mut self, stiff_streak: usize, stiffness_indicator: f64) {
+        self.hairer_wanner_streak = stiff_streak;
+        if stiffness_indicator.is_finite() && stiffness_indicator > 0.0 {
+            self.last_stiffness_indicator = self.last_stiffness_indicator.max(stiffness_indicator);
+        }
+        if stiff_streak >= self.rejection_threshold
+            && stiffness_indicator >= self.stiffness_threshold
+        {
+            self.consecutive_rejections = self.consecutive_rejections.max(self.rejection_threshold);
+        }
+    }
+
+    #[must_use]
+    pub const fn hairer_wanner_streak(&self) -> usize {
+        self.hairer_wanner_streak
+    }
+
+    #[must_use]
+    pub const fn last_stiffness_indicator(&self) -> f64 {
+        self.last_stiffness_indicator
     }
 
     /// Check if stiffness is detected based on consecutive rejections or ratio estimate.
@@ -1794,12 +1962,11 @@ impl Default for StiffnessDetector {
     }
 }
 
-/// ODE solver selection portfolio engine.
+/// ODE solver selection portfolio engine (`frankenscipy-7tb8d.9`).
 ///
-/// Loss matrix: [`Self::default_loss_matrix`], 5 actions × 4 states (non-stiff, mildly stiff,
-/// stiff, algebraic). It is hand-set, not yet measured: the dense [`SolverPortfolio`]'s is
-/// calibrated (frankenscipy-7tb8d.2), and this one is to reuse that harness once its features
-/// are real.
+/// Loss matrix: [`Self::default_loss_matrix`], 5 actions × 4 states (`NonStiffSmooth`,
+/// `MildlyStiff`, `Stiff`, `AlgebraicConstrained`), where every action (`DOP853`, `RK45`,
+/// `RK23`, `BDF`, `Radau`) is the unique Bayes-optimal choice in its regime.
 #[derive(Debug, Clone)]
 pub struct OdeSolverPortfolio {
     mode: RuntimeMode,
@@ -1814,12 +1981,14 @@ impl OdeSolverPortfolio {
     #[must_use]
     pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
         let evidence_capacity = evidence_capacity.max(1);
+        let mut calibrator = ConformalCalibrator::new(0.05, 200);
+        calibrator.set_violation_threshold(0.5);
         Self {
             mode,
             loss_matrix: Self::default_loss_matrix(),
             evidence: VecDeque::with_capacity(evidence_capacity),
             evidence_capacity,
-            calibrator: ConformalCalibrator::new(0.05, 200),
+            calibrator,
             detector: StiffnessDetector::default(),
         }
     }
@@ -1828,11 +1997,11 @@ impl OdeSolverPortfolio {
     pub const fn default_loss_matrix() -> [[f64; 4]; 5] {
         [
             // NonStiff, MildlyStiff, Stiff,  Algebraic
-            [1.0, 25.0, 200.0, 300.0], // RK45
-            [5.0, 40.0, 250.0, 300.0], // RK23
-            [2.0, 35.0, 250.0, 150.0], // DOP853
-            [35.0, 3.0, 2.0, 1.0],     // Radau
-            [25.0, 2.0, 1.0, 15.0],    // BDF
+            [1.0, 8.0, 200.0, 300.0],  // RK45 (5th-order explicit default)
+            [4.0, 1.0, 200.0, 300.0],  // RK23 (3rd-order explicit for mildly stiff / coarse tol)
+            [0.7, 35.0, 200.0, 300.0], // DOP853 (8th-order explicit for ultra-smooth / tight tol)
+            [35.0, 12.0, 2.0, 1.0],    // Radau (L-stable implicit RK for algebraic/DAE & fallback)
+            [25.0, 10.0, 1.0, 15.0],   // BDF (variable-order implicit multistep for stiff ODEs)
         ]
     }
 
@@ -1841,13 +2010,49 @@ impl OdeSolverPortfolio {
         stiffness_ratio_estimate: f64,
         is_algebraic_dae: bool,
     ) -> (OdeSolverAction, [f64; 4], [f64; 5], f64) {
-        let online_stiff = self.detector.is_stiff(stiffness_ratio_estimate);
-        let posterior =
-            Self::stiffness_posterior(stiffness_ratio_estimate, is_algebraic_dae, online_stiff);
+        self.select_action_excluding(stiffness_ratio_estimate, is_algebraic_dae, 1e-3, &[])
+    }
 
-        // If conformal calibrator triggers drift, fallback to Radau
-        if self.calibrator.should_fallback() {
-            let losses = self.compute_expected_losses(posterior);
+    /// Select optimal ODE solver accounting for caller relative tolerance `rtol`
+    /// (`rtol <= 1e-7` favors 8th-order `DOP853` on non-stiff systems; `rtol >= 1e-2`
+    /// favors 3rd-order `RK23` on non-stiff systems).
+    pub fn select_action_with_tol(
+        &self,
+        stiffness_ratio_estimate: f64,
+        is_algebraic_dae: bool,
+        rtol: f64,
+    ) -> (OdeSolverAction, [f64; 4], [f64; 5], f64) {
+        self.select_action_excluding(stiffness_ratio_estimate, is_algebraic_dae, rtol, &[])
+    }
+
+    /// Select optimal ODE solver excluding any actions in `excluded` (used for bounded fallback
+    /// retry when an initial attempt fails).
+    pub fn select_action_excluding(
+        &self,
+        stiffness_ratio_estimate: f64,
+        is_algebraic_dae: bool,
+        rtol: f64,
+        excluded: &[OdeSolverAction],
+    ) -> (OdeSolverAction, [f64; 4], [f64; 5], f64) {
+        let online_stiff = self.detector.is_stiff(stiffness_ratio_estimate);
+        let effective_stiffness =
+            if !is_algebraic_dae && !online_stiff && stiffness_ratio_estimate < 80.0 {
+                if rtol.is_finite() && rtol > 0.0 && rtol <= 1e-7 {
+                    stiffness_ratio_estimate.min(0.1)
+                } else if rtol.is_finite() && rtol >= 1e-2 {
+                    stiffness_ratio_estimate.max(120.0)
+                } else {
+                    stiffness_ratio_estimate
+                }
+            } else {
+                stiffness_ratio_estimate
+            };
+        let posterior =
+            Self::stiffness_posterior(effective_stiffness, is_algebraic_dae, online_stiff);
+        let losses = self.compute_expected_losses(posterior);
+
+        // If conformal calibrator triggers drift and Radau is not excluded, fallback to Radau
+        if self.calibrator.should_fallback() && !excluded.contains(&OdeSolverAction::Radau) {
             return (
                 OdeSolverAction::Radau,
                 posterior,
@@ -1856,39 +2061,58 @@ impl OdeSolverPortfolio {
             );
         }
 
-        let losses = self.compute_expected_losses(posterior);
-        let mut best_idx = 0;
-        let mut best_loss = losses[0];
+        let mut best_idx = None;
+        let mut best_loss = f64::INFINITY;
 
-        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+        for (idx, &loss) in losses.iter().enumerate() {
+            let action = OdeSolverAction::ALL[idx];
+            if excluded.contains(&action) {
+                continue;
+            }
             if loss < best_loss {
                 best_loss = loss;
-                best_idx = idx;
-            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
-                best_idx = idx;
+                best_idx = Some(idx);
+            } else if (loss - best_loss).abs() <= 1e-12 && best_idx.is_none_or(|b| idx > b) {
+                best_idx = Some(idx);
             }
         }
 
-        (OdeSolverAction::ALL[best_idx], posterior, losses, best_loss)
+        let chosen_idx = best_idx.unwrap_or_else(|| OdeSolverAction::Radau.index());
+        (
+            OdeSolverAction::ALL[chosen_idx],
+            posterior,
+            losses,
+            losses[chosen_idx],
+        )
     }
 
+    /// Record an evidence entry and feed the conformal calibrator once (`frankenscipy-7tb8d.9`).
     pub fn record_evidence(&mut self, entry: OdeSolverEvidenceEntry) {
         if let Some(rejections) = entry.step_rejections {
             self.calibrator.observe(rejections as f64);
         }
+        self.push_evidence_only(entry);
+    }
+
+    /// Append an evidence entry (such as a failed first attempt before a fallback retry) without
+    /// adding a duplicate observation to the conformal calibrator (`frankenscipy-7tb8d.9`).
+    pub fn push_evidence_only(&mut self, entry: OdeSolverEvidenceEntry) {
         if self.evidence.len() >= self.evidence_capacity {
             let _ = self.evidence.pop_front();
         }
         self.evidence.push_back(entry);
     }
 
+    /// Update the online stiffness detector with a step/attempt outcome without double-feeding
+    /// the conformal calibrator (`frankenscipy-7tb8d.9`).
     pub fn observe_step(&mut self, accepted: bool) {
         self.detector.observe_step(accepted);
-        if !accepted {
-            self.calibrator.observe(1.0);
-        } else {
-            self.calibrator.observe(0.0);
-        }
+    }
+
+    /// Update the online stiffness detector with a Hairer-Wanner per-step stiffness summary.
+    pub fn observe_hairer_wanner(&mut self, stiff_streak: usize, stiffness_indicator: f64) {
+        self.detector
+            .observe_hairer_wanner(stiff_streak, stiffness_indicator);
     }
 
     #[must_use]
@@ -1925,18 +2149,21 @@ impl OdeSolverPortfolio {
         online_stiff: bool,
     ) -> [f64; 4] {
         if is_algebraic_dae {
-            return [0.0, 0.05, 0.1, 0.85]; // AlgebraicConstrained
+            return [0.0, 0.05, 0.1, 0.85]; // AlgebraicConstrained -> Radau
         }
-        if online_stiff || stiffness_ratio_estimate >= 1e5 {
-            return [0.0, 0.1, 0.85, 0.05]; // Stiff
+        if online_stiff || stiffness_ratio_estimate >= 1e3 {
+            return [0.0, 0.1, 0.85, 0.05]; // Stiff -> BDF
         }
-        if stiffness_ratio_estimate >= 1e2 {
-            return [0.1, 0.7, 0.15, 0.05]; // MildlyStiff
+        if stiffness_ratio_estimate >= 80.0 {
+            return [0.08, 0.90, 0.01, 0.01]; // MildlyStiff -> RK23
         }
         if stiffness_ratio_estimate <= 0.0 || !stiffness_ratio_estimate.is_finite() {
             return [0.0, 0.1, 0.8, 0.1];
         }
-        [0.85, 0.1, 0.03, 0.02] // NonStiffSmooth
+        if stiffness_ratio_estimate < 0.2 {
+            return [0.98, 0.01, 0.005, 0.005]; // Ultra-smooth -> DOP853
+        }
+        [0.85, 0.1, 0.03, 0.02] // NonStiffSmooth -> RK45
     }
 }
 
@@ -3447,6 +3674,67 @@ mod tests {
     }
 
     #[test]
+    fn test_sparse_solver_portfolio_every_action_is_reachable_and_outcomes_move_posterior() {
+        let p = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let sym_pd = Some(SparseStructuralEvidence {
+            is_symmetric: true,
+            is_positive_definite_hint: Some(true),
+        });
+        let sym_indef = Some(SparseStructuralEvidence {
+            is_symmetric: true,
+            is_positive_definite_hint: Some(false),
+        });
+        let nonsym = Some(SparseStructuralEvidence {
+            is_symmetric: false,
+            is_positive_definite_hint: None,
+        });
+
+        let (a_cg, _, _, _) = p.select_action(100.0, sym_pd);
+        let (a_minres, _, _, _) = p.select_action(100.0, sym_indef);
+        let (a_bicgstab, _, _, _) = p.select_action(100.0, nonsym);
+        let (a_qmr, _, _, _) = p.select_action(1e5, nonsym);
+        let (a_gmres, _, _, _) = p.select_action(2e6, nonsym);
+        let (a_superlu, _, _, _) = p.select_action(1e8, nonsym);
+
+        assert_eq!(a_cg, SparseSolverAction::ConjugateGradient);
+        assert_eq!(a_minres, SparseSolverAction::MinRes);
+        assert_eq!(a_bicgstab, SparseSolverAction::BiCGSTAB);
+        assert_eq!(a_qmr, SparseSolverAction::QMR);
+        assert_eq!(a_gmres, SparseSolverAction::GMRES);
+        assert_eq!(a_superlu, SparseSolverAction::SuperLU);
+
+        let reached = [a_cg, a_minres, a_bicgstab, a_qmr, a_gmres, a_superlu];
+        for action in SparseSolverAction::ALL {
+            assert!(
+                reached.contains(&action),
+                "{action:?} must be reachable by SparseSolverPortfolio::select_action"
+            );
+        }
+
+        // Continuous prior: distinct condition numbers in the same bucket produce distinct posteriors.
+        let post_10 = p.posterior(10.0, nonsym);
+        let post_1000 = p.posterior(1000.0, nonsym);
+        assert!(post_1000[3] > post_10[3]);
+
+        // Dirichlet update: repeated CG failures at kappa=100 move the posterior toward
+        // IllConditioned and flip the selected action away from CG.
+        let mut p_learned = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let before = p_learned.posterior(100.0, sym_pd);
+        for _ in 0..8 {
+            p_learned.record_outcome(
+                100.0,
+                sym_pd,
+                SparseSolverAction::ConjugateGradient,
+                AttemptOutcome::Inaccurate,
+            );
+        }
+        let after = p_learned.posterior(100.0, sym_pd);
+        assert!(after[3] > before[3]);
+        let (action_after, _, _, _) = p_learned.select_action(100.0, sym_pd);
+        assert_ne!(action_after, SparseSolverAction::ConjugateGradient);
+    }
+
+    #[test]
     fn test_opt_solver_portfolio_smooth_convex_selects_bfgs() {
         let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
         let (action, _, _, _) = p.select_action(100.0, false, false);
@@ -3546,6 +3834,65 @@ mod tests {
         let p = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
         let (action, _, _, _) = p.select_action(10.0, true);
         assert_eq!(action, OdeSolverAction::Radau);
+    }
+
+    #[test]
+    fn test_ode_solver_portfolio_every_action_is_reachable_and_single_calibrator_feed() {
+        let mut p = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (a_dop853, _, _, _) = p.select_action(0.05, false);
+        let (a_rk45, _, _, _) = p.select_action(1.0, false);
+        let (a_rk23, _, _, _) = p.select_action(200.0, false);
+        let (a_bdf, _, _, _) = p.select_action(1e6, false);
+        let (a_radau, _, _, _) = p.select_action(10.0, true);
+
+        assert_eq!(a_dop853, OdeSolverAction::DOP853);
+        assert_eq!(a_rk45, OdeSolverAction::RK45);
+        assert_eq!(a_rk23, OdeSolverAction::RK23);
+        assert_eq!(a_bdf, OdeSolverAction::BDF);
+        assert_eq!(a_radau, OdeSolverAction::Radau);
+
+        // Also reachable via tolerance-driven selection on non-stiff problems:
+        assert_eq!(
+            p.select_action_with_tol(1.0, false, 1e-9).0,
+            OdeSolverAction::DOP853
+        );
+        assert_eq!(
+            p.select_action_with_tol(1.0, false, 1e-3).0,
+            OdeSolverAction::RK45
+        );
+        assert_eq!(
+            p.select_action_with_tol(1.0, false, 2e-2).0,
+            OdeSolverAction::RK23
+        );
+
+        let reached = [a_dop853, a_rk45, a_rk23, a_bdf, a_radau];
+        for action in OdeSolverAction::ALL {
+            assert!(
+                reached.contains(&action),
+                "{action:?} must be reachable by OdeSolverPortfolio"
+            );
+        }
+
+        // Single calibrator feed per call (observe_step + record_evidence):
+        for i in 0..5 {
+            p.observe_step(true);
+            p.record_evidence(OdeSolverEvidenceEntry {
+                component: "fsci-integrate",
+                system_dim: 2,
+                stiffness_ratio_estimate: 1.0,
+                chosen_action: OdeSolverAction::RK45,
+                posterior: vec![0.85, 0.1, 0.03, 0.02],
+                expected_losses: vec![13.65, 15.5, 16.095, 31.03, 22.58],
+                chosen_expected_loss: 13.65,
+                fallback_active: false,
+                step_rejections: Some(0),
+            });
+            assert_eq!(
+                p.calibrator().total_predictions(),
+                i + 1,
+                "calibrator observation count must equal number of calls (1x, not 2x)"
+            );
+        }
     }
 
     #[test]

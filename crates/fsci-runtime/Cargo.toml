@@ -9,6 +9,11 @@ description = "Condition-Aware Solver Portfolio (CASP) runtime for FrankenSciPy"
 [lints]
 workspace = true
 
+[features]
+# Campaign-internal benchmark and live-SciPy incumbent harness infrastructure.
+# Off by default so published fsci-runtime exposes only the CASP runtime API (frankenscipy-eclzm.1).
+bench-harness = []
+
 [dependencies]
 blake3 = { workspace = true }
 serde = { workspace = true }
