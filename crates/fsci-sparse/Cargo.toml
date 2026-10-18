@@ -13,8 +13,9 @@ workspace = true
 # Compatibility feature names retained for existing measurement invocations.
 # The executable identity has to be available to every live-incumbent bin, so
 # the hash implementation is a normal dependency of this benchmark crate.
-sparse-incumbent-bench = []
-live-scipy-bench = []
+sparse-incumbent-bench = ["fsci-runtime/bench-harness"]
+live-scipy-bench = ["fsci-runtime/bench-harness"]
+bench-harness = ["fsci-runtime/bench-harness", "sparse-incumbent-bench", "live-scipy-bench"]
 # The .npz archive codec (`io`: load_npz / save_npz). On by default for direct
 # users. Workspace members that never touch .npz (fsci-integrate) leave it off,
 # so they do not resolve or build npyz and zip and their pest and zlib-rs
@@ -46,3 +47,13 @@ harness = false
 # shared with the explicitly named balanced-square harness below.
 name = "perf_splu"
 path = "src/bin/perf_splu_balanced_square.rs"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_splu_balanced_square"
+path = "src/bin/perf_splu_balanced_square.rs"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_eigsh_vs_scipy"
+required-features = ["bench-harness"]

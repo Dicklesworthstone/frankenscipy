@@ -208,6 +208,7 @@ pub use linalg::{
     // Eigensolvers
     eigs,
     eigsh,
+    estimate_sparse_cond_1norm,
     expm,
     expm_multiply,
     factorized,
@@ -277,6 +278,7 @@ pub use linalg::{
     splu,
     splu_factor_payload_bytes,
     splu_solve,
+    splu_solve_transpose,
     spmm,
     spmv,
     // Direct solvers
@@ -3129,5 +3131,395 @@ mod tests {
             guard.entries()[0].action,
             fsci_runtime::AuditAction::FailClosed { .. }
         ));
+    }
+
+    #[test]
+    fn test_estimate_sparse_cond_1norm_within_factor_10_on_200_matrices() {
+        fn exact_cond_1norm(csr: &CsrMatrix) -> f64 {
+            let n = csr.shape().rows;
+            let norm_a = onenormest(csr);
+            let csc = csr.to_csc().unwrap();
+            let lu = splu(&csc, LuOptions::default()).unwrap();
+            let mut norm_inv = 0.0_f64;
+            let mut e = vec![0.0; n];
+            for j in 0..n {
+                e[j] = 1.0;
+                let col = splu_solve(&lu, &e).unwrap();
+                e[j] = 0.0;
+                let col_sum: f64 = col.iter().map(|x| x.abs()).sum();
+                norm_inv = norm_inv.max(col_sum);
+            }
+            norm_a * norm_inv
+        }
+
+        let mut ratios = Vec::with_capacity(200);
+        for idx in 0..200usize {
+            let family = idx % 5;
+            let n = match family {
+                0 => 12 + (idx / 5) * 4,
+                1 => 10 + (idx / 5) * 3,
+                2 => 15 + (idx / 5) * 4,
+                3 => 14 + (idx / 5) * 3,
+                _ => 20 + (idx / 5) * 12, // reaches up to n = 488 <= 500
+            };
+            let mut rows = Vec::new();
+            let mut cols = Vec::new();
+            let mut data = Vec::new();
+
+            match family {
+                0 => {
+                    // Scaled SPD tridiagonal across condition numbers 10^0 .. 10^7
+                    let scale = 10.0_f64.powf((idx / 5) as f64 * 0.18);
+                    for i in 0..n {
+                        let d = 3.0 * (1.0 + (scale - 1.0) * (i as f64 / (n - 1) as f64));
+                        rows.push(i);
+                        cols.push(i);
+                        data.push(d);
+                        if i > 0 {
+                            let off = -0.8 * (1.0 + 0.2 * ((i + idx) % 3) as f64);
+                            rows.extend([i, i - 1]);
+                            cols.extend([i - 1, i]);
+                            data.extend([off, off]);
+                        }
+                    }
+                }
+                1 => {
+                    // Unit-diagonal SPD tridiagonal with varying spectral gap
+                    let c0 = 0.5 / (std::f64::consts::PI / (n as f64 + 1.0)).cos();
+                    let gap = 10.0_f64.powf(-0.5 - ((idx / 5) % 7) as f64 * 0.9);
+                    let beta = c0 * (1.0 - gap);
+                    for i in 0..n {
+                        rows.push(i);
+                        cols.push(i);
+                        data.push(1.0);
+                        if i > 0 {
+                            rows.extend([i, i - 1]);
+                            cols.extend([i - 1, i]);
+                            data.extend([-beta, -beta]);
+                        }
+                    }
+                }
+                2 => {
+                    // Non-symmetric convection-diffusion banded matrix
+                    let peclet = 0.1 + 0.08 * (idx / 5) as f64;
+                    let scale = 10.0_f64.powf(((idx / 5) % 6) as f64 * 0.7);
+                    for i in 0..n {
+                        let d = if i == 0 { 4.0 * scale } else { 4.0 };
+                        rows.push(i);
+                        cols.push(i);
+                        data.push(d);
+                        if i > 0 {
+                            rows.extend([i, i - 1]);
+                            cols.extend([i - 1, i]);
+                            data.extend([-1.0 - peclet, -1.0 + peclet]);
+                        }
+                        if i + 2 < n {
+                            rows.extend([i, i + 2]);
+                            cols.extend([i + 2, i]);
+                            data.extend([0.15, -0.1]);
+                        }
+                    }
+                }
+                3 => {
+                    // Symmetric indefinite matrix with mixed diagonal signs
+                    let scale = 10.0_f64.powf(((idx / 5) % 6) as f64 * 0.6);
+                    for i in 0..n {
+                        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                        let mag = if i == n - 1 { 5.0 * scale } else { 5.0 + (i % 4) as f64 };
+                        rows.push(i);
+                        cols.push(i);
+                        data.push(sign * mag);
+                        if i > 0 {
+                            rows.extend([i, i - 1]);
+                            cols.extend([i - 1, i]);
+                            data.extend([0.9, 0.9]);
+                        }
+                    }
+                }
+                _ => {
+                    // Larger banded + far-coupling non-symmetric matrices up to n <= 500
+                    let scale = 10.0_f64.powf(((idx / 5) % 5) as f64 * 0.8);
+                    let stride = 3 + (idx % 7);
+                    for i in 0..n {
+                        let d = if i % 7 == 0 { 6.0 * scale } else { 6.0 };
+                        rows.push(i);
+                        cols.push(i);
+                        data.push(d);
+                        if i > 0 {
+                            rows.extend([i, i - 1]);
+                            cols.extend([i - 1, i]);
+                            data.extend([-1.2, -0.8]);
+                        }
+                        if i + stride < n {
+                            rows.extend([i, i + stride]);
+                            cols.extend([i + stride, i]);
+                            data.extend([0.4, -0.3]);
+                        }
+                    }
+                }
+            }
+
+            let csr = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+                .unwrap()
+                .to_csr()
+                .unwrap();
+            let est = estimate_sparse_cond_1norm(&csr);
+            let exact = exact_cond_1norm(&csr);
+            let ratio = est / exact;
+            assert!(
+                (0.1..=10.0).contains(&ratio),
+                "matrix #{idx} (family={family}, n={n}): est={est:.4e}, exact={exact:.4e}, ratio={ratio:.4}"
+            );
+            ratios.push(ratio);
+        }
+
+        ratios.sort_by(f64::total_cmp);
+        println!(
+            "estimate_sparse_cond_1norm ratio distribution over 200 matrices: min={:.4}, p10={:.4}, p50={:.4}, p90={:.4}, max={:.4}",
+            ratios[0],
+            ratios[20],
+            ratios[100],
+            ratios[180],
+            ratios[199]
+        );
+    }
+
+    #[test]
+    fn test_solve_with_casp_portfolio_unit_diagonal_ill_conditioned_spd() {
+        // Construct a unit-diagonal (A_ii = 1.0) SPD tridiagonal matrix with kappa ~ 10^10.
+        // The old diagonal ratio estimator reported max|diag|/min|diag| = 1.0, selected CG,
+        // failed to converge in max_iter, and in Strict mode returned the unconverged iterate.
+        let n = 24;
+        let c0 = 0.5 / (std::f64::consts::PI / (n as f64 + 1.0)).cos();
+        let beta = c0 * (1.0 - 1e-10);
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(1.0);
+            if i > 0 {
+                rows.extend([i, i - 1]);
+                cols.extend([i - 1, i]);
+                data.extend([-beta, -beta]);
+            }
+        }
+        let csr = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .unwrap()
+            .to_csr()
+            .unwrap();
+        let x_true: Vec<f64> = (0..n)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (1.0 + (i as f64) / (n as f64))
+            })
+            .collect();
+        let b = spmv_csr(&csr, &x_true).unwrap();
+
+        let cond_est = estimate_sparse_cond_1norm(&csr);
+        assert!(
+            cond_est >= 1e8,
+            "expected unit-diagonal ill-conditioned SPD cond_est >= 1e8, got {cond_est:.3e}"
+        );
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = IterativeSolveOptions {
+            mode: RuntimeMode::Strict,
+            tol: 1e-12,
+            max_iter: Some(8),
+            check_finite: true,
+        };
+        let res = solve_with_casp_portfolio(&csr, &b, None, &mut portfolio, opts)
+            .expect("solve_with_casp_portfolio must succeed");
+
+        assert!(res.cond_estimate >= 1e8, "res.cond_estimate = {:.3e}", res.cond_estimate);
+        assert_eq!(res.chosen_action, fsci_runtime::SparseSolverAction::SuperLU);
+        assert!(res.converged, "residual_norm = {:.3e}", res.residual_norm);
+
+        let ax = spmv_csr(&csr, &res.x).unwrap();
+        let r_norm: f64 = ax
+            .iter()
+            .zip(&b)
+            .map(|(axi, bi)| (axi - bi).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let b_norm: f64 = b.iter().map(|bi| bi.powi(2)).sum::<f64>().sqrt();
+        let rel_res = r_norm / b_norm;
+        assert!(
+            rel_res < 1e-10,
+            "expected ||Ax - b||/||b|| < 1e-10 on kappa=1e10 system, got rel_res={rel_res:.3e}"
+        );
+        assert!((res.residual_norm - rel_res).abs() <= 1e-12 * rel_res.max(1.0));
+    }
+
+    #[test]
+    fn test_solve_with_casp_portfolio_all_six_actions_reachable_and_direct_residual_exact() {
+        use fsci_runtime::SparseSolverAction;
+
+        let n = 8;
+        let b = vec![1.0; n];
+
+        // 1. ConjugateGradient: well-conditioned SPD (diag = 4, off-diag = -1)
+        let spd = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(4.0);
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([-1.0, -1.0]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        // 2. MinRes: symmetric indefinite well-conditioned (alternating +/-4 on diagonal)
+        let sym_indef = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(if i % 2 == 0 { 4.0 } else { -4.0 });
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([0.5, 0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        // 3. BiCGSTAB: non-symmetric well-conditioned (kappa ~ 3)
+        let nonsym_well = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(5.0);
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([-1.5, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        // 4. QMR: non-symmetric moderate condition (kappa ~ 1.5e4)
+        let nonsym_qmr = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(if i == 0 { 1.5e4 } else { 4.0 });
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([-1.0, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        // 5. GMRES: non-symmetric harder pre-direct band (kappa ~ 6e5)
+        let nonsym_gmres = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(if i == 0 { 2.0e6 } else { 4.0 });
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([-1.0, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        // 6. SuperLU: ill-conditioned (kappa ~ 1e9)
+        let ill_superlu = {
+            let (mut r, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                r.push(i);
+                c.push(i);
+                d.push(if i == 0 { 1.0e9 } else { 4.0 });
+                if i > 0 {
+                    r.extend([i, i - 1]);
+                    c.extend([i - 1, i]);
+                    d.extend([-1.0, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), d, r, c, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        };
+
+        let cases = [
+            (SparseSolverAction::ConjugateGradient, &spd),
+            (SparseSolverAction::MinRes, &sym_indef),
+            (SparseSolverAction::BiCGSTAB, &nonsym_well),
+            (SparseSolverAction::QMR, &nonsym_qmr),
+            (SparseSolverAction::GMRES, &nonsym_gmres),
+            (SparseSolverAction::SuperLU, &ill_superlu),
+        ];
+
+        let opts = IterativeSolveOptions {
+            tol: 1e-10,
+            ..IterativeSolveOptions::default()
+        };
+
+        for (expected_action, mat) in cases {
+            let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+            let res = solve_with_casp_portfolio(mat, &b, None, &mut portfolio, opts)
+                .expect("portfolio solve");
+            assert_eq!(
+                res.chosen_action, expected_action,
+                "expected {expected_action:?} for cond_estimate={:.3e}, structure={:?}",
+                res.cond_estimate, res.structure
+            );
+            assert!(res.converged, "{expected_action:?} did not converge");
+
+            let ax = spmv_csr(mat, &res.x).unwrap();
+            let r_norm: f64 = ax
+                .iter()
+                .zip(&b)
+                .map(|(axi, bi)| (axi - bi).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let b_norm: f64 = b.iter().map(|bi| bi.powi(2)).sum::<f64>().sqrt();
+            let recomputed_rel_res = r_norm / b_norm;
+            assert!(
+                recomputed_rel_res < 1e-7,
+                "{expected_action:?}: relative residual {recomputed_rel_res:.3e}"
+            );
+            if expected_action == SparseSolverAction::SuperLU {
+                assert!(
+                    (res.residual_norm - recomputed_rel_res).abs() <= 1e-15,
+                    "direct arm residual_norm ({:.3e}) must equal recomputed ||b - Ax||/||b|| ({:.3e})",
+                    res.residual_norm,
+                    recomputed_rel_res
+                );
+            }
+        }
     }
 }

@@ -11,9 +11,9 @@ use fsci_linalg::{
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
 use fsci_runtime::{
-    AuditAction, AuditScope, Fingerprinter, PortfolioEvidence, RuntimeMode, SparseSolverAction,
-    SparseSolverEvidenceEntry, SparseSolverPortfolio, SparseStructuralEvidence, audit_recover,
-    audit_reject,
+    AttemptOutcome, AuditAction, AuditScope, Fingerprinter, PortfolioEvidence, RuntimeMode,
+    SparseSolverAction, SparseSolverEvidenceEntry, SparseSolverPortfolio, SparseStructuralEvidence,
+    audit_recover, audit_reject,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -5273,6 +5273,79 @@ impl NativeSparseLu {
         solved
     }
 
+    /// Solve the transposed linear system `Aᵀ·x = b` using the row-packed factors in place.
+    ///
+    /// Since `solve` computes `x = Fᵀ · U⁻¹ · L⁻¹ · G · b` (where `(G·b)[r] = b[g[r]]` and
+    /// `(F·v)[i] = v[fill_perm[i]]`), its exact transpose is `x = Gᵀ · L⁻ᵀ · U⁻ᵀ · F · b`.
+    fn solve_transpose(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        if b.len() != self.n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("rhs length {} must match matrix size {}", b.len(), self.n),
+            });
+        }
+
+        let mut y: Vec<f64> = match self.fill_perm.as_deref() {
+            Some(fill) => fill.iter().map(|&old_i| b[old_i]).collect(),
+            None => b.to_vec(),
+        };
+
+        let upper_offsets = &self.upper.offsets;
+        let upper_columns = &self.upper.columns;
+        let upper_values = &self.upper.values;
+        for row in 0..self.n {
+            let start = upper_offsets[row];
+            let end = upper_offsets[row + 1];
+            let (diag_col, pivot) = if start < end {
+                (upper_columns[start] as usize, upper_values[start])
+            } else {
+                (usize::MAX, 0.0)
+            };
+            if diag_col != row || is_sparse_zero_pivot(pivot) {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("zero pivot in sparse LU transpose solve at row {row}"),
+                });
+            }
+            y[row] /= pivot;
+            let y_row = y[row];
+            if y_row != 0.0 {
+                for idx in (start + 1)..end {
+                    let col = upper_columns[idx] as usize;
+                    y[col] -= upper_values[idx] * y_row;
+                }
+            }
+        }
+
+        let lower_offsets = &self.lower.offsets;
+        let lower_columns = &self.lower.columns;
+        let lower_values = &self.lower.values;
+        for row in (0..self.n).rev() {
+            let y_row = y[row];
+            if y_row != 0.0 {
+                let start = lower_offsets[row];
+                let end = lower_offsets[row + 1];
+                for idx in start..end {
+                    let col = lower_columns[idx] as usize;
+                    y[col] -= lower_values[idx] * y_row;
+                }
+            }
+        }
+
+        let mut x = vec![0.0; self.n];
+        match self.rhs_gather.as_deref() {
+            Some(gather) => {
+                for (row, &val) in y.iter().enumerate() {
+                    x[gather[row]] = val;
+                }
+            }
+            None => {
+                for (row, &val) in y.iter().enumerate() {
+                    x[self.row_perm[row]] = val;
+                }
+            }
+        }
+        Ok(x)
+    }
+
     /// Solve one factor against a row-major panel of right-hand sides.
     ///
     /// The factor rows are traversed once, with the right-hand-side lane as the
@@ -6169,6 +6242,57 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
             Ok(x.iter().copied().collect())
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
+        SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
+        SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
+    }
+}
+
+/// Solve the transposed linear system `Aᵀ·x = b` using a precomputed sparse LU factorization
+/// (`scipy.sparse.linalg.SuperLU.solve(b, trans='T')`).
+pub fn splu_solve_transpose(
+    factorization: &SparseLuFactorization,
+    b: &[f64],
+) -> SparseResult<Vec<f64>> {
+    let n = factorization.shape.0;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: format!("rhs length {} must match matrix size {}", b.len(), n),
+        });
+    }
+    match &factorization.lu_internal {
+        SparseLuInternal::Dense(lu) => {
+            let u = lu.u();
+            let l = lu.l();
+            let mut y = b.to_vec();
+            for r in 0..n {
+                let pivot = u[(r, r)];
+                if is_sparse_zero_pivot(pivot) {
+                    return Err(SparseError::SingularMatrix {
+                        message: "LU factorization detected singular matrix".to_string(),
+                    });
+                }
+                y[r] /= pivot;
+                let yr = y[r];
+                if yr != 0.0 {
+                    for c in (r + 1)..n {
+                        y[c] -= u[(r, c)] * yr;
+                    }
+                }
+            }
+            for r in (0..n).rev() {
+                let zr = y[r];
+                if zr != 0.0 {
+                    for c in 0..r {
+                        y[c] -= l[(r, c)] * zr;
+                    }
+                }
+            }
+            let mut x = DVector::from_vec(y);
+            lu.p().inv_permute_rows(&mut x);
+            Ok(x.iter().copied().collect())
+        }
+        SparseLuInternal::Native(lu) => lu.solve_transpose(b),
+        // Both spectral stencils are symmetric (Aᵀ = A).
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
         SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
     }
@@ -12259,6 +12383,302 @@ pub fn casp_iterative_solve_with_audit(
     Ok(solved)
 }
 
+fn sparse_all_2x2_principal_minors_positive(a: &CsrMatrix, diag: &[f64]) -> bool {
+    let n = a.shape().rows.min(diag.len());
+    for row in 0..n {
+        let d_i = diag[row];
+        if d_i <= 0.0 {
+            return false;
+        }
+        let start = a.indptr()[row];
+        let end = a.indptr()[row + 1];
+        for idx in start..end {
+            let col = a.indices()[idx];
+            if col > row && col < n {
+                let a_ij = a.data()[idx];
+                let d_j = diag[col];
+                if a_ij * a_ij >= d_i * d_j {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Hager-Higham 1-norm inverse estimator `‖A⁻¹‖₁` over a precomputed [`NativeSparseLu`]
+/// (`frankenscipy-7tb8d.7`).
+///
+/// Runs Hager (1984) / Higham & Tisseur (2000) 1-norm ascent from three deterministic
+/// starting vectors (uniform `1/n`, alternating Nyquist `(-1)^i/n`, and the column with
+/// minimum 1-norm) using `lu.solve` and `lu.solve_transpose`.
+fn estimate_inv_onenorm_lu(a: &CsrMatrix, lu: &NativeSparseLu) -> Option<f64> {
+    let n = lu.n;
+    if n == 0 {
+        return Some(0.0);
+    }
+    let mut col_sums = vec![0.0_f64; n];
+    for (&col, &val) in a.indices().iter().zip(a.data().iter()) {
+        if col < n {
+            col_sums[col] += val.abs();
+        }
+    }
+    let min_col = col_sums
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map_or(0, |(idx, _)| idx);
+
+    let mut visited = vec![false; n];
+    let mut best_gamma = 0.0_f64;
+    let mut v = vec![0.0_f64; n];
+
+    for pass in 0..3 {
+        v.fill(0.0);
+        match pass {
+            0 => {
+                let inv_n = 1.0 / (n as f64);
+                v.fill(inv_n);
+            }
+            1 => {
+                let mut sum = 0.0;
+                for (i, slot) in v.iter_mut().enumerate() {
+                    let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                    let weight = 1.0 + (i as f64) / ((n.max(1)) as f64);
+                    *slot = sign * weight;
+                    sum += weight;
+                }
+                if sum > 0.0 {
+                    for slot in &mut v {
+                        *slot /= sum;
+                    }
+                }
+            }
+            _ => {
+                let start_col = if !visited[min_col] {
+                    min_col
+                } else {
+                    (0..n).find(|&j| !visited[j]).unwrap_or(min_col)
+                };
+                visited[start_col] = true;
+                v[start_col] = 1.0;
+            }
+        }
+
+        let mut prev_gamma = 0.0_f64;
+        for iter in 0..5 {
+            let w = lu.solve(&v).ok()?;
+            if w.iter().any(|x| !x.is_finite()) {
+                return Some(f64::INFINITY);
+            }
+            let gamma: f64 = w.iter().map(|x| x.abs()).sum();
+            if !gamma.is_finite() {
+                return Some(f64::INFINITY);
+            }
+            if gamma > best_gamma {
+                best_gamma = gamma;
+            }
+            if iter > 0 && gamma <= prev_gamma {
+                break;
+            }
+            prev_gamma = gamma;
+
+            let xi: Vec<f64> = w
+                .iter()
+                .map(|&x| if x >= 0.0 { 1.0 } else { -1.0 })
+                .collect();
+            let z = lu.solve_transpose(&xi).ok()?;
+            if z.iter().any(|x| !x.is_finite()) {
+                return Some(f64::INFINITY);
+            }
+
+            let mut j_max = 0usize;
+            let mut z_max = -1.0_f64;
+            for (j, &zj) in z.iter().enumerate() {
+                let abs_z = zj.abs();
+                if (iter == 0 && pass > 0 && visited[j]) || abs_z <= z_max {
+                    continue;
+                }
+                z_max = abs_z;
+                j_max = j;
+            }
+            if z_max < 0.0 {
+                for (j, &zj) in z.iter().enumerate() {
+                    let abs_z = zj.abs();
+                    if abs_z > z_max {
+                        z_max = abs_z;
+                        j_max = j;
+                    }
+                }
+            }
+
+            let z_dot_v: f64 = z.iter().zip(&v).map(|(zi, vi)| zi * vi).sum();
+            if iter > 0 && (z_max <= z_dot_v || visited[j_max]) {
+                break;
+            }
+            visited[j_max] = true;
+            v.fill(0.0);
+            v[j_max] = 1.0;
+        }
+    }
+
+    Some(best_gamma)
+}
+
+/// Matrix-free condition number lower-bound estimator for large sparse systems (`n > 1024`)
+/// where a full sparse LU factorization is deferred until action selection.
+fn estimate_sparse_cond_matrix_free(a: &CsrMatrix, norm_a: f64) -> f64 {
+    let n = a.shape().rows;
+    if n == 0 {
+        return 1.0;
+    }
+    let diag = sparse_diagonal(a);
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for &d in &diag {
+        let abs_d = d.abs();
+        if abs_d > 0.0 {
+            min_diag = min_diag.min(abs_d);
+            max_diag = max_diag.max(abs_d);
+        }
+    }
+    let diag_ratio = if min_diag > 0.0 && min_diag.is_finite() {
+        (max_diag / min_diag).max(1.0)
+    } else {
+        1.0
+    };
+
+    let mut col_sums = vec![0.0_f64; n];
+    for (&col, &val) in a.indices().iter().zip(a.data().iter()) {
+        if col < n {
+            col_sums[col] += val.abs();
+        }
+    }
+    let min_col_sum = col_sums
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    if min_col_sum == 0.0 {
+        return f64::INFINITY;
+    }
+    let col_ratio = if min_col_sum.is_finite() && min_col_sum > 0.0 {
+        (norm_a / min_col_sum).max(1.0)
+    } else {
+        1.0
+    };
+
+    // Short Golub-Kahan Lanczos bidiagonalization (k <= 8 steps) to estimate extremal singular ratio.
+    let at = sparse_transpose(a);
+    let steps = 8.min(n);
+    let mut u = vec![1.0 / (n as f64).sqrt(); n];
+    let mut v = vec![0.0_f64; n];
+    let mut alphas = Vec::with_capacity(steps);
+    let mut betas = Vec::with_capacity(steps);
+    let mut beta = 0.0_f64;
+    for step in 0..steps {
+        let mut r = spmv(&at, &u);
+        if step > 0 {
+            for (ri, &vi) in r.iter_mut().zip(&v) {
+                *ri -= beta * vi;
+            }
+        }
+        let alpha = vec_norm(&r);
+        if alpha <= f64::EPSILON * norm_a {
+            return f64::INFINITY;
+        }
+        for (vi, &ri) in v.iter_mut().zip(&r) {
+            *vi = ri / alpha;
+        }
+        alphas.push(alpha);
+
+        let mut p = spmv(a, &v);
+        for (pi, &ui) in p.iter_mut().zip(&u) {
+            *pi -= alpha * ui;
+        }
+        beta = vec_norm(&p);
+        betas.push(beta);
+        if beta <= f64::EPSILON * norm_a {
+            break;
+        }
+        for (ui, &pi) in u.iter_mut().zip(&p) {
+            *ui = pi / beta;
+        }
+    }
+
+    let k = alphas.len();
+    let lanczos_cond = if k > 0 {
+        let mut b_mat = DMatrix::<f64>::zeros(k, k);
+        for i in 0..k {
+            b_mat[(i, i)] = alphas[i];
+            if i + 1 < k {
+                b_mat[(i, i + 1)] = betas[i];
+            }
+        }
+        let svd = b_mat.svd(false, false);
+        let s_max = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
+        let s_min = svd
+            .singular_values
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        if s_min > 0.0 && s_min.is_finite() {
+            (s_max / s_min).max(1.0)
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        1.0
+    };
+
+    diag_ratio.max(col_ratio).max(lanczos_cond)
+}
+
+/// Estimate the 1-norm condition number `κ₁(A) = ‖A‖₁ · ‖A⁻¹‖₁` of a square sparse matrix
+/// (`frankenscipy-7tb8d.7`).
+///
+/// Combines the exact 1-norm [`onenormest`] with Hager–Higham 1-norm inverse estimation over
+/// [`NativeSparseLu`] (`solve` + `solve_transpose`) for `n <= 1024`, and a matrix-free
+/// column-norm + Golub–Kahan Lanczos estimator for larger systems.
+#[must_use]
+pub fn estimate_sparse_cond_1norm(a: &CsrMatrix) -> f64 {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return f64::INFINITY;
+    }
+    let n = shape.rows;
+    if n == 0 {
+        return 1.0;
+    }
+    if a.data().iter().any(|v| !v.is_finite()) {
+        return f64::INFINITY;
+    }
+    let norm_a = onenormest(a);
+    if !norm_a.is_finite() || norm_a <= 0.0 {
+        return f64::INFINITY;
+    }
+    if n == 1 {
+        return 1.0;
+    }
+
+    const MAX_LU_COND_N: usize = 1024;
+    if n <= MAX_LU_COND_N {
+        match NativeSparseLu::factorize_csr(a, 1.0, PermutationOrdering::Colamd) {
+            Ok(lu) => {
+                if let Some(inv_norm) = estimate_inv_onenorm_lu(a, &lu) {
+                    if !inv_norm.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    return (norm_a * inv_norm).max(1.0);
+                }
+            }
+            Err(SparseError::SingularMatrix { .. }) => return f64::INFINITY,
+            Err(_) => {}
+        }
+    }
+
+    estimate_sparse_cond_matrix_free(a, norm_a)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaspPortfolioSolveResult {
     pub chosen_action: SparseSolverAction,
@@ -12319,41 +12739,23 @@ pub fn solve_with_casp_portfolio(
 
     let is_sym = sparse_is_symmetric(a, iterative_opts.tol.max(1e-12));
     let pd_hint = if is_sym {
-        if has_strictly_positive_diagonal(a)
+        let diag = sparse_diagonal(a);
+        if diag.iter().any(|&d| d <= 0.0) {
+            Some(false)
+        } else if has_strictly_positive_diagonal(a)
             && is_row_diagonally_dominant(a, iterative_opts.tol.max(1e-12))
         {
             Some(true)
+        } else if !sparse_all_2x2_principal_minors_positive(a, &diag) {
+            Some(false)
         } else {
-            let diag = sparse_diagonal(a);
-            if diag.iter().any(|&d| d <= 0.0) {
-                Some(false)
-            } else {
-                None
-            }
+            None
         }
     } else {
         None
     };
 
-    let diag = sparse_diagonal(a);
-    let mut min_diag = f64::INFINITY;
-    let mut max_diag = 0.0_f64;
-    for &d in &diag {
-        let abs_d = d.abs();
-        if abs_d > 0.0 {
-            if abs_d < min_diag {
-                min_diag = abs_d;
-            }
-            if abs_d > max_diag {
-                max_diag = abs_d;
-            }
-        }
-    }
-    let cond_estimate = if min_diag > 0.0 && min_diag.is_finite() {
-        (max_diag / min_diag).max(1.0)
-    } else {
-        1e9
-    };
+    let cond_estimate = estimate_sparse_cond_1norm(a);
 
     let structural = SparseStructuralEvidence {
         is_symmetric: is_sym,
@@ -12423,6 +12825,14 @@ pub fn solve_with_casp_portfolio(
         }
     };
 
+    let action_outcome = if !converged || !res_norm.is_finite() {
+        AttemptOutcome::Failed
+    } else if res_norm > iterative_opts.tol.max(1e-12) {
+        AttemptOutcome::Inaccurate
+    } else {
+        AttemptOutcome::Ok
+    };
+
     // An iterative arm that did not converge falls back to the direct LU in BOTH modes. The
     // contract is `spsolve`'s, a solved system; Strict used to return the unconverged iterate
     // as Ok with only a warning string (frankenscipy-7tb8d.7). The fallback is recorded as
@@ -12441,6 +12851,7 @@ pub fn solve_with_casp_portfolio(
             (x, converged, iters, res_norm, fallback_active)
         };
 
+    portfolio.record_outcome(cond_estimate, Some(structural), action, action_outcome);
     portfolio.record_evidence(SparseSolverEvidenceEntry {
         component: "fsci-sparse",
         matrix_shape: (shape.rows, shape.cols),
