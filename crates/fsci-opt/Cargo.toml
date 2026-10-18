@@ -7,7 +7,8 @@ repository.workspace = true
 description = "Optimization and root-finding solvers for FrankenSciPy"
 
 [features]
-opt-incumbent-bench = ["dep:sha2"]
+opt-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
+bench-harness = ["fsci-runtime/bench-harness", "opt-incumbent-bench"]
 
 [lints]
 workspace = true
@@ -27,3 +28,7 @@ sha2 = "0.10.9"
 [[bench]]
 name = "optimize_bench"
 harness = false
+
+[[bin]]
+name = "perf_opt_vs_scipy"
+required-features = ["bench-harness"]

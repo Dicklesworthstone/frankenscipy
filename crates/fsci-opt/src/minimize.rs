@@ -202,12 +202,340 @@ pub struct OptPortfolioResult {
     pub fallback_active: bool,
 }
 
+/// Diagnostic probe of an optimization objective around `x0` (frankenscipy-7tb8d.8).
+///
+/// Budget: at most `2 * min(n, 8) + 11 <= 4 * n + 8` objective evaluations, all counted in
+/// [`Self::probe_nfev`] and included in [`OptimizeResult::nfev`] by [`minimize_with_casp`] and
+/// [`minimize_with_casp_portfolio`]:
+/// 1. **Noise estimate (`ECnoise` / Hamming difference table):** 7 equispaced points (reusing
+///    `f(x_probe)` at the center, so 6 additional evaluations) along a deterministic unit
+///    direction `u` with micro-step `h_noise = 1e-5 * max(||x_probe||_inf, 1)`. Level-3 and
+///    level-4 Moré–Wild difference-table estimators `eps3` and `eps4` separate computational or
+///    stochastic noise from smooth higher-order derivatives.
+/// 2. **Hessian conditioning estimate (finite-difference Rayleigh quotients):** central second
+///    differences along `k = min(n, 8)` orthonormal coordinate directions (`2k` evaluations) plus,
+///    for `n >= 2`, 2 rotated orthonormal directions `(e_0 +/- e_{n-1}) / sqrt(2)` (4 evaluations)
+///    that recover the exact eigenvalues of the `2 x 2` projected Hessian in the `(0, n - 1)`
+///    plane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectiveLandscapeProbe {
+    pub cond_estimate: f64,
+    pub noise_estimate: f64,
+    pub is_noisy: bool,
+    pub is_multimodal: bool,
+    pub rayleigh_quotients: Vec<f64>,
+    pub probe_nfev: usize,
+    pub initial_grad_norm: f64,
+}
+
+/// Probe `fun` around `x0` for Hessian conditioning and computational noise within `<= 4n + 8`
+/// evaluations (frankenscipy-7tb8d.8).
+pub fn probe_objective_landscape<F>(
+    fun: &F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    caller_is_noisy: bool,
+    caller_is_multimodal: bool,
+) -> Result<ObjectiveLandscapeProbe, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let n = x0.len();
+    let maxfev = options.maxfev.unwrap_or(usize::MAX);
+    let mut probe_nfev = 0_usize;
+
+    let mut eval = |x: &[f64]| -> Result<Option<f64>, OptError> {
+        if probe_nfev >= maxfev {
+            return Ok(None);
+        }
+        probe_nfev += 1;
+        let val = fun(x);
+        if !val.is_finite() && options.mode == RuntimeMode::Hardened {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("hardened mode rejects non-finite objective values"),
+            });
+        }
+        Ok(Some(val))
+    };
+
+    // Shift the probe center into the strict interior of box bounds when `x0` lies on or near a
+    // bound so symmetric finite-difference steps never collapse onto the boundary.
+    let mut x_probe = x0.to_vec();
+    let mut min_bound_margin = f64::INFINITY;
+    if let Some(bounds) = options.bounds
+        && bounds.len() == n
+    {
+        for (xi, &(lo, hi)) in x_probe.iter_mut().zip(bounds.iter()) {
+            let lo_val = lo.unwrap_or(f64::NEG_INFINITY);
+            let hi_val = hi.unwrap_or(f64::INFINITY);
+            if lo_val.is_finite() && hi_val.is_finite() {
+                let width = hi_val - lo_val;
+                if width > 0.0 {
+                    let pad = (0.125 * width).min(1.0e-2);
+                    *xi = xi.clamp(lo_val + pad, hi_val - pad);
+                    min_bound_margin = min_bound_margin
+                        .min((*xi - lo_val).max(0.0))
+                        .min((hi_val - *xi).max(0.0));
+                } else {
+                    *xi = lo_val;
+                    min_bound_margin = 0.0;
+                }
+            } else if lo_val.is_finite() {
+                let pad = 1.0e-2;
+                if *xi < lo_val + pad {
+                    *xi = lo_val + pad;
+                }
+                min_bound_margin = min_bound_margin.min((*xi - lo_val).max(0.0));
+            } else if hi_val.is_finite() {
+                let pad = 1.0e-2;
+                if *xi > hi_val - pad {
+                    *xi = hi_val - pad;
+                }
+                min_bound_margin = min_bound_margin.min((hi_val - *xi).max(0.0));
+            }
+        }
+    }
+
+    let Some(f0) = eval(&x_probe)? else {
+        return Ok(ObjectiveLandscapeProbe {
+            cond_estimate: variable_scale_ratio(x0),
+            noise_estimate: 0.0,
+            is_noisy: caller_is_noisy,
+            is_multimodal: caller_is_multimodal,
+            rayleigh_quotients: Vec::new(),
+            probe_nfev,
+            initial_grad_norm: 0.0,
+        });
+    };
+
+    let x_scale = x_probe
+        .iter()
+        .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+
+    // 1. Hamming / Moré-Wild ECnoise difference-table probe along a deterministic unit vector `u`.
+    let mut rng_state = options.seed.unwrap_or(0x7B8D_0008_CAFE_F00D);
+    for &xi in &x_probe {
+        rng_state ^= xi.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        rng_state = rng_state.rotate_left(27).wrapping_add(0x94D0_49BB_1331_11EB);
+    }
+    let mut u = Vec::with_capacity(n);
+    for _ in 0..n {
+        rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let unit = ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+        u.push(if unit.abs() < 0.1 {
+            if unit >= 0.0 { 0.5 } else { -0.5 }
+        } else {
+            unit
+        });
+    }
+    let u_norm = l2_norm(&u).max(f64::MIN_POSITIVE);
+    for ui in &mut u {
+        *ui /= u_norm;
+    }
+
+    let h_noise = if min_bound_margin.is_finite() {
+        (1.0e-5 * x_scale).min(min_bound_margin / 4.0)
+    } else {
+        1.0e-5 * x_scale
+    };
+
+    let mut noise_estimate = 0.0_f64;
+    let mut detected_noisy = false;
+    if h_noise > 0.0 && f0.is_finite() {
+        let mut table_vals = [f0; 7];
+        let mut all_valid = true;
+        let mut trial = x_probe.clone();
+        for (j, slot) in table_vals.iter_mut().enumerate() {
+            if j == 3 {
+                continue;
+            }
+            let offset = (j as isize - 3) as f64 * h_noise;
+            for i in 0..n {
+                trial[i] = x_probe[i] + offset * u[i];
+            }
+            if let Some(bounds) = options.bounds
+                && bounds.len() == n
+            {
+                project_onto_bounds(&mut trial, bounds);
+            }
+            match eval(&trial)? {
+                Some(v) if v.is_finite() => *slot = v,
+                _ => {
+                    all_valid = false;
+                    break;
+                }
+            }
+        }
+        if all_valid {
+            let mut d1 = [0.0_f64; 6];
+            for j in 0..6 {
+                d1[j] = table_vals[j + 1] - table_vals[j];
+            }
+            let mut d2 = [0.0_f64; 5];
+            for j in 0..5 {
+                d2[j] = d1[j + 1] - d1[j];
+            }
+            let mut d3 = [0.0_f64; 4];
+            for j in 0..4 {
+                d3[j] = d2[j + 1] - d2[j];
+            }
+            let mut d4 = [0.0_f64; 3];
+            for j in 0..3 {
+                d4[j] = d3[j + 1] - d3[j];
+            }
+            // Moré & Wild (2011) level-k noise variance: ((k!)^2 / (2k)!) * mean((Delta^k f)^2).
+            // For k = 3: (2k)! / (k!)^2 = 20; for k = 4: (2k)! / (k!)^2 = 70.
+            let eps3 = (d3.iter().map(|v| v * v).sum::<f64>() / (20.0 * 4.0)).sqrt();
+            let eps4 = (d4.iter().map(|v| v * v).sum::<f64>() / (70.0 * 3.0)).sqrt();
+            let sign_changes_3 = d3
+                .windows(2)
+                .filter(|w| w[0] * w[1] < 0.0)
+                .count();
+            let sign_changes_4 = d4
+                .windows(2)
+                .filter(|w| w[0] * w[1] < 0.0)
+                .count();
+            let f_scale = table_vals
+                .iter()
+                .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+            noise_estimate = eps4;
+            detected_noisy = eps4 > 1.0e-7 * f_scale
+                && (eps4 >= 0.05 * eps3 || sign_changes_3 >= 1 || sign_changes_4 >= 1);
+        }
+    }
+
+    // 2. Finite-difference Hessian Rayleigh quotients along k = min(n, 8) orthonormal axes
+    //    plus 2 rotated orthonormal directions in the (0, n - 1) plane when n >= 2.
+    let k_dirs = n.min(8);
+    let h_hess = if min_bound_margin.is_finite() {
+        (1.0e-4 * x_scale).min(min_bound_margin / 2.0)
+    } else {
+        1.0e-4 * x_scale
+    };
+
+    let mut rayleigh_quotients = Vec::with_capacity(k_dirs + 2);
+    let mut grad_sq_sum = 0.0_f64;
+    if h_hess > 0.0 && f0.is_finite() {
+        let mut trial = x_probe.clone();
+        for j in 0..k_dirs {
+            let axis = if k_dirs <= 1 {
+                0
+            } else {
+                j * (n - 1) / (k_dirs - 1)
+            };
+            let orig = trial[axis];
+            trial[axis] = orig + h_hess;
+            let Some(fp) = eval(&trial)? else {
+                trial[axis] = orig;
+                break;
+            };
+            trial[axis] = orig - h_hess;
+            let Some(fm) = eval(&trial)? else {
+                trial[axis] = orig;
+                break;
+            };
+            trial[axis] = orig;
+            if fp.is_finite() && fm.is_finite() {
+                let rq = (fp - 2.0 * f0 + fm) / (h_hess * h_hess);
+                let g_axis = (fp - fm) / (2.0 * h_hess);
+                rayleigh_quotients.push(rq);
+                grad_sq_sum += g_axis * g_axis;
+            }
+        }
+
+        if n >= 2 && rayleigh_quotients.len() >= 2 {
+            let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+            let step = h_hess * inv_sqrt2;
+            let (x0_orig, xn_orig) = (trial[0], trial[n - 1]);
+
+            // u_+ = (e_0 + e_{n-1}) / sqrt(2)
+            trial[0] = x0_orig + step;
+            trial[n - 1] = xn_orig + step;
+            let fp_plus = eval(&trial)?;
+            trial[0] = x0_orig - step;
+            trial[n - 1] = xn_orig - step;
+            let fm_plus = eval(&trial)?;
+
+            // u_- = (e_0 - e_{n-1}) / sqrt(2)
+            trial[0] = x0_orig + step;
+            trial[n - 1] = xn_orig - step;
+            let fp_minus = eval(&trial)?;
+            trial[0] = x0_orig - step;
+            trial[n - 1] = xn_orig + step;
+            let fm_minus = eval(&trial)?;
+
+            trial[0] = x0_orig;
+            trial[n - 1] = xn_orig;
+
+            if let (Some(fpp), Some(fmp), Some(fpm), Some(fmm)) =
+                (fp_plus, fm_plus, fp_minus, fm_minus)
+                && fpp.is_finite()
+                && fmp.is_finite()
+                && fpm.is_finite()
+                && fmm.is_finite()
+            {
+                let rq_plus = (fpp - 2.0 * f0 + fmp) / (h_hess * h_hess);
+                let rq_minus = (fpm - 2.0 * f0 + fmm) / (h_hess * h_hess);
+                let a = rayleigh_quotients[0];
+                let c = *rayleigh_quotients.last().expect("at least 2 quotients");
+                let b = 0.5 * (rq_plus - rq_minus);
+                let mean = 0.5 * (a + c);
+                let half_diff = 0.5 * (a - c);
+                let disc = (half_diff * half_diff + b * b).sqrt();
+                rayleigh_quotients.push(mean + disc);
+                rayleigh_quotients.push(mean - disc);
+            }
+        }
+    }
+
+    let is_noisy = caller_is_noisy || detected_noisy;
+    let hessian_cond = if n <= 1 || is_noisy || rayleigh_quotients.is_empty() {
+        1.0
+    } else {
+        let mut max_curv = 0.0_f64;
+        let mut min_curv = f64::INFINITY;
+        for &rq in &rayleigh_quotients {
+            let mag = rq.abs();
+            if mag.is_finite() {
+                max_curv = max_curv.max(mag);
+                if mag > 0.0 {
+                    min_curv = min_curv.min(mag);
+                }
+            }
+        }
+        if max_curv <= 0.0 {
+            1.0
+        } else if !min_curv.is_finite() || min_curv <= 1.0e-12 * max_curv {
+            1.0e8
+        } else {
+            (max_curv / min_curv).max(1.0)
+        }
+    };
+
+    let cond_estimate = hessian_cond.max(variable_scale_ratio(x0));
+    let initial_grad_norm = grad_sq_sum.sqrt();
+
+    Ok(ObjectiveLandscapeProbe {
+        cond_estimate,
+        noise_estimate,
+        is_noisy,
+        is_multimodal: caller_is_multimodal,
+        rayleigh_quotients,
+        probe_nfev,
+        initial_grad_norm,
+    })
+}
+
 /// Minimize an objective function using CASP Bayesian expected-loss portfolio selection.
 ///
 /// Dispatches across BFGS (smooth convex), TrustRegionNewtonCG (narrow valley / high curvature),
 /// DIRECT (multimodal global exploration), Nelder-Mead (noisy non-smooth), and L-BFGS-B (bounded).
 /// When `options.bounds` constrains any variable, only methods that honour bounds are
-/// candidates: L-BFGS-B, plus DIRECT when every bound is finite.
+/// candidates: L-BFGS-B, Nelder-Mead, plus DIRECT when every bound is finite.
 pub fn minimize_with_casp_portfolio<F>(
     fun: F,
     x0: &[f64],
@@ -287,55 +615,133 @@ where
             ),
         });
     }
+    validate_bounds_for_x0(x0, options.bounds)?;
 
-    // br-szq1n.9: bounds are a feasibility constraint, not a preference. L-BFGS-B
-    // and Nelder-Mead (which clips every trial point, as SciPy's does, since
-    // br-szq1n.7) honour arbitrary bounds, and DIRECT needs every side finite; BFGS
-    // and Newton-CG ignore `options.bounds` and would return an infeasible x
-    // reported as success. Restrict the candidates BEFORE the argmin.
+    // br-szq1n.9 / frankenscipy-7tb8d.8: bounds are a feasibility constraint, not a preference.
+    // L-BFGS-B and Nelder-Mead honour arbitrary bounds, and DIRECT requires every side finite;
+    // BFGS and Newton-CG ignore `options.bounds` and would return an infeasible x reported as
+    // success. Restrict the candidates BEFORE the argmin.
     let active_bounds = options
         .bounds
         .filter(|b| b.iter().any(|&(lo, hi)| lo.is_some() || hi.is_some()));
+    let all_bounds_finite = active_bounds.is_some_and(|b| {
+        b.len() == x0.len()
+            && b.iter()
+                .all(|&(lo, hi)| lo.is_some_and(f64::is_finite) && hi.is_some_and(f64::is_finite))
+    });
     let feasible: Vec<OptSolverAction> = match active_bounds {
-        None => OptSolverAction::ALL.to_vec(),
-        Some(b) => {
+        None => {
+            if is_multimodal {
+                OptSolverAction::ALL.to_vec()
+            } else {
+                vec![
+                    OptSolverAction::BFGS,
+                    OptSolverAction::LBFGSB,
+                    OptSolverAction::NelderMead,
+                    OptSolverAction::TrustRegionNewtonCG,
+                ]
+            }
+        }
+        Some(_) => {
             let mut v = vec![OptSolverAction::LBFGSB, OptSolverAction::NelderMead];
-            if b.iter().all(|&(lo, hi)| lo.is_some() && hi.is_some()) {
+            if all_bounds_finite || is_multimodal {
                 v.push(OptSolverAction::DIRECT);
             }
             v
         }
     };
 
-    let cond_estimate = variable_scale_ratio(x0);
-    let (action, posterior, expected_losses, chosen_loss) =
-        portfolio.select_action_among(cond_estimate, is_noisy, is_multimodal, &feasible);
+    let probe = probe_objective_landscape(&fun, x0, options, is_noisy, is_multimodal)?;
+    let cond_estimate = probe.cond_estimate;
+    let effective_noisy = probe.is_noisy;
+    let effective_multimodal = probe.is_multimodal;
+
+    let (action, posterior, expected_losses, chosen_loss) = portfolio.select_action_among(
+        cond_estimate,
+        effective_noisy,
+        effective_multimodal,
+        &feasible,
+    );
+
+    let solver_options = MinimizeOptions {
+        maxfev: options
+            .maxfev
+            .map(|limit| limit.saturating_sub(probe.probe_nfev).max(1)),
+        ..options
+    };
 
     let (result, fallback_active) = match action {
         OptSolverAction::BFGS => {
-            let res = bfgs(&fun, x0, options)?;
+            let res = bfgs(&fun, x0, solver_options)?;
             (res, false)
         }
         OptSolverAction::LBFGSB => {
-            let res = lbfgsb(&fun, x0, options, options.bounds)?;
+            let res = lbfgsb(&fun, x0, solver_options, solver_options.bounds)?;
             (res, false)
         }
         OptSolverAction::NelderMead => {
-            let res = nelder_mead(&fun, x0, options)?;
+            let res = nelder_mead(&fun, x0, solver_options)?;
             (res, false)
         }
         OptSolverAction::TrustRegionNewtonCG => {
-            let res = newton_cg(&fun, x0, options)?;
+            let mut res = newton_cg(&fun, x0, solver_options)?;
+            // When called with a bare closure (`gradient: None`), the first Newton-CG pass
+            // steps the stiff coordinates into the valley bottom (dropping f(x) by orders of
+            // magnitude), where a single warm-started Newton-CG pass resolves the soft
+            // coordinates without f(x0) cancellation roundoff. When `gradient`/`hess`/`hessp`
+            // is supplied, preserve the single SciPy Newton-CG run verbatim.
+            if solver_options.gradient.is_none()
+                && solver_options.hess.is_none()
+                && solver_options.hessp.is_none()
+                && res.nit > 0
+                && res.x.as_slice() != x0
+            {
+                let refine_options = MinimizeOptions {
+                    maxfev: solver_options
+                        .maxfev
+                        .map(|limit| limit.saturating_sub(res.nfev).max(1)),
+                    ..solver_options
+                };
+                if let Ok(polished) = newton_cg(&fun, &res.x, refine_options)
+                    && (polished.success
+                        || polished.fun.unwrap_or(f64::INFINITY)
+                            < res.fun.unwrap_or(f64::INFINITY))
+                {
+                    res = OptimizeResult {
+                        success: res.success || polished.success,
+                        status: if polished.success {
+                            polished.status
+                        } else {
+                            res.status
+                        },
+                        message: if polished.success {
+                            polished.message
+                        } else {
+                            res.message
+                        },
+                        nfev: res.nfev.saturating_add(polished.nfev),
+                        njev: res.njev.saturating_add(polished.njev),
+                        nhev: res.nhev.saturating_add(polished.nhev),
+                        nit: res.nit.saturating_add(polished.nit),
+                        ..polished
+                    };
+                }
+            }
             (res, false)
         }
         OptSolverAction::DIRECT => {
-            let (lb, ub): (Vec<f64>, Vec<f64>) = if let Some(bnds) = options.bounds {
-                bnds.iter()
-                    .map(|b| (b.0.unwrap_or(-10.0), b.1.unwrap_or(10.0)))
-                    .unzip()
-            } else {
-                x0.iter().map(|&x| (x - 10.0, x + 10.0)).unzip()
-            };
+            if !all_bounds_finite {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from(
+                        "DIRECT requires explicit finite lower and upper bounds on every variable",
+                    ),
+                });
+            }
+            let bnds = options.bounds.expect("verified all_bounds_finite");
+            let (lb, ub): (Vec<f64>, Vec<f64>) = bnds
+                .iter()
+                .map(|&(lo, hi)| (lo.expect("finite lower"), hi.expect("finite upper")))
+                .unzip();
             let direct_bounds = Bounds::new(lb, ub)?;
             let direct_res = crate::direct::direct(
                 &fun,
@@ -366,16 +772,39 @@ where
 
     // The Hardened retry uses Nelder-Mead, which receives the same `options` and so
     // honours the same bounds (br-szq1n.7).
-    let (final_res, final_fallback) = if !result.success
+    let (mut final_res, final_fallback) = if !result.success
         && action != OptSolverAction::DIRECT
         && portfolio.mode() == RuntimeMode::Hardened
     {
-        match nelder_mead(&fun, x0, options) {
-            Ok(nm) => (nm, true),
+        match nelder_mead(&fun, x0, solver_options) {
+            Ok(mut nm) => {
+                nm.nfev = nm.nfev.saturating_add(result.nfev);
+                (nm, true)
+            }
             Err(_) => (result, fallback_active),
         }
     } else {
         (result, fallback_active)
+    };
+
+    final_res.nfev = final_res.nfev.saturating_add(probe.probe_nfev);
+
+    // Note: Newton-CG's `result.jac` is the gradient at the start of the last outer iteration
+    // (before the final Newton step), not at `result.x`.
+    let final_grad_norm = if action == OptSolverAction::TrustRegionNewtonCG && final_res.success {
+        0.0
+    } else {
+        match (&final_res.jac, active_bounds) {
+            (Some(g), Some(b)) => l2_norm(&projected_gradient(&final_res.x, g, b)),
+            (Some(g), None) => l2_norm(g),
+            (None, _) => {
+                if final_res.success {
+                    0.0
+                } else {
+                    probe.initial_grad_norm.max(1.0)
+                }
+            }
+        }
     };
 
     portfolio.record_evidence(OptSolverEvidenceEntry {
@@ -387,8 +816,11 @@ where
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: chosen_loss,
         fallback_active: final_fallback,
-        gradient_norm: None,
+        gradient_norm: Some(final_grad_norm),
     });
+    if !final_res.success {
+        portfolio.observe_step_failure(final_grad_norm.max(1.0));
+    }
 
     if let Some(audit) = audit {
         audit.record(
@@ -407,11 +839,14 @@ where
                         cond_estimate.into(),
                     ),
                     ("dimension".to_string(), (x0.len() as f64).into()),
-                    ("is_noisy".to_string(), is_noisy.to_string().into()),
+                    ("is_noisy".to_string(), effective_noisy.to_string().into()),
                     (
                         "is_multimodal".to_string(),
-                        is_multimodal.to_string().into(),
+                        effective_multimodal.to_string().into(),
                     ),
+                    ("noise_estimate".to_string(), probe.noise_estimate.into()),
+                    ("probe_nfev".to_string(), (probe.probe_nfev as f64).into()),
+                    ("gradient_norm".to_string(), final_grad_norm.into()),
                 ]),
             },
             &format!("CASP selected {action:?}"),
@@ -435,9 +870,11 @@ where
 
 /// Minimize an objective function using CASP condition-aware portfolio selection.
 ///
-/// Dispatches among BFGS (smooth), L-BFGS-B (bounded), Nelder-Mead (noisy),
-/// TrustRegionNewtonCG (narrow valley), and DIRECT (global exploration)
-/// via Bayesian expected-loss minimization, with automatic condition diagnostics.
+/// Probes `fun` around `x0` (within `<= 4n + 8` evaluations, counted in `result.nfev`) for
+/// Hessian conditioning and computational noise, then dispatches among BFGS (smooth),
+/// L-BFGS-B (bounded), Nelder-Mead (noisy), TrustRegionNewtonCG (narrow valley / ill-conditioned),
+/// and DIRECT (global exploration on explicit finite bounds) via Bayesian expected-loss
+/// minimization.
 pub fn minimize_with_casp<F>(
     fun: F,
     x0: &[f64],
@@ -8602,8 +9039,30 @@ mod tests {
 
     #[test]
     fn test_minimize_with_casp_portfolio_multimodal_routes_to_direct() {
+        static BOUNDS: [crate::types::Bound; 2] =
+            [(Some(-10.0), Some(10.0)), (Some(-10.0), Some(10.0))];
         let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let options = MinimizeOptions {
+            bounds: Some(&BOUNDS),
+            ..MinimizeOptions::default()
+        };
         let res = minimize_with_casp_portfolio(
+            convex_bowl,
+            &[1.0, 1.0],
+            options,
+            &mut portfolio,
+            false,
+            true,
+        )
+        .expect("portfolio minimize with explicit finite bounds");
+
+        assert_eq!(res.chosen_action, OptSolverAction::DIRECT);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+
+        // frankenscipy-7tb8d.8: DIRECT refuses missing or half-infinite bounds with a typed
+        // OptError::InvalidArgument instead of inventing x0 +/- 10.0.
+        let unbounded_err = minimize_with_casp_portfolio(
             convex_bowl,
             &[1.0, 1.0],
             MinimizeOptions::default(),
@@ -8611,11 +9070,198 @@ mod tests {
             false,
             true,
         )
-        .expect("portfolio minimize");
+        .expect_err("DIRECT without bounds must fail closed");
+        assert!(
+            matches!(unbounded_err, OptError::InvalidArgument { ref detail } if detail.contains("DIRECT requires explicit finite")),
+            "unexpected error: {unbounded_err:?}"
+        );
 
-        assert_eq!(res.chosen_action, OptSolverAction::DIRECT);
-        assert!(res.result.success);
+        static HALF_OPEN: [crate::types::Bound; 2] =
+            [(Some(-10.0), None), (Some(-10.0), Some(10.0))];
+        let half_open_err = minimize_with_casp_portfolio(
+            convex_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions {
+                bounds: Some(&HALF_OPEN),
+                ..MinimizeOptions::default()
+            },
+            &mut portfolio,
+            false,
+            true,
+        )
+        .expect_err("DIRECT with open upper bound must fail closed");
+        assert!(
+            matches!(half_open_err, OptError::InvalidArgument { ref detail } if detail.contains("DIRECT requires explicit finite")),
+            "unexpected error: {half_open_err:?}"
+        );
+    }
+
+    /// frankenscipy-7tb8d.8 negative case: on an ill-conditioned quadratic `diag(1 .. 1e8)` with
+    /// `x0 = [0, 0, 0]`, `variable_scale_ratio(x0)` is `1.0`, whereas the FD Rayleigh-quotient
+    /// probe estimates `>= 1e6` (`1e8`) and routes `minimize_with_casp` to `TrustRegionNewtonCG`.
+    #[test]
+    fn test_minimize_with_casp_ill_conditioned_quadratic_at_zero_detects_conditioning() {
+        use fsci_runtime::PortfolioEvidence;
+
+        let ill_quad = |x: &[f64]| -> f64 {
+            (x[0] - 1.0).powi(2) + 1.0e4 * (x[1] + 2.0).powi(2) + 1.0e8 * (x[2] - 0.5).powi(2)
+        };
+        let x0 = [0.0, 0.0, 0.0];
+        assert_eq!(super::variable_scale_ratio(&x0), 1.0);
+
+        let probe = super::probe_objective_landscape(
+            &ill_quad,
+            &x0,
+            MinimizeOptions::default(),
+            false,
+            false,
+        )
+        .expect("probe ill-conditioned quadratic");
+        println!(
+            "ill_quad probe: cond_estimate={:e}, rayleigh_quotients={:?}, noise_estimate={:e}, probe_nfev={}",
+            probe.cond_estimate, probe.rayleigh_quotients, probe.noise_estimate, probe.probe_nfev
+        );
+        assert!(
+            probe.cond_estimate >= 1.0e6,
+            "expected cond_estimate >= 1e6 at x0=0, got {:e}",
+            probe.cond_estimate
+        );
+        assert!(!probe.is_noisy, "smooth ill-conditioned quadratic is not noisy");
+        assert!(
+            probe.probe_nfev <= 4 * x0.len() + 8,
+            "probe_nfev {} exceeded budget {}",
+            probe.probe_nfev,
+            4 * x0.len() + 8
+        );
+
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp(ill_quad, &x0, MinimizeOptions::default(), &mut portfolio)
+            .expect("minimize_with_casp on ill-conditioned quadratic");
+        assert_eq!(res.chosen_action, OptSolverAction::TrustRegionNewtonCG);
+        assert!(res.result.success, "{}", res.result.message);
+        assert!((res.result.x[0] - 1.0).abs() < 1.0e-4, "x={:?}", res.result.x);
+        assert!((res.result.x[1] + 2.0).abs() < 1.0e-4, "x={:?}", res.result.x);
+        assert!((res.result.x[2] - 0.5).abs() < 1.0e-4, "x={:?}", res.result.x);
+
+        let entry = portfolio.evidence().back().expect("recorded evidence");
+        assert!(
+            entry.condition_number_estimate >= 1.0e6,
+            "recorded condition_number_estimate {:e} < 1e6",
+            entry.condition_number_estimate
+        );
+    }
+
+    /// frankenscipy-7tb8d.8: on a noisy objective (quadratic + 1e-3 uniform noise),
+    /// `minimize_with_casp` detects noise via the Moré–Wild ECnoise difference table and selects
+    /// `NelderMead` without any caller flag.
+    #[test]
+    fn test_minimize_with_casp_noisy_objective_selects_nelder_mead_without_caller_flag() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let rng = AtomicU64::new(0x1234_5678_9ABC_DEF0);
+        let noisy_quadratic = |x: &[f64]| -> f64 {
+            let mut z = rng
+                .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let u = ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0; // uniform in [-1, 1]
+            let noise = 1.0e-3 * u;
+            (x[0] - 1.5).powi(2) + (x[1] + 0.5).powi(2) + noise
+        };
+
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp(
+            noisy_quadratic,
+            &[0.5, -1.5],
+            MinimizeOptions::default(),
+            &mut portfolio,
+        )
+        .expect("minimize_with_casp on noisy quadratic");
+        println!(
+            "noisy_quadratic: chosen={:?}, x={:?}, nfev={}",
+            res.chosen_action, res.result.x, res.result.nfev
+        );
+        assert_eq!(
+            res.chosen_action,
+            OptSolverAction::NelderMead,
+            "ECnoise probe must detect 1e-3 uniform noise and route to NelderMead without caller flag"
+        );
+        assert!((res.result.x[0] - 1.5).abs() < 0.15, "x={:?}", res.result.x);
+        assert!((res.result.x[1] + 0.5).abs() < 0.15, "x={:?}", res.result.x);
+    }
+
+    /// frankenscipy-7tb8d.8: calibrator receives >= 1 observation per call, `observe_step_failure`
+    /// is invoked on non-convergence, and `result.nfev` includes the landscape probe evaluations.
+    #[test]
+    fn test_minimize_with_casp_feeds_calibrator_and_includes_probe_nfev() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let eval_counter = AtomicUsize::new(0);
+        let counted_bowl = |x: &[f64]| -> f64 {
+            eval_counter.fetch_add(1, Ordering::Relaxed);
+            convex_bowl(x)
+        };
+
+        let standalone = bfgs(&convex_bowl, &[1.0, 1.0], MinimizeOptions::default())
+            .expect("standalone bfgs");
+
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        assert_eq!(portfolio.evidence_len(), 0);
+        assert_eq!(portfolio.calibrator().total_predictions(), 0);
+
+        let res = minimize_with_casp(
+            counted_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions::default(),
+            &mut portfolio,
+        )
+        .expect("casp minimize");
+        let actual_calls = eval_counter.load(Ordering::Relaxed);
+        let probe_nfev = res.result.nfev.saturating_sub(standalone.nfev);
+        println!(
+            "nfev split: probe_nfev={probe_nfev}, solve_nfev={}, total_nfev={}, actual_calls={actual_calls}",
+            standalone.nfev, res.result.nfev
+        );
+
+        assert_eq!(
+            res.result.nfev, actual_calls,
+            "result.nfev must equal the exact total objective evaluations including probe"
+        );
+        assert!(
+            probe_nfev >= 7 && probe_nfev <= 4 * 2 + 8,
+            "probe_nfev={probe_nfev} must lie in [7, 16]"
+        );
         assert_eq!(portfolio.evidence_len(), 1);
+        assert_eq!(portfolio.calibrator().total_predictions(), 1);
+        assert_eq!(portfolio.calibrator().empirical_miscoverage(), 0.0);
+
+        // A failed solve (maxiter=1 on Rosenbrock in Strict mode) must call observe_step_failure
+        // and register a violation in the calibrator.
+        let failed = minimize_with_casp(
+            rosenbrock,
+            &[-1.2, 1.0],
+            MinimizeOptions {
+                maxiter: Some(1),
+                tol: Some(1.0e-14),
+                mode: RuntimeMode::Strict,
+                ..MinimizeOptions::default()
+            },
+            &mut portfolio,
+        )
+        .expect("casp minimize maxiter=1");
+        assert!(!failed.result.success);
+        assert_eq!(portfolio.evidence_len(), 2);
+        assert!(
+            portfolio.calibrator().total_predictions() >= 2,
+            "calibrator predictions={}",
+            portfolio.calibrator().total_predictions()
+        );
+        assert!(
+            portfolio.calibrator().empirical_miscoverage() > 0.0,
+            "failed solve must record a calibrator violation via observe_step_failure"
+        );
     }
 
     // br-szq1n.9: expected optima are live SciPy 1.17.1
