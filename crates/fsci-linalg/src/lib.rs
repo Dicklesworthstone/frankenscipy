@@ -3665,10 +3665,11 @@ fn run_portfolio_attempts(
     posterior: [f64; 4],
     expected_losses: [f64; 6],
     decision: PortfolioDecision,
-) -> (SolverAction, Result<SolveResult, LinalgError>) {
+) -> (SolverAction, Vec<f64>, Result<SolveResult, LinalgError>) {
     let applicable = candidate_actions(report.structural_evidence);
     let rcond = report.rcond_estimate;
     let mut tried: Vec<SolverAction> = Vec::with_capacity(applicable.len());
+    let mut inaccurate_errors: Vec<f64> = Vec::new();
     let mut last_error = None;
     let mut accepted: Option<(SolverAction, SolveResult)> = None;
     let mut least_inaccurate: Option<(SolverAction, SolveResult)> = None;
@@ -3693,6 +3694,7 @@ fn run_portfolio_attempts(
                     break;
                 }
                 portfolio.record_outcome(rcond, action, AttemptOutcome::Inaccurate);
+                inaccurate_errors.push(omega);
                 let improves = least_inaccurate
                     .as_ref()
                     .is_none_or(|(_, best)| omega < best.backward_error.unwrap_or(f64::INFINITY));
@@ -3722,6 +3724,14 @@ fn run_portfolio_attempts(
             _ => break,
         }
     }
+    let superseded_inaccurate = if accepted.is_some() {
+        inaccurate_errors
+    } else {
+        if !inaccurate_errors.is_empty() {
+            inaccurate_errors.pop();
+        }
+        inaccurate_errors
+    };
     match accepted.or(least_inaccurate) {
         Some((action, mut solve_result)) => {
             let accuracy = certify_accuracy(
@@ -3741,10 +3751,11 @@ fn run_portfolio_attempts(
                 accuracy,
                 decision,
             ));
-            (action, Ok(solve_result))
+            (action, superseded_inaccurate, Ok(solve_result))
         }
         None => (
             selected_action,
+            superseded_inaccurate,
             Err(last_error.unwrap_or(LinalgError::SingularMatrix)),
         ),
     }
@@ -3843,7 +3854,7 @@ fn solve_with_portfolio_internal(
 
     let decision =
         PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
-    let (actual_action, result) = run_portfolio_attempts(
+    let (actual_action, superseded_inaccurate, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
         &effective_a,
@@ -3878,6 +3889,9 @@ fn solve_with_portfolio_internal(
     });
 
     if record_evidence {
+        for omega in superseded_inaccurate {
+            portfolio.observe_backward_error(omega);
+        }
         let fallback_active = actual_action != selected_action;
         let backward_error = result
             .as_ref()
@@ -4075,7 +4089,7 @@ fn solve_audited(
 
     let decision =
         PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
-    let (actual_action, result) = run_portfolio_attempts(
+    let (actual_action, superseded_inaccurate, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
         &effective_a,
@@ -4163,6 +4177,9 @@ fn solve_audited(
     });
 
     // Record evidence to portfolio
+    for omega in superseded_inaccurate {
+        portfolio.observe_backward_error(omega);
+    }
     let backward_error = result
         .as_ref()
         .ok()
