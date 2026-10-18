@@ -454,6 +454,18 @@ trait IvpSolver<F> {
     fn dense_output_at(&self, _t: f64) -> Option<Vec<f64>> {
         None
     }
+    fn step_rejections(&self) -> usize {
+        0
+    }
+    fn hairer_wanner_stiff_count(&self) -> usize {
+        0
+    }
+    fn hairer_wanner_max_stiff_streak(&self) -> usize {
+        0
+    }
+    fn hairer_wanner_spectral_radius(&self) -> f64 {
+        0.0
+    }
 }
 
 impl<F> IvpSolver<F> for RkSolver
@@ -498,6 +510,18 @@ where
     }
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
+    }
+    fn step_rejections(&self) -> usize {
+        self.step_rejections()
+    }
+    fn hairer_wanner_stiff_count(&self) -> usize {
+        self.hairer_wanner_stiff_count()
+    }
+    fn hairer_wanner_max_stiff_streak(&self) -> usize {
+        self.hairer_wanner_max_stiff_streak()
+    }
+    fn hairer_wanner_spectral_radius(&self) -> f64 {
+        self.hairer_wanner_spectral_radius()
     }
 }
 
@@ -942,11 +966,20 @@ where
     }
 }
 
-fn solve_ivp_core<F, S>(
+#[derive(Debug, Clone, Copy, Default)]
+struct IvpRunDiagnostics {
+    step_rejections: usize,
+    hw_max_streak: usize,
+    hw_spectral_radius: f64,
+    hw_aborted: bool,
+}
+
+fn solve_ivp_core_with_diag<F, S>(
     fun: &mut F,
     mut solver: S,
     options: &SolveIvpOptions<'_>,
-) -> Result<SolveIvpResult, IntegrateValidationError>
+    hw_abort_streak: Option<usize>,
+) -> Result<(SolveIvpResult, IvpRunDiagnostics), IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
     S: IvpSolver<F>,
@@ -997,6 +1030,7 @@ where
     }
 
     let mut status: i32 = -1;
+    let mut hw_aborted = false;
 
     while solver.ivp_state() == OdeSolverState::Running {
         match solver.step_with(fun) {
@@ -1150,6 +1184,13 @@ where
 
                 if outcome.state == OdeSolverState::Finished {
                     status = 0;
+                } else if let Some(limit) = hw_abort_streak
+                    && solver.hairer_wanner_stiff_count() >= limit
+                    && solver.hairer_wanner_spectral_radius() * (tf - t0).abs() >= 1e3
+                {
+                    status = -1;
+                    hw_aborted = true;
+                    break;
                 }
             }
             Err(_) => {
@@ -1162,6 +1203,10 @@ where
     let message = match status {
         0 => MSG_SUCCESS.to_owned(),
         1 => "A termination event occurred.".to_owned(),
+        _ if hw_aborted => {
+            "Hairer-Wanner per-step stiffness detector triggered; switching to stiff solver."
+                .to_owned()
+        }
         _ => MSG_FAILED.to_owned(),
     };
 
@@ -1171,19 +1216,29 @@ where
         alt_segment: matches!(options.method, SolverKind::Bdf | SolverKind::Lsoda),
     });
 
-    Ok(SolveIvpResult {
-        t: ts,
-        y: ys,
-        sol,
-        t_events,
-        y_events,
-        nfev: solver.nfev(),
-        njev: solver.njev(),
-        nlu: solver.nlu(),
-        status,
-        message,
-        success: status >= 0,
-    })
+    let diag = IvpRunDiagnostics {
+        step_rejections: solver.step_rejections(),
+        hw_max_streak: solver.hairer_wanner_max_stiff_streak(),
+        hw_spectral_radius: solver.hairer_wanner_spectral_radius(),
+        hw_aborted,
+    };
+
+    Ok((
+        SolveIvpResult {
+            t: ts,
+            y: ys,
+            sol,
+            t_events,
+            y_events,
+            nfev: solver.nfev(),
+            njev: solver.njev(),
+            nlu: solver.nlu(),
+            status,
+            message,
+            success: status >= 0,
+        },
+        diag,
+    ))
 }
 
 pub fn solve_ivp<F>(
@@ -1226,6 +1281,227 @@ impl From<OdeSolverAction> for SolverKind {
     }
 }
 
+/// Finite-difference Jacobian stiffness probe at `(t0, y0)` (`frankenscipy-7tb8d.9`).
+///
+/// # Formula
+/// 1. Evaluates $f_0 = f(t_0, y_0)$ and $n$ forward-difference columns
+///    $J_{:,j} = (f(t_0, y_0 + \delta_j e_j) - f_0) / \delta_j$ ($n + 1$ RHS evaluations total,
+///    counted in [`SolveIvpResult::nfev`]).
+///    For non-zero initial components, $\delta_j = \sqrt{\varepsilon_{\text{mach}}} \max(|y_{0,j}|, 1)$.
+///    For zero initial components with non-zero initial rate $f_{0,j} \ne 0$ (such as reaction
+///    intermediates starting at concentration zero in Robertson kinetics),
+///    $\delta_j = \text{clamp}(|f_{0,j}| \min(\Delta t, 1) \cdot 10^{-3},\; \sqrt{\varepsilon_{\text{mach}}},\; 10^{-3})$
+///    samples the Jacobian along the initial transient tangent.
+/// 2. Estimates the spectral radius $\rho(J) = \max_i |\lambda_i(J)|$ via $\le 20$ power iterations
+///    $v_{k+1} = J v_k / \|J v_k\|_2$ starting from a deterministic unit vector.
+/// 3. Computes the dimensionless horizon stiffness indicator:
+///    $$I_{\text{stiff}} = \rho(J) \cdot |t_{\text{end}} - t_0|$$
+///    and the ratio of the tolerance-driven explicit step scale $h_{\text{tol}} = \Delta t \cdot \text{rtol}^{1/5}$
+///    to the Dormand-Prince RK45 real-axis stability step bound $h_{\text{stab}} = 3.25 / \rho(J)$:
+///    $$R_{\text{step}} = \frac{h_{\text{tol}}}{h_{\text{stab}}} = \frac{\rho(J) \cdot \Delta t \cdot \text{rtol}^{1/5}}{3.25}.$$
+/// 4. Combines $I_{\text{stiff}}$, $R_{\text{step}}$, and the column timescale separation ratio
+///    $\max_j \|J_{:,j}\|_2 / \min_{j: \|J_{:,j}\|_2 > 0} \|J_{:,j}\|_2$ into `stiffness_ratio_estimate`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OdeStiffnessProbe {
+    /// Spectral radius estimate $\rho(J)$ at `(t0, y0)` from $\le 20$ power iterations.
+    pub spectral_radius: f64,
+    /// Integration horizon $\Delta t = |t_{\text{end}} - t_0|$.
+    pub span: f64,
+    /// Dimensionless stiffness indicator $I_{\text{stiff}} = \rho(J) \cdot |t_{\text{end}} - t_0|$.
+    pub stiffness_indicator: f64,
+    /// Ratio $h_{\text{tol}} / h_{\text{stab}}$ of tolerance step scale to explicit stability step bound.
+    pub step_bound_ratio: f64,
+    /// Combined stiffness ratio estimate fed into [`OdeSolverPortfolio`].
+    pub stiffness_ratio_estimate: f64,
+    /// Number of RHS evaluations consumed by the probe ($n + 1$, or $0$ when skipped).
+    pub probe_nfev: usize,
+}
+
+impl Default for OdeStiffnessProbe {
+    fn default() -> Self {
+        Self {
+            spectral_radius: 0.0,
+            span: 0.0,
+            stiffness_indicator: 0.0,
+            step_bound_ratio: 0.0,
+            stiffness_ratio_estimate: 1.0,
+            probe_nfev: 0,
+        }
+    }
+}
+
+/// Probe the ODE right-hand side at `(t0, y0)` using $n + 1$ finite-difference evaluations and
+/// $\le 20$ power iterations (`frankenscipy-7tb8d.9`).
+pub fn probe_ode_stiffness<F>(fun: &mut F, options: &SolveIvpOptions<'_>) -> OdeStiffnessProbe
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    let (t0, tf) = options.t_span;
+    let n = options.y0.len();
+    if n == 0
+        || !t0.is_finite()
+        || !tf.is_finite()
+        || options.y0.iter().any(|v| !v.is_finite())
+        || options.max_step <= 0.0
+        || options.max_step.is_nan()
+        || !options.rtol.is_finite()
+        || options.rtol <= 0.0
+    {
+        return OdeStiffnessProbe::default();
+    }
+    if let Some(first_step) = options.first_step
+        && (!first_step.is_finite() || first_step <= 0.0)
+    {
+        return OdeStiffnessProbe::default();
+    }
+    let span = (tf - t0).abs();
+    if span == 0.0 {
+        return OdeStiffnessProbe::default();
+    }
+
+    let f0 = fun(t0, options.y0);
+    if f0.len() != n || f0.iter().any(|v| !v.is_finite()) {
+        return OdeStiffnessProbe {
+            probe_nfev: 1,
+            ..OdeStiffnessProbe::default()
+        };
+    }
+
+    let sqrt_eps = 1.490_116_119_384_765_6e-8_f64;
+    let mut y_pert = options.y0.to_vec();
+    let mut jac = vec![0.0_f64; n * n];
+    let mut col_norms = vec![0.0_f64; n];
+    let mut probe_nfev = 1usize;
+
+    for j in 0..n {
+        let yj_abs = options.y0[j].abs();
+        let delta_j = if yj_abs > 0.0 {
+            sqrt_eps * yj_abs.max(1.0)
+        } else if f0[j].abs() > 0.0 {
+            (f0[j].abs() * span.min(1.0) * 1.0e-3).clamp(sqrt_eps, 1.0e-3)
+        } else {
+            sqrt_eps
+        };
+        y_pert[j] = options.y0[j] + delta_j;
+        let f_pert = fun(t0, &y_pert);
+        probe_nfev += 1;
+        y_pert[j] = options.y0[j];
+        if f_pert.len() != n {
+            return OdeStiffnessProbe {
+                probe_nfev,
+                ..OdeStiffnessProbe::default()
+            };
+        }
+        let mut col_sq = 0.0_f64;
+        for i in 0..n {
+            let df = f_pert[i] - f0[i];
+            let val = if df.is_finite() { df / delta_j } else { 0.0 };
+            jac[i * n + j] = val;
+            col_sq += val * val;
+        }
+        col_norms[j] = col_sq.sqrt();
+    }
+
+    // Power iteration (<= 20 iterations) to estimate spectral radius rho(J).
+    let mut v: Vec<f64> = (0..n)
+        .map(|i| 1.0 + (i as f64 + 1.0) / (n as f64 + 1.0))
+        .collect();
+    if let Some((j_max, &max_c)) = col_norms
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        && max_c > 0.0
+    {
+        v[j_max] += 1.0;
+    }
+    let v_norm0 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    for x in &mut v {
+        *x /= v_norm0;
+    }
+
+    let mut rho_power = 0.0_f64;
+    let mut w = vec![0.0_f64; n];
+    for _iter in 0..20 {
+        let mut w_sq = 0.0_f64;
+        for i in 0..n {
+            let row = &jac[i * n..(i + 1) * n];
+            let mut s = 0.0_f64;
+            for j in 0..n {
+                s += row[j] * v[j];
+            }
+            w[i] = s;
+            w_sq += s * s;
+        }
+        let w_norm = w_sq.sqrt();
+        if !w_norm.is_finite() || w_norm <= 1e-300 {
+            rho_power = 0.0;
+            break;
+        }
+        let prev = rho_power;
+        rho_power = w_norm;
+        for i in 0..n {
+            v[i] = w[i] / w_norm;
+        }
+        if (rho_power - prev).abs() <= 1e-9 * rho_power {
+            break;
+        }
+    }
+
+    let max_diag = (0..n)
+        .map(|i| jac[i * n + i].abs())
+        .fold(0.0_f64, f64::max);
+    let spectral_radius = rho_power.max(max_diag);
+    let stiffness_indicator = spectral_radius * span;
+    let rtol_fifth = options.rtol.abs().max(1e-15).powf(0.2);
+    let step_bound_ratio = (stiffness_indicator * rtol_fifth) / 3.25;
+
+    let max_col = col_norms.iter().copied().fold(0.0_f64, f64::max);
+    let min_col = col_norms
+        .iter()
+        .copied()
+        .filter(|&c| c > 1e-15 * max_col)
+        .fold(f64::INFINITY, f64::min);
+    let col_ratio = if min_col.is_finite() && min_col > 0.0 {
+        (max_col / min_col).max(1.0)
+    } else {
+        1.0
+    };
+
+    let stiffness_ratio_estimate = if stiffness_indicator >= 100.0 || spectral_radius >= 500.0 {
+        stiffness_indicator
+            .max(spectral_radius * col_ratio)
+            .max(step_bound_ratio)
+    } else {
+        stiffness_indicator.max(1e-6)
+    };
+
+    OdeStiffnessProbe {
+        spectral_radius,
+        span,
+        stiffness_indicator,
+        step_bound_ratio,
+        stiffness_ratio_estimate,
+        probe_nfev,
+    }
+}
+
+std::thread_local! {
+    static FORCE_NEXT_CASP_FIRST_ATTEMPT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only hook (`frankenscipy-7tb8d.9`): forces the first solver attempt in the next
+/// [`solve_ivp_with_casp`] or [`solve_ivp_with_casp_portfolio`] call on the current thread to
+/// fail, verifying that CASP triggers a bounded retry with the next action, records both
+/// attempts, and sets `fallback_active == true`.
+pub fn force_next_casp_first_attempt_failure() {
+    FORCE_NEXT_CASP_FIRST_ATTEMPT_FAILURE.with(|flag| flag.set(true));
+}
+
+fn take_forced_casp_first_attempt_failure() -> bool {
+    FORCE_NEXT_CASP_FIRST_ATTEMPT_FAILURE.with(|flag| flag.replace(false))
+}
+
 #[derive(Debug, Clone)]
 pub struct OdePortfolioResult {
     pub chosen_action: OdeSolverAction,
@@ -1233,12 +1509,15 @@ pub struct OdePortfolioResult {
     pub expected_losses: [f64; 5],
     pub result: SolveIvpResult,
     pub fallback_active: bool,
+    pub stiffness_probe: OdeStiffnessProbe,
+    pub attempts: Vec<(OdeSolverAction, bool)>,
 }
 
 /// Solve an initial value problem using CASP Bayesian expected-loss portfolio selection.
 ///
-/// Selects RK45 for non-stiff dynamics, Radau IIA for algebraic/DAE constraints,
-/// and BDF for stiff systems, with online stiffness detection and conformal drift fallback.
+/// Probes the initial Jacobian at `(t0, y0)`, selects among `DOP853`, `RK45`, `RK23`, `BDF`,
+/// and `Radau`, monitors the per-step Hairer-Wanner embedded-pair stiffness test during explicit
+/// stepping, retries with the next action on failure, and feeds the conformal calibrator once per call.
 pub fn solve_ivp_with_casp_portfolio<F>(
     fun: &mut F,
     options: &SolveIvpOptions<'_>,
@@ -1306,28 +1585,126 @@ fn solve_ivp_with_casp_portfolio_impl<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
-    let (action, posterior, expected_losses, chosen_loss) =
-        portfolio.select_action(stiffness_ratio_estimate, is_algebraic_dae);
+    let probe = probe_ode_stiffness(fun, options);
+    let mut effective_stiffness =
+        if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
+            if stiffness_ratio_estimate < 1.0 && probe.stiffness_ratio_estimate <= 10.0 {
+                stiffness_ratio_estimate
+            } else if (stiffness_ratio_estimate - 1.0).abs() > 1e-12 {
+                probe.stiffness_ratio_estimate.max(stiffness_ratio_estimate)
+            } else {
+                probe.stiffness_ratio_estimate
+            }
+        } else {
+            probe.stiffness_ratio_estimate
+        };
 
-    let method: SolverKind = action.into();
+    let conformal_fallback_used = portfolio.calibrator().should_fallback();
+    let (mut action, mut posterior, mut expected_losses, mut chosen_loss) =
+        portfolio.select_action_with_tol(effective_stiffness, is_algebraic_dae, options.rtol);
+
     let mut resolved_opts = options.clone();
-    resolved_opts.method = method;
+    resolved_opts.method = action.into();
 
-    let res = solve_ivp_impl(fun, &resolved_opts, audit)?;
-    let fallback_active = portfolio.calibrator().should_fallback();
+    let is_explicit = matches!(
+        action,
+        OdeSolverAction::RK45 | OdeSolverAction::RK23 | OdeSolverAction::DOP853
+    );
+    let hw_abort_streak = is_explicit.then_some(10);
+    let forced_fail = take_forced_casp_first_attempt_failure();
 
-    portfolio.observe_step(res.success);
-    portfolio.record_evidence(OdeSolverEvidenceEntry {
-        component: "fsci-integrate",
-        system_dim: options.y0.len(),
-        stiffness_ratio_estimate,
-        chosen_action: action,
-        posterior: posterior.to_vec(),
-        expected_losses: expected_losses.to_vec(),
-        chosen_expected_loss: chosen_loss,
-        fallback_active,
-        step_rejections: if res.success { Some(0) } else { Some(1) },
-    });
+    let (mut res, diag) =
+        solve_ivp_impl_with_diag(fun, &resolved_opts, audit, hw_abort_streak)?;
+    if forced_fail {
+        res.status = -1;
+        res.success = false;
+        res.message = "Forced first-attempt failure (test hook).".to_owned();
+    }
+    if diag.hw_max_streak > 0 {
+        portfolio.observe_hairer_wanner(diag.hw_max_streak, diag.hw_spectral_radius * probe.span);
+    }
+
+    let mut attempts = vec![(action, res.success)];
+    let fallback_active = if res.success {
+        res.nfev += probe.probe_nfev;
+        portfolio.observe_step(true);
+        portfolio.record_evidence(OdeSolverEvidenceEntry {
+            component: "fsci-integrate",
+            system_dim: options.y0.len(),
+            stiffness_ratio_estimate: effective_stiffness,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: chosen_loss,
+            fallback_active: conformal_fallback_used,
+            step_rejections: Some(0),
+        });
+        conformal_fallback_used
+    } else {
+        // First attempt failed or triggered Hairer-Wanner stiffness abort: record the failed
+        // first attempt (without double-feeding the calibrator) and retry with the next action.
+        let mut accumulated_nfev = probe.probe_nfev + res.nfev;
+        portfolio.observe_step(false);
+        portfolio.push_evidence_only(OdeSolverEvidenceEntry {
+            component: "fsci-integrate",
+            system_dim: options.y0.len(),
+            stiffness_ratio_estimate: effective_stiffness,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: chosen_loss,
+            fallback_active: conformal_fallback_used,
+            step_rejections: Some(diag.step_rejections.max(1)),
+        });
+
+        let mut excluded = vec![action];
+        if diag.hw_aborted || (is_explicit && !forced_fail) {
+            effective_stiffness = effective_stiffness.max(1e5);
+            for exp_action in [
+                OdeSolverAction::RK45,
+                OdeSolverAction::RK23,
+                OdeSolverAction::DOP853,
+            ] {
+                if !excluded.contains(&exp_action) {
+                    excluded.push(exp_action);
+                }
+            }
+        }
+
+        let (retry_action, retry_post, retry_losses, retry_chosen_loss) = portfolio
+            .select_action_excluding(
+                effective_stiffness,
+                is_algebraic_dae,
+                options.rtol,
+                &excluded,
+            );
+        action = retry_action;
+        posterior = retry_post;
+        expected_losses = retry_losses;
+        chosen_loss = retry_chosen_loss;
+
+        resolved_opts.method = action.into();
+        let (mut retry_res, _retry_diag) =
+            solve_ivp_impl_with_diag(fun, &resolved_opts, audit, None)?;
+        accumulated_nfev += retry_res.nfev;
+        retry_res.nfev = accumulated_nfev;
+        attempts.push((action, retry_res.success));
+        res = retry_res;
+
+        portfolio.observe_step(res.success);
+        portfolio.record_evidence(OdeSolverEvidenceEntry {
+            component: "fsci-integrate",
+            system_dim: options.y0.len(),
+            stiffness_ratio_estimate: effective_stiffness,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: chosen_loss,
+            fallback_active: true,
+            step_rejections: Some(1),
+        });
+        true
+    };
 
     if let Some(audit) = audit {
         audit.record(
@@ -1343,7 +1720,15 @@ where
                 evidence: std::collections::BTreeMap::from([
                     (
                         "stiffness_ratio_estimate".to_string(),
-                        stiffness_ratio_estimate.into(),
+                        effective_stiffness.into(),
+                    ),
+                    (
+                        "spectral_radius_estimate".to_string(),
+                        probe.spectral_radius.into(),
+                    ),
+                    (
+                        "stiffness_indicator".to_string(),
+                        probe.stiffness_indicator.into(),
                     ),
                     ("system_dim".to_string(), (options.y0.len() as f64).into()),
                     (
@@ -1362,14 +1747,17 @@ where
         expected_losses,
         result: res,
         fallback_active,
+        stiffness_probe: probe,
+        attempts,
     })
 }
 
 /// Solve an initial value problem using CASP condition-aware portfolio selection.
 ///
-/// Selects RK45 for non-stiff dynamics, Radau IIA for algebraic/DAE constraints,
-/// and BDF for stiff systems via Bayesian expected-loss minimization, with
-/// online stiffness detection and conformal drift fallback.
+/// Probes the initial Jacobian at `(t0, y0)` via $n + 1$ finite-difference evaluations and $\le 20$
+/// power iterations, selects among `DOP853`, `RK45`, `RK23`, `BDF`, and `Radau` via Bayesian
+/// expected-loss minimization, monitors the per-step Hairer-Wanner stiffness detector during
+/// explicit stepping, and feeds the conformal calibrator once per call (`frankenscipy-7tb8d.9`).
 pub fn solve_ivp_with_casp<F>(
     fun: &mut F,
     options: &SolveIvpOptions<'_>,
@@ -1378,7 +1766,7 @@ pub fn solve_ivp_with_casp<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
-    solve_ivp_with_casp_portfolio(fun, options, portfolio, 1.0, false)
+    solve_ivp_with_casp_portfolio(fun, options, portfolio, 0.0, false)
 }
 
 /// Batched ODE integration: integrate the SAME dynamics `fun` from MANY initial conditions
@@ -1455,6 +1843,18 @@ fn solve_ivp_impl<F>(
     options: &SolveIvpOptions<'_>,
     audit: Option<&AuditScope<'_>>,
 ) -> Result<SolveIvpResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    solve_ivp_impl_with_diag(fun, options, audit, None).map(|(res, _)| res)
+}
+
+fn solve_ivp_impl_with_diag<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    audit: Option<&AuditScope<'_>>,
+    hw_abort_streak: Option<usize>,
+) -> Result<(SolveIvpResult, IvpRunDiagnostics), IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
@@ -1540,7 +1940,7 @@ where
                 tableau,
             };
             let solver = RkSolver::new(fun, config)?;
-            solve_ivp_core(fun, solver, &resolved_options)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, hw_abort_streak)
         }
         SolverKind::Radau => {
             // Genuine Radau IIA (3-stage, order 5) — see radau.rs (frankenscipy-3y5p9).
@@ -1555,7 +1955,7 @@ where
                 mode: resolved_options.mode,
             };
             let solver = crate::radau::RadauSolver::new(fun, config)?;
-            solve_ivp_core(fun, solver, &resolved_options)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
         }
         SolverKind::Bdf => {
             let config = BdfSolverConfig {
@@ -1570,11 +1970,11 @@ where
                 max_order: 5,
             };
             let solver = BdfSolver::new(fun, config)?;
-            solve_ivp_core(fun, solver, &resolved_options)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
         }
         SolverKind::Lsoda => {
             let solver = LsodaSolver::from_options(&resolved_options)?;
-            solve_ivp_core(fun, solver, &resolved_options)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
         }
     }
 }
@@ -3517,5 +3917,239 @@ mod tests {
             );
             assert_eq!(*ev_fallback, recorded.fallback_active);
         }
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_robertson_auto_detects_stiffness_without_hint() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 40.0),
+            y0: &[1.0, 0.0, 0.0],
+            rtol: 1e-4,
+            atol: ToleranceValue::Vector(vec![1e-8, 1e-11, 1e-6]),
+            ..SolveIvpOptions::default()
+        };
+        let mut robertson = |_t: f64, y: &[f64]| {
+            let y0 = y[0];
+            let y1 = y[1];
+            let y2 = y[2];
+            vec![
+                -0.04 * y0 + 1.0e4 * y1 * y2,
+                0.04 * y0 - 1.0e4 * y1 * y2 - 3.0e7 * y1 * y1,
+                3.0e7 * y1 * y1,
+            ]
+        };
+
+        let res = solve_ivp_with_casp(&mut robertson, &opts, &mut portfolio)
+            .expect("Robertson kinetics via solve_ivp_with_casp");
+
+        assert!(
+            matches!(
+                res.chosen_action,
+                OdeSolverAction::BDF | OdeSolverAction::Radau
+            ),
+            "Robertson kinetics without caller hint must select BDF or Radau, got {:?} (probe={:?})",
+            res.chosen_action,
+            res.stiffness_probe
+        );
+        let probe = &res.stiffness_probe;
+        assert_eq!(probe.probe_nfev, 4, "3-state ODE probe uses n+1 = 4 nfev");
+        assert!(
+            probe.stiffness_indicator >= 1.0e4,
+            "Robertson stiffness_indicator must be stiff (>= 1e4), got {}",
+            probe.stiffness_indicator
+        );
+        assert!(res.result.success, "Robertson integration must succeed");
+        assert!(
+            res.result.nfev > probe.probe_nfev,
+            "result.nfev ({}) must include probe_nfev ({})",
+            res.result.nfev,
+            probe.probe_nfev
+        );
+        let y_final = res.result.y.last().expect("final state");
+        let mass_sum: f64 = y_final.iter().sum();
+        assert!(
+            (mass_sum - 1.0).abs() < 1e-3,
+            "Robertson mass conservation violated: sum={mass_sum}"
+        );
+        assert_eq!(portfolio.calibrator().total_predictions(), 1);
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_van_der_pol_nonstiff_vs_stiff_and_single_calibrator_feed() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+
+        // 1. Van der Pol mu = 1 -> non-stiff -> RK45
+        let opts_nonstiff = SolveIvpOptions {
+            t_span: (0.0, 5.0),
+            y0: &[2.0, 0.0],
+            rtol: 1e-5,
+            atol: ToleranceValue::Scalar(1e-8),
+            ..SolveIvpOptions::default()
+        };
+        let mut vdp_mu1 = |_t: f64, y: &[f64]| vec![y[1], (1.0 - y[0] * y[0]) * y[1] - y[0]];
+        let res1 = solve_ivp_with_casp(&mut vdp_mu1, &opts_nonstiff, &mut portfolio)
+            .expect("vdp mu=1 solve");
+        assert_eq!(res1.chosen_action, OdeSolverAction::RK45);
+        assert!(res1.result.success);
+        assert_eq!(
+            portfolio.calibrator().total_predictions(),
+            1,
+            "calibrator must be fed exactly once after 1 call"
+        );
+
+        // 2. Van der Pol mu = 1000 -> stiff -> BDF
+        let opts_stiff = SolveIvpOptions {
+            t_span: (0.0, 5.0),
+            y0: &[2.0, 0.0],
+            rtol: 1e-4,
+            atol: ToleranceValue::Scalar(1e-7),
+            ..SolveIvpOptions::default()
+        };
+        let mut vdp_mu1000 =
+            |_t: f64, y: &[f64]| vec![y[1], 1000.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]];
+        let res2 = solve_ivp_with_casp(&mut vdp_mu1000, &opts_stiff, &mut portfolio)
+            .expect("vdp mu=1000 solve");
+        assert_eq!(res2.chosen_action, OdeSolverAction::BDF);
+        assert!(res2.result.success);
+        assert_eq!(
+            portfolio.calibrator().total_predictions(),
+            2,
+            "calibrator must be fed once per call (2 total, not 4)"
+        );
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_all_five_actions_reachable_and_retry_on_failure() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 32);
+        let mut harmonic = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+
+        // 1. DOP853 via tight rtol (1e-9) on non-stiff harmonic oscillator
+        let opts_dop = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            rtol: 1e-9,
+            atol: ToleranceValue::Scalar(1e-11),
+            ..SolveIvpOptions::default()
+        };
+        let res_dop =
+            solve_ivp_with_casp(&mut harmonic, &opts_dop, &mut portfolio).expect("dop853");
+        assert_eq!(res_dop.chosen_action, OdeSolverAction::DOP853);
+        assert!(!res_dop.fallback_active);
+
+        // 2. RK45 via default rtol (1e-3) on non-stiff harmonic oscillator
+        let opts_rk45 = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            rtol: 1e-3,
+            atol: ToleranceValue::Scalar(1e-6),
+            ..SolveIvpOptions::default()
+        };
+        let res_rk45 =
+            solve_ivp_with_casp(&mut harmonic, &opts_rk45, &mut portfolio).expect("rk45");
+        assert_eq!(res_rk45.chosen_action, OdeSolverAction::RK45);
+
+        // 3. RK23 via coarse rtol (5e-2) on non-stiff harmonic oscillator
+        let opts_rk23 = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            rtol: 5e-2,
+            atol: ToleranceValue::Scalar(1e-4),
+            ..SolveIvpOptions::default()
+        };
+        let res_rk23 =
+            solve_ivp_with_casp(&mut harmonic, &opts_rk23, &mut portfolio).expect("rk23");
+        assert_eq!(res_rk23.chosen_action, OdeSolverAction::RK23);
+
+        // 4. BDF via stiff system
+        let opts_bdf = SolveIvpOptions {
+            t_span: (0.0, 2.0),
+            y0: &[1.0],
+            rtol: 1e-5,
+            atol: ToleranceValue::Scalar(1e-8),
+            ..SolveIvpOptions::default()
+        };
+        let mut stiff_linear = |_t: f64, y: &[f64]| vec![-10000.0 * y[0]];
+        let res_bdf =
+            solve_ivp_with_casp(&mut stiff_linear, &opts_bdf, &mut portfolio).expect("bdf");
+        assert_eq!(res_bdf.chosen_action, OdeSolverAction::BDF);
+
+        // 5. Radau via DAE/algebraic flag
+        let res_radau =
+            solve_ivp_with_casp_portfolio(&mut harmonic, &opts_rk45, &mut portfolio, 10.0, true)
+                .expect("radau");
+        assert_eq!(res_radau.chosen_action, OdeSolverAction::Radau);
+
+        // 6. Forced first-attempt failure triggers retry, records both attempts, sets fallback_active = true
+        let preds_before = portfolio.calibrator().total_predictions();
+        let evidence_before = portfolio.evidence_len();
+        force_next_casp_first_attempt_failure();
+        let res_retry =
+            solve_ivp_with_casp(&mut harmonic, &opts_rk45, &mut portfolio).expect("retry");
+        assert!(res_retry.result.success);
+        assert!(
+            res_retry.fallback_active,
+            "fallback_active must be true after retry"
+        );
+        assert_eq!(
+            res_retry.attempts.len(),
+            2,
+            "both attempts must be recorded in res.attempts"
+        );
+        assert_eq!(res_retry.attempts[0], (OdeSolverAction::RK45, false));
+        assert_ne!(res_retry.chosen_action, OdeSolverAction::RK45);
+        assert_eq!(
+            portfolio.evidence_len(),
+            evidence_before + 2,
+            "failed first attempt and winning retry must both be in portfolio.evidence"
+        );
+        assert_eq!(
+            portfolio.calibrator().total_predictions(),
+            preds_before + 1,
+            "calibrator must still be fed only once per top-level call"
+        );
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_delayed_stiffness_hairer_wanner_mid_integration_switch() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        // Delayed-onset stiff ODE:
+        // y' = -(1 + 5000 * t^2) * (y - cos(t)) - sin(t), y(0) = 1, t in [0, 2]
+        // Exact solution: y(t) = cos(t).
+        // At t = 0, df/dy = -1 (non-stiff -> initial probe selects RK45).
+        // For t > 0.3, |df/dy| >> 450 -> Hairer-Wanner per-step detector fires and switches to BDF.
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 2.0),
+            y0: &[1.0],
+            rtol: 1e-5,
+            atol: ToleranceValue::Scalar(1e-7),
+            ..SolveIvpOptions::default()
+        };
+        let mut delayed_stiff = |t: f64, y: &[f64]| {
+            let lambda = 1.0 + 5000.0 * t * t;
+            vec![-lambda * (y[0] - t.cos()) - t.sin()]
+        };
+
+        let res = solve_ivp_with_casp(&mut delayed_stiff, &opts, &mut portfolio)
+            .expect("delayed stiff solve_ivp_with_casp");
+        assert!(res.result.success);
+        assert_eq!(
+            res.attempts,
+            vec![(OdeSolverAction::RK45, false), (OdeSolverAction::BDF, true)],
+            "must start with RK45 and switch to BDF after Hairer-Wanner detector triggers"
+        );
+        assert_eq!(res.chosen_action, OdeSolverAction::BDF);
+        assert!(res.fallback_active);
+        assert!(
+            portfolio.detector().hairer_wanner_streak() >= 10,
+            "Hairer-Wanner stiff streak must reach threshold (>= 10), got {}",
+            portfolio.detector().hairer_wanner_streak()
+        );
+        let y_final = res.result.y.last().expect("final state")[0];
+        let exact = 2.0_f64.cos();
+        assert!(
+            (y_final - exact).abs() < 1e-3,
+            "y(2) = {y_final}, expected cos(2) = {exact}"
+        );
     }
 }

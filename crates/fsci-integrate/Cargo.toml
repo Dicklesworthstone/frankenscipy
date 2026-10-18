@@ -13,13 +13,20 @@ workspace = true
 # Perf-only: pulls in `sha2` so `perf_bdf_diag_newton` can self-report the SHA-256 of
 # the ELF that produced its numbers (§2.1 of the campaign bench-harness contract).
 # Off by default — the library itself never depends on sha2.
-bdf-diag-bench = ["dep:sha2"]
+bdf-diag-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
 # Perf-only: live SciPy incumbent harness with in-process ELF/source identity.
-dblquad-incumbent-bench = ["dep:sha2"]
+dblquad-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
 # Perf-only: screened live-SciPy `quad_many` whole-job harness.
-quad-incumbent-bench = ["dep:sha2"]
+quad-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
 # Perf-only: screened live-SciPy `tplquad_many` whole-job harness.
-tplquad-incumbent-bench = ["dep:sha2"]
+tplquad-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
+bench-harness = [
+    "fsci-runtime/bench-harness",
+    "bdf-diag-bench",
+    "dblquad-incumbent-bench",
+    "quad-incumbent-bench",
+    "tplquad-incumbent-bench",
+]
 
 [dependencies]
 fsci-opt = { workspace = true }

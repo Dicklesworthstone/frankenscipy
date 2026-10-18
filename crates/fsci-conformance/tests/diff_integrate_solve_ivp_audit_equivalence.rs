@@ -12,10 +12,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{
-    SolveIvpOptions, SolverKind, solve_ivp, solve_ivp_with_audit, solve_ivp_with_casp_portfolio,
+    SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp, solve_ivp_with_audit,
+    solve_ivp_with_casp, solve_ivp_with_casp_portfolio,
 };
 use fsci_runtime::{AuditLedger, OdeSolverAction, OdeSolverPortfolio, RuntimeMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-15;
@@ -271,5 +272,212 @@ fn diff_integrate_solve_ivp_with_casp_portfolio() {
 
     assert!(all_pass, "all casp portfolio routing cases must pass");
     // One routing case per arm.
+    compare_ledger.finish(1);
+}
+
+#[derive(Debug, Deserialize)]
+struct ScipyIvpEntry {
+    case_id: String,
+    y_final: Vec<f64>,
+    success: bool,
+}
+
+#[test]
+fn diff_integrate_solve_ivp_with_casp_live_scipy() {
+    let start = Instant::now();
+    let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 32);
+
+    // 1. Harmonic oscillator (non-stiff -> RK45)
+    let opts_harmonic = SolveIvpOptions {
+        t_span: (0.0, 2.0),
+        y0: &[1.0, 0.0],
+        rtol: 1e-6,
+        atol: ToleranceValue::Scalar(1e-9),
+        ..SolveIvpOptions::default()
+    };
+    let mut harmonic = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+    let res_harmonic =
+        solve_ivp_with_casp(&mut harmonic, &opts_harmonic, &mut portfolio).expect("harmonic");
+    assert_eq!(res_harmonic.chosen_action, OdeSolverAction::RK45);
+
+    // 2. Van der Pol mu=1 (non-stiff -> RK45)
+    let opts_vdp1 = SolveIvpOptions {
+        t_span: (0.0, 5.0),
+        y0: &[2.0, 0.0],
+        rtol: 1e-6,
+        atol: ToleranceValue::Scalar(1e-9),
+        ..SolveIvpOptions::default()
+    };
+    let mut vdp1 = |_t: f64, y: &[f64]| vec![y[1], (1.0 - y[0] * y[0]) * y[1] - y[0]];
+    let res_vdp1 = solve_ivp_with_casp(&mut vdp1, &opts_vdp1, &mut portfolio).expect("vdp_mu1");
+    assert_eq!(res_vdp1.chosen_action, OdeSolverAction::RK45);
+
+    // 3. Van der Pol mu=1000 (stiff -> BDF)
+    let opts_vdp1000 = SolveIvpOptions {
+        t_span: (0.0, 5.0),
+        y0: &[2.0, 0.0],
+        rtol: 1e-6,
+        atol: ToleranceValue::Scalar(1e-9),
+        ..SolveIvpOptions::default()
+    };
+    let mut vdp1000 = |_t: f64, y: &[f64]| vec![y[1], 1000.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]];
+    let res_vdp1000 =
+        solve_ivp_with_casp(&mut vdp1000, &opts_vdp1000, &mut portfolio).expect("vdp_mu1000");
+    assert_eq!(res_vdp1000.chosen_action, OdeSolverAction::BDF);
+
+    // 4. Robertson chemical kinetics (stiff with zero initial y1 -> BDF)
+    let opts_robertson = SolveIvpOptions {
+        t_span: (0.0, 40.0),
+        y0: &[1.0, 0.0, 0.0],
+        rtol: 1e-6,
+        atol: ToleranceValue::Vector(vec![1e-8, 1e-11, 1e-6]),
+        ..SolveIvpOptions::default()
+    };
+    let mut robertson = |_t: f64, y: &[f64]| {
+        let y0 = y[0];
+        let y1 = y[1];
+        let y2 = y[2];
+        vec![
+            -0.04 * y0 + 1.0e4 * y1 * y2,
+            0.04 * y0 - 1.0e4 * y1 * y2 - 3.0e7 * y1 * y1,
+            3.0e7 * y1 * y1,
+        ]
+    };
+    let res_robertson =
+        solve_ivp_with_casp(&mut robertson, &opts_robertson, &mut portfolio).expect("robertson");
+    assert!(matches!(
+        res_robertson.chosen_action,
+        OdeSolverAction::BDF | OdeSolverAction::Radau
+    ));
+    assert_eq!(
+        portfolio.calibrator().total_predictions(),
+        4,
+        "calibrator must be fed once per top-level call (4 total)"
+    );
+
+    let action_name = |a: OdeSolverAction| match a {
+        OdeSolverAction::RK45 => "RK45",
+        OdeSolverAction::RK23 => "RK23",
+        OdeSolverAction::DOP853 => "DOP853",
+        OdeSolverAction::BDF => "BDF",
+        OdeSolverAction::Radau => "Radau",
+    };
+
+    let py_script = format!(
+        r#"
+import json
+import numpy as np
+from scipy.integrate import solve_ivp
+
+out = []
+
+r1 = solve_ivp(lambda t, y: [y[1], -y[0]], (0.0, 2.0), [1.0, 0.0], method="{m1}", rtol=1e-6, atol=1e-9)
+out.append({{"case_id": "harmonic", "y_final": r1.y[:, -1].tolist(), "success": bool(r1.success)}})
+
+r2 = solve_ivp(lambda t, y: [y[1], (1.0 - y[0]**2)*y[1] - y[0]], (0.0, 5.0), [2.0, 0.0], method="{m2}", rtol=1e-6, atol=1e-9)
+out.append({{"case_id": "vdp_mu1", "y_final": r2.y[:, -1].tolist(), "success": bool(r2.success)}})
+
+r3 = solve_ivp(lambda t, y: [y[1], 1000.0*(1.0 - y[0]**2)*y[1] - y[0]], (0.0, 5.0), [2.0, 0.0], method="{m3}", rtol=1e-6, atol=1e-9)
+out.append({{"case_id": "vdp_mu1000", "y_final": r3.y[:, -1].tolist(), "success": bool(r3.success)}})
+
+def robertson(t, y):
+    return [
+        -0.04 * y[0] + 1e4 * y[1] * y[2],
+        0.04 * y[0] - 1e4 * y[1] * y[2] - 3e7 * y[1]**2,
+        3e7 * y[1]**2,
+    ]
+r4 = solve_ivp(robertson, (0.0, 40.0), [1.0, 0.0, 0.0], method="{m4}", rtol=1e-6, atol=[1e-8, 1e-11, 1e-6])
+out.append({{"case_id": "robertson", "y_final": r4.y[:, -1].tolist(), "success": bool(r4.success)}})
+
+print(json.dumps(out))
+"#,
+        m1 = action_name(res_harmonic.chosen_action),
+        m2 = action_name(res_vdp1.chosen_action),
+        m3 = action_name(res_vdp1000.chosen_action),
+        m4 = action_name(res_robertson.chosen_action),
+    );
+
+    let output = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", &py_script])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            assert!(
+                std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").is_err(),
+                "scipy oracle required but spawn failed: {e}"
+            );
+            return;
+        }
+    };
+    if !output.status.success() {
+        assert!(
+            std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").is_err(),
+            "scipy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let scipy_entries: Vec<ScipyIvpEntry> =
+        serde_json::from_slice(&output.stdout).expect("parse scipy JSON");
+
+    let rust_results = [
+        ("harmonic", &res_harmonic, 1e-4),
+        ("vdp_mu1", &res_vdp1, 1e-4),
+        ("vdp_mu1000", &res_vdp1000, 1e-3),
+        ("robertson", &res_robertson, 1e-3),
+    ];
+
+    let mut compare_ledger = CompareLedger::new(
+        "diff_integrate_solve_ivp_with_casp_live_scipy",
+        &["harmonic", "vdp_mu1", "vdp_mu1000", "robertson"],
+    );
+    let mut diffs = Vec::new();
+    let mut max_overall = 0.0_f64;
+
+    for ((case_id, rust_res, tol), scipy_res) in rust_results.iter().zip(scipy_entries.iter()) {
+        assert_eq!(*case_id, scipy_res.case_id);
+        let rust_final = rust_res.result.y.last().expect("rust y_final");
+        let Some((r_y, s_y)) = compare_ledger.both(
+            case_id,
+            case_id,
+            rust_res.result.success.then_some(rust_final),
+            scipy_res.success.then_some(&scipy_res.y_final),
+        ) else {
+            continue;
+        };
+        let d = vec_max_diff(r_y, s_y);
+        max_overall = max_overall.max(d);
+        let pass = d <= *tol && !r_y.iter().any(|v| v.is_nan());
+        compare_ledger.compared(case_id, case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: (*case_id).to_string(),
+            op: format!("{:?}", rust_res.chosen_action),
+            abs_diff: d,
+            pass,
+        });
+    }
+
+    let all_pass = diffs.iter().all(|d| d.pass);
+    let log = DiffLog {
+        test_id: "diff_integrate_solve_ivp_with_casp_live_scipy".into(),
+        category: "fsci_integrate::solve_ivp_with_casp vs live scipy.integrate.solve_ivp".into(),
+        case_count: diffs.len(),
+        compared: compare_ledger.counts().clone(),
+        max_abs_diff: max_overall,
+        pass: all_pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs.clone(),
+    };
+    emit_log(&log);
+
+    for d in &diffs {
+        assert!(
+            d.pass,
+            "live scipy mismatch on {} ({}): abs_diff={}",
+            d.case_id, d.op, d.abs_diff
+        );
+    }
     compare_ledger.finish(1);
 }

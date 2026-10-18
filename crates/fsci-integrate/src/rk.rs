@@ -737,6 +737,11 @@ pub struct RkSolver {
     y_stage: Vec<f64>,
     // Statistics
     nfev: usize,
+    step_rejections: usize,
+    hw_consecutive_stiff: usize,
+    hw_max_consecutive_stiff: usize,
+    hw_total_stiff_steps: usize,
+    hw_max_spectral_radius: f64,
     // Stored ODE function for trait-object stepping (Some if created with new_owned)
     fun: Option<OdeFn>,
     /// DOP853's seven interpolation rows for the last step, once
@@ -850,6 +855,11 @@ impl RkSolver {
             dy,
             y_stage,
             nfev,
+            step_rejections: 0,
+            hw_consecutive_stiff: 0,
+            hw_max_consecutive_stiff: 0,
+            hw_total_stiff_steps: 0,
+            hw_max_spectral_radius: 0.0,
             fun: None,
             dop853_dense: None,
         })
@@ -965,6 +975,11 @@ impl RkSolver {
             dy,
             y_stage,
             nfev,
+            step_rejections: 0,
+            hw_consecutive_stiff: 0,
+            hw_max_consecutive_stiff: 0,
+            hw_total_stiff_steps: 0,
+            hw_max_spectral_radius: 0.0,
             fun: Some(fun_box),
             dop853_dense: None,
         })
@@ -1003,6 +1018,119 @@ impl RkSolver {
     /// Number of function evaluations.
     pub fn nfev(&self) -> usize {
         self.nfev
+    }
+
+    /// Total number of rejected trial steps (`frankenscipy-7tb8d.9`).
+    #[must_use]
+    pub const fn step_rejections(&self) -> usize {
+        self.step_rejections
+    }
+
+    /// Current streak of consecutive steps triggering the Hairer-Wanner embedded-pair
+    /// stiffness test (`frankenscipy-7tb8d.9`).
+    #[must_use]
+    pub const fn hairer_wanner_stiff_count(&self) -> usize {
+        self.hw_consecutive_stiff
+    }
+
+    /// Maximum consecutive streak of positive Hairer-Wanner stiffness tests observed so far.
+    #[must_use]
+    pub const fn hairer_wanner_max_stiff_streak(&self) -> usize {
+        self.hw_max_consecutive_stiff
+    }
+
+    /// Total steps where the Hairer-Wanner stiffness test was positive.
+    #[must_use]
+    pub const fn hairer_wanner_total_stiff_steps(&self) -> usize {
+        self.hw_total_stiff_steps
+    }
+
+    /// Maximum local spectral radius estimate `||df||_2 / ||dy||_2` observed by the
+    /// Hairer-Wanner per-step stiffness detector (`frankenscipy-7tb8d.9`).
+    #[must_use]
+    pub const fn hairer_wanner_spectral_radius(&self) -> f64 {
+        self.hw_max_spectral_radius
+    }
+
+    /// Returns `true` when at least `threshold` consecutive steps tested positive on the
+    /// Hairer-Wanner embedded-pair stiffness test (`frankenscipy-7tb8d.9`).
+    #[must_use]
+    pub const fn is_hairer_wanner_stiff(&self, threshold: usize) -> bool {
+        self.hw_max_consecutive_stiff >= threshold
+    }
+
+    /// Hairer-Wanner per-step stiffness detector on the embedded RK pair
+    /// (Hairer & Wanner, *Solving Ordinary Differential Equations II*, Section IV.2, eq. 2.4).
+    ///
+    /// Computes the power-method spectral radius quotient `||f(y_new) - k_{s_prev}||_2 / ||y_new - g_{s_prev}||_2`
+    /// between the final endpoint stage and the penultimate internal stage, compares
+    /// `hlamb = |h| * rho_step` against the method's real-axis stability boundary
+    /// (`2.5` for RK23, `3.25` for RK45, `6.1` for DOP853), and tracks consecutive positive tests.
+    fn update_hairer_wanner_stiffness(&mut self, h: f64, step_accepted: bool) {
+        if self.n == 0 || h == 0.0 {
+            return;
+        }
+        if !step_accepted {
+            self.step_rejections += 1;
+        }
+
+        let s_prev = self.tableau.n_stages - 1 - usize::from(self.tableau.fsal);
+        let a_prev = self.tableau.a[s_prev];
+        let mut dy_hw_sq = 0.0_f64;
+        let mut df_hw_sq = 0.0_f64;
+        let mut dy_sec_sq = 0.0_f64;
+        let mut df_sec_sq = 0.0_f64;
+        for i in 0..self.n {
+            let mut stage_prev_i = self.y[i];
+            for (j, &a_j) in a_prev.iter().enumerate() {
+                if a_j != 0.0 {
+                    stage_prev_i += h * a_j * self.k[j][i];
+                }
+            }
+            let dy_hw = self.y_new[i] - stage_prev_i;
+            let df_hw = self.f_new[i] - self.k[s_prev][i];
+            dy_hw_sq += dy_hw * dy_hw;
+            df_hw_sq += df_hw * df_hw;
+
+            let dy_sec = self.y_new[i] - self.y[i];
+            let df_sec = self.f_new[i] - self.f[i];
+            dy_sec_sq += dy_sec * dy_sec;
+            df_sec_sq += df_sec * df_sec;
+        }
+        let rho_hw = if dy_hw_sq > 1e-300 && df_hw_sq.is_finite() {
+            (df_hw_sq / dy_hw_sq).sqrt()
+        } else {
+            0.0
+        };
+        let rho_sec = if dy_sec_sq > 1e-300 && df_sec_sq.is_finite() {
+            (df_sec_sq / dy_sec_sq).sqrt()
+        } else {
+            0.0
+        };
+        let rho_step = rho_hw.max(rho_sec);
+        let c_stab = if std::ptr::eq(self.tableau, &RK23_TABLEAU) {
+            2.5
+        } else if std::ptr::eq(self.tableau, &DOP853_TABLEAU) {
+            6.1
+        } else {
+            3.25
+        };
+        let hlamb = h.abs() * rho_step;
+        let remaining_span = (self.t_bound - self.t).abs();
+        let is_positive = hlamb >= 0.8 * c_stab
+            || (!step_accepted && rho_step.is_finite() && rho_step * remaining_span >= 1e3);
+
+        if is_positive {
+            self.hw_consecutive_stiff += 1;
+            self.hw_max_consecutive_stiff =
+                self.hw_max_consecutive_stiff.max(self.hw_consecutive_stiff);
+            self.hw_total_stiff_steps += 1;
+            if rho_step.is_finite() {
+                self.hw_max_spectral_radius = self.hw_max_spectral_radius.max(rho_step);
+            }
+        } else if step_accepted && hlamb < 0.5 * c_stab {
+            self.hw_consecutive_stiff = 0;
+        }
     }
 
     /// Solver-specific dense output at `t` for the last step, SciPy's interpolant for each
@@ -1204,6 +1332,7 @@ impl RkSolver {
             self.nfev += evals_per_step(self.tableau);
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
+            self.update_hairer_wanner_stiffness(h, err_norm < 1.0);
 
             // A NaN or infinite error norm (the RHS went non-finite at a trial point) is a
             // REJECTED step in SciPy's rk.py, not a failure: `error_norm < 1` is false, and
@@ -1415,6 +1544,7 @@ impl RkSolver {
             self.nfev += evals_per_step(self.tableau);
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
+            self.update_hairer_wanner_stiffness(h, err_norm < 1.0);
 
             // A NaN or infinite error norm (the RHS went non-finite at a trial point) is a
             // REJECTED step in SciPy's rk.py, not a failure: `error_norm < 1` is false, and
