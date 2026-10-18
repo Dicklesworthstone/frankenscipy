@@ -997,7 +997,7 @@ FrankenSciPy is part of a deliberate family of "Franken*" projects that share th
 
 | Project | Domain | Relationship |
 |---|---|---|
-| **[asupersync](https://github.com/Dicklesworthstone/asupersync)** | Async runtime | The exclusive async runtime FrankenSciPy depends on |
+| **[asupersync](https://github.com/Dicklesworthstone/asupersync)** | RaptorQ & async runtime | Consumed by `fsci-conformance` for RaptorQ systematic encoding and decode recovery verification |
 | **[ftui](https://github.com/Dicklesworthstone/ftui)** | Terminal UI rendering | Drives the `conformance_dashboard` binary |
 | **[FrankenTerm](https://github.com/Dicklesworthstone/frankenterm)** | Terminal emulator (a WezTerm fork) | Sibling project; same doctrine |
 | **[FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite)** | SQLite re-implementation | Sibling project; shares the `docs/planning/SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md` doctrine alignment |
@@ -1051,7 +1051,7 @@ FrankenSciPy is the answer to those three pressures as a single coherent system,
 - You are writing a long-running service in Rust that needs numerical kernels and you do not want to embed Python.
 - You need to *prove* (in a postmortem, an audit, or a regulator's report) which algorithm produced a numerical result and why.
 - You need to drop a numerical routine into a memory-constrained, supply-chain-strict, or WebAssembly environment.
-- You want a SciPy-shape API surface with cancel-correct async semantics from `asupersync` instead of tokio.
+- You want a synchronous, deterministic SciPy-shape API surface free of `tokio` and its transitive ecosystem, with RaptorQ artifact durability via `asupersync`.
 - You are building an agentic system that needs numerical kernels alongside per-decision audit ledgers.
 
 **Don't reach for it when:**

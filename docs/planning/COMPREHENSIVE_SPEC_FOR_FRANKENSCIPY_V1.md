@@ -400,20 +400,19 @@ Adoption threshold:
   - domain-specific adaptation,
   - rationale for any divergence.
 
-## 23. Asupersync Integration Contract
+## 23. Asupersync Integration & Runtime Supervision Contract
 
-FrankenSciPy must consume `/dp/asupersync` for:
-1. RaptorQ symbol generation and repair/decode proof plumbing for durable artifacts.
-2. E-process and lab-runtime style statistical monitoring where runtime invariants require anytime-valid alarms.
-3. Structured runtime primitives for bounded supervision and fail-closed recovery orchestration.
+FrankenSciPy consumes `/dp/asupersync` exclusively in `fsci-conformance` for:
+1. RaptorQ systematic symbol generation (`asupersync::raptorq::systematic::SystematicEncoder`) and repair/decode proof verification for durable artifacts (`*.raptorq.json` sidecars and `*.decode_proof.json` recovery proofs).
 
-Initial implementation status (V1 bootstrap):
-- `fsci-conformance` emits parity reports with RaptorQ sidecars using `asupersync::raptorq::systematic::SystematicEncoder`.
+Because FrankenSciPy is a purely synchronous, deterministic numerical library (`cargo tree -i tokio` must remain empty and `fsci-runtime` depends only on `blake3`, `serde`, and `serde_json`), statistical drift monitoring and bounded supervision are implemented as synchronous in-house primitives hosted persistently on `fsci_runtime::PolicyController` (and embedded inside `SolverPortfolio`):
+2. Anytime-valid statistical drift monitoring via `fsci_runtime::EProcessMonitor` (`EProcessConfig`, `EProcessStatus`), a betting-martingale test supermartingale satisfying Ville's inequality $\sup_{\tau} \mathbb{P}_{H_0}(E_\tau \ge 1/\alpha) \le \alpha$ over backward-error exceedance indicators.
+3. Bounded runtime supervision and circuit-breaking via `fsci_runtime::PolicySupervisor` (`SupervisionConfig`, `SupervisionStatus`, `SupervisionEvent`), enforcing finite recovery budgets (`recovery_budget = 16` in Hardened mode) and progressive state escalation (`Healthy -> Degraded -> Quarantined -> FailClosed`) across consecutive fallback/failure events.
 
-Mandatory future expansions:
-- packet-level decode replay proofs for actual recovery events,
-- scheduler and supervision integration in runtime policy controllers,
-- calibrated invariant monitors for solver correctness sentinels.
+**FrankenSQLite-delta note (§22 compliance, `frankenscipy-7tb8d.13`):**
+- **Inherited pattern:** RaptorQ systematic sidecars with deterministic decode proofs (`asupersync`), anytime-valid e-process drift alarms, and bounded recovery supervision with fail-closed circuit-breaking.
+- **Domain-specific adaptation:** Supervision and e-process state machines operate synchronously per numerical solve step on `PolicyController` / `SolverPortfolio` over condition diagnostics (`rcond`, anomaly scores) and backward-error exceedances ($\mathbf{1}\{\omega_t > \text{tol}\}$), rather than supervising asynchronous actor tasks or region trees.
+- **Rationale for divergence:** `asupersync::supervision` is coupled to async actor `RegionId`/`TaskId` restart plans, whereas FrankenSciPy exposes a 100% synchronous numerical API with zero async runtime overhead in `fsci-runtime`.
 
 ## 24. FrankenTUI Integration Contract
 
