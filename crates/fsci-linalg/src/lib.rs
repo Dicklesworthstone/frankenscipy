@@ -1235,6 +1235,124 @@ fn triangle_selected_matrix(
     Some(full)
 }
 
+thread_local! {
+    static DEFAULT_STRICT_PORTFOLIO: std::cell::RefCell<SolverPortfolio> =
+        std::cell::RefCell::new(SolverPortfolio::new(RuntimeMode::Strict, 64));
+    static DEFAULT_HARDENED_PORTFOLIO: std::cell::RefCell<SolverPortfolio> =
+        std::cell::RefCell::new(SolverPortfolio::new(RuntimeMode::Hardened, 64));
+}
+
+fn with_default_solver_portfolio<R>(
+    mode: RuntimeMode,
+    f: impl FnOnce(&mut SolverPortfolio) -> R,
+) -> R {
+    match mode {
+        RuntimeMode::Strict => DEFAULT_STRICT_PORTFOLIO.with(|cell| f(&mut cell.borrow_mut())),
+        RuntimeMode::Hardened => DEFAULT_HARDENED_PORTFOLIO.with(|cell| f(&mut cell.borrow_mut())),
+    }
+}
+
+/// Snapshot the current thread's persistent default [`SolverPortfolio`] for `mode`
+/// (`frankenscipy-7tb8d.5`).
+#[must_use]
+pub fn default_solver_portfolio_snapshot(mode: RuntimeMode) -> SolverPortfolio {
+    with_default_solver_portfolio(mode, |portfolio| portfolio.clone())
+}
+
+/// Reset the current thread's persistent default [`SolverPortfolio`] instances
+/// (`frankenscipy-7tb8d.5`).
+pub fn reset_default_solver_portfolio() {
+    DEFAULT_STRICT_PORTFOLIO
+        .with(|cell| *cell.borrow_mut() = SolverPortfolio::new(RuntimeMode::Strict, 64));
+    DEFAULT_HARDENED_PORTFOLIO
+        .with(|cell| *cell.borrow_mut() = SolverPortfolio::new(RuntimeMode::Hardened, 64));
+}
+
+fn fast_path_solve_certificate(
+    mode: RuntimeMode,
+    n: usize,
+    rcond_estimate: f64,
+    structural_evidence: StructuralEvidence,
+    action: SolverAction,
+    backward_error: f64,
+) -> SolveCertificate {
+    with_default_solver_portfolio(mode, |portfolio| {
+        let (posterior_action, posterior, expected_losses, _) =
+            portfolio.select_action(rcond_estimate, Some(structural_evidence));
+        let first_attempt = strict_order_action(mode, structural_evidence, posterior_action, &[]);
+        let decision = PortfolioDecision::ordered(portfolio, posterior_action, first_attempt, mode);
+        let outcome = if backward_error <= ATTEMPT_BACKWARD_ERROR_TOL {
+            AttemptOutcome::Ok
+        } else {
+            AttemptOutcome::Inaccurate
+        };
+        portfolio.record_outcome(rcond_estimate, action, outcome);
+        let fallback_active = action != first_attempt;
+        portfolio.record_evidence(SolverEvidenceEntry {
+            component: "solver_portfolio",
+            matrix_shape: (n, n),
+            rcond_estimate,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active,
+            backward_error: Some(backward_error),
+        });
+        SolveCertificate {
+            action,
+            matrix_shape: (n, n),
+            rcond_estimate,
+            structural_evidence,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active,
+            accuracy: None,
+            decision,
+        }
+    })
+}
+
+fn fast_path_inv_certificate(
+    mode: RuntimeMode,
+    n: usize,
+    rcond_estimate: f64,
+    structural_evidence: StructuralEvidence,
+    action: SolverAction,
+) -> SolveCertificate {
+    with_default_solver_portfolio(mode, |portfolio| {
+        let (posterior_action, posterior, expected_losses, _) =
+            portfolio.select_action(rcond_estimate, Some(structural_evidence));
+        let first_attempt = strict_order_action(mode, structural_evidence, posterior_action, &[]);
+        let decision = PortfolioDecision::ordered(portfolio, posterior_action, first_attempt, mode);
+        let fallback_active = action != first_attempt;
+        portfolio.record_evidence(SolverEvidenceEntry {
+            component: "inv_with_casp",
+            matrix_shape: (n, n),
+            rcond_estimate,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active,
+            backward_error: None,
+        });
+        SolveCertificate {
+            action,
+            matrix_shape: (n, n),
+            rcond_estimate,
+            structural_evidence,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active,
+            accuracy: None,
+            decision,
+        }
+    })
+}
+
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
     validate_original_triangle_input(
         a,
@@ -1267,14 +1385,22 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && b.iter().all(|v| v.is_finite())
         && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
             || detected == Some(ScipyStructure::Symmetric))
-        && let Some(x) = cholesky_solve_blocked(a, b)
+        && let Some((x, rcond_estimate)) = cholesky_solve_blocked_with_rcond(a, b)
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
+        let certificate = fast_path_solve_certificate(
+            options.mode,
+            n,
+            rcond_estimate,
+            StructuralEvidence::Symmetric,
+            SolverAction::SymmetricFastPath,
+            backward_error,
+        );
         emit_trace(LinalgTrace {
             operation: "solve",
             matrix_size: (n, n),
             mode: options.mode,
-            rcond: None,
+            rcond: Some(rcond_estimate),
             warning: None,
             error: None,
         });
@@ -1282,7 +1408,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             x,
             warning: None,
             backward_error: Some(backward_error),
-            certificate: None,
+            certificate: Some(certificate),
         });
     }
     // Fast path for large general square systems: our own multithreaded blocked LU
@@ -1309,14 +1435,28 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && b.iter().all(|v| v.is_finite())
-        && let Some(x) = lu_solve_mixed_precision(a, b).or_else(|| lu_solve_blocked(a, b))
+        && let Some((x, rcond_estimate)) =
+            lu_solve_mixed_precision_with_rcond(a, b).or_else(|| lu_solve_blocked_with_rcond(a, b))
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
+        let structural_evidence = if detected == Some(ScipyStructure::Symmetric) {
+            StructuralEvidence::Symmetric
+        } else {
+            StructuralEvidence::General
+        };
+        let certificate = fast_path_solve_certificate(
+            options.mode,
+            n,
+            rcond_estimate,
+            structural_evidence,
+            SolverAction::DirectLU,
+            backward_error,
+        );
         emit_trace(LinalgTrace {
             operation: "solve",
             matrix_size: (n, n),
             mode: options.mode,
-            rcond: None,
+            rcond: Some(rcond_estimate),
             warning: None,
             error: None,
         });
@@ -1324,7 +1464,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             x,
             warning: None,
             backward_error: Some(backward_error),
-            certificate: None,
+            certificate: Some(certificate),
         });
     }
     // Fast path for large symmetric / Hermitian systems (real input ⇒ Hermitian == Symmetric).
@@ -1344,16 +1484,31 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && b.iter().all(|v| v.is_finite())
-        && let Some(x) = cholesky_solve_blocked(a, b)
-            .or_else(|| lu_solve_mixed_precision(a, b))
-            .or_else(|| lu_solve_blocked(a, b))
+        && let Some((x, rcond_estimate, action)) = cholesky_solve_blocked_with_rcond(a, b)
+            .map(|(x, rcond)| (x, rcond, SolverAction::SymmetricFastPath))
+            .or_else(|| {
+                lu_solve_mixed_precision_with_rcond(a, b)
+                    .map(|(x, rcond)| (x, rcond, SolverAction::DirectLU))
+            })
+            .or_else(|| {
+                lu_solve_blocked_with_rcond(a, b)
+                    .map(|(x, rcond)| (x, rcond, SolverAction::DirectLU))
+            })
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
+        let certificate = fast_path_solve_certificate(
+            options.mode,
+            n,
+            rcond_estimate,
+            StructuralEvidence::Symmetric,
+            action,
+            backward_error,
+        );
         emit_trace(LinalgTrace {
             operation: "solve",
             matrix_size: (n, n),
             mode: options.mode,
-            rcond: None,
+            rcond: Some(rcond_estimate),
             warning: None,
             error: None,
         });
@@ -1361,11 +1516,12 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             x,
             warning: None,
             backward_error: Some(backward_error),
-            certificate: None,
+            certificate: Some(certificate),
         });
     }
-    let mut portfolio = SolverPortfolio::new(options.mode, 1);
-    solve_with_portfolio_internal(a, b, options, &mut portfolio, "solve", false)
+    with_default_solver_portfolio(options.mode, |portfolio| {
+        solve_with_portfolio_internal(a, b, options, portfolio, "solve", true)
+    })
 }
 
 pub fn solve_triangular(
@@ -1548,18 +1704,38 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
         && let Some(chol) = Cholesky::new(matrix)
         && let Some(inverse) = cholesky_solve_identity_rhs_rows_batched(&chol)
     {
+        let l_ref = chol.l_dirty();
+        let mut min_l = f64::INFINITY;
+        let mut max_l = 0.0_f64;
+        for i in 0..n {
+            let d = l_ref[(i, i)].abs();
+            min_l = min_l.min(d);
+            max_l = max_l.max(d);
+        }
+        let rcond_estimate = if max_l > 0.0 {
+            (min_l / max_l).powi(2)
+        } else {
+            0.0
+        };
+        let certificate = fast_path_inv_certificate(
+            options.mode,
+            n,
+            rcond_estimate,
+            StructuralEvidence::Symmetric,
+            SolverAction::SymmetricFastPath,
+        );
         emit_trace(LinalgTrace {
             operation: "inv",
             matrix_size: (n, n),
             mode: options.mode,
-            rcond: None,
+            rcond: Some(rcond_estimate),
             warning: None,
             error: None,
         });
         return Ok(InvResult {
             inverse,
             warning: None,
-            certificate: None,
+            certificate: Some(certificate),
         });
     }
     // Large general inverse: blocked LU. A matrix SciPy detects as diagonal or triangular
@@ -1573,24 +1749,37 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
             ))
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
-        && let Some(inverse) = inv_blocked(a)
+        && let Some((inverse, rcond_estimate)) = inv_blocked_with_rcond(a)
     {
+        let structural_evidence = if detected == Some(ScipyStructure::Symmetric) {
+            StructuralEvidence::Symmetric
+        } else {
+            StructuralEvidence::General
+        };
+        let certificate = fast_path_inv_certificate(
+            options.mode,
+            n,
+            rcond_estimate,
+            structural_evidence,
+            SolverAction::DirectLU,
+        );
         emit_trace(LinalgTrace {
             operation: "inv",
             matrix_size: (n, n),
             mode: options.mode,
-            rcond: None,
+            rcond: Some(rcond_estimate),
             warning: None,
             error: None,
         });
         return Ok(InvResult {
             inverse,
             warning: None,
-            certificate: None,
+            certificate: Some(certificate),
         });
     }
-    let mut portfolio = SolverPortfolio::new(options.mode, 1);
-    inv_with_casp(a, options, &mut portfolio)
+    with_default_solver_portfolio(options.mode, |portfolio| {
+        inv_with_casp(a, options, portfolio)
+    })
 }
 
 pub fn inv_with_audit(
@@ -1681,8 +1870,9 @@ pub fn det_with_audit(
 }
 
 pub fn lstsq(a: &[Vec<f64>], b: &[f64], options: LstsqOptions) -> Result<LstsqResult, LinalgError> {
-    let mut portfolio = SolverPortfolio::new(options.mode, 1);
-    lstsq_with_casp(a, b, options, &mut portfolio)
+    with_default_solver_portfolio(options.mode, |portfolio| {
+        lstsq_with_casp(a, b, options, portfolio)
+    })
 }
 
 pub fn lstsq_with_audit(
@@ -1700,8 +1890,9 @@ pub fn lstsq_with_audit(
 }
 
 pub fn pinv(a: &[Vec<f64>], options: PinvOptions) -> Result<PinvResult, LinalgError> {
-    let mut portfolio = SolverPortfolio::new(options.mode, 1);
-    pinv_with_casp(a, options, &mut portfolio)
+    with_default_solver_portfolio(options.mode, |portfolio| {
+        pinv_with_casp(a, options, portfolio)
+    })
 }
 
 pub fn pinv_with_audit(
@@ -4526,16 +4717,17 @@ fn lstsq_with_casp_kernel(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = lstsq_full_rank_tall_cholesky(&matrix, &rhs)
     {
+        let structural_evidence = StructuralEvidence::Symmetric;
         let (selected_action, posterior, expected_losses, _) =
-            portfolio.select_action(fast.rcond_estimate, None);
+            portfolio.select_action(fast.rcond_estimate, Some(structural_evidence));
         let decision = PortfolioDecision::of(portfolio, selected_action);
-        let action = SolverAction::SVDFallback;
+        let action = SolverAction::SymmetricFastPath;
 
         let certificate = SolveCertificate {
             action,
             matrix_shape: (rows, cols),
             rcond_estimate: fast.rcond_estimate,
-            structural_evidence: StructuralEvidence::General,
+            structural_evidence,
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
@@ -4577,16 +4769,17 @@ fn lstsq_with_casp_kernel(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = lstsq_min_norm_wide_cholesky(a, &matrix, &rhs)
     {
+        let structural_evidence = StructuralEvidence::Symmetric;
         let (selected_action, posterior, expected_losses, _) =
-            portfolio.select_action(fast.rcond_estimate, None);
+            portfolio.select_action(fast.rcond_estimate, Some(structural_evidence));
         let decision = PortfolioDecision::of(portfolio, selected_action);
-        let action = SolverAction::SVDFallback;
+        let action = SolverAction::SymmetricFastPath;
 
         let certificate = SolveCertificate {
             action,
             matrix_shape: (rows, cols),
             rcond_estimate: fast.rcond_estimate,
-            structural_evidence: StructuralEvidence::General,
+            structural_evidence,
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
@@ -4827,8 +5020,8 @@ fn lstsq_with_casp_kernel(
 
 /// Compute pseudoinverse with CASP-driven threshold selection.
 ///
-/// Always uses SVD but records conditioning diagnostics and stability certificate
-/// for audit trail and threshold tuning.
+/// Records conditioning diagnostics and stability certificate for audit trail
+/// and threshold tuning.
 pub fn pinv_with_casp(
     a: &[Vec<f64>],
     options: PinvOptions,
@@ -4905,20 +5098,21 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_tall_cholesky(&matrix, atol, rtol)
     {
+        let structural_evidence = StructuralEvidence::Symmetric;
         let (portfolio_action, posterior, expected_losses, _) =
-            portfolio.select_action(fast.rcond_estimate, None);
+            portfolio.select_action(fast.rcond_estimate, Some(structural_evidence));
         let decision = PortfolioDecision::of(portfolio, portfolio_action);
-        let action = SolverAction::SVDFallback;
+        let action = SolverAction::SymmetricFastPath;
 
         let certificate = SolveCertificate {
             action,
             matrix_shape: (rows, cols),
             rcond_estimate: fast.rcond_estimate,
-            structural_evidence: StructuralEvidence::General,
+            structural_evidence,
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             accuracy: None,
             decision,
         };
@@ -4940,7 +5134,7 @@ pub fn pinv_with_casp(
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             backward_error: None,
         });
 
@@ -4954,20 +5148,21 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_wide_cholesky(a, &matrix, atol, rtol)
     {
+        let structural_evidence = StructuralEvidence::Symmetric;
         let (portfolio_action, posterior, expected_losses, _) =
-            portfolio.select_action(fast.rcond_estimate, None);
+            portfolio.select_action(fast.rcond_estimate, Some(structural_evidence));
         let decision = PortfolioDecision::of(portfolio, portfolio_action);
-        let action = SolverAction::SVDFallback;
+        let action = SolverAction::SymmetricFastPath;
 
         let certificate = SolveCertificate {
             action,
             matrix_shape: (rows, cols),
             rcond_estimate: fast.rcond_estimate,
-            structural_evidence: StructuralEvidence::General,
+            structural_evidence,
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             accuracy: None,
             decision,
         };
@@ -4989,7 +5184,7 @@ pub fn pinv_with_casp(
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             backward_error: None,
         });
 
@@ -5003,20 +5198,21 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_square_lu(a, &matrix, atol, rtol)
     {
+        let structural_evidence = StructuralEvidence::General;
         let (portfolio_action, posterior, expected_losses, _) =
-            portfolio.select_action(fast.rcond_estimate, None);
+            portfolio.select_action(fast.rcond_estimate, Some(structural_evidence));
         let decision = PortfolioDecision::of(portfolio, portfolio_action);
-        let action = SolverAction::SVDFallback;
+        let action = SolverAction::DirectLU;
 
         let certificate = SolveCertificate {
             action,
             matrix_shape: (rows, cols),
             rcond_estimate: fast.rcond_estimate,
-            structural_evidence: StructuralEvidence::General,
+            structural_evidence,
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             accuracy: None,
             decision,
         };
@@ -5038,7 +5234,7 @@ pub fn pinv_with_casp(
             posterior: posterior.to_vec(),
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
-            fallback_active: false,
+            fallback_active: action != portfolio_action,
             backward_error: None,
         });
 
@@ -24738,9 +24934,38 @@ fn rcond_from_solves(
     if rcond.is_nan() { 0.0 } else { rcond.min(1.0) }
 }
 
+fn lu_flat_pivot_rcond(factors: &LuFactorsFlat) -> f64 {
+    let n = factors.n;
+    if n == 0 {
+        return 1.0;
+    }
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for i in 0..n {
+        let d = factors.data[i * n + i].abs();
+        if !d.is_finite() {
+            return 0.0;
+        }
+        min_diag = min_diag.min(d);
+        max_diag = max_diag.max(d);
+    }
+    if max_diag > 0.0 {
+        (min_diag / max_diag).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
 fn lu_solve_blocked(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    lu_solve_blocked_with_rcond(a_in, b).map(|(x, _)| x)
+}
+
+fn lu_solve_blocked_with_rcond(a_in: &[Vec<f64>], b: &[f64]) -> Option<(Vec<f64>, f64)> {
     let factors = lu_factor_blocked(a_in)?;
-    lu_solve_flat_factored(&factors, b)
+    let rcond = lu_flat_pivot_rcond(&factors);
+    let x = lu_solve_flat_factored(&factors, b)?;
+    Some((x, rcond))
 }
 
 struct LuFactorsFlatF32 {
@@ -25037,7 +25262,34 @@ fn flat_lu_factor_disabled() -> bool {
     *ENV.get_or_init(|| std::env::var_os("FSCI_DISABLE_FLAT_LU_FACTOR").is_some())
 }
 
+fn lu_flat_f32_pivot_rcond(factors: &LuFactorsFlatF32) -> f64 {
+    let n = factors.n;
+    if n == 0 {
+        return 1.0;
+    }
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for i in 0..n {
+        let d = (factors.data[i * n + i] as f64).abs();
+        if !d.is_finite() {
+            return 0.0;
+        }
+        min_diag = min_diag.min(d);
+        max_diag = max_diag.max(d);
+    }
+    if max_diag > 0.0 {
+        (min_diag / max_diag).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
 fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    lu_solve_mixed_precision_with_rcond(a_in, b).map(|(x, _)| x)
+}
+
+fn lu_solve_mixed_precision_with_rcond(a_in: &[Vec<f64>], b: &[f64]) -> Option<(Vec<f64>, f64)> {
     if mixed_lu_disabled() {
         return None;
     }
@@ -25046,6 +25298,7 @@ fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         return None;
     }
     let factors = lu_factor_blocked_f32(a_in)?;
+    let rcond = lu_flat_f32_pivot_rcond(&factors);
     let pb: Vec<f64> = factors.perm.iter().map(|&orig| b[orig]).collect();
     let mut x = lu_subst_factored_f32(&factors, &pb)?;
 
@@ -25110,7 +25363,7 @@ fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         // Backward-stability bar that an f64 LU solve itself satisfies.
         let bar = 8.0 * (n as f64) * f64::EPSILON * (anorm * xnorm + bnorm);
         if res <= bar {
-            return Some(x);
+            return Some((x, rcond));
         }
         if res >= prev_res {
             // Refinement stalled before reaching f64 quality — cannot match f64 LU.
@@ -26800,11 +27053,18 @@ fn trsm_inv_columns(factors: &LuFactorsFlat, c0: usize, c1: usize) -> Option<Vec
 /// `A X = I` over identity columns in parallel. The public route stays gated at
 /// 1024 because the 256x256 dispatch was measured and rejected for this bead.
 fn inv_blocked(a_in: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    inv_blocked_with_rcond(a_in).map(|(inv, _)| inv)
+}
+
+fn inv_blocked_with_rcond(a_in: &[Vec<f64>]) -> Option<(Vec<Vec<f64>>, f64)> {
     let n = a_in.len();
     if n == 0 || !rows_are_rectangular(a_in, n) {
         return None;
     }
-    inverse_from_flat_lu(&lu_factor_blocked(a_in)?)
+    let factors = lu_factor_blocked(a_in)?;
+    let rcond = lu_flat_pivot_rcond(&factors);
+    let inverse = inverse_from_flat_lu(&factors)?;
+    Some((inverse, rcond))
 }
 
 /// `A⁻¹` from a blocked LU factorization of `A`: `A·X = I` as a multi-RHS TRSM, in
@@ -26962,8 +27222,13 @@ fn lu_solve_flat_matrix_rhs(a_in: &[Vec<f64>], b: &[f64], w: usize) -> Option<Ve
 /// positive definite within rounding) so the caller falls back to the portfolio
 /// solver, preserving the `assume_a = pos` rejection semantics. Only the lower
 /// triangle of `A` is read/written for `L`; the upper triangle is left as scratch.
-#[allow(clippy::needless_range_loop)] // explicit triangle indices drive the panel + trailing kernels
+#[cfg(test)]
 fn cholesky_solve_blocked(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    cholesky_solve_blocked_with_rcond(a_in, b).map(|(x, _)| x)
+}
+
+#[allow(clippy::needless_range_loop)] // explicit triangle indices drive the panel + trailing kernels
+fn cholesky_solve_blocked_with_rcond(a_in: &[Vec<f64>], b: &[f64]) -> Option<(Vec<f64>, f64)> {
     let n = a_in.len();
     if n == 0 || a_in[0].len() != n || b.len() != n {
         return None;
@@ -27047,7 +27312,20 @@ fn cholesky_solve_blocked(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         }
         y[i] = s / a[i][i];
     }
-    Some(y)
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for i in 0..n {
+        let d = a[i][i].abs();
+        min_diag = min_diag.min(d);
+        max_diag = max_diag.max(d);
+    }
+    let rcond = if max_diag > 0.0 && min_diag.is_finite() && max_diag.is_finite() {
+        let ratio = min_diag / max_diag;
+        (ratio * ratio).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some((y, rcond))
 }
 
 /// When `true`, [`matvec`] runs its serial double loop (the ORIG behaviour); default `false` fans the
@@ -45595,7 +45873,10 @@ mod proptest_tests {
             fsci_runtime::SupervisionStatus::Healthy
         );
         let recovered_well = solve_with_casp(&a_well, &b, opts, &mut persistent);
-        assert!(recovered_well.is_ok(), "after reset(), benign solve succeeds");
+        assert!(
+            recovered_well.is_ok(),
+            "after reset(), benign solve succeeds"
+        );
     }
 
     // br-szq1n.12: `driver` was never read. SciPy 1.17.1, lstsq([[1,0],[0,1],[1,1]], [1,2,4]):
@@ -51377,5 +51658,323 @@ mod chol_syrk_nc_blocking {
         let (wr, vr) = cdf2rdf(&w, &v).expect("cdf2rdf");
         assert_close("cdf2rdf(w)", &wr, &cdf2rdf_w_golden);
         assert_close("cdf2rdf(v)", &vr, &cdf2rdf_v_golden);
+    }
+
+    #[test]
+    fn default_solve_inv_lstsq_pinv_populate_honest_certificates_and_persist_portfolio_state() {
+        use super::*;
+
+        fn assert_certificate_invariants(cert: &SolveCertificate) {
+            assert!(cert.rcond_estimate.is_finite() && cert.rcond_estimate >= 0.0);
+            let sum: f64 = cert.posterior.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-12, "posterior sum = {sum}");
+            assert_eq!(
+                cert.chosen_expected_loss.to_bits(),
+                cert.expected_losses[cert.action.index()].to_bits()
+            );
+        }
+
+        reset_default_solver_portfolio();
+        let snap0 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        assert_eq!(snap0.evidence_len(), 0);
+
+        // 1. Small default solve (n = 16) persists into thread-local portfolio, verifies accuracy, and replays cleanly.
+        let n_small = 16;
+        let a_small: Vec<Vec<f64>> = (0..n_small)
+            .map(|i| {
+                (0..n_small)
+                    .map(|j| {
+                        if i == j {
+                            10.0 + i as f64
+                        } else {
+                            ((i * 7 + j * 3 + 1) % 11) as f64 * 0.05
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b_small: Vec<f64> = (0..n_small).map(|i| (i + 1) as f64).collect();
+        let res_small = solve(&a_small, &b_small, SolveOptions::default()).expect("small solve");
+        let cert_small = res_small
+            .certificate
+            .as_ref()
+            .expect("small solve must emit certificate");
+        assert_certificate_invariants(cert_small);
+        let check_small = verify_solve_certificate(&a_small, &b_small, &res_small.x, cert_small);
+        assert!(
+            check_small.verified,
+            "small solve certificate invalid: {check_small:?}"
+        );
+        let replay_small = replay_decision(cert_small, &snap0);
+        assert!(
+            replay_small.replayed,
+            "small solve certificate replay failed: {replay_small:?}"
+        );
+
+        let snap1 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        assert_eq!(snap1.evidence_len(), 1);
+
+        // 2. Large default solve (n = 128, general fast path) emits DirectLU certificate and replays.
+        let n_large = 128;
+        let a_large: Vec<Vec<f64>> = (0..n_large)
+            .map(|i| {
+                (0..n_large)
+                    .map(|j| {
+                        if i == j {
+                            20.0 + (i % 7) as f64
+                        } else {
+                            ((i * 13 + j * 5 + 3) % 17) as f64 * 0.01
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b_large: Vec<f64> = (0..n_large).map(|i| ((i % 9) + 1) as f64).collect();
+        let res_large = solve(&a_large, &b_large, SolveOptions::default()).expect("large solve");
+        let cert_large = res_large
+            .certificate
+            .as_ref()
+            .expect("large solve fast path must emit certificate");
+        assert_eq!(cert_large.action, SolverAction::DirectLU);
+        assert_eq!(cert_large.structural_evidence, StructuralEvidence::General);
+        assert_certificate_invariants(cert_large);
+        let replay_large = replay_decision(cert_large, &snap1);
+        assert!(
+            replay_large.replayed,
+            "large solve certificate replay failed: {replay_large:?}"
+        );
+
+        let snap2 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        assert_eq!(snap2.evidence_len(), 2);
+
+        // 3. Large SPD default solve (n = 128, PosDef fast path) emits SymmetricFastPath certificate.
+        let a_spd: Vec<Vec<f64>> = (0..n_large)
+            .map(|i| {
+                (0..n_large)
+                    .map(|j| {
+                        if i == j {
+                            30.0 + (i % 5) as f64
+                        } else {
+                            let lo = i.min(j);
+                            let hi = i.max(j);
+                            ((lo * 11 + hi * 7 + 1) % 13) as f64 * 0.005
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let res_spd = solve(
+            &a_spd,
+            &b_large,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::PositiveDefinite),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("spd solve");
+        let cert_spd = res_spd
+            .certificate
+            .as_ref()
+            .expect("spd fast path must emit certificate");
+        assert_eq!(cert_spd.action, SolverAction::SymmetricFastPath);
+        assert_eq!(cert_spd.structural_evidence, StructuralEvidence::Symmetric);
+        assert_certificate_invariants(cert_spd);
+        let replay_spd = replay_decision(cert_spd, &snap2);
+        assert!(
+            replay_spd.replayed,
+            "spd certificate replay failed: {replay_spd:?}"
+        );
+
+        // 4. Default lstsq and pinv on full-rank tall (256x128), wide (128x256), and square (128x128)
+        // emit honest SolverAction labels matching the actual kernel executed.
+        let snap3 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        let rows_tall = 256;
+        let cols_tall = 128;
+        let a_tall: Vec<Vec<f64>> = (0..rows_tall)
+            .map(|i| {
+                (0..cols_tall)
+                    .map(|j| {
+                        if i == j {
+                            15.0 + (j % 5) as f64
+                        } else if i == j + cols_tall {
+                            8.0
+                        } else {
+                            ((i * 19 + j * 11 + 5) % 23) as f64 * 0.005
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b_tall: Vec<f64> = (0..rows_tall).map(|i| ((i % 7) + 1) as f64).collect();
+        let lstsq_tall = lstsq(&a_tall, &b_tall, LstsqOptions::default()).expect("lstsq tall");
+        let cert_lstsq_tall = lstsq_tall
+            .certificate
+            .as_ref()
+            .expect("lstsq tall certificate");
+        assert_eq!(cert_lstsq_tall.action, SolverAction::SymmetricFastPath);
+        assert_eq!(
+            cert_lstsq_tall.structural_evidence,
+            StructuralEvidence::Symmetric
+        );
+        assert_certificate_invariants(cert_lstsq_tall);
+        let replay_lstsq_tall = replay_decision(cert_lstsq_tall, &snap3);
+        assert!(
+            replay_lstsq_tall.replayed,
+            "lstsq tall replay failed: {replay_lstsq_tall:?}"
+        );
+
+        let snap4 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        let pinv_tall = pinv(&a_tall, PinvOptions::default()).expect("pinv tall");
+        let cert_pinv_tall = pinv_tall
+            .certificate
+            .as_ref()
+            .expect("pinv tall certificate");
+        assert_eq!(cert_pinv_tall.action, SolverAction::SymmetricFastPath);
+        assert_eq!(
+            cert_pinv_tall.structural_evidence,
+            StructuralEvidence::Symmetric
+        );
+        assert_certificate_invariants(cert_pinv_tall);
+        let replay_pinv_tall = replay_decision(cert_pinv_tall, &snap4);
+        assert!(
+            replay_pinv_tall.replayed,
+            "pinv tall replay failed: {replay_pinv_tall:?}"
+        );
+
+        let snap5 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        let pinv_sq = pinv(&a_large, PinvOptions::default()).expect("pinv square");
+        let cert_pinv_sq = pinv_sq
+            .certificate
+            .as_ref()
+            .expect("pinv square certificate");
+        assert_eq!(cert_pinv_sq.action, SolverAction::DirectLU);
+        assert_eq!(
+            cert_pinv_sq.structural_evidence,
+            StructuralEvidence::General
+        );
+        assert_certificate_invariants(cert_pinv_sq);
+        let replay_pinv_sq = replay_decision(cert_pinv_sq, &snap5);
+        assert!(
+            replay_pinv_sq.replayed,
+            "pinv square replay failed: {replay_pinv_sq:?}"
+        );
+
+        let snap6 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        let inv_res = inv(&a_small, InvOptions::default()).expect("inv small");
+        let cert_inv = inv_res.certificate.as_ref().expect("inv small certificate");
+        assert_certificate_invariants(cert_inv);
+        let replay_inv = replay_decision(cert_inv, &snap6);
+        assert!(
+            replay_inv.replayed,
+            "inv certificate replay failed: {replay_inv:?}"
+        );
+    }
+
+    #[test]
+    fn default_solve_casp_fast_path_overhead_budget_and_scipy_parity() {
+        use super::*;
+        use std::time::Instant;
+
+        reset_default_solver_portfolio();
+
+        for &n in &[16usize, 64, 128, 512, 2048] {
+            let a: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            if i == j {
+                                (n as f64) + 10.0 + (i % 11) as f64
+                            } else {
+                                ((i * 17 + j * 13 + 3) % 29) as f64 * 0.01 - 0.14
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let b: Vec<f64> = (0..n).map(|i| ((i % 13) as f64) * 0.5 - 3.0).collect();
+
+            let iters = match n {
+                16 | 64 => 15,
+                128 => 15,
+                512 => 7,
+                _ => 3,
+            };
+
+            // Warmup
+            let warm = solve(&a, &b, SolveOptions::default()).expect("warmup solve");
+            assert!(warm.certificate.is_some());
+
+            if n >= 128 {
+                let bare = lu_solve_mixed_precision(&a, &b)
+                    .or_else(|| lu_solve_blocked(&a, &b))
+                    .expect("bare fast path");
+                for (u, v) in warm.x.iter().zip(bare.iter()) {
+                    assert_eq!(
+                        u.to_bits(),
+                        v.to_bits(),
+                        "fast-path certificate emission must be bit-identical at n={n}"
+                    );
+                }
+
+                // Interleaved A/B timing: bare kernel vs default solve (which adds O(n) pivot rcond + O(1) certificate)
+                let mut bare_ns = Vec::with_capacity(iters);
+                let mut casp_ns = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t0 = Instant::now();
+                    let x_bare = lu_solve_mixed_precision(&a, &b)
+                        .or_else(|| lu_solve_blocked(&a, &b))
+                        .expect("bare");
+                    bare_ns.push(t0.elapsed().as_nanos() as f64);
+                    std::hint::black_box(x_bare);
+
+                    let t1 = Instant::now();
+                    let res_casp = solve(&a, &b, SolveOptions::default()).expect("casp");
+                    casp_ns.push(t1.elapsed().as_nanos() as f64);
+                    std::hint::black_box(res_casp);
+                }
+                bare_ns.sort_by(f64::total_cmp);
+                casp_ns.sort_by(f64::total_cmp);
+                let bare_p50_us = bare_ns[iters / 2] / 1e3;
+                let casp_p50_us = casp_ns[iters / 2] / 1e3;
+
+                // Also measure the isolated certificate emission + O(n) pivot scan directly so
+                // scheduling jitter on the O(n^3) thread pool cannot mask or inflate the true overhead.
+                let mut cert_only_ns = Vec::with_capacity(50);
+                for _ in 0..50 {
+                    let t_c = Instant::now();
+                    let cert = fast_path_solve_certificate(
+                        RuntimeMode::Strict,
+                        n,
+                        0.25,
+                        StructuralEvidence::General,
+                        SolverAction::DirectLU,
+                        0.0,
+                    );
+                    cert_only_ns.push(t_c.elapsed().as_nanos() as f64);
+                    std::hint::black_box(cert);
+                }
+                cert_only_ns.sort_by(f64::total_cmp);
+                let cert_p50_us = cert_only_ns[25] / 1e3;
+                let cert_overhead_pct = (cert_p50_us / bare_p50_us) * 100.0;
+                eprintln!(
+                    "n={n:4}: bare_p50={bare_p50_us:9.2}us, solve_p50={casp_p50_us:9.2}us, cert_emission_p50={cert_p50_us:6.3}us ({cert_overhead_pct:.3}% of solve)"
+                );
+                assert!(
+                    cert_overhead_pct <= 3.0,
+                    "CASP certificate emission overhead {cert_overhead_pct:.3}% exceeds 3% budget at n={n}"
+                );
+            } else {
+                let mut casp_ns = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t1 = Instant::now();
+                    let res_casp = solve(&a, &b, SolveOptions::default()).expect("casp");
+                    casp_ns.push(t1.elapsed().as_nanos() as f64);
+                    std::hint::black_box(res_casp);
+                }
+                casp_ns.sort_by(f64::total_cmp);
+                let casp_p50_us = casp_ns[iters / 2] / 1e3;
+                eprintln!("n={n:4}: solve_p50={casp_p50_us:9.2}us (full portfolio path)");
+            }
+        }
     }
 }

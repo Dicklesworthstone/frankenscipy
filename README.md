@@ -41,7 +41,7 @@ SciPy is the bedrock of scientific Python, but the runtime it sits on is showing
 FrankenSciPy reimplements the SciPy surface in idiomatic Rust with three guarantees that the original cannot provide:
 
 1. **Memory- and thread-safety by construction.** `#![forbid(unsafe_code)]` is enforced workspace-wide.
-2. **Explicit conditioning-aware algorithm selection.** The dense linear-solve family can run through CASP (`solve_with_casp`, `solve_with_audit`, `lstsq_with_casp`), which records the chosen action, the evidence that drove the choice, and the expected loss versus alternatives. CASP is opt-in: the plain `solve`/`lstsq` calls do not use it.
+2. **Explicit conditioning-aware algorithm selection.** The dense linear-solve family (`solve`, `inv`, `lstsq`, `pinv`) routes through a persistent thread-local CASP `SolverPortfolio` and returns a `SolveCertificate` recording the chosen action, the conditioning evidence that drove the choice, and the expected loss versus alternatives; `solve_with_casp`, `solve_with_audit`, and `lstsq_with_casp` accept a caller-owned `SolverPortfolio` and/or `AuditLedger`.
 3. **Differential conformance against the real SciPy.** Most routines have a differential test that runs the same inputs through `scipy.*` in a live Python process and diffs the FrankenSciPy result against it inside the Rust test run.
 
 ### Why FrankenSciPy?
@@ -282,7 +282,7 @@ The artifact topology is locked, the contract schemas (`behavior_ledger.schema.j
 
 ## Architecture
 
-The data flow of a CASP solve (`solve_with_casp` and friends; plain `solve` calls the numeric kernels directly):
+The data flow of a CASP solve (`solve`, `solve_with_casp`, `solve_with_audit`, and friends):
 
 ```text
                 ┌──────────────────────────────────────────────────────┐
@@ -403,7 +403,7 @@ What follows is the technical-depth pass: which algorithms FrankenSciPy actually
 
 | Routine | What FrankenSciPy uses |
 |---|---|
-| `solve` (dense) | Plain `solve` does not go through CASP: in Strict mode for n ≥ 128 (general / symmetric / positive-definite) it factors in `f32` and refines to `f64`, falling back to an in-house blocked LU or Cholesky; below 128 it uses the linalg portfolio on a throwaway `SolverPortfolio`. `solve_with_casp` chooses among LU with partial pivoting (`DirectLU`: nalgebra's below n = 128, the blocked in-house LU from there), nalgebra QR (`PivotedQR`; no column pivoting despite the name) and nalgebra SVD (`SVDFallback`), with diagonal, triangular and symmetric fast paths. With the calibrated loss matrix, LU is chosen at every conditioning; QR, then the SVD, are the fallbacks when LU's backward error fails. |
+| `solve` (dense) | Plain `solve` routes through a persistent thread-local `SolverPortfolio` per `RuntimeMode` and always returns a `SolveCertificate`: in Strict mode for n ≥ 128 (general / symmetric / positive-definite) it factors in `f32` and refines to `f64`, falling back to an in-house blocked LU or Cholesky while recording the $O(n)$ pivot-ratio `rcond_estimate` and action (`DirectLU` or `SymmetricFastPath`) into the persistent portfolio; below 128 it runs `solve_with_casp` directly on that persistent portfolio. `solve_with_casp` chooses among LU with partial pivoting (`DirectLU`: nalgebra's below n = 128, the blocked in-house LU from there), nalgebra QR (`PivotedQR`; no column pivoting despite the name) and nalgebra SVD (`SVDFallback`), with diagonal, triangular and symmetric fast paths. With the calibrated loss matrix, LU is chosen at every conditioning; QR, then the SVD, are the fallbacks when LU's backward error fails. |
 | `lstsq` | SVD-based by default (in-house thin SVD); QR only for square full-rank systems. Strict-mode fast paths use normal equations via Cholesky plus one refinement step for tall systems (cols ≥ 128), a wide Cholesky path and a low-rank path. |
 | `expm` | Adaptive Padé (degree 3/5/7/9/13) with scaling and squaring (Higham 2005, the algorithm SciPy uses); a truncated Taylor fallback is used only if the Padé solve fails. |
 | `logm` | Symmetric input: eigendecomposition. Otherwise real Schur form with an element-wise Parlett recurrence (repeated eigenvalues via the first-derivative limit), and a complex Schur–Parlett when the Schur form has 2×2 blocks. No inverse scaling-and-squaring (SciPy's method); negative real eigenvalues give `NaN` rather than a complex logarithm — `complex::logm_real` is the SciPy-shaped entry point there (SciPy's `_logm`: complex Schur, then Al-Mohy–Higham inverse scaling and squaring). |
@@ -1269,7 +1269,7 @@ Three rules of thumb:
 
 1. **Options structs replace keyword arguments.** Python's `method='BFGS', tol=1e-6` becomes a `MinimizeOptions { tol: 1e-6, ... }` literal.
 2. **Outputs are typed result structs.** Where SciPy returns a tuple or a `Result` object, FrankenSciPy returns a named struct: `SolveResult`, `OptimizeResult`, `IterativeSolveResult`, `TtestResult`, `QuadResult`, etc.
-3. **The CASP/audit surface is opt-in.** The plain `solve(...)` and `lstsq(...)` calls are SciPy-shape and don't require a `SolverPortfolio`. Reach for `solve_with_casp(...)` only when you want the decision certificate.
+3. **Caller-managed CASP portfolios and `AuditLedger` are explicit.** Plain `solve(...)`, `inv(...)`, `lstsq(...)`, and `pinv(...)` are SciPy-shaped and populate `result.certificate` via a persistent thread-local `SolverPortfolio`; reach for `solve_with_casp(...)` or `solve_with_audit(...)` when you want to supply your own `SolverPortfolio` or record into an `AuditLedger`.
 
 ### Bibliography
 
