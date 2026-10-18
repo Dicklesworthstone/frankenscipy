@@ -45508,6 +45508,96 @@ mod proptest_tests {
         )));
     }
 
+    // frankenscipy-7tb8d.13: driving >16 consecutive FullValidate recoveries through ONE
+    // persistent SolverPortfolio in Hardened mode exhausts the default recovery_budget=16,
+    // transitions PolicySupervisor Healthy -> Degraded -> Quarantined, and causes subsequent
+    // solves to fail closed with LinalgError::PolicyRejected. Negative control: a throwaway
+    // fresh portfolio per solve never depletes budget below 15 and never trips quarantine.
+    #[test]
+    fn supervision_escalation_trips_quarantine_after_16_recoveries_on_persistent_portfolio() {
+        let mut persistent = SolverPortfolio::new(RuntimeMode::Hardened, 32);
+        let opts = SolveOptions {
+            mode: RuntimeMode::Hardened,
+            ..SolveOptions::default()
+        };
+        // rcond ~ 1e-10 triggers PolicyAction::FullValidate in Hardened mode without tripping
+        // the Hardened rcond < 1e-14 immediate rejection.
+        let a_ill = vec![vec![1.0, 1.0], vec![1.0, 1.0 + 1e-10]];
+        let a_well = vec![vec![4.0, 1.0], vec![2.0, 3.0]];
+        let b = vec![1.0, 2.0];
+
+        assert_eq!(
+            persistent
+                .policy_controller()
+                .supervisor()
+                .recovery_budget_remaining(),
+            16
+        );
+
+        for step in 1..=20 {
+            let res = solve_with_casp(&a_ill, &b, opts, &mut persistent);
+            let sup = persistent.policy_controller().supervisor();
+            println!(
+                "step={step:02} status={:?} budget_remaining={} ok={}",
+                sup.status(),
+                sup.recovery_budget_remaining(),
+                res.is_ok()
+            );
+            if step < 3 {
+                assert!(res.is_ok(), "step {step} should succeed while budget > 0");
+                assert_eq!(sup.status(), fsci_runtime::SupervisionStatus::Healthy);
+                assert_eq!(sup.recovery_budget_remaining(), 16 - step);
+            } else if step < 16 {
+                assert!(
+                    res.is_ok(),
+                    "step {step} should succeed in Degraded while budget > 0"
+                );
+                assert_eq!(sup.status(), fsci_runtime::SupervisionStatus::Degraded);
+                assert_eq!(sup.recovery_budget_remaining(), 16 - step);
+            } else {
+                assert_eq!(sup.status(), fsci_runtime::SupervisionStatus::Quarantined);
+                assert_eq!(sup.recovery_budget_remaining(), 0);
+                assert!(
+                    matches!(res, Err(LinalgError::PolicyRejected { .. })),
+                    "step {step} must fail closed with PolicyRejected once Quarantined, got {res:?}"
+                );
+            }
+
+            // Negative control: fresh portfolio per solve never depletes budget below 15.
+            let mut throwaway = SolverPortfolio::new(RuntimeMode::Hardened, 32);
+            let fresh_res = solve_with_casp(&a_ill, &b, opts, &mut throwaway);
+            assert!(
+                fresh_res.is_ok(),
+                "throwaway portfolio never trips quarantine"
+            );
+            assert_eq!(
+                throwaway.policy_controller().supervisor().status(),
+                fsci_runtime::SupervisionStatus::Healthy
+            );
+            assert_eq!(
+                throwaway
+                    .policy_controller()
+                    .supervisor()
+                    .recovery_budget_remaining(),
+                15
+            );
+        }
+
+        // While Quarantined, even a benign well-conditioned solve is rejected until reset().
+        let blocked_well = solve_with_casp(&a_well, &b, opts, &mut persistent);
+        assert!(matches!(
+            blocked_well,
+            Err(LinalgError::PolicyRejected { .. })
+        ));
+        persistent.policy_controller_mut().supervisor_mut().reset();
+        assert_eq!(
+            persistent.policy_controller().supervisor().status(),
+            fsci_runtime::SupervisionStatus::Healthy
+        );
+        let recovered_well = solve_with_casp(&a_well, &b, opts, &mut persistent);
+        assert!(recovered_well.is_ok(), "after reset(), benign solve succeeds");
+    }
+
     // br-szq1n.12: `driver` was never read. SciPy 1.17.1, lstsq([[1,0],[0,1],[1,1]], [1,2,4]):
     // gelsd/gelss -> x [4/3, 7/3], residues 1/3, s [sqrt(3), 1]; gelsy -> same x, residues [],
     // s None.

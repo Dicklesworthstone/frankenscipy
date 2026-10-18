@@ -13,10 +13,11 @@ workspace = true
 chol-wall-bench = []
 # Perf-only: pulls in `sha2` so `perf_eigh_vs_scipy` can self-report the SHA-256 of
 # its own ELF from inside the process. Off by default — the library never uses sha2.
-eigh-incumbent-bench = ["dep:sha2"]
+eigh-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
 # Perf/infra-only: `probe_build_freshness` compares the source rustc compiled into it
 # against the source on disk, to catch a stale remote binary (frankenscipy-eibro).
 freshness-probe = ["dep:sha2"]
+bench-harness = ["fsci-runtime/bench-harness", "eigh-incumbent-bench"]
 
 [dependencies]
 fsci-fft = { workspace = true }
@@ -34,3 +35,15 @@ criterion = { workspace = true }
 [[bench]]
 name = "linalg_bench"
 harness = false
+
+[[bin]]
+name = "diff_uncovered_linalg_scipy"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_chol_vs_scipy"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_syrk_partition_vs_blas"
+required-features = ["bench-harness"]
