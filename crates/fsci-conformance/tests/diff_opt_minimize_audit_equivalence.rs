@@ -324,11 +324,11 @@ fn diff_opt_minimize_with_casp_portfolio() {
 /// CASP chose.
 #[test]
 fn diff_opt_minimize_with_casp_10_problems_scipy() {
+    use fsci_opt::minimize_with_casp;
+    use fsci_opt::types::Bound;
+    use serde::Deserialize;
     use std::io::Write;
     use std::process::Stdio;
-    use fsci_opt::types::Bound;
-    use fsci_opt::minimize_with_casp;
-    use serde::Deserialize;
 
     const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
@@ -354,11 +354,9 @@ fn diff_opt_minimize_with_casp_10_problems_scipy() {
             "rosenbrock_2d" | "rosenbrock_bounded" => {
                 (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2)
             }
-            "rosenbrock_3d" => {
-                (0..2)
-                    .map(|i| (1.0 - x[i]).powi(2) + 100.0 * (x[i + 1] - x[i] * x[i]).powi(2))
-                    .sum()
-            }
+            "rosenbrock_3d" => (0..2)
+                .map(|i| (1.0 - x[i]).powi(2) + 100.0 * (x[i + 1] - x[i] * x[i]).powi(2))
+                .sum(),
             "beale" => {
                 (1.5 - x[0] + x[0] * x[1]).powi(2)
                     + (2.25 - x[0] + x[0] * x[1].powi(2)).powi(2)
@@ -366,7 +364,9 @@ fn diff_opt_minimize_with_casp_10_problems_scipy() {
             }
             "booth" => (x[0] + 2.0 * x[1] - 7.0).powi(2) + (2.0 * x[0] + x[1] - 5.0).powi(2),
             "matyas" => 0.26 * (x[0] * x[0] + x[1] * x[1]) - 0.48 * x[0] * x[1],
-            "himmelblau" => (x[0] * x[0] + x[1] - 11.0).powi(2) + (x[0] + x[1] * x[1] - 7.0).powi(2),
+            "himmelblau" => {
+                (x[0] * x[0] + x[1] - 11.0).powi(2) + (x[0] + x[1] * x[1] - 7.0).powi(2)
+            }
             "ill_quad_1e6" => (x[0] - 1.0).powi(2) + 1.0e6 * (x[1] + 1.0).powi(2),
             "ill_quad_1e8" => {
                 (x[0] - 1.0).powi(2) + 1.0e4 * (x[1] + 2.0).powi(2) + 1.0e8 * (x[2] - 0.5).powi(2)
@@ -411,14 +411,24 @@ fn diff_opt_minimize_with_casp_10_problems_scipy() {
         ("booth", vec![0.0, 0.0], None, None),
         ("matyas", vec![-2.0, 3.0], None, None),
         ("himmelblau", vec![2.5, 1.8], None, None),
-        ("ill_quad_1e6", vec![0.0, 0.0], None, Some(grad_ill_quad_1e6)),
+        (
+            "ill_quad_1e6",
+            vec![0.0, 0.0],
+            None,
+            Some(grad_ill_quad_1e6),
+        ),
         (
             "ill_quad_1e8",
             vec![0.0, 0.0, 0.0],
             None,
             Some(grad_ill_quad_1e8),
         ),
-        ("rosenbrock_bounded", vec![-1.2, 1.0], Some(&BOUNDS_ROSEN), None),
+        (
+            "rosenbrock_bounded",
+            vec![-1.2, 1.0],
+            Some(&BOUNDS_ROSEN),
+            None,
+        ),
         ("bounded_quad", vec![0.0, 0.0], Some(&BOUNDS_QUAD), None),
     ];
     assert_eq!(specs.len(), 10);
@@ -434,13 +444,8 @@ fn diff_opt_minimize_with_casp_10_problems_scipy() {
             maxiter: Some(2000),
             ..MinimizeOptions::default()
         };
-        let out = minimize_with_casp(
-            |x| eval_prob(prob_id, x),
-            x0,
-            options,
-            &mut portfolio,
-        )
-        .expect(prob_id);
+        let out = minimize_with_casp(|x| eval_prob(prob_id, x), x0, options, &mut portfolio)
+            .expect(prob_id);
         let scipy_method = match out.chosen_action {
             OptSolverAction::BFGS => "BFGS",
             OptSolverAction::LBFGSB => "L-BFGS-B",
@@ -570,4 +575,3 @@ print(json.dumps(out))
     }
     ledger.finish(10);
 }
-

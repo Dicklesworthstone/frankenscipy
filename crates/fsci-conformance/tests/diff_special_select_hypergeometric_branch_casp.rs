@@ -423,7 +423,7 @@ fn ulp_distance(actual: f64, reference: f64) -> u64 {
 /// used to measure the before/after accuracy delta on the `|z| in [0.9, 1.1]` band in the same
 /// test invocation.
 fn legacy_hyp2f1_unit_band(a: f64, b: f64, c: f64, z: f64) -> f64 {
-    use fsci_special::{gamma, hyp2f1, SpecialTensor};
+    use fsci_special::{SpecialTensor, gamma, hyp2f1};
     if (0.9..1.0).contains(&z) {
         let cab = c - a - b;
         if (cab - cab.round()).abs() > 1e-6 {
@@ -462,12 +462,10 @@ fn legacy_hyp2f1_unit_band(a: f64, b: f64, c: f64, z: f64) -> f64 {
 
 #[test]
 fn diff_special_hyper_casp_2000_point_mpmath_accuracy_grid() {
-    use fsci_special::{hyp0f1, hyp1f1, hyp2f1, SpecialTensor};
+    use fsci_special::{SpecialTensor, hyp0f1, hyp1f1, hyp2f1};
     use std::process::Command;
 
-    let mut script = String::from(
-        "import json, mpmath as mp\nmp.mp.dps = 50\nout = []\n",
-    );
+    let mut script = String::from("import json, mpmath as mp\nmp.mp.dps = 50\nout = []\n");
 
     // 500 points of hyp0f1(b, z)
     let mut hyp0f1_pts = Vec::with_capacity(500);
@@ -524,10 +522,7 @@ fn diff_special_hyper_casp_2000_point_mpmath_accuracy_grid() {
         "hyp1f1": hyp1f1_pts,
         "hyp2f1": hyp2f1_pts,
     });
-    script.push_str(&format!(
-        "data = json.loads({:?})\n",
-        payload.to_string()
-    ));
+    script.push_str(&format!("data = json.loads({:?})\n", payload.to_string()));
     script.push_str(
         "r0 = [float(mp.hyp0f1(b, z)) for b, z in data['hyp0f1']]\n\
          r1 = [float(mp.hyp1f1(a, b, z)) for a, b, z in data['hyp1f1']]\n\
