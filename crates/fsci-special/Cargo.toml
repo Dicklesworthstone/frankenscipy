@@ -8,7 +8,8 @@ description = "Special mathematical functions for FrankenSciPy"
 autobins = false
 
 [features]
-ndtri-isafloor-bench = ["dep:sha2"]
+ndtri-isafloor-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
+bench-harness = ["fsci-runtime/bench-harness", "ndtri-isafloor-bench"]
 
 
 [lints]
@@ -44,16 +45,16 @@ path = "src/bin/perf_cdf.rs"
 required-features = ["ndtri-isafloor-bench"]
 
 # The live-SciPy harness. Registered for the same reason `perf_cdf` is — `autobins = false`
-# would otherwise hide it among the untracked scratch — but WITHOUT `required-features`,
-# matching the five other `perf_*_vs_scipy` harnesses in this workspace. Gating a benchmark
-# behind a feature flag is how `perf_cdf` silently became unbuildable, and a harness that
-# needs a flag to exist is a harness that gets measured with a stale binary.
+# would otherwise hide it among the untracked scratch — and gated on `bench-harness`
+# (frankenscipy-eclzm.1) alongside every other workspace live-SciPy harness.
 [[bin]]
 name = "perf_special_vs_scipy"
 path = "src/bin/perf_special_vs_scipy.rs"
+required-features = ["bench-harness"]
 
 # Accuracy probe for gammaln's Lanczos->asymptotic crossover. Registered explicitly for the
 # same reason as the harness above: `autobins = false` hides src/bin from cargo.
 [[bin]]
 name = "diff_gammaln_crossover"
 path = "src/bin/diff_gammaln_crossover.rs"
+required-features = ["bench-harness"]

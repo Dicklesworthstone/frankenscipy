@@ -9,6 +9,7 @@ description = "Differential conformance testing harness for FrankenSciPy"
 [features]
 default = ["dashboard"]
 dashboard = ["dep:ftui"]
+bench-harness = ["fsci-runtime/bench-harness"]
 
 [[bin]]
 name = "conformance_dashboard"
@@ -53,7 +54,7 @@ fsci-linalg = { workspace = true }
 fsci-ndimage = { workspace = true }
 fsci-odr = { workspace = true }
 fsci-opt = { workspace = true }
-fsci-runtime = { workspace = true }
+fsci-runtime = { workspace = true, features = ["bench-harness"] }
 fsci-signal = { workspace = true }
 fsci-sparse = { workspace = true, features = ["npz"] }
 fsci-special = { workspace = true }

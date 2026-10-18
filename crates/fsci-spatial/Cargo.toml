@@ -15,9 +15,16 @@ fsci-sparse = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 
+[features]
+bench-harness = ["fsci-runtime/bench-harness"]
+
 [[bench]]
 name = "spatial_bench"
 harness = false
+
+[[bin]]
+name = "perf_spatial_vs_scipy"
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true

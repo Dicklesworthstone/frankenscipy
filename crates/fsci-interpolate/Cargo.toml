@@ -17,9 +17,20 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 sha2 = "0.10.9"
 
+[features]
+bench-harness = ["fsci-runtime/bench-harness"]
+
 [[bench]]
 name = "interpolate_bench"
 harness = false
+
+[[bin]]
+name = "perf_griddata_live"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_interpolate_vs_scipy"
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true

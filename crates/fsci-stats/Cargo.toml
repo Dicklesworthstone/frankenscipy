@@ -9,7 +9,8 @@ description = "Probability distributions and statistical tests for FrankenSciPy"
 [features]
 # Perf-only provenance support for live-incumbent harnesses. Off by default so
 # the library itself does not acquire a production hashing dependency.
-stats-incumbent-bench = ["dep:sha2"]
+stats-incumbent-bench = ["dep:sha2", "fsci-runtime/bench-harness"]
+bench-harness = ["fsci-runtime/bench-harness", "stats-incumbent-bench"]
 
 [dependencies]
 fsci-runtime = { workspace = true }
@@ -28,6 +29,10 @@ sha2 = "0.10.9"
 [[bench]]
 name = "stats_bench"
 harness = false
+
+[[bin]]
+name = "perf_stats_vs_scipy"
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true

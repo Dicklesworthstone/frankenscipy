@@ -17,6 +17,13 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+bench-harness = ["fsci-runtime/bench-harness"]
+
 [[bench]]
 name = "fft_bench"
 harness = false
+
+[[bin]]
+name = "perf_fft_vs_scipy"
+required-features = ["bench-harness"]

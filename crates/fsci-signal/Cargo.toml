@@ -15,9 +15,16 @@ fsci-runtime = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 
+[features]
+bench-harness = ["fsci-runtime/bench-harness"]
+
 [[bench]]
 name = "signal_bench"
 harness = false
+
+[[bin]]
+name = "perf_signal_vs_scipy"
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true

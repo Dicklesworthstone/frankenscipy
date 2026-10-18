@@ -21,6 +21,7 @@ description = "Multi-dimensional image processing routines for FrankenSciPy"
 # It is a MEASUREMENT feature: it hardcodes the shipped defaults, so it must never be enabled
 # for a build whose behaviour is under test by the toggles it removes.
 spline-flags-const = []
+bench-harness = ["fsci-runtime/bench-harness"]
 
 [dependencies]
 fsci-fft = { workspace = true }
@@ -34,6 +35,14 @@ criterion = { workspace = true }
 [[bench]]
 name = "ndimage_bench"
 harness = false
+
+[[bin]]
+name = "perf_ndimage_vs_scipy"
+required-features = ["bench-harness"]
+
+[[bin]]
+name = "perf_separable_filter"
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true
