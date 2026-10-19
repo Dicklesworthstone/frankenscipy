@@ -52397,6 +52397,7 @@ mod chol_syrk_nc_blocking {
 
     #[test]
     fn test_linalg_hardened_nonfinite_projection_and_reject_default() {
+        use super::*;
         let a = vec![vec![4.0, f64::NAN], vec![1.0, 3.0]];
         let b = vec![4.0, 7.0];
 
@@ -52456,6 +52457,7 @@ mod chol_syrk_nc_blocking {
 
     #[test]
     fn test_linalg_hardened_tikhonov_regularization_hilbert12() {
+        use super::*;
         let n = 12usize;
         let h: Vec<Vec<f64>> = (0..n)
             .map(|i| (0..n).map(|j| 1.0 / ((i + j + 1) as f64)).collect())
@@ -52546,6 +52548,7 @@ mod chol_syrk_nc_blocking {
 
     #[test]
     fn test_linalg_strict_mode_bit_identity_2000_calls() {
+        use super::*;
         let mut state = 0x517cc1b727220a95_u64;
         let mut next_f64 = || -> f64 {
             state = state

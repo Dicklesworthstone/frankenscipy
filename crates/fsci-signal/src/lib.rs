@@ -36121,6 +36121,7 @@ mod jyfke_trailing_trim_is_exact {
 
     #[test]
     fn test_signal_hardened_nonfinite_projection_and_reject_default() {
+        use super::*;
         let b = [0.5, 0.5];
         let a = [1.0, -0.2];
         let x_bad = [1.0, f64::NAN, 3.0, 4.0];
