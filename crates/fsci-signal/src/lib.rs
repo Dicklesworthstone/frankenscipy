@@ -9314,12 +9314,17 @@ pub fn lfilter_with_options(
     }
 
     let make_fp = || {
-        Fingerprinter::new("fsci_signal::lfilter_with_options")
-            .f64s(b)
-            .f64s(a)
-            .f64s(x)
-            .opt(zi, |f, z| f.f64s(z))
-            .str(&format!("{:?}", options.mode))
+        let mut fp = Fingerprinter::new("fsci_signal::lfilter_with_options");
+        fp.f64s(b).f64s(a).f64s(x);
+        match zi {
+            Some(z) => {
+                fp.usize(1).f64s(z);
+            }
+            None => {
+                fp.usize(0);
+            }
+        }
+        fp.str(&format!("{:?}", options.mode))
             .str(&format!("{:?}", options.recovery))
             .finish()
     };
