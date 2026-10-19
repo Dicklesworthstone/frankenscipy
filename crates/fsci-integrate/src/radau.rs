@@ -361,6 +361,7 @@ impl RadauSolver {
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
         let n = config.y0.len();
+        crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
         let _ = validate_tol(
             ToleranceValue::Scalar(config.rtol),
             config.atol.clone(),

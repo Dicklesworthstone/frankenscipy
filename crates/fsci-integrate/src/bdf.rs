@@ -524,6 +524,7 @@ impl BdfSolver {
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
         let n = config.y0.len();
+        crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
 
         // Input validation mirrors RkSolver::new (per frankenscipy-ljmg):
         // previously BdfSolver::new did ZERO validation — a caller passing

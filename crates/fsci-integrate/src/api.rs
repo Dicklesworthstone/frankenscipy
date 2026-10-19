@@ -669,6 +669,7 @@ impl LsodaSolver {
         if n == 0 {
             return Err(IntegrateValidationError::EmptyY0);
         }
+        crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
         if !config.t0.is_finite() || !config.t_bound.is_finite() {
             return Err(IntegrateValidationError::NonFiniteSpan);
         }
@@ -979,6 +980,7 @@ fn solve_ivp_core_with_diag<F, S>(
     mut solver: S,
     options: &SolveIvpOptions<'_>,
     hw_abort_streak: Option<usize>,
+    audit: Option<&AuditScope<'_>>,
 ) -> Result<(SolveIvpResult, IvpRunDiagnostics), IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -1031,10 +1033,39 @@ where
 
     let mut status: i32 = -1;
     let mut hw_aborted = false;
+    let mut steps_taken = 0usize;
+    let (_cap_dim, cap_steps, cap_nfev) = crate::validation::hardened_integrate_caps();
 
     while solver.ivp_state() == OdeSolverState::Running {
+        if options.mode == RuntimeMode::Hardened {
+            if let Some(max_steps) = cap_steps
+                && steps_taken >= max_steps
+            {
+                let message =
+                    format!("ODE step count {steps_taken} exceeded Hardened cap {max_steps}");
+                fail_closed(audit, "resource_exhausted", &message);
+                return Err(IntegrateValidationError::ResourceExhausted { message });
+            }
+            if solver.nfev() > cap_nfev {
+                let message = format!(
+                    "ODE RHS evaluation count {} exceeded Hardened cap {cap_nfev}",
+                    solver.nfev()
+                );
+                fail_closed(audit, "resource_exhausted", &message);
+                return Err(IntegrateValidationError::ResourceExhausted { message });
+            }
+        }
         match solver.step_with(fun) {
             Ok(outcome) => {
+                steps_taken += 1;
+                if options.mode == RuntimeMode::Hardened && solver.nfev() > cap_nfev {
+                    let message = format!(
+                        "ODE RHS evaluation count {} exceeded Hardened cap {cap_nfev}",
+                        solver.nfev()
+                    );
+                    fail_closed(audit, "resource_exhausted", &message);
+                    return Err(IntegrateValidationError::ResourceExhausted { message });
+                }
                 let t = solver.t();
                 let y = solver.y().to_vec();
                 let f = solver.f().map(<[f64]>::to_vec);
@@ -1585,6 +1616,19 @@ fn solve_ivp_with_casp_portfolio_impl<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
+    let effective_mode = if options.mode == RuntimeMode::Hardened
+        || portfolio.mode() == RuntimeMode::Hardened
+    {
+        RuntimeMode::Hardened
+    } else {
+        RuntimeMode::Strict
+    };
+    crate::validation::check_hardened_integrate_cap(
+        options.y0.len(),
+        options.max_step,
+        effective_mode,
+        audit,
+    )?;
     let probe = probe_ode_stiffness(fun, options);
     let mut effective_stiffness =
         if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
@@ -1864,6 +1908,7 @@ where
         fail_closed(audit, "empty_y0", "rejected");
         return Err(IntegrateValidationError::EmptyY0);
     }
+    crate::validation::check_hardened_integrate_cap(n, options.max_step, options.mode, audit)?;
     if !t0.is_finite() || !tf.is_finite() {
         fail_closed(audit, "non_finite_span", "rejected");
         return Err(IntegrateValidationError::NonFiniteSpan);
@@ -1940,7 +1985,7 @@ where
                 tableau,
             };
             let solver = RkSolver::new(fun, config)?;
-            solve_ivp_core_with_diag(fun, solver, &resolved_options, hw_abort_streak)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, hw_abort_streak, audit)
         }
         SolverKind::Radau => {
             // Genuine Radau IIA (3-stage, order 5) — see radau.rs (frankenscipy-3y5p9).
@@ -1955,7 +2000,7 @@ where
                 mode: resolved_options.mode,
             };
             let solver = crate::radau::RadauSolver::new(fun, config)?;
-            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Bdf => {
             let config = BdfSolverConfig {
@@ -1970,11 +2015,11 @@ where
                 max_order: 5,
             };
             let solver = BdfSolver::new(fun, config)?;
-            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Lsoda => {
             let solver = LsodaSolver::from_options(&resolved_options)?;
-            solve_ivp_core_with_diag(fun, solver, &resolved_options, None)
+            solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
     }
 }

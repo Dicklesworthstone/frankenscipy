@@ -47,6 +47,83 @@ fn bounded_recovery(audit: Option<&AuditScope<'_>>, recovery_action: &str, outco
 pub const EPS: f64 = f64::EPSILON;
 pub const MIN_RTOL: f64 = 100.0 * EPS;
 
+/// Maximum state dimension `y0.len()` permitted in Hardened mode (`frankenscipy-3cu8u.4`).
+pub const HARDENED_MAX_STATE_DIM: usize = 100_000;
+/// Default maximum solver steps permitted in Hardened mode (`frankenscipy-3cu8u.4`).
+pub const HARDENED_MAX_STEPS: usize = 100_000;
+/// Default maximum RHS evaluations (`nfev`) permitted in Hardened mode (`frankenscipy-3cu8u.4`).
+pub const HARDENED_MAX_NFEV: usize = 1_000_000;
+
+std::thread_local! {
+    static HARDENED_INTEGRATE_CAPS_OVERRIDE: std::cell::Cell<Option<(usize, Option<usize>, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Active `(max_state_dim, max_steps, max_nfev)` caps for Hardened mode.
+#[must_use]
+pub fn hardened_integrate_caps() -> (usize, Option<usize>, usize) {
+    HARDENED_INTEGRATE_CAPS_OVERRIDE.with(|cell| {
+        cell.get().unwrap_or((
+            HARDENED_MAX_STATE_DIM,
+            Some(HARDENED_MAX_STEPS),
+            HARDENED_MAX_NFEV,
+        ))
+    })
+}
+
+/// Temporarily override `(max_state_dim, max_steps, max_nfev)` for Hardened-mode boundary tests.
+pub fn with_hardened_integrate_caps<R>(
+    max_state_dim: usize,
+    max_steps: Option<usize>,
+    max_nfev: usize,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Guard(Option<(usize, Option<usize>, usize)>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HARDENED_INTEGRATE_CAPS_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = HARDENED_INTEGRATE_CAPS_OVERRIDE
+        .with(|cell| cell.replace(Some((max_state_dim, max_steps, max_nfev))));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Temporarily override only the Hardened step budget `max_steps` (`None` disables the step cap,
+/// requiring a finite `max_step` in Hardened mode).
+pub fn with_hardened_step_cap<R>(max_steps: Option<usize>, f: impl FnOnce() -> R) -> R {
+    let (max_dim, _, max_nfev) = hardened_integrate_caps();
+    with_hardened_integrate_caps(max_dim, max_steps, max_nfev, f)
+}
+
+/// Enforce Hardened-mode state-dimension and step-budget preconditions before solver allocation.
+pub fn check_hardened_integrate_cap(
+    state_dim: usize,
+    max_step: f64,
+    mode: RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<(), IntegrateValidationError> {
+    if mode != RuntimeMode::Hardened {
+        return Ok(());
+    }
+    let (max_state_dim, max_steps, _max_nfev) = hardened_integrate_caps();
+    if state_dim > max_state_dim {
+        let message =
+            format!("state dimension {state_dim} exceeds Hardened cap {max_state_dim}");
+        fail_closed(audit, "resource_exhausted", &message);
+        return Err(IntegrateValidationError::ResourceExhausted { message });
+    }
+    if max_step.is_infinite() && max_step > 0.0 && max_steps.is_none() {
+        let message =
+            "unbounded max_step=inf without a finite step cap is refused in Hardened mode"
+                .to_string();
+        fail_closed(audit, "resource_exhausted", &message);
+        return Err(IntegrateValidationError::ResourceExhausted { message });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToleranceValue {
     Scalar(f64),
@@ -146,6 +223,11 @@ pub enum IntegrateValidationError {
     IntegrationFailed {
         message: String,
     },
+    /// Hardened-mode resource cap exceeded (`HARDENED_MAX_STATE_DIM`, `HARDENED_MAX_STEPS`,
+    /// `HARDENED_MAX_NFEV`, or `max_step = inf` without a step cap).
+    ResourceExhausted {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for IntegrateValidationError {
@@ -191,6 +273,7 @@ impl std::fmt::Display for IntegrateValidationError {
                  65, 71, 77, 83, 89, 95, 101, 107, 113, 119, 125, 131."
             ),
             Self::IntegrationFailed { message } => write!(f, "integration failed: {message}"),
+            Self::ResourceExhausted { message } => write!(f, "resource exhausted: {message}"),
         }
     }
 }
@@ -226,6 +309,7 @@ impl IntegrateValidationError {
             Self::QuadInvalidTolerance { .. } => "quad_invalid_tolerance",
             Self::LebedevOrderUnavailable { .. } => "lebedev_order_unavailable",
             Self::IntegrationFailed { .. } => "integration_failed",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
         }
     }
 }

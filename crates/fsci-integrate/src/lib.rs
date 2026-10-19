@@ -49,10 +49,11 @@ pub use rk::{
 pub use solver::{OdeSolver, OdeSolverState, StepFailure, StepOutcome};
 pub use step_size::{InitialStepRequest, StepRhsFn, select_initial_step};
 pub use validation::{
-    EPS, IntegrateValidationError, MIN_RTOL, SyncSharedAuditLedger, ToleranceValue,
-    ToleranceWarning, ValidatedTolerance, sync_audit_ledger, validate_first_step,
+    EPS, HARDENED_MAX_NFEV, HARDENED_MAX_STATE_DIM, HARDENED_MAX_STEPS, IntegrateValidationError,
+    MIN_RTOL, SyncSharedAuditLedger, ToleranceValue, ToleranceWarning, ValidatedTolerance,
+    check_hardened_integrate_cap, hardened_integrate_caps, sync_audit_ledger, validate_first_step,
     validate_first_step_with_audit, validate_max_step, validate_max_step_with_audit, validate_tol,
-    validate_tol_with_audit,
+    validate_tol_with_audit, with_hardened_integrate_caps, with_hardened_step_cap,
 };
 
 /// SciPy-compatible alias for explicit Runge-Kutta 5(4) solver, matching `scipy.integrate.RK45`.
@@ -392,4 +393,194 @@ mod tests {
             .expect_err("single-point odeint should validate t");
         assert_eq!(err, IntegrateValidationError::NonFiniteSpan);
     }
+
+    #[test]
+    fn hardened_integrate_resource_cap_boundary_and_audit() {
+        use fsci_runtime::{AuditAction, OdeSolverPortfolio, RuntimeMode};
+
+        assert_eq!(HARDENED_MAX_STATE_DIM, 100_000);
+        assert_eq!(HARDENED_MAX_STEPS, 100_000);
+        assert_eq!(HARDENED_MAX_NFEV, 1_000_000);
+
+        // 1. State dimension cap at HARDENED_MAX_STATE_DIM + 1 fails closed before solver/probe allocation
+        let big_y0 = vec![1.0_f64; HARDENED_MAX_STATE_DIM + 1];
+        let ledger = sync_audit_ledger();
+        let err = solve_ivp_with_audit(
+            &mut |_t, _y| panic!("RHS must not be evaluated when state dimension exceeds cap"),
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &big_y0,
+                mode: RuntimeMode::Hardened,
+                ..SolveIvpOptions::default()
+            },
+            &ledger,
+        )
+        .expect_err("HARDENED_MAX_STATE_DIM + 1 must fail closed");
+        assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+        let guard = ledger.lock().expect("lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(
+            guard.entries()[0].action,
+            AuditAction::FailClosed {
+                reason: "resource_exhausted".to_string()
+            }
+        );
+        drop(guard);
+
+        // CASP portfolio also refuses before probe_ode_stiffness allocates n*n Jacobian
+        let ledger_casp = sync_audit_ledger();
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Hardened, 8);
+        let casp_err = solve_ivp_with_casp_portfolio_and_audit(
+            &mut |_t, _y| panic!("probe must not run when state dimension exceeds cap"),
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &big_y0,
+                mode: RuntimeMode::Hardened,
+                ..SolveIvpOptions::default()
+            },
+            &mut portfolio,
+            0.0,
+            false,
+            &ledger_casp,
+        )
+        .expect_err("CASP portfolio must fail closed before probe allocation");
+        assert!(matches!(casp_err, IntegrateValidationError::ResourceExhausted { .. }));
+        let guard_casp = ledger_casp.lock().expect("lock");
+        assert_eq!(guard_casp.len(), 1);
+        assert_eq!(
+            guard_casp.entries()[0].action,
+            AuditAction::FailClosed {
+                reason: "resource_exhausted".to_string()
+            }
+        );
+        drop(guard_casp);
+
+        // 2. Boundary check on state dimension (cap = 2 vs 3) across RK, BDF, Radau, LSODA
+        let y3 = [1.0, 2.0, 3.0];
+        with_hardened_integrate_caps(3, Some(100), 1000, || {
+            let ok = solve_ivp(
+                &mut |_t, y| y.iter().map(|v| -v).collect(),
+                &SolveIvpOptions {
+                    t_span: (0.0, 0.1),
+                    y0: &y3,
+                    mode: RuntimeMode::Hardened,
+                    ..SolveIvpOptions::default()
+                },
+            );
+            assert!(ok.is_ok(), "state_dim == cap must succeed");
+        });
+        with_hardened_integrate_caps(2, Some(100), 1000, || {
+            for method in [
+                SolverKind::Rk45,
+                SolverKind::Rk23,
+                SolverKind::Dop853,
+                SolverKind::Bdf,
+                SolverKind::Radau,
+                SolverKind::Lsoda,
+            ] {
+                let err = solve_ivp(
+                    &mut |_t, y| y.iter().map(|v| -v).collect(),
+                    &SolveIvpOptions {
+                        t_span: (0.0, 0.1),
+                        y0: &y3,
+                        method,
+                        mode: RuntimeMode::Hardened,
+                        ..SolveIvpOptions::default()
+                    },
+                )
+                .expect_err("state_dim > cap must fail closed");
+                assert!(
+                    matches!(err, IntegrateValidationError::ResourceExhausted { .. }),
+                    "method {method:?}"
+                );
+            }
+        });
+
+        // 3. Step cap boundary and max_step = inf without a step cap
+        with_hardened_step_cap(None, || {
+            let ledger = sync_audit_ledger();
+            let err = solve_ivp_with_audit(
+                &mut |_t, y| vec![-y[0]],
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0],
+                    max_step: f64::INFINITY,
+                    mode: RuntimeMode::Hardened,
+                    ..SolveIvpOptions::default()
+                },
+                &ledger,
+            )
+            .expect_err("max_step=inf without a step cap must be refused in Hardened mode");
+            assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+            let guard = ledger.lock().expect("lock");
+            assert_eq!(
+                guard.entries()[0].action,
+                AuditAction::FailClosed {
+                    reason: "resource_exhausted".to_string()
+                }
+            );
+        });
+
+        // Step cap exceeded during stepping (max_steps = 2 with small max_step = 0.1 on [0, 1])
+        with_hardened_integrate_caps(10, Some(2), 10_000, || {
+            let ledger = sync_audit_ledger();
+            let err = solve_ivp_with_audit(
+                &mut |_t, y| vec![-y[0]],
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0],
+                    max_step: 0.1,
+                    mode: RuntimeMode::Hardened,
+                    ..SolveIvpOptions::default()
+                },
+                &ledger,
+            )
+            .expect_err("exceeding Hardened step cap must fail closed");
+            assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+            let guard = ledger.lock().expect("lock");
+            assert_eq!(
+                guard.entries().last().unwrap().action,
+                AuditAction::FailClosed {
+                    reason: "resource_exhausted".to_string()
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn strict_integrate_500_calls_bit_identical() {
+        use fsci_runtime::RuntimeMode;
+
+        for call_idx in 0..500usize {
+            let y0 = [1.0 + (call_idx as f64) * 0.01, -0.5 + (call_idx as f64) * 0.005];
+            let opts = SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &y0,
+                method: match call_idx % 4 {
+                    0 => SolverKind::Rk45,
+                    1 => SolverKind::Dop853,
+                    2 => SolverKind::Bdf,
+                    _ => SolverKind::Radau,
+                },
+                rtol: 1e-6,
+                atol: ToleranceValue::Scalar(1e-8),
+                mode: RuntimeMode::Strict,
+                ..SolveIvpOptions::default()
+            };
+            let r1 = solve_ivp(&mut |_t, y| vec![-y[0] + 0.1 * y[1], -2.0 * y[1]], &opts).unwrap();
+            let r2 = with_hardened_integrate_caps(1, Some(1), 1, || {
+                solve_ivp(&mut |_t, y| vec![-y[0] + 0.1 * y[1], -2.0 * y[1]], &opts).unwrap()
+            });
+            assert_eq!(r1.nfev, r2.nfev);
+            for (t1, t2) in r1.t.iter().zip(r2.t.iter()) {
+                assert_eq!(t1.to_bits(), t2.to_bits(), "t strict bit-identity at call {call_idx}");
+            }
+            for (row1, row2) in r1.y.iter().zip(r2.y.iter()) {
+                for (a, b) in row1.iter().zip(row2.iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "y strict bit-identity at call {call_idx}");
+                }
+            }
+        }
+    }
 }
+
