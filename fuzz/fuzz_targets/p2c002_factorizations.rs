@@ -223,6 +223,7 @@ fuzz_target!(|input: FactorizationInput| {
             check_finite: input.check_finite,
             cond: None,
             driver: LstsqDriver::Gelsd,
+            ..LstsqOptions::default()
         },
     );
     let _ = pinv(

@@ -92,6 +92,7 @@ fuzz_target!(|input: SolveInput| {
         assume_a: None,
         lower: input.lower,
         transposed: input.transposed,
+        ..SolveOptions::default()
     };
     if let Ok(result) = solve(&a, &b, options)
         && rows == cols
