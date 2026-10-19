@@ -32,11 +32,13 @@ use std::io::Write;
 use std::process::Stdio;
 
 use fsci_conformance::CompareLedger;
+use fsci_runtime::Fingerprinter;
 use fsci_sparse::{
     CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SolveOptions,
-    SparseBackend, cg, spsolve,
+    SparseBackend, cg, estimate_sparse_cond_1norm, spsolve,
 };
 use serde::Deserialize;
+use std::time::Instant;
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// The one case: the bead's permuted 100 x 100 grid Laplacian and its right-hand side.
@@ -178,12 +180,17 @@ struct Oracle {
     x: Vec<f64>,
     backward_error: f64,
     one_ulp_envelope: f64,
+    scipy_median_ms: f64,
+    scipy_version: String,
+    numpy_version: String,
+    python_exe: String,
 }
 
 fn scipy_solution(s: &System) -> Option<Oracle> {
     let script = r#"
-import json, sys
+import json, sys, time
 import numpy as np
+import scipy
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 q = json.load(sys.stdin)
@@ -191,11 +198,24 @@ n = q["n"]
 A = sp.csc_matrix((q["vals"], (q["rows"], q["cols"])), shape=(n, n))
 b = np.array(q["b"])
 x = spla.spsolve(A, b)
+times_ms = []
+for _ in range(5):
+    t0 = time.perf_counter()
+    _ = spla.spsolve(A, b)
+    times_ms.append((time.perf_counter() - t0) * 1e3)
+times_ms.sort()
 bwd = np.abs(b - A @ x).max() / (abs(A).sum(axis=1).max() * np.abs(x).max() + np.abs(b).max())
 x2 = spla.spsolve(A, np.nextafter(b, np.inf))
 env = np.abs(x2 - x).max() / np.abs(x).max()
-json.dump({"x": x.tolist(), "backward_error": float(bwd), "one_ulp_envelope": float(env)},
-          sys.stdout)
+json.dump({
+    "x": x.tolist(),
+    "backward_error": float(bwd),
+    "one_ulp_envelope": float(env),
+    "scipy_median_ms": float(times_ms[2]),
+    "scipy_version": scipy.__version__,
+    "numpy_version": np.__version__,
+    "python_exe": sys.executable,
+}, sys.stdout)
 "#;
     let query = serde_json::json!({
         "n": s.n, "rows": s.rows, "cols": s.cols, "vals": s.vals, "b": s.b,
@@ -240,6 +260,7 @@ json.dump({"x": x.tolist(), "backward_error": float(bwd), "one_ulp_envelope": fl
 fn diff_sparse_spsolve_accuracy_contract() {
     let system = build_system();
     let a = to_csr(&system);
+    let nnz = a.nnz();
     let half_bandwidth = system
         .rows
         .iter()
@@ -251,12 +272,15 @@ fn diff_sparse_spsolve_accuracy_contract() {
         half_bandwidth > system.n / 2,
         "the permutation must defeat the banded arms (half-bandwidth {half_bandwidth})"
     );
+    let cond_1_est = estimate_sparse_cond_1norm(&a);
 
+    let t_direct = Instant::now();
     let result = spsolve(&a, &system.b, SolveOptions::default()).expect("spsolve");
+    let fsci_direct_ms = t_direct.elapsed().as_secs_f64() * 1e3;
     let fsci_bwd = backward_error(&a, &result.solution, &system.b);
     println!(
-        "fsci spsolve: backend {:?}, ordering {:?}, warnings {:?}, backward error {fsci_bwd:.3e}",
-        result.backend_used, result.ordering_used, result.warnings
+        "fsci spsolve: n={}, nnz={nnz}, half_bandwidth={half_bandwidth}, cond_1_est={cond_1_est:.3e}, backend={:?}, ordering={:?}, warnings={:?}, backward_error={fsci_bwd:.3e}, time_ms={fsci_direct_ms:.2}",
+        system.n, result.backend_used, result.ordering_used, result.warnings
     );
     assert!(
         matches!(result.backend_used, SparseBackend::NativeSparseLu),
@@ -270,6 +294,7 @@ fn diff_sparse_spsolve_accuracy_contract() {
     );
 
     // Must-miss: the removed shortcut's answer, checked against SciPy below.
+    let t_cg = Instant::now();
     let shortcut = cg(
         &a,
         &system.b,
@@ -281,9 +306,10 @@ fn diff_sparse_spsolve_accuracy_contract() {
         },
     )
     .expect("cg");
+    let fsci_cg_shortcut_ms = t_cg.elapsed().as_secs_f64() * 1e3;
     let shortcut_bwd = backward_error(&a, &shortcut.solution, &system.b);
     println!(
-        "CG to rtol {OLD_SHORTCUT_CG_TOL:e} (the removed shortcut): converged {}, {} iterations, backward error {shortcut_bwd:.3e}",
+        "CG to rtol {OLD_SHORTCUT_CG_TOL:e} (the removed shortcut): converged {}, {} iterations, backward error {shortcut_bwd:.3e}, time_ms={fsci_cg_shortcut_ms:.2}",
         shortcut.converged, shortcut.iterations
     );
 
@@ -301,9 +327,24 @@ fn diff_sparse_spsolve_accuracy_contract() {
     };
     let forward = relative_gap(&result.solution);
     let shortcut_forward = relative_gap(&shortcut.solution);
+    let exe_bytes = std::fs::read("/proc/self/exe").unwrap_or_default();
+    let elf_blake3 = Fingerprinter::new("diff_sparse_spsolve_accuracy_contract")
+        .bytes(&exe_bytes)
+        .finish();
+    let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
     println!(
         "SciPy spsolve: backward error {:.3e}, its own 1-ulp-in-b envelope {:.3e}; fsci forward error vs SciPy {forward:.3e} (CG shortcut: {shortcut_forward:.3e})",
         oracle.backward_error, oracle.one_ulp_envelope
+    );
+    println!(
+        "PERF_ROW [frankenscipy-szq1n.4]: n={} nnz={nnz} half_bw={half_bandwidth} cond_1_est={cond_1_est:.3e} fsci_direct_lu_ms={fsci_direct_ms:.2} fsci_cg_shortcut_before_ms={fsci_cg_shortcut_ms:.2} scipy_spsolve_median_ms={:.2} direct_vs_before_speedup={:.2}x scipy_version={} numpy_version={} python={} host={} elf={elf_blake3}",
+        system.n,
+        oracle.scipy_median_ms,
+        fsci_cg_shortcut_ms / fsci_direct_ms.max(1e-9),
+        oracle.scipy_version,
+        oracle.numpy_version,
+        oracle.python_exe,
+        hostname.trim()
     );
 
     let mut ledger = CompareLedger::new("diff_sparse_spsolve_accuracy_contract", &ARMS);
