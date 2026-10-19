@@ -27,15 +27,16 @@ pub use plan::{
 };
 pub use transforms::{
     BackendKind, Complex64, FFT_PRIME_FORCE_BLUESTEIN, FHTCOEFF_FORCE_SERIAL, FftError, FftOptions,
-    SyncSharedAuditLedger, TransformTrace, WorkerPolicy, dct, dct_i, dct_iii, dct_iv, dctn, dst,
-    dst_i, dst_ii, dst_iii, dst_iv, dstn, fft, fft_with_audit, fft2, fft2_with_audit, fftn,
-    fftn_with_audit, fht, fhtoffset, fwht, hfft, hfft_with_audit, hfft2, hfft2_with_audit, hfftn,
-    hfftn_with_audit, hilbert, idct, idct_i, idct_iii, idct_iv, idctn, idst, idstn, ifft,
-    ifft_with_audit, ifft2, ifft2_with_audit, ifftn, ifftn_with_audit, ifht, ihfft,
-    ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn, ihfftn_with_audit, irfft,
-    irfft_with_audit, irfft2, irfft2_with_audit, irfftn, irfftn_with_audit, next_fast_len,
-    prev_fast_len, rfft, rfft_with_audit, rfft2, rfft2_with_audit, rfftn, rfftn_with_audit,
-    sync_audit_ledger, take_transform_traces,
+    HARDENED_MAX_FFT_LEN, SyncSharedAuditLedger, TransformTrace, WorkerPolicy, dct, dct_i, dct_iii,
+    dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn, fft, fft_with_audit, fft2,
+    fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht, hardened_max_fft_len, hfft,
+    hfft_with_audit, hfft2, hfft2_with_audit, hfftn, hfftn_with_audit, hilbert, idct, idct_i,
+    idct_iii, idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2, ifft2_with_audit, ifftn,
+    ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn,
+    ihfftn_with_audit, irfft, irfft_with_audit, irfft2, irfft2_with_audit, irfftn,
+    irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_with_audit, rfft2,
+    rfft2_with_audit, rfftn, rfftn_with_audit, sync_audit_ledger, take_transform_traces,
+    with_hardened_max_fft_len,
 };
 
 /// FFT normalization modes matching SciPy/PocketFFT conventions.
@@ -1220,6 +1221,106 @@ mod tests {
                 (im - expected_im).abs() < 1e-10,
                 "analytic_signal[{i}].imag = {im}, expected {expected_im}"
             );
+        }
+    }
+
+    #[test]
+    fn hardened_fft_resource_cap_boundary_and_audit() {
+        use fsci_runtime::{AuditAction, AuditLedger, RuntimeMode};
+
+        let strict_opts = FftOptions::default().with_mode(RuntimeMode::Strict);
+        let hardened_opts = FftOptions::default().with_mode(RuntimeMode::Hardened);
+
+        super::with_hardened_max_fft_len(16, || {
+            let ok_c: Vec<Complex64> = (0..16).map(|i| (i as f64, 0.0)).collect();
+            let over_c: Vec<Complex64> = (0..17).map(|i| (i as f64, 0.0)).collect();
+            let ok_r: Vec<f64> = (0..16).map(|i| i as f64).collect();
+            let over_r: Vec<f64> = (0..17).map(|i| i as f64).collect();
+
+            // Exact cap succeeds in Hardened mode.
+            assert!(fft(&ok_c, &hardened_opts).is_ok());
+            assert!(rfft(&ok_r, &hardened_opts).is_ok());
+            assert!(dct(&ok_r, &hardened_opts).is_ok());
+
+            // Cap + 1 fails closed in Hardened mode, succeeds in Strict mode.
+            let ledger = AuditLedger::shared();
+            let err = super::fft_with_audit(&over_c, &hardened_opts, &ledger)
+                .expect_err("fft len 17 must fail closed under cap 16 in Hardened mode");
+            assert_eq!(
+                err,
+                super::FftError::ResourceExhausted {
+                    detail: "Hardened mode FFT length exceeds HARDENED_MAX_FFT_LEN",
+                }
+            );
+            assert!(fft(&over_c, &strict_opts).is_ok());
+
+            let err_r = super::rfft_with_audit(&over_r, &hardened_opts, &ledger)
+                .expect_err("rfft len 17 must fail closed under cap 16 in Hardened mode");
+            assert_eq!(
+                err_r,
+                super::FftError::ResourceExhausted {
+                    detail: "Hardened mode FFT length exceeds HARDENED_MAX_FFT_LEN",
+                }
+            );
+            assert!(rfft(&over_r, &strict_opts).is_ok());
+
+            // irfft with spectrum len 10 -> output_len 18 > 16 fails closed in Hardened mode.
+            let half_spec: Vec<Complex64> = (0..10).map(|i| (i as f64, 0.0)).collect();
+            let err_ir = super::irfft_with_audit(&half_spec, Some(18), &hardened_opts, &ledger)
+                .expect_err("irfft output_len 18 must fail closed under cap 16 in Hardened mode");
+            assert_eq!(
+                err_ir,
+                super::FftError::ResourceExhausted {
+                    detail: "Hardened mode FFT length exceeds HARDENED_MAX_FFT_LEN",
+                }
+            );
+            assert!(irfft(&half_spec, Some(18), &strict_opts).is_ok());
+
+            let entries = ledger.lock().expect("lock").entries().to_vec();
+            let fail_closed_count = entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.action,
+                        AuditAction::FailClosed { reason } if reason == "resource_exhausted"
+                    )
+                })
+                .count();
+            assert_eq!(fail_closed_count, 3);
+        });
+    }
+
+    #[test]
+    fn strict_fft_500_calls_bit_identical() {
+        use fsci_runtime::RuntimeMode;
+
+        let strict_opts = FftOptions::default().with_mode(RuntimeMode::Strict);
+        for k in 0..500usize {
+            let n = 8 + (k % 16);
+            let input_c: Vec<Complex64> = (0..n)
+                .map(|i| {
+                    let t = (k * 17 + i) as f64 * 0.05;
+                    (t.sin(), t.cos())
+                })
+                .collect();
+            let input_r: Vec<f64> = input_c.iter().map(|&(re, _)| re).collect();
+
+            let c1 = fft(&input_c, &strict_opts).expect("strict fft 1");
+            let c2 = super::with_hardened_max_fft_len(4, || {
+                fft(&input_c, &strict_opts).expect("strict fft 2")
+            });
+            for (&(r1, i1), &(r2, i2)) in c1.iter().zip(c2.iter()) {
+                assert_eq!(r1.to_bits(), r2.to_bits());
+                assert_eq!(i1.to_bits(), i2.to_bits());
+            }
+
+            let d1 = dct(&input_r, &strict_opts).expect("strict dct 1");
+            let d2 = super::with_hardened_max_fft_len(4, || {
+                dct(&input_r, &strict_opts).expect("strict dct 2")
+            });
+            for (&a, &b) in d1.iter().zip(d2.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
         }
     }
 }

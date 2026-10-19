@@ -2085,6 +2085,34 @@ impl FftOptions {
     }
 }
 
+/// Maximum transform element count allowed in `RuntimeMode::Hardened` (16M elements).
+pub const HARDENED_MAX_FFT_LEN: usize = 16_777_216;
+
+thread_local! {
+    static HARDENED_MAX_FFT_LEN_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Active Hardened-mode maximum FFT element count for the current thread.
+#[must_use]
+pub fn hardened_max_fft_len() -> usize {
+    HARDENED_MAX_FFT_LEN_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or(HARDENED_MAX_FFT_LEN)
+}
+
+/// Execute `f` with a thread-local override for [`HARDENED_MAX_FFT_LEN`].
+pub fn with_hardened_max_fft_len<R>(max_len: usize, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HARDENED_MAX_FFT_LEN_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = HARDENED_MAX_FFT_LEN_OVERRIDE.with(|cell| cell.replace(Some(max_len)));
+    let _reset = Reset(prev);
+    f()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FftError {
     InvalidShape { detail: &'static str },
@@ -2093,6 +2121,7 @@ pub enum FftError {
     LengthMismatch { expected: usize, actual: usize },
     NonPositiveSampleSpacing,
     NonFiniteInput,
+    ResourceExhausted { detail: &'static str },
 }
 
 impl Display for FftError {
@@ -2108,6 +2137,7 @@ impl Display for FftError {
                 write!(f, "sample spacing must be non-zero")
             }
             Self::NonFiniteInput => write!(f, "non-finite input rejected by policy"),
+            Self::ResourceExhausted { detail } => write!(f, "resource exhausted: {detail}"),
         }
     }
 }
@@ -2124,6 +2154,7 @@ impl FftError {
             Self::LengthMismatch { .. } => "length_mismatch",
             Self::NonPositiveSampleSpacing => "non_positive_sample_spacing",
             Self::NonFiniteInput => "non_finite_input",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
         }
     }
 }
@@ -2631,6 +2662,7 @@ fn irfft_impl(
             actual: input.len(),
         });
     }
+    validate_hardened_len_with_audit(n, options, audit)?;
 
     let backend = resolve_backend(options.backend);
     let key = PlanKey::new(
@@ -4618,6 +4650,7 @@ fn run_real_nd_inverse(
 
     validate_workers_with_audit(options.workers, audit)?;
     validate_finite_complex_with_audit(input, options, audit)?;
+    validate_hardened_len_with_audit(expected_len, options, audit)?;
     let _worker_cap = install_worker_cap(options.workers);
 
     let backend = resolve_backend(options.backend);
@@ -5020,6 +5053,7 @@ fn validate_workers(policy: WorkerPolicy) -> Result<(), FftError> {
 }
 
 fn validate_finite_complex(input: &[Complex64], options: &FftOptions) -> Result<(), FftError> {
+    validate_hardened_len_with_audit(input.len(), options, None)?;
     let should_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     if should_check
         && input
@@ -5032,6 +5066,7 @@ fn validate_finite_complex(input: &[Complex64], options: &FftOptions) -> Result<
 }
 
 fn validate_finite_real(input: &[f64], options: &FftOptions) -> Result<(), FftError> {
+    validate_hardened_len_with_audit(input.len(), options, None)?;
     let should_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     if should_check && input.iter().any(|value| !value.is_finite()) {
         return Err(FftError::NonFiniteInput);
@@ -5258,6 +5293,27 @@ fn validate_workers_with_audit(
     validate_workers(policy)
 }
 
+fn validate_hardened_len_with_audit(
+    len: usize,
+    options: &FftOptions,
+    audit: Option<&FftAudit<'_>>,
+) -> Result<(), FftError> {
+    if options.mode == RuntimeMode::Hardened {
+        let max_len = hardened_max_fft_len();
+        if len > max_len {
+            record_fail_closed(
+                audit,
+                "resource_exhausted",
+                format!("rejected: transform length {len} exceeds Hardened cap {max_len}"),
+            );
+            return Err(FftError::ResourceExhausted {
+                detail: "Hardened mode FFT length exceeds HARDENED_MAX_FFT_LEN",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_finite_complex_with_audit(
     input: &[Complex64],
     options: &FftOptions,
@@ -5270,6 +5326,7 @@ fn validate_finite_complex_with_audit(
             "promoted finite-check policy for complex FFT input",
         );
     }
+    validate_hardened_len_with_audit(input.len(), options, audit)?;
     // Short-circuit on the cheap policy flag BEFORE the O(n) finiteness scan:
     // the scan's result only ever feeds `record_fail_closed`, which is gated on
     // `check_finite || Hardened`. On the default path (check_finite=false,
@@ -5302,6 +5359,7 @@ fn validate_finite_real_with_audit(
             "promoted finite-check policy for real FFT input",
         );
     }
+    validate_hardened_len_with_audit(input.len(), options, audit)?;
     // See validate_finite_complex_with_audit: gate the O(n) scan on the policy
     // flag so the default (check_finite=false) path skips a wasted full pass.
     if (options.check_finite || options.mode == RuntimeMode::Hardened)
@@ -5797,6 +5855,7 @@ fn ihfft_impl(
     validate_finite_real_with_audit(input, options, audit)?;
 
     let in_len = n.unwrap_or(input.len());
+    validate_hardened_len_with_audit(in_len, options, audit)?;
     let mut padded = vec![0.0; in_len];
     let copy_len = input.len().min(in_len);
     padded[..copy_len].copy_from_slice(&input[..copy_len]);

@@ -203,6 +203,13 @@ pub fn polynomial_multiply_fft(
         .ok_or(FftError::InvalidShape {
             detail: "polynomial FFT length overflow",
         })?;
+    if options.mode == fsci_runtime::RuntimeMode::Hardened
+        && fft_len > crate::transforms::hardened_max_fft_len()
+    {
+        return Err(FftError::ResourceExhausted {
+            detail: "Hardened mode FFT length exceeds HARDENED_MAX_FFT_LEN",
+        });
+    }
 
     let mut transform_options = options.clone();
     transform_options.normalization = crate::Normalization::Backward;
