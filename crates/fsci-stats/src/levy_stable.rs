@@ -18,7 +18,6 @@
 use std::f64::consts::{FRAC_1_PI, FRAC_1_SQRT_2, FRAC_2_PI, FRAC_PI_2, PI, SQRT_2};
 
 use fsci_integrate::{QuadOptions, quad_full_output};
-use fsci_runtime::RuntimeMode;
 use fsci_special::SpecialTensor;
 
 /// `_QUAD_EPS`, `levy_stable.quad_eps`: `epsrel` of every quadrature (with `epsabs = 0`) and the
@@ -186,10 +185,10 @@ fn bisect(f: impl Fn(f64) -> f64, xa: f64, xb: f64, xtol: f64) -> Option<f64> {
 
 /// `scipy.special.gamma` on a real argument.
 fn gamma(x: f64) -> f64 {
-    match fsci_special::gamma(&SpecialTensor::RealScalar(x), RuntimeMode::Strict) {
-        Ok(SpecialTensor::RealScalar(v)) => v,
-        _ => f64::NAN,
-    }
+    crate::unwrap_special_tensor(fsci_special::gamma(
+        &SpecialTensor::RealScalar(x),
+        crate::active_stats_mode(),
+    ))
 }
 
 /// `scipy.special.ndtr` (cephes `ndtr`), which `_norm_cdf` calls.

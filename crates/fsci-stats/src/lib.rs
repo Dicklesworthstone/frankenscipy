@@ -37,7 +37,7 @@ use std::{
     sync::OnceLock,
 };
 
-use fsci_runtime::RuntimeMode;
+pub use fsci_runtime::{RecoveryPolicy, RuntimeMode};
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
 const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
@@ -138,6 +138,385 @@ fn ks_prob_outside_square(n: usize, h: u64) -> f64 {
     2.0 * probability
 }
 
+/// Maximum 1-D sample length allowed in `RuntimeMode::Hardened` (10M elements).
+pub const HARDENED_MAX_SAMPLE_LEN: usize = 10_000_000;
+/// Maximum pairwise / quadratic sample length allowed in `RuntimeMode::Hardened` (100K elements).
+pub const HARDENED_MAX_PAIRWISE_LEN: usize = 100_000;
+/// Maximum bootstrap / permutation resample count allowed in `RuntimeMode::Hardened` (100K resamples).
+pub const HARDENED_MAX_RESAMPLES: usize = 100_000;
+
+thread_local! {
+    static HARDENED_STATS_CAPS_OVERRIDE: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    static HARDENED_MAX_RESAMPLES_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static ACTIVE_STATS_MODE: std::cell::Cell<RuntimeMode> =
+        const { std::cell::Cell::new(RuntimeMode::Strict) };
+}
+
+/// Active Hardened-mode maximum sample length for the current thread.
+#[must_use]
+pub fn hardened_max_sample_len() -> usize {
+    HARDENED_STATS_CAPS_OVERRIDE
+        .with(std::cell::Cell::get)
+        .map_or(HARDENED_MAX_SAMPLE_LEN, |(s, _)| s)
+}
+
+/// Active Hardened-mode maximum pairwise sample length for the current thread.
+#[must_use]
+pub fn hardened_max_pairwise_len() -> usize {
+    HARDENED_STATS_CAPS_OVERRIDE
+        .with(std::cell::Cell::get)
+        .map_or(HARDENED_MAX_PAIRWISE_LEN, |(_, p)| p)
+}
+
+/// Active Hardened-mode maximum resample count for the current thread.
+#[must_use]
+pub fn hardened_max_resamples() -> usize {
+    HARDENED_MAX_RESAMPLES_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(HARDENED_MAX_RESAMPLES)
+}
+
+/// Execute `f` with thread-local overrides for `(HARDENED_MAX_SAMPLE_LEN, HARDENED_MAX_PAIRWISE_LEN)`.
+pub fn with_hardened_stats_caps<R>(
+    max_sample_len: usize,
+    max_pairwise_len: usize,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<(usize, usize)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HARDENED_STATS_CAPS_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = HARDENED_STATS_CAPS_OVERRIDE
+        .with(|cell| cell.replace(Some((max_sample_len, max_pairwise_len))));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Execute `f` with a thread-local override for `HARDENED_MAX_RESAMPLES`.
+pub fn with_hardened_max_resamples<R>(max_resamples: usize, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HARDENED_MAX_RESAMPLES_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = HARDENED_MAX_RESAMPLES_OVERRIDE.with(|cell| cell.replace(Some(max_resamples)));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Active `RuntimeMode` threaded into `fsci-special` calls on the current thread.
+#[must_use]
+pub fn active_stats_mode() -> RuntimeMode {
+    ACTIVE_STATS_MODE.with(std::cell::Cell::get)
+}
+
+/// Execute `f` with `mode` set as the active `fsci-stats` runtime mode on the current thread.
+pub fn with_stats_runtime_mode<R>(mode: RuntimeMode, f: impl FnOnce() -> R) -> R {
+    struct Reset(RuntimeMode);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ACTIVE_STATS_MODE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = ACTIVE_STATS_MODE.with(|cell| cell.replace(mode));
+    let _reset = Reset(prev);
+    f()
+}
+
+thread_local! {
+    static LAST_SPECIAL_ERROR: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn clear_last_special_error() {
+    LAST_SPECIAL_ERROR.with(|cell| cell.set(None));
+}
+
+fn take_last_special_error() -> Option<&'static str> {
+    LAST_SPECIAL_ERROR.with(|cell| cell.replace(None))
+}
+
+fn record_special_error(err: &fsci_special::SpecialError) {
+    let code = match err.kind {
+        fsci_special::SpecialErrorKind::ResourceExhausted => "special_resource_exhausted",
+        fsci_special::SpecialErrorKind::NonFiniteInput => "special_non_finite_input",
+        fsci_special::SpecialErrorKind::DomainError => "special_domain_error",
+        fsci_special::SpecialErrorKind::PoleInput => "special_pole_input",
+        fsci_special::SpecialErrorKind::OverflowRisk => "special_overflow_risk",
+        fsci_special::SpecialErrorKind::SingularityRisk => "special_singularity_risk",
+        fsci_special::SpecialErrorKind::CancellationRisk => "special_cancellation_risk",
+        fsci_special::SpecialErrorKind::ShapeMismatch => "special_shape_mismatch",
+        fsci_special::SpecialErrorKind::FixtureSchemaError => "special_fixture_schema_error",
+        fsci_special::SpecialErrorKind::NotYetImplemented => "special_not_yet_implemented",
+        fsci_special::SpecialErrorKind::Errstate(_) => "special_errstate_error",
+    };
+    LAST_SPECIAL_ERROR.with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(code));
+        }
+    });
+}
+
+fn unwrap_special_scalar(res: Result<f64, fsci_special::SpecialError>) -> f64 {
+    match res {
+        Ok(v) => v,
+        Err(err) => {
+            record_special_error(&err);
+            f64::NAN
+        }
+    }
+}
+
+fn unwrap_special_tensor(
+    res: Result<fsci_special::SpecialTensor, fsci_special::SpecialError>,
+) -> f64 {
+    match res {
+        Ok(fsci_special::SpecialTensor::RealScalar(v)) => v,
+        Ok(_) => f64::NAN,
+        Err(err) => {
+            record_special_error(&err);
+            f64::NAN
+        }
+    }
+}
+
+/// Mode and bounded-recovery options for mode-aware `fsci-stats` entrypoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsOptions {
+    pub mode: RuntimeMode,
+    pub allow_non_finite_projection: bool,
+    pub recovery: RecoveryPolicy,
+}
+
+impl Default for StatsOptions {
+    fn default() -> Self {
+        Self {
+            mode: RuntimeMode::Strict,
+            allow_non_finite_projection: false,
+            recovery: RecoveryPolicy::Reject,
+        }
+    }
+}
+
+impl StatsOptions {
+    #[must_use]
+    pub const fn new(mode: RuntimeMode) -> Self {
+        Self {
+            mode,
+            allow_non_finite_projection: false,
+            recovery: RecoveryPolicy::Reject,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_mode(mut self, mode: RuntimeMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_non_finite_projection(mut self, allow: bool) -> Self {
+        self.allow_non_finite_projection = allow;
+        if allow {
+            self.recovery = RecoveryPolicy::ProjectNonFinite;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn with_recovery(mut self, recovery: RecoveryPolicy) -> Self {
+        self.recovery = recovery;
+        self.allow_non_finite_projection = recovery.allows_projection();
+        self
+    }
+
+    #[must_use]
+    pub const fn allows_projection(self) -> bool {
+        self.allow_non_finite_projection || self.recovery.allows_projection()
+    }
+}
+
+fn project_finite_value(v: f64) -> Option<f64> {
+    if v.is_nan() {
+        None
+    } else if v.is_infinite() {
+        Some(if v.is_sign_positive() {
+            f64::MAX / 2.0
+        } else {
+            f64::MIN / 2.0
+        })
+    } else {
+        Some(v)
+    }
+}
+
+fn validate_or_project_sample<'a>(
+    arg_name: &'static str,
+    data: &'a [f64],
+    max_len: usize,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+    fp: &str,
+) -> Result<std::borrow::Cow<'a, [f64]>, StatsError> {
+    if options.mode != RuntimeMode::Hardened {
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+    if data.len() > max_len {
+        let err = StatsError::ResourceExhausted {
+            detail: "Hardened mode sample length exceeds cap",
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    if data.iter().any(|v| !v.is_finite()) {
+        if options.allows_projection() {
+            let mut pos_fp = fsci_runtime::Fingerprinter::new("fsci_stats::nonfinite_positions");
+            let mut count = 0usize;
+            for (idx, &v) in data.iter().enumerate() {
+                if !v.is_finite() {
+                    count += 1;
+                    pos_fp.str(arg_name).usize(idx);
+                }
+            }
+            let positions_digest = pos_fp.finish();
+            let projected: Vec<f64> = data
+                .iter()
+                .copied()
+                .filter_map(project_finite_value)
+                .collect();
+            if let Some(ledger) = ledger {
+                record_bounded_recovery(
+                    ledger,
+                    fp,
+                    "project_non_finite_sample",
+                    &format!(
+                        "projected {arg_name} ({} -> {} finite elements, count={count}, positions_digest={positions_digest})",
+                        data.len(),
+                        projected.len()
+                    ),
+                );
+            }
+            return Ok(std::borrow::Cow::Owned(projected));
+        }
+        let err = StatsError::NonFiniteInput { argument: arg_name };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    Ok(std::borrow::Cow::Borrowed(data))
+}
+
+fn validate_or_project_paired_samples<'a>(
+    x: &'a [f64],
+    y: &'a [f64],
+    max_len: usize,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+    fp: &str,
+) -> Result<(std::borrow::Cow<'a, [f64]>, std::borrow::Cow<'a, [f64]>), StatsError> {
+    if options.mode != RuntimeMode::Hardened {
+        return Ok((std::borrow::Cow::Borrowed(x), std::borrow::Cow::Borrowed(y)));
+    }
+    if x.len() > max_len || y.len() > max_len {
+        let err = StatsError::ResourceExhausted {
+            detail: "Hardened mode paired sample length exceeds cap",
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    if x.len() != y.len() {
+        let err = StatsError::ShapeMismatch {
+            expected: x.len(),
+            actual: y.len(),
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    let bad_x = x.iter().any(|v| !v.is_finite());
+    let bad_y = y.iter().any(|v| !v.is_finite());
+    if bad_x || bad_y {
+        if options.allows_projection() {
+            let mut pos_fp = fsci_runtime::Fingerprinter::new("fsci_stats::nonfinite_positions");
+            let mut count = 0usize;
+            let mut px = Vec::with_capacity(x.len());
+            let mut py = Vec::with_capacity(y.len());
+            for (idx, (&xi, &yi)) in x.iter().zip(y.iter()).enumerate() {
+                if !xi.is_finite() || !yi.is_finite() {
+                    count += 1;
+                    pos_fp.usize(idx);
+                }
+                if let (Some(fxi), Some(fyi)) = (project_finite_value(xi), project_finite_value(yi))
+                {
+                    px.push(fxi);
+                    py.push(fyi);
+                }
+            }
+            let positions_digest = pos_fp.finish();
+            if let Some(ledger) = ledger {
+                record_bounded_recovery(
+                    ledger,
+                    fp,
+                    "project_non_finite_pairs",
+                    &format!(
+                        "projected paired samples ({} -> {} finite pairs, count={count}, positions_digest={positions_digest})",
+                        x.len(),
+                        px.len()
+                    ),
+                );
+            }
+            return Ok((std::borrow::Cow::Owned(px), std::borrow::Cow::Owned(py)));
+        }
+        let err = StatsError::NonFiniteInput {
+            argument: if bad_x { "x" } else { "y" },
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    Ok((std::borrow::Cow::Borrowed(x), std::borrow::Cow::Borrowed(y)))
+}
+
+fn run_with_special_guard<T>(
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+    fp: &str,
+    f: impl FnOnce() -> T,
+) -> Result<T, StatsError> {
+    clear_last_special_error();
+    let value = with_stats_runtime_mode(options.mode, f);
+    if options.mode == RuntimeMode::Hardened
+        && let Some(special_reason) = take_last_special_error()
+    {
+        let err = if special_reason == "special_resource_exhausted" {
+            StatsError::ResourceExhausted {
+                detail: "Hardened fsci-special resource cap exceeded",
+            }
+        } else {
+            StatsError::Arithmetic {
+                detail: format!("Hardened fsci-special error: {special_reason}"),
+            }
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    Ok(value)
+}
+
 /// Error type for stats APIs that validate structured inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatsError {
@@ -163,6 +542,26 @@ pub enum StatsError {
     Arithmetic {
         detail: String,
     },
+    ResourceExhausted {
+        detail: &'static str,
+    },
+}
+
+impl StatsError {
+    /// Machine-matchable audit reason code for this error.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidArgument(_) => "invalid_argument",
+            Self::ShapeMismatch { .. } => "shape_mismatch",
+            Self::NonFiniteInput { .. } => "non_finite_input",
+            Self::DataTooSmall { .. } => "data_too_small",
+            Self::MissingParameter { .. } => "missing_parameter",
+            Self::Unsupported { .. } => "unsupported",
+            Self::Arithmetic { .. } => "arithmetic",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
+        }
+    }
 }
 
 impl std::fmt::Display for StatsError {
@@ -184,6 +583,7 @@ impl std::fmt::Display for StatsError {
                 distribution,
             } => write!(f, "{operation} is unsupported for {distribution}"),
             Self::Arithmetic { detail } => write!(f, "arithmetic failure: {detail}"),
+            Self::ResourceExhausted { detail } => write!(f, "resource exhausted: {detail}"),
         }
     }
 }
@@ -207,6 +607,8 @@ pub enum FitError {
     UnsupportedData(String),
     /// Numerical fitting did not converge within the configured budget.
     NonConvergent(String),
+    /// Hardened mode sample length cap exceeded.
+    ResourceExhausted { detail: &'static str },
 }
 
 impl std::fmt::Display for FitError {
@@ -220,6 +622,7 @@ impl std::fmt::Display for FitError {
             }
             Self::UnsupportedData(msg) => write!(f, "unsupported data: {msg}"),
             Self::NonConvergent(msg) => write!(f, "fit did not converge: {msg}"),
+            Self::ResourceExhausted { detail } => write!(f, "resource exhausted: {detail}"),
         }
     }
 }
@@ -234,6 +637,7 @@ impl FitError {
             Self::InsufficientData { .. } => "insufficient_data",
             Self::UnsupportedData(_) => "unsupported_data",
             Self::NonConvergent(_) => "non_convergent",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
         }
     }
 }
@@ -251,6 +655,7 @@ impl From<FitError> for StatsError {
             },
             FitError::UnsupportedData(detail) => Self::InvalidArgument(detail),
             FitError::NonConvergent(detail) => Self::Arithmetic { detail },
+            FitError::ResourceExhausted { detail } => Self::ResourceExhausted { detail },
         }
     }
 }
@@ -515,7 +920,14 @@ pub trait ContinuousDistribution {
     where
         Self: Sized,
     {
-        let result = Self::try_fit(data);
+        let mode = active_stats_mode();
+        let result = if mode == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+            })
+        } else {
+            Self::try_fit(data)
+        };
         if let Err(err) = &result {
             // frankenscipy-3cu8u.2: a machine-matchable code; it used to be the error's message.
             let reason = format!("fit::{}", err.reason_code());
@@ -529,6 +941,224 @@ pub trait ContinuousDistribution {
             record_fail_closed(ledger, &fingerprint, &reason, &format!("rejected: {err}"));
         }
         result
+    }
+
+    /// Mode-aware and audit-emitting distribution fit (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+    ///
+    /// In `RuntimeMode::Hardened`:
+    /// - Enforces [`hardened_max_sample_len`], failing closed with `FitError::ResourceExhausted`.
+    /// - Rejects non-finite samples by default, or projects them (removing `NaN` and clamping
+    ///   `±Inf` to `±f64::MAX`) when `options.allow_non_finite_projection` is `true`, recording
+    ///   `AuditAction::BoundedRecovery`.
+    /// - Threads `options.mode` into any `fsci-special` calls made during fitting.
+    fn try_fit_with_options(
+        data: &[f64],
+        options: StatsOptions,
+        ledger: Option<&SyncSharedAuditLedger>,
+    ) -> Result<Self, FitError>
+    where
+        Self: Sized,
+    {
+        let routine = format!("{}::try_fit_with_options", std::any::type_name::<Self>());
+        let make_fp = || {
+            fsci_runtime::Fingerprinter::new(&routine)
+                .f64s(data)
+                .str(&format!("{:?}", options.mode))
+                .bool(options.allows_projection())
+                .finish()
+        };
+
+        if options.mode == RuntimeMode::Hardened {
+            let max_len = hardened_max_sample_len();
+            if data.len() > max_len {
+                let err = FitError::ResourceExhausted {
+                    detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+                };
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_fail_closed(
+                        ledger,
+                        &fp,
+                        &format!("fit::{}", err.reason_code()),
+                        &format!("rejected: {err}"),
+                    );
+                }
+                return Err(err);
+            }
+        }
+
+        let projected_buf: Option<Vec<f64>> = if options.mode == RuntimeMode::Hardened
+            && data.iter().any(|v| !v.is_finite())
+        {
+            if options.allows_projection() {
+                let mut nonfinite_positions = Vec::new();
+                let projected: Vec<f64> = data
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &v)| {
+                        if v.is_nan() {
+                            nonfinite_positions.push(idx);
+                            None
+                        } else if v.is_infinite() {
+                            nonfinite_positions.push(idx);
+                            Some(if v.is_sign_positive() {
+                                f64::MAX / 2.0
+                            } else {
+                                f64::MIN / 2.0
+                            })
+                        } else {
+                            Some(v)
+                        }
+                    })
+                    .collect();
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    let pos_digest =
+                        fsci_runtime::Fingerprinter::new("stats_fit_nonfinite_positions")
+                            .usizes(&nonfinite_positions)
+                            .finish();
+                    record_bounded_recovery(
+                        ledger,
+                        &fp,
+                        "project_non_finite_sample",
+                        &format!(
+                            "count={}, positions_digest={}, projected {} sample elements to {} finite values",
+                            nonfinite_positions.len(),
+                            pos_digest,
+                            data.len(),
+                            projected.len()
+                        ),
+                    );
+                }
+                Some(projected)
+            } else {
+                let err = FitError::UnsupportedData(
+                    "Hardened mode rejected non-finite sample".to_string(),
+                );
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_fail_closed(
+                        ledger,
+                        &fp,
+                        "fit::non_finite_input",
+                        &format!("rejected: {err}"),
+                    );
+                }
+                return Err(err);
+            }
+        } else {
+            None
+        };
+
+        let effective = projected_buf.as_deref().unwrap_or(data);
+        clear_last_special_error();
+        let result = with_stats_runtime_mode(options.mode, || Self::try_fit(effective));
+        if options.mode == RuntimeMode::Hardened
+            && let Some(special_reason) = take_last_special_error()
+        {
+            let err = if special_reason == "special_resource_exhausted" {
+                FitError::ResourceExhausted {
+                    detail: "Hardened fsci-special resource cap exceeded during fit",
+                }
+            } else {
+                FitError::NonConvergent(format!(
+                    "Hardened fsci-special error during fit: {special_reason}"
+                ))
+            };
+            if let Some(ledger) = ledger {
+                let fp = make_fp();
+                record_fail_closed(
+                    ledger,
+                    &fp,
+                    &format!("fit::{}", err.reason_code()),
+                    &format!("rejected: {err}"),
+                );
+            }
+            return Err(err);
+        }
+        if let Err(err) = &result
+            && let Some(ledger) = ledger
+        {
+            let fp = make_fp();
+            record_fail_closed(
+                ledger,
+                &fp,
+                &format!("fit::{}", err.reason_code()),
+                &format!("rejected: {err}"),
+            );
+        }
+        result
+    }
+
+    /// Mode-aware and audit-emitting CDF evaluation (`frankenscipy-3cu8u.5`).
+    ///
+    /// Threads `options.mode` into any underlying `fsci-special` calls and surfaces
+    /// Hardened special errors as [`StatsError`] with `FailClosed` audit events.
+    fn cdf_with_options(
+        &self,
+        x: f64,
+        options: StatsOptions,
+        ledger: Option<&SyncSharedAuditLedger>,
+    ) -> Result<f64, StatsError> {
+        let routine = format!("{}::cdf_with_options", std::any::type_name::<Self>());
+        let make_fp = || {
+            fsci_runtime::Fingerprinter::new(&routine)
+                .f64(x)
+                .str(&format!("{:?}", options.mode))
+                .bool(options.allow_non_finite_projection)
+                .finish()
+        };
+        let x_eval = if options.mode == RuntimeMode::Hardened && !x.is_finite() {
+            if options.allow_non_finite_projection {
+                let projected = if x.is_nan() {
+                    0.0
+                } else if x.is_sign_positive() {
+                    f64::MAX
+                } else {
+                    f64::MIN
+                };
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_bounded_recovery(
+                        ledger,
+                        &fp,
+                        "project_non_finite_scalar",
+                        &format!("projected non-finite x={x} to {projected}"),
+                    );
+                }
+                projected
+            } else {
+                let err = StatsError::NonFiniteInput { argument: "x" };
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+                }
+                return Err(err);
+            }
+        } else {
+            x
+        };
+        clear_last_special_error();
+        let value = with_stats_runtime_mode(options.mode, || self.cdf(x_eval));
+        if options.mode == RuntimeMode::Hardened
+            && let Some(special_reason) = take_last_special_error()
+        {
+            let err = if special_reason == "special_resource_exhausted" {
+                StatsError::ResourceExhausted {
+                    detail: "Hardened fsci-special resource cap exceeded during cdf",
+                }
+            } else {
+                StatsError::Arithmetic {
+                    detail: format!("Hardened fsci-special error during cdf: {special_reason}"),
+                }
+            };
+            if let Some(ledger) = ledger {
+                let fp = make_fp();
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            return Err(err);
+        }
+        Ok(value)
     }
 
     /// Differential entropy H(X) = -∫ f(x) log f(x) dx.
@@ -10757,16 +11387,13 @@ impl JfSkewT {
 
 /// Scalar Gauss hypergeometric `₂F₁(a, b; c; z)` via fsci-special's tensor API.
 fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64) -> f64 {
-    match fsci_special::hyp2f1(
+    unwrap_special_tensor(fsci_special::hyp2f1(
         &fsci_special::SpecialTensor::RealScalar(a),
         &fsci_special::SpecialTensor::RealScalar(b),
         &fsci_special::SpecialTensor::RealScalar(c),
         &fsci_special::SpecialTensor::RealScalar(z),
-        RuntimeMode::Strict,
-    ) {
-        Ok(fsci_special::SpecialTensor::RealScalar(v)) => v,
-        _ => f64::NAN,
-    }
+        active_stats_mode(),
+    ))
 }
 
 /// The Gauss hypergeometric distribution, matching
@@ -16309,7 +16936,7 @@ fn gamma_ratio_t(v: f64) -> f64 {
 }
 
 fn ln_gamma(x: f64) -> f64 {
-    fsci_special::gammaln_scalar(x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    unwrap_special_scalar(fsci_special::gammaln_scalar(x, active_stats_mode()))
 }
 
 fn digamma(x: f64) -> f64 {
@@ -16317,37 +16944,31 @@ fn digamma(x: f64) -> f64 {
 }
 
 fn lower_regularized_gamma(a: f64, x: f64) -> f64 {
-    fsci_special::gammainc_scalar(a, x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    unwrap_special_scalar(fsci_special::gammainc_scalar(a, x, active_stats_mode()))
 }
 
 fn upper_regularized_gamma(a: f64, x: f64) -> f64 {
-    fsci_special::gammaincc_scalar(a, x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    unwrap_special_scalar(fsci_special::gammaincc_scalar(a, x, active_stats_mode()))
 }
 
 fn regularized_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
-    fsci_special::betainc_scalar(a, b, x, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    unwrap_special_scalar(fsci_special::betainc_scalar(a, b, x, active_stats_mode()))
 }
 
 fn modified_bessel_i(order: f64, x: f64) -> f64 {
-    match fsci_special::iv(
+    unwrap_special_tensor(fsci_special::iv(
         &fsci_special::SpecialTensor::RealScalar(order),
         &fsci_special::SpecialTensor::RealScalar(x),
-        RuntimeMode::Strict,
-    ) {
-        Ok(fsci_special::SpecialTensor::RealScalar(value)) => value,
-        _ => f64::NAN,
-    }
+        active_stats_mode(),
+    ))
 }
 
 fn modified_bessel_k(order: f64, x: f64) -> f64 {
-    match fsci_special::kv(
+    unwrap_special_tensor(fsci_special::kv(
         &fsci_special::SpecialTensor::RealScalar(order),
         &fsci_special::SpecialTensor::RealScalar(x),
-        RuntimeMode::Strict,
-    ) {
-        Ok(fsci_special::SpecialTensor::RealScalar(value)) => value,
-        _ => f64::NAN,
-    }
+        active_stats_mode(),
+    ))
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
@@ -30705,7 +31326,7 @@ impl ContinuousDistribution for Argus {
     fn mean(&self) -> f64 {
         let a = 0.5 * self.chi * self.chi;
         let gamma_half3 = ln_gamma(1.5).exp();
-        let p = fsci_special::gammainc_scalar(1.5, a, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        let p = lower_regularized_gamma(1.5, a);
         let norm = 2.0 * a.powf(1.5) / (gamma_half3 * p);
         norm * simpson_integrate_adaptive(
             |t| (1.0 - t * t).sqrt() * t * t * (-(a * t * t)).exp(),
@@ -30722,8 +31343,8 @@ impl ContinuousDistribution for Argus {
         let a = 0.5 * self.chi * self.chi;
         let gamma_half3 = ln_gamma(1.5).exp();
         let gamma_half5 = ln_gamma(2.5).exp();
-        let p3 = fsci_special::gammainc_scalar(1.5, a, RuntimeMode::Strict).unwrap_or(f64::NAN);
-        let p5 = fsci_special::gammainc_scalar(2.5, a, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        let p3 = lower_regularized_gamma(1.5, a);
+        let p5 = lower_regularized_gamma(2.5, a);
         let mean = self.mean();
         let gamma3 = p3 * gamma_half3;
         let gamma5 = p5 * gamma_half5;
@@ -33653,6 +34274,45 @@ pub fn ttest_1samp(data: &[f64], popmean: f64) -> TtestResult {
     }
 }
 
+/// Mode-aware and audit-emitting one-sample t-test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Live SciPy (`scipy.stats.ttest_1samp([1.0, np.nan, 3.0], 0.0)` in `scipy 1.18.1`) returns
+/// `TtestResult(statistic=nan, pvalue=nan, df=nan)`. `Strict` mode preserves this behavior;
+/// `Hardened` mode enforces [`hardened_max_sample_len`], rejects non-finite `data` / `popmean`
+/// (or projects non-finite sample elements when `options.allow_non_finite_projection` is `true`),
+/// and threads `options.mode` into `fsci-special`.
+pub fn ttest_1samp_with_options(
+    data: &[f64],
+    popmean: f64,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<TtestResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::ttest_1samp_with_options")
+        .f64s(data)
+        .f64(popmean)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    if options.mode == RuntimeMode::Hardened && !popmean.is_finite() {
+        let err = StatsError::NonFiniteInput {
+            argument: "popmean",
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    let effective = validate_or_project_sample(
+        "data",
+        data,
+        hardened_max_sample_len(),
+        options,
+        ledger,
+        &fp,
+    )?;
+    run_with_special_guard(options, ledger, &fp, || ttest_1samp(&effective, popmean))
+}
+
 /// One-sample t-test with alternative hypothesis specification.
 ///
 /// Matches `scipy.stats.ttest_1samp(a, popmean, alternative=...)`.
@@ -33832,6 +34492,25 @@ pub fn ttest_ind(a: &[f64], b: &[f64]) -> TtestResult {
         pvalue,
         df,
     }
+}
+
+/// Mode-aware and audit-emitting two-sample independent t-test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+pub fn ttest_ind_with_options(
+    a: &[f64],
+    b: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<TtestResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::ttest_ind_with_options")
+        .f64s(a)
+        .f64s(b)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let max_len = hardened_max_sample_len();
+    let eff_a = validate_or_project_sample("a", a, max_len, options, ledger, &fp)?;
+    let eff_b = validate_or_project_sample("b", b, max_len, options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || ttest_ind(&eff_a, &eff_b))
 }
 
 /// Independent two-sample t-test with alternative hypothesis specification.
@@ -34105,6 +34784,29 @@ pub fn wasserstein_distance(u: &[f64], v: &[f64]) -> f64 {
     wasserstein_distance_sorted(&u_sorted, &v_sorted)
 }
 
+/// Mode-aware and audit-emitting 1-D Wasserstein distance (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Enforces [`hardened_max_pairwise_len`] in `RuntimeMode::Hardened`.
+pub fn wasserstein_distance_with_options(
+    u: &[f64],
+    v: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<f64, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::wasserstein_distance_with_options")
+        .f64s(u)
+        .f64s(v)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let max_len = hardened_max_pairwise_len();
+    let eff_u = validate_or_project_sample("u", u, max_len, options, ledger, &fp)?;
+    let eff_v = validate_or_project_sample("v", v, max_len, options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || {
+        wasserstein_distance(&eff_u, &eff_v)
+    })
+}
+
 /// [`wasserstein_distance`] (1-D) on inputs already sorted ascending (`total_cmp` order) and NaN-free.
 /// Skips the sort so an all-pairs matrix can sort each sample ONCE up front (the sort is
 /// query-independent). BYTE-IDENTICAL to `wasserstein_distance` on the same finite data: the same
@@ -34284,6 +34986,27 @@ pub fn energy_distance(u: &[f64], v: &[f64]) -> f64 {
     // sort_two_f64_total), then evaluate the closed-form L1-pair sums via energy_distance_sorted.
     let (su, sv) = sort_two_f64_total(u, v);
     energy_distance_sorted(&su, &sv)
+}
+
+/// Mode-aware and audit-emitting 1-D energy distance (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Enforces [`hardened_max_pairwise_len`] in `RuntimeMode::Hardened`.
+pub fn energy_distance_with_options(
+    u: &[f64],
+    v: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<f64, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::energy_distance_with_options")
+        .f64s(u)
+        .f64s(v)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let max_len = hardened_max_pairwise_len();
+    let eff_u = validate_or_project_sample("u", u, max_len, options, ledger, &fp)?;
+    let eff_v = validate_or_project_sample("v", v, max_len, options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || energy_distance(&eff_u, &eff_v))
 }
 
 /// [`energy_distance`] on inputs already sorted ascending (`total_cmp` order) and NaN-free. Skips the
@@ -38340,6 +39063,24 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
     }
 }
 
+/// Mode-aware and audit-emitting Pearson correlation (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+pub fn pearsonr_with_options(
+    x: &[f64],
+    y: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<CorrelationResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::pearsonr_with_options")
+        .f64s(x)
+        .f64s(y)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let (eff_x, eff_y) =
+        validate_or_project_paired_samples(x, y, hardened_max_sample_len(), options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || pearsonr(&eff_x, &eff_y))
+}
+
 /// Calculate Pearson correlation with alternative hypothesis.
 ///
 /// Matches `scipy.stats.pearsonr(x, y, alternative=...)`.
@@ -38503,6 +39244,24 @@ pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let (rank_x, rank_y) = rank_two_average(x, y);
 
     pearsonr(&rank_x, &rank_y)
+}
+
+/// Mode-aware and audit-emitting Spearman rank correlation (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+pub fn spearmanr_with_options(
+    x: &[f64],
+    y: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<CorrelationResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::spearmanr_with_options")
+        .f64s(x)
+        .f64s(y)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let (eff_x, eff_y) =
+        validate_or_project_paired_samples(x, y, hardened_max_sample_len(), options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || spearmanr(&eff_x, &eff_y))
 }
 
 /// Spearman correlation with alternative hypothesis specification.
@@ -40017,6 +40776,33 @@ pub fn describe(data: &[f64]) -> DescribeResult {
         skewness: skewness_val,
         kurtosis: kurtosis_val,
     }
+}
+
+/// Mode-aware and audit-emitting descriptive statistics (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Live SciPy (`scipy.stats.describe([1.0, np.nan, 3.0])` in `scipy 1.18.1`) returns
+/// `DescribeResult(nobs=3, minmax=(nan, nan), mean=nan, variance=nan, skewness=nan, kurtosis=nan)`.
+/// `Strict` mode preserves this behavior; `Hardened` mode enforces [`hardened_max_sample_len`]
+/// and rejects non-finite inputs unless `options.allow_non_finite_projection` is `true`.
+pub fn describe_with_options(
+    data: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<DescribeResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::describe_with_options")
+        .f64s(data)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let effective = validate_or_project_sample(
+        "data",
+        data,
+        hardened_max_sample_len(),
+        options,
+        ledger,
+        &fp,
+    )?;
+    run_with_special_guard(options, ledger, &fp, || describe(&effective))
 }
 
 /// When `true`, [`skew`]/[`kurtosis`] fold their central-moment loop serially (the ORIG one-pass loop);
@@ -47399,6 +48185,29 @@ pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessO
     }
 }
 
+/// Mode-aware and audit-emitting one-sample Kolmogorov-Smirnov test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+pub fn ks_1samp_with_options(
+    data: &[f64],
+    cdf_func: impl Fn(f64) -> f64 + Sync,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<GoodnessOfFitResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::ks_1samp_with_options")
+        .f64s(data)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let effective = validate_or_project_sample(
+        "data",
+        data,
+        hardened_max_sample_len(),
+        options,
+        ledger,
+        &fp,
+    )?;
+    run_with_special_guard(options, ledger, &fp, || ks_1samp(&effective, cdf_func))
+}
+
 /// Kolmogorov-Smirnov test wrapper.
 ///
 /// Dispatches to one-sample or two-sample KS based on `target`.
@@ -47873,6 +48682,27 @@ pub fn ks_2samp(data1: &[f64], data2: &[f64]) -> GoodnessOfFitResult {
     sort_f64_total(&mut sorted1);
     sort_f64_total(&mut sorted2);
     ks_2samp_sorted(&sorted1, &sorted2)
+}
+
+/// Mode-aware and audit-emitting two-sample Kolmogorov-Smirnov test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Enforces [`hardened_max_pairwise_len`] in `RuntimeMode::Hardened`.
+pub fn ks_2samp_with_options(
+    data1: &[f64],
+    data2: &[f64],
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<GoodnessOfFitResult, StatsError> {
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::ks_2samp_with_options")
+        .f64s(data1)
+        .f64s(data2)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    let max_len = hardened_max_pairwise_len();
+    let eff1 = validate_or_project_sample("data1", data1, max_len, options, ledger, &fp)?;
+    let eff2 = validate_or_project_sample("data2", data2, max_len, options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || ks_2samp(&eff1, &eff2))
 }
 
 /// [`ks_2samp`] on inputs already sorted ascending (`total_cmp` order) and NaN-free. Skips the
@@ -49067,6 +49897,38 @@ impl GaussianKde {
             sorted_dataset: gaussian_kde_sorted_copy(data),
             bandwidth: bw.max(f64::EPSILON),
         }
+    }
+
+    /// Mode-aware and audit-emitting Gaussian KDE constructor (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+    pub fn new_with_options(
+        data: &[f64],
+        options: StatsOptions,
+        ledger: Option<&SyncSharedAuditLedger>,
+    ) -> Result<Self, StatsError> {
+        let fp = fsci_runtime::Fingerprinter::new("fsci_stats::GaussianKde::new_with_options")
+            .f64s(data)
+            .str(&format!("{:?}", options.mode))
+            .bool(options.allow_non_finite_projection)
+            .finish();
+        let effective = validate_or_project_sample(
+            "data",
+            data,
+            hardened_max_pairwise_len(),
+            options,
+            ledger,
+            &fp,
+        )?;
+        if effective.is_empty() {
+            let err = StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            };
+            if let Some(ledger) = ledger {
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            return Err(err);
+        }
+        run_with_special_guard(options, ledger, &fp, || Self::new(&effective))
     }
 
     /// Create a KDE with a specified bandwidth.
@@ -54150,6 +55012,47 @@ where
     (observed, pvalue)
 }
 
+/// Mode-aware and audit-emitting permutation test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Enforces [`hardened_max_pairwise_len`] on `x` and `y` and [`hardened_max_resamples`] on
+/// `n_permutations` in `RuntimeMode::Hardened`.
+pub fn permutation_test_with_options<F>(
+    x: &[f64],
+    y: &[f64],
+    stat_fn: F,
+    n_permutations: usize,
+    seed: u64,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<(f64, f64), StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> f64 + Sync,
+{
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::permutation_test_with_options")
+        .f64s(x)
+        .f64s(y)
+        .u64(n_permutations as u64)
+        .u64(seed)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    if options.mode == RuntimeMode::Hardened && n_permutations > hardened_max_resamples() {
+        let err = StatsError::ResourceExhausted {
+            detail: "Hardened mode n_permutations exceeds HARDENED_MAX_RESAMPLES",
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    let max_len = hardened_max_pairwise_len();
+    let eff_x = validate_or_project_sample("x", x, max_len, options, ledger, &fp)?;
+    let eff_y = validate_or_project_sample("y", y, max_len, options, ledger, &fp)?;
+    run_with_special_guard(options, ledger, &fp, || {
+        permutation_test(&eff_x, &eff_y, stat_fn, n_permutations, seed)
+    })
+}
+
 /// Monte Carlo hypothesis test result.
 #[derive(Debug, Clone)]
 pub struct MonteCarloTestResult {
@@ -55726,6 +56629,73 @@ where
         bootstrap_distribution: distribution,
         standard_error,
     })
+}
+
+/// Mode-aware and audit-emitting bootstrap (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
+///
+/// Enforces [`hardened_max_pairwise_len`] on `data` and [`hardened_max_resamples`] on
+/// `method.n_resamples` in `RuntimeMode::Hardened`.
+pub fn bootstrap_with_options<F>(
+    data: &[f64],
+    statistic: F,
+    confidence_level: f64,
+    method: &BootstrapMethod,
+    options: StatsOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<BootstrapResult, StatsError>
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
+    let fp = fsci_runtime::Fingerprinter::new("fsci_stats::bootstrap_with_options")
+        .f64s(data)
+        .f64(confidence_level)
+        .u64(method.n_resamples as u64)
+        .str(&format!("{:?}", options.mode))
+        .bool(options.allow_non_finite_projection)
+        .finish();
+    if options.mode == RuntimeMode::Hardened && method.n_resamples > hardened_max_resamples() {
+        let err = StatsError::ResourceExhausted {
+            detail: "Hardened mode n_resamples exceeds HARDENED_MAX_RESAMPLES",
+        };
+        if let Some(ledger) = ledger {
+            record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+        }
+        return Err(err);
+    }
+    let eff_data = validate_or_project_sample(
+        "data",
+        data,
+        hardened_max_pairwise_len(),
+        options,
+        ledger,
+        &fp,
+    )?;
+    clear_last_special_error();
+    let res = with_stats_runtime_mode(options.mode, || {
+        bootstrap(&eff_data, statistic, confidence_level, method)
+    });
+    match res {
+        Ok(val) => {
+            if options.mode == RuntimeMode::Hardened
+                && let Some(special_reason) = take_last_special_error()
+            {
+                let err = StatsError::Arithmetic {
+                    detail: format!("Hardened fsci-special error: {special_reason}"),
+                };
+                if let Some(ledger) = ledger {
+                    record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+                }
+                return Err(err);
+            }
+            Ok(val)
+        }
+        Err(err) => {
+            if let Some(ledger) = ledger {
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            Err(err)
+        }
+    }
 }
 
 fn bootstrap_standard_error(distribution: &[f64]) -> f64 {
@@ -114769,5 +115739,502 @@ mod histogram_distribution_matches_scipy {
         assert!((color[0] - 1.0).abs() < 1e-12);
         assert!((color[1] - 2.0).abs() < 1e-12);
         assert!((color[2] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_stats_hardened_resource_caps_boundary() {
+        use crate::{
+            BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
+            GaussianKde, KdeBandwidth, Normal, RandomState, StatsError, StatsOptions,
+            bootstrap_with_options, describe_with_options, energy_distance_with_options,
+            permutation_test_with_options, ttest_1samp_with_options,
+            wasserstein_distance_with_options, with_hardened_max_resamples,
+            with_hardened_stats_caps,
+        };
+        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+
+        let hardened = StatsOptions::new(RuntimeMode::Hardened);
+
+        with_hardened_stats_caps(8, 6, || {
+            let sample_ok = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let sample_over = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+
+            // 1. Sample cap boundary (8 vs 9)
+            let ledger = SyncSharedAuditLedger::new();
+            assert!(Normal::try_fit_with_options(&sample_ok, hardened, Some(&ledger)).is_ok());
+            assert!(ledger.entries().is_empty());
+
+            let err = Normal::try_fit_with_options(&sample_over, hardened, Some(&ledger))
+                .expect_err("sample_len = cap + 1 must fail closed in Hardened mode");
+            assert!(matches!(err, FitError::ResourceExhausted { .. }));
+            let entries = ledger.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].action,
+                AuditAction::FailClosed {
+                    reason_code: "resource_exhausted".to_string()
+                }
+            );
+
+            let ledger = SyncSharedAuditLedger::new();
+            assert!(ttest_1samp_with_options(&sample_ok, 0.0, hardened, Some(&ledger)).is_ok());
+            assert!(describe_with_options(&sample_ok, hardened, Some(&ledger)).is_ok());
+            assert!(ledger.entries().is_empty());
+
+            let err = ttest_1samp_with_options(&sample_over, 0.0, hardened, Some(&ledger))
+                .expect_err("ttest_1samp sample_len = cap + 1 must fail closed");
+            assert!(matches!(err, StatsError::ResourceExhausted { .. }));
+            let err2 = describe_with_options(&sample_over, hardened, Some(&ledger))
+                .expect_err("describe sample_len = cap + 1 must fail closed");
+            assert!(matches!(err2, StatsError::ResourceExhausted { .. }));
+            assert_eq!(ledger.entries().len(), 2);
+
+            // 2. Pairwise / O(n^2) cap boundary (6 vs 7)
+            let pair_ok = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let pair_over = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+            let ledger = SyncSharedAuditLedger::new();
+            assert!(
+                wasserstein_distance_with_options(&pair_ok, &pair_ok, hardened, Some(&ledger))
+                    .is_ok()
+            );
+            assert!(
+                energy_distance_with_options(&pair_ok, &pair_ok, hardened, Some(&ledger)).is_ok()
+            );
+            assert!(
+                GaussianKde::new_with_options(
+                    &pair_ok,
+                    KdeBandwidth::Scott,
+                    hardened,
+                    Some(&ledger)
+                )
+                .is_ok()
+            );
+            assert!(ledger.entries().is_empty());
+
+            for res in [
+                wasserstein_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger))
+                    .err(),
+                energy_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger)).err(),
+                GaussianKde::new_with_options(
+                    &pair_over,
+                    KdeBandwidth::Scott,
+                    hardened,
+                    Some(&ledger),
+                )
+                .err(),
+            ] {
+                let err = res.expect("pairwise_len = cap + 1 must fail closed");
+                assert!(matches!(err, StatsError::ResourceExhausted { .. }));
+            }
+            assert_eq!(ledger.entries().len(), 3);
+
+            // 3. Resamples cap boundary (10 vs 11)
+            with_hardened_max_resamples(10, || {
+                let ledger = SyncSharedAuditLedger::new();
+                assert!(
+                    permutation_test_with_options(
+                        &pair_ok,
+                        &pair_ok,
+                        |a, b| a.iter().sum::<f64>() - b.iter().sum::<f64>(),
+                        10,
+                        42,
+                        hardened,
+                        Some(&ledger),
+                    )
+                    .is_ok()
+                );
+                let err = permutation_test_with_options(
+                    &pair_ok,
+                    &pair_ok,
+                    |a, b| a.iter().sum::<f64>() - b.iter().sum::<f64>(),
+                    11,
+                    42,
+                    hardened,
+                    Some(&ledger),
+                )
+                .expect_err("n_permutations = cap + 1 must fail closed");
+                assert!(matches!(err, StatsError::ResourceExhausted { .. }));
+
+                let method_ok = BootstrapMethod {
+                    n_resamples: 10,
+                    batch: None,
+                    method: BootstrapIntervalMethod::Percentile,
+                    rng: RandomState::seed_from_u64(42),
+                };
+                assert!(
+                    bootstrap_with_options(
+                        &pair_ok,
+                        |s| s.iter().sum::<f64>() / s.len() as f64,
+                        0.95,
+                        &method_ok,
+                        hardened,
+                        Some(&ledger),
+                    )
+                    .is_ok()
+                );
+
+                let method_over = BootstrapMethod {
+                    n_resamples: 11,
+                    batch: None,
+                    method: BootstrapIntervalMethod::Percentile,
+                    rng: RandomState::seed_from_u64(42),
+                };
+                let err = bootstrap_with_options(
+                    &pair_ok,
+                    |s| s.iter().sum::<f64>() / s.len() as f64,
+                    0.95,
+                    &method_over,
+                    hardened,
+                    Some(&ledger),
+                )
+                .expect_err("n_resamples = cap + 1 must fail closed");
+                assert!(matches!(err, StatsError::ResourceExhausted { .. }));
+                assert_eq!(ledger.entries().len(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn test_stats_mode_awareness_and_audit_emission() {
+        use crate::{
+            BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
+            GaussianKde, KdeBandwidth, Normal, RandomState, StatsError, StatsOptions,
+            bootstrap_with_options, describe_with_options, energy_distance_with_options,
+            ks_1samp_with_options, ks_2samp_with_options, pearsonr_with_options,
+            permutation_test_with_options, spearmanr_with_options, ttest_1samp_with_options,
+            ttest_ind_with_options, wasserstein_distance_with_options,
+        };
+        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+
+        let nan_sample = [1.0, 2.0, f64::NAN, 4.0, 5.0];
+        let clean_sample = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let strict = StatsOptions::new(RuntimeMode::Strict);
+        let hardened = StatsOptions::new(RuntimeMode::Hardened);
+        let hardened_proj =
+            StatsOptions::new(RuntimeMode::Hardened).with_non_finite_projection(true);
+
+        // Strict mode matches live SciPy NaN behavior:
+        // - norm.fit([1, 2, nan, 4, 5]) raises ValueError -> Err(FitError::NonFiniteData)
+        // - ttest_1samp([1, 2, nan, 4, 5], 0.0) -> statistic = NaN, pvalue = NaN
+        // - describe([1, 2, nan, 4, 5]) -> nobs = 5, minmax = (NaN, NaN), mean = NaN
+        let strict_fit = Normal::try_fit_with_options(&nan_sample, strict, None);
+        assert_eq!(strict_fit, Err(FitError::NonFiniteData));
+        let strict_tt = ttest_1samp_with_options(&nan_sample, 0.0, strict, None).unwrap();
+        assert!(strict_tt.statistic.is_nan() && strict_tt.pvalue.is_nan());
+        let strict_desc = describe_with_options(&nan_sample, strict, None).unwrap();
+        assert_eq!(strict_desc.nobs, 5);
+        assert!(strict_desc.minmax.0.is_nan() && strict_desc.mean.is_nan());
+
+        // Hardened mode rejects NaN with FailClosed by default:
+        let ledger = SyncSharedAuditLedger::new();
+        assert_eq!(
+            Normal::try_fit_with_options(&nan_sample, hardened, Some(&ledger)),
+            Err(FitError::NonFiniteData)
+        );
+        assert_eq!(
+            ttest_1samp_with_options(&nan_sample, 0.0, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "data" })
+        );
+        assert_eq!(
+            ttest_ind_with_options(&nan_sample, &clean_sample, true, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "a" })
+        );
+        assert_eq!(
+            ks_1samp_with_options(&nan_sample, |x| x, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "data" })
+        );
+        assert_eq!(
+            ks_2samp_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "data1" })
+        );
+        assert_eq!(
+            pearsonr_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "x" })
+        );
+        assert_eq!(
+            spearmanr_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "x" })
+        );
+        assert_eq!(
+            wasserstein_distance_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "u" })
+        );
+        assert_eq!(
+            energy_distance_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "u" })
+        );
+        assert_eq!(
+            describe_with_options(&nan_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "data" })
+        );
+        assert!(matches!(
+            GaussianKde::new_with_options(
+                &nan_sample,
+                KdeBandwidth::Scott,
+                hardened,
+                Some(&ledger)
+            ),
+            Err(StatsError::NonFiniteInput {
+                argument: "dataset"
+            })
+        ));
+        assert_eq!(
+            permutation_test_with_options(
+                &nan_sample,
+                &clean_sample,
+                |a, b| a[0] - b[0],
+                10,
+                7,
+                hardened,
+                Some(&ledger)
+            ),
+            Err(StatsError::NonFiniteInput { argument: "x" })
+        );
+        let method = BootstrapMethod {
+            n_resamples: 10,
+            batch: None,
+            method: BootstrapIntervalMethod::Percentile,
+            rng: RandomState::seed_from_u64(7),
+        };
+        assert_eq!(
+            bootstrap_with_options(
+                &nan_sample,
+                |s| s[0],
+                0.95,
+                &method,
+                hardened,
+                Some(&ledger)
+            ),
+            Err(StatsError::NonFiniteInput { argument: "data" })
+        );
+        assert_eq!(ledger.entries().len(), 13);
+        for entry in ledger.entries() {
+            assert_eq!(
+                entry.action,
+                AuditAction::FailClosed {
+                    reason_code: "non_finite_input".to_string()
+                }
+            );
+        }
+
+        // Hardened mode with RecoveryPolicy::Project (or allow_non_finite_projection = true)
+        // recovers and logs BoundedRecovery with count and positions_digest:
+        let hardened_policy_proj =
+            StatsOptions::new(RuntimeMode::Hardened).with_recovery(crate::RecoveryPolicy::Project);
+        let ledger_rec = SyncSharedAuditLedger::new();
+        let fit_rec =
+            Normal::try_fit_with_options(&nan_sample, hardened_policy_proj, Some(&ledger_rec))
+                .unwrap();
+        assert!(fit_rec.mean().is_finite());
+        let tt_rec =
+            ttest_1samp_with_options(&nan_sample, 0.0, hardened_policy_proj, Some(&ledger_rec))
+                .unwrap();
+        assert!(tt_rec.statistic.is_finite());
+        let pearson_rec =
+            pearsonr_with_options(&nan_sample, &clean_sample, hardened_proj, Some(&ledger_rec))
+                .unwrap();
+        assert!(pearson_rec.statistic.is_finite());
+        let desc_rec =
+            describe_with_options(&nan_sample, hardened_proj, Some(&ledger_rec)).unwrap();
+        assert_eq!(desc_rec.nobs, 4);
+        assert!(desc_rec.mean.is_finite());
+        assert_eq!(ledger_rec.entries().len(), 4);
+        for entry in ledger_rec.entries() {
+            assert!(matches!(entry.action, AuditAction::BoundedRecovery { .. }));
+            assert!(
+                entry.outcome.contains("count=1"),
+                "outcome={}",
+                entry.outcome
+            );
+            assert!(
+                entry.outcome.contains("positions_digest="),
+                "outcome={}",
+                entry.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn test_stats_special_mode_propagation() {
+        use crate::{
+            ContinuousDistribution, GammaDist, StatsError, StatsOptions, lower_regularized_gamma,
+            take_last_special_error, with_stats_runtime_mode,
+        };
+        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+
+        // Calling lower_regularized_gamma(NaN, 1.0) inside Hardened stats mode must invoke
+        // fsci-special with RuntimeMode::Hardened and record "special_non_finite_input".
+        let val = with_stats_runtime_mode(RuntimeMode::Hardened, || {
+            lower_regularized_gamma(f64::NAN, 1.0)
+        });
+        assert!(val.is_nan());
+        assert_eq!(take_last_special_error(), Some("special_non_finite_input"));
+
+        // Calling GammaDist(NaN, 1.0).cdf_with_options(1.0, Hardened) must fail closed via
+        // the propagated fsci-special Hardened error.
+        let ledger = SyncSharedAuditLedger::new();
+        let g = GammaDist::from_shape_scale(f64::NAN, 1.0);
+        let res = g.cdf_with_options(1.0, StatsOptions::new(RuntimeMode::Hardened), Some(&ledger));
+        assert!(matches!(res, Err(StatsError::Arithmetic { .. })));
+        assert_eq!(ledger.entries().len(), 1);
+        assert!(matches!(
+            ledger.entries()[0].action,
+            AuditAction::FailClosed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_stats_strict_mode_bit_identity_1000_calls() {
+        use crate::{
+            BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, GaussianKde,
+            KdeBandwidth, Normal, RandomState, StatsOptions, bootstrap, bootstrap_with_options,
+            describe, describe_with_options, energy_distance, energy_distance_with_options,
+            ks_1samp, ks_1samp_with_options, ks_2samp, ks_2samp_with_options, pearsonr,
+            pearsonr_with_options, permutation_test, permutation_test_with_options, spearmanr,
+            spearmanr_with_options, ttest_1samp, ttest_1samp_with_options, ttest_ind,
+            ttest_ind_with_options, wasserstein_distance, wasserstein_distance_with_options,
+        };
+        use fsci_runtime::RuntimeMode;
+
+        let strict = StatsOptions::new(RuntimeMode::Strict);
+        let mut state = 0x5EED_3CU8_0005_u64;
+        let mut next_f64 = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 11) as f64) / ((1u64 << 53) as f64);
+            -5.0 + 10.0 * u
+        };
+
+        for i in 0..1000 {
+            let x: Vec<f64> = (0..12).map(|_| next_f64()).collect();
+            let y: Vec<f64> = (0..12).map(|_| next_f64()).collect();
+
+            match i % 10 {
+                0 => {
+                    let a = Normal::try_fit(&x).unwrap();
+                    let b = Normal::try_fit_with_options(&x, strict, None).unwrap();
+                    assert_eq!(a.mean().to_bits(), b.mean().to_bits());
+                    assert_eq!(a.std().to_bits(), b.std().to_bits());
+                    let c1 = a.cdf(x[0]);
+                    let c2 = a.cdf_with_options(x[0], strict, None).unwrap();
+                    assert_eq!(c1.to_bits(), c2.to_bits());
+                }
+                1 => {
+                    let a = ttest_1samp(&x, 0.25);
+                    let b = ttest_1samp_with_options(&x, 0.25, strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                2 => {
+                    let a = ttest_ind(&x, &y, true);
+                    let b = ttest_ind_with_options(&x, &y, true, strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                3 => {
+                    let norm = Normal::standard();
+                    let a = ks_1samp(&x, |v| norm.cdf(v));
+                    let b = ks_1samp_with_options(&x, |v| norm.cdf(v), strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                4 => {
+                    let a = ks_2samp(&x, &y);
+                    let b = ks_2samp_with_options(&x, &y, strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                5 => {
+                    let a = pearsonr(&x, &y);
+                    let b = pearsonr_with_options(&x, &y, strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                6 => {
+                    let a = spearmanr(&x, &y);
+                    let b = spearmanr_with_options(&x, &y, strict, None).unwrap();
+                    assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
+                    assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
+                }
+                7 => {
+                    let a = wasserstein_distance(&x, &y);
+                    let b = wasserstein_distance_with_options(&x, &y, strict, None).unwrap();
+                    assert_eq!(a.to_bits(), b.to_bits());
+                    let e1 = energy_distance(&x, &y);
+                    let e2 = energy_distance_with_options(&x, &y, strict, None).unwrap();
+                    assert_eq!(e1.to_bits(), e2.to_bits());
+                }
+                8 => {
+                    let a = describe(&x);
+                    let b = describe_with_options(&x, strict, None).unwrap();
+                    assert_eq!(a.nobs, b.nobs);
+                    assert_eq!(a.mean.to_bits(), b.mean.to_bits());
+                    assert_eq!(a.variance.to_bits(), b.variance.to_bits());
+                    assert_eq!(a.skewness.to_bits(), b.skewness.to_bits());
+                    assert_eq!(a.kurtosis.to_bits(), b.kurtosis.to_bits());
+                    let k1 = GaussianKde::new(&x, KdeBandwidth::Scott).unwrap();
+                    let k2 = GaussianKde::new_with_options(&x, KdeBandwidth::Scott, strict, None)
+                        .unwrap();
+                    assert_eq!(
+                        k1.evaluate_point(0.0).to_bits(),
+                        k2.evaluate_point(0.0).to_bits()
+                    );
+                }
+                _ => {
+                    let (s1, p1) = permutation_test(
+                        &x[..6],
+                        &y[..6],
+                        |u, v| u.iter().sum::<f64>() - v.iter().sum::<f64>(),
+                        8,
+                        i as u64,
+                    );
+                    let (s2, p2) = permutation_test_with_options(
+                        &x[..6],
+                        &y[..6],
+                        |u, v| u.iter().sum::<f64>() - v.iter().sum::<f64>(),
+                        8,
+                        i as u64,
+                        strict,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(s1.to_bits(), s2.to_bits());
+                    assert_eq!(p1.to_bits(), p2.to_bits());
+
+                    let m1 = BootstrapMethod {
+                        n_resamples: 8,
+                        batch: None,
+                        method: BootstrapIntervalMethod::Percentile,
+                        rng: RandomState::seed_from_u64(i as u64),
+                    };
+                    let b1 = bootstrap(
+                        &x[..6],
+                        |s| s.iter().sum::<f64>() / s.len() as f64,
+                        0.95,
+                        &m1,
+                    )
+                    .unwrap();
+                    let b2 = bootstrap_with_options(
+                        &x[..6],
+                        |s| s.iter().sum::<f64>() / s.len() as f64,
+                        0.95,
+                        &m1,
+                        strict,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        b1.confidence_interval.0.to_bits(),
+                        b2.confidence_interval.0.to_bits()
+                    );
+                    assert_eq!(
+                        b1.confidence_interval.1.to_bits(),
+                        b2.confidence_interval.1.to_bits()
+                    );
+                    assert_eq!(b1.standard_error.to_bits(), b2.standard_error.to_bits());
+                }
+            }
+        }
     }
 }
