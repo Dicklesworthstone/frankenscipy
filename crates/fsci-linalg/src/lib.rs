@@ -77,12 +77,12 @@ mod generalized_schur;
 mod bunch_kaufman;
 use bunch_kaufman::{BunchKaufman, Triangle};
 
-pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
     AttemptOutcome, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionSignals,
     Fingerprinter, PolicyAction, PolicyDecision, PortfolioEvidence, RuntimeMode, SolverAction,
     SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
+pub use fsci_runtime::{RecoveryPolicy, SyncSharedAuditLedger};
 use std::{borrow::Cow, fmt, simd::Simd};
 
 type EigenDecomposition = (Vec<f64>, Option<Vec<Vec<f64>>>);
@@ -330,6 +330,9 @@ impl FingerprintOptions for SolveOptions {
             .str(&format!("{:?}", self.assume_a))
             .bool(self.lower)
             .bool(self.transposed);
+        if self.recovery != RecoveryPolicy::Reject {
+            fingerprinter.str(&format!("{:?}", self.recovery));
+        }
     }
 }
 
@@ -361,6 +364,9 @@ impl FingerprintOptions for LstsqOptions {
             .bool(self.check_finite);
         fingerprint_optional(fingerprinter, self.cond);
         fingerprinter.str(&format!("{:?}", self.driver));
+        if self.recovery != RecoveryPolicy::Reject {
+            fingerprinter.str(&format!("{:?}", self.recovery));
+        }
     }
 }
 
@@ -444,6 +450,7 @@ pub struct SolveOptions {
     pub assume_a: Option<MatrixAssumption>,
     pub lower: bool,
     pub transposed: bool,
+    pub recovery: RecoveryPolicy,
 }
 
 impl Default for SolveOptions {
@@ -454,6 +461,7 @@ impl Default for SolveOptions {
             assume_a: None,
             lower: false,
             transposed: false,
+            recovery: RecoveryPolicy::Reject,
         }
     }
 }
@@ -504,6 +512,7 @@ pub struct LstsqOptions {
     pub check_finite: bool,
     pub cond: Option<f64>,
     pub driver: LstsqDriver,
+    pub recovery: RecoveryPolicy,
 }
 
 impl Default for LstsqOptions {
@@ -513,6 +522,7 @@ impl Default for LstsqOptions {
             check_finite: true,
             cond: None,
             driver: LstsqDriver::default(),
+            recovery: RecoveryPolicy::Reject,
         }
     }
 }
@@ -761,6 +771,7 @@ pub struct SolveResult {
     pub warning: Option<LinalgWarning>,
     pub backward_error: Option<f64>,
     pub certificate: Option<SolveCertificate>,
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -777,6 +788,7 @@ pub struct LstsqResult {
     pub rank: usize,
     pub singular_values: Vec<f64>,
     pub certificate: Option<SolveCertificate>,
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1354,14 +1366,21 @@ fn fast_path_inv_certificate(
 }
 
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
-    validate_original_triangle_input(
-        a,
-        Some(b),
-        options.assume_a,
-        options.mode,
-        options.check_finite,
-    )?;
-    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    if !(options.mode == RuntimeMode::Hardened && options.recovery.allows_projection()) {
+        validate_original_triangle_input(
+            a,
+            Some(b),
+            options.assume_a,
+            options.mode,
+            options.check_finite,
+        )?;
+    }
+    let mirrored = if options.mode == RuntimeMode::Hardened && options.recovery.allows_projection()
+    {
+        None
+    } else {
+        triangle_selected_matrix(a, options.assume_a, options.lower)
+    };
     let a = mirrored.as_deref().unwrap_or(a);
     let n = a.len();
     // SciPy's structure detection for `assume_a = None`, which the fast paths below follow.
@@ -1409,6 +1428,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             warning: None,
             backward_error: Some(backward_error),
             certificate: Some(certificate),
+            recovered: false,
         });
     }
     // Fast path for large general square systems: our own multithreaded blocked LU
@@ -1465,6 +1485,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             warning: None,
             backward_error: Some(backward_error),
             certificate: Some(certificate),
+            recovered: false,
         });
     }
     // Fast path for large symmetric / Hermitian systems (real input ⇒ Hermitian == Symmetric).
@@ -1517,6 +1538,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             warning: None,
             backward_error: Some(backward_error),
             certificate: Some(certificate),
+            recovered: false,
         });
     }
     with_default_solver_portfolio(options.mode, |portfolio| {
@@ -1547,6 +1569,7 @@ pub fn solve_triangular(
             warning: None,
             backward_error: None,
             certificate: None,
+            recovered: false,
         });
         emit_trace(LinalgTrace {
             operation: "solve_triangular",
@@ -1613,6 +1636,19 @@ pub fn solve_banded(
         });
     }
     hardened_dimension_check(options.mode, cols, cols)?;
+    let mut projected_storage: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut recovered = false;
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((proj_ab, proj_b, _, _)) = project_non_finite_matrix_and_vector(ab, b)
+    {
+        projected_storage = Some((proj_ab, proj_b));
+        recovered = true;
+    }
+    let (ab, b): (&[Vec<f64>], &[f64]) = match &projected_storage {
+        Some((pab, pb)) => (pab.as_slice(), pb.as_slice()),
+        None => (ab, b),
+    };
     validate_finite_matrix_and_vector(ab, b, options.mode, options.check_finite)?;
 
     // Fast path: banded Gaussian elimination with partial pivoting on LAPACK-style
@@ -1631,17 +1667,20 @@ pub fn solve_banded(
             warning: None,
             backward_error: Some(backward_error),
             certificate: None,
+            recovered,
         });
     }
     let dense = dense_from_banded(nlower, nupper, ab, cols);
-    solve(
+    let mut res = solve(
         &dense,
         b,
         SolveOptions {
             assume_a: Some(MatrixAssumption::General),
             ..options
         },
-    )
+    )?;
+    res.recovered |= recovered;
+    Ok(res)
 }
 
 pub fn solve_banded_with_audit(
@@ -1654,6 +1693,17 @@ pub fn solve_banded_with_audit(
     let fingerprint = audit_fingerprint("fsci_linalg::solve_banded", &options, |f| {
         f.usize(l_and_u.0).usize(l_and_u.1).rows(ab).f64s(b);
     });
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((_, _, count, positions_digest)) = project_non_finite_matrix_and_vector(ab, b)
+    {
+        record_bounded_recovery(
+            audit_ledger,
+            &fingerprint,
+            "nonfinite_projection",
+            &format!("count={count}, positions_digest={positions_digest}"),
+        );
+    }
     let result = solve_banded(l_and_u, ab, b, options);
     record_operation_audit(
         audit_ledger,
@@ -1884,6 +1934,24 @@ pub fn lstsq_with_audit(
     let fingerprint = audit_fingerprint("fsci_linalg::lstsq", &options, |f| {
         f.rows(a).f64s(b);
     });
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((proj_a, proj_b, count, positions_digest)) =
+            project_non_finite_matrix_and_vector(a, b)
+    {
+        record_bounded_recovery(
+            audit_ledger,
+            &fingerprint,
+            "nonfinite_projection",
+            &format!("count={count}, positions_digest={positions_digest}"),
+        );
+        let mut result = lstsq(&proj_a, &proj_b, options);
+        if let Ok(ref mut ok) = result {
+            ok.recovered = true;
+        }
+        record_operation_audit(audit_ledger, &fingerprint, "lstsq", options.mode, &result);
+        return result;
+    }
     let result = lstsq(a, b, options);
     record_operation_audit(audit_ledger, &fingerprint, "lstsq", options.mode, &result);
     result
@@ -2685,6 +2753,140 @@ fn hardened_dimension_check(
     Ok(())
 }
 
+/// Project non-finite entries in `a` and `b` to `0.0`, returning the projected copies,
+/// count of replaced entries, and a BLAKE3 digest of their positions when at least one
+/// non-finite entry is present (`frankenscipy-3cu8u.3`).
+fn project_non_finite_matrix_and_vector(
+    a: &[Vec<f64>],
+    b: &[f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>, usize, String)> {
+    let has_non_finite =
+        a.iter().flatten().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite());
+    if !has_non_finite {
+        return None;
+    }
+    let mut fp = Fingerprinter::new("fsci_linalg::nonfinite_positions");
+    let mut count = 0usize;
+    let mut proj_a = Vec::with_capacity(a.len());
+    for (r, row) in a.iter().enumerate() {
+        let mut proj_row = Vec::with_capacity(row.len());
+        for (c, &v) in row.iter().enumerate() {
+            if v.is_finite() {
+                proj_row.push(v);
+            } else {
+                proj_row.push(0.0);
+                count += 1;
+                fp.str("a").usize(r).usize(c);
+            }
+        }
+        proj_a.push(proj_row);
+    }
+    let mut proj_b = Vec::with_capacity(b.len());
+    for (i, &v) in b.iter().enumerate() {
+        if v.is_finite() {
+            proj_b.push(v);
+        } else {
+            proj_b.push(0.0);
+            count += 1;
+            fp.str("b").usize(i);
+        }
+    }
+    Some((proj_a, proj_b, count, fp.finish()))
+}
+
+struct TikhonovRecovery {
+    result: SolveResult,
+    lambda: f64,
+    filtered_modes: usize,
+    rel_residual: f64,
+}
+
+/// Solve a near-singular square linear system via SVD Tikhonov regularization:
+/// $x_\lambda = \sum_i \frac{\sigma_i}{\sigma_i^2 + \lambda^2} (u_i^T b) v_i$
+/// with $\lambda = \sigma_{\max} \sqrt{\varepsilon} \max(m, n)$ (`frankenscipy-3cu8u.3`).
+fn solve_tikhonov_regularized(
+    a: &[Vec<f64>],
+    b: &[f64],
+    rcond: f64,
+) -> Result<TikhonovRecovery, LinalgError> {
+    let matrix = dmatrix_from_rows(a)?;
+    let rhs = DVector::from_column_slice(b);
+    let svd = safe_svd(matrix.clone(), true, true)?;
+    let sigma_max = svd.singular_values.iter().copied().fold(0.0_f64, |acc, v| {
+        if v.is_finite() { acc.max(v) } else { acc }
+    });
+    if sigma_max <= 0.0 || !sigma_max.is_finite() {
+        return Err(LinalgError::SingularMatrix);
+    }
+    let n = matrix.nrows().max(matrix.ncols()) as f64;
+    let lambda = sigma_max * f64::EPSILON.sqrt() * n;
+    let lambda_sq = lambda * lambda;
+    let u = svd
+        .u
+        .as_ref()
+        .ok_or_else(|| LinalgError::ConvergenceFailure {
+            detail: "SVD did not produce U".to_string(),
+        })?;
+    let v_t = svd
+        .v_t
+        .as_ref()
+        .ok_or_else(|| LinalgError::ConvergenceFailure {
+            detail: "SVD did not produce V^T".to_string(),
+        })?;
+    let ncols = matrix.ncols();
+    let mut x_vec = vec![0.0_f64; ncols];
+    let mut filtered_modes = 0usize;
+    for (i, &sigma) in svd.singular_values.iter().enumerate() {
+        if sigma < lambda {
+            filtered_modes += 1;
+        }
+        let denom = sigma * sigma + lambda_sq;
+        if denom <= 0.0 {
+            continue;
+        }
+        let filter = sigma / denom;
+        let mut ut_b = 0.0_f64;
+        for r in 0..matrix.nrows() {
+            ut_b += u[(r, i)] * b[r];
+        }
+        let coeff = filter * ut_b;
+        for c in 0..ncols {
+            x_vec[c] += coeff * v_t[(i, c)];
+        }
+    }
+    let x_dvec = DVector::from_column_slice(&x_vec);
+    let backward_err = compute_backward_error(&matrix, &x_dvec, &rhs);
+    let b_norm = b.iter().map(|&v| v * v).sum::<f64>().sqrt();
+    let res_norm = a
+        .iter()
+        .zip(b.iter())
+        .map(|(row, &bi)| {
+            let ax_i: f64 = row
+                .iter()
+                .zip(x_vec.iter())
+                .map(|(&aij, &xj)| aij * xj)
+                .sum();
+            let diff = bi - ax_i;
+            diff * diff
+        })
+        .sum::<f64>()
+        .sqrt();
+    let rel_residual = if b_norm > 0.0 { res_norm / b_norm } else { 0.0 };
+
+    Ok(TikhonovRecovery {
+        result: SolveResult {
+            x: x_vec,
+            warning: rcond_warning(rcond),
+            backward_error: Some(backward_err),
+            certificate: None,
+            recovered: true,
+        },
+        lambda,
+        filtered_modes,
+        rel_residual,
+    })
+}
+
 /// General solver with hardened-mode condition number rejection.
 #[allow(dead_code)] // Used by test-only solve_general
 fn solve_general_with_hardening(
@@ -2714,6 +2916,7 @@ fn solve_general_with_hardening(
         warning: rcond_warning(rcond),
         backward_error: Some(backward_err),
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -2734,6 +2937,7 @@ fn solve_qr(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
         warning: None,
         backward_error: Some(backward_err),
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -2752,6 +2956,7 @@ fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgEr
             }),
             backward_error: None,
             certificate: None,
+            recovered: false,
         });
     }
     let matrix = dmatrix_from_rows(a)?;
@@ -2799,6 +3004,7 @@ fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgEr
         warning: rcond_warning(rcond),
         backward_error: Some(backward_err),
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -3534,6 +3740,7 @@ fn dispatch_solve_action(
                     warning: rcond_warning(report.rcond_estimate),
                     backward_error: Some(backward_error),
                     certificate: None,
+                    recovered: false,
                 });
             }
             let matrix = if let Some(matrix) = matrix_cache.take() {
@@ -3561,6 +3768,7 @@ fn dispatch_solve_action(
                 warning: rcond_warning(report.rcond_estimate),
                 backward_error: Some(backward_err),
                 certificate: None,
+                recovered: false,
             })
         }
         SolverAction::PivotedQR => solve_qr(effective_a, b),
@@ -3581,6 +3789,7 @@ fn dispatch_solve_action(
                 warning: rcond_warning(report.rcond_estimate),
                 backward_error: Some(backward_error),
                 certificate: None,
+                recovered: false,
             })
         }
     }
@@ -3780,6 +3989,20 @@ fn solve_with_portfolio_internal(
         });
     }
     hardened_dimension_check(options.mode, rows, cols)?;
+    let mut projected_storage: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut recovered = false;
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((proj_a, proj_b, _, _)) = project_non_finite_matrix_and_vector(a, b)
+    {
+        let mirrored = triangle_selected_matrix(&proj_a, options.assume_a, options.lower);
+        projected_storage = Some((mirrored.unwrap_or(proj_a), proj_b));
+        recovered = true;
+    }
+    let (a, b): (&[Vec<f64>], &[f64]) = match &projected_storage {
+        Some((pa, pb)) => (pa.as_slice(), pb.as_slice()),
+        None => (a, b),
+    };
     validate_finite_matrix_and_vector(a, b, options.mode, options.check_finite)?;
 
     if rows == 0 {
@@ -3788,6 +4011,7 @@ fn solve_with_portfolio_internal(
             warning: None,
             backward_error: None,
             certificate: None,
+            recovered,
         });
         emit_trace(LinalgTrace {
             operation: trace_operation,
@@ -3832,17 +4056,6 @@ fn solve_with_portfolio_internal(
             None
         };
 
-    // Hardened mode: reject ill-conditioned matrices upfront
-    if options.mode == RuntimeMode::Hardened
-        && report.rcond_estimate < HARDENED_RCOND_THRESHOLD
-        && report.rcond_estimate > 0.0
-    {
-        return Err(LinalgError::ConditionTooHigh {
-            rcond: report.rcond_estimate,
-            threshold: HARDENED_RCOND_THRESHOLD,
-        });
-    }
-
     let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
     let selected_action = strict_order_action(
@@ -3854,6 +4067,64 @@ fn solve_with_portfolio_internal(
 
     let decision =
         PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
+
+    // Hardened mode: regularize or reject ill-conditioned matrices upfront
+    if options.mode == RuntimeMode::Hardened && report.rcond_estimate < HARDENED_RCOND_THRESHOLD {
+        if options.recovery.allows_regularization() {
+            let mut tikhonov = solve_tikhonov_regularized(&effective_a, b, report.rcond_estimate)?;
+            let actual_action = SolverAction::SVDFallback;
+            let accuracy = certify_accuracy(
+                &effective_a,
+                b,
+                &tikhonov.result.x,
+                &report,
+                lu_cache.as_ref(),
+                &cholesky_cache,
+            );
+            tikhonov.result.certificate = Some(build_solve_certificate(
+                &report,
+                actual_action,
+                posterior,
+                expected_losses,
+                actual_action != selected_action,
+                accuracy,
+                decision,
+            ));
+            emit_trace(LinalgTrace {
+                operation: trace_operation,
+                matrix_size: (rows, cols),
+                mode: options.mode,
+                rcond: Some(report.rcond_estimate),
+                warning: tikhonov
+                    .result
+                    .warning
+                    .as_ref()
+                    .map(|warning| format!("{warning:?}")),
+                error: None,
+            });
+            if record_evidence {
+                portfolio.record_evidence(SolverEvidenceEntry {
+                    component: "solver_portfolio",
+                    matrix_shape: (rows, cols),
+                    rcond_estimate: report.rcond_estimate,
+                    chosen_action: actual_action,
+                    posterior: posterior.to_vec(),
+                    expected_losses: expected_losses.to_vec(),
+                    chosen_expected_loss: expected_losses[actual_action.index()],
+                    fallback_active: actual_action != selected_action,
+                    backward_error: tikhonov.result.backward_error,
+                });
+            }
+            return Ok(tikhonov.result);
+        }
+        if report.rcond_estimate > 0.0 {
+            return Err(LinalgError::ConditionTooHigh {
+                rcond: report.rcond_estimate,
+                threshold: HARDENED_RCOND_THRESHOLD,
+            });
+        }
+    }
+
     let (actual_action, superseded_inaccurate, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3869,8 +4140,9 @@ fn solve_with_portfolio_internal(
         expected_losses,
         decision,
     );
-    let result = result.and_then(|solve_result| {
+    let result = result.and_then(|mut solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
+        solve_result.recovered |= recovered;
         Ok(solve_result)
     });
 
@@ -3919,14 +4191,21 @@ pub fn solve_with_casp(
     options: SolveOptions,
     portfolio: &mut SolverPortfolio,
 ) -> Result<SolveResult, LinalgError> {
-    validate_original_triangle_input(
-        a,
-        Some(b),
-        options.assume_a,
-        options.mode,
-        options.check_finite,
-    )?;
-    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    if !(options.mode == RuntimeMode::Hardened && options.recovery.allows_projection()) {
+        validate_original_triangle_input(
+            a,
+            Some(b),
+            options.assume_a,
+            options.mode,
+            options.check_finite,
+        )?;
+    }
+    let mirrored = if options.mode == RuntimeMode::Hardened && options.recovery.allows_projection()
+    {
+        None
+    } else {
+        triangle_selected_matrix(a, options.assume_a, options.lower)
+    };
     let a = mirrored.as_deref().unwrap_or(a);
     solve_with_portfolio_internal(a, b, options, portfolio, "solve_with_casp", true)
 }
@@ -3999,6 +4278,27 @@ fn solve_audited(
         });
     }
 
+    let mut projected_storage: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut recovered = false;
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((proj_a, proj_b, count, positions_digest)) =
+            project_non_finite_matrix_and_vector(a, b)
+    {
+        record_bounded_recovery(
+            audit.ledger(),
+            audit.fingerprint(),
+            "nonfinite_projection",
+            &format!("count={count}, positions_digest={positions_digest}"),
+        );
+        projected_storage = Some((proj_a, proj_b));
+        recovered = true;
+    }
+    let (a, b): (&[Vec<f64>], &[f64]) = match &projected_storage {
+        Some((pa, pb)) => (pa.as_slice(), pb.as_slice()),
+        None => (a, b),
+    };
+
     // Finite check with audit
     let must_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     if must_check {
@@ -4018,6 +4318,7 @@ fn solve_audited(
             warning: None,
             backward_error: None,
             certificate: None,
+            recovered,
         });
     }
 
@@ -4059,24 +4360,6 @@ fn solve_audited(
             None
         };
 
-    // Hardened mode: reject ill-conditioned matrices with audit
-    if options.mode == RuntimeMode::Hardened
-        && report.rcond_estimate < HARDENED_RCOND_THRESHOLD
-        && report.rcond_estimate > 0.0
-    {
-        audit.reject(
-            "condition_too_high",
-            &format!(
-                "rejected: rcond={:.2e} < threshold={:.2e}",
-                report.rcond_estimate, HARDENED_RCOND_THRESHOLD
-            ),
-        );
-        return Err(LinalgError::ConditionTooHigh {
-            rcond: report.rcond_estimate,
-            threshold: HARDENED_RCOND_THRESHOLD,
-        });
-    }
-
     // CASP solver selection with audit
     let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
@@ -4089,6 +4372,97 @@ fn solve_audited(
 
     let decision =
         PortfolioDecision::ordered(portfolio, posterior_action, selected_action, options.mode);
+
+    // Hardened mode: regularize or reject ill-conditioned matrices with audit
+    if options.mode == RuntimeMode::Hardened && report.rcond_estimate < HARDENED_RCOND_THRESHOLD {
+        if options.recovery.allows_regularization() {
+            let mut tikhonov = solve_tikhonov_regularized(&effective_a, b, report.rcond_estimate)?;
+            let actual_action = SolverAction::SVDFallback;
+            let fallback_active = actual_action != selected_action;
+            let accuracy = certify_accuracy(
+                &effective_a,
+                b,
+                &tikhonov.result.x,
+                &report,
+                lu_cache.as_ref(),
+                &cholesky_cache,
+            );
+            tikhonov.result.certificate = Some(build_solve_certificate(
+                &report,
+                actual_action,
+                posterior,
+                expected_losses,
+                fallback_active,
+                accuracy,
+                decision,
+            ));
+            record_casp_decision(
+                audit.ledger(),
+                audit.fingerprint(),
+                CaspChoice {
+                    mode: options.mode,
+                    action: actual_action,
+                    portfolio_action: posterior_action,
+                    first_attempt: selected_action,
+                    posterior,
+                    expected_losses,
+                    fallback: fallback_active,
+                    rcond: report.rcond_estimate,
+                    structure: report.structural_evidence,
+                },
+            );
+            record_bounded_recovery(
+                audit.ledger(),
+                audit.fingerprint(),
+                "tikhonov_regularization",
+                &format!(
+                    "lambda={:.16e}, rcond_est={:.16e}, filtered_modes={}, rel_residual={:.16e}",
+                    tikhonov.lambda,
+                    report.rcond_estimate,
+                    tikhonov.filtered_modes,
+                    tikhonov.rel_residual
+                ),
+            );
+            emit_trace(LinalgTrace {
+                operation: "solve_with_audit",
+                matrix_size: (rows, cols),
+                mode: options.mode,
+                rcond: Some(report.rcond_estimate),
+                warning: tikhonov
+                    .result
+                    .warning
+                    .as_ref()
+                    .map(|warning| format!("{warning:?}")),
+                error: None,
+            });
+            portfolio.record_evidence(SolverEvidenceEntry {
+                component: "solver_portfolio",
+                matrix_shape: (rows, cols),
+                rcond_estimate: report.rcond_estimate,
+                chosen_action: actual_action,
+                posterior: posterior.to_vec(),
+                expected_losses: expected_losses.to_vec(),
+                chosen_expected_loss: expected_losses[actual_action.index()],
+                fallback_active,
+                backward_error: tikhonov.result.backward_error,
+            });
+            return Ok(tikhonov.result);
+        }
+        if report.rcond_estimate > 0.0 {
+            audit.reject(
+                "condition_too_high",
+                &format!(
+                    "rejected: rcond={:.2e} < threshold={:.2e}",
+                    report.rcond_estimate, HARDENED_RCOND_THRESHOLD
+                ),
+            );
+            return Err(LinalgError::ConditionTooHigh {
+                rcond: report.rcond_estimate,
+                threshold: HARDENED_RCOND_THRESHOLD,
+            });
+        }
+    }
+
     let (actual_action, superseded_inaccurate, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -4104,8 +4478,9 @@ fn solve_audited(
         expected_losses,
         decision,
     );
-    let result = result.and_then(|solve_result| {
+    let result = result.and_then(|mut solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
+        solve_result.recovered |= recovered;
         Ok(solve_result)
     });
 
@@ -4666,6 +5041,19 @@ fn lstsq_with_casp_kernel(
         });
     }
     hardened_dimension_check(options.mode, rows, cols)?;
+    let mut projected_storage: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut recovered = false;
+    if options.mode == RuntimeMode::Hardened
+        && options.recovery.allows_projection()
+        && let Some((proj_a, proj_b, _, _)) = project_non_finite_matrix_and_vector(a, b)
+    {
+        projected_storage = Some((proj_a, proj_b));
+        recovered = true;
+    }
+    let (a, b): (&[Vec<f64>], &[f64]) = match &projected_storage {
+        Some((pa, pb)) => (pa.as_slice(), pb.as_slice()),
+        None => (a, b),
+    };
     validate_finite_matrix_and_vector(a, b, options.mode, options.check_finite)?;
 
     if rows == 0 || cols == 0 {
@@ -4675,6 +5063,7 @@ fn lstsq_with_casp_kernel(
             rank: 0,
             singular_values: Vec::new(),
             certificate: None,
+            recovered,
         });
     }
 
@@ -4725,6 +5114,7 @@ fn lstsq_with_casp_kernel(
             rank: fast.rank,
             singular_values: fast.singular_values,
             certificate: Some(certificate),
+            recovered,
         });
     }
 
@@ -4780,6 +5170,7 @@ fn lstsq_with_casp_kernel(
             rank: fast.rank,
             singular_values: fast.singular_values,
             certificate: Some(certificate),
+            recovered,
         });
     }
 
@@ -4832,6 +5223,7 @@ fn lstsq_with_casp_kernel(
             rank: fast.rank,
             singular_values: fast.singular_values,
             certificate: Some(certificate),
+            recovered,
         });
     }
 
@@ -4895,6 +5287,7 @@ fn lstsq_with_casp_kernel(
                 rank,
                 singular_values: singular_values_out,
                 certificate: Some(certificate),
+                recovered,
             });
         }
     }
@@ -5032,6 +5425,7 @@ fn lstsq_with_casp_kernel(
         rank,
         singular_values: singular_values_out,
         certificate: Some(certificate),
+        recovered,
     })
 }
 
@@ -5766,6 +6160,7 @@ pub fn lu_solve(lu_factor: &LuFactorResult, b: &[f64]) -> Result<SolveResult, Li
         warning: rcond_warning(rcond),
         backward_error: None,
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -8116,6 +8511,7 @@ pub fn cho_solve(cho: &ChoFactorResult, b: &[f64]) -> Result<SolveResult, Linalg
         warning: None,
         backward_error: None,
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -8175,6 +8571,7 @@ pub fn cho_solve_banded(
             warning: None,
             backward_error: None,
             certificate: None,
+            recovered: false,
         });
     }
 
@@ -8244,6 +8641,7 @@ pub fn cho_solve_banded(
         warning: None,
         backward_error: None,
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -13468,6 +13866,7 @@ fn solve_diagonal(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError>
         warning,
         backward_error: Some(backward_error),
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -13554,6 +13953,7 @@ fn solve_triangular_internal(
         warning: None,
         backward_error: Some(backward_error),
         certificate: None,
+        recovered: false,
     })
 }
 
@@ -51991,6 +52391,220 @@ mod chol_syrk_nc_blocking {
                 casp_ns.sort_by(f64::total_cmp);
                 let casp_p50_us = casp_ns[iters / 2] / 1e3;
                 eprintln!("n={n:4}: solve_p50={casp_p50_us:9.2}us (full portfolio path)");
+            }
+        }
+    }
+
+    #[test]
+    fn test_linalg_hardened_nonfinite_projection_and_reject_default() {
+        let a = vec![vec![4.0, f64::NAN], vec![1.0, 3.0]];
+        let b = vec![4.0, 7.0];
+
+        // 1. Default RecoveryPolicy::Reject in Hardened mode rejects non-finite input
+        let ledger_reject = AuditLedger::shared();
+        let mut portfolio_reject = SolverPortfolio::new(RuntimeMode::Hardened, 64);
+        let err = solve_with_audit(
+            &a,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..SolveOptions::default()
+            },
+            &mut portfolio_reject,
+            &ledger_reject,
+        )
+        .expect_err("Default RecoveryPolicy::Reject must reject NaN");
+        assert!(matches!(err, LinalgError::NonFiniteInput));
+
+        // 2. RecoveryPolicy::Project in Hardened mode projects NaN -> 0.0 and logs BoundedRecovery
+        let ledger_proj = AuditLedger::shared();
+        let mut portfolio_proj = SolverPortfolio::new(RuntimeMode::Hardened, 64);
+        let res = solve_with_audit(
+            &a,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                recovery: RecoveryPolicy::Project,
+                ..SolveOptions::default()
+            },
+            &mut portfolio_proj,
+            &ledger_proj,
+        )
+        .expect("RecoveryPolicy::Project must recover from single NaN");
+        assert!(res.recovered);
+        assert!((res.x[0] - 1.0).abs() < 1e-12);
+        assert!((res.x[1] - 2.0).abs() < 1e-12);
+
+        let guard = ledger_proj.lock().unwrap();
+        let proj_events: Vec<_> = guard
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.action {
+                AuditAction::BoundedRecovery { recovery_action }
+                    if recovery_action == "nonfinite_projection" =>
+                {
+                    Some((e.input_fingerprint.clone(), e.outcome.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proj_events.len(), 1);
+        assert!(proj_events[0].0.starts_with("blake3:"));
+        assert!(proj_events[0].1.contains("count=1"));
+        assert!(proj_events[0].1.contains("positions_digest="));
+    }
+
+    #[test]
+    fn test_linalg_hardened_tikhonov_regularization_hilbert12() {
+        let n = 12usize;
+        let h: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| 1.0 / ((i + j + 1) as f64)).collect())
+            .collect();
+        let b: Vec<f64> = h.iter().map(|row| row.iter().sum()).collect();
+
+        // 1. Default RecoveryPolicy::Reject rejects Hilbert(12) in Hardened mode
+        let ledger_reject = AuditLedger::shared();
+        let mut portfolio_reject = SolverPortfolio::new(RuntimeMode::Hardened, 64);
+        let err = solve_with_audit(
+            &h,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..SolveOptions::default()
+            },
+            &mut portfolio_reject,
+            &ledger_reject,
+        )
+        .expect_err("Hilbert(12) must be rejected under default RecoveryPolicy::Reject");
+        assert!(matches!(err, LinalgError::ConditionTooHigh { .. }));
+
+        // 2. RecoveryPolicy::Regularize in Hardened mode applies SVD Tikhonov regularization
+        let ledger_reg = AuditLedger::shared();
+        let mut portfolio_reg = SolverPortfolio::new(RuntimeMode::Hardened, 64);
+        let res = solve_with_audit(
+            &h,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                recovery: RecoveryPolicy::Regularize,
+                ..SolveOptions::default()
+            },
+            &mut portfolio_reg,
+            &ledger_reg,
+        )
+        .expect("Hilbert(12) must succeed under RecoveryPolicy::Regularize");
+        assert!(res.recovered);
+        assert_eq!(res.x.len(), n);
+        assert!(res.x.iter().all(|v| v.is_finite()));
+
+        let guard = ledger_reg.lock().unwrap();
+        let reg_details = guard
+            .entries()
+            .iter()
+            .find_map(|e| match &e.action {
+                AuditAction::BoundedRecovery { recovery_action }
+                    if recovery_action == "tikhonov_regularization" =>
+                {
+                    Some(e.outcome.clone())
+                }
+                _ => None,
+            })
+            .expect("must emit tikhonov_regularization BoundedRecovery event");
+
+        assert!(reg_details.contains("lambda="));
+        assert!(reg_details.contains("rcond_est="));
+        assert!(reg_details.contains("filtered_modes="));
+
+        let recorded_rel_residual: f64 = reg_details
+            .split(", ")
+            .find_map(|kv| kv.strip_prefix("rel_residual="))
+            .expect("rel_residual field present")
+            .parse()
+            .expect("valid f64 rel_residual");
+
+        let b_norm = b.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        let res_norm = h
+            .iter()
+            .zip(b.iter())
+            .map(|(row, &bi)| {
+                let ax_i: f64 = row
+                    .iter()
+                    .zip(res.x.iter())
+                    .map(|(&aij, &xj)| aij * xj)
+                    .sum();
+                let diff = bi - ax_i;
+                diff * diff
+            })
+            .sum::<f64>()
+            .sqrt();
+        let recomputed_rel_residual = res_norm / b_norm;
+        assert!(
+            (recorded_rel_residual - recomputed_rel_residual).abs() <= 1e-12,
+            "recorded rel_residual {recorded_rel_residual:.16e} vs recomputed {recomputed_rel_residual:.16e}"
+        );
+    }
+
+    #[test]
+    fn test_linalg_strict_mode_bit_identity_2000_calls() {
+        let mut state = 0x517cc1b727220a95_u64;
+        let mut next_f64 = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) - 0.5
+        };
+
+        for call in 0..2000usize {
+            let n = 2 + (call % 5);
+            let mut a = vec![vec![0.0; n]; n];
+            for (r, row) in a.iter_mut().enumerate() {
+                for (c, val) in row.iter_mut().enumerate() {
+                    *val = next_f64() + if r == c { (n as f64) + 3.0 } else { 0.0 };
+                }
+            }
+            if call % 20 == 7 {
+                // Inject near-singular scaling on last row
+                for val in &mut a[n - 1] {
+                    *val *= 1e-15;
+                }
+            } else if call % 25 == 13 {
+                // Inject non-finite entry
+                a[0][n - 1] = f64::NAN;
+            }
+            let b: Vec<f64> = (0..n).map(|_| next_f64() * 4.0).collect();
+
+            reset_default_solver_portfolio();
+            let r1 = solve(
+                &a,
+                &b,
+                SolveOptions {
+                    mode: RuntimeMode::Strict,
+                    recovery: RecoveryPolicy::Reject,
+                    ..SolveOptions::default()
+                },
+            );
+            reset_default_solver_portfolio();
+            let r2 = solve(
+                &a,
+                &b,
+                SolveOptions {
+                    mode: RuntimeMode::Strict,
+                    recovery: RecoveryPolicy::ProjectAndRegularize,
+                    ..SolveOptions::default()
+                },
+            );
+            match (r1, r2) {
+                (Ok(ok1), Ok(ok2)) => {
+                    assert!(!ok1.recovered);
+                    assert!(!ok2.recovered);
+                    for (u, v) in ok1.x.iter().zip(ok2.x.iter()) {
+                        assert_eq!(u.to_bits(), v.to_bits(), "bit mismatch on call {call}");
+                    }
+                }
+                (Err(e1), Err(e2)) => {
+                    assert_eq!(e1, e2, "error mismatch on call {call}");
+                }
+                (lhs, rhs) => panic!("Strict outcome mismatch on call {call}: {lhs:?} vs {rhs:?}"),
             }
         }
     }
