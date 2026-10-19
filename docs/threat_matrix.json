@@ -64,10 +64,10 @@
       "severity": "critical",
       "likelihood": "likely",
       "description": "Ill-conditioned matrices cause catastrophic cancellation in LU/Cholesky/QR decomposition, producing high backward error.",
-      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): estimates reciprocal condition number via Hager-Higham 1-norm, checks Oettli-Prager backward error, and falls back from LU to QR/SVD via CASP SolverPortfolio.",
-      "test_reference": "ill_conditioned_factor_matches_lapack_not_lu",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:2806 (solve_tikhonov_regularized): estimates reciprocal condition number via Hager-Higham 1-norm, falls back from LU to QR/SVD via CASP SolverPortfolio, and in Hardened mode with RecoveryPolicy::Regularize applies SVD Tikhonov regularization with audited BoundedRecovery.",
+      "test_reference": "test_linalg_hardened_tikhonov_regularization_hilbert12",
       "strict_mode_response": "Return result with LinAlgWarning when condition exceeds threshold and fallback when backward error exceeds ATTEMPT_BACKWARD_ERROR_TOL.",
-      "hardened_mode_response": "Enforce finite checks, emit SolveCertificate, and record fallback/warning events in AuditLedger.",
+      "hardened_mode_response": "Reject ConditionTooHigh by default or apply SVD Tikhonov regularization under RecoveryPolicy::Regularize, recording BoundedRecovery in AuditLedger.",
       "required_artifact": "conditioning_diagnostic_log"
     },
     {
@@ -77,10 +77,10 @@
       "severity": "high",
       "likelihood": "possible",
       "description": "Non-square matrices passed to square-only operations (det, inv, eig), NaN/Inf elements in input matrices, mismatched dimensions in solve(A, B).",
-      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): validates matrix dimensions and element finiteness at entry point.",
-      "test_reference": "solve_singular_and_shape_errors",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:4207 (solve_with_audit): validates matrix dimensions and element finiteness, or projects non-finite entries to 0.0 under Hardened + RecoveryPolicy::Project with an audited BoundedRecovery event.",
+      "test_reference": "test_linalg_hardened_nonfinite_projection_and_reject_default",
       "strict_mode_response": "Return LinalgError::ShapeMismatch or SingularMatrix matching SciPy LinAlgError.",
-      "hardened_mode_response": "Return LinalgError and record AuditAction::FailClosed in AuditLedger."
+      "hardened_mode_response": "Reject with FailClosed by default, or project non-finite entries to 0.0 under RecoveryPolicy::Project with BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-003",
@@ -89,7 +89,7 @@
       "severity": "high",
       "likelihood": "possible",
       "description": "Very large dense matrices (>10000x10000) in O(n^3) decompositions exhaust memory or cause unacceptable runtime in Hardened mode.",
-      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): enforces HARDENED_MAX_DIM (10,000) dimension cap in Hardened mode.",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:4207 (solve_with_audit): enforces HARDENED_MAX_DIM (10,000) dimension cap in Hardened mode.",
       "test_reference": "solve_matches_scipy_doc_example",
       "strict_mode_response": "Proceed without dimension limit (matching SciPy).",
       "hardened_mode_response": "Reject matrices exceeding HARDENED_MAX_DIM with LinalgError::ResourceExhausted and FailClosed audit record."
@@ -221,7 +221,7 @@
       "severity": "high",
       "likelihood": "likely",
       "description": "Distribution CDF/PDF/PPF evaluation at extreme quantiles or nearly-singular covariance matrices.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38242 (pearsonr): uses log-space density evaluations and scale-preserving Cholesky/eigendecomposition in Covariance.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38958 (pearsonr): uses log-space density evaluations and scale-preserving Cholesky/eigendecomposition in Covariance.",
       "test_reference": "tiny_positive_diagonal_and_cholesky_keep_scale",
       "strict_mode_response": "Match SciPy tail probability and quantile semantics.",
       "hardened_mode_response": "Reject non-finite or out-of-domain distribution parameters fail-closed."
@@ -233,10 +233,10 @@
       "severity": "medium",
       "likelihood": "likely",
       "description": "Statistical tests receiving empty samples, ties, zero variance, or non-finite observations.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:36704 (mannwhitneyu): validates sample sizes, applies tie corrections, and checks observation finiteness.",
-      "test_reference": "cholesky_checks_later_rows_before_matrix_product",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:358 (validate_or_project_sample): validates sample sizes and observation finiteness, or projects non-finite observations under Hardened + RecoveryPolicy::Project with an audited BoundedRecovery event.",
+      "test_reference": "test_stats_mode_awareness_and_audit_emission",
       "strict_mode_response": "Match SciPy tie-correction and degenerate-sample handling.",
-      "hardened_mode_response": "Reject non-finite or insufficient samples fail-closed with FailClosed audit record."
+      "hardened_mode_response": "Reject non-finite samples with FailClosed by default, or project non-finite observations under RecoveryPolicy::Project with BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-016",
@@ -245,7 +245,7 @@
       "severity": "high",
       "likelihood": "possible",
       "description": "High-order IIR filter transfer-function coefficients losing precision compared to cascaded second-order sections (SOS).",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9924 (sosfilt): implements direct ZPK-to-SOS pairing and biquad filtering.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:10074 (sosfilt): implements direct ZPK-to-SOS pairing and biquad filtering.",
       "test_reference": "lfilter_low_order_matches_general_path_bits",
       "strict_mode_response": "Provide both BA and SOS filter representations matching SciPy.",
       "hardened_mode_response": "Validate finite section coefficients and non-zero leading a0."
@@ -257,10 +257,10 @@
       "severity": "medium",
       "likelihood": "possible",
       "description": "Signal processing functions receiving non-finite samples, empty signals, or invalid cutoff frequencies.",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:8029 (butter): validates filter order, cutoff bounds in (0, 1), and sample finiteness.",
-      "test_reference": "short_time_fft_rejects_non_finite_samples",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9300 (lfilter_with_options): validates sample finiteness in Hardened mode or projects non-finite samples to 0.0 under RecoveryPolicy::Project with an audited BoundedRecovery event.",
+      "test_reference": "test_signal_hardened_nonfinite_projection_and_reject_default",
       "strict_mode_response": "Return SignalError matching SciPy ValueError.",
-      "hardened_mode_response": "Reject invalid parameters and non-finite inputs fail-closed with FailClosed audit record."
+      "hardened_mode_response": "Reject non-finite inputs with FailClosed by default, or project non-finite samples to 0.0 under RecoveryPolicy::Project with BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-018",
