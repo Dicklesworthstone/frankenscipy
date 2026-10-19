@@ -45,7 +45,7 @@ pub use evidence::{
     EvidenceValue, Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
     audit_finish, audit_recover, audit_reject,
 };
-pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
+pub use mode::{HARDENED_MAX_DIM, RecoveryPolicy, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
 pub use signals::{DecisionSignals, SignalSequence};
 pub use supervision::{PolicySupervisor, SupervisionConfig, SupervisionEvent, SupervisionStatus};
@@ -4034,7 +4034,10 @@ mod tests {
             default_p.select_action(0.0078125, None).0,
             SolverAction::PivotedQR
         );
-        assert_eq!(default_p.select_action(0.02, None).0, SolverAction::DirectLU);
+        assert_eq!(
+            default_p.select_action(0.02, None).0,
+            SolverAction::DirectLU
+        );
     }
 
     /// frankenscipy-7tb8d.3: verify the Conformal Risk Control precondition that `L_i(t)` is
@@ -4260,8 +4263,7 @@ mod tests {
             .iter()
             .filter(|e| e.rcond <= 1e-8 && e.svd_failed)
             .count();
-        let fixed_svd_rule_rate =
-            fixed_svd_rule_exceedances as f64 / shifted_held_out.len() as f64;
+        let fixed_svd_rule_rate = fixed_svd_rule_exceedances as f64 / shifted_held_out.len() as f64;
         let shifted_bwd_cal: Vec<CrcCalibrationSample> = shifted_cal
             .iter()
             .map(|e| CrcCalibrationSample {
@@ -4302,10 +4304,8 @@ mod tests {
                 escalated_exceeded: false,
             })
             .collect();
-        let fixed_rcond_held_out_rate = ConformalRiskControl::empirical_risk(
-            &shifted_fwd_held_out,
-            fixed_rcond_threshold,
-        );
+        let fixed_rcond_held_out_rate =
+            ConformalRiskControl::empirical_risk(&shifted_fwd_held_out, fixed_rcond_threshold);
         let recalibrated_fwd_crc = ConformalRiskControl::calibrate(&shifted_fwd_cal, alpha, seed);
         let recalibrated_fwd_held_out_rate = ConformalRiskControl::empirical_risk(
             &shifted_fwd_held_out,

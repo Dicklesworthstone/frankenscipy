@@ -52,4 +52,3 @@ pub(crate) const SOLVER_CRC_T_HAT: f64 = 0.0;
 /// and `PivotedQR` succeeds, allowing exact CRC threshold recomputation when `alpha` changes.
 #[rustfmt::skip]
 pub(crate) const SOLVER_CRC_EXCEEDANCE_RCONDS: [f64; 1] = [0.0078125];
-
