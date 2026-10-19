@@ -22,10 +22,10 @@
       "severity": "critical",
       "likelihood": "likely",
       "description": "Ill-conditioned or pivot-growth dense systems (e.g., Wilkinson or Hilbert matrices) defeat LU backward error.",
-      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): computes Oettli-Prager componentwise and normwise backward error, feeds outcome to CASP portfolio, and falls back to QR/SVD when backward error exceeds ATTEMPT_BACKWARD_ERROR_TOL.",
-      "test_reference": "ill_conditioned_factor_matches_lapack_not_lu",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:2806 (solve_tikhonov_regularized): computes Oettli-Prager backward error for CASP portfolio fallback and applies SVD Tikhonov regularization in Hardened mode under RecoveryPolicy::Regularize.",
+      "test_reference": "test_linalg_hardened_tikhonov_regularization_hilbert12",
       "strict_mode_response": "Evaluate CASP portfolio and fallback on backward-error failure while emitting SolveCertificate.",
-      "hardened_mode_response": "Enforce finite-input check, dimension limit, and emit AuditLedger entries for fallback and ill-conditioned warnings."
+      "hardened_mode_response": "Reject ConditionTooHigh by default or apply SVD Tikhonov regularization under RecoveryPolicy::Regularize, recording BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-002",
@@ -33,11 +33,11 @@
       "category": "malformed_input",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Singular matrices, non-square matrices, or mismatched RHS lengths passed to dense linear solvers.",
-      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:3737 (solve_with_audit): validates square matrix dimensions, RHS compatibility, and non-singularity before returning solution.",
-      "test_reference": "solve_singular_and_shape_errors",
+      "description": "Singular matrices, non-square matrices, non-finite entries, or mismatched RHS lengths passed to dense linear solvers.",
+      "mitigation": "Defended in crates/fsci-linalg/src/lib.rs:4207 (solve_with_audit): validates square matrix dimensions, RHS compatibility, and non-singularity, or projects non-finite entries to 0.0 under Hardened + RecoveryPolicy::Project.",
+      "test_reference": "test_linalg_hardened_nonfinite_projection_and_reject_default",
       "strict_mode_response": "Return Err(LinalgError::SingularMatrix) or Err(LinalgError::ShapeMismatch) matching SciPy LinAlgError.",
-      "hardened_mode_response": "Reject fail-closed and record AuditAction::FailClosed in AuditLedger."
+      "hardened_mode_response": "Reject fail-closed by default or project non-finite entries under RecoveryPolicy::Project with AuditAction::BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-003",

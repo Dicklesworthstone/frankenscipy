@@ -11282,6 +11282,7 @@ fn execute_linalg_case(case: &LinalgCase) -> Result<LinalgObservedOutcome, Linal
                     assume_a: assume_a.clone().map(Into::into),
                     lower: lower.unwrap_or(false),
                     transposed: transposed.unwrap_or(false),
+                    ..SolveOptions::default()
                 },
             )?;
             Ok(LinalgObservedOutcome::Vector {
@@ -11336,6 +11337,7 @@ fn execute_linalg_case(case: &LinalgCase) -> Result<LinalgObservedOutcome, Linal
                     assume_a: Some(MatrixAssumption::General),
                     lower: false,
                     transposed: false,
+                    ..SolveOptions::default()
                 },
             )?;
             Ok(LinalgObservedOutcome::Vector {
@@ -11389,6 +11391,7 @@ fn execute_linalg_case(case: &LinalgCase) -> Result<LinalgObservedOutcome, Linal
                     check_finite: check_finite.unwrap_or(true),
                     cond: *cond,
                     driver: LstsqDriver::default(),
+                    ..LstsqOptions::default()
                 },
             )?;
             Ok(LinalgObservedOutcome::Lstsq {
@@ -11546,6 +11549,7 @@ fn execute_linalg_case_with_differential_audit(
                     assume_a: assume_a.clone().map(Into::into),
                     lower: lower.unwrap_or(false),
                     transposed: transposed.unwrap_or(false),
+                    ..SolveOptions::default()
                 },
                 &mut portfolio,
                 audit_ledger,
@@ -11656,6 +11660,7 @@ fn execute_linalg_case_with_differential_audit(
                     cond: *cond,
                     check_finite: check_finite.unwrap_or(true),
                     driver: LstsqDriver::default(),
+                    ..LstsqOptions::default()
                 },
                 audit_ledger,
             )?;

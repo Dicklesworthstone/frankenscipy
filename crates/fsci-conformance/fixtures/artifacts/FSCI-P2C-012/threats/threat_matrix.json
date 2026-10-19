@@ -22,7 +22,7 @@
       "severity": "high",
       "likelihood": "likely",
       "description": "Catastrophic cancellation in KL divergence / relative entropy when probability distributions p and q are nearly equal.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38242 (pearsonr): uses numerically stable centered inner products and delegates kl_divergence elementwise terms to fsci_special::rel_entr (log1p).",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:38958 (pearsonr): uses numerically stable centered inner products and delegates kl_divergence elementwise terms to fsci_special::rel_entr (log1p).",
       "test_reference": "tiny_positive_diagonal_and_cholesky_keep_scale",
       "strict_mode_response": "Compute accurate relative entropy and correlation within <= 2 ULPs of reference.",
       "hardened_mode_response": "Reject non-finite or negative probability weights fail-closed."
@@ -33,11 +33,11 @@
       "category": "malformed_input",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Empty sample arrays, mismatched paired sample lengths, or non-PSD covariance matrices passed to statistical routines.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:33610 (ttest_1samp): validates sample size and finiteness before computing t-statistics and p-values.",
-      "test_reference": "cholesky_checks_later_rows_before_matrix_product",
+      "description": "Empty sample arrays, non-finite observations, mismatched paired sample lengths, or non-PSD covariance matrices passed to statistical routines.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:358 (validate_or_project_sample): validates sample size and finiteness, or projects non-finite observations under Hardened + RecoveryPolicy::Project with an audited BoundedRecovery event.",
+      "test_reference": "test_stats_mode_awareness_and_audit_emission",
       "strict_mode_response": "Return NaN or StatsError matching SciPy stats conventions.",
-      "hardened_mode_response": "Reject malformed or non-finite samples fail-closed and record AuditAction::FailClosed."
+      "hardened_mode_response": "Reject malformed or non-finite samples with AuditAction::FailClosed by default, or project non-finite observations under RecoveryPolicy::Project with AuditAction::BoundedRecovery."
     },
     {
       "threat_id": "THREAT-003",
@@ -46,7 +46,7 @@
       "severity": "medium",
       "likelihood": "possible",
       "description": "Exact permutation/rank distribution recurrences in Mann-Whitney U or KS tests blowing up on large sample sizes.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:36704 (mannwhitneyu): switches from exact dynamic programming to normal/tie-corrected asymptotic approximation above threshold or when ties are present.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:37420 (mannwhitneyu): switches from exact dynamic programming to normal/tie-corrected asymptotic approximation above threshold or when ties are present.",
       "test_reference": "record_after_poison_still_lands_in_ledger",
       "strict_mode_response": "Select exact vs asymptotic method matching SciPy auto rule.",
       "hardened_mode_response": "Bound exact table allocation size and emit audit record on error."
@@ -58,7 +58,7 @@
       "severity": "medium",
       "likelihood": "possible",
       "description": "Two-sample Kolmogorov-Smirnov p-value calculation drifting between Smirnov exact and Kolmogorov asymptotic distributions.",
-      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:47407 (kstest): dispatches one-sample and two-sample KS statistics with exact/asymp p-value evaluation matching SciPy.",
+      "mitigation": "Defended in crates/fsci-stats/src/lib.rs:48221 (kstest): dispatches one-sample and two-sample KS statistics with exact/asymp p-value evaluation matching SciPy.",
       "test_reference": "test_from_eigendecomposition",
       "strict_mode_response": "Match SciPy kstest statistic and p-value across alternatives.",
       "hardened_mode_response": "Validate finite sample observations before empirical CDF sort."

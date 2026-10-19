@@ -7,7 +7,7 @@
       "action": "select_action",
       "input_summary": "state=WellConditioned",
       "output_summary": "action=DirectLU, chosen_loss=1.03, posterior_sum=1.000000000000",
-      "duration_ns": 55484,
+      "duration_ns": 10360,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -17,7 +17,7 @@
       "action": "select_action",
       "input_summary": "state=ModerateCondition",
       "output_summary": "action=DirectLU, chosen_loss=1.00, posterior_sum=1.000000000000",
-      "duration_ns": 2994,
+      "duration_ns": 3807,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -27,7 +27,7 @@
       "action": "select_action",
       "input_summary": "state=IllConditioned",
       "output_summary": "action=DirectLU, chosen_loss=1.00, posterior_sum=1.000000000000",
-      "duration_ns": 2063,
+      "duration_ns": 3216,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -37,7 +37,7 @@
       "action": "select_action",
       "input_summary": "state=NearSingular",
       "output_summary": "action=DirectLU, chosen_loss=1.00, posterior_sum=1.000000000000",
-      "duration_ns": 1813,
+      "duration_ns": 2726,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -46,22 +46,22 @@
       "step_name": "verify_expected_selections",
       "action": "check",
       "input_summary": "well→DirectLU, ill→DirectLU (calibrated)",
-      "output_summary": "well=DirectLU, ill=DirectLU, ill_losses=[1.0, 2.0, 31.821903845312676, 0.0, 0.0, 0.5]",
-      "duration_ns": 5939,
+      "output_summary": "well=DirectLU, ill=DirectLU, ill_losses=[1.0, 2.0, 31.821903837527074, 0.0, 0.0, 0.5]",
+      "duration_ns": 5691,
       "mode": "strict",
       "outcome": "ok"
     }
   ],
   "artifacts": [],
   "environment": {
-    "rust_version": "0.2.0",
+    "rust_version": "0.3.0",
     "os": "linux",
-    "cpu_count": 8,
+    "cpu_count": 64,
     "total_memory_mb": "unknown"
   },
   "overall": {
     "status": "pass",
-    "total_duration_ns": 263434,
+    "total_duration_ns": 220999,
     "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_003_solver_selection --nocapture"
   }
 }

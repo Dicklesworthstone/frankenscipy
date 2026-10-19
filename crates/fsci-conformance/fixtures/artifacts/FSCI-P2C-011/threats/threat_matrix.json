@@ -22,7 +22,7 @@
       "severity": "high",
       "likelihood": "likely",
       "description": "High-order transfer-function (BA) IIR filtering suffers polynomial root sensitivity and state overflow.",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9924 (sosfilt): cascades biquad second-order sections with normalized a0 and validates finite section coefficients.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:10074 (sosfilt): cascades biquad second-order sections with normalized a0 and validates finite section coefficients.",
       "test_reference": "lfilter_low_order_matches_general_path_bits",
       "strict_mode_response": "Execute direct-form II transposed filtering matching SciPy.",
       "hardened_mode_response": "Reject non-finite filter coefficients or signals fail-closed."
@@ -33,11 +33,11 @@
       "category": "malformed_input",
       "severity": "high",
       "likelihood": "likely",
-      "description": "Non-finite samples or invalid normalized cutoff frequencies (Wn <= 0 or Wn >= 1) passed to filter design or STFT/CZT.",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:8029 (butter): validates filter order N >= 1 and cutoff frequencies within (0, 1) Nyquist interval.",
-      "test_reference": "short_time_fft_rejects_non_finite_samples",
+      "description": "Non-finite samples or invalid normalized cutoff frequencies (Wn <= 0 or Wn >= 1) passed to filter design or digital filters.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:9300 (lfilter_with_options): validates sample finiteness in Hardened mode or projects non-finite samples to 0.0 under RecoveryPolicy::Project with an audited BoundedRecovery event.",
+      "test_reference": "test_signal_hardened_nonfinite_projection_and_reject_default",
       "strict_mode_response": "Return Err(SignalError) on invalid cutoff or order matching SciPy ValueError.",
-      "hardened_mode_response": "Reject non-finite samples and invalid cutoffs fail-closed with FailClosed audit event."
+      "hardened_mode_response": "Reject non-finite samples with FailClosed by default, or project non-finite samples to 0.0 under RecoveryPolicy::Project with BoundedRecovery in AuditLedger."
     },
     {
       "threat_id": "THREAT-003",
@@ -46,7 +46,7 @@
       "severity": "medium",
       "likelihood": "possible",
       "description": "Degenerate chirp-z transform (CZT) or ZoomFFT parameters (m == 0 or non-finite spiral ratio) causing unbounded work or NaN output.",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:12310 (welch): validates segment lengths, overlap bounds, and finite samples before spectral estimation.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:12549 (welch): validates segment lengths, overlap bounds, and finite samples before spectral estimation.",
       "test_reference": "czt_and_zoom_fft_reject_non_finite_samples",
       "strict_mode_response": "Return Err(SignalError) on invalid segment/overlap or non-finite CZT parameters.",
       "hardened_mode_response": "Reject degenerate spectral parameters fail-closed and record FailClosed in AuditLedger."
@@ -58,7 +58,7 @@
       "severity": "medium",
       "likelihood": "possible",
       "description": "Peak detection (find_peaks) prominence, width, and plateau conditions drifting from SciPy _peak_finding_utils.",
-      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:4132 (find_peaks): evaluates plateau, height, threshold, distance, prominence, and width filters in SciPy's exact order.",
+      "mitigation": "Defended in crates/fsci-signal/src/lib.rs:4192 (find_peaks): evaluates plateau, height, threshold, distance, prominence, and width filters in SciPy's exact order.",
       "test_reference": "short_time_fft_matches_scipy",
       "strict_mode_response": "Match SciPy find_peaks indices and properties dictionary.",
       "hardened_mode_response": "Validate distance >= 1 and finite signal samples before peak scan."
