@@ -393,8 +393,10 @@ pub use orthopoly::{
     ts_roots, u_roots, us_roots,
 };
 pub use types::{
-    Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, SpecialTraceEntry, take_special_traces,
+    Complex64, DispatchPlan, DispatchStep, HARDENED_MAX_BATCH_LEN, KernelRegime, SpecialError,
+    SpecialErrorKind, SpecialResult, SpecialTensor, SpecialTraceEntry, check_hardened_batch_len,
+    check_hardened_tensor_len, hardened_max_batch_len, take_special_traces,
+    with_hardened_max_batch_len,
 };
 
 /// SciPy-compatible type alias for [`SpecialError`], matching `scipy.special.SpecialFunctionError`.
@@ -3982,6 +3984,161 @@ mod tests {
                 (got - want).abs() < 1e-10,
                 "cbrt({x}) got {got}, expected {want} at index {i}"
             );
+        }
+    }
+
+    #[test]
+    fn hardened_special_resource_cap_boundary_and_audit() {
+        use fsci_runtime::{AuditAction, RuntimeMode};
+
+        with_hardened_max_batch_len(4, || {
+            let cap_minus_one = SpecialTensor::RealVec(vec![0.5, 1.0, 1.5]);
+            let cap_exact = SpecialTensor::RealVec(vec![0.5, 1.0, 1.5, 2.0]);
+            let cap_plus_one = SpecialTensor::RealVec(vec![0.5, 1.0, 1.5, 2.0, 2.5]);
+
+            gamma(&cap_minus_one, RuntimeMode::Hardened)
+                .expect("cap - 1 batch must succeed in Hardened mode");
+            gamma(&cap_exact, RuntimeMode::Hardened)
+                .expect("exact cap batch must succeed in Hardened mode");
+            erf(&cap_exact, RuntimeMode::Hardened)
+                .expect("erf at exact cap must succeed in Hardened mode");
+            j0(&cap_exact, RuntimeMode::Hardened)
+                .expect("j0 at exact cap must succeed in Hardened mode");
+            ellipk(&SpecialTensor::RealVec(vec![0.1, 0.2, 0.3, 0.4]), RuntimeMode::Hardened)
+                .expect("ellipk at exact cap must succeed in Hardened mode");
+            ndtr(&cap_exact, RuntimeMode::Hardened)
+                .expect("ndtr at exact cap must succeed in Hardened mode");
+            airy(&cap_exact, RuntimeMode::Hardened)
+                .expect("airy at exact cap must succeed in Hardened mode");
+
+            let _ = take_special_traces();
+            let err = gamma(&cap_plus_one, RuntimeMode::Hardened)
+                .expect_err("cap + 1 batch must fail closed in Hardened mode");
+            assert_eq!(err.kind, SpecialErrorKind::ResourceExhausted);
+            let traces = take_special_traces();
+            assert!(
+                traces.iter().any(|t| t.category == "resource_exhausted"),
+                "expected resource_exhausted trace entry, got: {traces:?}"
+            );
+
+            let ledger = sync_audit_ledger();
+            let err_audit = gamma_with_audit(&cap_plus_one, RuntimeMode::Hardened, &ledger)
+                .expect_err("gamma_with_audit cap + 1 must fail closed");
+            assert_eq!(err_audit.kind, SpecialErrorKind::ResourceExhausted);
+            let events = ledger.lock().expect("lock").entries().to_vec();
+            assert_eq!(events.len(), 1);
+            assert!(
+                matches!(
+                    &events[0].action,
+                    AuditAction::FailClosed { reason } if reason == "resource_exhausted"
+                ),
+                "expected FailClosed(resource_exhausted), got: {:?}",
+                events[0].action
+            );
+
+            for (name, res) in [
+                ("erf", erf(&cap_plus_one, RuntimeMode::Hardened)),
+                ("erfc", erfc(&cap_plus_one, RuntimeMode::Hardened)),
+                (
+                    "erfinv",
+                    erfinv(
+                        &SpecialTensor::RealVec(vec![0.1, 0.2, 0.3, 0.4, 0.5]),
+                        RuntimeMode::Hardened,
+                    ),
+                ),
+                ("j0", j0(&cap_plus_one, RuntimeMode::Hardened)),
+                (
+                    "jv",
+                    jv(
+                        &SpecialTensor::RealScalar(1.0),
+                        &cap_plus_one,
+                        RuntimeMode::Hardened,
+                    ),
+                ),
+                (
+                    "beta",
+                    beta(
+                        &SpecialTensor::RealScalar(1.0),
+                        &cap_plus_one,
+                        RuntimeMode::Hardened,
+                    ),
+                ),
+                (
+                    "ellipk",
+                    ellipk(
+                        &SpecialTensor::RealVec(vec![0.1, 0.2, 0.3, 0.4, 0.5]),
+                        RuntimeMode::Hardened,
+                    ),
+                ),
+                ("ndtr", ndtr(&cap_plus_one, RuntimeMode::Hardened)),
+                (
+                    "hyp1f1",
+                    hyp1f1(
+                        &SpecialTensor::RealScalar(1.0),
+                        &SpecialTensor::RealScalar(2.0),
+                        &cap_plus_one,
+                        RuntimeMode::Hardened,
+                    ),
+                ),
+            ] {
+                let e = res.expect_err("cap + 1 must fail closed in Hardened mode");
+                assert_eq!(
+                    e.kind,
+                    SpecialErrorKind::ResourceExhausted,
+                    "{name} expected ResourceExhausted"
+                );
+            }
+
+            let airy_err = airy(&cap_plus_one, RuntimeMode::Hardened)
+                .expect_err("airy cap + 1 must fail closed");
+            assert_eq!(airy_err.kind, SpecialErrorKind::ResourceExhausted);
+
+            // Strict mode bypasses the cap
+            gamma(&cap_plus_one, RuntimeMode::Strict)
+                .expect("Strict mode must bypass hardened batch cap");
+        });
+    }
+
+    #[test]
+    fn strict_special_500_calls_bit_identical() {
+        use fsci_runtime::RuntimeMode;
+
+        let input = SpecialTensor::RealVec(vec![0.25, 0.5, 0.75, 1.25, 2.5]);
+        let baseline_gamma = match gamma(&input, RuntimeMode::Strict).expect("gamma strict") {
+            SpecialTensor::RealVec(v) => v,
+            other => panic!("expected RealVec, got {other:?}"),
+        };
+        let baseline_erf = match erf(&input, RuntimeMode::Strict).expect("erf strict") {
+            SpecialTensor::RealVec(v) => v,
+            other => panic!("expected RealVec, got {other:?}"),
+        };
+        let baseline_j0 = match j0(&input, RuntimeMode::Strict).expect("j0 strict") {
+            SpecialTensor::RealVec(v) => v,
+            other => panic!("expected RealVec, got {other:?}"),
+        };
+
+        for _ in 0..500 {
+            let g = match gamma(&input, RuntimeMode::Strict).expect("gamma strict") {
+                SpecialTensor::RealVec(v) => v,
+                other => panic!("expected RealVec, got {other:?}"),
+            };
+            let e = match erf(&input, RuntimeMode::Strict).expect("erf strict") {
+                SpecialTensor::RealVec(v) => v,
+                other => panic!("expected RealVec, got {other:?}"),
+            };
+            let j = match j0(&input, RuntimeMode::Strict).expect("j0 strict") {
+                SpecialTensor::RealVec(v) => v,
+                other => panic!("expected RealVec, got {other:?}"),
+            };
+            for (a, b) in baseline_gamma.iter().zip(g.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            for (a, b) in baseline_erf.iter().zip(e.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            for (a, b) in baseline_j0.iter().zip(j.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
         }
     }
 }

@@ -8,7 +8,7 @@ use fsci_runtime::RuntimeMode;
 
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_tensor_len, record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_gated};
 
@@ -73,6 +73,7 @@ const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 const TWO_INV_SQRT_PI: f64 = 2.0 * INV_SQRT_PI;
 
 pub fn erf(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("erf", mode, z)?;
     // Same SIMD lever as erfc (2c9c639b): the |x|≤1 rational is a byte-identical SIMD
     // Horner, and the |x|>1 tail is `sign(x)·(1 − exp(−x²)·erfcx_cephes(|x|))` — the
     // exp via `simd_exp` (≤4 ulp) and the rational SIMD. Below the parallel gate, where
@@ -133,6 +134,7 @@ fn erf_real_vec_simd(values: &[f64]) -> Vec<f64> {
 }
 
 pub fn erfc(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("erfc", mode, z)?;
     // The scalar-per-element serial map lost ~1.4x to SciPy's SIMD-vectorized ufunc
     // (broad sweep 2a032a74). erfc(x) = exp(−x²)·(P/Q or R/S) for 1 ≤ x < 25, so both
     // the Cephes rational (byte-identical SIMD Horner) and the exp (`simd_exp`, ≤4 ulp
@@ -211,6 +213,7 @@ pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 fn erfinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("erfinv", mode, y)?;
     // Infallible batch. `erfinv_scalar` can only return `Err` on an out-of-domain input, so
     // an array with none cannot fail, and building a `Result<f64, SpecialError>` — two
     // `&'static str` plus two enums, around 56 bytes — for every element of it is pure
@@ -266,6 +269,7 @@ pub fn erfcinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 fn erfcinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("erfcinv", mode, y)?;
     // The arm is read ONCE for the whole batch and passed down as a `bool`, never read per
     // element: a relaxed load inside a per-item loop is an optimisation barrier this crate
     // has already paid 13% for, and a per-element `fetch_add` costs 2 instructions more.
@@ -360,6 +364,7 @@ where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
     G: Fn(Complex64) -> Result<Complex64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => real_kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {

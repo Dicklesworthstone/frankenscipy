@@ -17,7 +17,8 @@ use fsci_runtime::RuntimeMode;
 
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_batch_len, check_hardened_tensor_len,
+    record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_gated};
 
@@ -147,6 +148,7 @@ pub fn ellipkinc(
     m_tensor: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_batch_len("ellipkinc", mode, phi_tensor.len().max(m_tensor.len()))?;
     if let (SpecialTensor::RealScalar(phi), SpecialTensor::RealVec(m_values)) =
         (phi_tensor, m_tensor)
     {
@@ -1417,6 +1419,7 @@ where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
     G: Fn(Complex64) -> Result<Complex64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => real_kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -1463,6 +1466,7 @@ where
     F: Fn(f64, f64) -> Result<f64, SpecialError> + Sync,
     G: Fn(Complex64, Complex64) -> Result<Complex64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, lhs.len().max(rhs.len()))?;
     match (lhs, rhs) {
         (SpecialTensor::Empty, _) | (_, SpecialTensor::Empty) => {
             record_special_trace(

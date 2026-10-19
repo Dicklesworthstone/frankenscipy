@@ -6,7 +6,7 @@ use fsci_runtime::RuntimeMode;
 
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_tensor_len, record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_gated};
 
@@ -101,6 +101,7 @@ impl ComplexAiryResult {
 ///
 /// Matches `scipy.special.airy(x)` which returns `(Ai, Aip, Bi, Bip)`.
 pub fn airy(x: &SpecialTensor, mode: RuntimeMode) -> Result<Vec<SpecialTensor>, SpecialError> {
+    check_hardened_tensor_len("airy", mode, x)?;
     match x {
         SpecialTensor::RealScalar(val) => {
             let result = airy_scalar(*val, mode)?;
@@ -178,6 +179,7 @@ pub fn airy(x: &SpecialTensor, mode: RuntimeMode) -> Result<Vec<SpecialTensor>, 
 ///
 /// Matches `scipy.special.airye(x)`, returning `(eAi, eAip, eBi, eBip)`.
 pub fn airye(x: &SpecialTensor, mode: RuntimeMode) -> Result<Vec<SpecialTensor>, SpecialError> {
+    check_hardened_tensor_len("airye", mode, x)?;
     match x {
         SpecialTensor::RealScalar(val) => {
             let result = airye_scalar(*val, mode)?;
@@ -900,6 +902,7 @@ where
     F: Fn(AiryResult) -> f64 + Sync,
     G: Fn(ComplexAiryResult) -> Complex64 + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => airy_scalar(*x, mode)
             .map(real_kernel)

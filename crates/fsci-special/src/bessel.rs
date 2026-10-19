@@ -7,7 +7,8 @@ use fsci_runtime::RuntimeMode;
 use crate::gamma::gamma_scalar;
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_batch_len, check_hardened_tensor_len,
+    not_yet_implemented, record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_with_threads};
 
@@ -1420,6 +1421,7 @@ fn bessel_derivative_dispatch(
     kind: BesselKind,
     rule: DerivativeRule,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, v.len().max(z.len()))?;
     let eval_real = |order: f64, x: f64| {
         bessel_derivative_real_scalar(function, order, x, derivative_order, mode, kind, rule)
     };
@@ -1629,6 +1631,7 @@ fn hankel_derivative_dispatch(
     mode: RuntimeMode,
     kind: HankelKind,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, v.len().max(z.len()))?;
     let eval_real = |order: f64, x: f64| {
         hankel_derivative_real_scalar(function, order, x, derivative_order, mode, kind)
     };
@@ -3280,6 +3283,7 @@ fn spherical_bessel_dispatch(
     mode: RuntimeMode,
     kind: SphericalKind,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, n.len().max(z.len()))?;
     // Per-element real spherical Bessel kernel; pure in (order, x) given fixed kind/mode,
     // so the real array arms below fan out across cores bit-identically via par_map_indices.
     let eval = |order: f64, x: f64| -> Result<f64, SpecialError> {
@@ -4134,6 +4138,7 @@ fn map_real_input<F>(
 where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -4263,6 +4268,7 @@ fn map_real_ternary<F>(
 where
     F: Fn(f64, f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()).max(c.len()))?;
     match (a, b, c) {
         (
             SpecialTensor::RealScalar(av),
@@ -4315,6 +4321,7 @@ fn map_real_binary<F>(
 where
     F: Fn(f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, lhs.len().max(rhs.len()))?;
     match (lhs, rhs) {
         (SpecialTensor::RealScalar(left), SpecialTensor::RealScalar(right)) => {
             kernel(*left, *right).map(SpecialTensor::RealScalar)
@@ -5990,6 +5997,7 @@ fn hankel_dispatch(
     mode: RuntimeMode,
     kind: HankelKind,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, v.len().max(z.len()))?;
     match (v, z) {
         (SpecialTensor::RealScalar(order), SpecialTensor::RealScalar(x)) => {
             hankel_real_scalar(function, *order, *x, mode, kind).map(SpecialTensor::ComplexScalar)
@@ -6080,6 +6088,7 @@ fn scaled_hankel_dispatch(
     kind: HankelKind,
     scale: HankelScale,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, v.len().max(z.len()))?;
     match (v, z) {
         (SpecialTensor::RealScalar(order), SpecialTensor::RealScalar(x)) => {
             hankel_real_scalar(function, *order, *x, mode, kind)
@@ -6238,6 +6247,7 @@ fn bessel_dispatch(
     mode: RuntimeMode,
     kind: BesselKind,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, v.len().max(z.len()))?;
     // Per-element real-order Bessel kernel (J_v/Y_v/I_v/K_v + scaled). Pure function of
     // (order, x) given the fixed `kind`/`mode`, so the array arms below fan out across cores
     // bit-identically via par_map_indices.

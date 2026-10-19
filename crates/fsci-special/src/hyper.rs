@@ -8,7 +8,7 @@ use crate::convenience::erfcx_scalar;
 use crate::gamma::{gammaincc_scalar, log_gammaincc_scalar};
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor,
+    SpecialResult, SpecialTensor, check_hardened_batch_len,
 };
 
 pub const HYPER_DISPATCH_PLAN: &[DispatchPlan] = &[
@@ -711,6 +711,7 @@ fn hyp1f1_dispatch(
     z: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()).max(z.len()))?;
     // Check for empty tensors
     if matches!(a, SpecialTensor::Empty)
         || matches!(b, SpecialTensor::Empty)
@@ -775,6 +776,7 @@ fn hyperu_dispatch(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()).max(x.len()))?;
     if matches!(a, SpecialTensor::Empty)
         || matches!(b, SpecialTensor::Empty)
         || matches!(x, SpecialTensor::Empty)
@@ -1017,6 +1019,7 @@ fn tensor_get_complex(t: &SpecialTensor, i: usize, len: usize) -> Result<Complex
 /// # Returns
 /// Value of 0F1(; b; z)
 pub fn hyp0f1(b: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_batch_len("hyp0f1", mode, b.len().max(z.len()))?;
     match (b, z) {
         (SpecialTensor::RealScalar(b_val), SpecialTensor::RealScalar(z_val)) => {
             let result = hyp0f1_scalar(*b_val, *z_val, mode)?;
@@ -1845,6 +1848,11 @@ fn hyp2f1_dispatch(
     z: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_batch_len(
+        function,
+        mode,
+        a.len().max(b.len()).max(c.len()).max(z.len()),
+    )?;
     // Check for empty tensors
     if matches!(a, SpecialTensor::Empty)
         || matches!(b, SpecialTensor::Empty)

@@ -23,7 +23,8 @@ use fsci_runtime::RuntimeMode;
 
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_batch_len, check_hardened_tensor_len,
+    record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_with_threads, par_map_light, par_map_moderate};
 
@@ -325,6 +326,7 @@ pub fn expit(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// Matches `scipy.special.logit(p)`.
 /// Domain: p in (0, 1).
 pub fn logit(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("logit", mode, p_tensor)?;
     // Only a Hardened refusal can fail, so an array without one maps the kernel directly rather
     // than building a Result per element.
     if let SpecialTensor::RealVec(values) = p_tensor
@@ -363,6 +365,7 @@ pub fn rel_entr(
 ///
 /// Matches `scipy.special.ndtr(x)`.
 pub fn ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("ndtr", mode, x_tensor)?;
     // ndtr(x) = ½·erfc(−x/√2); the scalar-per-element map lost to SciPy's SIMD ndtr
     // ufunc. Reuse the full-domain SIMD erfc chunk (byte-identical for |−x/√2| < 1,
     // a few ulp on the tail — far inside ndtr's tolerance). Below the 1<<20 gate.
@@ -407,6 +410,7 @@ pub fn ndtr_scalar(x: f64) -> f64 {
 /// Matches `scipy.special.ndtri(y)`. Under `errstate`, `y` outside `[0, 1]` is SciPy's
 /// "domain error".
 pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("ndtri", mode, y_tensor)?;
     // The evaluator choice is read ONCE per call, never per element.
     let unrolled = NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
     if unrolled {
@@ -3078,6 +3082,7 @@ fn map_real_light<F>(
 where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     if let SpecialTensor::RealVec(values) = input
         && values.len() >= LIGHT_KERNEL_PAR_MIN
     {
@@ -3143,6 +3148,7 @@ fn map_real_inner<F>(
 where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -3185,6 +3191,7 @@ where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
     G: Fn(Complex64) -> Result<Complex64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => real_kernel(*x).map(SpecialTensor::RealScalar),
         // Moderate real kernels (erfcx/erfi/dawsn/spence/wrightomega, ~50-300ns/elt)
@@ -3285,6 +3292,7 @@ fn map_real_binary_gated<F>(
 where
     F: Fn(f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, lhs.len().max(rhs.len()))?;
     match (lhs, rhs) {
         (SpecialTensor::RealScalar(left), SpecialTensor::RealScalar(right)) => {
             kernel(*left, *right).map(SpecialTensor::RealScalar)
@@ -3351,6 +3359,11 @@ fn map_real_ternary<F>(
 where
     F: Fn(f64, f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(
+        function,
+        mode,
+        first.len().max(second.len()).max(third.len()),
+    )?;
     fn broadcast_len(tensor: &SpecialTensor) -> Option<usize> {
         match tensor {
             SpecialTensor::RealScalar(_) => Some(1),
@@ -5958,6 +5971,7 @@ pub fn inv_boxcox1p_scalar(y: f64, lam: f64) -> f64 {
 ///
 /// Matches `scipy.special.log_ndtr`.
 pub fn log_ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("log_ndtr", mode, x_tensor)?;
     if let SpecialTensor::RealVec(values) = x_tensor
         && (64..(1 << 20)).contains(&values.len())
     {
@@ -6227,6 +6241,7 @@ pub fn log1pmx_scalar(x: f64) -> f64 {
 /// [`wofz_scalar`]). Real inputs are returned as complex values because SciPy
 /// exposes `wofz` as a complex-valued function.
 pub fn wofz(z_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("wofz", mode, z_tensor)?;
     match z_tensor {
         SpecialTensor::RealScalar(x) => Ok(SpecialTensor::ComplexScalar(wofz_scalar(
             Complex64::from_real(*x),

@@ -6,7 +6,8 @@ use fsci_runtime::RuntimeMode;
 
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_batch_len, check_hardened_tensor_len,
+    not_yet_implemented, record_special_trace,
 };
 use crate::{par_map_indices, par_map_light};
 
@@ -183,7 +184,11 @@ pub fn gamma_with_audit(
 ) -> SpecialResult {
     let result = gamma_dispatch("gamma", z, mode);
     if let Err(err) = &result {
-        let reason = format!("gamma::{:?}", err.kind);
+        let reason = if err.kind == SpecialErrorKind::ResourceExhausted {
+            "resource_exhausted".to_string()
+        } else {
+            format!("gamma::{:?}", err.kind)
+        };
         let mut fingerprinter = fsci_runtime::Fingerprinter::new("fsci_special::gamma");
         crate::audit::fingerprint_tensor(&mut fingerprinter, z);
         let fingerprint = fingerprinter.str(&format!("{mode:?}")).finish();
@@ -200,6 +205,7 @@ pub fn gammaln(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("gammasgn", mode, x)?;
     // Only a Hardened pole can fail, so an array without one maps the kernel directly rather
     // than building a Result per element.
     if let SpecialTensor::RealVec(values) = x
@@ -406,6 +412,7 @@ fn first_hardened_failure(values: &[f64], mode: RuntimeMode, include_zero: bool)
 }
 
 fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len(function, mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => gamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -476,6 +483,7 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
 }
 
 fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len(function, mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => gammaln_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -562,6 +570,7 @@ fn loggamma_dispatch(
     z: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_tensor_len(function, mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => loggamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -615,6 +624,7 @@ pub fn psi(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len(function, mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => digamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -698,6 +708,7 @@ fn gammainc_dispatch(
     mode: RuntimeMode,
     lower: bool,
 ) -> SpecialResult {
+    check_hardened_batch_len(function, mode, a.len().max(x.len()))?;
     if let Some(values) = incomplete_gamma_real_batch(a, x, mode, lower) {
         return Ok(SpecialTensor::RealVec(values));
     }
@@ -1015,6 +1026,7 @@ fn polygamma_dispatch(
     z: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    check_hardened_tensor_len(function, mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => {
             let result = match n {
@@ -1055,6 +1067,7 @@ fn polygamma_dispatch(
 }
 
 pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("rgamma", mode, z)?;
     match z {
         SpecialTensor::RealScalar(x) => rgamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -1284,6 +1297,7 @@ fn map_real_input_rp<F>(
 where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_tensor_len(function, mode, input)?;
     match input {
         SpecialTensor::RealScalar(x) => kernel(*x).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
@@ -4234,6 +4248,7 @@ pub fn perm(n: u64, k: u64) -> f64 {
 /// Matches `scipy.special.zeta(s)` and uses the same parallel RealVec dispatch
 /// shape as the gamma-family tensor entry points.
 pub fn zeta(s_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    check_hardened_tensor_len("zeta", mode, s_tensor)?;
     if let SpecialTensor::RealVec(values) = s_tensor
         && let Some(out) = zeta_positive_affine_vec(values)
     {

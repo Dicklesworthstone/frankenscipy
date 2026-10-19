@@ -5,7 +5,8 @@ use fsci_runtime::RuntimeMode;
 use crate::gamma;
 use crate::types::{
     Complex64, DispatchPlan, DispatchStep, KernelRegime, SpecialError, SpecialErrorKind,
-    SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
+    SpecialResult, SpecialTensor, check_hardened_batch_len, not_yet_implemented,
+    record_special_trace,
 };
 use crate::{par_map_indices, par_map_indices_gated};
 
@@ -121,6 +122,7 @@ fn map_complex_binary<F>(
 where
     F: Fn(Complex64, Complex64) -> Complex64 + Sync,
 {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()))?;
     match (a, b) {
         (SpecialTensor::ComplexScalar(lhs), SpecialTensor::ComplexScalar(rhs)) => {
             Ok(SpecialTensor::ComplexScalar(kernel(*lhs, *rhs)))
@@ -3804,6 +3806,7 @@ fn map_real_binary<F>(
 where
     F: Fn(f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()))?;
     match (a, b) {
         (SpecialTensor::RealScalar(lhs), SpecialTensor::RealScalar(rhs)) => {
             kernel(*lhs, *rhs).map(SpecialTensor::RealScalar)
@@ -3876,6 +3879,7 @@ fn map_real_ternary<F>(
 where
     F: Fn(f64, f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()).max(c.len()))?;
     match (a, b, c) {
         (
             SpecialTensor::RealScalar(av),
@@ -3933,6 +3937,7 @@ pub(crate) fn broadcast_real_ternary<F>(
 where
     F: Fn(f64, f64, f64) -> Result<f64, SpecialError> + Sync,
 {
+    check_hardened_batch_len(function, mode, a.len().max(b.len()).max(c.len()))?;
     let args = [a, b, c];
     let all_real = args
         .iter()

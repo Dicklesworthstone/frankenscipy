@@ -238,6 +238,23 @@ pub enum SpecialTensor {
     ComplexVec(Vec<Complex64>),
 }
 
+impl SpecialTensor {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::RealScalar(_) | Self::ComplexScalar(_) => 1,
+            Self::RealVec(values) => values.len(),
+            Self::ComplexVec(values) => values.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelRegime {
     Series,
@@ -272,6 +289,8 @@ pub enum SpecialErrorKind {
     SingularityRisk,
     NotYetImplemented,
     ShapeMismatch,
+    /// Hardened-mode batch resource cap exceeded.
+    ResourceExhausted,
     /// SciPy's `SpecialFunctionError`: an error class set to "raise" by `seterr`/`errstate`.
     Errstate(crate::SpecialErrorCode),
 }
@@ -297,6 +316,76 @@ impl fmt::Display for SpecialError {
 impl std::error::Error for SpecialError {}
 
 pub type SpecialResult = Result<SpecialTensor, SpecialError>;
+
+/// Hardened-mode maximum element count for batched special-function evaluations.
+pub const HARDENED_MAX_BATCH_LEN: usize = 1_000_000;
+
+std::thread_local! {
+    static HARDENED_MAX_BATCH_LEN_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Returns the active Hardened-mode batch length cap.
+#[must_use]
+pub fn hardened_max_batch_len() -> usize {
+    HARDENED_MAX_BATCH_LEN_OVERRIDE
+        .with(|slot| slot.get())
+        .unwrap_or(HARDENED_MAX_BATCH_LEN)
+}
+
+/// Temporarily overrides the Hardened-mode batch length cap on the current thread.
+pub fn with_hardened_max_batch_len<R>(max_batch_len: usize, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<usize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HARDENED_MAX_BATCH_LEN_OVERRIDE.with(|slot| slot.set(self.0));
+        }
+    }
+    let prev = HARDENED_MAX_BATCH_LEN_OVERRIDE.with(|slot| {
+        let old = slot.get();
+        slot.set(Some(max_batch_len));
+        old
+    });
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Enforce the Hardened-mode batch length cap prior to output allocation.
+pub fn check_hardened_batch_len(
+    function: &'static str,
+    mode: RuntimeMode,
+    len: usize,
+) -> Result<(), SpecialError> {
+    if mode == RuntimeMode::Hardened {
+        let cap = hardened_max_batch_len();
+        if len > cap {
+            record_special_trace(
+                function,
+                mode,
+                "resource_exhausted",
+                format!("batch_len={len},limit={cap}"),
+                "fail_closed",
+                "ResourceExhausted",
+                false,
+            );
+            return Err(SpecialError {
+                function,
+                kind: SpecialErrorKind::ResourceExhausted,
+                mode,
+                detail: "hardened batch length exceeds HARDENED_MAX_BATCH_LEN",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Enforce the Hardened-mode batch length cap for a `SpecialTensor` prior to output allocation.
+pub fn check_hardened_tensor_len(
+    function: &'static str,
+    mode: RuntimeMode,
+    tensor: &SpecialTensor,
+) -> Result<(), SpecialError> {
+    check_hardened_batch_len(function, mode, tensor.len())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecialTraceEntry {
