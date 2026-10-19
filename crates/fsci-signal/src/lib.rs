@@ -40,9 +40,69 @@
 //! `Display` text.
 
 pub use fsci_runtime::{
-    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RecoveryPolicy, RuntimeMode,
+    SyncSharedAuditLedger,
 };
 use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
+
+/// Options for mode-aware and bounded-recovery signal filter routines (`frankenscipy-3cu8u.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalOptions {
+    pub mode: RuntimeMode,
+    pub recovery: RecoveryPolicy,
+}
+
+impl Default for SignalOptions {
+    fn default() -> Self {
+        Self {
+            mode: RuntimeMode::Strict,
+            recovery: RecoveryPolicy::Reject,
+        }
+    }
+}
+
+impl SignalOptions {
+    #[must_use]
+    pub const fn new(mode: RuntimeMode) -> Self {
+        Self {
+            mode,
+            recovery: RecoveryPolicy::Reject,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_recovery(mut self, recovery: RecoveryPolicy) -> Self {
+        self.recovery = recovery;
+        self
+    }
+}
+
+/// Output of a mode-aware signal filter (`lfilter_with_options`, `sosfilt_with_options`),
+/// carrying the filtered signal and `recovered: true` when Hardened bounded recovery was applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalFilterResult {
+    pub y: Vec<f64>,
+    pub recovered: bool,
+}
+
+fn project_non_finite_signal(x: &[f64]) -> Option<(Vec<f64>, usize, String)> {
+    if x.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut fp = Fingerprinter::new("fsci_signal::nonfinite_positions");
+    let mut count = 0usize;
+    let mut projected = Vec::with_capacity(x.len());
+    for (idx, &v) in x.iter().enumerate() {
+        if v.is_finite() {
+            projected.push(v);
+        } else {
+            projected.push(0.0);
+            count += 1;
+            fp.usize(idx);
+        }
+    }
+    Some((projected, count, fp.finish()))
+}
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -9229,6 +9289,100 @@ pub fn lfilter(
     lfilter_with_state(b, a, x, zi).map(|(y, _zf)| y)
 }
 
+/// Mode-aware and audit-emitting digital IIR filter (`frankenscipy-3cu8u.3`).
+///
+/// In `RuntimeMode::Strict`, delegates directly to [`lfilter`] with `recovered: false`.
+/// In `RuntimeMode::Hardened`, enforces [`HARDENED_MAX_DIM`] and either rejects non-finite
+/// input samples (`RecoveryPolicy::Reject`, the default) or projects `NaN`/`±Inf` samples to
+/// `0.0` (`RecoveryPolicy::Project` / `ProjectNonFinite` / `ProjectAndRegularize`), recording
+/// `AuditAction::BoundedRecovery { recovery_action: "nonfinite_projection" }` with the W5.1
+/// fingerprint of the original unprojected input and setting `recovered: true`.
+pub fn lfilter_with_options(
+    b: &[f64],
+    a: &[f64],
+    x: &[f64],
+    zi: Option<&[f64]>,
+    options: SignalOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<SignalFilterResult, SignalError> {
+    if options.mode == RuntimeMode::Strict {
+        let y = lfilter(b, a, x, zi)?;
+        return Ok(SignalFilterResult {
+            y,
+            recovered: false,
+        });
+    }
+
+    let make_fp = || {
+        Fingerprinter::new("fsci_signal::lfilter_with_options")
+            .f64s(b)
+            .f64s(a)
+            .f64s(x)
+            .opt(zi, |f, z| f.f64s(z))
+            .str(&format!("{:?}", options.mode))
+            .str(&format!("{:?}", options.recovery))
+            .finish()
+    };
+
+    if x.len() > HARDENED_MAX_DIM {
+        let err = SignalError::InvalidInputLength {
+            expected: HARDENED_MAX_DIM,
+            actual: x.len(),
+        };
+        if let Some(ledger) = ledger {
+            let fp = make_fp();
+            record_fail_closed(
+                ledger,
+                &fp,
+                "dimension_cap_exceeded",
+                &format!("rejected: {err}"),
+            );
+        }
+        return Err(err);
+    }
+
+    let mut recovered = false;
+    let projected_buf: Option<Vec<f64>> =
+        if let Some((proj_x, count, positions_digest)) = project_non_finite_signal(x) {
+            if options.recovery.allows_projection() {
+                recovered = true;
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_bounded_recovery(
+                        ledger,
+                        &fp,
+                        "nonfinite_projection",
+                        &format!("count={count}, positions_digest={positions_digest}"),
+                    );
+                }
+                Some(proj_x)
+            } else {
+                let err = SignalError::NonFiniteInput {
+                    detail: "lfilter input samples must be finite".to_string(),
+                };
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+                }
+                return Err(err);
+            }
+        } else {
+            None
+        };
+
+    let effective_x = projected_buf.as_deref().unwrap_or(x);
+    match lfilter(b, a, effective_x, zi) {
+        Ok(y) => Ok(SignalFilterResult { y, recovered }),
+        Err(err) => {
+            if let Some(ledger) = ledger {
+                let fp = make_fp();
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Apply a digital IIR filter and return the final delay state.
 ///
 /// Matches the `(y, zf)` result from `scipy.signal.lfilter(b, a, x, zi=zi)`.
@@ -9976,6 +10130,99 @@ pub fn sosfilt(sos: &[SosSection], x: &[f64]) -> Result<Vec<f64>, SignalError> {
     }
 
     Ok(signal)
+}
+
+/// Mode-aware and audit-emitting cascaded second-order section filter (`frankenscipy-3cu8u.3`).
+///
+/// In `RuntimeMode::Strict`, delegates directly to [`sosfilt`] with `recovered: false`.
+/// In `RuntimeMode::Hardened`, enforces [`HARDENED_MAX_DIM`] and either rejects non-finite
+/// input samples (`RecoveryPolicy::Reject`, the default) or projects `NaN`/`±Inf` samples to
+/// `0.0` (`RecoveryPolicy::Project` / `ProjectNonFinite` / `ProjectAndRegularize`), recording
+/// `AuditAction::BoundedRecovery { recovery_action: "nonfinite_projection" }` with the W5.1
+/// fingerprint of the original unprojected input and setting `recovered: true`.
+pub fn sosfilt_with_options(
+    sos: &[SosSection],
+    x: &[f64],
+    options: SignalOptions,
+    ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<SignalFilterResult, SignalError> {
+    if options.mode == RuntimeMode::Strict {
+        let y = sosfilt(sos, x)?;
+        return Ok(SignalFilterResult {
+            y,
+            recovered: false,
+        });
+    }
+
+    let make_fp = || {
+        let mut fp = Fingerprinter::new("fsci_signal::sosfilt_with_options");
+        fp.usize(sos.len());
+        for sec in sos {
+            fp.f64s(sec);
+        }
+        fp.f64s(x)
+            .str(&format!("{:?}", options.mode))
+            .str(&format!("{:?}", options.recovery))
+            .finish()
+    };
+
+    if x.len() > HARDENED_MAX_DIM {
+        let err = SignalError::InvalidInputLength {
+            expected: HARDENED_MAX_DIM,
+            actual: x.len(),
+        };
+        if let Some(ledger) = ledger {
+            let fp = make_fp();
+            record_fail_closed(
+                ledger,
+                &fp,
+                "dimension_cap_exceeded",
+                &format!("rejected: {err}"),
+            );
+        }
+        return Err(err);
+    }
+
+    let mut recovered = false;
+    let projected_buf: Option<Vec<f64>> =
+        if let Some((proj_x, count, positions_digest)) = project_non_finite_signal(x) {
+            if options.recovery.allows_projection() {
+                recovered = true;
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_bounded_recovery(
+                        ledger,
+                        &fp,
+                        "nonfinite_projection",
+                        &format!("count={count}, positions_digest={positions_digest}"),
+                    );
+                }
+                Some(proj_x)
+            } else {
+                let err = SignalError::NonFiniteInput {
+                    detail: "sosfilt input samples must be finite".to_string(),
+                };
+                if let Some(ledger) = ledger {
+                    let fp = make_fp();
+                    record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+                }
+                return Err(err);
+            }
+        } else {
+            None
+        };
+
+    let effective_x = projected_buf.as_deref().unwrap_or(x);
+    match sosfilt(sos, effective_x) {
+        Ok(y) => Ok(SignalFilterResult { y, recovered }),
+        Err(err) => {
+            if let Some(ledger) = ledger {
+                let fp = make_fp();
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            Err(err)
+        }
+    }
 }
 
 /// One homogeneous (`x = 0`) cascade step of the SOS recurrence on the flat composite
@@ -35870,5 +36117,82 @@ mod jyfke_trailing_trim_is_exact {
             &dd,
             &[1.0, -1.925628730795577, 0.9354144241119485],
         );
+    }
+
+    #[test]
+    fn test_signal_hardened_nonfinite_projection_and_reject_default() {
+        let b = [0.5, 0.5];
+        let a = [1.0, -0.2];
+        let x_bad = [1.0, f64::NAN, 3.0, 4.0];
+        let x_projected = [1.0, 0.0, 3.0, 4.0];
+
+        // 1. Default RecoveryPolicy::Reject rejects non-finite x in Hardened mode
+        let ledger_reject = sync_audit_ledger();
+        let err = lfilter_with_options(
+            &b,
+            &a,
+            &x_bad,
+            None,
+            SignalOptions::new(RuntimeMode::Hardened),
+            Some(&ledger_reject),
+        )
+        .expect_err("Hardened + Reject must reject NaN");
+        assert!(matches!(err, SignalError::NonFiniteInput { .. }));
+        assert_eq!(ledger_reject.lock().unwrap().entries().len(), 1);
+        assert!(matches!(
+            ledger_reject.lock().unwrap().entries()[0].action,
+            AuditAction::FailClosed { .. }
+        ));
+
+        // 2. RecoveryPolicy::Project in Hardened mode projects NaN -> 0.0, sets recovered=true,
+        //    and emits BoundedRecovery with count=1 and positions_digest.
+        let ledger_proj = sync_audit_ledger();
+        let res = lfilter_with_options(
+            &b,
+            &a,
+            &x_bad,
+            None,
+            SignalOptions::new(RuntimeMode::Hardened).with_recovery(RecoveryPolicy::Project),
+            Some(&ledger_proj),
+        )
+        .expect("Hardened + Project must recover from single NaN");
+        assert!(res.recovered);
+        let expected_y = lfilter(&b, &a, &x_projected, None).unwrap();
+        for (u, v) in res.y.iter().zip(expected_y.iter()) {
+            assert_eq!(u.to_bits(), v.to_bits());
+        }
+
+        let guard = ledger_proj.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        let entry = &guard.entries()[0];
+        assert!(entry.input_fingerprint.starts_with("blake3:"));
+        match &entry.action {
+            AuditAction::BoundedRecovery { recovery_action } => {
+                assert_eq!(recovery_action, "nonfinite_projection");
+            }
+            other => panic!("expected BoundedRecovery, got {other:?}"),
+        }
+        assert!(entry.outcome.contains("count=1"));
+        assert!(entry.outcome.contains("positions_digest="));
+
+        // 3. sosfilt_with_options also supports RecoveryPolicy::Project vs Reject
+        let sos: [[f64; 6]; 1] = [[0.5, 0.5, 0.0, 1.0, -0.2, 0.0]];
+        let ledger_sos = sync_audit_ledger();
+        let sos_res = sosfilt_with_options(
+            &sos,
+            &x_bad,
+            SignalOptions::new(RuntimeMode::Hardened).with_recovery(RecoveryPolicy::Project),
+            Some(&ledger_sos),
+        )
+        .expect("sosfilt Hardened + Project must recover");
+        assert!(sos_res.recovered);
+        let expected_sos = sosfilt(&sos, &x_projected).unwrap();
+        for (u, v) in sos_res.y.iter().zip(expected_sos.iter()) {
+            assert_eq!(u.to_bits(), v.to_bits());
+        }
+        let guard_sos = ledger_sos.lock().unwrap();
+        assert_eq!(guard_sos.entries().len(), 1);
+        assert!(guard_sos.entries()[0].outcome.contains("count=1"));
+        assert!(guard_sos.entries()[0].outcome.contains("positions_digest="));
     }
 }
