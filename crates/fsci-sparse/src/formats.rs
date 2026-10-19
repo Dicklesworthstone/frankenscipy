@@ -44,12 +44,91 @@ pub enum SparseError {
         message: String,
         partial: Box<crate::linalg::EigsResult>,
     },
+    /// Hardened mode resource limit exceeded (`HARDENED_MAX_DIM` or `HARDENED_MAX_NNZ`).
+    #[error("resource exhausted: {message}")]
+    ResourceExhausted { message: String },
+}
+
+/// Default Hardened-mode upper bound on sparse matrix row/column dimension (`10_000_000`).
+pub const HARDENED_MAX_DIM: usize = 10_000_000;
+
+/// Default Hardened-mode upper bound on sparse matrix stored nonzeros (`100_000_000`).
+pub const HARDENED_MAX_NNZ: usize = 100_000_000;
+
+std::thread_local! {
+    static HARDENED_SPARSE_CAPS_OVERRIDE: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Active `(max_dim, max_nnz)` limits enforced in [`RuntimeMode::Hardened`].
+#[must_use]
+pub fn hardened_sparse_caps() -> (usize, usize) {
+    HARDENED_SPARSE_CAPS_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or((HARDENED_MAX_DIM, HARDENED_MAX_NNZ))
+}
+
+/// Run `f` with a scoped `(max_dim, max_nnz)` override for [`RuntimeMode::Hardened`] checks.
+pub fn with_hardened_sparse_caps<R>(max_dim: usize, max_nnz: usize, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<(usize, usize)>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HARDENED_SPARSE_CAPS_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = HARDENED_SPARSE_CAPS_OVERRIDE.with(|cell| cell.replace(Some((max_dim, max_nnz))));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Pre-allocation Hardened-mode dimension and `nnz` guard (`frankenscipy-3cu8u.4`).
+///
+/// In [`RuntimeMode::Hardened`], rejects `shape.rows > max_dim`, `shape.cols > max_dim`, or
+/// `nnz > max_nnz` before allocating work buffers, recording one `AuditAction::FailClosed`
+/// with reason `"resource_exhausted"` when `audit` is present. In [`RuntimeMode::Strict`],
+/// this check is a no-op.
+pub fn check_hardened_sparse_cap(
+    shape: Shape2D,
+    nnz: usize,
+    mode: RuntimeMode,
+    audit: Option<&fsci_runtime::AuditScope<'_>>,
+) -> SparseResult<()> {
+    if mode != RuntimeMode::Hardened {
+        return Ok(());
+    }
+    let (max_dim, max_nnz) = hardened_sparse_caps();
+    if shape.rows > max_dim || shape.cols > max_dim {
+        let message = format!(
+            "sparse matrix dimension ({}x{}) exceeds hardened limit ({max_dim})",
+            shape.rows, shape.cols
+        );
+        fsci_runtime::audit_reject(
+            audit,
+            "resource_exhausted",
+            &format!("rejected: {message}"),
+        );
+        return Err(SparseError::ResourceExhausted { message });
+    }
+    if nnz > max_nnz {
+        let message = format!(
+            "sparse matrix nnz ({nnz}) exceeds hardened limit ({max_nnz})"
+        );
+        fsci_runtime::audit_reject(
+            audit,
+            "resource_exhausted",
+            &format!("rejected: {message}"),
+        );
+        return Err(SparseError::ResourceExhausted { message });
+    }
+    Ok(())
 }
 
 impl SparseError {
     /// The audit reason code of this error; audited APIs prefix it with their operation, as
-    /// in `spsolve_with_casp::singular_matrix` (frankenscipy-3cu8u.2).
-    pub(crate) const fn reason_code(&self) -> &'static str {
+    /// in `spsolve_with_casp::singular_matrix` (frankenscipy-3cu8u.2), except
+    /// `ResourceExhausted` which always uses `"resource_exhausted"` (frankenscipy-3cu8u.4).
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidShape { .. } => "invalid_shape",
             Self::InvalidSparseStructure { .. } => "invalid_sparse_structure",
@@ -62,6 +141,7 @@ impl SparseError {
             Self::SingularMatrix { .. } => "singular_matrix",
             Self::NegativeCycle { .. } => "negative_cycle",
             Self::EigsNoConvergence { .. } => "eigs_no_convergence",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
         }
     }
 }

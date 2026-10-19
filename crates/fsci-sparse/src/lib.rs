@@ -38,9 +38,10 @@ pub use construct::{
 pub use formats::{
     BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooArray,
     CooMatrix, CscMatrix, CscMatrixView, CsrMatrix, CsrMatrixView, DiaMatrix, DokMatrix,
-    IndexArray, IndexArrayRef, IndexDtype, LilMatrix, NalgebraBridge, Shape2D, SparseArray2D,
-    SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec,
-    get_index_dtype, safely_cast_index_arrays,
+    HARDENED_MAX_DIM, HARDENED_MAX_NNZ, IndexArray, IndexArrayRef, IndexDtype, LilMatrix,
+    NalgebraBridge, Shape2D, SparseArray2D, SparseError, SparseFormat, SparseIndexArrays,
+    SparseIndexSource, SparseResult, SparseSliceSpec, check_hardened_sparse_cap, get_index_dtype,
+    hardened_sparse_caps, safely_cast_index_arrays, with_hardened_sparse_caps,
 };
 pub use interface::{
     AdjointOperator, DenseLinearOperator, FunctionOperator, IdentityOperator, LinearOperator,
@@ -295,8 +296,9 @@ pub use linalg::{
 };
 pub use ops::{
     ConversionLogEntry, FormatConvertible, add_coo, add_csc, add_csr, coo_to_csr_with_mode,
-    csc_to_csr_with_mode, csr_to_csc_with_mode, find, scale_coo, scale_csc, scale_csr, spmv_coo,
-    spmv_csc, spmv_csr, sub_coo, sub_csc, sub_csr, tril, tril_array, triu, triu_array,
+    coo_to_csr_with_mode_and_audit, csc_to_csr_with_mode, csr_to_csc_with_mode, find, scale_coo,
+    scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr, sub_coo, sub_csc, sub_csr, tril,
+    tril_array, triu, triu_array,
 };
 pub use scipy_aliases::*;
 
@@ -3522,4 +3524,222 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn hardened_sparse_resource_cap_boundary_and_audit() {
+        use fsci_runtime::{AuditAction, RuntimeMode, SparseSolverPortfolio};
+
+        assert_eq!(HARDENED_MAX_DIM, 10_000_000);
+        assert_eq!(HARDENED_MAX_NNZ, 100_000_000);
+
+        // 1. Pre-allocation dimension cap on COO -> CSR at HARDENED_MAX_DIM + 1 (allocates only 1 triplet)
+        let over_dim_coo = CooMatrix::from_triplets(
+            Shape2D::new(HARDENED_MAX_DIM + 1, HARDENED_MAX_DIM + 1),
+            vec![1.0],
+            vec![0],
+            vec![0],
+            false,
+        )
+        .expect("O(1) triplet COO construction");
+        let ledger = sync_audit_ledger();
+        let err = coo_to_csr_with_mode_and_audit(
+            &over_dim_coo,
+            RuntimeMode::Hardened,
+            "test-over-dim",
+            &ledger,
+        )
+        .expect_err("HARDENED_MAX_DIM + 1 must fail closed before CSR indptr allocation");
+        assert!(matches!(err, SparseError::ResourceExhausted { .. }));
+        assert_eq!(err.reason_code(), "resource_exhausted");
+        let guard = ledger.lock().expect("lock");
+        assert_eq!(guard.entries().len(), 1);
+        assert_eq!(
+            guard.entries()[0].action,
+            AuditAction::FailClosed {
+                reason: "resource_exhausted".to_string()
+            }
+        );
+        drop(guard);
+
+        // 2. Boundary checks (cap vs cap + 1) across solvers using scoped hardened cap override
+        let mat4 = eye(4).expect("4x4 eye");
+        let mat4_csc = mat4.to_csc().expect("4x4 eye csc");
+        let rhs4 = [1.0, 2.0, 3.0, 4.0];
+
+        with_hardened_sparse_caps(4, 4, || {
+            let ok = spsolve(
+                &mat4,
+                &rhs4,
+                SolveOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..SolveOptions::default()
+                },
+            );
+            assert!(ok.is_ok(), "at exact cap (dim=4, nnz=4) must succeed");
+        });
+
+        // Dimension cap exceeded (max_dim = 3, actual = 4)
+        with_hardened_sparse_caps(3, 10, || {
+            let ledger = sync_audit_ledger();
+            let mut portfolio = SparseSolverPortfolio::new(RuntimeMode::Hardened, 8);
+            let err = spsolve_with_audit(
+                &mat4,
+                &rhs4,
+                SolveOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..SolveOptions::default()
+                },
+                &mut portfolio,
+                &ledger,
+            )
+            .expect_err("dim=4 > cap=3 must fail closed in Hardened mode");
+            assert!(matches!(err, SparseError::ResourceExhausted { .. }));
+            let guard = ledger.lock().expect("lock");
+            assert_eq!(guard.entries().len(), 1);
+            assert_eq!(
+                guard.entries()[0].action,
+                AuditAction::FailClosed {
+                    reason: "resource_exhausted".to_string()
+                }
+            );
+            drop(guard);
+
+            // Strict mode ignores Hardened resource caps
+            let strict_ok = spsolve(
+                &mat4,
+                &rhs4,
+                SolveOptions {
+                    mode: RuntimeMode::Strict,
+                    ..SolveOptions::default()
+                },
+            );
+            assert!(strict_ok.is_ok(), "Strict mode must not enforce Hardened caps");
+        });
+
+        // NNZ cap exceeded (max_nnz = 3, actual = 4) across splu, spilu, expm, and iterative solvers
+        with_hardened_sparse_caps(10, 3, || {
+            let lu_err = splu(
+                &mat4_csc,
+                LuOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..LuOptions::default()
+                },
+            )
+            .expect_err("splu must fail closed when nnz > cap");
+            assert!(matches!(lu_err, SparseError::ResourceExhausted { .. }));
+
+            let ilu_err = spilu(
+                &mat4_csc,
+                IluOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..IluOptions::default()
+                },
+            )
+            .expect_err("spilu must fail closed when nnz > cap");
+            assert!(matches!(ilu_err, SparseError::ResourceExhausted { .. }));
+
+            let expm_err = expm(
+                &mat4,
+                ExpmOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..ExpmOptions::default()
+                },
+            )
+            .expect_err("expm must fail closed when nnz > cap");
+            assert!(matches!(expm_err, SparseError::ResourceExhausted { .. }));
+
+            let iter_opts = IterativeSolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..IterativeSolveOptions::default()
+            };
+            assert!(matches!(
+                cg(&mat4, &rhs4, None, iter_opts),
+                Err(SparseError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                gmres(&mat4, &rhs4, None, iter_opts),
+                Err(SparseError::ResourceExhausted { .. })
+            ));
+
+            let ledger = sync_audit_ledger();
+            let casp_err = casp_iterative_solve_with_audit(
+                &mat4,
+                &rhs4,
+                None,
+                CaspIterativeSolveOptions {
+                    iterative: iter_opts,
+                    ..CaspIterativeSolveOptions::default()
+                },
+                &ledger,
+            )
+            .expect_err("casp_iterative_solve_with_audit must fail closed when nnz > cap");
+            assert!(matches!(casp_err, SparseError::ResourceExhausted { .. }));
+            let guard = ledger.lock().expect("lock");
+            assert_eq!(guard.entries().len(), 1);
+            assert_eq!(
+                guard.entries()[0].action,
+                AuditAction::FailClosed {
+                    reason: "resource_exhausted".to_string()
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn strict_sparse_500_calls_bit_identical() {
+        let n = 6;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            vals.push(4.0 + (i as f64) * 0.25);
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                vals.push(-1.0);
+                rows.push(i + 1);
+                cols.push(i);
+                vals.push(-1.0);
+            }
+        }
+        let csr = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, false)
+            .unwrap()
+            .to_csr()
+            .unwrap();
+        let csc = csr.to_csc().unwrap();
+
+        for call_idx in 0..500usize {
+            let rhs: Vec<f64> = (0..n)
+                .map(|j| ((call_idx + 1) as f64) * 0.1 + (j as f64) * 0.3)
+                .collect();
+            let s1 = spsolve(&csr, &rhs, SolveOptions::default()).unwrap();
+            let s2 = with_hardened_sparse_caps(1, 1, || {
+                spsolve(&csr, &rhs, SolveOptions::default()).unwrap()
+            });
+            for (a, b) in s1.solution.iter().zip(s2.solution.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "spsolve strict bit-identity at call {call_idx}");
+            }
+
+            let f1 = splu(&csc, LuOptions::default()).unwrap();
+            let lu1 = splu_solve(&f1, &rhs).unwrap();
+            let lu2 = with_hardened_sparse_caps(1, 1, || {
+                let f2 = splu(&csc, LuOptions::default()).unwrap();
+                splu_solve(&f2, &rhs).unwrap()
+            });
+            for (a, b) in lu1.iter().zip(lu2.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "splu strict bit-identity at call {call_idx}");
+            }
+
+            let cg1 = cg(&csr, &rhs, None, IterativeSolveOptions::default()).unwrap();
+            let cg2 = with_hardened_sparse_caps(1, 1, || {
+                cg(&csr, &rhs, None, IterativeSolveOptions::default()).unwrap()
+            });
+            for (a, b) in cg1.solution.iter().zip(cg2.solution.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "cg strict bit-identity at call {call_idx}");
+            }
+        }
+    }
 }
+

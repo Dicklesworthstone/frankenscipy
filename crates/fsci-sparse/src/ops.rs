@@ -240,6 +240,44 @@ pub fn coo_to_csr_with_mode(
     mode: RuntimeMode,
     operation_id: impl Into<String>,
 ) -> SparseResult<(CsrMatrix, ConversionLogEntry)> {
+    coo_to_csr_with_mode_inner(coo, mode, operation_id, None)
+}
+
+/// Audit-emitting variant of [`coo_to_csr_with_mode`] (`frankenscipy-3cu8u.4`).
+pub fn coo_to_csr_with_mode_and_audit(
+    coo: &CooMatrix,
+    mode: RuntimeMode,
+    operation_id: impl Into<String>,
+    ledger: &crate::audit::SyncSharedAuditLedger,
+) -> SparseResult<(CsrMatrix, ConversionLogEntry)> {
+    let operation_id: String = operation_id.into();
+    let fingerprint = || {
+        fsci_runtime::Fingerprinter::new("fsci_sparse::coo_to_csr_with_mode")
+            .shape(&[coo.shape().rows, coo.shape().cols])
+            .usize(coo.nnz())
+            .f64s(coo.data())
+            .str(&format!("{mode:?}"))
+            .str(&operation_id)
+            .finish()
+    };
+    let audit = fsci_runtime::AuditScope::new(ledger, &fingerprint);
+    let result = coo_to_csr_with_mode_inner(coo, mode, operation_id.as_str(), Some(&audit));
+    audit.finish(result, |error| {
+        if matches!(error, SparseError::ResourceExhausted { .. }) {
+            "resource_exhausted".to_string()
+        } else {
+            format!("coo_to_csr::{}", error.reason_code())
+        }
+    })
+}
+
+fn coo_to_csr_with_mode_inner(
+    coo: &CooMatrix,
+    mode: RuntimeMode,
+    operation_id: impl Into<String>,
+    audit: Option<&fsci_runtime::AuditScope<'_>>,
+) -> SparseResult<(CsrMatrix, ConversionLogEntry)> {
+    crate::formats::check_hardened_sparse_cap(coo.shape(), coo.nnz(), mode, audit)?;
     let mut csr = coo.to_csr()?;
     if mode == RuntimeMode::Hardened {
         csr.canonical.sorted_indices = true;
@@ -288,7 +326,11 @@ pub fn csr_to_csc_with_mode_and_audit(
     let audit = fsci_runtime::AuditScope::new(ledger, &fingerprint);
     let result = csr_to_csc_with_mode_inner(csr, mode, operation_id.as_str(), Some(&audit));
     audit.finish(result, |error| {
-        format!("csr_to_csc::{}", error.reason_code())
+        if matches!(error, SparseError::ResourceExhausted { .. }) {
+            "resource_exhausted".to_string()
+        } else {
+            format!("csr_to_csc::{}", error.reason_code())
+        }
     })
 }
 
@@ -298,6 +340,7 @@ fn csr_to_csc_with_mode_inner(
     operation_id: impl Into<String>,
     audit: Option<&fsci_runtime::AuditScope<'_>>,
 ) -> SparseResult<(CscMatrix, ConversionLogEntry)> {
+    crate::formats::check_hardened_sparse_cap(csr.shape(), csr.nnz(), mode, audit)?;
     if mode == RuntimeMode::Hardened && !csr.canonical.sorted_indices {
         fsci_runtime::audit_reject(audit, "csr_to_csc::unsorted_indices", "rejected");
         return Err(SparseError::InvalidSparseStructure {
@@ -325,6 +368,7 @@ pub fn csc_to_csr_with_mode(
     mode: RuntimeMode,
     operation_id: impl Into<String>,
 ) -> SparseResult<(CsrMatrix, ConversionLogEntry)> {
+    crate::formats::check_hardened_sparse_cap(csc.shape(), csc.nnz(), mode, None)?;
     if mode == RuntimeMode::Hardened && !csc.canonical.sorted_indices {
         return Err(SparseError::InvalidSparseStructure {
             message: "hardened conversion requires sorted CSC indices".to_string(),

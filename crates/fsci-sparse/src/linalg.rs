@@ -19,7 +19,9 @@ use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
 
 use crate::construct::eye;
-use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
+use crate::formats::{
+    CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult, check_hardened_sparse_cap,
+};
 // `CooMatrix` is used only by test fixtures in this file, so it is imported under
 // `cfg(test)` rather than added to the line above — an unconditional import would be
 // unused in the library build. Seven `#[cfg(test)] mod` blocks reach for it as
@@ -5933,6 +5935,7 @@ fn spsolve_banded_direct(
 
 pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<SolveResult> {
     let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
     if !shape.is_square() {
         return Err(SparseError::InvalidShape {
             message: "spsolve requires a square matrix".to_string(),
@@ -6113,6 +6116,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
 
 pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactorization> {
     let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
     if !shape.is_square() {
         return Err(SparseError::InvalidShape {
             message: "splu requires a square matrix".to_string(),
@@ -6539,6 +6543,7 @@ const ILU_NONE: usize = usize::MAX;
 /// SciPy raises "Factor is exactly singular".
 pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactorization> {
     let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
     if !shape.is_square() {
         return Err(SparseError::InvalidShape {
             message: "spilu requires a square matrix".to_string(),
@@ -8164,6 +8169,7 @@ fn kth_largest(values: &[f64], k: usize) -> f64 {
 /// `fsci_linalg::expm` after densifying the input matrix.
 pub fn expm(a: &CsrMatrix, options: ExpmOptions) -> SparseResult<Vec<Vec<f64>>> {
     let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
     if !shape.is_square() {
         return Err(SparseError::InvalidShape {
             message: "expm requires a square matrix".to_string(),
@@ -8383,6 +8389,8 @@ fn validate_iterative_finite_inputs(
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<()> {
+    let nnz = a.as_csr().map_or(b.len(), CsrMatrix::nnz);
+    check_hardened_sparse_cap(a.shape(), nnz, options.mode, None)?;
     if !options.tol.is_finite() || options.tol < 0.0 {
         return Err(SparseError::InvalidArgument {
             message: "tol must be finite and non-negative".to_string(),
@@ -12358,7 +12366,11 @@ pub fn casp_iterative_solve_with_audit(
     // frankenscipy-3cu8u.2: an error is one fail-closed event, as
     // `casp_iterative_solve::<error kind>`.
     let solved = audit.finish(casp_iterative_solve_inner(a, b, x0, options), |error| {
-        format!("casp_iterative_solve::{}", error.reason_code())
+        if matches!(error, SparseError::ResourceExhausted { .. }) {
+            "resource_exhausted".to_string()
+        } else {
+            format!("casp_iterative_solve::{}", error.reason_code())
+        }
     })?;
     audit.recover(
         &format!(
@@ -12929,7 +12941,11 @@ pub fn spsolve_with_audit(
     let audit = AuditScope::new(audit_ledger, &fingerprint);
     let result = spsolve_with_casp_internal(a, b, options, portfolio, Some(&audit));
     audit.finish(result, |error| {
-        format!("spsolve_with_casp::{}", error.reason_code())
+        if matches!(error, SparseError::ResourceExhausted { .. }) {
+            "resource_exhausted".to_string()
+        } else {
+            format!("spsolve_with_casp::{}", error.reason_code())
+        }
     })
 }
 
@@ -12941,6 +12957,7 @@ fn spsolve_with_casp_internal(
     audit: Option<&AuditScope<'_>>,
 ) -> SparseResult<SolveResult> {
     let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, audit)?;
     if !shape.is_square() {
         audit_reject(
             audit,
