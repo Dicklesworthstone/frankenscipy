@@ -709,3 +709,17 @@ path = "fuzz_targets/p2c007_stats_qmc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "p2c002_linalg_rcond_flood"
+path = "fuzz_targets/p2c002_linalg_rcond_flood.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_symmetry"
+path = "fuzz_targets/audit_symmetry.rs"
+test = false
+doc = false
+bench = false
