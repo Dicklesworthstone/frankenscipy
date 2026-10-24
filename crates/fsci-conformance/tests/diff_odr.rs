@@ -29,11 +29,14 @@ struct OdrCase {
     we: Vec<f64>,
     wd: Vec<f64>,
     beta0: Vec<f64>,
+    sclb: Option<Vec<f64>>,
+    scld: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     points: Vec<OdrCase>,
+    analytic_jacobian: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +46,7 @@ struct OracleCase {
     cov_beta: Vec<Vec<f64>>,
     sd_beta: Vec<f64>,
     res_var: f64,
+    info: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +60,7 @@ struct FsciCaseResult {
     cov_beta: Vec<Vec<f64>>,
     sd_beta: Vec<f64>,
     res_var: f64,
+    success: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +113,7 @@ fn generate_query() -> OracleQuery {
     let x = (0..7).map(f64::from).collect::<Vec<_>>();
     let y = vec![1.20, 2.90, 5.15, 6.80, 9.10, 10.95, 13.12];
     OracleQuery {
+        analytic_jacobian: false,
         points: vec![
             OdrCase {
                 case_id: "linear_equal_input_response_weights",
@@ -116,6 +122,8 @@ fn generate_query() -> OracleQuery {
                 we: vec![1.0; y.len()],
                 wd: vec![1.0; x.len()],
                 beta0: vec![1.5, 0.5],
+                sclb: None,
+                scld: None,
             },
             OdrCase {
                 case_id: "linear_stronger_input_weight",
@@ -124,6 +132,8 @@ fn generate_query() -> OracleQuery {
                 we: vec![1.0; x.len()],
                 wd: vec![4.0; x.len()],
                 beta0: vec![1.5, 0.5],
+                sclb: None,
+                scld: None,
             },
         ],
     }
@@ -187,9 +197,14 @@ for case in query["points"]:
     we = np.array(case["we"], dtype=float)
     wd = np.array(case["wd"], dtype=float)
     beta0 = np.array(case["beta0"], dtype=float)
-    model = odr.Model(lambda beta, x: beta[0] * x + beta[1])
+    model = (odr.unilinear if query["analytic_jacobian"]
+             else odr.Model(lambda beta, x: beta[0] * x + beta[1]))
     data = odr.Data(x, y, we=we, wd=wd)
-    out = odr.ODR(data, model, beta0=beta0).run()
+    solver = odr.ODR(data, model, beta0=beta0,
+                     sclb=case["sclb"], scld=case["scld"])
+    if query["analytic_jacobian"]:
+        solver.set_job(deriv=3)
+    out = solver.run()
     cov = np.asarray(out.cov_beta, dtype=float)
     points.append({
         "case_id": case["case_id"],
@@ -197,6 +212,7 @@ for case in query["points"]:
         "cov_beta": [[float(v) for v in row] for row in cov.tolist()],
         "sd_beta": [float(v) for v in out.sd_beta],
         "res_var": float(out.res_var),
+        "info": int(out.info),
     })
 
 print(json.dumps({"points": points}))
@@ -262,8 +278,19 @@ fn run_fsci_case(case: &OdrCase) -> TestResult<FsciCaseResult> {
         .map_err(|err| format!("set odr response weights: {err}"))?
         .with_input_weights(case.wd.clone())
         .map_err(|err| format!("set odr input weights: {err}"))?;
-    let output = ODR::new(data, unilinear(), case.beta0.clone())
-        .map_err(|err| format!("build odr solver: {err}"))?
+    let mut solver = ODR::new(data, unilinear(), case.beta0.clone())
+        .map_err(|err| format!("build odr solver: {err}"))?;
+    if let Some(scale) = &case.sclb {
+        solver = solver
+            .with_beta_scale(scale.clone())
+            .map_err(|err| format!("set sclb: {err}"))?;
+    }
+    if let Some(scale) = &case.scld {
+        solver = solver
+            .with_input_scale(scale.clone())
+            .map_err(|err| format!("set scld: {err}"))?;
+    }
+    let output = solver
         .run()
         .map_err(|err| format!("run odr solver: {err}"))?;
     Ok(FsciCaseResult {
@@ -271,6 +298,7 @@ fn run_fsci_case(case: &OdrCase) -> TestResult<FsciCaseResult> {
         cov_beta: output.cov_beta,
         sd_beta: output.sd_beta,
         res_var: output.res_var,
+        success: output.success,
     })
 }
 
@@ -454,6 +482,102 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
             "scipy.odr covariance conformance failed: {} cases, max_rel={max_rel}",
             diffs.len()
         ));
+    }
+    ledger.finish(query.points.len());
+    Ok(())
+}
+
+#[test]
+fn diff_odr_mixed_magnitude_scaling() -> TestResult<()> {
+    const SCALE_REL_TOL: f64 = 1e-6;
+    let mut points = Vec::new();
+    for (ids, x_scale, beta, beta0, sclb, noise) in [
+        (
+            ["tiny_default", "tiny_explicit"],
+            1e-9,
+            [2.0, 1e-9],
+            [1.0, 2e-9],
+            [0.5, 1e9],
+            1e-12,
+        ),
+        (
+            ["large_slope_default", "large_slope_explicit"],
+            1e-3,
+            [1e3, 0.25],
+            [5e2, 0.5],
+            [1e-3, 1.0],
+            1e-3,
+        ),
+        (
+            ["small_slope_default", "small_slope_explicit"],
+            1e3,
+            [1e-3, 0.25],
+            [5e-4, 0.5],
+            [1e3, 1.0],
+            1e-3,
+        ),
+    ] {
+        let x: Vec<f64> = (0..13).map(|i| (f64::from(i) - 6.0) * x_scale).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| beta[0] * v + beta[1] + noise * (0.7 * i as f64).sin())
+            .collect();
+        for (explicit, case_id) in ids.into_iter().enumerate() {
+            points.push(OdrCase {
+                case_id,
+                x: x.clone(),
+                y: y.clone(),
+                we: vec![1.0; y.len()],
+                wd: vec![1.0; x.len()],
+                beta0: beta0.to_vec(),
+                sclb: (explicit == 1).then(|| sclb.to_vec()),
+                scld: (explicit == 1).then(|| vec![1.0 / x_scale]),
+            });
+        }
+    }
+    // unilinear() supplies analytic Jacobians in Rust. Give ODRPACK the same
+    // derivatives so tiny-variable covariance is not limited by finite-difference
+    // roundoff in the oracle. The original covariance test retains its FD oracle.
+    let query = OracleQuery {
+        points,
+        analytic_jacobian: true,
+    };
+    let Some(oracle) = scipy_oracle_or_skip(&query)? else {
+        return Ok(());
+    };
+    assert_eq!(oracle.points.len(), query.points.len());
+    let mut ledger = CompareLedger::new("diff_odr_mixed_magnitude_scaling", &["beta", "cov_diag"]);
+    for (case, expected) in query.points.iter().zip(&oracle.points) {
+        assert_eq!(case.case_id, expected.case_id);
+        assert!(
+            (1..=3).contains(&(expected.info % 10)),
+            "{}: SciPy info={}",
+            case.case_id,
+            expected.info
+        );
+        let actual = run_fsci_case(case)?;
+        assert!(actual.success, "{}: fsci did not converge", case.case_id);
+        let expected_diag = diagonal(&expected.cov_beta);
+        let actual_diag = diagonal(&actual.cov_beta);
+        for (arm, expected_values, actual_values) in [
+            ("beta", expected.beta.as_slice(), actual.beta.as_slice()),
+            ("cov_diag", expected_diag.as_slice(), actual_diag.as_slice()),
+        ] {
+            if let Some((s, f)) = ledger.slices(
+                arm,
+                case.case_id,
+                Some(expected_values),
+                Some(actual_values),
+            ) {
+                let error = max_rel_diff_vec(f, s);
+                println!(
+                    "ODR scaling {} {arm}: SciPy={s:?} fsci={f:?} relative_error={error:.3e}",
+                    case.case_id
+                );
+                ledger.compared(arm, case.case_id, error <= SCALE_REL_TOL);
+            }
+        }
     }
     ledger.finish(query.points.len());
     Ok(())

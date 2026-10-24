@@ -354,6 +354,13 @@ pub struct ODR {
     pub delta0: Option<Vec<f64>>,
     pub ifixb: Option<Vec<bool>>,
     pub ifixx: Option<Vec<bool>>,
+    /// Positive parameter scale factors (`scipy.odr.ODR(sclb=...)`). A parameter
+    /// change is measured as `sclb[k] * delta_beta[k]`; `None` uses ODRPACK's DSCLB rule.
+    pub sclb: Option<Vec<f64>>,
+    /// Positive input-correction scale factors (`scld`). Supply one per input
+    /// coordinate, one per flattened input value, or one shared value. `None`
+    /// uses ODRPACK's DSCLD rule separately for each input coordinate.
+    pub scld: Option<Vec<f64>>,
     pub options: OdrOptions,
 }
 
@@ -367,6 +374,8 @@ impl ODR {
             delta0: None,
             ifixb: None,
             ifixx: None,
+            sclb: None,
+            scld: None,
             options: OdrOptions::default(),
         })
     }
@@ -434,6 +443,24 @@ impl ODR {
         Ok(self)
     }
 
+    /// Set positive finite scale factors for the model parameters. The factors
+    /// multiply parameter changes, so parameters of size `1e-9` and `1e3` can
+    /// be put on comparable scales with factors `1e9` and `1e-3`.
+    pub fn with_beta_scale(mut self, sclb: Vec<f64>) -> Result<Self, OdrError> {
+        validate_scale("sclb", &sclb, self.beta0.len())?;
+        self.sclb = Some(sclb);
+        Ok(self)
+    }
+
+    /// Set input-correction scales in the same observation-major order as
+    /// [`Data::x`]. A single value broadcasts to every input; a vector of one
+    /// value per coordinate broadcasts over observations.
+    pub fn with_input_scale(mut self, scld: Vec<f64>) -> Result<Self, OdrError> {
+        expand_input_scale(&scld, self.data.x.len(), self.data.response()?.len())?;
+        self.scld = Some(scld);
+        Ok(self)
+    }
+
     pub fn set_job(&mut self, fit_type: FitType) {
         self.options.fit_type = fit_type;
     }
@@ -488,6 +515,23 @@ impl ODR {
             });
         }
 
+        let beta_scale = self
+            .sclb
+            .clone()
+            .unwrap_or_else(|| odrpack_beta_scale(&self.beta0));
+        validate_scale("sclb", &beta_scale, self.beta0.len())?;
+        let delta_scale = match self.scld.as_deref() {
+            Some(values) => expand_input_scale(values, self.data.x.len(), y.len())?,
+            None => odrpack_input_scale(&self.data.x, y.len()),
+        };
+        validate_scale("scld", &delta_scale, self.data.x.len())?;
+        let variable_scale = pack_variables(
+            &beta_scale,
+            &delta_scale,
+            &free_beta_indices,
+            &free_delta_indices,
+        );
+
         let delta0 = self
             .delta0
             .clone()
@@ -524,6 +568,7 @@ impl ODR {
             delta_template: &delta0,
             free_beta: &free_beta_indices,
             free_delta: &free_delta_indices,
+            scale: &variable_scale,
             diff_step: self.options.diff_step,
         };
         // The structured (Schur-eliminated) path is valid only for scalar
@@ -551,6 +596,7 @@ impl ODR {
                 &residuals,
                 |x: &[f64], r: &[f64]| ctx.dense_jac(&residuals, x, r),
                 &variable0,
+                &variable_scale,
                 self.options,
             )?;
             SolvedFit {
@@ -613,7 +659,7 @@ impl ODR {
                 columns,
                 observed_rows,
                 sum_square,
-                &self.beta0,
+                &beta_scale,
                 &free_beta_indices,
             )
         };
@@ -970,6 +1016,73 @@ fn validate_weight_vec(name: &str, values: &[f64], expected_len: usize) -> Resul
     Ok(())
 }
 
+fn validate_scale(name: &str, values: &[f64], expected_len: usize) -> Result<(), OdrError> {
+    if values.len() != expected_len {
+        return Err(OdrError::InvalidArgument {
+            detail: format!(
+                "{name} must contain {expected_len} values, got {}",
+                values.len()
+            ),
+        });
+    }
+    for (i, &value) in values.iter().enumerate() {
+        if !(value > 0.0 && value.is_finite()) {
+            return Err(OdrError::InvalidArgument {
+                detail: format!("{name}[{i}] must be positive and finite, got {value}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn expand_input_scale(
+    values: &[f64],
+    inputs: usize,
+    observations: usize,
+) -> Result<Vec<f64>, OdrError> {
+    validate_scale("scld", values, values.len())?;
+    if values.len() == inputs {
+        return Ok(values.to_vec());
+    }
+    if values.len() == 1 {
+        return Ok(vec![values[0]; inputs]);
+    }
+    if observations > 0 && inputs.is_multiple_of(observations) {
+        let dimensions = inputs / observations;
+        if values.len() == dimensions {
+            return Ok((0..inputs).map(|i| values[i % dimensions]).collect());
+        }
+    }
+    Err(OdrError::InvalidArgument {
+        detail: String::from(
+            "scld must contain one value, one per input coordinate, or one per input value",
+        ),
+    })
+}
+
+/// DSCLD applies the same magnitude rule as DSCLB, independently in each input
+/// coordinate. Input rows are interleaved, as in [`multilinear`]. A custom model
+/// with no rectangular observation/input layout gets one scale group.
+fn odrpack_input_scale(x: &[f64], observations: usize) -> Vec<f64> {
+    if observations == 0 || !x.len().is_multiple_of(observations) {
+        return odrpack_beta_scale(x);
+    }
+    let dimensions = x.len() / observations;
+    let mut scales = vec![1.0; x.len()];
+    for coordinate in 0..dimensions {
+        let column: Vec<f64> = x
+            .iter()
+            .skip(coordinate)
+            .step_by(dimensions)
+            .copied()
+            .collect();
+        for (i, scale) in odrpack_beta_scale(&column).into_iter().enumerate() {
+            scales[i * dimensions + coordinate] = scale;
+        }
+    }
+    scales
+}
+
 fn stddev_to_weights(
     name: &str,
     values: &[f64],
@@ -1114,6 +1227,7 @@ fn solve_least_squares<F, J>(
     residuals: F,
     jacobian: J,
     x0: &[f64],
+    scale: &[f64],
     options: OdrOptions,
 ) -> Result<LocalLeastSquaresResult, OdrError>
 where
@@ -1144,8 +1258,12 @@ where
     nfev += jac_evals;
     let mut njev = 1usize;
     for nit in 0..options.maxit {
-        let gradient = jt_residual(&jac, &r);
-        let cosine = gradient_cosine(&gradient, &column_norms(&jac), &r);
+        // Solve in dimensionless coordinates z = scale * x. Keep the physical
+        // Jacobian for covariance and model callbacks.
+        let scaled_jac = scale_jacobian(&jac, scale);
+        let norms = column_norms(&scaled_jac);
+        let gradient = jt_residual(&scaled_jac, &r);
+        let cosine = gradient_cosine(&gradient, &norms, &r);
         if cosine.is_nan() {
             return Ok(LocalLeastSquaresResult {
                 x,
@@ -1174,6 +1292,9 @@ where
                 jac,
             });
         }
+        if nit == 0 {
+            damping = initial_damping(&norms);
+        }
 
         // JᵀJ/Jᵀr are damping-independent, so build them ONCE per Jacobian and reuse them
         // across the ≤8 damping retries below (each retry only re-adds `damping` to a copy
@@ -1183,15 +1304,16 @@ where
         let cached_normal = if ODR_LMSTEP_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
             None
         } else {
-            Some(build_normal_equations(&jac, &r))
+            Some(build_normal_equations(&scaled_jac, &r))
         };
 
         let mut accepted = false;
         for _ in 0..8 {
-            let step = match &cached_normal {
+            let scaled_step = match &cached_normal {
                 Some((normal, rhs)) => solve_damped_normal(normal, rhs, damping)?,
-                None => solve_lm_step(&jac, &r, damping)?,
+                None => solve_lm_step(&scaled_jac, &r, damping)?,
             };
+            let step: Vec<f64> = scaled_step.iter().zip(scale).map(|(s, d)| s / d).collect();
             let candidate = x
                 .iter()
                 .zip(step.iter())
@@ -1199,7 +1321,7 @@ where
                 .collect::<Vec<_>>();
             let candidate_r = residuals(&candidate);
             nfev += 1;
-            if step_within_partol(&step, &x, options.partol) {
+            if step_within_partol(&step, &x, scale, options.partol) {
                 // Take the converged step, as ODRPACK does (see the structured solver).
                 let candidate_cost = 0.5 * dot(&candidate_r, &candidate_r);
                 if candidate_cost <= cost {
@@ -1214,7 +1336,7 @@ where
                 return Ok(LocalLeastSquaresResult {
                     x,
                     cost,
-                    // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
+                    // status: scaled step norm <= partol * scaled parameter norm
                     success: true,
                     message: String::from("parameter tolerance reached"),
                     info: 1,
@@ -1238,7 +1360,7 @@ where
                 jac = new_jac;
                 nfev += jac_evals;
                 njev += 1;
-                damping = (damping * 0.3).max(1.0e-12);
+                damping = (damping * 0.3).max(f64::MIN_POSITIVE);
                 accepted = true;
                 if rel_change <= options.sstol {
                     return Ok(LocalLeastSquaresResult {
@@ -1308,6 +1430,27 @@ struct StructJac {
     b: Vec<f64>,
 }
 
+impl StructJac {
+    fn scaled(&self, scale: &[f64], p: usize) -> Self {
+        Self {
+            a: scale_jacobian(&self.a, &scale[..p]),
+            d_diag: self
+                .d_diag
+                .iter()
+                .zip(&scale[p..])
+                .map(|(v, d)| v / d)
+                .collect(),
+            b: self.b.iter().zip(&scale[p..]).map(|(v, d)| v / d).collect(),
+        }
+    }
+
+    fn column_norms(&self) -> Vec<f64> {
+        let mut norms = column_norms(&self.a);
+        norms.extend(self.d_diag.iter().zip(&self.b).map(|(a, b)| a.hypot(*b)));
+        norms
+    }
+}
+
 struct OdrStruct<'a> {
     model: &'a Model,
     data: &'a Data,
@@ -1316,6 +1459,7 @@ struct OdrStruct<'a> {
     delta_template: &'a [f64],
     free_beta: &'a [usize],
     free_delta: &'a [usize],
+    scale: &'a [f64],
     diff_step: f64,
 }
 
@@ -1370,7 +1514,7 @@ impl OdrStruct<'_> {
             }
         } else {
             for k in 0..p {
-                let h = self.diff_step * x[k].abs().max(1.0);
+                let h = finite_difference_step(x[k], self.scale[k], self.diff_step);
                 let mut beta_pert = beta.clone();
                 beta_pert[self.free_beta[k]] += h;
                 let pred = self.model.evaluate(&beta_pert, &xplus);
@@ -1402,7 +1546,7 @@ impl OdrStruct<'_> {
             let mut xpert = xplus.clone();
             let mut hs = vec![0.0; m];
             for (j, &dj) in self.free_delta.iter().enumerate() {
-                let h = self.diff_step * x[p + j].abs().max(1.0);
+                let h = finite_difference_step(x[p + j], self.scale[p + j], self.diff_step);
                 hs[j] = h;
                 xpert[dj] += h;
                 b[j] = self.data.wd[dj].sqrt();
@@ -1437,7 +1581,7 @@ impl OdrStruct<'_> {
     {
         if self.model.fjacb.is_none() && self.model.fjacd.is_none() {
             return Ok((
-                finite_diff_jacobian(residuals, x, r, self.diff_step)?,
+                finite_diff_jacobian(residuals, x, r, self.scale, self.diff_step)?,
                 x.len(),
             ));
         }
@@ -1464,7 +1608,7 @@ impl OdrStruct<'_> {
                 }
             }
         } else {
-            finite_diff_columns(residuals, x, r, self.diff_step, 0..p, &mut jac)?;
+            finite_diff_columns(residuals, x, r, self.scale, self.diff_step, 0..p, &mut jac)?;
             evals += p;
         }
         if let Some(fjacd) = &self.model.fjacd {
@@ -1484,7 +1628,15 @@ impl OdrStruct<'_> {
                 jac[n_obs + dj][p + j] = self.data.wd[dj].sqrt();
             }
         } else {
-            finite_diff_columns(residuals, x, r, self.diff_step, p..p + m, &mut jac)?;
+            finite_diff_columns(
+                residuals,
+                x,
+                r,
+                self.scale,
+                self.diff_step,
+                p..p + m,
+                &mut jac,
+            )?;
             evals += m;
         }
         Ok((jac, evals))
@@ -1502,7 +1654,6 @@ impl OdrStruct<'_> {
         beta_evals + usize::from(self.m() > 0 && self.model.fjacd.is_none())
     }
 
-    /// `max_abs(Jᵀr)`, matching the dense gradient-tolerance convergence test.
     /// The structured form of [`gradient_cosine`]: β column k holds `a[·][k]` on the response
     /// rows; free-δ column j holds `d_diag[j]` (response row) and `b[j]` (its δ row).
     fn gradient_cosine(&self, sj: &StructJac, r: &[f64]) -> f64 {
@@ -1715,7 +1866,8 @@ where
     nfev += ctx.jac_evals();
     let mut njev = 1usize;
     for nit in 0..options.maxit {
-        let cosine = ctx.gradient_cosine(&jac, &r);
+        let scaled_jac = jac.scaled(ctx.scale, ctx.p());
+        let cosine = ctx.gradient_cosine(&scaled_jac, &r);
         if cosine.is_nan() {
             return Ok(StructResult {
                 x,
@@ -1744,14 +1896,22 @@ where
                 jac,
             });
         }
+        if nit == 0 {
+            damping = initial_damping(&scaled_jac.column_norms());
+        }
 
         let mut accepted = false;
         for _ in 0..8 {
-            let step = ctx
-                .lm_step(&jac, &r, damping)
-                .ok_or_else(|| OdrError::SolverFailure {
-                    detail: String::from("normal equations are singular"),
-                })?;
+            let scaled_step =
+                ctx.lm_step(&scaled_jac, &r, damping)
+                    .ok_or_else(|| OdrError::SolverFailure {
+                        detail: String::from("normal equations are singular"),
+                    })?;
+            let step: Vec<f64> = scaled_step
+                .iter()
+                .zip(ctx.scale)
+                .map(|(s, d)| s / d)
+                .collect();
             let candidate = x
                 .iter()
                 .zip(step.iter())
@@ -1759,7 +1919,7 @@ where
                 .collect::<Vec<_>>();
             let candidate_r = residuals(&candidate);
             nfev += 1;
-            if step_within_partol(&step, &x, options.partol) {
+            if step_within_partol(&step, &x, ctx.scale, options.partol) {
                 // ODRPACK tests parameter convergence on the step it has just TAKEN, so the
                 // returned β includes it. Stopping before it left the fit one Gauss–Newton
                 // step short: 3 − 5.3e-6 on exact data where SciPy returns 3.0
@@ -1776,7 +1936,7 @@ where
                 return Ok(StructResult {
                     x,
                     cost,
-                    // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
+                    // status: scaled step norm <= partol * scaled parameter norm
                     success: true,
                     message: String::from("parameter tolerance reached"),
                     info: 1,
@@ -1799,7 +1959,7 @@ where
                 jac = ctx.jac(&x, &r)?;
                 nfev += ctx.jac_evals();
                 njev += 1;
-                damping = (damping * 0.3).max(1.0e-12);
+                damping = (damping * 0.3).max(f64::MIN_POSITIVE);
                 accepted = true;
                 if rel_change <= options.sstol {
                     return Ok(StructResult {
@@ -1855,17 +2015,58 @@ enum CovSource {
     Struct(StructJac),
 }
 
+/// Relative differencing in the scaled coordinate, converted back to an actual
+/// representable physical increment. This avoids a unit-sized floor on a
+/// nanometre input or a nanosecond parameter.
+fn finite_difference_step(value: f64, scale: f64, relative: f64) -> f64 {
+    let h = relative * value.abs().max(scale.recip());
+    let plus = value + h;
+    if plus.is_finite() && plus != value {
+        plus - value
+    } else if (value - h).is_finite() && value - h != value {
+        (value - h) - value
+    } else if value.next_up().is_finite() {
+        value.next_up() - value
+    } else {
+        value.next_down() - value
+    }
+}
+
+fn scale_jacobian(jac: &[Vec<f64>], scale: &[f64]) -> Vec<Vec<f64>> {
+    jac.iter()
+        .map(|row| row.iter().zip(scale).map(|(v, d)| v / d).collect())
+        .collect()
+}
+
+/// Damping has the units of JᵀJ, not those of a parameter. An absolute 1e-3
+/// overwhelms every column when the responses are tiny, producing a zero step
+/// and false convergence. Start below the weakest nonzero scaled column and
+/// let the ordinary rejection loop increase damping when necessary.
+fn initial_damping(column_norms: &[f64]) -> f64 {
+    let smallest = column_norms
+        .iter()
+        .map(|norm| norm * norm)
+        .filter(|&square| square > 0.0 && square.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    if smallest.is_finite() {
+        (1e-3 * smallest).max(f64::MIN_POSITIVE)
+    } else {
+        1e-3
+    }
+}
+
 fn finite_diff_jacobian<F>(
     residuals: &F,
     x: &[f64],
     r0: &[f64],
+    scale: &[f64],
     step: f64,
 ) -> Result<Vec<Vec<f64>>, OdrError>
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
     let mut jac = vec![vec![0.0; x.len()]; r0.len()];
-    finite_diff_columns(residuals, x, r0, step, 0..x.len(), &mut jac)?;
+    finite_diff_columns(residuals, x, r0, scale, step, 0..x.len(), &mut jac)?;
     Ok(jac)
 }
 
@@ -1874,6 +2075,7 @@ fn finite_diff_columns<F>(
     residuals: &F,
     x: &[f64],
     r0: &[f64],
+    scale: &[f64],
     step: f64,
     cols: std::ops::Range<usize>,
     jac: &mut [Vec<f64>],
@@ -1883,7 +2085,7 @@ where
 {
     for col in cols {
         let mut x_plus = x.to_vec();
-        let h = step * x[col].abs().max(1.0);
+        let h = finite_difference_step(x[col], scale[col], step);
         x_plus[col] += h;
         let r_plus = residuals(&x_plus);
         if r_plus.len() != r0.len() {
@@ -2025,6 +2227,19 @@ fn gaussian_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f6
     if n == 0 || rhs.len() != n || matrix.iter().any(|row| row.len() != n) {
         return None;
     }
+    // Symmetric equilibration preserves the damped normal equations while
+    // making the pivot test relative. An absolute pivot cutoff rejected a
+    // perfectly conditioned normal matrix when its entries were all 1e-18.
+    let equilibration: Vec<f64> = (0..n).map(|i| matrix[i][i].abs().sqrt()).collect();
+    if equilibration.iter().any(|&d| !(d > 0.0 && d.is_finite())) {
+        return None;
+    }
+    for i in 0..n {
+        rhs[i] /= equilibration[i];
+        for (j, value) in matrix[i].iter_mut().enumerate() {
+            *value = (*value / equilibration[i]) / equilibration[j];
+        }
+    }
     for pivot in 0..n {
         let best = (pivot..n).max_by(|&lhs, &rhs_row| {
             matrix[lhs][pivot]
@@ -2055,6 +2270,9 @@ fn gaussian_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f6
             }
             rhs[row] -= factor * rhs[pivot];
         }
+    }
+    for (value, d) in rhs.iter_mut().zip(equilibration) {
+        *value /= d;
     }
     Some(rhs)
 }
@@ -2105,9 +2323,18 @@ fn column_norms(jacobian: &[Vec<f64>]) -> Vec<f64> {
     sq.into_iter().map(f64::sqrt).collect()
 }
 
-/// ODRPACK's relative parameter-change test, `‖step‖ <= partol·‖x‖` (no additive floor).
-fn step_within_partol(step: &[f64], x: &[f64], partol: f64) -> bool {
-    max_abs(step) <= partol * max_abs(x)
+/// ODRPACK's scaled relative parameter-change test (no additive floor). `hypot`
+/// keeps the norms finite for representable large values without squaring them.
+fn step_within_partol(step: &[f64], x: &[f64], scale: &[f64], partol: f64) -> bool {
+    let step_norm = step
+        .iter()
+        .zip(scale)
+        .fold(0.0_f64, |norm, (s, d)| norm.hypot(s * d));
+    let parameter_norm = x
+        .iter()
+        .zip(scale)
+        .fold(0.0_f64, |norm, (v, d)| norm.hypot(v * d));
+    step_norm.is_finite() && parameter_norm.is_finite() && step_norm <= partol * parameter_norm
 }
 
 /// ODRPACK's relative sum-of-squares reduction, `(SS_old - SS_new) / SS_old`; only called
@@ -2133,13 +2360,6 @@ fn dot(values: &[f64], rhs: &[f64]) -> f64 {
         .zip(rhs.iter())
         .map(|(lhs, rhs)| lhs * rhs)
         .sum()
-}
-
-fn max_abs(values: &[f64]) -> f64 {
-    values
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2192,16 +2412,16 @@ impl OdrpackCovariance {
 
     /// DODVCV from the profiled Jacobian `columns` (one per entry of `free_beta`, in ODRPACK's
     /// sign), the number of observations with a nonzero weighted derivative, the weighted sum of
-    /// squares, and β0, which sets the column scales.
+    /// squares, and the parameter scale factors selected by DSCLB or supplied by
+    /// the caller. The covariance is transformed back to physical parameter units.
     fn new(
         mut columns: Vec<Vec<f64>>,
         observed_rows: usize,
         sum_square: f64,
-        beta0: &[f64],
+        ssf: &[f64],
         free_beta: &[usize],
     ) -> Self {
         let npp = free_beta.len();
-        let ssf = odrpack_beta_scale(beta0);
         for (column, &k) in columns.iter_mut().zip(free_beta) {
             for value in column.iter_mut() {
                 *value /= ssf[k];
@@ -2254,7 +2474,7 @@ impl OdrpackCovariance {
             sum_square
         };
         // (RᵀR)⁻¹ back in parameter order; fixed and dropped parameters keep zero.
-        let np = beta0.len();
+        let np = ssf.len();
         let mut variance = vec![vec![0.0; np]; np];
         for i in 0..kept {
             for j in i..kept {
@@ -2738,6 +2958,119 @@ mod tests {
     }
 
     #[test]
+    fn odr_default_scaling_resolves_mixed_magnitude_parameters() -> Result<(), OdrError> {
+        // SciPy ODRPACK: beta = [2, 1e-9], info = 2. Without parameter/input scaling,
+        // both solver paths stop after their first tiny delta step with slope still 1.
+        let x: Vec<f64> = (0..10).map(|i| (f64::from(i) - 4.5) * 1e-9).collect();
+        let y = x.iter().map(|&v| 2.0 * v + 1e-9).collect();
+        let solver = ODR::new(Data::new(x, y)?, unilinear(), vec![1.0, 2e-9])?;
+        for output in [solver.run()?, solver.run_dense_reference()?] {
+            assert!(output.success, "{:?}", output.stopreason);
+            assert_close(output.beta[0], 2.0, 2e-6);
+            assert_close(output.beta[1], 1e-9, 1e-15);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odr_explicit_scales_preserve_fixed_parameters_and_physical_covariance()
+    -> Result<(), OdrError> {
+        let x: Vec<f64> = (0..10).map(|i| (f64::from(i) - 4.5) * 1e-9).collect();
+        let y = x.iter().map(|&v| 2.0 * v + 3e-9).collect();
+        let solver = ODR::new(Data::new(x, y)?, unilinear(), vec![2.0, 1e-9])?
+            .with_beta_free(vec![false, true])?
+            .with_input_free((0..10).map(|i| i % 2 == 0).collect())?
+            .with_beta_scale(vec![0.5, 1e9])?
+            .with_input_scale(vec![1e9])?;
+        for output in [solver.run()?, solver.run_dense_reference()?] {
+            assert!(output.success, "{:?}", output.stopreason);
+            assert_eq!(output.beta[0], 2.0);
+            assert_close(output.beta[1], 3e-9, 3e-15);
+            assert_eq!(output.cov_beta[0][0], 0.0);
+            assert_eq!(output.sd_beta[0], 0.0);
+            // Five fixed inputs each supply weight 1; five free inputs supply
+            // weight 1/(1 + slope^2) = 1/5 after profiling their corrections.
+            assert_close(output.cov_beta[1][1], 1.0 / 6.0, 1e-12);
+            assert!(
+                output
+                    .delta
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &v)| i % 2 == 0 || v == 0.0)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odr_scale_defaults_follow_odrpack_per_coordinate() {
+        assert_eq!(
+            odrpack_beta_scale(&[2.0, 0.0, 0.02]),
+            vec![0.5, 500.0, 50.0]
+        );
+        let input = [1e-9, 1e3, 2e-9, 2e3, 0.0, 0.0];
+        let actual = odrpack_input_scale(&input, 3);
+        let expected = [5e8, 5e-4, 5e8, 5e-4, 1e10, 1e-2];
+        for (&a, &b) in actual.iter().zip(&expected) {
+            assert_close(a, b, b * 1e-15);
+        }
+        assert_eq!(odrpack_input_scale(&[0.0; 6], 3), vec![1.0; 6]);
+        assert_eq!(
+            expand_input_scale(&[2.0, 3.0], 6, 3).unwrap(),
+            vec![2.0, 3.0, 2.0, 3.0, 2.0, 3.0]
+        );
+        // A step in the tiny parameter must not be hidden by a large parameter.
+        assert!(!step_within_partol(
+            &[0.0, 1e-9],
+            &[1e3, 1e-9],
+            &[1e-3, 1e9],
+            1e-5
+        ));
+    }
+
+    #[test]
+    fn odr_invalid_scales_fail_before_model_evaluation() -> Result<(), OdrError> {
+        let solver = ODR::new(
+            Data::new(vec![0.0, 1.0], vec![1.0, 3.0])?,
+            unilinear(),
+            vec![1.0, 1.0],
+        )?;
+        for values in [
+            vec![],
+            vec![1.0],
+            vec![1.0, 0.0],
+            vec![1.0, -1.0],
+            vec![1.0, f64::NAN],
+            vec![1.0, f64::INFINITY],
+        ] {
+            assert!(matches!(
+                solver.clone().with_beta_scale(values),
+                Err(OdrError::InvalidArgument { .. })
+            ));
+        }
+        for values in [
+            vec![],
+            vec![1.0, 2.0, 3.0],
+            vec![0.0],
+            vec![f64::NAN],
+            vec![f64::INFINITY],
+        ] {
+            assert!(matches!(
+                solver.clone().with_input_scale(values),
+                Err(OdrError::InvalidArgument { .. })
+            ));
+        }
+        // Public field mutation must not bypass the builder's validation.
+        let mut malformed = solver;
+        malformed.sclb = Some(vec![1.0]);
+        assert!(matches!(
+            malformed.run(),
+            Err(OdrError::InvalidArgument { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn odr_convergence_measures_are_scale_free() {
         // cos(r, J_j): scaling J or r leaves it unchanged; an exact fit is optimal.
         let g = [3.0, 0.0];
@@ -2747,9 +3080,9 @@ mod tests {
         let scaled = gradient_cosine(&[3.0e-9, 0.0], &[2.0e-9, 5.0e-9], &r);
         assert!((c - scaled).abs() < 1e-15 && c > 0.0);
         assert_eq!(gradient_cosine(&g, &norms, &[0.0, 0.0]), 0.0);
-        assert!(step_within_partol(&[1e-13], &[1e-7], 1e-5));
+        assert!(step_within_partol(&[1e-13], &[1e-7], &[1.0], 1e-5));
         assert!(
-            !step_within_partol(&[1e-9], &[1e-7], 1e-5),
+            !step_within_partol(&[1e-9], &[1e-7], &[1.0], 1e-5),
             "the old +1 floor accepted this"
         );
         assert!((relative_ss_reduction(1e-10, 0.5e-10) - 0.5).abs() < 1e-15);
