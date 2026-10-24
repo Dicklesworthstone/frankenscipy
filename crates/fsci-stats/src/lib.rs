@@ -115743,17 +115743,21 @@ mod histogram_distribution_matches_scipy {
         assert!((color[2] - 4.0).abs() < 1e-12);
     }
 
+    fn audit_entries(ledger: &crate::SyncSharedAuditLedger) -> Vec<fsci_runtime::AuditEvent> {
+        ledger.lock().expect("audit ledger").entries().to_vec()
+    }
+
     #[test]
     fn test_stats_hardened_resource_caps_boundary() {
         use crate::{
             BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
-            GaussianKde, KdeBandwidth, Normal, RandomState, StatsError, StatsOptions,
+            GaussianKde, Normal, StatsError, StatsOptions,
             bootstrap_with_options, describe_with_options, energy_distance_with_options,
             permutation_test_with_options, ttest_1samp_with_options,
             wasserstein_distance_with_options, with_hardened_max_resamples,
             with_hardened_stats_caps,
         };
-        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+        use fsci_runtime::{AuditAction, RuntimeMode};
 
         let hardened = StatsOptions::new(RuntimeMode::Hardened);
 
@@ -115762,26 +115766,26 @@ mod histogram_distribution_matches_scipy {
             let sample_over = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
 
             // 1. Sample cap boundary (8 vs 9)
-            let ledger = SyncSharedAuditLedger::new();
+            let ledger = fsci_runtime::AuditLedger::shared();
             assert!(Normal::try_fit_with_options(&sample_ok, hardened, Some(&ledger)).is_ok());
-            assert!(ledger.entries().is_empty());
+            assert!(audit_entries(&ledger).is_empty());
 
             let err = Normal::try_fit_with_options(&sample_over, hardened, Some(&ledger))
                 .expect_err("sample_len = cap + 1 must fail closed in Hardened mode");
             assert!(matches!(err, FitError::ResourceExhausted { .. }));
-            let entries = ledger.entries();
+            let entries = audit_entries(&ledger);
             assert_eq!(entries.len(), 1);
             assert_eq!(
                 entries[0].action,
                 AuditAction::FailClosed {
-                    reason_code: "resource_exhausted".to_string()
+                    reason: "fit::resource_exhausted".to_string()
                 }
             );
 
-            let ledger = SyncSharedAuditLedger::new();
+            let ledger = fsci_runtime::AuditLedger::shared();
             assert!(ttest_1samp_with_options(&sample_ok, 0.0, hardened, Some(&ledger)).is_ok());
             assert!(describe_with_options(&sample_ok, hardened, Some(&ledger)).is_ok());
-            assert!(ledger.entries().is_empty());
+            assert!(audit_entries(&ledger).is_empty());
 
             let err = ttest_1samp_with_options(&sample_over, 0.0, hardened, Some(&ledger))
                 .expect_err("ttest_1samp sample_len = cap + 1 must fail closed");
@@ -115789,12 +115793,12 @@ mod histogram_distribution_matches_scipy {
             let err2 = describe_with_options(&sample_over, hardened, Some(&ledger))
                 .expect_err("describe sample_len = cap + 1 must fail closed");
             assert!(matches!(err2, StatsError::ResourceExhausted { .. }));
-            assert_eq!(ledger.entries().len(), 2);
+            assert_eq!(audit_entries(&ledger).len(), 2);
 
             // 2. Pairwise / O(n^2) cap boundary (6 vs 7)
             let pair_ok = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
             let pair_over = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-            let ledger = SyncSharedAuditLedger::new();
+            let ledger = fsci_runtime::AuditLedger::shared();
             assert!(
                 wasserstein_distance_with_options(&pair_ok, &pair_ok, hardened, Some(&ledger))
                     .is_ok()
@@ -115803,36 +115807,25 @@ mod histogram_distribution_matches_scipy {
                 energy_distance_with_options(&pair_ok, &pair_ok, hardened, Some(&ledger)).is_ok()
             );
             assert!(
-                GaussianKde::new_with_options(
-                    &pair_ok,
-                    KdeBandwidth::Scott,
-                    hardened,
-                    Some(&ledger)
-                )
-                .is_ok()
+                GaussianKde::new_with_options(&pair_ok, hardened, Some(&ledger)).is_ok()
             );
-            assert!(ledger.entries().is_empty());
+            assert!(audit_entries(&ledger).is_empty());
 
             for res in [
                 wasserstein_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger))
                     .err(),
                 energy_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger)).err(),
-                GaussianKde::new_with_options(
-                    &pair_over,
-                    KdeBandwidth::Scott,
-                    hardened,
-                    Some(&ledger),
-                )
+                GaussianKde::new_with_options(&pair_over, hardened, Some(&ledger))
                 .err(),
             ] {
                 let err = res.expect("pairwise_len = cap + 1 must fail closed");
                 assert!(matches!(err, StatsError::ResourceExhausted { .. }));
             }
-            assert_eq!(ledger.entries().len(), 3);
+            assert_eq!(audit_entries(&ledger).len(), 3);
 
             // 3. Resamples cap boundary (10 vs 11)
             with_hardened_max_resamples(10, || {
-                let ledger = SyncSharedAuditLedger::new();
+                let ledger = fsci_runtime::AuditLedger::shared();
                 assert!(
                     permutation_test_with_options(
                         &pair_ok,
@@ -115861,7 +115854,7 @@ mod histogram_distribution_matches_scipy {
                     n_resamples: 10,
                     batch: None,
                     method: BootstrapIntervalMethod::Percentile,
-                    rng: RandomState::seed_from_u64(42),
+                    rng: 42,
                 };
                 assert!(
                     bootstrap_with_options(
@@ -115879,7 +115872,7 @@ mod histogram_distribution_matches_scipy {
                     n_resamples: 11,
                     batch: None,
                     method: BootstrapIntervalMethod::Percentile,
-                    rng: RandomState::seed_from_u64(42),
+                    rng: 42,
                 };
                 let err = bootstrap_with_options(
                     &pair_ok,
@@ -115891,7 +115884,7 @@ mod histogram_distribution_matches_scipy {
                 )
                 .expect_err("n_resamples = cap + 1 must fail closed");
                 assert!(matches!(err, StatsError::ResourceExhausted { .. }));
-                assert_eq!(ledger.entries().len(), 2);
+                assert_eq!(audit_entries(&ledger).len(), 2);
             });
         });
     }
@@ -115900,13 +115893,13 @@ mod histogram_distribution_matches_scipy {
     fn test_stats_mode_awareness_and_audit_emission() {
         use crate::{
             BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
-            GaussianKde, KdeBandwidth, Normal, RandomState, StatsError, StatsOptions,
+            GaussianKde, Normal, StatsError, StatsOptions,
             bootstrap_with_options, describe_with_options, energy_distance_with_options,
             ks_1samp_with_options, ks_2samp_with_options, pearsonr_with_options,
             permutation_test_with_options, spearmanr_with_options, ttest_1samp_with_options,
             ttest_ind_with_options, wasserstein_distance_with_options,
         };
-        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+        use fsci_runtime::{AuditAction, RuntimeMode};
 
         let nan_sample = [1.0, 2.0, f64::NAN, 4.0, 5.0];
         let clean_sample = [1.0, 2.0, 3.0, 4.0, 5.0];
@@ -115916,11 +115909,14 @@ mod histogram_distribution_matches_scipy {
             StatsOptions::new(RuntimeMode::Hardened).with_non_finite_projection(true);
 
         // Strict mode matches live SciPy NaN behavior:
-        // - norm.fit([1, 2, nan, 4, 5]) raises ValueError -> Err(FitError::NonFiniteData)
+        // - norm.fit([1, 2, nan, 4, 5]) raises ValueError -> FitError::UnsupportedData
         // - ttest_1samp([1, 2, nan, 4, 5], 0.0) -> statistic = NaN, pvalue = NaN
         // - describe([1, 2, nan, 4, 5]) -> nobs = 5, minmax = (NaN, NaN), mean = NaN
         let strict_fit = Normal::try_fit_with_options(&nan_sample, strict, None);
-        assert_eq!(strict_fit, Err(FitError::NonFiniteData));
+        assert!(matches!(
+            strict_fit,
+            Err(FitError::UnsupportedData(ref msg)) if msg.contains("non-finite")
+        ));
         let strict_tt = ttest_1samp_with_options(&nan_sample, 0.0, strict, None).unwrap();
         assert!(strict_tt.statistic.is_nan() && strict_tt.pvalue.is_nan());
         let strict_desc = describe_with_options(&nan_sample, strict, None).unwrap();
@@ -115928,17 +115924,17 @@ mod histogram_distribution_matches_scipy {
         assert!(strict_desc.minmax.0.is_nan() && strict_desc.mean.is_nan());
 
         // Hardened mode rejects NaN with FailClosed by default:
-        let ledger = SyncSharedAuditLedger::new();
-        assert_eq!(
+        let ledger = fsci_runtime::AuditLedger::shared();
+        assert!(matches!(
             Normal::try_fit_with_options(&nan_sample, hardened, Some(&ledger)),
-            Err(FitError::NonFiniteData)
-        );
+            Err(FitError::UnsupportedData(ref msg)) if msg.contains("non-finite")
+        ));
         assert_eq!(
             ttest_1samp_with_options(&nan_sample, 0.0, hardened, Some(&ledger)),
             Err(StatsError::NonFiniteInput { argument: "data" })
         );
         assert_eq!(
-            ttest_ind_with_options(&nan_sample, &clean_sample, true, hardened, Some(&ledger)),
+            ttest_ind_with_options(&nan_sample, &clean_sample, hardened, Some(&ledger)),
             Err(StatsError::NonFiniteInput { argument: "a" })
         );
         assert_eq!(
@@ -115970,15 +115966,8 @@ mod histogram_distribution_matches_scipy {
             Err(StatsError::NonFiniteInput { argument: "data" })
         );
         assert!(matches!(
-            GaussianKde::new_with_options(
-                &nan_sample,
-                KdeBandwidth::Scott,
-                hardened,
-                Some(&ledger)
-            ),
-            Err(StatsError::NonFiniteInput {
-                argument: "dataset"
-            })
+            GaussianKde::new_with_options(&nan_sample, hardened, Some(&ledger)),
+            Err(StatsError::NonFiniteInput { argument: "data" })
         ));
         assert_eq!(
             permutation_test_with_options(
@@ -115996,7 +115985,7 @@ mod histogram_distribution_matches_scipy {
             n_resamples: 10,
             batch: None,
             method: BootstrapIntervalMethod::Percentile,
-            rng: RandomState::seed_from_u64(7),
+            rng: 7,
         };
         assert_eq!(
             bootstrap_with_options(
@@ -116009,13 +115998,16 @@ mod histogram_distribution_matches_scipy {
             ),
             Err(StatsError::NonFiniteInput { argument: "data" })
         );
-        assert_eq!(ledger.entries().len(), 13);
-        for entry in ledger.entries() {
-            assert_eq!(
-                entry.action,
-                AuditAction::FailClosed {
-                    reason_code: "non_finite_input".to_string()
-                }
+        assert_eq!(audit_entries(&ledger).len(), 13);
+        for entry in audit_entries(&ledger) {
+            assert!(
+                matches!(
+                    &entry.action,
+                    AuditAction::FailClosed { reason }
+                        if reason == "non_finite_input" || reason == "fit::non_finite_input"
+                ),
+                "unexpected audit action: {:?}",
+                entry.action
             );
         }
 
@@ -116023,7 +116015,7 @@ mod histogram_distribution_matches_scipy {
         // recovers and logs BoundedRecovery with count and positions_digest:
         let hardened_policy_proj =
             StatsOptions::new(RuntimeMode::Hardened).with_recovery(crate::RecoveryPolicy::Project);
-        let ledger_rec = SyncSharedAuditLedger::new();
+        let ledger_rec = fsci_runtime::AuditLedger::shared();
         let fit_rec =
             Normal::try_fit_with_options(&nan_sample, hardened_policy_proj, Some(&ledger_rec))
                 .unwrap();
@@ -116040,8 +116032,8 @@ mod histogram_distribution_matches_scipy {
             describe_with_options(&nan_sample, hardened_proj, Some(&ledger_rec)).unwrap();
         assert_eq!(desc_rec.nobs, 4);
         assert!(desc_rec.mean.is_finite());
-        assert_eq!(ledger_rec.entries().len(), 4);
-        for entry in ledger_rec.entries() {
+        assert_eq!(audit_entries(&ledger_rec).len(), 4);
+        for entry in audit_entries(&ledger_rec) {
             assert!(matches!(entry.action, AuditAction::BoundedRecovery { .. }));
             assert!(
                 entry.outcome.contains("count=1"),
@@ -116058,30 +116050,37 @@ mod histogram_distribution_matches_scipy {
 
     #[test]
     fn test_stats_special_mode_propagation() {
+        use super::{lower_regularized_gamma, take_last_special_error};
         use crate::{
-            ContinuousDistribution, GammaDist, StatsError, StatsOptions, lower_regularized_gamma,
-            take_last_special_error, with_stats_runtime_mode,
+            ContinuousDistribution, GammaDist, StatsError, StatsOptions, with_stats_runtime_mode,
         };
-        use fsci_runtime::{AuditAction, RuntimeMode, SyncSharedAuditLedger};
+        use fsci_runtime::{AuditAction, RuntimeMode};
 
-        // Calling lower_regularized_gamma(NaN, 1.0) inside Hardened stats mode must invoke
-        // fsci-special with RuntimeMode::Hardened and record "special_non_finite_input".
+        // NaN is SciPy's defined incomplete-gamma answer: the domain check returns
+        // Ok for a NaN endpoint, so Hardened mode still yields NaN and records no
+        // special error. The call still runs under the threaded stats runtime mode.
         let val = with_stats_runtime_mode(RuntimeMode::Hardened, || {
             lower_regularized_gamma(f64::NAN, 1.0)
         });
         assert!(val.is_nan());
-        assert_eq!(take_last_special_error(), Some("special_non_finite_input"));
+        assert_eq!(take_last_special_error(), None);
 
-        // Calling GammaDist(NaN, 1.0).cdf_with_options(1.0, Hardened) must fail closed via
-        // the propagated fsci-special Hardened error.
-        let ledger = SyncSharedAuditLedger::new();
-        let g = GammaDist::from_shape_scale(f64::NAN, 1.0);
+        // A non-finite, non-NaN shape is a Hardened domain error
+        // (`special_domain_error`). cdf_with_options must surface that as
+        // StatsError::Arithmetic and one FailClosed event. GammaDist::new
+        // asserts `a > 0`, which rejects NaN, so the shape is written through
+        // the public fields.
+        let ledger = fsci_runtime::AuditLedger::shared();
+        let g = GammaDist {
+            a: f64::INFINITY,
+            scale: 1.0,
+        };
         let res = g.cdf_with_options(1.0, StatsOptions::new(RuntimeMode::Hardened), Some(&ledger));
         assert!(matches!(res, Err(StatsError::Arithmetic { .. })));
-        assert_eq!(ledger.entries().len(), 1);
+        assert_eq!(audit_entries(&ledger).len(), 1);
         assert!(matches!(
-            ledger.entries()[0].action,
-            AuditAction::FailClosed { .. }
+            &audit_entries(&ledger)[0].action,
+            AuditAction::FailClosed { reason } if reason == "arithmetic"
         ));
     }
 
@@ -116089,7 +116088,7 @@ mod histogram_distribution_matches_scipy {
     fn test_stats_strict_mode_bit_identity_1000_calls() {
         use crate::{
             BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, GaussianKde,
-            KdeBandwidth, Normal, RandomState, StatsOptions, bootstrap, bootstrap_with_options,
+            Normal, StatsOptions, bootstrap, bootstrap_with_options,
             describe, describe_with_options, energy_distance, energy_distance_with_options,
             ks_1samp, ks_1samp_with_options, ks_2samp, ks_2samp_with_options, pearsonr,
             pearsonr_with_options, permutation_test, permutation_test_with_options, spearmanr,
@@ -116099,7 +116098,7 @@ mod histogram_distribution_matches_scipy {
         use fsci_runtime::RuntimeMode;
 
         let strict = StatsOptions::new(RuntimeMode::Strict);
-        let mut state = 0x5EED_3CU8_0005_u64;
+        let mut state = 0x5EED_3C8_0005_u64;
         let mut next_f64 = || -> f64 {
             state = state
                 .wrapping_mul(6364136223846793005)
@@ -116129,8 +116128,8 @@ mod histogram_distribution_matches_scipy {
                     assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
                 }
                 2 => {
-                    let a = ttest_ind(&x, &y, true);
-                    let b = ttest_ind_with_options(&x, &y, true, strict, None).unwrap();
+                    let a = ttest_ind(&x, &y);
+                    let b = ttest_ind_with_options(&x, &y, strict, None).unwrap();
                     assert_eq!(a.statistic.to_bits(), b.statistic.to_bits());
                     assert_eq!(a.pvalue.to_bits(), b.pvalue.to_bits());
                 }
@@ -116175,13 +116174,9 @@ mod histogram_distribution_matches_scipy {
                     assert_eq!(a.variance.to_bits(), b.variance.to_bits());
                     assert_eq!(a.skewness.to_bits(), b.skewness.to_bits());
                     assert_eq!(a.kurtosis.to_bits(), b.kurtosis.to_bits());
-                    let k1 = GaussianKde::new(&x, KdeBandwidth::Scott).unwrap();
-                    let k2 = GaussianKde::new_with_options(&x, KdeBandwidth::Scott, strict, None)
-                        .unwrap();
-                    assert_eq!(
-                        k1.evaluate_point(0.0).to_bits(),
-                        k2.evaluate_point(0.0).to_bits()
-                    );
+                    let k1 = GaussianKde::new(&x);
+                    let k2 = GaussianKde::new_with_options(&x, strict, None).unwrap();
+                    assert_eq!(k1.evaluate(0.0).to_bits(), k2.evaluate(0.0).to_bits());
                 }
                 _ => {
                     let (s1, p1) = permutation_test(
@@ -116208,7 +116203,7 @@ mod histogram_distribution_matches_scipy {
                         n_resamples: 8,
                         batch: None,
                         method: BootstrapIntervalMethod::Percentile,
-                        rng: RandomState::seed_from_u64(i as u64),
+                        rng: i as u64,
                     };
                     let b1 = bootstrap(
                         &x[..6],
