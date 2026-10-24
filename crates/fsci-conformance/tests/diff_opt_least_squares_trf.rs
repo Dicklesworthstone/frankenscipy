@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `least_squares` with SciPy's default Trust Region
-//! Reflective method (frankenscipy-1ksfv.6): Rosenbrock with and without a bound, an
+//! Reflective and rectangular Dogbox methods (frankenscipy-1ksfv.6): Rosenbrock with and without a bound, an
 //! exponential fit with outliers under bounds and under each robust loss (soft_l1, huber,
 //! cauchy, arctan), `x_scale='jac'` on a badly scaled problem, an underdetermined system, a
 //! `max_nfev` stop, and a box with both bounds active.
@@ -20,7 +20,9 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::{LeastSquaresOptions, LossKind, least_squares, least_squares_bounded};
+use fsci_opt::{
+    LeastSquaresMethod, LeastSquaresOptions, LossKind, least_squares, least_squares_bounded,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-003";
@@ -31,6 +33,7 @@ const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 #[derive(Debug, Clone, Serialize)]
 struct Case {
     case_id: String,
+    method: String,
     x0: Vec<f64>,
     lb: Option<Vec<f64>>,
     ub: Option<Vec<f64>>,
@@ -43,6 +46,7 @@ struct Case {
 fn case(id: &str, x0: &[f64]) -> Case {
     Case {
         case_id: id.to_string(),
+        method: "trf".to_string(),
         x0: x0.to_vec(),
         lb: None,
         ub: None,
@@ -200,7 +204,7 @@ for case in json.load(sys.stdin):
     arm = {"case_id": case["case_id"], "x": None, "cost": None, "status": None,
            "nfev": None, "active_mask": None}
     try:
-        kw = dict(loss=case["loss"], f_scale=case["f_scale"], method="trf")
+        kw = dict(loss=case["loss"], f_scale=case["f_scale"], method=case["method"])
         if case["x_scale_jac"]:
             kw["x_scale"] = "jac"
         if case["max_nfev"] is not None:
@@ -268,7 +272,19 @@ print(json.dumps(out))
 
 #[test]
 fn diff_opt_least_squares_trf() {
-    let cases = cases();
+    compare_method("trf");
+}
+
+#[test]
+fn diff_opt_least_squares_dogbox() {
+    compare_method("dogbox");
+}
+
+fn compare_method(method: &str) {
+    let mut cases = cases();
+    for case in &mut cases {
+        case.method = method.to_string();
+    }
     let Some(oracle) = scipy_oracle_or_skip(&cases) else {
         return;
     };
@@ -279,10 +295,17 @@ fn diff_opt_least_squares_trf() {
     let (t, y) = exp_data();
 
     let mut diffs = Vec::new();
-    let mut ledger = CompareLedger::new("diff_opt_least_squares_trf", &["least_squares_trf"]);
+    let test_id = format!("diff_opt_least_squares_{method}");
+    let family = format!("least_squares_{method}");
+    let mut ledger = CompareLedger::new(&test_id, &[&family]);
     for case in &cases {
         let arm = &arms[&case.case_id];
         let options = LeastSquaresOptions {
+            method: Some(if method == "dogbox" {
+                LeastSquaresMethod::Dogbox
+            } else {
+                LeastSquaresMethod::Trf
+            }),
             loss: loss_kind(&case.loss),
             f_scale: case.f_scale,
             x_scale_jac: case.x_scale_jac,
@@ -316,19 +339,12 @@ fn diff_opt_least_squares_trf() {
             (Ok(_), Some(_)) => {}
         }
         // `None` is recorded by the ledger: SciPy gave no result, or fsci returned an error.
-        if let Some(((x, cost, mask), r)) =
-            ledger.both("least_squares_trf", &case.case_id, scipy, fsci.ok())
-        {
+        if let Some(((x, cost, mask), r)) = ledger.both(&family, &case.case_id, scipy, fsci.ok()) {
             diff.fsci_status = r.status;
             diff.fsci_nfev = r.nfev;
             // The ledger rejects a length mismatch and a NaN coordinate (recording the case);
             // the zip below would truncate the one and the max fold swallow the other.
-            let x_pair = ledger.slices(
-                "least_squares_trf",
-                &case.case_id,
-                Some(x),
-                Some(r.x.as_slice()),
-            );
+            let x_pair = ledger.slices(&family, &case.case_id, Some(x), Some(r.x.as_slice()));
             diff.x_rel_diff = x_pair.map_or(f64::NAN, |(x, fsci_x)| {
                 fsci_x
                     .iter()
@@ -354,7 +370,7 @@ fn diff_opt_least_squares_trf() {
             diff.pass = problems.is_empty();
             diff.reason = problems.join("; ");
             if x_pair.is_some() {
-                ledger.compared("least_squares_trf", &case.case_id, diff.pass);
+                ledger.compared(&family, &case.case_id, diff.pass);
             }
         }
         diffs.push(diff);
@@ -366,8 +382,8 @@ fn diff_opt_least_squares_trf() {
         .filter(|d| d.pass && d.fsci_nfev == d.scipy_nfev)
         .count();
     let log = DiffLog {
-        test_id: "diff_opt_least_squares_trf".into(),
-        category: "scipy.optimize.least_squares(method='trf')".into(),
+        test_id: test_id.clone(),
+        category: format!("scipy.optimize.least_squares(method='{method}')"),
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         same_nfev_count,
@@ -377,7 +393,7 @@ fn diff_opt_least_squares_trf() {
     };
     fs::create_dir_all(output_dir()).expect("create trf diff dir");
     fs::write(
-        output_dir().join("diff_opt_least_squares_trf.json"),
+        output_dir().join(format!("{test_id}.json")),
         serde_json::to_string_pretty(&log).expect("serialize trf log"),
     )
     .expect("write trf log");
@@ -399,6 +415,6 @@ fn diff_opt_least_squares_trf() {
         diffs.len()
     );
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
-    assert!(all_pass, "least_squares(trf) vs scipy failed");
+    assert!(all_pass, "least_squares({method}) vs scipy failed");
     ledger.finish(cases.len());
 }

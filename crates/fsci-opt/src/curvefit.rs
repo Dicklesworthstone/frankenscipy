@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! Nonlinear least squares: `least_squares` (SciPy's default Trust Region Reflective method,
-//! bounds, robust losses, or Levenberg–Marquardt), `curve_fit`, and the batched variants.
+//! rectangular Dogbox, bounds, robust losses, or Levenberg–Marquardt), `curve_fit`, and the
+//! batched variants.
 
 use fsci_runtime::RuntimeMode;
 
@@ -13,6 +14,8 @@ use crate::types::OptError;
 pub enum LeastSquaresMethod {
     /// Trust Region Reflective (Branch, Coleman & Li): bounds, robust losses, `x_scale`.
     Trf,
+    /// Powell dogleg in rectangular trust regions: bounds, robust losses, `x_scale`.
+    Dogbox,
     /// Levenberg–Marquardt: no bounds, `m ≥ n`, linear loss only.
     Lm,
 }
@@ -45,14 +48,15 @@ pub struct LeastSquaresResult {
     pub nfev: usize,
     /// Number of Jacobian evaluations.
     pub njev: usize,
-    /// Number of iterations (accepted steps for `Trf`).
+    /// Number of iterations (accepted steps for `Trf` and `Dogbox`).
     pub nit: usize,
     /// Jacobian at the solution (row-major, m rows x n cols; for a robust loss, SciPy's
     /// loss-scaled Jacobian).
     pub jac: Vec<Vec<f64>>,
     /// SciPy's status: 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
     pub status: i32,
-    /// First-order optimality: ‖Jᵀf‖∞, scaled by the Coleman–Li vector under bounds.
+    /// First-order optimality: ‖Jᵀf‖∞, scaled by Coleman–Li for bounded `Trf`, or
+    /// restricted to the free variables for `Dogbox`.
     pub optimality: f64,
     /// Gradient `Jᵀf` of the cost at the solution.
     pub grad: Vec<f64>,
@@ -77,11 +81,11 @@ pub struct LeastSquaresOptions {
     /// Relative finite-difference step; `None` is SciPy's default
     /// `√ε·sign(x)·max(1, |x|)`.
     pub diff_step: Option<f64>,
-    /// Robust loss (`Trf` only).
+    /// Robust loss (`Trf` and `Dogbox`).
     pub loss: LossKind,
     /// Soft margin between inlier and outlier residuals for a robust loss.
     pub f_scale: f64,
-    /// SciPy's `x_scale='jac'` (`Trf`); otherwise unit scale.
+    /// SciPy's `x_scale='jac'` (`Trf` and `Dogbox`); otherwise unit scale.
     pub x_scale_jac: bool,
     /// Runtime mode.
     pub mode: RuntimeMode,
@@ -129,8 +133,9 @@ pub struct CurveFitOptions {
 }
 
 /// `scipy.optimize.least_squares(fun, x0, method=...)` without bounds: minimize
-/// `0.5·Σρ(residuals(x)²)`. The default method is SciPy's `trf`; `Lm` selects
-/// Levenberg–Marquardt. See [`least_squares_bounded`] for bounds.
+/// `0.5·Σρ(residuals(x)²)`. The default method is SciPy's `trf`; `Dogbox` selects rectangular
+/// trust-region dogleg and `Lm` selects Levenberg–Marquardt. See [`least_squares_bounded`]
+/// for bounds.
 pub fn least_squares<F>(
     residuals: F,
     x0: &[f64],
@@ -140,7 +145,9 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     match options.method.unwrap_or(LeastSquaresMethod::Trf) {
-        LeastSquaresMethod::Trf => least_squares_trf(&residuals, x0, None, options),
+        LeastSquaresMethod::Trf | LeastSquaresMethod::Dogbox => {
+            least_squares_trust_region(&residuals, x0, None, options)
+        }
         LeastSquaresMethod::Lm => least_squares_lm(residuals, x0, options),
     }
 }
@@ -523,10 +530,9 @@ impl From<trf::NonFiniteJacobian> for OptError {
     }
 }
 
-/// `method='trf'` with optional bounds, as SciPy's `least_squares` sets it up: tolerance and
-/// bound validation, `x0` made strictly feasible, the initial residuals required finite, then
-/// [`trf::trf`].
-fn least_squares_trf<F>(
+/// Dense `trf`/`dogbox` setup: validate tolerances and bounds, require finite initial
+/// residuals, and move `x0` off the bounds only for TRF (Dogbox accepts exact bounds).
+fn least_squares_trust_region<F>(
     residuals: &F,
     x0: &[f64],
     bounds: Option<(&[f64], &[f64])>,
@@ -597,6 +603,11 @@ where
             detail: String::from("f_scale must be positive and finite"),
         });
     }
+    if options.max_nfev == Some(0) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("max_nfev must be positive"),
+        });
+    }
     if let Some(r) = options.diff_step
         && !(r.is_finite() && r > 0.0)
     {
@@ -604,7 +615,12 @@ where
             detail: String::from("diff_step must be finite and > 0"),
         });
     }
-    let x0 = trf::make_strictly_feasible(x0, &lb, &ub, 1e-10);
+    let dogbox = options.method == Some(LeastSquaresMethod::Dogbox);
+    let x0 = if dogbox {
+        x0.to_vec()
+    } else {
+        trf::make_strictly_feasible(x0, &lb, &ub, 1e-10)
+    };
     let f0 = residuals(&x0);
     if f0.iter().any(|v| !v.is_finite()) {
         return Err(OptError::NonFiniteInput {
@@ -641,7 +657,8 @@ where
             options.diff_step,
         ))
     };
-    let out = trf::trf(
+    let solve = if dogbox { trf::dogbox } else { trf::trf };
+    let out = solve(
         &mut fun,
         &mut jac,
         &x0,
@@ -786,8 +803,8 @@ fn require_fit_converged(ls_result: &LeastSquaresResult) -> Result<(), OptError>
 }
 
 /// Box-constrained nonlinear least squares, `scipy.optimize.least_squares(fun, x0,
-/// bounds=(lower, upper))`: SciPy's Trust Region Reflective method, so a bound that is active
-/// at the solution is reached exactly and reported in `active_mask` (`±inf` = no bound).
+/// bounds=(lower, upper))`: Trust Region Reflective by default, or rectangular Dogbox.
+/// Active bounds are reported in `active_mask` (`±inf` = no bound).
 /// `method = Lm` is refused, as SciPy refuses it ("Method 'lm' doesn't support bounds").
 ///
 /// This used to reparameterise each bounded coordinate (logistic / softplus) and run LM,
@@ -823,7 +840,7 @@ where
     if options.method == Some(LeastSquaresMethod::Lm) {
         return least_squares_lm(residuals, x0, options);
     }
-    least_squares_trf(&residuals, x0, Some((lower, upper)), options)
+    least_squares_trust_region(&residuals, x0, Some((lower, upper)), options)
 }
 
 /// Box-constrained curve fitting: the bounded analogue of [`curve_fit`], matching
@@ -1857,6 +1874,100 @@ mod tests {
         assert!(
             matches!(lm_refused, OptError::InvalidArgument { detail } if detail.contains("'lm'"))
         );
+    }
+
+    #[test]
+    fn least_squares_dogbox_reaches_active_bounds_and_preserves_full_gradient() {
+        let result = least_squares_bounded(
+            |x| vec![x[0] - 3.0, x[1] + 1.0],
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[2.0, 2.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("Dogbox solves the constrained quadratic");
+        assert_eq!(result.x, vec![2.0, 0.0]);
+        assert_eq!(result.active_mask, vec![1, -1]);
+        assert_eq!(result.status, 1);
+        assert_eq!(result.optimality, 0.0);
+        assert!((result.grad[0] + 1.0).abs() < 1e-7);
+        assert!((result.grad[1] - 1.0).abs() < 1e-7);
+        assert!((result.cost - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn least_squares_dogbox_underdetermined_and_rank_deficient() {
+        for duplicate in [false, true] {
+            let result = least_squares(
+                |x| {
+                    let r = x[0] + 2.0 * x[1] - 3.0;
+                    if duplicate { vec![r, 2.0 * r] } else { vec![r] }
+                },
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Dogbox),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("Dogbox accepts a deficient dense Jacobian");
+            assert!(result.success);
+            assert!(result.cost < 1e-20);
+            assert!((result.x[0] - 0.6).abs() < 1e-7);
+            assert!((result.x[1] - 1.2).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn least_squares_dogbox_keeps_initial_bound_and_honors_evaluation_budget() {
+        let result = least_squares_bounded(
+            |x| vec![x[0] + 1.0],
+            &[0.0],
+            &[0.0],
+            &[1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                max_nfev: Some(1),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("initial bound optimum");
+        assert_eq!(result.x, vec![0.0]);
+        assert_eq!(result.active_mask, vec![-1]);
+        assert_eq!(result.nfev, 1);
+        assert_eq!(result.status, 1);
+
+        let starved = least_squares(
+            |x| vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]],
+            &[-1.2, 1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                max_nfev: Some(3),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("budget exhaustion returns the current iterate");
+        assert_eq!(starved.nfev, 3);
+        assert_eq!(starved.status, 0);
+        assert!(!starved.success);
+    }
+
+    #[test]
+    fn least_squares_trust_regions_reject_zero_evaluation_budget() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| vec![x[0] - 1.0],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    max_nfev: Some(0),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+        }
     }
 
     #[test]
