@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for fsci_opt::curve_fit on
-//! noise-free synthetic data. Three model families:
+//! noise-free synthetic data, plus TRF/Dogbox rank-deficient and underdetermined
+//! covariance with both curve-fit entry points and absolute/relative variance.
+//! Three noise-free model families:
 //!   - linear:        y = a*x + b
 //!   - quadratic:     y = a*x^2 + b*x + c
 //!   - exponential:   y = a * exp(-k*x)
@@ -16,7 +18,10 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::{CurveFitOptions, curve_fit};
+use fsci_opt::{
+    CurveFitOptions, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, curve_fit,
+    curve_fit_bounded,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-006";
@@ -171,6 +176,13 @@ for case in q["points"]:
         points.append({"case_id": cid, "popt": None})
 print(json.dumps({"points": points}))
 "#;
+    run_scipy_or_skip(query, script)
+}
+
+fn run_scipy_or_skip<Q: Serialize, R: for<'de> Deserialize<'de>>(
+    query: &Q,
+    script: &str,
+) -> Option<R> {
     let query_json = serde_json::to_string(query).expect("serialize curve_fit query");
     let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
@@ -326,4 +338,172 @@ fn diff_opt_curve_fit() {
         .min()
         .expect("ARMS is non-empty");
     ledger.finish(min_per_arm);
+}
+
+#[derive(Debug, Serialize)]
+struct CovarianceCase {
+    case_id: String,
+    method: String,
+    bounded: bool,
+    absolute_sigma: bool,
+    xdata: Vec<f64>,
+    ydata: Vec<f64>,
+    p0: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CovarianceOracle {
+    case_id: String,
+    popt: Option<Vec<f64>>,
+    pcov: Option<Vec<Vec<f64>>>,
+    infinite_covariance: bool,
+    warning_count: usize,
+    error: Option<String>,
+}
+
+#[test]
+fn diff_opt_curve_fit_trust_region_covariance() {
+    let mut cases = Vec::new();
+    for method in ["trf", "dogbox"] {
+        for bounded in [false, true] {
+            for absolute_sigma in [false, true] {
+                for underdetermined in [false, true] {
+                    cases.push(CovarianceCase {
+                        case_id: format!("{method}_bounded{bounded}_absolute{absolute_sigma}_under{underdetermined}"),
+                        method: method.to_owned(),
+                        bounded,
+                        absolute_sigma,
+                        xdata: if underdetermined { vec![0.0] } else { vec![0.0, 1.0, 2.0] },
+                        ydata: if underdetermined { vec![1.0] } else { vec![1.0, 2.0, 3.0] },
+                        p0: if underdetermined { vec![0.0, 0.0] } else { vec![1.0, 1.0] },
+                    });
+                }
+            }
+        }
+    }
+    let script = r#"
+import json
+import sys
+import warnings
+import numpy as np
+from scipy.optimize import OptimizeWarning, curve_fit
+
+out = []
+for case in json.load(sys.stdin):
+    x = np.asarray(case["xdata"], dtype=float)
+    y = np.asarray(case["ydata"], dtype=float)
+    def model(x, a, b):
+        return np.full(np.asarray(x).shape, a + b)
+    def jac(x, a, b):
+        return np.ones((np.size(x), 2))
+    options = dict(p0=case["p0"], method=case["method"], jac=jac,
+                   absolute_sigma=case["absolute_sigma"])
+    if case["bounded"]:
+        options["bounds"] = ([-2.0, -2.0], [2.0, 2.0])
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            popt, pcov = curve_fit(model, x, y, **options)
+        out.append(dict(case_id=case["case_id"], popt=popt.tolist(),
+                        pcov=pcov.tolist() if np.isfinite(pcov).all() else None,
+                        infinite_covariance=bool(np.isinf(pcov).all()),
+                        warning_count=sum(issubclass(w.category, OptimizeWarning) for w in caught),
+                        error=None))
+    except Exception as error:
+        out.append(dict(case_id=case["case_id"], popt=None, pcov=None,
+                        infinite_covariance=False, warning_count=0, error=str(error)))
+print(json.dumps(out))
+"#;
+    let Some(oracle): Option<Vec<CovarianceOracle>> = run_scipy_or_skip(&cases, script) else {
+        return;
+    };
+    assert_eq!(oracle.len(), cases.len());
+    let mut compared = 0;
+    for (case, expected) in cases.iter().zip(&oracle) {
+        assert_eq!(expected.case_id, case.case_id);
+        assert!(
+            expected.error.is_none(),
+            "{}: {:?}",
+            case.case_id,
+            expected.error
+        );
+        let method = if case.method == "trf" {
+            LeastSquaresMethod::Trf
+        } else {
+            LeastSquaresMethod::Dogbox
+        };
+        let observations = case.ydata.len();
+        let options = CurveFitOptions {
+            p0: Some(case.p0.clone()),
+            absolute_sigma: case.absolute_sigma,
+            ls_options: LeastSquaresOptions {
+                method: Some(method),
+                jac: Some(LeastSquaresJacobian::new(move |_| {
+                    vec![vec![1.0, 1.0]; observations]
+                })),
+                ..LeastSquaresOptions::default()
+            },
+        };
+        let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+            if case.bounded {
+                curve_fit_bounded(
+                    |_x, p| p[0] + p[1],
+                    &case.xdata,
+                    &case.ydata,
+                    &[-2.0, -2.0],
+                    &[2.0, 2.0],
+                    options,
+                )
+            } else {
+                curve_fit(|_x, p| p[0] + p[1], &case.xdata, &case.ydata, options)
+            }
+        });
+        let fit = fit.unwrap_or_else(|error| panic!("{}: {error}", case.case_id));
+        let popt = expected.popt.as_ref().expect("SciPy fit succeeded");
+        assert_eq!(fit.popt.len(), popt.len());
+        for (&got, &want) in fit.popt.iter().zip(popt) {
+            assert!(
+                (got - want).abs() < ABS_TOL,
+                "{}: {:?} vs {:?}",
+                case.case_id,
+                fit.popt,
+                popt
+            );
+        }
+        assert_eq!(fit.pcov.len(), popt.len());
+        assert!(fit.pcov.iter().all(|row| row.len() == popt.len()));
+        if expected.infinite_covariance {
+            assert!(
+                fit.pcov
+                    .iter()
+                    .flatten()
+                    .all(|value| *value == f64::INFINITY),
+                "{}: {:?}",
+                case.case_id,
+                fit.pcov
+            );
+        } else {
+            let pcov = expected.pcov.as_ref().expect("SciPy covariance is finite");
+            for (&got, &want) in fit.pcov.iter().flatten().zip(pcov.iter().flatten()) {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "{}: {:?} vs {:?}",
+                    case.case_id,
+                    fit.pcov,
+                    pcov
+                );
+            }
+        }
+        assert_eq!(
+            warnings.len(),
+            expected.warning_count,
+            "{}: {warnings:?}",
+            case.case_id
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 16,
+        "every method/entrypoint/variance/rank arm must run"
+    );
 }

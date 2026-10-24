@@ -200,7 +200,7 @@ fn scale_for_robust_loss(j: &mut [Vec<f64>], f: &mut [f64], rho: &[Vec<f64>; 3])
 /// Thin SVD `J = U·diag(s)·Vᵀ` (singular values descending) by one-sided Jacobi. Returns
 /// `(U` as k columns of length m, `s`, `V` as k columns of length n`)`, k = min(m, n).
 #[allow(clippy::type_complexity)]
-fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
+pub(super) fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
     let m = j.len();
     let transposed = m < n;
     // Columns of the matrix whose columns are orthogonalized: J (m ≥ n) or Jᵀ (m < n).

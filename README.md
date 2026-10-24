@@ -925,8 +925,9 @@ Plus:  minimize, minimize_with_audit, minimize_with_casp_portfolio,
 Roots: brentq, brenth, bisect, ridder, toms748, newton_scalar, halley, secant,
        anderson, broyden1, broyden2, fsolve, lm_root, root, root_scalar,
 
-Curve fitting: curve_fit, least_squares (TRF and Dogbox with bounds, robust
-               losses and parameter scaling, or LM; analytic Jacobians), nnls,
+Curve fitting: curve_fit (TRF/Dogbox underdetermined fits and SVD covariance),
+               least_squares (TRF and Dogbox with bounds, robust losses and
+               parameter scaling, or LM; analytic Jacobians), nnls,
                isotonic_regression,
 
 Global:        differential_evolution, dual_annealing, basinhopping, shgo, brute,

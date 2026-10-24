@@ -848,8 +848,9 @@ where
         detail: String::from("p0 (initial parameter guess) is required"),
     })?;
     let n_params = p0.len();
+    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm);
 
-    if xdata.len() < n_params {
+    if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
         return Err(OptError::InvalidArgument {
             detail: format!(
                 "number of data points ({}) must be >= number of parameters ({n_params})",
@@ -869,21 +870,13 @@ where
 
     // SciPy's curve_fit(method=None) runs 'lm' when there are no bounds.
     let ls_options = LeastSquaresOptions {
-        method: Some(options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm)),
+        method: Some(method),
         ..options.ls_options
     };
     let ls_result = least_squares(residuals, &p0, ls_options)?;
     require_fit_converged(&ls_result)?;
 
-    // Compute covariance: pcov = (J^T J)^{-1} * s^2
-    // where s^2 = cost * 2 / (m - n) for relative sigma
-    let pcov = compute_covariance(
-        &ls_result.jac,
-        ls_result.cost,
-        xdata.len(),
-        n_params,
-        options.absolute_sigma,
-    );
+    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -894,9 +887,9 @@ where
 }
 
 /// SciPy's `curve_fit` fills `pcov` with inf and warns `OptimizeWarning` when the covariance
-/// is indeterminate (a singular Jacobian) or, with relative sigma, when there are no more
-/// data points than parameters. `compute_covariance` returns the all-inf matrix in exactly
-/// those cases.
+/// is indeterminate (a singular LM Jacobian) or, with relative sigma, when there are no more
+/// data points than parameters. TRF and Dogbox instead use a pseudoinverse for a singular
+/// Jacobian.
 fn warn_if_covariance_not_estimated(pcov: &[Vec<f64>]) {
     if pcov.iter().flatten().any(|v| !v.is_finite()) {
         fsci_runtime::warn(
@@ -994,7 +987,8 @@ where
         detail: String::from("p0 (initial parameter guess) is required"),
     })?;
     let n_params = p0.len();
-    if xdata.len() < n_params {
+    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Trf);
+    if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
         return Err(OptError::InvalidArgument {
             detail: format!(
                 "number of data points ({}) must be >= number of parameters ({n_params})",
@@ -1014,13 +1008,7 @@ where
     let ls_result = least_squares_bounded(residuals, &p0, lower, upper, options.ls_options)?;
     require_fit_converged(&ls_result)?;
 
-    let pcov = compute_covariance(
-        &ls_result.jac,
-        ls_result.cost,
-        xdata.len(),
-        n_params,
-        options.absolute_sigma,
-    );
+    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -1617,7 +1605,69 @@ fn cholesky_solve_with_l_into(
     }
 }
 
-/// Compute parameter covariance matrix from Jacobian.
+/// SciPy's curve-fit covariance: LM retains its inverse, while TRF and Dogbox use
+/// the SVD pseudoinverse of JᵀJ without forming the condition-squaring normal matrix.
+fn curve_fit_covariance(
+    result: &LeastSquaresResult,
+    method: LeastSquaresMethod,
+    absolute_sigma: bool,
+) -> Vec<Vec<f64>> {
+    let m = result.fun.len();
+    let n = result.x.len();
+    if method == LeastSquaresMethod::Lm {
+        return compute_covariance(&result.jac, result.cost, m, n, absolute_sigma);
+    }
+    if !absolute_sigma && m <= n {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+    if result.jac.iter().flatten().any(|value| !value.is_finite()) {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+
+    // Normalize before the Jacobi SVD: its column inner products otherwise overflow
+    // or underflow for large/small model derivatives, even when the covariance is finite.
+    let scale = result
+        .jac
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    let mut covariance = vec![vec![0.0; n]; n];
+    if scale != 0.0 {
+        let normalized: Vec<Vec<f64>> = result
+            .jac
+            .iter()
+            .map(|row| row.iter().map(|value| value / scale).collect())
+            .collect();
+        let (_, singular_values, right_vectors) = trf::svd_thin(&normalized, n);
+        let threshold = f64::EPSILON * m.max(n) as f64 * singular_values[0];
+        for (&singular, vector) in singular_values.iter().zip(&right_vectors) {
+            if singular > threshold {
+                for (i, row) in covariance.iter_mut().enumerate() {
+                    for (j, entry) in row.iter_mut().enumerate() {
+                        *entry += (vector[i] / singular) * (vector[j] / singular);
+                    }
+                }
+            }
+        }
+        // Divide twice instead of forming scale², which can overflow for a finite J.
+        for entry in covariance.iter_mut().flatten() {
+            *entry /= scale;
+            *entry /= scale;
+        }
+    }
+    if covariance.iter().flatten().any(|value| value.is_nan()) {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+    if !absolute_sigma {
+        let residual_variance = 2.0 * result.cost / (m - n) as f64;
+        for entry in covariance.iter_mut().flatten() {
+            *entry *= residual_variance;
+        }
+    }
+    covariance
+}
+
+/// Compute the existing LM parameter covariance matrix from its Jacobian.
 fn compute_covariance(
     jac: &[Vec<f64>],
     cost: f64,
@@ -2469,6 +2519,261 @@ mod tests {
         assert!(result.pcov[0][0].is_finite());
         assert!(result.pcov[1][1].is_finite());
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn curve_fit_trust_region_accepts_underdetermined_models() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for bounded in [false, true] {
+                for absolute_sigma in [false, true] {
+                    let options = CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            gtol: 1e-12,
+                            xtol: 1e-12,
+                            ftol: 1e-12,
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    };
+                    let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                        if bounded {
+                            curve_fit_bounded(
+                                |_x, p| p[0] + p[1],
+                                &[0.0],
+                                &[1.0],
+                                &[-2.0, -2.0],
+                                &[2.0, 2.0],
+                                options,
+                            )
+                        } else {
+                            curve_fit(|_x, p| p[0] + p[1], &[0.0], &[1.0], options)
+                        }
+                    });
+                    let fit =
+                        fit.expect("TRF and Dogbox support fewer observations than parameters");
+                    for parameter in &fit.popt {
+                        assert!((parameter - 0.5).abs() < 1e-7, "{method:?}: {:?}", fit.popt);
+                    }
+                    assert_eq!(fit.pcov.len(), 2);
+                    assert!(fit.pcov.iter().all(|row| row.len() == 2));
+                    if absolute_sigma {
+                        assert!(
+                            fit.pcov
+                                .iter()
+                                .flatten()
+                                .all(|value| (value - 0.25).abs() < 1e-14)
+                        );
+                        assert!(warnings.is_empty(), "{warnings:?}");
+                    } else {
+                        assert!(fit.pcov.iter().flatten().all(|value| value.is_infinite()));
+                        assert_eq!(warnings.len(), 1);
+                        assert_eq!(
+                            warnings[0].category,
+                            fsci_runtime::WarningCategory::OptimizeWarning
+                        );
+                    }
+                }
+            }
+        }
+
+        for bounded in [false, true] {
+            let options = CurveFitOptions {
+                p0: Some(vec![0.0, 0.0]),
+                ls_options: LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            };
+            let result = if bounded {
+                curve_fit_bounded(
+                    |_x, p| p[0] + p[1],
+                    &[0.0],
+                    &[1.0],
+                    &[f64::NEG_INFINITY; 2],
+                    &[f64::INFINITY; 2],
+                    options,
+                )
+            } else {
+                curve_fit(|_x, p| p[0] + p[1], &[0.0], &[1.0], options)
+            };
+            assert!(
+                matches!(result, Err(OptError::InvalidArgument { detail }) if detail.contains("data points"))
+            );
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_rank_deficient_covariance() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for bounded in [false, true] {
+                for absolute_sigma in [false, true] {
+                    let options = CurveFitOptions {
+                        p0: Some(vec![1.0, 1.0]),
+                        absolute_sigma,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]; 3])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    };
+                    let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                        if bounded {
+                            curve_fit_bounded(
+                                |_x, p| p[0] + p[1],
+                                &[0.0, 1.0, 2.0],
+                                &[1.0, 2.0, 3.0],
+                                &[-2.0, -2.0],
+                                &[2.0, 2.0],
+                                options,
+                            )
+                        } else {
+                            curve_fit(
+                                |_x, p| p[0] + p[1],
+                                &[0.0, 1.0, 2.0],
+                                &[1.0, 2.0, 3.0],
+                                options,
+                            )
+                        }
+                    });
+                    let fit = fit.expect("rank-deficient fit has a pseudoinverse covariance");
+                    let expected = if absolute_sigma {
+                        1.0 / 12.0
+                    } else {
+                        1.0 / 6.0
+                    };
+                    for &entry in fit.pcov.iter().flatten() {
+                        assert!(
+                            (entry - expected).abs() < 1e-14,
+                            "{method:?}: {:?}",
+                            fit.pcov
+                        );
+                    }
+                    assert!(warnings.is_empty(), "{warnings:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_zero_rank_and_scipy_singular_value_cutoff() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for weak_derivative in [0.0, 5e-16, 1e-14] {
+                let options = CurveFitOptions {
+                    p0: Some(vec![0.0, 0.0]),
+                    absolute_sigma: true,
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            vec![vec![1.0, 0.0], vec![0.0, weak_derivative], vec![0.0, 0.0]]
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                };
+                let fit = curve_fit(
+                    |x, p| {
+                        if x == 0.0 {
+                            p[0]
+                        } else if x == 1.0 {
+                            weak_derivative * p[1]
+                        } else {
+                            0.0
+                        }
+                    },
+                    &[0.0, 1.0, 2.0],
+                    &[0.0, 0.0, 0.0],
+                    options,
+                )
+                .expect("small singular values are discarded by SciPy's dimension-aware cutoff");
+                assert!((fit.pcov[0][0] - 1.0).abs() < 1e-14);
+                if weak_derivative <= 5e-16 {
+                    assert_eq!(fit.pcov[1][1], 0.0);
+                } else {
+                    assert!((fit.pcov[1][1] / 1e28 - 1.0).abs() < 1e-14);
+                }
+                assert_eq!(fit.pcov[0][1], 0.0);
+                assert_eq!(fit.pcov[1][0], 0.0);
+            }
+            let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                curve_fit(
+                    |_x, _p| 0.0,
+                    &[0.0, 1.0, 2.0],
+                    &[1.0, 2.0, 3.0],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma: true,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0; 2]; 3])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    },
+                )
+            });
+            assert_eq!(
+                fit.expect("zero-rank pseudoinverse").pcov,
+                vec![vec![0.0; 2]; 2]
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_covariance_preserves_large_jacobian_units() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for derivative_scale in [1e80, 1e160] {
+                let fit = curve_fit(
+                    |x, p| {
+                        derivative_scale
+                            * if x == 0.0 {
+                                p[0] + p[1]
+                            } else if x == 1.0 {
+                                p[1]
+                            } else {
+                                p[0]
+                            }
+                    },
+                    &[0.0, 1.0, 2.0],
+                    &[0.0, 0.0, 0.0],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma: true,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(move |_| {
+                                vec![
+                                    vec![derivative_scale, derivative_scale],
+                                    vec![0.0, derivative_scale],
+                                    vec![derivative_scale, 0.0],
+                                ]
+                            })),
+                            ..LeastSquaresOptions::default()
+                        },
+                    },
+                )
+                .expect("finite covariance despite large derivatives");
+                for (i, row) in fit.pcov.iter().enumerate() {
+                    for (j, &entry) in row.iter().enumerate() {
+                        let expected = if i == j { 2.0 / 3.0 } else { -1.0 / 3.0 };
+                        let restored = entry * derivative_scale * derivative_scale;
+                        // At scale 1e160 the covariance is subnormal, with ~4 decimal digits.
+                        let tolerance = if derivative_scale > 1e100 {
+                            5e-4
+                        } else {
+                            1e-14
+                        };
+                        assert!(
+                            (restored - expected).abs() < tolerance,
+                            "{method:?}: {:?}",
+                            fit.pcov
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
