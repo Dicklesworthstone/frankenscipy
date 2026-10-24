@@ -39740,7 +39740,6 @@ question about the algorithm, and it is the first time this bead has had one.
   something other than the ordering enum) BEFORE the default moves, plus its own live rows on
   the cubic and periodic-cuboid cells to show the recognizers still fire. Until then `Amd`
   stays opt-in, which is how it is committed.
-<<<<<<< HEAD
 
 ## 2026-08-26 - BlackThrush (cc) - COUNTED: widening the periodic-cuboid recognizer cuts a cubic grid's spsolve 355,902,029 -> 21,658,722 Ir, and the stale 124.677x figure does NOT describe HEAD
 
