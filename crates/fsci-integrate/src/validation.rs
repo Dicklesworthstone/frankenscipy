@@ -109,8 +109,7 @@ pub fn check_hardened_integrate_cap(
     }
     let (max_state_dim, max_steps, _max_nfev) = hardened_integrate_caps();
     if state_dim > max_state_dim {
-        let message =
-            format!("state dimension {state_dim} exceeds Hardened cap {max_state_dim}");
+        let message = format!("state dimension {state_dim} exceeds Hardened cap {max_state_dim}");
         fail_closed(audit, "resource_exhausted", &message);
         return Err(IntegrateValidationError::ResourceExhausted { message });
     }
@@ -195,6 +194,10 @@ pub enum IntegrateValidationError {
         expected: usize,
         actual: usize,
     },
+    JacobianWrongShape {
+        expected: usize,
+    },
+    NonFiniteJacobian,
     NonFiniteEventDirection {
         index: usize,
     },
@@ -250,6 +253,10 @@ impl std::fmt::Display for IntegrateValidationError {
                 f,
                 "right-hand side returned {actual} derivative values, expected {expected}."
             ),
+            Self::JacobianWrongShape { expected } => {
+                write!(f, "`jac` must have shape ({expected}, {expected}).")
+            }
+            Self::NonFiniteJacobian => write!(f, "`jac` must contain only finite values."),
             Self::NonFiniteEventDirection { index } => {
                 write!(f, "event {index} has a non-finite direction.")
             }
@@ -299,6 +306,8 @@ impl IntegrateValidationError {
             Self::NonFiniteSpan => "non_finite_span",
             Self::NonFiniteF0 => "non_finite_f0",
             Self::RhsWrongShape { .. } => "rhs_wrong_shape",
+            Self::JacobianWrongShape { .. } => "jacobian_wrong_shape",
+            Self::NonFiniteJacobian => "non_finite_jacobian",
             Self::NonFiniteEventDirection { .. } => "event_direction_must_be_finite",
             Self::EventMaxEventsMustBePositive { .. } => "event_max_events_must_be_positive",
             Self::NonFiniteEventValue { .. } => "non_finite_event_value",
@@ -322,6 +331,24 @@ pub(crate) fn validate_rhs_shape(
         return Err(IntegrateValidationError::RhsWrongShape { expected, actual });
     }
     Ok(())
+}
+
+/// Evaluate a dense user Jacobian and validate it before indexing or factoring it.
+/// This check runs on every callback, including refreshes after Newton failures.
+pub(crate) fn evaluate_jacobian(
+    jac: crate::JacFn,
+    t: f64,
+    y: &[f64],
+) -> Result<nalgebra::DMatrix<f64>, IntegrateValidationError> {
+    let rows = jac(t, y);
+    let n = y.len();
+    if rows.len() != n || rows.iter().any(|row| row.len() != n) {
+        return Err(IntegrateValidationError::JacobianWrongShape { expected: n });
+    }
+    if rows.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(IntegrateValidationError::NonFiniteJacobian);
+    }
+    Ok(nalgebra::DMatrix::from_fn(n, n, |i, j| rows[i][j]))
 }
 
 pub fn validate_first_step(

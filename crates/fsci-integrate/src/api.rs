@@ -93,11 +93,10 @@ pub struct SolveIvpOptions<'a> {
     pub first_step: Option<f64>,
     pub max_step: f64,
     pub mode: RuntimeMode,
-    /// SciPy's `jac`: `jac(t, y)[i][j] = d f_i / d y_j`. LSODA uses it in place of its
-    /// finite-difference Jacobian (ODEPACK `jt = 1` instead of 2). The explicit Runge-Kutta
-    /// methods ignore it, as SciPy's do (with a warning there); BDF and Radau here form their
-    /// Jacobians by differences only, so a `jac` with either is refused as not implemented
-    /// rather than silently not used.
+    /// SciPy's `jac`: `jac(t, y)[i][j] = d f_i / d y_j`. BDF, Radau, and LSODA use it
+    /// in place of finite differences, including every Jacobian refresh. BDF and Radau
+    /// validate the square shape and finite entries on each evaluation. The explicit
+    /// Runge-Kutta methods ignore it, as SciPy's do (with a warning there).
     pub jac: Option<JacFn>,
 }
 
@@ -1224,6 +1223,10 @@ where
                     break;
                 }
             }
+            Err(StepFailure::InvalidJacobian(error)) => {
+                fail_closed(audit, error.reason_code(), "rejected");
+                return Err(error);
+            }
             Err(_) => {
                 status = -1;
                 break;
@@ -1478,9 +1481,7 @@ where
         }
     }
 
-    let max_diag = (0..n)
-        .map(|i| jac[i * n + i].abs())
-        .fold(0.0_f64, f64::max);
+    let max_diag = (0..n).map(|i| jac[i * n + i].abs()).fold(0.0_f64, f64::max);
     let spectral_radius = rho_power.max(max_diag);
     let stiffness_indicator = spectral_radius * span;
     let rtol_fifth = options.rtol.abs().max(1e-15).powf(0.2);
@@ -1616,13 +1617,12 @@ fn solve_ivp_with_casp_portfolio_impl<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
-    let effective_mode = if options.mode == RuntimeMode::Hardened
-        || portfolio.mode() == RuntimeMode::Hardened
-    {
-        RuntimeMode::Hardened
-    } else {
-        RuntimeMode::Strict
-    };
+    let effective_mode =
+        if options.mode == RuntimeMode::Hardened || portfolio.mode() == RuntimeMode::Hardened {
+            RuntimeMode::Hardened
+        } else {
+            RuntimeMode::Strict
+        };
     crate::validation::check_hardened_integrate_cap(
         options.y0.len(),
         options.max_step,
@@ -1657,8 +1657,7 @@ where
     let hw_abort_streak = is_explicit.then_some(10);
     let forced_fail = take_forced_casp_first_attempt_failure();
 
-    let (mut res, diag) =
-        solve_ivp_impl_with_diag(fun, &resolved_opts, audit, hw_abort_streak)?;
+    let (mut res, diag) = solve_ivp_impl_with_diag(fun, &resolved_opts, audit, hw_abort_streak)?;
     if forced_fail {
         res.status = -1;
         res.success = false;
@@ -1956,16 +1955,6 @@ where
         validate_t_eval_with_audit(t_eval, t0, tf, audit)?;
     }
 
-    // SciPy's BDF and Radau would use `jac`; these form their Jacobians by differences only.
-    if resolved_options.jac.is_some()
-        && matches!(resolved_options.method, SolverKind::Bdf | SolverKind::Radau)
-    {
-        fail_closed(audit, "not_yet_implemented", "rejected");
-        return Err(IntegrateValidationError::NotYetImplemented {
-            function: "solve_ivp(jac=...) with BDF or Radau",
-        });
-    }
-
     match resolved_options.method {
         SolverKind::Rk45 | SolverKind::Rk23 | SolverKind::Dop853 => {
             let tableau = match resolved_options.method {
@@ -1999,7 +1988,8 @@ where
                 first_step,
                 mode: resolved_options.mode,
             };
-            let solver = crate::radau::RadauSolver::new(fun, config)?;
+            let solver =
+                crate::radau::RadauSolver::new_with_jacobian(fun, config, resolved_options.jac)?;
             solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Bdf => {
@@ -2014,7 +2004,7 @@ where
                 mode: resolved_options.mode,
                 max_order: 5,
             };
-            let solver = BdfSolver::new(fun, config)?;
+            let solver = BdfSolver::new_with_jacobian(fun, config, resolved_options.jac)?;
             solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Lsoda => {
@@ -3197,8 +3187,7 @@ mod tests {
         }
     }
 
-    /// Negative arms: a Jacobian of the wrong shape fails the step (SciPy raises), a `jac` for
-    /// BDF or Radau is refused rather than silently replaced by differences, and a finished
+    /// A Jacobian of the wrong shape fails the step (SciPy raises), and a finished
     /// solver cannot be stepped.
     #[test]
     fn lsoda_rejects_bad_jacobians_and_finished_steps() {
@@ -3220,22 +3209,6 @@ mod tests {
         );
         assert_eq!(solver.state(), OdeSolverState::Failed);
 
-        for method in [SolverKind::Bdf, SolverKind::Radau] {
-            let err = solve_ivp(
-                &mut fun,
-                &SolveIvpOptions {
-                    method,
-                    jac: Some(stiff_cos_jac),
-                    ..lsoda_options((0.0, 1.0), &[0.0], 1e-3, 1e-6)
-                },
-            )
-            .expect_err("jac with BDF/Radau is not implemented");
-            assert!(
-                matches!(err, IntegrateValidationError::NotYetImplemented { .. }),
-                "{err:?}"
-            );
-        }
-
         let mut solver = crate::LSODA::new(lsoda_config((0.0, 0.1), &[0.0], None)).expect("init");
         while solver.state() == OdeSolverState::Running {
             solver.step_with(&mut fun).expect("step");
@@ -3246,6 +3219,217 @@ mod tests {
             "the last step lands on t_bound"
         );
         assert!(solver.step_with(&mut fun).is_err());
+    }
+
+    std::thread_local! {
+        static IMPLICIT_JAC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn implicit_user_jacobians_are_used_and_counted() {
+        fn jac(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            IMPLICIT_JAC_CALLS.with(|calls| calls.set(calls.get() + 1));
+            vec![vec![-1000.0, 1.0], vec![0.0, -1.0]]
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for method in [SolverKind::Bdf, SolverKind::Radau] {
+                IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
+                let mut rhs_calls = 0;
+                let mut fun = |_t: f64, y: &[f64]| {
+                    rhs_calls += 1;
+                    vec![-1000.0 * y[0] + y[1], -y[1]]
+                };
+                let result = solve_ivp(
+                    &mut fun,
+                    &SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &[1.0, 1.0],
+                        method,
+                        mode,
+                        jac: Some(jac),
+                        rtol: 1e-8,
+                        atol: ToleranceValue::Scalar(1e-11),
+                        ..SolveIvpOptions::default()
+                    },
+                )
+                .expect("analytic Jacobian is supported");
+                assert!(result.success, "{method:?} {mode:?}");
+                assert_eq!(result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
+                assert!(result.njev > 0, "the callback must actually be used");
+                assert_eq!(result.nfev, rhs_calls, "no hidden finite-difference calls");
+                let y = result.y.last().expect("final state");
+                let exact = [(-1.0_f64).exp() / 999.0, (-1.0_f64).exp()];
+                for (got, expected) in y.iter().zip(exact) {
+                    assert!((got - expected).abs() < 2e-8, "{method:?}: {y:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_user_jacobians_refresh_on_nonlinear_problems() {
+        fn jac(_t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            IMPLICIT_JAC_CALLS.with(|calls| calls.set(calls.get() + 1));
+            vec![vec![-200.0 * y[0]]]
+        }
+        for method in [SolverKind::Bdf, SolverKind::Radau] {
+            IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
+            let mut rhs_calls = 0;
+            let result = solve_ivp(
+                &mut |_t, y| {
+                    rhs_calls += 1;
+                    vec![-100.0 * y[0] * y[0]]
+                },
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0],
+                    method,
+                    jac: Some(jac),
+                    rtol: 1e-8,
+                    atol: ToleranceValue::Scalar(1e-11),
+                    first_step: Some(0.2),
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .expect("nonlinear solve with analytic Jacobian");
+            assert!(result.success);
+            assert!(result.njev > 1, "{method:?} must exercise refreshes");
+            assert_eq!(result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
+            assert_eq!(result.nfev, rhs_calls);
+            let got = result.y.last().expect("final state")[0];
+            assert!((got - 1.0 / 101.0).abs() < 2e-9, "{method:?}: {got}");
+        }
+    }
+
+    #[test]
+    fn implicit_user_jacobians_validate_initial_values_and_refreshes() {
+        fn wrong_shape(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![-1.0, 0.0], vec![]]
+        }
+        fn nonfinite(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![f64::NAN]]
+        }
+        fn wrong_on_refresh(t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            if t == 0.0 {
+                vec![vec![-200.0 * y[0]]]
+            } else {
+                vec![]
+            }
+        }
+        fn nonfinite_on_refresh(t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![if t == 0.0 {
+                -200.0 * y[0]
+            } else {
+                f64::INFINITY
+            }]]
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for method in [SolverKind::Bdf, SolverKind::Radau] {
+                for (jac, error) in [
+                    (
+                        wrong_shape as JacFn,
+                        IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                    ),
+                    (
+                        nonfinite as JacFn,
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
+                    (
+                        wrong_on_refresh as JacFn,
+                        IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                    ),
+                    (
+                        nonfinite_on_refresh as JacFn,
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
+                ] {
+                    let result = solve_ivp(
+                        &mut |_t, y| vec![-100.0 * y[0] * y[0]],
+                        &SolveIvpOptions {
+                            t_span: (0.0, 1.0),
+                            y0: &[1.0],
+                            method,
+                            mode,
+                            jac: Some(jac),
+                            first_step: Some(0.2),
+                            rtol: 1e-8,
+                            atol: ToleranceValue::Scalar(1e-11),
+                            ..SolveIvpOptions::default()
+                        },
+                    );
+                    assert_eq!(
+                        result.expect_err("invalid callback must fail closed"),
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_stepwise_jacobian_failure_is_terminal() {
+        fn rhs(_t: f64, y: &[f64]) -> Vec<f64> {
+            vec![-100.0 * y[0] * y[0]]
+        }
+        fn jac(t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            if t == 0.0 {
+                vec![vec![-200.0 * y[0]]]
+            } else {
+                vec![vec![f64::NAN]]
+            }
+        }
+        fn assert_terminal<S: IvpSolver<fn(f64, &[f64]) -> Vec<f64>>>(mut solver: S) {
+            let mut fun = rhs as fn(f64, &[f64]) -> Vec<f64>;
+            let failure = loop {
+                match solver.step_with(&mut fun) {
+                    Ok(_) => assert_eq!(solver.ivp_state(), OdeSolverState::Running),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(
+                failure,
+                StepFailure::InvalidJacobian(IntegrateValidationError::NonFiniteJacobian)
+            );
+            assert_eq!(solver.ivp_state(), OdeSolverState::Failed);
+            assert_eq!(solver.njev(), 2);
+            assert!(matches!(
+                solver.step_with(&mut fun),
+                Err(StepFailure::RuntimeError(_))
+            ));
+        }
+        let bdf = BdfSolver::new_with_jacobian(
+            &mut rhs,
+            BdfSolverConfig {
+                t0: 0.0,
+                y0: &[1.0],
+                t_bound: 1.0,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-11),
+                max_step: f64::INFINITY,
+                first_step: Some(0.2),
+                mode: RuntimeMode::Strict,
+                max_order: 5,
+            },
+            Some(jac),
+        )
+        .expect("valid initial BDF Jacobian");
+        assert_terminal(bdf);
+        let radau = crate::RadauSolver::new_with_jacobian(
+            &mut rhs,
+            crate::RadauSolverConfig {
+                t0: 0.0,
+                y0: &[1.0],
+                t_bound: 1.0,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-11),
+                max_step: f64::INFINITY,
+                first_step: Some(0.2),
+                mode: RuntimeMode::Strict,
+            },
+            Some(jac),
+        )
+        .expect("valid initial Radau Jacobian");
+        assert_terminal(radau);
     }
 
     /// `scipy.integrate.LSODA` used to be an empty unit struct (frankenscipy-8dndw.1), then an

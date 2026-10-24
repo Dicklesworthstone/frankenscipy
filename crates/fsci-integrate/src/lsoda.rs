@@ -51,7 +51,8 @@
 
 use crate::solver::StepFailure;
 
-/// A user Jacobian for LSODA (`jt = 1`): `jac(t, y)[i][j] = d f_i / d y_j`, `n` rows of `n`.
+/// A dense user Jacobian: `jac(t, y)[i][j] = d f_i / d y_j`, `n` rows of `n`.
+/// Used by BDF, Radau, and LSODA (`jt = 1`).
 pub type JacFn = fn(f64, &[f64]) -> Vec<Vec<f64>>;
 
 /// Stability-region step bounds for the Adams methods of order 1..12 (`sm1` in `stoda`).

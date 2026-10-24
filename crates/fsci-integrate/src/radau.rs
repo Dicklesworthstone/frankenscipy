@@ -6,8 +6,8 @@
 //! The collocation system is solved by simplified Newton in SciPy's transformed variables
 //! `W = T⁻¹Z`, with one real factor `(MU_REAL/h)I − J` and one complex factor
 //! `(MU_COMPLEX/h)I − J`; the Newton start `Z0` is extrapolated from the previous step's
-//! dense output. `J` is SciPy's finite-difference `num_jac`, taken at `(t0, y0)` on
-//! construction, refreshed at the current point when Newton fails on a Jacobian that is not
+//! dense output. `J` is a user-supplied Jacobian or SciPy's finite-difference `num_jac`, taken
+//! at `(t0, y0)` on construction, refreshed at the current point when Newton fails on a Jacobian that is not
 //! current, and after an accepted step that converged slowly. The factor pair is kept while
 //! the step size is held (predicted factor below 1.2 and no Jacobian refresh), and the step
 //! size comes from SciPy's two-step predictive controller. The embedded order-3 error
@@ -22,7 +22,8 @@
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
 use crate::step_size::{InitialStepRequest, num_jac, select_initial_step};
 use crate::validation::{
-    ToleranceValue, validate_first_step, validate_max_step, validate_rhs_shape, validate_tol,
+    ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
+    validate_tol,
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{Complex, DMatrix, DVector};
@@ -341,6 +342,7 @@ pub struct RadauSolver {
     t_old: Option<f64>,
     y_old: Option<Vec<f64>>,
 
+    jac_callback: Option<crate::JacFn>,
     jac: DMatrix<f64>,
     /// SciPy's `jac_factor`, carried by `num_jac` from one Jacobian to the next.
     jac_factor: Option<Vec<f64>>,
@@ -356,6 +358,22 @@ impl RadauSolver {
     pub fn new<F>(
         fun: &mut F,
         config: RadauSolverConfig<'_>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        Self::new_with_jacobian(fun, config, None)
+    }
+
+    /// Create a Radau solver with an optional dense analytic Jacobian.
+    ///
+    /// The callback returns `d f_i / d y_j` in row `i`, column `j`. It is evaluated
+    /// at construction and refreshed by the same Newton convergence policy as a
+    /// finite-difference Jacobian. `None` retains [`Self::new`]'s finite differences.
+    pub fn new_with_jacobian<F>(
+        fun: &mut F,
+        config: RadauSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
     ) -> Result<Self, crate::IntegrateValidationError>
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -421,7 +439,10 @@ impl RadauSolver {
         // SciPy's Radau.__init__ takes the first Jacobian here (njev = 1, its evaluations
         // not counted in nfev) and marks it current.
         let mut jac_factor = None;
-        let jac = num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor);
+        let jac = match jac_callback {
+            Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
+            None => num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor),
+        };
         let jac_diagonal = diagonal_jacobian_entries(&jac);
 
         Ok(Self {
@@ -445,6 +466,7 @@ impl RadauSolver {
             f: f0,
             t_old: None,
             y_old: None,
+            jac_callback,
             jac,
             jac_factor,
             jac_diagonal,
@@ -510,18 +532,32 @@ impl RadauSolver {
                 state: OdeSolverState::Finished,
             });
         }
-        self.radau_step(fun)
+        let result = self.radau_step(fun);
+        if result.is_err() {
+            self.state = OdeSolverState::Failed;
+        }
+        result
     }
 
     /// A fresh Jacobian at `(t, y)` with `f = fun(t, y)` (SciPy's `jac_wrapped`).
-    fn refresh_jacobian<F>(&mut self, fun: &mut F, t: f64, y: &[f64], f: &[f64])
+    fn refresh_jacobian<F>(
+        &mut self,
+        fun: &mut F,
+        t: f64,
+        y: &[f64],
+        f: &[f64],
+    ) -> Result<(), StepFailure>
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
-        self.jac = num_jac(fun, t, y, f, &self.atol, &mut self.jac_factor);
         self.njev += 1;
+        self.jac = match self.jac_callback {
+            Some(jac) => evaluate_jacobian(jac, t, y).map_err(StepFailure::InvalidJacobian)?,
+            None => num_jac(fun, t, y, f, &self.atol, &mut self.jac_factor),
+        };
         self.jac_diagonal = diagonal_jacobian_entries(&self.jac);
         self.current_jac = true;
+        Ok(())
     }
 
     /// SciPy's `Radau._step_impl`.
@@ -612,7 +648,7 @@ impl RadauSolver {
                 if self.current_jac {
                     break;
                 }
-                self.refresh_jacobian(fun, t, &y, &f);
+                self.refresh_jacobian(fun, t, &y, &f)?;
                 self.factors = None;
             }
             let Some((n_iter, z, rate)) = solved else {
@@ -674,7 +710,7 @@ impl RadauSolver {
         let f_new = fun(t_new, &y_new);
         self.nfev += 1;
         if recompute_jac {
-            self.refresh_jacobian(fun, t_new, &y_new, &f_new);
+            self.refresh_jacobian(fun, t_new, &y_new, &f_new)?;
         } else {
             self.current_jac = false;
         }

@@ -5,7 +5,7 @@
 //! Genuine variable-order (1-5) BDF with adaptive step size, a faithful port of
 //! `scipy.integrate.solve_ivp(method='BDF')` (`scipy/integrate/_ivp/bdf.py`):
 //! predictor from the backward-difference array `D`, modified-Newton corrector on
-//! `(I − c·J)` with a lazily-refreshed finite-difference Jacobian, and combined
+//! `(I − c·J)` with a lazily-refreshed analytic or finite-difference Jacobian, and combined
 //! error/step/order control via `change_D`. Order and step are reconsidered after
 //! `n_equal_steps >= order + 1` accepted steps by comparing the local error at
 //! orders `k-1`, `k`, `k+1` (frankenscipy-3y5p9). `SolverKind::Radau` now has its
@@ -14,7 +14,8 @@
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
 use crate::step_size::{InitialStepRequest, num_jac, select_initial_step};
 use crate::validation::{
-    ToleranceValue, validate_first_step, validate_max_step, validate_rhs_shape, validate_tol,
+    ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
+    validate_tol,
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
@@ -477,8 +478,9 @@ pub struct BdfSolver {
     // Nordsieck-style array: d[k] for k = 0..order
     d: Vec<Vec<f64>>,
 
-    // Newton solver state. The Jacobian is SciPy's finite-difference `num_jac`, first taken
-    // at (t0, y0) in `new` and refreshed at most once per step, when Newton fails on it.
+    // Newton solver state. The Jacobian is first taken at (t0, y0) and refreshed at most
+    // once per step, when Newton fails on it. `None` uses SciPy's finite-difference num_jac.
+    jac_callback: Option<crate::JacFn>,
     current_jac: Option<DMatrix<f64>>,
     /// SciPy's `jac_factor`: the per-column relative difference step `num_jac` carries
     /// from one Jacobian to the next.
@@ -519,6 +521,22 @@ impl BdfSolver {
     pub fn new<F>(
         fun: &mut F,
         config: BdfSolverConfig<'_>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        Self::new_with_jacobian(fun, config, None)
+    }
+
+    /// Create a BDF solver with an optional dense analytic Jacobian.
+    ///
+    /// `jac(t, y)[i][j]` is `d f_i / d y_j`. A callback is evaluated initially and
+    /// whenever Newton convergence requires a fresh Jacobian. Its evaluations count
+    /// toward `njev`, never `nfev`. `None` uses finite differences as in [`Self::new`].
+    pub fn new_with_jacobian<F>(
+        fun: &mut F,
+        config: BdfSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
     ) -> Result<Self, crate::IntegrateValidationError>
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -600,7 +618,10 @@ impl BdfSolver {
         // SciPy's BDF.__init__ takes the first Jacobian here, at (t0, y0): njev = 1 before
         // the first step, and its evaluations are not counted in nfev.
         let mut jac_factor = None;
-        let jac = num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor);
+        let jac = match jac_callback {
+            Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
+            None => num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor),
+        };
         let jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
         let jac_band = if jac_diagonal.is_some() {
             None
@@ -627,6 +648,7 @@ impl BdfSolver {
             nlu: 0,
             mode: config.mode,
             d,
+            jac_callback,
             current_jac: Some(jac),
             jac_factor,
             dense: None,
@@ -721,7 +743,11 @@ impl BdfSolver {
             });
         }
 
-        self.bdf_step_impl(fun)
+        let result = self.bdf_step_impl(fun);
+        if result.is_err() {
+            self.state = OdeSolverState::Failed;
+        }
+        result
     }
 
     // Index-aligned array arithmetic over the difference array reads cleaner with
@@ -916,16 +942,22 @@ impl BdfSolver {
                         // SciPy's jac_wrapped: f at the point (not counted in nfev), then
                         // num_jac. The O(n²) structural scan runs once per Jacobian, not
                         // once per factorization — see `newton_denominators`.
-                        let f_pred = fun(t_new, &y_predict);
-                        let jac = num_jac(
-                            fun,
-                            t_new,
-                            &y_predict,
-                            &f_pred,
-                            &self.atol,
-                            &mut self.jac_factor,
-                        );
                         self.njev += 1;
+                        let jac = match self.jac_callback {
+                            Some(jac) => evaluate_jacobian(jac, t_new, &y_predict)
+                                .map_err(StepFailure::InvalidJacobian)?,
+                            None => {
+                                let f_pred = fun(t_new, &y_predict);
+                                num_jac(
+                                    fun,
+                                    t_new,
+                                    &y_predict,
+                                    &f_pred,
+                                    &self.atol,
+                                    &mut self.jac_factor,
+                                )
+                            }
+                        };
                         self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
                         self.jac_band = if self.jac_diagonal.is_some() {
                             None // the diagonal path is strictly better; do not double-scan.
