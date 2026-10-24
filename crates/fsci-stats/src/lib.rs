@@ -1013,10 +1013,12 @@ pub trait ContinuousDistribution {
                     .collect();
                 if let Some(ledger) = ledger {
                     let fp = make_fp();
-                    let pos_digest =
-                        fsci_runtime::Fingerprinter::new("stats_fit_nonfinite_positions")
-                            .usizes(&nonfinite_positions)
-                            .finish();
+                    let mut pos_fp =
+                        fsci_runtime::Fingerprinter::new("stats_fit_nonfinite_positions");
+                    for idx in &nonfinite_positions {
+                        pos_fp.usize(*idx);
+                    }
+                    let pos_digest = pos_fp.finish();
                     record_bounded_recovery(
                         ledger,
                         &fp,
