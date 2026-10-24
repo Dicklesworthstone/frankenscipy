@@ -118,15 +118,15 @@ For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/pl
 
 ## Quick Example
 
-Add the crates you need (published on crates.io at 0.3.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
+Add the crates you need (published on crates.io at 0.4.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
 
 ```toml
 [dependencies]
-fsci-runtime    = "0.3"
-fsci-linalg     = "0.3"
-fsci-stats      = "0.3"
-fsci-special    = "0.3"
-fsci-integrate  = "0.3"
+fsci-runtime    = "0.4"
+fsci-linalg     = "0.4"
+fsci-stats      = "0.4"
+fsci-special    = "0.4"
+fsci-integrate  = "0.4"
 ```
 
 To track `main` instead, use `{ git = "https://github.com/Dicklesworthstone/frankenscipy" }` for each crate.
@@ -660,8 +660,8 @@ V1.0 is gated on the following items. Items 2, 4 and 6 are complete; 1, 3, 5 and
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
 3. **CI that stays green.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`); the first fully green fan-out was run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) on 2026-09-08 (43/43 jobs). Subsequent full fan-outs passed on 2026-09-25 ([`36123052714`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/36123052714), 45/45 jobs) and 2026-09-28 (`37116491361`, G3 green); sustaining streak stability is tracked under `frankenscipy-zbtht`.
 4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
-5. **Extend CASP beyond `fsci-linalg`.** Audited portfolio entry points exist for dense solve, sparse (`spsolve_with_casp_and_audit`), optimize (`minimize_with_casp_portfolio_and_audit`), ODE (`solve_ivp_with_casp_portfolio_and_audit`) and hypergeometric selection (`select_hypergeometric_branch_with_casp_and_audit`). Making the non-linalg portfolios empirically calibrated and auto-extracted is tracked under `frankenscipy-xzuno` and `frankenscipy-7tb8d.3`.
-6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed with Git tag `v0.2.0`; all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are now published on crates.io at version `0.3.0` with full `#![forbid(unsafe_code)]` compliance.
+5. **Extend CASP beyond `fsci-linalg`.** Opt-in portfolio types exist for sparse, optimize, ODE and hypergeometric selection (`SparseSolverPortfolio`, `OptSolverPortfolio`, `OdeSolverPortfolio`, `HyperSolverPortfolio`). Audited entry points exist for dense solve (`solve_with_casp` / `solve_with_audit`), sparse (`spsolve_with_casp` / `spsolve_with_audit`), optimize (`minimize_with_casp_portfolio_and_audit`), ODE (`solve_ivp_with_casp_portfolio_and_audit`) and hypergeometric selection (`select_hypergeometric_branch_with_casp_and_audit`). The non-linalg portfolios' features are mostly caller-supplied, their loss matrices are hand-set, and no default entry point uses them; making them evidence-driven, empirically calibrated and auto-extracted is tracked under `frankenscipy-xzuno` and the `frankenscipy-7tb8d` epic (including `frankenscipy-7tb8d.3`). The strict/hardened split with `HARDENED_MAX_DIM` is real in `fsci-linalg` and in one entry point each of signal, ndimage, interpolate, spatial, cluster and io (see **Participating Crates**).
+6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed with Git tag `v0.2.0`; all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are now published on crates.io at version `0.4.0` with full `#![forbid(unsafe_code)]` compliance.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are present in `crates/fsci-conformance/fixtures/artifacts/`; migration is tracked under `frankenscipy-icmu7`.
 
 `optimize.direct`, `stats.CensoredData` and `stats.Covariance` are implemented. The open work toward V1.0 is tracked in beads labelled `reality-check-2026-09-23` (capstone `frankenscipy-tit1y`); run `bv --robot-triage` for the live picture.
@@ -1671,7 +1671,7 @@ The active beads tracker (`.beads/issues.jsonl`) is the internal-state-of-truth 
 
 ## Installation
 
-FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.3.0 (tags `v0.1.0`, `v0.2.0` and `v0.3.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
+FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.4.0 (tags `v0.1.0` through `v0.4.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
 
 ### Prerequisites
 
@@ -1684,8 +1684,8 @@ FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.3.0
 ```toml
 # Cargo.toml of your project
 [dependencies]
-fsci-linalg = "0.3"
-fsci-stats  = "0.3"
+fsci-linalg = "0.4"
+fsci-stats  = "0.4"
 ```
 
 ### Per-crate, as a Git dependency (tracks `main`)
@@ -1694,7 +1694,7 @@ fsci-stats  = "0.3"
 [dependencies]
 fsci-linalg = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
 fsci-stats  = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
-# or pin: { git = "...", tag = "v0.3.0" } / { git = "...", rev = "<commit-sha>" }
+# or pin: { git = "...", tag = "v0.4.0" } / { git = "...", rev = "<commit-sha>" }
 ```
 
 ### From source (workspace clone)
@@ -1973,8 +1973,8 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
-- **Tagged release available.** The workspace is released at `0.3.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
-- **Name coverage vs behavioural parity.** Across 33<!-- fact:census_modules --> `scipy.*` modules (`1,555`<!-- fact:census_scipy --> public symbols; `16`<!-- fact:census_na --> N/A; `1,539`<!-- fact:census_applicable --> applicable), `scripts/symbol_census.py` counts **`1,495`<!-- fact:census_declared --> declared (`97.1%`)**, **`1,525`<!-- fact:census_real --> real (`99.1%`)**, and **`891`<!-- fact:census_compared --> differentially compared (`57.9%`)** (see [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) and [`docs/planning/symbol_census.json`](docs/planning/symbol_census.json)). The 14 missing symbols are recorded in `docs/planning/census_dispositions.toml`.
+- **Tagged release available.** The workspace is released at `0.4.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
+- **Name coverage vs behavioural parity.** Across 33<!-- fact:census_modules --> `scipy.*` modules (`1,555`<!-- fact:census_scipy --> public symbols; `16`<!-- fact:census_na --> N/A; `1,539`<!-- fact:census_applicable --> applicable), `scripts/symbol_census.py` counts **`1,495`<!-- fact:census_declared --> declared (`97.1%`)**, **`1,525`<!-- fact:census_real --> real (`99.1%`)**, and **`891`<!-- fact:census_compared --> differentially compared (`57.9%`)** (see [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) and [`docs/planning/symbol_census.json`](docs/planning/symbol_census.json)). The 14 missing symbols are recorded in `docs/planning/census_dispositions.toml`. The earlier 1,300-symbol census listed `optimize.direct`, `stats.CensoredData` and `stats.Covariance` as residual focus areas; they are implemented and are not in that missing list.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.

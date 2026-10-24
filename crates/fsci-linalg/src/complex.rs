@@ -1481,7 +1481,7 @@ fn lahqr(
                 h[(l, l - 1)] = CZERO;
             }
             if l >= iu {
-                // status: active QR subblock deflated to 1x1 (l >= iu)
+                // status: the active block is empty (l >= iu after zlahqr's small-subdiagonal test), so iu has deflated to a 1x1
                 converged = true;
                 break;
             }

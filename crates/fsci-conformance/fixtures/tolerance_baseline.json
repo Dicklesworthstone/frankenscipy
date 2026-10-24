@@ -16,6 +16,7 @@
     "ABS_TOL": 1e-10
   },
   "diff_cluster_dbscan_properties.rs": {},
+  "diff_cluster_dendrogram.rs": {},
   "diff_cluster_fclusterdata.rs": {},
   "diff_cluster_fowlkes_mallows.rs": {
     "ABS_TOL": 1e-12
@@ -78,6 +79,7 @@
   "diff_fft_fftconvolve_fftcorrelate.rs": {
     "ABS_TOL": 1e-10
   },
+  "diff_fft_fftpack_pseudo_diffs.rs": {},
   "diff_fft_helpers_windows_pad.rs": {
     "ABS_TOL": 1e-10
   },
@@ -123,7 +125,7 @@
     "ABS_TOL": 1e-12
   },
   "diff_integrate_dop853.rs": {
-    "COUNT_REL_TOL": 0.15,
+    "COUNT_REL_TOL": 0.05,
     "EXACT_RTOL_FACTOR_TOL": 50.0,
     "RETURN_GAP_VS_SCIPY_TOL": 2.0,
     "Y_SCALE_FACTOR_TOL": 1.0
@@ -173,7 +175,7 @@
   },
   "diff_integrate_solve_bvp_collocation.rs": {
     "NODE_RATIO_TOL": 1.5,
-    "P_REL_TOL": 1e-06,
+    "P_REL_TOL": 1e-6,
     "SOL_TOL_FACTOR": 10.0
   },
   "diff_integrate_solve_ivp_audit_equivalence.rs": {
@@ -250,6 +252,10 @@
   "diff_linalg_casp_variants_equivalence.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_linalg_complex_core.rs": {
+    "DIRECT_TOL": 1e-12,
+    "SPECTRAL_TOL": 1e-10
+  },
   "diff_linalg_cond_fractional_matrix_power.rs": {
     "COND_TOL": 1e-7,
     "FMP_TOL": 1e-6
@@ -268,6 +274,7 @@
   "diff_linalg_eigvalsh.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_linalg_estimate_rank.rs": {},
   "diff_linalg_funm_complex.rs": {
     "FUNM_REL_TOL": 1e-12
   },
@@ -293,6 +300,7 @@
   "diff_linalg_lyapunov.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_linalg_matrix_balance_permutation.rs": {},
   "diff_linalg_matrix_functions.rs": {
     "ABS_TOL": 1e-9
   },
@@ -482,12 +490,12 @@
   "diff_opt_audit_record_helpers.rs": {},
   "diff_opt_augmented_lagrangian.rs": {},
   "diff_opt_bfgs.rs": {
-    "CG_X_REL_TOL": 5e-5,
+    "CG_X_REL_TOL": 0.00005,
     "FD_FUN_ABS_TOL": 1e-9,
-    "FD_X_REL_TOL": 1e-5,
+    "FD_X_REL_TOL": 0.00001,
     "FUN_REL_TOL": 1e-10,
     "NEWTON_FD_FUN_ABS_TOL": 1e-8,
-    "NEWTON_FD_X_REL_TOL": 5e-5,
+    "NEWTON_FD_X_REL_TOL": 0.00005,
     "NIT_REL_TOL": 0.3,
     "X_REL_TOL": 1e-7
   },
@@ -537,8 +545,8 @@
     "PARAM_REL_TOL": 0.001
   },
   "diff_opt_least_squares_trf.rs": {
-    "COST_REL_TOL": 1e-08,
-    "X_REL_TOL": 1e-06
+    "COST_REL_TOL": 1e-8,
+    "X_REL_TOL": 1e-6
   },
   "diff_opt_line_search_wolfe.rs": {},
   "diff_opt_linear_sum_assignment.rs": {
@@ -546,6 +554,9 @@
   },
   "diff_opt_linprog.rs": {
     "ABS_TOL": 1e-6
+  },
+  "diff_opt_linprog_highs.rs": {
+    "KKT_TOL": 1e-9
   },
   "diff_opt_lm_root.rs": {
     "RESIDUAL_TOL": 0.00001
@@ -560,7 +571,7 @@
     "ACTIVE_BOUND_X_TOL": 1e-8,
     "FREE_MINIMUM_X_TOL": 1e-6,
     "SCIPY_X_ABS_TOL": 1e-6,
-    "SEEDED_BOX_REL_TOL": 1e-5
+    "SEEDED_BOX_REL_TOL": 0.00001
   },
   "diff_opt_minimize_options.rs": {
     "X_ABS_TOL": 1e-7
@@ -611,21 +622,21 @@
   "diff_opt_select_minimize_method.rs": {},
   "diff_opt_simulated_annealing.rs": {},
   "diff_opt_slsqp_constrained.rs": {
-    "FUN_REL_TOL": 1e-08,
-    "MAXCV_TOL": 1e-06,
-    "X_REL_TOL": 1e-06
+    "FUN_REL_TOL": 1e-8,
+    "MAXCV_TOL": 1e-6,
+    "X_REL_TOL": 1e-6
   },
   "diff_opt_tnc_slsqp_newton_cg_trust_constr.rs": {},
   "diff_opt_trust_constr_constrained.rs": {
-    "FUN_REL_TOL": 1e-07,
-    "MAXCV_TOL": 1e-08,
+    "FUN_REL_TOL": 1e-7,
+    "MAXCV_TOL": 1e-8,
     "V_REL_TOL": 0.0001,
-    "X_REL_TOL": 1e-05
+    "X_REL_TOL": 0.00001
   },
   "diff_opt_trust_region_family.rs": {
     "FUN_REL_TOL": 1e-10,
     "NIT_REL_TOL": 0.3,
-    "X_REL_TOL": 1e-07
+    "X_REL_TOL": 1e-7
   },
   "diff_opt_validate_wolfe_root_dispatch.rs": {},
   "diff_optimize_bracket_minimum.rs": {},
@@ -973,11 +984,18 @@
   "diff_sparse_expm.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_sparse_factorized_inv.rs": {
+    "REL_TOL": 1e-12
+  },
   "diff_sparse_find_tril_triu.rs": {
     "ABS_TOL": 1e-12
   },
   "diff_sparse_floyd_warshall.rs": {
     "ABS_TOL": 1e-12
+  },
+  "diff_sparse_funm_multiply_krylov.rs": {},
+  "diff_sparse_gcrotmk.rs": {
+    "SOLUTION_TOL": 1e-9
   },
   "diff_sparse_graph_summary.rs": {
     "ABS_TOL": 1e-12
@@ -993,6 +1011,20 @@
   },
   "diff_sparse_laplacian.rs": {
     "ABS_TOL": 1e-10
+  },
+  "diff_sparse_laplacian_nd.rs": {
+    "CLUSTER_TOL": 1e-12,
+    "EIGENVALUE_TOL": 1e-13,
+    "EIGENVECTOR_TOL": 1e-13,
+    "RESIDUAL_TOL": 1e-12
+  },
+  "diff_sparse_linear_operator.rs": {
+    "ALGEBRA_TOL": 1e-13,
+    "EIGEN_TOL": 1e-9
+  },
+  "diff_sparse_lobpcg.rs": {
+    "EIGENVALUE_TOL": 1e-8,
+    "SUBSPACE_TOL": 1e-8
   },
   "diff_sparse_lsqr.rs": {
     "ABS_TOL": 0.00001
@@ -2132,6 +2164,7 @@
   "diff_stats_msign_rank_biserial.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_stats_mstats_trimmed_mean.rs": {},
   "diff_stats_multiple_regression.rs": {
     "ABS_TOL": 1e-9
   },

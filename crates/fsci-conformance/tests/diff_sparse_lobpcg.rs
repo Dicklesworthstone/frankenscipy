@@ -9,12 +9,16 @@
 //! - `eigenvectors`: for each returned vector, the sine of its angle to the span of SciPy's
 //!   vectors for the same eigenvalue (a cluster at the eigenvalue tolerance) ≤ 1e-8.
 //!
-//! Each case also measures SciPy against ITSELF from a start block moved by one ulp. Where that
+//! Each case also measures SciPy against ITSELF from start blocks moved by one ulp. Where that
 //! movement exceeds the bounds above (a run that stagnates without converging amplifies rounding:
-//! `diag80_largest4_tol1e-10_precond` moves 4.5e-7 under one ulp, while a converging run moves
-//! ~1e-16), the case's bound is ten times SciPy's own movement. It never loosens a stable case,
-//! and on the stagnating one the fsci–SciPy difference grows smoothly from 1.1e-15 at iteration 0
-//! (its histories are printed on any mismatch), the signature of rounding, not of another path.
+//! `diag80_largest4_tol1e-10_precond` moves up to 4.1e-7 under one ulp on Haswell OpenBLAS, while a
+//! converging run moves ~1e-16), the case's bound is ten times SciPy's own movement. The movement
+//! is the maximum over a fixed set of one-ulp moves, not one draw, because a stagnating run's
+//! response is heavy-tailed: the whole-block move alone lands 17 times below the set's maximum
+//! there, so a one-draw bound depends on the host's BLAS kernel instead of on the case. It never
+//! loosens a stable case, and on the stagnating one the fsci–SciPy difference grows smoothly from
+//! 1.1e-15 at iteration 0 (its histories are printed on any mismatch), the signature of rounding,
+//! not of another path.
 //! - `converged`: whether every final residual is within `tol` (SciPy warns otherwise), exactly.
 //! - `history`: the number of rows of `lambdaHistory`/`residualNormsHistory` SciPy returns,
 //!   which encodes the best iteration it kept, exactly (none for the dense branch on either side).
@@ -409,16 +413,24 @@ for case in q["cases"]:
                               largest=case["largest"], retLambdaHistory=True,
                               retResidualNormsHistory=True)
         res = run(X)
-        # SciPy's own sensitivity: the same call from a start block moved by one ulp.
-        lam_a = np.asarray(res[0])
-        Va = np.asarray(res[1])
+        # SciPy's own sensitivity: the same call from start blocks moved by one ulp, maximised
+        # over a FIXED set (the whole block up and down, then eight single entries at fixed
+        # positions, alternately up and down). One draw of a stagnating run's movement is a
+        # sample of a heavy-tailed quantity: on Haswell OpenBLAS the whole block up moved
+        # diag80_largest4_tol1e-10_precond by 2.4e-8, entry (79, 0) up by 4.1e-7.
+        nr, nc = X.shape
+        perturbed = [np.nextafter(X, np.inf), np.nextafter(X, -np.inf)]
+        for t in range(8):
+            Xp = X.copy()
+            i, j = (t * 37 + 11) % nr, t % nc
+            Xp[i, j] = np.nextafter(Xp[i, j], np.inf if t % 2 == 0 else -np.inf)
+            perturbed.append(Xp)
+        lam_a, Va = np.asarray(res[0]), np.asarray(res[1])
         scale = max(float(np.max(np.abs(lam_a))), 1e-300)
-        eig_sens = 0.0
-        vec_sens = 0.0
-        for target in (np.inf, -np.inf, 0.0):
-            alt = run(np.nextafter(X, target))
-            lam_b = np.asarray(alt[0])
-            Vb = np.asarray(alt[1])
+        eig_sens, vec_sens = 0.0, 0.0
+        for Xp in perturbed:
+            alt = run(Xp)
+            lam_b, Vb = np.asarray(alt[0]), np.asarray(alt[1])
             eig_sens = max(eig_sens, float(np.max(np.abs(lam_a - lam_b)) / scale))
             vec_sens = max(vec_sens, max(
                 sine_to_span(Va[:, j], [Vb[:, i] for i in range(len(lam_b))

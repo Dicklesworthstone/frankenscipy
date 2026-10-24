@@ -20,7 +20,7 @@ mod live_cg {
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::time::Instant;
 
     const DIAGONAL: f64 = 4.001;

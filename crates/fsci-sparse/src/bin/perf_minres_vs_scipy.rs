@@ -24,7 +24,7 @@ mod live_minres {
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::time::Instant;
 
     /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an

@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fsci_signal::{find_peaks, FindPeaksOptions};
+use fsci_signal::{FindPeaksOptions, PeakCondition, find_peaks};
 use libfuzzer_sys::fuzz_target;
 
 // Signal peak detection oracle:
@@ -13,6 +13,17 @@ use libfuzzer_sys::fuzz_target;
 // 4. Height filter is respected
 // 5. Distance filter is respected (no two peaks closer than min_distance)
 // 6. Prominence values are non-negative
+//
+// API: scalar filters are `PeakCondition`s, `find_peaks` returns a
+// `Result`, and `peak_heights` / `prominences` are `Option`s that are
+// computed only when the matching condition is given. The former API
+// always returned both and filtered only when a bound was set, so a
+// fuzzed `None` maps to the unbounded `PeakCondition::default()`
+// (SciPy's `height=(None, None)`): the property is computed but nothing
+// is filtered, and both vectors are checked on every input. The other
+// options keep their stock defaults. Every option is valid after
+// sanitisation (distance ≥ 1, no `wlen`, no `width`), so an `Err` is a
+// defect and fails the target.
 
 const MAX_LEN: usize = 256;
 
@@ -45,43 +56,48 @@ fuzz_target!(|input: FindPeaksInput| {
     let prominence = input.prominence.map(|p| sanitize(p).abs());
 
     let options = FindPeaksOptions {
-        height,
+        height: Some(height.map_or_else(PeakCondition::default, PeakCondition::at_least)),
         distance,
-        prominence,
+        prominence: Some(prominence.map_or_else(PeakCondition::default, PeakCondition::at_least)),
         width: None,
+        ..FindPeaksOptions::default()
     };
 
-    let result = find_peaks(&signal, options);
+    let result = match find_peaks(&signal, options) {
+        Ok(result) => result,
+        Err(err) => panic!("find_peaks rejected sanitized options {options:?} (n={n}): {err}"),
+    };
 
-    if result.peaks.len() != result.peak_heights.len() {
+    let Some(peak_heights) = result.peak_heights.as_deref() else {
+        panic!("find_peaks omitted peak_heights although a height condition was given");
+    };
+    let Some(prominences) = result.prominences.as_deref() else {
+        panic!("find_peaks omitted prominences although a prominence condition was given");
+    };
+
+    if result.peaks.len() != peak_heights.len() {
         panic!(
             "find_peaks peaks count {} != peak_heights count {}",
             result.peaks.len(),
-            result.peak_heights.len()
+            peak_heights.len()
         );
     }
 
-    if result.peaks.len() != result.prominences.len() {
+    if result.peaks.len() != prominences.len() {
         panic!(
             "find_peaks peaks count {} != prominences count {}",
             result.peaks.len(),
-            result.prominences.len()
+            prominences.len()
         );
     }
 
     for (i, &peak_idx) in result.peaks.iter().enumerate() {
         if peak_idx >= n {
-            panic!(
-                "find_peaks peak index {} out of bounds (n={})",
-                peak_idx, n
-            );
+            panic!("find_peaks peak index {} out of bounds (n={})", peak_idx, n);
         }
 
         if peak_idx == 0 || peak_idx == n - 1 {
-            panic!(
-                "find_peaks peak at boundary index {} (n={})",
-                peak_idx, n
-            );
+            panic!("find_peaks peak at boundary index {} (n={})", peak_idx, n);
         }
 
         let peak_val = signal[peak_idx];
@@ -105,17 +121,17 @@ fuzz_target!(|input: FindPeaksInput| {
             );
         }
 
-        if (result.peak_heights[i] - peak_val).abs() > 1e-10 {
+        if (peak_heights[i] - peak_val).abs() > 1e-10 {
             panic!(
                 "find_peaks peak_heights[{}]={} != signal[{}]={}",
-                i, result.peak_heights[i], peak_idx, peak_val
+                i, peak_heights[i], peak_idx, peak_val
             );
         }
 
-        if result.prominences[i] < 0.0 {
+        if prominences[i] < 0.0 {
             panic!(
                 "find_peaks prominence {} at peak {} is negative",
-                result.prominences[i], peak_idx
+                prominences[i], peak_idx
             );
         }
     }
