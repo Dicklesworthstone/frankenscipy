@@ -229,3 +229,6 @@ rust_out
 
 # br doctor per-run artifacts
 .doctor/
+
+# Remote-compilation probe binaries. Several exceed GitHub's 100 MB blob limit.
+/rch-probe-bin/
