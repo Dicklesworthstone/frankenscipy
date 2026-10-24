@@ -86,8 +86,10 @@ impl Loss {
 /// `x_scale`: fixed positive scales, or SciPy's `'jac'` (inverse column norms of J, never
 /// decreasing across iterations).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum XScale {
+pub enum XScale {
+    /// Positive finite characteristic scales, one per parameter.
     Fixed(Vec<f64>),
+    /// Adapt scales using inverse column norms of the Jacobian.
     Jac,
 }
 
@@ -771,11 +773,16 @@ where
         None => 0.5 * dot(&f, &f),
     };
     let mut g = compute_grad(&j, &f);
+    // A zero-row Jacobian still has n parameter columns. Keep the vector shapes
+    // explicit so an empty residual system also works under bounds and Jac scaling.
+    g.resize(n, 0.0);
     let jac_scale = matches!(x_scale, XScale::Jac);
     let (mut scale, mut scale_inv) = match x_scale {
         XScale::Jac => compute_jac_scale(&j, None),
         XScale::Fixed(s) => (s.clone(), s.iter().map(|v| 1.0 / v).collect()),
     };
+    scale.resize(n, 1.0);
+    scale_inv.resize(n, 1.0);
     let mut delta = if bounded {
         let (mut v, dv) = cl_scaling_vector(&x, &g, lb, ub);
         for i in 0..n {

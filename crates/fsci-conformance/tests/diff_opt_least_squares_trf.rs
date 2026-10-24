@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
-    LeastSquaresMethod, LeastSquaresOptions, LossKind, least_squares, least_squares_bounded,
+    LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, LossKind, XScale, least_squares,
+    least_squares_bounded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,8 @@ struct Case {
     loss: String,
     f_scale: f64,
     x_scale_jac: bool,
+    x_scale_fixed: Option<Vec<f64>>,
+    analytic_jac: bool,
     max_nfev: Option<usize>,
 }
 
@@ -53,6 +56,8 @@ fn case(id: &str, x0: &[f64]) -> Case {
         loss: "linear".to_string(),
         f_scale: 1.0,
         x_scale_jac: false,
+        x_scale_fixed: None,
+        analytic_jac: false,
         max_nfev: None,
     }
 }
@@ -77,7 +82,7 @@ fn cases() -> Vec<Case> {
     xscale.x_scale_jac = true;
     let mut starved = case("max_nfev", &[-1.2, 1.0]);
     starved.max_nfev = Some(3);
-    vec![
+    let mut cases = vec![
         case("rosen_unbounded", &[-1.2, 1.0]),
         bounded("rosen_bounded", &[2.0, 2.0], &[-inf, 1.5], &[inf, inf]),
         bounded("exp_bounds", &[1.0, 1.0], &[0.0, 0.5], &[10.0, 5.0]),
@@ -94,7 +99,29 @@ fn cases() -> Vec<Case> {
         case("underdetermined", &[0.0, 0.0]),
         starved,
         bounded("box_both_active", &[1.0, 1.0], &[0.0, 0.0], &[2.0, 2.0]),
-    ]
+    ];
+    let mut fixed = case("xscale_fixed", &[1.0, 1e-6]);
+    fixed.x_scale_fixed = Some(vec![1.0, 1e-6]);
+    cases.push(fixed.clone());
+    fixed.case_id = "xscale_fixed_analytic".to_string();
+    fixed.analytic_jac = true;
+    cases.push(fixed);
+    let mut analytic = case("rosen_analytic", &[-1.2, 1.0]);
+    analytic.analytic_jac = true;
+    cases.push(analytic);
+    let mut analytic_bounds = with_loss(
+        bounded(
+            "exp_analytic_bounds",
+            &[1.0, 1.0],
+            &[0.0, 0.5],
+            &[10.0, 5.0],
+        ),
+        "soft_l1",
+        0.1,
+    );
+    analytic_bounds.analytic_jac = true;
+    cases.push(analytic_bounds);
+    cases
 }
 
 fn exp_data() -> (Vec<f64>, Vec<f64>) {
@@ -113,12 +140,27 @@ fn residuals(id: &str, x: &[f64], t: &[f64], y: &[f64]) -> Vec<f64> {
             .zip(y)
             .map(|(ti, yi)| x[0] * (-x[1] * ti).exp() - yi)
             .collect()
-    } else if id == "xscale_jac" {
+    } else if id.starts_with("xscale") {
         vec![x[0] - 2.0, 1e6 * (x[1] - 3e-6), x[0] * x[1] - 6e-6]
     } else if id == "underdetermined" {
         vec![x[0] + 2.0 * x[1] - 3.0]
     } else {
         vec![x[0] - 3.0, x[1] + 1.0]
+    }
+}
+
+fn jacobian(id: &str, x: &[f64], t: &[f64]) -> Vec<Vec<f64>> {
+    if id.starts_with("rosen") {
+        vec![vec![-20.0 * x[0], 10.0], vec![-1.0, 0.0]]
+    } else if id.starts_with("exp") {
+        t.iter()
+            .map(|ti| {
+                let e = (-x[1] * ti).exp();
+                vec![e, -x[0] * ti * e]
+            })
+            .collect()
+    } else {
+        vec![vec![1.0, 0.0], vec![0.0, 1e6], vec![x[1], x[0]]]
     }
 }
 
@@ -193,11 +235,18 @@ def residuals(cid):
         return lambda x: np.array([10 * (x[1] - x[0]**2), 1 - x[0]])
     if cid.startswith("exp"):
         return lambda p: p[0] * np.exp(-p[1] * t) - y
-    if cid == "xscale_jac":
+    if cid.startswith("xscale"):
         return lambda x: np.array([x[0] - 2, 1e6 * (x[1] - 3e-6), x[0] * x[1] - 6e-6])
     if cid == "underdetermined":
         return lambda x: np.array([x[0] + 2 * x[1] - 3])
     return lambda x: np.array([x[0] - 3, x[1] + 1])
+
+def jacobian(cid):
+    if cid.startswith("rosen"):
+        return lambda x: np.array([[-20 * x[0], 10], [-1, 0]])
+    if cid.startswith("exp"):
+        return lambda x: np.column_stack((np.exp(-x[1] * t), -x[0] * t * np.exp(-x[1] * t)))
+    return lambda x: np.array([[1, 0], [0, 1e6], [x[1], x[0]]])
 
 out = []
 for case in json.load(sys.stdin):
@@ -207,6 +256,10 @@ for case in json.load(sys.stdin):
         kw = dict(loss=case["loss"], f_scale=case["f_scale"], method=case["method"])
         if case["x_scale_jac"]:
             kw["x_scale"] = "jac"
+        if case["x_scale_fixed"] is not None:
+            kw["x_scale"] = np.array(case["x_scale_fixed"])
+        if case["analytic_jac"]:
+            kw["jac"] = jacobian(case["case_id"])
         if case["max_nfev"] is not None:
             kw["max_nfev"] = case["max_nfev"]
         if case["lb"] is not None:
@@ -300,6 +353,11 @@ fn compare_method(method: &str) {
     let mut ledger = CompareLedger::new(&test_id, &[&family]);
     for case in &cases {
         let arm = &arms[&case.case_id];
+        let analytic_jac = case.analytic_jac.then(|| {
+            let id = case.case_id.clone();
+            let t = t.clone();
+            LeastSquaresJacobian::new(move |x| jacobian(&id, x, &t))
+        });
         let options = LeastSquaresOptions {
             method: Some(if method == "dogbox" {
                 LeastSquaresMethod::Dogbox
@@ -308,7 +366,12 @@ fn compare_method(method: &str) {
             }),
             loss: loss_kind(&case.loss),
             f_scale: case.f_scale,
-            x_scale_jac: case.x_scale_jac,
+            x_scale: case
+                .x_scale_fixed
+                .clone()
+                .map(XScale::Fixed)
+                .or_else(|| case.x_scale_jac.then_some(XScale::Jac)),
+            jac: analytic_jac,
             max_nfev: case.max_nfev,
             ..LeastSquaresOptions::default()
         };

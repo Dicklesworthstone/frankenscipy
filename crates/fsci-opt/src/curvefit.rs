@@ -5,6 +5,7 @@
 //! batched variants.
 
 use fsci_runtime::RuntimeMode;
+use std::sync::Arc;
 
 use crate::trf::{self, Loss, LossKind, XScale};
 use crate::types::OptError;
@@ -64,8 +65,54 @@ pub struct LeastSquaresResult {
     pub active_mask: Vec<i8>,
 }
 
+/// An analytic residual Jacobian shared by individual and batched fits.
+///
+/// Rows correspond to residuals and columns to parameters. Capturing closures can own
+/// model data; the callback is validated at every evaluation before a solver uses it.
+/// A callback shared by [`least_squares_many`] must be valid for every parameter row;
+/// the callback receives the fitted variables, not the batch's per-fit data.
+#[derive(Clone)]
+pub struct LeastSquaresJacobian {
+    callback: Arc<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync>,
+}
+
+impl std::fmt::Debug for LeastSquaresJacobian {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LeastSquaresJacobian { callback }")
+    }
+}
+
+impl LeastSquaresJacobian {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn evaluate(&self, x: &[f64], residual_count: usize) -> Result<Vec<Vec<f64>>, OptError> {
+        let matrix = (self.callback)(x);
+        if matrix.len() != residual_count || matrix.iter().any(|row| row.len() != x.len()) {
+            return Err(OptError::InvalidArgument {
+                detail: format!(
+                    "Jacobian must have shape ({residual_count}, {}), with one row per residual",
+                    x.len()
+                ),
+            });
+        }
+        if matrix.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("Jacobian must not contain NaN or Inf"),
+            });
+        }
+        Ok(matrix)
+    }
+}
+
 /// Options for `least_squares`: SciPy's keyword arguments.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LeastSquaresOptions {
     /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
     /// `curve_fit`, `Trf` for a bounded one.
@@ -81,12 +128,17 @@ pub struct LeastSquaresOptions {
     /// Relative finite-difference step; `None` is SciPy's default
     /// `√ε·sign(x)·max(1, |x|)`.
     pub diff_step: Option<f64>,
+    /// Optional analytic Jacobian of the residuals. Numerical differences are used
+    /// when absent. Analytic calls contribute to `njev`, not `nfev`.
+    pub jac: Option<LeastSquaresJacobian>,
     /// Robust loss (`Trf` and `Dogbox`).
     pub loss: LossKind,
     /// Soft margin between inlier and outlier residuals for a robust loss.
     pub f_scale: f64,
-    /// SciPy's `x_scale='jac'` (`Trf` and `Dogbox`); otherwise unit scale.
-    pub x_scale_jac: bool,
+    /// Parameter scaling for `Trf` and `Dogbox`: fixed positive scales or `'jac'`.
+    /// `None` uses unit scale. Explicit scaling is not supported by this LM kernel
+    /// and is rejected instead of being ignored.
+    pub x_scale: Option<XScale>,
     /// Runtime mode.
     pub mode: RuntimeMode,
 }
@@ -100,9 +152,10 @@ impl Default for LeastSquaresOptions {
             ftol: 1.0e-8,
             max_nfev: None,
             diff_step: None,
+            jac: None,
             loss: LossKind::Linear,
             f_scale: 1.0,
-            x_scale_jac: false,
+            x_scale: None,
             mode: RuntimeMode::Strict,
         }
     }
@@ -200,6 +253,13 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     let n = x0.len();
+    if options.x_scale.is_some() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "explicit x_scale is supported by 'trf' and 'dogbox', not this 'lm' kernel",
+            ),
+        });
+    }
     if options.loss != LossKind::Linear {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
@@ -266,8 +326,15 @@ where
     let mut cost = 0.5 * dot_vec(&r, &r);
     let mut jac = Vec::new();
     let mut x_perturbed = x.clone();
-    finite_diff_jacobian_parallel_into(&residuals, &x, &r, diff_step, &mut jac, &mut x_perturbed);
-    nfev += n;
+    nfev += lm_jacobian_into(
+        &residuals,
+        &x,
+        &r,
+        diff_step,
+        options.jac.as_ref(),
+        &mut jac,
+        &mut x_perturbed,
+    )?;
     njev += 1;
     // J^T J (O(n²·m)) and J^T r depend only on (jac, r), which change ONLY on an accepted
     // step. Cache them and recompute only when jac/r change, rather than rebuilding both at
@@ -358,6 +425,11 @@ where
         let x_new: Vec<f64> = x.iter().zip(step.iter()).map(|(a, b)| a + b).collect();
         let r_new = residuals(&x_new);
         nfev += 1;
+        if r_new.len() != m {
+            return Err(OptError::InvalidArgument {
+                detail: format!("residuals changed length from {m} to {}", r_new.len()),
+            });
+        }
         let cost_new = 0.5 * dot_vec(&r_new, &r_new);
 
         // Gain ratio (actual reduction / predicted reduction)
@@ -381,15 +453,15 @@ where
                 // Check cost convergence
                 let cost_change = (old_cost - cost) / (1.0 + cost);
                 if cost_change.abs() <= options.ftol {
-                    finite_diff_jacobian_parallel_into(
+                    nfev += lm_jacobian_into(
                         &residuals,
                         &x,
                         &r,
                         diff_step,
+                        options.jac.as_ref(),
                         &mut jac,
                         &mut x_perturbed,
-                    );
-                    nfev += n;
+                    )?;
                     njev += 1;
                     // status 2: |Δcost|/(1+cost) ≤ ftol after an accepted step (rho > 0.25)
                     return Ok(lm_result(
@@ -406,15 +478,15 @@ where
                 }
 
                 // Recompute Jacobian (and the derived J^T J / J^T r) — jac and r changed.
-                finite_diff_jacobian_parallel_into(
+                nfev += lm_jacobian_into(
                     &residuals,
                     &x,
                     &r,
                     diff_step,
+                    options.jac.as_ref(),
                     &mut jac,
                     &mut x_perturbed,
-                );
-                nfev += n;
+                )?;
                 njev += 1;
                 jtj_matrix_into(&jac, &mut jtj);
                 jt_vec_into(&jac, &r, &mut jtr);
@@ -470,7 +542,7 @@ fn fd_jacobian_scipy<F>(
     lb: &[f64],
     ub: &[f64],
     rel_step: Option<f64>,
-) -> Vec<Vec<f64>>
+) -> Result<Vec<Vec<f64>>, OptError>
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
@@ -509,6 +581,15 @@ where
         let dx = x1[i] - x[i];
         let f1 = residuals(&x1);
         x1[i] = x[i];
+        if f1.len() != f0.len() {
+            return Err(OptError::InvalidArgument {
+                detail: format!(
+                    "residuals changed length from {} to {} during Jacobian evaluation",
+                    f0.len(),
+                    f1.len()
+                ),
+            });
+        }
         columns.push(
             f1.iter()
                 .zip(f0)
@@ -516,9 +597,31 @@ where
                 .collect::<Vec<f64>>(),
         );
     }
-    (0..f0.len())
+    Ok((0..f0.len())
         .map(|r| columns.iter().map(|col| col[r]).collect())
-        .collect()
+        .collect())
+}
+
+/// Fill the LM Jacobian and return the number of residual evaluations it required.
+fn lm_jacobian_into<F>(
+    residuals: &F,
+    x: &[f64],
+    residual: &[f64],
+    step: f64,
+    analytic: Option<&LeastSquaresJacobian>,
+    jac: &mut Vec<Vec<f64>>,
+    x_perturbed: &mut Vec<f64>,
+) -> Result<usize, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64> + Sync,
+{
+    if let Some(analytic) = analytic {
+        *jac = analytic.evaluate(x, residual.len())?;
+        Ok(0)
+    } else {
+        finite_diff_jacobian_parallel_into(residuals, x, residual, step, jac, x_perturbed);
+        Ok(x.len())
+    }
 }
 
 /// SciPy raises `ValueError` with this text when its `trf` SVD meets a non-finite matrix.
@@ -608,6 +711,26 @@ where
             detail: String::from("max_nfev must be positive"),
         });
     }
+    let x_scale = match &options.x_scale {
+        Some(XScale::Fixed(scale)) => {
+            if scale.len() != n {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("Inconsistent shapes between x_scale and `x0`."),
+                });
+            }
+            if scale
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("x_scale entries must be positive and finite"),
+                });
+            }
+            XScale::Fixed(scale.clone())
+        }
+        Some(XScale::Jac) => XScale::Jac,
+        None => XScale::Fixed(vec![1.0; n]),
+    };
     if let Some(r) = options.diff_step
         && !(r.is_finite() && r > 0.0)
     {
@@ -628,16 +751,14 @@ where
         });
     }
     let m = f0.len();
-    let j0 = fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step);
+    let j0 = match &options.jac {
+        Some(jac) => jac.evaluate(&x0, m)?,
+        None => fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step)?,
+    };
     let loss = (options.loss != LossKind::Linear).then_some(Loss {
         kind: options.loss,
         f_scale: options.f_scale,
     });
-    let x_scale = if options.x_scale_jac {
-        XScale::Jac
-    } else {
-        XScale::Fixed(vec![1.0; n])
-    };
     let mut fun = |x: &[f64]| -> Result<Vec<f64>, OptError> {
         let f = residuals(x);
         if f.len() != m {
@@ -648,14 +769,10 @@ where
         Ok(f)
     };
     let mut jac = |x: &[f64], f: &[f64]| -> Result<Vec<Vec<f64>>, OptError> {
-        Ok(fd_jacobian_scipy(
-            residuals,
-            x,
-            f,
-            &lb,
-            &ub,
-            options.diff_step,
-        ))
+        match &options.jac {
+            Some(jac) => jac.evaluate(x, m),
+            None => fd_jacobian_scipy(residuals, x, f, &lb, &ub, options.diff_step),
+        }
     };
     let solve = if dogbox { trf::dogbox } else { trf::trf };
     let out = solve(
@@ -997,7 +1114,7 @@ where
         return Vec::new();
     }
     let r_ref = &residuals;
-    let solve_one = move |params: &[f64]| least_squares(|x| r_ref(x, params), x0, options);
+    let solve_one = move |params: &[f64]| least_squares(|x| r_ref(x, params), x0, options.clone());
 
     // Each solve is a heavy iterative LM fit → fan whole rows across cores, capped
     // by the row count; a tiny batch stays serial to dodge the spawn floor.
@@ -1971,6 +2088,231 @@ mod tests {
     }
 
     #[test]
+    fn least_squares_analytic_jacobian_counts_only_actual_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            let residual_calls = AtomicUsize::new(0);
+            let jacobian_calls = Arc::new(AtomicUsize::new(0));
+            let jacobian_count = Arc::clone(&jacobian_calls);
+            let slopes = vec![1.0, 2.0, 4.0];
+            let result = least_squares(
+                |x| {
+                    residual_calls.fetch_add(1, Ordering::Relaxed);
+                    vec![x[0] - 2.0, 2.0 * x[0] - 4.0, 4.0 * x[0] - 8.0]
+                },
+                &[0.5],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        jacobian_count.fetch_add(1, Ordering::Relaxed);
+                        slopes.iter().map(|&slope| vec![slope]).collect()
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("fit with a captured analytic Jacobian");
+            assert!(result.success, "{method:?}: {result:?}");
+            assert!((result.x[0] - 2.0).abs() < 1e-7);
+            assert_eq!(result.nfev, residual_calls.load(Ordering::Relaxed));
+            assert_eq!(result.njev, jacobian_calls.load(Ordering::Relaxed));
+            assert_eq!(result.jac, vec![vec![1.0], vec![2.0], vec![4.0]]);
+        }
+    }
+
+    #[test]
+    fn least_squares_validates_analytic_jacobian_every_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            for bad in [
+                vec![],
+                vec![vec![1.0]],
+                vec![vec![1.0, 0.0], vec![0.0]],
+                vec![vec![1.0, 0.0], vec![0.0, f64::NAN]],
+            ] {
+                let result = least_squares(
+                    |x| vec![x[0] - 1.0, x[1] - 2.0],
+                    &[0.0, 0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(move |_| bad.clone())),
+                        ..LeastSquaresOptions::default()
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(OptError::InvalidArgument { .. } | OptError::NonFiniteInput { .. })
+                ));
+            }
+            let calls = AtomicUsize::new(0);
+            let result = least_squares(
+                |x| vec![x[0] - 1.0, x[1] - 2.0],
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+                        } else {
+                            vec![vec![1.0]]
+                        }
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(OptError::InvalidArgument { .. })),
+                "refresh must validate: {method:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn least_squares_validates_fixed_scale_before_callbacks() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for scale in [
+                vec![],
+                vec![1.0, 2.0],
+                vec![0.0],
+                vec![-1.0],
+                vec![f64::INFINITY],
+                vec![f64::NAN],
+            ] {
+                let result = least_squares(
+                    |_| panic!("invalid scales must be rejected before evaluating the model"),
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Fixed(scale)),
+                        ..LeastSquaresOptions::default()
+                    },
+                );
+                assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+            }
+        }
+        let lm = least_squares(
+            |x| vec![x[0]],
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                x_scale: Some(XScale::Jac),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert!(matches!(lm, Err(OptError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn curve_fit_bounded_uses_analytic_jacobian_and_fixed_scaling() {
+        let xdata: Vec<f64> = (0..6).map(f64::from).collect();
+        let ydata: Vec<f64> = xdata.iter().map(|x| 2.0 * x + 1.0).collect();
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let jac_x = xdata.clone();
+            let fit = curve_fit_bounded(
+                |x, p| p[0] * x + p[1],
+                &xdata,
+                &ydata,
+                &[0.0, 0.0],
+                &[1.5, 10.0],
+                CurveFitOptions {
+                    p0: Some(vec![1.0, 1.0]),
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Fixed(vec![0.5, 2.0])),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            jac_x.iter().map(|&x| vec![x, 1.0]).collect()
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                    ..CurveFitOptions::default()
+                },
+            )
+            .expect("bounded analytic curve fit");
+            assert!((fit.popt[0] - 1.5).abs() < 1e-8);
+            assert!((fit.popt[1] - 2.25).abs() < 1e-7);
+            assert_eq!(fit.ls_result.active_mask, vec![1, 0]);
+        }
+    }
+
+    #[test]
+    fn least_squares_many_shares_analytic_jacobian() {
+        let results = least_squares_many(
+            |x, params| vec![x[0] - params[0]],
+            &[0.0],
+            &[vec![1.0], vec![2.0], vec![3.0]],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]])),
+                x_scale: Some(XScale::Fixed(vec![2.0])),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                (result.as_ref().expect("batch member").x[0] - (index + 1) as f64).abs() < 1e-8
+            );
+        }
+    }
+
+    #[test]
+    fn least_squares_detects_residual_shape_change_during_differencing() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| if x[0] == 0.0 { vec![-1.0] } else { vec![] },
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+        }
+    }
+
+    #[test]
+    fn least_squares_empty_residuals_preserve_parameter_dimensions() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for analytic in [false, true] {
+                for bounded in [false, true] {
+                    let options = LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Jac),
+                        jac: analytic.then(|| LeastSquaresJacobian::new(|_| vec![])),
+                        ..LeastSquaresOptions::default()
+                    };
+                    let result = if bounded {
+                        least_squares_bounded(
+                            |_| vec![],
+                            &[0.25, 0.75],
+                            &[0.0, 0.0],
+                            &[1.0, 1.0],
+                            options,
+                        )
+                    } else {
+                        least_squares(|_| vec![], &[0.25, 0.75], options)
+                    }
+                    .expect("SciPy accepts an empty residual system");
+                    assert_eq!(result.x, vec![0.25, 0.75]);
+                    assert_eq!(result.grad, vec![0.0, 0.0]);
+                    assert_eq!(result.active_mask, vec![0, 0]);
+                    assert_eq!(result.status, 1);
+                    assert_eq!(result.cost, 0.0);
+                    assert_eq!(result.optimality, 0.0);
+                    assert_eq!(result.nfev, 1);
+                    assert_eq!(result.njev, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn curve_fit_many_byte_identical_to_per_row() {
         // Batched fit must equal looping curve_fit per row, bit-for-bit (each fit is
         // independent; parallelism only distributes them).
@@ -2054,10 +2396,10 @@ mod tests {
             .collect();
         let opt = LeastSquaresOptions::default();
 
-        let batched = least_squares_many(resid, &[1.5, 1.0], &ys, opt);
+        let batched = least_squares_many(resid, &[1.5, 1.0], &ys, opt.clone());
         assert_eq!(batched.len(), nrows);
         for (i, y) in ys.iter().enumerate() {
-            let single = least_squares(|x| resid(x, y), &[1.5, 1.0], opt).expect("single");
+            let single = least_squares(|x| resid(x, y), &[1.5, 1.0], opt.clone()).expect("single");
             let many = batched[i].as_ref().expect("batched member");
             assert_eq!(many.x[0].to_bits(), single.x[0].to_bits(), "a mismatch {i}");
             assert_eq!(many.x[1].to_bits(), single.x[1].to_bits(), "b mismatch {i}");

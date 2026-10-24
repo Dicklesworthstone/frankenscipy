@@ -12,7 +12,7 @@ fn main() {
 
     // 1) Rosenbrock residuals r = [10(x1 - x0^2), 1 - x0]; minimum at (1, 1).
     let r1 = |x: &[f64]| vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]];
-    if let Ok(res) = leastsq(r1, &[-1.2, 1.0], opts) {
+    if let Ok(res) = leastsq(r1, &[-1.2, 1.0], opts.clone()) {
         dump("rosen", &res.x, res.ier);
     }
 
@@ -29,7 +29,7 @@ fn main() {
             .map(|(&t, &y)| p[0] * (-p[1] * t).exp() + p[2] - y)
             .collect()
     };
-    if let Ok(res) = leastsq(r2, &[1.0, 1.0, 1.0], opts) {
+    if let Ok(res) = leastsq(r2, &[1.0, 1.0, 1.0], opts.clone()) {
         dump("expfit", &res.x, res.ier);
     }
 
