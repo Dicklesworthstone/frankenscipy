@@ -1310,8 +1310,15 @@ where
         let mut accepted = false;
         for _ in 0..8 {
             let scaled_step = match &cached_normal {
-                Some((normal, rhs)) => solve_damped_normal(normal, rhs, damping)?,
-                None => solve_lm_step(&scaled_jac, &r, damping)?,
+                Some((normal, rhs)) => solve_damped_normal(normal, rhs, damping),
+                None => solve_lm_step(&scaled_jac, &r, damping),
+            };
+            let Ok(scaled_step) = scaled_step else {
+                // Dependent columns can require stronger damping before the
+                // normal matrix is numerically nonsingular. Reject this trial,
+                // not the whole fit, within the existing bounded retry loop.
+                damping *= 10.0;
+                continue;
             };
             let step: Vec<f64> = scaled_step.iter().zip(scale).map(|(s, d)| s / d).collect();
             let candidate = x
@@ -1902,11 +1909,10 @@ where
 
         let mut accepted = false;
         for _ in 0..8 {
-            let scaled_step =
-                ctx.lm_step(&scaled_jac, &r, damping)
-                    .ok_or_else(|| OdrError::SolverFailure {
-                        detail: String::from("normal equations are singular"),
-                    })?;
+            let Some(scaled_step) = ctx.lm_step(&scaled_jac, &r, damping) else {
+                damping *= 10.0;
+                continue;
+            };
             let step: Vec<f64> = scaled_step
                 .iter()
                 .zip(ctx.scale)
@@ -2040,16 +2046,22 @@ fn scale_jacobian(jac: &[Vec<f64>], scale: &[f64]) -> Vec<Vec<f64>> {
 
 /// Damping has the units of JᵀJ, not those of a parameter. An absolute 1e-3
 /// overwhelms every column when the responses are tiny, producing a zero step
-/// and false convergence. Start below the weakest nonzero scaled column and
-/// let the ordinary rejection loop increase damping when necessary.
+/// and false convergence. Start below the weakest nonzero scaled column, with
+/// a rounding-aware floor relative to the strongest column so damping cannot
+/// disappear when added to its diagonal. The rejection loop can then increase
+/// damping if dependent columns still make a trial system numerically singular.
 fn initial_damping(column_norms: &[f64]) -> f64 {
-    let smallest = column_norms
+    let (smallest, largest) = column_norms
         .iter()
         .map(|norm| norm * norm)
         .filter(|&square| square > 0.0 && square.is_finite())
-        .fold(f64::INFINITY, f64::min);
+        .fold((f64::INFINITY, 0.0_f64), |(smallest, largest), square| {
+            (smallest.min(square), largest.max(square))
+        });
     if smallest.is_finite() {
-        (1e-3 * smallest).max(f64::MIN_POSITIVE)
+        (1e-3 * smallest)
+            .max(64.0 * f64::EPSILON * largest)
+            .max(f64::MIN_POSITIVE)
     } else {
         1e-3
     }
@@ -2968,6 +2980,43 @@ mod tests {
             assert!(output.success, "{:?}", output.stopreason);
             assert_close(output.beta[0], 2.0, 2e-6);
             assert_close(output.beta[1], 1e-9, 1e-15);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odr_scaling_handles_dependent_and_weak_jacobian_columns() -> Result<(), OdrError> {
+        // The first two columns are identical, while the third is tiny but
+        // nonzero. Damping based only on that column formerly rounded away
+        // from the strong diagonals, causing an immediate singular-solve error.
+        // Global response weights must not turn the damping floor absolute.
+        for weight in [1e-18, 1.0, 1e18] {
+            for structured in [false, true] {
+                let model = Model::new(|beta: &[f64], x: &[f64]| {
+                    x.iter()
+                        .map(|v| beta[0] + beta[1] + 1e-8 * beta[2] * v)
+                        .collect()
+                })
+                .with_parameter_count(3)
+                .with_fjacb(|_: &[f64], x: &[f64]| {
+                    x.iter().map(|v| vec![1.0, 1.0, 1e-8 * v]).collect()
+                })
+                .with_scalar_separable(structured);
+                let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+                let y: Vec<f64> = x.iter().map(|v| 3.0 + 1e-8 * v).collect();
+                let data = Data::new(x, y.clone())?.with_response_weights(vec![weight; 5])?;
+                let mut solver = ODR::new(data, model, vec![1.0, 1.0, 1.0])?;
+                solver.options.fit_type = FitType::Ols;
+                let output = solver.run()?;
+                assert!(
+                    output.success,
+                    "weight={weight}, structured={structured}: {:?}",
+                    output.stopreason
+                );
+                assert_close(output.beta[0] + output.beta[1], 3.0, 1e-7);
+                assert_vec_close(&output.y, &y, 1e-8);
+                assert!(output.sum_square / weight < 1e-16);
+            }
         }
         Ok(())
     }
