@@ -5,8 +5,8 @@
 //! them compares fsci with fsci). Problems: Robertson's kinetics on [0, 40], Van der Pol with
 //! mu = 100 on [0, 200], the linear stiff system y1' = -1000 y1 + y2, y2' = -y2 on [0, 10]
 //! (exact solution known), and y' = -y·cos t on [0, 10] (exact exp(-sin t)); rtol 1e-4 and 1e-8
-//! with atol = 1e-3·rtol, no Jacobian (both sides use finite differences). The right-hand sides
-//! are written term by term identically on both sides.
+//! with atol = 1e-3·rtol, both with finite differences and user-supplied analytic Jacobians.
+//! The right-hand sides and Jacobians are written term by term identically on both sides.
 //!
 //! As in diff_integrate_dop853.rs, the oracle measures each row's conditioning: SciPy's own
 //! y(t_end) is rerun with every component of y0 moved by one ulp, and the largest move in units
@@ -18,19 +18,20 @@
 //! judge the 4.5e-8 component of the linear system, where atol dominates, by the wrong scale).
 //!
 //! Both solvers are SciPy's algorithms step for step (frankenscipy-szq1n / the stiff parity
-//! port): 15 of the 16 rows reproduce SciPy's nfev, njev, nlu and step count exactly on the
+//! port): 15 of the original 16 finite-difference rows reproduce SciPy's nfev, njev, nlu and step count exactly on the
 //! pinned incumbent, and the 16th (Radau, y' = -y·cos t, rtol 1e-8) spends one more Newton
 //! iteration (nfev 2731 vs 2728, everything else equal). That is a rounding-level difference:
 //! SciPy's LAPACK/OpenBLAS complex factor-and-divide against nalgebra's flips one borderline
 //! convergence test. COUNT_REL_TOL is sized to that and to BLAS-kernel variation on other
 //! hosts, far below the 30-110% count gaps of the solvers this port replaced. The compared
-//! count is asserted.
+//! count is asserted. Every problem also runs with an analytic Jacobian under the same
+//! tolerances; Robertson and Van der Pol exercise repeated nonlinear Jacobian refreshes.
 
 use std::io::Write;
 use std::process::Stdio;
 
 use fsci_conformance::CompareLedger;
-use fsci_integrate::{SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp};
+use fsci_integrate::{JacFn, SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp};
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -54,6 +55,7 @@ struct Case {
     y0: Vec<f64>,
     rtol: f64,
     atol: f64,
+    analytic_jacobian: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +79,26 @@ fn rhs(problem: &str, t: f64, y: &[f64]) -> Vec<f64> {
         "vdp100" => vec![y[1], 100.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]],
         "linear" => vec![-1000.0 * y[0] + y[1], -y[1]],
         _ => vec![-y[0] * t.cos()],
+    }
+}
+
+fn jacobian(problem: &str) -> JacFn {
+    match problem {
+        "robertson" => |_t, y| {
+            vec![
+                vec![-0.04, 1.0e4 * y[2], 1.0e4 * y[1]],
+                vec![0.04, -1.0e4 * y[2] - 6.0e7 * y[1], -1.0e4 * y[1]],
+                vec![0.0, 6.0e7 * y[1], 0.0],
+            ]
+        },
+        "vdp100" => |_t, y| {
+            vec![
+                vec![0.0, 1.0],
+                vec![-200.0 * y[0] * y[1] - 1.0, 100.0 * (1.0 - y[0] * y[0])],
+            ]
+        },
+        "linear" => |_t, _y| vec![vec![-1000.0, 1.0], vec![0.0, -1.0]],
+        _ => |t, _y| vec![vec![-t.cos()]],
     }
 }
 
@@ -104,15 +126,19 @@ fn cases() -> Vec<Case> {
     for method in ["BDF", "Radau"] {
         for (problem, t_end, y0) in &problems {
             for rtol in [1e-4, 1e-8] {
-                out.push(Case {
-                    name: format!("{method}_{problem}_rtol{rtol:e}"),
-                    problem: (*problem).to_string(),
-                    method: method.to_string(),
-                    t_end: *t_end,
-                    y0: y0.clone(),
-                    rtol,
-                    atol: 1e-3 * rtol,
-                });
+                for analytic_jacobian in [false, true] {
+                    let jac_kind = if analytic_jacobian { "analytic" } else { "fd" };
+                    out.push(Case {
+                        name: format!("{method}_{problem}_rtol{rtol:e}_{jac_kind}"),
+                        problem: (*problem).to_string(),
+                        method: method.to_string(),
+                        t_end: *t_end,
+                        y0: y0.clone(),
+                        rtol,
+                        atol: 1e-3 * rtol,
+                        analytic_jacobian,
+                    });
+                }
             }
         }
     }
@@ -136,9 +162,22 @@ def rhs(problem):
         return lambda t, y: [-1000.0 * y[0] + y[1], -y[1]]
     return lambda t, y: [-y[0] * math.cos(t)]
 
+def jacobian(problem):
+    if problem == "robertson":
+        return lambda t, y: [[-0.04, 1.0e4 * y[2], 1.0e4 * y[1]],
+                             [0.04, -1.0e4 * y[2] - 6.0e7 * y[1], -1.0e4 * y[1]],
+                             [0.0, 6.0e7 * y[1], 0.0]]
+    if problem == "vdp100":
+        return lambda t, y: [[0.0, 1.0],
+                             [-200.0 * y[0] * y[1] - 1.0, 100.0 * (1.0 - y[0] * y[0])]]
+    if problem == "linear":
+        return lambda t, y: [[-1000.0, 1.0], [0.0, -1.0]]
+    return lambda t, y: [[-math.cos(t)]]
+
 def run(c, y0):
     return solve_ivp(rhs(c["problem"]), (0.0, c["t_end"]), y0, method=c["method"],
-                     rtol=c["rtol"], atol=c["atol"])
+                     rtol=c["rtol"], atol=c["atol"],
+                     jac=jacobian(c["problem"]) if c["analytic_jacobian"] else None)
 
 out = []
 for c in json.load(sys.stdin):
@@ -233,6 +272,7 @@ fn diff_integrate_solve_ivp_stiff() {
             },
             rtol: case.rtol,
             atol: ToleranceValue::Scalar(case.atol),
+            jac: case.analytic_jacobian.then(|| jacobian(&case.problem)),
             ..SolveIvpOptions::default()
         };
         compared += 1;

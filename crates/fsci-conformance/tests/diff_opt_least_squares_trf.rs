@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `least_squares` with SciPy's default Trust Region
-//! Reflective method (frankenscipy-1ksfv.6): Rosenbrock with and without a bound, an
+//! Reflective and rectangular Dogbox methods (frankenscipy-1ksfv.6): Rosenbrock with and without a bound, an
 //! exponential fit with outliers under bounds and under each robust loss (soft_l1, huber,
 //! cauchy, arctan), `x_scale='jac'` on a badly scaled problem, an underdetermined system, a
 //! `max_nfev` stop, and a box with both bounds active.
@@ -20,7 +20,10 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::{LeastSquaresOptions, LossKind, least_squares, least_squares_bounded};
+use fsci_opt::{
+    LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, LossKind, XScale, least_squares,
+    least_squares_bounded,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-003";
@@ -31,24 +34,30 @@ const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 #[derive(Debug, Clone, Serialize)]
 struct Case {
     case_id: String,
+    method: String,
     x0: Vec<f64>,
     lb: Option<Vec<f64>>,
     ub: Option<Vec<f64>>,
     loss: String,
     f_scale: f64,
     x_scale_jac: bool,
+    x_scale_fixed: Option<Vec<f64>>,
+    analytic_jac: bool,
     max_nfev: Option<usize>,
 }
 
 fn case(id: &str, x0: &[f64]) -> Case {
     Case {
         case_id: id.to_string(),
+        method: "trf".to_string(),
         x0: x0.to_vec(),
         lb: None,
         ub: None,
         loss: "linear".to_string(),
         f_scale: 1.0,
         x_scale_jac: false,
+        x_scale_fixed: None,
+        analytic_jac: false,
         max_nfev: None,
     }
 }
@@ -73,7 +82,7 @@ fn cases() -> Vec<Case> {
     xscale.x_scale_jac = true;
     let mut starved = case("max_nfev", &[-1.2, 1.0]);
     starved.max_nfev = Some(3);
-    vec![
+    let mut cases = vec![
         case("rosen_unbounded", &[-1.2, 1.0]),
         bounded("rosen_bounded", &[2.0, 2.0], &[-inf, 1.5], &[inf, inf]),
         bounded("exp_bounds", &[1.0, 1.0], &[0.0, 0.5], &[10.0, 5.0]),
@@ -90,7 +99,29 @@ fn cases() -> Vec<Case> {
         case("underdetermined", &[0.0, 0.0]),
         starved,
         bounded("box_both_active", &[1.0, 1.0], &[0.0, 0.0], &[2.0, 2.0]),
-    ]
+    ];
+    let mut fixed = case("xscale_fixed", &[1.0, 1e-6]);
+    fixed.x_scale_fixed = Some(vec![1.0, 1e-6]);
+    cases.push(fixed.clone());
+    fixed.case_id = "xscale_fixed_analytic".to_string();
+    fixed.analytic_jac = true;
+    cases.push(fixed);
+    let mut analytic = case("rosen_analytic", &[-1.2, 1.0]);
+    analytic.analytic_jac = true;
+    cases.push(analytic);
+    let mut analytic_bounds = with_loss(
+        bounded(
+            "exp_analytic_bounds",
+            &[1.0, 1.0],
+            &[0.0, 0.5],
+            &[10.0, 5.0],
+        ),
+        "soft_l1",
+        0.1,
+    );
+    analytic_bounds.analytic_jac = true;
+    cases.push(analytic_bounds);
+    cases
 }
 
 fn exp_data() -> (Vec<f64>, Vec<f64>) {
@@ -109,12 +140,27 @@ fn residuals(id: &str, x: &[f64], t: &[f64], y: &[f64]) -> Vec<f64> {
             .zip(y)
             .map(|(ti, yi)| x[0] * (-x[1] * ti).exp() - yi)
             .collect()
-    } else if id == "xscale_jac" {
+    } else if id.starts_with("xscale") {
         vec![x[0] - 2.0, 1e6 * (x[1] - 3e-6), x[0] * x[1] - 6e-6]
     } else if id == "underdetermined" {
         vec![x[0] + 2.0 * x[1] - 3.0]
     } else {
         vec![x[0] - 3.0, x[1] + 1.0]
+    }
+}
+
+fn jacobian(id: &str, x: &[f64], t: &[f64]) -> Vec<Vec<f64>> {
+    if id.starts_with("rosen") {
+        vec![vec![-20.0 * x[0], 10.0], vec![-1.0, 0.0]]
+    } else if id.starts_with("exp") {
+        t.iter()
+            .map(|ti| {
+                let e = (-x[1] * ti).exp();
+                vec![e, -x[0] * ti * e]
+            })
+            .collect()
+    } else {
+        vec![vec![1.0, 0.0], vec![0.0, 1e6], vec![x[1], x[0]]]
     }
 }
 
@@ -189,20 +235,31 @@ def residuals(cid):
         return lambda x: np.array([10 * (x[1] - x[0]**2), 1 - x[0]])
     if cid.startswith("exp"):
         return lambda p: p[0] * np.exp(-p[1] * t) - y
-    if cid == "xscale_jac":
+    if cid.startswith("xscale"):
         return lambda x: np.array([x[0] - 2, 1e6 * (x[1] - 3e-6), x[0] * x[1] - 6e-6])
     if cid == "underdetermined":
         return lambda x: np.array([x[0] + 2 * x[1] - 3])
     return lambda x: np.array([x[0] - 3, x[1] + 1])
+
+def jacobian(cid):
+    if cid.startswith("rosen"):
+        return lambda x: np.array([[-20 * x[0], 10], [-1, 0]])
+    if cid.startswith("exp"):
+        return lambda x: np.column_stack((np.exp(-x[1] * t), -x[0] * t * np.exp(-x[1] * t)))
+    return lambda x: np.array([[1, 0], [0, 1e6], [x[1], x[0]]])
 
 out = []
 for case in json.load(sys.stdin):
     arm = {"case_id": case["case_id"], "x": None, "cost": None, "status": None,
            "nfev": None, "active_mask": None}
     try:
-        kw = dict(loss=case["loss"], f_scale=case["f_scale"], method="trf")
+        kw = dict(loss=case["loss"], f_scale=case["f_scale"], method=case["method"])
         if case["x_scale_jac"]:
             kw["x_scale"] = "jac"
+        if case["x_scale_fixed"] is not None:
+            kw["x_scale"] = np.array(case["x_scale_fixed"])
+        if case["analytic_jac"]:
+            kw["jac"] = jacobian(case["case_id"])
         if case["max_nfev"] is not None:
             kw["max_nfev"] = case["max_nfev"]
         if case["lb"] is not None:
@@ -268,7 +325,19 @@ print(json.dumps(out))
 
 #[test]
 fn diff_opt_least_squares_trf() {
-    let cases = cases();
+    compare_method("trf");
+}
+
+#[test]
+fn diff_opt_least_squares_dogbox() {
+    compare_method("dogbox");
+}
+
+fn compare_method(method: &str) {
+    let mut cases = cases();
+    for case in &mut cases {
+        case.method = method.to_string();
+    }
     let Some(oracle) = scipy_oracle_or_skip(&cases) else {
         return;
     };
@@ -279,13 +348,30 @@ fn diff_opt_least_squares_trf() {
     let (t, y) = exp_data();
 
     let mut diffs = Vec::new();
-    let mut ledger = CompareLedger::new("diff_opt_least_squares_trf", &["least_squares_trf"]);
+    let test_id = format!("diff_opt_least_squares_{method}");
+    let family = format!("least_squares_{method}");
+    let mut ledger = CompareLedger::new(&test_id, &[&family]);
     for case in &cases {
         let arm = &arms[&case.case_id];
+        let analytic_jac = case.analytic_jac.then(|| {
+            let id = case.case_id.clone();
+            let t = t.clone();
+            LeastSquaresJacobian::new(move |x| jacobian(&id, x, &t))
+        });
         let options = LeastSquaresOptions {
+            method: Some(if method == "dogbox" {
+                LeastSquaresMethod::Dogbox
+            } else {
+                LeastSquaresMethod::Trf
+            }),
             loss: loss_kind(&case.loss),
             f_scale: case.f_scale,
-            x_scale_jac: case.x_scale_jac,
+            x_scale: case
+                .x_scale_fixed
+                .clone()
+                .map(XScale::Fixed)
+                .or_else(|| case.x_scale_jac.then_some(XScale::Jac)),
+            jac: analytic_jac,
             max_nfev: case.max_nfev,
             ..LeastSquaresOptions::default()
         };
@@ -316,19 +402,12 @@ fn diff_opt_least_squares_trf() {
             (Ok(_), Some(_)) => {}
         }
         // `None` is recorded by the ledger: SciPy gave no result, or fsci returned an error.
-        if let Some(((x, cost, mask), r)) =
-            ledger.both("least_squares_trf", &case.case_id, scipy, fsci.ok())
-        {
+        if let Some(((x, cost, mask), r)) = ledger.both(&family, &case.case_id, scipy, fsci.ok()) {
             diff.fsci_status = r.status;
             diff.fsci_nfev = r.nfev;
             // The ledger rejects a length mismatch and a NaN coordinate (recording the case);
             // the zip below would truncate the one and the max fold swallow the other.
-            let x_pair = ledger.slices(
-                "least_squares_trf",
-                &case.case_id,
-                Some(x),
-                Some(r.x.as_slice()),
-            );
+            let x_pair = ledger.slices(&family, &case.case_id, Some(x), Some(r.x.as_slice()));
             diff.x_rel_diff = x_pair.map_or(f64::NAN, |(x, fsci_x)| {
                 fsci_x
                     .iter()
@@ -354,7 +433,7 @@ fn diff_opt_least_squares_trf() {
             diff.pass = problems.is_empty();
             diff.reason = problems.join("; ");
             if x_pair.is_some() {
-                ledger.compared("least_squares_trf", &case.case_id, diff.pass);
+                ledger.compared(&family, &case.case_id, diff.pass);
             }
         }
         diffs.push(diff);
@@ -366,8 +445,8 @@ fn diff_opt_least_squares_trf() {
         .filter(|d| d.pass && d.fsci_nfev == d.scipy_nfev)
         .count();
     let log = DiffLog {
-        test_id: "diff_opt_least_squares_trf".into(),
-        category: "scipy.optimize.least_squares(method='trf')".into(),
+        test_id: test_id.clone(),
+        category: format!("scipy.optimize.least_squares(method='{method}')"),
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         same_nfev_count,
@@ -377,7 +456,7 @@ fn diff_opt_least_squares_trf() {
     };
     fs::create_dir_all(output_dir()).expect("create trf diff dir");
     fs::write(
-        output_dir().join("diff_opt_least_squares_trf.json"),
+        output_dir().join(format!("{test_id}.json")),
         serde_json::to_string_pretty(&log).expect("serialize trf log"),
     )
     .expect("write trf log");
@@ -399,6 +478,6 @@ fn diff_opt_least_squares_trf() {
         diffs.len()
     );
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
-    assert!(all_pass, "least_squares(trf) vs scipy failed");
+    assert!(all_pass, "least_squares({method}) vs scipy failed");
     ledger.finish(cases.len());
 }
