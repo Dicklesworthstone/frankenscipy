@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! The Trust Region Reflective least-squares algorithm behind `least_squares(method = Trf)`:
+//! Dense trust-region least-squares algorithms behind `least_squares`.
+//!
+//! The Trust Region Reflective algorithm (`method = Trf`) follows
 //! SciPy's `scipy/optimize/_lsq/trf.py` with the helpers of `_lsq/common.py` and the robust
 //! losses of `_lsq/least_squares.py` (Branch, Coleman & Li, SIAM J. Sci. Comput. 21(1), 1999),
 //! transcribed function by function with the dense (`tr_solver = 'exact'`) subproblem solver:
@@ -9,6 +11,8 @@
 //! Bounds are handled by the Coleman–Li scaling `v`, a step that is reflected off the first
 //! bound it hits, and a choice among the scaled trust-region step, its reflection and the
 //! scaled gradient, as in SciPy. Without bounds the plain trust-region step is taken.
+//! `method = Dogbox` uses Powell's dogleg path inside rectangular trust regions, intersected
+//! with the original bounds, with active variables excluded from the Gauss–Newton solve.
 
 const EPS: f64 = f64::EPSILON;
 
@@ -82,12 +86,14 @@ impl Loss {
 /// `x_scale`: fixed positive scales, or SciPy's `'jac'` (inverse column norms of J, never
 /// decreasing across iterations).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum XScale {
+pub enum XScale {
+    /// Positive finite characteristic scales, one per parameter.
     Fixed(Vec<f64>),
+    /// Adapt scales using inverse column norms of the Jacobian.
     Jac,
 }
 
-/// What `trf` returns (SciPy's `OptimizeResult` fields).
+/// What the dense trust-region solvers return (SciPy's `OptimizeResult` fields).
 pub(crate) struct TrfOutcome {
     pub x: Vec<f64>,
     pub cost: f64,
@@ -194,7 +200,7 @@ fn scale_for_robust_loss(j: &mut [Vec<f64>], f: &mut [f64], rho: &[Vec<f64>; 3])
 /// Thin SVD `J = U·diag(s)·Vᵀ` (singular values descending) by one-sided Jacobi. Returns
 /// `(U` as k columns of length m, `s`, `V` as k columns of length n`)`, k = min(m, n).
 #[allow(clippy::type_complexity)]
-fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
+pub(super) fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
     let m = j.len();
     let transposed = m < n;
     // Columns of the matrix whose columns are orthogonalized: J (m ≥ n) or Jᵀ (m < n).
@@ -767,11 +773,16 @@ where
         None => 0.5 * dot(&f, &f),
     };
     let mut g = compute_grad(&j, &f);
+    // A zero-row Jacobian still has n parameter columns. Keep the vector shapes
+    // explicit so an empty residual system also works under bounds and Jac scaling.
+    g.resize(n, 0.0);
     let jac_scale = matches!(x_scale, XScale::Jac);
     let (mut scale, mut scale_inv) = match x_scale {
         XScale::Jac => compute_jac_scale(&j, None),
         XScale::Fixed(s) => (s.clone(), s.iter().map(|v| 1.0 / v).collect()),
     };
+    scale.resize(n, 1.0);
+    scale_inv.resize(n, 1.0);
     let mut delta = if bounded {
         let (mut v, dv) = cl_scaling_vector(&x, &g, lb, ub);
         for i in 0..n {
@@ -961,5 +972,261 @@ where
         nfev,
         njev,
         status: termination_status.unwrap_or(0),
+    })
+}
+
+/// Powell's dogleg step in the intersection of a rectangular trust region and the bounds.
+/// The returned signs refer to the original bounds; `trust_hit` concerns the trust region.
+#[allow(clippy::too_many_arguments)]
+fn rectangular_dogleg(
+    x: &[f64],
+    newton: &[f64],
+    g: &[f64],
+    a: f64,
+    b: f64,
+    radius: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+) -> (Vec<f64>, Vec<i8>, bool) {
+    let n = x.len();
+    let lower: Vec<f64> = (0..n).map(|i| (lb[i] - x[i]).max(-radius[i])).collect();
+    let upper: Vec<f64> = (0..n).map(|i| (ub[i] - x[i]).min(radius[i])).collect();
+    if in_bounds(newton, &lower, &upper) {
+        return (newton.to_vec(), vec![0; n], false);
+    }
+
+    let anti_gradient: Vec<f64> = g.iter().map(|v| -v).collect();
+    let (to_bounds, _) = step_size_to_bound(&vec![0.0; n], &anti_gradient, &lower, &upper);
+    let (cauchy_length, _) = minimize_quadratic_1d(a, b, 0.0, to_bounds, 0.0);
+    let cauchy: Vec<f64> = anti_gradient.iter().map(|v| cauchy_length * v).collect();
+    let difference: Vec<f64> = newton.iter().zip(&cauchy).map(|(a, b)| a - b).collect();
+    let (length, hits) = step_size_to_bound(&cauchy, &difference, &lower, &upper);
+    let mut bound_hits = vec![0; n];
+    let mut trust_hit = false;
+    for i in 0..n {
+        if hits[i] < 0 {
+            if lower[i] == lb[i] - x[i] {
+                bound_hits[i] = -1;
+            }
+            trust_hit |= lower[i] == -radius[i];
+        } else if hits[i] > 0 {
+            if upper[i] == ub[i] - x[i] {
+                bound_hits[i] = 1;
+            }
+            trust_hit |= upper[i] == radius[i];
+        }
+    }
+    let step = cauchy
+        .iter()
+        .zip(&difference)
+        .map(|(a, b)| a + length * b)
+        .collect();
+    (step, bound_hits, trust_hit)
+}
+
+/// Voglis–Lagaris rectangular trust-region dogleg, as in SciPy's `_lsq/dogbox.py`.
+/// The dense Gauss–Newton solve uses the same thin SVD as TRF, including minimum-norm
+/// steps for underdetermined or rank-deficient Jacobians. Bounds are reached exactly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dogbox<E>(
+    fun: ResidualFn<'_, E>,
+    jac: JacobianFn<'_, E>,
+    x0: &[f64],
+    f0: Vec<f64>,
+    j0: Vec<Vec<f64>>,
+    lb: &[f64],
+    ub: &[f64],
+    ftol: f64,
+    xtol: f64,
+    gtol: f64,
+    max_nfev: Option<usize>,
+    x_scale: &XScale,
+    loss: Option<&Loss>,
+) -> Result<TrfOutcome, E>
+where
+    E: From<NonFiniteJacobian>,
+{
+    let n = x0.len();
+    let mut x = x0.to_vec();
+    let mut f = f0;
+    let mut f_true = f.clone();
+    let mut j = j0;
+    let mut nfev = 1;
+    let mut njev = 1;
+    let mut cost = match loss {
+        Some(l) => {
+            let rho = l.rho(&f);
+            let cost = 0.5 * rho[0].iter().sum::<f64>();
+            scale_for_robust_loss(&mut j, &mut f, &rho);
+            cost
+        }
+        None => 0.5 * dot(&f, &f),
+    };
+    let mut g = compute_grad(&j, &f);
+    g.resize(n, 0.0);
+    let jac_scale = matches!(x_scale, XScale::Jac);
+    let (mut scale, mut scale_inv) = match x_scale {
+        XScale::Jac => compute_jac_scale(&j, None),
+        XScale::Fixed(s) => (s.clone(), s.iter().map(|v| 1.0 / v).collect()),
+    };
+    scale.resize(n, 1.0);
+    scale_inv.resize(n, 1.0);
+    let mut delta = norm_inf(
+        &x.iter()
+            .zip(&scale_inv)
+            .map(|(x, s)| x * s)
+            .collect::<Vec<_>>(),
+    );
+    if delta == 0.0 {
+        delta = 1.0;
+    }
+    let mut on_bound: Vec<i8> = (0..n)
+        .map(|i| {
+            if x[i] == ub[i] {
+                1
+            } else if x[i] == lb[i] {
+                -1
+            } else {
+                0
+            }
+        })
+        .collect();
+    let max_nfev = max_nfev.unwrap_or(n * 100);
+    let mut status = None;
+    let mut optimality;
+
+    loop {
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| !(f64::from(on_bound[i]) * g[i] < 0.0))
+            .collect();
+        let g_free: Vec<f64> = free.iter().map(|&i| g[i]).collect();
+        optimality = norm_inf(&g_free);
+        if optimality < gtol {
+            status = Some(1);
+        }
+        if status.is_some() || nfev >= max_nfev {
+            break;
+        }
+
+        let j_free: Vec<Vec<f64>> = j
+            .iter()
+            .map(|row| free.iter().map(|&i| row[i]).collect())
+            .collect();
+        if !all_finite(&j_free) {
+            return Err(NonFiniteJacobian.into());
+        }
+        let (u, singular, v) = svd_thin(&j_free, free.len());
+        let cutoff = EPS * singular.first().copied().unwrap_or(0.0);
+        let mut newton = vec![0.0; free.len()];
+        for k in 0..singular.len() {
+            if singular[k] > cutoff {
+                let coefficient = -dot(&u[k], &f) / singular[k];
+                for (step, &vk) in newton.iter_mut().zip(&v[k]) {
+                    *step += coefficient * vk;
+                }
+            }
+        }
+        let anti_gradient: Vec<f64> = g_free.iter().map(|v| -v).collect();
+        let (a, b, _) = build_quadratic_1d(&j_free, &g_free, &anti_gradient, None, None);
+        let x_free: Vec<f64> = free.iter().map(|&i| x[i]).collect();
+        let lb_free: Vec<f64> = free.iter().map(|&i| lb[i]).collect();
+        let ub_free: Vec<f64> = free.iter().map(|&i| ub[i]).collect();
+        let mut actual_reduction = -1.0;
+        let mut x_new = x.clone();
+        let mut f_new = f_true.clone();
+        let mut cost_new = cost;
+        let mut hits = vec![0; free.len()];
+
+        while actual_reduction <= 0.0 && nfev < max_nfev {
+            let radius: Vec<f64> = free.iter().map(|&i| delta * scale[i]).collect();
+            let (step_free, bound_hits, trust_hit) =
+                rectangular_dogleg(&x_free, &newton, &g_free, a, b, &radius, &lb_free, &ub_free);
+            hits = bound_hits;
+            let predicted_reduction = -evaluate_quadratic(&j_free, &g_free, &step_free, None);
+            let mut step = vec![0.0; n];
+            for (&i, &s) in free.iter().zip(&step_free) {
+                step[i] = s;
+            }
+            x_new = (0..n)
+                .map(|i| (x[i] + step[i]).clamp(lb[i], ub[i]))
+                .collect();
+            f_new = fun(&x_new)?;
+            nfev += 1;
+            let step_h_norm = norm_inf(
+                &step
+                    .iter()
+                    .zip(&scale_inv)
+                    .map(|(s, d)| s * d)
+                    .collect::<Vec<_>>(),
+            );
+            if f_new.iter().any(|v| !v.is_finite()) {
+                delta = 0.25 * step_h_norm;
+                continue;
+            }
+            cost_new = match loss {
+                Some(l) => l.cost(&f_new),
+                None => 0.5 * dot(&f_new, &f_new),
+            };
+            actual_reduction = cost - cost_new;
+            let (new_delta, ratio) = update_tr_radius(
+                delta,
+                actual_reduction,
+                predicted_reduction,
+                step_h_norm,
+                trust_hit,
+            );
+            delta = new_delta;
+            status = check_termination(
+                actual_reduction,
+                cost,
+                norm(&step),
+                norm(&x),
+                ratio,
+                ftol,
+                xtol,
+            );
+            if status.is_some() {
+                break;
+            }
+        }
+
+        if actual_reduction > 0.0 {
+            for (&i, &hit) in free.iter().zip(&hits) {
+                on_bound[i] = hit;
+            }
+            x = x_new;
+            for i in 0..n {
+                if on_bound[i] == -1 {
+                    x[i] = lb[i];
+                } else if on_bound[i] == 1 {
+                    x[i] = ub[i];
+                }
+            }
+            f = f_new;
+            f_true = f.clone();
+            cost = cost_new;
+            j = jac(&x, &f)?;
+            njev += 1;
+            if let Some(l) = loss {
+                scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true));
+            }
+            g = compute_grad(&j, &f);
+            if jac_scale {
+                (scale, scale_inv) = compute_jac_scale(&j, Some(&scale_inv));
+            }
+        }
+    }
+
+    Ok(TrfOutcome {
+        x,
+        cost,
+        fun: f_true,
+        jac: j,
+        grad: g,
+        optimality,
+        active_mask: on_bound,
+        nfev,
+        njev,
+        status: status.unwrap_or(0),
     })
 }

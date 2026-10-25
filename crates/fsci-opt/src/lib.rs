@@ -42,9 +42,9 @@ pub use chandrupatla::{
     FindRootStatus, find_minimum, find_root,
 };
 pub use curvefit::{
-    CurveFitOptions, CurveFitResult, LeastSquaresMethod, LeastSquaresOptions, LeastSquaresResult,
-    LeastsqResult, curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many,
-    least_squares, least_squares_bounded, least_squares_many, leastsq,
+    CurveFitOptions, CurveFitResult, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions,
+    LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded, curve_fit_bounded_many,
+    curve_fit_many, least_squares, least_squares_bounded, least_squares_many, leastsq,
 };
 pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,
@@ -60,7 +60,7 @@ pub use minimize::{
     minimize_with_casp_portfolio_and_audit, nelder_mead, newton_cg, powell,
     probe_objective_landscape, select_minimize_method, trust_exact, trust_krylov, trust_ncg,
 };
-pub use trf::LossKind;
+pub use trf::{LossKind, XScale};
 pub use trust_constr::{
     FactorizationMethod, TrustBounds, TrustConstrMethod, TrustConstrResult, TrustConstraint,
     trust_constr_full,

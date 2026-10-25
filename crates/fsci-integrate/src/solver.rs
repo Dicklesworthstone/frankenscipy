@@ -22,6 +22,7 @@ pub enum StepFailure {
     ConvergenceFailure,
     SolverError,
     NonFiniteState,
+    InvalidJacobian(crate::IntegrateValidationError),
     NotYetImplemented(&'static str),
 }
 

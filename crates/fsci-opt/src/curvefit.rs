@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 //! Nonlinear least squares: `least_squares` (SciPy's default Trust Region Reflective method,
-//! bounds, robust losses, or Levenberg–Marquardt), `curve_fit`, and the batched variants.
+//! rectangular Dogbox, bounds, robust losses, or Levenberg–Marquardt), `curve_fit`, and the
+//! batched variants.
 
 use fsci_runtime::RuntimeMode;
+use std::sync::Arc;
 
 use crate::trf::{self, Loss, LossKind, XScale};
 use crate::types::OptError;
@@ -13,6 +15,8 @@ use crate::types::OptError;
 pub enum LeastSquaresMethod {
     /// Trust Region Reflective (Branch, Coleman & Li): bounds, robust losses, `x_scale`.
     Trf,
+    /// Powell dogleg in rectangular trust regions: bounds, robust losses, `x_scale`.
+    Dogbox,
     /// Levenberg–Marquardt: no bounds, `m ≥ n`, linear loss only.
     Lm,
 }
@@ -45,14 +49,15 @@ pub struct LeastSquaresResult {
     pub nfev: usize,
     /// Number of Jacobian evaluations.
     pub njev: usize,
-    /// Number of iterations (accepted steps for `Trf`).
+    /// Number of iterations (accepted steps for `Trf` and `Dogbox`).
     pub nit: usize,
     /// Jacobian at the solution (row-major, m rows x n cols; for a robust loss, SciPy's
     /// loss-scaled Jacobian).
     pub jac: Vec<Vec<f64>>,
     /// SciPy's status: 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
     pub status: i32,
-    /// First-order optimality: ‖Jᵀf‖∞, scaled by the Coleman–Li vector under bounds.
+    /// First-order optimality: ‖Jᵀf‖∞, scaled by Coleman–Li for bounded `Trf`, or
+    /// restricted to the free variables for `Dogbox`.
     pub optimality: f64,
     /// Gradient `Jᵀf` of the cost at the solution.
     pub grad: Vec<f64>,
@@ -60,8 +65,54 @@ pub struct LeastSquaresResult {
     pub active_mask: Vec<i8>,
 }
 
+/// An analytic residual Jacobian shared by individual and batched fits.
+///
+/// Rows correspond to residuals and columns to parameters. Capturing closures can own
+/// model data; the callback is validated at every evaluation before a solver uses it.
+/// A callback shared by [`least_squares_many`] must be valid for every parameter row;
+/// the callback receives the fitted variables, not the batch's per-fit data.
+#[derive(Clone)]
+pub struct LeastSquaresJacobian {
+    callback: Arc<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync>,
+}
+
+impl std::fmt::Debug for LeastSquaresJacobian {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LeastSquaresJacobian { callback }")
+    }
+}
+
+impl LeastSquaresJacobian {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn evaluate(&self, x: &[f64], residual_count: usize) -> Result<Vec<Vec<f64>>, OptError> {
+        let matrix = (self.callback)(x);
+        if matrix.len() != residual_count || matrix.iter().any(|row| row.len() != x.len()) {
+            return Err(OptError::InvalidArgument {
+                detail: format!(
+                    "Jacobian must have shape ({residual_count}, {}), with one row per residual",
+                    x.len()
+                ),
+            });
+        }
+        if matrix.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("Jacobian must not contain NaN or Inf"),
+            });
+        }
+        Ok(matrix)
+    }
+}
+
 /// Options for `least_squares`: SciPy's keyword arguments.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LeastSquaresOptions {
     /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
     /// `curve_fit`, `Trf` for a bounded one.
@@ -77,12 +128,17 @@ pub struct LeastSquaresOptions {
     /// Relative finite-difference step; `None` is SciPy's default
     /// `√ε·sign(x)·max(1, |x|)`.
     pub diff_step: Option<f64>,
-    /// Robust loss (`Trf` only).
+    /// Optional analytic Jacobian of the residuals. Numerical differences are used
+    /// when absent. Analytic calls contribute to `njev`, not `nfev`.
+    pub jac: Option<LeastSquaresJacobian>,
+    /// Robust loss (`Trf` and `Dogbox`).
     pub loss: LossKind,
     /// Soft margin between inlier and outlier residuals for a robust loss.
     pub f_scale: f64,
-    /// SciPy's `x_scale='jac'` (`Trf`); otherwise unit scale.
-    pub x_scale_jac: bool,
+    /// Parameter scaling for `Trf` and `Dogbox`: fixed positive scales or `'jac'`.
+    /// `None` uses unit scale. Explicit scaling is not supported by this LM kernel
+    /// and is rejected instead of being ignored.
+    pub x_scale: Option<XScale>,
     /// Runtime mode.
     pub mode: RuntimeMode,
 }
@@ -96,9 +152,10 @@ impl Default for LeastSquaresOptions {
             ftol: 1.0e-8,
             max_nfev: None,
             diff_step: None,
+            jac: None,
             loss: LossKind::Linear,
             f_scale: 1.0,
-            x_scale_jac: false,
+            x_scale: None,
             mode: RuntimeMode::Strict,
         }
     }
@@ -129,8 +186,9 @@ pub struct CurveFitOptions {
 }
 
 /// `scipy.optimize.least_squares(fun, x0, method=...)` without bounds: minimize
-/// `0.5·Σρ(residuals(x)²)`. The default method is SciPy's `trf`; `Lm` selects
-/// Levenberg–Marquardt. See [`least_squares_bounded`] for bounds.
+/// `0.5·Σρ(residuals(x)²)`. The default method is SciPy's `trf`; `Dogbox` selects rectangular
+/// trust-region dogleg and `Lm` selects Levenberg–Marquardt. See [`least_squares_bounded`]
+/// for bounds.
 pub fn least_squares<F>(
     residuals: F,
     x0: &[f64],
@@ -140,7 +198,9 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     match options.method.unwrap_or(LeastSquaresMethod::Trf) {
-        LeastSquaresMethod::Trf => least_squares_trf(&residuals, x0, None, options),
+        LeastSquaresMethod::Trf | LeastSquaresMethod::Dogbox => {
+            least_squares_trust_region(&residuals, x0, None, options)
+        }
         LeastSquaresMethod::Lm => least_squares_lm(residuals, x0, options),
     }
 }
@@ -193,6 +253,13 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     let n = x0.len();
+    if options.x_scale.is_some() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "explicit x_scale is supported by 'trf' and 'dogbox', not this 'lm' kernel",
+            ),
+        });
+    }
     if options.loss != LossKind::Linear {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
@@ -259,8 +326,15 @@ where
     let mut cost = 0.5 * dot_vec(&r, &r);
     let mut jac = Vec::new();
     let mut x_perturbed = x.clone();
-    finite_diff_jacobian_parallel_into(&residuals, &x, &r, diff_step, &mut jac, &mut x_perturbed);
-    nfev += n;
+    nfev += lm_jacobian_into(
+        &residuals,
+        &x,
+        &r,
+        diff_step,
+        options.jac.as_ref(),
+        &mut jac,
+        &mut x_perturbed,
+    )?;
     njev += 1;
     // J^T J (O(n²·m)) and J^T r depend only on (jac, r), which change ONLY on an accepted
     // step. Cache them and recompute only when jac/r change, rather than rebuilding both at
@@ -351,6 +425,11 @@ where
         let x_new: Vec<f64> = x.iter().zip(step.iter()).map(|(a, b)| a + b).collect();
         let r_new = residuals(&x_new);
         nfev += 1;
+        if r_new.len() != m {
+            return Err(OptError::InvalidArgument {
+                detail: format!("residuals changed length from {m} to {}", r_new.len()),
+            });
+        }
         let cost_new = 0.5 * dot_vec(&r_new, &r_new);
 
         // Gain ratio (actual reduction / predicted reduction)
@@ -374,15 +453,15 @@ where
                 // Check cost convergence
                 let cost_change = (old_cost - cost) / (1.0 + cost);
                 if cost_change.abs() <= options.ftol {
-                    finite_diff_jacobian_parallel_into(
+                    nfev += lm_jacobian_into(
                         &residuals,
                         &x,
                         &r,
                         diff_step,
+                        options.jac.as_ref(),
                         &mut jac,
                         &mut x_perturbed,
-                    );
-                    nfev += n;
+                    )?;
                     njev += 1;
                     // status 2: |Δcost|/(1+cost) ≤ ftol after an accepted step (rho > 0.25)
                     return Ok(lm_result(
@@ -399,15 +478,15 @@ where
                 }
 
                 // Recompute Jacobian (and the derived J^T J / J^T r) — jac and r changed.
-                finite_diff_jacobian_parallel_into(
+                nfev += lm_jacobian_into(
                     &residuals,
                     &x,
                     &r,
                     diff_step,
+                    options.jac.as_ref(),
                     &mut jac,
                     &mut x_perturbed,
-                );
-                nfev += n;
+                )?;
                 njev += 1;
                 jtj_matrix_into(&jac, &mut jtj);
                 jt_vec_into(&jac, &r, &mut jtr);
@@ -463,7 +542,7 @@ fn fd_jacobian_scipy<F>(
     lb: &[f64],
     ub: &[f64],
     rel_step: Option<f64>,
-) -> Vec<Vec<f64>>
+) -> Result<Vec<Vec<f64>>, OptError>
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
@@ -502,6 +581,15 @@ where
         let dx = x1[i] - x[i];
         let f1 = residuals(&x1);
         x1[i] = x[i];
+        if f1.len() != f0.len() {
+            return Err(OptError::InvalidArgument {
+                detail: format!(
+                    "residuals changed length from {} to {} during Jacobian evaluation",
+                    f0.len(),
+                    f1.len()
+                ),
+            });
+        }
         columns.push(
             f1.iter()
                 .zip(f0)
@@ -509,9 +597,31 @@ where
                 .collect::<Vec<f64>>(),
         );
     }
-    (0..f0.len())
+    Ok((0..f0.len())
         .map(|r| columns.iter().map(|col| col[r]).collect())
-        .collect()
+        .collect())
+}
+
+/// Fill the LM Jacobian and return the number of residual evaluations it required.
+fn lm_jacobian_into<F>(
+    residuals: &F,
+    x: &[f64],
+    residual: &[f64],
+    step: f64,
+    analytic: Option<&LeastSquaresJacobian>,
+    jac: &mut Vec<Vec<f64>>,
+    x_perturbed: &mut Vec<f64>,
+) -> Result<usize, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64> + Sync,
+{
+    if let Some(analytic) = analytic {
+        *jac = analytic.evaluate(x, residual.len())?;
+        Ok(0)
+    } else {
+        finite_diff_jacobian_parallel_into(residuals, x, residual, step, jac, x_perturbed);
+        Ok(x.len())
+    }
 }
 
 /// SciPy raises `ValueError` with this text when its `trf` SVD meets a non-finite matrix.
@@ -523,10 +633,9 @@ impl From<trf::NonFiniteJacobian> for OptError {
     }
 }
 
-/// `method='trf'` with optional bounds, as SciPy's `least_squares` sets it up: tolerance and
-/// bound validation, `x0` made strictly feasible, the initial residuals required finite, then
-/// [`trf::trf`].
-fn least_squares_trf<F>(
+/// Dense `trf`/`dogbox` setup: validate tolerances and bounds, require finite initial
+/// residuals, and move `x0` off the bounds only for TRF (Dogbox accepts exact bounds).
+fn least_squares_trust_region<F>(
     residuals: &F,
     x0: &[f64],
     bounds: Option<(&[f64], &[f64])>,
@@ -597,6 +706,31 @@ where
             detail: String::from("f_scale must be positive and finite"),
         });
     }
+    if options.max_nfev == Some(0) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("max_nfev must be positive"),
+        });
+    }
+    let x_scale = match &options.x_scale {
+        Some(XScale::Fixed(scale)) => {
+            if scale.len() != n {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("Inconsistent shapes between x_scale and `x0`."),
+                });
+            }
+            if scale
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("x_scale entries must be positive and finite"),
+                });
+            }
+            XScale::Fixed(scale.clone())
+        }
+        Some(XScale::Jac) => XScale::Jac,
+        None => XScale::Fixed(vec![1.0; n]),
+    };
     if let Some(r) = options.diff_step
         && !(r.is_finite() && r > 0.0)
     {
@@ -604,7 +738,12 @@ where
             detail: String::from("diff_step must be finite and > 0"),
         });
     }
-    let x0 = trf::make_strictly_feasible(x0, &lb, &ub, 1e-10);
+    let dogbox = options.method == Some(LeastSquaresMethod::Dogbox);
+    let x0 = if dogbox {
+        x0.to_vec()
+    } else {
+        trf::make_strictly_feasible(x0, &lb, &ub, 1e-10)
+    };
     let f0 = residuals(&x0);
     if f0.iter().any(|v| !v.is_finite()) {
         return Err(OptError::NonFiniteInput {
@@ -612,16 +751,14 @@ where
         });
     }
     let m = f0.len();
-    let j0 = fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step);
+    let j0 = match &options.jac {
+        Some(jac) => jac.evaluate(&x0, m)?,
+        None => fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step)?,
+    };
     let loss = (options.loss != LossKind::Linear).then_some(Loss {
         kind: options.loss,
         f_scale: options.f_scale,
     });
-    let x_scale = if options.x_scale_jac {
-        XScale::Jac
-    } else {
-        XScale::Fixed(vec![1.0; n])
-    };
     let mut fun = |x: &[f64]| -> Result<Vec<f64>, OptError> {
         let f = residuals(x);
         if f.len() != m {
@@ -632,16 +769,13 @@ where
         Ok(f)
     };
     let mut jac = |x: &[f64], f: &[f64]| -> Result<Vec<Vec<f64>>, OptError> {
-        Ok(fd_jacobian_scipy(
-            residuals,
-            x,
-            f,
-            &lb,
-            &ub,
-            options.diff_step,
-        ))
+        match &options.jac {
+            Some(jac) => jac.evaluate(x, m),
+            None => fd_jacobian_scipy(residuals, x, f, &lb, &ub, options.diff_step),
+        }
     };
-    let out = trf::trf(
+    let solve = if dogbox { trf::dogbox } else { trf::trf };
+    let out = solve(
         &mut fun,
         &mut jac,
         &x0,
@@ -714,8 +848,9 @@ where
         detail: String::from("p0 (initial parameter guess) is required"),
     })?;
     let n_params = p0.len();
+    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm);
 
-    if xdata.len() < n_params {
+    if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
         return Err(OptError::InvalidArgument {
             detail: format!(
                 "number of data points ({}) must be >= number of parameters ({n_params})",
@@ -735,21 +870,13 @@ where
 
     // SciPy's curve_fit(method=None) runs 'lm' when there are no bounds.
     let ls_options = LeastSquaresOptions {
-        method: Some(options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm)),
+        method: Some(method),
         ..options.ls_options
     };
     let ls_result = least_squares(residuals, &p0, ls_options)?;
     require_fit_converged(&ls_result)?;
 
-    // Compute covariance: pcov = (J^T J)^{-1} * s^2
-    // where s^2 = cost * 2 / (m - n) for relative sigma
-    let pcov = compute_covariance(
-        &ls_result.jac,
-        ls_result.cost,
-        xdata.len(),
-        n_params,
-        options.absolute_sigma,
-    );
+    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -760,9 +887,9 @@ where
 }
 
 /// SciPy's `curve_fit` fills `pcov` with inf and warns `OptimizeWarning` when the covariance
-/// is indeterminate (a singular Jacobian) or, with relative sigma, when there are no more
-/// data points than parameters. `compute_covariance` returns the all-inf matrix in exactly
-/// those cases.
+/// is indeterminate (a singular LM Jacobian) or, with relative sigma, when there are no more
+/// data points than parameters. TRF and Dogbox instead use a pseudoinverse for a singular
+/// Jacobian.
 fn warn_if_covariance_not_estimated(pcov: &[Vec<f64>]) {
     if pcov.iter().flatten().any(|v| !v.is_finite()) {
         fsci_runtime::warn(
@@ -786,8 +913,8 @@ fn require_fit_converged(ls_result: &LeastSquaresResult) -> Result<(), OptError>
 }
 
 /// Box-constrained nonlinear least squares, `scipy.optimize.least_squares(fun, x0,
-/// bounds=(lower, upper))`: SciPy's Trust Region Reflective method, so a bound that is active
-/// at the solution is reached exactly and reported in `active_mask` (`±inf` = no bound).
+/// bounds=(lower, upper))`: Trust Region Reflective by default, or rectangular Dogbox.
+/// Active bounds are reported in `active_mask` (`±inf` = no bound).
 /// `method = Lm` is refused, as SciPy refuses it ("Method 'lm' doesn't support bounds").
 ///
 /// This used to reparameterise each bounded coordinate (logistic / softplus) and run LM,
@@ -823,7 +950,7 @@ where
     if options.method == Some(LeastSquaresMethod::Lm) {
         return least_squares_lm(residuals, x0, options);
     }
-    least_squares_trf(&residuals, x0, Some((lower, upper)), options)
+    least_squares_trust_region(&residuals, x0, Some((lower, upper)), options)
 }
 
 /// Box-constrained curve fitting: the bounded analogue of [`curve_fit`], matching
@@ -860,7 +987,8 @@ where
         detail: String::from("p0 (initial parameter guess) is required"),
     })?;
     let n_params = p0.len();
-    if xdata.len() < n_params {
+    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Trf);
+    if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
         return Err(OptError::InvalidArgument {
             detail: format!(
                 "number of data points ({}) must be >= number of parameters ({n_params})",
@@ -880,13 +1008,7 @@ where
     let ls_result = least_squares_bounded(residuals, &p0, lower, upper, options.ls_options)?;
     require_fit_converged(&ls_result)?;
 
-    let pcov = compute_covariance(
-        &ls_result.jac,
-        ls_result.cost,
-        xdata.len(),
-        n_params,
-        options.absolute_sigma,
-    );
+    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -980,7 +1102,7 @@ where
         return Vec::new();
     }
     let r_ref = &residuals;
-    let solve_one = move |params: &[f64]| least_squares(|x| r_ref(x, params), x0, options);
+    let solve_one = move |params: &[f64]| least_squares(|x| r_ref(x, params), x0, options.clone());
 
     // Each solve is a heavy iterative LM fit → fan whole rows across cores, capped
     // by the row count; a tiny batch stays serial to dodge the spawn floor.
@@ -1483,7 +1605,69 @@ fn cholesky_solve_with_l_into(
     }
 }
 
-/// Compute parameter covariance matrix from Jacobian.
+/// SciPy's curve-fit covariance: LM retains its inverse, while TRF and Dogbox use
+/// the SVD pseudoinverse of JᵀJ without forming the condition-squaring normal matrix.
+fn curve_fit_covariance(
+    result: &LeastSquaresResult,
+    method: LeastSquaresMethod,
+    absolute_sigma: bool,
+) -> Vec<Vec<f64>> {
+    let m = result.fun.len();
+    let n = result.x.len();
+    if method == LeastSquaresMethod::Lm {
+        return compute_covariance(&result.jac, result.cost, m, n, absolute_sigma);
+    }
+    if !absolute_sigma && m <= n {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+    if result.jac.iter().flatten().any(|value| !value.is_finite()) {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+
+    // Normalize before the Jacobi SVD: its column inner products otherwise overflow
+    // or underflow for large/small model derivatives, even when the covariance is finite.
+    let scale = result
+        .jac
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    let mut covariance = vec![vec![0.0; n]; n];
+    if scale != 0.0 {
+        let normalized: Vec<Vec<f64>> = result
+            .jac
+            .iter()
+            .map(|row| row.iter().map(|value| value / scale).collect())
+            .collect();
+        let (_, singular_values, right_vectors) = trf::svd_thin(&normalized, n);
+        let threshold = f64::EPSILON * m.max(n) as f64 * singular_values[0];
+        for (&singular, vector) in singular_values.iter().zip(&right_vectors) {
+            if singular > threshold {
+                for (i, row) in covariance.iter_mut().enumerate() {
+                    for (j, entry) in row.iter_mut().enumerate() {
+                        *entry += (vector[i] / singular) * (vector[j] / singular);
+                    }
+                }
+            }
+        }
+        // Divide twice instead of forming scale², which can overflow for a finite J.
+        for entry in covariance.iter_mut().flatten() {
+            *entry /= scale;
+            *entry /= scale;
+        }
+    }
+    if covariance.iter().flatten().any(|value| value.is_nan()) {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
+    if !absolute_sigma {
+        let residual_variance = 2.0 * result.cost / (m - n) as f64;
+        for entry in covariance.iter_mut().flatten() {
+            *entry *= residual_variance;
+        }
+    }
+    covariance
+}
+
+/// Compute the existing LM parameter covariance matrix from its Jacobian.
 fn compute_covariance(
     jac: &[Vec<f64>],
     cost: f64,
@@ -1860,6 +2044,325 @@ mod tests {
     }
 
     #[test]
+    fn least_squares_dogbox_reaches_active_bounds_and_preserves_full_gradient() {
+        let result = least_squares_bounded(
+            |x| vec![x[0] - 3.0, x[1] + 1.0],
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[2.0, 2.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("Dogbox solves the constrained quadratic");
+        assert_eq!(result.x, vec![2.0, 0.0]);
+        assert_eq!(result.active_mask, vec![1, -1]);
+        assert_eq!(result.status, 1);
+        assert_eq!(result.optimality, 0.0);
+        assert!((result.grad[0] + 1.0).abs() < 1e-7);
+        assert!((result.grad[1] - 1.0).abs() < 1e-7);
+        assert!((result.cost - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn least_squares_dogbox_underdetermined_and_rank_deficient() {
+        for duplicate in [false, true] {
+            let result = least_squares(
+                |x| {
+                    let r = x[0] + 2.0 * x[1] - 3.0;
+                    if duplicate { vec![r, 2.0 * r] } else { vec![r] }
+                },
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Dogbox),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("Dogbox accepts a deficient dense Jacobian");
+            assert!(result.success);
+            assert!(result.cost < 1e-20);
+            assert!((result.x[0] - 0.6).abs() < 1e-7);
+            assert!((result.x[1] - 1.2).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn least_squares_dogbox_keeps_initial_bound_and_honors_evaluation_budget() {
+        let result = least_squares_bounded(
+            |x| vec![x[0] + 1.0],
+            &[0.0],
+            &[0.0],
+            &[1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                max_nfev: Some(1),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("initial bound optimum");
+        assert_eq!(result.x, vec![0.0]);
+        assert_eq!(result.active_mask, vec![-1]);
+        assert_eq!(result.nfev, 1);
+        assert_eq!(result.status, 1);
+
+        let starved = least_squares(
+            |x| vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]],
+            &[-1.2, 1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                max_nfev: Some(3),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("budget exhaustion returns the current iterate");
+        assert_eq!(starved.nfev, 3);
+        assert_eq!(starved.status, 0);
+        assert!(!starved.success);
+    }
+
+    #[test]
+    fn least_squares_trust_regions_reject_zero_evaluation_budget() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| vec![x[0] - 1.0],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    max_nfev: Some(0),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+        }
+    }
+
+    #[test]
+    fn least_squares_analytic_jacobian_counts_only_actual_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            let residual_calls = AtomicUsize::new(0);
+            let jacobian_calls = Arc::new(AtomicUsize::new(0));
+            let jacobian_count = Arc::clone(&jacobian_calls);
+            let slopes = vec![1.0, 2.0, 4.0];
+            let result = least_squares(
+                |x| {
+                    residual_calls.fetch_add(1, Ordering::Relaxed);
+                    vec![x[0] - 2.0, 2.0 * x[0] - 4.0, 4.0 * x[0] - 8.0]
+                },
+                &[0.5],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        jacobian_count.fetch_add(1, Ordering::Relaxed);
+                        slopes.iter().map(|&slope| vec![slope]).collect()
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("fit with a captured analytic Jacobian");
+            assert!(result.success, "{method:?}: {result:?}");
+            assert!((result.x[0] - 2.0).abs() < 1e-7);
+            assert_eq!(result.nfev, residual_calls.load(Ordering::Relaxed));
+            assert_eq!(result.njev, jacobian_calls.load(Ordering::Relaxed));
+            assert_eq!(result.jac, vec![vec![1.0], vec![2.0], vec![4.0]]);
+        }
+    }
+
+    #[test]
+    fn least_squares_validates_analytic_jacobian_every_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            for bad in [
+                vec![],
+                vec![vec![1.0]],
+                vec![vec![1.0, 0.0], vec![0.0]],
+                vec![vec![1.0, 0.0], vec![0.0, f64::NAN]],
+            ] {
+                let result = least_squares(
+                    |x| vec![x[0] - 1.0, x[1] - 2.0],
+                    &[0.0, 0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(move |_| bad.clone())),
+                        ..LeastSquaresOptions::default()
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(OptError::InvalidArgument { .. } | OptError::NonFiniteInput { .. })
+                ));
+            }
+            let calls = AtomicUsize::new(0);
+            let result = least_squares(
+                |x| vec![x[0] - 1.0, x[1] - 2.0],
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+                        } else {
+                            vec![vec![1.0]]
+                        }
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(OptError::InvalidArgument { .. })),
+                "refresh must validate: {method:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn least_squares_validates_fixed_scale_before_callbacks() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for scale in [
+                vec![],
+                vec![1.0, 2.0],
+                vec![0.0],
+                vec![-1.0],
+                vec![f64::INFINITY],
+                vec![f64::NAN],
+            ] {
+                let result = least_squares(
+                    |_| panic!("invalid scales must be rejected before evaluating the model"),
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Fixed(scale)),
+                        ..LeastSquaresOptions::default()
+                    },
+                );
+                assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+            }
+        }
+        let lm = least_squares(
+            |x| vec![x[0]],
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                x_scale: Some(XScale::Jac),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert!(matches!(lm, Err(OptError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn curve_fit_bounded_uses_analytic_jacobian_and_fixed_scaling() {
+        let xdata: Vec<f64> = (0..6).map(f64::from).collect();
+        let ydata: Vec<f64> = xdata.iter().map(|x| 2.0 * x + 1.0).collect();
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let jac_x = xdata.clone();
+            let fit = curve_fit_bounded(
+                |x, p| p[0] * x + p[1],
+                &xdata,
+                &ydata,
+                &[0.0, 0.0],
+                &[1.5, 10.0],
+                CurveFitOptions {
+                    p0: Some(vec![1.0, 1.0]),
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Fixed(vec![0.5, 2.0])),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            jac_x.iter().map(|&x| vec![x, 1.0]).collect()
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                    ..CurveFitOptions::default()
+                },
+            )
+            .expect("bounded analytic curve fit");
+            assert!((fit.popt[0] - 1.5).abs() < 1e-8);
+            assert!((fit.popt[1] - 2.25).abs() < 1e-7);
+            assert_eq!(fit.ls_result.active_mask, vec![1, 0]);
+        }
+    }
+
+    #[test]
+    fn least_squares_many_shares_analytic_jacobian() {
+        let results = least_squares_many(
+            |x, params| vec![x[0] - params[0]],
+            &[0.0],
+            &[vec![1.0], vec![2.0], vec![3.0]],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Dogbox),
+                jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]])),
+                x_scale: Some(XScale::Fixed(vec![2.0])),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                (result.as_ref().expect("batch member").x[0] - (index + 1) as f64).abs() < 1e-8
+            );
+        }
+    }
+
+    #[test]
+    fn least_squares_detects_residual_shape_change_during_differencing() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| if x[0] == 0.0 { vec![-1.0] } else { vec![] },
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+        }
+    }
+
+    #[test]
+    fn least_squares_empty_residuals_preserve_parameter_dimensions() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for analytic in [false, true] {
+                for bounded in [false, true] {
+                    let options = LeastSquaresOptions {
+                        method: Some(method),
+                        x_scale: Some(XScale::Jac),
+                        jac: analytic.then(|| LeastSquaresJacobian::new(|_| vec![])),
+                        ..LeastSquaresOptions::default()
+                    };
+                    let result = if bounded {
+                        least_squares_bounded(
+                            |_| vec![],
+                            &[0.25, 0.75],
+                            &[0.0, 0.0],
+                            &[1.0, 1.0],
+                            options,
+                        )
+                    } else {
+                        least_squares(|_| vec![], &[0.25, 0.75], options)
+                    }
+                    .expect("SciPy accepts an empty residual system");
+                    assert_eq!(result.x, vec![0.25, 0.75]);
+                    assert_eq!(result.grad, vec![0.0, 0.0]);
+                    assert_eq!(result.active_mask, vec![0, 0]);
+                    assert_eq!(result.status, 1);
+                    assert_eq!(result.cost, 0.0);
+                    assert_eq!(result.optimality, 0.0);
+                    assert_eq!(result.nfev, 1);
+                    assert_eq!(result.njev, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn curve_fit_many_byte_identical_to_per_row() {
         // Batched fit must equal looping curve_fit per row, bit-for-bit (each fit is
         // independent; parallelism only distributes them).
@@ -1943,10 +2446,10 @@ mod tests {
             .collect();
         let opt = LeastSquaresOptions::default();
 
-        let batched = least_squares_many(resid, &[1.5, 1.0], &ys, opt);
+        let batched = least_squares_many(resid, &[1.5, 1.0], &ys, opt.clone());
         assert_eq!(batched.len(), nrows);
         for (i, y) in ys.iter().enumerate() {
-            let single = least_squares(|x| resid(x, y), &[1.5, 1.0], opt).expect("single");
+            let single = least_squares(|x| resid(x, y), &[1.5, 1.0], opt.clone()).expect("single");
             let many = batched[i].as_ref().expect("batched member");
             assert_eq!(many.x[0].to_bits(), single.x[0].to_bits(), "a mismatch {i}");
             assert_eq!(many.x[1].to_bits(), single.x[1].to_bits(), "b mismatch {i}");
@@ -2016,6 +2519,261 @@ mod tests {
         assert!(result.pcov[0][0].is_finite());
         assert!(result.pcov[1][1].is_finite());
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn curve_fit_trust_region_accepts_underdetermined_models() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for bounded in [false, true] {
+                for absolute_sigma in [false, true] {
+                    let options = CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            gtol: 1e-12,
+                            xtol: 1e-12,
+                            ftol: 1e-12,
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    };
+                    let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                        if bounded {
+                            curve_fit_bounded(
+                                |_x, p| p[0] + p[1],
+                                &[0.0],
+                                &[1.0],
+                                &[-2.0, -2.0],
+                                &[2.0, 2.0],
+                                options,
+                            )
+                        } else {
+                            curve_fit(|_x, p| p[0] + p[1], &[0.0], &[1.0], options)
+                        }
+                    });
+                    let fit =
+                        fit.expect("TRF and Dogbox support fewer observations than parameters");
+                    for parameter in &fit.popt {
+                        assert!((parameter - 0.5).abs() < 1e-7, "{method:?}: {:?}", fit.popt);
+                    }
+                    assert_eq!(fit.pcov.len(), 2);
+                    assert!(fit.pcov.iter().all(|row| row.len() == 2));
+                    if absolute_sigma {
+                        assert!(
+                            fit.pcov
+                                .iter()
+                                .flatten()
+                                .all(|value| (value - 0.25).abs() < 1e-14)
+                        );
+                        assert!(warnings.is_empty(), "{warnings:?}");
+                    } else {
+                        assert!(fit.pcov.iter().flatten().all(|value| value.is_infinite()));
+                        assert_eq!(warnings.len(), 1);
+                        assert_eq!(
+                            warnings[0].category,
+                            fsci_runtime::WarningCategory::OptimizeWarning
+                        );
+                    }
+                }
+            }
+        }
+
+        for bounded in [false, true] {
+            let options = CurveFitOptions {
+                p0: Some(vec![0.0, 0.0]),
+                ls_options: LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            };
+            let result = if bounded {
+                curve_fit_bounded(
+                    |_x, p| p[0] + p[1],
+                    &[0.0],
+                    &[1.0],
+                    &[f64::NEG_INFINITY; 2],
+                    &[f64::INFINITY; 2],
+                    options,
+                )
+            } else {
+                curve_fit(|_x, p| p[0] + p[1], &[0.0], &[1.0], options)
+            };
+            assert!(
+                matches!(result, Err(OptError::InvalidArgument { detail }) if detail.contains("data points"))
+            );
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_rank_deficient_covariance() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for bounded in [false, true] {
+                for absolute_sigma in [false, true] {
+                    let options = CurveFitOptions {
+                        p0: Some(vec![1.0, 1.0]),
+                        absolute_sigma,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]; 3])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    };
+                    let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                        if bounded {
+                            curve_fit_bounded(
+                                |_x, p| p[0] + p[1],
+                                &[0.0, 1.0, 2.0],
+                                &[1.0, 2.0, 3.0],
+                                &[-2.0, -2.0],
+                                &[2.0, 2.0],
+                                options,
+                            )
+                        } else {
+                            curve_fit(
+                                |_x, p| p[0] + p[1],
+                                &[0.0, 1.0, 2.0],
+                                &[1.0, 2.0, 3.0],
+                                options,
+                            )
+                        }
+                    });
+                    let fit = fit.expect("rank-deficient fit has a pseudoinverse covariance");
+                    let expected = if absolute_sigma {
+                        1.0 / 12.0
+                    } else {
+                        1.0 / 6.0
+                    };
+                    for &entry in fit.pcov.iter().flatten() {
+                        assert!(
+                            (entry - expected).abs() < 1e-14,
+                            "{method:?}: {:?}",
+                            fit.pcov
+                        );
+                    }
+                    assert!(warnings.is_empty(), "{warnings:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_zero_rank_and_scipy_singular_value_cutoff() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for weak_derivative in [0.0, 5e-16, 1e-14] {
+                let options = CurveFitOptions {
+                    p0: Some(vec![0.0, 0.0]),
+                    absolute_sigma: true,
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            vec![vec![1.0, 0.0], vec![0.0, weak_derivative], vec![0.0, 0.0]]
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                };
+                let fit = curve_fit(
+                    |x, p| {
+                        if x == 0.0 {
+                            p[0]
+                        } else if x == 1.0 {
+                            weak_derivative * p[1]
+                        } else {
+                            0.0
+                        }
+                    },
+                    &[0.0, 1.0, 2.0],
+                    &[0.0, 0.0, 0.0],
+                    options,
+                )
+                .expect("small singular values are discarded by SciPy's dimension-aware cutoff");
+                assert!((fit.pcov[0][0] - 1.0).abs() < 1e-14);
+                if weak_derivative <= 5e-16 {
+                    assert_eq!(fit.pcov[1][1], 0.0);
+                } else {
+                    assert!((fit.pcov[1][1] / 1e28 - 1.0).abs() < 1e-14);
+                }
+                assert_eq!(fit.pcov[0][1], 0.0);
+                assert_eq!(fit.pcov[1][0], 0.0);
+            }
+            let (fit, warnings) = fsci_runtime::catch_warnings(|| {
+                curve_fit(
+                    |_x, _p| 0.0,
+                    &[0.0, 1.0, 2.0],
+                    &[1.0, 2.0, 3.0],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma: true,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0; 2]; 3])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    },
+                )
+            });
+            assert_eq!(
+                fit.expect("zero-rank pseudoinverse").pcov,
+                vec![vec![0.0; 2]; 2]
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn curve_fit_trust_region_covariance_preserves_large_jacobian_units() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for derivative_scale in [1e80, 1e160] {
+                let fit = curve_fit(
+                    |x, p| {
+                        derivative_scale
+                            * if x == 0.0 {
+                                p[0] + p[1]
+                            } else if x == 1.0 {
+                                p[1]
+                            } else {
+                                p[0]
+                            }
+                    },
+                    &[0.0, 1.0, 2.0],
+                    &[0.0, 0.0, 0.0],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0, 0.0]),
+                        absolute_sigma: true,
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(move |_| {
+                                vec![
+                                    vec![derivative_scale, derivative_scale],
+                                    vec![0.0, derivative_scale],
+                                    vec![derivative_scale, 0.0],
+                                ]
+                            })),
+                            ..LeastSquaresOptions::default()
+                        },
+                    },
+                )
+                .expect("finite covariance despite large derivatives");
+                for (i, row) in fit.pcov.iter().enumerate() {
+                    for (j, &entry) in row.iter().enumerate() {
+                        let expected = if i == j { 2.0 / 3.0 } else { -1.0 / 3.0 };
+                        let restored = entry * derivative_scale * derivative_scale;
+                        // At scale 1e160 the covariance is subnormal, with ~4 decimal digits.
+                        let tolerance = if derivative_scale > 1e100 {
+                            5e-4
+                        } else {
+                            1e-14
+                        };
+                        assert!(
+                            (restored - expected).abs() < tolerance,
+                            "{method:?}: {:?}",
+                            fit.pcov
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
