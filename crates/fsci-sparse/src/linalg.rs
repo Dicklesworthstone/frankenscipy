@@ -12566,10 +12566,7 @@ fn estimate_sparse_cond_matrix_free(a: &CsrMatrix, norm_a: f64) -> f64 {
             col_sums[col] += val.abs();
         }
     }
-    let min_col_sum = col_sums
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let min_col_sum = col_sums.iter().copied().fold(f64::INFINITY, f64::min);
     if min_col_sum == 0.0 {
         return f64::INFINITY;
     }
@@ -34926,7 +34923,7 @@ impl std::str::FromStr for EigsWhich {
 /// Options for [`eigsh`], [`eigs`] and [`svds`], after SciPy's keyword arguments. The default
 /// is SciPy's: `which='LM'`, `tol=0` (machine precision), `maxiter=None` (`n * 10`),
 /// `ncv=None`, no shift, no mass matrix, and a start vector chosen by the solver.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct EigsOptions<'a> {
     /// Relative accuracy of the Ritz values: a pair is converged when its residual estimate is
     /// at most `tol·max(|θ|, ε^(2/3))`, ARPACK's `dsconv`/`dnconv` test on the operator's
@@ -34952,9 +34949,35 @@ pub struct EigsOptions<'a> {
     /// symmetric positive definite (semi-definite suffices in shift-invert mode). Without
     /// `sigma` the operator is `M⁻¹A` with `M` factored by [`splu`] (ARPACK mode 2).
     pub mass: Option<&'a CsrMatrix>,
+    /// User-supplied inverse of `M` (SciPy's `Minv`). Only valid with `mass` and without
+    /// `sigma`. The operator must solve `M y = x`; it is not a preconditioner. Supplying it
+    /// reuses an existing factorization or a problem-specific solve instead of factoring
+    /// `M` again.
+    pub minv: Option<&'a dyn LinearOperator>,
+    /// User-supplied inverse of `A − sigma M` (SciPy's `OPinv`). Only valid with `sigma`.
+    /// It must apply the inverse alone, without the multiplication by `M`. This enables
+    /// shift-invert eigenproblems with a matrix-free `A`; the returned eigenpairs still
+    /// pass the original problem's explicit residual check.
+    pub opinv: Option<&'a dyn LinearOperator>,
     /// Starting vector (SciPy's `v0`). `None` uses a fixed-seed pseudo-random vector, so results
     /// are reproducible (SciPy draws a random one).
     pub v0: Option<&'a [f64]>,
+}
+
+impl std::fmt::Debug for EigsOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EigsOptions")
+            .field("tol", &self.tol)
+            .field("max_iter", &self.max_iter)
+            .field("which", &self.which)
+            .field("ncv", &self.ncv)
+            .field("sigma", &self.sigma)
+            .field("mass", &self.mass)
+            .field("minv", &self.minv.map(LinearOperator::shape))
+            .field("opinv", &self.opinv.map(LinearOperator::shape))
+            .field("v0", &self.v0)
+            .finish()
+    }
 }
 
 /// The numeric settings of one `eigs`/`eigsh`/`svds` call after SciPy's defaults are applied.
@@ -35096,6 +35119,37 @@ fn validate_eigen_problem(
             message: format!("sigma must be finite, got {sigma}"),
         });
     }
+    if options.minv.is_some() && (options.mass.is_none() || options.sigma.is_some()) {
+        return Err(SparseError::InvalidArgument {
+            message: "Minv requires M and cannot be specified with sigma".to_string(),
+        });
+    }
+    if options.opinv.is_some() && options.sigma.is_none() {
+        return Err(SparseError::InvalidArgument {
+            message: "OPinv cannot be specified without sigma".to_string(),
+        });
+    }
+    for (label, inverse) in [("Minv", options.minv), ("OPinv", options.opinv)] {
+        if let Some(inverse) = inverse {
+            if inverse.shape() != shape {
+                return Err(SparseError::IncompatibleShape {
+                    message: format!(
+                        "wrong {label} dimensions {}x{}, should be {n}x{n}",
+                        inverse.shape().rows,
+                        inverse.shape().cols
+                    ),
+                });
+            }
+            if inverse
+                .as_csr()
+                .is_some_and(|matrix| matrix.data().iter().any(|v| !v.is_finite()))
+            {
+                return Err(SparseError::NonFiniteInput {
+                    message: format!("{name}: {label} contains NaN or Inf"),
+                });
+            }
+        }
+    }
     if let Some(v0) = options.v0 {
         if v0.len() != n {
             return Err(SparseError::IncompatibleShape {
@@ -35210,13 +35264,14 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
 /// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
 ///
 /// `A` may be any symmetric [`LinearOperator`] (a `&CsrMatrix` coerces). A matrix-free `A`
-/// runs modes 1 and 2; `sigma` needs a concrete matrix ([`SparseError::Unsupported`]). Without
-/// entries to bound `‖A‖`, the explicit residual check measures a matrix-free `A` against the
-/// largest Ritz magnitude of the final Krylov basis (times `‖M‖` in mode 2) instead.
+/// runs modes 1 and 2; `sigma` needs a concrete matrix or a supplied [`EigsOptions::opinv`]. Without
+/// entries to bound `‖A‖`, the explicit residual check uses the largest Ritz magnitude in
+/// modes 1/2. Shift-invert instead samples the original `A` on a deterministic unit vector
+/// and the returned eigenvectors; an inverse Ritz value is never used to scale `A`'s residual.
 ///
 /// Differences from SciPy: `k` may equal `n` (SciPy refuses `k ≥ n` for a sparse `A` and
 /// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one;
-/// `mode='buckling'`/`'cayley'`, `OPinv`/`Minv` operators and `return_eigenvectors=False` are
+/// `mode='buckling'`/`'cayley'` and `return_eigenvectors=False` are
 /// not offered.
 pub fn eigsh(
     a: &dyn LinearOperator,
@@ -35239,11 +35294,9 @@ pub fn eigsh(
 
     let sigma = transform.shift();
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
-    let a_norm = a
-        .as_csr()
-        .map_or(run.spectral_scale * m_norm, csr_norm_bound);
+    let (a_norm, norm_probes) = eigen_residual_scale(a, &transform, run.spectral_scale, m_norm)?;
     let guard = settings.tol.max(f64::EPSILON.sqrt());
-    let mut nmatvec = run.applications;
+    let mut nmatvec = run.applications + norm_probes;
     // (λ, eigenvector, converged)
     let mut pairs: Vec<(f64, Vec<f64>, bool)> = Vec::with_capacity(run.theta.len());
     for (i, &theta) in run.theta.iter().enumerate() {
@@ -35256,7 +35309,7 @@ pub fn eigsh(
             }
             b_normalize(&mut x, options.mass);
         }
-        let ax = a.matvec(&x)?;
+        let ax = checked_eigen_matvec(a, &x)?;
         let mx = options.mass.map(|m| csr_matvec(m, &x));
         nmatvec += 1 + usize::from(mx.is_some());
         // Modes 1 and 2 return the Rayleigh quotient xᵀAx / xᵀMx of the returned vector. It
@@ -35274,12 +35327,13 @@ pub fn eigsh(
         let resid = ax
             .iter()
             .zip(mx.as_deref().unwrap_or(&x))
-            .map(|(&axi, &mxi)| (axi - lambda * mxi).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let bound = guard * (a_norm + (lambda.abs() + sigma.abs()) * m_norm) * vec_norm(&x);
-        // A NaN residual fails: `resid <= bound` is false for NaN.
-        let ok = run.converged[i] && resid <= bound;
+            .fold(0.0_f64, |norm, (&axi, &mxi)| norm.hypot(axi - lambda * mxi));
+        let x_norm = x.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let ax_norm = ax.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let original_scale = a_norm.max(ax_norm / x_norm);
+        let bound = guard * (original_scale + (lambda.abs() + sigma.abs()) * m_norm) * x_norm;
+        // Neither a non-finite residual nor an overflowed allowance certifies convergence.
+        let ok = run.converged[i] && resid.is_finite() && bound.is_finite() && resid <= bound;
         pairs.push((lambda, x, ok));
     }
     pairs.sort_by(|p, q| p.0.total_cmp(&q.0));
@@ -35345,6 +35399,53 @@ fn csr_norm_bound(a: &CsrMatrix) -> f64 {
     col_sums.into_iter().fold(row_max, f64::max)
 }
 
+/// Matrix-free callbacks may override `matvec`, so validate their output at the residual
+/// boundary as well as inside the Krylov recurrence. In shift-invert mode the recurrence
+/// applies `OPinv` and may not have called `A` at all.
+fn checked_eigen_matvec(a: &dyn LinearOperator, x: &[f64]) -> SparseResult<Vec<f64>> {
+    let result = a.matvec(x)?;
+    if result.len() != x.len() {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "eigenproblem operator returned {} values, expected {}",
+                result.len(),
+                x.len()
+            ),
+        });
+    }
+    ensure_finite(&result)?;
+    Ok(result)
+}
+
+/// A residual must be scaled in the original eigenproblem, never by a shift-inverse Ritz
+/// value: an erroneous `OPinv = 1e12 I` would otherwise give a huge allowance for a small A.
+/// A concrete matrix has a norm bound. For a matrix-free shifted problem, sample A on a
+/// deterministic unit vector; the per-pair check also includes the observed `||Ax||/||x||`.
+/// This is an estimate, not a certified upper bound on the norm of an arbitrary callback.
+fn eigen_residual_scale(
+    a: &dyn LinearOperator,
+    transform: &SpectralTransform<'_>,
+    spectral_scale: f64,
+    m_norm: f64,
+) -> SparseResult<(f64, usize)> {
+    if let Some(matrix) = a.as_csr() {
+        return Ok((csr_norm_bound(matrix), 0));
+    }
+    if !transform.is_shift_invert() {
+        return Ok((spectral_scale * m_norm, 0));
+    }
+    let mut probe = KrylovBasis::new(a.shape().rows, None).random_vector();
+    b_normalize(&mut probe, None);
+    let image = checked_eigen_matvec(a, &probe)?;
+    let scale = image.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+    if !scale.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: "matrix-free eigenproblem norm estimate overflowed".to_string(),
+        });
+    }
+    Ok((scale, 1))
+}
+
 /// Scales `x` to unit B-norm (`B = M`, or the 2-norm without a mass matrix). A zero vector or a
 /// non-positive `xᵀMx` is left unchanged.
 fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
@@ -35362,37 +35463,72 @@ fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
 
 /// SciPy's ARPACK modes 1-3 for one `eigs`/`eigsh` call: the operator the Krylov–Schur kernel
 /// iterates on, and how its eigenvalues θ map back to the problem's λ.
-enum SpectralTransform {
+enum SpectralTransform<'a> {
     /// Mode 1: `OP = A`, `λ = θ`.
     Standard,
     /// Mode 2: `OP = M⁻¹A` in the M inner product, `λ = θ`. `M` is factored with [`splu`], as
     /// SciPy's `get_inv_matvec(M)` does.
-    Generalized(SparseLuFactorization),
+    Generalized(SpectralInverse<'a>),
     /// Mode 3: `OP = (A − σM)⁻¹M` (`M = I` without a mass matrix), `λ = σ + 1/θ`.
     ShiftInvert {
         sigma: f64,
-        factor: SparseLuFactorization,
+        inverse: SpectralInverse<'a>,
     },
 }
 
-impl SpectralTransform {
+/// A solve supplied by the caller or factored once for this eigensolver invocation.
+enum SpectralInverse<'a> {
+    Factored(SparseLuFactorization),
+    Operator(&'a dyn LinearOperator),
+}
+
+impl SpectralInverse<'_> {
+    fn solve(&self, rhs: &[f64]) -> SparseResult<Vec<f64>> {
+        match self {
+            Self::Factored(factor) => splu_solve(factor, rhs),
+            Self::Operator(operator) => {
+                let result = operator.matvec(rhs)?;
+                if result.len() != rhs.len() {
+                    return Err(SparseError::IncompatibleShape {
+                        message: format!(
+                            "inverse operator returned {} values, expected {}",
+                            result.len(),
+                            rhs.len()
+                        ),
+                    });
+                }
+                ensure_finite(&result)?;
+                Ok(result)
+            }
+        }
+    }
+}
+
+impl<'a> SpectralTransform<'a> {
     /// Modes 1 and 2 only apply `A`, so any [`LinearOperator`] serves. Mode 3 factors `A − σM`
-    /// and needs `A`'s entries: a matrix-free `A` with `sigma` is refused
-    /// ([`SparseError::Unsupported`]) where SciPy would fall back to an inner GMRES solve
-    /// (`IterOpInv`).
-    fn build(a: &dyn LinearOperator, options: &EigsOptions<'_>, n: usize) -> SparseResult<Self> {
+    /// and needs `A`'s entries unless the caller supplies `OPinv`. No inner iterative solve
+    /// is guessed for a matrix-free shifted operator without `OPinv`.
+    fn build(a: &dyn LinearOperator, options: &EigsOptions<'a>, n: usize) -> SparseResult<Self> {
         match (options.sigma, options.mass) {
             (None, None) => Ok(Self::Standard),
-            (None, Some(mass)) => Ok(Self::Generalized(splu(
-                &mass.to_csc()?,
-                LuOptions::default(),
-            )?)),
+            (None, Some(mass)) => {
+                let inverse = match options.minv {
+                    Some(operator) => SpectralInverse::Operator(operator),
+                    None => SpectralInverse::Factored(splu(&mass.to_csc()?, LuOptions::default())?),
+                };
+                Ok(Self::Generalized(inverse))
+            }
             (Some(sigma), mass) => {
+                if let Some(operator) = options.opinv {
+                    return Ok(Self::ShiftInvert {
+                        sigma,
+                        inverse: SpectralInverse::Operator(operator),
+                    });
+                }
                 let Some(matrix) = a.as_csr() else {
                     return Err(SparseError::Unsupported {
-                        feature: "shift-invert (sigma) needs A as a concrete sparse matrix; a \
-                                  matrix-free LinearOperator supports the standard and \
-                                  generalized modes"
+                        feature: "shift-invert (sigma) needs a concrete sparse A or OPinv; \
+                                  supply OPinv to solve a matrix-free shifted eigenproblem"
                             .to_string(),
                     });
                 };
@@ -35403,7 +35539,10 @@ impl SpectralTransform {
                 let shifted = sub_csr(matrix, &shift)?;
                 let factor = splu(&shifted.to_csc()?, LuOptions::default())
                     .map_err(|err| singular_shift_error(err, sigma))?;
-                Ok(Self::ShiftInvert { sigma, factor })
+                Ok(Self::ShiftInvert {
+                    sigma,
+                    inverse: SpectralInverse::Factored(factor),
+                })
             }
         }
     }
@@ -35412,10 +35551,10 @@ impl SpectralTransform {
     fn apply(&self, a: &dyn LinearOperator, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
         match self {
             Self::Standard => a.matvec(x),
-            Self::Generalized(mass_factor) => splu_solve(mass_factor, &a.matvec(x)?),
-            Self::ShiftInvert { sigma, factor } => {
-                splu_solve(factor, bx).map_err(|err| singular_shift_error(err, *sigma))
-            }
+            Self::Generalized(inverse) => inverse.solve(&a.matvec(x)?),
+            Self::ShiftInvert { sigma, inverse } => inverse
+                .solve(bx)
+                .map_err(|err| singular_shift_error(err, *sigma)),
         }
     }
 
@@ -36093,7 +36232,8 @@ struct GeneralPair {
 ///
 /// Differences from SciPy: `k` may reach `n` (SciPy refuses `k ≥ n − 1` for a sparse `A`); the
 /// default start vector is a fixed-seed pseudo-random one; complex `sigma` (`OPpart`),
-/// `OPinv`/`Minv` operators and `return_eigenvectors=False` are not offered.
+/// `return_eigenvectors=False` is not offered. Supply [`EigsOptions::opinv`] to use a
+/// matrix-free `A` with `sigma`, or [`EigsOptions::minv`] to reuse a mass-matrix solve.
 pub fn eigs(
     a: &dyn LinearOperator,
     k: usize,
@@ -36114,11 +36254,9 @@ pub fn eigs(
 
     let sigma = transform.shift();
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
-    let a_norm = a
-        .as_csr()
-        .map_or(run.spectral_scale * m_norm, csr_norm_bound);
+    let (a_norm, norm_probes) = eigen_residual_scale(a, &transform, run.spectral_scale, m_norm)?;
     let guard = settings.tol.max(f64::EPSILON.sqrt());
-    let mut nmatvec = run.applications;
+    let mut nmatvec = run.applications + norm_probes;
     let mut pairs: Vec<GeneralPair> = Vec::with_capacity(run.theta.len());
     for (i, &theta) in run.theta.iter().enumerate() {
         let (mut xr, mut xi) = run.vectors[i].clone();
@@ -36130,22 +36268,30 @@ pub fn eigs(
             add_scaled(&mut xi, c.1, &run.next);
             complex_b_normalize(&mut xr, &mut xi, options.mass);
         }
-        let (axr, axi) = (a.matvec(&xr)?, a.matvec(&xi)?);
+        let (axr, axi) = (checked_eigen_matvec(a, &xr)?, checked_eigen_matvec(a, &xi)?);
         let (mxr, mxi) = match options.mass {
             Some(m) => (csr_matvec(m, &xr), csr_matvec(m, &xi)),
             None => (xr.clone(), xi.clone()),
         };
         nmatvec += if options.mass.is_some() { 4 } else { 2 };
-        let mut resid_sq = 0.0;
+        let mut residual = 0.0_f64;
         for t in 0..n {
             let rr = axr[t] - (lambda.0 * mxr[t] - lambda.1 * mxi[t]);
             let ri = axi[t] - (lambda.0 * mxi[t] + lambda.1 * mxr[t]);
-            resid_sq += rr * rr + ri * ri;
+            residual = residual.hypot(rr).hypot(ri);
         }
-        let x_norm = (dot_product(&xr, &xr) + dot_product(&xi, &xi)).sqrt();
-        let bound = guard * (a_norm + (lambda.0.hypot(lambda.1) + sigma.abs()) * m_norm) * x_norm;
-        // A NaN residual fails: `<=` is false for NaN.
-        let ok = run.converged[i] && resid_sq.sqrt() <= bound;
+        let x_norm = xr
+            .iter()
+            .chain(&xi)
+            .fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let ax_norm = axr
+            .iter()
+            .chain(&axi)
+            .fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let original_scale = a_norm.max(ax_norm / x_norm);
+        let bound =
+            guard * (original_scale + (lambda.0.hypot(lambda.1) + sigma.abs()) * m_norm) * x_norm;
+        let ok = run.converged[i] && residual.is_finite() && bound.is_finite() && residual <= bound;
         pairs.push(GeneralPair {
             lambda,
             xr,
@@ -37107,6 +37253,8 @@ fn solve_small_perturbed(mut a: DMatrix<f64>, mut b: DVector<f64>, smin: f64) ->
 #[cfg(test)]
 mod krylov_eigen_tests {
     use super::*;
+    use crate::interface::{FunctionOperator, IdentityOperator};
+    use std::cell::Cell;
 
     fn laplacian_1d(n: usize) -> CsrMatrix {
         let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
@@ -37525,6 +37673,295 @@ mod krylov_eigen_tests {
         assert!(err <= 1e-9 * exact[n - 1], "max|dλ| = {err:e}");
         assert!(resid <= 1e-8);
         assert!(ortho <= 1e-12);
+    }
+
+    #[test]
+    fn supplied_opinv_solves_matrix_free_generalized_eigenproblems() {
+        let n = 50;
+        let (a, mass, exact) = fem_pair(n);
+        let sigma = 70.0;
+        let shifted = sub_csr(&a, &scale_csr(&mass, sigma).expect("scale")).expect("shift");
+        let factor = splu(&shifted.to_csc().expect("csc"), LuOptions::default())
+            .expect("external factorization");
+        let calls = Cell::new(0usize);
+        let inverse = FunctionOperator::new(a.shape(), |rhs| {
+            calls.set(calls.get() + 1);
+            splu_solve(&factor, rhs)
+        });
+        let operator = FunctionOperator::new(a.shape(), |x| Ok(csr_matvec(&a, x)));
+        let options = EigsOptions {
+            sigma: Some(sigma),
+            mass: Some(&mass),
+            opinv: Some(&inverse),
+            tol: 1e-11,
+            ..EigsOptions::default()
+        };
+        let expected = expected_symmetric(&exact, EigsWhich::LargestMagnitude, 4, Some(sigma));
+        for symmetric in [true, false] {
+            let result = if symmetric {
+                eigsh(&operator, 4, options)
+            } else {
+                eigs(&operator, 4, options)
+            }
+            .expect("matrix-free shift-invert converges");
+            let mut values = result.eigenvalues.clone();
+            values.sort_by(f64::total_cmp);
+            assert!(max_abs_diff(&values, &expected) < 1e-8);
+            assert!(max_relative_residual(&a, Some(&mass), &result) < 1e-9);
+            if symmetric {
+                assert!(orthonormality_defect(&result, Some(&mass)) < 1e-12);
+            }
+            assert!(calls.replace(0) > 0, "OPinv must actually be used");
+        }
+        assert!(matches!(
+            eigsh(
+                &operator,
+                4,
+                EigsOptions {
+                    opinv: None,
+                    ..options
+                }
+            ),
+            Err(SparseError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn supplied_opinv_handles_complex_ritz_pairs_without_a_mass_matrix() {
+        let (a, exact) = normal_nonsymmetric(20, 6);
+        let sigma = 2.3;
+        let shifted = sub_csr(
+            &a,
+            &scale_csr(&eye(a.shape().rows).expect("identity"), sigma).expect("scale"),
+        )
+        .expect("shift");
+        let factor = splu(&shifted.to_csc().expect("csc"), LuOptions::default()).expect("factor");
+        let inverse = FunctionOperator::new(a.shape(), |rhs| splu_solve(&factor, rhs));
+        let operator = FunctionOperator::new(a.shape(), |x| Ok(csr_matvec(&a, x)));
+        let options = EigsOptions {
+            sigma: Some(sigma),
+            opinv: Some(&inverse),
+            tol: 1e-11,
+            ..EigsOptions::default()
+        };
+        let result = eigs(&operator, 8, options).expect("matrix-free complex pairs");
+        let got = sorted_complex(&result);
+        let expected = expected_general(&exact, options.which, 8, Some(sigma));
+        for (actual, wanted) in got.iter().zip(&expected) {
+            assert!((actual.0 - wanted.0).hypot(actual.1 - wanted.1) < 1e-8);
+        }
+        assert!(result.eigenvalues_im.iter().any(|v| v.abs() > 0.1));
+        assert!(max_relative_residual(&a, None, &result) < 1e-9);
+    }
+
+    #[test]
+    fn supplied_minv_reuses_a_generalized_solve() {
+        let n = 40;
+        let (a, mass, exact) = fem_pair(n);
+        let factor = splu(&mass.to_csc().expect("csc"), LuOptions::default()).expect("factor");
+        let calls = Cell::new(0usize);
+        let inverse = FunctionOperator::new(mass.shape(), |rhs| {
+            calls.set(calls.get() + 1);
+            splu_solve(&factor, rhs)
+        });
+        let options = EigsOptions {
+            mass: Some(&mass),
+            minv: Some(&inverse),
+            tol: 1e-11,
+            ..EigsOptions::default()
+        };
+        for symmetric in [true, false] {
+            let result = if symmetric {
+                eigsh(&a, 4, options)
+            } else {
+                eigs(&a, 4, options)
+            }
+            .expect("supplied mass inverse converges");
+            let mut values = result.eigenvalues.clone();
+            values.sort_by(f64::total_cmp);
+            assert!(max_abs_diff(&values, &exact[n - 4..]) < 1e-7);
+            assert!(max_relative_residual(&a, Some(&mass), &result) < 1e-8);
+            assert!(calls.replace(0) > 0, "Minv must actually be used");
+        }
+    }
+
+    #[test]
+    fn inverse_operator_options_refuse_invalid_combinations_and_shapes() {
+        let a = laplacian_1d(20);
+        let identity = IdentityOperator::new(20);
+        for options in [
+            EigsOptions {
+                minv: Some(&identity),
+                ..EigsOptions::default()
+            },
+            EigsOptions {
+                opinv: Some(&identity),
+                ..EigsOptions::default()
+            },
+            EigsOptions {
+                mass: Some(&a),
+                minv: Some(&identity),
+                sigma: Some(0.2),
+                ..EigsOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                eigsh(&a, 2, options),
+                Err(SparseError::InvalidArgument { .. })
+            ));
+            assert!(matches!(
+                eigs(&a, 2, options),
+                Err(SparseError::InvalidArgument { .. })
+            ));
+            assert!(matches!(
+                svds(&a, 2, options),
+                Err(SparseError::Unsupported { .. })
+            ));
+        }
+        let wrong = IdentityOperator::new(19);
+        let options = EigsOptions {
+            sigma: Some(0.2),
+            opinv: Some(&wrong),
+            ..EigsOptions::default()
+        };
+        assert!(matches!(
+            eigsh(&a, 2, options),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            eigs(&a, 2, options),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    #[test]
+    fn inverse_operator_failures_and_wrong_solutions_cannot_report_convergence() {
+        let a = diagonal(&(1..=20).map(f64::from).collect::<Vec<_>>());
+        let wrong = IdentityOperator::new(20);
+        let free = FunctionOperator::new(a.shape(), |x| Ok(csr_matvec(&a, x)));
+        let scaled_wrong = FunctionOperator::new(a.shape(), |x| {
+            Ok(x.iter().map(|value| 1e12 * value).collect())
+        });
+        let nonfinite = FunctionOperator::new(a.shape(), |_| Ok(vec![f64::NAN; 20]));
+        let failed = FunctionOperator::new(a.shape(), |_| {
+            Err(SparseError::InvalidArgument {
+                message: "external inverse failed".to_string(),
+            })
+        });
+        for symmetric in [true, false] {
+            let solve = |opinv: &dyn LinearOperator| {
+                let options = EigsOptions {
+                    sigma: Some(0.2),
+                    opinv: Some(opinv),
+                    max_iter: 2,
+                    ..EigsOptions::default()
+                };
+                if symmetric {
+                    eigsh(&a, 2, options)
+                } else {
+                    eigs(&a, 2, options)
+                }
+            };
+            assert!(matches!(
+                solve(&wrong),
+                Err(SparseError::EigsNoConvergence { .. })
+            ));
+            assert!(matches!(
+                solve(&nonfinite),
+                Err(SparseError::NonFiniteInput { .. })
+            ));
+            assert!(
+                matches!(solve(&failed), Err(SparseError::InvalidArgument { message }) if message == "external inverse failed")
+            );
+            let options = EigsOptions {
+                sigma: Some(0.2),
+                opinv: Some(&scaled_wrong),
+                max_iter: 2,
+                ..EigsOptions::default()
+            };
+            let result = if symmetric {
+                eigsh(&free, 2, options)
+            } else {
+                eigs(&free, 2, options)
+            };
+            assert!(
+                matches!(result, Err(SparseError::EigsNoConvergence { .. })),
+                "an inverse Ritz magnitude must not inflate the original residual allowance"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_shift_invert_checks_original_operator_products() {
+        struct MalformedOperator {
+            nonfinite: bool,
+        }
+        impl LinearOperator for MalformedOperator {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(20, 20)
+            }
+            fn matvec_into(&self, _x: &[f64], _y: &mut [f64]) -> SparseResult<()> {
+                unreachable!("the overridden matvec is used")
+            }
+            fn matvec(&self, _x: &[f64]) -> SparseResult<Vec<f64>> {
+                Ok(if self.nonfinite {
+                    vec![f64::INFINITY; 20]
+                } else {
+                    Vec::new()
+                })
+            }
+        }
+        let inverse = IdentityOperator::new(20);
+        let options = EigsOptions {
+            sigma: Some(0.2),
+            opinv: Some(&inverse),
+            ..EigsOptions::default()
+        };
+        for nonfinite in [false, true] {
+            let a = MalformedOperator { nonfinite };
+            for result in [eigsh(&a, 2, options), eigs(&a, 2, options)] {
+                if nonfinite {
+                    assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
+                } else {
+                    assert!(matches!(result, Err(SparseError::IncompatibleShape { .. })));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_free_shift_invert_can_target_a_zero_eigenvalue() {
+        // A rotated zero eigenspace: the leading block has eigenvalues 0 and 2, so the
+        // original A*x of the wanted vector is almost zero. A norm probe independent of
+        // the returned vector keeps the residual check meaningful near the nullspace.
+        let n = 20;
+        let mut values = vec![1.0, 1.0, 1.0, 1.0];
+        let mut rows = vec![0, 0, 1, 1];
+        let mut cols = vec![0, 1, 0, 1];
+        for i in 2..n {
+            values.push((i + 1) as f64);
+            rows.push(i);
+            cols.push(i);
+        }
+        let a = csr(n, values, rows, cols);
+        let sigma = 1e-4;
+        let shifted =
+            sub_csr(&a, &scale_csr(&eye(n).expect("eye"), sigma).expect("scale")).expect("shift");
+        let factor = splu(&shifted.to_csc().expect("csc"), LuOptions::default()).expect("factor");
+        let free = FunctionOperator::new(a.shape(), |x| Ok(csr_matvec(&a, x)));
+        let inverse = FunctionOperator::new(a.shape(), |rhs| splu_solve(&factor, rhs));
+        let result = eigsh(
+            &free,
+            1,
+            EigsOptions {
+                sigma: Some(sigma),
+                opinv: Some(&inverse),
+                ..EigsOptions::default()
+            },
+        )
+        .expect("zero eigenvalue converges with original-space residual scaling");
+        assert!(result.eigenvalues[0].abs() < 1e-12);
+        assert!(max_relative_residual(&a, None, &result) < 1e-12);
     }
 
     #[test]
@@ -37982,7 +38419,7 @@ pub struct SvdsResult {
 /// Matches `scipy.sparse.linalg.svds(A, k=k)`.
 ///
 /// `options.tol`, `max_iter` and `ncv` apply to the symmetric Krylov–Schur run on AᵀA (SciPy's
-/// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass` and `v0` are refused
+/// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass`, `minv`, `opinv` and `v0` are refused
 /// ([`SparseError::Unsupported`]). A NaN/Inf in `A` (or an overflowing AᵀA) is refused with
 /// [`SparseError::NonFiniteInput`], where SciPy's ARPACK raises.
 ///
@@ -38005,10 +38442,12 @@ pub fn svds(
     if options.which != EigsWhich::LargestMagnitude
         || options.sigma.is_some()
         || options.mass.is_some()
+        || options.minv.is_some()
+        || options.opinv.is_some()
         || options.v0.is_some()
     {
         return Err(SparseError::Unsupported {
-            feature: "svds supports which='LM' without sigma, M or v0".to_string(),
+            feature: "svds supports which='LM' without sigma, M, Minv, OPinv or v0".to_string(),
         });
     }
     let settings = resolve_krylov_settings(n, k, &options, true)?;

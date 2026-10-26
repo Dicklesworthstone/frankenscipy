@@ -25,8 +25,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
-    CooMatrix, CsrMatrix, EigsOptions, EigsResult, EigsWhich, FormatConvertible, Shape2D,
-    SparseError, eigs, eigsh,
+    CooMatrix, CsrMatrix, EigsOptions, EigsResult, EigsWhich, FormatConvertible, FunctionOperator,
+    LuOptions, Shape2D, SparseError, eigs, eigsh, eye, scale_csr, splu, splu_solve, sub_csr,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,7 @@ struct Case {
     sigma: Option<f64>,
     maxiter: Option<usize>,
     expect: Expect,
+    supplied_inverse: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,6 +269,7 @@ fn case(
         sigma,
         maxiter,
         expect,
+        supplied_inverse: false,
     }
 }
 
@@ -611,6 +613,33 @@ fn generate_cases() -> Vec<Case> {
         None,
         Singular,
     ));
+    // Exercise the same physical problems through caller-owned inverse operators and a
+    // matrix-free A. The oracle also uses OPinv/Minv, rather than only its automatic LU.
+    for func in ["eigsh", "eigs"] {
+        for (with_mass, sigma) in [(false, Some(0.8)), (true, Some(70.0)), (true, None)] {
+            let n = 50;
+            let (a, mass) = if with_mass {
+                let (a, m) = fem_pair(n);
+                (a, Some(m))
+            } else {
+                (laplacian_1d(n), None)
+            };
+            let mut supplied = case(
+                &format!("supplied_{func}_mass{with_mass}_sigma{sigma:?}"),
+                func,
+                n,
+                a,
+                mass,
+                4,
+                "LM",
+                sigma,
+                None,
+                Values,
+            );
+            supplied.supplied_inverse = true;
+            cases.push(supplied);
+        }
+    }
     cases
 }
 
@@ -628,8 +657,8 @@ fn scipy_oracle_or_skip(cases: &[Case]) -> TestResult<Option<Vec<OracleArm>>> {
     let script = r#"
 import json, sys
 import numpy as np
-from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import eigsh, eigs, ArpackNoConvergence
+from scipy.sparse import csr_matrix, eye
+from scipy.sparse.linalg import eigsh, eigs, ArpackNoConvergence, LinearOperator, splu, aslinearoperator
 
 out = []
 for case in json.load(sys.stdin):
@@ -643,8 +672,19 @@ for case in json.load(sys.stdin):
             m = case["mass"]
             M = csr_matrix((m["vals"], (m["rows"], m["cols"])), shape=(n, n))
         fn = eigsh if case["func"] == "eigsh" else eigs
+        inverse_options = {}
+        if case["supplied_inverse"]:
+            sigma = case["sigma"]
+            if sigma is None:
+                factor = splu(M.tocsc())
+                inverse_options["Minv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=float)
+            else:
+                shifted = A - sigma * (eye(n, format="csr") if M is None else M)
+                factor = splu(shifted.tocsc())
+                inverse_options["OPinv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=float)
+            A = aslinearoperator(A)
         vals, _ = fn(A, k=int(case["k"]), M=M, sigma=case["sigma"], which=case["which"],
-                     maxiter=case["maxiter"], return_eigenvectors=True)
+                     maxiter=case["maxiter"], return_eigenvectors=True, **inverse_options)
         vals = np.asarray(vals)
         arm["re"] = [float(v) for v in np.real(vals)]
         arm["im"] = [float(v) for v in np.imag(vals)]
@@ -807,8 +847,39 @@ fn outcome_label(outcome: &Result<EigsResult, SparseError>) -> String {
 
 #[test]
 fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
+    run_cases(
+        "diff_sparse_eigs_eigsh_arpack_parity",
+        generate_cases(),
+        &["eigsh", "eigs", "raises"],
+        15,
+        4,
+    )
+}
+
+#[test]
+fn diff_sparse_eigs_eigsh_supplied_inverses() -> TestResult<()> {
+    let cases: Vec<_> = generate_cases()
+        .into_iter()
+        .filter(|case| case.supplied_inverse)
+        .collect();
+    assert_eq!(cases.len(), 6, "exercise every supplied-inverse variant");
+    run_cases(
+        "diff_sparse_eigs_eigsh_supplied_inverses",
+        cases,
+        &["eigsh", "eigs"],
+        6,
+        3,
+    )
+}
+
+fn run_cases(
+    test_id: &str,
+    cases: Vec<Case>,
+    comparison_arms: &[&str],
+    minimum_cases: usize,
+    minimum_per_arm: usize,
+) -> TestResult<()> {
     let start = Instant::now();
-    let cases = generate_cases();
     let Some(oracle) = scipy_oracle_or_skip(&cases)? else {
         return Ok(());
     };
@@ -817,10 +888,7 @@ fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
         .map(|arm| (arm.case_id.clone(), arm))
         .collect();
 
-    let mut ledger = CompareLedger::new(
-        "diff_sparse_eigs_eigsh_arpack_parity",
-        &["eigsh", "eigs", "raises"],
-    );
+    let mut ledger = CompareLedger::new(test_id, comparison_arms);
     let mut diffs = Vec::with_capacity(cases.len());
     for case in &cases {
         let case_start = Instant::now();
@@ -830,17 +898,51 @@ fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
             .which
             .parse()
             .map_err(|err: SparseError| format!("{}: {err}", case.case_id))?;
-        let options = EigsOptions {
+        let mut options = EigsOptions {
             which,
             sigma: case.sigma,
             mass: mass.as_ref(),
             max_iter: case.maxiter.unwrap_or(0),
             ..EigsOptions::default()
         };
-        let outcome = if case.func == "eigsh" {
-            eigsh(&a, case.k, options)
+        let inverse_factor = if case.supplied_inverse {
+            let matrix = if let Some(sigma) = case.sigma {
+                let shift = match &mass {
+                    Some(m) => scale_csr(m, sigma),
+                    None => eye(case.n).and_then(|identity| scale_csr(&identity, sigma)),
+                }
+                .map_err(|err| format!("scale shift: {err}"))?;
+                sub_csr(&a, &shift).map_err(|err| format!("shift: {err}"))?
+            } else {
+                mass.clone().ok_or("Minv case requires M")?
+            };
+            Some(
+                splu(
+                    &matrix.to_csc().map_err(|err| err.to_string())?,
+                    LuOptions::default(),
+                )
+                .map_err(|err| format!("supplied inverse factor: {err}"))?,
+            )
         } else {
-            eigs(&a, case.k, options)
+            None
+        };
+        let inverse = inverse_factor
+            .as_ref()
+            .map(|factor| FunctionOperator::new(a.shape(), |rhs| splu_solve(factor, rhs)));
+        let free_a = FunctionOperator::new(a.shape(), |x| fsci_sparse::spmv_csr(&a, x));
+        if let Some(inverse) = &inverse {
+            if case.sigma.is_some() {
+                options.opinv = Some(inverse);
+            } else {
+                options.minv = Some(inverse);
+            }
+        }
+        let operator: &dyn fsci_sparse::LinearOperator =
+            if case.supplied_inverse { &free_a } else { &a };
+        let outcome = if case.func == "eigsh" {
+            eigsh(operator, case.k, options)
+        } else {
+            eigs(operator, case.k, options)
         };
         let scipy = arms.get(&case.case_id);
         let scipy_status = scipy.map_or_else(|| "missing".to_string(), |s| s.status.clone());
@@ -961,7 +1063,7 @@ fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
 
     let all_pass = diffs.iter().all(|d| d.pass);
     let log = DiffLog {
-        test_id: "diff_sparse_eigs_eigsh_arpack_parity".into(),
+        test_id: test_id.into(),
         category: "scipy.sparse.linalg.eigsh/eigs (ARPACK) vs fsci Krylov–Schur".into(),
         case_count: cases.len(),
         compared: ledger.counts().clone(),
@@ -972,7 +1074,7 @@ fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
     };
     fs::create_dir_all(output_dir()).map_err(|err| format!("create diff dir: {err}"))?;
     fs::write(
-        output_dir().join("diff_sparse_eigs_eigsh_arpack_parity.json"),
+        output_dir().join(format!("{test_id}.json")),
         serde_json::to_string_pretty(&log).map_err(|err| format!("serialize log: {err}"))?,
     )
     .map_err(|err| format!("write log: {err}"))?;
@@ -983,9 +1085,9 @@ fn diff_sparse_eigs_eigsh_arpack_parity() -> TestResult<()> {
         cases.len(),
         ledger.counts()
     );
-    assert!(cases.len() >= 15, "the bead asks for at least 15 cases");
+    assert!(cases.len() >= minimum_cases, "required case coverage");
     assert_eq!(compared, cases.len(), "every case must be compared");
     assert!(all_pass, "an eigs/eigsh result disagrees with SciPy");
-    ledger.finish(4);
+    ledger.finish(minimum_per_arm);
     Ok(())
 }
