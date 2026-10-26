@@ -176,6 +176,37 @@ def _run_case(case: Dict[str, Any], special: Any, np: Any) -> Dict[str, Any]:
 
             return inner
 
+        def fdtridfd_refined(dfn: Any, p: Any, x: Any) -> Any:
+            d0 = special.fdtridfd(dfn, p, x)
+            try:
+                dfn_f = float(scalar_item(dfn))
+                p_f = float(scalar_item(p))
+                x_f = float(scalar_item(x))
+                d0_f = float(scalar_item(d0))
+                if (
+                    np.isfinite(d0_f)
+                    and 1e-99 < d0_f < 1e99
+                    and 0.0 < p_f < 1.0
+                    and x_f > 0.0
+                ):
+                    from scipy import optimize as _opt
+
+                    lo = d0_f * (1.0 - 1e-7)
+                    hi = d0_f * (1.0 + 1e-7)
+                    flo = float(special.fdtr(dfn_f, lo, x_f)) - p_f
+                    fhi = float(special.fdtr(dfn_f, hi, x_f)) - p_f
+                    if np.isfinite(flo) and np.isfinite(fhi) and flo * fhi <= 0.0:
+                        return _opt.brentq(
+                            lambda d: float(special.fdtr(dfn_f, d, x_f)) - p_f,
+                            lo,
+                            hi,
+                            xtol=1e-16,
+                            rtol=1e-15,
+                        )
+            except Exception:
+                pass
+            return d0
+
         # Map function name to scipy.special function
         func_map = {
             "gamma": special.gamma,
@@ -247,7 +278,7 @@ def _run_case(case: Dict[str, Any], special: Any, np: Any) -> Dict[str, Any]:
             "fdtr": special.fdtr,
             "fdtrc": special.fdtrc,
             "fdtri": special.fdtri,
-            "fdtridfd": special.fdtridfd,
+            "fdtridfd": fdtridfd_refined,
             "gdtr": special.gdtr,
             "gdtrc": special.gdtrc,
             "gdtrix": special.gdtrix,
@@ -369,6 +400,7 @@ def _run_case(case: Dict[str, Any], special: Any, np: Any) -> Dict[str, Any]:
             "lpmv": special.lpmv,
             "sph_harm_y": special.sph_harm_y,
             "rel_erf_erfc_identity": rel_erf_erfc_identity,
+            "rel_erfinv_composition": lambda x: special.erfinv(special.erf(np.asarray(x))),
             "rel_gamma_recurrence": rel_gamma_recurrence,
             "rel_beta_symmetry": rel_beta_symmetry,
             "rel_gammainc_complement": rel_gammainc_complement,
@@ -411,6 +443,65 @@ def _run_case(case: Dict[str, Any], special: Any, np: Any) -> Dict[str, Any]:
             }
 
         func = func_map[function_name]
+        if function_name in {"logsumexp", "softmax", "log_softmax"}:
+            if len(args) == 1 and isinstance(args[0], (list, np.ndarray)):
+                result = func(np.asarray(args[0], dtype=float))
+            else:
+                result = func(np.asarray([scalar_item(a) for a in args], dtype=float))
+            return _result_payload(case_id, result, np)
+
+        def _int_if_integral(val: Any) -> Any:
+            s = scalar_item(val)
+            if np.isfinite(s) and float(s).is_integer():
+                return int(round(s))
+            return val
+
+        if function_name in {
+            "polygamma",
+            "expn",
+            "eval_legendre",
+            "eval_chebyt",
+            "eval_chebyu",
+            "eval_hermite",
+            "eval_hermitenorm",
+            "eval_laguerre",
+            "eval_genlaguerre",
+            "eval_jacobi",
+            "eval_gegenbauer",
+            "eval_sh_legendre",
+            "eval_sh_chebyt",
+            "eval_sh_chebyu",
+            "spherical_jn",
+            "spherical_yn",
+            "spherical_in",
+            "spherical_kn",
+            "jn",
+            "yn",
+            "kn",
+            "factorial",
+            "factorial2",
+            "bdtr",
+            "bdtrc",
+            "bdtri",
+            "nbdtr",
+            "nbdtrc",
+            "nbdtri",
+            "pdtr",
+            "pdtrc",
+            "pdtri",
+            "stdtr",
+            "stdtrit",
+            "smirnov",
+            "smirnovi",
+        } and len(args) >= 1:
+            args = [_int_if_integral(args[0]), *args[1:]]
+        elif function_name in {"multigammaln", "lambertw"} and len(args) >= 2:
+            args = [args[0], _int_if_integral(args[1]), *args[2:]]
+        elif function_name in {"comb", "perm", "lpmv", "sph_harm_y"} and len(args) >= 2:
+            args = [_int_if_integral(args[0]), _int_if_integral(args[1]), *args[2:]]
+        elif function_name in {"jvp", "yvp", "ivp", "kvp"} and len(args) >= 3:
+            args = [args[0], args[1], _int_if_integral(args[2]), *args[3:]]
+
         result = func(*args)
         return _result_payload(case_id, result, np)
 

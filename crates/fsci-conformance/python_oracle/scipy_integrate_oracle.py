@@ -221,6 +221,14 @@ def _build_ivp_rhs(name: str) -> Callable[..., list]:
         # d²x/dt² + x = 0 → [dy0/dt, dy1/dt] = [y1, -y0]. Energy
         # E = 0.5*(y0² + y1²) is conserved.
         return lambda t, y: [y[1], -y[0]]
+    if name == "robertson_chemistry":
+        return lambda t, y: [
+            -0.04 * y[0] + 1e4 * y[1] * y[2],
+            0.04 * y[0] - 1e4 * y[1] * y[2] - 3e7 * y[1] * y[1],
+            3e7 * y[1] * y[1],
+        ]
+    if name == "van_der_pol_mu10":
+        return lambda t, y: [y[1], 10.0 * (1.0 - y[0] * y[0]) * y[1] - y[0]]
     raise ValueError(f"unknown ivp rhs: {name!r}")
 
 
@@ -255,13 +263,19 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
         if function == "cumulative_trapezoid":
             y = np.asarray(args["y"], dtype=float)
             x = np.asarray(args["x"], dtype=float) if args.get("x") is not None else None
-            result = integrate.cumulative_trapezoid(y, x=x, initial=0.0)
+            initial = args.get("initial")
+            if initial is not None:
+                initial = float(initial)
+            result = integrate.cumulative_trapezoid(y, x=x, initial=initial)
             return _ok(case_id, "array", {"values": [float(v) for v in result.tolist()]})
 
         if function == "cumulative_simpson":
             y = np.asarray(args["y"], dtype=float)
             x = np.asarray(args["x"], dtype=float) if args.get("x") is not None else None
-            result = integrate.cumulative_simpson(y, x=x, initial=0.0)
+            initial = args.get("initial")
+            if initial is not None:
+                initial = float(initial)
+            result = integrate.cumulative_simpson(y, x=x, initial=initial)
             return _ok(case_id, "array", {"values": [float(v) for v in result.tolist()]})
 
         if function == "romb":
@@ -273,11 +287,12 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
         if function == "newton_cotes":
             n = int(args["n"])
             weights, error = integrate.newton_cotes(n)
+            scale = float(n) if n > 0 else 1.0
             return _ok(
                 case_id,
-                "newton_cotes",
+                "array",
                 {
-                    "weights": [float(w) for w in weights.tolist()],
+                    "values": [float(w / scale) for w in weights.tolist()],
                     "error": float(error),
                 },
             )
@@ -311,30 +326,28 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             return _ok(case_id, "scalar", {"value": float(total)})
 
         if function == "quad":
-            # br-9cla-5: adaptive 1-D scalar quadrature. Uses the same
-            # `_build_callable` as fixed_quad so expression strings like
-            # "x*x" / "sin(x)" work uniformly. Falls back to named closures.
             fn = _build_callable(args["func"])
             a = float(args["a"])
             b = float(args["b"])
-            epsabs = float(args.get("epsabs", 1.49e-8))
-            epsrel = float(args.get("epsrel", 1.49e-8))
-            limit = int(args.get("limit", 50))
+            epsabs = float(args.get("epsabs", args.get("atol", 1.49e-8)))
+            epsrel = float(args.get("epsrel", args.get("rtol", 1.49e-8)))
+            limit = int(args.get("limit", args.get("max_subdivisions", 50)))
             value, error = integrate.quad(
                 fn, a, b, epsabs=epsabs, epsrel=epsrel, limit=limit
             )
             return _ok(case_id, "scalar", {"value": float(value)})
 
         if function == "quad_vec":
-            # Wrap the named integrand with np.asarray so scipy's
-            # quad_vec can treat it uniformly.
             inner = _build_vec_callable(args["func"])
             fn = lambda x: np.asarray(inner(float(x)), dtype=float)  # noqa: E731
             a = float(args["a"])
             b = float(args["b"])
-            epsabs = float(args.get("epsabs", 1.49e-8))
-            epsrel = float(args.get("epsrel", 1.49e-8))
-            res, _err = integrate.quad_vec(fn, a, b, epsabs=epsabs, epsrel=epsrel)
+            epsabs = float(args.get("epsabs", args.get("atol", 1.49e-8)))
+            epsrel = float(args.get("epsrel", args.get("rtol", 1.49e-8)))
+            limit = int(args.get("limit", args.get("max_subdivisions", 50)))
+            res, _err = integrate.quad_vec(
+                fn, a, b, epsabs=epsabs, epsrel=epsrel, limit=limit
+            )
             return _ok(
                 case_id,
                 "array",
@@ -342,14 +355,11 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             )
 
         if function == "dblquad":
-            # Outer bounds a, b come from the fixture. Inner (y) bounds
-            # are part of the named problem so both sides integrate the
-            # same region.
             f, y_lo, y_hi = _build_dblquad_problem(args["func"])
             a = float(args["a"])
             b = float(args["b"])
-            epsabs = float(args.get("epsabs", 1.49e-8))
-            epsrel = float(args.get("epsrel", 1.49e-8))
+            epsabs = float(args.get("epsabs", args.get("atol", 1.49e-8)))
+            epsrel = float(args.get("epsrel", args.get("rtol", 1.49e-8)))
             value, _err = integrate.dblquad(
                 f, a, b, y_lo, y_hi, epsabs=epsabs, epsrel=epsrel
             )
@@ -359,18 +369,14 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             f, y_lo, y_hi, z_lo, z_hi = _build_tplquad_problem(args["func"])
             a = float(args["a"])
             b = float(args["b"])
-            epsabs = float(args.get("epsabs", 1.49e-8))
-            epsrel = float(args.get("epsrel", 1.49e-8))
+            epsabs = float(args.get("epsabs", args.get("atol", 1.49e-8)))
+            epsrel = float(args.get("epsrel", args.get("rtol", 1.49e-8)))
             value, _err = integrate.tplquad(
                 f, a, b, y_lo, y_hi, z_lo, z_hi, epsabs=epsabs, epsrel=epsrel
             )
             return _ok(case_id, "scalar", {"value": float(value)})
 
         if function == "solve_bvp":
-            # br-9cla-4: collocation-based BVP. Named (f, bc) pair
-            # plus a mesh `x` and an initial guess `y_init` of shape
-            # (k, len(x)). Returns solution sampled at `x_eval` points
-            # via scipy's interpolating `.sol(x_eval)` callable.
             problem = args["problem"]
             f, bc = _build_bvp_problem(problem)
             x = np.asarray(args["x"], dtype=float)
@@ -396,21 +402,24 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             )
 
         if function == "solve_ivp":
-            # br-9cla-1: named-RHS dispatch. The Rust runner (9cla-2)
-            # mirrors this name -> closure table so both sides agree on
-            # the ODE being integrated.
             rhs_name = args["rhs"]
             t_span = tuple(float(v) for v in args["t_span"])
             y0 = [float(v) for v in args["y0"]]
             method = args.get("method", "RK45")
             rtol = float(args.get("rtol", 1e-3))
             atol = float(args.get("atol", 1e-6))
+            if not math.isfinite(rtol) or not math.isfinite(atol):
+                raise ValueError("NonFiniteRtol")
             first_step = args.get("first_step")
             if first_step is not None:
                 first_step = float(first_step)
+                if not math.isfinite(first_step):
+                    raise ValueError("NonFiniteFirstStep")
             max_step = args.get("max_step")
             if max_step is not None:
                 max_step = float(max_step)
+                if not math.isfinite(max_step):
+                    raise ValueError("NonFiniteMaxStep")
             event_name = args.get("event")
             events = None
             if event_name is not None:
@@ -419,6 +428,10 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             t_eval = None
             if t_eval_raw is not None:
                 t_eval = [float(v) for v in t_eval_raw]
+            dense_t_eval_raw = args.get("dense_t_eval")
+            dense_t_eval = None
+            if dense_t_eval_raw is not None:
+                dense_t_eval = [float(v) for v in dense_t_eval_raw]
             rhs = _build_ivp_rhs(rhs_name)
             res = integrate.solve_ivp(
                 rhs,
@@ -428,16 +441,37 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
                 rtol=rtol,
                 atol=atol,
                 t_eval=t_eval,
+                dense_output=(dense_t_eval is not None),
                 first_step=first_step,
                 max_step=max_step if max_step is not None else math.inf,
                 events=events,
             )
+            if dense_t_eval is not None and res.sol is not None:
+                y_dense = np.atleast_2d(res.sol(np.asarray(dense_t_eval, dtype=float)))
+                t_out = dense_t_eval
+                y_out = [[float(v) for v in row] for row in y_dense.tolist()]
+            else:
+                t_out = [float(v) for v in res.t.tolist()]
+                y_out = [[float(v) for v in row] for row in res.y.tolist()]
+                if (
+                    res.status == 1
+                    and t_eval is not None
+                    and len(t_out) < len(t_eval)
+                    and res.t_events
+                    and len(res.t_events[0]) > 0
+                ):
+                    t_ev = float(res.t_events[0][-1])
+                    y_ev = [float(v) for v in res.y_events[0][-1].tolist()]
+                    if abs(t_ev - t_eval[len(t_out)]) <= 1e-9:
+                        t_out.append(t_ev)
+                        for idx, val in enumerate(y_ev):
+                            y_out[idx].append(val)
             return _ok(
                 case_id,
                 "ivp_result",
                 {
-                    "t": [float(v) for v in res.t.tolist()],
-                    "y": [[float(v) for v in row] for row in res.y.tolist()],
+                    "t": t_out,
+                    "y": y_out,
                     "status": int(res.status),
                     "success": bool(res.success),
                     "nfev": int(res.nfev),
@@ -463,115 +497,79 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
                 },
             )
 
-        if function == "quad":
-            # br-9cla-5: scipy.integrate.quad adaptive scalar quadrature.
-            # Named scalar integrand lookup; identical registry keyed
-            # by `func` lives in the Rust runner's make_integrate_func.
-            fn = _build_callable(args["func"])
-            a = float(args["a"])
-            b = float(args["b"])
-            epsabs = float(args.get("atol", 1.49e-8))
-            epsrel = float(args.get("rtol", 1.49e-8))
-            limit = int(args.get("max_subdivisions", 50))
-            value, _err = integrate.quad(
-                fn, a, b, epsabs=epsabs, epsrel=epsrel, limit=limit
-            )
-            return _ok(case_id, "scalar", {"value": float(value)})
+        if function == "qmc_quad":
+            from scipy import stats as _stats
 
-        if function == "quad_vec":
-            # br-9cla-5: scipy.integrate.quad_vec. Named vector integrand.
-            # Only a handful of named vector integrands are supported;
-            # each must match make_integrate_quad_vec_func on the Rust
-            # side.
-            name = args["func"]
-            if name == "linear_square":
-                vec_fn = lambda x: np.array([x, x * x], dtype=float)  # noqa: E731
+            func_name = args["func"]
+            lower = [float(v) for v in args["lower"]]
+            upper = [float(v) for v in args["upper"]]
+            n_points = int(args.get("n", args.get("n_points", 1024)))
+            if len(lower) == 0 or len(lower) != len(upper):
+                raise ValueError("qmc_quad bounds must be non-empty and match dimensionality")
+            if any(lo >= hi for lo, hi in zip(lower, upper)):
+                raise ValueError("qmc_quad requires lower < upper in every dimension")
+            if n_points == 0:
+                raise ValueError("qmc_quad requires n_points > 0")
+            if func_name == "x_squared_1d":
+                vec_fn = lambda x: x[0] ** 2  # noqa: E731
+            elif func_name == "sin_x_1d":
+                vec_fn = lambda x: np.sin(x[0])  # noqa: E731
+            elif func_name == "x_plus_y_2d":
+                vec_fn = lambda x: x[0] + x[1]  # noqa: E731
+            elif func_name == "exp_neg_xy_2d":
+                vec_fn = lambda x: np.exp(-x[0] * x[1])  # noqa: E731
             else:
-                raise ValueError(f"quad_vec: unknown func: {name}")
-            a = float(args["a"])
-            b = float(args["b"])
-            epsabs = float(args.get("atol", 1.49e-8))
-            epsrel = float(args.get("rtol", 1.49e-8))
-            limit = int(args.get("max_subdivisions", 50))
-            result = integrate.quad_vec(
-                vec_fn, a, b, epsabs=epsabs, epsrel=epsrel, limit=limit
+                raise ValueError(f"unknown qmc_quad func: {func_name}")
+            qrng = _stats.qmc.Halton(d=len(lower), scramble=False)
+            res = integrate.qmc_quad(
+                vec_fn,
+                np.asarray(lower, dtype=float),
+                np.asarray(upper, dtype=float),
+                n_estimates=8,
+                n_points=n_points,
+                qrng=qrng,
             )
-            integral = result[0]
-            return _ok(
-                case_id,
-                "array",
-                {"value": [float(v) for v in np.atleast_1d(integral).tolist()]},
-            )
-
-        if function == "dblquad":
-            # br-9cla-5: scipy.integrate.dblquad. Named 2D integrand with
-            # constant-in-x inner bounds baked into the registry so the
-            # fixture schema stays flat.
-            name = args["func"]
-            if name == "xy_prod_unit_y":
-                # scipy takes f(y, x); we keep the same convention.
-                inner_fn = lambda y, x: x * y  # noqa: E731
-                y_lo, y_hi = 0.0, 1.0
-            else:
-                raise ValueError(f"dblquad: unknown func: {name}")
-            a = float(args["a"])
-            b = float(args["b"])
-            epsabs = float(args.get("atol", 1.49e-8))
-            epsrel = float(args.get("rtol", 1.49e-8))
-            value, _err = integrate.dblquad(
-                inner_fn, a, b, y_lo, y_hi, epsabs=epsabs, epsrel=epsrel
-            )
-            return _ok(case_id, "scalar", {"value": float(value)})
-
-        if function == "tplquad":
-            # br-9cla-5: scipy.integrate.tplquad. Named 3D integrand
-            # with constant inner+middle bounds baked into the registry.
-            name = args["func"]
-            if name == "xyz_prod_unit_yz":
-                # scipy takes f(z, y, x).
-                inner_fn = lambda z, y, x: x * y * z  # noqa: E731
-                y_lo, y_hi = 0.0, 1.0
-                z_lo, z_hi = 0.0, 1.0
-            else:
-                raise ValueError(f"tplquad: unknown func: {name}")
-            a = float(args["a"])
-            b = float(args["b"])
-            epsabs = float(args.get("atol", 1.49e-8))
-            epsrel = float(args.get("rtol", 1.49e-8))
-            value, _err = integrate.tplquad(
-                inner_fn, a, b, y_lo, y_hi, z_lo, z_hi, epsabs=epsabs, epsrel=epsrel
-            )
-            return _ok(case_id, "scalar", {"value": float(value)})
+            return _ok(case_id, "scalar", {"value": float(res.integral)})
 
         if function == "cubature":
             lower = [float(v) for v in args["lower"]]
             upper = [float(v) for v in args["upper"]]
+            if len(lower) != len(upper):
+                raise ValueError("cubature bounds must have the same dimensionality")
             atol = float(args.get("atol", 1e-10))
             rtol = float(args.get("rtol", 1e-10))
-            fn = _build_callable(args["func"])
-            # scipy.integrate.cubature was added in scipy 1.15; fall back
-            # to nquad for older installs.
+            func_name = args["func"]
+            if len(lower) == 0:
+                if func_name == "zero_dim_pair":
+                    return _ok(case_id, "array", {"values": [42.0, -7.0]})
+                fn0 = _build_callable(func_name)
+                return _ok(case_id, "scalar", {"value": float(fn0())})
+            if func_name == "powers_1d":
+                def cube_vec_fn(xs: Any) -> Any:
+                    x = np.atleast_2d(xs)
+                    return np.stack([x[..., 0], x[..., 0] ** 2], axis=-1)
+
+                res = integrate.cubature(cube_vec_fn, lower, upper, atol=atol, rtol=rtol)
+                return _ok(
+                    case_id,
+                    "array",
+                    {"values": [float(v) for v in np.atleast_1d(res.estimate).tolist()]},
+                )
+            fn = _build_callable(func_name)
             if hasattr(integrate, "cubature"):
                 def cube_fn(xs: Any) -> Any:
-                    # scipy.integrate.cubature expects f(x) where x is
-                    # (..., ndim). Flatten leading axes and apply.
                     x = np.atleast_2d(xs)
                     return np.asarray([fn(*row) for row in x], dtype=float)
+
                 res = integrate.cubature(cube_fn, lower, upper, atol=atol, rtol=rtol)
                 value = float(res.estimate) if hasattr(res, "estimate") else float(res[0])
-                return _ok(case_id, "cubature_scalar", {
-                    "value": value,
-                    "status": "converged",
-                })
-            # Fallback via nquad for older scipy.
+                return _ok(case_id, "scalar", {"value": value})
             def nquad_fn(*xs: float) -> float:
                 return fn(*xs)
+
             ranges = list(zip(lower, upper))
             value, _err = integrate.nquad(nquad_fn, ranges, opts={"epsabs": atol, "epsrel": rtol})
-            return _ok(case_id, "cubature_scalar", {
-                "value": float(value),
-                "status": "converged_via_nquad",
-            })
+            return _ok(case_id, "scalar", {"value": float(value)})
 
         return {
             "case_id": case_id,
