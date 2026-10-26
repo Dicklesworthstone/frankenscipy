@@ -1,15 +1,23 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `RegularGridInterpolator`'s tensor-product methods:
-//! `slinear`, `cubic`, `quintic` and `pchip`, on 1-D to 3-D grids, including queries outside
-//! the grid (`bounds_error=False, fill_value=None`, so both sides extrapolate).
+//! `slinear`, `cubic`, `quintic` and `pchip`, on 1-D to 3-D grids, including descending axes,
+//! partial/mixed derivatives and queries outside the grid (`bounds_error=False,
+//! fill_value=None`, so both sides extrapolate).
 //!
 //! fsci computes the exact interpolating spline. SciPy 1.17.1's default `slinear`, `cubic` and
 //! `quintic` build the same spline with `make_ndbspl`, which solves the tensor collocation
 //! system with the iterative `gcrotmk` at `rtol = 1e-5`, so those values carry that solver's
 //! error (1.5e-4 for cubic and 1.4e-2 for quintic on an O(1) grid in the unit tests). SciPy's
 //! `*_legacy` methods fit the exact spline one axis at a time. Each arm therefore compares
-//! against `<method>_legacy` (`pchip` is exact in SciPy already) at `REL_TOL`. The distance
-//! from SciPy's default to its own exact value is logged as `scipy_default_gap`.
+//! against `<method>_legacy` (`pchip` is exact in SciPy already) at `REL_TOL`.
+//!
+//! Derivatives use an independent 70-digit Decimal collocation solve with SciPy's knots,
+//! at the SAME tolerance. Even SciPy's direct `spsolve` coefficients can lose enough bits
+//! to move fifth derivatives by 1.5e-10 on these grids; evaluating derivative basis weights
+//! also produces nonzero derivatives of exactly constant coefficients. Comparing two f64
+//! solves would confuse that reference noise with the derivative's mathematical accuracy.
+//! `scipy_direct_gap` and `scipy_default_gap` retain both live SciPy comparisons. No value
+//! cases or tolerance thresholds are changed by the higher-precision derivative reference.
 //!
 //! frankenscipy-b7891: before this file RGI cubic and quintic ran a local Catmull-Rom tensor
 //! that agreed with SciPy only to ~1e-3, and no live test covered any of these methods.
@@ -39,15 +47,19 @@ struct GridCase {
     /// Row-major values over the grid.
     values: Vec<f64>,
     xi: Vec<Vec<f64>>,
+    /// Per-axis partial derivative orders for the tensor-product spline methods.
+    nu: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct OracleArm {
     case_id: String,
-    /// `<method>_legacy` (or `pchip`): the exact interpolant.
+    /// SciPy legacy/pchip values or the independently solved Decimal derivative.
     exact: Option<Vec<f64>>,
     /// The default `<method>`, built with gcrotmk; equal to `exact` for pchip.
     default: Option<Vec<f64>>,
+    /// The live direct `spsolve` derivative, retained to expose reference roundoff.
+    direct: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +68,7 @@ struct CaseDiff {
     method: String,
     max_rel_diff: f64,
     scipy_default_gap: f64,
+    scipy_direct_gap: Option<f64>,
     pass: bool,
 }
 
@@ -200,8 +213,47 @@ fn generate_cases() -> Vec<GridCase> {
                     points: points.clone(),
                     values: values.clone(),
                     xi: xi.clone(),
+                    nu: None,
                 });
             }
+        }
+    }
+    // Reverse coordinate axes without reversing the values here: these represent different
+    // sampled fields, and the independent SciPy arm must agree on which value belongs where.
+    // Every method is tested with both ascending and mixed-direction axes.
+    let ascending_cases = cases.clone();
+    for mut case in ascending_cases {
+        case.case_id.push_str("_descending");
+        for axis in case.points.iter_mut().step_by(2) {
+            axis.reverse();
+        }
+        cases.push(case);
+    }
+    let value_cases = cases.clone();
+    for case in value_cases {
+        let degree = match case.method.as_str() {
+            "slinear" => 1,
+            "cubic" => 3,
+            "quintic" => 5,
+            _ => continue,
+        };
+        let ndim = case.points.len();
+        let mut partial = vec![0; ndim];
+        partial[0] = 1;
+        let mut highest = vec![0; ndim];
+        highest[0] = degree;
+        let mut above_degree = vec![0; ndim];
+        above_degree[0] = degree + 1;
+        for (name, nu) in [
+            ("partial", partial),
+            ("mixed", vec![1; ndim]),
+            ("highest", highest),
+            ("above_degree", above_degree),
+        ] {
+            let mut derivative = case.clone();
+            derivative.case_id.push_str(&format!("_{name}"));
+            derivative.nu = Some(nu);
+            cases.push(derivative);
         }
     }
     cases
@@ -212,20 +264,127 @@ fn scipy_oracle_or_skip(cases: &[GridCase]) -> Option<Vec<OracleArm>> {
 import json
 import math
 import sys
+from decimal import Decimal as D, localcontext
+from itertools import product
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator, make_interp_spline
+from scipy.sparse.linalg import spsolve
 
 def finite_or_none(arr):
     out = [float(v) for v in np.asarray(arr).ravel()]
     return out if all(math.isfinite(v) for v in out) else None
 
-def run(grid, vals, xi, method):
+def run(grid, vals, xi, method, nu=None, solver=None):
     try:
+        options = {} if solver is None else {"solver": solver}
         rgi = RegularGridInterpolator(grid, vals, method=method, bounds_error=False,
-                                      fill_value=None)
-        return finite_or_none(rgi(xi))
+                                      fill_value=None, **options)
+        return finite_or_none(rgi(xi, nu=nu))
     except Exception:
         return None
+
+def decimal_array(values):
+    a = np.asarray(values)
+    return np.array([D.from_float(float(x)) for x in a.ravel()], dtype=object).reshape(a.shape)
+
+def basis(t, k, x):
+    n = len(t) - k - 1
+    if x <= t[k]:
+        span = k
+    elif x >= t[n]:
+        span = n - 1
+    else:
+        span = next(i for i in range(k, n) if t[i] <= x < t[i + 1])
+    # Full Cox-de Boor recurrence, independent of the Rust local basis implementation.
+    b = [D(0)] * (len(t) - 1)
+    b[span] = D(1)
+    for degree in range(1, k + 1):
+        next_b = [D(0)] * (len(t) - degree - 1)
+        for i in range(len(next_b)):
+            left = t[i + degree] - t[i]
+            right = t[i + degree + 1] - t[i + 1]
+            if left:
+                next_b[i] += (x - t[i]) * b[i] / left
+            if right:
+                next_b[i] += (t[i + degree + 1] - x) * b[i + 1] / right
+        b = next_b
+    return b
+
+def factor(axis, t, k):
+    a = [basis(t, k, x) for x in axis]
+    pivots = []
+    for j in range(len(a)):
+        pivot = max(range(j, len(a)), key=lambda i: abs(a[i][j]))
+        a[j], a[pivot] = a[pivot], a[j]
+        pivots.append(pivot)
+        for i in range(j + 1, len(a)):
+            a[i][j] /= a[j][j]
+            for col in range(j + 1, len(a)):
+                a[i][col] -= a[i][j] * a[j][col]
+    return a, pivots
+
+def solve(a, pivots, values):
+    b = list(values)
+    for j, pivot in enumerate(pivots):
+        b[j], b[pivot] = b[pivot], b[j]
+    for i in range(len(a)):
+        b[i] -= sum(a[i][j] * b[j] for j in range(i))
+    for i in reversed(range(len(a))):
+        b[i] -= sum(a[i][j] * b[j] for j in range(i + 1, len(a)))
+        b[i] /= a[i][i]
+    return b
+
+fit_cache = {}
+
+def decimal_derivative(grid, values, xi, method, nu):
+    k = {"slinear": 1, "cubic": 3, "quintic": 5}[method]
+    if any(order > k for order in nu):
+        return [0.0] * len(xi)
+    axes = [ax.copy() for ax in grid]
+    values = values.copy()
+    for d, ax in enumerate(axes):
+        if ax[0] > ax[-1]:
+            axes[d] = ax[::-1]
+            values = np.flip(values, axis=d)
+    key = (method, tuple(tuple(ax) for ax in axes), tuple(values.ravel()))
+    with localcontext() as ctx:
+        ctx.prec = 70
+        if key not in fit_cache:
+            # SciPy defines the not-a-knot convention; the dense solves below are separate.
+            knots = [decimal_array(make_interp_spline(ax, np.zeros(len(ax)), k=k).t).tolist()
+                     for ax in axes]
+            coeff = decimal_array(values)
+            for d, ax in enumerate(axes):
+                a, pivots = factor(decimal_array(ax), knots[d], k)
+                moved = np.moveaxis(coeff, d, 0)
+                for index in product(*(range(n) for n in moved.shape[1:])):
+                    selection = (slice(None),) + index
+                    moved[selection] = solve(a, pivots, moved[selection])
+                coeff = np.moveaxis(moved, 0, d)
+            fit_cache[key] = (knots, coeff)
+        knots, coeff = fit_cache[key]
+        knots = [list(t) for t in knots]
+        coeff = coeff.copy()
+        degrees = [k] * len(knots)
+        for d, order in enumerate(nu):
+            for _ in range(order):
+                degree = degrees[d]
+                coeff = np.diff(coeff, axis=d) * D(degree)
+                widths = [knots[d][i + degree + 1] - knots[d][i + 1]
+                          for i in range(coeff.shape[d])]
+                shape = [1] * coeff.ndim
+                shape[d] = len(widths)
+                coeff /= np.array(widths, dtype=object).reshape(shape)
+                knots[d] = knots[d][1:-1]
+                degrees[d] -= 1
+        out = []
+        for query in xi:
+            value = coeff
+            for d in reversed(range(len(knots))):
+                weights = basis(knots[d], degrees[d], D.from_float(float(query[d])))
+                value = np.sum(value * np.array(weights, dtype=object), axis=-1)
+            out.append(float(value))
+        return out
 
 cases = json.load(sys.stdin)
 out = []
@@ -234,9 +393,12 @@ for c in cases:
     vals = np.array(c["values"], dtype=float).reshape(tuple(len(ax) for ax in grid))
     xi = np.array(c["xi"], dtype=float)
     m = c["method"]
-    exact = run(grid, vals, xi, m if m == "pchip" else m + "_legacy")
-    default = run(grid, vals, xi, m)
-    out.append({"case_id": c["case_id"], "exact": exact, "default": default})
+    nu = c["nu"]
+    exact = (run(grid, vals, xi, m if m == "pchip" else m + "_legacy")
+             if nu is None else decimal_derivative(grid, vals, xi, m, nu))
+    default = run(grid, vals, xi, m, nu=nu)
+    direct = None if nu is None else run(grid, vals, xi, m, nu=nu, solver=spsolve)
+    out.append({"case_id": c["case_id"], "exact": exact, "default": default, "direct": direct})
 print(json.dumps(out))
 "#;
     let payload = serde_json::to_string(cases).expect("serialize regular grid cases");
@@ -332,6 +494,11 @@ fn diff_interpolate_regular_grid_splines() {
 
     for case in &cases {
         let arm = by_id.get(&case.case_id).expect("validated oracle map");
+        assert!(
+            arm.exact.is_some(),
+            "the independent spline reference must evaluate every valid grid case: {}",
+            case.case_id
+        );
         let fsci = RegularGridInterpolator::new(
             case.points.clone(),
             case.values.clone(),
@@ -339,7 +506,10 @@ fn diff_interpolate_regular_grid_splines() {
             false,
             None,
         )
-        .and_then(|rgi| rgi.eval_many(&case.xi))
+        .and_then(|rgi| match &case.nu {
+            Some(nu) => rgi.eval_derivative_many(&case.xi, nu),
+            None => rgi.eval_many(&case.xi),
+        })
         .ok();
         let Some((exact, fsci)) = ledger.slices(
             &case.method,
@@ -359,6 +529,12 @@ fn diff_interpolate_regular_grid_splines() {
                 .zip(exact)
                 .fold(0.0_f64, |acc, (&d, &e)| acc.max(rel_diff(d, e)))
         });
+        let scipy_direct_gap = arm.direct.as_deref().map(|direct| {
+            direct
+                .iter()
+                .zip(exact)
+                .fold(0.0_f64, |acc, (&d, &e)| acc.max(rel_diff(d, e)))
+        });
         let pass = max_rel <= REL_TOL;
         max_overall = max_overall.max(max_rel);
         ledger.compared(&case.method, &case.case_id, pass);
@@ -367,6 +543,7 @@ fn diff_interpolate_regular_grid_splines() {
             method: case.method.clone(),
             max_rel_diff: max_rel,
             scipy_default_gap,
+            scipy_direct_gap,
             pass,
         });
     }
@@ -386,17 +563,18 @@ fn diff_interpolate_regular_grid_splines() {
     });
     for d in &diffs {
         eprintln!(
-            "{} {}: max_rel_diff={:e} scipy_default_gap={:e}{}",
+            "{} {}: max_rel_diff={:e} scipy_default_gap={:e} scipy_direct_gap={:?}{}",
             d.method,
             d.case_id,
             d.max_rel_diff,
             d.scipy_default_gap,
+            d.scipy_direct_gap,
             if d.pass { "" } else { "  MISMATCH" }
         );
     }
     assert!(
         all_pass,
-        "RegularGridInterpolator spline methods diverged from SciPy's exact interpolant: max {max_overall:e}"
+        "RegularGridInterpolator spline methods diverged from the independent interpolant: max {max_overall:e}"
     );
     let min_per_arm = METHODS
         .iter()

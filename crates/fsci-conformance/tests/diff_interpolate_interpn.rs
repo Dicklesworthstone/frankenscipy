@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `scipy.interpolate.interpn` on
-//! 2-D regular grids with linear and nearest methods.
+//! regular grids with linear and nearest methods, including descending and singleton axes
+//! with both constant extrapolation and fill values.
 //!
 //! Resolves [frankenscipy-3sja3]. 1e-10 abs.
 
@@ -29,6 +30,8 @@ struct PointCase {
     values: Vec<f64>,
     /// Query points: list of [x_axis0, x_axis1, ...] coordinates.
     xi: Vec<Vec<f64>>,
+    bounds_error: bool,
+    fill_value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,7 +166,7 @@ fn generate_query() -> OracleQuery {
             xi_b,
         ),
     ];
-    let points = cases
+    let mut points: Vec<_> = cases
         .iter()
         .map(|(name, method, pts, vals, xi)| PointCase {
             case_id: (*name).into(),
@@ -171,8 +174,73 @@ fn generate_query() -> OracleQuery {
             points: pts.clone(),
             values: vals.clone(),
             xi: xi.clone(),
+            bounds_error: true,
+            fill_value: None,
         })
         .collect();
+    let singleton_grids = [
+        ("one_point", vec![vec![2.0]]),
+        ("singleton_first", vec![vec![2.0], vec![3.0, 0.5, -2.0]]),
+        ("singleton_last", vec![vec![3.0, 0.5, -2.0], vec![2.0]]),
+        (
+            "three_dimensional_slice",
+            vec![vec![2.0], vec![3.0, 0.5, -2.0], vec![2.0]],
+        ),
+        (
+            "three_dimensional_plane",
+            vec![vec![1.0, 0.0], vec![2.0], vec![-2.0, 0.5, 3.0]],
+        ),
+        (
+            "four_dimensional_plane",
+            vec![vec![2.0], vec![0.0, 1.0], vec![2.0], vec![3.0, 0.5, -2.0]],
+        ),
+        ("all_singleton", vec![vec![2.0], vec![3.0], vec![-1.0]]),
+    ];
+    for (name, grid) in singleton_grids {
+        let count = grid.iter().map(Vec::len).product();
+        let mut values = Vec::with_capacity(count);
+        for flat in 0..count {
+            let mut rest = flat;
+            let mut sum = 0.0;
+            let mut product = 1.0;
+            for (dim, axis) in grid.iter().enumerate().rev() {
+                let x = axis[rest % axis.len()];
+                rest /= axis.len();
+                sum += (dim + 1) as f64 * x;
+                product *= 1.0 + 0.1 * x;
+            }
+            values.push(sum + product);
+        }
+        let midpoint: Vec<f64> = grid
+            .iter()
+            .map(|ax| 0.5 * (ax[0] + ax[ax.len() - 1]))
+            .collect();
+        let xi = vec![
+            midpoint.clone(),
+            grid.iter().map(|ax| ax[0]).collect(),
+            grid.iter().map(|ax| ax[ax.len() - 1]).collect(),
+            midpoint.iter().map(|&x| x - 2.0).collect(),
+            midpoint.iter().map(|&x| x + 2.0).collect(),
+        ];
+        for method in ["linear", "nearest"] {
+            for fill_value in [None, Some(99.0)] {
+                let boundary = if fill_value.is_some() {
+                    "fill"
+                } else {
+                    "extrapolate"
+                };
+                points.push(PointCase {
+                    case_id: format!("{method}_{name}_{boundary}"),
+                    method: method.into(),
+                    points: grid.clone(),
+                    values: values.clone(),
+                    xi: xi.clone(),
+                    bounds_error: false,
+                    fill_value,
+                });
+            }
+        }
+    }
     OracleQuery { points }
 }
 
@@ -207,7 +275,7 @@ for case in q["points"]:
     try:
         out = interpolate.interpn(
             grid_axes, vals, xi,
-            method=method, bounds_error=True, fill_value=None,
+            method=method, bounds_error=case["bounds_error"], fill_value=case["fill_value"],
         )
         points_out.append({"case_id": cid, "expected": finite_vec_or_none(out)})
     except Exception:
@@ -291,8 +359,8 @@ fn diff_interpolate_interpn() {
             case.values.clone(),
             &case.xi,
             method,
-            true,
-            None,
+            case.bounds_error,
+            case.fill_value,
         )
         .ok();
         let Some((expected, fsci_v)) = ledger.slices(

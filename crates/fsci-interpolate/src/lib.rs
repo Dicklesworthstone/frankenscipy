@@ -525,14 +525,17 @@ fn find_interval_uniform_helper(meta: (f64, f64), array: &[f64], x_new: f64) -> 
 }
 
 /// Classify an axis as uniform (evenly spaced) and return `(x0, inv_dx)` for
-/// O(1) direct-address interval lookup. The axis is assumed strictly increasing
-/// with `len() >= 2` (guaranteed by `RegularGridInterpolator::new`). An axis
+/// O(1) direct-address interval lookup. The axis is assumed strictly increasing;
+/// singleton axes do not have a spacing and return `None`. An axis
 /// counts as uniform when every coordinate lies within `1e-9 * span` of its
 /// ideal linspace position, which covers grids built by `linspace`/`arange`
 /// while excluding genuinely irregular axes. Returns `None` when not uniform or
 /// when `dx` is not finite/positive.
 fn detect_uniform_axis(axis: &[f64]) -> Option<(f64, f64)> {
     let n = axis.len();
+    if n < 2 {
+        return None;
+    }
     let x0 = axis[0];
     let span = axis[n - 1] - x0;
     let dx = span / (n - 1) as f64;
@@ -3211,6 +3214,38 @@ fn bspline_basis_funs(t: &[f64], k: usize, x: f64, span: usize) -> [f64; 6] {
     n
 }
 
+/// The `nu`-th derivatives of the same `k+1` basis functions as `bspline_basis_funs`.
+/// Start with degree `k-nu` and apply
+/// `N'_{i,p} = p N_{i,p-1}/(t[i+p]-t[i]) - p N_{i+1,p-1}/(t[i+p+1]-t[i+1])`.
+/// This differentiates the local polynomial analytically, including its extrapolated end
+/// pieces; no coefficient-grid copy or finite differences are needed. Orders above the
+/// degree vanish, as in scipy's `NdBSpline.__call__(nu=...)`.
+fn bspline_basis_derivative(t: &[f64], k: usize, x: f64, span: usize, nu: usize) -> [f64; 6] {
+    if nu == 0 {
+        return bspline_basis_funs(t, k, x, span);
+    }
+    if nu > k {
+        return [0.0; 6];
+    }
+    let mut basis = bspline_basis_funs(t, k - nu, x, span);
+    for degree in k - nu + 1..=k {
+        let mut next = [0.0; 6];
+        for (r, value) in next.iter_mut().enumerate().take(degree + 1) {
+            let i = span - degree + r;
+            let left = t[i + degree] - t[i];
+            let right = t[i + degree + 1] - t[i + 1];
+            if r > 0 && left != 0.0 {
+                *value = degree as f64 * basis[r - 1] / left;
+            }
+            if r < degree && right != 0.0 {
+                *value -= degree as f64 * basis[r] / right;
+            }
+        }
+        basis = next;
+    }
+    basis
+}
+
 fn eval_basis_all(t: &[f64], x: f64, k: usize, n: usize) -> Vec<f64> {
     let mut basis = vec![0.0; n];
     // Degree-0 indicator: exactly the interval(s) containing x become 1.0. Track the
@@ -3766,10 +3801,10 @@ pub fn griddata(
 /// Matches `scipy.interpolate.RegularGridInterpolator(method=...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RegularGridMethod {
-    /// Linear interpolation (default). Requires at least 2 points per axis.
+    /// Linear interpolation (default). Singleton axes are constant under extrapolation.
     #[default]
     Linear,
-    /// Nearest-neighbor interpolation. Requires at least 2 points per axis.
+    /// Nearest-neighbor interpolation. Requires at least 1 point per axis.
     Nearest,
     /// Tensor-product PCHIP interpolation. Requires at least 4 points per axis.
     /// Matches scipy's `method='pchip'`.
@@ -3792,6 +3827,9 @@ pub struct RegularGridInterpolator {
     points: Vec<Vec<f64>>,
     values: Vec<f64>,
     strides: Vec<usize>,
+    /// Axes that contribute two corners to multilinear interpolation. Singleton axes
+    /// contribute their one value, even when the query extrapolates along that dimension.
+    non_singleton_axes: Vec<usize>,
     method: RegularGridMethod,
     bounds_error: bool,
     fill_value: Option<f64>,
@@ -3821,8 +3859,8 @@ pub static INTERPN_NEAREST3D_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 
 impl RegularGridInterpolator {
     pub fn new(
-        points: Vec<Vec<f64>>,
-        values: Vec<f64>,
+        mut points: Vec<Vec<f64>>,
+        mut values: Vec<f64>,
         method: RegularGridMethod,
         bounds_error: bool,
         fill_value: Option<f64>,
@@ -3835,13 +3873,13 @@ impl RegularGridInterpolator {
 
         // Determine minimum points required per axis based on method
         let min_points = match method {
-            RegularGridMethod::Linear | RegularGridMethod::Nearest | RegularGridMethod::Slinear => {
-                2
-            }
+            RegularGridMethod::Linear | RegularGridMethod::Nearest => 1,
+            RegularGridMethod::Slinear => 2,
             RegularGridMethod::Pchip | RegularGridMethod::Cubic => 4,
             RegularGridMethod::Quintic => 6,
         };
 
+        let mut descending_axes = Vec::new();
         for (dim, axis) in points.iter().enumerate() {
             if axis.len() < min_points {
                 return Err(InterpError::TooFewPoints {
@@ -3854,10 +3892,14 @@ impl RegularGridInterpolator {
             if axis.iter().any(|&v| !v.is_finite()) {
                 return Err(InterpError::NonFiniteX);
             }
-            if axis.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(InterpError::InvalidArgument {
-                    detail: format!("axis {dim} not strictly increasing"),
-                });
+            if !axis.windows(2).all(|w| w[1] > w[0]) {
+                if axis.windows(2).all(|w| w[1] < w[0]) {
+                    descending_axes.push(dim);
+                } else {
+                    return Err(InterpError::InvalidArgument {
+                        detail: format!("axis {dim} not strictly ascending or descending"),
+                    });
+                }
             }
         }
         let ndim = points.len();
@@ -3877,6 +3919,28 @@ impl RegularGridInterpolator {
                 y_len: values.len(),
             });
         }
+        // All evaluation paths use ascending axes. Reverse matching value fibers as well:
+        // reversing only the coordinates would silently attach each sample to the wrong point.
+        for dim in descending_axes {
+            points[dim].reverse();
+            let len = points[dim].len();
+            let stride = strides[dim];
+            let block = len * stride;
+            for start in (0..total_size).step_by(block) {
+                for i in 0..len / 2 {
+                    let left = start + i * stride;
+                    let right = start + (len - 1 - i) * stride;
+                    for offset in 0..stride {
+                        values.swap(left + offset, right + offset);
+                    }
+                }
+            }
+        }
+        let non_singleton_axes = points
+            .iter()
+            .enumerate()
+            .filter_map(|(dim, axis)| (axis.len() > 1).then_some(dim))
+            .collect();
         // scipy builds the slinear, cubic and quintic tensor splines in `__init__`
         // (`make_ndbspl`), whose solve rejects non-finite data whatever the queries or
         // `bounds_error` will be.
@@ -3910,6 +3974,7 @@ impl RegularGridInterpolator {
             points,
             values,
             strides,
+            non_singleton_axes,
             method,
             bounds_error,
             fill_value,
@@ -3923,6 +3988,57 @@ impl RegularGridInterpolator {
     }
 
     pub fn eval(&self, xi: &[f64]) -> Result<f64, InterpError> {
+        self.eval_impl(xi, None)
+    }
+
+    /// Evaluate a partial or mixed derivative of an `Slinear`, `Cubic`, or `Quintic`
+    /// interpolant, matching scipy's `RegularGridInterpolator(xi, nu=nu)`.
+    ///
+    /// `nu` contains one derivative order per axis: `[1, 0]` is the first partial derivative
+    /// along axis 0 and `[1, 1]` is a mixed derivative. Coordinates and derivative signs are
+    /// physical, regardless of whether input axes were ascending or descending. Orders above
+    /// the spline degree yield zero; bounds, fill values, and NaN queries follow [`Self::eval`].
+    /// The `Linear`, `Nearest`, and `Pchip` methods do not accept derivative orders.
+    pub fn eval_derivative(&self, xi: &[f64], nu: &[usize]) -> Result<f64, InterpError> {
+        self.derivative_spline(nu)?;
+        self.eval_impl(xi, Some(nu))
+    }
+
+    /// Evaluate one partial or mixed derivative at every query point, with the same batch
+    /// bounds validation and query ordering as [`Self::eval_many`].
+    pub fn eval_derivative_many(
+        &self,
+        xi: &[Vec<f64>],
+        nu: &[usize],
+    ) -> Result<Vec<f64>, InterpError> {
+        let spline = self.derivative_spline(nu)?;
+        if self.bounds_error {
+            self.check_batch_bounds(xi)?;
+        }
+        let work_per_query = (spline.k + 1).saturating_pow(self.ndim() as u32);
+        par_query_try_map(xi, work_per_query, |x| self.eval_impl(x, Some(nu)))
+    }
+
+    fn derivative_spline(&self, nu: &[usize]) -> Result<&GridSpline, InterpError> {
+        let spline = self
+            .spline
+            .as_ref()
+            .ok_or_else(|| InterpError::InvalidArgument {
+                detail: "derivatives require the slinear, cubic, or quintic method".to_string(),
+            })?;
+        if nu.len() != self.ndim() {
+            return Err(InterpError::InvalidArgument {
+                detail: format!(
+                    "expected {} derivative orders, got {}",
+                    self.ndim(),
+                    nu.len()
+                ),
+            });
+        }
+        Ok(spline)
+    }
+
+    fn eval_impl(&self, xi: &[f64], nu: Option<&[usize]>) -> Result<f64, InterpError> {
         let ndim = self.ndim();
         if xi.len() != ndim {
             return Err(InterpError::InvalidArgument {
@@ -3960,7 +4076,7 @@ impl RegularGridInterpolator {
             RegularGridMethod::Nearest => Ok(self.eval_nearest(xi)),
             RegularGridMethod::Pchip => self.eval_pchip(xi),
             RegularGridMethod::Slinear | RegularGridMethod::Cubic | RegularGridMethod::Quintic => {
-                Ok(self.eval_spline(xi))
+                Ok(self.eval_spline(xi, nu))
             }
         }
     }
@@ -4130,7 +4246,7 @@ impl RegularGridInterpolator {
 
     fn find_interval(axis: &[f64], x: f64) -> usize {
         let n = axis.len();
-        if x <= axis[0] {
+        if n == 1 || x <= axis[0] {
             return 0;
         }
         if x >= axis[n - 1] {
@@ -4178,6 +4294,14 @@ impl RegularGridInterpolator {
     /// paths since `find_interval_uniform` is bit-equivalent to `find_interval`.
     #[inline]
     fn nearest_index(uniform: Option<(f64, f64)>, axis: &[f64], x: f64) -> usize {
+        // Clamp first: at an infinite query both endpoint distances are infinite, so the
+        // distance comparison alone would mistake +infinity for a tie below the last point.
+        if x <= axis[0] {
+            return 0;
+        }
+        if x >= axis[axis.len() - 1] {
+            return axis.len() - 1;
+        }
         let i = match uniform {
             Some(meta) => Self::find_interval_uniform(meta, axis, x),
             None => Self::find_interval(axis, x),
@@ -4195,13 +4319,10 @@ impl RegularGridInterpolator {
         }
 
         let mut flat_idx = 0;
-        for ((axis, &x), &stride) in self.points.iter().zip(xi).zip(&self.strides) {
-            let i = Self::find_interval(axis, x);
-            let nearest = if i + 1 < axis.len() && (x - axis[i]).abs() > (axis[i + 1] - x).abs() {
-                i + 1
-            } else {
-                i
-            };
+        for (dim, ((axis, &x), &stride)) in
+            self.points.iter().zip(xi).zip(&self.strides).enumerate()
+        {
+            let nearest = Self::nearest_index(self.uniform_axes[dim], axis, x);
             flat_idx += nearest * stride;
         }
         self.values[flat_idx]
@@ -4296,16 +4417,19 @@ impl RegularGridInterpolator {
 
     fn eval_linear(&self, xi: &[f64]) -> Result<f64, InterpError> {
         let ndim = self.ndim();
-        if ndim == 2 {
+        let active_ndim = self.non_singleton_axes.len();
+        if ndim == 2 && active_ndim == ndim {
             return Ok(self.eval_linear_2d(xi));
         }
-        if ndim == 3 {
+        if ndim == 3 && active_ndim == ndim {
             return Ok(self.eval_linear_3d(xi));
         }
 
-        let mut indices = Vec::with_capacity(ndim);
-        let mut fracs = Vec::with_capacity(ndim);
-        for (dim, (axis, &x)) in self.points.iter().zip(xi).enumerate() {
+        let mut indices = Vec::with_capacity(active_ndim);
+        let mut fracs = Vec::with_capacity(active_ndim);
+        for &dim in &self.non_singleton_axes {
+            let axis = &self.points[dim];
+            let x = xi[dim];
             let i = self.linear_interval(dim, axis, x);
             let denom = axis[i + 1] - axis[i];
             indices.push(i);
@@ -4316,16 +4440,18 @@ impl RegularGridInterpolator {
             });
         }
         let mut result = 0.0;
-        for corner in 0..(1usize << ndim) {
+        // Construction checked the value-grid product, so 2^active_ndim fits in usize.
+        // Singleton dimensions add no corners; an entirely singleton grid evaluates once.
+        for corner in 0..(1usize << active_ndim) {
             let mut weight = 1.0;
             let mut flat_idx = 0;
-            for dim in 0..ndim {
-                let bit = (corner >> dim) & 1;
-                flat_idx += (indices[dim] + bit) * self.strides[dim];
+            for (active_dim, &dim) in self.non_singleton_axes.iter().enumerate() {
+                let bit = (corner >> active_dim) & 1;
+                flat_idx += (indices[active_dim] + bit) * self.strides[dim];
                 weight *= if bit == 0 {
-                    1.0 - fracs[dim]
+                    1.0 - fracs[active_dim]
                 } else {
-                    fracs[dim]
+                    fracs[active_dim]
                 };
             }
             result += weight * self.values[flat_idx];
@@ -4441,12 +4567,116 @@ impl RegularGridInterpolator {
 
     /// The tensor-product spline methods (`slinear`, `cubic`, `quintic`) evaluated from the
     /// coefficients `new` solved for. See [`GridSpline`].
-    fn eval_spline(&self, xi: &[f64]) -> f64 {
+    fn eval_spline(&self, xi: &[f64], nu: Option<&[usize]>) -> f64 {
         self.spline
             .as_ref()
             .expect("spline methods build their GridSpline in new")
-            .eval(xi, &self.strides)
+            .eval(xi, &self.strides, nu)
     }
+}
+
+/// Two-component arithmetic for the grid spline's construction and derivatives. A fifth
+/// derivative amplifies tiny coefficient errors by inverse knot spacing to the fifth power;
+/// compensated sums alone cannot recover the bits lost while constructing the coefficients.
+/// Keep the low component through the separable solves and derivative recurrences, while
+/// ordinary value evaluation continues to use f64 coefficients and basis functions.
+#[derive(Debug, Clone, Copy, Default)]
+struct GridFloat {
+    hi: f64,
+    lo: f64,
+}
+
+impl GridFloat {
+    fn from(value: f64) -> Self {
+        Self { hi: value, lo: 0.0 }
+    }
+
+    fn value(self) -> f64 {
+        self.hi + self.lo
+    }
+
+    fn normalize(hi: f64, lo: f64) -> Self {
+        let sum = hi + lo;
+        if !sum.is_finite() {
+            return Self::from(sum);
+        }
+        let virtual_lo = sum - hi;
+        Self {
+            hi: sum,
+            lo: (hi - (sum - virtual_lo)) + (lo - virtual_lo),
+        }
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        let sum = self.hi + rhs.hi;
+        if !sum.is_finite() {
+            return Self::from(sum);
+        }
+        let virtual_rhs = sum - self.hi;
+        let error = (self.hi - (sum - virtual_rhs)) + (rhs.hi - virtual_rhs);
+        let tail = error + self.lo + rhs.lo;
+        Self::normalize(sum, tail)
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        self.add(Self {
+            hi: -rhs.hi,
+            lo: -rhs.lo,
+        })
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let product = self.hi * rhs.hi;
+        if !product.is_finite() {
+            return Self::from(product);
+        }
+        let error = self.hi.mul_add(rhs.hi, -product)
+            + self.hi * rhs.lo
+            + self.lo * rhs.hi
+            + self.lo * rhs.lo;
+        Self::normalize(product, error)
+    }
+
+    fn div(self, rhs: Self) -> Self {
+        if !self.hi.is_finite() || !rhs.hi.is_finite() {
+            return Self::from(self.value() / rhs.value());
+        }
+        let quotient = self.hi / rhs.hi;
+        if !quotient.is_finite() {
+            return Self::from(quotient);
+        }
+        let remainder = self.sub(rhs.mul(Self::from(quotient)));
+        let correction = remainder.value() / rhs.hi;
+        if !correction.is_finite() {
+            return Self::from(quotient);
+        }
+        Self::from(quotient).add(Self::from(correction))
+    }
+}
+
+/// The same local Cox-de Boor recurrence as `bspline_basis_funs`, with compensated knot
+/// differences as well as products. Rounding the collocation matrix to f64 before residual
+/// refinement would refine a different interpolant and still contaminate high derivatives.
+fn grid_basis_funs(t: &[f64], k: usize, x: f64, span: usize) -> [GridFloat; 6] {
+    let mut basis = [GridFloat::default(); 6];
+    basis[0] = GridFloat::from(1.0);
+    for degree in 1..=k {
+        let mut saved = GridFloat::default();
+        for r in 0..degree {
+            let left = GridFloat::from(x).sub(GridFloat::from(t[span + 1 - degree + r]));
+            let right = GridFloat::from(t[span + r + 1]).sub(GridFloat::from(x));
+            let denominator = left.add(right);
+            let term = if denominator.value() != 0.0 {
+                basis[r].div(denominator)
+            } else {
+                GridFloat::default()
+            };
+            basis[r] = saved.add(right.mul(term));
+            saved = left.mul(term);
+        }
+        basis[degree] = saved;
+    }
+    basis
 }
 
 /// The interpolating tensor-product spline behind `RegularGridInterpolator`'s `slinear`,
@@ -4457,16 +4687,17 @@ impl RegularGridInterpolator {
 /// collocation system to the iterative `gcrotmk` at its default `rtol = 1e-5`, so its values
 /// carry that solver's error. Its `*_legacy` methods compute the exact interpolant by fitting a
 /// `make_interp_spline` along each axis per query. The system matrix is the Kronecker product
-/// of the per-axis collocation matrices, so here it is solved exactly, one banded solve per
-/// axis fiber, once at construction. A query is then the `(k+1)^ndim`-term sum `NdBSpline`
-/// evaluates, in the same order.
+/// of the per-axis collocation matrices, so here it is solved along each axis fiber once at
+/// construction, with compensated residual refinement to retain accurate derivatives. A
+/// value query uses the same `(k+1)^ndim`-term sum as `NdBSpline`; derivatives instead
+/// differentiate the local coefficients before evaluating the reduced-degree spline.
 #[derive(Debug, Clone)]
 struct GridSpline {
     k: usize,
     /// Per-axis knots, `interpolation_knots(axis, k)` as `make_interp_spline` builds them.
     knots: Vec<Vec<f64>>,
     /// Coefficients in the value grid's row-major layout.
-    coef: Vec<f64>,
+    coef: Vec<GridFloat>,
 }
 
 impl GridSpline {
@@ -4476,43 +4707,108 @@ impl GridSpline {
         strides: &[usize],
         k: usize,
     ) -> Result<Self, InterpError> {
-        let mut coef = values.to_vec();
+        let mut coef: Vec<_> = values.iter().copied().map(GridFloat::from).collect();
+        let knots: Vec<_> = points
+            .iter()
+            .map(|axis| interpolation_knots(axis, k))
+            .collect();
+        // At the knots a degree-one collocation matrix is the identity.
+        if k == 1 {
+            return Ok(Self { k, knots, coef });
+        }
         let mut fiber = Vec::new();
         for (dim, axis) in points.iter().enumerate() {
             let (len, stride) = (axis.len(), strides[dim]);
             let block = len * stride;
-            fiber.resize(len, 0.0);
+            let t = &knots[dim];
+            let mut rows = Vec::with_capacity(len);
+            let mut approximate = Vec::with_capacity(len);
+            let mut bandwidth = 0;
+            for (i, &x) in axis.iter().enumerate() {
+                let span = BSpline::find_span_n(t, len, k, x);
+                let start = span - k;
+                let basis = grid_basis_funs(t, k, x, span);
+                let rounded: Vec<_> = basis[..=k].iter().map(|b| b.value()).collect();
+                approximate.push(CompactBandRow::from_slice(start, &rounded));
+                bandwidth = bandwidth.max(i.abs_diff(start)).max(i.abs_diff(span));
+                rows.push((start, basis));
+            }
+            fiber.resize(len, GridFloat::default());
             for block_start in (0..coef.len()).step_by(block) {
                 for start in block_start..block_start + stride {
                     for (i, slot) in fiber.iter_mut().enumerate() {
                         *slot = coef[start + i * stride];
                     }
-                    let spline = make_interp_spline_unchecked(axis, &fiber, k)?;
-                    for (i, &c) in spline.coeffs().iter().enumerate() {
+                    let mut rhs: Vec<_> = fiber.iter().map(|c| c.value()).collect();
+                    let initial =
+                        solve_banded_compact(&mut approximate.clone(), &mut rhs, bandwidth)?;
+                    let mut fitted: Vec<_> = initial.into_iter().map(GridFloat::from).collect();
+                    // Two compensated-residual corrections recover the low coefficient bits
+                    // using the existing f64 band solver. Keep them across subsequent axes;
+                    // rounding between fibers or before differentiation would lose the gain.
+                    let mut previous = fitted.clone();
+                    let mut best_residual = f64::INFINITY;
+                    for iteration in 0..=2 {
+                        if fitted.iter().any(|c| !c.value().is_finite()) {
+                            fitted = previous;
+                            break;
+                        }
+                        for (i, (offset, basis)) in rows.iter().enumerate() {
+                            let residual = basis[..=k]
+                                .iter()
+                                .enumerate()
+                                .fold(fiber[i], |r, (j, &b)| r.sub(b.mul(fitted[offset + j])));
+                            rhs[i] = residual.value();
+                        }
+                        let residual = rhs.iter().fold(0.0_f64, |norm, r| norm.max(r.abs()));
+                        if rhs.iter().any(|r| !r.is_finite()) || residual > best_residual {
+                            fitted = previous;
+                            break;
+                        }
+                        if iteration == 2 || residual == 0.0 {
+                            break;
+                        }
+                        best_residual = residual;
+                        previous.clone_from(&fitted);
+                        let correction =
+                            solve_banded_compact(&mut approximate.clone(), &mut rhs, bandwidth)?;
+                        if correction.iter().any(|delta| !delta.is_finite()) {
+                            break;
+                        }
+                        for (c, delta) in fitted.iter_mut().zip(correction) {
+                            *c = c.add(GridFloat::from(delta));
+                        }
+                    }
+                    for (i, &c) in fitted.iter().enumerate() {
                         coef[start + i * stride] = c;
                     }
                 }
             }
         }
-        let knots = points
-            .iter()
-            .map(|axis| interpolation_knots(axis, k))
-            .collect();
         Ok(Self { k, knots, coef })
     }
 
     /// `NdBSpline.__call__` at one point: per axis the knot span (the end spans extend the
     /// polynomial outside the data, as `extrapolate=True` does) and its `k+1` non-zero basis
     /// values, then the sum over every combination with the last axis varying fastest.
-    fn eval(&self, xi: &[f64], strides: &[usize]) -> f64 {
+    fn eval(&self, xi: &[f64], strides: &[usize], nu: Option<&[usize]>) -> f64 {
+        if let Some(orders) = nu
+            && orders.iter().any(|&order| order != 0)
+            && xi.iter().all(|x| x.is_finite())
+        {
+            return self.eval_derivative(xi, strides, orders);
+        }
         let k = self.k;
         let ndim = self.knots.len();
         let mut spans = Vec::with_capacity(ndim);
         let mut basis = Vec::with_capacity(ndim);
-        for (t, &x) in self.knots.iter().zip(xi) {
+        for (dim, (t, &x)) in self.knots.iter().zip(xi).enumerate() {
             let span = BSpline::find_span_n(t, t.len() - k - 1, k, x);
             spans.push(span);
-            basis.push(bspline_basis_funs(t, k, x, span));
+            basis.push(match nu {
+                Some(orders) => bspline_basis_derivative(t, k, x, span, orders[dim]),
+                None => bspline_basis_funs(t, k, x, span),
+            });
         }
         let mut offsets = vec![0_usize; ndim];
         let mut total = 0.0;
@@ -4523,7 +4819,7 @@ impl GridSpline {
                 factor *= basis[dim][offsets[dim]];
                 flat += (spans[dim] - k + offsets[dim]) * strides[dim];
             }
-            total += self.coef[flat] * factor;
+            total += self.coef[flat].value() * factor;
             let mut dim = ndim;
             loop {
                 if dim == 0 {
@@ -4537,6 +4833,86 @@ impl GridSpline {
                 offsets[dim] = 0;
             }
         }
+    }
+
+    /// Differentiate coefficients before evaluating the reduced-degree spline. Summing
+    /// alternating high-derivative basis weights loses the derivative of a constant field
+    /// to cancellation. Local coefficient differences retain that exact-zero invariant and
+    /// need only the same `(k+1)^ndim` support as value evaluation, not a full-grid copy.
+    fn eval_derivative(&self, xi: &[f64], strides: &[usize], nu: &[usize]) -> f64 {
+        let k = self.k;
+        if nu.iter().any(|&order| order > k) {
+            return 0.0;
+        }
+        let ndim = self.knots.len();
+        let spans: Vec<_> = self
+            .knots
+            .iter()
+            .zip(xi)
+            .map(|(t, &x)| BSpline::find_span_n(t, t.len() - k - 1, k, x))
+            .collect();
+        let mut shape = vec![k + 1; ndim];
+        let mut local = Vec::new();
+        let mut index = vec![0; ndim];
+        loop {
+            let flat: usize = (0..ndim)
+                .map(|d| (spans[d] - k + index[d]) * strides[d])
+                .sum();
+            local.push(self.coef[flat]);
+            let mut dim = ndim;
+            while dim > 0 {
+                dim -= 1;
+                index[dim] += 1;
+                if index[dim] <= k {
+                    break;
+                }
+                index[dim] = 0;
+            }
+            if dim == 0 && index[0] == 0 {
+                break;
+            }
+        }
+        // Differentiate every axis before any interpolation contraction: otherwise an
+        // earlier contraction's rounding can be amplified by a later derivative.
+        for dim in 0..ndim {
+            let stride: usize = shape[dim + 1..].iter().product();
+            let start = spans[dim] - k;
+            let t = &self.knots[dim];
+            for order in 1..=nu[dim] {
+                let width = shape[dim];
+                let mut next = Vec::with_capacity(local.len() / width * (width - 1));
+                for block in local.chunks_exact(width * stride) {
+                    for j in 0..width - 1 {
+                        let denominator = GridFloat::from(t[start + j + k + 1])
+                            .sub(GridFloat::from(t[start + j + order]));
+                        for offset in 0..stride {
+                            next.push(
+                                block[(j + 1) * stride + offset]
+                                    .sub(block[j * stride + offset])
+                                    .mul(GridFloat::from((k - order + 1) as f64))
+                                    .div(denominator),
+                            );
+                        }
+                    }
+                }
+                local = next;
+                shape[dim] -= 1;
+            }
+        }
+        // Contract the last axis first to keep each remaining fiber contiguous.
+        for dim in (0..ndim).rev() {
+            let basis = grid_basis_funs(&self.knots[dim], k - nu[dim], xi[dim], spans[dim]);
+            local = local
+                .chunks_exact(shape[dim])
+                .map(|fiber| {
+                    fiber
+                        .iter()
+                        .zip(basis)
+                        .fold(GridFloat::default(), |s, (&c, b)| s.add(c.mul(b)))
+                })
+                .collect();
+        }
+        local[0].value()
     }
 }
 
@@ -15237,6 +15613,195 @@ mod tests {
     }
 
     #[test]
+    fn regular_grid_descending_axes_preserve_physical_coordinates() {
+        // scipy accepts each axis in either direction and reverses the corresponding value
+        // dimension. Unequal axis lengths expose reversals using the wrong row-major stride.
+        let ascending = vec![
+            vec![-2.0, -0.5, 0.0, 1.0, 2.0, 4.0],
+            vec![-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0],
+            vec![-3.0, -1.0, 0.0, 0.25, 1.0, 2.0, 4.0, 5.0],
+        ];
+        let field = |x: f64, y: f64, z: f64| x * y + 3.0 * y * z - 2.0 * x + 7.0;
+        for mask in 0..8 {
+            let mut points = ascending.clone();
+            for (dim, axis) in points.iter_mut().enumerate() {
+                if mask & (1 << dim) != 0 {
+                    axis.reverse();
+                }
+            }
+            let mut values = Vec::new();
+            for &x in &points[0] {
+                for &y in &points[1] {
+                    for &z in &points[2] {
+                        values.push(field(x, y, z));
+                    }
+                }
+            }
+            for method in [
+                RegularGridMethod::Linear,
+                RegularGridMethod::Nearest,
+                RegularGridMethod::Slinear,
+                RegularGridMethod::Pchip,
+                RegularGridMethod::Cubic,
+                RegularGridMethod::Quintic,
+            ] {
+                let rgi = RegularGridInterpolator::new(
+                    points.clone(),
+                    values.clone(),
+                    method,
+                    false,
+                    None,
+                )
+                .expect("ascending and descending axes");
+                let queries = vec![
+                    vec![-1.25, 0.75, 0.125],
+                    vec![1.5, 1.5, 3.0],
+                    vec![4.0, 3.0, 5.0],
+                    vec![4.5, 3.25, 5.5],
+                ];
+                let batch = rgi.eval_many(&queries).expect("batch");
+                for (i, q) in queries.iter().enumerate() {
+                    // At a nearest-neighbor tie scipy selects the lower physical coordinate,
+                    // even when the input axis was descending.
+                    let nearest = [
+                        [-2.0, 0.5, 0.0],
+                        [1.0, 1.0, 2.0],
+                        [4.0, 3.0, 5.0],
+                        [4.0, 3.0, 5.0],
+                    ];
+                    let want = if method == RegularGridMethod::Nearest {
+                        field(nearest[i][0], nearest[i][1], nearest[i][2])
+                    } else {
+                        field(q[0], q[1], q[2])
+                    };
+                    let got = rgi.eval(q).expect("scalar");
+                    assert_eq!(got.to_bits(), batch[i].to_bits());
+                    assert!(
+                        (got - want).abs() <= 2e-11,
+                        "{method:?} mask {mask} query {q:?}: {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regular_grid_singleton_axes_interpolate_and_extrapolate() {
+        // A dimension of length one is constant when fill_value=None; it still participates
+        // in bounds checks and in applying the fill value. Exercise the 2-D/3-D fast paths,
+        // the generic path, and both locations of the varying axis.
+        for varying_dim in 0..4 {
+            let mut points = vec![vec![2.0]; 4];
+            points[varying_dim] = vec![3.0, 1.0, -1.0];
+            for ndim in varying_dim + 1..=4 {
+                let grid = points[..ndim].to_vec();
+                for method in [RegularGridMethod::Linear, RegularGridMethod::Nearest] {
+                    let rgi = RegularGridInterpolator::new(
+                        grid.clone(),
+                        vec![30.0, 10.0, -10.0],
+                        method,
+                        false,
+                        None,
+                    )
+                    .expect("singleton axes");
+                    for (x, linear, nearest) in [
+                        (-2.0, -20.0, -10.0),
+                        (0.0, 0.0, -10.0),
+                        (2.0, 20.0, 10.0),
+                        (4.0, 40.0, 30.0),
+                    ] {
+                        let mut q = vec![f64::INFINITY; ndim];
+                        q[varying_dim] = x;
+                        let want = if method == RegularGridMethod::Linear {
+                            linear
+                        } else {
+                            nearest
+                        };
+                        assert_eq!(rgi.eval(&q).unwrap(), want, "{grid:?} {method:?}");
+                        assert_eq!(rgi.eval_many(&[q]).unwrap(), vec![want]);
+                    }
+                    if method == RegularGridMethod::Nearest {
+                        for (x, want) in [(f64::NEG_INFINITY, -10.0), (f64::INFINITY, 30.0)] {
+                            let mut q = vec![2.0; ndim];
+                            q[varying_dim] = x;
+                            assert_eq!(rgi.eval(&q).unwrap(), want);
+                            assert_eq!(rgi.eval_many(&[q]).unwrap(), vec![want]);
+                        }
+                    }
+                    let filled = RegularGridInterpolator::new(
+                        grid.clone(),
+                        vec![30.0, 10.0, -10.0],
+                        method,
+                        false,
+                        Some(99.0),
+                    )
+                    .unwrap();
+                    let strict = RegularGridInterpolator::new(
+                        grid.clone(),
+                        vec![30.0, 10.0, -10.0],
+                        method,
+                        true,
+                        None,
+                    )
+                    .unwrap();
+                    let mut q = vec![2.0; ndim];
+                    q[varying_dim] = 1.0;
+                    assert_eq!(filled.eval(&q).unwrap(), 10.0);
+                    assert_eq!(strict.eval(&q).unwrap(), 10.0);
+                    q[0] = f64::INFINITY;
+                    assert_eq!(filled.eval(&q).unwrap(), 99.0);
+                    assert!(matches!(
+                        strict.eval(&q),
+                        Err(InterpError::OutOfBounds { .. })
+                    ));
+                    q[0] = f64::NAN;
+                    assert!(filled.eval(&q).unwrap().is_nan());
+                    assert!(matches!(
+                        strict.eval(&q),
+                        Err(InterpError::OutOfBounds { .. })
+                    ));
+                }
+            }
+        }
+        // Corner enumeration must depend on non-singleton axes, not on ndim: this has one
+        // value, not 2^70 corners, and must neither overflow a bit shift nor duplicate it.
+        for ndim in [1, 2, 3, 70] {
+            for method in [RegularGridMethod::Linear, RegularGridMethod::Nearest] {
+                let rgi = RegularGridInterpolator::new(
+                    vec![vec![2.0]; ndim],
+                    vec![7.0],
+                    method,
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(rgi.eval(&vec![f64::INFINITY; ndim]).unwrap(), 7.0);
+                assert_eq!(rgi.eval(&vec![2.0; ndim]).unwrap(), 7.0);
+                assert!(rgi.eval(&vec![f64::NAN; ndim]).unwrap().is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn regular_grid_rejects_empty_repeated_and_nonmonotone_axes() {
+        for axis in [vec![], vec![1.0, 1.0], vec![2.0, 0.0, 1.0]] {
+            for method in [RegularGridMethod::Linear, RegularGridMethod::Nearest] {
+                assert!(
+                    RegularGridInterpolator::new(
+                        vec![axis.clone()],
+                        vec![0.0; axis.len()],
+                        method,
+                        false,
+                        None,
+                    )
+                    .is_err(),
+                    "{axis:?} {method:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn regular_grid_extrapolates_when_fill_value_none() {
         let points = vec![vec![0.0, 1.0]];
         let values = vec![0.0, 1.0];
@@ -15578,6 +16143,247 @@ mod tests {
         .expect_err("NaN value");
         assert!(
             matches!(err, InterpError::InvalidArgument { detail } if detail == "RHS must contain only finite numbers")
+        );
+    }
+
+    #[test]
+    fn regular_grid_spline_partials_reproduce_polynomial_derivatives() {
+        let points = vec![
+            vec![1.5, 1.1, 0.7, 0.2, -0.25, -0.8, -1.25],
+            vec![-1.2, -0.8, -0.1, 0.4, 0.9, 1.5],
+        ];
+        // Independently differentiate polynomial monomials, rather than finite-differencing
+        // the implementation. A descending first axis must not flip derivative signs.
+        let polynomial = |terms: &[(f64, usize, usize)], x: f64, y: f64, nu: [usize; 2]| {
+            terms.iter().fold(0.0, |total, &(c, px, py)| {
+                if nu[0] > px || nu[1] > py {
+                    return total;
+                }
+                let cx = (0..nu[0]).fold(c, |a, j| a * (px - j) as f64);
+                let cy = (0..nu[1]).fold(cx, |a, j| a * (py - j) as f64);
+                total + cy * x.powi((px - nu[0]) as i32) * y.powi((py - nu[1]) as i32)
+            })
+        };
+        let families: [(RegularGridMethod, usize, &[(f64, usize, usize)]); 3] = [
+            (
+                RegularGridMethod::Slinear,
+                1,
+                &[(3.0, 1, 1), (2.0, 1, 0), (-1.0, 0, 1), (5.0, 0, 0)],
+            ),
+            (
+                RegularGridMethod::Cubic,
+                3,
+                &[(1.0, 3, 2), (2.0, 1, 1), (1.0, 0, 3), (-4.0, 1, 0)],
+            ),
+            (
+                RegularGridMethod::Quintic,
+                5,
+                &[(1.0, 5, 3), (-2.0, 2, 1), (3.0, 0, 5)],
+            ),
+        ];
+        for (method, degree, terms) in families {
+            let mut values = Vec::new();
+            for &x in &points[0] {
+                for &y in &points[1] {
+                    values.push(polynomial(terms, x, y, [0, 0]));
+                }
+            }
+            let rgi = RegularGridInterpolator::new(points.clone(), values, method, false, None)
+                .expect("polynomial grid");
+            let queries = vec![
+                vec![-1.4, -1.6],
+                vec![-1.25, -1.2],
+                vec![0.12, 0.16],
+                vec![1.5, 1.5],
+                vec![1.7, 1.6],
+            ];
+            for nu in [
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [1, 1],
+                [2, 0],
+                [0, 2],
+                [2, 1],
+                [degree, 0],
+                [degree, degree.min(3)],
+                [degree + 1, 0],
+                [usize::MAX, 0],
+                [0, usize::MAX],
+            ] {
+                let batch = rgi.eval_derivative_many(&queries, &nu).expect("partials");
+                for (q, &got) in queries.iter().zip(&batch) {
+                    let want = polynomial(terms, q[0], q[1], nu);
+                    assert!(
+                        (got - want).abs() <= 3e-10 * want.abs().max(1.0),
+                        "{method:?} nu={nu:?} q={q:?}: {got} vs {want}"
+                    );
+                    assert_eq!(
+                        rgi.eval_derivative(q, &nu).unwrap().to_bits(),
+                        got.to_bits()
+                    );
+                    if nu == [0, 0] {
+                        assert_eq!(rgi.eval(q).unwrap().to_bits(), got.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regular_grid_spline_derivative_constant_and_wrong_order_controls() {
+        let points = vec![
+            vec![-1.0, -0.85, -0.6, -0.1, 0.3, 0.65, 0.9, 1.2, 1.5, 1.75, 2.0],
+            vec![0.0, 0.15, 0.55, 0.9, 1.4, 1.85, 2.5],
+        ];
+        let rgi = RegularGridInterpolator::new(
+            points,
+            vec![3.0; 11 * 7],
+            RegularGridMethod::Quintic,
+            false,
+            None,
+        )
+        .unwrap();
+        let queries = vec![vec![-1.2, -0.3], vec![0.37, 1.13], vec![2.2, 2.8]];
+        for nu in [[1, 1], [5, 0], [0, 5], [5, 5]] {
+            for value in rgi.eval_derivative_many(&queries, &nu).unwrap() {
+                assert!(value.abs() < 1e-18, "constant grid nu={nu:?}: {value}");
+            }
+        }
+        // Isolate evaluation from coefficient construction. Every derivative of exactly
+        // constant coefficients must be exactly zero, even on irregular extrapolated grids.
+        // A direct alternating derivative-basis sum loses this invariant by up to 1e-10.
+        let mut spline = rgi.spline.clone().unwrap();
+        spline.coef.fill(GridFloat::from(3.0));
+        for query in &queries {
+            for nu in [[1, 1], [5, 0], [0, 5], [5, 5]] {
+                assert_eq!(spline.eval(query, &rgi.strides, Some(&nu)), 0.0);
+            }
+        }
+        // All samples of this dyadic polynomial are exactly representable. Returning the
+        // value, a lower derivative, or zero must fail the independently known 720 result.
+        let axis: Vec<f64> = vec![-1.0, -0.5, 0.0, 0.5, 1.0, 1.5];
+        let values = axis
+            .iter()
+            .flat_map(|&x| axis.iter().map(move |&y| x.powi(5) * y.powi(3)))
+            .collect();
+        let polynomial = RegularGridInterpolator::new(
+            vec![axis.clone(), axis],
+            values,
+            RegularGridMethod::Quintic,
+            false,
+            None,
+        )
+        .unwrap();
+        let query = [0.25, 0.75];
+        let derivative = polynomial.eval_derivative(&query, &[5, 3]).unwrap();
+        assert!((derivative - 720.0).abs() < 1e-12, "{derivative}");
+        assert!((polynomial.eval(&query).unwrap() - 720.0).abs() > 700.0);
+        assert!((polynomial.eval_derivative(&query, &[4, 3]).unwrap() - 720.0).abs() > 500.0);
+    }
+
+    #[test]
+    fn regular_grid_spline_partials_validate_methods_shapes_and_bounds() {
+        let axis: Vec<f64> = (0..6).map(f64::from).collect();
+        let values: Vec<f64> = axis.iter().map(|&x| x * x * x).collect();
+        for method in [
+            RegularGridMethod::Slinear,
+            RegularGridMethod::Cubic,
+            RegularGridMethod::Quintic,
+        ] {
+            let make = |bounds_error, fill_value| {
+                RegularGridInterpolator::new(
+                    vec![axis.clone()],
+                    values.clone(),
+                    method,
+                    bounds_error,
+                    fill_value,
+                )
+                .unwrap()
+            };
+            let rgi = make(false, Some(42.0));
+            assert!(rgi.eval_derivative(&[1.0], &[]).is_err());
+            assert!(rgi.eval_derivative(&[1.0], &[1, 0]).is_err());
+            assert!(rgi.eval_derivative(&[], &[1]).is_err());
+            assert!(rgi.eval_derivative_many(&[vec![]], &[1]).is_err());
+            assert!(rgi.eval_derivative_many(&[], &[]).is_err());
+            assert!(rgi.eval_derivative_many(&[], &[1]).unwrap().is_empty());
+            for nu in [[1], [10]] {
+                assert_eq!(rgi.eval_derivative(&[6.0], &nu).unwrap(), 42.0);
+                assert!(rgi.eval_derivative(&[f64::NAN], &nu).unwrap().is_nan());
+                let strict = make(true, None);
+                assert!(matches!(
+                    strict.eval_derivative(&[6.0], &nu),
+                    Err(InterpError::OutOfBounds { .. })
+                ));
+                assert!(matches!(
+                    strict.eval_derivative_many(&[vec![1.0], vec![f64::NAN]], &nu),
+                    Err(InterpError::OutOfBounds { .. })
+                ));
+            }
+        }
+        for method in [
+            RegularGridMethod::Linear,
+            RegularGridMethod::Nearest,
+            RegularGridMethod::Pchip,
+        ] {
+            let rgi = RegularGridInterpolator::new(
+                vec![axis.clone()],
+                values.clone(),
+                method,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(rgi.eval_derivative(&[1.0], &[0]).is_err());
+            assert!(rgi.eval_derivative(&[1.0], &[1]).is_err());
+            assert!(rgi.eval_derivative_many(&[], &[1]).is_err());
+        }
+    }
+
+    #[test]
+    fn regular_grid_spline_partials_follow_scipy_at_infinite_coordinates() {
+        // scipy 1.17.1 with solver=spsolve: a highest-order derivative is constant even at
+        // infinity, and an order above the degree is zero. Other infinite-coordinate basis
+        // values remain NaN: a zero derivative on a different axis must not hide that NaN.
+        let axis = vec![0.0, 1.0, 2.0, 3.0];
+        let cubic = RegularGridInterpolator::new(
+            vec![axis.clone()],
+            vec![0.0, 1.0, 8.0, 27.0],
+            RegularGridMethod::Cubic,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!((cubic.eval_derivative(&[f64::INFINITY], &[3]).unwrap() - 6.0).abs() < 1e-13);
+        assert_eq!(cubic.eval_derivative(&[f64::INFINITY], &[4]).unwrap(), 0.0);
+        assert!(
+            cubic
+                .eval_derivative(&[f64::INFINITY], &[1])
+                .unwrap()
+                .is_nan()
+        );
+        let values = axis
+            .iter()
+            .flat_map(|&x| axis.iter().map(move |&y| x * x * x + y * y * y))
+            .collect();
+        let grid = RegularGridInterpolator::new(
+            vec![axis.clone(), axis],
+            values,
+            RegularGridMethod::Cubic,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            grid.eval_derivative(&[f64::INFINITY, 2.0], &[4, 0])
+                .unwrap(),
+            0.0
+        );
+        assert!(
+            grid.eval_derivative(&[2.0, f64::INFINITY], &[4, 0])
+                .unwrap()
+                .is_nan()
         );
     }
 
