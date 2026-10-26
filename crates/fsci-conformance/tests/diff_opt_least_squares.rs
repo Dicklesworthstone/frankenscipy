@@ -5,7 +5,8 @@
 //! squares against scipy.optimize.least_squares(method='lm') on 5
 //! residual problems: exponential decay parameter fit, Gaussian peak
 //! fit, circle-from-points fit, sine-curve parameter fit, and a simple
-//! linear residual baseline.
+//! linear residual baseline. Both two-point and three-point numerical Jacobians
+//! exercise the same problems against the live oracle.
 //!
 //! Pass criteria: (1) both solvers converge, AND (2) the cost
 //! 0.5||r(x*)||² agrees within rel 1e-4 (both should find the same
@@ -21,7 +22,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::{LeastSquaresMethod, LeastSquaresOptions, least_squares};
+use fsci_opt::{FiniteDiffMethod, LeastSquaresMethod, LeastSquaresOptions, least_squares};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -45,6 +46,7 @@ struct CasePoint {
 #[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     points: Vec<CasePoint>,
+    three_point: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,7 +167,7 @@ fn residuals_for(case: &CasePoint, params: &[f64]) -> Vec<f64> {
     }
 }
 
-fn build_query() -> OracleQuery {
+fn build_query(three_point: bool) -> OracleQuery {
     let mut pts = Vec::new();
 
     // 1. Exponential decay: y = 2.5 * exp(-0.8 * x), 20 points
@@ -247,7 +249,10 @@ fn build_query() -> OracleQuery {
         });
     }
 
-    OracleQuery { points: pts }
+    OracleQuery {
+        points: pts,
+        three_point,
+    }
 }
 
 fn scipy_oracle_or_skip(q: &OracleQuery) -> Option<OracleResult> {
@@ -283,7 +288,8 @@ for c in q["points"]:
         xs = np.array(c["xs"], dtype=float)
         ys = np.array(c["ys"], dtype=float)
         f = res_fn(c["kind"], xs, ys)
-        result = least_squares(f, np.array(c["x0"], dtype=float), method='lm')
+        result = least_squares(f, np.array(c["x0"], dtype=float), method='lm',
+                               jac='3-point' if q['three_point'] else '2-point')
         cost = float(0.5 * np.sum(result.fun ** 2))
         if not np.all(np.isfinite(result.x)) or not math.isfinite(cost):
             out.append({"case_id": cid, "converged": False, "x": None, "cost": None})
@@ -347,7 +353,22 @@ print(json.dumps({"points": out}))
 
 #[test]
 fn diff_opt_least_squares() {
-    let query = build_query();
+    compare_lm(FiniteDiffMethod::TwoPoint);
+}
+
+#[test]
+fn diff_opt_least_squares_lm_three_point() {
+    compare_lm(FiniteDiffMethod::ThreePoint);
+}
+
+fn compare_lm(diff_method: FiniteDiffMethod) {
+    let three_point = diff_method == FiniteDiffMethod::ThreePoint;
+    let test_id = if three_point {
+        "diff_opt_least_squares_lm_three_point"
+    } else {
+        "diff_opt_least_squares"
+    };
+    let query = build_query(three_point);
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
@@ -355,7 +376,7 @@ fn diff_opt_least_squares() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
-    let mut ledger = CompareLedger::new("diff_opt_least_squares", &["least_squares"]);
+    let mut ledger = CompareLedger::new(test_id, &["least_squares"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
@@ -369,6 +390,7 @@ fn diff_opt_least_squares() {
         // The oracle runs method='lm'; least_squares' default is SciPy's 'trf'.
         let lm = LeastSquaresOptions {
             method: Some(LeastSquaresMethod::Lm),
+            diff_method,
             ..LeastSquaresOptions::default()
         };
         let result = least_squares(f, &case.x0, lm);
@@ -431,8 +453,8 @@ fn diff_opt_least_squares() {
 
     let all_pass = diffs.iter().all(|d| d.pass);
     let log = DiffLog {
-        test_id: "diff_opt_least_squares".into(),
-        category: "fsci_opt::least_squares vs scipy.optimize.least_squares(method=lm)".into(),
+        test_id: test_id.into(),
+        category: format!("least_squares(method=lm, jac={diff_method:?}) vs SciPy"),
         case_count: diffs.len(),
         compared: ledger.counts().clone(),
         pass: all_pass,

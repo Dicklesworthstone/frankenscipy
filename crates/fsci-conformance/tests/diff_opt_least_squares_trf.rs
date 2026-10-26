@@ -3,7 +3,7 @@
 //! Reflective and rectangular Dogbox methods (frankenscipy-1ksfv.6): Rosenbrock with and without a bound, an
 //! exponential fit with outliers under bounds and under each robust loss (soft_l1, huber,
 //! cauchy, arctan), `x_scale='jac'` on a badly scaled problem, an underdetermined system, a
-//! `max_nfev` stop, and a box with both bounds active.
+//! `max_nfev` stop, a box with both bounds active, and bound-aware three-point Jacobians.
 //!
 //! Per case the status and `active_mask` must match SciPy's, `x` must agree to `X_REL_TOL`
 //! (relative to max(|x|, 1e-6)) and the cost to `COST_REL_TOL`. The port follows SciPy's
@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
-    LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, LossKind, XScale, least_squares,
-    least_squares_bounded,
+    FiniteDiffMethod, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, LossKind,
+    XScale, least_squares, least_squares_bounded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,8 @@ struct Case {
     x_scale_jac: bool,
     x_scale_fixed: Option<Vec<f64>>,
     analytic_jac: bool,
+    three_point: bool,
+    diff_step: Option<f64>,
     max_nfev: Option<usize>,
 }
 
@@ -58,6 +60,8 @@ fn case(id: &str, x0: &[f64]) -> Case {
         x_scale_jac: false,
         x_scale_fixed: None,
         analytic_jac: false,
+        three_point: false,
+        diff_step: None,
         max_nfev: None,
     }
 }
@@ -121,6 +125,36 @@ fn cases() -> Vec<Case> {
     );
     analytic_bounds.analytic_jac = true;
     cases.push(analytic_bounds);
+    let mut three_point = vec![
+        case("rosen_three_point", &[-1.2, 1.0]),
+        bounded(
+            "rosen_three_point_bound_start",
+            &[2.0, 1.5],
+            &[-inf, 1.5],
+            &[inf, inf],
+        ),
+        with_loss(case("exp_three_point_soft_l1", &[1.0, 1.0]), "soft_l1", 0.1),
+        with_loss(
+            bounded(
+                "exp_three_point_active_bound",
+                &[1.0, 0.5],
+                &[0.0, 0.5],
+                &[10.0, 5.0],
+            ),
+            "soft_l1",
+            0.1,
+        ),
+    ];
+    let mut scaled_three_point = case("xscale_three_point", &[1.0, 1e-6]);
+    scaled_three_point.x_scale_fixed = Some(vec![1.0, 1e-6]);
+    three_point.push(scaled_three_point);
+    let mut custom_step = case("exp_three_point_custom_step", &[1.0, 1.0]);
+    custom_step.diff_step = Some(1e-5);
+    three_point.push(custom_step);
+    for mut case in three_point {
+        case.three_point = true;
+        cases.push(case);
+    }
     cases
 }
 
@@ -260,6 +294,10 @@ for case in json.load(sys.stdin):
             kw["x_scale"] = np.array(case["x_scale_fixed"])
         if case["analytic_jac"]:
             kw["jac"] = jacobian(case["case_id"])
+        elif case["three_point"]:
+            kw["jac"] = "3-point"
+        if case["diff_step"] is not None:
+            kw["diff_step"] = case["diff_step"]
         if case["max_nfev"] is not None:
             kw["max_nfev"] = case["max_nfev"]
         if case["lb"] is not None:
@@ -372,6 +410,12 @@ fn compare_method(method: &str) {
                 .map(XScale::Fixed)
                 .or_else(|| case.x_scale_jac.then_some(XScale::Jac)),
             jac: analytic_jac,
+            diff_method: if case.three_point {
+                FiniteDiffMethod::ThreePoint
+            } else {
+                FiniteDiffMethod::TwoPoint
+            },
+            diff_step: case.diff_step,
             max_nfev: case.max_nfev,
             ..LeastSquaresOptions::default()
         };
