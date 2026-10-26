@@ -229,7 +229,7 @@ fn diff_ndimage_affine_transform_properties() {
             (
                 3,
                 BoundaryMode::Reflect,
-                1.0e-4,
+                ABS_TOL,
                 [
                     -6.370564537739e+00,
                     3.221833936293e-01,

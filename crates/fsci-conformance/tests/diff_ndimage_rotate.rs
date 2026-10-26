@@ -346,27 +346,6 @@ fn diff_ndimage_rotate() {
                 max_abs = max_abs.max((a - e).abs());
             }
             let pass = max_abs <= ABS_TOL;
-            // frankenscipy-q74y3: order >= 2 under reflect is ~1e-5 off SciPy at 30/45 degrees.
-            // Only that signature is allowlisted, and only while it fails and stays below 1e-4:
-            // anything larger or different is a compared failure. Once fixed, these cases
-            // count as compared again with no edit here.
-            if !pass && case.order >= 2 && case.mode == "reflect" && max_abs < 1e-4 {
-                ledger.allowlisted(
-                    "rotate",
-                    &case.case_id,
-                    "frankenscipy-q74y3",
-                    "order >= 2 reflect differs from SciPy by ~1e-5 at non-cardinal angles",
-                );
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    rows,
-                    cols,
-                    max_abs_diff: max_abs,
-                    pass: true,
-                    note: "allowlisted under frankenscipy-q74y3".into(),
-                });
-                continue;
-            }
             ledger.compared("rotate", &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
