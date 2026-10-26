@@ -7,6 +7,7 @@
 use fsci_runtime::RuntimeMode;
 use std::sync::Arc;
 
+use crate::FiniteDiffMethod;
 use crate::trf::{self, Loss, LossKind, XScale};
 use crate::types::OptError;
 
@@ -125,8 +126,13 @@ pub struct LeastSquaresOptions {
     pub ftol: f64,
     /// Maximum number of function evaluations.
     pub max_nfev: Option<usize>,
-    /// Relative finite-difference step; `None` is SciPy's default
-    /// `√ε·sign(x)·max(1, |x|)`.
+    /// Numerical Jacobian scheme, used when `jac` is absent. `ThreePoint` uses
+    /// central differences away from bounds and second-order one-sided differences
+    /// near a bound. Applies to `Trf`, `Dogbox`, and `Lm`.
+    pub diff_method: FiniteDiffMethod,
+    /// Relative finite-difference step. For `Trf`/`Dogbox` and three-point `Lm`,
+    /// `None` selects SciPy's `ε^(1/2)` (two-point) or `ε^(1/3)` (three-point)
+    /// relative step. Two-point `Lm` retains its `√ε·(1 + |x|)` step.
     pub diff_step: Option<f64>,
     /// Optional analytic Jacobian of the residuals. Numerical differences are used
     /// when absent. Analytic calls contribute to `njev`, not `nfev`.
@@ -151,6 +157,7 @@ impl Default for LeastSquaresOptions {
             xtol: 1.0e-8,
             ftol: 1.0e-8,
             max_nfev: None,
+            diff_method: FiniteDiffMethod::TwoPoint,
             diff_step: None,
             jac: None,
             loss: LossKind::Linear,
@@ -326,15 +333,7 @@ where
     let mut cost = 0.5 * dot_vec(&r, &r);
     let mut jac = Vec::new();
     let mut x_perturbed = x.clone();
-    nfev += lm_jacobian_into(
-        &residuals,
-        &x,
-        &r,
-        diff_step,
-        options.jac.as_ref(),
-        &mut jac,
-        &mut x_perturbed,
-    )?;
+    nfev += lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
     njev += 1;
     // J^T J (O(n²·m)) and J^T r depend only on (jac, r), which change ONLY on an accepted
     // step. Cache them and recompute only when jac/r change, rather than rebuilding both at
@@ -453,15 +452,8 @@ where
                 // Check cost convergence
                 let cost_change = (old_cost - cost) / (1.0 + cost);
                 if cost_change.abs() <= options.ftol {
-                    nfev += lm_jacobian_into(
-                        &residuals,
-                        &x,
-                        &r,
-                        diff_step,
-                        options.jac.as_ref(),
-                        &mut jac,
-                        &mut x_perturbed,
-                    )?;
+                    nfev +=
+                        lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
                     njev += 1;
                     // status 2: |Δcost|/(1+cost) ≤ ftol after an accepted step (rho > 0.25)
                     return Ok(lm_result(
@@ -478,15 +470,7 @@ where
                 }
 
                 // Recompute Jacobian (and the derived J^T J / J^T r) — jac and r changed.
-                nfev += lm_jacobian_into(
-                    &residuals,
-                    &x,
-                    &r,
-                    diff_step,
-                    options.jac.as_ref(),
-                    &mut jac,
-                    &mut x_perturbed,
-                )?;
+                nfev += lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
                 njev += 1;
                 jtj_matrix_into(&jac, &mut jtj);
                 jt_vec_into(&jac, &r, &mut jtr);
@@ -533,7 +517,7 @@ where
     ))
 }
 
-/// SciPy's `approx_derivative(fun, x, method='2-point', rel_step, f0, bounds)` as
+/// SciPy's dense two-/three-point `approx_derivative(fun, x, rel_step, f0, bounds)` as
 /// `least_squares`' `VectorFunction` calls it.
 fn fd_jacobian_scipy<F>(
     residuals: &F,
@@ -541,6 +525,7 @@ fn fd_jacobian_scipy<F>(
     f0: &[f64],
     lb: &[f64],
     ub: &[f64],
+    method: FiniteDiffMethod,
     rel_step: Option<f64>,
 ) -> Result<Vec<Vec<f64>>, OptError>
 where
@@ -551,9 +536,11 @@ where
         lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY);
     let mut columns = Vec::with_capacity(n);
     let mut x1 = x.to_vec();
+    let mut x2 = x.to_vec();
+    let relative_epsilon = method.rel_eps();
     for i in 0..n {
         let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
-        let default_step = SQRT_EPS * sign * x[i].abs().max(1.0);
+        let default_step = relative_epsilon * sign * x[i].abs().max(1.0);
         let mut h = match rel_step {
             None => default_step,
             Some(r) => {
@@ -565,37 +552,68 @@ where
                 }
             }
         };
+        let mut one_sided = method == FiniteDiffMethod::TwoPoint;
+        if method == FiniteDiffMethod::ThreePoint {
+            h = h.abs();
+        }
         if !unbounded {
             let lower = x[i] - lb[i];
             let upper = ub[i] - x[i];
-            let trial = x[i] + h;
-            let violated = trial < lb[i] || trial > ub[i];
-            let fitting = h.abs() <= lower.max(upper);
-            if violated && fitting {
-                h = -h;
-            } else if !fitting {
-                h = if upper >= lower { upper } else { -lower };
+            if method == FiniteDiffMethod::TwoPoint {
+                let trial = x[i] + h;
+                let violated = trial < lb[i] || trial > ub[i];
+                let fitting = h.abs() <= lower.max(upper);
+                if violated && fitting {
+                    h = -h;
+                } else if !fitting {
+                    h = if upper >= lower { upper } else { -lower };
+                }
+            } else if lower < h || upper < h {
+                // A three-point one-sided stencil needs two steps into the box.
+                // If shortening that step also permits a central stencil, use
+                // the latter: it avoids cancellation in -3*f0 + 4*f1 - f2.
+                h = if upper >= lower {
+                    h.min(0.5 * upper)
+                } else {
+                    -h.min(0.5 * lower)
+                };
+                one_sided = true;
+                if h.abs() <= lower.min(upper) {
+                    h = lower.min(upper);
+                    one_sided = false;
+                }
             }
         }
-        x1[i] = x[i] + h;
-        let dx = x1[i] - x[i];
+        x1[i] = if one_sided { x[i] + h } else { x[i] - h };
         let f1 = residuals(&x1);
+        check_jacobian_residual_shape(&f1, f0.len())?;
+        let column: Vec<f64> = if method == FiniteDiffMethod::TwoPoint {
+            let dx = x1[i] - x[i];
+            f1.iter().zip(f0).map(|(a, b)| (a - b) / dx).collect()
+        } else {
+            x2[i] = if one_sided { x[i] + 2.0 * h } else { x[i] + h };
+            let f2 = residuals(&x2);
+            check_jacobian_residual_shape(&f2, f0.len())?;
+            let dx = if one_sided {
+                x2[i] - x[i]
+            } else {
+                x2[i] - x1[i]
+            };
+            f0.iter()
+                .zip(&f1)
+                .zip(&f2)
+                .map(|((f0, f1), f2)| {
+                    if one_sided {
+                        (-3.0 * f0 + 4.0 * f1 - f2) / dx
+                    } else {
+                        (f2 - f1) / dx
+                    }
+                })
+                .collect()
+        };
         x1[i] = x[i];
-        if f1.len() != f0.len() {
-            return Err(OptError::InvalidArgument {
-                detail: format!(
-                    "residuals changed length from {} to {} during Jacobian evaluation",
-                    f0.len(),
-                    f1.len()
-                ),
-            });
-        }
-        columns.push(
-            f1.iter()
-                .zip(f0)
-                .map(|(a, b)| (a - b) / dx)
-                .collect::<Vec<f64>>(),
-        );
+        x2[i] = x[i];
+        columns.push(column);
     }
     Ok((0..f0.len())
         .map(|r| columns.iter().map(|col| col[r]).collect())
@@ -607,19 +625,36 @@ fn lm_jacobian_into<F>(
     residuals: &F,
     x: &[f64],
     residual: &[f64],
-    step: f64,
-    analytic: Option<&LeastSquaresJacobian>,
+    options: &LeastSquaresOptions,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
 ) -> Result<usize, OptError>
 where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
-    if let Some(analytic) = analytic {
+    if let Some(analytic) = &options.jac {
         *jac = analytic.evaluate(x, residual.len())?;
         Ok(0)
+    } else if options.diff_method == FiniteDiffMethod::ThreePoint {
+        *jac = fd_jacobian_scipy(
+            residuals,
+            x,
+            residual,
+            &vec![f64::NEG_INFINITY; x.len()],
+            &vec![f64::INFINITY; x.len()],
+            options.diff_method,
+            options.diff_step,
+        )?;
+        Ok(2 * x.len())
     } else {
-        finite_diff_jacobian_parallel_into(residuals, x, residual, step, jac, x_perturbed);
+        finite_diff_jacobian_parallel_into(
+            residuals,
+            x,
+            residual,
+            options.diff_step.unwrap_or(SQRT_EPS),
+            jac,
+            x_perturbed,
+        )?;
         Ok(x.len())
     }
 }
@@ -753,7 +788,15 @@ where
     let m = f0.len();
     let j0 = match &options.jac {
         Some(jac) => jac.evaluate(&x0, m)?,
-        None => fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step)?,
+        None => fd_jacobian_scipy(
+            residuals,
+            &x0,
+            &f0,
+            &lb,
+            &ub,
+            options.diff_method,
+            options.diff_step,
+        )?,
     };
     let loss = (options.loss != LossKind::Linear).then_some(Loss {
         kind: options.loss,
@@ -771,7 +814,15 @@ where
     let mut jac = |x: &[f64], f: &[f64]| -> Result<Vec<Vec<f64>>, OptError> {
         match &options.jac {
             Some(jac) => jac.evaluate(x, m),
-            None => fd_jacobian_scipy(residuals, x, f, &lb, &ub, options.diff_step),
+            None => fd_jacobian_scipy(
+                residuals,
+                x,
+                f,
+                &lb,
+                &ub,
+                options.diff_method,
+                options.diff_step,
+            ),
         }
     };
     let solve = if dogbox { trf::dogbox } else { trf::trf };
@@ -1315,6 +1366,19 @@ fn resize_square(matrix: &mut Vec<Vec<f64>>, n: usize) {
     }
 }
 
+/// Reject a changing residual shape before indexing a numerical Jacobian column.
+fn check_jacobian_residual_shape(residual: &[f64], expected: usize) -> Result<(), OptError> {
+    if residual.len() != expected {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "residuals changed length from {expected} to {} during Jacobian evaluation",
+                residual.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Compute finite-difference Jacobian into fixed-shape scratch.
 fn finite_diff_jacobian_into<F>(
     residuals: &F,
@@ -1323,7 +1387,8 @@ fn finite_diff_jacobian_into<F>(
     eps: f64,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
-) where
+) -> Result<(), OptError>
+where
     F: Fn(&[f64]) -> Vec<f64>,
 {
     let n = x.len();
@@ -1343,10 +1408,12 @@ fn finite_diff_jacobian_into<F>(
         x_perturbed[j] += step;
         let r_plus = residuals(x_perturbed);
         x_perturbed[j] = original; // restore
+        check_jacobian_residual_shape(&r_plus, m)?;
         for i in 0..m {
             jac[i][j] = (r_plus[i] - r0[i]) / step;
         }
     }
+    Ok(())
 }
 
 /// Finite-difference Jacobian with the independent columns evaluated in parallel.
@@ -1368,23 +1435,22 @@ fn finite_diff_jacobian_parallel_into<F>(
     eps: f64,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
-) where
+) -> Result<(), OptError>
+where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     let n = x.len();
     let m = r0.len();
     // Work-gate BEFORE any syscall: below it, the serial routine is faster.
     if n < 4 || m < 8192 || n.saturating_mul(m) < 131_072 {
-        finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
-        return;
+        return finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
     }
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
     let nthreads = cores.min(n);
     if nthreads <= 1 {
-        finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
-        return;
+        return finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
     }
 
     if jac.len() != m {
@@ -1426,12 +1492,14 @@ fn finite_diff_jacobian_parallel_into<F>(
     });
 
     for (j, r_plus, step) in &columns {
+        check_jacobian_residual_shape(r_plus, m)?;
         let step = *step;
         for i in 0..m {
             jac[i][*j] = (r_plus[i] - r0[i]) / step;
         }
     }
     let _ = x_perturbed;
+    Ok(())
 }
 
 /// Compute J^T * J (n x n).
@@ -1723,7 +1791,7 @@ mod tests {
     fn parallel_fd_jacobian_byte_identical_to_serial() {
         // Exercise the parallel path (m >= 8192, n >= 4 clears the work-gate) and
         // prove it produces a bit-for-bit identical Jacobian to the serial routine.
-        let n = 6usize;
+        let n = 16usize;
         let m = 9000usize;
         let params: Vec<f64> = (0..n).map(|k| 0.3 + 0.13 * k as f64).collect();
         let xs: Vec<f64> = (0..m).map(|i| i as f64 * 0.001).collect();
@@ -1749,7 +1817,8 @@ mod tests {
             eps,
             &mut jac_serial,
             &mut scratch_s,
-        );
+        )
+        .expect("serial Jacobian");
 
         let mut jac_par = Vec::new();
         let mut scratch_p = Vec::new();
@@ -1760,7 +1829,8 @@ mod tests {
             eps,
             &mut jac_par,
             &mut scratch_p,
-        );
+        )
+        .expect("parallel Jacobian");
 
         assert_eq!(jac_serial.len(), jac_par.len());
         for (rs, rp) in jac_serial.iter().zip(&jac_par) {
@@ -2157,6 +2227,7 @@ mod tests {
                 &[0.5],
                 LeastSquaresOptions {
                     method: Some(method),
+                    diff_method: FiniteDiffMethod::ThreePoint,
                     jac: Some(LeastSquaresJacobian::new(move |_| {
                         jacobian_count.fetch_add(1, Ordering::Relaxed);
                         slopes.iter().map(|&slope| vec![slope]).collect()
@@ -2313,16 +2384,179 @@ mod tests {
 
     #[test]
     fn least_squares_detects_residual_shape_change_during_differencing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+                for malformed_call in [1, 2] {
+                    let calls = AtomicUsize::new(0);
+                    let result = least_squares(
+                        |x| {
+                            if calls.fetch_add(1, Ordering::Relaxed) == malformed_call {
+                                vec![]
+                            } else {
+                                vec![x[0] - 1.0]
+                            }
+                        },
+                        &[0.0],
+                        LeastSquaresOptions {
+                            method: Some(method),
+                            diff_method,
+                            ..LeastSquaresOptions::default()
+                        },
+                    );
+                    assert!(
+                        matches!(result, Err(OptError::InvalidArgument { .. })),
+                        "{method:?}/{diff_method:?} call {malformed_call}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_parallel_differencing_rejects_shape_change() {
+        // Cross the production parallel threshold; a short column must be an error
+        // even when it was evaluated by a worker rather than the serial path.
+        let result = least_squares(
+            |x| {
+                if x.iter().any(|&value| value != 0.0) {
+                    vec![]
+                } else {
+                    vec![1.0; 8192]
+                }
+            },
+            &[0.0; 16],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn least_squares_three_point_improves_numerical_jacobian_accuracy() {
+        let x = [-0.75_f64, 0.5];
+        let residuals =
+            |x: &[f64]| vec![(1.3 * x[0]).exp() + x[1].sin(), x[0].cos() - (-x[1]).exp()];
+        let exact = [
+            [1.3 * (1.3 * x[0]).exp(), x[1].cos()],
+            [-x[0].sin(), (-x[1]).exp()],
+        ];
         for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
-            let result = least_squares(
-                |x| if x[0] == 0.0 { vec![-1.0] } else { vec![] },
-                &[0.0],
+            let mut errors = Vec::new();
+            for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+                let result = least_squares(
+                    residuals,
+                    &x,
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        diff_method,
+                        max_nfev: Some(1),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("return initial numerical Jacobian");
+                let error = result
+                    .jac
+                    .iter()
+                    .flatten()
+                    .zip(exact.iter().flatten())
+                    .map(|(actual, exact)| (actual - exact).abs())
+                    .fold(0.0_f64, f64::max);
+                errors.push(error);
+            }
+            // Independent analytic derivatives distinguish the requested scheme
+            // from silently continuing to use the two-point implementation.
+            assert!(errors[1] < 2e-10, "{method:?}: {errors:?}");
+            assert!(errors[0] > 1e-9, "two-point control: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn least_squares_three_point_stencils_stay_within_bounds() {
+        use std::sync::Mutex;
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let visited = Mutex::new(Vec::<Vec<f64>>::new());
+            // Exact bounds require one-sided stencils; a narrow interval forces
+            // the nominal cube-root-epsilon step to shrink.
+            let lower = [0.0, 0.0, 1.0 - 1e-7];
+            let upper = [1.0, 1.0, 1.0 + 1e-7];
+            let result = least_squares_bounded(
+                |x| {
+                    assert!((0..3).all(|i| lower[i] <= x[i] && x[i] <= upper[i]));
+                    visited.lock().expect("record stencil").push(x.to_vec());
+                    vec![x[0].exp(), x[1].exp(), x[2].sin()]
+                },
+                &[0.0, 1.0, 1.0],
+                &lower,
+                &upper,
                 LeastSquaresOptions {
                     method: Some(method),
+                    diff_method: FiniteDiffMethod::ThreePoint,
+                    max_nfev: Some(1),
                     ..LeastSquaresOptions::default()
                 },
+            )
+            .expect("three-point Jacobian at a bounded initial point");
+            let visited = visited.lock().expect("inspect stencil");
+            assert_eq!(
+                visited.len(),
+                7,
+                "one base evaluation plus two per variable"
             );
-            assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+            assert!(visited[1][0] > visited[0][0] && visited[2][0] > visited[1][0]);
+            assert!(visited[3][1] < visited[0][1] && visited[4][1] < visited[3][1]);
+            assert!(visited[5][2] < visited[0][2] && visited[6][2] > visited[0][2]);
+            for (i, exact) in [result.x[0].exp(), result.x[1].exp(), result.x[2].cos()]
+                .into_iter()
+                .enumerate()
+            {
+                assert!((result.jac[i][i] - exact).abs() < 2e-9);
+            }
+            assert_eq!(
+                result.nfev, 1,
+                "numerical Jacobian calls are counted separately"
+            );
+            assert_eq!(result.njev, 1);
+        }
+    }
+
+    #[test]
+    fn curve_fit_three_point_nonlinear_fit_all_methods() {
+        let t: Vec<f64> = (0..30).map(|i| f64::from(i) / 10.0).collect();
+        let y: Vec<f64> = t.iter().map(|&t| 2.5 * (-0.7 * t).exp() + 0.3).collect();
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            let options = CurveFitOptions {
+                p0: Some(vec![1.5, 0.4, 0.1]),
+                ls_options: LeastSquaresOptions {
+                    method: Some(method),
+                    diff_method: FiniteDiffMethod::ThreePoint,
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            };
+            let model = |t: f64, p: &[f64]| p[0] * (-p[1] * t).exp() + p[2];
+            let fit = curve_fit(model, &t, &y, options.clone()).expect("unbounded three-point fit");
+            for (actual, expected) in fit.popt.iter().zip([2.5, 0.7, 0.3]) {
+                assert!((actual - expected).abs() < 5e-6, "{method:?}: {fit:?}");
+            }
+            if method != LeastSquaresMethod::Lm {
+                let bounded =
+                    curve_fit_bounded(model, &t, &y, &[0.0, 0.0, 0.0], &[5.0, 2.0, 1.0], options)
+                        .expect("bounded three-point fit");
+                for (actual, expected) in bounded.popt.iter().zip([2.5, 0.7, 0.3]) {
+                    assert!((actual - expected).abs() < 5e-6, "{method:?}: {bounded:?}");
+                }
+            }
         }
     }
 

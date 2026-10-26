@@ -305,12 +305,14 @@ where
     Ok(gradient)
 }
 
-/// Finite-difference scheme used by [`approx_derivative`].
+/// Finite-difference scheme used by [`approx_derivative`] and
+/// [`LeastSquaresOptions::diff_method`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FiniteDiffMethod {
     /// Forward difference `(f(x+h) - f(x)) / h` (scipy `'2-point'`).
     TwoPoint,
-    /// Central difference `(f(x+h) - f(x-h)) / 2h` (scipy `'3-point'`).
+    /// Central difference `(f(x+h) - f(x-h)) / 2h`, switching to a second-order
+    /// one-sided stencil near bounds (SciPy `'3-point'`).
     ThreePoint,
 }
 
