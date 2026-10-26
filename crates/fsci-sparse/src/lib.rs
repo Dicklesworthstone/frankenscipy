@@ -100,9 +100,11 @@ pub use linalg::{
     CaspPortfolioSolveResult,
     ConnectedComponentsResult,
     Connection,
+    EigsOpPart,
     EigsOptions,
     EigsResult,
     EigsWhich,
+    EigshMode,
     ExpmOptions,
     FactorizedSolve,
     FunmKrylovOptions,
@@ -3227,7 +3229,11 @@ mod tests {
                     let scale = 10.0_f64.powf(((idx / 5) % 6) as f64 * 0.6);
                     for i in 0..n {
                         let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
-                        let mag = if i == n - 1 { 5.0 * scale } else { 5.0 + (i % 4) as f64 };
+                        let mag = if i == n - 1 {
+                            5.0 * scale
+                        } else {
+                            5.0 + (i % 4) as f64
+                        };
                         rows.push(i);
                         cols.push(i);
                         data.push(sign * mag);
@@ -3278,11 +3284,7 @@ mod tests {
         ratios.sort_by(f64::total_cmp);
         println!(
             "estimate_sparse_cond_1norm ratio distribution over 200 matrices: min={:.4}, p10={:.4}, p50={:.4}, p90={:.4}, max={:.4}",
-            ratios[0],
-            ratios[20],
-            ratios[100],
-            ratios[180],
-            ratios[199]
+            ratios[0], ratios[20], ratios[100], ratios[180], ratios[199]
         );
     }
 
@@ -3335,7 +3337,11 @@ mod tests {
         let res = solve_with_casp_portfolio(&csr, &b, None, &mut portfolio, opts)
             .expect("solve_with_casp_portfolio must succeed");
 
-        assert!(res.cond_estimate >= 1e8, "res.cond_estimate = {:.3e}", res.cond_estimate);
+        assert!(
+            res.cond_estimate >= 1e8,
+            "res.cond_estimate = {:.3e}",
+            res.cond_estimate
+        );
         assert_eq!(res.chosen_action, fsci_runtime::SparseSolverAction::SuperLU);
         assert!(res.converged, "residual_norm = {:.3e}", res.residual_norm);
 
@@ -3613,7 +3619,10 @@ mod tests {
                     ..SolveOptions::default()
                 },
             );
-            assert!(strict_ok.is_ok(), "Strict mode must not enforce Hardened caps");
+            assert!(
+                strict_ok.is_ok(),
+                "Strict mode must not enforce Hardened caps"
+            );
         });
 
         // NNZ cap exceeded (max_nnz = 3, actual = 4) across splu, spilu, expm, and iterative solvers
@@ -3719,7 +3728,11 @@ mod tests {
                 spsolve(&csr, &rhs, SolveOptions::default()).unwrap()
             });
             for (a, b) in s1.solution.iter().zip(s2.solution.iter()) {
-                assert_eq!(a.to_bits(), b.to_bits(), "spsolve strict bit-identity at call {call_idx}");
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "spsolve strict bit-identity at call {call_idx}"
+                );
             }
 
             let f1 = splu(&csc, LuOptions::default()).unwrap();
@@ -3729,7 +3742,11 @@ mod tests {
                 splu_solve(&f2, &rhs).unwrap()
             });
             for (a, b) in lu1.iter().zip(lu2.iter()) {
-                assert_eq!(a.to_bits(), b.to_bits(), "splu strict bit-identity at call {call_idx}");
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "splu strict bit-identity at call {call_idx}"
+                );
             }
 
             let cg1 = cg(&csr, &rhs, None, IterativeSolveOptions::default()).unwrap();
@@ -3737,9 +3754,12 @@ mod tests {
                 cg(&csr, &rhs, None, IterativeSolveOptions::default()).unwrap()
             });
             for (a, b) in cg1.solution.iter().zip(cg2.solution.iter()) {
-                assert_eq!(a.to_bits(), b.to_bits(), "cg strict bit-identity at call {call_idx}");
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cg strict bit-identity at call {call_idx}"
+                );
             }
         }
     }
 }
-

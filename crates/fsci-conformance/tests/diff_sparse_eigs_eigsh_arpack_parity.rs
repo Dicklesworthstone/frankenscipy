@@ -25,8 +25,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{
-    CooMatrix, CsrMatrix, EigsOptions, EigsResult, EigsWhich, FormatConvertible, FunctionOperator,
-    LuOptions, Shape2D, SparseError, eigs, eigsh, eye, scale_csr, splu, splu_solve, sub_csr,
+    CooMatrix, CsrMatrix, EigsOpPart, EigsOptions, EigsResult, EigsWhich, EigshMode,
+    FormatConvertible, FunctionOperator, LuOptions, Shape2D, SparseError, eigs, eigsh, eye,
+    scale_csr, splu, splu_solve, sub_csr,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,10 @@ struct Case {
     k: usize,
     which: &'static str,
     sigma: Option<f64>,
+    sigma_im: f64,
+    mode: &'static str,
+    op_part: Option<&'static str>,
+    return_eigenvectors: bool,
     maxiter: Option<usize>,
     expect: Expect,
     supplied_inverse: bool,
@@ -267,6 +272,10 @@ fn case(
         k,
         which,
         sigma,
+        sigma_im: 0.0,
+        mode: "normal",
+        op_part: None,
+        return_eigenvectors: true,
         maxiter,
         expect,
         supplied_inverse: false,
@@ -640,6 +649,155 @@ fn generate_cases() -> Vec<Case> {
             cases.push(supplied);
         }
     }
+
+    // eigsh mode='buckling' and mode='cayley' (with M=None, M SPD, and M indefinite for buckling).
+    let (k60, m60) = fem_pair(60);
+    for mode in ["buckling", "cayley"] {
+        let mut std_mode = case(
+            &format!("lap60_{mode}_sigma0.7_LM_k4"),
+            "eigsh",
+            60,
+            laplacian_1d(60),
+            None,
+            4,
+            "LM",
+            Some(0.7),
+            None,
+            Values,
+        );
+        std_mode.mode = mode;
+        cases.push(std_mode);
+
+        let mut gen_mode = case(
+            &format!("fem60_M_{mode}_sigma40.0_LM_k4"),
+            "eigsh",
+            60,
+            k60.clone(),
+            Some(m60.clone()),
+            4,
+            "LM",
+            Some(40.0),
+            None,
+            Values,
+        );
+        gen_mode.mode = mode;
+        cases.push(gen_mode);
+    }
+    let indef_m: Vec<f64> = (0..60)
+        .map(|i| {
+            if i % 2 == 0 {
+                1.0 + 0.02 * i as f64
+            } else {
+                -0.8 - 0.01 * i as f64
+            }
+        })
+        .collect();
+    let mut buckling_indef = case(
+        "lap60_indefM_buckling_sigma1.1_LM_k4",
+        "eigsh",
+        60,
+        laplacian_1d(60),
+        Some(diagonal(&indef_m)),
+        4,
+        "LM",
+        Some(1.1),
+        None,
+        Values,
+    );
+    buckling_indef.mode = "buckling";
+    cases.push(buckling_indef);
+
+    // return_eigenvectors=False for eigsh and eigs.
+    let mut eigsh_no_vec = case(
+        "lap60_eigsh_no_eigenvectors_LM_k4",
+        "eigsh",
+        60,
+        laplacian_1d(60),
+        None,
+        4,
+        "LM",
+        None,
+        None,
+        Values,
+    );
+    eigsh_no_vec.return_eigenvectors = false;
+    cases.push(eigsh_no_vec);
+
+    let mut eigs_no_vec = case(
+        "convdiff60_eigs_no_eigenvectors_sigma1.2_LM_k4",
+        "eigs",
+        60,
+        convection_diffusion_1d(60, 0.1),
+        None,
+        4,
+        "LM",
+        Some(1.2),
+        None,
+        Values,
+    );
+    eigs_no_vec.return_eigenvectors = false;
+    cases.push(eigs_no_vec);
+
+    // eigs with complex sigma (OPpart='r' and OPpart='i'), including M != None and odd k
+    // splitting a complex-conjugate pair for both +Im(sigma) and -Im(sigma).
+    let complex_a = normal_blocks(
+        25,
+        |j| (1.0 + 0.7 * j as f64, 0.25 + 0.15 * (25 - j) as f64),
+        &[0.5, 2.3, 4.1, 7.8],
+        0xA11C_E5EE_D004,
+    );
+    let (_, m54) = fem_pair(54);
+    for op_part in ["r", "i"] {
+        let mut c_std = case(
+            &format!("normal54_complex_sigma_oppart_{op_part}_k4"),
+            "eigs",
+            54,
+            complex_a.clone(),
+            None,
+            4,
+            "LM",
+            Some(3.05),
+            None,
+            Values,
+        );
+        c_std.sigma_im = 1.8;
+        c_std.op_part = Some(op_part);
+        cases.push(c_std);
+
+        let mut c_gen = case(
+            &format!("normal54_M_complex_sigma_oppart_{op_part}_k4"),
+            "eigs",
+            54,
+            complex_a.clone(),
+            Some(m54.clone()),
+            4,
+            "LM",
+            Some(180.0),
+            None,
+            Values,
+        );
+        c_gen.sigma_im = 45.0;
+        c_gen.op_part = Some(op_part);
+        cases.push(c_gen);
+
+        for (tag, sim) in [("pos", 1.8), ("neg", -1.8)] {
+            let mut c_split = case(
+                &format!("normal54_complex_sigma_{tag}_oppart_{op_part}_k3"),
+                "eigs",
+                54,
+                complex_a.clone(),
+                None,
+                3,
+                "LM",
+                Some(3.05),
+                None,
+                Values,
+            );
+            c_split.sigma_im = sim;
+            c_split.op_part = Some(op_part);
+            cases.push(c_split);
+        }
+    }
     cases
 }
 
@@ -672,19 +830,28 @@ for case in json.load(sys.stdin):
             m = case["mass"]
             M = csr_matrix((m["vals"], (m["rows"], m["cols"])), shape=(n, n))
         fn = eigsh if case["func"] == "eigsh" else eigs
-        inverse_options = {}
+        sigma = case["sigma"]
+        sigma_im = float(case.get("sigma_im", 0.0))
+        if sigma is not None and sigma_im != 0.0:
+            sigma = complex(float(sigma), sigma_im)
+        extra = {}
+        if case["func"] == "eigsh":
+            extra["mode"] = case.get("mode", "normal")
+        elif case.get("op_part") is not None:
+            extra["OPpart"] = case["op_part"]
         if case["supplied_inverse"]:
-            sigma = case["sigma"]
             if sigma is None:
                 factor = splu(M.tocsc())
-                inverse_options["Minv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=float)
+                extra["Minv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=float)
             else:
                 shifted = A - sigma * (eye(n, format="csr") if M is None else M)
                 factor = splu(shifted.tocsc())
-                inverse_options["OPinv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=float)
+                extra["OPinv"] = LinearOperator(A.shape, matvec=factor.solve, dtype=shifted.dtype)
             A = aslinearoperator(A)
-        vals, _ = fn(A, k=int(case["k"]), M=M, sigma=case["sigma"], which=case["which"],
-                     maxiter=case["maxiter"], return_eigenvectors=True, **inverse_options)
+        ret_vecs = bool(case.get("return_eigenvectors", True))
+        res = fn(A, k=int(case["k"]), M=M, sigma=sigma, which=case["which"],
+                 maxiter=case["maxiter"], return_eigenvectors=ret_vecs, **extra)
+        vals = res[0] if ret_vecs else res
         vals = np.asarray(vals)
         arm["re"] = [float(v) for v in np.real(vals)]
         arm["im"] = [float(v) for v in np.imag(vals)]
@@ -872,6 +1039,31 @@ fn diff_sparse_eigs_eigsh_supplied_inverses() -> TestResult<()> {
     )
 }
 
+#[test]
+fn diff_sparse_eigs_eigsh_modes_complex_sigma_and_no_eigenvectors() -> TestResult<()> {
+    let cases: Vec<_> = generate_cases()
+        .into_iter()
+        .filter(|case| {
+            case.mode != "normal"
+                || case.sigma_im != 0.0
+                || case.op_part.is_some()
+                || !case.return_eigenvectors
+        })
+        .collect();
+    assert_eq!(
+        cases.len(),
+        15,
+        "exercise buckling, cayley, return_eigenvectors=False, and complex sigma OPpart='r'/'i'"
+    );
+    run_cases(
+        "diff_sparse_eigs_eigsh_modes_complex_sigma_and_no_eigenvectors",
+        cases,
+        &["eigsh", "eigs"],
+        15,
+        6,
+    )
+}
+
 fn run_cases(
     test_id: &str,
     cases: Vec<Case>,
@@ -898,9 +1090,22 @@ fn run_cases(
             .which
             .parse()
             .map_err(|err: SparseError| format!("{}: {err}", case.case_id))?;
+        let mode: EigshMode = case
+            .mode
+            .parse()
+            .map_err(|err: SparseError| format!("{}: {err}", case.case_id))?;
+        let op_part: Option<EigsOpPart> = case
+            .op_part
+            .map(str::parse)
+            .transpose()
+            .map_err(|err: SparseError| format!("{}: {err}", case.case_id))?;
         let mut options = EigsOptions {
             which,
             sigma: case.sigma,
+            sigma_im: case.sigma_im,
+            mode,
+            op_part,
+            return_eigenvectors: case.return_eigenvectors,
             mass: mass.as_ref(),
             max_iter: case.maxiter.unwrap_or(0),
             ..EigsOptions::default()
@@ -1031,16 +1236,30 @@ fn run_cases(
             f64::INFINITY
         };
         let a_norm = norm_bound(&case.a, case.n);
-        let resid = max_residual(&a, mass.as_ref(), result)? / a_norm;
-        let ortho = if case.func == "eigsh" {
-            Some(ortho_defect(result, mass.as_ref())?)
+        let (resid, ortho, vec_shape_ok) = if case.return_eigenvectors {
+            let resid = max_residual(&a, mass.as_ref(), result)? / a_norm;
+            let ortho = if case.func == "eigsh" {
+                let b_mat = if case.mode == "buckling" {
+                    Some(&a)
+                } else {
+                    mass.as_ref()
+                };
+                Some(ortho_defect(result, b_mat)?)
+            } else {
+                None
+            };
+            let vec_ok =
+                result.eigenvectors.len() == case.k && result.eigenvectors_im.len() == case.k;
+            (resid, ortho, vec_ok)
         } else {
-            None
+            let vec_ok = result.eigenvectors.is_empty() && result.eigenvectors_im.is_empty();
+            (0.0, None, vec_ok)
         };
         let pass = eig_diff <= EIG_REL_TOL * scale
             && resid <= RESID_REL_TOL
             && ortho.is_none_or(|o| o <= ORTHO_TOL)
-            && result.eigenvalues.len() == case.k;
+            && result.eigenvalues.len() == case.k
+            && vec_shape_ok;
         ledger.compared(arm, &case.case_id, pass);
         diff.max_eig_diff = Some(eig_diff);
         diff.max_rel_residual = Some(resid);

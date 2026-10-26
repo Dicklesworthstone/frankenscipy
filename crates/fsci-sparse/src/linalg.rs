@@ -34920,10 +34920,86 @@ impl std::str::FromStr for EigsWhich {
     }
 }
 
+/// Shift-invert spectral transformation mode for [`eigsh`] (SciPy's `mode=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EigshMode {
+    /// `'normal'` (ARPACK mode 3): `OP = (A − σM)⁻¹M`, `B = M`, `λ = σ + 1/θ`.
+    #[default]
+    Normal,
+    /// `'buckling'` (ARPACK mode 4): `OP = (A − σM)⁻¹A`, `B = A`, `λ = σ·θ/(θ − 1)`.
+    Buckling,
+    /// `'cayley'` (ARPACK mode 5): `OP = (A − σM)⁻¹(A + σM)`, `B = M`, `λ = σ·(θ + 1)/(θ − 1)`.
+    Cayley,
+}
+
+impl EigshMode {
+    /// SciPy's mode spelling.
+    #[must_use]
+    pub const fn scipy_name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Buckling => "buckling",
+            Self::Cayley => "cayley",
+        }
+    }
+}
+
+impl std::str::FromStr for EigshMode {
+    type Err = SparseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "normal" => Ok(Self::Normal),
+            "buckling" => Ok(Self::Buckling),
+            "cayley" => Ok(Self::Cayley),
+            other => Err(SparseError::InvalidArgument {
+                message: format!("unrecognized mode {other:?}"),
+            }),
+        }
+    }
+}
+
+/// Which part of `(A − σM)⁻¹M` [`eigs`] iterates on for a real matrix `A` with a complex shift
+/// `σ = σ_r + i·σ_i` (SciPy's `OPpart=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EigsOpPart {
+    /// `'r'` (ARPACK mode 3, the default): `OP = Re((A − σM)⁻¹M)`.
+    #[default]
+    Real,
+    /// `'i'` (ARPACK mode 4): `OP = Im((A − σM)⁻¹M)`. Requires `sigma_im != 0`.
+    Imag,
+}
+
+impl EigsOpPart {
+    /// SciPy's one-letter spelling (`"r"` or `"i"`).
+    #[must_use]
+    pub const fn scipy_name(self) -> &'static str {
+        match self {
+            Self::Real => "r",
+            Self::Imag => "i",
+        }
+    }
+}
+
+impl std::str::FromStr for EigsOpPart {
+    type Err = SparseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "r" | "R" => Ok(Self::Real),
+            "i" | "I" => Ok(Self::Imag),
+            other => Err(SparseError::InvalidArgument {
+                message: format!("OPpart must be one of ('r','i'), got {other:?}"),
+            }),
+        }
+    }
+}
+
 /// Options for [`eigsh`], [`eigs`] and [`svds`], after SciPy's keyword arguments. The default
 /// is SciPy's: `which='LM'`, `tol=0` (machine precision), `maxiter=None` (`n * 10`),
-/// `ncv=None`, no shift, no mass matrix, and a start vector chosen by the solver.
-#[derive(Clone, Copy, Default)]
+/// `ncv=None`, no shift, no mass matrix, `mode='normal'`, `return_eigenvectors=true`, and a
+/// start vector chosen by the solver.
+#[derive(Clone, Copy)]
 pub struct EigsOptions<'a> {
     /// Relative accuracy of the Ritz values: a pair is converged when its residual estimate is
     /// at most `tol·max(|θ|, ε^(2/3))`, ARPACK's `dsconv`/`dnconv` test on the operator's
@@ -34940,14 +35016,27 @@ pub struct EigsOptions<'a> {
     /// value is capped at `n` and must exceed `k` ([`eigsh`]) or `k + 1` ([`eigs`]) unless it
     /// spans the whole space.
     pub ncv: Option<usize>,
-    /// Shift for shift-invert mode (SciPy's `sigma`, `mode='normal'`). The operator becomes
-    /// `(A − σM)⁻¹M` (`M = I` without a mass matrix), factored once with [`splu`]; eigenvalues
-    /// map back as `λ = σ + 1/θ`. A shift exactly at an eigenvalue fails with
+    /// Shift for shift-invert mode (SciPy's `sigma`, or `Re(sigma)` for [`eigs`] when
+    /// `sigma_im != 0`). With `mode='normal'` the operator becomes `(A − σM)⁻¹M` (`M = I`
+    /// without a mass matrix), factored once with [`splu`]; eigenvalues map back as
+    /// `λ = σ + 1/θ`. A shift exactly at an eigenvalue fails with
     /// [`SparseError::SingularMatrix`], where SciPy raises "Factor is exactly singular".
     pub sigma: Option<f64>,
+    /// Imaginary part of a complex shift `σ = sigma + i·sigma_im` for [`eigs`] (`0.0` by
+    /// default). Requires `sigma: Some(re)`.
+    pub sigma_im: f64,
+    /// Which part (`'r'` or `'i'`) of `(A − σM)⁻¹M` [`eigs`] uses when `sigma` is specified.
+    /// `None` defaults to [`EigsOpPart::Real`] (`'r'`).
+    pub op_part: Option<EigsOpPart>,
+    /// Shift-invert transformation mode for [`eigsh`] (`'normal'`, `'buckling'`, or `'cayley'`).
+    pub mode: EigshMode,
+    /// Whether to populate `eigenvectors` and `eigenvectors_im` in the returned [`EigsResult`]
+    /// (`true` by default, matching SciPy's `return_eigenvectors=True`).
+    pub return_eigenvectors: bool,
     /// Mass matrix `M` of the generalized problem `A x = λ M x` (SciPy's `M`). It must be
-    /// symmetric positive definite (semi-definite suffices in shift-invert mode). Without
-    /// `sigma` the operator is `M⁻¹A` with `M` factored by [`splu`] (ARPACK mode 2).
+    /// symmetric positive definite (semi-definite suffices in shift-invert mode; indefinite is
+    /// allowed in `mode='buckling'`). Without `sigma` the operator is `M⁻¹A` with `M` factored
+    /// by [`splu`] (ARPACK mode 2).
     pub mass: Option<&'a CsrMatrix>,
     /// User-supplied inverse of `M` (SciPy's `Minv`). Only valid with `mass` and without
     /// `sigma`. The operator must solve `M y = x`; it is not a preconditioner. Supplying it
@@ -34964,6 +35053,26 @@ pub struct EigsOptions<'a> {
     pub v0: Option<&'a [f64]>,
 }
 
+impl Default for EigsOptions<'_> {
+    fn default() -> Self {
+        Self {
+            tol: 0.0,
+            max_iter: 0,
+            which: EigsWhich::LargestMagnitude,
+            ncv: None,
+            sigma: None,
+            sigma_im: 0.0,
+            op_part: None,
+            mode: EigshMode::Normal,
+            return_eigenvectors: true,
+            mass: None,
+            minv: None,
+            opinv: None,
+            v0: None,
+        }
+    }
+}
+
 impl std::fmt::Debug for EigsOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EigsOptions")
@@ -34972,6 +35081,10 @@ impl std::fmt::Debug for EigsOptions<'_> {
             .field("which", &self.which)
             .field("ncv", &self.ncv)
             .field("sigma", &self.sigma)
+            .field("sigma_im", &self.sigma_im)
+            .field("op_part", &self.op_part)
+            .field("mode", &self.mode)
+            .field("return_eigenvectors", &self.return_eigenvectors)
             .field("mass", &self.mass)
             .field("minv", &self.minv.map(LinearOperator::shape))
             .field("opinv", &self.opinv.map(LinearOperator::shape))
@@ -35119,6 +35232,55 @@ fn validate_eigen_problem(
             message: format!("sigma must be finite, got {sigma}"),
         });
     }
+    if !options.sigma_im.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: format!("sigma_im must be finite, got {}", options.sigma_im),
+        });
+    }
+    if options.sigma_im != 0.0 && options.sigma.is_none() {
+        return Err(SparseError::InvalidArgument {
+            message: "sigma_im cannot be specified without sigma".to_string(),
+        });
+    }
+    if name == "eigsh" {
+        if options.sigma_im != 0.0 {
+            return Err(SparseError::InvalidArgument {
+                message: "eigsh requires a real sigma".to_string(),
+            });
+        }
+        if options.op_part.is_some() {
+            return Err(SparseError::InvalidArgument {
+                message: "OPpart is only supported for eigs".to_string(),
+            });
+        }
+        if options.mode != EigshMode::Normal && options.sigma.is_none() {
+            return Err(SparseError::InvalidArgument {
+                message: format!(
+                    "mode={:?} requires sigma to be specified",
+                    options.mode.scipy_name()
+                ),
+            });
+        }
+    } else {
+        if options.mode != EigshMode::Normal {
+            return Err(SparseError::InvalidArgument {
+                message: format!(
+                    "mode={:?} is only supported for eigsh",
+                    options.mode.scipy_name()
+                ),
+            });
+        }
+        if options.op_part.is_some() && options.sigma.is_none() {
+            return Err(SparseError::InvalidArgument {
+                message: "OPpart should not be specified with sigma = None".to_string(),
+            });
+        }
+        if options.op_part == Some(EigsOpPart::Imag) && options.sigma_im == 0.0 {
+            return Err(SparseError::InvalidArgument {
+                message: "OPpart cannot be 'i' if sigma is real".to_string(),
+            });
+        }
+    }
     if options.minv.is_some() && (options.mass.is_none() || options.sigma.is_some()) {
         return Err(SparseError::InvalidArgument {
             message: "Minv requires M and cannot be specified with sigma".to_string(),
@@ -35232,24 +35394,26 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
 }
 
 /// `k` eigenpairs of the sparse symmetric matrix `A` (or of the symmetric-definite pencil
-/// `A x = λ M x`), as `scipy.sparse.linalg.eigsh(A, k, M, sigma, which, v0, ncv, maxiter, tol)`
-/// with `mode='normal'`.
+/// `A x = λ M x`), as `scipy.sparse.linalg.eigsh(A, k, M, sigma, which, v0, ncv, maxiter, tol,
+/// return_eigenvectors, Minv, OPinv, mode)`.
 ///
 /// Symmetric Krylov–Schur, i.e. thick-restart Lanczos (Stewart 2001; Wu & Simon 2000), with
 /// full DGKS reorthogonalization and locking of converged Ritz pairs: mathematically the
 /// implicitly restarted Lanczos method of ARPACK's `dsaupd`, which SciPy wraps. It restarts
 /// until every wanted Ritz pair passes ARPACK's test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))` or
 /// `max_iter` cycles pass. The operator follows SciPy's modes: `A` (mode 1), `M⁻¹A` in the
-/// M inner product (mode 2, `mass` without `sigma`), or `(A − σM)⁻¹M` (mode 3, `sigma`), with
-/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified as ARPACK's `dseupd`
-/// does.
+/// M inner product (mode 2, `mass` without `sigma`), `(A − σM)⁻¹M` in the M inner product
+/// (mode 3, `sigma` with `mode='normal'`), `(A − σM)⁻¹A` in the A inner product (mode 4,
+/// `mode='buckling'`), or `(A − σM)⁻¹(A + σM)` in the M inner product (mode 5,
+/// `mode='cayley'`), with eigenvalues mapped back and Ritz vectors purified as ARPACK's
+/// `dseupd` does.
 ///
-/// Eigenvalues come back in ascending order with their eigenvectors (M-orthonormal with a mass
-/// matrix). Without a shift each eigenvalue is the Rayleigh quotient `xᵀAx / xᵀMx` of its
-/// returned vector; in shift-invert mode it is `σ + 1/θ`, as in ARPACK's `dseupd`. The
-/// convergence test is floored at the rounding level of the projected eigenproblem
-/// (`ncv·ε·max|θ|`), which ARPACK reaches through exact QL deflations instead. Every returned
-/// pair must also pass an explicit residual check,
+/// Eigenvalues come back in ascending order with their eigenvectors (B-orthonormal: `B = A` in
+/// buckling mode, `B = M` otherwise). Without a shift each eigenvalue is the Rayleigh quotient
+/// `xᵀAx / xᵀMx` of its returned vector; in shift-invert modes it is mapped from `θ`, as in
+/// ARPACK's `dseupd`. The convergence test is floored at the rounding level of the projected
+/// eigenproblem (`ncv·ε·max|θ|`), which ARPACK reaches through exact QL deflations instead.
+/// Every returned pair must also pass an explicit residual check,
 /// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`, a guard against an operator that
 /// no longer matches `A`.
 ///
@@ -35260,7 +35424,7 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
 ///   exactly singular").
 /// - [`SparseError::InvalidArgument`] for a `which` that `eigsh` does not take, `which='BE'`
 ///   with `k = 1`, an `ncv` outside `k < ncv ≤ n`, a zero `v0`, a non-finite `tol`/`sigma`, or
-///   an `M` that is not positive definite.
+///   an inner-product matrix `B` that is not positive definite.
 /// - [`SparseError::NonFiniteInput`] for NaN/Inf in `A`, `M` or `v0`.
 ///
 /// `A` may be any symmetric [`LinearOperator`] (a `&CsrMatrix` coerces). A matrix-free `A`
@@ -35270,9 +35434,7 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
 /// and the returned eigenvectors; an inverse Ritz value is never used to scale `A`'s residual.
 ///
 /// Differences from SciPy: `k` may equal `n` (SciPy refuses `k ≥ n` for a sparse `A` and
-/// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one;
-/// `mode='buckling'`/`'cayley'` and `return_eigenvectors=False` are
-/// not offered.
+/// points to `scipy.linalg.eigh`); the default start vector is a fixed-seed pseudo-random one.
 pub fn eigsh(
     a: &dyn LinearOperator,
     k: usize,
@@ -35281,18 +35443,23 @@ pub fn eigsh(
     let n = validate_eigen_problem(a, k, &options, "eigsh")?;
     let settings = resolve_krylov_settings(n, k, &options, true)?;
     let transform = SpectralTransform::build(a, &options, n)?;
+    let b_op: Option<&dyn LinearOperator> = if options.mode == EigshMode::Buckling {
+        Some(a)
+    } else {
+        options.mass.map(|m| m as &dyn LinearOperator)
+    };
     // ARPACK's dgetv0 forces the start vector into the range of OP for a generalized problem.
     let run = symmetric_krylov_schur(
         |x: &[f64], bx: &[f64]| transform.apply(a, x, bx),
-        options.mass,
+        b_op,
         n,
         k,
         &settings,
         options.v0,
-        options.mass.is_some(),
+        b_op.is_some(),
     )?;
 
-    let sigma = transform.shift();
+    let sigma = transform.shift_norm();
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
     let (a_norm, norm_probes) = eigen_residual_scale(a, &transform, run.spectral_scale, m_norm)?;
     let guard = settings.tol.max(f64::EPSILON.sqrt());
@@ -35301,13 +35468,21 @@ pub fn eigsh(
     let mut pairs: Vec<(f64, Vec<f64>, bool)> = Vec::with_capacity(run.theta.len());
     for (i, &theta) in run.theta.iter().enumerate() {
         let mut x = run.vectors[i].clone();
-        if transform.is_shift_invert() && theta != 0.0 {
-            // dseupd's purification: OP x/θ = x + (β·y_last/θ)·v_next lies in range(OP).
-            let c = run.coupling[i] / theta;
-            for (xi, &ni) in x.iter_mut().zip(&run.next) {
-                *xi += c * ni;
+        if transform.is_shift_invert() {
+            // dseupd's purification: OP x/θ = x + (β·y_last/θ)·v_next lies in range(OP)
+            // (or (OP − I) x/(θ − 1) in Cayley mode).
+            let denom = if options.mode == EigshMode::Cayley {
+                theta - 1.0
+            } else {
+                theta
+            };
+            if denom != 0.0 {
+                let c = run.coupling[i] / denom;
+                for (xi, &ni) in x.iter_mut().zip(&run.next) {
+                    *xi += c * ni;
+                }
+                b_normalize_op(&mut x, b_op)?;
             }
-            b_normalize(&mut x, options.mass);
         }
         let ax = checked_eigen_matvec(a, &x)?;
         let mx = options.mass.map(|m| csr_matvec(m, &x));
@@ -35331,7 +35506,7 @@ pub fn eigsh(
         let x_norm = x.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
         let ax_norm = ax.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
         let original_scale = a_norm.max(ax_norm / x_norm);
-        let bound = guard * (original_scale + (lambda.abs() + sigma.abs()) * m_norm) * x_norm;
+        let bound = guard * (original_scale + (lambda.abs() + sigma) * m_norm) * x_norm;
         // Neither a non-finite residual nor an overflowed allowance certifies convergence.
         let ok = run.converged[i] && resid.is_finite() && bound.is_finite() && resid <= bound;
         pairs.push((lambda, x, ok));
@@ -35339,6 +35514,7 @@ pub fn eigsh(
     pairs.sort_by(|p, q| p.0.total_cmp(&q.0));
 
     let converged = pairs.len() == k && pairs.iter().all(|p| p.2);
+    let return_vecs = options.return_eigenvectors;
     let assemble = |pairs: Vec<(f64, Vec<f64>, bool)>, converged: bool| {
         let count = pairs.len();
         let (eigenvalues, eigenvectors): (Vec<f64>, Vec<Vec<f64>>) =
@@ -35346,8 +35522,16 @@ pub fn eigsh(
         EigsResult {
             eigenvalues,
             eigenvalues_im: vec![0.0; count],
-            eigenvectors,
-            eigenvectors_im: vec![vec![0.0; n]; count],
+            eigenvectors: if return_vecs {
+                eigenvectors
+            } else {
+                Vec::new()
+            },
+            eigenvectors_im: if return_vecs {
+                vec![vec![0.0; n]; count]
+            } else {
+                Vec::new()
+            },
             nmatvec,
             iterations: run.iterations,
             ncv: settings.ncv,
@@ -35417,6 +35601,18 @@ fn checked_eigen_matvec(a: &dyn LinearOperator, x: &[f64]) -> SparseResult<Vec<f
     Ok(result)
 }
 
+/// Applies the inner-product operator `B` (`M` or `A` in buckling mode), using direct CSR
+/// matvec when `B` is backed by a [`CsrMatrix`].
+fn apply_b_op(b_op: &dyn LinearOperator, x: &[f64]) -> SparseResult<Vec<f64>> {
+    if let Some(csr) = b_op.as_csr() {
+        let out = csr_matvec(csr, x);
+        ensure_finite(&out)?;
+        Ok(out)
+    } else {
+        checked_eigen_matvec(b_op, x)
+    }
+}
+
 /// A residual must be scaled in the original eigenproblem, never by a shift-inverse Ritz
 /// value: an erroneous `OPinv = 1e12 I` would otherwise give a huge allowance for a small A.
 /// A concrete matrix has a norm bound. For a matrix-free shifted problem, sample A on a
@@ -35435,7 +35631,7 @@ fn eigen_residual_scale(
         return Ok((spectral_scale * m_norm, 0));
     }
     let mut probe = KrylovBasis::new(a.shape().rows, None).random_vector();
-    b_normalize(&mut probe, None);
+    b_normalize_op(&mut probe, None)?;
     let image = checked_eigen_matvec(a, &probe)?;
     let scale = image.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
     if !scale.is_finite() {
@@ -35446,11 +35642,11 @@ fn eigen_residual_scale(
     Ok((scale, 1))
 }
 
-/// Scales `x` to unit B-norm (`B = M`, or the 2-norm without a mass matrix). A zero vector or a
-/// non-positive `xᵀMx` is left unchanged.
-fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
-    let norm_sq = match mass {
-        Some(m) => dot_product(x, &csr_matvec(m, x)),
+/// Scales `x` to unit B-norm (`B = M` or `A`, or the 2-norm when `None`). A zero vector or a
+/// non-positive `xᵀBx` is left unchanged.
+fn b_normalize_op(x: &mut [f64], b_op: Option<&dyn LinearOperator>) -> SparseResult<()> {
+    let norm_sq = match b_op {
+        Some(b) => dot_product(x, &apply_b_op(b, x)?),
         None => dot_product(x, x),
     };
     if norm_sq > 0.0 && norm_sq.is_finite() {
@@ -35459,9 +35655,10 @@ fn b_normalize(x: &mut [f64], mass: Option<&CsrMatrix>) {
             *xi *= inv;
         }
     }
+    Ok(())
 }
 
-/// SciPy's ARPACK modes 1-3 for one `eigs`/`eigsh` call: the operator the Krylov–Schur kernel
+/// SciPy's ARPACK modes 1-5 for one `eigs`/`eigsh` call: the operator the Krylov–Schur kernel
 /// iterates on, and how its eigenvalues θ map back to the problem's λ.
 enum SpectralTransform<'a> {
     /// Mode 1: `OP = A`, `λ = θ`.
@@ -35469,16 +35666,37 @@ enum SpectralTransform<'a> {
     /// Mode 2: `OP = M⁻¹A` in the M inner product, `λ = θ`. `M` is factored with [`splu`], as
     /// SciPy's `get_inv_matvec(M)` does.
     Generalized(SpectralInverse<'a>),
-    /// Mode 3: `OP = (A − σM)⁻¹M` (`M = I` without a mass matrix), `λ = σ + 1/θ`.
+    /// Modes 3-5 with real σ: `normal` (`OP = (A − σM)⁻¹M`), `buckling` (`OP = (A − σM)⁻¹A`),
+    /// or `cayley` (`OP = (A − σM)⁻¹(A + σM)`).
     ShiftInvert {
         sigma: f64,
+        mode: EigshMode,
         inverse: SpectralInverse<'a>,
+    },
+    /// Modes 3-4 for `eigs` with complex `σ = σ_r + i·σ_i` (`σ_i != 0`):
+    /// `OP = Re((A − σM)⁻¹M)` (`OPpart='r'`) or `OP = Im((A − σM)⁻¹M)` (`OPpart='i'`).
+    ComplexShiftInvert {
+        sigma_re: f64,
+        sigma_im: f64,
+        op_part: EigsOpPart,
+        inverse: ComplexSpectralInverse<'a>,
     },
 }
 
 /// A solve supplied by the caller or factored once for this eigensolver invocation.
 enum SpectralInverse<'a> {
     Factored(Box<SparseLuFactorization>),
+    Operator(&'a dyn LinearOperator),
+}
+
+/// Complex shift-invert solve `(A − (σ_r + i·σ_i)M)⁻¹ rhs` for real `A`, `M`, and `rhs`.
+enum ComplexSpectralInverse<'a> {
+    /// 2n×2n real block factorization of `[A − σ_r M, σ_i M; −σ_i M, A − σ_r M]`.
+    Factored2N {
+        n: usize,
+        factor: Box<SparseLuFactorization>,
+    },
+    /// Caller-supplied real operator (already returning the selected real/imaginary part).
     Operator(&'a dyn LinearOperator),
 }
 
@@ -35504,9 +35722,80 @@ impl SpectralInverse<'_> {
     }
 }
 
+impl ComplexSpectralInverse<'_> {
+    fn solve_part(&self, rhs: &[f64], op_part: EigsOpPart) -> SparseResult<Vec<f64>> {
+        match self {
+            Self::Factored2N { n, factor } => {
+                let mut rhs_2n = vec![0.0_f64; 2 * n];
+                rhs_2n[..*n].copy_from_slice(rhs);
+                let sol = splu_solve(factor, &rhs_2n)?;
+                let slice = match op_part {
+                    EigsOpPart::Real => &sol[..*n],
+                    EigsOpPart::Imag => &sol[*n..],
+                };
+                ensure_finite(slice)?;
+                Ok(slice.to_vec())
+            }
+            Self::Operator(operator) => {
+                let result = operator.matvec(rhs)?;
+                if result.len() != rhs.len() {
+                    return Err(SparseError::IncompatibleShape {
+                        message: format!(
+                            "inverse operator returned {} values, expected {}",
+                            result.len(),
+                            rhs.len()
+                        ),
+                    });
+                }
+                ensure_finite(&result)?;
+                Ok(result)
+            }
+        }
+    }
+}
+
+/// Builds the 2n×2n real block matrix `[C, D; −D, C]` where `C = A − σ_r M` and `D = σ_i M`,
+/// so solving `[C, D; −D, C] [y_r; y_i] = [b; 0]` yields `(A − (σ_r + i·σ_i)M)⁻¹ b = y_r + i·y_i`.
+fn build_complex_shift_block_csc(
+    c: &CsrMatrix,
+    d: &CsrMatrix,
+    n: usize,
+) -> SparseResult<CscMatrix> {
+    let nnz_cap = 2 * (c.nnz() + d.nnz());
+    let mut rows = Vec::with_capacity(nnz_cap);
+    let mut cols = Vec::with_capacity(nnz_cap);
+    let mut vals = Vec::with_capacity(nnz_cap);
+    let (c_indptr, c_indices, c_data) = (c.indptr(), c.indices(), c.data());
+    let (d_indptr, d_indices, d_data) = (d.indptr(), d.indices(), d.data());
+    for i in 0..n {
+        for idx in c_indptr[i]..c_indptr[i + 1] {
+            let j = c_indices[idx];
+            let v = c_data[idx];
+            rows.push(i);
+            cols.push(j);
+            vals.push(v);
+            rows.push(n + i);
+            cols.push(n + j);
+            vals.push(v);
+        }
+        for idx in d_indptr[i]..d_indptr[i + 1] {
+            let j = d_indices[idx];
+            let v = d_data[idx];
+            rows.push(i);
+            cols.push(n + j);
+            vals.push(v);
+            rows.push(n + i);
+            cols.push(j);
+            vals.push(-v);
+        }
+    }
+    crate::formats::CooMatrix::from_triplets(Shape2D::new(2 * n, 2 * n), vals, rows, cols, false)?
+        .to_csc()
+}
+
 impl<'a> SpectralTransform<'a> {
-    /// Modes 1 and 2 only apply `A`, so any [`LinearOperator`] serves. Mode 3 factors `A − σM`
-    /// and needs `A`'s entries unless the caller supplies `OPinv`. No inner iterative solve
+    /// Modes 1 and 2 only apply `A`, so any [`LinearOperator`] serves. Modes 3-5 factor `A − σM`
+    /// and need `A`'s entries unless the caller supplies `OPinv`. No inner iterative solve
     /// is guessed for a matrix-free shifted operator without `OPinv`.
     fn build(a: &dyn LinearOperator, options: &EigsOptions<'a>, n: usize) -> SparseResult<Self> {
         match (options.sigma, options.mass) {
@@ -35521,10 +35810,53 @@ impl<'a> SpectralTransform<'a> {
                 };
                 Ok(Self::Generalized(inverse))
             }
+            (Some(sigma), mass) if options.sigma_im != 0.0 => {
+                let sigma_im = options.sigma_im;
+                let op_part = options.op_part.unwrap_or(EigsOpPart::Real);
+                if let Some(operator) = options.opinv {
+                    return Ok(Self::ComplexShiftInvert {
+                        sigma_re: sigma,
+                        sigma_im,
+                        op_part,
+                        inverse: ComplexSpectralInverse::Operator(operator),
+                    });
+                }
+                let Some(matrix) = a.as_csr() else {
+                    return Err(SparseError::Unsupported {
+                        feature: "shift-invert (sigma) needs a concrete sparse A or OPinv; \
+                                  supply OPinv to solve a matrix-free shifted eigenproblem"
+                            .to_string(),
+                    });
+                };
+                let identity;
+                let m_ref = match mass {
+                    Some(m) => m,
+                    None => {
+                        identity = eye(n)?;
+                        &identity
+                    }
+                };
+                let c = sub_csr(matrix, &scale_csr(m_ref, sigma)?)?;
+                let d = scale_csr(m_ref, sigma_im)?;
+                let block_csc = build_complex_shift_block_csc(&c, &d, n)?;
+                let factor = splu(&block_csc, LuOptions::default())
+                    .map_err(|err| singular_shift_error(err, sigma))?;
+                Ok(Self::ComplexShiftInvert {
+                    sigma_re: sigma,
+                    sigma_im,
+                    op_part,
+                    inverse: ComplexSpectralInverse::Factored2N {
+                        n,
+                        factor: Box::new(factor),
+                    },
+                })
+            }
             (Some(sigma), mass) => {
+                let mode = options.mode;
                 if let Some(operator) = options.opinv {
                     return Ok(Self::ShiftInvert {
                         sigma,
+                        mode,
                         inverse: SpectralInverse::Operator(operator),
                     });
                 }
@@ -35544,39 +35876,99 @@ impl<'a> SpectralTransform<'a> {
                     .map_err(|err| singular_shift_error(err, sigma))?;
                 Ok(Self::ShiftInvert {
                     sigma,
+                    mode,
                     inverse: SpectralInverse::Factored(Box::new(factor)),
                 })
             }
         }
     }
 
-    /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`), which is all mode 3 needs.
+    /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`; `A·x` in buckling mode).
     fn apply(&self, a: &dyn LinearOperator, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
         match self {
             Self::Standard => checked_eigen_matvec(a, x),
             Self::Generalized(inverse) => inverse.solve(&checked_eigen_matvec(a, x)?),
-            Self::ShiftInvert { sigma, inverse } => inverse
+            Self::ShiftInvert {
+                sigma,
+                mode: EigshMode::Normal | EigshMode::Buckling,
+                inverse,
+            } => inverse
                 .solve(bx)
                 .map_err(|err| singular_shift_error(err, *sigma)),
+            Self::ShiftInvert {
+                sigma,
+                mode: EigshMode::Cayley,
+                inverse,
+            } => {
+                let mut rhs = checked_eigen_matvec(a, x)?;
+                add_scaled(&mut rhs, *sigma, bx);
+                inverse
+                    .solve(&rhs)
+                    .map_err(|err| singular_shift_error(err, *sigma))
+            }
+            Self::ComplexShiftInvert {
+                sigma_re,
+                op_part,
+                inverse,
+                ..
+            } => inverse
+                .solve_part(bx, *op_part)
+                .map_err(|err| singular_shift_error(err, *sigma_re)),
         }
     }
 
     const fn is_shift_invert(&self) -> bool {
-        matches!(self, Self::ShiftInvert { .. })
+        matches!(
+            self,
+            Self::ShiftInvert { .. } | Self::ComplexShiftInvert { .. }
+        )
     }
 
-    /// `σ`, or 0 outside shift-invert mode.
-    const fn shift(&self) -> f64 {
+    const fn is_complex_shift_invert(&self) -> bool {
+        matches!(self, Self::ComplexShiftInvert { .. })
+    }
+
+    /// `|σ|`, or 0 outside shift-invert mode.
+    fn shift_norm(&self) -> f64 {
         match self {
-            Self::ShiftInvert { sigma, .. } => *sigma,
+            Self::ShiftInvert { sigma, .. } => sigma.abs(),
+            Self::ComplexShiftInvert {
+                sigma_re, sigma_im, ..
+            } => sigma_re.hypot(*sigma_im),
             Self::Standard | Self::Generalized(_) => 0.0,
+        }
+    }
+
+    /// `(Re(σ), Im(σ))` in shift-invert mode.
+    const fn shift_complex(&self) -> (f64, f64) {
+        match self {
+            Self::ShiftInvert { sigma, .. } => (*sigma, 0.0),
+            Self::ComplexShiftInvert {
+                sigma_re, sigma_im, ..
+            } => (*sigma_re, *sigma_im),
+            Self::Standard | Self::Generalized(_) => (0.0, 0.0),
         }
     }
 
     /// λ for a real Ritz value θ of `OP`.
     fn eigenvalue(&self, theta: f64) -> f64 {
         match self {
-            Self::ShiftInvert { sigma, .. } => sigma + 1.0 / theta,
+            Self::ShiftInvert {
+                sigma,
+                mode: EigshMode::Normal,
+                ..
+            } => sigma + 1.0 / theta,
+            Self::ShiftInvert {
+                sigma,
+                mode: EigshMode::Buckling,
+                ..
+            } => sigma * theta / (theta - 1.0),
+            Self::ShiftInvert {
+                sigma,
+                mode: EigshMode::Cayley,
+                ..
+            } => sigma * (theta + 1.0) / (theta - 1.0),
+            Self::ComplexShiftInvert { sigma_re, .. } => sigma_re + 1.0 / theta,
             Self::Standard | Self::Generalized(_) => theta,
         }
     }
@@ -35587,6 +35979,12 @@ impl<'a> SpectralTransform<'a> {
             Self::ShiftInvert { sigma, .. } => {
                 let inv = complex_div((1.0, 0.0), theta);
                 (sigma + inv.0, inv.1)
+            }
+            Self::ComplexShiftInvert {
+                sigma_re, sigma_im, ..
+            } => {
+                let inv = complex_div((1.0, 0.0), theta);
+                (sigma_re + inv.0, sigma_im + inv.1)
             }
             Self::Standard | Self::Generalized(_) => theta,
         }
@@ -35703,10 +36101,10 @@ fn normalize_with(x: &mut [f64], bx: Option<&mut Vec<f64>>) {
     }
 }
 
-/// A B-orthonormal Krylov basis (`B = M`, or `I` without a mass matrix) with `B·v` stored beside
-/// each vector, so a B inner product costs one dot product.
+/// A B-orthonormal Krylov basis (`B = M`, `B = A` in buckling mode, or `I` without a mass
+/// matrix) with `B·v` stored beside each vector, so a B inner product costs one dot product.
 struct KrylovBasis<'b> {
-    mass: Option<&'b CsrMatrix>,
+    b_op: Option<&'b dyn LinearOperator>,
     v: Vec<Vec<f64>>,
     /// `B·v_i`; empty when `B = I`.
     bv: Vec<Vec<f64>>,
@@ -35727,9 +36125,9 @@ struct Orthogonalized {
 }
 
 impl<'b> KrylovBasis<'b> {
-    fn new(n: usize, mass: Option<&'b CsrMatrix>) -> Self {
+    fn new(n: usize, b_op: Option<&'b dyn LinearOperator>) -> Self {
         Self {
-            mass,
+            b_op,
             v: Vec::new(),
             bv: Vec::new(),
             n,
@@ -35758,13 +36156,13 @@ impl<'b> KrylovBasis<'b> {
         v
     }
 
-    fn b_times(&self, x: &[f64]) -> Option<Vec<f64>> {
-        self.mass.map(|m| csr_matvec(m, x))
+    fn b_times(&self, x: &[f64]) -> SparseResult<Option<Vec<f64>>> {
+        self.b_op.map(|op| apply_b_op(op, x)).transpose()
     }
 
     /// `B·v_i` (`v_i` itself when `B = I`).
     fn bvec(&self, i: usize) -> &[f64] {
-        if self.mass.is_some() {
+        if self.b_op.is_some() {
             &self.bv[i]
         } else {
             &self.v[i]
@@ -35804,7 +36202,7 @@ impl<'b> KrylovBasis<'b> {
                 }
             }
         }
-        let bw = self.b_times(w);
+        let bw = self.b_times(w)?;
         let mut norm_sq = match &bw {
             Some(b) => krylov_dot(w, b),
             None => krylov_dot(w, w),
@@ -35854,13 +36252,13 @@ impl<'b> KrylovBasis<'b> {
     fn combine_many(&self, count: usize, coefs: &[Vec<f64>]) -> Vec<(Vec<f64>, Option<Vec<f64>>)> {
         let mut out: Vec<(Vec<f64>, Option<Vec<f64>>)> = coefs
             .iter()
-            .map(|_| (vec![0.0; self.n], self.mass.map(|_| vec![0.0; self.n])))
+            .map(|_| (vec![0.0; self.n], self.b_op.map(|_| vec![0.0; self.n])))
             .collect();
         for start in (0..self.n).step_by(KRYLOV_BLOCK) {
             let end = (start + KRYLOV_BLOCK).min(self.n);
             for j in 0..count {
                 let vj = &self.v[j][start..end];
-                let bvj = self.mass.map(|_| &self.bv[j][start..end]);
+                let bvj = self.b_op.map(|_| &self.bv[j][start..end]);
                 for ((x, bx), c) in out.iter_mut().zip(coefs) {
                     let cj = c[j];
                     if cj == 0.0 {
@@ -35881,7 +36279,7 @@ impl<'b> KrylovBasis<'b> {
     #[cfg(test)]
     fn combine(&self, count: usize, coef: impl Fn(usize) -> f64) -> (Vec<f64>, Option<Vec<f64>>) {
         let mut x = vec![0.0; self.n];
-        let mut bx = self.mass.map(|_| vec![0.0; self.n]);
+        let mut bx = self.b_op.map(|_| vec![0.0; self.n]);
         for j in 0..count {
             let c = coef(j);
             if c == 0.0 {
@@ -35914,12 +36312,12 @@ where
         None => basis.random_vector(),
     };
     if force_range {
-        let bx = basis.b_times(&x).unwrap_or_else(|| x.clone());
+        let bx = basis.b_times(&x)?.unwrap_or_else(|| x.clone());
         x = op(&x, &bx)?;
         *applications += 1;
         ensure_finite(&x)?;
     }
-    let mut bx = basis.b_times(&x);
+    let mut bx = basis.b_times(&x)?;
     let norm_sq = match &bx {
         Some(b) => dot_product(&x, b),
         None => dot_product(&x, &x),
@@ -36038,7 +36436,7 @@ struct SymmetricRitz {
 
 /// Symmetric Krylov–Schur (Stewart 2001), i.e. thick-restart Lanczos (Wu & Simon 2000), for the
 /// `k` Ritz pairs wanted under `settings.which` of an operator `op(x, B·x)` self-adjoint in the
-/// B inner product (`B = mass`, or `I`), with an `ncv`-vector basis.
+/// B inner product (`B = M`, `B = A` in buckling mode, or `I`), with an `ncv`-vector basis.
 ///
 /// Each cycle extends the basis to `ncv` vectors with full reorthogonalization (a fresh random
 /// direction replaces an invariant subspace, as in ARPACK), solves the projected symmetric
@@ -36056,7 +36454,7 @@ struct SymmetricRitz {
 /// (frankenscipy-szq1n.15).
 fn symmetric_krylov_schur<F>(
     mut op: F,
-    mass: Option<&CsrMatrix>,
+    b_op: Option<&dyn LinearOperator>,
     n: usize,
     k: usize,
     settings: &KrylovSettings,
@@ -36070,7 +36468,7 @@ where
     let eps23 = arpack_eps23();
     let tol = settings.tol;
     let mut applications = 0_usize;
-    let mut basis = KrylovBasis::new(n, mass);
+    let mut basis = KrylovBasis::new(n, b_op);
     krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
 
     // The projected matrix, row-major m×m.
@@ -36161,7 +36559,7 @@ where
         let keep = keep.min(size - 1);
         let kept_idx = select_symmetric(&theta, settings.which, keep);
         let mut new_v = Vec::with_capacity(m + 1);
-        let mut new_bv = Vec::with_capacity(if mass.is_some() { m + 1 } else { 0 });
+        let mut new_bv = Vec::with_capacity(if b_op.is_some() { m + 1 } else { 0 });
         let columns: Vec<Vec<f64>> = kept_idx
             .iter()
             .map(|&i| (0..size).map(|j| y[(j, i)]).collect())
@@ -36204,8 +36602,8 @@ struct GeneralPair {
 }
 
 /// `k` eigenpairs of a general sparse matrix `A` (or of `A x = λ M x`), as
-/// `scipy.sparse.linalg.eigs(A, k, M, sigma, which, v0, ncv, maxiter, tol)` with a real
-/// `sigma`.
+/// `scipy.sparse.linalg.eigs(A, k, M, sigma, which, v0, ncv, maxiter, tol, return_eigenvectors,
+/// Minv, OPinv, OPpart)`.
 ///
 /// Nonsymmetric Krylov–Schur (Stewart 2001): Arnoldi with full DGKS reorthogonalization,
 /// restarted from a reordered real Schur form of the projected matrix, with converged leading
@@ -36213,13 +36611,14 @@ struct GeneralPair {
 /// (`dnaupd`), which SciPy wraps: the same `ncv`, `maxiter`, `tol` and `which` semantics and
 /// the same test `‖r‖ ≤ tol·max(|θ|, ε^(2/3))`, floored at the projected problem's rounding
 /// level `ncv·ε·max|θ|` as in [`eigsh`]. The operator follows SciPy's modes: `A`,
-/// `M⁻¹A` in the M inner product (M symmetric positive definite), or `(A − σM)⁻¹M` with
-/// eigenvalues mapped back as `λ = σ + 1/θ` and Ritz vectors purified.
+/// `M⁻¹A` in the M inner product (M symmetric positive definite), `(A − σM)⁻¹M` for real `σ`,
+/// or `Re((A − σM)⁻¹M)` / `Im((A − σM)⁻¹M)` for complex `σ = sigma + i·sigma_im` (`OPpart`).
 ///
 /// The pairs come back most wanted first (under `which`, applied to `1/(λ − σ)` when `sigma` is
 /// set), a complex-conjugate pair adjacent with the positive imaginary part first. When `k`
-/// splits a pair, the member with positive imaginary part is returned, as SciPy does for its
-/// `k + 1`-th candidate. Every pair must also pass the explicit residual check
+/// splits a pair, the member with positive imaginary part (or the one more wanted under
+/// `1/(λ − σ)` when `sigma_im != 0`) is returned, as SciPy does for its `k + 1`-th candidate.
+/// Every pair must also pass the explicit residual check
 /// `‖A x − λ M x‖ ≤ max(tol, √ε)·(‖A‖ + (|λ| + |σ|)·‖M‖)·‖x‖`.
 ///
 /// # Errors
@@ -36234,9 +36633,8 @@ struct GeneralPair {
 /// its residual check is measured against the largest Ritz magnitude of the final basis.
 ///
 /// Differences from SciPy: `k` may reach `n` (SciPy refuses `k ≥ n − 1` for a sparse `A`); the
-/// default start vector is a fixed-seed pseudo-random one; complex `sigma` (`OPpart`),
-/// `return_eigenvectors=False` is not offered. Supply [`EigsOptions::opinv`] to use a
-/// matrix-free `A` with `sigma`, or [`EigsOptions::minv`] to reuse a mass-matrix solve.
+/// default start vector is a fixed-seed pseudo-random one. Supply [`EigsOptions::opinv`] to use
+/// a matrix-free `A` with `sigma`, or [`EigsOptions::minv`] to reuse a mass-matrix solve.
 pub fn eigs(
     a: &dyn LinearOperator,
     k: usize,
@@ -36255,7 +36653,7 @@ pub fn eigs(
         options.mass.is_some(),
     )?;
 
-    let sigma = transform.shift();
+    let sigma_norm = transform.shift_norm();
     let m_norm = options.mass.map_or(1.0, csr_norm_bound);
     let (a_norm, norm_probes) = eigen_residual_scale(a, &transform, run.spectral_scale, m_norm)?;
     let guard = settings.tol.max(f64::EPSILON.sqrt());
@@ -36263,7 +36661,6 @@ pub fn eigs(
     let mut pairs: Vec<GeneralPair> = Vec::with_capacity(run.theta.len());
     for (i, &theta) in run.theta.iter().enumerate() {
         let (mut xr, mut xi) = run.vectors[i].clone();
-        let lambda = transform.eigenvalue_complex(theta);
         if transform.is_shift_invert() && (theta.0 != 0.0 || theta.1 != 0.0) {
             // dneupd's purification: OP x/θ = x + (β·y_last/θ)·v_next.
             let c = complex_div(run.coupling[i], theta);
@@ -36277,6 +36674,24 @@ pub fn eigs(
             None => (xr.clone(), xi.clone()),
         };
         nmatvec += if options.mass.is_some() { 4 } else { 2 };
+        let lambda = if transform.is_complex_shift_invert() {
+            // ARPACK dneupd Remark 3 (arpack.py lines 900-919): for real A and complex sigma,
+            // recover λ from the Rayleigh quotient on the B-normalized Ritz vector xr + i·xi.
+            let denom = dot_product(&xr, &mxr) + dot_product(&xi, &mxi);
+            let num_r = dot_product(&xr, &axr) + dot_product(&xi, &axi);
+            let num_i = if theta.1 == 0.0 {
+                0.0
+            } else {
+                dot_product(&xr, &axi) - dot_product(&xi, &axr)
+            };
+            if denom > 0.0 && denom.is_finite() {
+                (num_r / denom, num_i / denom)
+            } else {
+                (num_r, num_i)
+            }
+        } else {
+            transform.eigenvalue_complex(theta)
+        };
         let mut residual = 0.0_f64;
         for t in 0..n {
             let rr = axr[t] - (lambda.0 * mxr[t] - lambda.1 * mxi[t]);
@@ -36293,7 +36708,7 @@ pub fn eigs(
             .fold(0.0_f64, |norm, &value| norm.hypot(value));
         let original_scale = a_norm.max(ax_norm / x_norm);
         let bound =
-            guard * (original_scale + (lambda.0.hypot(lambda.1) + sigma.abs()) * m_norm) * x_norm;
+            guard * (original_scale + (lambda.0.hypot(lambda.1) + sigma_norm) * m_norm) * x_norm;
         let ok = run.converged[i] && residual.is_finite() && bound.is_finite() && residual <= bound;
         pairs.push(GeneralPair {
             lambda,
@@ -36316,9 +36731,38 @@ pub fn eigs(
             i += 1;
         }
     }
-    pairs.truncate(k);
+    // When sigma has a non-zero imaginary part and nreturned > k (k splits a conjugate pair),
+    // SciPy (arpack.py lines 936-957) ranks all k+1 candidates by rd = 1/(λ − σ) under `which`
+    // and keeps the top k.
+    if transform.is_complex_shift_invert() && pairs.len() > k {
+        let (sr, si) = transform.shift_complex();
+        let rds: Vec<SchurValue> = pairs
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let rd = complex_div((1.0, 0.0), (p.lambda.0 - sr, p.lambda.1 - si));
+                SchurValue {
+                    re: rd.0,
+                    im: rd.1,
+                    block: idx,
+                }
+            })
+            .collect();
+        let order = general_order(&rds, settings.which);
+        let mut ranked = Vec::with_capacity(k);
+        let mut slots: Vec<Option<GeneralPair>> = pairs.into_iter().map(Some).collect();
+        for &idx in order.iter().take(k) {
+            if let Some(pair) = slots[idx].take() {
+                ranked.push(pair);
+            }
+        }
+        pairs = ranked;
+    } else {
+        pairs.truncate(k);
+    }
 
     let converged = pairs.len() == k && pairs.iter().all(|p| p.ok);
+    let return_vecs = options.return_eigenvectors;
     let assemble = |pairs: Vec<GeneralPair>, converged: bool| {
         let mut result = EigsResult {
             nmatvec,
@@ -36330,8 +36774,10 @@ pub fn eigs(
         for p in pairs {
             result.eigenvalues.push(p.lambda.0);
             result.eigenvalues_im.push(p.lambda.1);
-            result.eigenvectors.push(p.xr);
-            result.eigenvectors_im.push(p.xi);
+            if return_vecs {
+                result.eigenvectors.push(p.xr);
+                result.eigenvectors_im.push(p.xi);
+            }
         }
         result
     };
@@ -36443,7 +36889,7 @@ where
     let eps23 = arpack_eps23();
     let tol = settings.tol;
     let mut applications = 0_usize;
-    let mut basis = KrylovBasis::new(n, mass);
+    let mut basis = KrylovBasis::new(n, mass.map(|m| m as &dyn LinearOperator));
     krylov_start(&mut basis, &mut op, v0, force_range, &mut applications)?;
 
     // The projected matrix, row-major m×m (upper Hessenberg plus the restart's spike row).
@@ -38273,7 +38719,7 @@ mod krylov_eigen_tests {
     fn blocked_basis_combinations_are_bit_identical() {
         let n = 2 * KRYLOV_BLOCK + 37;
         let mass = csr(n, vec![2.0; n], (0..n).collect(), (0..n).collect());
-        let mut basis = KrylovBasis::new(n, Some(&mass));
+        let mut basis = KrylovBasis::new(n, Some(&mass as &dyn LinearOperator));
         for j in 0..7 {
             let v: Vec<f64> = (0..n)
                 .map(|i| ((i * 31 + j * 17) % 97) as f64 / 97.0 - 0.5)
@@ -38409,6 +38855,210 @@ mod krylov_eigen_tests {
         let t11 = schur.t.view((0, 0), (3, 3)).clone_owned();
         let invariance = (&h * &q1 - &q1 * t11).abs().max();
         assert!(invariance <= 1e-13, "‖H·Q₁ − Q₁·T₁₁‖ = {invariance:e}");
+    }
+
+    #[test]
+    fn eigsh_buckling_and_cayley_modes_and_return_eigenvectors_false() {
+        let n = 10;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            vals.push(2.5 + 0.2 * i as f64);
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                vals.push(-0.4);
+                rows.push(i + 1);
+                cols.push(i);
+                vals.push(-0.4);
+            }
+        }
+        let a = csr(n, vals, rows, cols);
+        let m_spd = csr(
+            n,
+            (0..n).map(|i| 1.0 + 0.1 * i as f64).collect(),
+            (0..n).collect(),
+            (0..n).collect(),
+        );
+        let m_indef = csr(
+            n,
+            (0..n)
+                .map(|i| if i % 2 == 0 { 1.0 } else { -0.7 })
+                .collect(),
+            (0..n).collect(),
+            (0..n).collect(),
+        );
+
+        let normal = eigsh(
+            &a,
+            3,
+            EigsOptions {
+                sigma: Some(2.6),
+                mass: Some(&m_spd),
+                mode: EigshMode::Normal,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("normal");
+        let buckling = eigsh(
+            &a,
+            3,
+            EigsOptions {
+                sigma: Some(2.6),
+                mass: Some(&m_spd),
+                mode: EigshMode::Buckling,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("buckling");
+        let cayley = eigsh(
+            &a,
+            3,
+            EigsOptions {
+                sigma: Some(2.6),
+                mass: Some(&m_spd),
+                mode: EigshMode::Cayley,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("cayley");
+        for (l_n, (l_b, l_c)) in normal
+            .eigenvalues
+            .iter()
+            .zip(buckling.eigenvalues.iter().zip(cayley.eigenvalues.iter()))
+        {
+            assert!(
+                (l_n - l_b).abs() <= 1e-11,
+                "buckling vs normal: {l_b} vs {l_n}"
+            );
+            assert!(
+                (l_n - l_c).abs() <= 1e-11,
+                "cayley vs normal: {l_c} vs {l_n}"
+            );
+        }
+        // In buckling mode, eigenvectors are A-orthonormal (X^T A X = I) even when M is indefinite.
+        let buck_indef = eigsh(
+            &a,
+            2,
+            EigsOptions {
+                sigma: Some(2.5),
+                mass: Some(&m_indef),
+                mode: EigshMode::Buckling,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("buckling indefinite M");
+        assert!(buck_indef.converged);
+        for (lam, v) in buck_indef
+            .eigenvalues
+            .iter()
+            .zip(buck_indef.eigenvectors.iter())
+        {
+            let av = a.matvec(v).expect("av");
+            let mv = m_indef.matvec(v).expect("mv");
+            let v_av = dot_product(v, &av);
+            assert!((v_av - 1.0).abs() <= 1e-11, "v^T A v = {v_av}");
+            let res: f64 = av
+                .iter()
+                .zip(&mv)
+                .map(|(ai, mi)| (ai - lam * mi).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(res <= 1e-10, "residual = {res:e}");
+        }
+
+        // return_eigenvectors = false omits eigenvectors while matching eigenvalues.
+        let no_vecs = eigsh(
+            &a,
+            3,
+            EigsOptions {
+                sigma: Some(2.6),
+                mass: Some(&m_spd),
+                mode: EigshMode::Cayley,
+                return_eigenvectors: false,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("no eigenvectors");
+        assert!(no_vecs.eigenvectors.is_empty());
+        assert_eq!(no_vecs.eigenvalues, cayley.eigenvalues);
+    }
+
+    #[test]
+    fn eigs_complex_sigma_real_and_imag_parts_and_conjugate_pair_split() {
+        let n = 10;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            vals.push(1.5 + 0.3 * i as f64);
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                vals.push(0.8);
+                rows.push(i + 1);
+                cols.push(i);
+                vals.push(-0.6);
+            }
+        }
+        let a = csr(n, vals, rows, cols);
+        let r_part = eigs(
+            &a,
+            2,
+            EigsOptions {
+                sigma: Some(2.4),
+                sigma_im: 0.5,
+                op_part: Some(EigsOpPart::Real),
+                ..EigsOptions::default()
+            },
+        )
+        .expect("OPpart='r'");
+        let i_part = eigs(
+            &a,
+            2,
+            EigsOptions {
+                sigma: Some(2.4),
+                sigma_im: 0.5,
+                op_part: Some(EigsOpPart::Imag),
+                ..EigsOptions::default()
+            },
+        )
+        .expect("OPpart='i'");
+        assert!(r_part.converged && i_part.converged);
+        for j in 0..2 {
+            let (lr, li) = (r_part.eigenvalues[j], r_part.eigenvalues_im[j]);
+            let (vr, vi) = (&r_part.eigenvectors[j], &r_part.eigenvectors_im[j]);
+            let avr = a.matvec(vr).expect("avr");
+            let avi = a.matvec(vi).expect("avi");
+            let res: f64 = (0..n)
+                .map(|idx| {
+                    let dr = avr[idx] - (lr * vr[idx] - li * vi[idx]);
+                    let di = avi[idx] - (lr * vi[idx] + li * vr[idx]);
+                    dr * dr + di * di
+                })
+                .sum::<f64>()
+                .sqrt();
+            assert!(res <= 1e-10, "OPpart='r' residual {res:e}");
+        }
+        // Splitting a complex conjugate pair (k=3) chooses the member closer to sigma.
+        let split_pos = eigs(
+            &a,
+            3,
+            EigsOptions {
+                sigma: Some(2.4),
+                sigma_im: 0.5,
+                return_eigenvectors: false,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("split +im");
+        assert!(split_pos.eigenvectors.is_empty() && split_pos.eigenvectors_im.is_empty());
+        assert_eq!(split_pos.eigenvalues.len(), 3);
     }
 }
 
