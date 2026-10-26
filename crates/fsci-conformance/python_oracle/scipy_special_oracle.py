@@ -18,6 +18,8 @@ def _decode_arg(value: Any) -> Any:
     if isinstance(value, dict):
         if set(value.keys()) == {"re", "im"}:
             return complex(float(value["re"]), float(value["im"]))
+        if set(value.keys()) == {"values"} and isinstance(value["values"], list):
+            return [_decode_arg(item) for item in value["values"]]
         return {key: _decode_arg(inner) for key, inner in value.items()}
     if isinstance(value, list):
         return [_decode_arg(item) for item in value]
