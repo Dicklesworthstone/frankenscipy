@@ -4852,64 +4852,114 @@ impl ContinuousDistribution for BetaDist {
     }
 
     fn fit(data: &[f64]) -> Self {
-        if data.is_empty()
-            || data
-                .iter()
-                .any(|&x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-        {
-            return Self {
-                a: f64::NAN,
-                b: f64::NAN,
-            };
-        }
-
-        let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        if !mean.is_finite() || !var.is_finite() || mean <= 0.0 || mean >= 1.0 || var <= 0.0 {
-            return Self {
-                a: f64::NAN,
-                b: f64::NAN,
-            };
-        }
-
-        let common = mean * (1.0 - mean) / var - 1.0;
-        if !common.is_finite() || common <= 0.0 {
-            return Self {
-                a: f64::NAN,
-                b: f64::NAN,
-            };
-        }
-
-        Self {
-            a: mean * common,
-            b: (1.0 - mean) * common,
-        }
+        Self::try_fit(data).unwrap_or(Self {
+            a: f64::NAN,
+            b: f64::NAN,
+        })
     }
 
+    /// Maximum-likelihood shapes on the fixed support `[0, 1]`.
+    /// Matches `scipy.stats.beta.fit(data, floc=0, fscale=1)`, including
+    /// rejection of observations exactly at either support endpoint.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // [frankenscipy-sf2ax]: typed-error counterpart to fit().
-        if data.is_empty() {
-            return Err(FitError::InsufficientData {
-                required: 1,
-                actual: 0,
-            });
-        }
-        if data
-            .iter()
-            .any(|&x| !x.is_finite() || !(0.0..=1.0).contains(&x))
-        {
+        validate_finite_fit_data(data, 1, "BetaDist")?;
+        if data.iter().any(|&x| x <= 0.0 || x >= 1.0) {
             return Err(FitError::UnsupportedData(
-                "BetaDist support is [0, 1]".into(),
+                "BetaDist MLE requires samples strictly between zero and one".into(),
             ));
         }
-        let fitted = Self::fit(data);
-        if !fitted.a.is_finite() || !fitted.b.is_finite() {
+        if data.iter().all(|&x| x == data[0]) {
             return Err(FitError::NonConvergent(
-                "BetaDist fit produced non-finite parameters".into(),
+                "BetaDist MLE has no finite shapes for a constant sample".into(),
             ));
         }
-        Ok(fitted)
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+        let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        let common = mean * (1.0 - mean) / variance - 1.0;
+        let mut a = mean * common;
+        let mut b = (1.0 - mean) * common;
+        if !a.is_finite() || !b.is_finite() || a <= 0.0 || b <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "BetaDist MLE has no finite shapes for a degenerate sample".into(),
+            ));
+        }
+        let log_x = data.iter().map(|x| x.ln()).sum::<f64>() / n;
+        let log_one_minus_x = data.iter().map(|&x| (-x).ln_1p()).sum::<f64>() / n;
+        let objective = |a: f64, b: f64| {
+            unwrap_special_scalar(fsci_special::betaln_scalar(a, b, active_stats_mode()))
+                - (a - 1.0) * log_x
+                - (b - 1.0) * log_one_minus_x
+        };
+        let mut value = objective(a, b);
+
+        // The beta log-likelihood is strictly concave in positive (a, b).
+        // Start from the moment estimate and solve its two score equations
+        // with a damped Newton step. Backtracking preserves positivity and
+        // decreases negative log-likelihood rather than clipping the shapes.
+        for _ in 0..200 {
+            let psi_a = digamma(a);
+            let psi_b = digamma(b);
+            let psi_sum = digamma(a + b);
+            let ga = psi_a - psi_sum - log_x;
+            let gb = psi_b - psi_sum - log_one_minus_x;
+            let tri_sum = fsci_special::trigamma(a + b);
+            let haa = fsci_special::trigamma(a) - tri_sum;
+            let hbb = fsci_special::trigamma(b) - tri_sum;
+            let determinant = haa * hbb - tri_sum * tri_sum;
+            if !determinant.is_finite() || determinant <= 0.0 {
+                break;
+            }
+            let da = (hbb * ga + tri_sum * gb) / determinant;
+            let db = (tri_sum * ga + haa * gb) / determinant;
+            if !da.is_finite() || !db.is_finite() {
+                break;
+            }
+            if (da / a).abs().max((db / b).abs()) <= 1e-8 {
+                // Apply the final correction. Demanding sub-ULP score
+                // changes can otherwise stall a valid large-shape fit,
+                // whose Hessian amplifies digamma's rounding error.
+                return Ok(Self {
+                    a: a - da,
+                    b: b - db,
+                });
+            }
+            // Concentrated samples have an ill-conditioned Hessian: a
+            // rounding-sized score can produce a large relative Newton
+            // step. Require BOTH score components to be unresolved at the
+            // precision of their digamma subtractions before stopping.
+            // Keep the current shapes instead of applying that noisy step.
+            let score_roundoff_a = 2.0 * f64::EPSILON * (psi_a.abs() + psi_sum.abs() + log_x.abs());
+            let score_roundoff_b =
+                2.0 * f64::EPSILON * (psi_b.abs() + psi_sum.abs() + log_one_minus_x.abs());
+            if ga.abs() <= score_roundoff_a && gb.abs() <= score_roundoff_b {
+                return Ok(Self { a, b });
+            }
+            let mut fraction = 1.0;
+            let mut accepted = false;
+            for _ in 0..60 {
+                let next_a = a - fraction * da;
+                let next_b = b - fraction * db;
+                if next_a > 0.0 && next_b > 0.0 && next_a.is_finite() && next_b.is_finite() {
+                    let next_value = objective(next_a, next_b);
+                    let roundoff = 8.0 * f64::EPSILON * (1.0 + value.abs());
+                    if next_value.is_finite() && next_value <= value + roundoff {
+                        a = next_a;
+                        b = next_b;
+                        value = next_value;
+                        accepted = true;
+                        break;
+                    }
+                }
+                fraction *= 0.5;
+            }
+            if !accepted {
+                break;
+            }
+        }
+        Err(FitError::NonConvergent(
+            "BetaDist MLE score equations did not converge".into(),
+        ))
     }
 
     fn skewness(&self) -> f64 {
@@ -5361,46 +5411,107 @@ impl ContinuousDistribution for GammaDist {
     }
 
     fn fit(data: &[f64]) -> Self {
-        if data.is_empty() || data.iter().any(|&x| !x.is_finite() || x < 0.0) {
-            return Self {
-                a: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-        let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        if var <= 0.0 || mean <= 0.0 {
-            return Self {
-                a: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-        let a = mean * mean / var;
-        let scale = var / mean;
-        Self { a, scale }
+        Self::try_fit(data).unwrap_or(Self {
+            a: f64::NAN,
+            scale: f64::NAN,
+        })
     }
 
+    /// Maximum-likelihood shape and scale with location fixed at zero.
+    /// Matches `scipy.stats.gamma.fit(data, floc=0)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // [frankenscipy-sf2ax]: typed-error counterpart to fit().
-        if data.is_empty() {
-            return Err(FitError::InsufficientData {
-                required: 1,
-                actual: 0,
-            });
-        }
-        if data.iter().any(|&x| !x.is_finite() || x < 0.0) {
+        validate_finite_fit_data(data, 1, "GammaDist")?;
+        if data.iter().any(|&x| x <= 0.0) {
             return Err(FitError::UnsupportedData(
-                "GammaDist requires non-negative finite samples".into(),
+                "GammaDist MLE with location fixed at zero requires positive samples".into(),
             ));
         }
-        let fitted = Self::fit(data);
-        if !fitted.a.is_finite() || !fitted.scale.is_finite() {
+
+        // Profile out scale = mean / a. The remaining score equation is
+        // log(a) - digamma(a) = log(mean) - mean(log(x)). Unlike the old
+        // moment estimate, its root maximizes the actual likelihood.
+        let n = data.len() as f64;
+        let max_x = data.iter().copied().fold(0.0_f64, f64::max);
+        let mean = max_x * (data.iter().map(|&x| x / max_x).sum::<f64>() / n);
+        let log_mean = mean.ln();
+        let s = data
+            .iter()
+            .map(|&x| {
+                let relative = (x - mean) / mean;
+                if relative.abs() <= 0.5 {
+                    // E[u] = 0, u = (x-mean)/mean. Computing E[u-log1p(u)]
+                    // preserves the Jensen gap for tightly clustered data,
+                    // even if the sample mean rounds by a last bit.
+                    -fsci_special::log1pmx_scalar(relative)
+                } else {
+                    // Keep the ratio itself in the tail: forming 1+relative
+                    // loses its significant bits when x is much smaller than
+                    // the mean. Fall back to log differences on underflow.
+                    let ratio = x / mean;
+                    let log_ratio = if ratio > 0.0 {
+                        ratio.ln()
+                    } else {
+                        x.ln() - log_mean
+                    };
+                    ratio - 1.0 - log_ratio
+                }
+            })
+            .sum::<f64>()
+            / n;
+        if !s.is_finite() || s <= 0.0 {
             return Err(FitError::NonConvergent(
-                "GammaDist fit produced non-finite parameters".into(),
+                "GammaDist MLE has no finite shape for a degenerate sample".into(),
             ));
         }
-        Ok(fitted)
+
+        // 1/(2a) < log(a)-digamma(a) < 1/a brackets the unique root.
+        let mut lo = 0.5 / s;
+        let mut hi = 1.0 / s;
+        if !hi.is_finite() {
+            return Err(FitError::NonConvergent(
+                "GammaDist MLE shape exceeds the finite parameter range".into(),
+            ));
+        }
+        for _ in 0..100 {
+            let a = lo + 0.5 * (hi - lo);
+            let gap = if a < 16.0 {
+                a.ln() - digamma(a)
+            } else {
+                // Bernoulli expansion avoids subtracting nearly equal log(a)
+                // and digamma(a) for large shape. At a >= 16 the omitted term
+                // is below double-precision roundoff of this difference.
+                let inverse = a.recip();
+                let square = inverse * inverse;
+                0.5 * inverse
+                    + square
+                        * (1.0 / 12.0
+                            + square
+                                * (-1.0 / 120.0
+                                    + square
+                                        * (1.0 / 252.0
+                                            + square
+                                                * (-1.0 / 240.0
+                                                    + square
+                                                        * (1.0 / 132.0
+                                                            - square * (691.0 / 32760.0))))))
+            };
+            if gap > s {
+                lo = a;
+            } else {
+                hi = a;
+            }
+            if hi - lo <= 4.0 * f64::EPSILON * a {
+                break;
+            }
+        }
+        let a = lo + 0.5 * (hi - lo);
+        let scale = mean / a;
+        if !a.is_finite() || a <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "GammaDist MLE produced non-finite or non-positive parameters".into(),
+            ));
+        }
+        Ok(Self { a, scale })
     }
 
     fn entropy(&self) -> f64 {
@@ -82396,8 +82507,60 @@ mod tests {
     fn test_fit_gamma() {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0];
         let g = GammaDist::fit(&data);
-        assert!(g.a.is_finite() && g.a > 0.0);
-        assert!(g.scale.is_finite() && g.scale > 0.0);
+        // scipy.stats.gamma.fit(data, floc=0). The old moment estimator
+        // returned (4.5, 2/3), which does not solve the likelihood score.
+        assert_close(g.a, 3.701_643_810_008_814, 1e-11, "gamma MLE shape");
+        assert_close(g.scale, 0.810_450_749_444_976_1, 1e-12, "gamma MLE scale");
+        let moment_fit = GammaDist::new(4.5, 2.0 / 3.0);
+        let improvement: f64 = data
+            .iter()
+            .map(|&x| g.logpdf(x) - moment_fit.logpdf(x))
+            .sum();
+        assert!(improvement > 0.05, "MLE improvement was {improvement}");
+    }
+
+    #[test]
+    fn test_fit_gamma_is_scale_equivariant_at_extreme_magnitudes() {
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let reference = GammaDist::try_fit(&data).expect("finite fit");
+        for scale in [1e-300, 3e307] {
+            let scaled: Vec<f64> = data.iter().map(|x| x * scale).collect();
+            let fitted = GammaDist::try_fit(&scaled).expect("scaled fit");
+            assert_close(fitted.a, reference.a, 1e-11, "scale-invariant shape");
+            assert_close(
+                fitted.scale / scale,
+                reference.scale,
+                1e-12,
+                "equivariant gamma scale",
+            );
+        }
+        let concentrated = GammaDist::try_fit(&[1.0 - 1e-8, 1.0, 1.0 + 1e-8])
+            .expect("a nonconstant sample has a finite MLE");
+        assert!(concentrated.a > 1e15 && concentrated.a.is_finite());
+        assert!(concentrated.scale > 0.0);
+        assert_close(concentrated.mean(), 1.0, 1e-15, "fitted gamma mean");
+    }
+
+    #[test]
+    fn test_fit_gamma_rejects_invalid_and_degenerate_samples() {
+        assert!(matches!(
+            GammaDist::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                GammaDist::try_fit(&[1.0, 2.0, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        for data in [&[1.0][..], &[2.0, 2.0, 2.0][..]] {
+            assert!(matches!(
+                GammaDist::try_fit(data),
+                Err(FitError::NonConvergent(_))
+            ));
+            let fitted = GammaDist::fit(data);
+            assert!(fitted.a.is_nan() && fitted.scale.is_nan());
+        }
     }
 
     #[test]
@@ -82420,15 +82583,104 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_beta_matches_moments() {
+    fn test_fit_beta_maximizes_likelihood_instead_of_matching_moments() {
         let reference = BetaDist::new(2.0, 5.0);
         let mean = reference.mean();
         let var = reference.var();
         let delta = (1.5 * var).sqrt();
         let data = [mean - delta, mean, mean + delta];
-        let fitted = BetaDist::fit(&data);
-        assert_close(fitted.a, reference.a, 1e-10, "beta fit a");
-        assert_close(fitted.b, reference.b, 1e-10, "beta fit b");
+        let fitted = BetaDist::try_fit(&data).expect("beta MLE");
+        // SciPy with floc=0, fscale=1. This fixture's moment estimate is
+        // exactly (2, 5), but that estimate is not the likelihood maximum.
+        assert_close(fitted.a, 1.972_496_504_777_491_4, 1e-9, "beta MLE a");
+        assert_close(fitted.b, 4.999_632_007_167_58, 1e-9, "beta MLE b");
+        let improvement: f64 = data
+            .iter()
+            .map(|&x| fitted.logpdf(x) - reference.logpdf(x))
+            .sum();
+        assert!(improvement > 1e-4, "MLE improvement was {improvement}");
+        let log_x = data.iter().map(|x| x.ln()).sum::<f64>() / 3.0;
+        let log_one_minus_x = data.iter().map(|&x| (-x).ln_1p()).sum::<f64>() / 3.0;
+        assert_close(
+            digamma(fitted.a) - digamma(fitted.a + fitted.b),
+            log_x,
+            1e-10,
+            "beta first score",
+        );
+        assert_close(
+            digamma(fitted.b) - digamma(fitted.a + fitted.b),
+            log_one_minus_x,
+            1e-10,
+            "beta second score",
+        );
+    }
+
+    #[test]
+    fn test_fit_beta_handles_shapes_below_one() {
+        let data = [0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.4, 0.7];
+        let fitted = BetaDist::try_fit(&data).expect("skewed beta MLE");
+        assert_close(fitted.a, 0.686_866_780_034_621_1, 1e-9, "beta MLE a");
+        assert_close(fitted.b, 2.776_495_801_166_083_4, 1e-8, "beta MLE b");
+        let reflected: Vec<f64> = data.iter().map(|&x| 1.0 - x).collect();
+        let reverse = BetaDist::try_fit(&reflected).expect("reflected beta MLE");
+        assert_close(reverse.a, fitted.b, 1e-9, "beta reflection a");
+        assert_close(reverse.b, fitted.a, 1e-9, "beta reflection b");
+    }
+
+    #[test]
+    fn test_fit_beta_large_shapes_do_not_stall_at_roundoff() {
+        let data = [0.3329, 0.3331, 0.3332, 0.3334, 0.3335, 0.3337];
+        let fitted = BetaDist::try_fit(&data).expect("concentrated beta MLE");
+        // SciPy fixed-support fit. The score is a difference of digammas,
+        // so attainable parameter accuracy is conditioning-dependent.
+        assert!((fitted.a / 1_058_042.049_151_494_6 - 1.0).abs() < 1e-7);
+        assert!((fitted.b / 2_116_401.542_662_284 - 1.0).abs() < 1e-7);
+        let skewed = [1e-6, 1e-5, 3e-5, 1e-4, 2e-4, 7e-4, 1.1e-3];
+        let fitted = BetaDist::try_fit(&skewed).expect("skewed beta MLE");
+        assert_close(
+            fitted.a,
+            0.419_318_131_687_329_8,
+            1e-8,
+            "skewed beta shape a",
+        );
+        assert!((fitted.b / 1_370.690_275_191_510_4 - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_fit_beta_concentrated_score_roundoff_is_convergence() {
+        // SciPy fixed-support MLEs. These score residuals are below the
+        // precision of the digamma subtraction, while the Newton correction
+        // exceeds 1e-8 relative because the Hessian is nearly singular.
+        for (data, shape) in [
+            ([0.4999, 0.5, 0.5001], 18_749_999.500_004_13),
+            ([0.49999, 0.5, 0.50001], 1_874_999_999.506_658_3),
+        ] {
+            let fitted = BetaDist::try_fit(&data).expect("concentrated beta MLE");
+            assert!((fitted.a / shape - 1.0).abs() < 1e-8);
+            assert!((fitted.b / shape - 1.0).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn test_fit_beta_rejects_invalid_and_degenerate_samples() {
+        assert!(matches!(
+            BetaDist::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        for bad in [0.0, 1.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                BetaDist::try_fit(&[0.1, 0.5, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            let fitted = BetaDist::fit(&[0.1, 0.5, bad]);
+            assert!(fitted.a.is_nan() && fitted.b.is_nan());
+        }
+        for data in [&[0.5][..], &[0.2, 0.2, 0.2][..]] {
+            assert!(matches!(
+                BetaDist::try_fit(data),
+                Err(FitError::NonConvergent(_))
+            ));
+        }
     }
 
     #[test]
@@ -115801,11 +116053,10 @@ mod histogram_distribution_matches_scipy {
     fn test_stats_hardened_resource_caps_boundary() {
         use crate::{
             BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
-            GaussianKde, Normal, StatsError, StatsOptions,
-            bootstrap_with_options, describe_with_options, energy_distance_with_options,
-            permutation_test_with_options, ttest_1samp_with_options,
-            wasserstein_distance_with_options, with_hardened_max_resamples,
-            with_hardened_stats_caps,
+            GaussianKde, Normal, StatsError, StatsOptions, bootstrap_with_options,
+            describe_with_options, energy_distance_with_options, permutation_test_with_options,
+            ttest_1samp_with_options, wasserstein_distance_with_options,
+            with_hardened_max_resamples, with_hardened_stats_caps,
         };
         use fsci_runtime::{AuditAction, RuntimeMode};
 
@@ -115856,17 +116107,14 @@ mod histogram_distribution_matches_scipy {
             assert!(
                 energy_distance_with_options(&pair_ok, &pair_ok, hardened, Some(&ledger)).is_ok()
             );
-            assert!(
-                GaussianKde::new_with_options(&pair_ok, hardened, Some(&ledger)).is_ok()
-            );
+            assert!(GaussianKde::new_with_options(&pair_ok, hardened, Some(&ledger)).is_ok());
             assert!(audit_entries(&ledger).is_empty());
 
             for res in [
                 wasserstein_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger))
                     .err(),
                 energy_distance_with_options(&pair_over, &pair_ok, hardened, Some(&ledger)).err(),
-                GaussianKde::new_with_options(&pair_over, hardened, Some(&ledger))
-                .err(),
+                GaussianKde::new_with_options(&pair_over, hardened, Some(&ledger)).err(),
             ] {
                 let err = res.expect("pairwise_len = cap + 1 must fail closed");
                 assert!(matches!(err, StatsError::ResourceExhausted { .. }));
@@ -115943,11 +116191,11 @@ mod histogram_distribution_matches_scipy {
     fn test_stats_mode_awareness_and_audit_emission() {
         use crate::{
             BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, FitError,
-            GaussianKde, Normal, StatsError, StatsOptions,
-            bootstrap_with_options, describe_with_options, energy_distance_with_options,
-            ks_1samp_with_options, ks_2samp_with_options, pearsonr_with_options,
-            permutation_test_with_options, spearmanr_with_options, ttest_1samp_with_options,
-            ttest_ind_with_options, wasserstein_distance_with_options,
+            GaussianKde, Normal, StatsError, StatsOptions, bootstrap_with_options,
+            describe_with_options, energy_distance_with_options, ks_1samp_with_options,
+            ks_2samp_with_options, pearsonr_with_options, permutation_test_with_options,
+            spearmanr_with_options, ttest_1samp_with_options, ttest_ind_with_options,
+            wasserstein_distance_with_options,
         };
         use fsci_runtime::{AuditAction, RuntimeMode};
 
@@ -116137,13 +116385,13 @@ mod histogram_distribution_matches_scipy {
     #[test]
     fn test_stats_strict_mode_bit_identity_1000_calls() {
         use crate::{
-            BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, GaussianKde,
-            Normal, StatsOptions, bootstrap, bootstrap_with_options,
-            describe, describe_with_options, energy_distance, energy_distance_with_options,
-            ks_1samp, ks_1samp_with_options, ks_2samp, ks_2samp_with_options, pearsonr,
-            pearsonr_with_options, permutation_test, permutation_test_with_options, spearmanr,
-            spearmanr_with_options, ttest_1samp, ttest_1samp_with_options, ttest_ind,
-            ttest_ind_with_options, wasserstein_distance, wasserstein_distance_with_options,
+            BootstrapIntervalMethod, BootstrapMethod, ContinuousDistribution, GaussianKde, Normal,
+            StatsOptions, bootstrap, bootstrap_with_options, describe, describe_with_options,
+            energy_distance, energy_distance_with_options, ks_1samp, ks_1samp_with_options,
+            ks_2samp, ks_2samp_with_options, pearsonr, pearsonr_with_options, permutation_test,
+            permutation_test_with_options, spearmanr, spearmanr_with_options, ttest_1samp,
+            ttest_1samp_with_options, ttest_ind, ttest_ind_with_options, wasserstein_distance,
+            wasserstein_distance_with_options,
         };
         use fsci_runtime::RuntimeMode;
 
@@ -116315,9 +116563,7 @@ mod histogram_distribution_matches_scipy {
         }
 
         // With positive ridge regularization (alpha = 0.5), the collinear design is well-posed.
-        let x_unit: Vec<Vec<f64>> = (1..=15)
-            .map(|i| vec![i as f64, (i as f64) + 0.1])
-            .collect();
+        let x_unit: Vec<Vec<f64>> = (1..=15).map(|i| vec![i as f64, (i as f64) + 0.1]).collect();
         let y_unit: Vec<f64> = (1..=15).map(|i| 1.0 + 1.5 * (i as f64)).collect();
         let ridge_reg = ridge_regression(&x_unit, &y_unit, 0.5);
         assert_eq!(ridge_reg.len(), 3);

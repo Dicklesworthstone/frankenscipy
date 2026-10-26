@@ -30,6 +30,7 @@ const PDF_TOL: f64 = 1.0e-12;
 const CDF_TOL: f64 = 1.0e-12;
 const SF_TOL: f64 = 1.0e-12;
 const PPF_TOL_REL: f64 = 1.0e-9;
+const FIT_TOL_REL: f64 = 1.0e-8;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,9 +70,19 @@ struct PpfArm {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    a: f64,
+    scale: f64,
+    log_likelihood: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OracleResult {
     points: Vec<PointArm>,
     ppf: Vec<PpfArm>,
+    fits: Vec<FitArm>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +176,7 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import sys
+import numpy as np
 from scipy.stats import gamma
 
 q = json.load(sys.stdin)
@@ -188,7 +200,14 @@ for case in q["ppf"]:
         ppf.append({"case_id": cid, "ppf": float(gamma.ppf(qv, a, 0.0, scale))})
     except Exception:
         ppf.append({"case_id": cid, "ppf": None})
-print(json.dumps({"points": points, "ppf": ppf}))
+fits = []
+for seed, (a, scale) in enumerate([(0.3, 0.7), (2.5, 2.0), (15.0, 100.0)], 715):
+    data = gamma.rvs(a, scale=scale, size=2000, random_state=np.random.default_rng(seed))
+    fitted_a, _, fitted_scale = gamma.fit(data, floc=0)
+    fits.append({"case_id": f"fit_a{a}_scale{scale}", "data": data.tolist(),
+                 "a": float(fitted_a), "scale": float(fitted_scale),
+                 "log_likelihood": float(gamma.logpdf(data, fitted_a, scale=fitted_scale).sum())})
+print(json.dumps({"points": points, "ppf": ppf, "fits": fits}))
 "#;
 
     let query_json = serde_json::to_string(query).expect("serialize gamma query");
@@ -339,4 +358,59 @@ fn diff_stats_gamma() {
     );
     // pdf/cdf/sf arms compare every point case, the ppf arm every ppf case.
     ledger.finish(query.points.len().min(query.ppf.len()));
+}
+
+#[test]
+fn diff_stats_gamma_fit_maximum_likelihood() {
+    let Some(oracle) = scipy_oracle_or_skip(&generate_query()) else {
+        return;
+    };
+    assert_eq!(oracle.fits.len(), 3, "all seeded fitting cases must run");
+    let mut ledger = CompareLedger::new("diff_stats_gamma_fit", &["shape", "scale", "likelihood"]);
+    let mut moment_failures = 0;
+    for case in oracle.fits {
+        assert_eq!(case.data.len(), 2000);
+        let fitted = GammaDist::try_fit(&case.data).expect("finite SciPy fit must have a Rust fit");
+        let log_likelihood: f64 = case.data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for (arm, rust, reference) in [
+            ("shape", fitted.a, case.a),
+            ("scale", fitted.scale, case.scale),
+            ("likelihood", log_likelihood, case.log_likelihood),
+        ] {
+            let (reference, rust) = ledger
+                .pair(arm, &case.case_id, Some(reference), Some(rust))
+                .expect("finite MLE parameters and likelihood");
+            let tolerance = FIT_TOL_REL * reference.abs().max(1.0);
+            let pass = if arm == "likelihood" {
+                rust >= reference - tolerance
+            } else {
+                (rust - reference).abs() <= tolerance
+            };
+            ledger.compared(arm, &case.case_id, pass);
+            assert!(
+                pass,
+                "{} {arm}: Rust={rust}, SciPy={reference}",
+                case.case_id
+            );
+        }
+        // A live negative control: the previous moment fit must be detected
+        // as worse than the likelihood contract on these same seeded samples.
+        let n = case.data.len() as f64;
+        let mean = case.data.iter().sum::<f64>() / n;
+        let variance = case.data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        let moment = GammaDist::new(mean * mean / variance, variance / mean);
+        let moment_ll: f64 = case.data.iter().map(|&x| moment.logpdf(x)).sum();
+        if moment_ll < case.log_likelihood - FIT_TOL_REL * case.log_likelihood.abs().max(1.0) {
+            moment_failures += 1;
+        }
+        eprintln!(
+            "{}: MLE=({}, {}), SciPy=({}, {}), LL={log_likelihood}, SciPy LL={}, moment LL={moment_ll}",
+            case.case_id, fitted.a, fitted.scale, case.a, case.scale, case.log_likelihood
+        );
+    }
+    assert_eq!(
+        moment_failures, 3,
+        "the old moment fit must fail every new MLE row"
+    );
+    ledger.finish(3);
 }
