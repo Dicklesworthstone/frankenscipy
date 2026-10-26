@@ -7,7 +7,9 @@ use fsci_runtime::{
     AuditAction, AuditLedger, RuntimeMode, SharedAuditLedger, SolverPortfolio,
     SyncSharedAuditLedger,
 };
-use fsci_signal::{SignalOptions, czt_with_mode_and_audit, lfilter_with_options, sync_audit_ledger};
+use fsci_signal::{
+    SignalOptions, czt_with_mode_and_audit, lfilter_with_options, sync_audit_ledger,
+};
 use fsci_spatial::KDTree;
 use libfuzzer_sys::fuzz_target;
 
@@ -294,7 +296,8 @@ fuzz_target!(|input: SymmetryInput| {
 
             if let Err(e_s) = &res_strict {
                 assert_eq!(
-                    fc_strict, 1,
+                    fc_strict,
+                    1,
                     "czt Strict Err({e_s:?}) must record exactly 1 FailClosed, got {fc_strict} (len={}, m={m})",
                     x.len()
                 );
@@ -304,7 +307,8 @@ fuzz_target!(|input: SymmetryInput| {
 
             if let Err(e_h) = &res_hard {
                 assert_eq!(
-                    fc_hard, 1,
+                    fc_hard,
+                    1,
                     "czt Hardened Err({e_h:?}) must record exactly 1 FailClosed, got {fc_hard} (len={}, m={m})",
                     x.len()
                 );
