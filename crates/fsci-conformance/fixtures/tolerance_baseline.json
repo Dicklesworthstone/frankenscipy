@@ -24,7 +24,10 @@
   "diff_cluster_homog_complete_v.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_cluster_kmeans_properties.rs": {},
+  "diff_cluster_kmeans_properties.rs": {
+    "CENTROID_MEAN_TOL": 1e-9,
+    "INERTIA_REL_TOL": 1e-9
+  },
   "diff_cluster_linkage_from_distances.rs": {
     "ABS_TOL": 1e-12
   },
@@ -79,14 +82,18 @@
   "diff_fft_fftconvolve_fftcorrelate.rs": {
     "ABS_TOL": 1e-10
   },
-  "diff_fft_fftpack_pseudo_diffs.rs": {},
+  "diff_fft_fftpack_pseudo_diffs.rs": {
+    "ABS_TOL": 1e-13
+  },
   "diff_fft_helpers_windows_pad.rs": {
     "ABS_TOL": 1e-10
   },
   "diff_fft_hfft_ihfft.rs": {
     "ABS_TOL": 1e-10
   },
-  "diff_fft_hfft_nd.rs": {},
+  "diff_fft_hfft_nd.rs": {
+    "ABS_TOL": 1e-8
+  },
   "diff_fft_hilbert_analytic.rs": {
     "ABS_TOL": 1e-10
   },
@@ -114,7 +121,9 @@
   "diff_fft_shared_plan_cache.rs": {},
   "diff_fft_shift_live.rs": {},
   "diff_fft_take_transform_traces.rs": {},
-  "diff_integrate.rs": {},
+  "diff_integrate.rs": {
+    "ABS_TOL": 1e-10
+  },
   "diff_integrate_cubature_scalar.rs": {
     "ABS_TOL": 1e-6
   },
@@ -141,7 +150,13 @@
     "T_GRID_REL_TOL": 1e-12,
     "Y_SCALE_TOL": 1e-6
   },
-  "diff_integrate_monte_carlo_qmc_quad.rs": {},
+  "diff_integrate_monte_carlo_qmc_quad.rs": {
+    "MC_CONST_SE_FLOOR_TOL": 1e-6,
+    "MC_PI_SE_FLOOR_TOL": 0.01,
+    "MC_QMC_SE_FLOOR_TOL": 0.001,
+    "MC_SE_MULT_TOL": 4.0,
+    "QMC_SINGLE_EST_TOL": 1e-12
+  },
   "diff_integrate_odeint_closed_form.rs": {
     "ABS_TOL": 0.0001
   },
@@ -161,8 +176,19 @@
     "LI_ABS_TOL": 0.0001,
     "QV_ABS_TOL": 1e-8
   },
-  "diff_integrate_romb_func_quad_explain.rs": {},
-  "diff_integrate_romberg_nquad.rs": {},
+  "diff_integrate_romb_func_quad_explain.rs": {
+    "ROMB_POLY_TOL": 1e-9,
+    "ROMB_SIN_QUAD_TOL": 1e-8,
+    "ROMB_SQRT_LOW_ORDER_TOL": 0.01,
+    "ROMB_TIGHT_TOL": 1e-10
+  },
+  "diff_integrate_romberg_nquad.rs": {
+    "NQUAD_0D_TOL": 1e-12,
+    "NQUAD_2D_POLY_TOL": 1e-8,
+    "NQUAD_MULTI_TOL": 1e-7,
+    "ROMBERG_POLY_TOL": 1e-10,
+    "ROMBERG_TRIG_EXP_TOL": 1e-9
+  },
   "diff_integrate_sample_variants.rs": {
     "ABS_TOL": 1e-10
   },
@@ -239,7 +265,13 @@
     "VAL_TOL": 1e-9
   },
   "diff_io_loadmat_corpus.rs": {},
-  "diff_linalg.rs": {},
+  "diff_linalg.rs": {
+    "ABS_TOL": 1e-10,
+    "DIAG_DOMINANT_SOLVE_TOL": 1e-10,
+    "HILBERT_4X4_SOLVE_TOL": 1e-8,
+    "HILBERT_6X6_SOLVE_TOL": 1e-6,
+    "SYMMETRIC_INDEFINITE_4X4_SOLVE_TOL": 0.0012
+  },
   "diff_linalg_adjugate_cofactor.rs": {
     "ABS_TOL": 1e-9
   },
@@ -278,7 +310,11 @@
   "diff_linalg_funm_complex.rs": {
     "FUNM_REL_TOL": 1e-12
   },
-  "diff_linalg_interpolative_norm.rs": {},
+  "diff_linalg_interpolative_norm.rs": {
+    "FLOOR_TOL": 1e-13,
+    "HALF_GAP_CEIL_TOL": 1e-11,
+    "UPPER_ROUNDING_TOL": 1e-12
+  },
   "diff_linalg_interpolative_reconstruct.rs": {
     "REL_TOL": 1e-11
   },
@@ -311,7 +347,9 @@
     "ABS_TOL": 1e-12,
     "REL_TOL": 1e-10
   },
-  "diff_linalg_matrix_random_allclose.rs": {},
+  "diff_linalg_matrix_random_allclose.rs": {
+    "SPD_ASYM_TOL": 1e-12
+  },
   "diff_linalg_misc_deterministic.rs": {
     "ABS_TOL": 1e-12
   },
@@ -379,7 +417,9 @@
   "diff_linalg_vector_misc.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_ndimage.rs": {},
+  "diff_ndimage.rs": {
+    "ABS_TOL": 1e-10
+  },
   "diff_ndimage_affine_transform_properties.rs": {
     "ABS_TOL": 1e-9
   },
@@ -473,7 +513,8 @@
     "ABS_TOL": 1e-10
   },
   "diff_odr.rs": {
-    "REL_TOL": 0.15
+    "REL_TOL": 0.15,
+    "SCALE_REL_TOL": 1e-6
   },
   "diff_opt.rs": {
     "MIN_TOL": 0.0001,
@@ -488,9 +529,11 @@
     "GRAD_ABS_TOL": 1e-7
   },
   "diff_opt_audit_record_helpers.rs": {},
-  "diff_opt_augmented_lagrangian.rs": {},
+  "diff_opt_augmented_lagrangian.rs": {
+    "ABS_TOL": 0.05
+  },
   "diff_opt_bfgs.rs": {
-    "CG_X_REL_TOL": 0.00005,
+    "CG_X_REL_TOL": 0.0001,
     "FD_FUN_ABS_TOL": 1e-9,
     "FD_X_REL_TOL": 0.00001,
     "FUN_REL_TOL": 1e-10,
@@ -512,8 +555,13 @@
     "BRUTE_TOL": 0.5,
     "PSO_TOL": 0.01
   },
-  "diff_opt_casp_problem_constructors.rs": {},
-  "diff_opt_cobyla.rs": {},
+  "diff_opt_casp_problem_constructors.rs": {
+    "SCALE_RATIO_LARGE_TOL": 1e-9,
+    "SCALE_RATIO_UNIT_TOL": 1e-12
+  },
+  "diff_opt_cobyla.rs": {
+    "ABS_TOL": 0.05
+  },
   "diff_opt_cobyla_minimize.rs": {
     "FUN_REL_TOL": 0.0001,
     "X_REL_TOL": 0.001
@@ -521,14 +569,18 @@
   "diff_opt_curve_fit.rs": {
     "ABS_TOL": 1e-6
   },
-  "diff_opt_de_constrained.rs": {},
+  "diff_opt_de_constrained.rs": {
+    "ABS_TOL": 0.01
+  },
   "diff_opt_derivative.rs": {
     "ABS_TOL": 1e-8
   },
   "diff_opt_fsolve.rs": {
     "ABS_TOL": 1e-6
   },
-  "diff_opt_global_minimizers.rs": {},
+  "diff_opt_global_minimizers.rs": {
+    "ABS_TOL": 0.001
+  },
   "diff_opt_gradient_descent.rs": {
     "ABS_TOL": 0.001
   },
@@ -548,7 +600,9 @@
     "COST_REL_TOL": 1e-8,
     "X_REL_TOL": 1e-6
   },
-  "diff_opt_line_search_wolfe.rs": {},
+  "diff_opt_line_search_wolfe.rs": {
+    "WOLFE_SLACK_TOL": 1e-10
+  },
   "diff_opt_linear_sum_assignment.rs": {
     "ABS_TOL": 1e-12
   },
@@ -565,6 +619,8 @@
     "ABS_TOL": 1e-6
   },
   "diff_opt_minimize_audit_equivalence.rs": {
+    "@f_diff": 0.00001,
+    "@x_diff": 0.001,
     "ABS_TOL": 1e-12
   },
   "diff_opt_minimize_casp_bounds.rs": {
@@ -574,7 +630,8 @@
     "SEEDED_BOX_REL_TOL": 0.00001
   },
   "diff_opt_minimize_options.rs": {
-    "X_ABS_TOL": 1e-7
+    "CG_DEFAULT_SKYLAKEX_X_ABS_TOL": 0.00002,
+    "X_ABS_TOL": 0.000002
   },
   "diff_opt_minimize_quadratic.rs": {
     "ABS_TOL": 0.0001
@@ -599,7 +656,9 @@
     "SCALE_INVARIANCE_TOL": 0.0001,
     "X_ABS_TOL": 1e-8
   },
-  "diff_opt_projected_gradient_descent.rs": {},
+  "diff_opt_projected_gradient_descent.rs": {
+    "ABS_TOL": 0.01
+  },
   "diff_opt_root_brenth_ridder_toms748.rs": {
     "RESID_ABS_TOL": 1e-10,
     "X_ABS_TOL": 1e-9
@@ -611,7 +670,9 @@
     "ABS_TOL": 1e-14,
     "REL_TOL": 1e-12
   },
-  "diff_opt_scalar_bounded_trisection.rs": {},
+  "diff_opt_scalar_bounded_trisection.rs": {
+    "ABS_TOL": 0.00001
+  },
   "diff_opt_scalar_min_fixed_point.rs": {
     "FIXED_POINT_TOL": 1e-8,
     "XMIN_TOL": 5e-6
@@ -620,13 +681,17 @@
     "ABS_TOL": 1e-9
   },
   "diff_opt_select_minimize_method.rs": {},
-  "diff_opt_simulated_annealing.rs": {},
+  "diff_opt_simulated_annealing.rs": {
+    "ABS_TOL": 4.0
+  },
   "diff_opt_slsqp_constrained.rs": {
     "FUN_REL_TOL": 1e-8,
     "MAXCV_TOL": 1e-6,
     "X_REL_TOL": 1e-6
   },
-  "diff_opt_tnc_slsqp_newton_cg_trust_constr.rs": {},
+  "diff_opt_tnc_slsqp_newton_cg_trust_constr.rs": {
+    "ABS_TOL": 0.001
+  },
   "diff_opt_trust_constr_constrained.rs": {
     "FUN_REL_TOL": 1e-7,
     "MAXCV_TOL": 1e-8,
@@ -638,7 +703,9 @@
     "NIT_REL_TOL": 0.3,
     "X_REL_TOL": 1e-7
   },
-  "diff_opt_validate_wolfe_root_dispatch.rs": {},
+  "diff_opt_validate_wolfe_root_dispatch.rs": {
+    "ROOT_DISPATCH_X_TOL": 0.0001
+  },
   "diff_optimize_bracket_minimum.rs": {},
   "diff_optimize_bracket_root.rs": {},
   "diff_optimize_find_minimum.rs": {},
@@ -651,8 +718,15 @@
   "diff_runtime_close_within_tol.rs": {},
   "diff_runtime_decision_loss_matrix.rs": {},
   "diff_runtime_decision_signals_is_finite.rs": {},
-  "diff_runtime_policy_evidence_ledger.rs": {},
-  "diff_runtime_solver_portfolio_calibrator.rs": {},
+  "diff_runtime_policy_evidence_ledger.rs": {
+    "CONFIDENCE_POSTERIOR_TOL": 1e-15
+  },
+  "diff_runtime_solver_portfolio_calibrator.rs": {
+    "LOSS_MATCH_TOL": 1e-12,
+    "POSTERIOR_ACCESSOR_TOL": 1e-9,
+    "TINY_ERROR_MISCOVERAGE_TOL": 0.01,
+    "T_HAT_MATCH_TOL": 1e-15
+  },
   "diff_runtime_test_log_entry_builder.rs": {},
   "diff_scipy_warnings_errstate.rs": {
     "FIT_VALUE_ABS_TOL": 1e-6,
@@ -919,7 +993,10 @@
   "diff_signal_zpk2tf.rs": {
     "ABS_TOL": 1e-10
   },
-  "diff_sparse.rs": {},
+  "diff_sparse.rs": {
+    "ABS_TOL": 1e-12,
+    "SPSOLVE_TOL": 1e-10
+  },
   "diff_sparse_audit_record_helpers.rs": {},
   "diff_sparse_basic_ops.rs": {
     "ABS_TOL": 1e-12
@@ -993,7 +1070,9 @@
   "diff_sparse_floyd_warshall.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_sparse_funm_multiply_krylov.rs": {},
+  "diff_sparse_funm_multiply_krylov.rs": {
+    "ABS_TOL": 1e-11
+  },
   "diff_sparse_gcrotmk.rs": {
     "SOLUTION_TOL": 1e-9
   },
@@ -1060,7 +1139,11 @@
     "NNZ_REL_TOL": 0.25,
     "SKEW_GMRES_TOL": 1e-10
   },
-  "diff_sparse_spilu_solve.rs": {},
+  "diff_sparse_spilu_solve.rs": {
+    "DIAG_RESIDUAL_TOL": 1e-12,
+    "PENTADIAG_RESIDUAL_TOL": 0.001,
+    "TRIDIAG_RESIDUAL_TOL": 1e-10
+  },
   "diff_sparse_splu_solve.rs": {
     "ABS_TOL": 1e-8
   },
@@ -1083,7 +1166,9 @@
   "diff_sparse_svds.rs": {
     "ABS_TOL": 0.0001
   },
-  "diff_spatial.rs": {},
+  "diff_spatial.rs": {
+    "ABS_TOL": 1e-10
+  },
   "diff_spatial_boolean_distances.rs": {
     "ABS_TOL": 1e-12
   },
@@ -1207,8 +1292,13 @@
     "ABS_TOL": 1e-9,
     "REL_TOL": 1e-9
   },
-  "diff_special_betaincc.rs": {},
-  "diff_special_betaincinv.rs": {},
+  "diff_special_betaincc.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-9
+  },
+  "diff_special_betaincinv.rs": {
+    "REL_TOL": 1e-9
+  },
   "diff_special_binom_zetac.rs": {
     "ABS_TOL": 1e-10,
     "REL_TOL": 1e-10,
@@ -1335,10 +1425,16 @@
     "REL_TOL": 1e-10
   },
   "diff_special_hyp1f1.rs": {
-    "CANCELLATION_REL_TOL": 1e-13
+    "CANCELLATION_REL_TOL": 1e-13,
+    "REL_TOL": 5e-7
   },
-  "diff_special_hyp2f1.rs": {},
-  "diff_special_hyperu.rs": {},
+  "diff_special_hyp2f1.rs": {
+    "REL_TOL": 1e-9
+  },
+  "diff_special_hyperu.rs": {
+    "ABS_TOL": 5e-7,
+    "REL_TOL": 5e-7
+  },
   "diff_special_inv_boxcox1p.rs": {
     "ABS_TOL": 1e-12
   },
@@ -1531,7 +1627,9 @@
     "ABS_TOL": 1e-8,
     "REL_TOL": 1e-10
   },
-  "diff_stats.rs": {},
+  "diff_stats.rs": {
+    "ABS_TOL": 1e-9
+  },
   "diff_stats_2x2_effect_sizes.rs": {
     "ABS_TOL": 1e-12
   },
@@ -1592,6 +1690,7 @@
   },
   "diff_stats_beta.rs": {
     "CDF_TOL": 1e-12,
+    "FIT_TOL_REL": 1e-8,
     "PDF_TOL": 1e-12,
     "PPF_TOL_REL": 1e-9
   },
@@ -1864,6 +1963,7 @@
   },
   "diff_stats_gamma.rs": {
     "CDF_TOL": 1e-12,
+    "FIT_TOL_REL": 1e-8,
     "PDF_TOL": 1e-12,
     "PPF_TOL_REL": 1e-9,
     "SF_TOL": 1e-12
@@ -2164,7 +2264,9 @@
   "diff_stats_msign_rank_biserial.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_stats_mstats_trimmed_mean.rs": {},
+  "diff_stats_mstats_trimmed_mean.rs": {
+    "ABS_TOL": 1e-14
+  },
   "diff_stats_multiple_regression.rs": {
     "ABS_TOL": 1e-9
   },
@@ -2176,11 +2278,9 @@
     "CLOSED_FORM_REL_TOL": 1e-10,
     "CORRELATION_DIAG_TOL": 1e-7,
     "FROM_COVARIANCE_IDENTITY_TOL": 1e-14,
-    "MATRIX_T_RVS_MEAN_TOL": 0.35,
-    "MVHYPERGEOM_RVS_MEAN_TOL": 0.2,
     "ORTHONORMALITY_TOL": 1e-10,
     "ORTHO_DET_TOL": 1e-8,
-    "RVS_MEAN_TOL": 0.25,
+    "RVS_MEAN_Z_TOL": 4.0,
     "SERIES_ENTROPY_ABS_TOL": 1e-9,
     "SERIES_ENTROPY_REL_TOL": 1e-8,
     "SPECIAL_FN_ABS_TOL": 1e-10,

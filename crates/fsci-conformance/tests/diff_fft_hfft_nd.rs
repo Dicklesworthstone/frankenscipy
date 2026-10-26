@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-005";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-const TOL: f64 = 1e-8;
+const ABS_TOL: f64 = 1e-8;
+const TOL: f64 = ABS_TOL;
 /// One ledger arm per SciPy entrypoint compared.
 const ARMS: [&str; 4] = ["ihfft2", "hfft2", "ihfftn", "hfftn"];
 

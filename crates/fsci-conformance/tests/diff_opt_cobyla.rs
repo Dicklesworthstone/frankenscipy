@@ -15,7 +15,8 @@ use fsci_opt::{FminCobylaOptions, cobyla};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL: f64 = 5.0e-2;
+const ABS_TOL: f64 = 5.0e-2;
+const TOL: f64 = ABS_TOL;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {

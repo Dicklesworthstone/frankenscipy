@@ -28,6 +28,7 @@ use fsci_linalg::{DecompOptions, cholesky, mat_allclose, random_matrix, random_s
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const SPD_ASYM_TOL: f64 = 1e-12;
 /// One ledger arm per property check, each a single fixed case recorded under its own name.
 /// There is no SciPy side: the mat_allclose arms compare fsci's verdict with the documented
 /// boolean, the random_* arms are boolean invariants of fsci's own output, and
@@ -246,7 +247,7 @@ fn diff_linalg_matrix_random_allclose() {
         check(
             "random_spd_symmetric",
             Some((zeros.as_slice(), asym.as_slice())),
-            max_asym <= 1e-12,
+            max_asym <= SPD_ASYM_TOL,
             format!("max_asym={max_asym}"),
         );
 

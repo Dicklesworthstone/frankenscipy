@@ -58,7 +58,18 @@ fn emit_log(log: &DiffTestLog) {
     fs::write(path, json).expect("write log");
 }
 
-const TOL: f64 = 1e-10;
+const ABS_TOL: f64 = 1e-10;
+const TOL: f64 = ABS_TOL;
+const DIAG_DOMINANT_SOLVE_TOL: f64 = 1e-10;
+const HILBERT_4X4_SOLVE_TOL: f64 = 1e-8;
+// Hilbert 6x6 has cond ~1.5e7 with exact integer solution [-6, 210, -1680, 5040, -6300, 2772].
+// On SkylakeX (`blas=SkylakeX`, CI run 36242613403), SciPy's Cholesky answer moves by 5.52e-7
+// from the exact solution (diff 5.68e-7 vs fsci, ~9.0e-11 relative; frankenscipy-pvghr).
+const HILBERT_6X6_SOLVE_TOL: f64 = 1e-6;
+// Symmetric indefinite 4x4 has |x| up to 5.03e6 and cond ~1.3e9. On SkylakeX (`blas=SkylakeX`,
+// CI run 36242613403), SciPy's Bunch-Kaufman `sytrf` answer moves by 9.85e-4 abs (1.96e-10 rel),
+// while an LU answer lands 2.4e-3 away (frankenscipy-pvghr).
+const SYMMETRIC_INDEFINITE_4X4_SOLVE_TOL: f64 = 1.2e-3;
 const DEFINED_DIFF_CASES: usize = 44;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
@@ -734,22 +745,20 @@ fn diff_solve_hilbert_like_4x4() {
 fn diff_solve_with_casp_hilbert_4x4() {
     let a = make_hilbert_matrix(4);
     let b = vec![1.0, 1.0, 1.0, 1.0];
-    run_solve_with_casp_diff("solve_with_casp_hilbert_4x4", &a, &b, 1e-8);
+    run_solve_with_casp_diff("solve_with_casp_hilbert_4x4", &a, &b, HILBERT_4X4_SOLVE_TOL);
 }
 
 #[test]
 fn diff_solve_with_casp_hilbert_6x6() {
     let a = make_hilbert_matrix(6);
     let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-    // Hilbert 6x6 has cond ~1.5e7 with solution components up to 6300;
-    // 5e-7 abs tol corresponds to ~2.4e-11 relative error.
-    run_solve_with_casp_diff("solve_with_casp_hilbert_6x6", &a, &b, 5e-7);
+    run_solve_with_casp_diff("solve_with_casp_hilbert_6x6", &a, &b, HILBERT_6X6_SOLVE_TOL);
 }
 
 /// `Pᵀ·diag(-1, 1, 1, -1)·P` with `P` unit upper triangular and integer: symmetric
 /// indefinite, det = 1, cond ≈ 1.3e9 (frankenscipy-7tb8d.15). SciPy factors it with
-/// Bunch–Kaufman LDLᵀ (sytrf): its answer (|x| up to 5.0e6) moves by at most 1.2e-10 across
-/// OpenBLAS's kernels, while an LU answer lands 2.4e-3 away.
+/// Bunch–Kaufman LDLᵀ (sytrf): its answer (|x| up to 5.0e6) moves by at most 2.0e-10 rel
+/// (9.85e-4 abs on SkylakeX) across OpenBLAS's kernels, while an LU answer lands 2.4e-3 away.
 #[test]
 fn diff_solve_with_casp_symmetric_indefinite_4x4() {
     let a = vec![
@@ -759,21 +768,36 @@ fn diff_solve_with_casp_symmetric_indefinite_4x4() {
         vec![-5.0, -48.0, -8.0, 307.0],
     ];
     let b = vec![1.0, -2.0, 3.0, -4.0];
-    run_solve_with_casp_diff("solve_with_casp_symmetric_indefinite_4x4", &a, &b, 1e-8);
+    run_solve_with_casp_diff(
+        "solve_with_casp_symmetric_indefinite_4x4",
+        &a,
+        &b,
+        SYMMETRIC_INDEFINITE_4X4_SOLVE_TOL,
+    );
 }
 
 #[test]
 fn diff_solve_with_casp_diag_dominant_4x4() {
     let a = make_diag_dominant(4, 0x1234);
     let b = make_test_vector(4, 0x5678);
-    run_solve_with_casp_diff("solve_with_casp_diag_dominant_4x4", &a, &b, 1e-10);
+    run_solve_with_casp_diff(
+        "solve_with_casp_diag_dominant_4x4",
+        &a,
+        &b,
+        DIAG_DOMINANT_SOLVE_TOL,
+    );
 }
 
 #[test]
 fn diff_solve_with_casp_diag_dominant_8x8() {
     let a = make_diag_dominant(8, 0x2345);
     let b = make_test_vector(8, 0x6789);
-    run_solve_with_casp_diff("solve_with_casp_diag_dominant_8x8", &a, &b, 1e-10);
+    run_solve_with_casp_diff(
+        "solve_with_casp_diag_dominant_8x8",
+        &a,
+        &b,
+        DIAG_DOMINANT_SOLVE_TOL,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -784,30 +808,48 @@ fn diff_solve_with_casp_diag_dominant_8x8() {
 fn diff_solve_with_audit_hilbert_4x4() {
     let a = make_hilbert_matrix(4);
     let b = vec![1.0, 1.0, 1.0, 1.0];
-    run_solve_with_audit_diff("solve_with_audit_hilbert_4x4", &a, &b, 1e-8);
+    run_solve_with_audit_diff(
+        "solve_with_audit_hilbert_4x4",
+        &a,
+        &b,
+        HILBERT_4X4_SOLVE_TOL,
+    );
 }
 
 #[test]
 fn diff_solve_with_audit_hilbert_6x6() {
     let a = make_hilbert_matrix(6);
     let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-    // Hilbert 6x6 has cond ~1.5e7 with solution components up to 6300;
-    // 5e-7 abs tol corresponds to ~2.4e-11 relative error.
-    run_solve_with_audit_diff("solve_with_audit_hilbert_6x6", &a, &b, 5e-7);
+    run_solve_with_audit_diff(
+        "solve_with_audit_hilbert_6x6",
+        &a,
+        &b,
+        HILBERT_6X6_SOLVE_TOL,
+    );
 }
 
 #[test]
 fn diff_solve_with_audit_diag_dominant_4x4() {
     let a = make_diag_dominant(4, 0x1234);
     let b = make_test_vector(4, 0x5678);
-    run_solve_with_audit_diff("solve_with_audit_diag_dominant_4x4", &a, &b, 1e-10);
+    run_solve_with_audit_diff(
+        "solve_with_audit_diag_dominant_4x4",
+        &a,
+        &b,
+        DIAG_DOMINANT_SOLVE_TOL,
+    );
 }
 
 #[test]
 fn diff_solve_with_audit_diag_dominant_8x8() {
     let a = make_diag_dominant(8, 0x2345);
     let b = make_test_vector(8, 0x6789);
-    run_solve_with_audit_diff("solve_with_audit_diag_dominant_8x8", &a, &b, 1e-10);
+    run_solve_with_audit_diff(
+        "solve_with_audit_diag_dominant_8x8",
+        &a,
+        &b,
+        DIAG_DOMINANT_SOLVE_TOL,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════

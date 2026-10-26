@@ -18,6 +18,7 @@ use fsci_opt::{MultivariateRootMethod, MultivariateRootOptions, WolfeParams, roo
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const ROOT_DISPATCH_X_TOL: f64 = 1.0e-4;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -179,7 +180,7 @@ fn diff_opt_validate_wolfe_root_dispatch() {
             check(&case_id, false, note);
             continue;
         };
-        let close = (x[0] - 1.0).abs() < 1.0e-4 && x[1].abs() < 1.0e-4;
+        let close = (x[0] - 1.0).abs() < ROOT_DISPATCH_X_TOL && x[1].abs() < ROOT_DISPATCH_X_TOL;
         ledger.compared("root", &case_id, close);
         check(&case_id, close, format!("x={x:?} converged=true"));
     }

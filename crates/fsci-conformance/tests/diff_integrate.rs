@@ -19,7 +19,8 @@ use fsci_integrate::{
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-008";
-const TOL: f64 = 1.0e-10;
+const ABS_TOL: f64 = 1.0e-10;
+const TOL: f64 = ABS_TOL;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 /// Ledger arms of `diff_integrate_scalar`: the `func` of each case.
 const SCALAR_FUNCS: [&str; 5] = [

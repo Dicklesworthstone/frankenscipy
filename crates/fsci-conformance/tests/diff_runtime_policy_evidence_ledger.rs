@@ -16,6 +16,7 @@ use fsci_runtime::{DecisionSignals, PolicyController, RuntimeMode};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const CONFIDENCE_POSTERIOR_TOL: f64 = 1.0e-15;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -215,7 +216,7 @@ fn diff_runtime_policy_evidence_ledger() {
         let posterior_at_top = entry.posterior[entry.top_state.index()];
         check(
             "confidence_eq_posterior_at_top_state",
-            (entry.confidence() - posterior_at_top).abs() < 1.0e-15,
+            (entry.confidence() - posterior_at_top).abs() < CONFIDENCE_POSTERIOR_TOL,
             format!("conf={} post={}", entry.confidence(), posterior_at_top),
         );
 

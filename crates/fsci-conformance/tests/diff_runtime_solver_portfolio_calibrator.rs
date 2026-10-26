@@ -26,6 +26,10 @@ use fsci_runtime::{
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const POSTERIOR_ACCESSOR_TOL: f64 = 1e-9;
+const LOSS_MATCH_TOL: f64 = 1e-12;
+const TINY_ERROR_MISCOVERAGE_TOL: f64 = 0.01;
+const T_HAT_MATCH_TOL: f64 = 1e-15;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -114,7 +118,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         // For rcond=0.1, posterior should be entirely well-conditioned (p[0]=1)
         check(
             "select_well_posterior_first_one",
-            (posterior[0] - 1.0).abs() < 1e-9,
+            (posterior[0] - 1.0).abs() < POSTERIOR_ACCESSOR_TOL,
             format!("posterior={posterior:?}"),
         );
         check(
@@ -125,7 +129,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         // chosen_loss matches losses[action.index()]
         check(
             "select_well_chosen_loss_matches",
-            (chosen_loss - losses[action.index()]).abs() < 1e-12,
+            (chosen_loss - losses[action.index()]).abs() < LOSS_MATCH_TOL,
             format!("chosen={chosen_loss} expected={}", losses[action.index()]),
         );
     }
@@ -193,7 +197,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         let cal_before = p.calibrator().empirical_miscoverage();
         check(
             "observe_no_violations_at_tiny_error",
-            cal_before < 0.01,
+            cal_before < TINY_ERROR_MISCOVERAGE_TOL,
             format!("miscoverage={cal_before}"),
         );
         for _ in 0..20 {
@@ -250,7 +254,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         let mis_high = cal.empirical_miscoverage();
         check(
             "high_threshold_zero_violations",
-            mis_high < 1e-9,
+            mis_high < POSTERIOR_ACCESSOR_TOL,
             format!("miscoverage={mis_high}"),
         );
         // Lower threshold below smallest score — every score is a violation.
@@ -258,7 +262,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         let mis_low = cal.empirical_miscoverage();
         check(
             "zero_threshold_all_violations",
-            (mis_low - 1.0).abs() < 1e-9,
+            (mis_low - 1.0).abs() < POSTERIOR_ACCESSOR_TOL,
             format!("miscoverage={mis_low}"),
         );
     }
@@ -271,7 +275,7 @@ fn diff_runtime_solver_portfolio_calibrator() {
         }
         check(
             "alpha_returned",
-            (cal.alpha() - 0.03).abs() < 1e-9,
+            (cal.alpha() - 0.03).abs() < POSTERIOR_ACCESSOR_TOL,
             format!("alpha={}", cal.alpha()),
         );
         check(
@@ -286,14 +290,14 @@ fn diff_runtime_solver_portfolio_calibrator() {
         let mut p = SolverPortfolio::new(RuntimeMode::Strict, 8);
         check(
             "crc_default_alpha_005",
-            (p.alpha() - 0.05).abs() < 1e-12 && p.crc().t_hat() == 0.0,
+            (p.alpha() - 0.05).abs() < LOSS_MATCH_TOL && p.crc().t_hat() == 0.0,
             format!("alpha={} t_hat={}", p.alpha(), p.crc().t_hat()),
         );
         p.set_alpha(0.005);
         let (esc_action, _, _, _) = p.select_action(0.0078125, None);
         check(
             "crc_set_alpha_0005_escalates_wilkinson_rcond",
-            (p.crc().t_hat() - 0.0078125).abs() < 1e-15
+            (p.crc().t_hat() - 0.0078125).abs() < T_HAT_MATCH_TOL
                 && matches!(esc_action, SolverAction::PivotedQR),
             format!("t_hat={} action={esc_action:?}", p.crc().t_hat()),
         );

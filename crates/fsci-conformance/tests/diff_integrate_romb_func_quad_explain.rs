@@ -17,6 +17,10 @@ use fsci_integrate::{QuadOptions, quad_explain, romb_func};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const ROMB_TIGHT_TOL: f64 = 1e-10;
+const ROMB_POLY_TOL: f64 = 1e-9;
+const ROMB_SIN_QUAD_TOL: f64 = 1e-8;
+const ROMB_SQRT_LOW_ORDER_TOL: f64 = 1e-2;
 /// One ledger arm per routine; a case's arm is its id prefix.
 const ARMS: [&str; 2] = ["romb_func", "quad_explain"];
 
@@ -88,7 +92,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let r = romb_func(|_| 5.0, 0.0, 2.0, None, None).expect("constant");
         check(
             "romb_func_constant",
-            r.converged && (r.integral - 10.0).abs() < 1e-10,
+            r.converged && (r.integral - 10.0).abs() < ROMB_TIGHT_TOL,
             format!("integral={} converged={}", r.integral, r.converged),
         );
     }
@@ -98,7 +102,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let r = romb_func(|x| x * x, 0.0, 1.0, None, None).expect("quadratic");
         check(
             "romb_func_quadratic",
-            r.converged && (r.integral - 1.0 / 3.0).abs() < 1e-9,
+            r.converged && (r.integral - 1.0 / 3.0).abs() < ROMB_POLY_TOL,
             format!("integral={} converged={}", r.integral, r.converged),
         );
     }
@@ -108,7 +112,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let r = romb_func(|x| x * x * x, 0.0, 2.0, None, None).expect("cubic");
         check(
             "romb_func_cubic",
-            r.converged && (r.integral - 4.0).abs() < 1e-9,
+            r.converged && (r.integral - 4.0).abs() < ROMB_POLY_TOL,
             format!("integral={} converged={}", r.integral, r.converged),
         );
     }
@@ -118,7 +122,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let r = romb_func(|x: f64| x.sin(), 0.0, PI, None, None).expect("sine");
         check(
             "romb_func_sin",
-            r.converged && (r.integral - 2.0).abs() < 1e-8,
+            r.converged && (r.integral - 2.0).abs() < ROMB_SIN_QUAD_TOL,
             format!("integral={} converged={}", r.integral, r.converged),
         );
     }
@@ -129,7 +133,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let expected = std::f64::consts::E - 1.0;
         check(
             "romb_func_exp",
-            r.converged && (r.integral - expected).abs() < 1e-10,
+            r.converged && (r.integral - expected).abs() < ROMB_TIGHT_TOL,
             format!("integral={} converged={}", r.integral, r.converged),
         );
     }
@@ -142,7 +146,7 @@ fn diff_integrate_romb_func_quad_explain() {
         // Even non-converged, integral should be in the ballpark
         check(
             "romb_func_sqrt_low_order_imperfect",
-            (r.integral - 2.0 / 3.0).abs() < 1e-2,
+            (r.integral - 2.0 / 3.0).abs() < ROMB_SQRT_LOW_ORDER_TOL,
             format!(
                 "integral={} converged={} (allowed-not-converge)",
                 r.integral, r.converged
@@ -166,7 +170,7 @@ fn diff_integrate_romb_func_quad_explain() {
         let (result, msg) = quad_explain(|x| x * x, 0.0, 1.0, opts);
         check(
             "quad_explain_success_integral_correct",
-            result.converged && (result.integral - 1.0 / 3.0).abs() < 1e-8,
+            result.converged && (result.integral - 1.0 / 3.0).abs() < ROMB_SIN_QUAD_TOL,
             format!("integral={}", result.integral),
         );
         check(

@@ -28,7 +28,8 @@ use fsci_stats::{
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL: f64 = 1.0e-9;
+const ABS_TOL: f64 = 1.0e-9;
+const TOL: f64 = ABS_TOL;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]

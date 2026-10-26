@@ -15,7 +15,8 @@ use fsci_opt::{DifferentialEvolutionOptions, differential_evolution_constrained}
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL: f64 = 1.0e-2;
+const ABS_TOL: f64 = 1.0e-2;
+const TOL: f64 = ABS_TOL;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {

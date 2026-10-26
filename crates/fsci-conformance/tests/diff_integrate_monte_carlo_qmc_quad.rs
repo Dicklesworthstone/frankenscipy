@@ -22,6 +22,11 @@ use fsci_integrate::{monte_carlo_integrate, qmc_quad};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const MC_SE_MULT_TOL: f64 = 4.0;
+const MC_CONST_SE_FLOOR_TOL: f64 = 1e-6;
+const MC_QMC_SE_FLOOR_TOL: f64 = 1e-3;
+const MC_PI_SE_FLOOR_TOL: f64 = 1e-2;
+const QMC_SINGLE_EST_TOL: f64 = 1e-12;
 /// (case id prefix, ledger arm): one arm per routine.
 const ARMS: [(&str, &str); 2] = [("mc_", "monte_carlo_integrate"), ("qmc_", "qmc_quad")];
 
@@ -98,7 +103,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         let diff = (est - 1.0 / 3.0).abs();
         check(
             "mc_1d_quadratic_within_4se",
-            diff <= 4.0 * se.max(1e-3),
+            diff <= MC_SE_MULT_TOL * se.max(MC_QMC_SE_FLOOR_TOL),
             format!("est={est} se={se} diff={diff}"),
         );
     }
@@ -108,7 +113,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         let (est, se) = monte_carlo_integrate(|_| 1.0, &[(0.0, 1.0), (0.0, 1.0)], 10_000, 7);
         check(
             "mc_2d_constant",
-            (est - 1.0).abs() <= 4.0 * se.max(1e-6),
+            (est - 1.0).abs() <= MC_SE_MULT_TOL * se.max(MC_CONST_SE_FLOOR_TOL),
             format!("est={est} se={se}"),
         );
     }
@@ -129,7 +134,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         );
         check(
             "mc_2d_pi_estimate_within_4se",
-            (est - PI).abs() <= 4.0 * se.max(1e-2),
+            (est - PI).abs() <= MC_SE_MULT_TOL * se.max(MC_PI_SE_FLOOR_TOL),
             format!("est={est} se={se}"),
         );
     }
@@ -160,7 +165,8 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         let r = qmc_quad(|x| x[0] * x[0], &[0.0], &[1.0], 5, 256).expect("qmc 1d quadratic");
         check(
             "qmc_1d_quadratic_close",
-            (r.integral - 1.0 / 3.0).abs() <= 4.0 * r.standard_error.max(1e-3),
+            (r.integral - 1.0 / 3.0).abs()
+                <= MC_SE_MULT_TOL * r.standard_error.max(MC_QMC_SE_FLOOR_TOL),
             format!("integral={} se={}", r.integral, r.standard_error),
         );
     }
@@ -170,7 +176,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         let r = qmc_quad(|v| v[0] + v[1], &[0.0, 0.0], &[1.0, 1.0], 5, 256).expect("qmc 2d sum");
         check(
             "qmc_2d_sum_close",
-            (r.integral - 1.0).abs() <= 4.0 * r.standard_error.max(1e-3),
+            (r.integral - 1.0).abs() <= MC_SE_MULT_TOL * r.standard_error.max(MC_QMC_SE_FLOOR_TOL),
             format!("integral={} se={}", r.integral, r.standard_error),
         );
     }
@@ -187,7 +193,8 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         .expect("qmc 3d xyz");
         check(
             "qmc_3d_xyz_close",
-            (r.integral - 1.0 / 8.0).abs() <= 4.0 * r.standard_error.max(1e-3),
+            (r.integral - 1.0 / 8.0).abs()
+                <= MC_SE_MULT_TOL * r.standard_error.max(MC_QMC_SE_FLOOR_TOL),
             format!("integral={} se={}", r.integral, r.standard_error),
         );
     }
@@ -197,7 +204,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         let r = qmc_quad(|_| 1.0, &[0.0], &[1.0], 1, 256).expect("single estimate ok");
         check(
             "qmc_n_estimates_one_ok_zero_se",
-            (r.integral - 1.0).abs() < 1e-12 && r.standard_error == 0.0,
+            (r.integral - 1.0).abs() < QMC_SINGLE_EST_TOL && r.standard_error == 0.0,
             format!("integral={} se={}", r.integral, r.standard_error),
         );
     }

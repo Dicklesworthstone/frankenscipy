@@ -27,7 +27,8 @@ use fsci_sparse::{
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-const TOL: f64 = 1.0e-11;
+const ABS_TOL: f64 = 1.0e-11;
+const TOL: f64 = ABS_TOL;
 
 #[derive(Debug, Clone, Serialize)]
 struct Query {

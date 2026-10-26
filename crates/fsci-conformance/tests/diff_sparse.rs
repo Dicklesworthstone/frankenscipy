@@ -87,7 +87,9 @@ fn emit_ledgered_log(log: &DiffTestLog, ledger: &CompareLedger) {
     fs::write(path, json).expect("write log");
 }
 
-const TOL: f64 = 1e-12;
+const ABS_TOL: f64 = 1e-12;
+const TOL: f64 = ABS_TOL;
+const SPSOLVE_TOL: f64 = 1e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 fn dense_from_coo(coo: &CooMatrix) -> Vec<Vec<f64>> {
@@ -1152,7 +1154,7 @@ fn diff_017_spsolve_vs_scipy_superlu_4x4() {
     let csr = coo.to_csr().expect("csr");
     let rhs = vec![15.0, 10.0, 10.0, 10.0];
     let rust_result = spsolve(&csr, &rhs, SolveOptions::default()).map(|r| r.solution);
-    let tolerance = 1e-10;
+    let tolerance = SPSOLVE_TOL;
     // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
     let test_id = "diff_017_spsolve_vs_scipy_superlu_4x4";
     let mut ledger = CompareLedger::new(test_id, &["spsolve"]);
@@ -1219,7 +1221,7 @@ fn diff_018_large_spsolve_native_sparse_direct_vs_scipy() {
     // recorded as an fsci failure against SciPy's samples.
     let rust_samples: Result<Vec<f64>, SparseError> = spsolve(&csr, &rhs, SolveOptions::default())
         .map(|r| sample_indices.iter().map(|&idx| r.solution[idx]).collect());
-    let tolerance = 1e-10;
+    let tolerance = SPSOLVE_TOL;
     let test_id = "diff_018_large_spsolve_native_sparse_direct_vs_scipy";
     let mut ledger = CompareLedger::new(test_id, &["spsolve"]);
     let (diff, pass) = match ledger.slices(
@@ -1650,7 +1652,7 @@ fn diff_022_spsolve_with_casp_vs_scipy_superlu_4x4() {
     let mut portfolio = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
     let rust_result =
         spsolve_with_casp(&csr, &rhs, SolveOptions::default(), &mut portfolio).map(|r| r.solution);
-    let tolerance = 1e-10;
+    let tolerance = SPSOLVE_TOL;
     // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
     let test_id = "diff_022_spsolve_with_casp_vs_scipy_superlu_4x4";
     let mut ledger = CompareLedger::new(test_id, &["spsolve_with_casp"]);
@@ -1728,7 +1730,7 @@ fn diff_023_spsolve_with_audit_records_evidence_and_matches_scipy() {
     let rust_result =
         spsolve_with_audit(&csr, &rhs, SolveOptions::default(), &mut portfolio, &ledger)
             .map(|r| r.solution);
-    let tolerance = 1e-10;
+    let tolerance = SPSOLVE_TOL;
     // One case: an fsci error is recorded as an fsci failure against SciPy's solution.
     let test_id = "diff_023_spsolve_with_audit_records_evidence_and_matches_scipy";
     let mut compare_ledger = CompareLedger::new(test_id, &["spsolve_with_audit"]);

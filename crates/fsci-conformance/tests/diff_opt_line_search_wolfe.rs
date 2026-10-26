@@ -17,6 +17,7 @@ use fsci_opt::{WolfeParams, line_search_wolfe1, line_search_wolfe2};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const WOLFE_SLACK_TOL: f64 = 1e-10;
 /// One ledger arm per search (the ops `wolfe1`, `wolfe2`), each checked on every probe. There
 /// is no SciPy side and no reference value for α: the verdict is the Wolfe inequalities on the
 /// analytic quadratic, a boolean property that a NaN α fails (every comparison with NaN is
@@ -104,8 +105,8 @@ fn diff_opt_line_search_wolfe() {
             let g_at = g(&xp);
             let dg0 = dot(&g0, direction);
             let dg_at = dot(&g_at, direction);
-            let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + 1e-10;
-            let curvature_ok = dg_at >= params.c2 * dg0 - 1e-10;
+            let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + WOLFE_SLACK_TOL;
+            let curvature_ok = dg_at >= params.c2 * dg0 - WOLFE_SLACK_TOL;
             let pass = armijo_ok && curvature_ok && res.alpha > 0.0;
             ledger.compared("wolfe1", label, pass);
             diffs.push(CaseDiff {
@@ -128,8 +129,8 @@ fn diff_opt_line_search_wolfe() {
             let g_at = g(&xp);
             let dg0 = dot(&g0, direction);
             let dg_at = dot(&g_at, direction);
-            let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + 1e-10;
-            let strong_ok = dg_at.abs() <= params.c2 * dg0.abs() + 1e-10;
+            let armijo_ok = f_at <= f0 + params.c1 * res.alpha * dg0 + WOLFE_SLACK_TOL;
+            let strong_ok = dg_at.abs() <= params.c2 * dg0.abs() + WOLFE_SLACK_TOL;
             let pass = armijo_ok && strong_ok && res.alpha > 0.0;
             ledger.compared("wolfe2", label, pass);
             diffs.push(CaseDiff {

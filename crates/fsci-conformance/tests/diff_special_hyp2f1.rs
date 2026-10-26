@@ -29,7 +29,8 @@ use fsci_special::types::SpecialTensor;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL_REL: f64 = 1.0e-9;
+const REL_TOL: f64 = 1.0e-9;
+const TOL_REL: f64 = REL_TOL;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]

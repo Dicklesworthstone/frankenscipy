@@ -84,7 +84,10 @@ const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 /// Floor for the derived tolerances: no comparison of two independently-rounded reductions is
 /// meaningful below this.
-const TOLERANCE_FLOOR: f64 = 1e-13;
+const FLOOR_TOL: f64 = 1e-13;
+const TOLERANCE_FLOOR: f64 = FLOOR_TOL;
+const UPPER_ROUNDING_TOL: f64 = 1e-12;
+const HALF_GAP_CEIL_TOL: f64 = 1e-11;
 
 /// Safety factor on the predicted `(σ₂/σ₁)^(2·its)` bound, covering the constant the asymptotic
 /// rate omits. Kept small on purpose: measured errors sit far inside the bound (3.2e-7 against
@@ -536,12 +539,12 @@ fn diff_linalg_interpolative_spectral_norm() {
         // NO TOLERANCE: the power method cannot exceed the largest singular value. Applied to
         // both arms, because it is a property of the method rather than of either code.
         assert!(
-            ours <= true_norm * (1.0 + 1e-12),
+            ours <= true_norm * (1.0 + UPPER_ROUNDING_TOL),
             "case {}: our estimate {ours} exceeds the true norm {true_norm}",
             case.case_id
         );
         assert!(
-            scipy_estimate <= true_norm * (1.0 + 1e-12),
+            scipy_estimate <= true_norm * (1.0 + UPPER_ROUNDING_TOL),
             "case {}: the incumbent's estimate {scipy_estimate} exceeds the true norm \
              {true_norm} — the oracle, not us",
             case.case_id
@@ -564,8 +567,8 @@ fn diff_linalg_interpolative_spectral_norm() {
         ledger.compared(
             func,
             &case.case_id,
-            ours <= true_norm * (1.0 + 1e-12)
-                && scipy_estimate <= true_norm * (1.0 + 1e-12)
+            ours <= true_norm * (1.0 + UPPER_ROUNDING_TOL)
+                && scipy_estimate <= true_norm * (1.0 + UPPER_ROUNDING_TOL)
                 && ours_error <= tolerance
                 && scipy_error <= tolerance
                 && arms_difference <= 2.0 * tolerance,
@@ -674,7 +677,7 @@ fn derived_tolerance_tightens_with_the_spectral_gap() {
     // pin.
     let half = derived_tolerance(0.5, its);
     assert!(
-        half > TOLERANCE_FLOOR && half < 1e-11,
+        half > TOLERANCE_FLOOR && half < HALF_GAP_CEIL_TOL,
         "a 0.5 gap should be just above the floor, got {half:e}"
     );
 

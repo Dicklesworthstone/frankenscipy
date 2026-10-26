@@ -57,13 +57,9 @@ const ORTHONORMALITY_TOL: f64 = 1e-10;
 /// Unit diagonal of a random_correlation sample, fsci and SciPy: T5.
 const CORRELATION_DIAG_TOL: f64 = 1e-7;
 /// Sample means of fsci's seeded rvs (N = 1000-2000 draws) against the exact
-/// mean. These check a sampler's consistency, not SciPy agreement, and they sit
-/// ABOVE the policy's T6 ceiling (1e-1) without a §5 exception. They are named
-/// here so they cannot loosen further; replacing them with a z-score bound is
-/// frankenscipy-el4n5.
-const MVHYPERGEOM_RVS_MEAN_TOL: f64 = 0.2;
-const RVS_MEAN_TOL: f64 = 0.25;
-const MATRIX_T_RVS_MEAN_TOL: f64 = 0.35;
+/// mean, checked via `|m_est - mean| <= RVS_MEAN_Z_TOL * sqrt(var / N)` where `var`
+/// is the marginal variance (frankenscipy-el4n5).
+const RVS_MEAN_Z_TOL: f64 = 4.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiffRecord {
@@ -667,6 +663,19 @@ fn check_pair(
         pass,
         "[{family}] {case_id}: rust={rust_val}, scipy={scipy_val}, abs_diff={abs_diff}, rel_diff={rel_diff} (atol={atol}, rtol={rtol})"
     );
+}
+
+fn check_rvs_mean(
+    case_id: &str,
+    family: &str,
+    m_est: f64,
+    mean: f64,
+    var: f64,
+    n_samples: usize,
+    checks: &mut Checks,
+) {
+    let se_bound = RVS_MEAN_Z_TOL * (var / n_samples as f64).sqrt();
+    check_pair(case_id, family, m_est, mean, se_bound, 0.0, checks);
 }
 
 #[test]
@@ -1395,13 +1404,14 @@ fn diff_multivariate_stats_scipy_oracle() {
         for r in 0..case.mean.len() {
             for c in 0..case.mean[0].len() {
                 let m_est = sample_sum[r][c] / 1000.0;
-                check_pair(
+                let var = case.rowcov[r][r] * case.colcov[c][c];
+                check_rvs_mean(
                     &format!("{}_rvs_mean_{r}_{c}", case.case_id),
                     "MatrixNormal",
                     m_est,
                     case.mean[r][c],
-                    RVS_MEAN_TOL,
-                    RVS_MEAN_TOL,
+                    var,
+                    1000,
                     &mut checks,
                 );
             }
@@ -1473,13 +1483,14 @@ fn diff_multivariate_stats_scipy_oracle() {
         for r in 0..case.mean.len() {
             for c in 0..case.mean[0].len() {
                 let m_est = sample_sum[r][c] / 1000.0;
-                check_pair(
+                let var = case.row_spread[r][r] * case.col_spread[c][c] / (case.df - 2.0);
+                check_rvs_mean(
                     &format!("{}_rvs_mean_{r}_{c}", case.case_id),
                     "MatrixT",
                     m_est,
                     case.mean[r][c],
-                    MATRIX_T_RVS_MEAN_TOL,
-                    MATRIX_T_RVS_MEAN_TOL,
+                    var,
+                    1000,
                     &mut checks,
                 );
             }
@@ -1754,13 +1765,13 @@ fn diff_multivariate_stats_scipy_oracle() {
         ) {
             for (k, (&sm, &exp_m)) in sample_sum.iter().zip(scipy_mean).enumerate() {
                 let m_est = sm / 1000.0;
-                check_pair(
+                check_rvs_mean(
                     &format!("{}_rvs_mean_{k}", case.case_id),
                     "MultivariateHypergeom",
                     m_est,
                     exp_m,
-                    MVHYPERGEOM_RVS_MEAN_TOL,
-                    MVHYPERGEOM_RVS_MEAN_TOL,
+                    resp.var[k],
+                    1000,
                     &mut checks,
                 );
             }
@@ -1855,22 +1866,22 @@ fn diff_multivariate_stats_scipy_oracle() {
         }
         let est_mean_x = sum_x / 2000.0;
         let est_mean_s2 = sum_s2 / 2000.0;
-        check_pair(
+        check_rvs_mean(
             &format!("{}_rvs_mean_x", case.case_id),
             "NormalInverseGamma",
             est_mean_x,
             resp.mean_x,
-            RVS_MEAN_TOL,
-            RVS_MEAN_TOL,
+            resp.var_x,
+            2000,
             &mut checks,
         );
-        check_pair(
+        check_rvs_mean(
             &format!("{}_rvs_mean_s2", case.case_id),
             "NormalInverseGamma",
             est_mean_s2,
             resp.mean_s2,
-            RVS_MEAN_TOL,
-            RVS_MEAN_TOL,
+            resp.var_s2,
+            2000,
             &mut checks,
         );
     }
@@ -1989,13 +2000,13 @@ fn diff_multivariate_stats_scipy_oracle() {
         ) {
             for (k, (&sm, &exp_m)) in sample_sum.iter().zip(scipy_mean).enumerate() {
                 let m_est = sm / 1500.0;
-                check_pair(
+                check_rvs_mean(
                     &format!("{}_rvs_mean_{k}", case.case_id),
                     "Multinomial",
                     m_est,
                     exp_m,
-                    RVS_MEAN_TOL,
-                    RVS_MEAN_TOL,
+                    resp.cov[k][k],
+                    1500,
                     &mut checks,
                 );
             }

@@ -62,7 +62,11 @@ const X_REL_TOL: f64 = 1.0e-7;
 const FUN_REL_TOL: f64 = 1.0e-10;
 const FD_X_REL_TOL: f64 = 1.0e-5;
 const FD_FUN_ABS_TOL: f64 = 1.0e-9;
-const CG_X_REL_TOL: f64 = 5.0e-5;
+// SkylakeX OpenBLAS kernel (CI run 36238057597, job 108393367150, `blas=SkylakeX`):
+// `CG/rosen2/fd` terminates with status 2 (precision loss) and x rel diff 6.66e-5 (fun diff
+// 2.7e-9), while Haswell/Zen/Sandybridge/Nehalem/Prescott terminate with status 0 at (37, 280,
+// 93, 0) matching fsci (frankenscipy-pvghr).
+const CG_X_REL_TOL: f64 = 1.0e-4;
 const NEWTON_FD_X_REL_TOL: f64 = 5.0e-5;
 const NEWTON_FD_FUN_ABS_TOL: f64 = 1.0e-8;
 const NIT_REL_TOL: f64 = 0.3;
@@ -309,9 +313,12 @@ fn cases(problems: &[Problem]) -> Vec<Case> {
                     analytic,
                     curvature: "",
                     maxiter: None,
-                    kernel_statuses: if method == OptimizeMethod::Bfgs
+                    kernel_statuses: if (method == OptimizeMethod::Bfgs
                         && problem.name == "rosen10"
-                        && !analytic
+                        && !analytic)
+                        || (method == OptimizeMethod::ConjugateGradient
+                            && problem.name == "rosen2"
+                            && !analytic)
                     {
                         &[0, 2]
                     } else {

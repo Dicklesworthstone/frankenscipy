@@ -15,7 +15,8 @@ use fsci_fft::fftpack;
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-const TOL: f64 = 1.0e-13;
+const ABS_TOL: f64 = 1.0e-13;
+const TOL: f64 = ABS_TOL;
 
 #[derive(Debug, Clone, Serialize)]
 struct Query {

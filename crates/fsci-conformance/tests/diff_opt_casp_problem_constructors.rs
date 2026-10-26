@@ -20,6 +20,8 @@ use fsci_opt::types::{Bound, Constraint, MinimizeOptions};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const SCALE_RATIO_LARGE_TOL: f64 = 1.0e-9;
+const SCALE_RATIO_UNIT_TOL: f64 = 1.0e-12;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -373,14 +375,14 @@ fn diff_opt_casp_problem_constructors() {
             "scale_spread",
             "ratio_a_eq_1e6",
             true,
-            (p_a.variable_scale_ratio - 1.0e6).abs() < 1.0e-9,
+            (p_a.variable_scale_ratio - 1.0e6).abs() < SCALE_RATIO_LARGE_TOL,
         );
         check(
             &mut diffs,
             "scale_spread",
             "ratio_b_eq_1",
             true,
-            (p_b.variable_scale_ratio - 1.0).abs() < 1.0e-12,
+            (p_b.variable_scale_ratio - 1.0).abs() < SCALE_RATIO_UNIT_TOL,
         );
     }
 

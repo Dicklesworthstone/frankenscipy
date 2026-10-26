@@ -23,6 +23,8 @@ use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const INERTIA_REL_TOL: f64 = 1.0e-9;
+const CENTROID_MEAN_TOL: f64 = 1.0e-9;
 /// One ledger arm per property check, each a single fixed case recorded under its own name
 /// (one `centroid_{c}_is_mean` arm per centroid of the k = 3 fit). There is no SciPy side: the
 /// reference kind is analytic (the inertia definition, the mean of the assigned points) or a
@@ -188,7 +190,7 @@ fn diff_cluster_kmeans_properties() {
             std::slice::from_ref(&computed_inertia),
             std::slice::from_ref(&r.inertia),
         )),
-        (r.inertia - computed_inertia).abs() <= 1.0e-9 * r.inertia.abs().max(1.0),
+        (r.inertia - computed_inertia).abs() <= INERTIA_REL_TOL * r.inertia.abs().max(1.0),
         format!("reported={} computed={}", r.inertia, computed_inertia),
     );
 
@@ -218,7 +220,7 @@ fn diff_cluster_kmeans_properties() {
             check(
                 &format!("centroid_{c}_is_mean"),
                 Some((mean.as_slice(), r.centroids[c].as_slice())),
-                dist < 1.0e-9,
+                dist < CENTROID_MEAN_TOL,
                 format!("dist={dist}"),
             );
         }

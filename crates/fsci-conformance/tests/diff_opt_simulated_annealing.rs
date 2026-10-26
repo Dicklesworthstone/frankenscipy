@@ -17,7 +17,8 @@ use fsci_opt::simulated_annealing;
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL: f64 = 4.0; // (x-target)² ≤ 4 (i.e. within 2 of target)
+const ABS_TOL: f64 = 4.0; // (x-target)² ≤ 4 (i.e. within 2 of target)
+const TOL: f64 = ABS_TOL;
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {

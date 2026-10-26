@@ -22,7 +22,8 @@ use fsci_spatial::{
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-011";
-const TOL: f64 = 1.0e-10;
+const ABS_TOL: f64 = 1.0e-10;
+const TOL: f64 = ABS_TOL;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]

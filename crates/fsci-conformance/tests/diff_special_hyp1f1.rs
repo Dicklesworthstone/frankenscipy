@@ -35,7 +35,8 @@ use fsci_special::types::SpecialTensor;
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const TOL_REL: f64 = 5.0e-7;
+const REL_TOL: f64 = 5.0e-7;
+const TOL_REL: f64 = REL_TOL;
 /// Relative to |scipy| for the cancellation group: 12x SciPy's own worst error there.
 const CANCELLATION_REL_TOL: f64 = 1.0e-13;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";

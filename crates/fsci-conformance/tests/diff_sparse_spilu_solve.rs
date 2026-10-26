@@ -25,6 +25,9 @@ use fsci_sparse::{CooMatrix, FormatConvertible, IluOptions, Shape2D, spilu};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const DIAG_RESIDUAL_TOL: f64 = 1.0e-12;
+const TRIDIAG_RESIDUAL_TOL: f64 = 1.0e-10;
+const PENTADIAG_RESIDUAL_TOL: f64 = 1.0e-3;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,7 +113,7 @@ fn build_query() -> OracleQuery {
         rows: 5,
         cols: 5,
         b: vec![2.0, 6.0, 12.0, 20.0, 30.0],
-        residual_tol: 1.0e-12,
+        residual_tol: DIAG_RESIDUAL_TOL,
     });
 
     // 2. Tridiagonal SPD 6x6: ILU also exact (no fill-in)
@@ -130,7 +133,7 @@ fn build_query() -> OracleQuery {
             rows: n,
             cols: n,
             b: vec![1.0; n],
-            residual_tol: 1.0e-10,
+            residual_tol: TRIDIAG_RESIDUAL_TOL,
         });
     }
 
@@ -151,7 +154,7 @@ fn build_query() -> OracleQuery {
             rows: n,
             cols: n,
             b: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            residual_tol: 1.0e-10,
+            residual_tol: TRIDIAG_RESIDUAL_TOL,
         });
     }
 
@@ -178,7 +181,7 @@ fn build_query() -> OracleQuery {
             b: (0..n).map(|i| i as f64).collect(),
             // ILU on pentadiagonal SPD with default drop_tol=1e-4 produces
             // residuals around 1e-3 to 1e-4 depending on conditioning.
-            residual_tol: 1.0e-3,
+            residual_tol: PENTADIAG_RESIDUAL_TOL,
         });
     }
 

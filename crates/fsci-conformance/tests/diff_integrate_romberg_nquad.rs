@@ -19,6 +19,11 @@ use fsci_integrate::{QuadOptions, nquad, romberg};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+const ROMBERG_POLY_TOL: f64 = 1e-10;
+const ROMBERG_TRIG_EXP_TOL: f64 = 1e-9;
+const NQUAD_2D_POLY_TOL: f64 = 1e-8;
+const NQUAD_MULTI_TOL: f64 = 1e-7;
+const NQUAD_0D_TOL: f64 = 1e-12;
 /// One ledger arm per routine; a case's arm is its id prefix.
 const ARMS: [&str; 2] = ["romberg", "nquad"];
 
@@ -125,7 +130,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             10.0,
             r.converged,
-            1e-10,
+            ROMBERG_POLY_TOL,
         );
     }
     // (b) linear: ∫_{0}^{3} (2x + 1) dx = x² + x |_0^3 = 9 + 3 = 12
@@ -138,7 +143,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             12.0,
             r.converged,
-            1e-10,
+            ROMBERG_POLY_TOL,
         );
     }
     // (c) quadratic: ∫_{0}^{1} x² dx = 1/3
@@ -151,7 +156,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             1.0 / 3.0,
             r.converged,
-            1e-10,
+            ROMBERG_POLY_TOL,
         );
     }
     // (d) cubic: ∫_{0}^{2} x³ dx = 4
@@ -164,7 +169,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             4.0,
             r.converged,
-            1e-10,
+            ROMBERG_POLY_TOL,
         );
     }
     // (e) sine: ∫_{0}^{π} sin(x) dx = 2
@@ -177,7 +182,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             2.0,
             r.converged,
-            1e-9,
+            ROMBERG_TRIG_EXP_TOL,
         );
     }
     // (f) cosine: ∫_{0}^{π} cos(x) dx = 0
@@ -190,7 +195,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             0.0,
             r.converged,
-            1e-9,
+            ROMBERG_TRIG_EXP_TOL,
         );
     }
     // (g) exp: ∫_{0}^{1} exp(x) dx = e - 1
@@ -204,7 +209,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             expected,
             r.converged,
-            1e-9,
+            ROMBERG_TRIG_EXP_TOL,
         );
     }
     // (h) NaN tolerance returns non-converged with NaN integral
@@ -241,7 +246,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             1.0,
             r.converged,
-            1e-8,
+            NQUAD_2D_POLY_TOL,
         );
     }
     // 2D: ∫∫_{[0,1]^2} (x + y) dxdy = 1
@@ -255,7 +260,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             1.0,
             r.converged,
-            1e-8,
+            NQUAD_2D_POLY_TOL,
         );
     }
     // 2D: ∫∫_{[0,π]×[0,π]} sin(x)*sin(y) dxdy = 2 * 2 = 4
@@ -273,7 +278,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             4.0,
             r.converged,
-            1e-7,
+            NQUAD_MULTI_TOL,
         );
     }
     // 3D: ∫∫∫_{[0,1]^3} xyz dxdydz = (1/2)^3 = 1/8
@@ -291,7 +296,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             1.0 / 8.0,
             r.converged,
-            1e-7,
+            NQUAD_MULTI_TOL,
         );
     }
     // 0D (empty ranges) returns func() with neval=1
@@ -304,7 +309,7 @@ fn diff_integrate_romberg_nquad() {
             r.integral,
             7.5,
             r.converged,
-            1e-12,
+            NQUAD_0D_TOL,
         );
     }
 
