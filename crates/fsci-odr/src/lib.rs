@@ -597,6 +597,7 @@ impl ODR {
                 |x: &[f64], r: &[f64]| ctx.dense_jac(&residuals, x, r),
                 &variable0,
                 &variable_scale,
+                free_beta_indices.len(),
                 self.options,
             )?;
             SolvedFit {
@@ -1228,6 +1229,7 @@ fn solve_least_squares<F, J>(
     jacobian: J,
     x0: &[f64],
     scale: &[f64],
+    p_beta: usize,
     options: OdrOptions,
 ) -> Result<LocalLeastSquaresResult, OdrError>
 where
@@ -1259,8 +1261,28 @@ where
     let mut njev = 1usize;
     for nit in 0..options.maxit {
         // Solve in dimensionless coordinates z = scale * x. Keep the physical
-        // Jacobian for covariance and model callbacks.
-        let scaled_jac = scale_jacobian(&jac, scale);
+        // Jacobian for covariance and model callbacks. Drop β columns that
+        // DODSTP's rank-revealing pivoted QR (DQRDC + DTRCO <= EPSFCN) eliminates
+        // in the sclb-scaled profiled Jacobian (frankenscipy-xyclk).
+        let mut scaled_jac = scale_jacobian(&jac, scale);
+        if p_beta > 1 {
+            let mut profiled = dense_profiled_beta_columns(&jac, p_beta);
+            for (col, &s) in profiled.iter_mut().zip(&scale[..p_beta]) {
+                for v in col.iter_mut() {
+                    *v /= s;
+                }
+            }
+            let kept = dodstp_kept_beta_mask(profiled);
+            if kept.iter().any(|&k| !k) {
+                for row in &mut scaled_jac {
+                    for (j, &is_kept) in kept.iter().enumerate() {
+                        if !is_kept {
+                            row[j] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
         let norms = column_norms(&scaled_jac);
         let gradient = jt_residual(&scaled_jac, &r);
         let cosine = gradient_cosine(&gradient, &norms, &r);
@@ -1718,9 +1740,6 @@ impl OdrStruct<'_> {
 
         // Reduced β system R = μI + Σ_i c_i a_i a_iᵀ.
         let mut rmat = vec![vec![0.0; p]; p];
-        for (k, row) in rmat.iter_mut().enumerate() {
-            row[k] = damping;
-        }
         for (i, &ci) in cvec.iter().enumerate().take(n) {
             if ci == 0.0 {
                 continue;
@@ -1735,6 +1754,13 @@ impl OdrStruct<'_> {
                 for rhs in 0..p {
                     row[rhs] += scaled * ai[rhs];
                 }
+            }
+        }
+        for (k, row) in rmat.iter_mut().enumerate() {
+            if row[k] == 0.0 && red_rhs[k] == 0.0 {
+                row[k] = 1.0;
+            } else {
+                row[k] += damping;
             }
         }
 
@@ -1873,7 +1899,25 @@ where
     nfev += ctx.jac_evals();
     let mut njev = 1usize;
     for nit in 0..options.maxit {
-        let scaled_jac = jac.scaled(ctx.scale, ctx.p());
+        let mut scaled_jac = jac.scaled(ctx.scale, ctx.p());
+        if ctx.p() > 1 {
+            let mut profiled = ctx.profiled_beta_columns(&jac);
+            for (col, &s) in profiled.iter_mut().zip(ctx.scale) {
+                for v in col.iter_mut() {
+                    *v /= s;
+                }
+            }
+            let kept = dodstp_kept_beta_mask(profiled);
+            if kept.iter().any(|&k| !k) {
+                for row in &mut scaled_jac.a {
+                    for (j, &is_kept) in kept.iter().enumerate() {
+                        if !is_kept {
+                            row[j] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
         let cosine = ctx.gradient_cosine(&scaled_jac, &r);
         if cosine.is_nan() {
             return Ok(StructResult {
@@ -2208,7 +2252,11 @@ fn solve_damped_normal(
 ) -> Result<Vec<f64>, OdrError> {
     let mut m: Vec<Vec<f64>> = normal.iter().map(Clone::clone).collect();
     for (idx, row) in m.iter_mut().enumerate() {
-        row[idx] += damping;
+        if row[idx] == 0.0 && rhs[idx] == 0.0 {
+            row[idx] = 1.0;
+        } else {
+            row[idx] += damping;
+        }
     }
     gaussian_solve(m, rhs.to_vec()).ok_or_else(|| OdrError::SolverFailure {
         detail: String::from("normal equations are singular"),
@@ -2225,7 +2273,11 @@ fn solve_lm_step(
 ) -> Result<Vec<f64>, OdrError> {
     let (mut normal, rhs) = build_normal_equations(jacobian, residuals);
     for (idx, row) in normal.iter_mut().enumerate() {
-        row[idx] += damping;
+        if row[idx] == 0.0 && rhs[idx] == 0.0 {
+            row[idx] = 1.0;
+        } else {
+            row[idx] += damping;
+        }
     }
     gaussian_solve(normal, rhs).ok_or_else(|| OdrError::SolverFailure {
         detail: String::from("normal equations are singular"),
@@ -2439,45 +2491,7 @@ impl OdrpackCovariance {
                 *value /= ssf[k];
             }
         }
-        let mut jpvt = qr_column_pivoted(&mut columns);
-        let rows = columns.first().map_or(0, Vec::len);
-        let mut r: Vec<Vec<f64>> = (0..npp)
-            .map(|i| {
-                (0..npp)
-                    .map(|j| {
-                        if i <= j && i < rows {
-                            columns[j][i]
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // DODSTP's elimination loop: drop the column the null vector points at (IDAMAX: its
-        // first entry of largest magnitude) while RCOND <= EPSFCN. A NaN estimate drops nothing.
-        let mut kept = npp;
-        let mut rcond = 0.0;
-        while kept > 0 {
-            let (estimate, null_vector) = triangular_rcond(&r, kept);
-            rcond = estimate;
-            if !(estimate <= ODRPACK_RANK_TOLERANCE) {
-                break;
-            }
-            let drop = (0..kept).fold(0, |best, i| {
-                if null_vector[i].abs() > null_vector[best].abs() {
-                    i
-                } else {
-                    best
-                }
-            });
-            if drop + 1 != kept {
-                triangle_move_column_last(&mut r, drop, kept);
-                jpvt[drop..kept].rotate_left(1);
-            }
-            kept -= 1;
-        }
+        let (mut r, jpvt, kept, rcond) = dodstp_rank_reduce(columns);
         invert_gram_from_triangle(&mut r, kept);
 
         let res_var = if observed_rows > kept {
@@ -2516,6 +2530,63 @@ impl OdrpackCovariance {
             rank_deficiency: npp - kept,
         }
     }
+}
+
+/// DODSTP's column-pivoted QR (DQRDC) and rank-revealing column elimination loop (DTRCO + DCHEX)
+/// on the `sclb`-scaled profiled β columns. Returns `(r, jpvt, kept, rcond)`.
+fn dodstp_rank_reduce(mut columns: Vec<Vec<f64>>) -> (Vec<Vec<f64>>, Vec<usize>, usize, f64) {
+    let npp = columns.len();
+    let mut jpvt = qr_column_pivoted(&mut columns);
+    let rows = columns.first().map_or(0, Vec::len);
+    let mut r: Vec<Vec<f64>> = (0..npp)
+        .map(|i| {
+            (0..npp)
+                .map(|j| {
+                    if i <= j && i < rows {
+                        columns[j][i]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // DODSTP's elimination loop: drop the column the null vector points at (IDAMAX: its
+    // first entry of largest magnitude) while RCOND <= EPSFCN. A NaN estimate drops nothing.
+    let mut kept = npp;
+    let mut rcond = 0.0;
+    while kept > 0 {
+        let (estimate, null_vector) = triangular_rcond(&r, kept);
+        rcond = estimate;
+        if !(estimate <= ODRPACK_RANK_TOLERANCE) {
+            break;
+        }
+        let drop = (0..kept).fold(0, |best, i| {
+            if null_vector[i].abs() > null_vector[best].abs() {
+                i
+            } else {
+                best
+            }
+        });
+        if drop + 1 != kept {
+            triangle_move_column_last(&mut r, drop, kept);
+            jpvt[drop..kept].rotate_left(1);
+        }
+        kept -= 1;
+    }
+    (r, jpvt, kept, rcond)
+}
+
+/// Mask of free-β columns kept by [`dodstp_rank_reduce`] (`true` = kept, `false` = dropped).
+fn dodstp_kept_beta_mask(columns: Vec<Vec<f64>>) -> Vec<bool> {
+    let npp = columns.len();
+    let (_r, jpvt, kept, _rcond) = dodstp_rank_reduce(columns);
+    let mut mask = vec![false; npp];
+    for &col in &jpvt[..kept] {
+        mask[col] = true;
+    }
+    mask
 }
 
 /// ODRPACK's DSCLB: the scale of each β from β0 (every parameter, fixed ones included).
@@ -3912,6 +3983,36 @@ mod tests {
                 1.0e-6,
                 &context,
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odr_dodstp_drops_rank_deficient_beta_column_like_scipy() -> Result<(), OdrError> {
+        // frankenscipy-xyclk: unilinear with x = [1..5]·1e150, y = [2.1, 3.9, 6.1, 7.9, 10.1]·1e150,
+        // beta0 = [1.0, 0.0]. Under DSCLB (sclb = [1.0, 10.0]), the intercept column in the
+        // profiled Jacobian is ~1e-151 of the slope column (rcond <= EPSFCN), so DODSTP drops it
+        // in the step as well as the covariance: beta = [2.005805720333347, 0.0],
+        // sd_beta = [0.014828903259795224, 0.0], info = 11.
+        let x: Vec<f64> = [1.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .map(|v| v * 1.0e150)
+            .collect();
+        let y: Vec<f64> = [2.1, 3.9, 6.1, 7.9, 10.1]
+            .into_iter()
+            .map(|v| v * 1.0e150)
+            .collect();
+        let odr = ODR::new(Data::new(x, y)?, unilinear(), vec![1.0, 0.0])?;
+        for (path, out) in [
+            ("structured", odr.run()?),
+            ("dense", odr.run_dense_reference()?),
+        ] {
+            let context = format!("{path}: {out:?}");
+            assert_eq!(out.info, 11, "{context}");
+            assert_rel(out.beta[0], 2.005_805_720_333_347, 1.0e-6, &context);
+            assert_eq!(out.beta[1], 0.0, "{context}");
+            assert_rel(out.sd_beta[0], 0.014_828_903_259_795_224, 1.0e-6, &context);
+            assert_eq!(out.sd_beta[1], 0.0, "{context}");
         }
         Ok(())
     }

@@ -536,6 +536,19 @@ fn diff_odr_mixed_magnitude_scaling() -> TestResult<()> {
             });
         }
     }
+    // frankenscipy-xyclk: when x, y ~ 1e150 and beta0 = [1.0, 0.0], DSCLB gives sclb = [1.0, 10.0],
+    // making the scaled intercept column ~1e-151 of the slope column; DODSTP drops it so beta[1]
+    // stays 0.0 and info = 11.
+    points.push(OdrCase {
+        case_id: "huge_1e150_zero_beta0_default",
+        x: vec![1.0e150, 2.0e150, 3.0e150, 4.0e150, 5.0e150],
+        y: vec![2.1e150, 3.9e150, 6.1e150, 7.9e150, 10.1e150],
+        we: vec![1.0; 5],
+        wd: vec![1.0; 5],
+        beta0: vec![1.0, 0.0],
+        sclb: None,
+        scld: None,
+    });
     // unilinear() supplies analytic Jacobians in Rust. Give ODRPACK the same
     // derivatives so tiny-variable covariance is not limited by finite-difference
     // roundoff in the oracle. The original covariance test retains its FD oracle.
