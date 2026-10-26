@@ -189,6 +189,23 @@ fn flatten_rows(rows: &[Vec<f64>], ncols: usize) -> Vec<f64> {
     out
 }
 
+fn flatten_rows_exact(rows: &[Vec<f64>], nrows: usize, ncols: usize) -> Vec<f64> {
+    if ncols == 0 {
+        if (rows.len() == nrows || rows.is_empty()) && rows.iter().all(|r| r.is_empty()) {
+            return Vec::new();
+        }
+        return vec![f64::NAN];
+    }
+    if rows.len() != nrows || rows.iter().any(|r| r.len() != ncols) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(nrows * ncols);
+    for r in rows {
+        out.extend_from_slice(r);
+    }
+    out
+}
+
 /// Solve `y' = f(x, y, p)` (plus `S·y/(x − a)` when `options.singular_term` is set) on the
 /// mesh `x` with `bc(y(a), y(b), p) = 0` (n + k residuals): `scipy.integrate.solve_bvp(fun, bc,
 /// x, y, p, S, fun_jac, bc_jac, tol, max_nodes, bc_tol=bc_tol)`.
@@ -284,12 +301,13 @@ where
         }
     });
     let bc_jac_flat = options.bc_jac.map(|jac| {
+        let rows = n + k;
         move |ya: &[f64], yb: &[f64], pq: &[f64]| {
             let (da, db, dp) = jac(ya, yb, pq);
             (
-                flatten_rows(&da, n),
-                flatten_rows(&db, n),
-                flatten_rows(&dp, k),
+                flatten_rows_exact(&da, rows, n),
+                flatten_rows_exact(&db, rows, n),
+                flatten_rows_exact(&dp, rows, k),
             )
         }
     });
@@ -697,6 +715,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, BvpError::InvalidArgument(m) if m.contains("`S`")));
+
+        // frankenscipy-vfs3g: a `bc_jac` with a row of the wrong width raises ValueError in SciPy
+        // (formerly padded with NaN and returned status 2).
+        let short_bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+            (
+                vec![vec![1.0], vec![0.0, 0.0]],
+                vec![vec![0.0, 0.0], vec![1.0, 0.0]],
+                vec![vec![], vec![]],
+            )
+        };
+        let e = solve_bvp(
+            f,
+            bc,
+            &[0.0, 0.5, 1.0],
+            &guess,
+            &[],
+            BvpOptions {
+                bc_jac: Some(&short_bc_jac),
+                ..opts
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(e, BvpError::InvalidArgument(m) if m.contains("`bc_jac`")));
     }
 
     #[test]

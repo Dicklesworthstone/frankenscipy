@@ -25584,7 +25584,16 @@ fn lu_factor_blocked_f32(a_in: &[Vec<f64>]) -> Option<LuFactorsFlatF32> {
     let mut urow_buf = [0.0f32; 64];
     let mut data: Vec<f32> = Vec::with_capacity(n.checked_mul(n)?);
     for row in a_in {
-        data.extend(row.iter().map(|&v| v as f32));
+        for &v in row {
+            let vf = v as f32;
+            // LAPACK `dsgesv` range guard (`dlange > slamch('O')`): if any entry of `A` overflows
+            // `f32`, decline the single-precision factorization and fall back to `f64` LU
+            // (frankenscipy-vfs3g).
+            if !vf.is_finite() {
+                return None;
+            }
+            data.push(vf);
+        }
     }
     let mut perm: Vec<usize> = (0..n).collect();
 
@@ -25700,12 +25709,22 @@ fn lu_factor_blocked_f32(a_in: &[Vec<f64>]) -> Option<LuFactorsFlatF32> {
 #[allow(clippy::needless_range_loop)]
 fn lu_subst_factored_f32(factors: &LuFactorsFlatF32, rhs: &[f64]) -> Option<Vec<f64>> {
     let n = factors.n;
-    let mut y: Vec<f32> = rhs.iter().map(|&v| v as f32).collect();
+    let mut y: Vec<f32> = Vec::with_capacity(n);
+    for &v in rhs {
+        let vf = v as f32;
+        if !vf.is_finite() {
+            return None;
+        }
+        y.push(vf);
+    }
     for i in 0..n {
         let mut s = y[i];
         let i_base = i * n;
         for p in 0..i {
             s -= factors.data[i_base + p] * y[p];
+        }
+        if !s.is_finite() {
+            return None;
         }
         y[i] = s;
     }
@@ -25716,10 +25735,14 @@ fn lu_subst_factored_f32(factors: &LuFactorsFlatF32, rhs: &[f64]) -> Option<Vec<
             s -= factors.data[i_base + p] * y[p];
         }
         let d = factors.data[i_base + i];
-        if d == 0.0 {
+        if d == 0.0 || !d.is_finite() {
             return None;
         }
-        y[i] = s / d;
+        let yi = s / d;
+        if !yi.is_finite() {
+            return None;
+        }
+        y[i] = yi;
     }
     Some(y.into_iter().map(f64::from).collect())
 }
@@ -25894,7 +25917,7 @@ fn lu_solve_mixed_precision_with_rcond(a_in: &[Vec<f64>], b: &[f64]) -> Option<(
         let xnorm = x.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         // Backward-stability bar that an f64 LU solve itself satisfies.
         let bar = 8.0 * (n as f64) * f64::EPSILON * (anorm * xnorm + bnorm);
-        if res <= bar {
+        if res.is_finite() && bar.is_finite() && res <= bar {
             return Some((x, rcond));
         }
         if res >= prev_res {
@@ -29951,6 +29974,10 @@ mod tests {
         assert_eq!(x[127], 0.5, "x[127]");
 
         let ones = vec![1.0; n];
+        assert!(
+            lu_solve_mixed_precision(&a, &ones).is_none(),
+            "mixed precision must decline a system with an entry above f32::MAX (before fix: returned Some([-inf, ...]) via inf <= inf)"
+        );
         let x = solve(&a, &ones, SolveOptions::default())
             .expect("SciPy solves this system")
             .x;

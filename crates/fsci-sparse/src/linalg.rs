@@ -15239,6 +15239,12 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 return Ok(0.0);
             }
             let result = svds(a, 1, EigsOptions::default())?;
+            if !result.converged {
+                return Err(SparseError::EigsNoConvergence {
+                    message: "spectral norm: svds did not converge".to_string(),
+                    partial: Box::new(EigsResult::default()),
+                });
+            }
             let sigma = result.singular_values.first().copied().ok_or_else(|| {
                 SparseError::InvalidArgument {
                     message: "spectral norm: svds returned no singular value".to_string(),
