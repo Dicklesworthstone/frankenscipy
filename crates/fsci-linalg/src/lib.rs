@@ -2941,7 +2941,11 @@ fn solve_qr(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
     })
 }
 
-fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
+fn solve_svd_fallback(
+    a: &[Vec<f64>],
+    b: &[f64],
+    allow_consistent_singular: bool,
+) -> Result<SolveResult, LinalgError> {
     // nalgebra's SVD cannot see a NaN: its internal pivot ordering hits an
     // unwrap panic (svd.rs) long before the singular values are read. Strict
     // mode with `check_finite = false` deliberately passes non-finite input
@@ -2979,12 +2983,34 @@ fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgEr
         .iter()
         .filter(|&&s| s > threshold)
         .count();
-    if matrix.nrows() == matrix.ncols() && rank < matrix.nrows() {
+    let rank_deficient_square = matrix.nrows() == matrix.ncols() && rank < matrix.nrows();
+    if rank == 0 || (rank_deficient_square && !allow_consistent_singular) {
         return Err(LinalgError::SingularMatrix);
     }
 
     let pinv = pseudo_inverse_from_svd(&svd, threshold)?;
     let x = pinv * rhs.clone();
+    let backward_err = compute_backward_error(&matrix, &x, &rhs);
+
+    // frankenscipy-qmgrm: in Hardened mode (and direct `solve_with_action(..., SVDFallback)`),
+    // return the minimum-norm solution of a CONSISTENT numerically singular square system
+    // (`b` in the numerical range of `A`, certified by `backward_err <= ATTEMPT_BACKWARD_ERROR_TOL`)
+    // with an explicit `IllConditioned { reciprocal_condition: 0.0 }` warning, while failing
+    // closed with `SingularMatrix` when `b` has a component outside `range(A)`.
+    if rank_deficient_square {
+        if !backward_err.is_finite() || backward_err > ATTEMPT_BACKWARD_ERROR_TOL {
+            return Err(LinalgError::SingularMatrix);
+        }
+        return Ok(SolveResult {
+            x: x.iter().copied().collect(),
+            warning: Some(LinalgWarning::IllConditioned {
+                reciprocal_condition: 0.0,
+            }),
+            backward_error: Some(backward_err),
+            certificate: None,
+            recovered: true,
+        });
+    }
 
     let min_s = svd
         .singular_values
@@ -2997,7 +3023,6 @@ fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgEr
         })
         .unwrap_or(0.0);
     let rcond = if max_s > 0.0 { min_s / max_s } else { 0.0 };
-    let backward_err = compute_backward_error(&matrix, &x, &rhs);
 
     Ok(SolveResult {
         x: x.iter().copied().collect(),
@@ -3712,6 +3737,7 @@ fn dispatch_solve_action(
     matrix_cache: &mut Option<DMatrix<f64>>,
     lu_cache: &mut Option<LuFactorStorage>,
     cholesky_cache: &CholeskyProbe,
+    allow_consistent_singular: bool,
 ) -> Result<SolveResult, LinalgError> {
     match action {
         SolverAction::DirectLU => {
@@ -3772,7 +3798,7 @@ fn dispatch_solve_action(
             })
         }
         SolverAction::PivotedQR => solve_qr(effective_a, b),
-        SolverAction::SVDFallback => solve_svd_fallback(effective_a, b),
+        SolverAction::SVDFallback => solve_svd_fallback(effective_a, b, allow_consistent_singular),
         SolverAction::DiagonalFastPath => solve_diagonal(effective_a, b),
         SolverAction::TriangularFastPath => solve_triangular_internal(
             effective_a,
@@ -3846,6 +3872,7 @@ pub fn solve_with_action(
         &mut matrix_cache,
         &mut lu_cache,
         &cholesky_cache,
+        true,
     )
 }
 
@@ -3894,6 +3921,7 @@ fn run_portfolio_attempts(
             matrix_cache,
             lu_cache,
             cholesky_cache,
+            mode == RuntimeMode::Hardened,
         ) {
             Ok(solve_result) => {
                 let omega = solve_result.backward_error.unwrap_or(0.0);
@@ -33199,7 +33227,7 @@ mod tests {
         let a = vec![vec![3.0, 2.0], vec![1.0, 2.0]];
         let b = vec![5.0, 5.0];
         let lu_result = solve_general(&a, &b).expect("LU solve works");
-        let svd_result = solve_svd_fallback(&a, &b).expect("SVD solve works");
+        let svd_result = solve_svd_fallback(&a, &b, false).expect("SVD solve works");
         assert_close_slice(&svd_result.x, &lu_result.x, 1e-12, 1e-12);
     }
 
@@ -33207,15 +33235,79 @@ mod tests {
     fn solve_svd_fallback_rejects_rank_deficient_square_systems() {
         let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
         let b = vec![1.0, 2.0];
-        let err = solve_svd_fallback(&a, &b).expect_err("rank-deficient system");
+        let err = solve_svd_fallback(&a, &b, false).expect_err("strict rank-deficient system");
         assert_eq!(err, LinalgError::SingularMatrix);
+
+        // Positive arm (frankenscipy-qmgrm): Hardened mode and direct SVDFallback return the
+        // minimum-norm solution of a consistent singular system (`b` in `range(A)`) with a
+        // typed warning (`reciprocal_condition == 0.0`).
+        let svd_consistent =
+            solve_with_action(&a, &b, SolverAction::SVDFallback).expect("consistent singular");
+        assert_close_slice(&svd_consistent.x, &[0.2, 0.4], 1e-12, 1e-12);
+        assert_eq!(
+            svd_consistent.warning,
+            Some(LinalgWarning::IllConditioned {
+                reciprocal_condition: 0.0
+            })
+        );
+        assert!(svd_consistent.recovered);
+        assert!(
+            svd_consistent
+                .backward_error
+                .is_some_and(|omega| omega <= ATTEMPT_BACKWARD_ERROR_TOL)
+        );
+
+        let hardened = solve(
+            &a,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..SolveOptions::default()
+            },
+        )
+        .expect("hardened solve of consistent singular system");
+        assert_close_slice(&hardened.x, &[0.2, 0.4], 1e-12, 1e-12);
+        assert_eq!(
+            hardened.warning,
+            Some(LinalgWarning::IllConditioned {
+                reciprocal_condition: 0.0
+            })
+        );
+        assert!(hardened.recovered);
+        let cert = hardened.certificate.expect("certificate present");
+        assert_eq!(cert.action, SolverAction::SVDFallback);
+        assert!(verify_solve_certificate(&a, &b, &hardened.x, &cert).verified);
+
+        // Negative arm (frankenscipy-qmgrm): inconsistent `b` (`[1.0, 3.0]` is not in `range(A)`)
+        // must still fail closed with `SingularMatrix`.
+        let b_inconsistent = vec![1.0, 3.0];
+        assert_eq!(
+            solve_svd_fallback(&a, &b_inconsistent, true).unwrap_err(),
+            LinalgError::SingularMatrix
+        );
+        assert_eq!(
+            solve_with_action(&a, &b_inconsistent, SolverAction::SVDFallback).unwrap_err(),
+            LinalgError::SingularMatrix
+        );
+        assert_eq!(
+            solve(
+                &a,
+                &b_inconsistent,
+                SolveOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..SolveOptions::default()
+                },
+            )
+            .unwrap_err(),
+            LinalgError::SingularMatrix
+        );
     }
 
     #[test]
     fn solve_svd_fallback_warns_on_ill_conditioned_but_full_rank_systems() {
         let a = vec![vec![1.0, 0.0], vec![0.0, 1e-14]];
         let b = vec![1.0, 1.0];
-        let result = solve_svd_fallback(&a, &b).expect("full-rank system");
+        let result = solve_svd_fallback(&a, &b, false).expect("full-rank system");
         assert!(matches!(
             result.warning,
             Some(LinalgWarning::IllConditioned { .. })
