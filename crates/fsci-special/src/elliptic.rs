@@ -128,14 +128,18 @@ pub fn ellipkm1(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// Uses the AGM method with E accumulator.
 /// Domain: m in [0, 1].
 pub fn ellipe(m_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_or_complex_rp(
+    let value = map_real_or_complex_rp(
         "ellipe",
         m_tensor,
         mode,
         |m| ellipe_scalar(m, mode),
         ellipe_complex_scalar,
         1 << 20, // work-gated: serial small, par_map_indices for huge arrays (>=1M)
-    )
+    )?;
+    crate::sf_error_unary("ellpe", m_tensor, mode, |m| {
+        (m > 1.0).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 /// Incomplete elliptic integral of the first kind F(φ, m).
@@ -149,21 +153,26 @@ pub fn ellipkinc(
     mode: RuntimeMode,
 ) -> SpecialResult {
     check_hardened_batch_len("ellipkinc", mode, phi_tensor.len().max(m_tensor.len()))?;
-    if let (SpecialTensor::RealScalar(phi), SpecialTensor::RealVec(m_values)) =
+    let value = if let (SpecialTensor::RealScalar(phi), SpecialTensor::RealVec(m_values)) =
         (phi_tensor, m_tensor)
     {
-        return ellipkinc_scalar_phi_over_m_vec(*phi, m_values, mode);
-    }
-
-    map_real_or_complex_binary(
-        "ellipkinc",
-        phi_tensor,
-        m_tensor,
-        mode,
-        |phi, m| ellipkinc_scalar(phi, m, mode),
-        ellipkinc_complex_scalar,
-        1 << 16, // ellipkinc break-even ~45k (BlackThrush A/B: 32768 loses 1.23x, 65536 wins 0.56x)
-    )
+        ellipkinc_scalar_phi_over_m_vec(*phi, m_values, mode)?
+    } else {
+        map_real_or_complex_binary(
+            "ellipkinc",
+            phi_tensor,
+            m_tensor,
+            mode,
+            |phi, m| ellipkinc_scalar(phi, m, mode),
+            ellipkinc_complex_scalar,
+            1 << 16, // ellipkinc break-even ~45k (BlackThrush A/B: 32768 loses 1.23x, 65536 wins 0.56x)
+        )?
+    };
+    crate::sf_error_binary("ellik", phi_tensor, m_tensor, mode, |phi, m| {
+        ((phi.abs() - std::f64::consts::FRAC_PI_2).abs() <= f64::EPSILON && m == 1.0)
+            .then_some(crate::SpecialErrorCode::Singular)
+    })?;
+    Ok(value)
 }
 
 /// Incomplete elliptic integral of the second kind E(φ, m).
@@ -194,14 +203,18 @@ pub fn ellipeinc(
 /// Solves w * exp(w) = x for w.
 /// Domain: x >= -1/e.
 pub fn lambertw(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_or_complex_rp(
+    let value = map_real_or_complex_rp(
         "lambertw",
         x_tensor,
         mode,
         |x| lambertw_scalar(x, mode),
         |z| Ok(lambertw_complex_scalar(z)),
         1 << 16, // lambertw break-even ~58k (BlackThrush A/B: 32768 loses 1.70x, 65536 wins 0.87x)
-    )
+    )?;
+    crate::sf_error_unary("lambertw", x_tensor, mode, |x| {
+        (x < -1.0 / std::f64::consts::E).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 // ══════════════════════════════════════════════════════════════════════

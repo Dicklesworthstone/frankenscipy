@@ -701,7 +701,22 @@ pub fn hyperu(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    hyperu_dispatch("hyperu", a, b, x, mode)
+    let value = hyperu_dispatch("hyperu", a, b, x, mode)?;
+    crate::sf_error_ternary("hyperu", a, b, x, mode, sf_hyperu)?;
+    Ok(value)
+}
+
+fn sf_hyperu(a: f64, b: f64, x: f64) -> Option<crate::SpecialErrorCode> {
+    if a.is_nan() || b.is_nan() || x.is_nan() {
+        return None;
+    }
+    if x < 0.0 {
+        Some(crate::SpecialErrorCode::Domain)
+    } else if x == 0.0 && b > 1.0 {
+        Some(crate::SpecialErrorCode::Singular)
+    } else {
+        None
+    }
 }
 
 fn hyp1f1_dispatch(
@@ -1160,8 +1175,10 @@ pub fn hyp0f1_scalar(b: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
         return Ok(1.0);
     }
 
-    let decision =
-        select_hypergeometric_branch_default_portfolio(HyperCaspProblem::hyp0f1(b, z, 1.0e-14), mode)?;
+    let decision = select_hypergeometric_branch_default_portfolio(
+        HyperCaspProblem::hyp0f1(b, z, 1.0e-14),
+        mode,
+    )?;
     match decision.branch {
         // z < 0 is the oscillatory J-Bessel side at every magnitude: its series alternates, so
         // both branches hand it to the cancellation-controlled route.
@@ -1826,7 +1843,53 @@ pub fn hyp2f1(
     z: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    hyp2f1_dispatch("hyp2f1", a, b, c, z, mode)
+    let value = hyp2f1_dispatch("hyp2f1", a, b, c, z, mode)?;
+    crate::sf_error_quaternary("hyp2f1", a, b, c, z, mode, sf_hyp2f1)?;
+    Ok(value)
+}
+
+fn sf_hyp2f1(a: f64, b: f64, c: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    const EPS: f64 = 1.0e-13;
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() || !z.is_finite() || z == 0.0 {
+        return None;
+    }
+    if c == 0.0 || (c < 0.0 && c == c.floor()) {
+        if (a == 0.0 || b == 0.0) && c != 0.0 {
+            return None;
+        }
+        let neg_int_a = a <= 0.0 && (a - a.round()).abs() < EPS;
+        let neg_int_b = b <= 0.0 && (b - b.round()).abs() < EPS;
+        let d = c - a - b;
+        let s = 1.0 - z;
+        if d <= -1.0 && !((d - d.round()).abs() > EPS && s < 0.0) && !(neg_int_a || neg_int_b) {
+            return sf_hyp2f1(c - a, c - b, c, z);
+        }
+        if d <= 0.0 && z == 1.0 && !(neg_int_a || neg_int_b) {
+            return Some(crate::SpecialErrorCode::Overflow);
+        }
+        if (z.abs() < 1.0 || z == -1.0) && ((b - c).abs() < EPS || (a - c).abs() < EPS) {
+            return None;
+        }
+        let ic = c.round();
+        if (neg_int_a && a.round() > ic) || (neg_int_b && b.round() > ic) {
+            return None;
+        }
+        return Some(crate::SpecialErrorCode::Overflow);
+    }
+    if is_nonpositive_integer(a) || is_nonpositive_integer(b) {
+        return None;
+    }
+    if z == 1.0 && c - a - b <= 0.0 {
+        return Some(crate::SpecialErrorCode::Overflow);
+    }
+    if z > 1.0 {
+        let terminates_b = is_nonpositive_integer(c - a) && is_integer(b);
+        let terminates_a = is_nonpositive_integer(c - b) && is_integer(a);
+        if !(terminates_a || terminates_b) {
+            return Some(crate::SpecialErrorCode::Overflow);
+        }
+    }
+    None
 }
 
 /// [`crate::par_map_indices_with_threads`] on one worker per 32 elements: hypergeometric
@@ -1992,8 +2055,10 @@ pub(crate) fn hyp1f1_scalar(
         return Ok(0.0);
     }
 
-    let decision =
-        select_hypergeometric_branch_default_portfolio(HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14), mode)?;
+    let decision = select_hypergeometric_branch_default_portfolio(
+        HyperCaspProblem::hyp1f1(a, b, z, 1.0e-14),
+        mode,
+    )?;
     match decision.branch {
         HypergeometricBranch::KummerTransform => {
             hyp1f1_converged_or(hyp1f1_kummer_value(a, b, z), mode)

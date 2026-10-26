@@ -304,7 +304,20 @@ pub fn yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 /// and reduces to j0/j1/jn for integer orders.
 /// Supports both real and complex z arguments.
 pub fn jv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("jv", v, z, mode, BesselKind::Jv)
+    let value = bessel_dispatch("jv", v, z, mode, BesselKind::Jv)?;
+    crate::sf_error_binary("jv", v, z, mode, sf_jv)?;
+    Ok(value)
+}
+
+fn sf_jv(v: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    if v.is_nan() || z.is_nan() {
+        return None;
+    }
+    if (z < 0.0 && v != v.trunc()) || (z == 0.0 && v < 0.0 && v != v.trunc()) {
+        Some(crate::SpecialErrorCode::Domain)
+    } else {
+        None
+    }
 }
 
 /// Bessel function of the second kind for real order v: Y_v(z).
@@ -313,7 +326,22 @@ pub fn jv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 /// For integer v, uses the integer-order y0/y1/yn implementations.
 /// Supports both real and complex z arguments.
 pub fn yv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("yv", v, z, mode, BesselKind::Yv)
+    let value = bessel_dispatch("yv", v, z, mode, BesselKind::Yv)?;
+    crate::sf_error_binary("yv", v, z, mode, sf_yv)?;
+    Ok(value)
+}
+
+fn sf_yv(v: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    if v.is_nan() || z.is_nan() {
+        return None;
+    }
+    if z < 0.0 {
+        Some(crate::SpecialErrorCode::Domain)
+    } else if z == 0.0 {
+        Some(crate::SpecialErrorCode::Overflow)
+    } else {
+        None
+    }
 }
 
 /// Exponentially scaled Bessel function of the first kind.
@@ -321,7 +349,16 @@ pub fn yv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 /// Matches `scipy.special.jve(v, z)`, scaling complex-valued inputs by
 /// `exp(-abs(Im(z)))`. Real-valued inputs are unchanged.
 pub fn jve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("jve", v, z, mode, BesselKind::Jve)
+    let value = bessel_dispatch("jve", v, z, mode, BesselKind::Jve)?;
+    crate::sf_error_binary("jve(yve):", v, z, mode, sf_jve_ive)?;
+    Ok(value)
+}
+
+fn sf_jve_ive(v: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    if v.is_nan() || z.is_nan() {
+        return None;
+    }
+    (z == 0.0 && v < 0.0 && v != v.trunc()).then_some(crate::SpecialErrorCode::Domain)
 }
 
 /// Exponentially scaled Bessel function of the second kind.
@@ -329,7 +366,11 @@ pub fn jve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRe
 /// Matches `scipy.special.yve(v, z)`, scaling complex-valued inputs by
 /// `exp(-abs(Im(z)))`. Real-valued inputs are unchanged.
 pub fn yve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("yve", v, z, mode, BesselKind::Yve)
+    let value = bessel_dispatch("yve", v, z, mode, BesselKind::Yve)?;
+    crate::sf_error_binary("yve:", v, z, mode, |v_val, z_val| {
+        (!v_val.is_nan() && z_val == 0.0).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 /// Modified Bessel function of the first kind for real order v: I_v(z).
@@ -337,7 +378,22 @@ pub fn yve(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRe
 /// I_v(z) = (z/2)^v Σ (z²/4)^k / (k! Γ(v+k+1))
 /// Supports both real and complex z arguments.
 pub fn iv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("iv", v, z, mode, BesselKind::Iv)
+    let value = bessel_dispatch("iv", v, z, mode, BesselKind::Iv)?;
+    crate::sf_error_binary("iv", v, z, mode, sf_iv)?;
+    Ok(value)
+}
+
+fn sf_iv(v: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    if v.is_nan() || z.is_nan() {
+        return None;
+    }
+    if z < 0.0 && v != v.trunc() {
+        Some(crate::SpecialErrorCode::Domain)
+    } else if z == 0.0 && v < 0.0 && v != v.trunc() {
+        Some(crate::SpecialErrorCode::Overflow)
+    } else {
+        None
+    }
 }
 
 /// Modified Bessel function of the first kind of order 0: I_0(z).
@@ -939,21 +995,27 @@ pub fn i1e(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 ///
 /// Matches `scipy.special.ive(v, x)`.
 pub fn ive(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    bessel_dispatch("ive", v, z, mode, BesselKind::Ive)
+    let value = bessel_dispatch("ive", v, z, mode, BesselKind::Ive)?;
+    crate::sf_error_binary("ive(kv):", v, z, mode, sf_jve_ive)?;
+    Ok(value)
 }
 
 /// Exponentially scaled modified Bessel function K_0: k0e(x) = K_0(x) * exp(x).
 ///
 /// Matches `scipy.special.k0e(x)`.
 pub fn k0e(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("k0e", z, mode, 1 << 12, |x| Ok(k0e_scalar(x)))
+    let value = map_real_input("k0e", z, mode, 1 << 12, |x| Ok(k0e_scalar(x)))?;
+    crate::sf_error_unary("k0e", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
 }
 
 /// Exponentially scaled modified Bessel function K_1: k1e(x) = K_1(x) * exp(x).
 ///
 /// Matches `scipy.special.k1e(x)`.
 pub fn k1e(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("k1e", z, mode, 1 << 12, |x| Ok(k1e_scalar(x)))
+    let value = map_real_input("k1e", z, mode, 1 << 12, |x| Ok(k1e_scalar(x)))?;
+    crate::sf_error_unary("k1e", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
 }
 
 /// Exponentially scaled modified Bessel function K_v: kve(v, x) = K_v(x) * exp(x).
@@ -1178,9 +1240,11 @@ pub fn wright_bessel(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_ternary("wright_bessel", a, b, x, mode, |av, bv, xv| {
+    let value = map_real_ternary("wright_bessel", a, b, x, mode, |av, bv, xv| {
         wright_bessel_scalar(av, bv, xv, mode)
-    })
+    })?;
+    crate::sf_error_ternary("wright_bessel", a, b, x, mode, sf_wright_bessel)?;
+    Ok(value)
 }
 
 /// Logarithm of Wright's generalized Bessel function.
@@ -1193,9 +1257,18 @@ pub fn log_wright_bessel(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_ternary("log_wright_bessel", a, b, x, mode, |av, bv, xv| {
+    let value = map_real_ternary("log_wright_bessel", a, b, x, mode, |av, bv, xv| {
         log_wright_bessel_scalar(av, bv, xv, mode)
-    })
+    })?;
+    crate::sf_error_ternary("wright_bessel", a, b, x, mode, sf_wright_bessel)?;
+    Ok(value)
+}
+
+fn sf_wright_bessel(a: f64, b: f64, x: f64) -> Option<crate::SpecialErrorCode> {
+    if a.is_nan() || b.is_nan() || x.is_nan() {
+        return None;
+    }
+    (a < 0.0 || b < 0.0 || x < 0.0).then_some(crate::SpecialErrorCode::Domain)
 }
 
 /// Derivative of the Bessel function `J_v(z)`.
@@ -3235,7 +3308,9 @@ fn lgamma(x: f64) -> f64 {
 /// Computed via recurrence from:
 ///   j_0(z) = sin(z)/z,  j_1(z) = sin(z)/z² - cos(z)/z
 pub fn spherical_jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    spherical_bessel_dispatch("spherical_jn", n, z, mode, SphericalKind::Jn)
+    let value = spherical_bessel_dispatch("spherical_jn", n, z, mode, SphericalKind::Jn)?;
+    crate::sf_error_binary("spherical_jn", n, z, mode, sf_spherical_order)?;
+    Ok(value)
 }
 
 /// Spherical Bessel function of the second kind y_n(z).
@@ -3245,7 +3320,9 @@ pub fn spherical_jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> 
 /// Computed via recurrence from:
 ///   y_0(z) = -cos(z)/z,  y_1(z) = -cos(z)/z² - sin(z)/z
 pub fn spherical_yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    spherical_bessel_dispatch("spherical_yn", n, z, mode, SphericalKind::Yn)
+    let value = spherical_bessel_dispatch("spherical_yn", n, z, mode, SphericalKind::Yn)?;
+    crate::sf_error_binary("spherical_yn", n, z, mode, sf_spherical_order)?;
+    Ok(value)
 }
 
 /// Modified spherical Bessel function of the first kind i_n(z).
@@ -3255,7 +3332,9 @@ pub fn spherical_yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> 
 /// Computed via recurrence from:
 ///   i_0(z) = sinh(z)/z,  i_1(z) = cosh(z)/z - sinh(z)/z²
 pub fn spherical_in(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    spherical_bessel_dispatch("spherical_in", n, z, mode, SphericalKind::In)
+    let value = spherical_bessel_dispatch("spherical_in", n, z, mode, SphericalKind::In)?;
+    crate::sf_error_binary("spherical_in", n, z, mode, sf_spherical_order)?;
+    Ok(value)
 }
 
 /// Modified spherical Bessel function of the second kind k_n(z).
@@ -3265,7 +3344,16 @@ pub fn spherical_in(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> 
 /// Computed via recurrence from:
 ///   k_0(z) = π exp(-z)/(2z),  k_1(z) = π exp(-z)/(2z) * (1 + 1/z)
 pub fn spherical_kn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    spherical_bessel_dispatch("spherical_kn", n, z, mode, SphericalKind::Kn)
+    let value = spherical_bessel_dispatch("spherical_kn", n, z, mode, SphericalKind::Kn)?;
+    crate::sf_error_binary("spherical_kn", n, z, mode, sf_spherical_order)?;
+    Ok(value)
+}
+
+fn sf_spherical_order(n: f64, z: f64) -> Option<crate::SpecialErrorCode> {
+    if n.is_nan() || z.is_nan() {
+        return None;
+    }
+    (n < 0.0 || n != n.trunc()).then_some(crate::SpecialErrorCode::Domain)
 }
 
 #[derive(Clone, Copy)]

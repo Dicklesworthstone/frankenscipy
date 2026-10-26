@@ -77,11 +77,22 @@ const DISTRIBUTION_INVERSE_ITERS: usize = 160;
 const DISTRIBUTION_INVERSE_UPPER_SENTINEL: f64 = 1.0e100;
 
 pub fn beta(a: &SpecialTensor, b: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    beta_dispatch(a, b, mode)
+    let value = beta_dispatch(a, b, mode)?;
+    crate::sf_error_binary("lbeta", a, b, mode, sf_lbeta)?;
+    Ok(value)
 }
 
 pub fn betaln(a: &SpecialTensor, b: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    betaln_dispatch(a, b, mode)
+    let value = betaln_dispatch(a, b, mode)?;
+    crate::sf_error_binary("lbeta", a, b, mode, sf_lbeta)?;
+    Ok(value)
+}
+
+fn sf_lbeta(a: f64, b: f64) -> Option<crate::SpecialErrorCode> {
+    let is_np = |x: f64| x.is_finite() && x <= 0.0 && x == x.floor();
+    let num_poles = usize::from(is_np(a)) + usize::from(is_np(b));
+    let den_poles = usize::from(is_np(a + b));
+    (num_poles > den_poles).then_some(crate::SpecialErrorCode::Overflow)
 }
 
 fn beta_dispatch(a: &SpecialTensor, b: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -214,7 +225,25 @@ pub fn betainc(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    betainc_dispatch(a, b, x, mode)
+    let value = betainc_dispatch(a, b, x, mode)?;
+    crate::sf_error_ternary("betainc", a, b, x, mode, sf_betainc)?;
+    Ok(value)
+}
+
+pub(crate) fn sf_betainc(a: f64, b: f64, x: f64) -> Option<crate::SpecialErrorCode> {
+    if a.is_nan() || b.is_nan() || x.is_nan() {
+        return None;
+    }
+    (a < 0.0 || b < 0.0 || !a.is_finite() || !b.is_finite() || !(0.0..=1.0).contains(&x))
+        .then_some(crate::SpecialErrorCode::Domain)
+}
+
+pub(crate) fn sf_betaincinv(a: f64, b: f64, y: f64) -> Option<crate::SpecialErrorCode> {
+    if a.is_nan() || b.is_nan() || y.is_nan() {
+        return None;
+    }
+    (!(a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite() && (0.0..=1.0).contains(&y)))
+        .then_some(crate::SpecialErrorCode::Domain)
 }
 
 fn betainc_dispatch(
@@ -266,9 +295,11 @@ pub fn betaincc(
     x: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_ternary("betaincc", a, b, x, mode, |av, bv, xv| {
+    let value = map_real_ternary("betaincc", a, b, x, mode, |av, bv, xv| {
         betaincc_scalar(av, bv, xv, mode)
-    })
+    })?;
+    crate::sf_error_ternary("betaincc", a, b, x, mode, sf_betainc)?;
+    Ok(value)
 }
 
 pub fn betainccinv(
@@ -277,9 +308,11 @@ pub fn betainccinv(
     y: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_ternary("betainccinv", a, b, y, mode, |av, bv, yv| {
+    let value = map_real_ternary("betainccinv", a, b, y, mode, |av, bv, yv| {
         Ok(betainccinv_scalar(av, bv, yv))
-    })
+    })?;
+    crate::sf_error_ternary("betainccinv", a, b, y, mode, sf_betaincinv)?;
+    Ok(value)
 }
 
 /// Beta distribution CDF.

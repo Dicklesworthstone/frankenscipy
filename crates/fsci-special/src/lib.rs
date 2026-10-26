@@ -672,6 +672,92 @@ pub(crate) fn sf_error_binary(
     Ok(())
 }
 
+/// [`sf_error_unary`] for a real three-argument call, broadcasting scalars against vectors.
+pub(crate) fn sf_error_ternary(
+    scipy_name: &'static str,
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    c: &SpecialTensor,
+    mode: RuntimeMode,
+    condition: fn(f64, f64, f64) -> Option<SpecialErrorCode>,
+) -> Result<(), SpecialError> {
+    let config = geterr();
+    if config.reports_nothing() {
+        return Ok(());
+    }
+    let as_slice = |t: &SpecialTensor| -> Option<Vec<f64>> {
+        match t {
+            SpecialTensor::RealScalar(v) => Some(vec![*v]),
+            SpecialTensor::RealVec(v) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let (Some(a), Some(b), Some(c)) = (as_slice(a), as_slice(b), as_slice(c)) else {
+        return Ok(());
+    };
+    let n = a.len().max(b.len()).max(c.len());
+    if (a.len() != n && a.len() != 1)
+        || (b.len() != n && b.len() != 1)
+        || (c.len() != n && c.len() != 1)
+    {
+        return Ok(());
+    }
+    for i in 0..n {
+        let ai = a[if a.len() == 1 { 0 } else { i }];
+        let bi = b[if b.len() == 1 { 0 } else { i }];
+        let ci = c[if c.len() == 1 { 0 } else { i }];
+        if let Some(code) = condition(ai, bi, ci) {
+            sf_error(&config, scipy_name, code, mode)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`sf_error_unary`] for a real four-argument call, broadcasting scalars against vectors.
+pub(crate) fn sf_error_quaternary(
+    scipy_name: &'static str,
+    a: &SpecialTensor,
+    b: &SpecialTensor,
+    c: &SpecialTensor,
+    d: &SpecialTensor,
+    mode: RuntimeMode,
+    condition: fn(f64, f64, f64, f64) -> Option<SpecialErrorCode>,
+) -> Result<(), SpecialError> {
+    let config = geterr();
+    if config.reports_nothing() {
+        return Ok(());
+    }
+    let as_slice = |t: &SpecialTensor| -> Option<Vec<f64>> {
+        match t {
+            SpecialTensor::RealScalar(v) => Some(vec![*v]),
+            SpecialTensor::RealVec(v) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let (Some(a), Some(b), Some(c), Some(d)) = (as_slice(a), as_slice(b), as_slice(c), as_slice(d))
+    else {
+        return Ok(());
+    };
+    let n = a.len().max(b.len()).max(c.len()).max(d.len());
+    if (a.len() != n && a.len() != 1)
+        || (b.len() != n && b.len() != 1)
+        || (c.len() != n && c.len() != 1)
+        || (d.len() != n && d.len() != 1)
+    {
+        return Ok(());
+    }
+    for i in 0..n {
+        let ai = a[if a.len() == 1 { 0 } else { i }];
+        let bi = b[if b.len() == 1 { 0 } else { i }];
+        let ci = c[if c.len() == 1 { 0 } else { i }];
+        let di = d[if d.len() == 1 { 0 } else { i }];
+        if let Some(code) = condition(ai, bi, ci, di) {
+            sf_error(&config, scipy_name, code, mode)?;
+        }
+    }
+    Ok(())
+}
+
 /// SciPy's pole test for `Gamma`: a finite negative integer.
 pub(crate) fn sf_negative_integer_pole(x: f64) -> Option<SpecialErrorCode> {
     (x.is_finite() && x < 0.0 && x == x.floor()).then_some(SpecialErrorCode::Singular)
@@ -4004,8 +4090,11 @@ mod tests {
                 .expect("erf at exact cap must succeed in Hardened mode");
             j0(&cap_exact, RuntimeMode::Hardened)
                 .expect("j0 at exact cap must succeed in Hardened mode");
-            ellipk(&SpecialTensor::RealVec(vec![0.1, 0.2, 0.3, 0.4]), RuntimeMode::Hardened)
-                .expect("ellipk at exact cap must succeed in Hardened mode");
+            ellipk(
+                &SpecialTensor::RealVec(vec![0.1, 0.2, 0.3, 0.4]),
+                RuntimeMode::Hardened,
+            )
+            .expect("ellipk at exact cap must succeed in Hardened mode");
             ndtr(&cap_exact, RuntimeMode::Hardened)
                 .expect("ndtr at exact cap must succeed in Hardened mode");
             airy(&cap_exact, RuntimeMode::Hardened)

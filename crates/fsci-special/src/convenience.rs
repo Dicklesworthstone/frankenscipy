@@ -730,7 +730,11 @@ fn cephes_ndtri_p1evl(x: f64, coef: &[f64]) -> f64 {
 ///
 /// Finds `x` such that `log_ndtr(x) = y`, matching `scipy.special.ndtri_exp(y)`.
 pub fn ndtri_exp(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real("ndtri_exp", y_tensor, mode, |y| Ok(ndtri_exp_scalar(y)))
+    let value = map_real("ndtri_exp", y_tensor, mode, |y| Ok(ndtri_exp_scalar(y)))?;
+    crate::sf_error_unary("ndtri", y_tensor, mode, |y| {
+        (y > 0.0).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 /// Scalar helper for `ndtri_exp`: xsf's `ndtri_exp`, bit-identical to SciPy 1.17.1 on 150,006
@@ -5226,14 +5230,23 @@ pub fn betaincinv(
     y_tensor: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_ternary(
+    let value = map_real_ternary(
         "betaincinv",
         a_tensor,
         b_tensor,
         y_tensor,
         mode,
         |a, b, y| Ok(betaincinv_scalar(a, b, y)),
-    )
+    )?;
+    crate::sf_error_ternary(
+        "betaincinv",
+        a_tensor,
+        b_tensor,
+        y_tensor,
+        mode,
+        crate::beta::sf_betaincinv,
+    )?;
+    Ok(value)
 }
 
 /// Scalar helper for the inverse regularized incomplete beta function.
@@ -5285,9 +5298,24 @@ pub fn gammaincinv(
     y_tensor: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_binary_eager("gammaincinv", a_tensor, y_tensor, mode, |a, y| {
+    let value = map_real_binary_eager("gammaincinv", a_tensor, y_tensor, mode, |a, y| {
         Ok(gammaincinv_scalar(a, y))
-    })
+    })?;
+    crate::sf_error_binary("gammaincinv", a_tensor, y_tensor, mode, sf_gammaincinv)?;
+    Ok(value)
+}
+
+fn sf_gammaincinv(a: f64, y: f64) -> Option<crate::SpecialErrorCode> {
+    if a.is_nan() || y.is_nan() {
+        return None;
+    }
+    if a < 0.0 || !a.is_finite() || !(0.0..=1.0).contains(&y) {
+        Some(crate::SpecialErrorCode::Domain)
+    } else if a == 0.0 && y > 0.0 && y < 1.0 {
+        Some(crate::SpecialErrorCode::Singular)
+    } else {
+        None
+    }
 }
 
 /// Scalar helper for the inverse regularized incomplete gamma function: SciPy's
@@ -5307,9 +5335,11 @@ pub fn gammainccinv(
     y_tensor: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
-    map_real_binary_eager("gammainccinv", a_tensor, y_tensor, mode, |a, y| {
+    let value = map_real_binary_eager("gammainccinv", a_tensor, y_tensor, mode, |a, y| {
         Ok(gammainccinv_scalar(a, y))
-    })
+    })?;
+    crate::sf_error_binary("gammainccinv", a_tensor, y_tensor, mode, sf_gammaincinv)?;
+    Ok(value)
 }
 
 /// Scalar helper for the inverse complemented regularized incomplete gamma function:
@@ -6889,7 +6919,11 @@ fn kolmogorov_sf_cdf_pdf(x: f64) -> (f64, f64, f64) {
 ///
 /// Matches `scipy.special.kolmogi(p)`.
 pub fn kolmogi(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_par("kolmogi", p_tensor, mode, |p| Ok(kolmogi_scalar(p)))
+    let value = map_real_par("kolmogi", p_tensor, mode, |p| Ok(kolmogi_scalar(p)))?;
+    crate::sf_error_unary("kolmogi", p_tensor, mode, |p| {
+        (!p.is_nan() && !(0.0..=1.0).contains(&p)).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 #[must_use]

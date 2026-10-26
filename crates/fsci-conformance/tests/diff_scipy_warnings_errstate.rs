@@ -43,8 +43,8 @@ const VALUE_REL_TOL: f64 = 1e-9;
 const FIT_VALUE_ABS_TOL: f64 = 1e-6;
 /// Grid points compared, and how many of them SciPy raises on: both lower bounds keep the
 /// comparison from passing over an empty or all-quiet grid.
-const MIN_ERRSTATE_POINTS: usize = 300;
-const MIN_ERRSTATE_RAISES: usize = 100;
+const MIN_ERRSTATE_POINTS: usize = 500;
+const MIN_ERRSTATE_RAISES: usize = 180;
 const WARNING_SCENARIOS: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ const SCIPY_CLASSES: &str = "{'DegenerateDataWarning','ConstantInputWarning','Ne
 'OptimizeWarning','IntegrationWarning','ODEintWarning','BadCoefficients','SpecialFunctionWarning'}";
 
 fn grid() -> Vec<GridRow> {
-    let unary: [(&'static str, &[f64]); 15] = [
+    let unary: [(&'static str, &[f64]); 20] = [
         (
             "gamma",
             &[
@@ -291,6 +291,26 @@ fn grid() -> Vec<GridRow> {
             "spence",
             &[f64::NEG_INFINITY, -1.0, -1e-300, -0.0, 0.0, 0.5, 1.0, 2.0],
         ),
+        (
+            "k0e",
+            &[-10.0, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 10.0, 100.0],
+        ),
+        (
+            "k1e",
+            &[-10.0, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 10.0, 100.0],
+        ),
+        (
+            "ellipe",
+            &[-10.0, -1.0, 0.0, 0.5, 1.0, 1.5, 2.0, f64::INFINITY],
+        ),
+        (
+            "ndtri_exp",
+            &[-10.0, -1.0, -0.1, -0.0, 0.0, 0.1, 1.0, f64::INFINITY],
+        ),
+        (
+            "kolmogi",
+            &[-1.0, -0.1, 0.0, 0.25, 0.5, 0.75, 1.0, 1.1, 2.0],
+        ),
     ];
     let mut rows = Vec::new();
     for (func, xs) in unary {
@@ -340,6 +360,278 @@ fn grid() -> Vec<GridRow> {
             });
         }
     }
+    let binary_table: &[(&str, &[(f64, f64)])] = &[
+        (
+            "jv",
+            &[
+                (1.5, -2.0),
+                (1.5, -1.0),
+                (-1.5, -1.0),
+                (1.0, -1.0),
+                (0.0, 0.0),
+                (1.5, 0.0),
+                (1.5, 2.0),
+            ],
+        ),
+        (
+            "yv",
+            &[
+                (1.5, -2.0),
+                (1.5, -1.0),
+                (1.0, -1.0),
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.5, 0.0),
+                (1.5, 2.0),
+            ],
+        ),
+        (
+            "jve",
+            &[
+                (-1.5, 0.0),
+                (-0.5, 0.0),
+                (0.0, 0.0),
+                (1.5, 0.0),
+                (1.0, -1.0),
+                (1.5, 2.0),
+            ],
+        ),
+        (
+            "yve",
+            &[(-1.5, 0.0), (0.0, 0.0), (1.5, 0.0), (1.0, 2.0), (1.5, 2.0)],
+        ),
+        (
+            "iv",
+            &[
+                (1.5, -2.0),
+                (1.5, -1.0),
+                (-1.5, -1.0),
+                (-1.5, 0.0),
+                (-0.5, 0.0),
+                (1.0, -1.0),
+                (0.0, 0.0),
+                (1.5, 0.0),
+                (1.5, 2.0),
+            ],
+        ),
+        (
+            "ive",
+            &[
+                (-1.5, 0.0),
+                (-0.5, 0.0),
+                (0.0, 0.0),
+                (1.5, 0.0),
+                (1.0, -1.0),
+                (1.5, 2.0),
+            ],
+        ),
+        (
+            "beta",
+            &[
+                (-2.0, 1.5),
+                (-1.0, 1.5),
+                (0.0, 1.5),
+                (1.5, -1.0),
+                (1.5, 0.0),
+                (-1.0, -1.0),
+                (-2.0, 1.0),
+                (1.0, 2.0),
+                (2.5, 3.5),
+            ],
+        ),
+        (
+            "betaln",
+            &[
+                (-2.0, 1.5),
+                (-1.0, 1.5),
+                (0.0, 1.5),
+                (1.5, -1.0),
+                (1.5, 0.0),
+                (-1.0, -1.0),
+                (-2.0, 1.0),
+                (1.0, 2.0),
+                (2.5, 3.5),
+            ],
+        ),
+        (
+            "ellipkinc",
+            &[
+                (0.5, 0.5),
+                (1.0, 0.5),
+                (std::f64::consts::FRAC_PI_2, 0.5),
+                (std::f64::consts::FRAC_PI_2, 1.0),
+                (-std::f64::consts::FRAC_PI_2, 1.0),
+            ],
+        ),
+        (
+            "spherical_jn",
+            &[
+                (-2.0, 1.0),
+                (-1.0, 1.0),
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (1.0, 2.0),
+                (2.0, 3.0),
+            ],
+        ),
+        (
+            "spherical_yn",
+            &[(-2.0, 1.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 2.0), (2.0, 3.0)],
+        ),
+        (
+            "spherical_in",
+            &[
+                (-2.0, 1.0),
+                (-1.0, 1.0),
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (1.0, 2.0),
+                (2.0, 3.0),
+            ],
+        ),
+        (
+            "spherical_kn",
+            &[(-2.0, 1.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 2.0), (2.0, 3.0)],
+        ),
+        (
+            "polygamma",
+            &[
+                (1.0, -2.0),
+                (1.0, -1.0),
+                (1.0, -0.5),
+                (1.0, 0.0),
+                (1.0, 0.5),
+                (1.0, 2.0),
+            ],
+        ),
+    ];
+    for &(func, pairs) in binary_table {
+        for &(a, b) in pairs {
+            rows.push(GridRow {
+                func,
+                args: vec![a, b],
+            });
+        }
+    }
+    let ternary_table: &[(&str, &[(f64, f64, f64)])] = &[
+        (
+            "betainc",
+            &[
+                (-1.0, 1.0, 0.5),
+                (1.0, -1.0, 0.5),
+                (0.0, 0.0, 0.5),
+                (1.0, 1.0, -0.1),
+                (1.0, 1.0, 1.1),
+                (1.0, 2.0, 0.0),
+                (1.0, 2.0, 0.5),
+                (1.0, 2.0, 1.0),
+            ],
+        ),
+        (
+            "betaincc",
+            &[
+                (-1.0, 1.0, 0.5),
+                (1.0, -1.0, 0.5),
+                (0.0, 0.0, 0.5),
+                (1.0, 1.0, -0.1),
+                (1.0, 1.0, 1.1),
+                (1.0, 2.0, 0.0),
+                (1.0, 2.0, 0.5),
+                (1.0, 2.0, 1.0),
+            ],
+        ),
+        (
+            "betaincinv",
+            &[
+                (-1.0, 1.0, 0.5),
+                (0.0, 1.0, 0.5),
+                (1.0, -1.0, 0.5),
+                (1.0, 0.0, 0.5),
+                (1.0, 1.0, -0.1),
+                (1.0, 1.0, 1.1),
+                (1.0, 2.0, 0.0),
+                (1.0, 2.0, 0.5),
+                (1.0, 2.0, 1.0),
+            ],
+        ),
+        (
+            "betainccinv",
+            &[
+                (-1.0, 1.0, 0.5),
+                (0.0, 1.0, 0.5),
+                (1.0, -1.0, 0.5),
+                (1.0, 0.0, 0.5),
+                (1.0, 1.0, -0.1),
+                (1.0, 1.0, 1.1),
+                (1.0, 2.0, 0.0),
+                (1.0, 2.0, 0.5),
+                (1.0, 2.0, 1.0),
+            ],
+        ),
+        (
+            "wright_bessel",
+            &[
+                (-1.0, 1.0, 1.0),
+                (1.0, -1.0, 1.0),
+                (1.0, 1.0, -1.0),
+                (0.0, 1.0, 1.0),
+                (1.0, 1.0, 0.0),
+                (1.0, 1.0, 1.0),
+                (0.5, 1.5, 2.0),
+            ],
+        ),
+        (
+            "log_wright_bessel",
+            &[
+                (-1.0, 1.0, 1.0),
+                (1.0, -1.0, 1.0),
+                (1.0, 1.0, -1.0),
+                (0.0, 1.0, 1.0),
+                (1.0, 1.0, 0.0),
+                (1.0, 1.0, 1.0),
+                (0.5, 1.5, 2.0),
+            ],
+        ),
+        (
+            "hyperu",
+            &[
+                (1.0, 1.0, -1.0),
+                (1.0, 0.5, -0.5),
+                (1.0, 1.0, 0.0),
+                (1.0, 2.0, 0.0),
+                (1.0, 0.5, 0.0),
+                (-1.0, 2.0, 0.0),
+                (1.0, 1.0, 1.0),
+                (1.5, 0.5, 2.0),
+            ],
+        ),
+    ];
+    for &(func, triples) in ternary_table {
+        for &(a, b, c) in triples {
+            rows.push(GridRow {
+                func,
+                args: vec![a, b, c],
+            });
+        }
+    }
+    let hyp2f1_quads: &[(f64, f64, f64, f64)] = &[
+        (1.0, 1.0, 0.0, 0.5),
+        (1.0, 1.0, -1.0, 0.5),
+        (-2.0, 1.0, -1.0, 0.5),
+        (1.0, 1.0, 2.0, 1.0),
+        (1.0, 1.0, 2.0, 1.5),
+        (0.0, 1.0, 0.0, 0.5),
+        (-1.0, 1.0, -2.0, 0.5),
+        (1.0, 0.5, 2.0, 1.0),
+        (1.0, 1.0, 2.0, 0.5),
+        (1.0, 1.0, 2.0, -1.0),
+    ];
+    for &(a, b, c, z) in hyp2f1_quads {
+        rows.push(GridRow {
+            func: "hyp2f1",
+            args: vec![a, b, c, z],
+        });
+    }
     rows
 }
 
@@ -361,9 +653,43 @@ fn call(func: &str, args: &[SpecialTensor]) -> SpecialResult {
         "ellipk" => fsci_special::ellipk(&args[0], m),
         "ellipkm1" => fsci_special::ellipkm1(&args[0], m),
         "spence" => fsci_special::spence(&args[0], m),
+        "k0e" => fsci_special::k0e(&args[0], m),
+        "k1e" => fsci_special::k1e(&args[0], m),
+        "ellipe" => fsci_special::ellipe(&args[0], m),
+        "ndtri_exp" => fsci_special::ndtri_exp(&args[0], m),
+        "kolmogi" => fsci_special::kolmogi(&args[0], m),
         "gammainc" => fsci_special::gammainc(&args[0], &args[1], m),
         "gammaincc" => fsci_special::gammaincc(&args[0], &args[1], m),
         "yn" => fsci_special::yn(&args[0], &args[1], m),
+        "jv" => fsci_special::jv(&args[0], &args[1], m),
+        "yv" => fsci_special::yv(&args[0], &args[1], m),
+        "jve" => fsci_special::jve(&args[0], &args[1], m),
+        "yve" => fsci_special::yve(&args[0], &args[1], m),
+        "iv" => fsci_special::iv(&args[0], &args[1], m),
+        "ive" => fsci_special::ive(&args[0], &args[1], m),
+        "beta" => fsci_special::beta(&args[0], &args[1], m),
+        "betaln" => fsci_special::betaln(&args[0], &args[1], m),
+        "ellipkinc" => fsci_special::ellipkinc(&args[0], &args[1], m),
+        "spherical_jn" => fsci_special::spherical_jn(&args[0], &args[1], m),
+        "spherical_yn" => fsci_special::spherical_yn(&args[0], &args[1], m),
+        "spherical_in" => fsci_special::spherical_in(&args[0], &args[1], m),
+        "spherical_kn" => fsci_special::spherical_kn(&args[0], &args[1], m),
+        "polygamma" => {
+            let n = match &args[0] {
+                SpecialTensor::RealScalar(v) => *v as usize,
+                SpecialTensor::RealVec(v) => v[0] as usize,
+                _ => 0,
+            };
+            fsci_special::polygamma(n, &args[1], m)
+        }
+        "betainc" => fsci_special::betainc(&args[0], &args[1], &args[2], m),
+        "betaincc" => fsci_special::betaincc(&args[0], &args[1], &args[2], m),
+        "betaincinv" => fsci_special::betaincinv(&args[0], &args[1], &args[2], m),
+        "betainccinv" => fsci_special::betainccinv(&args[0], &args[1], &args[2], m),
+        "wright_bessel" => fsci_special::wright_bessel(&args[0], &args[1], &args[2], m),
+        "log_wright_bessel" => fsci_special::log_wright_bessel(&args[0], &args[1], &args[2], m),
+        "hyperu" => fsci_special::hyperu(&args[0], &args[1], &args[2], m),
+        "hyp2f1" => fsci_special::hyp2f1(&args[0], &args[1], &args[2], &args[3], m),
         other => unreachable!("grid() only names bound functions, not {other}"),
     }
 }
@@ -417,7 +743,20 @@ funcs = {{"gamma": sc.gamma, "gammaln": sc.gammaln, "digamma": sc.digamma, "psi"
           "loggamma": sc.loggamma, "ndtri": sc.ndtri, "erfinv": sc.erfinv,
           "erfcinv": sc.erfcinv, "y0": sc.y0, "y1": sc.y1, "k0": sc.k0, "k1": sc.k1,
           "ellipk": sc.ellipk, "ellipkm1": sc.ellipkm1, "spence": sc.spence,
-          "gammainc": sc.gammainc, "gammaincc": sc.gammaincc, "yn": sc.yn}}
+          "k0e": sc.k0e, "k1e": sc.k1e, "ellipe": sc.ellipe, "exp1": sc.exp1,
+          "ndtri_exp": sc.ndtri_exp, "kolmogi": sc.kolmogi,
+          "gammainc": sc.gammainc, "gammaincc": sc.gammaincc, "yn": sc.yn,
+          "jv": sc.jv, "yv": sc.yv, "jve": sc.jve, "yve": sc.yve,
+          "iv": sc.iv, "ive": sc.ive, "beta": sc.beta, "betaln": sc.betaln,
+          "ellipkinc": sc.ellipkinc,
+          "spherical_jn": sc.spherical_jn, "spherical_yn": sc.spherical_yn,
+          "spherical_in": sc.spherical_in, "spherical_kn": sc.spherical_kn,
+          "polygamma": sc.polygamma,
+          "betainc": sc.betainc, "betaincc": sc.betaincc,
+          "betaincinv": sc.betaincinv, "betainccinv": sc.betainccinv,
+          "wright_bessel": sc.wright_bessel, "log_wright_bessel": sc.log_wright_bessel,
+          "hyperu": sc.hyperu, "hyp2f1": sc.hyp2f1}}
+INT_FIRST_ARG = {{"yn", "spherical_jn", "spherical_yn", "spherical_in", "spherical_kn", "polygamma"}}
 
 def raised(f, args):
     with sc.errstate(all="raise"):
@@ -431,13 +770,13 @@ def raised(f, args):
 
 # JSON has no infinities, so the arguments arrive as Rust's round-trip float strings.
 rows = [{{"func": r["func"], "args": [float(a) for a in r["args"]]}} for r in json.load(sys.stdin)]
-out_raised = [raised(funcs[r["func"]], [int(a) if r["func"] == "yn" and i == 0 else a
+out_raised = [raised(funcs[r["func"]], [int(a) if r["func"] in INT_FIRST_ARG and i == 0 else a
                                         for i, a in enumerate(r["args"])]) for r in rows]
 warn_counts = []
 for name in dict.fromkeys(r["func"] for r in rows):
     mine = [r["args"] for r in rows if r["func"] == name]
     cols = [np.array([a[c] for a in mine]) for c in range(len(mine[0]))]
-    if name == "yn":
+    if name in INT_FIRST_ARG:
         cols[0] = cols[0].astype(int)
     with sc.errstate(all="warn"):
         with warnings.catch_warnings(record=True) as w:

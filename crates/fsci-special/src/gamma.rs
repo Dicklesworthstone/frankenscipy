@@ -1017,7 +1017,14 @@ fn gammainc_complex_parameter_scalar(
 }
 
 pub fn polygamma(n: usize, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    polygamma_dispatch("polygamma", n, z, mode)
+    let value = polygamma_dispatch("polygamma", n, z, mode)?;
+    if n == 0 {
+        crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    } else {
+        crate::sf_error_unary("zeta", z, mode, crate::sf_nonpositive_integer_pole)?;
+        crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    }
+    Ok(value)
 }
 
 fn polygamma_dispatch(
