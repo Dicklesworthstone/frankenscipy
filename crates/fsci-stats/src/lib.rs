@@ -23808,54 +23808,51 @@ pub struct PowerResult {
     pub pvalues: Vec<f64>,
 }
 
-/// Simulate the power of a hypothesis test, matching
+/// Simulate the power of a one- or multi-sample hypothesis test, matching
 /// `scipy.stats.power(test, rvs, n_observations, significance=0.01, n_resamples=...)`.
 ///
-/// `rvs(n)` draws a sample of size `n` from the ALTERNATIVE distribution and
-/// `test(sample)` returns its p-value; the power is the fraction of the
-/// `n_resamples` simulated p-values at or below SciPy's default significance 0.01.
-/// Use [`power_simulate`] for another significance level.
+/// `n_observations` gives the sample size for each sample passed to the test
+/// (e.g. `&[20]` for a one-sample test or `&[20, 20]` for a two-sample test).
+/// On each of the `n_resamples` trials, `rvs(n_observations)` draws one `Vec<f64>` per
+/// sample from the ALTERNATIVE distribution and `test(&samples)` returns its p-value;
+/// the power is the fraction of finite simulated p-values at or below
+/// `significance.unwrap_or(0.01)` (SciPy's default significance 0.01).
 ///
-/// br-szq1n.11: this used to take no `rvs`, always sample N(0, 1) and use 0.05,
-/// so for the usual location test it returned the test's SIZE, not its power.
-pub fn power<F, R>(test: F, rvs: R, n_observations: usize, n_resamples: usize) -> PowerResult
-where
-    F: FnMut(&[f64]) -> f64,
-    R: FnMut(usize) -> Vec<f64>,
-{
-    power_simulate(test, rvs, n_observations, n_resamples, 0.01)
-}
-
-/// Simulate statistical power of a hypothesis test using a custom random generator and significance level,
-/// returning both the estimated power and the observed p-values.
-pub fn power_simulate<F, R>(
+/// br-szq1n.11 / frankenscipy-ph3er: one public entry point accepting multi-sample
+/// `n_observations: &[usize]` and `significance: Option<f64>`.
+pub fn power<F, R>(
     mut test: F,
     mut rvs: R,
-    n_obs: usize,
-    n_sim: usize,
-    significance: f64,
+    n_observations: &[usize],
+    n_resamples: usize,
+    significance: Option<f64>,
 ) -> PowerResult
 where
-    F: FnMut(&[f64]) -> f64,
-    R: FnMut(usize) -> Vec<f64>,
+    F: FnMut(&[Vec<f64>]) -> f64,
+    R: FnMut(&[usize]) -> Vec<Vec<f64>>,
 {
-    if n_obs == 0 || n_sim == 0 {
+    let alpha = significance.unwrap_or(0.01);
+    if n_observations.is_empty()
+        || n_observations.contains(&0)
+        || n_resamples == 0
+        || !alpha.is_finite()
+    {
         return PowerResult {
             power: 0.0,
             pvalues: Vec::new(),
         };
     }
-    let mut pvalues = Vec::with_capacity(n_sim);
+    let mut pvalues = Vec::with_capacity(n_resamples);
     let mut rejections = 0;
-    for _ in 0..n_sim {
-        let sample = rvs(n_obs);
-        let p = test(&sample);
-        if p.is_finite() && p <= significance {
+    for _ in 0..n_resamples {
+        let samples = rvs(n_observations);
+        let p = test(&samples);
+        if p.is_finite() && p <= alpha {
             rejections += 1;
         }
         pvalues.push(p);
     }
-    let power = rejections as f64 / n_sim as f64;
+    let power = rejections as f64 / n_resamples as f64;
     PowerResult { power, pvalues }
 }
 
@@ -71705,7 +71702,8 @@ mod tests {
 
     #[test]
     fn test_power_simulation() {
-        let z_test = |sample: &[f64]| {
+        let z_test = |samples: &[Vec<f64>]| {
+            let sample = &samples[0];
             let n = sample.len() as f64;
             let mean = sample.iter().sum::<f64>() / n;
             let z = mean * n.sqrt(); // known sd = 1
@@ -71713,8 +71711,15 @@ mod tests {
         };
 
         // Edge cases
-        assert_eq!(power(|_| 0.01, |n| vec![0.0; n], 0, 100).power, 0.0);
-        assert_eq!(power(|_| 0.01, |n| vec![0.0; n], 50, 0).power, 0.0);
+        assert_eq!(
+            power(|_| 0.01, |ns| vec![vec![0.0; ns[0]]], &[0], 100, None).power,
+            0.0
+        );
+        assert_eq!(power(|_| 0.01, |_| Vec::new(), &[], 100, None).power, 0.0);
+        assert_eq!(
+            power(|_| 0.01, |ns| vec![vec![0.0; ns[0]]], &[50], 0, None).power,
+            0.0
+        );
 
         // br-szq1n.11: power under a shift-0.5 alternative with n = 25 and SciPy's
         // default significance 0.01 is Phi(2.5 - z_0.995) + Phi(-2.5 - z_0.995)
@@ -71723,14 +71728,17 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(20260923);
         let alt = power(
             z_test,
-            move |n| {
-                sample_standard_normals(n, &mut rng)
-                    .into_iter()
-                    .map(|x| x + 0.5)
-                    .collect()
+            move |ns| {
+                vec![
+                    sample_standard_normals(ns[0], &mut rng)
+                        .into_iter()
+                        .map(|x| x + 0.5)
+                        .collect(),
+                ]
             },
-            25,
+            &[25],
             4000,
+            None,
         );
         assert_eq!(alt.pvalues.len(), 4000);
         assert!(
@@ -71739,14 +71747,14 @@ mod tests {
             alt.power
         );
 
-        // Size under the null at an explicit significance (power_simulate).
+        // Size under the null at an explicit significance (Some(0.05)).
         let mut null_rng = StdRng::seed_from_u64(7);
-        let null = power_simulate(
+        let null = power(
             z_test,
-            move |n| sample_standard_normals(n, &mut null_rng),
-            30,
+            move |ns| vec![sample_standard_normals(ns[0], &mut null_rng)],
+            &[30],
             4000,
-            0.05,
+            Some(0.05),
         );
         assert!(
             (null.power - 0.05).abs() < 0.015,

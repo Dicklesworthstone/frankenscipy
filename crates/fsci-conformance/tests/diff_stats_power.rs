@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
-//! Live SciPy diff for `fsci_stats::power` / `power_simulate` (frankenscipy-szq1n.11).
+//! Live SciPy diff for `fsci_stats::power` (frankenscipy-szq1n.11, frankenscipy-ph3er).
 //!
 //! `power` used to take no alternative generator, always sampled N(0, 1) and used 0.05, so for a
-//! location test it returned the test's SIZE (~0.05) whatever the effect. The target here is a
-//! one-sample t-test against 0 with n = 20 draws from N(0.5, 1), 20 000 resamples:
-//! - its exact power from the noncentral t (`nct.sf(t_crit) + nct.cdf(-t_crit)`, df 19,
-//!   nc 0.5·√20), computed by the pinned SciPy — 0.5645 at significance 0.05;
-//! - `scipy.stats.power`'s own simulation of the same thing.
+//! location test it returned the test's SIZE (~0.05) whatever the effect. The targets here are:
+//! 1. a one-sample t-test against 0 with n = 20 draws from N(0.5, 1), 20 000 resamples:
+//!    - its exact power from the noncentral t (`nct.sf(t_crit) + nct.cdf(-t_crit)`, df 19,
+//!      nc 0.5·√20), computed by the pinned SciPy — 0.5645 at significance 0.05;
+//!    - `scipy.stats.power`'s own simulation of the same thing;
+//! 2. a two-sample `ttest_ind` with n = (20, 20) draws from N(0, 1) and N(0.5, 1), 20 000
+//!    resamples at significance 0.05 against the noncentral-t analytic power (df 38, nc 0.5·√10).
 //!
 //! fsci's estimate must agree with the analytic value, and with SciPy's estimate, within
 //! POWER_SE_TOL binomial standard errors (seeded, so a row passes or fails deterministically);
@@ -17,7 +19,7 @@
 use std::process::Stdio;
 
 use fsci_conformance::CompareLedger;
-use fsci_stats::{PowerResult, power, power_simulate, ttest_1samp};
+use fsci_stats::{PowerResult, power, ttest_1samp, ttest_ind};
 use serde::Deserialize;
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -63,13 +65,30 @@ impl Normal {
     }
 }
 
-fn sampler(seed: u64, mean: f64) -> impl FnMut(usize) -> Vec<f64> {
+fn sampler(seed: u64, mean: f64) -> impl FnMut(&[usize]) -> Vec<Vec<f64>> {
     let mut normal = Normal::new(seed);
-    move |n| (0..n).map(|_| mean + normal.next()).collect()
+    move |ns| {
+        ns.iter()
+            .map(|&n| (0..n).map(|_| mean + normal.next()).collect())
+            .collect()
+    }
 }
 
-fn t_test(sample: &[f64]) -> f64 {
-    ttest_1samp(sample, 0.0).pvalue
+fn sampler_pair(seed: u64, mean0: f64, mean1: f64) -> impl FnMut(&[usize]) -> Vec<Vec<f64>> {
+    let mut normal = Normal::new(seed);
+    move |ns| {
+        let s0 = (0..ns[0]).map(|_| mean0 + normal.next()).collect();
+        let s1 = (0..ns[1]).map(|_| mean1 + normal.next()).collect();
+        vec![s0, s1]
+    }
+}
+
+fn t_test(samples: &[Vec<f64>]) -> f64 {
+    ttest_1samp(&samples[0], 0.0).pvalue
+}
+
+fn t_test_2samp(samples: &[Vec<f64>]) -> f64 {
+    ttest_ind(&samples[0], &samples[1]).pvalue
 }
 
 fn se(p: f64) -> f64 {
@@ -80,6 +99,7 @@ fn se(p: f64) -> f64 {
 struct Oracle {
     analytic_05: f64,
     analytic_01: f64,
+    analytic_2samp_05: f64,
     scipy_power_05: f64,
     scipy_size_05: f64,
 }
@@ -95,6 +115,11 @@ def analytic(alpha):
     tc = stats.t.ppf(1 - alpha / 2, n - 1)
     nc = eff * np.sqrt(n)
     return float(stats.nct.sf(tc, n - 1, nc) + stats.nct.cdf(-tc, n - 1, nc))
+def analytic_2samp(alpha):
+    df = 2 * n - 2
+    tc = stats.t.ppf(1 - alpha / 2, df)
+    nc = eff / np.sqrt(2.0 / n)
+    return float(stats.nct.sf(tc, df, nc) + stats.nct.cdf(-tc, df, nc))
 test = lambda x, axis=-1: stats.ttest_1samp(x, 0.0, axis=axis).pvalue
 rng = np.random.default_rng(12345)
 alt = stats.power(test, lambda size: rng.normal(eff, 1.0, size=size), n,
@@ -103,6 +128,7 @@ rng0 = np.random.default_rng(54321)
 null = stats.power(test, lambda size: rng0.normal(0.0, 1.0, size=size), n,
                    significance=0.05, n_resamples=R, vectorized=True)
 print(json.dumps({"analytic_05": analytic(0.05), "analytic_01": analytic(0.01),
+                  "analytic_2samp_05": analytic_2samp(0.05),
                   "scipy_power_05": float(alt.power), "scipy_size_05": float(null.power)}))
 "#;
     let mut child = match fsci_conformance::scipy_oracle_command()
@@ -139,7 +165,7 @@ print(json.dumps({"analytic_05": analytic(0.05), "analytic_01": analytic(0.01),
 
 #[test]
 fn power_is_deterministic_for_a_seed() {
-    let run = |seed| power_simulate(t_test, sampler(seed, EFFECT), N_OBS, 2_000, 0.05);
+    let run = |seed| power(t_test, sampler(seed, EFFECT), &[N_OBS], 2_000, Some(0.05));
     let (a, b, c): (PowerResult, PowerResult, PowerResult) = (run(7), run(7), run(8));
     let bits = |r: &PowerResult| r.pvalues.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
     assert_eq!(
@@ -161,9 +187,28 @@ fn diff_stats_power() {
     let Some(oracle) = scipy_oracle() else {
         return;
     };
-    let alt = power_simulate(t_test, sampler(2026, EFFECT), N_OBS, N_RESAMPLES, 0.05);
-    let null = power_simulate(t_test, sampler(2027, 0.0), N_OBS, N_RESAMPLES, 0.05);
-    let default_level = power(t_test, sampler(2028, EFFECT), N_OBS, N_RESAMPLES);
+    let alt = power(
+        t_test,
+        sampler(2026, EFFECT),
+        &[N_OBS],
+        N_RESAMPLES,
+        Some(0.05),
+    );
+    let null = power(
+        t_test,
+        sampler(2027, 0.0),
+        &[N_OBS],
+        N_RESAMPLES,
+        Some(0.05),
+    );
+    let default_level = power(t_test, sampler(2028, EFFECT), &[N_OBS], N_RESAMPLES, None);
+    let two_sample = power(
+        t_test_2samp,
+        sampler_pair(2029, 0.0, EFFECT),
+        &[N_OBS, N_OBS],
+        N_RESAMPLES,
+        Some(0.05),
+    );
 
     // (label, estimate, target, standard error of the comparison)
     let rows = [
@@ -197,6 +242,12 @@ fn diff_stats_power() {
             default_level.power,
             oracle.analytic_01,
             se(oracle.analytic_01),
+        ),
+        (
+            "fsci 2-sample ttest_ind power (20,20) @0.05 vs noncentral-t",
+            two_sample.power,
+            oracle.analytic_2samp_05,
+            se(oracle.analytic_2samp_05),
         ),
     ];
     // One arm; each row is a case. The target is the reference side (the analytic value, SciPy's
