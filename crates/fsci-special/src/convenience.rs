@@ -3627,23 +3627,80 @@ pub fn beip(x: f64) -> f64 {
 /// Kelvin function ker(x): real part of K_0(x * sqrt(j)).
 ///
 /// Matches `scipy.special.ker`.
-/// Crossover where the Kelvin K-functions switch from the ascending log/harmonic
-/// series to the K₀/K₁ asymptotic. The series cancels ~ε·e^{x√2} (ber/bei grow
-/// while ker/kei decay) and the dominant-solution asymptotic floors at ~e^{-2x};
-/// the two cross near x≈10, so 10 minimizes the worst-case error (at 11 the
-/// series region [10,11] was ~1e-8 off scipy/mpmath vs the asymptotic's ~2e-9).
-/// frankenscipy.
-const KELVIN_ASYMP_X: f64 = 10.0;
+/// Crossover where the Kelvin K-functions (`ker`, `kei`, `kerp`, `keip`) switch
+/// from the ascending log/harmonic series to Temme's complex CF2 continued
+/// fraction (`x ∈ [2, 25)`) and large-|z| asymptotic (`x ≥ 25`).
+///
+/// The ascending series cancels like `~ε·e^{x√2}` (`ber`/`bei` grow while
+/// `ker`/`kei` decay) and loses digits above `x ≈ 2`, whereas the divergent
+/// asymptotic series summed to its smallest term floors at `~3e-7` near `x = 10`.
+/// Temme's complex CF2 continued fraction (`complex_k0_k1_temme_cf2`) bridges
+/// `x ∈ [2, 25)` to `~1e-15` of the envelope `√(ker² + kei²)` / `√(kerp² + keip²)`
+/// without cancellation (frankenscipy-qlbbq).
+const KELVIN_ASYMP_X: f64 = 2.0;
 
-/// (ker(x), kei(x)) for large x from the Kelvin identity
-/// ker(x) + i·kei(x) = K₀(x e^{iπ/4}), evaluated with the complex DLMF 10.40.2
-/// asymptotic K₀(z) ~ √(π/(2z)) e^{-z} Σ_k a_k/z^k, a₀ = 1,
-/// a_k = a_{k-1}·(-(2k-1)²)/(8k) (the ν=0 coefficients). Summed to its smallest
-/// term (asymptotic/divergent). This avoids the catastrophic cancellation of the
-/// log/harmonic series, which loses ~x√2/ln(10) digits at large x.
+/// Complex Temme CF2 (Lentz) continued fraction for `(K₀(z), K₁(z))` at
+/// `z = x e^{iπ/4}` (`|z| ≥ 2`).
+///
+/// Generalizes the real `kv_temme_scaled` CF2 recurrence (`xmu = 0`, `a₁ = 1/4`)
+/// in `bessel.rs` to `Complex64`, achieving `< 2e-15` envelope accuracy across
+/// `x ∈ [2, 25)` in 17..91 iterations (frankenscipy-qlbbq).
+fn complex_k0_k1_temme_cf2(z: Complex64) -> (Complex64, Complex64) {
+    let one = Complex64::from_real(1.0);
+    let two = Complex64::from_real(2.0);
+    let mut b = two * (one + z);
+    let mut d = b.recip();
+    let mut delh = d;
+    let mut h = d;
+    let mut q1 = Complex64::from_real(0.0);
+    let mut q2 = one;
+    let a1 = 0.25_f64;
+    let mut q = Complex64::from_real(a1);
+    let mut c = a1;
+    let mut a = -a1;
+    let mut s = one + q * delh;
+    for i in 2..=300usize {
+        let fi = i as f64;
+        a -= 2.0 * (fi - 1.0);
+        c = -a * c / fi;
+        let qnew = (q1 - b * q2) * Complex64::from_real(1.0 / a);
+        q1 = q2;
+        q2 = qnew;
+        q = q + qnew * Complex64::from_real(c);
+        b = b + two;
+        d = (b + d * Complex64::from_real(a)).recip();
+        delh = delh * (b * d - one);
+        h = h + delh;
+        let dels = q * delh;
+        s = s + dels;
+        if dels.abs() < 1e-16 * s.abs() {
+            break;
+        }
+    }
+    h = h * Complex64::from_real(a1);
+    let pref = (Complex64::from_real(std::f64::consts::PI) / (two * z))
+        .powc(Complex64::from_real(0.5));
+    let rk0_scaled = pref / s;
+    let rk1_scaled = rk0_scaled * (z + Complex64::from_real(0.5) - h) / z;
+    let emz = (-z).exp();
+    (rk0_scaled * emz, rk1_scaled * emz)
+}
+
+/// (ker(x), kei(x)) for `x >= KELVIN_ASYMP_X` from the Kelvin identity
+/// `ker(x) + i·kei(x) = K₀(x e^{iπ/4})`.
+///
+/// For `x < 25.0`, evaluates `K₀(z)` via Temme's complex CF2 continued fraction
+/// (`complex_k0_k1_temme_cf2`) to avoid both the ascending series' `e^{x√2}`
+/// cancellation and the asymptotic series' `~3e-7` truncation floor around
+/// `x ∈ [7, 11]` (frankenscipy-qlbbq). For `x >= 25.0`, uses the DLMF 10.40.2
+/// asymptotic series.
 fn kelvin_ker_kei_asymptotic(x: f64) -> (f64, f64) {
     use std::f64::consts::{FRAC_1_SQRT_2, PI};
     let z = Complex64::new(x * FRAC_1_SQRT_2, x * FRAC_1_SQRT_2); // x e^{iπ/4}
+    if x < 25.0 {
+        let (k0, _) = complex_k0_k1_temme_cf2(z);
+        return (k0.re, k0.im);
+    }
     let mut term = Complex64::from_real(1.0);
     let mut sum = term;
     let mut prev_abs = 1.0;
@@ -3707,9 +3764,16 @@ fn complex_i1_asymptotic(z: Complex64) -> Complex64 {
     z.exp() * z.powc(Complex64::from_real(-0.5)) * Complex64::from_real(inv_sqrt_2pi) * sum
 }
 
-/// K₁(z) via the DLMF 10.40.2 asymptotic √(π/(2z)) e^{-z} Σ_k a_k/z^k (ν=1, the
-/// all-positive coefficients (4-(2k-1)²)/(8k)).
+/// K₁(z) for `|z| >= KELVIN_ASYMP_X`.
+///
+/// Uses Temme's complex CF2 continued fraction (`complex_k0_k1_temme_cf2`) for
+/// `|z| < 25.0` (avoiding the asymptotic truncation floor around `x ∈ [7, 11]`,
+/// frankenscipy-qlbbq) and the DLMF 10.40.2 asymptotic `√(π/(2z)) e^{-z} Σ_k a_k/z^k`
+/// (`ν = 1`, `a_k = (4 - (2k - 1)²) / (8k)`) for `|z| >= 25.0`.
 fn complex_k1_asymptotic(z: Complex64) -> Complex64 {
+    if z.abs() < 25.0 {
+        return complex_k0_k1_temme_cf2(z).1;
+    }
     let mu = 4.0;
     let mut term = Complex64::from_real(1.0);
     let mut sum = term;
@@ -11668,6 +11732,78 @@ mod tests {
         // Continuity / small-x series path stays correct.
         assert!((ker(5.0) - (-0.011511727199492405)).abs() < 1e-12);
         assert!((kei(5.0) - 0.011187586509870114).abs() < 1e-12);
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn ker_kei_kerp_keip_cf2_matches_mpmath_across_7_to_15() {
+        // frankenscipy-qlbbq: Temme's complex CF2 continued fraction bridges
+        // x ∈ [2, 25) for K₀(x e^{iπ/4}) and K₁(x e^{iπ/4}), eliminating the
+        // ~3e-7 envelope error across x ∈ [7, 11] where the ascending log series
+        // cancelled and the asymptotic series hit its truncation floor.
+        // Reference values from 40-digit mpmath (mp.dps = 40).
+        let cases = [
+            (
+                7.0_f64,
+                0.0019220215686653417_f64,
+                0.0027003651075956764_f64,
+                0.0004205094673598952_f64,
+                -0.003459508640993744_f64,
+            ),
+            (
+                8.0_f64,
+                0.0014858340685189625_f64,
+                0.0003695839561259596_f64,
+                -0.0008797240991414724_f64,
+                -0.0013363129148588901_f64,
+            ),
+            (
+                9.0_f64,
+                0.0006371641911212719_f64,
+                -0.00031915291619127433_f64,
+                -0.0007112308637487125_f64,
+                -0.00020807941712374493_f64,
+            ),
+            (
+                10.0_f64,
+                0.0001294663302148061_f64,
+                -0.0003075245690881442_f64,
+                -0.0003155969344208975_f64,
+                0.00014091383761261612_f64,
+            ),
+            (
+                11.0_f64,
+                -4.779193360644515e-05_f64,
+                -0.00014953707795241244_f64,
+                -6.990344095585164e-05_f64,
+                0.00014625254023280907_f64,
+            ),
+            (
+                15.0_f64,
+                -1.5143472073472068e-08_f64,
+                7.962894398377627e-06_f64,
+                5.64467807595597e-06_f64,
+                -5.882222803057288e-06_f64,
+            ),
+        ];
+        for (x, kr_ref, ki_ref, krp_ref, kip_ref) in cases {
+            let kr = ker(x);
+            let ki = kei(x);
+            let krp = kerp(x);
+            let kip = keip(x);
+            let env0 = kr_ref.hypot(ki_ref);
+            let env1 = krp_ref.hypot(kip_ref);
+            let err0 = (kr - kr_ref).hypot(ki - ki_ref) / env0;
+            let err1 = (krp - krp_ref).hypot(kip - kip_ref) / env1;
+            assert!(
+                err0 < 5.0e-15,
+                "ker/kei({x}) envelope error {err0:e} >= 5e-15 (got ({kr}, {ki}), want ({kr_ref}, {ki_ref}))"
+            );
+            assert!(
+                err1 < 5.0e-15,
+                "kerp/keip({x}) envelope error {err1:e} >= 5e-15 (got ({krp}, {kip}), want ({krp_ref}, {kip_ref}))"
+            );
+        }
     }
 
     #[test]
