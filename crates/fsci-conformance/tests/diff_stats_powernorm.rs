@@ -66,6 +66,16 @@ struct PpfArm {
 struct OracleResult {
     points: Vec<PointArm>,
     ppf: Vec<PpfArm>,
+    fits: Vec<FitArm>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    c: f64,
+    log_likelihood: f64,
+    scipy_fit_log_likelihood: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,7 +157,8 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
 import json
 import math
 import sys
-from scipy.stats import powernorm
+import numpy as np
+from scipy.stats import powernorm, norm, expon
 
 def finite_or_none(v):
     try:
@@ -176,7 +187,18 @@ for case in q["ppf"]:
         ppf.append({"case_id": cid, "ppf": finite_or_none(powernorm.ppf(qv, c))})
     except Exception:
         ppf.append({"case_id": cid, "ppf": None})
-print(json.dumps({"points": points, "ppf": ppf}))
+fits = []
+for seed, c in enumerate([0.25, 1.0, 8.0], 843):
+    data = powernorm.rvs(c, size=1024, random_state=np.random.default_rng(seed))
+    # -log(Phi(-X)) has an exponential law with rate c. Its SciPy fit
+    # provides an independent exact oracle for this fixed-location/scale MLE.
+    _, scale = expon.fit(-norm.logsf(data), floc=0)
+    fitted_c = 1.0 / scale
+    generic = powernorm.fit(data, floc=0, fscale=1)
+    fits.append({"case_id": f"fit_c{c}", "data": data.tolist(), "c": float(fitted_c),
+                 "log_likelihood": float(powernorm.logpdf(data, fitted_c).sum()),
+                 "scipy_fit_log_likelihood": float(powernorm.logpdf(data, *generic).sum())})
+print(json.dumps({"points": points, "ppf": ppf, "fits": fits}))
 "#;
 
     let query_json = serde_json::to_string(query).expect("serialize powernorm query");
@@ -223,6 +245,42 @@ print(json.dumps({"points": points, "ppf": ppf}))
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Some(serde_json::from_str(&stdout).expect("parse powernorm oracle JSON"))
+}
+
+#[test]
+fn diff_stats_powernorm_fit_maximum_likelihood() {
+    let Some(oracle) = scipy_oracle_or_skip(&generate_query()) else {
+        return;
+    };
+    assert_eq!(oracle.fits.len(), 3);
+    let mut ledger = CompareLedger::new("diff_stats_powernorm_fit", &["shape", "likelihood"]);
+    for case in oracle.fits {
+        assert_eq!(case.data.len(), 1024);
+        let fitted = PowerNorm::try_fit(&case.data).expect("finite transformed-exponential MLE");
+        let log_likelihood: f64 = case.data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for (arm, rust, reference) in [
+            ("shape", fitted.c, case.c),
+            ("likelihood", log_likelihood, case.log_likelihood),
+        ] {
+            let (reference, rust) = ledger
+                .pair(arm, &case.case_id, Some(reference), Some(rust))
+                .expect("finite fit shape and likelihood");
+            let pass = (rust - reference).abs() <= 1e-10 * reference.abs().max(1.0);
+            ledger.compared(arm, &case.case_id, pass);
+            assert!(
+                pass,
+                "{} {arm}: Rust={rust}, SciPy={reference}",
+                case.case_id
+            );
+        }
+        assert!(
+            log_likelihood >= case.scipy_fit_log_likelihood - 1e-10 * log_likelihood.abs().max(1.0)
+        );
+        let perturbed = PowerNorm::new(fitted.c * 1.25);
+        let perturbed_ll: f64 = case.data.iter().map(|&x| perturbed.logpdf(x)).sum();
+        assert!(log_likelihood > perturbed_ll + 1.0);
+    }
+    ledger.finish(3);
 }
 
 #[test]

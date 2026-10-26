@@ -67,6 +67,17 @@ struct PpfArm {
 struct OracleResult {
     points: Vec<PointArm>,
     ppf: Vec<PpfArm>,
+    fits: Vec<FitArm>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    a: f64,
+    b: f64,
+    log_likelihood: f64,
+    scipy_fit_log_likelihood: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,7 +164,9 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import sys
-from scipy.stats import johnsonsb
+import numpy as np
+from scipy.special import logit
+from scipy.stats import johnsonsb, norm
 
 q = json.load(sys.stdin)
 points = []
@@ -176,7 +189,19 @@ for case in q["ppf"]:
         ppf.append({"case_id": cid, "ppf": float(johnsonsb.ppf(qv, a, b))})
     except Exception:
         ppf.append({"case_id": cid, "ppf": None})
-print(json.dumps({"points": points, "ppf": ppf}))
+fits = []
+for seed, (a, b) in enumerate([(-1.0, 0.7), (0.0, 1.0), (2.5, 4.0)], 843):
+    data = johnsonsb.rvs(a, b, size=1024, random_state=np.random.default_rng(seed))
+    # The Jacobian does not depend on a/b, so fitting logit(X) with SciPy's
+    # normal MLE gives the exact fixed-support JohnsonSB likelihood maximum.
+    mean, scale = norm.fit(logit(data))
+    fitted_a, fitted_b = -mean / scale, 1.0 / scale
+    generic = johnsonsb.fit(data, floc=0, fscale=1)
+    fits.append({"case_id": f"fit_a{a}_b{b}", "data": data.tolist(),
+                 "a": float(fitted_a), "b": float(fitted_b),
+                 "log_likelihood": float(johnsonsb.logpdf(data, fitted_a, fitted_b).sum()),
+                 "scipy_fit_log_likelihood": float(johnsonsb.logpdf(data, *generic).sum())})
+print(json.dumps({"points": points, "ppf": ppf, "fits": fits}))
 "#;
 
     let query_json = serde_json::to_string(query).expect("serialize johnsonsb query");
@@ -223,6 +248,43 @@ print(json.dumps({"points": points, "ppf": ppf}))
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Some(serde_json::from_str(&stdout).expect("parse johnsonsb oracle JSON"))
+}
+
+#[test]
+fn diff_stats_johnsonsb_fit_maximum_likelihood() {
+    let Some(oracle) = scipy_oracle_or_skip(&generate_query()) else {
+        return;
+    };
+    assert_eq!(oracle.fits.len(), 3);
+    let mut ledger = CompareLedger::new("diff_stats_johnsonsb_fit", &["a", "b", "likelihood"]);
+    for case in oracle.fits {
+        assert_eq!(case.data.len(), 1024);
+        let fitted = JohnsonSB::try_fit(&case.data).expect("finite transformed-normal MLE");
+        let log_likelihood: f64 = case.data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for (arm, rust, reference) in [
+            ("a", fitted.a, case.a),
+            ("b", fitted.b, case.b),
+            ("likelihood", log_likelihood, case.log_likelihood),
+        ] {
+            let (reference, rust) = ledger
+                .pair(arm, &case.case_id, Some(reference), Some(rust))
+                .expect("finite fit parameters and likelihood");
+            let pass = (rust - reference).abs() <= 1e-10 * reference.abs().max(1.0);
+            ledger.compared(arm, &case.case_id, pass);
+            assert!(
+                pass,
+                "{} {arm}: Rust={rust}, SciPy={reference}",
+                case.case_id
+            );
+        }
+        assert!(
+            log_likelihood >= case.scipy_fit_log_likelihood - 1e-10 * log_likelihood.abs().max(1.0)
+        );
+        let perturbed = JohnsonSB::new(fitted.a + 0.25, fitted.b * 1.25);
+        let perturbed_ll: f64 = case.data.iter().map(|&x| perturbed.logpdf(x)).sum();
+        assert!(log_likelihood > perturbed_ll + 1.0);
+    }
+    ledger.finish(3);
 }
 
 #[test]

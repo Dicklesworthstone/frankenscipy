@@ -1353,6 +1353,43 @@ fn validate_finite_fit_data(
     Ok(())
 }
 
+/// The standardized Johnson families turn into a normal location/scale
+/// model after asinh or logit. Center before squaring and scale the residuals
+/// so a narrow, nonconstant sample does not lose its variance to underflow.
+fn fit_johnson_shapes(
+    data: &[f64],
+    distribution: &str,
+    transform: fn(f64) -> f64,
+) -> Result<(f64, f64), FitError> {
+    validate_finite_fit_data(data, 2, distribution)?;
+    let origin = transform(data[0]);
+    let offsets: Vec<f64> = data.iter().map(|&x| transform(x) - origin).collect();
+    let n = data.len() as f64;
+    let mean_offset = offsets.iter().sum::<f64>() / n;
+    let spread = offsets
+        .iter()
+        .map(|&y| (y - mean_offset).abs())
+        .fold(0.0_f64, f64::max);
+    if !spread.is_finite() || spread <= 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{distribution} MLE requires nonconstant transformed samples"
+        )));
+    }
+    let scaled_variance = offsets
+        .iter()
+        .map(|&y| ((y - mean_offset) / spread).powi(2))
+        .sum::<f64>()
+        / n;
+    let b = spread.recip() / scaled_variance.sqrt();
+    let a = -(origin + mean_offset) * b;
+    if !a.is_finite() || !b.is_finite() || b <= 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{distribution} MLE shapes are not representable as finite values"
+        )));
+    }
+    Ok((a, b))
+}
+
 fn sample_population_variance(data: &[f64]) -> f64 {
     let mean = sample_mean(data);
     data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64
@@ -19162,15 +19199,31 @@ impl PowerNorm {
 
 impl ContinuousDistribution for PowerNorm {
     fn pdf(&self, x: f64) -> f64 {
-        (self.c.ln() - 0.5 * x * x - 0.5 * (2.0 * PI).ln()
-            + (self.c - 1.0) * fsci_special::log_ndtr_scalar(-x))
-        .exp()
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c) − ½x² − ½ln(2π) + (c−1)·logΦ(−x); finite in the tail. frankenscipy-p82v7
-        self.c.ln() - 0.5 * x * x - 0.5 * (2.0 * PI).ln()
-            + (self.c - 1.0) * fsci_special::log_ndtr_scalar(-x)
+        if x.is_infinite() {
+            return f64::NEG_INFINITY;
+        }
+        let log_survival = fsci_special::log_ndtr_scalar(-x);
+        // log(c) + log(phi(x)/Phi(-x)) + c*log(Phi(-x)). For small
+        // fitted c and large positive x, the original two x^2-sized terms
+        // cancel and erase the likelihood. erfcx supplies the log hazard
+        // directly without forming that subtraction.
+        let log_hazard = if x >= 0.0 {
+            0.5 * (2.0 / PI).ln() - fsci_special::convenience::erfcx_scalar(x * FRAC_1_SQRT_2).ln()
+        } else {
+            -0.5 * x * x - 0.5 * (2.0 * PI).ln() - log_survival
+        };
+        let scaled_log_survival = if log_survival == f64::NEG_INFINITY && x > 0.0 {
+            // log(Phi(-x)) itself can overflow although c*x^2/2 is finite.
+            // In that range its logarithmic correction is far below one ULP.
+            (-0.5 * x) * (self.c * x)
+        } else {
+            self.c * log_survival
+        };
+        self.c.ln() + log_hazard + scaled_log_survival
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -19203,6 +19256,48 @@ impl ContinuousDistribution for PowerNorm {
     fn var(&self) -> f64 {
         let mean = self.mean();
         (self.raw_moment(2) - mean * mean).max(0.0)
+    }
+
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self { c: f64::NAN })
+    }
+
+    /// Maximum-likelihood shape with location zero and scale one.
+    /// `-log(Phi(-X))` is exponential with rate `c`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 1, "PowerNorm")?;
+        let largest_x = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let largest = -fsci_special::log_ndtr_scalar(-largest_x);
+        if largest.is_nan() || largest <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "PowerNorm MLE requires a resolvable positive log-survival mean".into(),
+            ));
+        }
+        let c = if largest == f64::INFINITY {
+            // For x beyond the representable log-survival range, -log(Phi(-x))
+            // is x^2/2 to floating-point precision. Normalize x before squaring;
+            // smaller observations' omitted log terms cannot affect the mean.
+            let scaled_mean = data
+                .iter()
+                .map(|&x| (x.max(0.0) / largest_x).powi(2))
+                .sum::<f64>()
+                / data.len() as f64;
+            // Preserve dilution by n before forming a possibly subnormal c.
+            (2.0 / largest_x) / (scaled_mean * largest_x)
+        } else {
+            let scaled_mean = data
+                .iter()
+                .map(|&x| -fsci_special::log_ndtr_scalar(-x) / largest)
+                .sum::<f64>()
+                / data.len() as f64;
+            scaled_mean.recip() / largest
+        };
+        if !c.is_finite() || c <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "PowerNorm MLE shape is not representable as a finite positive value".into(),
+            ));
+        }
+        Ok(Self { c })
     }
 
     fn skewness(&self) -> f64 {
@@ -19546,6 +19641,11 @@ impl ContinuousDistribution for JohnsonSU {
         self.b * standard_normal_pdf(z) / x.hypot(1.0)
     }
 
+    fn logpdf(&self, x: f64) -> f64 {
+        let z = self.b.mul_add(x.asinh(), self.a);
+        self.b.ln() - 0.5 * z * z - 0.5 * (2.0 * PI).ln() - x.hypot(1.0).ln()
+    }
+
     fn cdf(&self, x: f64) -> f64 {
         standard_normal_cdf(self.a + self.b * x.asinh())
     }
@@ -19590,6 +19690,20 @@ impl ContinuousDistribution for JohnsonSU {
         let inv_b = self.b.recip();
         let exp_inv_b_sq = (inv_b * inv_b).exp();
         0.5 * exp_inv_b_sq.mul_add((2.0 * self.a * inv_b).cosh(), 1.0) * (inv_b * inv_b).exp_m1()
+    }
+
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
+            a: f64::NAN,
+            b: f64::NAN,
+        })
+    }
+
+    /// Maximum-likelihood shapes with location zero and scale one.
+    /// `asinh(X)` is normal with mean `-a/b` and standard deviation `1/b`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        let (a, b) = fit_johnson_shapes(data, "JohnsonSU", f64::asinh)?;
+        Ok(Self { a, b })
     }
 
     fn skewness(&self) -> f64 {
@@ -19714,8 +19828,10 @@ impl ContinuousDistribution for JohnsonSB {
         if x <= 0.0 || x >= 1.0 {
             return f64::NEG_INFINITY;
         }
-        let z = self.a + self.b * (x / (1.0 - x)).ln();
-        self.b.ln() - 0.5 * z * z - 0.5 * (2.0 * PI).ln() - x.ln() - (1.0 - x).ln()
+        let log_x = x.ln();
+        let log_one_minus_x = (-x).ln_1p();
+        let z = self.b.mul_add(log_x - log_one_minus_x, self.a);
+        self.b.ln() - 0.5 * z * z - 0.5 * (2.0 * PI).ln() - log_x - log_one_minus_x
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -19753,6 +19869,25 @@ impl ContinuousDistribution for JohnsonSB {
     fn var(&self) -> f64 {
         let m1 = self.raw_moment(1);
         (self.raw_moment(2) - m1 * m1).max(0.0)
+    }
+
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
+            a: f64::NAN,
+            b: f64::NAN,
+        })
+    }
+
+    /// Maximum-likelihood shapes on the fixed support `(0, 1)`.
+    /// `logit(X)` is normal with mean `-a/b` and standard deviation `1/b`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        if data.iter().any(|&x| x <= 0.0 || x >= 1.0) {
+            return Err(FitError::UnsupportedData(
+                "JohnsonSB MLE requires samples strictly between zero and one".into(),
+            ));
+        }
+        let (a, b) = fit_johnson_shapes(data, "JohnsonSB", |x| x.ln() - (-x).ln_1p())?;
+        Ok(Self { a, b })
     }
 
     fn skewness(&self) -> f64 {
@@ -20839,22 +20974,17 @@ impl ContinuousDistribution for FatigueLife {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let numerator = x + 1.0;
-        let denominator = 2.0 * self.c * (2.0 * PI * x.powi(3)).sqrt();
-        let exponent = -((x - 1.0) * (x - 1.0)) / (2.0 * x * self.c * self.c);
-        numerator * exponent.exp() / denominator
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(x+1) + exponent − ln(2c) − ½ln(2π) − 1.5·ln(x); finite tail. frankenscipy-p82v7
-        if x <= 0.0 {
+        if x <= 0.0 || x == f64::INFINITY {
             return f64::NEG_INFINITY;
         }
-        let exponent = -((x - 1.0) * (x - 1.0)) / (2.0 * x * self.c * self.c);
-        (x + 1.0).ln() + exponent - (2.0 * self.c).ln() - 0.5 * (2.0 * PI).ln() - 1.5 * x.ln()
+        // Scale before squaring: x^2, x*c^2 and 2*c can overflow even
+        // when the fitted density and its log are representable.
+        let z = ((x - 1.0) / x.sqrt()) / self.c;
+        x.ln_1p() - 0.5 * z * z - 2.0_f64.ln() - self.c.ln() - 0.5 * (2.0 * PI).ln() - 1.5 * x.ln()
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -20919,6 +21049,42 @@ impl ContinuousDistribution for FatigueLife {
 
     fn var(&self) -> f64 {
         0.25 * self.c * self.c * (5.0 * self.c * self.c + 4.0)
+    }
+
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self { c: f64::NAN })
+    }
+
+    /// Maximum-likelihood shape with location zero and scale one.
+    /// `(X-1)/sqrt(X)` is normal with fixed mean zero and standard deviation `c`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 1, "FatigueLife")?;
+        if data.iter().any(|&x| x <= 0.0) {
+            return Err(FitError::UnsupportedData(
+                "FatigueLife MLE requires strictly positive samples".into(),
+            ));
+        }
+        let largest = data
+            .iter()
+            .map(|&x| ((x - 1.0) / x.sqrt()).abs())
+            .fold(0.0_f64, f64::max);
+        if largest <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "FatigueLife MLE has no positive shape when every sample is one".into(),
+            ));
+        }
+        let mean_square = data
+            .iter()
+            .map(|&x| (((x - 1.0) / x.sqrt()) / largest).powi(2))
+            .sum::<f64>()
+            / data.len() as f64;
+        let c = largest * mean_square.sqrt();
+        if !c.is_finite() || c <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "FatigueLife MLE shape is not representable as a finite positive value".into(),
+            ));
+        }
+        Ok(Self { c })
     }
 
     fn skewness(&self) -> f64 {
@@ -82681,6 +82847,199 @@ mod tests {
                 Err(FitError::NonConvergent(_))
             ));
         }
+    }
+
+    #[test]
+    fn test_fit_johnson_standardized_maximum_likelihood() {
+        // Independently fit the transformed observations with scipy.stats.norm.fit.
+        let su_data = [-10.0, -2.0, 0.0, 0.5, 3.0, 8.0];
+        let su = JohnsonSU::try_fit(&su_data).expect("JohnsonSU MLE");
+        assert_close(su.a, -0.054_890_981_482_363_57, 1e-12, "JohnsonSU fit a");
+        assert_close(su.b, 0.519_250_126_820_577_9, 1e-12, "JohnsonSU fit b");
+        let su_ll: f64 = su_data.iter().map(|&x| su.logpdf(x)).sum();
+        assert_close(su_ll, -18.908_185_802_895_375, 1e-11, "JohnsonSU fit LL");
+        let reflected: Vec<f64> = su_data.iter().map(|x| -x).collect();
+        let reverse = JohnsonSU::fit(&reflected);
+        assert_close(reverse.a, -su.a, 1e-12, "JohnsonSU reflection a");
+        assert_close(reverse.b, su.b, 1e-12, "JohnsonSU reflection b");
+
+        let sb_data = [0.01, 0.08, 0.2, 0.5, 0.8, 0.95];
+        let sb = JohnsonSB::try_fit(&sb_data).expect("JohnsonSB MLE");
+        assert_close(sb.a, 0.275_446_338_193_305_55, 1e-12, "JohnsonSB fit a");
+        assert_close(sb.b, 0.403_778_832_438_680_4, 1e-12, "JohnsonSB fit b");
+        let sb_ll: f64 = sb_data.iter().map(|&x| sb.logpdf(x)).sum();
+        assert_close(sb_ll, 1.367_854_460_126_148, 1e-11, "JohnsonSB fit LL");
+        let reflected: Vec<f64> = sb_data.iter().map(|x| 1.0 - x).collect();
+        let reverse = JohnsonSB::fit(&reflected);
+        assert_close(reverse.a, -sb.a, 1e-12, "JohnsonSB reflection a");
+        assert_close(reverse.b, sb.b, 1e-12, "JohnsonSB reflection b");
+    }
+
+    #[test]
+    fn test_fit_johnson_preserves_small_spread_and_tail_likelihoods() {
+        let narrow = [-1e-200, 0.0, 1e-200];
+        let su = JohnsonSU::try_fit(&narrow).expect("underflow-resistant transformed variance");
+        assert_close(su.a, 0.0, 1e-12, "narrow JohnsonSU a");
+        assert_close(su.b * 1e-200, 1.5_f64.sqrt(), 1e-12, "narrow JohnsonSU b");
+        assert!(narrow.iter().all(|&x| su.logpdf(x).is_finite()));
+        assert_close(
+            JohnsonSU::new(0.0, 1.0).logpdf(1e300),
+            -239_756.158_774_028_77,
+            1e-8,
+            "JohnsonSU finite tail log density",
+        );
+        let small = [1e-300, 2e-300, 4e-300];
+        let sb = JohnsonSB::try_fit(&small).expect("near-boundary JohnsonSB MLE");
+        assert!(sb.a.is_finite() && sb.b.is_finite() && sb.b > 0.0);
+        assert!(small.iter().all(|&x| sb.logpdf(x).is_finite()));
+    }
+
+    #[test]
+    fn test_fit_powernorm_standardized_maximum_likelihood() {
+        let data = [-4.0, -1.0, 0.0, 1.0, 3.0, 7.0];
+        let fitted = PowerNorm::try_fit(&data).expect("PowerNorm MLE");
+        assert_close(fitted.c, 0.163_492_246_722_075_24, 1e-12, "PowerNorm fit c");
+        let ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        assert_close(ll, -23.680_581_465_146_457, 1e-11, "PowerNorm fit LL");
+        assert_close(
+            PowerNorm::fit(&[0.0]).c,
+            2.0_f64.ln().recip(),
+            1e-12,
+            "single PowerNorm sample",
+        );
+
+        let tail = [1e150, 2e150, 3e150];
+        let fitted = PowerNorm::try_fit(&tail).expect("PowerNorm finite extreme shape");
+        assert_close(fitted.c * 1e300, 3.0 / 7.0, 1e-12, "tail PowerNorm c");
+        for x in tail {
+            let log_pdf = fitted.logpdf(x);
+            assert!(log_pdf.is_finite() && log_pdf < -300.0 && log_pdf > -400.0);
+            assert!(fitted.pdf(x).is_finite() && fitted.pdf(x) > 0.0);
+        }
+        let fitted = PowerNorm::try_fit(&[2e154]).expect("representable subnormal PowerNorm shape");
+        assert!((fitted.c / 5e-309 - 1.0).abs() < 1e-12);
+        assert_close(
+            fitted.logpdf(2e154),
+            -355.598_104_321_083,
+            1e-10,
+            "PowerNorm scaled overflowing log survival",
+        );
+        let diluted = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e162];
+        let fitted =
+            PowerNorm::try_fit(&diluted).expect("preserve subnormal shape after averaging");
+        assert_eq!(fitted.c, f64::from_bits(3));
+        assert!(diluted.iter().all(|&x| fitted.logpdf(x).is_finite()));
+    }
+
+    #[test]
+    fn test_fit_fatiguelife_standardized_maximum_likelihood() {
+        let data = [0.05, 0.2, 0.6, 1.0, 2.0, 8.0, 30.0];
+        let fitted = FatigueLife::try_fit(&data).expect("FatigueLife MLE");
+        assert_close(fitted.c, 2.832_843_094_843_059, 1e-12, "FatigueLife fit c");
+        let ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        assert_close(ll, -15.536_164_677_871_842, 1e-11, "FatigueLife fit LL");
+        let reciprocal: Vec<f64> = data.iter().map(|x| 1.0 / x).collect();
+        assert_close(
+            FatigueLife::fit(&reciprocal).c,
+            fitted.c,
+            1e-12,
+            "FatigueLife reciprocal invariance",
+        );
+        // With location/scale fixed, repeated samples away from one still
+        // have a finite MLE; only an all-one sample is degenerate.
+        assert_close(
+            FatigueLife::fit(&[2.0, 2.0]).c,
+            FRAC_1_SQRT_2,
+            1e-12,
+            "constant FatigueLife sample",
+        );
+    }
+
+    #[test]
+    fn test_fit_fatiguelife_preserves_extreme_and_concentrated_samples() {
+        let wide = [1e-300, 1.0, 1e300];
+        let fitted = FatigueLife::try_fit(&wide).expect("scaled FatigueLife RMS");
+        assert_close(
+            fitted.c / 1e150,
+            (2.0_f64 / 3.0).sqrt(),
+            1e-12,
+            "extreme FatigueLife c",
+        );
+        assert!(wide.iter().all(|&x| fitted.logpdf(x).is_finite()));
+        let close_to_one = [1.0 - 1e-8, 1.0, 1.0 + 1e-8];
+        let fitted = FatigueLife::try_fit(&close_to_one).expect("concentrated FatigueLife MLE");
+        assert!((fitted.c / 8.164_965_804_979_584e-9 - 1.0).abs() < 1e-12);
+        assert!(close_to_one.iter().all(|&x| fitted.logpdf(x).is_finite()));
+    }
+
+    #[test]
+    fn test_fit_standardized_transforms_validate_data_and_degeneracy() {
+        assert!(matches!(
+            JohnsonSU::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            JohnsonSB::try_fit(&[0.5]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            PowerNorm::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            FatigueLife::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                JohnsonSU::try_fit(&[0.0, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            assert!(matches!(
+                JohnsonSB::try_fit(&[0.5, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            assert!(matches!(
+                PowerNorm::try_fit(&[0.0, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            assert!(matches!(
+                FatigueLife::try_fit(&[1.0, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        for bad in [0.0, 1.0, -0.1, 1.1] {
+            assert!(matches!(
+                JohnsonSB::try_fit(&[0.5, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        for bad in [0.0, -1.0] {
+            assert!(matches!(
+                FatigueLife::try_fit(&[1.0, bad]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        assert!(matches!(
+            JohnsonSU::try_fit(&[0.2, 0.2, 0.2]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            JohnsonSB::try_fit(&[0.2, 0.2, 0.2]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            FatigueLife::try_fit(&[1.0, 1.0]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            PowerNorm::try_fit(&[-40.0]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(JohnsonSU::fit(&[]).a.is_nan());
+        assert!(JohnsonSB::fit(&[]).b.is_nan());
+        assert!(PowerNorm::fit(&[]).c.is_nan());
+        assert!(FatigueLife::fit(&[]).c.is_nan());
     }
 
     #[test]
