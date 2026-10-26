@@ -308,15 +308,15 @@ where
         });
     };
 
-    let x_scale = x_probe
-        .iter()
-        .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+    let x_scale = x_probe.iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
 
     // 1. Hamming / Moré-Wild ECnoise difference-table probe along a deterministic unit vector `u`.
     let mut rng_state = options.seed.unwrap_or(0x7B8D_0008_CAFE_F00D);
     for &xi in &x_probe {
         rng_state ^= xi.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        rng_state = rng_state.rotate_left(27).wrapping_add(0x94D0_49BB_1331_11EB);
+        rng_state = rng_state
+            .rotate_left(27)
+            .wrapping_add(0x94D0_49BB_1331_11EB);
     }
     let mut u = Vec::with_capacity(n);
     for _ in 0..n {
@@ -391,17 +391,9 @@ where
             // For k = 3: (2k)! / (k!)^2 = 20; for k = 4: (2k)! / (k!)^2 = 70.
             let eps3 = (d3.iter().map(|v| v * v).sum::<f64>() / (20.0 * 4.0)).sqrt();
             let eps4 = (d4.iter().map(|v| v * v).sum::<f64>() / (70.0 * 3.0)).sqrt();
-            let sign_changes_3 = d3
-                .windows(2)
-                .filter(|w| w[0] * w[1] < 0.0)
-                .count();
-            let sign_changes_4 = d4
-                .windows(2)
-                .filter(|w| w[0] * w[1] < 0.0)
-                .count();
-            let f_scale = table_vals
-                .iter()
-                .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+            let sign_changes_3 = d3.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+            let sign_changes_4 = d4.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+            let f_scale = table_vals.iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
             noise_estimate = eps4;
             detected_noisy = eps4 > 1.0e-7 * f_scale
                 && (eps4 >= 0.05 * eps3 || sign_changes_3 >= 1 || sign_changes_4 >= 1);
@@ -704,8 +696,7 @@ where
                 };
                 if let Ok(polished) = newton_cg(&fun, &res.x, refine_options)
                     && (polished.success
-                        || polished.fun.unwrap_or(f64::INFINITY)
-                            < res.fun.unwrap_or(f64::INFINITY))
+                        || polished.fun.unwrap_or(f64::INFINITY) < res.fun.unwrap_or(f64::INFINITY))
                 {
                     res = OptimizeResult {
                         success: res.success || polished.success,
@@ -9126,7 +9117,10 @@ mod tests {
             "expected cond_estimate >= 1e6 at x0=0, got {:e}",
             probe.cond_estimate
         );
-        assert!(!probe.is_noisy, "smooth ill-conditioned quadratic is not noisy");
+        assert!(
+            !probe.is_noisy,
+            "smooth ill-conditioned quadratic is not noisy"
+        );
         assert!(
             probe.probe_nfev <= 4 * x0.len() + 8,
             "probe_nfev {} exceeded budget {}",
@@ -9139,9 +9133,21 @@ mod tests {
             .expect("minimize_with_casp on ill-conditioned quadratic");
         assert_eq!(res.chosen_action, OptSolverAction::TrustRegionNewtonCG);
         assert!(res.result.success, "{}", res.result.message);
-        assert!((res.result.x[0] - 1.0).abs() < 1.0e-4, "x={:?}", res.result.x);
-        assert!((res.result.x[1] + 2.0).abs() < 1.0e-4, "x={:?}", res.result.x);
-        assert!((res.result.x[2] - 0.5).abs() < 1.0e-4, "x={:?}", res.result.x);
+        assert!(
+            (res.result.x[0] - 1.0).abs() < 1.0e-4,
+            "x={:?}",
+            res.result.x
+        );
+        assert!(
+            (res.result.x[1] + 2.0).abs() < 1.0e-4,
+            "x={:?}",
+            res.result.x
+        );
+        assert!(
+            (res.result.x[2] - 0.5).abs() < 1.0e-4,
+            "x={:?}",
+            res.result.x
+        );
 
         let entry = portfolio.evidence().back().expect("recorded evidence");
         assert!(
@@ -9204,8 +9210,8 @@ mod tests {
             convex_bowl(x)
         };
 
-        let standalone = bfgs(&convex_bowl, &[1.0, 1.0], MinimizeOptions::default())
-            .expect("standalone bfgs");
+        let standalone =
+            bfgs(&convex_bowl, &[1.0, 1.0], MinimizeOptions::default()).expect("standalone bfgs");
 
         let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
         assert_eq!(portfolio.evidence_len(), 0);

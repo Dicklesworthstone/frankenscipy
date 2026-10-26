@@ -416,7 +416,10 @@ mod tests {
             &ledger,
         )
         .expect_err("HARDENED_MAX_STATE_DIM + 1 must fail closed");
-        assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+        assert!(matches!(
+            err,
+            IntegrateValidationError::ResourceExhausted { .. }
+        ));
         let guard = ledger.lock().expect("lock");
         assert_eq!(guard.len(), 1);
         assert_eq!(
@@ -444,7 +447,10 @@ mod tests {
             &ledger_casp,
         )
         .expect_err("CASP portfolio must fail closed before probe allocation");
-        assert!(matches!(casp_err, IntegrateValidationError::ResourceExhausted { .. }));
+        assert!(matches!(
+            casp_err,
+            IntegrateValidationError::ResourceExhausted { .. }
+        ));
         let guard_casp = ledger_casp.lock().expect("lock");
         assert_eq!(guard_casp.len(), 1);
         assert_eq!(
@@ -511,7 +517,10 @@ mod tests {
                 &ledger,
             )
             .expect_err("max_step=inf without a step cap must be refused in Hardened mode");
-            assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+            assert!(matches!(
+                err,
+                IntegrateValidationError::ResourceExhausted { .. }
+            ));
             let guard = ledger.lock().expect("lock");
             assert_eq!(
                 guard.entries()[0].action,
@@ -536,7 +545,10 @@ mod tests {
                 &ledger,
             )
             .expect_err("exceeding Hardened step cap must fail closed");
-            assert!(matches!(err, IntegrateValidationError::ResourceExhausted { .. }));
+            assert!(matches!(
+                err,
+                IntegrateValidationError::ResourceExhausted { .. }
+            ));
             let guard = ledger.lock().expect("lock");
             assert_eq!(
                 guard.entries().last().unwrap().action,
@@ -552,7 +564,10 @@ mod tests {
         use fsci_runtime::RuntimeMode;
 
         for call_idx in 0..500usize {
-            let y0 = [1.0 + (call_idx as f64) * 0.01, -0.5 + (call_idx as f64) * 0.005];
+            let y0 = [
+                1.0 + (call_idx as f64) * 0.01,
+                -0.5 + (call_idx as f64) * 0.005,
+            ];
             let opts = SolveIvpOptions {
                 t_span: (0.0, 1.0),
                 y0: &y0,
@@ -573,14 +588,21 @@ mod tests {
             });
             assert_eq!(r1.nfev, r2.nfev);
             for (t1, t2) in r1.t.iter().zip(r2.t.iter()) {
-                assert_eq!(t1.to_bits(), t2.to_bits(), "t strict bit-identity at call {call_idx}");
+                assert_eq!(
+                    t1.to_bits(),
+                    t2.to_bits(),
+                    "t strict bit-identity at call {call_idx}"
+                );
             }
             for (row1, row2) in r1.y.iter().zip(r2.y.iter()) {
                 for (a, b) in row1.iter().zip(row2.iter()) {
-                    assert_eq!(a.to_bits(), b.to_bits(), "y strict bit-identity at call {call_idx}");
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "y strict bit-identity at call {call_idx}"
+                    );
                 }
             }
         }
     }
 }
-

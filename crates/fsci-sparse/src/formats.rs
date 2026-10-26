@@ -102,22 +102,12 @@ pub fn check_hardened_sparse_cap(
             "sparse matrix dimension ({}x{}) exceeds hardened limit ({max_dim})",
             shape.rows, shape.cols
         );
-        fsci_runtime::audit_reject(
-            audit,
-            "resource_exhausted",
-            &format!("rejected: {message}"),
-        );
+        fsci_runtime::audit_reject(audit, "resource_exhausted", &format!("rejected: {message}"));
         return Err(SparseError::ResourceExhausted { message });
     }
     if nnz > max_nnz {
-        let message = format!(
-            "sparse matrix nnz ({nnz}) exceeds hardened limit ({max_nnz})"
-        );
-        fsci_runtime::audit_reject(
-            audit,
-            "resource_exhausted",
-            &format!("rejected: {message}"),
-        );
+        let message = format!("sparse matrix nnz ({nnz}) exceeds hardened limit ({max_nnz})");
+        fsci_runtime::audit_reject(audit, "resource_exhausted", &format!("rejected: {message}"));
         return Err(SparseError::ResourceExhausted { message });
     }
     Ok(())

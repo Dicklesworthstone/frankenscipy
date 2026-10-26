@@ -3286,7 +3286,10 @@ mod tests {
             .iter()
             .map(|a| a.as_str().expect("an action name"))
             .collect();
-        assert!(listed.is_empty(), "the report's own unreached list is empty");
+        assert!(
+            listed.is_empty(),
+            "the report's own unreached list is empty"
+        );
         assert!(report["sole_success"]["SVDFallback"].as_u64() > Some(0));
         assert!(report["fallback_success"]["SVDFallback"].as_u64() > Some(0));
 
