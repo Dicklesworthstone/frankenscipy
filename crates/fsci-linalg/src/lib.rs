@@ -3610,8 +3610,10 @@ fn scipy_route(structural_evidence: StructuralEvidence) -> SolverAction {
 ///   (`dlasyf`, n > 64), and its answer moves by 2e-8 to 1.3e-7 (relative, cond 1e10)
 ///   between OpenBLAS's own kernels, as far as LU is from it.
 /// - A tridiagonal `solve` (n > 3) is dense LU; SciPy's `gttrf` has the same pivots.
-/// - Triangular solves use a row-oriented substitution; SciPy's `trtrs` is column-oriented,
-///   so the two differ by rounding.
+/// - Triangular solves up to OpenBLAS's `DTB_ENTRIES` (`n <= 64`) match `dtrsv`'s unblocked
+///   column-axpy rounding tree (`'N'`) and dot-then-subtract order (`'T'`); above `n = 64`,
+///   where OpenBLAS switches to blocked `dtrsv` + `dgemv` (whose own kernels differ across
+///   microarchitectures), fsci uses 8-lane `simd_dot_and_normsq` (frankenscipy-8cl8o).
 fn strict_order_action(
     mode: RuntimeMode,
     structural_evidence: StructuralEvidence,
@@ -13905,12 +13907,29 @@ fn solve_triangular_internal(
     lower: bool,
     unit_diagonal: bool,
 ) -> Result<SolveResult, LinalgError> {
+    // OpenBLAS's x86-64 `dtrsv` runs unblocked up to `DTB_ENTRIES = 64` and blocks with
+    // `dgemv` above that. Up to `TRSV_UNBLOCKED_MAX`, match `dtrsv`'s exact IEEE-754
+    // rounding tree (`frankenscipy-8cl8o`):
+    // - `'N'` (`trsv_L` / `trsv_U` without transpose) is column-axpy with division:
+    //   `x[j] /= a[j][j]; for i { x[i] -= x[j] * a[i][j] }`. Because `x[i]` starts at `b[i]`
+    //   and is modified only by subtracting `x[j] * a[i][j]` for `j = 0..i` (lower) or
+    //   `j = (i+1..n).rev()` (upper) before dividing by `a[i][i]`, accumulating `xi` across
+    //   contiguous row `a[i]` in that exact `j` order produces the identical IEEE-754 bits
+    //   with no transpose copy and no column-strided cache misses.
+    // - `'T'` / `'C'` (`trsv` with transpose) is dot-then-subtract along row `i` of `A^T`:
+    //   `dot = Σ_{j<i} A^T[i][j] * x[j]` (or `j>i`), then `x[i] = (b[i] - dot) / A^T[i][i]`.
+    // Above `TRSV_UNBLOCKED_MAX`, use 8-lane `simd_dot_and_normsq`.
+    const TRSV_UNBLOCKED_MAX: usize = 64;
+
     let n = a.len();
-    let (mat_storage, is_lower): (Cow<'_, [Vec<f64>]>, bool) = match trans {
-        TriangularTranspose::NoTranspose => (Cow::Borrowed(a), lower),
-        TriangularTranspose::Transpose | TriangularTranspose::ConjugateTranspose => {
-            (Cow::Owned(transpose(a)), !lower)
-        }
+    let is_transposed = matches!(
+        trans,
+        TriangularTranspose::Transpose | TriangularTranspose::ConjugateTranspose
+    );
+    let (mat_storage, is_lower): (Cow<'_, [Vec<f64>]>, bool) = if is_transposed {
+        (Cow::Owned(transpose(a)), !lower)
+    } else {
+        (Cow::Borrowed(a), lower)
     };
     let mat = mat_storage.as_ref();
 
@@ -13918,20 +13937,88 @@ fn solve_triangular_internal(
     // Fuse the O(n²) backward-error certificate INTO the substitution instead of
     // recomputing it with two extra full-matrix passes afterward (SciPy's dtrsv
     // computes no certificate at all — that redundant work was the ~3x gap).
-    //
-    // The substitution's running dot `sum_i = Σ_{j∈offdiag} mat[i][j]·x[j]` is
-    // exactly the off-diagonal part of `(A·x)_i`, so the row residual is
-    // `r_i = sum_i + mat[i][i]·x[i] − b[i]` — O(1) per row, no residual matvec.
-    // `‖A‖_F²` accumulates over the SAME single streamed pass over the nonzero
-    // triangle via `simd_dot_and_normsq`, so the norm needs no second pass either.
-    // For a properly-formed triangular input the ignored (opposite) triangle is
-    // structurally zero, so summing only the stored triangle is bit-identical to
-    // the full-matrix `compute_backward_error_dense` (`0·x = 0`, `0² = 0` are
-    // no-op terms) — the same argument the banded certificate already relies on.
-    // The `sum_i` dot reuses `simd_dot`'s exact lane layout, so `x` is unchanged.
     let mut residual_sum_sq = 0.0_f64;
     let mut a_sum_sq = 0.0_f64;
-    if is_lower {
+    if n <= TRSV_UNBLOCKED_MAX {
+        if !unit_diagonal {
+            for (i, row) in mat.iter().enumerate().take(n) {
+                if row[i] == 0.0 {
+                    return Err(LinalgError::SingularMatrix);
+                }
+            }
+        }
+        if is_lower {
+            for i in 0..n {
+                let dstored = mat[i][i];
+                let row = &mat[i][..i];
+                let x_prefix = &x[..i];
+                let mut sum = 0.0_f64;
+                let mut row_nsq = 0.0_f64;
+                let xi = if is_transposed {
+                    for (&aij, &xj) in row.iter().zip(x_prefix) {
+                        sum += aij * xj;
+                        row_nsq += aij * aij;
+                    }
+                    let mut xi = b[i] - sum;
+                    if !unit_diagonal {
+                        xi /= dstored;
+                    }
+                    xi
+                } else {
+                    let mut xi = b[i];
+                    for (&aij, &xj) in row.iter().zip(x_prefix) {
+                        let prod = xj * aij;
+                        xi -= prod;
+                        sum += prod;
+                        row_nsq += aij * aij;
+                    }
+                    if !unit_diagonal {
+                        xi /= dstored;
+                    }
+                    xi
+                };
+                x[i] = xi;
+                let res_i = sum + dstored * xi - b[i];
+                residual_sum_sq += res_i * res_i;
+                a_sum_sq += row_nsq + dstored * dstored;
+            }
+        } else {
+            for i in (0..n).rev() {
+                let dstored = mat[i][i];
+                let row = &mat[i][(i + 1)..n];
+                let x_suffix = &x[(i + 1)..n];
+                let mut sum = 0.0_f64;
+                let mut row_nsq = 0.0_f64;
+                let xi = if is_transposed {
+                    for (&aij, &xj) in row.iter().zip(x_suffix) {
+                        sum += aij * xj;
+                        row_nsq += aij * aij;
+                    }
+                    let mut xi = b[i] - sum;
+                    if !unit_diagonal {
+                        xi /= dstored;
+                    }
+                    xi
+                } else {
+                    let mut xi = b[i];
+                    for (&aij, &xj) in row.iter().zip(x_suffix).rev() {
+                        let prod = xj * aij;
+                        xi -= prod;
+                        sum += prod;
+                        row_nsq += aij * aij;
+                    }
+                    if !unit_diagonal {
+                        xi /= dstored;
+                    }
+                    xi
+                };
+                x[i] = xi;
+                let res_i = sum + dstored * xi - b[i];
+                residual_sum_sq += res_i * res_i;
+                a_sum_sq += row_nsq + dstored * dstored;
+            }
+        }
+    } else if is_lower {
         for i in 0..n {
             let (sum, row_nsq) = simd_dot_and_normsq(&mat[i][..i], &x[..i]);
             let dstored = mat[i][i];
@@ -49701,6 +49788,206 @@ mod proptest_tests {
             assert!(
                 (got - want).abs() < 1e-10,
                 "x[{i}] got {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn solve_triangular_matches_openblas_dtrsv_6x6_and_64x64_and_row_dot_differs() {
+        // frankenscipy-8cl8o: up to OpenBLAS's DTB_ENTRIES = 64, solve_triangular and solve on
+        // triangular matrices match OpenBLAS dtrsv's column-axpy rounding tree to 0 ULP across
+        // all non-FMA OpenBLAS kernels (PRESCOTT, NEHALEM, SANDYBRIDGE; and at n=6 also HASWELL
+        // and ZEN), whereas the old row-dot simd_dot_and_normsq order differs in the last bit.
+        fn splitmix64(state: &mut u64) -> f64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let unit = (z >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64));
+            unit * 2.0 - 1.0
+        }
+
+        fn make_case(n: usize, seed: u64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>) {
+            let mut s = seed;
+            let mut u = vec![vec![0.0; n]; n];
+            let mut l = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    let v = splitmix64(&mut s);
+                    if i == j {
+                        let d = if v >= 0.0 {
+                            v.abs() + 1.5
+                        } else {
+                            -(v.abs() + 1.5)
+                        };
+                        u[i][j] = d;
+                        l[i][j] = d;
+                    } else if i < j {
+                        u[i][j] = v;
+                    } else {
+                        l[i][j] = v;
+                    }
+                }
+            }
+            let b: Vec<f64> = (0..n).map(|_| splitmix64(&mut s)).collect();
+            (u, l, b)
+        }
+
+        fn dtrsv_col_axpy(a: &[Vec<f64>], b: &[f64], lower: bool) -> Vec<f64> {
+            let n = a.len();
+            let mut x = b.to_vec();
+            if lower {
+                for j in 0..n {
+                    x[j] /= a[j][j];
+                    let xj = x[j];
+                    for i in (j + 1)..n {
+                        x[i] -= xj * a[i][j];
+                    }
+                }
+            } else {
+                for j in (0..n).rev() {
+                    x[j] /= a[j][j];
+                    let xj = x[j];
+                    for i in 0..j {
+                        x[i] -= xj * a[i][j];
+                    }
+                }
+            }
+            x
+        }
+
+        fn row_dot_simd_legacy(a: &[Vec<f64>], b: &[f64], lower: bool) -> Vec<f64> {
+            let n = a.len();
+            let mut x = vec![0.0; n];
+            if lower {
+                for i in 0..n {
+                    let (sum, _) = simd_dot_and_normsq(&a[i][..i], &x[..i]);
+                    x[i] = (b[i] - sum) / a[i][i];
+                }
+            } else {
+                for i in (0..n).rev() {
+                    let (sum, _) = simd_dot_and_normsq(&a[i][(i + 1)..n], &x[(i + 1)..n]);
+                    x[i] = (b[i] - sum) / a[i][i];
+                }
+            }
+            x
+        }
+
+        // Exact IEEE-754 bits from SciPy 1.17.1 scipy.linalg.solve_triangular on n=6
+        // across OPENBLAS_CORETYPE in {PRESCOTT, NEHALEM, SANDYBRIDGE, HASWELL, ZEN}:
+        const SCIPY_U6_BITS: [u64; 6] = [
+            0x3fd8_ab46_c185_4d9f,
+            0x3fe5_0863_219b_d6cc,
+            0x3fe1_6748_807a_596a,
+            0xbfc5_aaaf_cad3_708c,
+            0x3fcb_cb3f_9650_7c44,
+            0xbfdd_bb1f_4ece_0815,
+        ];
+        const SCIPY_L6_BITS: [u64; 6] = [
+            0x3fd3_1a0f_b131_1adb,
+            0x3fe0_5d31_8580_eb77,
+            0x3fd1_a1ba_19a0_6929,
+            0x3fc0_75d1_9ea0_dd67,
+            0x3fb6_b241_8719_5cd1,
+            0xbfe9_65dd_2ce2_892c,
+        ];
+
+        for &n in &[6_usize, 64_usize] {
+            let (u, l, b) = make_case(n, 0x2026_0924_8C18_0000 ^ (n as u64));
+            let want_u = dtrsv_col_axpy(&u, &b, false);
+            let want_l = dtrsv_col_axpy(&l, &b, true);
+            if n == 6 {
+                let got_u_bits: Vec<u64> = want_u.iter().map(|v| v.to_bits()).collect();
+                let got_l_bits: Vec<u64> = want_l.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got_u_bits, SCIPY_U6_BITS);
+                assert_eq!(got_l_bits, SCIPY_L6_BITS);
+            }
+
+            let tri_u = solve_triangular(
+                &u,
+                &b,
+                TriangularSolveOptions {
+                    lower: false,
+                    ..Default::default()
+                },
+            )
+            .expect("upper solve_triangular");
+            let tri_l = solve_triangular(
+                &l,
+                &b,
+                TriangularSolveOptions {
+                    lower: true,
+                    ..Default::default()
+                },
+            )
+            .expect("lower solve_triangular");
+
+            for i in 0..n {
+                assert_eq!(
+                    tri_u.x[i].to_bits(),
+                    want_u[i].to_bits(),
+                    "upper n={n} i={i} must be 0-ULP bit-identical to OpenBLAS dtrsv"
+                );
+                assert_eq!(
+                    tri_l.x[i].to_bits(),
+                    want_l[i].to_bits(),
+                    "lower n={n} i={i} must be 0-ULP bit-identical to OpenBLAS dtrsv"
+                );
+            }
+
+            // General `solve` with detected triangular structure also routes here in Strict mode.
+            let solve_u = solve(&u, &b, SolveOptions::default()).expect("solve upper");
+            let solve_l = solve(&l, &b, SolveOptions::default()).expect("solve lower");
+            for i in 0..n {
+                assert_eq!(solve_u.x[i].to_bits(), want_u[i].to_bits());
+                assert_eq!(solve_l.x[i].to_bits(), want_l[i].to_bits());
+            }
+
+            // Must-differ arm: legacy row-dot SIMD order differs in last bits on both upper and lower.
+            let legacy_u = row_dot_simd_legacy(&u, &b, false);
+            let legacy_l = row_dot_simd_legacy(&l, &b, true);
+            let diff_u = legacy_u
+                .iter()
+                .zip(&want_u)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let diff_l = legacy_l
+                .iter()
+                .zip(&want_l)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert!(
+                diff_u > 0 && diff_l > 0,
+                "legacy row-dot must differ from dtrsv on n={n} (diff_u={diff_u}, diff_l={diff_l})"
+            );
+
+            // Same-invocation performance measurement (new row-streamed dtrsv vs legacy row-dot).
+            let iters = if n == 6 { 20_000 } else { 2_000 };
+            let t0 = std::time::Instant::now();
+            let mut sink = 0.0_f64;
+            for _ in 0..iters {
+                let r = solve_triangular_internal(
+                    &u,
+                    &b,
+                    TriangularTranspose::NoTranspose,
+                    false,
+                    false,
+                )
+                .expect("dtrsv");
+                sink += r.x[0];
+            }
+            let dtrsv_ns = t0.elapsed().as_nanos() as f64 / f64::from(iters);
+
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters {
+                let x = row_dot_simd_legacy(&u, &b, false);
+                sink += x[0];
+            }
+            let legacy_ns = t1.elapsed().as_nanos() as f64 / f64::from(iters);
+            assert!(sink.is_finite());
+            eprintln!(
+                "frankenscipy-8cl8o perf n={n}: dtrsv_with_cert={dtrsv_ns:.1}ns, legacy_row_dot_no_cert={legacy_ns:.1}ns"
             );
         }
     }
