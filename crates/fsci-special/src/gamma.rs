@@ -2137,6 +2137,25 @@ fn record_non_finite_incomplete_gamma(
 /// `1 - Q` (Q from the continued fraction) and `ln P = ln1p(-Q)`. Matches
 /// `gammainc_scalar(a, x).ln()` wherever the latter is representable.
 ///
+/// Below this, `log_gammainc_scalar` and `log_gammaincc_scalar` stop taking the log of `igam` /
+/// `igamc` and sum the tail in log space with Loader's saddle-point prefactor.
+const LOG_GAMMAINC_LOG_SPACE_BELOW: f64 = 1e-290;
+
+/// `ln(x^a e^{-x} / Γ(a))` for `a > 0, x > 0`, using Loader's saddle-point form
+/// `½·ln a − ln √(2π) − stirlerr(a) − bd0(a, x)` from `a = SADDLE_POINT_MIN_SHAPE` so that
+/// `-x + a·ln x − lnΓ(a)` does not lose `O(a·ln a·ε)` digits (frankenscipy-g9yid).
+#[inline]
+fn log_gamma_prefactor(a: f64, x: f64) -> f64 {
+    if a >= SADDLE_POINT_MIN_SHAPE {
+        0.5 * a.ln() - LN_SQRT_2PI - stirlerr(a) - bd0(a, x)
+    } else {
+        match gammaln_scalar(a, RuntimeMode::Strict) {
+            Ok(lg) => -x + a * x.ln() - lg,
+            Err(_) => f64::NAN,
+        }
+    }
+}
+
 /// Domain: `a > 0`, `x >= 0`. Returns `NaN` for invalid `a`/`x`, `-inf` at
 /// `x = 0` (`P = 0`), and `0.0` at `x = +inf` (`P = 1`).
 #[must_use]
@@ -2154,65 +2173,34 @@ pub fn log_gammainc_scalar(a: f64, x: f64) -> f64 {
         return 0.0;
     }
 
-    const EPS: f64 = 1.0e-14;
-    const FPMIN: f64 = 1.0e-300;
-
-    let lg = match gammaln_scalar(a, RuntimeMode::Strict) {
-        Ok(v) => v,
-        Err(_) => return f64::NAN,
-    };
-    let log_prefactor = -x + a * x.ln() - lg;
-
-    if x < a + 1.0 {
-        // Lower-tail series. `sum` is O(1/a), so the log form stays finite even
-        // when P = prefactor * sum underflows to 0 in the left tail.
-        let mut ap = a;
-        let mut term = 1.0 / a;
-        let mut sum = term;
-        let series_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
-        for _ in 0..series_max {
-            ap += 1.0;
-            term *= x / ap;
-            sum += term;
-            if term.abs() <= sum.abs() * EPS {
-                break;
-            }
+    if x >= a + 1.0 {
+        let q = crate::igam_temme::igamc(a, x).clamp(0.0, 1.0);
+        if q < 0.5 {
+            return (-q).ln_1p();
         }
-        log_prefactor + sum.ln()
-    } else {
-        // Upper-dominant region: P is O(1); form Q via the continued fraction
-        // and return ln(1 - Q) = ln1p(-Q).
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / FPMIN;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        // The upper continued fraction needs ~√a steps near x≈a; the fixed
-        // 200-iter cap truncated it for very large a (Q(100000,100001) was ~1e-5
-        // off). Scale the cap with √a (the EPS-break keeps typical a cheap),
-        // mirroring the lower-series fix. frankenscipy.
-        let cf_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
-        for i in 1..=cf_max {
-            let i_f = i as f64;
-            let an = -i_f * (i_f - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < FPMIN {
-                d = FPMIN;
-            }
-            c = b + an / c;
-            if c.abs() < FPMIN {
-                c = FPMIN;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() <= EPS {
-                break;
-            }
-        }
-        let q = (log_prefactor.exp() * h).clamp(0.0, 1.0);
-        (-q).ln_1p()
     }
+    let p = crate::igam_temme::igam(a, x);
+    if p >= LOG_GAMMAINC_LOG_SPACE_BELOW || x >= a + 1.0 {
+        return p.ln();
+    }
+
+    const EPS: f64 = 1.0e-15;
+    let log_prefactor = log_gamma_prefactor(a, x);
+    // Lower-tail series. `sum` is O(1/a), so the log form stays finite even
+    // when P = prefactor * sum underflows to 0 in the left tail.
+    let mut ap = a;
+    let mut term = 1.0 / a;
+    let mut sum = term;
+    let series_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+    for _ in 0..series_max {
+        ap += 1.0;
+        term *= x / ap;
+        sum += term;
+        if term.abs() <= sum.abs() * EPS {
+            break;
+        }
+    }
+    log_prefactor + sum.ln()
 }
 
 /// Natural log of the regularized upper incomplete gamma function `Q(a, x)`.
@@ -2222,10 +2210,10 @@ pub fn log_gammainc_scalar(a: f64, x: f64) -> f64 {
 /// upper-tail region (`x >= a + 1`) `Q = prefactor * h`, where
 /// `prefactor = exp(-x + a*ln x - lnΓ(a))` underflows but the Lentz continued
 /// fraction `h` is `O(1)`; computing
-/// `ln Q = (-x + a*ln x - lnΓ(a)) + ln(h)` keeps full precision. In the
+/// `ln Q = log_gamma_prefactor(a, x) + ln(h)` keeps full precision. In the
 /// lower-dominant region (`x < a + 1`) `Q` is `O(1)`, so it is evaluated
-/// directly and logged. Matches `gammaincc_scalar(a, x).ln()` wherever the
-/// latter is representable.
+/// directly via `igam`/`igamc` and logged. Matches `gammaincc_scalar(a, x).ln()`
+/// wherever the latter is representable.
 ///
 /// Domain: `a > 0`, `x >= 0`. Returns `NaN` for invalid `a`/`x`, `0.0` at
 /// `x = 0` (`Q = 1`), and `-inf` at `x = +inf` (`Q = 0`).
@@ -2244,64 +2232,48 @@ pub fn log_gammaincc_scalar(a: f64, x: f64) -> f64 {
         return f64::NEG_INFINITY;
     }
 
-    const EPS: f64 = 1.0e-14;
-    const FPMIN: f64 = 1.0e-300;
-
-    let lg = match gammaln_scalar(a, RuntimeMode::Strict) {
-        Ok(v) => v,
-        Err(_) => return f64::NAN,
-    };
-    let log_prefactor = -x + a * x.ln() - lg;
-
-    if x >= a + 1.0 {
-        // Upper-tail continued fraction (Lentz). `h` is O(1), so the log form
-        // stays finite even when Q = prefactor * h underflows to 0.
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / FPMIN;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        // The upper continued fraction needs ~√a steps near x≈a; the fixed
-        // 200-iter cap truncated it for very large a (Q(100000,100001) was ~1e-5
-        // off). Scale the cap with √a (the EPS-break keeps typical a cheap),
-        // mirroring the lower-series fix. frankenscipy.
-        let cf_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
-        for i in 1..=cf_max {
-            let i_f = i as f64;
-            let an = -i_f * (i_f - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < FPMIN {
-                d = FPMIN;
-            }
-            c = b + an / c;
-            if c.abs() < FPMIN {
-                c = FPMIN;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() <= EPS {
-                break;
-            }
+    if x < a + 1.0 {
+        let p = crate::igam_temme::igam(a, x).clamp(0.0, 1.0);
+        if p < 0.5 {
+            return (-p).ln_1p();
         }
-        log_prefactor + h.ln()
-    } else {
-        // Lower-dominant region: Q is O(1); evaluate the series for P then log Q.
-        let mut ap = a;
-        let mut term = 1.0 / a;
-        let mut sum = term;
-        let series_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
-        for _ in 0..series_max {
-            ap += 1.0;
-            term *= x / ap;
-            sum += term;
-            if term.abs() <= sum.abs() * EPS {
-                break;
-            }
-        }
-        let p = (log_prefactor.exp() * sum).clamp(0.0, 1.0);
-        (1.0 - p).ln()
     }
+    let q = crate::igam_temme::igamc(a, x);
+    if q >= LOG_GAMMAINC_LOG_SPACE_BELOW || x < a + 1.0 {
+        return q.ln();
+    }
+
+    const EPS: f64 = 1.0e-15;
+    const FPMIN: f64 = 1.0e-300;
+    let log_prefactor = log_gamma_prefactor(a, x);
+
+    // Upper-tail continued fraction (Lentz). `h` is O(1), so the log form
+    // stays finite even when Q = prefactor * h underflows to 0.
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / FPMIN;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    let cf_max = ((12.0 * a.sqrt()) as usize + 200).min(2_000_000);
+    for i in 1..=cf_max {
+        let i_f = i as f64;
+        let an = -i_f * (i_f - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = b + an / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() <= EPS {
+            break;
+        }
+    }
+    log_prefactor + h.ln()
 }
 
 fn validate_incomplete_gamma_domain(
@@ -6349,6 +6321,43 @@ mod tests {
         assert!(log_gammaincc_scalar(-1.0, 2.0).is_nan());
         assert!(log_gammaincc_scalar(2.0, f64::NAN).is_nan());
         assert!(log_gammaincc_scalar(0.0, 2.0).is_nan());
+    }
+
+    #[test]
+    fn log_gammainc_and_log_gammaincc_hold_at_huge_shape_and_underflowed_tails() {
+        // frankenscipy-g9yid item 2 leftover: `-x + a * x.ln() - gammaln(a)` lost `O(a ln a ε)`
+        // (~4e-7 at a = 1e8), and near the mean the series/CF took O(√a) steps instead of
+        // delegating to `igam`/`igamc` (Temme O(1)). 60-digit mpmath references:
+        for (a, x, want_lp) in [
+            (1e6_f64, 997_000.0, -6.616_501_467_306_787_5),
+            (1e6, 1_003_000.0, -1.362_668_657_580_906_4e-3),
+            (1e6, 960_000.0, -826.602_937_413_514_9),
+            (1e8, 99_970_000.0, -6.608_601_917_207_132),
+            (1e8, 100_030_000.0, -1.351_993_633_251_429_1e-3),
+            (1e8, 99_600_000.0, -806.748_193_402_635_5),
+        ] {
+            let got = log_gammainc_scalar(a, x);
+            let rel = (got - want_lp).abs() / want_lp.abs();
+            assert!(
+                rel < 1e-13,
+                "log_gammainc({a:e}, {x}): got {got}, want {want_lp} (rel={rel:.2e})"
+            );
+        }
+        for (a, x, want_lq) in [
+            (1e6_f64, 997_000.0, -1.339_000_228_132_565_9e-3),
+            (1e6, 1_003_000.0, -6.598_991_510_666_551_5),
+            (1e6, 1_040_000.0, -783.895_313_752_633),
+            (1e8, 99_970_000.0, -1.349_626_785_807_738_6e-3),
+            (1e8, 100_030_000.0, -6.606_850_931_160_689),
+            (1e8, 100_400_000.0, -802.481_490_763_055_2),
+        ] {
+            let got = log_gammaincc_scalar(a, x);
+            let rel = (got - want_lq).abs() / want_lq.abs();
+            assert!(
+                rel < 1e-13,
+                "log_gammaincc({a:e}, {x}): got {got}, want {want_lq} (rel={rel:.2e})"
+            );
+        }
     }
 
     #[test]

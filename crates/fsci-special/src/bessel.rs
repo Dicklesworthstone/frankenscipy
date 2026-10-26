@@ -7115,12 +7115,17 @@ pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
     //   lmbda(2147483647.0, 1.0) -> ValueError: negative dimensions are not allowed
     // A non-integer order in that range asks numpy for >= 16 GiB per array.
     // lmbda(2147483647.5, 1.0) raised MemoryError under an 8 GB address-space cap.
-    if v.is_nan() || v < 0.0 || v >= f64::from(i32::MAX) {
+    // Orders at or above `HARDENED_MAX_BATCH_LEN` (16_777_216) are refused with the same
+    // NaN pair rather than sizing multi-GiB vectors (frankenscipy-g9yid).
+    if v.is_nan() || v < 0.0 || v >= crate::HARDENED_MAX_BATCH_LEN as f64 {
         return (vec![f64::NAN], vec![f64::NAN]);
     }
     let n = v.floor().max(0.0) as usize;
     let v0 = v - v.floor();
     let count = n + 1;
+    if !x.is_finite() {
+        return (vec![f64::NAN; count], vec![f64::NAN; count]);
+    }
     let mut vl = vec![0.0_f64; count];
     let mut dl = vec![0.0_f64; count];
 
@@ -7137,23 +7142,38 @@ pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
     }
 
     let half = x / 2.0;
-    let m_extra = 40usize.max(n + 20 + x.abs() as usize);
+    let x_tail = x.abs().min(100_000.0) as usize;
+    let m_extra = 40usize.max(n + 20 + x_tail);
     let top = n + m_extra;
-    // Miller downward recurrence on Λ_{v0+i}; f[top+1]=0, f[top] seeded.
-    let mut f = vec![0.0_f64; top + 2];
-    f[top] = 1e-30;
-    for i in (1..=top).rev() {
+    // Miller downward recurrence on Λ_{v0+i}; f[top+1]=0, f[top]=1e-30 seeded.
+    // Walk `top` down to `n + 1` in scalar registers and store `0..=n` directly in `vl`
+    // so no third vector `f` is allocated (frankenscipy-g9yid).
+    let mut f_next = 0.0_f64;
+    let mut f_curr = 1e-30_f64;
+    let x2_quarter = 0.25 * x * x;
+    for i in ((count + 1)..=top).rev() {
         let w = v0 + i as f64;
-        f[i - 1] = f[i] - x * x / (4.0 * w * (w + 1.0)) * f[i + 1];
+        let f_prev = f_curr - x2_quarter / (w * (w + 1.0)) * f_next;
+        f_next = f_curr;
+        f_curr = f_prev;
+    }
+    let f_n_plus_1 = f_curr;
+    for i in (1..=count).rev() {
+        let w = v0 + i as f64;
+        let f_prev = f_curr - x2_quarter / (w * (w + 1.0)) * f_next;
+        f_next = f_curr;
+        f_curr = f_prev;
+        vl[i - 1] = f_curr;
     }
     let direct0 = gamma_scalar(v0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
         * jv_scalar(v0, x)
         * half.powf(-v0);
-    let scale = direct0 / f[0];
+    let scale = direct0 / vl[0];
     for i in 0..count {
         let vi = v0 + i as f64;
-        vl[i] = f[i] * scale;
-        dl[i] = -(x / (2.0 * (vi + 1.0))) * (f[i + 1] * scale);
+        let f_ip1 = if i < n { vl[i + 1] } else { f_n_plus_1 };
+        vl[i] *= scale;
+        dl[i] = -(x / (2.0 * (vi + 1.0))) * (f_ip1 * scale);
     }
     (vl, dl)
 }
@@ -8090,6 +8110,33 @@ mod tests {
         assert_eq!(dl, vec![0.0, 0.5, 0.0, 0.0], "lmbda(3,0) d");
         let (vl, _) = lmbda(2.5, 0.0);
         assert_eq!(vl, vec![1.0, 1.0, 1.0], "lmbda(2.5,0) v");
+    }
+
+    #[test]
+    fn lmbda_handles_nonfinite_x_and_caps_huge_orders() {
+        // frankenscipy-g9yid item 7: lmbda(2.5, ±inf) used to overflow `x.abs() as usize` in
+        // debug builds, and orders below 2^31 - 1 sized three vectors by v.
+        for x in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let (vl, dl) = lmbda(2.5, x);
+            assert_eq!((vl.len(), dl.len()), (3, 3));
+            assert!(
+                vl.iter().all(|z| z.is_nan()) && dl.iter().all(|z| z.is_nan()),
+                "lmbda(2.5, {x}) must return NaN vectors of len 3, got vl={vl:?} dl={dl:?}"
+            );
+        }
+        // Orders at or above HARDENED_MAX_BATCH_LEN return the NaN sentinel pair without
+        // attempting multi-GiB allocations.
+        for v in [16_777_216.0, 1e8, 2_147_483_646.0] {
+            let (vl, dl) = lmbda(v, 1.0);
+            assert!(
+                vl.len() == 1 && dl.len() == 1 && vl[0].is_nan() && dl[0].is_nan(),
+                "lmbda({v}, 1.0) must be NaN-signalled, got vl={vl:?} dl={dl:?}"
+            );
+        }
+        // Finite must-not-change check: lmbda(2.5, 1.5) matches SciPy 1.17.1 to 1e-14.
+        let (vl, dl) = lmbda(2.5, 1.5);
+        assert!((vl[2] - 0.848_995_224_589_388_1).abs() < 1e-14);
+        assert!((dl[2] - -0.188_830_943_883_145_34).abs() < 1e-14);
     }
 
     #[test]

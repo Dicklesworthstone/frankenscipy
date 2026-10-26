@@ -998,7 +998,7 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         u *= y * (a + b) / (a + 1.0);
         a += 1.0;
         w *= lam / j;
-        if w < 1e-300 || (w < 1e-14 * total.max(1e-300) && j > lam) {
+        if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
         steps += 1.0;
@@ -1016,7 +1016,7 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         j -= 1.0;
         a -= 1.0;
         total += w * p.clamp(0.0, 1.0);
-        if w < 1e-14 * total.max(1e-300) {
+        if w < 1e-17 * total.max(1e-300) {
             break;
         }
     }
@@ -1161,7 +1161,7 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         u *= y * (a + b) / (a + 1.0);
         a += 1.0;
         w *= lam / j;
-        if w < 1e-300 || (w < 1e-14 * total.max(1e-300) && j > lam) {
+        if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
             break;
         }
         steps += 1.0;
@@ -1186,7 +1186,7 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         j -= 1.0;
         a -= 1.0;
         total += w * q.clamp(0.0, 1.0);
-        if w < 1e-14 * total.max(1e-300) {
+        if w < 1e-17 * total.max(1e-300) {
             break;
         }
     }
@@ -8456,6 +8456,44 @@ mod tests {
             rel_err(far, 0.8626668135599574) <= BRATIO_TOL,
             "ncfdtr(5, 1e100, 1, 2) = {far:e}, the search's upper bound"
         );
+    }
+
+    #[test]
+    fn ncfdtr_ncfdtrc_hold_precision_at_large_noncentrality() {
+        // frankenscipy-g9yid item 2 leftover: stopping the Poisson walks at `w < 1e-14 * total`
+        // discarded ~√λ * 1e-14 of tail mass at large λ (~1e-10 at λ = 1e8). With `1e-17 * total`
+        // (matching chndtr/chndtrc/nctdtr), both CDF and survival hold 1e-13 against SciPy 1.17.1
+        // and sum to 1 within 1e-13.
+        for (nc, f, want_cdf, want_sf) in [
+            (
+                2e6_f64,
+                (3.0 + 2e6) / 3.0,
+                4.158_807_972_000_878e-1,
+                5.841_192_027_999_147e-1,
+            ),
+            (
+                2e8_f64,
+                (3.0 + 2e8) / 3.0,
+                4.158_801_930_979_195_7e-1,
+                5.841_198_069_021_478e-1,
+            ),
+        ] {
+            let cdf = ncfdtr(3.0, 5.0, nc, f);
+            let sf = ncfdtrc(3.0, 5.0, nc, f);
+            assert!(
+                (cdf - want_cdf).abs() < 1e-12,
+                "ncfdtr(3, 5, {nc:e}, {f}): got {cdf}, want {want_cdf}"
+            );
+            assert!(
+                (sf - want_sf).abs() < 1e-12,
+                "ncfdtrc(3, 5, {nc:e}, {f}): got {sf}, want {want_sf}"
+            );
+            assert!(
+                (cdf + sf - 1.0).abs() < 1e-12,
+                "ncfdtr + ncfdtrc - 1 at nc={nc:e}: got {}",
+                cdf + sf - 1.0
+            );
+        }
     }
 
     #[test]
