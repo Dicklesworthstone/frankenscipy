@@ -27,9 +27,6 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-/// x2 = x1 + 0.1 beside the intercept column, with no regularisation: the normal equations are
-/// singular (cond 1.6e18) and numpy's reference raises (frankenscipy-cb36a).
-const SINGULAR_DESIGN_CASE: &str = "two_correlated_a0";
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -255,14 +252,19 @@ fn diff_stats_ridge_regression() {
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let rust_coeffs = ridge_regression(&case.x, &case.y, case.alpha);
-        if case.case_id == SINGULAR_DESIGN_CASE && scipy_arm.coeffs.is_none() {
-            ledger.allowlisted(
-                "ridge_regression",
-                &case.case_id,
-                "frankenscipy-cb36a",
-                "alpha=0 on a collinear design: numpy.linalg.solve raises Singular matrix, fsci \
-                 returns a rounding-chosen minimizer",
-            );
+        if scipy_arm.coeffs.is_none() {
+            // Singular normal equations (e.g. `two_correlated_a0` with alpha=0): numpy.linalg.solve
+            // raises LinAlgError(Singular matrix), and fsci refuses with all-NaN coefficients
+            // (frankenscipy-cb36a).
+            let expected_len = case.x.first().map_or(0, |row| row.len() + 1);
+            let both_refused =
+                rust_coeffs.len() == expected_len && rust_coeffs.iter().all(|v| v.is_nan());
+            ledger.compared("ridge_regression", &case.case_id, both_refused);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                abs_diff: if both_refused { 0.0 } else { f64::INFINITY },
+                pass: both_refused,
+            });
             continue;
         }
         // slices rejects a length mismatch and any non-finite fsci coefficient,
@@ -319,6 +321,5 @@ fn diff_stats_ridge_regression() {
         diffs.len(),
         max_overall
     );
-    // Every case but the allowlisted singular design compares.
-    ledger.finish(query.points.len() - 1);
+    ledger.finish(query.points.len());
 }

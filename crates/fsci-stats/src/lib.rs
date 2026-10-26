@@ -64430,8 +64430,55 @@ pub fn multiple_regression(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, Vec<f64>, f6
 }
 
 #[allow(clippy::needless_range_loop)]
+fn is_normal_equation_numerically_singular(a: &[Vec<f64>]) -> bool {
+    let n = a.len();
+    if n == 0 {
+        return false;
+    }
+    let mut d = Vec::with_capacity(n);
+    for i in 0..n {
+        let diag = a[i][i];
+        if !diag.is_finite() || diag <= 0.0 {
+            return true;
+        }
+        d.push(diag.sqrt());
+    }
+    let mut eq = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            let v = a[i][j] / (d[i] * d[j]);
+            if !v.is_finite() {
+                return true;
+            }
+            eq[i][j] = v;
+        }
+    }
+    let rank_tol = (n as f64) * 1.0e-12;
+    for col in 0..n {
+        let max_row = (col..n)
+            .max_by(|&i, &j| eq[i][col].abs().total_cmp(&eq[j][col].abs()))
+            .unwrap_or(col);
+        eq.swap(col, max_row);
+        let pivot = eq[col][col];
+        if !pivot.is_finite() || pivot.abs() <= rank_tol {
+            return true;
+        }
+        for row in col + 1..n {
+            let factor = eq[row][col] / pivot;
+            for j in col..n {
+                eq[row][j] -= factor * eq[col][j];
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::needless_range_loop)]
 fn solve_regression_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let n = a.len();
+    if is_normal_equation_numerically_singular(a) {
+        return vec![f64::NAN; n];
+    }
     let mut aug: Vec<Vec<f64>> = a
         .iter()
         .enumerate()
@@ -64447,8 +64494,8 @@ fn solve_regression_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
             .max_by(|&i, &j| aug[i][col].abs().total_cmp(&aug[j][col].abs()))
             .unwrap_or(col);
         aug.swap(col, max_row);
-        if aug[col][col].abs() < 1e-15 {
-            continue;
+        if aug[col][col] == 0.0 || !aug[col][col].is_finite() {
+            return vec![f64::NAN; n];
         }
         let pivot = aug[col][col];
         for row in col + 1..n {
@@ -64462,8 +64509,8 @@ fn solve_regression_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
-        if aug[i][i].abs() < 1e-15 {
-            continue;
+        if aug[i][i] == 0.0 || !aug[i][i].is_finite() {
+            return vec![f64::NAN; n];
         }
         let mut sum = aug[i][n];
         for j in i + 1..n {
@@ -64477,6 +64524,9 @@ fn solve_regression_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 #[allow(clippy::needless_range_loop)]
 fn compute_std_errors(xtx: &[Vec<f64>], mse: f64) -> Vec<f64> {
     let n = xtx.len();
+    if is_normal_equation_numerically_singular(xtx) {
+        return vec![f64::NAN; n];
+    }
     // Compute inverse of XtX via Gauss-Jordan
     let mut aug: Vec<Vec<f64>> = xtx
         .iter()
@@ -64494,8 +64544,8 @@ fn compute_std_errors(xtx: &[Vec<f64>], mse: f64) -> Vec<f64> {
             .max_by(|&i, &j| aug[i][col].abs().total_cmp(&aug[j][col].abs()))
             .unwrap_or(col);
         aug.swap(col, max_row);
-        if aug[col][col].abs() < 1e-15 {
-            continue;
+        if aug[col][col] == 0.0 || !aug[col][col].is_finite() {
+            return vec![f64::NAN; n];
         }
         let pivot = aug[col][col];
         for j in 0..2 * n {
@@ -116233,5 +116283,64 @@ mod histogram_distribution_matches_scipy {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_stats_ridge_and_multiple_regression_singular_normal_equations_scale_invariant() {
+        use crate::{multiple_regression, ridge_regression};
+
+        // Collinear design: x2 = x1 + 0.1 alongside intercept column 1.0, alpha = 0.0 (frankenscipy-cb36a).
+        // Must refuse with NaN coefficients at both unit scale (1.0) and 1e-8 scale.
+        for &scale in &[1.0_f64, 1.0e-8_f64] {
+            let x_collinear: Vec<Vec<f64>> = (1..=15)
+                .map(|i| vec![(i as f64) * scale, ((i as f64) + 0.1) * scale])
+                .collect();
+            let y: Vec<f64> = (1..=15).map(|i| 1.0 + 1.5 * (i as f64)).collect();
+
+            let ridge_a0 = ridge_regression(&x_collinear, &y, 0.0);
+            assert_eq!(ridge_a0.len(), 3);
+            assert!(
+                ridge_a0.iter().all(|v| v.is_nan()),
+                "collinear alpha=0 design at scale={scale:e} must refuse with NaN, got {ridge_a0:?}"
+            );
+
+            let (mult_beta, _resid, mult_r2, mult_se) = multiple_regression(&x_collinear, &y);
+            assert_eq!(mult_beta.len(), 3);
+            assert!(
+                mult_beta.iter().all(|v| v.is_nan()),
+                "multiple_regression on collinear design at scale={scale:e} must refuse with NaN, got {mult_beta:?}"
+            );
+            assert!(mult_r2.is_nan());
+            assert!(mult_se.iter().all(|v| v.is_nan()));
+        }
+
+        // With positive ridge regularization (alpha = 0.5), the collinear design is well-posed.
+        let x_unit: Vec<Vec<f64>> = (1..=15)
+            .map(|i| vec![i as f64, (i as f64) + 0.1])
+            .collect();
+        let y_unit: Vec<f64> = (1..=15).map(|i| 1.0 + 1.5 * (i as f64)).collect();
+        let ridge_reg = ridge_regression(&x_unit, &y_unit, 0.5);
+        assert_eq!(ridge_reg.len(), 3);
+        assert!(
+            ridge_reg.iter().all(|v| v.is_finite()),
+            "regularized ridge(alpha=0.5) must return finite coefficients, got {ridge_reg:?}"
+        );
+
+        // Full-rank design scaled by 1e-8 must still solve accurately (old absolute 1e-15 threshold skipped its pivot).
+        let scale = 1.0e-8_f64;
+        let x_full_scaled: Vec<Vec<f64>> = (1..=10).map(|i| vec![(i as f64) * scale]).collect();
+        let y_full: Vec<f64> = (1..=10).map(|i| 2.0 + 3.0 * (i as f64)).collect();
+        let coeffs_scaled = ridge_regression(&x_full_scaled, &y_full, 0.0);
+        assert_eq!(coeffs_scaled.len(), 2);
+        assert!(
+            (coeffs_scaled[0] - 2.0).abs() <= 1e-6,
+            "intercept at scale 1e-8: got {}",
+            coeffs_scaled[0]
+        );
+        assert!(
+            (coeffs_scaled[1] * scale - 3.0).abs() <= 1e-6,
+            "slope * scale at scale 1e-8: got {}",
+            coeffs_scaled[1] * scale
+        );
     }
 }
