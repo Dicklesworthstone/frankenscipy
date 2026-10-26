@@ -334,13 +334,12 @@
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "ArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-yrlc3)",
-    "ParseArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-yrlc3)"
-   },
-   "real": 2,
+   "not_real": {},
+   "real": 4,
    "real_not_compared": [
+    "ArffError",
     "MetaData",
+    "ParseArffError",
     "loadarff"
    ],
    "scipy": 4
@@ -372,7 +371,7 @@
    "scipy": 10
   },
   "scipy.io.wavfile": {
-   "applicable": 3,
+   "applicable": 2,
    "compared": 0,
    "crate": "fsci-io",
    "declared": 0,
@@ -383,9 +382,9 @@
     "trait": 0,
     "type_alias": 0
    },
-   "na": 0,
+   "na": 1,
    "not_real": {
-    "WavFileWarning": "missing: no warning channel for skipped or malformed WAV chunks (frankenscipy-yrlc3)"
+    "WavFileWarning": "na: wav_read returns IoError::InvalidFormat on malformed headers/chunks and skips non-audio metadata chunks without a Python warnings channel"
    },
    "real": 2,
    "real_not_compared": [
@@ -759,7 +758,7 @@
   },
   "scipy.sparse": {
    "applicable": 51,
-   "compared": 24,
+   "compared": 25,
    "crate": "fsci-sparse",
    "declared": 51,
    "matched_by": {
@@ -784,7 +783,6 @@
     "diags_array",
     "dok_array",
     "dok_matrix",
-    "eye",
     "eye_array",
     "identity",
     "isspmatrix_bsr",
@@ -934,7 +932,7 @@
   },
   "scipy.special": {
    "applicable": 358,
-   "compared": 208,
+   "compared": 211,
    "crate": "fsci-special",
    "declared": 357,
    "matched_by": {
@@ -994,14 +992,12 @@
     "itairy",
     "iti0k0",
     "itj0y0",
-    "ive",
     "j_roots",
     "jacobi",
     "jn",
     "jnjnp_zeros",
     "jnyn_zeros",
     "js_roots",
-    "jve",
     "kei_zeros",
     "keip_zeros",
     "kelvin_zeros",
@@ -1095,7 +1091,6 @@
     "u_roots",
     "us_roots",
     "wrightomega",
-    "yve",
     "zeta",
     "zetac"
    ],
@@ -1278,28 +1273,27 @@
    "applicable": 9,
    "compared": 0,
    "crate": "fsci-stats",
-   "declared": 5,
+   "declared": 8,
    "matched_by": {
     "case_fold": 0,
-    "exact": 5,
+    "exact": 8,
     "reexport": 0,
     "trait": 0,
     "type_alias": 0
    },
    "na": 0,
-   "not_real": {
-    "FastGeneratorInversion": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
-    "NumericalInversePolynomial": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
-    "SimpleRatioUniforms": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
-    "UNURANError": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)"
-   },
-   "real": 5,
+   "not_real": {},
+   "real": 9,
    "real_not_compared": [
     "DiscreteAliasUrn",
     "DiscreteGuideTable",
+    "FastGeneratorInversion",
     "NumericalInverseHermite",
+    "NumericalInversePolynomial",
     "RatioUniforms",
-    "TransformedDensityRejection"
+    "SimpleRatioUniforms",
+    "TransformedDensityRejection",
+    "UNURANError"
    ],
    "scipy": 9
   }
@@ -1307,18 +1301,18 @@
  "numpy": "2.4.3",
  "scipy": "1.17.1",
  "total": {
-  "applicable": 1539,
-  "compared": 891,
-  "declared": 1495,
+  "applicable": 1538,
+  "compared": 895,
+  "declared": 1498,
   "matched_by": {
    "case_fold": 131,
-   "exact": 1289,
+   "exact": 1292,
    "reexport": 13,
    "trait": 2,
    "type_alias": 60
   },
-  "na": 16,
-  "real": 1525,
+  "na": 17,
+  "real": 1531,
   "scipy": 1555
  }
 }
