@@ -13,7 +13,10 @@ use std::io::Write;
 use std::process::Stdio;
 
 use fsci_conformance::CompareLedger;
-use fsci_stats::trimmed_mean;
+use fsci_stats::{
+    FastGeneratorInversion, Normal, NumericalInversePolynomial, SimpleRatioUniforms, StatsError,
+    trimmed_mean,
+};
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -240,4 +243,178 @@ fn diff_stats_mstats_trimmed_mean() {
     );
     assert!(failures.is_empty(), "trimmed_mean differs from SciPy");
     ledger.finish(queries.len());
+}
+
+const SAMPLING_ORACLE: &str = r#"
+import json
+import sys
+import numpy as np
+from scipy import stats
+from scipy.stats import sampling
+
+us = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+xs = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
+
+fgi = sampling.FastGeneratorInversion(stats.norm(), domain=(-3.0, 3.0))
+fgi_ppf = [float(v) for v in fgi.ppf(us)]
+
+class StdNorm:
+    def pdf(self, x):
+        return float(np.exp(-0.5 * x * x))
+    def dpdf(self, x):
+        return float(-x * np.exp(-0.5 * x * x))
+
+pinv = sampling.NumericalInversePolynomial(
+    StdNorm(), center=0.0, domain=(-5.0, 5.0), order=5, u_resolution=1e-10
+)
+pinv_ppf = [float(v) for v in pinv.ppf(us)]
+pinv_cdf = [float(v) for v in pinv.cdf(xs)]
+
+sru = sampling.SimpleRatioUniforms(
+    StdNorm(),
+    mode=0.0,
+    pdf_area=float(np.sqrt(2.0 * np.pi)),
+    cdf_at_mode=0.5,
+    random_state=np.random.default_rng(12345),
+)
+sru_samples = sru.rvs(4000)
+sru_mean = float(np.mean(sru_samples))
+sru_std = float(np.std(sru_samples, ddof=1))
+
+class ZeroPdf:
+    def pdf(self, x):
+        return 0.0
+
+unuran_err = False
+try:
+    sampling.NumericalInversePolynomial(ZeroPdf(), center=0.0, domain=(-1.0, 1.0))
+except sampling.UNURANError:
+    unuran_err = True
+
+print(json.dumps({
+    "us": us,
+    "xs": xs,
+    "fgi_ppf": fgi_ppf,
+    "pinv_ppf": pinv_ppf,
+    "pinv_cdf": pinv_cdf,
+    "sru_mean": sru_mean,
+    "sru_std": sru_std,
+    "unuran_err": unuran_err,
+}))
+"#;
+
+#[derive(Debug, Deserialize)]
+struct SamplingOracleOut {
+    us: Vec<f64>,
+    xs: Vec<f64>,
+    fgi_ppf: Vec<f64>,
+    pinv_ppf: Vec<f64>,
+    pinv_cdf: Vec<f64>,
+    sru_mean: f64,
+    sru_std: f64,
+    unuran_err: bool,
+}
+
+#[test]
+fn diff_stats_sampling_unuran() {
+    let output = match fsci_conformance::scipy_oracle_command()
+        .arg("-c")
+        .arg(SAMPLING_ORACLE)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "spawn sampling oracle: {e}"
+            );
+            eprintln!("skipping sampling oracle: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "sampling oracle failed: {stderr}"
+        );
+        eprintln!("skipping sampling oracle: {stderr}");
+        return;
+    }
+    let oracle: SamplingOracleOut =
+        serde_json::from_slice(&output.stdout).expect("parse sampling oracle JSON");
+
+    let mut ledger = CompareLedger::new(
+        "diff_stats_sampling_unuran",
+        &[
+            "FastGeneratorInversion",
+            "NumericalInversePolynomial",
+            "SimpleRatioUniforms",
+            "UNURANError",
+        ],
+    );
+
+    let fgi = FastGeneratorInversion::new(Normal::standard(), Some((-3.0, 3.0))).expect("fgi");
+    for (u, want) in oracle.us.iter().zip(&oracle.fgi_ppf) {
+        let got = fgi.ppf(*u).expect("fgi ppf");
+        let pass = (got - want).abs() <= 1e-6;
+        ledger.compared("FastGeneratorInversion", &format!("u={u}"), pass);
+    }
+
+    let pinv = NumericalInversePolynomial::new(
+        |x: f64| (-0.5 * x * x).exp(),
+        Some(0.0),
+        Some((-5.0, 5.0)),
+        5,
+        1e-10,
+    )
+    .expect("pinv");
+    for (u, want) in oracle.us.iter().zip(&oracle.pinv_ppf) {
+        let got = pinv.ppf(*u).expect("pinv ppf");
+        let pass = (got - want).abs() <= 1e-5;
+        ledger.compared("NumericalInversePolynomial", &format!("ppf_u={u}"), pass);
+    }
+    for (x, want) in oracle.xs.iter().zip(&oracle.pinv_cdf) {
+        let got = pinv.cdf(*x).expect("pinv cdf");
+        let pass = (got - want).abs() <= 1e-5;
+        ledger.compared("NumericalInversePolynomial", &format!("cdf_x={x}"), pass);
+    }
+
+    let sru = SimpleRatioUniforms::new(
+        |x: f64| (-0.5 * x * x).exp(),
+        0.0,
+        (2.0 * std::f64::consts::PI).sqrt(),
+        Some(0.5),
+    )
+    .expect("sru");
+    let mut rng_state = 12345_u64;
+    let samples = sru
+        .sample(4000, &mut || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng_state >> 11) as f64) / ((1u64 << 53) as f64)
+        })
+        .expect("sru sample");
+    let mean = samples.iter().sum::<f64>() / (samples.len() as f64);
+    let var = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((samples.len() - 1) as f64);
+    let std = var.sqrt();
+    ledger.compared(
+        "SimpleRatioUniforms",
+        "mean",
+        (mean - oracle.sru_mean).abs() <= 0.1,
+    );
+    ledger.compared(
+        "SimpleRatioUniforms",
+        "std",
+        (std - oracle.sru_std).abs() <= 0.1,
+    );
+
+    let zero_res = NumericalInversePolynomial::new(|_: f64| 0.0, Some(0.0), Some((-1.0, 1.0)), 5, 1e-10);
+    let err_matches = oracle.unuran_err && matches!(zero_res, Err(StatsError::InvalidArgument { .. }));
+    ledger.compared("UNURANError", "zero_pdf", err_matches);
+
+    ledger.finish(1);
 }

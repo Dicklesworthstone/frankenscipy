@@ -323,7 +323,7 @@
   },
   "scipy.io.arff": {
    "applicable": 4,
-   "compared": 0,
+   "compared": 3,
    "crate": "fsci-io",
    "declared": 0,
    "matched_by": {
@@ -337,10 +337,7 @@
    "not_real": {},
    "real": 4,
    "real_not_compared": [
-    "ArffError",
-    "MetaData",
-    "ParseArffError",
-    "loadarff"
+    "MetaData"
    ],
    "scipy": 4
   },
@@ -372,7 +369,7 @@
   },
   "scipy.io.wavfile": {
    "applicable": 2,
-   "compared": 0,
+   "compared": 2,
    "crate": "fsci-io",
    "declared": 0,
    "matched_by": {
@@ -387,10 +384,7 @@
     "WavFileWarning": "na: wav_read returns IoError::InvalidFormat on malformed headers/chunks and skips non-audio metadata chunks without a Python warnings channel"
    },
    "real": 2,
-   "real_not_compared": [
-    "read",
-    "write"
-   ],
+   "real_not_compared": [],
    "scipy": 3
   },
   "scipy.linalg": {
@@ -1271,7 +1265,7 @@
   },
   "scipy.stats.sampling": {
    "applicable": 9,
-   "compared": 0,
+   "compared": 4,
    "crate": "fsci-stats",
    "declared": 8,
    "matched_by": {
@@ -1287,13 +1281,9 @@
    "real_not_compared": [
     "DiscreteAliasUrn",
     "DiscreteGuideTable",
-    "FastGeneratorInversion",
     "NumericalInverseHermite",
-    "NumericalInversePolynomial",
     "RatioUniforms",
-    "SimpleRatioUniforms",
-    "TransformedDensityRejection",
-    "UNURANError"
+    "TransformedDensityRejection"
    ],
    "scipy": 9
   }
@@ -1302,7 +1292,7 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1538,
-  "compared": 895,
+  "compared": 904,
   "declared": 1498,
   "matched_by": {
    "case_fold": 131,

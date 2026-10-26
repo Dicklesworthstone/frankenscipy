@@ -41,9 +41,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_io::{
-    IoError, LoadmatOptions, MatCell, MatChar, MatClass, MatData, MatDtype, MatFile, MatFormat,
-    MatNumeric, MatObject, MatOpaque, MatSparse, MatStruct, MatValue, OnedAs, SavematOptions,
-    loadmat, matfile_version, savemat, varmats_from_mat, whosmat,
+    ArffAttribute, ArffValue, IoError, LoadmatOptions, MatCell, MatChar, MatClass, MatData,
+    MatDtype, MatFile, MatFormat, MatNumeric, MatObject, MatOpaque, MatSparse, MatStruct, MatValue,
+    OnedAs, SavematOptions, loadmat, matfile_version, read_arff, savemat, varmats_from_mat,
+    wav_read, wav_write, whosmat,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -1209,4 +1210,119 @@ fn diff_io_savemat_roundtrip_fsci_to_scipy() {
         );
     }
     ledger.finish(2);
+}
+
+const ARFF_WAV_ORACLE: &str = r#"
+import io
+import json
+import numpy as np
+from scipy.io import arff, wavfile
+
+arff_text = "@relation sample\n@attribute x numeric\n@attribute y numeric\n@data\n1.5, -2.25\n3.0, 4.5\n"
+data, meta = arff.loadarff(io.StringIO(arff_text))
+meta_cls = arff.MetaData.__name__
+rows = [[float(r[0]), float(r[1])] for r in data]
+names = list(meta.names())
+
+bad_type_err = False
+try:
+    arff.loadarff(io.StringIO("@relation r\n@attribute x badtype\n@data\n1.0\n"))
+except (arff.ParseArffError, arff.ArffError):
+    bad_type_err = True
+
+buf = io.BytesIO()
+pcm = np.array([0, 16384, -16384, 32767], dtype=np.int16)
+wavfile.write(buf, 44100, pcm)
+wav_bytes_hex = buf.getvalue().hex()
+rate, read_back = wavfile.read(io.BytesIO(buf.getvalue()))
+
+print(json.dumps({
+    "meta_cls": meta_cls,
+    "names": names,
+    "rows": rows,
+    "bad_type_err": bad_type_err,
+    "wav_bytes_hex": wav_bytes_hex,
+    "rate": int(rate),
+    "pcm": [int(v) for v in read_back.tolist()],
+}))
+"#;
+
+#[test]
+fn diff_io_arff_and_wavfile() {
+    let Some(oracle) = run_oracle(ARFF_WAV_ORACLE, &json!({})) else {
+        return;
+    };
+    let mut ledger = CompareLedger::new(
+        "diff_io_arff_and_wavfile",
+        &["arff_loadarff", "arff_errors", "wavfile_roundtrip"],
+    );
+
+    let arff_text =
+        "@relation sample\n@attribute x numeric\n@attribute y numeric\n@data\n1.5, -2.25\n3.0, 4.5\n";
+    let parsed = read_arff(arff_text).expect("read_arff valid");
+    let attr_names: Vec<&str> = parsed
+        .attributes
+        .iter()
+        .map(|a: &ArffAttribute| a.name.as_str())
+        .collect();
+    let want_names: Vec<&str> = oracle["names"]
+        .as_array()
+        .expect("names")
+        .iter()
+        .map(|v| v.as_str().expect("str"))
+        .collect();
+    let want_rows: Vec<Vec<f64>> = oracle["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            r.as_array()
+                .expect("row")
+                .iter()
+                .map(|v| v.as_f64().expect("f64"))
+                .collect()
+        })
+        .collect();
+    let got_rows: Vec<Vec<f64>> = parsed
+        .rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|cell| match cell {
+                    ArffValue::Numeric(v) => *v,
+                    other => panic!("unexpected ArffValue: {other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    ledger.compared(
+        "arff_loadarff",
+        "attributes_and_rows",
+        attr_names == want_names && got_rows == want_rows && oracle["meta_cls"] == "MetaData",
+    );
+
+    let bad = read_arff("@relation r\n@attribute x badtype\n@data\n1.0\n");
+    ledger.compared(
+        "arff_errors",
+        "invalid_attribute_type",
+        oracle["bad_type_err"].as_bool() == Some(true)
+            && matches!(bad, Err(IoError::InvalidFormat(_))),
+    );
+
+    let wav_bytes = unhex(oracle["wav_bytes_hex"].as_str().expect("wav_bytes_hex"));
+    let wav = wav_read(&wav_bytes).expect("wav_read scipy wav");
+    let reencoded = wav_write(wav.sample_rate, wav.channels, &wav.data).expect("wav_write");
+    let roundtrip = wav_read(&reencoded).expect("wav_read roundtrip");
+    let samples_close = wav
+        .data
+        .iter()
+        .zip(&roundtrip.data)
+        .all(|(a, b)| (a - b).abs() <= 1.0 / 32767.0 + 1e-9);
+    ledger.compared(
+        "wavfile_roundtrip",
+        "pcm16",
+        wav.sample_rate == 44100 && roundtrip.sample_rate == 44100 && samples_close,
+    );
+
+    ledger.finish(1);
 }
