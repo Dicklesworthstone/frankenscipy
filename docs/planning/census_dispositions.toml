@@ -207,15 +207,17 @@ reason = "loadarff's (data, meta) pair is one ArffData, whose relation and attri
 [[entry]]
 module = "scipy.io.arff"
 name = "ArffError"
-disposition = "missing"
-reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
+disposition = "adapted"
+rust = "fsci_io::IoError::InvalidFormat"
+reason = "read_arff reports ARFF failures as IoError::InvalidFormat (and IoError::UnsupportedFeature for relational attributes)"
 bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.io.arff"
 name = "ParseArffError"
-disposition = "missing"
-reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
+disposition = "adapted"
+rust = "fsci_io::IoError::InvalidFormat"
+reason = "read_arff reports ARFF syntax, header, and row parse failures as IoError::InvalidFormat"
 bead = "frankenscipy-yrlc3"
 
 [[entry]]
@@ -284,9 +286,8 @@ reason = "encodes a WAV byte buffer"
 [[entry]]
 module = "scipy.io.wavfile"
 name = "WavFileWarning"
-disposition = "missing"
-reason = "no warning channel for skipped or malformed WAV chunks"
-bead = "frankenscipy-yrlc3"
+disposition = "na"
+reason = "wav_read returns IoError::InvalidFormat on malformed headers/chunks and skips non-audio metadata chunks without a Python warnings channel"
 
 [[entry]]
 module = "scipy.signal.windows"
@@ -408,28 +409,8 @@ reason = "QMC engines carry a Sampler suffix"
 
 [[entry]]
 module = "scipy.stats.sampling"
-name = "FastGeneratorInversion"
-disposition = "missing"
-reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-yrlc3"
-
-[[entry]]
-module = "scipy.stats.sampling"
-name = "NumericalInversePolynomial"
-disposition = "missing"
-reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-yrlc3"
-
-[[entry]]
-module = "scipy.stats.sampling"
-name = "SimpleRatioUniforms"
-disposition = "missing"
-reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-yrlc3"
-
-[[entry]]
-module = "scipy.stats.sampling"
 name = "UNURANError"
-disposition = "missing"
-reason = "UNU.RAN generators are not ported"
+disposition = "adapted"
+rust = "fsci_stats::StatsError::InvalidArgument"
+reason = "UNU.RAN generator construction and rejection-budget failures return StatsError::InvalidArgument"
 bead = "frankenscipy-yrlc3"

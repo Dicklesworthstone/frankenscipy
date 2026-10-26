@@ -68470,6 +68470,62 @@ impl<F: Fn(f64) -> f64> RatioUniforms<F> {
     }
 }
 
+/// Simple Ratio-of-Uniforms (SROU) generator.
+///
+/// Matches `scipy.stats.sampling.SimpleRatioUniforms(dist, *, mode=None, pdf_area=1,
+/// cdf_at_mode=None)` (UNU.RAN's SROU). Derives the universal bounding rectangle
+/// `[0, umax] × [vmin, vmax]` from the density's `mode`, total `pdf_area`, and
+/// optional `cdf_at_mode`.
+#[derive(Debug, Clone)]
+pub struct SimpleRatioUniforms<F> {
+    inner: RatioUniforms<F>,
+}
+
+impl<F: Fn(f64) -> f64> SimpleRatioUniforms<F> {
+    /// Build a Simple Ratio-of-Uniforms sampler from `pdf`, `mode`, `pdf_area`,
+    /// and optional `cdf_at_mode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError::InvalidArgument`] when `mode` is non-finite,
+    /// `pdf_area` is non-positive or non-finite, `pdf(mode)` is non-positive or
+    /// non-finite, or `cdf_at_mode` lies outside `[0, 1]`.
+    pub fn new(
+        pdf: F,
+        mode: f64,
+        pdf_area: f64,
+        cdf_at_mode: Option<f64>,
+    ) -> Result<Self, StatsError> {
+        Ok(Self {
+            inner: RatioUniforms::simple(pdf, mode, pdf_area, cdf_at_mode)?,
+        })
+    }
+
+    /// Derived bounding rectangle `(umax, vmin, vmax)`.
+    #[must_use]
+    pub const fn bounding_rectangle(&self) -> (f64, f64, f64) {
+        (self.inner.umax, self.inner.vmin, self.inner.vmax)
+    }
+
+    /// One draw, or `Err` if [`RatioUniforms::MAX_TRIES`] candidates are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError::InvalidArgument`] if the rejection budget is exhausted.
+    pub fn try_sample_one(&self, rng: &mut impl Rng) -> Result<f64, StatsError> {
+        self.inner.try_sample_one(rng)
+    }
+
+    /// Draw `n` samples.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_sample_one`].
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<f64>, StatsError> {
+        self.inner.sample(n, rng)
+    }
+}
+
 #[cfg(test)]
 mod ratio_uniforms_matches_scipy {
     use super::{RatioUniforms, StatsError};
@@ -69560,6 +69616,629 @@ mod hinv_matches_scipy {
         assert!(NumericalInverseHermite::new(Normal::standard(), f64::NAN).is_err());
         // MUST-MISS control for the guards above.
         assert!(NumericalInverseHermite::new(Normal::standard(), 1e-9).is_ok());
+    }
+}
+
+/// Fast sampling by numerical inversion of the CDF for continuous distributions.
+///
+/// Matches `scipy.stats.sampling.FastGeneratorInversion(dist, *, domain=None)`.
+/// Wraps [`NumericalInverseHermite`] with optional support truncation `domain = (a, b)`
+/// and exposes `.ppf`, `.qrvs`, `.sample`, and `.evaluate_error`.
+#[derive(Debug, Clone)]
+pub struct FastGeneratorInversion<D: ContinuousDistribution> {
+    inner: NumericalInverseHermite<D>,
+    domain: Option<(f64, f64)>,
+    u_lo: f64,
+    u_hi: f64,
+}
+
+impl<D: ContinuousDistribution> FastGeneratorInversion<D> {
+    /// Default u-resolution used by `FastGeneratorInversion::new`.
+    pub const DEFAULT_U_RESOLUTION: f64 = 1.0e-10;
+
+    /// Build a fast inversion sampler for `dist`, optionally truncated to `domain = (a, b)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError::InvalidArgument`] if `domain` is malformed (`a >= b` or NaN),
+    /// carries zero probability mass under `dist`, or if [`NumericalInverseHermite`] setup fails.
+    pub fn new(dist: D, domain: Option<(f64, f64)>) -> Result<Self, StatsError> {
+        Self::with_resolution(dist, domain, Self::DEFAULT_U_RESOLUTION)
+    }
+
+    /// Build a fast inversion sampler with an explicit `u_resolution`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], or if `u_resolution` is non-positive / non-finite.
+    pub fn with_resolution(
+        dist: D,
+        domain: Option<(f64, f64)>,
+        u_resolution: f64,
+    ) -> Result<Self, StatsError> {
+        let (u_lo, u_hi) = if let Some((a, b)) = domain {
+            if a.is_nan() || b.is_nan() || a >= b {
+                return Err(StatsError::InvalidArgument(format!(
+                    "domain must satisfy a < b, got ({a}, {b})"
+                )));
+            }
+            let lo = if a == f64::NEG_INFINITY {
+                0.0
+            } else {
+                dist.cdf(a).clamp(0.0, 1.0)
+            };
+            let hi = if b == f64::INFINITY {
+                1.0
+            } else {
+                dist.cdf(b).clamp(0.0, 1.0)
+            };
+            if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+                return Err(StatsError::InvalidArgument(format!(
+                    "domain ({a}, {b}) carries no probability mass (cdf [{lo}, {hi}])"
+                )));
+            }
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        };
+        let inner = NumericalInverseHermite::new(dist, u_resolution)?;
+        Ok(Self {
+            inner,
+            domain,
+            u_lo,
+            u_hi,
+        })
+    }
+
+    /// Achieved midpoint u-error on the underlying Hermite table.
+    #[must_use]
+    pub fn u_error(&self) -> f64 {
+        self.inner.u_error()
+    }
+
+    /// Inverse CDF (quantile) of the (optionally domain-truncated) distribution.
+    #[must_use]
+    pub fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let u = self.u_lo + q * (self.u_hi - self.u_lo);
+        let x = self.inner.ppf(u);
+        if let Some((a, b)) = self.domain {
+            x.clamp(a, b)
+        } else {
+            x
+        }
+    }
+
+    /// Quasi-random variates mapped from uniform points in `[0, 1]`.
+    #[must_use]
+    pub fn qrvs(&self, u: &[f64]) -> Vec<f64> {
+        u.iter().map(|&q| self.ppf(q)).collect()
+    }
+
+    /// Draw a single sample.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> f64 {
+        self.ppf(rng.random::<f64>())
+    }
+
+    /// Draw `n` samples.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+
+    /// Empirical `(u_error, x_error)` over `size` uniform draws, matching
+    /// `scipy.stats.sampling.FastGeneratorInversion.evaluate_error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError::InvalidArgument`] if `size == 0`.
+    pub fn evaluate_error(
+        &self,
+        size: usize,
+        rng: &mut impl Rng,
+    ) -> Result<(f64, f64), StatsError> {
+        if size == 0 {
+            return Err(StatsError::InvalidArgument(
+                "size must be at least 1".to_string(),
+            ));
+        }
+        let span = self.u_hi - self.u_lo;
+        let mut max_u_err = 0.0_f64;
+        let mut max_x_err = 0.0_f64;
+        for _ in 0..size {
+            let q: f64 = rng.random();
+            let x = self.ppf(q);
+            let u_mapped = self.u_lo + q * span;
+            let cdf_x = self.inner.dist.cdf(x);
+            let q_actual = (cdf_x - self.u_lo) / span;
+            let u_err = (q_actual - q).abs();
+            if u_err > max_u_err {
+                max_u_err = u_err;
+            }
+            let x_exact = self.inner.dist.ppf(u_mapped);
+            if x_exact.is_finite() {
+                let x_err = (x - x_exact).abs();
+                if x_err > max_x_err {
+                    max_x_err = x_err;
+                }
+            }
+        }
+        Ok((max_u_err, max_x_err))
+    }
+}
+
+/// Polynomial interpolation based inversion of the CDF (UNU.RAN PINV).
+///
+/// Matches `scipy.stats.sampling.NumericalInversePolynomial(dist, *, center=None,
+/// domain=None, order=5, u_resolution=1e-10)`.
+///
+/// Constructs an adaptive piecewise Newton polynomial approximation of `F⁻¹(u)`
+/// from the (possibly unnormalised) density `pdf` alone, integrating `pdf` on each
+/// subinterval via 5-point Gauss-Lobatto quadrature.
+#[derive(Debug, Clone)]
+pub struct NumericalInversePolynomial<F> {
+    pdf: F,
+    /// Left endpoints `a_i` in `x`, ascending, followed by final right endpoint `b_{m-1}`.
+    x_bounds: Vec<f64>,
+    /// Cumulative probability `u_i = F(x_bounds[i])` in `[0, 1]`, with `u_bounds[0] = 0`
+    /// and `u_bounds[m] = 1`.
+    u_bounds: Vec<f64>,
+    /// Per-interval Newton interpolation nodes in `u`.
+    u_nodes: Vec<Vec<f64>>,
+    /// Per-interval Newton divided-difference coefficients for `F⁻¹(u)`.
+    coeffs: Vec<Vec<f64>>,
+    /// Total area of `pdf` over the effective support.
+    total_area: f64,
+    /// Achieved maximum midpoint u-error across all intervals.
+    max_u_error: f64,
+}
+
+impl<F: Fn(f64) -> f64> NumericalInversePolynomial<F> {
+    /// Maximum subintervals allowed during adaptive refinement.
+    pub const MAX_INTERVALS: usize = 4096;
+
+    /// Build a polynomial inverse-CDF sampler from `pdf`.
+    ///
+    /// - `center`: point inside the support where `pdf(center) > 0` (SciPy's `center`/`mode`).
+    /// - `domain`: optional finite support `(a, b)`; if `None`, the numerical tail cutoffs
+    ///   where `pdf(x)` drops below `1e-14 * pdf(center)` are located automatically.
+    /// - `order`: interpolating polynomial degree (`3..=17`; SciPy's default is `5`).
+    /// - `u_resolution`: target bound on the midpoint u-error `|F(P(u)) - u|` (SciPy's default `1e-10`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatsError::InvalidArgument`] if `center` is non-finite, `pdf(center) <= 0`,
+    /// `order` is outside `3..=17`, `u_resolution` is non-positive or non-finite, or `domain`
+    /// is invalid or encloses non-positive mass.
+    pub fn new(
+        pdf: F,
+        center: f64,
+        domain: Option<(f64, f64)>,
+        order: usize,
+        u_resolution: f64,
+    ) -> Result<Self, StatsError> {
+        if !center.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "center must be finite, got {center}"
+            )));
+        }
+        if !(3..=17).contains(&order) {
+            return Err(StatsError::InvalidArgument(format!(
+                "order must lie in 3..=17, got {order}"
+            )));
+        }
+        if u_resolution <= 0.0 || !u_resolution.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "u_resolution must be positive and finite, got {u_resolution}"
+            )));
+        }
+        let (x_min, x_max) = if let Some((a, b)) = domain {
+            if !a.is_finite() || !b.is_finite() || a >= b {
+                return Err(StatsError::InvalidArgument(format!(
+                    "domain must be finite with a < b, got ({a}, {b})"
+                )));
+            }
+            (a, b)
+        } else {
+            let f_c = pdf(center);
+            if f_c <= 0.0 || !f_c.is_finite() {
+                return Err(StatsError::InvalidArgument(format!(
+                    "pdf(center) must be positive and finite, got {f_c}"
+                )));
+            }
+            let cutoff = f_c * 1.0e-14;
+            let find_tail = |dir: f64| -> f64 {
+                let mut step = 1.0_f64;
+                let mut prev = center;
+                for _ in 0..60 {
+                    let x = center + dir * step;
+                    let fx = pdf(x);
+                    if !fx.is_finite() || fx <= 0.0 {
+                        // Bisect between `prev` (positive) and `x` (zero/outside support)
+                        let mut lo = prev;
+                        let mut hi = x;
+                        for _ in 0..40 {
+                            let mid = 0.5 * (lo + hi);
+                            let fm = pdf(mid);
+                            if fm.is_finite() && fm > cutoff {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        return lo;
+                    }
+                    if fx <= cutoff {
+                        return x;
+                    }
+                    prev = x;
+                    step *= 1.5;
+                }
+                center + dir * step
+            };
+            (find_tail(-1.0), find_tail(1.0))
+        };
+
+        if !(x_min < x_max) {
+            return Err(StatsError::InvalidArgument(format!(
+                "effective support [{x_min}, {x_max}] is empty"
+            )));
+        }
+
+        // Start with 32 subintervals across [x_min, x_max] (ensuring `center` is a breakpoint if inside).
+        let mut x_bounds: Vec<f64> = (0..=32)
+            .map(|i| x_min + (x_max - x_min) * f64::from(i) / 32.0)
+            .collect();
+        if center > x_min && center < x_max && !x_bounds.iter().any(|&x| (x - center).abs() < 1e-12)
+        {
+            let pos = x_bounds.partition_point(|&x| x < center);
+            x_bounds.insert(pos, center);
+        }
+
+        let total_area: f64 = x_bounds
+            .windows(2)
+            .map(|w| Self::lobatto5(&pdf, w[0], w[1]))
+            .sum();
+        if total_area <= 0.0 || !total_area.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "pdf has non-positive or non-finite integral {total_area} on [{x_min}, {x_max}]"
+            )));
+        }
+
+        // Adaptive refinement loop: build Chebyshev nodes + Newton divided differences on each
+        // subinterval and bisect any interval whose midpoint u-error exceeds `u_resolution`.
+        let mut max_u_error;
+        let mut u_bounds;
+        let mut u_nodes;
+        let mut coeffs;
+
+        loop {
+            let m = x_bounds.len() - 1;
+            let mut areas = Vec::with_capacity(m);
+            for w in x_bounds.windows(2) {
+                let area = Self::lobatto5(&pdf, w[0], w[1]);
+                if !area.is_finite() || area < 0.0 {
+                    return Err(StatsError::InvalidArgument(
+                        "pdf took negative or non-finite values on the domain".to_string(),
+                    ));
+                }
+                areas.push(area);
+            }
+            let sum_area: f64 = areas.iter().sum();
+            if sum_area <= 0.0 || !sum_area.is_finite() {
+                return Err(StatsError::InvalidArgument(
+                    "pdf carries no mass on the domain".to_string(),
+                ));
+            }
+
+            u_bounds = Vec::with_capacity(m + 1);
+            u_bounds.push(0.0);
+            let mut acc = 0.0;
+            for &a in &areas {
+                acc += a / sum_area;
+                u_bounds.push(acc);
+            }
+            u_bounds[m] = 1.0;
+
+            u_nodes = Vec::with_capacity(m);
+            coeffs = Vec::with_capacity(m);
+            let mut split = Vec::new();
+            let mut worst = 0.0_f64;
+
+            for i in 0..m {
+                let a = x_bounds[i];
+                let b = x_bounds[i + 1];
+                let ua = u_bounds[i];
+                let ub = u_bounds[i + 1];
+                if ub <= ua {
+                    u_nodes.push(vec![ua]);
+                    coeffs.push(vec![a]);
+                    continue;
+                }
+                let mut xs = Vec::with_capacity(order + 1);
+                for k in 0..=order {
+                    let theta = PI * (k as f64) / (order as f64);
+                    let xk = if k == 0 {
+                        a
+                    } else if k == order {
+                        b
+                    } else {
+                        0.5 * (a + b) - 0.5 * (b - a) * theta.cos()
+                    };
+                    xs.push(xk);
+                }
+                let mut sub_areas = Vec::with_capacity(order);
+                for w in xs.windows(2) {
+                    sub_areas.push(Self::lobatto5(&pdf, w[0], w[1]).max(0.0));
+                }
+                let sub_sum: f64 = sub_areas.iter().sum();
+                let mut us = Vec::with_capacity(order + 1);
+                us.push(ua);
+                if sub_sum > 0.0 {
+                    let span = ub - ua;
+                    let mut sub_acc = 0.0;
+                    for &sa in &sub_areas[..order - 1] {
+                        sub_acc += sa / sub_sum;
+                        us.push(ua + span * sub_acc);
+                    }
+                } else {
+                    for k in 1..order {
+                        us.push(ua + (ub - ua) * (k as f64) / (order as f64));
+                    }
+                }
+                us.push(ub);
+
+                // Ensure strictly increasing u-nodes for divided differences; if flat, fall back to linear.
+                let strictly_inc = us.windows(2).all(|w| w[1] > w[0] + 1e-15 * (ub - ua));
+                let (node_u, div_diff) = if strictly_inc {
+                    let dd = Self::newton_divided_differences(&us, &xs);
+                    (us, dd)
+                } else {
+                    let lin_u = vec![ua, ub];
+                    let lin_dd = Self::newton_divided_differences(&lin_u, &[a, b]);
+                    (lin_u, lin_dd)
+                };
+
+                // Check midpoint u-error in x and u.
+                let um = 0.5 * (ua + ub);
+                let xm = Self::eval_newton(&node_u, &div_diff, um).clamp(a, b);
+                // If Newton polynomial overshoots or isn't monotone inside [a, b], bisect.
+                let xm_raw = Self::eval_newton(&node_u, &div_diff, um);
+                let u_xm = if sub_sum > 0.0 {
+                    ua + (ub - ua) * (Self::lobatto5(&pdf, a, xm).max(0.0) / sub_sum).clamp(0.0, 1.0)
+                } else {
+                    um
+                };
+                let err = (u_xm - um).abs()
+                    + if xm_raw < a || xm_raw > b {
+                        ub - ua
+                    } else {
+                        0.0
+                    };
+                if err > worst {
+                    worst = err;
+                }
+                if err > u_resolution {
+                    split.push(i);
+                }
+                u_nodes.push(node_u);
+                coeffs.push(div_diff);
+            }
+
+            max_u_error = worst;
+            if split.is_empty() || m + split.len() > Self::MAX_INTERVALS {
+                break;
+            }
+            for &i in split.iter().rev() {
+                let mid = 0.5 * (x_bounds[i] + x_bounds[i + 1]);
+                x_bounds.insert(i + 1, mid);
+            }
+        }
+
+        let final_area: f64 = x_bounds
+            .windows(2)
+            .map(|w| Self::lobatto5(&pdf, w[0], w[1]))
+            .sum();
+
+        Ok(Self {
+            pdf,
+            x_bounds,
+            u_bounds,
+            u_nodes,
+            coeffs,
+            total_area: final_area,
+            max_u_error,
+        })
+    }
+
+    /// 5-point Gauss-Lobatto quadrature on `[a, b]` (exact up to degree 7).
+    fn lobatto5(pdf: &F, a: f64, b: f64) -> f64 {
+        let half = 0.5 * (b - a);
+        if half <= 0.0 {
+            return 0.0;
+        }
+        let mid = 0.5 * (a + b);
+        // sqrt(3/7)
+        let s = 0.654_653_670_707_977_1;
+        let x1 = mid - half * s;
+        let x2 = mid + half * s;
+        half * ((pdf(a) + pdf(b)) / 10.0
+            + (49.0 / 90.0) * (pdf(x1) + pdf(x2))
+            + (32.0 / 45.0) * pdf(mid))
+    }
+
+    fn newton_divided_differences(u: &[f64], x: &[f64]) -> Vec<f64> {
+        let n = u.len();
+        let mut dd = x.to_vec();
+        for j in 1..n {
+            for i in (j..n).rev() {
+                let denom = u[i] - u[i - j];
+                dd[i] = if denom.abs() > 0.0 {
+                    (dd[i] - dd[i - 1]) / denom
+                } else {
+                    0.0
+                };
+            }
+        }
+        dd
+    }
+
+    fn eval_newton(u_nodes: &[f64], coeffs: &[f64], u: f64) -> f64 {
+        let n = coeffs.len();
+        if n == 0 {
+            return f64::NAN;
+        }
+        let mut acc = coeffs[n - 1];
+        for i in (0..n - 1).rev() {
+            acc = acc.mul_add(u - u_nodes[i], coeffs[i]);
+        }
+        acc
+    }
+
+    /// Achieved maximum midpoint u-error across all subintervals.
+    #[must_use]
+    pub const fn u_error(&self) -> f64 {
+        self.max_u_error
+    }
+
+    /// Number of polynomial subintervals.
+    #[must_use]
+    pub fn intervals(&self) -> usize {
+        self.x_bounds.len() - 1
+    }
+
+    /// Approximated CDF `F(x)` via subinterval lookup + 5-point Gauss-Lobatto integration.
+    #[must_use]
+    pub fn cdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let m = self.x_bounds.len() - 1;
+        if x <= self.x_bounds[0] {
+            return 0.0;
+        }
+        if x >= self.x_bounds[m] {
+            return 1.0;
+        }
+        let i = self
+            .x_bounds
+            .partition_point(|&xb| xb <= x)
+            .saturating_sub(1)
+            .min(m - 1);
+        let partial = Self::lobatto5(&self.pdf, self.x_bounds[i], x).max(0.0) / self.total_area;
+        (self.u_bounds[i] + partial).clamp(self.u_bounds[i], self.u_bounds[i + 1])
+    }
+
+    /// Approximated inverse CDF `F⁻¹(u)`.
+    #[must_use]
+    pub fn ppf(&self, u: f64) -> f64 {
+        if !(0.0..=1.0).contains(&u) {
+            return f64::NAN;
+        }
+        let m = self.u_bounds.len() - 1;
+        if u <= 0.0 {
+            return self.x_bounds[0];
+        }
+        if u >= 1.0 {
+            return self.x_bounds[m];
+        }
+        let i = self
+            .u_bounds
+            .partition_point(|&ub| ub <= u)
+            .saturating_sub(1)
+            .min(m - 1);
+        let a = self.x_bounds[i];
+        let b = self.x_bounds[i + 1];
+        Self::eval_newton(&self.u_nodes[i], &self.coeffs[i], u).clamp(a, b)
+    }
+
+    /// Draw a single sample.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> f64 {
+        self.ppf(rng.random::<f64>())
+    }
+
+    /// Draw `n` samples.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod pinv_and_fgi_match_scipy {
+    use super::{
+        ContinuousDistribution, FastGeneratorInversion, Normal, NumericalInversePolynomial,
+        SimpleRatioUniforms,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn fast_generator_inversion_ppf_and_evaluate_error() {
+        let fgi = FastGeneratorInversion::new(Normal::standard(), None).expect("valid");
+        let base = Normal::standard();
+        for k in 1..=999_u32 {
+            let q = f64::from(k) / 1000.0;
+            let x = fgi.ppf(q);
+            assert!(
+                (base.cdf(x) - q).abs() < 1e-9,
+                "q={q}: cdf(ppf(q))={} != {q}",
+                base.cdf(x)
+            );
+        }
+        let mut rng = StdRng::seed_from_u64(12345);
+        let (u_err, x_err) = fgi.evaluate_error(5_000, &mut rng).expect("evaluate_error");
+        assert!(u_err < 1e-8, "u_err = {u_err:e}");
+        assert!(x_err < 1e-6, "x_err = {x_err:e}");
+
+        // Truncated domain [-1, 2]
+        let trunc =
+            FastGeneratorInversion::new(Normal::standard(), Some((-1.0, 2.0))).expect("truncated");
+        let samples = trunc.sample(2_000, &mut rng);
+        assert!(samples.iter().all(|&x| (-1.0..=2.0).contains(&x)));
+        assert!((trunc.ppf(0.0) - (-1.0)).abs() < 1e-7);
+        assert!((trunc.ppf(1.0) - 2.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn numerical_inverse_polynomial_inverts_unnormalised_density() {
+        // Unnormalised standard normal exp(-x^2 / 2)
+        let pinv = NumericalInversePolynomial::new(
+            |x: f64| (-0.5 * x * x).exp(),
+            0.0,
+            None,
+            5,
+            1e-10,
+        )
+        .expect("pinv built");
+        assert!(pinv.u_error() <= 1e-10, "u_error = {:e}", pinv.u_error());
+        let base = Normal::standard();
+        for k in 1..=999_u32 {
+            let u = f64::from(k) / 1000.0;
+            let x = pinv.ppf(u);
+            let want = base.ppf(u);
+            assert!(
+                (x - want).abs() < 1e-7,
+                "u={u}: pinv.ppf={x}, exact={want}"
+            );
+            assert!(
+                (pinv.cdf(want) - u).abs() < 1e-8,
+                "u={u}: pinv.cdf={}",
+                pinv.cdf(want)
+            );
+        }
+
+        let srou = SimpleRatioUniforms::new(
+            |x: f64| (-0.5 * x * x).exp(),
+            0.0,
+            std::f64::consts::TAU.sqrt(),
+            Some(0.5),
+        )
+        .expect("srou built");
+        let mut rng = StdRng::seed_from_u64(99);
+        let draws = srou.sample(1_000, &mut rng).expect("srou sample");
+        assert_eq!(draws.len(), 1_000);
     }
 }
 

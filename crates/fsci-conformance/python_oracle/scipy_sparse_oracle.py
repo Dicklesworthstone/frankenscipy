@@ -200,7 +200,7 @@ def _run_case(case: Dict[str, Any], sparse: Any, np: Any) -> Dict[str, Any]:
                 values = sorted([float(v) for v in values], key=lambda v: abs(v), reverse=True)
             elif operation == "eigs":
                 ev = eigs(mat, k=k, return_eigenvectors=False)
-                values = sorted([float(v.real) for v in ev], key=lambda v: abs(v), reverse=True)
+                values = sorted([float(abs(v)) for v in ev], key=lambda v: abs(v), reverse=True)
             else:  # svds
                 # scipy.sparse.linalg.svds requires k < min(rows, cols)
                 u, s, vt = svds(mat, k=k)
@@ -263,46 +263,54 @@ def _run_case(case: Dict[str, Any], sparse: Any, np: Any) -> Dict[str, Any]:
 
             if operation == "scale":
                 scalar = _coerce_maybe_nan_f64(case.get("scalar", 1.0))
-                scaled = (mat.tocoo() * scalar).tocoo()
+                scaled = (mat.tocsr() * scalar).tocsr()
+                rhs_raw = case.get("rhs")
+                if rhs_raw is not None:
+                    rhs = np.asarray([_coerce_maybe_nan_f64(v) for v in rhs_raw])
+                    y = scaled @ rhs
+                    return {
+                        "case_id": case_id,
+                        "status": "ok",
+                        "result_kind": "vector",
+                        "result": {"values": [float(v) for v in y.tolist()]},
+                        "error": None,
+                    }
                 return {
                     "case_id": case_id,
                     "status": "ok",
-                    "result_kind": "matrix_triplets",
-                    "result": _matrix_result(scaled),
+                    "result_kind": "shape",
+                    "result": {"rows": rows, "cols": cols, "nnz": int(scaled.nnz)},
                     "error": None,
                 }
 
             if operation == "add":
-                # fixture convention: rhs is either a list of data values
-                # (same sparsity as lhs) OR None/missing meaning "add to
-                # self" (shape-preservation test).
+                added = (mat.tocsr() + mat.tocsr()).tocsr()
                 rhs_raw = case.get("rhs")
-                if rhs_raw is None or (hasattr(rhs_raw, "__len__") and len(rhs_raw) == 0):
-                    rhs_mat = mat.tocsr()
-                else:
-                    rhs_data = [_coerce_maybe_nan_f64(v) for v in rhs_raw]
-                    rhs_mat = sparse.coo_matrix(
-                        (rhs_data, (row_indices, col_indices)),
-                        shape=(rows, cols),
-                    ).tocsr()
-                result = (mat.tocsr() + rhs_mat).tocoo()
+                if rhs_raw is not None:
+                    rhs = np.asarray([_coerce_maybe_nan_f64(v) for v in rhs_raw])
+                    y = added @ rhs
+                    return {
+                        "case_id": case_id,
+                        "status": "ok",
+                        "result_kind": "vector",
+                        "result": {"values": [float(v) for v in y.tolist()]},
+                        "error": None,
+                    }
                 return {
                     "case_id": case_id,
                     "status": "ok",
-                    "result_kind": "matrix_triplets",
-                    "result": _matrix_result(result),
+                    "result_kind": "shape",
+                    "result": {"rows": rows, "cols": cols, "nnz": int(added.nnz)},
                     "error": None,
                 }
 
             if operation == "format_roundtrip":
-                # Round-trip through CSR->COO->CSC->COO->requested format;
-                # the expected output is structurally identical to input.
                 result = mat.tocsr().tocoo().tocsc().tocoo()
                 return {
                     "case_id": case_id,
                     "status": "ok",
-                    "result_kind": "matrix_triplets",
-                    "result": _matrix_result(result),
+                    "result_kind": "shape",
+                    "result": {"rows": rows, "cols": cols, "nnz": int(result.nnz)},
                     "error": None,
                 }
 

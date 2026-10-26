@@ -8,10 +8,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0.0 else "-Infinity"
+        return value
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
 
 
 def _rosenbrock(x: Any) -> float:
@@ -224,29 +239,35 @@ def _rotated_quadratic(x: Any) -> float:
     """Rotated quadratic with minimum at (1, -2)."""
     import numpy as np
     x = np.asarray(x, dtype=float)
-    dx0 = x[0] - 1.0
-    dx1 = x[1] + 2.0
-    # 45-degree rotation
-    inv_sqrt2 = 1.0 / np.sqrt(2.0)
-    u = (dx0 + dx1) * inv_sqrt2
-    v = (-dx0 + dx1) * inv_sqrt2
-    return u ** 2 + 2.0 * v ** 2
+    cx = x[0] - 1.0
+    cy = x[1] + 2.0
+    theta = np.pi / 6.0
+    xr = np.cos(theta) * cx - np.sin(theta) * cy
+    yr = np.sin(theta) * cx + np.cos(theta) * cy
+    return float(xr ** 2 + 4.0 * yr ** 2)
+
+
+def _l1_nonsmooth(x: Any) -> float:
+    """L1 nonsmooth objective."""
+    import numpy as np
+    x = np.asarray(x, dtype=float)
+    return float(np.sum(np.abs(x)))
 
 
 def _nan_branch(x: Any) -> float:
-    """Return NaN for near-origin inputs to trigger adversarial handling."""
+    """Return NaN for x[0] < 0 to trigger adversarial handling."""
     import numpy as np
     x = np.asarray(x, dtype=float)
-    if np.any(~np.isfinite(x)) or np.all(np.abs(x) <= 0.5):
+    if x[0] < 0.0:
         return float('nan')
-    return float(np.sum(x ** 2))
+    return float(x[0] ** 2 + x[1] ** 2)
 
 
 def _flat_quartic(x: Any) -> float:
     """Flat quartic landscape to stress maxfev handling."""
     import numpy as np
     x = np.asarray(x, dtype=float)
-    return float(np.sum(x ** 4))
+    return float(1.0e-4 * np.sum(x ** 4))
 
 
 def _objective_map() -> Dict[str, Callable]:
@@ -271,6 +292,7 @@ def _objective_map() -> Dict[str, Callable]:
         "scaled_quadratic": _scaled_quadratic,
         "translated_quadratic": _translated_quadratic,
         "rotated_quadratic": _rotated_quadratic,
+        "l1_nonsmooth": _l1_nonsmooth,
         "nan_branch": _nan_branch,
         "flat_quartic": _flat_quartic,
     }
@@ -319,7 +341,8 @@ def _root_function_map(np: Any) -> Dict[str, Callable]:
         "cos_minus_x": lambda x: np.cos(x) - x,
         "poly_root": lambda x: x**2 - 2,
         "exp_root": lambda x: np.exp(x) - 2,
-        "nan_branch": lambda x: np.nan,
+        "nan_branch": lambda x: float("nan") if x > 0.8 else float(x - 0.2),
+        "step_discontinuous": lambda x: -1.0 if x < 0.3 else 1.0,
     }
 
 
@@ -341,6 +364,32 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
         if operation == "differential_evolution":
             obj_func = _get_objective(objective_name)
             bounds = [tuple(pair) for pair in case["bounds"]]
+            de_constraints = []
+            for c in case.get("constraints", []) or []:
+                ckind = c.get("kind")
+                if ckind == "linear":
+                    de_constraints.append(
+                        optimize.LinearConstraint(
+                            np.asarray(c["A"], dtype=float),
+                            np.asarray(c["lb"], dtype=float),
+                            np.asarray(c["ub"], dtype=float),
+                        )
+                    )
+                elif ckind == "nonlinear":
+                    fn_name = c.get("fn_name")
+                    if fn_name == "unit_disk":
+                        nl_fn = lambda x: float(x[0] ** 2 + x[1] ** 2)
+                    elif fn_name == "sum_components":
+                        nl_fn = lambda x: float(np.sum(x))
+                    else:
+                        raise ValueError(f"unknown nonlinear constraint: {fn_name}")
+                    de_constraints.append(
+                        optimize.NonlinearConstraint(
+                            nl_fn,
+                            np.asarray(c["lb"], dtype=float),
+                            np.asarray(c["ub"], dtype=float),
+                        )
+                    )
             result = optimize.differential_evolution(
                 obj_func,
                 bounds,
@@ -351,6 +400,7 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
                 recombination=0.7,
                 seed=case.get("seed"),
                 polish=False,
+                constraints=tuple(de_constraints),
             )
             return {
                 "case_id": case_id,
@@ -397,7 +447,6 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
                 bounds,
                 maxiter=case.get("maxiter", 1000),
                 seed=case.get("seed", 0),
-                no_local_search=True,
             )
             return {
                 "case_id": case_id,
@@ -511,6 +560,7 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
             func_name = case.get("objective")
             method_map = {
                 "Brentq": "brentq",
+                "Brenth": "brenth",
                 "Bisect": "bisect",
                 "Newton": "newton",
                 "Secant": "secant",
@@ -526,7 +576,7 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
 
             root_func = _get_root_function(func_name, np)
 
-            if method in ("brentq", "bisect", "ridder", "toms748"):
+            if method in ("brentq", "brenth", "bisect", "ridder", "toms748"):
                 result = optimize.root_scalar(
                     root_func,
                     bracket=bracket,
@@ -644,7 +694,10 @@ def main() -> int:
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(_json_safe(payload), allow_nan=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return 0
 
 

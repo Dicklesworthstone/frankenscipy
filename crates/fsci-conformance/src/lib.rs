@@ -8223,7 +8223,7 @@ pub struct IntegratePacketFixture {
     pub cases: Vec<IntegrateCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrateCase {
     pub case_id: String,
@@ -8240,7 +8240,7 @@ impl IntegrateCase {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IntegrateArgs {
     pub y: Option<Vec<f64>>,
     pub x: Option<Vec<f64>>,
@@ -8274,7 +8274,7 @@ pub struct IntegrateArgs {
     pub dense_t_eval: Option<Vec<f64>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IntegrateExpected {
     pub kind: String,
     pub value: Option<serde_json::Value>,
@@ -10356,6 +10356,453 @@ fn compare_stats_case_against_oracle(
             let mut oracle_case_fixture = case.clone();
             oracle_case_fixture.expected = expected;
             compare_stats_case_differential(&oracle_case_fixture, observed)
+        }
+        Err(message) => (false, message, None, None),
+    }
+}
+
+fn sparse_oracle_case_to_expected(
+    case: &SparseCase,
+    oracle_case: &OracleCaseOutput,
+) -> Result<SparseExpectedOutcome, String> {
+    let (atol, rtol) = match &case.expected {
+        SparseExpectedOutcome::Vector { atol, rtol, .. }
+        | SparseExpectedOutcome::EigenvaluesAbsSorted { atol, rtol, .. } => (*atol, *rtol),
+        SparseExpectedOutcome::Scalar { atol, .. } => (*atol, None),
+        SparseExpectedOutcome::Shape { .. } | SparseExpectedOutcome::Error { .. } => (None, None),
+    };
+
+    match oracle_case.result_kind.as_str() {
+        "vector" => Ok(SparseExpectedOutcome::Vector {
+            values: oracle_result_field(&oracle_case.result, "values", case.case_id())?,
+            atol,
+            rtol,
+        }),
+        "shape" => Ok(SparseExpectedOutcome::Shape {
+            rows: oracle_result_field(&oracle_case.result, "rows", case.case_id())?,
+            cols: oracle_result_field(&oracle_case.result, "cols", case.case_id())?,
+            nnz: oracle_result_field(&oracle_case.result, "nnz", case.case_id())?,
+        }),
+        "eigenvalues_abs_sorted" => Ok(SparseExpectedOutcome::EigenvaluesAbsSorted {
+            values: oracle_result_field(&oracle_case.result, "values", case.case_id())?,
+            atol,
+            rtol,
+        }),
+        other => Err(format!(
+            "oracle result for {} has unsupported sparse result_kind `{other}`",
+            case.case_id()
+        )),
+    }
+}
+
+fn compare_sparse_case_against_oracle(
+    case: &SparseCase,
+    oracle_case: &OracleCaseOutput,
+    observed: &SparseObserved,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    let tolerance = match &case.expected {
+        SparseExpectedOutcome::Vector { atol, rtol, .. }
+        | SparseExpectedOutcome::EigenvaluesAbsSorted { atol, rtol, .. } => Some(ToleranceUsed {
+            atol: atol.unwrap_or(1.0e-10),
+            rtol: rtol.unwrap_or(1.0e-8),
+            comparison_mode: "allclose".to_owned(),
+        }),
+        _ => None,
+    };
+
+    if matches!(case.expected, SparseExpectedOutcome::Error { .. }) {
+        let (passed, message) = compare_sparse_outcome(&case.expected, observed);
+        return (passed, message, None, tolerance);
+    }
+
+    if oracle_case.status != "ok" {
+        return (
+            false,
+            format!(
+                "oracle errored (`{}`) for sparse case `{}`",
+                oracle_case
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown oracle error"),
+                case.case_id()
+            ),
+            None,
+            tolerance,
+        );
+    }
+
+    match sparse_oracle_case_to_expected(case, oracle_case) {
+        Ok(expected) => {
+            let (passed, message) = compare_sparse_outcome(&expected, observed);
+            (passed, message, None, tolerance)
+        }
+        Err(message) => (false, message, None, tolerance),
+    }
+}
+
+fn compare_optimize_case_against_oracle(
+    case: &OptimizeCase,
+    oracle_case: &OracleCaseOutput,
+    observed: &Result<OptimizeObservedOutcome, OptError>,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    match case.expected() {
+        OptimizeExpectedOutcome::Error { .. }
+        | OptimizeExpectedOutcome::MinimizeStatus { .. }
+        | OptimizeExpectedOutcome::RootStatus { .. } => {
+            compare_optimize_case_differential(case.expected(), observed)
+        }
+        OptimizeExpectedOutcome::MinimizePoint {
+            atol,
+            rtol,
+            require_success,
+            contract_ref,
+            ..
+        } => {
+            if oracle_case.status != "ok" {
+                return (
+                    false,
+                    format!(
+                        "oracle errored (`{}`) for optimize case `{}`",
+                        oracle_case
+                            .error
+                            .as_deref()
+                            .unwrap_or("unknown oracle error"),
+                        case.case_id()
+                    ),
+                    None,
+                    None,
+                );
+            }
+            let x: Vec<f64> = match oracle_result_field(&oracle_case.result, "x", case.case_id()) {
+                Ok(v) => v,
+                Err(msg) => return (false, msg, None, None),
+            };
+            let fun: f64 = match oracle_result_field(&oracle_case.result, "fun", case.case_id()) {
+                Ok(v) => v,
+                Err(msg) => return (false, msg, None, None),
+            };
+            let oracle_expected = OptimizeExpectedOutcome::MinimizePoint {
+                x,
+                fun,
+                atol: *atol,
+                rtol: *rtol,
+                require_success: *require_success,
+                contract_ref: contract_ref.clone(),
+            };
+            compare_optimize_case_differential(&oracle_expected, observed)
+        }
+        OptimizeExpectedOutcome::RootValue {
+            atol,
+            rtol,
+            require_converged,
+            contract_ref,
+            ..
+        } => {
+            if oracle_case.status != "ok" {
+                return (
+                    false,
+                    format!(
+                        "oracle errored (`{}`) for optimize case `{}`",
+                        oracle_case
+                            .error
+                            .as_deref()
+                            .unwrap_or("unknown oracle error"),
+                        case.case_id()
+                    ),
+                    None,
+                    None,
+                );
+            }
+            let root: f64 = match oracle_result_field(&oracle_case.result, "root", case.case_id()) {
+                Ok(v) => v,
+                Err(msg) => return (false, msg, None, None),
+            };
+            let oracle_expected = OptimizeExpectedOutcome::RootValue {
+                root,
+                atol: *atol,
+                rtol: *rtol,
+                require_converged: *require_converged,
+                contract_ref: contract_ref.clone(),
+            };
+            compare_optimize_case_differential(&oracle_expected, observed)
+        }
+    }
+}
+
+fn parse_special_oracle_f64(val: &serde_json::Value, case_id: &str) -> Result<f64, String> {
+    if let Some(v) = val.as_f64() {
+        return Ok(v);
+    }
+    if let Some(s) = val.as_str() {
+        return match s {
+            "NaN" | "nan" => Ok(f64::NAN),
+            "Infinity" | "+Infinity" | "+inf" | "inf" => Ok(f64::INFINITY),
+            "-Infinity" | "-inf" => Ok(f64::NEG_INFINITY),
+            other => Err(format!("invalid float string `{other}` in {case_id}")),
+        };
+    }
+    if let Some(tag) = val.get("__float__").and_then(serde_json::Value::as_str) {
+        return match tag {
+            "nan" | "NaN" => Ok(f64::NAN),
+            "+inf" | "inf" | "Infinity" | "+Infinity" => Ok(f64::INFINITY),
+            "-inf" | "-Infinity" => Ok(f64::NEG_INFINITY),
+            other => Err(format!("invalid __float__ tag `{other}` in {case_id}")),
+        };
+    }
+    Err(format!("expected float in oracle result for {case_id}, got {val}"))
+}
+
+fn parse_special_oracle_complex(
+    val: &serde_json::Value,
+    case_id: &str,
+) -> Result<SpecialComplexValue, String> {
+    let re_val = val
+        .get("re")
+        .ok_or_else(|| format!("missing `re` in complex oracle result for {case_id}"))?;
+    let im_val = val
+        .get("im")
+        .ok_or_else(|| format!("missing `im` in complex oracle result for {case_id}"))?;
+    Ok(SpecialComplexValue {
+        re: parse_special_oracle_f64(re_val, case_id)?,
+        im: parse_special_oracle_f64(im_val, case_id)?,
+    })
+}
+
+fn special_oracle_case_to_expected(
+    case: &SpecialCase,
+    oracle_case: &OracleCaseOutput,
+) -> Result<SpecialExpectedOutcome, String> {
+    let cid = case.case_id();
+    match &case.expected {
+        SpecialExpectedOutcome::Scalar {
+            atol,
+            rtol,
+            contract_ref,
+            ..
+        } => {
+            let value = match oracle_case.result_kind.as_str() {
+                "scalar" => {
+                    let v = oracle_case
+                        .result
+                        .get("value")
+                        .ok_or_else(|| format!("missing `value` in oracle scalar for {cid}"))?;
+                    parse_special_oracle_f64(v, cid)?
+                }
+                "complex_scalar" => {
+                    let v = oracle_case.result.get("value").ok_or_else(|| {
+                        format!("missing `value` in oracle complex_scalar for {cid}")
+                    })?;
+                    let c = parse_special_oracle_complex(v, cid)?;
+                    if c.im.abs() > 1.0e-15 {
+                        return Err(format!(
+                            "oracle returned non-real complex scalar ({}, {}) for real scalar case {cid}",
+                            c.re, c.im
+                        ));
+                    }
+                    c.re
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected oracle result_kind `{other}` for scalar special case {cid}"
+                    ));
+                }
+            };
+            Ok(SpecialExpectedOutcome::Scalar {
+                value,
+                atol: *atol,
+                rtol: *rtol,
+                contract_ref: contract_ref.clone(),
+            })
+        }
+        SpecialExpectedOutcome::Vector {
+            atol,
+            rtol,
+            contract_ref,
+            ..
+        } => {
+            let arr = oracle_case
+                .result
+                .get("values")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("missing `values` array in oracle result for {cid}"))?;
+            let mut values = Vec::with_capacity(arr.len());
+            for item in arr {
+                values.push(parse_special_oracle_f64(item, cid)?);
+            }
+            Ok(SpecialExpectedOutcome::Vector {
+                values,
+                atol: *atol,
+                rtol: *rtol,
+                contract_ref: contract_ref.clone(),
+            })
+        }
+        SpecialExpectedOutcome::ComplexScalar {
+            atol,
+            rtol,
+            contract_ref,
+            ..
+        } => {
+            let v = oracle_case
+                .result
+                .get("value")
+                .ok_or_else(|| format!("missing `value` in oracle complex_scalar for {cid}"))?;
+            let value = parse_special_oracle_complex(v, cid)?;
+            Ok(SpecialExpectedOutcome::ComplexScalar {
+                value,
+                atol: *atol,
+                rtol: *rtol,
+                contract_ref: contract_ref.clone(),
+            })
+        }
+        SpecialExpectedOutcome::ComplexVector {
+            atol,
+            rtol,
+            contract_ref,
+            ..
+        } => {
+            let arr = oracle_case
+                .result
+                .get("values")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("missing `values` array in oracle result for {cid}"))?;
+            let mut values = Vec::with_capacity(arr.len());
+            for item in arr {
+                values.push(parse_special_oracle_complex(item, cid)?);
+            }
+            Ok(SpecialExpectedOutcome::ComplexVector {
+                values,
+                atol: *atol,
+                rtol: *rtol,
+                contract_ref: contract_ref.clone(),
+            })
+        }
+        SpecialExpectedOutcome::Class { .. } => {
+            let v = oracle_case
+                .result
+                .get("value")
+                .ok_or_else(|| format!("missing `value` in oracle class case for {cid}"))?;
+            let scalar = parse_special_oracle_f64(v, cid)?;
+            let class = classify_special_observed(&SpecialObservedOutcome::Scalar(scalar));
+            Ok(SpecialExpectedOutcome::Class { class })
+        }
+        SpecialExpectedOutcome::ErrorKind { error } => Ok(SpecialExpectedOutcome::ErrorKind {
+            error: error.clone(),
+        }),
+    }
+}
+
+fn compare_special_case_against_oracle(
+    case: &SpecialCase,
+    oracle_case: &OracleCaseOutput,
+    observed: &Result<SpecialObservedOutcome, FsciSpecialError>,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    if matches!(case.expected, SpecialExpectedOutcome::ErrorKind { .. }) {
+        return compare_special_case_differential(case, observed);
+    }
+
+    if oracle_case.status != "ok" {
+        return (
+            false,
+            format!(
+                "oracle errored (`{}`) for special case `{}`",
+                oracle_case
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown oracle error"),
+                case.case_id()
+            ),
+            None,
+            None,
+        );
+    }
+
+    match special_oracle_case_to_expected(case, oracle_case) {
+        Ok(expected) => {
+            let mut oracle_case_fixture = case.clone();
+            oracle_case_fixture.expected = expected;
+            compare_special_case_differential(&oracle_case_fixture, observed)
+        }
+        Err(message) => (false, message, None, None),
+    }
+}
+
+fn integrate_oracle_case_to_expected(
+    case: &IntegrateCase,
+    oracle_case: &OracleCaseOutput,
+) -> Result<IntegrateExpected, String> {
+    let cid = case.case_id();
+    let mut expected = case.expected.clone();
+    match case.expected.kind.as_str() {
+        "scalar" => {
+            let v = oracle_case
+                .result
+                .get("value")
+                .cloned()
+                .ok_or_else(|| format!("oracle integrate scalar missing `value` for {cid}"))?;
+            expected.value = Some(v);
+        }
+        "array" => {
+            let v = oracle_case
+                .result
+                .get("values")
+                .or_else(|| oracle_case.result.get("value"))
+                .or_else(|| oracle_case.result.get("weights"))
+                .cloned()
+                .ok_or_else(|| format!("oracle integrate array missing `values` for {cid}"))?;
+            expected.value = Some(v);
+        }
+        "ivp_result" => {
+            let t = oracle_case
+                .result
+                .get("t")
+                .cloned()
+                .ok_or_else(|| format!("oracle integrate ivp_result missing `t` for {cid}"))?;
+            let y = oracle_case
+                .result
+                .get("y")
+                .cloned()
+                .ok_or_else(|| format!("oracle integrate ivp_result missing `y` for {cid}"))?;
+            expected.value = Some(serde_json::json!({ "t": t, "y": y }));
+        }
+        other => {
+            return Err(format!(
+                "unsupported integrate expected kind `{other}` for oracle comparison on {cid}"
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+fn compare_integrate_case_against_oracle(
+    case: &IntegrateCase,
+    oracle_case: &OracleCaseOutput,
+    observed: &IntegrateObserved,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    if matches!(case.expected.kind.as_str(), "error" | "error_kind") {
+        return compare_integrate_case_differential(case, observed);
+    }
+
+    if oracle_case.status != "ok" {
+        return (
+            false,
+            format!(
+                "oracle errored (`{}`) for integrate case `{}`",
+                oracle_case
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown oracle error"),
+                case.case_id()
+            ),
+            None,
+            None,
+        );
+    }
+
+    match integrate_oracle_case_to_expected(case, oracle_case) {
+        Ok(expected) => {
+            let mut oracle_case_fixture = case.clone();
+            oracle_case_fixture.expected = expected;
+            compare_integrate_case_differential(&oracle_case_fixture, observed)
         }
         Err(message) => (false, message, None, None),
     }
@@ -14459,7 +14906,43 @@ fn run_differential_linalg(
             source,
         })?;
 
-    let oracle_status = probe_oracle_availability(oracle_config);
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_cases = oracle_capture.as_ref().map(|capture| {
+        capture
+            .case_outputs
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
     let mut per_case_results = Vec::with_capacity(fixture.cases.len());
     let audit_ledger = linalg_sync_audit_ledger();
 
@@ -14470,7 +14953,20 @@ fn run_differential_linalg(
             Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_linalg_case_with_differential_audit(case, &audit_ledger);
-                compare_linalg_case_differential(case.expected(), &observed)
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_linalg_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing linalg case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => compare_linalg_case_differential(case.expected(), &observed),
+                }
             },
         ));
     }
@@ -14491,8 +14987,14 @@ fn run_differential_linalg(
         fail_count,
         oracle_status,
         per_case_results,
-        // Probes the oracle, compares against the fixture's expected values.
-        oracle_compared_cases: 0,
+        oracle_compared_cases: oracle_compared_count(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !matches!(case.expected(), LinalgExpectedOutcome::Error { .. }))
+                .map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14609,7 +15111,43 @@ fn run_differential_optimize(
             source,
         })?;
 
-    let oracle_status = probe_oracle_availability(oracle_config);
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_cases = oracle_capture.as_ref().map(|capture| {
+        capture
+            .case_outputs
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
     let mut per_case_results = Vec::with_capacity(fixture.cases.len());
     let audit_ledger = opt_sync_audit_ledger();
 
@@ -14620,7 +15158,20 @@ fn run_differential_optimize(
             Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_optimize_case_with_differential_audit(case, &audit_ledger);
-                compare_optimize_case_differential(case.expected(), &observed)
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_optimize_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing optimize case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => compare_optimize_case_differential(case.expected(), &observed),
+                }
             },
         ));
     }
@@ -14642,8 +15193,20 @@ fn run_differential_optimize(
         fail_count,
         oracle_status,
         per_case_results,
-        // Probes the oracle, compares against the fixture's expected values.
-        oracle_compared_cases: 0,
+        oracle_compared_cases: oracle_compared_count(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| {
+                    matches!(
+                        case.expected(),
+                        OptimizeExpectedOutcome::MinimizePoint { .. }
+                            | OptimizeExpectedOutcome::RootValue { .. }
+                    )
+                })
+                .map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14965,7 +15528,43 @@ fn run_differential_special(
             source,
         })?;
 
-    let oracle_status = probe_oracle_availability(oracle_config);
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_cases = oracle_capture.as_ref().map(|capture| {
+        capture
+            .case_outputs
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
     let mut per_case_results = Vec::with_capacity(fixture.cases.len());
     let audit_ledger = neutral_audit_ledger();
 
@@ -14976,7 +15575,20 @@ fn run_differential_special(
             Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_special_case(case);
-                compare_special_case_differential(case, &observed)
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_special_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing special case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => compare_special_case_differential(case, &observed),
+                }
             },
         ));
     }
@@ -14998,8 +15610,14 @@ fn run_differential_special(
         fail_count,
         oracle_status,
         per_case_results,
-        // Probes the oracle, compares against the fixture's expected values.
-        oracle_compared_cases: 0,
+        oracle_compared_cases: oracle_compared_count(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !matches!(case.expected, SpecialExpectedOutcome::ErrorKind { .. }))
+                .map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15015,23 +15633,79 @@ fn run_differential_integrate(
             source,
         })?;
 
-    let oracle_status = probe_oracle_availability(oracle_config);
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_cases = oracle_capture.as_ref().map(|capture| {
+        capture
+            .case_outputs
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
     let mut per_case_results = Vec::with_capacity(fixture.cases.len());
+    let audit_ledger = neutral_audit_ledger();
 
     for case in &fixture.cases {
         per_case_results.push(run_case_with_panic_capture(
             case.case_id(),
             &oracle_status,
-            None,
+            Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_integrate_case(case);
-                compare_integrate_case_differential(case, &observed)
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_integrate_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing integrate case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => compare_integrate_case_differential(case, &observed),
+                }
             },
         ));
     }
 
     let pass_count = per_case_results.iter().filter(|r| r.passed).count();
     let fail_count = per_case_results.len().saturating_sub(pass_count);
+
+    {
+        let ledger = recover_sync_audit_ledger(audit_ledger.as_ref());
+        let _ =
+            emit_differential_audit_ledger_for_fixture(fixture_path, &fixture.packet_id, &ledger)?;
+    }
 
     Ok(ConformanceReport {
         fixture_path: fixture_path.display().to_string(),
@@ -15041,8 +15715,14 @@ fn run_differential_integrate(
         fail_count,
         oracle_status,
         per_case_results,
-        // Probes the oracle, compares against the fixture's expected values.
-        oracle_compared_cases: 0,
+        oracle_compared_cases: oracle_compared_count(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !matches!(case.expected.kind.as_str(), "error" | "error_kind"))
+                .map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15918,6 +16598,13 @@ fn run_differential_sparse(
     } else {
         None
     };
+    let oracle_cases = oracle_capture.as_ref().map(|capture| {
+        capture
+            .case_outputs
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
     let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
         (Some(_), _) => OracleStatus::Available,
         (None, true) => probed_oracle_status.clone(),
@@ -15934,19 +16621,34 @@ fn run_differential_sparse(
             Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_sparse_case(case);
-                let (passed, message) = compare_sparse_outcome(&case.expected, &observed);
-                let tolerance = match &case.expected {
-                    SparseExpectedOutcome::Vector { atol, rtol, .. }
-                    | SparseExpectedOutcome::EigenvaluesAbsSorted { atol, rtol, .. } => {
-                        Some(ToleranceUsed {
-                            atol: atol.unwrap_or(1.0e-10),
-                            rtol: rtol.unwrap_or(1.0e-8),
-                            comparison_mode: "allclose".to_owned(),
-                        })
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_sparse_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing sparse case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => {
+                        let (passed, message) = compare_sparse_outcome(&case.expected, &observed);
+                        let tolerance = match &case.expected {
+                            SparseExpectedOutcome::Vector { atol, rtol, .. }
+                            | SparseExpectedOutcome::EigenvaluesAbsSorted {
+                                atol, rtol, ..
+                            } => Some(ToleranceUsed {
+                                atol: atol.unwrap_or(1.0e-10),
+                                rtol: rtol.unwrap_or(1.0e-8),
+                                comparison_mode: "allclose".to_owned(),
+                            }),
+                            _ => None,
+                        };
+                        (passed, message, None, tolerance)
                     }
-                    _ => None,
-                };
-                (passed, message, None, tolerance)
+                }
             },
         ));
     }
@@ -15970,9 +16672,14 @@ fn run_differential_sparse(
         fail_count,
         oracle_status,
         per_case_results,
-        // Captures SciPy's output but compares the fixture's expected values, so nothing in
-        // this report was checked against the capture.
-        oracle_compared_cases: 0,
+        oracle_compared_cases: oracle_compared_count(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !matches!(case.expected, SparseExpectedOutcome::Error { .. }))
+                .map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -21907,6 +22614,17 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         assert_eq!(report.family, "linalg_core");
         assert_eq!(report.fail_count, 0);
         assert!(report.pass_count >= 1);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "linalg oracle capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert!(
+                report.oracle_compared_cases > 0,
+                "linalg differential runner must compare cases against live oracle when available"
+            );
+        }
 
         // Linalg cases should produce max_diff values
         for case in &report.per_case_results {
@@ -22458,6 +23176,48 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             serde_json::to_string_pretty(&report).unwrap()
         );
         assert!(report.pass_count >= 29);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "optimize oracle capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert!(
+                report.oracle_compared_cases > 0,
+                "optimize differential runner must compare cases against live oracle when available"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_test_sparse_fixture() {
+        let fixture_path = HarnessConfig::default_paths()
+            .fixture_root
+            .join("FSCI-P2C-004_sparse_ops.json");
+        let oracle = default_test_oracle();
+        let report = run_differential_test(&fixture_path, &oracle)
+            .expect("differential sparse should succeed");
+
+        assert_eq!(report.packet_id, "FSCI-P2C-004");
+        assert_eq!(report.family, "sparse_ops");
+        assert_eq!(
+            report.fail_count,
+            0,
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap()
+        );
+        assert!(report.pass_count >= 35);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "sparse oracle capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert!(
+                report.oracle_compared_cases > 0,
+                "sparse differential runner must compare cases against live oracle when available"
+            );
+        }
     }
 
     #[test]
@@ -22922,6 +23682,17 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             serde_json::to_string_pretty(&report).unwrap()
         );
         assert!(report.pass_count >= 29);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "special oracle capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert!(
+                report.oracle_compared_cases > 0,
+                "special differential runner must compare cases against live oracle when available"
+            );
+        }
     }
 
     #[test]
@@ -23601,6 +24372,17 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             serde_json::to_string_pretty(&report).unwrap()
         );
         assert!(report.pass_count >= 23);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "integrate oracle capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert!(
+                report.oracle_compared_cases > 0,
+                "integrate differential runner must compare cases against live oracle when available"
+            );
+        }
     }
 
     #[test]
@@ -25256,5 +26038,252 @@ Path(args.output).write_text(json.dumps(result, indent=2))
 
         // First-occurrence ordering: first distinct ID seen maps to 0.
         assert_eq!(canon(&[5, 5, 7, 7, 5]), vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn f3gh7_five_family_oracle_comparators_use_captured_oracle_values_and_reject_drift() {
+        use super::{
+            IntegrateArgs, IntegrateCase, IntegrateExpected, LinalgCase, LinalgExpectedOutcome,
+            OptimizeCase, OptimizeExpectedOutcome, OracleCaseOutput, SparseCase,
+            SparseExpectedOutcome, SpecialCase, SpecialCaseFunction, SpecialExpectedOutcome,
+            compare_integrate_case_against_oracle, compare_linalg_case_against_oracle,
+            compare_optimize_case_against_oracle, compare_sparse_case_against_oracle,
+            compare_special_case_against_oracle,
+        };
+
+        // 1. linalg: Solve case where embedded fixture expected is wrong (999.0),
+        //    oracle capture has true solution [1.0, 2.0], and perturbed oracle [1.5, 2.0] fails.
+        let linalg_case = LinalgCase::Solve {
+            case_id: "f3gh7_linalg_solve".to_owned(),
+            mode: RuntimeMode::Strict,
+            a: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            b: vec![1.0, 2.0],
+            assume_a: fsci_linalg::AssumeA::Gen,
+            transposed: false,
+            check_finite: true,
+            lower: false,
+            expected: LinalgExpectedOutcome::Vector {
+                values: vec![999.0, 999.0],
+                atol: 1.0e-12,
+                rtol: 1.0e-12,
+            },
+        };
+        let linalg_oracle_ok = OracleCaseOutput {
+            case_id: "f3gh7_linalg_solve".to_owned(),
+            status: "ok".to_owned(),
+            result_kind: "vector".to_owned(),
+            result: serde_json::json!({ "values": [1.0, 2.0] }),
+            error: None,
+        };
+        let (passed, msg, _, _) =
+            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_ok);
+        assert!(passed, "linalg oracle comparator should pass: {msg}");
+
+        let linalg_oracle_bad = OracleCaseOutput {
+            result: serde_json::json!({ "values": [1.5, 2.0] }),
+            ..linalg_oracle_ok
+        };
+        let (passed, _, _, _) =
+            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_bad);
+        assert!(!passed, "linalg oracle comparator must reject drifted oracle value");
+
+        // 2. optimize: Root case on cubic (x^3 - 2 = 0 -> 2^(1/3)) where embedded expected is 999.0.
+        let true_root = 2.0_f64.cbrt();
+        let opt_case = OptimizeCase::Root {
+            case_id: "f3gh7_opt_root".to_owned(),
+            category: "differential".to_owned(),
+            mode: RuntimeMode::Strict,
+            method: fsci_opt::RootMethod::Brentq,
+            objective: super::RootObjectiveKind::CubicMinusTwo,
+            bracket: [1.0, 2.0],
+            xtol: Some(1.0e-12),
+            rtol: Some(1.0e-12),
+            maxiter: Some(100),
+            expected: OptimizeExpectedOutcome::RootValue {
+                root: 999.0,
+                atol: 1.0e-9,
+                rtol: 1.0e-9,
+                contract_ref: None,
+            },
+        };
+        let opt_oracle_ok = OracleCaseOutput {
+            case_id: "f3gh7_opt_root".to_owned(),
+            status: "ok".to_owned(),
+            result_kind: "root_value".to_owned(),
+            result: serde_json::json!({ "root": true_root, "converged": true }),
+            error: None,
+        };
+        let (passed, msg, _, _) = compare_optimize_case_against_oracle(&opt_case, &opt_oracle_ok);
+        assert!(passed, "optimize oracle comparator should pass: {msg}");
+
+        let opt_oracle_bad = OracleCaseOutput {
+            result: serde_json::json!({ "root": true_root + 0.1, "converged": true }),
+            ..opt_oracle_ok
+        };
+        let (passed, _, _, _) = compare_optimize_case_against_oracle(&opt_case, &opt_oracle_bad);
+        assert!(
+            !passed,
+            "optimize oracle comparator must reject drifted oracle value"
+        );
+
+        // 3. sparse: spsolve case where embedded expected is [999.0, 999.0].
+        let sparse_case: SparseCase = serde_json::from_value(serde_json::json!({
+            "operation": "spsolve",
+            "case_id": "f3gh7_sparse_spsolve",
+            "mode": "Strict",
+            "shape": [2, 2],
+            "triplets": [[0, 0, 2.0], [1, 1, 4.0]],
+            "b": [2.0, 8.0],
+            "expected": {
+                "kind": "vector",
+                "values": [999.0, 999.0],
+                "atol": 1.0e-12,
+                "rtol": 1.0e-12
+            }
+        }))
+        .expect("deserialize sparse case");
+        let sparse_oracle_ok = OracleCaseOutput {
+            case_id: "f3gh7_sparse_spsolve".to_owned(),
+            status: "ok".to_owned(),
+            result_kind: "vector".to_owned(),
+            result: serde_json::json!({ "values": [1.0, 2.0] }),
+            error: None,
+        };
+        let (passed, msg, _, _) =
+            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_ok);
+        assert!(passed, "sparse oracle comparator should pass: {msg}");
+
+        let sparse_oracle_bad = OracleCaseOutput {
+            result: serde_json::json!({ "values": [1.0, 3.0] }),
+            ..sparse_oracle_ok
+        };
+        let (passed, _, _, _) =
+            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_bad);
+        assert!(
+            !passed,
+            "sparse oracle comparator must reject drifted oracle value"
+        );
+
+        // 4. special: gamma(5.0) = 24.0 where embedded expected is 999.0.
+        let special_case = SpecialCase {
+            case_id: "f3gh7_special_gamma".to_owned(),
+            category: "differential".to_owned(),
+            mode: RuntimeMode::Strict,
+            function: SpecialCaseFunction::Gamma,
+            args: vec![super::SpecialCaseArg::Scalar(5.0)],
+            expected: SpecialExpectedOutcome::Scalar {
+                value: 999.0,
+                atol: Some(1.0e-12),
+                rtol: Some(1.0e-12),
+                contract_ref: None,
+            },
+        };
+        let special_oracle_ok = OracleCaseOutput {
+            case_id: "f3gh7_special_gamma".to_owned(),
+            status: "ok".to_owned(),
+            result_kind: "scalar".to_owned(),
+            result: serde_json::json!({ "value": 24.0 }),
+            error: None,
+        };
+        let (passed, msg, _, _) =
+            compare_special_case_against_oracle(&special_case, &special_oracle_ok);
+        assert!(passed, "special oracle comparator should pass: {msg}");
+
+        let special_oracle_bad = OracleCaseOutput {
+            result: serde_json::json!({ "value": 25.0 }),
+            ..special_oracle_ok
+        };
+        let (passed, _, _, _) =
+            compare_special_case_against_oracle(&special_case, &special_oracle_bad);
+        assert!(
+            !passed,
+            "special oracle comparator must reject drifted oracle value"
+        );
+
+        // 5. integrate: trapezoid on y=[0, 2], x=[0, 1] -> 1.0 where embedded expected is 999.0.
+        let integrate_case = IntegrateCase {
+            case_id: "f3gh7_integrate_trapz".to_owned(),
+            category: "differential".to_owned(),
+            mode: RuntimeMode::Strict,
+            function: "trapezoid".to_owned(),
+            args: IntegrateArgs {
+                y: Some(vec![0.0, 2.0]),
+                x: Some(vec![0.0, 1.0]),
+                dx: None,
+                initial: None,
+                rhs: None,
+                t_span: None,
+                y0: None,
+                t_eval: None,
+                dense_t_eval: None,
+                rtol: None,
+                atol: None,
+                first_step: None,
+                max_step: None,
+                n: None,
+                n_estimates: None,
+                n_points: None,
+                lower: None,
+                upper: None,
+                max_subdivisions: None,
+                epsabs: None,
+                epsrel: None,
+                limit: None,
+                integrand: None,
+                a: None,
+                b: None,
+                points: None,
+                events: None,
+                method: None,
+                jac_sparsity: None,
+                bc_kind: None,
+                x_mesh: None,
+                y_guess: None,
+                max_nodes: None,
+                ode_system: None,
+                t0: None,
+                t_bound: None,
+                max_steps: None,
+                gfun: None,
+                hfun: None,
+                qfun: None,
+                rfun: None,
+                ranges: None,
+                weight: None,
+                wvar: None,
+                wopts: None,
+                f_data: None,
+            },
+            expected: IntegrateExpected {
+                kind: "scalar".to_owned(),
+                value: Some(serde_json::json!(999.0)),
+                values: None,
+                error: None,
+                atol: Some(1.0e-12),
+                rtol: Some(1.0e-12),
+                contract_ref: "fsci_integrate::trapezoid".to_owned(),
+            },
+        };
+        let integrate_oracle_ok = OracleCaseOutput {
+            case_id: "f3gh7_integrate_trapz".to_owned(),
+            status: "ok".to_owned(),
+            result_kind: "scalar".to_owned(),
+            result: serde_json::json!({ "value": 1.0 }),
+            error: None,
+        };
+        let (passed, msg, _, _) =
+            compare_integrate_case_against_oracle(&integrate_case, &integrate_oracle_ok);
+        assert!(passed, "integrate oracle comparator should pass: {msg}");
+
+        let integrate_oracle_bad = OracleCaseOutput {
+            result: serde_json::json!({ "value": 2.0 }),
+            ..integrate_oracle_ok
+        };
+        let (passed, _, _, _) =
+            compare_integrate_case_against_oracle(&integrate_case, &integrate_oracle_bad);
+        assert!(
+            !passed,
+            "integrate oracle comparator must reject drifted oracle value"
+        );
     }
 }
