@@ -35478,7 +35478,7 @@ enum SpectralTransform<'a> {
 
 /// A solve supplied by the caller or factored once for this eigensolver invocation.
 enum SpectralInverse<'a> {
-    Factored(SparseLuFactorization),
+    Factored(Box<SparseLuFactorization>),
     Operator(&'a dyn LinearOperator),
 }
 
@@ -35514,7 +35514,10 @@ impl<'a> SpectralTransform<'a> {
             (None, Some(mass)) => {
                 let inverse = match options.minv {
                     Some(operator) => SpectralInverse::Operator(operator),
-                    None => SpectralInverse::Factored(splu(&mass.to_csc()?, LuOptions::default())?),
+                    None => SpectralInverse::Factored(Box::new(splu(
+                        &mass.to_csc()?,
+                        LuOptions::default(),
+                    )?)),
                 };
                 Ok(Self::Generalized(inverse))
             }
@@ -35541,7 +35544,7 @@ impl<'a> SpectralTransform<'a> {
                     .map_err(|err| singular_shift_error(err, sigma))?;
                 Ok(Self::ShiftInvert {
                     sigma,
-                    inverse: SpectralInverse::Factored(factor),
+                    inverse: SpectralInverse::Factored(Box::new(factor)),
                 })
             }
         }
@@ -35550,8 +35553,8 @@ impl<'a> SpectralTransform<'a> {
     /// `OP·x`; `bx` is `B·x` (`x` itself when `B = I`), which is all mode 3 needs.
     fn apply(&self, a: &dyn LinearOperator, x: &[f64], bx: &[f64]) -> SparseResult<Vec<f64>> {
         match self {
-            Self::Standard => a.matvec(x),
-            Self::Generalized(inverse) => inverse.solve(&a.matvec(x)?),
+            Self::Standard => checked_eigen_matvec(a, x),
+            Self::Generalized(inverse) => inverse.solve(&checked_eigen_matvec(a, x)?),
             Self::ShiftInvert { sigma, inverse } => inverse
                 .solve(bx)
                 .map_err(|err| singular_shift_error(err, *sigma)),
@@ -37892,7 +37895,7 @@ mod krylov_eigen_tests {
     }
 
     #[test]
-    fn matrix_free_shift_invert_checks_original_operator_products() {
+    fn matrix_free_eigenproblems_check_original_operator_products() {
         struct MalformedOperator {
             nonfinite: bool,
         }
@@ -37912,18 +37915,33 @@ mod krylov_eigen_tests {
             }
         }
         let inverse = IdentityOperator::new(20);
-        let options = EigsOptions {
-            sigma: Some(0.2),
-            opinv: Some(&inverse),
-            ..EigsOptions::default()
-        };
+        let mass = eye(20).unwrap();
+        let modes = [
+            EigsOptions::default(),
+            EigsOptions {
+                mass: Some(&mass),
+                ..EigsOptions::default()
+            },
+            EigsOptions {
+                mass: Some(&mass),
+                minv: Some(&inverse),
+                ..EigsOptions::default()
+            },
+            EigsOptions {
+                sigma: Some(0.2),
+                opinv: Some(&inverse),
+                ..EigsOptions::default()
+            },
+        ];
         for nonfinite in [false, true] {
             let a = MalformedOperator { nonfinite };
-            for result in [eigsh(&a, 2, options), eigs(&a, 2, options)] {
-                if nonfinite {
-                    assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
-                } else {
-                    assert!(matches!(result, Err(SparseError::IncompatibleShape { .. })));
+            for options in modes {
+                for result in [eigsh(&a, 2, options), eigs(&a, 2, options)] {
+                    if nonfinite {
+                        assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
+                    } else {
+                        assert!(matches!(result, Err(SparseError::IncompatibleShape { .. })));
+                    }
                 }
             }
         }
