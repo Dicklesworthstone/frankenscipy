@@ -391,7 +391,7 @@ fn cephes_ellpe_x(x: f64) -> f64 {
         if x.is_infinite() {
             return f64::INFINITY;
         }
-        return cephes_ellpe_x(1.0 - 1.0 / x) * x.sqrt();
+        return cephes_ellpe_x(1.0 / x) * x.sqrt();
     }
     cephes_polevl(x, &ELLPE_P) - x.ln() * (x * cephes_polevl(x, &ELLPE_Q))
 }
@@ -400,23 +400,22 @@ fn ellipk_scalar(m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if m.is_nan() {
         return Ok(f64::NAN);
     }
-    if m < 0.0 {
-        if mode == RuntimeMode::Hardened {
-            return domain_error("ellipk", mode, "m must be in [0, 1)");
-        }
-        // Reciprocal-modulus transformation K(m) = K(m/(m-1)) / sqrt(1-m), valid
-        // for m < 0 where m/(m-1) lands in [0, 1). Matches scipy.special.ellipk,
-        // which accepts negative parameters.
-        let mt = m / (m - 1.0);
-        let k = ellipk_scalar(mt, RuntimeMode::Strict)?;
-        return Ok(k / (1.0 - m).sqrt());
+    // K(m) = ∫₀^{π/2} (1 − m sin²θ)^{-1/2} dθ is smooth, finite, and bounded on
+    // (−∞, 1) via the reciprocal-modulus transformation K(m) = K(m/(m−1))/√(1−m),
+    // which cephes_ellpk_x(1−m) already evaluates for 1−m > 1 (consistent with
+    // ellipkm1 accepting p > 1 in Hardened mode, frankenscipy-35272 / frankenscipy-3xr5r).
+    // Only m > 1 is outside the real domain, while m = 1 is a logarithmic singularity
+    // rejected in Hardened mode.
+    if m > 1.0 {
+        return domain_error("ellipk", mode, "m must be < 1 (or <= 1 in Strict mode)");
     }
-    if !(0.0..=1.0).contains(&m) {
-        return domain_error("ellipk", mode, "m must be in [0, 1)");
-    }
-    if m >= 1.0 {
+    if m == 1.0 {
         if mode == RuntimeMode::Hardened {
-            return domain_error("ellipk", mode, "m must be in [0, 1)");
+            return domain_error(
+                "ellipk",
+                mode,
+                "m must be < 1 (logarithmic singularity at m = 1)",
+            );
         }
         return Ok(f64::INFINITY);
     }
@@ -450,18 +449,11 @@ fn ellipe_scalar(m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if m.is_nan() {
         return Ok(f64::NAN);
     }
-    if m < 0.0 {
-        if mode == RuntimeMode::Hardened {
-            return domain_error("ellipe", mode, "m must be in [0, 1]");
-        }
-        // Reciprocal-modulus transformation E(m) = sqrt(1-m) * E(m/(m-1)), valid
-        // for m < 0. Matches scipy.special.ellipe, which accepts negative m.
-        let mt = m / (m - 1.0);
-        let e = ellipe_scalar(mt, RuntimeMode::Strict)?;
-        return Ok((1.0 - m).sqrt() * e);
-    }
-    if !(0.0..=1.0).contains(&m) {
-        return domain_error("ellipe", mode, "m must be in [0, 1]");
+    // E(m) = ∫₀^{π/2} (1 − m sin²θ)^{1/2} dθ is smooth and real on (−∞, 1] via the
+    // reciprocal-modulus transformation E(m) = √(1−m) E(m/(m−1)), which
+    // cephes_ellpe_x(1−m) already evaluates for 1−m > 1 (frankenscipy-3xr5r).
+    if m > 1.0 {
+        return domain_error("ellipe", mode, "m must be <= 1");
     }
     if m == 0.0 {
         return Ok(PI / 2.0);
@@ -479,16 +471,13 @@ fn ellipkinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
         return Ok(f64::NAN);
     }
     if m > 1.0 {
-        return domain_error("ellipkinc", mode, "m must be in [0, 1]");
+        return domain_error("ellipkinc", mode, "m must be <= 1");
     }
-    // m < 0 is valid (scipy.special.ellipkinc accepts it): the Carlson R_F form
-    // F = sinφ·R_F(cos²φ, 1-m·sin²φ, 1) stays well-defined (1-m·sin²φ > 0) and the
-    // periodicity term uses K(m<0), now supported. Hardened stays conservative.
-    if m < 0.0 && mode == RuntimeMode::Hardened {
-        return domain_error("ellipkinc", mode, "m must be in [0, 1]");
-    }
-    if m >= 1.0 && mode == RuntimeMode::Hardened {
-        return domain_error("ellipkinc", mode, "m must be in [0, 1)");
+    // m < 0 is valid in both Strict and Hardened modes (scipy.special.ellipkinc
+    // accepts it and 1 − m sin²φ >= 1 > 0 everywhere; frankenscipy-3xr5r).
+    // Hardened rejects only the singular endpoint m = 1.
+    if m == 1.0 && mode == RuntimeMode::Hardened {
+        return domain_error("ellipkinc", mode, "m must be < 1");
     }
     Ok(cephes_ellik(phi, m))
 }
@@ -826,9 +815,9 @@ fn ellipeinc_carlson(phi: f64, m: f64, mode: RuntimeMode) -> f64 {
 
 fn ellipkinc_scalar_phi_over_m_vec(phi: f64, m_values: &[f64], mode: RuntimeMode) -> SpecialResult {
     if phi.is_nan()
-        || m_values.iter().any(|m| {
-            m.is_nan() || !(0.0..=1.0).contains(m) || (*m >= 1.0 && mode == RuntimeMode::Hardened)
-        })
+        || m_values
+            .iter()
+            .any(|m| m.is_nan() || *m > 1.0 || (*m == 1.0 && mode == RuntimeMode::Hardened))
     {
         return m_values
             .iter()
@@ -850,14 +839,10 @@ fn ellipeinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
         return Ok(f64::NAN);
     }
     if m > 1.0 {
-        return domain_error("ellipeinc", mode, "m must be in [0, 1]");
+        return domain_error("ellipeinc", mode, "m must be <= 1");
     }
-    // m < 0 is valid (scipy.special.ellipeinc accepts it): the Carlson form
-    // E = R_F - (m/3)·sin³φ·R_D(cos²φ, 1-m·sin²φ, 1) stays well-defined and the
-    // periodicity term uses E(m<0), now supported. Hardened stays conservative.
-    if m < 0.0 && mode == RuntimeMode::Hardened {
-        return domain_error("ellipeinc", mode, "m must be in [0, 1]");
-    }
+    // m < 0 is valid in both Strict and Hardened modes (scipy.special.ellipeinc
+    // accepts it and 1 − m sin²φ >= 1 > 0 everywhere; frankenscipy-3xr5r).
     if phi == 0.0 {
         return Ok(0.0);
     }
@@ -2611,6 +2596,58 @@ mod tests {
         let m = SpecialTensor::RealScalar(1.0);
         let err = ellipk(&m, RuntimeMode::Hardened).expect_err("hardened rejects K(1)");
         assert_eq!(err.kind, SpecialErrorKind::DomainError);
+    }
+
+    #[test]
+    fn hardened_ellipk_ellipe_accept_negative_m_and_match_strict() {
+        // frankenscipy-3xr5r: K(m), E(m), F(φ|m), E(φ|m) are smooth and real on
+        // (−∞, 1), so Hardened accepts m < 0 identically to Strict (and ellipkm1
+        // at p = 1 − m > 1) while still rejecting the singular endpoint m = 1 for
+        // ellipk/ellipkinc and out-of-domain m > 1 for all four.
+        for (m, want_k, want_e) in [
+            (
+                -5.0_f64,
+                0.955_503_927_064_044_1_f64,
+                2.830_198_246_345_877_f64,
+            ),
+            (-1.0, 1.311_028_777_146_059_8, 1.910_098_894_513_856_2),
+            (-0.5, 1.415_737_208_425_956, 1.751_771_275_694_817_4),
+        ] {
+            let m_t = SpecialTensor::RealScalar(m);
+            let k_h = eval_scalar(ellipk(&m_t, RuntimeMode::Hardened));
+            let k_s = eval_scalar(ellipk(&m_t, RuntimeMode::Strict));
+            assert_eq!(
+                k_h.to_bits(),
+                k_s.to_bits(),
+                "ellipk({m}) Hardened vs Strict"
+            );
+            assert_close(k_h, want_k, 1e-14, "ellipk(m < 0)");
+
+            let e_h = eval_scalar(ellipe(&m_t, RuntimeMode::Hardened));
+            let e_s = eval_scalar(ellipe(&m_t, RuntimeMode::Strict));
+            assert_eq!(
+                e_h.to_bits(),
+                e_s.to_bits(),
+                "ellipe({m}) Hardened vs Strict"
+            );
+            assert_close(e_h, want_e, 1e-14, "ellipe(m < 0)");
+        }
+        let phi_t = SpecialTensor::RealScalar(0.7);
+        let m_t = SpecialTensor::RealScalar(-5.0);
+        let kinc_h = eval_scalar(ellipkinc(&phi_t, &m_t, RuntimeMode::Hardened));
+        let einc_h = eval_scalar(ellipeinc(&phi_t, &m_t, RuntimeMode::Hardened));
+        assert_close(
+            kinc_h,
+            0.557_024_358_016_710_2,
+            1e-14,
+            "ellipkinc(0.7, -5.0)",
+        );
+        assert_close(
+            einc_h,
+            0.908_517_467_972_692_8,
+            1e-14,
+            "ellipeinc(0.7, -5.0)",
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@
 //! References: SciPy's `beta`, `betaln` and `polygamma` reject complex arguments, so beta is
 //! compared against `gamma(a) gamma(b) / gamma(a+b)` and betaln against
 //! `loggamma(a) + loggamma(b) - loggamma(a+b)`, both over SciPy's complex gamma/loggamma, and
-//! complex polygamma has no pinned reference (frankenscipy-a2l7s). Only digamma is a direct call.
+//! complex polygamma is compared against `mpmath.polygamma` (pinned at `mpmath==1.4.1` in
+//! `python_oracle/requirements.txt`, frankenscipy-a2l7s). Only digamma is a direct SciPy call.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -28,10 +29,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-7;
 const REL_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
-/// One ledger arm per op.
-/// polygamma is not an arm: SciPy has no complex polygamma to compare against, and mpmath is
-/// not in the CI oracle environment (frankenscipy-a2l7s). Its cases stay generated, uncompared.
-const ARMS: [&str; 3] = ["beta", "betaln", "digamma"];
+/// One ledger arm per op (`polygamma` uses pinned `mpmath==1.4.1` as oracle, frankenscipy-a2l7s).
+const ARMS: [&str; 4] = ["beta", "betaln", "digamma", "polygamma"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -165,6 +164,7 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
 import json
 import math
 import sys
+import mpmath
 import numpy as np
 from scipy import special as sp
 
@@ -176,9 +176,9 @@ for case in q["points"]:
     b = complex(float(case["b_re"]), float(case["b_im"]))
     n = int(case["n"])
     try:
-        # sp.beta, sp.betaln and sp.polygamma reject complex arguments (TypeError in 1.17.1), which
-        # blanked those columns until the compared-case ledger (olv0j.1). beta and betaln are
-        # compared against their defining identities over SciPy's complex gamma / loggamma.
+        # sp.beta, sp.betaln and sp.polygamma reject complex arguments (TypeError in 1.17.1).
+        # beta and betaln are compared against their defining identities over SciPy's complex
+        # gamma / loggamma; polygamma uses pinned mpmath.polygamma (frankenscipy-a2l7s).
         if op == "beta":
             c = complex(sp.gamma(a) * sp.gamma(b) / sp.gamma(a + b))
         elif op == "betaln":
@@ -186,7 +186,7 @@ for case in q["points"]:
         elif op == "digamma":
             c = complex(sp.digamma(a))
         elif op == "polygamma":
-            c = complex(sp.polygamma(n, a))
+            c = complex(mpmath.polygamma(n, a))
         else:
             points.append({"case_id": cid, "values": None}); continue
         if math.isfinite(c.real) and math.isfinite(c.imag):
@@ -263,9 +263,6 @@ fn diff_special_complex_beta_gamma_scalars() {
     let mut ledger = CompareLedger::new("diff_special_complex_beta_gamma_scalars", &ARMS);
 
     for case in &query.points {
-        if case.op == "polygamma" {
-            continue; // no pinned reference (frankenscipy-a2l7s)
-        }
         let scipy = pmap
             .get(&case.case_id)
             .and_then(|arm| arm.values.as_deref());

@@ -3678,8 +3678,8 @@ fn complex_k0_k1_temme_cf2(z: Complex64) -> (Complex64, Complex64) {
         }
     }
     h = h * Complex64::from_real(a1);
-    let pref = (Complex64::from_real(std::f64::consts::PI) / (two * z))
-        .powc(Complex64::from_real(0.5));
+    let pref =
+        (Complex64::from_real(std::f64::consts::PI) / (two * z)).powc(Complex64::from_real(0.5));
     let rk0_scaled = pref / s;
     let rk1_scaled = rk0_scaled * (z + Complex64::from_real(0.5) - h) / z;
     let emz = (-z).exp();

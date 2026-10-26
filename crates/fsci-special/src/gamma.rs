@@ -5045,8 +5045,11 @@ fn complex_trigamma_scalar(z: Complex64) -> Complex64 {
     acc + result
 }
 
-/// Complex polygamma function of order n.
-/// Uses recurrence and asymptotic expansion.
+/// Complex polygamma function of order `n`: `ψ^{(n)}(z) = (-1)^{n+1} n! ζ(n+1, z)`.
+///
+/// Uses upward recurrence `ψ^{(n)}(z) = ψ^{(n)}(z+1) + (-1)^{n+1} n! / z^{n+1}` into
+/// `Re(z) >= 10` followed by the Euler-Maclaurin asymptotic expansion of Hurwitz
+/// `ζ(n+1, z)` through `B_{12}` (frankenscipy-a2l7s).
 pub fn complex_polygamma_scalar(n: usize, z: Complex64) -> Complex64 {
     if n == 0 {
         return complex_digamma_scalar(z);
@@ -5058,38 +5061,55 @@ pub fn complex_polygamma_scalar(n: usize, z: Complex64) -> Complex64 {
     if !z.is_finite() {
         return Complex64::new(f64::NAN, f64::NAN);
     }
+    // Poles at non-positive real integers.
+    if z.im == 0.0 && z.re <= 0.0 && z.re == z.re.floor() {
+        return Complex64::new(f64::NAN, f64::NAN);
+    }
 
     let sign = if n % 2 == 1 { 1.0 } else { -1.0 };
     let factorial = (1..=n).fold(1.0, |acc, v| acc * v as f64);
-    let n_plus_one = n as f64 + 1.0;
+    let s = n as f64 + 1.0;
 
-    // Reflection for negative real part
-    if z.re < 0.5 {
-        // The reflection formula for higher polygamma is complex
-        // Use numerical differentiation of lower orders as fallback
+    if z.re < -50.0 {
+        // Deep negative half-plane fallback when upward shifting would take > 60 steps.
         let h = Complex64::new(1e-6, 0.0);
         let f_plus = complex_polygamma_scalar(n - 1, z + h);
         let f_minus = complex_polygamma_scalar(n - 1, z - h);
         return (f_plus - f_minus) / Complex64::new(2e-6, 0.0);
     }
 
-    // Shift upward: ψⁿ(z+1) = ψⁿ(z) + (-1)^(n+1) * n! / z^(n+1)
+    // Shift upward: ψⁿ(z) = ψⁿ(z+1) + (-1)^(n+1) * n! / z^(n+1)
     let mut shifted = z;
     let mut correction = Complex64::new(0.0, 0.0);
-    while shifted.re < 8.0 {
-        let inv_pow = shifted.powf(-n_plus_one);
+    while shifted.re < 10.0 {
+        let inv_pow = shifted.powf(-s);
         correction = correction + Complex64::new(sign * factorial, 0.0) * inv_pow;
         shifted = Complex64::new(shifted.re + 1.0, shifted.im);
     }
 
-    // Asymptotic expansion using Hurwitz zeta
-    // ψⁿ(z) ≈ (-1)^(n+1) * n! * ζ(n+1, z)
-    // For large z: ζ(s, z) ≈ z^(1-s)/(s-1) + z^(-s)/2 + Σ B_{2k}/(2k)! * (s)_{2k-1} * z^(-s-2k+1)
-    let inv_pow = shifted.powf(-n_plus_one);
+    // Euler-Maclaurin expansion of Hurwitz ζ(s, z) at Re(z) >= 10:
+    // ζ(s, z) ≈ z^{1-s}/(s-1) + z^{-s}/2 + Σ_{k=1}^6 (B_{2k}/(2k)!) (s)_{2k-1} z^{-s-2k+1}.
+    const B2K_OVER_FACT: [f64; 6] = [
+        1.0 / 12.0,                   // B_2 / 2!
+        -1.0 / 720.0,                 // B_4 / 4!
+        1.0 / 30_240.0,               // B_6 / 6!
+        -1.0 / 1_209_600.0,           // B_8 / 8!
+        1.0 / 47_900_160.0,           // B_10 / 10!
+        -691.0 / 1_307_674_368_000.0, // B_12 / 12!
+    ];
+    let inv = shifted.recip();
+    let inv2 = inv * inv;
+    let inv_pow = shifted.powf(-s);
     let inv_pow_minus_1 = shifted.powf(-(n as f64));
-
-    // Leading terms of asymptotic zeta
-    let zeta_approx = inv_pow_minus_1 / n as f64 + inv_pow * 0.5;
+    let mut zeta_approx = inv_pow_minus_1 / (n as f64) + inv_pow * 0.5;
+    let mut poch = s;
+    let mut z_pow = inv_pow * inv;
+    for (idx, &b_coeff) in B2K_OVER_FACT.iter().enumerate() {
+        let k = (idx + 1) as f64;
+        zeta_approx = zeta_approx + z_pow * (b_coeff * poch);
+        poch *= (s + 2.0 * k - 1.0) * (s + 2.0 * k);
+        z_pow = z_pow * inv2;
+    }
 
     let result = Complex64::new(sign * factorial, 0.0) * zeta_approx;
     correction + result
@@ -7049,14 +7069,13 @@ mod tests {
             &digamma_complex_scalar(x, 0.0),
             RuntimeMode::Strict,
         ))?;
-        // Higher-order polygamma uses numerical differentiation for complex, so tolerance is relaxed
         assert!(
-            (complex_result.re - real_result).abs() < 0.01,
+            (complex_result.re - real_result).abs() < 1e-13,
             "real_result={}, complex_result.re={}",
             real_result,
             complex_result.re
         );
-        assert!(complex_result.im.abs() < 1e-6);
+        assert!(complex_result.im.abs() < 1e-13);
         Ok(())
     }
 

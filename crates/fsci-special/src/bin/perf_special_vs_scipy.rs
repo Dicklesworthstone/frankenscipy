@@ -304,8 +304,7 @@ const CASES: &[(&str, f64, f64)] = &[
     // Exponential integrals across their series/continued-fraction switch.
     ("exp1", 0.01, 50.0),
     ("expi", -30.0, 30.0),
-    // Complete elliptic integrals in the parameter m. SciPy also takes m < 0, but this harness
-    // runs Hardened, where fsci's ellipk refuses m < 0 by policy, so the domain starts at 0.
+    // Complete elliptic integrals in the parameter m (Hardened also accepts m < 0, frankenscipy-3xr5r).
     ("ellipk", 0.0, 0.999),
     ("ellipkm1", 0.001, 1.0),
     ("ellipe", 0.0, 1.0),
@@ -377,7 +376,7 @@ const CASES2: &[(&str, f64, f64, f64, f64)] = &[
     ("ive", 0.0, 5.0, 0.1, 12.0),
     ("kve", 0.0, 5.0, 0.1, 12.0),
     // Widened: Struve, the chi-square / Student t / Poisson distribution family and their
-    // inverses, Owen's T, the incomplete elliptic integrals (m >= 0: Hardened refuses m < 0),
+    // inverses, Owen's T, the incomplete elliptic integrals (Hardened also accepts m < 0, frankenscipy-3xr5r),
     // Pochhammer and binom, and the log/entropy/Box-Cox/Huber helpers.
     ("struve", -2.0, 10.0, 0.0, 30.0),
     ("modstruve", -2.0, 10.0, 0.0, 20.0),
