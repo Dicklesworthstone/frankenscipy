@@ -12,10 +12,10 @@
 /// column per state (well conditioned, moderate, ill conditioned, near singular).
 #[rustfmt::skip]
 pub(crate) const SOLVER_LOSS_MATRIX: [[f64; 4]; 6] = [
-    [1.0319926099000587, 1.0006762508973737, 1.0, 1.0], // DirectLU
-    [2.0, 2.0, 2.0, 2.0], // PivotedQR
-    [31.5, 31.5021466321814, 31.727013976223127, 32.201463282742864], // SVDFallback
-    [0.0, 0.0, 0.0, 0.0], // DiagonalFastPath
+    [1.0319926099000587, 1.0006762508973737, 1.0, 1.9813420556850283], // DirectLU
+    [2.0, 2.0, 2.0, 2.9813420556850283], // PivotedQR
+    [31.5, 31.5021466321814, 31.72528465666925, 31.921568873863382], // SVDFallback
+    [0.0, 0.0, 0.0, 11.250000000000002], // DiagonalFastPath
     [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
     [0.5, 0.5, 0.5, 0.5], // SymmetricFastPath
 ];
@@ -28,10 +28,10 @@ pub(crate) const SOLVER_ACTION_COST: [f64; 6] = [1.0, 2.0, 31.5, 0.0, 0.0, 0.5];
 /// corpus; an unmeasured pair is 1).
 #[rustfmt::skip]
 pub(crate) const SOLVER_FAILURE_RATE: [[f64; 4]; 6] = [
-    [0.01599630495002933, 0.0003381254486868826, 0.0, 0.0], // DirectLU
-    [0.0, 0.0, 0.0, 0.0], // PivotedQR
-    [0.0, 0.0021466321814016215, 0.266468452116023, 0.9163039559984879], // SVDFallback
-    [0.0, 0.0, 0.0, 0.0], // DiagonalFastPath
+    [0.01599630495002933, 0.0003381254486868826, 0.0, 0.031153716053492958], // DirectLU
+    [0.0, 0.0, 0.0, 0.031153716053492958], // PivotedQR
+    [0.0, 0.0021466321814016215, 0.25104053432167883, 0.5071779868664816], // SVDFallback
+    [0.0, 0.0, 0.0, 0.3571428571428572], // DiagonalFastPath
     [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
     [0.0, 0.0, 0.0, 0.0], // SymmetricFastPath
 ];

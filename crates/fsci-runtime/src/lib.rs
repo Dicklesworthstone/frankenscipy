@@ -300,11 +300,12 @@ const INACCURATE_SHARE: f64 = 0.7;
 const FAILURE_PRIOR_TRIALS: f64 = 4.0;
 
 /// An action's expected loss once attempts with it at this rcond decade have been recorded
-/// (frankenscipy-3iekl). The calibrated loss is `cost + p0 × r`: `p0` the measured failure rate
-/// under the state posterior and `r` the expected recovery cost it implies. The recorded
-/// attempts replace `p0` by the Beta posterior mean `(m·p0 + failures) / (m + trials)`, with `m`
-/// = [`FAILURE_PRIOR_TRIALS`], and keep `r`. An action the corpus never saw fail implies no
-/// `r`; its failure is priced at the cheapest other general solver, the one that would recover.
+/// (frankenscipy-3iekl). In each condition state `s`, the calibrated loss is
+/// `cost + rate(a, s) × r(a, s)`, where `r(a, s)` is that state's measured recovery cost (or, for
+/// a state where the corpus never saw `a` fail, the cheapest other general solver). With
+/// `m` = [`FAILURE_PRIOR_TRIALS`] pseudo-trials, the prior failure term carries weight
+/// `m / (m + trials)` and the recorded `failures` carry weight `failures / (m + trials)` priced at
+/// the posterior-expected recovery cost `Σ_s P(s) · r(a, s)`.
 fn learned_loss(
     calibrated: f64,
     action: usize,
@@ -313,22 +314,25 @@ fn learned_loss(
     trials: f64,
 ) -> f64 {
     let cost = calibrated_losses::SOLVER_ACTION_COST[action];
-    let p0: f64 = calibrated_losses::SOLVER_FAILURE_RATE[action]
-        .iter()
-        .zip(posterior)
-        .map(|(rate, p)| rate * p)
+    let default_recovery = (0..3)
+        .filter(|&other| other != action)
+        .map(|other| calibrated_losses::SOLVER_ACTION_COST[other])
+        .fold(f64::INFINITY, f64::min);
+    let recovery: f64 = (0..4)
+        .map(|s| {
+            let rate = calibrated_losses::SOLVER_FAILURE_RATE[action][s];
+            let state_loss = calibrated_losses::SOLVER_LOSS_MATRIX[action][s];
+            let state_recovery = if rate > 0.0 && state_loss > cost {
+                (state_loss - cost) / rate
+            } else {
+                default_recovery
+            };
+            posterior[s] * state_recovery
+        })
         .sum();
-    let failure_term = calibrated - cost;
-    let recovery = if p0 > 0.0 && failure_term > 0.0 {
-        failure_term / p0
-    } else {
-        (0..3)
-            .filter(|&other| other != action)
-            .map(|other| calibrated_losses::SOLVER_ACTION_COST[other])
-            .fold(f64::INFINITY, f64::min)
-    };
-    let failure_rate = (FAILURE_PRIOR_TRIALS * p0 + failures) / (FAILURE_PRIOR_TRIALS + trials);
-    cost + failure_rate * recovery
+    let failure_term = (calibrated - cost).max(0.0);
+    let denom = FAILURE_PRIOR_TRIALS + trials;
+    cost + (FAILURE_PRIOR_TRIALS * failure_term + failures * recovery) / denom
 }
 
 /// The decade row an rcond value's outcomes are counted in.
@@ -3215,18 +3219,9 @@ mod tests {
             .trim_start_matches("0x");
         let report_seed = u64::from_str_radix(seed_str, 16).expect("hex seed");
         assert_eq!(calibrated_losses::SOLVER_CRC_SEED, report_seed);
-        let matrices = report["matrices"].as_u64().expect("matrices") as usize;
-        let unsolvable = report["unsolvable"].as_u64().expect("unsolvable") as usize;
-        assert_eq!(calibrated_losses::SOLVER_CRC_N, matrices - unsolvable);
         let mut samples = Vec::new();
         for cell in report["cells"].as_array().expect("cells") {
             let outcomes = cell["outcomes"].as_array().expect("outcomes");
-            let solvable = outcomes
-                .iter()
-                .any(|o| !o["failed"].as_bool().unwrap_or(true));
-            if !solvable {
-                continue;
-            }
             let rcond = cell["rcond_estimate"].as_f64().unwrap_or(0.0);
             let lu_failed = outcomes
                 .iter()
@@ -3236,6 +3231,9 @@ mod tests {
                 .iter()
                 .find(|o| o["action"].as_str() == Some("PivotedQR"))
                 .is_some_and(|o| o["failed"].as_bool().unwrap_or(true));
+            if lu_failed && qr_failed {
+                continue;
+            }
             samples.push(CrcCalibrationSample {
                 rcond,
                 unescalated_exceeded: lu_failed,
@@ -3255,19 +3253,17 @@ mod tests {
         );
     }
 
-    /// frankenscipy-7tb8d.2: every action does work on the calibration corpus, as the first
-    /// choice on some matrix or as the fallback that succeeds when the first choice fails,
-    /// except the ones named here, which are retained only as later fallbacks. A recalibration
-    /// that changes the set fails here until someone decides again.
+    /// frankenscipy-7tb8d.2 + frankenscipy-qmgrm: every action does work on the calibration
+    /// corpus, as the first choice on some matrix or as the fallback that succeeds when the
+    /// first choice fails. A recalibration that leaves any action unreached fails here.
     ///
-    /// `SVDFallback`: refuses a square system whose numerical rank is short (the rank cutoff
-    /// `max(m, n)·eps·σ_max`), and on the full-rank ones it accepts, Householder QR is backward
-    /// stable too, at `4n³/3` flops against its `21n³`. On the corpus it is never chosen, never
-    /// the fallback that succeeds and never the only action that succeeds; whether to remove it
-    /// from the dense portfolio or give it a job is frankenscipy-qmgrm.
+    /// `SVDFallback` solves consistent numerically rank-deficient square systems (`b in range(A)`)
+    /// via the minimum-norm pseudoinverse solution `x = A^+ b` in Hardened mode (and direct
+    /// `solve_with_action`), rescuing the consistent singular corpus cells where LU, QR, and
+    /// diagonal fast paths fail with `SingularMatrix`.
     #[test]
     fn every_solver_action_is_reached_or_named_as_retained() {
-        const RETAINED_UNREACHED: [SolverAction; 1] = [SolverAction::SVDFallback];
+        const RETAINED_UNREACHED: [SolverAction; 0] = [];
         let report: serde_json::Value = serde_json::from_str(include_str!(
             "../../../artifacts/casp-calibration-solver.json"
         ))
@@ -3290,17 +3286,21 @@ mod tests {
             .iter()
             .map(|a| a.as_str().expect("an action name"))
             .collect();
-        assert_eq!(listed, ["SVDFallback"], "the report's own list agrees");
+        assert!(listed.is_empty(), "the report's own unreached list is empty");
+        assert!(report["sole_success"]["SVDFallback"].as_u64() > Some(0));
+        assert!(report["fallback_success"]["SVDFallback"].as_u64() > Some(0));
 
         // Must-miss: the one matrix QR rescues is all that keeps it reached. Without it, QR
         // would join the unreached set and the assertion above would fail.
         assert!(report["fallback_success"]["PivotedQR"].as_u64() > Some(0));
-        let mut without_rescue = report.clone();
-        without_rescue["fallback_success"]["PivotedQR"] = 0.into();
-        assert_eq!(
-            unreached(&without_rescue),
-            [SolverAction::PivotedQR, SolverAction::SVDFallback]
-        );
+        let mut without_qr_rescue = report.clone();
+        without_qr_rescue["fallback_success"]["PivotedQR"] = 0.into();
+        assert_eq!(unreached(&without_qr_rescue), [SolverAction::PivotedQR]);
+
+        // Must-miss: without SVDFallback rescuing consistent singular cells, it would be unreached.
+        let mut without_svd_rescue = report.clone();
+        without_svd_rescue["fallback_success"]["SVDFallback"] = 0.into();
+        assert_eq!(unreached(&without_svd_rescue), [SolverAction::SVDFallback]);
     }
 
     /// frankenscipy-7tb8d.11: every portfolio's recorded decision reads back through its JSONL
@@ -4111,12 +4111,6 @@ mod tests {
         let mut solvable = Vec::new();
         for cell in cells {
             let outcomes = cell["outcomes"].as_array().expect("outcomes");
-            if !outcomes
-                .iter()
-                .any(|o| !o["failed"].as_bool().unwrap_or(true))
-            {
-                continue;
-            }
             let get = |action: &str| {
                 outcomes
                     .iter()
@@ -4126,6 +4120,11 @@ mod tests {
             let lu = get("DirectLU");
             let qr = get("PivotedQR");
             let svd = get("SVDFallback");
+            let lu_failed = lu["failed"].as_bool().unwrap_or(true);
+            let qr_failed = qr["failed"].as_bool().unwrap_or(true);
+            if lu_failed && qr_failed {
+                continue;
+            }
             solvable.push(CorpusEntry {
                 family: cell["family"].as_str().unwrap_or("").to_string(),
                 n: cell["n"].as_u64().unwrap_or(0) as usize,
@@ -4133,8 +4132,8 @@ mod tests {
                 lu_bwd: lu["backward_error"].as_f64().unwrap_or(f64::INFINITY),
                 qr_bwd: qr["backward_error"].as_f64().unwrap_or(f64::INFINITY),
                 lu_fwd: lu["forward_error"].as_f64().unwrap_or(f64::INFINITY),
-                lu_failed: lu["failed"].as_bool().unwrap_or(true),
-                qr_failed: qr["failed"].as_bool().unwrap_or(true),
+                lu_failed,
+                qr_failed,
                 svd_failed: svd["failed"].as_bool().unwrap_or(true),
             });
         }

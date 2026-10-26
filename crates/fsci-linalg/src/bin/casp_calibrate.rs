@@ -427,6 +427,7 @@ fn main() {
     let mut weights = [[0.0_f64; 4]; 6];
     let mut square_weights = [[0.0_f64; 4]; 6];
     let mut unsolvable = 0_usize;
+    let mut crc_n = 0_usize;
     let mut crc_exceedance_rconds = Vec::new();
     for (rcond, state_weights, outcomes) in &per_cell {
         let recovery = outcomes
@@ -446,6 +447,9 @@ fn main() {
             .iter()
             .find(|(a, _)| *a == SolverAction::PivotedQR)
             .is_some_and(|(_, failed)| !*failed);
+        if !lu_failed || qr_ok {
+            crc_n += 1;
+        }
         if lu_failed && qr_ok {
             crc_exceedance_rconds.push(*rcond);
         }
@@ -701,7 +705,6 @@ fn main() {
         );
     }
     module.push_str("];\n");
-    let crc_n = cases.len() - unsolvable;
     let crc_alpha = 0.05_f64;
     let crc_t_hat = {
         let mut t_hat = 1.0_f64;
