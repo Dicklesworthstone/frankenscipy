@@ -40,7 +40,8 @@ pub struct LeastSquaresResult {
     pub x: Vec<f64>,
     /// Residual vector at the solution.
     pub fun: Vec<f64>,
-    /// Sum of squared residuals (cost = 0.5 * ||fun||^2).
+    /// Objective value: `0.5 * ||fun||²` for linear loss, or the robust loss
+    /// applied to the residuals with the requested `f_scale`.
     pub cost: f64,
     /// Whether the solver converged.
     pub success: bool,
@@ -177,8 +178,28 @@ pub struct CurveFitResult {
     pub popt: Vec<f64>,
     /// Estimated covariance matrix of parameters (n x n).
     pub pcov: Vec<Vec<f64>>,
-    /// Underlying least-squares result.
+    /// Underlying least-squares result. Its residuals and Jacobian include the
+    /// measurement-error transformation specified by [`CurveFitOptions::sigma`].
     pub ls_result: LeastSquaresResult,
+}
+
+/// Measurement-error specification for [`curve_fit`] and [`curve_fit_bounded`].
+///
+/// Standard deviations minimize `Σ((f(xᵢ, p) - yᵢ) / sigmaᵢ)²`; a covariance
+/// matrix minimizes `rᵀ sigma⁻¹ r`. Correlated errors are handled by a Cholesky
+/// solve, without forming the inverse. The same transformation is applied to
+/// an analytic model Jacobian supplied through [`LeastSquaresOptions::jac`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CurveFitSigma {
+    /// A common, finite nonzero standard deviation for every observation.
+    Scalar(f64),
+    /// One finite nonzero standard deviation per observation. A single entry
+    /// broadcasts to all observations, as in SciPy.
+    StandardDeviations(Vec<f64>),
+    /// A finite, positive-definite observation covariance matrix. Its shape
+    /// must be `m × m`, where `m` is the number of observations. As in SciPy's
+    /// lower Cholesky factorization, only the lower triangle is used.
+    Covariance(Vec<Vec<f64>>),
 }
 
 /// Options for `curve_fit`.
@@ -188,8 +209,127 @@ pub struct CurveFitOptions {
     pub p0: Option<Vec<f64>>,
     /// Least-squares options.
     pub ls_options: LeastSquaresOptions,
-    /// Whether to compute absolute sigma (unscaled covariance).
+    /// Measurement standard deviations or covariance; `None` gives unit weights.
+    pub sigma: Option<CurveFitSigma>,
+    /// If true, return covariance in the units of `sigma`. Otherwise multiply
+    /// it by the weighted residual variance `2 * cost / (m - n)`.
     pub absolute_sigma: bool,
+}
+
+/// Prepared measurement-error transform, shared by every fit in a batch.
+/// Factorizing an `m × m` covariance is O(m³), so it must not be repeated for
+/// each residual/Jacobian evaluation or each independent batch member.
+enum FitWhitening {
+    Identity,
+    Diagonal(Vec<f64>),
+    Cholesky(Vec<Vec<f64>>),
+}
+
+impl FitWhitening {
+    fn new(sigma: Option<&CurveFitSigma>, observations: usize) -> Result<Self, OptError> {
+        let deviation = |value: f64| -> Result<f64, OptError> {
+            if !value.is_finite() || value == 0.0 {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("sigma standard deviations must be finite and nonzero"),
+                });
+            }
+            Ok(value)
+        };
+        match sigma {
+            None => Ok(Self::Identity),
+            Some(CurveFitSigma::Scalar(value)) => {
+                Ok(Self::Diagonal(vec![deviation(*value)?; observations]))
+            }
+            Some(CurveFitSigma::StandardDeviations(values)) => {
+                if values.len() == 1 {
+                    return Ok(Self::Diagonal(vec![deviation(values[0])?; observations]));
+                }
+                if values.len() != observations {
+                    return Err(OptError::InvalidArgument {
+                        detail: format!(
+                            "sigma must contain one or {observations} standard deviations"
+                        ),
+                    });
+                }
+                values
+                    .iter()
+                    .map(|&value| deviation(value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Self::Diagonal)
+            }
+            Some(CurveFitSigma::Covariance(matrix)) => {
+                if matrix.len() != observations
+                    || matrix.iter().any(|row| row.len() != observations)
+                {
+                    return Err(OptError::InvalidArgument {
+                        detail: format!(
+                            "sigma covariance must have shape ({observations}, {observations})"
+                        ),
+                    });
+                }
+                if matrix.iter().flatten().any(|value| !value.is_finite()) {
+                    return Err(OptError::NonFiniteInput {
+                        detail: String::from("sigma covariance must not contain NaN or Inf"),
+                    });
+                }
+                let lower = cholesky_decompose(matrix, observations)
+                    .filter(|factor| factor.iter().flatten().all(|value| value.is_finite()));
+                lower
+                    .map(Self::Cholesky)
+                    .ok_or_else(|| OptError::InvalidArgument {
+                        detail: String::from("sigma covariance must be positive definite"),
+                    })
+            }
+        }
+    }
+
+    fn residuals(&self, residuals: &mut [f64]) {
+        match self {
+            Self::Identity => {}
+            Self::Diagonal(deviations) => {
+                // Divide directly: for subnormal sigma, 1/sigma may overflow
+                // even when the scaled residual itself is finite.
+                for (value, &deviation) in residuals.iter_mut().zip(deviations) {
+                    *value /= deviation;
+                }
+            }
+            Self::Cholesky(lower) => {
+                // Forward substitution L z = r, so ||z||² = rᵀ sigma⁻¹ r.
+                for i in 0..residuals.len() {
+                    let mut value = residuals[i];
+                    for j in 0..i {
+                        value -= lower[i][j] * residuals[j];
+                    }
+                    residuals[i] = value / lower[i][i];
+                }
+            }
+        }
+    }
+
+    fn jacobian(&self, jacobian: &mut [Vec<f64>]) {
+        match self {
+            Self::Identity => {}
+            Self::Diagonal(deviations) => {
+                for (row, &deviation) in jacobian.iter_mut().zip(deviations) {
+                    for value in row {
+                        *value /= deviation;
+                    }
+                }
+            }
+            Self::Cholesky(lower) => {
+                let parameters = jacobian.first().map_or(0, Vec::len);
+                for i in 0..jacobian.len() {
+                    for column in 0..parameters {
+                        let mut value = jacobian[i][column];
+                        for j in 0..i {
+                            value -= lower[i][j] * jacobian[j][column];
+                        }
+                        jacobian[i][column] = value / lower[i][i];
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `scipy.optimize.least_squares(fun, x0, method=...)` without bounds: minimize
@@ -880,6 +1020,23 @@ pub fn curve_fit<F>(
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
 {
+    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    curve_fit_impl(&f, xdata, ydata, None, options, &whitening)
+}
+
+/// Shared scalar/batched and bounded/unbounded curve fitting. `whitening` has
+/// already been validated and factored exactly once for this observation grid.
+fn curve_fit_impl<F>(
+    f: &F,
+    xdata: &[f64],
+    ydata: &[f64],
+    bounds: Option<(&[f64], &[f64])>,
+    options: CurveFitOptions,
+    whitening: &Arc<FitWhitening>,
+) -> Result<CurveFitResult, OptError>
+where
+    F: Fn(f64, &[f64]) -> f64 + Sync,
+{
     if xdata.len() != ydata.len() {
         return Err(OptError::InvalidArgument {
             detail: format!(
@@ -899,7 +1056,11 @@ where
         detail: String::from("p0 (initial parameter guess) is required"),
     })?;
     let n_params = p0.len();
-    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm);
+    let method = options.ls_options.method.unwrap_or(if bounds.is_some() {
+        LeastSquaresMethod::Trf
+    } else {
+        LeastSquaresMethod::Lm
+    });
 
     if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
         return Err(OptError::InvalidArgument {
@@ -910,21 +1071,42 @@ where
         });
     }
 
-    // Build residual function: r_i(p) = f(x_i, p) - y_i
+    // Differentiate the weighted residuals when no analytic Jacobian is supplied.
+    // Analytic model Jacobians need the identical linear transform below.
     let residuals = |params: &[f64]| -> Vec<f64> {
-        xdata
+        let mut values: Vec<f64> = xdata
             .iter()
             .zip(ydata.iter())
             .map(|(&xi, &yi)| f(xi, params) - yi)
-            .collect()
+            .collect();
+        whitening.residuals(&mut values);
+        values
     };
 
     // SciPy's curve_fit(method=None) runs 'lm' when there are no bounds.
-    let ls_options = LeastSquaresOptions {
+    let mut ls_options = LeastSquaresOptions {
         method: Some(method),
         ..options.ls_options
     };
-    let ls_result = least_squares(residuals, &p0, ls_options)?;
+    if !matches!(whitening.as_ref(), FitWhitening::Identity)
+        && let Some(jacobian) = ls_options.jac.take()
+    {
+        let whitening = Arc::clone(whitening);
+        let observations = xdata.len();
+        ls_options.jac = Some(LeastSquaresJacobian::new(move |params| {
+            let mut matrix = (jacobian.callback)(params);
+            // Leave malformed matrices intact for LeastSquaresJacobian::evaluate
+            // to report its normal shape error, before indexing any row here.
+            if matrix.len() == observations && matrix.iter().all(|row| row.len() == params.len()) {
+                whitening.jacobian(&mut matrix);
+            }
+            matrix
+        }));
+    }
+    let ls_result = match bounds {
+        Some((lower, upper)) => least_squares_bounded(residuals, &p0, lower, upper, ls_options)?,
+        None => least_squares(residuals, &p0, ls_options)?,
+    };
     require_fit_converged(&ls_result)?;
 
     let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
@@ -1020,53 +1202,8 @@ pub fn curve_fit_bounded<F>(
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
 {
-    if xdata.len() != ydata.len() {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "xdata and ydata must have same length (got {} and {})",
-                xdata.len(),
-                ydata.len()
-            ),
-        });
-    }
-    if xdata.is_empty() {
-        return Err(OptError::InvalidArgument {
-            detail: String::from("xdata must not be empty"),
-        });
-    }
-    let p0 = options.p0.ok_or_else(|| OptError::InvalidArgument {
-        detail: String::from("p0 (initial parameter guess) is required"),
-    })?;
-    let n_params = p0.len();
-    let method = options.ls_options.method.unwrap_or(LeastSquaresMethod::Trf);
-    if method == LeastSquaresMethod::Lm && xdata.len() < n_params {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "number of data points ({}) must be >= number of parameters ({n_params})",
-                xdata.len()
-            ),
-        });
-    }
-
-    let residuals = |params: &[f64]| -> Vec<f64> {
-        xdata
-            .iter()
-            .zip(ydata.iter())
-            .map(|(&xi, &yi)| f(xi, params) - yi)
-            .collect()
-    };
-
-    let ls_result = least_squares_bounded(residuals, &p0, lower, upper, options.ls_options)?;
-    require_fit_converged(&ls_result)?;
-
-    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
-    warn_if_covariance_not_estimated(&pcov);
-
-    Ok(CurveFitResult {
-        popt: ls_result.x.clone(),
-        pcov,
-        ls_result,
-    })
+    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    curve_fit_impl(&f, xdata, ydata, Some((lower, upper)), options, &whitening)
 }
 
 /// Batched curve fitting: fit the same model `f` (and shared `xdata`) to MANY independent
@@ -1091,8 +1228,17 @@ where
         return Ok(Vec::new());
     }
     let f_ref = &f;
-    let opts_ref = &options;
-    let fit_one = move |row: &[f64]| curve_fit(f_ref, xdata, row, opts_ref.clone()).map(|r| r.popt);
+    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    // The factored transform is shared. Do not also copy an O(m²) covariance
+    // input into every worker's per-fit options.
+    let fit_options = CurveFitOptions {
+        sigma: None,
+        ..options
+    };
+    let opts_ref = &fit_options;
+    let fit_one = move |row: &[f64]| {
+        curve_fit_impl(f_ref, xdata, row, None, opts_ref.clone(), &whitening).map(|r| r.popt)
+    };
 
     // Each fit is an independent ~0.1 ms LM solve (heavy per item) → fan whole rows across
     // cores, capped by the row count; a tiny batch stays serial to dodge the spawn floor.
@@ -1214,9 +1360,22 @@ where
         return Ok(Vec::new());
     }
     let f_ref = &f;
-    let opts_ref = &options;
+    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    let fit_options = CurveFitOptions {
+        sigma: None,
+        ..options
+    };
+    let opts_ref = &fit_options;
     let fit_one = move |row: &[f64]| {
-        curve_fit_bounded(f_ref, xdata, row, lower, upper, opts_ref.clone()).map(|r| r.popt)
+        curve_fit_impl(
+            f_ref,
+            xdata,
+            row,
+            Some((lower, upper)),
+            opts_ref.clone(),
+            &whitening,
+        )
+        .map(|r| r.popt)
     };
 
     let cores = std::thread::available_parallelism()
@@ -2771,6 +2930,7 @@ mod tests {
                             jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]])),
                             ..LeastSquaresOptions::default()
                         },
+                        ..CurveFitOptions::default()
                     };
                     let (fit, warnings) = fsci_runtime::catch_warnings(|| {
                         if bounded {
@@ -2853,6 +3013,7 @@ mod tests {
                             jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]; 3])),
                             ..LeastSquaresOptions::default()
                         },
+                        ..CurveFitOptions::default()
                     };
                     let (fit, warnings) = fsci_runtime::catch_warnings(|| {
                         if bounded {
@@ -2906,6 +3067,7 @@ mod tests {
                         })),
                         ..LeastSquaresOptions::default()
                     },
+                    ..CurveFitOptions::default()
                 };
                 let fit = curve_fit(
                     |x, p| {
@@ -2944,6 +3106,7 @@ mod tests {
                             jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0; 2]; 3])),
                             ..LeastSquaresOptions::default()
                         },
+                        ..CurveFitOptions::default()
                     },
                 )
             });
@@ -2986,6 +3149,7 @@ mod tests {
                             })),
                             ..LeastSquaresOptions::default()
                         },
+                        ..CurveFitOptions::default()
                     },
                 )
                 .expect("finite covariance despite large derivatives");

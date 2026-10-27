@@ -42,9 +42,10 @@ pub use chandrupatla::{
     FindRootStatus, find_minimum, find_root,
 };
 pub use curvefit::{
-    CurveFitOptions, CurveFitResult, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions,
-    LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded, curve_fit_bounded_many,
-    curve_fit_many, least_squares, least_squares_bounded, least_squares_many, leastsq,
+    CurveFitOptions, CurveFitResult, CurveFitSigma, LeastSquaresJacobian, LeastSquaresMethod,
+    LeastSquaresOptions, LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded,
+    curve_fit_bounded_many, curve_fit_many, least_squares, least_squares_bounded,
+    least_squares_many, leastsq,
 };
 pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,

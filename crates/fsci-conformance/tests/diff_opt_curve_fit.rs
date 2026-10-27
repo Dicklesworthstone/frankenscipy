@@ -443,6 +443,7 @@ print(json.dumps(out))
                 })),
                 ..LeastSquaresOptions::default()
             },
+            ..CurveFitOptions::default()
         };
         let (fit, warnings) = fsci_runtime::catch_warnings(|| {
             if case.bounded {
