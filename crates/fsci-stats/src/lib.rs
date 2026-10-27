@@ -16,6 +16,7 @@ pub mod censored;
 pub mod covariance;
 mod landau;
 mod levy_stable;
+pub mod mle;
 pub mod qmc;
 
 pub use audit::{
@@ -23,6 +24,7 @@ pub use audit::{
 };
 pub use censored::CensoredData;
 pub use covariance::Covariance;
+pub use mle::{MleOptions, MleParameter, MleResult, fit_mle};
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
@@ -1309,6 +1311,11 @@ fn log_probability(probability: f64) -> f64 {
     } else {
         probability.ln()
     }
+}
+
+/// `ln(1 + exp(x))` without overflowing the exponential.
+fn log_one_plus_exp(x: f64) -> f64 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
 /// Helper: validate fit() data for parameterless / standardized distributions.
@@ -25079,6 +25086,34 @@ impl ContinuousDistribution for Burr3 {
         c * d * x.powf(-c - 1.0) * (1.0 + xnc).powf(-d - 1.0)
     }
 
+    fn logpdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= 0.0 || !x.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+        let lx = x.ln();
+        let t = self.c * lx;
+        // Algebraically ln(c*d) + (-c-1)*ln(x) - (d+1)*ln(1+x^-c).
+        // The softplus form avoids both overflow and subtracting c*ln(x)
+        // from a nearly identical term during shape fitting.
+        self.c.ln() + self.d.ln() - lx - log_one_plus_exp(t) - self.d * log_one_plus_exp(-t)
+    }
+
+    /// MLE for `(c, d)` with location zero and scale one, matching
+    /// `scipy.stats.burr.fit(data, floc=0, fscale=1)`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        mle::validate_positive_sample(data, "Burr3")?;
+        fit_mle(
+            data,
+            &[MleParameter::Positive(1.0), MleParameter::Positive(1.0)],
+            |p| Some(Self { c: p[0], d: p[1] }),
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
+    }
+
     fn cdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
@@ -25268,19 +25303,38 @@ impl ContinuousDistribution for Burr12 {
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c)+ln(d)+(c−1)·ln(x) − (d+1)·ln1p(x^c); shape-dependent x=0 limit
-        // delegates to pdf. frankenscipy-p82v7
+        // The shape-dependent x=0 limit delegates to pdf. For positive x,
+        // evaluate in log space so trial MLE shapes cannot overflow x^c.
         if x <= 0.0 {
             return self.pdf(x).ln();
         }
         let c = self.c;
         let d = self.d;
-        if weibull_density_reuse() {
-            let lx = x.ln();
-            c.ln() + d.ln() + (c - 1.0) * lx - (d + 1.0) * (c * lx).exp().ln_1p()
+        let lx = x.ln();
+        let t = c * lx;
+        let (log_up, log_down) = if weibull_density_reuse() {
+            (log_one_plus_exp(t), log_one_plus_exp(-t))
+        } else if x >= 1.0 {
+            let log_down = x.powf(-c).ln_1p();
+            (t + log_down, log_down)
         } else {
-            c.ln() + d.ln() + (c - 1.0) * x.ln() - (d + 1.0) * x.powf(c).ln_1p()
-        }
+            let log_up = x.powf(c).ln_1p();
+            (log_up, -t + log_up)
+        };
+        c.ln() + d.ln() - lx - log_down - d * log_up
+    }
+
+    /// MLE for `(c, d)` with location zero and scale one, matching
+    /// `scipy.stats.burr12.fit(data, floc=0, fscale=1)`.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        mle::validate_positive_sample(data, "Burr12")?;
+        fit_mle(
+            data,
+            &[MleParameter::Positive(1.0), MleParameter::Positive(1.0)],
+            |p| Some(Self { c: p[0], d: p[1] }),
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -31285,25 +31339,49 @@ impl ContinuousDistribution for Kappa3 {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 || !x.is_finite() {
-            return 0.0;
-        }
-        if x == 0.0 {
-            return 0.0;
-        }
-        let a = self.a;
-        let xa = x.powf(a);
-        let base = a + xa;
-        a * base.powf(-(a + 1.0) / a)
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
         // ln(a) − (a+1)/a·ln(a + x^a); finite in the power-law tail. frankenscipy-p82v7
-        if x <= 0.0 || !x.is_finite() {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x < 0.0 || !x.is_finite() {
             return f64::NEG_INFINITY;
         }
         let a = self.a;
-        a.ln() - (a + 1.0) / a * (a + x.powf(a)).ln()
+        let log_a = a.ln();
+        if x == 0.0 {
+            return -log_a / a;
+        }
+        let log_xa = a * x.ln();
+        // Anchor at the larger logarithm. Anchoring at log(a) when a is tiny
+        // cancels it against the softplus term and loses ln1p(a) at x=1.
+        let log_base = if log_a > log_xa {
+            log_a + (log_xa - log_a).exp().ln_1p()
+        } else {
+            log_xa + (log_a - log_xa).exp().ln_1p()
+        };
+        // Divide the small log_base directly rather than overflowing 1/a.
+        log_a - log_base - log_base / a
+    }
+
+    /// MLE for shape `a`, with location zero and scale one.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "Kappa3")?;
+        if data.iter().any(|&x| x < 0.0) {
+            return Err(FitError::UnsupportedData(
+                "Kappa3 requires nonnegative observations".into(),
+            ));
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Positive(1.0)],
+            |p| Some(Self { a: p[0] }),
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -31934,6 +32012,21 @@ impl CrystalBall {
         Self { beta_param, m }
     }
 
+    /// Logarithms of the integrated power tail and the full normalization.
+    fn log_integrals(&self) -> (f64, f64) {
+        let beta = self.beta_param;
+        let m = self.m;
+        if !beta.is_finite() || beta <= 0.0 || !m.is_finite() || m <= 1.0 {
+            return (f64::NAN, f64::NAN);
+        }
+        let log_gauss = 0.5 * (2.0 * PI).ln() + standard_normal_cdf(beta).ln();
+        // Integral over x <= -beta: exp(-beta²/2) * m / (beta * (m-1)).
+        // Computing (m/beta)^m first can overflow even at ordinary shapes.
+        let log_tail = -0.5 * beta * beta + (m / (m - 1.0)).ln() - beta.ln();
+        let log_norm = log_gauss + log_one_plus_exp(log_tail - log_gauss);
+        (log_tail, log_norm)
+    }
+
     /// Raw moments m_1..m_4 of CrystalBall computed exactly from
     /// closed-form integrals over both pieces of the split pdf:
     ///   gauss part: ∫_{−β}^∞ x^k e^{−x²/2} dx via recurrence
@@ -31998,132 +32091,98 @@ impl ContinuousDistribution for CrystalBall {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        let beta = self.beta_param;
-        let m = self.m;
-
-        let gauss_norm = (2.0 * PI).sqrt() * standard_normal_cdf(beta);
-        let a = (m / beta).powf(m) * (-0.5 * beta * beta).exp();
-        let b = m / beta - beta;
-        let tail_norm = if m > 1.0 {
-            a * (m / beta).powf(1.0 - m) / (m - 1.0)
-        } else {
-            100.0 * a // rough estimate for divergent tail
-        };
-        let total_norm = gauss_norm + tail_norm;
-
-        let unnormalized_pdf = if x > -beta {
-            (-0.5 * x * x).exp()
-        } else {
-            a * (b - x).powf(-m)
-        };
-
-        if total_norm > 0.0 {
-            unnormalized_pdf / total_norm
-        } else {
-            0.0
-        }
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // Closed form so the Gaussian right arm stays finite (default ln(pdf)
-        // underflows once exp(−x²/2) → 0, e.g. x≈38). frankenscipy.
         let beta = self.beta_param;
         let m = self.m;
-        let gauss_norm = (2.0 * PI).sqrt() * standard_normal_cdf(beta);
-        let a = (m / beta).powf(m) * (-0.5 * beta * beta).exp();
-        let tail_norm = if m > 1.0 {
-            a * (m / beta).powf(1.0 - m) / (m - 1.0)
-        } else {
-            100.0 * a
-        };
-        let total_norm = gauss_norm + tail_norm;
-        // Deliberate negated comparison: `!(x > 0.0)` is TRUE for NaN, whereas
-        // `x <= 0.0` is FALSE for NaN. Rewriting this to a direct comparison
-        // would silently stop rejecting a NaN normalisation constant.
-        #[allow(clippy::neg_cmp_op_on_partial_ord)]
-        if !(total_norm > 0.0) {
+        if x.is_nan() || !beta.is_finite() || beta <= 0.0 || !m.is_finite() || m <= 1.0 {
+            return f64::NAN;
+        }
+        if !x.is_finite() {
             return f64::NEG_INFINITY;
         }
-        let ln_norm = total_norm.ln();
+        let (_, ln_norm) = self.log_integrals();
         if x > -beta {
             -0.5 * x * x - ln_norm
         } else {
-            // ln a = m·ln(m/β) − β²/2;  power-law arm a·(b − x)^{−m}.
-            let b = m / beta - beta;
-            (m * (m / beta).ln() - 0.5 * beta * beta) - m * (b - x).ln() - ln_norm
+            -0.5 * beta * beta - m * ((-beta - x) * (beta / m)).ln_1p() - ln_norm
         }
+    }
+
+    /// MLE for `(beta, m)` with location zero and scale one. The power-law
+    /// exponent is constrained to `m > 1`, so every candidate is normalizable.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "CrystalBall")?;
+        fit_mle(
+            data,
+            &[
+                MleParameter::Positive(1.0),
+                MleParameter::Above {
+                    initial: 3.0,
+                    lower: 1.0,
+                },
+            ],
+            |p| {
+                Some(Self {
+                    beta_param: p[0],
+                    m: p[1],
+                })
+            },
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
     }
 
     fn cdf(&self, x: f64) -> f64 {
         let beta = self.beta_param;
         let m = self.m;
-
-        // Analytical normalization: split at x = -beta
-        // Gaussian part: ∫_{-β}^{∞} exp(-x²/2) dx = √(2π) * Φ(β)... wait, ∫ from -β to ∞
-        // = √(2π) * (1 - Φ(-β)) = √(2π) * Φ(β)
-        let gauss_norm = (2.0 * PI).sqrt() * standard_normal_cdf(beta);
-
-        // Power tail part: ∫_{-∞}^{-β} A*(B-x)^{-m} dx
-        let a_coeff = (m / beta).powf(m) * (-0.5 * beta * beta).exp();
-        let b_val = m / beta - beta;
-        // ∫_{-∞}^{-β} A*(B-x)^{-m} dx = A * (B-(-β))^{1-m} / (m-1)
-        // B - (-β) = m/β - β + β = m/β
-        let tail_norm = if m > 1.0 {
-            a_coeff * (m / beta).powf(1.0 - m) / (m - 1.0)
-        } else {
-            // For m <= 1 the integral diverges; use numerical fallback
-            100.0 * a_coeff // rough estimate
-        };
-
-        let total_norm = gauss_norm + tail_norm;
-        if total_norm <= 0.0 {
-            return 0.5;
+        let (log_tail, log_norm) = self.log_integrals();
+        if x.is_nan() || log_norm.is_nan() {
+            return f64::NAN;
         }
-
-        // CDF: integrate pdf from -∞ to x
-        if x >= -beta {
-            // All tail + Gaussian from -β to x
-            let gauss_cdf_part =
-                (2.0 * PI).sqrt() * (standard_normal_cdf(x) - standard_normal_cdf(-beta));
-            (tail_norm + gauss_cdf_part) / total_norm
+        if x == f64::NEG_INFINITY {
+            return 0.0;
+        }
+        if x == f64::INFINITY {
+            return 1.0;
+        }
+        if x < -beta {
+            // Relative to the full power tail, the remaining integral is
+            // (1 + (-beta-x)*beta/m)^(1-m). No large powers are formed.
+            (log_tail - log_norm + (1.0 - m) * ((-beta - x) * (beta / m)).ln_1p())
+                .exp()
+                .clamp(0.0, 1.0)
         } else {
-            // Only part of the tail: ∫_{-∞}^{x} A*(B-t)^{-m} dt
-            let bx = b_val - x;
-            let partial = if m > 1.0 && bx > 0.0 {
-                a_coeff * bx.powf(1.0 - m) / (m - 1.0)
-            } else {
-                0.0
-            };
-            // tail_norm - ∫_{x}^{-β} = tail_norm - (tail_norm - partial)
-            (partial / total_norm).clamp(0.0, 1.0)
+            // Retain the small left-tail probability when beta is large;
+            // evaluating this as 1-sf would erase it near the transition.
+            let gaussian = (0.5 * (2.0 * PI).ln() - log_norm).exp()
+                * (standard_normal_cdf(x) - standard_normal_cdf(-beta));
+            ((log_tail - log_norm).exp() + gaussian).clamp(0.0, 1.0)
         }
     }
 
     fn sf(&self, x: f64) -> f64 {
         let beta = self.beta_param;
         let m = self.m;
+        let (log_tail, log_norm) = self.log_integrals();
+        if x.is_nan() || log_norm.is_nan() {
+            return f64::NAN;
+        }
+        if x == f64::NEG_INFINITY {
+            return 1.0;
+        }
+        if x == f64::INFINITY {
+            return 0.0;
+        }
         if x < -beta {
-            // Power-law left region: cdf is small, so 1 - cdf has no cancellation.
-            return 1.0 - self.cdf(x);
+            let log_cdf = log_tail - log_norm + (1.0 - m) * ((-beta - x) * (beta / m)).ln_1p();
+            return (-log_cdf.exp_m1()).clamp(0.0, 1.0);
         }
-        // Gaussian right region. From cdf = (tail_norm + sqrt(2pi)*(Phi(x)-Phi(-b)))
-        // /total_norm and Phi(b)+Phi(-b)=1, the algebra collapses to
-        //   sf(x) = sqrt(2pi) * Phi(-x) / total_norm,
-        // which equals 1 - cdf but evaluates Phi(-x) via erfc (standard_normal_cdf
-        // is erfc-stable for negative args) instead of cancelling 1 - cdf -> 0.
-        // The default underflowed sf to exactly 0 by x~8 (scipy: 7.5e-24). frankenscipy.
-        let gauss_norm = (2.0 * PI).sqrt() * standard_normal_cdf(beta);
-        let a_coeff = (m / beta).powf(m) * (-0.5 * beta * beta).exp();
-        let tail_norm = if m > 1.0 {
-            a_coeff * (m / beta).powf(1.0 - m) / (m - 1.0)
-        } else {
-            100.0 * a_coeff
-        };
-        let total_norm = gauss_norm + tail_norm;
-        if total_norm <= 0.0 {
-            return 0.5;
-        }
-        ((2.0 * PI).sqrt() * standard_normal_cdf(-x) / total_norm).clamp(0.0, 1.0)
+        // The Gaussian right tail is sqrt(2*pi) * Phi(-x) / total_norm.
+        // Evaluate it directly to preserve probabilities below machine epsilon.
+        ((0.5 * (2.0 * PI).ln() - log_norm).exp() * standard_normal_cdf(-x)).clamp(0.0, 1.0)
     }
 
     fn mean(&self) -> f64 {
@@ -60842,6 +60901,40 @@ impl ContinuousDistribution for FoldedCauchy {
         1.0 / (PI * (1.0 + (x - c).powi(2))) + 1.0 / (PI * (1.0 + (x + c).powi(2)))
     }
 
+    fn logpdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x < 0.0 || !x.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+        let left = -PI.ln() - 2.0 * (x - self.c).hypot(1.0).ln();
+        let right = -PI.ln() - 2.0 * (x + self.c).hypot(1.0).ln();
+        left.max(right) + (-(left - right).abs()).exp().ln_1p()
+    }
+
+    /// MLE for the nonnegative fold parameter `c`, with location zero and
+    /// scale one. A boundary optimum at `c = 0` is retained exactly.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "FoldedCauchy")?;
+        if data.iter().any(|&x| x < 0.0) {
+            return Err(FitError::UnsupportedData(
+                "FoldedCauchy requires nonnegative observations".into(),
+            ));
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Bounded {
+                initial: median(data),
+                lower: 0.0,
+                upper: f64::INFINITY,
+            }],
+            |p| Some(Self { c: p[0] }),
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
+    }
+
     fn cdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
@@ -70007,7 +70100,8 @@ impl<F: Fn(f64) -> f64> NumericalInversePolynomial<F> {
                 // If Newton polynomial overshoots or isn't monotone inside [a, b], bisect.
                 let xm_raw = Self::eval_newton(&node_u, &div_diff, um);
                 let u_xm = if sub_sum > 0.0 {
-                    ua + (ub - ua) * (Self::lobatto5(&pdf, a, xm).max(0.0) / sub_sum).clamp(0.0, 1.0)
+                    ua + (ub - ua)
+                        * (Self::lobatto5(&pdf, a, xm).max(0.0) / sub_sum).clamp(0.0, 1.0)
                 } else {
                     um
                 };
@@ -70204,24 +70298,16 @@ mod pinv_and_fgi_match_scipy {
     #[test]
     fn numerical_inverse_polynomial_inverts_unnormalised_density() {
         // Unnormalised standard normal exp(-x^2 / 2)
-        let pinv = NumericalInversePolynomial::new(
-            |x: f64| (-0.5 * x * x).exp(),
-            0.0,
-            None,
-            5,
-            1e-10,
-        )
-        .expect("pinv built");
+        let pinv =
+            NumericalInversePolynomial::new(|x: f64| (-0.5 * x * x).exp(), 0.0, None, 5, 1e-10)
+                .expect("pinv built");
         assert!(pinv.u_error() <= 1e-10, "u_error = {:e}", pinv.u_error());
         let base = Normal::standard();
         for k in 1..=999_u32 {
             let u = f64::from(k) / 1000.0;
             let x = pinv.ppf(u);
             let want = base.ppf(u);
-            assert!(
-                (x - want).abs() < 1e-7,
-                "u={u}: pinv.ppf={x}, exact={want}"
-            );
+            assert!((x - want).abs() < 1e-7, "u={u}: pinv.ppf={x}, exact={want}");
             assert!(
                 (pinv.cdf(want) - u).abs() < 1e-8,
                 "u={u}: pinv.cdf={}",
