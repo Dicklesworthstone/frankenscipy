@@ -47358,16 +47358,20 @@ mod funm_multiply_krylov_tests {
 ///
 /// # Algorithm
 ///
-/// SciPy's `_expm_multiply_simple_core` (Al-Mohy & Higham 2011), ported directly:
+/// Uses the trace-shifted, scaled Taylor expansion of Al-Mohy & Higham (2011):
 /// shift by the mean of the diagonal, scale into `s` steps, and sum a truncated
-/// Taylor series in each, with the early exit `c1 + c2 <= tol * ||F||_inf`.
+/// Taylor series in each. Every state and right-hand side must separately satisfy
+/// `|previous_term| + |current_term| <= tol * |partial_sum|`. These component
+/// checks are stronger than SciPy's norm-based exit, which can hide a small
+/// component's unfinished series as other components grow.
 ///
 /// The trace shift is not cosmetic. Writing `A = mu*I + A'` with `mu = tr(A)/n` makes
 /// `exp(tA) = exp(t*mu) * exp(tA')`, and `A'` has its spectrum centred, so the Taylor
-/// series sees a smaller argument. Without it a matrix like `-1000*I` needs enormous
-/// `s` to be stable, and with it that case is exact in one step.
+/// series sees a smaller argument. For a matrix like `-1000*I`, the shifted Taylor
+/// series has no nonzero terms. The scalar exponential is still split across steps
+/// so a representable action such as `exp(-1000) * 1e300` does not underflow first.
 ///
-/// # THE DIFFERENCE FROM SciPy, and it is a real one
+/// # Differences from SciPy
 ///
 /// SciPy chooses the scaling `s` and truncation order `m*` with `_fragment_3_1`, a
 /// search over the Al-Mohy & Higham parameter table using estimates of `||A^p||^(1/p)`
@@ -47376,122 +47380,559 @@ mod funm_multiply_krylov_tests {
 /// each step advances by a unit of 1-norm, and lets the series-termination test decide
 /// the order.
 ///
-/// The consequence is stated plainly rather than left to be discovered: this may take
-/// MORE matrix-vector products than SciPy for the same accuracy -- it is a worse
-/// parameter choice, not a different answer. Accuracy is governed by the same
-/// termination test, so results agree to tolerance; only the work differs. Anyone
-/// benchmarking this against SciPy should expect to lose, and the fix is to port the
-/// table rather than to tune the bound.
+/// This conservative scaling may require more matrix-vector products than SciPy.
+/// The component checks can also require more Taylor terms when state magnitudes
+/// differ substantially. They govern series truncation; floating-point rounding
+/// and accumulation over multiple steps also contribute to the final error.
 ///
 /// # Parameters
 ///
 /// `tol` is the relative tolerance for the series termination, defaulting to `2^-53`
 /// (SciPy's `u_d`) when a non-positive value is passed.
+/// If intermediate arithmetic leaves the normal floating-point range, the action
+/// restarts with a separate binary exponent for each state and right-hand side.
+/// Only the final result is rounded into the `f64` range; mixed large and tiny
+/// components are preserved without normalizing an entire vector by one scale.
 pub fn expm_multiply(a: &CsrMatrix, b: &[f64], t: f64, tol: f64) -> SparseResult<Vec<f64>> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "expm_multiply requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
+    let plan = ExpmActionPlan::new(a)?;
+    let n = a.shape().rows;
     if b.len() != n {
         return Err(SparseError::IncompatibleShape {
             message: format!("vector length {} must match matrix rows {n}", b.len()),
         });
     }
-    if !t.is_finite() || b.iter().any(|v| !v.is_finite()) {
-        return Err(SparseError::NonFiniteInput {
-            message: "expm_multiply requires finite t and b".to_string(),
+    plan.apply(b, 1, t, tol)
+}
+
+/// `exp(t*A) @ B` for a row-major dense block with one row per state and one column
+/// per right-hand side. All columns share the sparse traversal and trace-shift plan;
+/// neither `A` nor its exponential is densified. An `n × 0` block returns `n × 0`.
+///
+/// Uses the same tolerance and conservative Taylor scaling as [`expm_multiply`].
+pub fn expm_multiply_matrix(
+    a: &CsrMatrix,
+    b: &[Vec<f64>],
+    t: f64,
+    tol: f64,
+) -> SparseResult<Vec<Vec<f64>>> {
+    let plan = ExpmActionPlan::new(a)?;
+    let (flat, columns) = expm_action_block(b, a.shape().rows)?;
+    let result = plan.apply(&flat, columns, t, tol)?;
+    Ok(expm_action_rows(&result, a.shape().rows, columns))
+}
+
+/// Evaluate `exp(t*A) @ b` on `num` evenly spaced times from `start` to `stop`.
+/// `endpoint=false` excludes `stop`, as in SciPy and `linspace`. At least two time
+/// points are required. The result is time-major (`num × n`).
+///
+/// The sparse analysis is shared across the interval. Each sample acts on the
+/// original vector so an underflowed earlier state cannot erase a later result.
+/// No dense exponential is formed. Negative times and descending intervals are supported.
+pub fn expm_multiply_interval(
+    a: &CsrMatrix,
+    b: &[f64],
+    start: f64,
+    stop: f64,
+    num: usize,
+    endpoint: bool,
+    tol: f64,
+) -> SparseResult<Vec<Vec<f64>>> {
+    let plan = ExpmActionPlan::new(a)?;
+    if b.len() != a.shape().rows {
+        return Err(SparseError::IncompatibleShape {
+            message: "expm_multiply_interval: vector length must match matrix rows".to_string(),
         });
     }
-    if n == 0 {
-        return Ok(Vec::new());
-    }
+    plan.interval(b, 1, start, stop, num, endpoint, tol)
+}
 
-    let tol = if tol > 0.0 {
-        tol
+/// Block counterpart of [`expm_multiply_interval`]. The result has axes
+/// `(time, state, right_hand_side)` and the input block is row-major.
+pub fn expm_multiply_matrix_interval(
+    a: &CsrMatrix,
+    b: &[Vec<f64>],
+    start: f64,
+    stop: f64,
+    num: usize,
+    endpoint: bool,
+    tol: f64,
+) -> SparseResult<Vec<Vec<Vec<f64>>>> {
+    let plan = ExpmActionPlan::new(a)?;
+    let (flat, columns) = expm_action_block(b, a.shape().rows)?;
+    Ok(plan
+        .interval(&flat, columns, start, stop, num, endpoint, tol)?
+        .iter()
+        .map(|sample| expm_action_rows(sample, a.shape().rows, columns))
+        .collect())
+}
+
+fn expm_action_block(b: &[Vec<f64>], rows: usize) -> SparseResult<(Vec<f64>, usize)> {
+    if b.len() != rows {
+        return Err(SparseError::IncompatibleShape {
+            message: "expm_multiply: block row count must match matrix rows".to_string(),
+        });
+    }
+    let columns = b.first().map_or(0, Vec::len);
+    if b.iter().any(|row| row.len() != columns) {
+        return Err(SparseError::InvalidShape {
+            message: "expm_multiply: all block rows must have the same length".to_string(),
+        });
+    }
+    Ok((b.iter().flatten().copied().collect(), columns))
+}
+
+fn expm_action_rows(flat: &[f64], rows: usize, columns: usize) -> Vec<Vec<f64>> {
+    if columns == 0 {
+        vec![Vec::new(); rows]
     } else {
-        f64::EPSILON / 2.0 /* 2^-53, SciPy's u_d; EPSILON is 2^-52 */
-    };
-
-    // mu = tr(A)/n, and A' = A - mu*I. Only the diagonal is touched, so the shift
-    // costs one pass over the stored entries rather than a matrix copy.
-    let mut trace = 0.0_f64;
-    for row in 0..n {
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            if a.indices()[idx] == row {
-                trace += a.data()[idx];
-            }
-        }
+        flat.chunks_exact(columns).map(<[f64]>::to_vec).collect()
     }
-    let mu = trace / n as f64;
+}
 
-    // ||t*A'||_1, the max absolute column sum, which is what bounds the growth of the
-    // Taylor terms.
-    let mut col_sums = vec![0.0_f64; shape.cols];
-    for row in 0..n {
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            let col = a.indices()[idx];
-            let shifted = if col == row {
-                a.data()[idx] - mu
-            } else {
-                a.data()[idx]
+/// Form `value * step * term / order` without an overflowing unscaled matvec or
+/// an underflowed scaled matrix entry. The plan bounds `|value * step| <= 1`.
+fn expm_action_product(value: f64, term: f64, step: f64, order: f64) -> Option<f64> {
+    let scaled = (value * step) / order;
+    let product = if scaled.is_normal() || value == 0.0 || step == 0.0 || term == 0.0 {
+        scaled * term
+    } else {
+        // A subnormal scaled entry can still make a normal contribution to a large
+        // RHS. Multiply the smallest and largest magnitudes first in this rare case.
+        let (mut small, mut middle, mut large) = (value, term, step);
+        if small.abs() > middle.abs() {
+            std::mem::swap(&mut small, &mut middle);
+        }
+        if middle.abs() > large.abs() {
+            std::mem::swap(&mut middle, &mut large);
+        }
+        if small.abs() > middle.abs() {
+            std::mem::swap(&mut small, &mut middle);
+        }
+        let intermediate = small * large;
+        if !intermediate.is_normal() {
+            // A second multiplication can restore a normal magnitude, but it
+            // cannot restore bits already lost in a subnormal intermediate.
+            return None;
+        }
+        (intermediate * middle) / order
+    };
+    // Even a subnormal product that survives rounding can lose significant bits
+    // which a later trace exponential or a different state can amplify.
+    if !product.is_finite()
+        || product.is_subnormal()
+        || (product == 0.0 && value != 0.0 && step != 0.0 && term != 0.0)
+    {
+        None
+    } else {
+        Some(product)
+    }
+}
+
+/// A finite signed mantissa with magnitude in [1, 2), or zero, and an unrestricted
+/// binary exponent. Used only when the ordinary Taylor action encounters a range
+/// risk. Each entry has its own exponent: a growing tiny state must survive beside
+/// a large decaying one even when their ratio cannot be represented by an f64.
+#[derive(Clone, Copy, Default)]
+struct ExpmScaledValue {
+    mantissa: f64,
+    exponent: i64,
+}
+
+impl ExpmScaledValue {
+    const SIGN_AND_FRACTION: u64 = 0x800f_ffff_ffff_ffff;
+
+    fn from_f64(value: f64) -> Self {
+        debug_assert!(value.is_finite());
+        if value == 0.0 {
+            return Self {
+                mantissa: value,
+                exponent: 0,
             };
-            col_sums[col] += shifted.abs();
+        }
+        let mut bits = value.to_bits();
+        let mut exponent = ((bits >> 52) & 0x7ff) as i64 - 1023;
+        if exponent == -1023 {
+            // Multiplication by 2^52 normalizes even the smallest subnormal
+            // exactly, without rounding away its significant bits.
+            bits = (value * 4_503_599_627_370_496.0).to_bits();
+            exponent = ((bits >> 52) & 0x7ff) as i64 - 1023 - 52;
+        }
+        Self {
+            mantissa: f64::from_bits((bits & Self::SIGN_AND_FRACTION) | (1023_u64 << 52)),
+            exponent,
         }
     }
-    let a1_norm = col_sums.iter().fold(0.0_f64, |m, v| m.max(*v));
-    let scaled = (t.abs() * a1_norm).ceil();
-    // At least one step; the cast is guarded because `scaled` can be huge for a
-    // badly scaled operator and saturating there is better than wrapping to a tiny s.
-    let s: usize = if scaled.is_finite() && scaled >= 1.0 {
-        (scaled as u64).min(1_000_000) as usize
-    } else {
-        1
-    };
 
-    // A' * v, computed without materialising the shifted matrix.
-    let shifted_matvec = |v: &[f64]| -> Vec<f64> {
-        let mut out = csr_matvec(a, v);
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot -= mu * v[i];
+    fn normalized(mantissa: f64, exponent: i64) -> Self {
+        let mut result = Self::from_f64(mantissa);
+        if result.mantissa != 0.0 {
+            result.exponent += exponent;
         }
-        out
-    };
-    let inf_norm = |v: &[f64]| -> f64 { v.iter().fold(0.0_f64, |m, x| m.max(x.abs())) };
-
-    let mut f = b.to_vec();
-    let mut work = b.to_vec();
-    let eta = (t * mu / s as f64).exp();
-    // The truncation order is bounded so a non-converging series cannot spin; SciPy's
-    // m_star comes from its table and is finite for the same reason.
-    const MAX_TERMS: usize = 200;
-
-    for _ in 0..s {
-        let mut c1 = inf_norm(&work);
-        for j in 0..MAX_TERMS {
-            let coeff = t / (s as f64 * (j + 1) as f64);
-            let next = shifted_matvec(&work);
-            for (slot, value) in work.iter_mut().zip(&next) {
-                *slot = coeff * value;
-            }
-            let c2 = inf_norm(&work);
-            for (slot, value) in f.iter_mut().zip(&work) {
-                *slot += value;
-            }
-            if c1 + c2 <= tol * inf_norm(&f) {
-                break;
-            }
-            c1 = c2;
-        }
-        for slot in &mut f {
-            *slot *= eta;
-        }
-        work.copy_from_slice(&f);
+        result
     }
 
-    Ok(f)
+    fn mul(self, other: Self) -> Self {
+        Self::normalized(
+            self.mantissa * other.mantissa,
+            self.exponent + other.exponent,
+        )
+    }
+
+    fn div(self, other: Self) -> Self {
+        Self::normalized(
+            self.mantissa / other.mantissa,
+            self.exponent - other.exponent,
+        )
+    }
+
+    fn add(self, other: Self) -> Self {
+        if self.mantissa == 0.0 {
+            return other;
+        }
+        if other.mantissa == 0.0 {
+            return self;
+        }
+        let (large, small) = if self.exponent >= other.exponent {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let difference = large.exponent - small.exponent;
+        if difference > 54 {
+            return large;
+        }
+        let scale = f64::from_bits(((1023 - difference) as u64) << 52);
+        Self::normalized(large.mantissa + small.mantissa * scale, large.exponent)
+    }
+
+    fn abs_le(self, other: Self) -> bool {
+        if self.mantissa == 0.0 {
+            return true;
+        }
+        if other.mantissa == 0.0 {
+            return false;
+        }
+        self.exponent < other.exponent
+            || (self.exponent == other.exponent && self.mantissa.abs() <= other.mantissa.abs())
+    }
+
+    fn abs(self) -> Self {
+        let mut result = self;
+        result.mantissa = result.mantissa.abs();
+        result
+    }
+
+    fn to_f64(self) -> Option<f64> {
+        if self.mantissa == 0.0 {
+            return Some(self.mantissa);
+        }
+        if self.exponent > 1023 {
+            return None;
+        }
+        if self.exponent >= -1022 {
+            return Some(f64::from_bits(
+                (self.mantissa.to_bits() & Self::SIGN_AND_FRACTION)
+                    | (((self.exponent + 1023) as u64) << 52),
+            ));
+        }
+        if self.exponent < -1075 {
+            return Some(0.0_f64.copysign(self.mantissa));
+        }
+        // The first multiplication is exact and normal. Only the final one
+        // rounds, including ties at half the smallest subnormal.
+        let scale = f64::from_bits(((self.exponent + 2045) as u64) << 52);
+        Some((self.mantissa * f64::MIN_POSITIVE) * scale)
+    }
+}
+
+/// Analysis reusable for every right-hand side and time. The diagonal is accumulated
+/// separately: a structurally absent diagonal still contributes `|-mu|` to the
+/// shifted norm, and duplicate diagonal entries must subtract the shift only ONCE.
+struct ExpmActionPlan<'a> {
+    a: &'a CsrMatrix,
+    diagonal: Vec<f64>,
+    mu: f64,
+    norm: f64,
+}
+
+impl<'a> ExpmActionPlan<'a> {
+    fn new(a: &'a CsrMatrix) -> SparseResult<Self> {
+        let shape = a.shape();
+        if !shape.is_square() {
+            return Err(SparseError::InvalidShape {
+                message: "expm_multiply requires a square matrix".to_string(),
+            });
+        }
+        if a.data().iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "expm_multiply requires finite matrix entries".to_string(),
+            });
+        }
+        let n = shape.rows;
+        let mut diagonal = vec![0.0; n];
+        let mut col_sums = vec![0.0; n];
+        for (row, diag) in diagonal.iter_mut().enumerate() {
+            for idx in a.indptr()[row]..a.indptr()[row + 1] {
+                let col = a.indices()[idx];
+                if row == col {
+                    *diag += a.data()[idx];
+                } else {
+                    col_sums[col] += a.data()[idx].abs();
+                }
+            }
+        }
+        // Dividing entries by n before summing can still overflow through
+        // rounding, e.g. three identical f64::MAX entries. Average bounded
+        // ratios first, then restore their common magnitude.
+        let diagonal_scale = diagonal.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+        let mu = if diagonal_scale == 0.0 {
+            0.0
+        } else {
+            (diagonal.iter().map(|d| d / diagonal_scale).sum::<f64>() / n as f64) * diagonal_scale
+        };
+        for (column_norm, diag) in col_sums.iter_mut().zip(&mut diagonal) {
+            *diag -= mu;
+            *column_norm += diag.abs();
+        }
+        let norm = col_sums.iter().copied().fold(0.0_f64, f64::max);
+        Ok(Self {
+            a,
+            diagonal,
+            mu,
+            norm,
+        })
+    }
+
+    fn apply(&self, b: &[f64], columns: usize, t: f64, tol: f64) -> SparseResult<Vec<f64>> {
+        if !t.is_finite() || b.iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "expm_multiply requires finite t and right-hand sides".to_string(),
+            });
+        }
+        if !tol.is_finite() {
+            return Err(SparseError::InvalidArgument {
+                message: "expm_multiply tolerance must be finite".to_string(),
+            });
+        }
+        if t == 0.0 || b.iter().all(|value| *value == 0.0) {
+            return Ok(b.to_vec());
+        }
+        if !self.mu.is_finite() || !self.norm.is_finite() {
+            return Err(SparseError::ResourceExhausted {
+                message: "expm_multiply: shifted matrix norm exceeds the floating-point range"
+                    .to_string(),
+            });
+        }
+        let tol = if tol > 0.0 { tol } else { f64::EPSILON / 2.0 };
+        // Also split a large trace exponential. For example exp(-1000)*1e300
+        // is representable even though forming exp(-1000) first underflows.
+        let scaled = (t.abs() * self.norm)
+            .max((t.abs() * self.mu.abs()) / 500.0)
+            .ceil()
+            .max(1.0);
+        // Never silently clamp the scaling: doing so destroys the Taylor error bound.
+        if !scaled.is_finite() || scaled > 1_000_000.0 {
+            return Err(SparseError::ResourceExhausted {
+                message: "expm_multiply requires more than 1000000 scaling steps".to_string(),
+            });
+        }
+        let steps = scaled as usize;
+        let step = t / steps as f64;
+        let eta = (step * self.mu).exp();
+        let mut result = b.to_vec();
+        let mut term = b.to_vec();
+        let mut next = vec![0.0; b.len()];
+        // A growing state must not mask an unfinished series in another state
+        // of the same RHS, even after many trace-shifted scaling steps.
+        for _ in 0..steps {
+            let mut converged = false;
+            for order in 1..=200 {
+                for (row, &diagonal) in self.diagonal.iter().enumerate() {
+                    let begin = row * columns;
+                    for k in 0..columns {
+                        let Some(product) =
+                            expm_action_product(diagonal, term[begin + k], step, f64::from(order))
+                        else {
+                            return self.apply_scaled(b, columns, step, steps, tol);
+                        };
+                        next[begin + k] = product;
+                    }
+                    for idx in self.a.indptr()[row]..self.a.indptr()[row + 1] {
+                        let col = self.a.indices()[idx];
+                        if col == row {
+                            continue;
+                        }
+                        let value = self.a.data()[idx];
+                        for k in 0..columns {
+                            let Some(product) = expm_action_product(
+                                value,
+                                term[col * columns + k],
+                                step,
+                                f64::from(order),
+                            ) else {
+                                return self.apply_scaled(b, columns, step, steps, tol);
+                            };
+                            next[begin + k] += product;
+                            if !next[begin + k].is_finite() || next[begin + k].is_subnormal() {
+                                return self.apply_scaled(b, columns, step, steps, tol);
+                            }
+                        }
+                    }
+                }
+                converged = true;
+                for ((term, result), &product) in term.iter_mut().zip(&mut result).zip(&next) {
+                    let previous = term.abs();
+                    *term = product;
+                    *result += *term;
+                    if !term.is_finite()
+                        || !result.is_finite()
+                        || term.is_subnormal()
+                        || result.is_subnormal()
+                    {
+                        return self.apply_scaled(b, columns, step, steps, tol);
+                    }
+                    converged &= previous + term.abs() <= tol * result.abs();
+                }
+                if converged {
+                    break;
+                }
+            }
+            if !converged {
+                return Err(SparseError::ResourceExhausted {
+                    message: "expm_multiply Taylor series did not converge within 200 terms"
+                        .to_string(),
+                });
+            }
+            for value in &mut result {
+                let unscaled = *value;
+                *value *= eta;
+                if !value.is_finite() || value.is_subnormal() || (*value == 0.0 && unscaled != 0.0)
+                {
+                    return self.apply_scaled(b, columns, step, steps, tol);
+                }
+            }
+            term.copy_from_slice(&result);
+        }
+        Ok(result)
+    }
+
+    // Restart from the original RHS, not from the intermediate that first lost
+    // range. Mantissas retain ordinary f64 precision, while separate exponents
+    // keep trace shifts and sparse couplings from erasing small state components.
+    fn apply_scaled(
+        &self,
+        b: &[f64],
+        columns: usize,
+        step: f64,
+        steps: usize,
+        tol: f64,
+    ) -> SparseResult<Vec<f64>> {
+        let eta = ExpmScaledValue::from_f64((step * self.mu).exp());
+        let step = ExpmScaledValue::from_f64(step);
+        let tolerance = ExpmScaledValue::from_f64(tol);
+        let zero = ExpmScaledValue::default();
+        let mut result: Vec<_> = b.iter().copied().map(ExpmScaledValue::from_f64).collect();
+        let mut term = result.clone();
+        let mut next = vec![zero; b.len()];
+        for _ in 0..steps {
+            let mut converged = false;
+            for order in 1..=200 {
+                let factor = step.div(ExpmScaledValue::from_f64(f64::from(order)));
+                for (row, &diagonal) in self.diagonal.iter().enumerate() {
+                    let begin = row * columns;
+                    let coefficient = ExpmScaledValue::from_f64(diagonal).mul(factor);
+                    for k in 0..columns {
+                        next[begin + k] = coefficient.mul(term[begin + k]);
+                    }
+                    for idx in self.a.indptr()[row]..self.a.indptr()[row + 1] {
+                        let col = self.a.indices()[idx];
+                        if col == row {
+                            continue;
+                        }
+                        let coefficient = ExpmScaledValue::from_f64(self.a.data()[idx]).mul(factor);
+                        for k in 0..columns {
+                            next[begin + k] =
+                                next[begin + k].add(coefficient.mul(term[col * columns + k]));
+                        }
+                    }
+                }
+                converged = true;
+                for ((term, result), &product) in term.iter_mut().zip(&mut result).zip(&next) {
+                    let previous = term.abs();
+                    *term = product;
+                    *result = result.add(product);
+                    converged &= previous
+                        .add(product.abs())
+                        .abs_le(tolerance.mul(result.abs()));
+                }
+                if converged {
+                    break;
+                }
+            }
+            if !converged {
+                return Err(SparseError::ResourceExhausted {
+                    message: "expm_multiply Taylor series did not converge within 200 terms"
+                        .to_string(),
+                });
+            }
+            for value in &mut result {
+                *value = value.mul(eta);
+            }
+            term.copy_from_slice(&result);
+        }
+        result
+            .into_iter()
+            .map(|value| {
+                value
+                    .to_f64()
+                    .ok_or_else(|| SparseError::ResourceExhausted {
+                        message: "expm_multiply result exceeds the floating-point range"
+                            .to_string(),
+                    })
+            })
+            .collect()
+    }
+
+    fn interval(
+        &self,
+        b: &[f64],
+        columns: usize,
+        start: f64,
+        stop: f64,
+        num: usize,
+        endpoint: bool,
+        tol: f64,
+    ) -> SparseResult<Vec<Vec<f64>>> {
+        if num < 2 || !start.is_finite() || !stop.is_finite() {
+            return Err(SparseError::InvalidArgument {
+                message: "expm_multiply interval requires finite endpoints and at least two times"
+                    .to_string(),
+            });
+        }
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(num)
+            .map_err(|_| SparseError::ResourceExhausted {
+                message: "expm_multiply interval output is too large".to_string(),
+            })?;
+        result.push(self.apply(b, columns, start, tol)?);
+        let denominator = if endpoint { num - 1 } else { num } as f64;
+        let span = stop - start;
+        for index in 1..num {
+            let fraction = index as f64 / denominator;
+            let time = if endpoint && index == num - 1 {
+                stop
+            } else if span.is_finite() {
+                // Preserve representable interior times such as zero; a convex
+                // combination can introduce cancellation error at those points.
+                start + fraction * span
+            } else {
+                (1.0 - fraction) * start + fraction * stop
+            };
+            result.push(self.apply(b, columns, time, tol)?);
+        }
+        Ok(result)
+    }
 }
 
 /// `expm_multiply` -- the action of the matrix exponential on a vector.
