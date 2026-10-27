@@ -12,7 +12,7 @@
 //! own genuine Radau IIA solver (see `radau.rs`).
 
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
-use crate::step_size::{InitialStepRequest, num_jac, select_initial_step};
+use crate::step_size::{InitialStepRequest, JacobianSparsity, num_jac, select_initial_step};
 use crate::validation::{
     ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
     validate_tol,
@@ -481,6 +481,7 @@ pub struct BdfSolver {
     // Newton solver state. The Jacobian is first taken at (t0, y0) and refreshed at most
     // once per step, when Newton fails on it. `None` uses SciPy's finite-difference num_jac.
     jac_callback: Option<crate::JacFn>,
+    jac_sparsity: Option<JacobianSparsity>,
     current_jac: Option<DMatrix<f64>>,
     /// SciPy's `jac_factor`: the per-column relative difference step `num_jac` carries
     /// from one Jacobian to the next.
@@ -541,8 +542,29 @@ impl BdfSolver {
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
+        Self::new_with_jacobian_sparsity(fun, config, jac_callback, None)
+    }
+
+    /// Create a BDF solver with optional analytic or sparsity-aware numerical Jacobians.
+    ///
+    /// The pattern is ignored when an analytic Jacobian is supplied. Otherwise its
+    /// dimension must match `y0`; disjoint columns share one RHS perturbation call.
+    /// Jacobian refreshes retain both the coloring and the adaptive difference steps.
+    pub fn new_with_jacobian_sparsity<F>(
+        fun: &mut F,
+        config: BdfSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
+        jac_sparsity: Option<&JacobianSparsity>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
         let n = config.y0.len();
         crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
+        let jac_sparsity = jac_sparsity.filter(|_| jac_callback.is_none());
+        if let Some(pattern) = jac_sparsity {
+            pattern.validate_dimension(n)?;
+        }
 
         // Input validation mirrors RkSolver::new (per frankenscipy-ljmg):
         // previously BdfSolver::new did ZERO validation — a caller passing
@@ -620,7 +642,15 @@ impl BdfSolver {
         let mut jac_factor = None;
         let jac = match jac_callback {
             Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
-            None => num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor),
+            None => num_jac(
+                fun,
+                config.t0,
+                &y0,
+                &f0,
+                &atol_vec,
+                &mut jac_factor,
+                jac_sparsity,
+            )?,
         };
         let jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
         let jac_band = if jac_diagonal.is_some() {
@@ -649,6 +679,7 @@ impl BdfSolver {
             mode: config.mode,
             d,
             jac_callback,
+            jac_sparsity: jac_sparsity.cloned(),
             current_jac: Some(jac),
             jac_factor,
             dense: None,
@@ -955,7 +986,9 @@ impl BdfSolver {
                                     &f_pred,
                                     &self.atol,
                                     &mut self.jac_factor,
+                                    self.jac_sparsity.as_ref(),
                                 )
+                                .map_err(StepFailure::InvalidJacobian)?
                             }
                         };
                         self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);

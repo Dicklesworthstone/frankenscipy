@@ -8,6 +8,129 @@ use crate::{IntegrateValidationError, ToleranceValue};
 /// Type alias for the right-hand side function used in step size selection.
 pub type StepRhsFn = dyn FnMut(f64, &[f64]) -> Vec<f64>;
 
+/// A Jacobian's structural nonzeros and a reusable finite-difference coloring.
+///
+/// A missing entry declares that `d f_i / d y_j` is zero for every state, not merely
+/// at the initial state. BDF and Radau perturb columns with disjoint row supports
+/// together, requiring one RHS call per color instead of one per state variable.
+/// The coloring is deterministic and is computed once when this object is built.
+///
+/// This reduces Jacobian evaluation work; the implicit solvers retain their existing
+/// dense/structured Newton factorizations and dense Jacobian storage.
+///
+/// ```
+/// use fsci_integrate::JacobianSparsity;
+///
+/// // A tridiagonal four-component system, listed by row.
+/// let pattern = JacobianSparsity::from_rows(&[
+///     vec![0, 1], vec![0, 1, 2], vec![1, 2, 3], vec![2, 3],
+/// ])?;
+/// assert_eq!(pattern.group_count(), 3);
+/// # Ok::<(), fsci_integrate::IntegrateValidationError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JacobianSparsity {
+    /// Row indices for each column, canonicalized in increasing order.
+    pub(crate) column_rows: Vec<Vec<usize>>,
+    groups: Vec<Vec<usize>>,
+}
+
+impl JacobianSparsity {
+    /// Build an `n × n` pattern from `n` rows of nonzero column indices.
+    ///
+    /// Unsorted indices and duplicates are accepted and canonicalized. Every index
+    /// must be less than the number of rows. Empty rows and columns are valid.
+    pub fn from_rows(rows: &[Vec<usize>]) -> Result<Self, IntegrateValidationError> {
+        let n = rows.len();
+        let mut column_rows = vec![Vec::new(); n];
+        for (i, row) in rows.iter().enumerate() {
+            let mut columns = row.clone();
+            columns.sort_unstable();
+            columns.dedup();
+            for j in columns {
+                if j >= n {
+                    return Err(IntegrateValidationError::InvalidJacobianSparsity {
+                        message: format!("column {j} in row {i} is outside the {n} by {n} pattern"),
+                    });
+                }
+                column_rows[j].push(i);
+            }
+        }
+
+        // Build one independent set of columns at a time. Marking occupied rows
+        // avoids materializing the potentially dense column-intersection graph.
+        let mut remaining: Vec<usize> = (0..n).filter(|&j| !column_rows[j].is_empty()).collect();
+        let mut groups = Vec::new();
+        let mut occupied = vec![false; n];
+        while !remaining.is_empty() {
+            occupied.fill(false);
+            let mut group = Vec::new();
+            remaining.retain(|&j| {
+                if column_rows[j].iter().any(|&i| occupied[i]) {
+                    true
+                } else {
+                    for &i in &column_rows[j] {
+                        occupied[i] = true;
+                    }
+                    group.push(j);
+                    false
+                }
+            });
+            groups.push(group);
+        }
+        Ok(Self {
+            column_rows,
+            groups,
+        })
+    }
+
+    /// Build a pattern from a square boolean mask (`true` means potentially nonzero).
+    pub fn from_dense(mask: &[Vec<bool>]) -> Result<Self, IntegrateValidationError> {
+        let n = mask.len();
+        if mask.iter().any(|row| row.len() != n) {
+            return Err(IntegrateValidationError::InvalidJacobianSparsity {
+                message: format!("the mask must have shape ({n}, {n})"),
+            });
+        }
+        let rows: Vec<Vec<usize>> = mask
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter_map(|(j, &present)| present.then_some(j))
+                    .collect()
+            })
+            .collect();
+        Self::from_rows(&rows)
+    }
+
+    /// Number of state variables in the square pattern.
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.column_rows.len()
+    }
+
+    /// RHS calls for one Jacobian before any roundoff-driven retries.
+    ///
+    /// A structurally zero Jacobian has zero groups and needs no perturbation calls.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub(crate) fn validate_dimension(&self, n: usize) -> Result<(), IntegrateValidationError> {
+        if self.dimension() != n {
+            return Err(IntegrateValidationError::InvalidJacobianSparsity {
+                message: format!(
+                    "pattern dimension {} does not match state dimension {n}",
+                    self.dimension()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// `x^(1/k)` for integer `k >= 1`, computed with IEEE-754 `+ - * /` only.
 ///
 /// Step-size control needs `err^(-1/(order+1))` and `(0.01/d)^(1/(order+1))`.
@@ -269,8 +392,8 @@ fn eps_powers() -> (f64, f64, f64, f64) {
     (seven_eighths, three_quarters, quarter, sqrt_eps)
 }
 
-/// Finite-difference Jacobian of `fun` at `(t, y)`, SciPy's `_ivp.common.num_jac` (dense
-/// path), for the implicit solvers.
+/// Finite-difference Jacobian of `fun` at `(t, y)`, following SciPy's
+/// `_ivp.common.num_jac`, for the implicit solvers.
 ///
 /// `f` is `fun(t, y)`; `threshold` is the solver's `atol` (per component). `factor` is the
 /// per-column relative step SciPy carries between calls as `jac_factor`: `None` starts at
@@ -290,13 +413,21 @@ pub(crate) fn num_jac<F>(
     f: &[f64],
     threshold: &[f64],
     factor: &mut Option<Vec<f64>>,
-) -> nalgebra::DMatrix<f64>
+    sparsity: Option<&JacobianSparsity>,
+) -> Result<nalgebra::DMatrix<f64>, IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
 {
     let n = y.len();
+    validate_rhs_shape(f.len(), n)?;
+    if !f.iter().all(|value| value.is_finite()) {
+        return Err(IntegrateValidationError::NonFiniteJacobian);
+    }
+    if let Some(pattern) = sparsity {
+        pattern.validate_dimension(n)?;
+    }
     if n == 0 {
-        return nalgebra::DMatrix::zeros(0, 0);
+        return Ok(nalgebra::DMatrix::zeros(0, 0));
     }
     let (diff_reject, diff_small, diff_big, sqrt_eps) = eps_powers();
     let min_factor = 1e3 * f64::EPSILON;
@@ -305,6 +436,11 @@ where
     let mut y_scale = vec![0.0; n];
     let mut h = vec![0.0; n];
     for j in 0..n {
+        if sparsity.is_some_and(|pattern| pattern.column_rows[j].is_empty()) {
+            // A structurally zero column needs neither a perturbation nor a scale.
+            h[j] = 1.0;
+            continue;
+        }
         let sign = if f[j] >= 0.0 { 1.0 } else { -1.0 };
         y_scale[j] = sign * threshold[j].max(y[j].abs());
         h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
@@ -312,6 +448,15 @@ where
             fac[j] *= 10.0;
             h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
         }
+        if !h[j].is_finite() {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
+    }
+
+    if let Some(pattern) = sparsity {
+        let jac = grouped_num_jac(fun, t, y, f, &mut h, &mut fac, &y_scale, pattern)?;
+        *factor = Some(fac);
+        return Ok(jac);
     }
 
     // One column: fun at y + h_j e_j, its difference from f, and the row of the largest
@@ -319,7 +464,16 @@ where
     let column = |fun: &mut F, j: usize, hj: f64| {
         let mut yj = y.to_vec();
         yj[j] += hj;
+        // A cancellation retry enlarges the step after the initial h validation.
+        // Reject overflow before exposing a non-finite state to the caller's RHS.
+        if !hj.is_finite() || !yj.iter().all(|value| value.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
         let f_new = fun(t, &yj);
+        validate_rhs_shape(f_new.len(), n)?;
+        if !f_new.iter().all(|value| value.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
         let diff: Vec<f64> = f_new.iter().zip(f).map(|(a, b)| a - b).collect();
         let mut max_ind = 0;
         for i in 1..n {
@@ -329,14 +483,14 @@ where
         }
         let max_diff = diff[max_ind].abs();
         let scale = f[max_ind].abs().max(f_new[max_ind].abs());
-        (diff, max_diff, scale)
+        Ok((diff, max_diff, scale))
     };
 
     let mut diffs = Vec::with_capacity(n);
     let mut max_diff = vec![0.0; n];
     let mut scale = vec![0.0; n];
     for j in 0..n {
-        let (d, md, s) = column(fun, j, h[j]);
+        let (d, md, s) = column(fun, j, h[j])?;
         diffs.push(d);
         max_diff[j] = md;
         scale[j] = s;
@@ -345,7 +499,7 @@ where
         if max_diff[j] < diff_reject * scale[j] {
             let new_factor = 10.0 * fac[j];
             let h_new = (y[j] + new_factor * y_scale[j]) - y[j];
-            let (d, md, s) = column(fun, j, h_new);
+            let (d, md, s) = column(fun, j, h_new)?;
             if max_diff[j] * s < md * scale[j] {
                 fac[j] = new_factor;
                 h[j] = h_new;
@@ -357,6 +511,9 @@ where
     }
 
     let jac = nalgebra::DMatrix::from_fn(n, n, |i, j| diffs[j][i] / h[j]);
+    if !jac.iter().all(|value| value.is_finite()) {
+        return Err(IntegrateValidationError::NonFiniteJacobian);
+    }
     for j in 0..n {
         if max_diff[j] < diff_small * scale[j] {
             fac[j] *= 10.0;
@@ -366,12 +523,319 @@ where
         fac[j] = fac[j].max(min_factor);
     }
     *factor = Some(fac);
-    jac
+    Ok(jac)
+}
+
+/// Sparse finite differences with SciPy's adaptive per-column perturbations. Columns
+/// in one color never affect the same output row, including during retry evaluation.
+fn grouped_num_jac<F>(
+    fun: &mut F,
+    t: f64,
+    y: &[f64],
+    f: &[f64],
+    h: &mut [f64],
+    factor: &mut [f64],
+    y_scale: &[f64],
+    pattern: &JacobianSparsity,
+) -> Result<nalgebra::DMatrix<f64>, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
+{
+    let n = y.len();
+    let (diff_reject, diff_small, diff_big, _) = eps_powers();
+    let mut jac = nalgebra::DMatrix::zeros(n, n);
+    let mut max_diff = vec![0.0_f64; n];
+    let mut scale = vec![0.0; n];
+    let mut perturbed = y.to_vec();
+
+    for group in &pattern.groups {
+        perturbed.copy_from_slice(y);
+        for &j in group {
+            perturbed[j] += h[j];
+        }
+        if !perturbed.iter().all(|value| value.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
+        let f_new = fun(t, &perturbed);
+        validate_rhs_shape(f_new.len(), n)?;
+        if !f_new.iter().all(|value| value.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
+        for &j in group {
+            let mut max_ind = 0;
+            for &i in &pattern.column_rows[j] {
+                let diff = f_new[i] - f[i];
+                jac[(i, j)] = diff;
+                if diff.abs() > max_diff[j] {
+                    max_diff[j] = diff.abs();
+                    max_ind = i;
+                }
+            }
+            scale[j] = f[max_ind].abs().max(f_new[max_ind].abs());
+        }
+
+        // Retry only the columns whose difference was lost to cancellation. Reusing
+        // the color keeps the retry count bounded by the original number of colors.
+        let retry: Vec<(usize, f64)> = group
+            .iter()
+            .copied()
+            .filter(|&j| max_diff[j] < diff_reject * scale[j])
+            .map(|j| (j, (y[j] + (10.0 * factor[j]) * y_scale[j]) - y[j]))
+            .collect();
+        if !retry.is_empty() {
+            perturbed.copy_from_slice(y);
+            for &(j, h_new) in &retry {
+                if !h_new.is_finite() {
+                    return Err(IntegrateValidationError::NonFiniteJacobian);
+                }
+                perturbed[j] += h_new;
+            }
+            if !perturbed.iter().all(|value| value.is_finite()) {
+                return Err(IntegrateValidationError::NonFiniteJacobian);
+            }
+            let f_retry = fun(t, &perturbed);
+            validate_rhs_shape(f_retry.len(), n)?;
+            if !f_retry.iter().all(|value| value.is_finite()) {
+                return Err(IntegrateValidationError::NonFiniteJacobian);
+            }
+            for &(j, h_new) in &retry {
+                let mut retry_max = 0.0_f64;
+                let mut max_ind = 0;
+                for &i in &pattern.column_rows[j] {
+                    let diff = (f_retry[i] - f[i]).abs();
+                    if diff > retry_max {
+                        retry_max = diff;
+                        max_ind = i;
+                    }
+                }
+                let retry_scale = f[max_ind].abs().max(f_retry[max_ind].abs());
+                if max_diff[j] * retry_scale < retry_max * scale[j] {
+                    factor[j] *= 10.0;
+                    h[j] = h_new;
+                    for &i in &pattern.column_rows[j] {
+                        jac[(i, j)] = f_retry[i] - f[i];
+                    }
+                    scale[j] = retry_scale;
+                    max_diff[j] = retry_max;
+                }
+            }
+        }
+
+        for &j in group {
+            for &i in &pattern.column_rows[j] {
+                jac[(i, j)] /= h[j];
+                if !jac[(i, j)].is_finite() {
+                    return Err(IntegrateValidationError::NonFiniteJacobian);
+                }
+            }
+            if max_diff[j] < diff_small * scale[j] {
+                factor[j] *= 10.0;
+            } else if max_diff[j] > diff_big * scale[j] {
+                factor[j] *= 0.1;
+            }
+            factor[j] = factor[j].max(1e3 * f64::EPSILON);
+        }
+    }
+    Ok(jac)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jacobian_sparsity_colors_overlapping_columns_separately() {
+        // Every column touches row zero. Grouping by column number modulo a band
+        // width would silently mix these derivatives; all five colors are needed.
+        let rows = vec![vec![4, 2, 0, 1, 3, 2], vec![1], vec![], vec![0, 3], vec![4]];
+        let pattern = JacobianSparsity::from_rows(&rows).unwrap();
+        assert_eq!(pattern.group_count(), 5);
+        for group in &pattern.groups {
+            let mut seen = vec![false; pattern.dimension()];
+            for &j in group {
+                for &i in &pattern.column_rows[j] {
+                    assert!(!seen[i], "row {i} appears twice in one color");
+                    seen[i] = true;
+                }
+            }
+        }
+        let mut fun = |_t: f64, y: &[f64]| {
+            vec![
+                y[0] + 2.0 * y[1] + 3.0 * y[2] + 4.0 * y[3] + 5.0 * y[4],
+                7.0 * y[1],
+                11.0,
+                y[0] - 2.0 * y[3],
+                -3.0 * y[4],
+            ]
+        };
+        let y = [1.0; 5];
+        let f = fun(0.0, &y);
+        let jac = num_jac(&mut fun, 0.0, &y, &f, &[1e-8; 5], &mut None, Some(&pattern)).unwrap();
+        let expected = [
+            [1.0, 2.0, 3.0, 4.0, 5.0],
+            [0.0, 7.0, 0.0, 0.0, 0.0],
+            [0.0; 5],
+            [1.0, 0.0, 0.0, -2.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, -3.0],
+        ];
+        for i in 0..5 {
+            for j in 0..5 {
+                assert_eq!(jac[(i, j)], expected[i][j], "entry ({i}, {j})");
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_num_jac_reduces_stencil_calls_without_changing_derivatives() {
+        let n = 64_usize;
+        let rows: Vec<Vec<usize>> = (0..n)
+            .map(|i| (i.saturating_sub(1)..=(i + 1).min(n - 1)).collect())
+            .collect();
+        let pattern = JacobianSparsity::from_rows(&rows).unwrap();
+        assert_eq!(pattern.group_count(), 3);
+        let rhs = |y: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| {
+                    let left = if i > 0 { y[i - 1] } else { 0.0 };
+                    let right = if i + 1 < n { y[i + 1] } else { 0.0 };
+                    left - 3.0 * y[i] + right
+                })
+                .collect()
+        };
+        let y: Vec<f64> = (0..n).map(|i| 1.0 + i as f64 / 64.0).collect();
+        let f = rhs(&y);
+        let mut calls = 0;
+        let mut fun = |_t: f64, y: &[f64]| {
+            calls += 1;
+            rhs(y)
+        };
+        let dense = num_jac(&mut fun, 0.0, &y, &f, &vec![1e-9; n], &mut None, None).unwrap();
+        assert_eq!(calls, n);
+        calls = 0;
+        let mut fun = |_t: f64, y: &[f64]| {
+            calls += 1;
+            rhs(y)
+        };
+        let grouped = num_jac(
+            &mut fun,
+            0.0,
+            &y,
+            &f,
+            &vec![1e-9; n],
+            &mut None,
+            Some(&pattern),
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(dense, grouped);
+    }
+
+    #[test]
+    fn grouped_num_jac_preserves_cancellation_retries_and_factor_history() {
+        let pattern = JacobianSparsity::from_rows(&[vec![0], vec![1], vec![2]]).unwrap();
+        // Columns zero and two need a larger difference; column one must keep its
+        // original derivative and step even though it shares their color.
+        let y = [1e-7, 1.0, 1e-7];
+        let rhs = |y: &[f64]| vec![1.0 + y[0], 2.0 + 3.0 * y[1], 4.0 - 2.0 * y[2]];
+        let f = rhs(&y);
+        let mut dense_factor = None;
+        let mut sparse_factor = None;
+        for pass in 0..3 {
+            let dense = num_jac(
+                &mut |_t, y| rhs(y),
+                0.0,
+                &y,
+                &f,
+                &[1e-12; 3],
+                &mut dense_factor,
+                None,
+            )
+            .unwrap();
+            let mut calls = 0;
+            let grouped = num_jac(
+                &mut |_t, y| {
+                    calls += 1;
+                    rhs(y)
+                },
+                0.0,
+                &y,
+                &f,
+                &[1e-12; 3],
+                &mut sparse_factor,
+                Some(&pattern),
+            )
+            .unwrap();
+            assert_eq!(
+                dense_factor, sparse_factor,
+                "adaptive factors on pass {pass}"
+            );
+            assert_eq!(dense, grouped, "Jacobian on pass {pass}");
+            if pass == 0 {
+                assert_eq!(calls, 2, "one color and one grouped cancellation retry");
+                assert!(sparse_factor.as_ref().unwrap()[0] > f64::EPSILON.sqrt());
+            }
+        }
+    }
+
+    #[test]
+    fn jacobian_sparsity_validates_and_canonicalizes_patterns() {
+        assert!(JacobianSparsity::from_rows(&[vec![1]]).is_err());
+        assert!(JacobianSparsity::from_dense(&[vec![true, false]]).is_err());
+        let sparse = JacobianSparsity::from_rows(&[vec![1, 0, 1], vec![]]).unwrap();
+        let dense = JacobianSparsity::from_dense(&[vec![true, true], vec![false, false]]).unwrap();
+        assert_eq!(sparse, dense);
+        assert!(sparse.validate_dimension(3).is_err());
+
+        let zero = JacobianSparsity::from_rows(&vec![vec![]; 3]).unwrap();
+        assert_eq!(zero.group_count(), 0);
+        let jac = num_jac(
+            &mut |_t, _y| panic!("a zero pattern needs no perturbation"),
+            0.0,
+            &[0.0; 3],
+            &[1.0; 3],
+            &[0.0; 3],
+            &mut None,
+            Some(&zero),
+        )
+        .unwrap();
+        assert!(jac.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn numerical_jacobians_reject_malformed_rhs_evaluations() {
+        let pattern = JacobianSparsity::from_rows(&[vec![0], vec![1]]).unwrap();
+        for sparsity in [None, Some(&pattern)] {
+            let result = num_jac(
+                &mut |_t, _y| vec![1.0],
+                0.0,
+                &[1.0; 2],
+                &[1.0; 2],
+                &[1e-6; 2],
+                &mut None,
+                sparsity,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                IntegrateValidationError::RhsWrongShape {
+                    expected: 2,
+                    actual: 1
+                }
+            );
+            let result = num_jac(
+                &mut |_t, _y| vec![f64::NAN; 2],
+                0.0,
+                &[1.0; 2],
+                &[1.0; 2],
+                &[1e-6; 2],
+                &mut None,
+                sparsity,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                IntegrateValidationError::NonFiniteJacobian
+            );
+        }
+    }
 
     #[test]
     fn eps_powers_are_the_exact_values() {

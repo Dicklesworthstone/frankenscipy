@@ -20,7 +20,7 @@
 //! and the `RADAU_HELD_STEP_HITS` / `RADAU_POST_STEP_JAC_REFRESH_HITS` counters for them.
 
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
-use crate::step_size::{InitialStepRequest, num_jac, select_initial_step};
+use crate::step_size::{InitialStepRequest, JacobianSparsity, num_jac, select_initial_step};
 use crate::validation::{
     ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
     validate_tol,
@@ -343,6 +343,7 @@ pub struct RadauSolver {
     y_old: Option<Vec<f64>>,
 
     jac_callback: Option<crate::JacFn>,
+    jac_sparsity: Option<JacobianSparsity>,
     jac: DMatrix<f64>,
     /// SciPy's `jac_factor`, carried by `num_jac` from one Jacobian to the next.
     jac_factor: Option<Vec<f64>>,
@@ -378,8 +379,28 @@ impl RadauSolver {
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
+        Self::new_with_jacobian_sparsity(fun, config, jac_callback, None)
+    }
+
+    /// Create a Radau solver with optional analytic or sparsity-aware numerical Jacobians.
+    ///
+    /// A supplied analytic Jacobian takes precedence over the pattern. Otherwise
+    /// the coloring groups independent finite-difference columns on every refresh.
+    pub fn new_with_jacobian_sparsity<F>(
+        fun: &mut F,
+        config: RadauSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
+        jac_sparsity: Option<&JacobianSparsity>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
         let n = config.y0.len();
         crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
+        let jac_sparsity = jac_sparsity.filter(|_| jac_callback.is_none());
+        if let Some(pattern) = jac_sparsity {
+            pattern.validate_dimension(n)?;
+        }
         let _ = validate_tol(
             ToleranceValue::Scalar(config.rtol),
             config.atol.clone(),
@@ -441,7 +462,15 @@ impl RadauSolver {
         let mut jac_factor = None;
         let jac = match jac_callback {
             Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
-            None => num_jac(fun, config.t0, &y0, &f0, &atol_vec, &mut jac_factor),
+            None => num_jac(
+                fun,
+                config.t0,
+                &y0,
+                &f0,
+                &atol_vec,
+                &mut jac_factor,
+                jac_sparsity,
+            )?,
         };
         let jac_diagonal = diagonal_jacobian_entries(&jac);
 
@@ -467,6 +496,7 @@ impl RadauSolver {
             t_old: None,
             y_old: None,
             jac_callback,
+            jac_sparsity: jac_sparsity.cloned(),
             jac,
             jac_factor,
             jac_diagonal,
@@ -553,7 +583,16 @@ impl RadauSolver {
         self.njev += 1;
         self.jac = match self.jac_callback {
             Some(jac) => evaluate_jacobian(jac, t, y).map_err(StepFailure::InvalidJacobian)?,
-            None => num_jac(fun, t, y, f, &self.atol, &mut self.jac_factor),
+            None => num_jac(
+                fun,
+                t,
+                y,
+                f,
+                &self.atol,
+                &mut self.jac_factor,
+                self.jac_sparsity.as_ref(),
+            )
+            .map_err(StepFailure::InvalidJacobian)?,
         };
         self.jac_diagonal = diagonal_jacobian_entries(&self.jac);
         self.current_jac = true;

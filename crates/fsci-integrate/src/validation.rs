@@ -197,6 +197,9 @@ pub enum IntegrateValidationError {
     JacobianWrongShape {
         expected: usize,
     },
+    InvalidJacobianSparsity {
+        message: String,
+    },
     NonFiniteJacobian,
     NonFiniteEventDirection {
         index: usize,
@@ -256,6 +259,9 @@ impl std::fmt::Display for IntegrateValidationError {
             Self::JacobianWrongShape { expected } => {
                 write!(f, "`jac` must have shape ({expected}, {expected}).")
             }
+            Self::InvalidJacobianSparsity { message } => {
+                write!(f, "invalid `jac_sparsity`: {message}.")
+            }
             Self::NonFiniteJacobian => write!(f, "`jac` must contain only finite values."),
             Self::NonFiniteEventDirection { index } => {
                 write!(f, "event {index} has a non-finite direction.")
@@ -307,6 +313,7 @@ impl IntegrateValidationError {
             Self::NonFiniteF0 => "non_finite_f0",
             Self::RhsWrongShape { .. } => "rhs_wrong_shape",
             Self::JacobianWrongShape { .. } => "jacobian_wrong_shape",
+            Self::InvalidJacobianSparsity { .. } => "invalid_jacobian_sparsity",
             Self::NonFiniteJacobian => "non_finite_jacobian",
             Self::NonFiniteEventDirection { .. } => "event_direction_must_be_finite",
             Self::EventMaxEventsMustBePositive { .. } => "event_max_events_must_be_positive",

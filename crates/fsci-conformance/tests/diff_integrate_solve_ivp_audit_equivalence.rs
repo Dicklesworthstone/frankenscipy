@@ -118,6 +118,7 @@ fn diff_integrate_solve_ivp_audit_equivalence() {
                 max_step: f64::INFINITY,
                 mode: RuntimeMode::Strict,
                 jac: None,
+                jac_sparsity: None,
             };
             let mut f1 = f;
             let mut f2 = f;
@@ -205,6 +206,7 @@ fn diff_integrate_solve_ivp_with_casp_portfolio() {
         max_step: f64::INFINITY,
         mode: RuntimeMode::Strict,
         jac: None,
+        jac_sparsity: None,
     };
 
     // 1. Non-stiff system routes to RK45

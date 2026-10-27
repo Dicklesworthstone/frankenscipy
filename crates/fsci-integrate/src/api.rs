@@ -98,6 +98,11 @@ pub struct SolveIvpOptions<'a> {
     /// validate the square shape and finite entries on each evaluation. The explicit
     /// Runge-Kutta methods ignore it, as SciPy's do (with a warning there).
     pub jac: Option<JacFn>,
+    /// Structural Jacobian nonzeros for grouped finite differences in BDF and Radau.
+    /// Ignored when `jac` is supplied and by other methods. Missing entries declare
+    /// derivatives that are always zero. Newton solves retain their existing dense
+    /// or structured factorization; this option reduces RHS calls for Jacobians.
+    pub jac_sparsity: Option<&'a crate::JacobianSparsity>,
 }
 
 /// Field by field, with `jac` compared by address (`fn_addr_eq`), as [`EventSpec`] compares
@@ -121,6 +126,7 @@ impl PartialEq for SolveIvpOptions<'_> {
             && self.max_step == other.max_step
             && self.mode == other.mode
             && jac_eq
+            && self.jac_sparsity == other.jac_sparsity
     }
 }
 
@@ -139,6 +145,7 @@ impl Default for SolveIvpOptions<'_> {
             max_step: f64::INFINITY,
             mode: RuntimeMode::Strict,
             jac: None,
+            jac_sparsity: None,
         }
     }
 }
@@ -227,8 +234,9 @@ fn validate_events_with_audit(
 /// (presence flag, then `f64s`), `dense_output`, `events` (presence flag, then the count and,
 /// per event, `direction` then `max_events` as presence flag and value), `rtol`, `atol`
 /// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`,
-/// `mode` (`Debug`) and `jac` (presence flag only). The right-hand side, the event functions and
-/// the Jacobian are code, not data, and are not part of it.
+/// `mode` (`Debug`), `jac` (presence flag only), and `jac_sparsity` (presence flag and
+/// canonical column supports). The right-hand side, the event functions and the analytic
+/// Jacobian are code, not data, and are not part of it.
 fn feed_solve_ivp_options(fingerprinter: &mut Fingerprinter, options: &SolveIvpOptions<'_>) {
     fingerprinter
         .f64(options.t_span.0)
@@ -259,7 +267,17 @@ fn feed_solve_ivp_options(fingerprinter: &mut Fingerprinter, options: &SolveIvpO
     fingerprinter
         .f64(options.max_step)
         .str(&format!("{:?}", options.mode))
-        .bool(options.jac.is_some());
+        .bool(options.jac.is_some())
+        .bool(options.jac_sparsity.is_some());
+    if let Some(pattern) = options.jac_sparsity {
+        fingerprinter.usize(pattern.dimension());
+        for rows in &pattern.column_rows {
+            fingerprinter.usize(rows.len());
+            for &row in rows {
+                fingerprinter.usize(row);
+            }
+        }
+    }
 }
 
 fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
@@ -1954,6 +1972,14 @@ where
     if let Some(t_eval) = resolved_options.t_eval {
         validate_t_eval_with_audit(t_eval, t0, tf, audit)?;
     }
+    if matches!(resolved_options.method, SolverKind::Bdf | SolverKind::Radau)
+        && resolved_options.jac.is_none()
+        && let Some(pattern) = resolved_options.jac_sparsity
+        && let Err(error) = pattern.validate_dimension(n)
+    {
+        fail_closed(audit, error.reason_code(), "rejected");
+        return Err(error);
+    }
 
     match resolved_options.method {
         SolverKind::Rk45 | SolverKind::Rk23 | SolverKind::Dop853 => {
@@ -1988,8 +2014,12 @@ where
                 first_step,
                 mode: resolved_options.mode,
             };
-            let solver =
-                crate::radau::RadauSolver::new_with_jacobian(fun, config, resolved_options.jac)?;
+            let solver = crate::radau::RadauSolver::new_with_jacobian_sparsity(
+                fun,
+                config,
+                resolved_options.jac,
+                resolved_options.jac_sparsity,
+            )?;
             solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Bdf => {
@@ -2004,7 +2034,12 @@ where
                 mode: resolved_options.mode,
                 max_order: 5,
             };
-            let solver = BdfSolver::new_with_jacobian(fun, config, resolved_options.jac)?;
+            let solver = BdfSolver::new_with_jacobian_sparsity(
+                fun,
+                config,
+                resolved_options.jac,
+                resolved_options.jac_sparsity,
+            )?;
             solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Lsoda => {
