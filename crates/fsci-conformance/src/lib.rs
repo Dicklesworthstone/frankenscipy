@@ -9826,6 +9826,62 @@ fn compare_fft_case_differential(
     }
 }
 
+fn fft_oracle_case_to_expected(
+    case: &FftCase,
+    oracle_case: &OracleCaseOutput,
+) -> Result<FftExpectedOutcome, String> {
+    if oracle_case.status != "ok" {
+        return Err(format!(
+            "SciPy capture errored for FFT case `{}`: {}",
+            case.case_id(),
+            oracle_case.error.as_deref().unwrap_or("unknown oracle error")
+        ));
+    }
+    match (&case.expected, oracle_case.result_kind.as_str()) {
+        (FftExpectedOutcome::ComplexVector { atol, rtol, .. }, "complex_vector") => {
+            Ok(FftExpectedOutcome::ComplexVector {
+                values: oracle_result_field(&oracle_case.result, "values", case.case_id())?,
+                atol: *atol,
+                rtol: *rtol,
+            })
+        }
+        (FftExpectedOutcome::RealVector { atol, rtol, .. }, "real_vector") => {
+            Ok(FftExpectedOutcome::RealVector {
+                values: oracle_result_field(&oracle_case.result, "values", case.case_id())?,
+                atol: *atol,
+                rtol: *rtol,
+            })
+        }
+        _ => Err(format!(
+            "SciPy capture has unexpected FFT result kind `{}` for `{}`",
+            oracle_case.result_kind,
+            case.case_id()
+        )),
+    }
+}
+
+fn compare_fft_case_against_oracle(
+    case: &FftCase,
+    oracle_case: &OracleCaseOutput,
+    observed: &FftObserved,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    // Hardened rejection is a local policy contract: SciPy may propagate NaN/Inf
+    // instead. Keep these checks, but never count them as numeric oracle evidence.
+    if matches!(case.expected, FftExpectedOutcome::Error { .. }) {
+        return compare_fft_case_differential(case, observed);
+    }
+    match fft_oracle_case_to_expected(case, oracle_case) {
+        Ok(expected) => {
+            let mut captured_case = case.clone();
+            captured_case.expected = expected;
+            let (passed, message, diff, tolerance) =
+                compare_fft_case_differential(&captured_case, observed);
+            (passed, format!("SciPy capture: {message}"), diff, tolerance)
+        }
+        Err(message) => (false, message, None, None),
+    }
+}
+
 pub fn run_integrate_packet(
     config: &HarnessConfig,
     fixture_name: &str,
@@ -14709,13 +14765,10 @@ fn recover_sync_audit_ledger<'a>(
 /// A report is `OracleBacked` only when its runner compared cases against SciPy output
 /// captured in the same run (`ConformanceReport::oracle_compared_cases > 0`); otherwise it
 /// is `SelfCheck`, whatever `oracle_status` says (frankenscipy-olv0j.8).
-/// - Compare against a capture: array_api, interpolate, io, ndimage, stats, constants.
+/// - Compare against a capture: linalg, optimize, special, integrate, sparse, FFT,
+///   array_api, interpolate, io, ndimage, stats, constants.
 /// - Probe availability, then compare the fixture's embedded expected values (self-checks):
-///   validate_tol, linalg, optimize, special, integrate, signal, spatial, cluster, casp, fft.
-/// - Capture, but still compare the fixture's expected values (self-check): sparse.
-///
-/// The linalg packet's live lane is `run_linalg_packet_with_oracle_capture`, not this entry
-/// point.
+///   validate_tol, signal, spatial, cluster, casp.
 pub fn run_differential_test(
     fixture_path: &Path,
     oracle_config: &DifferentialOracleConfig,
@@ -16049,7 +16102,54 @@ fn run_differential_fft(
             source,
         })?;
 
-    let oracle_status = probe_oracle_availability(oracle_config);
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_cases = if let Some(capture) = &oracle_capture {
+        if capture.packet_id != fixture.packet_id || capture.family != fixture.family {
+            return Err(HarnessError::OracleCaptureMismatch {
+                detail: "FFT oracle capture packet or family does not match the fixture".to_owned(),
+            });
+        }
+        let mut cases = std::collections::HashMap::new();
+        for output in &capture.case_outputs {
+            if cases.insert(output.case_id.as_str(), output).is_some() {
+                return Err(HarnessError::OracleCaptureMismatch {
+                    detail: format!("duplicate FFT oracle case `{}`", output.case_id),
+                });
+            }
+        }
+        Some(cases)
+    } else {
+        None
+    };
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
     let mut per_case_results = Vec::with_capacity(fixture.cases.len());
     let audit_ledger = fft_sync_audit_ledger();
 
@@ -16060,7 +16160,20 @@ fn run_differential_fft(
             Some(audit_ledger.as_ref()),
             || {
                 let observed = execute_fft_case_with_differential_audit(case, &audit_ledger);
-                compare_fft_case_differential(case, &observed)
+                match oracle_cases.as_ref() {
+                    Some(cases) => match cases.get(case.case_id()) {
+                        Some(oracle_case) => {
+                            compare_fft_case_against_oracle(case, oracle_case, &observed)
+                        }
+                        None => (
+                            false,
+                            format!("oracle capture missing FFT case `{}`", case.case_id()),
+                            None,
+                            None,
+                        ),
+                    },
+                    None => compare_fft_case_differential(case, &observed),
+                }
             },
         ));
     }
@@ -16076,6 +16189,18 @@ fn run_differential_fft(
         emit_differential_audit_ledger_for_fixture(fixture_path, &fixture.packet_id, &ledger)?;
     }
 
+    let oracle_compared_cases = oracle_cases.as_ref().map_or(0, |cases| {
+        fixture
+            .cases
+            .iter()
+            .filter(|case| {
+                cases
+                    .get(case.case_id())
+                    .is_some_and(|output| fft_oracle_case_to_expected(case, output).is_ok())
+            })
+            .count()
+    });
+
     Ok(ConformanceReport {
         fixture_path: fixture_path.display().to_string(),
         packet_id: fixture.packet_id,
@@ -16084,8 +16209,7 @@ fn run_differential_fft(
         fail_count,
         oracle_status,
         per_case_results,
-        // Probes the oracle, compares against the fixture's expected values.
-        oracle_compared_cases: 0,
+        oracle_compared_cases,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -25004,7 +25128,149 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             "{}",
             serde_json::to_string_pretty(&report).unwrap()
         );
-        assert!(report.pass_count >= 56);
+        assert_eq!(report.pass_count, 93);
+        assert!(
+            !matches!(report.oracle_status, OracleStatus::Failed { .. }),
+            "FFT capture failed: {:?}",
+            report.oracle_status
+        );
+        if report.oracle_status == OracleStatus::Available {
+            assert_eq!(report.oracle_compared_cases, 84);
+        }
+    }
+
+    #[test]
+    fn differential_fft_uses_capture_and_rejects_missing_or_malformed_results() {
+        let root = std::env::temp_dir().join(format!(
+            "fsci-fft-capture-controls-{}",
+            super::now_unix_ms()
+        ));
+        let fixture = serde_json::json!({
+            "packet_id": "FSCI-P2C-005",
+            "family": "fft_core",
+            "cases": [{
+                "case_id": "fft_probe",
+                "category": "differential",
+                "mode": "Strict",
+                "transform": "fftshift",
+                "real_input": [1.0, 2.0],
+                "expected": {
+                    "kind": "real_vector", "values": [999.0, 999.0],
+                    "atol": 1e-12, "rtol": 1e-12
+                }
+            }]
+        });
+        let raw = serde_json::to_string(&fixture).expect("serialize FFT fixture");
+        let script = r#"
+import argparse
+import json
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--fixture')
+parser.add_argument('--output')
+parser.add_argument('--oracle-root')
+args = parser.parse_args()
+fixture = json.loads(Path(args.fixture).read_text())
+case = {'case_id': 'fft_probe', 'status': 'ok', 'result_kind': 'real_vector',
+        'result': {'values': [2.0, 1.0]}, 'error': None}
+if scenario == 'wrong':
+    case['result']['values'][0] += 0.25
+elif scenario == 'error':
+    case.update(status='error', error='oracle computation failed')
+elif scenario == 'malformed':
+    case['result'] = {'values': ['not a number']}
+elif scenario == 'wrong_kind':
+    case['result_kind'] = 'complex_vector'
+cases = [] if scenario == 'missing' else [case]
+if scenario == 'duplicate':
+    cases.append(case)
+payload = {'packet_id': fixture['packet_id'], 'family': fixture['family'],
+           'generated_unix_ms': 0, 'case_outputs': cases}
+Path(args.output).write_text(json.dumps(payload))
+"#;
+        for scenario in [
+            "correct",
+            "wrong",
+            "missing",
+            "error",
+            "malformed",
+            "wrong_kind",
+            "duplicate",
+        ] {
+            let directory = root.join(scenario);
+            fs::create_dir_all(&directory).expect("create FFT control directory");
+            let fixture_path = directory.join("fixture.json");
+            fs::write(&fixture_path, &raw).expect("write FFT fixture");
+            let script_path = directory.join("oracle.py");
+            fs::write(&script_path, format!("scenario = {scenario:?}\n{script}"))
+                .expect("write controlled oracle");
+            let oracle = DifferentialOracleConfig {
+                python_path: super::default_oracle_python(),
+                script_path,
+                timeout_secs: 30,
+                required: true,
+            };
+            let result = super::run_differential_fft(&fixture_path, &raw, &oracle);
+            if scenario == "duplicate" {
+                let error = result.expect_err("duplicate captures must be rejected");
+                assert!(error.to_string().contains("duplicate FFT oracle case"));
+                continue;
+            }
+            let report = result.expect("capture control should produce a report");
+            assert_eq!(report.oracle_status, OracleStatus::Available);
+            assert_eq!(report.pass_count, usize::from(scenario == "correct"));
+            assert_eq!(report.fail_count, usize::from(scenario != "correct"));
+            assert_eq!(
+                report.oracle_compared_cases,
+                usize::from(matches!(scenario, "correct" | "wrong")),
+                "invalid captures cannot supply numerical evidence: {scenario}"
+            );
+            if matches!(scenario, "correct" | "wrong") {
+                let case = &report.per_case_results[0];
+                assert!(case.message.starts_with("SciPy capture:"));
+                assert_eq!(
+                    case.max_diff,
+                    Some(if scenario == "correct" { 0.0 } else { 0.25 })
+                );
+                let tolerance = case.tolerance_used.as_ref().unwrap();
+                assert_eq!(tolerance.atol, 1e-12);
+                assert_eq!(tolerance.rtol, 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn fft_complex_capture_is_compared_componentwise() {
+        let case: super::FftCase = serde_json::from_value(serde_json::json!({
+            "case_id": "complex_probe", "category": "differential", "mode": "Strict",
+            "transform": "fft", "complex_input": [[1.0, 0.0], [0.0, 1.0]],
+            "expected": { "kind": "complex_vector", "values": [[99.0, 99.0]],
+                          "atol": 1e-12, "rtol": 1e-12 }
+        }))
+        .unwrap();
+        let observed = super::execute_fft_case(&case);
+        let mut capture = OracleCaseOutput {
+            case_id: case.case_id.clone(),
+            status: "ok".to_owned(),
+            result_kind: "complex_vector".to_owned(),
+            result: serde_json::json!({"values": [[1.0, 1.0], [1.0, -1.0]]}),
+            error: None,
+        };
+        assert!(super::compare_fft_case_against_oracle(&case, &capture, &observed).0);
+        capture.result["values"][1][1] = serde_json::json!(-0.5);
+        let (passed, _, diff, _) =
+            super::compare_fft_case_against_oracle(&case, &capture, &observed);
+        assert!(!passed, "an imaginary-component mismatch must fail");
+        assert_eq!(diff, Some(0.5));
+        assert!(
+            !super::compare_fft_case_against_oracle(
+                &case,
+                &capture,
+                &super::FftObserved::Error("solver failed".to_owned())
+            )
+            .0,
+            "Rust failure against a numerical SciPy result must fail"
+        );
     }
 
     #[test]

@@ -1,0 +1,77 @@
+name: Numerical regression tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/fsci-opt/**"
+      - "crates/fsci-stats/**"
+      - "crates/fsci-conformance/src/lib.rs"
+      - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
+      - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
+      - ".github/workflows/numerical-regressions.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: -D warnings
+  FSCI_REQUIRE_SCIPY_ORACLE: "1"
+  SCIPY_PYTHON: python
+  FSCI_PYTHON: python
+
+jobs:
+  numerical-regressions:
+    name: "Numerical regressions (${{ matrix.lane }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [least-squares, distribution-fit, fft-capture]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: numerical-regressions
+          cache-on-failure: true
+          workspaces: ". -> target-isolated"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install and verify the numerical oracle
+        run: |
+          python -m pip install "scipy==1.17.1" "numpy==2.4.3"
+          python - <<'PY'
+          import scipy, numpy
+          assert scipy.__version__ == "1.17.1", scipy.__version__
+          assert numpy.__version__ == "2.4.3", numpy.__version__
+          PY
+      - name: Run numerical regression tests
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          case "$LANE" in
+            least-squares)
+              cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
+              ;;
+            distribution-fit)
+              cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
+              ;;
+            fft-capture)
+              cargo test --locked -p fsci-conformance --no-default-features --lib fft -- --nocapture
+              ;;
+            *)
+              echo "Unknown regression lane: $LANE" >&2
+              exit 1
+              ;;
+          esac

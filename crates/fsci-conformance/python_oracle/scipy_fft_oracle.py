@@ -8,23 +8,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 
-def _to_complex_list(arr: Any) -> List[List[float]]:
+def _json_float(value: Any) -> Any:
+    """Keep non-finite SciPy output representable in strict JSON captures."""
+    value = float(value)
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def _to_complex_list(arr: Any) -> List[List[Any]]:
     """Convert numpy array to [[real, imag], ...] format."""
     result = []
     for val in arr.flat:
-        result.append([float(val.real), float(val.imag)])
+        result.append([_json_float(val.real), _json_float(val.imag)])
     return result
 
 
-def _to_real_list(arr: Any) -> List[float]:
+def _to_real_list(arr: Any) -> List[Any]:
     """Convert numpy array to list of floats."""
-    return [float(v) for v in arr.flat]
+    return [_json_float(v) for v in arr.flat]
 
 
 def _coerce_maybe_nan_f64(value: Any) -> float:
@@ -146,14 +157,22 @@ def _run_case(case: Dict[str, Any], fft: Any, np: Any) -> Dict[str, Any]:
             result = fft.rfft(x, n=n, norm=normalization)
         elif transform == "irfft":
             result = fft.irfft(x, n=n, norm=normalization)
-        elif transform == "dct":
-            dct_type = case.get("dct_type", 2)
+        elif transform == "hfft":
+            result = fft.hfft(x, n=n, norm=normalization)
+        elif transform == "ihfft":
+            result = fft.ihfft(x, n=n, norm=normalization)
+        elif transform in ("dct", "dct_i", "dct_iii", "dct_iv"):
+            dct_type = {"dct_i": 1, "dct_iii": 3, "dct_iv": 4}.get(
+                transform, case.get("dct_type", 2)
+            )
             result = fft.dct(x, type=dct_type, norm=normalization)
         elif transform == "idct":
             dct_type = case.get("dct_type", 2)
             result = fft.idct(x, type=dct_type, norm=normalization)
-        elif transform == "dst":
-            dst_type = case.get("dst_type", 2)
+        elif transform in ("dst", "dst_i", "dst_ii", "dst_iii", "dst_iv"):
+            dst_type = {"dst_i": 1, "dst_ii": 2, "dst_iii": 3, "dst_iv": 4}.get(
+                transform, case.get("dst_type", 2)
+            )
             result = fft.dst(x, type=dst_type, norm=normalization)
         elif transform == "idst":
             dst_type = case.get("dst_type", 2)
@@ -196,11 +215,15 @@ def _run_case(case: Dict[str, Any], fft: Any, np: Any) -> Dict[str, Any]:
             result = fft.irfftn(x_nd, s=output_shape, norm=normalization)
         elif transform == "fftfreq":
             n_pts = int(case.get("n_points", len(x)))
-            d = case.get("sample_spacing", 1.0)
+            d = case.get("sample_spacing")
+            if d is None:
+                d = 1.0
             result = fft.fftfreq(n_pts, d=d)
         elif transform == "rfftfreq":
             n_pts = int(case.get("n_points", len(x)))
-            d = case.get("sample_spacing", 1.0)
+            d = case.get("sample_spacing")
+            if d is None:
+                d = 1.0
             result = fft.rfftfreq(n_pts, d=d)
         elif transform == "fftshift":
             result = fft.fftshift(x)
@@ -398,7 +421,9 @@ def main() -> int:
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
+    )
     return 0
 
 
