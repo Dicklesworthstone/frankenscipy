@@ -212,6 +212,8 @@ pub enum IntegrateValidationError {
     },
     TEvalOutOfSpan,
     TEvalNotSorted,
+    /// A requested dense-output evaluation time is NaN or infinite.
+    NonFiniteDenseTime,
     NotYetImplemented {
         function: &'static str,
     },
@@ -274,6 +276,7 @@ impl std::fmt::Display for IntegrateValidationError {
             }
             Self::TEvalOutOfSpan => write!(f, "Values in `t_eval` are not within `t_span`."),
             Self::TEvalNotSorted => write!(f, "Values in `t_eval` are not properly sorted."),
+            Self::NonFiniteDenseTime => write!(f, "Dense-output evaluation times must be finite."),
             Self::NotYetImplemented { function } => {
                 write!(f, "`{function}` is planned but not implemented yet.")
             }
@@ -320,6 +323,7 @@ impl IntegrateValidationError {
             Self::NonFiniteEventValue { .. } => "non_finite_event_value",
             Self::TEvalOutOfSpan => "t_eval_out_of_span",
             Self::TEvalNotSorted => "t_eval_not_sorted",
+            Self::NonFiniteDenseTime => "non_finite_dense_time",
             Self::NotYetImplemented { .. } => "not_yet_implemented",
             Self::QuadInvalidBounds { .. } => "quad_invalid_bounds",
             Self::QuadInvalidTolerance { .. } => "quad_invalid_tolerance",

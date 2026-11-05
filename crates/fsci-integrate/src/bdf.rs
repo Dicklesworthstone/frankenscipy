@@ -447,11 +447,31 @@ pub struct BdfSolverConfig<'a> {
 }
 
 /// SciPy's `BdfDenseOutput(t_old, t, h, order, D[:order + 1])` for one accepted step.
-struct BdfDense {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BdfDense {
     t: f64,
     h: f64,
     order: usize,
     d: Vec<Vec<f64>>,
+}
+
+impl BdfDense {
+    pub(crate) fn at(&self, t: f64) -> Vec<f64> {
+        // SciPy: y = np.dot(D[1:].T, cumprod(x)) + D[0], summed in that order.
+        let mut p = 1.0;
+        let mut y = vec![0.0; self.d[0].len()];
+        for k in 1..=self.order {
+            let i = (k - 1) as f64;
+            p *= (t - (self.t - self.h * i)) / (self.h * (1.0 + i));
+            for (yj, dkj) in y.iter_mut().zip(&self.d[k]) {
+                *yj += dkj * p;
+            }
+        }
+        for (yj, d0j) in y.iter_mut().zip(&self.d[0]) {
+            *yj += d0j;
+        }
+        y
+    }
 }
 
 /// BDF solver for stiff ODE systems.
@@ -734,21 +754,13 @@ impl BdfSolver {
     /// polynomial held in the difference array, `D[0] + Σ_k D[k] · Π_{i<k} (t - t_i)/(h·(i+1))`
     /// with `t_i = t_n - i·h`. `None` before the first accepted step.
     pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
-        let dense = self.dense.as_ref()?;
-        // SciPy: y = np.dot(D[1:].T, cumprod(x)) + D[0], summed in that order.
-        let mut p = 1.0;
-        let mut y = vec![0.0; dense.d[0].len()];
-        for k in 1..=dense.order {
-            let i = (k - 1) as f64;
-            p *= (t - (dense.t - dense.h * i)) / (dense.h * (1.0 + i));
-            for (yj, dkj) in y.iter_mut().zip(&dense.d[k]) {
-                *yj += dkj * p;
-            }
-        }
-        for (yj, d0j) in y.iter_mut().zip(&dense.d[0]) {
-            *yj += d0j;
-        }
-        Some(y)
+        self.dense.as_ref().map(|dense| dense.at(t))
+    }
+
+    /// Retain the accepted step's difference polynomial before the next step
+    /// rescales and overwrites the solver's history.
+    pub(crate) fn dense_output_snapshot(&self) -> Option<BdfDense> {
+        self.dense.clone()
     }
 
     /// Perform one adaptive BDF step.

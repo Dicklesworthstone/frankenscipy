@@ -73,11 +73,141 @@ pub enum SolverKind {
     Lsoda,
 }
 
+/// Piecewise continuous solution retained by `solve_ivp(dense_output = true)`.
+///
+/// Each interval owns its solver's interpolation coefficients. Evaluating the
+/// solution needs neither the original right-hand side nor a live solver.
+/// `knots` and `values` describe the accepted interval endpoints, independently
+/// of `t_eval`; the private interpolation snapshots remain valid if these
+/// public diagnostic vectors are subsequently edited.
+///
+/// # Example
+///
+/// Request a continuous solution, then sample it after integration has finished:
+///
+/// ```
+/// use fsci_integrate::{SolveIvpOptions, ToleranceValue, solve_ivp};
+///
+/// let mut rhs = |_t: f64, y: &[f64]| vec![-y[0]];
+/// let result = solve_ivp(&mut rhs, &SolveIvpOptions {
+///     t_span: (0.0, 2.0),
+///     y0: &[1.0],
+///     dense_output: true,
+///     rtol: 1e-9,
+///     atol: ToleranceValue::Scalar(1e-11),
+///     ..SolveIvpOptions::default()
+/// })?;
+/// let solution = result.sol.expect("dense output was requested");
+/// let state = solution.evaluate(0.75)?;
+/// assert!((state[0] - (-0.75_f64).exp()).abs() < 1e-8);
+/// let states = solution.evaluate_many(&[1.5, 0.25, 1.5])?;
+/// assert_eq!(states[0], states[2]);
+/// # Ok::<(), fsci_integrate::IntegrateValidationError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct OdeSolution {
     pub knots: Vec<f64>,
     pub values: Vec<Vec<f64>>,
+    /// At an interior knot, select the following interval in integration order
+    /// instead of the preceding one. BDF and LSODA use this convention in SciPy.
     pub alt_segment: bool,
+    segments: Vec<DenseSegment>,
+    initial_state: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DenseSegment {
+    start: f64,
+    end: f64,
+    interpolant: DenseInterpolant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DenseInterpolant {
+    Rk(crate::rk::RkDense),
+    Bdf(crate::bdf::BdfDense),
+    Radau(crate::radau::RadauDense),
+    Lsoda(LsodaDense),
+}
+
+impl DenseInterpolant {
+    fn at(&self, t: f64) -> Vec<f64> {
+        match self {
+            Self::Rk(dense) => dense.at(t),
+            Self::Bdf(dense) => dense.at(t),
+            Self::Radau(dense) => dense.at(t),
+            Self::Lsoda(dense) => dense.at(t),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LsodaDense {
+    t: f64,
+    h: f64,
+    coefficients: Vec<Vec<f64>>,
+}
+
+impl LsodaDense {
+    fn at(&self, t: f64) -> Vec<f64> {
+        let x = (t - self.t) / self.h;
+        let mut out = vec![0.0; self.coefficients[0].len()];
+        for (k, column) in self.coefficients.iter().enumerate() {
+            let power = x.powf(k as f64);
+            for (value, &coefficient) in out.iter_mut().zip(column) {
+                *value += coefficient * power;
+            }
+        }
+        out
+    }
+}
+
+impl OdeSolution {
+    /// Evaluate the retained method-specific polynomial at a finite time.
+    ///
+    /// Forward and backward integrations use binary interval lookup. At an
+    /// interior knot, `alt_segment` controls which adjacent polynomial is used.
+    /// As in SciPy, times outside the integrated interval extrapolate the first
+    /// or last polynomial; accuracy outside that interval is not guaranteed.
+    /// A zero-length integration returns the initial state at every finite time.
+    ///
+    /// # Errors
+    /// Returns `NonFiniteDenseTime` for NaN or an infinite query time.
+    pub fn evaluate(&self, t: f64) -> Result<Vec<f64>, IntegrateValidationError> {
+        if !t.is_finite() {
+            return Err(IntegrateValidationError::NonFiniteDenseTime);
+        }
+        let Some(first) = self.segments.first() else {
+            return Ok(self.initial_state.clone());
+        };
+        let forward = first.end > first.start;
+        let index = self
+            .segments
+            .partition_point(|segment| {
+                if forward {
+                    if self.alt_segment {
+                        segment.end <= t
+                    } else {
+                        segment.end < t
+                    }
+                } else if self.alt_segment {
+                    segment.end >= t
+                } else {
+                    segment.end > t
+                }
+            })
+            .min(self.segments.len() - 1);
+        Ok(self.segments[index].interpolant.at(t))
+    }
+
+    /// Evaluate any sequence of finite times, preserving order and duplicates.
+    ///
+    /// Each returned row is one state vector, matching `SolveIvpResult::y`.
+    /// An empty query returns an empty vector. No right-hand-side evaluations
+    /// occur, even when the original solver was DOP853.
+    pub fn evaluate_many(&self, times: &[f64]) -> Result<Vec<Vec<f64>>, IntegrateValidationError> {
+        times.iter().map(|&t| self.evaluate(t)).collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -393,9 +523,7 @@ where
 }
 
 fn is_new_time_point(points: &[f64], candidate: f64) -> bool {
-    points
-        .last()
-        .is_none_or(|&last| (last - candidate).abs() > 1e-14)
+    points.last().is_none_or(|&last| last != candidate)
 }
 
 fn eval_time_in_range(t_eval: f64, t_old: f64, t_new: f64, direction: f64) -> bool {
@@ -470,6 +598,8 @@ trait IvpSolver<F> {
     fn dense_output_at(&self, _t: f64) -> Option<Vec<f64>> {
         None
     }
+    /// Own the current polynomial before the next step mutates solver history.
+    fn dense_output_snapshot(&self) -> Option<DenseInterpolant>;
     fn step_rejections(&self) -> usize {
         0
     }
@@ -527,6 +657,9 @@ where
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
     }
+    fn dense_output_snapshot(&self) -> Option<DenseInterpolant> {
+        self.dense_output_snapshot().map(DenseInterpolant::Rk)
+    }
     fn step_rejections(&self) -> usize {
         self.step_rejections()
     }
@@ -581,6 +714,9 @@ where
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
     }
+    fn dense_output_snapshot(&self) -> Option<DenseInterpolant> {
+        self.dense_output_snapshot().map(DenseInterpolant::Bdf)
+    }
 }
 
 impl<F> IvpSolver<F> for crate::radau::RadauSolver
@@ -622,6 +758,9 @@ where
     }
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
+    }
+    fn dense_output_snapshot(&self) -> Option<DenseInterpolant> {
+        self.dense_output_snapshot().map(DenseInterpolant::Radau)
     }
 }
 
@@ -941,6 +1080,36 @@ impl LsodaSolver {
     }
 }
 
+impl LsodaSolver {
+    fn dense_output_snapshot(&self) -> Option<LsodaDense> {
+        let t_old = self.t_old?;
+        if self.t == t_old {
+            return None;
+        }
+        let order = self.core.nqu();
+        let h = self.core.h();
+        let top_scale = (self.core.nq() < order).then(|| (h / self.core.hu()).powf(order as f64));
+        let coefficients = (0..=order)
+            .map(|k| {
+                let mut column = self.core.yh_column(k).to_vec();
+                if k == order
+                    && let Some(scale) = top_scale
+                {
+                    for value in &mut column {
+                        *value *= scale;
+                    }
+                }
+                column
+            })
+            .collect();
+        Some(LsodaDense {
+            t: self.t,
+            h,
+            coefficients,
+        })
+    }
+}
+
 impl<F> IvpSolver<F> for LsodaSolver
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -981,6 +1150,9 @@ where
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
     }
+    fn dense_output_snapshot(&self) -> Option<DenseInterpolant> {
+        self.dense_output_snapshot().map(DenseInterpolant::Lsoda)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1010,6 +1182,7 @@ where
     // Dense output uses solver-chosen knots even when t_eval is supplied.
     let mut dense_knots = vec![t0];
     let mut dense_values = vec![options.y0.to_vec()];
+    let mut dense_segments = Vec::new();
     let mut next_t_eval_index = 0usize;
 
     let mut t_events: Option<Vec<Vec<f64>>> = options
@@ -1126,6 +1299,16 @@ where
                     break;
                 }
 
+                let dense_interpolant = if options.dense_output && t != t_old {
+                    Some(solver.dense_output_snapshot().ok_or_else(|| {
+                        IntegrateValidationError::IntegrationFailed {
+                            message: String::from("accepted step has no dense-output polynomial"),
+                        }
+                    })?)
+                } else {
+                    None
+                };
+
                 // The step's interpolant, for t_eval samples AND event roots.
                 let interp = |te: f64| {
                     sample_state(
@@ -1191,9 +1374,18 @@ where
                 }
 
                 if let Some((t_ev, y_ev)) = terminal_event {
-                    if is_new_time_point(&dense_knots, t_ev) {
+                    if options.dense_output
+                        && (dense_knots.last() != Some(&t_ev) || dense_segments.is_empty())
+                    {
                         dense_knots.push(t_ev);
                         dense_values.push(y_ev.clone());
+                        if let Some(interpolant) = dense_interpolant {
+                            dense_segments.push(DenseSegment {
+                                start: t_old,
+                                end: t_ev,
+                                interpolant,
+                            });
+                        }
                     }
 
                     if let Some(t_eval) = options.t_eval {
@@ -1215,9 +1407,16 @@ where
                     break;
                 }
 
-                if is_new_time_point(&dense_knots, t) {
+                if options.dense_output && dense_knots.last() != Some(&t) {
                     dense_knots.push(t);
                     dense_values.push(y.clone());
+                    if let Some(interpolant) = dense_interpolant {
+                        dense_segments.push(DenseSegment {
+                            start: t_old,
+                            end: t,
+                            interpolant,
+                        });
+                    }
                 }
 
                 if let Some(t_eval) = options.t_eval {
@@ -1267,10 +1466,12 @@ where
         _ => MSG_FAILED.to_owned(),
     };
 
-    let sol = options.dense_output.then_some(OdeSolution {
+    let sol = options.dense_output.then(|| OdeSolution {
         knots: dense_knots,
         values: dense_values,
         alt_segment: matches!(options.method, SolverKind::Bdf | SolverKind::Lsoda),
+        segments: dense_segments,
+        initial_state: options.y0.to_vec(),
     });
 
     let diag = IvpRunDiagnostics {
@@ -3197,6 +3398,172 @@ mod tests {
             (result.t.last().unwrap() - 1.0).abs() < 1e-6,
             "solver should stop at the second event"
         );
+    }
+
+    #[test]
+    fn retained_dense_output_evaluates_all_methods_in_both_directions() {
+        for method in [
+            SolverKind::Rk23,
+            SolverKind::Rk45,
+            SolverKind::Dop853,
+            SolverKind::Bdf,
+            SolverKind::Radau,
+            SolverKind::Lsoda,
+        ] {
+            for backward in [false, true] {
+                let (t0, tf) = if backward { (2.0, 0.0) } else { (0.0, 2.0) };
+                let y0 = [f64::exp(t0)];
+                let requested = [t0, tf];
+                let result = {
+                    // The returned solution must own its coefficients after both
+                    // this capturing callback and its solver have been dropped.
+                    let rate = 1.0;
+                    let mut rhs = move |_t: f64, y: &[f64]| vec![rate * y[0]];
+                    solve_ivp(
+                        &mut rhs,
+                        &SolveIvpOptions {
+                            t_span: (t0, tf),
+                            y0: &y0,
+                            method,
+                            t_eval: Some(&requested),
+                            dense_output: true,
+                            rtol: 2e-10,
+                            atol: ToleranceValue::Scalar(1e-12),
+                            max_step: 0.15,
+                            ..SolveIvpOptions::default()
+                        },
+                    )
+                    .expect("solve exponential IVP")
+                };
+                assert!(result.success, "{method:?}: {}", result.message);
+                assert_eq!(result.t, requested);
+                let dense = result.sol.expect("retained dense solution");
+                assert_eq!(dense.segments.len() + 1, dense.knots.len());
+                let queries = [1.607, 0.137, 0.873, 0.137, tf, t0];
+                let values = dense.evaluate_many(&queries).unwrap();
+                for (&t, y) in queries.iter().zip(&values) {
+                    assert_eq!(*y, dense.evaluate(t).unwrap());
+                    let expected = t.exp();
+                    assert!(
+                        (y[0] - expected).abs() < 3e-8 * expected,
+                        "{method:?}, backward={backward}, t={t}: {} != {expected}",
+                        y[0]
+                    );
+                }
+                assert_eq!(values[1], values[3]);
+                assert!(dense.evaluate_many(&[]).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_dense_output_rejects_nonfinite_queries_and_handles_zero_span() {
+        for method in [
+            SolverKind::Rk23,
+            SolverKind::Rk45,
+            SolverKind::Dop853,
+            SolverKind::Bdf,
+            SolverKind::Radau,
+            SolverKind::Lsoda,
+        ] {
+            let mut rhs = |_t: f64, y: &[f64]| y.to_vec();
+            let result = solve_ivp(
+                &mut rhs,
+                &SolveIvpOptions {
+                    t_span: (1.0, 1.0),
+                    y0: &[2.0, -3.0],
+                    method,
+                    dense_output: true,
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(result.success, "{method:?}: {}", result.message);
+            let dense = result.sol.unwrap();
+            for t in [-10.0, 1.0, 100.0] {
+                assert_eq!(dense.evaluate(t).unwrap(), vec![2.0, -3.0]);
+            }
+            for t in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(
+                    dense.evaluate(t),
+                    Err(IntegrateValidationError::NonFiniteDenseTime)
+                );
+                assert_eq!(
+                    dense.evaluate_many(&[1.0, t]),
+                    Err(IntegrateValidationError::NonFiniteDenseTime)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_dense_output_selects_the_correct_side_of_a_knot() {
+        for backward in [false, true] {
+            let knots = if backward {
+                vec![2.0, 1.0, 0.0]
+            } else {
+                vec![0.0, 1.0, 2.0]
+            };
+            // Distinct constant pieces make the interval choice observable even
+            // though real IVP polynomials are continuous at their shared knots.
+            let segments = (0..2)
+                .map(|i| DenseSegment {
+                    start: knots[i],
+                    end: knots[i + 1],
+                    interpolant: DenseInterpolant::Lsoda(LsodaDense {
+                        t: knots[i],
+                        h: 1.0,
+                        coefficients: vec![vec![(i + 1) as f64]],
+                    }),
+                })
+                .collect();
+            let mut dense = OdeSolution {
+                knots,
+                values: vec![vec![1.0], vec![1.0], vec![2.0]],
+                alt_segment: false,
+                segments,
+                initial_state: vec![1.0],
+            };
+            assert_eq!(dense.evaluate(1.0).unwrap(), vec![1.0]);
+            dense.alt_segment = true;
+            assert_eq!(dense.evaluate(1.0).unwrap(), vec![2.0]);
+            assert_eq!(
+                dense.evaluate(if backward { 3.0 } else { -1.0 }).unwrap(),
+                vec![1.0]
+            );
+            assert_eq!(
+                dense.evaluate(if backward { -1.0 } else { 3.0 }).unwrap(),
+                vec![2.0]
+            );
+            // Public diagnostics do not own or invalidate the polynomial data.
+            dense.knots.clear();
+            dense.values.clear();
+            assert_eq!(dense.evaluate(1.0).unwrap(), vec![2.0]);
+        }
+    }
+
+    #[test]
+    fn retained_dense_output_preserves_intervals_below_old_knot_tolerance() {
+        let mut rhs = |_t: f64, _y: &[f64]| vec![1e15];
+        let result = solve_ivp(
+            &mut rhs,
+            &SolveIvpOptions {
+                t_span: (0.0, 4e-15),
+                y0: &[0.0],
+                dense_output: true,
+                first_step: Some(1e-15),
+                max_step: 1e-15,
+                ..SolveIvpOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.success);
+        let dense = result.sol.unwrap();
+        assert_eq!(dense.knots.len(), 5);
+        assert_eq!(result.t, dense.knots);
+        for t in [0.5e-15, 1.5e-15, 2.5e-15, 3.5e-15] {
+            assert!((dense.evaluate(t).unwrap()[0] - t * 1e15).abs() < 1e-13);
+        }
     }
 
     #[test]

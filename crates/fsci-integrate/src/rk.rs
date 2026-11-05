@@ -703,9 +703,80 @@ pub struct RkSolverConfig<'a> {
     pub tableau: &'static ButcherTableau,
 }
 
+/// An owned interpolation polynomial for one accepted step. This retains only
+/// the dense coefficients, not a solver or an ODE callback.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RkDense {
+    t_old: f64,
+    h: f64,
+    y_old: Vec<f64>,
+    coefficients: RkDenseCoefficients,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RkDenseCoefficients {
+    /// Rows of Q = Kᵀ P, with one row per state component.
+    Power(Vec<Vec<f64>>),
+    /// DOP853's seven nested interpolation vectors.
+    Dop853(Vec<Vec<f64>>),
+}
+
+impl RkDense {
+    pub(crate) fn at(&self, t: f64) -> Vec<f64> {
+        if self.h == 0.0 {
+            return self.y_old.clone();
+        }
+        let x = (t - self.t_old) / self.h;
+        match &self.coefficients {
+            RkDenseCoefficients::Power(q) => q
+                .iter()
+                .zip(&self.y_old)
+                .map(|(row, &y0)| {
+                    let mut power = 1.0;
+                    let mut value = 0.0;
+                    for &coefficient in row {
+                        power *= x;
+                        value += coefficient * power;
+                    }
+                    self.h * value + y0
+                })
+                .collect(),
+            RkDenseCoefficients::Dop853(rows) => dop853_dense_at(rows, &self.y_old, x),
+        }
+    }
+}
+
+fn rk_dense_coefficients<const M: usize>(k: &[Vec<f64>], p: &[[f64; M]]) -> Vec<Vec<f64>> {
+    (0..k[0].len())
+        .map(|i| {
+            (0..M)
+                .map(|j| {
+                    p.iter()
+                        .enumerate()
+                        .fold(0.0, |acc, (s, row)| acc + k[s][i] * row[j])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn dop853_dense_at(rows: &[Vec<f64>], y_old: &[f64], x: f64) -> Vec<f64> {
+    let mut y = vec![0.0; y_old.len()];
+    for (i, row) in rows.iter().rev().enumerate() {
+        let factor = if i % 2 == 0 { x } else { 1.0 - x };
+        for (yj, fj) in y.iter_mut().zip(row) {
+            *yj = (*yj + fj) * factor;
+        }
+    }
+    for (yj, y0) in y.iter_mut().zip(y_old) {
+        *yj += y0;
+    }
+    y
+}
+
 /// An explicit Runge-Kutta ODE solver with adaptive step-size control.
 ///
-/// Supports RK45 (Dormand-Prince) and RK23 (Bogacki-Shampine) via
+/// Supports RK45 (Dormand-Prince), RK23 (Bogacki-Shampine), and DOP853 via
 /// interchangeable Butcher tableaux.
 pub struct RkSolver {
     mode: RuntimeMode,
@@ -1164,20 +1235,30 @@ impl RkSolver {
             // SciPy's Dop853DenseOutput: for i, f in enumerate(reversed(F)):
             // y += f; y *= x if i is even else (1 - x); then y += y_old.
             let rows = self.dop853_dense.as_ref()?;
-            let mut y = vec![0.0; y_old.len()];
-            for (i, row) in rows.iter().rev().enumerate() {
-                let factor = if i % 2 == 0 { x } else { 1.0 - x };
-                for (yj, fj) in y.iter_mut().zip(row) {
-                    *yj = (*yj + fj) * factor;
-                }
-            }
-            for (yj, y0) in y.iter_mut().zip(y_old) {
-                *yj += y0;
-            }
-            Some(y)
+            Some(dop853_dense_at(rows, y_old, x))
         } else {
             None
         }
+    }
+
+    pub(crate) fn dense_output_snapshot(&self) -> Option<RkDense> {
+        let t_old = self.t_old?;
+        let y_old = self.y_old.clone()?;
+        let coefficients = if std::ptr::eq(self.tableau, &RK45_TABLEAU) {
+            RkDenseCoefficients::Power(rk_dense_coefficients(&self.k, &RK45_P))
+        } else if std::ptr::eq(self.tableau, &RK23_TABLEAU) {
+            RkDenseCoefficients::Power(rk_dense_coefficients(&self.k, &RK23_P))
+        } else if std::ptr::eq(self.tableau, &DOP853_TABLEAU) {
+            RkDenseCoefficients::Dop853(self.dop853_dense.clone()?)
+        } else {
+            return None;
+        };
+        Some(RkDense {
+            t_old,
+            h: self.t - t_old,
+            y_old,
+            coefficients,
+        })
     }
 
     /// SciPy's `solver.dense_output()` for the last step, where building it costs

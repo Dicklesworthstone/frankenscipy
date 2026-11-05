@@ -236,7 +236,8 @@ impl NewtonFactors {
 
 /// SciPy's `RadauDenseOutput(t_old, t, y_old, Q)` with `Q = Z.T @ P`: the collocation
 /// polynomial `y_old + Q · (x, x², x³)`, `x = (t - t_old) / (t_new - t_old)`.
-struct RadauDense {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RadauDense {
     t_old: f64,
     t: f64,
     y_old: Vec<f64>,
@@ -244,7 +245,7 @@ struct RadauDense {
 }
 
 impl RadauDense {
-    fn at(&self, s: f64) -> Vec<f64> {
+    pub(crate) fn at(&self, s: f64) -> Vec<f64> {
         let x = (s - self.t_old) / (self.t - self.t_old);
         let p = [x, x * x, x * x * x];
         self.q
@@ -540,6 +541,10 @@ impl RadauSolver {
     /// SciPy's dense output for the last accepted step at `t`; `None` before the first.
     pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.sol.as_ref().map(|sol| sol.at(t))
+    }
+
+    pub(crate) fn dense_output_snapshot(&self) -> Option<RadauDense> {
+        self.sol.clone()
     }
 
     pub fn step_with<F>(&mut self, fun: &mut F) -> Result<StepOutcome, StepFailure>
