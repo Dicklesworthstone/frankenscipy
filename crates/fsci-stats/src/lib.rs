@@ -21146,211 +21146,337 @@ impl TruncNormal {
         Self { a, b }
     }
 
-    /// `Φ(b) − Φ(a)`, the renormalising mass — computed on whichever tail keeps
-    /// the subtraction small.
-    ///
-    /// Written literally, that difference is exactly ZERO for `a = 30, b = 40`,
-    /// because both operands round to 1.0. Every method here divides by it, so the
-    /// whole distribution collapsed: `pdf` was identically 0 across its entire
-    /// support where `scipy.stats.truncnorm.pdf(30.5, 30, 40)` is 8.107714e-06.
-    /// The survival-side form `S(a) − S(b)` gives 4.906713927147908e-198 for the
-    /// same interval. It is not only an extreme-case problem — on `[5, 10]` the
-    /// two forms already disagree in the 10th significant digit.
-    ///
-    /// [`interval_probability`] makes that choice; this is a thin alias so the
-    /// seven call sites below cannot drift apart again. frankenscipy-45de1.
-    fn mass(&self) -> f64 {
-        interval_probability(&Normal::standard(), self.a, self.b)
+    /// Log Q(x)/phi(x), without either underflowing normal quantity.
+    fn log_mills(x: f64) -> f64 {
+        if x > 1.0e8 {
+            // The first omitted relative term, 1/x², is below machine epsilon.
+            -x.ln()
+        } else {
+            0.5 * (PI / 2.0).ln()
+                + fsci_special::erfcx_scalar(x * FRAC_1_SQRT_2).ln()
+        }
+    }
+
+    /// Integral of exp(-a*t-t²/2) over [0, width], for a >= 0.
+    /// Taking the width separately also retains offsets smaller than an ULP
+    /// of a when a quantile is computed in local coordinates.
+    fn positive_log_mass(a: f64, width: f64) -> f64 {
+        if width <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        let drop = width * (a + 0.5 * width);
+        if drop <= 1.0 {
+            // A difference of Mills ratios would cancel here. The integrand
+            // on [0, 1] varies by at most e, so GL16 resolves it directly.
+            return width.ln() + Self::local_integrals(a, width, 0.0, 1.0)[0].ln();
+        }
+        let left = Self::log_mills(a);
+        if width == f64::INFINITY {
+            return left;
+        }
+        let log_ratio = -drop + Self::log_mills(a + width) - left;
+        left + (-log_ratio.exp()).ln_1p()
+    }
+
+    /// Log interval mass relative to phi at the interval's mode. Factoring
+    /// that density out avoids underflow even when both bounds exceed 40.
+    fn relative_log_mass(a: f64, b: f64) -> f64 {
+        if b <= 0.0 {
+            return Self::positive_log_mass(-b, b - a);
+        }
+        if a < 0.0 {
+            // The erf terms add, including for very narrow central intervals.
+            return 0.5 * (PI / 2.0).ln()
+                + (fsci_special::erf_scalar(b * FRAC_1_SQRT_2)
+                    + fsci_special::erf_scalar(-a * FRAC_1_SQRT_2))
+                .ln();
+        }
+        Self::positive_log_mass(a, b - a)
+    }
+
+    fn log_interval_ratio(&self, lower: f64, upper: f64, log_mass: f64) -> f64 {
+        let mode = 0.0_f64.clamp(self.a, self.b);
+        let part_mode = 0.0_f64.clamp(lower, upper);
+        Self::relative_log_mass(lower, upper) - log_mass
+            - (part_mode - mode) * (0.5 * part_mode + 0.5 * mode)
+    }
+
+    fn log_probability_pair(&self, x: f64) -> (f64, f64) {
+        if x.is_nan() {
+            return (f64::NAN, f64::NAN);
+        }
+        if x <= self.a {
+            return (f64::NEG_INFINITY, 0.0);
+        }
+        if x >= self.b {
+            return (0.0, f64::NEG_INFINITY);
+        }
+        let log_mass = Self::relative_log_mass(self.a, self.b);
+        let lower = self.log_interval_ratio(self.a, x, log_mass).min(0.0);
+        let upper = self.log_interval_ratio(x, self.b, log_mass).min(0.0);
+        // Keep the smaller probability directly and derive its complement
+        // with log1p. This preserves tiny tails and makes CDF + SF close.
+        if lower < upper {
+            (lower, (-lower.exp()).ln_1p())
+        } else {
+            ((-upper.exp()).ln_1p(), upper)
+        }
+    }
+
+    /// Integrals of t^k exp(-origin*scale*t-(scale*t)²/2), k=0..4.
+    /// GL16 panels of width at most two resolve the smooth scaled density.
+    fn local_integrals(origin: f64, scale: f64, lower: f64, upper: f64) -> [f64; 5] {
+        const NODES_WEIGHTS: [(f64, f64); 8] = [
+            (0.095_012_509_837_637_44, 0.189_450_610_455_068_5),
+            (0.281_603_550_779_258_9, 0.182_603_415_044_923_6),
+            (0.458_016_777_657_227_4, 0.169_156_519_395_002_54),
+            (0.617_876_244_402_643_8, 0.149_595_988_816_576_73),
+            (0.755_404_408_355_003, 0.124_628_971_255_533_87),
+            (0.865_631_202_387_831_8, 0.095_158_511_682_492_79),
+            (0.944_575_023_073_232_6, 0.062_253_523_938_647_894),
+            (0.989_400_934_991_649_9, 0.027_152_459_411_754_095),
+        ];
+        let panels = ((upper - lower) / 2.0).ceil().max(1.0) as usize;
+        let step = (upper - lower) / panels as f64;
+        let half = 0.5 * step;
+        let mut sums = [0.0; 5];
+        let mut corrections = [0.0; 5];
+        for panel in 0..panels {
+            let middle = lower + (panel as f64 + 0.5) * step;
+            for (node, weight) in NODES_WEIGHTS {
+                for t in [middle - half * node, middle + half * node] {
+                    let offset = scale * t;
+                    let mut value = half * weight
+                        * (-(origin * scale) * t - 0.5 * offset * offset).exp();
+                    for k in 0..5 {
+                        let term = value - corrections[k];
+                        let next = sums[k] + term;
+                        corrections[k] = (next - sums[k]) - term;
+                        sums[k] = next;
+                        value *= t;
+                    }
+                }
+            }
+        }
+        sums
+    }
+
+    /// Invert either tail on a positive interval in a coordinate whose
+    /// characteristic width is O(1). No normal CDF is added to a tiny mass.
+    fn positive_quantile(a: f64, b: f64, q: f64, survival: bool) -> f64 {
+        if q <= 0.0 {
+            return if survival { b } else { a };
+        }
+        if q >= 1.0 {
+            return if survival { a } else { b };
+        }
+        if q > 0.5 {
+            return Self::positive_quantile(a, b, 1.0 - q, !survival);
+        }
+        let width = b - a;
+        let scale = (1.0 / a.max(1.0)).min(width);
+        let log_mass = Self::positive_log_mass(a, width);
+        let t = if survival {
+            let log_q = q.ln();
+            // SF(a+offset) <= exp(-a*offset-offset²/2). The rationalized
+            // root bounds the quantile even when a is extremely large.
+            let limit = -log_q
+                / (0.5 * a.hypot((-2.0 * log_q).sqrt()) + 0.5 * a);
+            let mut lower = 0.0;
+            let mut upper = limit.min(width) / scale;
+            for _ in 0..80 {
+                let middle = 0.5 * (lower + upper);
+                if middle == lower || middle == upper {
+                    break;
+                }
+                let offset = scale * middle;
+                let log_sf = Self::positive_log_mass(a + offset, width - offset)
+                    - log_mass
+                    - (a * scale) * middle
+                    - 0.5 * offset * offset;
+                if log_sf > log_q {
+                    lower = middle;
+                } else {
+                    upper = middle;
+                }
+            }
+            0.5 * (lower + upper)
+        } else {
+            let target = q * (log_mass - scale.ln()).exp();
+            let mut t = target;
+            // The density decreases, so the tangent at zero starts below
+            // the root. Newton's tangents then increase to it without an
+            // overshoot; for q <= 1/2 the root stays below one in this scale.
+            for _ in 0..16 {
+                let offset = scale * t;
+                let integral = Self::local_integrals(a, offset, 0.0, 1.0)[0];
+                let density = (-(a * scale) * t - 0.5 * offset * offset).exp();
+                let next = t - (t * integral - target) / density;
+                if next == t || !next.is_finite() || next < 0.0 {
+                    break;
+                }
+                t = next;
+            }
+            t
+        };
+        scale.mul_add(t, a).clamp(a, b)
+    }
+
+    fn lower_quantile(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.a;
+        }
+        if q == 1.0 {
+            return self.b;
+        }
+        if q > 0.5 {
+            let reflected = Self { a: -self.b, b: -self.a };
+            return -reflected.lower_quantile(1.0 - q);
+        }
+        if self.a >= 0.0 {
+            return Self::positive_quantile(self.a, self.b, q, false);
+        }
+        if self.b <= 0.0 {
+            return -Self::positive_quantile(-self.b, -self.a, q, true);
+        }
+        // Split a central interval at its mode. Each conditional component
+        // is a positive truncated normal, reflected for its negative half.
+        let left = fsci_special::erf_scalar(-self.a * FRAC_1_SQRT_2);
+        let right = fsci_special::erf_scalar(self.b * FRAC_1_SQRT_2);
+        let left_weight = left / (left + right);
+        if q <= left_weight {
+            -Self::positive_quantile(0.0, -self.a, q / left_weight, true)
+        } else {
+            let right_weight = right / (left + right);
+            Self::positive_quantile(0.0, self.b, (q - left_weight) / right_weight, false)
+        }
+    }
+
+    /// Mean, variance, skewness, excess kurtosis and entropy. Raw moments
+    /// cancel on narrow intervals and in the tails; local moments do not.
+    fn moment_summary(&self) -> [f64; 5] {
+        if self.b - self.a < 1.0 || self.a > 2.0 || self.b < -2.0 {
+            let (a, b, sign) = if self.b < 0.0 {
+                (-self.b, -self.a, -1.0)
+            } else {
+                (self.a, self.b, 1.0)
+            };
+            let origin = a.max(0.0);
+            let scale = (1.0 / origin.max(1.0)).min(b - a);
+            // Omitted density is below exp(-64); even its fourth-moment
+            // tail is below 3e-21. This cutoff scales with the local width.
+            let cutoff = 64.0 / (0.5 * origin.hypot(128.0_f64.sqrt()) + 0.5 * origin)
+                / scale;
+            let lower = ((a - origin) / scale).max(-cutoff);
+            let upper = ((b - origin) / scale).min(cutoff);
+            let integrals = Self::local_integrals(origin, scale, lower, upper);
+            let m1 = integrals[1] / integrals[0];
+            let m2 = integrals[2] / integrals[0];
+            let m3 = integrals[3] / integrals[0];
+            let m4 = integrals[4] / integrals[0];
+            let variance = m2 - m1 * m1;
+            let central3 = m3 + m1 * (2.0 * m1 * m1 - 3.0 * m2);
+            let central4 = m4 + m1 * (-4.0 * m3 + 3.0 * m1 * (2.0 * m2 - m1 * m1));
+            return [
+                sign * scale.mul_add(m1, origin),
+                scale * scale * variance,
+                sign * central3 / variance.powf(1.5),
+                central4 / (variance * variance) - 3.0,
+                scale.ln() + integrals[0].ln() + (origin * scale) * m1
+                    + 0.5 * scale * scale * m2,
+            ];
+        }
+
+        let p_a = self.pdf(self.a);
+        let p_b = self.pdf(self.b);
+        // A zero boundary density contributes zero, including at infinity
+        // and at finite endpoints whose powers would overflow.
+        let boundary = |x: f64, p: f64, power: i32| {
+            if p == 0.0 { 0.0 } else { x.powi(power) * p }
+        };
+        let mean = p_a - p_b;
+        let m2 = 1.0 + boundary(self.a, p_a, 1) - boundary(self.b, p_b, 1);
+        let variance = 1.0 + boundary(self.a - mean, p_a, 1)
+            - boundary(self.b - mean, p_b, 1);
+        let m3 = 2.0 * mean + boundary(self.a, p_a, 2) - boundary(self.b, p_b, 2);
+        let m4 = 3.0 * m2 + boundary(self.a, p_a, 3) - boundary(self.b, p_b, 3);
+        let central3 = m3 + mean * (2.0 * mean * mean - 3.0 * m2);
+        let central4 = m4 + mean * (-4.0 * m3 + 3.0 * mean * (2.0 * m2 - mean * mean));
+        let mode = 0.0_f64.clamp(self.a, self.b);
+        [
+            mean,
+            variance,
+            central3 / variance.powf(1.5),
+            central4 / (variance * variance) - 3.0,
+            Self::relative_log_mass(self.a, self.b) + 0.5 * (m2 - mode * mode),
+        ]
     }
 }
 
 impl ContinuousDistribution for TruncNormal {
-    // erf/ndtr-class cdf (~25-50ns): intermediate cost, pessimized ~3-4x@4096 under the
-    // default 2048 gate (break-even ~45-70k). Moderate gate -> parallel only at ~65k+.
     fn cdf_sf_par_min(&self) -> usize {
         32768
     }
 
     fn pdf(&self, x: f64) -> f64 {
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
         if x < self.a || x > self.b {
-            return 0.0;
+            return f64::NEG_INFINITY;
         }
-        let phi_x = (-x * x / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = self.mass();
-        if norm > 0.0 { phi_x / norm } else { 0.0 }
+        let mode = 0.0_f64.clamp(self.a, self.b);
+        -Self::relative_log_mass(self.a, self.b)
+            - (x - mode) * (0.5 * x + 0.5 * mode)
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        if x <= self.a {
-            return 0.0;
-        }
-        if x >= self.b {
-            return 1.0;
-        }
-        // BOTH the numerator and the denominator are interval masses, and both
-        // cancel for the same reason, so both go through the tail choice.
-        let norm = self.mass();
-        if norm > 0.0 {
-            (interval_probability(&Normal::standard(), self.a, x) / norm).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
+        self.logcdf(x).exp()
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        self.log_probability_pair(x).0
     }
 
     fn sf(&self, x: f64) -> f64 {
-        if x <= self.a {
-            return 1.0;
-        }
-        if x >= self.b {
-            return 0.0;
-        }
-        // Its own interval mass, NOT 1 − cdf. Previously there was no `sf` here at
-        // all, so the trait default subtracted — and the upper part of the interval
-        // is exactly where that has already lost its digits.
-        // scipy.stats.truncnorm.sf(32, 30, 40) = 1.08655699900926376e-34.
-        let norm = self.mass();
-        if norm > 0.0 {
-            (interval_probability(&Normal::standard(), x, self.b) / norm).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
+        self.logsf(x).exp()
     }
 
-    /// The quantile, kept inside the support.
-    ///
-    /// The trait default returns `-inf` at `q = 0` and `+inf` at `q = 1`, which is right
-    /// for a distribution on the whole line and wrong for a truncated one: the support
-    /// IS `[a, b]`, so those are the two quantiles that are known exactly.
-    /// `scipy.stats.truncnorm.ppf(0, 30, 40)` is 30 and `ppf(1, 30, 40)` is 40.
-    ///
-    /// The interior is left to the default bisection, which is sound here because `cdf`
-    /// now goes through the tail-choosing interval mass. Its result is clamped for the
-    /// same reason `Truncated::quantile` clamps: on `[30, 40]` the bracketing anchors
-    /// are built from `mean` and `std`, both of which are computed from quantities that
-    /// underflow, so the search can step outside a support it should never leave.
+    fn logsf(&self, x: f64) -> f64 {
+        self.log_probability_pair(x).1
+    }
+
     fn ppf(&self, q: f64) -> f64 {
-        if !(0.0..=1.0).contains(&q) {
-            return f64::NAN;
-        }
-        if q == 0.0 {
-            return self.a;
-        }
-        if q == 1.0 {
-            return self.b;
-        }
-        let x = ppf_bisection(|x| self.cdf(x), q, self.mean(), self.std());
-        x.clamp(self.a, self.b)
+        self.lower_quantile(q)
     }
 
-    /// Inverse survival function, with the same endpoints reflected.
-    ///
-    /// `isf(0)` is the upper bound and `isf(1)` the lower — the mirror of `ppf`. Left to
-    /// the trait default these are `+inf` and `-inf`, and fixing only `ppf` would leave
-    /// the two functions disagreeing about where the distribution lives.
-    ///
-    /// The interior keeps the trait's own tail discipline rather than reinventing it:
-    /// `1 - q` is used only while it is representable, and below that the accurate `sf`
-    /// is inverted directly. Routing everything through `ppf(1 - q)` would reintroduce
-    /// precisely the underflow the default was written to avoid — for `q` under about
-    /// 1.1e-16, `1 - q` rounds to 1.0 and the answer collapses to the upper bound.
     fn isf(&self, q: f64) -> f64 {
-        if !(0.0..=1.0).contains(&q) {
-            return f64::NAN;
-        }
-        if q == 0.0 {
-            return self.b;
-        }
-        if q == 1.0 {
-            return self.a;
-        }
-        let p = 1.0 - q;
-        let x = if p < 1.0 {
-            ppf_bisection(|x| self.cdf(x), p, self.mean(), self.std())
-        } else {
-            isf_bisection(|x| self.sf(x), q, self.mean(), self.std())
-        };
-        x.clamp(self.a, self.b)
+        let reflected = Self { a: -self.b, b: -self.a };
+        -reflected.lower_quantile(q)
     }
 
     fn mean(&self) -> f64 {
-        let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
-        let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = self.mass();
-        if norm > 0.0 {
-            (phi_a - phi_b) / norm
-        } else {
-            (self.a + self.b) / 2.0
-        }
+        self.moment_summary()[0]
     }
 
     fn var(&self) -> f64 {
-        let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
-        let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = self.mass();
-        if norm <= 0.0 {
-            return 0.0;
-        }
-        let z = norm;
-        1.0 + (self.a * phi_a - self.b * phi_b) / z - ((phi_a - phi_b) / z).powi(2)
-    }
-
-    fn entropy(&self) -> f64 {
-        // h(TruncNormal(a, b)) = ln(√(2πe) · Δ)
-        //                      + (a·φ(a) − b·φ(b)) / (2 Δ),
-        // where Δ = Φ(b) − Φ(a). (Standard normal truncation.)
-        let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
-        let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let delta = self.mass();
-        if delta <= 0.0 {
-            return f64::NAN;
-        }
-        ((2.0 * PI * std::f64::consts::E).sqrt() * delta).ln()
-            + (self.a * phi_a - self.b * phi_b) / (2.0 * delta)
+        self.moment_summary()[1]
     }
 
     fn skewness(&self) -> f64 {
-        // Raw moments of the standard truncated normal follow the
-        // integration-by-parts recurrence m_k = (a^{k−1}φ(a) −
-        // b^{k−1}φ(b))/Δ + (k−1) m_{k−2} with m_0 = 1.
-        let (a, b) = (self.a, self.b);
-        let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
-        let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = self.mass();
-        if z <= 0.0 {
-            return f64::NAN;
-        }
-        let m1 = (phi_a - phi_b) / z;
-        let m2 = (a * phi_a - b * phi_b) / z + 1.0;
-        let m3 = 2.0_f64.mul_add(m1, (a * a * phi_a - b * b * phi_b) / z);
-        let var = m2 - m1 * m1;
-        if var <= 0.0 {
-            return f64::NAN;
-        }
-        let mu3 = 2.0_f64.mul_add(m1.powi(3), m3 - 3.0 * m1 * m2);
-        mu3 / var.powf(1.5)
+        self.moment_summary()[2]
     }
 
     fn kurtosis(&self) -> f64 {
-        let (a, b) = (self.a, self.b);
-        let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
-        let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = self.mass();
-        if z <= 0.0 {
-            return f64::NAN;
-        }
-        let m1 = (phi_a - phi_b) / z;
-        let m2 = (a * phi_a - b * phi_b) / z + 1.0;
-        let m3 = 2.0_f64.mul_add(m1, (a * a * phi_a - b * b * phi_b) / z);
-        let m4 = 3.0_f64.mul_add(m2, (a.powi(3) * phi_a - b.powi(3) * phi_b) / z);
-        let var = m2 - m1 * m1;
-        if var <= 0.0 {
-            return f64::NAN;
-        }
-        let mu4 = (-3.0_f64).mul_add(
-            m1.powi(4),
-            6.0_f64.mul_add(m1 * m1 * m2, 4.0_f64.mul_add(-m1 * m3, m4)),
-        );
-        mu4 / (var * var) - 3.0
+        self.moment_summary()[3]
+    }
+
+    fn entropy(&self) -> f64 {
+        self.moment_summary()[4]
     }
 }
 
@@ -116769,6 +116895,184 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
             "the survival-side mass is the one scipy agrees with, got {kept:e}"
         );
     }
+    fn moment_values(d: &TruncNormal) -> [f64; 5] {
+        [d.mean(), d.var(), d.skewness(), d.kurtosis(), d.entropy()]
+    }
+
+    #[test]
+    fn far_tail_moments_survive_an_underflowing_normal_mass() {
+        assert_eq!((-0.5_f64 * 40.0 * 40.0).exp(), 0.0);
+        // Independent high-precision integration of the centered density.
+        // SciPy's raw-moment recurrence loses accuracy here and its entropy
+        // is NaN, so those outputs cannot serve as the extreme-tail oracle.
+        let expected = [
+            40.024_968_847_207_26,
+            0.000_622_668_378_591_387_5,
+            1.996_276_707_943_13,
+            5.970_273_558_530_36,
+            -2.690_126_536_403_842,
+        ];
+        for (a, b, sign) in [(40.0, 41.0, 1.0), (-41.0, -40.0, -1.0)] {
+            let d = TruncNormal::new(a, b);
+            let actual = moment_values(&d);
+            for (i, (&got, &reference)) in actual.iter().zip(&expected).enumerate() {
+                let want = if i == 0 || i == 2 { sign * reference } else { reference };
+                assert!(
+                    (got - want).abs() <= 2.0e-12 * want.abs(),
+                    "moment {i} for [{a}, {b}]: {got} != {want}"
+                );
+            }
+            assert!(d.var() > 0.0);
+            let mode = if sign > 0.0 { a } else { b };
+            assert!((d.pdf(mode) / expected[0] - 1.0).abs() < 2.0e-13);
+        }
+    }
+
+    #[test]
+    fn infinite_and_extreme_finite_bounds_reduce_to_normal_limits() {
+        let normal = Normal::standard();
+        let whole = TruncNormal::new(f64::NEG_INFINITY, f64::INFINITY);
+        for x in [-40.0, -10.0, -1.0, 0.0, 1.0, 10.0, 40.0] {
+            for (got, want) in [
+                (whole.pdf(x), normal.pdf(x)),
+                (whole.cdf(x), normal.cdf(x)),
+                (whole.sf(x), normal.sf(x)),
+                (whole.logpdf(x), normal.logpdf(x)),
+                (whole.logcdf(x), normal.logcdf(x)),
+                (whole.logsf(x), normal.logsf(x)),
+            ] {
+                assert!((got - want).abs() < 3.0e-12 * want.abs().max(1.0));
+            }
+        }
+        for q in [1.0e-300, 1.0e-20, 0.1, 0.5, 0.9, 1.0 - 1.0e-12] {
+            for (got, want) in [
+                (whole.ppf(q), normal.ppf(q)),
+                (whole.isf(q), normal.isf(q)),
+            ] {
+                assert!((got - want).abs() < 2.0e-12 * want.abs().max(1.0));
+            }
+        }
+        assert_eq!(&moment_values(&whole)[..4], &[0.0, 1.0, 0.0, 0.0]);
+        let pi = std::f64::consts::PI;
+        assert!((whole.entropy() - 0.5 * (2.0 * pi * std::f64::consts::E).ln()).abs() < 1e-14);
+
+        let half_mean = (2.0 / pi).sqrt();
+        let half_skew = 2.0_f64.sqrt() * (4.0 - pi) / (pi - 2.0).powf(1.5);
+        let half_kurtosis = 8.0 * (pi - 3.0) / (pi - 2.0).powi(2);
+        for (a, b, sign) in [
+            (0.0, f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 0.0, -1.0),
+        ] {
+            let half = TruncNormal::new(a, b);
+            let expected = [
+                sign * half_mean,
+                1.0 - 2.0 / pi,
+                sign * half_skew,
+                half_kurtosis,
+                0.5 * (pi / 2.0).ln() + 0.5,
+            ];
+            for (got, want) in moment_values(&half).into_iter().zip(expected) {
+                assert!((got - want).abs() < 3.0e-13, "{got} != {want}");
+            }
+        }
+        let finite = TruncNormal::new(-1.0e200, 1.0);
+        let infinite = TruncNormal::new(f64::NEG_INFINITY, 1.0);
+        assert_eq!(moment_values(&finite), moment_values(&infinite));
+    }
+
+    #[test]
+    fn narrow_intervals_retain_their_width_and_positive_variance() {
+        let width = 1.0e-8;
+        let central = TruncNormal::new(-width, width);
+        assert!(central.mean().abs() < 1.0e-22);
+        assert!((central.var() / (width * width / 3.0) - 1.0).abs() < 1.0e-13);
+        assert!(central.skewness().abs() < 1.0e-13);
+        assert!((central.kurtosis() + 1.2).abs() < 1.0e-13);
+        assert!((central.entropy() - (2.0 * width).ln()).abs() < 5.0e-14);
+        assert!((central.pdf(0.0) * (2.0 * width) - 1.0).abs() < 1.0e-13);
+        for q in [1.0e-12, 0.01, 0.1, 0.5, 0.9, 1.0 - 1.0e-12] {
+            let uniform_limit = width * (2.0 * q - 1.0);
+            assert!((central.ppf(q) - uniform_limit).abs() < 1.0e-21);
+        }
+
+        let shifted = TruncNormal::new(40.0, 40.0 + width);
+        let actual_width = shifted.b - shifted.a;
+        assert!((shifted.var() / (actual_width * actual_width / 12.0) - 1.0).abs() < 1.0e-12);
+        assert!((shifted.kurtosis() + 1.2).abs() < 1.0e-12);
+        assert!((shifted.entropy() - actual_width.ln()).abs() < 1.0e-12);
+        assert!(shifted.mean() >= shifted.a && shifted.mean() <= shifted.b);
+    }
+
+    #[test]
+    fn logarithmic_tails_and_support_endpoints_remain_usable() {
+        let right = TruncNormal::new(40.0, f64::INFINITY);
+        let left = TruncNormal::new(f64::NEG_INFINITY, -40.0);
+        assert_eq!(right.pdf(100.0), 0.0);
+        assert_eq!(right.sf(100.0), 0.0);
+        assert!(right.logpdf(100.0).is_finite());
+        assert!(right.logsf(100.0).is_finite());
+        assert!(right.logsf(100.0) < -4200.0);
+        assert_eq!(right.logpdf(100.0), left.logpdf(-100.0));
+        assert_eq!(right.logsf(100.0), left.logcdf(-100.0));
+        for d in [right, left, TruncNormal::new(40.0, 41.0)] {
+            assert_eq!(d.ppf(0.0), d.a);
+            assert_eq!(d.ppf(1.0), d.b);
+            assert_eq!(d.isf(0.0), d.b);
+            assert_eq!(d.isf(1.0), d.a);
+            assert_eq!(d.logcdf(d.a), f64::NEG_INFINITY);
+            assert_eq!(d.logsf(d.b), f64::NEG_INFINITY);
+            assert!(d.pdf(f64::NAN).is_nan());
+            assert!(d.logpdf(f64::NAN).is_nan());
+            assert!(d.cdf(f64::NAN).is_nan());
+            assert!(d.sf(f64::NAN).is_nan());
+            assert!(d.logcdf(f64::NAN).is_nan());
+            assert!(d.logsf(f64::NAN).is_nan());
+            for q in [f64::NAN, -0.1, 1.1] {
+                assert!(d.ppf(q).is_nan());
+                assert!(d.isf(q).is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn quantiles_round_trip_to_the_resolution_of_the_support() {
+        for (a, b) in [
+            (40.0, 41.0),
+            (-41.0, -40.0),
+            (40.0, f64::INFINITY),
+            (f64::NEG_INFINITY, -40.0),
+            (-1.0, 2.0),
+            (-1.0e-8, 1.0e-8),
+            (40.0, 40.0 + 1.0e-8),
+            (0.0, f64::INFINITY),
+        ] {
+            let d = TruncNormal::new(a, b);
+            let mut previous = a;
+            for q in [1.0e-300, 1.0e-20, 1.0e-12, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0 - 1.0e-12] {
+                let lower = d.ppf(q);
+                assert!(lower.is_finite() && lower >= previous && lower <= b);
+                previous = lower;
+                for (x, probability) in [(lower, d.cdf(lower)), (d.isf(q), d.sf(d.isf(q)))] {
+                    assert!(x.is_finite() && x >= a && x <= b);
+                    // One representable x can carry a substantial probability
+                    // on a narrow support. Do not demand an impossible roundtrip.
+                    let ulp = f64::from_bits(x.abs().to_bits() + 1) - x.abs();
+                    let tolerance = (2.0e-12 * q).max(4.0 * ulp * d.pdf(x));
+                    assert!(
+                        (probability - q).abs() <= tolerance,
+                        "[{a}, {b}], q={q:e}, x={x}: probability={probability:e}, tolerance={tolerance:e}"
+                    );
+                }
+            }
+        }
+        // Unlike a transformed normal-CDF sum, the local inverse retains
+        // a tiny representable distance from a finite boundary at zero.
+        let half = TruncNormal::new(0.0, f64::INFINITY);
+        let tiny = half.ppf(1.0e-300);
+        assert!(tiny > 0.0);
+        assert!((tiny / 1.0e-300 - (std::f64::consts::PI / 2.0).sqrt()).abs() < 1.0e-13);
+    }
+
 }
 
 #[cfg(test)]
