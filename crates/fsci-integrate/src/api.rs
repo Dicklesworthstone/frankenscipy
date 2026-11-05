@@ -399,11 +399,10 @@ fn is_new_time_point(points: &[f64], candidate: f64) -> bool {
 }
 
 fn eval_time_in_range(t_eval: f64, t_old: f64, t_new: f64, direction: f64) -> bool {
-    let eps = 1e-12_f64.max(1e-12 * t_new.abs());
     if direction > 0.0 {
-        t_eval > t_old + eps && t_eval <= t_new + eps
+        t_eval > t_old && t_eval <= t_new
     } else {
-        t_eval < t_old - eps && t_eval >= t_new - eps
+        t_eval < t_old && t_eval >= t_new
     }
 }
 
@@ -1037,7 +1036,7 @@ where
     // exactly), so that step builds dense output even when no other sample falls in it.
     let mut t0_sample_pending = false;
     if let Some(t_eval) = options.t_eval {
-        if matches!(t_eval.first(), Some(&first) if (first - t0).abs() < 1e-14) {
+        if matches!(t_eval.first(), Some(&first) if first == t0) {
             ts.push(t0);
             ys.push(options.y0.to_vec());
             next_t_eval_index = 1;
@@ -1149,36 +1148,45 @@ where
                     event_counts.as_mut(),
                     new_event_vals.as_ref(),
                 ) {
+                    let mut active_roots = Vec::new();
                     for (i, ev_spec) in evs.iter().enumerate() {
                         let val = new_vals[i];
                         if event_active(old_vals[i], val, ev_spec.direction) {
                             let t_ev = solve_event_equation(i, ev_spec.func, t_old, t, &interp)?;
-                            let y_ev = interp(t_ev);
-
-                            if let Some(tes) = t_events.as_mut() {
-                                tes[i].push(t_ev);
-                            }
-                            if let Some(yes) = y_events.as_mut() {
-                                yes[i].push(y_ev.clone());
-                            }
-
                             counts[i] += 1;
                             let terminal_hit = ev_spec
                                 .max_events
                                 .is_some_and(|max_events| counts[i] >= max_events);
-                            if terminal_hit {
-                                let select = match terminal_event.as_ref() {
-                                    None => true,
-                                    Some((current_t_ev, _)) => {
-                                        (t_ev - t_old).abs() < (current_t_ev - t_old).abs()
-                                    }
-                                };
-                                if select {
-                                    terminal_event = Some((t_ev, y_ev.clone()));
-                                }
-                            }
+                            active_roots.push((i, t_ev, terminal_hit));
                         }
                         old_vals[i] = val;
+                    }
+
+                    // A step can cross several events before it is stopped. Match
+                    // SciPy's handle_events: emit roots in integration order only up to
+                    // the first terminal occurrence, independent of registration order.
+                    // Stable sorting retains registration order for simultaneous roots.
+                    if active_roots.iter().any(|&(_, _, terminal)| terminal) {
+                        active_roots.sort_by(|a, b| {
+                            if direction > 0.0 {
+                                a.1.total_cmp(&b.1)
+                            } else {
+                                b.1.total_cmp(&a.1)
+                            }
+                        });
+                    }
+                    for (i, t_ev, terminal_hit) in active_roots {
+                        let y_ev = interp(t_ev);
+                        if let Some(tes) = t_events.as_mut() {
+                            tes[i].push(t_ev);
+                        }
+                        if let Some(yes) = y_events.as_mut() {
+                            yes[i].push(y_ev.clone());
+                        }
+                        if terminal_hit {
+                            terminal_event = Some((t_ev, y_ev));
+                            break;
+                        }
                     }
                 }
 
@@ -1197,12 +1205,9 @@ where
                             ys.push(interp(te));
                             next_t_eval_index += 1;
                         }
-                    }
-                    // Always add the event time itself when terminal event triggers
-                    if ts
-                        .last()
-                        .is_none_or(|&last_t| (last_t - t_ev).abs() > 1e-14)
-                    {
+                    } else if is_new_time_point(&ts, t_ev) {
+                        // With t_eval, only requested samples belong in t/y. The root
+                        // remains available in t_events/y_events and the dense solution.
                         ts.push(t_ev);
                         ys.push(y_ev);
                     }
@@ -2665,10 +2670,218 @@ mod tests {
         )
         .expect("event truncation test");
 
-        assert_eq!(result.t.len(), 3);
-        assert!((result.t[0] - 0.1).abs() < 1e-12);
-        assert!((result.t[1] - 0.2).abs() < 1e-12);
-        assert!((result.t[2] - 0.3).abs() < 1e-12);
+        let root = result.t_events.as_ref().unwrap()[0][0];
+        assert!((root - 0.3).abs() < 1e-12);
+        // The interpolant's root may lie just below the mathematical root. SciPy
+        // excludes a requested 0.3 in that case; there is no fuzzy endpoint halo.
+        let expected: Vec<f64> = t_eval.iter().copied().take_while(|&t| t <= root).collect();
+        assert_eq!(result.t, expected);
+        assert_eq!(result.y.len(), expected.len());
+    }
+
+    #[test]
+    fn solve_ivp_terminal_event_keeps_only_requested_samples() {
+        fn at_half(t: f64, _y: &[f64]) -> f64 {
+            t - 0.5
+        }
+
+        for backward in [false, true] {
+            let t_span = if backward { (1.0, 0.0) } else { (0.0, 1.0) };
+            let grids = if backward {
+                vec![
+                    vec![],
+                    vec![1.0, 0.75, 0.25, 0.0],
+                    vec![0.25, 0.0],
+                    vec![1.0, 0.5, 0.0],
+                    vec![1.0, 0.5_f64.next_up(), 0.5, 0.5_f64.next_down(), 0.0],
+                ]
+            } else {
+                vec![
+                    vec![],
+                    vec![0.0, 0.25, 0.75, 1.0],
+                    vec![0.75, 1.0],
+                    vec![0.0, 0.5, 1.0],
+                    vec![0.0, 0.5_f64.next_down(), 0.5, 0.5_f64.next_up(), 1.0],
+                ]
+            };
+            for times in grids {
+                let result = solve_ivp(
+                    &mut |_t, _y| vec![1.0],
+                    &SolveIvpOptions {
+                        t_span,
+                        y0: &[t_span.0],
+                        first_step: Some(1.0),
+                        max_step: 1.0,
+                        t_eval: Some(&times),
+                        events: Some(vec![EventSpec::terminal(at_half)]),
+                        ..SolveIvpOptions::default()
+                    },
+                )
+                .expect("terminal event with requested samples");
+
+                let expected: Vec<f64> = times
+                    .iter()
+                    .copied()
+                    .filter(|&t| if backward { t >= 0.5 } else { t <= 0.5 })
+                    .collect();
+                assert!(result.success);
+                assert_eq!(result.status, 1);
+                assert_eq!(result.t, expected, "backward={backward}, t_eval={times:?}");
+                assert_eq!(result.y.len(), expected.len());
+                for (&t, y) in result.t.iter().zip(&result.y) {
+                    assert!((y[0] - t).abs() < 1e-12);
+                }
+                assert_eq!(result.t_events.as_ref().unwrap()[0], vec![0.5]);
+            }
+        }
+    }
+
+    #[test]
+    fn solve_ivp_terminal_event_truncates_other_roots_in_time_order() {
+        fn at_quarter(t: f64, _y: &[f64]) -> f64 {
+            t - 0.25
+        }
+        fn at_half(t: f64, _y: &[f64]) -> f64 {
+            t - 0.5
+        }
+        fn at_three_quarters(t: f64, _y: &[f64]) -> f64 {
+            t - 0.75
+        }
+
+        for backward in [false, true] {
+            let t_span = if backward { (1.0, 0.0) } else { (0.0, 1.0) };
+            let (before, after): (EventFn, EventFn) = if backward {
+                (at_three_quarters, at_quarter)
+            } else {
+                (at_quarter, at_three_quarters)
+            };
+            for reverse_registration in [false, true] {
+                // Two roots lie after the terminal event, including another terminal
+                // event. Registration order must not override integration order.
+                let mut cases = vec![
+                    (EventSpec::new(after), None),
+                    (EventSpec::terminal(at_half), Some(0.5)),
+                    (
+                        EventSpec::new(before),
+                        Some(if backward { 0.75 } else { 0.25 }),
+                    ),
+                    (EventSpec::terminal(after), None),
+                ];
+                if reverse_registration {
+                    cases.reverse();
+                }
+                let result = solve_ivp(
+                    &mut |_t, _y| vec![1.0],
+                    &SolveIvpOptions {
+                        t_span,
+                        y0: &[t_span.0],
+                        first_step: Some(1.0),
+                        max_step: 1.0,
+                        events: Some(cases.iter().map(|(event, _)| *event).collect()),
+                        ..SolveIvpOptions::default()
+                    },
+                )
+                .expect("multiple events in one accepted step");
+
+                assert_eq!(result.status, 1);
+                assert_eq!(result.t.last(), Some(&0.5));
+                let roots = result.t_events.as_ref().unwrap();
+                let states = result.y_events.as_ref().unwrap();
+                for (i, (_, expected)) in cases.iter().enumerate() {
+                    match expected {
+                        Some(t) => {
+                            assert_eq!(roots[i], vec![*t]);
+                            assert_eq!(states[i].len(), 1);
+                            assert!((states[i][0][0] - t).abs() < 1e-12);
+                        }
+                        None => {
+                            assert!(
+                                roots[i].is_empty(),
+                                "post-termination root {i}: {:?}",
+                                roots[i]
+                            );
+                            assert!(states[i].is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solve_ivp_terminal_event_count_truncates_the_final_step() {
+        fn two_crossings(t: f64, _y: &[f64]) -> f64 {
+            (t - 0.25) * (t - 0.75)
+        }
+        fn near_start(t: f64, _y: &[f64]) -> f64 {
+            t - 0.1
+        }
+        fn near_end(t: f64, _y: &[f64]) -> f64 {
+            t - 0.9
+        }
+
+        for backward in [false, true] {
+            let t_span = if backward { (1.0, 0.0) } else { (0.0, 1.0) };
+            let after: EventFn = if backward { near_start } else { near_end };
+            let result = solve_ivp(
+                &mut |_t, _y| vec![1.0],
+                &SolveIvpOptions {
+                    t_span,
+                    y0: &[t_span.0],
+                    first_step: Some(0.5),
+                    max_step: 0.5,
+                    events: Some(vec![
+                        EventSpec::new(after),
+                        EventSpec::new(two_crossings).with_max_events(2),
+                    ]),
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .expect("second occurrence terminates the solve");
+
+            let expected = if backward { [0.75, 0.25] } else { [0.25, 0.75] };
+            assert_eq!(result.status, 1);
+            let roots = result.t_events.as_ref().unwrap();
+            assert!(
+                roots[0].is_empty(),
+                "event after the second terminal occurrence"
+            );
+            assert_eq!(roots[1].len(), 2);
+            for (&actual, expected) in roots[1].iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-10);
+            }
+            assert!((result.t.last().unwrap() - expected[1]).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn solve_ivp_preserves_samples_close_to_initial_time() {
+        for backward in [false, true] {
+            let t_span = if backward { (1.0, 0.0) } else { (0.0, 1.0) };
+            let times = if backward {
+                [1.0_f64.next_down(), 1.0 - 1e-14, 0.75, 0.0]
+            } else {
+                [1e-15, 1e-14, 0.25, 1.0]
+            };
+            let result = solve_ivp(
+                &mut |_t, _y| vec![1.0],
+                &SolveIvpOptions {
+                    t_span,
+                    y0: &[t_span.0],
+                    t_eval: Some(&times),
+                    first_step: Some(1.0),
+                    max_step: 1.0,
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .expect("samples adjacent to the initial time");
+
+            assert_eq!(result.t, times);
+            assert_eq!(result.y.len(), times.len());
+            for (&t, y) in times.iter().zip(&result.y) {
+                assert!((y[0] - t).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]
