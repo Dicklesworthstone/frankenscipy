@@ -10955,6 +10955,15 @@ fn resolve_differential_oracle_config(
     }
 }
 
+/// A capture includes the subprocess write, the read back, and normalization.
+/// Parallel tests can target the same fixture, so the entire exchange must be
+/// serialized; locking only the final write would still let a reader see a
+/// truncated JSON file. The captured value is returned by ownership.
+fn oracle_capture_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn capture_python_oracle_inner(
     fixture_path: &Path,
     fixture_raw: &str,
@@ -10967,6 +10976,9 @@ fn capture_python_oracle_inner(
         path: output_dir.clone(),
         source,
     })?;
+    let _capture_guard = oracle_capture_write_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let output_path = output_dir.join("oracle_capture.json");
 
     if !oracle.script_path.exists() {
@@ -25117,7 +25129,10 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         let fixture_path = HarnessConfig::default_paths()
             .fixture_root
             .join("FSCI-P2C-005_fft_core.json");
-        let oracle = default_test_oracle();
+        let oracle = DifferentialOracleConfig {
+            required: super::scipy_oracle_required(),
+            ..default_test_oracle()
+        };
         let report = run_differential_test(&fixture_path, &oracle).expect("differential fft runs");
 
         assert_eq!(report.packet_id, "FSCI-P2C-005");

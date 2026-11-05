@@ -23288,7 +23288,30 @@ impl ContinuousDistribution for SkewCauchy {
     fn logpdf(&self, x: f64) -> f64 {
         // −ln(π) − ln(1 + x²/scale²), scale = a·sign(x)+1; heavy tail. frankenscipy-p82v7
         let scale = self.a * x.signum() + 1.0;
-        -PI.ln() - (1.0 + x * x / (scale * scale)).ln()
+        // hypot avoids both x² overflow and division by a nearly zero scale.
+        -PI.ln() + 2.0 * (scale.ln() - x.hypot(scale).ln())
+    }
+
+    /// Maximum-likelihood skewness with location zero and scale one.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "SkewCauchy")?;
+        if !data.iter().any(|&x| x < 0.0) || !data.iter().any(|&x| x > 0.0) {
+            return Err(FitError::NonConvergent(
+                "SkewCauchy requires observations on both sides of zero for an identifiable interior MLE"
+                    .into(),
+            ));
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Bounded {
+                initial: 0.0,
+                lower: -1.0,
+                upper: 1.0,
+            }],
+            |p| (p[0].abs() < 1.0).then_some(Self { a: p[0] }),
+            MleOptions::default(),
+        )
+        .map(|result| result.distribution)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -31075,6 +31098,33 @@ impl ContinuousDistribution for Alpha {
         -0.5 * z * z - 0.5 * (2.0 * PI).ln() - 2.0 * x.ln() - standard_normal_cdf(self.a).ln()
     }
 
+    /// Maximum-likelihood shape with location zero and scale one.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "Alpha")?;
+        if data.iter().any(|&x| x <= 0.0) {
+            return Err(FitError::UnsupportedData(
+                "Alpha requires strictly positive observations".into(),
+            ));
+        }
+        let n = data.len() as f64;
+        let mean_reciprocal = data.iter().map(|&x| (1.0 / x) / n).sum::<f64>();
+        // The score decreases from E[1/X] − sqrt(2/π) at a=0. A
+        // nonpositive starting score has its supremum at the excluded
+        // shape-zero boundary, rather than a finite admissible MLE.
+        if !mean_reciprocal.is_finite() || mean_reciprocal <= (2.0 / PI).sqrt() {
+            return Err(FitError::NonConvergent(
+                "Alpha has no finite positive-shape MLE for these observations".into(),
+            ));
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Positive(mean_reciprocal)],
+            |p| Some(Self { a: p[0] }),
+            MleOptions::default(),
+        )
+        .map(|result| result.distribution)
+    }
+
     fn cdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
@@ -31634,47 +31684,104 @@ impl Argus {
     }
 }
 
-/// Ψ(z) = Φ(z) − z·φ(z) − ½, the Argus normalization/CDF auxiliary
-/// (Φ standard normal CDF, φ standard normal PDF). frankenscipy-tvfae
-fn argus_psi(z: f64) -> f64 {
-    let phi = (-0.5 * z * z).exp() / (2.0 * PI).sqrt();
-    standard_normal_cdf(z) - z * phi - 0.5
+/// Log of the multiplier of x sqrt(1-x²) exp(-χ²(1-x²)/2).
+/// The small-χ integral series avoids cancellation in Φ(χ)-χφ(χ)-1/2.
+fn argus_log_normalizer(chi: f64) -> f64 {
+    let a = 0.5 * chi * chi;
+    if a <= 1.0 {
+        let mut term = 1.0;
+        let mut integral = 1.0 / 3.0;
+        for k in 1..=64 {
+            term *= -a / f64::from(k);
+            let increment = term / f64::from(2 * k + 3);
+            integral += increment;
+            if increment.abs() <= f64::EPSILON * integral.abs() {
+                break;
+            }
+        }
+        -integral.ln()
+    } else {
+        3.0 * chi.ln() + 0.5 * (2.0 / PI).ln() - fsci_special::log_gammainc_scalar(1.5, a)
+    }
 }
 
 impl ContinuousDistribution for Argus {
     fn pdf(&self, x: f64) -> f64 {
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
         if x <= 0.0 || x >= 1.0 {
-            return 0.0;
+            return f64::NEG_INFINITY;
         }
-        let chi = self.chi;
-        let chi2 = chi * chi;
-        let t = 1.0 - x * x;
-        // Normalization via Ψ(χ) = Φ(χ) - χφ(χ) - 1/2
-        // where Φ = standard normal CDF, φ = standard normal PDF
-        let phi_chi = standard_normal_cdf(chi);
-        let pdf_chi = (-0.5 * chi2).exp() / (2.0 * PI).sqrt();
-        let psi = phi_chi - chi * pdf_chi - 0.5;
-        let norm = if psi > 0.0 {
-            chi.powi(3) / ((2.0 * PI).sqrt() * psi)
-        } else {
-            1.0
-        };
-        norm * x * t.sqrt() * (-0.5 * chi2 * t).exp()
+        let t = (1.0 - x) * (1.0 + x);
+        // Form χ sqrt(t) first: χ² can overflow while χ²t is finite.
+        let z = self.chi * t.sqrt();
+        argus_log_normalizer(self.chi) + x.ln() + 0.5 * t.ln() - 0.5 * z * z
     }
 
     fn cdf(&self, x: f64) -> f64 {
+        -self.logsf(x).exp_m1()
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        self.logsf(x).exp()
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        self.cdf(x).ln()
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
         if x >= 1.0 {
-            return 1.0;
+            return f64::NEG_INFINITY;
         }
-        // Closed form: F(x) = 1 − Ψ(χ·√(1−x²))/Ψ(χ), Ψ(z) = Φ(z) − z·φ(z) − ½.
-        // The old 400-point Simpson over the pdf lost accuracy as χ grew
-        // (≈1e-7 at χ=8); this matches scipy to ~3e-14. frankenscipy-tvfae
-        let chi = self.chi;
-        let z = chi * (1.0 - x * x).sqrt();
-        (1.0 - argus_psi(z) / argus_psi(chi)).clamp(0.0, 1.0)
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let t = (1.0 - x) * (1.0 + x);
+        let a = 0.5 * self.chi * self.chi;
+        let log_ratio = if a > 1.0 {
+            fsci_special::log_gammainc_scalar(1.5, a * t)
+                - fsci_special::log_gammainc_scalar(1.5, a)
+        } else {
+            1.5 * t.ln() + argus_log_normalizer(self.chi)
+                - argus_log_normalizer(self.chi * t.sqrt())
+        };
+        log_ratio.min(0.0)
+    }
+
+    /// Maximum-likelihood shape with location zero and scale one.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "Argus")?;
+        if data.iter().any(|&x| x <= 0.0 || x >= 1.0) {
+            return Err(FitError::UnsupportedData(
+                "Argus requires observations strictly between zero and one".into(),
+            ));
+        }
+        let n = data.len() as f64;
+        let mean_complement = data
+            .iter()
+            .map(|&x| (1.0 - x) * (1.0 + x) / n)
+            .sum::<f64>();
+        // In the exponential-family coordinate a=χ²/2 the score is
+        // E_a[1-X²] minus the sample average, decreasing from 3/5 at
+        // a=0. Detect a supremum at the excluded χ=0 boundary explicitly.
+        if mean_complement >= 0.6 {
+            return Err(FitError::NonConvergent(
+                "Argus likelihood is maximized at the excluded shape-zero boundary".into(),
+            ));
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Positive(1.0)],
+            |p| Some(Self { chi: p[0] }),
+            MleOptions::default(),
+        )
+        .map(|result| result.distribution)
     }
 
     fn mean(&self) -> f64 {

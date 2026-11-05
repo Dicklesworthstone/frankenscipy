@@ -9,9 +9,9 @@ use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
-    BetaDist, Burr3, Burr12, ContinuousDistribution, CrystalBall, FitError, FoldedCauchy,
-    GammaDist, Kappa3, Lognormal, MleOptions, MleParameter, Normal, Weibull, fit_mle,
-    with_hardened_stats_caps, with_stats_runtime_mode,
+    Alpha, Argus, BetaDist, Burr3, Burr12, ContinuousDistribution, CrystalBall, FitError,
+    FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter, Normal, SkewCauchy,
+    Weibull, fit_mle, with_hardened_stats_caps, with_stats_runtime_mode,
 };
 
 const ORACLE: &str = r#"
@@ -34,6 +34,9 @@ cases = [
     ('beta', stats.beta, [(0.3, 0.6), (2.0, 5.0), (8.0, 0.7)]),
     ('weibull_min', stats.weibull_min, [(0.4,), (1.5,), (6.0,)]),
     ('lognorm', stats.lognorm, [(0.3,), (0.9,), (1.5,)]),
+    ('skewcauchy', stats.skewcauchy, [(-0.7,), (0.0,), (0.6,)]),
+    ('alpha', stats.alpha, [(0.2,), (2.0,), (6.0,)]),
+    ('argus', stats.argus, [(0.8,), (2.0,), (5.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -55,6 +58,117 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn new_shape_fits_reject_invalid_samples_and_nonexistent_interior_maxima() {
+    assert!(matches!(
+        Alpha::try_fit(&[0.5]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    assert!(matches!(
+        Argus::try_fit(&[0.5]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    assert!(matches!(
+        SkewCauchy::try_fit(&[0.5]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for data in [&[0.0, 0.5][..], &[-1.0, 0.5], &[f64::NAN, 0.5]] {
+        assert!(matches!(
+            Alpha::try_fit(data),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            Argus::try_fit(data),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        Argus::try_fit(&[0.5, 1.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    assert!(matches!(
+        SkewCauchy::try_fit(&[-1.0, f64::INFINITY]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    assert!(matches!(
+        Alpha::try_fit(&[3.0, 4.0, 5.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+    assert!(matches!(
+        Argus::try_fit(&[0.1, 0.2, 0.3]),
+        Err(FitError::NonConvergent(_))
+    ));
+    for data in [&[0.0, 0.0][..], &[1.0, 2.0], &[-2.0, -1.0]] {
+        assert!(matches!(
+            SkewCauchy::try_fit(data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+}
+
+#[test]
+fn shape_fits_allow_repeated_data_when_the_shape_is_identifiable() {
+    let alpha = Alpha::try_fit(&[0.5; 8]).unwrap();
+    let normal = Normal::standard();
+    let score = 2.0 - alpha.a - normal.pdf(alpha.a) / normal.cdf(alpha.a);
+    assert!(score.abs() < 1.0e-6, "Alpha score at MLE: {score}");
+
+    let argus = Argus::try_fit(&[0.9; 8]).unwrap();
+    let fitted_likelihood = likelihood(&argus, &[0.9; 8]);
+    for chi in [argus.chi * 0.99, argus.chi * 1.01] {
+        assert!(fitted_likelihood < likelihood(&Argus::new(chi), &[0.9; 8]));
+    }
+
+    let skew = SkewCauchy::try_fit(&[-2.0, -0.5, 0.0, 0.5, 2.0]).unwrap();
+    assert!(skew.a.abs() < 1.0e-6);
+}
+
+#[test]
+fn argus_small_shape_preserves_density_normalization_and_probability_tails() {
+    // At χ→0 the normalized limiting density is 3x sqrt(1-x²),
+    // with survival probability (1-x²)^(3/2).
+    for chi in [1.0e-150, 1.0e-8] {
+        let distribution = Argus::new(chi);
+        for x in [0.1, 0.5, 0.9, 1.0 - 1.0e-12] {
+            let t = (1.0_f64 - x) * (1.0 + x);
+            let expected_pdf = 3.0 * x * t.sqrt();
+            let expected_sf = t.powf(1.5);
+            assert!((distribution.pdf(x) / expected_pdf - 1.0).abs() < 1.0e-13);
+            assert!((distribution.sf(x) / expected_sf - 1.0).abs() < 1.0e-13);
+            assert!((distribution.logsf(x) - expected_sf.ln()).abs() < 1.0e-13);
+            assert!((distribution.cdf(x) + distribution.sf(x) - 1.0).abs() < 1.0e-15);
+            assert!((distribution.logcdf(x).exp() - distribution.cdf(x)).abs() < 1.0e-15);
+        }
+        assert_eq!(distribution.cdf(0.0), 0.0);
+        assert_eq!(distribution.cdf(1.0), 1.0);
+        assert_eq!(distribution.sf(0.0), 1.0);
+        assert_eq!(distribution.sf(1.0), 0.0);
+        assert!(distribution.logpdf(f64::NAN).is_nan());
+        assert!(distribution.logsf(f64::NAN).is_nan());
+    }
+}
+
+#[test]
+fn new_shape_likelihoods_remain_finite_when_pdf_underflows() {
+    let skew = SkewCauchy::new(0.3);
+    for x in [-1.0e200_f64, 1.0e200] {
+        let side_scale = 1.0 + 0.3 * x.signum();
+        let expected = -std::f64::consts::PI.ln() - 2.0 * (x.abs() / side_scale).ln();
+        assert!(skew.logpdf(x).is_finite());
+        assert!((skew.logpdf(x) - expected).abs() < 1.0e-12);
+    }
+    let argus = Argus::new(100.0);
+    assert_eq!(argus.pdf(0.5), 0.0);
+    assert!(argus.logpdf(0.5).is_finite());
+    assert!(Alpha::new(2.0).logpdf(1.0e200).is_finite());
+
+    // χ² overflows, but χ²(1-x²) remains representable near the endpoint.
+    let x = f64::from_bits(1.0_f64.to_bits() - 1);
+    let value = Argus::new(1.0e160).logpdf(x);
+    assert!(value.is_finite());
+    assert!((value / -1.110_223_024_625_156_4e304 - 1.0).abs() < 1.0e-14);
 }
 
 #[test]
@@ -376,7 +490,7 @@ fn crystal_ball_large_shape_density_and_probabilities_are_usable() {
 }
 
 #[test]
-fn mle_matches_live_scipy_on_twenty_seven_seeded_fits() {
+fn mle_matches_live_scipy_on_thirty_six_seeded_fits() {
     let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
     let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
     let available = Command::new(&python)
@@ -434,6 +548,18 @@ fn mle_matches_live_scipy_on_twenty_seven_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "skewcauchy" => {
+                let fitted = SkewCauchy::try_fit(&data).unwrap();
+                (vec![fitted.a], likelihood(&fitted, &data))
+            }
+            "alpha" => {
+                let fitted = Alpha::try_fit(&data).unwrap();
+                (vec![fitted.a], likelihood(&fitted, &data))
+            }
+            "argus" => {
+                let fitted = Argus::try_fit(&data).unwrap();
+                (vec![fitted.chi], likelihood(&fitted, &data))
+            }
             "burr" => {
                 let fitted = Burr3::try_fit(&data).unwrap();
                 (vec![fitted.c, fitted.d], likelihood(&fitted, &data))
@@ -536,8 +662,8 @@ fn mle_matches_live_scipy_on_twenty_seven_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 27,
+        compared, 36,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 9; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 12; samples per case = 2000");
 }
