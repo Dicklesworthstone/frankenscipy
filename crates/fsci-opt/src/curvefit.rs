@@ -119,13 +119,15 @@ pub struct LeastSquaresOptions {
     /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
     /// `curve_fit`, `Trf` for a bounded one.
     pub method: Option<LeastSquaresMethod>,
-    /// Convergence tolerance on the gradient (gtol).
+    /// Gradient convergence tolerance. LM uses the maximum absolute cosine
+    /// between the residual vector and each Jacobian column; the trust-region
+    /// methods use their scaled gradient norms.
     pub gtol: f64,
     /// Convergence tolerance on the change in parameters (xtol).
     pub xtol: f64,
     /// Convergence tolerance on the change in cost (ftol).
     pub ftol: f64,
-    /// Maximum number of function evaluations.
+    /// Maximum number of function evaluations, excluding numerical Jacobian calls.
     pub max_nfev: Option<usize>,
     /// Numerical Jacobian scheme, used when `jac` is absent. `ThreePoint` uses
     /// central differences away from bounds and second-order one-sided differences
@@ -142,9 +144,8 @@ pub struct LeastSquaresOptions {
     pub loss: LossKind,
     /// Soft margin between inlier and outlier residuals for a robust loss.
     pub f_scale: f64,
-    /// Parameter scaling for `Trf` and `Dogbox`: fixed positive scales or `'jac'`.
-    /// `None` uses unit scale. Explicit scaling is not supported by this LM kernel
-    /// and is rejected instead of being ignored.
+    /// Parameter scaling: fixed positive scales or `'jac'`. `None` uses unit
+    /// scale for `Trf`/`Dogbox` and Jacobian column scaling for `Lm`, as in SciPy.
     pub x_scale: Option<XScale>,
     /// Runtime mode.
     pub mode: RuntimeMode,
@@ -390,6 +391,124 @@ fn lm_result(
     }
 }
 
+/// The LM damping metric. Store adaptive column norms directly, avoiding the
+/// overflowing reciprocal of a small derivative. Fixed characteristic scales
+/// remain in the units supplied by the caller.
+enum LmScaling {
+    Fixed(Vec<f64>),
+    Jacobian(Vec<f64>),
+}
+
+impl LmScaling {
+    fn new(scale: Option<&XScale>, n: usize) -> Result<Self, OptError> {
+        match scale {
+            Some(XScale::Fixed(values)) => {
+                if values.len() != n {
+                    return Err(OptError::InvalidArgument {
+                        detail: String::from("Inconsistent shapes between x_scale and `x0`."),
+                    });
+                }
+                if values.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+                    return Err(OptError::InvalidArgument {
+                        detail: String::from("x_scale entries must be positive and finite"),
+                    });
+                }
+                Ok(Self::Fixed(values.clone()))
+            }
+            Some(XScale::Jac) | None => Ok(Self::Jacobian(Vec::new())),
+        }
+    }
+
+    fn update(&mut self, jac: &[Vec<f64>]) -> Result<(), OptError> {
+        if let Self::Jacobian(norms) = self {
+            let initial = norms.is_empty();
+            norms.resize(jac[0].len(), 0.0);
+            for (column, norm) in norms.iter_mut().enumerate() {
+                let current = jac
+                    .iter()
+                    .fold(0.0_f64, |value, row| value.hypot(row[column]));
+                if !current.is_finite() {
+                    return Err(OptError::NonFiniteInput {
+                        detail: String::from("Jacobian column norm is not finite"),
+                    });
+                }
+                // MINPACK's adaptive diagonal never decreases: a later small
+                // derivative must not suddenly enlarge this parameter's steps.
+                *norm = if initial && current == 0.0 {
+                    1.0
+                } else {
+                    (*norm).max(current)
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn physical_step(&self, step: &[f64]) -> Vec<f64> {
+        match self {
+            Self::Fixed(scale) => step.iter().zip(scale).map(|(s, d)| s * d).collect(),
+            Self::Jacobian(norms) => step.iter().zip(norms).map(|(s, d)| s / d).collect(),
+        }
+    }
+
+    fn parameter_norm(&self, x: &[f64]) -> f64 {
+        match self {
+            Self::Fixed(scale) => x
+                .iter()
+                .zip(scale)
+                .fold(0.0_f64, |norm, (value, d)| norm.hypot(value / d)),
+            Self::Jacobian(norms) => x
+                .iter()
+                .zip(norms)
+                .fold(0.0_f64, |norm, (value, d)| norm.hypot(value * d)),
+        }
+    }
+
+    fn jacobian(&self, jac: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, OptError> {
+        // J times the characteristic parameter scale uses the same columnwise
+        // transformation as converting a scaled step back to physical units.
+        let scaled: Vec<Vec<f64>> = jac.iter().map(|row| self.physical_step(row)).collect();
+        if scaled.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("scaled Jacobian must not contain NaN or Inf"),
+            });
+        }
+        Ok(scaled)
+    }
+}
+
+fn lm_max_cosine(jac: &[Vec<f64>], residuals: &[f64]) -> f64 {
+    let residual_norm = residuals
+        .iter()
+        .fold(0.0_f64, |norm, &value| norm.hypot(value));
+    if residual_norm == 0.0 {
+        return 0.0;
+    }
+    if !residual_norm.is_finite() {
+        return f64::INFINITY;
+    }
+    let mut maximum = 0.0_f64;
+    for column in 0..jac[0].len() {
+        let column_norm = jac
+            .iter()
+            .fold(0.0_f64, |norm, row| norm.hypot(row[column]));
+        if !column_norm.is_finite() {
+            return f64::INFINITY;
+        }
+        if column_norm != 0.0 {
+            // Normalize before multiplying: Jᵀr and ||J||*||r|| can underflow
+            // even when their ratio is an ordinary, nonzero cosine.
+            let cosine: f64 = jac
+                .iter()
+                .zip(residuals)
+                .map(|(row, &value)| (row[column] / column_norm) * (value / residual_norm))
+                .sum();
+            maximum = maximum.max(cosine.abs());
+        }
+    }
+    maximum
+}
+
 /// Levenberg–Marquardt (`method='lm'`).
 fn least_squares_lm<F>(
     residuals: F,
@@ -400,13 +519,6 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     let n = x0.len();
-    if options.x_scale.is_some() {
-        return Err(OptError::InvalidArgument {
-            detail: String::from(
-                "explicit x_scale is supported by 'trf' and 'dogbox', not this 'lm' kernel",
-            ),
-        });
-    }
     if options.loss != LossKind::Linear {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
@@ -428,23 +540,24 @@ where
             detail: String::from("diff_step must be finite and > 0"),
         });
     }
-    if !options.gtol.is_finite() || options.gtol < 0.0 {
+    for (name, tolerance) in [
+        ("gtol", options.gtol),
+        ("xtol", options.xtol),
+        ("ftol", options.ftol),
+    ] {
+        if !tolerance.is_finite() || tolerance < f64::EPSILON {
+            return Err(OptError::InvalidArgument {
+                detail: format!("{name} must be finite and at least machine epsilon for 'lm'"),
+            });
+        }
+    }
+    if options.max_nfev == Some(0) {
         return Err(OptError::InvalidArgument {
-            detail: String::from("gtol must be finite and >= 0"),
+            detail: String::from("max_nfev must be positive"),
         });
     }
-    if !options.xtol.is_finite() || options.xtol < 0.0 {
-        return Err(OptError::InvalidArgument {
-            detail: String::from("xtol must be finite and >= 0"),
-        });
-    }
-    if !options.ftol.is_finite() || options.ftol < 0.0 {
-        return Err(OptError::InvalidArgument {
-            detail: String::from("ftol must be finite and >= 0"),
-        });
-    }
-
-    let max_nfev = options.max_nfev.unwrap_or(100 * (n + 1));
+    let mut scaling = LmScaling::new(options.x_scale.as_ref(), n)?;
+    let max_nfev = options.max_nfev.unwrap_or(100 * n);
 
     let mut x = x0.to_vec();
     let mut r = residuals(&x);
@@ -471,19 +584,25 @@ where
     }
 
     let mut cost = 0.5 * dot_vec(&r, &r);
+    let mut residual_norm = r.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+    if !residual_norm.is_finite() {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("residual norm is not finite"),
+        });
+    }
     let mut jac = Vec::new();
     let mut x_perturbed = x.clone();
-    nfev += lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
+    lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
     njev += 1;
-    // J^T J (O(n²·m)) and J^T r depend only on (jac, r), which change ONLY on an accepted
-    // step. Cache them and recompute only when jac/r change, rather than rebuilding both at
-    // the top of every iteration — on a rejected step (mu ratchets up, common for hard /
-    // ill-conditioned problems) only `mu`/`nu` change, so the rebuild was redundant. Byte-
-    // identical: jtj/jtr are deterministic functions of (jac, r).
+    scaling.update(&jac)?;
+    let mut scaled_jac = scaling.jacobian(&jac)?;
+    // Solve in scaled parameter coordinates. Cache the linear model until an
+    // accepted step changes residuals, derivatives, or adaptive column scales.
     let mut jtj = Vec::new();
     let mut jtr = Vec::new();
-    jtj_matrix_into(&jac, &mut jtj);
-    jt_vec_into(&jac, &r, &mut jtr);
+    jtj_matrix_into(&scaled_jac, &mut jtj);
+    jt_vec_into(&scaled_jac, &r, &mut jtr);
+    let mut max_cosine = lm_max_cosine(&jac, &r);
     let mut damped_normal = Vec::new();
     let mut cholesky_low = Vec::new();
     let mut solve_y = Vec::new();
@@ -491,7 +610,7 @@ where
     let mut jstep = Vec::new();
 
     // Initial damping parameter (Marquardt strategy)
-    let mut mu = 1.0e-3 * max_diag_jtj(&jac);
+    let mut mu = 1.0e-3 * max_diag_jtj(&scaled_jac);
     if mu == 0.0 {
         mu = 1.0;
     }
@@ -501,25 +620,16 @@ where
     for _ in 0..max_nfev {
         nit += 1;
 
-        // jtj / jtr are current for this (jac, r) — computed before the loop and refreshed
-        // only after an accepted step recomputes the Jacobian (see below).
-
-        // Check gradient convergence: ||J^T r||_inf <= gtol
-        let grad_inf = jtr.iter().map(|v| v.abs()).fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        });
-        // status 1: ‖Jᵀr‖_inf ≤ gtol (a NaN gradient fails this test)
-        if grad_inf <= options.gtol {
+        // LM's gtol is the maximum absolute cosine between a Jacobian column
+        // and the residual vector. An absolute Jᵀr test falsely converges at x0
+        // when residuals (or curve_fit's 1/sigma weights) have small units.
+        if max_cosine <= options.gtol {
             return Ok(lm_result(
                 x,
                 r,
                 cost,
                 1,
-                String::from("gradient converged (||J^T r||_inf <= gtol)"),
+                String::from("residual is orthogonal to the Jacobian columns (gtol)"),
                 nfev,
                 njev,
                 nit,
@@ -541,12 +651,17 @@ where
             },
         );
 
-        let step_norm = l2_norm(&step);
-        let x_norm = l2_norm(&x);
+        let step_norm = step.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let x_norm = scaling.parameter_norm(&x);
+        if !step_norm.is_finite() || !x_norm.is_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("scaled LM step or parameter norm is not finite"),
+            });
+        }
 
-        // Check parameter convergence
-        // status 3: ‖step‖ ≤ xtol·(xtol + ‖x‖)
-        if step_norm <= options.xtol * (options.xtol + x_norm) {
+        // Use the same parameter metric as the damped solve. An additive
+        // xtol² floor would prematurely stop small scaled parameter steps.
+        if step_norm <= options.xtol * x_norm {
             return Ok(lm_result(
                 x,
                 r,
@@ -561,7 +676,8 @@ where
         }
 
         // Trial step
-        let x_new: Vec<f64> = x.iter().zip(step.iter()).map(|(a, b)| a + b).collect();
+        let physical_step = scaling.physical_step(&step);
+        let x_new: Vec<f64> = x.iter().zip(&physical_step).map(|(a, b)| a + b).collect();
         let r_new = residuals(&x_new);
         nfev += 1;
         if r_new.len() != m {
@@ -571,13 +687,25 @@ where
         }
         let cost_new = 0.5 * dot_vec(&r_new, &r_new);
 
-        // Gain ratio (actual reduction / predicted reduction)
+        // Compare relative reductions in units of the current residual norm.
+        // Squaring tiny residuals first would underflow both costs to zero and
+        // prevent otherwise valid steps (even with a correctly scaled solve).
+        let trial_norm = r_new.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+        let norm_ratio = trial_norm / residual_norm;
+        let actual_reduction = (1.0 - norm_ratio) * (1.0 + norm_ratio);
         let predicted_reduction = {
-            mat_vec_into(&jac, &step, &mut jstep);
-            -dot_vec(&jtr, &step) - 0.5 * dot_vec(&jstep, &jstep)
+            mat_vec_into(&scaled_jac, &step, &mut jstep);
+            let linear: f64 = r
+                .iter()
+                .zip(&jstep)
+                .map(|(f, j)| (f / residual_norm) * (j / residual_norm))
+                .sum();
+            let quadratic: f64 = jstep
+                .iter()
+                .map(|value| (value / residual_norm).powi(2))
+                .sum();
+            -2.0 * linear - quadratic
         };
-
-        let actual_reduction = cost - cost_new;
 
         if predicted_reduction > 0.0 {
             let rho = actual_reduction / predicted_reduction;
@@ -586,16 +714,14 @@ where
                 // Accept step
                 x = x_new;
                 r = r_new;
-                let old_cost = cost;
                 cost = cost_new;
+                residual_norm = trial_norm;
+                lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
+                njev += 1;
 
-                // Check cost convergence
-                let cost_change = (old_cost - cost) / (1.0 + cost);
-                if cost_change.abs() <= options.ftol {
-                    nfev +=
-                        lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
-                    njev += 1;
-                    // status 2: |Δcost|/(1+cost) ≤ ftol after an accepted step (rho > 0.25)
+                // LM requires small actual and predicted relative reductions;
+                // the accepted step also establishes adequate model agreement.
+                if actual_reduction <= options.ftol && predicted_reduction <= options.ftol {
                     return Ok(lm_result(
                         x,
                         r,
@@ -609,11 +735,12 @@ where
                     ));
                 }
 
-                // Recompute Jacobian (and the derived J^T J / J^T r) — jac and r changed.
-                nfev += lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
-                njev += 1;
-                jtj_matrix_into(&jac, &mut jtj);
-                jt_vec_into(&jac, &r, &mut jtr);
+                // Refresh the scaled model only after an accepted step.
+                scaling.update(&jac)?;
+                scaled_jac = scaling.jacobian(&jac)?;
+                jtj_matrix_into(&scaled_jac, &mut jtj);
+                jt_vec_into(&scaled_jac, &r, &mut jtr);
+                max_cosine = lm_max_cosine(&jac, &r);
 
                 // Decrease damping
                 mu *= f64::max(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0).powi(3));
@@ -760,7 +887,8 @@ where
         .collect())
 }
 
-/// Fill the LM Jacobian and return the number of residual evaluations it required.
+/// Fill the LM Jacobian. As in SciPy >= 1.16, residual calls made solely for
+/// numerical differentiation do not consume `max_nfev` or contribute to `nfev`.
 fn lm_jacobian_into<F>(
     residuals: &F,
     x: &[f64],
@@ -768,13 +896,12 @@ fn lm_jacobian_into<F>(
     options: &LeastSquaresOptions,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
-) -> Result<usize, OptError>
+) -> Result<(), OptError>
 where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     if let Some(analytic) = &options.jac {
         *jac = analytic.evaluate(x, residual.len())?;
-        Ok(0)
     } else if options.diff_method == FiniteDiffMethod::ThreePoint {
         *jac = fd_jacobian_scipy(
             residuals,
@@ -785,7 +912,6 @@ where
             options.diff_method,
             options.diff_step,
         )?;
-        Ok(2 * x.len())
     } else {
         finite_diff_jacobian_parallel_into(
             residuals,
@@ -795,8 +921,13 @@ where
             jac,
             x_perturbed,
         )?;
-        Ok(x.len())
     }
+    if jac.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("Jacobian must not contain NaN or Inf"),
+        });
+    }
+    Ok(())
 }
 
 /// SciPy raises `ValueError` with this text when its `trf` SVD meets a non-finite matrix.
@@ -1511,10 +1642,6 @@ fn dot_vec(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn l2_norm(v: &[f64]) -> f64 {
-    dot_vec(v, v).sqrt()
-}
-
 fn resize_square(matrix: &mut Vec<Vec<f64>>, n: usize) {
     if matrix.len() != n {
         matrix.resize_with(n, Vec::new);
@@ -2088,6 +2215,228 @@ mod tests {
     }
 
     #[test]
+    fn least_squares_lm_does_not_converge_just_because_residual_units_are_small() {
+        // The unique solution is x = 1 in every case. The last two magnitudes
+        // also underflow the unscaled sum of squared residuals to zero.
+        for magnitude in [1.0, 1.0e-6, 1.0e-12, 1.0e-30, 1.0e-200, 1.0e-300] {
+            for derivative in 0..3 {
+                let result = least_squares(
+                    |x| vec![magnitude * (x[0] - 1.0)],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        diff_method: if derivative == 2 {
+                            FiniteDiffMethod::ThreePoint
+                        } else {
+                            FiniteDiffMethod::TwoPoint
+                        },
+                        jac: if derivative == 0 {
+                            Some(LeastSquaresJacobian::new(move |_| vec![vec![magnitude]]))
+                        } else {
+                            None
+                        },
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("scaled linear least squares");
+                assert!(
+                    result.success,
+                    "magnitude={magnitude}, derivative={derivative}: {result:?}"
+                );
+                assert!(
+                    (result.x[0] - 1.0).abs() < 1e-10,
+                    "magnitude={magnitude}, derivative={derivative}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_scaled_nonlinear_residuals_keep_iterating() {
+        for magnitude in [1.0, 1.0e-12, 1.0e-200] {
+            let result = least_squares(
+                |x| vec![magnitude * (x[0] * x[0] - 2.0)],
+                &[1.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    jac: Some(LeastSquaresJacobian::new(move |x| {
+                        vec![vec![2.0 * magnitude * x[0]]]
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("scaled nonlinear least squares");
+            assert!(result.success, "magnitude={magnitude}: {result:?}");
+            assert!(
+                (result.x[0] - 2.0_f64.sqrt()).abs() < 1e-8,
+                "magnitude={magnitude}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_handles_parameters_with_different_units() {
+        for x_scale in [
+            None,
+            Some(XScale::Jac),
+            Some(XScale::Fixed(vec![1.0e6, 1.0e-6])),
+        ] {
+            let result = least_squares(
+                |x| {
+                    let a = x[0] * 1.0e-6 - 1.0;
+                    let b = x[1] * 1.0e6 - 2.0;
+                    vec![a + b, 2.0 * a - b, a - 2.0 * b]
+                },
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    x_scale,
+                    jac: Some(LeastSquaresJacobian::new(|_| {
+                        vec![
+                            vec![1.0e-6, 1.0e6],
+                            vec![2.0e-6, -1.0e6],
+                            vec![1.0e-6, -2.0e6],
+                        ]
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("LM accepts fixed and adaptive parameter scales");
+            assert!(result.success, "{result:?}");
+            assert!((result.x[0] * 1.0e-6 - 1.0).abs() < 1e-9, "{result:?}");
+            assert!((result.x[1] * 1.0e6 - 2.0).abs() < 1e-9, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_evaluation_budget_excludes_numerical_jacobian_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            for max_nfev in [1, 2, 3] {
+                let calls = AtomicUsize::new(0);
+                let result = least_squares(
+                    |x| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        vec![x[0] * x[0] - 2.0]
+                    },
+                    &[0.1],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        max_nfev: Some(max_nfev),
+                        diff_method,
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("a spent budget is a result with status zero");
+                // MINPACK checks maxfev after its first trial: a budget of one
+                // still reports two evaluations unless x0 already converges.
+                assert_eq!(result.nfev, max_nfev.max(2), "{result:?}");
+                assert_eq!(result.status, 0, "{result:?}");
+                let stencil_calls = if diff_method == FiniteDiffMethod::ThreePoint {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    result.nfev + stencil_calls * result.njev
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_validates_tolerances_and_budget_before_callbacks() {
+        for invalid in [0.0, f64::EPSILON / 2.0, f64::NAN, f64::INFINITY] {
+            for field in 0..3 {
+                let mut options = LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    ..LeastSquaresOptions::default()
+                };
+                match field {
+                    0 => options.ftol = invalid,
+                    1 => options.xtol = invalid,
+                    _ => options.gtol = invalid,
+                }
+                let result = least_squares(
+                    |_| panic!("invalid LM options must fail before calling the model"),
+                    &[0.0],
+                    options,
+                );
+                assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+            }
+        }
+        let result = least_squares(
+            |_| panic!("zero evaluation budget must fail before calling the model"),
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                max_nfev: Some(0),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
+        let at_epsilon = least_squares(
+            |x| vec![x[0]],
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                ftol: f64::EPSILON,
+                xtol: f64::EPSILON,
+                gtol: f64::EPSILON,
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("SciPy accepts tolerances equal to machine epsilon");
+        assert_eq!(at_epsilon.status, 1);
+    }
+
+    #[test]
+    fn least_squares_lm_rejects_nonfinite_numerical_jacobian() {
+        for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            let result = least_squares(
+                |x| vec![if x[0] == 0.0 { 1.0 } else { f64::NAN }],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    diff_method,
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::NonFiniteInput { .. })));
+        }
+    }
+
+    #[test]
+    fn curve_fit_lm_large_measurement_uncertainties_do_not_stop_the_fit() {
+        for sigma in [
+            CurveFitSigma::Scalar(1.0e12),
+            CurveFitSigma::StandardDeviations(vec![1.0e12, 2.0e12, 3.0e12, 4.0e12]),
+            CurveFitSigma::Covariance(vec![
+                vec![1.0e24, 0.25e24, 0.25e24, 0.25e24],
+                vec![0.25e24, 1.0e24, 0.25e24, 0.25e24],
+                vec![0.25e24, 0.25e24, 1.0e24, 0.25e24],
+                vec![0.25e24, 0.25e24, 0.25e24, 1.0e24],
+            ]),
+        ] {
+            let result = curve_fit(
+                |x, p| p[0] * x + p[1],
+                &[0.0, 1.0, 2.0, 3.0],
+                &[3.0, 5.0, 7.0, 9.0],
+                CurveFitOptions {
+                    p0: Some(vec![0.0, 0.0]),
+                    sigma: Some(sigma),
+                    ..CurveFitOptions::default()
+                },
+            )
+            .expect("uncertainties change the weights, not this exact-fit optimum");
+            assert!(result.ls_result.success, "{result:?}");
+            assert!((result.popt[0] - 2.0).abs() < 1e-8, "{result:?}");
+            assert!((result.popt[1] - 3.0).abs() < 1e-8, "{result:?}");
+        }
+    }
+
+    #[test]
     fn curve_fit_quadratic() {
         // Fit y = a*x^2 + b*x + c
         let xdata: Vec<f64> = (-10..=10).map(|i| i as f64).collect();
@@ -2456,7 +2805,11 @@ mod tests {
 
     #[test]
     fn least_squares_validates_fixed_scale_before_callbacks() {
-        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
             for scale in [
                 vec![],
                 vec![1.0, 2.0],
@@ -2477,16 +2830,6 @@ mod tests {
                 assert!(matches!(result, Err(OptError::InvalidArgument { .. })));
             }
         }
-        let lm = least_squares(
-            |x| vec![x[0]],
-            &[0.0],
-            LeastSquaresOptions {
-                method: Some(LeastSquaresMethod::Lm),
-                x_scale: Some(XScale::Jac),
-                ..LeastSquaresOptions::default()
-            },
-        );
-        assert!(matches!(lm, Err(OptError::InvalidArgument { .. })));
     }
 
     #[test]
