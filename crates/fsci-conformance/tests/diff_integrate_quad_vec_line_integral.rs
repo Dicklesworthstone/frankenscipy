@@ -35,12 +35,24 @@ struct Case {
     case_id: String,
     op: String, // "qv" | "li"
     func: String,
+    #[serde(serialize_with = "serialize_bound")]
     a: f64,
+    #[serde(serialize_with = "serialize_bound")]
     b: f64,
     /// li
     n: usize,
     /// li analytical answer
     analytical: f64,
+}
+
+fn serialize_bound<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    if value.is_finite() {
+        serializer.serialize_f64(*value)
+    } else if value.is_sign_positive() {
+        serializer.serialize_str("inf")
+    } else {
+        serializer.serialize_str("-inf")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +120,9 @@ fn f_vec(name: &str, x: f64) -> Vec<f64> {
         "trig_sq" => vec![x.sin(), x.cos(), x * x],
         // 2-component: [exp(-x), x exp(-x)]
         "exp_decay" => vec![(-x).exp(), x * (-x).exp()],
+        "exp_left" => vec![x.exp(), -x * x.exp()],
+        "gaussian" => vec![(-x * x).exp(), x * x * (-x * x).exp()],
+        "inv_sqrt" => vec![x.sqrt().recip(), x.sqrt()],
         _ => vec![],
     }
 }
@@ -115,11 +130,19 @@ fn f_vec(name: &str, x: f64) -> Vec<f64> {
 fn generate_query() -> OracleQuery {
     let mut points = Vec::new();
 
-    // quad_vec probes (smooth, finite interval)
+    // Smooth, singular-endpoint, and infinite-interval cases. Infinite bounds
+    // must be JSON strings: serde_json's default null would silently lose them.
     let qv_probes: &[(&str, f64, f64)] = &[
         ("trig_sq", 0.0, std::f64::consts::PI),
         ("trig_sq", -1.0, 1.0),
         ("exp_decay", 0.0, 5.0),
+        ("exp_decay", 0.0, f64::INFINITY),
+        ("exp_decay", f64::INFINITY, 0.0),
+        ("exp_left", f64::NEG_INFINITY, 0.0),
+        ("exp_left", 0.0, f64::NEG_INFINITY),
+        ("gaussian", f64::NEG_INFINITY, f64::INFINITY),
+        ("gaussian", f64::INFINITY, f64::NEG_INFINITY),
+        ("inv_sqrt", 0.0, 1.0),
     ];
     for &(fname, a, b) in qv_probes {
         points.push(Case {
@@ -192,6 +215,9 @@ from scipy.integrate import quad_vec
 def f_vec(name, x):
     if name == "trig_sq":     return np.array([math.sin(x), math.cos(x), x*x])
     if name == "exp_decay":   return np.array([math.exp(-x), x*math.exp(-x)])
+    if name == "exp_left":    return np.array([math.exp(x), -x*math.exp(x)])
+    if name == "gaussian":    return np.array([math.exp(-x*x), x*x*math.exp(-x*x)])
+    if name == "inv_sqrt":    return np.array([1/math.sqrt(x), math.sqrt(x)])
     return np.array([])
 
 q = json.load(sys.stdin)
@@ -201,7 +227,11 @@ for case in q["points"]:
     a = float(case["a"]); b = float(case["b"])
     try:
         if op == "qv":
-            v, _ = quad_vec(lambda x: f_vec(fname, x), a, b, epsabs=1e-13, epsrel=1e-12)
+            v, _, info = quad_vec(lambda x: f_vec(fname, x), a, b,
+                                 epsabs=1e-10, epsrel=1e-10, norm="max",
+                                 quadrature="gk15", full_output=True)
+            if not info.success:
+                raise RuntimeError(info.message)
             flat = [float(x) for x in v.tolist()]
             points.append({"case_id": cid, "values": flat})
         elif op == "li":
@@ -284,7 +314,11 @@ fn diff_integrate_quad_vec_line_integral() {
         .map(|d| (d.case_id.clone(), d))
         .collect();
 
-    let opts = QuadOptions::default();
+    let opts = QuadOptions {
+        epsabs: 1e-10,
+        epsrel: 1e-10,
+        limit: 256,
+    };
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
@@ -299,7 +333,10 @@ fn diff_integrate_quad_vec_line_integral() {
             "qv" => {
                 let fname = case.func.clone();
                 let f = move |x: f64| f_vec(&fname, x);
-                quad_vec(&f, case.a, case.b, opts).ok().map(|r| r.integral)
+                quad_vec(&f, case.a, case.b, opts)
+                    .ok()
+                    .filter(|r| r.converged)
+                    .map(|r| r.integral)
             }
             "li" => {
                 let v = match case.func.as_str() {

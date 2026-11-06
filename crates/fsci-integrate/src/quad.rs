@@ -41,7 +41,7 @@ pub struct QuadResult {
 pub struct QuadVecResult {
     /// Estimated value of the integral for each output component.
     pub integral: Vec<f64>,
-    /// Estimated absolute error using the maximum componentwise GK15/G7 delta.
+    /// Estimated absolute error in the maximum-component norm, including roundoff.
     pub error: f64,
     /// Number of function evaluations.
     pub neval: usize,
@@ -153,11 +153,36 @@ pub struct CubatureScalarResult {
     pub neval: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct QuadVecSpec {
-    epsabs: f64,
-    epsrel: f64,
-    dim: usize,
+#[derive(Debug)]
+struct QuadVecPanel {
+    a: f64,
+    b: f64,
+    integral: Vec<f64>,
+    error: f64,
+    roundoff: f64,
+}
+
+impl PartialEq for QuadVecPanel {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for QuadVecPanel {}
+
+impl PartialOrd for QuadVecPanel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QuadVecPanel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.error
+            .total_cmp(&other.error)
+            .then_with(|| other.a.total_cmp(&self.a))
+            .then_with(|| other.b.total_cmp(&self.b))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -719,14 +744,6 @@ fn quadpack_message(ier: u8, limit: usize) -> String {
     }
 }
 
-/// QUADPACK's acceptance test on the SUMMED result: `abserr <= max(epsabs, epsrel*|result|)`.
-/// Each leaf of the recursion only tests `epsrel` against its own piece, so when pieces cancel the
-/// leaves can all pass while the total misses its relative tolerance; the reported flag must be
-/// decided on the total.
-fn meets_global_tolerance(magnitude: f64, error: f64, epsabs: f64, epsrel: f64) -> bool {
-    error <= epsabs.max(epsrel * magnitude)
-}
-
 /// Batched adaptive integration: evaluate `I(params) = ∫_a^b f(x, params) dx` for MANY parameter
 /// sets (`param_rows`), one [`QuadResult`] per set over the shared interval `[a, b]`. This is the
 /// vmap-over-solver primitive SciPy lacks — a definite-integral sweep (a family of moments /
@@ -791,12 +808,21 @@ where
     out
 }
 
-/// Numerically integrate a vector-valued function over a finite interval [a, b].
+/// Numerically integrate a vector-valued function over [a, b].
 ///
-/// Uses the same adaptive Gauss-Kronrod quadrature core as [`quad`], but
-/// preserves every output component of the integrand.
+/// Adaptive GK15 quadrature refines the interval with the largest error until the
+/// summed error meets the requested tolerance in the maximum-component norm.
+/// `limit` bounds the number of active subintervals, rather than recursion depth.
+/// Semi-infinite and infinite intervals use a change of variables to a finite
+/// interval. Reversing the bounds negates the result. Nonzero intervals are sampled
+/// only at interior nodes, so integrable endpoint singularities are supported.
 ///
-/// Matches the core finite-interval behavior of `scipy.integrate.quad_vec(f, a, b)`.
+/// This corresponds to `scipy.integrate.quad_vec` with `norm="max"` and
+/// `quadrature="gk15"`; it does not use scalar QUADPACK's epsilon extrapolation.
+///
+/// # Errors
+/// Rejects NaN bounds, identical infinite bounds, invalid tolerances, changing
+/// output shapes, and nonzero intervals without a representable interior node.
 pub fn quad_vec<F>(
     f: F,
     a: f64,
@@ -806,9 +832,9 @@ pub fn quad_vec<F>(
 where
     F: Fn(f64) -> Vec<f64>,
 {
-    if !a.is_finite() || !b.is_finite() {
+    if a.is_nan() || b.is_nan() || (a == b && !a.is_finite()) {
         return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "integration bounds must be finite".to_string(),
+            detail: "integration bounds must not be NaN or the same infinity".to_string(),
         });
     }
     if !options.epsabs.is_finite()
@@ -821,9 +847,8 @@ where
         });
     }
 
-    let sample = f(a);
-    let dim = sample.len();
     if a == b {
+        let dim = f(a).len();
         return Ok(QuadVecResult {
             integral: vec![0.0; dim],
             error: 0.0,
@@ -833,21 +858,24 @@ where
         });
     }
 
-    let mut neval = 0;
-    let spec = QuadVecSpec {
-        epsabs: options.epsabs,
-        epsrel: options.epsrel,
-        dim,
+    let (lo, hi, sign) = if a < b { (a, b, 1.0) } else { (b, a, -1.0) };
+    let transform = match (lo.is_finite(), hi.is_finite()) {
+        (true, true) => BoundTransform::Finite,
+        (false, true) => BoundTransform::LowerInfinite { upper: hi },
+        (true, false) => BoundTransform::UpperInfinite { lower: lo },
+        (false, false) => BoundTransform::BothInfinite,
     };
-    let (integral, error, leaves_converged) =
-        adaptive_gk15_vec(&f, a, b, options.limit, &mut neval, spec)?;
-    let converged = leaves_converged
-        && meets_global_tolerance(
-            max_abs_component(&integral),
-            error,
-            options.epsabs,
-            options.epsrel,
-        );
+    let (left, right) = transform.interval(lo, hi);
+    let mapped = |t| {
+        let (x, jacobian) = transform.map(t);
+        f(x).into_iter().map(|value| value * jacobian).collect()
+    };
+    let mut neval = 0;
+    let (mut integral, error, converged) =
+        adaptive_gk15_vec(&mapped, left, right, &mut neval, options)?;
+    for value in &mut integral {
+        *value *= sign;
+    }
 
     Ok(QuadVecResult {
         integral,
@@ -857,51 +885,54 @@ where
     })
 }
 
-/// Adaptive Gauss-Kronrod 15-point quadrature for vector-valued integrands.
+/// Global error control with at most `limit` active panels and no recursive calls.
 fn adaptive_gk15_vec<F>(
     f: &F,
     a: f64,
     b: f64,
-    limit: usize,
     neval: &mut usize,
-    spec: QuadVecSpec,
+    options: QuadOptions,
 ) -> Result<(Vec<f64>, f64, bool), IntegrateValidationError>
 where
     F: Fn(f64) -> Vec<f64>,
 {
-    let (integral, error) = gauss_kronrod_15_vec(f, a, b, neval, spec.dim)?;
+    let first = gauss_kronrod_15_vec(f, a, b, neval, None)?;
+    let mut integral = first.integral.clone();
+    let mut error = first.error;
+    let mut roundoff = first.roundoff;
+    let mut panels = std::collections::BinaryHeap::from([first]);
 
-    // Same non-finite short-circuit as adaptive_gk15 (frankenscipy-t45u3):
-    // a NaN component would otherwise cause 2^limit recursive subdivisions.
-    if !error.is_finite() || integral.iter().any(|v| !v.is_finite()) {
-        return Ok((integral, error, false));
+    loop {
+        let total_error = error + roundoff;
+        if !total_error.is_finite() || integral.iter().any(|v| !v.is_finite()) {
+            return Ok((integral, f64::INFINITY, false));
+        }
+        let tolerance = options
+            .epsabs
+            .max(options.epsrel * max_abs_component(&integral));
+        // Leave headroom for the accumulated roundoff estimate, as quad_vec does.
+        if error <= tolerance / 8.0 && total_error <= tolerance {
+            return Ok((integral, total_error, true));
+        }
+        if panels.len() >= options.limit.max(1) || error <= roundoff {
+            return Ok((integral, total_error, false));
+        }
+        let worst = panels.pop().expect("at least one quadrature panel");
+        let mid = worst.a.midpoint(worst.b);
+        if worst.a.next_up() >= mid || mid.next_up() >= worst.b {
+            return Ok((integral, total_error, false));
+        }
+        let dim = Some(integral.len());
+        let left = gauss_kronrod_15_vec(f, worst.a, mid, neval, dim)?;
+        let right = gauss_kronrod_15_vec(f, mid, worst.b, neval, dim)?;
+        for (i, value) in integral.iter_mut().enumerate() {
+            *value += (left.integral[i] - worst.integral[i]) + right.integral[i];
+        }
+        error = (error - worst.error).max(0.0) + left.error + right.error;
+        roundoff += left.roundoff + right.roundoff;
+        panels.push(left);
+        panels.push(right);
     }
-
-    let tolerance = spec.epsabs.max(spec.epsrel * max_abs_component(&integral));
-
-    if error <= tolerance || limit == 0 {
-        return Ok((integral, error, error <= tolerance));
-    }
-
-    let mid = 0.5 * (a + b);
-    let next_limit = limit.saturating_sub(1);
-
-    let next_spec = QuadVecSpec {
-        epsabs: spec.epsabs / 2.0,
-        ..spec
-    };
-    let (i_left, e_left, c_left) = adaptive_gk15_vec(f, a, mid, next_limit, neval, next_spec)?;
-    let (i_right, e_right, c_right) = adaptive_gk15_vec(f, mid, b, next_limit, neval, next_spec)?;
-
-    let total_integral = i_left
-        .iter()
-        .zip(i_right.iter())
-        .map(|(left, right)| left + right)
-        .collect();
-    let total_error = e_left + e_right;
-    let converged = c_left && c_right;
-
-    Ok((total_integral, total_error, converged))
 }
 
 /// Vector-valued Gauss-Kronrod 15-point / 7-point quadrature rule on [a, b].
@@ -910,8 +941,8 @@ fn gauss_kronrod_15_vec<F>(
     a: f64,
     b: f64,
     neval: &mut usize,
-    dim: usize,
-) -> Result<(Vec<f64>, f64), IntegrateValidationError>
+    dim: Option<usize>,
+) -> Result<QuadVecPanel, IntegrateValidationError>
 where
     F: Fn(f64) -> Vec<f64>,
 {
@@ -959,16 +990,42 @@ where
         0.129_484_966_168_869_7,
     ];
 
-    let half_length = 0.5 * (b - a);
-    let center = 0.5 * (a + b);
+    if a.next_up() >= b {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "interval has no representable interior quadrature node".to_string(),
+        });
+    }
+    let width = b - a;
+    let half_length = if width.is_finite() {
+        0.5 * width
+    } else {
+        0.5 * b - 0.5 * a
+    };
+    let center = a.midpoint(b);
+    let mut center_value = f(center);
+    *neval += 1;
+    let dim = dim.unwrap_or(center_value.len());
 
     let mut result_kronrod = vec![0.0; dim];
     let mut result_gauss = vec![0.0; dim];
+    let mut absolute = vec![0.0; dim];
+    let mut samples = Vec::with_capacity(XGK.len());
 
     for (i, (&xgk, &wgk)) in XGK.iter().zip(WGK.iter()).enumerate() {
-        let x = center + half_length * xgk;
-        let fval = f(x);
-        *neval += 1;
+        // Rounding can otherwise move an interior Kronrod node onto a singular
+        // endpoint after repeated refinement. Keep representable nodes inside.
+        let mut x = center + half_length * xgk;
+        if x <= a && a.next_up() < b {
+            x = a.next_up();
+        } else if x >= b && b.next_down() > a {
+            x = b.next_down();
+        }
+        let fval = if i == 7 {
+            std::mem::take(&mut center_value)
+        } else {
+            *neval += 1;
+            f(x)
+        };
 
         if fval.len() != dim {
             return Err(IntegrateValidationError::QuadInvalidBounds {
@@ -979,8 +1036,9 @@ where
             });
         }
 
-        for (acc, value) in result_kronrod.iter_mut().zip(fval.iter()) {
-            *acc += wgk * value;
+        for j in 0..dim {
+            result_kronrod[j] += wgk * fval[j];
+            absolute[j] += wgk * fval[j].abs();
         }
 
         if i % 2 == 1 {
@@ -989,8 +1047,15 @@ where
                 *acc += wg * value;
             }
         }
+        samples.push(fval);
     }
 
+    let mut deviation = vec![0.0; dim];
+    for (sample, weight) in samples.iter().zip(WGK) {
+        for j in 0..dim {
+            deviation[j] += weight * (sample[j] - 0.5 * result_kronrod[j]).abs();
+        }
+    }
     for value in &mut result_kronrod {
         *value *= half_length;
     }
@@ -1009,11 +1074,24 @@ where
                 a.max(b)
             }
         });
-    if error.is_nan() {
+    let deviation = max_abs_component(&deviation) * half_length.abs();
+    if deviation != 0.0 && error != 0.0 {
+        error = deviation * (200.0 * (error / deviation)).powf(1.5).min(1.0);
+    }
+    let roundoff = 50.0 * f64::EPSILON * (max_abs_component(&absolute) * half_length.abs());
+    if error.is_nan() || roundoff.is_nan() {
         error = f64::INFINITY;
+    } else {
+        error = error.max(roundoff);
     }
 
-    Ok((result_kronrod, error))
+    Ok(QuadVecPanel {
+        a,
+        b,
+        integral: result_kronrod,
+        error,
+        roundoff,
+    })
 }
 
 fn max_abs_component(values: &[f64]) -> f64 {
@@ -6018,11 +6096,136 @@ mod tests {
     }
 
     #[test]
+    fn quad_vec_limit_bounds_work_and_counts_every_evaluation() {
+        for limit in [1, 2, 4, 8] {
+            let calls = std::cell::Cell::new(0);
+            let result = quad_vec(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    vec![(37.0 * x).sin(), x.exp()]
+                },
+                0.0,
+                1.0,
+                QuadOptions {
+                    epsabs: 0.0,
+                    epsrel: 0.0,
+                    limit,
+                },
+            )
+            .unwrap();
+            assert!(!result.converged, "roundoff prevents exact quadrature");
+            assert_eq!(result.neval, calls.get());
+            assert!(
+                calls.get() <= 15 + 30 * (limit - 1),
+                "limit={limit} permits at most {limit} panels, got {} calls",
+                calls.get()
+            );
+        }
+    }
+
+    #[test]
+    fn quad_vec_avoids_endpoints_and_refines_integrable_singularities() {
+        let result = quad_vec(
+            |x| {
+                assert!(x > 0.0 && x < 1.0, "quadrature must use interior nodes");
+                vec![x.sqrt().recip(), (1.0 - x).sqrt().recip()]
+            },
+            0.0,
+            1.0,
+            QuadOptions {
+                epsabs: 1e-7,
+                epsrel: 1e-7,
+                limit: 128,
+            },
+        )
+        .unwrap();
+        assert!(result.converged, "{result:?}");
+        for value in result.integral {
+            assert!((value - 2.0).abs() < 2e-7, "{value}");
+        }
+    }
+
+    #[test]
+    fn quad_vec_integrates_infinite_bounds_in_both_directions() {
+        for (a, b, expected) in [
+            (0.0, f64::INFINITY, 1.0),
+            (f64::INFINITY, 0.0, -1.0),
+            (f64::NEG_INFINITY, 0.0, 1.0),
+            (0.0, f64::NEG_INFINITY, -1.0),
+            (f64::NEG_INFINITY, f64::INFINITY, 2.0),
+            (f64::INFINITY, f64::NEG_INFINITY, -2.0),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result = quad_vec(
+                |x| {
+                    assert!(x.is_finite());
+                    calls.set(calls.get() + 1);
+                    let decay = (-x.abs()).exp();
+                    vec![decay, x.abs() * decay]
+                },
+                a,
+                b,
+                QuadOptions {
+                    epsabs: 1e-10,
+                    epsrel: 1e-10,
+                    limit: 128,
+                },
+            )
+            .unwrap();
+            assert!(result.converged, "{a}..{b}: {result:?}");
+            assert_eq!(result.neval, calls.get());
+            for value in result.integral {
+                assert!((value - expected).abs() < 1e-9, "{a}..{b}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn quad_vec_respects_roundoff_and_nonfinite_integrands() {
+        let exact = quad_vec(
+            |_| vec![1.0, -2.0],
+            0.0,
+            1.0,
+            QuadOptions {
+                epsabs: 0.0,
+                epsrel: 0.0,
+                limit: 4,
+            },
+        )
+        .unwrap();
+        assert!(!exact.converged);
+        assert!(exact.error > 0.0);
+        assert!(
+            exact.neval <= 45,
+            "roundoff must stop unproductive refinement"
+        );
+
+        for value in [f64::NAN, f64::INFINITY] {
+            let result = quad_vec(|_| vec![value, 1.0], 0.0, 1.0, QuadOptions::default()).unwrap();
+            assert!(!result.converged);
+            assert!(!result.error.is_finite());
+            assert_eq!(result.neval, 15);
+        }
+    }
+
+    #[test]
     fn quad_vec_invalid_input_errors() {
-        let bounds_err = quad_vec(|x| vec![x], f64::INFINITY, 1.0, QuadOptions::default())
-            .expect_err("non-finite bounds");
+        let bounds_err =
+            quad_vec(|x| vec![x], f64::NAN, 1.0, QuadOptions::default()).expect_err("NaN bound");
         assert!(matches!(
             bounds_err,
+            IntegrateValidationError::QuadInvalidBounds { .. }
+        ));
+
+        let adjacent_err = quad_vec(
+            |_| panic!("no interior point exists, so the callback must not run"),
+            1.0,
+            1.0_f64.next_up(),
+            QuadOptions::default(),
+        )
+        .expect_err("no representable interior");
+        assert!(matches!(
+            adjacent_err,
             IntegrateValidationError::QuadInvalidBounds { .. }
         ));
 
