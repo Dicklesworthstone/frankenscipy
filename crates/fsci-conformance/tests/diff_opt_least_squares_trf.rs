@@ -4,6 +4,7 @@
 //! exponential fit with outliers under bounds and under each robust loss (soft_l1, huber,
 //! cauchy, arctan), `x_scale='jac'` on a badly scaled problem, an underdetermined system, a
 //! `max_nfev` stop, a box with both bounds active, and bound-aware three-point Jacobians.
+//! Large finite Jacobians also check the fitted parameters in their physical units.
 //!
 //! Per case the status and `active_mask` must match SciPy's, `x` must agree to `X_REL_TOL`
 //! (relative to max(|x|, 1e-6)) and the cost to `COST_REL_TOL`. The port follows SciPy's
@@ -155,7 +156,21 @@ fn cases() -> Vec<Case> {
         case.three_point = true;
         cases.push(case);
     }
+    for id in ["large_jac_e80", "large_jac_e160"] {
+        let mut large = case(id, &[0.0, 0.0]);
+        large.analytic_jac = true;
+        large.max_nfev = Some(10);
+        cases.push(large);
+    }
     cases
+}
+
+fn large_jacobian_scale(id: &str) -> Option<f64> {
+    match id {
+        "large_jac_e80" => Some(1e80),
+        "large_jac_e160" => Some(1e160),
+        _ => None,
+    }
 }
 
 fn exp_data() -> (Vec<f64>, Vec<f64>) {
@@ -167,7 +182,13 @@ fn exp_data() -> (Vec<f64>, Vec<f64>) {
 }
 
 fn residuals(id: &str, x: &[f64], t: &[f64], y: &[f64]) -> Vec<f64> {
-    if id.starts_with("rosen") || id == "max_nfev" {
+    if let Some(scale) = large_jacobian_scale(id) {
+        vec![
+            scale * (x[0] + x[1]) - 3.0,
+            scale * x[1] - 2.0,
+            scale * x[0] - 1.0,
+        ]
+    } else if id.starts_with("rosen") || id == "max_nfev" {
         vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]]
     } else if id.starts_with("exp") {
         t.iter()
@@ -184,7 +205,9 @@ fn residuals(id: &str, x: &[f64], t: &[f64], y: &[f64]) -> Vec<f64> {
 }
 
 fn jacobian(id: &str, x: &[f64], t: &[f64]) -> Vec<Vec<f64>> {
-    if id.starts_with("rosen") {
+    if let Some(scale) = large_jacobian_scale(id) {
+        vec![vec![scale, scale], vec![0.0, scale], vec![scale, 0.0]]
+    } else if id.starts_with("rosen") {
         vec![vec![-20.0 * x[0], 10.0], vec![-1.0, 0.0]]
     } else if id.starts_with("exp") {
         t.iter()
@@ -263,8 +286,12 @@ t = np.linspace(0, 4, 40)
 y = 2 * np.exp(-0.3 * t)
 y[5] += 3
 y[20] -= 2.5
+large_scales = {"large_jac_e80": 1e80, "large_jac_e160": 1e160}
 
 def residuals(cid):
+    if cid in large_scales:
+        a = large_scales[cid] * np.array([[1, 1], [0, 1], [1, 0]])
+        return lambda x: a @ x - np.array([3, 2, 1])
     if cid.startswith("rosen") or cid == "max_nfev":
         return lambda x: np.array([10 * (x[1] - x[0]**2), 1 - x[0]])
     if cid.startswith("exp"):
@@ -276,6 +303,9 @@ def residuals(cid):
     return lambda x: np.array([x[0] - 3, x[1] + 1])
 
 def jacobian(cid):
+    if cid in large_scales:
+        a = large_scales[cid] * np.array([[1, 1], [0, 1], [1, 0]])
+        return lambda x: a
     if cid.startswith("rosen"):
         return lambda x: np.array([[-20 * x[0], 10], [-1, 0]])
     if cid.startswith("exp"):
@@ -452,11 +482,14 @@ fn compare_method(method: &str) {
             // The ledger rejects a length mismatch and a NaN coordinate (recording the case);
             // the zip below would truncate the one and the max fold swallow the other.
             let x_pair = ledger.slices(&family, &case.case_id, Some(x), Some(r.x.as_slice()));
+            let parameter_units = large_jacobian_scale(&case.case_id).unwrap_or(1.0);
             diff.x_rel_diff = x_pair.map_or(f64::NAN, |(x, fsci_x)| {
                 fsci_x
                     .iter()
                     .zip(x)
-                    .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+                    .map(|(a, b)| {
+                        ((a - b) * parameter_units).abs() / (b * parameter_units).abs().max(1e-6)
+                    })
                     .fold(0.0, f64::max)
             });
             diff.cost_rel_diff = (r.cost - cost).abs() / cost.abs().max(1e-12);

@@ -203,6 +203,9 @@ fn scale_for_robust_loss(j: &mut [Vec<f64>], f: &mut [f64], rho: &[Vec<f64>; 3])
 pub(super) fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
     let m = j.len();
     let transposed = m < n;
+    // Keep the data in its original units: dividing the whole matrix by its largest
+    // element could erase a small, orthogonal column. The Jacobi angle below instead
+    // uses normalized columns and pairwise norms, never their unscaled squares.
     // Columns of the matrix whose columns are orthogonalized: J (m ≥ n) or Jᵀ (m < n).
     let (rows, cols) = if transposed { (n, m) } else { (m, n) };
     let mut a: Vec<Vec<f64>> = (0..cols)
@@ -219,16 +222,36 @@ pub(super) fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Ve
         let mut rotated = false;
         for p in 0..cols {
             for q in p + 1..cols {
-                let alpha = dot(&a[p], &a[p]);
-                let beta = dot(&a[q], &a[q]);
-                let gamma = dot(&a[p], &a[q]);
-                if gamma.abs() <= EPS * (alpha * beta).sqrt() || gamma == 0.0 {
+                let norm_p = a[p].iter().fold(0.0_f64, |s, &x| s.hypot(x));
+                let norm_q = a[q].iter().fold(0.0_f64, |s, &x| s.hypot(x));
+                if norm_p == 0.0 || norm_q == 0.0 {
+                    continue;
+                }
+                let correlation: f64 = a[p]
+                    .iter()
+                    .zip(&a[q])
+                    .map(|(&x, &y)| (x / norm_p) * (y / norm_q))
+                    .sum();
+                if correlation.abs() <= EPS {
+                    continue;
+                }
+                // Compute the Jacobi angle without forming a huge zeta or zeta².
+                // Pairwise scaling also preserves rotations involving a very small
+                // column beside a large one, whose squared norm could underflow.
+                let pair_scale = norm_p.max(norm_q);
+                let ap = norm_p / pair_scale;
+                let aq = norm_q / pair_scale;
+                let gamma = correlation * ap * aq;
+                let half_gap = 0.5 * (aq * aq - ap * ap);
+                let t = if half_gap == 0.0 {
+                    1.0
+                } else {
+                    gamma / (half_gap + half_gap.hypot(gamma).copysign(half_gap))
+                };
+                if t == 0.0 {
                     continue;
                 }
                 rotated = true;
-                let zeta = (beta - alpha) / (2.0 * gamma);
-                let t = zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt());
-                let t = if zeta == 0.0 { 1.0 } else { t };
                 let c = 1.0 / (1.0 + t * t).sqrt();
                 let s = c * t;
                 for k in 0..rows {
@@ -248,7 +271,10 @@ pub(super) fn svd_thin(j: &[Vec<f64>], n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Ve
         }
     }
     let mut order: Vec<usize> = (0..cols).collect();
-    let sv: Vec<f64> = a.iter().map(|col| norm(col)).collect();
+    let sv: Vec<f64> = a
+        .iter()
+        .map(|col| col.iter().fold(0.0_f64, |s, &x| s.hypot(x)))
+        .collect();
     order.sort_by(|&x, &y| sv[y].total_cmp(&sv[x]));
     let k = m.min(n);
     let mut left = Vec::with_capacity(k);
@@ -1229,4 +1255,49 @@ where
         njev,
         status: status.unwrap_or(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::svd_thin;
+
+    #[test]
+    fn thin_svd_preserves_extreme_units_and_rectangular_reconstruction() {
+        for scale in [1e-200, 1.0, 1e200] {
+            for wide in [false, true] {
+                let normalized = if wide {
+                    vec![vec![1.0, 0.0, 1.0], vec![1.0, 1.0, 0.0]]
+                } else {
+                    vec![vec![1.0, 1.0], vec![0.0, 1.0], vec![1.0, 0.0]]
+                };
+                let j: Vec<Vec<f64>> = normalized
+                    .iter()
+                    .map(|row| row.iter().map(|x| x * scale).collect())
+                    .collect();
+                let (u, singular, v) = svd_thin(&j, j[0].len());
+                assert!((singular[0] / scale - 3.0_f64.sqrt()).abs() < 1e-14);
+                assert!((singular[1] / scale - 1.0).abs() < 1e-14);
+                for (row, values) in normalized.iter().enumerate() {
+                    for (col, expected) in values.iter().enumerate() {
+                        let reconstructed: f64 = (0..singular.len())
+                            .map(|k| u[k][row] * (singular[k] / scale) * v[k][col])
+                            .sum();
+                        assert!(
+                            (reconstructed - expected).abs() < 1e-14,
+                            "scale={scale}, wide={wide}, ({row}, {col}): {reconstructed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thin_svd_retains_small_orthogonal_columns_at_mixed_scales() {
+        let matrix = vec![vec![1e200, 0.0], vec![0.0, 1e-200], vec![0.0, 0.0]];
+        let (u, singular, v) = svd_thin(&matrix, 2);
+        assert_eq!(singular, vec![1e200, 1e-200]);
+        assert_eq!(u, vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]);
+        assert_eq!(v, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    }
 }
