@@ -9,9 +9,9 @@ use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
-    Alpha, Argus, BetaDist, Burr3, Burr12, ContinuousDistribution, CrystalBall, FitError,
-    FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter, Normal, SkewCauchy,
-    Weibull, fit_mle, with_hardened_stats_caps, with_stats_runtime_mode,
+    Alpha, Argus, BetaDist, Burr3, Burr12, ContinuousDistribution, CrystalBall, FDistribution,
+    FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter, Normal,
+    SkewCauchy, Weibull, fit_mle, with_hardened_stats_caps, with_stats_runtime_mode,
 };
 
 const ORACLE: &str = r#"
@@ -37,6 +37,7 @@ cases = [
     ('skewcauchy', stats.skewcauchy, [(-0.7,), (0.0,), (0.6,)]),
     ('alpha', stats.alpha, [(0.2,), (2.0,), (6.0,)]),
     ('argus', stats.argus, [(0.8,), (2.0,), (5.0,)]),
+    ('f', stats.f, [(1.0, 1.5), (5.0, 10.0), (30.0, 8.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -58,6 +59,79 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn f_distribution_mle_fits_heavy_tails_without_finite_sample_moments() {
+    // SciPy F fitting uses likelihood, not the existence of the family's
+    // first two moments. These F MLEs have infinite mean/variance or variance.
+    // References: scipy.stats.f.fit(data, floc=0, fscale=1), SciPy 1.17.0.
+    let cases = [
+        (
+            [
+                0.02, 0.05, 0.1, 0.15, 0.3, 0.5, 0.8, 1.5, 3.0, 8.0, 25.0, 100.0,
+            ],
+            [1.246_044_954_941_134_5, 1.209_589_814_253_467_3],
+            26.569_364_618_839_074,
+        ),
+        (
+            [0.2, 0.35, 0.5, 0.7, 0.9, 1.0, 1.2, 1.4, 1.8, 2.5, 4.0, 8.0],
+            [7.199_934_851_824_194, 3.839_962_291_413_743_7],
+            18.568_068_233_416_327,
+        ),
+    ];
+    for (data, expected, expected_nll) in cases {
+        let fitted = FDistribution::try_fit(&data).expect("finite heavy-tail F MLE");
+        assert!(
+            fitted.dfd < 4.0,
+            "MLE must allow infinite-variance families"
+        );
+        for (actual, reference) in [fitted.dfn, fitted.dfd].into_iter().zip(expected) {
+            assert!(
+                (actual - reference).abs() < 2.0e-4,
+                "{actual} != {reference}"
+            );
+        }
+        let nll = likelihood(&fitted, &data);
+        assert!(nll.is_finite() && nll <= expected_nll + 1.0e-9);
+        let infallible = FDistribution::fit(&data);
+        assert_eq!(infallible, fitted);
+    }
+}
+
+#[test]
+fn f_distribution_mle_rejects_invalid_samples() {
+    for data in [&[][..], &[1.0], &[0.0, 1.0], &[-1.0, 2.0], &[1.0, f64::NAN]] {
+        assert!(FDistribution::try_fit(data).is_err());
+        let fitted = FDistribution::fit(data);
+        assert!(fitted.dfn.is_nan() && fitted.dfd.is_nan());
+    }
+    assert!(matches!(
+        FDistribution::try_fit(&[1.0, 1.0, 1.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+}
+
+#[test]
+fn f_distribution_likelihood_survives_extreme_observations() {
+    let distribution = FDistribution::new(5.0, 10.0);
+    // 100-digit Decimal evaluation with B(5/2,5) = 24 / product(5/2 .. 13/2).
+    // The direct dfn*x expression overflows at 1e308 although logpdf is finite.
+    for (x, expected) in [
+        (1.0e308, -4_247.639_888_414_259),
+        (1.0e-300, -1_033.824_532_262_782_4),
+    ] {
+        let actual = distribution.logpdf(x);
+        assert!(actual.is_finite());
+        assert!(
+            (actual - expected).abs() < 1.0e-11,
+            "{actual} != {expected}"
+        );
+    }
+    assert_eq!(distribution.pdf(f64::INFINITY), 0.0);
+    assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+    assert!(distribution.pdf(f64::NAN).is_nan());
+    assert!(distribution.logpdf(f64::NAN).is_nan());
 }
 
 #[test]
@@ -490,7 +564,7 @@ fn crystal_ball_large_shape_density_and_probabilities_are_usable() {
 }
 
 #[test]
-fn mle_matches_live_scipy_on_thirty_six_seeded_fits() {
+fn mle_matches_live_scipy_on_seeded_fits() {
     let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
     let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
     let available = Command::new(&python)
@@ -548,6 +622,10 @@ fn mle_matches_live_scipy_on_thirty_six_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "f" => {
+                let fitted = FDistribution::try_fit(&data).unwrap();
+                (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
+            }
             "skewcauchy" => {
                 let fitted = SkewCauchy::try_fit(&data).unwrap();
                 (vec![fitted.a], likelihood(&fitted, &data))
@@ -662,8 +740,8 @@ fn mle_matches_live_scipy_on_thirty_six_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 36,
+        compared, 39,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 12; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 13; samples per case = 2000");
 }

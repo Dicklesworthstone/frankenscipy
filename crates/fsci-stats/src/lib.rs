@@ -4088,27 +4088,26 @@ impl FDistribution {
 
 impl ContinuousDistribution for FDistribution {
     fn pdf(&self, x: f64) -> f64 {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        let ln_pdf = 0.5 * d1 * (d1 / d2).ln() + (0.5 * d1 - 1.0) * x.ln()
-            - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln()
-            - ln_beta(0.5 * d1, 0.5 * d2);
-        ln_pdf.exp()
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // log of the F density; finite in the tail where pdf underflows. frankenscipy-p82v7
-        if x <= 0.0 {
-            return self.pdf(x).ln();
+        if x <= 0.0 || x == f64::INFINITY {
+            return f64::NEG_INFINITY;
         }
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        0.5 * d1 * (d1 / d2).ln() + (0.5 * d1 - 1.0) * x.ln()
-            - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln()
-            - ln_beta(0.5 * d1, 0.5 * d2)
+        // Write the beta-prime density in log coordinates. Neither dfn*x nor
+        // dfn/dfd need be representable; combining the linear terms first also
+        // avoids cancellation in the right tail during likelihood fitting.
+        let a = 0.5 * self.dfn;
+        let b = 0.5 * self.dfd;
+        let log_x = x.ln();
+        let log_ratio = self.dfn.ln() - self.dfd.ln() + log_x;
+        let log_kernel = if log_ratio >= 0.0 {
+            -b * log_ratio - (a + b) * (-log_ratio).exp().ln_1p()
+        } else {
+            a * log_ratio - (a + b) * log_ratio.exp().ln_1p()
+        };
+        log_kernel - log_x - ln_beta(a, b)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -4251,78 +4250,30 @@ impl ContinuousDistribution for FDistribution {
     }
 
     fn fit(data: &[f64]) -> Self {
-        if data.is_empty() || data.iter().any(|&x| !x.is_finite() || x < 0.0) {
-            return Self {
-                dfn: f64::NAN,
-                dfd: f64::NAN,
-            };
-        }
-
-        let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        if !mean.is_finite() || !var.is_finite() || mean <= 1.0 || var <= 0.0 {
-            return Self {
-                dfn: f64::NAN,
-                dfd: f64::NAN,
-            };
-        }
-
-        let dfd = 2.0 * mean / (mean - 1.0);
-        if !dfd.is_finite() || dfd <= 4.0 {
-            return Self {
-                dfn: f64::NAN,
-                dfd: f64::NAN,
-            };
-        }
-
-        let base_variance = 2.0 * dfd * dfd / ((dfd - 2.0).powi(2) * (dfd - 4.0));
-        let variance_ratio = var / base_variance;
-        if !variance_ratio.is_finite() || variance_ratio <= 1.0 {
-            return Self {
-                dfn: f64::NAN,
-                dfd: f64::NAN,
-            };
-        }
-
-        let dfn = (dfd - 2.0) / (variance_ratio - 1.0);
-        if !dfn.is_finite() || dfn <= 0.0 {
-            return Self {
-                dfn: f64::NAN,
-                dfd: f64::NAN,
-            };
-        }
-
-        Self { dfn, dfd }
+        Self::try_fit(data).unwrap_or(Self {
+            dfn: f64::NAN,
+            dfd: f64::NAN,
+        })
     }
 
+    /// Maximum-likelihood estimates of both degrees of freedom, with location
+    /// zero and scale one, as in `scipy.stats.f.fit(data, floc=0, fscale=1)`.
+    /// No finite-moment assumption is imposed: denominator degrees of freedom
+    /// below four (or below two) remain valid likelihood models.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        if let Some(&x) = data.iter().find(|&&x| !x.is_finite()) {
-            return Err(FitError::UnsupportedData(format!(
-                "FDistribution fit data contains non-finite value: {x}"
-            )));
-        }
-        if let Some(&x) = data.iter().find(|&&x| x < 0.0) {
-            return Err(FitError::UnsupportedData(format!(
-                "FDistribution support is [0, infinity); got {x}"
-            )));
-        }
-
-        let fitted = Self::fit(data);
-        if fitted.dfn.is_finite() && fitted.dfn > 0.0 && fitted.dfd.is_finite() && fitted.dfd > 4.0
-        {
-            Ok(fitted)
-        } else {
-            Err(FitError::NonConvergent(
-                "FDistribution moment fit could not estimate valid degrees of freedom".to_owned(),
-            ))
-        }
+        mle::validate_positive_sample(data, "FDistribution")?;
+        fit_mle(
+            data,
+            &[MleParameter::Positive(1.0), MleParameter::Positive(1.0)],
+            |p| {
+                Some(Self {
+                    dfn: p[0],
+                    dfd: p[1],
+                })
+            },
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
     }
 
     fn mode(&self) -> f64 {
@@ -83743,15 +83694,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_f_distribution_matches_moments() {
+    fn test_fit_f_distribution_maximizes_likelihood_instead_of_matching_moments() {
         let reference = FDistribution::new(20.0, 30.0);
         let mean = reference.mean();
         let var = reference.var();
         let delta = (1.5 * var).sqrt();
         let data = [mean - delta, mean, mean + delta];
         let fitted = FDistribution::fit(&data);
-        assert_close(fitted.dfn, reference.dfn, 1e-10, "F fit dfn");
-        assert_close(fitted.dfd, reference.dfd, 1e-10, "F fit dfd");
+        // SciPy 1.17.0 with floc=0, fscale=1. The moment estimate (20,30)
+        // is admissible but has a measurably worse likelihood on this sample.
+        assert_close(fitted.dfn, 9.765_252_686_360_254, 1e-3, "F MLE dfn");
+        assert_close(fitted.dfd, 218.103_303_223_121_57, 0.1, "F MLE dfd");
+        let nll = -data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        let moment_nll = -data.iter().map(|&x| reference.logpdf(x)).sum::<f64>();
+        assert!(nll <= 1.929_048_516_792_818_2 + 1e-9);
+        assert!(moment_nll - nll > 0.1);
     }
 
     #[test]
@@ -84426,8 +84383,9 @@ mod tests {
         let f_delta = (1.5 * f_var).sqrt();
         let f_data = [f_mean - f_delta, f_mean, f_mean + f_delta];
         let f = FDistribution::try_fit(&f_data).expect("F try_fit");
-        assert_close(f.dfn, f_reference.dfn, 1e-10, "F dfn");
-        assert_close(f.dfd, f_reference.dfd, 1e-10, "F dfd");
+        assert_eq!(f, FDistribution::fit(&f_data));
+        assert!(f.dfn.is_finite() && f.dfn > 0.0);
+        assert!(f.dfd.is_finite() && f.dfd > 0.0);
 
         let weibull_reference = Weibull::new(2.0, 3.0);
         let weibull_data: Vec<f64> = (1..100)
