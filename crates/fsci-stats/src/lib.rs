@@ -21103,8 +21103,7 @@ impl TruncNormal {
             // The first omitted relative term, 1/x², is below machine epsilon.
             -x.ln()
         } else {
-            0.5 * (PI / 2.0).ln()
-                + fsci_special::erfcx_scalar(x * FRAC_1_SQRT_2).ln()
+            0.5 * (PI / 2.0).ln() + fsci_special::convenience::erfcx_scalar(x * FRAC_1_SQRT_2).ln()
         }
     }
 
