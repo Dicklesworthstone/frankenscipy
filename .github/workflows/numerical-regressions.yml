@@ -64,6 +64,8 @@ jobs:
           case "$LANE" in
             least-squares)
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
+              cargo test --locked -p fsci-opt --lib trf_lsmr::tests -- --nocapture
+              cargo test --locked -p fsci-opt --test least_squares_lsmr_scipy -- --nocapture
               ;;
             sparse-lsmr)
               cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture

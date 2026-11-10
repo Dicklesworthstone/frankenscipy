@@ -21,6 +21,7 @@ mod npx;
 pub mod root;
 mod slsqp;
 mod trf;
+mod trf_lsmr;
 pub mod trust_constr;
 mod trust_region;
 pub mod types;
@@ -62,6 +63,7 @@ pub use minimize::{
     probe_objective_landscape, select_minimize_method, trust_exact, trust_krylov, trust_ncg,
 };
 pub use trf::{LossKind, XScale};
+pub use trf_lsmr::{TrustRegionLsmrOptions, TrustRegionSolver};
 pub use trust_constr::{
     FactorizationMethod, TrustBounds, TrustConstrMethod, TrustConstrResult, TrustConstraint,
     trust_constr_full,

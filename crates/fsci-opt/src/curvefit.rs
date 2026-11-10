@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::FiniteDiffMethod;
 use crate::trf::{self, Loss, LossKind, XScale};
+use crate::trf_lsmr::TrustRegionSolver;
 use crate::types::OptError;
 
 /// SciPy's `least_squares(method=...)`.
@@ -119,6 +120,10 @@ pub struct LeastSquaresOptions {
     /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
     /// `curve_fit`, `Trf` for a bounded one.
     pub method: Option<LeastSquaresMethod>,
+    /// Linear solver for TRF and Dogbox. `Exact` factors the dense Jacobian;
+    /// `Lsmr` uses iterative products instead. The Jacobian itself is still
+    /// dense in this API. LM does not accept the LSMR backend.
+    pub tr_solver: TrustRegionSolver,
     /// Gradient convergence tolerance. LM uses the maximum absolute cosine
     /// between the residual vector and each Jacobian column; the trust-region
     /// methods use their scaled gradient norms.
@@ -155,6 +160,7 @@ impl Default for LeastSquaresOptions {
     fn default() -> Self {
         Self {
             method: None,
+            tr_solver: TrustRegionSolver::Exact,
             gtol: 1.0e-8,
             xtol: 1.0e-8,
             ftol: 1.0e-8,
@@ -522,6 +528,11 @@ where
     if options.loss != LossKind::Linear {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
+        });
+    }
+    if !matches!(options.tr_solver, TrustRegionSolver::Exact) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("method 'lm' does not support tr_solver='lsmr'"),
         });
     }
     let diff_step = options.diff_step.unwrap_or(SQRT_EPS);
@@ -939,6 +950,19 @@ impl From<trf::NonFiniteJacobian> for OptError {
     }
 }
 
+impl From<fsci_sparse::SparseError> for OptError {
+    fn from(error: fsci_sparse::SparseError) -> Self {
+        match error {
+            fsci_sparse::SparseError::NonFiniteInput { message } => Self::NonFiniteInput {
+                detail: message,
+            },
+            error => Self::NotConverged {
+                detail: format!("LSMR subproblem failed: {error}"),
+            },
+        }
+    }
+}
+
 /// Dense `trf`/`dogbox` setup: validate tolerances and bounds, require finite initial
 /// residuals, and move `x0` off the bounds only for TRF (Dogbox accepts exact bounds).
 fn least_squares_trust_region<F>(
@@ -1044,6 +1068,15 @@ where
             detail: String::from("diff_step must be finite and > 0"),
         });
     }
+    if let TrustRegionSolver::Lsmr(lsmr) = options.tr_solver
+        && !lsmr.validate()
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "LSMR atol, btol and conlim must be finite and nonnegative; damp must be finite",
+            ),
+        });
+    }
     let dogbox = options.method == Some(LeastSquaresMethod::Dogbox);
     let x0 = if dogbox {
         x0.to_vec()
@@ -1111,6 +1144,8 @@ where
         options.max_nfev,
         &x_scale,
         loss.as_ref(),
+        options.tr_solver,
+        options.mode,
     )?;
     Ok(LeastSquaresResult {
         // status: SciPy's code; success = status > 0 (a gtol/ftol/xtol test passed)

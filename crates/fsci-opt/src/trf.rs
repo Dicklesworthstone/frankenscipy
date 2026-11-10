@@ -5,14 +5,18 @@
 //! The Trust Region Reflective algorithm (`method = Trf`) follows
 //! SciPy's `scipy/optimize/_lsq/trf.py` with the helpers of `_lsq/common.py` and the robust
 //! losses of `_lsq/least_squares.py` (Branch, Coleman & Li, SIAM J. Sci. Comput. 21(1), 1999),
-//! transcribed function by function with the dense (`tr_solver = 'exact'`) subproblem solver:
-//! Moré's algorithm on one SVD per outer iteration.
+//! with two subproblem solvers: Moré's algorithm on one SVD per outer iteration
+//! (`Exact`), or an iterative LSMR direction and two-dimensional trust-region
+//! minimization (`Lsmr`). The latter avoids a full Jacobian factorization.
 //!
 //! Bounds are handled by the Coleman–Li scaling `v`, a step that is reflected off the first
 //! bound it hits, and a choice among the scaled trust-region step, its reflection and the
 //! scaled gradient, as in SciPy. Without bounds the plain trust-region step is taken.
 //! `method = Dogbox` uses Powell's dogleg path inside rectangular trust regions, intersected
 //! with the original bounds, with active variables excluded from the Gauss–Newton solve.
+
+use crate::trf_lsmr::{self, TrustRegionSolver};
+use fsci_runtime::RuntimeMode;
 
 const EPS: f64 = f64::EPSILON;
 
@@ -775,9 +779,11 @@ pub(crate) fn trf<E>(
     max_nfev: Option<usize>,
     x_scale: &XScale,
     loss: Option<&Loss>,
+    solver: TrustRegionSolver,
+    mode: RuntimeMode,
 ) -> Result<TrfOutcome, E>
 where
-    E: From<NonFiniteJacobian>,
+    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
 {
     let bounded =
         lb.iter().any(|v| *v != f64::NEG_INFINITY) || ub.iter().any(|v| *v != f64::INFINITY);
@@ -878,7 +884,19 @@ where
             .iter()
             .map(|row| row.iter().zip(&d).map(|(a, b)| a * b).collect())
             .collect();
-        let (s, vv, uf) = if bounded {
+        let lsmr_model = if let TrustRegionSolver::Lsmr(options) = solver {
+            if !all_finite(&j_h) || diag_h.iter().any(|value| !value.is_finite()) {
+                return Err(NonFiniteJacobian.into());
+            }
+            Some(trf_lsmr::subspace(
+                &j_h, &f, &g_h, &diag_h, delta, bounded, options, mode,
+            )?)
+        } else {
+            None
+        };
+        let (s, vv, uf) = if lsmr_model.is_some() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else if bounded {
             let mut aug = j_h.clone();
             for (i, dh) in diag_h.iter().enumerate() {
                 let mut row = vec![0.0; n];
@@ -912,8 +930,14 @@ where
         let mut f_new = f.clone();
         let mut cost_new = cost;
         while actual_reduction <= 0.0 && nfev < max_nfev {
-            let (p_h, new_alpha) = solve_lsq_trust_region(n, m, &uf, &s, &vv, delta, alpha);
-            alpha = new_alpha;
+            let p_h = if let Some(model) = &lsmr_model {
+                model.step(delta)
+            } else {
+                let (step, new_alpha) =
+                    solve_lsq_trust_region(n, m, &uf, &s, &vv, delta, alpha);
+                alpha = new_alpha;
+                step
+            };
             let (step, step_h, predicted_reduction) = if bounded {
                 let p: Vec<f64> = d.iter().zip(&p_h).map(|(a, b)| a * b).collect();
                 select_step(&x, &j_h, &diag_h, &g_h, p, p_h, &d, delta, lb, ub, theta)
@@ -1068,9 +1092,11 @@ pub(crate) fn dogbox<E>(
     max_nfev: Option<usize>,
     x_scale: &XScale,
     loss: Option<&Loss>,
+    solver: TrustRegionSolver,
+    mode: RuntimeMode,
 ) -> Result<TrfOutcome, E>
 where
-    E: From<NonFiniteJacobian>,
+    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
 {
     let n = x0.len();
     let mut x = x0.to_vec();
@@ -1141,17 +1167,29 @@ where
         if !all_finite(&j_free) {
             return Err(NonFiniteJacobian.into());
         }
-        let (u, singular, v) = svd_thin(&j_free, free.len());
-        let cutoff = EPS * singular.first().copied().unwrap_or(0.0);
-        let mut newton = vec![0.0; free.len()];
-        for k in 0..singular.len() {
-            if singular[k] > cutoff {
-                let coefficient = -dot(&u[k], &f) / singular[k];
-                for (step, &vk) in newton.iter_mut().zip(&v[k]) {
-                    *step += coefficient * vk;
+        let newton = match solver {
+            TrustRegionSolver::Exact => {
+                let (u, singular, v) = svd_thin(&j_free, free.len());
+                let cutoff = EPS * singular.first().copied().unwrap_or(0.0);
+                let mut step = vec![0.0; free.len()];
+                for k in 0..singular.len() {
+                    if singular[k] > cutoff {
+                        let coefficient = -dot(&u[k], &f) / singular[k];
+                        for (value, &vk) in step.iter_mut().zip(&v[k]) {
+                            *value += coefficient * vk;
+                        }
+                    }
                 }
+                step
             }
-        }
+            TrustRegionSolver::Lsmr(mut options) => {
+                let scales: Vec<f64> = free.iter().map(|&i| scale[i]).collect();
+                // SciPy's operator keeps all columns and masks the active ones.
+                // Retain its default budget even though we store only free columns.
+                options.max_iter = options.max_iter.or(Some(j.len().min(n)));
+                trf_lsmr::dogbox_step(&j_free, &f, &scales, options, mode)?
+            }
+        };
         let anti_gradient: Vec<f64> = g_free.iter().map(|v| -v).collect();
         let (a, b, _) = build_quadratic_1d(&j_free, &g_free, &anti_gradient, None, None);
         let x_free: Vec<f64> = free.iter().map(|&i| x[i]).collect();
