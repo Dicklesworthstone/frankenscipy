@@ -11786,26 +11786,290 @@ fn csc_transpose_matvec_into(
     }
 }
 
+/// Controls for [`lsmr_with_options`], corresponding to SciPy's LSMR keywords.
+///
+/// `atol` bounds the relative uncertainty in the operator and `btol` in the
+/// right-hand side. They are independent stopping tolerances, not a tolerance
+/// on the relative residual alone. Setting both to zero retains the machine
+/// precision safeguards. A nonpositive or infinite `conlim` disables the
+/// user condition-number limit; the machine-precision limit remains active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LsmrOptions<'a> {
+    pub mode: RuntimeMode,
+    pub atol: f64,
+    pub btol: f64,
+    pub conlim: f64,
+    /// Defaults to `min(rows, cols)`, as in SciPy.
+    pub max_iter: Option<usize>,
+    /// Tikhonov damping. A negative value has the same effect as its magnitude.
+    pub damp: f64,
+    /// With a warm start the damping penalizes `x - x0`, as in SciPy.
+    pub x0: Option<&'a [f64]>,
+}
+
+impl Default for LsmrOptions<'_> {
+    fn default() -> Self {
+        Self {
+            mode: RuntimeMode::Strict,
+            atol: 1.0e-6,
+            btol: 1.0e-6,
+            conlim: 1.0e8,
+            max_iter: None,
+            damp: 0.0,
+            x0: None,
+        }
+    }
+}
+
+/// SciPy's LSMR result tuple, with named fields.
+///
+/// The norms and condition number are the bidiagonalization estimates returned
+/// by SciPy, including its zero-iteration initialization (`normx = 0`).
+/// `normr` includes the damping block; it is not the relative residual exposed
+/// by [`IterativeSolveResult`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LsmrResult {
+    pub solution: Vec<f64>,
+    /// 0: initial point is stationary; 1: compatible-system tolerance;
+    /// 2: least-squares tolerance; 3: condition limit; 4/5/6: the corresponding
+    /// machine-precision safeguards; 7: iteration limit.
+    pub istop: i32,
+    pub iterations: usize,
+    pub normr: f64,
+    pub normar: f64,
+    pub norma: f64,
+    pub conda: f64,
+    pub normx: f64,
+}
+
+/// Solve a real least-squares problem with SciPy's LSMR stopping controls.
+///
+/// Minimizes `||A*x - b||² + damp² * ||x - x0||²`, with a zero start when `x0`
+/// is absent. The Fong–Saunders recurrence is shared with [`lsmr`]; this entry
+/// point additionally implements SciPy's independent `atol`/`btol` tests,
+/// condition limit, machine-precision exits, and all eight result fields.
+///
+/// An iteration or condition limit is a successful computation with `istop`
+/// 7 or 3, not a Rust error. Callers such as a nonlinear trust-region solver
+/// can use that approximate step. Invalid controls, dimensions, non-finite
+/// inputs, or operator failures return a typed error.
+///
+/// Reference: `scipy/sparse/linalg/_isolve/lsmr.py`, SciPy 1.17.1.
+pub fn lsmr_with_options(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    options: LsmrOptions<'_>,
+) -> SparseResult<LsmrResult> {
+    let shape = a.shape();
+    let (m, n) = (shape.rows, shape.cols);
+    if b.len() != m {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    if let Some(start) = options.x0
+        && start.len() != n
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!("lsmr x0 length {} must match matrix columns {n}", start.len()),
+        });
+    }
+    for (name, tolerance) in [("atol", options.atol), ("btol", options.btol)] {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(SparseError::InvalidArgument {
+                message: format!("lsmr {name} must be finite and non-negative"),
+            });
+        }
+    }
+    if options.conlim.is_nan() || !options.damp.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: "lsmr conlim must not be NaN and damp must be finite".to_string(),
+        });
+    }
+    validate_iterative_finite_inputs(
+        a,
+        b,
+        options.x0,
+        IterativeSolveOptions {
+            mode: options.mode,
+            check_finite: true,
+            tol: options.atol,
+            max_iter: options.max_iter,
+        },
+    )?;
+
+    let normb = vec_norm(b);
+    let mut x = options.x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
+    let mut u = match options.x0 {
+        Some(_) => {
+            let ax = a.matvec(&x)?;
+            b.iter().zip(ax).map(|(bi, ai)| bi - ai).collect()
+        }
+        None => b.to_vec(),
+    };
+    let mut beta = vec_norm(&u);
+    let cached_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
+    let mut v = vec![0.0; n];
+    let mut alpha = 0.0;
+    if beta > 0.0 {
+        let inverse = 1.0 / beta;
+        for entry in &mut u {
+            *entry *= inverse;
+        }
+        csc_transpose_matvec_into(a, cached_csc.as_ref(), &u, &mut v)?;
+        alpha = vec_norm(&v);
+        if alpha > 0.0 {
+            let inverse = 1.0 / alpha;
+            for entry in &mut v {
+                *entry *= inverse;
+            }
+        }
+    }
+    if !alpha.is_finite() || !beta.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: "lsmr operator or initial residual produced a non-finite norm".to_string(),
+        });
+    }
+    let mut norm_a_squared = alpha * alpha;
+    let mut norma = norm_a_squared.sqrt();
+    let mut conda = 1.0;
+    let mut normx = 0.0;
+    let mut normr = beta;
+    let mut normar = alpha * beta;
+    let mut istop = 0;
+    let mut iterations = 0;
+    // SciPy checks stationarity before a zero rhs, which matters for a warm
+    // start in the operator's nullspace.
+    if normar == 0.0 || normb == 0.0 {
+        if normar != 0.0 && normb == 0.0 {
+            x.fill(0.0);
+        }
+        return Ok(LsmrResult {
+            solution: x,
+            istop,
+            iterations,
+            normr,
+            normar,
+            norma,
+            conda,
+            normx,
+        });
+    }
+
+    let max_iter = options.max_iter.unwrap_or(m.min(n));
+    let ctol = if options.conlim > 0.0 {
+        1.0 / options.conlim
+    } else {
+        0.0
+    };
+    let mut max_r_bar = 0.0_f64;
+    let mut min_r_bar = 1.0e100_f64;
+    let mut recurrence = LsmrRecurrence::new(alpha, beta, &v);
+    let mut av = vec![0.0; m];
+    let mut atu = vec![0.0; n];
+
+    for iteration in 0..max_iter {
+        beta = lsmr_bidiagonalize(
+            a,
+            cached_csc.as_ref(),
+            &mut u,
+            &mut v,
+            &mut alpha,
+            &mut av,
+            &mut atu,
+            true,
+        )?;
+        if !alpha.is_finite() || !beta.is_finite() {
+            return Err(SparseError::NonFiniteInput {
+                message: "lsmr operator produced a non-finite bidiagonalization norm".to_string(),
+            });
+        }
+        let step = recurrence
+            .advance(alpha, beta, options.damp, &v, &mut x)
+            .ok_or_else(|| SparseError::SingularMatrix {
+                message: "lsmr orthogonalization broke down before a stopping test".to_string(),
+            })?;
+        iterations = iteration + 1;
+        normr = step.normr;
+        normar = step.normar;
+
+        // Include alpha_1 from initialization, then beta_(k+1) before the
+        // square root and alpha_(k+1) afterwards, exactly as SciPy does.
+        norm_a_squared += beta * beta;
+        norma = norm_a_squared.sqrt();
+        norm_a_squared += alpha * alpha;
+        max_r_bar = max_r_bar.max(step.rho_bar_old);
+        if iterations > 1 {
+            min_r_bar = min_r_bar.min(step.rho_bar_old);
+        }
+        conda = max_r_bar.max(step.rho_temp) / min_r_bar.min(step.rho_temp);
+        normx = vec_norm(&x);
+        if !normr.is_finite() || !normar.is_finite() || !norma.is_finite() || !normx.is_finite() {
+            return Err(SparseError::NonFiniteInput {
+                message: "lsmr arithmetic produced non-finite residual or solution norms"
+                    .to_string(),
+            });
+        }
+
+        let test1 = normr / normb;
+        let test2 = if norma * normr != 0.0 {
+            normar / (norma * normr)
+        } else {
+            f64::INFINITY
+        };
+        let test3 = 1.0 / conda;
+        let scaled_residual = test1 / (1.0 + norma * normx / normb);
+        let rtol = options.btol + options.atol * norma * normx / normb;
+        // Later tests override earlier ones. In particular, convergence on
+        // the final allowed iteration is not reported as budget exhaustion.
+        if iterations >= max_iter {
+            istop = 7;
+        }
+        if 1.0 + test3 <= 1.0 {
+            istop = 6;
+        }
+        if 1.0 + test2 <= 1.0 {
+            istop = 5;
+        }
+        if 1.0 + scaled_residual <= 1.0 {
+            istop = 4;
+        }
+        if test3 <= ctol {
+            istop = 3;
+        }
+        if test2 <= options.atol {
+            istop = 2;
+        }
+        if test1 <= rtol {
+            istop = 1;
+        }
+        if istop != 0 {
+            break;
+        }
+    }
+
+    Ok(LsmrResult {
+        solution: x,
+        istop,
+        iterations,
+        normr,
+        normar,
+        norma,
+        conda,
+        normx,
+    })
+}
+
 /// LSMR solver for sparse least-squares problems.
 ///
 /// Uses the Fong-Saunders second QR recurrence to minimize the normal-equation
 /// residual ||Aᵀ(Ax - b)||₂ monotonically.
 ///
-/// Matches `scipy.sparse.linalg.lsmr(A, b)` in the ITERATION, but NOT in the
-/// DEFAULT ITERATION LIMIT, and the docstring used to claim parity without that
-/// qualification. SciPy defaults to `maxiter = min(m, n)`
-/// (`_isolve/lsmr.py:221-222`, `minDim`); this defaults to `n * 10`, which is
-/// SciPy's convention for the KRYLOV solvers (`_isolve/iterative.py:102`) and not
-/// for the least-squares pair.
+/// The default iteration limit is `min(m, n)`. This entry point retains its
+/// relative-residual tolerance and [`IterativeSolveResult`] contract. Use
+/// [`lsmr_with_options`] for SciPy's independent `atol`/`btol` criteria,
+/// condition limit, stop code, and residual/condition estimates.
 ///
-/// The difference is one of budget, not of answer: ours is strictly LARGER, so it
-/// can only converge where SciPy gives up, never return a different solution for a
-/// problem both finish. What it does change is the `converged` flag and the
-/// `iterations` count on a problem neither solves quickly, which is exactly what a
-/// differential test against SciPy would compare.
-///
-/// See `scipy_default_iteration_limits` below for the faithful values and why the
-/// flip has not been made yet.
 /// LSMR for the plain least-squares problem, `min ||Ax - b||`.
 ///
 /// Equivalent to `lsmr_damped(a, b, 0.0, options)`, and BIT-FOR-BIT what this
@@ -12040,87 +12304,26 @@ fn lsmr_impl(
         *entry /= alpha;
     }
 
-    // Fong & Saunders, Algorithm 6.1.  These rotations distinguish LSMR
-    // from LSQR even though both use Golub-Kahan bidiagonalization.
-    let mut beta = beta_0;
-    let mut alpha_bar = alpha;
-    let mut rho = 1.0;
-    let mut rho_bar = 1.0;
-    let mut c_bar = 1.0;
-    let mut s_bar = 0.0;
-    let mut zeta_bar = alpha * beta;
-    let mut h = v.clone();
-    let mut h_bar = vec![0.0; n];
-    let mut beta_dd = beta;
-    let mut beta_d = 0.0;
-    let mut rho_d_old = 1.0;
-    let mut tau_tilde_old = 0.0;
-    let mut theta_tilde = 0.0;
-    let mut zeta = 0.0;
-    let mut residual_squared = 0.0;
-    // Running ‖A‖_F estimate for the least-squares stopping test
-    // (frankenscipy-7crv5), accumulated from the bidiagonal entries as SciPy
-    // accumulates `normA2`.
+    let mut recurrence = LsmrRecurrence::new(alpha, beta_0, &v);
+    // Retain this API's existing norm estimate and relative-residual stopping
+    // rules. The SciPy-options entry point has independent atol/btol tests.
     let mut a_norm_sq = 0.0_f64;
     let mut x = x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
 
     for iteration in 0..max_iter {
-        a.matvec_into(&v, &mut av)?;
-        for index in 0..m {
-            u[index] = av[index] - alpha * u[index];
-        }
-        beta = vec_norm(&u);
-        // `> 0.0`, not `> f64::EPSILON`: these two guard divisions by β and α,
-        // and only zero makes a division undefined. SciPy's lsmr writes exactly
-        // `if beta > 0:` and `if alpha > 0:` here (frankenscipy-xs7i2).
-        if beta > 0.0 {
-            for entry in &mut u {
-                *entry /= beta;
-            }
-            csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atu)?;
-            for index in 0..n {
-                v[index] = atu[index] - beta * v[index];
-            }
-            alpha = vec_norm(&v);
-            if alpha > 0.0 {
-                for entry in &mut v {
-                    *entry /= alpha;
-                }
-            }
-        }
-
-        // Qhat_{k,2k+1}: this is where SciPy passes `damp`
-        // (`_isolve/lsmr.py:344`, `_sym_ortho(alphabar, damp)`). With damp = 0 the
-        // rotation is the identity — `c_hat = 1`, `s_hat = 0` — so `beta_check`
-        // below is exactly zero and the regularization term drops out of the
-        // residual recurrence without a branch. That is why the undamped path is
-        // bit-for-bit what it was before `damp` existed.
-        let (c_hat, s_hat, alpha_hat) = symmetric_orthogonalization(alpha_bar, damp);
-        let rho_old = rho;
-        let (c, s, next_rho) = symmetric_orthogonalization(alpha_hat, beta);
-        rho = next_rho;
-        let theta_new = s * alpha;
-        alpha_bar = c * alpha;
-
-        let rho_bar_old = rho_bar;
-        let zeta_old = zeta;
-        let theta_bar = s_bar * rho;
-        let rho_temp = c_bar * rho;
-        let (next_c_bar, next_s_bar, next_rho_bar) =
-            symmetric_orthogonalization(rho_temp, theta_new);
-        c_bar = next_c_bar;
-        s_bar = next_s_bar;
-        rho_bar = next_rho_bar;
-        // ρ and ρ̄ are divisors below, and both are hypotenuses: each is zero
-        // only when both of its arguments are, which is precisely the state
-        // where Golub-Kahan has terminated and the current x is the answer.
-        // Clamping them to `f64::EPSILON` instead — as this did — did not
-        // prevent that state, it just made the clamp fire on every well-formed
-        // problem whose scale happened to be small (frankenscipy-xs7i2). SciPy
-        // carries no clamp here at all.
-        if rho == 0.0 || rho_bar == 0.0 {
+        let beta = lsmr_bidiagonalize(
+            a,
+            a_csc.as_ref(),
+            &mut u,
+            &mut v,
+            &mut alpha,
+            &mut av,
+            &mut atu,
+            false,
+        )?;
+        let Some(step) = recurrence.advance(alpha, beta, damp, &v, &mut x) else {
             a.matvec_into(&x, &mut av)?;
             let residual_norm = vec_norm_diff(&av, b) / b_norm;
             return Ok(IterativeSolveResult {
@@ -12129,34 +12332,8 @@ fn lsmr_impl(
                 iterations: iteration + 1,
                 residual_norm,
             });
-        }
-        zeta = c_bar * zeta_bar;
-        zeta_bar *= -s_bar;
-
-        let h_bar_scale = -(theta_bar * rho / (rho_old * rho_bar_old));
-        for index in 0..n {
-            h_bar[index] = h[index] + h_bar_scale * h_bar[index];
-            x[index] += zeta / (rho * rho_bar) * h_bar[index];
-            h[index] = v[index] - theta_new / rho * h[index];
-        }
-
-        let beta_acute = c_hat * beta_dd;
-        let beta_check = -s_hat * beta_dd;
-        let beta_hat = c * beta_acute;
-        beta_dd = -s * beta_acute;
-
-        let theta_tilde_old = theta_tilde;
-        let (c_tilde_old, s_tilde_old, rho_tilde_old) =
-            symmetric_orthogonalization(rho_d_old, theta_bar);
-        theta_tilde = s_tilde_old * rho_bar;
-        rho_d_old = c_tilde_old * rho_bar;
-        beta_d = -s_tilde_old * beta_d + c_tilde_old * beta_hat;
-        tau_tilde_old = (zeta_old - theta_tilde_old * tau_tilde_old) / rho_tilde_old;
-        let tau_d = (zeta - theta_tilde * tau_tilde_old) / rho_d_old;
-        residual_squared += beta_check * beta_check;
-        let estimated_residual =
-            (residual_squared + (beta_d - tau_d) * (beta_d - tau_d) + beta_dd * beta_dd).sqrt()
-                / b_norm;
+        };
+        let estimated_residual = step.normr / b_norm;
 
         // SciPy's istop=2, in LSMR's own quantities: ‖Aᵀr‖ is estimated by
         // |ζ̄|, and `x` is the least-squares solution once that goes small
@@ -12171,7 +12348,7 @@ fn lsmr_impl(
         // [0.6, -0.2, 0.4] (frankenscipy-7crv5, RCH_WORKER=vmi1153651).
         a_norm_sq += alpha * alpha + beta * beta;
         let a_norm = a_norm_sq.sqrt();
-        let normal_residual = zeta_bar.abs();
+        let normal_residual = step.normar;
         let unscaled_residual = estimated_residual * b_norm;
         if normal_residual > 0.0
             && a_norm > 0.0
@@ -12213,6 +12390,375 @@ fn lsmr_impl(
         iterations: max_iter,
         residual_norm,
     })
+}
+
+/// One Golub–Kahan step shared by both LSMR stopping policies.
+/// The original entry points divide by the norm; the SciPy-options entry
+/// point uses SciPy's reciprocal multiplication without changing legacy bits.
+fn lsmr_bidiagonalize(
+    a: &dyn LinearOperator,
+    cached_csc: Option<&CscMatrix>,
+    u: &mut [f64],
+    v: &mut [f64],
+    alpha: &mut f64,
+    av: &mut [f64],
+    atu: &mut [f64],
+    reciprocal_scaling: bool,
+) -> SparseResult<f64> {
+    a.matvec_into(v, av)?;
+    for index in 0..u.len() {
+        u[index] = av[index] - *alpha * u[index];
+    }
+    let beta = vec_norm(u);
+    if beta > 0.0 {
+        if reciprocal_scaling {
+            let inverse = 1.0 / beta;
+            for entry in u.iter_mut() {
+                *entry *= inverse;
+            }
+        } else {
+            for entry in u.iter_mut() {
+                *entry /= beta;
+            }
+        }
+        csc_transpose_matvec_into(a, cached_csc, u, atu)?;
+        for index in 0..v.len() {
+            v[index] = atu[index] - beta * v[index];
+        }
+        *alpha = vec_norm(v);
+        if *alpha > 0.0 {
+            if reciprocal_scaling {
+                let inverse = 1.0 / *alpha;
+                for entry in v.iter_mut() {
+                    *entry *= inverse;
+                }
+            } else {
+                for entry in v.iter_mut() {
+                    *entry /= *alpha;
+                }
+            }
+        }
+    }
+    Ok(beta)
+}
+
+/// Fong–Saunders Algorithm 6.1: the second QR recurrence and residual
+/// estimate. Keeping this state shared prevents the SciPy-options solver
+/// and the older relative-residual API from growing different algorithms.
+struct LsmrRecurrence {
+    alpha_bar: f64,
+    rho: f64,
+    rho_bar: f64,
+    c_bar: f64,
+    s_bar: f64,
+    zeta_bar: f64,
+    h: Vec<f64>,
+    h_bar: Vec<f64>,
+    beta_dd: f64,
+    beta_d: f64,
+    rho_d_old: f64,
+    tau_tilde_old: f64,
+    theta_tilde: f64,
+    zeta: f64,
+    residual_squared: f64,
+}
+
+struct LsmrStep {
+    normr: f64,
+    normar: f64,
+    rho_bar_old: f64,
+    rho_temp: f64,
+}
+
+impl LsmrRecurrence {
+    fn new(alpha: f64, beta: f64, v: &[f64]) -> Self {
+        Self {
+            alpha_bar: alpha,
+            rho: 1.0,
+            rho_bar: 1.0,
+            c_bar: 1.0,
+            s_bar: 0.0,
+            zeta_bar: alpha * beta,
+            h: v.to_vec(),
+            h_bar: vec![0.0; v.len()],
+            beta_dd: beta,
+            beta_d: 0.0,
+            rho_d_old: 1.0,
+            tau_tilde_old: 0.0,
+            theta_tilde: 0.0,
+            zeta: 0.0,
+            residual_squared: 0.0,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        alpha: f64,
+        beta: f64,
+        damp: f64,
+        v: &[f64],
+        x: &mut [f64],
+    ) -> Option<LsmrStep> {
+        let (c_hat, s_hat, alpha_hat) = symmetric_orthogonalization(self.alpha_bar, damp);
+        let rho_old = self.rho;
+        let (c, s, rho) = symmetric_orthogonalization(alpha_hat, beta);
+        self.rho = rho;
+        let theta_new = s * alpha;
+        self.alpha_bar = c * alpha;
+
+        let rho_bar_old = self.rho_bar;
+        let zeta_old = self.zeta;
+        let theta_bar = self.s_bar * rho;
+        let rho_temp = self.c_bar * rho;
+        let (c_bar, s_bar, rho_bar) = symmetric_orthogonalization(rho_temp, theta_new);
+        self.c_bar = c_bar;
+        self.s_bar = s_bar;
+        self.rho_bar = rho_bar;
+        // The previous API's exact-zero breakdown guard is retained. No
+        // epsilon clamp is valid here: the coefficients carry matrix units.
+        if rho == 0.0 || rho_bar == 0.0 {
+            return None;
+        }
+        self.zeta = c_bar * self.zeta_bar;
+        self.zeta_bar *= -s_bar;
+
+        let h_bar_scale = -(theta_bar * rho / (rho_old * rho_bar_old));
+        for index in 0..x.len() {
+            self.h_bar[index] = self.h[index] + h_bar_scale * self.h_bar[index];
+            x[index] += self.zeta / (rho * rho_bar) * self.h_bar[index];
+            self.h[index] = v[index] - theta_new / rho * self.h[index];
+        }
+
+        let beta_acute = c_hat * self.beta_dd;
+        let beta_check = -s_hat * self.beta_dd;
+        let beta_hat = c * beta_acute;
+        self.beta_dd = -s * beta_acute;
+
+        let theta_tilde_old = self.theta_tilde;
+        let (c_tilde_old, s_tilde_old, rho_tilde_old) =
+            symmetric_orthogonalization(self.rho_d_old, theta_bar);
+        self.theta_tilde = s_tilde_old * rho_bar;
+        self.rho_d_old = c_tilde_old * rho_bar;
+        self.beta_d = -s_tilde_old * self.beta_d + c_tilde_old * beta_hat;
+        self.tau_tilde_old = (zeta_old - theta_tilde_old * self.tau_tilde_old) / rho_tilde_old;
+        let tau_d = (self.zeta - self.theta_tilde * self.tau_tilde_old) / self.rho_d_old;
+        self.residual_squared += beta_check * beta_check;
+        let normr = (self.residual_squared
+            + (self.beta_d - tau_d) * (self.beta_d - tau_d)
+            + self.beta_dd * self.beta_dd)
+            .sqrt();
+        Some(LsmrStep {
+            normr,
+            normar: self.zeta_bar.abs(),
+            rho_bar_old,
+            rho_temp,
+        })
+    }
+}
+
+#[cfg(test)]
+mod lsmr_options_tests {
+    use super::{LsmrOptions, lsmr_with_options};
+    use crate::{DenseLinearOperator, FunctionOperator, Shape2D, SparseError};
+
+    fn dense(rows: &[&[f64]]) -> DenseLinearOperator {
+        DenseLinearOperator::from_rows(&rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>())
+            .expect("rectangular matrix")
+    }
+
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-12 * expected.abs().max(1.0),
+            "actual={actual:.17e}, expected={expected:.17e}"
+        );
+    }
+
+    #[test]
+    fn lsmr_options_damped_warm_start_reports_augmented_residual() {
+        let a = dense(&[&[1.0, 0.0], &[0.0, 1.0]]);
+        let start = [1.0, 4.0];
+        let result = lsmr_with_options(
+            &a,
+            &[3.0, -2.0],
+            LsmrOptions {
+                damp: 2.0,
+                x0: Some(&start),
+                atol: 1.0e-12,
+                btol: 1.0e-12,
+                ..LsmrOptions::default()
+            },
+        )
+        .expect("damped fit");
+        // (I + 4I) x = b + 4*x0. The ordinary squared residual is
+        // 25.6; the augmented one additionally includes 4*||x-x0||²=6.4.
+        close(result.solution[0], 1.4);
+        close(result.solution[1], 2.8);
+        close(result.normr, 32.0_f64.sqrt());
+        close(result.normx, 9.8_f64.sqrt());
+        close(result.normar, 0.0);
+        assert_eq!(result.istop, 2);
+    }
+
+    #[test]
+    fn lsmr_options_independent_rhs_and_optimality_tolerances() {
+        let a = dense(&[&[1.0], &[0.0]]);
+        let b = [1.0, 3.0];
+        let optimal = lsmr_with_options(
+            &a,
+            &b,
+            LsmrOptions {
+                atol: 1.0e-12,
+                btol: 0.0,
+                ..LsmrOptions::default()
+            },
+        )
+        .expect("inconsistent least squares");
+        assert_eq!(optimal.istop, 2);
+        close(optimal.solution[0], 1.0);
+        close(optimal.normr, 3.0);
+        let rhs_tolerance = lsmr_with_options(
+            &a,
+            &b,
+            LsmrOptions {
+                atol: 0.0,
+                btol: 0.99,
+                ..LsmrOptions::default()
+            },
+        )
+        .expect("rhs tolerance");
+        // User tolerances override both machine exits and the iteration
+        // limit when they are satisfied on the same step.
+        assert_eq!(rhs_tolerance.istop, 1);
+        assert_eq!(rhs_tolerance.iterations, 1);
+    }
+
+    #[test]
+    fn lsmr_options_iteration_and_condition_limits_are_distinct() {
+        let a = dense(&[
+            &[1.0, 0.0, 0.0],
+            &[0.0, 0.1, 0.0],
+            &[0.0, 0.0, 0.01],
+        ]);
+        let controls = LsmrOptions {
+            atol: 0.0,
+            btol: 0.0,
+            conlim: 0.0,
+            max_iter: Some(1),
+            ..LsmrOptions::default()
+        };
+        let limited = lsmr_with_options(&a, &[1.0; 3], controls).expect("budgeted solve");
+        assert_eq!(limited.istop, 7);
+        assert_eq!(limited.iterations, 1);
+        let conditioned = lsmr_with_options(
+            &a,
+            &[1.0; 3],
+            LsmrOptions {
+                conlim: 1.1,
+                max_iter: Some(20),
+                ..controls
+            },
+        )
+        .expect("condition-limited solve");
+        assert_eq!(conditioned.istop, 3);
+        assert!(conditioned.conda >= 1.1);
+        assert!(conditioned.iterations < 20);
+    }
+
+    #[test]
+    fn lsmr_options_preserves_stationary_nullspace_warm_start() {
+        let a = dense(&[&[1.0, 0.0]]);
+        let start = [0.0, 5.0];
+        let result = lsmr_with_options(
+            &a,
+            &[0.0],
+            LsmrOptions {
+                x0: Some(&start),
+                ..LsmrOptions::default()
+            },
+        )
+        .expect("stationary start");
+        assert_eq!(result.solution, start);
+        assert_eq!(result.istop, 0);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.normr, 0.0);
+        // SciPy initializes this diagnostic to zero before any iteration.
+        assert_eq!(result.normx, 0.0);
+    }
+
+    #[test]
+    fn lsmr_options_validates_controls_and_initial_guess() {
+        let a = dense(&[&[1.0]]);
+        for controls in [
+            LsmrOptions {
+                atol: -1.0,
+                ..LsmrOptions::default()
+            },
+            LsmrOptions {
+                btol: f64::NAN,
+                ..LsmrOptions::default()
+            },
+            LsmrOptions {
+                conlim: f64::NAN,
+                ..LsmrOptions::default()
+            },
+            LsmrOptions {
+                damp: f64::INFINITY,
+                ..LsmrOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                lsmr_with_options(&a, &[1.0], controls),
+                Err(SparseError::InvalidArgument { .. })
+            ));
+        }
+        assert!(matches!(
+            lsmr_with_options(
+                &a,
+                &[1.0],
+                LsmrOptions {
+                    x0: Some(&[f64::NAN]),
+                    ..LsmrOptions::default()
+                }
+            ),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+        assert!(matches!(
+            lsmr_with_options(
+                &a,
+                &[1.0],
+                LsmrOptions {
+                    x0: Some(&[]),
+                    ..LsmrOptions::default()
+                }
+            ),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+    }
+
+    #[test]
+    fn lsmr_options_uses_operator_products_without_materializing() {
+        use std::cell::Cell;
+        let products = Cell::new(0);
+        let operator = FunctionOperator::new(Shape2D::new(3, 2), |x| {
+            products.set(products.get() + 1);
+            Ok(vec![x[0], x[1], x[0] + x[1]])
+        })
+        .with_rmatvec(|x| Ok(vec![x[0] + x[2], x[1] + x[2]]));
+        let result = lsmr_with_options(
+            &operator,
+            &[1.0, 2.0, 3.0],
+            LsmrOptions {
+                atol: 1.0e-12,
+                btol: 1.0e-12,
+                ..LsmrOptions::default()
+            },
+        )
+        .expect("matrix-free solve");
+        close(result.solution[0], 1.0);
+        close(result.solution[1], 2.0);
+        assert_eq!(products.get(), result.iterations);
+        assert_eq!(result.istop, 1);
+    }
 }
 
 /// Stable Givens coefficients for a symmetric two-element vector.

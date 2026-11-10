@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "crates/fsci-opt/**"
+      - "crates/fsci-sparse/**"
       - "crates/fsci-stats/**"
       - "crates/fsci-conformance/src/lib.rs"
       - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
@@ -34,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, distribution-fit, fft-capture]
+        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -63,6 +64,10 @@ jobs:
           case "$LANE" in
             least-squares)
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
+              ;;
+            sparse-lsmr)
+              cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture
+              cargo test --locked -p fsci-sparse --no-default-features --test lsmr_options_scipy -- --nocapture
               ;;
             distribution-fit)
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
