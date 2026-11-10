@@ -24,7 +24,7 @@ pub use audit::{
 };
 pub use censored::CensoredData;
 pub use covariance::Covariance;
-pub use mle::{MleOptions, MleParameter, MleResult, fit_mle};
+pub use mle::{MleOptions, MleParameter, MleResult, fit_mle, fit_mle_censored};
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
@@ -5336,6 +5336,15 @@ impl ContinuousDistribution for GammaDist {
             return 1.0;
         }
         upper_regularized_gamma(self.a, x / self.scale)
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        // Censored likelihoods need log Q directly: log(sf) loses the entire
+        // right tail once the regularized gamma probability underflows.
+        if x <= 0.0 {
+            return 0.0;
+        }
+        fsci_special::log_gammaincc_scalar(self.a, x / self.scale)
     }
 
     fn ppf(&self, q: f64) -> f64 {

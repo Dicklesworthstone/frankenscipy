@@ -9,9 +9,10 @@ use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
-    Alpha, Argus, BetaDist, Burr3, Burr12, ContinuousDistribution, CrystalBall, FDistribution,
-    FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter, Normal,
-    SkewCauchy, Weibull, fit_mle, with_hardened_stats_caps, with_stats_runtime_mode,
+    Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, ContinuousDistribution, CrystalBall,
+    FDistribution, FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter,
+    Normal, SkewCauchy, Weibull, fit_mle, fit_mle_censored, with_hardened_stats_caps,
+    with_stats_runtime_mode,
 };
 
 const ORACLE: &str = r#"
@@ -744,4 +745,530 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         "every seeded case must produce a real comparison"
     );
     eprintln!("MLE compared cases = {compared}; families = 13; samples per case = 2000");
+}
+
+#[test]
+fn censored_mle_uses_survival_for_unobserved_failures() {
+    // Exponential censored MLE: scale = total exposure / observed failures.
+    // Treating the censoring times as events would incorrectly return 30 / 7.
+    let data = CensoredData::new(
+        vec![1.0, 2.0, 4.0, 7.0],
+        vec![],
+        vec![3.0, 5.0, 8.0],
+        vec![],
+    );
+    let original = data.clone();
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        let fitted = with_stats_runtime_mode(mode, || {
+            fit_mle_censored(
+                &data,
+                &[MleParameter::Fixed(1.0), MleParameter::Positive(1.0)],
+                |p| {
+                    Some(GammaDist {
+                        a: p[0],
+                        scale: p[1],
+                    })
+                },
+                MleOptions::default(),
+            )
+        })
+        .expect("right-censored exponential MLE");
+        let expected_scale = 30.0_f64 / 4.0;
+        let expected_nll = 4.0 * expected_scale.ln() + 30.0 / expected_scale;
+        assert_eq!(fitted.parameters[0], 1.0);
+        assert!((fitted.parameters[1] - expected_scale).abs() < 2.0e-6);
+        assert!((fitted.negative_log_likelihood - expected_nll).abs() < 1.0e-10);
+    }
+    assert_eq!(data, original, "fitting must not rewrite censoring metadata");
+}
+
+#[test]
+fn censored_mle_exact_observations_preserve_the_uncensored_fit() {
+    let values = [-2.5, -0.3, 0.2, 1.7, 2.9, 3.2, 5.4];
+    let parameters = [MleParameter::Free(0.0), MleParameter::Positive(1.0)];
+    let factory = |p: &[f64]| {
+        Some(Normal {
+            loc: p[0],
+            scale: p[1],
+        })
+    };
+    let original = fit_mle(&values, &parameters, factory, MleOptions::default()).unwrap();
+    let samples = [
+        CensoredData::new(values.to_vec(), vec![], vec![], vec![]),
+        CensoredData::interval_censored(&values, &values).unwrap(),
+    ];
+    for data in samples {
+        let fitted =
+            fit_mle_censored(&data, &parameters, factory, MleOptions::default()).unwrap();
+        assert_eq!(
+            fitted
+                .parameters
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            original
+                .parameters
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fitted.negative_log_likelihood.to_bits(),
+            original.negative_log_likelihood.to_bits()
+        );
+        assert_eq!(fitted.iterations, original.iterations);
+        assert_eq!(fitted.evaluations, original.evaluations);
+    }
+}
+
+#[test]
+fn censored_mle_mixed_likelihood_and_interval_normalization() {
+    let data = CensoredData::new(
+        vec![0.2, 0.7],
+        vec![-0.8],
+        vec![1.3],
+        vec![
+            (-0.3, 0.4),
+            (f64::NEG_INFINITY, -1.1),
+            (1.8, f64::INFINITY),
+            (0.5, 0.5),
+        ],
+    );
+    let parameters = [MleParameter::Fixed(-0.0), MleParameter::Fixed(1.2)];
+    let fitted = fit_mle_censored(
+        &data,
+        &parameters,
+        |p| {
+            Some(Normal {
+                loc: p[0],
+                scale: p[1],
+            })
+        },
+        MleOptions::default(),
+    )
+    .unwrap();
+    let normal = Normal {
+        loc: 0.0,
+        scale: 1.2,
+    };
+    let expected = -(normal.logpdf(0.2)
+        + normal.logpdf(0.7)
+        + normal.logcdf(-0.8)
+        + normal.logsf(1.3)
+        + (normal.cdf(0.4) - normal.cdf(-0.3)).ln()
+        + normal.logcdf(-1.1)
+        + normal.logsf(1.8)
+        + normal.logpdf(0.5));
+    assert!((fitted.negative_log_likelihood - expected).abs() < 1.0e-12);
+    assert_eq!(fitted.parameters[0].to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(fitted.iterations, 0);
+    assert_eq!(fitted.evaluations, 1);
+}
+
+#[test]
+fn censored_mle_interval_likelihood_survives_probability_underflow() {
+    let gamma = GammaDist { a: 1.0, scale: 2.0 };
+    assert_eq!(gamma.logsf(-1.0), 0.0);
+    assert_eq!(gamma.logsf(0.0), 0.0);
+    assert_eq!(gamma.logsf(f64::INFINITY), f64::NEG_INFINITY);
+    assert!(gamma.logsf(f64::NAN).is_nan());
+    assert!((gamma.logsf(2000.0) + 1000.0).abs() < 1.0e-10);
+    assert_eq!(gamma.cdf(2000.0), 1.0);
+    assert_eq!(gamma.cdf(2002.0), 1.0);
+    assert_eq!(gamma.sf(2000.0), 0.0);
+    assert_eq!(gamma.sf(2002.0), 0.0);
+    let data = CensoredData::interval_censored(&[2000.0], &[2002.0]).unwrap();
+    let fitted = fit_mle_censored(
+        &data,
+        &[MleParameter::Fixed(1.0), MleParameter::Fixed(2.0)],
+        |p| {
+            Some(GammaDist {
+                a: p[0],
+                scale: p[1],
+            })
+        },
+        MleOptions::default(),
+    )
+    .unwrap();
+    // P(2000 < Exp(scale=2) < 2002) = exp(-1000) * (1 - exp(-1)).
+    let expected = 1000.0 - (-(-1.0_f64).exp()).ln_1p();
+    assert!(fitted.negative_log_likelihood.is_finite());
+    assert!((fitted.negative_log_likelihood - expected).abs() < 1.0e-10);
+
+    let mut likelihoods = Vec::new();
+    for (lower, upper) in [(-41.0, -40.0), (40.0, 41.0)] {
+        let data = CensoredData::interval_censored(&[lower], &[upper]).unwrap();
+        let fitted = fit_mle_censored(
+            &data,
+            &[MleParameter::Fixed(0.0), MleParameter::Fixed(1.0)],
+            |p| {
+                Some(Normal {
+                    loc: p[0],
+                    scale: p[1],
+                })
+            },
+            MleOptions::default(),
+        )
+        .unwrap();
+        assert!(fitted.negative_log_likelihood.is_finite());
+        likelihoods.push(fitted.negative_log_likelihood);
+    }
+    assert!((likelihoods[0] - likelihoods[1]).abs() < 1.0e-11);
+    // Normal tail reference independently agrees with the Mills-ratio expansion.
+    assert!((likelihoods[0] - 804.608_442_013_753_8).abs() < 1.0e-10);
+}
+
+#[test]
+fn censored_mle_rejects_invalid_impossible_and_uninformative_data() {
+    let factory = |p: &[f64]| {
+        Some(Normal {
+            loc: p[0],
+            scale: p[1],
+        })
+    };
+    let parameters = [MleParameter::Fixed(0.0), MleParameter::Fixed(1.0)];
+    let options = MleOptions::default();
+    assert!(matches!(
+        fit_mle_censored(&CensoredData::default(), &parameters, factory, options),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for data in [
+        CensoredData::new(vec![f64::NAN], vec![], vec![], vec![]),
+        CensoredData::new(vec![], vec![f64::INFINITY], vec![], vec![]),
+        CensoredData::new(vec![], vec![], vec![f64::NEG_INFINITY], vec![]),
+        CensoredData::new(vec![], vec![], vec![], vec![(2.0, 1.0)]),
+        CensoredData::new(vec![], vec![], vec![], vec![(f64::NAN, 1.0)]),
+        CensoredData::new(vec![], vec![], vec![], vec![(0.0, f64::NAN)]),
+        CensoredData::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![(f64::NEG_INFINITY, f64::INFINITY)],
+        ),
+        CensoredData::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![(f64::INFINITY, f64::INFINITY)],
+        ),
+        CensoredData::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![(f64::NEG_INFINITY, f64::NEG_INFINITY)],
+        ),
+    ] {
+        assert!(matches!(
+            fit_mle_censored(&data, &parameters, factory, options),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+
+    let gamma = |p: &[f64]| {
+        Some(GammaDist {
+            a: p[0],
+            scale: p[1],
+        })
+    };
+    let parameters = [MleParameter::Fixed(1.0), MleParameter::Fixed(1.0)];
+    for data in [
+        // Impossible event for a distribution supported on nonnegative values.
+        CensoredData::new(vec![], vec![-1.0], vec![], vec![]),
+        // Probability-one events alone cannot identify model parameters.
+        CensoredData::new(vec![], vec![], vec![-1.0, -2.0], vec![]),
+    ] {
+        assert!(matches!(
+            fit_mle_censored(&data, &parameters, gamma, options),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    let data = CensoredData::new(vec![0.2, 0.7], vec![-0.8], vec![1.3], vec![]);
+    assert!(matches!(
+        fit_mle_censored(
+            &data,
+            &[MleParameter::Free(0.0), MleParameter::Positive(1.0)],
+            factory,
+            MleOptions {
+                max_evaluations: 1,
+                ..options
+            },
+        ),
+        Err(FitError::NonConvergent(_))
+    ));
+}
+
+#[test]
+fn censored_mle_hardened_counts_every_censoring_kind_toward_sample_cap() {
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(3, 3, || {
+            let data = CensoredData::new(
+                vec![0.0],
+                vec![-1.0],
+                vec![1.0],
+                vec![(-0.2, 0.2)],
+            );
+            let result = fit_mle_censored(
+                &data,
+                &[MleParameter::Free(0.0), MleParameter::Positive(1.0)],
+                |p| {
+                    Some(Normal {
+                        loc: p[0],
+                        scale: p[1],
+                    })
+                },
+                MleOptions::default(),
+            );
+            assert!(matches!(result, Err(FitError::ResourceExhausted { .. })));
+        });
+    });
+}
+
+const CENSORED_ORACLE: &str = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats, optimize
+
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+
+def optimizer(fun, start, args=(), disp=0):
+    result = optimize.minimize(fun, start, args=args, method='Nelder-Mead',
+                              options={'xatol': 1e-10, 'fatol': 1e-10,
+                                       'maxiter': 10000, 'maxfev': 40000})
+    assert result.success, result.message
+    return result.x
+
+def censor(values, lower, upper, width):
+    exact, left, right, intervals = [], [], [], []
+    for i, x in enumerate(values):
+        if x <= lower:
+            left.append(lower)
+        elif x >= upper:
+            right.append(upper)
+        elif i % 3 == 0:
+            lo = width * np.floor(x / width)
+            intervals.append((lo, lo + width))
+        else:
+            exact.append(x)
+    return exact, left, right, intervals
+
+def logmass(dist, lo, hi):
+    lc, ls = dist.logcdf(hi), dist.logsf(lo)
+    a, b = (lc, dist.logcdf(lo)) if lc < ls else (ls, dist.logsf(hi))
+    return a + np.log(-np.expm1(b - a))
+
+def emit(case, family, policy, params, frozen, parts):
+    exact, left, right, intervals = parts
+    nll = -(sum(frozen.logpdf(exact)) + sum(frozen.logcdf(left))
+            + sum(frozen.logsf(right))
+            + sum(logmass(frozen, lo, hi) for lo, hi in intervals))
+    assert np.isfinite(nll)
+    print(case, family, policy, *(format(x, '.17g') for x in params),
+          format(nll, '.17g'))
+    for label, values in [('u', exact), ('l', left), ('r', right),
+                          ('i', [x for pair in intervals for x in pair])]:
+        print(label, *(format(x, '.17g') for x in values))
+
+specs = [
+    ('normal', stats.norm, (), 1.2, 2.5, -1.5, 3.5, 0.5),
+    ('gamma', stats.gamma, (0.7,), 0.0, 2.4, 0.1, 4.0, 0.25),
+    ('weibull', stats.weibull_min, (1.6,), 0.0, 3.2, 0.4, 4.5, 0.4),
+]
+for index, (family, dist, shapes, loc, scale, lower, upper, width) in enumerate(specs):
+    values = dist.rvs(*shapes, loc=loc, scale=scale, size=400,
+                      random_state=np.random.default_rng(91100 + index))
+    parts = censor(values, lower, upper, width)
+    data = stats.CensoredData(uncensored=parts[0], left=parts[1],
+                              right=parts[2], interval=parts[3])
+    kwargs = {'optimizer': optimizer}
+    if family != 'normal':
+        kwargs['floc'] = 0.0
+    fitted = dist.fit(data, **kwargs)
+    params = fitted if family == 'normal' else (fitted[0], fitted[-1])
+    frozen = dist(*fitted[:-2], loc=fitted[-2], scale=fitted[-1])
+    emit(family + '_mixed', family, 'free', params, frozen, parts)
+
+    if family == 'normal':
+        kwargs['floc'] = loc
+        policy = 'fixed0'
+    elif family == 'gamma':
+        kwargs['fscale'] = scale
+        policy = 'fixed1'
+    else:
+        kwargs['f0'] = shapes[0]
+        policy = 'fixed0'
+    fitted = dist.fit(data, **kwargs)
+    params = fitted if family == 'normal' else (fitted[0], fitted[-1])
+    frozen = dist(*fitted[:-2], loc=fitted[-2], scale=fitted[-1])
+    emit(family + '_fixed', family, policy, params, frozen, parts)
+
+    if family == 'normal':
+        intervals = [(width * np.floor(x / width),
+                      width * np.floor(x / width) + width) for x in values]
+        interval_data = stats.CensoredData(interval=intervals)
+        fitted = stats.norm.fit(interval_data, optimizer=optimizer)
+        emit('normal_intervals', 'normal', 'free', fitted,
+             stats.norm(*fitted), ([], [], [], intervals))
+
+parts = ([1.0, 2.0, 4.0, 7.0], [], [3.0, 5.0, 8.0], [])
+data = stats.CensoredData(uncensored=parts[0], right=parts[2])
+fitted = stats.expon.fit(data, floc=0.0, optimizer=optimizer)
+emit('exponential_right', 'gamma', 'fixed0', (1.0, fitted[-1]),
+     stats.expon(*fitted), parts)
+emit('normal_tails', 'normal', 'fixed_both', (0.0, 1.0), stats.norm(),
+     ([], [], [], [(-41.0, -40.0), (40.0, 41.0)]))
+"#;
+
+fn censor_values(line: &str, label: &str) -> Vec<f64> {
+    let mut values = line.split_whitespace();
+    assert_eq!(values.next(), Some(label), "censored oracle line label");
+    values.map(|value| value.parse().unwrap()).collect()
+}
+
+#[test]
+fn censored_mle_matches_live_scipy() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        eprintln!("SKIP censored MLE: SciPy oracle unavailable via {python}; compared cases = 0");
+        return;
+    }
+    let output = Command::new(&python)
+        .args(["-c", CENSORED_ORACLE])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy censored MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("censored oracle version metadata");
+    assert!(versions.starts_with("versions "));
+    eprintln!("Censored MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        assert_eq!(fields.len(), 6);
+        let (case, family, policy) = (fields[0], fields[1], fields[2]);
+        let expected = [
+            fields[3].parse::<f64>().unwrap(),
+            fields[4].parse::<f64>().unwrap(),
+        ];
+        let expected_nll = fields[5].parse::<f64>().unwrap();
+        assert!(expected.iter().all(|value| value.is_finite()));
+        assert!(expected_nll.is_finite());
+        let exact = censor_values(lines.next().unwrap(), "u");
+        let left = censor_values(lines.next().unwrap(), "l");
+        let right = censor_values(lines.next().unwrap(), "r");
+        let intervals = censor_values(lines.next().unwrap(), "i");
+        assert_eq!(intervals.len() % 2, 0);
+        let data = CensoredData::new(
+            exact,
+            left,
+            right,
+            intervals
+                .chunks_exact(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect(),
+        );
+        let mut parameters = [
+            if family == "normal" {
+                MleParameter::Free(0.0)
+            } else {
+                MleParameter::Positive(1.0)
+            },
+            MleParameter::Positive(1.0),
+        ];
+        if policy == "fixed0" || policy == "fixed_both" {
+            parameters[0] = MleParameter::Fixed(expected[0]);
+        }
+        if policy == "fixed1" || policy == "fixed_both" {
+            parameters[1] = MleParameter::Fixed(expected[1]);
+        }
+        let options = MleOptions::default();
+        let (actual, nll) = match family {
+            "normal" => {
+                let fit = fit_mle_censored(
+                    &data,
+                    &parameters,
+                    |p| {
+                        Some(Normal {
+                            loc: p[0],
+                            scale: p[1],
+                        })
+                    },
+                    options,
+                )
+                .unwrap();
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            "gamma" => {
+                let fit = fit_mle_censored(
+                    &data,
+                    &parameters,
+                    |p| {
+                        Some(GammaDist {
+                            a: p[0],
+                            scale: p[1],
+                        })
+                    },
+                    options,
+                )
+                .unwrap();
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            "weibull" => {
+                let fit = fit_mle_censored(
+                    &data,
+                    &parameters,
+                    |p| {
+                        Some(Weibull {
+                            c: p[0],
+                            scale: p[1],
+                        })
+                    },
+                    options,
+                )
+                .unwrap();
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            _ => panic!("unexpected censored oracle family {family}"),
+        };
+        assert!(nll.is_finite(), "{case}: nonfinite fitted likelihood");
+        assert_eq!(actual.len(), expected.len(), "{case}: parameter count");
+        assert!(
+            (nll - expected_nll).abs() <= 1.0e-7 * expected_nll.abs().max(1.0),
+            "{case}: fsci NLL {nll} != SciPy {expected_nll}"
+        );
+        for (i, (&value, &reference)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (value - reference).abs() <= 2.0e-5 * reference.abs().max(1.0),
+                "{case}: parameter {i}: {value} != {reference}"
+            );
+            if matches!(parameters[i], MleParameter::Fixed(_)) {
+                assert_eq!(value.to_bits(), reference.to_bits());
+            }
+        }
+        eprintln!(
+            "{case}: censored MLE fsci={actual:?} scipy={expected:?}; \
+             NLL fsci={nll:.12e} scipy={expected_nll:.12e}; observations={}",
+            data.len()
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 9, "every censored oracle case must be compared");
+    eprintln!("Censored MLE compared cases = {compared}");
 }

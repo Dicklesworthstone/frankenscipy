@@ -1,6 +1,7 @@
 //! Fallible maximum-likelihood fitting with explicit parameter constraints.
 //!
-//! [`fit_mle`] minimizes the negative log likelihood using Nelder–Mead. The
+//! [`fit_mle`] and [`fit_mle_censored`] minimize the negative log likelihood
+//! using Nelder–Mead. The
 //! model factory defines the parameterization, including any location and scale
 //! parameters; [`MleParameter::Fixed`] holds a parameter exactly constant. This
 //! also supports distributions whose concrete type has fixed location or scale.
@@ -9,8 +10,144 @@
 use fsci_opt::{MinimizeMethodOptions, MinimizeOptions, OptimizeMethod, minimize};
 
 use crate::{
-    ContinuousDistribution, FitError, RuntimeMode, active_stats_mode, hardened_max_sample_len,
+    CensoredData, ContinuousDistribution, FitError, RuntimeMode, active_stats_mode,
+    hardened_max_sample_len,
 };
+
+/// Borrow both representations so censoring never mutates the caller's data or
+/// allocates an observation vector on every likelihood evaluation.
+#[derive(Clone, Copy)]
+enum MleSample<'a> {
+    Exact(&'a [f64]),
+    Censored(&'a CensoredData),
+}
+
+impl MleSample<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Exact(data) => data.len(),
+            Self::Censored(data) => data.len(),
+        }
+    }
+
+    fn validate(self) -> Result<(), FitError> {
+        match self {
+            Self::Exact(data) => crate::validate_finite_fit_data(data, 1, "maximum likelihood"),
+            Self::Censored(data) => {
+                if data.is_empty() {
+                    return Err(FitError::InsufficientData {
+                        required: 1,
+                        actual: 0,
+                    });
+                }
+                for (name, values) in [
+                    ("uncensored", &data.uncensored),
+                    ("left-censored", &data.left),
+                    ("right-censored", &data.right),
+                ] {
+                    if values.iter().any(|value| !value.is_finite()) {
+                        return Err(FitError::UnsupportedData(format!(
+                            "{name} MLE observations must be finite"
+                        )));
+                    }
+                }
+                for (index, &(lower, upper)) in data.interval.iter().enumerate() {
+                    if lower.is_nan()
+                        || upper.is_nan()
+                        || lower > upper
+                        || (!lower.is_finite() && !upper.is_finite())
+                    {
+                        return Err(FitError::UnsupportedData(format!(
+                            "MLE interval {index} must have ordered bounds and at least one finite endpoint"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn has_exact(self) -> bool {
+        match self {
+            Self::Exact(data) => !data.is_empty(),
+            Self::Censored(data) => {
+                !data.uncensored.is_empty()
+                    || data.interval.iter().any(|&(lower, upper)| lower == upper)
+            }
+        }
+    }
+
+    fn log_terms<'a, D: ContinuousDistribution>(
+        &'a self,
+        distribution: &'a D,
+    ) -> impl Iterator<Item = f64> + 'a {
+        let (exact, left, right, interval): (&[f64], &[f64], &[f64], &[(f64, f64)]) =
+            match self {
+                Self::Exact(data) => (*data, &[], &[], &[]),
+                Self::Censored(data) => {
+                    (&data.uncensored, &data.left, &data.right, &data.interval)
+                }
+            };
+        exact
+            .iter()
+            .map(move |&x| distribution.logpdf(x))
+            .chain(
+                left.iter()
+                    .map(move |&x| checked_log_probability(distribution.logcdf(x))),
+            )
+            .chain(
+                right
+                    .iter()
+                    .map(move |&x| checked_log_probability(distribution.logsf(x))),
+            )
+            .chain(interval.iter().map(move |&(lower, upper)| {
+                if lower == upper {
+                    distribution.logpdf(lower)
+                } else if lower == f64::NEG_INFINITY {
+                    checked_log_probability(distribution.logcdf(upper))
+                } else if upper == f64::INFINITY {
+                    checked_log_probability(distribution.logsf(lower))
+                } else {
+                    interval_log_probability(distribution, lower, upper)
+                }
+            }))
+    }
+}
+
+fn checked_log_probability(value: f64) -> f64 {
+    if value > 0.0 { f64::NAN } else { value }
+}
+
+/// log(exp(larger) - exp(smaller)), without subtracting rounded probabilities.
+fn log_probability_difference(larger: f64, smaller: f64) -> f64 {
+    if larger.is_nan() || smaller.is_nan() || larger > 0.0 || smaller > larger {
+        return f64::NAN;
+    }
+    if larger == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    larger + (-(smaller - larger).exp_m1()).ln()
+}
+
+fn interval_log_probability<D: ContinuousDistribution>(
+    distribution: &D,
+    lower: f64,
+    upper: f64,
+) -> f64 {
+    // Use CDF differences in the left tail and SF differences in the right
+    // tail. For a normal interval [40, 41], both CDFs round to one and both
+    // SFs underflow to zero, but the log survival probabilities remain useful.
+    let log_cdf_upper = checked_log_probability(distribution.logcdf(upper));
+    let log_sf_lower = checked_log_probability(distribution.logsf(lower));
+    if log_cdf_upper.is_nan() || log_sf_lower.is_nan() {
+        return f64::NAN;
+    }
+    if log_cdf_upper < log_sf_lower {
+        log_probability_difference(log_cdf_upper, distribution.logcdf(lower))
+    } else {
+        log_probability_difference(log_sf_lower, distribution.logsf(upper))
+    }
+}
 
 pub(crate) fn validate_positive_sample(data: &[f64], family: &str) -> Result<(), FitError> {
     crate::validate_finite_fit_data(data, 2, family)?;
@@ -98,7 +235,7 @@ impl MleParameter {
     }
 }
 
-/// Budgets and stopping tolerances for [`fit_mle`].
+/// Budgets and stopping tolerances for [`fit_mle`] and [`fit_mle_censored`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MleOptions {
     pub max_iterations: usize,
@@ -169,12 +306,82 @@ where
     D: ContinuousDistribution,
     F: Fn(&[f64]) -> Option<D>,
 {
+    fit_mle_sample(MleSample::Exact(data), parameters, make_distribution, options)
+}
+
+/// Fit a continuous distribution to exact, left-, right-, or interval-censored
+/// observations using maximum likelihood.
+///
+/// The likelihood contributes `logpdf(x)` for exact observations, `logcdf(x)`
+/// for left censoring, `logsf(x)` for right censoring, and
+/// `log(cdf(upper) - cdf(lower))` for interval censoring. Interval differences
+/// use logarithms of the smaller tail to avoid cancellation and underflow.
+///
+/// All explicit exact/left/right observations must be finite. An interval may
+/// have a lower bound of negative infinity or an upper bound of positive
+/// infinity, but at least one endpoint must be finite. Equal finite endpoints
+/// denote an exact observation, matching SciPy's `CensoredData` convention.
+/// The input is validated without modifying its vectors.
+///
+/// Parameters, fixed values, parameter bounds, budgets, and runtime modes have
+/// the same meanings as in [`fit_mle`]. A successful fit has a finite,
+/// unpenalized likelihood for every observation. Data whose censored events all
+/// have probability one at the fitted parameters are rejected as uninformative
+/// when no exact observations are present. As with any local MLE optimizer,
+/// convergence does not prove identifiability or a global maximum.
+///
+/// ```
+/// use fsci_stats::{CensoredData, GammaDist, MleOptions, MleParameter};
+/// use fsci_stats::mle::fit_mle_censored;
+///
+/// let data = CensoredData::right_censored(
+///     &[1.0, 2.0, 3.0, 4.0],
+///     &[false, false, true, true],
+/// ).unwrap();
+/// // Gamma(shape=1) is exponential. Its censored scale MLE is total
+/// // exposure / observed event count, here 10 / 2 = 5.
+/// let result = fit_mle_censored(
+///     &data,
+///     &[MleParameter::Fixed(1.0), MleParameter::Positive(1.0)],
+///     |p| Some(GammaDist { a: p[0], scale: p[1] }),
+///     MleOptions::default(),
+/// ).unwrap();
+/// assert!((result.distribution.scale - 5.0).abs() < 1.0e-5);
+/// ```
+pub fn fit_mle_censored<D, F>(
+    data: &CensoredData,
+    parameters: &[MleParameter],
+    make_distribution: F,
+    options: MleOptions,
+) -> Result<MleResult<D>, FitError>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    fit_mle_sample(
+        MleSample::Censored(data),
+        parameters,
+        make_distribution,
+        options,
+    )
+}
+
+fn fit_mle_sample<D, F>(
+    data: MleSample<'_>,
+    parameters: &[MleParameter],
+    make_distribution: F,
+    options: MleOptions,
+) -> Result<MleResult<D>, FitError>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
     if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
         return Err(FitError::ResourceExhausted {
             detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
         });
     }
-    crate::validate_finite_fit_data(data, 1, "maximum likelihood")?;
+    data.validate()?;
     if options.max_iterations == 0
         || options.max_evaluations == 0
         || !options.parameter_tolerance.is_finite()
@@ -217,13 +424,14 @@ where
         })?;
         let mut nll = 0.0;
         let mut correction = 0.0;
-        for &x in data {
-            let log_density = distribution.logpdf(x);
+        let mut all_zero = true;
+        for log_density in data.log_terms(&distribution) {
             if !log_density.is_finite() {
                 return Err(FitError::NonConvergent(
                     "MLE has non-finite log density at an observation".into(),
                 ));
             }
+            all_zero &= log_density == 0.0;
             // Compensated summation keeps the reported LL useful for AIC and for
             // comparisons between models with close likelihoods.
             let term = -log_density - correction;
@@ -234,6 +442,11 @@ where
         if !nll.is_finite() {
             return Err(FitError::NonConvergent(
                 "MLE negative log likelihood is not finite".into(),
+            ));
+        }
+        if !data.has_exact() && all_zero {
+            return Err(FitError::NonConvergent(
+                "censored observations have probability one and provide no fitting information".into(),
             ));
         }
         Ok(MleResult {
@@ -298,8 +511,7 @@ where
         };
         let mut mean_nll = 0.0;
         let n = data.len() as f64;
-        for &x in data {
-            let log_density = distribution.logpdf(x);
+        for log_density in data.log_terms(&distribution) {
             mean_nll += if log_density.is_finite() {
                 -log_density / n
             } else {
