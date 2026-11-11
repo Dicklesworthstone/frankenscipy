@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Dense trust-region least-squares algorithms behind `least_squares`.
+//! Dense and sparse trust-region least-squares algorithms behind `least_squares`.
 //!
 //! The Trust Region Reflective algorithm (`method = Trf`) follows
 //! SciPy's `scipy/optimize/_lsq/trf.py` with the helpers of `_lsq/common.py` and the robust
@@ -15,6 +15,7 @@
 //! `method = Dogbox` uses Powell's dogleg path inside rectangular trust regions, intersected
 //! with the original bounds, with active variables excluded from the Gauss–Newton solve.
 
+use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf_lsmr::{self, TrustRegionSolver};
 use fsci_runtime::RuntimeMode;
 
@@ -97,12 +98,12 @@ pub enum XScale {
     Jac,
 }
 
-/// What the dense trust-region solvers return (SciPy's `OptimizeResult` fields).
+/// What the trust-region solvers return (SciPy's `OptimizeResult` fields).
 pub(crate) struct TrfOutcome {
     pub x: Vec<f64>,
     pub cost: f64,
     pub fun: Vec<f64>,
-    pub jac: Vec<Vec<f64>>,
+    pub jac: LeastSquaresMatrix,
     pub grad: Vec<f64>,
     pub optimality: f64,
     pub active_mask: Vec<i8>,
@@ -141,34 +142,24 @@ fn all_finite(m: &[Vec<f64>]) -> bool {
     m.iter().flatten().all(|v| v.is_finite())
 }
 
-fn mat_vec(j: &[Vec<f64>], s: &[f64]) -> Vec<f64> {
-    j.iter().map(|row| dot(row, s)).collect()
+fn dense_exact_jacobian(j: &LeastSquaresMatrix) -> Result<&[Vec<f64>], fsci_sparse::SparseError> {
+    j.as_dense()
+        .ok_or_else(|| fsci_sparse::SparseError::Unsupported {
+            feature: String::from("the exact trust-region solver requires a dense Jacobian"),
+        })
 }
 
 /// `Jᵀ·f`.
-fn compute_grad(j: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
-    let n = j.first().map_or(0, Vec::len);
-    let mut g = vec![0.0; n];
-    for (row, &fi) in j.iter().zip(f) {
-        for (gk, &jk) in g.iter_mut().zip(row) {
-            *gk += jk * fi;
-        }
-    }
-    g
+fn compute_grad(j: &LeastSquaresMatrix, f: &[f64]) -> Vec<f64> {
+    j.transpose_product(f)
 }
 
 /// `compute_jac_scale`: `(scale, scale_inv)` with `scale_inv` the column norms of J.
-fn compute_jac_scale(j: &[Vec<f64>], scale_inv_old: Option<&[f64]>) -> (Vec<f64>, Vec<f64>) {
-    let n = j.first().map_or(0, Vec::len);
-    let mut scale_inv = vec![0.0; n];
-    for row in j {
-        for (s, &v) in scale_inv.iter_mut().zip(row) {
-            *s += v * v;
-        }
-    }
-    for s in &mut scale_inv {
-        *s = s.sqrt();
-    }
+fn compute_jac_scale(
+    j: &LeastSquaresMatrix,
+    scale_inv_old: Option<&[f64]>,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut scale_inv = j.column_norms();
     match scale_inv_old {
         None => {
             for s in &mut scale_inv {
@@ -187,18 +178,18 @@ fn compute_jac_scale(j: &[Vec<f64>], scale_inv_old: Option<&[f64]>) -> (Vec<f64>
 }
 
 /// `scale_for_robust_loss_function`: rows of J and entries of f scaled in place.
-fn scale_for_robust_loss(j: &mut [Vec<f64>], f: &mut [f64], rho: &[Vec<f64>; 3]) {
-    for (i, (row, fi)) in j.iter_mut().zip(f.iter_mut()).enumerate() {
+fn scale_for_robust_loss(j: &mut LeastSquaresMatrix, f: &mut [f64], rho: &[Vec<f64>; 3]) {
+    let mut row_scale = Vec::with_capacity(f.len());
+    for (i, fi) in f.iter_mut().enumerate() {
         let mut js = rho[1][i] + 2.0 * rho[2][i] * *fi * *fi;
         if js < EPS {
             js = EPS;
         }
         let js = js.sqrt();
         *fi *= rho[1][i] / js;
-        for v in row.iter_mut() {
-            *v *= js;
-        }
+        row_scale.push(js);
     }
+    j.scale_rows(&row_scale);
 }
 
 /// Thin SVD `J = U·diag(s)·Vᵀ` (singular values descending) by one-sided Jacobi. Returns
@@ -439,13 +430,13 @@ fn update_tr_radius(
 
 /// `build_quadratic_1d`: coefficients of q(t) = a·t² + b·t (+ c with `s0`).
 fn build_quadratic_1d(
-    j: &[Vec<f64>],
+    j: &LeastSquaresMatrix,
     g: &[f64],
     s: &[f64],
     diag: Option<&[f64]>,
     s0: Option<&[f64]>,
 ) -> (f64, f64, f64) {
-    let v = mat_vec(j, s);
+    let v = j.product(s);
     let mut a = dot(&v, &v);
     if let Some(d) = diag {
         a += s
@@ -459,7 +450,7 @@ fn build_quadratic_1d(
     let mut b = dot(g, s);
     let mut c = 0.0;
     if let Some(s0) = s0 {
-        let u = mat_vec(j, s0);
+        let u = j.product(s0);
         b += dot(&u, &v);
         c = 0.5 * dot(&u, &u) + dot(g, s0);
         if let Some(d) = diag {
@@ -500,8 +491,8 @@ fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64)
 }
 
 /// `evaluate_quadratic`: ½·‖J·s‖² + ½·sᵀ·diag·s + gᵀ·s.
-fn evaluate_quadratic(j: &[Vec<f64>], g: &[f64], s: &[f64], diag: Option<&[f64]>) -> f64 {
-    let js = mat_vec(j, s);
+fn evaluate_quadratic(j: &LeastSquaresMatrix, g: &[f64], s: &[f64], diag: Option<&[f64]>) -> f64 {
+    let js = j.product(s);
     let mut q = dot(&js, &js);
     if let Some(d) = diag {
         q += s
@@ -667,7 +658,7 @@ fn check_termination(
 #[allow(clippy::too_many_arguments)]
 fn select_step(
     x: &[f64],
-    j_h: &[Vec<f64>],
+    j_h: &LeastSquaresMatrix,
     diag_h: &[f64],
     g_h: &[f64],
     mut p: Vec<f64>,
@@ -759,7 +750,8 @@ fn select_step(
 /// Residuals at `x`.
 pub(crate) type ResidualFn<'a, E> = &'a mut dyn FnMut(&[f64]) -> Result<Vec<f64>, E>;
 /// Jacobian at `x` (rows = residuals), given the residuals `f` just evaluated there.
-pub(crate) type JacobianFn<'a, E> = &'a mut dyn FnMut(&[f64], &[f64]) -> Result<Vec<Vec<f64>>, E>;
+pub(crate) type JacobianFn<'a, E> =
+    &'a mut dyn FnMut(&[f64], &[f64]) -> Result<LeastSquaresMatrix, E>;
 
 /// `trf`: `fun(x)` evaluates the residuals, `jac(x, f)` the Jacobian (rows = residuals) at the
 /// point where `f` was just evaluated. `x0` must already be strictly feasible (SciPy's caller
@@ -770,7 +762,7 @@ pub(crate) fn trf<E>(
     jac: JacobianFn<'_, E>,
     x0: &[f64],
     f0: Vec<f64>,
-    j0: Vec<Vec<f64>>,
+    j0: LeastSquaresMatrix,
     lb: &[f64],
     ub: &[f64],
     ftol: f64,
@@ -880,12 +872,9 @@ where
             vec![0.0; n]
         };
         let g_h: Vec<f64> = d.iter().zip(&g).map(|(a, b)| a * b).collect();
-        let j_h: Vec<Vec<f64>> = j
-            .iter()
-            .map(|row| row.iter().zip(&d).map(|(a, b)| a * b).collect())
-            .collect();
+        let j_h = j.scaled_columns(&d);
         let lsmr_model = if let TrustRegionSolver::Lsmr(options) = solver {
-            if !all_finite(&j_h) || diag_h.iter().any(|value| !value.is_finite()) {
+            if !j_h.all_finite() || diag_h.iter().any(|value| !value.is_finite()) {
                 return Err(NonFiniteJacobian.into());
             }
             Some(trf_lsmr::subspace(
@@ -897,7 +886,7 @@ where
         let (s, vv, uf) = if lsmr_model.is_some() {
             (Vec::new(), Vec::new(), Vec::new())
         } else if bounded {
-            let mut aug = j_h.clone();
+            let mut aug = dense_exact_jacobian(&j_h)?.to_vec();
             for (i, dh) in diag_h.iter().enumerate() {
                 let mut row = vec![0.0; n];
                 row[i] = dh.sqrt();
@@ -912,10 +901,10 @@ where
             let uf: Vec<f64> = u.iter().map(|col| dot(col, &f_aug)).collect();
             (s, vv, uf)
         } else {
-            if !all_finite(&j_h) {
+            if !j_h.all_finite() {
                 return Err(NonFiniteJacobian.into());
             }
-            let (u, s, vv) = svd_thin(&j_h, n);
+            let (u, s, vv) = svd_thin(dense_exact_jacobian(&j_h)?, n);
             let uf: Vec<f64> = u.iter().map(|col| dot(col, &f)).collect();
             (s, vv, uf)
         };
@@ -933,8 +922,7 @@ where
             let p_h = if let Some(model) = &lsmr_model {
                 model.step(delta)
             } else {
-                let (step, new_alpha) =
-                    solve_lsq_trust_region(n, m, &uf, &s, &vv, delta, alpha);
+                let (step, new_alpha) = solve_lsq_trust_region(n, m, &uf, &s, &vv, delta, alpha);
                 alpha = new_alpha;
                 step
             };
@@ -1083,7 +1071,7 @@ pub(crate) fn dogbox<E>(
     jac: JacobianFn<'_, E>,
     x0: &[f64],
     f0: Vec<f64>,
-    j0: Vec<Vec<f64>>,
+    j0: LeastSquaresMatrix,
     lb: &[f64],
     ub: &[f64],
     ftol: f64,
@@ -1160,16 +1148,13 @@ where
             break;
         }
 
-        let j_free: Vec<Vec<f64>> = j
-            .iter()
-            .map(|row| free.iter().map(|&i| row[i]).collect())
-            .collect();
-        if !all_finite(&j_free) {
+        let j_free = j.select_columns(&free);
+        if !j_free.all_finite() {
             return Err(NonFiniteJacobian.into());
         }
         let newton = match solver {
-            TrustRegionSolver::Exact => {
-                let (u, singular, v) = svd_thin(&j_free, free.len());
+            TrustRegionSolver::Exact | TrustRegionSolver::Auto => {
+                let (u, singular, v) = svd_thin(dense_exact_jacobian(&j_free)?, free.len());
                 let cutoff = EPS * singular.first().copied().unwrap_or(0.0);
                 let mut step = vec![0.0; free.len()];
                 for k in 0..singular.len() {
@@ -1186,7 +1171,7 @@ where
                 let scales: Vec<f64> = free.iter().map(|&i| scale[i]).collect();
                 // SciPy's operator keeps all columns and masks the active ones.
                 // Retain its default budget even though we store only free columns.
-                options.max_iter = options.max_iter.or(Some(j.len().min(n)));
+                options.max_iter = options.max_iter.or(Some(j.shape().rows.min(n)));
                 trf_lsmr::dogbox_step(&j_free, &f, &scales, options, mode)?
             }
         };
@@ -1297,7 +1282,127 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::svd_thin;
+    use super::{Loss, LossKind, XScale, dogbox, svd_thin, trf};
+    use crate::{LeastSquaresMatrix, OptError, TrustRegionLsmrOptions, TrustRegionSolver};
+    use fsci_runtime::RuntimeMode;
+    use fsci_sparse::{CsrMatrix, Shape2D};
+
+    #[test]
+    fn sparse_lsmr_preserves_bounds_robust_loss_and_parameter_scaling() {
+        let residual = |x: &[f64]| {
+            vec![
+                x[0] - 2.0,
+                2.0 * x[0] - 4.1,
+                x[1] + 1.0,
+                3.0 * x[1] + 2.9,
+                x[2] - 0.5,
+                2.0 * x[2] - 1.1,
+                x[2] - 8.0,
+                0.0,
+            ]
+        };
+        let sparse = CsrMatrix::from_components(
+            Shape2D::new(8, 3),
+            vec![1.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0],
+            vec![0, 0, 1, 1, 2, 2, 2],
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 7],
+            true,
+        )
+        .unwrap();
+        let sparse = LeastSquaresMatrix::Sparse(sparse);
+        let dense = LeastSquaresMatrix::Dense(sparse.to_dense());
+        let initial = [0.0, 0.0, 1.0];
+        let lower = [-10.0, -0.8, 0.0];
+        let upper = [1.5, 10.0, 10.0];
+        let loss = Loss {
+            kind: LossKind::SoftL1,
+            f_scale: 0.2,
+        };
+        for rectangular in [false, true] {
+            for scale in [XScale::Jac, XScale::Fixed(vec![0.3, 2.0, 4.0])] {
+                let solve = if rectangular {
+                    dogbox::<OptError>
+                } else {
+                    trf::<OptError>
+                };
+                let run = |matrix: &LeastSquaresMatrix| {
+                    solve(
+                        &mut |x| Ok(residual(x)),
+                        &mut |_, _| Ok(matrix.clone()),
+                        &initial,
+                        residual(&initial),
+                        matrix.clone(),
+                        &lower,
+                        &upper,
+                        1.0e-12,
+                        1.0e-12,
+                        1.0e-10,
+                        Some(400),
+                        &scale,
+                        Some(&loss),
+                        TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default()),
+                        RuntimeMode::Strict,
+                    )
+                    .unwrap()
+                };
+                let reference = run(&dense);
+                let compressed = run(&sparse);
+                assert!(
+                    compressed.status > 0,
+                    "rectangular={rectangular}, scale={scale:?}"
+                );
+                assert!((compressed.x[0] - 1.5).abs() < 1.0e-10);
+                assert!((compressed.x[1] + 0.8).abs() < 1.0e-10);
+                assert!(compressed.x[2] > 0.5 && compressed.x[2] < 0.7);
+                for (a, b) in compressed.x.iter().zip(&reference.x) {
+                    assert!((a - b).abs() < 1.0e-8);
+                }
+                assert!((compressed.cost - reference.cost).abs() < 1.0e-10);
+                assert_eq!(compressed.active_mask, reference.active_mask);
+                assert_eq!(compressed.jac.as_sparse().unwrap().nnz(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_lsmr_solves_a_large_diagonal_system_without_dense_storage() {
+        // A dense copy would contain 100 million entries. Every intermediate
+        // Jacobian on this route must instead retain the 10,000-entry diagonal.
+        let n = 10_000;
+        let matrix = LeastSquaresMatrix::Sparse(
+            CsrMatrix::from_components(
+                Shape2D::new(n, n),
+                vec![1.0; n],
+                (0..n).collect(),
+                (0..=n).collect(),
+                true,
+            )
+            .unwrap(),
+        );
+        let initial = vec![0.0; n];
+        let out = trf::<OptError>(
+            &mut |x| Ok(x.iter().map(|value| value - 1.0).collect()),
+            &mut |_, _| Ok(matrix.clone()),
+            &initial,
+            vec![-1.0; n],
+            matrix.clone(),
+            &vec![f64::NEG_INFINITY; n],
+            &vec![f64::INFINITY; n],
+            1.0e-12,
+            1.0e-12,
+            1.0e-10,
+            Some(100),
+            &XScale::Jac,
+            None,
+            TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default()),
+            RuntimeMode::Strict,
+        )
+        .unwrap();
+        assert!(out.status > 0);
+        assert!(out.x.iter().all(|value| (value - 1.0).abs() < 1.0e-10));
+        assert!(out.cost < 1.0e-18);
+        assert_eq!(out.jac.as_sparse().unwrap().nnz(), n);
+    }
 
     #[test]
     fn thin_svd_preserves_extreme_units_and_rectangular_reconstruction() {

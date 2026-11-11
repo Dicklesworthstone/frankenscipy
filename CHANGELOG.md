@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Sparse nonlinear least squares in `fsci-opt`: TRF and Dogbox accept analytic
+  CSR Jacobians through `LeastSquaresJacobian::new_sparse` and numerical
+  dependency patterns through `JacobianSparsity::from_rows` or `from_csr`.
+  Grouped two-point and three-point differences share residual evaluations
+  between independent columns, including bound-aware one-sided stencils.
+- Sparse Jacobians stay compressed through robust losses, parameter scaling,
+  active-variable selection, and LSMR trust-region subproblems. Automatic
+  solver selection uses Exact for dense Jacobians and LSMR for sparse ones.
+  CSR rows are normalized before use, including unsorted and duplicate entries.
+- Sparse derivatives integrate with weighted `curve_fit`. Diagonal weights
+  preserve CSR storage; full covariance whitening expands the numerical
+  dependency pattern and can make analytic derivatives dense. Parameter
+  covariance remains a dense output and requires a dense Jacobian copy.
+
+### Changed (breaking)
+
+- `LeastSquaresResult::jac` now holds `LeastSquaresMatrix::Dense` or `Sparse`.
+  Use `as_dense()` / `as_sparse()` to borrow the stored representation or
+  `to_dense()` to allocate a dense copy.
+- `LeastSquaresOptions` adds `jac_sparsity`; `tr_solver` now defaults to
+  `TrustRegionSolver::Auto`. Dense inputs retain the previous Exact route.
+  Explicit Exact and LM reject sparse Jacobians; LM also rejects numerical
+  sparsity patterns. Struct literals can use `..Default::default()`.
+
 ## [0.4.0] — 2026-10-14
 
 ### Added

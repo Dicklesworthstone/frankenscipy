@@ -8,9 +8,11 @@ use fsci_runtime::RuntimeMode;
 use std::sync::Arc;
 
 use crate::FiniteDiffMethod;
+use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf::{self, Loss, LossKind, XScale};
-use crate::trf_lsmr::TrustRegionSolver;
+use crate::trf_lsmr::{TrustRegionLsmrOptions, TrustRegionSolver};
 use crate::types::OptError;
+use fsci_sparse::{CsrMatrix, Shape2D};
 
 /// SciPy's `least_squares(method=...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +56,11 @@ pub struct LeastSquaresResult {
     pub njev: usize,
     /// Number of iterations (accepted steps for `Trf` and `Dogbox`).
     pub nit: usize,
-    /// Jacobian at the solution (row-major, m rows x n cols; for a robust loss, SciPy's
-    /// loss-scaled Jacobian).
-    pub jac: Vec<Vec<f64>>,
+    /// Jacobian at the solution, retaining sparse storage when supplied by the
+    /// caller or estimated using `jac_sparsity`. For a robust loss this is
+    /// SciPy's loss-scaled Jacobian. Use [`LeastSquaresMatrix::to_dense`] when
+    /// an explicitly materialized dense matrix is needed.
+    pub jac: LeastSquaresMatrix,
     /// SciPy's status: 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
     pub status: i32,
     /// First-order optimality: ‖Jᵀf‖∞, scaled by Coleman–Li for bounded `Trf`, or
@@ -76,7 +80,7 @@ pub struct LeastSquaresResult {
 /// the callback receives the fitted variables, not the batch's per-fit data.
 #[derive(Clone)]
 pub struct LeastSquaresJacobian {
-    callback: Arc<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync>,
+    callback: Arc<dyn Fn(&[f64]) -> LeastSquaresMatrix + Send + Sync>,
 }
 
 impl std::fmt::Debug for LeastSquaresJacobian {
@@ -91,13 +95,32 @@ impl LeastSquaresJacobian {
         F: Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'static,
     {
         Self {
-            callback: Arc::new(callback),
+            callback: Arc::new(move |x| LeastSquaresMatrix::Dense(callback(x))),
         }
     }
 
-    fn evaluate(&self, x: &[f64], residual_count: usize) -> Result<Vec<Vec<f64>>, OptError> {
+    /// Supply an analytic CSR Jacobian. The automatic trust-region solver
+    /// selects LSMR; all subsequent scaling and products retain sparse storage.
+    /// Duplicate entries are summed and unsorted rows are canonicalized before
+    /// computing column norms. LM requires a dense Jacobian.
+    pub fn new_sparse<F>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> CsrMatrix + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(move |x| LeastSquaresMatrix::Sparse(callback(x))),
+        }
+    }
+
+    fn evaluate(&self, x: &[f64], residual_count: usize) -> Result<LeastSquaresMatrix, OptError> {
         let matrix = (self.callback)(x);
-        if matrix.len() != residual_count || matrix.iter().any(|row| row.len() != x.len()) {
+        let valid_shape = match &matrix {
+            LeastSquaresMatrix::Dense(rows) => {
+                rows.len() == residual_count && rows.iter().all(|row| row.len() == x.len())
+            }
+            LeastSquaresMatrix::Sparse(csr) => csr.shape() == Shape2D::new(residual_count, x.len()),
+        };
+        if !valid_shape {
             return Err(OptError::InvalidArgument {
                 detail: format!(
                     "Jacobian must have shape ({residual_count}, {}), with one row per residual",
@@ -105,12 +128,125 @@ impl LeastSquaresJacobian {
                 ),
             });
         }
-        if matrix.iter().flatten().any(|value| !value.is_finite()) {
+        if !matrix.all_finite() {
             return Err(OptError::NonFiniteInput {
                 detail: String::from("Jacobian must not contain NaN or Inf"),
             });
         }
+        let matrix = match matrix {
+            LeastSquaresMatrix::Sparse(csr) => LeastSquaresMatrix::from_sparse(csr)?,
+            dense => dense,
+        };
+        if !matrix.all_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("summing duplicate Jacobian entries produced NaN or Inf"),
+            });
+        }
         Ok(matrix)
+    }
+}
+
+/// Structural nonzeros of a residual Jacobian, with a cached deterministic
+/// column coloring for grouped finite differences.
+///
+/// Each row lists the parameters that can affect that residual. Columns whose
+/// row supports are disjoint are perturbed together, reducing residual calls
+/// from the parameter count to the number of colors (twice that for three-point
+/// differences). Storage and construction never allocate a dense conflict graph.
+/// The pattern must include every possible nonzero throughout the solve; an
+/// omitted dependency is a promise that derivative is identically zero.
+#[derive(Debug, Clone)]
+pub struct JacobianSparsity {
+    shape: Shape2D,
+    indices: Vec<usize>,
+    indptr: Vec<usize>,
+    column_entries: Vec<Vec<(usize, usize)>>,
+    groups: Vec<Vec<usize>>,
+}
+
+impl JacobianSparsity {
+    /// Build a pattern from one list of parameter indices per residual.
+    /// Unsorted and repeated indices are accepted and canonicalized.
+    pub fn from_rows(mut rows: Vec<Vec<usize>>, columns: usize) -> Result<Self, OptError> {
+        let shape = Shape2D::new(rows.len(), columns);
+        let mut indices = Vec::new();
+        let mut indptr = Vec::with_capacity(rows.len() + 1);
+        let mut column_entries = vec![Vec::new(); columns];
+        indptr.push(0);
+        for (r, row) in rows.iter_mut().enumerate() {
+            row.sort_unstable();
+            row.dedup();
+            for &c in row.iter() {
+                if c >= columns {
+                    return Err(OptError::InvalidArgument {
+                        detail: format!("jac_sparsity column {c} is outside {columns} parameters"),
+                    });
+                }
+                column_entries[c].push((r, indices.len()));
+                indices.push(c);
+            }
+            indptr.push(indices.len());
+        }
+        // Greedy coloring on the row incidence lists. A generation marker
+        // avoids clearing a color set for every column. Empty columns require
+        // no residual evaluation at all.
+        let mut colors = vec![usize::MAX; columns];
+        let mut seen = vec![usize::MAX; columns];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for c in 0..columns {
+            if column_entries[c].is_empty() {
+                continue;
+            }
+            for &(r, _) in &column_entries[c] {
+                for &neighbor in &rows[r] {
+                    if neighbor >= c {
+                        break;
+                    }
+                    seen[colors[neighbor]] = c;
+                }
+            }
+            let color = (0..groups.len())
+                .find(|&color| seen[color] != c)
+                .unwrap_or(groups.len());
+            if color == groups.len() {
+                groups.push(Vec::new());
+            }
+            groups[color].push(c);
+            colors[c] = color;
+        }
+        Ok(Self {
+            shape,
+            indices,
+            indptr,
+            column_entries,
+            groups,
+        })
+    }
+
+    /// Use the nonzero entries of a CSR matrix as the structural pattern.
+    pub fn from_csr(matrix: &CsrMatrix) -> Result<Self, OptError> {
+        let rows = (0..matrix.shape().rows)
+            .map(|r| {
+                (matrix.indptr()[r]..matrix.indptr()[r + 1])
+                    .filter(|&p| matrix.data()[p] != 0.0)
+                    .map(|p| matrix.indices()[p])
+                    .collect()
+            })
+            .collect();
+        Self::from_rows(rows, matrix.shape().cols)
+    }
+
+    pub fn shape(&self) -> Shape2D {
+        self.shape
+    }
+
+    /// Number of residual calls per two-point Jacobian evaluation.
+    pub fn color_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub fn nnz(&self) -> usize {
+        self.indices.len()
     }
 }
 
@@ -120,9 +256,9 @@ pub struct LeastSquaresOptions {
     /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
     /// `curve_fit`, `Trf` for a bounded one.
     pub method: Option<LeastSquaresMethod>,
-    /// Linear solver for TRF and Dogbox. `Exact` factors the dense Jacobian;
-    /// `Lsmr` uses iterative products instead. The Jacobian itself is still
-    /// dense in this API. LM does not accept the LSMR backend.
+    /// Linear solver for TRF and Dogbox. `Auto` uses `Exact` for dense
+    /// Jacobians and `Lsmr` for sparse ones. An explicit `Exact` with a sparse
+    /// Jacobian is rejected. LM does not accept the LSMR backend.
     pub tr_solver: TrustRegionSolver,
     /// Gradient convergence tolerance. LM uses the maximum absolute cosine
     /// between the residual vector and each Jacobian column; the trust-region
@@ -145,6 +281,10 @@ pub struct LeastSquaresOptions {
     /// Optional analytic Jacobian of the residuals. Numerical differences are used
     /// when absent. Analytic calls contribute to `njev`, not `nfev`.
     pub jac: Option<LeastSquaresJacobian>,
+    /// Structural sparsity for numerical Jacobians, ignored with a callable
+    /// `jac`. Disjoint columns are differentiated together and stored in CSR
+    /// format. Requires TRF or Dogbox and an automatic or LSMR subproblem solver.
+    pub jac_sparsity: Option<JacobianSparsity>,
     /// Robust loss (`Trf` and `Dogbox`).
     pub loss: LossKind,
     /// Soft margin between inlier and outlier residuals for a robust loss.
@@ -160,7 +300,7 @@ impl Default for LeastSquaresOptions {
     fn default() -> Self {
         Self {
             method: None,
-            tr_solver: TrustRegionSolver::Exact,
+            tr_solver: TrustRegionSolver::Auto,
             gtol: 1.0e-8,
             xtol: 1.0e-8,
             ftol: 1.0e-8,
@@ -168,6 +308,7 @@ impl Default for LeastSquaresOptions {
             diff_method: FiniteDiffMethod::TwoPoint,
             diff_step: None,
             jac: None,
+            jac_sparsity: None,
             loss: LossKind::Linear,
             f_scale: 1.0,
             x_scale: None,
@@ -214,7 +355,8 @@ pub enum CurveFitSigma {
 pub struct CurveFitOptions {
     /// Initial guess for parameters.
     pub p0: Option<Vec<f64>>,
-    /// Least-squares options.
+    /// Least-squares options. Analytic Jacobians and `jac_sparsity` describe
+    /// the unweighted model; measurement-error whitening transforms both.
     pub ls_options: LeastSquaresOptions,
     /// Measurement standard deviations or covariance; `None` gives unit weights.
     pub sigma: Option<CurveFitSigma>,
@@ -337,6 +479,64 @@ impl FitWhitening {
             }
         }
     }
+
+    fn jacobian_matrix(&self, matrix: LeastSquaresMatrix) -> LeastSquaresMatrix {
+        match (self, matrix) {
+            (Self::Identity, matrix) => matrix,
+            (Self::Diagonal(deviations), LeastSquaresMatrix::Sparse(csr)) => {
+                // Divide directly, preserving finite ratios for subnormal sigma.
+                let mut data = csr.data().to_vec();
+                for (r, &deviation) in deviations.iter().enumerate() {
+                    for value in &mut data[csr.indptr()[r]..csr.indptr()[r + 1]] {
+                        *value /= deviation;
+                    }
+                }
+                LeastSquaresMatrix::Sparse(
+                    CsrMatrix::from_components(
+                        csr.shape(),
+                        data,
+                        csr.indices().to_vec(),
+                        csr.indptr().to_vec(),
+                        false,
+                    )
+                    .expect("row division preserves validated CSR structure"),
+                )
+            }
+            (_, matrix) => {
+                // A full covariance mixes observation rows. Its whitened
+                // analytic Jacobian is generally dense, even for sparse input.
+                let mut dense = matrix.to_dense();
+                self.jacobian(&mut dense);
+                LeastSquaresMatrix::Dense(dense)
+            }
+        }
+    }
+
+    fn sparsity(&self, pattern: &JacobianSparsity) -> Result<JacobianSparsity, OptError> {
+        let Self::Cholesky(lower) = self else {
+            return Ok(pattern.clone());
+        };
+        if pattern.shape.rows != lower.len() {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("jac_sparsity must have one row per observation"),
+            });
+        }
+        // Forward substitution makes row i depend on every earlier whitened
+        // row j with L[i,j] != 0. Preserve this transitive dependency closure;
+        // reusing the unweighted pattern would silently drop real derivatives.
+        let mut rows: Vec<Vec<usize>> = Vec::with_capacity(lower.len());
+        for (i, low_row) in lower.iter().enumerate() {
+            let mut dependencies = std::collections::BTreeSet::new();
+            dependencies.extend(&pattern.indices[pattern.indptr[i]..pattern.indptr[i + 1]]);
+            for (j, previous) in rows.iter().enumerate() {
+                if low_row[j] != 0.0 {
+                    dependencies.extend(previous);
+                }
+            }
+            rows.push(dependencies.into_iter().copied().collect());
+        }
+        JacobianSparsity::from_rows(rows, pattern.shape.cols)
+    }
 }
 
 /// `scipy.optimize.least_squares(fun, x0, method=...)` without bounds: minimize
@@ -393,7 +593,7 @@ fn lm_result(
         nfev,
         njev,
         nit,
-        jac,
+        jac: LeastSquaresMatrix::Dense(jac),
     }
 }
 
@@ -414,7 +614,10 @@ impl LmScaling {
                         detail: String::from("Inconsistent shapes between x_scale and `x0`."),
                     });
                 }
-                if values.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+                if values
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0)
+                {
                     return Err(OptError::InvalidArgument {
                         detail: String::from("x_scale entries must be positive and finite"),
                     });
@@ -530,9 +733,17 @@ where
             detail: String::from("method 'lm' supports only loss='linear'"),
         });
     }
-    if !matches!(options.tr_solver, TrustRegionSolver::Exact) {
+    if !matches!(
+        options.tr_solver,
+        TrustRegionSolver::Auto | TrustRegionSolver::Exact
+    ) {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' does not support tr_solver='lsmr'"),
+        });
+    }
+    if options.jac.is_none() && options.jac_sparsity.is_some() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("method 'lm' does not support jac_sparsity"),
         });
     }
     let diff_step = options.diff_step.unwrap_or(SQRT_EPS);
@@ -795,26 +1006,20 @@ where
     ))
 }
 
-/// SciPy's dense two-/three-point `approx_derivative(fun, x, rel_step, f0, bounds)` as
-/// `least_squares`' `VectorFunction` calls it.
-fn fd_jacobian_scipy<F>(
-    residuals: &F,
+/// Bound-aware points shared by dense and grouped numerical Jacobians. The
+/// boolean marks a one-sided stencil; the points are actual representable
+/// coordinates, so the denominator includes rounding of the perturbation.
+fn fd_points_scipy(
     x: &[f64],
-    f0: &[f64],
     lb: &[f64],
     ub: &[f64],
     method: FiniteDiffMethod,
     rel_step: Option<f64>,
-) -> Result<Vec<Vec<f64>>, OptError>
-where
-    F: Fn(&[f64]) -> Vec<f64>,
-{
+) -> Vec<(f64, f64, bool)> {
     let n = x.len();
     let unbounded =
         lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY);
-    let mut columns = Vec::with_capacity(n);
-    let mut x1 = x.to_vec();
-    let mut x2 = x.to_vec();
+    let mut points = Vec::with_capacity(n);
     let relative_epsilon = method.rel_eps();
     for i in 0..n {
         let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
@@ -862,14 +1067,39 @@ where
                 }
             }
         }
-        x1[i] = if one_sided { x[i] + h } else { x[i] - h };
+        let first = if one_sided { x[i] + h } else { x[i] - h };
+        let second = if one_sided { x[i] + 2.0 * h } else { x[i] + h };
+        points.push((first, second, one_sided));
+    }
+    points
+}
+
+/// SciPy's dense two-/three-point `approx_derivative`.
+fn fd_jacobian_scipy<F>(
+    residuals: &F,
+    x: &[f64],
+    f0: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    method: FiniteDiffMethod,
+    rel_step: Option<f64>,
+) -> Result<Vec<Vec<f64>>, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let points = fd_points_scipy(x, lb, ub, method, rel_step);
+    let mut columns = Vec::with_capacity(x.len());
+    let mut x1 = x.to_vec();
+    let mut x2 = x.to_vec();
+    for (i, &(first, second, one_sided)) in points.iter().enumerate() {
+        x1[i] = first;
         let f1 = residuals(&x1);
         check_jacobian_residual_shape(&f1, f0.len())?;
         let column: Vec<f64> = if method == FiniteDiffMethod::TwoPoint {
             let dx = x1[i] - x[i];
             f1.iter().zip(f0).map(|(a, b)| (a - b) / dx).collect()
         } else {
-            x2[i] = if one_sided { x[i] + 2.0 * h } else { x[i] + h };
+            x2[i] = second;
             let f2 = residuals(&x2);
             check_jacobian_residual_shape(&f2, f0.len())?;
             let dx = if one_sided {
@@ -898,6 +1128,73 @@ where
         .collect())
 }
 
+/// Sparse finite differences with the same per-coordinate stencils as the
+/// dense path. Only declared nonzeros are formed; neither differentiation nor
+/// the returned matrix allocates an m-by-n array.
+fn fd_jacobian_grouped<F>(
+    residuals: &F,
+    x: &[f64],
+    f0: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    method: FiniteDiffMethod,
+    rel_step: Option<f64>,
+    sparsity: &JacobianSparsity,
+) -> Result<LeastSquaresMatrix, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let points = fd_points_scipy(x, lb, ub, method, rel_step);
+    let mut data = vec![0.0; sparsity.nnz()];
+    let mut x1 = x.to_vec();
+    let mut x2 = x.to_vec();
+    for group in &sparsity.groups {
+        for &c in group {
+            x1[c] = points[c].0;
+            x2[c] = points[c].1;
+        }
+        let f1 = residuals(&x1);
+        check_jacobian_residual_shape(&f1, f0.len())?;
+        if method == FiniteDiffMethod::TwoPoint {
+            for &c in group {
+                let dx = x1[c] - x[c];
+                for &(r, entry) in &sparsity.column_entries[c] {
+                    data[entry] = (f1[r] - f0[r]) / dx;
+                }
+            }
+        } else {
+            let f2 = residuals(&x2);
+            check_jacobian_residual_shape(&f2, f0.len())?;
+            for &c in group {
+                let one_sided = points[c].2;
+                let dx = if one_sided {
+                    x2[c] - x[c]
+                } else {
+                    x2[c] - x1[c]
+                };
+                for &(r, entry) in &sparsity.column_entries[c] {
+                    data[entry] = if one_sided {
+                        (-3.0 * f0[r] + 4.0 * f1[r] - f2[r]) / dx
+                    } else {
+                        (f2[r] - f1[r]) / dx
+                    };
+                }
+            }
+        }
+        for &c in group {
+            x1[c] = x[c];
+            x2[c] = x[c];
+        }
+    }
+    Ok(LeastSquaresMatrix::Sparse(CsrMatrix::from_components(
+        sparsity.shape,
+        data,
+        sparsity.indices.clone(),
+        sparsity.indptr.clone(),
+        true,
+    )?))
+}
+
 /// Fill the LM Jacobian. As in SciPy >= 1.16, residual calls made solely for
 /// numerical differentiation do not consume `max_nfev` or contribute to `nfev`.
 fn lm_jacobian_into<F>(
@@ -912,7 +1209,14 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     if let Some(analytic) = &options.jac {
-        *jac = analytic.evaluate(x, residual.len())?;
+        *jac = match analytic.evaluate(x, residual.len())? {
+            LeastSquaresMatrix::Dense(matrix) => matrix,
+            LeastSquaresMatrix::Sparse(_) => {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("method 'lm' requires a dense Jacobian"),
+                });
+            }
+        };
     } else if options.diff_method == FiniteDiffMethod::ThreePoint {
         *jac = fd_jacobian_scipy(
             residuals,
@@ -953,9 +1257,9 @@ impl From<trf::NonFiniteJacobian> for OptError {
 impl From<fsci_sparse::SparseError> for OptError {
     fn from(error: fsci_sparse::SparseError) -> Self {
         match error {
-            fsci_sparse::SparseError::NonFiniteInput { message } => Self::NonFiniteInput {
-                detail: message,
-            },
+            fsci_sparse::SparseError::NonFiniteInput { message } => {
+                Self::NonFiniteInput { detail: message }
+            }
             error => Self::NotConverged {
                 detail: format!("LSMR subproblem failed: {error}"),
             },
@@ -963,7 +1267,7 @@ impl From<fsci_sparse::SparseError> for OptError {
     }
 }
 
-/// Dense `trf`/`dogbox` setup: validate tolerances and bounds, require finite initial
+/// `trf`/`dogbox` setup: validate tolerances and bounds, require finite initial
 /// residuals, and move `x0` off the bounds only for TRF (Dogbox accepts exact bounds).
 fn least_squares_trust_region<F>(
     residuals: &F,
@@ -1090,17 +1394,64 @@ where
         });
     }
     let m = f0.len();
-    let j0 = match &options.jac {
-        Some(jac) => jac.evaluate(&x0, m)?,
-        None => fd_jacobian_scipy(
-            residuals,
-            &x0,
-            &f0,
-            &lb,
-            &ub,
-            options.diff_method,
-            options.diff_step,
-        )?,
+    // A callable Jacobian takes precedence, as in SciPy: its values and
+    // storage are authoritative and a numerical sparsity hint is ignored.
+    let sparsity = options
+        .jac
+        .is_none()
+        .then_some(options.jac_sparsity.as_ref())
+        .flatten();
+    if let Some(pattern) = sparsity {
+        if pattern.shape() != Shape2D::new(m, n) {
+            return Err(OptError::InvalidArgument {
+                detail: format!("jac_sparsity must have shape ({m}, {n})"),
+            });
+        }
+        if options.tr_solver == TrustRegionSolver::Exact {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("tr_solver='exact' is incompatible with jac_sparsity"),
+            });
+        }
+    }
+    let evaluate_jacobian = |x: &[f64], f: &[f64]| -> Result<LeastSquaresMatrix, OptError> {
+        if let Some(analytic) = &options.jac {
+            analytic.evaluate(x, m)
+        } else if let Some(pattern) = sparsity {
+            fd_jacobian_grouped(
+                residuals,
+                x,
+                f,
+                &lb,
+                &ub,
+                options.diff_method,
+                options.diff_step,
+                pattern,
+            )
+        } else {
+            fd_jacobian_scipy(
+                residuals,
+                x,
+                f,
+                &lb,
+                &ub,
+                options.diff_method,
+                options.diff_step,
+            )
+            .map(LeastSquaresMatrix::Dense)
+        }
+    };
+    let j0 = evaluate_jacobian(&x0, &f0)?;
+    let solver = match options.tr_solver {
+        TrustRegionSolver::Auto if j0.is_sparse() => {
+            TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default())
+        }
+        TrustRegionSolver::Auto => TrustRegionSolver::Exact,
+        TrustRegionSolver::Exact if j0.is_sparse() => {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("tr_solver='exact' requires a dense Jacobian"),
+            });
+        }
+        solver => solver,
     };
     let loss = (options.loss != LossKind::Linear).then_some(Loss {
         kind: options.loss,
@@ -1115,19 +1466,16 @@ where
         }
         Ok(f)
     };
-    let mut jac = |x: &[f64], f: &[f64]| -> Result<Vec<Vec<f64>>, OptError> {
-        match &options.jac {
-            Some(jac) => jac.evaluate(x, m),
-            None => fd_jacobian_scipy(
-                residuals,
-                x,
-                f,
-                &lb,
-                &ub,
-                options.diff_method,
-                options.diff_step,
-            ),
+    let mut jac = |x: &[f64], f: &[f64]| -> Result<LeastSquaresMatrix, OptError> {
+        let matrix = evaluate_jacobian(x, f)?;
+        if solver == TrustRegionSolver::Exact && matrix.is_sparse() {
+            return Err(OptError::InvalidArgument {
+                detail: String::from(
+                    "tr_solver='exact' requires a dense Jacobian at every evaluation",
+                ),
+            });
         }
+        Ok(matrix)
     };
     let solve = if dogbox { trf::dogbox } else { trf::trf };
     let out = solve(
@@ -1144,7 +1492,7 @@ where
         options.max_nfev,
         &x_scale,
         loss.as_ref(),
-        options.tr_solver,
+        solver,
         options.mode,
     )?;
     Ok(LeastSquaresResult {
@@ -1254,20 +1602,37 @@ where
         method: Some(method),
         ..options.ls_options
     };
+    if ls_options.jac.is_none()
+        && let Some(pattern) = &ls_options.jac_sparsity
+    {
+        ls_options.jac_sparsity = Some(whitening.sparsity(pattern)?);
+    }
     if !matches!(whitening.as_ref(), FitWhitening::Identity)
         && let Some(jacobian) = ls_options.jac.take()
     {
         let whitening = Arc::clone(whitening);
         let observations = xdata.len();
-        ls_options.jac = Some(LeastSquaresJacobian::new(move |params| {
-            let mut matrix = (jacobian.callback)(params);
-            // Leave malformed matrices intact for LeastSquaresJacobian::evaluate
-            // to report its normal shape error, before indexing any row here.
-            if matrix.len() == observations && matrix.iter().all(|row| row.len() == params.len()) {
-                whitening.jacobian(&mut matrix);
-            }
-            matrix
-        }));
+        ls_options.jac = Some(LeastSquaresJacobian {
+            callback: Arc::new(move |params| {
+                let matrix = (jacobian.callback)(params);
+                // Leave malformed matrices intact for LeastSquaresJacobian::evaluate
+                // to report its normal shape error, before indexing any row here.
+                let valid_shape = match &matrix {
+                    LeastSquaresMatrix::Dense(rows) => {
+                        rows.len() == observations
+                            && rows.iter().all(|row| row.len() == params.len())
+                    }
+                    LeastSquaresMatrix::Sparse(csr) => {
+                        csr.shape() == Shape2D::new(observations, params.len())
+                    }
+                };
+                if valid_shape {
+                    whitening.jacobian_matrix(matrix)
+                } else {
+                    matrix
+                }
+            }),
+        });
     }
     let ls_result = match bounds {
         Some((lower, upper)) => least_squares_bounded(residuals, &p0, lower, upper, ls_options)?,
@@ -1631,7 +1996,10 @@ where
     // scipy's `cov_x` is the *unscaled* inverse (JᵀJ)⁻¹; reuse the
     // `absolute_sigma` branch of the covariance helper. A rank-deficient
     // Jacobian yields a non-finite inverse -> report `None` like scipy.
-    let cov = compute_covariance(&ls.jac, ls.cost, m, n, true);
+    let jac = ls.jac.as_dense().ok_or_else(|| OptError::InvalidArgument {
+        detail: String::from("leastsq requires a dense LM Jacobian"),
+    })?;
+    let cov = compute_covariance(jac, ls.cost, m, n, true);
     let cov_x = if cov.iter().flatten().all(|v| v.is_finite()) {
         Some(cov)
     } else {
@@ -2003,27 +2371,36 @@ fn curve_fit_covariance(
 ) -> Vec<Vec<f64>> {
     let m = result.fun.len();
     let n = result.x.len();
-    if method == LeastSquaresMethod::Lm {
-        return compute_covariance(&result.jac, result.cost, m, n, absolute_sigma);
-    }
     if !absolute_sigma && m <= n {
         return vec![vec![f64::INFINITY; n]; n];
     }
-    if result.jac.iter().flatten().any(|value| !value.is_finite()) {
+    if !result.jac.all_finite() {
         return vec![vec![f64::INFINITY; n]; n];
     }
 
+    // curve_fit returns a full parameter covariance and explicitly performs a
+    // dense SVD here. Existing dense Jacobians are borrowed without copying;
+    // least_squares itself retains CSR storage end to end.
+    let dense_storage;
+    let jac = match result.jac.as_dense() {
+        Some(matrix) => matrix,
+        None => {
+            dense_storage = result.jac.to_dense();
+            &dense_storage
+        }
+    };
+    if method == LeastSquaresMethod::Lm {
+        return compute_covariance(jac, result.cost, m, n, absolute_sigma);
+    }
     // Normalize before the Jacobi SVD: its column inner products otherwise overflow
     // or underflow for large/small model derivatives, even when the covariance is finite.
-    let scale = result
-        .jac
+    let scale = jac
         .iter()
         .flatten()
         .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
     let mut covariance = vec![vec![0.0; n]; n];
     if scale != 0.0 {
-        let normalized: Vec<Vec<f64>> = result
-            .jac
+        let normalized: Vec<Vec<f64>> = jac
             .iter()
             .map(|row| row.iter().map(|value| value / scale).collect())
             .collect();
@@ -2783,7 +3160,7 @@ mod tests {
             assert!((result.x[0] - 2.0).abs() < 1e-7);
             assert_eq!(result.nfev, residual_calls.load(Ordering::Relaxed));
             assert_eq!(result.njev, jacobian_calls.load(Ordering::Relaxed));
-            assert_eq!(result.jac, vec![vec![1.0], vec![2.0], vec![4.0]]);
+            assert_eq!(result.jac.to_dense(), vec![vec![1.0], vec![2.0], vec![4.0]]);
         }
     }
 
@@ -3000,6 +3377,7 @@ mod tests {
                 .expect("return initial numerical Jacobian");
                 let error = result
                     .jac
+                    .to_dense()
                     .iter()
                     .flatten()
                     .zip(exact.iter().flatten())
@@ -3053,7 +3431,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                assert!((result.jac[i][i] - exact).abs() < 2e-9);
+                assert!((result.jac.to_dense()[i][i] - exact).abs() < 2e-9);
             }
             assert_eq!(
                 result.nfev, 1,

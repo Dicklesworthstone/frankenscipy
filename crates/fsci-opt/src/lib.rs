@@ -15,6 +15,7 @@ pub mod lbfgs_inv_hess;
 mod lbfgsb;
 pub mod linesearch;
 mod linprog;
+mod lsq_matrix;
 pub mod minimize;
 pub mod nonlin;
 mod npx;
@@ -43,16 +44,17 @@ pub use chandrupatla::{
     FindRootStatus, find_minimum, find_root,
 };
 pub use curvefit::{
-    CurveFitOptions, CurveFitResult, CurveFitSigma, LeastSquaresJacobian, LeastSquaresMethod,
-    LeastSquaresOptions, LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded,
-    curve_fit_bounded_many, curve_fit_many, least_squares, least_squares_bounded,
-    least_squares_many, leastsq,
+    CurveFitOptions, CurveFitResult, CurveFitSigma, JacobianSparsity, LeastSquaresJacobian,
+    LeastSquaresMethod, LeastSquaresOptions, LeastSquaresResult, LeastsqResult, curve_fit,
+    curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,
+    least_squares_bounded, least_squares_many, leastsq,
 };
 pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,
     line_search_wolfe2,
 };
 pub use linprog::{LinprogMethod, LinprogOptions, LinprogResult, LinprogSensitivity, linprog};
+pub use lsq_matrix::LeastSquaresMatrix;
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, ObjectiveLandscapeProbe, OptCaspDecision,
     OptCaspProblem, OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE,

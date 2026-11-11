@@ -8,6 +8,7 @@
 //! positive semidefinite; a safeguarded secular solve handles its at-most-two
 //! eigenvalues, including a one-dimensional or rank-deficient subspace.
 
+use crate::lsq_matrix::LeastSquaresMatrix;
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::linalg::{LsmrOptions, lsmr_with_options};
 use fsci_sparse::{LinearOperator, Shape2D, SparseError, SparseResult};
@@ -15,8 +16,11 @@ use fsci_sparse::{LinearOperator, Shape2D, SparseError, SparseResult};
 /// Linear subproblem solver for nonlinear least squares.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TrustRegionSolver {
-    /// Factor the dense Jacobian using an SVD. This remains the default.
+    /// Select an exact factorization for a dense Jacobian and LSMR for a
+    /// sparse one, matching SciPy's default `tr_solver=None` behavior.
     #[default]
+    Auto,
+    /// Factor a dense Jacobian using an SVD. Sparse Jacobians are rejected.
     Exact,
     /// Iterative Gauss–Newton solves, with a two-dimensional TRF subspace.
     Lsmr(TrustRegionLsmrOptions),
@@ -83,13 +87,9 @@ fn norm(x: &[f64]) -> f64 {
     x.iter().fold(0.0_f64, |value, &x| value.hypot(x))
 }
 
-fn product(matrix: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
-    matrix.iter().map(|row| dot(row, x)).collect()
-}
-
 /// [J; diag(diagonal)], without allocating an n-by-n diagonal block.
 struct AugmentedJacobian<'a> {
-    matrix: &'a [Vec<f64>],
+    matrix: &'a LeastSquaresMatrix,
     diagonal: &'a [f64],
     columns: usize,
 }
@@ -97,7 +97,7 @@ struct AugmentedJacobian<'a> {
 impl LinearOperator for AugmentedJacobian<'_> {
     fn shape(&self) -> Shape2D {
         Shape2D {
-            rows: self.matrix.len() + self.diagonal.len(),
+            rows: self.matrix.shape().rows + self.diagonal.len(),
             cols: self.columns,
         }
     }
@@ -108,14 +108,9 @@ impl LinearOperator for AugmentedJacobian<'_> {
                 message: String::from("least-squares operator matvec dimensions"),
             });
         }
-        for (out, row) in y.iter_mut().zip(self.matrix) {
-            *out = dot(row, x);
-        }
-        for ((out, &d), &value) in y[self.matrix.len()..]
-            .iter_mut()
-            .zip(self.diagonal)
-            .zip(x)
-        {
+        let rows = self.matrix.shape().rows;
+        self.matrix.product_into(x, &mut y[..rows]);
+        for ((out, &d), &value) in y[rows..].iter_mut().zip(self.diagonal).zip(x) {
             *out = d * value;
         }
         Ok(())
@@ -127,13 +122,9 @@ impl LinearOperator for AugmentedJacobian<'_> {
                 message: String::from("least-squares operator rmatvec dimensions"),
             });
         }
-        y.fill(0.0);
-        for (row, &value) in self.matrix.iter().zip(x) {
-            for (out, &entry) in y.iter_mut().zip(row) {
-                *out += entry * value;
-            }
-        }
-        for ((out, &d), &value) in y.iter_mut().zip(self.diagonal).zip(&x[self.matrix.len()..]) {
+        let rows = self.matrix.shape().rows;
+        self.matrix.transpose_product_into(&x[..rows], y);
+        for ((out, &d), &value) in y.iter_mut().zip(self.diagonal).zip(&x[rows..]) {
             *out += d * value;
         }
         Ok(())
@@ -227,7 +218,7 @@ fn solve_projected(hessian: [[f64; 2]; 2], gradient: [f64; 2], radius: f64) -> [
 }
 
 pub(crate) fn subspace(
-    jacobian: &[Vec<f64>],
+    jacobian: &LeastSquaresMatrix,
     residuals: &[f64],
     gradient: &[f64],
     diagonal: &[f64],
@@ -250,7 +241,7 @@ pub(crate) fn subspace(
     let mut regularization = 0.0;
     if options.regularize {
         // Minimize q(-t*g) for 0 <= t <= radius/||g||.
-        let image = product(jacobian, gradient);
+        let image = jacobian.product(gradient);
         let quadratic = dot(&image, &image)
             + gradient
                 .iter()
@@ -291,7 +282,8 @@ pub(crate) fn subspace(
     };
     let mut rhs = residuals.to_vec();
     rhs.resize(operator.shape().rows, 0.0);
-    let gauss_newton = lsmr_with_options(&operator, &rhs, options.linear_options(mode, damp))?.solution;
+    let gauss_newton =
+        lsmr_with_options(&operator, &rhs, options.linear_options(mode, damp))?.solution;
 
     let first: Vec<f64> = gradient.iter().map(|value| value / gradient_norm).collect();
     let mut second = gauss_newton.clone();
@@ -311,7 +303,10 @@ pub(crate) fn subspace(
         }
         basis.push(second);
     }
-    let images: Vec<_> = basis.iter().map(|column| product(jacobian, column)).collect();
+    let images: Vec<_> = basis
+        .iter()
+        .map(|column| jacobian.product(column))
+        .collect();
     let mut hessian = [[0.0; 2]; 2];
     let mut projected_gradient = [0.0; 2];
     for i in 0..basis.len() {
@@ -348,17 +343,14 @@ pub(crate) fn subspace(
 /// step back. A finite iteration budget may legitimately give an approximate
 /// direction; the outer trust-region ratio still decides whether to accept it.
 pub(crate) fn dogbox_step(
-    jacobian: &[Vec<f64>],
+    jacobian: &LeastSquaresMatrix,
     residuals: &[f64],
     scales: &[f64],
     options: TrustRegionLsmrOptions,
     mode: RuntimeMode,
 ) -> SparseResult<Vec<f64>> {
-    let scaled: Vec<Vec<f64>> = jacobian
-        .iter()
-        .map(|row| row.iter().zip(scales).map(|(a, b)| a * b).collect())
-        .collect();
-    if scaled.iter().flatten().any(|x| !x.is_finite()) {
+    let scaled = jacobian.scaled_columns(scales);
+    if !scaled.all_finite() {
         return Err(SparseError::NonFiniteInput {
             message: String::from("non-finite scaled least-squares Jacobian"),
         });
@@ -402,10 +394,7 @@ mod tests {
         let step = solve_projected(hessian, gradient, 0.25);
         assert!((step[0].hypot(step[1]) - 0.25).abs() < 1.0e-14);
         // KKT: Bp + g must equal -lambda*p for a nonnegative lambda.
-        let residual = [
-            4.0 * step[0] + step[1] + 3.0,
-            step[0] + 2.0 * step[1] - 4.0,
-        ];
+        let residual = [4.0 * step[0] + step[1] + 3.0, step[0] + 2.0 * step[1] - 4.0];
         assert!((residual[0] * step[1] - residual[1] * step[0]).abs() < 1.0e-13);
         assert!(residual[0] * step[0] + residual[1] * step[1] < 0.0);
     }

@@ -7,9 +7,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use fsci_opt::{
-    CurveFitOptions, CurveFitSigma, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions,
-    LossKind, OptError, curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many,
+    CurveFitOptions, CurveFitSigma, JacobianSparsity, LeastSquaresJacobian, LeastSquaresMethod,
+    LeastSquaresOptions, LossKind, OptError, curve_fit, curve_fit_bounded, curve_fit_bounded_many,
+    curve_fit_many,
 };
+use fsci_sparse::{CsrMatrix, Shape2D};
 use serde::{Deserialize, Serialize};
 
 const METHODS: [LeastSquaresMethod; 3] = [
@@ -24,6 +26,73 @@ fn correlated_covariance() -> Vec<Vec<f64>> {
         vec![1.0, 1.0, 0.0],
         vec![0.0, 0.0, 9.0],
     ]
+}
+
+#[test]
+fn sparse_curve_fit_preserves_whitening_and_covariance() {
+    let xdata = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+    let ydata = [1.0, 2.0, 3.0, 1.3, 1.8, 3.1];
+    let pattern = JacobianSparsity::from_rows((0..6).map(|i| vec![i % 3]).collect(), 3).unwrap();
+    let callback = LeastSquaresJacobian::new_sparse(|_| {
+        CsrMatrix::from_components(
+            Shape2D::new(6, 3),
+            vec![1.0; 6],
+            (0..6).map(|i| i % 3).collect(),
+            (0..=6).collect(),
+            true,
+        )
+        .unwrap()
+    });
+    let covariance: Vec<Vec<f64>> = (0..6)
+        .map(|i: i32| (0..6).map(|j: i32| 0.4_f64.powi((i - j).abs())).collect())
+        .collect();
+    for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+        for sigma in [
+            CurveFitSigma::StandardDeviations(vec![1.0, 2.0, 3.0, 2.0, 1.0, 4.0]),
+            CurveFitSigma::Covariance(covariance.clone()),
+        ] {
+            let options = CurveFitOptions {
+                p0: Some(vec![0.5; 3]),
+                sigma: Some(sigma.clone()),
+                absolute_sigma: true,
+                ls_options: LeastSquaresOptions {
+                    method: Some(method),
+                    gtol: 1e-12,
+                    xtol: 1e-12,
+                    ftol: 1e-12,
+                    ..LeastSquaresOptions::default()
+                },
+            };
+            let model = |x: f64, p: &[f64]| p[x as usize];
+            let dense = curve_fit(model, &xdata, &ydata, options.clone()).unwrap();
+            for analytic in [false, true] {
+                let mut sparse_options = options.clone();
+                sparse_options.ls_options.jac = analytic.then(|| callback.clone());
+                sparse_options.ls_options.jac_sparsity = (!analytic).then(|| pattern.clone());
+                let sparse = curve_fit(model, &xdata, &ydata, sparse_options).unwrap();
+                for (&a, &b) in sparse.popt.iter().zip(&dense.popt) {
+                    assert!(
+                        (a - b).abs() < 2e-7,
+                        "{method:?} {sigma:?}: {:?} != {:?}",
+                        sparse.popt,
+                        dense.popt
+                    );
+                }
+                for (a, b) in sparse
+                    .pcov
+                    .iter()
+                    .flatten()
+                    .zip(dense.pcov.iter().flatten())
+                {
+                    assert!((a - b).abs() < 2e-7);
+                }
+                assert!((sparse.ls_result.cost - dense.ls_result.cost).abs() < 1e-10);
+                let stays_sparse =
+                    !analytic || matches!(sigma, CurveFitSigma::StandardDeviations(_));
+                assert_eq!(sparse.ls_result.jac.is_sparse(), stays_sparse);
+            }
+        }
+    }
 }
 
 fn constant_options(
@@ -110,9 +179,10 @@ fn sigma_whitens_correlated_errors_and_analytic_jacobians() {
                     "{method:?}: {fit:?}"
                 );
                 assert!((fit.ls_result.cost - 101.0 / 30.0).abs() < 1e-12);
-                assert!((fit.ls_result.jac[0][0] - 0.5).abs() < 1e-7);
-                assert!((fit.ls_result.jac[1][0] - 3.0_f64.sqrt() / 2.0).abs() < 1e-7);
-                assert!((fit.ls_result.jac[2][0] - 1.0 / 3.0).abs() < 1e-7);
+                let jac = fit.ls_result.jac.to_dense();
+                assert!((jac[0][0] - 0.5).abs() < 1e-7);
+                assert!((jac[1][0] - 3.0_f64.sqrt() / 2.0).abs() < 1e-7);
+                assert!((jac[2][0] - 1.0 / 3.0).abs() < 1e-7);
             }
         }
     }
@@ -163,7 +233,13 @@ fn subnormal_sigma_scales_finite_residuals_and_jacobians() {
             assert!((fit.popt[0] - 2.0).abs() < 1e-3, "{method:?}: {fit:?}");
             assert_eq!(fit.ls_result.cost, 0.0);
             assert!(fit.ls_result.fun.iter().all(|&value| value == 0.0));
-            assert!(fit.ls_result.jac.iter().all(|row| row[0].abs() == 1.0));
+            assert!(
+                fit.ls_result
+                    .jac
+                    .to_dense()
+                    .iter()
+                    .all(|row| row[0].abs() == 1.0)
+            );
             assert!((fit.pcov[0][0] - 1.0 / 3.0).abs() < 1e-12);
         }
     }

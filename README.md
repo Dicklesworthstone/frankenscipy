@@ -50,9 +50,9 @@ FrankenSciPy reimplements the SciPy surface in idiomatic Rust with three guarant
 |---|---|---|---|---|
 | Memory safety | C/Fortran kernels | safe Rust | safe Rust | **`#![forbid(unsafe_code)]`** workspace-wide |
 | Async runtime | N/A (Python) | N/A | tokio-leaning | **none in the API** (synchronous kernels; no tokio anywhere in the tree) |
-| Surface area | 1,555<!-- fact:census_scipy --> callable symbols (1,539<!-- fact:census_applicable --> applicable) | low-level only | optimization or ML focus | **1,525<!-- fact:census_real --> real (99.1%) / 1,495<!-- fact:census_declared --> declared (97.1%) / 891<!-- fact:census_compared --> compared (57.9%) across 33<!-- fact:census_modules --> SciPy modules** (see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)) |
+| Surface area | 1,555<!-- fact:census_scipy --> callable symbols (1,538<!-- fact:census_applicable --> applicable) | low-level only | optimization or ML focus | **1,531<!-- fact:census_real --> real (99.5%) / 1,498<!-- fact:census_declared --> declared (97.4%) / 904<!-- fact:census_compared --> compared (58.8%) across 33<!-- fact:census_modules --> SciPy modules** (see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)) |
 | Algorithm selection | hand-rolled per routine | manual | manual | **CASP runtime portfolio** with audit trail on dense solve, sparse, opt, ODE, and hypergeometric families |
-| Conformance against SciPy | self-checking | none | partial | **781<!-- fact:diff_files --> differential test files**, most of which drive a live SciPy interpreter at test time |
+| Conformance against SciPy | self-checking | none | partial | **782<!-- fact:diff_files --> differential test files**, most of which drive a live SciPy interpreter at test time |
 | Distribution moments | partial closed-forms | none | none | **95+ continuous, 10+ discrete, explicit `skewness`/`kurtosis`/`entropy`** |
 | Numerical-stability contract | implicit | implicit | implicit | **Stability outranks speed; tolerance contracts cannot be weakened** |
 | Artifact durability | none | none | none | **RaptorQ systematic encoding for conformance/benchmark/reproducibility bundles** |
@@ -88,20 +88,20 @@ Three other crates ship rule-based selectors that share the CASP name but not it
 
 ## Workspace at a Glance
 
-FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning ~722,500<!-- fact:total_src_lines --> lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,921<!-- fact:all_tests --> `#[test]` functions in all, 8,494<!-- fact:inline_tests --> of them inline), plus 846<!-- fact:conf_test_files --> conformance integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, verified in CI by `scripts/readme_facts.py --check`.
+FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning ~738,000<!-- fact:total_src_lines --> lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,921<!-- fact:all_tests --> `#[test]` functions in all, 8,494<!-- fact:inline_tests --> of them inline), plus 848<!-- fact:conf_test_files --> conformance integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, verified in CI by `scripts/readme_facts.py --check`.
 
 | Crate | Lines | Surface |
 |---|---|---|
 | [`fsci-linalg`](crates/fsci-linalg/) | ~72,600<!-- fact:src_lines_fsci_linalg --> | Dense and structured linear algebra; CASP solver selection; LU / QR / Cholesky / SVD / LDL / Schur / Hessenberg / QZ; `expm`, `logm`, `sqrtm`, `funm`, `signm`; Sylvester, Lyapunov, continuous and discrete Riccati; banded specialists; subspace and polar decompositions; **complex128** (`fsci_linalg::complex`): solve / lu / lu_factor / det / inv / cholesky / qr / hessenberg / schur / eig / eigvals / eigh / svd / lstsq / pinv / norm / expm / sqrtm / logm on complex matrices, and `logm_real` / `sqrtm_real` returning SciPy's complex result for a real matrix with a negative eigenvalue |
-| [`fsci-sparse`](crates/fsci-sparse/) | ~87,900<!-- fact:src_lines_fsci_sparse --> | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens with adaptive restart tolerance), LGMRES, BiCG, BiCGSTAB, CGS, QMR, MINRES, LSQR, LSMR (with a rule-based iterative-solver selector); `eigs` via implicitly-restarted Krylov-Schur; `eigsh` via thick-restart Lanczos (Wu & Simon) over `ncv = min(n, max(2k+1, 20))`; `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
+| [`fsci-sparse`](crates/fsci-sparse/) | ~91,200<!-- fact:src_lines_fsci_sparse --> | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens with adaptive restart tolerance), LGMRES, BiCG, BiCGSTAB, CGS, QMR, MINRES, LSQR, LSMR (with a rule-based iterative-solver selector); `eigs` via implicitly-restarted Krylov-Schur; `eigsh` via thick-restart Lanczos (Wu & Simon) over `ncv = min(n, max(2k+1, 20))`; `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
 | [`fsci-integrate`](crates/fsci-integrate/) | ~43,200<!-- fact:src_lines_fsci_integrate --> | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp` (collocation, as SciPy); `quad` as QUADPACK (qagse/qagie/qagpe and the weighted qawoe/qawfe/qawse/qawce); `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
 | [`fsci-interpolate`](crates/fsci-interpolate/) | ~28,100<!-- fact:src_lines_fsci_interpolate --> | `interp1d`, `CubicSpline`, `CubicHermiteSpline`, `BSpline`, `Akima`, `PCHIP`; `RegularGridInterpolator`, `griddata`, `interpn`; Krogh, barycentric, polynomial helpers; `make_lsq_spline` for k = 1/3/5 |
-| [`fsci-opt`](crates/fsci-opt/) | ~66,400<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, fixed or Jacobian-based parameter scales; LM; analytic Jacobians for all three methods), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
+| [`fsci-opt`](crates/fsci-opt/) | ~70,200<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, parameter scales, analytic CSR Jacobians and grouped sparse finite differences through LSMR; LM; dense analytic Jacobians for all three methods), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
 | [`fsci-fft`](crates/fsci-fft/) | ~14,200<!-- fact:src_lines_fsci_fft --> | Mixed radix 2/3/4/5/7/11/13/17, direct DFT for primes ≤ 61, Rader and Bluestein for the rest; `rfft`/`irfft`; n-D transforms (`fftn`/`ifftn`/`rfftn`/`irfftn`); DCT/DST I–IV in 1-D, type II in n-D; Hilbert analytic signal; FHT; legacy `scipy.fftpack` pseudo-differential operators (`fftpack::diff`, `tilbert`, `itilbert`, `hilbert`, `ihilbert`, `cs_diff`, `sc_diff`, `ss_diff`, `cc_diff`, `shift`); plan cache keyed by (kind, shape, axes, normalization, real input) |
 | [`fsci-signal`](crates/fsci-signal/) | ~41,700<!-- fact:src_lines_fsci_signal --> | Windows (Hann, Hamming, Kaiser, Tukey, Blackman, Taylor, exponential, general-Hamming…); filter design (`butter` / `cheby1` / `cheby2` / `ellip` / `bessel`, ZPK and BA forms, full `lp2{lp,hp,bp,bs}` and `lp2{lp,hp,bp,bs}_zpk` transforms, `bilinear` / `bilinear_zpk`); filter-order helpers `buttord` / `cheb1ord` / `cheb2ord` / `ellipord`; analog prototypes `buttap` and `cheb1ap`; `firwin`, `firls`, `remez`; `lfilter`, `filtfilt`, SOS application; `welch`, `periodogram`, `csd`, `coherence`; `find_peaks` with SciPy's full condition set (height, threshold, distance, prominence, width, wlen, rel_height, plateau_size) and properties; CWT; Daubechies / Morlet / Ricker wavelets; MFCC, mel filterbank, chroma |
 | [`fsci-spatial`](crates/fsci-spatial/) | ~20,200<!-- fact:src_lines_fsci_spatial --> | KDTree / cKDTree (`query`, `query_pairs`, `count_neighbors`); `pdist` / `cdist` / `distance_matrix` (Euclidean, Manhattan, Chebyshev, Minkowski, Mahalanobis, Hausdorff, weighted variants); ConvexHull, Delaunay and Voronoi in 2-D; HalfspaceIntersection (full metadata in 2-D) |
-| [`fsci-special`](crates/fsci-special/) | ~90,400<!-- fact:src_lines_fsci_special --> | Gamma family (`gamma`, `gammaln`, `digamma`, `polygamma`, `pentagamma`, `factorialk`); beta family; `erf`/`erfc`/`erfinv`; Bessel J/Y/I/K/H1/H2 and spherical variants; Airy + zeros; hypergeometric `0F1`/`1F1`/`2F1` with rule-based branch selection (series, transformations, connection formulas); elliptic `K`/`E`/`J` and the full Carlson family `RC`/`RF`/`RD`/`RJ`/`RG`; zeta; Struve; Dawson; spherical harmonics; orthogonal polynomials (Legendre / Cheby T,U,C,S / Hermite / Laguerre / Jacobi / Gegenbauer + shifted variants); Voigt profile; accurate-near-zero `log1pmx`, `powm1`, `cosm1`; Kelvin functions |
-| [`fsci-stats`](crates/fsci-stats/) | ~139,600<!-- fact:src_lines_fsci_stats --> | **95+ continuous and 10+ discrete distributions** with PDF/CDF/SF/PPF and moments (most with `fit` and `mode`; see **Distribution Moment Surface**); t-tests, KS, Shapiro, Mann-Whitney, Wilcoxon, ANOVA, chi-square contingency; Pearson/Spearman/Kendall correlations; linear regression; bootstrap; permutation tests; `gaussian_kde`; Box-Cox; QMC engines (Sobol, Halton, Latin Hypercube) with centered / mixture / wraparound / L2-star discrepancies |
+| [`fsci-special`](crates/fsci-special/) | ~85,200<!-- fact:src_lines_fsci_special --> | Gamma family (`gamma`, `gammaln`, `digamma`, `polygamma`, `pentagamma`, `factorialk`); beta family; `erf`/`erfc`/`erfinv`; Bessel J/Y/I/K/H1/H2 and spherical variants; Airy + zeros; hypergeometric `0F1`/`1F1`/`2F1` with rule-based branch selection (series, transformations, connection formulas); elliptic `K`/`E`/`J` and the full Carlson family `RC`/`RF`/`RD`/`RJ`/`RG`; zeta; Struve; Dawson; spherical harmonics; orthogonal polynomials (Legendre / Cheby T,U,C,S / Hermite / Laguerre / Jacobi / Gegenbauer + shifted variants); Voigt profile; accurate-near-zero `log1pmx`, `powm1`, `cosm1`; Kelvin functions |
+| [`fsci-stats`](crates/fsci-stats/) | ~143,900<!-- fact:src_lines_fsci_stats --> | **95+ continuous and 10+ discrete distributions** with PDF/CDF/SF/PPF and moments (most with `fit` and `mode`; see **Distribution Moment Surface**); t-tests, KS, Shapiro, Mann-Whitney, Wilcoxon, ANOVA, chi-square contingency; Pearson/Spearman/Kendall correlations; linear regression; bootstrap; permutation tests; `gaussian_kde`; Box-Cox; QMC engines (Sobol, Halton, Latin Hypercube) with centered / mixture / wraparound / L2-star discrepancies |
 | [`fsci-cluster`](crates/fsci-cluster/) | ~18,400<!-- fact:src_lines_fsci_cluster --> | KMeans + KMeans++ initialization; DBSCAN; hierarchical agglomerative linkage; `dendrogram`; `fcluster`; silhouette / Davies-Bouldin / Calinski-Harabasz indices |
 | [`fsci-ndimage`](crates/fsci-ndimage/) | ~32,100<!-- fact:src_lines_fsci_ndimage --> | Uniform / Gaussian / median / minimum / maximum filters; closure-driven `generic_filter`; binary and grayscale morphology (erosion, dilation, opening, closing, hit-or-miss); `label`, `find_objects`; Euclidean distance transform; affine transform, rotate, zoom, shift; Sobel / Prewitt / Laplace edge detectors; histograms and extrema indexed by label |
 | [`fsci-io`](crates/fsci-io/) | ~12,700<!-- fact:src_lines_fsci_io --> | MATLAB MAT-files: `loadmat` / `savemat` / `whosmat` / `matfile_version` / `varmats_from_mat` for Level 5 (v6/v7: compressed or not, either byte order; numeric incl. complex, logical and N-D, char, cell, struct, object, sparse, function handles) and Level 4, matching SciPy 1.17.1 on all 111 files of its MAT test corpus (v7.3/HDF5 rejected as SciPy rejects it); Matrix Market `mmread` / `mmwrite` (dense and sparse); WAV PCM and IEEE-float read/write; simplified NetCDF reader; IDL `.sav` reader; Fortran sequential unformatted reader |
@@ -110,7 +110,7 @@ FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning 
 | [`fsci-datasets`](crates/fsci-datasets/) | ~670<!-- fact:src_lines_fsci_datasets --> | Deterministic SYNTHETIC stand-ins with SciPy's shapes for `ascent`, `face` (RGB / gray) and `electrocardiogram` (generated patterns, not SciPy's data) |
 | [`fsci-runtime`](crates/fsci-runtime/) | ~8,100<!-- fact:src_lines_fsci_runtime --> | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
 | [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~5,100<!-- fact:src_lines_fsci_arrayapi --> | Reference Array API backend and broadcasting/index specification used by the conformance suite (`fsci-conformance`) |
-| [`fsci-conformance`](crates/fsci-conformance/) | ~35,100<!-- fact:src_lines_fsci_conformance --> (lib + 9 bins) + **846<!-- fact:conf_test_files --> test files** | Live-SciPy differential tests (781<!-- fact:diff_files --> `diff_*` files, most with an inline SciPy script); fixture self-check packets; RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 16<!-- fact:oracle_scripts --> Python oracle scripts for packet capture; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
+| [`fsci-conformance`](crates/fsci-conformance/) | ~35,100<!-- fact:src_lines_fsci_conformance --> (lib + 9 bins) + **848<!-- fact:conf_test_files --> test files** | Live-SciPy differential tests (782<!-- fact:diff_files --> `diff_*` files, most with an inline SciPy script); fixture self-check packets; RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 16<!-- fact:oracle_scripts --> Python oracle scripts for packet capture; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
 
 For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
 
@@ -927,7 +927,8 @@ Roots: brentq, brenth, bisect, ridder, toms748, newton_scalar, halley, secant,
 
 Curve fitting: curve_fit (TRF/Dogbox underdetermined fits and SVD covariance),
                least_squares (TRF and Dogbox with bounds, robust losses and
-               parameter scaling, or LM; analytic Jacobians), nnls,
+               parameter scaling, or LM; dense/CSR analytic Jacobians and
+               grouped sparse finite differences), nnls,
                isotonic_regression,
 
 Global:        differential_evolution, dual_annealing, basinhopping, shgo, brute,
@@ -941,6 +942,59 @@ Other:         linear_sum_assignment (Jonker-Volgenant), bracket,
                projected_gradient_descent, augmented_lagrangian,
                simulated_annealing, …
 ```
+
+##### Sparse nonlinear least squares
+
+For a residual model with sparse dependencies, pass a `JacobianSparsity` through
+`LeastSquaresOptions::jac_sparsity`. Each row lists the parameters that can affect
+that residual. The pattern must include every possible nonzero throughout the
+solve. Columns with disjoint row supports are differentiated together: each color
+uses one residual call for two-point differences or two calls for three-point
+differences, including one-sided stencils near bounds.
+
+```rust
+use fsci_opt::{JacobianSparsity, LeastSquaresOptions, least_squares};
+
+fn main() {
+    // Three independent residuals: all three columns share one color.
+    let sparsity = JacobianSparsity::from_rows(
+        vec![vec![0], vec![1], vec![2]],
+        3,
+    ).expect("valid dependency pattern");
+    assert_eq!(sparsity.color_count(), 1);
+
+    let result = least_squares(
+        |x| vec![x[0] * x[0] - 1.0, x[1] * x[1] - 4.0, x[2] * x[2] - 9.0],
+        &[0.5, 1.0, 1.5],
+        LeastSquaresOptions {
+            jac_sparsity: Some(sparsity),
+            ..Default::default()
+        },
+    ).expect("fit");
+    assert!(result.success);
+    assert!(result.jac.as_sparse().is_some());
+    println!("parameters = {:?}", result.x); // approximately [1, 2, 3]
+}
+```
+
+If derivatives are available, `LeastSquaresJacobian::new_sparse` accepts a
+callback returning `fsci_sparse::CsrMatrix`; `new` accepts dense rows. Analytic
+callbacks take precedence over a numerical sparsity hint. Sparse rows are sorted
+and duplicate entries summed before use. The default `TrustRegionSolver::Auto`
+selects Exact for a dense Jacobian and LSMR for a sparse one. TRF and Dogbox retain
+CSR storage through robust-loss scaling, parameter scaling, active bounds, and
+linear subproblems. Explicit Exact and LM require dense Jacobians.
+
+**Result migration:** `LeastSquaresResult::jac` is now `LeastSquaresMatrix`, with
+`Dense` and `Sparse` variants. Use `as_dense()` or `as_sparse()` to borrow its
+storage, or `to_dense()` to request a dense copy explicitly.
+
+`curve_fit` still returns a dense parameter covariance matrix and materializes
+the fitted Jacobian for that covariance calculation. Diagonal measurement weights
+preserve sparse derivatives. A full observation covariance mixes residual rows:
+its Cholesky whitening expands numerical sparsity dependencies and converts an
+analytic sparse Jacobian to dense storage. Use `least_squares` directly when the
+entire fitting path must avoid dense Jacobian allocation.
 
 #### `fsci-integrate` public surface (selected)
 
@@ -1509,7 +1563,7 @@ When you want to understand a kernel, follow this order:
 
 The single largest file in the workspace is `crates/fsci-stats/src/lib.rs` at ~115K<!-- fact:stats_lib_lines --> lines, roughly half of it inline tests. It is intentionally not split: every distribution is defined inline so a reader can `grep -n "pub struct <Name>"` and land on the entire implementation in one place.
 
-`fsci-special` takes the opposite approach: ~90K<!-- fact:src_lines_fsci_special --> lines of source split across ~10 modules (`gamma.rs`, `hyper.rs`, `orthopoly.rs`, `elliptic.rs`, `beta.rs`, etc.) with `lib.rs` acting as the re-export header. Use either layout when adding new content; match the existing one in the crate you're touching.
+`fsci-special` takes the opposite approach: ~85K<!-- fact:src_lines_fsci_special --> lines of source split across ~10 modules (`gamma.rs`, `hyper.rs`, `orthopoly.rs`, `elliptic.rs`, `beta.rs`, etc.) with `lib.rs` acting as the re-export header. Use either layout when adding new content; match the existing one in the crate you're touching.
 
 ---
 
@@ -1519,7 +1573,7 @@ The final reference block: the fuzz harness layout, the anatomy of a conformance
 
 ### The Fuzz Harness
 
-`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **96<!-- fact:fuzz_targets --> fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
+`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **98<!-- fact:fuzz_targets --> fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
 
 ```text
 fuzz/
@@ -1536,12 +1590,12 @@ fuzz/
 │   ├── p2c012_cluster_fcluster_bounds.rs         # hierarchical cluster cut at extreme thresholds
 │   ├── p2c017_io_wav_read.rs                     # WAV header parser against malformed files
 │   └── ...                                        # 86 more
-├── corpus/         # accumulated fuzzer inputs that trigger interesting paths (923 files)
-├── seeds/          # human-curated seed inputs (569 files)
+├── corpus/         # accumulated fuzzer inputs that trigger interesting paths (218 files)
+├── seeds/          # human-curated seed inputs (580 files)
 └── artifacts/      # minimized reproducers from any crash
 ```
 
-The fuzz directory holds 923<!-- fact:fuzz_corpus --> corpus files and 569<!-- fact:fuzz_seeds --> seed inputs. The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan (cargo-fuzz's `-Zsanitizer=address`; UBSan is not reachable through `-Zsanitizer` on the pinned toolchain — an earlier `address,undefined` flag was rejected at compile time and kept the workflow red at the build step); the other 87 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/`; the `fuzz_triage` binary promotes them to regression fixtures and files `fuzz-finding` beads when run by hand, but the nightly workflow does not invoke it.
+The fuzz directory holds 218<!-- fact:fuzz_corpus --> corpus files and 580<!-- fact:fuzz_seeds --> seed inputs. The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan (cargo-fuzz's `-Zsanitizer=address`; UBSan is not reachable through `-Zsanitizer` on the pinned toolchain — an earlier `address,undefined` flag was rejected at compile time and kept the workflow red at the build step); the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/`; the `fuzz_triage` binary promotes them to regression fixtures and files `fuzz-finding` beads when run by hand, but the nightly workflow does not invoke it.
 
 Each target uses `libfuzzer-sys` and is structured around the same three-phase pattern:
 
@@ -1791,7 +1845,7 @@ The coverage columns come from `scripts/symbol_census.py` against `scipy 1.17.1`
 | `fsci-datasets` | `parity_green` | 5 (`5 / 5 / 0`) | 0 | Synthetic stand-ins with SciPy's shapes, not SciPy's data |
 | `fsci-runtime` | `parity_green` | n/a (FrankenSciPy-native) | 8 | CASP engine + `PolicyController` + `EProcessMonitor` + audit ledger |
 | `fsci-arrayapi` | `reference` | n/a | 5 | Reference backend and broadcasting spec used by conformance suite |
-| `fsci-conformance` | `parity_green` | n/a (harness) | — | 846<!-- fact:conf_test_files --> integration test files (781<!-- fact:diff_files --> `diff_*`), 18<!-- fact:fsci_packets --> packets, 16<!-- fact:oracle_scripts --> oracle scripts |
+| `fsci-conformance` | `parity_green` | n/a (harness) | — | 848<!-- fact:conf_test_files --> integration test files (782<!-- fact:diff_files --> `diff_*`), 18<!-- fact:fsci_packets --> packets, 16<!-- fact:oracle_scripts --> oracle scripts |
 
 ---
 
@@ -1865,7 +1919,7 @@ without SciPy and asserting it fails.
 | G0 | `G0: integrity fast lane` (push) | Every tracked RaptorQ sidecar matches its source's BLAKE3; `readme_facts.py --check`; every `diff_*.rs` falls in exactly one G3 shard; `cargo test -p fsci-runtime` (byte-exact audit-ledger golden); the G9 tolerance ratchet |
 | G1 | `fmt + clippy` (push) | Toolchain pin check, `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | G2 | `unit + property tests (<crate>)` | One job per crate: `cargo test -p <crate>` for the 18 domain crates plus the conformance library |
-| G3 | `live-SciPy diff (<shard>)` | The 781<!-- fact:diff_files --> `diff_*` files in 15 shards, each binary built and run with `FSCI_REQUIRE_SCIPY_ORACLE=1` against the pinned SciPy |
+| G3 | `live-SciPy diff (<shard>)` | The 782<!-- fact:diff_files --> `diff_*` files in 15 shards, each binary built and run with `FSCI_REQUIRE_SCIPY_ORACLE=1` against the pinned SciPy |
 | G3 control | `no SciPy must fail` | Runs one oracle-required lane with an interpreter that cannot import SciPy; the job passes only if that lane fails |
 | G3b | `live SciPy oracle capture` | `live_oracle_capture` in required-oracle mode against the pinned versions; uploads the capture, its RaptorQ sidecar and decode proof |
 | G3c | `goldens + metamorphic + fallback capture` | Golden journeys, the metamorphic suites, the oracle/live/fuzz regression files, and `live_oracle_capture --allow-missing-oracle` |
@@ -1956,7 +2010,7 @@ cargo tree -i tokio
 
 ### Builds are slow / OOM during `cargo build`
 
-`fsci-stats` (~140K<!-- fact:src_lines_fsci_stats --> source lines including inline tests) and `fsci-special` (~90K<!-- fact:src_lines_fsci_special -->) are the largest compilation units. Building them in parallel can exhaust RAM on smaller hosts. Use:
+`fsci-stats` (~144K<!-- fact:src_lines_fsci_stats --> source lines including inline tests) and `fsci-special` (~85K<!-- fact:src_lines_fsci_special -->) are the largest compilation units. Building them in parallel can exhaust RAM on smaller hosts. Use:
 
 ```bash
 CARGO_BUILD_JOBS=2 cargo build --workspace --release
@@ -1975,7 +2029,7 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
 - **Tagged release available.** The workspace is released at `0.4.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
-- **Name coverage vs behavioural parity.** Across 33<!-- fact:census_modules --> `scipy.*` modules (`1,555`<!-- fact:census_scipy --> public symbols; `16`<!-- fact:census_na --> N/A; `1,539`<!-- fact:census_applicable --> applicable), `scripts/symbol_census.py` counts **`1,495`<!-- fact:census_declared --> declared (`97.1%`)**, **`1,525`<!-- fact:census_real --> real (`99.1%`)**, and **`891`<!-- fact:census_compared --> differentially compared (`57.9%`)** (see [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) and [`docs/planning/symbol_census.json`](docs/planning/symbol_census.json)). The 14 missing symbols are recorded in `docs/planning/census_dispositions.toml`. The earlier 1,300-symbol census listed `optimize.direct`, `stats.CensoredData` and `stats.Covariance` as residual focus areas; they are implemented and are not in that missing list.
+- **Name coverage vs behavioural parity.** Across 33<!-- fact:census_modules --> `scipy.*` modules (`1,555`<!-- fact:census_scipy --> public symbols; `17`<!-- fact:census_na --> N/A; `1,538`<!-- fact:census_applicable --> applicable), `scripts/symbol_census.py` counts **`1,498`<!-- fact:census_declared --> declared (`97.4%`)**, **`1,531`<!-- fact:census_real --> real (`99.5%`)**, and **`904`<!-- fact:census_compared --> differentially compared (`58.8%`)** (see [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) and [`docs/planning/symbol_census.json`](docs/planning/symbol_census.json)). The 7 missing symbols are recorded in `docs/planning/census_dispositions.toml`. The earlier 1,300-symbol census listed `optimize.direct`, `stats.CensoredData` and `stats.Covariance` as residual focus areas; they are implemented and are not in that missing list.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.
@@ -1996,7 +2050,7 @@ Workstreams are tracked in [`.beads/beads.jsonl`](.beads/beads.jsonl) and surfac
 A. Because then you still have the GIL, the Python object model, the SciPy install footprint, the Python build dependency chain, and zero ability to reason about memory safety or runtime algorithm selection. The whole point is to remove Python from the hot path.
 
 **Q. Why not use `ndarray` + `nalgebra` + `argmin` + `linfa` + a hand-rolled wrapper?**
-A. You can. That stack gives you fast linear algebra and a couple of solvers. It does not give you SciPy parity, a conformance harness against the real SciPy, an audited runtime algorithm selector, a distribution moment surface for 100+ distributions, RaptorQ-backed artifact durability, or 846<!-- fact:conf_test_files --> conformance test files covering the same surface. FrankenSciPy is the integration of all of that into one Cargo workspace.
+A. You can. That stack gives you fast linear algebra and a couple of solvers. It does not give you SciPy parity, a conformance harness against the real SciPy, an audited runtime algorithm selector, a distribution moment surface for 100+ distributions, RaptorQ-backed artifact durability, or 848<!-- fact:conf_test_files --> conformance test files covering the same surface. FrankenSciPy is the integration of all of that into one Cargo workspace.
 
 **Q. Why no tokio?**
 A. FrankenSciPy is a synchronous numerical library; none of its public API is async, and dragging in tokio's heavyweight ecosystem (`hyper`, `reqwest`, `axum`, `tower`, lots of transitive features) is forbidden. `asupersync` is consumed exclusively for RaptorQ systematic encoding and decode recovery verification in `fsci-conformance`.
