@@ -12,7 +12,7 @@ use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf::{self, Loss, LossKind, XScale};
 use crate::trf_lsmr::{TrustRegionLsmrOptions, TrustRegionSolver};
 use crate::types::OptError;
-use fsci_sparse::{CsrMatrix, Shape2D};
+use fsci_sparse::{CsrMatrix, LinearOperator, Shape2D};
 
 /// SciPy's `least_squares(method=...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +56,8 @@ pub struct LeastSquaresResult {
     pub njev: usize,
     /// Number of iterations (accepted steps for `Trf` and `Dogbox`).
     pub nit: usize,
-    /// Jacobian at the solution, retaining sparse storage when supplied by the
-    /// caller or estimated using `jac_sparsity`. For a robust loss this is
+    /// Jacobian at the solution, retaining sparse or matrix-free storage when supplied
+    /// by the caller or estimated using `jac_sparsity`. For a robust loss this is
     /// SciPy's loss-scaled Jacobian. Use [`LeastSquaresMatrix::to_dense`] when
     /// an explicitly materialized dense matrix is needed.
     pub jac: LeastSquaresMatrix,
@@ -80,7 +80,8 @@ pub struct LeastSquaresResult {
 /// the callback receives the fitted variables, not the batch's per-fit data.
 #[derive(Clone)]
 pub struct LeastSquaresJacobian {
-    callback: Arc<dyn Fn(&[f64]) -> LeastSquaresMatrix + Send + Sync>,
+    callback: Arc<dyn Fn(&[f64]) -> Result<LeastSquaresMatrix, OptError> + Send + Sync>,
+    matrix_free: bool,
 }
 
 impl std::fmt::Debug for LeastSquaresJacobian {
@@ -95,7 +96,8 @@ impl LeastSquaresJacobian {
         F: Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'static,
     {
         Self {
-            callback: Arc::new(move |x| LeastSquaresMatrix::Dense(callback(x))),
+            callback: Arc::new(move |x| Ok(LeastSquaresMatrix::Dense(callback(x)))),
+            matrix_free: false,
         }
     }
 
@@ -108,17 +110,44 @@ impl LeastSquaresJacobian {
         F: Fn(&[f64]) -> CsrMatrix + Send + Sync + 'static,
     {
         Self {
-            callback: Arc::new(move |x| LeastSquaresMatrix::Sparse(callback(x))),
+            callback: Arc::new(move |x| Ok(LeastSquaresMatrix::Sparse(callback(x)))),
+            matrix_free: false,
+        }
+    }
+
+    /// Supply a matrix-free analytic Jacobian at each parameter vector.
+    ///
+    /// The returned [`LinearOperator`] must implement both `matvec_into` and
+    /// `rmatvec_into` and own the state defining the Jacobian at this point. It must
+    /// keep its shape fixed. Each product is checked for errors and nonfinite outputs.
+    /// Automatic subproblem selection uses LSMR; TRF and Dogbox preserve products
+    /// through bounds, parameter scaling, and robust losses without probing entries.
+    ///
+    /// `method='lm'`, `tr_solver='exact'`, and `x_scale='jac'` require explicit
+    /// entries and reject this representation. `curve_fit` also requires explicit
+    /// entries for its parameter-covariance calculation; use `least_squares` for
+    /// matrix-free fitting. Batched solves require `Send + Sync` operators.
+    pub fn new_operator<F, O>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> O + Send + Sync + 'static,
+        O: LinearOperator + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(move |x| Ok(LeastSquaresMatrix::from_operator(callback(x)))),
+            matrix_free: true,
         }
     }
 
     fn evaluate(&self, x: &[f64], residual_count: usize) -> Result<LeastSquaresMatrix, OptError> {
-        let matrix = (self.callback)(x);
+        let matrix = (self.callback)(x)?;
         let valid_shape = match &matrix {
             LeastSquaresMatrix::Dense(rows) => {
                 rows.len() == residual_count && rows.iter().all(|row| row.len() == x.len())
             }
             LeastSquaresMatrix::Sparse(csr) => csr.shape() == Shape2D::new(residual_count, x.len()),
+            LeastSquaresMatrix::Operator(operator) => {
+                operator.shape() == Shape2D::new(residual_count, x.len())
+            }
         };
         if !valid_shape {
             return Err(OptError::InvalidArgument {
@@ -257,8 +286,8 @@ pub struct LeastSquaresOptions {
     /// `curve_fit`, `Trf` for a bounded one.
     pub method: Option<LeastSquaresMethod>,
     /// Linear solver for TRF and Dogbox. `Auto` uses `Exact` for dense
-    /// Jacobians and `Lsmr` for sparse ones. An explicit `Exact` with a sparse
-    /// Jacobian is rejected. LM does not accept the LSMR backend.
+    /// Jacobians and `Lsmr` for sparse or matrix-free ones. An explicit `Exact` with a
+    /// sparse or matrix-free Jacobian is rejected. LM does not accept the LSMR backend.
     pub tr_solver: TrustRegionSolver,
     /// Gradient convergence tolerance. LM uses the maximum absolute cosine
     /// between the residual vector and each Jacobian column; the trust-region
@@ -480,8 +509,8 @@ impl FitWhitening {
         }
     }
 
-    fn jacobian_matrix(&self, matrix: LeastSquaresMatrix) -> LeastSquaresMatrix {
-        match (self, matrix) {
+    fn jacobian_matrix(&self, matrix: LeastSquaresMatrix) -> Result<LeastSquaresMatrix, OptError> {
+        Ok(match (self, matrix) {
             (Self::Identity, matrix) => matrix,
             (Self::Diagonal(deviations), LeastSquaresMatrix::Sparse(csr)) => {
                 // Divide directly, preserving finite ratios for subnormal sigma.
@@ -505,11 +534,11 @@ impl FitWhitening {
             (_, matrix) => {
                 // A full covariance mixes observation rows. Its whitened
                 // analytic Jacobian is generally dense, even for sparse input.
-                let mut dense = matrix.to_dense();
+                let mut dense = matrix.to_dense()?;
                 self.jacobian(&mut dense);
                 LeastSquaresMatrix::Dense(dense)
             }
-        }
+        })
     }
 
     fn sparsity(&self, pattern: &JacobianSparsity) -> Result<JacobianSparsity, OptError> {
@@ -1211,7 +1240,7 @@ where
     if let Some(analytic) = &options.jac {
         *jac = match analytic.evaluate(x, residual.len())? {
             LeastSquaresMatrix::Dense(matrix) => matrix,
-            LeastSquaresMatrix::Sparse(_) => {
+            LeastSquaresMatrix::Sparse(_) | LeastSquaresMatrix::Operator(_) => {
                 return Err(OptError::InvalidArgument {
                     detail: String::from("method 'lm' requires a dense Jacobian"),
                 });
@@ -1441,12 +1470,17 @@ where
         }
     };
     let j0 = evaluate_jacobian(&x0, &f0)?;
+    if j0.is_operator() && matches!(x_scale, XScale::Jac) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("x_scale='jac' is not supported for a matrix-free Jacobian"),
+        });
+    }
     let solver = match options.tr_solver {
-        TrustRegionSolver::Auto if j0.is_sparse() => {
+        TrustRegionSolver::Auto if j0.as_dense().is_none() => {
             TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default())
         }
         TrustRegionSolver::Auto => TrustRegionSolver::Exact,
-        TrustRegionSolver::Exact if j0.is_sparse() => {
+        TrustRegionSolver::Exact if j0.as_dense().is_none() => {
             return Err(OptError::InvalidArgument {
                 detail: String::from("tr_solver='exact' requires a dense Jacobian"),
             });
@@ -1468,11 +1502,16 @@ where
     };
     let mut jac = |x: &[f64], f: &[f64]| -> Result<LeastSquaresMatrix, OptError> {
         let matrix = evaluate_jacobian(x, f)?;
-        if solver == TrustRegionSolver::Exact && matrix.is_sparse() {
+        if solver == TrustRegionSolver::Exact && matrix.as_dense().is_none() {
             return Err(OptError::InvalidArgument {
                 detail: String::from(
                     "tr_solver='exact' requires a dense Jacobian at every evaluation",
                 ),
+            });
+        }
+        if matrix.is_operator() && matches!(x_scale, XScale::Jac) {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("x_scale='jac' is not supported for a matrix-free Jacobian"),
             });
         }
         Ok(matrix)
@@ -1585,6 +1624,19 @@ where
         });
     }
 
+    if options
+        .ls_options
+        .jac
+        .as_ref()
+        .is_some_and(|jacobian| jacobian.matrix_free)
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "curve_fit requires explicit Jacobian entries for covariance; use least_squares for a matrix-free fit",
+            ),
+        });
+    }
+
     // Differentiate the weighted residuals when no analytic Jacobian is supplied.
     // Analytic model Jacobians need the identical linear transform below.
     let residuals = |params: &[f64]| -> Vec<f64> {
@@ -1614,7 +1666,7 @@ where
         let observations = xdata.len();
         ls_options.jac = Some(LeastSquaresJacobian {
             callback: Arc::new(move |params| {
-                let matrix = (jacobian.callback)(params);
+                let matrix = (jacobian.callback)(params)?;
                 // Leave malformed matrices intact for LeastSquaresJacobian::evaluate
                 // to report its normal shape error, before indexing any row here.
                 let valid_shape = match &matrix {
@@ -1625,13 +1677,17 @@ where
                     LeastSquaresMatrix::Sparse(csr) => {
                         csr.shape() == Shape2D::new(observations, params.len())
                     }
+                    LeastSquaresMatrix::Operator(operator) => {
+                        operator.shape() == Shape2D::new(observations, params.len())
+                    }
                 };
                 if valid_shape {
                     whitening.jacobian_matrix(matrix)
                 } else {
-                    matrix
+                    Ok(matrix)
                 }
             }),
+            matrix_free: false,
         });
     }
     let ls_result = match bounds {
@@ -1640,7 +1696,7 @@ where
     };
     require_fit_converged(&ls_result)?;
 
-    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma);
+    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma)?;
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -2368,14 +2424,14 @@ fn curve_fit_covariance(
     result: &LeastSquaresResult,
     method: LeastSquaresMethod,
     absolute_sigma: bool,
-) -> Vec<Vec<f64>> {
+) -> Result<Vec<Vec<f64>>, OptError> {
     let m = result.fun.len();
     let n = result.x.len();
     if !absolute_sigma && m <= n {
-        return vec![vec![f64::INFINITY; n]; n];
+        return Ok(vec![vec![f64::INFINITY; n]; n]);
     }
     if !result.jac.all_finite() {
-        return vec![vec![f64::INFINITY; n]; n];
+        return Ok(vec![vec![f64::INFINITY; n]; n]);
     }
 
     // curve_fit returns a full parameter covariance and explicitly performs a
@@ -2385,12 +2441,12 @@ fn curve_fit_covariance(
     let jac = match result.jac.as_dense() {
         Some(matrix) => matrix,
         None => {
-            dense_storage = result.jac.to_dense();
+            dense_storage = result.jac.to_dense()?;
             &dense_storage
         }
     };
     if method == LeastSquaresMethod::Lm {
-        return compute_covariance(jac, result.cost, m, n, absolute_sigma);
+        return Ok(compute_covariance(jac, result.cost, m, n, absolute_sigma));
     }
     // Normalize before the Jacobi SVD: its column inner products otherwise overflow
     // or underflow for large/small model derivatives, even when the covariance is finite.
@@ -2422,7 +2478,7 @@ fn curve_fit_covariance(
         }
     }
     if covariance.iter().flatten().any(|value| value.is_nan()) {
-        return vec![vec![f64::INFINITY; n]; n];
+        return Ok(vec![vec![f64::INFINITY; n]; n]);
     }
     if !absolute_sigma {
         let residual_variance = 2.0 * result.cost / (m - n) as f64;
@@ -2430,7 +2486,7 @@ fn curve_fit_covariance(
             *entry *= residual_variance;
         }
     }
-    covariance
+    Ok(covariance)
 }
 
 /// Compute the existing LM parameter covariance matrix from its Jacobian.
@@ -2484,6 +2540,278 @@ fn compute_covariance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsci_sparse::{SparseError, SparseResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct IdentityJacobianProbe {
+        dimension: usize,
+        products: Arc<AtomicUsize>,
+        basis_probes: Arc<AtomicUsize>,
+    }
+
+    impl LinearOperator for IdentityJacobianProbe {
+        fn shape(&self) -> Shape2D {
+            Shape2D::new(self.dimension, self.dimension)
+        }
+
+        fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            if x.len() != self.dimension || y.len() != self.dimension {
+                return Err(SparseError::IncompatibleShape {
+                    message: String::from("identity probe dimensions"),
+                });
+            }
+            self.products.fetch_add(1, Ordering::Relaxed);
+            if x.iter().filter(|&&value| value != 0.0).count() == 1
+                && x.iter().any(|&value| value == 1.0)
+            {
+                self.basis_probes.fetch_add(1, Ordering::Relaxed);
+            }
+            y.copy_from_slice(x);
+            Ok(())
+        }
+
+        fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            self.matvec_into(x, y)
+        }
+    }
+
+    fn identity_operator_jacobian(n: usize) -> LeastSquaresJacobian {
+        LeastSquaresJacobian::new_operator(move |_| IdentityJacobianProbe {
+            dimension: n,
+            products: Arc::new(AtomicUsize::new(0)),
+            basis_probes: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[test]
+    fn matrix_free_least_squares_never_materializes_or_probes_entries() {
+        // A dense conversion takes n basis applications; the iterative solution takes
+        // only a small, dimension-independent number of full-vector applications.
+        let n = 1024;
+        let target: Vec<_> = (0..n).map(|i| 1.0 + i as f64 / n as f64).collect();
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let products = Arc::new(AtomicUsize::new(0));
+            let basis_probes = Arc::new(AtomicUsize::new(0));
+            let product_counter = Arc::clone(&products);
+            let basis_counter = Arc::clone(&basis_probes);
+            let result = least_squares(
+                |x| x.iter().zip(&target).map(|(a, b)| a - b).collect(),
+                &vec![0.0; n],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new_operator(move |_| {
+                        IdentityJacobianProbe {
+                            dimension: n,
+                            products: Arc::clone(&product_counter),
+                            basis_probes: Arc::clone(&basis_counter),
+                        }
+                    })),
+                    gtol: 1e-12,
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("matrix-free default selects LSMR");
+            assert!(result.success, "{method:?}: {}", result.message);
+            assert!(
+                result
+                    .x
+                    .iter()
+                    .zip(&target)
+                    .all(|(a, b)| (a - b).abs() < 1e-10)
+            );
+            assert!(result.jac.as_operator().is_some());
+            assert_eq!(basis_probes.load(Ordering::Relaxed), 0);
+            let count = products.load(Ordering::Relaxed);
+            assert!(
+                count > 0 && count < 128,
+                "{method:?}: {count} products for {n} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_jacobian_is_retained_in_parallel_batch_results() {
+        let targets = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![2.0, -1.0, 0.5],
+            vec![-2.0, 3.0, 4.0],
+            vec![0.5, 1.0, 2.0],
+        ];
+        let results = least_squares_many(
+            |x, target| x.iter().zip(target).map(|(a, b)| a - b).collect(),
+            &[0.0; 3],
+            &targets,
+            LeastSquaresOptions {
+                jac: Some(identity_operator_jacobian(3)),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        for (result, target) in results.into_iter().zip(targets) {
+            let result = result.expect("operator result transfers from worker");
+            assert!(result.success);
+            assert!(
+                result
+                    .x
+                    .iter()
+                    .zip(target)
+                    .all(|(a, b)| (a - b).abs() < 1e-8)
+            );
+            assert_eq!(
+                result
+                    .jac
+                    .as_operator()
+                    .unwrap()
+                    .matvec(&[1.0, -2.0, 0.5])
+                    .unwrap(),
+                vec![1.0, -2.0, 0.5]
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_least_squares_rejects_entry_dependent_options_and_wrong_shapes() {
+        for options in [
+            LeastSquaresOptions {
+                tr_solver: TrustRegionSolver::Exact,
+                ..LeastSquaresOptions::default()
+            },
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                ..LeastSquaresOptions::default()
+            },
+            LeastSquaresOptions {
+                x_scale: Some(XScale::Jac),
+                ..LeastSquaresOptions::default()
+            },
+        ] {
+            let result = least_squares(
+                |x| vec![x[0] - 1.0],
+                &[0.0],
+                LeastSquaresOptions {
+                    jac: Some(identity_operator_jacobian(1)),
+                    ..options
+                },
+            );
+            assert!(
+                matches!(result, Err(OptError::InvalidArgument { .. })),
+                "{result:?}"
+            );
+        }
+        let wrong_shape = least_squares(
+            |x| vec![x[0] - 1.0],
+            &[0.0],
+            LeastSquaresOptions {
+                jac: Some(identity_operator_jacobian(2)),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert!(matches!(
+            wrong_shape,
+            Err(OptError::InvalidArgument { .. })
+        ));
+
+        for sigma in [None, Some(CurveFitSigma::Scalar(2.0))] {
+            let fitted = curve_fit(
+                |_t, p| p[0],
+                &[0.0, 1.0],
+                &[1.0, 2.0],
+                CurveFitOptions {
+                    p0: Some(vec![0.0]),
+                    sigma,
+                    ls_options: LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Trf),
+                        jac: Some(identity_operator_jacobian(1)),
+                        ..LeastSquaresOptions::default()
+                    },
+                    ..CurveFitOptions::default()
+                },
+            );
+            assert!(
+                matches!(fitted, Err(OptError::InvalidArgument { detail }) if detail.contains("covariance"))
+            );
+        }
+    }
+
+    struct ForwardOnlyJacobian;
+
+    impl LinearOperator for ForwardOnlyJacobian {
+        fn shape(&self) -> Shape2D {
+            Shape2D::new(1, 1)
+        }
+
+        fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            y.copy_from_slice(x);
+            Ok(())
+        }
+    }
+
+    struct FaultyJacobian {
+        failure: u8,
+    }
+
+    impl LinearOperator for FaultyJacobian {
+        fn shape(&self) -> Shape2D {
+            Shape2D::new(1, 1)
+        }
+
+        fn matvec_into(&self, _x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            match self.failure {
+                0 => Err(SparseError::Unsupported {
+                    feature: String::from("user product failure"),
+                }),
+                1 => {
+                    y[0] = f64::INFINITY;
+                    Ok(())
+                }
+                _ => Ok(()), // Deliberately fail to write the output.
+            }
+        }
+
+        fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            y.copy_from_slice(x);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn matrix_free_products_fail_closed_on_callback_errors_and_incomplete_outputs() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let no_transpose = least_squares(
+                |x| vec![x[0] - 1.0],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new_operator(|_| ForwardOnlyJacobian)),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert!(
+                matches!(no_transpose, Err(OptError::NotConverged { detail }) if detail.contains("rmatvec"))
+            );
+            for failure in 0..3 {
+                let result = least_squares(
+                    |x| vec![x[0] - 1.0],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new_operator(move |_| FaultyJacobian {
+                            failure,
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                );
+                match failure {
+                    0 => assert!(
+                        matches!(result, Err(OptError::NotConverged { detail }) if detail.contains("user product failure"))
+                    ),
+                    _ => assert!(
+                        matches!(result, Err(OptError::NonFiniteInput { .. })),
+                        "{method:?}/{failure}: {result:?}"
+                    ),
+                }
+            }
+        }
+    }
 
     #[test]
     fn parallel_fd_jacobian_byte_identical_to_serial() {
@@ -3160,7 +3488,10 @@ mod tests {
             assert!((result.x[0] - 2.0).abs() < 1e-7);
             assert_eq!(result.nfev, residual_calls.load(Ordering::Relaxed));
             assert_eq!(result.njev, jacobian_calls.load(Ordering::Relaxed));
-            assert_eq!(result.jac.to_dense(), vec![vec![1.0], vec![2.0], vec![4.0]]);
+            assert_eq!(
+                result.jac.to_dense().unwrap(),
+                vec![vec![1.0], vec![2.0], vec![4.0]]
+            );
         }
     }
 
@@ -3378,6 +3709,7 @@ mod tests {
                 let error = result
                     .jac
                     .to_dense()
+                    .unwrap()
                     .iter()
                     .flatten()
                     .zip(exact.iter().flatten())
@@ -3431,7 +3763,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                assert!((result.jac.to_dense()[i][i] - exact).abs() < 2e-9);
+                assert!((result.jac.to_dense().unwrap()[i][i] - exact).abs() < 2e-9);
             }
             assert_eq!(
                 result.nfev, 1,

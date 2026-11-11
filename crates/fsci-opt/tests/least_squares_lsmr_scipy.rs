@@ -11,7 +11,7 @@ use fsci_opt::{
     LeastSquaresOptions, LossKind, OptError, TrustRegionLsmrOptions, TrustRegionSolver, XScale,
     least_squares, least_squares_bounded,
 };
-use fsci_sparse::{CsrMatrix, Shape2D};
+use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +166,27 @@ fn cases() -> Vec<Case> {
             cases.push(case);
         }
     }
+    // SciPy refuses x_scale='jac' for an implicit Jacobian: its columns are
+    // intentionally unavailable. Every other solve also runs through products
+    // only, including both robust-loss scaling and active-bound projection.
+    for mut case in dense_cases {
+        if case.scale == "jac" {
+            continue;
+        }
+        case.jacobian_kind = "operator".into();
+        cases.push(case);
+    }
+    for method in ["trf", "dogbox"] {
+        cases.push(Case {
+            problem: "exponential".into(),
+            method: method.into(),
+            loss: "soft_l1".into(),
+            bounded: true,
+            scale: "unit".into(),
+            regularize: true,
+            jacobian_kind: "operator".into(),
+        });
+    }
     cases
 }
 
@@ -175,6 +196,7 @@ import numpy as np
 import scipy
 from scipy.optimize import least_squares
 from scipy.sparse import csr_array
+from scipy.sparse.linalg import aslinearoperator
 if os.environ.get("FSCI_REQUIRE_SCIPY_ORACLE") == "1":
     assert (scipy.__version__, np.__version__) == ("1.17.1", "2.4.3")
 cases = json.loads(sys.argv[1])
@@ -221,6 +243,8 @@ for case in cases:
         dense_jac = jac
         if case["jacobian_kind"] == "sparse":
             jac = lambda x, dense_jac=dense_jac: csr_array(dense_jac(x))
+        elif case["jacobian_kind"] == "operator":
+            jac = lambda x, dense_jac=dense_jac: aslinearoperator(dense_jac(x))
         else:
             structure = csr_array(np.ones_like(dense_jac(start)))
             if problem == "coupled":
@@ -316,6 +340,9 @@ fn iterative_least_squares_matches_live_scipy() {
                 "sparse" => Some(LeastSquaresJacobian::new_sparse(move |x| {
                     sparse_jacobian(&name, x)
                 })),
+                "operator" => Some(LeastSquaresJacobian::new_operator(move |x| {
+                    DenseLinearOperator::from_rows(&jacobian(&name, x)).unwrap()
+                })),
                 _ => None,
             },
             jac_sparsity: matches!(case.jacobian_kind.as_str(), "two-point" | "three-point")
@@ -362,7 +389,17 @@ fn iterative_least_squares_matches_live_scipy() {
         assert_eq!(result.x.len(), reference.x.len());
         assert_eq!(result.active_mask, reference.active_mask, "{case:?}");
         assert!(result.optimality.is_finite());
-        assert_eq!(result.jac.is_sparse(), case.jacobian_kind != "dense");
+        assert_eq!(
+            result.jac.is_sparse(),
+            matches!(
+                case.jacobian_kind.as_str(),
+                "sparse" | "two-point" | "three-point"
+            )
+        );
+        assert_eq!(
+            result.jac.as_operator().is_some(),
+            case.jacobian_kind == "operator"
+        );
         for (actual, expected) in result.x.iter().zip(&reference.x) {
             assert!(
                 (actual - expected).abs() <= 1.0e-6 * expected.abs().max(1.0),
@@ -381,8 +418,11 @@ fn iterative_least_squares_matches_live_scipy() {
         );
         compared += 1;
     }
-    assert_eq!(compared, 96);
-    eprintln!("Least-squares LSMR compared cases = {compared}");
+    assert_eq!(compared, 118);
+    eprintln!(
+        "Least-squares LSMR compared cases = {compared}; SciPy {}, NumPy {}",
+        oracle.scipy, oracle.numpy
+    );
 }
 
 #[test]
@@ -509,7 +549,7 @@ fn grouped_differences_reduce_calls_and_keep_mixed_bound_stencils() {
                 .expect("grouped Jacobian stays compressed");
             assert_eq!(csr.shape(), Shape2D::new(m, n));
             assert_eq!(csr.nnz(), 2 * m - 1);
-            let dense_values = sparse.jac.to_dense();
+            let dense_values = sparse.jac.to_dense().unwrap();
             for i in 0..m {
                 let tolerance = if stencil_calls == 2 { 2e-9 } else { 5e-8 };
                 assert!((dense_values[i][i] - sparse.x[i].cos()).abs() < tolerance);

@@ -17,10 +17,10 @@ use fsci_sparse::{LinearOperator, Shape2D, SparseError, SparseResult};
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TrustRegionSolver {
     /// Select an exact factorization for a dense Jacobian and LSMR for a
-    /// sparse one, matching SciPy's default `tr_solver=None` behavior.
+    /// sparse or matrix-free one, matching SciPy's default `tr_solver=None` behavior.
     #[default]
     Auto,
-    /// Factor a dense Jacobian using an SVD. Sparse Jacobians are rejected.
+    /// Factor a dense Jacobian using an SVD. Sparse and matrix-free Jacobians are rejected.
     Exact,
     /// Iterative Gauss–Newton solves, with a two-dimensional TRF subspace.
     Lsmr(TrustRegionLsmrOptions),
@@ -109,7 +109,7 @@ impl LinearOperator for AugmentedJacobian<'_> {
             });
         }
         let rows = self.matrix.shape().rows;
-        self.matrix.product_into(x, &mut y[..rows]);
+        self.matrix.product_into(x, &mut y[..rows])?;
         for ((out, &d), &value) in y[rows..].iter_mut().zip(self.diagonal).zip(x) {
             *out = d * value;
         }
@@ -123,7 +123,7 @@ impl LinearOperator for AugmentedJacobian<'_> {
             });
         }
         let rows = self.matrix.shape().rows;
-        self.matrix.transpose_product_into(&x[..rows], y);
+        self.matrix.transpose_product_into(&x[..rows], y)?;
         for ((out, &d), &value) in y.iter_mut().zip(self.diagonal).zip(&x[rows..]) {
             *out += d * value;
         }
@@ -241,7 +241,7 @@ pub(crate) fn subspace(
     let mut regularization = 0.0;
     if options.regularize {
         // Minimize q(-t*g) for 0 <= t <= radius/||g||.
-        let image = jacobian.product(gradient);
+        let image = jacobian.product(gradient)?;
         let quadratic = dot(&image, &image)
             + gradient
                 .iter()
@@ -306,7 +306,7 @@ pub(crate) fn subspace(
     let images: Vec<_> = basis
         .iter()
         .map(|column| jacobian.product(column))
-        .collect();
+        .collect::<SparseResult<_>>()?;
     let mut hessian = [[0.0; 2]; 2];
     let mut projected_gradient = [0.0; 2];
     for i in 0..basis.len() {

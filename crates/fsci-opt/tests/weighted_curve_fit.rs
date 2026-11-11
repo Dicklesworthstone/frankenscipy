@@ -179,7 +179,7 @@ fn sigma_whitens_correlated_errors_and_analytic_jacobians() {
                     "{method:?}: {fit:?}"
                 );
                 assert!((fit.ls_result.cost - 101.0 / 30.0).abs() < 1e-12);
-                let jac = fit.ls_result.jac.to_dense();
+                let jac = fit.ls_result.jac.to_dense().unwrap();
                 assert!((jac[0][0] - 0.5).abs() < 1e-7);
                 assert!((jac[1][0] - 3.0_f64.sqrt() / 2.0).abs() < 1e-7);
                 assert!((jac[2][0] - 1.0 / 3.0).abs() < 1e-7);
@@ -237,6 +237,7 @@ fn subnormal_sigma_scales_finite_residuals_and_jacobians() {
                 fit.ls_result
                     .jac
                     .to_dense()
+                    .unwrap()
                     .iter()
                     .all(|row| row[0].abs() == 1.0)
             );

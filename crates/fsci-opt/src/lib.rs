@@ -54,7 +54,7 @@ pub use linesearch::{
     line_search_wolfe2,
 };
 pub use linprog::{LinprogMethod, LinprogOptions, LinprogResult, LinprogSensitivity, linprog};
-pub use lsq_matrix::LeastSquaresMatrix;
+pub use lsq_matrix::{LeastSquaresMatrix, LeastSquaresOperator};
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, ObjectiveLandscapeProbe, OptCaspDecision,
     OptCaspProblem, OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE,

@@ -150,7 +150,7 @@ fn dense_exact_jacobian(j: &LeastSquaresMatrix) -> Result<&[Vec<f64>], fsci_spar
 }
 
 /// `Jᵀ·f`.
-fn compute_grad(j: &LeastSquaresMatrix, f: &[f64]) -> Vec<f64> {
+fn compute_grad(j: &LeastSquaresMatrix, f: &[f64]) -> fsci_sparse::SparseResult<Vec<f64>> {
     j.transpose_product(f)
 }
 
@@ -158,8 +158,8 @@ fn compute_grad(j: &LeastSquaresMatrix, f: &[f64]) -> Vec<f64> {
 fn compute_jac_scale(
     j: &LeastSquaresMatrix,
     scale_inv_old: Option<&[f64]>,
-) -> (Vec<f64>, Vec<f64>) {
-    let mut scale_inv = j.column_norms();
+) -> fsci_sparse::SparseResult<(Vec<f64>, Vec<f64>)> {
+    let mut scale_inv = j.column_norms()?;
     match scale_inv_old {
         None => {
             for s in &mut scale_inv {
@@ -174,7 +174,7 @@ fn compute_jac_scale(
             }
         }
     }
-    (scale_inv.iter().map(|s| 1.0 / s).collect(), scale_inv)
+    Ok((scale_inv.iter().map(|s| 1.0 / s).collect(), scale_inv))
 }
 
 /// `scale_for_robust_loss_function`: rows of J and entries of f scaled in place.
@@ -435,8 +435,8 @@ fn build_quadratic_1d(
     s: &[f64],
     diag: Option<&[f64]>,
     s0: Option<&[f64]>,
-) -> (f64, f64, f64) {
-    let v = j.product(s);
+) -> fsci_sparse::SparseResult<(f64, f64, f64)> {
+    let v = j.product(s)?;
     let mut a = dot(&v, &v);
     if let Some(d) = diag {
         a += s
@@ -450,7 +450,7 @@ fn build_quadratic_1d(
     let mut b = dot(g, s);
     let mut c = 0.0;
     if let Some(s0) = s0 {
-        let u = j.product(s0);
+        let u = j.product(s0)?;
         b += dot(&u, &v);
         c = 0.5 * dot(&u, &u) + dot(g, s0);
         if let Some(d) = diag {
@@ -468,7 +468,7 @@ fn build_quadratic_1d(
                     .sum::<f64>();
         }
     }
-    (a, b, c)
+    Ok((a, b, c))
 }
 
 /// `minimize_quadratic_1d` on `[lb, ub]`: `(t, q(t))`.
@@ -491,8 +491,13 @@ fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64)
 }
 
 /// `evaluate_quadratic`: ½·‖J·s‖² + ½·sᵀ·diag·s + gᵀ·s.
-fn evaluate_quadratic(j: &LeastSquaresMatrix, g: &[f64], s: &[f64], diag: Option<&[f64]>) -> f64 {
-    let js = j.product(s);
+fn evaluate_quadratic(
+    j: &LeastSquaresMatrix,
+    g: &[f64],
+    s: &[f64],
+    diag: Option<&[f64]>,
+) -> fsci_sparse::SparseResult<f64> {
+    let js = j.product(s)?;
     let mut q = dot(&js, &js);
     if let Some(d) = diag {
         q += s
@@ -502,7 +507,7 @@ fn evaluate_quadratic(j: &LeastSquaresMatrix, g: &[f64], s: &[f64], diag: Option
             .map(|((x, y), z)| x * y * z)
             .sum::<f64>();
     }
-    0.5 * q + dot(s, g)
+    Ok(0.5 * q + dot(s, g))
 }
 
 fn in_bounds(x: &[f64], lb: &[f64], ub: &[f64]) -> bool {
@@ -668,11 +673,11 @@ fn select_step(
     lb: &[f64],
     ub: &[f64],
     theta: f64,
-) -> (Vec<f64>, Vec<f64>, f64) {
+) -> fsci_sparse::SparseResult<(Vec<f64>, Vec<f64>, f64)> {
     let x_plus_p: Vec<f64> = x.iter().zip(&p).map(|(a, b)| a + b).collect();
     if in_bounds(&x_plus_p, lb, ub) {
-        let p_value = evaluate_quadratic(j_h, g_h, &p_h, Some(diag_h));
-        return (p, p_h, -p_value);
+        let p_value = evaluate_quadratic(j_h, g_h, &p_h, Some(diag_h))?;
+        return Ok((p, p_h, -p_value));
     }
     let (p_stride, hits) = step_size_to_bound(x, &p, lb, ub);
     let mut r_h = p_h.clone();
@@ -704,7 +709,7 @@ fn select_step(
         (0.0, -1.0)
     };
     let r_value = if r_stride_l <= r_stride_u {
-        let (a, b, c) = build_quadratic_1d(j_h, g_h, &r_h, Some(diag_h), Some(&p_h));
+        let (a, b, c) = build_quadratic_1d(j_h, g_h, &r_h, Some(diag_h), Some(&p_h))?;
         let (stride, value) = minimize_quadratic_1d(a, b, r_stride_l, r_stride_u, c);
         for (rh, &ph) in r_h.iter_mut().zip(&p_h) {
             *rh = *rh * stride + ph;
@@ -720,7 +725,7 @@ fn select_step(
     for v in &mut p_h {
         *v *= theta;
     }
-    let p_value = evaluate_quadratic(j_h, g_h, &p_h, Some(diag_h));
+    let p_value = evaluate_quadratic(j_h, g_h, &p_h, Some(diag_h))?;
     let mut ag_h: Vec<f64> = g_h.iter().map(|v| -v).collect();
     let mut ag: Vec<f64> = d.iter().zip(&ag_h).map(|(a, b)| a * b).collect();
     let to_tr = delta / norm(&ag_h);
@@ -730,7 +735,7 @@ fn select_step(
     } else {
         to_tr
     };
-    let (a, b, _) = build_quadratic_1d(j_h, g_h, &ag_h, Some(diag_h), None);
+    let (a, b, _) = build_quadratic_1d(j_h, g_h, &ag_h, Some(diag_h), None)?;
     let (ag_stride, ag_value) = minimize_quadratic_1d(a, b, 0.0, ag_stride, 0.0);
     for v in &mut ag_h {
         *v *= ag_stride;
@@ -739,11 +744,11 @@ fn select_step(
         *v *= ag_stride;
     }
     if p_value < r_value && p_value < ag_value {
-        (p, p_h, -p_value)
+        Ok((p, p_h, -p_value))
     } else if r_value < p_value && r_value < ag_value {
-        (r, r_h, -r_value)
+        Ok((r, r_h, -r_value))
     } else {
-        (ag, ag_h, -ag_value)
+        Ok((ag, ag_h, -ag_value))
     }
 }
 
@@ -796,13 +801,13 @@ where
         }
         None => 0.5 * dot(&f, &f),
     };
-    let mut g = compute_grad(&j, &f);
+    let mut g = compute_grad(&j, &f)?;
     // A zero-row Jacobian still has n parameter columns. Keep the vector shapes
     // explicit so an empty residual system also works under bounds and Jac scaling.
     g.resize(n, 0.0);
     let jac_scale = matches!(x_scale, XScale::Jac);
     let (mut scale, mut scale_inv) = match x_scale {
-        XScale::Jac => compute_jac_scale(&j, None),
+        XScale::Jac => compute_jac_scale(&j, None)?,
         XScale::Fixed(s) => (s.clone(), s.iter().map(|v| 1.0 / v).collect()),
     };
     scale.resize(n, 1.0);
@@ -928,9 +933,9 @@ where
             };
             let (step, step_h, predicted_reduction) = if bounded {
                 let p: Vec<f64> = d.iter().zip(&p_h).map(|(a, b)| a * b).collect();
-                select_step(&x, &j_h, &diag_h, &g_h, p, p_h, &d, delta, lb, ub, theta)
+                select_step(&x, &j_h, &diag_h, &g_h, p, p_h, &d, delta, lb, ub, theta)?
             } else {
-                let predicted = -evaluate_quadratic(&j_h, &g_h, &p_h, None);
+                let predicted = -evaluate_quadratic(&j_h, &g_h, &p_h, None)?;
                 let step: Vec<f64> = d.iter().zip(&p_h).map(|(a, b)| a * b).collect();
                 (step, p_h, predicted)
             };
@@ -985,9 +990,9 @@ where
                 let rho = l.rho(&f);
                 scale_for_robust_loss(&mut j, &mut f, &rho);
             }
-            g = compute_grad(&j, &f);
+            g = compute_grad(&j, &f)?;
             if jac_scale {
-                let (sc, sci) = compute_jac_scale(&j, Some(&scale_inv));
+                let (sc, sci) = compute_jac_scale(&j, Some(&scale_inv))?;
                 scale = sc;
                 scale_inv = sci;
             }
@@ -1102,11 +1107,11 @@ where
         }
         None => 0.5 * dot(&f, &f),
     };
-    let mut g = compute_grad(&j, &f);
+    let mut g = compute_grad(&j, &f)?;
     g.resize(n, 0.0);
     let jac_scale = matches!(x_scale, XScale::Jac);
     let (mut scale, mut scale_inv) = match x_scale {
-        XScale::Jac => compute_jac_scale(&j, None),
+        XScale::Jac => compute_jac_scale(&j, None)?,
         XScale::Fixed(s) => (s.clone(), s.iter().map(|v| 1.0 / v).collect()),
     };
     scale.resize(n, 1.0);
@@ -1176,7 +1181,7 @@ where
             }
         };
         let anti_gradient: Vec<f64> = g_free.iter().map(|v| -v).collect();
-        let (a, b, _) = build_quadratic_1d(&j_free, &g_free, &anti_gradient, None, None);
+        let (a, b, _) = build_quadratic_1d(&j_free, &g_free, &anti_gradient, None, None)?;
         let x_free: Vec<f64> = free.iter().map(|&i| x[i]).collect();
         let lb_free: Vec<f64> = free.iter().map(|&i| lb[i]).collect();
         let ub_free: Vec<f64> = free.iter().map(|&i| ub[i]).collect();
@@ -1191,7 +1196,7 @@ where
             let (step_free, bound_hits, trust_hit) =
                 rectangular_dogleg(&x_free, &newton, &g_free, a, b, &radius, &lb_free, &ub_free);
             hits = bound_hits;
-            let predicted_reduction = -evaluate_quadratic(&j_free, &g_free, &step_free, None);
+            let predicted_reduction = -evaluate_quadratic(&j_free, &g_free, &step_free, None)?;
             let mut step = vec![0.0; n];
             for (&i, &s) in free.iter().zip(&step_free) {
                 step[i] = s;
@@ -1259,9 +1264,9 @@ where
             if let Some(l) = loss {
                 scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true));
             }
-            g = compute_grad(&j, &f);
+            g = compute_grad(&j, &f)?;
             if jac_scale {
-                (scale, scale_inv) = compute_jac_scale(&j, Some(&scale_inv));
+                (scale, scale_inv) = compute_jac_scale(&j, Some(&scale_inv))?;
             }
         }
     }
@@ -1310,7 +1315,7 @@ mod tests {
         )
         .unwrap();
         let sparse = LeastSquaresMatrix::Sparse(sparse);
-        let dense = LeastSquaresMatrix::Dense(sparse.to_dense());
+        let dense = LeastSquaresMatrix::Dense(sparse.to_dense().unwrap());
         let initial = [0.0, 0.0, 1.0];
         let lower = [-10.0, -0.8, 0.0];
         let upper = [1.5, 10.0, 10.0];
