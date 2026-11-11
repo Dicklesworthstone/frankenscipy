@@ -9,10 +9,10 @@ use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
-    Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, ContinuousDistribution, CrystalBall,
-    FDistribution, FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions, MleParameter,
-    Normal, SkewCauchy, Weibull, fit_mle, fit_mle_censored, with_hardened_stats_caps,
-    with_stats_runtime_mode,
+    Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
+    CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions,
+    MleParameter, Normal, RDist, SkewCauchy, Weibull, fit_mle, fit_mle_censored,
+    with_hardened_stats_caps, with_stats_runtime_mode,
 };
 
 const ORACLE: &str = r#"
@@ -39,6 +39,9 @@ cases = [
     ('alpha', stats.alpha, [(0.2,), (2.0,), (6.0,)]),
     ('argus', stats.argus, [(0.8,), (2.0,), (5.0,)]),
     ('f', stats.f, [(1.0, 1.5), (5.0, 10.0), (30.0, 8.0)]),
+    ('chi2', stats.chi2, [(0.3,), (4.0,), (50.0,)]),
+    ('chi', stats.chi, [(0.3,), (4.0,), (50.0,)]),
+    ('rdist', stats.rdist, [(1.5,), (5.0,), (30.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -60,6 +63,133 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn shape_mle_maximizes_likelihood_instead_of_matching_moments() {
+    // The roots were independently evaluated at 60 digits from the likelihood
+    // scores; the likelihoods also agree with SciPy 1.17's fixed-loc/scale fit.
+    let chi2_data = [2.0, 4.0, 6.0];
+    let chi2 = ChiSquared::try_fit(&chi2_data).unwrap();
+    assert!((chi2.df - 4.589_741_071_010_053).abs() < 1.0e-12);
+    assert!((likelihood(&chi2, &chi2_data) - 6.212_701_145_212_076).abs() < 1.0e-12);
+    assert!(likelihood(&chi2, &chi2_data) + 0.07 < likelihood(&ChiSquared::new(4.0), &chi2_data));
+    assert_eq!(ChiSquared::fit(&chi2_data), chi2);
+
+    let chi_data = [0.5_f64, 1.0, 1.5, 2.0, 2.5, 3.0, 1.7, 1.3];
+    let chi = Chi::try_fit(&chi_data).unwrap();
+    let moment_df = chi_data.iter().map(|x| x * x).sum::<f64>() / chi_data.len() as f64;
+    assert!((chi.df - 3.163_339_845_788_104_4).abs() < 1.0e-12);
+    assert!((likelihood(&chi, &chi_data) - 9.020_813_538_035_092).abs() < 1.0e-12);
+    assert!(likelihood(&chi, &chi_data) + 0.05 < likelihood(&Chi::new(moment_df), &chi_data));
+
+    let point = 0.2_f64.sqrt();
+    let rdist_data = [-point, point];
+    let rdist = RDist::try_fit(&rdist_data).unwrap();
+    assert!((rdist.c - 4.927_460_070_166_763).abs() < 1.0e-12);
+    assert!((likelihood(&rdist, &rdist_data) - 0.997_103_731_389_696_2).abs() < 1.0e-12);
+    assert!(likelihood(&rdist, &rdist_data) + 0.02 < likelihood(&RDist::new(4.0), &rdist_data));
+}
+
+#[test]
+fn shape_mle_preserves_chi_square_transformation_and_identifiable_repeated_samples() {
+    let data = [0.1_f64, 0.3, 0.7, 2.0, 4.0, 8.0];
+    let squared = data.map(|x| x * x);
+    let chi = Chi::try_fit(&data).unwrap();
+    let chi2 = ChiSquared::try_fit(&squared).unwrap();
+    assert!((chi.df - chi2.df).abs() < 1.0e-13);
+
+    // A constant sample can still identify a shape when location and scale
+    // are fixed. RDist's previous variance inversion incorrectly rejected it.
+    let rdist = RDist::try_fit(&[0.5; 8]).unwrap();
+    let nll = likelihood(&rdist, &[0.5; 8]);
+    for shape in [rdist.c * 0.99, rdist.c * 1.01] {
+        assert!(nll < likelihood(&RDist::new(shape), &[0.5; 8]));
+    }
+    assert!(Chi::try_fit(&[2.0; 8]).unwrap().df.is_finite());
+    assert!(ChiSquared::try_fit(&[2.0; 8]).unwrap().df.is_finite());
+}
+
+#[test]
+fn shape_mle_handles_extreme_sufficient_statistics() {
+    let data = [1.0e-300_f64, 1.0e-200, 1.0e-100];
+    for (power, df) in [
+        (1.0, ChiSquared::try_fit(&data).unwrap().df),
+        (2.0, Chi::try_fit(&data).unwrap().df),
+    ] {
+        let target =
+            power * data.iter().map(|x| x.ln()).sum::<f64>() / 3.0 - std::f64::consts::LN_2;
+        assert!((fsci_special::digamma_scalar(df / 2.0) - target).abs() < 1.0e-10);
+    }
+    // Subtracting two digammas, or taking log(1-x*x), loses this score.
+    for x in [1.0e-8_f64, 1.0e-100] {
+        let fitted = RDist::try_fit(&[-x, x]).unwrap();
+        assert!(fitted.c.is_finite());
+        assert!((fitted.c * x * x - 1.0).abs() < 5.0e-15);
+    }
+    // 80-digit evaluation at the exact f64 input. Forming 1-x*x first
+    // introduces a 2.75e-7 likelihood error at this support boundary.
+    let concentrated = RDist::new(1000.0);
+    assert_eq!(concentrated.pdf(0.999_999_99), 0.0);
+    assert!((concentrated.logpdf(0.999_999_99) + 8_843.504_559_014_134).abs() < 2.0e-11);
+    // A logarithmic sufficient statistic remains valid even when summing
+    // the sample, or its squares, overflows.
+    assert!(ChiSquared::try_fit(&[1.0e307; 20]).unwrap().df.is_finite());
+    assert!(Chi::try_fit(&[1.0e153; 20]).unwrap().df.is_finite());
+    assert!(matches!(
+        Chi::try_fit(&[1.0e200; 2]),
+        Err(FitError::NonConvergent(_))
+    ));
+}
+
+#[test]
+fn shape_mle_rejects_invalid_samples_and_unbounded_likelihoods() {
+    for data in [
+        &[0.0, 1.0][..],
+        &[-1.0, 1.0],
+        &[f64::NAN, 1.0],
+        &[f64::INFINITY, 1.0],
+    ] {
+        assert!(matches!(
+            Chi::try_fit(data),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            ChiSquared::try_fit(data),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(ChiSquared::fit(data).df.is_nan());
+    }
+    assert!(matches!(
+        ChiSquared::try_fit(&[]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for data in [&[-1.0, 0.0][..], &[0.0, 1.0], &[0.0, f64::NAN]] {
+        assert!(matches!(
+            RDist::try_fit(data),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        RDist::try_fit(&[0.0; 8]),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(1, 1, || {
+            assert!(matches!(
+                Chi::try_fit(&[1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                ChiSquared::try_fit(&[1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                RDist::try_fit(&[0.1, 0.2]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
 }
 
 #[test]
@@ -623,6 +753,18 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "chi2" => {
+                let fitted = ChiSquared::try_fit(&data).unwrap();
+                (vec![fitted.df], likelihood(&fitted, &data))
+            }
+            "chi" => {
+                let fitted = Chi::try_fit(&data).unwrap();
+                (vec![fitted.df], likelihood(&fitted, &data))
+            }
+            "rdist" => {
+                let fitted = RDist::try_fit(&data).unwrap();
+                (vec![fitted.c], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -741,10 +883,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 39,
+        compared, 48,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 13; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 16; samples per case = 2000");
 }
 
 #[test]

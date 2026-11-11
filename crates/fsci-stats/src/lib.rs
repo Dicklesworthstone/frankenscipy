@@ -3109,44 +3109,13 @@ impl ContinuousDistribution for ChiSquared {
     }
 
     fn fit(data: &[f64]) -> Self {
-        if data.is_empty() || data.iter().any(|&x| !x.is_finite() || x < 0.0) {
-            return Self { df: f64::NAN };
-        }
-
-        let mean = data.iter().sum::<f64>() / data.len() as f64;
-        if !mean.is_finite() || mean <= 0.0 {
-            return Self { df: f64::NAN };
-        }
-
-        Self { df: mean }
+        Self::try_fit(data).unwrap_or(Self { df: f64::NAN })
     }
 
+    /// Maximum likelihood with location zero and scale one, matching
+    /// `scipy.stats.chi2.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.is_empty() {
-            return Err(FitError::InsufficientData {
-                required: 1,
-                actual: 0,
-            });
-        }
-        if let Some(&x) = data.iter().find(|&&x| !x.is_finite()) {
-            return Err(FitError::UnsupportedData(format!(
-                "ChiSquared fit data contains non-finite value: {x}"
-            )));
-        }
-        if let Some(&x) = data.iter().find(|&&x| x < 0.0) {
-            return Err(FitError::UnsupportedData(format!(
-                "ChiSquared support is [0, infinity); got {x}"
-            )));
-        }
-
-        let fitted = Self::fit(data);
-        if fitted.df.is_finite() && fitted.df > 0.0 {
-            Ok(fitted)
-        } else {
-            Err(FitError::NonConvergent(
-                "ChiSquared fit produced non-positive degrees of freedom".to_owned(),
-            ))
-        }
+        mle::chi_shape_mle(data, 1.0, 1, "ChiSquared").map(|df| Self { df })
     }
 
     fn skewness(&self) -> f64 {
@@ -21612,38 +21581,10 @@ impl ContinuousDistribution for Chi {
         }
     }
 
+    /// Maximum likelihood with location zero and scale one, matching
+    /// `scipy.stats.chi.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        // Chi(df) is sqrt of ChiSquared(df), so E[X²] = df.
-        // Closed-form MoM: df_hat = sample_E[x²].
-        let mut sum2 = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Chi data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Chi support is [0, ∞); got {x}"
-                )));
-            }
-            sum2 += x * x;
-            count += 1;
-        }
-        let df = sum2 / count as f64;
-        if df <= 0.0 || !df.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "Chi MoM produced non-positive df: {df}"
-            )));
-        }
-        Ok(Self { df })
+        mle::chi_shape_mle(data, 2.0, 2, "Chi").map(|df| Self { df })
     }
 }
 
@@ -29409,6 +29350,15 @@ impl ContinuousDistribution for RDist {
         log_pdf.exp()
     }
 
+    fn logpdf(&self, x: f64) -> f64 {
+        if x.abs() >= 1.0 {
+            return self.pdf(x).ln();
+        }
+        // Keep the sufficient statistic log(1-x²) accurate near zero and
+        // retain finite likelihoods when the density itself underflows.
+        (self.c / 2.0 - 1.0) * mle::log_one_minus_square(x) - ln_beta(0.5, self.c / 2.0)
+    }
+
     fn cdf(&self, x: f64) -> f64 {
         if x <= -1.0 {
             return 0.0;
@@ -29470,29 +29420,10 @@ impl ContinuousDistribution for RDist {
             + 2.0_f64.ln()
     }
 
+    /// Maximum likelihood for the shape with location zero and scale one,
+    /// matching `scipy.stats.rdist.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        validate_finite_fit_data(data, 2, "RDist")?;
-        for &x in data {
-            if !(-1.0..=1.0).contains(&x) {
-                return Err(FitError::UnsupportedData(format!(
-                    "RDist support is [-1, 1]; got {x}"
-                )));
-            }
-        }
-        let variance = sample_population_variance(data);
-        if !variance.is_finite() || variance <= 0.0 || variance >= 1.0 {
-            return Err(FitError::NonConvergent(format!(
-                "RDist variance must be in (0, 1); got {variance}"
-            )));
-        }
-        let c = 1.0 / variance - 1.0;
-        if c.is_finite() && c > 0.0 {
-            Ok(Self { c })
-        } else {
-            Err(FitError::NonConvergent(format!(
-                "RDist moment fit produced invalid c: {c}"
-            )))
-        }
+        mle::rdist_shape_mle(data).map(|c| Self { c })
     }
 }
 
@@ -83698,7 +83629,8 @@ mod tests {
     fn test_fit_chi_squared() {
         let data = [2.0, 4.0, 6.0];
         let fitted = ChiSquared::fit(&data);
-        assert_close(fitted.df, 4.0, 1e-12, "chi-squared fit df");
+        // 60-digit root of psi(df/2) = mean(log(data)) - log(2).
+        assert_close(fitted.df, 4.589_741_071_010_053, 1e-12, "chi-squared MLE df");
     }
 
     #[test]
@@ -102160,14 +102092,14 @@ mod tests {
     }
 
     #[test]
-    fn chi_fit_e_x_sq_equals_df() {
+    fn chi_fit_solves_likelihood_score() {
         let data = [0.5_f64, 1.0, 1.5, 2.0, 2.5, 3.0, 1.7, 1.3];
-        let n = data.len() as f64;
-        let m2 = data.iter().map(|x| x * x).sum::<f64>() / n;
         let fitted = Chi::try_fit(&data).expect("fit");
+        // 60-digit root of psi(df/2) = 2*mean(log(data)) - log(2).
+        let expected = 3.163_339_845_788_104_4;
         assert!(
-            (fitted.df - m2).abs() < 1e-13,
-            "Chi MoM df-inversion: got {}, expected {m2}",
+            (fitted.df - expected).abs() < 1e-13,
+            "Chi MLE: got {}, expected {expected}",
             fitted.df
         );
     }
@@ -102175,7 +102107,7 @@ mod tests {
     #[test]
     fn chi_fit_synthetic_recovery() {
         // Synthesize Chi(df=4) samples via sqrt of ChiSquared(4) ppf grid;
-        // MoM recovers df within 5%.
+        // MLE recovers df within 5%.
         let true_df = 4.0;
         let chi2 = ChiSquared::new(true_df);
         let n = 2000;
@@ -102208,7 +102140,7 @@ mod tests {
     #[test]
     fn chi_fit_rejects_zero_data() {
         let err = Chi::try_fit(&[0.0, 0.0]).expect_err("all-zero data must be rejected");
-        assert!(matches!(err, FitError::NonConvergent(_)));
+        assert!(matches!(err, FitError::UnsupportedData(_)));
     }
 
     #[test]
@@ -103337,7 +103269,8 @@ mod tests {
     fn fit_gap_moment_and_circular_families_validate_support_and_shapes() {
         let rdist_std = (1.0_f64 / 5.0).sqrt();
         let fitted = RDist::try_fit(&[-rdist_std, rdist_std]).expect("RDist fit");
-        assert_close(fitted.c, 4.0, 1e-12, "RDist variance inversion");
+        // 60-digit root of psi((c+1)/2)-psi(c/2) = -log(0.8).
+        assert_close(fitted.c, 4.927_460_070_166_763, 1e-12, "RDist MLE");
 
         let recip = RecipInvGauss::try_fit(&[1.0, 2.0, 4.0]).expect("RecipInvGauss fit");
         assert_close(

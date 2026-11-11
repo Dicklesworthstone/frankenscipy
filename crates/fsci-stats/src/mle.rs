@@ -164,6 +164,163 @@ pub(crate) fn validate_positive_sample(data: &[f64], family: &str) -> Result<(),
     Ok(())
 }
 
+fn validate_shape_sample(
+    data: &[f64],
+    minimum_sample: usize,
+    family: &str,
+) -> Result<(), FitError> {
+    if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+        return Err(FitError::ResourceExhausted {
+            detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+        });
+    }
+    crate::validate_finite_fit_data(data, minimum_sample, family)
+}
+
+/// With location zero and scale one, the chi/chi-squared likelihood has a
+/// unique maximum at psi(df / 2) = mean(log(X^power)) - log(2). Computing its
+/// sufficient statistic in log space also avoids squaring large chi samples.
+pub(crate) fn chi_shape_mle(
+    data: &[f64],
+    power: f64,
+    minimum_sample: usize,
+    family: &str,
+) -> Result<f64, FitError> {
+    validate_shape_sample(data, minimum_sample, family)?;
+    if data.iter().any(|&x| x <= 0.0) {
+        return Err(FitError::UnsupportedData(format!(
+            "{family} MLE with fixed location zero requires strictly positive observations"
+        )));
+    }
+    let mut mean_log = 0.0;
+    let mut correction = 0.0;
+    let n = data.len() as f64;
+    for &x in data {
+        let term = x.ln() / n - correction;
+        let next = mean_log + term;
+        correction = (next - mean_log) - term;
+        mean_log = next;
+    }
+    let target = power * mean_log - std::f64::consts::LN_2;
+    // psi is strictly increasing on the positive axis. Start above the
+    // asymptotic inverse and retain a bracket instead of trusting an
+    // unconstrained Newton step near df=0.
+    let mut upper = (target.exp() + 1.0).max(1.0);
+    if !upper.is_finite() {
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE degrees of freedom exceed the finite parameter range"
+        )));
+    }
+    while fsci_special::digamma_scalar(upper) < target {
+        upper *= 2.0;
+        if !upper.is_finite() {
+            return Err(FitError::NonConvergent(format!(
+                "{family} MLE degrees of freedom exceed the finite parameter range"
+            )));
+        }
+    }
+    let mut lower = 0.0;
+    for _ in 0..100 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            break;
+        }
+        if fsci_special::digamma_scalar(middle) < target {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    let df = lower + upper;
+    if df.is_finite() && df > 0.0 {
+        Ok(df)
+    } else {
+        Err(FitError::NonConvergent(format!(
+            "{family} MLE degrees of freedom exceed the finite parameter range"
+        )))
+    }
+}
+
+/// psi(a + 1/2) - psi(a), evaluated without subtracting nearly equal
+/// digammas for concentrated symmetric beta distributions. Shift to a >= 16
+/// by recurrence, then use the Bernoulli expansion through a^-12.
+fn half_digamma_difference(mut a: f64) -> f64 {
+    let mut correction = 0.0;
+    while a < 16.0 {
+        correction += (0.5 / a) / (a + 0.5);
+        a += 1.0;
+    }
+    let inverse = a.recip();
+    let square = inverse * inverse;
+    correction
+        + 0.5 * inverse
+        + square
+            * (0.125
+                + square
+                    * (-1.0 / 64.0
+                        + square
+                            * (1.0 / 128.0
+                                + square
+                                    * (-17.0 / 2048.0
+                                        + square * (31.0 / 2048.0 - square * 691.0 / 16384.0)))))
+}
+
+pub(crate) fn log_one_minus_square(x: f64) -> f64 {
+    if x.abs() < 0.5 {
+        // Separate logarithms cancel their leading ±x terms near zero.
+        (-x * x).ln_1p()
+    } else {
+        // Here 1-x*x would instead lose relative accuracy near |x|=1.
+        (-x.abs()).ln_1p() + x.abs().ln_1p()
+    }
+}
+
+/// Shape-only R-distribution MLE. The score is strictly decreasing, and
+/// 1/(2a) < psi(a+1/2)-psi(a) < 1/a supplies a finite root bracket.
+pub(crate) fn rdist_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "RDist")?;
+    if data.iter().any(|&x| x.abs() >= 1.0) {
+        return Err(FitError::UnsupportedData(
+            "RDist MLE requires observations strictly inside (-1, 1)".into(),
+        ));
+    }
+    let mut target = 0.0;
+    let mut correction = 0.0;
+    let n = data.len() as f64;
+    for &x in data {
+        let term = -log_one_minus_square(x) / n - correction;
+        let next = target + term;
+        correction = (next - target) - term;
+        target = next;
+    }
+    let mut upper = target.recip();
+    if !upper.is_finite() || target <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "RDist likelihood has no finite representable shape maximum".into(),
+        ));
+    }
+    let mut lower = 0.5 * upper;
+    for _ in 0..100 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            break;
+        }
+        if half_digamma_difference(middle) > target {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    let shape = lower + upper;
+    if shape.is_finite() && shape > 0.0 {
+        Ok(shape)
+    } else {
+        Err(FitError::NonConvergent(
+            "RDist MLE shape exceeds the finite parameter range".into(),
+        ))
+    }
+}
+
 /// One parameter of a likelihood model, in the order expected by its factory.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MleParameter {
