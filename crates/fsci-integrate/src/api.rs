@@ -232,6 +232,8 @@ pub struct SolveIvpOptions<'a> {
     /// Ignored when `jac` is supplied and by other methods. Missing entries declare
     /// derivatives that are always zero. Newton solves retain their existing dense
     /// or structured factorization; this option reduces RHS calls for Jacobians.
+    /// CASP also uses this structure for its initial stiffness probe, regardless of
+    /// which solver it ultimately selects, when `jac` is not supplied.
     pub jac_sparsity: Option<&'a crate::JacobianSparsity>,
     /// Lower Jacobian bandwidth for LSODA. With either bandwidth set, the other
     /// defaults to zero. Both must be smaller than the state dimension. A supplied
@@ -1589,7 +1591,10 @@ impl From<OdeSolverAction> for SolverKind {
 /// # Formula
 /// 1. Evaluates $f_0 = f(t_0, y_0)$ and $n$ forward-difference columns
 ///    $J_{:,j} = (f(t_0, y_0 + \delta_j e_j) - f_0) / \delta_j$ ($n + 1$ RHS evaluations total,
-///    counted in [`SolveIvpResult::nfev`]).
+///    counted in [`SolveIvpResult::nfev`]). With `jac_sparsity` and no analytic `jac`, columns
+///    with disjoint row supports are perturbed together: one RHS call per color plus $f_0$,
+///    and only declared nonzeros are stored. The derivative and power-iteration formulas
+///    are unchanged.
 ///    For non-zero initial components, $\delta_j = \sqrt{\varepsilon_{\text{mach}}} \max(|y_{0,j}|, 1)$.
 ///    For zero initial components with non-zero initial rate $f_{0,j} \ne 0$ (such as reaction
 ///    intermediates starting at concentration zero in Robertson kinetics),
@@ -1616,7 +1621,8 @@ pub struct OdeStiffnessProbe {
     pub step_bound_ratio: f64,
     /// Combined stiffness ratio estimate fed into [`OdeSolverPortfolio`].
     pub stiffness_ratio_estimate: f64,
-    /// Number of RHS evaluations consumed by the probe ($n + 1$, or $0$ when skipped).
+    /// RHS evaluations consumed by the probe: $n + 1$ for dense differences,
+    /// `jac_sparsity.group_count() + 1` for grouped differences, or $0$ when skipped.
     pub probe_nfev: usize,
 }
 
@@ -1635,6 +1641,10 @@ impl Default for OdeStiffnessProbe {
 
 /// Probe the ODE right-hand side at `(t0, y0)` using $n + 1$ finite-difference evaluations and
 /// $\le 20$ power iterations (`frankenscipy-7tb8d.9`).
+/// A supplied `jac_sparsity` without `jac` reduces the evaluations to one per color plus
+/// the initial RHS and uses storage proportional to its nonzeros. Invalid inputs, including
+/// a pattern of the wrong dimension, return a skipped probe; CASP solve entry points reject
+/// a mismatched pattern with [`IntegrateValidationError::InvalidJacobianSparsity`].
 pub fn probe_ode_stiffness<F>(fun: &mut F, options: &SolveIvpOptions<'_>) -> OdeStiffnessProbe
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -1662,6 +1672,11 @@ where
         return OdeStiffnessProbe::default();
     }
 
+    let pattern = options.jac_sparsity.filter(|_| options.jac.is_none());
+    if pattern.is_some_and(|pattern| pattern.dimension() != n) {
+        return OdeStiffnessProbe::default();
+    }
+
     let f0 = fun(t0, options.y0);
     if f0.len() != n || f0.iter().any(|v| !v.is_finite()) {
         return OdeStiffnessProbe {
@@ -1672,37 +1687,85 @@ where
 
     let sqrt_eps = 1.490_116_119_384_765_6e-8_f64;
     let mut y_pert = options.y0.to_vec();
-    let mut jac = vec![0.0_f64; n * n];
+    let mut jac = if pattern.is_none() {
+        vec![0.0_f64; n * n]
+    } else {
+        Vec::new()
+    };
+    let mut sparse_jac = pattern.map(|pattern| {
+        pattern
+            .column_rows
+            .iter()
+            .map(|rows| vec![0.0_f64; rows.len()])
+            .collect::<Vec<_>>()
+    });
     let mut col_norms = vec![0.0_f64; n];
     let mut probe_nfev = 1usize;
 
-    for j in 0..n {
-        let yj_abs = options.y0[j].abs();
-        let delta_j = if yj_abs > 0.0 {
-            sqrt_eps * yj_abs.max(1.0)
-        } else if f0[j].abs() > 0.0 {
-            (f0[j].abs() * span.min(1.0) * 1.0e-3).clamp(sqrt_eps, 1.0e-3)
-        } else {
-            sqrt_eps
-        };
-        y_pert[j] = options.y0[j] + delta_j;
-        let f_pert = fun(t0, &y_pert);
-        probe_nfev += 1;
-        y_pert[j] = options.y0[j];
-        if f_pert.len() != n {
-            return OdeStiffnessProbe {
-                probe_nfev,
-                ..OdeStiffnessProbe::default()
-            };
+    let deltas: Vec<f64> = options
+        .y0
+        .iter()
+        .zip(&f0)
+        .map(|(&y, &f)| {
+            let y_abs = y.abs();
+            if y_abs > 0.0 {
+                sqrt_eps * y_abs.max(1.0)
+            } else if f.abs() > 0.0 {
+                (f.abs() * span.min(1.0) * 1.0e-3).clamp(sqrt_eps, 1.0e-3)
+            } else {
+                sqrt_eps
+            }
+        })
+        .collect();
+
+    if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_mut()) {
+        for group in pattern.column_groups() {
+            for &j in group {
+                y_pert[j] = options.y0[j] + deltas[j];
+            }
+            let f_pert = fun(t0, &y_pert);
+            probe_nfev += 1;
+            for &j in group {
+                y_pert[j] = options.y0[j];
+            }
+            if f_pert.len() != n {
+                return OdeStiffnessProbe {
+                    probe_nfev,
+                    ..OdeStiffnessProbe::default()
+                };
+            }
+            for &j in group {
+                let mut col_sq = 0.0_f64;
+                for (&i, value) in pattern.column_rows[j].iter().zip(&mut columns[j]) {
+                    let df = f_pert[i] - f0[i];
+                    let val = if df.is_finite() { df / deltas[j] } else { 0.0 };
+                    *value = val;
+                    col_sq += val * val;
+                }
+                col_norms[j] = col_sq.sqrt();
+            }
         }
-        let mut col_sq = 0.0_f64;
-        for i in 0..n {
-            let df = f_pert[i] - f0[i];
-            let val = if df.is_finite() { df / delta_j } else { 0.0 };
-            jac[i * n + j] = val;
-            col_sq += val * val;
+    } else {
+        for (j, &delta_j) in deltas.iter().enumerate() {
+            y_pert[j] = options.y0[j] + delta_j;
+            let f_pert = fun(t0, &y_pert);
+            probe_nfev += 1;
+            y_pert[j] = options.y0[j];
+            if f_pert.len() != n {
+                return OdeStiffnessProbe {
+                    probe_nfev,
+                    ..OdeStiffnessProbe::default()
+                };
+            }
+            let mut col_sq = 0.0_f64;
+            for i in 0..n {
+                let df = f_pert[i] - f0[i];
+                let val = if df.is_finite() { df / delta_j } else { 0.0 };
+                jac[i * n + j] = val;
+                col_sq += val * val;
+            }
+            col_norms[j] = col_sq.sqrt();
         }
-        col_norms[j] = col_sq.sqrt();
     }
 
     // Power iteration (<= 20 iterations) to estimate spectral radius rho(J).
@@ -1726,14 +1789,27 @@ where
     let mut w = vec![0.0_f64; n];
     for _iter in 0..20 {
         let mut w_sq = 0.0_f64;
-        for i in 0..n {
-            let row = &jac[i * n..(i + 1) * n];
-            let mut s = 0.0_f64;
-            for j in 0..n {
-                s += row[j] * v[j];
+        if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
+            w.fill(0.0);
+            // Ascending columns preserve the dense path's summation order in each row.
+            for (j, (rows, values)) in pattern.column_rows.iter().zip(columns).enumerate() {
+                for (&i, &value) in rows.iter().zip(values) {
+                    w[i] += value * v[j];
+                }
             }
-            w[i] = s;
-            w_sq += s * s;
+            for &value in &w {
+                w_sq += value * value;
+            }
+        } else {
+            for i in 0..n {
+                let row = &jac[i * n..(i + 1) * n];
+                let mut s = 0.0_f64;
+                for j in 0..n {
+                    s += row[j] * v[j];
+                }
+                w[i] = s;
+                w_sq += s * s;
+            }
         }
         let w_norm = w_sq.sqrt();
         if !w_norm.is_finite() || w_norm <= 1e-300 {
@@ -1750,7 +1826,17 @@ where
         }
     }
 
-    let max_diag = (0..n).map(|i| jac[i * n + i].abs()).fold(0.0_f64, f64::max);
+    let max_diag = if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
+        pattern
+            .column_rows
+            .iter()
+            .zip(columns)
+            .enumerate()
+            .filter_map(|(j, (rows, values))| rows.binary_search(&j).ok().map(|i| values[i].abs()))
+            .fold(0.0_f64, f64::max)
+    } else {
+        (0..n).map(|i| jac[i * n + i].abs()).fold(0.0_f64, f64::max)
+    };
     let spectral_radius = rho_power.max(max_diag);
     let stiffness_indicator = spectral_radius * span;
     let rtol_fifth = options.rtol.abs().max(1e-15).powf(0.2);
@@ -1903,6 +1989,11 @@ where
     )?;
     let mut resolved_opts = options.clone();
     resolved_opts.mode = effective_mode;
+    if resolved_opts.jac.is_none()
+        && let Some(pattern) = resolved_opts.jac_sparsity
+    {
+        pattern.validate_dimension(resolved_opts.y0.len())?;
+    }
     let probe = probe_ode_stiffness(fun, &resolved_opts);
     let mut effective_stiffness =
         if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
@@ -2070,8 +2161,9 @@ where
 
 /// Solve an initial value problem using CASP condition-aware portfolio selection.
 ///
-/// Probes the initial Jacobian at `(t0, y0)` via $n + 1$ finite-difference evaluations and $\le 20$
-/// power iterations, selects among `DOP853`, `RK45`, `RK23`, `BDF`, and `Radau` via Bayesian
+/// Probes the initial Jacobian at `(t0, y0)` using one base evaluation plus one per column
+/// (or sparsity color), then at most 20 power iterations. Selects among `DOP853`, `RK45`,
+/// `RK23`, `BDF`, and `Radau` via Bayesian
 /// expected-loss minimization, monitors the per-step Hairer-Wanner stiffness detector during
 /// explicit stepping, and feeds the conformal calibrator once per call (`frankenscipy-7tb8d.9`).
 pub fn solve_ivp_with_casp<F>(
@@ -4807,6 +4899,191 @@ mod tests {
             vdp.y[last][0],
             vdp.y[last][1]
         );
+    }
+
+    #[test]
+    fn casp_colored_stiffness_probe_preserves_dense_diagnostics_and_solution() {
+        let n = 9usize;
+        let rows: Vec<Vec<usize>> = (0..n)
+            .map(|i| (i.saturating_sub(1)..=(i + 1).min(n - 1)).collect())
+            .collect();
+        let pattern = crate::JacobianSparsity::from_rows(&rows).expect("tridiagonal pattern");
+        assert_eq!(pattern.group_count(), 3);
+        let y0: Vec<f64> = (0..n).map(|i| i as f64 / 8.0).collect();
+        let mut rhs = |_t: f64, y: &[f64]| {
+            (0..y.len())
+                .map(|i| {
+                    let mut value = -2.0 * y[i];
+                    if i > 0 {
+                        value += 0.25 * y[i - 1];
+                    }
+                    if i + 1 < y.len() {
+                        value += 0.25 * y[i + 1];
+                    }
+                    value
+                })
+                .collect()
+        };
+        let options = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &y0,
+            ..SolveIvpOptions::default()
+        };
+        let dense = probe_ode_stiffness(&mut rhs, &options);
+        let mut sparse_options = options.clone();
+        sparse_options.jac_sparsity = Some(&pattern);
+        let sparse = probe_ode_stiffness(&mut rhs, &sparse_options);
+        assert_eq!(dense.probe_nfev, n + 1);
+        assert_eq!(sparse.probe_nfev, pattern.group_count() + 1);
+        let diagnostic_bits = |probe: &OdeStiffnessProbe| {
+            [
+                probe.spectral_radius,
+                probe.span,
+                probe.stiffness_indicator,
+                probe.step_bound_ratio,
+                probe.stiffness_ratio_estimate,
+            ]
+            .map(f64::to_bits)
+        };
+        assert_eq!(diagnostic_bits(&sparse), diagnostic_bits(&dense));
+
+        let mut dense_portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
+        let mut sparse_portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
+        let dense_result = solve_ivp_with_casp(&mut rhs, &options, &mut dense_portfolio)
+            .expect("dense CASP integration");
+        let sparse_result = solve_ivp_with_casp(&mut rhs, &sparse_options, &mut sparse_portfolio)
+            .expect("sparse CASP integration");
+        assert!(dense_result.result.success);
+        assert!(sparse_result.result.success);
+        assert_eq!(dense_result.chosen_action, sparse_result.chosen_action);
+        assert_eq!(dense_result.result.t, sparse_result.result.t);
+        let solution_bits = |result: &SolveIvpResult| {
+            result
+                .y
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            solution_bits(&dense_result.result),
+            solution_bits(&sparse_result.result)
+        );
+        assert_eq!(
+            dense_result.result.nfev - dense_result.stiffness_probe.probe_nfev,
+            sparse_result.result.nfev - sparse_result.stiffness_probe.probe_nfev
+        );
+    }
+
+    #[test]
+    fn casp_colored_probe_scales_with_structure_and_skips_zero_columns() {
+        let n = 4096usize;
+        let rows: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+        let pattern = crate::JacobianSparsity::from_rows(&rows).expect("diagonal pattern");
+        let y0 = vec![1.0; n];
+        let mut calls = 0usize;
+        let probe = probe_ode_stiffness(
+            &mut |_t, y| {
+                calls += 1;
+                y.iter().map(|value| -2.0 * value).collect()
+            },
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &y0,
+                jac_sparsity: Some(&pattern),
+                ..SolveIvpOptions::default()
+            },
+        );
+        assert_eq!(pattern.group_count(), 1);
+        assert_eq!(calls, 2, "one base call and one diagonal color");
+        assert_eq!(probe.probe_nfev, calls);
+        assert!((probe.spectral_radius - 2.0).abs() < 1e-12);
+
+        let zero_rows: Vec<Vec<usize>> = (0..4).map(|_| Vec::new()).collect();
+        let zero_pattern =
+            crate::JacobianSparsity::from_rows(&zero_rows).expect("zero Jacobian pattern");
+        let mut zero_calls = 0usize;
+        let zero = probe_ode_stiffness(
+            &mut |_t, y| {
+                zero_calls += 1;
+                vec![1.0; y.len()]
+            },
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &[0.0; 4],
+                jac_sparsity: Some(&zero_pattern),
+                ..SolveIvpOptions::default()
+            },
+        );
+        assert_eq!(zero_pattern.group_count(), 0);
+        assert_eq!(zero_calls, 1);
+        assert_eq!(zero.probe_nfev, 1);
+        assert_eq!(zero.spectral_radius, 0.0);
+    }
+
+    #[test]
+    fn casp_rejects_mismatched_probe_structure_before_rhs_and_audits_once() {
+        let pattern =
+            crate::JacobianSparsity::from_rows(&[vec![0]]).expect("valid one-dimensional pattern");
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let options = SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &[1.0, 2.0],
+                jac_sparsity: Some(&pattern),
+                mode,
+                ..SolveIvpOptions::default()
+            };
+            let skipped = probe_ode_stiffness(
+                &mut |_t, _y| panic!("invalid structure must not evaluate the RHS"),
+                &options,
+            );
+            assert_eq!(skipped, OdeStiffnessProbe::default());
+            let ledger = crate::validation::sync_audit_ledger();
+            let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+            let err = solve_ivp_with_casp_portfolio_and_audit(
+                &mut |_t, _y| panic!("invalid structure must be rejected before the probe"),
+                &options,
+                &mut portfolio,
+                0.0,
+                false,
+                &ledger,
+            )
+            .expect_err("CASP validates the structure it uses for diagnostics");
+            assert!(matches!(
+                err,
+                IntegrateValidationError::InvalidJacobianSparsity { .. }
+            ));
+            let guard = ledger.lock().expect("audit ledger");
+            assert_eq!(guard.len(), 1);
+            assert!(matches!(
+                &guard.entries()[0].action,
+                fsci_runtime::AuditAction::FailClosed { reason }
+                    if reason == "invalid_jacobian_sparsity"
+            ));
+        }
+    }
+
+    #[test]
+    fn casp_probe_preserves_analytic_jacobian_precedence_over_sparsity() {
+        fn jacobian(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![-2.0, 0.0], vec![0.0, -2.0]]
+        }
+        let ignored_pattern = crate::JacobianSparsity::from_rows(&[vec![0]])
+            .expect("one-dimensional pattern is ignored when jac is supplied");
+        let options = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 2.0],
+            jac: Some(jacobian),
+            jac_sparsity: Some(&ignored_pattern),
+            ..SolveIvpOptions::default()
+        };
+        let mut rhs = |_t: f64, y: &[f64]| y.iter().map(|value| -2.0 * value).collect();
+        let probe = probe_ode_stiffness(&mut rhs, &options);
+        assert_eq!(probe.probe_nfev, 3, "analytic jac disables the sparsity hint");
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
+        let result = solve_ivp_with_casp(&mut rhs, &options, &mut portfolio)
+            .expect("ignored sparsity pattern must not invalidate a usable Jacobian");
+        assert!(result.result.success);
     }
 
     #[test]

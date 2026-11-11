@@ -17,6 +17,7 @@ pub type StepRhsFn = dyn FnMut(f64, &[f64]) -> Vec<f64>;
 ///
 /// This reduces Jacobian evaluation work; the implicit solvers retain their existing
 /// dense/structured Newton factorizations and dense Jacobian storage.
+/// The CASP stiffness probe also uses this coloring and stores only the declared nonzeros.
 ///
 /// ```
 /// use fsci_integrate::JacobianSparsity;
@@ -116,6 +117,10 @@ impl JacobianSparsity {
     #[must_use]
     pub fn group_count(&self) -> usize {
         self.groups.len()
+    }
+
+    pub(crate) fn column_groups(&self) -> &[Vec<usize>] {
+        &self.groups
     }
 
     pub(crate) fn validate_dimension(&self, n: usize) -> Result<(), IntegrateValidationError> {
