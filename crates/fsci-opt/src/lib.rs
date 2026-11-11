@@ -4160,90 +4160,188 @@ fn cholesky_solve_spd(m: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
     Some(x)
 }
 
-/// Solve a small symmetric positive-definite system `M z = rhs` by Gaussian
-/// elimination with partial pivoting. Returns `None` on (near-)singularity.
-fn dense_spd_solve(m: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
-    let n = rhs.len();
+/// Minimum-norm least-squares solution without squaring the condition number.
+/// The relative singular-value cutoff follows NumPy's `lstsq`: machine precision
+/// for the initial solve, and `max(m, n) * eps` for BVLS free-set solves.
+fn lsq_linear_minimum_norm(a: &[Vec<f64>], b: &[f64], rcond: f64) -> Result<Vec<f64>, OptError> {
+    let n = a[0].len();
+    let mut x = vec![0.0; n];
     if n == 0 {
-        return Some(Vec::new());
+        return Ok(x);
     }
-    let mut aug: Vec<Vec<f64>> = (0..n)
-        .map(|i| {
-            let mut row = m[i].clone();
-            row.push(rhs[i]);
-            row
-        })
-        .collect();
-    for col in 0..n {
-        let mut piv = col;
-        for r in (col + 1)..n {
-            if aug[r][col].abs() > aug[piv][col].abs() {
-                piv = r;
-            }
+    let (left, singular, right) = trf::svd_thin(a, n);
+    if singular.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: non-finite singular value in the free least-squares problem"
+                .to_string(),
+        });
+    }
+    let largest = singular[0];
+    let b_scale = b
+        .iter()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if largest == 0.0 || b_scale == 0.0 {
+        return Ok(x);
+    }
+    for ((u, &sigma), v) in left.iter().zip(&singular).zip(&right) {
+        if sigma / largest <= rcond {
+            continue;
         }
-        if aug[piv][col].abs() < 1e-300 {
-            return None;
-        }
-        aug.swap(col, piv);
-        for r in 0..n {
-            if r != col {
-                let f = aug[r][col] / aug[col][col];
-                if f != 0.0 {
-                    if r < col {
-                        let (rows_before_pivot, rows_from_pivot) = aug.split_at_mut(col);
-                        let row = &mut rows_before_pivot[r];
-                        let pivot = &rows_from_pivot[0];
-                        for (entry, &pivot_entry) in
-                            row[col..=n].iter_mut().zip(pivot[col..=n].iter())
-                        {
-                            *entry -= f * pivot_entry;
-                        }
-                    } else {
-                        let (rows_before_row, rows_from_row) = aug.split_at_mut(r);
-                        let pivot = &rows_before_row[col];
-                        let row = &mut rows_from_row[0];
-                        for (entry, &pivot_entry) in
-                            row[col..=n].iter_mut().zip(pivot[col..=n].iter())
-                        {
-                            *entry -= f * pivot_entry;
-                        }
-                    }
-                }
-            }
+        let projection: f64 = u.iter().zip(b).map(|(&ui, &bi)| ui * (bi / b_scale)).sum();
+        let ratio = b_scale / sigma;
+        let coefficient = if ratio.is_finite() && ratio != 0.0 {
+            projection * ratio
+        } else {
+            (projection / sigma) * b_scale
+        };
+        for (xi, &vi) in x.iter_mut().zip(v) {
+            *xi += vi * coefficient;
         }
     }
-    Some((0..n).map(|i| aug[i][n] / aug[i][i]).collect())
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: the free least-squares solution is not finite".to_string(),
+        });
+    }
+    Ok(x)
 }
 
-/// Power of two that `lsq_linear` scales `A` and `b` by before forming `AᵀA` and `Aᵀb`.
-///
-/// `AᵀA` squares A's magnitude, so entries past ~1e154 overflow it and entries below ~1e-154
-/// underflow it although the least-squares problem is well posed: A = [[1e160], [-1e160]],
-/// b = [1e160, 0] gave x = [NaN] unbounded and [0] on [0, 1], where SciPy 1.17.1 (lstsq on A,
-/// never AᵀA) returns 0.5 (frankenscipy-vfs3g). Scaling A and b by the same power of two is exact
-/// and leaves the minimiser and the bounds unchanged, so bring max|A| near 1 whenever it lies
-/// outside [2^-500, 2^500]; inside that range the factor is 1 and nothing changes.
-fn lsq_gram_scale(a: &[Vec<f64>]) -> f64 {
-    let safe = 2.0_f64.powi(500);
-    let a_max = a
+/// Solve for the free variables against the residual of the fixed variables.
+fn lsq_linear_free_solution(
+    a: &[Vec<f64>],
+    b: &[f64],
+    x: &[f64],
+    state: &[i8],
+    free: &[usize],
+) -> Result<Vec<f64>, OptError> {
+    let free_a: Vec<Vec<f64>> = a
         .iter()
-        .flatten()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    if a_max > safe || (a_max > 0.0 && a_max < safe.recip()) {
-        2.0_f64.powi(-(a_max.log2().round() as i32).clamp(-1000, 1000))
-    } else {
-        1.0
+        .map(|row| free.iter().map(|&column| row[column]).collect())
+        .collect();
+    let free_b: Vec<f64> = a
+        .iter()
+        .zip(b)
+        .map(|(row, &bi)| {
+            bi - row
+                .iter()
+                .zip(x)
+                .zip(state)
+                .filter(|&(_, &side)| side != 0)
+                .map(|((&aij, &xj), _)| aij * xj)
+                .sum::<f64>()
+        })
+        .collect();
+    if free_b.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: non-finite residual in the free least-squares problem".to_string(),
+        });
     }
+    lsq_linear_minimum_norm(
+        &free_a,
+        &free_b,
+        f64::EPSILON * a.len().max(free.len()) as f64,
+    )
+}
+
+/// Residual-space projected gradient, normalized by the matrix and data norms.
+/// This checks free-variable stationarity as well as the signs at active bounds.
+/// Common scaling of A and b leaves the stopping test and the minimizer unchanged.
+/// Dot-product roundoff is bounded using `|A| |x|`, so cancellation in Ax does
+/// not demand accuracy beyond what the supplied floating-point data can provide.
+fn lsq_linear_optimality(
+    a: &[Vec<f64>],
+    b: &[f64],
+    x: &[f64],
+    state: &[i8],
+    a_norm: f64,
+) -> Result<(f64, Option<usize>), OptError> {
+    let model: Vec<f64> = a
+        .iter()
+        .map(|row| row.iter().zip(x).map(|(&aij, &xj)| aij * xj).sum())
+        .collect();
+    if model.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: non-finite fitted values prevent an optimality check".to_string(),
+        });
+    }
+    let data_scale = model
+        .iter()
+        .chain(b)
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if a_norm == 0.0 || data_scale == 0.0 {
+        return Ok((0.0, None));
+    }
+    let model_norm = model
+        .iter()
+        .fold(0.0_f64, |norm, &value| norm.hypot(value / data_scale));
+    let b_norm = b
+        .iter()
+        .fold(0.0_f64, |norm, &value| norm.hypot(value / data_scale));
+    let reference_norm = model_norm.max(b_norm);
+    let mut gradient = vec![0.0; x.len()];
+    let mut activity_norm = 0.0_f64;
+    let mut residual_norm = 0.0_f64;
+    for ((row, &prediction), &bi) in a.iter().zip(&model).zip(b) {
+        let residual = (prediction / data_scale - bi / data_scale) / reference_norm;
+        residual_norm = residual_norm.hypot(residual);
+        let activity: f64 = row
+            .iter()
+            .zip(x)
+            .map(|(&aij, &xj)| (aij * xj).abs() / data_scale)
+            .sum();
+        activity_norm = activity_norm.hypot(activity);
+        for (gj, &aij) in gradient.iter_mut().zip(row) {
+            *gj += (aij / a_norm) * residual;
+        }
+    }
+    // For a floating-point dot product, |fl(a·x) - a·x| <= gamma_n |a|·|x|,
+    // gamma_n = n*eps/(1-n*eps). Include residual subtraction and the gradient
+    // dot products as well. This is an absolute backward-error allowance in the
+    // same normalized units as the gradient, not a larger solver tolerance.
+    let model_roundoff = x.len() as f64 * f64::EPSILON;
+    let gradient_roundoff = (a.len() as f64 + 2.0) * f64::EPSILON;
+    let roundoff = (model_roundoff / (1.0 - model_roundoff)) * activity_norm / reference_norm
+        + f64::EPSILON * (model_norm + b_norm) / reference_norm
+        + (gradient_roundoff / (1.0 - gradient_roundoff)) * residual_norm;
+    if !roundoff.is_finite() {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: the roundoff bound prevents a finite optimality check".to_string(),
+        });
+    }
+    let mut optimality = 0.0_f64;
+    let mut best_bound_score = 0.0;
+    let mut release = None;
+    for (j, (&gj, &side)) in gradient.iter().zip(state).enumerate() {
+        let violation = match side {
+            -1 => -gj,
+            0 => gj.abs(),
+            1 => gj,
+            _ => 0.0, // A variable with equal finite bounds is fixed permanently.
+        };
+        optimality = optimality.max(violation);
+        if matches!(side, -1 | 1) && violation > best_bound_score {
+            best_bound_score = violation;
+            release = Some(j);
+        }
+    }
+    Ok(((optimality - roundoff).max(0.0), release))
 }
 
 /// Solve the bound-constrained linear least-squares problem
 /// `min ‖A·x − b‖²` subject to `lb ≤ x ≤ ub`, matching
 /// `scipy.optimize.lsq_linear(A, b, bounds=(lb, ub), method='bvls')`.
 ///
-/// Uses the BVLS active-set algorithm (Stark & Parker). Bounds may be infinite
-/// (`f64::NEG_INFINITY`/`INFINITY`) for one-sided or unconstrained variables.
-/// The problem is convex, so the returned minimiser matches scipy's `bvls`
-/// solution to solver tolerance.
+/// Uses the BVLS active-set algorithm (Stark & Parker), with direct SVD solves
+/// for rank-deficient and underdetermined free-variable problems. Bounds may be
+/// infinite (`f64::NEG_INFINITY`/`INFINITY`) for one-sided or unconstrained
+/// variables. Equal finite bounds fix a variable. When minimizers are not
+/// unique, the initial unconstrained solve returns the minimum-norm solution;
+/// the active-set path may select another minimizer when bounds bind.
+///
+/// The projected gradient is checked in residual space to relative tolerance
+/// `1e-10`, accounting for the roundoff bound of the matrix-vector products.
+/// Numerical failure or exhaustion of the iteration budget returns
+/// [`OptError::NotConverged`], rather than an unchecked feasible point.
 pub fn lsq_linear(a: &[Vec<f64>], b: &[f64], lb: &[f64], ub: &[f64]) -> Result<Vec<f64>, OptError> {
     let m = a.len();
     if m == 0 {
@@ -4275,177 +4373,161 @@ pub fn lsq_linear(a: &[Vec<f64>], b: &[f64], lb: &[f64], ub: &[f64]) -> Result<V
         });
     }
     for (index, (&lo, &hi)) in lb.iter().zip(ub.iter()).enumerate() {
-        if lo.is_nan() || hi.is_nan() || lo > hi {
+        if lo.is_nan() || hi.is_nan() || lo > hi || lo == f64::INFINITY || hi == f64::NEG_INFINITY {
             return Err(OptError::InvalidBounds {
                 detail: format!("invalid bounds for variable {index}"),
             });
         }
     }
-    // Gram = AᵀA, atb = Aᵀb. Accumulate by RANK-1 update over a contiguous row-major copy of A:
-    // `gram[j1][.] += a_i[j1] · a_i[.]` is a contiguous AXPY the compiler vectorizes, vs the old
-    // per-pair `Σ_i row[j1]·row[j2]` that strided TWO columns through the `Vec<Vec>` heap rows
-    // (a cache miss per element, O(n²·m) of them — the dominant cost for this routine). ~1e-13
-    // reassociation only; lsq_linear's bounded LS has a unique minimizer (full column rank), so
-    // the optimum is unchanged (the Gram only feeds the subproblem solves and the KKT gradient).
-    // A and b enter scaled by `lsq_gram_scale(a)`, which is exactly 1 unless |A| would overflow
-    // or underflow AᵀA.
-    let scale = lsq_gram_scale(a);
-    let a_flat: Vec<f64> = a
-        .iter()
-        .flat_map(|row| row.iter().map(move |&value| value * scale))
-        .collect();
-    let mut gram = vec![0.0_f64; n * n]; // contiguous row-major (full symmetric); feeds nnls_chol_*
-    let mut atb = vec![0.0_f64; n];
-    for i in 0..m {
-        let ai = &a_flat[i * n..i * n + n];
-        let bi = b[i] * scale;
-        for j1 in 0..n {
-            let v1 = ai[j1];
-            let grow = &mut gram[j1 * n..j1 * n + n];
-            for (g, &v2) in grow.iter_mut().zip(ai.iter()) {
-                *g += v1 * v2;
-            }
-            atb[j1] += v1 * bi;
-        }
+    if n == 0 {
+        return Ok(Vec::new());
     }
+    // A common data scale protects the SVD and the residual calculations at both
+    // ends of the floating-point range without changing x or its bounds. Divide
+    // instead of taking a reciprocal, which can overflow for subnormal data.
+    let scale = a
+        .iter()
+        .flatten()
+        .chain(b)
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    let scale = if scale == 0.0 { 1.0 } else { scale };
+    if a.iter()
+        .flatten()
+        .chain(b)
+        .any(|&value| value != 0.0 && value / scale == 0.0)
+    {
+        return Err(OptError::NotConverged {
+            detail: "lsq_linear: the data range cannot be scaled without underflow".to_string(),
+        });
+    }
+    let a: Vec<Vec<f64>> = a
+        .iter()
+        .map(|row| row.iter().map(|value| value / scale).collect())
+        .collect();
+    let b: Vec<f64> = b.iter().map(|value| value / scale).collect();
+    let a_norm = a
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |norm, &value| norm.hypot(value));
+    let mut x = lsq_linear_minimum_norm(&a, &b, f64::EPSILON)?;
 
-    // State: -1 = at lower, +1 = at upper, 0 = free. Start each variable at a bound.
+    // State: -1 = lower, +1 = upper, 0 = free, 2 = fixed at equal bounds.
     let mut state = vec![0i8; n];
-    let mut x = vec![0.0_f64; n];
     for j in 0..n {
-        if lb[j].is_infinite() && ub[j].is_infinite() {
-            state[j] = 0;
-            x[j] = 0.0;
-        } else if lb[j].is_finite() {
+        if lb[j] == ub[j] {
+            state[j] = 2;
+            x[j] = lb[j];
+        } else if x[j] <= lb[j] {
             state[j] = -1;
             x[j] = lb[j];
-        } else {
+        } else if x[j] >= ub[j] {
             state[j] = 1;
             x[j] = ub[j];
         }
     }
-    let tol = 1e-10;
-    let max_outer = 10 * (n + 1);
 
-    // Incrementally-maintained Cholesky of `gram[free, free]` (`lflat`, strided stride=n). A
-    // variable ENTERS the free set via the KKT step = O(p²) rank-1 column add (`nnls_chol_add_col`);
-    // it LEAVES via inner-loop blocking = O(p³) refactor (`nnls_chol_refactor`) — rare, since the
-    // active set mostly grows. The old code rebuilt+re-factored the full free submatrix on EVERY
-    // inner solve (O(n⁴)); this is O(n³). `use_slow` reverts to the gather + Cholesky/Gauss-Jordan
-    // path on a rank-deficient free set. Bounded-LS minimizer is unique → converged x unchanged.
-    let mut free: Vec<usize> = (0..n).filter(|&j| state[j] == 0).collect();
-    let mut lflat = vec![0.0_f64; n * n];
-    let mut use_slow = !free.is_empty() && !nnls_chol_refactor(&gram, n, &free, &mut lflat);
-    let mut rhs = vec![0.0_f64; n];
-    let mut zbuf = vec![0.0_f64; n];
-    let mut ybuf = vec![0.0_f64; n];
-
-    for _ in 0..max_outer {
-        // Inner active-set loop: solve the free subproblem, fixing blocking vars.
+    // Find a feasible free-set least-squares solution before beginning BVLS.
+    // Each unsuccessful pass fixes at least one additional variable.
+    if state.iter().any(|&side| side != 0) {
         loop {
-            if use_slow {
-                free = (0..n).filter(|&j| state[j] == 0).collect();
-            }
-            let p = free.len();
-            if p == 0 {
+            let free: Vec<usize> = (0..n).filter(|&j| state[j] == 0).collect();
+            if free.is_empty() {
                 break;
             }
-            // sub_rhs[k] = atb[free[k]] − Σ_{fixed j} gram[free[k]][j]·x[j].
-            for (k, &jk) in free.iter().enumerate() {
-                let grow = &gram[jk * n..jk * n + n];
-                let mut r = atb[jk];
-                for (j2, (&gv, &xv)) in grow.iter().zip(x.iter()).enumerate() {
-                    if state[j2] != 0 {
-                        r -= gv * xv;
-                    }
+            let z = lsq_linear_free_solution(&a, &b, &x, &state, &free)?;
+            let mut blocked = false;
+            for (&j, &zj) in free.iter().zip(&z) {
+                if zj < lb[j] {
+                    x[j] = lb[j];
+                    state[j] = -1;
+                    blocked = true;
+                } else if zj > ub[j] {
+                    x[j] = ub[j];
+                    state[j] = 1;
+                    blocked = true;
+                } else {
+                    x[j] = zj;
                 }
-                rhs[k] = r;
             }
-            // Solve gram[free,free] · z = rhs. Incremental factor on the fast path; gather +
-            // Cholesky/Gauss-Jordan on the rank-deficient fallback (preserving break-on-singular).
-            if use_slow {
-                let mut sub_gram = vec![vec![0.0_f64; p]; p];
-                for (pi, &ii) in free.iter().enumerate() {
-                    for (pj, &jj) in free.iter().enumerate() {
-                        sub_gram[pi][pj] = gram[ii * n + jj];
-                    }
-                }
-                match cholesky_solve_spd(&sub_gram, &rhs[..p])
-                    .or_else(|| dense_spd_solve(&sub_gram, &rhs[..p]))
-                {
-                    Some(zz) => zbuf[..p].copy_from_slice(&zz),
-                    None => break,
-                }
-            } else {
-                nnls_chol_solve(&lflat, n, p, &rhs[..p], &mut zbuf[..p], &mut ybuf[..p]);
+            if !blocked {
+                break;
             }
-            let z = &zbuf[..p];
+        }
+    }
 
-            // Step toward z; if any free var would cross a bound, clamp the most-binding one.
+    let tolerance = 1e-10;
+    let max_outer = 10 * (n + 1);
+    for _ in 0..max_outer {
+        let (optimality, release) = lsq_linear_optimality(&a, &b, &x, &state, a_norm)?;
+        if optimality <= tolerance {
+            return Ok(x);
+        }
+        let Some(j_free) = release else {
+            return Err(OptError::NotConverged {
+                detail: format!(
+                    "lsq_linear: free-variable optimality {optimality:e} exceeds tolerance"
+                ),
+            });
+        };
+        state[j_free] = 0;
+
+        // Each blocking step removes a free variable. The final pass either
+        // accepts a feasible free solution or exhausts the finite free set.
+        let mut solved = false;
+        for _ in 0..=n {
+            let free: Vec<usize> = (0..n).filter(|&j| state[j] == 0).collect();
+            if free.is_empty() {
+                solved = true;
+                break;
+            }
+            let z = lsq_linear_free_solution(&a, &b, &x, &state, &free)?;
             let mut alpha = 1.0_f64;
-            let mut block: Option<(usize, i8)> = None;
-            for (fi, &j) in free.iter().enumerate() {
-                if z[fi] < lb[j] - tol {
-                    let a_j = (lb[j] - x[j]) / (z[fi] - x[j]);
-                    if a_j < alpha {
-                        alpha = a_j;
-                        block = Some((j, -1));
-                    }
-                } else if z[fi] > ub[j] + tol {
-                    let a_j = (ub[j] - x[j]) / (z[fi] - x[j]);
-                    if a_j < alpha {
-                        alpha = a_j;
-                        block = Some((j, 1));
+            let mut block = None;
+            for (&j, &zj) in free.iter().zip(&z) {
+                let side = if zj < lb[j] {
+                    -1
+                } else if zj > ub[j] {
+                    1
+                } else {
+                    0
+                };
+                if side != 0 {
+                    let bound = if side == -1 { lb[j] } else { ub[j] };
+                    let difference = zj - x[j];
+                    let fraction = if difference.is_finite() {
+                        (bound - x[j]) / difference
+                    } else {
+                        (0.5 * bound - 0.5 * x[j]) / (0.5 * zj - 0.5 * x[j])
+                    };
+                    if block.is_none() || fraction < alpha {
+                        alpha = fraction.clamp(0.0, 1.0);
+                        block = Some((j, side));
                     }
                 }
             }
-            for (fi, &j) in free.iter().enumerate() {
-                x[j] += alpha * (z[fi] - x[j]);
+            for (&j, &zj) in free.iter().zip(&z) {
+                x[j] = ((1.0 - alpha) * x[j] + alpha * zj).clamp(lb[j], ub[j]);
             }
             match block {
                 Some((j, side)) => {
                     x[j] = if side == -1 { lb[j] } else { ub[j] };
                     state[j] = side;
-                    if !use_slow {
-                        free.retain(|&f| f != j);
-                        if !nnls_chol_refactor(&gram, n, &free, &mut lflat) {
-                            use_slow = true;
-                        }
-                    }
                 }
-                None => break, // all free vars within bounds: subproblem solved
+                None => {
+                    solved = true;
+                    break;
+                }
             }
         }
-        // KKT check: free the bound variable that most violates optimality.
-        // Gradient g[j] = (Gram·x − atb)[j] = Aᵀ(Ax − b); only bound vars can be freed.
-        let mut best = None;
-        let mut best_score = tol;
-        for j in 0..n {
-            if state[j] == 0 {
-                continue;
-            }
-            let grow = &gram[j * n..j * n + n];
-            let mut gj = -atb[j];
-            for (&gv, &xv) in grow.iter().zip(x.iter()) {
-                gj += gv * xv;
-            }
-            let score = if state[j] == -1 { -gj } else { gj };
-            if score > best_score {
-                best_score = score;
-                best = Some(j);
-            }
-        }
-        let Some(j_free) = best else { break };
-        state[j_free] = 0;
-        if !use_slow {
-            if nnls_chol_add_col(&gram, n, &free, j_free, &mut lflat) {
-                free.push(j_free);
-            } else {
-                use_slow = true;
-            }
+        if !solved {
+            return Err(OptError::NotConverged {
+                detail: "lsq_linear: the free-set feasibility loop did not converge".to_string(),
+            });
         }
     }
-    Ok(x)
+    Err(OptError::NotConverged {
+        detail: format!("lsq_linear: exceeded {max_outer} BVLS iterations"),
+    })
 }
 
 fn solve_small_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
