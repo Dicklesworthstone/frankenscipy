@@ -580,15 +580,17 @@ fn solve_event_equation(
     t_new: f64,
     interp: &dyn Fn(f64) -> Vec<f64>,
 ) -> Result<f64, IntegrateValidationError> {
+    // Preserve the first endpoint in integration order before sorting the
+    // scalar bracket. If both endpoints are roots, a backward step must stop
+    // at its original start, just as a forward step does.
+    let start_value = validate_event_value(event_index, event_fn(t_old, &interp(t_old)))?;
+    if start_value == 0.0 {
+        return Ok(t_old);
+    }
     if t_old == t_new {
-        let value = validate_event_value(event_index, event_fn(t_old, &interp(t_old)))?;
-        return if value == 0.0 {
-            Ok(t_old)
-        } else {
-            Err(IntegrateValidationError::IntegrationFailed {
-                message: format!("event {event_index} has no root in a zero-length step"),
-            })
-        };
+        return Err(IntegrateValidationError::IntegrationFailed {
+            message: format!("event {event_index} has no root in a zero-length step"),
+        });
     }
     let saw_non_finite = std::cell::Cell::new(false);
     let f = |t: f64| {

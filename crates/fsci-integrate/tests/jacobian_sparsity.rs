@@ -1134,3 +1134,44 @@ fn all_solvers_refine_backward_events_away_from_step_midpoints() {
         assert!((result.y.last().unwrap()[0] - 0.3).abs() < 5e-12, "{method:?}");
     }
 }
+
+#[test]
+fn terminal_events_at_both_endpoints_keep_the_integration_start() {
+    for method in [
+        SolverKind::Rk23,
+        SolverKind::Rk45,
+        SolverKind::Dop853,
+        SolverKind::Bdf,
+        SolverKind::Radau,
+        SolverKind::Lsoda,
+    ] {
+        for (t0, tf) in [(1.0, 0.0), (0.0, 1.0)] {
+            let result = solve_ivp(
+                &mut |_t, _y| vec![1.0],
+                &SolveIvpOptions {
+                    t_span: (t0, tf),
+                    y0: &[t0],
+                    method,
+                    first_step: Some(1.0),
+                    max_step: 1.0,
+                    rtol: 1e-9,
+                    atol: ToleranceValue::Scalar(1e-12),
+                    events: Some(vec![fsci_integrate::EventSpec::terminal(|_, _| 0.0)]),
+                    ..SolveIvpOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.status, 1, "{method:?}: {t0} -> {tf}");
+            assert_eq!(
+                result.t_events.as_ref().unwrap()[0],
+                vec![t0],
+                "{method:?}: {t0} -> {tf}"
+            );
+            assert_eq!(result.t.last(), Some(&t0), "{method:?}: {t0} -> {tf}");
+            assert!(
+                (result.y.last().unwrap()[0] - t0).abs() < 5e-12,
+                "{method:?}: {t0} -> {tf}"
+            );
+        }
+    }
+}
