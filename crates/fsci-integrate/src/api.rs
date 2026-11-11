@@ -233,6 +233,15 @@ pub struct SolveIvpOptions<'a> {
     /// derivatives that are always zero. Newton solves retain their existing dense
     /// or structured factorization; this option reduces RHS calls for Jacobians.
     pub jac_sparsity: Option<&'a crate::JacobianSparsity>,
+    /// Lower Jacobian bandwidth for LSODA. With either bandwidth set, the other
+    /// defaults to zero. Both must be smaller than the state dimension. A supplied
+    /// `jac` returns `lband + uband + 1` rows, packed as
+    /// `jac[uband + i - j][j] = d f_i / d y_j`. Without `jac`, columns are grouped
+    /// for finite differences. Newton factors use compact pivoted band storage.
+    /// Ignored by other methods, as in SciPy.
+    pub lband: Option<usize>,
+    /// Upper Jacobian bandwidth for LSODA; see [`Self::lband`].
+    pub uband: Option<usize>,
 }
 
 /// Field by field, with `jac` compared by address (`fn_addr_eq`), as [`EventSpec`] compares
@@ -257,6 +266,8 @@ impl PartialEq for SolveIvpOptions<'_> {
             && self.mode == other.mode
             && jac_eq
             && self.jac_sparsity == other.jac_sparsity
+            && self.lband == other.lband
+            && self.uband == other.uband
     }
 }
 
@@ -276,6 +287,8 @@ impl Default for SolveIvpOptions<'_> {
             mode: RuntimeMode::Strict,
             jac: None,
             jac_sparsity: None,
+            lband: None,
+            uband: None,
         }
     }
 }
@@ -365,8 +378,9 @@ fn validate_events_with_audit(
 /// per event, `direction` then `max_events` as presence flag and value), `rtol`, `atol`
 /// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`,
 /// `mode` (`Debug`), `jac` (presence flag only), and `jac_sparsity` (presence flag and
-/// canonical column supports). The right-hand side, the event functions and the analytic
-/// Jacobian are code, not data, and are not part of it.
+/// canonical column supports), then `lband` and `uband` (presence flag and value).
+/// The right-hand side, the event functions and the analytic Jacobian are code,
+/// not data, and are not part of it.
 fn feed_solve_ivp_options(fingerprinter: &mut Fingerprinter, options: &SolveIvpOptions<'_>) {
     fingerprinter
         .f64(options.t_span.0)
@@ -406,6 +420,12 @@ fn feed_solve_ivp_options(fingerprinter: &mut Fingerprinter, options: &SolveIvpO
             for &row in rows {
                 fingerprinter.usize(row);
             }
+        }
+    }
+    for bandwidth in [options.lband, options.uband] {
+        fingerprinter.bool(bandwidth.is_some());
+        if let Some(bandwidth) = bandwidth {
+            fingerprinter.usize(bandwidth);
         }
     }
 }
@@ -765,7 +785,8 @@ where
 }
 
 /// Configuration for constructing an [`LsodaSolver`]: the arguments of
-/// `scipy.integrate.LSODA(fun, t0, y0, t_bound, first_step, max_step, rtol, atol, jac)`.
+/// `scipy.integrate.LSODA(fun, t0, y0, t_bound, first_step, max_step, rtol, atol,
+/// jac, lband, uband)`.
 pub struct LsodaSolverConfig<'a> {
     pub t0: f64,
     pub y0: &'a [f64],
@@ -777,9 +798,16 @@ pub struct LsodaSolverConfig<'a> {
     /// The first step to try (ODEPACK's `h0`, given the integration direction's sign); `None`
     /// lets ODEPACK choose it from the tolerances and `f(t0, y0)`.
     pub first_step: Option<f64>,
-    /// `jac(t, y)[i][j] = d f_i / d y_j` (`jt = 1`); `None` forms the Jacobian by forward
-    /// differences of `fun` (`jt = 2`), one evaluation per column.
+    /// A dense Jacobian (`jt = 1`) or a packed banded Jacobian (`jt = 4`) when
+    /// either bandwidth is set. The packed convention is
+    /// `jac(t, y)[uband + i - j][j] = d f_i / d y_j` with `lband + uband + 1` rows.
+    /// `None` forms forward differences, one evaluation per column for dense
+    /// matrices (`jt = 2`), or per column group for banded matrices (`jt = 5`).
     pub jac: Option<JacFn>,
+    /// Lower bandwidth; the other bandwidth defaults to zero when omitted.
+    pub lband: Option<usize>,
+    /// Upper bandwidth; each bandwidth must be smaller than `y0.len()`.
+    pub uband: Option<usize>,
     pub mode: RuntimeMode,
 }
 
@@ -824,6 +852,20 @@ impl LsodaSolver {
         if n == 0 {
             return Err(IntegrateValidationError::EmptyY0);
         }
+        let bandwidth = if config.lband.is_some() || config.uband.is_some() {
+            let lower = config.lband.unwrap_or(0);
+            let upper = config.uband.unwrap_or(0);
+            if lower >= n || upper >= n {
+                return Err(IntegrateValidationError::InvalidJacobianBandwidth {
+                    lower,
+                    upper,
+                    dimension: n,
+                });
+            }
+            Some((lower, upper))
+        } else {
+            None
+        };
         crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
         if !config.t0.is_finite() || !config.t_bound.is_finite() {
             return Err(IntegrateValidationError::NonFiniteSpan);
@@ -864,6 +906,7 @@ impl LsodaSolver {
             },
             mxstep: 500,
             jac: config.jac,
+            bandwidth,
         };
         Ok(Self {
             core: Lsoda::new(n, setup),
@@ -888,6 +931,8 @@ impl LsodaSolver {
             max_step: options.max_step,
             first_step: options.first_step,
             jac: options.jac,
+            lband: options.lband,
+            uband: options.uband,
             mode: options.mode,
         })
     }
@@ -2529,7 +2574,10 @@ mod tests {
             .bool(false) // first_step: None
             .f64(f64::INFINITY) // max_step
             .str(mode)
-            .bool(false); // jac: None
+            .bool(false) // jac: None
+            .bool(false) // jac_sparsity: None
+            .bool(false) // lband: None
+            .bool(false); // uband: None
         fingerprinter.finish()
     }
 
@@ -3658,6 +3706,8 @@ mod tests {
             max_step: f64::INFINITY,
             first_step: None,
             jac,
+            lband: None,
+            uband: None,
             mode: RuntimeMode::Strict,
         }
     }
@@ -3800,6 +3850,151 @@ mod tests {
                 "y(3000): fsci {got:?}, SciPy {want:?}"
             );
         }
+    }
+
+    #[test]
+    fn lsoda_diagonal_bands_support_analytic_and_grouped_jacobians() {
+        fn packed_diagonal(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![-10.0, -100.0, -1000.0, -10_000.0]]
+        }
+        let rates = [10.0, 100.0, 1000.0, 10_000.0];
+        let mut rhs = |t: f64, y: &[f64]| {
+            rates
+                .iter()
+                .zip(y)
+                .map(|(r, yi)| -r * (yi - t.cos()))
+                .collect()
+        };
+        let options = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0; 4],
+            method: SolverKind::Lsoda,
+            rtol: 1e-8,
+            atol: ToleranceValue::Scalar(1e-10),
+            t_eval: Some(&[0.0, 0.1, 0.5, 1.0]),
+            ..SolveIvpOptions::default()
+        };
+        for (lband, uband) in [(Some(0), None), (None, Some(0))] {
+            for jac in [None, Some(packed_diagonal as JacFn)] {
+                let result = solve_ivp(
+                    &mut rhs,
+                    &SolveIvpOptions {
+                        lband,
+                        uband,
+                        jac,
+                        ..options.clone()
+                    },
+                )
+                .unwrap();
+                assert!(result.success, "{}", result.message);
+                assert!(result.njev > 0, "the stiff banded path must be taken");
+                assert_eq!(result.njev, result.nlu);
+                for (&t, y) in result.t.iter().zip(&result.y) {
+                    for (&rate, &value) in rates.iter().zip(y) {
+                        let particular = rate * (rate * t.cos() + t.sin()) / (rate * rate + 1.0);
+                        let exact = particular + (-rate * t).exp() / (rate * rate + 1.0);
+                        assert!(
+                            (value - exact).abs() < 2e-7,
+                            "t={t}, rate={rate}: {value} vs {exact}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lsoda_rejects_invalid_bandwidth_before_rhs_evaluation() {
+        for (lower, upper) in [(3, 0), (0, 3), (usize::MAX, usize::MAX)] {
+            let mut calls = 0;
+            let result = solve_ivp(
+                &mut |_t, y| {
+                    calls += 1;
+                    y.to_vec()
+                },
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0; 3],
+                    method: SolverKind::Lsoda,
+                    lband: Some(lower),
+                    uband: Some(upper),
+                    ..SolveIvpOptions::default()
+                },
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                IntegrateValidationError::InvalidJacobianBandwidth {
+                    lower,
+                    upper,
+                    dimension: 3,
+                }
+            );
+            assert_eq!(calls, 0);
+        }
+    }
+
+    #[test]
+    fn lsoda_rejects_malformed_and_nonfinite_packed_jacobians() {
+        fn wrong_shape(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![-1000.0; 4]]
+        }
+        fn nonfinite(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![f64::NAN; 4]; 3]
+        }
+        for (jac, expected) in [
+            (
+                wrong_shape as JacFn,
+                IntegrateValidationError::BandedJacobianWrongShape {
+                    expected_rows: 3,
+                    expected_cols: 4,
+                },
+            ),
+            (
+                nonfinite as JacFn,
+                IntegrateValidationError::NonFiniteJacobian,
+            ),
+        ] {
+            let result = solve_ivp(
+                &mut |t: f64, y: &[f64]| y.iter().map(|yi| -1000.0 * (yi - t.cos())).collect(),
+                &SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0; 4],
+                    method: SolverKind::Lsoda,
+                    jac: Some(jac),
+                    lband: Some(1),
+                    uband: Some(1),
+                    ..SolveIvpOptions::default()
+                },
+            );
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn lsoda_bandwidth_is_part_of_the_audit_fingerprint() {
+        let options = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0; 4],
+            method: SolverKind::Lsoda,
+            ..SolveIvpOptions::default()
+        };
+        let plain = solve_ivp_fingerprint(&options);
+        let diagonal = solve_ivp_fingerprint(&SolveIvpOptions {
+            lband: Some(0),
+            uband: Some(0),
+            ..options.clone()
+        });
+        let lower = solve_ivp_fingerprint(&SolveIvpOptions {
+            lband: Some(1),
+            ..options.clone()
+        });
+        let upper = solve_ivp_fingerprint(&SolveIvpOptions {
+            uband: Some(1),
+            ..options
+        });
+        assert_ne!(plain, diagonal);
+        assert_ne!(diagonal, lower);
+        assert_ne!(lower, upper);
     }
 
     /// A Jacobian of the wrong shape fails the step (SciPy raises), and a finished

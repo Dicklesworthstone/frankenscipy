@@ -207,6 +207,7 @@ where
             hmax: 0.0,
             mxstep: ODEINT_MXSTEP,
             jac: None,
+            bandwidth: None,
         },
     );
     // odeint's func(y, t) as ODEPACK's f(t, y).

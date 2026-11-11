@@ -19,8 +19,9 @@
 //! | labels 430-445 (`stoda_handle_corrector_failure`) | `Lsoda::corrector_failure`      |
 //! | labels 470-478 / 480-486 (method switch)    | `Lsoda::consider_bdf` / `consider_adams` |
 //! | `cfode` (DCFODE)                            | `cfode`                               |
-//! | `prja` (DPRJA), full matrix                 | `Lsoda::prja`                         |
+//! | `prja` (DPRJA), full/banded matrix          | `Lsoda::prja`, `Lsoda::prja_banded`    |
 //! | `dgetrf_`, and `solsy` with `dgetrs_`       | `lu_factor`, `lu_solve`               |
+//! | `dgbtrf_`, and `solsy` with `dgbtrs_`       | `band_lu_factor`, `band_lu_solve`     |
 //! | `intdy` (DINTDY), k = 0                     | `Lsoda::intdy`                        |
 //! | `ewset` (DEWSET)                            | `Lsoda::ewset`                        |
 //! | `vmnorm` (DVMNORM), `fnorm` (DFNORM)        | `vmnorm`, `fnorm`                     |
@@ -30,7 +31,6 @@
 //! it is written on either side of a method switch, so the split does not change a result.
 //!
 //! What is deliberately NOT ported, and why:
-//! - Banded Jacobians (`jt` = 4, 5; `prja` miter 4/5, `bnorm`, `dgbtrf`/`dgbtrs`).
 //! - `itask` 2, 3 and 4 (only `odeint`'s 1 and `solve_ivp`'s 5 have callers).
 //! - `hmin`: SciPy 1.17.1's `lsoda()` reads `rwork[6]` into a local variable and never stores it
 //!   in the common block, so the stepper always runs with `hmin = 0` whatever `min_step` or
@@ -51,8 +51,10 @@
 
 use crate::solver::StepFailure;
 
-/// A dense user Jacobian: `jac(t, y)[i][j] = d f_i / d y_j`, `n` rows of `n`.
-/// Used by BDF, Radau, and LSODA (`jt = 1`).
+/// A user Jacobian: BDF, Radau, and dense LSODA expect `n` rows of `n` with
+/// `jac(t, y)[i][j] = d f_i / d y_j`. Banded LSODA instead expects
+/// `lband + uband + 1` packed rows, with the same derivative at
+/// `jac(t, y)[uband + i - j][j]` (SciPy's compact band convention).
 pub type JacFn = fn(f64, &[f64]) -> Vec<Vec<f64>>;
 
 /// Stability-region step bounds for the Adams methods of order 1..12 (`sm1` in `stoda`).
@@ -340,6 +342,105 @@ fn lu_solve(a: &[f64], ipvt: &[usize], n: usize, b: &mut [f64]) {
     }
 }
 
+/// Weighted infinity norm of a band matrix in LAPACK's extended storage.
+/// The true diagonal is at `lower + upper`; the leading `lower` rows are
+/// reserved for fill-in, not part of the input Jacobian.
+fn band_norm(n: usize, a: &[f64], lower: usize, upper: usize, w: &[f64]) -> f64 {
+    let diagonal = lower + upper;
+    let stride = 2 * lower + upper + 1;
+    let mut norm = 0.0_f64;
+    for row in 0..n {
+        let mut sum = 0.0;
+        for col in row.saturating_sub(lower)..=(row + upper).min(n - 1) {
+            sum += a[diagonal + row - col + col * stride].abs() / w[col];
+        }
+        norm = norm.max(sum * w[row]);
+    }
+    norm
+}
+
+/// Pivoted band LU in `n * (2*lower + upper + 1)` storage. The lower factors
+/// remain interleaved with their row permutations, as in LAPACK DGBTF2/DGBTRS;
+/// swapping already-eliminated lower columns would destroy the band envelope.
+/// U may acquire `lower` extra superdiagonals. No dense fallback is needed,
+/// including when the largest pivot is off the diagonal.
+fn band_lu_factor(a: &mut [f64], ipvt: &mut [usize], n: usize, lower: usize, upper: usize) -> bool {
+    let diagonal = lower + upper;
+    let stride = 2 * lower + upper + 1;
+    for col in 0..n {
+        a[col * stride..col * stride + lower].fill(0.0);
+    }
+    let mut last_affected = 0;
+    let mut nonsingular = true;
+    for col in 0..n {
+        let below = lower.min(n - col - 1);
+        let base = col * stride + diagonal;
+        let mut pivot_offset = 0;
+        for offset in 1..=below {
+            if a[base + offset].abs() > a[base + pivot_offset].abs() {
+                pivot_offset = offset;
+            }
+        }
+        ipvt[col] = col + pivot_offset;
+        if a[base + pivot_offset] == 0.0 {
+            nonsingular = false;
+            continue;
+        }
+        last_affected = last_affected.max((col + upper + pivot_offset).min(n - 1));
+        if pivot_offset != 0 {
+            for trailing in col..=last_affected {
+                let row = diagonal + col - trailing + trailing * stride;
+                a.swap(row, row + pivot_offset);
+            }
+        }
+        let pivot = a[base];
+        if pivot.abs() >= f64::MIN_POSITIVE {
+            let reciprocal = 1.0 / pivot;
+            for offset in 1..=below {
+                a[base + offset] *= reciprocal;
+            }
+        } else {
+            // A reciprocal would overflow even when every multiplier is finite.
+            for offset in 1..=below {
+                a[base + offset] /= pivot;
+            }
+        }
+        for trailing in col + 1..=last_affected {
+            let row = diagonal + col - trailing + trailing * stride;
+            let alpha = -a[row];
+            if alpha != 0.0 {
+                for offset in 1..=below {
+                    a[row + offset] += alpha * a[base + offset];
+                }
+            }
+        }
+    }
+    nonsingular
+}
+
+/// Solve from the interleaved pivoted band factors, applying each permutation
+/// just before its lower-triangular update, then back-substituting through U.
+fn band_lu_solve(a: &[f64], ipvt: &[usize], n: usize, lower: usize, upper: usize, b: &mut [f64]) {
+    let diagonal = lower + upper;
+    let stride = 2 * lower + upper + 1;
+    for col in 0..n {
+        b.swap(col, ipvt[col]);
+        let alpha = -b[col];
+        for offset in 1..=lower.min(n - col - 1) {
+            b[col + offset] += alpha * a[diagonal + offset + col * stride];
+        }
+    }
+    for col in (0..n).rev() {
+        if b[col] != 0.0 {
+            b[col] /= a[diagonal + col * stride];
+            let alpha = -b[col];
+            for row in (col.saturating_sub(diagonal)..col).rev() {
+                b[row] += alpha * a[diagonal + row - col + col * stride];
+            }
+        }
+    }
+}
+
 /// How one pass of the corrector ended (`stoda_corrector_loop`'s exits).
 enum Corrector {
     /// Converged after `m` extra iterations with last correction norm `del` (label 450).
@@ -364,6 +465,9 @@ pub(crate) struct LsodaSetup {
     pub mxstep: usize,
     /// `jac` for `jt = 1`; `None` is `jt = 2`, a finite-difference Jacobian.
     pub jac: Option<JacFn>,
+    /// Validated `(lower, upper)` bandwidths. Selects `jt = 4` or `5` instead;
+    /// the analytic callback then follows the compact packed-band convention.
+    pub bandwidth: Option<(usize, usize)>,
 }
 
 /// The state of one LSODA integration: SciPy's `lsoda_common_struct_t` (the Fortran common
@@ -373,6 +477,7 @@ pub(crate) struct Lsoda {
     rtol: Vec<f64>,
     atol: Vec<f64>,
     jac: Option<JacFn>,
+    bandwidth: Option<(usize, usize)>,
     h0: f64,
     hmxi: f64,
     /// Always 0: SciPy 1.17.1 never stores `rwork[6]` in the common block (module docs).
@@ -443,7 +548,8 @@ pub(crate) struct Lsoda {
     ewt: Vec<f64>,
     savf: Vec<f64>,
     acor: Vec<f64>,
-    /// The LU factors of `P = I - h el0 J`, column-major (`wm[2..]`).
+    /// The LU factors of `P = I - h el0 J`, dense or extended band column-major
+    /// storage (`wm[2..]`). Band storage reserves lower rows for pivot fill-in.
     wm: Vec<f64>,
     ipvt: Vec<usize>,
     /// `stoda`'s `y` argument: predicted and corrected values, scratch between calls.
@@ -453,12 +559,21 @@ pub(crate) struct Lsoda {
 impl Lsoda {
     /// An LSODA problem of `n` equations that has not taken its first call (istate = 1).
     pub(crate) fn new(n: usize, setup: LsodaSetup) -> Self {
-        let jtyp = if setup.jac.is_some() { 1 } else { 2 };
+        let jtyp = match (setup.bandwidth, setup.jac) {
+            (None, Some(_)) => 1,
+            (None, None) => 2,
+            (Some(_), Some(_)) => 4,
+            (Some(_), None) => 5,
+        };
+        let matrix_rows = setup
+            .bandwidth
+            .map_or(n, |(lower, upper)| 2 * lower + upper + 1);
         Self {
             n,
             rtol: setup.rtol,
             atol: setup.atol,
             jac: setup.jac,
+            bandwidth: setup.bandwidth,
             h0: setup.h0,
             hmxi: if setup.hmax > 0.0 {
                 1.0 / setup.hmax
@@ -521,7 +636,7 @@ impl Lsoda {
             ewt: vec![0.0; n],
             savf: vec![0.0; n],
             acor: vec![0.0; n],
-            wm: vec![0.0; n * n],
+            wm: vec![0.0; n * matrix_rows],
             ipvt: vec![0; n],
             y: vec![0.0; n],
         }
@@ -1380,7 +1495,11 @@ impl Lsoda {
                 for i in 0..n {
                     self.y[i] = self.h * self.savf[i] - (self.yh[i + n] + self.acor[i]);
                 }
-                lu_solve(&self.wm, &self.ipvt, n, &mut self.y);
+                if let Some((lower, upper)) = self.bandwidth {
+                    band_lu_solve(&self.wm, &self.ipvt, n, lower, upper, &mut self.y);
+                } else {
+                    lu_solve(&self.wm, &self.ipvt, n, &mut self.y);
+                }
                 del = vmnorm(&self.y, &self.ewt);
                 for i in 0..n {
                     self.acor[i] += self.y[i];
@@ -1456,6 +1575,9 @@ impl Lsoda {
         self.lu_ok = true;
         self.jcur = true;
         let hl0 = self.h * self.el0;
+        if let Some((lower, upper)) = self.bandwidth {
+            return self.prja_banded(f, lower, upper, hl0);
+        }
         match (self.miter, self.jac) {
             (1, Some(jac)) => {
                 let rows = jac(self.tn, &self.y);
@@ -1497,6 +1619,98 @@ impl Lsoda {
             self.wm[i + i * n] += 1.0;
         }
         self.lu_ok = lu_factor(&mut self.wm, &mut self.ipvt, n);
+        Ok(())
+    }
+
+    /// Banded DPRJA: disjoint column supports allow `lower + upper + 1`
+    /// perturbation groups. Both analytic and numerical paths build only the
+    /// declared band and keep the factors compact throughout Newton iteration.
+    fn prja_banded<F>(
+        &mut self,
+        f: &mut F,
+        lower: usize,
+        upper: usize,
+        hl0: f64,
+    ) -> Result<(), LsodaFailure>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        let n = self.n;
+        let width = lower + upper + 1;
+        let stride = width + lower;
+        let diagonal = lower + upper;
+        self.wm.fill(0.0);
+        if let Some(jac) = self.jac {
+            let rows = jac(self.tn, &self.y);
+            if rows.len() != width || rows.iter().any(|row| row.len() != n) {
+                return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
+                    crate::IntegrateValidationError::BandedJacobianWrongShape {
+                        expected_rows: width,
+                        expected_cols: n,
+                    },
+                )));
+            }
+            if rows.iter().flatten().any(|value| !value.is_finite()) {
+                return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
+                    crate::IntegrateValidationError::NonFiniteJacobian,
+                )));
+            }
+            for col in 0..n {
+                for row in col.saturating_sub(upper)..=(col + lower).min(n - 1) {
+                    self.wm[diagonal + row - col + col * stride] =
+                        -hl0 * rows[upper + row - col][col];
+                }
+            }
+        } else {
+            let mut r0 =
+                1000.0 * self.h.abs() * self.uround * n as f64 * vmnorm(&self.savf, &self.ewt);
+            if r0 == 0.0 {
+                r0 = 1.0;
+            }
+            let srur = self.uround.sqrt();
+            for group in 0..width.min(n) {
+                for col in (group..n).step_by(width) {
+                    let increment = (srur * self.y[col].abs()).max(r0 / self.ewt[col]);
+                    self.y[col] += increment;
+                }
+                if self.y.iter().any(|value| !value.is_finite()) {
+                    self.y.copy_from_slice(&self.yh[..n]);
+                    return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
+                        crate::IntegrateValidationError::NonFiniteJacobian,
+                    )));
+                }
+                let evaluated = eval(f, self.tn, &self.y, &mut self.acor);
+                // The predicted state is restored even if the callback fails.
+                for col in (group..n).step_by(width) {
+                    self.y[col] = self.yh[col];
+                }
+                evaluated?;
+                self.nfe += 1;
+                if self.acor.iter().any(|value| !value.is_finite()) {
+                    return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
+                        crate::IntegrateValidationError::NonFiniteJacobian,
+                    )));
+                }
+                for col in (group..n).step_by(width) {
+                    let increment = (srur * self.y[col].abs()).max(r0 / self.ewt[col]);
+                    let factor = -hl0 / increment;
+                    for row in col.saturating_sub(upper)..=(col + lower).min(n - 1) {
+                        self.wm[diagonal + row - col + col * stride] =
+                            (self.acor[row] - self.savf[row]) * factor;
+                    }
+                }
+            }
+        }
+        if self.wm.iter().any(|value| !value.is_finite()) {
+            return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
+                crate::IntegrateValidationError::NonFiniteJacobian,
+            )));
+        }
+        self.pdnorm = band_norm(n, &self.wm, lower, upper, &self.ewt) / hl0.abs();
+        for col in 0..n {
+            self.wm[diagonal + col * stride] += 1.0;
+        }
+        self.lu_ok = band_lu_factor(&mut self.wm, &mut self.ipvt, n, lower, upper);
         Ok(())
     }
 }
@@ -1544,6 +1758,126 @@ mod tests {
         let mut singular = vec![1.0, 2.0, 2.0, 4.0];
         let mut ipvt = vec![0; 2];
         assert!(!lu_factor(&mut singular, &mut ipvt, 2));
+    }
+
+    #[test]
+    fn band_lu_preserves_backward_error_with_pivots_and_asymmetric_bands() {
+        let mut state = 0x9482_1736_ead4_109b_u64;
+        let mut pivot_count = 0;
+        for n in [1, 2, 5, 11] {
+            for lower in 0..n {
+                for upper in 0..n {
+                    let stride = 2 * lower + upper + 1;
+                    let diagonal = lower + upper;
+                    let mut dense = vec![0.0; n * n];
+                    let mut band = vec![0.0; n * stride];
+                    for col in 0..n {
+                        for row in col.saturating_sub(upper)..=(col + lower).min(n - 1) {
+                            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let value = (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5;
+                            dense[row + col * n] = value;
+                            band[diagonal + row - col + col * stride] = value;
+                        }
+                    }
+                    let weights: Vec<_> = (0..n).map(|i| 1.0 + i as f64).collect();
+                    assert_eq!(
+                        band_norm(n, &band, lower, upper, &weights),
+                        fnorm(n, &dense, &weights),
+                        "band norm ({lower}, {upper}), n={n}"
+                    );
+                    let mut pivots = vec![0; n];
+                    assert!(band_lu_factor(&mut band, &mut pivots, n, lower, upper));
+                    pivot_count += pivots.iter().enumerate().filter(|&(i, &p)| i != p).count();
+                    // Two independent right-hand sides reuse the same factorization.
+                    for sign in [-1.0, 1.0] {
+                        let wanted: Vec<_> = (0..n).map(|i| sign * (i as f64 + 1.0)).collect();
+                        let rhs: Vec<_> = (0..n)
+                            .map(|row| (0..n).map(|col| dense[row + col * n] * wanted[col]).sum())
+                            .collect();
+                        let mut x = rhs.clone();
+                        band_lu_solve(&band, &pivots, n, lower, upper, &mut x);
+                        for row in 0..n {
+                            let ax: f64 = (0..n).map(|col| dense[row + col * n] * x[col]).sum();
+                            let scale = rhs[row].abs()
+                                + (0..n)
+                                    .map(|col| (dense[row + col * n] * x[col]).abs())
+                                    .sum::<f64>();
+                            assert!(
+                                (ax - rhs[row]).abs() <= 64.0 * n as f64 * f64::EPSILON * scale,
+                                "band ({lower}, {upper}), n={n}, row={row}: {x:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            pivot_count > 100,
+            "the pivoting path must actually be exercised"
+        );
+    }
+
+    #[test]
+    fn band_lu_reports_singular_and_handles_subnormal_pivots() {
+        let mut singular = vec![0.0; 4 * 3];
+        assert!(!band_lu_factor(&mut singular, &mut [0; 3], 3, 1, 1));
+
+        // Lower triangular [[1e-310, 0], [2e-311, 2e-310]]: forming 1/pivot
+        // overflows, although its multipliers and the answer are well-defined.
+        let mut tiny = vec![0.0, 1e-310, 2e-311, 0.0, 2e-310, 0.0];
+        let mut pivots = [0; 2];
+        assert!(band_lu_factor(&mut tiny, &mut pivots, 2, 1, 0));
+        let mut rhs = [1e-310, 4.2e-310];
+        band_lu_solve(&tiny, &pivots, 2, 1, 0, &mut rhs);
+        assert!((rhs[0] - 1.0).abs() < 1e-12);
+        assert!((rhs[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn banded_newton_workspace_and_differencing_are_linear_in_dimension() {
+        let n = 10_000;
+        let mut solver = Lsoda::new(
+            n,
+            LsodaSetup {
+                rtol: vec![1e-6],
+                atol: vec![1e-9],
+                h0: 0.0,
+                hmax: 0.0,
+                mxstep: 500,
+                jac: None,
+                bandwidth: Some((1, 1)),
+            },
+        );
+        assert_eq!(solver.wm.len(), 4 * n);
+        solver.h = 0.25;
+        solver.el0 = 1.0;
+        solver.ewt.fill(1.0);
+        solver.y.fill(1.0);
+        solver.yh[..n].fill(1.0);
+        let mut calls = 0;
+        let mut rhs = |_t: f64, y: &[f64]| {
+            calls += 1;
+            (0..n)
+                .map(|i| {
+                    -4.0 * y[i]
+                        + if i > 0 { y[i - 1] } else { 0.0 }
+                        + if i + 1 < n { y[i + 1] } else { 0.0 }
+                })
+                .collect::<Vec<_>>()
+        };
+        solver.savf = rhs(0.0, &solver.y);
+        solver.prja(&mut rhs).unwrap();
+        assert_eq!(calls, 4, "one baseline plus three disjoint column groups");
+        assert_eq!(solver.nfe, 3);
+        assert_eq!(solver.nje, 1);
+        assert!(solver.lu_ok);
+        assert!(solver.y.iter().all(|&value| value == 1.0));
+        // P = I - 0.25*J, and P*1 is 1.5 inside, 1.75 at either edge.
+        let mut b = vec![1.5; n];
+        b[0] = 1.75;
+        b[n - 1] = 1.75;
+        band_lu_solve(&solver.wm, &solver.ipvt, n, 1, 1, &mut b);
+        assert!(b.iter().all(|&value| (value - 1.0).abs() < 1e-14));
     }
 
     /// vmnorm/fnorm follow C's fmax: a NaN component does not poison the norm.

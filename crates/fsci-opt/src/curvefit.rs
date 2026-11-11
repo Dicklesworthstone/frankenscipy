@@ -2562,7 +2562,7 @@ mod tests {
             }
             self.products.fetch_add(1, Ordering::Relaxed);
             if x.iter().filter(|&&value| value != 0.0).count() == 1
-                && x.iter().any(|&value| value == 1.0)
+                && x.contains(&1.0)
             {
                 self.basis_probes.fetch_add(1, Ordering::Relaxed);
             }
@@ -2623,7 +2623,7 @@ mod tests {
             assert_eq!(basis_probes.load(Ordering::Relaxed), 0);
             let count = products.load(Ordering::Relaxed);
             assert!(
-                count > 0 && count < 128,
+                (1..128).contains(&count),
                 "{method:?}: {count} products for {n} columns"
             );
         }
@@ -2705,10 +2705,7 @@ mod tests {
                 ..LeastSquaresOptions::default()
             },
         );
-        assert!(matches!(
-            wrong_shape,
-            Err(OptError::InvalidArgument { .. })
-        ));
+        assert!(matches!(wrong_shape, Err(OptError::InvalidArgument { .. })));
 
         for sigma in [None, Some(CurveFitSigma::Scalar(2.0))] {
             let fitted = curve_fit(

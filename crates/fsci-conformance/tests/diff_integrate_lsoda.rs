@@ -616,6 +616,8 @@ fn run_fsci(case: &Case) -> Result<Observed, String> {
             max_step: case.max_step.unwrap_or(f64::INFINITY),
             first_step: case.first_step,
             jac,
+            lband: None,
+            uband: None,
             mode: RuntimeMode::Strict,
         })
         .map_err(|e| format!("{e:?}"))?;

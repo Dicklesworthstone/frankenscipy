@@ -197,6 +197,15 @@ pub enum IntegrateValidationError {
     JacobianWrongShape {
         expected: usize,
     },
+    BandedJacobianWrongShape {
+        expected_rows: usize,
+        expected_cols: usize,
+    },
+    InvalidJacobianBandwidth {
+        lower: usize,
+        upper: usize,
+        dimension: usize,
+    },
     InvalidJacobianSparsity {
         message: String,
     },
@@ -261,6 +270,21 @@ impl std::fmt::Display for IntegrateValidationError {
             Self::JacobianWrongShape { expected } => {
                 write!(f, "`jac` must have shape ({expected}, {expected}).")
             }
+            Self::BandedJacobianWrongShape {
+                expected_rows,
+                expected_cols,
+            } => write!(
+                f,
+                "packed `jac` must have shape ({expected_rows}, {expected_cols})."
+            ),
+            Self::InvalidJacobianBandwidth {
+                lower,
+                upper,
+                dimension,
+            } => write!(
+                f,
+                "LSODA Jacobian bandwidths ({lower}, {upper}) must each be smaller than the state dimension {dimension}."
+            ),
             Self::InvalidJacobianSparsity { message } => {
                 write!(f, "invalid `jac_sparsity`: {message}.")
             }
@@ -316,6 +340,8 @@ impl IntegrateValidationError {
             Self::NonFiniteF0 => "non_finite_f0",
             Self::RhsWrongShape { .. } => "rhs_wrong_shape",
             Self::JacobianWrongShape { .. } => "jacobian_wrong_shape",
+            Self::BandedJacobianWrongShape { .. } => "banded_jacobian_wrong_shape",
+            Self::InvalidJacobianBandwidth { .. } => "invalid_jacobian_bandwidth",
             Self::InvalidJacobianSparsity { .. } => "invalid_jacobian_sparsity",
             Self::NonFiniteJacobian => "non_finite_jacobian",
             Self::NonFiniteEventDirection { .. } => "event_direction_must_be_finite",

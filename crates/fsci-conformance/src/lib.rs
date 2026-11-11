@@ -8428,6 +8428,8 @@ fn execute_integrate_solve_ivp(case: &IntegrateCase) -> IntegrateObserved {
         mode: case.mode,
         jac: None,
         jac_sparsity: None,
+        lband: None,
+        uband: None,
     };
     let mut rhs_mut = rhs_fn;
     match fsci_integrate::solve_ivp(&mut rhs_mut, &opts) {

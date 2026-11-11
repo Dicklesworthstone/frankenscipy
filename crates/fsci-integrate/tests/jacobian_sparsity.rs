@@ -1,4 +1,5 @@
-//! Public BDF/Radau sparsity regressions and an opt-in live SciPy comparison.
+//! Public BDF/Radau sparsity and LSODA banded-Jacobian regressions, including
+//! live SciPy comparisons.
 
 use fsci_integrate::{
     IntegrateValidationError, JacobianSparsity, SolveIvpOptions, SolverKind, ToleranceValue,
@@ -433,4 +434,251 @@ print(json.dumps(dict(version=scipy.__version__, numpy=np.__version__, results=r
         }
     }
     assert_eq!(compared, 1024, "all eight solutions must be compared");
+}
+
+fn banded_rhs(problem: &str, y: &[f64]) -> Vec<f64> {
+    let n = y.len();
+    (0..n)
+        .map(|i| match problem {
+            "diagonal" => -10.0_f64.powf(i as f64 / 7.0) * y[i],
+            "lower" => {
+                (20.0 + i as f64).powi(2)
+                    * (if i == 0 { 1.0 } else { y[i - 1] } - y[i])
+            }
+            "upper" => {
+                (20.0 + i as f64).powi(2)
+                    * (if i + 1 == n { 1.0 } else { y[i + 1] } - y[i])
+            }
+            _ => {
+                let left = if i == 0 { 0.0 } else { y[i - 1] };
+                let right = if i + 1 == n { 0.0 } else { y[i + 1] };
+                200.0 * (left - 2.0 * y[i] + right)
+                    + if problem == "nonlinear" {
+                        y[i] * (1.0 - y[i])
+                    } else {
+                        -0.5 * y[i]
+                    }
+            }
+        })
+        .collect()
+}
+
+fn packed_band_jacobian(problem: &str, y: &[f64]) -> Vec<Vec<f64>> {
+    let (lower, upper) = match problem {
+        "diagonal" => (0, 0),
+        "lower" => (1, 0),
+        "upper" => (0, 1),
+        _ => (1, 1),
+    };
+    let n = y.len();
+    let mut matrix = vec![vec![0.0; n]; lower + upper + 1];
+    for j in 0..n {
+        matrix[upper][j] = match problem {
+            "diagonal" => -10.0_f64.powf(j as f64 / 7.0),
+            "lower" | "upper" => -(20.0 + j as f64).powi(2),
+            "nonlinear" => -400.0 + (1.0 - 2.0 * y[j]),
+            _ => -400.5,
+        };
+        if lower > 0 && j + 1 < n {
+            matrix[upper + 1][j] = if problem == "lower" {
+                (21.0 + j as f64).powi(2)
+            } else {
+                200.0
+            };
+        }
+        if upper > 0 && j > 0 {
+            matrix[upper - 1][j] = if problem == "upper" {
+                (19.0 + j as f64).powi(2)
+            } else {
+                200.0
+            };
+        }
+    }
+    matrix
+}
+
+/// The diagonal and both asymmetric bands exercise every packed-storage edge.
+/// The nonlinear reaction/diffusion system forces Jacobian refreshes. Every
+/// case also samples retained dense output between the requested output times.
+#[test]
+fn lsoda_banded_jacobians_match_live_scipy() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = std::process::Command::new(&python)
+        .args(["-c", "import scipy, numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP LSODA banded oracle: missing SciPy; compared cases = 0");
+        return;
+    }
+    let output = std::process::Command::new(&python)
+        .args([
+            "-c",
+            r#"
+import json, os
+import numpy as np
+import scipy
+from scipy.integrate import solve_ivp
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+n = 32
+times = [0., .001, .01, .1, .5, 1., 2.]
+samples = [.003, .03, .3, .9, 1.7]
+rows = []
+for kind in ['heat', 'lower', 'upper', 'diagonal', 'nonlinear']:
+    rates = 10.**(np.arange(n)/7.)
+    y0 = (1 + np.arange(n)/n if kind == 'diagonal' else
+          np.zeros(n) if kind in ['lower', 'upper'] else
+          np.array([np.sin((i+1)*np.pi/(n+1)) + .2*np.sin(17*(i+1)*np.pi/(n+1)) for i in range(n)]))
+    lb, ub = {'heat': (1,1), 'nonlinear': (1,1), 'lower': (1,0), 'upper': (0,1), 'diagonal': (0,0)}[kind]
+    def fun(t, y):
+        if kind == 'diagonal': return -rates*y
+        if kind == 'lower': return np.array([(20+i)**2*((y[i-1] if i else 1.)-y[i]) for i in range(n)])
+        if kind == 'upper': return np.array([(20+i)**2*((y[i+1] if i+1<n else 1.)-y[i]) for i in range(n)])
+        return np.array([200.*((y[i-1] if i else 0.)-2*y[i]+(y[i+1] if i+1<n else 0.)) +
+                         (y[i]*(1-y[i]) if kind == 'nonlinear' else -.5*y[i]) for i in range(n)])
+    def jac(t, y):
+        a = np.zeros((lb+ub+1, n))
+        for j in range(n):
+            a[ub,j] = (-rates[j] if kind == 'diagonal' else -(20+j)**2 if kind in ['lower','upper'] else
+                       -400. + (1.-2*y[j] if kind == 'nonlinear' else -.5))
+            if lb and j+1<n: a[ub+1,j] = (21+j)**2 if kind == 'lower' else 200.
+            if ub and j: a[ub-1,j] = (19+j)**2 if kind == 'upper' else 200.
+        return a
+    for analytic in [False, True]:
+        r = solve_ivp(fun, (0.,2.), y0, method='LSODA', rtol=1e-8, atol=1e-10,
+                      lband=lb, uband=ub, jac=jac if analytic else None,
+                      t_eval=times, dense_output=True)
+        assert r.success and r.nlu > 0, (kind, analytic, r.message)
+        row = dict(problem=kind, analytic=analytic, y=r.y.T.tolist(), dense=r.sol(samples).T.tolist(),
+                   nfev=r.nfev, njev=r.njev, nlu=r.nlu)
+        if kind == 'heat':
+            def event(t,y): return y[n//2]-.1
+            event.terminal = True
+            event.direction = -1
+            stopped = solve_ivp(fun, (0.,2.), y0, method='LSODA', rtol=1e-8, atol=1e-10,
+                                lband=lb, uband=ub, jac=jac if analytic else None, events=event)
+            assert stopped.status == 1 and len(stopped.t_events[0]) == 1
+            row['event_time'] = stopped.t_events[0][0]
+        rows.append(row)
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows), allow_nan=False))
+"#,
+        ])
+        .output()
+        .expect("launch banded LSODA SciPy oracle");
+    assert!(
+        output.status.success(),
+        "SciPy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 10);
+    let n = 32;
+    let times = [0.0, 0.001, 0.01, 0.1, 0.5, 1.0, 2.0];
+    let samples = [0.003, 0.03, 0.3, 0.9, 1.7];
+    let mut compared = 0;
+    let mut compared_values = 0;
+    for row in rows {
+        let problem = row["problem"].as_str().unwrap();
+        let analytic = row["analytic"].as_bool().unwrap();
+        let (lower, upper) = match problem {
+            "diagonal" => (0, 0),
+            "lower" => (1, 0),
+            "upper" => (0, 1),
+            _ => (1, 1),
+        };
+        let y0: Vec<_> = (0..n)
+            .map(|i| match problem {
+                "diagonal" => 1.0 + i as f64 / n as f64,
+                "lower" | "upper" => 0.0,
+                _ => {
+                    let angle = (i + 1) as f64 * std::f64::consts::PI / (n + 1) as f64;
+                    angle.sin() + 0.2 * (17.0 * angle).sin()
+                }
+            })
+            .collect();
+        let jac: fsci_integrate::JacFn = match problem {
+            "diagonal" => |_, y| packed_band_jacobian("diagonal", y),
+            "lower" => |_, y| packed_band_jacobian("lower", y),
+            "upper" => |_, y| packed_band_jacobian("upper", y),
+            "nonlinear" => |_, y| packed_band_jacobian("nonlinear", y),
+            _ => |_, y| packed_band_jacobian("heat", y),
+        };
+        let options = SolveIvpOptions {
+            t_span: (0.0, 2.0),
+            y0: &y0,
+            method: SolverKind::Lsoda,
+            t_eval: Some(&times),
+            dense_output: true,
+            rtol: 1e-8,
+            atol: ToleranceValue::Scalar(1e-10),
+            lband: Some(lower),
+            uband: Some(upper),
+            jac: analytic.then_some(jac),
+            ..SolveIvpOptions::default()
+        };
+        let result = solve_ivp(&mut |_, y| banded_rhs(problem, y), &options).unwrap();
+        assert!(result.success, "{problem}/{analytic}: {}", result.message);
+        assert!(
+            result.nlu > 0 && result.njev > 0,
+            "banded stiff path must execute"
+        );
+        let dense = result.sol.as_ref().unwrap().evaluate_many(&samples).unwrap();
+        let mut max_scaled_error = 0.0_f64;
+        for (actual, key) in [(&result.y, "y"), (&dense, "dense")] {
+            let expected = row[key].as_array().unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (actual_row, expected_row) in actual.iter().zip(expected) {
+                let expected_row = expected_row.as_array().unwrap();
+                assert_eq!(actual_row.len(), expected_row.len());
+                for (&actual, expected) in actual_row.iter().zip(expected_row) {
+                    let expected = expected.as_f64().unwrap();
+                    let scaled =
+                        (actual - expected).abs() / (1e-10 + 1e-8 * expected.abs());
+                    // Global error accumulates over many locally controlled
+                    // steps; both solutions must stay within 50 local scales.
+                    assert!(
+                        actual.is_finite() && scaled <= 50.0,
+                        "{problem}/{analytic}/{key}: {actual} vs {expected}, scaled={scaled}"
+                    );
+                    max_scaled_error = max_scaled_error.max(scaled);
+                    compared_values += 1;
+                }
+            }
+        }
+        if problem == "heat" {
+            let stopped = solve_ivp(
+                &mut |_, y| banded_rhs(problem, y),
+                &SolveIvpOptions {
+                    t_eval: None,
+                    events: Some(vec![
+                        fsci_integrate::EventSpec::terminal(|_, y| y[y.len() / 2] - 0.1)
+                            .with_direction(-1.0),
+                    ]),
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(stopped.status, 1);
+            let event_time = stopped.t_events.as_ref().unwrap()[0][0];
+            let expected = row["event_time"].as_f64().unwrap();
+            // At this root |dy/dt| exceeds 0.2; the state-error contract
+            // gives a time error below 1e-6.
+            assert!((event_time - expected).abs() < 1e-6);
+        }
+        eprintln!(
+            "LSODA {problem}/analytic={analytic}: max_scaled={max_scaled_error:e}, nfev/njev/nlu={}/{}/{}; SciPy {}/{}/{}",
+            result.nfev, result.njev, result.nlu, row["nfev"], row["njev"], row["nlu"]
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 10);
+    assert_eq!(compared_values, 3840);
+    eprintln!(
+        "Banded LSODA compared cases={compared}, values={compared_values}; SciPy {}, NumPy {}",
+        oracle["scipy"], oracle["numpy"]
+    );
 }
