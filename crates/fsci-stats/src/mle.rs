@@ -6,13 +6,218 @@
 //! parameters; [`MleParameter::Fixed`] holds a parameter exactly constant. This
 //! also supports distributions whose concrete type has fixed location or scale.
 //! No method-of-moments estimate is returned as a successful MLE.
+//!
+//! [`LocationScale`] supplies the affine distribution `loc + scale * Z` for any
+//! continuous base distribution. [`fit_mle_location_scale`] and
+//! [`fit_mle_location_scale_censored`] fit its shapes, location, and scale with
+//! the same explicit bounds and fixed-parameter masks.
 
 use fsci_opt::{MinimizeMethodOptions, MinimizeOptions, OptimizeMethod, minimize};
+use rand::Rng;
 
 use crate::{
-    CensoredData, ContinuousDistribution, FitError, RuntimeMode, active_stats_mode,
+    CensoredData, ContinuousDistribution, FitError, RuntimeMode, StatsError, active_stats_mode,
     hardened_max_sample_len,
 };
+
+/// The continuous distribution of `X = loc + scale * Z` for a base `Z`.
+///
+/// Location must be finite and scale must be positive and finite. Parameters
+/// are immutable so evaluation cannot invalidate these constraints. The base
+/// distribution retains responsibility for validating its own parameters.
+/// Log densities, log tails, and inverse survival probabilities delegate to the
+/// corresponding base methods without first rounding ordinary probabilities.
+///
+/// Use [`fit_mle_location_scale`] or [`fit_mle_location_scale_censored`] to fit
+/// shapes together with location and scale. A generic adapter cannot infer the
+/// base family's shape parameterization, so its trait-level `try_fit` retains
+/// the default [`FitError::NotImplemented`] behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocationScale<D> {
+    base: D,
+    loc: f64,
+    scale: f64,
+    log_scale: f64,
+}
+
+impl<D> LocationScale<D> {
+    /// Construct an affine distribution, rejecting a nonfinite location or a
+    /// nonpositive/nonfinite scale without panicking.
+    pub fn new(base: D, loc: f64, scale: f64) -> Result<Self, StatsError> {
+        if !loc.is_finite() || !scale.is_finite() || scale <= 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "location must be finite and scale must be positive and finite".into(),
+            ));
+        }
+        Ok(Self {
+            base,
+            loc,
+            scale,
+            log_scale: scale.ln(),
+        })
+    }
+
+    /// The base distribution, before the affine transformation.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.base
+    }
+
+    /// The additive location parameter.
+    #[must_use]
+    pub fn loc(&self) -> f64 {
+        self.loc
+    }
+
+    /// The positive multiplicative scale parameter.
+    #[must_use]
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Recover the base distribution and affine parameters.
+    #[must_use]
+    pub fn into_parts(self) -> (D, f64, f64) {
+        (self.base, self.loc, self.scale)
+    }
+
+    fn standardize(&self, x: f64) -> f64 {
+        let difference = x - self.loc;
+        if difference.is_infinite() && x.is_finite() {
+            // Opposite-sign finite inputs can overflow subtraction even when
+            // their standardized difference is representable. Dividing first
+            // is safe here because the two terms cannot cancel.
+            x / self.scale - self.loc / self.scale
+        } else {
+            difference / self.scale
+        }
+    }
+
+    fn transform(&self, z: f64) -> f64 {
+        // A fused operation also handles cancellation when scale*z alone
+        // would overflow but adding location gives a finite quantile or mean.
+        self.scale.mul_add(z, self.loc)
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for LocationScale<D> {
+    fn pdf(&self, x: f64) -> f64 {
+        let z = self.standardize(x);
+        let base_density = self.base.pdf(z);
+        let density = base_density / self.scale;
+        if base_density.is_subnormal() || density == 0.0 || density.is_infinite() {
+            // A small scale can rescue a base density that underflows, and a
+            // large scale can rescue one that overflows. Subnormal base
+            // densities also lose relative precision before the rescaling.
+            (self.base.logpdf(z) - self.log_scale).exp()
+        } else {
+            density
+        }
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        self.base.logpdf(self.standardize(x)) - self.log_scale
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        self.base.cdf(self.standardize(x))
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        self.base.logcdf(self.standardize(x))
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        self.base.sf(self.standardize(x))
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        self.base.logsf(self.standardize(x))
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        self.transform(self.base.ppf(q))
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        self.transform(self.base.isf(q))
+    }
+
+    fn cdf_sf_is_cheap(&self) -> bool {
+        self.base.cdf_sf_is_cheap()
+    }
+
+    fn cdf_sf_par_min(&self) -> usize {
+        self.base.cdf_sf_par_min()
+    }
+
+    fn ppf_isf_is_cheap(&self) -> bool {
+        self.base.ppf_isf_is_cheap()
+    }
+
+    fn ppf_isf_par_min(&self) -> usize {
+        self.base.ppf_isf_par_min()
+    }
+
+    fn mean(&self) -> f64 {
+        self.transform(self.base.mean())
+    }
+
+    fn var(&self) -> f64 {
+        // Multiplying the variance first avoids a spurious infinity or zero
+        // from scale*scale when the final scaled variance is representable.
+        self.scale * (self.scale * self.base.var())
+    }
+
+    fn std(&self) -> f64 {
+        self.scale * self.base.std()
+    }
+
+    fn entropy(&self) -> f64 {
+        self.base.entropy() + self.log_scale
+    }
+
+    fn try_entropy(&self) -> Result<f64, StatsError> {
+        self.base.try_entropy().map(|value| value + self.log_scale)
+    }
+
+    fn median(&self) -> f64 {
+        self.transform(self.base.median())
+    }
+
+    fn mode(&self) -> f64 {
+        self.transform(self.base.mode())
+    }
+
+    fn skewness(&self) -> f64 {
+        self.base.skewness()
+    }
+
+    fn try_skewness(&self) -> Result<f64, StatsError> {
+        self.base.try_skewness()
+    }
+
+    fn kurtosis(&self) -> f64 {
+        self.base.kurtosis()
+    }
+
+    fn try_kurtosis(&self) -> Result<f64, StatsError> {
+        self.base.try_kurtosis()
+    }
+
+    fn interval(&self, alpha: f64) -> (f64, f64) {
+        let (lower, upper) = self.base.interval(alpha);
+        (self.transform(lower), self.transform(upper))
+    }
+
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        let mut values = self.base.rvs(n, rng);
+        for value in &mut values {
+            *value = self.transform(*value);
+        }
+        values
+    }
+}
 
 /// Borrow both representations so censoring never mutates the caller's data or
 /// allocates an observation vector on every likelihood evaluation.
@@ -392,7 +597,7 @@ impl MleParameter {
     }
 }
 
-/// Budgets and stopping tolerances for [`fit_mle`] and [`fit_mle_censored`].
+/// Budgets and stopping tolerances for the continuous MLE drivers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MleOptions {
     pub max_iterations: usize,
@@ -418,7 +623,8 @@ impl Default for MleOptions {
 /// A converged maximum-likelihood fit and its unpenalized likelihood.
 ///
 /// Like SciPy's local fitting optimizer, this does not certify a global maximum.
-/// `parameters` includes fixed values in the original factory order.
+/// `parameters` includes fixed values in the supplied order. The location/scale
+/// helpers append location and scale after the base family's shapes.
 #[derive(Debug)]
 pub struct MleResult<D> {
     pub distribution: D,
@@ -519,6 +725,124 @@ where
         MleSample::Censored(data),
         parameters,
         make_distribution,
+        options,
+    )
+}
+
+/// Fit a continuous family's shapes, location, and scale to exact observations.
+///
+/// `make_standard` receives only `shape_parameters`, in their supplied order,
+/// and must return `None` outside the shape domain. It should construct the
+/// family's standard form with any intrinsic location and scale held fixed
+/// (usually zero and one). Fitting an intrinsic location/scale as a shape as
+/// well as the outer location/scale generally makes the model unidentifiable.
+/// The returned distribution is `location + scale * make_standard(shapes)`.
+///
+/// Every shape, location, and scale can be fixed with [`MleParameter::Fixed`]
+/// or constrained by the other [`MleParameter`] variants. Use
+/// [`MleParameter::Positive`] for a free scale; every trial scale is also
+/// required to be positive and finite by [`LocationScale`]. Result parameters
+/// are ordered `[shapes..., location, scale]`, including fixed values exactly.
+/// Budgets, likelihood validation, runtime limits, and local convergence have
+/// the same meanings as in [`fit_mle`].
+///
+/// ```
+/// use fsci_stats::{ContinuousDistribution, GammaDist, MleOptions, MleParameter};
+/// use fsci_stats::fit_mle_location_scale;
+///
+/// let result = fit_mle_location_scale(
+///     &[3.2, 3.8, 4.5, 5.0, 6.1, 8.0],
+///     &[MleParameter::Fixed(2.0)],
+///     MleParameter::Fixed(3.0),
+///     MleParameter::Positive(1.0),
+///     |shapes| Some(GammaDist { a: shapes[0], scale: 1.0 }),
+///     MleOptions::default(),
+/// ).unwrap();
+/// assert_eq!(result.distribution.loc(), 3.0);
+/// assert_eq!(result.distribution.base().a, 2.0);
+/// assert!(result.distribution.cdf(5.0) > 0.0);
+/// ```
+pub fn fit_mle_location_scale<D, F>(
+    data: &[f64],
+    shape_parameters: &[MleParameter],
+    location: MleParameter,
+    scale: MleParameter,
+    make_standard: F,
+    options: MleOptions,
+) -> Result<MleResult<LocationScale<D>>, FitError>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    fit_mle_location_scale_sample(
+        MleSample::Exact(data),
+        shape_parameters,
+        location,
+        scale,
+        make_standard,
+        options,
+    )
+}
+
+/// Fit shapes, location, and scale to exact and censored observations.
+///
+/// The parameterization and result ordering match [`fit_mle_location_scale`].
+/// Exact observations contribute the affine density, including its `1/scale`
+/// Jacobian. Censored observations contribute probabilities, so they receive
+/// no density Jacobian. Logarithmic tails are evaluated in standardized
+/// coordinates; finite intervals use the stable differences described in
+/// [`fit_mle_censored`]. The input observations are never transformed in place.
+pub fn fit_mle_location_scale_censored<D, F>(
+    data: &CensoredData,
+    shape_parameters: &[MleParameter],
+    location: MleParameter,
+    scale: MleParameter,
+    make_standard: F,
+    options: MleOptions,
+) -> Result<MleResult<LocationScale<D>>, FitError>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    fit_mle_location_scale_sample(
+        MleSample::Censored(data),
+        shape_parameters,
+        location,
+        scale,
+        make_standard,
+        options,
+    )
+}
+
+fn fit_mle_location_scale_sample<D, F>(
+    data: MleSample<'_>,
+    shape_parameters: &[MleParameter],
+    location: MleParameter,
+    scale: MleParameter,
+    make_standard: F,
+    options: MleOptions,
+) -> Result<MleResult<LocationScale<D>>, FitError>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    // Check before constructing the parameter vector or calling user code,
+    // matching the generic MLE driver's fail-closed sample bound.
+    if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+        return Err(FitError::ResourceExhausted {
+            detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+        });
+    }
+    let n_shapes = shape_parameters.len();
+    let mut parameters = shape_parameters.to_vec();
+    parameters.extend([location, scale]);
+    fit_mle_sample(
+        data,
+        &parameters,
+        |values| {
+            let base = make_standard(&values[..n_shapes])?;
+            LocationScale::new(base, values[n_shapes], values[n_shapes + 1]).ok()
+        },
         options,
     )
 }

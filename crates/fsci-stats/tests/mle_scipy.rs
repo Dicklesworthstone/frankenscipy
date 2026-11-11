@@ -10,10 +10,12 @@ use std::process::Command;
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
-    CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, Kappa3, Lognormal, MleOptions,
-    MleParameter, Normal, RDist, SkewCauchy, Weibull, fit_mle, fit_mle_censored,
-    with_hardened_stats_caps, with_stats_runtime_mode,
+    CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
+    LocationScale, Lognormal, MleOptions, MleParameter, MleResult, Normal, RDist, SkewCauchy,
+    StatsError, Weibull, fit_mle, fit_mle_censored, fit_mle_location_scale,
+    fit_mle_location_scale_censored, with_hardened_stats_caps, with_stats_runtime_mode,
 };
+use rand::{SeedableRng, rngs::StdRng};
 
 const ORACLE: &str = r#"
 import os
@@ -63,6 +65,273 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn location_scale_distribution_transforms_support_moments_and_probabilities() {
+    let distribution = LocationScale::new(BetaDist::new(2.0, 3.0), -3.0, 5.0).unwrap();
+    // Independent Beta(2,3) formulas: F(1/2)=11/16, f(1/2)=3/2,
+    // mean=2/5, variance=1/25, skewness=2/7, excess kurtosis=-9/14.
+    assert!((distribution.pdf(-0.5) - 0.3).abs() < 1.0e-15);
+    assert!((distribution.logpdf(-0.5) - 0.3_f64.ln()).abs() < 1.0e-14);
+    assert!((distribution.cdf(-0.5) - 0.6875).abs() < 1.0e-14);
+    assert!((distribution.sf(-0.5) - 0.3125).abs() < 1.0e-14);
+    assert!((distribution.logcdf(-0.5) - 0.6875_f64.ln()).abs() < 1.0e-14);
+    assert!((distribution.logsf(-0.5) - 0.3125_f64.ln()).abs() < 1.0e-14);
+    assert!((distribution.ppf(0.6875) + 0.5).abs() < 1.0e-12);
+    assert!((distribution.isf(0.3125) + 0.5).abs() < 1.0e-12);
+    assert_eq!(distribution.ppf(0.0), -3.0);
+    assert_eq!(distribution.ppf(1.0), 2.0);
+    assert_eq!(distribution.cdf(-4.0), 0.0);
+    assert_eq!(distribution.sf(3.0), 0.0);
+    assert_eq!(distribution.pdf(-4.0), 0.0);
+    assert_eq!(distribution.logpdf(3.0), f64::NEG_INFINITY);
+    assert!((distribution.mean() + 1.0).abs() < 1.0e-15);
+    assert!((distribution.var() - 1.0).abs() < 1.0e-15);
+    assert!((distribution.std() - 1.0).abs() < 1.0e-15);
+    assert!((distribution.mode() + 4.0 / 3.0).abs() < 1.0e-15);
+    assert!((distribution.skewness() - 2.0 / 7.0).abs() < 1.0e-15);
+    assert!((distribution.kurtosis() + 9.0 / 14.0).abs() < 1.0e-15);
+    assert!((distribution.entropy() - 1.374_531_262_646_099_5).abs() < 1.0e-13);
+    assert_eq!(distribution.try_entropy().unwrap(), distribution.entropy());
+    assert_eq!(
+        distribution.try_skewness().unwrap(),
+        distribution.skewness()
+    );
+    assert_eq!(
+        distribution.try_kurtosis().unwrap(),
+        distribution.kurtosis()
+    );
+    assert!((distribution.median() + 1.071_362_159_338_052_2).abs() < 1.0e-12);
+    let (lower, upper) = distribution.interval(0.8);
+    assert!((distribution.cdf(lower) - 0.1).abs() < 1.0e-12);
+    assert!((distribution.sf(upper) - 0.1).abs() < 1.0e-12);
+    assert_eq!(distribution.base().a, 2.0);
+    assert_eq!(distribution.loc(), -3.0);
+    assert_eq!(distribution.scale(), 5.0);
+    assert_eq!(
+        distribution.into_parts(),
+        (BetaDist::new(2.0, 3.0), -3.0, 5.0)
+    );
+}
+
+#[test]
+fn location_scale_preserves_tail_accuracy_and_avoids_intermediate_overflow() {
+    let distribution = LocationScale::new(Normal::standard(), 3.0, 2.0).unwrap();
+    assert!(distribution.sf(23.0) > 0.0);
+    assert!((distribution.logsf(83.0) + 804.608_442_013_753_8).abs() < 1.0e-11);
+    assert!((distribution.logcdf(-77.0) + 804.608_442_013_753_8).abs() < 1.0e-11);
+    let quantile = distribution.isf(1.0e-100);
+    assert!(quantile.is_finite());
+    assert!((distribution.logsf(quantile) - 1.0e-100_f64.ln()).abs() < 1.0e-10);
+
+    let wide = LocationScale::new(Normal::standard(), -1.0e308, 1.0e308).unwrap();
+    assert!((wide.cdf(1.0e308) - 0.977_249_868_051_820_8).abs() < 1.0e-15);
+    assert!(wide.logpdf(1.0e308).is_finite());
+    let cancelled = LocationScale::new(Normal::new(2.0, 1.0), -1.0e308, 1.0e308).unwrap();
+    assert_eq!(cancelled.mean(), 1.0e308);
+
+    let narrow = LocationScale::new(Normal::standard(), 0.0, 1.0e-200).unwrap();
+    assert_eq!(Normal::standard().pdf(40.0), 0.0);
+    let density = narrow.pdf(4.0e-199);
+    assert!(density > 0.0 && density.is_finite());
+    assert!((density.ln() - narrow.logpdf(4.0e-199)).abs() < 1.0e-12);
+    // 100-digit Decimal evaluation at the exact f64 x and scale. Rescaling
+    // the nonzero subnormal base PDF would lose about 1.2e-11 relatively.
+    let reference = 1.097_221_052_007_641_3e-114;
+    assert!((narrow.pdf(3.8e-199) / reference - 1.0).abs() < 3.0e-13);
+    let rescued = LocationScale::new(Normal::new(0.0, 1.0e-310), 0.0, 1.0e100).unwrap();
+    assert!(rescued.pdf(0.0).is_finite() && rescued.pdf(0.0) > 0.0);
+    assert!((rescued.pdf(0.0).ln() - rescued.logpdf(0.0)).abs() < 1.0e-12);
+    for (base_scale, outer_scale, variance) in
+        [(1.0e-150, 1.0e200, 1.0e100), (1.0e150, 1.0e-200, 1.0e-100)]
+    {
+        let scaled = LocationScale::new(Normal::new(0.0, base_scale), 0.0, outer_scale).unwrap();
+        assert!((scaled.var() / variance - 1.0).abs() < 1.0e-14);
+        assert!((scaled.std() / variance.sqrt() - 1.0).abs() < 1.0e-14);
+    }
+}
+
+#[test]
+fn location_scale_validates_parameters_and_preserves_the_base_sampler() {
+    for (loc, scale) in [
+        (f64::NAN, 1.0),
+        (f64::INFINITY, 1.0),
+        (f64::NEG_INFINITY, 1.0),
+        (0.0, 0.0),
+        (0.0, -1.0),
+        (0.0, f64::NAN),
+        (0.0, f64::INFINITY),
+    ] {
+        assert!(matches!(
+            LocationScale::new(Normal::standard(), loc, scale),
+            Err(StatsError::InvalidArgument(_))
+        ));
+    }
+    let base = GammaDist::new(2.0, 1.0);
+    let distribution = LocationScale::new(base, -4.0, 3.0).unwrap();
+    let mut base_rng = StdRng::seed_from_u64(4721);
+    let mut affine_rng = StdRng::seed_from_u64(4721);
+    let expected: Vec<_> = base
+        .rvs(100, &mut base_rng)
+        .into_iter()
+        .map(|z| 3.0_f64.mul_add(z, -4.0))
+        .collect();
+    assert_eq!(distribution.rvs(100, &mut affine_rng), expected);
+    assert!(matches!(
+        LocationScale::<GammaDist>::try_fit(&[1.0, 2.0, 3.0]),
+        Err(FitError::NotImplemented { .. })
+    ));
+}
+
+#[test]
+fn location_scale_mle_fits_free_location_scale_and_holds_shapes_exactly() {
+    let data = [-3.0, 0.5, 1.2, 3.5, 8.0];
+    let expected = Normal::try_fit(&data).unwrap();
+    let fitted = fit_mle_location_scale(
+        &data,
+        &[],
+        MleParameter::Free(0.0),
+        MleParameter::Positive(1.0),
+        |shapes| {
+            assert!(shapes.is_empty());
+            Some(Normal::standard())
+        },
+        MleOptions::default(),
+    )
+    .unwrap();
+    assert!((fitted.distribution.loc() - expected.loc).abs() < 1.0e-6);
+    assert!((fitted.distribution.scale() - expected.scale).abs() < 1.0e-6);
+    assert!((fitted.negative_log_likelihood - likelihood(&expected, &data)).abs() < 1.0e-10);
+    assert_eq!(fitted.parameters.len(), 2);
+
+    let shifted = [3.2, 3.8, 4.5, 5.0, 6.1, 8.0];
+    let fitted = fit_mle_location_scale(
+        &shifted,
+        &[MleParameter::Fixed(2.0)],
+        MleParameter::Fixed(3.0),
+        MleParameter::Positive(1.0),
+        |shapes| Some(GammaDist::new(shapes[0], 1.0)),
+        MleOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(&fitted.parameters[..2], &[2.0, 3.0]);
+    assert_eq!(fitted.distribution.base().a, 2.0);
+    assert_eq!(fitted.distribution.base().scale, 1.0);
+    // For a known shape and location, scale MLE is mean(X-loc)/shape.
+    assert!((fitted.distribution.scale() - 1.05).abs() < 1.0e-7);
+}
+
+#[test]
+fn location_scale_censored_likelihood_adds_the_jacobian_only_for_exact_values() {
+    let original = CensoredData::new(
+        vec![0.0, 1.0],
+        vec![-40.0],
+        vec![40.0],
+        vec![(40.0, 41.0), (-41.0, -40.0)],
+    );
+    let shifted = CensoredData::new(
+        vec![3.0, 5.0],
+        vec![-77.0],
+        vec![83.0],
+        vec![(83.0, 85.0), (-79.0, -77.0)],
+    );
+    let original_fit = fit_mle_censored(
+        &original,
+        &[],
+        |_| Some(Normal::standard()),
+        MleOptions::default(),
+    )
+    .unwrap();
+    let fitted = fit_mle_location_scale_censored(
+        &shifted,
+        &[],
+        MleParameter::Fixed(3.0),
+        MleParameter::Fixed(2.0),
+        |_| Some(Normal::standard()),
+        MleOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(fitted.parameters, vec![3.0, 2.0]);
+    assert_eq!((fitted.iterations, fitted.evaluations), (0, 1));
+    let expected = original_fit.negative_log_likelihood + 2.0 * 2.0_f64.ln();
+    assert!((fitted.negative_log_likelihood - expected).abs() < 1.0e-11);
+    assert_eq!(shifted.interval, vec![(83.0, 85.0), (-79.0, -77.0)]);
+}
+
+#[test]
+fn location_scale_mle_rejects_invalid_support_parameters_and_exhausted_budgets() {
+    let shapes = [MleParameter::Fixed(2.0), MleParameter::Fixed(3.0)];
+    let factory = |p: &[f64]| Some(BetaDist::new(p[0], p[1]));
+    for data in [&[][..], &[4.9], &[9.1], &[f64::NAN]] {
+        assert!(
+            fit_mle_location_scale(
+                data,
+                &shapes,
+                MleParameter::Fixed(5.0),
+                MleParameter::Fixed(4.0),
+                factory,
+                MleOptions::default(),
+            )
+            .is_err()
+        );
+    }
+    for scale in [0.0, -1.0, f64::INFINITY] {
+        assert!(matches!(
+            fit_mle_location_scale(
+                &[6.0, 7.0],
+                &shapes,
+                MleParameter::Fixed(5.0),
+                MleParameter::Fixed(scale),
+                factory,
+                MleOptions::default(),
+            ),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        fit_mle_location_scale(
+            &[0.0, 1.0, 3.0],
+            &[],
+            MleParameter::Free(0.0),
+            MleParameter::Positive(1.0),
+            |_| Some(Normal::standard()),
+            MleOptions {
+                max_evaluations: 1,
+                ..MleOptions::default()
+            },
+        ),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(1, 1, || {
+            let factory = |_: &[f64]| -> Option<Normal> {
+                panic!("sample cap must be checked before constructing a distribution")
+            };
+            assert!(matches!(
+                fit_mle_location_scale(
+                    &[0.0, 1.0],
+                    &[],
+                    MleParameter::Free(0.0),
+                    MleParameter::Positive(1.0),
+                    factory,
+                    MleOptions::default(),
+                ),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                fit_mle_location_scale_censored(
+                    &CensoredData::new(vec![], vec![0.0], vec![1.0], vec![]),
+                    &[],
+                    MleParameter::Free(0.0),
+                    MleParameter::Positive(1.0),
+                    factory,
+                    MleOptions::default(),
+                ),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
 }
 
 #[test]
@@ -1413,4 +1682,252 @@ fn censored_mle_matches_live_scipy() {
     }
     assert_eq!(compared, 9, "every censored oracle case must be compared");
     eprintln!("Censored MLE compared cases = {compared}");
+}
+
+const LOCATION_SCALE_ORACLE: &str = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats, optimize
+
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+
+def optimizer(fun, start, args=(), disp=0):
+    result = optimize.minimize(fun, start, args=args, method='Nelder-Mead',
+                              options={'xatol': 1e-10, 'fatol': 1e-10,
+                                       'maxiter': 10000, 'maxfev': 40000})
+    assert result.success, result.message
+    return result.x
+
+def logmass(dist, lo, hi):
+    lc, ls = dist.logcdf(hi), dist.logsf(lo)
+    a, b = (lc, dist.logcdf(lo)) if lc < ls else (ls, dist.logsf(hi))
+    return a + np.log(-np.expm1(b - a))
+
+# Masks are in [shapes..., loc, scale] order. Starts are generated from the
+# declared model, never from the fitted reference parameters.
+specs = [
+    ('gamma', stats.gamma, (3.5,), -2.0, 1.7, '000'),
+    ('gamma', stats.gamma, (5.0,), 3.0, 0.8, '101'),
+    ('beta', stats.beta, (2.5, 4.0), -3.0, 8.0, '0011'),
+    ('beta', stats.beta, (4.0, 2.0), 2.0, 3.0, '1010'),
+    ('lognorm', stats.lognorm, (0.45,), -4.0, 2.5, '010'),
+    ('lognorm', stats.lognorm, (0.8,), 1.5, 0.7, '100'),
+    ('johnsonsu', stats.johnsonsu, (-0.8, 0.9), 2.0, 2.7, '0000'),
+    ('johnsonsu', stats.johnsonsu, (1.2, 2.0), -3.0, 1.1, '0101'),
+]
+for index, (family, dist, shapes, loc, scale, mask) in enumerate(specs):
+    values = dist.rvs(*shapes, loc=loc, scale=scale, size=800,
+                      random_state=np.random.default_rng(61020 + index))
+    truth = (*shapes, loc, scale)
+    initial = [value + 0.15 if family == 'johnsonsu' and i == 0 else 0.9*value
+               for i, value in enumerate(shapes)] + [loc - 0.15*scale, 1.1*scale]
+    for i, fixed in enumerate(mask):
+        if fixed == '1':
+            initial[i] = truth[i]
+    lower, upper = dist.ppf([0.15, 0.8], *shapes, loc=loc, scale=scale)
+    width = 0.15*scale
+    exact, left, right, intervals = [], [], [], []
+    for i, x in enumerate(values):
+        if x <= lower:
+            left.append(lower)
+        elif x >= upper:
+            right.append(upper)
+        elif i % 4 == 0:
+            lo = loc + width*np.floor((x-loc)/width)
+            intervals.append((lo, lo+width))
+        else:
+            exact.append(x)
+    mixed = stats.CensoredData(uncensored=exact, left=left, right=right,
+                               interval=intervals)
+    for kind, data, parts in [
+        ('exact', values, (values, [], [], [])),
+        ('censored', mixed, (exact, left, right, intervals)),
+    ]:
+        kwargs = {'optimizer': optimizer, 'loc': initial[-2], 'scale': initial[-1]}
+        for i, fixed in enumerate(mask):
+            if fixed == '1':
+                key = ('f'+str(i) if i < len(shapes) else
+                       'floc' if i == len(shapes) else 'fscale')
+                kwargs[key] = truth[i]
+        fitted = dist.fit(data, *initial[:-2], **kwargs)
+        frozen = dist(*fitted[:-2], loc=fitted[-2], scale=fitted[-1])
+        u, l, r, intervals_used = parts
+        nll = -(sum(frozen.logpdf(u)) + sum(frozen.logcdf(l))
+                + sum(frozen.logsf(r))
+                + sum(logmass(frozen, lo, hi) for lo, hi in intervals_used))
+        assert np.isfinite(nll) and np.all(np.isfinite(fitted))
+        print(family, index, kind, mask, len(fitted),
+              *(format(x, '.17g') for x in fitted), format(nll, '.17g'))
+        for label, numbers in [('start', initial), ('u', u), ('l', l), ('r', r),
+                               ('i', [x for pair in intervals_used for x in pair])]:
+            print(label, *(format(x, '.17g') for x in numbers))
+"#;
+
+fn fit_location_scale_oracle<D, F>(
+    data: &CensoredData,
+    parameters: &[MleParameter],
+    censored: bool,
+    factory: F,
+) -> MleResult<LocationScale<D>>
+where
+    D: ContinuousDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    let n_shapes = parameters.len() - 2;
+    let shapes = &parameters[..n_shapes];
+    let location = parameters[n_shapes];
+    let scale = parameters[n_shapes + 1];
+    let options = MleOptions::default();
+    if censored {
+        fit_mle_location_scale_censored(data, shapes, location, scale, factory, options).unwrap()
+    } else {
+        fit_mle_location_scale(&data.uncensored, shapes, location, scale, factory, options).unwrap()
+    }
+}
+
+#[test]
+fn location_scale_mle_matches_live_scipy() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
+        eprintln!("SKIP location/scale MLE: SciPy unavailable via {python}; compared cases = 0");
+        return;
+    }
+    let output = Command::new(&python)
+        .args(["-c", LOCATION_SCALE_ORACLE])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy location/scale MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines
+        .next()
+        .expect("location/scale oracle version metadata");
+    assert!(versions.starts_with("versions "));
+    eprintln!("Location/scale MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let (family, case, kind, mask) = (fields[0], fields[1], fields[2], fields[3]);
+        let n_parameters: usize = fields[4].parse().unwrap();
+        assert_eq!(fields.len(), n_parameters + 6);
+        assert_eq!(mask.len(), n_parameters);
+        let expected: Vec<f64> = fields[5..5 + n_parameters]
+            .iter()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let expected_nll: f64 = fields[5 + n_parameters].parse().unwrap();
+        let initial = censor_values(lines.next().unwrap(), "start");
+        assert_eq!(initial.len(), n_parameters);
+        let exact = censor_values(lines.next().unwrap(), "u");
+        let left = censor_values(lines.next().unwrap(), "l");
+        let right = censor_values(lines.next().unwrap(), "r");
+        let intervals = censor_values(lines.next().unwrap(), "i");
+        assert_eq!(intervals.len() % 2, 0);
+        let data = CensoredData::new(
+            exact,
+            left,
+            right,
+            intervals.chunks_exact(2).map(|p| (p[0], p[1])).collect(),
+        );
+        assert_eq!(data.len(), 800);
+        let parameters: Vec<_> = initial
+            .iter()
+            .zip(mask.bytes())
+            .enumerate()
+            .map(|(i, (&value, fixed))| {
+                if fixed == b'1' {
+                    MleParameter::Fixed(value)
+                } else if i == n_parameters - 2 || (family == "johnsonsu" && i == 0) {
+                    MleParameter::Free(value)
+                } else {
+                    MleParameter::Positive(value)
+                }
+            })
+            .collect();
+        let censored = match kind {
+            "exact" => false,
+            "censored" => true,
+            _ => panic!("unexpected observation kind: {kind}"),
+        };
+        let (actual, nll) = match family {
+            "gamma" => {
+                let fit = fit_location_scale_oracle(&data, &parameters, censored, |p| {
+                    Some(GammaDist {
+                        a: p[0],
+                        scale: 1.0,
+                    })
+                });
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            "beta" => {
+                let fit = fit_location_scale_oracle(&data, &parameters, censored, |p| {
+                    Some(BetaDist { a: p[0], b: p[1] })
+                });
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            "lognorm" => {
+                let fit = fit_location_scale_oracle(&data, &parameters, censored, |p| {
+                    Some(Lognormal {
+                        s: p[0],
+                        scale: 1.0,
+                    })
+                });
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            "johnsonsu" => {
+                let fit = fit_location_scale_oracle(&data, &parameters, censored, |p| {
+                    Some(JohnsonSU { a: p[0], b: p[1] })
+                });
+                (fit.parameters, fit.negative_log_likelihood)
+            }
+            _ => panic!("unexpected location/scale oracle family {family}"),
+        };
+        assert!(nll.is_finite() && expected_nll.is_finite());
+        assert_eq!(actual.len(), expected.len());
+        assert!(
+            (nll - expected_nll).abs() <= 1.0e-7 * expected_nll.abs().max(1.0),
+            "{family}/{case}/{kind}: fsci NLL {nll} != SciPy {expected_nll}"
+        );
+        for (i, (&value, &reference)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (value - reference).abs() <= 1.0e-4 * reference.abs().max(1.0),
+                "{family}/{case}/{kind}: parameter {i}: {value} != {reference}"
+            );
+            if let MleParameter::Fixed(fixed) = parameters[i] {
+                assert_eq!(value.to_bits(), fixed.to_bits());
+                assert_eq!(value.to_bits(), reference.to_bits());
+            }
+        }
+        eprintln!(
+            "{family}/{case}/{kind}: location/scale MLE fsci={actual:?} scipy={expected:?}; \
+             NLL fsci={nll:.12e} scipy={expected_nll:.12e}"
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 16,
+        "every location/scale oracle case must be compared"
+    );
+    eprintln!(
+        "Location/scale MLE compared cases = {compared}; families = 4; samples per case = 800"
+    );
 }

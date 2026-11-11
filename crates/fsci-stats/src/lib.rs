@@ -24,7 +24,10 @@ pub use audit::{
 };
 pub use censored::CensoredData;
 pub use covariance::Covariance;
-pub use mle::{MleOptions, MleParameter, MleResult, fit_mle, fit_mle_censored};
+pub use mle::{
+    LocationScale, MleOptions, MleParameter, MleResult, fit_mle, fit_mle_censored,
+    fit_mle_location_scale, fit_mle_location_scale_censored,
+};
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
