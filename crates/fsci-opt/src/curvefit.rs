@@ -2047,7 +2047,6 @@ where
         },
     )?;
     let n = x0.len();
-    let m = ls.fun.len();
 
     // scipy's `cov_x` is the *unscaled* inverse (JᵀJ)⁻¹; reuse the
     // `absolute_sigma` branch of the covariance helper. A rank-deficient
@@ -2055,7 +2054,7 @@ where
     let jac = ls.jac.as_dense().ok_or_else(|| OptError::InvalidArgument {
         detail: String::from("leastsq requires a dense LM Jacobian"),
     })?;
-    let cov = compute_covariance(jac, ls.cost, m, n, true);
+    let cov = compute_covariance(jac, &ls.fun, n, true);
     let cov_x = if cov.iter().flatten().all(|v| v.is_finite()) {
         Some(cov)
     } else {
@@ -2247,13 +2246,6 @@ where
     Ok(())
 }
 
-/// Compute J^T * J (n x n).
-fn jtj_matrix(jac: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let mut jtj = Vec::new();
-    jtj_matrix_into(jac, &mut jtj);
-    jtj
-}
-
 /// Compute J^T * J (n x n) into fixed-shape scratch.
 fn jtj_matrix_into(jac: &[Vec<f64>], jtj: &mut Vec<Vec<f64>>) {
     let n = jac.first().map_or(0, Vec::len);
@@ -2381,14 +2373,6 @@ fn cholesky_decompose_into(a: &[Vec<f64>], n: usize, low: &mut Vec<Vec<f64>>) ->
     true
 }
 
-/// Solve L * L^T * x = b given L.
-fn cholesky_solve_with_l(low: &[Vec<f64>], b: &[f64], n: usize) -> Vec<f64> {
-    let mut y = Vec::new();
-    let mut x = Vec::new();
-    cholesky_solve_with_l_into(low, b, n, &mut y, &mut x);
-    x
-}
-
 /// Solve L * L^T * x = b given L into fixed-shape scratch.
 fn cholesky_solve_with_l_into(
     low: &[Vec<f64>],
@@ -2418,8 +2402,9 @@ fn cholesky_solve_with_l_into(
     }
 }
 
-/// SciPy's curve-fit covariance: LM retains its inverse, while TRF and Dogbox use
-/// the SVD pseudoinverse of JᵀJ without forming the condition-squaring normal matrix.
+/// SciPy's curve-fit covariance: LM retains the full inverse, while TRF and
+/// Dogbox truncate numerically singular directions in their pseudoinverse.
+/// Neither covariance path forms the condition-squaring normal matrix.
 fn curve_fit_covariance(
     result: &LeastSquaresResult,
     method: LeastSquaresMethod,
@@ -2446,7 +2431,7 @@ fn curve_fit_covariance(
         }
     };
     if method == LeastSquaresMethod::Lm {
-        return Ok(compute_covariance(jac, result.cost, m, n, absolute_sigma));
+        return Ok(compute_covariance(jac, &result.fun, n, absolute_sigma));
     }
     // Normalize before the Jacobi SVD: its column inner products otherwise overflow
     // or underflow for large/small model derivatives, even when the covariance is finite.
@@ -2489,51 +2474,55 @@ fn curve_fit_covariance(
     Ok(covariance)
 }
 
-/// Compute the existing LM parameter covariance matrix from its Jacobian.
+/// Compute LM's full parameter covariance directly from its Jacobian.
+///
+/// Forming JᵀJ can erase a small but resolved singular direction or overflow
+/// perfectly finite derivatives. The shared one-sided Jacobi SVD retains the
+/// Jacobian's original scales. Unlike TRF/Dogbox covariance, LM does not discard
+/// nonzero singular values using a relative pseudoinverse threshold.
 fn compute_covariance(
     jac: &[Vec<f64>],
-    cost: f64,
-    m: usize,
+    residuals: &[f64],
     n: usize,
     absolute_sigma: bool,
 ) -> Vec<Vec<f64>> {
+    let m = residuals.len();
     if !absolute_sigma && m <= n {
         return vec![vec![f64::INFINITY; n]; n];
     }
 
-    let jtj = jtj_matrix(jac);
+    let (_, singular_values, right_vectors) = trf::svd_thin(jac, n);
+    if singular_values.len() != n
+        || singular_values
+            .iter()
+            .any(|value| *value == 0.0 || !value.is_finite())
+    {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
 
-    // Invert J^T J via Cholesky
-    let mut pcov = vec![vec![0.0; n]; n];
-    if let Some(low) = cholesky_decompose(&jtj, n) {
-        for col in 0..n {
-            let mut e = vec![0.0; n];
-            e[col] = 1.0;
-            let column = cholesky_solve_with_l(&low, &e, n);
-            for (row, val) in column.iter().enumerate() {
-                pcov[row][col] = *val;
-            }
-        }
+    // Apply the residual standard deviation before taking outer products.
+    // The squared cost can underflow or overflow even when this ratio, and
+    // consequently the final relative covariance, are ordinary finite values.
+    let residual_scale = if absolute_sigma {
+        1.0
     } else {
-        // If J^T J is singular, return infinity on diagonal
-        for row in &mut pcov {
-            for val in row.iter_mut() {
-                *val = f64::INFINITY;
-            }
-        }
-        return pcov;
-    }
-
-    // Scale by residual variance if not absolute_sigma
-    if !absolute_sigma && m > n {
-        let s2 = 2.0 * cost / (m - n) as f64;
-        for row in &mut pcov {
-            for val in row.iter_mut() {
-                *val *= s2;
+        residuals
+            .iter()
+            .fold(0.0_f64, |norm, value| norm.hypot(*value))
+            / ((m - n) as f64).sqrt()
+    };
+    let mut pcov = vec![vec![0.0; n]; n];
+    for (&singular, vector) in singular_values.iter().zip(&right_vectors) {
+        let scale = residual_scale / singular;
+        for (i, row) in pcov.iter_mut().enumerate() {
+            for (j, entry) in row.iter_mut().enumerate() {
+                *entry += (vector[i] * scale) * (vector[j] * scale);
             }
         }
     }
-
+    if pcov.iter().flatten().any(|value| value.is_nan()) {
+        return vec![vec![f64::INFINITY; n]; n];
+    }
     pcov
 }
 
@@ -3171,6 +3160,170 @@ mod tests {
             assert!((result.popt[0] - 2.0).abs() < 1e-8, "{result:?}");
             assert!((result.popt[1] - 3.0).abs() < 1e-8, "{result:?}");
         }
+    }
+
+    #[test]
+    fn curve_fit_lm_preserves_full_rank_covariance_for_correlated_parameters() {
+        // The exact normal matrix is
+        // [[4, 4], [4, 4 + 10*delta^2]], but all four entries round to 4
+        // when it is formed in f64. The Jacobian itself remains full rank.
+        let delta = 2.0_f64.powi(-28);
+        let offsets = [-delta, delta, -2.0 * delta, 2.0 * delta];
+        let model = |t: f64, p: &[f64]| p[0] + (1.0 + t) * p[1];
+        let observations: Vec<f64> = offsets
+            .iter()
+            .map(|&t| model(t, &[1.0, 2.0]))
+            .collect();
+        let jacobian = || {
+            LeastSquaresJacobian::new(move |_| {
+                offsets.iter().map(|t| vec![1.0, 1.0 + t]).collect()
+            })
+        };
+        let fit = curve_fit(
+            model,
+            &offsets,
+            &observations,
+            CurveFitOptions {
+                // Isolate covariance from the LM iteration's convergence policy.
+                p0: Some(vec![1.0, 2.0]),
+                absolute_sigma: true,
+                ls_options: LeastSquaresOptions {
+                    jac: Some(jacobian()),
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            },
+        )
+        .expect("a full-rank correlated model has finite covariance");
+        let inverse_variance = 1.0 / (10.0 * delta * delta);
+        let expected = [
+            [inverse_variance + 0.25, -inverse_variance],
+            [-inverse_variance, inverse_variance],
+        ];
+        for (actual_row, expected_row) in fit.pcov.iter().zip(expected) {
+            for (&actual, reference) in actual_row.iter().zip(expected_row) {
+                assert!(actual.is_finite(), "{:?}", fit.pcov);
+                assert!(
+                    (actual / reference - 1.0).abs() < 1e-6,
+                    "covariance={:?}, expected={expected:?}",
+                    fit.pcov
+                );
+            }
+        }
+
+        let result = leastsq(
+            |p| {
+                offsets
+                    .iter()
+                    .map(|t| (p[0] - 1.0) + (1.0 + t) * (p[1] - 2.0))
+                    .collect()
+            },
+            &[1.0, 2.0],
+            LeastSquaresOptions {
+                jac: Some(jacobian()),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("leastsq uses the same stable covariance");
+        let covariance = result
+            .cov_x
+            .expect("a resolved full-rank Jacobian has an inverse");
+        assert!((covariance[0][0] / inverse_variance - 1.0).abs() < 1e-6);
+        assert!((covariance[0][1] / -inverse_variance - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn curve_fit_lm_covariance_handles_independent_derivative_scales() {
+        let large = 1.0e160;
+        let small = 1.0e-150;
+        let fit = curve_fit(
+            |t, p| {
+                if t == 0.0 {
+                    large * p[0]
+                } else if t == 1.0 {
+                    small * p[1]
+                } else {
+                    0.0
+                }
+            },
+            &[0.0, 1.0, 2.0],
+            &[0.0, 0.0, 0.0],
+            CurveFitOptions {
+                p0: Some(vec![0.0, 0.0]),
+                absolute_sigma: true,
+                ls_options: LeastSquaresOptions {
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        vec![vec![large, 0.0], vec![0.0, small], vec![0.0, 0.0]]
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            },
+        )
+        .expect("independent derivative scales must not overflow the covariance");
+        assert!(fit.pcov.iter().flatten().all(|value| value.is_finite()));
+        // The first entry is subnormal; its rounding unit is about 5e-4 relative.
+        assert!((fit.pcov[0][0] / 1.0e-320 - 1.0).abs() < 1e-3);
+        assert!((fit.pcov[1][1] / 1.0e300 - 1.0).abs() < 1e-12);
+        assert_eq!(fit.pcov[0][1], 0.0);
+        assert_eq!(fit.pcov[1][0], 0.0);
+    }
+
+    #[test]
+    fn curve_fit_lm_relative_covariance_uses_residual_norm() {
+        for magnitude in [1.0e-200, 1.0e200] {
+            // The optimum is p=0, RSS=2*magnitude^2, and JᵀJ=2*magnitude^2.
+            // With one residual degree of freedom, the relative covariance is 1.
+            // Both squared quantities underflow or overflow at these scales.
+            let fit = curve_fit(
+                |_, p| magnitude * p[0],
+                &[0.0, 1.0],
+                &[-magnitude, magnitude],
+                CurveFitOptions {
+                    p0: Some(vec![0.0]),
+                    ls_options: LeastSquaresOptions {
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            vec![vec![magnitude], vec![magnitude]]
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                    ..CurveFitOptions::default()
+                },
+            )
+            .expect("relative covariance is finite in the original parameter units");
+            assert!(
+                (fit.pcov[0][0] - 1.0).abs() < 1e-12,
+                "magnitude={magnitude}, covariance={:?}",
+                fit.pcov
+            );
+        }
+    }
+
+    #[test]
+    fn curve_fit_lm_covariance_reports_rank_deficiency() {
+        let fit = curve_fit(
+            |_, p| p[0] + p[1],
+            &[0.0, 1.0, 2.0],
+            &[3.0, 3.0, 3.0],
+            CurveFitOptions {
+                p0: Some(vec![1.0, 2.0]),
+                absolute_sigma: true,
+                ls_options: LeastSquaresOptions {
+                    jac: Some(LeastSquaresJacobian::new(|_| {
+                        vec![vec![1.0, 1.0]; 3]
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            },
+        )
+        .expect("an unidentifiable fit returns an infinite LM covariance");
+        assert!(
+            fit.pcov
+                .iter()
+                .flatten()
+                .all(|value| *value == f64::INFINITY)
+        );
     }
 
     #[test]
