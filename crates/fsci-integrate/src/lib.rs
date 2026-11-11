@@ -22,7 +22,7 @@ pub use api::{
     solve_ivp_with_audit, solve_ivp_with_casp, solve_ivp_with_casp_portfolio,
     solve_ivp_with_casp_portfolio_and_audit,
 };
-pub use bdf::{BdfSolver, BdfSolverConfig};
+pub use bdf::{BdfSolver, BdfSolverConfig, SparseJacFn};
 pub use bvp::{BvpBcJac, BvpError, BvpFunJac, BvpOptions, BvpResult, solve_bvp, solve_bvp_many};
 pub use complex::{ComplexOdeResult, complex_ode};
 pub use fsci_runtime::{StiffnessConditionState, StiffnessDetector};

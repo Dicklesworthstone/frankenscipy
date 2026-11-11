@@ -12,14 +12,171 @@
 //! own genuine Radau IIA solver (see `radau.rs`).
 
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
-use crate::step_size::{InitialStepRequest, JacobianSparsity, num_jac, select_initial_step};
+use crate::step_size::{
+    InitialStepRequest, JacobianSparsity, num_jac, num_jac_sparse, select_initial_step,
+};
 use crate::validation::{
     ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
     validate_tol,
 };
 use fsci_runtime::RuntimeMode;
+use fsci_sparse::{
+    CscMatrix, LuOptions, Shape2D, SparseError, SparseLuFactorization, splu_native, splu_solve,
+};
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// An analytic BDF Jacobian in compressed sparse column format.
+///
+/// The callback returns an `n × n` matrix with `J[i, j] = d f_i / d y_j`. Unsorted
+/// row indices and duplicate entries are accepted; duplicates are summed before
+/// factorization. Every evaluation, including Newton refreshes, validates the shape
+/// and finite values. Evaluations count toward `njev`, never `nfev`.
+pub type SparseJacFn = fn(f64, &[f64]) -> CscMatrix;
+
+enum BdfJacobian {
+    Dense(DMatrix<f64>),
+    Sparse(CscMatrix),
+}
+
+impl BdfJacobian {
+    fn dense(&self) -> Option<&DMatrix<f64>> {
+        match self {
+            Self::Dense(matrix) => Some(matrix),
+            Self::Sparse(_) => None,
+        }
+    }
+
+    fn dense_structure(&self) -> (Option<Vec<f64>>, Option<(usize, usize)>) {
+        let Some(jac) = self.dense() else {
+            return (None, None);
+        };
+        let diagonal = crate::radau::diagonal_jacobian_entries(jac);
+        let band = if diagonal.is_some() {
+            None
+        } else {
+            jacobian_bandwidth(jac)
+        };
+        (diagonal, band)
+    }
+}
+
+fn evaluate_sparse_jacobian(
+    jac: SparseJacFn,
+    t: f64,
+    y: &[f64],
+    mode: RuntimeMode,
+) -> Result<CscMatrix, crate::IntegrateValidationError> {
+    let matrix = jac(t, y);
+    let n = y.len();
+    if matrix.shape() != Shape2D::new(n, n) {
+        return Err(crate::IntegrateValidationError::JacobianWrongShape { expected: n });
+    }
+    check_sparse_jacobian_cap(n, matrix.nnz(), mode)?;
+    if matrix.data().iter().any(|value| !value.is_finite()) {
+        return Err(crate::IntegrateValidationError::NonFiniteJacobian);
+    }
+
+    // Do not trust a canonical-format flag supplied by the constructor: validate
+    // the actual buffers, preserving duplicate addition order within each column.
+    let mut data: Vec<f64> = Vec::with_capacity(matrix.nnz());
+    let mut indices = Vec::with_capacity(matrix.nnz());
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for column in 0..n {
+        let mut entries: Vec<(usize, f64)> = (matrix.indptr()[column]..matrix.indptr()[column + 1])
+            .map(|k| (matrix.indices()[k], matrix.data()[k]))
+            .collect();
+        entries.sort_by_key(|&(row, _)| row);
+        for (row, value) in entries {
+            if indices.len() > indptr[column] && indices.last() == Some(&row) {
+                let sum = data.last_mut().expect("duplicate has a previous entry");
+                *sum += value;
+                if !sum.is_finite() {
+                    return Err(crate::IntegrateValidationError::NonFiniteJacobian);
+                }
+            } else {
+                indices.push(row);
+                data.push(value);
+            }
+        }
+        indptr.push(data.len());
+    }
+    CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, true).map_err(|error| {
+        crate::IntegrateValidationError::InvalidJacobianSparsity {
+            message: error.to_string(),
+        }
+    })
+}
+
+fn check_sparse_jacobian_cap(
+    n: usize,
+    nnz: usize,
+    mode: RuntimeMode,
+) -> Result<(), crate::IntegrateValidationError> {
+    fsci_sparse::check_hardened_sparse_cap(Shape2D::new(n, n), nnz, mode, None).map_err(|error| {
+        match error {
+            SparseError::ResourceExhausted { message } => {
+                crate::IntegrateValidationError::ResourceExhausted { message }
+            }
+            error => crate::IntegrateValidationError::InvalidJacobianSparsity {
+                message: error.to_string(),
+            },
+        }
+    })
+}
+
+/// Form `I - c J` in CSC, inserting an identity entry when a column lacks its
+/// diagonal. The Jacobian already has sorted, unique row indices.
+fn sparse_newton_matrix(
+    jac: &CscMatrix,
+    c: f64,
+    mode: RuntimeMode,
+) -> Result<CscMatrix, StepFailure> {
+    let n = jac.shape().rows;
+    let missing_diagonal = (0..n)
+        .filter(|&column| {
+            jac.indices()[jac.indptr()[column]..jac.indptr()[column + 1]]
+                .binary_search(&column)
+                .is_err()
+        })
+        .count();
+    let nnz = jac.nnz().saturating_add(missing_diagonal);
+    check_sparse_jacobian_cap(n, nnz, mode).map_err(StepFailure::InvalidJacobian)?;
+    let mut data = Vec::with_capacity(nnz);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for column in 0..n {
+        let mut diagonal = false;
+        for k in jac.indptr()[column]..jac.indptr()[column + 1] {
+            let row = jac.indices()[k];
+            if !diagonal && row > column {
+                indices.push(column);
+                data.push(1.0);
+                diagonal = true;
+            }
+            let unit = if row == column {
+                diagonal = true;
+                1.0
+            } else {
+                0.0
+            };
+            indices.push(row);
+            data.push(unit - c * jac.data()[k]);
+        }
+        if !diagonal {
+            indices.push(column);
+            data.push(1.0);
+        }
+        indptr.push(data.len());
+    }
+    CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, true).map_err(|error| {
+        StepFailure::SparseLinearSolve {
+            message: error.to_string(),
+        }
+    })
+}
 
 /// Runtime switch that restores the per-Newton-iteration scratch allocation in
 /// [`BdfSolver::newton_bdf`] (a fresh `rhs` `DVector` plus a `lu.solve` result Vec per
@@ -36,6 +193,8 @@ pub static BDF_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
 /// matrix is diagonal too, and [`NewtonFactor::Diagonal`] replaces an `O(n³)` LU plus
 /// two `O(n²)` substitutions with `n` scalar divisions. See [`NewtonFactor`] for the
 /// bit-identity argument. Mirrors [`BDF_FORCE_PER_ITER_ALLOC`]. `#[doc(hidden)]`.
+/// This switch applies only to dense Jacobians; an explicitly requested sparse
+/// Jacobian is never converted to dense storage by a benchmarking switch.
 #[doc(hidden)]
 /// CONTRACT: BIT-IDENTICAL either way. The toggle disables BOTH structural
 /// factorizations of `I − c·J` -- diagonal and banded -- and each is bit-identical to the
@@ -105,12 +264,17 @@ pub static BDF_BAND_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 /// reconstructs the dense LU for that iteration (see `newton_bdf`), which is the
 /// dense computation itself. That branch is unreachable for any convergent step.
 enum NewtonFactor {
-    /// Dense LU of `I − c·J` (scipy's unconditional path).
+    /// Dense LU of `I − c·J` for a dense Jacobian.
     Dense(LU<f64, Dyn, Dyn>),
     /// `I − c·J` is exactly diagonal: the stored entries are `1 − c·J[j][j]`.
     Diagonal(Vec<f64>),
     /// `I − c·J` is exactly banded: GEPP restricted to the band (see [`BandedLu`]).
     Banded(BandedLu),
+    /// A user-supplied or numerically computed sparse Jacobian stays sparse.
+    Sparse(SparseLuFactorization),
+    /// Singular or overflowing sparse Newton systems request the normal Jacobian
+    /// refresh / step reduction, without allocating a dense fallback.
+    SparseUnusable,
 }
 
 /// Gaussian elimination on a matrix whose non-zeros lie in a band, storing the factors
@@ -501,8 +665,9 @@ pub struct BdfSolver {
     // Newton solver state. The Jacobian is first taken at (t0, y0) and refreshed at most
     // once per step, when Newton fails on it. `None` uses SciPy's finite-difference num_jac.
     jac_callback: Option<crate::JacFn>,
+    jac_sparse_callback: Option<SparseJacFn>,
     jac_sparsity: Option<JacobianSparsity>,
-    current_jac: Option<DMatrix<f64>>,
+    current_jac: Option<BdfJacobian>,
     /// SciPy's `jac_factor`: the per-column relative difference step `num_jac` carries
     /// from one Jacobian to the next.
     jac_factor: Option<Vec<f64>>,
@@ -515,8 +680,9 @@ pub struct BdfSolver {
     /// `current_jac`'s `(kl, ku)` bandwidths when it is usefully banded, else `None`.
     /// Same cadence as `jac_diagonal`: computed per Jacobian, consumed per factorization.
     jac_band: Option<(usize, usize)>,
-    /// Factorization of `I − c·J`: dense LU, or the diagonal itself when `J` is
-    /// exactly diagonal (see [`NewtonFactor`]). As in SciPy it is dropped where the step
+    /// Factorization of `I − c·J`: sparse LU for CSC Jacobians, or the existing
+    /// dense/structured factorization for dense Jacobians (see [`NewtonFactor`]).
+    /// As in SciPy it is dropped where the step
     /// size changes for a reason other than an error rejection; after an error rejection
     /// the next attempt keeps the factorization of the previous `c` (SciPy: "As we didn't
     /// have problems with convergence, we don't reset LU here").
@@ -531,6 +697,8 @@ pub struct BdfSolver {
     /// (frankenscipy-gj3mi); these do not.
     diag_factorizations: usize,
     band_factorizations: usize,
+    /// Successful native sparse factorizations made by this solver instance.
+    sparse_factorizations: usize,
 
     // Previous step values for interpolation
     t_old: Option<f64>,
@@ -570,6 +738,8 @@ impl BdfSolver {
     /// The pattern is ignored when an analytic Jacobian is supplied. Otherwise its
     /// dimension must match `y0`; disjoint columns share one RHS perturbation call.
     /// Jacobian refreshes retain both the coloring and the adaptive difference steps.
+    /// With a pattern, Jacobians and Newton matrices use CSC storage and native
+    /// sparse LU; no n-by-n dense work buffer is constructed.
     pub fn new_with_jacobian_sparsity<F>(
         fun: &mut F,
         config: BdfSolverConfig<'_>,
@@ -579,11 +749,46 @@ impl BdfSolver {
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
+        Self::new_with_jacobians(fun, config, jac_callback, None, jac_sparsity)
+    }
+
+    /// Create a BDF solver with an analytic CSC Jacobian.
+    ///
+    /// The Jacobian, shifted Newton matrix and pivoted LU factors remain sparse at
+    /// every dimension. Sparse factorization failures never select a dense fallback.
+    /// See [`SparseJacFn`] for the callback's shape and duplicate-entry contracts.
+    pub fn new_with_sparse_jacobian<F>(
+        fun: &mut F,
+        config: BdfSolverConfig<'_>,
+        jac_callback: SparseJacFn,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        Self::new_with_jacobians(fun, config, None, Some(jac_callback), None)
+    }
+
+    fn new_with_jacobians<F>(
+        fun: &mut F,
+        config: BdfSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
+        jac_sparse_callback: Option<SparseJacFn>,
+        jac_sparsity: Option<&JacobianSparsity>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
         let n = config.y0.len();
         crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
-        let jac_sparsity = jac_sparsity.filter(|_| jac_callback.is_none());
+        let jac_sparsity =
+            jac_sparsity.filter(|_| jac_callback.is_none() && jac_sparse_callback.is_none());
         if let Some(pattern) = jac_sparsity {
             pattern.validate_dimension(n)?;
+            check_sparse_jacobian_cap(
+                n,
+                pattern.column_rows.iter().map(Vec::len).sum(),
+                config.mode,
+            )?;
         }
 
         // Input validation mirrors RkSolver::new (per frankenscipy-ljmg):
@@ -660,24 +865,37 @@ impl BdfSolver {
         // SciPy's BDF.__init__ takes the first Jacobian here, at (t0, y0): njev = 1 before
         // the first step, and its evaluations are not counted in nfev.
         let mut jac_factor = None;
-        let jac = match jac_callback {
-            Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
-            None => num_jac(
+        let jac = if let Some(callback) = jac_sparse_callback {
+            BdfJacobian::Sparse(evaluate_sparse_jacobian(
+                callback,
+                config.t0,
+                &y0,
+                config.mode,
+            )?)
+        } else if let Some(callback) = jac_callback {
+            BdfJacobian::Dense(evaluate_jacobian(callback, config.t0, &y0)?)
+        } else if let Some(pattern) = jac_sparsity {
+            BdfJacobian::Sparse(num_jac_sparse(
                 fun,
                 config.t0,
                 &y0,
                 &f0,
                 &atol_vec,
                 &mut jac_factor,
-                jac_sparsity,
-            )?,
-        };
-        let jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
-        let jac_band = if jac_diagonal.is_some() {
-            None
+                pattern,
+            )?)
         } else {
-            jacobian_bandwidth(&jac)
+            BdfJacobian::Dense(num_jac(
+                fun,
+                config.t0,
+                &y0,
+                &f0,
+                &atol_vec,
+                &mut jac_factor,
+                None,
+            )?)
         };
+        let (jac_diagonal, jac_band) = jac.dense_structure();
 
         Ok(Self {
             n,
@@ -699,6 +917,7 @@ impl BdfSolver {
             mode: config.mode,
             d,
             jac_callback,
+            jac_sparse_callback,
             jac_sparsity: jac_sparsity.cloned(),
             current_jac: Some(jac),
             jac_factor,
@@ -709,6 +928,7 @@ impl BdfSolver {
             lu_c: 0.0,
             diag_factorizations: 0,
             band_factorizations: 0,
+            sparse_factorizations: 0,
             t_old: None,
             y_old: None,
         })
@@ -888,81 +1108,124 @@ impl BdfSolver {
             loop {
                 if self.lu.is_none() {
                     let jac = self.current_jac.as_ref().expect("jacobian present");
-                    // Structure-exploiting factorization: an exactly-diagonal Jacobian
-                    // makes `I − c·J` diagonal, so the O(n³) LU collapses to `n`
-                    // reciprocal denominators. Bit-identical (see `NewtonFactor`);
-                    // `nlu` counts the factorization either way, so the reported
-                    // `SolveIvpResult` counters are unchanged.
-                    let force_dense = BDF_FORCE_DENSE_NEWTON.load(Ordering::Relaxed);
-                    let diag = if force_dense {
-                        None
-                    } else {
-                        self.jac_diagonal
-                            .as_deref()
-                            .and_then(|d| newton_denominators(d, c))
-                    };
-                    let band = if force_dense { None } else { self.jac_band };
-                    self.lu = Some(match diag {
-                        Some(d) => {
-                            BDF_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
-                            self.diag_factorizations += 1;
-                            NewtonFactor::Diagonal(d)
-                        }
-                        None => {
-                            // ONE allocation and ONE traversal, not three: the
-                            // idiomatic `identity(n, n) - jac.scale(c)` materialises an
-                            // identity, a scaled copy, and the difference. At n=512
-                            // those are 2 MB each, above glibc's mmap threshold, so
-                            // every factorization mmap'd and faulted in ~6 MB and freed
-                            // it again — MEASURED as 246,581 minor faults for three
-                            // n=512 solves versus 2,569 at n=256 (a 96x jump for 2x n,
-                            // i.e. not the n^2 the arithmetic predicts), and 75% of the
-                            // arm-isolated profile sitting in the kernel.
-                            // BIT-IDENTICAL: same expression per entry, `1.0` or `0.0`
-                            // minus `c * jac[(i, j)]`, and IEEE multiplication is
-                            // commutative so `jac.scale(c)`'s operand order is moot.
-                            let system = if BDF_FORCE_TEMP_SYSTEM_BUILD.load(Ordering::Relaxed) {
-                                DMatrix::<f64>::identity(n, n) - jac.scale(c)
-                            } else {
-                                DMatrix::<f64>::from_fn(n, n, |row, col| {
-                                    let unit = if row == col { 1.0 } else { 0.0 };
-                                    unit - c * jac[(row, col)]
-                                })
-                            };
-                            // Same structural argument one step out: a banded
-                            // `I - c*J` makes GEPP touch only the band, and the skipped
-                            // work is provably a no-op — PROVIDED no row interchange
-                            // occurs, which `BandedLu::factor` checks and reports by
-                            // returning `None` (see `BandedLu`). The dense LU is the
-                            // fallback in that case, so nothing is claimed for matrices
-                            // that would pivot.
-                            let banded = band.filter(|&(kl, ku)| {
-                                // Strict column diagonal dominance is preserved by
-                                // Gaussian elimination, so checking it ONCE on the
-                                // untouched matrix means no step can interchange. It is
-                                // O(n·band) and lets `factor` consume `system` without
-                                // an n² defensive copy.
-                                band_column_diagonally_dominant(&system, kl, ku)
-                            });
-                            match banded {
-                                Some((kl, ku)) => match BandedLu::factor(system, kl, ku) {
-                                    Some(banded) => {
-                                        BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
-                                        self.band_factorizations += 1;
-                                        NewtonFactor::Banded(banded)
-                                    }
-                                    // Unreachable given the dominance check above, but
-                                    // the check is belt-and-braces, not a proof we lean
-                                    // on: rebuild and take the dense path.
-                                    None => NewtonFactor::Dense(
-                                        DMatrix::<f64>::from_fn(n, n, |row, col| {
-                                            let unit = if row == col { 1.0 } else { 0.0 };
-                                            unit - c * jac[(row, col)]
-                                        })
-                                        .lu(),
-                                    ),
+                    self.lu = Some(if let BdfJacobian::Sparse(jac) = jac {
+                        let system = sparse_newton_matrix(jac, c, self.mode)?;
+                        if system.data().iter().any(|value| !value.is_finite()) {
+                            NewtonFactor::SparseUnusable
+                        } else {
+                            match splu_native(
+                                &system,
+                                LuOptions {
+                                    mode: self.mode,
+                                    ..LuOptions::default()
                                 },
-                                None => NewtonFactor::Dense(system.lu()),
+                            ) {
+                                Ok(factor) => {
+                                    self.sparse_factorizations += 1;
+                                    NewtonFactor::Sparse(factor)
+                                }
+                                Err(
+                                    SparseError::SingularMatrix { .. }
+                                    | SparseError::NonFiniteInput { .. },
+                                ) => {
+                                    // The CSC system is finite and canonical here, so
+                                    // NonFiniteInput can only describe overflow during
+                                    // elimination. Reducing c can repair that growth.
+                                    NewtonFactor::SparseUnusable
+                                }
+                                Err(SparseError::ResourceExhausted { message }) => {
+                                    return Err(StepFailure::InvalidJacobian(
+                                        crate::IntegrateValidationError::ResourceExhausted {
+                                            message,
+                                        },
+                                    ));
+                                }
+                                Err(error) => {
+                                    return Err(StepFailure::SparseLinearSolve {
+                                        message: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        let jac = jac.dense().expect("dense Jacobian arm");
+                        // Structure-exploiting factorization: an exactly-diagonal Jacobian
+                        // makes `I − c·J` diagonal, so the O(n³) LU collapses to `n`
+                        // reciprocal denominators. Bit-identical (see `NewtonFactor`);
+                        // `nlu` counts the factorization either way, so the reported
+                        // `SolveIvpResult` counters are unchanged.
+                        let force_dense = BDF_FORCE_DENSE_NEWTON.load(Ordering::Relaxed);
+                        let diag = if force_dense {
+                            None
+                        } else {
+                            self.jac_diagonal
+                                .as_deref()
+                                .and_then(|d| newton_denominators(d, c))
+                        };
+                        let band = if force_dense { None } else { self.jac_band };
+                        match diag {
+                            Some(d) => {
+                                BDF_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                self.diag_factorizations += 1;
+                                NewtonFactor::Diagonal(d)
+                            }
+                            None => {
+                                // ONE allocation and ONE traversal, not three: the
+                                // idiomatic `identity(n, n) - jac.scale(c)` materialises an
+                                // identity, a scaled copy, and the difference. At n=512
+                                // those are 2 MB each, above glibc's mmap threshold, so
+                                // every factorization mmap'd and faulted in ~6 MB and freed
+                                // it again — MEASURED as 246,581 minor faults for three
+                                // n=512 solves versus 2,569 at n=256 (a 96x jump for 2x n,
+                                // i.e. not the n^2 the arithmetic predicts), and 75% of the
+                                // arm-isolated profile sitting in the kernel.
+                                // BIT-IDENTICAL: same expression per entry, `1.0` or `0.0`
+                                // minus `c * jac[(i, j)]`, and IEEE multiplication is
+                                // commutative so `jac.scale(c)`'s operand order is moot.
+                                let system = if BDF_FORCE_TEMP_SYSTEM_BUILD.load(Ordering::Relaxed)
+                                {
+                                    DMatrix::<f64>::identity(n, n) - jac.scale(c)
+                                } else {
+                                    DMatrix::<f64>::from_fn(n, n, |row, col| {
+                                        let unit = if row == col { 1.0 } else { 0.0 };
+                                        unit - c * jac[(row, col)]
+                                    })
+                                };
+                                // Same structural argument one step out: a banded
+                                // `I - c*J` makes GEPP touch only the band, and the skipped
+                                // work is provably a no-op — PROVIDED no row interchange
+                                // occurs, which `BandedLu::factor` checks and reports by
+                                // returning `None` (see `BandedLu`). The dense LU is the
+                                // fallback in that case, so nothing is claimed for matrices
+                                // that would pivot.
+                                let banded = band.filter(|&(kl, ku)| {
+                                    // Strict column diagonal dominance is preserved by
+                                    // Gaussian elimination, so checking it ONCE on the
+                                    // untouched matrix means no step can interchange. It is
+                                    // O(n·band) and lets `factor` consume `system` without
+                                    // an n² defensive copy.
+                                    band_column_diagonally_dominant(&system, kl, ku)
+                                });
+                                match banded {
+                                    Some((kl, ku)) => match BandedLu::factor(system, kl, ku) {
+                                        Some(banded) => {
+                                            BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                            self.band_factorizations += 1;
+                                            NewtonFactor::Banded(banded)
+                                        }
+                                        // Unreachable given the dominance check above, but
+                                        // the check is belt-and-braces, not a proof we lean
+                                        // on: rebuild and take the dense path.
+                                        None => NewtonFactor::Dense(
+                                            DMatrix::<f64>::from_fn(n, n, |row, col| {
+                                                let unit = if row == col { 1.0 } else { 0.0 };
+                                                unit - c * jac[(row, col)]
+                                            })
+                                            .lu(),
+                                        ),
+                                    },
+                                    None => NewtonFactor::Dense(system.lu()),
+                                }
                             }
                         }
                     });
@@ -983,32 +1246,50 @@ impl BdfSolver {
                             break; // Jacobian already fresh this step: shrink the step.
                         }
                         // SciPy's jac_wrapped: f at the point (not counted in nfev), then
-                        // num_jac. The O(n²) structural scan runs once per Jacobian, not
+                        // num_jac. Dense structural scans run once per Jacobian, not
                         // once per factorization — see `newton_denominators`.
                         self.njev += 1;
-                        let jac = match self.jac_callback {
-                            Some(jac) => evaluate_jacobian(jac, t_new, &y_predict)
-                                .map_err(StepFailure::InvalidJacobian)?,
-                            None => {
-                                let f_pred = fun(t_new, &y_predict);
-                                num_jac(
-                                    fun,
-                                    t_new,
-                                    &y_predict,
-                                    &f_pred,
-                                    &self.atol,
-                                    &mut self.jac_factor,
-                                    self.jac_sparsity.as_ref(),
+                        let jac = if let Some(callback) = self.jac_sparse_callback {
+                            BdfJacobian::Sparse(
+                                evaluate_sparse_jacobian(callback, t_new, &y_predict, self.mode)
+                                    .map_err(StepFailure::InvalidJacobian)?,
+                            )
+                        } else if let Some(callback) = self.jac_callback {
+                            BdfJacobian::Dense(
+                                evaluate_jacobian(callback, t_new, &y_predict)
+                                    .map_err(StepFailure::InvalidJacobian)?,
+                            )
+                        } else {
+                            let f_pred = fun(t_new, &y_predict);
+                            if let Some(pattern) = self.jac_sparsity.as_ref() {
+                                BdfJacobian::Sparse(
+                                    num_jac_sparse(
+                                        fun,
+                                        t_new,
+                                        &y_predict,
+                                        &f_pred,
+                                        &self.atol,
+                                        &mut self.jac_factor,
+                                        pattern,
+                                    )
+                                    .map_err(StepFailure::InvalidJacobian)?,
                                 )
-                                .map_err(StepFailure::InvalidJacobian)?
+                            } else {
+                                BdfJacobian::Dense(
+                                    num_jac(
+                                        fun,
+                                        t_new,
+                                        &y_predict,
+                                        &f_pred,
+                                        &self.atol,
+                                        &mut self.jac_factor,
+                                        None,
+                                    )
+                                    .map_err(StepFailure::InvalidJacobian)?,
+                                )
                             }
                         };
-                        self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
-                        self.jac_band = if self.jac_diagonal.is_some() {
-                            None // the diagonal path is strictly better; do not double-scan.
-                        } else {
-                            jacobian_bandwidth(&jac)
-                        };
+                        (self.jac_diagonal, self.jac_band) = jac.dense_structure();
                         self.current_jac = Some(jac);
                         self.lu = None;
                         jac_fresh = true;
@@ -1191,6 +1472,18 @@ impl BdfSolver {
                     }
                     &rhs
                 }
+                NewtonFactor::Sparse(lu) => {
+                    for j in 0..n {
+                        rhs[j] = c * f[j] - psi[j] - d[j];
+                    }
+                    let solved = splu_solve(lu, rhs.as_slice()).ok()?;
+                    if solved.iter().any(|value| !value.is_finite()) {
+                        return None;
+                    }
+                    dy_owned = DVector::from_vec(solved);
+                    &dy_owned
+                }
+                NewtonFactor::SparseUnusable => return None,
                 NewtonFactor::Diagonal(diag) => {
                     // `(I − c·J) Δ = rhs` with a diagonal system is `n` divisions.
                     // `finite` guards the ONE case where the dense arm's zero-times-
@@ -1206,7 +1499,7 @@ impl BdfSolver {
                         rhs[j] = q;
                     }
                     if !finite {
-                        let jac = self.current_jac.as_ref()?;
+                        let jac = self.current_jac.as_ref()?.dense()?;
                         let lu_c = self.lu_c;
                         let lu = DMatrix::<f64>::from_fn(n, n, |row, col| {
                             let unit = if row == col { 1.0 } else { 0.0 };
@@ -1249,6 +1542,232 @@ impl BdfSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sparse_test_config(y0: &[f64], t_bound: f64) -> BdfSolverConfig<'_> {
+        BdfSolverConfig {
+            t0: 0.0,
+            y0,
+            t_bound,
+            rtol: 1e-7,
+            atol: ToleranceValue::Scalar(1e-10),
+            max_step: f64::INFINITY,
+            first_step: None,
+            mode: RuntimeMode::Strict,
+            max_order: 5,
+        }
+    }
+
+    #[test]
+    fn bdf_sparse_coloring_and_newton_storage_scale_with_nonzeros() {
+        // Relabeling a ring makes the Jacobian far from diagonal or narrowly banded.
+        // A dense Jacobian at this dimension would alone retain 128 MiB.
+        let n = 4096;
+        let stride = 127;
+        let pattern = JacobianSparsity::from_rows(
+            &(0..n)
+                .map(|i| vec![i, (i + stride) % n, (i + n - stride) % n])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut calls = 0;
+        let mut rhs = |_t: f64, y: &[f64]| {
+            calls += 1;
+            (0..n)
+                .map(|i| {
+                    500.0 * (y[(i + stride) % n] - 2.0 * y[i] + y[(i + n - stride) % n]) - y[i]
+                })
+                .collect::<Vec<_>>()
+        };
+        let y0 = vec![1.0; n];
+        let mut config = sparse_test_config(&y0, 1e-4);
+        config.first_step = Some(1e-4);
+        let mut solver =
+            BdfSolver::new_with_jacobian_sparsity(&mut rhs, config, None, Some(&pattern)).unwrap();
+        let Some(BdfJacobian::Sparse(jac)) = solver.current_jac.as_ref() else {
+            panic!("a sparsity pattern must produce a CSC Jacobian");
+        };
+        assert_eq!(jac.nnz(), 3 * n);
+        assert_eq!(jac.indptr().len(), n + 1);
+        assert!(solver.jac_diagonal.is_none() && solver.jac_band.is_none());
+        solver.step_with(&mut rhs).unwrap();
+        assert_eq!(solver.state(), OdeSolverState::Finished);
+        assert_eq!(solver.njev(), 1);
+        assert_eq!(calls, solver.nfev() + pattern.group_count());
+        assert_eq!(solver.sparse_factorizations, solver.nlu());
+        let Some(NewtonFactor::Sparse(factor)) = solver.lu.as_ref() else {
+            panic!("sparse Newton factors must be retained for reuse");
+        };
+        assert_eq!(
+            factor.backend_used,
+            fsci_sparse::SparseBackend::NativeSparseLu
+        );
+        assert!(fsci_sparse::linalg::splu_factor_payload_bytes(factor) < 512 * n);
+        let exact = (-1e-4_f64).exp();
+        assert!(solver.y().iter().all(|value| (value - exact).abs() < 1e-8));
+    }
+
+    #[test]
+    fn bdf_zero_sparse_jacobian_inserts_identity_without_rhs_perturbations() {
+        let n = 5;
+        let pattern = JacobianSparsity::from_rows(&vec![vec![]; n]).unwrap();
+        let mut calls = 0;
+        let mut rhs = |_t: f64, _y: &[f64]| {
+            calls += 1;
+            vec![2.0; n]
+        };
+        let y0 = vec![1.0; n];
+        let mut solver = BdfSolver::new_with_jacobian_sparsity(
+            &mut rhs,
+            sparse_test_config(&y0, 1.0),
+            None,
+            Some(&pattern),
+        )
+        .unwrap();
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut rhs).unwrap();
+        }
+        assert_eq!(calls, solver.nfev());
+        assert_eq!(solver.njev(), 1);
+        assert!(solver.sparse_factorizations > 0);
+        assert_eq!(solver.diag_factorizations, 0);
+        assert_eq!(solver.band_factorizations, 0);
+        assert!(solver.y().iter().all(|value| (value - 3.0).abs() < 1e-13));
+        let Some(BdfJacobian::Sparse(jac)) = solver.current_jac.as_ref() else {
+            panic!("zero Jacobians still retain sparse storage");
+        };
+        assert_eq!(jac.nnz(), 0);
+    }
+
+    #[test]
+    fn sparse_jacobian_canonicalization_and_shift_preserve_duplicate_sums() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(
+                Shape2D::new(3, 3),
+                vec![1.0, -4.0, 2.0, 5.0, 2.0, -5.0],
+                vec![2, 0, 2, 2, 0, 2],
+                vec![0, 3, 6, 6],
+                false,
+            )
+            .unwrap()
+        }
+        let jac = evaluate_sparse_jacobian(jac, 0.0, &[1.0; 3], RuntimeMode::Strict).unwrap();
+        assert_eq!(jac.indptr(), &[0, 2, 4, 4]);
+        assert_eq!(jac.indices(), &[0, 2, 0, 2]);
+        assert_eq!(jac.data(), &[-4.0, 3.0, 2.0, 0.0]);
+        let system = sparse_newton_matrix(&jac, 0.5, RuntimeMode::Strict).unwrap();
+        let factor = splu_native(&system, LuOptions::default()).unwrap();
+        assert_eq!(
+            factor.backend_used,
+            fsci_sparse::SparseBackend::NativeSparseLu
+        );
+        let solved = splu_solve(&factor, &[5.0, -2.0, 1.5]).unwrap();
+        for (got, expected) in solved.iter().zip([1.0, -2.0, 3.0]) {
+            assert!((got - expected).abs() < 1e-14);
+        }
+
+        fn overflow(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(
+                Shape2D::new(1, 1),
+                vec![f64::MAX, f64::MAX],
+                vec![0, 0],
+                vec![0, 2],
+                false,
+            )
+            .unwrap()
+        }
+        assert_eq!(
+            evaluate_sparse_jacobian(overflow, 0.0, &[1.0], RuntimeMode::Strict),
+            Err(crate::IntegrateValidationError::NonFiniteJacobian)
+        );
+    }
+
+    #[test]
+    fn bdf_sparse_singular_newton_matrix_recovers_by_reducing_step() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(Shape2D::new(1, 1), vec![1.0], vec![0], vec![0, 1], true)
+                .unwrap()
+        }
+        let mut rhs = |_t: f64, y: &[f64]| vec![y[0]];
+        let mut config = sparse_test_config(&[1.0], ALPHA_C[1]);
+        config.first_step = Some(ALPHA_C[1]);
+        let mut solver = BdfSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
+        let shifted = sparse_newton_matrix(&jac(0.0, &[1.0]), 1.0, RuntimeMode::Strict).unwrap();
+        assert_eq!(shifted.data(), &[0.0]);
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut rhs).unwrap();
+        }
+        assert!(solver.nlu() > solver.sparse_factorizations);
+        assert!(
+            solver.njev() > 1,
+            "a singular factor must try a fresh Jacobian"
+        );
+        assert!((solver.y()[0] - ALPHA_C[1].exp()).abs() < 3e-6);
+        assert_eq!(solver.diag_factorizations + solver.band_factorizations, 0);
+    }
+
+    #[test]
+    fn bdf_sparse_factor_failure_is_typed_and_terminal() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(
+                Shape2D::new(2, 2),
+                vec![-1.0, -2.0],
+                vec![0, 1],
+                vec![0, 1, 2],
+                true,
+            )
+            .unwrap()
+        }
+        let mut rhs = |_t: f64, y: &[f64]| vec![-y[0], -2.0 * y[1]];
+        let mut config = sparse_test_config(&[1.0; 2], 1.0);
+        config.mode = RuntimeMode::Hardened;
+        let mut solver = BdfSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
+        let error = fsci_sparse::with_hardened_sparse_caps(1, 1, || {
+            solver.step_with(&mut rhs).unwrap_err()
+        });
+        assert!(matches!(
+            error,
+            StepFailure::InvalidJacobian(crate::IntegrateValidationError::ResourceExhausted { .. })
+        ));
+        assert_eq!(solver.state(), OdeSolverState::Failed);
+        assert_eq!(solver.sparse_factorizations, 0);
+        assert!(matches!(
+            solver.step_with(&mut rhs),
+            Err(StepFailure::RuntimeError(_))
+        ));
+    }
+
+    #[test]
+    fn bdf_sparse_lu_growth_overflow_recovers_by_reducing_step() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(
+                Shape2D::new(2, 2),
+                vec![-1e308, 1e308, -1e308, -1e308],
+                vec![0, 1, 0, 1],
+                vec![0, 2, 4],
+                true,
+            )
+            .unwrap()
+        }
+        let system = sparse_newton_matrix(&jac(0.0, &[0.0; 2]), 1.0, RuntimeMode::Strict).unwrap();
+        assert!(system.data().iter().all(|value| value.is_finite()));
+        assert!(matches!(
+            splu_native(&system, LuOptions::default()),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+        let mut rhs =
+            |_t: f64, y: &[f64]| vec![-1e308 * y[0] - 1e308 * y[1], 1e308 * y[0] - 1e308 * y[1]];
+        let mut config = sparse_test_config(&[0.0; 2], ALPHA_C[1]);
+        config.first_step = Some(ALPHA_C[1]);
+        let mut solver = BdfSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut rhs).unwrap();
+        }
+        assert_eq!(solver.y(), &[0.0, 0.0]);
+        assert!(solver.nlu() > solver.sparse_factorizations);
+        assert!(solver.sparse_factorizations > 0);
+        assert!(solver.njev() > 1);
+        assert_eq!(solver.diag_factorizations + solver.band_factorizations, 0);
+    }
 
     /// `BDF_FORCE_DENSE_NEWTON` is process-global and the test harness runs tests
     /// concurrently, so every test that toggles it must hold this lock. The lock does NOT

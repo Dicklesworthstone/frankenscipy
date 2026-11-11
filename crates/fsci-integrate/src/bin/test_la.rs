@@ -15,6 +15,7 @@ fn main() {
         max_step: f64::INFINITY,
         mode: RuntimeMode::Strict,
         jac: None,
+        jac_sparse: None,
         jac_sparsity: None,
         lband: None,
         uband: None,

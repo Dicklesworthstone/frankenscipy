@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use fsci_runtime::RuntimeMode;
+use fsci_sparse::{CscMatrix, Shape2D};
 
 use crate::validation::validate_rhs_shape;
 use crate::{IntegrateValidationError, ToleranceValue};
@@ -15,8 +16,9 @@ pub type StepRhsFn = dyn FnMut(f64, &[f64]) -> Vec<f64>;
 /// together, requiring one RHS call per color instead of one per state variable.
 /// The coloring is deterministic and is computed once when this object is built.
 ///
-/// This reduces Jacobian evaluation work; the implicit solvers retain their existing
-/// dense/structured Newton factorizations and dense Jacobian storage.
+/// BDF preserves this structure through CSC Jacobian storage and sparse Newton
+/// factorizations. Radau uses the coloring to reduce Jacobian evaluation work while
+/// retaining its dense Jacobian storage and existing Newton factorizations.
 /// The CASP stiffness probe also uses this coloring and stores only the declared nonzeros.
 ///
 /// ```
@@ -424,44 +426,23 @@ where
     F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
 {
     let n = y.len();
-    validate_rhs_shape(f.len(), n)?;
-    if !f.iter().all(|value| value.is_finite()) {
-        return Err(IntegrateValidationError::NonFiniteJacobian);
-    }
-    if let Some(pattern) = sparsity {
-        pattern.validate_dimension(n)?;
-    }
+    let (mut fac, y_scale, mut h) = num_jac_steps(y, f, threshold, factor, sparsity)?;
     if n == 0 {
         return Ok(nalgebra::DMatrix::zeros(0, 0));
     }
-    let (diff_reject, diff_small, diff_big, sqrt_eps) = eps_powers();
+    let (diff_reject, diff_small, diff_big, _) = eps_powers();
     let min_factor = 1e3 * f64::EPSILON;
-
-    let mut fac = factor.take().unwrap_or_else(|| vec![sqrt_eps; n]);
-    let mut y_scale = vec![0.0; n];
-    let mut h = vec![0.0; n];
-    for j in 0..n {
-        if sparsity.is_some_and(|pattern| pattern.column_rows[j].is_empty()) {
-            // A structurally zero column needs neither a perturbation nor a scale.
-            h[j] = 1.0;
-            continue;
-        }
-        let sign = if f[j] >= 0.0 { 1.0 } else { -1.0 };
-        y_scale[j] = sign * threshold[j].max(y[j].abs());
-        h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
-        while h[j] == 0.0 {
-            fac[j] *= 10.0;
-            h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
-        }
-        if !h[j].is_finite() {
-            return Err(IntegrateValidationError::NonFiniteJacobian);
-        }
-    }
 
     if let Some(pattern) = sparsity {
         let jac = grouped_num_jac(fun, t, y, f, &mut h, &mut fac, &y_scale, pattern)?;
         *factor = Some(fac);
-        return Ok(jac);
+        let mut dense = nalgebra::DMatrix::zeros(n, n);
+        for j in 0..n {
+            for k in jac.indptr()[j]..jac.indptr()[j + 1] {
+                dense[(jac.indices()[k], j)] = jac.data()[k];
+            }
+        }
+        return Ok(dense);
     }
 
     // One column: fun at y + h_j e_j, its difference from f, and the row of the largest
@@ -531,6 +512,73 @@ where
     Ok(jac)
 }
 
+/// The sparse counterpart of `num_jac`: never materializes an n-by-n buffer.
+/// It shares perturbation sizing, coloring and cancellation retries with Radau's
+/// numerical Jacobian path, but retains only the declared structural entries.
+pub(crate) fn num_jac_sparse<F>(
+    fun: &mut F,
+    t: f64,
+    y: &[f64],
+    f: &[f64],
+    threshold: &[f64],
+    factor: &mut Option<Vec<f64>>,
+    sparsity: &JacobianSparsity,
+) -> Result<CscMatrix, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
+{
+    let (mut fac, y_scale, mut h) = num_jac_steps(y, f, threshold, factor, Some(sparsity))?;
+    let jac = grouped_num_jac(fun, t, y, f, &mut h, &mut fac, &y_scale, sparsity)?;
+    if !y.is_empty() {
+        *factor = Some(fac);
+    }
+    Ok(jac)
+}
+
+/// Prepare identical adaptive perturbations for dense and sparse destinations.
+#[allow(clippy::type_complexity)]
+fn num_jac_steps(
+    y: &[f64],
+    f: &[f64],
+    threshold: &[f64],
+    factor: &mut Option<Vec<f64>>,
+    sparsity: Option<&JacobianSparsity>,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), IntegrateValidationError> {
+    let n = y.len();
+    validate_rhs_shape(f.len(), n)?;
+    if !f.iter().all(|value| value.is_finite()) {
+        return Err(IntegrateValidationError::NonFiniteJacobian);
+    }
+    if let Some(pattern) = sparsity {
+        pattern.validate_dimension(n)?;
+    }
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let (_, _, _, sqrt_eps) = eps_powers();
+    let mut fac = factor.take().unwrap_or_else(|| vec![sqrt_eps; n]);
+    let mut y_scale = vec![0.0; n];
+    let mut h = vec![0.0; n];
+    for j in 0..n {
+        if sparsity.is_some_and(|pattern| pattern.column_rows[j].is_empty()) {
+            // A structurally zero column needs neither a perturbation nor a scale.
+            h[j] = 1.0;
+            continue;
+        }
+        let sign = if f[j] >= 0.0 { 1.0 } else { -1.0 };
+        y_scale[j] = sign * threshold[j].max(y[j].abs());
+        h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
+        while h[j] == 0.0 {
+            fac[j] *= 10.0;
+            h[j] = (y[j] + fac[j] * y_scale[j]) - y[j];
+        }
+        if !h[j].is_finite() {
+            return Err(IntegrateValidationError::NonFiniteJacobian);
+        }
+    }
+    Ok((fac, y_scale, h))
+}
+
 /// Sparse finite differences with SciPy's adaptive per-column perturbations. Columns
 /// in one color never affect the same output row, including during retry evaluation.
 fn grouped_num_jac<F>(
@@ -542,13 +590,18 @@ fn grouped_num_jac<F>(
     factor: &mut [f64],
     y_scale: &[f64],
     pattern: &JacobianSparsity,
-) -> Result<nalgebra::DMatrix<f64>, IntegrateValidationError>
+) -> Result<CscMatrix, IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
 {
     let n = y.len();
     let (diff_reject, diff_small, diff_big, _) = eps_powers();
-    let mut jac = nalgebra::DMatrix::zeros(n, n);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for rows in &pattern.column_rows {
+        indptr.push(indptr.last().copied().unwrap() + rows.len());
+    }
+    let mut data = vec![0.0; indptr[n]];
     let mut max_diff = vec![0.0_f64; n];
     let mut scale = vec![0.0; n];
     let mut perturbed = y.to_vec();
@@ -568,9 +621,9 @@ where
         }
         for &j in group {
             let mut max_ind = 0;
-            for &i in &pattern.column_rows[j] {
+            for (k, &i) in pattern.column_rows[j].iter().enumerate() {
                 let diff = f_new[i] - f[i];
-                jac[(i, j)] = diff;
+                data[indptr[j] + k] = diff;
                 if diff.abs() > max_diff[j] {
                     max_diff[j] = diff.abs();
                     max_ind = i;
@@ -617,8 +670,8 @@ where
                 if max_diff[j] * retry_scale < retry_max * scale[j] {
                     factor[j] *= 10.0;
                     h[j] = h_new;
-                    for &i in &pattern.column_rows[j] {
-                        jac[(i, j)] = f_retry[i] - f[i];
+                    for (k, &i) in pattern.column_rows[j].iter().enumerate() {
+                        data[indptr[j] + k] = f_retry[i] - f[i];
                     }
                     scale[j] = retry_scale;
                     max_diff[j] = retry_max;
@@ -627,9 +680,9 @@ where
         }
 
         for &j in group {
-            for &i in &pattern.column_rows[j] {
-                jac[(i, j)] /= h[j];
-                if !jac[(i, j)].is_finite() {
+            for value in &mut data[indptr[j]..indptr[j + 1]] {
+                *value /= h[j];
+                if !value.is_finite() {
                     return Err(IntegrateValidationError::NonFiniteJacobian);
                 }
             }
@@ -641,7 +694,16 @@ where
             factor[j] = factor[j].max(1e3 * f64::EPSILON);
         }
     }
-    Ok(jac)
+    CscMatrix::from_components(
+        Shape2D::new(n, n),
+        data,
+        pattern.column_rows.iter().flatten().copied().collect(),
+        indptr,
+        true,
+    )
+    .map_err(|error| IntegrateValidationError::InvalidJacobianSparsity {
+        message: error.to_string(),
+    })
 }
 
 #[cfg(test)]

@@ -6114,6 +6114,62 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     })
 }
 
+/// Factor a CSC matrix using native sparse LU at every matrix size.
+///
+/// This entry point keeps the input and factors in sparse storage, including for
+/// small matrices and patterns that [`splu`] would route to dense LU. It is useful
+/// when a caller, such as a stiff ODE solver, must retain a sparse Jacobian through
+/// every Newton factorization. Fill-in can still increase storage according to the
+/// matrix pattern and the requested ordering; no dense fallback is performed.
+///
+/// Duplicate entries are summed before factorization. Non-finite entries or
+/// arithmetic, invalid pivot thresholds, singular matrices, and Hardened resource
+/// limits are returned as errors. The result supports all existing `splu_solve`
+/// variants, including transpose and multiple-right-hand-side solves.
+pub fn splu_native(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactorization> {
+    let shape = a.shape();
+    check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "splu_native requires a square matrix".to_string(),
+        });
+    }
+    if !(0.0..=1.0).contains(&options.diag_pivot_thresh) {
+        return Err(SparseError::InvalidArgument {
+            message: "diag_pivot_thresh must be in [0, 1]".to_string(),
+        });
+    }
+    if a.data().iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "splu_native requires finite matrix entries".to_string(),
+        });
+    }
+    let csr = a.to_csr()?;
+    if csr.data().iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "summing sparse matrix duplicates produced a non-finite entry".to_string(),
+        });
+    }
+    let native = NativeSparseLu::factorize_csr(&csr, options.diag_pivot_thresh, options.ordering)?;
+    if native
+        .lower
+        .values
+        .iter()
+        .chain(&native.upper.values)
+        .any(|value| !value.is_finite())
+    {
+        return Err(SparseError::NonFiniteInput {
+            message: "native sparse LU arithmetic produced non-finite factors".to_string(),
+        });
+    }
+    Ok(SparseLuFactorization {
+        shape: (shape.rows, shape.cols),
+        backend_used: SparseBackend::NativeSparseLu,
+        ordering_used: native.ordering_used,
+        lu_internal: SparseLuInternal::Native(native),
+    })
+}
+
 pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactorization> {
     let shape = a.shape();
     check_hardened_sparse_cap(shape, a.nnz(), options.mode, None)?;
@@ -11871,7 +11927,10 @@ pub fn lsmr_with_options(
         && start.len() != n
     {
         return Err(SparseError::IncompatibleShape {
-            message: format!("lsmr x0 length {} must match matrix columns {n}", start.len()),
+            message: format!(
+                "lsmr x0 length {} must match matrix columns {n}",
+                start.len()
+            ),
         });
     }
     for (name, tolerance) in [("atol", options.atol), ("btol", options.btol)] {
@@ -12634,11 +12693,7 @@ mod lsmr_options_tests {
 
     #[test]
     fn lsmr_options_iteration_and_condition_limits_are_distinct() {
-        let a = dense(&[
-            &[1.0, 0.0, 0.0],
-            &[0.0, 0.1, 0.0],
-            &[0.0, 0.0, 0.01],
-        ]);
+        let a = dense(&[&[1.0, 0.0, 0.0], &[0.0, 0.1, 0.0], &[0.0, 0.0, 0.01]]);
         let controls = LsmrOptions {
             atol: 0.0,
             btol: 0.0,
@@ -18977,6 +19032,152 @@ mod tests {
         let a = square_csc();
         let result = splu(&a, LuOptions::default()).expect("splu should succeed");
         assert_eq!(result.shape, (2, 2));
+    }
+
+    #[test]
+    fn splu_native_preserves_sparse_pivoted_and_transpose_solves() {
+        // Unsorted entries and duplicates represent [[0,2,0],[3,4,1],[0,1,5]].
+        // Its zero leading diagonal forces a row interchange in natural order.
+        let a = CscMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![1.0, 2.0, 1.0, 1.5, 4.0, 0.5, 5.0, 1.0],
+            vec![1, 1, 2, 0, 1, 0, 2, 1],
+            vec![0, 2, 6, 8],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            splu(&a, LuOptions::default()).unwrap().backend_used,
+            SparseBackend::DenseLu,
+            "the fixture exercises a size the automatic entry point densifies"
+        );
+        for ordering in [
+            PermutationOrdering::Natural,
+            PermutationOrdering::ReverseCuthillMcKee,
+            PermutationOrdering::Amd,
+        ] {
+            let factor = splu_native(
+                &a,
+                LuOptions {
+                    ordering,
+                    ..LuOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(factor.backend_used, SparseBackend::NativeSparseLu);
+            let SparseLuInternal::Native(native) = &factor.lu_internal else {
+                panic!("splu_native must retain compressed factors");
+            };
+            if ordering == PermutationOrdering::Natural {
+                assert_ne!(native.row_perm, [0, 1, 2]);
+            }
+            let expected = [1.0, -2.0, 3.0];
+            let direct = splu_solve(&factor, &[-4.0, -2.0, 13.0]).unwrap();
+            let transpose = splu_solve_transpose(&factor, &[-6.0, -3.0, 13.0]).unwrap();
+            let panel = splu_solve_many(&factor, &[vec![-4.0, -2.0, 13.0], vec![-8.0, -4.0, 26.0]])
+                .unwrap();
+            for i in 0..expected.len() {
+                assert!((direct[i] - expected[i]).abs() < 1e-12);
+                assert!((transpose[i] - expected[i]).abs() < 1e-12);
+                assert!((panel[0][i] - expected[i]).abs() < 1e-12);
+                assert!((panel[1][i] - 2.0 * expected[i]).abs() < 2e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn splu_native_large_stencil_retains_linear_factor_storage() {
+        let n = 4096;
+        let mut values = Vec::with_capacity(3 * n - 2);
+        let mut indices = Vec::with_capacity(3 * n - 2);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for column in 0..n {
+            for row in column.saturating_sub(1)..=(column + 1).min(n - 1) {
+                indices.push(row);
+                values.push(if row == column { 4.0 } else { -1.0 });
+            }
+            indptr.push(values.len());
+        }
+        let a =
+            CscMatrix::from_components(Shape2D::new(n, n), values, indices, indptr, true).unwrap();
+        let factor = splu_native(
+            &a,
+            LuOptions {
+                ordering: PermutationOrdering::Natural,
+                ..LuOptions::default()
+            },
+        )
+        .unwrap();
+        let SparseLuInternal::Native(native) = &factor.lu_internal else {
+            panic!("a sparse stencil must not become a dense factor");
+        };
+        assert!(native.stored_nnz() <= 3 * n);
+        assert!(splu_factor_payload_bytes(&factor) < 96 * n);
+        let mut rhs = vec![2.0; n];
+        rhs[0] = 3.0;
+        rhs[n - 1] = 3.0;
+        let solution = splu_solve(&factor, &rhs).unwrap();
+        assert!(solution.iter().all(|value| (value - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn splu_native_rejects_invalid_or_nonfinite_factorizations() {
+        assert!(matches!(
+            splu_native(&non_square_csc(), LuOptions::default()),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        for threshold in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                splu_native(
+                    &square_csc(),
+                    LuOptions {
+                        diag_pivot_thresh: threshold,
+                        ..LuOptions::default()
+                    }
+                ),
+                Err(SparseError::InvalidArgument { .. })
+            ));
+        }
+        for values in [vec![f64::NAN], vec![f64::INFINITY], vec![1e308, 1e308]] {
+            let count = values.len();
+            let a = CscMatrix::from_components(
+                Shape2D::new(1, 1),
+                values,
+                vec![0; count],
+                vec![0, count],
+                false,
+            )
+            .unwrap();
+            assert!(matches!(
+                splu_native(&a, LuOptions::default()),
+                Err(SparseError::NonFiniteInput { .. })
+            ));
+        }
+        let singular = CscMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0, 2.0, 4.0],
+            vec![0, 1, 0, 1],
+            vec![0, 2, 4],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            splu_native(&singular, LuOptions::default()),
+            Err(SparseError::SingularMatrix { .. })
+        ));
+        crate::formats::with_hardened_sparse_caps(1, 1, || {
+            assert!(matches!(
+                splu_native(
+                    &square_csc(),
+                    LuOptions {
+                        mode: RuntimeMode::Hardened,
+                        ..LuOptions::default()
+                    }
+                ),
+                Err(SparseError::ResourceExhausted { .. })
+            ));
+        });
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub enum StepFailure {
     SolverError,
     NonFiniteState,
     InvalidJacobian(crate::IntegrateValidationError),
+    /// A sparse factorization failed for a reason that step reduction cannot repair.
+    SparseLinearSolve {
+        message: String,
+    },
     NotYetImplemented(&'static str),
 }
 

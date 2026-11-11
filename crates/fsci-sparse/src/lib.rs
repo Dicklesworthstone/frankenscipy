@@ -286,6 +286,7 @@ pub use linalg::{
     spilu,
     splu,
     splu_factor_payload_bytes,
+    splu_native,
     splu_solve,
     splu_solve_transpose,
     spmm,

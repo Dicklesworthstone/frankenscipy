@@ -209,6 +209,8 @@ pub enum IntegrateValidationError {
     InvalidJacobianSparsity {
         message: String,
     },
+    ConflictingJacobians,
+    SparseJacobianUnsupported,
     NonFiniteJacobian,
     NonFiniteEventDirection {
         index: usize,
@@ -288,6 +290,12 @@ impl std::fmt::Display for IntegrateValidationError {
             Self::InvalidJacobianSparsity { message } => {
                 write!(f, "invalid `jac_sparsity`: {message}.")
             }
+            Self::ConflictingJacobians => {
+                write!(f, "`jac` and `jac_sparse` cannot both be supplied.")
+            }
+            Self::SparseJacobianUnsupported => {
+                write!(f, "`jac_sparse` is supported only by the BDF method.")
+            }
             Self::NonFiniteJacobian => write!(f, "`jac` must contain only finite values."),
             Self::NonFiniteEventDirection { index } => {
                 write!(f, "event {index} has a non-finite direction.")
@@ -343,6 +351,8 @@ impl IntegrateValidationError {
             Self::BandedJacobianWrongShape { .. } => "banded_jacobian_wrong_shape",
             Self::InvalidJacobianBandwidth { .. } => "invalid_jacobian_bandwidth",
             Self::InvalidJacobianSparsity { .. } => "invalid_jacobian_sparsity",
+            Self::ConflictingJacobians => "conflicting_jacobians",
+            Self::SparseJacobianUnsupported => "sparse_jacobian_unsupported",
             Self::NonFiniteJacobian => "non_finite_jacobian",
             Self::NonFiniteEventDirection { .. } => "event_direction_must_be_finite",
             Self::EventMaxEventsMustBePositive { .. } => "event_max_events_must_be_positive",

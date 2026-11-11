@@ -8427,6 +8427,7 @@ fn execute_integrate_solve_ivp(case: &IntegrateCase) -> IntegrateObserved {
         max_step: args.max_step.unwrap_or(f64::INFINITY),
         mode: case.mode,
         jac: None,
+        jac_sparse: None,
         jac_sparsity: None,
         lband: None,
         uband: None,
