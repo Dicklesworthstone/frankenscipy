@@ -528,6 +528,7 @@ where
 /// DIRECT (multimodal global exploration), Nelder-Mead (noisy non-smooth), and L-BFGS-B (bounded).
 /// When `options.bounds` constrains any variable, only methods that honour bounds are
 /// candidates: L-BFGS-B, Nelder-Mead, plus DIRECT when every bound is finite.
+/// Hardened mode is enforced when either the options or the portfolio requests it.
 pub fn minimize_with_casp_portfolio<F>(
     fun: F,
     x0: &[f64],
@@ -544,7 +545,7 @@ where
 
 /// Audited variant of [`minimize_with_casp_portfolio`] (frankenscipy-dbjm3): records the
 /// portfolio's choice as an [`fsci_runtime::AuditAction::CaspDecision`] under the call's
-/// [`Fingerprinter`] digest in the portfolio's runtime mode, any bounded Nelder-Mead fallback as a
+/// [`Fingerprinter`] digest in the effective runtime mode, any bounded Nelder-Mead fallback as a
 /// [`fsci_runtime::AuditAction::BoundedRecovery`], and any returned [`OptError`] as a single
 /// [`fsci_runtime::AuditAction::FailClosed`].
 pub fn minimize_with_casp_portfolio_and_audit<F>(
@@ -589,6 +590,16 @@ fn minimize_with_casp_portfolio_impl<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
+    let effective_mode =
+        if options.mode == RuntimeMode::Hardened || portfolio.mode() == RuntimeMode::Hardened {
+            RuntimeMode::Hardened
+        } else {
+            RuntimeMode::Strict
+        };
+    let options = MinimizeOptions {
+        mode: effective_mode,
+        ..options
+    };
     if x0.is_empty() {
         return Err(OptError::InvalidArgument {
             detail: String::from("x0 must be a finite 1-D vector with at least one element"),
@@ -734,10 +745,16 @@ where
                 .map(|&(lo, hi)| (lo.expect("finite lower"), hi.expect("finite upper")))
                 .unzip();
             let direct_bounds = Bounds::new(lb, ub)?;
+            let direct_defaults = crate::direct::DirectOptions::default();
             let direct_res = crate::direct::direct(
                 &fun,
                 &direct_bounds,
-                crate::direct::DirectOptions::default(),
+                crate::direct::DirectOptions {
+                    maxfun: solver_options.maxfev,
+                    maxiter: solver_options.maxiter.unwrap_or(direct_defaults.maxiter),
+                    mode: solver_options.mode,
+                    ..direct_defaults
+                },
             )?;
             let res = OptimizeResult {
                 x: direct_res.x,
@@ -749,6 +766,8 @@ where
                 success: direct_res.success,
                 status: if direct_res.success {
                     ConvergenceStatus::Success
+                } else if direct_res.status == 1 {
+                    ConvergenceStatus::MaxEvaluations
                 } else {
                     ConvergenceStatus::MaxIterations
                 },
@@ -765,7 +784,7 @@ where
     // honours the same bounds (br-szq1n.7).
     let (mut final_res, final_fallback) = if !result.success
         && action != OptSolverAction::DIRECT
-        && portfolio.mode() == RuntimeMode::Hardened
+        && options.mode == RuntimeMode::Hardened
     {
         match nelder_mead(&fun, x0, solver_options) {
             Ok(mut nm) => {
@@ -818,7 +837,7 @@ where
             fsci_runtime::AuditAction::CaspDecision {
                 portfolio: <OptSolverPortfolio as fsci_runtime::PortfolioEvidence>::NAME
                     .to_string(),
-                mode: portfolio.mode(),
+                mode: options.mode,
                 action: format!("{action:?}"),
                 posterior: posterior.to_vec(),
                 expected_losses: expected_losses.to_vec(),
@@ -9297,14 +9316,94 @@ mod tests {
     }
 
     #[test]
-    fn minimize_with_casp_portfolio_and_audit_records_casp_decision_in_its_mode() {
+    fn casp_hardened_portfolio_rejects_nonfinite_objectives_before_dispatch() {
+        for (option_mode, portfolio_mode) in [
+            (RuntimeMode::Strict, RuntimeMode::Hardened),
+            (RuntimeMode::Hardened, RuntimeMode::Strict),
+            (RuntimeMode::Hardened, RuntimeMode::Hardened),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let ledger = crate::audit::sync_audit_ledger();
+            let mut portfolio = OptSolverPortfolio::new(portfolio_mode, 4);
+            let result = minimize_with_casp_portfolio_and_audit(
+                |_| {
+                    calls.set(calls.get() + 1);
+                    f64::INFINITY
+                },
+                &[1.0],
+                MinimizeOptions {
+                    mode: option_mode,
+                    ..MinimizeOptions::default()
+                },
+                &mut portfolio,
+                false,
+                false,
+                &ledger,
+            );
+            assert!(matches!(result, Err(OptError::NonFiniteInput { .. })));
+            assert_eq!(calls.get(), 1, "reject before solver or fallback evaluations");
+            let guard = ledger.lock().expect("audit ledger");
+            assert_eq!(guard.len(), 1, "failure is audited exactly once");
+            assert!(matches!(
+                &guard.entries()[0].action,
+                fsci_runtime::AuditAction::FailClosed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn casp_direct_honours_iteration_and_evaluation_limits() {
+        let bounds = [(Some(-10.0), Some(10.0)); 2];
+        for (maxiter, maxfev, expected_status) in [
+            (Some(1), None, ConvergenceStatus::MaxIterations),
+            (Some(1000), Some(20), ConvergenceStatus::MaxEvaluations),
+        ] {
+            let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 4);
+            let calls = std::cell::Cell::new(0);
+            let result = minimize_with_casp_portfolio(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    convex_bowl(x)
+                },
+                &[1.0, 1.0],
+                MinimizeOptions {
+                    bounds: Some(&bounds),
+                    maxiter,
+                    maxfev,
+                    ..MinimizeOptions::default()
+                },
+                &mut portfolio,
+                false,
+                true,
+            )
+            .expect("bounded DIRECT dispatch");
+            assert_eq!(result.chosen_action, OptSolverAction::DIRECT);
+            assert!(!result.result.success);
+            assert_eq!(result.result.status, expected_status);
+            assert_eq!(result.result.nfev, calls.get());
+            if maxiter == Some(1) {
+                assert_eq!(result.result.nit, 1);
+            } else {
+                // DIRECT checks maxfun between rectangle subdivisions, as SciPy does.
+                assert!(calls.get() < 40, "caller budget must replace the DIRECT default");
+            }
+        }
+    }
+
+    #[test]
+    fn minimize_with_casp_portfolio_and_audit_records_casp_decision_in_effective_mode() {
         use fsci_runtime::PortfolioEvidence;
 
-        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        for (option_mode, portfolio_mode, mode) in [
+            (RuntimeMode::Strict, RuntimeMode::Strict, RuntimeMode::Strict),
+            (RuntimeMode::Hardened, RuntimeMode::Hardened, RuntimeMode::Hardened),
+            (RuntimeMode::Strict, RuntimeMode::Hardened, RuntimeMode::Hardened),
+            (RuntimeMode::Hardened, RuntimeMode::Strict, RuntimeMode::Hardened),
+        ] {
             let ledger = crate::audit::sync_audit_ledger();
-            let mut portfolio = OptSolverPortfolio::new(mode, 4);
+            let mut portfolio = OptSolverPortfolio::new(portfolio_mode, 4);
             let options = MinimizeOptions {
-                mode,
+                mode: option_mode,
                 ..MinimizeOptions::default()
             };
             let res = minimize_with_casp_portfolio_and_audit(

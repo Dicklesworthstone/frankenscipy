@@ -1819,6 +1819,8 @@ pub struct OdePortfolioResult {
 /// Probes the initial Jacobian at `(t0, y0)`, selects among `DOP853`, `RK45`, `RK23`, `BDF`,
 /// and `Radau`, monitors the per-step Hairer-Wanner embedded-pair stiffness test during explicit
 /// stepping, retries with the next action on failure, and feeds the conformal calibrator once per call.
+/// If either the options or the portfolio requests Hardened mode, every attempted solver
+/// runs in Hardened mode, including validation and resource budgets.
 pub fn solve_ivp_with_casp_portfolio<F>(
     fun: &mut F,
     options: &SolveIvpOptions<'_>,
@@ -1841,7 +1843,8 @@ where
 
 /// Audited variant of [`solve_ivp_with_casp_portfolio`] (frankenscipy-dbjm3): records the
 /// portfolio's choice as an [`fsci_runtime::AuditAction::CaspDecision`] under the call's
-/// [`Fingerprinter`] digest in the portfolio's runtime mode, and any returned
+/// [`Fingerprinter`] digest in the effective runtime mode (Hardened if either the options or
+/// the portfolio requests it), and any returned
 /// [`IntegrateValidationError`] as a single [`fsci_runtime::AuditAction::FailClosed`].
 pub fn solve_ivp_with_casp_portfolio_and_audit<F>(
     fun: &mut F,
@@ -1898,7 +1901,9 @@ where
         effective_mode,
         audit,
     )?;
-    let probe = probe_ode_stiffness(fun, options);
+    let mut resolved_opts = options.clone();
+    resolved_opts.mode = effective_mode;
+    let probe = probe_ode_stiffness(fun, &resolved_opts);
     let mut effective_stiffness =
         if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
             if stiffness_ratio_estimate < 1.0 && probe.stiffness_ratio_estimate <= 10.0 {
@@ -1916,7 +1921,6 @@ where
     let (mut action, mut posterior, mut expected_losses, mut chosen_loss) =
         portfolio.select_action_with_tol(effective_stiffness, is_algebraic_dae, options.rtol);
 
-    let mut resolved_opts = options.clone();
     resolved_opts.method = action.into();
 
     let is_explicit = matches!(
@@ -2023,7 +2027,7 @@ where
             fsci_runtime::AuditAction::CaspDecision {
                 portfolio: <OdeSolverPortfolio as fsci_runtime::PortfolioEvidence>::NAME
                     .to_string(),
-                mode: portfolio.mode(),
+                mode: effective_mode,
                 action: format!("{action:?}"),
                 posterior: posterior.to_vec(),
                 expected_losses: expected_losses.to_vec(),
@@ -4873,16 +4877,92 @@ mod tests {
     }
 
     #[test]
-    fn solve_ivp_with_casp_portfolio_and_audit_records_casp_decision_in_its_mode() {
+    fn casp_hardened_mode_enforces_step_and_rhs_caps_for_every_solver() {
+        use crate::validation::with_hardened_integrate_caps;
+
+        // CASP overwrites the requested method: exercise each selected solver.
+        let regimes = [
+            (1.0, false, 1e-3, OdeSolverAction::RK45),
+            (1.0, false, 1e-2, OdeSolverAction::RK23),
+            (0.1, false, 1e-8, OdeSolverAction::DOP853),
+            (1e6, false, 1e-3, OdeSolverAction::BDF),
+            (1.0, true, 1e-3, OdeSolverAction::Radau),
+        ];
+        for (stiffness, algebraic, rtol, expected_action) in regimes {
+            let mut opts = SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &[1.0],
+                first_step: Some(0.01),
+                max_step: 0.05,
+                rtol,
+                ..SolveIvpOptions::default()
+            };
+            let strict = with_hardened_integrate_caps(4, Some(0), 0, || {
+                let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
+                solve_ivp_with_casp_portfolio(
+                    &mut |_t, y| vec![-y[0]],
+                    &opts,
+                    &mut portfolio,
+                    stiffness,
+                    algebraic,
+                )
+                .expect("strict integration ignores Hardened budgets")
+            });
+            assert!(strict.result.success, "{expected_action:?}");
+            assert_eq!(strict.chosen_action, expected_action);
+            assert!((strict.result.y.last().unwrap()[0] - (-1.0_f64).exp()).abs() < 1e-3);
+
+            for (option_mode, portfolio_mode) in [
+                (RuntimeMode::Strict, RuntimeMode::Hardened),
+                (RuntimeMode::Hardened, RuntimeMode::Strict),
+            ] {
+                opts.mode = option_mode;
+                for (step_cap, rhs_cap) in [(Some(1), 10_000), (Some(10_000), 1)] {
+                    let ledger = crate::validation::sync_audit_ledger();
+                    let mut portfolio = OdeSolverPortfolio::new(portfolio_mode, 4);
+                    let err = with_hardened_integrate_caps(4, step_cap, rhs_cap, || {
+                        solve_ivp_with_casp_portfolio_and_audit(
+                            &mut |_t, y| vec![-y[0]],
+                            &opts,
+                            &mut portfolio,
+                            stiffness,
+                            algebraic,
+                            &ledger,
+                        )
+                        .expect_err("CASP must enforce the effective Hardened mode")
+                    });
+                    assert!(
+                        matches!(err, IntegrateValidationError::ResourceExhausted { .. }),
+                        "{expected_action:?}, options={option_mode:?}, portfolio={portfolio_mode:?}: {err:?}"
+                    );
+                    let guard = ledger.lock().expect("audit ledger");
+                    assert_eq!(guard.len(), 1, "resource rejection is audited once");
+                    assert!(matches!(
+                        &guard.entries()[0].action,
+                        fsci_runtime::AuditAction::FailClosed { reason }
+                            if reason == "resource_exhausted"
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solve_ivp_with_casp_portfolio_and_audit_records_casp_decision_in_effective_mode() {
         use fsci_runtime::PortfolioEvidence;
 
-        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        for (option_mode, portfolio_mode, mode) in [
+            (RuntimeMode::Strict, RuntimeMode::Strict, RuntimeMode::Strict),
+            (RuntimeMode::Hardened, RuntimeMode::Hardened, RuntimeMode::Hardened),
+            (RuntimeMode::Strict, RuntimeMode::Hardened, RuntimeMode::Hardened),
+            (RuntimeMode::Hardened, RuntimeMode::Strict, RuntimeMode::Hardened),
+        ] {
             let ledger = crate::validation::sync_audit_ledger();
-            let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+            let mut portfolio = OdeSolverPortfolio::new(portfolio_mode, 4);
             let opts = SolveIvpOptions {
                 t_span: (0.0, 1.0),
                 y0: &[1.0, 0.0],
-                mode,
+                mode: option_mode,
                 ..SolveIvpOptions::default()
             };
             let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
