@@ -2,9 +2,10 @@
 //! Live scipy.optimize.milp parity for fsci_opt::milp.
 //!
 //! Resolves [frankenscipy-az0ae]. Several small mixed-integer LP
-//! problems with continuous/integer/binary variables.
+//! problems with continuous/integer/binary and semi-continuous/semi-integer variables.
 //!
-//! Tolerance: 1e-6 abs on x and fun (LP relaxations + B&B can drift).
+//! Tolerance: 1e-6 absolute on objective and feasibility. Optimal vectors may
+//! differ when the optimum is not unique, but both must satisfy their domains.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -25,7 +26,9 @@ const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 struct MilpCase {
     case_id: String,
     c: Vec<f64>,
-    /// 0 = Continuous, 1 = Integer, 2 = Binary
+    /// SciPy codes: 0 = Continuous, 1 = Integer, 2 = SemiContinuous,
+    /// 3 = SemiInteger. Code 4 is Rust's Binary extension; the oracle converts
+    /// it to Integer and intersects its bounds with [0, 1].
     integrality: Vec<u8>,
     a_ub: Vec<Vec<f64>>,
     b_ub: Vec<f64>,
@@ -43,10 +46,8 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
-    #[allow(dead_code)]
     x: Option<Vec<f64>>,
     fun: Option<f64>,
-    #[allow(dead_code)]
     success: Option<bool>,
 }
 
@@ -59,6 +60,8 @@ struct OracleResult {
 struct CaseDiff {
     case_id: String,
     abs_diff: f64,
+    scipy_feasible: bool,
+    fsci_feasible: bool,
     pass: bool,
 }
 
@@ -96,8 +99,38 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write log");
 }
 
+fn single_variable_case(
+    case_id: &str,
+    integrality: u8,
+    cost: f64,
+    bounds: (Option<f64>, Option<f64>),
+    required: Option<f64>,
+    capacity: Option<f64>,
+) -> MilpCase {
+    let mut a_ub = Vec::new();
+    let mut b_ub = Vec::new();
+    if let Some(minimum) = required {
+        a_ub.push(vec![-1.0]);
+        b_ub.push(-minimum);
+    }
+    if let Some(maximum) = capacity {
+        a_ub.push(vec![1.0]);
+        b_ub.push(maximum);
+    }
+    MilpCase {
+        case_id: case_id.into(),
+        c: vec![cost],
+        integrality: vec![integrality],
+        a_ub,
+        b_ub,
+        a_eq: vec![],
+        b_eq: vec![],
+        bounds: vec![bounds],
+    }
+}
+
 fn generate_query() -> OracleQuery {
-    let points = vec![
+    let mut points = vec![
         // Simple continuous LP: min x+y s.t. x+y>=3 → (3,0) or (0,3); fun=3.
         // Make symmetric-breaking with c=(1, 2): min x+2y s.t. x+y>=3, x,y>=0
         // optimal: (3, 0), fun = 3.
@@ -130,7 +163,7 @@ fn generate_query() -> OracleQuery {
         MilpCase {
             case_id: "knapsack_binary_3var".into(),
             c: vec![-3.0, -5.0, -4.0],
-            integrality: vec![2, 2, 2],
+            integrality: vec![4, 4, 4],
             a_ub: vec![vec![2.0, 3.0, 2.0]],
             b_ub: vec![5.0],
             a_eq: vec![],
@@ -149,7 +182,91 @@ fn generate_query() -> OracleQuery {
             b_eq: vec![4.0],
             bounds: vec![(Some(0.0), Some(3.0)), (Some(0.0), Some(4.0))],
         },
+        // The convex relaxation uses (5, 1.5, 0), objective 7.25. Enforcing
+        // the second activity's minimum gives (3.5, 3, 0), objective 8.
+        MilpCase {
+            case_id: "mixed_semi_activity".into(),
+            c: vec![1.0, 1.5, 3.0],
+            integrality: vec![2, 3, 0],
+            a_ub: vec![],
+            b_ub: vec![],
+            a_eq: vec![vec![1.0, 1.0, 1.0]],
+            b_eq: vec![6.5],
+            bounds: vec![
+                (Some(2.0), Some(5.0)),
+                (Some(3.0), Some(6.0)),
+                (Some(0.0), Some(10.0)),
+            ],
+        },
+        // SciPy code 2 would give 0.5 here. The Binary extension must use
+        // code 1 in the oracle, even when wider bounds were supplied.
+        single_variable_case(
+            "binary_fractional_relaxation",
+            4,
+            1.0,
+            (Some(-5.0), Some(5.0)),
+            Some(0.5),
+            None,
+        ),
     ];
+    for (kind, prefix) in [(2, "semi_continuous"), (3, "semi_integer")] {
+        for (suffix, cost, bounds, required, capacity) in [
+            ("inactive", 1.0, (Some(2.0), Some(5.5)), None, None),
+            (
+                "activation_gap",
+                1.0,
+                (Some(2.2), Some(5.5)),
+                Some(1.0),
+                None,
+            ),
+            ("active_upper", -1.0, (Some(2.0), Some(5.5)), None, None),
+            (
+                "zero_branch",
+                -1.0,
+                (Some(2.0), Some(5.5)),
+                None,
+                Some(1.0),
+            ),
+            (
+                "active_fractional_relaxation",
+                1.0,
+                (Some(2.2), Some(8.7)),
+                Some(3.5),
+                None,
+            ),
+            (
+                "zero_lower",
+                1.0,
+                (Some(0.0), Some(5.0)),
+                Some(0.5),
+                None,
+            ),
+            (
+                "empty_active_interval",
+                -1.0,
+                (Some(5.0), Some(2.0)),
+                None,
+                None,
+            ),
+            (
+                "fixed_fractional_active",
+                -1.0,
+                (Some(2.5), Some(2.5)),
+                None,
+                None,
+            ),
+            ("infinite_upper", 1.0, (Some(2.0), None), Some(3.5), None),
+        ] {
+            points.push(single_variable_case(
+                &format!("{prefix}_{suffix}"),
+                kind,
+                cost,
+                bounds,
+                required,
+                capacity,
+            ));
+        }
+    }
     OracleQuery { points }
 }
 
@@ -166,12 +283,17 @@ points = []
 for case in q["points"]:
     cid = case["case_id"]
     c = np.array(case["c"], dtype=float)
-    integrality = np.array(case["integrality"], dtype=int)
+    kinds = case["integrality"]
+    integrality = np.array([1 if kind == 4 else kind for kind in kinds], dtype=int)
     a_ub = case["a_ub"]; b_ub = case["b_ub"]
     a_eq = case["a_eq"]; b_eq = case["b_eq"]
     bounds_in = case["bounds"]
     lb = [b[0] if b[0] is not None else -np.inf for b in bounds_in]
     ub = [b[1] if b[1] is not None else np.inf for b in bounds_in]
+    for i, kind in enumerate(kinds):
+        if kind == 4:
+            lb[i] = max(lb[i], 0)
+            ub[i] = min(ub[i], 1)
     bounds = Bounds(lb, ub)
     constraints = []
     if len(a_ub) > 0:
@@ -238,10 +360,48 @@ print(json.dumps({"points": points}))
 
 fn integrality_from(u: u8) -> Integrality {
     match u {
+        0 => Integrality::Continuous,
         1 => Integrality::Integer,
-        2 => Integrality::Binary,
-        _ => Integrality::Continuous,
+        2 => Integrality::SemiContinuous,
+        3 => Integrality::SemiInteger,
+        4 => Integrality::Binary,
+        _ => panic!("unknown MILP fixture integrality code: {u}"),
     }
+}
+
+fn solution_is_feasible(case: &MilpCase, x: &[f64], fun: f64) -> bool {
+    if x.len() != case.c.len() || !fun.is_finite() || x.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    for (i, &value) in x.iter().enumerate() {
+        let kind = case.integrality[i];
+        let isolated_zero = matches!(kind, 2 | 3) && value.abs() <= ABS_TOL;
+        let (lo, hi) = case.bounds[i];
+        if !isolated_zero
+            && (value < lo.unwrap_or(f64::NEG_INFINITY) - ABS_TOL
+                || value > hi.unwrap_or(f64::INFINITY) + ABS_TOL)
+        {
+            return false;
+        }
+        if matches!(kind, 1 | 3 | 4) && (value - value.round()).abs() > ABS_TOL {
+            return false;
+        }
+        if kind == 4 && !(-ABS_TOL..=1.0 + ABS_TOL).contains(&value) {
+            return false;
+        }
+    }
+    let dot = |row: &[f64]| row.iter().zip(x).map(|(a, b)| a * b).sum::<f64>();
+    (dot(&case.c) - fun).abs() <= ABS_TOL
+        && case
+            .a_ub
+            .iter()
+            .zip(&case.b_ub)
+            .all(|(row, rhs)| dot(row) <= rhs + ABS_TOL)
+        && case
+            .a_eq
+            .iter()
+            .zip(&case.b_eq)
+            .all(|(row, rhs)| (dot(row) - rhs).abs() <= ABS_TOL)
 }
 
 #[test]
@@ -265,7 +425,10 @@ fn diff_opt_milp() {
 
     for case in &query.points {
         // A missing oracle row is recorded as SciPy giving no value, not skipped.
-        let scipy_fun = pmap.get(&case.case_id).and_then(|arm| arm.fun);
+        let scipy = pmap
+            .get(&case.case_id)
+            .filter(|arm| arm.success == Some(true));
+        let scipy_fun = scipy.and_then(|arm| arm.fun);
         let integrality: Vec<Integrality> = case
             .integrality
             .iter()
@@ -281,22 +444,29 @@ fn diff_opt_milp() {
             bounds: &case.bounds,
         };
         // SciPy reports `fun` only on success, so an unsuccessful fsci solve is a failure.
-        let fsci_fun = milp(problem, opts)
-            .ok()
-            .filter(|res| res.success)
-            .map(|res| res.fun);
+        let fsci = milp(problem, opts).ok().filter(|res| res.success);
+        let fsci_fun = fsci.as_ref().map(|res| res.fun);
         let Some((efun, fsci_fun)) = ledger.pair("milp", &case.case_id, scipy_fun, fsci_fun) else {
             continue;
         };
-        // Compare only objective value: x may be non-unique on degenerate
-        // problems (e.g., mixed_eq has multiple optima).
+        // The objective agrees even when degenerate optima have different x,
+        // but every returned vector must independently satisfy the true domain.
         let abs_d = (fsci_fun - efun).abs();
+        let scipy_feasible = scipy
+            .and_then(|arm| arm.x.as_deref())
+            .is_some_and(|x| solution_is_feasible(case, x, efun));
+        let fsci_feasible = fsci
+            .as_ref()
+            .is_some_and(|res| solution_is_feasible(case, &res.x, res.fun));
+        let pass = abs_d <= ABS_TOL && scipy_feasible && fsci_feasible;
         max_overall = max_overall.max(abs_d);
-        ledger.compared("milp", &case.case_id, abs_d <= ABS_TOL);
+        ledger.compared("milp", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
+            scipy_feasible,
+            fsci_feasible,
+            pass,
         });
     }
 

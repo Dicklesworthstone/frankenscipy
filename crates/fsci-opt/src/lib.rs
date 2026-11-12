@@ -1238,6 +1238,10 @@ pub enum Integrality {
     Continuous,
     Integer,
     Binary,
+    /// Either zero or a real value in the supplied bounds (SciPy integrality 2).
+    SemiContinuous,
+    /// Either zero or an integer in the supplied bounds (SciPy integrality 3).
+    SemiInteger,
 }
 
 /// Result of a mixed-integer linear programming problem.
@@ -1340,7 +1344,11 @@ fn is_integral_with_tol(value: f64, tol: f64) -> bool {
 /// relaxations.
 ///
 /// Matches the core SciPy surface of `scipy.optimize.milp` for bounded
-/// continuous/integer/binary variables on small to medium problems.
+/// continuous/integer/binary and semi-continuous/semi-integer variables on
+/// small to medium problems. A semi-variable may be zero even when its lower
+/// bound is positive. Its active interval requires a finite nonnegative lower
+/// bound; an infinite upper bound is allowed. An empty active interval leaves
+/// only zero, including an interval containing no integer for `SemiInteger`.
 pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult, OptError> {
     let MilpProblem {
         c,
@@ -1386,14 +1394,41 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
     };
 
     let mut root_bounds = default_milp_bounds(n, bounds)?;
+    let mut semi_lower = vec![0.0; n];
     for (i, (bound, kind)) in root_bounds.iter_mut().zip(integrality.iter()).enumerate() {
-        validate_variable_bounds(i, bound.0, bound.1)?;
-        match kind {
-            Integrality::Continuous | Integrality::Integer => {}
-            Integrality::Binary => {
-                bound.0 = bound.0.max(0.0);
-                bound.1 = bound.1.min(1.0);
+        if matches!(kind, Integrality::SemiContinuous | Integrality::SemiInteger) {
+            // The LP sees the convex hull of {0} union [lo, hi]. Keep the
+            // activation threshold separately so a point in (0, lo) is never
+            // accepted as a feasible incumbent merely because it solves the LP.
+            if !bound.0.is_finite()
+                || bound.0 < 0.0
+                || bound.1.is_nan()
+                || bound.1 == f64::NEG_INFINITY
+            {
+                return Err(OptError::InvalidBounds {
+                    detail: format!(
+                        "semi-variable {i}: lower bound must be finite and nonnegative, and upper bound must not be NaN or -inf"
+                    ),
+                });
             }
+            if *kind == Integrality::SemiInteger {
+                bound.0 = bound.0.ceil();
+                bound.1 = bound.1.floor();
+            }
+            if bound.0 > bound.1 {
+                // There is no active value, but the isolated zero remains in
+                // the domain. This is not an infeasible-variable certificate.
+                *bound = (0.0, 0.0);
+            } else {
+                semi_lower[i] = bound.0;
+                bound.0 = 0.0;
+            }
+            continue;
+        }
+        validate_variable_bounds(i, bound.0, bound.1)?;
+        if *kind == Integrality::Binary {
+            bound.0 = bound.0.max(0.0);
+            bound.1 = bound.1.min(1.0);
         }
         if bound.0.is_nan() || bound.1.is_nan() {
             return Err(OptError::InvalidBounds {
@@ -1444,7 +1479,7 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
                     fun: 0.0,
                     success: false,
                     status: 1,
-                    message: "MILP node limit exceeded before finding a feasible integer solution"
+                    message: "MILP node limit exceeded before finding a feasible solution"
                         .to_string(),
                     mip_node_count: node_count,
                     nit: total_nit,
@@ -1483,35 +1518,43 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             continue;
         }
 
-        let branch_index = integrality
-            .iter()
-            .enumerate()
-            .find_map(|(i, kind)| match kind {
-                Integrality::Continuous => None,
-                Integrality::Integer | Integrality::Binary => {
-                    if is_integral_with_tol(lp.x[i], tol) {
-                        None
-                    } else {
-                        Some(i)
-                    }
-                }
-            });
+        // A semi-variable has two different branch decisions: isolate zero
+        // from its active interval first, then enforce integrality inside the
+        // active interval when requested. Both children intersect the current
+        // node bounds, so other integer branches cannot resurrect a removed arm.
+        let branch = integrality.iter().enumerate().find_map(|(i, kind)| {
+            if semi_lower[i] > 0.0
+                && node_bounds[i].0 < semi_lower[i]
+                && node_bounds[i].1 > 0.0
+                && lp.x[i] != 0.0
+                && lp.x[i] < semi_lower[i]
+            {
+                // Only unresolved disjunctions may be split. An LP endpoint
+                // rounded just outside an already selected arm must not
+                // recreate the same node indefinitely.
+                Some((i, 0.0, semi_lower[i]))
+            } else if matches!(
+                kind,
+                Integrality::Integer | Integrality::Binary | Integrality::SemiInteger
+            ) && !is_integral_with_tol(lp.x[i], tol)
+            {
+                Some((i, lp.x[i].floor(), lp.x[i].ceil()))
+            } else {
+                None
+            }
+        });
 
-        match branch_index {
+        match branch {
             None => best = Some(lp),
-            Some(i) => {
-                let value = lp.x[i];
-                let floor = value.floor();
-                let ceil = value.ceil();
-
+            Some((i, left_upper, right_lower)) => {
                 let mut lower_branch = node_bounds.clone();
-                lower_branch[i].1 = lower_branch[i].1.min(floor);
+                lower_branch[i].1 = lower_branch[i].1.min(left_upper);
                 if lower_branch[i].0 <= lower_branch[i].1 {
                     stack.push(lower_branch);
                 }
 
                 let mut upper_branch = node_bounds;
-                upper_branch[i].0 = upper_branch[i].0.max(ceil);
+                upper_branch[i].0 = upper_branch[i].0.max(right_lower);
                 if upper_branch[i].0 <= upper_branch[i].1 {
                     stack.push(upper_branch);
                 }
@@ -1548,7 +1591,7 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
                 _ if unresolved_nodes > 0 => (
                     1,
                     format!(
-                        "no integer solution found and {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
+                        "no feasible solution found and {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
                     ),
                 ),
                 _ => (2, "Problem is infeasible".to_string()),
@@ -7369,6 +7412,315 @@ mod tests {
     }
 
     // ── milp tests ──────────────────────────────────────────────────
+
+    fn one_variable_milp(
+        kind: Integrality,
+        cost: f64,
+        bounds: (Option<f64>, Option<f64>),
+        required: Option<f64>,
+        capacity: Option<f64>,
+        options: MilpOptions,
+    ) -> crate::MilpResult {
+        let mut a_ub = Vec::new();
+        let mut b_ub = Vec::new();
+        if let Some(minimum) = required {
+            a_ub.push(vec![-1.0]);
+            b_ub.push(-minimum);
+        }
+        if let Some(maximum) = capacity {
+            a_ub.push(vec![1.0]);
+            b_ub.push(maximum);
+        }
+        milp(
+            MilpProblem {
+                c: &[cost],
+                integrality: &[kind],
+                a_ub: &a_ub,
+                b_ub: &b_ub,
+                a_eq: &[],
+                b_eq: &[],
+                bounds: &[bounds],
+            },
+            options,
+        )
+        .expect("one-variable MILP")
+    }
+
+    #[test]
+    fn milp_semi_variables_branch_across_the_activation_gap() {
+        // The ordinary LP relaxation returns x=1. A semi-continuous activity
+        // must instead activate at 2.2; its semi-integer counterpart starts at 3.
+        let relaxation = one_variable_milp(
+            Integrality::Continuous,
+            1.0,
+            (Some(0.0), Some(5.5)),
+            Some(1.0),
+            None,
+            MilpOptions::default(),
+        );
+        assert!(relaxation.success);
+        assert!((relaxation.x[0] - 1.0).abs() < 1e-9);
+        for (kind, expected) in [
+            (Integrality::SemiContinuous, 2.2),
+            (Integrality::SemiInteger, 3.0),
+        ] {
+            let result = one_variable_milp(
+                kind,
+                1.0,
+                (Some(2.2), Some(5.5)),
+                Some(1.0),
+                None,
+                MilpOptions::default(),
+            );
+            assert!(result.success, "{kind:?}: {}", result.message);
+            assert_eq!(result.status, 0);
+            assert!((result.x[0] - expected).abs() < 1e-9, "{result:?}");
+            assert!((result.fun - expected).abs() < 1e-9);
+            assert!(result.mip_node_count > 1);
+        }
+        let integer_active = one_variable_milp(
+            Integrality::SemiInteger,
+            1.0,
+            (Some(2.2), Some(8.7)),
+            Some(3.5),
+            None,
+            MilpOptions::default(),
+        );
+        assert!(integer_active.success);
+        assert_eq!(integer_active.x, vec![4.0]);
+    }
+
+    #[test]
+    fn milp_semi_variables_allow_zero_and_fractional_active_values() {
+        for (kind, active) in [
+            (Integrality::SemiContinuous, 5.5),
+            (Integrality::SemiInteger, 5.0),
+        ] {
+            for (cost, capacity, expected) in [
+                (1.0, None, 0.0),
+                (-1.0, Some(1.0), 0.0),
+                (-1.0, None, active),
+            ] {
+                let result = one_variable_milp(
+                    kind,
+                    cost,
+                    (Some(2.0), Some(5.5)),
+                    None,
+                    capacity,
+                    MilpOptions::default(),
+                );
+                assert!(result.success, "{result:?}");
+                assert!((result.x[0] - expected).abs() < 1e-9, "{result:?}");
+                assert!((result.fun - cost * expected).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn milp_semi_bounds_preserve_the_isolated_zero() {
+        for kind in [Integrality::SemiContinuous, Integrality::SemiInteger] {
+            for bounds in [
+                (Some(5.0), Some(2.0)),
+                (Some(2.0), Some(-1.0)),
+                (Some(0.0), Some(0.0)),
+            ] {
+                let result = one_variable_milp(
+                    kind,
+                    -1.0,
+                    bounds,
+                    None,
+                    None,
+                    MilpOptions::default(),
+                );
+                assert!(result.success, "{kind:?} {bounds:?}: {result:?}");
+                assert_eq!(result.x, vec![0.0]);
+            }
+            let gap_only = one_variable_milp(
+                kind,
+                1.0,
+                (Some(2.0), Some(5.0)),
+                Some(0.5),
+                Some(1.5),
+                MilpOptions::default(),
+            );
+            assert!(!gap_only.success);
+            assert_eq!(gap_only.status, 2, "{gap_only:?}");
+        }
+        for (kind, expected) in [
+            (Integrality::SemiContinuous, 2.5),
+            (Integrality::SemiInteger, 0.0),
+        ] {
+            let result = one_variable_milp(
+                kind,
+                -1.0,
+                (Some(2.5), Some(2.5)),
+                None,
+                None,
+                MilpOptions::default(),
+            );
+            assert!(result.success, "{result:?}");
+            assert_eq!(result.x, vec![expected]);
+        }
+        let no_active_integer = one_variable_milp(
+            Integrality::SemiInteger,
+            1.0,
+            (Some(2.2), Some(2.8)),
+            Some(0.1),
+            None,
+            MilpOptions::default(),
+        );
+        assert!(!no_active_integer.success);
+        assert_eq!(no_active_integer.status, 2);
+    }
+
+    #[test]
+    fn milp_semi_zero_lower_and_infinite_upper_bounds() {
+        for (kind, zero_lower, infinite_upper) in [
+            (Integrality::SemiContinuous, 0.5, 3.5),
+            (Integrality::SemiInteger, 1.0, 4.0),
+        ] {
+            for (bounds, required, expected) in [
+                ((Some(0.0), Some(5.0)), 0.5, zero_lower),
+                ((Some(2.0), None), 3.5, infinite_upper),
+            ] {
+                let result = one_variable_milp(
+                    kind,
+                    1.0,
+                    bounds,
+                    Some(required),
+                    None,
+                    MilpOptions::default(),
+                );
+                assert!(result.success, "{result:?}");
+                assert_eq!(result.x, vec![expected]);
+            }
+            let default_bounds = milp(
+                MilpProblem {
+                    c: &[1.0],
+                    integrality: &[kind],
+                    a_ub: &[vec![-1.0]],
+                    b_ub: &[-0.5],
+                    a_eq: &[],
+                    b_eq: &[],
+                    bounds: &[],
+                },
+                MilpOptions::default(),
+            )
+            .expect("default semi bounds");
+            assert!(default_bounds.success);
+            assert_eq!(default_bounds.x, vec![zero_lower]);
+        }
+    }
+
+    #[test]
+    fn milp_combines_semi_and_continuous_activity() {
+        // The LP mixes a disallowed 1.5 units of the second activity with
+        // 5 units of the first. Activating the second at 3 instead gives the
+        // true optimum (3.5, 3, 0), objective 8.
+        let result = milp(
+            MilpProblem {
+                c: &[1.0, 1.5, 3.0],
+                integrality: &[
+                    Integrality::SemiContinuous,
+                    Integrality::SemiInteger,
+                    Integrality::Continuous,
+                ],
+                a_ub: &[],
+                b_ub: &[],
+                a_eq: &[vec![1.0, 1.0, 1.0]],
+                b_eq: &[6.5],
+                bounds: &[
+                    (Some(2.0), Some(5.0)),
+                    (Some(3.0), Some(6.0)),
+                    (Some(0.0), Some(10.0)),
+                ],
+            },
+            MilpOptions::default(),
+        )
+        .expect("mixed semi domains");
+        assert!(result.success, "{result:?}");
+        for (&actual, expected) in result.x.iter().zip([3.5, 3.0, 0.0]) {
+            assert!((actual - expected).abs() < 1e-9, "{result:?}");
+        }
+        assert!((result.fun - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn milp_semi_node_and_lp_limits_never_certify_the_relaxation() {
+        for max_nodes in [1, 2] {
+            let limited = one_variable_milp(
+                Integrality::SemiContinuous,
+                1.0,
+                (Some(2.0), Some(5.0)),
+                Some(1.0),
+                None,
+                MilpOptions {
+                    max_nodes: Some(max_nodes),
+                    ..MilpOptions::default()
+                },
+            );
+            assert!(!limited.success, "{limited:?}");
+            assert_eq!(limited.status, 1);
+            assert_eq!(limited.mip_node_count, max_nodes);
+            if max_nodes == 2 {
+                assert_eq!(limited.x, vec![2.0]);
+                assert_eq!(limited.fun, 2.0);
+            }
+        }
+        let problem = MilpProblem {
+            c: &[-5.0, -4.0],
+            integrality: &[Integrality::SemiContinuous, Integrality::SemiInteger],
+            a_ub: &[vec![6.0, 4.0], vec![1.0, 2.0]],
+            b_ub: &[24.0, 6.0],
+            a_eq: &[],
+            b_eq: &[],
+            bounds: &[(Some(2.0), Some(3.0)); 2],
+        };
+        let limited = milp(
+            problem,
+            MilpOptions {
+                lp_maxiter: Some(1),
+                ..MilpOptions::default()
+            },
+        )
+        .expect("limited semi relaxation");
+        assert!(!limited.success);
+        assert_eq!(limited.status, 1, "{limited:?}");
+        let result = milp(problem, MilpOptions::default()).expect("semi optimum");
+        assert!(result.success, "{result:?}");
+        assert!((result.fun + 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn milp_semi_bounds_reject_invalid_activation_thresholds() {
+        for kind in [Integrality::SemiContinuous, Integrality::SemiInteger] {
+            for bounds in [
+                (Some(-1.0), Some(5.0)),
+                (None, Some(5.0)),
+                (Some(f64::INFINITY), Some(5.0)),
+                (Some(f64::NAN), Some(5.0)),
+                (Some(2.0), Some(f64::NAN)),
+                (Some(2.0), Some(f64::NEG_INFINITY)),
+            ] {
+                let result = milp(
+                    MilpProblem {
+                        c: &[1.0],
+                        integrality: &[kind],
+                        a_ub: &[],
+                        b_ub: &[],
+                        a_eq: &[],
+                        b_eq: &[],
+                        bounds: &[bounds],
+                    },
+                    MilpOptions::default(),
+                );
+                assert!(
+                    matches!(result, Err(OptError::InvalidBounds { .. })),
+                    "{kind:?} {bounds:?}: {result:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn milp_finds_integer_optimum() {
