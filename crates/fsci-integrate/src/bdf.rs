@@ -1397,7 +1397,7 @@ impl BdfSolver {
                     d: self.d[..=self.order].to_vec(),
                 });
 
-                let state = if reached_bound {
+                let state = if reached_bound || self.t == self.t_bound {
                     self.state = OdeSolverState::Finished;
                     OdeSolverState::Finished
                 } else {
@@ -1558,6 +1558,94 @@ mod tests {
     }
 
     #[test]
+    fn bdf_exact_endpoint_finishes_and_retains_dense_output() {
+        fn zero_jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(Shape2D::new(1, 1), Vec::new(), Vec::new(), vec![0, 0], true)
+                .unwrap()
+        }
+
+        for direction in [-1.0, 1.0] {
+            for sparse in [false, true] {
+                let y0 = [3.0];
+                let t0 = 1.0;
+                let t_bound = t0 + direction * 0.125;
+                let mut config = sparse_test_config(&y0, t_bound);
+                config.t0 = t0;
+                config.first_step = Some(0.125);
+                let mut rhs = |_t: f64, _y: &[f64]| vec![2.0];
+                let mut solver = if sparse {
+                    BdfSolver::new_with_sparse_jacobian(&mut rhs, config, zero_jac).unwrap()
+                } else {
+                    BdfSolver::new(&mut rhs, config).unwrap()
+                };
+
+                let outcome = solver.step_with(&mut rhs).unwrap();
+                assert_eq!(outcome.state, OdeSolverState::Finished);
+                assert_eq!(solver.state(), OdeSolverState::Finished);
+                assert_eq!(solver.t(), t_bound);
+                assert_eq!(solver.y(), &[3.0 + direction * 0.25]);
+                assert_eq!(solver.t_old(), Some(t0));
+                assert_eq!(solver.y_old(), Some(y0.as_slice()));
+                let midpoint = t0 + direction * 0.0625;
+                let dense = solver.dense_output_at(midpoint).unwrap();
+                assert_eq!(dense, vec![3.0 + direction * 0.125]);
+                let nfev = solver.nfev();
+                assert!(matches!(
+                    solver.step_with(&mut rhs),
+                    Err(StepFailure::RuntimeError(_))
+                ));
+                assert_eq!(solver.nfev(), nfev);
+                assert_eq!(solver.dense_output_at(midpoint), Some(dense));
+            }
+        }
+    }
+
+    #[test]
+    fn bdf_exact_endpoint_event_is_reported_once_by_solve_ivp() {
+        fn endpoint_event(_t: f64, y: &[f64]) -> f64 {
+            (y[0] - 3.0).abs() - 0.25
+        }
+
+        for direction in [-1.0, 1.0] {
+            for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                let t0 = 1.0;
+                let t_bound = t0 + direction * 0.125;
+                let mut rhs = |_t: f64, _y: &[f64]| vec![2.0];
+                let result = crate::solve_ivp(
+                    &mut rhs,
+                    &crate::SolveIvpOptions {
+                        t_span: (t0, t_bound),
+                        y0: &[3.0],
+                        method: crate::SolverKind::Bdf,
+                        first_step: Some(0.125),
+                        dense_output: true,
+                        events: Some(vec![crate::EventSpec::new(endpoint_event)]),
+                        mode,
+                        ..crate::SolveIvpOptions::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.success);
+                assert_eq!(result.status, 0);
+                assert_eq!(result.t, vec![t0, t_bound]);
+                assert_eq!(result.y, vec![vec![3.0], vec![3.0 + direction * 0.25]]);
+                assert_eq!(result.t_events, Some(vec![vec![t_bound]]));
+                assert_eq!(
+                    result.y_events,
+                    Some(vec![vec![vec![3.0 + direction * 0.25]]])
+                );
+                let solution = result.sol.unwrap();
+                assert_eq!(solution.knots, vec![t0, t_bound]);
+                assert_eq!(solution.values.len(), 2);
+                assert_eq!(
+                    solution.evaluate(t0 + direction * 0.0625).unwrap(),
+                    vec![3.0 + direction * 0.125]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bdf_sparse_coloring_and_newton_storage_scale_with_nonzeros() {
         // Relabeling a ring makes the Jacobian far from diagonal or narrowly banded.
         // A dense Jacobian at this dimension would alone retain 128 MiB.
@@ -1689,6 +1777,10 @@ mod tests {
         }
         let mut rhs = |_t: f64, y: &[f64]| vec![y[0]];
         let mut config = sparse_test_config(&[1.0], ALPHA_C[1]);
+        // Request tighter local accuracy to meet the global endpoint-error target
+        // after recovery from the deliberately singular first Newton matrix.
+        config.rtol = 1e-8;
+        config.atol = ToleranceValue::Scalar(1e-11);
         config.first_step = Some(ALPHA_C[1]);
         let mut solver = BdfSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
         let shifted = sparse_newton_matrix(&jac(0.0, &[1.0]), 1.0, RuntimeMode::Strict).unwrap();
@@ -1701,7 +1793,8 @@ mod tests {
             solver.njev() > 1,
             "a singular factor must try a fresh Jacobian"
         );
-        assert!((solver.y()[0] - ALPHA_C[1].exp()).abs() < 3e-6);
+        let error = (solver.y()[0] - ALPHA_C[1].exp()).abs();
+        assert!(error < 3e-6, "global endpoint error {error:e}");
         assert_eq!(solver.diag_factorizations + solver.band_factorizations, 0);
     }
 
