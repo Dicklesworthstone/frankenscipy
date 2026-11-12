@@ -2239,7 +2239,10 @@ mod tests {
                     };
                     let mut rhs = make_rhs();
                     let mut solver = RkSolver::new(&mut rhs, config()).unwrap();
-                    assert_eq!(solver.step_with(&mut rhs), Err(StepFailure::StepSizeTooSmall));
+                    assert_eq!(
+                        solver.step_with(&mut rhs),
+                        Err(StepFailure::StepSizeTooSmall)
+                    );
                     assert_eq!(solver.state(), OdeSolverState::Failed);
                     assert_eq!(solver.t(), 1.0);
                     assert_eq!(solver.y(), &[1.0]);

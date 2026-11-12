@@ -39822,30 +39822,41 @@ mod krylov_eigen_tests {
 /// Result of sparse SVD computation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SvdsResult {
-    /// Singular values (largest first).
+    /// Singular values, largest first for `LM` and smallest first for `SM`.
     pub singular_values: Vec<f64>,
     /// Left singular vectors (columns of U).
     pub u: Vec<Vec<f64>>,
     /// Right singular vectors (columns of V).
     pub vt: Vec<Vec<f64>>,
-    /// Whether the underlying eigensolve of AᵀA converged for all `k` pairs (SciPy raises
-    /// `ArpackNoConvergence` where this is false). It used to be dropped (br-szq1n.7).
+    /// Whether the smaller Gram eigensolve converged for all `k` pairs and both
+    /// original singular-vector residuals passed. A partial nullspace completion
+    /// that fails either residual is never reported as converged.
     pub converged: bool,
 }
 
-/// Compute the `k` largest singular values of a sparse matrix.
+/// Compute the `k` largest or smallest singular triplets of a sparse matrix.
 ///
-/// Uses the eigenvalue decomposition of A^T A to find singular values.
-/// σ_i = √(λ_i(A^T A)), u_i = A v_i / σ_i.
-/// Matches `scipy.sparse.linalg.svds(A, k=k)`.
+/// Matches `scipy.sparse.linalg.svds(A, k=k, which=..., v0=...)`: Krylov–Schur
+/// runs on the smaller Gram operator, AᵀA for tall matrices or AAᵀ for wide
+/// matrices. An SVD of A times the resulting right subspace (or Aᵀ times the
+/// left subspace) refines the singular values and constructs orthonormal factors,
+/// including at zero singular values. The full input matrix is never densified.
 ///
-/// `options.tol`, `max_iter` and `ncv` apply to the symmetric Krylov–Schur run on AᵀA (SciPy's
-/// defaults when zero/`None`). `which` other than `LM`, `sigma`, `mass`, `minv`, `opinv` and `v0` are refused
-/// ([`SparseError::Unsupported`]). A NaN/Inf in `A` (or an overflowing AᵀA) is refused with
-/// [`SparseError::NonFiniteInput`], where SciPy's ARPACK raises.
+/// `options.which` accepts `LM` and `SM`; `v0` has length `min(rows, cols)`.
+/// `tol`, `max_iter` and `ncv` control the Gram eigensolve. The returned
+/// `converged` flag also requires both original singular-vector equations to
+/// pass a residual check at `max(tol, √ε)` relative to the final operator scale.
+/// In particular, an arbitrary completion of a partial nullspace cannot be
+/// reported as converged merely because the Gram eigenvalues converged.
 ///
-/// `A` may be any [`LinearOperator`] that defines `rmatvec` (the Krylov operator is
-/// `v ↦ Aᵀ(A v)`, as SciPy's `svds` builds from `A.matvec` and `A.rmatvec`).
+/// `return_eigenvectors=false` returns empty `u` and `vt` after checking the
+/// triplets, corresponding to SciPy's `return_singular_vectors=False`.
+/// Shift-invert and generalized-eigenproblem options are refused.
+/// Unlike SciPy's ARPACK backend, `k` may equal `min(rows, cols)`.
+///
+/// `A` may be any [`LinearOperator`] that defines `rmatvec`. Non-finite
+/// entries or products are refused, and the projected SVD has a bounded
+/// iteration count.
 pub fn svds(
     a: &dyn LinearOperator,
     k: usize,
@@ -39854,100 +39865,423 @@ pub fn svds(
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
+    let side = m.min(n);
+    let transposed = m < n;
 
-    if k == 0 || k > m.min(n) {
+    if k == 0 || k > side {
         return Err(SparseError::InvalidArgument {
-            message: format!("k={k} must be in [1, {}]", m.min(n)),
+            message: format!("k={k} must be in [1, {side}]"),
         });
     }
-    if options.which != EigsWhich::LargestMagnitude
-        || options.sigma.is_some()
+    if !matches!(
+        options.which,
+        EigsWhich::LargestMagnitude | EigsWhich::SmallestMagnitude
+    ) || options.sigma.is_some()
+        || options.sigma_im != 0.0
+        || options.op_part.is_some()
+        || options.mode != EigshMode::Normal
         || options.mass.is_some()
         || options.minv.is_some()
         || options.opinv.is_some()
-        || options.v0.is_some()
     {
         return Err(SparseError::Unsupported {
-            feature: "svds supports which='LM' without sigma, M, Minv, OPinv or v0".to_string(),
+            feature: "svds supports which='LM' or 'SM' without eigenproblem transformations"
+                .to_string(),
         });
     }
-    let settings = resolve_krylov_settings(n, k, &options, true)?;
+    let settings = resolve_krylov_settings(side, k, &options, true)?;
+    if let Some(matrix) = a.as_csr() {
+        ensure_finite(matrix.data())?;
+    }
+    let start = if let Some(v0) = options.v0 {
+        if v0.len() != side {
+            return Err(SparseError::IncompatibleShape {
+                message: format!("v0 has length {}, expected {side}", v0.len()),
+            });
+        }
+        ensure_finite(v0)?;
+        let magnitude = v0.iter().fold(0.0_f64, |largest, v| largest.max(v.abs()));
+        if magnitude == 0.0 {
+            return Err(SparseError::InvalidArgument {
+                message: "starting vector is zero".to_string(),
+            });
+        }
+        // A starting direction is scale-free; normalize before its squared
+        // norm can overflow or underflow inside the shared Krylov kernel.
+        let mut start: Vec<f64> = v0.iter().map(|value| value / magnitude).collect();
+        let norm = start.iter().fold(0.0_f64, |norm, value| norm.hypot(*value));
+        start.iter_mut().for_each(|value| *value /= norm);
+        Some(start)
+    } else {
+        None
+    };
 
-    // Cache A in CSC once so the operator Aᵀ·w is a byte-identical parallel
-    // column-gather (`csc_matvec`), reused across all Krylov steps. A matrix-free
-    // operator applies its own rmatvec instead.
+    // Reuse the cached CSC gather for CSR inputs, and retain caller-supplied
+    // transpose products for matrix-free operators.
     let a_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
-
-    // The top-k singular values of A are the square roots of the top-k eigenvalues
-    // of the n×n SPSD matrix AᵀA, with right singular vectors = its eigenvectors.
-    // Build the k largest eigenpairs of AᵀA by symmetric Krylov–Schur on the operator
-    // v ↦ Aᵀ(A v), restarting until they converge (a single max(2k+1, 20) subspace,
-    // what this used to run, resolves only a well-separated spectrum).
-    // AᵀA·v: reuse a hoisted `tmp` (rows-length) for the discarded intermediate
-    // A·v instead of allocating it every Arnoldi step; the Aᵀ·tmp result is
-    // returned fresh because it becomes the next basis vector. frankenscipy-fo9cj
-    // (byte-identical: same kernels, tmp fully overwritten each call).
-    let mut tmp = vec![0.0; a.shape().rows];
-    let ata_op = move |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
-        a.matvec_into(v, &mut tmp)?;
-        let mut image = vec![0.0; n];
-        csc_transpose_matvec_into(a, a_csc.as_ref(), &tmp, &mut image)?;
+    let mut tmp = vec![0.0; m.max(n)];
+    let gram_op = |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
+        let mut image = vec![0.0; side];
+        if transposed {
+            csc_transpose_matvec_into(a, a_csc.as_ref(), v, &mut tmp[..n])?;
+            ensure_finite(&tmp[..n])?;
+            a.matvec_into(&tmp[..n], &mut image)?;
+        } else {
+            a.matvec_into(v, &mut tmp[..m])?;
+            ensure_finite(&tmp[..m])?;
+            csc_transpose_matvec_into(a, a_csc.as_ref(), &tmp[..m], &mut image)?;
+        }
         Ok(image)
     };
-    let run = symmetric_krylov_schur(ata_op, None, n, k, &settings, None, false)?;
-    let eig = EigsResult {
-        converged: run.theta.len() == k && run.converged.iter().all(|&c| c),
-        eigenvalues: run.theta,
-        eigenvectors: run.vectors,
-        ..EigsResult::default()
-    };
+    let run = symmetric_krylov_schur(gram_op, None, side, k, &settings, start.as_deref(), false)?;
+    let count = run.vectors.len();
+    let mut converged = count == k && run.converged.iter().all(|&value| value);
+    if count == 0 {
+        return Ok(SvdsResult {
+            singular_values: Vec::new(),
+            u: Vec::new(),
+            vt: Vec::new(),
+            converged: false,
+        });
+    }
 
-    let mut singular_values = Vec::with_capacity(k);
-    let mut v_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
-    let mut u_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
-
-    // frankenscipy-6bfm3: the "is σ numerically zero, so u = A v / σ is not
-    // recoverable" test below has to be relative to the largest singular value
-    // present. It used to be the absolute `f64::EPSILON * 1e6` = 2.22e-10, which
-    // on a uniformly small matrix is larger than EVERY singular value — so every
-    // left singular vector was returned as the zero vector while the σ values
-    // themselves were reported correctly and nonzero. σ_max = 0 (the zero matrix)
-    // leaves the test as `sigma > 0.0`, which is the right answer there.
-    let sigma_max = eig
-        .eigenvalues
-        .iter()
-        .fold(0.0f64, |acc, &e| acc.max(e.max(0.0).sqrt()));
-
-    for (eigenvalue, v) in eig.eigenvalues.iter().zip(eig.eigenvectors.iter()) {
-        // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding. A NaN
-        // eigenvalue stays NaN: `f64::max` would drop it and report σ = 0 for a matrix
-        // holding a NaN, where SciPy's ARPACK raises.
-        let sigma = if eigenvalue.is_nan() {
-            f64::NAN
+    // Re-orthogonalize the Ritz subspace before projecting the original
+    // operator. Taking sqrt(Gram eigenvalues) and dividing A*v by each result
+    // loses relative accuracy near rank deficiency and cannot construct a
+    // normalized singular vector at sigma=0.
+    let basis = DMatrix::from_fn(side, count, |i, j| run.vectors[j][i])
+        .qr()
+        .q();
+    let projected_rows = m.max(n);
+    let mut projected = DMatrix::zeros(projected_rows, count);
+    for j in 0..count {
+        let input = &basis.as_slice()[j * side..(j + 1) * side];
+        let output = &mut projected.as_mut_slice()[j * projected_rows..(j + 1) * projected_rows];
+        if transposed {
+            csc_transpose_matvec_into(a, a_csc.as_ref(), input, output)?;
         } else {
-            eigenvalue.max(0.0).sqrt()
-        };
-        singular_values.push(sigma);
-        v_vecs.push(v.clone());
-
-        // Left singular vector: u = A v / σ.
-        if sigma > f64::EPSILON * sigma_max {
-            let mut u = a.matvec(v)?;
-            for ui in &mut u {
-                *ui /= sigma;
+            a.matvec_into(input, output)?;
+        }
+        ensure_finite(output)?;
+    }
+    let svd =
+        nalgebra::SVD::try_new(projected, true, true, f64::EPSILON, 10_000).ok_or_else(|| {
+            SparseError::EigsNoConvergence {
+                message: "svds: the projected singular value decomposition did not converge"
+                    .to_string(),
+                partial: Box::new(EigsResult {
+                    iterations: run.iterations,
+                    ncv: settings.ncv,
+                    ..EigsResult::default()
+                }),
             }
-            u_vecs.push(u);
+        })?;
+    let projected_u = svd.u.expect("the projected SVD requested left vectors");
+    let projected_vt = svd.v_t.expect("the projected SVD requested right vectors");
+    ensure_finite(svd.singular_values.as_slice())?;
+    ensure_finite(projected_u.as_slice())?;
+    ensure_finite(projected_vt.as_slice())?;
+    let lifted = basis * projected_vt.transpose();
+    ensure_finite(lifted.as_slice())?;
+
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&i, &j| {
+        if options.which == EigsWhich::SmallestMagnitude {
+            svd.singular_values[i].total_cmp(&svd.singular_values[j])
         } else {
-            u_vecs.push(vec![0.0; m]);
+            svd.singular_values[j].total_cmp(&svd.singular_values[i])
+        }
+    });
+    let mut singular_values = Vec::with_capacity(count);
+    let mut u = Vec::with_capacity(count);
+    let mut vt = Vec::with_capacity(count);
+    let spectral_scale = run.spectral_scale.sqrt();
+    let mut av = vec![0.0; m];
+    let mut atu = vec![0.0; n];
+    for j in order {
+        let sigma = svd.singular_values[j];
+        let projected_vector: Vec<f64> = projected_u.column(j).iter().copied().collect();
+        let lifted_vector: Vec<f64> = lifted.column(j).iter().copied().collect();
+        let (left, right) = if transposed {
+            (lifted_vector, projected_vector)
+        } else {
+            (projected_vector, lifted_vector)
+        };
+        a.matvec_into(&right, &mut av)?;
+        csc_transpose_matvec_into(a, a_csc.as_ref(), &left, &mut atu)?;
+        ensure_finite(&av)?;
+        ensure_finite(&atu)?;
+        let left_residual = av
+            .iter()
+            .zip(&left)
+            .fold(0.0_f64, |norm, (&x, &y)| norm.hypot(x - sigma * y));
+        let right_residual = atu
+            .iter()
+            .zip(&right)
+            .fold(0.0_f64, |norm, (&x, &y)| norm.hypot(x - sigma * y));
+        let tolerance = settings.tol.max(f64::EPSILON.sqrt()) * (spectral_scale + sigma);
+        converged &= left_residual.is_finite()
+            && right_residual.is_finite()
+            && tolerance.is_finite()
+            && left_residual <= tolerance
+            && right_residual <= tolerance;
+        singular_values.push(sigma);
+        u.push(left);
+        vt.push(right);
+    }
+    if !options.return_eigenvectors {
+        u.clear();
+        vt.clear();
+    }
+    Ok(SvdsResult {
+        singular_values,
+        u,
+        vt,
+        converged,
+    })
+}
+
+#[cfg(test)]
+mod svds_refinement_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn diagonal_rect(rows: usize, cols: usize, diagonal: &[f64]) -> CsrMatrix {
+        CooMatrix::from_triplets(
+            Shape2D::new(rows, cols),
+            diagonal.to_vec(),
+            (0..diagonal.len()).collect(),
+            (0..diagonal.len()).collect(),
+            true,
+        )
+        .expect("diagonal COO")
+        .to_csr()
+        .expect("diagonal CSR")
+    }
+
+    fn check_triplets(a: &dyn LinearOperator, result: &SvdsResult, expected: &[f64]) {
+        assert!(
+            result.converged,
+            "unconverged singular triplets: {result:?}"
+        );
+        assert_eq!(result.singular_values.len(), expected.len());
+        assert_eq!(result.u.len(), expected.len());
+        assert_eq!(result.vt.len(), expected.len());
+        let mut values = result.singular_values.clone();
+        values.sort_by(|x, y| y.total_cmp(x));
+        let scale = expected.iter().copied().fold(0.0_f64, f64::max);
+        for (&value, &want) in values.iter().zip(expected) {
+            assert!((value - want).abs() <= 1e-9 * scale.max(1.0), "{values:?}");
+        }
+        for i in 0..expected.len() {
+            assert_eq!(result.u[i].len(), a.shape().rows);
+            assert_eq!(result.vt[i].len(), a.shape().cols);
+            let av = a.matvec(&result.vt[i]).expect("A v");
+            let atu = a.rmatvec(&result.u[i]).expect("A^T u");
+            let sigma = result.singular_values[i];
+            let left = av
+                .iter()
+                .zip(&result.u[i])
+                .fold(0.0_f64, |r, (&x, &y)| r.hypot(x - sigma * y));
+            let right = atu
+                .iter()
+                .zip(&result.vt[i])
+                .fold(0.0_f64, |r, (&x, &y)| r.hypot(x - sigma * y));
+            assert!(left <= 1e-9 * scale.max(1.0), "left residual {left:e}");
+            assert!(right <= 1e-9 * scale.max(1.0), "right residual {right:e}");
+            for j in 0..=i {
+                let want = if i == j { 1.0 } else { 0.0 };
+                let uu = dot_product(&result.u[i], &result.u[j]);
+                let vv = dot_product(&result.vt[i], &result.vt[j]);
+                assert!((uu - want).abs() < 1e-10, "U[{i}] dot U[{j}] = {uu:e}");
+                assert!((vv - want).abs() < 1e-10, "V[{i}] dot V[{j}] = {vv:e}");
+            }
         }
     }
 
-    Ok(SvdsResult {
-        singular_values,
-        u: u_vecs,
-        vt: v_vecs,
-        converged: eig.converged,
-    })
+    #[test]
+    fn svds_zero_matrices_return_orthonormal_singular_vectors() {
+        for (rows, cols) in [(7, 4), (4, 7)] {
+            let a = diagonal_rect(rows, cols, &[0.0; 4]);
+            let result = svds(&a, 3, EigsOptions::default()).expect("zero SVD");
+            check_triplets(&a, &result, &[0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn svds_rank_deficient_matrices_retain_orthonormal_factors() {
+        for (rows, cols) in [(8, 5), (5, 8)] {
+            let a = diagonal_rect(rows, cols, &[6.0, 3.0, 0.0, 0.0, 0.0]);
+            let result = svds(&a, 4, EigsOptions::default()).expect("rank-deficient SVD");
+            check_triplets(&a, &result, &[6.0, 3.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn svds_smallest_triplets_accept_start_vectors_on_the_smaller_side() {
+        let start = [1.0, -2.0, 3.0, -4.0, 5.0];
+        for (rows, cols) in [(11, 5), (5, 80)] {
+            let a = diagonal_rect(rows, cols, &[9.0, 7.0, 4.0, 2.0, 1.0]);
+            let result = svds(
+                &a,
+                2,
+                EigsOptions {
+                    which: EigsWhich::SmallestMagnitude,
+                    v0: Some(&start),
+                    ..EigsOptions::default()
+                },
+            )
+            .expect("smallest SVD");
+            check_triplets(&a, &result, &[2.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn svds_matrix_free_wide_problem_uses_the_smaller_gram_space() {
+        struct CountedOperator {
+            matrix: CsrMatrix,
+            applications: Cell<usize>,
+        }
+        impl LinearOperator for CountedOperator {
+            fn shape(&self) -> Shape2D {
+                self.matrix.shape()
+            }
+
+            fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.applications.set(self.applications.get() + 1);
+                self.matrix.matvec_into(x, y)
+            }
+
+            fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.applications.set(self.applications.get() + 1);
+                self.matrix.rmatvec_into(x, y)
+            }
+
+            fn to_dense(&self) -> SparseResult<Vec<Vec<f64>>> {
+                panic!("svds must never materialize its input operator")
+            }
+        }
+        let a = CountedOperator {
+            matrix: diagonal_rect(5, 20_000, &[9.0, 7.0, 4.0, 2.0, 1.0]),
+            applications: Cell::new(0),
+        };
+        let result = svds(&a, 2, EigsOptions::default()).expect("matrix-free SVD");
+        // Five Krylov directions, two projected products and four residual
+        // products. A basis on the 20,000-dimensional side exceeds this bound.
+        assert!(
+            a.applications.get() <= 18,
+            "{} applications",
+            a.applications.get()
+        );
+        check_triplets(&a, &result, &[9.0, 7.0]);
+    }
+
+    #[test]
+    fn svds_refined_clustered_triplets_preserve_orthogonality() {
+        let diagonal = [3.0, 3.0 + 1e-8, 3.0 + 2e-8, 1.0, 1.0 + 1e-8, 1.0 + 2e-8];
+        let a = diagonal_rect(9, 6, &diagonal);
+        for (which, expected) in [
+            (EigsWhich::LargestMagnitude, [3.0 + 2e-8, 3.0 + 1e-8, 3.0]),
+            (EigsWhich::SmallestMagnitude, [1.0 + 2e-8, 1.0 + 1e-8, 1.0]),
+        ] {
+            let result = svds(
+                &a,
+                3,
+                EigsOptions {
+                    which,
+                    ..EigsOptions::default()
+                },
+            )
+            .expect("clustered SVD");
+            check_triplets(&a, &result, &expected);
+        }
+    }
+
+    #[test]
+    fn svds_refinement_does_not_hide_an_exhausted_krylov_budget() {
+        let diagonal: Vec<f64> = (0..80).map(|i| (i + 1) as f64).collect();
+        let a = diagonal_rect(90, 80, &diagonal);
+        let result = svds(
+            &a,
+            2,
+            EigsOptions {
+                ncv: Some(4),
+                max_iter: 1,
+                ..EigsOptions::default()
+            },
+        )
+        .expect("bounded iteration returns its convergence flag");
+        assert!(!result.converged, "{result:?}");
+    }
+
+    #[test]
+    fn svds_partial_nullspace_completion_requires_original_residuals() {
+        // A's right null vector is e0, but its left null vector is e3. The
+        // SVD of the zero projected column may complete it with e0; the Gram
+        // eigenproblem alone cannot certify that opposite-side null vector.
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![3.0, 5.0, 7.0],
+            vec![0, 1, 2],
+            vec![1, 2, 3],
+            true,
+        )
+        .expect("shift COO")
+        .to_csr()
+        .expect("shift CSR");
+        let result = svds(
+            &a,
+            1,
+            EigsOptions {
+                which: EigsWhich::SmallestMagnitude,
+                v0: Some(&[1.0, 0.0, 0.0, 0.0]),
+                ..EigsOptions::default()
+            },
+        )
+        .expect("partial nullspace");
+        assert_eq!(result.singular_values, vec![0.0]);
+        let atu = a.rmatvec(&result.u[0]).expect("A^T u");
+        let residual = atu.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        assert!(
+            residual <= 1e-8 || !result.converged,
+            "an invalid opposite-side null vector was certified: {result:?}"
+        );
+    }
+
+    #[test]
+    fn svds_validates_start_vectors_and_preserves_the_values_only_verdict() {
+        let a = diagonal_rect(4, 7, &[4.0, 3.0, 2.0, 1.0]);
+        for start in [&[1.0; 7][..], &[0.0; 4][..], &[f64::NAN; 4][..]] {
+            assert!(
+                svds(
+                    &a,
+                    2,
+                    EigsOptions {
+                        v0: Some(start),
+                        ..EigsOptions::default()
+                    },
+                )
+                .is_err()
+            );
+        }
+        for magnitude in [1e-300, 1e300] {
+            let start = [magnitude; 4];
+            let result = svds(
+                &a,
+                2,
+                EigsOptions {
+                    v0: Some(&start),
+                    return_eigenvectors: false,
+                    ..EigsOptions::default()
+                },
+            )
+            .expect("scaled starting vector");
+            assert!(result.converged);
+            assert!(result.u.is_empty() && result.vt.is_empty());
+            assert!((result.singular_values[0] - 4.0).abs() < 1e-10);
+            assert!((result.singular_values[1] - 3.0).abs() < 1e-10);
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════

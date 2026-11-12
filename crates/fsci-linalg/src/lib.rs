@@ -11321,16 +11321,17 @@ fn expm_frechet_blocks(a: &DMatrix<f64>, e: &DMatrix<f64>) -> (DMatrix<f64>, DMa
     let max_a = a
         .iter()
         .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-    let s = if max_a == 0.0 {
-        0u32
-    } else {
-        let scaled_norm = (0..n)
-            .map(|j| (0..n).map(|i| a[(i, j)].abs() / max_a).sum::<f64>())
-            .fold(0.0_f64, f64::max);
-        (max_a.log2() + scaled_norm.log2() - ELL13.log2())
-            .ceil()
-            .max(0.0) as u32
-    };
+    if max_a == 0.0 {
+        // L(0, E) = E exactly. Normalizing a mixed-scale E can discard
+        // subnormal entries even though no exponential calculation is needed.
+        return (identity, e.clone());
+    }
+    let scaled_norm = (0..n)
+        .map(|j| (0..n).map(|i| a[(i, j)].abs() / max_a).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let s = (max_a.log2() + scaled_norm.log2() - ELL13.log2())
+        .ceil()
+        .max(0.0) as u32;
     // Multiplying by 2^-s also avoids overflowing an intermediate 2^s.
     let scale = 0.5_f64.powi(s as i32);
     let ad = a * scale;
@@ -50694,6 +50695,22 @@ mod proptest_tests {
                 expm_frechet(&a, &e, DecompOptions::default()).expect("finite inputs");
             assert_eq!(exponential, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
             assert_eq!(derivative, e, "L(0, E) = E at scale {scale}");
+        }
+    }
+
+    #[test]
+    fn expm_frechet_zero_matrix_preserves_mixed_scale_directions() {
+        let tiny = f64::from_bits(1);
+        let a = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        for e in [
+            vec![vec![2.0, tiny], vec![-0.0, -1.0]],
+            vec![vec![1e308, 1e-300], vec![tiny, -1e308]],
+        ] {
+            let (exponential, derivative) = expm_frechet(&a, &e, DecompOptions::default())
+                .expect("finite mixed-scale direction");
+            assert_eq!(exponential, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+            assert_eq!(derivative, e);
+            assert_eq!(derivative[1][0].to_bits(), e[1][0].to_bits());
         }
     }
 

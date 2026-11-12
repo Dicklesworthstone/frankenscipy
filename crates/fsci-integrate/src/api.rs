@@ -5349,7 +5349,10 @@ mod tests {
         };
         let mut rhs = |_t: f64, y: &[f64]| y.iter().map(|value| -2.0 * value).collect();
         let probe = probe_ode_stiffness(&mut rhs, &options);
-        assert_eq!(probe.probe_nfev, 3, "analytic jac disables the sparsity hint");
+        assert_eq!(
+            probe.probe_nfev, 3,
+            "analytic jac disables the sparsity hint"
+        );
         let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
         let result = solve_ivp_with_casp(&mut rhs, &options, &mut portfolio)
             .expect("ignored sparsity pattern must not invalidate a usable Jacobian");
@@ -5499,10 +5502,26 @@ mod tests {
         use fsci_runtime::PortfolioEvidence;
 
         for (option_mode, portfolio_mode, mode) in [
-            (RuntimeMode::Strict, RuntimeMode::Strict, RuntimeMode::Strict),
-            (RuntimeMode::Hardened, RuntimeMode::Hardened, RuntimeMode::Hardened),
-            (RuntimeMode::Strict, RuntimeMode::Hardened, RuntimeMode::Hardened),
-            (RuntimeMode::Hardened, RuntimeMode::Strict, RuntimeMode::Hardened),
+            (
+                RuntimeMode::Strict,
+                RuntimeMode::Strict,
+                RuntimeMode::Strict,
+            ),
+            (
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+            ),
+            (
+                RuntimeMode::Strict,
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+            ),
+            (
+                RuntimeMode::Hardened,
+                RuntimeMode::Strict,
+                RuntimeMode::Hardened,
+            ),
         ] {
             let ledger = crate::validation::sync_audit_ledger();
             let mut portfolio = OdeSolverPortfolio::new(portfolio_mode, 4);
