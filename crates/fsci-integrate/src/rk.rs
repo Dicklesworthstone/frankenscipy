@@ -1369,21 +1369,24 @@ impl RkSolver {
         // Minimum step: 10 * machine epsilon at current t
         let min_step = 10.0 * (next_after(t, self.direction * f64::INFINITY) - t).abs();
 
-        let mut h_abs = self.h_abs.clamp(0.0, self.max_step);
+        // Apply the initial floor once, as SciPy does. Clipping to t_bound below
+        // can still produce an accurate final step shorter than min_step, but a
+        // rejected trial must not be restored to that same interval indefinitely.
+        let mut h_abs = if self.h_abs > self.max_step {
+            self.max_step
+        } else if self.h_abs < min_step {
+            min_step
+        } else {
+            self.h_abs
+        };
 
         let mut step_accepted = false;
         let mut step_rejected = false;
 
         while !step_accepted {
             if h_abs < min_step {
-                // If we are extremely close to the boundary, we can allow one final tiny step
-                let remaining = (self.t_bound - t).abs();
-                if remaining < min_step {
-                    h_abs = remaining;
-                } else {
-                    self.state = OdeSolverState::Failed;
-                    return Err(StepFailure::StepSizeTooSmall);
-                }
+                self.state = OdeSolverState::Failed;
+                return Err(StepFailure::StepSizeTooSmall);
             }
 
             let h = h_abs * self.direction;
@@ -1574,21 +1577,24 @@ impl RkSolver {
         // Minimum step: 10 * machine epsilon at current t
         let min_step = 10.0 * (next_after(t, self.direction * f64::INFINITY) - t).abs();
 
-        let mut h_abs = self.h_abs.clamp(0.0, self.max_step);
+        // Apply the initial floor once, as SciPy does. Clipping to t_bound below
+        // can still produce an accurate final step shorter than min_step, but a
+        // rejected trial must not be restored to that same interval indefinitely.
+        let mut h_abs = if self.h_abs > self.max_step {
+            self.max_step
+        } else if self.h_abs < min_step {
+            min_step
+        } else {
+            self.h_abs
+        };
 
         let mut step_accepted = false;
         let mut step_rejected = false;
 
         while !step_accepted {
             if h_abs < min_step {
-                // If we are extremely close to the boundary, we can allow one final tiny step
-                let remaining = (self.t_bound - t).abs();
-                if remaining < min_step {
-                    h_abs = remaining;
-                } else {
-                    self.state = OdeSolverState::Failed;
-                    return Err(StepFailure::StepSizeTooSmall);
-                }
+                self.state = OdeSolverState::Failed;
+                return Err(StepFailure::StepSizeTooSmall);
             }
 
             let h = h_abs * self.direction;
@@ -2202,6 +2208,120 @@ mod tests {
         };
         let solver = RkSolver::new(&mut fun, config).expect("solver creation should succeed");
         assert_eq!(solver.state(), OdeSolverState::Running);
+    }
+
+    #[test]
+    fn rejected_final_rk_step_below_minimum_terminates() {
+        for tableau in [&RK23_TABLEAU, &RK45_TABLEAU, &DOP853_TABLEAU] {
+            for t_bound in [1.0_f64.next_up(), 1.0_f64.next_down()] {
+                for rejected_derivative in [f64::NAN, f64::INFINITY, 1e100] {
+                    let config = || RkSolverConfig {
+                        t0: 1.0,
+                        y0: &[1.0],
+                        t_bound,
+                        rtol: 1e-10,
+                        atol: ToleranceValue::Scalar(1e-12),
+                        max_step: f64::INFINITY,
+                        first_step: Some((t_bound - 1.0).abs()),
+                        mode: RuntimeMode::Strict,
+                        tableau,
+                    };
+                    let expected_nfev = 1 + evals_per_step(tableau);
+                    let make_rhs = || {
+                        let mut calls = 0;
+                        move |t: f64, _y: &[f64]| {
+                            calls += 1;
+                            // Fail promptly on the old non-progress loop instead of
+                            // hanging the test process on its repeated final trial.
+                            assert!(calls <= expected_nfev, "repeated rejected final step");
+                            vec![if t == 1.0 { 0.0 } else { rejected_derivative }]
+                        }
+                    };
+                    let mut rhs = make_rhs();
+                    let mut solver = RkSolver::new(&mut rhs, config()).unwrap();
+                    assert_eq!(solver.step_with(&mut rhs), Err(StepFailure::StepSizeTooSmall));
+                    assert_eq!(solver.state(), OdeSolverState::Failed);
+                    assert_eq!(solver.t(), 1.0);
+                    assert_eq!(solver.y(), &[1.0]);
+                    assert_eq!(solver.nfev(), expected_nfev);
+
+                    let mut owned = RkSolver::new_owned(make_rhs(), config()).unwrap();
+                    assert_eq!(owned.step(), Err(StepFailure::StepSizeTooSmall));
+                    assert_eq!(owned.state(), OdeSolverState::Failed);
+                    assert_eq!(owned.t(), 1.0);
+                    assert_eq!(owned.y(), &[1.0]);
+                    assert_eq!(owned.nfev(), expected_nfev);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_rk_step_below_minimum_still_succeeds_when_accurate() {
+        for tableau in [&RK23_TABLEAU, &RK45_TABLEAU, &DOP853_TABLEAU] {
+            for t_bound in [1.0_f64.next_up(), 1.0_f64.next_down()] {
+                let config = || RkSolverConfig {
+                    t0: 1.0,
+                    y0: &[1.0],
+                    t_bound,
+                    rtol: 1e-6,
+                    atol: ToleranceValue::Scalar(1e-8),
+                    max_step: f64::INFINITY,
+                    first_step: Some((t_bound - 1.0).abs()),
+                    mode: RuntimeMode::Strict,
+                    tableau,
+                };
+                let mut rhs = |_t: f64, _y: &[f64]| vec![0.0];
+                let mut solver = RkSolver::new(&mut rhs, config()).unwrap();
+                assert_eq!(
+                    solver.step_with(&mut rhs).unwrap().state,
+                    OdeSolverState::Finished
+                );
+                assert_eq!(solver.t(), t_bound);
+                assert_eq!(solver.y(), &[1.0]);
+
+                let mut owned = RkSolver::new_owned(rhs, config()).unwrap();
+                assert_eq!(owned.step().unwrap().state, OdeSolverState::Finished);
+                assert_eq!(owned.t(), t_bound);
+                assert_eq!(owned.y(), &[1.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn rk_initial_step_below_minimum_is_raised_before_retry_loop() {
+        for tableau in [&RK23_TABLEAU, &RK45_TABLEAU, &DOP853_TABLEAU] {
+            for t_bound in [0.0, 2.0] {
+                let spacing = if t_bound > 1.0 {
+                    1.0_f64.next_up() - 1.0
+                } else {
+                    1.0 - 1.0_f64.next_down()
+                };
+                let config = || RkSolverConfig {
+                    t0: 1.0,
+                    y0: &[1.0],
+                    t_bound,
+                    rtol: 1e-6,
+                    atol: ToleranceValue::Scalar(1e-8),
+                    max_step: f64::INFINITY,
+                    first_step: Some(spacing),
+                    mode: RuntimeMode::Strict,
+                    tableau,
+                };
+                let expected_t = 1.0 + (t_bound - 1.0).signum() * 10.0 * spacing;
+                let mut rhs = |_t: f64, _y: &[f64]| vec![0.0];
+                let mut solver = RkSolver::new(&mut rhs, config()).unwrap();
+                assert_eq!(
+                    solver.step_with(&mut rhs).unwrap().state,
+                    OdeSolverState::Running
+                );
+                assert_eq!(solver.t(), expected_t);
+
+                let mut owned = RkSolver::new_owned(rhs, config()).unwrap();
+                assert_eq!(owned.step().unwrap().state, OdeSolverState::Running);
+                assert_eq!(owned.t(), expected_t);
+            }
+        }
     }
 
     #[test]

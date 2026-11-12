@@ -2539,6 +2539,48 @@ mod tests {
     }
 
     #[test]
+    fn solve_ivp_rejected_final_rk_step_returns_failure_without_retrying_forever() {
+        for (method, nfev) in [
+            (SolverKind::Rk23, 4),
+            (SolverKind::Rk45, 7),
+            (SolverKind::Dop853, 13),
+        ] {
+            for t_bound in [1.0_f64.next_up(), 1.0_f64.next_down()] {
+                for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                    let mut calls = 0;
+                    let result = solve_ivp(
+                        &mut |t, _y| {
+                            calls += 1;
+                            // Detect the old non-progress loop without hanging the suite.
+                            assert!(calls <= nfev, "repeated rejected final step: {method:?}");
+                            vec![if t == 1.0 { 0.0 } else { f64::NAN }]
+                        },
+                        &SolveIvpOptions {
+                            t_span: (1.0, t_bound),
+                            y0: &[1.0],
+                            method,
+                            first_step: Some((t_bound - 1.0).abs()),
+                            dense_output: true,
+                            mode,
+                            ..SolveIvpOptions::default()
+                        },
+                    )
+                    .expect("an unresolvable step returns the partial integration result");
+                    assert!(!result.success, "{method:?}");
+                    assert_eq!(result.status, -1);
+                    assert_eq!(result.nfev, nfev);
+                    assert_eq!(calls, nfev);
+                    assert_eq!(result.t, vec![1.0]);
+                    assert_eq!(result.y, vec![vec![1.0]]);
+                    let sol = result.sol.unwrap();
+                    assert_eq!(sol.knots, vec![1.0]);
+                    assert_eq!(sol.evaluate(1.0).unwrap(), vec![1.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn solve_ivp_harmonic_oscillator_system() {
         // 2-equation system y' = [y1, -y0], y(0)=[1,0] -> [cos t, -sin t].
         // Exercises the vector ODE path; scipy.integrate.solve_ivp converges to
