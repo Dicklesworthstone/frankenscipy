@@ -500,6 +500,83 @@ fn cases() -> Vec<Case> {
             &[],
             vec![(None, None), (Some(0.0), None)],
         ),
+        // Exact live-oracle regression: these mixed-unit diagonal bases used to
+        // return a solve error for every fsci method while HiGHS returned (1, 1).
+        lp(
+            "mixed_row_units_small_first",
+            &[-1.0, -1.0],
+            &[&[1e-8, 0.0], &[0.0, 1e8]],
+            &[1e-8, 1e8],
+            &[],
+            &[],
+            vec![],
+        ),
+        lp(
+            "mixed_row_units_large_first",
+            &[-1.0, -1.0],
+            &[&[1e8, 0.0], &[0.0, 1e-8]],
+            &[1e8, 1e-8],
+            &[],
+            &[],
+            vec![],
+        ),
+        lp(
+            "mixed_equality_units_free",
+            &[1.0, 2.0],
+            &[],
+            &[],
+            &[&[1e8, 0.0], &[0.0, 1e-8]],
+            &[2e8, -3e-8],
+            vec![(None, None), (None, None)],
+        ),
+        // The documented marginal example with variable units (2^16, 2^-16)
+        // and row units (2^-8, 2^8). Every coefficient exceeds HiGHS's tiny-entry
+        // cutoff. This checks primal, row-dual and bound-dual reconstruction.
+        lp(
+            "row_column_units_boxed",
+            &[-1.0 / 65536.0, -131072.0],
+            &[&[1.0 / 16777216.0, 256.0], &[1.0 / 256.0, -16777216.0]],
+            &[1.0 / 64.0, 512.0],
+            &[],
+            &[],
+            vec![(Some(0.0), None), (Some(0.0), Some(3.0 / 65536.0))],
+        ),
+        lp(
+            "row_column_units_free_equality",
+            &[2.0 / 65536.0, 65536.0],
+            &[],
+            &[],
+            &[&[1.0 / 256.0, -16777216.0]],
+            &[512.0],
+            vec![(None, None), (Some(0.0), None)],
+        ),
+        lp(
+            "row_column_units_fixed_equality",
+            &[1.0 / 65536.0, -131072.0],
+            &[],
+            &[],
+            &[&[1.0 / 256.0, 16777216.0]],
+            &[768.0],
+            vec![(Some(131072.0), Some(131072.0)), (Some(0.0), None)],
+        ),
+        lp(
+            "scaled_unbounded_ray_zero_row",
+            &[-1.0, 0.0],
+            &[&[1e8, -1e8], &[0.0, 0.0]],
+            &[1e8, 0.0],
+            &[],
+            &[],
+            vec![],
+        ),
+        lp(
+            "scaled_infeasible_zero_row",
+            &[-1.0, 0.0],
+            &[&[1e-8, -1e-8], &[0.0, 0.0]],
+            &[1e-8, -1.0],
+            &[],
+            &[],
+            vec![],
+        ),
     ];
     let mut limited = random_dense("iteration_limit_1", 0x5EED_1A1B, 20, 10, 50);
     limited.maxiter = Some(1);

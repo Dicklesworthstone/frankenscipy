@@ -32,7 +32,11 @@
 //! carries no solution: `x`, `slack`, `con` and every `residual`/`marginals` vector are empty
 //! and `fun` is NaN where SciPy returns `None`.
 //!
-//! Differences from HiGHS that can show: there is no presolve and no scaling; HiGHS's
+//! Both solvers equilibrate the constraint rows and columns with reversible powers of two.
+//! The returned solution, residuals, objective and marginals remain in the user's units;
+//! scaling never relaxes a primal or dual tolerance in those units or deletes a coefficient.
+//!
+//! Differences from HiGHS that can show: there is no presolve; HiGHS's
 //! `highs-ds` is a *dual* simplex while this one is primal, so on an LP with several optimal
 //! vertices (or several optimal duals) the two can return different, equally optimal answers;
 //! `nit` counts this solver's iterations, not HiGHS's; and the `primal_status` word inside a
@@ -231,7 +235,8 @@ pub fn linprog(
         ));
     }
 
-    let lp = Lp::new(c, a_ub, b_ub, a_eq, b_eq, &lb, &ub);
+    let mut lp = Lp::new(c, a_ub, b_ub, a_eq, b_eq, &lb, &ub);
+    lp.equilibrate();
     let tolerances = Tolerances {
         primal: options.primal_feasibility_tolerance,
         dual: options.dual_feasibility_tolerance,
@@ -379,6 +384,9 @@ struct Lp {
     c: Vec<f64>,
     lo: Vec<f64>,
     hi: Vec<f64>,
+    /// Original variable = scale × working variable. Structural factors are the column
+    /// scaling; logical factors are the reciprocal row scaling.
+    variable_scale: Vec<f64>,
 }
 
 impl Lp {
@@ -415,7 +423,61 @@ impl Lp {
             c: c.to_vec(),
             lo,
             hi,
+            variable_scale: vec![1.0; n + m],
         }
+    }
+
+    /// Max-norm row/column equilibration: A' = R A C, b' = R b, c' = C c and
+    /// bounds' = bounds / C. A power-of-two factor is accepted only when every affected
+    /// finite datum survives the round trip exactly, including subnormals. Thus a row
+    /// with an extreme dynamic range cannot silently lose its smallest coefficient.
+    fn equilibrate(&mut self) {
+        for i in 0..self.m {
+            let maximum = (0..self.n)
+                .map(|j| self.a[j * self.m + i].abs())
+                .fold(0.0_f64, f64::max);
+            let factor = reversible_power_scale(maximum, |factor| {
+                exactly_scalable(self.b[i], factor)
+                    && (0..self.n).all(|j| exactly_scalable(self.a[j * self.m + i], factor))
+            });
+            for j in 0..self.n {
+                self.a[j * self.m + i] *= factor;
+            }
+            self.b[i] *= factor;
+            self.variable_scale[self.n + i] = 1.0 / factor;
+        }
+        for j in 0..self.n {
+            let maximum = self
+                .column(j)
+                .iter()
+                .map(|a| a.abs())
+                .fold(0.0_f64, f64::max);
+            let factor = reversible_power_scale(maximum, |factor| {
+                exactly_scalable(self.c[j], factor)
+                    && self.column(j).iter().all(|&a| exactly_scalable(a, factor))
+                    && [self.lo[j], self.hi[j]]
+                        .iter()
+                        .all(|&bound| !bound.is_finite() || exactly_scalable(bound, 1.0 / factor))
+            });
+            for a in &mut self.a[j * self.m..(j + 1) * self.m] {
+                *a *= factor;
+            }
+            self.c[j] *= factor;
+            self.lo[j] /= factor;
+            self.hi[j] /= factor;
+            self.variable_scale[j] = factor;
+        }
+    }
+
+    /// Never make the original-unit bound tolerance looser through a change of units.
+    fn primal_tolerance(&self, j: usize, tolerance: f64) -> f64 {
+        tolerance / self.variable_scale[j].max(1.0)
+    }
+
+    /// Reduced costs transform inversely to variables. The phase-2 pricing tolerance
+    /// must respect the original cost units as well as the working ones.
+    fn dual_tolerance(&self, j: usize, tolerance: f64) -> f64 {
+        tolerance * self.variable_scale[j].min(1.0)
     }
 
     fn ncols(&self) -> usize {
@@ -451,6 +513,27 @@ impl Lp {
 
     fn is_fixed(&self, j: usize) -> bool {
         self.lo[j] == self.hi[j]
+    }
+}
+
+fn exactly_scalable(value: f64, factor: f64) -> bool {
+    let scaled = value * factor;
+    scaled.is_finite() && scaled / factor == value
+}
+
+/// Keep the factor and its reciprocal representable. Move toward one if the desired
+/// equilibration would overflow or round any affected datum; one is always admissible.
+fn reversible_power_scale(maximum: f64, acceptable: impl Fn(f64) -> bool) -> f64 {
+    if maximum == 0.0 {
+        return 1.0;
+    }
+    let mut exponent = (-maximum.log2().floor()).clamp(-1023.0, 1023.0) as i32;
+    loop {
+        let factor = 2.0_f64.powi(exponent);
+        if acceptable(factor) {
+            return factor;
+        }
+        exponent -= exponent.signum();
     }
 }
 
@@ -756,10 +839,11 @@ impl<'a> Simplex<'a> {
         let mut infeasible = false;
         for (k, &j) in self.basis.iter().enumerate() {
             let xj = self.x[j];
-            if xj < self.lp.lo[j] - self.tol_p {
+            let tolerance = self.lp.primal_tolerance(j, self.tol_p);
+            if xj < self.lp.lo[j] - tolerance {
                 cb[k] = -1.0;
                 infeasible = true;
-            } else if xj > self.lp.hi[j] + self.tol_p {
+            } else if xj > self.lp.hi[j] + tolerance {
                 cb[k] = 1.0;
                 infeasible = true;
             }
@@ -784,10 +868,15 @@ impl<'a> Simplex<'a> {
             }
             let cost = if phase1 { 0.0 } else { self.lp.cost(j) };
             let d = cost - self.lp.dot_col(j, y);
+            let tolerance = if phase1 {
+                self.tol_d
+            } else {
+                self.lp.dual_tolerance(j, self.tol_d)
+            };
             let eligible = match st {
-                VarState::AtLower => d < -self.tol_d,
-                VarState::AtUpper => d > self.tol_d,
-                VarState::Zero => d.abs() > self.tol_d,
+                VarState::AtLower => d < -tolerance,
+                VarState::AtUpper => d > tolerance,
+                VarState::Zero => d.abs() > tolerance,
                 VarState::Basic => false,
             };
             if !eligible {
@@ -810,17 +899,18 @@ impl<'a> Simplex<'a> {
     fn blocking_bound(&self, k: usize, rate: f64) -> Option<f64> {
         let j = self.basis[k];
         let (xj, lo, hi) = (self.x[j], self.lp.lo[j], self.lp.hi[j]);
+        let tolerance = self.lp.primal_tolerance(j, self.tol_p);
         if rate > 0.0 {
-            if xj < lo - self.tol_p {
+            if xj < lo - tolerance {
                 Some(lo)
-            } else if xj > hi + self.tol_p || hi == f64::INFINITY {
+            } else if xj > hi + tolerance || hi == f64::INFINITY {
                 None
             } else {
                 Some(hi)
             }
-        } else if xj > hi + self.tol_p {
+        } else if xj > hi + tolerance {
             Some(hi)
-        } else if xj < lo - self.tol_p || lo == f64::NEG_INFINITY {
+        } else if xj < lo - tolerance || lo == f64::NEG_INFINITY {
             None
         } else {
             Some(lo)
@@ -854,7 +944,8 @@ impl<'a> Simplex<'a> {
             // relaxed by the primal tolerance.
             let mut theta_max = flip;
             for (k, rate, bound) in candidates() {
-                let relaxed = bound + rate.signum() * self.tol_p;
+                let tolerance = self.lp.primal_tolerance(self.basis[k], self.tol_p);
+                let relaxed = bound + rate.signum() * tolerance;
                 let t = (relaxed - self.x[self.basis[k]]) / rate;
                 theta_max = theta_max.min(t);
             }
@@ -1043,8 +1134,9 @@ impl<'a> Simplex<'a> {
         let lp = self.lp;
         for &j in &self.basis {
             let xj = self.x[j];
-            if (lp.lo[j] - xj) > STRICT_TOL * (1.0 + lp.lo[j].abs())
-                || (xj - lp.hi[j]) > STRICT_TOL * (1.0 + lp.hi[j].abs())
+            let unit = (1.0 / lp.variable_scale[j]).min(1.0);
+            if (lp.lo[j] - xj) > STRICT_TOL * (unit + lp.lo[j].abs())
+                || (xj - lp.hi[j]) > STRICT_TOL * (unit + lp.hi[j].abs())
             {
                 return true;
             }
@@ -1054,7 +1146,7 @@ impl<'a> Simplex<'a> {
             if lp.is_fixed(j) {
                 return false;
             }
-            let scale = STRICT_TOL * (1.0 + lp.cost(j).abs());
+            let scale = STRICT_TOL * (lp.variable_scale[j].min(1.0) + lp.cost(j).abs());
             match self.state[j] {
                 VarState::Basic => false,
                 VarState::AtLower => d[j] < -scale,
@@ -1157,7 +1249,22 @@ fn assemble(
             );
         }
     };
-    let Vertex { x, y, d, state } = *vertex;
+    let Vertex {
+        mut x,
+        mut y,
+        mut d,
+        state,
+    } = *vertex;
+    for j in 0..lp.n {
+        x[j] *= lp.variable_scale[j];
+        d[j] /= lp.variable_scale[j];
+    }
+    for (i, value) in y.iter_mut().enumerate() {
+        *value /= lp.variable_scale[lp.n + i];
+    }
+    if y.iter().chain(&d).any(|value| !value.is_finite()) {
+        return LinprogResult::without_solution(4, MSG_SOLVE_ERROR.to_string(), nit, crossover_nit);
+    }
     let residual = |rows: &[Vec<f64>], rhs: &[f64]| -> Vec<f64> {
         rows.iter()
             .zip(rhs)
@@ -1222,7 +1329,7 @@ fn assemble(
 /// `sqrt(1e-9) * 10`, and nothing NaN.
 fn check_result(x: &[f64], fun: f64, slack: &[f64], con: &[f64], lb: &[f64], ub: &[f64]) -> bool {
     let tol = 1e-9_f64.sqrt() * 10.0;
-    if x.iter().chain(slack).chain(con).any(|v| v.is_nan()) || fun.is_nan() {
+    if x.iter().chain(slack).chain(con).any(|v| !v.is_finite()) || !fun.is_finite() {
         return false;
     }
     let bounds_ok = x
@@ -2095,6 +2202,202 @@ mod tests {
                 (g - w).abs() <= tol * (1.0 + w.abs()),
                 "{got:?} vs {want:?}"
             );
+        }
+    }
+
+    /// These are the same two unit-box constraints in different row units. Without
+    /// equilibration the mixed 1e8 / 1e-8 basis is rejected as singular by every method,
+    /// although SciPy/HiGHS returns x = [1, 1], fun = -2 and the duals below.
+    #[test]
+    fn differently_scaled_rows_preserve_solutions_and_marginals() {
+        for scale in [1e-8, 1e8, 2.0_f64.powi(-24), 2.0_f64.powi(24)] {
+            let p = Problem {
+                c: vec![-1.0, -1.0],
+                a_ub: vec![vec![scale, 0.0], vec![0.0, 1.0 / scale]],
+                b_ub: vec![scale, 1.0 / scale],
+                a_eq: vec![],
+                b_eq: vec![],
+                bounds: vec![],
+            };
+            for method in ALL_METHODS {
+                let res = p.solve(opts(method));
+                p.assert_optimal(&res, 1e-12);
+                assert_close(&res.x, &[1.0, 1.0], 1e-14);
+                assert_close(&res.ineqlin.marginals, &[-1.0 / scale, -scale], 1e-14);
+            }
+            let p = Problem {
+                c: vec![1.0, 2.0],
+                a_ub: vec![],
+                b_ub: vec![],
+                a_eq: p.a_ub,
+                b_eq: vec![2.0 * scale, -3.0 / scale],
+                bounds: vec![(None, None), (None, None)],
+            };
+            for method in ALL_METHODS {
+                let res = p.solve(opts(method));
+                p.assert_optimal(&res, 1e-12);
+                assert_close(&res.x, &[2.0, -3.0], 1e-14);
+                assert_close(&res.eqlin.marginals, &[1.0 / scale, 2.0 * scale], 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn row_and_variable_units_preserve_bound_and_equality_sensitivities() {
+        for units in [
+            [2.0_f64.powi(16), 2.0_f64.powi(-16)],
+            [2.0_f64.powi(-16), 2.0_f64.powi(16)],
+        ] {
+            let rows = [2.0_f64.powi(-8), 2.0_f64.powi(8)];
+            let p = Problem {
+                c: vec![-1.0 / units[0], -2.0 / units[1]],
+                a_ub: vec![
+                    vec![rows[0] / units[0], rows[0] / units[1]],
+                    vec![rows[1] / units[0], -rows[1] / units[1]],
+                ],
+                b_ub: vec![4.0 * rows[0], 2.0 * rows[1]],
+                a_eq: vec![],
+                b_eq: vec![],
+                bounds: vec![(Some(0.0), None), (Some(0.0), Some(3.0 * units[1]))],
+            };
+            for method in ALL_METHODS {
+                let res = p.solve(opts(method));
+                p.assert_optimal(&res, 1e-12);
+                assert_close(&res.x, &[units[0], 3.0 * units[1]], 1e-14);
+                assert_close(&res.ineqlin.marginals, &[-1.0 / rows[0], 0.0], 1e-14);
+                assert_close(&res.upper.marginals, &[0.0, -1.0 / units[1]], 1e-14);
+            }
+            for fixed in [false, true] {
+                let p = Problem {
+                    c: if fixed {
+                        vec![1.0 / units[0], -2.0 / units[1]]
+                    } else {
+                        vec![2.0 / units[0], 1.0 / units[1]]
+                    },
+                    a_ub: vec![],
+                    b_ub: vec![],
+                    a_eq: vec![vec![
+                        rows[1] / units[0],
+                        if fixed {
+                            rows[1] / units[1]
+                        } else {
+                            -rows[1] / units[1]
+                        },
+                    ]],
+                    b_eq: vec![if fixed { 3.0 * rows[1] } else { 2.0 * rows[1] }],
+                    bounds: vec![
+                        if fixed {
+                            (Some(2.0 * units[0]), Some(2.0 * units[0]))
+                        } else {
+                            (None, None)
+                        },
+                        (Some(0.0), None),
+                    ],
+                };
+                for method in ALL_METHODS {
+                    let res = p.solve(opts(method));
+                    p.assert_optimal(&res, 1e-12);
+                    assert_close(
+                        &res.x,
+                        &[2.0 * units[0], if fixed { units[1] } else { 0.0 }],
+                        1e-14,
+                    );
+                    assert_close(
+                        &res.eqlin.marginals,
+                        &[if fixed { -2.0 / rows[1] } else { 2.0 / rows[1] }],
+                        1e-14,
+                    );
+                    assert_close(
+                        &res.lower.marginals,
+                        &if fixed {
+                            [3.0 / units[0], 0.0]
+                        } else {
+                            [0.0, 3.0 / units[1]]
+                        },
+                        1e-14,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equilibration_preserves_infeasible_unbounded_and_budget_results() {
+        for scale in [1e-8, 1e8] {
+            for method in ALL_METHODS {
+                let mut p = Problem {
+                    c: vec![-1.0, 0.0],
+                    a_ub: vec![vec![scale, -scale], vec![0.0, 0.0]],
+                    b_ub: vec![scale, 0.0],
+                    a_eq: vec![],
+                    b_eq: vec![],
+                    bounds: vec![],
+                };
+                let res = p.solve(opts(method));
+                assert_eq!(res.status, 3, "{method:?}: {}", res.message);
+                assert!(res.x.is_empty() && res.fun.is_nan());
+                p.b_ub[1] = -1.0;
+                let res = p.solve(opts(method));
+                assert_eq!(res.status, 2, "{method:?}: {}", res.message);
+                assert!(res.x.is_empty() && res.fun.is_nan());
+                p.a_ub = vec![vec![scale, 0.0], vec![0.0, 1.0 / scale]];
+                p.b_ub = vec![scale, 1.0 / scale];
+                p.c = vec![-1.0, -1.0];
+                let res = p.solve(LinprogOptions {
+                    maxiter: Some(0),
+                    ..opts(method)
+                });
+                assert_eq!(res.status, 1, "{method:?}: {}", res.message);
+                assert_eq!(res.nit, 0);
+                assert!(res.x.is_empty() && res.fun.is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn equilibration_keeps_extreme_finite_data_reversible() {
+        let tiny = f64::from_bits(1);
+        let mut lp = Lp::new(
+            &[1.0, f64::MIN_POSITIVE],
+            &[vec![f64::MAX, tiny], vec![0.0, 0.0]],
+            &[1.0, -2.0],
+            &[],
+            &[],
+            &[-1.0, tiny],
+            &[f64::INFINITY, 1.0],
+        );
+        lp.equilibrate();
+        assert_eq!(
+            lp.a[0] / lp.variable_scale[0] * lp.variable_scale[2],
+            f64::MAX
+        );
+        assert_eq!(lp.a[2] / lp.variable_scale[1] * lp.variable_scale[2], tiny);
+        assert_eq!(lp.b[0] * lp.variable_scale[2], 1.0);
+        assert_eq!(lp.b[1] * lp.variable_scale[3], -2.0);
+        assert_eq!(lp.c[1] / lp.variable_scale[1], f64::MIN_POSITIVE);
+        assert_eq!(lp.lo[1] * lp.variable_scale[1], tiny);
+        assert_eq!(lp.hi[0], f64::INFINITY);
+        assert!(lp.a.iter().chain(&lp.b).chain(&lp.c).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn unrepresentable_original_marginals_report_numerical_failure() {
+        // The primal optimum and objective are representable (x=1, fun=-1e308),
+        // but the constraint marginal -1e308/1e-308 is not. Never report a successful
+        // result carrying an infinite sensitivity after restoring the user's units.
+        let p = Problem {
+            c: vec![-1e308],
+            a_ub: vec![vec![1e-308]],
+            b_ub: vec![1e-308],
+            a_eq: vec![],
+            b_eq: vec![],
+            bounds: vec![],
+        };
+        for method in ALL_METHODS {
+            let res = p.solve(opts(method));
+            assert_eq!(res.status, 4, "{method:?}: {}", res.message);
+            assert!(res.x.is_empty() && res.fun.is_nan());
+            assert!(res.ineqlin.marginals.is_empty());
         }
     }
 
