@@ -5,12 +5,13 @@
 //! them compares fsci with fsci). Problems: Robertson's kinetics on [0, 40], Van der Pol with
 //! mu = 100 on [0, 200], the linear stiff system y1' = -1000 y1 + y2, y2' = -y2 on [0, 10]
 //! (exact solution known), and y' = -y·cos t on [0, 10] (exact exp(-sin t)); rtol 1e-4 and 1e-8
-//! with atol = 1e-3·rtol, both with finite differences and user-supplied analytic Jacobians.
+//! with atol = 1e-3·rtol, using dense and sparse analytic Jacobians, dense finite
+//! differences, and colored sparse finite differences.
 //! The right-hand sides and Jacobians are written term by term identically on both sides.
 //!
 //! As in diff_integrate_dop853.rs, the oracle measures each row's conditioning: SciPy's own
 //! y(t_end) is rerun with every component of y0 moved by one ulp, and the largest move in units
-//! of rtol·|y| + atol is the row's envelope. Every row here measured below 3e-3, so each is held
+//! of rtol·|y| + atol is the row's envelope. Every row here measured below 2e-2, so each is held
 //! to SciPy's answer within Y_SCALE_FACTOR_TOL of those units and to SciPy's nfev, njev, nlu and
 //! accepted-step count within COUNT_REL_TOL; a row whose envelope exceeds 1 fails outright
 //! rather than being skipped. Exact references: the linear system and y' = -y·cos t within
@@ -31,7 +32,10 @@ use std::io::Write;
 use std::process::Stdio;
 
 use fsci_conformance::CompareLedger;
-use fsci_integrate::{JacFn, SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp};
+use fsci_integrate::{
+    JacFn, JacobianSparsity, SolveIvpOptions, SolverKind, SparseJacFn, ToleranceValue, solve_ivp,
+};
+use fsci_sparse::{CscMatrix, Shape2D};
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -55,7 +59,7 @@ struct Case {
     y0: Vec<f64>,
     rtol: f64,
     atol: f64,
-    analytic_jacobian: bool,
+    jacobian_kind: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +106,42 @@ fn jacobian(problem: &str) -> JacFn {
     }
 }
 
+fn sparse_jacobian(problem: &str) -> SparseJacFn {
+    fn to_sparse(matrix: Vec<Vec<f64>>) -> CscMatrix {
+        let n = matrix.len();
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0];
+        for column in 0..n {
+            for (row, values) in matrix.iter().enumerate() {
+                if values[column] != 0.0 {
+                    data.push(values[column]);
+                    indices.push(row);
+                }
+            }
+            indptr.push(data.len());
+        }
+        CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, true)
+            .expect("analytic CSC Jacobian")
+    }
+    match problem {
+        "robertson" => |t, y| to_sparse(jacobian("robertson")(t, y)),
+        "vdp100" => |t, y| to_sparse(jacobian("vdp100")(t, y)),
+        "linear" => |t, y| to_sparse(jacobian("linear")(t, y)),
+        _ => |t, y| to_sparse(jacobian("cos_decay")(t, y)),
+    }
+}
+
+fn jacobian_pattern(problem: &str) -> JacobianSparsity {
+    let rows = match problem {
+        "robertson" => vec![vec![0, 1, 2], vec![0, 1, 2], vec![1]],
+        "vdp100" => vec![vec![1], vec![0, 1]],
+        "linear" => vec![vec![0, 1], vec![1]],
+        _ => vec![vec![0]],
+    };
+    JacobianSparsity::from_rows(&rows).expect("structural Jacobian pattern")
+}
+
 /// Exact y(t_end) where one is known.
 fn exact(problem: &str, t: f64) -> Option<Vec<f64>> {
     match problem {
@@ -126,17 +166,16 @@ fn cases() -> Vec<Case> {
     for method in ["BDF", "Radau"] {
         for (problem, t_end, y0) in &problems {
             for rtol in [1e-4, 1e-8] {
-                for analytic_jacobian in [false, true] {
-                    let jac_kind = if analytic_jacobian { "analytic" } else { "fd" };
+                for jacobian_kind in ["fd", "analytic", "sparse_analytic", "sparse_fd"] {
                     out.push(Case {
-                        name: format!("{method}_{problem}_rtol{rtol:e}_{jac_kind}"),
+                        name: format!("{method}_{problem}_rtol{rtol:e}_{jacobian_kind}"),
                         problem: (*problem).to_string(),
                         method: method.to_string(),
                         t_end: *t_end,
                         y0: y0.clone(),
                         rtol,
                         atol: 1e-3 * rtol,
-                        analytic_jacobian,
+                        jacobian_kind,
                     });
                 }
             }
@@ -150,6 +189,7 @@ fn scipy_answers(cases: &[Case]) -> Option<Vec<Answer>> {
 import json, sys, math
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.sparse import csc_matrix
 
 def rhs(problem):
     if problem == "robertson":
@@ -175,9 +215,22 @@ def jacobian(problem):
     return lambda t, y: [[-math.cos(t)]]
 
 def run(c, y0):
+    kind = c["jacobian_kind"]
+    jac = None
+    sparsity = None
+    if kind == "analytic":
+        jac = jacobian(c["problem"])
+    elif kind == "sparse_analytic":
+        dense_jac = jacobian(c["problem"])
+        jac = lambda t, y: csc_matrix(dense_jac(t, y))
+    elif kind == "sparse_fd":
+        patterns = {"robertson": [[1, 1, 1], [1, 1, 1], [0, 1, 0]],
+                    "vdp100": [[0, 1], [1, 1]], "linear": [[1, 1], [0, 1]],
+                    "cos_decay": [[1]]}
+        sparsity = csc_matrix(patterns[c["problem"]])
     return solve_ivp(rhs(c["problem"]), (0.0, c["t_end"]), y0, method=c["method"],
                      rtol=c["rtol"], atol=c["atol"],
-                     jac=jacobian(c["problem"]) if c["analytic_jacobian"] else None)
+                     jac=jac, jac_sparsity=sparsity)
 
 out = []
 for c in json.load(sys.stdin):
@@ -262,6 +315,7 @@ fn diff_integrate_solve_ivp_stiff() {
     for (case, answer) in cases.iter().zip(&answers) {
         let problem = case.problem.clone();
         let mut fun = move |t: f64, y: &[f64]| rhs(&problem, t, y);
+        let pattern = jacobian_pattern(&case.problem);
         let options = SolveIvpOptions {
             t_span: (0.0, case.t_end),
             y0: &case.y0,
@@ -272,7 +326,10 @@ fn diff_integrate_solve_ivp_stiff() {
             },
             rtol: case.rtol,
             atol: ToleranceValue::Scalar(case.atol),
-            jac: case.analytic_jacobian.then(|| jacobian(&case.problem)),
+            jac: (case.jacobian_kind == "analytic").then(|| jacobian(&case.problem)),
+            jac_sparse: (case.jacobian_kind == "sparse_analytic")
+                .then(|| sparse_jacobian(&case.problem)),
+            jac_sparsity: (case.jacobian_kind == "sparse_fd").then_some(&pattern),
             ..SolveIvpOptions::default()
         };
         compared += 1;

@@ -7524,14 +7524,8 @@ mod tests {
                 (Some(2.0), Some(-1.0)),
                 (Some(0.0), Some(0.0)),
             ] {
-                let result = one_variable_milp(
-                    kind,
-                    -1.0,
-                    bounds,
-                    None,
-                    None,
-                    MilpOptions::default(),
-                );
+                let result =
+                    one_variable_milp(kind, -1.0, bounds, None, None, MilpOptions::default());
                 assert!(result.success, "{kind:?} {bounds:?}: {result:?}");
                 assert_eq!(result.x, vec![0.0]);
             }

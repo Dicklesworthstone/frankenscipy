@@ -228,15 +228,15 @@ pub struct SolveIvpOptions<'a> {
     /// validate the square shape and finite entries on each evaluation. The explicit
     /// Runge-Kutta methods ignore it, as SciPy's do (with a warning there).
     pub jac: Option<JacFn>,
-    /// Analytic CSC Jacobian for BDF. Storage and Newton factorizations remain
+    /// Analytic CSC Jacobian for BDF and Radau. Storage and Newton factorizations remain
     /// sparse, including after Jacobian refreshes. `jac` and `jac_sparse` are
     /// mutually exclusive; other solver methods reject this option explicitly.
     /// See [`crate::SparseJacFn`] for shape and duplicate-entry handling.
     pub jac_sparse: Option<crate::SparseJacFn>,
     /// Structural Jacobian nonzeros for grouped finite differences in BDF and Radau.
     /// Ignored when an analytic Jacobian is supplied and by other methods. Missing
-    /// entries declare derivatives that are always zero. BDF retains CSC Jacobians
-    /// and sparse Newton factors; Radau retains its dense/structured factors.
+    /// entries declare derivatives that are always zero. Both solvers retain CSC
+    /// Jacobians and native sparse Newton factors, including Radau's complex system.
     /// CASP also uses this structure for its initial stiffness probe, regardless of
     /// which solver it ultimately selects, when no analytic Jacobian is supplied.
     pub jac_sparsity: Option<&'a crate::JacobianSparsity>,
@@ -2369,7 +2369,7 @@ where
     if resolved_options.jac_sparse.is_some() {
         let error = if resolved_options.jac.is_some() {
             Some(IntegrateValidationError::ConflictingJacobians)
-        } else if resolved_options.method != SolverKind::Bdf {
+        } else if !matches!(resolved_options.method, SolverKind::Bdf | SolverKind::Radau) {
             Some(IntegrateValidationError::SparseJacobianUnsupported)
         } else {
             None
@@ -2422,12 +2422,16 @@ where
                 first_step,
                 mode: resolved_options.mode,
             };
-            let solver = crate::radau::RadauSolver::new_with_jacobian_sparsity(
-                fun,
-                config,
-                resolved_options.jac,
-                resolved_options.jac_sparsity,
-            )?;
+            let solver = if let Some(jac) = resolved_options.jac_sparse {
+                crate::radau::RadauSolver::new_with_sparse_jacobian(fun, config, jac)?
+            } else {
+                crate::radau::RadauSolver::new_with_jacobian_sparsity(
+                    fun,
+                    config,
+                    resolved_options.jac,
+                    resolved_options.jac_sparsity,
+                )?
+            };
             solve_ivp_core_with_diag(fun, solver, &resolved_options, None, audit)
         }
         SolverKind::Bdf => {
@@ -4281,7 +4285,7 @@ mod tests {
     }
 
     #[test]
-    fn bdf_sparse_analytic_jacobian_refreshes_without_hidden_rhs_calls() {
+    fn implicit_sparse_analytic_jacobians_refresh_without_hidden_rhs_calls() {
         fn jac(_t: f64, y: &[f64]) -> fsci_sparse::CscMatrix {
             IMPLICIT_JAC_CALLS.with(|calls| calls.set(calls.get() + 1));
             // Duplicate stored entries are added to recover -200*y, including
@@ -4296,36 +4300,38 @@ mod tests {
             .unwrap()
         }
         for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
-            IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
-            let mut rhs_calls = 0;
-            let result = solve_ivp(
-                &mut |_t, y| {
-                    rhs_calls += 1;
-                    vec![-100.0 * y[0] * y[0]]
-                },
-                &SolveIvpOptions {
-                    t_span: (0.0, 1.0),
-                    y0: &[1.0],
-                    method: SolverKind::Bdf,
-                    mode,
-                    jac_sparse: Some(jac),
-                    rtol: 1e-8,
-                    atol: ToleranceValue::Scalar(1e-11),
-                    first_step: Some(0.2),
-                    ..SolveIvpOptions::default()
-                },
-            )
-            .unwrap();
-            assert!(result.success);
-            assert!(result.njev > 1, "must exercise sparse Jacobian refreshes");
-            assert_eq!(result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
-            assert_eq!(result.nfev, rhs_calls);
-            assert!((result.y.last().unwrap()[0] - 1.0 / 101.0).abs() < 2e-9);
+            for method in [SolverKind::Bdf, SolverKind::Radau] {
+                IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
+                let mut rhs_calls = 0;
+                let result = solve_ivp(
+                    &mut |_t, y| {
+                        rhs_calls += 1;
+                        vec![-100.0 * y[0] * y[0]]
+                    },
+                    &SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &[1.0],
+                        method,
+                        mode,
+                        jac_sparse: Some(jac),
+                        rtol: 1e-8,
+                        atol: ToleranceValue::Scalar(1e-11),
+                        first_step: Some(0.2),
+                        ..SolveIvpOptions::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.success);
+                assert!(result.njev > 1, "must exercise sparse Jacobian refreshes");
+                assert_eq!(result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
+                assert_eq!(result.nfev, rhs_calls);
+                assert!((result.y.last().unwrap()[0] - 1.0 / 101.0).abs() < 2e-9);
+            }
         }
     }
 
     #[test]
-    fn bdf_sparse_jacobians_validate_initial_values_and_refreshes() {
+    fn implicit_sparse_jacobians_validate_initial_values_and_refreshes() {
         fn scalar(value: f64) -> fsci_sparse::CscMatrix {
             fsci_sparse::CscMatrix::from_components(
                 fsci_sparse::Shape2D::new(1, 1),
@@ -4364,39 +4370,41 @@ mod tests {
             })
         }
         for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
-            for (jac, error) in [
-                (
-                    wrong_shape as crate::SparseJacFn,
-                    IntegrateValidationError::JacobianWrongShape { expected: 1 },
-                ),
-                (
-                    nonfinite as crate::SparseJacFn,
-                    IntegrateValidationError::NonFiniteJacobian,
-                ),
-                (
-                    wrong_on_refresh as crate::SparseJacFn,
-                    IntegrateValidationError::JacobianWrongShape { expected: 1 },
-                ),
-                (
-                    nonfinite_on_refresh as crate::SparseJacFn,
-                    IntegrateValidationError::NonFiniteJacobian,
-                ),
-            ] {
-                let result = solve_ivp(
-                    &mut |_t, y| vec![-100.0 * y[0] * y[0]],
-                    &SolveIvpOptions {
-                        t_span: (0.0, 1.0),
-                        y0: &[1.0],
-                        method: SolverKind::Bdf,
-                        mode,
-                        jac_sparse: Some(jac),
-                        first_step: Some(0.2),
-                        rtol: 1e-8,
-                        atol: ToleranceValue::Scalar(1e-11),
-                        ..SolveIvpOptions::default()
-                    },
-                );
-                assert_eq!(result.unwrap_err(), error);
+            for method in [SolverKind::Bdf, SolverKind::Radau] {
+                for (jac, error) in [
+                    (
+                        wrong_shape as crate::SparseJacFn,
+                        IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                    ),
+                    (
+                        nonfinite as crate::SparseJacFn,
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
+                    (
+                        wrong_on_refresh as crate::SparseJacFn,
+                        IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                    ),
+                    (
+                        nonfinite_on_refresh as crate::SparseJacFn,
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
+                ] {
+                    let result = solve_ivp(
+                        &mut |_t, y| vec![-100.0 * y[0] * y[0]],
+                        &SolveIvpOptions {
+                            t_span: (0.0, 1.0),
+                            y0: &[1.0],
+                            method,
+                            mode,
+                            jac_sparse: Some(jac),
+                            first_step: Some(0.2),
+                            rtol: 1e-8,
+                            atol: ToleranceValue::Scalar(1e-11),
+                            ..SolveIvpOptions::default()
+                        },
+                    );
+                    assert_eq!(result.unwrap_err(), error);
+                }
             }
         }
     }
@@ -4420,7 +4428,12 @@ mod tests {
                 ..options.clone()
             })
         );
-        for method in [SolverKind::Rk45, SolverKind::Radau, SolverKind::Lsoda] {
+        for method in [
+            SolverKind::Rk23,
+            SolverKind::Rk45,
+            SolverKind::Dop853,
+            SolverKind::Lsoda,
+        ] {
             let error = solve_ivp(
                 &mut |_t, _y| panic!("invalid options must not evaluate RHS"),
                 &SolveIvpOptions {

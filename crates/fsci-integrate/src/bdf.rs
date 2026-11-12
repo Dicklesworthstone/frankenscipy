@@ -26,7 +26,7 @@ use fsci_sparse::{
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// An analytic BDF Jacobian in compressed sparse column format.
+/// An analytic BDF or Radau Jacobian in compressed sparse column format.
 ///
 /// The callback returns an `n × n` matrix with `J[i, j] = d f_i / d y_j`. Unsorted
 /// row indices and duplicate entries are accepted; duplicates are summed before
@@ -61,7 +61,7 @@ impl BdfJacobian {
     }
 }
 
-fn evaluate_sparse_jacobian(
+pub(crate) fn evaluate_sparse_jacobian(
     jac: SparseJacFn,
     t: f64,
     y: &[f64],
@@ -109,7 +109,7 @@ fn evaluate_sparse_jacobian(
     })
 }
 
-fn check_sparse_jacobian_cap(
+pub(crate) fn check_sparse_jacobian_cap(
     n: usize,
     nnz: usize,
     mode: RuntimeMode,

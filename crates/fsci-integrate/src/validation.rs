@@ -294,7 +294,10 @@ impl std::fmt::Display for IntegrateValidationError {
                 write!(f, "`jac` and `jac_sparse` cannot both be supplied.")
             }
             Self::SparseJacobianUnsupported => {
-                write!(f, "`jac_sparse` is supported only by the BDF method.")
+                write!(
+                    f,
+                    "`jac_sparse` is supported only by the BDF and Radau methods."
+                )
             }
             Self::NonFiniteJacobian => write!(f, "`jac` must contain only finite values."),
             Self::NonFiniteEventDirection { index } => {

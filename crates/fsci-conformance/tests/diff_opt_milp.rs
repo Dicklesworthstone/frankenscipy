@@ -220,13 +220,7 @@ fn generate_query() -> OracleQuery {
                 None,
             ),
             ("active_upper", -1.0, (Some(2.0), Some(5.5)), None, None),
-            (
-                "zero_branch",
-                -1.0,
-                (Some(2.0), Some(5.5)),
-                None,
-                Some(1.0),
-            ),
+            ("zero_branch", -1.0, (Some(2.0), Some(5.5)), None, Some(1.0)),
             (
                 "active_fractional_relaxation",
                 1.0,
@@ -234,13 +228,7 @@ fn generate_query() -> OracleQuery {
                 Some(3.5),
                 None,
             ),
-            (
-                "zero_lower",
-                1.0,
-                (Some(0.0), Some(5.0)),
-                Some(0.5),
-                None,
-            ),
+            ("zero_lower", 1.0, (Some(0.0), Some(5.0)), Some(0.5), None),
             (
                 "empty_active_interval",
                 -1.0,

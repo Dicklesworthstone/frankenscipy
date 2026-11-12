@@ -19,13 +19,19 @@
 //! `RADAU_FORCE_DENSE_LU_REBUILD` / `RADAU_DENSE_LU_REUSE_HITS` single-step LU retention,
 //! and the `RADAU_HELD_STEP_HITS` / `RADAU_POST_STEP_JAC_REFRESH_HITS` counters for them.
 
+use crate::bdf::{check_sparse_jacobian_cap, evaluate_sparse_jacobian};
 use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
-use crate::step_size::{InitialStepRequest, JacobianSparsity, num_jac, select_initial_step};
+use crate::step_size::{
+    InitialStepRequest, JacobianSparsity, num_jac, num_jac_sparse, select_initial_step,
+};
 use crate::validation::{
     ToleranceValue, evaluate_jacobian, validate_first_step, validate_max_step, validate_rhs_shape,
     validate_tol,
 };
 use fsci_runtime::RuntimeMode;
+use fsci_sparse::{
+    CscMatrix, LuOptions, Shape2D, SparseError, SparseLuFactorization, splu_native, splu_solve,
+};
 use nalgebra::{Complex, DMatrix, DVector};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -154,6 +160,20 @@ impl Tableau {
 type DenseRealLu = nalgebra::linalg::LU<f64, nalgebra::Dyn, nalgebra::Dyn>;
 type DenseComplexLu = nalgebra::linalg::LU<Complex<f64>, nalgebra::Dyn, nalgebra::Dyn>;
 
+enum RadauJacobian {
+    Dense(DMatrix<f64>),
+    Sparse(CscMatrix),
+}
+
+impl RadauJacobian {
+    fn diagonal(&self) -> Option<Vec<f64>> {
+        match self {
+            Self::Dense(jac) => diagonal_jacobian_entries(jac),
+            Self::Sparse(_) => None,
+        }
+    }
+}
+
 /// SciPy's `LU_real` / `LU_complex` pair: factors of `(MU_REAL/h)I − J` and
 /// `(MU_COMPLEX/h)I − J`, built and dropped together.
 enum NewtonFactors {
@@ -168,6 +188,16 @@ enum NewtonFactors {
         real: Vec<f64>,
         complex: Vec<Complex<f64>>,
     },
+    /// Both systems retain sparse storage. The complex system is represented by
+    /// interleaved real/imaginary coordinates, with two entries per Jacobian
+    /// entry and two imaginary diagonal couplings per state variable.
+    Sparse {
+        real: Box<SparseLuFactorization>,
+        complex: Box<SparseLuFactorization>,
+    },
+    /// A singular or overflowing sparse factor requests the ordinary Jacobian
+    /// refresh and step reduction without converting the system to dense storage.
+    SparseUnusable,
 }
 
 impl NewtonFactors {
@@ -201,6 +231,47 @@ impl NewtonFactors {
         }
     }
 
+    fn build_sparse(
+        jac: &CscMatrix,
+        mu_real: f64,
+        h: f64,
+        mode: RuntimeMode,
+    ) -> Result<Self, StepFailure> {
+        let real = sparse_shifted_jacobian(jac, mu_real / h, mode)?;
+        let complex_real = sparse_shifted_jacobian(jac, MU_COMPLEX.re / h, mode)?;
+        let complex = sparse_complex_system(&complex_real, MU_COMPLEX.im / h, mode)?;
+        if real
+            .data()
+            .iter()
+            .chain(complex.data())
+            .any(|v| !v.is_finite())
+        {
+            return Ok(Self::SparseUnusable);
+        }
+        let options = LuOptions {
+            mode,
+            ..LuOptions::default()
+        };
+        let real = match splu_native(&real, options) {
+            Ok(factor) => factor,
+            Err(SparseError::SingularMatrix { .. } | SparseError::NonFiniteInput { .. }) => {
+                return Ok(Self::SparseUnusable);
+            }
+            Err(error) => return Err(sparse_factor_error(error)),
+        };
+        let complex = match splu_native(&complex, options) {
+            Ok(factor) => factor,
+            Err(SparseError::SingularMatrix { .. } | SparseError::NonFiniteInput { .. }) => {
+                return Ok(Self::SparseUnusable);
+            }
+            Err(error) => return Err(sparse_factor_error(error)),
+        };
+        Ok(Self::Sparse {
+            real: Box::new(real),
+            complex: Box::new(complex),
+        })
+    }
+
     /// Solve with the real factor in place; `false` when it is singular.
     fn solve_real(&self, b: &mut DVector<f64>) -> bool {
         match self {
@@ -214,6 +285,17 @@ impl NewtonFactors {
                 }
                 true
             }
+            Self::Sparse { real, .. } => {
+                let Ok(solution) = splu_solve(real, b.as_slice()) else {
+                    return false;
+                };
+                if solution.iter().any(|v| !v.is_finite()) {
+                    return false;
+                }
+                b.as_mut_slice().copy_from_slice(&solution);
+                true
+            }
+            Self::SparseUnusable => false,
         }
     }
 
@@ -230,8 +312,131 @@ impl NewtonFactors {
                 }
                 true
             }
+            Self::Sparse { complex, .. } => {
+                let rhs: Vec<f64> = b.iter().flat_map(|value| [value.re, value.im]).collect();
+                let Ok(solution) = splu_solve(complex, &rhs) else {
+                    return false;
+                };
+                if solution.iter().any(|v| !v.is_finite()) {
+                    return false;
+                }
+                for (value, pair) in b.iter_mut().zip(solution.chunks_exact(2)) {
+                    *value = Complex::new(pair[0], pair[1]);
+                }
+                true
+            }
+            Self::SparseUnusable => false,
         }
     }
+}
+
+fn sparse_factor_error(error: SparseError) -> StepFailure {
+    match error {
+        SparseError::ResourceExhausted { message } => {
+            StepFailure::InvalidJacobian(crate::IntegrateValidationError::ResourceExhausted {
+                message,
+            })
+        }
+        error => StepFailure::SparseLinearSolve {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// `shift I - J`, preserving CSC structure and inserting absent diagonals.
+fn sparse_shifted_jacobian(
+    jac: &CscMatrix,
+    shift: f64,
+    mode: RuntimeMode,
+) -> Result<CscMatrix, StepFailure> {
+    let n = jac.shape().rows;
+    let missing = (0..n)
+        .filter(|&column| {
+            jac.indices()[jac.indptr()[column]..jac.indptr()[column + 1]]
+                .binary_search(&column)
+                .is_err()
+        })
+        .count();
+    let nnz = jac.nnz().saturating_add(missing);
+    check_sparse_jacobian_cap(n, nnz, mode).map_err(StepFailure::InvalidJacobian)?;
+    let mut data = Vec::with_capacity(nnz);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for column in 0..n {
+        let mut diagonal = false;
+        for k in jac.indptr()[column]..jac.indptr()[column + 1] {
+            let row = jac.indices()[k];
+            if !diagonal && row > column {
+                indices.push(column);
+                data.push(shift);
+                diagonal = true;
+            }
+            indices.push(row);
+            data.push(if row == column {
+                diagonal = true;
+                shift - jac.data()[k]
+            } else {
+                0.0 - jac.data()[k]
+            });
+        }
+        if !diagonal {
+            indices.push(column);
+            data.push(shift);
+        }
+        indptr.push(data.len());
+    }
+    CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, true)
+        .map_err(sparse_factor_error)
+}
+
+/// Real representation of `(D + i beta I) z = b` with interleaved coordinates:
+/// each diagonal block is `[[D_ii, -beta], [beta, D_ii]]`. Off-diagonal
+/// `D_ij` occurs in the real-real and imaginary-imaginary positions only.
+fn sparse_complex_system(
+    real_part: &CscMatrix,
+    imaginary_shift: f64,
+    mode: RuntimeMode,
+) -> Result<CscMatrix, StepFailure> {
+    let n = real_part.shape().rows;
+    let dimension = n.checked_mul(2).ok_or_else(|| {
+        StepFailure::InvalidJacobian(crate::IntegrateValidationError::ResourceExhausted {
+            message: "Radau complex sparse system dimension overflow".to_string(),
+        })
+    })?;
+    let nnz = real_part.nnz().saturating_mul(2).saturating_add(dimension);
+    check_sparse_jacobian_cap(dimension, nnz, mode).map_err(StepFailure::InvalidJacobian)?;
+    let mut data = Vec::with_capacity(nnz);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut indptr = Vec::with_capacity(dimension + 1);
+    indptr.push(0);
+    for column in 0..n {
+        for component in 0..2 {
+            for k in real_part.indptr()[column]..real_part.indptr()[column + 1] {
+                let row = real_part.indices()[k];
+                if row == column {
+                    indices.extend([2 * row, 2 * row + 1]);
+                    if component == 0 {
+                        data.extend([real_part.data()[k], imaginary_shift]);
+                    } else {
+                        data.extend([-imaginary_shift, real_part.data()[k]]);
+                    }
+                } else {
+                    indices.push(2 * row + component);
+                    data.push(real_part.data()[k]);
+                }
+            }
+            indptr.push(data.len());
+        }
+    }
+    CscMatrix::from_components(
+        Shape2D::new(dimension, dimension),
+        data,
+        indices,
+        indptr,
+        true,
+    )
+    .map_err(sparse_factor_error)
 }
 
 /// SciPy's `RadauDenseOutput(t_old, t, y_old, Q)` with `Q = Z.T @ P`: the collocation
@@ -344,8 +549,9 @@ pub struct RadauSolver {
     y_old: Option<Vec<f64>>,
 
     jac_callback: Option<crate::JacFn>,
+    jac_sparse_callback: Option<crate::SparseJacFn>,
     jac_sparsity: Option<JacobianSparsity>,
-    jac: DMatrix<f64>,
+    jac: RadauJacobian,
     /// SciPy's `jac_factor`, carried by `num_jac` from one Jacobian to the next.
     jac_factor: Option<Vec<f64>>,
     /// `jac`'s diagonal when `jac` is exactly diagonal, found once per Jacobian.
@@ -387,6 +593,7 @@ impl RadauSolver {
     ///
     /// A supplied analytic Jacobian takes precedence over the pattern. Otherwise
     /// the coloring groups independent finite-difference columns on every refresh.
+    /// With a pattern, the Jacobian and both Newton factorizations remain sparse.
     pub fn new_with_jacobian_sparsity<F>(
         fun: &mut F,
         config: RadauSolverConfig<'_>,
@@ -396,11 +603,47 @@ impl RadauSolver {
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
+        Self::new_with_jacobians(fun, config, jac_callback, None, jac_sparsity)
+    }
+
+    /// Create a Radau solver with an analytic CSC Jacobian.
+    ///
+    /// The real and complex Newton systems use native sparse LU, including on
+    /// every Jacobian refresh. The complex system uses interleaved real and
+    /// imaginary coordinates; no dense Jacobian or factorization is constructed.
+    /// See [`crate::SparseJacFn`] for shape and duplicate-entry handling.
+    pub fn new_with_sparse_jacobian<F>(
+        fun: &mut F,
+        config: RadauSolverConfig<'_>,
+        jac_callback: crate::SparseJacFn,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        Self::new_with_jacobians(fun, config, None, Some(jac_callback), None)
+    }
+
+    fn new_with_jacobians<F>(
+        fun: &mut F,
+        config: RadauSolverConfig<'_>,
+        jac_callback: Option<crate::JacFn>,
+        jac_sparse_callback: Option<crate::SparseJacFn>,
+        jac_sparsity: Option<&JacobianSparsity>,
+    ) -> Result<Self, crate::IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
         let n = config.y0.len();
         crate::validation::check_hardened_integrate_cap(n, config.max_step, config.mode, None)?;
-        let jac_sparsity = jac_sparsity.filter(|_| jac_callback.is_none());
+        let jac_sparsity =
+            jac_sparsity.filter(|_| jac_callback.is_none() && jac_sparse_callback.is_none());
         if let Some(pattern) = jac_sparsity {
             pattern.validate_dimension(n)?;
+            check_sparse_jacobian_cap(
+                n,
+                pattern.column_rows.iter().map(Vec::len).sum(),
+                config.mode,
+            )?;
         }
         let _ = validate_tol(
             ToleranceValue::Scalar(config.rtol),
@@ -461,19 +704,37 @@ impl RadauSolver {
         // SciPy's Radau.__init__ takes the first Jacobian here (njev = 1, its evaluations
         // not counted in nfev) and marks it current.
         let mut jac_factor = None;
-        let jac = match jac_callback {
-            Some(jac) => evaluate_jacobian(jac, config.t0, &y0)?,
-            None => num_jac(
+        let jac = if let Some(callback) = jac_sparse_callback {
+            RadauJacobian::Sparse(evaluate_sparse_jacobian(
+                callback,
+                config.t0,
+                &y0,
+                config.mode,
+            )?)
+        } else if let Some(callback) = jac_callback {
+            RadauJacobian::Dense(evaluate_jacobian(callback, config.t0, &y0)?)
+        } else if let Some(pattern) = jac_sparsity {
+            RadauJacobian::Sparse(num_jac_sparse(
                 fun,
                 config.t0,
                 &y0,
                 &f0,
                 &atol_vec,
                 &mut jac_factor,
-                jac_sparsity,
-            )?,
+                pattern,
+            )?)
+        } else {
+            RadauJacobian::Dense(num_jac(
+                fun,
+                config.t0,
+                &y0,
+                &f0,
+                &atol_vec,
+                &mut jac_factor,
+                None,
+            )?)
         };
-        let jac_diagonal = diagonal_jacobian_entries(&jac);
+        let jac_diagonal = jac.diagonal();
 
         Ok(Self {
             n,
@@ -497,6 +758,7 @@ impl RadauSolver {
             t_old: None,
             y_old: None,
             jac_callback,
+            jac_sparse_callback,
             jac_sparsity: jac_sparsity.cloned(),
             jac,
             jac_factor,
@@ -586,20 +848,27 @@ impl RadauSolver {
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
         self.njev += 1;
-        self.jac = match self.jac_callback {
-            Some(jac) => evaluate_jacobian(jac, t, y).map_err(StepFailure::InvalidJacobian)?,
-            None => num_jac(
-                fun,
-                t,
-                y,
-                f,
-                &self.atol,
-                &mut self.jac_factor,
-                self.jac_sparsity.as_ref(),
+        self.jac = if let Some(callback) = self.jac_sparse_callback {
+            RadauJacobian::Sparse(
+                evaluate_sparse_jacobian(callback, t, y, self.mode)
+                    .map_err(StepFailure::InvalidJacobian)?,
             )
-            .map_err(StepFailure::InvalidJacobian)?,
+        } else if let Some(callback) = self.jac_callback {
+            RadauJacobian::Dense(
+                evaluate_jacobian(callback, t, y).map_err(StepFailure::InvalidJacobian)?,
+            )
+        } else if let Some(pattern) = self.jac_sparsity.as_ref() {
+            RadauJacobian::Sparse(
+                num_jac_sparse(fun, t, y, f, &self.atol, &mut self.jac_factor, pattern)
+                    .map_err(StepFailure::InvalidJacobian)?,
+            )
+        } else {
+            RadauJacobian::Dense(
+                num_jac(fun, t, y, f, &self.atol, &mut self.jac_factor, None)
+                    .map_err(StepFailure::InvalidJacobian)?,
+            )
         };
-        self.jac_diagonal = diagonal_jacobian_entries(&self.jac);
+        self.jac_diagonal = self.jac.diagonal();
         self.current_jac = true;
         Ok(())
     }
@@ -667,7 +936,7 @@ impl RadauSolver {
                     let rescan = RADAU_FORCE_DIAGONAL_RESCAN.load(Ordering::Relaxed);
                     let rescanned;
                     let diagonal = if rescan {
-                        rescanned = diagonal_jacobian_entries(&self.jac);
+                        rescanned = self.jac.diagonal();
                         rescanned.as_deref()
                     } else {
                         self.jac_diagonal.as_deref()
@@ -675,12 +944,14 @@ impl RadauSolver {
                     if diagonal.is_some() {
                         RADAU_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.factors = Some(NewtonFactors::build(
-                        &self.jac,
-                        diagonal,
-                        self.tableau.mu_real,
-                        h,
-                    ));
+                    self.factors = Some(match &self.jac {
+                        RadauJacobian::Dense(jac) => {
+                            NewtonFactors::build(jac, diagonal, self.tableau.mu_real, h)
+                        }
+                        RadauJacobian::Sparse(jac) => {
+                            NewtonFactors::build_sparse(jac, self.tableau.mu_real, h, self.mode)?
+                        }
+                    });
                     self.nlu += 2;
                 }
                 let (converged, n_iter, z, rate) =
@@ -916,6 +1187,258 @@ impl RadauSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sparse_test_config(y0: &[f64], t_bound: f64) -> RadauSolverConfig<'_> {
+        RadauSolverConfig {
+            t0: 0.0,
+            y0,
+            t_bound,
+            rtol: 1e-8,
+            atol: ToleranceValue::Scalar(1e-11),
+            max_step: f64::INFINITY,
+            first_step: None,
+            mode: RuntimeMode::Strict,
+        }
+    }
+
+    #[test]
+    fn sparse_newton_factors_solve_real_and_complex_equations_in_both_directions() {
+        fn callback(_t: f64, _y: &[f64]) -> CscMatrix {
+            // Unsorted duplicates, an absent diagonal and an empty column.
+            CscMatrix::from_components(
+                Shape2D::new(3, 3),
+                vec![1.0, -4.0, 2.0, 5.0, 2.0, -5.0],
+                vec![2, 0, 2, 2, 0, 2],
+                vec![0, 3, 6, 6],
+                false,
+            )
+            .unwrap()
+        }
+        let jac = evaluate_sparse_jacobian(callback, 0.0, &[1.0; 3], RuntimeMode::Strict).unwrap();
+        let dense = DMatrix::from_row_slice(3, 3, &[-4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        let mu_real = Tableau::scipy().mu_real;
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for h in [-0.125, 0.125] {
+                let factors = NewtonFactors::build_sparse(&jac, mu_real, h, mode).unwrap();
+                let NewtonFactors::Sparse { real, complex } = &factors else {
+                    panic!("both Newton systems must use sparse factors");
+                };
+                assert_eq!(
+                    real.backend_used,
+                    fsci_sparse::SparseBackend::NativeSparseLu
+                );
+                assert_eq!(
+                    complex.backend_used,
+                    fsci_sparse::SparseBackend::NativeSparseLu
+                );
+                let rhs_real = DVector::from_vec(vec![2.0, -1.5, 0.125]);
+                let rhs_complex = DVector::from_vec(vec![
+                    Complex::new(1.0, -2.0),
+                    Complex::new(-0.5, 3.0),
+                    Complex::new(0.25, 0.75),
+                ]);
+                let mut real_solution = rhs_real.clone();
+                let mut complex_solution = rhs_complex.clone();
+                assert!(factors.solve_real(&mut real_solution));
+                assert!(factors.solve_complex(&mut complex_solution));
+                let real_residual =
+                    dense_real_newton_matrix(&dense, mu_real, h) * real_solution - rhs_real;
+                let complex_system = DMatrix::from_fn(3, 3, |row, column| {
+                    let diagonal = row == column;
+                    Complex::new(
+                        if diagonal { MU_COMPLEX.re / h } else { 0.0 } - dense[(row, column)],
+                        if diagonal { MU_COMPLEX.im / h } else { 0.0 },
+                    )
+                });
+                let complex_residual = complex_system * complex_solution - rhs_complex;
+                assert!(real_residual.norm() < 2e-14);
+                assert!(complex_residual.norm() < 2e-14);
+            }
+        }
+    }
+
+    fn sparse_ring_jacobian(_t: f64, y: &[f64]) -> CscMatrix {
+        let n = y.len();
+        let stride = 127;
+        let mut data = Vec::with_capacity(3 * n);
+        let mut indices = Vec::with_capacity(3 * n);
+        let mut indptr = vec![0];
+        for column in 0..n {
+            let mut rows = [(column + n - stride) % n, column, (column + stride) % n];
+            rows.sort_unstable();
+            for row in rows {
+                indices.push(row);
+                data.push(if row == column { -1001.0 } else { 500.0 });
+            }
+            indptr.push(data.len());
+        }
+        CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, true).unwrap()
+    }
+
+    #[test]
+    fn sparse_radau_coloring_and_both_newton_factors_scale_with_nonzeros() {
+        // A relabeled ring defeats diagonal/band shortcuts. A dense Jacobian alone
+        // would occupy 128 MiB, before either real or complex factorization.
+        let n = 4096;
+        let stride = 127;
+        let pattern = JacobianSparsity::from_rows(
+            &(0..n)
+                .map(|i| vec![i, (i + stride) % n, (i + n - stride) % n])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let y0 = vec![1.0; n];
+        for analytic in [false, true] {
+            let mut calls = 0;
+            let mut rhs = |_t: f64, y: &[f64]| {
+                calls += 1;
+                (0..n)
+                    .map(|i| {
+                        500.0 * (y[(i + stride) % n] - 2.0 * y[i] + y[(i + n - stride) % n]) - y[i]
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut config = sparse_test_config(&y0, 1e-4);
+            config.first_step = Some(1e-4);
+            let mut solver = if analytic {
+                RadauSolver::new_with_sparse_jacobian(&mut rhs, config, sparse_ring_jacobian)
+            } else {
+                RadauSolver::new_with_jacobian_sparsity(&mut rhs, config, None, Some(&pattern))
+            }
+            .unwrap();
+            let RadauJacobian::Sparse(jac) = &solver.jac else {
+                panic!("both sparse Jacobian interfaces must retain CSC storage");
+            };
+            assert_eq!(jac.nnz(), 3 * n);
+            assert!(solver.jac_diagonal.is_none());
+            let factors =
+                NewtonFactors::build_sparse(jac, solver.tableau.mu_real, 1e-4, solver.mode)
+                    .unwrap();
+            let NewtonFactors::Sparse { real, complex } = factors else {
+                panic!("both systems must retain native sparse factors");
+            };
+            assert_eq!(
+                real.backend_used,
+                fsci_sparse::SparseBackend::NativeSparseLu
+            );
+            assert_eq!(
+                complex.backend_used,
+                fsci_sparse::SparseBackend::NativeSparseLu
+            );
+            let payload = fsci_sparse::linalg::splu_factor_payload_bytes(&real)
+                + fsci_sparse::linalg::splu_factor_payload_bytes(&complex);
+            assert!(payload < 2048 * n, "sparse factor payload {payload}");
+            solver.step_with(&mut rhs).unwrap();
+            assert_eq!(solver.state(), OdeSolverState::Finished);
+            assert_eq!(solver.njev(), 1);
+            assert_eq!(solver.nlu(), 2);
+            assert_eq!(
+                calls,
+                solver.nfev() + if analytic { 0 } else { pattern.group_count() }
+            );
+            assert!(
+                solver
+                    .y()
+                    .iter()
+                    .all(|value| (value - (-1e-4_f64).exp()).abs() < 1e-11)
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_radau_zero_pattern_needs_no_rhs_perturbations() {
+        let n = 5;
+        let pattern = JacobianSparsity::from_rows(&vec![vec![]; n]).unwrap();
+        for direction in [-1.0, 1.0] {
+            let y0 = vec![1.0; n];
+            let mut calls = 0;
+            let mut rhs = |_t: f64, _y: &[f64]| {
+                calls += 1;
+                vec![2.0; n]
+            };
+            let mut solver = RadauSolver::new_with_jacobian_sparsity(
+                &mut rhs,
+                sparse_test_config(&y0, direction),
+                None,
+                Some(&pattern),
+            )
+            .unwrap();
+            while solver.state() == OdeSolverState::Running {
+                solver.step_with(&mut rhs).unwrap();
+            }
+            assert_eq!(calls, solver.nfev());
+            assert_eq!(solver.njev(), 1);
+            assert!(
+                solver
+                    .y()
+                    .iter()
+                    .all(|v| (v - (1.0 + 2.0 * direction)).abs() < 1e-13)
+            );
+            let RadauJacobian::Sparse(jac) = &solver.jac else {
+                panic!("zero pattern must retain sparse storage");
+            };
+            assert_eq!(jac.nnz(), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_radau_singular_newton_system_recovers_by_reducing_step() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(Shape2D::new(1, 1), vec![1.0], vec![0], vec![0, 1], true)
+                .unwrap()
+        }
+        let h = Tableau::scipy().mu_real;
+        assert!(matches!(
+            NewtonFactors::build_sparse(&jac(0.0, &[1.0]), h, h, RuntimeMode::Strict).unwrap(),
+            NewtonFactors::SparseUnusable
+        ));
+        let mut rhs = |_t: f64, y: &[f64]| vec![y[0]];
+        let mut config = sparse_test_config(&[1.0], h);
+        config.first_step = Some(h);
+        let mut solver = RadauSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut rhs).unwrap();
+        }
+        assert_eq!(solver.state(), OdeSolverState::Finished);
+        assert!(solver.nlu() > 2);
+        assert!((solver.y()[0] - h.exp()).abs() < 1e-7);
+    }
+
+    #[test]
+    fn sparse_radau_complex_resource_cap_is_typed_and_terminal() {
+        fn jac(_t: f64, _y: &[f64]) -> CscMatrix {
+            CscMatrix::from_components(
+                Shape2D::new(2, 2),
+                vec![-1.0, -2.0],
+                vec![0, 1],
+                vec![0, 1, 2],
+                true,
+            )
+            .unwrap()
+        }
+        for (dimension_cap, nnz_cap) in [(3, 100), (100, 7)] {
+            let mut rhs = |_t: f64, y: &[f64]| vec![-y[0], -2.0 * y[1]];
+            let mut config = sparse_test_config(&[1.0; 2], 1.0);
+            config.mode = RuntimeMode::Hardened;
+            let mut solver = RadauSolver::new_with_sparse_jacobian(&mut rhs, config, jac).unwrap();
+            // The real 2x2 system fits; the complex 4x4 representation exceeds the cap.
+            let error = fsci_sparse::with_hardened_sparse_caps(dimension_cap, nnz_cap, || {
+                solver.step_with(&mut rhs).unwrap_err()
+            });
+            assert!(matches!(
+                error,
+                StepFailure::InvalidJacobian(
+                    crate::IntegrateValidationError::ResourceExhausted { .. }
+                )
+            ));
+            assert_eq!(solver.state(), OdeSolverState::Failed);
+            assert!(solver.factors.is_none());
+            assert!(matches!(
+                solver.step_with(&mut rhs),
+                Err(StepFailure::RuntimeError(_))
+            ));
+        }
+    }
 
     #[test]
     fn dense_real_newton_matrix_matches_identity_shift_expression() {
