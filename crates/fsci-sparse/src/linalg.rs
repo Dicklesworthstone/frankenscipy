@@ -39949,7 +39949,7 @@ pub fn svds(
     // operator. Taking sqrt(Gram eigenvalues) and dividing A*v by each result
     // loses relative accuracy near rank deficiency and cannot construct a
     // normalized singular vector at sigma=0.
-    let basis = DMatrix::from_fn(side, count, |i, j| run.vectors[j][i])
+    let mut basis = DMatrix::from_fn(side, count, |i, j| run.vectors[j][i])
         .qr()
         .q();
     let projected_rows = m.max(n);
@@ -39963,6 +39963,31 @@ pub fn svds(
             a.matvec_into(input, output)?;
         }
         ensure_finite(output)?;
+    }
+
+    // Order the projected columns independently of the requested output order.
+    // Nalgebra's two-column bidiagonal SVD loses accuracy when its first diagonal
+    // is the smaller singular value: constructing a rotation subtracts two nearly
+    // equal squares. Descending column norms give |d0| >= |d1| in that reduction,
+    // avoiding the cancellation for nearly orthogonal ascending Ritz vectors.
+    // Apply the identical permutation to the basis so lifting remains exact.
+    let mut column_norms: Vec<f64> = (0..count)
+        .map(|j| {
+            projected
+                .column(j)
+                .iter()
+                .fold(0.0_f64, |norm, &value| norm.hypot(value))
+        })
+        .collect();
+    for first in 0..count {
+        let largest = (first..count)
+            .max_by(|&i, &j| column_norms[i].total_cmp(&column_norms[j]))
+            .expect("the remaining projected columns are nonempty");
+        if largest != first {
+            projected.swap_columns(first, largest);
+            basis.swap_columns(first, largest);
+            column_norms.swap(first, largest);
+        }
     }
     let svd =
         nalgebra::SVD::try_new(projected, true, true, f64::EPSILON, 10_000).ok_or_else(|| {
@@ -40059,6 +40084,31 @@ mod svds_refinement_tests {
         .expect("diagonal CSR")
     }
 
+    fn dense_rect(matrix: &DMatrix<f64>) -> CsrMatrix {
+        let mut data = Vec::new();
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        for i in 0..matrix.nrows() {
+            for j in 0..matrix.ncols() {
+                if matrix[(i, j)] != 0.0 {
+                    data.push(matrix[(i, j)]);
+                    rows.push(i);
+                    cols.push(j);
+                }
+            }
+        }
+        CooMatrix::from_triplets(
+            Shape2D::new(matrix.nrows(), matrix.ncols()),
+            data,
+            rows,
+            cols,
+            true,
+        )
+        .expect("dense fixture COO")
+        .to_csr()
+        .expect("dense fixture CSR")
+    }
+
     fn check_triplets(a: &dyn LinearOperator, result: &SvdsResult, expected: &[f64]) {
         assert!(
             result.converged,
@@ -40133,6 +40183,91 @@ mod svds_refinement_tests {
             )
             .expect("smallest SVD");
             check_triplets(&a, &result, &[2.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn svds_smallest_nondiagonal_pairs_preserve_coordinate_invariance() {
+        // The live SciPy counterexample: before projection-column ordering, the
+        // correct Ritz subspace was rotated by the two-column SVD, producing
+        // singular values 13.4166 and 14.7626 with residual 2.94e-2.
+        let mut original = DMatrix::zeros(5, 200);
+        let mut state = 0xface_beef_u64;
+        for i in 0..5 {
+            for j in 0..200 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = ((state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5) * 4.0;
+                if i == j || (i * 7 + j * 13) % 5 != 0 {
+                    original[(i, j)] = value + if i == j { 5.0 } else { 0.0 };
+                }
+            }
+        }
+        let start = [1.0, -2.0, 3.0, -4.0, 5.0];
+        for coordinates in 0..3 {
+            let mut matrix = original.clone();
+            if coordinates == 1 {
+                matrix.swap_rows(0, 4);
+                matrix.swap_columns(1, 197);
+            } else if coordinates == 2 {
+                for j in 0..200 {
+                    let (a, b) = (matrix[(0, j)], matrix[(3, j)]);
+                    matrix[(0, j)] = 0.6 * a - 0.8 * b;
+                    matrix[(3, j)] = 0.8 * a + 0.6 * b;
+                }
+                for i in 0..5 {
+                    let (a, b) = (matrix[(i, 1)], matrix[(i, 197)]);
+                    matrix[(i, 1)] = 0.6 * a - 0.8 * b;
+                    matrix[(i, 197)] = 0.8 * a + 0.6 * b;
+                }
+            }
+            for transposed in [false, true] {
+                for scale in [1e-3, 1.0, 1e3] {
+                    let scaled = if transposed {
+                        matrix.transpose() * scale
+                    } else {
+                        &matrix * scale
+                    };
+                    let a = dense_rect(&scaled);
+                    let result = svds(
+                        &a,
+                        2,
+                        EigsOptions {
+                            which: EigsWhich::SmallestMagnitude,
+                            v0: Some(&start),
+                            ..EigsOptions::default()
+                        },
+                    )
+                    .expect("nondiagonal smallest pair");
+                    // SciPy 1.17.1's singular values; orthogonal coordinate
+                    // changes and transposition preserve them analytically.
+                    check_triplets(
+                        &a,
+                        &result,
+                        &[14.565619571816649 * scale, 13.237624264010346 * scale],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn svds_two_column_refinement_preserves_zero_and_rank_deficient_factors() {
+        for (rows, cols) in [(9, 5), (5, 9)] {
+            for scale in [1e-3, 1.0, 1e3] {
+                for (diagonal, expected) in [
+                    ([0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0]),
+                    ([7.0, 0.0, 0.0, 0.0, 0.0], [7.0, 0.0]),
+                    ([7.0, 4.0, 0.0, 0.0, 0.0], [7.0, 4.0]),
+                ] {
+                    let scaled: Vec<f64> = diagonal.iter().map(|value| scale * value).collect();
+                    let a = diagonal_rect(rows, cols, &scaled);
+                    let result = svds(&a, 2, EigsOptions::default())
+                        .expect("rank-deficient two-column projection");
+                    check_triplets(&a, &result, &[expected[0] * scale, expected[1] * scale]);
+                }
+            }
         }
     }
 
