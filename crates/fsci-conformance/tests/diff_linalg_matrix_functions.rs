@@ -20,7 +20,9 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_linalg::{DecompOptions, coshm, cosm, expm, logm, sinhm, sinm, sqrtm, tanhm, tanm};
+use fsci_linalg::{
+    DecompOptions, coshm, cosm, expm, expm_frechet, logm, sinhm, sinm, sqrtm, tanhm, tanm,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-013";
@@ -35,8 +37,17 @@ struct PointCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct FrechetCase {
+    case_id: String,
+    a: Vec<Vec<f64>>,
+    e: Vec<Vec<f64>>,
+    direction_scale: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     points: Vec<PointCase>,
+    frechet: Vec<FrechetCase>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,8 +58,16 @@ struct PointArm {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct FrechetArm {
+    case_id: String,
+    exponential: Vec<Vec<f64>>,
+    derivative: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OracleResult {
     points: Vec<PointArm>,
+    frechet: Vec<FrechetArm>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,6 +191,7 @@ fn generate_query() -> OracleQuery {
                 fns: all_fns.clone(),
             },
         ],
+        frechet: Vec::new(),
     }
 }
 
@@ -181,7 +201,7 @@ import json
 import math
 import sys
 import numpy as np
-from scipy.linalg import expm, sqrtm, logm, sinm, cosm, tanm, sinhm, coshm, tanhm
+from scipy.linalg import expm, expm_frechet, sqrtm, logm, sinm, cosm, tanm, sinhm, coshm, tanhm
 
 def fnone(v):
     try:
@@ -230,7 +250,17 @@ for case in q["points"]:
         except Exception:
             pass
         points.append(out)
-print(json.dumps({"points": points}, allow_nan=False))
+frechet = []
+for case in q["frechet"]:
+    A = np.asarray(case["a"], dtype=np.float64)
+    E = np.asarray(case["e"], dtype=np.float64)
+    exponential, derivative = expm_frechet(A, E)
+    # These cases have finite answers. Never convert a failure or NaN into a
+    # skipped comparison: JSON serialization and the required Rust fields fail.
+    frechet.append({"case_id": case["case_id"],
+                    "exponential": exponential.tolist(),
+                    "derivative": derivative.tolist()})
+print(json.dumps({"points": points, "frechet": frechet}, allow_nan=False))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize matrix-functions query");
     let mut child = match fsci_conformance::scipy_oracle_command()
@@ -384,4 +414,99 @@ fn diff_linalg_matrix_functions() {
             .min()
             .unwrap_or(0),
     );
+}
+
+#[test]
+fn diff_linalg_expm_frechet_direction_scaling() {
+    let mut cases = Vec::new();
+    for (name, a) in [
+        ("diagonal", vec![vec![1.0, 0.0], vec![0.0, -2.0]]),
+        ("nonnormal", vec![vec![0.0, 5.0], vec![0.0, 0.0]]),
+        ("dense", vec![vec![1.0, 2.0], vec![3.0, 4.0]]),
+    ] {
+        for scale in [1e-200, 1.0, 1e20, -1e20, 1e100] {
+            cases.push(FrechetCase {
+                case_id: format!("{name}_direction_{scale}"),
+                a: a.clone(),
+                e: vec![
+                    vec![0.5 * scale, -0.1 * scale],
+                    vec![0.2 * scale, 0.3 * scale],
+                ],
+                direction_scale: scale,
+            });
+        }
+    }
+    let query = OracleQuery {
+        points: Vec::new(),
+        frechet: cases,
+    };
+    let Some(oracle) = scipy_oracle_or_skip(&query) else {
+        return;
+    };
+    let expected: HashMap<_, _> = oracle
+        .frechet
+        .into_iter()
+        .map(|arm| (arm.case_id.clone(), arm))
+        .collect();
+    assert_eq!(expected.len(), query.frechet.len(), "missing oracle cases");
+    let arms = ["expm_frechet_expm", "expm_frechet_derivative"];
+    let mut ledger = CompareLedger::new("diff_linalg_expm_frechet_direction_scaling", &arms);
+    let start = Instant::now();
+    let mut diffs = Vec::new();
+    let mut max_overall = 0.0_f64;
+    for case in &query.frechet {
+        let reference = expected.get(&case.case_id).expect("oracle case");
+        let (exponential, derivative) = expm_frechet(&case.a, &case.e, DecompOptions::default())
+            .expect("finite Fréchet inputs");
+        for (name, actual, oracle_matrix, divisor) in [
+            (arms[0], &exponential, &reference.exponential, 1.0),
+            (
+                arms[1],
+                &derivative,
+                &reference.derivative,
+                case.direction_scale,
+            ),
+        ] {
+            assert_eq!(actual.len(), oracle_matrix.len(), "{}", case.case_id);
+            let mut pass = true;
+            let mut max_difference = 0.0_f64;
+            for (actual_row, expected_row) in actual.iter().zip(oracle_matrix) {
+                assert_eq!(actual_row.len(), expected_row.len(), "{}", case.case_id);
+                for (&value, &expected_value) in actual_row.iter().zip(expected_row) {
+                    let value = value / divisor;
+                    let expected_value = expected_value / divisor;
+                    let difference = (value - expected_value).abs();
+                    pass &= value.is_finite()
+                        && expected_value.is_finite()
+                        && difference <= 5e-12 * expected_value.abs().max(1.0);
+                    max_difference = max_difference.max(difference);
+                }
+            }
+            ledger.compared(name, &case.case_id, pass);
+            max_overall = max_overall.max(max_difference);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                fn_name: name.to_string(),
+                max_abs_diff: max_difference,
+                pass,
+            });
+        }
+    }
+    let all_pass = diffs.iter().all(|case| case.pass);
+    emit_log(&DiffLog {
+        test_id: "diff_linalg_expm_frechet_direction_scaling".into(),
+        category: "expm_frechet vs SciPy, derivative normalized by direction scale".into(),
+        case_count: diffs.len(),
+        compared: ledger.counts().clone(),
+        max_abs_diff: max_overall,
+        pass: all_pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs,
+    });
+    assert!(
+        all_pass,
+        "Fréchet scaling mismatch: max difference {max_overall}"
+    );
+    ledger.finish(query.frechet.len());
 }

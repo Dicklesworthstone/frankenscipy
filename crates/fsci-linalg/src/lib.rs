@@ -11285,14 +11285,16 @@ pub fn expm_frechet(
 /// block-triangular M=[[A,E],[0,A]], but computed on n×n blocks instead of the
 /// full 2n×2n matrix. Since f(M)=[[f(A),Df],[0,f(A)]], every matrix in the Padé
 /// is block-triangular with EQUAL diagonal blocks — represent it as (D,F) with
-/// block product (D₁,F₁)·(D₂,F₂)=(D₁D₂, D₁F₂+F₁D₂). The D-track reproduces
-/// `expm_pade_scaling_squaring` exactly; the F-track carries the derivative. ~19
-/// n×n matmuls + 1 factor + 2 solves vs 6 matmuls at 8× cost on the 2n×2n matrix
-/// (~2.5× fewer flops). Same algorithm/accuracy as expm(M), no complex arithmetic.
+/// block product (D₁,F₁)·(D₂,F₂)=(D₁D₂, D₁F₂+F₁D₂). The F-track differentiates
+/// the Padé approximation on the D-track. Scaling depends only on A, using the
+/// Fréchet backward-error bound of Al-Mohy and Higham (2009), Algorithm 6.4.
+/// The direction is normalized independently while evaluating the polynomials;
+/// its magnitude must neither change exp(A) nor overflow the Padé coefficients.
 fn expm_frechet_blocks(a: &DMatrix<f64>, e: &DMatrix<f64>) -> (DMatrix<f64>, DMatrix<f64>) {
     let n = a.nrows();
     let identity = DMatrix::<f64>::identity(n, n);
-    const THETA13: f64 = 5.371_920_351_148_152;
+    // Table 6.1, degree 13: bounds the backward error of the derivative too.
+    const ELL13: f64 = 4.74;
     const B: [f64; 14] = [
         64_764_752_532_480_000.0,
         32_382_376_266_240_000.0,
@@ -11309,21 +11311,37 @@ fn expm_frechet_blocks(a: &DMatrix<f64>, e: &DMatrix<f64>) -> (DMatrix<f64>, DMa
         182.0,
         1.0,
     ];
-    // ‖M‖₁ = maxⱼ(‖A[:,j]‖₁ + ‖E[:,j]‖₁) (the E-columns sit above the A-columns).
-    let mut norm_m = 0.0_f64;
-    for j in 0..n {
-        let ca: f64 = (0..n).map(|i| a[(i, j)].abs()).sum();
-        let ce: f64 = (0..n).map(|i| e[(i, j)].abs()).sum();
-        norm_m = norm_m.max(ca).max(ca + ce);
-    }
-    let s = if norm_m <= THETA13 {
+    // L(A, E) is linear in E: its magnitude must not choose the squaring
+    // count. Scaling by ||[[A,E],[0,A]]|| can round exp(A / 2^s) to I for
+    // a large E, even when A itself is small. A finite E can also overflow
+    // that block norm and turn s into u32::MAX.
+    //
+    // Compute log2(||A||_1) from scaled column sums so even finite entries
+    // whose sum overflows yield a bounded squaring count.
+    let max_a = a
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let s = if max_a == 0.0 {
         0u32
     } else {
-        (norm_m / THETA13).log2().ceil().max(0.0) as u32
+        let scaled_norm = (0..n)
+            .map(|j| (0..n).map(|i| a[(i, j)].abs() / max_a).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        (max_a.log2() + scaled_norm.log2() - ELL13.log2())
+            .ceil()
+            .max(0.0) as u32
     };
-    let scale = 2.0_f64.powi(s as i32);
-    let ad = a / scale;
-    let af = e / scale;
+    // Multiplying by 2^-s also avoids overflowing an intermediate 2^s.
+    let scale = 0.5_f64.powi(s as i32);
+    let ad = a * scale;
+    let direction_scale = e
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let af = if direction_scale == 0.0 {
+        DMatrix::<f64>::zeros(n, n)
+    } else {
+        DMatrix::from_fn(n, n, |i, j| (e[(i, j)] / direction_scale) * scale)
+    };
     // (D,F) block product.
     let bmul = |d1: &DMatrix<f64>, f1: &DMatrix<f64>, d2: &DMatrix<f64>, f2: &DMatrix<f64>| {
         (
@@ -11359,6 +11377,9 @@ fn expm_frechet_blocks(a: &DMatrix<f64>, e: &DMatrix<f64>) -> (DMatrix<f64>, DMa
     let mut xf = lu
         .solve(&(&num_f - &denf_xd))
         .unwrap_or_else(|| DMatrix::<f64>::zeros(n, n));
+    // Restore E before squaring. Restoring it only at the end would lose a
+    // representable derivative when exp(A) underflows (e.g. A=-1000, E=1e300).
+    xf *= direction_scale;
     // Square s times: (D,F) → (D², DF+FD).
     for _ in 0..s {
         let nd = par_dmatmul(&xd, &xd);
@@ -50591,6 +50612,113 @@ mod proptest_tests {
         )
         .expect("finite input");
         assert!((expm[0][1] - 17.36725509).abs() < 1e-7, "{expm:?}");
+    }
+
+    #[test]
+    fn expm_frechet_is_linear_in_direction_across_scales() {
+        // For diagonal A, L(A, E)[i,j] is E[i,j] times the divided difference
+        // of exp at A[i,i], A[j,j]. This is independent of the block algorithm
+        // and also exercises a direction that does not commute with A.
+        let a = vec![vec![1.0, 0.0], vec![0.0, -2.0]];
+        let divided_difference = (1.0_f64.exp() - (-2.0_f64).exp()) / 3.0;
+        let expected_exp = [[1.0_f64.exp(), 0.0], [0.0, (-2.0_f64).exp()]];
+        let expected_derivative = [
+            [2.0 * 1.0_f64.exp(), -3.0 * divided_difference],
+            [5.0 * divided_difference, (-2.0_f64).exp()],
+        ];
+        for scale in [1e-300, 1.0, 1e20, -1e20, 1e100] {
+            let e = vec![vec![2.0 * scale, -3.0 * scale], vec![5.0 * scale, scale]];
+            let (exponential, derivative) =
+                expm_frechet(&a, &e, DecompOptions::default()).expect("finite inputs");
+            for i in 0..2 {
+                for j in 0..2 {
+                    assert!(
+                        (exponential[i][j] - expected_exp[i][j]).abs()
+                            <= 5e-13 * expected_exp[i][j].abs().max(1.0),
+                        "E scale {scale}: exp(A)[{i},{j}] = {}",
+                        exponential[i][j]
+                    );
+                    assert!(
+                        (derivative[i][j] / scale - expected_derivative[i][j]).abs()
+                            <= 5e-13 * expected_derivative[i][j].abs().max(1.0),
+                        "E scale {scale}: L(A,E)[{i},{j}] = {}",
+                        derivative[i][j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expm_frechet_preserves_derivative_when_exponential_underflows() {
+        // exp(-1000) underflows, but E * exp(-1000) is representable. Restoring
+        // a normalized direction only after all squarings would erase it.
+        let scale = 1e300_f64;
+        let (exponential, derivative) =
+            expm_frechet(&[vec![-1000.0]], &[vec![scale]], DecompOptions::default())
+                .expect("finite inputs");
+        let expected = (scale.ln() - 1000.0).exp();
+        assert_eq!(exponential[0][0], 0.0);
+        assert!(
+            (derivative[0][0] / expected - 1.0).abs() < 5e-12,
+            "L(-1000, 1e300) = {}, expected {expected}",
+            derivative[0][0]
+        );
+    }
+
+    #[test]
+    fn expm_frechet_accepts_finite_directions_with_overflowing_column_sums() {
+        let scale = 1e308;
+        let a = vec![vec![-1.0, 0.0], vec![0.0, -1.0]];
+        let e = vec![vec![scale, -scale], vec![scale, -scale]];
+        let (exponential, derivative) =
+            expm_frechet(&a, &e, DecompOptions::default()).expect("finite inputs");
+        let expected = (-1.0_f64).exp();
+        for i in 0..2 {
+            for j in 0..2 {
+                let exp_entry = if i == j { expected } else { 0.0 };
+                let sign = if j == 0 { 1.0 } else { -1.0 };
+                assert!((exponential[i][j] - exp_entry).abs() < 5e-14);
+                assert!(derivative[i][j].is_finite());
+                assert!((derivative[i][j] / scale - sign * expected).abs() < 5e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn expm_frechet_zero_matrix_preserves_direction_at_extreme_scales() {
+        for scale in [0.0, f64::from_bits(1), 1e-300, 1.0, 1e308] {
+            let a = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+            let e = vec![vec![scale, -scale], vec![scale, scale]];
+            let (exponential, derivative) =
+                expm_frechet(&a, &e, DecompOptions::default()).expect("finite inputs");
+            assert_eq!(exponential, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+            assert_eq!(derivative, e, "L(0, E) = E at scale {scale}");
+        }
+    }
+
+    #[test]
+    fn expm_frechet_scales_finite_nilpotent_matrix_with_overflowing_norm() {
+        // A^2 = 0, so exp(A) = I + A. Its entries are finite, but its
+        // one-norm is 8e308 and the required 2^-1024 scale is subnormal.
+        let magnitude = 1.6e308;
+        let mut a = vec![vec![0.0; 6]; 6];
+        for row in a.iter_mut().take(5) {
+            row[5] = magnitude;
+        }
+        let e = vec![vec![0.0; 6]; 6];
+        let (exponential, derivative) =
+            expm_frechet(&a, &e, DecompOptions::default()).expect("finite nilpotent matrix");
+        for i in 0..6 {
+            for j in 0..6 {
+                if i < 5 && j == 5 {
+                    assert!((exponential[i][j] / magnitude - 1.0).abs() < 1e-13);
+                } else {
+                    assert_eq!(exponential[i][j], if i == j { 1.0 } else { 0.0 });
+                }
+                assert_eq!(derivative[i][j], 0.0);
+            }
+        }
     }
 
     #[test]
