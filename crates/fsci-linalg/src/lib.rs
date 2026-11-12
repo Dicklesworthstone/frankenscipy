@@ -6709,28 +6709,157 @@ pub fn svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, LinalgEr
     })
 }
 
-// One-sided Jacobi SVD core for a TALL/SQUARE matrix (m ≥ n). Orthogonalizes the columns of A
-// by a cyclic sweep of Givens rotations (W ← A·V); on convergence the column norms are the
-// singular values and W/σ are the left singular vectors. Guaranteed-convergent with high
-// relative accuracy and — unlike the Gram-tridiagonal QR path — it deflates exact-zero singular
-// values trivially (zero/orthogonal columns need no rotation), so rank-deficient inputs that
-// stall the bidiagonal QR (frankenscipy-9xrce) finish in a couple of sweeps. Returns thin
-// (U: m×n, s: n desc, Vᵀ: n×n).
-//
-// Errors when `max_sweeps` sweeps pass and the last one still rotated, as LAPACK `dgesvj`
-// reports INFO > 0; it used to build U, s and Vᵀ from the unconverged state and return them as
-// if converged (frankenscipy-cb92n).
-const JACOBI_SVD_MAX_SWEEPS: usize = 60;
+// With no numerical-rank cutoff, dependent columns at extreme scales may take
+// more than sixty sweeps to vanish. Keep a finite budget without silently dropping
+// a small, representable singular value to force earlier convergence.
+const JACOBI_SVD_MAX_SWEEPS: usize = 128;
 
+fn jacobi_column_norm(column: &[f64]) -> f64 {
+    let maximum = column
+        .iter()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    if maximum == 0.0 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    let mut correction = 0.0;
+    for &value in column {
+        let scaled = value / maximum;
+        let term = scaled * scaled - correction;
+        let next = sum + term;
+        correction = (next - sum) - term;
+        sum = next;
+    }
+    // Only this final product can be subnormal. Repeated hypot at the physical
+    // scale would round eighty minimum-subnormal entries to one ULP instead of nine.
+    maximum * sum.sqrt()
+}
+
+// value = fraction * 2^exponent, with 0.5 <= |fraction| < 1. The caller supplies a
+// finite nonzero value; scaling subnormals first makes their leading bit explicit.
+fn jacobi_frexp(value: f64) -> (f64, i32) {
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    if exponent == 0 {
+        let (fraction, exponent) = jacobi_frexp(value * 18_014_398_509_481_984.0);
+        return (fraction, exponent - 54);
+    }
+    (
+        f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (1022_u64 << 52)),
+        exponent - 1022,
+    )
+}
+
+// Evaluate value * numerator / denominator without losing a representable result
+// to an overflowing/underflowing intermediate product or ratio. Column lengths are
+// positive and finite. The common unit-length case needs no exponent arithmetic.
+fn jacobi_rescale(value: f64, numerator: f64, denominator: f64) -> f64 {
+    if value == 0.0 || numerator == denominator {
+        return value;
+    }
+    if numerator == 0.0 || denominator == 1.0 {
+        return value * numerator;
+    }
+    if numerator == 1.0 {
+        return value / denominator;
+    }
+    let (value_fraction, value_exponent) = jacobi_frexp(value);
+    let (numerator_fraction, numerator_exponent) = jacobi_frexp(numerator);
+    let (denominator_fraction, denominator_exponent) = jacobi_frexp(denominator);
+    let (fraction, extra_exponent) =
+        jacobi_frexp(value_fraction * numerator_fraction / denominator_fraction);
+    let exponent = value_exponent + numerator_exponent - denominator_exponent + extra_exponent;
+    let power_of_two = |exponent: i32| f64::from_bits(((1023 + exponent) as u64) << 52);
+    if exponent > 1024 {
+        f64::INFINITY.copysign(fraction)
+    } else if exponent < -1074 {
+        0.0_f64.copysign(fraction)
+    } else if exponent == 1024 {
+        (fraction * power_of_two(1023)) * 2.0
+    } else if exponent < -1022 {
+        // Keep the first product normal so the final subnormal is rounded only once.
+        (fraction * power_of_two(-969)) * power_of_two(exponent + 969)
+    } else {
+        fraction * power_of_two(exponent)
+    }
+}
+
+// Most columns are stored at unit length, separately from their singular-value
+// scale. Retain raw entries when division would erase their relative information:
+// [1e200, 1e-200] must not become [1, 0] before a later cancellation exposes the tail.
+fn jacobi_normalize_column(column: &mut [f64], norm: f64) -> f64 {
+    if norm.is_subnormal() {
+        // A rounded subnormal norm can have very poor relative accuracy. Normalize
+        // the direction at a normal scale instead (e.g. [MIN_SUBNORMAL; 2]).
+        let maximum = column
+            .iter()
+            .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+        for value in column.iter_mut() {
+            *value /= maximum;
+        }
+        let scaled_norm = jacobi_column_norm(column);
+        for value in column {
+            *value /= scaled_norm;
+        }
+        return 1.0;
+    }
+    if norm != 0.0
+        && column
+            .iter()
+            .all(|&value| value == 0.0 || (value / norm).is_normal())
+    {
+        for value in column {
+            *value /= norm;
+        }
+        1.0
+    } else {
+        norm
+    }
+}
+
+fn jacobi_column_cosine(left: &[f64], left_norm: f64, right: &[f64], right_norm: f64) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut correction = 0.0;
+    for (&left, &right) in left.iter().zip(right) {
+        let product = (left / left_norm) * (right / right_norm);
+        let next = sum + product;
+        correction += if sum.abs() >= product.abs() {
+            (sum - next) + product
+        } else {
+            (product - next) + sum
+        };
+        sum = next;
+    }
+    (sum + correction).clamp(-1.0, 1.0)
+}
+
+// One-sided Jacobi for m >= n, with W = A V represented by a direction and a
+// separate norm for each column. Normalizing after each rotation prevents exact
+// rank deficiency from stalling on subnormal roundoff columns. No global rank
+// threshold is used: even a tiny singular value is retained if it is representable.
+// The relative angle criterion follows the sqrt(m)*eps accuracy scale of DGESVJ.
+// An exhausted sweep budget remains an error (frankenscipy-cb92n).
 fn one_sided_jacobi_svd_tall(
     a: &[Vec<f64>],
     m: usize,
     n: usize,
     max_sweeps: usize,
 ) -> Result<SvdResult, String> {
-    // Column-major working copies: w[j] is column j of W = A·V (length m); v[j] is column j of
-    // the accumulated right factor V (length n).
-    let mut w: Vec<Vec<f64>> = (0..n).map(|j| (0..m).map(|i| a[i][j]).collect()).collect();
+    let maximum = a
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    // This exact upward scaling cannot lose a nonzero entry. It also keeps norm
+    // ratios informative when the entire matrix is at the subnormal rounding floor.
+    let input_scale = if maximum > 0.0 && maximum < f64::MIN_POSITIVE {
+        f64::from_bits(2046_u64 << 52)
+    } else {
+        1.0
+    };
+    // Column-major directions: W[j] = norms[j] * w[j] / lengths[j].
+    let mut w: Vec<Vec<f64>> = (0..n)
+        .map(|j| (0..m).map(|i| a[i][j] * input_scale).collect())
+        .collect();
     let mut v: Vec<Vec<f64>> = (0..n)
         .map(|j| {
             let mut col = vec![0.0; n];
@@ -6738,63 +6867,80 @@ fn one_sided_jacobi_svd_tall(
             col
         })
         .collect();
-    let tol = f64::EPSILON;
-    // Cached squared column norms of W: α = nrm2[i], β = nrm2[j] are read instead of recomputed,
-    // so a skipped (already-orthogonal) pair costs only one dot product γ — the common case for
-    // rank-deficient inputs whose zero columns are mutually orthogonal.
-    let mut nrm2: Vec<f64> = (0..n).map(|j| w[j].iter().map(|x| x * x).sum()).collect();
-    // A column whose squared norm has collapsed this far below the largest is a numerical zero
-    // (norm ≤ ~1e-13·‖A‖). Its singular value and reconstruction contribution are below the
-    // rounding floor, so any pair involving it is permanently orthogonal — skip it WITHOUT the
-    // O(m) dot product. On rank-deficient inputs (the only ones routed here) the dependent columns
-    // collapse and this prunes the bulk of the pair work in later sweeps.
-    let zero_tol = nrm2.iter().cloned().fold(0.0_f64, f64::max) * 1e-26;
+    let tol = (m as f64).sqrt() * f64::EPSILON;
+    let mut norms: Vec<f64> = w.iter().map(|column| jacobi_column_norm(column)).collect();
+    if norms.iter().any(|norm| !norm.is_finite()) {
+        return Err("one-sided Jacobi SVD has a non-finite column norm".into());
+    }
+    let mut lengths: Vec<f64> = w
+        .iter_mut()
+        .zip(&norms)
+        .map(|(column, &norm)| jacobi_normalize_column(column, norm))
+        .collect();
 
     let mut converged = false;
     for _ in 0..max_sweeps {
         let mut rotated = false;
         for i in 0..n {
-            if nrm2[i] <= zero_tol {
+            if norms[i] == 0.0 {
                 continue;
             }
             for j in (i + 1)..n {
-                let alpha = nrm2[i];
-                let beta = nrm2[j];
-                if beta <= zero_tol {
+                if norms[i] == 0.0 || norms[j] == 0.0 {
                     continue;
                 }
-                let (wi, wj) = (&w[i], &w[j]);
-                let mut gamma = 0.0;
-                for (&wik, &wjk) in wi.iter().zip(wj.iter()).take(m) {
-                    gamma += wik * wjk;
-                }
-                if gamma.abs() <= tol * (alpha * beta).sqrt() {
-                    continue; // columns already orthogonal (covers zero columns: γ = 0)
+                let cosine = jacobi_column_cosine(&w[i], lengths[i], &w[j], lengths[j]);
+                if cosine.abs() <= tol {
+                    continue;
                 }
                 rotated = true;
-                let zeta = (beta - alpha) / (2.0 * gamma);
-                let t = if zeta == 0.0 {
-                    1.0
+                let i_is_larger = norms[i] >= norms[j];
+                let ratio = if i_is_larger {
+                    norms[j] / norms[i]
                 } else {
-                    zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt())
+                    norms[i] / norms[j]
                 };
-                let c = 1.0 / (1.0 + t * t).sqrt();
+                let difference = (1.0 - ratio) * (1.0 + ratio);
+                // q = tan(theta)/ratio stays representable even when the rotation
+                // angle underflows. Its small-column update is then Gram-Schmidt.
+                let q = if difference == 0.0 {
+                    1.0_f64.copysign(cosine)
+                } else {
+                    let magnitude =
+                        2.0 * cosine / (difference + difference.hypot(2.0 * ratio * cosine));
+                    if i_is_larger { -magnitude } else { magnitude }
+                };
+                let t = ratio * q;
+                let c = 1.0 / 1.0_f64.hypot(t);
                 let s = c * t;
-                let mut ni = 0.0;
-                let mut nj = 0.0;
                 let (w_left, w_right) = w.split_at_mut(j);
                 let (wi, wj) = (&mut w_left[i], &mut w_right[0]);
-                for (wik, wjk) in wi.iter_mut().zip(wj.iter_mut()).take(m) {
+                for (wik, wjk) in wi.iter_mut().zip(wj.iter_mut()) {
                     let (old_wik, old_wjk) = (*wik, *wjk);
-                    let nik = c * old_wik - s * old_wjk;
-                    let njk = s * old_wik + c * old_wjk;
-                    *wik = nik;
-                    *wjk = njk;
-                    ni += nik * nik;
-                    nj += njk * njk;
+                    let j_in_i_units = jacobi_rescale(old_wjk, lengths[i], lengths[j]);
+                    let i_in_j_units = jacobi_rescale(old_wik, lengths[j], lengths[i]);
+                    if i_is_larger {
+                        *wik = c * old_wik - t * (ratio * (c * j_in_i_units));
+                        *wjk = c * old_wjk + q * (c * i_in_j_units);
+                    } else {
+                        *wik = c * old_wik - q * (c * j_in_i_units);
+                        *wjk = c * old_wjk + t * (ratio * (c * i_in_j_units));
+                    }
                 }
-                nrm2[i] = ni;
-                nrm2[j] = nj;
+                let new_i_length = jacobi_column_norm(wi);
+                let new_j_length = jacobi_column_norm(wj);
+                if !new_i_length.is_finite() || !new_j_length.is_finite() {
+                    return Err("one-sided Jacobi SVD has a non-finite rotated column".into());
+                }
+                norms[i] = jacobi_rescale(norms[i], new_i_length, lengths[i]);
+                norms[j] = jacobi_rescale(norms[j], new_j_length, lengths[j]);
+                if !norms[i].is_finite() || !norms[j].is_finite() {
+                    return Err(
+                        "one-sided Jacobi SVD singular value exceeds the finite range".into(),
+                    );
+                }
+                lengths[i] = jacobi_normalize_column(wi, new_i_length);
+                lengths[j] = jacobi_normalize_column(wj, new_j_length);
                 let (v_left, v_right) = v.split_at_mut(j);
                 let (vi, vj) = (&mut v_left[i], &mut v_right[0]);
                 for (vik, vjk) in vi.iter_mut().zip(vj.iter_mut()).take(n) {
@@ -6805,7 +6951,7 @@ fn one_sided_jacobi_svd_tall(
             }
         }
         if !rotated {
-            // status: a full sweep found every pair orthogonal (|γ| ≤ eps·√(αβ))
+            // A full sweep found every nonzero pair orthogonal to the relative tolerance.
             converged = true;
             break;
         }
@@ -6817,19 +6963,48 @@ fn one_sided_jacobi_svd_tall(
     }
 
     // Singular values = column norms of W; sort descending (stable on index for ties).
-    let mut order: Vec<(f64, usize)> = (0..n).map(|j| (nrm2[j].max(0.0).sqrt(), j)).collect();
+    let mut order: Vec<(f64, usize)> = norms
+        .into_iter()
+        .enumerate()
+        .map(|(j, norm)| (norm, j))
+        .collect();
     order.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
-    let s: Vec<f64> = order.iter().map(|(nrm, _)| *nrm).collect();
-    let smax = s.first().copied().unwrap_or(0.0);
-    let svtol = (m.max(n) as f64) * f64::EPSILON * smax.max(1.0);
-
+    let s: Vec<f64> = order.iter().map(|(nrm, _)| *nrm / input_scale).collect();
     let mut u = vec![vec![0.0; n]; m];
     let mut vt = vec![vec![0.0; n]; n];
+    let mut row_energy = vec![0.0; m];
     for (out, &(nrm, orig)) in order.iter().enumerate() {
-        if nrm > svtol {
-            let inv = 1.0 / nrm;
+        if nrm > 0.0 {
             for (row, urow) in u.iter_mut().enumerate() {
-                urow[out] = w[orig][row] * inv;
+                urow[out] = w[orig][row] / lengths[orig];
+                row_energy[row] += urow[out] * urow[out];
+            }
+        } else {
+            // A zero singular value still needs a unit left vector. The coordinate
+            // with the largest residual outside the current span avoids a fragile
+            // near-dependent choice and keeps completion O(m*n^2).
+            let pivot = row_energy
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map_or(0, |(row, _)| row);
+            let mut candidate = vec![0.0; m];
+            candidate[pivot] = 1.0;
+            for _ in 0..2 {
+                for col in 0..out {
+                    let dot: f64 = (0..m).map(|row| candidate[row] * u[row][col]).sum();
+                    for row in 0..m {
+                        candidate[row] -= dot * u[row][col];
+                    }
+                }
+            }
+            let norm = jacobi_column_norm(&candidate);
+            if norm == 0.0 || !norm.is_finite() {
+                return Err("one-sided Jacobi SVD could not complete the left basis".into());
+            }
+            for (row, urow) in u.iter_mut().enumerate() {
+                urow[out] = candidate[row] / norm;
+                row_energy[row] += urow[out] * urow[out];
             }
         }
         vt[out].copy_from_slice(&v[orig]);
@@ -6841,15 +7016,18 @@ fn one_sided_jacobi_svd_tall(
 ///
 /// An alternative to [`svd`] that trades speed for robustness and high relative accuracy: it
 /// orthogonalizes columns with cyclic Givens rotations rather than reducing to bidiagonal form
-/// and running implicit-shift QR. Its key property is that it deflates exactly-zero singular
-/// values trivially, so it returns in a couple of sweeps on rank-deficient matrices that stall
-/// the bidiagonal-QR path (see `frankenscipy-9xrce`). Reconstruction is exact to rounding and
-/// `U`, `V` have orthonormal columns. Cost O(m·n²·sweeps); use [`svd`] for large well-conditioned
-/// inputs and this when robustness on (near-)singular matrices matters.
+/// and running implicit-shift QR. Column directions and magnitudes are tracked separately to
+/// avoid squaring away tiny singular values or overflowing large ones. Exactly zero values get
+/// an orthonormal basis completion; nonzero values are never dropped by a global rank cutoff.
+/// Reconstruction is accurate to rounding and `U`, `V` have orthonormal columns, including for
+/// rank-deficient inputs. Cost O(m·n²·sweeps); use [`svd`] for large well-conditioned inputs and
+/// this when robustness on (near-)singular matrices matters. Exhausting the bounded sweep budget
+/// or encountering an unrepresentable singular value returns a convergence error.
 pub fn jacobi_svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
+    reject_nan_for_svd(a)?;
 
     if rows == 0 || cols == 0 {
         return Ok(SvdResult {
@@ -36670,15 +36848,9 @@ mod tests {
                     assert!((dot - expect).abs() < 1e-9, "Vt not orthonormal ({p},{q})");
                 }
             }
-            // U columns with σ>0 orthonormal.
+            // Every thin U column must be orthonormal, including the null space.
             for p in 0..k {
-                if res.s[p] <= 1e-9 {
-                    continue;
-                }
                 for q in 0..k {
-                    if res.s[q] <= 1e-9 {
-                        continue;
-                    }
                     let dot: f64 = (0..m).map(|i| res.u[i][p] * res.u[i][q]).sum();
                     let expect = if p == q { 1.0 } else { 0.0 };
                     assert!((dot - expect).abs() < 1e-9, "U not orthonormal ({p},{q})");
@@ -36723,6 +36895,256 @@ mod tests {
         let orthogonal = vec![vec![3.0, 0.0], vec![0.0, 2.0], vec![0.0, 0.0]];
         let res = one_sided_jacobi_svd_tall(&orthogonal, 3, 2, 1).expect("already orthogonal");
         assert_eq!(res.s, vec![3.0, 2.0]);
+    }
+
+    fn assert_complete_jacobi_factors(a: &[Vec<f64>], result: &SvdResult, tolerance: f64) {
+        let (m, n) = (a.len(), a[0].len());
+        let k = m.min(n);
+        assert_eq!(result.s.len(), k);
+        assert_eq!(result.u.len(), m);
+        assert!(result.u.iter().all(|row| row.len() == k));
+        assert_eq!(result.vt.len(), k);
+        assert!(result.vt.iter().all(|row| row.len() == n));
+        assert!(
+            result
+                .s
+                .iter()
+                .all(|&value| value.is_finite() && value >= 0.0)
+        );
+        assert!(result.s.windows(2).all(|pair| pair[0] >= pair[1]));
+        assert!(result.u.iter().flatten().all(|value| value.is_finite()));
+        assert!(result.vt.iter().flatten().all(|value| value.is_finite()));
+        let scale = a
+            .iter()
+            .flatten()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        let scale = if scale == 0.0 { 1.0 } else { scale };
+        for i in 0..m {
+            for j in 0..n {
+                let reconstructed: f64 = (0..k)
+                    .map(|p| result.u[i][p] * (result.s[p] / scale) * result.vt[p][j])
+                    .sum();
+                assert!(
+                    (reconstructed - a[i][j] / scale).abs() <= tolerance,
+                    "scaled reconstruction ({i},{j}): {reconstructed} vs {}",
+                    a[i][j] / scale
+                );
+            }
+        }
+        for p in 0..k {
+            for q in 0..k {
+                let expected = if p == q { 1.0 } else { 0.0 };
+                let u_dot: f64 = (0..m).map(|i| result.u[i][p] * result.u[i][q]).sum();
+                let v_dot: f64 = (0..n).map(|j| result.vt[p][j] * result.vt[q][j]).sum();
+                assert!(
+                    (u_dot - expected).abs() <= tolerance,
+                    "U dot({p},{q})={u_dot}"
+                );
+                assert!(
+                    (v_dot - expected).abs() <= tolerance,
+                    "V dot({p},{q})={v_dot}"
+                );
+            }
+            for i in 0..m {
+                let av: f64 = (0..n).map(|j| (a[i][j] / scale) * result.vt[p][j]).sum();
+                let us = result.u[i][p] * (result.s[p] / scale);
+                assert!((av - us).abs() <= tolerance, "A v - sigma u at ({i},{p})");
+            }
+            for j in 0..n {
+                let atu: f64 = (0..m).map(|i| (a[i][j] / scale) * result.u[i][p]).sum();
+                let vs = result.vt[p][j] * (result.s[p] / scale);
+                assert!(
+                    (atu - vs).abs() <= tolerance,
+                    "A^T u - sigma v at ({j},{p})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jacobi_svd_preserves_extreme_scales_and_small_nonzero_values() {
+        // The symmetric 2x2 block has exact singular values 4*scale and 2*scale.
+        // These exercise rotations as well as norms in tall and wide orientations.
+        for scale in [1e-310, 1e-200, 1.0, 1e200, 1e300] {
+            let a = vec![
+                vec![3.0 * scale, scale],
+                vec![scale, 3.0 * scale],
+                vec![0.0, 0.0],
+            ];
+            for matrix in [a.clone(), transpose_rows(&a)] {
+                let result = jacobi_svd(&matrix, DecompOptions::default()).expect("scaled SVD");
+                assert_complete_jacobi_factors(&matrix, &result, 2e-12);
+                for (&actual, expected) in result.s.iter().zip([4.0 * scale, 2.0 * scale]) {
+                    assert!(
+                        (actual / expected - 1.0).abs() < 2e-12,
+                        "{actual} vs {expected}"
+                    );
+                }
+            }
+        }
+
+        // A small value is not a numerical zero just because another column is large.
+        let a = vec![
+            vec![1e200, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1e-20, 0.0],
+            vec![0.0, 0.0, 0.0, 1e-200],
+        ];
+        let result = jacobi_svd(&a, DecompOptions::default()).expect("graded diagonal");
+        assert_eq!(result.s, vec![1e200, 1.0, 1e-20, 1e-200]);
+        assert_complete_jacobi_factors(&a, &result, 2e-12);
+
+        // Both column norms differ by more than the entire exponent range. The
+        // small-column orthogonalization still needs to remove its correlation.
+        let a = vec![vec![1e200, 1e-200], vec![0.0, 1e-200], vec![0.0, 0.0]];
+        let result = jacobi_svd(&a, DecompOptions::default()).expect("mixed column scales");
+        assert!((result.s[0] / 1e200 - 1.0).abs() < 2e-12);
+        assert!((result.s[1] / 1e-200 - 1.0).abs() < 2e-12);
+        assert_complete_jacobi_factors(&a, &result, 2e-12);
+
+        // Tiny singular values can also arise through cancellation of large input
+        // entries. Global downward scaling would erase this representable value
+        // even though every input entry could survive the scale/unscale round trip.
+        let mut a = vec![vec![0.0; 5]; 5];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1e100;
+            if i + 1 < 5 {
+                row[i + 1] = 1e200;
+            }
+        }
+        let result = jacobi_svd(&a, DecompOptions::default()).expect("graded triangular SVD");
+        assert!(
+            result.s[..4]
+                .iter()
+                .all(|&value| (value / 1e200 - 1.0).abs() < 2e-12)
+        );
+        assert!((result.s[4] / 1e-300 - 1.0).abs() < 2e-12, "{:?}", result.s);
+        assert_complete_jacobi_factors(&a, &result, 2e-12);
+    }
+
+    #[test]
+    fn jacobi_svd_retains_tiny_entries_within_large_columns() {
+        // Dividing these columns by their norm would erase the second row. A
+        // cancellation of the large entries must still expose the small singular
+        // value. The last case also requires applying c before adding large terms.
+        for (large, small) in [(1e200, 1e-200), (1e308, 1e-308)] {
+            let a = vec![vec![large, large], vec![small, 2.0 * small]];
+            for matrix in [a.clone(), transpose_rows(&a)] {
+                let result = jacobi_svd(&matrix, DecompOptions::default()).expect("wide range");
+                assert!((result.s[0] / large / 2.0_f64.sqrt() - 1.0).abs() < 2e-12);
+                assert!((result.s[1] / small * 2.0_f64.sqrt() - 1.0).abs() < 2e-12);
+                assert_complete_jacobi_factors(&matrix, &result, 2e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn jacobi_svd_completes_zero_and_rank_deficient_factors() {
+        for (m, n) in [(5, 3), (3, 5), (4, 1), (1, 4)] {
+            let a = vec![vec![0.0; n]; m];
+            let result = jacobi_svd(&a, DecompOptions::default()).expect("zero SVD");
+            assert!(result.s.iter().all(|&value| value == 0.0));
+            assert_complete_jacobi_factors(&a, &result, 2e-12);
+        }
+        let a: Vec<Vec<f64>> = (1..=80)
+            .map(|i| (1..=64).map(|j| (i * j) as f64).collect())
+            .collect();
+        for scale in [1e-200, 1.0, 1e200] {
+            let scaled: Vec<Vec<f64>> = a
+                .iter()
+                .map(|row| row.iter().map(|value| value * scale).collect())
+                .collect();
+            for matrix in [scaled.clone(), transpose_rows(&scaled)] {
+                let result = jacobi_svd(&matrix, DecompOptions::default()).expect("rank-one SVD");
+                assert_complete_jacobi_factors(&matrix, &result, 2e-11);
+                assert!(
+                    result.s[1..]
+                        .iter()
+                        .all(|&value| value <= result.s[0] * 2e-14)
+                );
+                if scale == 1.0 {
+                    let routed =
+                        svd(&matrix, DecompOptions::default()).expect("public rank-one SVD");
+                    assert_complete_jacobi_factors(&matrix, &routed, 2e-11);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jacobi_svd_normalizes_subnormal_directions_before_rounding_values() {
+        let tiny = f64::from_bits(1);
+        let cases = [
+            (vec![vec![tiny], vec![tiny]], vec![tiny]),
+            (vec![vec![tiny]; 80], vec![9.0 * tiny]),
+            (
+                vec![vec![tiny, tiny], vec![tiny, 0.0]],
+                vec![2.0 * tiny, tiny],
+            ),
+            (
+                vec![vec![1.0, 0.0], vec![0.0, tiny], vec![0.0, tiny]],
+                vec![1.0, tiny],
+            ),
+            (
+                (0..=80)
+                    .map(|i| {
+                        if i == 0 {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, tiny]
+                        }
+                    })
+                    .collect(),
+                vec![1.0, 9.0 * tiny],
+            ),
+        ];
+        for (a, expected) in cases {
+            for matrix in [a.clone(), transpose_rows(&a)] {
+                let result = jacobi_svd(&matrix, DecompOptions::default()).expect("subnormal SVD");
+                assert_eq!(result.s, expected);
+                for p in 0..result.s.len() {
+                    for q in 0..result.s.len() {
+                        let expected = if p == q { 1.0 } else { 0.0 };
+                        let u_dot: f64 = result.u.iter().map(|row| row[p] * row[q]).sum();
+                        let v_dot: f64 = result.vt[p]
+                            .iter()
+                            .zip(&result.vt[q])
+                            .map(|(p, q)| p * q)
+                            .sum();
+                        assert!((u_dot - expected).abs() < 2e-12, "subnormal U dot={u_dot}");
+                        assert!((v_dot - expected).abs() < 2e-12, "subnormal V dot={v_dot}");
+                    }
+                }
+                // At this scale one ULP is a large relative change. Check the
+                // reconstruction in representable input units, without an absolute
+                // tolerance that would conceal errors on normal-scale regressions.
+                for (i, row) in matrix.iter().enumerate() {
+                    for (j, &value) in row.iter().enumerate() {
+                        let reconstructed: f64 = (0..result.s.len())
+                            .map(|p| (result.u[i][p] * result.s[p]) * result.vt[p][j])
+                            .sum();
+                        assert!((reconstructed - value).abs() <= tiny);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jacobi_rescaling_avoids_intermediate_overflow_and_underflow() {
+        for (value, numerator, denominator, expected) in [
+            (1e200, 1e200, 1e100, 1e300),
+            (1e-200, 1e-200, 1e-100, 1e-300),
+            (1e200, 1e-200, 1e200, 1e-200),
+            (-1e-200, 1e200, 1e-200, -1e200),
+            (1e308, 1e-308, 1e308, 1e-308),
+        ] {
+            let actual = jacobi_rescale(value, numerator, denominator);
+            assert!(
+                (actual / expected - 1.0).abs() < 2e-14,
+                "{actual} vs {expected}"
+            );
+        }
     }
 
     #[test]
@@ -50576,6 +50998,10 @@ mod proptest_tests {
             assert!(
                 matches!(svdvals(&a, unchecked), Err(LinalgError::NonFiniteInput)),
                 "svdvals {a:?}"
+            );
+            assert!(
+                matches!(jacobi_svd(&a, unchecked), Err(LinalgError::NonFiniteInput)),
+                "jacobi_svd {a:?}"
             );
         }
         let s = svdvals(&[vec![1.0, 2.0], vec![3.0, 4.0]], unchecked).expect("finite");
