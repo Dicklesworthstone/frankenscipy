@@ -5,10 +5,12 @@
 //! The public surface mirrors the durable pieces of `scipy.odr`: data
 //! containers, model containers, an `ODR` runner, an `Output` result, a
 //! low-level `odr` helper, and the standard model factories. The solver is a
-//! conservative explicit-model implementation with a local damped
-//! Gauss-Newton/Levenberg-Marquardt loop: it estimates both fit parameters and
-//! input corrections, so weighted errors in `x` and `y` participate in the same
-//! objective.
+//! damped Gauss-Newton/Levenberg-Marquardt loop for explicit models and a
+//! quadratic-penalty continuation for implicit models. Both estimate fit
+//! parameters and input corrections. Implicit models provide one scalar
+//! equation per observation and minimize weighted input corrections subject to
+//! that equation being zero; success requires constraint convergence, not just
+//! convergence of a single penalized fit.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -66,7 +68,8 @@ impl fmt::Display for OdrError {
 
 impl std::error::Error for OdrError {}
 
-/// Data to fit, equivalent to `scipy.odr.Data` for explicit one-response data.
+/// Data to fit, equivalent to `scipy.odr.Data` for one response or implicit
+/// equation per observation. Multidimensional inputs use observation-major order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Data {
     pub x: Vec<f64>,
@@ -102,8 +105,9 @@ impl Data {
         })
     }
 
-    /// Construct implicit data. The current runner rejects implicit models, but
-    /// the container is exposed so callers can represent the SciPy shape.
+    /// Construct implicit data for a model returning one scalar equation per
+    /// observation. For `n` equations with `m` coordinates, `x` has length `n*m`
+    /// and observation `i` occupies `x[i*m..(i+1)*m]`.
     pub fn implicit(x: Vec<f64>) -> Result<Self, OdrError> {
         validate_finite_slice("x", &x)?;
         if x.is_empty() {
@@ -121,10 +125,14 @@ impl Data {
         })
     }
 
-    /// Set response weights `we`.
+    /// Set response weights `we`. For implicit data, supply one positive finite
+    /// scalar to set the initial penalty; continuation increases it as needed.
     pub fn with_response_weights(mut self, we: Vec<f64>) -> Result<Self, OdrError> {
-        let y_len = self.response()?.len();
-        validate_weight_vec("we", &we, y_len)?;
+        if let Some(y) = &self.y {
+            validate_weight_vec("we", &we, y.len())?;
+        } else {
+            validate_scale("implicit we", &we, 1)?;
+        }
         self.we = we;
         Ok(self)
     }
@@ -319,6 +327,7 @@ impl Model {
 /// Solver options for `ODR::run`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OdrOptions {
+    /// Total iteration budget, including all continuation stages for implicit fits.
     pub maxit: usize,
     pub sstol: f64,
     pub partol: f64,
@@ -456,7 +465,16 @@ impl ODR {
     /// [`Data::x`]. A single value broadcasts to every input; a vector of one
     /// value per coordinate broadcasts over observations.
     pub fn with_input_scale(mut self, scld: Vec<f64>) -> Result<Self, OdrError> {
-        expand_input_scale(&scld, self.data.x.len(), self.data.response()?.len())?;
+        if let Some(y) = &self.data.y {
+            expand_input_scale(&scld, self.data.x.len(), y.len())?;
+        } else {
+            validate_scale("scld", &scld, scld.len())?;
+            if scld.is_empty() || !self.data.x.len().is_multiple_of(scld.len()) {
+                return Err(OdrError::InvalidArgument {
+                    detail: String::from("implicit scld length must divide the input length"),
+                });
+            }
+        }
         self.scld = Some(scld);
         Ok(self)
     }
@@ -480,9 +498,7 @@ impl ODR {
 
     fn run_impl(&self, use_structured: bool) -> Result<Output, OdrError> {
         if self.model.implicit {
-            return Err(OdrError::Unsupported {
-                detail: String::from("implicit ODR models are represented but not solved yet"),
-            });
+            return self.run_implicit(use_structured);
         }
         validate_options(self.options)?;
         let y = self.data.response()?;
@@ -704,6 +720,286 @@ impl ODR {
         })
     }
 
+    /// ODRPACK's quadratic-penalty construction (NISTIR 4834, §1.B): solve
+    /// min sum(wd * delta^2) + r * sum(f(beta, x + delta)^2) for increasing r.
+    /// Each stage is an ordinary explicit ODR problem with a zero response.
+    /// Carry the original scales across stages, and charge their combined work
+    /// to one iteration budget. A converged inner fit alone is never success.
+    fn run_implicit(&self, use_structured: bool) -> Result<Output, OdrError> {
+        validate_options(self.options)?;
+        validate_beta0(&self.beta0, self.model.parameter_count)?;
+        if self.data.y.is_some() || self.options.fit_type == FitType::Ols {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from("implicit ODR requires implicit data and the ODR fit type"),
+            });
+        }
+        if self.data.x.is_empty() {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from("implicit ODR needs at least one observation"),
+            });
+        }
+        validate_finite_slice("x", &self.data.x)?;
+        // Implicit ODR's input metric must be positive definite (NISTIR 4834,
+        // §1.A.ii). Zero weights would leave a correction unpenalized.
+        validate_scale("implicit wd", &self.data.wd, self.data.x.len())?;
+        let mut penalty = if self.data.we.is_empty() {
+            10.0
+        } else {
+            validate_scale("implicit we", &self.data.we, 1)?;
+            self.data.we[0]
+        };
+        for (name, mask, expected) in [
+            ("ifixb", self.ifixb.as_deref(), self.beta0.len()),
+            ("ifixx", self.ifixx.as_deref(), self.data.x.len()),
+            ("fix", self.data.fix.as_deref(), self.data.x.len()),
+        ] {
+            if mask.is_some_and(|values| values.len() != expected) {
+                return Err(OdrError::InvalidArgument {
+                    detail: format!("{name} length must be {expected}"),
+                });
+            }
+        }
+        let delta0 = self
+            .delta0
+            .clone()
+            .unwrap_or_else(|| vec![0.0; self.data.x.len()]);
+        if delta0.len() != self.data.x.len() {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from("delta0 length must match x length"),
+            });
+        }
+        validate_finite_slice("delta0", &delta0)?;
+        if let Some(values) = &self.sclb {
+            validate_scale("sclb", values, self.beta0.len())?;
+        }
+        if let Some(values) = &self.scld {
+            validate_scale("scld", values, values.len())?;
+            if values.is_empty() || !self.data.x.len().is_multiple_of(values.len()) {
+                return Err(OdrError::InvalidArgument {
+                    detail: String::from("implicit scld length must divide the input length"),
+                });
+            }
+        }
+        let f0 = self
+            .model
+            .evaluate(&self.beta0, &add_slices(&self.data.x, &delta0));
+        validate_finite_slice("initial implicit constraints", &f0)?;
+        let observations = f0.len();
+        if observations == 0 || !self.data.x.len().is_multiple_of(observations) {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from(
+                    "implicit model must return one scalar constraint per observation, with the same number of inputs for each observation",
+                ),
+            });
+        }
+
+        let free_beta = free_indices(&freedom_mask(self.ifixb.as_deref(), self.beta0.len()));
+        let free_delta = free_indices(&freedom_mask(
+            self.ifixx.as_deref().or(self.data.fix.as_deref()),
+            self.data.x.len(),
+        ));
+        if free_beta.is_empty() && free_delta.is_empty() {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from("at least one beta or delta variable must be free"),
+            });
+        }
+        let beta_scale = self
+            .sclb
+            .clone()
+            .unwrap_or_else(|| odrpack_beta_scale(&self.beta0));
+        validate_scale("sclb", &beta_scale, self.beta0.len())?;
+        let delta_scale = match self.scld.as_deref() {
+            Some(values) => expand_input_scale(values, self.data.x.len(), observations)?,
+            None => odrpack_input_scale(&self.data.x, observations),
+        };
+        validate_scale("scld", &delta_scale, self.data.x.len())?;
+        let scale = pack_variables(&beta_scale, &delta_scale, &free_beta, &free_delta);
+        let mut variables = pack_variables(&self.beta0, &delta0, &free_beta, &free_delta);
+
+        let mut stage = self.clone();
+        stage.model.implicit = false;
+        stage.data.y = Some(vec![0.0; observations]);
+        stage.data.we = vec![1.0; observations];
+        stage.delta0 = Some(delta0.clone());
+        stage.sclb = Some(beta_scale);
+        stage.scld = Some(delta_scale);
+
+        // Measure feasibility in the model's own units. Including derivatives
+        // in scaled coordinates handles an initially exact fit and prevents a
+        // small multiplicative rescaling of f from masquerading as feasibility.
+        let residuals = |point: &[f64]| {
+            let (beta, delta) =
+                unpack_variables(point, &self.beta0, &delta0, &free_beta, &free_delta);
+            weighted_residuals(&stage.data, &stage.model, &beta, &delta)
+                .unwrap_or_else(|_| vec![f64::INFINITY; observations + self.data.x.len()])
+        };
+        let context = OdrStruct {
+            model: &stage.model,
+            data: &stage.data,
+            y: stage.data.response()?,
+            beta_template: &self.beta0,
+            delta_template: &delta0,
+            free_beta: &free_beta,
+            free_delta: &free_delta,
+            scale: &scale,
+            diff_step: self.options.diff_step,
+        };
+        let (initial_jac, initial_evals) =
+            context.dense_jac(&residuals, &variables, &residuals(&variables))?;
+        let constraint_scale: Vec<f64> = initial_jac
+            .iter()
+            .take(observations)
+            .zip(&f0)
+            .map(|(row, &value)| {
+                row.iter()
+                    .zip(&scale)
+                    .fold(value.abs(), |norm, (derivative, s)| {
+                        norm.hypot(derivative / s)
+                    })
+            })
+            .collect();
+        if constraint_scale.iter().any(|value| !value.is_finite()) {
+            return Err(OdrError::NonFiniteInput {
+                detail: String::from("implicit constraint scales must be finite"),
+            });
+        }
+        if self.data.we.is_empty() {
+            // The default continuation starts at comparable model/input scales.
+            // Without this equilibration, multiplying an equation by 1e6
+            // starts at an effective penalty 1e12 times larger and can hide
+            // the correction objective behind the constraint residuals.
+            // An explicitly supplied `we` retains its requested starting value.
+            let model_scale = constraint_scale.iter().copied().fold(0.0_f64, f64::max);
+            let resolved_scales = stage.scld.as_ref().expect("resolved input scales");
+            let input_scale = free_delta
+                .iter()
+                .map(|&i| self.data.wd[i].sqrt() / resolved_scales[i])
+                .fold(0.0_f64, f64::max);
+            if model_scale > 0.0 && input_scale > 0.0 {
+                let ratio = input_scale / model_scale;
+                let equilibrated = 10.0 * ratio * ratio;
+                if equilibrated.is_finite() && equilibrated > 0.0 {
+                    penalty = equilibrated;
+                }
+            }
+        }
+        let feasibility_tolerance = self
+            .options
+            .sstol
+            .min(self.options.partol)
+            .max(64.0 * f64::EPSILON);
+        let mut nfev = initial_evals + 2;
+        let mut njev = 1;
+        let mut nit = 0;
+
+        loop {
+            stage.data.we.fill(penalty);
+            stage.options.maxit = self.options.maxit - nit;
+            let mut result = stage.run_impl(use_structured)?;
+            nfev += result.nfev;
+            njev += result.njev;
+            // A zero-iteration convergence verdict still consumes one stage of
+            // the bounded continuation. The total never exceeds maxit.
+            nit += result.nit.max(1);
+            let next = pack_variables(&result.beta, &result.delta, &free_beta, &free_delta);
+            let step: Vec<f64> = next.iter().zip(&variables).map(|(a, b)| a - b).collect();
+            let stable = step_within_partol(&step, &variables, &scale, self.options.partol);
+            let feasible = result
+                .eps
+                .iter()
+                .zip(&constraint_scale)
+                .all(|(&value, &s)| {
+                    value == 0.0 || (s > 0.0 && (value / s).abs() <= feasibility_tolerance)
+                });
+            let stationary = if result.success && stable && feasible {
+                // A large penalty can make an inner LM step look converged
+                // while the correction objective is still moving along the
+                // constraint surface. Independently check its projected
+                // gradient; this does not contain the penalty parameter.
+                stage.data.we.fill(1.0);
+                let base_residuals: Vec<f64> = result
+                    .eps
+                    .iter()
+                    .map(|value| -value)
+                    .chain(
+                        result
+                            .delta
+                            .iter()
+                            .zip(&self.data.wd)
+                            .map(|(delta, weight)| delta * weight.sqrt()),
+                    )
+                    .collect();
+                let residuals = |point: &[f64]| {
+                    let (beta, delta) = unpack_variables(
+                        point,
+                        &result.beta,
+                        &result.delta,
+                        &free_beta,
+                        &free_delta,
+                    );
+                    weighted_residuals(&stage.data, &stage.model, &beta, &delta)
+                        .unwrap_or_else(|_| vec![f64::INFINITY; observations + self.data.x.len()])
+                };
+                let context = OdrStruct {
+                    model: &stage.model,
+                    data: &stage.data,
+                    y: stage.data.response()?,
+                    beta_template: &result.beta,
+                    delta_template: &result.delta,
+                    free_beta: &free_beta,
+                    free_delta: &free_delta,
+                    scale: &scale,
+                    diff_step: self.options.diff_step,
+                };
+                let (jac, evaluations) = context.dense_jac(&residuals, &next, &base_residuals)?;
+                nfev += evaluations;
+                njev += 1;
+                let gradient: Vec<f64> = std::iter::repeat_n(0.0, free_beta.len())
+                    .chain(free_delta.iter().enumerate().map(|(i, &j)| {
+                        self.data.wd[j] * result.delta[j] / scale[free_beta.len() + i]
+                    }))
+                    .collect();
+                implicit_projected_gradient(&jac[..observations], &scale, &gradient)
+                    <= self.options.sstol.sqrt()
+            } else {
+                false
+            };
+            result.nfev = nfev;
+            result.njev = njev;
+            result.nit = nit;
+            // Implicit ODR estimates the residual variance from the input
+            // correction objective alone, not the numerical penalty term.
+            // cov_beta is unscaled, while sd_beta carries sqrt(res_var).
+            if result.sum_square > 0.0 && result.sum_square.is_finite() {
+                let correction_fraction = result.sum_square_delta / result.sum_square;
+                result.res_var *= correction_fraction;
+                for deviation in &mut result.sd_beta {
+                    *deviation *= correction_fraction.sqrt();
+                }
+            }
+            if result.success && stable && feasible && stationary {
+                result.stopreason.push(String::from(
+                    "implicit constraints, parameters, and projected gradient converged",
+                ));
+                return Ok(result);
+            }
+            if nit >= self.options.maxit || !result.success || !(penalty * 10.0).is_finite() {
+                result.success = false;
+                if result.info < ODRPACK_NUMERICAL_ERROR {
+                    result.info = (result.info / 10) * 10 + 4;
+                    result.stopreason.push(String::from(
+                        "implicit constraints did not converge within the iteration budget",
+                    ));
+                }
+                return Ok(result);
+            }
+            stage.beta0.clone_from(&result.beta);
+            stage.delta0 = Some(result.delta);
+            variables = next;
+            penalty *= 10.0;
+        }
+    }
+
     pub fn restart(&self, additional_iterations: usize) -> Result<Output, OdrError> {
         let mut restarted = self.clone();
         restarted.options.maxit = self.options.maxit.saturating_add(additional_iterations);
@@ -724,11 +1020,14 @@ pub struct Output {
     pub cov_beta: Vec<Vec<f64>>,
     /// Input corrections: `xplus = x + delta`.
     pub delta: Vec<f64>,
-    /// Response errors as SciPy reports them: fitted minus observed (`Output::y − Data::y`).
+    /// Explicit response errors: fitted minus observed (`Output::y − Data::y`).
+    /// For implicit models these are the final constraint values `f(beta, xplus)`.
     pub eps: Vec<f64>,
     pub xplus: Vec<f64>,
+    /// Fitted explicit responses, or implicit constraint values `f(beta, xplus)`.
     pub y: Vec<f64>,
     pub res_var: f64,
+    /// Weighted correction sum plus, for implicit models, the final penalty term.
     pub sum_square: f64,
     pub sum_square_delta: f64,
     pub sum_square_eps: f64,
@@ -1206,6 +1505,67 @@ fn weighted_sum_square(values: &[f64], weights: &[f64]) -> f64 {
         .zip(weights.iter())
         .map(|(value, weight)| weight * value * value)
         .sum()
+}
+
+/// Fraction of the scaled correction gradient tangent to the constraint
+/// surface. At a constrained stationary point the gradient is in the span of
+/// the constraint gradients. Pivoted Householder projection avoids both a
+/// normal-equation condition-number square and a penalty-dependent test.
+fn implicit_projected_gradient(jac: &[Vec<f64>], scale: &[f64], gradient: &[f64]) -> f64 {
+    let norm = nrm2(gradient);
+    if norm == 0.0 {
+        return 0.0;
+    }
+    if !norm.is_finite() {
+        return f64::INFINITY;
+    }
+    let mut remainder: Vec<f64> = gradient.iter().map(|value| value / norm).collect();
+    let mut columns: Vec<Vec<f64>> = jac
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(scale)
+                .map(|(derivative, s)| derivative / s)
+                .collect()
+        })
+        .collect();
+    for column in &mut columns {
+        let length = nrm2(column);
+        if !length.is_finite() {
+            return f64::INFINITY;
+        }
+        if length > 0.0 {
+            for value in column {
+                *value /= length;
+            }
+        }
+    }
+    let mut rank = 0;
+    for pivot in 0..columns.len().min(gradient.len()) {
+        let Some(best) = (pivot..columns.len())
+            .max_by(|&a, &b| nrm2(&columns[a][rank..]).total_cmp(&nrm2(&columns[b][rank..])))
+        else {
+            break;
+        };
+        if nrm2(&columns[best][rank..]) <= 64.0 * f64::EPSILON {
+            break;
+        }
+        columns.swap(pivot, best);
+        let (_, remaining) = columns.split_at_mut(pivot);
+        let (column, later) = remaining
+            .split_first_mut()
+            .expect("selected constraint column");
+        let reflector = &mut column[rank..];
+        if householder_reflector(reflector).is_none() {
+            break;
+        }
+        apply_householder(reflector, &mut remainder[rank..]);
+        for column in later {
+            apply_householder(reflector, &mut column[rank..]);
+        }
+        rank += 1;
+    }
+    nrm2(&remainder[rank..])
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3423,6 +3783,591 @@ mod tests {
         };
         let err = ODR::new(data, unilinear(), vec![0.0]);
         assert!(err.is_err());
+    }
+
+    fn implicit_circle_model(analytic: bool) -> Model {
+        let model = Model::new(|beta, x| {
+            x.chunks_exact(2)
+                .map(|point| {
+                    (point[0] - beta[0]).powi(2) + (point[1] - beta[1]).powi(2) - beta[2].powi(2)
+                })
+                .collect()
+        })
+        .implicit(true)
+        .with_parameter_count(3);
+        if analytic {
+            model
+                .with_fjacb(|beta, x| {
+                    x.chunks_exact(2)
+                        .map(|point| {
+                            vec![
+                                -2.0 * (point[0] - beta[0]),
+                                -2.0 * (point[1] - beta[1]),
+                                -2.0 * beta[2],
+                            ]
+                        })
+                        .collect()
+                })
+                .with_fjacd(|beta, x| {
+                    x.chunks_exact(2)
+                        .map(|point| vec![2.0 * (point[0] - beta[0]), 2.0 * (point[1] - beta[1])])
+                        .collect()
+                })
+        } else {
+            model
+        }
+    }
+
+    fn implicit_circle_data() -> Vec<f64> {
+        (0..16)
+            .flat_map(|i| {
+                let angle = std::f64::consts::TAU * i as f64 / 16.0;
+                let radius = 3.0 + 0.03 * ((i % 5) as f64 - 2.0);
+                [1.0 + radius * angle.cos(), -2.0 + radius * angle.sin()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn implicit_circle_continuation_enforces_constraints() -> Result<(), OdrError> {
+        for analytic in [false, true] {
+            let fit = ODR::new(
+                Data::implicit(implicit_circle_data())?,
+                implicit_circle_model(analytic),
+                vec![0.8, -1.8, 2.8],
+            )?
+            .with_options(OdrOptions {
+                maxit: 150,
+                sstol: 1.0e-10,
+                partol: 1.0e-8,
+                ..OdrOptions::default()
+            })?
+            .run()?;
+            println!(
+                "implicit circle analytic={analytic}: {:?}; input_ss={}; nit={}; stop={:?}",
+                fit.beta, fit.sum_square_delta, fit.nit, fit.stopreason
+            );
+            assert!(fit.success);
+            assert!(fit.nit <= 150);
+            assert!(fit.eps.iter().all(|f| f.abs() < 1.0e-7));
+            assert_vec_close(&fit.beta, &[0.99187421, -2.00005068, 2.99625549], 5.0e-7);
+            assert_close(fit.sum_square_delta, 0.029_845_886_988_293_276, 1.0e-8);
+            for point in fit.xplus.chunks_exact(2) {
+                assert_close(
+                    (point[0] - fit.beta[0]).hypot(point[1] - fit.beta[1]),
+                    fit.beta[2],
+                    1.0e-7,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_constraints_are_invariant_to_model_units() -> Result<(), OdrError> {
+        for factor in [1.0e-6, 1.0, 1.0e6] {
+            let mut model = implicit_circle_model(true);
+            let function = model.fcn.clone();
+            model.fcn = Arc::new(move |beta, x| {
+                function(beta, x).into_iter().map(|f| factor * f).collect()
+            });
+            let beta_jacobian = model.fjacb.take().unwrap();
+            model.fjacb = Some(Arc::new(move |beta, x| {
+                beta_jacobian(beta, x)
+                    .into_iter()
+                    .map(|row| row.into_iter().map(|v| factor * v).collect())
+                    .collect()
+            }));
+            let input_jacobian = model.fjacd.take().unwrap();
+            model.fjacd = Some(Arc::new(move |beta, x| {
+                input_jacobian(beta, x)
+                    .into_iter()
+                    .map(|row| row.into_iter().map(|v| factor * v).collect())
+                    .collect()
+            }));
+            let fit = ODR::new(
+                Data::implicit(implicit_circle_data())?,
+                model,
+                vec![0.8, -1.8, 2.8],
+            )?
+            .with_options(OdrOptions {
+                maxit: 150,
+                sstol: 1.0e-10,
+                partol: 1.0e-8,
+                ..OdrOptions::default()
+            })?
+            .run()?;
+            assert!(fit.success, "factor={factor}: {:?}", fit.stopreason);
+            assert_vec_close(&fit.beta, &[0.99187421, -2.00005068, 2.99625549], 5e-7);
+            assert!(fit.eps.iter().all(|&f| (f / factor).abs() < 1e-7));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_odr_refuses_false_success_and_bad_shapes() -> Result<(), OdrError> {
+        let infeasible = ODR::new(
+            Data::implicit(vec![1.0, 2.0, 3.0])?,
+            Model::new(|_, x| vec![1.0; x.len()]).implicit(true),
+            vec![1.0],
+        )?
+        .with_options(OdrOptions {
+            maxit: 5,
+            ..OdrOptions::default()
+        })?
+        .run()?;
+        assert!(!infeasible.success);
+        assert_eq!(infeasible.info % 10, 4);
+        assert_eq!(infeasible.nit, 5);
+        assert!(
+            Data::implicit(vec![1.0])?
+                .with_response_weights(vec![1.0, 2.0])
+                .is_err()
+        );
+        assert!(
+            Data::implicit(vec![1.0])?
+                .with_response_weights(vec![0.0])
+                .is_err()
+        );
+        let invalid = ODR::new(
+            Data::implicit(vec![1.0, 2.0, 3.0])?,
+            Model::new(|_, _| vec![0.0, 0.0]).implicit(true),
+            vec![1.0],
+        )?
+        .run();
+        assert!(matches!(invalid, Err(OdrError::InvalidArgument { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_projected_gradient_detects_tangent_descent() {
+        for factor in [1.0e-100, 1.0, 1.0e100] {
+            let constraints = vec![vec![factor, factor], vec![2.0 * factor, 2.0 * factor]];
+            assert!(implicit_projected_gradient(&constraints, &[1.0, 1.0], &[1.0, 1.0]) < 1.0e-14);
+            assert_close(
+                implicit_projected_gradient(&constraints, &[1.0, 1.0], &[1.0, -1.0]),
+                1.0,
+                1.0e-14,
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_weighted_line_matches_explicit_geometry_and_fixed_masks() -> Result<(), OdrError> {
+        let x = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let y = vec![1.20, 2.90, 5.15, 6.80, 9.10, 10.95, 13.12];
+        let wx = vec![1.0, 2.0, 4.0, 1.5, 3.0, 1.0, 2.0];
+        let wy = vec![4.0, 1.0, 2.0, 3.0, 1.0, 4.0, 2.0];
+        let model = Model::new(|beta, points| {
+            points
+                .chunks_exact(2)
+                .map(|point| beta[0] * point[0] + beta[1] - point[1])
+                .collect()
+        })
+        .with_fjacb(|_, points| {
+            points
+                .chunks_exact(2)
+                .map(|point| vec![point[0], 1.0])
+                .collect()
+        })
+        .with_fjacd(|beta, points| {
+            points
+                .chunks_exact(2)
+                .map(|_| vec![beta[0], -1.0])
+                .collect()
+        })
+        .implicit(true);
+        let options = OdrOptions {
+            maxit: 100,
+            sstol: 1.0e-10,
+            partol: 1.0e-8,
+            ..OdrOptions::default()
+        };
+        for fixed in [false, true] {
+            let beta_free = vec![true, !fixed];
+            let x_free: Vec<bool> = (0..x.len()).map(|i| !fixed || i % 3 != 0).collect();
+            let explicit = ODR::new(
+                Data::new(x.clone(), y.clone())?
+                    .with_input_weights(wx.clone())?
+                    .with_response_weights(wy.clone())?,
+                unilinear(),
+                vec![1.5, 1.0],
+            )?
+            .with_beta_free(beta_free.clone())?
+            .with_input_free(x_free.clone())?
+            .with_beta_scale(vec![0.5, 2.0])?
+            .with_input_scale(vec![2.0])?
+            .with_options(options)?
+            .run()?;
+            assert!(explicit.success);
+            let points = x.iter().zip(&y).flat_map(|(&a, &b)| [a, b]).collect();
+            let weights = wx.iter().zip(&wy).flat_map(|(&a, &b)| [a, b]).collect();
+            let freedoms = x_free.iter().flat_map(|&free| [free, true]).collect();
+            let implicit = ODR::new(
+                Data::implicit(points)?.with_input_weights(weights)?,
+                model.clone(),
+                vec![1.5, 1.0],
+            )?
+            .with_beta_free(beta_free)?
+            .with_input_free(freedoms)?
+            .with_beta_scale(vec![0.5, 2.0])?
+            .with_input_scale(vec![2.0, 0.5])?
+            .with_options(options)?
+            .run()?;
+            println!(
+                "weighted line fixed={fixed}: {:?}, {:?}",
+                implicit.beta, implicit.stopreason
+            );
+            assert!(implicit.success);
+            assert_vec_close(&implicit.beta, &explicit.beta, 1.0e-6);
+            assert_close(implicit.sum_square_delta, explicit.sum_square, 1.0e-8);
+            let implicit_dof = x.len() - if fixed { 1 } else { 2 };
+            assert_close(
+                implicit.res_var,
+                implicit.sum_square_delta / implicit_dof as f64,
+                1.0e-12,
+            );
+            if fixed {
+                // SciPy 1.17.1 / NumPy 2.4.3: the explicit fit excludes x=0 from
+                // its derivative-based observation count because both x and the
+                // intercept are fixed. The implicit fit still adjusts that
+                // point's y coordinate, so its residual degrees of freedom are
+                // 6 instead of 5 even though the geometry and VCV agree.
+                assert_close(explicit.res_var, 0.066_392_164_200_305_83, 1.0e-10);
+                assert_close(implicit.res_var, 0.055_326_803_144_315_21, 1.0e-8);
+            } else {
+                assert_close(implicit.res_var, explicit.res_var, 1.0e-8);
+            }
+            // Eliminate the input corrections analytically at each fitted beta.
+            // A slope error is amplified by x_i (exactly so for a fixed x),
+            // making a uniform absolute comparison between two converged fits
+            // misleading. Check each solver's closest point directly, then
+            // propagate their actual parameter difference through that geometry.
+            let closest_point = |beta: &[f64], i: usize| {
+                let residual = beta[0] * x[i] + beta[1] - y[i];
+                let dx = if x_free[i] {
+                    -wy[i] * beta[0] * residual / (wx[i] + wy[i] * beta[0].powi(2))
+                } else {
+                    0.0
+                };
+                [dx, residual + beta[0] * dx]
+            };
+            let projection_tolerance = 1.0e-6;
+            let mut largest_projection_error = 0.0_f64;
+            for i in 0..x.len() {
+                let implicit_projection = closest_point(&implicit.beta, i);
+                let explicit_projection = closest_point(&explicit.beta, i);
+                for (coordinate, explicit_correction) in
+                    [explicit.delta[i], explicit.eps[i]].into_iter().enumerate()
+                {
+                    largest_projection_error = largest_projection_error.max(
+                        (implicit.delta[2 * i + coordinate] - implicit_projection[coordinate])
+                            .abs(),
+                    );
+                    assert_close(
+                        implicit.delta[2 * i + coordinate],
+                        implicit_projection[coordinate],
+                        projection_tolerance,
+                    );
+                    assert_close(
+                        explicit_correction,
+                        explicit_projection[coordinate],
+                        projection_tolerance,
+                    );
+                    let propagated_error =
+                        (implicit_projection[coordinate] - explicit_projection[coordinate]).abs();
+                    assert_close(
+                        implicit.delta[2 * i + coordinate],
+                        explicit_correction,
+                        propagated_error + 2.0 * projection_tolerance,
+                    );
+                }
+                if !x_free[i] {
+                    assert_eq!(implicit.delta[2 * i], 0.0);
+                }
+            }
+            println!(
+                "weighted line fixed={fixed}: max closest-point error={largest_projection_error:.3e}"
+            );
+            for (actual, expected) in implicit.cov_beta.iter().zip(&explicit.cov_beta) {
+                assert_vec_close(actual, expected, 1.0e-6);
+            }
+            if fixed {
+                assert_eq!(implicit.beta[1], 1.0);
+                assert_eq!(implicit.cov_beta[1], vec![0.0, 0.0]);
+                // The unique root of the analytically profiled objective's
+                // derivative; independently agrees with pinned SciPy's slope.
+                let optimum = [1.999_364_564_376_978, 1.0];
+                assert_close(implicit.beta[0], optimum[0], 3.0e-7);
+                for i in 0..x.len() {
+                    let fitted = closest_point(&implicit.beta, i);
+                    let optimal = closest_point(&optimum, i);
+                    for coordinate in 0..2 {
+                        assert_close(
+                            implicit.delta[2 * i + coordinate],
+                            optimal[coordinate],
+                            (fitted[coordinate] - optimal[coordinate]).abs() + projection_tolerance,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn implicit_ellipse_model(analytic: bool) -> Model {
+        let model = Model::new(|beta, x| {
+            x.chunks_exact(2)
+                .map(|point| {
+                    ((point[0] - beta[0]) / beta[2]).powi(2)
+                        + ((point[1] - beta[1]) / beta[3]).powi(2)
+                        - 1.0
+                })
+                .collect()
+        })
+        .implicit(true)
+        .with_parameter_count(4);
+        if analytic {
+            model
+                .with_fjacb(|beta, x| {
+                    x.chunks_exact(2)
+                        .map(|point| {
+                            let dx = point[0] - beta[0];
+                            let dy = point[1] - beta[1];
+                            vec![
+                                -2.0 * dx / beta[2].powi(2),
+                                -2.0 * dy / beta[3].powi(2),
+                                -2.0 * dx.powi(2) / beta[2].powi(3),
+                                -2.0 * dy.powi(2) / beta[3].powi(3),
+                            ]
+                        })
+                        .collect()
+                })
+                .with_fjacd(|beta, x| {
+                    x.chunks_exact(2)
+                        .map(|point| {
+                            vec![
+                                2.0 * (point[0] - beta[0]) / beta[2].powi(2),
+                                2.0 * (point[1] - beta[1]) / beta[3].powi(2),
+                            ]
+                        })
+                        .collect()
+                })
+        } else {
+            model
+        }
+    }
+
+    /// This std-only crate can exercise the real public solver and live oracle
+    /// without compiling the entire numerical workspace. Enable with
+    /// SCIPY_PYTHON=<pinned interpreter> or FSCI_REQUIRE_SCIPY_ORACLE=1.
+    #[test]
+    fn implicit_circle_and_ellipse_match_live_scipy() -> Result<(), OdrError> {
+        let required = std::env::var_os("FSCI_REQUIRE_SCIPY_ORACLE").is_some();
+        let python = match std::env::var_os("SCIPY_PYTHON") {
+            Some(path) => path,
+            None if required => "python3".into(),
+            None => {
+                eprintln!(
+                    "implicit ODR live oracle skipped: set SCIPY_PYTHON to enable the pinned comparison"
+                );
+                return Ok(());
+            }
+        };
+        let options = OdrOptions {
+            maxit: 200,
+            sstol: 1.0e-10,
+            partol: 1.0e-8,
+            ..OdrOptions::default()
+        };
+        let circle = implicit_circle_data();
+        let weights: Vec<f64> = (0..circle.len())
+            .map(|i| {
+                if i % 2 == 0 {
+                    0.4 + 0.1 * ((i / 2) % 5) as f64
+                } else {
+                    4.0
+                }
+            })
+            .collect();
+        let mut cases = Vec::new();
+        for analytic in [false, true] {
+            cases.push((
+                "circle",
+                ODR::new(
+                    Data::implicit(circle.clone())?,
+                    implicit_circle_model(analytic),
+                    vec![0.8, -1.8, 2.8],
+                )?
+                .with_options(options)?,
+            ));
+        }
+        cases.push((
+            "circle",
+            ODR::new(
+                Data::implicit(circle.clone())?.with_input_weights(weights.clone())?,
+                implicit_circle_model(true),
+                vec![0.8, -1.8, 2.8],
+            )?
+            .with_options(options)?,
+        ));
+        cases.push((
+            "circle",
+            ODR::new(
+                Data::implicit(circle)?.with_input_weights(weights)?,
+                implicit_circle_model(true),
+                vec![0.8, -2.0, 2.8],
+            )?
+            .with_beta_free(vec![true, false, true])?
+            .with_input_free((0..32).map(|i| i % 2 != 0 || (i / 2) % 7 != 3).collect())?
+            .with_options(options)?,
+        ));
+        let ellipse: Vec<f64> = (0..20)
+            .flat_map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / 20.0;
+                [
+                    0.5 + 3.0 * t.cos() + 0.02 * ((i % 5) as f64 - 2.0),
+                    -0.8 + 1.5 * t.sin() + 0.015 * ((i % 7) as f64 - 3.0),
+                ]
+            })
+            .collect();
+        cases.push((
+            "ellipse",
+            ODR::new(
+                Data::implicit(ellipse.clone())?,
+                implicit_ellipse_model(false),
+                vec![0.3, -0.7, 2.5, 1.0],
+            )?
+            .with_options(options)?,
+        ));
+        let ellipse_weights = (0..ellipse.len())
+            .map(|i| if i % 2 == 0 { 2.0 } else { 0.5 })
+            .collect();
+        cases.push((
+            "ellipse",
+            ODR::new(
+                Data::implicit(ellipse)?.with_input_weights(ellipse_weights)?,
+                implicit_ellipse_model(true),
+                vec![0.3, -0.7, 2.5, 1.0],
+            )?
+            .with_beta_scale(vec![2.0, 0.5, 1.0 / 3.0, 2.0 / 3.0])?
+            .with_input_scale(vec![1.0 / 3.0, 2.0 / 3.0])?
+            .with_options(options)?,
+        ));
+
+        let script = r#"
+import json, sys
+import numpy as np
+import scipy
+from scipy import odr
+case = json.loads(sys.argv[1])
+x = np.asarray(case['x']).reshape(-1, 2).T
+wd = np.asarray(case['wd']).reshape(-1, 2).T
+fixed_x = np.asarray(case['free_x'], dtype=int).reshape(-1, 2).T
+if case['kind'] == 'circle':
+    f = lambda b, x: (x[0]-b[0])**2 + (x[1]-b[1])**2 - b[2]**2
+    jb = lambda b, x: np.array([-2*(x[0]-b[0]), -2*(x[1]-b[1]), np.full(x.shape[1], -2*b[2])])
+    jd = lambda b, x: np.array([2*(x[0]-b[0]), 2*(x[1]-b[1])])
+else:
+    f = lambda b, x: ((x[0]-b[0])/b[2])**2 + ((x[1]-b[1])/b[3])**2 - 1
+    jb = lambda b, x: np.array([-2*(x[0]-b[0])/b[2]**2, -2*(x[1]-b[1])/b[3]**2, -2*(x[0]-b[0])**2/b[2]**3, -2*(x[1]-b[1])**2/b[3]**3])
+    jd = lambda b, x: np.array([2*(x[0]-b[0])/b[2]**2, 2*(x[1]-b[1])/b[3]**2])
+model = odr.Model(f, fjacb=jb if case['analytic'] else None,
+                  fjacd=jd if case['analytic'] else None, implicit=True)
+solver = odr.ODR(odr.Data(x, y=1, wd=wd), model, beta0=case['beta0'],
+                 ifixb=case['free_beta'], ifixx=fixed_x,
+                 sclb=case['sclb'], scld=case['scld'], maxit=200,
+                 sstol=1e-10, partol=1e-10)
+if case['analytic']:
+    solver.set_job(deriv=3)
+out = solver.run()
+assert out.info % 10 in (1, 2, 3), (out.info, out.stopreason)
+print(scipy.__version__, np.__version__)
+values = list(out.beta) + list(out.delta.T.ravel()) + list(out.cov_beta.ravel())
+values += list(out.sd_beta) + [out.res_var, out.sum_square_delta]
+print(' '.join(format(float(value), '.17g') for value in values))
+"#;
+        let mut compared = 0;
+        for (kind, solver) in cases {
+            let free_beta = freedom_mask(solver.ifixb.as_deref(), solver.beta0.len());
+            let free_x = freedom_mask(solver.ifixx.as_deref(), solver.data.x.len());
+            let sclb = solver
+                .sclb
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |v| format!("{v:?}"));
+            let scld = solver
+                .scld
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |v| format!("{v:?}"));
+            let query = format!(
+                "{{\"kind\":{kind:?},\"x\":{:?},\"wd\":{:?},\"beta0\":{:?},\"free_beta\":{free_beta:?},\"free_x\":{free_x:?},\"sclb\":{sclb},\"scld\":{scld},\"analytic\":{}}}",
+                solver.data.x,
+                solver.data.wd,
+                solver.beta0,
+                solver.model.fjacb.is_some()
+            );
+            let oracle = std::process::Command::new(&python)
+                .args(["-c", script, &query])
+                .env("OPENBLAS_NUM_THREADS", "1")
+                .env("OMP_NUM_THREADS", "1")
+                .output()
+                .expect("launch pinned SciPy implicit ODR oracle");
+            assert!(
+                oracle.status.success(),
+                "SciPy implicit ODR failed: {}",
+                String::from_utf8_lossy(&oracle.stderr)
+            );
+            let stdout = String::from_utf8(oracle.stdout).expect("SciPy oracle emits UTF-8");
+            let mut lines = stdout.lines();
+            assert_eq!(
+                lines.next(),
+                Some("1.17.1 2.4.3"),
+                "implicit ODR oracle must be the pinned incumbent"
+            );
+            let expected: Vec<f64> = lines
+                .next()
+                .expect("oracle values")
+                .split_whitespace()
+                .map(|s| s.parse().expect("finite SciPy value"))
+                .collect();
+            let actual = solver.run()?;
+            assert!(actual.success, "{kind}: {:?}", actual.stopreason);
+            let p = actual.beta.len();
+            let d = actual.delta.len();
+            assert_eq!(expected.len(), p + d + p * p + p + 2);
+            for (&value, &reference) in actual.beta.iter().chain(&actual.delta).zip(&expected) {
+                assert_close(value, reference, 2.0e-6 * (1.0 + reference.abs()));
+            }
+            let covariance = expected[p + d..p + d + p * p].iter();
+            for (&value, &reference) in actual.cov_beta.iter().flatten().zip(covariance) {
+                assert_close(value, reference, 5.0e-7 + 2.0e-4 * reference.abs());
+            }
+            for (&value, &reference) in actual.sd_beta.iter().zip(&expected[p + d + p * p..]) {
+                assert_close(value, reference, 5.0e-7 + 2.0e-4 * reference.abs());
+            }
+            assert_close(
+                actual.res_var,
+                expected[expected.len() - 2],
+                1.0e-8 + 1.0e-6 * actual.res_var.abs(),
+            );
+            assert_close(
+                actual.sum_square_delta,
+                expected[expected.len() - 1],
+                1.0e-8 + 1.0e-6 * actual.sum_square_delta.abs(),
+            );
+            compared += 1;
+            println!(
+                "implicit ODR live SciPy: {kind} analytic={} compared={compared} beta={:?} input_ss={:.12e}",
+                solver.model.fjacb.is_some(),
+                actual.beta,
+                actual.sum_square_delta
+            );
+        }
+        assert_eq!(
+            compared, 6,
+            "every implicit ODR fixture must actually compare"
+        );
+        Ok(())
     }
 
     #[test]
