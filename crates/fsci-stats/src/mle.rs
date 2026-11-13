@@ -11,13 +11,20 @@
 //! continuous base distribution. [`fit_mle_location_scale`] and
 //! [`fit_mle_location_scale_censored`] fit its shapes, location, and scale with
 //! the same explicit bounds and fixed-parameter masks.
+//!
+//! [`fit_mle_discrete`] fits signed integer observations with finite parameter
+//! bounds using differential evolution. Integer shape parameters are enforced
+//! throughout the search, and equal bounds hold parameters exactly fixed.
 
-use fsci_opt::{MinimizeMethodOptions, MinimizeOptions, OptimizeMethod, minimize};
+pub use fsci_opt::DifferentialEvolutionOptions;
+use fsci_opt::{
+    MinimizeMethodOptions, MinimizeOptions, OptimizeMethod, differential_evolution, minimize,
+};
 use rand::Rng;
 
 use crate::{
-    CensoredData, ContinuousDistribution, FitError, RuntimeMode, StatsError, active_stats_mode,
-    hardened_max_sample_len,
+    CensoredData, ContinuousDistribution, DiscreteDistribution, FitError, RuntimeMode, StatsError,
+    active_stats_mode, hardened_max_sample_len,
 };
 
 /// The continuous distribution of `X = loc + scale * Z` for a base `Z`.
@@ -759,6 +766,151 @@ where
         make_distribution,
         options,
     )
+}
+
+/// Fit a discrete likelihood model with bounded real and integer parameters.
+///
+/// This supplies the bounded maximum-likelihood workflow of `scipy.stats.fit`
+/// for any [`DiscreteDistribution`], including families whose trait-level
+/// `try_fit` is unavailable. Observations remain signed integers throughout.
+/// `bounds` gives a finite closed interval for each parameter in the order
+/// expected by `make_distribution`; equal bounds fix that parameter exactly.
+/// Mark integer shape parameters in [`DifferentialEvolutionOptions::integrality`].
+/// An empty mask means all parameters are real. The optimizer applies the
+/// integer restrictions before calling the factory, including at initialization.
+///
+/// The factory defines the model's parameterization and must return `None` for
+/// invalid parameter combinations instead of calling a panicking constructor.
+/// No location or scale parameter is introduced implicitly. A model factory
+/// that includes a discrete location must mark it as integral too. Parameter
+/// domains cannot be inferred from a generic distribution type: callers supply
+/// their intersection with the requested search bounds.
+///
+/// Differential evolution searches globally within those bounds, with the
+/// seed, population, generation budget and objective-spread tolerance given by
+/// `options`. It is stochastic and does not certify the global optimum. This
+/// driver does not perform a continuous polishing step that could violate the
+/// integer constraints. Exhausting the generation budget returns
+/// [`FitError::NonConvergent`], even when an approximate candidate is available.
+///
+/// A finite support penalty guides trial distributions past out-of-support
+/// observations. A successful result must have finite, nonpositive `logpmf`
+/// at every observation; a penalized candidate is never reported as a fit.
+/// Repeated observations are counted once and evaluated with their exact
+/// multiplicities, without expanding or mutating the input. The returned
+/// likelihood is the total unpenalized negative log likelihood, suitable for
+/// model comparison. Hardened mode enforces the usual fit sample-size cap
+/// before allocating the frequency table or invoking user code.
+///
+/// ```
+/// use fsci_stats::mle::DifferentialEvolutionOptions;
+/// use fsci_stats::{Binomial, fit_mle_discrete};
+///
+/// let fitted = fit_mle_discrete(
+///     &[1, 3, 4, 2, 0, 5, 2, 3],
+///     &[(10.0, 10.0), (0.0, 1.0)],
+///     |p| Some(Binomial::new(p[0] as u64, p[1])),
+///     DifferentialEvolutionOptions {
+///         integrality: vec![true, false],
+///         seed: Some(42),
+///         tol: 1e-12,
+///         ..Default::default()
+///     },
+/// ).unwrap();
+/// assert_eq!(fitted.distribution.n, 10);
+/// assert!((fitted.distribution.p - 0.25).abs() < 1e-5);
+/// ```
+pub fn fit_mle_discrete<D, F>(
+    data: &[i64],
+    bounds: &[(f64, f64)],
+    make_distribution: F,
+    options: DifferentialEvolutionOptions,
+) -> Result<MleResult<D>, FitError>
+where
+    D: DiscreteDistribution,
+    F: Fn(&[f64]) -> Option<D>,
+{
+    if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+        return Err(FitError::ResourceExhausted {
+            detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+        });
+    }
+    if data.is_empty() {
+        return Err(FitError::InsufficientData {
+            required: 1,
+            actual: 0,
+        });
+    }
+    let mut frequencies = std::collections::BTreeMap::<i64, usize>::new();
+    for &observation in data {
+        *frequencies.entry(observation).or_default() += 1;
+    }
+    let penalty = 100.0 * f64::MAX.ln();
+    let n = data.len() as f64;
+    let objective = |parameters: &[f64]| {
+        let Some(distribution) = make_distribution(parameters) else {
+            return f64::MAX / 16.0;
+        };
+        let mut mean_nll = 0.0;
+        let mut correction = 0.0;
+        for (&observation, &count) in &frequencies {
+            let log_mass = distribution.logpmf(observation);
+            let contribution = if log_mass.is_finite() && log_mass <= 0.0 {
+                -log_mass
+            } else {
+                penalty
+            };
+            let term = (count as f64 / n) * contribution - correction;
+            let next = mean_nll + term;
+            correction = (next - mean_nll) - term;
+            mean_nll = next;
+        }
+        if mean_nll.is_finite() {
+            mean_nll
+        } else {
+            f64::MAX / 16.0
+        }
+    };
+    let result = differential_evolution(objective, bounds, options).map_err(|error| {
+        FitError::UnsupportedData(format!(
+            "invalid discrete MLE search specification: {error}"
+        ))
+    })?;
+    if !result.success {
+        return Err(FitError::NonConvergent(format!(
+            "{} ({} generations, {} evaluations)",
+            result.message, result.nit, result.nfev
+        )));
+    }
+    let distribution = make_distribution(&result.x).ok_or_else(|| {
+        FitError::NonConvergent("discrete MLE parameters are outside the model's domain".into())
+    })?;
+    let mut nll = 0.0;
+    let mut correction = 0.0;
+    for (&observation, &count) in &frequencies {
+        let log_mass = distribution.logpmf(observation);
+        if !log_mass.is_finite() || log_mass > 0.0 {
+            return Err(FitError::NonConvergent(format!(
+                "discrete MLE has invalid or zero probability at observation {observation}"
+            )));
+        }
+        let term = -(count as f64) * log_mass - correction;
+        let next = nll + term;
+        correction = (next - nll) - term;
+        nll = next;
+    }
+    if !nll.is_finite() {
+        return Err(FitError::NonConvergent(
+            "discrete MLE negative log likelihood is not finite".into(),
+        ));
+    }
+    Ok(MleResult {
+        distribution,
+        parameters: result.x,
+        negative_log_likelihood: nll,
+        iterations: result.nit,
+        evaluations: result.nfev,
+    })
 }
 
 /// Fit a continuous distribution to exact, left-, right-, or interval-censored
