@@ -29175,7 +29175,7 @@ impl ContinuousDistribution for RecipInvGauss {
     }
 }
 
-/// Doubly-truncated Weibull minimum distribution on (a, b].
+/// Doubly-truncated Weibull minimum distribution on [a, b].
 ///
 /// Matches `scipy.stats.truncweibull_min(c, a, b)` with shape
 /// `c > 0` and bounds `0 ≤ a < b`. Resolves [frankenscipy-op097].
@@ -29200,6 +29200,46 @@ impl TruncWeibullMin {
         assert!(b > a && b.is_finite(), "b must be > a and finite");
         Self { c, a, b }
     }
+
+    /// log(upper^c-lower^c), retaining narrow intervals and power
+    /// differences whose ordinary representation overflows or underflows.
+    fn log_power_difference(&self, lower: f64, upper: f64) -> f64 {
+        if lower == upper {
+            return f64::NEG_INFINITY;
+        }
+        if lower == 0.0 {
+            return self.c * upper.ln();
+        }
+        let relative_width = (upper - lower) / lower;
+        let log_ratio = if relative_width.is_finite() {
+            relative_width.ln_1p()
+        } else {
+            upper.ln() - lower.ln()
+        };
+        let t = self.c * log_ratio;
+        if t < 1.0e-3 {
+            // log(expm1(t)/t), including t rounded to zero.
+            let square = t * t;
+            self.c * lower.ln() + self.c.ln() + log_ratio.ln()
+                + 0.5 * t + square / 24.0 - square * square / 2880.0
+        } else if t <= std::f64::consts::LN_2 {
+            self.c * lower.ln() + t.exp_m1().ln()
+        } else {
+            self.c * upper.ln() + (-(-t).exp()).ln_1p()
+        }
+    }
+
+    /// log(1-exp(-(upper^c-lower^c))), without losing a small power gap.
+    fn log_relative_mass(&self, lower: f64, upper: f64) -> f64 {
+        let log_gap = self.log_power_difference(lower, upper);
+        let gap = log_gap.exp();
+        if gap < 1.0e-3 {
+            let square = gap * gap;
+            log_gap - 0.5 * gap + square / 24.0 - square * square / 2880.0
+        } else {
+            (-(-gap).exp_m1()).ln()
+        }
+    }
 }
 
 impl ContinuousDistribution for TruncWeibullMin {
@@ -29208,19 +29248,27 @@ impl ContinuousDistribution for TruncWeibullMin {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if !(self.a < x && x <= self.b) {
-            return 0.0;
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        // SciPy includes both endpoints. In particular, an estimated lower
+        // truncation endpoint must retain its finite boundary density.
+        if x < self.a || x > self.b {
+            return f64::NEG_INFINITY;
         }
-        // Rewrite as c·x^(c-1)·exp(a^c - x^c) / (-expm1(a^c - b^c))
-        // to avoid underflow when both exp(-a^c) and exp(-b^c) are
-        // tiny (e.g., c=10, a=10 → a^c = 1e10). The naive denom
-        // exp(-a^c) - exp(-b^c) becomes 0/0 = NaN there.
-        // Resolves [frankenscipy-li9bu] (fuzz finding kin4s).
-        let ac = self.a.powf(self.c);
-        let xc = x.powf(self.c);
-        let bc = self.b.powf(self.c);
-        let denom_log = -(ac - bc).exp_m1(); // 1 - exp(a^c - b^c) > 0
-        self.c * x.powf(self.c - 1.0) * (ac - xc).exp() / denom_log
+        if x == 0.0 {
+            return if self.c < 1.0 {
+                f64::INFINITY
+            } else if self.c > 1.0 {
+                f64::NEG_INFINITY
+            } else {
+                -self.log_relative_mass(self.a, self.b)
+            };
+        }
+        self.c.ln() + (self.c - 1.0) * x.ln()
+            - self.log_power_difference(self.a, x).exp()
+            - self.log_relative_mass(self.a, self.b)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -29666,10 +29714,32 @@ impl ContinuousDistribution for TruncPareto {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if !(1.0..=self.c).contains(&x) {
-            return 0.0;
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        if x < 1.0 || x > self.c {
+            return f64::NEG_INFINITY;
         }
-        self.b * x.powf(-self.b - 1.0) / self.denom()
+        let width = self.c.ln();
+        let rate = self.b.abs();
+        let tilt = rate * width;
+        // The b -> 0 limit is log-uniform. Computing log(b) minus
+        // log(1-exp(-b*width)) directly loses that limit when b is tiny.
+        let normalization = if tilt < 1.0e-3 {
+            let square = tilt * tilt;
+            -width.ln() + 0.5 * tilt - square / 24.0 + square * square / 2880.0
+        } else {
+            rate.ln() - (-(-tilt).exp_m1()).ln()
+        };
+        let distance = if self.b > 0.0 {
+            x.ln()
+        } else {
+            // For a negative tilt, factor the density at the upper bound.
+            // log1p retains differences when x is very close to c.
+            ((self.c - x) / x).ln_1p()
+        };
+        normalization - x.ln() - rate * distance
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -29767,6 +29837,90 @@ impl ContinuousDistribution for TruncPareto {
         let denom = 1.0 - cb;
         let e_ln_x = (1.0 - cb * self.b.mul_add(self.c.ln(), 1.0)) / (self.b * denom);
         -self.b.ln() + (self.b + 1.0) * e_ln_x + denom.ln()
+    }
+
+    /// Maximum likelihood at fixed location zero and scale one. Profile the
+    /// upper endpoint exactly at max(data), then solve the strictly decreasing
+    /// score of the truncated exponential distribution of log(X). Both signs
+    /// of b are supported; b=0 is excluded by this family's parameter contract.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "TruncPareto")?;
+        if data.iter().any(|&x| x < 1.0) {
+            return Err(FitError::UnsupportedData(
+                "TruncPareto fit requires every observation at or above one".into(),
+            ));
+        }
+        let c = data.iter().copied().fold(1.0, f64::max);
+        if c <= 1.0 {
+            return Err(FitError::NonConvergent(
+                "TruncPareto has no valid upper endpoint for a sample of ones".into(),
+            ));
+        }
+        let width = c.ln();
+        let n = data.len() as f64;
+        let mean_distance = |from_upper: bool| {
+            let mut mean = 0.0;
+            let mut correction = 0.0;
+            for &x in data {
+                let distance = if from_upper {
+                    ((c - x) / x).ln_1p()
+                } else {
+                    x.ln()
+                };
+                let term = (distance / width) / n - correction;
+                let next = mean + term;
+                correction = (next - mean) - term;
+                mean = next;
+            }
+            mean
+        };
+        let from_lower = mean_distance(false);
+        let from_upper = mean_distance(true);
+        if from_lower == from_upper {
+            return Err(FitError::NonConvergent(
+                "TruncPareto likelihood is maximized only at excluded shape b=0".into(),
+            ));
+        }
+        let target = from_lower.min(from_upper);
+        if target <= 0.0 || !target.is_finite() {
+            return Err(FitError::NonConvergent(
+                "TruncPareto likelihood has no finite shape maximum".into(),
+            ));
+        }
+        // For a positive dimensionless tilt t, E[Y]/width is
+        // 1/t - 1/expm1(t). It decreases from 1/2 to zero. Its reflection
+        // handles negative b without subtracting a mean close to one.
+        let expected_distance = |t: f64| {
+            if t < 0.1 {
+                let square = t * t;
+                0.5 - t * (1.0 / 12.0
+                    - square * (1.0 / 720.0
+                        - square * (1.0 / 30240.0 - square / 1209600.0)))
+            } else {
+                t.recip() - t.exp_m1().recip()
+            }
+        };
+        let mut lower = 0.0;
+        let mut upper = target.recip();
+        for _ in 0..200 {
+            let middle = lower + 0.5 * (upper - lower);
+            if middle == lower || middle == upper {
+                break;
+            }
+            if expected_distance(middle) > target {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        let sign = if from_lower < from_upper { 1.0 } else { -1.0 };
+        let b = sign * (lower + 0.5 * (upper - lower)) / width;
+        if b == 0.0 || !b.is_finite() {
+            return Err(FitError::NonConvergent(
+                "TruncPareto MLE shape is outside the finite nonzero parameter domain".into(),
+            ));
+        }
+        Ok(Self { b, c })
     }
 }
 
