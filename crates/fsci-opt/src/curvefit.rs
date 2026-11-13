@@ -2337,6 +2337,18 @@ impl LmQr {
                 lm_qr_add_row(&mut scratch.upper, &mut scratch.rhs, &mut scratch.row, 0.0);
             }
         }
+        // An overflowing augmented diagonal can turn a nonzero residual into
+        // an apparently zero step. Reject that factor before back-substitution
+        // so the bounded damping search cannot report false convergence.
+        if scratch
+            .upper
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+            || scratch.rhs.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
         scratch.step.resize(n, 0.0);
         for row in (0..n).rev() {
             let mut value = -scratch.rhs[row];
@@ -3314,6 +3326,63 @@ mod tests {
         assert_eq!(stationary.status, 1);
         assert_eq!(stationary.x, [0.0]);
         assert_eq!(stationary.cost, 0.5);
+    }
+
+    #[test]
+    fn least_squares_lm_rejects_nonfinite_augmented_factor() {
+        let fit = |scale, mode| {
+            least_squares(
+                |x| {
+                    let z = 1.0e308 * x[0];
+                    vec![1.0 + z + 100.0 * z * z]
+                },
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    jac: Some(LeastSquaresJacobian::new(|x| {
+                        let z = 1.0e308 * x[0];
+                        vec![vec![1.0e308 * (1.0 + 200.0 * z)]]
+                    })),
+                    x_scale: Some(scale),
+                    mode,
+                    ..LeastSquaresOptions::default()
+                },
+            )
+        };
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            // The first Gauss–Newton trial is rejected. Fixed parameter units
+            // then require damping beyond the finite range; an infinite QR
+            // diagonal must not masquerade as a converged zero step at x0.
+            let error = fit(XScale::Fixed(vec![1.0]), mode)
+                .expect_err("nonfinite augmentation cannot establish convergence");
+            assert!(matches!(error, OptError::NotConverged { .. }), "{error}");
+
+            // The same finite model remains solvable with Jacobian scaling.
+            // Its exact minimizer is z = -1/200 and residual is 399/400.
+            let scaled = fit(XScale::Jac, mode).expect("scaled damping stays finite");
+            assert!(scaled.success, "{scaled:?}");
+            assert!((1.0e308 * scaled.x[0] + 0.005).abs() < 1.0e-7);
+            assert!((scaled.cost - 0.497_503_125).abs() < 1.0e-12);
+        }
+
+        // Checking factors must not normalize away an independently resolved
+        // weak column when the undamped step is already representable.
+        let mixed = least_squares(
+            |x| vec![1.0e308 * (x[0] - 1.0), 1.0e-120 * (x[1] - 2.0)],
+            &[0.0, 0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|_| {
+                    vec![vec![1.0e308, 0.0], vec![0.0, 1.0e-120]]
+                })),
+                x_scale: Some(XScale::Fixed(vec![1.0, 1.0])),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("finite mixed-scale directions remain resolved");
+        assert!(mixed.success, "{mixed:?}");
+        assert_eq!(mixed.x, [1.0, 2.0]);
+        assert_eq!(mixed.cost, 0.0);
     }
 
     #[test]
