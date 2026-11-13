@@ -847,25 +847,35 @@ where
     njev += 1;
     scaling.update(&jac)?;
     let mut scaled_jac = scaling.jacobian(&jac)?;
-    // Solve in scaled parameter coordinates. Cache the linear model until an
-    // accepted step changes residuals, derivatives, or adaptive column scales.
-    let mut jtj = Vec::new();
-    let mut jtr = Vec::new();
-    jtj_matrix_into(&scaled_jac, &mut jtj);
-    jt_vec_into(&scaled_jac, &r, &mut jtr);
+    // Reduce the Jacobian itself, not JᵀJ: squaring the condition number can
+    // erase an identifiable direction and produce a plausible but wrong fit.
+    // The reduction is reused until an accepted step changes the linear model.
+    let mut qr = LmQr::new(&scaled_jac, &r)?;
+    let mut scratch = LmQrScratch::default();
     let mut max_cosine = lm_max_cosine(&jac, &r);
-    let mut damped_normal = Vec::new();
-    let mut cholesky_low = Vec::new();
-    let mut solve_y = Vec::new();
-    let mut step = Vec::new();
     let mut jstep = Vec::new();
-
-    // Initial damping parameter (Marquardt strategy)
-    let mut mu = 1.0e-3 * max_diag_jtj(&scaled_jac);
-    if mu == 0.0 {
-        mu = 1.0;
+    let mut x_norm = scaling.parameter_norm(&x);
+    if !x_norm.is_finite() {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("scaled LM parameter norm is not finite"),
+        });
     }
-    let mut nu = 2.0;
+    // Include the residual/model scale so changing residual units does not
+    // change the first physical step. A fixed radius at x0 == 0 can be tiny
+    // in Jacobian-scaled coordinates and falsely satisfy ftol without moving.
+    // Store damping in square-root units so neither the Jacobian norms nor
+    // the regularization parameter need to be squared.
+    let initial_norm = if qr.max_column_norm > 0.0 {
+        x_norm.max(residual_norm / qr.max_column_norm)
+    } else {
+        x_norm
+    };
+    let mut radius = if initial_norm == 0.0 {
+        100.0
+    } else {
+        100.0 * initial_norm.min(f64::MAX / 100.0)
+    };
+    let mut damping = 0.0;
     let mut nit = 0usize;
 
     for _ in 0..max_nfev {
@@ -888,46 +898,14 @@ where
             ));
         }
 
-        // Solve (J^T J + mu I) * step = -J^T r
-        solve_damped_normal_equations_into(
-            &jtj,
-            &jtr,
-            mu,
-            n,
-            DampedNormalScratch {
-                a: &mut damped_normal,
-                low: &mut cholesky_low,
-                y: &mut solve_y,
-                step: &mut step,
-            },
-        );
-
-        let step_norm = step.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
-        let x_norm = scaling.parameter_norm(&x);
-        if !step_norm.is_finite() || !x_norm.is_finite() {
-            return Err(OptError::NonFiniteInput {
-                detail: String::from("scaled LM step or parameter norm is not finite"),
-            });
-        }
-
-        // Use the same parameter metric as the damped solve. An additive
-        // xtol² floor would prematurely stop small scaled parameter steps.
-        if step_norm <= options.xtol * x_norm {
-            return Ok(lm_result(
-                x,
-                r,
-                cost,
-                3,
-                String::from("parameter change converged (xtol)"),
-                nfev,
-                njev,
-                nit,
-                jac,
-            ));
+        let step_norm;
+        (damping, step_norm) = qr.trust_region_step(radius, damping, &mut scratch)?;
+        if nit == 1 {
+            radius = radius.min(step_norm);
         }
 
         // Trial step
-        let physical_step = scaling.physical_step(&step);
+        let physical_step = scaling.physical_step(&scratch.step);
         let x_new: Vec<f64> = x.iter().zip(&physical_step).map(|(a, b)| a + b).collect();
         let r_new = residuals(&x_new);
         nfev += 1;
@@ -945,7 +923,7 @@ where
         let norm_ratio = trial_norm / residual_norm;
         let actual_reduction = (1.0 - norm_ratio) * (1.0 + norm_ratio);
         let predicted_reduction = {
-            mat_vec_into(&scaled_jac, &step, &mut jstep);
+            mat_vec_into(&scaled_jac, &scratch.step, &mut jstep);
             let linear: f64 = r
                 .iter()
                 .zip(&jstep)
@@ -958,53 +936,71 @@ where
             -2.0 * linear - quadratic
         };
 
-        if predicted_reduction > 0.0 {
-            let rho = actual_reduction / predicted_reduction;
-
-            if rho > 0.25 {
-                // Accept step
-                x = x_new;
-                r = r_new;
-                cost = cost_new;
-                residual_norm = trial_norm;
-                lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
-                njev += 1;
-
-                // LM requires small actual and predicted relative reductions;
-                // the accepted step also establishes adequate model agreement.
-                if actual_reduction <= options.ftol && predicted_reduction <= options.ftol {
-                    return Ok(lm_result(
-                        x,
-                        r,
-                        cost,
-                        2,
-                        String::from("cost change converged (ftol)"),
-                        nfev,
-                        njev,
-                        nit,
-                        jac,
-                    ));
-                }
-
-                // Refresh the scaled model only after an accepted step.
-                scaling.update(&jac)?;
-                scaled_jac = scaling.jacobian(&jac)?;
-                jtj_matrix_into(&scaled_jac, &mut jtj);
-                jt_vec_into(&scaled_jac, &r, &mut jtr);
-                max_cosine = lm_max_cosine(&jac, &r);
-
-                // Decrease damping
-                mu *= f64::max(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0).powi(3));
-                nu = 2.0;
-            } else {
-                // Reject step, increase damping
-                mu *= nu;
-                nu *= 2.0;
-            }
+        let ratio = if predicted_reduction > 0.0 && actual_reduction.is_finite() {
+            actual_reduction / predicted_reduction
         } else {
-            // Reject step, increase damping
-            mu *= nu;
-            nu *= 2.0;
+            0.0
+        };
+        if ratio <= 0.25 {
+            let contraction = if actual_reduction.is_finite() && actual_reduction < 0.0 {
+                (0.5 * predicted_reduction / (predicted_reduction - actual_reduction))
+                    .clamp(0.1, 0.5)
+            } else if !trial_norm.is_finite() {
+                0.1
+            } else {
+                0.5
+            };
+            radius = contraction * radius.min(10.0 * step_norm);
+        } else if damping == 0.0 || ratio >= 0.75 {
+            radius = 2.0 * step_norm.min(f64::MAX / 2.0);
+        }
+
+        if ratio >= 1.0e-4 {
+            x = x_new;
+            r = r_new;
+            cost = cost_new;
+            residual_norm = trial_norm;
+            lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
+            njev += 1;
+            scaling.update(&jac)?;
+            scaled_jac = scaling.jacobian(&jac)?;
+            qr = LmQr::new(&scaled_jac, &r)?;
+            max_cosine = lm_max_cosine(&jac, &r);
+            x_norm = scaling.parameter_norm(&x);
+            if !x_norm.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("scaled LM parameter norm is not finite"),
+                });
+            }
+        }
+
+        // A heavily damped step can be arbitrarily small far from a solution.
+        // LM's xtol therefore tests the trust radius, not that step alone.
+        // ftol additionally requires agreement of actual and model reductions.
+        let ftol_satisfied = actual_reduction.abs() <= options.ftol
+            && predicted_reduction >= 0.0
+            && predicted_reduction <= options.ftol
+            && ratio <= 2.0;
+        let xtol_satisfied = radius <= options.xtol * x_norm;
+        if ftol_satisfied || xtol_satisfied {
+            let status = if ftol_satisfied && xtol_satisfied {
+                4
+            } else if ftol_satisfied {
+                2
+            } else {
+                3
+            };
+            return Ok(lm_result(
+                x,
+                r,
+                cost,
+                status,
+                termination_message(status).to_string(),
+                nfev,
+                njev,
+                nit,
+                jac,
+            ));
         }
 
         if nfev >= max_nfev {
@@ -2246,35 +2242,6 @@ where
     Ok(())
 }
 
-/// Compute J^T * J (n x n) into fixed-shape scratch.
-fn jtj_matrix_into(jac: &[Vec<f64>], jtj: &mut Vec<Vec<f64>>) {
-    let n = jac.first().map_or(0, Vec::len);
-    resize_square(jtj, n);
-    for row in jac {
-        for i in 0..n {
-            for j in i..n {
-                let v = row[i] * row[j];
-                jtj[i][j] += v;
-                if i != j {
-                    jtj[j][i] += v;
-                }
-            }
-        }
-    }
-}
-
-/// Compute J^T * v into fixed-shape scratch.
-fn jt_vec_into(jac: &[Vec<f64>], v: &[f64], result: &mut Vec<f64>) {
-    let n = jac.first().map_or(0, Vec::len);
-    result.resize(n, 0.0);
-    result.fill(0.0);
-    for (row, &vi) in jac.iter().zip(v.iter()) {
-        for (j, &jval) in row.iter().enumerate() {
-            result[j] += jval * vi;
-        }
-    }
-}
-
 /// Compute J * v into fixed-shape scratch.
 fn mat_vec_into(jac: &[Vec<f64>], v: &[f64], result: &mut Vec<f64>) {
     result.resize(jac.len(), 0.0);
@@ -2283,61 +2250,210 @@ fn mat_vec_into(jac: &[Vec<f64>], v: &[f64], result: &mut Vec<f64>) {
     }
 }
 
-/// Max diagonal element of J^T * J.
-fn max_diag_jtj(jac: &[Vec<f64>]) -> f64 {
-    let n = jac.first().map_or(0, Vec::len);
-    let mut max_val = 0.0_f64;
-    for j in 0..n {
-        let mut diag = 0.0;
-        for row in jac {
-            diag += row[j] * row[j];
-        }
-        if max_val.is_nan() || diag.is_nan() {
-            max_val = f64::NAN;
-        } else {
-            max_val = max_val.max(diag);
-        }
-    }
-    max_val
+/// Orthogonal reduction of the scaled residual Jacobian and right-hand side.
+/// Adding diagonal rows to R solves the regularized least-squares problem
+/// without forming JᵀJ, including when its rounded normal matrix is singular.
+struct LmQr {
+    upper: Vec<Vec<f64>>,
+    rhs: Vec<f64>,
+    max_column_norm: f64,
 }
 
-/// Solve (A + mu * I) * x = -b into fixed-shape scratch.
-/// Falls back to diagonal if matrix is singular.
-struct DampedNormalScratch<'a> {
-    a: &'a mut Vec<Vec<f64>>,
-    low: &'a mut Vec<Vec<f64>>,
-    y: &'a mut Vec<f64>,
-    step: &'a mut Vec<f64>,
+#[derive(Default)]
+struct LmQrScratch {
+    upper: Vec<Vec<f64>>,
+    rhs: Vec<f64>,
+    row: Vec<f64>,
+    step: Vec<f64>,
 }
 
-fn solve_damped_normal_equations_into(
-    jtj: &[Vec<f64>],
-    jtr: &[f64],
-    mu: f64,
-    n: usize,
-    scratch: DampedNormalScratch<'_>,
-) {
-    resize_square(scratch.a, n);
-    for (dst_row, src_row) in scratch.a.iter_mut().zip(jtj.iter()) {
-        dst_row.copy_from_slice(src_row);
+/// Eliminate a new row with Givens rotations. `hypot` forms each rotation
+/// without squaring the entries; the same orthogonal operations transform f.
+fn lm_qr_add_row(upper: &mut [Vec<f64>], rhs: &mut [f64], row: &mut [f64], mut value: f64) {
+    for k in 0..rhs.len() {
+        if row[k] == 0.0 {
+            continue;
+        }
+        let diagonal = upper[k][k].hypot(row[k]);
+        let cosine = upper[k][k] / diagonal;
+        let sine = row[k] / diagonal;
+        upper[k][k] = diagonal;
+        for (entry, incoming) in upper[k][k + 1..].iter_mut().zip(&mut row[k + 1..]) {
+            let old = *entry;
+            *entry = cosine * old + sine * *incoming;
+            *incoming = cosine * *incoming - sine * old;
+        }
+        let old = rhs[k];
+        rhs[k] = cosine * old + sine * value;
+        value = cosine * value - sine * old;
     }
-    for (i, row) in scratch.a.iter_mut().enumerate() {
-        row[i] += mu;
+}
+
+impl LmQr {
+    fn new(jac: &[Vec<f64>], residuals: &[f64]) -> Result<Self, OptError> {
+        let n = jac[0].len();
+        let mut upper = vec![vec![0.0; n]; n];
+        let mut rhs = vec![0.0; n];
+        let mut row = vec![0.0; n];
+        for (source, &value) in jac.iter().zip(residuals) {
+            row.copy_from_slice(source);
+            lm_qr_add_row(&mut upper, &mut rhs, &mut row, value);
+        }
+        let max_column_norm = (0..n)
+            .map(|column| {
+                upper
+                    .iter()
+                    .take(column + 1)
+                    .fold(0.0_f64, |norm, row| norm.hypot(row[column]))
+            })
+            .fold(0.0_f64, f64::max);
+        if upper.iter().flatten().any(|value| !value.is_finite())
+            || rhs.iter().any(|value| !value.is_finite())
+            || !max_column_norm.is_finite()
+        {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("LM orthogonal Jacobian factorization is not finite"),
+            });
+        }
+        Ok(Self {
+            upper,
+            rhs,
+            max_column_norm,
+        })
     }
 
-    // Solve via Cholesky decomposition
-    if cholesky_decompose_into(scratch.a, n, scratch.low) {
-        cholesky_solve_with_l_into(scratch.low, jtr, n, scratch.y, scratch.step);
-        // Return -step (we solve A*step = -jtr, but passed jtr not -jtr).
-        for value in scratch.step.iter_mut() {
-            *value = -*value;
+    /// Minimize ‖R p + Qᵀf‖² + damping²·‖p‖². An exactly empty row of the
+    /// undamped factor leaves its free variable at zero. Positive damping
+    /// retains the full triangular factor, including dependent directions.
+    fn solve(&self, damping: f64, scratch: &mut LmQrScratch) -> Option<f64> {
+        let n = self.rhs.len();
+        scratch.upper.clone_from(&self.upper);
+        scratch.rhs.clone_from(&self.rhs);
+        scratch.row.resize(n, 0.0);
+        if damping > 0.0 {
+            for column in 0..n {
+                scratch.row.fill(0.0);
+                scratch.row[column] = damping;
+                lm_qr_add_row(&mut scratch.upper, &mut scratch.rhs, &mut scratch.row, 0.0);
+            }
         }
-    } else {
-        // Fallback: diagonal solve
         scratch.step.resize(n, 0.0);
-        for i in 0..n {
-            scratch.step[i] = -jtr[i] / (jtj[i][i] + mu);
+        for row in (0..n).rev() {
+            let mut value = -scratch.rhs[row];
+            for (&entry, &step) in scratch.upper[row][row + 1..]
+                .iter()
+                .zip(&scratch.step[row + 1..])
+            {
+                value -= entry * step;
+            }
+            let diagonal = scratch.upper[row][row];
+            if diagonal == 0.0 {
+                // A row receives entries only after a nonzero pivot arrives,
+                // so a zero diagonal here means the whole row is zero.
+                scratch.step[row] = 0.0;
+            } else {
+                scratch.step[row] = value / diagonal;
+            }
         }
+        let norm = scratch
+            .step
+            .iter()
+            .fold(0.0_f64, |norm, &value| norm.hypot(value));
+        norm.is_finite().then_some(norm)
+    }
+
+    /// Find an LM step in the scaled trust region. The Gauss–Newton step is
+    /// used whenever it fits. Otherwise the step norm decreases monotonically
+    /// with positive damping; a bounded bracket and geometric bisection locate
+    /// the boundary to one percent, including damping far below machine epsilon.
+    fn trust_region_step(
+        &self,
+        radius: f64,
+        previous_damping: f64,
+        scratch: &mut LmQrScratch,
+    ) -> Result<(f64, f64), OptError> {
+        if let Some(norm) = self.solve(0.0, scratch)
+            && norm <= radius
+        {
+            return Ok((0.0, norm));
+        }
+        if !(radius > 0.0 && radius.is_finite()) {
+            return Err(OptError::NotConverged {
+                detail: String::from("LM trust radius is no longer positive and finite"),
+            });
+        }
+        let mut lower = 0.0;
+        let mut upper = if previous_damping > 0.0 && previous_damping.is_finite() {
+            previous_damping
+        } else {
+            self.max_column_norm
+        };
+        if upper == 0.0 {
+            return Err(OptError::NotConverged {
+                detail: String::from("LM Jacobian has no resolvable descent direction"),
+            });
+        }
+        // Multiplying/dividing by ten reaches every representable damping
+        // magnitude in at most 632 iterations, even from opposite extremes.
+        for _ in 0..640 {
+            let norm = self.solve(upper, scratch).unwrap_or(f64::INFINITY);
+            if norm / radius >= 0.99 && norm / radius <= 1.01 {
+                return Ok((upper, norm));
+            }
+            if norm < radius {
+                break;
+            }
+            lower = upper;
+            let next = (upper * 10.0).min(f64::MAX);
+            if next == upper {
+                return Err(OptError::NotConverged {
+                    detail: String::from("LM could not bound its regularized step"),
+                });
+            }
+            upper = next;
+        }
+        if lower == 0.0 {
+            for _ in 0..640 {
+                let next = upper * 0.1;
+                if next == 0.0 || next == upper {
+                    break;
+                }
+                let norm = self.solve(next, scratch).unwrap_or(f64::INFINITY);
+                if norm > radius {
+                    lower = next;
+                    break;
+                }
+                upper = next;
+                if norm / radius >= 0.99 {
+                    return Ok((upper, norm));
+                }
+            }
+        }
+        // The bracket is at most a decade wide. Geometric bisection avoids
+        // overflowing its product and retains subnormal damping parameters.
+        if lower > 0.0 {
+            for _ in 0..64 {
+                let candidate = lower.sqrt() * upper.sqrt();
+                if candidate <= lower || candidate >= upper {
+                    break;
+                }
+                let norm = self.solve(candidate, scratch).unwrap_or(f64::INFINITY);
+                if norm / radius >= 0.99 && norm / radius <= 1.01 {
+                    return Ok((candidate, norm));
+                }
+                if norm > radius {
+                    lower = candidate;
+                } else {
+                    upper = candidate;
+                }
+            }
+        }
+        self.solve(upper, scratch)
+            .filter(|&norm| norm <= radius * 1.01)
+            .map(|norm| (upper, norm))
+            .ok_or_else(|| OptError::NotConverged {
+                detail: String::from("LM could not resolve a finite trust-region step"),
+            })
     }
 }
 
@@ -2371,35 +2487,6 @@ fn cholesky_decompose_into(a: &[Vec<f64>], n: usize, low: &mut Vec<Vec<f64>>) ->
         }
     }
     true
-}
-
-/// Solve L * L^T * x = b given L into fixed-shape scratch.
-fn cholesky_solve_with_l_into(
-    low: &[Vec<f64>],
-    b: &[f64],
-    n: usize,
-    y: &mut Vec<f64>,
-    x: &mut Vec<f64>,
-) {
-    // Forward substitution: L * y = b
-    y.resize(n, 0.0);
-    for i in 0..n {
-        let mut sum = b[i];
-        for j in 0..i {
-            sum -= low[i][j] * y[j];
-        }
-        y[i] = sum / low[i][i];
-    }
-
-    // Back substitution: L^T * x = y
-    x.resize(n, 0.0);
-    for i in (0..n).rev() {
-        let mut sum = y[i];
-        for j in (i + 1)..n {
-            sum -= low[j][i] * x[j];
-        }
-        x[i] = sum / low[i][i];
-    }
 }
 
 /// SciPy's curve-fit covariance: LM retains the full inverse, while TRF and
@@ -2550,9 +2637,7 @@ mod tests {
                 });
             }
             self.products.fetch_add(1, Ordering::Relaxed);
-            if x.iter().filter(|&&value| value != 0.0).count() == 1
-                && x.contains(&1.0)
-            {
+            if x.iter().filter(|&&value| value != 0.0).count() == 1 && x.contains(&1.0) {
                 self.basis_probes.fetch_add(1, Ordering::Relaxed);
             }
             y.copy_from_slice(x);
@@ -2780,8 +2865,8 @@ mod tests {
                     &[0.0],
                     LeastSquaresOptions {
                         method: Some(method),
-                        jac: Some(LeastSquaresJacobian::new_operator(move |_| FaultyJacobian {
-                            failure,
+                        jac: Some(LeastSquaresJacobian::new_operator(move |_| {
+                            FaultyJacobian { failure }
                         })),
                         ..LeastSquaresOptions::default()
                     },
@@ -3001,6 +3086,237 @@ mod tests {
     }
 
     #[test]
+    fn least_squares_lm_resolves_correlated_parameters_without_normal_equations() {
+        // J is full rank, but forming JᵀJ rounds its last diagonal to 1
+        // for the smaller weak directions. The former Cholesky/diagonal
+        // fallback returned success near [0.5, 0.5] instead of [0, 1].
+        for weak in [1.0e-6, 1.0e-8, 1.0e-9, 1.0e-10, 1.0e-12] {
+            for magnitude in [1.0e-200, 1.0e-120, 1.0, 1.0e100, 1.0e200] {
+                let result = least_squares(
+                    move |x| {
+                        vec![
+                            magnitude * (x[0] + x[1] - 1.0),
+                            magnitude * weak * (x[1] - 1.0),
+                        ]
+                    },
+                    &[0.0, 0.0],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            vec![vec![magnitude, magnitude], vec![0.0, magnitude * weak]]
+                        })),
+                        ftol: 1.0e-14,
+                        xtol: 1.0e-14,
+                        gtol: 1.0e-14,
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("identifiable linear model");
+                assert!(
+                    result.success,
+                    "weak={weak}, magnitude={magnitude}: {result:?}"
+                );
+                assert!(
+                    result.x[0].abs() < 1.0e-8 && (result.x[1] - 1.0).abs() < 1.0e-8,
+                    "weak={weak}, magnitude={magnitude}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_initial_radius_preserves_large_residual_units() {
+        for magnitude in [1.0e100, 1.0e200] {
+            for start in [0.0, 1.0e-100] {
+                let result = least_squares(
+                    move |x| vec![magnitude * (x[0] - 1.0)],
+                    &[start],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        jac: Some(LeastSquaresJacobian::new(move |_| vec![vec![magnitude]])),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("the initial trust radius respects scaled residual units");
+                assert!(
+                    result.success && (result.x[0] - 1.0).abs() < 1.0e-12,
+                    "magnitude={magnitude}, start={start}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_fixed_scaling_does_not_square_jacobian_units() {
+        // With fixed x_scale, adaptive column normalization cannot hide an
+        // overflow or underflow caused by squaring the physical Jacobian.
+        for magnitude in [1.0e-200, 1.0e-100, 1.0, 1.0e100, 1.0e200] {
+            let result = least_squares(
+                move |x| vec![magnitude * (x[0] - 1.0)],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    x_scale: Some(XScale::Fixed(vec![1.0])),
+                    jac: Some(LeastSquaresJacobian::new(move |_| vec![vec![magnitude]])),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("finite unsquared least-squares system");
+            assert!(result.success, "magnitude={magnitude}: {result:?}");
+            assert!((result.x[0] - 1.0).abs() < 1.0e-12, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_resolves_rotated_and_permuted_weak_directions() {
+        for weak in [1.0e-8, 1.0e-10] {
+            for weak_column in [0, 1] {
+                let result = least_squares(
+                    move |x| {
+                        let a = x[0] + x[1] - 1.0;
+                        let b = weak * (x[weak_column] - 1.0);
+                        vec![
+                            (a - b) * std::f64::consts::FRAC_1_SQRT_2,
+                            (a + b) * std::f64::consts::FRAC_1_SQRT_2,
+                        ]
+                    },
+                    &[0.0, 0.0],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        jac: Some(LeastSquaresJacobian::new(move |_| {
+                            let mut rows = vec![vec![1.0; 2]; 2];
+                            rows[0][weak_column] -= weak;
+                            rows[1][weak_column] += weak;
+                            for entry in rows.iter_mut().flatten() {
+                                *entry *= std::f64::consts::FRAC_1_SQRT_2;
+                            }
+                            rows
+                        })),
+                        ftol: 1.0e-14,
+                        xtol: 1.0e-14,
+                        gtol: 1.0e-14,
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("rotating residuals and permuting parameters preserves identifiability");
+                assert!(result.success, "{result:?}");
+                assert!((result.x[weak_column] - 1.0).abs() < 1.0e-8, "{result:?}");
+                assert!(result.x[1 - weak_column].abs() < 1.0e-8, "{result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_trust_radius_recovers_after_rejected_nonlinear_steps() {
+        let result = least_squares(
+            |x| vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]],
+            &[-1.2, 1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|x| {
+                    vec![vec![-20.0 * x[0], 10.0], vec![-1.0, 0.0]]
+                })),
+                ftol: 1.0e-12,
+                xtol: 1.0e-12,
+                gtol: 1.0e-12,
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("Rosenbrock residuals need a bounded step after the first rejected trial");
+        assert!(result.success, "{result:?}");
+        assert!(
+            result.x.iter().all(|x| (x - 1.0).abs() < 1.0e-9),
+            "{result:?}"
+        );
+        assert!(result.cost < 1.0e-20, "{result:?}");
+        assert!(
+            result.nfev > result.njev,
+            "the rejected step must be counted"
+        );
+    }
+
+    #[test]
+    fn least_squares_lm_rank_deficient_model_keeps_full_least_squares_objective() {
+        let result = least_squares(
+            |x| vec![x[0] + x[1] - 1.0, x[0] + x[1] - 3.0],
+            &[0.0, 0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]; 2])),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("a rank-deficient model still has a finite least-squares minimum");
+        assert!(result.success, "{result:?}");
+        assert!(
+            (result.x.iter().sum::<f64>() - 2.0).abs() < 1.0e-9,
+            "{result:?}"
+        );
+        assert!((result.cost - 1.0).abs() < 1.0e-12, "{result:?}");
+
+        let zero_column = least_squares(
+            |x| vec![x[0] - 2.0, 1.0, -1.0],
+            &[0.0, 7.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|_| {
+                    vec![vec![1.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]]
+                })),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("an unused parameter remains at its initial value");
+        assert!(zero_column.success, "{zero_column:?}");
+        assert_eq!(zero_column.x, [2.0, 7.0]);
+        assert_eq!(zero_column.cost, 1.0);
+    }
+
+    #[test]
+    fn least_squares_lm_rejects_nonfinite_trials_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let invalid_trials = AtomicUsize::new(0);
+        let result = least_squares(
+            |x| {
+                if x[0] <= 0.0 {
+                    invalid_trials.fetch_add(1, Ordering::Relaxed);
+                }
+                vec![x[0].ln() + 10.0]
+            },
+            &[1.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|x| vec![vec![1.0 / x[0]]])),
+                ftol: 1.0e-12,
+                xtol: 1.0e-12,
+                gtol: 1.0e-12,
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("the trust radius shrinks before retrying outside the model domain");
+        assert!(invalid_trials.load(Ordering::Relaxed) > 0);
+        assert!(result.success, "{result:?}");
+        assert!(
+            (result.x[0] / (-10.0_f64).exp() - 1.0).abs() < 1.0e-9,
+            "{result:?}"
+        );
+        assert!(result.cost < 1.0e-20, "{result:?}");
+
+        let stationary = least_squares(
+            |x| vec![x[0] * x[0] - 1.0],
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|x| vec![vec![2.0 * x[0]]])),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("LM may stop at a stationary point with a nonzero residual, as SciPy does");
+        assert_eq!(stationary.status, 1);
+        assert_eq!(stationary.x, [0.0]);
+        assert_eq!(stationary.cost, 0.5);
+    }
+
+    #[test]
     fn least_squares_lm_handles_parameters_with_different_units() {
         for x_scale in [
             None,
@@ -3170,22 +3486,16 @@ mod tests {
         let delta = 2.0_f64.powi(-28);
         let offsets = [-delta, delta, -2.0 * delta, 2.0 * delta];
         let model = |t: f64, p: &[f64]| p[0] + (1.0 + t) * p[1];
-        let observations: Vec<f64> = offsets
-            .iter()
-            .map(|&t| model(t, &[1.0, 2.0]))
-            .collect();
+        let observations: Vec<f64> = offsets.iter().map(|&t| model(t, &[1.0, 2.0])).collect();
         let jacobian = || {
-            LeastSquaresJacobian::new(move |_| {
-                offsets.iter().map(|t| vec![1.0, 1.0 + t]).collect()
-            })
+            LeastSquaresJacobian::new(move |_| offsets.iter().map(|t| vec![1.0, 1.0 + t]).collect())
         };
         let fit = curve_fit(
             model,
             &offsets,
             &observations,
             CurveFitOptions {
-                // Isolate covariance from the LM iteration's convergence policy.
-                p0: Some(vec![1.0, 2.0]),
+                p0: Some(vec![0.0, 0.0]),
                 absolute_sigma: true,
                 ls_options: LeastSquaresOptions {
                     jac: Some(jacobian()),
@@ -3195,6 +3505,8 @@ mod tests {
             },
         )
         .expect("a full-rank correlated model has finite covariance");
+        assert!((fit.popt[0] - 1.0).abs() < 1.0e-7, "{fit:?}");
+        assert!((fit.popt[1] - 2.0).abs() < 1.0e-7, "{fit:?}");
         let inverse_variance = 1.0 / (10.0 * delta * delta);
         let expected = [
             [inverse_variance + 0.25, -inverse_variance],
@@ -3309,9 +3621,7 @@ mod tests {
                 p0: Some(vec![1.0, 2.0]),
                 absolute_sigma: true,
                 ls_options: LeastSquaresOptions {
-                    jac: Some(LeastSquaresJacobian::new(|_| {
-                        vec![vec![1.0, 1.0]; 3]
-                    })),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0, 1.0]; 3])),
                     ..LeastSquaresOptions::default()
                 },
                 ..CurveFitOptions::default()

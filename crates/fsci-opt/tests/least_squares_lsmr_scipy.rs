@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! The iterative nonlinear least-squares backend against live SciPy.
+//! Nonlinear least-squares backends against live SciPy.
 //! Every generated case must be compared. Set FSCI_REQUIRE_SCIPY_ORACLE=1 to
 //! require the repository's pinned SciPy 1.17.1 / NumPy 2.4.3 installation.
 
@@ -276,6 +276,246 @@ struct Oracle {
     scipy: String,
     numpy: String,
     rows: Vec<OracleRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LmCase {
+    problem: String,
+    weak: f64,
+    magnitude: f64,
+    weak_column: usize,
+    rotated: bool,
+}
+
+fn lm_residuals(case: &LmCase, x: &[f64]) -> Vec<f64> {
+    match case.problem.as_str() {
+        "correlated" => {
+            let strong = x[0] + x[1] - 1.0;
+            let weak = case.weak * (x[case.weak_column] - 1.0);
+            if case.rotated {
+                vec![
+                    (strong - weak) / std::f64::consts::SQRT_2,
+                    (strong + weak) / std::f64::consts::SQRT_2,
+                ]
+            } else {
+                vec![strong, weak]
+            }
+        }
+        "units" => vec![case.magnitude * (x[0] - 1.0)],
+        _ => residuals(&case.problem, x),
+    }
+}
+
+fn lm_jacobian(case: &LmCase, x: &[f64]) -> Vec<Vec<f64>> {
+    match case.problem.as_str() {
+        "correlated" if case.rotated => {
+            let mut result = vec![vec![1.0; 2]; 2];
+            result[0][case.weak_column] -= case.weak;
+            result[1][case.weak_column] += case.weak;
+            for row in &mut result {
+                for value in row {
+                    *value /= std::f64::consts::SQRT_2;
+                }
+            }
+            result
+        }
+        "correlated" => {
+            let mut result = vec![vec![1.0; 2], vec![0.0; 2]];
+            result[1][case.weak_column] = case.weak;
+            result
+        }
+        "units" => vec![vec![case.magnitude]],
+        _ => jacobian(&case.problem, x),
+    }
+}
+
+const LM_ORACLE: &str = r#"
+import json, os, sys
+import numpy as np
+import scipy
+from scipy.optimize import least_squares
+if os.environ.get("FSCI_REQUIRE_SCIPY_ORACLE") == "1":
+    assert (scipy.__version__, np.__version__) == ("1.17.1", "2.4.3")
+rows = []
+for case in json.loads(sys.argv[1]):
+    problem = case["problem"]
+    if problem == "correlated":
+        weak, column, rotated = case["weak"], case["weak_column"], case["rotated"]
+        def fun(x):
+            strong = x[0] + x[1] - 1
+            small = weak*(x[column]-1)
+            return (np.array([strong-small, strong+small])/np.sqrt(2)
+                    if rotated else np.array([strong, small]))
+        if rotated:
+            a = np.ones((2, 2))
+            a[0, column] -= weak
+            a[1, column] += weak
+            a /= np.sqrt(2)
+        else:
+            a = np.array([[1., 1.], [0., 0.]])
+            a[1, column] = weak
+        jac = lambda x: a
+        start = [0., 0.]
+    elif problem == "units":
+        magnitude = case["magnitude"]
+        fun = lambda x: np.array([magnitude*(x[0]-1)])
+        jac = lambda x: np.array([[magnitude]])
+        start = [0.]
+    elif problem == "rosenbrock":
+        fun = lambda x: np.array([10*(x[1]-x[0]**2), 1-x[0]])
+        jac = lambda x: np.array([[-20*x[0], 10], [-1, 0]])
+        start = [-1.2, 1.]
+    elif problem == "exponential":
+        t = 4*np.arange(40)/39
+        y = 2*np.exp(-0.3*t)
+        y[5] += 3
+        y[20] -= 2.5
+        fun = lambda x: x[0]*np.exp(-x[1]*t)-y
+        jac = lambda x: np.column_stack((np.exp(-x[1]*t), -t*x[0]*np.exp(-x[1]*t)))
+        start = [1., 1.]
+    elif problem == "scaled":
+        a = np.array([[1., 1e6], [2., -1e6], [1., 0.]])
+        fun = lambda x: a@x - [4., 2., 2.]
+        jac = lambda x: a
+        start = [1., 1e-6]
+    elif problem == "coupled":
+        target = 1 + np.arange(40)/40
+        def fun(x):
+            d = x-target
+            return 2*d + 0.25*d*d - np.r_[0., d[:-1]]
+        def jac(x):
+            return np.diag(2 + 0.5*(x-target)) + np.diag(-np.ones(39), -1)
+        start = np.zeros(40)
+    else:
+        raise AssertionError(problem)
+    result = least_squares(fun, start, jac=jac, method="lm",
+                           x_scale=1. if problem == "units" else "jac",
+                           ftol=1e-14, xtol=1e-14, gtol=1e-14, max_nfev=2000)
+    assert result.success, (case, result.message)
+    rows.append(dict(x=result.x.tolist(), cost=result.cost,
+                     active_mask=result.active_mask.astype(int).tolist(), status=int(result.status)))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows), allow_nan=False))
+"#;
+
+#[test]
+fn lm_orthogonal_subproblem_matches_live_scipy() {
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP least-squares LM: missing SciPy; compared cases = 0");
+        return;
+    }
+
+    let mut cases = Vec::new();
+    for weak in [1.0e-6, 1.0e-8, 1.0e-9, 1.0e-10, 1.0e-12] {
+        for weak_column in 0..2 {
+            for rotated in [false, true] {
+                cases.push(LmCase {
+                    problem: "correlated".into(),
+                    weak,
+                    magnitude: 1.0,
+                    weak_column,
+                    rotated,
+                });
+            }
+        }
+    }
+    for magnitude in [1.0e-200, 1.0e-100, 1.0, 1.0e100, 1.0e200] {
+        cases.push(LmCase {
+            problem: "units".into(),
+            weak: 0.0,
+            magnitude,
+            weak_column: 0,
+            rotated: false,
+        });
+    }
+    for problem in ["rosenbrock", "exponential", "scaled", "coupled"] {
+        cases.push(LmCase {
+            problem: problem.into(),
+            weak: 0.0,
+            magnitude: 1.0,
+            weak_column: 0,
+            rotated: false,
+        });
+    }
+
+    let output = Command::new(&python)
+        .args(["-c", LM_ORACLE, &serde_json::to_string(&cases).unwrap()])
+        .output()
+        .expect("launch SciPy");
+    assert!(
+        output.status.success(),
+        "SciPy LM oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: Oracle = serde_json::from_slice(&output.stdout).expect("SciPy result JSON");
+    if required {
+        assert_eq!((&*oracle.scipy, &*oracle.numpy), ("1.17.1", "2.4.3"));
+    }
+    assert_eq!(oracle.rows.len(), cases.len());
+    let mut compared = 0;
+    for (case, reference) in cases.iter().zip(&oracle.rows) {
+        let x0 = match case.problem.as_str() {
+            "correlated" => vec![0.0, 0.0],
+            "units" => vec![0.0],
+            "rosenbrock" => vec![-1.2, 1.0],
+            "exponential" => vec![1.0, 1.0],
+            "scaled" => vec![1.0, 1.0e-6],
+            "coupled" => vec![0.0; 40],
+            _ => unreachable!(),
+        };
+        let jac_case = case.clone();
+        let result = least_squares(
+            |x| lm_residuals(case, x),
+            &x0,
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(move |x| {
+                    lm_jacobian(&jac_case, x)
+                })),
+                x_scale: Some(if case.problem == "units" {
+                    XScale::Fixed(vec![1.0])
+                } else {
+                    XScale::Jac
+                }),
+                ftol: 1.0e-14,
+                xtol: 1.0e-14,
+                gtol: 1.0e-14,
+                max_nfev: Some(2000),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{case:?}: {error}"));
+        assert!(
+            result.success && result.status > 0 && reference.status > 0,
+            "{case:?}: {result:?}"
+        );
+        assert_eq!(result.x.len(), reference.x.len(), "{case:?}");
+        assert_eq!(result.active_mask, reference.active_mask, "{case:?}");
+        for (actual, expected) in result.x.iter().zip(&reference.x) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-6 * expected.abs().max(1.0),
+                "{case:?}: x {actual} != SciPy {expected}"
+            );
+        }
+        assert!(
+            (result.cost - reference.cost).abs() <= 1.0e-8 * reference.cost.abs().max(1.0),
+            "{case:?}: cost {} != SciPy {}",
+            result.cost,
+            reference.cost
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 29);
+    eprintln!(
+        "Least-squares LM compared cases = {compared}; SciPy {}, NumPy {}",
+        oracle.scipy, oracle.numpy
+    );
 }
 
 #[test]
