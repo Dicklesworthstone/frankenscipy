@@ -3787,7 +3787,9 @@ mod tests {
 
     fn implicit_circle_model(analytic: bool) -> Model {
         let model = Model::new(|beta, x| {
-            x.chunks_exact(2)
+            x.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|point| {
                     (point[0] - beta[0]).powi(2) + (point[1] - beta[1]).powi(2) - beta[2].powi(2)
                 })
@@ -3798,7 +3800,9 @@ mod tests {
         if analytic {
             model
                 .with_fjacb(|beta, x| {
-                    x.chunks_exact(2)
+                    x.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|point| {
                             vec![
                                 -2.0 * (point[0] - beta[0]),
@@ -3809,7 +3813,9 @@ mod tests {
                         .collect()
                 })
                 .with_fjacd(|beta, x| {
-                    x.chunks_exact(2)
+                    x.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|point| vec![2.0 * (point[0] - beta[0]), 2.0 * (point[1] - beta[1])])
                         .collect()
                 })
@@ -3852,7 +3858,7 @@ mod tests {
             assert!(fit.eps.iter().all(|f| f.abs() < 1.0e-7));
             assert_vec_close(&fit.beta, &[0.99187421, -2.00005068, 2.99625549], 5.0e-7);
             assert_close(fit.sum_square_delta, 0.029_845_886_988_293_276, 1.0e-8);
-            for point in fit.xplus.chunks_exact(2) {
+            for point in fit.xplus.as_chunks::<2>().0 {
                 assert_close(
                     (point[0] - fit.beta[0]).hypot(point[1] - fit.beta[1]),
                     fit.beta[2],
@@ -3960,19 +3966,25 @@ mod tests {
         let wy = vec![4.0, 1.0, 2.0, 3.0, 1.0, 4.0, 2.0];
         let model = Model::new(|beta, points| {
             points
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|point| beta[0] * point[0] + beta[1] - point[1])
                 .collect()
         })
         .with_fjacb(|_, points| {
             points
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|point| vec![point[0], 1.0])
                 .collect()
         })
         .with_fjacd(|beta, points| {
             points
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|_| vec![beta[0], -1.0])
                 .collect()
         })
@@ -4117,7 +4129,9 @@ mod tests {
 
     fn implicit_ellipse_model(analytic: bool) -> Model {
         let model = Model::new(|beta, x| {
-            x.chunks_exact(2)
+            x.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|point| {
                     ((point[0] - beta[0]) / beta[2]).powi(2)
                         + ((point[1] - beta[1]) / beta[3]).powi(2)
@@ -4130,7 +4144,9 @@ mod tests {
         if analytic {
             model
                 .with_fjacb(|beta, x| {
-                    x.chunks_exact(2)
+                    x.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|point| {
                             let dx = point[0] - beta[0];
                             let dy = point[1] - beta[1];
@@ -4144,7 +4160,9 @@ mod tests {
                         .collect()
                 })
                 .with_fjacd(|beta, x| {
-                    x.chunks_exact(2)
+                    x.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|point| {
                             vec![
                                 2.0 * (point[0] - beta[0]) / beta[2].powi(2),

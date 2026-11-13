@@ -5623,11 +5623,25 @@ impl ContinuousDistribution for GenGamma {
         }
         let a = self.a;
         let c = self.c;
-        let y = x.powf(c.abs());
+        // X^c is Gamma(a, 1). A negative c reverses the inequality,
+        // but must also remain negative in the power transformation.
+        let y = x.powf(c);
         if c > 0.0 {
             lower_regularized_gamma(a, y)
         } else {
             upper_regularized_gamma(a, y)
+        }
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        if x <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        let y = x.powf(self.c);
+        if self.c > 0.0 {
+            fsci_special::log_gammainc_scalar(self.a, y)
+        } else {
+            fsci_special::log_gammaincc_scalar(self.a, y)
         }
     }
 
@@ -5641,11 +5655,23 @@ impl ContinuousDistribution for GenGamma {
         }
         let a = self.a;
         let c = self.c;
-        let y = x.powf(c.abs());
+        let y = x.powf(c);
         if c > 0.0 {
             upper_regularized_gamma(a, y)
         } else {
             lower_regularized_gamma(a, y)
+        }
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let y = x.powf(self.c);
+        if self.c > 0.0 {
+            fsci_special::log_gammaincc_scalar(self.a, y)
+        } else {
+            fsci_special::log_gammainc_scalar(self.a, y)
         }
     }
 
@@ -5661,9 +5687,31 @@ impl ContinuousDistribution for GenGamma {
         }
         let a = self.a;
         let c = self.c;
-        let q_adj = if c > 0.0 { q } else { 1.0 - q };
-        let y = fsci_special::gammaincinv_scalar(a, q_adj);
-        y.powf(1.0 / c.abs())
+        let y = if c > 0.0 {
+            fsci_special::gammaincinv_scalar(a, q)
+        } else {
+            // Invert Q directly; 1-q rounds to one for small left-tail q.
+            fsci_special::gammainccinv_scalar(a, q)
+        };
+        y.powf(1.0 / c)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return f64::INFINITY;
+        }
+        if q == 1.0 {
+            return 0.0;
+        }
+        let y = if self.c > 0.0 {
+            fsci_special::gammainccinv_scalar(self.a, q)
+        } else {
+            fsci_special::gammaincinv_scalar(self.a, q)
+        };
+        y.powf(1.0 / self.c)
     }
 
     fn mean(&self) -> f64 {
@@ -5793,7 +5841,11 @@ impl ContinuousDistribution for GenGamma {
     fn mode(&self) -> f64 {
         let a = self.a;
         let c = self.c;
-        if c * a >= 1.0 {
+        if c < 0.0 {
+            // d(log f)/dx=0 gives x^c=a-1/c, which is positive for every
+            // negative c. The reciprocal-gamma family has an interior mode.
+            (a - 1.0 / c).powf(1.0 / c)
+        } else if c * a >= 1.0 {
             ((c * a - 1.0) / c).powf(1.0 / c)
         } else {
             0.0
@@ -104770,6 +104822,65 @@ mod tests {
         assert!(gg.mode() >= 0.0 && gg.mode().is_finite());
         let q50 = gg.ppf(0.5);
         assert!(q50 > 0.0 && q50.is_finite());
+    }
+
+    #[test]
+    fn gen_gamma_negative_shape_has_increasing_cdf_and_reciprocal_quantiles() {
+        let distribution = GenGamma::new(2.0, -1.0);
+        let mut previous = 0.0;
+        for x in [0.05_f64, 0.5, 1.0, 2.0, 10.0] {
+            let expected = (-x.recip()).exp() * (1.0 + x.recip());
+            let actual = distribution.cdf(x);
+            assert!(actual > previous, "CDF decreases at {x}");
+            assert!((actual - expected).abs() < 2.0e-14);
+            assert!((distribution.sf(x) + actual - 1.0).abs() < 2.0e-14);
+            previous = actual;
+        }
+        for c in [-2.0_f64, -1.0, -0.5, 0.5, 1.0, 2.0] {
+            let distribution = GenGamma::new(2.0, c);
+            for q in [1.0e-30_f64, 1.0e-12, 0.01, 0.5, 0.99] {
+                let lower = distribution.ppf(q);
+                let upper = distribution.isf(q);
+                assert!(lower.is_finite() && lower > 0.0);
+                assert!(upper.is_finite() && upper > 0.0);
+                assert!((distribution.logcdf(lower) - q.ln()).abs() < 2.0e-10);
+                assert!((distribution.logsf(upper) - q.ln()).abs() < 2.0e-10);
+            }
+            assert_eq!(distribution.ppf(0.0), 0.0);
+            assert_eq!(distribution.ppf(1.0), f64::INFINITY);
+            assert_eq!(distribution.isf(0.0), f64::INFINITY);
+            assert_eq!(distribution.isf(1.0), 0.0);
+            assert_eq!(distribution.cdf(f64::INFINITY), 1.0);
+            assert_eq!(distribution.sf(f64::INFINITY), 0.0);
+            assert!(distribution.ppf(f64::NAN).is_nan());
+            assert!(distribution.isf(-0.1).is_nan());
+        }
+        assert!((distribution.mode() - 1.0 / 3.0).abs() < 1.0e-16);
+        for c in [-2.0_f64, -1.0, -0.5] {
+            let distribution = GenGamma::new(2.0, c);
+            let mode = distribution.mode();
+            let derivative = (c * distribution.a - 1.0 - c * mode.powf(c)) / mode;
+            assert!(derivative.abs() < 1.0e-13);
+            assert!(distribution.pdf(mode) > distribution.pdf(mode * 0.99));
+            assert!(distribution.pdf(mode) > distribution.pdf(mode * 1.01));
+        }
+    }
+
+    #[test]
+    fn gen_gamma_log_tails_remain_finite_after_probability_underflow() {
+        let distribution = GenGamma::new(2.0, -1.0);
+        assert_eq!(distribution.cdf(1.0e-4), 0.0);
+        assert!(
+            (distribution.logcdf(1.0e-4) - (-1.0e4 + 1.0e4_f64.ln_1p())).abs()
+                < 2.0e-12
+        );
+        assert_eq!(distribution.sf(1.0e200), 0.0);
+        assert!(
+            (distribution.logsf(1.0e200)
+                - (-2.0 * 1.0e200_f64.ln() - 2.0_f64.ln()))
+                .abs()
+                < 2.0e-12
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_stats::{ContinuousDistribution, GammaDist};
+use fsci_stats::{ContinuousDistribution, GammaDist, GenGamma};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -413,4 +413,86 @@ fn diff_stats_gamma_fit_maximum_likelihood() {
         "the old moment fit must fail every new MLE row"
     );
     ledger.finish(3);
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneralizedGammaArm {
+    a: f64,
+    c: f64,
+    method: String,
+    argument: f64,
+    value: f64,
+}
+
+#[test]
+fn diff_stats_generalized_gamma_signed_shapes() {
+    let script = r#"
+import json
+from scipy.stats import gengamma
+
+rows = []
+for a in (0.5, 2.0, 10.0):
+    for c in (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0):
+        for x in (0.25, 0.5, 1.0, 2.0, 5.0):
+            for method in ('cdf', 'sf', 'logcdf', 'logsf'):
+                rows.append(dict(a=a, c=c, method=method, argument=x,
+                                 value=float(getattr(gengamma, method)(x, a, c))))
+        for q in (1e-30, 1e-12, 0.01, 0.25, 0.5, 0.9, 1-1e-12):
+            for method in ('ppf', 'isf'):
+                rows.append(dict(a=a, c=c, method=method, argument=q,
+                                 value=float(getattr(gengamma, method)(q, a, c))))
+print(json.dumps(rows, allow_nan=False))
+"#;
+    let output = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        output => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "required generalized-gamma oracle failed: {output:?}"
+            );
+            eprintln!("skipping generalized-gamma oracle: {output:?}");
+            return;
+        }
+    };
+    let rows: Vec<GeneralizedGammaArm> =
+        serde_json::from_slice(&output.stdout).expect("finite generalized-gamma oracle rows");
+    assert_eq!(rows.len(), 612, "every signed-shape case must be compared");
+    let mut ledger = CompareLedger::new(
+        "diff_stats_generalized_gamma_signed_shapes",
+        &["cdf", "sf", "logcdf", "logsf", "ppf", "isf"],
+    );
+    for row in rows {
+        let distribution = GenGamma::new(row.a, row.c);
+        let rust = match row.method.as_str() {
+            "cdf" => distribution.cdf(row.argument),
+            "sf" => distribution.sf(row.argument),
+            "logcdf" => distribution.logcdf(row.argument),
+            "logsf" => distribution.logsf(row.argument),
+            "ppf" => distribution.ppf(row.argument),
+            "isf" => distribution.isf(row.argument),
+            unknown => panic!("unknown generalized-gamma oracle method: {unknown}"),
+        };
+        let case_id = format!("a{}_c{}_{}", row.a, row.c, row.argument);
+        let (reference, rust) = ledger
+            .pair(&row.method, &case_id, Some(row.value), Some(rust))
+            .expect("both generalized-gamma arms must return a finite value");
+        // SciPy takes the logarithm of its ordinary probability here, so
+        // log tails near zero need an absolute tolerance for that rounding.
+        let tolerance = if row.method.starts_with("log") {
+            3.0e-12 * reference.abs().max(1.0)
+        } else {
+            3.0e-11 * reference.abs().max(1.0e-300)
+        };
+        let pass = (rust - reference).abs() <= tolerance;
+        ledger.compared(&row.method, &case_id, pass);
+        assert!(
+            pass,
+            "gengamma {case_id} {}: Rust={rust:.17e}, SciPy={reference:.17e}, tol={tolerance:.3e}",
+            row.method
+        );
+    }
+    ledger.finish(90);
 }
