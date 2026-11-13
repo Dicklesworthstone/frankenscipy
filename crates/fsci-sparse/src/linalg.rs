@@ -11428,16 +11428,11 @@ pub fn minres(
 /// Solves min ||Ax - b||₂ (equivalent to A^T A x = A^T b but numerically superior).
 /// Works for rectangular matrices (overdetermined and underdetermined systems).
 /// Based on Golub-Kahan bidiagonalization.
-/// Matches `scipy.sparse.linalg.lsqr(A, b)` in the ITERATION, but NOT in the
-/// DEFAULT ITERATION LIMIT. SciPy defaults to `iter_lim = 2 * n`
-/// (`_isolve/lsqr.py:330-331`); this defaults to `n * 10`. Same shape of divergence
-/// as `lsmr` below, same reasoning — see `scipy_default_iteration_limits`.
-/// LSQR for the plain least-squares problem, `min ||Ax - b||`.
+/// The default iteration budget is `2 * n`, as in SciPy. An inconsistent
+/// system can converge at a nonzero residual when the normal equations hold.
 ///
-/// Equivalent to `lsqr_damped(a, b, 0.0, options)`, and BIT-FOR-BIT what this
-/// function computed before `damp` existed: the damping rotation is skipped by an
-/// explicit branch rather than folded into the arithmetic, so the undamped path runs
-/// the same operations in the same order.
+/// Equivalent to `lsqr_damped(a, b, 0.0, options)`: both entry points share the
+/// same undamped recurrence and stopping tests.
 ///
 /// `A` may be any [`LinearOperator`] that defines `rmatvec` (LSQR applies `Aᵀ` every step, as
 /// SciPy's does).
@@ -11548,9 +11543,9 @@ fn lsqr_impl(
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    // Accumulates SciPy's `res2 = sum(psi**2)`; stays exactly 0 when damp == 0,
-    // so every residual expression below is unchanged on the undamped path.
-    let mut res2 = 0.0_f64;
+    // Norm of the accumulated damping residuals (SciPy's sqrt(res2)).
+    // Hypot avoids squaring the problem's scale in the residual estimate.
+    let mut damping_residual_norm = 0.0_f64;
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
@@ -11559,7 +11554,7 @@ fn lsqr_impl(
             message: "rhs length must match matrix rows".to_string(),
         });
     }
-    validate_iterative_finite_inputs(a, b, None, options)?;
+    validate_iterative_finite_inputs(a, b, x0, options)?;
 
     // SciPy's `iter_lim = 2 * n` (lsqr.py). Ours was `n * 10`, five times larger, so a
     // caller who passed no explicit budget got a different convergence VERDICT than
@@ -11668,11 +11663,10 @@ fn lsqr_impl(
 
     let mut phi_bar = beta;
     let mut rho_bar = alpha;
-    // Running ‖A‖_F estimate, accumulated from the bidiagonal entries exactly as
-    // SciPy accumulates `anorm2`. It is the denominator of the least-squares
-    // stopping test below, which is the only test that can terminate an
+    // Running ‖A‖_F estimate, accumulated from the bidiagonal entries. It is
+    // the denominator of the least-squares stopping test below, which can terminate an
     // inconsistent system (frankenscipy-7crv5).
-    let mut a_norm_sq = 0.0_f64;
+    let mut a_norm = 0.0_f64;
     // Reused bidiagonalization matvec buffers (A·v and Aᵀ·u) hoisted out of the
     // LSQR loop — byte-identical. frankenscipy-2hclc.
     let mut av = vec![0.0; u.len()];
@@ -11690,28 +11684,37 @@ fn lsqr_impl(
             for ui in &mut u {
                 *ui /= beta;
             }
-        }
+            // The current diagonal belongs to this bidiagonal column; the
+            // alpha computed below belongs to the NEXT column. Omitting the
+            // current alpha loses alpha_1 from the stopping-test scale.
+            a_norm = a_norm.hypot(alpha).hypot(beta).hypot(damp);
 
-        // v = A^T*u - beta*v
-        csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atu)?;
-        for i in 0..n {
-            v[i] = atu[i] - beta * v[i];
-        }
-        alpha = vec_norm(&v);
-        if alpha > 0.0 {
-            for vi in &mut v {
-                *vi /= alpha;
+            // v = A^T*u - beta*v. If beta is exactly zero the left Krylov
+            // space is exhausted: retain alpha/v and finish the rotation.
+            csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atu)?;
+            for i in 0..n {
+                v[i] = atu[i] - beta * v[i];
+            }
+            alpha = vec_norm(&v);
+            if alpha > 0.0 {
+                for vi in &mut v {
+                    *vi /= alpha;
+                }
             }
         }
 
+        // Preserve the primitive factors for the stopping test: the products
+        // formed by the rotations can underflow even when their relative
+        // normal residual is significant.
+        let rho_bar_before_damping = rho_bar;
+        let phi_bar_before_damping = phi_bar;
+
         // Plane rotation eliminating the damping parameter, which alters the
         // diagonal of the lower-bidiagonal matrix (`_isolve/lsqr.py:441-452`).
-        // SciPy branches on a positive damp and notes the else-arm is exactly
-        // `cs1 = 1, sn1 = 0`; keeping that branch rather than folding it means
-        // the undamped path performs the SAME operations it always did, so it
-        // stays bit-for-bit identical rather than merely equivalent.
+        // At zero damping the rotation is the identity (`cs1 = 1, sn1 = 0`),
+        // so plain LSQR and damped LSQR with damp=0 follow the same recurrence.
         let (rho_bar_damped, psi) = if damp > 0.0 {
-            let rho_bar1 = (rho_bar * rho_bar + damp * damp).sqrt();
+            let rho_bar1 = rho_bar.hypot(damp);
             let cs1 = rho_bar / rho_bar1;
             let sn1 = damp / rho_bar1;
             let psi = sn1 * phi_bar;
@@ -11720,10 +11723,15 @@ fn lsqr_impl(
         } else {
             (rho_bar, 0.0)
         };
-        res2 += psi * psi;
+        damping_residual_norm = damping_residual_norm.hypot(psi);
 
         // Construct and apply rotation
-        let rho = (rho_bar_damped * rho_bar_damped + beta * beta).sqrt();
+        let rho = rho_bar_damped.hypot(beta);
+        if rho == 0.0 || !rho.is_finite() {
+            return Err(SparseError::SingularMatrix {
+                message: "lsqr orthogonalization broke down before a stopping test".to_string(),
+            });
+        }
         let cs = rho_bar_damped / rho;
         let sn = beta / rho;
         let theta = sn * alpha;
@@ -11760,16 +11768,18 @@ fn lsqr_impl(
         }
 
         // Check convergence — SciPy's istop=1: the residual itself is small.
-        // SciPy's `rnorm = sqrt(res1 + res2)` with `res1 = phibar**2`. With
-        // damp == 0 res2 is 0 and this is `phi_bar.abs()` exactly.
-        let res_norm = (phi_bar * phi_bar + res2).sqrt() / b_norm;
-        if res_norm < options.tol {
+        // This is the augmented residual when damp > 0. The result field
+        // always describes the original system, so recompute it on return.
+        let r_norm = phi_bar.hypot(damping_residual_norm);
+        let res_norm = r_norm / b_norm;
+        if res_norm <= options.tol {
+            let ax = a.matvec(&x)?;
             return Ok(IterativeSolveResult {
                 solution: x,
-                // status: istop 1, estimated residual √(φ̄² + res2)/‖b‖ < tol
+                // status: istop 1, estimated augmented residual / ‖b‖ ≤ tol
                 converged: true,
                 iterations: iteration + 1,
-                residual_norm: res_norm,
+                residual_norm: vec_norm_diff(&ax, b) / b_norm,
             });
         }
 
@@ -11789,17 +11799,32 @@ fn lsqr_impl(
         // removed an absolute gate there for good reasons that still hold. A
         // missing stopping criterion is not fixed by clamping the recurrence
         // that runs on past it.
-        // SciPy adds `dampsq` here too (`_isolve/lsqr.py:435`): the norm being
-        // estimated is that of the AUGMENTED operator [[A]; [damp*I]].
-        a_norm_sq += alpha * alpha + beta * beta + damp * damp;
-        let a_norm = a_norm_sq.sqrt();
-        let ar_norm = alpha * (sn * phi).abs();
-        let r_norm = (phi_bar * phi_bar + res2).sqrt();
-        if ar_norm > 0.0
+        // An EXACT zero bidiagonal coefficient is convergence. Requiring
+        // ar_norm > 0 skipped that case and advanced into a 0/0 rotation.
+        // A computed sn or phi can instead be zero because it underflowed.
+        // The damping and final rotations give
+        // phi = (rho_bar_before_damping / rho) * phi_bar_before_damping.
+        // Compare logs of these primitive factors, so neither that product
+        // nor beta/rho can erase a nonzero relative normal residual. An old
+        // rotation factor rounded to zero is not an exact-zero certificate.
+        let normal_residual_is_zero = alpha == 0.0 || beta == 0.0;
+        let normal_residual_is_small = if options.tol > 0.0
             && a_norm > 0.0
             && r_norm > 0.0
-            && ar_norm / (a_norm * r_norm) <= options.tol
+            && alpha > 0.0
+            && beta > 0.0
+            && rho_bar_before_damping != 0.0
+            && phi_bar_before_damping != 0.0
         {
+            let log_relative_normal = (alpha.ln() - a_norm.ln())
+                + (beta.ln() - rho.ln())
+                + (rho_bar_before_damping.abs().ln() - rho.ln())
+                + (phi_bar_before_damping.abs().ln() - r_norm.ln());
+            log_relative_normal <= options.tol.ln()
+        } else {
+            false
+        };
+        if normal_residual_is_zero || normal_residual_is_small {
             let ax = a.matvec(&x)?;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -32333,6 +32358,253 @@ mod tests {
                 xi.is_finite() && xi == 0.0,
                 "x[{i}] = {xi}, expected exactly 0 (NaN means the rho divide escaped)"
             );
+        }
+    }
+
+    #[test]
+    fn lsqr_stops_when_an_inconsistent_system_reaches_exact_stationarity() {
+        // A^T (b - A x) = 10 - 5 x vanishes at x = 2, while
+        // ||b - A x|| = sqrt(5) cannot vanish. The first Golub-Kahan
+        // step has alpha_next = 0 exactly; advancing once more divides by
+        // a zero Givens radius and used to replace the answer with NaN.
+        let a = CsrMatrix::from_components(
+            Shape2D::new(2, 1),
+            vec![1.0, 2.0],
+            vec![0, 0],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr(&a, &[4.0, 3.0], IterativeSolveOptions::default()).expect("lsqr");
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        assert!((result.solution[0] - 2.0).abs() < 1e-14, "{result:?}");
+        assert!(
+            (result.residual_norm - 5.0_f64.sqrt() / 5.0).abs() < 1e-14,
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn lsqr_stationarity_survives_scaling_damping_and_matrix_free_warm_starts() {
+        for exponent in [-100, 0, 100] {
+            let scale = 2.0_f64.powi(exponent);
+            let operator = crate::FunctionOperator::new(Shape2D::new(2, 1), |x| {
+                Ok(vec![scale * x[0], 2.0 * scale * x[0]])
+            })
+            .with_rmatvec(|x| Ok(vec![scale * x[0] + 2.0 * scale * x[1]]));
+            for damp in [0.0_f64, 0.5] {
+                for start in [None, Some([1.0])] {
+                    let result = lsqr_regularized(
+                        &operator,
+                        &[4.0 * scale, 3.0 * scale],
+                        damp * scale,
+                        start.as_ref().map(<[f64; 1]>::as_slice),
+                        IterativeSolveOptions {
+                            tol: 1e-12,
+                            ..IterativeSolveOptions::default()
+                        },
+                    )
+                    .expect("matrix-free lsqr");
+                    let initial = start.map_or(0.0, |x| x[0]);
+                    // (A^T A + damp^2) x = A^T b + damp^2 x0,
+                    // divided by scale^2 so the certificate is scale-independent.
+                    let expected = (10.0 + damp * damp * initial) / (5.0 + damp * damp);
+                    assert!(result.converged, "exponent={exponent}, {result:?}");
+                    assert!(
+                        (result.solution[0] - expected).abs() < 2e-12,
+                        "exponent={exponent}, damp={damp}, start={start:?}, {result:?}"
+                    );
+                    let x = result.solution[0];
+                    let relative_residual = (4.0 - x).hypot(3.0 - 2.0 * x) / 5.0;
+                    assert!(
+                        (result.residual_norm - relative_residual).abs() < 2e-14,
+                        "exponent={exponent}, {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lsqr_exhausted_left_space_and_zero_tolerance_return_finite_solutions() {
+        let a =
+            CsrMatrix::from_components(Shape2D::new(1, 1), vec![4.0], vec![0], vec![0, 1], false)
+                .expect("csr");
+        for (damp, tol) in [(0.0, 0.0), (0.01, 0.01), (0.01, 1e-12), (4.0, 1e-12)] {
+            let result = lsqr_damped(
+                &a,
+                &[1.0],
+                damp,
+                IterativeSolveOptions {
+                    tol,
+                    ..IterativeSolveOptions::default()
+                },
+            )
+            .expect("scalar lsqr");
+            assert!(result.converged, "damp={damp}, tol={tol}, {result:?}");
+            assert_eq!(result.iterations, 1);
+            assert!((result.solution[0] - 4.0 / (16.0 + damp * damp)).abs() < 1e-14);
+            // With loose tolerance the old first stopping branch returned the
+            // augmented residual (~0.0025), not the actual residual (~6.25e-6).
+            let actual = (1.0 - 4.0 * result.solution[0]).abs();
+            assert!((result.residual_norm - actual).abs() < 1e-14, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn lsqr_iteration_limit_does_not_imply_stationarity() {
+        let a = CsrMatrix::from_components(
+            Shape2D::new(3, 2),
+            vec![1.0, 3.0, 1.0, 1.0],
+            vec![0, 1, 0, 1],
+            vec![0, 1, 2, 4],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr(
+            &a,
+            &[2.0, 1.0, 5.0],
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("iteration limit is not an error");
+        assert!(!result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        let x = &result.solution;
+        let residual = [2.0 - x[0], 1.0 - 3.0 * x[1], 5.0 - x[0] - x[1]];
+        let normal = [residual[0] + residual[2], 3.0 * residual[1] + residual[2]];
+        assert!(
+            vec_norm(&normal) > 1e-3,
+            "fixture must not already be stationary"
+        );
+        assert!((result.residual_norm - vec_norm(&residual) / 30.0_f64.sqrt()).abs() < 1e-14);
+    }
+
+    #[test]
+    fn lsqr_does_not_confuse_underflow_with_exact_stationarity() {
+        // The first step has |sn * phi| ~ 5e-351, which underflows even
+        // though all vector norms are representable. Its relative normal
+        // residual is ~5e-201, greater than the requested 1e-250 tolerance.
+        let a = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1e100, 1e-100, 1e100],
+            vec![0, 0, 1],
+            vec![0, 1, 3],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr_damped(
+            &a,
+            &[1e-150, 0.0],
+            1e100,
+            IterativeSolveOptions {
+                tol: 1e-250,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("one finite iteration");
+        assert!(!result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        assert!(result.solution.iter().all(|value| value.is_finite()));
+        assert!(result.solution[0] > 4.9e-251 && result.solution[0] < 5.1e-251);
+        assert!((result.residual_norm - 0.5).abs() < 1e-14);
+
+        // Here (alpha / a_norm) * sn underflows before the large phi/r_norm
+        // factor restores a representable 1e-200 ratio. The log fallback
+        // must preserve this nonzero residual instead of accepting tol=1e-250.
+        let narrow = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1e100, 1e-100, 1e-100],
+            vec![0, 0, 1],
+            vec![0, 1, 3],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr(
+            &narrow,
+            &[1e100, 0.0],
+            IterativeSolveOptions {
+                tol: 1e-250,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("one finite iteration");
+        assert!(!result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        assert!((result.solution[0] - 1.0).abs() < 1e-14);
+        assert!((result.residual_norm / 1e-200 - 1.0).abs() < 1e-14);
+
+        // phi = cs * phi_bar underflows, although the relative normal
+        // residual is 1e-200, greater than tol. Only its factors are usable.
+        let tiny_phi = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1e-100, 1e100, 1e100],
+            vec![0, 0, 1],
+            vec![0, 1, 3],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr(
+            &tiny_phi,
+            &[1e-150, 0.0],
+            IterativeSolveOptions {
+                tol: 1e-250,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("one finite iteration with underflowed phi");
+        assert!(!result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        assert_eq!(result.solution, vec![0.0, 0.0]);
+        assert!((result.residual_norm - 1.0).abs() < 1e-14);
+
+        // Damping makes sn = beta/rho underflow to zero. The normal
+        // residual remains mathematically nonzero, so tol=0 cannot pass.
+        let tiny_sine = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1.0, 1e-100, 1.0],
+            vec![0, 0, 1],
+            vec![0, 1, 3],
+            false,
+        )
+        .expect("csr");
+        let result = lsqr_damped(
+            &tiny_sine,
+            &[1.0, 0.0],
+            1e300,
+            IterativeSolveOptions {
+                tol: 0.0,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("one finite iteration with underflowed sine");
+        assert!(!result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        assert_eq!(result.solution, vec![0.0, 0.0]);
+        assert!((result.residual_norm - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn lsqr_checks_non_finite_warm_starts_before_iteration() {
+        let a = identity_csr(1);
+        for options in [
+            IterativeSolveOptions::default(),
+            hardened_unchecked_iterative_options(),
+        ] {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(matches!(
+                    lsqr_regularized(&a, &[1.0], 0.0, Some(&[value]), options),
+                    Err(SparseError::NonFiniteInput { .. })
+                ));
+            }
         }
     }
 

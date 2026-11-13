@@ -94,7 +94,7 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let points = vec![
+    let mut points = vec![
         // 5x3 over-determined, full column rank
         PointCase {
             case_id: "5x3_overdetermined".into(),
@@ -152,6 +152,20 @@ fn generate_query() -> OracleQuery {
             b: vec![1.0, 2.0, 3.0, 4.0],
         },
     ];
+
+    // Exact Golub-Kahan exhaustion at a nonzero least-squares residual:
+    // A^T(b - A*x) is zero after one iteration, but b - A*x is not.
+    // Continuing the recurrence used to turn the solution x = [2] into NaN.
+    for exponent in [-100, 0, 100] {
+        let scale = 2.0_f64.powi(exponent);
+        points.push(PointCase {
+            case_id: format!("exact_stationarity_scale_2_pow_{exponent}"),
+            rows: 2,
+            cols: 1,
+            triplets: vec![(0, 0, scale), (1, 0, 2.0 * scale)],
+            b: vec![4.0 * scale, 3.0 * scale],
+        });
+    }
 
     OracleQuery { points }
 }
