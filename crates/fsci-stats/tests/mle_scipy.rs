@@ -11,8 +11,8 @@ use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
-    LocationScale, Lognormal, MleOptions, MleParameter, MleResult, Normal, RDist, SkewCauchy,
-    StatsError, Weibull, fit_mle, fit_mle_censored, fit_mle_location_scale,
+    LocationScale, Lognormal, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
+    SkewCauchy, StatsError, Weibull, fit_mle, fit_mle_censored, fit_mle_location_scale,
     fit_mle_location_scale_censored, with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -44,6 +44,7 @@ cases = [
     ('chi2', stats.chi2, [(0.3,), (4.0,), (50.0,)]),
     ('chi', stats.chi, [(0.3,), (4.0,), (50.0,)]),
     ('rdist', stats.rdist, [(1.5,), (5.0,), (30.0,)]),
+    ('nakagami', stats.nakagami, [(0.25,), (2.0,), (1000.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -65,6 +66,212 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn nakagami_mle_fits_the_fixed_scale_likelihood() {
+    let ordinary = vec![0.5, 0.7, 1.0, 1.2, 1.5, 0.8, 1.1];
+    let scaled: Vec<_> = ordinary.iter().map(|x| 3.5 * x).collect();
+    // Independent 100-digit roots and likelihoods at the exact f64 samples.
+    // SciPy 1.17.1 fits agree to its default optimizer tolerance. The old
+    // moment ratio gave identical shapes before/after rescaling, even though
+    // the concrete distribution fixes scale=1. Constant data away from one
+    // also have a finite shape-only MLE and must not be rejected as degenerate.
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            for (data, expected_shape, expected_nll) in [
+                (
+                    ordinary.clone(),
+                    2.552_027_326_371_895,
+                    1.664_305_741_143_636_8,
+                ),
+                (
+                    scaled.clone(),
+                    0.087_759_956_055_839_38,
+                    27.932_952_000_990_9,
+                ),
+                (
+                    vec![2.0, 2.0],
+                    0.406_692_729_164_263_7,
+                    4.417_143_924_415_318,
+                ),
+                (
+                    vec![0.5, 0.5],
+                    0.916_687_435_099_460_8,
+                    0.494_922_538_002_487_1,
+                ),
+            ] {
+                let fitted = Nakagami::try_fit(&data).expect("finite fixed-scale Nakagami MLE");
+                assert!(
+                    (fitted.nu / expected_shape - 1.0).abs() < 2.0e-12,
+                    "{mode:?}: shape {} != {expected_shape}",
+                    fitted.nu
+                );
+                let nll = likelihood(&fitted, &data);
+                assert!(
+                    (nll - expected_nll).abs() < 2.0e-11,
+                    "{mode:?}: likelihood {nll} != {expected_nll}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn nakagami_mle_preserves_concentrated_samples_without_a_shape_ceiling() {
+    // The second sample's likelihood gap is about 1.33e-20. Directly
+    // subtracting x^2-1-2*log(x), or log(nu)-digamma(nu), loses it. The
+    // references use 100-digit arithmetic on the exact f64 observations.
+    for (data, expected_shape, expected_nll) in [
+        (
+            [0.99, 1.0, 1.01],
+            3_750.072_905_352_076,
+            -10.166_888_456_629_632,
+        ),
+        (
+            [1.0 - 1.0e-10, 1.0, 1.0 + 1.0e-10],
+            3.749_999_379_447_294_5e19,
+            -65.428_934_604_148_5,
+        ),
+    ] {
+        let fitted = Nakagami::try_fit(&data).expect("concentrated sample must fit");
+        assert!((fitted.nu / expected_shape - 1.0).abs() < 3.0e-14);
+        let nll = likelihood(&fitted, &data);
+        assert!((nll - expected_nll).abs() < 1.0e-11, "NLL={nll}");
+        assert!(fitted.mean().is_finite() && fitted.mean() > 0.0 && fitted.mean() <= 1.0);
+        assert!(fitted.var().is_finite() && fitted.var() > 0.0);
+        assert!(fitted.pdf(1.0).is_finite() && fitted.pdf(1.0) > 0.0);
+    }
+}
+
+#[test]
+fn nakagami_small_shapes_endpoints_and_large_shape_densities_remain_usable() {
+    let small = Nakagami::new(0.25);
+    assert_eq!(small.mode(), 0.0);
+    assert_eq!(small.pdf(0.0), f64::INFINITY);
+    assert_eq!(small.logpdf(0.0), f64::INFINITY);
+    assert!((small.pdf(1.0) - 0.303_780_786_595_024_94).abs() < 1.0e-14);
+    assert!((small.mean() - 0.675_978_240_067_284_8).abs() < 1.0e-14);
+    let half = Nakagami::new(0.5);
+    assert_eq!(half.mode(), 0.0);
+    assert!((half.pdf(0.0) - (2.0 / std::f64::consts::PI).sqrt()).abs() < 1.0e-15);
+    assert_eq!(Nakagami::new(1.0).pdf(0.0), 0.0);
+
+    for shape in [1.0e-300, 1.0e-310] {
+        let distribution = Nakagami::new(shape);
+        // As nu tends to zero, f(1) / (2*nu) tends to one and
+        // E[X] / sqrt(pi*nu) tends to one. Corrections at these shapes
+        // are far below double-precision resolution.
+        assert!((distribution.pdf(1.0) / (2.0 * shape) - 1.0).abs() < 2.0e-13);
+        assert!(
+            (distribution.mean() / (std::f64::consts::PI.sqrt() * shape.sqrt()) - 1.0).abs()
+                < 1.0e-14
+        );
+        assert!(distribution.logpdf(1.0).is_finite());
+        assert_eq!(distribution.var(), 1.0);
+    }
+    let diffuse_fit = Nakagami::try_fit(&[1.0e150, 1.0e150]).unwrap();
+    assert!((diffuse_fit.nu / 1.0e-300 - 1.0).abs() < 2.0e-14);
+    assert!(diffuse_fit.logpdf(1.0e150).is_finite());
+
+    // Direct 100-digit gamma-ratio and density evaluations. At nu=1000
+    // the old gamma exponentials were inf/inf. At nu=1e30 even subtracting
+    // log-gammas (also used by SciPy's density) loses the finite answer.
+    for (shape, density, mean, variance) in [
+        (
+            16.0,
+            3.174_961_011_908_986,
+            0.992_219_198_457_234_9,
+            0.015_501_062_212_882_232,
+        ),
+        (
+            1000.0,
+            25.229_222_697_443,
+            0.999_875_007_817_382_2,
+            0.000_249_968_742_189_944_2,
+        ),
+        (
+            1.0e10,
+            79_788.456_079_621_63,
+            0.999_999_999_987_5,
+            2.499_999_999_968_75e-11,
+        ),
+        (1.0e30, 797_884_560_802_865.4, 1.0, 2.5e-31),
+        (1.0e100, 7.978_845_608_028_654e49, 1.0, 2.5e-101),
+    ] {
+        let distribution = Nakagami::new(shape);
+        assert!((distribution.pdf(1.0) / density - 1.0).abs() < 3.0e-14);
+        assert!((distribution.logpdf(1.0) - density.ln()).abs() < 3.0e-14);
+        assert!((distribution.mean() - mean).abs() < 3.0e-15);
+        assert!((distribution.var() / variance - 1.0).abs() < 3.0e-14);
+    }
+
+    let points = [
+        f64::NEG_INFINITY,
+        -1.0,
+        -0.0,
+        0.0,
+        0.3,
+        1.0,
+        100.0,
+        f64::INFINITY,
+        f64::NAN,
+    ];
+    for shape in [0.25, 0.5, 2.0, 16.0, 1000.0, 1.0e30, f64::MAX] {
+        let distribution = Nakagami::new(shape);
+        assert_eq!(distribution.pdf(f64::NEG_INFINITY), 0.0);
+        assert_eq!(distribution.pdf(f64::INFINITY), 0.0);
+        assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        assert!(distribution.pdf(f64::NAN).is_nan());
+        assert!(distribution.logpdf(f64::NAN).is_nan());
+        for ((&x, density), log_density) in points
+            .iter()
+            .zip(distribution.pdf_many(&points))
+            .zip(distribution.logpdf_many(&points))
+        {
+            assert_eq!(density.to_bits(), distribution.pdf(x).to_bits());
+            assert_eq!(log_density.to_bits(), distribution.logpdf(x).to_bits());
+        }
+    }
+}
+
+#[test]
+fn nakagami_mle_rejects_undefined_samples_and_honors_hardened_caps() {
+    for data in [vec![], vec![1.0]] {
+        assert!(matches!(
+            Nakagami::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for data in [
+        [0.0, 1.0],
+        [-1.0, 1.0],
+        [f64::NAN, 1.0],
+        [f64::INFINITY, 1.0],
+        [f64::NEG_INFINITY, 1.0],
+    ] {
+        assert!(matches!(
+            Nakagami::try_fit(&data),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        Nakagami::try_fit(&[1.0, 1.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+    assert!(matches!(
+        Nakagami::try_fit(&[f64::MAX, f64::MAX]),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Nakagami::try_fit(&[0.9, 1.0, 1.1]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(Nakagami::try_fit(&[0.9, 1.1]).is_ok());
+        });
+    });
 }
 
 #[test]
@@ -1034,6 +1241,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
                 let fitted = RDist::try_fit(&data).unwrap();
                 (vec![fitted.c], likelihood(&fitted, &data))
             }
+            "nakagami" => {
+                let fitted = Nakagami::try_fit(&data).unwrap();
+                (vec![fitted.nu], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -1152,10 +1363,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 48,
+        compared, 51,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 16; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 17; samples per case = 2000");
 }
 
 #[test]
@@ -1190,7 +1401,10 @@ fn censored_mle_uses_survival_for_unobserved_failures() {
         assert!((fitted.parameters[1] - expected_scale).abs() < 2.0e-6);
         assert!((fitted.negative_log_likelihood - expected_nll).abs() < 1.0e-10);
     }
-    assert_eq!(data, original, "fitting must not rewrite censoring metadata");
+    assert_eq!(
+        data, original,
+        "fitting must not rewrite censoring metadata"
+    );
 }
 
 #[test]
@@ -1209,8 +1423,7 @@ fn censored_mle_exact_observations_preserve_the_uncensored_fit() {
         CensoredData::interval_censored(&values, &values).unwrap(),
     ];
     for data in samples {
-        let fitted =
-            fit_mle_censored(&data, &parameters, factory, MleOptions::default()).unwrap();
+        let fitted = fit_mle_censored(&data, &parameters, factory, MleOptions::default()).unwrap();
         assert_eq!(
             fitted
                 .parameters
@@ -1356,12 +1569,7 @@ fn censored_mle_rejects_invalid_impossible_and_uninformative_data() {
             vec![],
             vec![(f64::NEG_INFINITY, f64::INFINITY)],
         ),
-        CensoredData::new(
-            vec![],
-            vec![],
-            vec![],
-            vec![(f64::INFINITY, f64::INFINITY)],
-        ),
+        CensoredData::new(vec![], vec![], vec![], vec![(f64::INFINITY, f64::INFINITY)]),
         CensoredData::new(
             vec![],
             vec![],
@@ -1412,12 +1620,7 @@ fn censored_mle_rejects_invalid_impossible_and_uninformative_data() {
 fn censored_mle_hardened_counts_every_censoring_kind_toward_sample_cap() {
     with_stats_runtime_mode(RuntimeMode::Hardened, || {
         with_hardened_stats_caps(3, 3, || {
-            let data = CensoredData::new(
-                vec![0.0],
-                vec![-1.0],
-                vec![1.0],
-                vec![(-0.2, 0.2)],
-            );
+            let data = CensoredData::new(vec![0.0], vec![-1.0], vec![1.0], vec![(-0.2, 0.2)]);
             let result = fit_mle_censored(
                 &data,
                 &[MleParameter::Free(0.0), MleParameter::Positive(1.0)],
@@ -1547,7 +1750,10 @@ fn censored_mle_matches_live_scipy() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
         eprintln!("SKIP censored MLE: SciPy oracle unavailable via {python}; compared cases = 0");
         return;
     }

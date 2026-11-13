@@ -286,13 +286,10 @@ impl MleSample<'_> {
         &'a self,
         distribution: &'a D,
     ) -> impl Iterator<Item = f64> + 'a {
-        let (exact, left, right, interval): (&[f64], &[f64], &[f64], &[(f64, f64)]) =
-            match self {
-                Self::Exact(data) => (*data, &[], &[], &[]),
-                Self::Censored(data) => {
-                    (&data.uncensored, &data.left, &data.right, &data.interval)
-                }
-            };
+        let (exact, left, right, interval): (&[f64], &[f64], &[f64], &[(f64, f64)]) = match self {
+            Self::Exact(data) => (*data, &[], &[], &[]),
+            Self::Censored(data) => (&data.uncensored, &data.left, &data.right, &data.interval),
+        };
         exact
             .iter()
             .map(move |&x| distribution.logpdf(x))
@@ -380,6 +377,93 @@ fn validate_shape_sample(
         });
     }
     crate::validate_finite_fit_data(data, minimum_sample, family)
+}
+
+/// log(a) - psi(a), preserving the small positive gap at large shape.
+fn log_minus_digamma(a: f64) -> f64 {
+    if a < 16.0 {
+        a.ln() - crate::digamma(a)
+    } else {
+        // Bernoulli expansion from the Gamma MLE: subtracting the two
+        // logarithmic terms directly loses the score for concentrated data.
+        let inverse = a.recip();
+        let square = inverse * inverse;
+        0.5 * inverse
+            + square
+                * (1.0 / 12.0
+                    + square
+                        * (-1.0 / 120.0
+                            + square
+                                * (1.0 / 252.0
+                                    + square
+                                        * (-1.0 / 240.0
+                                            + square
+                                                * (1.0 / 132.0 - square * (691.0 / 32760.0))))))
+    }
+}
+
+/// Shared shape score for Gamma and standardized Nakagami likelihoods.
+/// The strict bounds 1/(2a) < log(a)-psi(a) < 1/a bracket the unique root
+/// without an arbitrary upper shape limit or an unconstrained Newton step.
+pub(crate) fn gamma_shape_from_log_gap(target: f64, family: &str) -> Result<f64, FitError> {
+    if !target.is_finite() || target <= 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE requires a finite positive likelihood gap"
+        )));
+    }
+    let mut lower = 0.5 / target;
+    let mut upper = 1.0 / target;
+    if !upper.is_finite() || upper <= 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE shape exceeds the finite parameter range"
+        )));
+    }
+    for _ in 0..100 {
+        let shape = lower + 0.5 * (upper - lower);
+        if log_minus_digamma(shape) > target {
+            lower = shape;
+        } else {
+            upper = shape;
+        }
+        if upper - lower <= 4.0 * f64::EPSILON * shape {
+            break;
+        }
+    }
+    Ok(lower + 0.5 * (upper - lower))
+}
+
+/// x^2 - 1 - 2*log(x), nonnegative for positive x. Centering at one avoids
+/// cancellation of all significant bits for tightly concentrated samples.
+pub(crate) fn nakagami_shape_statistic(x: f64) -> f64 {
+    let offset = x - 1.0;
+    if offset.abs() <= 0.5 {
+        offset * offset - 2.0 * fsci_special::log1pmx_scalar(offset)
+    } else {
+        x * x - 1.0 - 2.0 * x.ln()
+    }
+}
+
+pub(crate) fn nakagami_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "Nakagami")?;
+    if data.iter().any(|&x| x <= 0.0) {
+        return Err(FitError::UnsupportedData(
+            "Nakagami MLE with fixed location zero requires strictly positive observations".into(),
+        ));
+    }
+    // Location and scale are fixed at zero and one in the concrete type.
+    // The log-likelihood score is log(nu)-psi(nu)-mean(x^2-1-2*log(x)).
+    // Constant samples away from one have a finite maximum; only all-ones
+    // data have an unbounded concentration parameter.
+    let mut target = 0.0;
+    let mut correction = 0.0;
+    let n = data.len() as f64;
+    for &x in data {
+        let term = nakagami_shape_statistic(x) / n - correction;
+        let next = target + term;
+        correction = (next - target) - term;
+        target = next;
+    }
+    gamma_shape_from_log_gap(target, "Nakagami")
 }
 
 /// With location zero and scale one, the chi/chi-squared likelihood has a
@@ -669,7 +753,12 @@ where
     D: ContinuousDistribution,
     F: Fn(&[f64]) -> Option<D>,
 {
-    fit_mle_sample(MleSample::Exact(data), parameters, make_distribution, options)
+    fit_mle_sample(
+        MleSample::Exact(data),
+        parameters,
+        make_distribution,
+        options,
+    )
 }
 
 /// Fit a continuous distribution to exact, left-, right-, or interval-censored
@@ -927,7 +1016,8 @@ where
         }
         if !data.has_exact() && all_zero {
             return Err(FitError::NonConvergent(
-                "censored observations have probability one and provide no fitting information".into(),
+                "censored observations have probability one and provide no fitting information"
+                    .into(),
             ));
         }
         Ok(MleResult {

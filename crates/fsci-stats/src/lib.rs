@@ -5434,53 +5434,7 @@ impl ContinuousDistribution for GammaDist {
             })
             .sum::<f64>()
             / n;
-        if !s.is_finite() || s <= 0.0 {
-            return Err(FitError::NonConvergent(
-                "GammaDist MLE has no finite shape for a degenerate sample".into(),
-            ));
-        }
-
-        // 1/(2a) < log(a)-digamma(a) < 1/a brackets the unique root.
-        let mut lo = 0.5 / s;
-        let mut hi = 1.0 / s;
-        if !hi.is_finite() {
-            return Err(FitError::NonConvergent(
-                "GammaDist MLE shape exceeds the finite parameter range".into(),
-            ));
-        }
-        for _ in 0..100 {
-            let a = lo + 0.5 * (hi - lo);
-            let gap = if a < 16.0 {
-                a.ln() - digamma(a)
-            } else {
-                // Bernoulli expansion avoids subtracting nearly equal log(a)
-                // and digamma(a) for large shape. At a >= 16 the omitted term
-                // is below double-precision roundoff of this difference.
-                let inverse = a.recip();
-                let square = inverse * inverse;
-                0.5 * inverse
-                    + square
-                        * (1.0 / 12.0
-                            + square
-                                * (-1.0 / 120.0
-                                    + square
-                                        * (1.0 / 252.0
-                                            + square
-                                                * (-1.0 / 240.0
-                                                    + square
-                                                        * (1.0 / 132.0
-                                                            - square * (691.0 / 32760.0))))))
-            };
-            if gap > s {
-                lo = a;
-            } else {
-                hi = a;
-            }
-            if hi - lo <= 4.0 * f64::EPSILON * a {
-                break;
-            }
-        }
-        let a = lo + 0.5 * (hi - lo);
+        let a = mle::gamma_shape_from_log_gap(s, "GammaDist")?;
         let scale = mean / a;
         if !a.is_finite() || a <= 0.0 || !scale.is_finite() || scale <= 0.0 {
             return Err(FitError::NonConvergent(
@@ -21180,7 +21134,8 @@ impl TruncNormal {
     fn log_interval_ratio(&self, lower: f64, upper: f64, log_mass: f64) -> f64 {
         let mode = 0.0_f64.clamp(self.a, self.b);
         let part_mode = 0.0_f64.clamp(lower, upper);
-        Self::relative_log_mass(lower, upper) - log_mass
+        Self::relative_log_mass(lower, upper)
+            - log_mass
             - (part_mode - mode) * (0.5 * part_mode + 0.5 * mode)
     }
 
@@ -21229,8 +21184,8 @@ impl TruncNormal {
             for (node, weight) in NODES_WEIGHTS {
                 for t in [middle - half * node, middle + half * node] {
                     let offset = scale * t;
-                    let mut value = half * weight
-                        * (-(origin * scale) * t - 0.5 * offset * offset).exp();
+                    let mut value =
+                        half * weight * (-(origin * scale) * t - 0.5 * offset * offset).exp();
                     for k in 0..5 {
                         let term = value - corrections[k];
                         let next = sums[k] + term;
@@ -21263,8 +21218,7 @@ impl TruncNormal {
             let log_q = q.ln();
             // SF(a+offset) <= exp(-a*offset-offset²/2). The rationalized
             // root bounds the quantile even when a is extremely large.
-            let limit = -log_q
-                / (0.5 * a.hypot((-2.0 * log_q).sqrt()) + 0.5 * a);
+            let limit = -log_q / (0.5 * a.hypot((-2.0 * log_q).sqrt()) + 0.5 * a);
             let mut lower = 0.0;
             let mut upper = limit.min(width) / scale;
             for _ in 0..80 {
@@ -21316,7 +21270,10 @@ impl TruncNormal {
             return self.b;
         }
         if q > 0.5 {
-            let reflected = Self { a: -self.b, b: -self.a };
+            let reflected = Self {
+                a: -self.b,
+                b: -self.a,
+            };
             return -reflected.lower_quantile(1.0 - q);
         }
         if self.a >= 0.0 {
@@ -21351,8 +21308,7 @@ impl TruncNormal {
             let scale = (1.0 / origin.max(1.0)).min(b - a);
             // Omitted density is below exp(-64); even its fourth-moment
             // tail is below 3e-21. This cutoff scales with the local width.
-            let cutoff = 64.0 / (0.5 * origin.hypot(128.0_f64.sqrt()) + 0.5 * origin)
-                / scale;
+            let cutoff = 64.0 / (0.5 * origin.hypot(128.0_f64.sqrt()) + 0.5 * origin) / scale;
             let lower = ((a - origin) / scale).max(-cutoff);
             let upper = ((b - origin) / scale).min(cutoff);
             let integrals = Self::local_integrals(origin, scale, lower, upper);
@@ -21368,8 +21324,7 @@ impl TruncNormal {
                 scale * scale * variance,
                 sign * central3 / variance.powf(1.5),
                 central4 / (variance * variance) - 3.0,
-                scale.ln() + integrals[0].ln() + (origin * scale) * m1
-                    + 0.5 * scale * scale * m2,
+                scale.ln() + integrals[0].ln() + (origin * scale) * m1 + 0.5 * scale * scale * m2,
             ];
         }
 
@@ -21382,8 +21337,7 @@ impl TruncNormal {
         };
         let mean = p_a - p_b;
         let m2 = 1.0 + boundary(self.a, p_a, 1) - boundary(self.b, p_b, 1);
-        let variance = 1.0 + boundary(self.a - mean, p_a, 1)
-            - boundary(self.b - mean, p_b, 1);
+        let variance = 1.0 + boundary(self.a - mean, p_a, 1) - boundary(self.b - mean, p_b, 1);
         let m3 = 2.0 * mean + boundary(self.a, p_a, 2) - boundary(self.b, p_b, 2);
         let m4 = 3.0 * m2 + boundary(self.a, p_a, 3) - boundary(self.b, p_b, 3);
         let central3 = m3 + mean * (2.0 * mean * mean - 3.0 * m2);
@@ -21413,8 +21367,7 @@ impl ContinuousDistribution for TruncNormal {
             return f64::NEG_INFINITY;
         }
         let mode = 0.0_f64.clamp(self.a, self.b);
-        -Self::relative_log_mass(self.a, self.b)
-            - (x - mode) * (0.5 * x + 0.5 * mode)
+        -Self::relative_log_mass(self.a, self.b) - (x - mode) * (0.5 * x + 0.5 * mode)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -21438,7 +21391,10 @@ impl ContinuousDistribution for TruncNormal {
     }
 
     fn isf(&self, q: f64) -> f64 {
-        let reflected = Self { a: -self.b, b: -self.a };
+        let reflected = Self {
+            a: -self.b,
+            b: -self.a,
+        };
         -reflected.lower_quantile(q)
     }
 
@@ -21823,65 +21779,127 @@ impl ContinuousDistribution for Rice {
 
 /// Nakagami distribution.
 ///
-/// Matches `scipy.stats.nakagami`.
+/// Matches `scipy.stats.nakagami` with location zero and scale one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Nakagami {
-    pub nu: f64, // shape parameter >= 0.5
+    pub nu: f64, // finite positive shape parameter
 }
 
 impl Nakagami {
     #[must_use]
     pub fn new(nu: f64) -> Self {
-        assert!(nu >= 0.5, "nu must be >= 0.5");
+        assert!(nu.is_finite() && nu > 0.0, "nu must be positive and finite");
         Self { nu }
     }
 
-    /// Log-density at many points, hoisting the `ln2 + ν·ln(ν) − lnΓ(ν)` lead term
-    /// out of the per-point loop. Byte-identical to mapping `logpdf` (lead kept as
-    /// the leading addends, same subtraction order); x≤0 delegates to `pdf`.
+    fn logpdf_normalization(&self) -> f64 {
+        let nu = self.nu;
+        if nu < 16.0 {
+            // Recurrence keeps logGamma(nu) finite for subnormal nu even
+            // if a gamma kernel's intermediate reciprocal would overflow.
+            let log_gamma_nu = if nu < 0.5 {
+                ln_gamma(nu + 1.0) - nu.ln()
+            } else {
+                ln_gamma(nu)
+            };
+            std::f64::consts::LN_2 + nu * nu.ln() - log_gamma_nu
+        } else {
+            // Center at x=1. Stirling's remainder computes
+            // log(2) + nu*log(nu) - logGamma(nu) - nu without cancellation,
+            // even when the original nu*log(nu) expression overflows.
+            let inverse = nu.recip();
+            let square = inverse * inverse;
+            let remainder = inverse
+                * (1.0 / 12.0
+                    + square
+                        * (-1.0 / 360.0
+                            + square
+                                * (1.0 / 1260.0
+                                    + square
+                                        * (-1.0 / 1680.0
+                                            + square
+                                                * (1.0 / 1188.0 - square * (691.0 / 360360.0))))));
+            0.5 * nu.ln() + 0.5 * (2.0 / PI).ln() - remainder
+        }
+    }
+
+    fn logpdf_with_normalization(&self, x: f64, normalization: f64) -> f64 {
+        if !self.nu.is_finite() || self.nu <= 0.0 || x.is_nan() {
+            return f64::NAN;
+        }
+        if x < 0.0 || x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        if x == 0.0 {
+            return if self.nu < 0.5 {
+                f64::INFINITY
+            } else if self.nu == 0.5 {
+                normalization
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
+        if self.nu < 16.0 {
+            normalization + (2.0 * self.nu - 1.0) * x.ln() - self.nu * x * x
+        } else {
+            normalization - x.ln() - self.nu * mle::nakagami_shape_statistic(x)
+        }
+    }
+
+    fn log_mean(&self) -> f64 {
+        let nu = self.nu;
+        if nu < 0.5 {
+            ln_gamma(nu + 0.5) - ln_gamma(nu + 1.0) + 0.5 * nu.ln()
+        } else if nu < 16.0 {
+            ln_gamma(nu + 0.5) - ln_gamma(nu) - 0.5 * nu.ln()
+        } else {
+            // Log of Gamma(nu+1/2)/(Gamma(nu)*sqrt(nu)). The Bernoulli
+            // ratio expansion avoids both overflowing gamma factors and
+            // cancellation of their logarithms for concentrated fits.
+            let inverse = nu.recip();
+            let square = inverse * inverse;
+            inverse
+                * (-1.0 / 8.0
+                    + square
+                        * (1.0 / 192.0
+                            + square
+                                * (-1.0 / 640.0
+                                    + square
+                                        * (17.0 / 14336.0
+                                            + square
+                                                * (-31.0 / 18432.0
+                                                    + square * (691.0 / 180224.0))))))
+        }
+    }
+
+    /// Log-density at many points, hoisting the shape normalization out of
+    /// the loop. Byte-identical to mapping `logpdf`, including large shapes.
     #[must_use]
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
-        let nu = self.nu;
-        let lead = 2.0_f64.ln() + nu * nu.ln() - ln_gamma(nu);
+        let normalization = self.logpdf_normalization();
         par_continuous_map_min(xs, 65536, |x| {
-            if x <= 0.0 {
-                return self.pdf(x).ln();
-            }
-            lead + (2.0 * nu - 1.0) * x.ln() - nu * x * x
+            self.logpdf_with_normalization(x, normalization)
         })
     }
 
-    /// Density at many points; hoists the `2·ν^ν / Γ(ν)` coefficient like
-    /// [`logpdf_many`](Self::logpdf_many). Byte-identical to mapping `pdf`.
+    /// Density at many points, evaluated in log space so intermediate
+    /// powers and gamma factors do not overflow. Byte-identical to `pdf`.
     #[must_use]
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
-        let nu = self.nu;
-        let coeff = 2.0 * nu.powf(nu) / ln_gamma(nu).exp();
+        let normalization = self.logpdf_normalization();
         par_continuous_map_min(xs, 65536, |x| {
-            if x < 0.0 {
-                return 0.0;
-            }
-            coeff * x.powf(2.0 * nu - 1.0) * (-nu * x * x).exp()
+            self.logpdf_with_normalization(x, normalization).exp()
         })
     }
 }
 
 impl ContinuousDistribution for Nakagami {
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 {
-            return 0.0;
-        }
-        let nu = self.nu;
-        2.0 * nu.powf(nu) / ln_gamma(nu).exp() * x.powf(2.0 * nu - 1.0) * (-nu * x * x).exp()
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln2 + ν·ln(ν) − lnΓ(ν) + (2ν−1)·ln(x) − ν·x²; finite in the tail. frankenscipy-p82v7
-        if x <= 0.0 {
-            return self.pdf(x).ln();
-        }
-        let nu = self.nu;
-        2.0_f64.ln() + nu * nu.ln() - ln_gamma(nu) + (2.0 * nu - 1.0) * x.ln() - nu * x * x
+        self.logpdf_with_normalization(x, self.logpdf_normalization())
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -21934,12 +21952,16 @@ impl ContinuousDistribution for Nakagami {
     }
 
     fn mean(&self) -> f64 {
-        ln_gamma(self.nu + 0.5).exp() / (self.nu.sqrt() * ln_gamma(self.nu).exp())
+        if self.nu < 0.5 {
+            self.nu.sqrt() * (ln_gamma(self.nu + 0.5) - ln_gamma(self.nu + 1.0)).exp()
+        } else {
+            self.log_mean().exp()
+        }
     }
 
     fn var(&self) -> f64 {
-        let m = self.mean();
-        1.0 - m * m
+        // E[X^2]=1. Keep the variance when the mean rounds to exactly one.
+        -(2.0 * self.log_mean()).exp_m1()
     }
 
     fn entropy(&self) -> f64 {
@@ -21982,78 +22004,18 @@ impl ContinuousDistribution for Nakagami {
     }
 
     fn mode(&self) -> f64 {
-        // Setting d/dx [x^{2ν−1}·exp(−ν x²)] = 0 gives 2ν x² = 2ν − 1,
-        // i.e. mode = √((2ν − 1)/(2ν)) = √((ν − 1/2)/ν). Constructor
-        // requires ν ≥ 1/2, so the radicand is non-negative
-        // (frankenscipy-rt24d).
-        ((self.nu - 0.5) / self.nu).sqrt()
+        if self.nu <= 0.5 {
+            0.0
+        } else {
+            ((self.nu - 0.5) / self.nu).sqrt()
+        }
     }
 
+    /// Maximum-likelihood shape with location zero and scale one fixed.
+    /// Matches `scipy.stats.nakagami.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let mut sum1 = 0.0_f64;
-        let mut sum2 = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Nakagami data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Nakagami support is [0, ∞); got {x}"
-                )));
-            }
-            sum1 += x;
-            sum2 += x * x;
-            count += 1;
-        }
-        let n = count as f64;
-        let mean = sum1 / n;
-        let m2 = sum2 / n;
-        if m2 <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "Nakagami MoM: sample E[x²]={m2} non-positive"
-            )));
-        }
-        // Ω-invariant moment ratio:
-        //   r = (E[X])² / E[X²] = Γ(ν+0.5)² / (Γ(ν)² · ν)
-        // monotone-increasing in ν from 2/π at ν=0.5 to 1 as ν→∞.
-        let target = (mean * mean) / m2;
-        let ratio_of = |nu: f64| {
-            let log_num = 2.0 * ln_gamma(nu + 0.5);
-            let log_den = 2.0 * ln_gamma(nu) + nu.ln();
-            (log_num - log_den).exp()
-        };
-        let mut lo = 0.5_f64;
-        let mut hi = 50.0_f64;
-        let r_lo = ratio_of(lo); // ≈ 0.6366
-        let r_hi = ratio_of(hi); // ≈ 0.995
-        if !(r_lo <= target && target <= r_hi) {
-            return Err(FitError::NonConvergent(format!(
-                "Nakagami MoM bracket failed: r({lo})={r_lo}, r({hi})={r_hi}, target={target}"
-            )));
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let r_mid = ratio_of(mid);
-            if (r_mid - target).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { nu: mid });
-            }
-            if r_mid < target {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
         Ok(Self {
-            nu: 0.5 * (lo + hi),
+            nu: mle::nakagami_shape_mle(data)?,
         })
     }
 }
@@ -31834,10 +31796,7 @@ impl ContinuousDistribution for Argus {
             ));
         }
         let n = data.len() as f64;
-        let mean_complement = data
-            .iter()
-            .map(|&x| (1.0 - x) * (1.0 + x) / n)
-            .sum::<f64>();
+        let mean_complement = data.iter().map(|&x| (1.0 - x) * (1.0 + x) / n).sum::<f64>();
         // In the exponential-family coordinate a=χ²/2 the score is
         // E_a[1-X²] minus the sample average, decreasing from 3/5 at
         // a=0. Detect a supremum at the excluded χ=0 boundary explicitly.
@@ -83685,7 +83644,12 @@ mod tests {
         let data = [2.0, 4.0, 6.0];
         let fitted = ChiSquared::fit(&data);
         // 60-digit root of psi(df/2) = mean(log(data)) - log(2).
-        assert_close(fitted.df, 4.589_741_071_010_053, 1e-12, "chi-squared MLE df");
+        assert_close(
+            fitted.df,
+            4.589_741_071_010_053,
+            1e-12,
+            "chi-squared MLE df",
+        );
     }
 
     #[test]
@@ -102548,20 +102512,18 @@ mod tests {
     }
 
     #[test]
-    fn nakagami_fit_metamorphic_omega_invariant_ratio() {
-        // The fit's MoM ratio is invariant under multiplicative scaling of
-        // the data (it's r = mean² / E[x²]). So fit(data) == fit(α·data)
-        // for any α > 0.
+    fn nakagami_fit_fixed_scale_responds_to_rescaling() {
+        // Scale is fixed at one, so rescaling observations changes the
+        // likelihood and its maximizing shape. A scale-invariant moment
+        // ratio fits a different model. These score roots use independent
+        // 100-digit evaluation at the exact f64 observations.
         let data = [0.5_f64, 0.7, 1.0, 1.2, 1.5, 0.8, 1.1];
         let scaled: Vec<f64> = data.iter().map(|x| 3.5 * x).collect();
         let a = Nakagami::try_fit(&data).expect("fit a");
         let b = Nakagami::try_fit(&scaled).expect("fit b");
-        assert!(
-            (a.nu - b.nu).abs() < 1e-10,
-            "Ω-invariance: ν_unscaled {} ≠ ν_scaled {}",
-            a.nu,
-            b.nu
-        );
+        assert!((a.nu - 2.552_027_326_371_895).abs() < 1.0e-12);
+        assert!((b.nu - 0.087_759_956_055_839_38).abs() < 1.0e-13);
+        assert!(b.nu < 0.5);
     }
 
     #[test]
@@ -104870,15 +104832,10 @@ mod tests {
     fn gen_gamma_log_tails_remain_finite_after_probability_underflow() {
         let distribution = GenGamma::new(2.0, -1.0);
         assert_eq!(distribution.cdf(1.0e-4), 0.0);
-        assert!(
-            (distribution.logcdf(1.0e-4) - (-1.0e4 + 1.0e4_f64.ln_1p())).abs()
-                < 2.0e-12
-        );
+        assert!((distribution.logcdf(1.0e-4) - (-1.0e4 + 1.0e4_f64.ln_1p())).abs() < 2.0e-12);
         assert_eq!(distribution.sf(1.0e200), 0.0);
         assert!(
-            (distribution.logsf(1.0e200)
-                - (-2.0 * 1.0e200_f64.ln() - 2.0_f64.ln()))
-                .abs()
+            (distribution.logsf(1.0e200) - (-2.0 * 1.0e200_f64.ln() - 2.0_f64.ln())).abs()
                 < 2.0e-12
         );
     }
@@ -116929,7 +116886,11 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
             let d = TruncNormal::new(a, b);
             let actual = moment_values(&d);
             for (i, (&got, &reference)) in actual.iter().zip(&expected).enumerate() {
-                let want = if i == 0 || i == 2 { sign * reference } else { reference };
+                let want = if i == 0 || i == 2 {
+                    sign * reference
+                } else {
+                    reference
+                };
                 assert!(
                     (got - want).abs() <= 2.0e-12 * want.abs(),
                     "moment {i} for [{a}, {b}]: {got} != {want}"
@@ -116958,10 +116919,7 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
             }
         }
         for q in [1.0e-300, 1.0e-20, 0.1, 0.5, 0.9, 1.0 - 1.0e-12] {
-            for (got, want) in [
-                (whole.ppf(q), normal.ppf(q)),
-                (whole.isf(q), normal.isf(q)),
-            ] {
+            for (got, want) in [(whole.ppf(q), normal.ppf(q)), (whole.isf(q), normal.isf(q))] {
                 assert!((got - want).abs() < 2.0e-12 * want.abs().max(1.0));
             }
         }
@@ -116972,10 +116930,7 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
         let half_mean = (2.0 / pi).sqrt();
         let half_skew = 2.0_f64.sqrt() * (4.0 - pi) / (pi - 2.0).powf(1.5);
         let half_kurtosis = 8.0 * (pi - 3.0) / (pi - 2.0).powi(2);
-        for (a, b, sign) in [
-            (0.0, f64::INFINITY, 1.0),
-            (f64::NEG_INFINITY, 0.0, -1.0),
-        ] {
+        for (a, b, sign) in [(0.0, f64::INFINITY, 1.0), (f64::NEG_INFINITY, 0.0, -1.0)] {
             let half = TruncNormal::new(a, b);
             let expected = [
                 sign * half_mean,
@@ -117061,7 +117016,17 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
         ] {
             let d = TruncNormal::new(a, b);
             let mut previous = a;
-            for q in [1.0e-300, 1.0e-20, 1.0e-12, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0 - 1.0e-12] {
+            for q in [
+                1.0e-300,
+                1.0e-20,
+                1.0e-12,
+                0.01,
+                0.25,
+                0.5,
+                0.75,
+                0.99,
+                1.0 - 1.0e-12,
+            ] {
                 let lower = d.ppf(q);
                 assert!(lower.is_finite() && lower >= previous && lower <= b);
                 previous = lower;
@@ -117085,7 +117050,6 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
         assert!(tiny > 0.0);
         assert!((tiny / 1.0e-300 - (std::f64::consts::PI / 2.0).sqrt()).abs() < 1.0e-13);
     }
-
 }
 
 #[cfg(test)]
