@@ -1642,6 +1642,12 @@ pub struct DifferentialEvolutionOptions {
     pub recombination: f64,
     /// Random seed for reproducibility.
     pub seed: Option<u64>,
+    /// Integer decision variables. An empty vector means all variables are real;
+    /// otherwise it must contain one flag per bound. Both the objective and
+    /// constraint callback receive integer values at flagged coordinates.
+    /// Bounds are intersected with the integer lattice before optimization.
+    /// Integer endpoints must lie in the exactly representable range ±(2^53 - 1).
+    pub integrality: Vec<bool>,
 }
 
 impl Default for DifferentialEvolutionOptions {
@@ -1654,6 +1660,7 @@ impl Default for DifferentialEvolutionOptions {
             mutation: 0.8,
             recombination: 0.7,
             seed: None,
+            integrality: Vec::new(),
         }
     }
 }
@@ -1663,7 +1670,10 @@ impl Default for DifferentialEvolutionOptions {
 /// Matches `scipy.optimize.differential_evolution(func, bounds)`.
 ///
 /// A population-based evolutionary optimizer that requires only function evaluations
-/// (no gradients). Handles box constraints naturally.
+/// (no gradients). Handles box constraints and mixed integer/real variables.
+/// Equal bounds fix a variable exactly. Integer variables retain a continuous
+/// search coordinate internally, so rounding an accepted trial does not collapse
+/// the mutation population onto the integer lattice.
 ///
 /// # Arguments
 /// * `func` — Objective function to minimize.
@@ -1719,6 +1729,14 @@ where
             detail: "bounds must not be empty".to_string(),
         });
     }
+    if !opts.integrality.is_empty() && opts.integrality.len() != ndim {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "integrality length ({}) must match bounds length ({ndim})",
+                opts.integrality.len()
+            ),
+        });
+    }
     if opts.popsize == 0 {
         return Err(OptError::InvalidArgument {
             detail: "popsize must be at least 1".to_string(),
@@ -1767,16 +1785,48 @@ where
             ),
         });
     }
+    let mut search_bounds = bounds.to_vec();
+    let mut integer_bounds = vec![None; ndim];
     for (i, &(lo, hi)) in bounds.iter().enumerate() {
         if !lo.is_finite() || !hi.is_finite() {
             return Err(OptError::InvalidBounds {
                 detail: format!("variable {i}: bounds must be finite, got ({lo}, {hi})"),
             });
         }
-        if lo >= hi {
+        if lo > hi {
             return Err(OptError::InvalidBounds {
-                detail: format!("variable {i}: lower bound {lo} >= upper bound {hi}"),
+                detail: format!("variable {i}: lower bound {lo} > upper bound {hi}"),
             });
+        }
+        if opts.integrality.get(i).copied().unwrap_or(false) {
+            let lower = lo.ceil();
+            let upper = hi.floor();
+            if lower > upper {
+                return Err(OptError::InvalidBounds {
+                    detail: format!("variable {i}: bounds ({lo}, {hi}) contain no integer"),
+                });
+            }
+            const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_991.0;
+            if lower < -MAX_EXACT_INTEGER || upper > MAX_EXACT_INTEGER {
+                return Err(OptError::InvalidBounds {
+                    detail: format!(
+                        "variable {i}: integer bounds exceed the exactly representable range"
+                    ),
+                });
+            }
+            integer_bounds[i] = Some((lower, upper));
+            search_bounds[i] = if lower == upper {
+                (lower, upper)
+            } else {
+                // Give endpoint integers a full rounding cell, like SciPy.
+                // Exclude the half-integer endpoints where ties-to-even could
+                // round outside the feasible lattice. At large magnitudes a
+                // half step can round away; preserve the endpoint itself.
+                (
+                    (lower - 0.5).next_up().min(lower),
+                    (upper + 0.5).next_down().max(upper),
+                )
+            };
         }
     }
     let mut rng: rand::rngs::StdRng = match opts.seed {
@@ -1787,15 +1837,40 @@ where
     // Initialize population uniformly within bounds.
     let mut population: Vec<Vec<f64>> = (0..pop_count)
         .map(|_| {
-            bounds
+            search_bounds
                 .iter()
-                .map(|&(lo, hi)| rng.random_range(lo..hi))
+                .map(|&(lo, hi)| {
+                    if lo == hi {
+                        lo
+                    } else if (hi - lo).is_finite() {
+                        rng.random_range(lo..hi)
+                    } else {
+                        // Opposite-sign finite bounds can have an overflowing
+                        // width even though every convex combination is finite.
+                        let weight: f64 = rng.random();
+                        (1.0 - weight) * lo + weight * hi
+                    }
+                })
                 .collect()
         })
         .collect();
 
+    let has_integers = integer_bounds.iter().any(Option::is_some);
+    let mut evaluation_point = vec![0.0; ndim];
+    let mut evaluate_point = |point: &[f64]| {
+        if !has_integers {
+            return evaluate(point);
+        }
+        for (j, &value) in point.iter().enumerate() {
+            evaluation_point[j] = match integer_bounds[j] {
+                Some((lower, upper)) => value.round_ties_even().clamp(lower, upper),
+                None => value,
+            };
+        }
+        evaluate(&evaluation_point)
+    };
     let (mut fitness, mut violation): (Vec<f64>, Vec<f64>) =
-        population.iter().map(|x| evaluate(x)).unzip();
+        population.iter().map(|x| evaluate_point(x)).unzip();
     let mut nfev = pop_count;
 
     // Track best.
@@ -1827,7 +1902,11 @@ where
                 DeStrategy::Rand1Bin => &population[r0],
             };
             for j in 0..ndim {
-                mutant[j] = base[j] + opts.mutation * (population[r1][j] - population[r2][j]);
+                mutant[j] = if opts.mutation == 0.0 {
+                    base[j]
+                } else {
+                    base[j] + opts.mutation * (population[r1][j] - population[r2][j])
+                };
             }
 
             // Binomial crossover.
@@ -1835,14 +1914,14 @@ where
             for j in 0..ndim {
                 trial[j] = if j == j_rand || rng.random_range(0.0..1.0) < opts.recombination {
                     // Clip to bounds.
-                    mutant[j].clamp(bounds[j].0, bounds[j].1)
+                    mutant[j].clamp(search_bounds[j].0, search_bounds[j].1)
                 } else {
                     population[i][j]
                 };
             }
 
             // Selection.
-            let scored_trial = evaluate(&trial);
+            let scored_trial = evaluate_point(&trial);
             nfev += 1;
             if de_accepts(scored_trial, (fitness[i], violation[i])) {
                 population[i].copy_from_slice(&trial);
@@ -1886,8 +1965,14 @@ where
     }
 
     let best_violation = violation[best_idx];
+    let mut best_point = population[best_idx].clone();
+    for (j, value) in best_point.iter_mut().enumerate() {
+        if let Some((lower, upper)) = integer_bounds[j] {
+            *value = value.round_ties_even().clamp(lower, upper);
+        }
+    }
     let result = OptimizeResult {
-        x: population[best_idx].clone(),
+        x: best_point,
         fun: Some(fitness[best_idx]),
         success: converged,
         status: if converged {
@@ -7919,6 +8004,118 @@ mod tests {
     }
 
     // ── Differential Evolution tests ───────────────────────────────
+
+    #[test]
+    fn de_mixed_integer_callbacks_and_solution_are_feasible() {
+        let calls = std::cell::Cell::new(0);
+        let objective = |x: &[f64]| {
+            calls.set(calls.get() + 1);
+            assert_eq!(x[0], x[0].round_ties_even());
+            assert!((-4.2..=5.8).contains(&x[0]));
+            assert_eq!(x[2], 7.0);
+            (x[0] - 2.3).powi(2) + (x[1] + 0.4 * x[0]).powi(2)
+        };
+        for strategy in [crate::DeStrategy::Best1Bin, crate::DeStrategy::Rand1Bin] {
+            let result = differential_evolution(
+                objective,
+                &[(-4.2, 5.8), (-4.0, 4.0), (7.0, 7.0)],
+                DifferentialEvolutionOptions {
+                    strategy,
+                    integrality: vec![true, false, true],
+                    seed: Some(713),
+                    tol: 1e-12,
+                    ..Default::default()
+                },
+            )
+            .expect("mixed integer evolution");
+            assert!(result.success, "{}", result.message);
+            assert_eq!(result.x[0], 2.0);
+            assert_eq!(result.x[2], 7.0);
+            assert!((result.x[1] + 0.8).abs() < 2e-6, "{:?}", result.x);
+            assert!((result.fun.unwrap() - 0.09).abs() < 1e-11);
+        }
+        assert!(calls.get() > 0);
+    }
+
+    #[test]
+    fn de_integer_constraints_receive_the_same_point_as_the_objective() {
+        let objective = |x: &[f64]| {
+            assert_eq!(x[0].fract(), 0.0);
+            x[0] * x[0] + x[1] * x[1]
+        };
+        let constraint = |x: &[f64]| {
+            assert_eq!(x[0].fract(), 0.0);
+            (2.2 - x[0]).max(0.0)
+        };
+        let result = differential_evolution_constrained(
+            objective,
+            &[(0.2, 6.8), (-2.0, 2.0)],
+            constraint,
+            DifferentialEvolutionOptions {
+                integrality: vec![true, false],
+                seed: Some(81),
+                tol: 1e-12,
+                ..Default::default()
+            },
+        )
+        .expect("integer constraint");
+        assert!(result.success);
+        assert_eq!(result.x[0], 3.0);
+        assert_eq!(result.maxcv, Some(0.0));
+        assert!(result.x[1].abs() < 4e-6);
+        assert!((result.fun.unwrap() - objective(&result.x)).abs() < 1e-14);
+    }
+
+    #[test]
+    fn de_integer_singletons_fixed_parameters_and_endpoints_are_exact() {
+        for (bounds, integrality, expected) in [
+            (vec![(1.2, 2.8)], vec![true], vec![2.0]),
+            (vec![(-3.8, -2.2)], vec![true], vec![-3.0]),
+            (vec![(0.25, 0.25)], vec![false], vec![0.25]),
+            (vec![(0.0, 3.0)], vec![true], vec![0.0]),
+            (vec![(-3.0, 0.0)], vec![true], vec![-3.0]),
+        ] {
+            let result = differential_evolution(
+                |x| x[0],
+                &bounds,
+                DifferentialEvolutionOptions {
+                    integrality,
+                    seed: Some(52),
+                    ..Default::default()
+                },
+            )
+            .expect("fixed or endpoint optimum");
+            assert!(result.success);
+            assert_eq!(result.x, expected);
+            assert_eq!(result.fun, Some(expected[0]));
+        }
+    }
+
+    #[test]
+    fn de_rejects_invalid_integer_domains_before_user_callbacks() {
+        for (bounds, integrality) in [
+            (vec![(0.0, 1.0); 2], vec![true]),
+            (vec![(0.2, 0.8)], vec![true]),
+            (vec![(1.5, 1.5)], vec![true]),
+            (vec![(3.0, 2.0)], vec![true]),
+            (vec![(0.0, f64::INFINITY)], vec![true]),
+            (vec![(0.0, 9_007_199_254_740_992.0)], vec![true]),
+        ] {
+            let error = differential_evolution(
+                |_| panic!("invalid bounds must not reach the objective"),
+                &bounds,
+                DifferentialEvolutionOptions {
+                    integrality,
+                    ..Default::default()
+                },
+            )
+            .expect_err("invalid integer domain");
+            assert!(matches!(
+                error,
+                OptError::InvalidBounds { .. } | OptError::InvalidArgument { .. }
+            ));
+        }
+    }
 
     #[test]
     fn de_rastrigin_finds_global_minimum() {
