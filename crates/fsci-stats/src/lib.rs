@@ -21417,6 +21417,28 @@ impl ContinuousDistribution for TruncNormal {
     fn entropy(&self) -> f64 {
         self.moment_summary()[4]
     }
+
+    /// Maximum likelihood for the truncation bounds at fixed location zero
+    /// and scale one. The normal density is independent of the bounds, while
+    /// its normalization increases with interval width, so the smallest
+    /// interval containing every observation is the exact optimum.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "TruncNormal")?;
+        let a = data.iter().copied().fold(f64::INFINITY, f64::min);
+        let b = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if a >= b {
+            return Err(FitError::NonConvergent(
+                "TruncNormal has no finite-width MLE for a constant sample".into(),
+            ));
+        }
+        let fitted = Self { a, b };
+        if data.iter().any(|&x| !fitted.logpdf(x).is_finite()) {
+            return Err(FitError::NonConvergent(
+                "TruncNormal fitted log likelihood is not finite".into(),
+            ));
+        }
+        Ok(fitted)
+    }
 }
 
 /// Chi distribution (not chi-squared).
@@ -29220,8 +29242,8 @@ impl TruncWeibullMin {
         if t < 1.0e-3 {
             // log(expm1(t)/t), including t rounded to zero.
             let square = t * t;
-            self.c * lower.ln() + self.c.ln() + log_ratio.ln()
-                + 0.5 * t + square / 24.0 - square * square / 2880.0
+            self.c * lower.ln() + self.c.ln() + log_ratio.ln() + 0.5 * t + square / 24.0
+                - square * square / 2880.0
         } else if t <= std::f64::consts::LN_2 {
             self.c * lower.ln() + t.exp_m1().ln()
         } else {
@@ -29367,6 +29389,73 @@ impl ContinuousDistribution for TruncWeibullMin {
             1e-12,
             10,
         )
+    }
+
+    /// Maximum likelihood at fixed location zero and scale one. For every
+    /// shape, the normalizing mass is minimized by the sample endpoints;
+    /// profiling those endpoints leaves a one-dimensional shape likelihood.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 3, "TruncWeibullMin")?;
+        if data.iter().any(|&x| x <= 0.0) {
+            return Err(FitError::UnsupportedData(
+                "TruncWeibullMin MLE requires strictly positive observations".into(),
+            ));
+        }
+        let a = data.iter().copied().fold(f64::INFINITY, f64::min);
+        let b = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if a >= b {
+            return Err(FitError::NonConvergent(
+                "TruncWeibullMin has no finite-width MLE for a constant sample".into(),
+            ));
+        }
+        let relative_width = (b - a) / a;
+        let log_width = if relative_width.is_finite() {
+            relative_width.ln_1p()
+        } else {
+            b.ln() - a.ln()
+        };
+        let mut best: Option<mle::MleResult<Self>> = None;
+        // Around x=1 a narrow interval can identify a very large shape,
+        // while every ordinary shape lies on a flat likelihood plateau.
+        // One start resolving the log-support width reaches that regime.
+        for initial in [0.25, 1.0, 2.0, 4.0, log_width.recip()] {
+            let fitted = mle::fit_mle(
+                data,
+                &[mle::MleParameter::Positive(initial)],
+                |p| Some(Self { c: p[0], a, b }),
+                mle::MleOptions::default(),
+            );
+            if let Ok(fitted) = fitted
+                && best.as_ref().is_none_or(|previous| {
+                    fitted.negative_log_likelihood < previous.negative_log_likelihood
+                })
+            {
+                best = Some(fitted);
+            }
+        }
+        let fitted = best.ok_or_else(|| {
+            FitError::NonConvergent(
+                "TruncWeibullMin shape likelihood did not converge to a finite fit".into(),
+            )
+        })?;
+        // As c approaches zero the conditional density tends to the
+        // log-uniform distribution. That boundary is excluded (c > 0), and
+        // an optimizer can otherwise report success on its flat plateau.
+        let mut boundary_nll = 0.0;
+        let mut correction = 0.0;
+        for &x in data {
+            let term = x.ln() + log_width.ln() - correction;
+            let next = boundary_nll + term;
+            correction = (next - boundary_nll) - term;
+            boundary_nll = next;
+        }
+        let margin = 64.0 * f64::EPSILON * (boundary_nll.abs() + data.len() as f64);
+        if fitted.negative_log_likelihood >= boundary_nll - margin {
+            return Err(FitError::NonConvergent(
+                "TruncWeibullMin has no identifiable finite shape maximum beyond c=0".into(),
+            ));
+        }
+        Ok(fitted.distribution)
     }
 }
 
@@ -29893,9 +29982,9 @@ impl ContinuousDistribution for TruncPareto {
         let expected_distance = |t: f64| {
             if t < 0.1 {
                 let square = t * t;
-                0.5 - t * (1.0 / 12.0
-                    - square * (1.0 / 720.0
-                        - square * (1.0 / 30240.0 - square / 1209600.0)))
+                0.5 - t
+                    * (1.0 / 12.0
+                        - square * (1.0 / 720.0 - square * (1.0 / 30240.0 - square / 1209600.0)))
             } else {
                 t.recip() - t.exp_m1().recip()
             }

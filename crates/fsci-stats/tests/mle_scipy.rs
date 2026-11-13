@@ -12,9 +12,9 @@ use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
     LocationScale, Lognormal, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
-    SkewCauchy, StatsError, TruncPareto, TruncWeibullMin, Weibull, fit_mle, fit_mle_censored,
-    fit_mle_location_scale, fit_mle_location_scale_censored, with_hardened_stats_caps,
-    with_stats_runtime_mode,
+    SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
+    fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
+    with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -276,6 +276,78 @@ fn nakagami_mle_rejects_undefined_samples_and_honors_hardened_caps() {
 }
 
 #[test]
+fn truncated_normal_fit_uses_exact_sample_endpoints_including_far_tails() {
+    for data in [
+        vec![-1.7, -0.3, 0.2, 1.1, 1.4, 2.2],
+        vec![40.0, 40.005, 40.01, 40.03],
+        vec![1.0e-200, 1.2e-200, 1.8e-200, 2.0e-200],
+    ] {
+        let fitted = TruncNormal::try_fit(&data).expect("finite nonconstant sample");
+        assert_eq!(fitted.a, data.iter().copied().fold(f64::INFINITY, f64::min));
+        assert_eq!(
+            fitted.b,
+            data.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        );
+        assert!(likelihood(&fitted, &data).is_finite());
+        let width = fitted.b - fitted.a;
+        let wider = TruncNormal::new(fitted.a - width, fitted.b + width);
+        assert!(likelihood(&fitted, &data) < likelihood(&wider, &data));
+        // The generic fit surface must now reach this implementation, too.
+        let generic = fsci_stats::fit::<TruncNormal>(&data);
+        assert_eq!(generic.a, fitted.a);
+        assert_eq!(generic.b, fitted.b);
+    }
+}
+
+#[test]
+fn truncated_normal_fit_respects_runtime_guards_and_explicit_projection() {
+    use fsci_stats::{StatsOptions, active_stats_mode, hardened_max_sample_len, sync_audit_ledger};
+
+    assert!(matches!(
+        TruncNormal::try_fit(&[-f64::MAX, f64::MAX]),
+        Err(FitError::NonConvergent(_))
+    ));
+    let old_cap = hardened_max_sample_len();
+    with_hardened_stats_caps(2, 2, || {
+        let sample = [-1.0, 0.0, 1.0];
+        assert!(matches!(
+            TruncNormal::try_fit_with_options(
+                &sample,
+                StatsOptions::new(RuntimeMode::Hardened),
+                None,
+            ),
+            Err(FitError::ResourceExhausted { .. })
+        ));
+        assert!(
+            TruncNormal::try_fit_with_options(
+                &sample,
+                StatsOptions::new(RuntimeMode::Strict),
+                None,
+            )
+            .is_ok()
+        );
+        let ledger = sync_audit_ledger();
+        let result = with_stats_runtime_mode(RuntimeMode::Hardened, || {
+            TruncNormal::try_fit_with_audit(&sample, &ledger)
+        });
+        assert!(matches!(result, Err(FitError::ResourceExhausted { .. })));
+        assert_eq!(ledger.lock().unwrap().len(), 1);
+    });
+    assert_eq!(hardened_max_sample_len(), old_cap);
+    assert_eq!(active_stats_mode(), RuntimeMode::Strict);
+    let ledger = sync_audit_ledger();
+    let recovered = TruncNormal::try_fit_with_options(
+        &[-1.0, f64::NAN, 2.0],
+        StatsOptions::new(RuntimeMode::Hardened).with_non_finite_projection(true),
+        Some(&ledger),
+    )
+    .unwrap();
+    assert_eq!((recovered.a, recovered.b), (-1.0, 2.0));
+    assert_eq!(ledger.lock().unwrap().len(), 1);
+    assert_eq!(active_stats_mode(), RuntimeMode::Strict);
+}
+
+#[test]
 fn truncated_pareto_fit_solves_both_signs_of_the_shape_score() {
     for b in [-2.0, 0.5, 2.0] {
         let original = TruncPareto::new(b, 6.0);
@@ -303,6 +375,33 @@ fn truncated_pareto_fit_solves_both_signs_of_the_shape_score() {
 }
 
 #[test]
+fn truncated_weibull_fit_profiles_bounds_and_identifies_narrow_support() {
+    let original = TruncWeibullMin::new(2.0, 0.5, 3.0);
+    let data: Vec<_> = (0..400)
+        .map(|i| original.ppf((f64::from(i) + 0.5) / 400.0))
+        .collect();
+    let fitted = TruncWeibullMin::try_fit(&data).unwrap();
+    assert_eq!(fitted.a, data[0]);
+    assert_eq!(fitted.b, data[399]);
+    assert!((fitted.c - 2.0).abs() < 0.1);
+    assert!(fitted.logpdf(fitted.a).is_finite());
+    assert!(likelihood(&fitted, &data) <= likelihood(&original, &data));
+
+    // Shapes of ordinary magnitude are indistinguishable from c=0 on
+    // this log-support scale, but a finite shape near 1e8 improves the
+    // likelihood. The fitter must reach it instead of declaring a limit.
+    let mut concentrated = vec![1.0; 12];
+    concentrated[0] = 1.0 - 1.0e-8;
+    concentrated[11] = 1.0 + 1.0e-8;
+    let fitted = TruncWeibullMin::try_fit(&concentrated).unwrap();
+    let log_width = ((fitted.b - fitted.a) / fitted.a).ln_1p();
+    let boundary_nll = concentrated.iter().map(|x| x.ln()).sum::<f64>()
+        + concentrated.len() as f64 * log_width.ln();
+    assert!(fitted.c > 1.0e6);
+    assert!(likelihood(&fitted, &concentrated) < boundary_nll - 0.5);
+}
+
+#[test]
 fn truncated_weibull_density_retains_closed_boundary_and_extreme_normalization() {
     // For c=1 this is a truncated exponential, with a nonzero density
     // at its lower endpoint. Both endpoints follow SciPy's closed support.
@@ -321,7 +420,7 @@ fn truncated_weibull_density_retains_closed_boundary_and_extreme_normalization()
 }
 
 #[test]
-fn truncated_pareto_fit_rejects_invalid_data_and_unattained_maxima_without_panicking() {
+fn truncated_fits_reject_invalid_data_and_unattained_maxima_without_panicking() {
     for data in [
         vec![],
         vec![1.0],
@@ -330,7 +429,9 @@ fn truncated_pareto_fit_rejects_invalid_data_and_unattained_maxima_without_panic
         vec![1.0, f64::NEG_INFINITY, 2.0],
         vec![2.0, 2.0, 2.0],
     ] {
+        assert!(TruncNormal::try_fit(&data).is_err());
         assert!(TruncPareto::try_fit(&data).is_err());
+        assert!(TruncWeibullMin::try_fit(&data).is_err());
     }
     assert!(matches!(
         TruncPareto::try_fit(&[0.5, 1.0, 2.0]),
@@ -344,27 +445,48 @@ fn truncated_pareto_fit_rejects_invalid_data_and_unattained_maxima_without_panic
         TruncPareto::try_fit(&[1.0, 1.0, 1.0]),
         Err(FitError::NonConvergent(_))
     ));
+    assert!(matches!(
+        TruncWeibullMin::try_fit(&[0.0, 1.0, 2.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    assert!(matches!(
+        TruncWeibullMin::try_fit(&[-1.0, 1.0, 2.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    // The conditional Weibull density on [1, 2] tilts toward the lower
+    // endpoint. These observations favor its excluded c -> 0 limit, so
+    // an arbitrarily small positive optimizer result is not a finite MLE.
+    assert!(matches!(
+        TruncWeibullMin::try_fit(&[1.0, 2.0, 2.0]),
+        Err(FitError::NonConvergent(_))
+    ));
 }
 
-const TRUNCATED_PARETO_FIT_ORACLE: &str = r#"
+const TRUNCATED_FIT_ORACLE: &str = r#"
 import numpy as np
 import scipy
 from scipy import stats
 
 print('versions', scipy.__version__, np.__version__)
-for case_index, shape in enumerate([(0.5, 5.), (2., 20.), (-2., 5.)]):
-    data = stats.truncpareto.rvs(*shape, size=2000,
-                                random_state=np.random.default_rng(30117 + case_index))
-    fitted = stats.truncpareto.fit(data, *shape, floc=0, fscale=1)
-    nll = -np.sum(stats.truncpareto.logpdf(data, *fitted[:-2], loc=0, scale=1))
-    assert np.all(np.isfinite(fitted)) and np.isfinite(nll)
-    print('truncpareto', case_index, len(fitted)-2,
-          *(format(x, '.17g') for x in fitted[:-2]), format(nll, '.17g'))
-    print(' '.join(format(x, '.17g') for x in data))
+cases = [
+    ('truncnorm', stats.truncnorm, [(-1., 2.), (5., 6.), (-6., -4.)]),
+    ('truncpareto', stats.truncpareto, [(0.5, 5.), (2., 20.), (-2., 5.)]),
+    ('truncweibull_min', stats.truncweibull_min, [(0.7, 0., 4.), (2., 0.5, 3.), (4., 1., 2.)]),
+]
+for family_index, (name, dist, shapes) in enumerate(cases):
+    for case_index, shape in enumerate(shapes):
+        data = dist.rvs(*shape, size=2000,
+                        random_state=np.random.default_rng(30100 + 17*family_index + case_index))
+        fitted = dist.fit(data, *shape, floc=0, fscale=1)
+        nll = -np.sum(dist.logpdf(data, *fitted[:-2], loc=0, scale=1))
+        assert np.all(np.isfinite(fitted)) and np.isfinite(nll)
+        print(name, case_index, len(fitted)-2, *(format(x, '.17g') for x in fitted[:-2]),
+              format(nll, '.17g'))
+        print(' '.join(format(x, '.17g') for x in data))
 "#;
 
 #[test]
-fn truncated_pareto_mle_matches_live_scipy_on_seeded_fits() {
+fn truncated_mle_matches_live_scipy_on_seeded_fits() {
     let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
     let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
     let available = Command::new(&python)
@@ -372,12 +494,15 @@ fn truncated_pareto_mle_matches_live_scipy_on_seeded_fits() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        assert!(!required, "required truncated-fit SciPy oracle is unavailable");
+        assert!(
+            !required,
+            "required truncated-fit SciPy oracle is unavailable"
+        );
         eprintln!("SKIP: truncated-fit SciPy oracle unavailable");
         return;
     }
     let output = Command::new(&python)
-        .args(["-c", TRUNCATED_PARETO_FIT_ORACLE])
+        .args(["-c", TRUNCATED_FIT_ORACLE])
         .output()
         .expect("run truncated-fit oracle");
     assert!(
@@ -394,8 +519,12 @@ fn truncated_pareto_mle_matches_live_scipy_on_seeded_fits() {
     }
     eprintln!("Truncated MLE oracle {versions}");
     let mut compared = 0;
-    for _ in 0..3 {
-        let header: Vec<_> = lines.next().expect("fit metadata").split_whitespace().collect();
+    for _ in 0..9 {
+        let header: Vec<_> = lines
+            .next()
+            .expect("fit metadata")
+            .split_whitespace()
+            .collect();
         let family = header[0];
         let count: usize = header[2].parse().unwrap();
         assert_eq!(header.len(), count + 4);
@@ -412,9 +541,20 @@ fn truncated_pareto_mle_matches_live_scipy_on_seeded_fits() {
             .collect();
         assert_eq!(data.len(), 2000);
         let (parameters, nll) = match family {
+            "truncnorm" => {
+                let fitted = TruncNormal::try_fit(&data).unwrap();
+                (vec![fitted.a, fitted.b], likelihood(&fitted, &data))
+            }
             "truncpareto" => {
                 let fitted = TruncPareto::try_fit(&data).unwrap();
                 (vec![fitted.b, fitted.c], likelihood(&fitted, &data))
+            }
+            "truncweibull_min" => {
+                let fitted = TruncWeibullMin::try_fit(&data).unwrap();
+                (
+                    vec![fitted.c, fitted.a, fitted.b],
+                    likelihood(&fitted, &data),
+                )
             }
             unknown => panic!("unexpected truncated-fit family {unknown}"),
         };
@@ -432,9 +572,9 @@ fn truncated_pareto_mle_matches_live_scipy_on_seeded_fits() {
         );
         compared += 1;
     }
-    assert_eq!(compared, 3);
+    assert_eq!(compared, 9);
     assert!(lines.next().is_none(), "every oracle row must be consumed");
-    eprintln!("Truncated MLE compared cases=3; families=1; samples per case=2000");
+    eprintln!("Truncated MLE compared cases=9; families=3; samples per case=2000");
 }
 
 #[test]
