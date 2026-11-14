@@ -537,6 +537,145 @@ pub(crate) fn chi_shape_mle(
     }
 }
 
+/// Inverse-gamma shape MLE at location zero and scale one. Its sufficient
+/// statistic is -mean(log(x)); unlike a moment estimate, the score remains
+/// defined for shapes below one and for samples whose arithmetic sum overflows.
+pub(crate) fn inverse_gamma_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "InverseGamma")?;
+    let mut target = 0.0;
+    let mut correction = 0.0;
+    let n = data.len() as f64;
+    for &x in data {
+        if x <= 0.0 {
+            return Err(FitError::UnsupportedData(
+                "InverseGamma MLE with fixed location zero requires positive observations".into(),
+            ));
+        }
+        let term = -x.ln() / n - correction;
+        let next = target + term;
+        correction = (next - target) - term;
+        target = next;
+    }
+
+    // psi(a) increases strictly from -infinity to infinity. The asymptotic
+    // inverse gives a starting upper bound; expand it if rounding requires it.
+    let mut upper = (target.exp() + 1.0).max(1.0);
+    if !upper.is_finite() {
+        return Err(FitError::NonConvergent(
+            "InverseGamma MLE shape exceeds the finite parameter range".into(),
+        ));
+    }
+    while fsci_special::digamma_scalar(upper) < target {
+        let next = (2.0 * upper).min(f64::MAX);
+        if next == upper {
+            return Err(FitError::NonConvergent(
+                "InverseGamma MLE shape exceeds the finite parameter range".into(),
+            ));
+        }
+        upper = next;
+    }
+    let mut lower = 0.0;
+    for _ in 0..100 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            break;
+        }
+        if fsci_special::digamma_scalar(middle) < target {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    Ok(lower + 0.5 * (upper - lower))
+}
+
+/// Both standardized log-logistic and inverse-Weibull likelihoods are strictly
+/// concave in the positive shape. Writing t=log(x)/max|log(x)| and q=c*max|log(x)|
+/// gives the monotone score q*mean(t*response(q*t)) = 1. The normalization avoids
+/// arbitrary shape cutoffs and preserves the root for observations close to one.
+fn unit_scale_log_shape_mle(
+    data: &[f64],
+    family: &str,
+    response: fn(f64) -> f64,
+) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, family)?;
+    if data.iter().any(|&x| x <= 0.0) {
+        return Err(FitError::UnsupportedData(format!(
+            "{family} MLE with fixed location zero requires positive observations"
+        )));
+    }
+    let mut logs: Vec<f64> = data.iter().map(|x| x.ln()).collect();
+    let scale = logs.iter().fold(0.0_f64, |largest, x| largest.max(x.abs()));
+    if scale == 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{family} likelihood is unbounded for observations all equal to one"
+        )));
+    }
+    for value in &mut logs {
+        *value /= scale;
+    }
+    let n = data.len() as f64;
+    let score = |q: f64| {
+        let mut sum = 0.0;
+        let mut correction = 0.0;
+        for &t in &logs {
+            // Every term is nonnegative for both response functions. An
+            // overflowing exponential is therefore a valid upper-bracket
+            // signal, never a cancellation or a spurious missing root.
+            let contribution = t * response(q * t) / n;
+            if contribution.is_infinite() {
+                return f64::INFINITY;
+            }
+            let term = contribution - correction;
+            let next = sum + term;
+            if next.is_infinite() {
+                return f64::INFINITY;
+            }
+            correction = (next - sum) - term;
+            sum = next;
+        }
+        q * sum
+    };
+    let mut lower = 0.0;
+    let mut upper = 1.0;
+    while score(upper) < 1.0 {
+        lower = upper;
+        upper *= 2.0;
+        if !upper.is_finite() {
+            return Err(FitError::NonConvergent(format!(
+                "{family} MLE shape exceeds the finite parameter range"
+            )));
+        }
+    }
+    for _ in 0..100 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            break;
+        }
+        if score(middle) < 1.0 {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    let shape = (lower + 0.5 * (upper - lower)) / scale;
+    if shape.is_finite() && shape > 0.0 {
+        Ok(shape)
+    } else {
+        Err(FitError::NonConvergent(format!(
+            "{family} MLE shape exceeds the finite parameter range"
+        )))
+    }
+}
+
+pub(crate) fn fisk_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    unit_scale_log_shape_mle(data, "Fisk", |z| (0.5 * z).tanh())
+}
+
+pub(crate) fn invweibull_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    unit_scale_log_shape_mle(data, "InvWeibull", |z| -(-z).exp_m1())
+}
+
 /// psi(a + 1/2) - psi(a), evaluated without subtracting nearly equal
 /// digammas for concentrated symmetric beta distributions. Shift to a >= 16
 /// by recurrence, then use the Bernoulli expansion through a^-12.

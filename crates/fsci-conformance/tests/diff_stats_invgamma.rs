@@ -65,6 +65,83 @@ struct OracleResult {
     ppf: Vec<PpfArm>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    shape: f64,
+    log_likelihood: f64,
+    moment_log_likelihood: f64,
+}
+
+#[test]
+fn diff_stats_invgamma_shape_mle() {
+    let script = r#"
+import json
+import numpy as np
+from scipy.stats import invgamma
+
+rows = []
+for i, shape in enumerate((0.3, 0.8, 4.0)):
+    data = invgamma.rvs(shape, size=2000, random_state=np.random.default_rng(14311+i))
+    fitted, _, _ = invgamma.fit(data, floc=0, fscale=1)
+    moment = 1 + 1/data.mean()
+    rows.append(dict(case_id=f"shape_{shape}", data=data.tolist(), shape=float(fitted),
+                     log_likelihood=float(invgamma.logpdf(data, fitted).sum()),
+                     moment_log_likelihood=float(invgamma.logpdf(data, moment).sum())))
+print(json.dumps(rows, allow_nan=False))
+"#;
+    let output = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        output => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "required inverse-gamma MLE oracle failed: {output:?}"
+            );
+            eprintln!("skipping inverse-gamma MLE oracle: {output:?}");
+            return;
+        }
+    };
+    let rows: Vec<FitArm> = serde_json::from_slice(&output.stdout).expect("finite MLE oracle rows");
+    assert_eq!(rows.len(), 3);
+    let mut ledger = CompareLedger::new("diff_stats_invgamma_shape_mle", &["shape", "likelihood"]);
+    let mut moment_failures = 0;
+    for row in rows {
+        assert_eq!(row.data.len(), 2000);
+        let fitted = InverseGamma::try_fit(&row.data).expect("every valid oracle sample must fit");
+        let log_likelihood = row.data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        for (arm, rust, reference) in [
+            ("shape", fitted.a, row.shape),
+            ("likelihood", log_likelihood, row.log_likelihood),
+        ] {
+            let (reference, rust) = ledger
+                .pair(arm, &row.case_id, Some(reference), Some(rust))
+                .expect("finite MLE parameters and likelihoods");
+            let pass = if arm == "likelihood" {
+                rust >= reference - 1e-6 * reference.abs().max(1.0)
+            } else {
+                (rust - reference).abs() <= 1e-4 * reference.abs()
+            };
+            ledger.compared(arm, &row.case_id, pass);
+            assert!(pass, "{} {arm}: Rust={rust}, SciPy={reference}", row.case_id);
+        }
+        if row.moment_log_likelihood
+            < row.log_likelihood - 1e-6 * row.log_likelihood.abs().max(1.0)
+        {
+            moment_failures += 1;
+        }
+        eprintln!(
+            "{}: MLE={}, SciPy={}, LL={log_likelihood}, SciPy LL={}, old moment LL={}",
+            row.case_id, fitted.a, row.shape, row.log_likelihood, row.moment_log_likelihood
+        );
+    }
+    assert_eq!(moment_failures, 3, "the old moment fit must fail every new MLE row");
+    ledger.finish(3);
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
     case_id: String,

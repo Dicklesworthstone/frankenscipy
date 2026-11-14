@@ -18651,45 +18651,12 @@ impl ContinuousDistribution for InverseGamma {
         self.a + ln_gamma(self.a) - (1.0 + self.a) * fsci_special::digamma_scalar(self.a)
     }
 
+    /// Maximum-likelihood shape with location zero and scale one, including
+    /// the heavy-tail regime in which the mean does not exist.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        // MoM at unit scale: E[X | a] = 1/(a-1) for a>1, so
-        //   a_hat = 1 + 1/sample_mean
-        // Requires positive observations and a positive (>1) result.
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "InverseGamma data contains non-finite value: {x}"
-                )));
-            }
-            if x <= 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "InverseGamma support is (0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
-        }
-        let mean = sum / count as f64;
-        if mean <= 0.0 || !mean.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "InverseGamma MoM: sample mean {mean} non-positive"
-            )));
-        }
-        let a = 1.0 + 1.0 / mean;
-        if !a.is_finite() || a <= 1.0 {
-            return Err(FitError::NonConvergent(format!(
-                "InverseGamma MoM produced a={a} (must be > 1)"
-            )));
-        }
-        Ok(Self { a })
+        Ok(Self {
+            a: mle::inverse_gamma_shape_mle(data)?,
+        })
     }
 
     fn mode(&self) -> f64 {
@@ -22289,18 +22256,15 @@ impl ContinuousDistribution for Fisk {
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c) + (c−1)·ln(x) − 2·ln1p(x^c); finite in the power-law tail. The
-        // shape-dependent x=0 limit is delegated to pdf. frankenscipy-p82v7
+        // log(c/x) - |c*log(x)| - 2*log1p(exp(-|c*log(x)|)). The symmetric
+        // logistic form stays finite when x^c overflows or underflows, which
+        // is essential for comparing likelihoods in the heavy tails.
         if x <= 0.0 {
             return self.pdf(x).ln();
         }
-        let c = self.c;
-        if weibull_density_reuse() {
-            let lx = x.ln();
-            c.ln() + (c - 1.0) * lx - 2.0 * (c * lx).exp().ln_1p()
-        } else {
-            c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
-        }
+        let log_x = x.ln();
+        let magnitude = (self.c * log_x).abs();
+        self.c.ln() - log_x - magnitude - 2.0 * (-magnitude).exp().ln_1p()
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -22409,63 +22373,12 @@ impl ContinuousDistribution for Fisk {
         }
     }
 
+    /// Maximum-likelihood shape with location zero and scale one. The score
+    /// uses log observations, so a finite sample mean is not required.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Fisk data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Fisk support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
-        }
-        let mean = sum / count as f64;
-        if mean <= 1.0 || !mean.is_finite() {
-            return Err(FitError::UnsupportedData(format!(
-                "Fisk MoM (unit-scale) requires sample mean > 1; got {mean}"
-            )));
-        }
-        // Mean(c) = π/(c · sin(π/c)) for c > 1, monotone-decreasing from
-        // ∞ at c→1+ to 1 at c→∞. Bisect on c ∈ (1.001, 1e3).
-        let mean_of = |c: f64| {
-            let b = PI / c;
-            b / b.sin()
-        };
-        let mut lo = 1.001_f64;
-        let mut hi = 1.0e3_f64;
-        let m_lo = mean_of(lo);
-        let m_hi = mean_of(hi);
-        if !(m_hi <= mean && mean <= m_lo) {
-            return Err(FitError::NonConvergent(format!(
-                "Fisk MoM bracket failed: mean({lo})={m_lo}, mean({hi})={m_hi}, target={mean}"
-            )));
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let m_mid = mean_of(mid);
-            if (m_mid - mean).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { c: mid });
-            }
-            if m_mid > mean {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(Self { c: 0.5 * (lo + hi) })
+        Ok(Self {
+            c: mle::fisk_shape_mle(data)?,
+        })
     }
 }
 
@@ -25998,17 +25911,12 @@ impl ContinuousDistribution for Loglogistic {
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c) + (c−1)·ln(x) − 2·ln1p(x^c); finite in the power-law tail. frankenscipy-p82v7
+        // This is the same standardized distribution as Fisk. Share its
+        // overflow-safe log-density for positive observations.
         if x <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        let c = self.c;
-        if weibull_density_reuse() {
-            let lx = x.ln();
-            c.ln() + (c - 1.0) * lx - 2.0 * (c * lx).exp().ln_1p()
-        } else {
-            c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
-        }
+        Fisk { c: self.c }.logpdf(x)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -26112,43 +26020,12 @@ impl ContinuousDistribution for Loglogistic {
         mu4 / (var * var) - 3.0
     }
 
+    /// Maximum-likelihood shape at fixed location zero and scale one. This
+    /// shares the exact score solve with the synonymous [`Fisk`] distribution.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        for &x in data {
-            if !x.is_finite() || x <= 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Loglogistic data must be finite and positive: {x}"
-                )));
-            }
-        }
-        // Method-of-moments-via-quartiles: scipy's MLE has no closed
-        // form, so we use the analytic relation between the log-logistic
-        // quartile ratio Q3/Q1 and the shape parameter c. With pinned
-        // ppf, Q1/Q3 = (1/3)^(1/c) / 3^(1/c) = (1/9)^(1/c), so
-        // c = ln(9) / ln(Q3/Q1). Median is 1 by construction; this
-        // matches scipy's default fixed-loc=0 fit signature.
-        let mut sorted: Vec<f64> = data.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = sorted.len();
-        let q1 = sorted[(n / 4).max(1) - 1];
-        let q3 = sorted[((3 * n) / 4).min(n - 1)];
-        if q3 <= q1 || q1 <= 0.0 {
-            return Err(FitError::NonConvergent(
-                "Loglogistic quartile ratio is non-positive".to_string(),
-            ));
-        }
-        let c = (9.0_f64).ln() / (q3 / q1).ln();
-        if !c.is_finite() || c <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "Loglogistic shape estimate is non-positive: {c}"
-            )));
-        }
-        Ok(Self { c })
+        Ok(Self {
+            c: mle::fisk_shape_mle(data)?,
+        })
     }
 }
 
@@ -30925,60 +30802,12 @@ impl ContinuousDistribution for InvWeibull {
         mu4 / (var * var) - 3.0
     }
 
+    /// Maximum-likelihood shape with location zero and scale one, without
+    /// assuming that a finite population mean exists.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "InvWeibull data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "InvWeibull support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
-        }
-        let mean = sum / count as f64;
-        if mean <= 1.0 || !mean.is_finite() {
-            return Err(FitError::UnsupportedData(format!(
-                "InvWeibull MoM (unit-scale) requires sample mean > 1; got {mean}"
-            )));
-        }
-        // Mean(c) = Γ(1 - 1/c) for c > 1. Monotone-decreasing from ∞ at
-        // c→1+ to 1 at c→∞. Bisect on c ∈ (1.001, 1e3).
-        let mean_of = |c: f64| ln_gamma(1.0 - 1.0 / c).exp();
-        let mut lo = 1.001_f64;
-        let mut hi = 1.0e3_f64;
-        let m_lo = mean_of(lo);
-        let m_hi = mean_of(hi);
-        if !(m_hi <= mean && mean <= m_lo) {
-            return Err(FitError::NonConvergent(format!(
-                "InvWeibull MoM bracket failed: mean({lo})={m_lo}, mean({hi})={m_hi}, target={mean}"
-            )));
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let m_mid = mean_of(mid);
-            if (m_mid - mean).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { c: mid });
-            }
-            if m_mid > mean {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(Self { c: 0.5 * (lo + hi) })
+        Ok(Self {
+            c: mle::invweibull_shape_mle(data)?,
+        })
     }
 }
 
@@ -94879,11 +94708,41 @@ mod tests {
     }
 
     #[test]
-    fn inverse_gamma_fit_recovers_unit_scale_shape_from_mean() {
+    fn inverse_gamma_fit_maximizes_unit_scale_likelihood() {
         let data = [0.25, 0.5, 0.75, 0.5];
         let fit = InverseGamma::try_fit(&data).expect("InverseGamma fit");
-        assert_close(fit.a, 3.0, 1e-12, "InverseGamma shape from MoM");
-        assert_close(fit.mean(), 0.5, 1e-12, "InverseGamma fitted mean");
+        // scipy.optimize.brentq of the scipy.special.digamma score;
+        // scipy.stats.invgamma.fit(data, floc=0, fscale=1) agrees to its
+        // default optimizer tolerance. The former moment answer was 3.
+        assert_close(fit.a, 2.630_177_822_830_407_6, 1e-12, "InverseGamma MLE");
+        let likelihood = |a| {
+            let distribution = InverseGamma::new(a);
+            data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+        };
+        assert!(likelihood(fit.a) > likelihood(3.0) + 0.1);
+        assert_close(InverseGamma::fit(&data).a, fit.a, 0.0, "fit delegates to MLE");
+    }
+
+    #[test]
+    fn inverse_gamma_fit_handles_heavy_tails_and_extreme_samples() {
+        for data in [
+            [1.0, 10.0, 100.0, 1000.0],
+            [f64::MAX, f64::MAX / 2.0, 1.0e300, 1.0e300],
+        ] {
+            let fitted = InverseGamma::try_fit(&data).expect("heavy-tail MLE");
+            assert!(fitted.a > 0.0 && fitted.a < 1.0);
+            let target = -data.iter().map(|x| x.ln() / 4.0).sum::<f64>();
+            assert_close(
+                fsci_special::digamma_scalar(fitted.a),
+                target,
+                1e-12,
+                "heavy-tail likelihood score",
+            );
+        }
+        let constant = InverseGamma::try_fit(&[1.0, 1.0]).expect("finite fixed-scale MLE");
+        assert_close(constant.a, 1.461_632_144_968_362_3, 1e-12, "digamma zero");
+        let concentrated = InverseGamma::try_fit(&[1.0e-300, 2.0e-300]).expect("large shape");
+        assert!((concentrated.a * 2.0_f64.sqrt() * 1.0e-300 - 1.0).abs() < 2e-13);
     }
 
     #[test]
@@ -95819,6 +95678,28 @@ mod tests {
         assert!(Loglogistic::try_fit(&[1.0, 0.0, 2.0]).is_err());
         assert!(Loglogistic::try_fit(&[1.0, f64::NAN]).is_err());
         assert!(Loglogistic::try_fit(&[1.0]).is_err()); // too few
+    }
+
+    #[test]
+    fn loglogistic_fit_agrees_with_fisk_mle() {
+        for data in [
+            [0.1, 0.2, 0.5, 0.9],
+            [0.05, 0.5, 5.0, 500.0],
+            [2.0, 2.0, 2.0, 2.0],
+            [1.0e-300, 1.0e-100, 1.0e100, 1.0e300],
+        ] {
+            let fisk = Fisk::try_fit(&data).expect("Fisk MLE");
+            let loglogistic = Loglogistic::try_fit(&data).expect("Loglogistic MLE");
+            assert_eq!(fisk.c, loglogistic.c);
+            assert_eq!(Loglogistic::fit(&data).c, loglogistic.c);
+            for x in data {
+                assert_eq!(fisk.logpdf(x), loglogistic.logpdf(x));
+            }
+        }
+        assert!(matches!(
+            Loglogistic::try_fit(&[1.0, 1.0]),
+            Err(FitError::NonConvergent(_))
+        ));
     }
 
     #[test]
@@ -102471,15 +102352,17 @@ mod tests {
     }
 
     #[test]
-    fn invweibull_fit_metamorphic_mean_recovery() {
+    fn invweibull_fit_maximizes_unit_scale_likelihood() {
         let data = [1.5_f64, 2.0, 2.5, 1.8, 3.0, 1.7];
-        let m: f64 = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = InvWeibull::try_fit(&data).expect("fit");
-        let recovered = fitted.mean();
-        assert!(
-            (recovered - m).abs() < 1.0e-6,
-            "InvWeibull MoM mean recovery: sample {m}, fitted {recovered}"
-        );
+        assert_close(fitted.c, 1.892_581_145_282_845_8, 1e-12, "InvWeibull MLE");
+        let likelihood = |c| {
+            let distribution = InvWeibull::new(c);
+            data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+        };
+        assert!(likelihood(fitted.c) > likelihood(fitted.c * 0.99));
+        assert!(likelihood(fitted.c) > likelihood(fitted.c * 1.01));
+        assert_close(InvWeibull::fit(&data).c, fitted.c, 0.0, "fit delegates to MLE");
     }
 
     #[test]
@@ -102502,9 +102385,9 @@ mod tests {
     }
 
     #[test]
-    fn invweibull_fit_rejects_mean_at_or_below_one() {
-        let err = InvWeibull::try_fit(&[0.5, 0.7, 1.0]).expect_err("mean ≤ 1 must be rejected");
-        assert!(matches!(err, FitError::UnsupportedData(_)));
+    fn invweibull_fit_accepts_mean_below_one() {
+        let fitted = InvWeibull::try_fit(&[0.5, 0.7, 1.0]).expect("valid fixed-scale sample");
+        assert_close(fitted.c, 1.667_690_907_110_741, 1e-12, "InvWeibull MLE");
     }
 
     #[test]
@@ -102520,24 +102403,23 @@ mod tests {
     }
 
     #[test]
-    fn fisk_fit_metamorphic_mean_recovery() {
-        // Sample mean must lie in (1, ∞). For unit-scale Fisk, fit(data).c
-        // gives a distribution whose own mean equals the sample mean to
-        // bisection precision.
+    fn fisk_fit_maximizes_unit_scale_likelihood() {
         let data = [1.5_f64, 2.0, 2.5, 1.8, 3.0, 1.7];
-        let m: f64 = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = Fisk::try_fit(&data).expect("fit");
-        let recovered = fitted.mean();
-        assert!(
-            (recovered - m).abs() < 1.0e-6,
-            "Fisk MoM mean recovery: sample {m}, fitted {recovered}"
-        );
+        assert_close(fitted.c, 2.141_623_924_920_150_7, 1e-12, "Fisk MLE");
+        let likelihood = |c| {
+            let distribution = Fisk::new(c);
+            data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+        };
+        assert!(likelihood(fitted.c) > likelihood(fitted.c * 0.99));
+        assert!(likelihood(fitted.c) > likelihood(fitted.c * 1.01));
+        assert_close(Fisk::fit(&data).c, fitted.c, 0.0, "fit delegates to MLE");
     }
 
     #[test]
     fn fisk_fit_synthetic_recovery() {
         // Synthesize Fisk(c=3) samples via inverse CDF (closed form
-        // (q/(1-q))^(1/c)); MoM via mean inversion recovers c within 5%.
+        // (q/(1-q))^(1/c)); the shape MLE recovers c within 5%.
         let true_c = 3.0;
         let dist = Fisk::new(true_c);
         let n = 2000;
@@ -102557,9 +102439,9 @@ mod tests {
     }
 
     #[test]
-    fn fisk_fit_rejects_mean_at_or_below_one() {
-        let err = Fisk::try_fit(&[0.5, 0.7, 1.0]).expect_err("mean ≤ 1 must be rejected");
-        assert!(matches!(err, FitError::UnsupportedData(_)));
+    fn fisk_fit_accepts_mean_below_one() {
+        let fitted = Fisk::try_fit(&[0.5, 0.7, 1.0]).expect("valid fixed-scale sample");
+        assert_close(fitted.c, 3.732_429_747_534_688, 1e-12, "Fisk MLE");
     }
 
     #[test]
@@ -102572,6 +102454,94 @@ mod tests {
     fn fisk_fit_rejects_too_few_samples() {
         let err = Fisk::try_fit(&[2.0]).expect_err("n=1 must be rejected");
         assert!(matches!(err, FitError::InsufficientData { .. }));
+    }
+
+    #[test]
+    fn unit_scale_log_shape_fits_recover_infinite_mean_regimes() {
+        for shape in [0.3, 0.8] {
+            let n = 2000;
+            let fisk = Fisk::new(shape);
+            let invweibull = InvWeibull::new(shape);
+            let fisk_sample: Vec<f64> = (0..n)
+                .map(|i| fisk.ppf((i as f64 + 0.5) / n as f64))
+                .collect();
+            let invweibull_sample: Vec<f64> = (0..n)
+                .map(|i| invweibull.ppf((i as f64 + 0.5) / n as f64))
+                .collect();
+            let fisk_fit = Fisk::try_fit(&fisk_sample).expect("Fisk heavy-tail fit");
+            let invweibull_fit =
+                InvWeibull::try_fit(&invweibull_sample).expect("InvWeibull heavy-tail fit");
+            assert!((fisk_fit.c / shape - 1.0).abs() < 0.005);
+            assert!((invweibull_fit.c / shape - 1.0).abs() < 0.005);
+            assert!(fisk_fit.mean().is_infinite());
+            assert!(invweibull_fit.mean().is_infinite());
+        }
+    }
+
+    #[test]
+    fn unit_scale_log_shape_fits_use_logarithmic_range() {
+        for data in [
+            [f64::MAX, f64::MAX / 2.0, 1.0e300, 1.0e300],
+            [1.0e-300, 1.0e-250, 1.0e-200, 1.0e-100],
+            [
+                1.0 - 2.0 * f64::EPSILON,
+                1.0 - f64::EPSILON,
+                1.0 + f64::EPSILON,
+                1.0 + 2.0 * f64::EPSILON,
+            ],
+        ] {
+            let fisk = Fisk::try_fit(&data).expect("finite Fisk shape");
+            let invweibull = InvWeibull::try_fit(&data).expect("finite InvWeibull shape");
+            let fisk_score = data
+                .iter()
+                .map(|x| fisk.c * x.ln() * (0.5 * fisk.c * x.ln()).tanh() / 4.0)
+                .sum::<f64>();
+            let invweibull_score = data
+                .iter()
+                .map(|x| -invweibull.c * x.ln() * (-invweibull.c * x.ln()).exp_m1() / 4.0)
+                .sum::<f64>();
+            assert_close(fisk_score, 1.0, 2e-14, "Fisk scaled score");
+            assert_close(invweibull_score, 1.0, 2e-14, "InvWeibull scaled score");
+        }
+    }
+
+    #[test]
+    fn unit_scale_log_shape_fits_distinguish_constant_and_unbounded_samples() {
+        for point in [0.5, 2.0] {
+            assert!(Fisk::try_fit(&[point, point]).is_ok());
+            assert!(InvWeibull::try_fit(&[point, point]).is_ok());
+        }
+        assert!(matches!(
+            Fisk::try_fit(&[1.0, 1.0]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            InvWeibull::try_fit(&[1.0, 1.0]),
+            Err(FitError::NonConvergent(_))
+        ));
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                Fisk::try_fit(&[0.5, invalid]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            assert!(matches!(
+                InvWeibull::try_fit(&[0.5, invalid]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn fisk_logpdf_is_finite_beyond_power_overflow() {
+        let distribution = Fisk::new(2.0);
+        for x in [1.0e-300_f64, 1.0e300] {
+            let expected = if x < 1.0 {
+                std::f64::consts::LN_2 + x.ln()
+            } else {
+                std::f64::consts::LN_2 - 3.0 * x.ln()
+            };
+            assert_close(distribution.logpdf(x), expected, 1e-12, "Fisk tail logpdf");
+        }
     }
 
     #[test]

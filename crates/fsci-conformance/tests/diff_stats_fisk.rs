@@ -69,6 +69,98 @@ struct OracleResult {
     ppf: Vec<PpfArm>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    shape: f64,
+    log_likelihood: f64,
+    moment_log_likelihood: Option<f64>,
+}
+
+#[test]
+fn diff_stats_fisk_shape_mle() {
+    let script = r#"
+import json
+import numpy as np
+from scipy import optimize
+from scipy.stats import fisk
+
+rows = []
+for i, shape in enumerate((0.3, 0.8, 4.0)):
+    data = fisk.rvs(shape, size=2000, random_state=np.random.default_rng(14311+i))
+    fitted, _, _ = fisk.fit(data, floc=0, fscale=1)
+    moment_ll = None
+    try:
+        # The former implementation inverted the mean on this fixed bracket.
+        moment = optimize.brentq(lambda c: float(fisk.mean(c))-data.mean(), 1.001, 1000)
+        moment_ll = float(fisk.logpdf(data, moment).sum())
+    except ValueError:
+        pass
+    rows.append(dict(case_id=f"shape_{shape}", data=data.tolist(), shape=float(fitted),
+                     log_likelihood=float(fisk.logpdf(data, fitted).sum()),
+                     moment_log_likelihood=moment_ll))
+print(json.dumps(rows, allow_nan=False))
+"#;
+    let output = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        output => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "required Fisk MLE oracle failed: {output:?}"
+            );
+            eprintln!("skipping Fisk MLE oracle: {output:?}");
+            return;
+        }
+    };
+    let rows: Vec<FitArm> = serde_json::from_slice(&output.stdout).expect("finite MLE oracle rows");
+    assert_eq!(rows.len(), 3);
+    let mut ledger = CompareLedger::new(
+        "diff_stats_fisk_shape_mle",
+        &["Fisk.shape", "Fisk.likelihood", "Loglogistic.shape", "Loglogistic.likelihood"],
+    );
+    let mut moment_failures = 0;
+    for row in rows {
+        assert_eq!(row.data.len(), 2000);
+        let fitted = Fisk::try_fit(&row.data).expect("every valid oracle sample must fit");
+        let loglogistic =
+            Loglogistic::try_fit(&row.data).expect("the synonymous family must also fit");
+        let log_likelihood = row.data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        let loglogistic_likelihood = row.data.iter().map(|&x| loglogistic.logpdf(x)).sum::<f64>();
+        for (arm, rust, reference) in [
+            ("Fisk.shape", fitted.c, row.shape),
+            ("Fisk.likelihood", log_likelihood, row.log_likelihood),
+            ("Loglogistic.shape", loglogistic.c, row.shape),
+            ("Loglogistic.likelihood", loglogistic_likelihood, row.log_likelihood),
+        ] {
+            let (reference, rust) = ledger
+                .pair(arm, &row.case_id, Some(reference), Some(rust))
+                .expect("finite MLE parameters and likelihoods");
+            let pass = if arm.ends_with("likelihood") {
+                rust >= reference - 1e-6 * reference.abs().max(1.0)
+            } else {
+                (rust - reference).abs() <= 1e-4 * reference.abs()
+            };
+            ledger.compared(arm, &row.case_id, pass);
+            assert!(pass, "{} {arm}: Rust={rust}, SciPy={reference}", row.case_id);
+        }
+        if row.moment_log_likelihood.is_none_or(|ll| {
+            ll < row.log_likelihood - 1e-6 * row.log_likelihood.abs().max(1.0)
+        }) {
+            moment_failures += 1;
+        }
+        eprintln!(
+            "{}: MLE={}, SciPy={}, LL={log_likelihood}, SciPy LL={}, old moment LL={:?}",
+            row.case_id, fitted.c, row.shape, row.log_likelihood, row.moment_log_likelihood
+        );
+    }
+    assert_eq!(moment_failures, 3, "the old moment fit must fail every new MLE row");
+    ledger.finish(3);
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
     case_id: String,
