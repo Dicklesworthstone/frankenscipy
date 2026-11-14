@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Measurement-error curve fitting through the public API. Closed-form regressions
 //! run without Python. The live differential test uses SCIPY_PYTHON (or python3);
-//! FSCI_REQUIRE_SCIPY_ORACLE=1 requires SciPy 1.17.1 / NumPy 2.4.3 and all 60 cases.
+//! FSCI_REQUIRE_SCIPY_ORACLE=1 requires SciPy 1.17.1 / NumPy 2.4.3 and all 66 cases.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -406,6 +406,7 @@ struct WeightedCase {
     analytic: bool,
     absolute_sigma: bool,
     robust: bool,
+    diff_step: Option<f64>,
     sigma: OracleSigma,
     xdata: Vec<f64>,
     ydata: Vec<f64>,
@@ -435,7 +436,8 @@ import json
 import sys
 import numpy as np
 import scipy
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
+from scipy.linalg import cholesky, solve_triangular, svd
 
 out = []
 for case in json.load(sys.stdin):
@@ -456,7 +458,29 @@ for case in json.load(sys.stdin):
     if case["bounded"]: options["bounds"] = ([0.0, -10.0], [1.5, 10.0])
     if case["robust"]: options.update(loss="soft_l1", f_scale=0.2)
     try:
-        popt, pcov, info, message, status = curve_fit(model, x, y, **options)
+        if case["diff_step"] is None:
+            popt, pcov, info, message, status = curve_fit(model, x, y, **options)
+        else:
+            # curve_fit(method='lm') uses legacy leastsq, whose step option is
+            # epsfcn. Compare our modern least_squares diff_step contract with
+            # SciPy's corresponding entry point on the same weighted problem.
+            assert case["method"] == "lm" and not case["bounded"] and not case["robust"]
+            sigma = np.asarray(case["sigma"], dtype=float)
+            lower = cholesky(sigma, lower=True) if sigma.ndim == 2 else None
+            def residual(p):
+                values = model(x, *p) - y
+                return solve_triangular(lower, values, lower=True) if lower is not None else values / sigma
+            result = least_squares(residual, [1.0, 1.0], method="lm",
+                                   diff_step=case["diff_step"],
+                                   ftol=1e-12, xtol=1e-12, gtol=1e-12)
+            if not result.success:
+                raise RuntimeError(result.message)
+            popt = result.x
+            _, singular, vt = svd(result.jac, full_matrices=False)
+            pcov = (vt.T / singular**2) @ vt
+            if not case["absolute_sigma"]:
+                pcov *= np.dot(result.fun, result.fun) / (len(y) - len(popt))
+            info = dict(fvec=result.fun)
         residual = info["fvec"]
         cost = (0.04 * np.sum(np.sqrt(1 + (residual / 0.2)**2) - 1)
                 if case["robust"] else 0.5 * np.dot(residual, residual))
@@ -552,6 +576,7 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                         analytic,
                         absolute_sigma,
                         robust: false,
+                        diff_step: None,
                         sigma,
                         xdata: xdata.clone(),
                         ydata: vec![1.2, 2.2, 2.9, 4.4, 4.8, 7.5],
@@ -573,6 +598,7 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                         analytic,
                         absolute_sigma,
                         robust: false,
+                        diff_step: None,
                         sigma: sigma.clone(),
                         xdata: xdata.clone(),
                         ydata: vec![1.2, 2.2, 2.9, 4.4, 4.8, 7.5],
@@ -585,6 +611,7 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                     analytic,
                     absolute_sigma: true,
                     robust: true,
+                    diff_step: None,
                     sigma: sigma.clone(),
                     xdata: xdata.clone(),
                     ydata: xdata
@@ -594,6 +621,25 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                         .collect(),
                 });
             }
+        }
+    }
+    // A requested perturbation smaller than one ULP must not become a zero
+    // Jacobian and a spurious successful fit at p0. Exercise both ordinary
+    // sub-ULP and almost-underflowing relative steps through the public API.
+    for diff_step in [1e-18, 1e-300] {
+        for (name, sigma) in &sigmas {
+            cases.push(WeightedCase {
+                case_id: format!("lm_{name}_difference_step_{diff_step:e}"),
+                method: "lm".to_string(),
+                bounded: false,
+                analytic: false,
+                absolute_sigma: true,
+                robust: false,
+                diff_step: Some(diff_step),
+                sigma: sigma.clone(),
+                xdata: xdata.clone(),
+                ydata: vec![1.2, 2.2, 2.9, 4.4, 4.8, 7.5],
+            });
         }
     }
     let Some(oracle) = scipy_oracle(&cases) else {
@@ -647,6 +693,7 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                 xtol: 1e-12,
                 ftol: 1e-12,
                 max_nfev: Some(1000),
+                diff_step: case.diff_step,
                 ..LeastSquaresOptions::default()
             },
         };
@@ -710,8 +757,8 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
         compared += 1;
     }
     assert_eq!(
-        compared, 60,
-        "all scalar/diagonal/correlated, bounded, analytic, variance and robust cases must compare"
+        compared, 66,
+        "all scalar/diagonal/correlated, bounded, analytic, variance, robust and finite-difference cases must compare"
     );
     eprintln!("weighted curve-fit compared_cases={compared}");
 }

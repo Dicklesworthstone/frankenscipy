@@ -303,9 +303,11 @@ pub struct LeastSquaresOptions {
     /// central differences away from bounds and second-order one-sided differences
     /// near a bound. Applies to `Trf`, `Dogbox`, and `Lm`.
     pub diff_method: FiniteDiffMethod,
-    /// Relative finite-difference step. For `Trf`/`Dogbox` and three-point `Lm`,
-    /// `None` selects SciPy's `ε^(1/2)` (two-point) or `ε^(1/3)` (three-point)
-    /// relative step. Two-point `Lm` retains its `√ε·(1 + |x|)` step.
+    /// Relative finite-difference step for all methods. `None` selects SciPy's
+    /// `ε^(1/2)` (two-point) or `ε^(1/3)` (three-point), scaled by `max(1, |x|)`.
+    /// An explicit step is scaled by `|x|`; a zero coordinate or an unrepresentable
+    /// requested displacement uses the automatic step. Derivatives use the actual
+    /// rounded displacement, not the requested one.
     pub diff_step: Option<f64>,
     /// Optional analytic Jacobian of the residuals. Numerical differences are used
     /// when absent. Analytic calls contribute to `njev`, not `nfev`.
@@ -1031,6 +1033,23 @@ where
     ))
 }
 
+/// SciPy's initial absolute step, before adjusting the stencil to bounds.
+fn fd_step_scipy(value: f64, method: FiniteDiffMethod, rel_step: Option<f64>) -> f64 {
+    let sign = if value >= 0.0 { 1.0 } else { -1.0 };
+    let default_step = method.rel_eps() * sign * value.abs().max(1.0);
+    match rel_step {
+        None => default_step,
+        Some(relative) => {
+            let step = relative * sign * value.abs();
+            if (value + step) - value == 0.0 {
+                default_step
+            } else {
+                step
+            }
+        }
+    }
+}
+
 /// Bound-aware points shared by dense and grouped numerical Jacobians. The
 /// boolean marks a one-sided stencil; the points are actual representable
 /// coordinates, so the denominator includes rounding of the perturbation.
@@ -1045,21 +1064,8 @@ fn fd_points_scipy(
     let unbounded =
         lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY);
     let mut points = Vec::with_capacity(n);
-    let relative_epsilon = method.rel_eps();
     for i in 0..n {
-        let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
-        let default_step = relative_epsilon * sign * x[i].abs().max(1.0);
-        let mut h = match rel_step {
-            None => default_step,
-            Some(r) => {
-                let h = r * sign * x[i].abs();
-                if (x[i] + h) - x[i] == 0.0 {
-                    default_step
-                } else {
-                    h
-                }
-            }
-        };
+        let mut h = fd_step_scipy(x[i], method, rel_step);
         let mut one_sided = method == FiniteDiffMethod::TwoPoint;
         if method == FiniteDiffMethod::ThreePoint {
             h = h.abs();
@@ -1257,7 +1263,7 @@ where
             residuals,
             x,
             residual,
-            options.diff_step.unwrap_or(SQRT_EPS),
+            options.diff_step,
             jac,
             x_perturbed,
         )?;
@@ -2119,12 +2125,32 @@ fn check_jacobian_residual_shape(residual: &[f64], expected: usize) -> Result<()
     Ok(())
 }
 
+/// Unbounded two-point stencils for LM, including their representable displacement.
+/// Compute them before any worker calls the model so a nonfinite point cannot be
+/// mistaken for a zero derivative when the model ignores that coordinate.
+fn lm_difference_points(x: &[f64], rel_step: Option<f64>) -> Result<Vec<(f64, f64)>, OptError> {
+    x.iter()
+        .map(|&value| {
+            let point = value + fd_step_scipy(value, FiniteDiffMethod::TwoPoint, rel_step);
+            let displacement = point - value;
+            if !point.is_finite() || !displacement.is_finite() || displacement == 0.0 {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from(
+                        "finite-difference perturbation must have a finite nonzero displacement",
+                    ),
+                });
+            }
+            Ok((point, displacement))
+        })
+        .collect()
+}
+
 /// Compute finite-difference Jacobian into fixed-shape scratch.
 fn finite_diff_jacobian_into<F>(
     residuals: &F,
     x: &[f64],
     r0: &[f64],
-    eps: f64,
+    rel_step: Option<f64>,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
 ) -> Result<(), OptError>
@@ -2133,6 +2159,7 @@ where
 {
     let n = x.len();
     let m = r0.len();
+    let points = lm_difference_points(x, rel_step)?;
     if jac.len() != m {
         jac.resize_with(m, Vec::new);
     }
@@ -2143,9 +2170,9 @@ where
     x_perturbed.copy_from_slice(x);
 
     for j in 0..n {
-        let step = eps * (1.0 + x[j].abs());
+        let (point, step) = points[j];
         let original = x_perturbed[j];
-        x_perturbed[j] += step;
+        x_perturbed[j] = point;
         let r_plus = residuals(x_perturbed);
         x_perturbed[j] = original; // restore
         check_jacobian_residual_shape(&r_plus, m)?;
@@ -2162,7 +2189,7 @@ where
 /// vector — the columns are independent, so their (expensive) residual evals run
 /// on a worker pool and the `jac` matrix is filled serially afterwards. The result
 /// is byte-identical to [`finite_diff_jacobian_into`] (each column uses the same
-/// per-column `step = eps*(1+|x[j]|)` and the same one-sided difference).
+/// relative-step policy and rounded displacement in the one-sided difference).
 ///
 /// Parallelism pays only when `n_params * m_data * cost_per_eval` is large enough
 /// to amortize thread spawn (measured: a hard loss below ~30K work, 2.75–13.66x
@@ -2172,7 +2199,7 @@ fn finite_diff_jacobian_parallel_into<F>(
     residuals: &F,
     x: &[f64],
     r0: &[f64],
-    eps: f64,
+    rel_step: Option<f64>,
     jac: &mut Vec<Vec<f64>>,
     x_perturbed: &mut Vec<f64>,
 ) -> Result<(), OptError>
@@ -2183,16 +2210,17 @@ where
     let m = r0.len();
     // Work-gate BEFORE any syscall: below it, the serial routine is faster.
     if n < 4 || m < 8192 || n.saturating_mul(m) < 131_072 {
-        return finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
+        return finite_diff_jacobian_into(residuals, x, r0, rel_step, jac, x_perturbed);
     }
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
     let nthreads = cores.min(n);
     if nthreads <= 1 {
-        return finite_diff_jacobian_into(residuals, x, r0, eps, jac, x_perturbed);
+        return finite_diff_jacobian_into(residuals, x, r0, rel_step, jac, x_perturbed);
     }
 
+    let points = lm_difference_points(x, rel_step)?;
     if jac.len() != m {
         jac.resize_with(m, Vec::new);
     }
@@ -2211,13 +2239,14 @@ where
                     return None;
                 }
                 let hi = (lo + per).min(n);
+                let points = &points;
                 Some(scope.spawn(move || {
                     let mut xp = x.to_vec();
                     (lo..hi)
                         .map(|j| {
-                            let step = eps * (1.0 + x[j].abs());
+                            let (point, step) = points[j];
                             let original = xp[j];
-                            xp[j] += step;
+                            xp[j] = point;
                             let r_plus = residuals(&xp);
                             xp[j] = original;
                             (j, r_plus, step)
@@ -2915,15 +2944,13 @@ mod tests {
                 .collect()
         };
         let r0 = residuals(&params);
-        let eps = 1.4901161193847656e-8;
-
         let mut jac_serial = Vec::new();
         let mut scratch_s = Vec::new();
         finite_diff_jacobian_into(
             &residuals,
             &params,
             &r0,
-            eps,
+            None,
             &mut jac_serial,
             &mut scratch_s,
         )
@@ -2935,7 +2962,7 @@ mod tests {
             &residuals,
             &params,
             &r0,
-            eps,
+            None,
             &mut jac_par,
             &mut scratch_p,
         )
@@ -2950,6 +2977,51 @@ mod tests {
                     b.to_bits(),
                     "parallel Jacobian must be byte-identical"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn finite_difference_jacobian_uses_actual_displacement() {
+        let point = [1.0];
+        let residual = |x: &[f64]| x.to_vec();
+        let mut jac = Vec::new();
+        finite_diff_jacobian_into(
+            &residual,
+            &point,
+            &point,
+            Some(0.75 * f64::EPSILON),
+            &mut jac,
+            &mut Vec::new(),
+        )
+        .expect("a rounded but nonzero displacement is valid");
+        // The derivative of the identity is exactly one. Dividing by the
+        // requested step instead of the rounded displacement gives 4/3 here.
+        assert_eq!(jac, vec![vec![1.0]]);
+    }
+
+    #[test]
+    fn parallel_fd_jacobian_cannot_erase_sub_ulp_perturbations() {
+        const N: usize = 16;
+        const M: usize = 8192;
+        const { assert!(N >= 4 && M >= 8192 && N * M >= 131_072) };
+        let point: Vec<f64> = (0..N)
+            .map(|j| if j % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let residual = |x: &[f64]| (0..M).map(|i| x[i % N]).collect::<Vec<_>>();
+        let mut jac = Vec::new();
+        finite_diff_jacobian_parallel_into(
+            &residual,
+            &point,
+            &residual(&point),
+            Some(1e-18),
+            &mut jac,
+            &mut Vec::new(),
+        )
+        .expect("parallel perturbations retain each identity column");
+        for (i, row) in jac.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                assert_eq!(value, if i % N == j { 1.0 } else { 0.0 });
             }
         }
     }
@@ -3071,6 +3143,57 @@ mod tests {
                     "magnitude={magnitude}, derivative={derivative}: {result:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_difference_step_cannot_erase_the_jacobian() {
+        // Each requested perturbation rounds back to the starting coordinate.
+        // Treating that as a zero derivative falsely reported gtol success at x0.
+        for start in [-1.0, 0.0, 1.0] {
+            for diff_step in [1.0e-18, 1.0e-300] {
+                let result = least_squares(
+                    |x| vec![x[0] - 3.0],
+                    &[start],
+                    LeastSquaresOptions {
+                        method: Some(LeastSquaresMethod::Lm),
+                        diff_step: Some(diff_step),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("a sub-ULP requested step uses the default representable step");
+                assert!(
+                    result.success,
+                    "start={start}, step={diff_step}: {result:?}"
+                );
+                assert!((result.x[0] - 3.0).abs() < 1e-10, "{result:?}");
+                assert!(result.fun[0].abs() < 1e-10, "{result:?}");
+                assert_eq!(result.jac.to_dense().unwrap(), vec![vec![1.0]]);
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_lm_difference_step_respects_small_parameter_units() {
+        // An explicitly requested relative step scales with |x|, not 1 + |x|.
+        // Adding 1e-4 to a 1e-12 parameter samples an entirely different regime.
+        for sign in [-1.0, 1.0] {
+            let result = least_squares(
+                |x| vec![(x[0] / 1e-12).powi(2) - 4.0],
+                &[sign * 1e-12],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Lm),
+                    diff_step: Some(1e-4),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("relative finite differences preserve parameter units");
+            assert!(result.success, "{result:?}");
+            assert!(
+                (result.x[0] / 1e-12 - sign * 2.0).abs() < 1e-8,
+                "{result:?}"
+            );
+            assert!(result.fun[0].abs() < 1e-7, "{result:?}");
         }
     }
 
