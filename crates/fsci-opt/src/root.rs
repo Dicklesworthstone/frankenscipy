@@ -516,7 +516,7 @@ where
     }
 
     for iter in 1..=options.maxiter {
-        let mid = 0.5 * (state.a + state.b);
+        let mid = finite_midpoint(state.a, state.b);
         let f_mid = eval.evaluate(mid)?;
         let interval_tol = options.xtol + options.rtol * mid.abs();
         if f_mid == 0.0 || (state.b - state.a).abs() <= interval_tol {
@@ -539,7 +539,7 @@ where
         }
     }
 
-    let root = 0.5 * (state.a + state.b);
+    let root = finite_midpoint(state.a, state.b);
     Ok(RootResult::terminal(
         RootMethod::Bisect,
         root,
@@ -583,7 +583,7 @@ where
     }
 
     for iter in 1..=options.maxiter {
-        let mid = 0.5 * (state.a + state.b);
+        let mid = finite_midpoint(state.a, state.b);
         let f_mid = eval.evaluate(mid)?;
         if f_mid == 0.0 {
             return Ok(RootResult::terminal(
@@ -596,26 +596,36 @@ where
                 "ridder converged (f(mid) == 0)",
             ));
         }
-        let disc = f_mid * f_mid - state.fa * state.fb;
-        if disc <= 0.0 {
-            return Ok(RootResult::terminal(
-                RootMethod::Ridder,
-                mid,
-                false,
-                ConvergenceStatus::PrecisionLoss,
-                iter,
-                eval.function_calls,
-                "ridder encountered non-positive discriminant",
-            ));
-        }
-        let s = disc.sqrt();
-        let sign = if (state.fa - state.fb) < 0.0 {
-            -1.0
+        // Scale the three function values before forming the discriminant.
+        // Squaring raw residuals underflows below ~1e-162 and overflows above
+        // ~1e154, despite finite, sign-changing endpoints. The quotient in
+        // Ridder's correction is invariant under a common positive scale.
+        let magnitude = state.fa.abs().max(state.fb.abs()).max(f_mid.abs());
+        let scaled_mid = f_mid / magnitude;
+        let scaled_a = state.fa / magnitude;
+        let scaled_b = state.fb / magnitude;
+        let discriminant = scaled_mid * scaled_mid - scaled_a * scaled_b;
+        let correction = if discriminant > 0.0 {
+            scaled_mid / discriminant.sqrt()
         } else {
-            1.0
+            // Extreme ratios may underflow even after scaling. Bisection
+            // remains valid; do not report precision loss on a valid bracket.
+            0.0
         };
-        let x_new = mid + (mid - state.a) * sign * f_mid / s;
-        let f_new = eval.evaluate(x_new)?;
+        let sign = if state.fa < state.fb { -1.0 } else { 1.0 };
+        let candidate = mid + (mid - state.a) * sign * correction;
+        let x_new = if candidate > state.a && candidate < state.b {
+            candidate
+        } else {
+            mid
+        };
+        // A correction can round back to mid. Reuse that evaluation rather
+        // than unnecessarily calling the user function at the same point.
+        let f_new = if x_new == mid {
+            f_mid
+        } else {
+            eval.evaluate(x_new)?
+        };
 
         let interval_tol = options.xtol + options.rtol * x_new.abs();
         if f_new == 0.0 || (state.b - state.a).abs() <= interval_tol {
@@ -644,7 +654,7 @@ where
         }
     }
 
-    let root = 0.5 * (state.a + state.b);
+    let root = finite_midpoint(state.a, state.b);
     Ok(RootResult::terminal(
         RootMethod::Ridder,
         root,
@@ -739,7 +749,7 @@ fn toms748_frexp_exponent(x: f64) -> i32 {
 fn toms748_newton_quadratic(ab: [f64; 2], fab: [f64; 2], d: f64, fd: f64, k: usize) -> f64 {
     let [a, b] = ab;
     let [fa, fb] = fab;
-    let mid = 0.5 * (a + b);
+    let mid = finite_midpoint(a, b);
 
     // Forward divided differences of [a, b, d]: coeff_b = f[a,b], coeff_a = f[a,b,d].
     let coeff_b = (fb - fa) / (b - a);
@@ -904,7 +914,7 @@ where
         (-ratio * ab[0] + ab[1]) / (1.0 - ratio)
     };
     if !(c > ab[0] && c < ab[1]) {
-        c = 0.5 * (ab[0] + ab[1]);
+        c = finite_midpoint(ab[0], ab[1]);
     }
     let fc = eval.evaluate(c)?;
     if fc == 0.0 {
@@ -946,7 +956,7 @@ where
         let slope = (fab[1] - fab[0]) / (ab[1] - ab[0]);
         let mut c = u - 2.0 * fu / slope;
         if !c.is_finite() || (c - u).abs() > 0.5 * (ab[1] - ab[0]) {
-            c = 0.5 * (ab[0] + ab[1]);
+            c = finite_midpoint(ab[0], ab[1]);
         } else if (c - u).abs() <= f64::EPSILON * u.abs() {
             // The step did not move: either the endpoint f-values differ in
             // magnitude by so much that the secant is pinned to `u`, or the
@@ -963,7 +973,7 @@ where
                 u + sign * (c.abs() * options.rtol + options.xtol)
             };
             if !(c > ab[0] && c < ab[1]) {
-                c = 0.5 * (ab[0] + ab[1]);
+                c = finite_midpoint(ab[0], ab[1]);
             }
         }
         let fc = eval.evaluate(c)?;
@@ -977,7 +987,7 @@ where
         // the bracket, spend one bisection so the worst case stays bisection's.
         if ab[1] - ab[0] > TOMS748_MU * start_width {
             e = Some((d, fd));
-            let z = 0.5 * (ab[0] + ab[1]);
+            let z = finite_midpoint(ab[0], ab[1]);
             let fz = eval.evaluate(z)?;
             if fz == 0.0 {
                 return Ok(exact(z, iter, eval.function_calls));
@@ -986,7 +996,7 @@ where
         }
     }
 
-    let root = 0.5 * (ab[0] + ab[1]);
+    let root = finite_midpoint(ab[0], ab[1]);
     Ok(RootResult::terminal(
         RootMethod::Toms748,
         root,
@@ -1552,6 +1562,18 @@ where
 
 fn same_sign(lhs: f64, rhs: f64) -> bool {
     lhs.is_sign_positive() == rhs.is_sign_positive()
+}
+
+/// Compute the midpoint of any two finite f64 endpoints without overflowing
+/// their sum. On ordinary brackets retain the original expression (and its
+/// rounding), preserving existing solver traces and evaluation counts.
+fn finite_midpoint(a: f64, b: f64) -> f64 {
+    let sum = a + b;
+    if sum.is_finite() {
+        0.5 * sum
+    } else {
+        0.5 * a + 0.5 * b
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
