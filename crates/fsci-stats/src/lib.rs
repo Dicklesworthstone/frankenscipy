@@ -1321,6 +1321,135 @@ fn log_one_plus_exp(x: f64) -> f64 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
+/// `exp(log_scale) * ln(1 + exp(x))` when the factors separately overflow
+/// or underflow. Below -36, ln(softplus(x)) rounds to x in binary64.
+fn scaled_softplus(log_scale: f64, x: f64) -> f64 {
+    let log_value = if x < -36.0 {
+        x
+    } else {
+        log_one_plus_exp(x).ln()
+    };
+    (log_scale + log_value).exp()
+}
+
+/// Validate before allocating the log observations used by positive-shape
+/// profile likelihoods. A constant sample has no finite two-shape maximum
+/// for these families (the optimum is a singular or limiting distribution).
+fn positive_profile_fit_logs(data: &[f64], family: &str) -> Result<Vec<f64>, FitError> {
+    if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+        return Err(FitError::ResourceExhausted {
+            detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+        });
+    }
+    mle::validate_positive_sample(data, family)?;
+    Ok(data.iter().map(|x| x.ln()).collect())
+}
+
+/// Fit two positive shapes by profiling the first out analytically and
+/// minimizing the remaining mean negative log likelihood in log-shape space.
+/// The search expands until it brackets a strict interior minimum; it never
+/// substitutes an endpoint or an arbitrary parameter cap for a finite MLE.
+fn fit_positive_shape_profile<F>(
+    initial: f64,
+    family: &str,
+    profile: F,
+) -> Result<(f64, f64), FitError>
+where
+    F: Fn(f64) -> Option<(f64, f64)>,
+{
+    let objective = |log_shape: f64| {
+        let shape = log_shape.exp();
+        if !shape.is_finite() || shape <= 0.0 {
+            return f64::INFINITY;
+        }
+        profile(shape)
+            .filter(|&(first, nll)| first.is_finite() && first > 0.0 && nll.is_finite())
+            .map_or(f64::INFINITY, |(_, nll)| nll)
+    };
+    let start = initial.ln();
+    if !start.is_finite() || !objective(start).is_finite() {
+        return Err(FitError::NonConvergent(format!(
+            "{family} profile likelihood has no finite starting point"
+        )));
+    }
+    let bracket = fsci_opt::bracket_minimum(
+        objective,
+        start,
+        fsci_opt::MinimumBracketOptions {
+            maxiter: 64,
+            ..fsci_opt::MinimumBracketOptions::default()
+        },
+    )
+    .map_err(|error| FitError::NonConvergent(error.to_string()))?;
+    let (mut left, mut middle, mut right) = bracket.bracket;
+    let (mut fl, mut fm, mut fr) = bracket.f_bracket;
+    if !bracket.success || !fm.is_finite() || !(fm < fl && fm < fr) {
+        return Err(FitError::NonConvergent(format!(
+            "{family} profile likelihood has no bracketed finite interior maximum"
+        )));
+    }
+    // A nonfinite edge may be a representability wall for the profiled
+    // parameter, not an uphill likelihood. Certify a finite uphill point
+    // before accepting it as a bracket: otherwise, e.g. Mielke on [2,2.0001]
+    // would report k ~= f64::MAX although the likelihood is still increasing.
+    for _ in 0..64 {
+        if fl.is_finite() && fr.is_finite() {
+            break;
+        }
+        let on_left = !fl.is_finite();
+        let edge = if on_left { left } else { right };
+        let point = middle + 0.5 * (edge - middle);
+        if point == middle || point == edge {
+            break;
+        }
+        let value = objective(point);
+        if value < fm {
+            if on_left {
+                right = middle;
+                fr = fm;
+            } else {
+                left = middle;
+                fl = fm;
+            }
+            middle = point;
+            fm = value;
+        } else if on_left {
+            left = point;
+            fl = value;
+        } else {
+            right = point;
+            fr = value;
+        }
+    }
+    if !fl.is_finite() || !fr.is_finite() || !(fm < fl && fm < fr) {
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE has no finite uphill bracket before its representability limit"
+        )));
+    }
+    let (mut log_shape, nll) =
+        fsci_opt::minimize_scalar_bounded(objective, (left, right), 1e-11, 256);
+    // Near the optimum several adjacent f64 parameters can have the same
+    // likelihood. Retain the best observed point rather than degrading it.
+    if nll > fm {
+        log_shape = middle;
+    }
+    if !log_shape.is_finite() || !(left < log_shape && log_shape < right) {
+        return Err(FitError::NonConvergent(format!(
+            "{family} profile likelihood did not converge inside its bracket"
+        )));
+    }
+    let shape = log_shape.exp();
+    let (first, nll) = profile(shape).ok_or_else(|| {
+        FitError::NonConvergent(format!("{family} fitted shapes are not representable"))
+    })?;
+    if !first.is_finite() || first <= 0.0 || !nll.is_finite() {
+        return Err(FitError::NonConvergent(format!(
+            "{family} fitted likelihood is not finite"
+        )));
+    }
+    Ok((first, shape))
+}
+
 /// Helper: validate fit() data for parameterless / standardized distributions.
 /// Requires at least one observation and rejects non-finite values. Used by
 /// the no-op fit() implementations on parameterless distributions where the
@@ -26005,35 +26134,86 @@ impl ContinuousDistribution for Mielke {
                 0.0
             };
         }
-        let k = self.k;
-        let s = self.s;
-        k * x.powf(k - 1.0) / (1.0 + x.powf(s)).powf(1.0 + k / s)
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        if x <= 0.0 {
+            return self.pdf(x).ln();
+        }
+        if x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let lx = x.ln();
+        let correction = scaled_softplus(
+            log_one_plus_exp(self.k.ln() - self.s.ln()),
+            -(self.s * lx).abs(),
+        );
+        // Split off the linear part on the appropriate side of x=1.
+        // Neither k/s overflow nor s*ln(x) overflow in the left tail should
+        // erase a finite log density.
+        if lx < 0.0 {
+            self.k.ln() + (self.k - 1.0) * lx - correction
+        } else {
+            self.k.ln() - (self.s + 1.0) * lx - correction
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
+        self.logcdf(x).exp()
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if x == f64::INFINITY {
             return 0.0;
         }
-        let xk = x.powf(self.k);
-        xk / (1.0 + x.powf(self.s)).powf(self.k / self.s)
+        let lx = x.ln();
+        let correction = scaled_softplus(self.k.ln() - self.s.ln(), -(self.s * lx).abs());
+        // log CDF = -(k/s)*softplus(-s*ln x). The signed split
+        // preserves the finite power-law limit when s*ln(x) overflows.
+        if lx < 0.0 {
+            self.k * lx - correction
+        } else {
+            -correction
+        }
     }
 
     fn ppf(&self, q: f64) -> f64 {
-        // cdf=(1+x^{-s})^{-k/s} ⇒ x=(q^{-s/k}−1)^{-1/s}; closed-form inverse. frankenscipy-ld94y
         if !(0.0..=1.0).contains(&q) {
             return f64::NAN;
         }
-        (q.powf(-self.s / self.k) - 1.0).powf(-1.0 / self.s)
+        if q == 0.0 {
+            return 0.0;
+        }
+        if q == 1.0 {
+            return f64::INFINITY;
+        }
+        // log x = -log(expm1(-(s/k)*log q))/s. Form the small
+        // argument in log space so a large fitted k cannot round q^(-s/k)
+        // to one, or underflow s/k before the logarithm can rescue it.
+        let log_q = q.ln();
+        let log_argument = self.s.ln() - self.k.ln() + (-log_q).ln();
+        let argument = log_argument.exp();
+        let log_x = if argument > LN_2 {
+            // Split the linear term before dividing by s; argument itself
+            // can overflow even when the finite quantile is representable.
+            log_q / self.k - (-(-argument).exp()).ln_1p() / self.s
+        } else {
+            let log_expm1 = if argument == 0.0 {
+                log_argument
+            } else {
+                argument.exp_m1().ln()
+            };
+            -log_expm1 / self.s
+        };
+        log_x.exp()
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // cdf = x^k/(1+x^s)^{k/s} ≡ (1+x^{-s})^{-k/s}, so
-        // sf = 1 − (1+x^{-s})^{-k/s} = −expm1(−(k/s)·ln1p(x^{-s})) — stable in
-        // the right tail where the default 1−cdf collapses. frankenscipy-w3f6m
-        if x <= 0.0 {
-            return 1.0;
-        }
-        -(-(self.k / self.s) * x.powf(-self.s).ln_1p()).exp_m1()
+        -self.logcdf(x).exp_m1()
     }
 
     fn mean(&self) -> f64 {
@@ -26116,48 +26296,61 @@ impl ContinuousDistribution for Mielke {
         )
     }
 
+    /// MLE with location zero and scale one. For fixed `s`, the likelihood
+    /// score gives `k = s / mean(log(1 + x^(-s)))`; only `s` needs a search.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        validate_finite_fit_data(data, 4, "Mielke")?;
-        for &x in data {
-            if x <= 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Mielke support is (0, infinity); got {x}"
-                )));
-            }
-        }
-        let qs = quantile(data, &[0.25, 0.5, 0.75]);
-        if qs.iter().any(|&x| x <= 0.0) || qs[0] >= qs[2] {
+        let logs = positive_profile_fit_logs(data, "Mielke")?;
+        if logs.iter().all(|&lx| lx <= 0.0) {
+            // If every x <= 1, increasing s improves the likelihood toward
+            // its power-law limit. No finite pair (k,s) attains that limit.
             return Err(FitError::NonConvergent(
-                "Mielke fit needs positive non-degenerate quartiles".to_owned(),
+                "Mielke MLE is a limiting distribution when every observation is at most one"
+                    .into(),
             ));
         }
-
-        let mut best = None::<(f64, f64, f64)>;
-        for ki in 0..=195 {
-            let k = 0.25 + 0.05 * ki as f64;
-            for si in 0..=195 {
-                let s = 0.25 + 0.05 * si as f64;
-                let dist = Self { k, s };
-                let c25 = dist.cdf(qs[0]);
-                let c50 = dist.cdf(qs[1]);
-                let c75 = dist.cdf(qs[2]);
-                if !c25.is_finite() || !c50.is_finite() || !c75.is_finite() {
-                    continue;
-                }
-                let error = (c25 - 0.25).powi(2) + (c50 - 0.5).powi(2) + (c75 - 0.75).powi(2);
-                if best.is_none_or(|(_, _, best_error)| error < best_error) {
-                    best = Some((k, s, error));
-                }
+        let n = logs.len() as f64;
+        let largest_log = logs.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+        let (k, s) = fit_positive_shape_profile(largest_log.recip(), "Mielke", |s| {
+            let mut mean_left = 0.0;
+            let mut mean_right = 0.0;
+            for &lx in &logs {
+                mean_left += log_one_plus_exp(-s * lx) / n;
+                mean_right += log_one_plus_exp(s * lx) / n;
             }
+            let k = s / mean_left;
+            // Drop mean(log x), which is independent of the parameters.
+            Some((k, -k.ln() + mean_right + 1.0))
+        })?;
+        let mut mean_entropy = 0.0;
+        let mut mean_weighted_log = 0.0;
+        for &lx in &logs {
+            let t = s * lx;
+            let magnitude = t.abs();
+            let small_exp = (-magnitude).exp();
+            let small_probability = small_exp / (1.0 + small_exp);
+            // softplus(t)-t*sigmoid(t) is the binary entropy of
+            // sigmoid(t). Evaluate its small terms directly, avoiding a
+            // subtraction of two t-sized quantities in a concentrated fit.
+            mean_entropy += (log_one_plus_exp(-magnitude) + magnitude * small_probability) / n;
+            let weighted_log = if t >= 0.0 {
+                t / (1.0 + small_exp)
+            } else {
+                t * small_probability
+            };
+            mean_weighted_log += weighted_log / n;
         }
-
-        if let Some((k, s, _)) = best {
-            Ok(Self { k, s })
-        } else {
-            Err(FitError::NonConvergent(
-                "Mielke quantile fit did not find finite k/s".to_owned(),
-            ))
+        let profiled_term = (k / s) * mean_entropy;
+        let score = profiled_term - mean_weighted_log;
+        let score_scale = 1.0 + profiled_term.abs() + mean_weighted_log.abs();
+        // A rounded objective can manufacture an apparent minimum at the
+        // largest finite k. Such a point still has a nonzero likelihood
+        // score, and must not be reported as a converged finite MLE.
+        if !score.is_finite() || score.abs() > 1e-6 * score_scale {
+            return Err(FitError::NonConvergent(
+                "Mielke profile likelihood did not reach a stationary finite maximum".into(),
+            ));
         }
+        Ok(Self { k, s })
     }
 }
 
@@ -103507,8 +103700,11 @@ mod tests {
         let mielke = Mielke::new(2.0, 4.0);
         let data = [0.1, 0.25, 0.5, 0.75, 0.9].map(|q| mielke_ppf_for_test(mielke, q));
         let fitted = Mielke::try_fit(&data).expect("Mielke fit");
+        // These five quantiles are not a population sample: their MLE is
+        // different from the generating shapes, and must maximize likelihood.
         assert!(
-            (fitted.k - 2.0).abs() <= 0.1 && (fitted.s - 4.0).abs() <= 0.1,
+            (fitted.k - 2.122_504_877_508_915).abs() <= 2e-6
+                && (fitted.s - 4.274_247_728_151_3).abs() <= 2e-6,
             "Mielke fit got k={}, s={}",
             fitted.k,
             fitted.s

@@ -11,7 +11,7 @@ use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
-    LocationScale, Lognormal, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
+    LocationScale, Lognormal, Mielke, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
     SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
@@ -48,6 +48,7 @@ cases = [
     ('nakagami', stats.nakagami, [(0.25,), (2.0,), (1000.0,)]),
     ('gompertz', stats.gompertz, [(0.1,), (1.0,), (10.0,)]),
     ('genlogistic', stats.genlogistic, [(0.2,), (1.0,), (5.0,)]),
+    ('mielke', stats.mielke, [(0.2, 1.4), (2.0, 4.0), (40.0, 20.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -1558,6 +1559,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
                 let fitted = fsci_stats::GenLogistic::try_fit(&data).unwrap();
                 (vec![fitted.c], likelihood(&fitted, &data))
             }
+            "mielke" => {
+                let fitted = Mielke::try_fit(&data).unwrap();
+                (vec![fitted.k, fitted.s], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -1661,7 +1666,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
             "{family}/{case}: fsci NLL {nll} worse than SciPy {expected_nll}; \
              fsci parameters {actual:?}, SciPy {expected:?}"
         );
-        if matches!(family, "gamma" | "beta" | "weibull_min" | "lognorm") {
+        if matches!(
+            family,
+            "gamma" | "beta" | "weibull_min" | "lognorm" | "mielke"
+        ) {
             for (&value, &reference) in actual.iter().zip(&expected) {
                 assert!(
                     (value - reference).abs() <= 1.0e-4 * reference.abs().max(1.0e-8),
@@ -1676,10 +1684,160 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 57,
+        compared, 60,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 19; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 20; samples per case = 2000");
+}
+
+#[test]
+fn mielke_profile_fit_uses_the_likelihood_and_has_no_shape_grid_cap() {
+    let data = [0.2, 0.5, 0.8, 1.1, 1.9, 4.0, 8.0];
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let fitted = Mielke::try_fit(&data).unwrap();
+            assert!((fitted.k - 1.699_724_340_636_757_5).abs() < 2e-6);
+            assert!((fitted.s - 1.360_158_431_045_784_4).abs() < 2e-6);
+            assert!((likelihood(&fitted, &data) - 12.846_688_114_889_446).abs() < 1e-11);
+
+            // The analytic k-score must vanish; changing either fitted shape
+            // independently must increase the actual sample NLL.
+            let score_k = data.len() as f64 / fitted.k
+                - data
+                    .iter()
+                    .map(|x| x.powf(-fitted.s).ln_1p() / fitted.s)
+                    .sum::<f64>();
+            assert!(score_k.abs() < 1e-12);
+            let score_s = data
+                .iter()
+                .map(|x| {
+                    let y = x.ln();
+                    let t = fitted.s * y;
+                    fitted.k / fitted.s.powi(2) * t.exp().ln_1p()
+                        - (1.0 + fitted.k / fitted.s) * y / (1.0 + (-t).exp())
+                })
+                .sum::<f64>();
+            assert!(score_s.abs() < 2e-6, "Mielke s-score = {score_s}");
+            for factor in [0.9, 1.1] {
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&Mielke::new(factor * fitted.k, fitted.s), &data)
+                );
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&Mielke::new(fitted.k, factor * fitted.s), &data)
+                );
+            }
+
+            let source = Mielke::new(40.0, 20.0);
+            let samples: Vec<_> = (0..2000)
+                .map(|i| source.ppf((i as f64 + 0.5) / 2000.0))
+                .collect();
+            let fitted = Mielke::try_fit(&samples).unwrap();
+            assert!(fitted.k > 30.0 && fitted.s > 15.0);
+            assert!(likelihood(&fitted, &samples) <= likelihood(&source, &samples));
+        });
+    }
+}
+
+#[test]
+fn mielke_profile_fit_rejects_limiting_samples_and_honors_hardened_caps() {
+    for data in [vec![], vec![2.0]] {
+        assert!(matches!(
+            Mielke::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            Mielke::try_fit(&[0.5, invalid, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [
+        vec![0.2, 0.5, 0.8, 1.0],
+        vec![2.0, 2.0],
+        // A finite optimum exists mathematically, but its k is larger than
+        // f64::MAX. The finite representability edge is not an MLE.
+        vec![2.0, 2.0001],
+        // Here rounding can even make both finite endpoint likelihoods
+        // slightly worse than the middle: only the score detects the wall.
+        vec![2.0, 2.0002],
+        vec![1.1, 1.1001],
+    ] {
+        assert!(matches!(
+            Mielke::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Mielke::try_fit(&[0.5, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(Mielke::try_fit(&[0.5, 2.0]).is_ok());
+        });
+    });
+}
+
+#[test]
+fn mielke_log_density_preserves_finite_likelihood_when_powers_overflow() {
+    let distribution = Mielke::new(2000.0, 1000.0);
+    for x in [0.25, 0.5, 2.0, 4.0] {
+        let actual = distribution.logpdf(x);
+        assert!(actual.is_finite());
+        let lx = x.ln();
+        let expected = if x > 1.0 {
+            2000.0_f64.ln() - 1001.0 * lx
+        } else {
+            2000.0_f64.ln() + 1999.0 * lx
+        };
+        assert!((actual - expected).abs() < 1e-12);
+        assert_eq!(distribution.pdf(x), actual.exp());
+    }
+    assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+    assert_eq!(Mielke::new(0.5, 2.0).logpdf(0.0), f64::INFINITY);
+    assert_eq!(Mielke::new(1.0, 2.0).logpdf(0.0), 0.0);
+    assert_eq!(distribution.logpdf(0.0), f64::NEG_INFINITY);
+    assert!(distribution.logpdf(f64::NAN).is_nan());
+    let finite_after_rescaling = Mielke::new(1e308, 0.5).logpdf(1e308);
+    assert!(finite_after_rescaling.is_finite());
+    assert!((finite_after_rescaling / -2e154 - 1.0).abs() < 1e-12);
+    // s*ln(x) overflows, although the limiting density is exactly one.
+    assert_eq!(Mielke::new(1.0, 1e308).logpdf(0.01), 0.0);
+}
+
+#[test]
+fn mielke_fitted_high_shapes_keep_probabilities_and_quantiles_usable() {
+    for data in [[2.0, 2.1, 2.2, 2.3], [2.0, 2.02, 2.04, 2.06]] {
+        let fitted = Mielke::try_fit(&data).unwrap();
+        assert!(fitted.k > 1e6);
+        for x in data {
+            let cdf = fitted.cdf(x);
+            let sf = fitted.sf(x);
+            assert!(cdf.is_finite() && cdf > 0.0 && cdf < 1.0);
+            assert!(sf.is_finite() && sf > 0.0 && sf < 1.0);
+            assert!((cdf + sf - 1.0).abs() < 2e-15);
+        }
+        for q in [0.1, 0.5, 0.9] {
+            let x = fitted.ppf(q);
+            assert!(x.is_finite());
+            assert!((fitted.cdf(x) - q).abs() < 1e-12);
+        }
+    }
+    // Independent analytical profile-score root for this finite sample.
+    let fitted = Mielke::try_fit(&[2.0, 2.02, 2.04, 2.06]).unwrap();
+    assert!((fitted.ppf(0.5) - 2.026_066_324_557_367_3).abs() < 2e-6);
+
+    // s/k is huge and -(s/k)*ln(q) overflows; the limiting quantile
+    // q^(1/k) is nevertheless finite.
+    let limiting = Mielke::new(1.0, 1e308);
+    assert!((limiting.ppf(0.01) - 0.01).abs() < 1e-16);
+    assert!((limiting.cdf(0.01) - 0.01).abs() < 1e-16);
+    assert_eq!(limiting.ppf(0.0), 0.0);
+    assert_eq!(limiting.ppf(1.0), f64::INFINITY);
+    assert!(limiting.ppf(f64::NAN).is_nan());
 }
 
 #[test]
