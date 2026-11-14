@@ -1131,7 +1131,10 @@ fn all_solvers_refine_backward_events_away_from_step_midpoints() {
         assert_eq!(result.status, 1, "{method:?}");
         let root = result.t_events.as_ref().unwrap()[0][0];
         assert!((root - 0.3).abs() < 5e-12, "{method:?}: root={root}");
-        assert!((result.y.last().unwrap()[0] - 0.3).abs() < 5e-12, "{method:?}");
+        assert!(
+            (result.y.last().unwrap()[0] - 0.3).abs() < 5e-12,
+            "{method:?}"
+        );
     }
 }
 

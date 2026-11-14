@@ -4118,7 +4118,7 @@ mod tests {
             let residual_calls = AtomicUsize::new(0);
             let jacobian_calls = Arc::new(AtomicUsize::new(0));
             let jacobian_count = Arc::clone(&jacobian_calls);
-            let slopes = vec![1.0, 2.0, 4.0];
+            let slopes = [1.0, 2.0, 4.0];
             let result = least_squares(
                 |x| {
                     residual_calls.fetch_add(1, Ordering::Relaxed);

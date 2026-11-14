@@ -9837,7 +9837,10 @@ fn fft_oracle_case_to_expected(
         return Err(format!(
             "SciPy capture errored for FFT case `{}`: {}",
             case.case_id(),
-            oracle_case.error.as_deref().unwrap_or("unknown oracle error")
+            oracle_case
+                .error
+                .as_deref()
+                .unwrap_or("unknown oracle error")
         ));
     }
     match (&case.expected, oracle_case.result_kind.as_str()) {
@@ -10609,7 +10612,9 @@ fn parse_special_oracle_f64(val: &serde_json::Value, case_id: &str) -> Result<f6
             other => Err(format!("invalid __float__ tag `{other}` in {case_id}")),
         };
     }
-    Err(format!("expected float in oracle result for {case_id}, got {val}"))
+    Err(format!(
+        "expected float in oracle result for {case_id}, got {val}"
+    ))
 }
 
 fn parse_special_oracle_complex(
@@ -16777,13 +16782,13 @@ fn run_differential_sparse(
                         let (passed, message) = compare_sparse_outcome(&case.expected, &observed);
                         let tolerance = match &case.expected {
                             SparseExpectedOutcome::Vector { atol, rtol, .. }
-                            | SparseExpectedOutcome::EigenvaluesAbsSorted {
-                                atol, rtol, ..
-                            } => Some(ToleranceUsed {
-                                atol: atol.unwrap_or(1.0e-10),
-                                rtol: rtol.unwrap_or(1.0e-8),
-                                comparison_mode: "allclose".to_owned(),
-                            }),
+                            | SparseExpectedOutcome::EigenvaluesAbsSorted { atol, rtol, .. } => {
+                                Some(ToleranceUsed {
+                                    atol: atol.unwrap_or(1.0e-10),
+                                    rtol: rtol.unwrap_or(1.0e-8),
+                                    comparison_mode: "allclose".to_owned(),
+                                })
+                            }
                             _ => None,
                         };
                         (passed, message, None, tolerance)
@@ -26370,7 +26375,10 @@ Path(args.output).write_text(json.dumps(payload))
         };
         let (passed, _, _, _) =
             compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_bad);
-        assert!(!passed, "linalg oracle comparator must reject drifted oracle value");
+        assert!(
+            !passed,
+            "linalg oracle comparator must reject drifted oracle value"
+        );
 
         // 2. optimize: Root case on cubic (x^3 - 2 = 0 -> 2^(1/3)) where embedded expected is 999.0.
         let true_root = 2.0_f64.cbrt();

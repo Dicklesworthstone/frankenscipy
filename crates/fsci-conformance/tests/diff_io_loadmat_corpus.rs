@@ -1257,8 +1257,7 @@ fn diff_io_arff_and_wavfile() {
         &["arff_loadarff", "arff_errors", "wavfile_roundtrip"],
     );
 
-    let arff_text =
-        "@relation sample\n@attribute x numeric\n@attribute y numeric\n@data\n1.5, -2.25\n3.0, 4.5\n";
+    let arff_text = "@relation sample\n@attribute x numeric\n@attribute y numeric\n@data\n1.5, -2.25\n3.0, 4.5\n";
     let parsed = read_arff(arff_text).expect("read_arff valid");
     let attr_names: Vec<&str> = parsed
         .attributes

@@ -399,7 +399,8 @@ fn diff_stats_sampling_unuran() {
         })
         .expect("sru sample");
     let mean = samples.iter().sum::<f64>() / (samples.len() as f64);
-    let var = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((samples.len() - 1) as f64);
+    let var =
+        samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((samples.len() - 1) as f64);
     let std = var.sqrt();
     ledger.compared(
         "SimpleRatioUniforms",
@@ -412,8 +413,10 @@ fn diff_stats_sampling_unuran() {
         (std - oracle.sru_std).abs() <= 0.1,
     );
 
-    let zero_res = NumericalInversePolynomial::new(|_: f64| 0.0, Some(0.0), Some((-1.0, 1.0)), 5, 1e-10);
-    let err_matches = oracle.unuran_err && matches!(zero_res, Err(StatsError::InvalidArgument { .. }));
+    let zero_res =
+        NumericalInversePolynomial::new(|_: f64| 0.0, Some(0.0), Some((-1.0, 1.0)), 5, 1e-10);
+    let err_matches =
+        oracle.unuran_err && matches!(zero_res, Err(StatsError::InvalidArgument { .. }));
     ledger.compared("UNURANError", "zero_pdf", err_matches);
 
     ledger.finish(1);

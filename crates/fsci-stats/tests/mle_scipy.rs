@@ -10,7 +10,7 @@ use std::process::Command;
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
-    CrystalBall, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
+    CrystalBall, ExponWeibull, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
     LocationScale, Lognormal, Mielke, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
     SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
@@ -49,6 +49,7 @@ cases = [
     ('gompertz', stats.gompertz, [(0.1,), (1.0,), (10.0,)]),
     ('genlogistic', stats.genlogistic, [(0.2,), (1.0,), (5.0,)]),
     ('mielke', stats.mielke, [(0.2, 1.4), (2.0, 4.0), (40.0, 20.0)]),
+    ('exponweib', stats.exponweib, [(0.2, 1.4), (2.0, 1.5), (40.0, 20.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -1563,6 +1564,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
                 let fitted = Mielke::try_fit(&data).unwrap();
                 (vec![fitted.k, fitted.s], likelihood(&fitted, &data))
             }
+            "exponweib" => {
+                let fitted = ExponWeibull::try_fit(&data).unwrap();
+                (vec![fitted.a, fitted.c], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -1668,7 +1673,7 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         );
         if matches!(
             family,
-            "gamma" | "beta" | "weibull_min" | "lognorm" | "mielke"
+            "gamma" | "beta" | "weibull_min" | "lognorm" | "mielke" | "exponweib"
         ) {
             for (&value, &reference) in actual.iter().zip(&expected) {
                 assert!(
@@ -1684,10 +1689,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 60,
+        compared, 63,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 20; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 21; samples per case = 2000");
 }
 
 #[test]
@@ -1764,6 +1769,12 @@ fn mielke_profile_fit_rejects_limiting_samples_and_honors_hardened_caps() {
         // slightly worse than the middle: only the score detects the wall.
         vec![2.0, 2.0002],
         vec![1.1, 1.1001],
+        // These lie immediately beyond the finite k boundary; a small
+        // scaled score alone cannot certify a representable maximum.
+        vec![2.0, 2.004_741_612_574_921_6],
+        vec![2.0, 2.004_742_039_362_732],
+        vec![2.0, 2.004_742_082_041_513],
+        vec![2.0, 2.004_742_086_309_391],
     ] {
         assert!(matches!(
             Mielke::try_fit(&data),
@@ -1829,6 +1840,11 @@ fn mielke_fitted_high_shapes_keep_probabilities_and_quantiles_usable() {
     // Independent analytical profile-score root for this finite sample.
     let fitted = Mielke::try_fit(&[2.0, 2.02, 2.04, 2.06]).unwrap();
     assert!((fitted.ppf(0.5) - 2.026_066_324_557_367_3).abs() < 2e-6);
+    // Just inside the representability boundary, k is about 1.7964e308.
+    // The score certificate must not introduce another large-shape cap.
+    let near_limit = Mielke::try_fit(&[2.0, 2.004_742_091_525_687]).unwrap();
+    assert!(near_limit.k.is_finite() && near_limit.k > 1e308);
+    assert!(near_limit.ppf(0.5).is_finite());
 
     // s/k is huge and -(s/k)*ln(q) overflows; the limiting quantile
     // q^(1/k) is nevertheless finite.
@@ -1838,6 +1854,169 @@ fn mielke_fitted_high_shapes_keep_probabilities_and_quantiles_usable() {
     assert_eq!(limiting.ppf(0.0), 0.0);
     assert_eq!(limiting.ppf(1.0), f64::INFINITY);
     assert!(limiting.ppf(f64::NAN).is_nan());
+}
+
+#[test]
+fn exponweibull_profile_fit_handles_a_unit_median_and_maximizes_likelihood() {
+    let data = [0.5, 0.8, 1.0, 1.2, 2.0];
+    // Independent 65-digit likelihood-score solution at these observations.
+    // The old quartile matcher had no candidate when the sample median was 1.
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let fitted = ExponWeibull::try_fit(&data).unwrap();
+            assert!((fitted.a - 1.736_613_448_391_161).abs() < 2e-6);
+            assert!((fitted.c - 1.794_628_798_993_685).abs() < 2e-6);
+            assert!((likelihood(&fitted, &data) - 3.284_193_592_822_329_4).abs() < 1e-11);
+            let score_a = data.len() as f64 / fitted.a
+                + data
+                    .iter()
+                    .map(|x| (-(-x.powf(fitted.c)).exp_m1()).ln())
+                    .sum::<f64>();
+            let score_c = data.len() as f64 / fitted.c
+                + data
+                    .iter()
+                    .map(|x| {
+                        let w = x.powf(fitted.c);
+                        x.ln() * ((fitted.a - 1.0) * w / w.exp_m1() + 1.0 - w)
+                    })
+                    .sum::<f64>();
+            assert!(score_a.abs() < 1e-12);
+            assert!(score_c.abs() < 2e-6, "ExponWeibull c-score={score_c}");
+            for factor in [0.9, 1.1] {
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&ExponWeibull::new(factor * fitted.a, fitted.c), &data)
+                );
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&ExponWeibull::new(fitted.a, factor * fitted.c), &data)
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn exponweibull_profile_fit_rejects_limiting_samples_and_honors_hardened_caps() {
+    for data in [vec![], vec![2.0]] {
+        assert!(matches!(
+            ExponWeibull::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            ExponWeibull::try_fit(&[0.5, invalid, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [
+        vec![0.2, 0.5, 0.8, 1.0],
+        vec![2.0, 2.0],
+        // Independent log(a) optima exceed 4008, 2165, and 3125
+        // respectively. An apparent minimum at a=f64::MAX is not an MLE.
+        vec![2.0, 2.0001],
+        vec![2.0, 2.0002],
+        vec![1.1, 1.10001],
+        // Much closer to the a=f64::MAX boundary: objective roundoff can
+        // fake a strict minimum and the scaled score is already tiny.
+        vec![2.0, 2.000_713_380_004_696],
+        vec![2.0, 2.000_713_444_215_317],
+        vec![2.0, 2.000_713_450_636_379_5],
+    ] {
+        assert!(matches!(
+            ExponWeibull::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                ExponWeibull::try_fit(&[0.5, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(ExponWeibull::try_fit(&[0.5, 2.0]).is_ok());
+        });
+    });
+}
+
+#[test]
+fn exponweibull_fitted_high_shapes_preserve_probabilities_and_quantiles() {
+    for data in [vec![2.0, 2.01, 2.02, 2.03], vec![2.0, 2.001, 2.002, 2.003]] {
+        let fitted = ExponWeibull::try_fit(&data).unwrap();
+        assert!(fitted.a > 1e15, "a={} was artificially capped", fitted.a);
+        for &x in &data {
+            assert!(fitted.logpdf(x).is_finite());
+            let cdf = fitted.cdf(x);
+            let sf = fitted.sf(x);
+            assert!(cdf.is_finite() && cdf > 0.0 && cdf < 1.0);
+            assert!(sf.is_finite() && sf > 0.0 && sf < 1.0);
+            assert!((cdf + sf - 1.0).abs() < 2e-15);
+        }
+        for q in [0.1, 0.5, 0.9] {
+            let x = fitted.ppf(q);
+            assert!(x.is_finite());
+            assert!((fitted.cdf(x) - q).abs() < 2e-12);
+        }
+        for factor in [0.9, 1.1] {
+            assert!(
+                likelihood(&fitted, &data)
+                    < likelihood(&ExponWeibull::new(factor * fitted.a, fitted.c), &data)
+            );
+        }
+    }
+    // Independent 90-digit likelihood-score solution. Default SciPy fit
+    // stops well short of this concentrated sample's global maximum.
+    let data = [2.0, 2.001, 2.002, 2.003];
+    let fitted = ExponWeibull::try_fit(&data).unwrap();
+    assert!((likelihood(&fitted, &data) - -21.417_963_830_126_58).abs() < 1e-9);
+    assert!((fitted.ppf(0.5) - 2.001_310_892_956_218_4).abs() < 2e-7);
+    // This close sample has a finite MLE, unlike the tighter sample above.
+    let fitted = ExponWeibull::try_fit(&[1.1, 1.1001]).unwrap();
+    assert!(fitted.a > 1e170 && fitted.a < 1e190);
+    assert!((fitted.c - 63.272_996_726_439_76).abs() < 2e-5);
+    assert!(fitted.ppf(0.5).is_finite());
+    // The adjacent sample on the finite side of the boundary remains
+    // fit-able even though its a is about 1.7966e308.
+    let near_limit = ExponWeibull::try_fit(&[2.0, 2.000_713_452_063_282]).unwrap();
+    assert!(near_limit.a.is_finite() && near_limit.a > 1e308);
+    assert!(near_limit.ppf(0.5).is_finite());
+}
+
+#[test]
+fn exponweibull_density_and_probability_tails_remain_finite() {
+    for (a, c) in [(1.0, 2000.0), (0.5, 2000.0)] {
+        let distribution = ExponWeibull::new(a, c);
+        let expected = (a * c).ln() + (a * c - 1.0) * 0.5_f64.ln();
+        assert!((distribution.logpdf(0.5) - expected).abs() < 1e-12);
+        assert_eq!(distribution.pdf(0.5), distribution.logpdf(0.5).exp());
+        assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        assert!(distribution.logpdf(f64::NAN).is_nan());
+    }
+    let left = ExponWeibull::new(0.01, 1.0);
+    assert!((left.cdf(1e-100) - 0.1).abs() < 1e-15);
+    assert!((left.sf(1e-100) - 0.9).abs() < 1e-15);
+    assert!((left.ppf(0.1).ln() - 1e-100_f64.ln()).abs() < 1e-12);
+    // w is reconstructed from exp(c*ln(x)); allow its binary64 rounding.
+    assert!(
+        (ExponWeibull::new(1.0, 1.0).logsf(1000.0) + 1000.0).abs() < 4.0 * f64::EPSILON * 1000.0
+    );
+    let right = ExponWeibull::new(1e308, 1.0);
+    assert!((right.logpdf(1000.0) - (1e308_f64.ln() - 1000.0)).abs() < 1e-11);
+    assert!((right.logsf(1000.0) - (1e308_f64.ln() - 1000.0)).abs() < 1e-11);
+
+    // c*ln(x), and t=-ln(q)/a in the inverse, overflow separately.
+    // Their finite power-law limits must survive the parameter rescaling.
+    let limiting = ExponWeibull::new(1e-308, 1e308);
+    assert!(limiting.logpdf(0.01).abs() < 1e-12);
+    assert!((limiting.cdf(0.01) - 0.01).abs() < 1e-15);
+    assert!((limiting.ppf(0.01) - 0.01).abs() < 1e-15);
+    assert_eq!(limiting.ppf(0.0), 0.0);
+    assert_eq!(limiting.ppf(1.0), f64::INFINITY);
+    assert!(limiting.ppf(f64::NAN).is_nan());
+    assert_eq!(ExponWeibull::new(0.5, 0.5).logpdf(0.0), f64::INFINITY);
+    assert_eq!(ExponWeibull::new(1.0, 1.0).logpdf(0.0), 0.0);
+    assert_eq!(ExponWeibull::new(2.0, 2.0).logpdf(0.0), f64::NEG_INFINITY);
 }
 
 #[test]

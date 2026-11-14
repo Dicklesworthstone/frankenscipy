@@ -9255,7 +9255,7 @@ mod tests {
             "result.nfev must equal the exact total objective evaluations including probe"
         );
         assert!(
-            probe_nfev >= 7 && probe_nfev <= 4 * 2 + 8,
+            (7..=4 * 2 + 8).contains(&probe_nfev),
             "probe_nfev={probe_nfev} must lie in [7, 16]"
         );
         assert_eq!(portfolio.evidence_len(), 1);
@@ -9341,7 +9341,11 @@ mod tests {
                 &ledger,
             );
             assert!(matches!(result, Err(OptError::NonFiniteInput { .. })));
-            assert_eq!(calls.get(), 1, "reject before solver or fallback evaluations");
+            assert_eq!(
+                calls.get(),
+                1,
+                "reject before solver or fallback evaluations"
+            );
             let guard = ledger.lock().expect("audit ledger");
             assert_eq!(guard.len(), 1, "failure is audited exactly once");
             assert!(matches!(
@@ -9385,7 +9389,10 @@ mod tests {
                 assert_eq!(result.result.nit, 1);
             } else {
                 // DIRECT checks maxfun between rectangle subdivisions, as SciPy does.
-                assert!(calls.get() < 40, "caller budget must replace the DIRECT default");
+                assert!(
+                    calls.get() < 40,
+                    "caller budget must replace the DIRECT default"
+                );
             }
         }
     }
@@ -9395,10 +9402,26 @@ mod tests {
         use fsci_runtime::PortfolioEvidence;
 
         for (option_mode, portfolio_mode, mode) in [
-            (RuntimeMode::Strict, RuntimeMode::Strict, RuntimeMode::Strict),
-            (RuntimeMode::Hardened, RuntimeMode::Hardened, RuntimeMode::Hardened),
-            (RuntimeMode::Strict, RuntimeMode::Hardened, RuntimeMode::Hardened),
-            (RuntimeMode::Hardened, RuntimeMode::Strict, RuntimeMode::Hardened),
+            (
+                RuntimeMode::Strict,
+                RuntimeMode::Strict,
+                RuntimeMode::Strict,
+            ),
+            (
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+            ),
+            (
+                RuntimeMode::Strict,
+                RuntimeMode::Hardened,
+                RuntimeMode::Hardened,
+            ),
+            (
+                RuntimeMode::Hardened,
+                RuntimeMode::Strict,
+                RuntimeMode::Hardened,
+            ),
         ] {
             let ledger = crate::audit::sync_audit_ledger();
             let mut portfolio = OptSolverPortfolio::new(portfolio_mode, 4);

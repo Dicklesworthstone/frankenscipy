@@ -1349,13 +1349,16 @@ fn positive_profile_fit_logs(data: &[f64], family: &str) -> Result<Vec<f64>, Fit
 /// minimizing the remaining mean negative log likelihood in log-shape space.
 /// The search expands until it brackets a strict interior minimum; it never
 /// substitutes an endpoint or an arbitrary parameter cap for a finite MLE.
-fn fit_positive_shape_profile<F>(
+fn fit_positive_shape_profile<F, G>(
     initial: f64,
     family: &str,
+    sample_len: usize,
     profile: F,
+    score: G,
 ) -> Result<(f64, f64), FitError>
 where
     F: Fn(f64) -> Option<(f64, f64)>,
+    G: Fn(f64, f64) -> (f64, f64),
 {
     let objective = |log_shape: f64| {
         let shape = log_shape.exp();
@@ -1446,6 +1449,67 @@ where
         return Err(FitError::NonConvergent(format!(
             "{family} fitted likelihood is not finite"
         )));
+    }
+    let (likelihood_score, score_scale) = score(first, shape);
+    if !likelihood_score.is_finite()
+        || !score_scale.is_finite()
+        || score_scale <= 0.0
+        || likelihood_score.abs() > 1e-6 * score_scale
+    {
+        return Err(FitError::NonConvergent(format!(
+            "{family} profile likelihood did not reach a stationary finite maximum"
+        )));
+    }
+    // A small score alone cannot distinguish a maximum just inside the
+    // representable range from one just outside it. Require finite scores
+    // of opposite signs around the solution, beyond exp/log and summation
+    // roundoff. An exact or rounded zero does not certify either sign.
+    let roundoff = 1024.0_f64.max(32.0 * sample_len as f64) * f64::EPSILON;
+    let evaluate_score = |point: f64| {
+        let shape = point.exp();
+        if !shape.is_finite() || shape <= 0.0 {
+            return None;
+        }
+        let (first, nll) = profile(shape)?;
+        if !first.is_finite() || first <= 0.0 || !nll.is_finite() {
+            return None;
+        }
+        let (value, scale) = score(first, shape);
+        (value.is_finite() && scale.is_finite() && scale > 0.0).then_some((value, scale))
+    };
+    for direction in [-1.0, 1.0] {
+        if direction * likelihood_score < -roundoff * score_scale {
+            continue;
+        }
+        let mut near = log_shape;
+        let mut wall = None::<f64>;
+        let mut step = f64::EPSILON.sqrt();
+        let mut certified = false;
+        for _ in 0..64 {
+            let point = wall.map_or(log_shape + direction * step, |edge| {
+                near + 0.5 * (edge - near)
+            });
+            if point == near || wall == Some(point) {
+                break;
+            }
+            if let Some((value, scale)) = evaluate_score(point) {
+                if direction * value < -roundoff * scale {
+                    certified = true;
+                    break;
+                }
+                near = point;
+            } else {
+                wall = Some(point);
+            }
+            if wall.is_none() {
+                step *= 2.0;
+            }
+        }
+        if !certified {
+            return Err(FitError::NonConvergent(format!(
+                "{family} MLE has no finite likelihood-score bracket before its representability limit"
+            )));
+        }
     }
     Ok((first, shape))
 }
@@ -26310,7 +26374,7 @@ impl ContinuousDistribution for Mielke {
         }
         let n = logs.len() as f64;
         let largest_log = logs.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
-        let (k, s) = fit_positive_shape_profile(largest_log.recip(), "Mielke", |s| {
+        let profile = |s: f64| {
             let mut mean_left = 0.0;
             let mut mean_right = 0.0;
             for &lx in &logs {
@@ -26320,36 +26384,34 @@ impl ContinuousDistribution for Mielke {
             let k = s / mean_left;
             // Drop mean(log x), which is independent of the parameters.
             Some((k, -k.ln() + mean_right + 1.0))
-        })?;
-        let mut mean_entropy = 0.0;
-        let mut mean_weighted_log = 0.0;
-        for &lx in &logs {
-            let t = s * lx;
-            let magnitude = t.abs();
-            let small_exp = (-magnitude).exp();
-            let small_probability = small_exp / (1.0 + small_exp);
-            // softplus(t)-t*sigmoid(t) is the binary entropy of
-            // sigmoid(t). Evaluate its small terms directly, avoiding a
-            // subtraction of two t-sized quantities in a concentrated fit.
-            mean_entropy += (log_one_plus_exp(-magnitude) + magnitude * small_probability) / n;
-            let weighted_log = if t >= 0.0 {
-                t / (1.0 + small_exp)
-            } else {
-                t * small_probability
-            };
-            mean_weighted_log += weighted_log / n;
-        }
-        let profiled_term = (k / s) * mean_entropy;
-        let score = profiled_term - mean_weighted_log;
-        let score_scale = 1.0 + profiled_term.abs() + mean_weighted_log.abs();
-        // A rounded objective can manufacture an apparent minimum at the
-        // largest finite k. Such a point still has a nonzero likelihood
-        // score, and must not be reported as a converged finite MLE.
-        if !score.is_finite() || score.abs() > 1e-6 * score_scale {
-            return Err(FitError::NonConvergent(
-                "Mielke profile likelihood did not reach a stationary finite maximum".into(),
-            ));
-        }
+        };
+        let score = |k: f64, s: f64| {
+            let mut mean_entropy = 0.0;
+            let mut mean_weighted_log = 0.0;
+            for &lx in &logs {
+                let t = s * lx;
+                let magnitude = t.abs();
+                let small_exp = (-magnitude).exp();
+                let small_probability = small_exp / (1.0 + small_exp);
+                // softplus(t)-t*sigmoid(t) is the binary entropy of
+                // sigmoid(t). Evaluate its small terms directly, avoiding a
+                // subtraction of two t-sized quantities in a concentrated fit.
+                mean_entropy += (log_one_plus_exp(-magnitude) + magnitude * small_probability) / n;
+                let weighted_log = if t >= 0.0 {
+                    t / (1.0 + small_exp)
+                } else {
+                    t * small_probability
+                };
+                mean_weighted_log += weighted_log / n;
+            }
+            let profiled_term = (k / s) * mean_entropy;
+            (
+                profiled_term - mean_weighted_log,
+                1.0 + profiled_term.abs() + mean_weighted_log.abs(),
+            )
+        };
+        let (k, s) =
+            fit_positive_shape_profile(largest_log.recip(), "Mielke", data.len(), profile, score)?;
         Ok(Self { k, s })
     }
 }
@@ -28386,10 +28448,7 @@ impl ContinuousDistribution for Gompertz {
         let largest_term = largest.exp_m1();
         let n = data.len() as f64;
         let c = if largest_term.is_finite() {
-            let scaled_sum = data
-                .iter()
-                .map(|&x| x.exp_m1() / largest_term)
-                .sum::<f64>();
+            let scaled_sum = data.iter().map(|&x| x.exp_m1() / largest_term).sum::<f64>();
             (n / scaled_sum) / largest_term
         } else {
             // exp(x) may overflow although the reciprocal mean remains a
@@ -61185,6 +61244,34 @@ impl ContinuousDistribution for ExponPow {
     }
 }
 
+/// Return `(ln(h), B)` for `w = exp(log_w)`, where
+/// `h = -ln(1-exp(-w))` and `B = ln(expm1(w)/w) = w-log_w-h`.
+/// These terms keep both the ExponWeibull density and its profile likelihood
+/// finite when `w` underflows or `exp(w)` overflows.
+fn exponweibull_likelihood_terms(log_w: f64) -> (f64, f64) {
+    if log_w < -36.0 {
+        // h = -log_w + w/2 + O(w^2): the correction to h is less
+        // than half an ulp here, while B = w/2 + O(w^2) must be retained.
+        return ((-log_w).ln(), 0.5 * log_w.exp());
+    }
+    let w = log_w.exp();
+    if w == f64::INFINITY {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    let h = if w <= LN_2 {
+        -(-(-w).exp_m1()).ln()
+    } else {
+        -(-(-w).exp()).ln_1p()
+    };
+    let log_h = if w > 36.0 { -w } else { h.ln() };
+    let b = if w <= LN_2 {
+        (w.exp_m1() / w).ln()
+    } else {
+        w - log_w - h
+    };
+    (log_h, b)
+}
+
 /// Exponentiated Weibull distribution.
 ///
 /// Matches `scipy.stats.exponweib`.
@@ -61258,52 +61345,76 @@ impl ContinuousDistribution for ExponWeibull {
                 0.0
             };
         }
-        let a = self.a;
-        let c = self.c;
-        if weibull_density_reuse() {
-            // x^c and exp(−x^c) each appear twice; x^(c−1) = x^c/x. Compute once.
-            let xc = x.powf(c);
-            let e = (-xc).exp();
-            a * c * (1.0 - e).powf(a - 1.0) * e * (xc / x)
-        } else {
-            a * c * (1.0 - (-x.powf(c)).exp()).powf(a - 1.0) * (-x.powf(c)).exp() * x.powf(c - 1.0)
-        }
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(a)+ln(c)+(a−1)·ln(1−e^{−x^c}) − x^c + (c−1)·ln(x); shape-dependent
-        // x=0 limit delegates to pdf. frankenscipy-p82v7
         if x <= 0.0 {
             return self.pdf(x).ln();
         }
-        let a = self.a;
-        let c = self.c;
-        if weibull_density_reuse() {
-            // reuse ln(x): w = x^c = exp(c·ln x), and (c−1)·ln x share the one ln.
-            let lx = x.ln();
-            let w = (c * lx).exp();
-            a.ln() + c.ln() + (a - 1.0) * (-((-w).exp_m1())).ln() - w + (c - 1.0) * lx
+        if x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let lx = x.ln();
+        let log_w = self.c * lx;
+        let log_a = self.a.ln();
+        if log_w < -36.0 {
+            // Split h=-log_w+w/2+O(w^2) before multiplying by a.
+            // This preserves the power-law limit when c*ln(x) overflows,
+            // and avoids subtracting nearly equal terms when a*c is one.
+            let linear = if (self.a * self.c).is_finite() {
+                self.a.mul_add(self.c, -1.0) * lx
+            } else {
+                self.a * log_w - lx
+            };
+            log_a + self.c.ln() + linear - (log_a + log_w - LN_2).exp() - 0.5 * log_w.exp()
         } else {
-            let w = x.powf(c);
-            a.ln() + c.ln() + (a - 1.0) * (-((-w).exp_m1())).ln() - w + (c - 1.0) * x.ln()
+            let (log_h, b) = exponweibull_likelihood_terms(log_w);
+            log_a + self.c.ln() - (log_a + log_h).exp() - b - lx
         }
     }
 
     fn cdf(&self, x: f64) -> f64 {
+        self.logcdf(x).exp()
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if x == f64::INFINITY {
             return 0.0;
         }
-        (1.0 - (-x.powf(self.c)).exp()).powf(self.a)
+        let lx = x.ln();
+        let log_w = self.c * lx;
+        if log_w < -36.0 {
+            let linear = if log_w.is_finite() {
+                self.a * log_w
+            } else {
+                (self.a * self.c) * lx
+            };
+            linear - (self.a.ln() + log_w - LN_2).exp()
+        } else {
+            let (log_h, _) = exponweibull_likelihood_terms(log_w);
+            -(self.a.ln() + log_h).exp()
+        }
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // sf = 1 − (1 − e^{−x^c})^a = −expm1(a·ln1p(−e^{−x^c})); stable in the
-        // right tail where (1 − tiny)^a → 1 and 1−cdf collapses. frankenscipy-w3f6m
+        -self.logcdf(x).exp_m1()
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
         if x <= 0.0 {
-            return 1.0;
+            return 0.0;
         }
-        let w = (-x.powf(self.c)).exp(); // e^{−x^c}, small in the tail
-        -(self.a * (-w).ln_1p()).exp_m1()
+        let (log_h, _) = exponweibull_likelihood_terms(self.c * x.ln());
+        let log_product = self.a.ln() + log_h;
+        if log_product < -36.0 {
+            log_product
+        } else {
+            self.sf(x).ln()
+        }
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -61316,8 +61427,23 @@ impl ContinuousDistribution for ExponWeibull {
         if q == 1.0 {
             return f64::INFINITY;
         }
-        let u = q.powf(1.0 / self.a);
-        (-(1.0 - u).ln()).powf(1.0 / self.c)
+        // ln(x) = ln(h(t))/c, t=-ln(q)/a. Keep t in log space
+        // so q^(1/a) cannot round to one at a large fitted shape.
+        let log_q = q.ln();
+        let log_t = (-log_q).ln() - self.a.ln();
+        let log_x = if log_t > 36.0_f64.ln() {
+            // ln(h(t)) rounds to -t here. Divide before exponentiating
+            // since t itself can overflow while t/c remains finite.
+            let ac = self.a * self.c;
+            if ac.is_finite() && ac > 0.0 {
+                log_q / ac
+            } else {
+                -(log_t - self.c.ln()).exp()
+            }
+        } else {
+            exponweibull_likelihood_terms(log_t).0 / self.c
+        };
+        log_x.exp()
     }
 
     fn mean(&self) -> f64 {
@@ -61379,56 +61505,69 @@ impl ContinuousDistribution for ExponWeibull {
         )
     }
 
+    /// Fixed-location, fixed-scale MLE. For fixed `c`, the exact first
+    /// shape is `a = -1 / mean(ln(1-exp(-x^c)))`; profile over positive `c`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        validate_finite_fit_data(data, 4, "ExponWeibull")?;
-        for &x in data {
-            if x <= 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "ExponWeibull support is (0, infinity) for fitting; got {x}"
-                )));
-            }
-        }
-
-        let qs = quantile(data, &[0.25, 0.5, 0.75]);
-        let spread = qs[2] - qs[0];
-        if !spread.is_finite() || spread <= 0.0 || qs[1] <= 0.0 {
+        let logs = positive_profile_fit_logs(data, "ExponWeibull")?;
+        if logs.iter().all(|&lx| lx <= 0.0) {
+            // The likelihood strictly increases toward a power-law limit
+            // as c tends to infinity; no finite pair attains its maximum.
             return Err(FitError::NonConvergent(
-                "ExponWeibull fit needs positive non-degenerate quartiles".to_owned(),
+                "ExponWeibull MLE is a limiting distribution when every observation is at most one"
+                    .into(),
             ));
         }
-
-        let mut best = None::<(f64, f64, f64)>;
-        for step in 0..=990 {
-            let a = 0.1 + 0.01 * step as f64;
-            let median_base = -(1.0 - 0.5_f64.powf(1.0 / a)).ln();
-            let ln_median = qs[1].ln();
-            if !median_base.is_finite() || median_base <= 0.0 || ln_median.abs() < 1e-12 {
-                continue;
+        let n = logs.len() as f64;
+        let largest_log = logs.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+        let profile = |c: f64| {
+            let mut mean_h = 0.0;
+            let mut mean_b = 0.0;
+            for &lx in &logs {
+                let (log_h, b) = exponweibull_likelihood_terms(c * lx);
+                mean_h += log_h.exp() / n;
+                mean_b += b / n;
             }
-            let c = median_base.ln() / ln_median;
-            if !c.is_finite() || c <= 0.0 {
-                continue;
+            // Drop mean(log x). Combining w-log(w)-h into B keeps this
+            // objective stable for the small observations of a skewed fit.
+            Some((mean_h.recip(), mean_h.ln() - c.ln() + 1.0 + mean_b))
+        };
+        let score = |a: f64, c: f64| {
+            let mut mean_gr = 0.0;
+            let mut mean_gq = 0.0;
+            for &lx in &logs {
+                let g = c * lx;
+                let w = g.exp();
+                // R=w/expm1(w), Q=1-w-R. In the left tail use their
+                // Bernoulli expansions so Q does not lose its O(w) term.
+                let (r, q) = if w < 0.01 {
+                    let square = w * w;
+                    let even = square * (1.0 / 12.0 - square * (1.0 / 720.0 - square / 30240.0));
+                    (1.0 - 0.5 * w + even, -0.5 * w - even)
+                } else {
+                    let r = if w > 36.0 {
+                        (g - w).exp()
+                    } else {
+                        w / w.exp_m1()
+                    };
+                    (r, 1.0 - w - r)
+                };
+                mean_gr += g * r / n;
+                mean_gq += g * q / n;
             }
-            let dist = Self { a, c };
-            let model_q25 = dist.ppf(0.25);
-            let model_q75 = dist.ppf(0.75);
-            if !model_q25.is_finite() || !model_q75.is_finite() {
-                continue;
-            }
-            let error =
-                ((model_q25 - qs[0]) / spread).powi(2) + ((model_q75 - qs[2]) / spread).powi(2);
-            if best.is_none_or(|(_, _, best_error)| error < best_error) {
-                best = Some((a, c, error));
-            }
-        }
-
-        if let Some((a, c, _)) = best {
-            Ok(Self { a, c })
-        } else {
-            Err(FitError::NonConvergent(
-                "ExponWeibull quantile fit did not find finite a/c".to_owned(),
-            ))
-        }
+            let profiled_term = a * mean_gr;
+            (
+                1.0 + profiled_term + mean_gq,
+                1.0 + profiled_term.abs() + mean_gq.abs(),
+            )
+        };
+        let (a, c) = fit_positive_shape_profile(
+            largest_log.recip(),
+            "ExponWeibull",
+            data.len(),
+            profile,
+            score,
+        )?;
+        Ok(Self { a, c })
     }
 }
 
@@ -103675,8 +103814,11 @@ mod tests {
         let exponweib = ExponWeibull::new(2.0, 1.5);
         let data = [0.1, 0.25, 0.5, 0.75, 0.9].map(|q| exponweib.ppf(q));
         let fitted = ExponWeibull::try_fit(&data).expect("ExponWeibull fit");
+        // Independent likelihood maximum for these five quantiles; a
+        // small quantile sample need not fit its generating parameters.
         assert!(
-            (fitted.a - 2.0).abs() <= 0.02 && (fitted.c - 1.5).abs() <= 0.02,
+            (fitted.a - 2.056_086_808_672_755).abs() <= 2e-6
+                && (fitted.c - 1.613_904_512_928_637).abs() <= 2e-6,
             "ExponWeibull fit got a={}, c={}",
             fitted.a,
             fitted.c

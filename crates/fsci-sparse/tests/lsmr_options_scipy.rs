@@ -134,7 +134,11 @@ fn cases() -> Vec<Case> {
     let mut atol_only = Case::new("atol_only_inconsistent", &[&[1.0], &[0.0]], &[1.0, 3.0]);
     atol_only.btol = 0.0;
     cases.push(atol_only);
-    let mut btol_only = Case::new("btol_overrides_iteration_limit", &[&[1.0], &[0.0]], &[1.0, 3.0]);
+    let mut btol_only = Case::new(
+        "btol_overrides_iteration_limit",
+        &[&[1.0], &[0.0]],
+        &[1.0, 3.0],
+    );
     btol_only.atol = 0.0;
     btol_only.btol = 0.99;
     cases.push(btol_only);
@@ -187,7 +191,11 @@ print(json.dumps(results, allow_nan=False))
     };
     let query: Vec<Value> = cases.iter().map(Case::query).collect();
     let encoded = serde_json::to_vec(&query).expect("serialize oracle input");
-    let write_result = child.stdin.take().expect("oracle stdin").write_all(&encoded);
+    let write_result = child
+        .stdin
+        .take()
+        .expect("oracle stdin")
+        .write_all(&encoded);
     let output = child.wait_with_output().expect("wait for LSMR oracle");
     if !output.status.success() || write_result.is_err() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -228,9 +236,9 @@ fn compare(result: &LsmrResult, expected: &Value) -> bool {
             result.conda,
             result.normx,
         ]
-            .iter()
-            .zip(diagnostics)
-            .all(|(&a, b)| close(a, b.as_f64().expect("finite diagnostic")))
+        .iter()
+        .zip(diagnostics)
+        .all(|(&a, b)| close(a, b.as_f64().expect("finite diagnostic")))
 }
 
 #[test]
