@@ -46,6 +46,8 @@ cases = [
     ('chi', stats.chi, [(0.3,), (4.0,), (50.0,)]),
     ('rdist', stats.rdist, [(1.5,), (5.0,), (30.0,)]),
     ('nakagami', stats.nakagami, [(0.25,), (2.0,), (1000.0,)]),
+    ('gompertz', stats.gompertz, [(0.1,), (1.0,), (10.0,)]),
+    ('genlogistic', stats.genlogistic, [(0.2,), (1.0,), (5.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -1548,6 +1550,14 @@ fn mle_matches_live_scipy_on_seeded_fits() {
                 let fitted = Nakagami::try_fit(&data).unwrap();
                 (vec![fitted.nu], likelihood(&fitted, &data))
             }
+            "gompertz" => {
+                let fitted = fsci_stats::Gompertz::try_fit(&data).unwrap();
+                (vec![fitted.c], likelihood(&fitted, &data))
+            }
+            "genlogistic" => {
+                let fitted = fsci_stats::GenLogistic::try_fit(&data).unwrap();
+                (vec![fitted.c], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -1666,10 +1676,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 51,
+        compared, 57,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 17; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 19; samples per case = 2000");
 }
 
 #[test]
@@ -2439,4 +2449,127 @@ fn location_scale_mle_matches_live_scipy() {
     eprintln!(
         "Location/scale MLE compared cases = {compared}; families = 4; samples per case = 800"
     );
+}
+
+#[test]
+fn closed_form_shape_fits_maximize_the_actual_likelihood() {
+    use fsci_stats::{GenLogistic, Gompertz};
+
+    // expm1(log(2)), expm1(log(3)), expm1(log(4)) are 1, 2, 3:
+    // n/sum(expm1(x)) = 1/2, independent of any sample moment.
+    let gompertz_data = [2.0_f64.ln(), 3.0_f64.ln(), 4.0_f64.ln()];
+    let gompertz = Gompertz::try_fit(&gompertz_data).unwrap();
+    assert!((gompertz.c - 0.5).abs() < 2.0e-15);
+    assert!((likelihood(&gompertz, &gompertz_data) - 1.901_387_711_331_890_4).abs() < 1.0e-13);
+
+    // The likelihood statistic is log(4) + log(2) + log(4/3).
+    // A symmetric sample has mean zero, but its shape MLE is not one.
+    let logistic_data = [-3.0_f64.ln(), 0.0, 3.0_f64.ln()];
+    let logistic = GenLogistic::try_fit(&logistic_data).unwrap();
+    let expected = 3.0 / (32.0_f64 / 3.0).ln();
+    assert!((logistic.c / expected - 1.0).abs() < 2.0e-15);
+    assert!((likelihood(&logistic, &logistic_data) - 4.656_313_407_535_147).abs() < 1.0e-13);
+    assert!(
+        likelihood(&logistic, &logistic_data) < likelihood(&GenLogistic::new(1.0), &logistic_data)
+    );
+
+    for factor in [0.5, 2.0] {
+        assert!(
+            likelihood(&gompertz, &gompertz_data)
+                < likelihood(&Gompertz::new(factor * gompertz.c), &gompertz_data)
+        );
+        assert!(
+            likelihood(&logistic, &logistic_data)
+                < likelihood(&GenLogistic::new(factor * logistic.c), &logistic_data)
+        );
+    }
+}
+
+#[test]
+fn closed_form_shape_fits_preserve_extreme_finite_parameters() {
+    use fsci_stats::{GenLogistic, Gompertz};
+
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let narrow = Gompertz::try_fit(&[1.0e-300, 2.0e-300]).unwrap();
+            assert!((narrow.c / (2.0e300 / 3.0) - 1.0).abs() < 3.0e-15);
+            assert!(narrow.logpdf(1.0e-300).is_finite());
+            assert!((narrow.mean() * narrow.c - 1.0).abs() < 3.0e-15);
+            let expected_cdf = -(-1.0_f64).exp_m1();
+            assert!((narrow.cdf(narrow.c.recip()) - expected_cdf).abs() < 3.0e-15);
+
+            // exp(710) overflows, but exp(-710) is a positive f64.
+            let wide = Gompertz::try_fit(&[710.0, 710.0]).unwrap();
+            assert!((wide.c / (-710.0_f64).exp() - 1.0).abs() < 3.0e-13);
+            assert!((wide.logpdf(710.0) + 1.0).abs() < 3.0e-13);
+            assert!((wide.cdf(710.0) - expected_cdf).abs() < 3.0e-13);
+            assert!((wide.logsf(710.0) + 1.0).abs() < 3.0e-13);
+            assert!((wide.ppf(expected_cdf) - 710.0).abs() < 3.0e-13);
+
+            let left = GenLogistic::try_fit(&[-1.0e308, -1.0e308]).unwrap();
+            assert!((left.c / 1.0e-308 - 1.0).abs() < 3.0e-15);
+            assert!((left.logpdf(-1.0e308) + 1.0 + 1.0e308_f64.ln()).abs() < 3.0e-13);
+            assert!((left.cdf(-1.0e308) - (-1.0_f64).exp()).abs() < 3.0e-15);
+            assert!(left.pdf(-1.0e308) > 0.0);
+            assert!((left.ppf((-1.0_f64).exp()) / -1.0e308 - 1.0).abs() < 3.0e-15);
+
+            let right = GenLogistic::try_fit(&[700.0, 700.0]).unwrap();
+            assert!((right.c / 700.0_f64.exp() - 1.0).abs() < 3.0e-15);
+            assert!((right.logpdf(700.0) + 1.0).abs() < 3.0e-13);
+        });
+    }
+}
+
+#[test]
+fn closed_form_shape_fits_reject_undefined_limits_and_honor_caps() {
+    use fsci_stats::{GenLogistic, Gompertz};
+
+    for data in [vec![], vec![1.0]] {
+        assert!(matches!(
+            Gompertz::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            GenLogistic::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            Gompertz::try_fit(&[1.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            GenLogistic::try_fit(&[1.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        Gompertz::try_fit(&[-0.1, 1.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    for data in [[0.0, 0.0], [1000.0, 1000.0]] {
+        assert!(matches!(
+            Gompertz::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    assert!(matches!(
+        GenLogistic::try_fit(&[1000.0, 1000.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Gompertz::try_fit(&[0.1, 0.2, 0.3]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                GenLogistic::try_fit(&[0.1, 0.2, 0.3]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(Gompertz::try_fit(&[0.1, 0.2]).is_ok());
+            assert!(GenLogistic::try_fit(&[0.1, 0.2]).is_ok());
+        });
+    });
 }

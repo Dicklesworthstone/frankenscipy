@@ -28008,6 +28008,16 @@ impl Gompertz {
         Self { c }
     }
 
+    fn cumulative_hazard(&self, x: f64) -> f64 {
+        let expm1 = x.exp_m1();
+        if expm1.is_finite() {
+            self.c * expm1
+        } else {
+            // A tiny shape can rescue an overflowing exponential.
+            (self.c.ln() + x).exp() * -(-x).exp_m1()
+        }
+    }
+
     /// Raw moments m_1, m_2, m_3, m_4 via the substitution U = c(e^X − 1),
     /// which gives U ~ Exp(1) and X = log(1 + U/c). Then
     /// E[X^n] = ∫_0^∞ (log(1 + u/c))^n e^{−u} du, evaluated by composite
@@ -28052,61 +28062,74 @@ impl ContinuousDistribution for Gompertz {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 {
-            return 0.0;
-        }
-        // f(x; c) = c * exp(x) * exp(-c * (exp(x) - 1))
-        self.c * x.exp() * (-self.c * (x.exp() - 1.0)).exp()
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c) + x − c·(e^x − 1); finite where pdf underflows. frankenscipy-p82v7
-        if x < 0.0 {
+        if x < 0.0 || x == f64::INFINITY {
             return f64::NEG_INFINITY;
         }
-        self.c.ln() + x - self.c * (x.exp() - 1.0)
+        self.c.ln() + x - self.cumulative_hazard(x)
     }
 
     fn cdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
-        1.0 - (-self.c * (x.exp() - 1.0)).exp()
+        -(-self.cumulative_hazard(x)).exp_m1()
     }
 
     fn ppf(&self, q: f64) -> f64 {
-        // Closed-form inverse x = ln(1 − ln(1−q)/c). frankenscipy-ld94y
         if !(0.0..=1.0).contains(&q) {
             return f64::NAN;
         }
-        // Let a = -ln(1-q)/c (≥0, small for small q). x = ln(1+a) via ln_1p
-        // keeps full precision; the outer (1.0 - ...).ln() cancelled
-        // (ppf(1e-12) was 1.3e-4 off scipy). Matches scipy.stats.gompertz.ppf.
-        let a = -(-q).ln_1p() / self.c;
-        a.ln_1p()
+        // log(1 + -log(1-q)/c), without overflowing the positive ratio.
+        log_one_plus_exp((-(-q).ln_1p()).ln() - self.c.ln())
     }
 
     fn isf(&self, q: f64) -> f64 {
-        // sf(x)=exp(−c·(e^x−1))=q ⇒ x=ln(1 − ln q / c)=ln_1p(−ln q / c). The
-        // trait default ppf(1−q) cancels 1−q for small q (isf(1e-12) was ~2.6e-7
-        // off scipy). Matches scipy.stats.gompertz.isf. frankenscipy-d2gag
         if !(0.0..=1.0).contains(&q) {
             return f64::NAN;
         }
-        (-q.ln() / self.c).ln_1p()
+        log_one_plus_exp((-q.ln()).ln() - self.c.ln())
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // Closed-form survival exp(−c(eˣ−1)) — the default 1−cdf returned 0 in
-        // the tail (gompertz.sf(5,1) scipy 9.5e-65). frankenscipy-8y248
         if x <= 0.0 {
             return 1.0;
         }
-        (-self.c * (x.exp() - 1.0)).exp()
+        (-self.cumulative_hazard(x)).exp()
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        -self.cumulative_hazard(x)
     }
 
     fn mean(&self) -> f64 {
-        -(self.c.exp() * fsci_special::expi_scalar(-self.c))
+        if self.c <= 50.0 {
+            return -(self.c.exp() * fsci_special::expi_scalar(-self.c));
+        }
+        // exp(c)*E1(c) = (1 - 1/c + 2!/c^2 - ...)/c.
+        // In this range the decreasing asymptotic terms reach double
+        // precision before the expansion turns around.
+        let mut sum = 1.0;
+        let mut term = 1.0;
+        for k in 1..=64 {
+            let next_term = term * (-f64::from(k) / self.c);
+            if next_term.abs() >= term.abs() {
+                break;
+            }
+            let next_sum = sum + next_term;
+            if next_sum == sum {
+                break;
+            }
+            sum = next_sum;
+            term = next_term;
+        }
+        sum / self.c
     }
 
     fn var(&self) -> f64 {
@@ -28148,70 +28171,48 @@ impl ContinuousDistribution for Gompertz {
         mu4 / (var * var) - 3.0
     }
 
+    /// Exact fixed-location, fixed-scale MLE: c = n / sum(expm1(x)).
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
+        if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            return Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
             });
         }
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Gompertz data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Gompertz support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
+        validate_finite_fit_data(data, 2, "Gompertz")?;
+        if data.iter().any(|&x| x < 0.0) {
+            return Err(FitError::UnsupportedData(
+                "Gompertz support is [0, infinity)".into(),
+            ));
         }
-        let mean = sum / count as f64;
-        if mean <= 0.0 || !mean.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "Gompertz MoM: sample mean {mean} non-positive"
-            )));
+        let largest = data.iter().copied().fold(0.0_f64, f64::max);
+        if largest == 0.0 {
+            return Err(FitError::NonConvergent(
+                "Gompertz likelihood has no finite maximum for an all-zero sample".into(),
+            ));
         }
-        // Mean(c) = -e^c · Ei(-c) is monotone-decreasing in c on (0, ∞).
-        // Bisect on c ∈ (1e-6, 50). The upper bound is constrained by
-        // numerical overflow: e^c · Ei(-c) blows past f64::MAX around
-        // c ≈ 709 even though the product remains O(1/c). For c > 50 we
-        // fall back to the asymptotic form mean ≈ 1/c which is accurate
-        // to better than 1e-12 there.
-        let mean_of = |c: f64| {
-            if c > 50.0 {
-                1.0 / c
-            } else {
-                -(c.exp() * fsci_special::expi_scalar(-c))
-            }
+        let largest_term = largest.exp_m1();
+        let n = data.len() as f64;
+        let c = if largest_term.is_finite() {
+            let scaled_sum = data
+                .iter()
+                .map(|&x| x.exp_m1() / largest_term)
+                .sum::<f64>();
+            (n / scaled_sum) / largest_term
+        } else {
+            // exp(x) may overflow although the reciprocal mean remains a
+            // representable subnormal. Factor exp(max(x)) out of the sum.
+            let scaled_sum = data
+                .iter()
+                .map(|&x| (x - largest).exp() * -(-x).exp_m1())
+                .sum::<f64>();
+            ((n / scaled_sum).ln() - largest).exp()
         };
-        let mut lo = 1.0e-6_f64;
-        let mut hi = 1.0e6_f64;
-        let m_lo = mean_of(lo);
-        let m_hi = mean_of(hi);
-        if !(m_hi <= mean && mean <= m_lo) {
-            return Err(FitError::NonConvergent(format!(
-                "Gompertz MoM bracket failed: mean({lo})={m_lo}, mean({hi})={m_hi}, target={mean}"
-            )));
+        if !c.is_finite() || c <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "Gompertz MLE shape is not representable as a finite positive value".into(),
+            ));
         }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let m_mid = mean_of(mid);
-            if (m_mid - mean).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { c: mid });
-            }
-            if m_mid > mean {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(Self { c: 0.5 * (lo + hi) })
+        Ok(Self { c })
     }
 }
 
@@ -28340,24 +28341,21 @@ impl ContinuousDistribution for GenLogistic {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        let c = self.c;
-        c * (-x).exp() / (1.0 + (-x).exp()).powf(c + 1.0)
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(c) − x − (c+1)·softplus(−x); stable softplus keeps both tails
-        // finite where pdf underflows. frankenscipy-p82v7
-        let c = self.c;
-        let softplus_neg_x = if x <= 0.0 {
-            -x + x.exp().ln_1p()
+        // On the left, combine -x with the linear part of softplus(-x)
+        // before multiplying. Otherwise small c loses c*x to cancellation.
+        if x <= 0.0 {
+            self.c.ln() + self.c * x - (self.c + 1.0) * x.exp().ln_1p()
         } else {
-            (-x).exp().ln_1p()
-        };
-        c.ln() - x - (c + 1.0) * softplus_neg_x
+            self.c.ln() - x - (self.c + 1.0) * (-x).exp().ln_1p()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        1.0 / (1.0 + (-x).exp()).powf(self.c)
+        self.logcdf(x).exp()
     }
 
     fn logcdf(&self, x: f64) -> f64 {
@@ -28374,10 +28372,7 @@ impl ContinuousDistribution for GenLogistic {
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // sf = 1 − (1+e^{-x})^{-c} = −expm1(−c·ln1p(e^{-x})); stable in the
-        // right tail where (1+tiny)^{-c}→1 and 1−cdf collapses. frankenscipy-w3f6m
-        let u = (-x).exp();
-        -(-self.c * u.ln_1p()).exp_m1()
+        -self.logcdf(x).exp_m1()
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -28390,12 +28385,16 @@ impl ContinuousDistribution for GenLogistic {
         if q == 1.0 {
             return f64::INFINITY;
         }
-        // x = -ln(q^(-1/c) − 1). The naive q.powf(-1/c) − 1 cancels for q→1
-        // (q^(-1/c) ≈ 1), so isf(q)=ppf(1−q) lost precision in the right tail
-        // (~3.9e-6 off scipy at q=1e-12). q^(-1/c) − 1 = expm1(−ln(q)/c) is exact;
-        // this matches scipy.stats.genlogistic.ppf (and isf via ppf(1−q))
-        // bit-for-bit. frankenscipy-d2gag
-        -((-q.ln() / self.c).exp_m1()).ln()
+        let numerator = -q.ln();
+        let t = numerator / self.c;
+        if t < f64::MIN_POSITIVE {
+            // The quotient can underflow even though its logarithm is finite.
+            self.c.ln() - numerator.ln()
+        } else if t > LN_2 {
+            -t - (-(-t).exp()).ln_1p()
+        } else {
+            -t.exp_m1().ln()
+        }
     }
 
     fn mean(&self) -> f64 {
@@ -28434,48 +28433,34 @@ impl ContinuousDistribution for GenLogistic {
         kappa4 / (mu2 * mu2)
     }
 
+    /// Exact fixed-location, fixed-scale MLE: c = n / sum(log(1 + exp(-x))).
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
+        if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            return Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
             });
         }
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "GenLogistic data contains non-finite value: {x}"
-                )));
-            }
+        validate_finite_fit_data(data, 2, "GenLogistic")?;
+        let smallest = data.iter().copied().fold(f64::INFINITY, f64::min);
+        let largest_term = log_one_plus_exp(-smallest);
+        if largest_term <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "GenLogistic MLE shape exceeds the finite parameter range".into(),
+            ));
         }
-        // Method-of-moments: standardized mean = ψ(c) + γ. Sample mean
-        // m_hat = (1/n) Σ x_i, then solve ψ(c) = m_hat - γ via bisection
-        // (digamma is monotone increasing on (0, ∞)).
-        let mean: f64 = data.iter().sum::<f64>() / data.len() as f64;
-        let target = mean - EULER_MASCHERONI;
-        // Bracket: ψ(1e-6) ≈ -1e6, ψ(1e6) ≈ ln(1e6) ≈ 13.8
-        let mut lo = 1.0e-6_f64;
-        let mut hi = 1.0e6_f64;
-        let f_lo = fsci_special::digamma_scalar(lo);
-        let f_hi = fsci_special::digamma_scalar(hi);
-        if !(f_lo <= target && target <= f_hi) {
-            return Err(FitError::NonConvergent(format!(
-                "GenLogistic MoM bracket failed: ψ({lo})={f_lo}, ψ({hi})={f_hi}, target={target}"
-            )));
+        // Normalize before summing so a finite negative observation near
+        // -f64::MAX cannot overflow the sufficient statistic.
+        let scaled_sum = data
+            .iter()
+            .map(|&x| log_one_plus_exp(-x) / largest_term)
+            .sum::<f64>();
+        let c = (data.len() as f64 / scaled_sum) / largest_term;
+        if !c.is_finite() || c <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "GenLogistic MLE shape is not representable as a finite positive value".into(),
+            ));
         }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let f_mid = fsci_special::digamma_scalar(mid);
-            if (f_mid - target).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { c: mid });
-            }
-            if f_mid < target {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(Self { c: 0.5 * (lo + hi) })
+        Ok(Self { c })
     }
 }
 
@@ -102301,15 +102286,19 @@ mod tests {
     }
 
     #[test]
-    fn gompertz_fit_metamorphic_mean_recovery() {
+    fn gompertz_fit_solves_the_likelihood_score() {
         let data = [0.5_f64, 1.0, 1.5, 2.0, 0.8, 0.4, 1.1];
-        let m: f64 = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = Gompertz::try_fit(&data).expect("fit");
-        let recovered = fitted.mean();
-        assert!(
-            (recovered - m).abs() < 1.0e-6,
-            "Gompertz MoM mean recovery: sample {m}, fitted {recovered}"
-        );
+        // The MLE score is n/c - sum(expm1(x)), not mean(X)-E[X].
+        let statistic: f64 = data.iter().map(|x| x.exp_m1()).sum();
+        let score = fitted.c * statistic / data.len() as f64 - 1.0;
+        assert!(score.abs() < 2.0e-14, "Gompertz MLE score: {score}");
+        let ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for factor in [0.5, 2.0] {
+            let other = Gompertz::new(factor * fitted.c);
+            let other_ll: f64 = data.iter().map(|&x| other.logpdf(x)).sum();
+            assert!(ll > other_ll, "MLE must improve the likelihood");
+        }
     }
 
     #[test]
@@ -102876,18 +102865,19 @@ mod tests {
     }
 
     #[test]
-    fn genlogistic_fit_metamorphic_recovers_mean() {
-        // After fitting, the fitted distribution's mean must match the
-        // sample mean to bisection precision (the MoM equation IS the
-        // moment-matching identity).
+    fn genlogistic_fit_solves_the_likelihood_score() {
         let data = [-0.5_f64, 0.0, 0.3, 0.7, 1.2, -0.2, 0.8];
-        let m: f64 = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = GenLogistic::try_fit(&data).expect("fit");
-        let recovered = fitted.mean();
-        assert!(
-            (recovered - m).abs() < 1.0e-6,
-            "MoM mean recovery: sample {m}, fitted dist mean {recovered}"
-        );
+        // Direct moderate-input score, independent of the fitter's scaled sum.
+        let statistic: f64 = data.iter().map(|&x| (-x).exp().ln_1p()).sum();
+        let score = fitted.c * statistic / data.len() as f64 - 1.0;
+        assert!(score.abs() < 2.0e-14, "GenLogistic MLE score: {score}");
+        let ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for factor in [0.5, 2.0] {
+            let other = GenLogistic::new(factor * fitted.c);
+            let other_ll: f64 = data.iter().map(|&x| other.logpdf(x)).sum();
+            assert!(ll > other_ll, "MLE must improve the likelihood");
+        }
     }
 
     #[test]
