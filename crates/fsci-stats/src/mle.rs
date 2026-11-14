@@ -358,6 +358,104 @@ fn interval_log_probability<D: ContinuousDistribution>(
     }
 }
 
+/// Solve the two beta shape scores from logarithmic sufficient statistics.
+/// Beta-prime fitting uses the same likelihood after a parameter-independent
+/// change of variables, but must retain these logs before its transformed
+/// observations round to zero or one.
+pub(crate) fn beta_shapes_mle(
+    log_x: f64,
+    log_one_minus_x: f64,
+    initial: (f64, f64),
+    family: &str,
+) -> Result<(f64, f64), FitError> {
+    let (mut a, mut b) = initial;
+    if !a.is_finite() || !b.is_finite() || a <= 0.0 || b <= 0.0 {
+        // With very dispersed beta-prime data the moment transform can round
+        // to a Bernoulli sample, giving a zero concentration. The geometric
+        // means still retain a valid interior starting point. Evaluate their
+        // Jensen gap without subtracting a rounded value close to one.
+        let gap = if log_x > log_one_minus_x {
+            -log_x.exp_m1() - log_one_minus_x.exp()
+        } else {
+            -log_one_minus_x.exp_m1() - log_x.exp()
+        };
+        if gap.is_finite() && gap > 0.0 {
+            a = -log_one_minus_x.exp_m1() / (2.0 * gap);
+            b = -log_x.exp_m1() / (2.0 * gap);
+        }
+    }
+    if !a.is_finite() || !b.is_finite() || a <= 0.0 || b <= 0.0 {
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE has no finite initial shapes for a degenerate sample"
+        )));
+    }
+    let objective = |a: f64, b: f64| {
+        crate::unwrap_special_scalar(fsci_special::betaln_scalar(a, b, active_stats_mode()))
+            - (a - 1.0) * log_x
+            - (b - 1.0) * log_one_minus_x
+    };
+    let mut value = objective(a, b);
+
+    // The shape log-likelihood is strictly concave. Backtracking keeps the
+    // Newton iterates positive and decreases the negative log-likelihood,
+    // without imposing artificial upper or lower limits on either shape.
+    for _ in 0..200 {
+        let psi_a = crate::digamma(a);
+        let psi_b = crate::digamma(b);
+        let psi_sum = crate::digamma(a + b);
+        let ga = psi_a - psi_sum - log_x;
+        let gb = psi_b - psi_sum - log_one_minus_x;
+        let tri_sum = fsci_special::trigamma(a + b);
+        let haa = fsci_special::trigamma(a) - tri_sum;
+        let hbb = fsci_special::trigamma(b) - tri_sum;
+        let determinant = haa * hbb - tri_sum * tri_sum;
+        if !determinant.is_finite() || determinant <= 0.0 {
+            break;
+        }
+        let da = (hbb * ga + tri_sum * gb) / determinant;
+        let db = (tri_sum * ga + haa * gb) / determinant;
+        if !da.is_finite() || !db.is_finite() {
+            break;
+        }
+        if (da / a).abs().max((db / b).abs()) <= 1e-8 {
+            return Ok((a - da, b - db));
+        }
+        // At large concentration, subtracting digammas can no longer resolve
+        // the score although the ill-conditioned Hessian amplifies roundoff
+        // into a visible relative step. Preserve the last resolved estimate.
+        let score_roundoff_a = 2.0 * f64::EPSILON * (psi_a.abs() + psi_sum.abs() + log_x.abs());
+        let score_roundoff_b =
+            2.0 * f64::EPSILON * (psi_b.abs() + psi_sum.abs() + log_one_minus_x.abs());
+        if ga.abs() <= score_roundoff_a && gb.abs() <= score_roundoff_b {
+            return Ok((a, b));
+        }
+        let mut fraction = 1.0;
+        let mut accepted = false;
+        for _ in 0..60 {
+            let next_a = a - fraction * da;
+            let next_b = b - fraction * db;
+            if next_a > 0.0 && next_b > 0.0 && next_a.is_finite() && next_b.is_finite() {
+                let next_value = objective(next_a, next_b);
+                let roundoff = 8.0 * f64::EPSILON * (1.0 + value.abs());
+                if next_value.is_finite() && next_value <= value + roundoff {
+                    a = next_a;
+                    b = next_b;
+                    value = next_value;
+                    accepted = true;
+                    break;
+                }
+            }
+            fraction *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    Err(FitError::NonConvergent(format!(
+        "{family} MLE score equations did not converge"
+    )))
+}
+
 pub(crate) fn validate_positive_sample(data: &[f64], family: &str) -> Result<(), FitError> {
     crate::validate_finite_fit_data(data, 2, family)?;
     if data.iter().any(|&x| x <= 0.0) {

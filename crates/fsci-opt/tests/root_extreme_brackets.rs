@@ -17,10 +17,7 @@ fn opts() -> RootOptions {
 
 #[test]
 fn bisection_does_not_overflow_the_midpoint_of_finite_endpoints() {
-    for (a, b, expected) in [
-        (1.4e308, 1.7e308, 1.5e308),
-        (-1.7e308, -1.4e308, -1.5e308),
-    ] {
+    for (a, b, expected) in [(1.4e308, 1.7e308, 1.5e308), (-1.7e308, -1.4e308, -1.5e308)] {
         let f = |x: f64| x - expected;
         let result = bisect(f, (a, b), opts()).expect("finite bracket is valid");
         assert!(result.converged, "{result:?}");
@@ -48,10 +45,7 @@ fn bisection_does_not_overflow_the_midpoint_of_finite_endpoints() {
 
 #[test]
 fn ridder_finds_roots_with_finite_huge_bracket_endpoints() {
-    for (a, b, expected) in [
-        (1.4e308, 1.7e308, 1.5e308),
-        (-1.7e308, -1.4e308, -1.5e308),
-    ] {
+    for (a, b, expected) in [(1.4e308, 1.7e308, 1.5e308), (-1.7e308, -1.4e308, -1.5e308)] {
         let result = ridder(|x| x - expected, (a, b), opts())
             .expect("Ridder's interpolation stays inside the finite bracket");
         assert!(result.converged, "{result:?}");

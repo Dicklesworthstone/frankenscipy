@@ -5037,89 +5037,15 @@ impl ContinuousDistribution for BetaDist {
         let mean = data.iter().sum::<f64>() / n;
         let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
         let common = mean * (1.0 - mean) / variance - 1.0;
-        let mut a = mean * common;
-        let mut b = (1.0 - mean) * common;
-        if !a.is_finite() || !b.is_finite() || a <= 0.0 || b <= 0.0 {
-            return Err(FitError::NonConvergent(
-                "BetaDist MLE has no finite shapes for a degenerate sample".into(),
-            ));
-        }
         let log_x = data.iter().map(|x| x.ln()).sum::<f64>() / n;
         let log_one_minus_x = data.iter().map(|&x| (-x).ln_1p()).sum::<f64>() / n;
-        let objective = |a: f64, b: f64| {
-            unwrap_special_scalar(fsci_special::betaln_scalar(a, b, active_stats_mode()))
-                - (a - 1.0) * log_x
-                - (b - 1.0) * log_one_minus_x
-        };
-        let mut value = objective(a, b);
-
-        // The beta log-likelihood is strictly concave in positive (a, b).
-        // Start from the moment estimate and solve its two score equations
-        // with a damped Newton step. Backtracking preserves positivity and
-        // decreases negative log-likelihood rather than clipping the shapes.
-        for _ in 0..200 {
-            let psi_a = digamma(a);
-            let psi_b = digamma(b);
-            let psi_sum = digamma(a + b);
-            let ga = psi_a - psi_sum - log_x;
-            let gb = psi_b - psi_sum - log_one_minus_x;
-            let tri_sum = fsci_special::trigamma(a + b);
-            let haa = fsci_special::trigamma(a) - tri_sum;
-            let hbb = fsci_special::trigamma(b) - tri_sum;
-            let determinant = haa * hbb - tri_sum * tri_sum;
-            if !determinant.is_finite() || determinant <= 0.0 {
-                break;
-            }
-            let da = (hbb * ga + tri_sum * gb) / determinant;
-            let db = (tri_sum * ga + haa * gb) / determinant;
-            if !da.is_finite() || !db.is_finite() {
-                break;
-            }
-            if (da / a).abs().max((db / b).abs()) <= 1e-8 {
-                // Apply the final correction. Demanding sub-ULP score
-                // changes can otherwise stall a valid large-shape fit,
-                // whose Hessian amplifies digamma's rounding error.
-                return Ok(Self {
-                    a: a - da,
-                    b: b - db,
-                });
-            }
-            // Concentrated samples have an ill-conditioned Hessian: a
-            // rounding-sized score can produce a large relative Newton
-            // step. Require BOTH score components to be unresolved at the
-            // precision of their digamma subtractions before stopping.
-            // Keep the current shapes instead of applying that noisy step.
-            let score_roundoff_a = 2.0 * f64::EPSILON * (psi_a.abs() + psi_sum.abs() + log_x.abs());
-            let score_roundoff_b =
-                2.0 * f64::EPSILON * (psi_b.abs() + psi_sum.abs() + log_one_minus_x.abs());
-            if ga.abs() <= score_roundoff_a && gb.abs() <= score_roundoff_b {
-                return Ok(Self { a, b });
-            }
-            let mut fraction = 1.0;
-            let mut accepted = false;
-            for _ in 0..60 {
-                let next_a = a - fraction * da;
-                let next_b = b - fraction * db;
-                if next_a > 0.0 && next_b > 0.0 && next_a.is_finite() && next_b.is_finite() {
-                    let next_value = objective(next_a, next_b);
-                    let roundoff = 8.0 * f64::EPSILON * (1.0 + value.abs());
-                    if next_value.is_finite() && next_value <= value + roundoff {
-                        a = next_a;
-                        b = next_b;
-                        value = next_value;
-                        accepted = true;
-                        break;
-                    }
-                }
-                fraction *= 0.5;
-            }
-            if !accepted {
-                break;
-            }
-        }
-        Err(FitError::NonConvergent(
-            "BetaDist MLE score equations did not converge".into(),
-        ))
+        let (a, b) = mle::beta_shapes_mle(
+            log_x,
+            log_one_minus_x,
+            (mean * common, (1.0 - mean) * common),
+            "BetaDist",
+        )?;
+        Ok(Self { a, b })
     }
 
     fn skewness(&self) -> f64 {
@@ -60668,48 +60594,90 @@ impl BetaPrime {
         Self { a, b }
     }
 
+    fn log_normalizer(&self) -> f64 {
+        unwrap_special_scalar(fsci_special::betaln_scalar(
+            self.a,
+            self.b,
+            active_stats_mode(),
+        ))
+    }
+
+    fn logpdf_normalized(&self, x: f64, log_beta: f64) -> f64 {
+        if x <= 0.0 || x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        if x > 1.0 {
+            // Combine the powers of x before evaluating: separately forming
+            // (a-1)*log(x) and (a+b)*log1p(x) loses the entire right-tail
+            // exponent when a is large, and powers/Gamma values overflow.
+            -(self.b + 1.0) * x.ln() - (self.a + self.b) * x.recip().ln_1p() - log_beta
+        } else {
+            (self.a - 1.0) * x.ln() - (self.a + self.b) * x.ln_1p() - log_beta
+        }
+    }
+
+    fn quantile(a: f64, b: f64, q: f64, survival: bool) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return if survival { f64::INFINITY } else { 0.0 };
+        }
+        if q == 1.0 {
+            return if survival { 0.0 } else { f64::INFINITY };
+        }
+        let t = if survival {
+            fsci_special::betainccinv_scalar(a, b, q)
+        } else {
+            fsci_special::betaincinv_scalar(a, b, q)
+        };
+        if t <= 0.5 {
+            t / (1.0 - t)
+        } else {
+            // Invert the small coordinate directly: t can round to one
+            // while its odds are finite. Keep q unchanged in either tail.
+            let complement = if survival {
+                fsci_special::betaincinv_scalar(b, a, q)
+            } else {
+                fsci_special::betainccinv_scalar(b, a, q)
+            };
+            (1.0 - complement) / complement
+        }
+    }
+
     /// Log-density at many points, computing the parameter-only `ln B(a, b)`
     /// normalizer once. Each output preserves [`ContinuousDistribution::logpdf`]
     /// operation order; `x <= 0` returns negative infinity.
     #[must_use]
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
-        let (a, b) = (self.a, self.b);
-        let ln_beta_ab = ln_beta(a, b);
-        par_continuous_map_min(xs, 65536, |x| {
-            if x <= 0.0 {
-                return f64::NEG_INFINITY;
-            }
-            (a - 1.0) * x.ln() - (a + b) * x.ln_1p() - ln_beta_ab
-        })
+        let log_beta = self.log_normalizer();
+        par_continuous_map_min(xs, 65536, |x| self.logpdf_normalized(x, log_beta))
     }
 }
 
 impl ContinuousDistribution for BetaPrime {
     fn pdf(&self, x: f64) -> f64 {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let a = self.a;
-        let b = self.b;
-        x.powf(a - 1.0) * (1.0 + x).powf(-a - b)
-            / (ln_gamma(a).exp() * ln_gamma(b).exp() / ln_gamma(a + b).exp())
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // (a−1)·ln(x) − (a+b)·ln1p(x) − lnB(a,b); finite in the power-law tail. frankenscipy-p82v7
-        if x <= 0.0 {
-            return f64::NEG_INFINITY;
-        }
-        (self.a - 1.0) * x.ln() - (self.a + self.b) * x.ln_1p() - ln_beta(self.a, self.b)
+        self.logpdf_normalized(x, self.log_normalizer())
     }
 
     fn cdf(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
-        // CDF = I_{x/(1+x)}(a, b) where I is regularized incomplete beta
-        let t = x / (1.0 + x);
-        regularized_incomplete_beta(self.a, self.b, t)
+        if x > 1.0 {
+            unwrap_special_scalar(fsci_special::betaincc_scalar(
+                self.b,
+                self.a,
+                1.0 / (1.0 + x),
+                active_stats_mode(),
+            ))
+        } else {
+            regularized_incomplete_beta(self.a, self.b, x / (1.0 + x))
+        }
     }
 
     fn logcdf(&self, x: f64) -> f64 {
@@ -60717,7 +60685,16 @@ impl ContinuousDistribution for BetaPrime {
         if x <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        fsci_special::log_betainc_scalar(self.a, self.b, x / (1.0 + x))
+        if x > 1.0 {
+            let log_sf = fsci_special::log_betainc_scalar(self.b, self.a, 1.0 / (1.0 + x));
+            if log_sf < -LN_2 {
+                (-log_sf.exp()).ln_1p()
+            } else {
+                (-log_sf.exp_m1()).ln()
+            }
+        } else {
+            fsci_special::log_betainc_scalar(self.a, self.b, x / (1.0 + x))
+        }
     }
 
     fn sf(&self, x: f64) -> f64 {
@@ -60727,7 +60704,16 @@ impl ContinuousDistribution for BetaPrime {
         if x <= 0.0 {
             return 1.0;
         }
-        regularized_incomplete_beta(self.b, self.a, 1.0 / (1.0 + x))
+        if x > 1.0 {
+            regularized_incomplete_beta(self.b, self.a, 1.0 / (1.0 + x))
+        } else {
+            unwrap_special_scalar(fsci_special::betaincc_scalar(
+                self.a,
+                self.b,
+                x / (1.0 + x),
+                active_stats_mode(),
+            ))
+        }
     }
 
     fn logsf(&self, x: f64) -> f64 {
@@ -60735,36 +60721,32 @@ impl ContinuousDistribution for BetaPrime {
         if x <= 0.0 {
             return 0.0;
         }
-        fsci_special::log_betainc_scalar(self.b, self.a, 1.0 / (1.0 + x))
+        if x > 1.0 {
+            fsci_special::log_betainc_scalar(self.b, self.a, 1.0 / (1.0 + x))
+        } else {
+            let log_cdf = fsci_special::log_betainc_scalar(self.a, self.b, x / (1.0 + x));
+            if log_cdf < -LN_2 {
+                (-log_cdf.exp()).ln_1p()
+            } else {
+                (-log_cdf.exp_m1()).ln()
+            }
+        }
     }
 
     fn ppf(&self, q: f64) -> f64 {
-        if !(0.0..=1.0).contains(&q) {
-            return f64::NAN;
+        Self::quantile(self.a, self.b, q, false)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        Self::quantile(self.a, self.b, q, true)
+    }
+
+    fn mode(&self) -> f64 {
+        if self.a > 1.0 {
+            (self.a - 1.0) / (self.b + 1.0)
+        } else {
+            0.0
         }
-        if q == 0.0 {
-            return 0.0;
-        }
-        if q == 1.0 {
-            return f64::INFINITY;
-        }
-        // CDF = I_{x/(1+x)}(a,b), so t = betaincinv(a,b,q), x = t/(1-t)
-        let t = fsci_special::betaincinv_scalar(self.a, self.b, q);
-        if t >= 1.0 {
-            return f64::INFINITY;
-        }
-        let mut x = t / (1.0 - t);
-        for _ in 0..8 {
-            let err = self.cdf(x) - q;
-            if err.abs() < 1e-14 {
-                break;
-            }
-            let dx = self.pdf(x);
-            if dx > 1e-30 {
-                x = (x - err / dx).max(0.0);
-            }
-        }
-        x
     }
 
     fn mean(&self) -> f64 {
@@ -60789,7 +60771,7 @@ impl ContinuousDistribution for BetaPrime {
         // E[ln(1+X)] = ψ(a+b) − ψ(b). Therefore
         //   h = ln B(a, b) − (a−1)·(ψ(a) − ψ(b)) + (a+b)·(ψ(a+b) − ψ(b)).
         let (a, b) = (self.a, self.b);
-        let log_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
+        let log_beta = self.log_normalizer();
         let psi_a = fsci_special::digamma_scalar(a);
         let psi_b = fsci_special::digamma_scalar(b);
         let psi_ab = fsci_special::digamma_scalar(a + b);
@@ -60831,46 +60813,60 @@ impl ContinuousDistribution for BetaPrime {
         mu4 / (var * var) - 3.0
     }
 
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
+            a: f64::NAN,
+            b: f64::NAN,
+        })
+    }
+
+    /// Maximum-likelihood shapes with fixed location zero and scale one,
+    /// equivalent to `scipy.stats.betaprime.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // If X ~ BetaPrime(a, b) then Y = X / (1 + X) ~ Beta(a, b).
-        // Closed-form MOM on Beta:
-        //   Var(Y) < mean(Y)·(1 − mean(Y))      (Beta admissibility)
-        //   a + b  = mean(Y)·(1 − mean(Y)) / Var(Y) − 1
-        //   a      = (a + b)·mean(Y)
-        //   b      = (a + b)·(1 − mean(Y))
-        // We require a, b > 0; the existing BetaPrime moment surface
-        // also relies on b > 4 for kurtosis/3 for skewness, but the
-        // distribution itself is well-defined for any b > 0.
-        validate_finite_fit_data(data, 2, "BetaPrime")?;
-        if let Some(&bad) = data.iter().find(|&&x| x <= 0.0) {
-            return Err(FitError::UnsupportedData(format!(
-                "BetaPrime support is (0, ∞); got {bad}"
-            )));
-        }
-        let y: Vec<f64> = data.iter().map(|&x| x / (1.0 + x)).collect();
-        let m = sample_mean(&y);
-        let v = sample_variance(&y);
-        if !m.is_finite() || !v.is_finite() || v <= 0.0 || m <= 0.0 || m >= 1.0 {
-            return Err(FitError::NonConvergent(
-                "BetaPrime MOM requires positive variance and mean ∈ (0, 1) of X/(1+X)".to_owned(),
-            ));
-        }
-        let bound = m * (1.0 - m);
-        if v >= bound {
-            return Err(FitError::NonConvergent(format!(
-                "BetaPrime MOM admissibility violated: Var(Y)={v} ≥ mean(Y)·(1−mean(Y))={bound}"
-            )));
-        }
-        let common = bound / v - 1.0;
-        let a = common * m;
-        let b = common * (1.0 - m);
-        if a > 0.0 && b > 0.0 && a.is_finite() && b.is_finite() {
-            Ok(Self { a, b })
+        mle::validate_positive_sample(data, "BetaPrime")?;
+        let n = data.len() as f64;
+        // The beta sufficient statistics can be evaluated from X directly.
+        // Forming Y=X/(1+X) first would replace valid large observations by
+        // the forbidden beta endpoint 1 and erase their likelihood scores.
+        let log_y = data
+            .iter()
+            .map(|&x| {
+                if x > 1.0 {
+                    -x.recip().ln_1p()
+                } else {
+                    x.ln() - x.ln_1p()
+                }
+            })
+            .sum::<f64>()
+            / n;
+        let log_complement = -data.iter().map(|x| x.ln_1p()).sum::<f64>() / n;
+        // Use the smaller transformed variable for the moment *start*, so
+        // samples entirely in the upper tail do not produce a mean of one.
+        let reflected = log_y > log_complement;
+        let transform = |x: f64| {
+            if reflected {
+                1.0 / (1.0 + x)
+            } else {
+                x / (1.0 + x)
+            }
+        };
+        let scale = data.iter().map(|&x| transform(x)).fold(0.0, f64::max);
+        let mean_scaled = data.iter().map(|&x| transform(x) / scale).sum::<f64>() / n;
+        let variance_scaled = data
+            .iter()
+            .map(|&x| (transform(x) / scale - mean_scaled).powi(2))
+            .sum::<f64>()
+            / n;
+        let mean = scale * mean_scaled;
+        let first = mean_scaled * mean_scaled / variance_scaled * (1.0 - mean) - mean;
+        let second = first / mean * (1.0 - mean);
+        let (a, b) = if reflected {
+            let (b, a) = mle::beta_shapes_mle(log_complement, log_y, (first, second), "BetaPrime")?;
+            (a, b)
         } else {
-            Err(FitError::NonConvergent(
-                "BetaPrime MOM did not yield positive (a, b)".to_owned(),
-            ))
-        }
+            mle::beta_shapes_mle(log_y, log_complement, (first, second), "BetaPrime")?
+        };
+        Ok(Self { a, b })
     }
 }
 
@@ -94720,7 +94716,12 @@ mod tests {
             data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
         };
         assert!(likelihood(fit.a) > likelihood(3.0) + 0.1);
-        assert_close(InverseGamma::fit(&data).a, fit.a, 0.0, "fit delegates to MLE");
+        assert_close(
+            InverseGamma::fit(&data).a,
+            fit.a,
+            0.0,
+            "fit delegates to MLE",
+        );
     }
 
     #[test]
@@ -95160,6 +95161,131 @@ mod tests {
         );
         assert!((bp.pdf(1.0) - 0.375).abs() < 1e-12, "pdf(1)");
         assert!((bp.cdf(1.0) - 0.6875).abs() < 1e-12, "cdf(1)");
+    }
+
+    #[test]
+    fn betaprime_heavy_tails_preserve_both_probabilities() {
+        let upper = BetaPrime::new(2.0, 0.01);
+        let lower = BetaPrime::new(0.01, 2.0);
+        // SciPy's complementary incomplete-beta path: the direct transform
+        // rounds 1e30/(1+1e30) to one although almost half the mass remains.
+        let cdf = 0.493_800_894_036_455;
+        let sf = 0.506_199_105_963_545_2;
+        assert_close(upper.cdf(1e30), cdf, 2e-14, "heavy-tail CDF");
+        assert_close(upper.sf(1e30), sf, 2e-14, "heavy-tail SF");
+        assert_close(lower.cdf(1e-30), sf, 2e-14, "reflected CDF");
+        assert_close(lower.sf(1e-30), cdf, 2e-14, "reflected SF");
+        assert_close(upper.logcdf(1e30), cdf.ln(), 2e-14, "heavy-tail log-CDF");
+        assert_close(lower.logsf(1e-30), cdf.ln(), 2e-14, "reflected log-SF");
+        for dist in [upper, lower] {
+            assert_eq!(dist.pdf(f64::INFINITY), 0.0);
+            assert_eq!(dist.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+            assert_eq!(dist.cdf(f64::INFINITY), 1.0);
+            assert_eq!(dist.sf(f64::INFINITY), 0.0);
+            assert_eq!(dist.logcdf(f64::INFINITY), 0.0);
+            assert_eq!(dist.logsf(f64::INFINITY), f64::NEG_INFINITY);
+            assert!(dist.cdf(f64::NAN).is_nan());
+            assert!(dist.sf(f64::NAN).is_nan());
+        }
+    }
+
+    #[test]
+    fn betaprime_quantiles_do_not_round_finite_tails_to_infinity() {
+        let dist = BetaPrime::new(2.0, 0.01);
+        for (q, expected) in [
+            (0.8, 2.133_721_885_931_886e70),
+            (0.99, 2.704_813_829_421_380_6e200),
+        ] {
+            let x = dist.ppf(q);
+            assert!((x / expected - 1.0).abs() < 2e-12, "q={q}: {x}");
+            assert_close(dist.cdf(x), q, 2e-14, "tail quantile round trip");
+        }
+        // This family has an exact inverse survival function; forming 1-q
+        // before inversion would instead return infinity below epsilon.
+        let uniform_odds = BetaPrime::new(1.0, 1.0);
+        for q in [1e-30, 1e-100, 1e-300] {
+            let x = uniform_odds.isf(q);
+            assert!(x.is_finite() && (x * q - 1.0).abs() < 1e-13, "q={q}: {x}");
+            assert!((uniform_odds.sf(x) / q - 1.0).abs() < 1e-13);
+        }
+        assert_eq!(uniform_odds.isf(1.0), 0.0);
+        assert_eq!(uniform_odds.isf(0.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn betaprime_density_avoids_gamma_and_power_overflow() {
+        let dist = BetaPrime::new(400.0, 200.0);
+        assert_close(
+            dist.pdf(2.0),
+            2.302_174_945_807_710_8,
+            2e-11,
+            "large-shape PDF",
+        );
+        assert_close(dist.mode(), 399.0 / 201.0, 1e-15, "beta-prime mode");
+        let tail = BetaPrime::new(1000.0, 2.0);
+        let x = 1e100_f64;
+        // B(a,2)=1/(a(a+1)): an independent elementary reference, without
+        // cancellation between large log-Gamma values or powers of x.
+        let expected = 1000.0_f64.ln() + 1001.0_f64.ln() - 3.0 * x.ln();
+        assert_close(tail.logpdf(x), expected, 2e-12, "power-law log-density");
+        assert!(tail.pdf(x) > 0.0);
+    }
+
+    #[test]
+    fn betaprime_fit_maximizes_likelihood_and_retains_log_tail_data() {
+        let data = [0.002, 0.03, 0.1, 0.2, 0.5, 1.0, 2.0, 6.0, 50.0, 300.0];
+        let fitted = BetaPrime::try_fit(&data).expect("fixed-support beta-prime MLE");
+        // Independently solved SciPy digamma score equations at fixed loc/scale.
+        assert_close(fitted.a, 0.414_973_397_792_861_4, 2e-10, "MLE a");
+        assert_close(fitted.b, 0.450_028_173_843_170_4, 2e-10, "MLE b");
+        let ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        assert_close(ll, -24.308_401_418_965_857, 1e-11, "MLE likelihood");
+        let reciprocal: Vec<_> = data.iter().map(|x| 1.0 / x).collect();
+        let reversed = BetaPrime::try_fit(&reciprocal).expect("reciprocal MLE");
+        assert_close(reversed.a, fitted.b, 2e-10, "reciprocal MLE a");
+        assert_close(reversed.b, fitted.a, 2e-10, "reciprocal MLE b");
+
+        let extreme = [1e-300, 1e-100, 1.0, 1e100, 1e300];
+        let fitted = BetaPrime::try_fit(&extreme).expect("logarithmic sufficient statistics");
+        // 60-digit mpmath solution of psi(a)-psi(2a)=mean(log(X/(1+X))).
+        let expected = 0.002_712_364_561_733_377_3;
+        assert_close(fitted.a, expected, 1e-13, "extreme MLE a");
+        assert_close(fitted.b, expected, 1e-13, "extreme MLE b");
+        let endpoints = BetaPrime::try_fit(&[1e-300, 1e300])
+            .expect("a rounded Bernoulli moment start does not destroy a finite MLE");
+        assert!(endpoints.a > 0.0 && endpoints.a < 0.01);
+        assert_close(endpoints.a, endpoints.b, 1e-13, "symmetric tail MLE");
+    }
+
+    #[test]
+    fn betaprime_fit_invalid_data_is_fallible_and_convenience_fit_does_not_panic() {
+        for data in [
+            &[][..],
+            &[1.0][..],
+            &[1.0, 1.0][..],
+            &[0.0, 1.0][..],
+            &[-1.0, 2.0][..],
+            &[f64::NAN, 1.0][..],
+            &[f64::INFINITY, 1.0][..],
+        ] {
+            assert!(BetaPrime::try_fit(data).is_err());
+            let fitted = BetaPrime::fit(data);
+            assert!(fitted.a.is_nan() && fitted.b.is_nan());
+        }
+    }
+
+    #[test]
+    fn betaprime_isf_preserves_representable_subnormal_quantiles() {
+        // With b=1, I_y(a,1)=y^a. At q=1/2 and a=1/1025,
+        // the beta coordinate is exactly 2^-1025, a representable subnormal.
+        // Taking reciprocal odds first would overflow and then return zero.
+        let distribution = BetaPrime::new(1.0 / 1025.0, 1.0);
+        let expected = f64::from_bits(1_u64 << 49);
+        let upper = distribution.isf(0.5);
+        let lower = distribution.ppf(0.5);
+        assert!(upper > 0.0 && lower > 0.0);
+        assert!((upper / expected - 1.0).abs() < 2e-13);
+        assert!((lower / expected - 1.0).abs() < 2e-13);
     }
 
     #[test]
@@ -102362,7 +102488,12 @@ mod tests {
         };
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 0.99));
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 1.01));
-        assert_close(InvWeibull::fit(&data).c, fitted.c, 0.0, "fit delegates to MLE");
+        assert_close(
+            InvWeibull::fit(&data).c,
+            fitted.c,
+            0.0,
+            "fit delegates to MLE",
+        );
     }
 
     #[test]
@@ -104850,9 +104981,8 @@ mod tests {
 
     #[test]
     fn try_fit_beta_prime_recovers_shape_via_transformation() {
-        // The MOM estimator inverts X / (1 + X) ~ Beta(a, b) exactly
-        // when sample moments equal population moments. We test on a
-        // deciles sample and demand reasonable agreement on (a, b).
+        // Fixed-support MLE uses the beta log sufficient statistics of the
+        // transformed quantile sample, including both shape parameters.
         for (a_true, b_true) in [(2.0_f64, 5.0_f64), (1.5, 3.0), (3.0, 7.0)] {
             let dist = BetaPrime {
                 a: a_true,

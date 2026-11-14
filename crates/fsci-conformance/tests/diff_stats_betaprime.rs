@@ -67,6 +67,29 @@ struct PpfArm {
 struct OracleResult {
     points: Vec<PointArm>,
     ppf: Vec<PpfArm>,
+    fits: Vec<FitArm>,
+    tails: Vec<TailArm>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FitArm {
+    case_id: String,
+    data: Vec<f64>,
+    a: f64,
+    b: f64,
+    log_likelihood: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TailArm {
+    a: f64,
+    b: f64,
+    x: f64,
+    pdf: f64,
+    cdf: f64,
+    sf: f64,
+    logcdf: f64,
+    logsf: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +175,8 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import sys
+import numpy as np
+from scipy.optimize import fmin
 from scipy.stats import betaprime
 
 q = json.load(sys.stdin)
@@ -175,7 +200,26 @@ for case in q["ppf"]:
         ppf.append({"case_id": cid, "ppf": float(betaprime.ppf(qv, a, b))})
     except Exception:
         ppf.append({"case_id": cid, "ppf": None})
-print(json.dumps({"points": points, "ppf": ppf}))
+def optimizer(fun, x0, args=(), disp=0):
+    return fmin(fun, x0, args=args, disp=0, xtol=1e-10, ftol=1e-10,
+                maxiter=10000, maxfun=20000)
+
+fits = []
+for index, (a, b) in enumerate([(0.4, 0.6), (2.0, 5.0), (7.0, 0.4),
+                               (0.2, 3.0), (100.0, 200.0)]):
+    data = betaprime.rvs(a, b, size=2000, random_state=np.random.default_rng(23170 + index))
+    fitted = betaprime.fit(data, floc=0, fscale=1, optimizer=optimizer)
+    fits.append({"case_id": f"fit_a{a}_b{b}", "data": data.tolist(),
+                 "a": float(fitted[0]), "b": float(fitted[1]),
+                 "log_likelihood": float(betaprime.logpdf(data, *fitted).sum())})
+tails = []
+for a, b, x in [(2.0, 0.01, 1e30), (0.01, 2.0, 1e-30),
+                 (400.0, 200.0, 2.0), (2.0, 0.1, 1e100)]:
+    dist = betaprime(a, b)
+    tails.append({"a": a, "b": b, "x": x,
+                  **{name: float(getattr(dist, name)(x))
+                     for name in ["pdf", "cdf", "sf", "logcdf", "logsf"]}})
+print(json.dumps({"points": points, "ppf": ppf, "fits": fits, "tails": tails}, allow_nan=False))
 "#;
 
     let query_json = serde_json::to_string(query).expect("serialize betaprime query");
@@ -326,4 +370,88 @@ fn diff_stats_betaprime() {
     );
     // pdf/cdf/sf compare every point case; ppf has its own (smaller) q-grid.
     ledger.finish(query.points.len().min(query.ppf.len()));
+}
+
+#[test]
+fn diff_stats_betaprime_mle_and_heavy_tails() {
+    let Some(oracle) = scipy_oracle_or_skip(&generate_query()) else {
+        return;
+    };
+    assert_eq!(oracle.fits.len(), 5, "all seeded MLE fixtures must run");
+    assert_eq!(oracle.tails.len(), 4, "all tail fixtures must run");
+    let mut fits = CompareLedger::new(
+        "diff_stats_betaprime_fit",
+        &["shape_a", "shape_b", "likelihood"],
+    );
+    let mut rejected_moment_fits = 0;
+    for case in oracle.fits {
+        assert_eq!(case.data.len(), 2000);
+        let fitted = BetaPrime::try_fit(&case.data).expect("finite SciPy MLE needs a Rust MLE");
+        let likelihood: f64 = case.data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for (arm, rust, reference) in [
+            ("shape_a", fitted.a, case.a),
+            ("shape_b", fitted.b, case.b),
+            ("likelihood", likelihood, case.log_likelihood),
+        ] {
+            let (reference, rust) = fits
+                .pair(arm, &case.case_id, Some(reference), Some(rust))
+                .expect("finite MLE parameter or likelihood");
+            let pass = if arm == "likelihood" {
+                rust >= reference - 1e-6 * reference.abs().max(1.0)
+            } else {
+                (rust - reference).abs() <= 1e-4 * reference.abs()
+            };
+            fits.compared(arm, &case.case_id, pass);
+            assert!(
+                pass,
+                "{} {arm}: Rust={rust}, SciPy={reference}",
+                case.case_id
+            );
+        }
+        // Run the replaced estimator on the same observations. This negative
+        // control distinguishes likelihood fitting from merely matching moments.
+        let n = case.data.len() as f64;
+        let transformed: Vec<_> = case.data.iter().map(|x| x / (1.0 + x)).collect();
+        let mean = transformed.iter().sum::<f64>() / n;
+        let variance = transformed.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let common = mean * (1.0 - mean) / variance - 1.0;
+        let moment = BetaPrime::new(common * mean, common * (1.0 - mean));
+        let moment_ll: f64 = case.data.iter().map(|&x| moment.logpdf(x)).sum();
+        rejected_moment_fits += usize::from(
+            moment_ll < case.log_likelihood - 1e-6 * case.log_likelihood.abs().max(1.0),
+        );
+        eprintln!(
+            "{}: Rust=({}, {}), SciPy=({}, {}), LL={likelihood}, SciPy LL={}, old moment LL={moment_ll}",
+            case.case_id, fitted.a, fitted.b, case.a, case.b, case.log_likelihood
+        );
+    }
+    assert!(
+        rejected_moment_fits >= 3,
+        "old moment fits must be detected"
+    );
+    fits.finish(5);
+
+    let mut tails = CompareLedger::new(
+        "diff_stats_betaprime_tails",
+        &["pdf", "cdf", "sf", "logcdf", "logsf"],
+    );
+    for case in oracle.tails {
+        let dist = BetaPrime::new(case.a, case.b);
+        let id = format!("a{}_b{}_x{}", case.a, case.b, case.x);
+        for (arm, rust, reference) in [
+            ("pdf", dist.pdf(case.x), case.pdf),
+            ("cdf", dist.cdf(case.x), case.cdf),
+            ("sf", dist.sf(case.x), case.sf),
+            ("logcdf", dist.logcdf(case.x), case.logcdf),
+            ("logsf", dist.logsf(case.x), case.logsf),
+        ] {
+            let (reference, rust) = tails
+                .pair(arm, &id, Some(reference), Some(rust))
+                .expect("finite tail value");
+            let pass = (rust - reference).abs() <= 2e-10 * reference.abs();
+            tails.compared(arm, &id, pass);
+            assert!(pass, "{id} {arm}: Rust={rust}, SciPy={reference}");
+        }
+    }
+    tails.finish(4);
 }

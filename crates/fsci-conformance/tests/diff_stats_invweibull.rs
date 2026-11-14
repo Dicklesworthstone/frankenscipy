@@ -112,7 +112,8 @@ print(json.dumps(rows, allow_nan=False))
     };
     let rows: Vec<FitArm> = serde_json::from_slice(&output.stdout).expect("finite MLE oracle rows");
     assert_eq!(rows.len(), 3);
-    let mut ledger = CompareLedger::new("diff_stats_invweibull_shape_mle", &["shape", "likelihood"]);
+    let mut ledger =
+        CompareLedger::new("diff_stats_invweibull_shape_mle", &["shape", "likelihood"]);
     let mut moment_failures = 0;
     for row in rows {
         assert_eq!(row.data.len(), 2000);
@@ -131,11 +132,16 @@ print(json.dumps(rows, allow_nan=False))
                 (rust - reference).abs() <= 1e-4 * reference.abs()
             };
             ledger.compared(arm, &row.case_id, pass);
-            assert!(pass, "{} {arm}: Rust={rust}, SciPy={reference}", row.case_id);
+            assert!(
+                pass,
+                "{} {arm}: Rust={rust}, SciPy={reference}",
+                row.case_id
+            );
         }
-        if row.moment_log_likelihood.is_none_or(|ll| {
-            ll < row.log_likelihood - 1e-6 * row.log_likelihood.abs().max(1.0)
-        }) {
+        if row
+            .moment_log_likelihood
+            .is_none_or(|ll| ll < row.log_likelihood - 1e-6 * row.log_likelihood.abs().max(1.0))
+        {
             moment_failures += 1;
         }
         eprintln!(
@@ -143,7 +149,10 @@ print(json.dumps(rows, allow_nan=False))
             row.case_id, fitted.c, row.shape, row.log_likelihood, row.moment_log_likelihood
         );
     }
-    assert_eq!(moment_failures, 3, "the old moment fit must fail every new MLE row");
+    assert_eq!(
+        moment_failures, 3,
+        "the old moment fit must fail every new MLE row"
+    );
     ledger.finish(3);
 }
 
