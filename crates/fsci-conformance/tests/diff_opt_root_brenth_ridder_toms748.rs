@@ -7,9 +7,9 @@
 //! bracket. Compare root x at 1e-9 abs and require residual |f(x)|
 //! to be < 1e-10 on both sides.
 //!
-//! Note: fsci's brenth is currently an alias for brentq (see
-//! frankenscipy-88gz), so it should match scipy's brenth at roughly
-//! the same precision because both converge to the same true root.
+//! Brent's two variants are also compared by their full evaluation traces,
+//! iteration counts and exhausted-budget results. Matching only their roots
+//! cannot distinguish hyperbolic interpolation from a brentq alias.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_opt::{RootOptions, brenth, ridder, toms748};
+use fsci_opt::{RootMethod, RootOptions, brenth, ridder, root_scalar, toms748};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -306,4 +306,163 @@ fn diff_opt_root_brenth_ridder_toms748() {
     );
     // Every method runs the same six functions; brenth's count is each arm's count.
     ledger.finish(query.points.iter().filter(|c| c.method == "brenth").count());
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrentCase {
+    method: String,
+    function: String,
+    maxiter: usize,
+    sign: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrentOracle {
+    root: f64,
+    converged: bool,
+    iterations: usize,
+    calls: usize,
+    trace: Vec<f64>,
+}
+
+#[test]
+fn diff_brent_interpolation_traces_and_budgets() {
+    let mut cases = Vec::new();
+    for method in ["brentq", "brenth"] {
+        for function in ["wallis", "rational", "cosine", "flat"] {
+            for maxiter in [1, 3, 7, 10, 150] {
+                for sign in [-1.0, 1.0] {
+                    cases.push(BrentCase {
+                        method: method.to_owned(),
+                        function: function.to_owned(),
+                        maxiter,
+                        sign,
+                    });
+                }
+            }
+        }
+    }
+    let script = r#"
+import json, math, os, sys
+import numpy as np
+import scipy
+from scipy.optimize import brentq, brenth
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert scipy.__version__ == '1.17.1', scipy.__version__
+    assert np.__version__ == '2.4.3', np.__version__
+out = []
+for case in json.load(sys.stdin):
+    name = case['function']
+    if name == 'wallis':
+        fn, bounds = lambda x: x*x*x - 2*x - 5, (2., 3.)
+    elif name == 'rational':
+        fn, bounds = lambda x: (x-1)/(x+2), (0., 2.)
+    elif name == 'cosine':
+        fn, bounds = lambda x: math.cos(x)-x, (0., 1.)
+    else:
+        fn, bounds = lambda x: (x-.5)*(x-.5)*(x-.5), (-1., 1.)
+    trace = []
+    def f(x):
+        trace.append(x)
+        return case['sign'] * fn(x)
+    solve = brentq if case['method'] == 'brentq' else brenth
+    x, result = solve(f, *bounds, xtol=1e-12, rtol=1e-12,
+                      maxiter=case['maxiter'], full_output=True, disp=False)
+    out.append(dict(root=x, converged=bool(result.converged),
+                    iterations=result.iterations, calls=result.function_calls,
+                    trace=trace))
+print(json.dumps(out, allow_nan=False))
+"#;
+    let mut child = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            assert!(
+                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+                "Brent oracle unavailable: {error}"
+            );
+            eprintln!("skipping optional Brent oracle: {error}");
+            return;
+        }
+    };
+    let input = serde_json::to_vec(&cases).unwrap();
+    let write_result = child.stdin.take().unwrap().write_all(&input);
+    let output = child.wait_with_output().unwrap();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "Brent oracle failed: {stderr}"
+        );
+        eprintln!("skipping optional Brent oracle: {stderr}");
+        return;
+    }
+    write_result.expect("write all Brent oracle cases");
+    let oracle: Vec<BrentOracle> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(oracle.len(), cases.len());
+    let mut ledger = CompareLedger::new("brent_interpolation_traces", &["brentq", "brenth"]);
+    for (case, reference) in cases.iter().zip(&oracle) {
+        let method = if case.method == "brentq" {
+            RootMethod::Brentq
+        } else {
+            RootMethod::Brenth
+        };
+        let bounds = match case.function.as_str() {
+            "wallis" => (2.0, 3.0),
+            "rational" => (0.0, 2.0),
+            "cosine" => (0.0, 1.0),
+            _ => (-1.0, 1.0),
+        };
+        let trace = std::cell::RefCell::new(Vec::new());
+        let result = root_scalar(
+            |x| {
+                trace.borrow_mut().push(x);
+                case.sign
+                    * match case.function.as_str() {
+                        "wallis" => x * x * x - 2.0 * x - 5.0,
+                        "rational" => (x - 1.0) / (x + 2.0),
+                        "cosine" => x.cos() - x,
+                        _ => (x - 0.5) * (x - 0.5) * (x - 0.5),
+                    }
+            },
+            Some(bounds),
+            None,
+            None,
+            RootOptions {
+                method: Some(method),
+                xtol: 1e-12,
+                rtol: 1e-12,
+                maxiter: case.maxiter,
+                ..RootOptions::default()
+            },
+        )
+        .expect("valid Brent problem");
+        let trace = trace.borrow();
+        let trace_matches = trace.len() == reference.trace.len()
+            && trace
+                .iter()
+                .zip(&reference.trace)
+                .all(|(actual, expected)| {
+                    (actual - expected).abs() <= 8.0 * f64::EPSILON * expected.abs().max(1.0)
+                });
+        let pass = (result.root - reference.root).abs() <= 2e-12
+            && result.converged == reference.converged
+            && result.iterations == reference.iterations
+            && result.function_calls == reference.calls
+            && result.function_calls == trace.len()
+            && trace_matches;
+        let id = format!("{}-{}-{}", case.function, case.sign, case.maxiter);
+        ledger.compared(&case.method, &id, pass);
+        if !pass {
+            eprintln!("{case:?}\nRust={result:?}\nSciPy={reference:?}\ntrace={trace:?}");
+        }
+    }
+    ledger.finish(40);
+    assert_eq!(cases.len(), 80);
+    eprintln!("Brent live SciPy comparisons: {}", cases.len());
 }

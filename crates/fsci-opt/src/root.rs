@@ -122,131 +122,150 @@ pub fn brentq<F>(f: F, bracket: (f64, f64), options: RootOptions) -> Result<Root
 where
     F: Fn(f64) -> f64,
 {
+    brent_solve(f, bracket, options, RootMethod::Brentq)
+}
+
+/// Brent's safeguarded iteration with inverse-quadratic or hyperbolic
+/// interpolation. The current point and opposite endpoint bracket the root;
+/// the previous point provides the third interpolation value. Interpolation
+/// must shorten both the preceding step and the bracket, or we bisect.
+fn brent_solve<F>(
+    f: F,
+    bracket: (f64, f64),
+    options: RootOptions,
+    method: RootMethod,
+) -> Result<RootResult, OptError>
+where
+    F: Fn(f64) -> f64,
+{
     validate_root_options(options)?;
     validate_bracket_finite(bracket)?;
     let mut eval = RootEvaluator::new(&f, options);
-    let mut state = prepare_bracket(&mut eval, bracket, RootMethod::Brentq)?;
+    let state = prepare_bracket(&mut eval, bracket, method)?;
+    let name = if method == RootMethod::Brenth {
+        "brenth"
+    } else {
+        "brentq"
+    };
     if state.fa == 0.0 {
         return Ok(RootResult::terminal(
-            RootMethod::Brentq,
+            method,
             state.a,
             true,
             ConvergenceStatus::Success,
             0,
             eval.function_calls,
-            "brentq accepted bracket start as root",
+            format!("{name} accepted bracket start as root"),
         ));
     }
     if state.fb == 0.0 {
         return Ok(RootResult::terminal(
-            RootMethod::Brentq,
+            method,
             state.b,
             true,
             ConvergenceStatus::Success,
             0,
             eval.function_calls,
-            "brentq accepted bracket end as root",
+            format!("{name} accepted bracket end as root"),
         ));
     }
 
-    let mut c = state.a;
-    let mut fc = state.fa;
-    let mut d = state.b - state.a;
-    let mut e = d;
+    let (mut previous, mut f_previous) = (state.a, state.fa);
+    let (mut current, mut f_current) = (state.b, state.fb);
+    let (mut opposite, mut f_opposite) = (previous, f_previous);
+    let mut step = current - previous;
+    let mut previous_step = step;
 
     for iter in 1..=options.maxiter {
-        if state.fb == 0.0 {
+        if f_previous != 0.0 && f_current != 0.0 && !same_sign(f_previous, f_current) {
+            opposite = previous;
+            f_opposite = f_previous;
+            step = current - previous;
+            previous_step = step;
+        }
+        if f_opposite.abs() < f_current.abs() {
+            // The old current point becomes BOTH previous and opposite;
+            // a three-way rotation would lose the previous evaluation.
+            previous = current;
+            f_previous = f_current;
+            std::mem::swap(&mut current, &mut opposite);
+            std::mem::swap(&mut f_current, &mut f_opposite);
+        }
+
+        let half_tolerance = 0.5 * (options.xtol + options.rtol * current.abs());
+        let distance = opposite - current;
+        let bisect_step = if distance.is_finite() {
+            0.5 * distance
+        } else {
+            // Opposite-sign finite endpoints can have an overflowing width.
+            0.5 * opposite - 0.5 * current
+        };
+        if f_current == 0.0 || bisect_step.abs() < half_tolerance {
             return Ok(RootResult::terminal(
-                RootMethod::Brentq,
-                state.b,
+                method,
+                current,
                 true,
                 ConvergenceStatus::Success,
                 iter,
                 eval.function_calls,
-                "brentq converged (f(x) == 0)",
+                format!("{name} converged"),
             ));
         }
 
-        if same_sign(state.fa, state.fb) {
-            state.a = c;
-            state.fa = fc;
-            d = state.b - state.a;
-            e = d;
-        }
-
-        if state.fa.abs() < state.fb.abs() {
-            c = state.b;
-            fc = state.fb;
-            state.b = state.a;
-            state.fb = state.fa;
-            state.a = c;
-            state.fa = fc;
-        }
-
-        let tol = options.xtol + options.rtol * state.b.abs();
-        let m = 0.5 * (state.a - state.b);
-        if m.abs() <= tol {
-            return Ok(RootResult::terminal(
-                RootMethod::Brentq,
-                state.b,
-                true,
-                ConvergenceStatus::Success,
-                iter,
-                eval.function_calls,
-                "brentq converged (interval width <= tol)",
-            ));
-        }
-
-        if e.abs() >= tol && fc.abs() > state.fb.abs() {
-            let s = state.fb / fc;
-            let (mut p, mut q) = if state.a == c {
-                (2.0 * m * s, 1.0 - s)
+        let candidate =
+            if previous_step.abs() > half_tolerance && f_current.abs() < f_previous.abs() {
+                if previous == opposite {
+                    // With two distinct points, take a secant step.
+                    -f_current * (current - previous) / (f_current - f_previous)
+                } else {
+                    let previous_slope = (f_previous - f_current) / (previous - current);
+                    let opposite_slope = (f_opposite - f_current) / (opposite - current);
+                    if method == RootMethod::Brenth {
+                        // Zero of the hyperbola through the three (x, f) pairs.
+                        -f_current * (f_opposite - f_previous)
+                            / (f_opposite * previous_slope - f_previous * opposite_slope)
+                    } else {
+                        // Evaluate the quadratic interpolating x(f) at f=0.
+                        -f_current * (f_opposite * opposite_slope - f_previous * previous_slope)
+                            / (opposite_slope * previous_slope * (f_opposite - f_previous))
+                    }
+                }
             } else {
-                let q_val = fc / state.fa;
-                let r_val = state.fb / state.fa;
-                (
-                    s * (2.0 * m * q_val * (q_val - r_val) - (state.b - c) * (r_val - 1.0)),
-                    (q_val - 1.0) * (r_val - 1.0) * (s - 1.0),
-                )
+                f64::NAN
             };
-            if p > 0.0 {
-                q = -q;
-            }
-            p = p.abs();
-            let min1 = 3.0 * m * q.abs() - (tol * q).abs();
-            let min2 = (e * q).abs();
-            if 2.0 * p < min1.min(min2) {
-                e = d;
-                d = p / q;
-            } else {
-                d = m;
-                e = d;
-            }
+        // Compare lengths: using a signed bracket displacement here rejects
+        // valid interpolation whenever the opposite endpoint is to the left.
+        // Singular or nonfinite interpolants naturally fall back to bisection.
+        if 2.0 * candidate.abs()
+            < previous_step
+                .abs()
+                .min(3.0 * bisect_step.abs() - half_tolerance)
+        {
+            previous_step = step;
+            step = candidate;
         } else {
-            d = m;
-            e = d;
+            step = bisect_step;
+            previous_step = bisect_step;
         }
 
-        c = state.b;
-        fc = state.fb;
-        if d.abs() > tol {
-            state.b += d;
-        } else if m > 0.0 {
-            state.b += tol;
+        previous = current;
+        f_previous = f_current;
+        current += if step.abs() > half_tolerance {
+            step
         } else {
-            state.b -= tol;
-        }
-        state.fb = eval.evaluate(state.b)?;
+            half_tolerance.copysign(bisect_step)
+        };
+        f_current = eval.evaluate(current)?;
     }
 
     Ok(RootResult::terminal(
-        RootMethod::Brentq,
-        state.b,
+        method,
+        current,
         false,
         ConvergenceStatus::MaxIterations,
         options.maxiter,
         eval.function_calls,
-        "brentq failed to converge within maxiter",
+        format!("{name} failed to converge within maxiter"),
     ))
 }
 
@@ -452,25 +471,17 @@ where
     out
 }
 
-/// Root finder dispatched as `brenth`.
+/// Brent's bracketed root finder with hyperbolic extrapolation.
 ///
-/// # Implementation note
-/// This is currently an ALIAS for [`brentq`]; it runs Brent's method with
-/// inverse-quadratic interpolation and relabels the output. SciPy's
-/// `brenth` uses hyperbolic interpolation (Harris 1970) which has
-/// different convergence dynamics on functions with near-horizontal
-/// tangents. A caller selecting `brenth` for its documented Brent-Harris
-/// convergence behavior will observe `brentq`-equivalent iteration counts
-/// and numerical traces here. Tracked by frankenscipy-88gz; the algorithm
-/// swap-in will change this docstring.
+/// Implements Bus and Dekker's Algorithm M, as used by SciPy's `brenth`.
+/// It shares the safeguarded secant/bisection iteration with [`brentq`], but
+/// uses a hyperbola through three function values instead of an inverse
+/// quadratic. The choice affects evaluations and exhausted-budget results.
 pub fn brenth<F>(f: F, bracket: (f64, f64), options: RootOptions) -> Result<RootResult, OptError>
 where
     F: Fn(f64) -> f64,
 {
-    let mut result = brentq(f, bracket, options)?;
-    result.method = RootMethod::Brenth;
-    result.message = result.message.replace("brentq", "brenth");
-    Ok(result)
+    brent_solve(f, bracket, options, RootMethod::Brenth)
 }
 
 pub fn bisect<F>(f: F, bracket: (f64, f64), options: RootOptions) -> Result<RootResult, OptError>
@@ -3535,9 +3546,9 @@ mod tests {
         // TOMS748Solver (verified bracket-by-bracket against a live trace of
         // scipy.optimize._zeros_py) and spends the same 9 function calls.
         //
-        // brentq is still the outlier at 23 iterations to scipy's 7: its
-        // interpolation-acceptance condition over-rejects the same way toms748's
-        // used to. It does beat bisection, so it is asserted but not yet fixed.
+        // The historical brentq interpolation rejection is covered separately
+        // by brent_methods_keep_interpolation_with_a_short_iteration_budget,
+        // which requires the SciPy count of 7 iterations and 8 calls.
     }
 
     #[test]
@@ -3610,6 +3621,59 @@ mod tests {
             Some(cubic(brenth_result.root)),
             305,
         );
+    }
+
+    #[test]
+    fn brent_methods_keep_interpolation_with_a_short_iteration_budget() {
+        // The signed-step guard used to reject interpolation whenever the
+        // opposite endpoint lay to the left. Both methods then exhausted ten
+        // iterations on this smooth cubic instead of finishing in seven.
+        for method in [RootMethod::Brentq, RootMethod::Brenth] {
+            for sign in [-1.0, 1.0] {
+                let result = root_scalar(
+                    |x| sign * (x * x * x - 2.0 * x - 5.0),
+                    Some((2.0, 3.0)),
+                    None,
+                    None,
+                    RootOptions {
+                        method: Some(method),
+                        xtol: 1e-12,
+                        rtol: 1e-12,
+                        maxiter: 10,
+                        ..RootOptions::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.converged, "{method:?}: {result:?}");
+                assert!((result.root - 2.094_551_481_542_326_5).abs() < 1e-11);
+                assert_eq!(result.iterations, 7, "{method:?}: {result:?}");
+                assert_eq!(result.function_calls, 8, "{method:?}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn brenth_interpolates_a_hyperbola_instead_of_aliasing_brentq() {
+        let trace = std::cell::RefCell::new(Vec::new());
+        let result = brenth(
+            |x| {
+                trace.borrow_mut().push(x);
+                (x - 1.0) / (x + 2.0)
+            },
+            (0.0, 2.0),
+            RootOptions {
+                xtol: 1e-12,
+                rtol: 1e-12,
+                maxiter: 4,
+                ..RootOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.converged, "{result:?}");
+        assert!((result.root - 1.0).abs() < 2e-12, "{result:?}");
+        let trace = trace.borrow();
+        assert!((trace[2] - 4.0 / 3.0).abs() < 1e-15, "{trace:?}");
+        assert!((trace[3] - 1.0).abs() < 1e-15, "{trace:?}");
     }
 
     #[test]
