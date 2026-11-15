@@ -8071,6 +8071,17 @@ impl Logistic {
         assert!(scale > 0.0, "scale must be positive, got {scale}");
         Self { loc, scale }
     }
+
+    fn standardized(&self, x: f64) -> f64 {
+        let difference = x - self.loc;
+        if difference.is_infinite() && x.is_finite() && self.loc.is_finite() {
+            // Opposite-sign finite endpoints can overflow their subtraction
+            // even when division by a large scale makes the result finite.
+            x / self.scale - self.loc / self.scale
+        } else {
+            difference / self.scale
+        }
+    }
 }
 
 impl ContinuousDistribution for Logistic {
@@ -8083,26 +8094,26 @@ impl ContinuousDistribution for Logistic {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
-        let exp_neg_z = (-z).exp();
-        exp_neg_z / (self.scale * (1.0 + exp_neg_z).powi(2))
+        let exp_neg_abs_z = (-self.standardized(x).abs()).exp();
+        if exp_neg_abs_z < f64::MIN_POSITIVE {
+            // A tiny scale can bring an underflowed standardized density back
+            // into the representable range; also avoid amplifying subnormal
+            // rounding when the exponential has only a few significant bits.
+            self.logpdf(x).exp()
+        } else {
+            exp_neg_abs_z / (1.0 + exp_neg_abs_z).powi(2) / self.scale
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // −z − ln(scale) − 2·softplus(−z); the stable softplus keeps both tails
-        // finite where pdf underflows. frankenscipy-p82v7
-        let z = (x - self.loc) / self.scale;
-        // softplus(−z) = ln(1 + e^{−z}) without overflow.
-        let softplus_neg_z = if z <= 0.0 {
-            -z + z.exp().ln_1p()
-        } else {
-            (-z).exp().ln_1p()
-        };
-        -z - self.scale.ln() - 2.0 * softplus_neg_z
+        // The symmetric expression avoids both exp(-z) overflow and the
+        // inf-inf cancellation of -z - 2*softplus(-z) in the far left tail.
+        let abs_z = self.standardized(x).abs();
+        -abs_z - self.scale.ln() - 2.0 * (-abs_z).exp().ln_1p()
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardized(x);
         1.0 / (1.0 + (-z).exp())
     }
 
@@ -8110,7 +8121,7 @@ impl ContinuousDistribution for Logistic {
         // logcdf = ln(expit(z)) = -softplus(-z). The default ln(cdf) underflows
         // for z << 0 (cdf -> 0, logcdf(-1000)=-inf vs scipy -1000). Reuse the
         // same stable softplus the logpdf/sf use.
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardized(x);
         let softplus_neg_z = if z <= 0.0 {
             -z + z.exp().ln_1p()
         } else {
@@ -8122,7 +8133,7 @@ impl ContinuousDistribution for Logistic {
     fn logsf(&self, x: f64) -> f64 {
         // logsf = ln(sf) = -softplus(z). The default ln(sf) underflows for z >> 0
         // (sf=1/(1+exp(z))->0, logsf(1000)=-inf vs scipy -1000).
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardized(x);
         let softplus_z = if z <= 0.0 {
             z.exp().ln_1p()
         } else {
@@ -8136,7 +8147,7 @@ impl ContinuousDistribution for Logistic {
         //   sf = 1/(1 + exp(z))  vs.  the imprecise default 1 - cdf.
         // For large positive z (deep right tail), 1 - 1/(1 + exp(-z))
         // catastrophically cancels.
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardized(x);
         1.0 / (1.0 + z.exp())
     }
 
@@ -8179,31 +8190,22 @@ impl ContinuousDistribution for Logistic {
     }
 
     fn fit(data: &[f64]) -> Self {
-        let n = data.len() as f64;
-        if n == 0.0 {
-            return Self {
-                loc: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        Self {
-            loc: mean,
-            scale: var.sqrt() * 3.0_f64.sqrt() / PI,
-        }
+        Self::try_fit(data).unwrap_or(Self {
+            loc: f64::NAN,
+            scale: f64::NAN,
+        })
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // [frankenscipy-covaj]: previously inherited the trait-default
-        // try_fit which returned NotImplemented even though fit() had a
-        // working method-of-moments closed form. Surface typed errors
-        // to non-panicking callers without touching fit() (which keeps
-        // its existing NaN-on-bad-input behavior for back-compat).
-        if data.is_empty() {
+        if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            return Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+            });
+        }
+        if data.len() < 2 {
             return Err(FitError::InsufficientData {
-                required: 1,
-                actual: 0,
+                required: 2,
+                actual: data.len(),
             });
         }
         if data.iter().any(|x| !x.is_finite()) {
@@ -8211,13 +8213,135 @@ impl ContinuousDistribution for Logistic {
                 "Logistic fit requires all-finite samples".into(),
             ));
         }
+
+        let minimum = data.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if minimum == maximum {
+            return Err(FitError::NonConvergent(
+                "Logistic likelihood has no finite maximum for a constant sample".into(),
+            ));
+        }
+        let range = maximum - minimum;
+        let center = if range.is_finite() {
+            minimum + 0.5 * range
+        } else {
+            0.5 * minimum + 0.5 * maximum
+        };
+        let radius = (maximum - center).max(center - minimum);
         let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        Ok(Self {
-            loc: mean,
-            scale: var.sqrt() * 3.0_f64.sqrt() / PI,
-        })
+        let mut normalized: Vec<f64> = data.iter().map(|&x| (x - center) / radius).collect();
+        let mean = normalized.iter().sum::<f64>() / n;
+        for x in &mut normalized {
+            *x -= mean;
+        }
+        let variance = normalized.iter().map(|x| x * x).sum::<f64>() / n;
+
+        // In inverse-scale/intercept coordinates, z = tau*x + beta, the
+        // negative log likelihood is strictly convex for a nonconstant sample:
+        //   -ln(tau) + mean(|z| + 2*ln(1 + exp(-|z|))), tau > 0.
+        // A damped Newton solve of this two-dimensional likelihood replaces
+        // the old method-of-moments estimate. Centering and rescaling the data
+        // avoids overflow in variance and makes the score tolerance independent
+        // of the caller's units. The moments provide only the initial iterate.
+        let mut tau = PI / (3.0 * variance).sqrt();
+        let mut beta = 0.0;
+        let objective = |intercept: f64, inverse_scale: f64| -> f64 {
+            if !intercept.is_finite() || !inverse_scale.is_finite() || inverse_scale <= 0.0 {
+                return f64::INFINITY;
+            }
+            normalized
+                .iter()
+                .map(|&x| {
+                    let abs_z = inverse_scale.mul_add(x, intercept).abs();
+                    abs_z + 2.0 * (-abs_z).exp().ln_1p()
+                })
+                .sum::<f64>()
+                / n
+                - inverse_scale.ln()
+        };
+        let mut value = objective(beta, tau);
+        let mut converged = false;
+        for _ in 0..100 {
+            let mut g_beta = 0.0;
+            let mut g_tau = 0.0;
+            let mut h_beta_beta = 0.0;
+            let mut h_beta_tau = 0.0;
+            let mut h_tau_tau = 0.0;
+            for &x in &normalized {
+                let z = tau.mul_add(x, beta);
+                let score = (0.5 * z).tanh();
+                let exp_neg_abs_z = (-z.abs()).exp();
+                let curvature = 2.0 * exp_neg_abs_z / (1.0 + exp_neg_abs_z).powi(2);
+                g_beta += score;
+                g_tau += x * score;
+                h_beta_beta += curvature;
+                h_beta_tau += x * curvature;
+                h_tau_tau += x * x * curvature;
+            }
+            g_beta /= n;
+            g_tau = g_tau / n - 1.0 / tau;
+            h_beta_beta /= n;
+            h_beta_tau /= n;
+            h_tau_tau = h_tau_tau / n + 1.0 / (tau * tau);
+            if g_beta.abs().max((tau * g_tau).abs()) <= 1.0e-12 {
+                converged = true;
+                break;
+            }
+            let schur = h_tau_tau - h_beta_tau * h_beta_tau / h_beta_beta;
+            if !schur.is_finite() || schur <= 0.0 || h_beta_beta <= 0.0 {
+                return Err(FitError::NonConvergent(
+                    "Logistic likelihood Hessian is numerically singular".into(),
+                ));
+            }
+            let delta_tau = (g_tau - h_beta_tau * g_beta / h_beta_beta) / schur;
+            let delta_beta = (g_beta - h_beta_tau * delta_tau) / h_beta_beta;
+            let descent = g_beta * delta_beta + g_tau * delta_tau;
+            if !descent.is_finite() || descent <= 0.0 {
+                return Err(FitError::NonConvergent(
+                    "Logistic likelihood has no finite Newton descent direction".into(),
+                ));
+            }
+            let mut step = 1.0;
+            let mut accepted = false;
+            for _ in 0..64 {
+                let next_beta = beta - step * delta_beta;
+                let next_tau = tau - step * delta_tau;
+                let next_value = objective(next_beta, next_tau);
+                // Permit objective roundoff near the optimum; convergence
+                // still requires both independent likelihood scores to vanish.
+                if next_value.is_finite()
+                    && next_value
+                        <= value - 1.0e-4 * step * descent
+                            + 8.0 * f64::EPSILON * (1.0 + value.abs())
+                {
+                    beta = next_beta;
+                    tau = next_tau;
+                    value = next_value;
+                    accepted = true;
+                    break;
+                }
+                step *= 0.5;
+            }
+            if !accepted {
+                return Err(FitError::NonConvergent(
+                    "Logistic likelihood line search did not converge".into(),
+                ));
+            }
+        }
+        let fitted = Self {
+            loc: (mean - beta / tau).mul_add(radius, center),
+            scale: radius / tau,
+        };
+        if !converged
+            || !fitted.loc.is_finite()
+            || !fitted.scale.is_finite()
+            || fitted.scale <= 0.0
+        {
+            return Err(FitError::NonConvergent(
+                "Logistic MLE has no converged finite positive-scale solution".into(),
+            ));
+        }
+        Ok(fitted)
     }
 
     fn entropy(&self) -> f64 {
