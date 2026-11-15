@@ -6371,6 +6371,7 @@ struct NetcdfVariableHeader {
     dim_ids: Vec<usize>,
     attributes: Vec<NetcdfAttribute>,
     value_type: NetcdfType,
+    vsize: usize,
     begin: usize,
 }
 
@@ -6382,10 +6383,15 @@ struct NetcdfReader<'a> {
 
 /// Read a NetCDF classic or 64-bit-offset file from bytes.
 ///
-/// This covers the fixed-size NetCDF v3 subset exposed by
-/// `scipy.io.netcdf_file`: dimensions, global attributes, variables, and
-/// primitive numeric/character arrays. Unlimited record variables are rejected
-/// until the record-interleaving path is implemented.
+/// Supports fixed-size arrays and variables whose first dimension is the classic
+/// unlimited dimension. Record slabs are deinterleaved into each variable's
+/// row-major payload, including the unpadded single-record-variable convention.
+/// Zero-record files produce empty payloads for their record variables. Both
+/// classic (CDF-1) and 64-bit-offset (CDF-2) headers are accepted.
+///
+/// Malformed shapes, inconsistent record layouts, and truncated data return an
+/// error before record buffers are allocated. Indeterminate streaming record
+/// counts (`numrecs = 0xffffffff`) are not supported.
 pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
     if bytes.len() < 4 {
         return Err(IoError::InvalidFormat("NetCDF file too short".to_string()));
@@ -6408,6 +6414,12 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
         version,
     };
     let numrecs = read_netcdf_u32(&mut reader)? as usize;
+    if numrecs == u32::MAX as usize {
+        return Err(IoError::UnsupportedFeature(
+            "NetCDF streaming files with an indeterminate record count are not supported"
+                .to_string(),
+        ));
+    }
     let dimensions = read_netcdf_dimensions(&mut reader)?;
     if dimensions.iter().filter(|dim| dim.len.is_none()).count() > 1 {
         return Err(IoError::InvalidFormat(
@@ -6417,29 +6429,116 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
     let attributes = read_netcdf_attributes(&mut reader)?;
     let variable_headers = read_netcdf_variable_headers(&mut reader)?;
 
-    let mut variables = Vec::with_capacity(variable_headers.len());
-    for header in variable_headers {
-        let element_count = netcdf_element_count_for_dims(&dimensions, &header.dim_ids, numrecs)?;
-        if header
-            .dim_ids
-            .iter()
-            .any(|&dim_id| dimensions[dim_id].len.is_none())
-        {
-            return Err(IoError::UnsupportedFeature(
-                "NetCDF unlimited record variables are not supported".to_string(),
+    // vsize is redundant: derive it from the shape and primitive type instead
+    // of trusting a malformed header to control allocation or record strides.
+    // See the Unidata classic-format specification, "Note on vsize" and
+    // "Note on padding". SciPy writes an unpadded vsize for a lone small
+    // record variable, and zero for empty record variables; accept both.
+    let layouts = variable_headers
+        .iter()
+        .map(|header| netcdf_variable_layout(&dimensions, &header.dim_ids, header.value_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let record_variables = layouts.iter().filter(|layout| layout.is_record).count();
+    let record_stride = netcdf_record_stride(&layouts)?;
+    let mut first_record = None;
+    let mut next_record_offset = 0usize;
+    for (header, layout) in variable_headers.iter().zip(&layouts) {
+        if header.begin < reader.offset || !header.begin.is_multiple_of(4) {
+            return Err(IoError::InvalidFormat(format!(
+                "NetCDF variable '{}' has an invalid payload begin offset",
+                header.name
+            )));
+        }
+        if layout.is_record {
+            let vsize_ok = header.vsize == layout.padded_len
+                || (record_variables == 1 && header.vsize == layout.raw_len)
+                || (numrecs == 0 && header.vsize == 0);
+            if !vsize_ok {
+                return Err(IoError::InvalidFormat(format!(
+                    "NetCDF record variable '{}' has an inconsistent byte size",
+                    header.name
+                )));
+            }
+            // Empty SciPy files can point all record variables at EOF: no
+            // record slabs exist yet, so only validate interleaving when used.
+            if numrecs != 0 {
+                let start = *first_record.get_or_insert(header.begin);
+                if header.begin
+                    != start.checked_add(next_record_offset).ok_or_else(|| {
+                        IoError::InvalidFormat("NetCDF record offset overflowed usize".to_string())
+                    })?
+                {
+                    return Err(IoError::InvalidFormat(
+                        "NetCDF record variables are not laid out in header order".to_string(),
+                    ));
+                }
+                next_record_offset = next_record_offset
+                    .checked_add(layout.padded_len)
+                    .ok_or_else(|| {
+                        IoError::InvalidFormat("NetCDF record size overflowed usize".to_string())
+                    })?;
+            }
+        }
+    }
+    if let Some(start) = first_record {
+        let record_bytes = numrecs.checked_mul(record_stride).ok_or_else(|| {
+            IoError::InvalidFormat("NetCDF record data size overflowed usize".to_string())
+        })?;
+        let end = start.checked_add(record_bytes).ok_or_else(|| {
+            IoError::InvalidFormat("NetCDF record payload offset overflowed usize".to_string())
+        })?;
+        if end > bytes.len() {
+            return Err(IoError::InvalidFormat(
+                "NetCDF record data extends past file".to_string(),
             ));
         }
-        let raw_len = netcdf_value_raw_len(header.value_type, element_count)?;
-        let end = header.begin.checked_add(raw_len).ok_or_else(|| {
-            IoError::InvalidFormat("NetCDF variable payload offset overflowed usize".to_string())
-        })?;
-        let payload = bytes.get(header.begin..end).ok_or_else(|| {
-            IoError::InvalidFormat(format!(
-                "NetCDF variable '{}' payload extends past file",
-                header.name
-            ))
-        })?;
-        let data = decode_netcdf_values(header.value_type, payload, element_count, &header.name)?;
+        for (header, layout) in variable_headers.iter().zip(&layouts) {
+            if !layout.is_record {
+                let fixed_end = header.begin.checked_add(layout.padded_len).ok_or_else(|| {
+                    IoError::InvalidFormat("NetCDF fixed payload offset overflowed usize".to_string())
+                })?;
+                // Classic writers ordinarily put fixed data before records,
+                // but SciPy can put a scalar after the complete record area.
+                // Either disjoint interval is readable; a scalar inside any
+                // record remains an error, even when SciPy itself emitted it.
+                if header.begin < end && fixed_end > start {
+                    return Err(IoError::InvalidFormat(format!(
+                        "NetCDF fixed variable '{}' overlaps record data",
+                        header.name
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut variables = Vec::with_capacity(variable_headers.len());
+    for (header, layout) in variable_headers.into_iter().zip(layouts) {
+        let data = if layout.is_record {
+            let element_count = layout.elements.checked_mul(numrecs).ok_or_else(|| {
+                IoError::InvalidFormat("NetCDF record shape overflowed usize".to_string())
+            })?;
+            let raw_len = netcdf_value_raw_len(header.value_type, element_count)?;
+            let mut payload = Vec::with_capacity(raw_len);
+            for record in 0..numrecs {
+                // The complete record area was checked above, before allocation.
+                let start = header.begin + record * record_stride;
+                payload.extend_from_slice(&bytes[start..start + layout.raw_len]);
+            }
+            decode_netcdf_values(header.value_type, &payload, element_count, &header.name)?
+        } else {
+            let end = header.begin.checked_add(layout.raw_len).ok_or_else(|| {
+                IoError::InvalidFormat(
+                    "NetCDF variable payload offset overflowed usize".to_string(),
+                )
+            })?;
+            let payload = bytes.get(header.begin..end).ok_or_else(|| {
+                IoError::InvalidFormat(format!(
+                    "NetCDF variable '{}' payload extends past file",
+                    header.name
+                ))
+            })?;
+            decode_netcdf_values(header.value_type, payload, layout.elements, &header.name)?
+        };
         variables.push(NetcdfVariable {
             name: header.name,
             dim_ids: header.dim_ids,
@@ -6471,25 +6570,52 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
 pub static WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Write a fixed-size NetCDF classic file.
+/// Write a NetCDF classic file with fixed-size and unlimited record variables.
 ///
-/// The writer emits NetCDF classic v1 files and fails closed for unlimited
-/// dimensions or payload offsets that require the 64-bit-offset variant.
+/// The writer emits CDF-1, with fixed-size data followed by interleaved records.
+/// The unlimited dimension must be the first dimension of each record variable.
+/// The record count is inferred from the payloads, which must contain the same
+/// number of complete records; empty payloads encode a zero-record file.
+/// Payload offsets requiring the 64-bit-offset variant return an error.
 pub fn write_netcdf_classic(file: &NetcdfFile) -> Result<Vec<u8>, IoError> {
-    validate_netcdf_fixed_file(file)?;
+    let numrecs = validate_netcdf_file(file)?;
+    let layouts = file
+        .variables
+        .iter()
+        .map(|variable| {
+            netcdf_variable_layout(
+                &file.dimensions,
+                &variable.dim_ids,
+                variable.data.value_type(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let record_stride = netcdf_record_stride(&layouts)?;
+    let record_variables = layouts.iter().filter(|layout| layout.is_record).count();
 
     let placeholder_begins = vec![0usize; file.variables.len()];
-    let header = encode_netcdf_header(file, &placeholder_begins)?;
+    let header = encode_netcdf_header(file, &placeholder_begins, numrecs)?;
     let mut cursor = align4(header.len());
-    let mut begins = Vec::with_capacity(file.variables.len());
+    let mut begins = vec![0; file.variables.len()];
     let mut payloads = Vec::with_capacity(file.variables.len());
-    for variable in &file.variables {
+    for (idx, variable) in file.variables.iter().enumerate() {
         let payload = encode_netcdf_padded_values(&variable.data)?;
-        begins.push(cursor);
-        cursor = cursor.checked_add(payload.len()).ok_or_else(|| {
-            IoError::InvalidFormat("NetCDF output size overflowed usize".to_string())
-        })?;
+        if !layouts[idx].is_record {
+            begins[idx] = cursor;
+            cursor = cursor.checked_add(payload.len()).ok_or_else(|| {
+                IoError::InvalidFormat("NetCDF output size overflowed usize".to_string())
+            })?;
+        }
         payloads.push(payload);
+    }
+    let record_start = cursor;
+    for (idx, layout) in layouts.iter().enumerate() {
+        if layout.is_record {
+            begins[idx] = cursor;
+            cursor = cursor.checked_add(layout.padded_len).ok_or_else(|| {
+                IoError::InvalidFormat("NetCDF record offset overflowed usize".to_string())
+            })?;
+        }
     }
     if begins.iter().any(|&begin| u32::try_from(begin).is_err()) {
         return Err(IoError::UnsupportedFeature(
@@ -6497,12 +6623,32 @@ pub fn write_netcdf_classic(file: &NetcdfFile) -> Result<Vec<u8>, IoError> {
         ));
     }
 
-    let mut out = encode_netcdf_header(file, &begins)?;
+    let mut out = encode_netcdf_header(file, &begins, numrecs)?;
     while out.len() < align4(out.len()) {
         out.push(0);
     }
-    for payload in payloads {
-        out.extend_from_slice(&payload);
+    for (layout, payload) in layouts.iter().zip(&payloads) {
+        if !layout.is_record {
+            out.extend_from_slice(payload);
+        }
+    }
+    let output_len = numrecs
+        .checked_mul(record_stride)
+        .and_then(|len| record_start.checked_add(len))
+        .ok_or_else(|| IoError::InvalidFormat("NetCDF output size overflowed usize".to_string()))?;
+    out.try_reserve_exact(output_len - out.len()).map_err(|_| {
+        IoError::InvalidFormat("NetCDF output is too large to allocate".to_string())
+    })?;
+    for record in 0..numrecs {
+        for (layout, payload) in layouts.iter().zip(&payloads) {
+            if layout.is_record {
+                let start = record * layout.raw_len;
+                out.extend_from_slice(&payload[start..start + layout.raw_len]);
+                if record_variables > 1 {
+                    out.resize(out.len() + layout.padded_len - layout.raw_len, 0);
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -6565,9 +6711,63 @@ fn netcdf_value_raw_len(value_type: NetcdfType, count: usize) -> Result<usize, I
 
 fn netcdf_padded_value_len(value: &NetcdfValue) -> Result<usize, IoError> {
     let raw_len = netcdf_value_raw_len(value.value_type(), value.len())?;
+    netcdf_padded_len(raw_len)
+}
+
+fn netcdf_padded_len(raw_len: usize) -> Result<usize, IoError> {
     raw_len
         .checked_add((4 - (raw_len % 4)) % 4)
         .ok_or_else(|| IoError::InvalidFormat("NetCDF padded value length overflowed usize".into()))
+}
+
+/// One fixed variable, or one slab of a record variable. Shape validation is
+/// shared by reading and writing, so an unlimited dimension is never mistaken
+/// for an ordinary zero-length axis.
+struct NetcdfVariableLayout {
+    is_record: bool,
+    elements: usize,
+    raw_len: usize,
+    padded_len: usize,
+}
+
+fn netcdf_variable_layout(
+    dimensions: &[NetcdfDimension],
+    dim_ids: &[usize],
+    value_type: NetcdfType,
+) -> Result<NetcdfVariableLayout, IoError> {
+    // Counting one record validates all dimension IDs and multiplication before
+    // callers inspect the leading dimension or process an empty record area.
+    let elements = netcdf_element_count_for_dims(dimensions, dim_ids, 1)?;
+    let is_record = dim_ids
+        .first()
+        .is_some_and(|&dim_id| dimensions[dim_id].len.is_none());
+    let raw_len = netcdf_value_raw_len(value_type, elements)?;
+    Ok(NetcdfVariableLayout {
+        is_record,
+        elements,
+        raw_len,
+        padded_len: netcdf_padded_len(raw_len)?,
+    })
+}
+
+fn netcdf_record_stride(layouts: &[NetcdfVariableLayout]) -> Result<usize, IoError> {
+    let mut records = layouts.iter().filter(|layout| layout.is_record);
+    let Some(first) = records.next() else {
+        return Ok(0);
+    };
+    let Some(second) = records.next() else {
+        // With one record variable the small primitive types have no padding
+        // between records, even though the standard header vsize is padded.
+        return Ok(first.raw_len);
+    };
+    std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(records)
+        .try_fold(0usize, |size, layout| {
+            size.checked_add(layout.padded_len).ok_or_else(|| {
+                IoError::InvalidFormat("NetCDF record size overflowed usize".to_string())
+            })
+        })
 }
 
 fn read_netcdf_u32(reader: &mut NetcdfReader<'_>) -> Result<u32, IoError> {
@@ -6634,6 +6834,13 @@ fn read_netcdf_list_count(
             "NetCDF {context} list tag {tag} does not match expected {expected_tag}"
         )));
     }
+    // Every entry needs at least a length word. Reject impossible counts before
+    // Vec::with_capacity sees an attacker-controlled header value.
+    if count > reader.bytes.len().saturating_sub(reader.offset) / 4 {
+        return Err(IoError::InvalidFormat(format!(
+            "truncated NetCDF {context} list"
+        )));
+    }
     Ok(count)
 }
 
@@ -6687,19 +6894,25 @@ fn read_netcdf_variable_headers(
     for _ in 0..count {
         let name = read_netcdf_name(reader, "variable")?;
         let dim_count = read_netcdf_u32(reader)? as usize;
+        if dim_count > reader.bytes.len().saturating_sub(reader.offset) / 4 {
+            return Err(IoError::InvalidFormat(
+                "truncated NetCDF variable dimension list".to_string(),
+            ));
+        }
         let mut dim_ids = Vec::with_capacity(dim_count);
         for _ in 0..dim_count {
             dim_ids.push(read_netcdf_u32(reader)? as usize);
         }
         let attributes = read_netcdf_attributes(reader)?;
         let value_type = netcdf_type_from_code(read_netcdf_u32(reader)?)?;
-        let _vsize = read_netcdf_u32(reader)?;
+        let vsize = read_netcdf_u32(reader)? as usize;
         let begin = read_netcdf_begin(reader)?;
         variables.push(NetcdfVariableHeader {
             name,
             dim_ids,
             attributes,
             value_type,
+            vsize,
             begin,
         });
     }
@@ -6715,19 +6928,24 @@ fn netcdf_element_count_for_dims(
         return Ok(1);
     }
     let mut count = 1usize;
-    for &dim_id in dim_ids {
+    for (axis, &dim_id) in dim_ids.iter().enumerate() {
         let dimension = dimensions.get(dim_id).ok_or_else(|| {
             IoError::InvalidFormat(format!(
                 "NetCDF variable references bad dimension id {dim_id}"
             ))
         })?;
-        let dim_len = dimension.len.unwrap_or(numrecs);
-        if dim_len == 0 {
+        if dimension.len.is_none() && axis != 0 {
+            return Err(IoError::InvalidFormat(
+                "NetCDF unlimited dimension must be the first variable dimension".to_string(),
+            ));
+        }
+        if dimension.len == Some(0) {
             return Err(IoError::InvalidFormat(format!(
                 "NetCDF dimension '{}' has zero length",
                 dimension.name
             )));
         }
+        let dim_len = dimension.len.unwrap_or(numrecs);
         count = count.checked_mul(dim_len).ok_or_else(|| {
             IoError::InvalidFormat("NetCDF variable shape overflowed usize".to_string())
         })?;
@@ -6804,15 +7022,15 @@ fn validate_netcdf_name(name: &str, context: &str) -> Result<(), IoError> {
     Ok(())
 }
 
-fn validate_netcdf_fixed_file(file: &NetcdfFile) -> Result<(), IoError> {
+fn validate_netcdf_file(file: &NetcdfFile) -> Result<usize, IoError> {
     let unlimited_count = file
         .dimensions
         .iter()
         .filter(|dimension| dimension.len.is_none())
         .count();
-    if unlimited_count > 0 {
-        return Err(IoError::UnsupportedFeature(
-            "NetCDF writer does not yet support unlimited record dimensions".to_string(),
+    if unlimited_count > 1 {
+        return Err(IoError::InvalidFormat(
+            "NetCDF classic permits at most one unlimited dimension".to_string(),
         ));
     }
     for dimension in &file.dimensions {
@@ -6827,21 +7045,46 @@ fn validate_netcdf_fixed_file(file: &NetcdfFile) -> Result<(), IoError> {
     for attribute in &file.attributes {
         validate_netcdf_name(&attribute.name, "attribute")?;
     }
+    let mut numrecs = None;
     for variable in &file.variables {
         validate_netcdf_name(&variable.name, "variable")?;
         for attribute in &variable.attributes {
             validate_netcdf_name(&attribute.name, "attribute")?;
         }
-        let expected = netcdf_element_count_for_dims(&file.dimensions, &variable.dim_ids, 0)?;
-        if variable.data.len() != expected {
+        let layout = netcdf_variable_layout(
+            &file.dimensions,
+            &variable.dim_ids,
+            variable.data.value_type(),
+        )?;
+        if layout.is_record {
+            if !variable.data.len().is_multiple_of(layout.elements) {
+                return Err(IoError::InvalidFormat(format!(
+                    "NetCDF record variable '{}' does not contain complete records",
+                    variable.name
+                )));
+            }
+            let count = variable.data.len() / layout.elements;
+            if numrecs.is_some_and(|expected| count != expected) {
+                return Err(IoError::InvalidFormat(
+                    "NetCDF record variables must contain the same number of records".to_string(),
+                ));
+            }
+            if count >= u32::MAX as usize {
+                return Err(IoError::UnsupportedFeature(
+                    "NetCDF record count exceeds the classic format limit".to_string(),
+                ));
+            }
+            numrecs = Some(count);
+        } else if variable.data.len() != layout.elements {
             return Err(IoError::InvalidFormat(format!(
-                "NetCDF variable '{}' expected {expected} values from its dimensions but found {}",
+                "NetCDF variable '{}' expected {} values from its dimensions but found {}",
                 variable.name,
+                layout.elements,
                 variable.data.len()
             )));
         }
     }
-    Ok(())
+    Ok(numrecs.unwrap_or(0))
 }
 
 fn write_netcdf_u32(out: &mut Vec<u8>, value: usize, context: &str) -> Result<(), IoError> {
@@ -6862,7 +7105,11 @@ fn write_netcdf_name(out: &mut Vec<u8>, name: &str, context: &str) -> Result<(),
     Ok(())
 }
 
-fn encode_netcdf_header(file: &NetcdfFile, begins: &[usize]) -> Result<Vec<u8>, IoError> {
+fn encode_netcdf_header(
+    file: &NetcdfFile,
+    begins: &[usize],
+    numrecs: usize,
+) -> Result<Vec<u8>, IoError> {
     if begins.len() != file.variables.len() {
         return Err(IoError::InvalidFormat(
             "NetCDF begin-offset count does not match variable count".to_string(),
@@ -6871,7 +7118,7 @@ fn encode_netcdf_header(file: &NetcdfFile, begins: &[usize]) -> Result<Vec<u8>, 
     let mut out = Vec::new();
     out.extend_from_slice(b"CDF");
     out.push(1);
-    out.extend_from_slice(&0u32.to_be_bytes());
+    write_netcdf_u32(&mut out, numrecs, "record count")?;
 
     if file.dimensions.is_empty() {
         out.extend_from_slice(&0u32.to_be_bytes());
@@ -6881,11 +7128,7 @@ fn encode_netcdf_header(file: &NetcdfFile, begins: &[usize]) -> Result<Vec<u8>, 
         write_netcdf_u32(&mut out, file.dimensions.len(), "dimension count")?;
         for dimension in &file.dimensions {
             write_netcdf_name(&mut out, &dimension.name, "dimension")?;
-            let len = dimension.len.ok_or_else(|| {
-                IoError::UnsupportedFeature(
-                    "NetCDF classic writer does not support unlimited dimensions".to_string(),
-                )
-            })?;
+            let len = dimension.len.unwrap_or(0);
             write_netcdf_u32(&mut out, len, "dimension length")?;
         }
     }
@@ -6912,7 +7155,14 @@ fn encode_netcdf_header(file: &NetcdfFile, begins: &[usize]) -> Result<Vec<u8>, 
             }
             encode_netcdf_attribute_list(&mut out, &variable.attributes)?;
             out.extend_from_slice(&netcdf_type_code(variable.data.value_type()).to_be_bytes());
-            let value_size = if WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING
+            let layout = netcdf_variable_layout(
+                &file.dimensions,
+                &variable.dim_ids,
+                variable.data.value_type(),
+            )?;
+            let value_size = if layout.is_record {
+                layout.padded_len
+            } else if WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 encode_netcdf_padded_values(&variable.data)?.len()
@@ -11421,7 +11671,7 @@ mod tests {
     }
 
     #[test]
-    fn netcdf_classic_writer_rejects_unlimited_dimension() {
+    fn netcdf_classic_empty_unlimited_dimension_roundtrips() {
         let file = NetcdfFile {
             dimensions: vec![NetcdfDimension {
                 name: "time".to_string(),
@@ -11430,8 +11680,296 @@ mod tests {
             attributes: Vec::new(),
             variables: Vec::new(),
         };
-        let err = write_netcdf_classic(&file).expect_err("unlimited dims are follow-on work");
-        assert!(matches!(err, IoError::UnsupportedFeature(_)));
+        let bytes = write_netcdf_classic(&file).expect("empty unlimited dimension");
+        assert_eq!(&bytes[4..8], &[0; 4]);
+        assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+    }
+
+    fn netcdf_record_fixture() -> NetcdfFile {
+        NetcdfFile {
+            dimensions: vec![
+                NetcdfDimension {
+                    name: "time".into(),
+                    len: None,
+                },
+                NetcdfDimension {
+                    name: "station".into(),
+                    len: Some(3),
+                },
+            ],
+            attributes: vec![NetcdfAttribute {
+                name: "title".into(),
+                value: NetcdfValue::Char("record data".into()),
+            }],
+            // Interspersed fixed variables must still precede the record area.
+            variables: vec![
+                NetcdfVariable {
+                    name: "temperature".into(),
+                    dim_ids: vec![0, 1],
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Double(vec![280.0, 281.0, 282.0, 283.0, 284.0, 285.0]),
+                },
+                NetcdfVariable {
+                    name: "station_id".into(),
+                    dim_ids: vec![1],
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Int(vec![10, 20, 30]),
+                },
+                NetcdfVariable {
+                    name: "flags".into(),
+                    dim_ids: vec![0],
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Byte(vec![-1, 7]),
+                },
+                NetcdfVariable {
+                    name: "offset".into(),
+                    dim_ids: Vec::new(),
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Float(vec![1.25]),
+                },
+                NetcdfVariable {
+                    name: "counts".into(),
+                    dim_ids: vec![0, 1],
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Short(vec![-2, 3, 4, 100, -200, 300]),
+                },
+                NetcdfVariable {
+                    name: "labels".into(),
+                    dim_ids: vec![0, 1],
+                    attributes: Vec::new(),
+                    data: NetcdfValue::Char("abcXYZ".into()),
+                },
+            ],
+        }
+    }
+
+    fn netcdf_test_headers(bytes: &[u8]) -> Vec<NetcdfVariableHeader> {
+        let mut reader = NetcdfReader {
+            bytes,
+            offset: 8,
+            version: bytes[3],
+        };
+        read_netcdf_dimensions(&mut reader).unwrap();
+        read_netcdf_attributes(&mut reader).unwrap();
+        read_netcdf_variable_headers(&mut reader).unwrap()
+    }
+
+    #[test]
+    fn netcdf_classic_interleaves_records_after_fixed_data() {
+        let file = netcdf_record_fixture();
+        let bytes = write_netcdf_classic(&file).unwrap();
+        assert_eq!(&bytes[4..8], &2_u32.to_be_bytes());
+        assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+        let headers = netcdf_test_headers(&bytes);
+        let start = headers[0].begin;
+        let stride = 40;
+        assert_eq!(headers[2].begin, start + 24);
+        assert_eq!(headers[4].begin, start + 28);
+        assert_eq!(headers[5].begin, start + 36);
+        assert_eq!(headers[1].begin + 12, headers[3].begin);
+        assert_eq!(headers[3].begin + 4, start);
+        assert_eq!(bytes.len(), start + 2 * stride);
+        assert_eq!(bytes[start + 24], 255);
+        assert_eq!(bytes[start + stride + 24], 7);
+        assert_eq!(&bytes[start + 36..start + 39], b"abc");
+        assert_eq!(&bytes[start + stride + 36..start + stride + 39], b"XYZ");
+    }
+
+    #[test]
+    fn netcdf_classic_single_record_variable_has_no_inter_record_padding() {
+        for data in [
+            NetcdfValue::Byte(vec![-1, 0, 7]),
+            NetcdfValue::Char("aZ!".into()),
+            NetcdfValue::Short(vec![-2, 3, 300]),
+        ] {
+            let raw_len = netcdf_type_size(data.value_type());
+            let file = NetcdfFile {
+                dimensions: vec![NetcdfDimension {
+                    name: "time".into(),
+                    len: None,
+                }],
+                attributes: Vec::new(),
+                variables: vec![NetcdfVariable {
+                    name: "sample".into(),
+                    dim_ids: vec![0],
+                    attributes: Vec::new(),
+                    data,
+                }],
+            };
+            let mut bytes = write_netcdf_classic(&file).unwrap();
+            let header = &netcdf_test_headers(&bytes)[0];
+            assert_eq!(header.vsize, 4);
+            assert_eq!(bytes.len(), header.begin + 3 * raw_len);
+            assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+            // SciPy stores the unpadded size in the header for a lone record
+            // variable, unlike the padded vsize in the standard specification.
+            let vsize_offset = header.begin - 8;
+            bytes[vsize_offset..vsize_offset + 4].copy_from_slice(&(raw_len as u32).to_be_bytes());
+            assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+        }
+    }
+
+    #[test]
+    fn netcdf_classic_zero_records_preserve_fixed_payloads() {
+        let mut file = netcdf_record_fixture();
+        file.variables[0].data = NetcdfValue::Double(Vec::new());
+        file.variables[2].data = NetcdfValue::Byte(Vec::new());
+        file.variables[4].data = NetcdfValue::Short(Vec::new());
+        file.variables[5].data = NetcdfValue::Char(String::new());
+        let bytes = write_netcdf_classic(&file).unwrap();
+        assert_eq!(&bytes[4..8], &[0; 4]);
+        assert_eq!(bytes.len(), netcdf_test_headers(&bytes)[0].begin);
+        assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+    }
+
+    #[test]
+    fn netcdf_record_reader_accepts_disjoint_trailing_scalars_but_rejects_overlap() {
+        for records in [1, 2] {
+            let file = NetcdfFile {
+                dimensions: vec![NetcdfDimension {
+                    name: "time".into(),
+                    len: None,
+                }],
+                attributes: Vec::new(),
+                variables: vec![
+                    NetcdfVariable {
+                        name: "sample".into(),
+                        dim_ids: vec![0],
+                        attributes: Vec::new(),
+                        data: NetcdfValue::Int([11, 22][..records].into()),
+                    },
+                    NetcdfVariable {
+                        name: "offset".into(),
+                        dim_ids: Vec::new(),
+                        attributes: Vec::new(),
+                        data: NetcdfValue::Float(vec![-0.0]),
+                    },
+                ],
+            };
+            let start = encode_netcdf_header(&file, &[0, 0], records).unwrap().len();
+            // SciPy 1.17.1 places scalar fixed variables after records when
+            // writing a one-record file. Read that disjoint layout faithfully.
+            let mut bytes =
+                encode_netcdf_header(&file, &[start, start + 4 * records], records).unwrap();
+            bytes.extend(encode_netcdf_padded_values(&file.variables[0].data).unwrap());
+            bytes.extend(encode_netcdf_padded_values(&file.variables[1].data).unwrap());
+            assert_eq!(read_netcdf_classic(&bytes).unwrap(), file);
+            assert!(matches!(
+                read_netcdf_classic(&bytes[..bytes.len() - 1]),
+                Err(IoError::InvalidFormat(_))
+            ));
+
+            // The same SciPy writer places its scalar inside record two for
+            // multi-record files, corrupting that record. Do not accept such
+            // an overlapping layout just because the incumbent emits it.
+            let overlapping =
+                encode_netcdf_header(&file, &[start, start + 4 * (records - 1)], records).unwrap();
+            bytes[..start].copy_from_slice(&overlapping);
+            assert!(matches!(
+                read_netcdf_classic(&bytes),
+                Err(IoError::InvalidFormat(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn netcdf_classic_record_writer_rejects_inconsistent_shapes() {
+        let file = netcdf_record_fixture();
+        let mut partial = file.clone();
+        partial.variables[0].data = NetcdfValue::Double(vec![0.0; 5]);
+        assert!(matches!(
+            write_netcdf_classic(&partial),
+            Err(IoError::InvalidFormat(_))
+        ));
+        let mut unequal = file.clone();
+        unequal.variables[2].data = NetcdfValue::Byte(vec![1]);
+        assert!(matches!(
+            write_netcdf_classic(&unequal),
+            Err(IoError::InvalidFormat(_))
+        ));
+        let mut misplaced = file.clone();
+        misplaced.variables[0].dim_ids = vec![1, 0];
+        assert!(matches!(
+            write_netcdf_classic(&misplaced),
+            Err(IoError::InvalidFormat(_))
+        ));
+        let mut multiple = file.clone();
+        multiple.dimensions[1].len = None;
+        assert!(matches!(
+            write_netcdf_classic(&multiple),
+            Err(IoError::InvalidFormat(_))
+        ));
+        let mut invalid_dim = file;
+        invalid_dim.variables[0].dim_ids = vec![9];
+        assert!(matches!(
+            write_netcdf_classic(&invalid_dim),
+            Err(IoError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn netcdf_classic_record_reader_rejects_truncation_and_huge_counts() {
+        let bytes = write_netcdf_classic(&netcdf_record_fixture()).unwrap();
+        for missing in [1, 2, 4, 17, 40] {
+            assert!(matches!(
+                read_netcdf_classic(&bytes[..bytes.len() - missing]),
+                Err(IoError::InvalidFormat(_))
+            ));
+        }
+        let mut oversized = bytes.clone();
+        oversized[4..8].copy_from_slice(&(u32::MAX - 1).to_be_bytes());
+        assert!(matches!(
+            read_netcdf_classic(&oversized),
+            Err(IoError::InvalidFormat(_))
+        ));
+        oversized[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            read_netcdf_classic(&oversized),
+            Err(IoError::UnsupportedFeature(_))
+        ));
+        let mut huge_list = bytes;
+        huge_list[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            read_netcdf_classic(&huge_list),
+            Err(IoError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn netcdf_record_reader_validates_offsets_sizes_and_cdf2() {
+        let file = NetcdfFile {
+            dimensions: vec![NetcdfDimension {
+                name: "time".into(),
+                len: None,
+            }],
+            attributes: Vec::new(),
+            variables: vec![NetcdfVariable {
+                name: "sample".into(),
+                dim_ids: vec![0],
+                attributes: Vec::new(),
+                data: NetcdfValue::Short(vec![-2, 3, 300]),
+            }],
+        };
+        let bytes = write_netcdf_classic(&file).unwrap();
+        let begin = netcdf_test_headers(&bytes)[0].begin;
+        let mut bad_size = bytes.clone();
+        bad_size[begin - 8..begin - 4].copy_from_slice(&8_u32.to_be_bytes());
+        assert!(matches!(
+            read_netcdf_classic(&bad_size),
+            Err(IoError::InvalidFormat(_))
+        ));
+        let mut bad_begin = bytes.clone();
+        bad_begin[begin - 4..begin].copy_from_slice(&4_u32.to_be_bytes());
+        assert!(matches!(
+            read_netcdf_classic(&bad_begin),
+            Err(IoError::InvalidFormat(_))
+        ));
+        // CDF-2 widens begin offsets to 64 bits; numrecs and vsize stay 32-bit.
+        let mut cdf2 = bytes[..begin - 4].to_vec();
+        cdf2[3] = 2;
+        cdf2.extend_from_slice(&((begin + 4) as u64).to_be_bytes());
+        cdf2.extend_from_slice(&bytes[begin..]);
+        assert_eq!(read_netcdf_classic(&cdf2).unwrap(), file);
     }
 
     /// Tiny canonical HB file: 3x3 RUA, 4 nonzeros at (0,0)=1.0, (1,1)=2.0,
