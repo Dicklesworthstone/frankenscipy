@@ -7084,7 +7084,8 @@ impl NormInvGauss {
     }
 
     fn gamma(&self) -> f64 {
-        (self.a * self.a - self.b * self.b).sqrt()
+        // sqrt((a-|b|)*(a+|b|)), without overflowing either square or sum.
+        (self.a - self.b.abs()).sqrt() * self.a.sqrt() * (1.0 + self.b.abs() / self.a).sqrt()
     }
 }
 
@@ -7144,35 +7145,43 @@ fn illinois_root_increasing(
 
 impl ContinuousDistribution for NormInvGauss {
     fn pdf(&self, x: f64) -> f64 {
-        if !x.is_finite() {
-            return 0.0;
-        }
-        let a = self.a;
-        let b = self.b;
-        let gamma = self.gamma();
-        let q = (1.0 + x * x).sqrt();
-        let k1_arg = a * q;
-        let k1_val = fsci_special::bessel::k1_scalar(k1_arg);
-        (a / std::f64::consts::PI) * k1_val * (b * x + gamma).exp() / q
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(a) − ln(π) + ln K₁(a·q) + (b·x+γ) − ln(q), q=√(1+x²); ln K₁(z) =
-        // ln(kve(1,z)) − z (kve is properly exp-scaled, finite past z≈745 where
-        // K₁ underflows and the pdf collapses to NaN/0). frankenscipy-7m3xk
+        if x.is_nan() {
+            return f64::NAN;
+        }
         if !x.is_finite() {
             return f64::NEG_INFINITY;
         }
         let a = self.a;
-        let b = self.b;
-        let gamma = self.gamma();
-        let q = (1.0 + x * x).sqrt();
+        let q = x.hypot(1.0);
+        let log_q = q.ln();
+        let skew = self.b / a;
+        let normal = self.gamma() / a;
+        let projection = skew.mul_add(x, normal);
+        // gamma+b*x-a*q is nonpositive. Rationalizing the difference of
+        // norms preserves its small value near the mode at large a, rather
+        // than subtracting terms of order a or forming inf-inf.
+        let gap = if projection <= 0.0 {
+            q - projection
+        } else {
+            let orthogonal = (-normal).mul_add(x, skew);
+            (orthogonal / q) * orthogonal / (1.0 + projection / q)
+        };
+        let exponent = -a * gap;
         let aq = a * q;
-        let kve = fsci_special::bessel::kve_scalar(1.0, aq);
-        if kve <= 0.0 || !kve.is_finite() {
-            return f64::NEG_INFINITY;
+        if aq < 1.0e-100 {
+            // K1(z)~1/z. Cancel a analytically before the Bessel reciprocal
+            // can overflow; omitted corrections are below f64 resolution.
+            -PI.ln() - 2.0 * log_q + aq + exponent
+        } else if aq > 1.0e100 {
+            // k1e(z)~sqrt(pi/(2*z)); log(a*q) must not form the product.
+            0.5 * (a.ln() - (2.0 * PI).ln()) - 1.5 * log_q + exponent
+        } else {
+            a.ln() - PI.ln() + fsci_special::bessel::k1e_scalar(aq).ln() - log_q + exponent
         }
-        a.ln() - std::f64::consts::PI.ln() + (kve.ln() - aq) + (b * x + gamma) - q.ln()
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -7270,55 +7279,20 @@ impl ContinuousDistribution for NormInvGauss {
 
     fn var(&self) -> f64 {
         let gamma = self.gamma();
-        self.a * self.a / (gamma * gamma * gamma)
+        (self.a / gamma).powi(2) / gamma
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self {
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
             a: f64::NAN,
             b: f64::NAN,
-        }
+        })
     }
 
+    /// Maximum likelihood with fixed location zero and scale one, matching
+    /// `scipy.stats.norminvgauss.fit(data, floc=0, fscale=1)`.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // Method-of-moments fit (standardized NIG, loc=0/scale=1), consistent
-        // with the crate's pragmatic per-distribution estimators. With
-        // gamma = sqrt(a^2 - b^2): E[X] = b/gamma and Var[X] = a^2/gamma^3.
-        // Letting s = 1 + mean^2, these invert in closed form to
-        //   gamma = s/var,  a = s^1.5/var,  b = mean*s/var
-        // (NIG support is all of R, so negative observations are valid).
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let n = data.len() as f64;
-        let mut sum = 0.0;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "NormInvGauss data contains non-finite value: {x}"
-                )));
-            }
-            sum += x;
-        }
-        let mean = sum / n;
-        let var = data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
-        if !var.is_finite() || var <= 0.0 {
-            return Err(FitError::NonConvergent(
-                "NormInvGauss fit requires a positive sample variance".to_owned(),
-            ));
-        }
-        let s = 1.0 + mean * mean;
-        let a = s.powf(1.5) / var;
-        let b = mean * s / var;
-        if !a.is_finite() || a <= 0.0 || !b.is_finite() || b.abs() >= a {
-            return Err(FitError::NonConvergent(format!(
-                "NormInvGauss MoM produced invalid parameters: a={a}, b={b}"
-            )));
-        }
-        Ok(Self { a, b })
+        mle::norminvgauss_shapes_mle(data).map(|(a, b)| Self { a, b })
     }
 
     fn skewness(&self) -> f64 {
@@ -21849,23 +21823,25 @@ impl Rice {
 
 impl ContinuousDistribution for Rice {
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 {
-            return 0.0;
-        }
-        let b = self.b;
-        // f(x) = x * exp(-(x² + b²)/2) * I₀(b*x)
-        x * (-(x * x + b * b) / 2.0).exp() * modified_bessel_i(0.0, b * x)
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // ln(x) − (x²+b²)/2 + ln I₀(b·x), with ln I₀(z) = log_ive(0,z) + z;
-        // finite far into the tail where the pdf's I₀(b·x) overflows. frankenscipy-7m3xk
-        if x < 0.0 {
+        if x <= 0.0 || x == f64::INFINITY {
             return f64::NEG_INFINITY;
         }
         let b = self.b;
         let bx = b * x;
-        x.ln() - (x * x + b * b) / 2.0 + fsci_special::log_ive_scalar(0.0, bx) + bx
+        let difference = x - b;
+        if bx.is_infinite() {
+            // i0e(b*x)~1/sqrt(2*pi*b*x); the finite product may overflow
+            // even though the density near x=b tends to a normal density.
+            0.5 * (x.ln() - b.ln() - (2.0 * PI).ln()) - 0.5 * difference * difference
+        } else {
+            // Completing the square avoids cancellation of b*x against
+            // (x*x+b*b)/2 and avoids the unscaled Bessel overflow entirely.
+            x.ln() - 0.5 * difference * difference + fsci_special::i0e_scalar(bx).ln()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -21968,44 +21944,11 @@ impl ContinuousDistribution for Rice {
         )
     }
 
+    /// Maximum likelihood with location zero and scale one, matching
+    /// `scipy.stats.rice.fit(data, floc=0, fscale=1)`. Low-power positive
+    /// samples have the valid Rayleigh boundary solution b=0.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        // Standardized Rice (σ=1) has E[X²] = 2 + b².
-        // Closed-form: b_hat = sqrt(max(0, sample_E[X²] - 2)).
-        let mut sum2 = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Rice data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Rice support is [0, ∞); got {x}"
-                )));
-            }
-            sum2 += x * x;
-            count += 1;
-        }
-        let m2 = sum2 / count as f64;
-        if m2 < 2.0 {
-            return Err(FitError::UnsupportedData(format!(
-                "Rice MoM (σ=1) requires sample E[x²] ≥ 2; got {m2}"
-            )));
-        }
-        let b = (m2 - 2.0).sqrt();
-        if !b.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "Rice MoM produced non-finite b: {b}"
-            )));
-        }
-        Ok(Self { b })
+        mle::rice_shape_mle(data).map(|b| Self { b })
     }
 }
 
@@ -103179,31 +103122,33 @@ mod tests {
     }
 
     #[test]
-    fn norm_inv_gauss_fit_round_trips_moments() {
-        // MoM is an exact closed-form inversion: NIG(a,b) built from the fit
-        // must reproduce the sample mean and variance. Data spans negatives
-        // (NIG support is all of R).
+    fn norm_inv_gauss_fit_maximizes_the_profile_likelihood() {
+        // Independent 65-digit Bessel score root at the exact f64 data.
+        // The skew score still reproduces the mean, but the shape maximizes
+        // likelihood instead of merely reproducing the sample variance.
         let data = [-1.0_f64, 0.5, 2.0, -0.3, 1.5, 0.8, -2.1, 3.0, 1.1, 0.2];
         let n = data.len() as f64;
         let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
         let fitted = NormInvGauss::try_fit(&data).expect("fit");
-        // Closed-form parameters.
-        let s = 1.0 + mean * mean;
         assert!(
-            (fitted.a - s.powf(1.5) / var).abs() < 1e-9,
+            (fitted.a - 0.511_973_017_685_176_8).abs() < 1e-12,
             "a: {}",
             fitted.a
         );
-        assert!((fitted.b - mean * s / var).abs() < 1e-9, "b: {}", fitted.b);
-        assert!(fitted.a > fitted.b.abs(), "must satisfy a > |b|");
-        // Round-trip: fitted distribution reproduces the sample moments.
         assert!(
-            (fitted.mean() - mean).abs() < 1e-9,
+            (fitted.b - 0.253_530_596_808_591_3).abs() < 1e-12,
+            "b: {}",
+            fitted.b
+        );
+        assert!(fitted.a > fitted.b.abs(), "must satisfy a > |b|");
+        assert!(
+            (fitted.mean() - mean).abs() < 1e-13,
             "mean: {}",
             fitted.mean()
         );
-        assert!((fitted.var() - var).abs() < 1e-9, "var: {}", fitted.var());
+        let nll = -data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        assert!((nll - 18.929_628_467_574_305).abs() < 1e-12, "NLL: {nll}");
+        assert_eq!(NormInvGauss::fit(&data), fitted);
     }
 
     #[test]
@@ -103224,37 +103169,38 @@ mod tests {
     }
 
     #[test]
-    fn rice_fit_metamorphic_e_x_sq_inverts_b() {
-        // For Rice(b) at σ=1, E[X²] = 2 + b², so b_hat = sqrt(E[x²] - 2).
+    fn rice_fit_maximizes_the_bessel_likelihood() {
+        // Independent 65-digit root of mean(x*I1(b*x)/I0(b*x))=b.
         let data = [1.5_f64, 2.0, 2.5, 1.8, 2.2, 1.7];
-        let n = data.len() as f64;
-        let m2 = data.iter().map(|x| x * x).sum::<f64>() / n;
         let fitted = Rice::try_fit(&data).expect("fit");
-        let expected = (m2 - 2.0).sqrt();
+        let expected = 1.592_952_485_197_401_5;
         assert!(
             (fitted.b - expected).abs() < 1e-13,
-            "Rice MoM b-inversion: got {}, expected {expected}",
+            "Rice MLE: got {}, expected {expected}",
             fitted.b
         );
+        let nll = -data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        assert!((nll - 5.338_886_178_802_261).abs() < 1e-13, "NLL: {nll}");
     }
 
     #[test]
     fn rice_fit_pinned_synthetic_value() {
-        // Construct samples whose E[x²] = 5, then b_hat must be sqrt(3).
+        // Repeated positive data can identify b when the scale stays fixed.
         let data: Vec<f64> = (0..1000).map(|_| 5.0_f64.sqrt()).collect();
         let fitted = Rice::try_fit(&data).expect("fit");
-        let expected = 3.0_f64.sqrt();
+        let expected = 1.960_636_775_996_733;
         assert!(
             (fitted.b - expected).abs() < 1e-12,
-            "Rice MoM at E[x²]=5: got {}, expected {expected}",
+            "Rice MLE at E[x²]=5: got {}, expected {expected}",
             fitted.b
         );
     }
 
     #[test]
-    fn rice_fit_rejects_low_e_x_sq() {
-        // All-zero data → E[x²] = 0 < 2 → impossible for Rice with σ=1.
-        let err = Rice::try_fit(&[0.0, 0.0, 0.0]).expect_err("E[x²]<2 must be rejected");
+    fn rice_fit_accepts_boundary_maxima_and_rejects_zero_density_observations() {
+        assert_eq!(Rice::try_fit(&[0.1, 0.3, 0.8]).unwrap().b, 0.0);
+        // Zero has zero density for every b and therefore no finite likelihood.
+        let err = Rice::try_fit(&[0.0, 0.0, 0.0]).expect_err("zero density must be rejected");
         assert!(matches!(err, FitError::UnsupportedData(_)));
     }
 

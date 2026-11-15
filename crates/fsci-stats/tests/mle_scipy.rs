@@ -11,8 +11,8 @@ use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, ExponWeibull, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
-    LocationScale, Lognormal, Mielke, MleOptions, MleParameter, MleResult, Nakagami, Normal, RDist,
-    SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
+    LocationScale, Lognormal, Mielke, MleOptions, MleParameter, MleResult, Nakagami, NormInvGauss,
+    Normal, RDist, Rice, SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
@@ -50,6 +50,8 @@ cases = [
     ('genlogistic', stats.genlogistic, [(0.2,), (1.0,), (5.0,)]),
     ('mielke', stats.mielke, [(0.2, 1.4), (2.0, 4.0), (40.0, 20.0)]),
     ('exponweib', stats.exponweib, [(0.2, 1.4), (2.0, 1.5), (40.0, 20.0)]),
+    ('rice', stats.rice, [(0.0,), (2.0,), (25.0,)]),
+    ('norminvgauss', stats.norminvgauss, [(1.5, 0.5), (5.0, -2.0), (50.0, 45.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -71,6 +73,215 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+#[test]
+fn rice_mle_finds_interior_and_boundary_likelihood_maxima() {
+    // Independent 65-digit Bessel score roots and likelihoods at the exact
+    // f64 observations. A valid low-power sample maximizes the likelihood
+    // at b=0; a dispersed sample is not fitted by its second moment.
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            for (data, expected_shape, expected_nll) in [
+                (vec![0.1, 0.3, 0.8], 0.0, 4.099_701_448_634_192),
+                (
+                    vec![1.5, 2.0, 2.5, 1.8, 2.2, 1.7],
+                    1.592_952_485_197_401_5,
+                    5.338_886_178_802_261,
+                ),
+                (
+                    vec![1.0, 2.0, 5.0, 10.0],
+                    4.382_179_946_147_269,
+                    28.798_957_737_546_447,
+                ),
+                (
+                    vec![1000.0, 1001.0, 999.0, 1002.0],
+                    1000.499_500_249_500_6,
+                    6.175_754_382_568_785,
+                ),
+            ] {
+                let fitted = Rice::try_fit(&data).expect("finite Rice MLE");
+                assert!(
+                    (fitted.b - expected_shape).abs() <= 2.0e-12 * (1.0 + expected_shape),
+                    "{mode:?}: b={} expected {expected_shape}",
+                    fitted.b
+                );
+                let nll = likelihood(&fitted, &data);
+                assert!((nll - expected_nll).abs() < 2.0e-11, "{mode:?}: NLL={nll}");
+                assert_eq!(Rice::fit(&data), fitted);
+            }
+        });
+    }
+}
+
+#[test]
+fn normal_inverse_gaussian_mle_preserves_concentrated_and_skewed_samples() {
+    // Independent 65-digit roots after profiling the skew. Concentrated
+    // cases exercise the rationalized Jensen gap and complementary Bessel
+    // ratio, where a direct score subtraction rounds to zero prematurely.
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            for (data, a, b, expected_nll) in [
+                (
+                    vec![-2.0, -1.0, 0.0, 1.0, 2.0],
+                    0.356_555_689_185_252_15,
+                    0.0,
+                    9.781_298_084_427_22,
+                ),
+                (
+                    vec![-1.0, 0.5, 2.0, -0.3, 1.5, 0.8, -2.1, 3.0, 1.1, 0.2],
+                    0.511_973_017_685_176_8,
+                    0.253_530_596_808_591_3,
+                    18.929_628_467_574_305,
+                ),
+                (
+                    vec![0.9, 1.0, 1.1],
+                    422.940_513_793_993,
+                    299.064_105_342_255,
+                    -3.258_191_925_375_759,
+                ),
+                (
+                    vec![99.0, 100.0, 101.0],
+                    1_500_075.009_375_531_2,
+                    1_500_000.011_249_875,
+                    3.648_617_941_202_396_2,
+                ),
+                (
+                    vec![-1.0e-5, 0.0, 1.0e-5],
+                    14_999_999_999.624_998,
+                    0.0,
+                    -30.890_158_457_421_414,
+                ),
+            ] {
+                let fitted = NormInvGauss::try_fit(&data).expect("finite NIG MLE");
+                assert!(fitted.a.is_finite() && fitted.a > 0.0);
+                assert!(fitted.b.is_finite() && fitted.b.abs() < fitted.a);
+                assert!(
+                    (fitted.a - a).abs() <= 2.0e-10 * (1.0 + a),
+                    "{mode:?}: a={} expected {a}",
+                    fitted.a
+                );
+                assert!(
+                    (fitted.b - b).abs() <= 2.0e-10 * (1.0 + b.abs()),
+                    "{mode:?}: b={} expected {b}",
+                    fitted.b
+                );
+                let nll = likelihood(&fitted, &data);
+                assert!(nll.is_finite());
+                assert!(
+                    (nll - expected_nll).abs() < 1.0e-8 * (1.0 + expected_nll.abs()),
+                    "{mode:?}: NLL={nll} expected {expected_nll}"
+                );
+
+                let mean = data.iter().sum::<f64>() / data.len() as f64;
+                let q = mean.hypot(1.0);
+                assert!((fitted.b / fitted.a - mean / q).abs() < 2.0e-15);
+                let radial_score = data
+                    .iter()
+                    .map(|x| {
+                        let radius = x.hypot(1.0);
+                        let z = fitted.a * radius;
+                        radius * fsci_special::bessel::k0e_scalar(z)
+                            / fsci_special::bessel::k1e_scalar(z)
+                    })
+                    .sum::<f64>()
+                    / data.len() as f64;
+                assert!((q - radial_score).abs() < 2.0e-11 * q);
+                for factor in [0.9, 1.1] {
+                    let perturbed = NormInvGauss::new(factor * fitted.a, factor * fitted.b);
+                    assert!(nll < likelihood(&perturbed, &data));
+                }
+                let infallible = NormInvGauss::fit(&data);
+                assert_eq!(infallible.a, fitted.a);
+                assert_eq!(infallible.b, fitted.b);
+            }
+        });
+    }
+}
+
+#[test]
+fn bessel_likelihoods_do_not_overflow_at_finite_high_shapes() {
+    let log_two_pi = (2.0 * std::f64::consts::PI).ln();
+    let rice = Rice::new(1.0e200);
+    let rice_logpdf = rice.logpdf(1.0e200);
+    assert!(rice_logpdf.is_finite());
+    assert!((rice_logpdf + 0.5 * log_two_pi).abs() < 2.0e-12);
+    assert!((rice.pdf(1.0e200) * (2.0 * std::f64::consts::PI).sqrt() - 1.0).abs() < 2.0e-12);
+    assert_eq!(rice.logpdf(0.0), f64::NEG_INFINITY);
+    assert_eq!(rice.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+    assert!(rice.logpdf(f64::NAN).is_nan());
+
+    for a in [1.0e200, f64::MAX] {
+        let distribution = NormInvGauss::new(a, 0.0);
+        let actual = distribution.logpdf(0.0);
+        let expected = 0.5 * (a.ln() - log_two_pi);
+        assert!(actual.is_finite());
+        assert!((actual - expected).abs() < 2.0e-12);
+        let density = distribution.pdf(0.0);
+        assert!(density.is_finite() && density > 0.0);
+        assert!((density.ln() - actual).abs() < 2.0e-12);
+        assert!(distribution.var().is_finite() && distribution.var() > 0.0);
+        assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        assert_eq!(distribution.logpdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert!(distribution.logpdf(f64::NAN).is_nan());
+    }
+    let cauchy_limit = NormInvGauss::new(1.0e-310, 0.0);
+    assert!((cauchy_limit.logpdf(0.0) + std::f64::consts::PI.ln()).abs() < 2.0e-12);
+    assert!((cauchy_limit.pdf(0.0) * std::f64::consts::PI - 1.0).abs() < 2.0e-12);
+}
+
+#[test]
+fn bessel_mle_rejects_undefined_data_and_honors_hardened_caps() {
+    for data in [vec![], vec![1.0]] {
+        assert!(matches!(
+            Rice::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            NormInvGauss::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            Rice::try_fit(&[0.5, invalid, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            NormInvGauss::try_fit(&[-1.0, invalid, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for invalid in [0.0, -1.0] {
+        assert!(matches!(
+            Rice::try_fit(&[0.5, invalid, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for constant in [-1.0, 0.0, 1.0] {
+        assert!(matches!(
+            NormInvGauss::try_fit(&[constant, constant]),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    // Constant positive data still identify a fixed-scale Rice shape.
+    let repeated = Rice::try_fit(&[5.0_f64.sqrt(), 5.0_f64.sqrt()]).unwrap();
+    assert!((repeated.b - 1.960_636_775_996_733).abs() < 2.0e-12);
+
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Rice::try_fit(&[0.5, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                NormInvGauss::try_fit(&[-1.0, 0.0, 1.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(Rice::try_fit(&[0.5, 2.0]).is_ok());
+            assert!(NormInvGauss::try_fit(&[-1.0, 1.0]).is_ok());
+        });
+    });
 }
 
 #[test]
@@ -1568,6 +1779,14 @@ fn mle_matches_live_scipy_on_seeded_fits() {
                 let fitted = ExponWeibull::try_fit(&data).unwrap();
                 (vec![fitted.a, fitted.c], likelihood(&fitted, &data))
             }
+            "rice" => {
+                let fitted = Rice::try_fit(&data).unwrap();
+                (vec![fitted.b], likelihood(&fitted, &data))
+            }
+            "norminvgauss" => {
+                let fitted = NormInvGauss::try_fit(&data).unwrap();
+                (vec![fitted.a, fitted.b], likelihood(&fitted, &data))
+            }
             "f" => {
                 let fitted = FDistribution::try_fit(&data).unwrap();
                 (vec![fitted.dfn, fitted.dfd], likelihood(&fitted, &data))
@@ -1689,10 +1908,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 63,
+        compared, 69,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 21; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 23; samples per case = 2000");
 }
 
 #[test]

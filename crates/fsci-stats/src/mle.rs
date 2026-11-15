@@ -484,6 +484,220 @@ fn validate_shape_sample(
     crate::validate_finite_fit_data(data, minimum_sample, family)
 }
 
+fn compensated_mean(values: impl Iterator<Item = f64>, count: usize) -> f64 {
+    let mut mean = 0.0;
+    let mut correction = 0.0;
+    for value in values {
+        if !value.is_finite() {
+            return value;
+        }
+        let term = value / count as f64 - correction;
+        let next = mean + term;
+        correction = (next - mean) - term;
+        mean = next;
+    }
+    mean
+}
+
+/// Standardized Rice MLE. The likelihood is concave in b^2: its boundary
+/// maximum is b=0 when mean(x^2)<=2; otherwise its unique positive score root
+/// lies below mean(x), because I1(z)/I0(z)<1.
+pub(crate) fn rice_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "Rice")?;
+    if data.iter().any(|&x| x <= 0.0) {
+        return Err(FitError::UnsupportedData(
+            "Rice MLE with fixed location zero requires strictly positive observations".into(),
+        ));
+    }
+    if compensated_mean(data.iter().map(|x| x * x), data.len()) <= 2.0 {
+        return Ok(0.0);
+    }
+    let score = |b: f64| {
+        compensated_mean(
+            data.iter().map(|&x| {
+                let z = b * x;
+                if z < 1.0e-3 {
+                    // I1(z)/(z*I0(z)); dividing the score by b avoids the
+                    // spurious zero root and cancellation near the boundary.
+                    let square = z * z;
+                    x * x
+                        * (0.5
+                            + square
+                                * (-1.0 / 16.0 + square * (1.0 / 96.0 - square * (11.0 / 6144.0))))
+                } else if z.is_infinite() {
+                    // For an overflowing finite product, the Bessel ratio
+                    // differs from one by much less than one f64 ulp.
+                    x / b
+                } else {
+                    (x / b) * (fsci_special::i1e_scalar(z) / fsci_special::i0e_scalar(z))
+                }
+            }),
+            data.len(),
+        ) - 1.0
+    };
+    let mut lower = 0.0;
+    let mut upper = compensated_mean(data.iter().copied(), data.len());
+    if score(upper) == 0.0 {
+        return Ok(upper);
+    }
+    for _ in 0..128 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            return Ok(middle);
+        }
+        let value = score(middle);
+        if value.is_nan() {
+            return Err(FitError::NonConvergent(
+                "Rice likelihood score could not be evaluated".into(),
+            ));
+        }
+        if value > 0.0 {
+            lower = middle;
+        } else if value < 0.0 {
+            upper = middle;
+        } else {
+            return Ok(middle);
+        }
+        if upper - lower <= 8.0 * f64::EPSILON * middle {
+            return Ok(lower + 0.5 * (upper - lower));
+        }
+    }
+    Err(FitError::NonConvergent(
+        "Rice likelihood score did not converge".into(),
+    ))
+}
+
+/// 1 - K0(z)/K1(z), retaining the small positive difference when the two
+/// exponentially scaled Bessel functions round to the same value.
+fn k01_ratio_complement(z: f64) -> f64 {
+    if z >= 1.0e4 {
+        let inverse = z.recip();
+        inverse
+            * (0.5
+                + inverse
+                    * (-0.375 + inverse * (0.375 + inverse * (-0.492_187_5 + inverse * 0.843_75))))
+    } else {
+        1.0 - fsci_special::bessel::k0e_scalar(z) / fsci_special::bessel::k1e_scalar(z)
+    }
+}
+
+/// Profile out NIG skew exactly: b=a*mean(x)/hypot(1,mean(x)). The remaining
+/// shape score is q-mean(r*K0(a*r)/K1(a*r)), q=hypot(1,mean(x)), r=hypot(1,x).
+/// K0/K1 increases monotonically, so a bracketed scalar solve finds the unique
+/// finite maximum without returning a moment estimate as an MLE.
+pub(crate) fn norminvgauss_shapes_mle(data: &[f64]) -> Result<(f64, f64), FitError> {
+    validate_shape_sample(data, 2, "NormInvGauss")?;
+    if data.iter().all(|&x| x == data[0]) {
+        return Err(FitError::NonConvergent(
+            "NormInvGauss MLE is unbounded for a constant sample".into(),
+        ));
+    }
+    let mean = compensated_mean(data.iter().copied(), data.len());
+    let q = mean.hypot(1.0);
+    let skew = mean / q;
+    if !mean.is_finite() || skew.abs() >= 1.0 {
+        return Err(FitError::NonConvergent(
+            "NormInvGauss MLE skew is outside the representable parameter domain".into(),
+        ));
+    }
+    let radii: Vec<_> = data.iter().map(|x| x.hypot(1.0)).collect();
+    // Rationalize r - (1/q + skew*x) before averaging. Its expectation is
+    // the Jensen gap mean(r)-q, which direct subtraction loses completely
+    // for concentrated samples. Using x-mean also makes constant data exact.
+    let gap = compensated_mean(
+        data.iter().zip(&radii).map(|(&x, &radius)| {
+            let projection = skew.mul_add(x, q.recip());
+            if projection <= 0.0 {
+                radius - projection
+            } else {
+                let difference = x - mean;
+                let orthogonal = if difference.is_finite() {
+                    difference / q
+                } else {
+                    x / q - skew
+                };
+                (orthogonal / radius) * orthogonal / (1.0 + projection / radius)
+            }
+        }),
+        data.len(),
+    );
+    if !gap.is_finite() || gap <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "NormInvGauss likelihood gap is outside the finite parameter range".into(),
+        ));
+    }
+    let score = |a: f64| {
+        if gap < 0.5 * q {
+            // The complement form preserves a score of order 1/a even when
+            // q and mean(r*K0/K1) agree to every available significant bit.
+            compensated_mean(
+                radii.iter().map(|&radius| {
+                    let z = a * radius;
+                    if z.is_infinite() {
+                        0.5 / a
+                    } else {
+                        radius * k01_ratio_complement(z)
+                    }
+                }),
+                data.len(),
+            ) - gap
+        } else {
+            q - compensated_mean(
+                radii.iter().map(|&radius| {
+                    let z = a * radius;
+                    if z < 1.0e-10 {
+                        // K1(z) can overflow near zero although its ratio,
+                        // multiplied by radius, is finite and informative.
+                        (radius * z) * (-z.ln() + std::f64::consts::LN_2 - crate::EULER_MASCHERONI)
+                    } else if z.is_infinite() {
+                        radius
+                    } else {
+                        radius
+                            * (fsci_special::bessel::k0e_scalar(z)
+                                / fsci_special::bessel::k1e_scalar(z))
+                    }
+                }),
+                data.len(),
+            )
+        }
+    };
+    // 0 < 1-K0(z)/K1(z) < 1/(2z) gives an upper shape bracket.
+    let upper = 0.5 / gap;
+    let smallest = f64::from_bits(1);
+    if !upper.is_finite() || upper <= 0.0 || score(smallest) <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "NormInvGauss MLE shape is outside the finite parameter range".into(),
+        ));
+    }
+    let mut log_lower = smallest.ln();
+    let mut log_upper = upper.ln();
+    for _ in 0..128 {
+        let log_middle = log_lower + 0.5 * (log_upper - log_lower);
+        let a = log_middle.exp();
+        let value = score(a);
+        if value.is_nan() {
+            return Err(FitError::NonConvergent(
+                "NormInvGauss likelihood score could not be evaluated".into(),
+            ));
+        }
+        if value > 0.0 {
+            log_lower = log_middle;
+        } else if value < 0.0 {
+            log_upper = log_middle;
+        }
+        if value == 0.0 || log_upper - log_lower <= 8.0 * f64::EPSILON * (1.0 + log_middle.abs()) {
+            let b = a * skew;
+            if a.is_finite() && a > 0.0 && b.is_finite() && b.abs() < a {
+                return Ok((a, b));
+            }
+            break;
+        }
+    }
+    Err(FitError::NonConvergent(
+        "NormInvGauss likelihood score did not converge to representable shapes".into(),
+    ))
+}
+
 /// log(a) - psi(a), preserving the small positive gap at large shape.
 fn log_minus_digamma(a: f64) -> f64 {
     if a < 16.0 {
