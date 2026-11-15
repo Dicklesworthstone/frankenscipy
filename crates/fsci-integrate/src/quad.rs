@@ -2084,6 +2084,110 @@ where
     Ok((integral, n))
 }
 
+/// One integration interval for [`nquad_with_ranges`].
+///
+/// Ranges use SciPy's variable order: the first variable is integrated innermost.
+/// The callback for variable `i` receives only the already fixed outer coordinates,
+/// `args[i + 1..]`, in the same order as the integrand's arguments. Captured data
+/// can supply additional parameters without allocating a new range for every call.
+#[derive(Clone, Copy)]
+pub enum NquadRange<'a> {
+    Fixed(f64, f64),
+    Dynamic(&'a dyn Fn(&[f64]) -> (f64, f64)),
+}
+
+impl std::fmt::Debug for NquadRange<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(lower, upper) => formatter
+                .debug_tuple("Fixed")
+                .field(lower)
+                .field(upper)
+                .finish(),
+            Self::Dynamic(_) => formatter.write_str("Dynamic(<function>)"),
+        }
+    }
+}
+
+/// Adaptive integration over nested, possibly nonrectangular domains.
+///
+/// As in `scipy.integrate.nquad`, `ranges[0]` bounds `args[0]` and is integrated
+/// innermost. A dynamic range sees the outer coordinates; for example the range
+/// for `args[0]` in three dimensions receives `[args[1], args[2]]`.
+/// Infinite and reversed intervals are supported by the underlying [`quad`].
+///
+/// `options` may be empty (defaults), contain one common set of options, or have
+/// one entry per variable, in the same innermost-first order as `ranges`.
+/// `neval` counts evaluations of the user's integrand, and `error` is the largest
+/// error estimate from any nested integration. A failed inner integration marks
+/// the whole result unconverged; an invalid range or tolerance returns an error.
+///
+/// ```rust
+/// use fsci_integrate::{nquad_with_ranges, NquadRange};
+/// let inner = |outer: &[f64]| (0.0, outer[0]);
+/// let result = nquad_with_ranges(
+///     |_| 1.0,
+///     &[NquadRange::Dynamic(&inner), NquadRange::Fixed(0.0, 1.0)],
+///     &[],
+/// ).unwrap();
+/// assert!((result.integral - 0.5).abs() < 1e-12);
+/// ```
+pub fn nquad_with_ranges<F>(
+    func: F,
+    ranges: &[NquadRange<'_>],
+    options: &[QuadOptions],
+) -> Result<QuadResult, IntegrateValidationError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    if options.len() > 1 && options.len() != ranges.len() {
+        return Err(IntegrateValidationError::QuadInvalidTolerance {
+            detail: "nquad options must be empty, common to all variables, or one per variable"
+                .to_string(),
+        });
+    }
+    for range in ranges {
+        if let NquadRange::Fixed(lower, upper) = range
+            && (lower.is_nan() || upper.is_nan())
+        {
+            return Err(IntegrateValidationError::QuadInvalidBounds {
+                detail: "nquad integration bounds must not be NaN".to_string(),
+            });
+        }
+    }
+    let default_options = [QuadOptions::default()];
+    let options = if options.is_empty() {
+        &default_options[..]
+    } else {
+        options
+    };
+    // Validate every level before any user callback, including levels beneath
+    // an empty outer interval. Include QUADPACK's relative-tolerance floor;
+    // a zero-width dummy quad would return before checking that floor.
+    for &option in options {
+        if !option.epsabs.is_finite()
+            || !option.epsrel.is_finite()
+            || option.epsabs < 0.0
+            || option.epsrel < 0.0
+            || (option.epsabs <= 0.0 && option.epsrel < (50.0 * f64::EPSILON).max(5e-29))
+        {
+            return Err(IntegrateValidationError::QuadInvalidTolerance {
+                detail: "nquad tolerances must be finite and non-negative; with zero epsabs, epsrel must meet QUADPACK's tolerance floor".to_string(),
+            });
+        }
+    }
+    nquad_run(
+        &func,
+        ranges.len(),
+        &|dim, args: &[f64]| match ranges[dim] {
+            NquadRange::Fixed(lower, upper) => (lower, upper),
+            NquadRange::Dynamic(bounds) => bounds(&args[dim + 1..]),
+        },
+        options,
+        true,
+    )
+}
+
 /// N-dimensional adaptive quadrature via nested `quad` calls.
 ///
 /// Matches `scipy.integrate.nquad(func, ranges)`.
@@ -2092,6 +2196,9 @@ where
 /// * `func` — Function of N variables. Takes a slice `&[f64]` of length N.
 /// * `ranges` — Integration ranges as `(lower, upper)` pairs, from outermost to innermost.
 /// * `options` — Quadrature options for each 1D integration.
+///
+/// For coordinate-dependent bounds and different options per variable, use
+/// [`nquad_with_ranges`]. `neval` counts only calls to `func`.
 ///
 /// # Example
 /// ```rust
@@ -2108,8 +2215,6 @@ pub fn nquad<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
-    use std::cell::RefCell;
-
     let ndim = ranges.len();
     // scipy's nquad with an empty ranges list evaluates the function once at
     // the (empty) point vector and returns that value with neval = 1 — the
@@ -2142,6 +2247,37 @@ where
         });
     }
 
+    nquad_run(
+        &func,
+        ndim,
+        &|dim, _args: &[f64]| ranges[dim],
+        &[options],
+        false,
+    )
+}
+
+fn nquad_run<F, R>(
+    func: &F,
+    ndim: usize,
+    range: &R,
+    options: &[QuadOptions],
+    innermost_first: bool,
+) -> Result<QuadResult, IntegrateValidationError>
+where
+    F: Fn(&[f64]) -> f64,
+    R: Fn(usize, &[f64]) -> (f64, f64),
+{
+    use std::cell::RefCell;
+
+    if ndim == 0 {
+        let integral = func(&[]);
+        return Ok(QuadResult {
+            integral,
+            error: 0.0,
+            neval: 1,
+            converged: integral.is_finite(),
+        });
+    }
     // Use RefCell for interior mutability since quad() takes Fn, not FnMut
     let args = RefCell::new(vec![0.0; ndim]);
     let total_neval = RefCell::new(0usize);
@@ -2159,9 +2295,9 @@ where
     let max_abserr = std::cell::Cell::new(0.0_f64);
 
     let result = nquad_inner(
-        &func,
-        ranges,
-        &options,
+        func,
+        range,
+        options,
         &NquadState {
             args: &args,
             total_neval: &total_neval,
@@ -2170,6 +2306,8 @@ where
             max_abserr: &max_abserr,
         },
         0,
+        ndim,
+        innermost_first,
     )?;
     let error = max_abserr.get();
 
@@ -2211,7 +2349,6 @@ struct NquadState<'s> {
 impl NquadState<'_> {
     /// Fold one nested quad's verdict into the shared state.
     fn record(&self, result: &QuadResult) {
-        *self.total_neval.borrow_mut() += result.neval;
         if !result.converged {
             self.all_converged.set(false);
         }
@@ -2284,31 +2421,41 @@ where
 }
 
 /// Returns this level's integral; its evaluation count, convergence and abserr go into `state`.
-fn nquad_inner<F>(
+fn nquad_inner<F, R>(
     func: &F,
-    ranges: &[(f64, f64)],
-    options: &QuadOptions,
+    range: &R,
+    options: &[QuadOptions],
     state: &NquadState<'_>,
-    dim: usize,
+    depth: usize,
+    ndim: usize,
+    innermost_first: bool,
 ) -> Result<f64, IntegrateValidationError>
 where
     F: Fn(&[f64]) -> f64,
+    R: Fn(usize, &[f64]) -> (f64, f64),
 {
     let NquadState {
         args, inner_error, ..
     } = *state;
-    let (a, b) = ranges[dim];
+    let dim = if innermost_first {
+        ndim - 1 - depth
+    } else {
+        depth
+    };
+    let (a, b) = range(dim, &args.borrow());
+    let level_options = options[if options.len() == 1 { 0 } else { dim }];
 
-    if dim == ranges.len() - 1 {
+    if depth == ndim - 1 {
         // Innermost dimension: call quad directly
         let result = quad(
             |x| {
                 args.borrow_mut()[dim] = x;
+                *state.total_neval.borrow_mut() += 1;
                 func(&args.borrow())
             },
             a,
             b,
-            *options,
+            level_options,
         )?;
         state.record(&result);
         Ok(result.integral)
@@ -2328,7 +2475,15 @@ where
                     return 0.0;
                 }
                 args.borrow_mut()[dim] = x;
-                match nquad_inner(func, ranges, options, state, dim + 1) {
+                match nquad_inner(
+                    func,
+                    range,
+                    options,
+                    state,
+                    depth + 1,
+                    ndim,
+                    innermost_first,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         let mut slot = inner_error.borrow_mut();
@@ -2341,7 +2496,7 @@ where
             },
             a,
             b,
-            *options,
+            level_options,
         )?;
         state.record(&result);
         Ok(result.integral)
@@ -7326,6 +7481,170 @@ mod tests {
     }
 
     // ── nquad tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn nquad_callable_ranges_use_scipy_variable_order() {
+        let inner = |outer: &[f64]| {
+            assert_eq!(outer.len(), 1);
+            (0.0, 2.0 * outer[0])
+        };
+        let result = nquad_with_ranges(
+            |args| args[0] + 10.0 * args[1],
+            &[NquadRange::Dynamic(&inner), NquadRange::Fixed(0.0, 3.0)],
+            &[],
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert!((result.integral - 198.0).abs() < 1e-11);
+
+        let simplex_inner = |outer: &[f64]| {
+            assert_eq!(outer.len(), 2);
+            (0.0, 1.0 - outer[0] - outer[1])
+        };
+        let simplex_middle = |outer: &[f64]| (0.0, 1.0 - outer[0]);
+        let result = nquad_with_ranges(
+            |_| 1.0,
+            &[
+                NquadRange::Dynamic(&simplex_inner),
+                NquadRange::Dynamic(&simplex_middle),
+                NquadRange::Fixed(0.0, 1.0),
+            ],
+            &[QuadOptions::default()],
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert!((result.integral - 1.0 / 6.0).abs() < 1e-13);
+    }
+
+    #[test]
+    fn nquad_callable_ranges_support_infinite_and_reversed_intervals() {
+        for sign in [-1.0, 1.0] {
+            let inner = |outer: &[f64]| {
+                if sign > 0.0 {
+                    (0.0, outer[0])
+                } else {
+                    (outer[0], 0.0)
+                }
+            };
+            let result = nquad_with_ranges(
+                |args| (-args[0] - args[1]).exp(),
+                &[
+                    NquadRange::Dynamic(&inner),
+                    NquadRange::Fixed(0.0, f64::INFINITY),
+                ],
+                &[QuadOptions {
+                    epsabs: 1e-10,
+                    epsrel: 1e-10,
+                    limit: 100,
+                }],
+            )
+            .unwrap();
+            assert!(result.converged);
+            assert!((result.integral - sign * 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn nquad_counts_only_user_integrand_evaluations() {
+        let samples = std::cell::Cell::new(0);
+        let func = |_: &[f64]| {
+            samples.set(samples.get() + 1);
+            1.0
+        };
+        let result = nquad(func, &[(0.0, 1.0); 3], QuadOptions::default()).unwrap();
+        assert_eq!(result.neval, samples.get());
+        assert_eq!(result.neval, 21usize.pow(3));
+        samples.set(0);
+        let result = nquad_with_ranges(func, &[NquadRange::Fixed(0.0, 1.0); 3], &[]).unwrap();
+        assert_eq!(result.neval, samples.get());
+        assert_eq!(result.neval, 21usize.pow(3));
+    }
+
+    #[test]
+    fn nquad_per_dimension_options_preserve_inner_failure() {
+        let inner_options = QuadOptions {
+            limit: 3,
+            ..QuadOptions::default()
+        };
+        let singular = |x: f64| (x - 1.0 / 3.0).abs().powf(-0.9);
+        let inner = quad(singular, 0.0, 1.0, inner_options).unwrap();
+        let result = nquad_with_ranges(
+            |args| singular(args[0]),
+            &[NquadRange::Fixed(0.0, 1.0); 2],
+            &[inner_options, QuadOptions::default()],
+        )
+        .unwrap();
+        assert!(!result.converged);
+        assert!((result.integral - inner.integral).abs() < 1e-12);
+        assert_eq!(result.error, inner.error);
+        assert_eq!(result.neval, 21 * inner.neval);
+    }
+
+    #[test]
+    fn nquad_invalid_dynamic_range_fails_once_without_sampling_integrand() {
+        let bound_calls = std::cell::Cell::new(0);
+        let invalid = |_: &[f64]| {
+            bound_calls.set(bound_calls.get() + 1);
+            (0.0, f64::NAN)
+        };
+        let result = nquad_with_ranges(
+            |_| panic!("invalid inner bounds must not reach the integrand"),
+            &[NquadRange::Dynamic(&invalid), NquadRange::Fixed(0.0, 1.0)],
+            &[],
+        );
+        assert!(matches!(
+            result,
+            Err(IntegrateValidationError::QuadInvalidBounds { .. })
+        ));
+        assert_eq!(bound_calls.get(), 1);
+    }
+
+    #[test]
+    fn nquad_rejects_invalid_options_before_any_bound_callback() {
+        let bounds = |_: &[f64]| panic!("options must be validated first");
+        let ranges = [NquadRange::Dynamic(&bounds), NquadRange::Fixed(0.0, 0.0)];
+        assert!(nquad_with_ranges(|_| 1.0, &ranges, &[QuadOptions::default(); 3]).is_err());
+        let bad = QuadOptions {
+            epsabs: f64::NAN,
+            ..QuadOptions::default()
+        };
+        assert!(nquad_with_ranges(|_| 1.0, &ranges, &[bad, QuadOptions::default()]).is_err());
+        let empty = nquad_with_ranges(
+            |args| {
+                assert!(args.is_empty());
+                42.0
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty.integral, 42.0);
+        assert_eq!(empty.neval, 1);
+    }
+
+    #[test]
+    fn nquad_rejects_unattainable_tolerances_beneath_empty_ranges() {
+        let bounds = |_: &[f64]| panic!("invalid tolerances must not evaluate bounds");
+        let ranges = [NquadRange::Dynamic(&bounds), NquadRange::Fixed(0.0, 0.0)];
+        for epsrel in [0.0, 49.0 * f64::EPSILON] {
+            let options = [
+                QuadOptions {
+                    epsabs: 0.0,
+                    epsrel,
+                    limit: 50,
+                },
+                QuadOptions::default(),
+            ];
+            assert!(matches!(
+                nquad_with_ranges(
+                    |_| panic!("invalid options must not evaluate a model"),
+                    &ranges,
+                    &options
+                ),
+                Err(IntegrateValidationError::QuadInvalidTolerance { .. })
+            ));
+        }
+    }
 
     #[test]
     fn nquad_1d_matches_quad() {
