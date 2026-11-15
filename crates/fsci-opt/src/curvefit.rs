@@ -5,6 +5,7 @@
 //! batched variants.
 
 use fsci_runtime::RuntimeMode;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::FiniteDiffMethod;
@@ -28,6 +29,7 @@ pub enum LeastSquaresMethod {
 /// SciPy's `least_squares` termination messages by status.
 fn termination_message(status: i32) -> &'static str {
     match status {
+        -2 => "Stopped by the least-squares iteration callback.",
         0 => "The maximum number of function evaluations is exceeded.",
         1 => "`gtol` termination condition is satisfied.",
         2 => "`ftol` termination condition is satisfied.",
@@ -54,14 +56,17 @@ pub struct LeastSquaresResult {
     pub nfev: usize,
     /// Number of Jacobian evaluations.
     pub njev: usize,
-    /// Number of iterations (accepted steps for `Trf` and `Dogbox`).
+    /// Number of outer iterations. A trust-region iteration may try several
+    /// steps before accepting one, or finish without accepting a step.
     pub nit: usize,
     /// Jacobian at the solution, retaining sparse or matrix-free storage when supplied
     /// by the caller or estimated using `jac_sparsity`. For a robust loss this is
     /// SciPy's loss-scaled Jacobian. Use [`LeastSquaresMatrix::to_dense`] when
     /// an explicitly materialized dense matrix is needed.
     pub jac: LeastSquaresMatrix,
-    /// SciPy's status: 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
+    /// SciPy's status: -2 callback stop, 0 max_nfev, 1 gtol, 2 ftol,
+    /// 3 xtol, 4 ftol and xtol. A callback stop retains the latest iterate
+    /// but does not report convergence (`success` is false).
     pub status: i32,
     /// First-order optimality: ‖Jᵀf‖∞, scaled by Coleman–Li for bounded `Trf`, or
     /// restricted to the free variables for `Dogbox`.
@@ -70,6 +75,85 @@ pub struct LeastSquaresResult {
     pub grad: Vec<f64>,
     /// −1 / 1 where a lower / upper bound is active, 0 otherwise.
     pub active_mask: Vec<i8>,
+}
+
+/// A read-only view of the current iterate passed to a least-squares callback.
+///
+/// The slices borrow solver storage only for the duration of the callback.
+/// Copy the values you want to retain. `fun` contains the residuals at `x`,
+/// before robust-loss scaling; for `curve_fit` they include its measurement
+/// weights. `cost` is the requested objective, including any robust loss.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeastSquaresIteration<'a> {
+    pub x: &'a [f64],
+    pub fun: &'a [f64],
+    pub cost: f64,
+    /// Completed outer iterations, starting at one on the first callback.
+    pub nit: usize,
+    /// Residual evaluations, excluding finite-difference Jacobian calls.
+    pub nfev: usize,
+    pub njev: usize,
+}
+
+/// Iteration monitoring and cooperative cancellation for TRF and Dogbox.
+///
+/// Return [`ControlFlow::Continue`] to continue or [`ControlFlow::Break`] to
+/// stop with status -2. The callback runs after each outer iteration, including
+/// the final one, with the latest accepted iterate. It is not called at `x0`
+/// or for individual rejected trial steps. No residual or Jacobian evaluation
+/// is performed after a callback requests a stop.
+///
+/// Clones share the same callback. Batched fits may call it concurrently, so
+/// use synchronization for shared progress or cancellation state. LM does not
+/// support callbacks; passing one to LM returns an explicit option error.
+///
+/// ```
+/// use std::ops::ControlFlow;
+/// use fsci_opt::{LeastSquaresCallback, LeastSquaresOptions, least_squares};
+///
+/// let result = least_squares(
+///     |x| vec![x[0] - 10.0],
+///     &[0.0],
+///     LeastSquaresOptions {
+///         callback: Some(LeastSquaresCallback::new(|state| {
+///             if state.nit >= 2 {
+///                 ControlFlow::Break(())
+///             } else {
+///                 ControlFlow::Continue(())
+///             }
+///         })),
+///         ..LeastSquaresOptions::default()
+///     },
+/// ).unwrap();
+/// assert_eq!(result.status, -2);
+/// assert!(!result.success);
+/// ```
+#[derive(Clone)]
+pub struct LeastSquaresCallback {
+    callback: Arc<dyn Fn(&LeastSquaresIteration<'_>) -> ControlFlow<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for LeastSquaresCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeastSquaresCallback")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeastSquaresCallback {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&LeastSquaresIteration<'_>) -> ControlFlow<()> + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub(crate) fn call(&self, iteration: LeastSquaresIteration<'_>) -> ControlFlow<()> {
+        (self.callback)(&iteration)
+    }
 }
 
 /// An analytic residual Jacobian shared by individual and batched fits.
@@ -323,6 +407,10 @@ pub struct LeastSquaresOptions {
     /// Parameter scaling: fixed positive scales or `'jac'`. `None` uses unit
     /// scale for `Trf`/`Dogbox` and Jacobian column scaling for `Lm`, as in SciPy.
     pub x_scale: Option<XScale>,
+    /// Inspect each TRF/Dogbox iteration or stop early with status -2.
+    /// LM rejects this option. See [`LeastSquaresCallback`] for call timing
+    /// and the synchronization requirements of batched fits.
+    pub callback: Option<LeastSquaresCallback>,
     /// Runtime mode.
     pub mode: RuntimeMode,
 }
@@ -343,6 +431,7 @@ impl Default for LeastSquaresOptions {
             loss: LossKind::Linear,
             f_scale: 1.0,
             x_scale: None,
+            callback: None,
             mode: RuntimeMode::Strict,
         }
     }
@@ -759,6 +848,13 @@ where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
     let n = x0.len();
+    if options.callback.is_some() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "method 'lm' does not support iteration callbacks; use 'trf' or 'dogbox'",
+            ),
+        });
+    }
     if options.loss != LossKind::Linear {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
@@ -1535,12 +1631,13 @@ where
         loss.as_ref(),
         solver,
         options.mode,
+        options.callback.as_ref(),
     )?;
     Ok(LeastSquaresResult {
         // status: SciPy's code; success = status > 0 (a gtol/ftol/xtol test passed)
         success: out.status > 0,
         message: termination_message(out.status).to_string(),
-        nit: out.njev.saturating_sub(1),
+        nit: out.nit,
         x: out.x,
         fun: out.fun,
         cost: out.cost,
@@ -2658,7 +2755,235 @@ fn compute_covariance(
 mod tests {
     use super::*;
     use fsci_sparse::{SparseError, SparseResult};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn least_squares_callback_stops_with_current_bounded_robust_state() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for sparse in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let jac_calls = Arc::new(AtomicUsize::new(0));
+                let snapshot = Arc::new(Mutex::new(None));
+                let callback_calls = Arc::clone(&calls);
+                let callback_jac_calls = Arc::clone(&jac_calls);
+                let callback_snapshot = Arc::clone(&snapshot);
+                let jac_counter = Arc::clone(&jac_calls);
+                let jac = if sparse {
+                    LeastSquaresJacobian::new_sparse(move |_| {
+                        jac_counter.fetch_add(1, Ordering::Relaxed);
+                        CsrMatrix::from_components(
+                            Shape2D::new(2, 2),
+                            vec![1.0, 1.0],
+                            vec![0, 1],
+                            vec![0, 1, 2],
+                            true,
+                        )
+                        .unwrap()
+                    })
+                } else {
+                    LeastSquaresJacobian::new(move |_| {
+                        jac_counter.fetch_add(1, Ordering::Relaxed);
+                        vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+                    })
+                };
+                let result = least_squares_bounded(
+                    |x| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        vec![x[0] - 5.0, x[1] + 3.0]
+                    },
+                    &[0.0, 0.0],
+                    &[-2.0, -1.0],
+                    &[3.0, 2.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(jac),
+                        loss: LossKind::SoftL1,
+                        f_scale: 0.5,
+                        callback: Some(LeastSquaresCallback::new(move |state| {
+                            assert_eq!(state.nit, 1);
+                            assert_eq!(state.fun, [state.x[0] - 5.0, state.x[1] + 3.0]);
+                            let expected_cost: f64 = state
+                                .fun
+                                .iter()
+                                .map(|f| 0.25 * ((1.0 + 4.0 * f * f).sqrt() - 1.0))
+                                .sum();
+                            assert!((state.cost - expected_cost).abs() < 1.0e-14);
+                            assert_eq!(state.nfev, callback_calls.load(Ordering::Relaxed));
+                            assert_eq!(state.njev, callback_jac_calls.load(Ordering::Relaxed));
+                            *callback_snapshot.lock().unwrap() = Some((
+                                state.x.to_vec(),
+                                state.fun.to_vec(),
+                                state.cost,
+                                state.nfev,
+                                state.njev,
+                            ));
+                            ControlFlow::Break(())
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .unwrap();
+                let (x, fun, cost, nfev, njev) = snapshot.lock().unwrap().clone().unwrap();
+                assert_eq!(result.status, -2);
+                assert!(!result.success);
+                assert!(result.message.contains("callback"));
+                assert_eq!(result.nit, 1);
+                assert_eq!(result.x, x);
+                assert_eq!(result.fun, fun);
+                assert_eq!(result.cost, cost);
+                assert_eq!(result.nfev, nfev);
+                assert_eq!(result.njev, njev);
+                // There must be no residual or Jacobian call after cancellation.
+                assert_eq!(calls.load(Ordering::Relaxed), nfev);
+                assert_eq!(jac_calls.load(Ordering::Relaxed), njev);
+                assert_eq!(result.jac.as_sparse().is_some(), sparse);
+                assert!(result.optimality.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_callback_continue_preserves_results_and_evaluations() {
+        let rosenbrock = |x: &[f64]| vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]];
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let options = LeastSquaresOptions {
+                method: Some(method),
+                ..LeastSquaresOptions::default()
+            };
+            let baseline = least_squares(rosenbrock, &[-1.2, 1.0], options.clone()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            let monitored = least_squares(
+                rosenbrock,
+                &[-1.2, 1.0],
+                LeastSquaresOptions {
+                    callback: Some(LeastSquaresCallback::new(move |state| {
+                        let previous = callback_calls.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(state.nit, previous + 1);
+                        assert_eq!(state.fun, rosenbrock(state.x));
+                        ControlFlow::Continue(())
+                    })),
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(monitored, baseline);
+            assert_eq!(calls.load(Ordering::Relaxed), monitored.nit);
+            assert!(monitored.nit > 1);
+        }
+    }
+
+    #[test]
+    fn least_squares_callback_stop_has_priority_over_convergence() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| vec![x[0] - 1.0],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]])),
+                    callback: Some(LeastSquaresCallback::new(|state| {
+                        assert_eq!(state.x, [1.0]);
+                        ControlFlow::Break(())
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.status, -2);
+            assert!(!result.success);
+            assert_eq!(result.nit, 1);
+            assert_eq!(result.optimality, 0.0);
+            assert_eq!(result.nfev, 2);
+        }
+    }
+
+    #[test]
+    fn least_squares_callback_is_not_called_without_an_iteration() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for start in [0.0, 1.0] {
+                let result = least_squares(
+                    |x| vec![x[0] - 1.0],
+                    &[start],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        max_nfev: Some(1),
+                        callback: Some(LeastSquaresCallback::new(|_| {
+                            panic!("the solver has not taken an iteration")
+                        })),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(result.nit, 0);
+                assert_eq!(result.nfev, 1);
+                assert_eq!(result.status, if start == 1.0 { 1 } else { 0 });
+            }
+        }
+        let error = least_squares(
+            |_| panic!("unsupported callbacks must fail before evaluating a model"),
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                callback: Some(LeastSquaresCallback::new(|_| ControlFlow::Break(()))),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, OptError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn least_squares_callback_is_shared_safely_by_batched_solves() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let targets: Vec<_> = (2..10).map(|i| vec![f64::from(i)]).collect();
+        let results = least_squares_many(
+            |x, target| vec![x[0] - target[0]],
+            &[0.0],
+            &targets,
+            LeastSquaresOptions {
+                callback: Some(LeastSquaresCallback::new(move |state| {
+                    assert_eq!(state.nit, 1);
+                    callback_calls.fetch_add(1, Ordering::Relaxed);
+                    ControlFlow::Break(())
+                })),
+                ..LeastSquaresOptions::default()
+            },
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), targets.len());
+        assert!(
+            results
+                .into_iter()
+                .all(|result| result.unwrap().status == -2)
+        );
+    }
+
+    #[test]
+    fn least_squares_callback_stop_propagates_through_curve_fit() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let error = curve_fit_bounded(
+                |x, p| p[0] * x,
+                &[1.0, 2.0, 3.0],
+                &[10.0, 20.0, 30.0],
+                &[0.0],
+                &[20.0],
+                CurveFitOptions {
+                    p0: Some(vec![1.0]),
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        callback: Some(LeastSquaresCallback::new(|_| ControlFlow::Break(()))),
+                        ..LeastSquaresOptions::default()
+                    },
+                    ..CurveFitOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, OptError::NotConverged { .. }));
+            assert!(error.to_string().contains("callback"));
+        }
+    }
 
     struct IdentityJacobianProbe {
         dimension: usize,
@@ -2696,6 +3021,44 @@ mod tests {
             products: Arc::new(AtomicUsize::new(0)),
             basis_probes: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    #[test]
+    fn least_squares_callback_preserves_matrix_free_storage() {
+        let n = 128;
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let products = Arc::new(AtomicUsize::new(0));
+            let probes = Arc::new(AtomicUsize::new(0));
+            let product_counter = Arc::clone(&products);
+            let probe_counter = Arc::clone(&probes);
+            let result = least_squares_bounded(
+                |x| x.iter().map(|value| value - 3.0).collect(),
+                &vec![0.0; n],
+                &vec![-1.0; n],
+                &vec![4.0; n],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new_operator(move |_| {
+                        IdentityJacobianProbe {
+                            dimension: n,
+                            products: Arc::clone(&product_counter),
+                            basis_probes: Arc::clone(&probe_counter),
+                        }
+                    })),
+                    callback: Some(LeastSquaresCallback::new(move |state| {
+                        assert_eq!(state.x.len(), n);
+                        assert!(state.fun.iter().zip(state.x).all(|(f, x)| *f == x - 3.0));
+                        ControlFlow::Break(())
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.status, -2);
+            assert!(result.jac.is_operator());
+            assert_eq!(probes.load(Ordering::Relaxed), 0);
+            assert!(products.load(Ordering::Relaxed) > 0);
+        }
     }
 
     #[test]

@@ -14,6 +14,199 @@ use fsci_opt::{
 use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
 use serde::{Deserialize, Serialize};
 
+#[test]
+fn iteration_callbacks_match_live_scipy_stopping_points() {
+    use fsci_opt::LeastSquaresCallback;
+    use std::ops::ControlFlow;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Deserialize)]
+    struct Iteration {
+        x: Vec<f64>,
+        fun: Vec<f64>,
+        cost: f64,
+        nit: usize,
+        nfev: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct Row {
+        iterations: Vec<Iteration>,
+        result: OracleRow,
+        nfev: usize,
+        njev: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct CallbackOracle {
+        scipy: String,
+        numpy: String,
+        rows: Vec<Row>,
+    }
+
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP least-squares callbacks: missing SciPy; compared cases = 0");
+        return;
+    }
+    let mut cases = Vec::new();
+    for method in ["trf", "dogbox"] {
+        for bounded in [false, true] {
+            for storage in ["dense", "sparse", "operator"] {
+                for stop_after in [1, 2] {
+                    cases.push((method, bounded, storage, stop_after));
+                }
+            }
+        }
+    }
+    let script = r#"
+import json, os, sys
+import numpy as np
+import scipy
+from scipy.optimize import least_squares
+from scipy.sparse import csr_array
+from scipy.sparse.linalg import aslinearoperator
+if os.environ.get("FSCI_REQUIRE_SCIPY_ORACLE") == "1":
+    assert (scipy.__version__, np.__version__) == ("1.17.1", "2.4.3")
+rows = []
+for method, bounded, storage, stop_after in json.loads(sys.argv[1]):
+    iterations = []
+    def callback(intermediate_result):
+        r = intermediate_result
+        iterations.append(dict(x=r.x.tolist(), fun=r.fun.tolist(), cost=r.cost,
+                               nit=r.nit, nfev=r.nfev))
+        if r.nit >= stop_after:
+            raise StopIteration
+    def jac(x):
+        value = np.diag(2*x)
+        return (csr_array(value) if storage == 'sparse' else
+                aslinearoperator(value) if storage == 'operator' else value)
+    result = least_squares(lambda x: np.array([x[0]**2-4, x[1]**2-9]),
+                           [.5, 1.], jac=jac, method=method, callback=callback,
+                           bounds=([0., 0.], [1.5, 10.]) if bounded else (-np.inf, np.inf),
+                           ftol=1e-12, xtol=1e-12, gtol=1e-12)
+    assert result.status == -2 and not result.success
+    rows.append(dict(iterations=iterations, nfev=result.nfev, njev=result.njev,
+                     result=dict(x=result.x.tolist(), cost=result.cost,
+                                 active_mask=result.active_mask.astype(int).tolist(),
+                                 status=int(result.status))))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows), allow_nan=False))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script, &serde_json::to_string(&cases).unwrap()])
+        .output()
+        .expect("launch SciPy callback oracle");
+    assert!(
+        output.status.success(),
+        "SciPy callback oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: CallbackOracle = serde_json::from_slice(&output.stdout).unwrap();
+    if required {
+        assert_eq!((&*oracle.scipy, &*oracle.numpy), ("1.17.1", "2.4.3"));
+    }
+    assert_eq!(oracle.rows.len(), cases.len());
+    let mut compared = 0;
+    for ((method, bounded, storage, stop_after), reference) in cases.iter().zip(&oracle.rows) {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        let limit = *stop_after;
+        let jac = match *storage {
+            "sparse" => LeastSquaresJacobian::new_sparse(|x| {
+                CsrMatrix::from_components(
+                    Shape2D::new(2, 2),
+                    vec![2.0 * x[0], 2.0 * x[1]],
+                    vec![0, 1],
+                    vec![0, 1, 2],
+                    true,
+                )
+                .unwrap()
+            }),
+            "operator" => LeastSquaresJacobian::new_operator(|x| {
+                DenseLinearOperator::from_rows(&[vec![2.0 * x[0], 0.0], vec![0.0, 2.0 * x[1]]])
+                    .unwrap()
+            }),
+            _ => LeastSquaresJacobian::new(|x| vec![vec![2.0 * x[0], 0.0], vec![0.0, 2.0 * x[1]]]),
+        };
+        let options = LeastSquaresOptions {
+            method: Some(if *method == "trf" {
+                LeastSquaresMethod::Trf
+            } else {
+                LeastSquaresMethod::Dogbox
+            }),
+            jac: Some(jac),
+            ftol: 1.0e-12,
+            xtol: 1.0e-12,
+            gtol: 1.0e-12,
+            callback: Some(LeastSquaresCallback::new(move |state| {
+                callback_observed.lock().unwrap().push(Iteration {
+                    x: state.x.to_vec(),
+                    fun: state.fun.to_vec(),
+                    cost: state.cost,
+                    nit: state.nit,
+                    nfev: state.nfev,
+                });
+                if state.nit >= limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })),
+            ..LeastSquaresOptions::default()
+        };
+        let fun = |x: &[f64]| vec![x[0] * x[0] - 4.0, x[1] * x[1] - 9.0];
+        let result = if *bounded {
+            least_squares_bounded(fun, &[0.5, 1.0], &[0.0, 0.0], &[1.5, 10.0], options)
+        } else {
+            least_squares(fun, &[0.5, 1.0], options)
+        }
+        .unwrap();
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), *stop_after);
+        assert_eq!(observed.len(), reference.iterations.len());
+        for (actual, expected) in observed.iter().zip(&reference.iterations) {
+            assert_eq!(actual.nit, expected.nit);
+            assert_eq!(actual.nfev, expected.nfev);
+            for (a, b) in actual
+                .x
+                .iter()
+                .zip(&expected.x)
+                .chain(actual.fun.iter().zip(&expected.fun))
+            {
+                assert!(
+                    (a - b).abs() < 2e-8 * b.abs().max(1.0),
+                    "{method}/{bounded}/{storage}: {actual:?} vs {expected:?}"
+                );
+            }
+            assert!((actual.cost - expected.cost).abs() < 2e-8 * expected.cost.abs().max(1.0));
+        }
+        assert_eq!(result.status, reference.result.status);
+        assert!(!result.success);
+        assert_eq!(result.nit, *stop_after);
+        assert_eq!(result.nfev, reference.nfev);
+        assert_eq!(result.njev, reference.njev);
+        assert_eq!(result.active_mask, reference.result.active_mask);
+        for (a, b) in result.x.iter().zip(&reference.result.x) {
+            assert!((a - b).abs() < 2e-8 * b.abs().max(1.0));
+        }
+        assert!(
+            (result.cost - reference.result.cost).abs() < 2e-8 * reference.result.cost.max(1.0)
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 24);
+    eprintln!(
+        "callbacks: compared {compared} cases against SciPy {} / NumPy {}",
+        oracle.scipy, oracle.numpy
+    );
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Case {
     problem: String,

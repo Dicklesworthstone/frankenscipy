@@ -15,6 +15,7 @@
 //! `method = Dogbox` uses Powell's dogleg path inside rectangular trust regions, intersected
 //! with the original bounds, with active variables excluded from the Gauss–Newton solve.
 
+use crate::curvefit::{LeastSquaresCallback, LeastSquaresIteration};
 use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf_lsmr::{self, TrustRegionSolver};
 use fsci_runtime::RuntimeMode;
@@ -109,7 +110,8 @@ pub(crate) struct TrfOutcome {
     pub active_mask: Vec<i8>,
     pub nfev: usize,
     pub njev: usize,
-    /// 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
+    pub nit: usize,
+    /// -2 callback stop, 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
     pub status: i32,
 }
 
@@ -778,6 +780,7 @@ pub(crate) fn trf<E>(
     loss: Option<&Loss>,
     solver: TrustRegionSolver,
     mode: RuntimeMode,
+    callback: Option<&LeastSquaresCallback>,
 ) -> Result<TrfOutcome, E>
 where
     E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
@@ -841,6 +844,7 @@ where
     let mut alpha = 0.0;
     let mut termination_status: Option<i32> = None;
     let mut g_norm;
+    let mut nit = 0;
 
     loop {
         let (mut v, dv) = if bounded {
@@ -849,7 +853,7 @@ where
             (vec![1.0; n], vec![0.0; n])
         };
         g_norm = norm_inf(&g.iter().zip(&v).map(|(a, b)| a * b).collect::<Vec<_>>());
-        if g_norm < gtol {
+        if termination_status != Some(-2) && g_norm < gtol {
             termination_status = Some(1);
         }
         if termination_status.is_some() || nfev == max_nfev {
@@ -997,6 +1001,23 @@ where
                 scale_inv = sci;
             }
         }
+        nit += 1;
+        if let Some(callback) = callback
+            && callback
+                .call(LeastSquaresIteration {
+                    x: &x,
+                    fun: &f_true,
+                    cost,
+                    nit,
+                    nfev,
+                    njev,
+                })
+                .is_break()
+        {
+            // Re-enter only the termination check, which refreshes optimality
+            // for the returned iterate without evaluating the model again.
+            termination_status = Some(-2);
+        }
     }
 
     let active_mask = if bounded {
@@ -1014,6 +1035,7 @@ where
         active_mask,
         nfev,
         njev,
+        nit,
         status: termination_status.unwrap_or(0),
     })
 }
@@ -1087,6 +1109,7 @@ pub(crate) fn dogbox<E>(
     loss: Option<&Loss>,
     solver: TrustRegionSolver,
     mode: RuntimeMode,
+    callback: Option<&LeastSquaresCallback>,
 ) -> Result<TrfOutcome, E>
 where
     E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
@@ -1139,6 +1162,7 @@ where
     let max_nfev = max_nfev.unwrap_or(n * 100);
     let mut status = None;
     let mut optimality;
+    let mut nit = 0;
 
     loop {
         let free: Vec<usize> = (0..n)
@@ -1146,7 +1170,7 @@ where
             .collect();
         let g_free: Vec<f64> = free.iter().map(|&i| g[i]).collect();
         optimality = norm_inf(&g_free);
-        if optimality < gtol {
+        if status != Some(-2) && optimality < gtol {
             status = Some(1);
         }
         if status.is_some() || nfev >= max_nfev {
@@ -1269,6 +1293,21 @@ where
                 (scale, scale_inv) = compute_jac_scale(&j, Some(&scale_inv))?;
             }
         }
+        nit += 1;
+        if let Some(callback) = callback
+            && callback
+                .call(LeastSquaresIteration {
+                    x: &x,
+                    fun: &f_true,
+                    cost,
+                    nit,
+                    nfev,
+                    njev,
+                })
+                .is_break()
+        {
+            status = Some(-2);
+        }
     }
 
     Ok(TrfOutcome {
@@ -1281,6 +1320,7 @@ where
         active_mask: on_bound,
         nfev,
         njev,
+        nit,
         status: status.unwrap_or(0),
     })
 }
@@ -1347,6 +1387,7 @@ mod tests {
                         Some(&loss),
                         TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default()),
                         RuntimeMode::Strict,
+                        None,
                     )
                     .unwrap()
                 };
@@ -1401,6 +1442,7 @@ mod tests {
             None,
             TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default()),
             RuntimeMode::Strict,
+            None,
         )
         .unwrap();
         assert!(out.status > 0);
