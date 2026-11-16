@@ -205,8 +205,8 @@ criteria are met.
 - [x] Implement trait-level likelihood fits for LogSeries, RandInt and Zipfian, including fixed-n
   Zipfian fitting, invalid-data errors and resource limits (advances frankenscipy-1ksfv.14).
   Rust and live-oracle execution remains pending under section 9.
-- [ ] Correct sparse iterative solver norm underflow/overflow, exact least-squares stationarity
-  and non-finite warm-start validation.
+- [x] Implement range-safe LSQR/LSMR norms and scalar recurrences, exact least-squares
+  stationarity, warm-start and operator-product validation. Executable validation is pending.
 - [ ] Implement sparse/matrix-free bounded linear least squares using the existing LSMR
   infrastructure. This larger feature was deferred until executable validation is available.
 
@@ -243,18 +243,44 @@ changing unrelated source. Implementation checkboxes below do not claim test pas
 - [ ] Execute the Rust tests and the live oracle, and run formatting/Clippy.
 - [ ] Complete the wider fit-completeness Bead's all-family acceptance criteria.
 
-### 9.2 Validation status and next commands
+### 9.2 Sparse iterative reliability
+
+- [x] Preserve ordinary-range norm arithmetic and use stable fallback when squared
+  sums overflow or become subnormal.
+- [x] Correct exact least-squares stationarity with a nonzero residual.
+- [x] Reject non-finite warm starts and incomplete/non-finite operator products,
+  including products used for final true-residual validation.
+- [x] Keep LSMR scalar recurrences and per-component updates in mantissa/exponent
+  form until conversion is safe; preserve subnormal normalization.
+- [x] Distinguish exact stationarity from an underflowed rotation or wholly
+  unrepresentable correction, and exclude the initial condition-estimate sentinel.
+- [x] Add 10 analytical Rust regressions over extreme RHS/matrix scales, damping,
+  warm starts, stationarity, range breakdown and final residual checks.
+- [x] Independently reproduce 29 arithmetic cases and review the source.
+- [ ] Execute the Rust LSMR/LSQR tests and the required 45-comparison SciPy suite.
+- [ ] Verify nonlinear TRF/Dogbox callers with their existing live-oracle suite.
+
+These changes improve shared Euclidean norms and LSQR/LSMR specifically; they
+do not certify every Krylov solver's other dot products at arbitrary scales.
+
+### 9.3 Validation status and next commands
 
 The exact pinned nightly and SciPy/NumPy versions were installed and verified,
 and `cargo fetch --locked` succeeded. The first compilation was interrupted
 after resource contention; a one-job, debug-disabled retry reached fsci-sparse
-before the execution host went offline. No Rust test pass is claimed.
+before the execution host went offline. The host briefly returned, and the
+reviewed source was restored byte-for-byte. A retry encountered a full /tmp;
+a subsequent single-job retry lost the host again during dependency compilation.
+No Rust test or live-SciPy pass is claimed.
 
-Pending checks for the completed fitting subset:
+Pending executable checks for the implemented subsets:
 
 - [ ] `cargo test --locked -p fsci-stats --lib discrete_likelihood_fits`
 - [ ] `cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals`
 - [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-stats --test mle_scipy discrete_mle -- --nocapture`
+- [ ] `cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture`
+- [ ] `cargo test --locked -p fsci-sparse --no-default-features --lib lsqr -- --nocapture`
+- [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-sparse --no-default-features --test lsmr_options_scipy -- --nocapture`
 - [ ] Formatting, workspace check, Clippy and the required broader conformance gates.
 
 The main Beads graph is left open. Local claims and new issue records could not

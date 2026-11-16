@@ -10011,18 +10011,58 @@ fn update_solution_slab(
     }
 }
 
-/// Euclidean norm of a vector.
+/// Euclidean norm of a vector, without mistaking squared-norm underflow for zero.
+/// Keep the established accumulation order in the normal range. Only a sum that
+/// overflows or enters the subnormal range needs the scaled `hypot` fallback.
 fn vec_norm(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    let squared = v.iter().map(|x| x * x).sum::<f64>();
+    if squared.is_normal() || squared.is_nan() {
+        squared.sqrt()
+    } else {
+        v.iter().fold(0.0_f64, |norm, &value| norm.hypot(value))
+    }
 }
 
 /// Euclidean norm of (a - b).
 fn vec_norm_diff(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
+    let squared = a
+        .iter()
         .zip(b.iter())
         .map(|(ai, bi)| (ai - bi).powi(2))
-        .sum::<f64>()
-        .sqrt()
+        .sum::<f64>();
+    if squared.is_normal() || squared.is_nan() {
+        squared.sqrt()
+    } else {
+        a.iter()
+            .zip(b)
+            .fold(0.0_f64, |norm, (ai, bi)| norm.hypot(ai - bi))
+    }
+}
+
+fn finite_least_squares_norm(norm: f64) -> SparseResult<f64> {
+    if norm.is_finite() {
+        Ok(norm)
+    } else {
+        Err(SparseError::NonFiniteInput {
+            message: "least-squares input, operator product, or recurrence has a non-finite norm"
+                .to_string(),
+        })
+    }
+}
+
+/// Recompute the reported residual, rejecting a poisoned or unwritten operator
+/// output even when the recurrence itself has already satisfied a stopping test.
+fn least_squares_relative_residual(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    x: &[f64],
+    b_norm: f64,
+) -> SparseResult<f64> {
+    finite_least_squares_norm(vec_norm(x))?;
+    let mut ax = vec![f64::NAN; b.len()];
+    a.matvec_into(x, &mut ax)?;
+    let norm = finite_least_squares_norm(vec_norm_diff(&ax, b))?;
+    finite_least_squares_norm(norm / b_norm)
 }
 
 /// Dot product of two vectors.
@@ -11563,7 +11603,7 @@ fn lsqr_impl(
     // the change can only turn a converged result into a non-converged one, never a
     // wrong answer.
     let max_iter = options.max_iter.unwrap_or(2 * n);
-    let b_norm = vec_norm(b);
+    let b_norm = finite_least_squares_norm(vec_norm(b))?;
     if rhs_is_zero(b_norm) {
         if let Some(start) = x0 {
             // With a guess, b = 0 is NOT a zero problem: the objective
@@ -11607,7 +11647,7 @@ fn lsqr_impl(
         Some(start) => {
             let ax0 = a.matvec(start)?;
             let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
-            let norm = vec_norm(&residual);
+            let norm = finite_least_squares_norm(vec_norm(&residual))?;
             (residual, norm)
         }
     };
@@ -11630,7 +11670,7 @@ fn lsqr_impl(
     // α₁v₁ = A^T u₁
     let mut atb = vec![0.0; n];
     csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atb)?;
-    let mut alpha = vec_norm(&atb);
+    let mut alpha = finite_least_squares_norm(vec_norm(&atb))?;
     let mut v: Vec<f64> = if alpha > 0.0 {
         atb.iter().map(|ai| ai / alpha).collect()
     } else {
@@ -11679,7 +11719,7 @@ fn lsqr_impl(
         for i in 0..m {
             u[i] = av[i] - alpha * u[i];
         }
-        beta = vec_norm(&u);
+        beta = finite_least_squares_norm(vec_norm(&u))?;
         if beta > 0.0 {
             for ui in &mut u {
                 *ui /= beta;
@@ -11695,7 +11735,7 @@ fn lsqr_impl(
             for i in 0..n {
                 v[i] = atu[i] - beta * v[i];
             }
-            alpha = vec_norm(&v);
+            alpha = finite_least_squares_norm(vec_norm(&v))?;
             if alpha > 0.0 {
                 for vi in &mut v {
                     *vi /= alpha;
@@ -11762,9 +11802,35 @@ fn lsqr_impl(
         //
         // SciPy performs this update unconditionally; the degenerate case it
         // guards structurally, via the `arnorm == 0` early return mirrored above.
+        let step_scale =
+            if phi == 0.0 && rho_bar_before_damping != 0.0 && phi_bar_before_damping != 0.0 {
+                ScaledValue::from_f64(rho_bar_before_damping)
+                    .mul(ScaledValue::from_f64(phi_bar_before_damping))
+                    .div(ScaledValue::from_f64(rho).mul(ScaledValue::from_f64(rho)))
+            } else {
+                ScaledValue::from_f64(phi).div(ScaledValue::from_f64(rho))
+            };
+        let mut nonzero_update = false;
+        let mut representable_update = false;
         for i in 0..n {
-            x[i] += (phi / rho) * w[i];
+            let update = scaled_product_to_f64(step_scale, w[i]).ok_or_else(|| {
+                SparseError::NonFiniteInput {
+                    message: "lsqr solution update exceeds the floating-point range".to_string(),
+                }
+            })?;
+            nonzero_update |= step_scale.mantissa != 0.0 && w[i] != 0.0;
+            representable_update |= update != 0.0;
+            x[i] += update;
             w[i] = v[i] - (theta / rho) * w[i];
+        }
+        if nonzero_update && !representable_update {
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: residual_norm <= options.tol,
+                iterations: iteration + 1,
+                residual_norm,
+            });
         }
 
         // Check convergence — SciPy's istop=1: the residual itself is small.
@@ -11773,13 +11839,13 @@ fn lsqr_impl(
         let r_norm = phi_bar.hypot(damping_residual_norm);
         let res_norm = r_norm / b_norm;
         if res_norm <= options.tol {
-            let ax = a.matvec(&x)?;
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 // status: istop 1, estimated augmented residual / ‖b‖ ≤ tol
                 converged: true,
                 iterations: iteration + 1,
-                residual_norm: vec_norm_diff(&ax, b) / b_norm,
+                residual_norm,
             });
         }
 
@@ -11825,7 +11891,7 @@ fn lsqr_impl(
             false
         };
         if normal_residual_is_zero || normal_residual_is_small {
-            let ax = a.matvec(&x)?;
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 // status: istop 2, ‖Aᵀr‖/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
@@ -11834,13 +11900,12 @@ fn lsqr_impl(
                 // The TRUE relative residual, which for an inconsistent system is
                 // not small and must not be reported as if it were: ‖r‖ is the
                 // least-squares floor, and optimality is what was just proven.
-                residual_norm: vec_norm_diff(&ax, b) / b_norm,
+                residual_norm,
             });
         }
     }
 
-    let ax = a.matvec(&x)?;
-    let final_norm = vec_norm_diff(&ax, b) / b_norm;
+    let final_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
     Ok(IterativeSolveResult {
         solution: x,
         converged: false,
@@ -11908,6 +11973,9 @@ impl Default for LsmrOptions<'_> {
 /// by SciPy, including its zero-iteration initialization (`normx = 0`).
 /// `normr` includes the damping block; it is not the relative residual exposed
 /// by [`IterativeSolveResult`].
+/// An absolute `normar` outside the f64 range rounds to zero or infinity; the
+/// convergence decision retains its separate exponent and does not use that
+/// rounded diagnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LsmrResult {
     pub solution: Vec<f64>,
@@ -11982,7 +12050,7 @@ pub fn lsmr_with_options(
         },
     )?;
 
-    let normb = vec_norm(b);
+    let normb = finite_least_squares_norm(vec_norm(b))?;
     let mut x = options.x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
     let mut u = match options.x0 {
         Some(_) => {
@@ -11991,22 +12059,16 @@ pub fn lsmr_with_options(
         }
         None => b.to_vec(),
     };
-    let mut beta = vec_norm(&u);
+    let mut beta = finite_least_squares_norm(vec_norm(&u))?;
     let cached_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
     let mut v = vec![0.0; n];
     let mut alpha = 0.0;
     if beta > 0.0 {
-        let inverse = 1.0 / beta;
-        for entry in &mut u {
-            *entry *= inverse;
-        }
+        lsmr_normalize(&mut u, beta, true);
         csc_transpose_matvec_into(a, cached_csc.as_ref(), &u, &mut v)?;
-        alpha = vec_norm(&v);
+        alpha = finite_least_squares_norm(vec_norm(&v))?;
         if alpha > 0.0 {
-            let inverse = 1.0 / alpha;
-            for entry in &mut v {
-                *entry *= inverse;
-            }
+            lsmr_normalize(&mut v, alpha, true);
         }
     }
     if !alpha.is_finite() || !beta.is_finite() {
@@ -12014,18 +12076,19 @@ pub fn lsmr_with_options(
             message: "lsmr operator or initial residual produced a non-finite norm".to_string(),
         });
     }
-    let mut norm_a_squared = alpha * alpha;
-    let mut norma = norm_a_squared.sqrt();
+    let mut norm_a_accumulated = alpha;
+    let mut norma = alpha;
     let mut conda = 1.0;
     let mut normx = 0.0;
     let mut normr = beta;
-    let mut normar = alpha * beta;
+    let initial_normar = ScaledValue::from_f64(alpha).mul(ScaledValue::from_f64(beta));
+    let mut normar = initial_normar.to_f64().unwrap_or(f64::INFINITY);
     let mut istop = 0;
     let mut iterations = 0;
     // SciPy checks stationarity before a zero rhs, which matters for a warm
     // start in the operator's nullspace.
-    if normar == 0.0 || normb == 0.0 {
-        if normar != 0.0 && normb == 0.0 {
+    if alpha == 0.0 || beta == 0.0 || normb == 0.0 {
+        if alpha != 0.0 && beta != 0.0 && normb == 0.0 {
             x.fill(0.0);
         }
         return Ok(LsmrResult {
@@ -12047,7 +12110,7 @@ pub fn lsmr_with_options(
         0.0
     };
     let mut max_r_bar = 0.0_f64;
-    let mut min_r_bar = 1.0e100_f64;
+    let mut min_r_bar = f64::INFINITY;
     let mut recurrence = LsmrRecurrence::new(alpha, beta, &v);
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
@@ -12075,35 +12138,39 @@ pub fn lsmr_with_options(
             })?;
         iterations = iteration + 1;
         normr = step.normr;
-        normar = step.normar;
+        normar = step.normar.to_f64().unwrap_or(f64::INFINITY);
 
         // Include alpha_1 from initialization, then beta_(k+1) before the
-        // square root and alpha_(k+1) afterwards, exactly as SciPy does.
-        norm_a_squared += beta * beta;
-        norma = norm_a_squared.sqrt();
-        norm_a_squared += alpha * alpha;
-        max_r_bar = max_r_bar.max(step.rho_bar_old);
+        // reported norm and alpha_(k+1) afterwards. `hypot` keeps the same
+        // bidiagonal estimate without squaring the operator's scale.
+        norma = norm_a_accumulated.hypot(beta);
+        norm_a_accumulated = norma.hypot(alpha);
         if iterations > 1 {
+            // rho_bar_old starts at the dimensionless placeholder 1. It is
+            // an operator-scale QR diagonal only after the first iteration.
+            max_r_bar = max_r_bar.max(step.rho_bar_old);
             min_r_bar = min_r_bar.min(step.rho_bar_old);
         }
         conda = max_r_bar.max(step.rho_temp) / min_r_bar.min(step.rho_temp);
         normx = vec_norm(&x);
-        if !normr.is_finite() || !normar.is_finite() || !norma.is_finite() || !normx.is_finite() {
+        if !normr.is_finite() || !norma.is_finite() || !normx.is_finite() {
             return Err(SparseError::NonFiniteInput {
                 message: "lsmr arithmetic produced non-finite residual or solution norms"
                     .to_string(),
             });
         }
 
-        let test1 = normr / normb;
-        let test2 = if norma * normr != 0.0 {
-            normar / (norma * normr)
-        } else {
-            f64::INFINITY
-        };
+        let test2 = lsmr_relative_normal_residual(step.normar, norma, normr);
         let test3 = 1.0 / conda;
-        let scaled_residual = test1 / (1.0 + norma * normx / normb);
-        let rtol = options.btol + options.atol * norma * normx / normb;
+        let ax_norm = ScaledValue::from_f64(norma).mul(ScaledValue::from_f64(normx));
+        let scaled_residual = ScaledValue::from_f64(normr)
+            .div(ScaledValue::from_f64(normb).add(ax_norm))
+            .to_f64()
+            .unwrap_or(f64::INFINITY);
+        let compatible_tolerance = ScaledValue::from_f64(options.btol)
+            .mul(ScaledValue::from_f64(normb))
+            .add(ScaledValue::from_f64(options.atol).mul(ax_norm));
+        let stationary = lsmr_normal_residual_within(step.normar, norma, normr, options.atol);
         // Later tests override earlier ones. In particular, convergence on
         // the final allowed iteration is not reported as budget exhaustion.
         if iterations >= max_iter {
@@ -12121,10 +12188,10 @@ pub fn lsmr_with_options(
         if test3 <= ctol {
             istop = 3;
         }
-        if test2 <= options.atol {
+        if stationary {
             istop = 2;
         }
-        if test1 <= rtol {
+        if ScaledValue::from_f64(normr).abs_le(compatible_tolerance) {
             istop = 1;
         }
         if istop != 0 {
@@ -12303,9 +12370,9 @@ fn lsmr_impl(
             message: "rhs length must match matrix rows".to_string(),
         });
     }
-    validate_iterative_finite_inputs(a, b, None, options)?;
+    validate_iterative_finite_inputs(a, b, x0, options)?;
 
-    let b_norm = vec_norm(b);
+    let b_norm = finite_least_squares_norm(vec_norm(b))?;
     if rhs_is_zero(b_norm) {
         // Unlike lsqr_impl (where SciPy's answer for b = 0 with a guess divides by zero and fsci
         // solves the damped correction problem instead), lsmr keeps SciPy's behaviour here.
@@ -12342,7 +12409,7 @@ fn lsmr_impl(
         Some(start) => {
             let ax0 = a.matvec(start)?;
             let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
-            let norm = vec_norm(&residual);
+            let norm = finite_least_squares_norm(vec_norm(&residual))?;
             (residual, norm)
         }
     };
@@ -12362,7 +12429,7 @@ fn lsmr_impl(
     }
     let mut v = vec![0.0; n];
     csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut v)?;
-    let mut alpha = vec_norm(&v);
+    let mut alpha = finite_least_squares_norm(vec_norm(&v))?;
     // α = ‖Aᵀu‖ with u already normalized, so it carries the units of ‖A‖: a
     // bare `f64::EPSILON` here asked whether the MATRIX was small, and returned
     // the zero vector after zero iterations for any system scaled below about
@@ -12379,7 +12446,9 @@ fn lsmr_impl(
         let residual_norm = beta_0 / b_norm;
         return Ok(IterativeSolveResult {
             solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
-            converged: residual_norm <= options.tol,
+            // status: alpha = 0 proves exact normal-equation stationarity,
+            // even when the inconsistent system has a nonzero residual.
+            converged: true,
             iterations: 0,
             residual_norm,
         });
@@ -12389,9 +12458,9 @@ fn lsmr_impl(
     }
 
     let mut recurrence = LsmrRecurrence::new(alpha, beta_0, &v);
-    // Retain this API's existing norm estimate and relative-residual stopping
-    // rules. The SciPy-options entry point has independent atol/btol tests.
-    let mut a_norm_sq = 0.0_f64;
+    // Include the first diagonal and accumulate norms without squaring the
+    // operator's scale. The SciPy-options API has independent atol/btol tests.
+    let mut a_norm_accumulated = alpha;
     let mut x = x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
@@ -12408,8 +12477,7 @@ fn lsmr_impl(
             false,
         )?;
         let Some(step) = recurrence.advance(alpha, beta, damp, &v, &mut x) else {
-            a.matvec_into(&x, &mut av)?;
-            let residual_norm = vec_norm_diff(&av, b) / b_norm;
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: residual_norm <= options.tol,
@@ -12417,6 +12485,8 @@ fn lsmr_impl(
                 residual_norm,
             });
         };
+        finite_least_squares_norm(step.normr)?;
+        finite_least_squares_norm(vec_norm(&x))?;
         let estimated_residual = step.normr / b_norm;
 
         // SciPy's istop=2, in LSMR's own quantities: ‖Aᵀr‖ is estimated by
@@ -12430,16 +12500,10 @@ fn lsmr_impl(
         // exact zero — so the recurrence kept running on a spent subspace and
         // returned ‖x‖ ≈ 2.7e17 as `Ok` for a rank-2 3×3, where SciPy returns
         // [0.6, -0.2, 0.4] (frankenscipy-7crv5, RCH_WORKER=vmi1153651).
-        a_norm_sq += alpha * alpha + beta * beta;
-        let a_norm = a_norm_sq.sqrt();
-        let normal_residual = step.normar;
-        let unscaled_residual = estimated_residual * b_norm;
-        if normal_residual > 0.0
-            && a_norm > 0.0
-            && unscaled_residual > 0.0
-            && normal_residual / (a_norm * unscaled_residual) <= options.tol
-        {
-            a.matvec_into(&x, &mut av)?;
+        let a_norm = finite_least_squares_norm(a_norm_accumulated.hypot(beta))?;
+        a_norm_accumulated = a_norm.hypot(alpha);
+        if lsmr_normal_residual_within(step.normar, a_norm, step.normr, options.tol) {
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
                 // status: istop 2, ‖Aᵀr‖ estimate |ζ̄|/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
@@ -12448,32 +12512,47 @@ fn lsmr_impl(
                 // Reported honestly: for an inconsistent system this is the
                 // least-squares floor, not a small number, and optimality —
                 // not smallness — is what was just established.
-                residual_norm: vec_norm_diff(&av, b) / b_norm,
+                residual_norm,
             });
         }
 
         // Golub-Kahan has terminated exactly when α or β is zero; below that it
         // is still producing information, however small the matrix happens to be.
         if estimated_residual <= options.tol || alpha == 0.0 || beta == 0.0 {
-            a.matvec_into(&x, &mut av)?;
-            let residual_norm = vec_norm_diff(&av, b) / b_norm;
+            let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
-                converged: residual_norm <= options.tol,
+                // status: estimated relative residual <= tol, or exact
+                // alpha/beta = 0 proves least-squares stationarity.
+                converged: true,
                 iterations: iteration + 1,
                 residual_norm,
             });
         }
     }
 
-    a.matvec_into(&x, &mut av)?;
-    let residual_norm = vec_norm_diff(&av, b) / b_norm;
+    let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
     Ok(IterativeSolveResult {
         solution: x,
         converged: residual_norm <= options.tol,
         iterations: max_iter,
         residual_norm,
     })
+}
+
+/// Normalize without an overflowing reciprocal for a subnormal norm. Preserve
+/// SciPy's multiplication order wherever its reciprocal is representable.
+fn lsmr_normalize(vector: &mut [f64], norm: f64, reciprocal_scaling: bool) {
+    let inverse = 1.0 / norm;
+    if reciprocal_scaling && inverse.is_finite() {
+        for entry in vector {
+            *entry *= inverse;
+        }
+    } else {
+        for entry in vector {
+            *entry /= norm;
+        }
+    }
 }
 
 /// One Golub–Kahan step shared by both LSMR stopping policies.
@@ -12493,34 +12572,16 @@ fn lsmr_bidiagonalize(
     for index in 0..u.len() {
         u[index] = av[index] - *alpha * u[index];
     }
-    let beta = vec_norm(u);
+    let beta = finite_least_squares_norm(vec_norm(u))?;
     if beta > 0.0 {
-        if reciprocal_scaling {
-            let inverse = 1.0 / beta;
-            for entry in u.iter_mut() {
-                *entry *= inverse;
-            }
-        } else {
-            for entry in u.iter_mut() {
-                *entry /= beta;
-            }
-        }
+        lsmr_normalize(u, beta, reciprocal_scaling);
         csc_transpose_matvec_into(a, cached_csc, u, atu)?;
         for index in 0..v.len() {
             v[index] = atu[index] - beta * v[index];
         }
-        *alpha = vec_norm(v);
+        *alpha = finite_least_squares_norm(vec_norm(v))?;
         if *alpha > 0.0 {
-            if reciprocal_scaling {
-                let inverse = 1.0 / *alpha;
-                for entry in v.iter_mut() {
-                    *entry *= inverse;
-                }
-            } else {
-                for entry in v.iter_mut() {
-                    *entry /= *alpha;
-                }
-            }
+            lsmr_normalize(v, *alpha, reciprocal_scaling);
         }
     }
     Ok(beta)
@@ -12535,7 +12596,10 @@ struct LsmrRecurrence {
     rho_bar: f64,
     c_bar: f64,
     s_bar: f64,
-    zeta_bar: f64,
+    // zeta carries ||A|| * ||b||. It can underflow or overflow even when
+    // every vector and the final step are representable. Keep its exponent
+    // until division by the two QR diagonals restores solution units.
+    zeta_bar: ScaledValue,
     h: Vec<f64>,
     h_bar: Vec<f64>,
     beta_dd: f64,
@@ -12543,13 +12607,13 @@ struct LsmrRecurrence {
     rho_d_old: f64,
     tau_tilde_old: f64,
     theta_tilde: f64,
-    zeta: f64,
-    residual_squared: f64,
+    zeta: ScaledValue,
+    damping_residual_norm: f64,
 }
 
 struct LsmrStep {
     normr: f64,
-    normar: f64,
+    normar: ScaledValue,
     rho_bar_old: f64,
     rho_temp: f64,
 }
@@ -12562,7 +12626,7 @@ impl LsmrRecurrence {
             rho_bar: 1.0,
             c_bar: 1.0,
             s_bar: 0.0,
-            zeta_bar: alpha * beta,
+            zeta_bar: ScaledValue::from_f64(alpha).mul(ScaledValue::from_f64(beta)),
             h: v.to_vec(),
             h_bar: vec![0.0; v.len()],
             beta_dd: beta,
@@ -12570,8 +12634,8 @@ impl LsmrRecurrence {
             rho_d_old: 1.0,
             tau_tilde_old: 0.0,
             theta_tilde: 0.0,
-            zeta: 0.0,
-            residual_squared: 0.0,
+            zeta: ScaledValue::default(),
+            damping_residual_norm: 0.0,
         }
     }
 
@@ -12592,25 +12656,62 @@ impl LsmrRecurrence {
 
         let rho_bar_old = self.rho_bar;
         let zeta_old = self.zeta;
-        let theta_bar = self.s_bar * rho;
-        let rho_temp = self.c_bar * rho;
+        let s_bar_old = self.s_bar;
+        let c_bar_old = self.c_bar;
+        let theta_bar = s_bar_old * rho;
+        let rho_temp = c_bar_old * rho;
         let (c_bar, s_bar, rho_bar) = symmetric_orthogonalization(rho_temp, theta_new);
         self.c_bar = c_bar;
         self.s_bar = s_bar;
         self.rho_bar = rho_bar;
         // The previous API's exact-zero breakdown guard is retained. No
         // epsilon clamp is valid here: the coefficients carry matrix units.
-        if rho == 0.0 || rho_bar == 0.0 {
+        if rho == 0.0 || rho_bar == 0.0 || !rho.is_finite() || !rho_bar.is_finite() {
             return None;
         }
-        self.zeta = c_bar * self.zeta_bar;
-        self.zeta_bar *= -s_bar;
+        self.zeta = if c_bar == 0.0 && c_bar_old != 0.0 {
+            self.zeta_bar
+                .mul(ScaledValue::from_f64(c_bar_old))
+                .mul(ScaledValue::from_f64(rho))
+                .div(ScaledValue::from_f64(rho_bar))
+        } else {
+            self.zeta_bar.mul(ScaledValue::from_f64(c_bar))
+        };
+        self.zeta_bar = if s_bar == 0.0 && alpha > 0.0 && beta > 0.0 {
+            // theta_new = (beta / rho) * alpha and s_bar = theta_new / rho_bar.
+            // A rounded-to-zero rotation sine is not exact stationarity.
+            self.zeta_bar
+                .mul(ScaledValue::from_f64(-beta))
+                .mul(ScaledValue::from_f64(alpha))
+                .div(ScaledValue::from_f64(rho))
+                .div(ScaledValue::from_f64(rho_bar))
+        } else {
+            self.zeta_bar.mul(ScaledValue::from_f64(-s_bar))
+        };
 
-        let h_bar_scale = -(theta_bar * rho / (rho_old * rho_bar_old));
+        let h_bar_scale = ScaledValue::from_f64(-s_bar_old)
+            .mul(ScaledValue::from_f64(rho))
+            .mul(ScaledValue::from_f64(rho))
+            .div(ScaledValue::from_f64(rho_old).mul(ScaledValue::from_f64(rho_bar_old)));
+        let step_scale = self
+            .zeta
+            .div(ScaledValue::from_f64(rho).mul(ScaledValue::from_f64(rho_bar)));
+        let mut nonzero_update = false;
+        let mut representable_update = false;
         for index in 0..x.len() {
-            self.h_bar[index] = self.h[index] + h_bar_scale * self.h_bar[index];
-            x[index] += self.zeta / (rho * rho_bar) * self.h_bar[index];
+            self.h_bar[index] =
+                self.h[index] + scaled_product_to_f64(h_bar_scale, self.h_bar[index])?;
+            let update = scaled_product_to_f64(step_scale, self.h_bar[index])?;
+            nonzero_update |= step_scale.mantissa != 0.0 && self.h_bar[index] != 0.0;
+            representable_update |= update != 0.0;
+            x[index] += update;
             self.h[index] = v[index] - theta_new / rho * self.h[index];
+        }
+        // A nonzero correction that has no representable component cannot
+        // justify the recurrence's apparent residual reduction. The caller
+        // verifies the actual residual or reports a numerical breakdown.
+        if nonzero_update && !representable_update {
+            return None;
         }
 
         let beta_acute = c_hat * self.beta_dd;
@@ -12624,13 +12725,29 @@ impl LsmrRecurrence {
         self.theta_tilde = s_tilde_old * rho_bar;
         self.rho_d_old = c_tilde_old * rho_bar;
         self.beta_d = -s_tilde_old * self.beta_d + c_tilde_old * beta_hat;
-        self.tau_tilde_old = (zeta_old - theta_tilde_old * self.tau_tilde_old) / rho_tilde_old;
-        let tau_d = (self.zeta - self.theta_tilde * self.tau_tilde_old) / self.rho_d_old;
-        self.residual_squared += beta_check * beta_check;
-        let normr = (self.residual_squared
-            + (self.beta_d - tau_d) * (self.beta_d - tau_d)
-            + self.beta_dd * self.beta_dd)
-            .sqrt();
+        if rho_tilde_old == 0.0 || self.rho_d_old == 0.0 || !rho_tilde_old.is_finite() {
+            return None;
+        }
+        self.tau_tilde_old = zeta_old
+            .add(
+                ScaledValue::from_f64(-theta_tilde_old)
+                    .mul(ScaledValue::from_f64(self.tau_tilde_old)),
+            )
+            .div(ScaledValue::from_f64(rho_tilde_old))
+            .to_f64()?;
+        let tau_d = self
+            .zeta
+            .add(
+                ScaledValue::from_f64(-self.theta_tilde)
+                    .mul(ScaledValue::from_f64(self.tau_tilde_old)),
+            )
+            .div(ScaledValue::from_f64(self.rho_d_old))
+            .to_f64()?;
+        self.damping_residual_norm = self.damping_residual_norm.hypot(beta_check);
+        let normr = self
+            .damping_residual_norm
+            .hypot(self.beta_d - tau_d)
+            .hypot(self.beta_dd);
         Some(LsmrStep {
             normr,
             normar: self.zeta_bar.abs(),
@@ -12640,9 +12757,50 @@ impl LsmrRecurrence {
     }
 }
 
+/// Apply a scalar with a separate exponent before rounding the component. The
+/// ordinary product order is retained whenever its intermediate is normal.
+fn scaled_product_to_f64(coefficient: ScaledValue, value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    if let Some(factor) = coefficient.to_f64() {
+        let product = factor * value;
+        if product.is_normal() || coefficient.mantissa == 0.0 || value == 0.0 {
+            return Some(product);
+        }
+    }
+    coefficient.mul(ScaledValue::from_f64(value)).to_f64()
+}
+
+/// The absolute normal residual can be outside the f64 range while this ratio
+/// is well resolved. Do not round either product before the stopping decision.
+fn lsmr_relative_normal_residual(normar: ScaledValue, norma: f64, normr: f64) -> f64 {
+    if norma > 0.0 && normr > 0.0 {
+        normar
+            .div(ScaledValue::from_f64(norma).mul(ScaledValue::from_f64(normr)))
+            .to_f64()
+            .unwrap_or(f64::INFINITY)
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn lsmr_normal_residual_within(normar: ScaledValue, norma: f64, normr: f64, tol: f64) -> bool {
+    norma > 0.0
+        && normr > 0.0
+        && normar.abs_le(
+            ScaledValue::from_f64(norma)
+                .mul(ScaledValue::from_f64(normr))
+                .mul(ScaledValue::from_f64(tol)),
+        )
+}
+
 #[cfg(test)]
 mod lsmr_options_tests {
-    use super::{LsmrOptions, lsmr_with_options};
+    use super::{
+        IterativeSolveOptions, LsmrOptions, RuntimeMode, lsmr, lsmr_regularized, lsmr_with_options,
+        lsqr, lsqr_regularized, vec_norm, vec_norm_diff,
+    };
     use crate::{DenseLinearOperator, FunctionOperator, Shape2D, SparseError};
 
     fn dense(rows: &[&[f64]]) -> DenseLinearOperator {
@@ -12655,6 +12813,278 @@ mod lsmr_options_tests {
             (actual - expected).abs() <= 1.0e-12 * expected.abs().max(1.0),
             "actual={actual:.17e}, expected={expected:.17e}"
         );
+    }
+
+    #[test]
+    fn least_squares_norms_keep_finite_extreme_scales() {
+        // frankenscipy-v3dir: squaring first erased small nonzero right-hand
+        // sides and overflowed large vectors whose norms are representable.
+        for scale in [1e-200, 1e200] {
+            let vector = [3.0 * scale, 4.0 * scale];
+            close(vec_norm(&vector) / scale, 5.0);
+            close(vec_norm_diff(&vector, &[0.0, 0.0]) / scale, 5.0);
+        }
+        let smallest = f64::from_bits(1);
+        assert_eq!(vec_norm(&[smallest]), smallest);
+        assert_eq!(vec_norm_diff(&[smallest], &[0.0]), smallest);
+        assert_eq!(vec_norm(&[]), 0.0);
+        assert!(vec_norm(&[f64::NAN, f64::INFINITY]).is_nan());
+        assert!(vec_norm(&[f64::INFINITY]).is_infinite());
+
+        let ordinary = [1.0, -2.0, 3.0, 0.25];
+        let original = ordinary
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        assert_eq!(vec_norm(&ordinary).to_bits(), original.to_bits());
+    }
+
+    #[test]
+    fn least_squares_extreme_rhs_is_solved_without_false_zero_or_overflow() {
+        let identity = dense(&[&[1.0, 0.0], &[0.0, 1.0]]);
+        let controls = IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(8),
+            ..IterativeSolveOptions::default()
+        };
+        for scale in [1e-200, 1e200] {
+            let rhs = [3.0 * scale, 4.0 * scale];
+            for result in [
+                lsqr(&identity, &rhs, controls).expect("range-safe LSQR"),
+                lsmr(&identity, &rhs, controls).expect("range-safe LSMR"),
+            ] {
+                assert!(result.converged, "scale={scale}, {result:?}");
+                assert!(result.iterations > 0, "nonzero rhs must be solved");
+                close(result.solution[0] / scale, 3.0);
+                close(result.solution[1] / scale, 4.0);
+                assert!(result.residual_norm < 1e-12, "{result:?}");
+            }
+            let result = lsmr_with_options(
+                &identity,
+                &rhs,
+                LsmrOptions {
+                    atol: 1e-12,
+                    btol: 1e-12,
+                    max_iter: Some(8),
+                    ..LsmrOptions::default()
+                },
+            )
+            .expect("range-safe SciPy-options LSMR");
+            assert_eq!(result.istop, 1, "scale={scale}, {result:?}");
+            close(result.solution[0] / scale, 3.0);
+            close(result.solution[1] / scale, 4.0);
+        }
+    }
+
+    #[test]
+    fn least_squares_scaled_matrices_keep_damped_warm_start_solutions() {
+        let start = [0.25, 0.75];
+        let controls = IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(20),
+            ..IterativeSolveOptions::default()
+        };
+        for scale in [1e-200, 1e-160, 1.0, 1e160, 1e200] {
+            let a = dense(&[&[scale, 0.0], &[0.0, 2.0 * scale]]);
+            let b = [scale, 2.0 * scale];
+            for damping in [0.0, 1.0] {
+                // Divide the objective by scale² to obtain the analytical
+                // optimum without squaring scale in the reference calculation.
+                let expected = if damping == 0.0 {
+                    [1.0, 1.0]
+                } else {
+                    [0.625, 0.95]
+                };
+                for result in [
+                    lsqr_regularized(&a, &b, damping * scale, Some(&start), controls)
+                        .expect("scaled LSQR"),
+                    lsmr_regularized(&a, &b, damping * scale, Some(&start), controls)
+                        .expect("scaled LSMR"),
+                ] {
+                    assert!(
+                        result.converged,
+                        "scale={scale}, damping={damping}, {result:?}"
+                    );
+                    close(result.solution[0], expected[0]);
+                    close(result.solution[1], expected[1]);
+                    let residual = (result.solution[0] - 1.0)
+                        .hypot(2.0 * (result.solution[1] - 1.0))
+                        / 5.0_f64.sqrt();
+                    close(result.residual_norm, residual);
+                }
+                let result = lsmr_with_options(
+                    &a,
+                    &b,
+                    LsmrOptions {
+                        damp: damping * scale,
+                        x0: Some(&start),
+                        atol: 1e-12,
+                        btol: 1e-12,
+                        max_iter: Some(20),
+                        ..LsmrOptions::default()
+                    },
+                )
+                .expect("scaled SciPy-options LSMR");
+                assert!(matches!(result.istop, 1 | 2), "scale={scale}, {result:?}");
+                close(result.solution[0], expected[0]);
+                close(result.solution[1], expected[1]);
+                assert!(
+                    result.conda.is_finite() && result.conda < 10.0,
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_unrepresentable_solution_is_not_reported_as_converged() {
+        // The mathematical solution is 1e-400. A returned f64 zero leaves
+        // the full residual, so exact Krylov exhaustion cannot certify it.
+        let a = dense(&[&[1e200]]);
+        for result in [
+            lsqr(&a, &[1e-200], IterativeSolveOptions::default()).expect("LSQR range limit"),
+            lsmr(&a, &[1e-200], IterativeSolveOptions::default()).expect("LSMR range limit"),
+        ] {
+            assert!(!result.converged, "{result:?}");
+            assert_eq!(result.solution, vec![0.0]);
+            assert_eq!(result.residual_norm, 1.0);
+        }
+        assert!(matches!(
+            lsmr_with_options(&a, &[1e-200], LsmrOptions::default()),
+            Err(SparseError::SingularMatrix { .. })
+        ));
+    }
+
+    #[test]
+    fn lsmr_normalizes_a_subnormal_rhs_without_an_infinite_reciprocal() {
+        let a = dense(&[&[1.0]]);
+        let smallest = f64::from_bits(1);
+        let result = lsmr_with_options(&a, &[smallest], LsmrOptions::default())
+            .expect("representable subnormal solution");
+        assert_eq!(result.solution, vec![smallest]);
+        assert_eq!(result.iterations, 1);
+        assert_eq!(result.istop, 1);
+        assert_eq!(result.normr, 0.0);
+    }
+
+    #[test]
+    fn lsmr_exact_least_squares_stationarity_is_success() {
+        let a = dense(&[&[1.0, 0.0], &[0.0, 0.0]]);
+        let start = [0.0, 7.0];
+        for initial in [None, Some(start.as_slice())] {
+            let result = lsmr_regularized(
+                &a,
+                &[0.0, 3.0],
+                0.5,
+                initial,
+                IterativeSolveOptions::default(),
+            )
+            .expect("stationary initial point");
+            assert!(result.converged, "{result:?}");
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.residual_norm, 1.0);
+            assert_eq!(result.solution.as_slice(), initial.unwrap_or(&[0.0, 0.0]));
+        }
+
+        let a = dense(&[&[1.0], &[0.0]]);
+        let result = lsmr(&a, &[1.0, 1.0], IterativeSolveOptions::default())
+            .expect("one-step inconsistent fit");
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.iterations, 1);
+        close(result.solution[0], 1.0);
+        close(result.residual_norm, 1.0 / 2.0_f64.sqrt());
+    }
+
+    #[test]
+    fn lsmr_does_not_turn_an_underflowed_rotation_into_exact_stationarity() {
+        let a = dense(&[&[1.0, 0.0], &[1e-100, 1.0]]);
+        let result = lsmr_regularized(
+            &a,
+            &[1.0, 0.0],
+            1e300,
+            None,
+            IterativeSolveOptions {
+                tol: 0.0,
+                max_iter: Some(1),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("finite iteration with an unrepresentably small rotation sine");
+        assert!(
+            !result.converged,
+            "a rounded zero is not an exact certificate: {result:?}"
+        );
+        assert_eq!(result.iterations, 1);
+        assert_eq!(result.solution, vec![0.0, 0.0]);
+        assert_eq!(result.residual_norm, 1.0);
+    }
+
+    #[test]
+    fn lsmr_checks_nonfinite_warm_starts_before_zero_rhs_shortcut() {
+        let a = dense(&[&[1.0]]);
+        for controls in [
+            IterativeSolveOptions::default(),
+            IterativeSolveOptions {
+                mode: RuntimeMode::Hardened,
+                check_finite: false,
+                ..IterativeSolveOptions::default()
+            },
+        ] {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for rhs in [0.0, 1.0] {
+                    assert!(matches!(
+                        lsmr_regularized(&a, &[rhs], 0.0, Some(&[bad]), controls),
+                        Err(SparseError::NonFiniteInput { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_rejects_nonfinite_operator_products() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for forward in [false, true] {
+                let a = FunctionOperator::new(Shape2D::new(1, 1), |x| {
+                    Ok(vec![if forward { bad } else { x[0] }])
+                })
+                .with_rmatvec(|x| Ok(vec![if forward { x[0] } else { bad }]));
+                for result in [
+                    lsqr(&a, &[1.0], IterativeSolveOptions::default()),
+                    lsmr(&a, &[1.0], IterativeSolveOptions::default()),
+                ] {
+                    assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
+                }
+                assert!(matches!(
+                    lsmr_with_options(&a, &[1.0], LsmrOptions::default()),
+                    Err(SparseError::NonFiniteInput { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_checks_final_true_residual_after_recurrence_convergence() {
+        use std::cell::Cell;
+
+        for use_lsmr in [false, true] {
+            for bad in [f64::NAN, f64::INFINITY] {
+                let products = Cell::new(0);
+                let a = FunctionOperator::new(Shape2D::new(1, 1), |x| {
+                    products.set(products.get() + 1);
+                    Ok(vec![if products.get() == 1 { x[0] } else { bad }])
+                })
+                .with_rmatvec(|x| Ok(x.to_vec()));
+                let result = if use_lsmr {
+                    lsmr(&a, &[1.0], IterativeSolveOptions::default())
+                } else {
+                    lsqr(&a, &[1.0], IterativeSolveOptions::default())
+                };
+                assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
+                assert_eq!(products.get(), 2, "the final verification must run");
+            }
+        }
     }
 
     #[test]
@@ -49017,16 +49447,16 @@ fn expm_action_product(value: f64, term: f64, step: f64, order: f64) -> Option<f
 }
 
 /// A finite signed mantissa with magnitude in [1, 2), or zero, and an unrestricted
-/// binary exponent. Used only when the ordinary Taylor action encounters a range
-/// risk. Each entry has its own exponent: a growing tiny state must survive beside
-/// a large decaying one even when their ratio cannot be represented by an f64.
+/// binary exponent. Shared by the Taylor action and least-squares scalar recurrences.
+/// Products can leave the f64 range before a later division restores it; retaining
+/// the exponent keeps that intermediate from becoming an infinity or a false zero.
 #[derive(Clone, Copy, Default)]
-struct ExpmScaledValue {
+struct ScaledValue {
     mantissa: f64,
     exponent: i64,
 }
 
-impl ExpmScaledValue {
+impl ScaledValue {
     const SIGN_AND_FRACTION: u64 = 0x800f_ffff_ffff_ffff;
 
     fn from_f64(value: f64) -> Self {
@@ -49315,20 +49745,20 @@ impl<'a> ExpmActionPlan<'a> {
         steps: usize,
         tol: f64,
     ) -> SparseResult<Vec<f64>> {
-        let eta = ExpmScaledValue::from_f64((step * self.mu).exp());
-        let step = ExpmScaledValue::from_f64(step);
-        let tolerance = ExpmScaledValue::from_f64(tol);
-        let zero = ExpmScaledValue::default();
-        let mut result: Vec<_> = b.iter().copied().map(ExpmScaledValue::from_f64).collect();
+        let eta = ScaledValue::from_f64((step * self.mu).exp());
+        let step = ScaledValue::from_f64(step);
+        let tolerance = ScaledValue::from_f64(tol);
+        let zero = ScaledValue::default();
+        let mut result: Vec<_> = b.iter().copied().map(ScaledValue::from_f64).collect();
         let mut term = result.clone();
         let mut next = vec![zero; b.len()];
         for _ in 0..steps {
             let mut converged = false;
             for order in 1..=200 {
-                let factor = step.div(ExpmScaledValue::from_f64(f64::from(order)));
+                let factor = step.div(ScaledValue::from_f64(f64::from(order)));
                 for (row, &diagonal) in self.diagonal.iter().enumerate() {
                     let begin = row * columns;
-                    let coefficient = ExpmScaledValue::from_f64(diagonal).mul(factor);
+                    let coefficient = ScaledValue::from_f64(diagonal).mul(factor);
                     for k in 0..columns {
                         next[begin + k] = coefficient.mul(term[begin + k]);
                     }
@@ -49337,7 +49767,7 @@ impl<'a> ExpmActionPlan<'a> {
                         if col == row {
                             continue;
                         }
-                        let coefficient = ExpmScaledValue::from_f64(self.a.data()[idx]).mul(factor);
+                        let coefficient = ScaledValue::from_f64(self.a.data()[idx]).mul(factor);
                         for k in 0..columns {
                             next[begin + k] =
                                 next[begin + k].add(coefficient.mul(term[col * columns + k]));
