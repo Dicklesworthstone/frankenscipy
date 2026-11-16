@@ -3501,15 +3501,21 @@ where
     let t_cap = 7.0;
     let mut neval = 0usize;
     let eval = |t: f64, sum: &mut f64, neval: &mut usize| {
+        // Geometry may omit rounded endpoint nodes, but a non-finite value at
+        // an interior node invalidates the integral. Do not turn it into zero.
+        if !sum.is_finite() {
+            return;
+        }
         if let Some((x, jac)) = node(t)
             && jac != 0.0
-            && jac.is_finite()
         {
+            if !x.is_finite() || !jac.is_finite() {
+                *sum = f64::NAN;
+                return;
+            }
             let fx = f(x);
             *neval += 1;
-            if fx.is_finite() {
-                *sum += jac * fx;
-            }
+            *sum += jac * fx;
         }
     };
 
@@ -3524,6 +3530,14 @@ where
         eval(-t, &mut bare, &mut neval);
         j += 1;
     }
+    if !bare.is_finite() || neval == 0 {
+        return QuadResult {
+            integral: f64::NAN,
+            error: f64::INFINITY,
+            neval,
+            converged: false,
+        };
+    }
     let mut prev = h * bare;
     let mut prev_delta = f64::INFINITY;
     let mut last_err = f64::INFINITY;
@@ -3537,14 +3551,24 @@ where
             eval(-t, &mut bare, &mut neval);
             j += 2;
         }
+        if !bare.is_finite() {
+            return QuadResult {
+                integral: f64::NAN,
+                error: f64::INFINITY,
+                neval,
+                converged: false,
+            };
+        }
         let cur = h * bare;
         let delta = (cur - prev).abs();
         last_err = if prev_delta > 0.0 && prev_delta.is_finite() {
-            (delta * delta / prev_delta).min(delta)
+            // Form the ratio before multiplying: delta squared can underflow
+            // to zero while the error is still larger than a relative tolerance.
+            (delta * (delta / prev_delta)).min(delta)
         } else {
             delta
         };
-        if level >= 2 && last_err <= atol + rtol * cur.abs() {
+        if level >= 2 && last_err.is_finite() && last_err <= atol + rtol * cur.abs() {
             return QuadResult {
                 integral: cur,
                 error: last_err,
@@ -3582,6 +3606,9 @@ where
 /// back to `0.0` and `1e-12`); `max_level` caps the refinement levels (`0` →
 /// 16). Returns the estimate, a `d1²/d2` error estimate, the
 /// function-evaluation count, and whether the tolerance was met.
+/// Non-finite interior values or accumulated quadrature sums return an
+/// unconverged result with a non-finite integral and infinite error. Rounded
+/// endpoint nodes are omitted so integrable endpoint singularities remain supported.
 pub fn tanhsinh<F>(f: F, a: f64, b: f64, atol: f64, rtol: f64, max_level: usize) -> QuadResult
 where
     F: Fn(f64) -> f64,
@@ -3617,13 +3644,28 @@ where
     let mut result = if lo.is_finite() && hi.is_finite() {
         // Finite interval: tanh-sinh. Near each endpoint the abscissa is
         // `endpoint ∓ d·r` with `r = 1 − tanh(u)` formed cancellation-free.
-        let c = 0.5 * (lo + hi);
-        let d = 0.5 * (hi - lo);
+        if lo.next_up() >= hi {
+            return QuadResult {
+                integral: f64::NAN,
+                error: f64::INFINITY,
+                neval: 0,
+                converged: false,
+            };
+        }
+        let c = lo.midpoint(hi);
+        let width = hi - lo;
+        let d = if width.is_finite() {
+            0.5 * width
+        } else {
+            0.5 * hi - 0.5 * lo
+        };
         let node = |t: f64| -> Option<(f64, f64)> {
             let u = half_pi * t.sinh();
             let cu = u.cosh();
-            let w = d * half_pi * t.cosh() / (cu * cu);
-            if !w.is_finite() || w == 0.0 {
+            // Form the dimensionless weight first: d * half_pi * cosh(t)
+            // can overflow even when the final weight is representable.
+            let w = d * (half_pi * t.cosh() / (cu * cu));
+            if w == 0.0 {
                 return None;
             }
             if t == 0.0 {
@@ -3652,7 +3694,7 @@ where
             }
             let x = lo + eg;
             let jac = eg * half_pi * t.cosh();
-            if !x.is_finite() || !jac.is_finite() {
+            if !x.is_finite() || !jac.is_finite() || x <= lo {
                 return None;
             }
             Some((x, jac))
@@ -3668,7 +3710,7 @@ where
             }
             let x = hi - eg;
             let jac = eg * half_pi * t.cosh();
-            if !x.is_finite() || !jac.is_finite() {
+            if !x.is_finite() || !jac.is_finite() || x >= hi {
                 return None;
             }
             Some((x, jac))
@@ -3766,6 +3808,14 @@ where
         for k in 0..count {
             sum += f(a + k as f64 * step);
             nfev += 1;
+            if !sum.is_finite() {
+                return NsumResult {
+                    sum,
+                    error: f64::INFINITY,
+                    nfev,
+                    converged: false,
+                };
+            }
         }
         // A non-finite partial sum is SciPy's status -3, not a converged result.
         return NsumResult {
@@ -3796,6 +3846,14 @@ where
             direct += f(a + filled as f64 * s);
             nfev += 1;
             filled += 1;
+            if !direct.is_finite() {
+                return NsumResult {
+                    sum: direct,
+                    error: f64::INFINITY,
+                    nfev,
+                    converged: false,
+                };
+            }
         }
         let n_m = a + m as f64 * s;
         let f_nm = f(n_m);
@@ -3807,19 +3865,46 @@ where
         let fp2 = f(n_m + 2.0 * delta);
         let fm2 = f(n_m - 2.0 * delta);
         nfev += 4;
+        if [f_nm, fp, fm, fp2, fm2]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return NsumResult {
+                sum: f64::NAN,
+                error: f64::INFINITY,
+                nfev,
+                converged: false,
+            };
+        }
         let d1 = (fp - fm) / (2.0 * delta); // f'(n_m)
         let d3 = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * delta.powi(3)); // f'''(n_m)
 
         let integ = tanhsinh(&f, n_m, f64::INFINITY, atol, rtol, 16);
         nfev += integ.neval;
+        if !integ.integral.is_finite() {
+            return NsumResult {
+                sum: f64::NAN,
+                error: f64::INFINITY,
+                nfev,
+                converged: false,
+            };
+        }
 
         let tail = integ.integral / s + 0.5 * f_nm - (s / 12.0) * d1 + (s.powi(3) / 720.0) * d3;
         let est = direct + tail;
+        if !est.is_finite() {
+            return NsumResult {
+                sum: est,
+                error: f64::INFINITY,
+                nfev,
+                converged: false,
+            };
+        }
 
         last_err = (est - prev_est).abs();
         // Two successive estimates agreeing is not enough if the tail integral itself missed its
         // tolerance: both could carry the same unconverged tail.
-        if integ.converged && last_err <= atol + rtol * est.abs() {
+        if integ.converged && last_err.is_finite() && last_err <= atol + rtol * est.abs() {
             return NsumResult {
                 sum: est,
                 error: last_err,
@@ -3992,12 +4077,25 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
     // Indices into k_nodes that correspond to the 7 Gauss nodes
     let g_indices: [usize; 7] = [1, 3, 5, 7, 9, 11, 13];
 
-    let mid = 0.5 * (a + b);
-    let half = 0.5 * (b - a);
+    let mid = a.midpoint(b);
+    let width = b - a;
+    let half = if width.is_finite() {
+        0.5 * width
+    } else {
+        0.5 * b - 0.5 * a
+    };
 
     // Evaluate f at all 15 Kronrod nodes
     let fvals: Vec<f64> = k_nodes.iter().map(|&node| f(mid + half * node)).collect();
     let neval = 15;
+    if fvals.iter().any(|value| !value.is_finite()) {
+        return QuadResult {
+            integral: f64::NAN,
+            error: f64::INFINITY,
+            neval,
+            converged: false,
+        };
+    }
 
     // Kronrod estimate (15-point)
     let kronrod_sum: f64 = fvals
@@ -4016,7 +4114,15 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
         * half;
 
     let error = (kronrod_sum - gauss_sum).abs();
-    let within_tolerance = !(error > options.epsabs && error > options.epsrel * kronrod_sum.abs());
+    if !kronrod_sum.is_finite() || !error.is_finite() {
+        return QuadResult {
+            integral: kronrod_sum,
+            error: f64::INFINITY,
+            neval,
+            converged: false,
+        };
+    }
+    let within_tolerance = error <= options.epsabs || error <= options.epsrel * kronrod_sum.abs();
 
     if !within_tolerance && options.limit > 1 {
         let left = gauss_kronrod_inner(
@@ -4037,11 +4143,16 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
                 ..options
             },
         );
+        let integral = left.integral + right.integral;
+        let error = left.error + right.error;
         return QuadResult {
-            integral: left.integral + right.integral,
-            error: left.error + right.error,
-            neval: left.neval + right.neval,
-            converged: left.converged && right.converged,
+            integral,
+            error,
+            neval: neval + left.neval + right.neval,
+            converged: left.converged
+                && right.converged
+                && integral.is_finite()
+                && error.is_finite(),
         };
     }
 
@@ -7931,6 +8042,241 @@ mod tests {
             "reversed inf: {}",
             r.integral
         );
+    }
+
+    #[test]
+    fn tanhsinh_nonfinite_interior_values_never_converge() {
+        for (a, b) in [
+            (0.0, 1.0),
+            (0.0, f64::INFINITY),
+            (f64::NEG_INFINITY, 0.0),
+            (f64::NEG_INFINITY, f64::INFINITY),
+        ] {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let calls = std::cell::Cell::new(0usize);
+                let result = tanhsinh(
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        bad
+                    },
+                    a,
+                    b,
+                    0.0,
+                    1e-12,
+                    16,
+                );
+                assert!(!result.converged, "{a}..{b}, value={bad}: {result:?}");
+                assert!(result.integral.is_nan());
+                assert_eq!(result.error, f64::INFINITY);
+                assert_eq!(result.neval, 1);
+                assert_eq!(calls.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn tanhsinh_stops_when_refinement_finds_nonfinite_values() {
+        let calls = std::cell::Cell::new(0usize);
+        let rejected = std::cell::Cell::new(false);
+        let result = tanhsinh(
+            |x| {
+                assert!(!rejected.get(), "evaluated again after an invalid sample");
+                calls.set(calls.get() + 1);
+                if (0.30..0.34).contains(&x) {
+                    rejected.set(true);
+                    f64::NAN
+                } else {
+                    1.0
+                }
+            },
+            0.0,
+            1.0,
+            0.0,
+            1e-12,
+            16,
+        );
+        assert!(rejected.get(), "must exercise a new refinement node");
+        assert!(!result.converged);
+        assert!(result.integral.is_nan());
+        assert_eq!(result.error, f64::INFINITY);
+        assert_eq!(result.neval, calls.get());
+        assert!(result.neval > 1 && result.neval < 100);
+    }
+
+    #[test]
+    fn tanhsinh_large_finite_intervals_keep_finite_nodes_and_weights() {
+        for (a, b, exact) in [
+            (-1e308_f64, 1e308_f64, 2.0),
+            (1e308, -1e308, -2.0),
+            (1e308, 1.7e308, 0.7),
+        ] {
+            let result = tanhsinh(
+                |x| {
+                    assert!(x.is_finite() && x > a.min(b) && x < a.max(b));
+                    1e-308
+                },
+                a,
+                b,
+                0.0,
+                1e-12,
+                16,
+            );
+            assert!(result.converged, "{a}..{b}: {result:?}");
+            assert!((result.integral - exact).abs() <= 1e-12);
+            assert!(result.neval > 0 && result.neval < 1000);
+        }
+        let result = tanhsinh(
+            |x| 1e-308 * (x / 1e308),
+            1e308,
+            1.7e308,
+            0.0,
+            1e-12,
+            16,
+        );
+        assert!(result.converged);
+        assert!((result.integral - 0.945).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn tanhsinh_error_estimate_preserves_relative_accuracy_at_small_scales() {
+        for scale in [1e-200, 1e-300, -1e-200, 1e200] {
+            let result = tanhsinh(|x| scale * x.exp(), 0.0, 1.0, 0.0, 1e-12, 16);
+            assert!(result.converged, "scale={scale}: {result:?}");
+            assert!((result.integral / scale - (std::f64::consts::E - 1.0)).abs() <= 1e-12);
+            assert!(result.error.is_finite());
+        }
+    }
+
+    #[test]
+    fn tanhsinh_shifted_infinite_intervals_do_not_sample_singular_endpoints() {
+        let upper = tanhsinh(
+            |x| {
+                assert!(x > 1.0, "rounded onto the singular lower endpoint");
+                (-(x - 1.0)).exp() / (x - 1.0).sqrt()
+            },
+            1.0,
+            f64::INFINITY,
+            0.0,
+            1e-6,
+            16,
+        );
+        let lower = tanhsinh(
+            |x| {
+                assert!(x < -1.0, "rounded onto the singular upper endpoint");
+                (x + 1.0).exp() / (-1.0 - x).sqrt()
+            },
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            1e-6,
+            16,
+        );
+        for result in [upper, lower] {
+            assert!(result.converged, "{result:?}");
+            assert!((result.integral - std::f64::consts::PI.sqrt()).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn tanhsinh_unrepresentable_nodes_or_accumulation_do_not_report_success() {
+        let adjacent = tanhsinh(
+            |_| panic!("adjacent bounds have no interior node"),
+            1.0,
+            1.0_f64.next_up(),
+            0.0,
+            1e-12,
+            16,
+        );
+        assert!(!adjacent.converged);
+        assert_eq!(adjacent.neval, 0);
+        assert_eq!(adjacent.error, f64::INFINITY);
+        let empty_nodes = tanhsinh(
+            |_| panic!("no representable finite interior point"),
+            f64::MAX,
+            f64::INFINITY,
+            0.0,
+            1e-12,
+            16,
+        );
+        assert!(!empty_nodes.converged);
+        assert_eq!(empty_nodes.neval, 0);
+        assert_eq!(empty_nodes.error, f64::INFINITY);
+        let overflow = tanhsinh(|_| f64::MAX, 0.0, 2.0, 0.0, 1e-12, 16);
+        assert!(!overflow.converged);
+        assert!(overflow.integral.is_nan());
+        assert_eq!(overflow.error, f64::INFINITY);
+        assert!(overflow.neval < 100);
+    }
+
+    #[test]
+    fn nsum_nonfinite_terms_derivatives_and_tails_stop_with_bounded_work() {
+        let cases: &[fn(f64) -> f64] = &[
+            |_| f64::NAN,
+            |x| if x == 9.0 { f64::NAN } else { 1.0 / (x * x) },
+            |x| {
+                if (10.0..10.5).contains(&x) {
+                    f64::NAN
+                } else {
+                    1.0 / (x * x)
+                }
+            },
+        ];
+        for &f in cases {
+            let calls = std::cell::Cell::new(0usize);
+            let result = nsum(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    assert!(calls.get() <= 1000, "invalid series kept expanding");
+                    f(x)
+                },
+                1.0,
+                f64::INFINITY,
+                1.0,
+                0.0,
+                1e-11,
+            );
+            assert!(!result.converged);
+            assert!(!result.sum.is_finite());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.nfev, calls.get());
+        }
+        let finite = nsum(|_| f64::INFINITY, 1.0, 100.0, 1.0, 0.0, 1e-11);
+        assert!(!finite.converged);
+        assert_eq!(finite.nfev, 1);
+        assert_eq!(finite.error, f64::INFINITY);
+    }
+
+    #[test]
+    fn gauss_kronrod_nonfinite_samples_never_converge() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = gauss_kronrod_quad(|_| bad, 0.0, 1.0, QuadOptions::default());
+            assert!(!result.converged, "{bad}: {result:?}");
+            assert!(result.integral.is_nan());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.neval, 15);
+        }
+    }
+
+    #[test]
+    fn gauss_kronrod_refinement_counts_every_function_evaluation() {
+        let calls = std::cell::Cell::new(0usize);
+        let result = gauss_kronrod_quad(
+            |x| {
+                calls.set(calls.get() + 1);
+                (x - 0.5).abs()
+            },
+            0.0,
+            1.0,
+            QuadOptions {
+                epsabs: 1e-12,
+                epsrel: 1e-12,
+                ..QuadOptions::default()
+            },
+        );
+        assert!(result.converged, "{result:?}");
+        assert!((result.integral - 0.25).abs() <= 1e-12);
+        assert!(result.neval > 15, "the cusp must require refinement");
+        assert_eq!(result.neval, calls.get());
     }
 
     #[test]

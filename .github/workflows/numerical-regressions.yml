@@ -11,6 +11,7 @@ on:
       - "crates/fsci-conformance/src/lib.rs"
       - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
       - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
+      - "crates/fsci-conformance/tests/diff_integrate.rs"
       - ".github/workflows/numerical-regressions.yml"
   workflow_dispatch:
 
@@ -36,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp]
+        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp, quadrature]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -71,6 +72,10 @@ jobs:
             sparse-lsmr)
               cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --test lsmr_options_scipy -- --nocapture
+              ;;
+            quadrature)
+              cargo test --locked -p fsci-integrate --lib quad::tests -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh_nonfinite_and_scaled_integrals -- --nocapture
               ;;
             casp)
               cargo test --locked -p fsci-integrate --lib casp -- --nocapture

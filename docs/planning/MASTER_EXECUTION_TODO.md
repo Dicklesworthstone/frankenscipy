@@ -175,3 +175,44 @@ Execution scope requested: complete all previously identified next steps in one 
 - [x] Summarize implemented changes with file-level references. (captured in final report)
 - [x] List residual risks and next-most-valuable follow-ups. (captured in final report)
 - [x] Confirm method-stack artifact production status (produced vs deferred). (captured in final report)
+
+## 8. Numerical correctness and remaining fitting work (2026-11-15)
+
+The comprehensive specification and the 4,623-record Beads graph were reviewed
+before selecting this work. The older W6 descriptions substantially lag the code;
+the targets below are concrete defects or missing public behavior in the current
+implementation. Broad feature Beads remain open until their full acceptance
+criteria are met.
+
+### 8.1 Quadrature and series reliability
+
+- [x] Reject non-finite interior tanh-sinh samples and accumulated sums.
+- [x] Preserve integrable endpoint singularities when exp-sinh nodes round to a bound.
+- [x] Use range-safe finite-interval geometry; reject an empty representable node set.
+- [x] Avoid squaring tiny error estimates into a false zero; require finite error estimates.
+- [x] Stop invalid finite/infinite series before expanding unnecessary evaluation windows.
+- [x] Reject non-finite Gauss-Kronrod samples and include parent evaluations in recursive counts.
+- [x] Add analytical regressions and a 12-case required live-SciPy comparison.
+- [x] Add these checks to the existing numerical regression workflow.
+- [x] Independently review the arithmetic and reproduce the original failure mechanisms in
+  JavaScript double precision.
+- [ ] Execute the new Rust tests and live SciPy oracle, formatting, workspace check and clippy.
+  The execution environment disconnected during dependency setup; numerical reproductions
+  and source review are not Rust test passes.
+
+### 8.2 Remaining implementation targets
+
+- [ ] Add trait-level likelihood fits for LogSeries, RandInt and Zipfian, including fixed-n
+  Zipfian fitting, invalid-data errors and resource limits (advances frankenscipy-1ksfv.14).
+- [ ] Correct sparse iterative solver norm underflow/overflow, exact least-squares stationarity
+  and non-finite warm-start validation.
+- [ ] Implement sparse/matrix-free bounded linear least squares using the existing LSMR
+  infrastructure. This larger feature was deferred until executable validation is available.
+
+### 8.3 Follow-up correctness work
+
+- [ ] Improve tanh-sinh endpoint-tail error estimates near the representability limit;
+  the present work does not certify the omitted tail of a right-endpoint singularity.
+- [ ] Bound finite nsum grid cardinality before conversion to i64.
+- [ ] Run full Beads closeout checks after executable evidence is available. No feature
+  closure is claimed from a JavaScript reproduction or a source-only review.

@@ -602,3 +602,149 @@ json.dump(results, sys.stdout)
         .expect("CUMULATIVE_FUNCS is non-empty");
     ledger.finish(min_per_arm);
 }
+
+#[test]
+fn diff_integrate_tanhsinh_nonfinite_and_scaled_integrals() {
+    #[derive(Deserialize)]
+    struct ProbeRow {
+        name: String,
+        success: bool,
+        status: i32,
+        integral: Option<f64>,
+    }
+    #[derive(Deserialize)]
+    struct ProbeOutput {
+        scipy: String,
+        numpy: String,
+        rows: Vec<ProbeRow>,
+    }
+    let script = r#"
+import json
+import numpy as np
+import scipy
+from scipy.integrate import tanhsinh
+
+probes = [
+    ('nan', lambda x: np.full_like(x, np.nan), 0., 1.),
+    ('inf', lambda x: np.full_like(x, np.inf), 0., 1.),
+    ('neg_inf', lambda x: np.full_like(x, -np.inf), 0., 1.),
+    ('nan_upper', lambda x: np.full_like(x, np.nan), 0., np.inf),
+    ('nan_lower', lambda x: np.full_like(x, np.nan), -np.inf, 0.),
+    ('nan_both', lambda x: np.full_like(x, np.nan), -np.inf, np.inf),
+    ('nan_refinement', lambda x: np.where((x >= .30) & (x < .34), np.nan, 1.), 0., 1.),
+    ('sqrt', lambda x: 1 / np.sqrt(x), 0., 1.),
+    ('log', lambda x: np.log(x), 0., 1.),
+    ('gaussian', lambda x: np.exp(-x*x), -np.inf, np.inf),
+    ('tiny_exp', lambda x: 1e-200 * np.exp(x), 0., 1.),
+    ('negative_tiny_exp', lambda x: -1e-200 * np.exp(x), 0., 1.),
+]
+rows = []
+with np.errstate(all='ignore'):
+    for name, f, a, b in probes:
+        r = tanhsinh(f, a, b, atol=0., rtol=1e-12, maxlevel=16)
+        rows.append(dict(name=name, success=bool(r.success), status=int(r.status),
+                         integral=float(r.integral) if np.isfinite(r.integral) else None))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows)))
+"#;
+    let required = std::env::var(REQUIRE_SCIPY_ENV).as_deref() == Ok("1");
+    let output = match fsci_conformance::scipy_oracle_command()
+        .arg("-c")
+        .arg(script)
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            assert!(!required, "cannot start tanhsinh oracle: {error}");
+            eprintln!("skipping tanhsinh oracle: {error}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!required, "tanhsinh oracle failed: {error}");
+        eprintln!("skipping tanhsinh oracle: {error}");
+        return;
+    }
+    let oracle: ProbeOutput =
+        serde_json::from_slice(&output.stdout).expect("complete tanhsinh oracle JSON");
+    if required {
+        assert_eq!(oracle.scipy, "1.17.1", "pinned SciPy oracle");
+        assert_eq!(oracle.numpy, "2.4.3", "pinned NumPy oracle");
+    }
+    type Probe = (&'static str, fn(f64) -> f64, f64, f64, bool);
+    let probes: &[Probe] = &[
+        ("nan", |_| f64::NAN, 0.0, 1.0, false),
+        ("inf", |_| f64::INFINITY, 0.0, 1.0, false),
+        ("neg_inf", |_| f64::NEG_INFINITY, 0.0, 1.0, false),
+        ("nan_upper", |_| f64::NAN, 0.0, f64::INFINITY, false),
+        ("nan_lower", |_| f64::NAN, f64::NEG_INFINITY, 0.0, false),
+        (
+            "nan_both",
+            |_| f64::NAN,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            false,
+        ),
+        (
+            "nan_refinement",
+            |x| {
+                if (0.30..0.34).contains(&x) {
+                    f64::NAN
+                } else {
+                    1.0
+                }
+            },
+            0.0,
+            1.0,
+            false,
+        ),
+        ("sqrt", |x| 1.0 / x.sqrt(), 0.0, 1.0, true),
+        ("log", f64::ln, 0.0, 1.0, true),
+        (
+            "gaussian",
+            |x| (-x * x).exp(),
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            true,
+        ),
+        ("tiny_exp", |x| 1e-200 * x.exp(), 0.0, 1.0, true),
+        ("negative_tiny_exp", |x| -1e-200 * x.exp(), 0.0, 1.0, true),
+    ];
+    assert_eq!(oracle.rows.len(), probes.len(), "partial oracle coverage");
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_tanhsinh_nonfinite_and_scaled_integrals",
+        &["nonfinite", "finite"],
+    );
+    for (&(name, f, a, b, finite), reference) in probes.iter().zip(&oracle.rows) {
+        assert_eq!(reference.name, name, "oracle case order/identity");
+        let actual = fsci_integrate::tanhsinh(f, a, b, 0.0, 1e-12, 16);
+        let pass = if finite {
+            let expected = reference.integral.expect("finite oracle integral");
+            let scale = expected.abs().max(f64::MIN_POSITIVE);
+            reference.success
+                && actual.converged
+                && actual.integral.is_finite()
+                && (actual.integral / scale - expected / scale).abs() <= 1e-12
+        } else {
+            !reference.success
+                && reference.status == -3
+                && !actual.converged
+                && !actual.integral.is_finite()
+                && actual.error == f64::INFINITY
+        };
+        eprintln!(
+            "{name}: scipy_status={} scipy={:?}; fsci={actual:?}",
+            reference.status, reference.integral,
+        );
+        ledger.compared(if finite { "finite" } else { "nonfinite" }, name, pass);
+    }
+    eprintln!(
+        "tanhsinh compared={} scipy={} numpy={}",
+        probes.len(),
+        oracle.scipy,
+        oracle.numpy,
+    );
+    ledger.finish(5);
+}
