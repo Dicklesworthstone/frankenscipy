@@ -605,7 +605,7 @@ pub fn add_csr(lhs: &CsrMatrix, rhs: &CsrMatrix) -> SparseResult<CsrMatrix> {
         }
         CsrRowCombineMode::Fallback => {}
     }
-    combine_coo(lhs.to_coo()?, rhs.to_coo()?, 1.0)?.to_csr()
+    combine_coo(&lhs.to_coo()?, &rhs.to_coo()?, 1.0)?.to_csr()
 }
 
 pub fn sub_csr(lhs: &CsrMatrix, rhs: &CsrMatrix) -> SparseResult<CsrMatrix> {
@@ -616,7 +616,7 @@ pub fn sub_csr(lhs: &CsrMatrix, rhs: &CsrMatrix) -> SparseResult<CsrMatrix> {
         }
         CsrRowCombineMode::Fallback => {}
     }
-    combine_coo(lhs.to_coo()?, rhs.to_coo()?, -1.0)?.to_csr()
+    combine_coo(&lhs.to_coo()?, &rhs.to_coo()?, -1.0)?.to_csr()
 }
 
 pub fn scale_csr(matrix: &CsrMatrix, alpha: f64) -> SparseResult<CsrMatrix> {
@@ -640,7 +640,7 @@ pub fn add_csc(lhs: &CscMatrix, rhs: &CscMatrix) -> SparseResult<CscMatrix> {
     ) {
         return Ok(combine_csc_cols_directly(lhs, rhs, 1.0));
     }
-    combine_coo(lhs.to_coo()?, rhs.to_coo()?, 1.0)?.to_csc()
+    combine_coo(&lhs.to_coo()?, &rhs.to_coo()?, 1.0)?.to_csc()
 }
 
 pub fn sub_csc(lhs: &CscMatrix, rhs: &CscMatrix) -> SparseResult<CscMatrix> {
@@ -651,7 +651,7 @@ pub fn sub_csc(lhs: &CscMatrix, rhs: &CscMatrix) -> SparseResult<CscMatrix> {
     ) {
         return Ok(combine_csc_cols_directly(lhs, rhs, -1.0));
     }
-    combine_coo(lhs.to_coo()?, rhs.to_coo()?, -1.0)?.to_csc()
+    combine_coo(&lhs.to_coo()?, &rhs.to_coo()?, -1.0)?.to_csc()
 }
 
 pub fn scale_csc(matrix: &CscMatrix, alpha: f64) -> SparseResult<CscMatrix> {
@@ -669,7 +669,11 @@ pub fn scale_csc(matrix: &CscMatrix, alpha: f64) -> SparseResult<CscMatrix> {
 
 pub fn add_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
-    combine_coo(lhs.clone(), rhs.clone(), 1.0)
+    if has_strictly_increasing_coo_coordinates(lhs) && has_strictly_increasing_coo_coordinates(rhs)
+    {
+        return combine_sorted_unique_coo(lhs, rhs, 1.0);
+    }
+    combine_coo_stably(lhs, rhs, 1.0)
 }
 
 /// Force [`sub_coo`] through its legacy ordered-tree implementation.
@@ -789,7 +793,7 @@ fn is_upper_triangle(row: usize, col: usize, k: isize) -> bool {
     }
 }
 
-fn combine_coo(lhs: CooMatrix, rhs: CooMatrix, rhs_scale: f64) -> SparseResult<CooMatrix> {
+fn combine_coo(lhs: &CooMatrix, rhs: &CooMatrix, rhs_scale: f64) -> SparseResult<CooMatrix> {
     let shape = lhs.shape();
     let mut accum = BTreeMap::<(usize, usize), f64>::new();
     for idx in 0..lhs.nnz() {
@@ -812,6 +816,115 @@ fn combine_coo(lhs: CooMatrix, rhs: CooMatrix, rhs_scale: f64) -> SparseResult<C
         }
     }
     CooMatrix::from_triplets(shape, data, rows, cols, false)
+}
+
+/// Group by row, then stable-sort the much shorter column runs. Keeping the
+/// left operand's entries before the right operand's entries, including within
+/// duplicate coordinates, preserves the ordered-tree accumulator's floating
+/// point evaluation order exactly. In particular, each sum starts at +0 and
+/// exact zeros are removed only after all contributions have been added.
+///
+/// Row pointers are used only when their size is bounded by the number of
+/// entries. A very tall, mostly empty COO matrix instead sorts its actual
+/// entries; its logical dimensions never cause a dimension-sized allocation.
+fn combine_coo_stably(
+    lhs: &CooMatrix,
+    rhs: &CooMatrix,
+    rhs_scale: f64,
+) -> SparseResult<CooMatrix> {
+    let shape = lhs.shape();
+    let capacity = lhs
+        .nnz()
+        .checked_add(rhs.nnz())
+        .ok_or_else(|| SparseError::IndexOverflow {
+            message: "combined COO output capacity overflows usize".to_string(),
+        })?;
+    let mut output = CooMatrix {
+        shape,
+        data: Vec::with_capacity(capacity),
+        row_indices: Vec::with_capacity(capacity),
+        col_indices: Vec::with_capacity(capacity),
+    };
+
+    if shape.rows <= capacity && shape.rows < usize::MAX {
+        let mut row_ptr = vec![0usize; shape.rows + 1];
+        for &row in lhs.row_indices().iter().chain(rhs.row_indices()) {
+            row_ptr[row + 1] += 1;
+        }
+        for row in 0..shape.rows {
+            row_ptr[row + 1] += row_ptr[row];
+        }
+        let mut next = row_ptr[..shape.rows].to_vec();
+        let mut pairs = vec![(0usize, 0.0); capacity];
+        for index in 0..lhs.nnz() {
+            let row = lhs.row_indices()[index];
+            pairs[next[row]] = (lhs.col_indices()[index], lhs.data()[index]);
+            next[row] += 1;
+        }
+        for index in 0..rhs.nnz() {
+            let row = rhs.row_indices()[index];
+            pairs[next[row]] = (rhs.col_indices()[index], rhs_scale * rhs.data()[index]);
+            next[row] += 1;
+        }
+        for row in 0..shape.rows {
+            let entries = &mut pairs[row_ptr[row]..row_ptr[row + 1]];
+            entries.sort_by_key(|&(col, _)| col);
+            let mut index = 0;
+            while index < entries.len() {
+                let col = entries[index].0;
+                let mut value = 0.0;
+                while index < entries.len() && entries[index].0 == col {
+                    value += entries[index].1;
+                    index += 1;
+                }
+                push_coo_value(
+                    &mut output.row_indices,
+                    &mut output.col_indices,
+                    &mut output.data,
+                    row,
+                    col,
+                    value,
+                );
+            }
+        }
+    } else {
+        let mut entries = Vec::with_capacity(capacity);
+        for index in 0..lhs.nnz() {
+            entries.push((
+                lhs.row_indices()[index],
+                lhs.col_indices()[index],
+                lhs.data()[index],
+            ));
+        }
+        for index in 0..rhs.nnz() {
+            entries.push((
+                rhs.row_indices()[index],
+                rhs.col_indices()[index],
+                rhs_scale * rhs.data()[index],
+            ));
+        }
+        entries.sort_by_key(|&(row, col, _)| (row, col));
+        let mut index = 0;
+        while index < entries.len() {
+            let (row, col, _) = entries[index];
+            let mut value = 0.0;
+            while index < entries.len() && (entries[index].0, entries[index].1) == (row, col) {
+                value += entries[index].2;
+                index += 1;
+            }
+            push_coo_value(
+                &mut output.row_indices,
+                &mut output.col_indices,
+                &mut output.data,
+                row,
+                col,
+                value,
+            );
+        }
+    }
+    // Every coordinate came from a validated input, stable grouping emits
+    // strictly increasing coordinates, and each coordinate was reduced once.
+    Ok(output)
 }
 
 fn has_strictly_increasing_coo_coordinates(matrix: &CooMatrix) -> bool {
@@ -943,7 +1056,7 @@ fn combine_sorted_unique_coo_or_btree(
     #[cfg(any(test, feature = "sparse-incumbent-bench"))]
     if COO_SUB_FORCE_BTREE.load(std::sync::atomic::Ordering::Relaxed) {
         COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return combine_coo(lhs.clone(), rhs.clone(), rhs_scale);
+        return combine_coo(lhs, rhs, rhs_scale);
     }
 
     if has_strictly_increasing_coo_coordinates(lhs) && has_strictly_increasing_coo_coordinates(rhs)
@@ -955,7 +1068,7 @@ fn combine_sorted_unique_coo_or_btree(
 
     #[cfg(any(test, feature = "sparse-incumbent-bench"))]
     COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    combine_coo(lhs.clone(), rhs.clone(), rhs_scale)
+    combine_coo(lhs, rhs, rhs_scale)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1795,7 +1908,7 @@ mod tests {
 
         for rhs_scale in [1.0, -1.0] {
             let candidate = combine_sorted_unique_coo(&lhs, &rhs, rhs_scale).unwrap();
-            let control = combine_coo(lhs.clone(), rhs.clone(), rhs_scale).unwrap();
+            let control = combine_coo(&lhs, &rhs, rhs_scale).unwrap();
             assert_coo_bits_eq(&candidate, &control);
         }
 
@@ -1803,7 +1916,7 @@ mod tests {
         for (left, right) in [(&empty, &empty), (&lhs, &empty), (&empty, &rhs)] {
             for rhs_scale in [1.0, -1.0] {
                 let candidate = combine_sorted_unique_coo(left, right, rhs_scale).unwrap();
-                let control = combine_coo(left.clone(), right.clone(), rhs_scale).unwrap();
+                let control = combine_coo(left, right, rhs_scale).unwrap();
                 assert_coo_bits_eq(&candidate, &control);
             }
         }
@@ -1835,11 +1948,142 @@ mod tests {
         let duplicate = coo_from_entries(shape, &[(0, 2, 7.0), (0, 2, -1.0)]);
         for noncanonical in [&unsorted, &duplicate] {
             let actual = sub_coo(noncanonical, &canonical_rhs).unwrap();
-            let expected = combine_coo(noncanonical.clone(), canonical_rhs.clone(), -1.0).unwrap();
+            let expected = combine_coo(noncanonical, &canonical_rhs, -1.0).unwrap();
             assert_coo_bits_eq(&actual, &expected);
         }
         assert_eq!(COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 1);
         assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn coo_add_preserves_duplicate_order_zero_elision_and_nonfinite_values() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_4321);
+        let shape = Shape2D::new(5, 7);
+        let lhs = coo_from_entries(
+            shape,
+            &[
+                (3, 2, 1e16),
+                (0, 5, -0.0),
+                (3, 2, 1.0),
+                (1, 4, f64::INFINITY),
+                (3, 2, -1e16),
+                (2, 1, nan),
+                (4, 0, 4.0),
+            ],
+        );
+        let rhs = coo_from_entries(
+            shape,
+            &[
+                (4, 0, -4.0),
+                (3, 2, 2.0),
+                (1, 4, f64::NEG_INFINITY),
+                (2, 1, 3.0),
+                (0, 5, 0.0),
+                (3, 2, -1.0),
+            ],
+        );
+        let expected = combine_coo(&lhs, &rhs, 1.0).unwrap();
+        let actual = add_coo(&lhs, &rhs).unwrap();
+        assert_coo_bits_eq(&actual, &expected);
+        assert_eq!(actual.row_indices(), &[1, 2, 3]);
+        assert_eq!(actual.col_indices(), &[4, 1, 2]);
+        assert_eq!(actual.data()[2], 1.0);
+        assert!(has_strictly_increasing_coo_coordinates(&actual));
+
+        // The same arithmetic must work without allocating by the logical
+        // row count. Neither the row count nor the output shape is truncated.
+        let huge = Shape2D::new(usize::MAX, usize::MAX);
+        let high_row = usize::MAX - 2;
+        let high_col = usize::MAX - 3;
+        let tall_lhs = coo_from_entries(
+            huge,
+            &[
+                (high_row, high_col, 1e16),
+                (0, 0, -0.0),
+                (high_row, high_col, 1.0),
+            ],
+        );
+        let tall_rhs = coo_from_entries(
+            huge,
+            &[
+                (high_row, high_col, -1e16),
+                (high_row, high_col, 5.0),
+                (0, 1, 2.0),
+            ],
+        );
+        let expected = combine_coo(&tall_lhs, &tall_rhs, 1.0).unwrap();
+        let actual = add_coo(&tall_lhs, &tall_rhs).unwrap();
+        assert_coo_bits_eq(&actual, &expected);
+        assert_eq!(actual.shape(), huge);
+        assert_eq!(actual.data(), &[2.0, 5.0]);
+    }
+
+    #[test]
+    fn coo_add_checks_shape_and_handles_empty_operands() {
+        let shape = Shape2D::new(4, 6);
+        let empty = coo_from_entries(shape, &[]);
+        let other = coo_from_entries(Shape2D::new(6, 4), &[]);
+        assert!(matches!(
+            add_coo(&empty, &other),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        let unsorted = coo_from_entries(shape, &[(3, 5, 4.0), (0, 1, 2.0), (3, 5, -1.0)]);
+        let canonical = coo_from_entries(shape, &[(0, 1, -2.0), (2, 3, 7.0), (3, 5, 1.0)]);
+        for (lhs, rhs) in [
+            (&empty, &empty),
+            (&empty, &unsorted),
+            (&unsorted, &empty),
+            (&canonical, &empty),
+            (&empty, &canonical),
+            (&canonical, &canonical),
+        ] {
+            assert_coo_bits_eq(
+                &add_coo(lhs, rhs).unwrap(),
+                &combine_coo(lhs, rhs, 1.0).unwrap(),
+            );
+        }
+        let zero_rows = coo_from_entries(Shape2D::new(0, usize::MAX), &[]);
+        assert_eq!(add_coo(&zero_rows, &zero_rows).unwrap().nnz(), 0);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn coo_add_stable_grouping_matches_ordered_tree_bits(
+            row_count in 1usize..32,
+            col_count in 1usize..32,
+            left in proptest::collection::vec(
+                (0usize..64, 0usize..64, proptest::num::i16::ANY), 0..100,
+            ),
+            right in proptest::collection::vec(
+                (0usize..64, 0usize..64, proptest::num::i16::ANY), 0..100,
+            ),
+        ) {
+            let shape = Shape2D::new(row_count, col_count);
+            // A wide range of exponents makes an accidental reordering of
+            // duplicate sums observable; exact dyadic values avoid an oracle
+            // round-trip through decimal text.
+            let entry = |&(row, col, bits): &(usize, usize, i16)| {
+                let value = f64::from(bits) * 2.0f64.powi(i32::from(bits) % 64);
+                (row % row_count, col % col_count, value)
+            };
+            let lhs = coo_from_entries(shape, &left.iter().map(entry).collect::<Vec<_>>());
+            let rhs = coo_from_entries(shape, &right.iter().map(entry).collect::<Vec<_>>());
+            let expected = combine_coo(&lhs, &rhs, 1.0).unwrap();
+            let actual = add_coo(&lhs, &rhs).unwrap();
+            assert_coo_bits_eq(&actual, &expected);
+            proptest::prop_assert!(has_strictly_increasing_coo_coordinates(&actual));
+            proptest::prop_assert!(actual.data().iter().all(|&value| value != 0.0));
+
+            // Exercise the global stable-sort arm using the same entries,
+            // instead of depending on the generator to produce a tall case.
+            let tall_shape = Shape2D::new(usize::MAX, col_count);
+            let lhs = coo_from_entries(tall_shape, &left.iter().map(entry).collect::<Vec<_>>());
+            let rhs = coo_from_entries(tall_shape, &right.iter().map(entry).collect::<Vec<_>>());
+            assert_coo_bits_eq(
+                &add_coo(&lhs, &rhs).unwrap(),
+                &combine_coo(&lhs, &rhs, 1.0).unwrap(),
+            );
+        }
     }
 
     fn skewed_spmv_fixture() -> (CsrMatrix, Vec<f64>) {
