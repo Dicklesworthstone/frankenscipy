@@ -135,7 +135,7 @@ impl LeastSquaresOperator {
 fn finite_product(values: &[f64]) -> SparseResult<()> {
     if values.iter().any(|value| !value.is_finite()) {
         return Err(SparseError::NonFiniteInput {
-            message: String::from("matrix-free Jacobian product contains NaN or Inf"),
+            message: String::from("least-squares matrix product contains NaN or Inf"),
         });
     }
     Ok(())
@@ -222,7 +222,54 @@ pub enum LeastSquaresMatrix {
     Operator(LeastSquaresOperator),
 }
 
+impl LinearOperator for LeastSquaresMatrix {
+    fn shape(&self) -> Shape2D {
+        LeastSquaresMatrix::shape(self)
+    }
+
+    fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        self.validate_product_dimensions(x, y, false)?;
+        self.product_into(x, y)?;
+        finite_product(y)
+    }
+
+    fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        self.validate_product_dimensions(x, y, true)?;
+        self.transpose_product_into(x, y)?;
+        finite_product(y)
+    }
+}
+
 impl LeastSquaresMatrix {
+    fn validate_product_dimensions(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        transpose: bool,
+    ) -> SparseResult<()> {
+        let shape = self.shape();
+        let (input, output) = if transpose {
+            (shape.rows, shape.cols)
+        } else {
+            (shape.cols, shape.rows)
+        };
+        if x.len() != input || y.len() != output {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "least-squares product requires input length {input} and output length {output}"
+                ),
+            });
+        }
+        if let Self::Dense(rows) = self
+            && rows.iter().any(|row| row.len() != shape.cols)
+        {
+            return Err(SparseError::IncompatibleShape {
+                message: String::from("least-squares matrix has ragged rows"),
+            });
+        }
+        finite_product(x)
+    }
+
     /// Retain an analytic Jacobian as matrix-vector and transpose products.
     ///
     /// Shape is captured now and must remain fixed for the lifetime of this matrix.

@@ -88,10 +88,10 @@ fn norm(x: &[f64]) -> f64 {
 }
 
 /// [J; diag(diagonal)], without allocating an n-by-n diagonal block.
-struct AugmentedJacobian<'a> {
-    matrix: &'a LeastSquaresMatrix,
-    diagonal: &'a [f64],
-    columns: usize,
+pub(crate) struct AugmentedJacobian<'a> {
+    pub(crate) matrix: &'a LeastSquaresMatrix,
+    pub(crate) diagonal: &'a [f64],
+    pub(crate) columns: usize,
 }
 
 impl LinearOperator for AugmentedJacobian<'_> {

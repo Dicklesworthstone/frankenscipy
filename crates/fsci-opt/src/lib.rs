@@ -13,6 +13,7 @@ pub mod direct;
 mod gsa;
 pub mod lbfgs_inv_hess;
 mod lbfgsb;
+mod linear_lsq;
 pub mod linesearch;
 mod linprog;
 mod lsq_matrix;
@@ -48,6 +49,9 @@ pub use curvefit::{
     LeastSquaresIteration, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions,
     LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded, curve_fit_bounded_many,
     curve_fit_many, least_squares, least_squares_bounded, least_squares_many, leastsq,
+};
+pub use linear_lsq::{
+    LinearLeastSquaresOptions, LinearLeastSquaresResult, lsq_linear_with_options,
 };
 pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,

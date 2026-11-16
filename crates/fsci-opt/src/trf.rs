@@ -431,7 +431,7 @@ fn update_tr_radius(
 }
 
 /// `build_quadratic_1d`: coefficients of q(t) = a·t² + b·t (+ c with `s0`).
-fn build_quadratic_1d(
+pub(crate) fn build_quadratic_1d(
     j: &LeastSquaresMatrix,
     g: &[f64],
     s: &[f64],
@@ -474,7 +474,7 @@ fn build_quadratic_1d(
 }
 
 /// `minimize_quadratic_1d` on `[lb, ub]`: `(t, q(t))`.
-fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64) {
+pub(crate) fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64) {
     let mut t = vec![lb, ub];
     if a != 0.0 {
         let extremum = -0.5 * b / a;
@@ -493,7 +493,7 @@ fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64)
 }
 
 /// `evaluate_quadratic`: ½·‖J·s‖² + ½·sᵀ·diag·s + gᵀ·s.
-fn evaluate_quadratic(
+pub(crate) fn evaluate_quadratic(
     j: &LeastSquaresMatrix,
     g: &[f64],
     s: &[f64],
@@ -512,14 +512,19 @@ fn evaluate_quadratic(
     Ok(0.5 * q + dot(s, g))
 }
 
-fn in_bounds(x: &[f64], lb: &[f64], ub: &[f64]) -> bool {
+pub(crate) fn in_bounds(x: &[f64], lb: &[f64], ub: &[f64]) -> bool {
     x.iter()
         .zip(lb.iter().zip(ub))
         .all(|(&xi, (&l, &u))| xi >= l && xi <= u)
 }
 
 /// `step_size_to_bound`: `(min_step, hits)` with hits ∈ {−1, 0, 1} per coordinate.
-fn step_size_to_bound(x: &[f64], s: &[f64], lb: &[f64], ub: &[f64]) -> (f64, Vec<i8>) {
+pub(crate) fn step_size_to_bound(
+    x: &[f64],
+    s: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+) -> (f64, Vec<i8>) {
     let steps: Vec<f64> = x
         .iter()
         .zip(s)
@@ -604,7 +609,7 @@ pub(crate) fn make_strictly_feasible(x: &[f64], lb: &[f64], ub: &[f64], rstep: f
                     u - rstep * u.abs().max(1.0)
                 };
             }
-            if v < l || v > u { 0.5 * (l + u) } else { v }
+            if v < l || v > u { 0.5 * l + 0.5 * u } else { v }
         })
         .collect()
 }
@@ -623,7 +628,12 @@ fn next_toward(from: f64, to: f64) -> f64 {
 }
 
 /// `CL_scaling_vector`: Coleman–Li `(v, dv)`.
-fn cl_scaling_vector(x: &[f64], g: &[f64], lb: &[f64], ub: &[f64]) -> (Vec<f64>, Vec<f64>) {
+pub(crate) fn cl_scaling_vector(
+    x: &[f64],
+    g: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let mut v = vec![1.0; n];
     let mut dv = vec![0.0; n];

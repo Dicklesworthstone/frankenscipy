@@ -207,8 +207,8 @@ criteria are met.
   Rust and live-oracle execution remains pending under section 9.
 - [x] Implement range-safe LSQR/LSMR norms and scalar recurrences, exact least-squares
   stationarity, warm-start and operator-product validation. Executable validation is pending.
-- [ ] Implement sparse/matrix-free bounded linear least squares using the existing LSMR
-  infrastructure. This larger feature was deferred until executable validation is available.
+- [x] Implement sparse/matrix-free bounded linear least squares using the existing LSMR
+  infrastructure. Source review is complete; executable validation remains pending.
 
 ### 8.3 Follow-up correctness work
 
@@ -263,7 +263,29 @@ changing unrelated source. Implementation checkboxes below do not claim test pas
 These changes improve shared Euclidean norms and LSQR/LSMR specifically; they
 do not certify every Krylov solver's other dot products at arbitrary scales.
 
-### 9.3 Validation status and next commands
+### 9.3 Native bounded linear least squares (advances `frankenscipy-1ksfv`)
+
+- [x] Expose `lsq_linear_with_options` with shared dense/CSR/operator inputs.
+- [x] Implement linear TRF with Coleman–Li scaling, augmented LSMR subproblems,
+  reflected steps and bounded backtracking, without dense materialization or normal equations.
+- [x] Return residuals, cost, gradient, scaled optimality, active bounds, iteration
+  count, termination status and the initial LSMR diagnostics.
+- [x] Reject invalid controls, ragged matrices, partial/non-finite products and
+  invalid bounds. Support zero-column matrices and infinite bounds.
+- [x] Prevent feasible truncated solves or rounded zero steps from claiming success.
+- [x] Add analytical, stationarity, iteration-limit and invalid-input regressions.
+- [x] Add a 20,000-variable products-only regression that forbids dense conversion
+  and detects entry-by-entry probing through a product-count limit.
+- [x] Add 69 live SciPy comparisons over dense, CSR and matrix-free representations,
+  preserving all four pre-existing tests including 35 dense BVLS comparisons.
+- [x] Add the public solver suite and missing sparse/stats unit filters to the
+  existing numerical-regression workflow.
+- [x] Document the public API, tolerance semantics and convergence diagnostics.
+- [x] Independently review Rust signatures, operator/error propagation and stopping logic.
+- [ ] Run all eight linear integration tests, existing library regressions and the
+  nonlinear TRF/Dogbox live suite against the final source.
+
+### 9.4 Validation status and next commands
 
 The exact pinned nightly and SciPy/NumPy versions were installed and verified,
 and `cargo fetch --locked` succeeded. The first compilation was interrupted
@@ -281,8 +303,17 @@ Pending executable checks for the implemented subsets:
 - [ ] `cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture`
 - [ ] `cargo test --locked -p fsci-sparse --no-default-features --lib lsqr -- --nocapture`
 - [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-sparse --no-default-features --test lsmr_options_scipy -- --nocapture`
+- [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-opt --test linear_least_squares_scipy -- --nocapture`
+- [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-opt --test least_squares_lsmr_scipy -- --nocapture`
 - [ ] Formatting, workspace check, Clippy and the required broader conformance gates.
 
-The main Beads graph is left open. Local claims and new issue records could not
-be synchronized after the host became unavailable; do not infer closures from
-the implementation checklist.
+Scoped native-source formatting completed before the second outage, and pinned
+rustfmt parsed the sparse source; these are not compiler or test verdicts. The
+status-literal guard ran and reported five findings, all independently verified
+present in the base revision. No new unannotated success literal was introduced.
+
+The main Beads graph is left open. Local claims, two new issue records and
+progress notes were prepared through br, but the graph could not be published
+before the repeated host failure. Its export also normalized unrelated legacy
+path fields; those changes must be excluded when reconciling the three intended
+records. Do not infer Beads closure from the implementation checklist.

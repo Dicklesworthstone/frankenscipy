@@ -96,7 +96,7 @@ FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning 
 | [`fsci-sparse`](crates/fsci-sparse/) | ~91,200<!-- fact:src_lines_fsci_sparse --> | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens with adaptive restart tolerance), LGMRES, BiCG, BiCGSTAB, CGS, QMR, MINRES, LSQR, LSMR (with a rule-based iterative-solver selector); `eigs` via implicitly-restarted Krylov-Schur; `eigsh` via thick-restart Lanczos (Wu & Simon) over `ncv = min(n, max(2k+1, 20))`; `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
 | [`fsci-integrate`](crates/fsci-integrate/) | ~43,200<!-- fact:src_lines_fsci_integrate --> | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp` (collocation, as SciPy); `quad` as QUADPACK (qagse/qagie/qagpe and the weighted qawoe/qawfe/qawse/qawce); `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
 | [`fsci-interpolate`](crates/fsci-interpolate/) | ~28,100<!-- fact:src_lines_fsci_interpolate --> | `interp1d`, `CubicSpline`, `CubicHermiteSpline`, `BSpline`, `Akima`, `PCHIP`; `RegularGridInterpolator`, `griddata`, `interpn`; Krogh, barycentric, polynomial helpers; `make_lsq_spline` for k = 1/3/5 |
-| [`fsci-opt`](crates/fsci-opt/) | ~70,200<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, parameter scales, analytic CSR Jacobians and grouped sparse finite differences through LSMR; LM; dense analytic Jacobians for all three methods), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
+| [`fsci-opt`](crates/fsci-opt/) | ~70,200<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, parameter scales, analytic CSR Jacobians and grouped sparse finite differences through LSMR; LM; dense analytic Jacobians for all three methods); `lsq_linear_with_options` (bounded linear TRF with CSR or matrix-free LSMR), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
 | [`fsci-fft`](crates/fsci-fft/) | ~14,200<!-- fact:src_lines_fsci_fft --> | Mixed radix 2/3/4/5/7/11/13/17, direct DFT for primes ≤ 61, Rader and Bluestein for the rest; `rfft`/`irfft`; n-D transforms (`fftn`/`ifftn`/`rfftn`/`irfftn`); DCT/DST I–IV in 1-D, type II in n-D; Hilbert analytic signal; FHT; legacy `scipy.fftpack` pseudo-differential operators (`fftpack::diff`, `tilbert`, `itilbert`, `hilbert`, `ihilbert`, `cs_diff`, `sc_diff`, `ss_diff`, `cc_diff`, `shift`); plan cache keyed by (kind, shape, axes, normalization, real input) |
 | [`fsci-signal`](crates/fsci-signal/) | ~41,700<!-- fact:src_lines_fsci_signal --> | Windows (Hann, Hamming, Kaiser, Tukey, Blackman, Taylor, exponential, general-Hamming…); filter design (`butter` / `cheby1` / `cheby2` / `ellip` / `bessel`, ZPK and BA forms, full `lp2{lp,hp,bp,bs}` and `lp2{lp,hp,bp,bs}_zpk` transforms, `bilinear` / `bilinear_zpk`); filter-order helpers `buttord` / `cheb1ord` / `cheb2ord` / `ellipord`; analog prototypes `buttap` and `cheb1ap`; `firwin`, `firls`, `remez`; `lfilter`, `filtfilt`, SOS application; `welch`, `periodogram`, `csd`, `coherence`; `find_peaks` with SciPy's full condition set (height, threshold, distance, prominence, width, wlen, rel_height, plateau_size) and properties; CWT; Daubechies / Morlet / Ricker wavelets; MFCC, mel filterbank, chroma |
 | [`fsci-spatial`](crates/fsci-spatial/) | ~20,200<!-- fact:src_lines_fsci_spatial --> | KDTree / cKDTree (`query`, `query_pairs`, `count_neighbors`); `pdist` / `cdist` / `distance_matrix` (Euclidean, Manhattan, Chebyshev, Minkowski, Mahalanobis, Hausdorff, weighted variants); ConvexHull, Delaunay and Voronoi in 2-D; HalfspaceIntersection (full metadata in 2-D) |
@@ -942,6 +942,47 @@ Other:         linear_sum_assignment (Jonker-Volgenant), bracket,
                projected_gradient_descent, augmented_lagrangian,
                simulated_annealing, …
 ```
+
+##### Sparse and matrix-free bounded linear least squares
+
+`lsq_linear_with_options` solves `min 0.5 * ||A*x - b||²` with lower and upper
+bounds using linear TRF and LSMR. It accepts `LeastSquaresMatrix::Dense`,
+`LeastSquaresMatrix::Sparse`, and `LeastSquaresMatrix::from_operator`.
+The sparse and matrix-free paths preserve products throughout scaling,
+regularization and reflected steps; they do not construct a dense design matrix
+or normal equations. Operators must supply both forward and transpose products.
+
+```rust
+use fsci_opt::{LeastSquaresMatrix, LinearLeastSquaresOptions, lsq_linear_with_options};
+use fsci_sparse::{CsrMatrix, Shape2D};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let matrix = LeastSquaresMatrix::from_sparse(CsrMatrix::from_components(
+        Shape2D::new(3, 2),
+        vec![1.0, 1.0, 1.0, 1.0],
+        vec![0, 1, 0, 1],
+        vec![0, 1, 2, 4],
+        true,
+    )?)?;
+    let fit = lsq_linear_with_options(
+        &matrix,
+        &[2.0, -1.0, 1.0],
+        &[0.0, 0.0],
+        &[1.0, 1.0],
+        LinearLeastSquaresOptions::default(),
+    )?;
+    assert!(fit.success, "{}", fit.message);
+    println!("x = {:?}, active bounds = {:?}", fit.x, fit.active_mask);
+    Ok(())
+}
+```
+
+The result includes residuals, cost, gradient, scaled optimality, active bounds,
+iteration count and the initial LSMR diagnostics. Inspect `success` and `status`:
+a feasible point alone does not certify convergence, and exhausted budgets are
+reported explicitly. Bounds can be infinite but must be strictly ordered.
+`lsmr_tol=None` uses `0.01 * tol`; a positive fixed inner tolerance is also
+available. The existing `lsq_linear` entry point supplies dense BVLS fitting.
 
 ##### Sparse nonlinear least squares
 
