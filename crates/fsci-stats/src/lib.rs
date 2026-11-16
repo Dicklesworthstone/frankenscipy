@@ -612,7 +612,7 @@ pub enum FitError {
     UnsupportedData(String),
     /// Numerical fitting did not converge within the configured budget.
     NonConvergent(String),
-    /// Hardened mode sample length cap exceeded.
+    /// A fitting work limit or Hardened-mode sample length cap was exceeded.
     ResourceExhausted { detail: &'static str },
 }
 
@@ -12735,6 +12735,23 @@ fn nonnegative_observations(data: &[i64]) -> Result<Vec<u64>, FitError> {
         .collect()
 }
 
+/// Check resource and sample-size requirements before a discrete fit scans
+/// observations or allocates a support-sized likelihood workspace.
+fn validate_discrete_fit_data(data: &[i64]) -> Result<(), FitError> {
+    if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+        return Err(FitError::ResourceExhausted {
+            detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
+        });
+    }
+    if data.is_empty() {
+        return Err(FitError::InsufficientData {
+            required: 1,
+            actual: 0,
+        });
+    }
+    Ok(())
+}
+
 /// SciPy `hypergeom(M, n, N).support()` (also `nchypergeom_wallenius`):
 /// `(max(0, N − (M − n)), min(n, N))`.
 fn hypergeometric_support(big_m: u64, n: u64, big_n: u64) -> (f64, f64) {
@@ -17007,6 +17024,84 @@ impl DiscreteDistribution for LogSeries {
         }
         h
     }
+
+    /// Maximum-likelihood estimate of `p` with location fixed at zero.
+    /// The score equates the distribution mean to the sample mean. An
+    /// all-ones sample only attains its supremum at the excluded limit
+    /// `p = 0`, so it returns an error rather than a fabricated small `p`.
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        validate_discrete_fit_data(data)?;
+        let mut excess_sum = 0.0;
+        let mut correction = 0.0;
+        for &value in data {
+            if value < 1 {
+                return Err(FitError::UnsupportedData(format!(
+                    "LogSeries support is the positive integers; got {value}"
+                )));
+            }
+            // Subtract one in integer arithmetic before summing, retaining
+            // the score when almost every observation is one. No integer
+            // sum can overflow, even for observations near i64::MAX.
+            let term = (value - 1) as f64 - correction;
+            let next = excess_sum + term;
+            correction = (next - excess_sum) - term;
+            excess_sum = next;
+        }
+        let target = excess_sum / data.len() as f64;
+        if target == 0.0 {
+            return Err(FitError::NonConvergent(
+                "LogSeries MLE for an all-ones sample has only the excluded p=0 limit".into(),
+            ));
+        }
+
+        let mean_excess = |p: f64| {
+            // Write t=-log(1-p), so E[X]=expm1(t)/t. The series
+            // avoids subtracting two nearly equal numbers when p is tiny.
+            let t = -(-p).ln_1p();
+            if t < 1.0e-3 {
+                t * (0.5
+                    + t * (1.0 / 6.0
+                        + t * (1.0 / 24.0
+                            + t * (1.0 / 120.0 + t * (1.0 / 720.0 + t / 5040.0)))))
+            } else {
+                p / ((1.0 - p) * t) - 1.0
+            }
+        };
+        let mut lower = 0.0;
+        let mut upper = 1.0_f64.next_down();
+        if mean_excess(upper) < target {
+            return Err(FitError::NonConvergent(
+                "LogSeries MLE lies between the largest representable p<1 and one".into(),
+            ));
+        }
+        // The mean is strictly increasing. Bisect until the bracket has
+        // adjacent f64 endpoints, then retain the smaller score residual.
+        for _ in 0..128 {
+            let p = lower + 0.5 * (upper - lower);
+            if p == lower || p == upper {
+                let p = if (mean_excess(lower) - target).abs()
+                    < (mean_excess(upper) - target).abs()
+                {
+                    lower
+                } else {
+                    upper
+                };
+                return Ok(Self { p });
+            }
+            let value = mean_excess(p);
+            if value == target {
+                return Ok(Self { p });
+            }
+            if value < target {
+                lower = p;
+            } else {
+                upper = p;
+            }
+        }
+        Err(FitError::NonConvergent(
+            "LogSeries likelihood score did not converge within 128 iterations".into(),
+        ))
+    }
 }
 
 /// Discrete uniform distribution over integers in `[low, high)`.
@@ -17025,8 +17120,8 @@ impl RandInt {
         Self { low, high }
     }
 
-    fn width(&self) -> i64 {
-        self.high - self.low
+    fn width(&self) -> u64 {
+        self.high.abs_diff(self.low)
     }
 
     pub fn pmf(&self, k: i64) -> f64 {
@@ -17043,7 +17138,7 @@ impl RandInt {
         } else if k >= self.high - 1 {
             1.0
         } else {
-            (k - self.low + 1) as f64 / self.width() as f64
+            (k.abs_diff(self.low) + 1) as f64 / self.width() as f64
         }
     }
 
@@ -17052,17 +17147,20 @@ impl RandInt {
             return f64::NAN;
         }
         if q == 0.0 {
-            return (self.low - 1) as f64;
+            return (i128::from(self.low) - 1) as f64;
         }
         if q == 1.0 {
             return (self.high - 1) as f64;
         }
 
-        (self.low + (q * self.width() as f64).ceil() as i64 - 1) as f64
+        let offset = ((q * self.width() as f64).ceil() as u64)
+            .saturating_sub(1)
+            .min(self.width() - 1);
+        (i128::from(self.low) + i128::from(offset)) as f64
     }
 
     pub fn mean(&self) -> f64 {
-        self.low as f64 + (self.width() as f64 - 1.0) / 2.0
+        (i128::from(self.low) + i128::from(self.high) - 1) as f64 / 2.0
     }
 
     pub fn var(&self) -> f64 {
@@ -17101,6 +17199,24 @@ impl DiscreteDistribution for RandInt {
         // SciPy randint._stats: g2 = −(6/5)·(d² + 1)/(d² − 1), d = high − low.
         let d = self.width() as f64;
         -6.0 / 5.0 * (d * d + 1.0) / (d * d - 1.0)
+    }
+
+    /// The likelihood is maximized by the shortest integer interval that
+    /// contains every observation: `[min(data), max(data) + 1)`.
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        validate_discrete_fit_data(data)?;
+        let mut low = data[0];
+        let mut maximum = data[0];
+        for &value in &data[1..] {
+            low = low.min(value);
+            maximum = maximum.max(value);
+        }
+        let high = maximum.checked_add(1).ok_or_else(|| {
+            FitError::NonConvergent(
+                "RandInt cannot represent the exclusive upper endpoint above i64::MAX".into(),
+            )
+        })?;
+        Ok(Self { low, high })
     }
 }
 
@@ -22557,9 +22673,127 @@ pub struct Zipfian {
 impl Zipfian {
     #[must_use]
     pub fn new(a: f64, n: u32) -> Self {
-        assert!(a > 0.0 && a.is_finite(), "a must be positive and finite");
+        assert!(a >= 0.0 && a.is_finite(), "a must be nonnegative and finite");
         assert!(n >= 1, "n must be at least 1");
         Self { a, n }
+    }
+
+    /// Fit the shape by maximum likelihood on the fixed support `1..=n`.
+    ///
+    /// The shape score is `E_a[log K] - mean(log(data))`, with derivative
+    /// `-Var_a[log K]`. A safeguarded Newton solve therefore finds the
+    /// unique interior maximum, or returns `a = 0` at the uniform boundary.
+    /// An all-ones sample has no finite maximum when `n > 1`; for `n = 1`
+    /// every shape gives the same point mass and the returned shape is zero.
+    ///
+    /// The likelihood workspace is limited to 1,000,000 support points in
+    /// both modes, and to [`hardened_max_sample_len`] in Hardened mode.
+    /// Larger support requests return [`FitError::ResourceExhausted`]
+    /// before allocation. Newton iteration is capped at 128 steps.
+    pub fn try_fit_with_n(data: &[i64], n: u32) -> Result<Self, FitError> {
+        validate_discrete_fit_data(data)?;
+        if n == 0 {
+            return Err(FitError::UnsupportedData(
+                "Zipfian upper support endpoint must be at least one".into(),
+            ));
+        }
+        if n > 1_000_000
+            || (active_stats_mode() == RuntimeMode::Hardened
+                && n as usize > hardened_max_sample_len())
+        {
+            return Err(FitError::ResourceExhausted {
+                detail: "Zipfian fit support exceeds the bounded likelihood workspace",
+            });
+        }
+        let mut log_sum = 0.0;
+        let mut correction = 0.0;
+        for &value in data {
+            if value < 1 || value > i64::from(n) {
+                return Err(FitError::UnsupportedData(format!(
+                    "Zipfian support is 1..={n}; got {value}"
+                )));
+            }
+            let term = (value as f64).ln() - correction;
+            let next = log_sum + term;
+            correction = (next - log_sum) - term;
+            log_sum = next;
+        }
+        if n == 1 {
+            return Ok(Self { a: 0.0, n });
+        }
+        let target = log_sum / data.len() as f64;
+        if target == 0.0 {
+            return Err(FitError::NonConvergent(
+                "Zipfian MLE for an all-ones sample with n>1 requires an infinite shape".into(),
+            ));
+        }
+        let logs: Vec<f64> = (2..=n).map(|value| f64::from(value).ln()).collect();
+        let log_moments = |shape: f64| {
+            // The k=1 term has weight one and log(k)=0. Compensated
+            // positive sums retain the score for large finite supports.
+            let mut sums = [1.0, 0.0, 0.0];
+            let mut corrections = [0.0, 0.0, 0.0];
+            for &log_k in &logs {
+                let weight = (-shape * log_k).exp();
+                for (index, term) in [weight, weight * log_k, weight * log_k * log_k]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let term = term - corrections[index];
+                    let next = sums[index] + term;
+                    corrections[index] = (next - sums[index]) - term;
+                    sums[index] = next;
+                }
+            }
+            let mean = sums[1] / sums[0];
+            (mean, (sums[2] / sums[0] - mean * mean).max(0.0))
+        };
+        if target >= log_moments(0.0).0 {
+            return Ok(Self { a: 0.0, n });
+        }
+        let mut lower = 0.0;
+        let mut upper = 1.0;
+        for _ in 0..64 {
+            if log_moments(upper).0 <= target {
+                break;
+            }
+            lower = upper;
+            upper *= 2.0;
+        }
+        if log_moments(upper).0 > target {
+            return Err(FitError::NonConvergent(
+                "Zipfian likelihood score could not be bracketed within its iteration budget".into(),
+            ));
+        }
+        let mut shape = lower + 0.5 * (upper - lower);
+        for _ in 0..128 {
+            let (mean, variance) = log_moments(shape);
+            let score = mean - target;
+            if score == 0.0 {
+                return Ok(Self { a: shape, n });
+            }
+            if score > 0.0 {
+                lower = shape;
+            } else {
+                upper = shape;
+            }
+            let middle = lower + 0.5 * (upper - lower);
+            if middle == lower
+                || middle == upper
+                || upper - lower <= 8.0 * f64::EPSILON * (1.0 + middle)
+            {
+                return Ok(Self { a: middle, n });
+            }
+            let newton = shape + score / variance;
+            shape = if newton.is_finite() && newton > lower && newton < upper {
+                newton
+            } else {
+                middle
+            };
+        }
+        Err(FitError::NonConvergent(
+            "Zipfian likelihood score did not converge within 128 iterations".into(),
+        ))
     }
 
     #[inline]
@@ -22704,8 +22938,25 @@ impl DiscreteDistribution for Zipfian {
 
     fn mode(&self) -> f64 {
         // Zipfian pmf ∝ k^{−a} on [1, n] is strictly decreasing in k for
-        // every a > 0; mode at k=1 (frankenscipy-ckykz).
+        // every a > 0; k=1 remains a mode of the uniform a=0 boundary.
         1.0
+    }
+
+    /// Joint MLE of the shape and finite upper endpoint. For each shape
+    /// the normalizer grows with `n`, so the optimum is `n = max(data)`.
+    /// Use [`Zipfian::try_fit_with_n`] when the support endpoint is known.
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        validate_discrete_fit_data(data)?;
+        let maximum = data.iter().copied().max().ok_or(FitError::InsufficientData {
+            required: 1,
+            actual: 0,
+        })?;
+        let n = u32::try_from(maximum).map_err(|_| {
+            FitError::UnsupportedData(
+                "Zipfian observations require an upper endpoint representable as u32".into(),
+            )
+        })?;
+        Self::try_fit_with_n(data, n)
     }
 }
 
@@ -87553,6 +87804,110 @@ mod tests {
         assert_eq!(d_samples.len(), 10);
         let fitted_trait = Poisson::try_fit(&signed_variates(samples_small.clone()));
         assert!(fitted_trait.is_ok());
+    }
+
+    #[test]
+    fn discrete_likelihood_fits_reach_trait_and_fixed_support_maxima() {
+        // Independently solved likelihood-score roots at 65 decimal digits.
+        let logseries = LogSeries::try_fit(&[1, 1, 2, 3, 5, 8]).unwrap();
+        assert!((logseries.p - 0.873_126_944_135_352).abs() < 2.0e-15);
+        assert_eq!(LogSeries::fit(&[1, 1, 2, 3, 5, 8]), logseries);
+        let sample = [1, 1, 1, 2, 2, 3, 5];
+        let zipfian = Zipfian::try_fit(&sample).unwrap();
+        assert_eq!(zipfian.n, 5);
+        assert!((zipfian.a - 1.057_037_564_360_507_8).abs() < 3.0e-14);
+        let fixed = Zipfian::try_fit_with_n(&sample, 30).unwrap();
+        assert_eq!(fixed.n, 30);
+        assert!((fixed.a - 1.851_682_467_267_154_3).abs() < 3.0e-14);
+        assert_eq!(Zipfian::try_fit(&[8, 9, 10]).unwrap(), Zipfian::new(0.0, 10));
+        assert_eq!(Zipfian::try_fit(&[1]).unwrap(), Zipfian::new(0.0, 1));
+        let uniform = Zipfian::new(0.0, 4);
+        assert_eq!(uniform.pmf(2), 0.25);
+        assert_eq!(uniform.cdf(2), 0.5);
+        assert_eq!(RandInt::try_fit(&[-7, 3, 0, -2]).unwrap(), RandInt::new(-7, 4));
+    }
+
+    #[test]
+    fn discrete_likelihood_fits_reject_undefined_data_and_bound_work() {
+        for error in [
+            LogSeries::try_fit(&[]).unwrap_err(),
+            RandInt::try_fit(&[]).unwrap_err(),
+            Zipfian::try_fit(&[]).unwrap_err(),
+        ] {
+            assert!(matches!(error, FitError::InsufficientData { .. }));
+        }
+        for value in [i64::MIN, -1, 0] {
+            assert!(matches!(
+                LogSeries::try_fit(&[1, value]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            assert!(matches!(
+                Zipfian::try_fit(&[2, value]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        assert!(matches!(
+            LogSeries::try_fit(&[1, 1]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            LogSeries::try_fit(&[i64::MAX, i64::MAX]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            RandInt::try_fit(&[i64::MAX]),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            Zipfian::try_fit_with_n(&[1, 1], 10),
+            Err(FitError::NonConvergent(_))
+        ));
+        for (sample, n) in [(&[1, 2][..], 0), (&[1, 3][..], 2)] {
+            assert!(matches!(
+                Zipfian::try_fit_with_n(sample, n),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        assert!(matches!(
+            Zipfian::try_fit_with_n(&[1, 2], 1_000_001),
+            Err(FitError::ResourceExhausted { .. })
+        ));
+        with_stats_runtime_mode(RuntimeMode::Hardened, || {
+            with_hardened_stats_caps(2, 2, || {
+                assert!(LogSeries::try_fit(&[1, 2]).is_ok());
+                assert!(RandInt::try_fit(&[-1, 2]).is_ok());
+                assert!(Zipfian::try_fit(&[1, 2]).is_ok());
+                for error in [
+                    LogSeries::try_fit(&[1, 1, 2]).unwrap_err(),
+                    RandInt::try_fit(&[-1, 0, 2]).unwrap_err(),
+                    Zipfian::try_fit(&[1, 1, 2]).unwrap_err(),
+                    Zipfian::try_fit_with_n(&[1, 2], 3).unwrap_err(),
+                ] {
+                    assert!(matches!(error, FitError::ResourceExhausted { .. }));
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn randint_fitted_extreme_signed_intervals_do_not_overflow() {
+        let distribution = RandInt::try_fit(&[i64::MIN, i64::MAX - 1]).unwrap();
+        assert_eq!(distribution.low, i64::MIN);
+        assert_eq!(distribution.high, i64::MAX);
+        assert_eq!(distribution.mean(), -1.0);
+        assert_eq!(distribution.ppf(0.5), -1.0);
+        assert_eq!(distribution.cdf(-1), 0.5);
+        assert_eq!(distribution.cdf(i64::MAX - 1), 1.0);
+        assert_eq!(distribution.pmf(i64::MAX), 0.0);
+        assert!(distribution.pmf(0) > 0.0);
+        assert!(distribution.logpmf(0).is_finite());
+        assert!(distribution.var().is_finite());
+        assert!(distribution.entropy().is_finite());
+        let point = RandInt::try_fit(&[i64::MIN]).unwrap();
+        assert_eq!(point.pmf(i64::MIN), 1.0);
+        assert_eq!(point.cdf(i64::MIN), 1.0);
+        assert_eq!(point.ppf(0.0), i64::MIN as f64 - 1.0);
+        assert_eq!(point.ppf(0.5), i64::MIN as f64);
     }
 
     #[test]

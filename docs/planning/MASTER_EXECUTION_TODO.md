@@ -202,8 +202,9 @@ criteria are met.
 
 ### 8.2 Remaining implementation targets
 
-- [ ] Add trait-level likelihood fits for LogSeries, RandInt and Zipfian, including fixed-n
+- [x] Implement trait-level likelihood fits for LogSeries, RandInt and Zipfian, including fixed-n
   Zipfian fitting, invalid-data errors and resource limits (advances frankenscipy-1ksfv.14).
+  Rust and live-oracle execution remains pending under section 9.
 - [ ] Correct sparse iterative solver norm underflow/overflow, exact least-squares stationarity
   and non-finite warm-start validation.
 - [ ] Implement sparse/matrix-free bounded linear least squares using the existing LSMR
@@ -216,3 +217,46 @@ criteria are met.
 - [ ] Bound finite nsum grid cardinality before conversion to i64.
 - [ ] Run full Beads closeout checks after executable evidence is available. No feature
   closure is claimed from a JavaScript reproduction or a source-only review.
+
+## 9. Discrete fitting and sparse least-squares follow-through
+
+The specification and all 4,623 Beads records were reviewed before selecting
+these functional changes. Older W6 descriptions were checked against actual code.
+The execution host became unavailable during the first Rust build; completed
+manual edits were recovered against the exact GitHub base and uploaded without
+changing unrelated source. Implementation checkboxes below do not claim test passes.
+
+### 9.1 Discrete likelihood fitting (advances `frankenscipy-1ksfv.14`)
+
+- [x] Implement trait-level LogSeries MLE with a monotone likelihood score and
+  cancellation-safe evaluation for samples dominated by ones.
+- [x] Fit RandInt signed endpoints and use overflow-safe interval width, means
+  and quantiles across the representable signed range.
+- [x] Implement Zipfian MLE with profiled support and fixed-n fitting.
+- [x] Admit the genuine Zipfian a=0 uniform boundary.
+- [x] Report nonexistent finite maxima, invalid observations and resource limits
+  through typed errors instead of panics or arbitrary parameter estimates.
+- [x] Add three unit regressions and two integration tests, including 12 seeded
+  comparisons against required SciPy 1.17.1 / NumPy 2.4.3.
+- [x] Independently check the score equations, high-precision root references
+  and signed-interval arithmetic in JavaScript double precision.
+- [ ] Execute the Rust tests and the live oracle, and run formatting/Clippy.
+- [ ] Complete the wider fit-completeness Bead's all-family acceptance criteria.
+
+### 9.2 Validation status and next commands
+
+The exact pinned nightly and SciPy/NumPy versions were installed and verified,
+and `cargo fetch --locked` succeeded. The first compilation was interrupted
+after resource contention; a one-job, debug-disabled retry reached fsci-sparse
+before the execution host went offline. No Rust test pass is claimed.
+
+Pending checks for the completed fitting subset:
+
+- [ ] `cargo test --locked -p fsci-stats --lib discrete_likelihood_fits`
+- [ ] `cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals`
+- [ ] `FSCI_REQUIRE_SCIPY_ORACLE=1 cargo test --locked -p fsci-stats --test mle_scipy discrete_mle -- --nocapture`
+- [ ] Formatting, workspace check, Clippy and the required broader conformance gates.
+
+The main Beads graph is left open. Local claims and new issue records could not
+be synchronized after the host became unavailable; do not infer closures from
+the implementation checklist.

@@ -10,11 +10,11 @@ use std::process::Command;
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
-    CrystalBall, ExponWeibull, FDistribution, FitError, FoldedCauchy, GammaDist, JohnsonSU, Kappa3,
-    LocationScale, Lognormal, Mielke, MleOptions, MleParameter, MleResult, Nakagami, NormInvGauss,
-    Normal, RDist, Rice, SkewCauchy, StatsError, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, fit_mle,
-    fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
-    with_hardened_stats_caps, with_stats_runtime_mode,
+    CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy, GammaDist,
+    JohnsonSU, Kappa3, LocationScale, LogSeries, Lognormal, Mielke, MleOptions, MleParameter, MleResult,
+    Nakagami, NormInvGauss, Normal, RDist, RandInt, Rice, SkewCauchy, StatsError, TruncNormal, TruncPareto,
+    TruncWeibullMin, Weibull, Zipfian, fit_mle, fit_mle_censored, fit_mle_location_scale,
+    fit_mle_location_scale_censored, with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -73,6 +73,191 @@ for family_index, (name, dist, shapes) in enumerate(cases):
 
 fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 {
     -data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
+}
+
+fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
+    -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn discrete_mle_preserves_likelihood_near_parameter_boundaries() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            for (data, expected_p, expected_nll) in [
+                (vec![2], 0.715_331_862_959_161_6, 1.591_439_908_596_979),
+                (
+                    vec![1, 1, 1, 1, 1, 2],
+                    0.259_750_921_820_885_4,
+                    2.920_886_545_434_61,
+                ),
+                (
+                    vec![10_000_000, 20_000_000],
+                    0.999_999_996_580_082_9,
+                    38.972_113_490_036_816,
+                ),
+            ] {
+                // Independent 65-digit score roots, not method-of-moments
+                // reconstruction of the fitted distribution's own draws.
+                let fitted = LogSeries::try_fit(&data).unwrap();
+                assert!((fitted.p - expected_p).abs() <= 2.0 * f64::EPSILON);
+                let nll = discrete_likelihood(&fitted, &data);
+                assert!((nll - expected_nll).abs() < 2.0e-12, "{mode:?}: {nll}");
+                for factor in [0.9, 1.1] {
+                    let p = fitted.p * factor;
+                    if p < 1.0 {
+                        assert!(nll < discrete_likelihood(&LogSeries::new(p), &data));
+                    }
+                }
+            }
+            let mut rare = vec![1; 100_000];
+            rare.push(2);
+            let fitted = LogSeries::try_fit(&rare).unwrap();
+            assert!((fitted.p / 1.999_946_668_044_409_7e-5 - 1.0).abs() < 2.0e-12);
+            assert!((fitted.mean() - (1.0 + 1.0 / rare.len() as f64)).abs() < 3.0e-15);
+
+            let mut concentrated = vec![1; 999];
+            concentrated.push(2);
+            let fitted = Zipfian::try_fit_with_n(&concentrated, 20).unwrap();
+            assert!((fitted.a - 10.006_520_963_236_412).abs() < 3.0e-13);
+            let nll = discrete_likelihood(&fitted, &concentrated);
+            assert!((nll - 7.925_542_267_572_123).abs() < 3.0e-11);
+            for factor in [0.9, 1.1] {
+                let perturbed = Zipfian::new(factor * fitted.a, fitted.n);
+                assert!(nll < discrete_likelihood(&perturbed, &concentrated));
+            }
+        });
+    }
+}
+
+const DISCRETE_FIT_ORACLE: &str = r#"
+import os
+import numpy as np
+import scipy
+from scipy import optimize, stats
+
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+
+def optimizer(fun, bounds, **kwargs):
+    return optimize.differential_evolution(
+        fun, bounds, rng=np.random.default_rng(27501),
+        tol=1e-11, atol=1e-11, polish=True, **kwargs)
+
+cases = [
+    ('logser', stats.logser, [(0.2,), (0.7,), (0.95,)]),
+    ('randint', stats.randint, [(-6, 4), (5, 15), (-3, -2)]),
+    ('zipfian', stats.zipfian, [(0.2, 10), (1.2, 25), (3.0, 40)]),
+    ('zipfian_fixed', stats.zipfian, [(0.2, 10), (1.2, 25), (3.0, 40)]),
+]
+for family_index, (name, dist, shapes) in enumerate(cases):
+    for case_index, shape in enumerate(shapes):
+        data = dist.rvs(*shape, size=2000,
+                        random_state=np.random.default_rng(27400 + 17*family_index + case_index))
+        if name == 'logser':
+            bounds = {'p': (1e-12, 1-1e-12)}
+        elif name == 'randint':
+            bounds = {'low': (int(data.min())-5, int(data.min())),
+                      'high': (int(data.max())+1, int(data.max())+6)}
+        elif name == 'zipfian':
+            bounds = {'a': (0, 20), 'n': (int(data.max()), int(data.max())+10)}
+        else:
+            bounds = {'a': (0, 20), 'n': (shape[1], shape[1])}
+        result = stats.fit(dist, data, bounds=bounds, optimizer=optimizer)
+        assert result.success, (name, case_index, result.message)
+        if name == 'logser':
+            parameters = (result.params.p, 0, 0)
+        elif name == 'randint':
+            parameters = (0, result.params.low, result.params.high)
+        else:
+            parameters = (result.params.a, result.params.n, 0)
+        print(name, case_index, *(format(float(p), '.17g') for p in parameters),
+              format(result.nllf(), '.17g'))
+        print(' '.join(str(int(x)) for x in data))
+"#;
+
+#[test]
+fn discrete_mle_matches_live_scipy_on_seeded_fits() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required discrete-fit SciPy oracle is unavailable");
+        eprintln!("SKIP discrete MLE: SciPy oracle unavailable; compared cases = 0");
+        return;
+    }
+    let output = Command::new(&python)
+        .args(["-c", DISCRETE_FIT_ORACLE])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "discrete-fit SciPy oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    assert!(versions.starts_with("versions "));
+    eprintln!("discrete MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        assert_eq!(fields.len(), 6);
+        let family = fields[0];
+        let expected: Vec<f64> = fields[2..].iter().map(|s| s.parse().unwrap()).collect();
+        let data: Vec<i64> = lines
+            .next()
+            .expect("oracle observation row")
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(data.len(), 2000);
+        let nll = match family {
+            "logser" => {
+                let fitted = LogSeries::try_fit(&data).unwrap();
+                assert!((fitted.p - expected[0]).abs() < 2.0e-6);
+                discrete_likelihood(&fitted, &data)
+            }
+            "randint" => {
+                let fitted = RandInt::try_fit(&data).unwrap();
+                assert_eq!(fitted.low as f64, expected[1]);
+                assert_eq!(fitted.high as f64, expected[2]);
+                discrete_likelihood(&fitted, &data)
+            }
+            "zipfian" | "zipfian_fixed" => {
+                let fitted = if family == "zipfian_fixed" {
+                    Zipfian::try_fit_with_n(&data, expected[1] as u32).unwrap()
+                } else {
+                    Zipfian::try_fit(&data).unwrap()
+                };
+                assert_eq!(f64::from(fitted.n), expected[1]);
+                assert!((fitted.a - expected[0]).abs() < 2.0e-5);
+                discrete_likelihood(&fitted, &data)
+            }
+            other => panic!("unexpected discrete-fit oracle family {other}"),
+        };
+        let scipy_nll = expected[3];
+        assert!(nll.is_finite() && scipy_nll.is_finite());
+        assert!(
+            (nll - scipy_nll).abs() <= 1.0e-8 * (1.0 + scipy_nll.abs()),
+            "{family}/{}: fsci NLL={nll}, SciPy NLL={scipy_nll}",
+            fields[1]
+        );
+        eprintln!(
+            "{family}/{}: fsci NLL={nll:.14}, SciPy NLL={scipy_nll:.14}",
+            fields[1]
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 12, "all discrete-fit oracle cases must be compared");
+    eprintln!("discrete MLE compared cases = {compared}");
 }
 
 #[test]
