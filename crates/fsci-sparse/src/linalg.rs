@@ -10050,6 +10050,72 @@ fn finite_least_squares_norm(norm: f64) -> SparseResult<f64> {
     }
 }
 
+/// Validate user-defined operator products before a least-squares recurrence
+/// can interpret untouched output slots as zeros or previously computed data.
+/// Concrete CSR inputs retain their existing kernels and cached CSC transpose.
+struct CheckedLeastSquaresOperator<'a> {
+    inner: &'a dyn LinearOperator,
+    shape: Shape2D,
+}
+
+impl CheckedLeastSquaresOperator<'_> {
+    fn apply(&self, x: &[f64], y: &mut [f64], transpose: bool) -> SparseResult<()> {
+        let (input, output) = if transpose {
+            (self.shape.rows, self.shape.cols)
+        } else {
+            (self.shape.cols, self.shape.rows)
+        };
+        if self.inner.shape() != self.shape || x.len() != input || y.len() != output {
+            return Err(SparseError::IncompatibleShape {
+                message: "least-squares operator changed shape or received incompatible vectors"
+                    .to_string(),
+            });
+        }
+        if x.iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "least-squares operator input contains NaN or Inf".to_string(),
+            });
+        }
+        y.fill(f64::NAN);
+        if transpose {
+            self.inner.rmatvec_into(x, y)?;
+        } else {
+            self.inner.matvec_into(x, y)?;
+        }
+        if self.inner.shape() != self.shape {
+            return Err(SparseError::IncompatibleShape {
+                message: "least-squares operator changed shape while applying a product"
+                    .to_string(),
+            });
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: "least-squares operator returned a non-finite or incomplete product"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl LinearOperator for CheckedLeastSquaresOperator<'_> {
+    fn shape(&self) -> Shape2D {
+        self.shape
+    }
+
+    fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        self.apply(x, y, false)
+    }
+
+    fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+        self.apply(x, y, true)
+    }
+
+    fn as_csr(&self) -> Option<&CsrMatrix> {
+        self.inner.as_csr()
+    }
+}
+
 /// Recompute the reported residual, rejecting a poisoned or unwritten operator
 /// output even when the recurrence itself has already satisfied a stopping test.
 fn least_squares_relative_residual(
@@ -11509,6 +11575,8 @@ pub fn lsqr(
 /// the ORIGINAL system's relative residual rather than the augmented system's, and a
 /// negative `damp` is accepted because it enters only as `damp^2`. A non-finite damp
 /// is rejected.
+/// This sign symmetry follows the stated objective; SciPy 1.17.1's LSQR skips
+/// the damping rotation for a negative value, so its equivalent call uses `abs(damp)`.
 pub fn lsqr_damped(
     a: &dyn LinearOperator,
     b: &[f64],
@@ -11595,6 +11663,9 @@ fn lsqr_impl(
         });
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
+    let checked = CheckedLeastSquaresOperator { inner: a, shape };
+    let a: &dyn LinearOperator = if a.as_csr().is_some() { a } else { &checked };
+    let damp = damp.abs();
 
     // SciPy's `iter_lim = 2 * n` (lsqr.py). Ours was `n * 10`, five times larger, so a
     // caller who passed no explicit budget got a different convergence VERDICT than
@@ -11939,6 +12010,9 @@ fn csc_transpose_matvec_into(
 /// on the relative residual alone. Setting both to zero retains the machine
 /// precision safeguards. A nonpositive or infinite `conlim` disables the
 /// user condition-number limit; the machine-precision limit remains active.
+/// Strict mode retains SciPy's condition estimate, including its initial
+/// unit-valued QR placeholder. Hardened mode excludes that placeholder so
+/// rescaling the operator cannot alone trigger a condition-limit exit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LsmrOptions<'a> {
     pub mode: RuntimeMode,
@@ -11976,6 +12050,8 @@ impl Default for LsmrOptions<'_> {
 /// An absolute `normar` outside the f64 range rounds to zero or infinity; the
 /// convergence decision retains its separate exponent and does not use that
 /// rounded diagnostic.
+/// In hardened mode `conda` uses only actual QR diagonals; strict mode includes
+/// SciPy's initial unit-valued placeholder for diagnostic and stopping parity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LsmrResult {
     pub solution: Vec<f64>,
@@ -12049,6 +12125,8 @@ pub fn lsmr_with_options(
             max_iter: options.max_iter,
         },
     )?;
+    let checked = CheckedLeastSquaresOperator { inner: a, shape };
+    let a: &dyn LinearOperator = if a.as_csr().is_some() { a } else { &checked };
 
     let normb = finite_least_squares_norm(vec_norm(b))?;
     let mut x = options.x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
@@ -12145,10 +12223,16 @@ pub fn lsmr_with_options(
         // bidiagonal estimate without squaring the operator's scale.
         norma = norm_a_accumulated.hypot(beta);
         norm_a_accumulated = norma.hypot(alpha);
-        if iterations > 1 {
+        if options.mode == RuntimeMode::Strict || iterations > 1 {
             // rho_bar_old starts at the dimensionless placeholder 1. It is
             // an operator-scale QR diagonal only after the first iteration.
+            // Strict mode preserves SciPy's observable estimate and stopping
+            // rule. Hardened mode prevents this placeholder from confusing
+            // the operator's units with its condition number.
             max_r_bar = max_r_bar.max(step.rho_bar_old);
+        }
+        // SciPy excludes the placeholder from the minimum in both modes.
+        if iterations > 1 {
             min_r_bar = min_r_bar.min(step.rho_bar_old);
         }
         conda = max_r_bar.max(step.rho_temp) / min_r_bar.min(step.rho_temp);
@@ -12371,14 +12455,29 @@ fn lsmr_impl(
         });
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
+    let checked = CheckedLeastSquaresOperator { inner: a, shape };
+    let a: &dyn LinearOperator = if a.as_csr().is_some() { a } else { &checked };
 
     let b_norm = finite_least_squares_norm(vec_norm(b))?;
     if rhs_is_zero(b_norm) {
+        if let Some(start) = x0 {
+            let ax = a.matvec(start)?;
+            if finite_least_squares_norm(vec_norm(&ax))? == 0.0 {
+                return Ok(IterativeSolveResult {
+                    solution: start.to_vec(),
+                    // status: Ax0 = b = 0 and the damping correction is zero.
+                    converged: true,
+                    iterations: 0,
+                    residual_norm: 0.0,
+                });
+            }
+        }
         // Unlike lsqr_impl (where SciPy's answer for b = 0 with a guess divides by zero and fsci
-        // solves the damped correction problem instead), lsmr keeps SciPy's behaviour here.
+        // solves the damped correction problem instead), lsmr keeps SciPy's behaviour for
+        // a nonstationary guess. SciPy tests stationarity before this zero-rhs shortcut.
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
-            // status: SciPy parity -- lsmr returns x = 0 whenever ‖b‖ = 0, even with a guess
+            // status: SciPy's zero-rhs shortcut after the stationary-start check.
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -12801,7 +12900,7 @@ mod lsmr_options_tests {
         IterativeSolveOptions, LsmrOptions, RuntimeMode, lsmr, lsmr_regularized, lsmr_with_options,
         lsqr, lsqr_regularized, vec_norm, vec_norm_diff,
     };
-    use crate::{DenseLinearOperator, FunctionOperator, Shape2D, SparseError};
+    use crate::{DenseLinearOperator, FunctionOperator, LinearOperator, Shape2D, SparseError};
 
     fn dense(rows: &[&[f64]]) -> DenseLinearOperator {
         DenseLinearOperator::from_rows(&rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>())
@@ -12813,6 +12912,139 @@ mod lsmr_options_tests {
             (actual - expected).abs() <= 1.0e-12 * expected.abs().max(1.0),
             "actual={actual:.17e}, expected={expected:.17e}"
         );
+    }
+
+    #[test]
+    fn lsqr_negative_damping_preserves_the_regularized_objective() {
+        let a = dense(&[&[1.0, 0.0], &[0.0, 1.0]]);
+        let rhs = [3.0, -2.0];
+        let start = [1.0, 4.0];
+        for initial in [None, Some(start.as_slice())] {
+            let expected = if initial.is_some() {
+                [1.4, 2.8]
+            } else {
+                [0.6, -0.4]
+            };
+            for damping in [-2.0, 2.0] {
+                let result =
+                    lsqr_regularized(&a, &rhs, damping, initial, IterativeSolveOptions::default())
+                        .expect("signed damping is accepted");
+                assert!(result.converged, "{result:?}");
+                for (&actual, expected) in result.solution.iter().zip(expected) {
+                    close(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lsmr_zero_rhs_preserves_a_stationary_nullspace_warm_start() {
+        let a = dense(&[&[1.0, 0.0]]);
+        let start = [0.0, 5.0];
+        for damping in [0.0, 0.5, -0.5] {
+            let result = lsmr_regularized(
+                &a,
+                &[0.0],
+                damping,
+                Some(&start),
+                IterativeSolveOptions::default(),
+            )
+            .expect("stationary warm start");
+            assert!(result.converged);
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.residual_norm, 0.0);
+            assert_eq!(result.solution, start);
+        }
+    }
+
+    #[test]
+    fn least_squares_rejects_incomplete_operator_products_at_every_stage() {
+        use std::cell::Cell;
+
+        struct PartialOperator {
+            forward: bool,
+            fail_at: usize,
+            calls: Cell<usize>,
+        }
+
+        impl LinearOperator for PartialOperator {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(2, 2)
+            }
+
+            fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> crate::SparseResult<()> {
+                self.apply(x, y, true)
+            }
+
+            fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> crate::SparseResult<()> {
+                self.apply(x, y, false)
+            }
+        }
+
+        impl PartialOperator {
+            fn apply(&self, x: &[f64], y: &mut [f64], forward: bool) -> crate::SparseResult<()> {
+                if self.forward == forward {
+                    self.calls.set(self.calls.get() + 1);
+                    if self.calls.get() == self.fail_at {
+                        // The second output is intentionally left untouched.
+                        // Reused zeros or old products must not conceal it.
+                        y[0] = x[0];
+                        return Ok(());
+                    }
+                }
+                y[0] = x[0];
+                y[1] = 2.0 * x[1];
+                Ok(())
+            }
+        }
+
+        let start = [0.25, 0.75];
+        for forward in [false, true] {
+            for fail_at in [1, 2] {
+                for initial in [None, Some(start.as_slice())] {
+                    let a = PartialOperator {
+                        forward,
+                        fail_at,
+                        calls: Cell::new(0),
+                    };
+                    let controls = IterativeSolveOptions {
+                        tol: 1e-12,
+                        max_iter: Some(8),
+                        ..IterativeSolveOptions::default()
+                    };
+                    let q = lsqr_regularized(&a, &[1.0, 2.0], 0.0, initial, controls);
+                    assert!(
+                        matches!(q, Err(SparseError::NonFiniteInput { .. })),
+                        "LSQR: forward={forward}, fail_at={fail_at}, warm={}, {q:?}",
+                        initial.is_some()
+                    );
+                    a.calls.set(0);
+                    let m = lsmr_regularized(&a, &[1.0, 2.0], 0.0, initial, controls);
+                    assert!(
+                        matches!(m, Err(SparseError::NonFiniteInput { .. })),
+                        "LSMR: forward={forward}, fail_at={fail_at}, warm={}, {m:?}",
+                        initial.is_some()
+                    );
+                    a.calls.set(0);
+                    let m = lsmr_with_options(
+                        &a,
+                        &[1.0, 2.0],
+                        LsmrOptions {
+                            atol: 1e-12,
+                            btol: 1e-12,
+                            max_iter: Some(8),
+                            x0: initial,
+                            ..LsmrOptions::default()
+                        },
+                    );
+                    assert!(
+                        matches!(m, Err(SparseError::NonFiniteInput { .. })),
+                        "LSMR options: forward={forward}, fail_at={fail_at}, warm={}, {m:?}",
+                        initial.is_some()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -12917,6 +13149,9 @@ mod lsmr_options_tests {
                     &a,
                     &b,
                     LsmrOptions {
+                        // Scale-invariant condition stopping is hardened
+                        // behavior; strict mode retains SciPy's unit sentinel.
+                        mode: RuntimeMode::Hardened,
                         damp: damping * scale,
                         x0: Some(&start),
                         atol: 1e-12,
